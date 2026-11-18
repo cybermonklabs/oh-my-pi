@@ -9,6 +9,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -19,6 +20,9 @@ from robomp.github_client import GitHubClient
 from robomp.proxy.server import create_proxy_app
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, sign
 from robomp.sandbox import workspace_key
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 _HMAC = "test-hmac-key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _TOKEN = "ghp_test_token_value"
@@ -201,6 +205,20 @@ def test_read_remote_urls_uses_safe_directory_and_slot_identity(
     assert captured["group"] == 2001
     assert captured["extra_groups"] == [2000]
     assert captured["umask"] == 0o002
+
+
+def test_git_probe_env_appends_safe_directory_after_inherited_git_config(
+    tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # The user's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    from robomp.proxy import server as proxy_server
+
+    repo_dir = tmp_path / "repo"
+    env = proxy_server._git_probe_env(repo_dir)
+
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(repo_dir))]
+    assert git_config.past_count(env) == {}
 
 
 # ============================================================================
@@ -1334,9 +1352,7 @@ async def test_git_fetch_pr_head_falls_back_to_safe_branch(
 
 
 @pytest.mark.parametrize("pr_number", [0, -1])
-async def test_git_fetch_pr_head_rejects_nonpositive_pr_number(
-    proxy_settings: Settings, pr_number: int
-) -> None:
+async def test_git_fetch_pr_head_rejects_nonpositive_pr_number(proxy_settings: Settings, pr_number: int) -> None:
     app = _build_app(proxy_settings)
     endpoint = "/gh/v1/git/fetch_pr_head"
     body = json.dumps({"repo": "octo/widget", "pr_number": pr_number}).encode()

@@ -197,13 +197,17 @@ async function createSession(tempDir: TempDir): Promise<string> {
 
 /**
  * Resume `sessionFile` while another process owns it and write once (a user
- * turn with text `write`, or the given write): the session moves to a sibling.
+ * turn with text `write`, or the given write): the session moves to a sibling,
+ * a fork. This build records no `continuationOf` there; an earlier build did,
+ * and the picker, `--continue` and a `--resume` prefix still follow one, so
+ * the sibling's header gets the `continuationOf` that build wrote.
  */
 async function continueElsewhere(
 	sessionFile: string,
 	sessionDir: string,
 	write: string | ((manager: SessionManager) => void),
 ): Promise<string> {
+	const continuedFrom = await readSessionHeaderId(sessionFile);
 	const manager = await open(sessionFile, sessionDir);
 	const notices: SessionPersistenceNotice[] = [];
 	manager.onPersistenceNotice(notice => notices.push(notice));
@@ -213,6 +217,17 @@ async function continueElsewhere(
 	const sibling = manager.getSessionFile();
 	if (!sibling) throw new Error("Expected the session to save somewhere");
 	expect(notices).toEqual([{ reason: "open-elsewhere", from: sessionFile, to: sibling }]);
+	const lines = (await Bun.file(sibling).text()).split("\n");
+	const index = lines.findIndex(line => line.includes('"type":"session"'));
+	const header = JSON.parse(lines[index] ?? "{}");
+	expect({ parentSession: header.parentSession, continuationOf: header.continuationOf }).toEqual({
+		parentSession: continuedFrom,
+		continuationOf: undefined,
+	});
+	// Where that build wrote it: before the carried-over fields, inside the 4 KB the listing reads.
+	const { type, id, timestamp, parentSession, ...carried } = header;
+	lines[index] = JSON.stringify({ type, id, timestamp, parentSession, continuationOf: continuedFrom, ...carried });
+	await Bun.write(sibling, lines.join("\n"));
 	return sibling;
 }
 
@@ -323,7 +338,7 @@ describe("--resume of a session that continued in a sibling file", () => {
 			if (!sessionId) throw new Error("Expected a session id");
 			const args =
 				by === "id"
-					? resumeArgs(sessionId, tempDir.path())
+					? resumeArgs(sessionId.slice(0, 13), tempDir.path())
 					: by === "continue"
 						? continueArgs(tempDir.path())
 						: resumeArgs(original);
@@ -455,7 +470,11 @@ describe("--resume of a session that continued in a sibling file", () => {
 			const savedTo = manager.getSessionFile();
 			if (!savedTo) throw new Error("Expected the resumed session to save somewhere");
 			expect(notices).toEqual([{ reason: "open-elsewhere", from: continuation, to: savedTo }]);
-			expect(manager.getHeader()?.continuationOf).toBe(continuationId);
+			// The second move is a fork too: it names the continuation, and no build writes `continuationOf` now.
+			expect([manager.getHeader()?.parentSession, manager.getHeader()?.continuationOf]).toEqual([
+				continuationId,
+				undefined,
+			]);
 			await manager.close();
 			expect(await userTurnsIn(savedTo, tempDir.path())).toEqual([
 				"before",
@@ -647,7 +666,7 @@ describe("--resume of a session that continued in a sibling file", () => {
 			await Bun.write(original, "not a session journal\n");
 
 			const followed: SessionContinuation[] = [];
-			const args = by === "id" ? resumeArgs(sessionId, tempDir.path()) : resumeArgs(original);
+			const args = by === "id" ? resumeArgs(sessionId.slice(0, 13), tempDir.path()) : resumeArgs(original);
 			const manager = await createSessionManager(args, tempDir.path(), stubSettings, undefined, {
 				onSessionContinuation: c => followed.push(c),
 			});
@@ -674,7 +693,11 @@ describe("--resume of a session that continued in a sibling file", () => {
 		const otherId = await readSessionHeaderId(original);
 		expect(otherId).not.toBe(sessionId);
 
-		const byId = await createSessionManager(resumeArgs(sessionId, tempDir.path()), tempDir.path(), stubSettings);
+		const byId = await createSessionManager(
+			resumeArgs(sessionId.slice(0, 13), tempDir.path()),
+			tempDir.path(),
+			stubSettings,
+		);
 		try {
 			expect(byId?.getSessionFile()).toBe(continuation);
 		} finally {

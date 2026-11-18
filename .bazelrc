@@ -6,8 +6,9 @@
 common --enable_platform_specific_config
 
 # Hermetic-ish action env: no host env leaks into action keys. Build scripts
-# that need host tools (cmake for opusic-sys' bundled Opus) get an explicit
-# PATH through crate annotations in MODULE.bazel.
+# that spawn cmake/ninja (opusic-sys' bundled Opus, wasmtime-c-api-impl) get the
+# pinned @cmake_ninja (bazel/toolchains/cmake.bzl) on an explicit PATH through
+# crate annotations in MODULE.bazel.
 build --incompatible_strict_action_env
 
 # Third-party crate resolution (rules_rust crate_universe) shells out to

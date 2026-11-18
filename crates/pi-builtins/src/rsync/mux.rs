@@ -2872,8 +2872,14 @@ mod tests {
 	/// each second sees at most 1 s of silence. (At `--timeout=1` lull equals the
 	/// timeout and upstream itself times out on the second check, because a queued
 	/// keepalive stamps `last_io_out` only once it is written.)
+	///
+	/// The test runs in a process of its own, away from the other tests'
+	/// threads.
 	#[test]
 	fn blocked_sender_sends_keepalives_instead_of_timing_out() {
+		if !crate::own_process::own_process() {
+			return;
+		}
 		let (mut r, _tx, cancel) = blocking_reader(Some(Duration::from_secs(2)));
 		let sink = Sink::default();
 		let w = writer(&sink, WriteConfig { timeout: Some(Duration::from_secs(2)), ..WriteConfig::default() });

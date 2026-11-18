@@ -22,7 +22,9 @@
 //! [`ToolCalls::poll`] on each turn, parking no longer than
 //! [`ToolCalls::next_deadline`]. A tool's subshells are ordinary runs of the
 //! engine: functions, builtins and externals run as anywhere else, and the
-//! tool only watches their `Done`.
+//! tool only watches their `Done`. Under a callout (`xargs timeout 5 f`) they
+//! are subshells of the callout's, which has none of the caller's functions
+//! ([`Script::as_program`](crate::bash::Script::as_program)).
 //!
 //! The `kill` builtin is the engine's intrinsic (`%job` operands stay on the
 //! virtual signal bus); the host's policy for OS pids is
@@ -32,16 +34,19 @@ mod extra;
 mod git;
 mod nohup;
 mod timeout;
-
-use std::{collections::VecDeque, sync::Arc, task::Waker, time::Duration};
+use std::{collections::VecDeque, io, sync::Arc, task::Waker, time::Duration};
 
 use bstr::{BStr, BString, ByteSlice};
 use parking_lot::Mutex;
+/// The environment variable with which a test fires the deadline of this
+/// session's `timeout` calls itself (see `timeout::Timeout::gate`).
+#[cfg(all(test, unix))]
+pub(crate) use timeout::GATE_VAR as TIMEOUT_GATE_VAR;
 
 use crate::{
 	bash::{
-		CallId, CallOutcome, ControlHandle, Cx, IoPoll, Lineage, NativeRef, RunId, Script, Shell,
-		ShellApi, ToolCall, ToolRef,
+		CallId, CallOutcome, ControlHandle, Cx, ExecRefusal, IoPoll, Lineage, NativeRef, RunId,
+		Script, Shell, ShellApi, ToolCall, ToolRef,
 	},
 	extras::{ExtrasGate, ReportedError},
 	git::{GitLayers, flag_on},
@@ -151,13 +156,13 @@ impl SpawnLog {
 		}
 	}
 
-	/// The recorded externals of `labels` that are still running.
+	/// The recorded externals of `labels` that may still run.
 	fn live(&self, labels: &[u32]) -> Vec<u32> {
 		self
 			.0
 			.lock()
 			.iter()
-			.filter(|&&(label, pid)| labels.contains(&label) && running(pid))
+			.filter(|&&(label, pid)| labels.contains(&label) && may_run(pid))
 			.map(|&(_, pid)| pid)
 			.collect()
 	}
@@ -167,19 +172,19 @@ impl SpawnLog {
 	}
 }
 
-/// Whether `pid` runs (exited but unreaped counts as gone).
+/// Whether `pid` may still run: it has not [ended](crate::sys::proc::ended).
+/// An exited, unreaped process counts as gone; one the process table cannot
+/// read counts as running, so `timeout`'s KILL still reaches it and
+/// `timeout` waits for it (until it gives up) instead of ending first.
 #[cfg(unix)]
-fn running(pid: u32) -> bool {
-	i32::try_from(pid)
-		.ok()
-		.and_then(crate::sys::proc::info)
-		.is_some_and(|p| p.state != crate::sys::proc::ProcState::Zombie)
+fn may_run(pid: u32) -> bool {
+	i32::try_from(pid).is_ok_and(|pid| !crate::sys::proc::ended(pid))
 }
 
 /// Externals off Unix are not watched: their process tree is the Job
 /// Object's, which the spawner ends with the subshell.
 #[cfg(not(unix))]
-const fn running(_pid: u32) -> bool {
+const fn may_run(_pid: u32) -> bool {
 	false
 }
 
@@ -286,14 +291,20 @@ impl Tool {
 
 	/// `run` (one of the tool's subshells) ended; `false` when it is not
 	/// the tool's.
-	fn on_done(&mut self, run: RunId, status: i32, signal: Option<i32>) -> bool {
+	fn on_done(
+		&mut self,
+		run: RunId,
+		status: i32,
+		signal: Option<i32>,
+		refusal: Option<ExecRefusal>,
+	) -> bool {
 		let child = match self {
 			Self::Timeout(t) => &mut t.child,
 			Self::Nohup(t) => &mut t.child,
 			Self::Git(t) => &mut t.child,
-			Self::Extra(t) => return t.on_done(run, status, signal),
+			Self::Extra(t) => return t.on_done(run, status, signal, refusal),
 		};
-		child.on_done(run, status)
+		child.on_done(run, status, refusal)
 	}
 
 	const fn child(&self) -> &Child {
@@ -325,15 +336,33 @@ impl Tool {
 /// A tool's subshell: its run and label, and its status once it ended.
 #[derive(Default)]
 struct Child {
-	run:    Option<RunId>,
-	label:  u32,
-	status: Option<i32>,
+	run:     Option<RunId>,
+	label:   u32,
+	status:  Option<i32>,
+	/// The subshell's `exec` the system refused, or that found nothing to
+	/// run, for a tool that hears of it ([`Child::start`] with `reports`).
+	refusal: Option<ExecRefusal>,
 }
 
 impl Child {
 	/// Run `argv` (`"$@"`, so functions, builtins and externals run as
 	/// anywhere) in a subshell of the caller under a fresh label;
 	/// `redirect` is appended to the command (`>&2`).
+	///
+	/// With `reports` (`timeout`, `nohup`), a name that is no function and
+	/// no builtin is a program, which the subshell `exec`s: the shell's own
+	/// `exec` finds it, as it finds any command (its hash table, `PATH`,
+	/// `PATHEXT` on Windows; a name with a separator as written), and an
+	/// `exec` it refused or that found nothing ends the subshell with
+	/// [`Child::refusal`] instead of the shell's diagnostic, so the tool
+	/// reports a command it cannot run as GNU's does ([`Child::cannot_run`]),
+	/// or hands a line too long up to a caller that retries it
+	/// ([`ToolCall::too_long_to_caller`], [`CallOutcome::TooLong`]). That
+	/// subshell stands for the program, as a callout's does
+	/// ([`Script::as_program`]): neither `set -x` nor the caller's DEBUG, ERR
+	/// or RETURN traps see its words. A builtin that hands such a refusal up
+	/// itself (`env` under `timeout` under `xargs`) runs as `"$@"` and is
+	/// heard of the same way.
 	fn start(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -342,9 +371,29 @@ impl Child {
 		argv: Vec<BString>,
 		detached: bool,
 		redirect: &str,
+		reports: bool,
 	) {
 		self.label = turn.labels.fresh(api.lineage().label);
-		let mut script = Script::command(format!("\"$@\"{redirect}").into_bytes());
+		self.status = None;
+		self.refusal = None;
+		let (mut too_long_to_host, mut refusals_to_host, mut as_program) = (false, false, false);
+		let mut source = format!("\"$@\"{redirect}").into_bytes();
+		// A function runs as `"$@"`, as anywhere.
+		if reports
+			&& let Some(name) = argv.first()
+			&& !api.has_function(name.as_bstr())
+		{
+			if extra::Lookup::for_call(call, turn.config).builtin(&name.to_os_str_lossy()) {
+				too_long_to_host = call.too_long_to_caller
+					&& extra::Program::Builtin.hands_up_too_long(name.as_bytes());
+			} else {
+				// Quoted, so no alias applies; `builtin`, so no function named
+				// `exec` runs.
+				source = format!("\\builtin exec -- \"$@\"{redirect}").into_bytes();
+				(too_long_to_host, refusals_to_host, as_program) = (true, true, true);
+			}
+		}
+		let mut script = Script::command(source);
 		script.args = Some(argv);
 		// The command's environment, per-command assignments included.
 		script.env = call
@@ -352,7 +401,9 @@ impl Child {
 			.iter()
 			.map(|(name, value)| (BString::from(name), BString::from(value)))
 			.collect();
-		self.status = None;
+		script.too_long_to_host = too_long_to_host;
+		script.refusals_to_host = refusals_to_host;
+		script.as_program = as_program;
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.
@@ -363,17 +414,42 @@ impl Child {
 		});
 	}
 
-	fn on_done(&mut self, run: RunId, status: i32) -> bool {
+	fn on_done(&mut self, run: RunId, status: i32, refusal: Option<ExecRefusal>) -> bool {
 		if self.run != Some(run) || self.status.is_some() {
 			return false;
 		}
 		self.status = Some(status);
+		self.refusal = refusal;
 		true
 	}
 
 	/// The run, while its `Done` is still to come.
 	fn pending(&self) -> Option<RunId> {
 		self.run.filter(|_| self.status.is_none())
+	}
+
+	/// The error of a line too long to hand up to a caller that retries it
+	/// ([`ToolCall::too_long_to_caller`]), once the subshell ended.
+	fn too_long(&self, call: &ToolCall) -> Option<i32> {
+		self
+			.refusal
+			.filter(|refusal| refusal.too_long && call.too_long_to_caller)
+			.map(|refusal| refusal.errno)
+	}
+
+	/// The command could not run (the shell's `exec` found nothing, or the
+	/// system refused it for any reason but a line too long handed up):
+	/// GNU's status (127 for `ENOENT`, else 126) and `strerror` text, which
+	/// `timeout` and `nohup` print as `failed to run command`.
+	fn cannot_run(&self, call: &ToolCall) -> Option<(i32, String)> {
+		let refusal = self.refusal.filter(|_| self.too_long(call).is_none())?;
+		let error = io::Error::from_raw_os_error(refusal.errno);
+		let status = if error.kind() == io::ErrorKind::NotFound {
+			127
+		} else {
+			126
+		};
+		Some((status, crate::bash::diag::strerror(&error).into_owned()))
 	}
 }
 
@@ -448,12 +524,20 @@ impl ToolCalls {
 
 	/// A run that is not the session's own ended; `true` when it belonged
 	/// to a tool (the driver ignores it then). `signal` is the actual
-	/// signal death of a command replacing the run, not an exit code.
-	pub fn on_done(&mut self, run: RunId, status: i32, signal: Option<i32>) -> bool {
+	/// signal death of a command replacing the run, not an exit code;
+	/// `refusal` an `exec` the system refused, that the run hands up
+	/// ([`Shell::exec_refusal`]).
+	pub fn on_done(
+		&mut self,
+		run: RunId,
+		status: i32,
+		signal: Option<i32>,
+		refusal: Option<ExecRefusal>,
+	) -> bool {
 		if self
 			.active
 			.iter_mut()
-			.any(|(_, tool)| tool.on_done(run, status, signal))
+			.any(|(_, tool)| tool.on_done(run, status, signal, refusal))
 		{
 			return true;
 		}
@@ -570,5 +654,57 @@ mod tests {
 		assert_eq!(no_utils.lookup("xargs".into()), None);
 		assert!(no_utils.native_extra("sort".into()).is_none());
 		assert_eq!(no_utils.lookup("timeout".into()), Some(TIMEOUT));
+	}
+
+	/// The externals `timeout` still waits for, and KILLs: a running one the
+	/// process table cannot read is among them (a failed read proves
+	/// nothing), and a zombie is not. The unreadable case runs in a child
+	/// test process with no descriptor left.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn the_live_externals_include_a_running_one_that_cannot_be_read() {
+		use crate::sys::proc::short_of_descriptors;
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.unwrap();
+		let pid = child.id();
+		let log = SpawnLog::default();
+		log.record(Lineage { label: 7, detached: false }, pid);
+		let running = log.live(&[7]);
+		let probed = short_of_descriptors::run("tools::tests::live_with_no_descriptor_left", pid);
+		// SAFETY: plain syscall; the test's own child.
+		unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+		while !crate::sys::proc::ended(pid as i32) {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let zombie = log.live(&[7]);
+		child.wait().unwrap();
+		probed.unwrap();
+		assert_eq!(running, [pid], "the running sleep is not live");
+		assert!(zombie.is_empty(), "the zombie {pid} is live");
+		assert!(log.live(&[8]).is_empty(), "another label's externals are live");
+	}
+
+	/// Run by [`the_live_externals_include_a_running_one_that_cannot_be_read`]
+	/// in a child process with no descriptor left.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by \
+	            the_live_externals_include_a_running_one_that_cannot_be_read"]
+	fn live_with_no_descriptor_left() {
+		use crate::sys::proc::short_of_descriptors;
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let log = SpawnLog::default();
+		log.record(Lineage { label: 7, detached: false }, pid as u32);
+		short_of_descriptors::leave_none();
+		assert!(crate::sys::proc::info(pid).is_none(), "/proc/{pid}/stat could still be read");
+		assert_eq!(
+			log.live(&[7]),
+			[pid as u32],
+			"the running sleep {pid} is not live when it cannot be read"
+		);
 	}
 }

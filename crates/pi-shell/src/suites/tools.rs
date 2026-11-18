@@ -7,18 +7,27 @@ use std::{
 	io::{Read as _, Seek as _},
 	os::unix::{ffi::OsStrExt as _, process::ExitStatusExt as _},
 	path::Path,
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use bstr::BString;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{RunOptions, RunStdio, Session, SessionConfig};
+use crate::{
+	session::{RunOptions, RunStdio, Session, SessionConfig},
+	sys::proc,
+};
 
 fn session() -> Session {
+	session_with(Vec::new())
+}
+
+/// A session whose environment is this process's, plus `extra`.
+fn session_with(extra: Vec<(BString, BString)>) -> Session {
 	let env = std::env::vars_os()
 		.filter(|(name, _)| name != "PI_DISABLE_NOHUP_BUILTIN")
 		.map(|(k, v)| (BString::from(k.as_bytes()), BString::from(v.as_bytes())))
+		.chain(extra)
 		.collect();
 	let cwd = std::env::current_dir().unwrap();
 	Session::new(SessionConfig {
@@ -28,15 +37,31 @@ fn session() -> Session {
 		vfs: None,
 		runtime: tokio::runtime::Handle::current(),
 		output_decoding: None,
+		term_grace: crate::host::TERM_GRACE,
 	})
 	.unwrap()
 }
 
+/// A session whose `timeout` calls expire when `gate` is created, rather
+/// than after their duration ([`crate::tools::TIMEOUT_GATE_VAR`]): the test
+/// fires the deadline once its command is up, instead of racing a loaded
+/// host with a short duration.
+fn session_gating_timeouts(gate: &Path) -> Session {
+	session_with(vec![(
+		BString::from(crate::tools::TIMEOUT_GATE_VAR),
+		BString::from(gate.as_os_str().as_bytes()),
+	)])
+}
+
+/// Creates `gate`, firing the deadline of the session's `timeout` calls.
+fn fire_timeouts(gate: &Path) {
+	std::fs::write(gate, b"").unwrap();
+}
+
 struct Ran {
-	status:  i32,
-	stdout:  String,
-	stderr:  String,
-	elapsed: Duration,
+	status: i32,
+	stdout: String,
+	stderr: String,
 }
 
 fn read_back(mut file: std::fs::File) -> String {
@@ -53,40 +78,30 @@ async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> 
 		stdout: Some(out.try_clone().unwrap()),
 		stderr: Some(err.try_clone().unwrap()),
 	};
-	let started = Instant::now();
 	let outcome = s
 		.run_with(RunOptions::new(command), stdio, cancel)
 		.await
 		.unwrap();
-	Ran {
-		status:  outcome.status,
-		stdout:  read_back(out),
-		stderr:  read_back(err),
-		elapsed: started.elapsed(),
-	}
+	Ran { status: outcome.status, stdout: read_back(out), stderr: read_back(err) }
 }
 
 async fn run(s: &mut Session, command: &str) -> Ran {
 	run_with(s, command, CancellationToken::new()).await
 }
 
-fn alive(pid: i32) -> bool {
-	// SAFETY: signal 0 only probes existence.
-	unsafe { libc::kill(pid, 0) == 0 }
-}
-
-/// Waits (bounded) for `pid` to be gone; whether it is.
-async fn gone(pid: i32, within: Duration) -> bool {
-	let start = Instant::now();
-	while alive(pid) && start.elapsed() < within {
+/// Waits for `pid` to have ended ([`proc::ended`]: a zombie counts, since
+/// under a PID 1 that reaps nothing but its own child an orphan stays one),
+/// however long that takes: the tests' processes never end by themselves
+/// while a test runs, so a process the tool did not end hangs the test until
+/// the runner's timeout instead of being timed.
+async fn ends(pid: i32) {
+	while !proc::ended(pid) {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
-	!alive(pid)
 }
 
 /// The pid an operand wrote to `file`, once it is there.
 async fn pid_in(file: &Path) -> i32 {
-	let start = Instant::now();
 	loop {
 		if let Some(pid) = std::fs::read_to_string(file)
 			.ok()
@@ -94,25 +109,32 @@ async fn pid_in(file: &Path) -> i32 {
 		{
 			return pid;
 		}
-		assert!(start.elapsed() < Duration::from_secs(10), "no pid in {}", file.display());
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_expires_with_124_and_leaves_no_process() {
-	let mut s = session();
-	let r = run(&mut s, "timeout 0.2 sleep 5").await;
-	assert_eq!(r.status, 124, "{}", r.stderr);
-	assert!(r.elapsed < Duration::from_secs(2), "took {:?}", r.elapsed);
-
 	let dir = tempfile::tempdir().unwrap();
-	let file = dir.path().join("pid");
-	let command = format!("timeout 0.2 sh -c 'echo $$ > {}; exec sleep 5'", file.display());
-	let r = run(&mut s, &command).await;
+	let gate = dir.path().join("gate");
+	let mut s = session_gating_timeouts(&gate);
+	fire_timeouts(&gate);
+	let r = run(&mut s, "timeout 100 sleep 600").await;
 	assert_eq!(r.status, 124, "{}", r.stderr);
-	let pid = pid_in(&file).await;
-	assert!(gone(pid, Duration::from_millis(500)).await, "sleep {pid} survived the timeout");
+
+	let fresh = tempfile::tempdir().unwrap();
+	let (gate, file) = (fresh.path().join("gate"), fresh.path().join("pid"));
+	let mut s = session_gating_timeouts(&gate);
+	let command = format!("timeout 100 sh -c 'echo $$ > {}; exec sleep 600'", file.display());
+	let (r, pid) = tokio::join!(run(&mut s, &command), async {
+		// The deadline comes only once the command is up and recorded.
+		let pid = pid_in(&file).await;
+		fire_timeouts(&gate);
+		pid
+	});
+	assert_eq!(r.status, 124, "{}", r.stderr);
+	// `timeout` returns only once its command is gone.
+	assert!(proc::ended(pid), "sleep {pid} survived the timeout");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -121,7 +143,7 @@ async fn timeout_reports_the_status_of_a_command_that_finishes() {
 	assert_eq!(run(&mut s, "timeout 5 true").await.status, 0);
 	assert_eq!(run(&mut s, "timeout 5 sh -c 'exit 7'").await.status, 7);
 	assert_eq!(run(&mut s, "timeout 0 true").await.status, 0);
-	// Not found and not executable, as the shell reports them.
+	// Not found: coreutils' status (and words; see `suites::extras`).
 	assert_eq!(run(&mut s, "timeout 5 nosuchcommand-pi").await.status, 127);
 	// Operands reach the command as they are: no re-splitting or expansion.
 	let r = run(&mut s, "timeout 5 printf '[%s]' 'a b' '$HOME' ''").await;
@@ -131,47 +153,61 @@ async fn timeout_reports_the_status_of_a_command_that_finishes() {
 /// Functions and builtins run under `timeout`, as with pi's builtin.
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_runs_functions_and_builtins() {
-	let mut s = session();
-	let r = run(&mut s, "f(){ sleep 5; }; timeout 0.2 f").await;
+	let dir = tempfile::tempdir().unwrap();
+	let gate = dir.path().join("gate");
+	let mut s = session_gating_timeouts(&gate);
+	fire_timeouts(&gate);
+	let r = run(&mut s, "f(){ sleep 600; }; timeout 100 f").await;
 	assert_eq!(r.status, 124);
-	assert!(r.elapsed < Duration::from_secs(2), "took {:?}", r.elapsed);
+	let r = run(&mut s, "timeout 100 eval 'while :; do :; done'").await;
+	assert_eq!((r.status, r.stderr.as_str()), (124, ""));
+	// A command that finishes first: no deadline is reached, gate or not.
+	let mut s = session();
 	let r = run(&mut s, "g(){ echo in-g \"$@\"; return 3; }; timeout 5 g x").await;
 	assert_eq!((r.status, r.stdout.as_str()), (3, "in-g x\n"));
-	let r = run(&mut s, "timeout 0.2 eval 'while :; do :; done'").await;
-	assert_eq!((r.status, r.stderr.as_str()), (124, ""));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_signals_and_statuses_follow_gnu() {
-	let mut s = session();
-	assert_eq!(run(&mut s, "timeout -s KILL 0.2 sleep 5").await.status, 137);
+	let dir = tempfile::tempdir().unwrap();
+	let gate = dir.path().join("gate");
+	let mut s = session_gating_timeouts(&gate);
+	fire_timeouts(&gate);
+	assert_eq!(run(&mut s, "timeout -s KILL 100 sleep 600").await.status, 137);
 	assert_eq!(
-		run(&mut s, "timeout --preserve-status 0.1 sleep 5")
+		run(&mut s, "timeout --preserve-status 100 sleep 600")
 			.await
 			.status,
 		143
 	);
-	let r = run(&mut s, "timeout -v 0.1 sleep 5").await;
+	let r = run(&mut s, "timeout -v 100 sleep 600").await;
 	assert_eq!(r.status, 124);
 	assert_eq!(r.stderr, "timeout: sending signal TERM to command 'sleep'\n");
 }
 
 /// A command that ignores the signal is killed after `-k`, external
-/// grandchildren included.
+/// grandchildren included. Neither ends by itself (TERM is ignored, and the
+/// `sleep 600` outlives the test runner's bound): only the KILL ends them.
+/// The test fires the deadline once both are up.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_after_ends_a_command_that_ignores_the_signal() {
-	let mut s = session();
 	let dir = tempfile::tempdir().unwrap();
-	let file = dir.path().join("pid");
+	let gate = dir.path().join("gate");
+	let mut s = session_gating_timeouts(&gate);
+	let (shell, file) = (dir.path().join("sh"), dir.path().join("pid"));
 	let command = format!(
-		"timeout -k 0.2 0.1 sh -c 'trap \"\" TERM; sleep 5 & echo $! > {}; wait'",
+		"timeout -k 0.2 100 sh -c 'trap \"\" TERM; echo $$ > {}; sleep 600 & echo $! > {}; wait'",
+		shell.display(),
 		file.display()
 	);
-	let r = run(&mut s, &command).await;
+	let (r, (shell_pid, sleep_pid)) = tokio::join!(run(&mut s, &command), async {
+		let pids = (pid_in(&shell).await, pid_in(&file).await);
+		fire_timeouts(&gate);
+		pids
+	});
 	assert_eq!(r.status, 137, "{}", r.stderr);
-	assert!(r.elapsed < Duration::from_secs(2), "took {:?}", r.elapsed);
-	let pid = pid_in(&file).await;
-	assert!(gone(pid, Duration::from_millis(500)).await, "sleep {pid} survived -k");
+	ends(shell_pid).await;
+	ends(sleep_pid).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -187,14 +223,15 @@ async fn timeout_usage_errors_exit_125() {
 	assert!(r.stdout.starts_with("Usage: timeout"), "{}", r.stdout);
 }
 
-/// Cancelling the run that waits in `timeout` ends the command too.
+/// Cancelling the run that waits in `timeout` ends the command too: nothing
+/// else would end it while the test runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_reaches_the_timed_command() {
 	let mut s = session();
 	let dir = tempfile::tempdir().unwrap();
 	let file = dir.path().join("pid");
 	let cancel = CancellationToken::new();
-	let command = format!("timeout 30 sh -c 'echo $$ > {}; exec sleep 30'", file.display());
+	let command = format!("timeout 600 sh -c 'echo $$ > {}; exec sleep 600'", file.display());
 	let trigger = cancel.clone();
 	let probe = async {
 		let pid = pid_in(&file).await;
@@ -203,7 +240,7 @@ async fn cancel_reaches_the_timed_command() {
 	};
 	let (r, pid) = tokio::join!(run_with(&mut s, &command, cancel), probe);
 	assert_eq!(r.status, 143);
-	assert!(gone(pid, Duration::from_secs(3)).await, "sleep {pid} survived the cancel");
+	ends(pid).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,9 +270,9 @@ async fn nohup_in_the_background_has_a_usable_pid() {
 	assert_eq!(r.status, 0);
 	let pid = r.stdout.trim().strip_prefix("pid=").expect("pid= line");
 	assert!(pid.parse::<i32>().is_ok_and(|pid| pid > 0), "{}", r.stdout);
-	let r = run(&mut s, "nohup sleep 30 & kill $!; wait $!; echo st=$?").await;
+	// 143: the job died of the TERM `kill` sent, not at its own end.
+	let r = run(&mut s, "nohup sleep 600 & kill $!; wait $!; echo st=$?").await;
 	assert_eq!(r.stdout, "st=143\n");
-	assert!(r.elapsed < Duration::from_secs(5), "took {:?}", r.elapsed);
 }
 
 /// `nohup cmd &` outlives the cancel of the run that started it and the
@@ -247,7 +284,7 @@ async fn nohup_operand_survives_cancel_and_teardown() {
 	let file = dir.path().join("pid");
 	let cancel = CancellationToken::new();
 	let command =
-		format!("nohup sh -c 'echo $$ > {}; exec sleep 30' >/dev/null 2>&1 & wait", file.display());
+		format!("nohup sh -c 'echo $$ > {}; exec sleep 600' >/dev/null 2>&1 & wait", file.display());
 	let trigger = cancel.clone();
 	let probe = async {
 		let pid = pid_in(&file).await;
@@ -258,11 +295,11 @@ async fn nohup_operand_survives_cancel_and_teardown() {
 	let _reap = Reap(pid);
 	assert_ne!(r.status, 0, "the run was cancelled");
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(alive(pid), "the nohup operand died with the cancel");
+	assert!(proc::running(pid), "the nohup operand died with the cancel");
 	assert_eq!(run(&mut s, "echo ok").await.stdout, "ok\n");
 	drop(s);
 	tokio::time::sleep(Duration::from_millis(1500)).await;
-	assert!(alive(pid), "the nohup operand died with the session");
+	assert!(proc::running(pid), "the nohup operand died with the session");
 }
 
 /// Kills a process when dropped (a test's cleanup, even when it fails).
@@ -280,9 +317,9 @@ impl Drop for Reap {
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_of_a_job_spec_ends_the_job() {
 	let mut s = session();
-	let r = run(&mut s, "sleep 30 & kill %1; wait %1; echo st=$?").await;
+	// 143: the job died of the TERM, not at its own end.
+	let r = run(&mut s, "sleep 600 & kill %1; wait %1; echo st=$?").await;
 	assert_eq!(r.stdout, "st=143\n", "{}", r.stderr);
-	assert!(r.elapsed < Duration::from_secs(5), "took {:?}", r.elapsed);
 }
 
 /// pi's `kill_builtin_refuses_*`: no signal reaches pi's own process group or
@@ -301,10 +338,10 @@ async fn kill_refuses_pi_and_its_ancestors() {
 	assert!(r.stdout.contains("probe=0"), "{}", r.stdout);
 	assert!(r.stderr.contains("refusing to signal the shell process"), "{}", r.stderr);
 
-	let mut child = std::process::Command::new("/bin/sleep")
-		.arg("30")
-		.spawn()
-		.unwrap();
+	let mut child =
+		crate::testkit::child::dies_with_this_process(std::process::Command::new("sleep").arg("600"))
+			.spawn()
+			.unwrap();
 	let r = run(&mut s, &format!("kill -TERM {}; echo child=$?", child.id())).await;
 	assert_eq!(r.stdout, "child=0\n", "{}", r.stderr);
 	assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));

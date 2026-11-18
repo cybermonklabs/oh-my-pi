@@ -2066,6 +2066,231 @@ export function capFrameDataBytes(
 }
 
 // ============================================================================
+// Redrawing stored frames
+// ============================================================================
+
+/** Frame edges snapcompact picks by itself: the per-model sizes and the shape
+ *  table's. A caller's `frameSize` or a host's image edge can be any other. */
+const KNOWN_FRAME_SIZES: ReadonlySet<number> = new Set([
+	...MODEL_VARIANTS.flatMap(([, ideal]) => (ideal.frameSize === undefined ? [] : [ideal.frameSize])),
+	...Object.values(SHAPE_VARIANTS).map(variant => variant.frameSize),
+	FRAME_SIZE,
+]);
+
+const VARIANT_GEOMETRIES: readonly ShapeGeometry[] = Object.values(SHAPE_VARIANTS);
+
+/** `base` at frame edge `size`, as a shape {@link render} draws. */
+function shapeAt(base: ShapeGeometry, size: number): Shape {
+	return { ...base, frameSize: size, frameTokenEstimate: FRAME_TOKEN_ESTIMATE };
+}
+
+/** The shape table's geometries that fit `frame`'s recorded font, ink, line
+ *  repeat, layout and dimming. A frame without a font is a legacy 5x8 frame. */
+function frameGeometries(frame: Frame): ShapeGeometry[] {
+	const legacy = SHAPE_VARIANTS["5x8-sent"];
+	const font = frame.font ?? legacy.font;
+	const ink = frame.variant ?? legacy.variant;
+	const lineRepeat = frame.lineRepeat ?? legacy.lineRepeat;
+	return VARIANT_GEOMETRIES.filter(
+		base =>
+			base.font === font &&
+			base.variant === ink &&
+			base.lineRepeat === lineRepeat &&
+			(base.columns ?? 1) === (frame.columns ?? 1) &&
+			(base.stopwordDim ?? false) === (frame.stopwordDim ?? false),
+	);
+}
+
+/** Frame edges at which `base` lays out `frame`'s recorded columns and rows. */
+function frameSizes(frame: Frame, base: ShapeGeometry): number[] {
+	// A doc frame's columns are `(gridCols - DOC_GUTTER) / 2` rounded down, so two grid widths give one count.
+	const gridCols = base.columns === 2 ? 2 * frame.cols + DOC_GUTTER : frame.cols;
+	const gridColsSpan = base.columns === 2 ? 2 : 1;
+	const rowPitch = base.cellHeight * base.lineRepeat;
+	const low = Math.max(gridCols * base.cellWidth, frame.rows * rowPitch);
+	const high = Math.min((gridCols + gridColsSpan) * base.cellWidth, (frame.rows + 1) * rowPitch);
+	const sizes: number[] = [];
+	for (let size = low; size < high; size++) {
+		const laid = geometry(shapeAt(base, size));
+		if (laid.cols === frame.cols && laid.rows === frame.rows) sizes.push(size);
+	}
+	return sizes;
+}
+
+/** Frame edges that lay out every frame of `frames` at its recorded columns
+ *  and rows, the edges snapcompact picks by itself first. */
+function archiveFrameSizes(frames: readonly Frame[]): number[] {
+	let common: number[] | undefined;
+	for (const frame of frames) {
+		const sizes = new Set(frameGeometries(frame).flatMap(base => frameSizes(frame, base)));
+		common = (common ?? [...sizes]).filter(size => sizes.has(size));
+		if (common.length === 0) return [];
+	}
+	return (common ?? []).sort((a, b) => Number(KNOWN_FRAME_SIZES.has(b)) - Number(KNOWN_FRAME_SIZES.has(a)) || a - b);
+}
+
+/** Every shape that draws `frame` at frame edge `size` with its recorded columns
+ *  and rows. Two cells can give one grid at a small edge (an `8x13` cell and an
+ *  `8on16` cell both give 8 by 4 at 64 px), so each is a candidate. */
+function frameShapes(frame: Frame, size: number): Shape[] {
+	return frameGeometries(frame)
+		.map(base => shapeAt(base, size))
+		.filter(shape => {
+			const laid = geometry(shape);
+			return laid.cols === frame.cols && laid.rows === frame.rows;
+		});
+}
+
+function isInkToggle(ch: string | undefined): boolean {
+	return ch === DIM_ON || ch === DIM_OFF;
+}
+
+/**
+ * The imaged middle of a grid archive cut into one slice per frame: the
+ * frame's recorded count of printed characters, then the zero-width ink
+ * toggles up to the next printed one (pagination leaves them on the earlier
+ * page). `undefined` unless the counts consume the middle exactly.
+ */
+function gridSlices(middle: string, frames: readonly Frame[]): string[] | undefined {
+	const chars = [...middle];
+	const slices: string[] = [];
+	let start = 0;
+	for (const frame of frames) {
+		let end = start;
+		let printed = 0;
+		while (end < chars.length && printed < frame.chars) {
+			if (!isInkToggle(chars[end])) printed++;
+			end++;
+		}
+		if (printed < frame.chars) return undefined;
+		while (end < chars.length && isInkToggle(chars[end])) end++;
+		slices.push(chars.slice(start, end).join(""));
+		start = end;
+	}
+	return start === chars.length ? slices : undefined;
+}
+
+/**
+ * The imaged middle of a two-column archive cut into its pages, each wrapped
+ * alone. {@link compact} keeps a doc archive's pages as their words, one space
+ * between lines and one between pages, and may have dropped pages between the
+ * first and the newest, so wrapping the whole middle again would pull the next
+ * kept page's first words onto a page's short last line. Every page but the
+ * newest holds `2 * rows` lines, so its run in the middle is its printed
+ * characters plus the one space each line break became; the newest page is
+ * the rest. `undefined` unless every page wraps back to its recorded lines.
+ */
+function docSlices(middle: string, frames: readonly Frame[]): string[] | undefined {
+	const chars = [...middle];
+	const pages: string[] = [];
+	let start = 0;
+	for (const [index, frame] of frames.entries()) {
+		const newest = index === frames.length - 1;
+		const lines = 2 * frame.rows;
+		let end = chars.length;
+		if (!newest) {
+			const visible = frame.chars + lines - 1;
+			let seen = 0;
+			end = start;
+			while (end < chars.length && seen < visible) {
+				if (!isInkToggle(chars[end])) seen++;
+				end++;
+			}
+			while (end < chars.length && isInkToggle(chars[end])) end++;
+			if (seen < visible || chars[end] !== " ") return undefined;
+		}
+		const wrapped = wrap(
+			chars.slice(start, end).join(""),
+			frame.cols,
+			usesWideCells({ font: frame.font ?? SHAPE_VARIANTS["5x8-sent"].font }),
+		);
+		if (!newest && wrapped.length !== lines) return undefined;
+		pages.push(wrapped.join("\n"));
+		start = end + 1;
+	}
+	return pages;
+}
+
+/**
+ * Every frame's page as {@link compact} handed it to {@link render}, cut back
+ * out of the archive's kept source, oldest first. Each page opens with the ink
+ * state the previous one left, as {@link compact} drew it. `undefined` when the
+ * source does not split into the recorded frames.
+ */
+function framePages(archive: Archive): string[] | undefined {
+	const { text, frames } = archive;
+	const head = archive.textHead ?? "";
+	const tail = archive.textTail ?? "";
+	if (!text || text.length < head.length + tail.length || !text.startsWith(head) || !text.endsWith(tail)) {
+		return undefined;
+	}
+	const middle = text.slice(head.length, text.length - tail.length);
+	const doc = frames.filter(frame => frame.columns === 2).length;
+	if (doc !== 0 && doc !== frames.length) return undefined;
+	const slices = doc === 0 ? gridSlices(middle, frames) : docSlices(middle, frames);
+	if (!slices || slices.length !== frames.length) return undefined;
+	let dimOpen = head.lastIndexOf(DIM_ON) > head.lastIndexOf(DIM_OFF);
+	return slices.map((slice, index) => {
+		const page = dimOpen ? DIM_ON + slice : slice;
+		dimOpen = page.lastIndexOf(DIM_ON) > page.lastIndexOf(DIM_OFF);
+		return archive.frames[index]?.stopwordDim ? dimStopwords(page) : page;
+	});
+}
+
+/** Missing frames tried at every candidate edge before the archive is taken not to draw again. */
+const REDRAW_SETTLE_ATTEMPTS = 3;
+
+/**
+ * Draw the frames at `indexes` again from the archive's kept source text
+ * ({@link Archive.text}), for frames whose stored PNG is gone. Each page is cut
+ * back out of the text in frame order and drawn with its frame's recorded
+ * font, ink, line repeat and layout, at a frame edge that lays out every
+ * frame's recorded columns and rows, with each cell that fits that grid.
+ * `matches` says whether a drawn PNG (base64) is stored frame `index`; only
+ * those are returned. One archive draws all its frames at one edge: the first
+ * missing frame that matches at some edge settles it, after up to
+ * {@link REDRAW_SETTLE_ATTEMPTS} frames that match at none, and the others are
+ * drawn at that edge alone.
+ */
+export async function redrawFrames(
+	archive: Archive,
+	indexes: readonly number[],
+	matches: (index: number, data: string) => boolean,
+): Promise<Map<number, string>> {
+	const redrawn = new Map<number, string>();
+	const pages = indexes.length > 0 && archive.text ? framePages(archive) : undefined;
+	if (!pages) return redrawn;
+	const draw = async (index: number, size: number): Promise<boolean> => {
+		const frame = archive.frames[index];
+		const page = pages[index];
+		if (!frame || page === undefined) return false;
+		for (const shape of frameShapes(frame, size)) {
+			const { data } = await render(page, shape);
+			if (!matches(index, data)) continue;
+			redrawn.set(index, data);
+			return true;
+		}
+		return false;
+	};
+	const sizes = archiveFrameSizes(archive.frames);
+	const tried = new Set<number>();
+	let edge: number | undefined;
+	for (const index of indexes.slice(0, REDRAW_SETTLE_ATTEMPTS)) {
+		tried.add(index);
+		for (const size of sizes) {
+			if (!(await draw(index, size))) continue;
+			edge = size;
+			break;
+		}
+		if (edge !== undefined) break;
+	}
+	if (edge === undefined) return redrawn;
+	const settled = edge;
+	await Promise.all(indexes.filter(index => !tried.has(index)).map(index => draw(index, settled)));
+	return redrawn;
+}
+
+// ============================================================================
 // Compaction entry point
 // ============================================================================
 

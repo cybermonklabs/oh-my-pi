@@ -1,8 +1,14 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { stateDir } from "../config";
 
 export const DEFAULT_PLUGIN_DIR = join(homedir(), ".hermes", "mnemopi", "plugins");
+
+/** The plugin directory a manager without one uses: under a relocated omp config root, else {@link DEFAULT_PLUGIN_DIR}. */
+function defaultPluginDir(): string {
+	return stateDir("plugins", DEFAULT_PLUGIN_DIR);
+}
 
 export type PluginConfig = Record<string, unknown>;
 export type MemoryDict = Record<string, unknown>;
@@ -262,7 +268,7 @@ export type PluginConstructor<T extends MnemopiPlugin = MnemopiPlugin> = new (co
 export class PluginManager {
 	private readonly registry = new Map<string, PluginConstructor>();
 	private readonly instances = new Map<string, MnemopiPlugin>();
-	constructor(private readonly pluginDir = DEFAULT_PLUGIN_DIR) {
+	constructor(private readonly pluginDir = defaultPluginDir()) {
 		this.registerPlugin("logging", LoggingPlugin);
 		this.registerPlugin("metrics", MetricsPlugin);
 		this.registerPlugin("filter", FilterPlugin);

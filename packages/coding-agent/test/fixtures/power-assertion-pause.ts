@@ -2,6 +2,7 @@ import { spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, agentPauseGate, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -55,10 +56,15 @@ const agent = new Agent({
 });
 const settings = Settings.isolated({ "compaction.enabled": false, "power.sleepPrevention": "idle" });
 using tempDir = TempDir.createSync("@omp-power-pause-");
+// The model cache is SQLite's in-memory database, which lives as long as the connection retained
+// here, so opening it waits on no disk sync (on disk it costs 11 of them, which a loaded machine
+// can stretch past the test's timeout).
+const modelCacheDb = ":memory:";
+using _modelCache = retainModelCacheConnection(modelCacheDb);
 const session = new AgentSession({
 	agent,
 	sessionManager: SessionManager.inMemory(),
-	modelRegistry: new ModelRegistry(auth, tempDir.join("models.yml")),
+	modelRegistry: new ModelRegistry(auth, tempDir.join("models.yml"), { cacheDbPath: modelCacheDb }),
 	settings,
 	toolRegistry: new Map([[tool.name, tool]]),
 });

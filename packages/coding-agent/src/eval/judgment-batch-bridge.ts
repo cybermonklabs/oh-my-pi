@@ -20,6 +20,7 @@ import type { ImageContent, JudgmentState, Question } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
 import type { ChainJudge } from "../judgment";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -302,11 +303,14 @@ export class JudgmentBatch {
 		return out;
 	}
 
-	/** Abort in-flight items, settle everything unstarted as cancelled, and cancel the async job. */
+	/**
+	 * Abort in-flight items, settle everything unstarted as cancelled, and cancel the async job:
+	 * a stop, which is what the cancel means, though the batch's judge calls start no subagent.
+	 */
 	cancel(): boolean {
 		if (!this.#running || this.#controller.signal.aborted) return false;
 		this.#controller.abort(new ToolError("judge_batch cancelled"));
-		this.#session.asyncJobManager?.cancel(this.id, { ownerId: this.ownerId });
+		this.#session.asyncJobManager?.cancel(this.id, { ownerId: this.ownerId }, plainTurnAbortReason("stop"));
 		return true;
 	}
 

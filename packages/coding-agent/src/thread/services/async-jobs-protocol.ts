@@ -132,7 +132,7 @@ export type AsyncJobManagerProtocol = {
 		],
 		string
 	>;
-	cancel: RpcMethod<[id: string, filter: AsyncJobFilter | undefined], boolean>;
+	cancel: RpcMethod<[id: string, filter: AsyncJobFilter | undefined, reason: unknown], boolean>;
 	getJob: RpcMethod<[id: string], AsyncJobWire | undefined>;
 	getRunningJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	getRecentJobs: RpcMethod<[limit: number | undefined, filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
@@ -154,9 +154,11 @@ export type AsyncJobManagerProtocol = {
 		[ownerId: string, options: { timeoutMs?: number; excludeSuppressed?: boolean } | undefined],
 		boolean
 	>;
-	cancelAndReapOwnerJobs: RpcMethod<[ownerId: string, deadlineAt: number], AsyncJobReapResult>;
+	cancelAndReapOwnerJobs: RpcMethod<[ownerId: string, deadlineAt: number, reason: unknown], AsyncJobReapResult>;
 	drainDeliveries: RpcMethod<[options: { timeoutMs?: number; filter?: AsyncJobFilter } | undefined], boolean>;
 	isDeliverySuppressed: RpcMethod<[jobId: string], boolean>;
+	isDeliveryPending: RpcMethod<[jobId: string], boolean>;
+	isDeliverySuperseded: RpcMethod<[jobId: string], boolean>;
 	/** Resolves once the job's run promise settled (immediately for unknown ids). */
 	whenSettled: RpcMethod<[jobId: string], void>;
 	/** The job's abort signal in wire form, or undefined for unknown ids. */

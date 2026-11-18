@@ -22,6 +22,44 @@ const SUBREAPER_KILL_WINDOW_MS = 100;
 const SUBREAPER_KILL_POLL_MS = 5;
 
 /**
+ * `root`'s children, or `undefined` when the walk could not read every candidate (the natives
+ * throw then, with no descriptor left say): a sweep that gets `undefined` reads again at its
+ * next pass instead of ending. A handle that cannot even tell whether its process runs is
+ * unusable (a class of another realm, say): its error is rethrown, for the caller's fallback
+ * that signals the process directly.
+ */
+function childrenOf(root: Process): Process[] | undefined {
+	try {
+		return root.children();
+	} catch (error) {
+		throwIfUnusable(root, error);
+		return undefined;
+	}
+}
+
+/**
+ * `process.killTree(signal)`, going on past a walk it could not finish: it already signalled
+ * every process it read, and the process group the root leads. An unusable handle's error is
+ * rethrown ({@link childrenOf}).
+ */
+function signalTree(process: Process, signal?: number): void {
+	try {
+		process.killTree(signal);
+	} catch (error) {
+		throwIfUnusable(process, error);
+	}
+}
+
+/** Rethrows `error` when `process`'s handle cannot be used at all: its `status()` fails too. */
+function throwIfUnusable(process: Process, error: unknown): void {
+	try {
+		process.status();
+	} catch {
+		throw error;
+	}
+}
+
+/**
  * Build the Linux child-subreaper entrypoint.
  *
  * @internal Exported so tests can force a missing first libc soname and verify
@@ -340,6 +378,9 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	kill(reason?: Exception, gracefulMs?: number) {
+		// A kill makes the exit promise reject. Its caller may wait later or never,
+		// as with a signal or a deadline, so that rejection is never left unhandled.
+		this.#exited.catch(() => {});
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
@@ -392,7 +433,10 @@ export class ChildProcess<In extends InMask = InMask> {
 		if (this.proc.exitCode !== null && this.#windowsRootProcess && this.#openPipeReaders > 0) {
 			// The retained handle keeps the dead root PID reserved, making the
 			// Windows Toolhelp descendant walk identity-safe after root exit.
-			this.#windowsRootProcess.killTree();
+			// The root is dead: an unusable handle leaves nothing to signal.
+			try {
+				signalTree(this.#windowsRootProcess);
+			} catch {}
 			this.#terminating = Promise.resolve();
 			return;
 		}
@@ -448,33 +492,47 @@ export class ChildProcess<In extends InMask = InMask> {
 	 * A subreaper with no child has not launched the command yet (or the
 	 * command has ended). It is looked at again while frozen with SIGSTOP and,
 	 * when still childless, killed, so a command cancelled before its launch
-	 * never starts. Freeze, kill and resume all go through `root`, the native
-	 * handle pinned to the subreaper's identity, never through the numeric pid:
-	 * once the subreaper has been reaped and its pid reused, they signal
-	 * nothing. The resume runs on every way out of the frozen section,
-	 * including a throw; it is a no-op on a killed subreaper. The grace timer is
-	 * cleared as soon as the sequence moves on, so a finished stop never keeps
-	 * the caller's process alive.
+	 * never starts. The subreaper leads its own process group (see `subreaper`),
+	 * so the native freeze and kill also signal that group. Linux delivers a
+	 * group signal to the child of a fork in progress, and restarts that fork if
+	 * the signal comes first, so the freeze and the kill reach a command the
+	 * subreaper is launching even when another process resumes it between them.
+	 * Signalling the subreaper alone would not: SIGSTOP does not end a fork in
+	 * progress, and its child can appear after the read. The one escape is a
+	 * command that leaves the group (setsid or setpgid, as coreutils `timeout`
+	 * and job-control shells do) after its fork and before the kill, which needs
+	 * another process to resume the frozen subreaper in that window.
+	 * Freeze, kill and resume all go through `root`, the native handle pinned to
+	 * the subreaper's identity, never through a pid this code holds: once the
+	 * subreaper has been reaped and its pid reused, they signal nothing. The
+	 * handle signals the group only while it sees the subreaper running, and
+	 * the group is named by the subreaper's own pid, which a running process
+	 * keeps. The resume runs on every way out of the frozen section, including
+	 * a throw; it is a no-op on a killed subreaper. The grace timer is cleared
+	 * as soon as the sequence moves on, so a finished stop never keeps the
+	 * caller's process alive.
 	 */
 	async #stopSubreaperTree(root: Process, gracefulMs: number, escalated: Promise<void>): Promise<void> {
-		let children = root.children();
-		if (children.length === 0) {
+		// A walk that could not read every candidate (`undefined`) is no stop that failed: the
+		// waves signalled what they read, and the hard sweep reads again at each pass.
+		let children = childrenOf(root);
+		if (children?.length === 0) {
 			try {
-				root.killTree(os.constants.signals.SIGSTOP);
-				children = root.children();
-				if (children.length === 0) {
-					root.killTree(9);
+				signalTree(root, os.constants.signals.SIGSTOP);
+				children = childrenOf(root);
+				if (children?.length === 0) {
+					signalTree(root, 9);
 					return;
 				}
 				// It launched the command just before the freeze: the first wave
 				// goes to the snapshot taken while it cannot fork.
-				for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+				for (const child of children ?? []) signalTree(child, gracefulMs < 0 ? 9 : 15);
 			} finally {
-				root.killTree(os.constants.signals.SIGCONT);
+				signalTree(root, os.constants.signals.SIGCONT);
 			}
 		} else {
 			// The subreaper launches one command; once it has a child, no later launch can escape the snapshot.
-			for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+			for (const child of children ?? []) signalTree(child, gracefulMs < 0 ? 9 : 15);
 		}
 		if (gracefulMs >= 0) {
 			const { promise: graceOver, resolve: endGrace } = Promise.withResolvers<void>();
@@ -493,17 +551,18 @@ export class ChildProcess<In extends InMask = InMask> {
 			const deadline = Date.now() + SUBREAPER_KILL_WINDOW_MS;
 			let emptySweeps = 0;
 			while (emptySweeps < 2 && Date.now() < deadline) {
-				const children = root.children();
-				if (children.length === 0) {
+				const children = childrenOf(root);
+				// A sweep that could not read every child is no empty one: the next reads again.
+				if (children?.length === 0) {
 					emptySweeps++;
 				} else {
 					emptySweeps = 0;
-					for (const child of children) child.killTree(9);
+					for (const child of children ?? []) signalTree(child, 9);
 				}
 				if (emptySweeps < 2) await Bun.sleep(SUBREAPER_KILL_POLL_MS);
 			}
 		} finally {
-			root.killTree(9);
+			signalTree(root, 9);
 		}
 	}
 
@@ -752,6 +811,15 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * remain reachable after changing session and reparenting. Other platforms
 	 * ignore this option. macOS process groups cannot retain a daemonized
 	 * descendant that creates a new session and reparents to launchd.
+	 *
+	 * On Linux, `subreaper` implies `detached`: the subreaper always leads its
+	 * own process group and session. A stop signals that group, and Linux
+	 * delivers a group signal to a child that a fork in progress adds, so a kill
+	 * cannot miss a command the subreaper is launching. The new session has no
+	 * controlling terminal, so the command cannot open `/dev/tty`, and terminal
+	 * job control (Ctrl-C, Ctrl-Z) and a terminal hangup (SIGHUP) no longer reach
+	 * it directly; stop it with `kill()`, `signal` or `timeout`. `detached:
+	 * false` with `subreaper` contradicts this and is refused on every platform.
 	 */
 	subreaper?: boolean;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
@@ -764,14 +832,20 @@ function spawnInternal<In extends InMask = InMask>(
 	retainFullStderr: boolean,
 ): ChildProcess<In> {
 	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
+	if (subreaper && detached === false) {
+		throw new Error("subreaper implies detached: the subreaper leads its own process group (omit detached: false)");
+	}
 	const useSubreaper = subreaper && process.platform === "linux";
+	// A subreaper leads its own group, so the stop's freeze and kill reach the
+	// command it is forking (see `subreaper`).
+	const leadsGroup = detached === true || useSubreaper;
 	const commandEnv = rest.env ?? Bun.env;
 	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		windowsHide: true,
-		detached,
+		detached: leadsGroup,
 		...rest,
 		env: useSubreaper
 			? {
@@ -782,7 +856,7 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, leadsGroup, useSubreaper);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;

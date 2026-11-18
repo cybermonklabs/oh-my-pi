@@ -15,6 +15,7 @@ import {
 	type OAuthAccountIdentity,
 	type OAuthAccountSummary,
 	type ResetCreditRedeemOutcome,
+	isAutoDisabledCredential,
 	isWithinUsageReserve,
 	resolveCredentialIdentityKey,
 	resolveUsedFraction,
@@ -59,6 +60,7 @@ import {
 	accountIdentityLabel,
 	collectStoredAccounts,
 	collectUnreportedAccounts,
+	hasActiveAccount,
 	selectReportableAccounts,
 	type UsageAccountIdentity,
 } from "../slash-commands/helpers/usage-accounts";
@@ -201,6 +203,7 @@ function collectIdentityStrings(
 		}
 	}
 	for (const account of accounts) {
+		add(account.identityKey);
 		add(account.email);
 		add(account.accountId);
 		add(account.projectId);
@@ -209,6 +212,7 @@ function collectIdentityStrings(
 		add(account.enterpriseUrl);
 	}
 	for (const summary of disabled) {
+		add(summary.identityKey);
 		add(summary.email);
 		add(summary.accountId);
 		add(summary.orgId);
@@ -585,38 +589,13 @@ function formatReloginDeadline(
 }
 
 /**
- * Tombstones worth a row in `omp usage`: OAuth credentials torn down
- * automatically (refresh failure, upstream invalidation). Rows the user
- * replaced or deleted deliberately are lifecycle noise, not lost capacity.
+ * Tombstones worth a row in `omp usage`: credentials torn down automatically
+ * ({@link isAutoDisabledCredential}) whose account has no active credential
+ * ({@link hasActiveAccount}). Rows the user replaced or deleted deliberately are
+ * lifecycle noise, not lost capacity.
  */
-function isActionableDisable(summary: DisabledCredentialSummary, activeAccounts: UsageAccountIdentity[] = []): boolean {
-	if (summary.type !== "oauth") return false;
-	if (/^(replaced by|deleted by user)/i.test(summary.cause)) return false;
-
-	// Do not display tombstone if there is an active account for the same provider
-	// matching the same identity (email, accountId, or org).
-	const summaryEmail = summary.email?.toLowerCase();
-	const summaryAccountId = summary.accountId?.toLowerCase();
-	const summaryOrgId = summary.orgId?.toLowerCase();
-
-	const matchesActive = activeAccounts.some(account => {
-		if (account.provider !== summary.provider) return false;
-
-		const accountEmail = account.email?.toLowerCase();
-		const accountAccountId = account.accountId?.toLowerCase();
-		const accountOrgId = account.orgId?.toLowerCase();
-
-		// If email or accountId match, it's the same identity
-		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
-		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
-
-		// Fallback: if orgId matches and neither email nor accountId contradicts
-		if (summaryOrgId && accountOrgId && summaryOrgId === accountOrgId) return true;
-
-		return false;
-	});
-
-	return !matchesActive;
+function isActionableDisable(summary: DisabledCredentialSummary, accounts: readonly UsageAccountIdentity[]): boolean {
+	return isAutoDisabledCredential(summary) && !hasActiveAccount(summary, accounts);
 }
 
 /** Human-sized disable cause: the upstream `error_description` when embedded, else the first clause. */
@@ -1688,6 +1667,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				trimmed = trimmed.map(report => redactReportForJson(report, redaction));
 				unreportedAccounts = unreportedAccounts.map(account => ({
 					...account,
+					identityKey: maskIdentity(redaction, account.identityKey),
 					email: maskIdentity(redaction, account.email),
 					accountId: maskIdentity(redaction, account.accountId),
 					projectId: maskIdentity(redaction, account.projectId),
@@ -1706,6 +1686,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			if (redaction) {
 				disabledForJson = disabledForJson.map(summary => ({
 					...summary,
+					identityKey: maskIdentity(redaction, summary.identityKey),
 					email: maskIdentity(redaction, summary.email),
 					accountId: maskIdentity(redaction, summary.accountId),
 					orgId: maskIdentity(redaction, summary.orgId),
