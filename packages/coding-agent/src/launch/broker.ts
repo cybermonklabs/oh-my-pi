@@ -90,6 +90,10 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
+	/** `null` until the child has exited. */
+	readonly exitCode: number | null;
+	/** `null` until the child has exited, or when it exited on its own. */
+	readonly signalCode: string | null;
 	unref(): void;
 }
 
@@ -170,7 +174,7 @@ function settledState(state: DaemonSnapshot["state"]): boolean {
 type DaemonPin =
 	/** The daemon, running and pinned: a kill through `process` reaches it alone. */
 	| { kind: "pinned"; process: Process }
-	/** Running (signal 0 reaches its pid), but not pinnable now: kill nothing by its pid. */
+	/** Running (signal 0 reaches its pid), but not known to be the daemon now: kill nothing by its pid. */
 	| { kind: "unpinned" }
 	/** Exited, or its pid now names another process (a start mark not the daemon's). */
 	| { kind: "gone" };
@@ -182,8 +186,10 @@ type DaemonPin =
  * `kill(pid, 0)` asks the kernel (`EPERM` is another user's process holding the number, never
  * the daemon this broker started). A pinned process whose start mark is not the recorded one
  * reused the pid: the daemon is gone. The mark is the kernel's own (`Process.startMark`), so no
- * clock is compared and a step of the wall clock changes nothing. Without a recorded mark
- * (a record from an older broker), the pin is trusted.
+ * clock is compared and a step of the wall clock changes nothing. A process that runs while no
+ * mark can be compared is unpinned, never trusted and never taken for gone: a record with no
+ * mark (from a broker before marks, or whose mark could not be read at spawn), or a mark that
+ * cannot be read now (the boot id unreadable); a later refresh tries again.
  */
 function pinDaemon(target: { pid?: number; processStart?: string }): DaemonPin {
 	const pid = target.pid;
@@ -191,9 +197,9 @@ function pinDaemon(target: { pid?: number; processStart?: string }): DaemonPin {
 	const processRef = Process.fromPid(pid);
 	if (processRef) {
 		if (processRef.status() !== "running") return { kind: "gone" };
-		if (target.processStart !== undefined && processRef.startMark !== target.processStart) {
-			return { kind: "gone" };
-		}
+		const mark = processRef.startMark;
+		if (target.processStart === undefined || mark === null) return { kind: "unpinned" };
+		if (mark !== target.processStart) return { kind: "gone" };
 		return { kind: "pinned", process: processRef };
 	}
 	try {
@@ -207,6 +213,25 @@ function pinDaemon(target: { pid?: number; processStart?: string }): DaemonPin {
 /** The start mark of the process `pid` this broker just spawned, or `undefined` when it cannot be read. */
 function startMarkOf(pid: number | undefined): string | undefined {
 	return pid === undefined ? undefined : (Process.fromPid(pid)?.startMark ?? undefined);
+}
+
+/**
+ * Reads the start mark of `record`'s daemon if its record has none (the read failed at spawn),
+ * while this broker still holds the daemon as its own child that has not exited: an unreaped
+ * child keeps its pid, so the process at that pid, whose parent is this broker, is the daemon.
+ * Once the child exited, or for a daemon this broker did not spawn, no mark is read: one read
+ * then could be another process's.
+ */
+function markOwnChild(record: { snapshot: DaemonSnapshot; process?: ManagedProcess }): boolean {
+	const { snapshot, process: child } = record;
+	if (snapshot.processStart !== undefined || snapshot.pid === undefined || !child) return false;
+	if (child.pid !== snapshot.pid || child.exitCode !== null || child.signalCode !== null) return false;
+	const processRef = Process.fromPid(snapshot.pid);
+	if (!processRef || processRef.ppid !== process.pid || processRef.status() !== "running") return false;
+	const mark = processRef.startMark;
+	if (mark === null) return false;
+	snapshot.processStart = mark;
+	return true;
 }
 
 /**
@@ -1113,13 +1138,15 @@ class DaemonBroker {
 	}
 
 	/**
-	 * Brings `record` up to date with its process: retries the kills it could
-	 * not pin the daemon for ({@link ManagedDaemon.pendingKills}), then, for a
+	 * Brings `record` up to date with its process: reads a start mark it could
+	 * not read at spawn ({@link #refreshMark}), retries the kills it could not
+	 * pin the daemon for ({@link ManagedDaemon.pendingKills}), then, for a
 	 * detached daemon this broker does not hold, reads its output and settles
 	 * it once it is gone.
 	 */
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
 		if (settledState(record.snapshot.state)) return;
+		this.#refreshMark(record);
 		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
 		if (!record.spec.detached) return;
 		const generation = record.generation;
@@ -1127,6 +1154,21 @@ class DaemonBroker {
 		if (generation !== record.generation || record.process) return;
 		if (pinDaemon(record.snapshot).kind !== "gone") return;
 		await this.#settle(record, generation);
+	}
+
+	/**
+	 * {@link markOwnChild}: a mark read for the broker's own child is
+	 * persisted, and given to the pending kills of the same daemon, which
+	 * then pin it.
+	 */
+	#refreshMark(record: ManagedDaemon): void {
+		if (!markOwnChild(record)) return;
+		for (const pending of record.pendingKills) {
+			if (pending.generation === record.generation && pending.target.pid === record.snapshot.pid) {
+				pending.target.processStart ??= record.snapshot.processStart;
+			}
+		}
+		this.#persist(record);
 	}
 
 	/**
@@ -1444,6 +1486,7 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
+				this.#refreshMark(record);
 				const pin = pinDaemon(record.snapshot);
 				if (pin.kind === "unpinned") {
 					throw new Error(`Daemon ${operation.name} runs, but cannot be pinned to signal it now`);

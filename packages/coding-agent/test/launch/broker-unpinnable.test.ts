@@ -59,22 +59,41 @@ function signalReaches(pid: number): boolean {
 
 /**
  * `Process.fromPid` for `pid`, failing (as with no descriptor left) while `pinnable.now` is
- * false, and counting the failures; every other pid pins as usual.
+ * false, and counting the failures; while `pinnable.markless` is true, it pins but its
+ * `startMark` cannot be read (`null`, as with the boot id unreadable). Every other pid pins as
+ * usual.
  */
 function spyOnPin(pid: () => number | undefined) {
 	const realFromPid = Process.fromPid.bind(Process);
-	const pinnable = { now: true, failures: 0 };
+	const pinnable = { now: true, failures: 0, markless: false };
 	const spy = spyOn(Process, "fromPid").mockImplementation(candidate => {
-		if (pinnable.now || candidate !== pid()) return realFromPid(candidate);
+		if (candidate !== pid()) return realFromPid(candidate);
+		if (!pinnable.now) {
+			pinnable.failures++;
+			return null;
+		}
+		const real = realFromPid(candidate);
+		if (!real || !pinnable.markless) return real;
 		pinnable.failures++;
-		return null;
+		return new Proxy(real, {
+			get(target, key) {
+				if (key === "startMark") return null;
+				const value = Reflect.get(target, key, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
 	});
 	return { pinnable, spy };
 }
 
 interface Broker {
 	client: DaemonBrokerClient;
-	pinnable: { now: boolean; failures: number };
+	pinnable: { now: boolean; failures: number; markless: boolean };
+}
+
+/** Until `pid` no longer runs (reaped, or a zombie): the test runner bounds the wait. */
+async function untilNotRunning(pid: number): Promise<void> {
+	while (Process.fromPid(pid)?.status() === "running") await Bun.sleep(20);
 }
 
 /**
@@ -187,20 +206,98 @@ describe("daemon broker with a detached daemon it cannot pin", () => {
 			broker.pinnable.now = true;
 			const settled = await waitForExit(broker.client);
 			expect({ state: settled.state, pid: settled.pid }).toEqual({ state: "exited", pid: undefined });
-			expect(signalReaches(pid)).toBe(false);
+			// Killed: it no longer runs (a zombie not yet reaped counts as ended).
+			await untilNotRunning(pid);
+		});
+	}, 20_000);
+
+	it("stops a detached daemon whose mark cannot be read through a later pin, never taking it for gone", async () => {
+		await withRecoveredDetachedDaemon("refresh", async (broker, pid) => {
+			// The daemon pins, but its mark cannot be read (the boot id unreadable): no mark
+			// to compare, so the stop kills nothing and the record stays.
+			broker.pinnable.now = true;
+			broker.pinnable.markless = true;
+			const stopped = await broker.client.request({ op: "stop", name: NAME, timeoutMs: 200 });
+			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
+			await expectRunningUnpinned(broker, pid, "stopping");
+			// Once the mark reads again, a refresh pins the daemon and kills it.
+			broker.pinnable.markless = false;
+			const settled = await waitForExit(broker.client);
+			expect({ state: settled.state, pid: settled.pid }).toEqual({ state: "exited", pid: undefined });
+			await untilNotRunning(pid);
 		});
 	}, 20_000);
 });
 
+describe("daemon broker with a daemon whose mark could not be read at spawn", () => {
+	for (const detached of [true, false]) {
+		it(`reads the mark of its own ${detached ? "detached" : "pipe"} daemon at a later refresh`, async () => {
+			using tempDir = TempDir.createSync("@omp-launch-nomark-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			const previousTitle = process.title;
+			// Every pin fails while `failing.now` (as with no descriptor left) but the test's own.
+			const realFromPid = Process.fromPid.bind(Process);
+			const failing = { now: true };
+			const spy = spyOn(Process, "fromPid").mockImplementation(candidate =>
+				failing.now && candidate !== process.pid ? null : realFromPid(candidate),
+			);
+			const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+			const broker = startBroker(projectDir, runtimeDir);
+			let pid: number | undefined;
+			try {
+				const started = await client.request({
+					op: "start",
+					spec: {
+						name: NAME,
+						application: "sleep",
+						args: ["600"],
+						env: {},
+						cwd: projectDir,
+						pty: false,
+						restart: "no",
+						persist: true,
+						detached,
+					},
+				});
+				if (started.op !== "start") throw new Error(`unexpected result: ${started.op}`);
+				pid = started.daemon.pid;
+				if (pid === undefined) throw new Error("the daemon has no pid");
+				expect(started.daemon.processStart).toBeUndefined();
+				failing.now = false;
+				// The broker still holds its child, which has not exited: the refresh reads
+				// the mark, and persists it.
+				const mark = realFromPid(pid)?.startMark;
+				expect((await snapshotOf(client)).processStart).toBe(mark ?? "no mark");
+				const meta = JSON.parse(await Bun.file(path.join(runtimeDir, "daemons", NAME, "meta.json")).text());
+				expect(meta.daemon.processStart).toBe(mark ?? "no mark");
+				// And the daemon stops through its pin.
+				const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 2_000 });
+				if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
+				expect(["exited", "failed"]).toContain(stopped.daemon.state);
+				await untilNotRunning(pid);
+			} finally {
+				spy.mockRestore();
+				await client.request({ op: "shutdown" }).catch(() => undefined);
+				client.close();
+				await broker;
+				process.title = previousTitle;
+			}
+		}, 20_000);
+	}
+});
+
 /**
  * The non-detached daemon of a previous broker that died without stopping it, recorded as running
- * with the start mark `recordedStart` gives for it (its own, or another process's): here a process
- * of its own session (as the broker spawns daemons) that the test starts now, recovered under a
- * fresh broker whose pin of it fails while `pinnable.now` is false (when the broker recovers,
- * `pinnable.now` is `pinnableAtRecovery`). It sleeps past the test runner's bound.
+ * with the start mark `recordedStart` gives for it (its own, another process's, or none, as a
+ * broker from before marks wrote it): here a process of its own session (as the broker spawns
+ * daemons) that the test starts now, recovered under a fresh broker whose pin of it fails while
+ * `pinnable.now` is false (when the broker recovers, `pinnable.now` is `pinnableAtRecovery`). It
+ * sleeps past the test runner's bound.
  */
 async function withRecoveredOrphan(
-	recordedStart: (orphanMark: string) => string,
+	recordedStart: (orphanMark: string) => string | undefined,
 	pinnableAtRecovery: boolean,
 	body: (broker: Broker, orphan: Bun.Subprocess) => Promise<void>,
 ): Promise<void> {
@@ -212,7 +309,7 @@ async function withRecoveredOrphan(
 	const now = Date.now();
 	const orphan = Bun.spawn(["sleep", "600"], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
 	const orphanMark = Process.fromPid(orphan.pid)?.startMark;
-	if (orphanMark === undefined) throw new Error("the orphan cannot be pinned");
+	if (orphanMark == null) throw new Error("the orphan cannot be pinned");
 	const dir = path.join(runtimeDir, "daemons", NAME);
 	await Bun.write(
 		path.join(dir, "spec.json"),
@@ -289,12 +386,41 @@ describe("daemon broker with a non-detached daemon of a previous broker it canno
 		);
 	}, 20_000);
 
+	it("keeps a recovered record with no mark, and kills nothing by its pid", async () => {
+		// A broker from before marks recorded no mark: whatever process holds the pid now is not
+		// known to be the daemon, so recovery kills nothing; the record stays, running, until the
+		// process at its pid is gone.
+		await withRecoveredOrphan(
+			() => undefined,
+			true,
+			async (broker, orphan) => {
+				for (let refresh = 0; refresh < 5; refresh++) {
+					const daemon = await snapshotOf(broker.client);
+					expect({ state: daemon.state, pid: daemon.pid, mark: daemon.processStart }).toEqual({
+						state: "running",
+						pid: orphan.pid,
+						mark: undefined,
+					});
+				}
+				expect({ exitCode: orphan.exitCode, alive: signalReaches(orphan.pid) }).toEqual({
+					exitCode: null,
+					alive: true,
+				});
+				// Once the process at its pid ends, the record is reaped.
+				orphan.kill("SIGKILL");
+				await orphan.exited;
+				const reaped = await waitForExit(broker.client);
+				expect({ state: reaped.state, pid: reaped.pid, exitReason: reaped.exitReason }).toEqual(REAPED);
+			},
+		);
+	}, 20_000);
+
 	it("kills no process that took the pid after the recorded daemon", async () => {
 		// The record names the start mark of another process (the test's own) than the one now
 		// holding its pid, so that one reused the pid: the daemon is gone, and its record is
 		// reaped without a kill, whether recovery pins the process or a later refresh does.
 		const another = Process.fromPid(process.pid)?.startMark;
-		if (another === undefined) throw new Error("the test process cannot be pinned");
+		if (another == null) throw new Error("the test process cannot be pinned");
 		const outcomes: unknown[] = [];
 		for (const pinnableAtRecovery of [true, false]) {
 			await withRecoveredOrphan(

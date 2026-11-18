@@ -1160,12 +1160,13 @@ async fn a_long_line_refused_for_its_interpreter_is_not_split() {
 	}
 }
 
-/// A script without `#!` that xargs runs, directly or under `timeout` or
-/// `nohup`, gets the name it was given as `$0`, as from GNU's utilities: a
-/// name with `/` runs as written, not by the absolute path it was found at.
+/// A script without `#!` gets as its `$0` the path it ran by, as at
+/// 9058ab9d: xargs runs a program by the path its lookup found (a name
+/// with `/` joined to the working directory), while `timeout` and `nohup`
+/// run a name with `/` as written, through the shell's `exec`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_script_without_a_shebang_keeps_its_name_as_dollar_zero() {
+async fn a_script_without_a_shebang_gets_the_path_it_ran_by_as_dollar_zero() {
 	use std::os::unix::fs::PermissionsExt as _;
 
 	let dir = tempfile::tempdir().unwrap();
@@ -1173,9 +1174,49 @@ async fn a_script_without_a_shebang_keeps_its_name_as_dollar_zero() {
 	std::fs::write(&script, "echo \"0=$0\"\n").unwrap();
 	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 	let mut s = session_in(dir.path(), &[]);
-	for wrapper in ["", "timeout 5 ", "nohup "] {
+	let found = format!("0={}/./ns\n", dir.path().display());
+	for (wrapper, zero) in [("", found.as_str()), ("timeout 5 ", "0=./ns\n"), ("nohup ", "0=./ns\n")]
+	{
 		let ran = run(&mut s, &format!("echo x | xargs {wrapper}./ns")).await;
-		assert_eq!((ran.status, ran.stdout.as_str()), (0, "0=./ns\n"), "{wrapper}: {}", ran.stderr);
+		assert_eq!((ran.status, ran.stdout.as_str()), (0, zero), "{wrapper}: {}", ran.stderr);
+	}
+}
+
+/// A `#!` interpreter that does not exist, under xargs and `find -exec`,
+/// `-exec ;` and `-execdir`: the shell's diagnostic names the path the
+/// program ran by, byte for byte as at 9058ab9d (measured there), in the C
+/// and UTF-8 locales, with base's statuses.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_interpreter_is_reported_as_at_base() {
+	let dir = cannot_run_dir();
+	let p = dir.path().display().to_string();
+	let said = |path: &str| {
+		format!(
+			"bash: {path}: /nonexistent/interpreter: bad interpreter: No such file or directory\n"
+		)
+	};
+	let by_path = said(&format!("{p}/./mi"));
+	let cases = [
+		("printf 'a\\nb\\n' | xargs -n1 ./mi", 123, by_path.repeat(2)),
+		("find findroot -name f1 -exec ./mi {} +", 1, by_path.clone()),
+		("find findroot -name f1 -exec ./mi {} \\;", 0, by_path.clone()),
+		(
+			"find findroot -name f2 -execdir ../../mi {} +",
+			1,
+			said(&format!("{p}/findroot/a/../../mi")),
+		),
+	];
+	for locale in ["C", "C.UTF-8"] {
+		let mut s = session_in(dir.path(), &[("LC_ALL", locale)]);
+		for (command, status, stderr) in &cases {
+			let ran = run(&mut s, command).await;
+			assert_eq!(
+				(ran.status, ran.stderr.as_str()),
+				(*status, stderr.as_str()),
+				"{locale} {command}"
+			);
+		}
 	}
 }
 

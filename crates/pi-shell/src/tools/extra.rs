@@ -369,10 +369,11 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 
 /// Appends to `source` the `exec` of the program at `path` in place of the
 /// first `skip` words of `args` (its positional parameters, rewritten to
-/// match), presented as `argv0` or else as the name it was asked for. A
-/// name with a separator runs as given, from the working directory it was
-/// looked up in, so a script without `#!` gets it as its `$0`, as from
-/// GNU's utilities; a name found on `PATH` runs by the path found.
+/// match), presented as `argv0` or else as the name it was asked for. The
+/// program runs by the path it was found at (for a name with a separator,
+/// joined to the working directory it was looked up in), as at 9058ab9d:
+/// the shell names that path in its diagnostics, and a script without `#!`
+/// gets it as its `$0`.
 fn exec_source(
 	source: &mut Vec<u8>,
 	args: &mut Vec<BString>,
@@ -389,9 +390,7 @@ fn exec_source(
 	source.extend_from_slice(b"\\builtin exec -a ");
 	quote(source, &argv0);
 	source.extend_from_slice(b" -- \"$@\"");
-	if !has_separator(&args[0].to_os_str_lossy()) {
-		args[0] = os_bytes(path.as_os_str());
-	}
+	args[0] = os_bytes(path.as_os_str());
 }
 
 /// fd 0 of a command: the null device unless the utility gave one. A host

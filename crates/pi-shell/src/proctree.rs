@@ -900,6 +900,24 @@ mod platform {
 	}
 }
 
+/// This boot's id (`/proc/sys/kernel/random/boot_id`), read once per
+/// process: a read that fails (no descriptor left, a sandbox that hides
+/// the file) is `None` and tried again at the next call; the first that
+/// succeeds is kept, so no later failure can change a mark.
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<&'static str> {
+	static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+	if let Some(id) = BOOT_ID.get() {
+		return Some(id);
+	}
+	let read = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+	let id = read.trim();
+	if id.is_empty() {
+		return None;
+	}
+	Some(BOOT_ID.get_or_init(|| id.to_owned()))
+}
+
 /// Stable process reference.
 #[derive(Clone)]
 pub struct Process {
@@ -941,21 +959,23 @@ impl Process {
 	}
 
 	/// The kernel's start mark of this process, read when it was pinned: on
-	/// Linux the boot's id (`/proc/sys/kernel/random/boot_id`) and the start
-	/// in clock ticks since that boot; on macOS and Windows the start time
-	/// the kernel recorded. A pid recorded with this mark names this process
+	/// Linux the boot's id (`/proc/sys/kernel/random/boot_id`, read once per
+	/// process: it cannot change while this process runs) and the start in
+	/// clock ticks since that boot; on macOS and Windows the start time the
+	/// kernel recorded. A pid recorded with this mark names this process
 	/// alone: one that reused the pid has another. No clock is compared, so
-	/// a step of the wall clock changes nothing.
+	/// a step of the wall clock changes nothing. `None` when the boot id
+	/// cannot be read (no descriptor left, a sandbox that hides it): no mark
+	/// is known, which proves nothing about the process.
 	#[must_use]
-	pub fn start_mark(&self) -> String {
+	pub fn start_mark(&self) -> Option<String> {
 		#[cfg(target_os = "linux")]
 		{
-			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-			format!("{}:{}", boot.trim(), self.inner.start_ticks())
+			boot_id().map(|boot| format!("{boot}:{}", self.inner.start_ticks()))
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
-			self.inner.start_ticks().to_string()
+			Some(self.inner.start_ticks().to_string())
 		}
 	}
 
@@ -1830,10 +1850,12 @@ mod tests {
 		let _ = child.wait();
 	}
 
-	/// `start_mark` names one process: the same process pinned twice has the
-	/// same mark, another process has another, and the mark is the kernel's
-	/// own start time (on Linux `/proc/<pid>/stat` field 22 after the boot
-	/// id), which no wall-clock step moves.
+	/// What the broker relies on in `start_mark`: the same process pinned
+	/// twice has the same mark, and a process known to have started earlier
+	/// (this test's parent, and pid 1 where it can be pinned) has another.
+	/// Nothing is asserted about two processes started together: on Linux
+	/// the mark counts 10 ms clock ticks, and a mark names a process only
+	/// with its pid.
 	#[cfg(unix)]
 	#[test]
 	fn start_mark_names_one_process() {
@@ -1843,23 +1865,91 @@ mod tests {
 		.spawn()
 		.expect("spawn sleep");
 		let pid = i32::try_from(child.id()).unwrap();
-		let me = Process::from_pid(i32::try_from(std::process::id()).unwrap()).expect("pin self");
 		let (first, again) = (
 			Process::from_pid(pid).expect("pin the child"),
 			Process::from_pid(pid).expect("pin the child again"),
 		);
-		let marks = (first.start_mark(), again.start_mark(), me.start_mark());
+		// SAFETY: getppid has no preconditions.
+		let parent = Process::from_pid(unsafe { libc::getppid() }).expect("pin the test's parent");
+		let init = Process::from_pid(1);
+		let marks = (first.start_mark(), again.start_mark(), parent.start_mark());
+		let init_mark = init.as_ref().map(Process::start_mark);
 		let _ = child.kill();
 		let _ = child.wait();
-		assert_eq!(marks.0, marks.1, "one process, one mark");
-		assert_ne!(marks.0, marks.2, "another process, another mark");
+		let child_mark = marks.0.clone().expect("the child's mark");
+		assert_eq!(marks.1.as_deref(), Some(child_mark.as_str()), "one process, one mark");
+		let parent_mark = marks.2.expect("the parent's mark");
+		assert_ne!(child_mark, parent_mark, "a process started earlier has another mark");
+		if let Some(init_mark) = init_mark {
+			assert_ne!(init_mark.as_deref(), Some(child_mark.as_str()), "pid 1 has another mark");
+		}
 		#[cfg(target_os = "linux")]
 		{
-			let stat = crate::sys::proc::read(pid).ok().flatten();
 			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
-			assert!(marks.0.starts_with(&format!("{}:", boot.trim())), "{marks:?}");
-			assert!(stat.is_none(), "the child is reaped");
+			assert!(child_mark.starts_with(&format!("{}:", boot.trim())), "{child_mark}");
 		}
+	}
+
+	/// The boot id is read once per process: once a mark was read, no later
+	/// failure to read the boot id (here, no descriptor left) changes the
+	/// mark of the same process. And in a process that never read it, a mark
+	/// it cannot read is `None`, not another mark. Both run in child test
+	/// processes ([`crate::sys::proc::short_of_descriptors`]).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_boot_id_that_cannot_be_read_never_changes_a_mark() {
+		use crate::sys::proc::short_of_descriptors;
+		let mut child = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new("/bin/sleep").arg("600"),
+		)
+		.spawn()
+		.expect("spawn sleep");
+		let probed = [
+			"proctree::tests::mark_read_again_with_no_descriptor_left",
+			"proctree::tests::mark_never_read_with_no_descriptor_left",
+		]
+		.map(|test| short_of_descriptors::run(test, child.id()));
+		let _ = child.kill();
+		let _ = child.wait();
+		for probed in probed {
+			probed.unwrap();
+		}
+	}
+
+	/// Run by [`a_boot_id_that_cannot_be_read_never_changes_a_mark`] in a
+	/// child process: the mark read with descriptors, then again with none.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by a_boot_id_that_cannot_be_read_never_changes_a_mark"]
+	fn mark_read_again_with_no_descriptor_left() {
+		use crate::sys::proc::short_of_descriptors;
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let pinned = Process::from_pid(pid).expect("pin the sleep");
+		let before = pinned.start_mark().expect("the mark, with descriptors");
+		short_of_descriptors::leave_none();
+		assert!(
+			std::fs::File::open("/proc/sys/kernel/random/boot_id").is_err(),
+			"a file still opens"
+		);
+		assert_eq!(pinned.start_mark().as_deref(), Some(before.as_str()), "the mark changed");
+	}
+
+	/// Run by [`a_boot_id_that_cannot_be_read_never_changes_a_mark`] in a
+	/// child process that has not read the boot id: with no descriptor left,
+	/// the mark cannot be read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by a_boot_id_that_cannot_be_read_never_changes_a_mark"]
+	fn mark_never_read_with_no_descriptor_left() {
+		use crate::sys::proc::short_of_descriptors;
+		let Some(pid) = short_of_descriptors::pid() else {
+			return;
+		};
+		let pinned = Process::from_pid(pid).expect("pin the sleep");
+		short_of_descriptors::leave_none();
+		assert_eq!(pinned.start_mark(), None, "a mark without the boot id");
 	}
 
 	/// A tree the walk cannot read (in a child test process with no
@@ -1869,14 +1959,24 @@ mod tests {
 	/// with what it could not read. Here the root is `sh`, with a `sleep` in
 	/// its own group, which dies with it; and then with both in the test's
 	/// group, which the root does not lead: the sleep is then reported, not
-	/// found.
+	/// found. Without a pidfd only the group needs no read: a root that leads
+	/// none cannot be signalled by a walk that cannot recheck its start
+	/// time, so that case is skipped there, and says so.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish() {
 		use std::{io::BufRead as _, os::unix::process::CommandExt as _};
 
 		use crate::sys::proc::short_of_descriptors;
+		let pidfd = short_of_descriptors::pidfd_available();
 		for own_group in [true, false] {
+			if !own_group && !pidfd {
+				eprintln!(
+					"skipped: without pidfd_open a root that leads no group cannot be signalled by a \
+					 walk that cannot read its start time"
+				);
+				continue;
+			}
 			let mut command = std::process::Command::new("/bin/sh");
 			command
 				.args(["-c", "/bin/sleep 600 & echo $!; wait"])

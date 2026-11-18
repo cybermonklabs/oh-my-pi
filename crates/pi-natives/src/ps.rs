@@ -106,9 +106,11 @@ impl Process {
 	/// (`/proc/<pid>/stat` field 22); on macOS and Windows the start time the
 	/// kernel recorded. A pid recorded with its mark names that process
 	/// alone (one that reused the pid has another mark), whatever the wall
-	/// clock did since.
+	/// clock did since. `null` when the boot id cannot be read (no descriptor
+	/// left, a sandbox that hides it): no mark is known, which proves nothing
+	/// about the process.
 	#[napi(getter)]
-	pub fn start_mark(&self) -> String {
+	pub fn start_mark(&self) -> Option<String> {
 		self.inner.start_mark()
 	}
 

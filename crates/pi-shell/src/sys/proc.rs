@@ -801,7 +801,9 @@ mod tests {
 	/// A pinned signal to a process it cannot read once its pidfd is open
 	/// fails instead of reporting the process gone, so a KILL sweep does not
 	/// skip a live process in silence. The check runs in a child test
-	/// process, with one descriptor left, which the pidfd takes.
+	/// process, with one descriptor left, which the pidfd takes; where the
+	/// system provides no pidfd, with none left, so the `stat` read of the
+	/// start-time pin is the one that fails.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_pinned_signal_fails_when_it_cannot_read_the_process() {
@@ -828,9 +830,14 @@ mod tests {
 			return;
 		};
 		let scanned = info(pid).expect("the control read of the sleep");
-		short_of_descriptors::leave_one();
+		if short_of_descriptors::pidfd_available() {
+			short_of_descriptors::leave_one();
+		} else {
+			short_of_descriptors::leave_none();
+		}
 		let sent = signal_pinned(&scanned, Signal::Term);
-		let failed = sent.expect_err("the pinned signal reported the unreadable sleep gone");
+		short_of_descriptors::restore();
+		let failed = sent.expect_err("the pinned signal went out to a sleep it could not read");
 		assert_eq!(failed.raw_os_error(), Some(libc::EMFILE), "{failed}");
 		assert!(running(pid), "the sleep {pid} was signalled");
 	}
@@ -878,6 +885,24 @@ pub(crate) mod short_of_descriptors {
 		limit(0);
 	}
 
+	/// Whether this system provides `pidfd_open` (Linux 5.3, no seccomp
+	/// filter against it): without it, a pin is by start time, which needs
+	/// the `stat` read a pidfd would otherwise have spared.
+	pub(crate) fn pidfd_available() -> bool {
+		// SAFETY: pidfd_open takes scalar arguments; a descriptor it returns
+		// is closed at once.
+		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+		if fd < 0 {
+			return !matches!(
+				std::io::Error::last_os_error().raw_os_error(),
+				Some(libc::ENOSYS | libc::EPERM)
+			);
+		}
+		// SAFETY: `fd` is the descriptor pidfd_open just returned.
+		unsafe { libc::close(fd as i32) };
+		true
+	}
+
 	/// One more file opens from now on in this process, and no other.
 	pub(crate) fn leave_one() {
 		// SAFETY: duplicates a descriptor of this process and closes the copy:
@@ -889,6 +914,14 @@ pub(crate) mod short_of_descriptors {
 			fd
 		};
 		limit(lowest as u64 + 1);
+	}
+
+	/// Files open again from now on in this process, up to its hard limit.
+	pub(crate) fn restore() {
+		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: `limit` is writable for the call.
+		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) }, 0);
+		self::limit(limit.rlim_max);
 	}
 
 	fn limit(files: u64) {
