@@ -4,7 +4,13 @@
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { IrcWaitFilter } from "../../irc/bus";
-import type { AdoptOptions, AgentReleaseOptions } from "../../registry/agent-lifecycle";
+import type {
+	AdoptOptions,
+	AgentLifecycleDisposeOptions,
+	AgentReleaseOptions,
+	ColdReviveOptions,
+	LiveAgentTarget,
+} from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
 	AgentRef,
@@ -44,6 +50,7 @@ export type AgentRegistryProtocol = {
 	>;
 	detachSession: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
 	unregister: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
+	bindLiveName: RpcMethod<[name: string, targetId: string, sessionFile: string], boolean>;
 	get: RpcMethod<[id: string], AgentRef | undefined>;
 	list: RpcMethod<[], AgentRef[]>;
 	listVisibleTo: RpcMethod<[id: string], AgentRef[]>;
@@ -56,16 +63,21 @@ export type AgentRegistryProtocol = {
 	awaitsSubscribe: RpcMethod<[listener: () => void], () => void>;
 };
 
-/** `AgentLifecycleApi` over the link (the persisted reviver factory and teardown stay main-only). */
+/** `AgentLifecycleApi` over the link (the persisted reviver factory and the process exit's teardown stay main-only). */
 export type AgentLifecycleProtocol = {
 	adopt: RpcMethod<[id: string, opts: AdoptOptions, expected?: AgentRefExpectation], void>;
 	has: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
 	reclaimDeadCorpse: RpcMethod<[id: string, expected: AgentRef], boolean>;
 	manages: RpcMethod<[registry: AgentRegistryApi], boolean>;
 	isParking: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
+	isReleasing: RpcMethod<[id: string], boolean>;
+	whenReleased: RpcMethod<[id: string], void>;
 	park: RpcMethod<[id: string], void>;
-	ensureLive: RpcMethod<[id: string], AgentSessionHandle>;
+	/** A `coldRevive` factory crosses as a callback into the thread that supplied it. */
+	ensureLive: RpcMethod<[id: string, coldRevive?: ColdReviveOptions], AgentSessionHandle>;
+	ensureLiveTarget: RpcMethod<[id: string, coldRevive?: ColdReviveOptions], LiveAgentTarget>;
 	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions], boolean>;
+	releaseUnder: RpcMethod<[ancestorId: string, options?: AgentLifecycleDisposeOptions], void>;
 };
 
 /** Result row of `IrcBusApi.unansweredSends`. */

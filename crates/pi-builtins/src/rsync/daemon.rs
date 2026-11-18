@@ -1022,17 +1022,17 @@ mod tests {
 	}
 
 	/// The reference binary as a real daemon: module listing and a password
-	/// login, over TCP.
+	/// login, over TCP. The reference is the conformance suite's rsync 3.5.1,
+	/// so the test runs wherever that suite does (and fails like it when the
+	/// Jobs require one): openrsync (`/usr/bin/rsync` on macOS) has no daemon
+	/// mode, and older distro rsyncs (3.2.x, protocol 31) negotiate down.
 	#[cfg(unix)]
 	#[test]
 	fn live_reference_daemon_listing_and_auth() {
-		let Some(rsync) = ["/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/usr/bin/rsync"]
-			.into_iter()
-			.map(Path::new)
-			.find(|p| p.exists() && is_protocol_33_samba_rsync(p))
-		else {
+		let Some(rsync) = crate::rsync::conformance::reference() else {
 			return;
 		};
+		let rsync = rsync.as_path();
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
 		std::fs::create_dir(root.join("data")).unwrap();
@@ -1042,44 +1042,17 @@ mod tests {
 			use std::os::unix::fs::PermissionsExt;
 			std::fs::set_permissions(root.join("secrets"), std::fs::Permissions::from_mode(0o600)).unwrap();
 		}
-		let port = {
-			let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-			probe.local_addr().unwrap().port()
-		};
 		let conf = format!(
-			"use chroot = no\naddress = 127.0.0.1\nmotd file = {r}/motd\npid file = {r}/pid\n\
+			"use chroot = no\naddress = 127.0.0.1\nmotd file = {r}/motd\npid file = {r}/pid\nlog file = {r}/log\n\
 			 [pub]\n\tpath = {r}/data\n\tcomment = Public stuff\n\
 			 [priv]\n\tpath = {r}/data\n\tauth users = alice\n\tsecrets file = {r}/secrets\n",
 			r = root.display()
 		);
 		std::fs::write(root.join("rsyncd.conf"), conf).unwrap();
-		let mut daemon = std::process::Command::new(rsync)
-			.arg("--daemon")
-			.arg("--no-detach")
-			.arg(format!("--port={port}"))
-			.arg(format!("--config={}", root.join("rsyncd.conf").display()))
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::null())
-			.spawn()
-			.unwrap();
-		struct Kill(std::process::Child);
-		impl Drop for Kill {
-			fn drop(&mut self) {
-				let _ = self.0.kill();
-				let _ = self.0.wait();
-			}
-		}
-		let _guard = {
-			let deadline = Instant::now() + Duration::from_secs(10);
-			while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-				assert!(Instant::now() < deadline, "daemon did not start");
-				if let Ok(Some(_)) = daemon.try_wait() {
-					return;
-				}
-				std::thread::sleep(Duration::from_millis(50));
-			}
-			Kill(daemon)
-		};
+		// Retried on a fresh port when another process takes the probed one
+		// first, and ready only once the daemon itself greets on it.
+		let daemon = crate::rsync::conformance::daemon::Daemon::serve(rsync, root, &root.join("rsyncd.conf"));
+		let port = daemon.port;
 
 		let (host, _) = crate::host::Host::for_test("rsync", "", root);
 		let env = host.child_env();
@@ -1127,17 +1100,6 @@ mod tests {
 		let err = daemon_handshake(&mut conn, &cfg, &logger).unwrap_err();
 		assert_eq!(err.message.as_deref(), Some("@ERROR: auth failed on module priv"));
 		assert_eq!(err.code, 5);
-	}
-
-	/// A samba rsync whose daemon negotiates protocol 33, which the test pins.
-	/// openrsync (`/usr/bin/rsync` on macOS) has no daemon mode, and older
-	/// distro rsyncs (3.2.x, protocol 31) negotiate down.
-	#[cfg(unix)]
-	fn is_protocol_33_samba_rsync(path: &Path) -> bool {
-		std::process::Command::new(path).arg("--version").output().is_ok_and(|out| {
-			let version = String::from_utf8_lossy(&out.stdout);
-			version.starts_with("rsync  version 3.") && version.contains("protocol version 33")
-		})
 	}
 
 	#[test]

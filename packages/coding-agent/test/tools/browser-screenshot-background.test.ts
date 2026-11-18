@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { findFreeCdpPort, gracefulKillTreeOnce, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { findFreeCdpPort, gracefulKillTreeOnce } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { ensureChromiumExecutable, RENDERER_PRIORITY_ARGS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import {
 	acquireBrowser,
@@ -14,7 +14,7 @@ import { decodePng } from "@oh-my-pi/pi-coding-agent/tools/browser/screenshot";
 import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { Page } from "puppeteer-core";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, chromiumDevToolsListening } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -72,7 +72,7 @@ async function connectedBrowser(): Promise<PuppeteerBrowserHandle> {
 			`--user-data-dir=${root}`,
 			`--remote-debugging-port=${port}`,
 		],
-		{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+		{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 	);
 	cleanups.push(async () => {
 		await gracefulKillTreeOnce(child.pid);
@@ -80,7 +80,7 @@ async function connectedBrowser(): Promise<PuppeteerBrowserHandle> {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 	const cdpUrl = `http://127.0.0.1:${port}`;
-	await waitForCdp(cdpUrl, 15_000);
+	await chromiumDevToolsListening(child);
 	const handle = await acquireBrowser({ kind: "connected", cdpUrl }, { cwd: process.cwd() });
 	if (!("browser" in handle)) throw new Error("Expected a Puppeteer browser");
 	cleanups.push(() => releaseBrowser(handle, { kill: false }));
@@ -102,8 +102,10 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 		await acquireTab(name, handle, { target: "agent-tab", timeoutMs: 30_000 });
 
 		expect(await repaintAndCapture(name, "#00ff00")).toEqual([0, 255, 0]);
+		// One tab of a window is shown at a time, so the user's tab still showing is what proves the capture did not
+		// select the agent's. The agent's own page cannot tell: omp focus-emulates a page it attaches to in a browser
+		// the user drives, and a focus-emulated page reports itself visible from behind another tab.
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(agentPage)).toBe("hidden");
 	}, 45_000);
 
 	it("captures the adopted tab after the user switched away from it", async () => {

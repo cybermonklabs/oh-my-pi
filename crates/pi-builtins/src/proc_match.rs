@@ -175,13 +175,20 @@ pub(crate) fn run<'a>(
 						// Selection may legitimately include an ancestor — `pgrep`
 						// should still list the terminal — but signalling one would
 						// tear down the session this shell runs in. Refuse late, at
-						// delivery, so only the destructive mode is affected.
+						// delivery, so only the destructive mode is affected. An
+						// ancestor the snapshot could not read refuses every signal:
+						// the target may be one above it.
 						if host.blocks(process.pid()) {
 							if !options.quiet {
+								let why = match &host.unread {
+									Some((unread, error)) if !host.protects(process.pid()) => format!(
+										"cannot read process {unread} to check it is not the shell's ancestor: {error}"
+									),
+									_ => "this shell or one of its ancestors".to_owned(),
+								};
 								writeln!(
 									context.stderr(),
-									"{command_name}: refusing to signal pid {} (this shell or one of its \
-									 ancestors)",
+									"{command_name}: refusing to signal pid {} ({why})",
 									process.pid()
 								)?;
 							}
@@ -376,7 +383,8 @@ async fn wait_for_watchable_exits(
 	let mut polled = Vec::new();
 	let mut watched = Vec::new();
 	for process in processes {
-		let Some(fd) = proc_snapshot::sys::open_pidfd(process.pid()) else {
+		let Ok(proc_snapshot::sys::Pidfd::Open(fd)) = proc_snapshot::sys::pidfd_open(process.pid(), None)
+		else {
 			polled.push(process);
 			continue;
 		};
@@ -511,7 +519,7 @@ async fn parse_proc_match(
 	context: &ProcContext,
 	stdin: &mut ProcStdin,
 ) -> std::result::Result<ParseProcResult, (u8, String)> {
-	let mut options = match parse_proc_match_args(mode, argv, context.paths())? {
+	let mut options = match parse_proc_match_args(mode, argv, context.paths()).await? {
 		ParseProcResult::Options(options) => *options,
 		other => return Ok(other),
 	};
@@ -529,7 +537,7 @@ async fn parse_proc_match(
 	Ok(ParseProcResult::Options(Box::new(options)))
 }
 
-fn parse_proc_match_args(
+async fn parse_proc_match_args(
 	mode: ProcMatchMode,
 	argv: &[String],
 	paths: &ShellPaths,
@@ -605,7 +613,7 @@ fn parse_proc_match_args(
 				"--euid" => parse_user_list(value.unwrap_or_default(), &mut options.effective_users)?,
 				"--uid" => parse_user_list(value.unwrap_or_default(), &mut options.real_users)?,
 				"--group" => parse_group_list(value.unwrap_or_default(), &mut options.real_groups)?,
-				"--terminal" => parse_terminal_list(value.unwrap_or_default(), &mut options.terminals, paths)?,
+				"--terminal" => parse_terminal_list(value.unwrap_or_default(), &mut options.terminals, paths).await?,
 				"--pidfile" => options
 					.pid_files
 					.push(value.unwrap_or_default().to_string()),
@@ -692,7 +700,7 @@ fn parse_proc_match_args(
 					'u' => parse_user_list(value, &mut options.effective_users)?,
 					'U' => parse_user_list(value, &mut options.real_users)?,
 					'G' => parse_group_list(value, &mut options.real_groups)?,
-					't' => parse_terminal_list(value, &mut options.terminals, paths)?,
+					't' => parse_terminal_list(value, &mut options.terminals, paths).await?,
 					'F' => options.pid_files.push(value.to_string()),
 					'L' => options.require_lock = true,
 					'p' => {

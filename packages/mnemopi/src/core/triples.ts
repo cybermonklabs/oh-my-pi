@@ -2,6 +2,7 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { copyFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { relocatedStateRoot, stateDir } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase } from "../db";
 
 export interface TripleRow {
@@ -78,7 +79,8 @@ export function legacyDataDir(env: ProcessEnv = process.env): string {
 }
 
 export function defaultDataDir(env: ProcessEnv = process.env): string {
-	return env.MNEMOPI_DATA_DIR && env.MNEMOPI_DATA_DIR.length > 0 ? env.MNEMOPI_DATA_DIR : legacyDataDir(env);
+	if (env.MNEMOPI_DATA_DIR && env.MNEMOPI_DATA_DIR.length > 0) return env.MNEMOPI_DATA_DIR;
+	return stateDir("data", legacyDataDir(env), env);
 }
 
 export function defaultTripleDbPath(env: ProcessEnv = process.env): string {
@@ -110,8 +112,14 @@ function copyLegacyDb(source: string, destination: string): void {
 	}
 }
 
+/**
+ * The default triples database, first copied from the legacy home location when it has none.
+ * Under a relocated omp config root the home location is never read: that root is separate
+ * from whatever the home directory holds.
+ */
 export function resolveDefaultTripleDb(env: ProcessEnv = process.env): string {
 	const destination = defaultTripleDbPath(env);
+	if (relocatedStateRoot(env) !== undefined) return destination;
 	const legacy = legacyTripleDbPath(env);
 	if (destination !== legacy && !existsSync(destination) && existsSync(legacy)) copyLegacyDb(legacy, destination);
 	return destination;

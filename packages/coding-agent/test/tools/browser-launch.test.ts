@@ -312,6 +312,9 @@ describe("browser executable selection", () => {
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					// The Chrome for Testing cache is this probe's XDG cache, not the shared download root.
+					OMP_CONFIG_ROOT: undefined,
+					OMP_DOWNLOAD_ROOT: undefined,
 					OMP_BROWSER_PROBE_PLATFORM: "darwin",
 					PUPPETEER_EXECUTABLE_PATH: "",
 				};
@@ -372,6 +375,9 @@ describe("browser executable selection", () => {
 					XDG_CACHE_HOME: xdgCache,
 					XDG_DATA_HOME: path.join(tempDir.path(), "data"),
 					XDG_STATE_HOME: path.join(tempDir.path(), "state"),
+					// The Chrome for Testing cache is this probe's XDG cache, not the shared download root.
+					OMP_CONFIG_ROOT: undefined,
+					OMP_DOWNLOAD_ROOT: undefined,
 					PUPPETEER_EXECUTABLE_PATH: edge,
 				};
 				const probe = (purpose: string) => {

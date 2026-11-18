@@ -84,10 +84,20 @@ describe("write tool keeps the replaced file's line endings and BOM", () => {
 		expect(await fs.readFile(filePath, "utf8")).toBe("\uFEFFclass A {}\r\nclass B {}\r\n");
 		expect(resultText(writeResult)).toContain("Note: kept the replaced file's CRLF line endings and UTF-8 BOM.");
 
+		// The write displayed no line numbers, so the first anchored edit under its tag
+		// reveals the anchored line instead of applying (write-hashline-header.test.ts).
+		// A seen-line refusal, not a tag mismatch: the tag matches the CRLF+BOM file.
 		const headerLine = resultText(writeResult).split("\n")[0] ?? "";
-		await new EditTool(session, "hashline").execute("call-2", {
-			input: `${headerLine}\nPUT 2.=2:\n+class C {}\n`,
-		});
+		const edit = new EditTool(session, "hashline");
+		const patchInput = `${headerLine}\nPUT 2.=2:\n+class C {}\n`;
+		const refused = await edit.execute("call-2", { input: patchInput });
+		expect(refused.isError).toBe(true);
+		expect(resultText(refused)).toContain("never displayed");
+		expect(resultText(refused)).toContain("2:class B {}");
+		expect(await fs.readFile(filePath, "utf8")).toBe("\uFEFFclass A {}\r\nclass B {}\r\n");
+
+		const applied = await edit.execute("call-3", { input: patchInput });
+		expect(applied.isError).not.toBe(true);
 		expect(await fs.readFile(filePath, "utf8")).toBe("\uFEFFclass A {}\r\nclass C {}\r\n");
 	});
 

@@ -42,7 +42,11 @@ const RETAINED_ARTIFACTS_CLEANUP_GRACE_MS = 60_000;
  */
 const RETAINED_ARTIFACTS_CLEANUP_MAX_WAIT_MS = DEFAULT_RETENTION_MS;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
-/** Abort reason used only when the owning session shuts down the entire manager. */
+/**
+ * Abort reason of a shutdown: the owning session shutting down the entire manager, or a
+ * session that goes away without a stop cutting its own jobs off. The task executor parks
+ * (rather than tombstones) a subagent whose job it aborts, so `omp --restore` goes on with it.
+ */
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
 
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
@@ -206,7 +210,10 @@ export interface AsyncJobManagerOptions {
 	 * would leak one agent's result into another session.
 	 */
 	onJobComplete?: AsyncJobDeliverySink;
-	/** Running-job cap; a function is re-read on every capacity check so a live setting resizes the cap. */
+	/**
+	 * Running-job cap; `0` or less means no limit. A function is re-read on every capacity check so a
+	 * live setting resizes the cap.
+	 */
 	maxRunningJobs?: number | (() => number);
 	retentionMs?: number;
 	/**
@@ -340,8 +347,11 @@ export interface AsyncJobManagerApi {
 		result: AsyncJobRunResult,
 		options: { id?: string; ownerId?: string; agentId?: string },
 	): string;
-	/** Cancel one running job; a filter whose owner does not match reads as not-found. */
-	cancel(id: string, filter?: AsyncJobFilter): boolean;
+	/**
+	 * Cancel one running job, aborting it with `reason`; a filter whose owner does not
+	 * match reads as not-found.
+	 */
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean;
 	getJob(id: string): AsyncJob | undefined;
 	/** Running background jobs; foreground-backed jobs stay hidden until promoted. */
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[];
@@ -372,10 +382,14 @@ export interface AsyncJobManagerApi {
 	registerDeliverySink(ownerId: string, sink: AsyncJobDeliverySink): () => void;
 	/** Wait until every job owned by `ownerId` settled; false when `timeoutMs` elapses first. */
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean>;
-	/** Cancel every job owned by `ownerId`, then wait until `deadlineAt`. */
-	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult>;
+	/** Cancel every job owned by `ownerId`, aborting each with `reason`, then wait until `deadlineAt`. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason: unknown): Promise<AsyncJobReapResult>;
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean>;
 	isDeliverySuppressed(jobId: string): boolean;
+	/** True while a settled job's completion is queued or in flight — its push is on the way. */
+	isDeliveryPending(jobId: string): boolean;
+	/** True when a foreground snapshot consumed this job's result while its push was still queued. */
+	isDeliverySuperseded(jobId: string): boolean;
 }
 
 export class AsyncJobManager implements AsyncJobManagerApi {
@@ -400,6 +414,14 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
+	/**
+	 * Settled jobs whose completion push a foreground snapshot superseded: the
+	 * snapshot consumed the result, so the push it raced will not reach the owner
+	 * even though it was queued or in flight when the snapshot read it. Kept apart
+	 * from {@link #deliveries} so the delivery line can say "superseded" instead of
+	 * promising a follow-up that cannot arrive (#16135 review).
+	 */
+	readonly #supersededDeliveries = new Set<string>();
 	readonly #watchedJobs = new Set<string>();
 	readonly #consumedJobResults = new Set<string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
@@ -462,11 +484,14 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		);
 	}
 
-	/** Effective running-job cap (at least 1), resolved at check time. */
+	/**
+	 * Effective running-job cap, resolved at check time: `Infinity` when the configured cap is `0` or
+	 * less, else the cap floored to at least 1.
+	 */
 	get #maxRunningJobs(): number {
 		const option = this.#maxRunningJobsOption;
-		const value = typeof option === "function" ? option() : option;
-		return Math.max(1, Math.floor(value ?? DEFAULT_MAX_RUNNING_JOBS));
+		const value = (typeof option === "function" ? option() : option) ?? DEFAULT_MAX_RUNNING_JOBS;
+		return value > 0 ? Math.max(1, Math.floor(value)) : Number.POSITIVE_INFINITY;
 	}
 
 	/** True when the running-job count has reached the configured cap. */
@@ -631,17 +656,18 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel a single job by id. When a filter is given and its owner does not
+	 * Cancel a single job by id, aborting it with `reason` (the platform's own
+	 * abort reason without one). When a filter is given and its owner does not
 	 * match the job's owner, the call is treated as not-found (returns false)
 	 * so cross-agent cancellation is rejected at the manager level.
 	 */
-	cancel(id: string, filter?: AsyncJobFilter): boolean {
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean {
 		const job = this.#jobs.get(id);
 		if (!job) return false;
 		if (filter && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
-		job.abortController.abort();
+		job.abortController.abort(reason);
 		return true;
 	}
 
@@ -774,6 +800,14 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	 */
 	consumeJobResults(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+		// Record the superseded push BEFORE acknowledging: acknowledgement drops
+		// the queued entry, so `isDeliveryPending` is false by the time the
+		// per-job consume below runs, and the delivery line could no longer tell a
+		// push this snapshot superseded from one that was never queued (#16135
+		// review).
+		for (const jobId of uniqueJobIds) {
+			if (this.isDeliveryPending(jobId)) this.#supersededDeliveries.add(jobId);
+		}
 		this.acknowledgeDeliveries(uniqueJobIds);
 		let consumed = 0;
 		for (const jobId of uniqueJobIds) {
@@ -883,13 +917,15 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
+	 * Cancel every job owned by `ownerId`, aborting each with `reason`, then wait only
+	 * until `deadlineAt`. A subagent of a job reads the kind of the cancel from `reason`
+	 * (`turnAbortKind`), so every caller says it.
 	 * The returned completion keeps waiting for actual process settlement when
 	 * the deadline expires, so callers can move that cleanup out of the
 	 * user-visible Task wait without losing ownership of the live work.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
+	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason: unknown): Promise<AsyncJobReapResult> {
+		this.cancelAll({ ownerId }, reason);
 		const timeoutMs = Math.max(0, deadlineAt - Date.now());
 		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
 		if (settled) {
@@ -987,6 +1023,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		this.#notifyDeliveryQueueChanged();
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
+		this.#supersededDeliveries.clear();
 		this.#watchedJobs.clear();
 		this.#consumedJobResults.clear();
 		this.#releasedForegroundJobs.clear();
@@ -1036,6 +1073,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	#claimJobId(preferredId?: string): string {
 		const id = this.#resolveJobId(preferredId);
 		this.#suppressedDeliveries.delete(id);
+		this.#supersededDeliveries.delete(id);
 		this.#consumedJobResults.delete(id);
 		this.#releasedForegroundJobs.delete(id);
 		return id;
@@ -1162,6 +1200,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
+		this.#supersededDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
 		this.#consumedJobResults.delete(jobId);
 		const job = this.#jobs.get(jobId);
@@ -1262,6 +1301,34 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 
 	isDeliverySuppressed(jobId: string): boolean {
 		return this.#suppressedDeliveries.has(jobId) || this.#watchedJobs.has(jobId);
+	}
+
+	/**
+	 * True while a settled job's completion is queued or in flight — its push
+	 * is on the way rather than lost. A `wait` that returns such a result
+	 * handed it over first; the delivery it raced is not a missed push
+	 * (#16052). Watch suppression is not consulted: `watchJobs` blocks new
+	 * enqueue attempts, but a push already queued or in flight when the watch
+	 * began is still on the way, and treating it as lost mislabels the result
+	 * this snapshot hands over (#18635).
+	 */
+	isDeliveryPending(jobId: string): boolean {
+		return (
+			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId)
+		);
+	}
+
+	/**
+	 * True when a foreground snapshot recovered this job's result while its
+	 * completion push was still queued or in flight. That push is superseded —
+	 * the snapshot consumed the result, so the entry it suppressed cannot reach
+	 * the owner. Lets the delivery line report a superseded push rather than
+	 * "still on the way", which would make the model expect a duplicate (#16135
+	 * review).
+	 */
+	isDeliverySuperseded(jobId: string): boolean {
+		return this.#supersededDeliveries.has(jobId);
 	}
 
 	#enqueueDelivery(jobId: string, text: string): void {

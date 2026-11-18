@@ -22,7 +22,7 @@ Config sources (.omp/.claude/.cursor/.vscode/mcp.json, mcp.json, etc.)
 - `stdio` (writer default when `type` missing): requires `command`, optional `args`, `env`, `cwd`
 - `http`: requires `url`, optional `headers`
 - `sse`: requires `url`, optional `headers` (legacy HTTP+SSE transport)
-- shared fields: `enabled`, `timeout`, `requestIdFormat` (`"number"` or `"string"`), `instructions` (`boolean`, default `true`), `auth`, `oauth`
+- shared fields: `enabled`, `lazy` (`boolean`, default `false`: dormant until first use), `timeout`, `requestIdFormat` (`"number"` or `"string"`), `instructions` (`boolean`, default `true`), `auth`, `oauth`
 
 `timeout` is in milliseconds, defaults to 30,000, and accepts `0` to disable
 client-side timeouts. A valid `OMP_MCP_TIMEOUT_MS` environment value overrides
@@ -143,7 +143,7 @@ continues with the existing access token.
 
 Before connect, manager normally resolves stdio `env` values and HTTP/SSE `headers` values via `resolveConfigValue()` (`src/config/resolve-config-value.ts`):
 
-- value starting with `!` => execute a shell command with a 10-second timeout, use trimmed stdout; successful output is cached, concurrent requests share one execution, and failures back off for 30 seconds
+- value starting with `!` => execute a shell command with a 10-second timeout, use trimmed stdout; successful output is cached, concurrent requests share one execution, and failures back off for 30 seconds. `MCPManager` invalidates a server's command values on every reconnect, on `disconnectAll()`, and on an HTTP/SSE 401/403 (`onAuthError`, which then retries once with the re-resolved headers)
 - failed, timed-out, or whitespace-only commands produce `undefined`, so that entry is omitted
 - otherwise, use a non-empty exact-name environment value, falling back to the literal value; empty resolved entries are omitted
 

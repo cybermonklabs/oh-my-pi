@@ -32,10 +32,15 @@ async function chromiumCanLaunch(): Promise<boolean> {
 }
 
 /**
- * A disposable headless launch must actually answer CDP, not just --version.
- * Chrome exiting first (e.g. code 127 for missing libnspr4) fails the probe at
- * once: polling on would let a concurrent test server that grabs the freed
- * port answer `/json/version` with 200 and pass the probe falsely.
+ * Whether a disposable headless launch of `executable` can run on this host. Only evidence that it cannot
+ * skips the browser suites: the spawn fails, or Chrome exits before its CDP endpoint answers (code 127 for a
+ * missing libnspr4, or a wrapper that prints a version without starting Chrome). An exit ends the wait at once:
+ * polling on would let a concurrent test server that grabs the freed port answer `/json/version` with 200 and
+ * pass the probe falsely.
+ *
+ * A wait that runs out while the launched browser is still running is no such evidence: a loaded host starts
+ * Chrome slowly, and skipping then would read as a pass. It counts as available, so the suites run and fail
+ * for real if the browser is broken.
  */
 export async function chromiumCdpAvailable(executable: string, timeoutMs = 5000): Promise<boolean> {
 	const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-chromium-probe-"));
@@ -55,12 +60,17 @@ export async function chromiumCdpAvailable(executable: string, timeoutMs = 5000)
 			],
 			{ stdin: "ignore", detached: true, subreaper: true },
 		);
-		const exitedEarly = new AbortController();
+		const exited = new AbortController();
 		child.exited.then(
-			() => exitedEarly.abort(),
-			() => exitedEarly.abort(),
+			() => exited.abort(),
+			() => exited.abort(),
 		);
-		await waitForCdp(`http://127.0.0.1:${port}`, timeoutMs, exitedEarly.signal);
+		try {
+			await waitForCdp(`http://127.0.0.1:${port}`, timeoutMs, exited.signal);
+		} catch {
+			// The wait ends on Chrome's exit or on running out; only the exit says Chrome cannot run here.
+			return !exited.signal.aborted && child.exitCode === null;
+		}
 		return true;
 	} catch {
 		return false;
@@ -71,6 +81,50 @@ export async function chromiumCdpAvailable(executable: string, timeoutMs = 5000)
 		}
 		await fs.rm(userDataDir, { recursive: true, force: true });
 	}
+}
+
+/**
+ * Launch arguments for every test Chromium: `--no-sandbox`, as {@link chromiumCdpAvailable}
+ * probes and omp's own headless launches run. A host that forbids unprivileged user namespaces
+ * (Ubuntu 23.10+ AppArmor) cannot start Chrome's sandbox, so the probe passes and a sandboxed
+ * launch then dies with "No usable sandbox!".
+ */
+export const TEST_CHROMIUM_ARGS = ["--no-sandbox"];
+
+/**
+ * Wait until a Chromium a test launched with `--remote-debugging-port` (and `stderr: "pipe"`) answers CDP. The event
+ * is the `DevTools listening on ws://…` line Chromium prints on stderr once that endpoint accepts connections; it
+ * resolves with that WebSocket URL. Chromium exiting first rejects, with what it printed. There is no time limit of
+ * its own: the test's timeout bounds a launch that never gets there. Stderr is read to its end, so Chromium never
+ * blocks on a full pipe.
+ */
+export async function chromiumDevToolsListening(child: {
+	stderr: ReadableStream<Uint8Array>;
+	exited: Promise<number>;
+}): Promise<string> {
+	const listening = Promise.withResolvers<string>();
+	void (async () => {
+		const decoder = new TextDecoder();
+		let printed = "";
+		let found = false;
+		for await (const chunk of child.stderr) {
+			if (found) continue;
+			printed += decoder.decode(chunk, { stream: true });
+			const match = /DevTools listening on (ws:\/\/\S+)/.exec(printed);
+			if (match?.[1]) {
+				found = true;
+				listening.resolve(match[1]);
+			}
+		}
+		if (found) return;
+		const code = await child.exited;
+		listening.reject(
+			new Error(
+				`Chromium exited (code ${code}) before its DevTools endpoint was listening:\n${printed.slice(-2_000)}`,
+			),
+		);
+	})().catch(error => listening.reject(error));
+	return await listening.promise;
 }
 
 let probe: Promise<boolean> | undefined;

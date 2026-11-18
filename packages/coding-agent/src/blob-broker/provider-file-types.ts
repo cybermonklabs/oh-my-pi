@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { OmpErrors, type } from "@oh-my-pi/omptype";
 import type { ProviderFileReference } from "@oh-my-pi/pi-ai";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { writeFileAtomicallySync } from "../utils/atomic-file";
 import type { RemoteDeleteAction } from "./publication";
 
 /** Model providers whose official APIs support reusable uploaded-file references. */
@@ -417,20 +418,10 @@ export class ProviderFileCache {
 
 	#saveIndex(): void {
 		const index: PersistedProviderFileIndex = { version: 1, entries: [...this.#entries.values()] };
-		const directory = path.dirname(this.#indexPath);
-		const temporaryPath = `${this.#indexPath}.${process.pid}.${Date.now()}.tmp`;
-		fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-		try {
-			fs.writeFileSync(temporaryPath, JSON.stringify(index), { encoding: "utf8", mode: 0o600 });
-			fs.renameSync(temporaryPath, this.#indexPath);
-		} catch (error) {
-			try {
-				fs.unlinkSync(temporaryPath);
-			} catch {
-				// The temporary file was never created or was already renamed.
-			}
-			throw error;
-		}
+		fs.mkdirSync(path.dirname(this.#indexPath), { recursive: true, mode: 0o700 });
+		// A temporary file of its own per write: another cache of this index in this process, a
+		// worker thread's (which shares the pid), can save in the same millisecond.
+		writeFileAtomicallySync(this.#indexPath, JSON.stringify(index), 0o600);
 		this.#dirty = false;
 		this.#lastSavedAt = this.#now();
 		this.#lastError = undefined;

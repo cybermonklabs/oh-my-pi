@@ -1,21 +1,13 @@
 import type { Database } from "bun:sqlite";
-import type * as fsNode from "node:fs";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { type ApiKey, completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
-import {
-	getAgentDbPath,
-	getMemoriesDir,
-	isEnoent,
-	logger,
-	parseJsonlLenient,
-	peekFile,
-	prompt,
-} from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
 
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
@@ -26,6 +18,12 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import {
+	defaultSessionStorage,
+	FileSessionStorage,
+	type SessionStorage,
+	type SessionStorageStat,
+} from "../session/session-storage";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -394,7 +392,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
+		const phase1ApiKey = await probeModelApiKey(modelRegistry, phase1Model, session.sessionId);
 		if (!phase1ApiKey) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
@@ -435,7 +433,9 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 				sessionId: session.sessionId,
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
+				storage: session.sessionManager.getStorage(),
 				metadata: session.agent?.metadataForProvider(phase1Model.provider),
+				signal: options.signal,
 			});
 			if (!isMemoryStartupActive(options)) return;
 
@@ -558,7 +558,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
+		const phase2ApiKey = await probeModelApiKey(modelRegistry, phase2Model, session.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,
@@ -597,6 +597,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
 				sessionId: session.sessionId,
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
+				signal: options.signal,
 			});
 			if (!isMemoryStartupActive(options)) return;
 			await applyConsolidation(memoryRoot, consolidated);
@@ -669,22 +670,28 @@ function markPhase2FailureWithFallback(
 	}
 }
 
-/** @internal Exported for unit-testing. */
+/**
+ * Past sessions in the current session's directory. They are read through the
+ * current session's storage, where its sibling sessions live and which keeps
+ * them as rows rather than files under `session.storage: sql`; stage 1 later
+ * reads each claimed `rolloutPath` through the same storage.
+ *
+ * @internal Exported for unit-testing.
+ */
 export async function collectThreads(session: AgentSession, currentThreadId?: string): Promise<MemoryThread[]> {
 	const sessionDir = session.sessionManager.getSessionDir();
-	const files = await fs.readdir(sessionDir);
+	const storage = session.sessionManager.getStorage();
+	await storage.refresh?.();
 	const threads: MemoryThread[] = [];
-	for (const name of files) {
-		if (!name.endsWith(".jsonl")) continue;
-		const fullPath = path.join(sessionDir, name);
-		let stat: fsNode.Stats;
+	for (const fullPath of storage.listFilesSync(sessionDir, "*.jsonl")) {
+		let stat: SessionStorageStat;
 		try {
-			stat = await fs.stat(fullPath);
+			stat = storage.statSync(fullPath);
 		} catch {
 			continue;
 		}
 		let cwd = "";
-		let id = name.slice(0, -6);
+		let id = path.basename(fullPath, ".jsonl");
 		try {
 			// Bounded head read: session files can grow to hundreds of MBs, but the
 			// session header line always lives at line 1 (or line 2 after a title
@@ -694,14 +701,14 @@ export async function collectThreads(session: AgentSession, currentThreadId?: st
 			const HEAD_CAP = 64 * 1024;
 			let isLarge = stat.size > HEAD_CAP;
 			let fileText = isLarge
-				? await peekFile(fullPath, HEAD_CAP, bytes => new TextDecoder().decode(bytes))
-				: await Bun.file(fullPath).text();
+				? (await storage.readTextSlices(fullPath, HEAD_CAP, 0))[0]
+				: await storage.readText(fullPath);
 			let lines = fileText.split(/\r?\n/);
 			let sawTitleSlot = false;
 			for (let i = 0; i < lines.length; i++) {
 				// If the slice was cut before this line terminated, fall back to full read
 				if (isLarge && i === lines.length - 1) {
-					fileText = await Bun.file(fullPath).text();
+					fileText = await storage.readText(fullPath);
 					lines = fileText.split(/\r?\n/);
 					isLarge = false;
 				}
@@ -780,14 +787,38 @@ function extractPersistableMessages(payload: string): AgentMessage[] {
 /** Byte window used when streaming rollout head/tail for stage-1 input. */
 const STAGE1_ROLLOUT_WINDOW_BYTES = 1024 * 1024;
 
+/** A rollout's UTF-8 bytes, read by range. */
+interface RolloutBytes {
+	size: number;
+	read(start: number, end: number): Promise<Uint8Array>;
+}
+
+/**
+ * Open a rollout in `storage` for windowed reads. A file backend reads each
+ * window from disk, so a rollout of hundreds of MB is never held whole. A
+ * key-indexed backend (`session.storage: sql`) keeps the rollout as one record
+ * with no byte range to read, so it is read once and windowed in memory, the
+ * same read `loadSessionFile` performs there. A missing rollout throws either way.
+ */
+async function openRollout(rolloutPath: string, storage: SessionStorage): Promise<RolloutBytes> {
+	if (storage instanceof FileSessionStorage) {
+		const file = Bun.file(rolloutPath);
+		const { size } = await file.stat();
+		return { size, read: (start, end) => file.slice(start, end).bytes() };
+	}
+	const bytes = new TextEncoder().encode(await storage.readText(rolloutPath));
+	return { size: bytes.length, read: async (start, end) => bytes.subarray(start, end) };
+}
+
 /** Persistable messages from the start of the rollout, in file order, read window by window. */
-async function* persistableMessagesFromFront(file: Bun.BunFile, size: number): AsyncGenerator<AgentMessage> {
+async function* persistableMessagesFromFront(rollout: RolloutBytes): AsyncGenerator<AgentMessage> {
+	const { size } = rollout;
 	const decoder = new TextDecoder();
 	let carry: Uint8Array | undefined;
 	let offset = 0;
 	while (offset < size) {
 		const end = Math.min(size, offset + STAGE1_ROLLOUT_WINDOW_BYTES);
-		const window = await file.slice(offset, end).bytes();
+		const window = await rollout.read(offset, end);
 		offset = end;
 		const bytes = carry ? Buffer.concat([carry, window]) : window;
 		const cut = offset >= size ? bytes.length : bytes.lastIndexOf(0x0a) + 1;
@@ -797,13 +828,13 @@ async function* persistableMessagesFromFront(file: Bun.BunFile, size: number): A
 }
 
 /** Persistable messages from the end of the rollout, in reverse file order, read window by window. */
-async function* persistableMessagesFromBack(file: Bun.BunFile, size: number): AsyncGenerator<AgentMessage> {
+async function* persistableMessagesFromBack(rollout: RolloutBytes): AsyncGenerator<AgentMessage> {
 	const decoder = new TextDecoder();
 	let carry: Uint8Array | undefined;
-	let end = size;
+	let end = rollout.size;
 	while (end > 0) {
 		const start = Math.max(0, end - STAGE1_ROLLOUT_WINDOW_BYTES);
-		const window = await file.slice(start, end).bytes();
+		const window = await rollout.read(start, end);
 		end = start;
 		const bytes = carry ? Buffer.concat([window, carry]) : window;
 		// Bytes before the first newline belong to a line that starts in an earlier window.
@@ -823,13 +854,18 @@ async function* persistableMessagesFromBack(file: Bun.BunFile, size: number): As
  *
  * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)`, but
  * streams the rollout in byte windows and serializes messages from the front and back only until
- * the head/tail budgets fill. Peak memory is bounded by the window size plus the largest single
- * JSONL record (a record spanning windows is carried until its newline), not by rollout size.
+ * the head/tail budgets fill. On a file backend peak memory is bounded by the window size plus the
+ * largest single JSONL record (a record spanning windows is carried until its newline), not by
+ * rollout size. The rollout is read through `storage`, where {@link collectThreads} found it
+ * (the current session's).
  */
-export async function buildStage1RolloutItems(rolloutPath: string, tokenLimit: number): Promise<string> {
-	const file = Bun.file(rolloutPath);
-	// stat() throws for a missing rollout, matching the previous Bun.file().text() failure.
-	const { size } = await file.stat();
+export async function buildStage1RolloutItems(
+	rolloutPath: string,
+	tokenLimit: number,
+	storage: SessionStorage = defaultSessionStorage(),
+): Promise<string> {
+	// Opening throws for a missing rollout, matching the previous whole-file read failure.
+	const rollout = await openRollout(rolloutPath, storage);
 	if (tokenLimit <= 0) return "";
 	const maxChars = tokenLimit * 4;
 	const headChars = Math.floor(maxChars * 0.6);
@@ -837,7 +873,7 @@ export async function buildStage1RolloutItems(rolloutPath: string, tokenLimit: n
 
 	let head = "[";
 	let truncated = false;
-	for await (const message of persistableMessagesFromFront(file, size)) {
+	for await (const message of persistableMessagesFromFront(rollout)) {
 		head += head.length === 1 ? JSON.stringify(message) : `,${JSON.stringify(message)}`;
 		if (head.length > maxChars) {
 			truncated = true;
@@ -851,7 +887,7 @@ export async function buildStage1RolloutItems(rolloutPath: string, tokenLimit: n
 
 	let tail = "]";
 	let exhausted = true;
-	for await (const message of persistableMessagesFromBack(file, size)) {
+	for await (const message of persistableMessagesFromBack(rollout)) {
 		tail = `,${JSON.stringify(message)}${tail}`;
 		if (tail.length >= tailChars) {
 			exhausted = false;
@@ -871,6 +907,10 @@ async function runStage1Job(options: {
 	modelMaxTokens: number;
 	config: MemoryRuntimeConfig;
 	metadata?: Record<string, unknown>;
+	/** This startup's lifetime: ends a `/pause` hold when the session goes away. */
+	signal: AbortSignal;
+	/** Storage the claimed rollout is read from: the session's. */
+	storage: SessionStorage;
 }): Promise<
 	| {
 			kind: "output";
@@ -880,13 +920,13 @@ async function runStage1Job(options: {
 	| { kind: "no_output" }
 	| { kind: "failed"; reason: string }
 > {
-	const { claim, model, apiKey, modelMaxTokens, config } = options;
+	const { claim, model, apiKey, modelMaxTokens, config, storage } = options;
 	try {
 		const budgetTokens = Math.min(
 			config.phase1InputTokenLimit,
 			Math.floor(modelMaxTokens * config.rolloutPayloadPercent),
 		);
-		const truncatedItems = await buildStage1RolloutItems(claim.rolloutPath, budgetTokens);
+		const truncatedItems = await buildStage1RolloutItems(claim.rolloutPath, budgetTokens, storage);
 		const inputPrompt = prompt.render(stageOneInputTemplate, {
 			thread_id: claim.threadId,
 			response_items_json: truncatedItems,
@@ -909,13 +949,16 @@ async function runStage1Job(options: {
 						// OpenAI chat-completions owns its transient retries in the HTTP
 						// transport; never restart that budget at the provider/oneshot layers.
 						maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
+						// Memory work runs beside the agent loop, so `/pause` holds
+						// each request here, at the provider boundary.
+						beforeDispatch: agentPauseGate.dispatchHold(options.signal),
 					},
 				),
 			{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 		);
 
 		if (response.stopReason === "error") {
-			return { kind: "failed", reason: response.errorMessage || "stage1 model error" };
+			return { kind: "failed", reason: errorDisplayText(response) || "stage1 model error" };
 		}
 		const text = response.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -1019,6 +1062,8 @@ async function runConsolidationModel(options: {
 	apiKey: ApiKey;
 	sessionId: string;
 	metadata?: Record<string, unknown>;
+	/** This startup's lifetime: ends a `/pause` hold when the session goes away. */
+	signal: AbortSignal;
 }): Promise<{
 	memoryMd: string;
 	memorySummary: string;
@@ -1053,12 +1098,13 @@ async function runConsolidationModel(options: {
 					maxTokens: 8192,
 					reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 					maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
+					beforeDispatch: agentPauseGate.dispatchHold(options.signal),
 				},
 			),
 		{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 	);
 	if (response.stopReason === "error") {
-		throw new Error(response.errorMessage || "phase2 model error");
+		throw new Error(errorDisplayText(response) || "phase2 model error");
 	}
 	const text = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
