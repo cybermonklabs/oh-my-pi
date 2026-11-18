@@ -2930,6 +2930,7 @@ export class TurnRecovery {
 		);
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
+		// A primary recorded at startup can be a configured alias (`pi/<role>`), so its resolved model's key is read.
 		if (primaryModel && this.isRetryFallbackEntrySuppressed(originalSelector, primaryModel)) return false;
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
