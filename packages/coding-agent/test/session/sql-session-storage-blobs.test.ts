@@ -426,8 +426,9 @@ describe("session blobs in the SQL session storage", () => {
 				expect((await db.row(plain.getSessionFile() ?? ""))?.content ?? "").toContain("no image here");
 				await withImage.flush().catch(() => undefined);
 				expect((await db.row(withImage.getSessionFile() ?? ""))?.content ?? "").not.toContain(IMAGE_HASH);
-				await plain.close();
+				// Closing drains the shared store, which reports the image session's failed write again.
 				await withImage.close().catch(() => undefined);
+				await plain.close().catch(() => undefined);
 			});
 
 			it("draws again, in the read-only loader, the snapcompact frames this machine lacks", async () => {

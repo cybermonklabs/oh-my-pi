@@ -25,6 +25,8 @@ const SQLITE_SCHEMA = [
 	`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len INTEGER)`,
 	`CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY (path, start_offset))`,
 	`CREATE TABLE omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BLOB NOT NULL, byte_len INTEGER NOT NULL, mime_type TEXT, created_ms INTEGER NOT NULL)`,
+	`CREATE TABLE omp_session_files_refs (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))`,
+	`CREATE INDEX omp_session_files_rhash ON omp_session_files_refs (sha256)`,
 ];
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
@@ -788,7 +790,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 
 			const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 			expect(more).toHaveLength(0);
-			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(4);
+			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(5);
 			expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 				...START_UP_OPENING,
 				expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
