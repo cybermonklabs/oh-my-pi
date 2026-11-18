@@ -145,6 +145,7 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	RACED_READ_RETRIES,
+	retryRacedRead,
 	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageWriter,
@@ -978,18 +979,11 @@ const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
 function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
 	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
 	const readRange = storage.readTextRangeSync;
-	if (readRange) return checkedTextRangeWindows((start, end) => readRange.call(storage, filePath, start, end));
+	if (readRange)
+		return checkedTextRangeWindows(filePath, (start, end) => readRange.call(storage, filePath, start, end));
 	const readText = storage.readTextSync;
 	if (readText) return wholeText(() => readText.call(storage, filePath));
 	return undefined;
-}
-
-/** A transcript read through `readTextRangeSync` that another writer changed between two of its windows. */
-class RangeReadRaceError extends Error {
-	constructor() {
-		super("The transcript changed between two windows of its read");
-		this.name = "RangeReadRaceError";
-	}
 }
 
 /**
@@ -997,9 +991,12 @@ class RangeReadRaceError extends Error {
  * SHA-256 with what was yielded: a storage that reads by range holds nothing
  * open across windows, so another writer's full write between two of them
  * would hand back a mix of two bodies. A second read that differs throws
- * {@link RangeReadRaceError} once the windows ran out.
+ * {@link SessionReadConflictError} for `filePath` once the windows ran out.
  */
-function* checkedTextRangeWindows(readRange: (start: number, end: number) => string): Generator<Uint8Array> {
+function* checkedTextRangeWindows(
+	filePath: string,
+	readRange: (start: number, end: number) => string,
+): Generator<Uint8Array> {
 	const yielded = new Bun.CryptoHasher("sha256");
 	for (const window of textRangeWindows(readRange)) {
 		yielded.update(window);
@@ -1007,7 +1004,7 @@ function* checkedTextRangeWindows(readRange: (start: number, end: number) => str
 	}
 	const again = new Bun.CryptoHasher("sha256");
 	for (const window of textRangeWindows(readRange)) again.update(window);
-	if (again.digest("hex") !== yielded.digest("hex")) throw new RangeReadRaceError();
+	if (again.digest("hex") !== yielded.digest("hex")) throw new SessionReadConflictError(filePath);
 }
 
 /**
@@ -1468,12 +1465,13 @@ export class SessionManager {
 	 * The file is read in bounded windows and parsed as they arrive, so the
 	 * transcript is never held whole. A deleted file is recreated; a file that
 	 * no longer reads as this session is left untouched and the session moves
-	 * to a sibling. A read through `readTextRangeSync` that another writer's
-	 * full write changed between two windows ({@link RangeReadRaceError}) is
-	 * read again from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES}
-	 * reads in all, then the session moves to a sibling as `contested`: the
-	 * rewrite is never retried without a whole read of one body, since its size
-	 * check could pass against the other writer's body and overwrite it.
+	 * to a sibling. A read that another writer's full write changed between
+	 * two windows (`SessionReadConflictError`, see {@link checkedTextRangeWindows})
+	 * is read again from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES}
+	 * reads in all as {@link #recoverFromWriteConflict} does, then the session
+	 * moves to a sibling as `contested`: the rewrite is never retried without a
+	 * whole read of one body, since its size check could pass against the other
+	 * writer's body and overwrite it.
 	 *
 	 * After {@link MAX_WRITE_CONFLICT_RECOVERIES} passes (`recoveries`) the
 	 * other writer is still racing every read-to-publish window: leave the file
@@ -1497,7 +1495,7 @@ export class SessionManager {
 					},
 				});
 			} catch (readError) {
-				if (readError instanceof RangeReadRaceError) {
+				if (readError instanceof SessionReadConflictError) {
 					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
 					continue;
 				}
@@ -2124,9 +2122,11 @@ export class SessionManager {
 				}
 				if (this.#diskEpoch !== epoch) {
 					try {
-						if (await chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body)) {
-							this.#recordFullRewrite(body.bytes);
-						}
+						// Another writer's full write can cut the read-back off mid-read; read it again whole.
+						const landed = await retryRacedRead(() =>
+							chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body),
+						);
+						if (landed) this.#recordFullRewrite(body.bytes);
 					} catch {
 						// A superseding rewrite owns the durability record when its body cannot be read back.
 					}
