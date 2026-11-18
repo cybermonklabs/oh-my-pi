@@ -228,7 +228,16 @@ function withFreshness<TApi extends Api>(
 	const fresh = Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= ttlMs;
 	return fresh === entry.fresh ? entry : { ...entry, fresh };
 }
+/**
+ * Bumped by every invalidation. A sliced read memoizes its parse only if none ran
+ * since its row was read: a write from this process clears the memo but does not
+ * move the shared connection's `data_version`, so a parse of the row read before
+ * the write would otherwise sit in the memo as current.
+ */
+let readRowGeneration = 0;
+
 function invalidateReadRow(providerId: string, dbPath?: string): void {
+	readRowGeneration++;
 	try {
 		readRowCache.delete(readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId));
 	} catch {
@@ -237,6 +246,7 @@ function invalidateReadRow(providerId: string, dbPath?: string): void {
 }
 
 function invalidateReadPath(resolvedPath: string): void {
+	readRowGeneration++;
 	for (const key of readRowCache.keys()) {
 		if (key.startsWith(`${resolvedPath} `)) readRowCache.delete(key);
 	}
@@ -581,6 +591,8 @@ type CacheRowRead<TApi extends Api> =
 			row: CacheRow | null;
 			key: string;
 			dataVersion: number | null;
+			/** {@link readRowGeneration} when the row was read. */
+			generation: number;
 			resolvedPath: string;
 			shared: boolean;
 	  };
@@ -621,7 +633,7 @@ function readCacheRow<TApi extends Api>(
 		}
 		// One statement reads payload and scalars from the same snapshot.
 		const row = queryRow<CacheRow>(db, SELECT_CACHE_ROW, providerId);
-		return { kind: "row", row, key, dataVersion, resolvedPath, shared };
+		return { kind: "row", row, key, dataVersion, generation: readRowGeneration, resolvedPath, shared };
 	});
 }
 
@@ -654,7 +666,10 @@ function parseReadRow<TApi extends Api>(
 		const { models: _models, ...rowScalars } = row;
 		meta = rowScalars;
 	}
-	rememberReadRow(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null });
+	// A write from this process since the read cleared the memo; this parse is of the row before it.
+	if (read.generation === readRowGeneration) {
+		rememberReadRow(key, { dataVersion, meta, entry: entry as CacheEntry<Api> | null });
+	}
 	return entry;
 }
 
