@@ -27,13 +27,7 @@ import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
-import {
-	defaultSessionStorage,
-	FileSessionStorage,
-	RACED_READ_RETRIES,
-	SessionReadConflictError,
-	type SessionStorage,
-} from "./session-storage";
+import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -556,20 +550,13 @@ async function loadWithKnownSize(
 	options?: { throwIfMissing?: boolean },
 ): Promise<{ loaded: SessionLoadResult; sourceSize: number }> {
 	if (shouldStreamEntries(storage, size)) {
-		for (let retries = 0; ; retries++) {
-			try {
-				const loaded = await loadEntriesFromFileStream(filePath, {
-					throwIfMissing: options?.throwIfMissing,
-					storage,
-				});
-				const sourceSize = loaded.sourceSize ?? 0;
-				return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
-			} catch (error) {
-				// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
-				// reads do not wait for): stream it again from its start, never as one whole-text read.
-				if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
-			}
-		}
+		// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
+		// reads do not wait for): stream it again from its start, never as one whole-text read.
+		const loaded = await retryRacedRead(() =>
+			loadEntriesFromFileStream(filePath, { throwIfMissing: options?.throwIfMissing, storage }),
+		);
+		const sourceSize = loaded.sourceSize ?? 0;
+		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}
 	const content = await storage.readText(filePath);
 	const loaded = parseSessionContent(content);

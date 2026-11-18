@@ -158,6 +158,22 @@ export class SessionReadConflictError extends Error {
 export const RACED_READ_RETRIES = 3;
 
 /**
+ * Run `pass`, a read of a stored transcript from its start, and run it again
+ * after each {@link SessionReadConflictError}, at most
+ * {@link RACED_READ_RETRIES} more times. Any other error, and a conflict past
+ * the last retry, is thrown.
+ */
+export async function retryRacedRead<T>(pass: () => Promise<T>): Promise<T> {
+	for (let retries = 0; ; retries++) {
+		try {
+			return await pass();
+		} catch (error) {
+			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+		}
+	}
+}
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.
