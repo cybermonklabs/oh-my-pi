@@ -6,7 +6,7 @@ import { PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models";
 import { openrouterDecisionsBaseUrl } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { apiServesKind, modelKind, type ModelKind, runnerApiKind } from "@oh-my-pi/pi-catalog/types";
-import { isRecord, runToCompletion } from "@oh-my-pi/pi-utils";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { createConfigHeaderResolver } from "./resolve-config-value";
 import { SPECIAL_MODEL_MANAGER_PROVIDER_IDS } from "./model-provider-discovery";
 import type { ModelOverride } from "./models-config-schema";
@@ -178,19 +178,10 @@ export function dropProviderModels(
 }
 
 /**
- * Merge `incoming` entries into a copy of `base`, keyed by `provider`+`id`.
- * Matches are replaced with `combine(existing, entry)`; new entries are
- * appended as `combine(undefined, entry)`.
+ * Merge `incoming` entries into a copy of `base`, keyed by `provider`+`id`, with one slice unit per
+ * base model indexed and per entry merged. Matches are replaced with `combine(existing, entry)`; new
+ * entries are appended as `combine(undefined, entry)`.
  */
-export function mergeByModelKey<T extends { provider: string; id: string }>(
-	base: readonly Model<Api>[],
-	incoming: readonly T[],
-	combine: (existing: Model<Api> | undefined, entry: T) => Model<Api>,
-): Model<Api>[] {
-	return runToCompletion(mergeByModelKeySteps(base, incoming, combine));
-}
-
-/** {@link mergeByModelKey} with one slice unit per base model indexed and per entry merged. */
 export function* mergeByModelKeySteps<T extends { provider: string; id: string }>(
 	base: readonly Model<Api>[],
 	incoming: readonly T[],
@@ -286,7 +277,7 @@ export interface ModelPatch {
  * - `merge`: fold the patch into the base's (modelOverrides semantics).
  * - `replace`: the patch owns transport wholesale — same-id custom definitions
  *   already folded provider-level headers/compat in during parsing, so bundled
- *   transport metadata must not be re-merged (see `#mergeCustomModels`).
+ *   transport metadata must not be re-merged (see `#mergeCustomModelSteps`).
  */
 type ModelTransportPolicy = "merge" | "replace";
 export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: ModelTransportPolicy): Model<Api> {

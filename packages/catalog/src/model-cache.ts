@@ -4,7 +4,6 @@
  */
 import type { Database } from "bun:sqlite";
 import * as path from "node:path";
-import { type } from "@oh-my-pi/omptype";
 import {
 	getModelDbPath,
 	isSqliteCorruptionError,
@@ -15,6 +14,15 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import RULES from "./compat/rules.json" with { type: "json" };
+import {
+	hasModelHeaders,
+	headersEqual,
+	isMaterializedModel,
+	type PersistedModel,
+	parseMaterializedModels,
+	parseModelIds,
+	toCachedModel,
+} from "./model-cache-codec";
 import type { Api, Model } from "./types";
 
 // Rows persist fully materialized Models so compatible warm-cache reads do not
@@ -142,14 +150,6 @@ type StoredRowState = Pick<
 interface TableInfoRow {
 	name: string;
 }
-
-/**
- * On-disk materialized row. `null` preserves the distinction between an
- * inferred computer-use value and an explicitly authored boolean through JSON.
- */
-type PersistedModel<TApi extends Api = Api> = Omit<Model<TApi>, "supportsComputerUseConfig"> & {
-	supportsComputerUseConfig: boolean | null;
-};
 
 /** Materialized provider snapshot with freshness and header-restoration provenance. */
 export interface CacheEntry<TApi extends Api = Api> {
@@ -499,56 +499,6 @@ function migrateCacheSchema(db: Database): void {
 	}
 }
 
-/**
- * A cacheable materialized model. Also checked on the write side against
- * in-memory models, so optional keys may be present as `undefined`.
- */
-const MaterializedModel = type({
-	id: "string > 0",
-	name: "string > 0",
-	api: "string > 0",
-	provider: "string > 0",
-	// Empty is legitimate: Azure-style providers resolve the endpoint from
-	// configuration at request time, and their bundled rows carry "".
-	baseUrl: "string",
-	reasoning: "boolean",
-	input: "('text' | 'image')[] > 0",
-	"headers?": "undefined",
-	supportsComputerUseConfig: "boolean | null",
-	contextWindow: "number > 0 | null",
-	maxTokens: "number > 0 | null",
-	identity: { class: "string" },
-	"compat?": type("object")
-		.narrow(compat => !Array.isArray(compat))
-		.or("undefined"),
-	cost: { input: "number", output: "number", cacheRead: "number", cacheWrite: "number" },
-});
-
-function isMaterializedModel(value: unknown): value is PersistedModel<Api> {
-	return MaterializedModel.allows(value);
-}
-
-function parseMaterializedModels<TApi extends Api>(serialized: string): Model<TApi>[] | null {
-	try {
-		const parsed: unknown = JSON.parse(serialized);
-		if (!Array.isArray(parsed) || !parsed.every(isMaterializedModel)) return null;
-		return parsed.map(model => ({
-			...model,
-			supportsComputerUseConfig: model.supportsComputerUseConfig ?? undefined,
-		})) as Model<TApi>[];
-	} catch {
-		return null;
-	}
-}
-
-function parseModelIds(serialized: string): string[] | null {
-	try {
-		const parsed: unknown = JSON.parse(serialized);
-		return Array.isArray(parsed) && parsed.every((id): id is string => typeof id === "string") ? parsed : null;
-	} catch {
-		return null;
-	}
-}
 export function readModelCache<TApi extends Api>(
 	providerId: string,
 	ttlMs: number,
@@ -751,43 +701,6 @@ function parseCacheRow<TApi extends Api>(
 		legacyHeaderRestoreMarkers: row.header_restore_version < HEADER_RESTORE_VERSION,
 		staticFingerprint: row.static_fingerprint ?? "",
 	};
-}
-
-/** Whether a live model carries at least one request header. */
-function hasModelHeaders(model: Model<Api>): boolean {
-	if (model.resolveHeaders) return true;
-	const headers = model.headers;
-	if (!headers) return false;
-	for (const _key in headers) return true;
-	return false;
-}
-
-/**
- * Project a materialized model to cache-safe metadata.
- *
- * Headers are never persisted: custom/runtime providers may use arbitrary
- * credential header names, so no name-based filter can be complete. All other
- * resolved fields are retained verbatim, including sparse provenance fields,
- * so a compatible cache can be consumed without running `buildModel`.
- */
-function toCachedModel<TApi extends Api>(model: Model<TApi>): PersistedModel<TApi> {
-	const { headers: _headers, resolveHeaders: _resolveHeaders, ...rest } = model;
-	return {
-		...rest,
-		supportsComputerUseConfig: model.supportsComputerUseConfig ?? null,
-	};
-}
-
-/** Whether two in-memory header records are byte-for-byte equivalent. */
-function headersEqual(left: Record<string, string> | undefined, right: Record<string, string> | undefined): boolean {
-	if (!left || !right) return left === right;
-	for (const key in left) {
-		if (right[key] !== left[key]) return false;
-	}
-	for (const key in right) {
-		if (!(key in left)) return false;
-	}
-	return true;
 }
 
 /**

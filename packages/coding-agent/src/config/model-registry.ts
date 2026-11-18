@@ -19,7 +19,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildDiscoveredModel, buildModel, nextBuildPriceChange } from "@oh-my-pi/pi-catalog/build";
-import { collapseBuiltVariants, collapseBuiltVariantsSteps } from "@oh-my-pi/pi-catalog/compat/collapse";
+import { collapseBuiltVariantsSteps } from "@oh-my-pi/pi-catalog/compat/collapse";
 import {
 	clampCodexContextWindow,
 	clampsContextOverride,
@@ -1526,12 +1526,10 @@ export class ModelRegistry {
 		logger.warn("extension model projection failed; serving unprojected catalog", { provider, error });
 	}
 
-	/** Built-in and cached models, before runtime discoveries and every projection. */
-	#composeCachedBaseModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
-		return runToCompletion(this.#cachedBaseModelSteps(providerFilter));
-	}
-
-	/** {@link #composeCachedBaseModels} with a slice unit per built-in model, whose window policy resolves the rule cascade. */
+	/**
+	 * Built-in and cached models, before runtime discoveries and every projection, with a slice unit
+	 * per built-in model, whose window policy resolves the rule cascade.
+	 */
 	*#cachedBaseModelSteps(providerFilter?: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
 		const cachedStandardModels = this.#getCachedStandardModels(providerFilter);
 		yield;
@@ -1669,10 +1667,7 @@ export class ModelRegistry {
 		return out;
 	}
 
-	#mergeResolvedModels(baseModels: Model<Api>[], replacementModels: Model<Api>[]): Model<Api>[] {
-		return runToCompletion(this.#mergeResolvedModelSteps(baseModels, replacementModels));
-	}
-
+	/** Merge resolved models over a base, keeping a base model's limits where the replacement has none. */
 	*#mergeResolvedModelSteps(
 		baseModels: Model<Api>[],
 		replacementModels: Model<Api>[],
@@ -1702,10 +1697,6 @@ export class ModelRegistry {
 	}
 
 	/** Merge custom models with built-in, replacing by provider+id match */
-	#mergeCustomModels(builtInModels: Model<Api>[], customModels: CustomModelOverlay[]): Model<Api>[] {
-		return runToCompletion(this.#mergeCustomModelSteps(builtInModels, customModels));
-	}
-
 	*#mergeCustomModelSteps(
 		builtInModels: Model<Api>[],
 		customModels: CustomModelOverlay[],
