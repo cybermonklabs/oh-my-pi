@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Fixed a parallel directory walk (`grep()`, `glob()`, `fd()`, ast-grep, edit path recovery, and the shell's `grep -r` and `rg`) that could hang for ever, about once in several thousand walks on a busy machine with 8 or more CPUs: a worker that missed the wakeup for its stop message waited for ever, with the message still queued. A walk now stops by closing its job queue
+- Fixed a walk that its caller dropped before its first worker ran reading freed memory as a path
+- Fixed a panic in the input of an ordered search pool being swallowed, which ended the search early with no error; it now reaches the caller after the outputs before it
 - Fixed the darwin native addons failing to build on a Linux build host: the macOS SDK now comes from the Command Line Tools for Xcode 27.2 package (`MacOSX27.2.sdk`) (by [@sjawhar](https://github.com/sjawhar))
 - The native loader honours `OMP_DOWNLOAD_ROOT` and `OMP_CONFIG_ROOT` when it resolves its natives directory
 - Native git reads the global and system configuration as git does: `GIT_CONFIG_GLOBAL` replaces `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` (empty means none) and `GIT_CONFIG_NOSYSTEM` skips the system file, so an identity, signing or hooks in a home it was told not to read no longer reach its commits; a `GIT_CONFIG_NOSYSTEM` that is not a boolean is refused with git's message, as git refuses it, instead of reading the system file
