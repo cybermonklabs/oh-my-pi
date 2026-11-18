@@ -138,6 +138,24 @@ describe("mapInSlices", () => {
 		expect(unitTimerTurns.second).toBeGreaterThan(unitTimerTurns.first);
 	});
 
+	it("runs a timer that fell due during a slice before the same pass's next slice", async () => {
+		// Real time: each unit outlasts a slice's budget and the timers' 1 ms clamp.
+		const busy = (ms: number) => {
+			const start = performance.now();
+			while (performance.now() - start < ms) {}
+		};
+		let fired = false;
+		const seen: boolean[] = [];
+		await mapInSlices([0, 1, 2], index => {
+			if (index > 0) seen.push(fired);
+			fired = false;
+			setTimeout(() => (fired = true), 0);
+			busy(EVENT_LOOP_SLICE_MS + 2);
+		});
+		// Each unit spent a slice, so the pass's release waited for the timers.
+		expect(seen).toEqual([true, true]);
+	});
+
 	it("runs to completion under fake timers, whose frozen clock never ends a slice", async () => {
 		vi.useFakeTimers();
 		let spin = 0;
