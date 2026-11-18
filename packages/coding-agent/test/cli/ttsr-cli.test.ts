@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/cli/ttsr-cli";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getProjectAgentDir, getProjectDir, removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
+import { swapAfterListing } from "../helpers/swap-after-listing";
 
 let testTmpDir: string;
 
@@ -547,6 +548,92 @@ describe("omp ttsr", () => {
 			expect(result.summary.scannedFiles).toBe(0);
 			expect(result.summary.skipped.binary).toBe(1);
 			expect(result.summary.totalMatches).toBe(0);
+		});
+
+		describe("reads below the walked directory", () => {
+			afterEach(() => {
+				vi.restoreAllMocks();
+			});
+
+			/**
+			 * A project whose `src/foo.ts` and `src/inner/bar.ts` match no rule, next to an
+			 * `outside/` directory whose files of the same names do.
+			 */
+			async function project(): Promise<{ projectDir: string; outsideDir: string; rulePath: string }> {
+				const id = Math.random().toString(36).slice(2);
+				const projectDir = path.join(testTmpDir, `.tmp-ttsr-project-${id}`);
+				const outsideDir = path.join(testTmpDir, `outside-${id}`);
+				fs.mkdirSync(path.join(projectDir, "src/inner"), { recursive: true });
+				fs.mkdirSync(path.join(outsideDir, "inner"), { recursive: true });
+				setProjectDir(projectDir);
+				await Bun.write(path.join(projectDir, "src/foo.ts"), "const x = 1;");
+				await Bun.write(path.join(projectDir, "src/inner/bar.ts"), "const y = 2;");
+				await Bun.write(path.join(outsideDir, "foo.ts"), "const OUTSIDE: any = 1;");
+				await Bun.write(path.join(outsideDir, "inner/bar.ts"), "const OUTSIDE: any = 2;");
+				const rulePath = await writeTempRule(": any", ["tool:edit(src/**/*.ts)"]);
+				return { projectDir, outsideDir, rulePath };
+			}
+
+			async function scanSrc(rulePath: string) {
+				await run({ action: "scan", scan: { directory: "src", rule: rulePath }, json: true });
+				return JSON.parse(stdout);
+			}
+
+			it("counts a directory swapped for a symlink after the listing as unreadable", async () => {
+				captureStreams();
+				const { projectDir, outsideDir, rulePath } = await project();
+				const swap = swapAfterListing(
+					() => {
+						fs.renameSync(path.join(projectDir, "src/inner"), path.join(projectDir, "src/inner.moved"));
+						fs.symlinkSync(path.join(outsideDir, "inner"), path.join(projectDir, "src/inner"));
+					},
+					options => options.pattern === "src/**/*",
+				);
+
+				const result = await scanSrc(rulePath);
+
+				expect(swap.ran).toBe(true);
+				expect(result.summary.totalMatches).toBe(0);
+				expect(result.summary.totalFiles).toBe(2);
+				expect(result.summary.scannedFiles).toBe(1);
+				expect(result.summary.skipped.unreadable).toBe(1);
+			});
+
+			it("counts a file swapped for a symlink after the listing as unreadable", async () => {
+				captureStreams();
+				const { projectDir, outsideDir, rulePath } = await project();
+				const swap = swapAfterListing(
+					() => {
+						fs.rmSync(path.join(projectDir, "src/foo.ts"));
+						fs.symlinkSync(path.join(outsideDir, "foo.ts"), path.join(projectDir, "src/foo.ts"));
+					},
+					options => options.pattern === "src/**/*",
+				);
+
+				const result = await scanSrc(rulePath);
+
+				expect(swap.ran).toBe(true);
+				expect(result.summary.totalMatches).toBe(0);
+				expect(result.summary.totalFiles).toBe(2);
+				expect(result.summary.scannedFiles).toBe(1);
+				expect(result.summary.skipped.unreadable).toBe(1);
+			});
+
+			it("still scans a file the listing showed as a symlink", async () => {
+				captureStreams();
+				const { projectDir, rulePath } = await project();
+				fs.mkdirSync(path.join(projectDir, "shared"));
+				await Bun.write(path.join(projectDir, "shared/target.ts"), "const z: any = 3;");
+				fs.symlinkSync("../shared/target.ts", path.join(projectDir, "src/link.ts"));
+
+				const result = await scanSrc(rulePath);
+
+				expect(result.summary.totalFiles).toBe(3);
+				expect(result.summary.scannedFiles).toBe(3);
+				expect(result.summary.skipped.unreadable).toBe(0);
+				expect(result.summary.totalMatches).toBe(1);
+				expect(result.files.map((file: { filePath: string }) => file.filePath)).toEqual(["src/link.ts"]);
+			});
 		});
 	});
 });

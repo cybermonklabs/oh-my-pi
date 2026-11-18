@@ -17,7 +17,7 @@ describe("ptree signal abort handling", () => {
 
 		try {
 			const signal = AbortSignal.abort(new Error("pre-aborted"));
-			using child = spawn(["bun", "-e", "setInterval(() => {}, 1000)"], { signal });
+			using child = spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { signal });
 			await child.nothrow().text();
 			await child.proc.exited;
 
@@ -41,7 +41,7 @@ describe("ptree signal abort handling", () => {
 
 		try {
 			const signal = AbortSignal.abort(new Error("pre-aborted"));
-			const result = await exec(["bun", "-e", "setInterval(() => {}, 1000)"], {
+			const result = await exec([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
 				signal,
 				allowAbort: true,
 			});
@@ -67,9 +67,15 @@ describe("ptree signal abort handling", () => {
 
 		try {
 			const controller = new AbortController();
-			using child = spawn(["bun", "-e", "setInterval(() => {}, 1000)"], {
+			using child = spawn([process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
 				signal: controller.signal,
 			});
+			// The abort must land mid-execution: a child that never started would pass the checks below too,
+			// so the test reads its first line before it aborts.
+			const reader = child.stdout.getReader();
+			const first = await reader.read();
+			reader.releaseLock();
+			expect(new TextDecoder().decode(first.value)).toContain("ready");
 			controller.abort(new Error("aborted mid-run"));
 			await child.nothrow().text();
 			await child.proc.exited;
@@ -84,6 +90,41 @@ describe("ptree signal abort handling", () => {
 			process.off("unhandledRejection", onUnhandled);
 		}
 	});
+
+	it.each(["kill", "dispose"] as const)(
+		"does not trigger unhandledRejection when %s ends the process before anyone waits",
+		async how => {
+			// The process exits from the kill while nobody waits on it yet: a caller
+			// that waits later, or never, must not get its exit as an unhandled rejection.
+			const unhandled: unknown[] = [];
+			const onUnhandled = (err: unknown) => {
+				unhandled.push(err);
+			};
+			process.on("unhandledRejection", onUnhandled);
+
+			try {
+				const child = spawn([process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"]);
+				// The child must be running when the kill lands; a child that never started would pass the
+				// abort checks below too, so the test reads its first line before it kills it.
+				const reader = child.stdout.getReader();
+				const first = await reader.read();
+				reader.releaseLock();
+				expect(new TextDecoder().decode(first.value)).toContain("ready");
+				if (how === "kill") child.kill(new AbortError(new Error("stop"), ""));
+				else child[Symbol.dispose]();
+				await child.proc.exited;
+
+				const nextTurn = Promise.withResolvers<void>();
+				setImmediate(nextTurn.resolve);
+				await nextTurn.promise;
+
+				expect(unhandled).toEqual([]);
+				expect(await child.wait().catch((error: unknown) => error)).toBeInstanceOf(AbortError);
+			} finally {
+				process.off("unhandledRejection", onUnhandled);
+			}
+		},
+	);
 
 	it.skipIf(process.platform === "win32").each([false, true])(
 		"aborts a read started after the root exits (detached: %s)",

@@ -40,9 +40,11 @@ export default class Index extends Command {
 			await runRootCommand(parsed, args);
 		} catch (error) {
 			// Usage errors found after startup (e.g. `--tools` checked against the
-			// discovered registry) may leave live handles; exit instead of draining.
+			// discovered registry) may leave live handles; exit instead of draining,
+			// after the cleanup that gives back a session lease the launch holds.
 			if (reportCliUsageError(error)) {
-				process.exit(2);
+				const { exitAfterCleanup } = await import("@oh-my-pi/pi-utils/postmortem");
+				return exitAfterCleanup(2);
 			}
 			throw error;
 		}

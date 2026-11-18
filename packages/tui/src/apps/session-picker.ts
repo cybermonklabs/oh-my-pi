@@ -1,4 +1,4 @@
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import {
 	SessionSelectorComponent,
 	type SessionHistoryMatcher,
@@ -67,7 +67,9 @@ export async function selectSession<T extends SessionSelectorEntry>(
 				() => finish(null),
 				() => {
 					ui.stop();
-					process.exit(0);
+					// Through postmortem's cleanup: a launch may already hold a session's lease (one it resumed on its
+					// own before the picker), which that cleanup gives back.
+					void postmortem.exitAfterCleanup(0);
 				},
 				{
 					onDelete: options.allowDelete === false ? undefined : host.deleteSession,

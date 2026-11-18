@@ -93,6 +93,7 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionFile: () => null,
+			getCwd: () => process.cwd(),
 			switchSession: () => Promise.reject(failure),
 		},
 		session: {

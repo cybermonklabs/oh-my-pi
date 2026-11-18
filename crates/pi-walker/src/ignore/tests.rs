@@ -219,7 +219,7 @@ async fn walk(fs: &Fs, root: &str) -> Vec<String> {
 			for r in listing.records() {
 				names.record(listing.name(r), r.file_type);
 			}
-			let frame = DirIgnores::load(s, dir, names, false)
+			let frame = DirIgnores::load(s, dir, names, false, false)
 				.await
 				.frame(parent, names, rel);
 			let mut scratch = Vec::new();

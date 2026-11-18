@@ -1,5 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { FetchImpl } from "@oh-my-pi/pi-utils";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { collapseVariants, type VariantCollapseTable } from "../compat/collapse";
 import { compareRevision, parseRevision } from "../compat/revision";
 import { classifyModel } from "../compat/taxonomy";
@@ -111,7 +112,7 @@ export async function fetchGeminiCliQuotaModels(
 
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return null;
 	}
@@ -191,7 +192,7 @@ async function loadProjectId(
 
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = await readJsonInSlices(response);
 	} catch {
 		return undefined;
 	}

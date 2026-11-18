@@ -87,7 +87,6 @@ rustc-hash = "2.1.1"
 self_cell = "1.0.4"
 serde_json = "1"
 smallvec.workspace = true
-tempfile = "3.15.0"
 tokio-util = "0.7"
 xutf.workspace = true
 libc = "0.2.172"
@@ -176,6 +175,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 anyhow = "1.0.102"
+pi-shell.workspace = true
 tempfile = "3"
 
 [features]
@@ -224,7 +224,7 @@ default = ["utils"]
 "util.isutf8" = []
 "util.sponge" = []
 "util.ts" = []
-"util.mv" = []
+"util.mv" = ["util.cp", "util.rm"]
 "util.nl" = ["util.bre"]
 "util.nproc" = []
 "util.od" = []

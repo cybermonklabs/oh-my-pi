@@ -136,6 +136,13 @@ pub struct TreeEntry<'a> {
 	pub size:      Option<u64>,
 	/// Modification time in Unix nanoseconds, when known.
 	pub mtime:     Option<i64>,
+	/// The open root of a traversal that follows no symlink below it, for
+	/// opening, writing, or removing the entry at `path` with no symlink
+	/// followed on the way ([`Session::open_file_beneath`],
+	/// [`Session::remove_file_beneath`]); `None` under [`Follow::Always`],
+	/// whose entries are reached by path, and for the root reported before
+	/// it is listed.
+	pub root_dir:  Option<&'a Arc<Dir>>,
 }
 
 impl<'a> TreeEntry<'a> {
@@ -183,8 +190,8 @@ struct Frame {
 	/// Depth of this directory; its entries sit one level deeper.
 	depth:    usize,
 	ignore:   Option<Arc<IgnoreFrame>>,
-	/// The open directory, for relative child opens (`None` past
-	/// [`MAX_OPEN_DIRS`]).
+	/// The open directory, for relative child opens (`None` for the root,
+	/// whose handle is [`Cx::root_dir`], and past [`MAX_OPEN_DIRS`]).
 	dir:      Option<Dir>,
 	/// Path lengths to restore once the directory is done.
 	rel_len:  usize,
@@ -204,10 +211,11 @@ impl Drop for Stack {
 	}
 }
 
-/// Directory handles kept open down the stack for relative child opens;
-/// deeper directories open by path, so deep trees cannot exhaust
-/// descriptors.
-const MAX_OPEN_DIRS: usize = 64;
+/// Directory handles kept open down the stack for relative child opens, the
+/// root's included; deeper directories open below the root's handle, with no
+/// symlink followed on the way ([`Session::open_dir_beneath`]; by path under
+/// [`Follow::Always`]), so deep trees cannot exhaust descriptors.
+pub(crate) const MAX_OPEN_DIRS: usize = 64;
 
 /// Where a [`Tree`] is in its traversal.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,6 +344,7 @@ impl Tree {
 				root:      abs_root,
 				ignorer:   None,
 				root_dev:  None,
+				root_dir:  None,
 				ancestors: Vec::new(),
 				pool:      Vec::new(),
 				ign:       Vec::new(),
@@ -367,6 +376,12 @@ impl Tree {
 			},
 			_ => {},
 		}
+	}
+
+	/// The open root, once the traversal has listed it: a walk below it opens
+	/// entries with [`Session::open_file_beneath`].
+	pub(crate) const fn root_dir(&self) -> Option<&Arc<Dir>> {
+		self.cx.root_dir.as_ref()
 	}
 
 	/// Runs the traversal to the next report.
@@ -490,6 +505,8 @@ struct Cx {
 	root:      PathBuf,
 	ignorer:   Option<Ignorer>,
 	root_dev:  Option<FileId>,
+	/// The open root, shared with consumers that open entries below it.
+	root_dir:  Option<Arc<Dir>>,
 	/// Identities of the open directories under [`Follow::Always`].
 	ancestors: Vec<FileId>,
 	/// Recycled listings.
@@ -527,6 +544,10 @@ impl Cx {
 			depth:     post.depth,
 			size:      post.size,
 			mtime:     post.mtime,
+			root_dir:  self
+				.root_dir
+				.as_ref()
+				.filter(|_| self.opts.follow != Follow::Always),
 		}
 	}
 
@@ -553,7 +574,9 @@ impl Cx {
 		Emit::Error
 	}
 
-	/// Opens and lists the root into its frame.
+	/// Opens and lists the root into its frame. Under [`Follow::Never`],
+	/// where [`Tree::new`] found the root a directory with `lstat`, it opens
+	/// without following a symlink put there since, which is refused.
 	async fn open_root(&mut self) -> io::Result<Frame> {
 		if self.opts.same_file_system {
 			self.root_dev = self.session.identify(&self.root).await.ok();
@@ -566,10 +589,16 @@ impl Cx {
 			None
 		};
 		let saved = (0, self.abs.len());
-		let dir = self.session.open_dir(&self.root).await?;
-		self
+		let dir = if self.opts.follow == Follow::Never {
+			self.session.open_dir_unlinked(&self.root).await?
+		} else {
+			self.session.open_dir(&self.root).await?
+		};
+		let mut frame = self
 			.open_frame(dir, 0, inherited.as_ref(), 0, None, saved)
-			.await
+			.await?;
+		self.root_dir = frame.dir.take().map(Arc::new);
+		Ok(frame)
 	}
 
 	/// Finishes a fully walked directory: its contents-first report, if any.
@@ -682,8 +711,11 @@ impl Cx {
 		}
 	}
 
-	/// Opens and lists the directory `name` of `parent` (by path when
-	/// `followed`); `None` when it lies on another filesystem than the root.
+	/// Opens and lists the directory `name` of `parent`: relative to
+	/// `parent`'s handle, or past [`MAX_OPEN_DIRS`] below the root's without
+	/// following a symlink on the way, and by path when `followed` (or deep
+	/// under [`Follow::Always`]); `None` when it lies on another filesystem
+	/// than the root.
 	#[expect(clippy::too_many_arguments, reason = "everything one entry decided")]
 	async fn list_child(
 		&mut self,
@@ -696,8 +728,16 @@ impl Cx {
 		post: Option<Post>,
 		saved: (usize, usize),
 	) -> io::Result<Option<Frame>> {
-		let dir = match (&parent.dir, followed) {
-			(Some(dir), false) => self.session.open_child(dir, name).await?,
+		let parent_dir = match &parent.dir {
+			Some(dir) => Some(dir),
+			None if parent.depth == 0 => self.root_dir.as_deref(),
+			None => None,
+		};
+		let dir = match (parent_dir, &self.root_dir, followed) {
+			(Some(dir), _, false) => self.session.open_child(dir, name).await?,
+			(None, Some(root), false) if self.opts.follow != Follow::Always => {
+				self.session.open_dir_beneath(root, &self.rel).await?
+			},
 			_ => self.session.open_dir(as_path(&self.abs)).await?,
 		};
 		if let Some(root) = self.root_dev {
@@ -758,7 +798,8 @@ impl Cx {
 			if names.is_empty() {
 				parent_ignore.cloned()
 			} else {
-				DirIgnores::load(&mut self.session, &dir, names, false)
+				let follow = self.opts.follow == Follow::Always;
+				DirIgnores::load(&mut self.session, &dir, names, false, follow)
 					.await
 					.frame(parent_ignore, names, &self.rel)
 			}

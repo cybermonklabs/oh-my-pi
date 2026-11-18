@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `ref` option to `sleepLong()`: `{ ref: false }` arms every chunk unreferenced, so a day-scale deadline does not by itself keep the process alive ([#17400](https://github.com/can1357/oh-my-pi/pull/17400) by [@sjawhar](https://github.com/sjawhar))
+- Added `expandTilde(path, home?)` (`@oh-my-pi/pi-utils/path`), which expands a leading `~` to the home directory; `@oh-my-pi/pi-coding-agent/tools/path-utils` re-exports it ([#17931](https://github.com/can1357/oh-my-pi/pull/17931) by [@will-bogusz](https://github.com/will-bogusz))
+- Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
+- Added `OMP_CONFIG_ROOT`, an absolute config root that replaces `~/.omp` on every OS (profiles, the default agent directory, and all state, data and caches move under it), and `OMP_DOWNLOAD_ROOT`, a config root that holds only the version-fixed downloads (the managed Chromium, the native addon and its grammars, FastEmbed models and runtime, tiny models), so several config roots share one copy; added `getConfigRootOverride()` and `getBrowserStateDir()`. The test preload gives every test process a config root of its own and shares only the developer's downloads
+- Added `@oh-my-pi/pi-utils/event-loop-slice` (`sliceExpired`, `nextSlice`, `mapInSlices`, `runInSlices`, `runToCompletion`, `parseJsonBytesInSlices`, `readJsonInSlices`) for CPU-bound background work that must give the event loop a turn after each 10 ms slice; concurrent passes share the budget and take it in turn, one pass through the event loop holds at most one slice, and a fetched JSON payload is decoded and parsed in slices of its own
+- `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it.
+- `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it. One without a `deadlineMs` of its own gets no time past the 10 s deadline: when another callback's `deadlineMs` held the pass open that long, it starts once that callback settles and the pass ends at once. With a `deadlineMs` of its own, the pass waits for it that long once it starts, also past the 10 s deadline. A `deadlineMs` callback's `waitMessage` does not wait for `afterOthers` callbacks.
+- `postmortem.exitAfterCleanup(code, { exit })`: runs every cleanup callback, then exits, and does not return, for a caller that must not go on; unlike `process.exit`, it waits for asynchronous cleanup callbacks first, and unlike `exitProcess`, it runs them at all. `exit: "native"` ends through `exitProcess`, past the extension-load guard, for a host-owned exit that can come while extensions load.
+
+### Changed
+
+- `spawn(cmd, { subreaper: true })` on Linux now starts the subreaper as the leader of its own process group and session, as `detached: true` does, and `subreaper` with `detached: false` is refused on every platform. The new session has no controlling terminal, so such a command cannot open `/dev/tty`, and terminal job control (Ctrl-C, Ctrl-Z) and a terminal hangup (SIGHUP) no longer reach it directly; stop it with `kill()`, `signal` or `timeout`
+
+### Fixed
+
+- Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
+- Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
+- Fixed a kill of a command run with `spawn(cmd, { subreaper: true })` (Linux, not `detached`) letting the command run on when the kill came while the subreaper was launching it. SIGSTOP does not end a fork in progress, and the stop signalled only the subreaper, so a command the fork added after the stop's last look survived the kill. The stop's freeze and kill now also reach the process group the subreaper leads, and Linux delivers a group signal to a child that a fork in progress adds. One gap remains: a command that leaves the group with `setsid()` or `setpgid()` (as coreutils `timeout` and job-control shells do) after its fork and before the kill escapes it, which needs another process to resume the frozen subreaper in that window
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

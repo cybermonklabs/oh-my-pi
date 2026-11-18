@@ -1,6 +1,7 @@
 import { scheduler } from "node:timers/promises";
 import {
 	Agent,
+	agentPauseGate,
 	type AgentMessage,
 	type AgentTool,
 	type AgentToolContext,
@@ -526,7 +527,7 @@ export interface SessionAdvisorsHost {
 		currentSelector: string,
 		currentModel?: Model | null,
 	): RetryFallbackSelector[];
-	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean;
+	isRetryFallbackEntrySuppressed(selector: RetryFallbackSelector, model: Model): boolean;
 	noteRetryFallbackCooldown(currentSelector: string, retryAfterMs: number | undefined, errorMessage: string): void;
 	createCodexCompactionContext(options: {
 		trigger: CodexCompactionContext["trigger"];
@@ -1432,6 +1433,9 @@ export class SessionAdvisors {
 				// Not gated on a tool grant: reading what a server advertises is
 				// not the same permission as calling one of its tools.
 				mcpResources: this.#advisorMcpResources,
+				// The advisor's own agent, resolved per frame: this bridge is built before it.
+				// Work a frame starts is the advisor's, never the primary's call of the same id.
+				getExecutionOwner: () => advisorAgent,
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, streamOptions) => {
@@ -1585,7 +1589,8 @@ export class SessionAdvisors {
 
 			// Persist this advisor's turns to `<session>/__advisor[.<slug>].jsonl`
 			// (resolved lazily so it follows session switches) for stats attribution
-			// and Agent Hub observability, without registering it as a peer.
+			// and Agent Hub observability, without registering it as a peer. It goes
+			// to the session's own storage, beside the rest of its transcript tree.
 			const recorder = new AdvisorTranscriptRecorder(
 				() => this.#host.sessionManager.getSessionFile(),
 				() => this.#host.sessionManager.getCwd(),
@@ -1595,7 +1600,10 @@ export class SessionAdvisors {
 				this.#advisorCostSnapshotBarrier
 					? Promise.all([this.#advisorRecorderClosed, this.#advisorCostSnapshotBarrier])
 					: this.#advisorRecorderClosed,
+				this.#host.sessionManager.getStorage(),
 			);
+			// Masks the transcript exactly as the session's own manager masks the session file.
+			recorder.setStoreMasking(this.#host.sessionManager.storeMasking);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
 				maintainContext: (incoming, signal) => this.#maintainAdvisorContext(advisorRef, incoming, signal),
@@ -2045,13 +2053,12 @@ export class SessionAdvisors {
 		}
 		const currentSelector = formatRetryFallbackSelector(advisor.agent.state.model, advisor.thinkingLevel);
 		if (currentSelector === originalSelector.raw) {
-			if (!this.#host.isRetryFallbackSelectorSuppressed(originalSelector)) {
+			if (!this.#host.isRetryFallbackEntrySuppressed(originalSelector, advisor.agent.state.model)) {
 				advisor.retryFallback = undefined;
 				advisor.retryFallbackPendingSuccess = false;
 			}
 			return;
 		}
-		if (this.#host.isRetryFallbackSelectorSuppressed(originalSelector)) return;
 
 		const resolvedPrimary = resolveModelOverride(
 			[originalSelector.raw],
@@ -2060,7 +2067,9 @@ export class SessionAdvisors {
 		);
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
-		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
+		if (!primaryModel) return;
+		if (this.#host.isRetryFallbackEntrySuppressed(originalSelector, primaryModel)) return;
+		if (!this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
 		if (!apiKey) return;
 		signal.throwIfAborted();
@@ -2104,6 +2113,7 @@ export class SessionAdvisors {
 					errorId: assistantFailure.errorId,
 					errorMessage: message,
 					errorStatus: assistantFailure.errorStatus,
+					errorRetryAfterMs: assistantFailure.errorRetryAfterMs,
 				})
 			: AIError.classify(error, currentModel.api);
 		if (AIError.is(errorId, AIError.Flag.Abort) || AIError.is(errorId, AIError.Flag.UserInterrupt)) return false;
@@ -2122,15 +2132,19 @@ export class SessionAdvisors {
 			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
-				{ error: message, modelId: currentModel.id, signal },
+				{ error: message, retryAfterMs: assistantFailure?.errorRetryAfterMs, modelId: currentModel.id, signal },
 			);
 			if (rotation.switched && this.#spendCredentialSwitch(advisor, currentModel.provider)) return true;
 		}
 
-		const retryAfterMs = extractProviderRetryHint(currentModel.provider, message);
+		const retryAfterMs = extractProviderRetryHint(
+			currentModel.provider,
+			message,
+			assistantFailure?.errorRetryAfterMs,
+		);
 		const usageLimit =
 			AIError.is(errorId, AIError.Flag.UsageLimit) ||
-			isUsageLimitOutcome(extractHttpStatusFromError(error), message);
+			isUsageLimitOutcome(extractHttpStatusFromError(error), message, assistantFailure?.errorRetryAfterMs);
 		let usageRetryAtMs: number | undefined;
 		let usageBlockedUntilMs: number | undefined;
 		let usageRequestedBlockedUntilMs: number | undefined;
@@ -2214,10 +2228,10 @@ export class SessionAdvisors {
 		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
 		for (const role of chainKeys) {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
-				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
+				if (this.#host.isRetryFallbackEntrySuppressed(selector, candidate)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 				if (!apiKey) continue;
@@ -2602,6 +2616,9 @@ export class SessionAdvisors {
 						preferWebsockets: this.#host.preferWebsockets(candidate),
 						codexAccessPrograms: cfgProvidersOpenaiCodexDaybreak.get(this.#host.settings),
 						codexCompaction,
+						// The advisor's loop holds its own turns at `/pause`, but this
+						// one-shot bypasses it: hold every request the pass sends.
+						beforeDispatch: agentPauseGate.dispatchHold(signal),
 					},
 				);
 				break;
