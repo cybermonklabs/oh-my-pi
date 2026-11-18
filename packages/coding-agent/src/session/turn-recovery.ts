@@ -1963,8 +1963,9 @@ export class TurnRecovery {
 	/**
 	 * Whether a fallback entry is in cooldown: by its own string, or by the key of
 	 * `model`, the model it resolves to. A cooldown is keyed by the model that
-	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so an
-	 * alias such as `pi/<role>` is in cooldown while the model it resolves to is.
+	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so any
+	 * other spelling that resolves to it (an alias such as `pi/<role>`, an id
+	 * without the catalog revision suffix) is in cooldown while that model is.
 	 */
 	isRetryFallbackEntrySuppressed(selector: RetryFallbackSelector, model: Model): boolean {
 		return (
@@ -2254,11 +2255,11 @@ export class TurnRecovery {
 	 * The check before a model call and the fallback walk share this search. It
 	 * answers the first entry that resolves to a model with configured auth, is
 	 * not in cooldown by its own string or by that model
-	 * (`isRetryFallbackEntrySuppressed`, so an alias such as `pi/<role>` of a
-	 * model in cooldown is passed over), fits the effort ceiling and the context
-	 * without `excludedMessage`, reads neither depleted nor at the reserve, and
-	 * gives a key, with that key and the model the entry resolves to. A key read
-	 * that throws passes over the entry.
+	 * (`isRetryFallbackEntrySuppressed`, so another spelling of a model in
+	 * cooldown, such as an alias `pi/<role>`, is passed over), fits the effort
+	 * ceiling and the context without `excludedMessage`, reads neither depleted
+	 * nor at the reserve, and gives a key, with that key and the model the entry
+	 * resolves to. A key read that throws passes over the entry.
 	 * Undefined when no entry passes, or once `stale()` is true.
 	 */
 	async #searchKeyedRetryFallback(
@@ -2766,8 +2767,8 @@ export class TurnRecovery {
 			// other failure the caller put the model in use in cooldown
 			// (`noteRetryFallbackCooldown`), which bounds the reset: the search, as
 			// every fallback walk, passes over an entry whose resolved model is in
-			// cooldown (`isRetryFallbackEntrySuppressed`), so an alias that resolves
-			// to the model in use, such as `pi/<role>`, is skipped too.
+			// cooldown (`isRetryFallbackEntrySuppressed`), so another spelling of
+			// the model in use, such as an alias `pi/<role>`, is skipped too.
 			if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
 			return true;
 		}
@@ -2931,7 +2932,8 @@ export class TurnRecovery {
 		);
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
-		// A primary recorded at startup can be a configured alias (`pi/<role>`), so its resolved model's key is read.
+		// A primary recorded at startup is the configured spelling (an alias such as
+		// `pi/<role>`, an id without the revision suffix), so its resolved model's key is read.
 		if (primaryModel && this.isRetryFallbackEntrySuppressed(originalSelector, primaryModel)) return false;
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
