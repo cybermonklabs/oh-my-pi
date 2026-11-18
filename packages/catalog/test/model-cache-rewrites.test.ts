@@ -1,14 +1,22 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getModelCacheWriteStats, readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	closeModelCache,
+	getModelCacheWriteStats,
+	readModelCache,
+	readModelCacheSteps,
+	retainModelCacheConnection,
+	writeModelCache,
+} from "@oh-my-pi/pi-catalog/model-cache";
 import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { modelsDevCatalogFallback } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
+import { __resetDirsFromEnvForTests, getModelDbPath, setAgentDir } from "@oh-my-pi/pi-utils";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -222,11 +230,16 @@ describe("model cache write churn", () => {
 	});
 
 	it("reads back every bundled provider snapshot it writes", () => {
+		// What is checked is that each snapshot parses back whole, not that it is on the disk: one in-memory
+		// connection serves the writes and reads. A database file synced the disk some 400 times here, and on a
+		// loaded machine those syncs alone outlasted the test's timeout.
+		const memoryDb = ":memory:";
+		using _cache = retainModelCacheConnection(memoryDb);
 		const rejected: string[] = [];
 		for (const providerId of getBundledProviders()) {
 			const models = getBundledModels(providerId as GeneratedProvider);
-			writeModelCache(providerId, Date.now(), models, false, "fp", dbPath);
-			const entry = readModelCache(providerId, TTL_MS, Date.now, dbPath);
+			writeModelCache(providerId, Date.now(), models, false, "fp", memoryDb);
+			const entry = readModelCache(providerId, TTL_MS, Date.now, memoryDb);
 			if (entry?.models.length !== models.length) rejected.push(providerId);
 		}
 		expect(rejected).toEqual([]);
@@ -251,5 +264,99 @@ describe("model cache write churn", () => {
 		await resolveProviderModels(options, "online");
 		expect(payloadWrites()).toBe(before);
 		expect(readModelCache("azure", TTL_MS, Date.now, dbPath)?.models.length).toBe(bundled.length);
+	});
+});
+
+describe("readModelCacheSteps", () => {
+	let tempDir = "";
+	let dbPath = "";
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-cache-steps-"));
+		dbPath = path.join(tempDir, "models.db");
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		if (tempDir) {
+			await removeWithRetries(tempDir);
+			tempDir = "";
+			dbPath = "";
+		}
+	});
+
+	it("reads a provider's row in one unit and parses it in the next", () => {
+		const models = Array.from({ length: 200 }, (_, index) => model(`m-${index}`));
+		writeModelCache("rewrite-test", 1_000, models, true, "fp", dbPath);
+		// The payload's parse is the only JSON.parse of a text this long.
+		let payloadParses = 0;
+		const parse = JSON.parse;
+		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
+			if (text.length > 10_000) payloadParses++;
+			return parse(text, reviver);
+		});
+		// A path of its own, so no earlier read of this process memoized the row.
+		const steps = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 1_000, dbPath);
+		const read = steps.next();
+		expect(read.done).toBe(false);
+		expect(payloadParses).toBe(0);
+		const parsed = steps.next();
+		expect(parsed.done).toBe(true);
+		expect(payloadParses).toBe(1);
+		expect(parsed.value?.models.map(entry => entry.id)).toEqual(models.map(entry => entry.id));
+		// A second read finds the memoized parse and takes one unit.
+		const again = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 1_000, dbPath).next();
+		expect(again.done).toBe(true);
+		expect(again.value?.models).toHaveLength(models.length);
+	});
+
+	it("does not memoize a parse of the row a write from this process replaced after the read", async () => {
+		// The shared default connection: a write here does not move its data_version, so only the
+		// memo's own bookkeeping keeps a stale parse out. The agent directory is the test's own, so the
+		// shared database it opens is never the one a running omp uses.
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const agentDir = path.join(tempDir, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		try {
+			expect(getModelDbPath().startsWith(agentDir)).toBe(true);
+			writeModelCache("stale-memo-test", 1_000, [model("a", "stale-memo-test")], true, "fp");
+			const steps = readModelCacheSteps<"openai-completions">("stale-memo-test", TTL_MS, () => 1_000);
+			expect(steps.next().done).toBe(false);
+			// Another pass writes the row between this read and its parse.
+			writeModelCache("stale-memo-test", 2_000, [model("b", "stale-memo-test")], true, "fp");
+			expect(steps.next().value?.models.map(entry => entry.id)).toEqual(["a"]);
+			// The next read, e.g. the same pass's re-read on its row turn, sees the write.
+			const next = readModelCache<"openai-completions">("stale-memo-test", TTL_MS, () => 2_000);
+			expect(next?.models.map(entry => entry.id)).toEqual(["b"]);
+		} finally {
+			closeModelCache();
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			__resetDirsFromEnvForTests();
+		}
+	});
+
+	it("deletes a corrupt row only if no write replaced it between the read and the parse", () => {
+		writeModelCache("rewrite-test", 1_000, [model("a")], true, "fp", dbPath);
+		const corrupt = (updatedAt: number) => {
+			const db = new Database(dbPath);
+			db.run("UPDATE model_cache SET models = ?, updated_at = ? WHERE provider_id = 'rewrite-test'", [
+				"[{not json",
+				updatedAt,
+			]);
+			db.close();
+		};
+		corrupt(1_500);
+		const steps = readModelCacheSteps<"openai-completions">("rewrite-test", TTL_MS, () => 2_000, dbPath);
+		expect(steps.next().done).toBe(false);
+		// A write lands between the read and the parse.
+		writeModelCache("rewrite-test", 2_000, [model("b")], true, "fp", dbPath);
+		expect(steps.next().value).toBeNull();
+		expect(readModelCache("rewrite-test", TTL_MS, () => 2_000, dbPath)?.models.map(entry => entry.id)).toEqual(["b"]);
+		// With no write between them, the corrupt row is deleted, as an unsliced read deletes it.
+		corrupt(2_500);
+		expect(readModelCache("rewrite-test", TTL_MS, () => 3_000, dbPath)).toBeNull();
+		expect(payloadRow(dbPath, "rewrite-test")).toBeNull();
 	});
 });

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -32,6 +32,36 @@ describe("discovery null limits", () => {
 		expect(models!.length).toBe(1);
 		expect(models![0].contextWindow).toBeNull();
 		expect(models![0].maxTokens).toBeNull();
+	});
+});
+
+describe("OpenAI-compatible discovery slicing", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	it("maps a long model list in slices that return to the event loop", async () => {
+		const body = JSON.stringify({ data: Array.from({ length: 2_000 }, (_, index) => ({ id: `model-${index}` })) });
+		// Each clock read is 1 ms of work, so a slice ends every ten checks.
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => now++);
+		// Counts passes through the event loop's check phase while the fetch runs.
+		let loopTurns = 0;
+		let counting = true;
+		const countTurns = () => {
+			if (!counting) return;
+			loopTurns++;
+			setImmediate(countTurns);
+		};
+		setImmediate(countTurns);
+		const models = await fetchOpenAICompatibleModels({
+			provider: "custom",
+			api: "openai-completions",
+			baseUrl: "https://api.example.com/v1",
+			fetch: async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }),
+		});
+		counting = false;
+		expect(models?.length).toBe(2_000);
+		// About 200 slices: the event loop went round between them.
+		expect(loopTurns).toBeGreaterThan(50);
 	});
 });
 

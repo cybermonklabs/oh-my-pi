@@ -33,7 +33,10 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 
 	async function add(name: string) {
 		const worktree = path.join(root, name);
-		const result = await $`bun ${cli} worktree add --detach ${worktree} HEAD`.cwd(repo).quiet().nothrow();
+		const result = await $`${process.execPath} ${cli} worktree add --detach ${worktree} HEAD`
+			.cwd(repo)
+			.quiet()
+			.nothrow();
 		return { worktree, result };
 	}
 

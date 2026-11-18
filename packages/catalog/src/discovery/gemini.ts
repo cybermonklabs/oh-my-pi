@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { getBundledModels } from "../models";
 import { toModelSpec } from "../provider-models/bundled-references";
 import type { FetchImpl, Model, ModelSpec } from "../types";
@@ -113,7 +114,7 @@ export async function fetchGeminiModels(
 
 		let payload: unknown;
 		try {
-			payload = await response.json();
+			payload = await readJsonInSlices(response);
 		} catch {
 			return null;
 		}
