@@ -212,6 +212,67 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("gateway", "gone-model")).toBeUndefined();
 	});
 
+	test("a static reload during a merge lets the older pass commit again, so a built-in provider keeps its discovered rows", async () => {
+		mockSteadyClock();
+		const modelsPath = tempDir.join("cfg", "models.json");
+		fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+		const writeConfig = (withOther: boolean, mtimeMs: number) => {
+			const providers: Record<string, unknown> = {
+				openai: { baseUrl: "https://proxy.example.com/v1", apiKey: "TEST_KEY", api: "openai-responses" },
+			};
+			if (withOther) {
+				providers.other = {
+					baseUrl: "https://other.example.com/v1",
+					apiKey: "OTHER_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "other-model",
+							name: "other-model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 100_000,
+							maxTokens: 8_000,
+						},
+					],
+				};
+			}
+			fs.writeFileSync(modelsPath, JSON.stringify({ providers }));
+			fs.utimesSync(modelsPath, new Date(mtimeMs), new Date(mtimeMs));
+		};
+		writeConfig(false, 1_700_000_000_000);
+		let listCalls = 0;
+		const { promise: firstListDone, resolve: firstListResolved } = Promise.withResolvers<void>();
+		const proxyFetch: FetchImpl = async input => {
+			if (String(input) !== "https://proxy.example.com/v1/models") throw new Error(`offline: ${String(input)}`);
+			listCalls++;
+			if (listCalls === 1) {
+				// The online pass's other discoveries finish first, so its fetches resolve with this one.
+				await new Promise(resolve => setTimeout(resolve, 300));
+				queueMicrotask(firstListResolved);
+			}
+			return Response.json({ data: [{ id: "gpt-9.9-proxy" }] });
+		};
+		const registry = new ModelRegistry(authStorage, modelsPath, { fetch: proxyFetch });
+		registry.getAll();
+		// The online pass fetches gpt-9.9-proxy, writes the cache, then merges in slices.
+		const onlinePass = registry.refresh("online");
+		await firstListDone;
+		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		let onlinePassDone = false;
+		void onlinePass.then(() => (onlinePassDone = true));
+		// A scoped pass reads that cache and commits first.
+		await registry.refreshDiscoverableProviders(["openai"], "online-if-uncached");
+		expect(registry.find("openai", "gpt-9.9-proxy")).toBeDefined();
+		// models.yml changes and another provider refreshes: a static reload drops the scoped pass's rows.
+		writeConfig(true, 1_700_000_100_000);
+		await registry.refreshProvider("other", "offline");
+		expect(onlinePassDone).toBe(false);
+		await onlinePass;
+		expect(registry.find("openai", "gpt-9.9-proxy")).toBeDefined();
+	});
+
 	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
 		// No model has auth here, so creation awaits refresh("online-if-uncached") before it rejects.
 		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });

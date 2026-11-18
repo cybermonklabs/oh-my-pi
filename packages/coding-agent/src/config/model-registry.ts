@@ -1244,6 +1244,7 @@ export class ModelRegistry {
 					models: Model<Api>[];
 					authoritativeProviders: Set<string>;
 					discoveryStates: Map<string, ProviderDiscoveryState>;
+					discoverySequences: Map<string, number>;
 					runtimeProviderIds: Set<string>;
 					configuredProviders: Map<string, DiscoveryProviderConfig>;
 					providerOverrides: Map<string, ProviderOverride>;
@@ -1256,6 +1257,7 @@ export class ModelRegistry {
 				models: this.#runtimeDiscoveredModels,
 				authoritativeProviders: new Set(this.#runtimeAuthoritativeProviders),
 				discoveryStates: new Map(this.#providerDiscoveryStates),
+				discoverySequences: new Map(this.#providerDiscoverySequence),
 				runtimeProviderIds: new Set(this.#runtimeModelManagers.keys()),
 				configuredProviders: new Map(this.#discoverableProviders.map(config => [config.provider, config])),
 				providerOverrides: new Map(this.#providerOverrides),
@@ -1324,6 +1326,11 @@ export class ModelRegistry {
 		for (const [providerId, state] of preservedRuntimeState.discoveryStates) {
 			if (preservedProviderIds.has(providerId)) this.#providerDiscoveryStates.set(providerId, state);
 		}
+		// A preserved provider keeps the sequence of the pass that committed its rows,
+		// so an older pass still in its merge cannot replace them.
+		for (const [providerId, sequence] of preservedRuntimeState.discoverySequences) {
+			if (preservedProviderIds.has(providerId)) this.#providerDiscoverySequence.set(providerId, sequence);
+		}
 	}
 
 	/**
@@ -1389,6 +1396,8 @@ export class ModelRegistry {
 		this.#replacedCacheProviders.clear();
 		this.#runtimeDiscoveredModels = [];
 		this.#runtimeAuthoritativeProviders.clear();
+		// The rows these sequences protected are gone; an older pass may commit again.
+		this.#providerDiscoverySequence.clear();
 		this.#internedStaticModels.clear();
 		this.#providerLookupSnapshots.clear();
 		this.#commandConfigsByProvider.clear();
@@ -3953,6 +3962,7 @@ export class ModelRegistry {
 			this.#runtimeDiscoveredModels = this.#runtimeDiscoveredModels.filter(model => model.provider !== providerName);
 			this.#runtimeAuthoritativeProviders.delete(providerName);
 			this.#providerDiscoveryStates.delete(providerName);
+			this.#providerDiscoverySequence.delete(providerName);
 		}
 		this.#invalidateProviderModelCache(providerName);
 		this.#runtimeRegistrations = this.#runtimeRegistrations.filter(change => change.name !== providerName);
