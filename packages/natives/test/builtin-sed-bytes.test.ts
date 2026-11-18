@@ -134,3 +134,20 @@ describe("builtin sed: an empty match inside a character of a line that is UTF-8
 		[String.raw`printf '\303\251\303\251\n' | sed -E 's/a*|b/-/g'`, "-\xc3-\xa9-\xc3-\xa9-\n", 0],
 	]);
 });
+
+describe("builtin sed: an empty match inside a character, beside a back-reference", () => {
+	cases([
+		// GNU, in the C and the C.UTF-8 locale alike: `printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g' | od -c`
+		// is `- c - a - f - 303 - 251 - \n`. Regressed: `-c-a-f-\303\251-`, no match inside the `é`.
+		[String.raw`printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
+		// The same with -E: `- c - a - f - 303 - 251 - \n`.
+		[String.raw`printf 'caf\303\251\n' | sed -E 's/(x)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
+		// The fifth match is the one inside the `é`: `c a f 303 - 251 \n`.
+		// Regressed: `caf\303\251-`.
+		[String.raw`printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/5'`, "caf\xc3-\xa9\n", 0],
+		// The same for the longest match of an alternation: `- c - a - f - 303 - 251 - \n`.
+		[String.raw`printf 'caf\303\251\n' | sed 's/y\|\(x\)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
+		// A character of three bytes: `- 346 - 227 - 245 - \n`.
+		[String.raw`printf '\346\227\245\n' | sed 's/\(x\)*\1*/-/g'`, "-\xe6-\x97-\xa5-\n", 0],
+	]);
+});

@@ -24,6 +24,10 @@
 - `grep` reads a line that is not UTF-8 as bytes, as GNU grep does in the C locale: `.` and `[^…]` match any byte of it, and `-w`, `-x`, `-i` and `-P` read it a byte to a character, so `grep -x 'caf. foo'` and `grep -w caf` select `caf\351 foo`
 - `sed` finds an empty match at every byte of a line, inside a character of several bytes too, as GNU sed does (`s/x*/-/g` on `é`), where it stopped with an internal error; replaces the longest branch beside a back-reference that keeps its group (`s/x\|\(x\)\1/Y/` on `xx` is `Y`); and reads a replacement's delimiter before its other escapes (`s1a1\11` gives `1`, `s&a&x&` gives `x`)
 - `grep` and `sed` accept a back-reference to a group an earlier branch of an enclosing group closed (`\(\(a\)\|b\)\2`), and `nl -bp` reads `a**`, `a*\{2\}` and a leading `\{1,3\}` as GNU nl does, where it refused them
+- `sed` accepts a `}` right after a command, as GNU sed does (`sed -n '/x/{p}'`, `/x/{s/x/X/p}`, `/x/{y/x/X/ }`, `/x/{ba}`, `1{/x/{p}}`), where it refused it with `extra characters at the end of the p command`
+- `sed` finds an empty match inside a character beside a back-reference too, as GNU sed does: `s/\(x\)*\1*/-/g` on `café` prints `-c-a-f-\303-\251-`
+- `sed -z` reads and writes lines ended by a NUL, as GNU sed does, where it ignored `-z`: `$`, `N`, `G`, `H`, `D`, `P`, `=`, `i`, `c`, `l`, `w`, `-i` and the `^` and `$` of the `M` flag follow the NUL, and `a` ends its text with a newline
+- `sed`'s `l` lists a newline inside the pattern space as `\n`, as GNU sed does (`N;l` on `x` and `y` prints `x\ny$`), where it ended the listed line there
 
 ## [18.18.6] - 2026-11-09
 
