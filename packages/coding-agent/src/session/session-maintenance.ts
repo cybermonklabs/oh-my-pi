@@ -650,6 +650,11 @@ export class SessionMaintenance {
 	readonly #host: SessionMaintenanceHost;
 	/** Called with every automatic cut the cut rule admits ({@link onContextCutAdmitted}). */
 	readonly #cutAdmittedListeners = new Set<(cut: ContextCut) => void>();
+	/**
+	 * The cut rule withheld a tool-result prune pass at its latest offer, so the passes are offered again before the
+	 * first request after the prompt cache entry lapses ({@link #pruneWithheldIfDue}).
+	 */
+	#pruneWithheld = false;
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -867,18 +872,42 @@ export class SessionMaintenance {
 		return tokens;
 	}
 
-	/** The cut-rule gate of a prune pass over `entries`: it keeps what precedes its first blanked result. */
+	/**
+	 * The cut-rule gate of a prune pass over `entries`: it keeps what precedes its first blanked result. A pass it
+	 * withholds is offered again once the prompt cache entry lapses ({@link #pruneWithheldIfDue}).
+	 */
 	#pruneGate(site: string, entries: readonly SessionEntry[]): (cut: PruneCut) => boolean {
 		return cut => {
 			const promptTokens = this.#cutPromptTokens();
-			return this.admitsContextCut({
+			const admitted = this.admitsContextCut({
 				site,
 				prefixTokens: Math.max(0, promptTokens - this.#tokensFrom(entries, cut.firstIndex)),
 				removedTokens: cut.tokensSaved,
 				forced: false,
 				promptTokens,
 			});
+			if (!admitted) this.#pruneWithheld = true;
+			return admitted;
 		};
+	}
+
+	/**
+	 * Offers the tool-result prune passes again when the cut rule withheld one at their latest offer and the prompt
+	 * cache entry the next request would read has lapsed since: that request writes the whole prompt again anyway, so
+	 * the rule admits the prune ("lapsed"). The passes are offered after each turn, when its reply has just refreshed
+	 * the entry; this runs before a request is sent (the pre-prompt maintenance and a tool-loop boundary), so a prune
+	 * withheld while the entry was live runs at the first request after it lapsed. `prepare` runs only when the
+	 * passes are due, and a `false` from it leaves them due. Returns whether a pass pruned.
+	 */
+	async #pruneWithheldIfDue(prepare?: () => Promise<boolean>): Promise<boolean> {
+		if (!this.#pruneWithheld || this.#usesExperimentalContextManagement() || !this.promptCacheLapsed()) return false;
+		if (prepare && !(await prepare())) return false;
+		this.#pruneWithheld = false;
+		const superseded = await this.#pruneStaleToolResults();
+		const settings = this.#compactionSettings;
+		const aged =
+			settings.enabled && hasConfiguredCompactionMethod(settings) ? await this.#pruneToolOutputs() : undefined;
+		return superseded !== undefined || aged !== undefined;
 	}
 
 	async #pruneToolOutputs(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
@@ -2981,6 +3010,8 @@ export class SessionMaintenance {
 	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
+		// A prune the cut rule withheld while the cache entry was live runs before the first request after it lapsed.
+		await this.#pruneWithheldIfDue();
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#compactionSettings;
@@ -3053,7 +3084,8 @@ export class SessionMaintenance {
 	 * are already paired in `activeMessages`, the live array the agent loop reads
 	 * before its next model call. Before compacting, the just-finished turn is
 	 * synchronously persisted if async message hooks have not reached the normal
-	 * append path yet.
+	 * append path yet. A prune the cut rule withheld runs here too, once the
+	 * prompt cache entry lapsed meanwhile (a tool that ran past its lifetime).
 	 */
 	async maintainContextMidRun(
 		activeMessages: AgentMessage[],
@@ -3068,6 +3100,18 @@ export class SessionMaintenance {
 			!context?.willContinue
 		)
 			return;
+
+		// The withheld prune rewrites the session, so the finished turn must be in it first.
+		const pruned = await this.#pruneWithheldIfDue(
+			async () =>
+				(await this.#host.persistTurnMessagesForMidRunCompaction(context)) &&
+				!signal?.aborted &&
+				!this.#host.isDisposed(),
+		);
+		if (pruned && this.#host.agent.state.messages !== activeMessages) {
+			activeMessages.splice(0, activeMessages.length, ...this.#host.agent.state.messages);
+			invalidateConvertToLlmArrayCache(activeMessages);
+		}
 
 		const model = this.#model;
 		const contextWindow = model?.contextWindow ?? 0;
@@ -3682,7 +3726,9 @@ export class SessionMaintenance {
 
 		// Stale-result pass runs every turn, before any threshold gating: it is
 		// cheap (bails when no candidate) and independent of the compaction
-		// setting.
+		// setting. The passes here are this turn's offer: a pass the cut rule
+		// withholds sets the flag again.
+		this.#pruneWithheld = false;
 		const supersedeResult = this.#usesExperimentalContextManagement()
 			? undefined
 			: await this.#pruneStaleToolResults();
@@ -5337,39 +5383,58 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * The cut-rule gate of an automatic compaction with `settings`. A compaction keeps the tools and
-	 * system prompt cached (`p`, their local estimate) and writes every message after them again: the
-	 * kept tail and the summary, which does not exist yet and is counted at the summarizer's cap (one
-	 * more for a split turn's prefix), so the write is never underestimated. `s` is the rest of the
-	 * prompt. With nothing to summarize the method's own no-op handling runs and nothing is cut, so the
-	 * rule is not asked.
+	 * The cut an automatic compaction makes, in the rule's letters, when it leaves `afterTokens` of context (the
+	 * tools and system prompt included, a pending prompt not). It keeps the tools and system prompt cached (`p`,
+	 * their local estimate) and writes every message after them again, and it removes what the context holds beyond
+	 * what it leaves. A pending prompt, counted in the trigger figure `P`, is sent either way, so it is not removed.
+	 */
+	#compactionCut(
+		site: string,
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		afterTokens: number,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): ContextCut {
+		const promptTokens = trigger.triggerContextTokens ?? this.#cutPromptTokens();
+		return {
+			site,
+			prefixTokens: computeNonMessageTokens(
+				this.#host.nonMessageTokenSource(),
+				this.#tokenizer,
+				this.#host.settings.revision,
+			),
+			removedTokens: Math.max(0, promptTokens - (trigger.pendingContextTokens ?? 0) - afterTokens),
+			forced: forcedByReason(reason),
+			promptTokens,
+		};
+	}
+
+	/**
+	 * The cut-rule gate of an automatic compaction with `settings`, asked before it starts. Its summary does not
+	 * exist yet, so the context it leaves is counted with the summary at the summarizer's cap (one more for a split
+	 * turn's prefix) plus the file lists appended to it, beside the kept tail and the tools and system prompt: the
+	 * write is never underestimated. Snapcompact is not asked here: it renders its archive first and is weighed by
+	 * that archive before it commits. With nothing to summarize the method's own no-op handling runs and nothing is
+	 * cut, so the rule is not asked.
 	 */
 	#admitsCompaction(
 		site: string,
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
 		settings: EngineCompactionSettings,
-		triggerContextTokens: number | undefined,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
 	): boolean {
 		const model = this.#model;
 		if (!model) return true;
 		const preparation = prepareCompaction(this.#host.sessionManager.getBranch(), settings, model, this.#tokenizer);
 		if (!preparation) return true;
-		const promptTokens = triggerContextTokens ?? this.#cutPromptTokens();
-		const prefixTokens = computeNonMessageTokens(
-			this.#host.nonMessageTokenSource(),
-			this.#tokenizer,
-			this.#host.settings.revision,
-		);
-		const rewrittenTokens =
+		const { readFiles, modifiedFiles } = snapcompact.computeFileLists(preparation.fileOps);
+		const afterTokens =
+			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
 			this.#tokenizer.countMessages(preparation.recentMessages) +
+			this.#tokenizer.countTokens(
+				snapcompact.upsertFileOperations("", readFiles, modifiedFiles, preparation.fileOps.read),
+			) +
 			MAX_SUMMARY_TOKENS * (preparation.isSplitTurn ? 2 : 1);
-		return this.admitsContextCut({
-			site,
-			prefixTokens,
-			removedTokens: Math.max(0, promptTokens - prefixTokens - rewrittenTokens),
-			forced: forcedByReason(reason),
-			promptTokens,
-		});
+		return this.admitsContextCut(this.#compactionCut(site, reason, afterTokens, trigger));
 	}
 
 	/**
@@ -5431,7 +5496,7 @@ export class SessionMaintenance {
 			// A rollover the model asked for (`new_context`) is its choice, not an automatic cut.
 			if (
 				!explicitNewContextRequest &&
-				!this.#admitsCompaction("context-rollover", reason, compactionSettings, options.triggerContextTokens)
+				!this.#admitsCompaction("context-rollover", reason, compactionSettings, options)
 			) {
 				return COMPACTION_CHECK_NONE;
 			}
@@ -5502,14 +5567,16 @@ export class SessionMaintenance {
 		}
 
 		// A compaction that waits leaves any background speculation armed for a later pass. Shake
-		// weighs its own, smaller cut ({@link #runAutoShake}).
+		// weighs its own, smaller cut ({@link #runAutoShake}); snapcompact weighs the archive it
+		// renders, before it commits it.
 		if (
 			method !== "shake" &&
+			method !== "snapcompact" &&
 			!this.#admitsCompaction(
 				`compaction-${method}`,
 				reason,
 				resolveMethodSettings(compactionSettings, method),
-				options.triggerContextTokens,
+				options,
 			)
 		) {
 			return COMPACTION_CHECK_NONE;
@@ -5520,9 +5587,12 @@ export class SessionMaintenance {
 		// run is aborted (this real pass supersedes it) and an armed result is
 		// returned only when still valid for the current branch/model/settings.
 		// Snapcompact is local and instant, so an armed LLM summary (possible
-		// only when settings/model changed since arming) never overrides it.
-		const claimedSpec = this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
-		const armedSpec = method === "snapcompact" ? undefined : claimedSpec;
+		// only when settings/model changed since arming) never overrides it; it
+		// claims the slot once the cut rule admits what it commits.
+		const armedSpec =
+			method === "snapcompact"
+				? undefined
+				: this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
 
 		const effectiveSettings = resolveMethodSettings(compactionSettings, method);
 		const fallbackFromShake = options.fallbackFromShake === true;
@@ -5655,6 +5725,9 @@ export class SessionMaintenance {
 
 			let pathEntriesForCompaction = pathEntries;
 			let preparation = prepareCompaction(pathEntriesForCompaction, effectiveSettings, this.#model, this.#tokenizer);
+			// Snapcompact asks the cut rule before it commits (below). A pass with nothing to summarize until its
+			// rescue rewrote history is not asked, as {@link #admitsCompaction} asks no pass with nothing to summarize.
+			const weighsSnapcompact = method === "snapcompact" && preparation !== undefined;
 			if (!preparation) {
 				// prepareCompaction found nothing to summarize because the kept region
 				// is a single oversized recent turn — findCutPoint never cuts inside a
@@ -6389,6 +6462,29 @@ export class SessionMaintenance {
 					});
 				}
 				return reason === "threshold" ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
+			}
+			// Snapcompact is weighed by what it commits, known only now: its rendered archive (or a hook's compaction)
+			// and the kept tail. One that waits starts no other method and leaves any speculation armed; one the rule
+			// admits claims the speculation slot, which this pass supersedes.
+			if (method === "snapcompact") {
+				if (
+					weighsSnapcompact &&
+					!this.admitsContextCut(this.#compactionCut(`compaction-${method}`, reason, projectedAfter, options))
+				) {
+					await this.#emitLifecycleEvent(
+						{
+							type: "auto_compaction_end",
+							action,
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							skipped: true,
+						},
+						options.detachPostCommit === true,
+					);
+					return COMPACTION_CHECK_NONE;
+				}
+				this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
 			}
 			if (projectedAfter < candidateTokensBefore) {
 				tokensBefore = candidateTokensBefore;

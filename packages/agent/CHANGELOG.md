@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input
+- Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input; an unbounded threshold (`Number.POSITIVE_INFINITY`, nothing compacts the context) counts the saved reads over every later request
 - Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
 - Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop
 

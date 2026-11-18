@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Automatic context cuts (tool-result pruning, auto-shake, automatic compaction and its rescue) now run only when the prompt-cache reads they save pay for the cache write they cause, the cached prompt has already expired or the next request cannot read it (another model, thinking level, tool set or system prompt), or the request cannot be sent without them; manual `/shake`, `/compact` and RPC-requested compaction are unchanged
+- Automatic context cuts (tool-result pruning, auto-shake, automatic compaction and its rescue) now run only when the prompt-cache reads they save pay for the cache write they cause, the cached prompt has already expired or the next request cannot read it (another model, thinking level, tool set or system prompt), or the request cannot be sent without them; manual `/shake`, `/compact` and RPC-requested compaction are unchanged. A prune that waited runs before the first request after the cached prompt expires. A snapcompact compaction is weighed by the archive it renders, before it is committed. A model whose cost data prices no cache keeps its cuts, as does one whose context window is unknown: nothing compacts its context, so what a cut removes is saved on every later request
 
 ### Fixed
 

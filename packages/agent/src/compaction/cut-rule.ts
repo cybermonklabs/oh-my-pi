@@ -27,7 +27,12 @@ export interface ContextCutInputs {
 	readPrice: number;
 	/** `w`: price of one token written to the cache, at the cache lifetime the next request asks. */
 	writePrice: number;
-	/** `T`: the compaction threshold `shouldCompact` uses (`resolveThresholdTokens`). */
+	/**
+	 * `T`: the compaction threshold `shouldCompact` uses (`resolveThresholdTokens`).
+	 * `Number.POSITIVE_INFINITY` when nothing compacts the context (a model whose
+	 * window is unknown): `N` is then unbounded, since the saved tokens are saved
+	 * on every later request.
+	 */
 	thresholdTokens: number;
 	/** `g`: mean prompt growth per main request, from {@link meanPromptGrowth}; at least 1. */
 	growthPerRequest: number;
@@ -47,9 +52,12 @@ export interface ContextCutDecision {
 	/** Whether the cut runs now; `false` means it waits. */
 	admitted: boolean;
 	reason: ContextCutReason;
-	/** `N`: requests until the context after the cut reaches the threshold again. */
+	/**
+	 * `N`: requests until the context after the cut reaches the threshold again;
+	 * `Number.POSITIVE_INFINITY` when the threshold is.
+	 */
 	requestsToThreshold: number;
-	/** `N * s * r`: the cache reads the cut saves over those requests. */
+	/** `N * s * r`: the cache reads the cut saves over those requests; 0 when `s` or `r` is. */
 	saving: number;
 	/** `(P - p - s) * (w - r)`: the extra cost of writing the tokens after the cut again. */
 	writeCost: number;
@@ -85,6 +93,9 @@ function nonNegative(value: number): number {
  * growth `g` ({@link meanPromptGrowth}), the idle time and cache lifetime, and
  * whether the cut is forced. Negative or NaN figures count as 0, `g` as at
  * least 1, and a cut position past the end of the prompt as nothing to write.
+ * A threshold of `Number.POSITIVE_INFINITY` (nothing compacts the context)
+ * makes `N` unbounded: a cut that removes tokens a read prices then pays,
+ * and one that removes none, or prices no read, saves nothing.
  *
  * The rule governs automatic cuts only. Manual `/shake` and `/compact`, and a
  * compaction an RPC client requests, are a person's or an operator's choice and
@@ -97,7 +108,7 @@ export function decideContextCut(inputs: ContextCutInputs): ContextCutDecision {
 	const growth = Math.max(1, nonNegative(inputs.growthPerRequest));
 	const tokensAfterCut = nonNegative(promptTokens - removedTokens);
 	const requestsToThreshold = Math.max(0, Math.floor((nonNegative(inputs.thresholdTokens) - tokensAfterCut) / growth));
-	const saving = requestsToThreshold * removedTokens * readPrice;
+	const saving = removedTokens > 0 && readPrice > 0 ? requestsToThreshold * removedTokens * readPrice : 0;
 	const rewrittenTokens = nonNegative(promptTokens - nonNegative(inputs.prefixTokens) - removedTokens);
 	const writeCost = rewrittenTokens * (nonNegative(inputs.writePrice) - readPrice);
 

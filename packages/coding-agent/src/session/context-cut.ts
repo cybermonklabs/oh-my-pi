@@ -120,8 +120,10 @@ export function promptCacheEntryLapsed(cacheEntry: ContextCutSession["cacheEntry
  * request touched it, so a warm refresh keeps the cache live), its lifetime (the model's declared one
  * for the entry's tier, else five minutes or one hour), and the lifetime `r` and `w` are priced at
  * ({@link getCacheTokenPrices}). Without an entry every cut counts as lapsed. `T` is the compaction
- * threshold and `g` the mean growth of the recent main requests' prompts. A prompt over the window
- * less the reserve forces the cut whatever the site says: with default settings that is the threshold.
+ * threshold, unbounded for a model whose window is unknown (no threshold compaction ever comes back
+ * for the saved tokens), and `g` the mean growth of the recent main requests' prompts. A prompt over
+ * the window less the reserve forces the cut whatever the site says: with default settings that is
+ * the threshold.
  */
 export function decideSessionContextCut(session: ContextCutSession, cut: ContextCut): ContextCutDecision {
 	const { model, compactionSettings, cacheEntry, promptTokens } = session;
@@ -135,7 +137,8 @@ export function decideSessionContextCut(session: ContextCutSession, cut: Context
 		removedTokens: cut.removedTokens,
 		readPrice: prices.read,
 		writePrice: prices.write,
-		thresholdTokens: contextWindow > 0 ? resolveThresholdTokens(contextWindow, compactionSettings) : 0,
+		thresholdTokens:
+			contextWindow > 0 ? resolveThresholdTokens(contextWindow, compactionSettings) : Number.POSITIVE_INFINITY,
 		growthPerRequest: meanPromptGrowth(recentMainPrompts(session.branch)),
 		idleMs,
 		lifeMs,
