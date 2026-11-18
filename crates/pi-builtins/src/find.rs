@@ -6072,6 +6072,55 @@ mod tests {
 		assert!(!tree.outside.join("decoy.txt").exists(), "-L removes through the link");
 	}
 
+	/// `find root -delete` removes nothing outside `root` while the operand
+	/// `root` itself flips between a directory and a symlink to `outside/`,
+	/// 2,000 times. find (`-P`) checks the root with `lstat`, so on every
+	/// kernel it must not walk a symlink put there since.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink() {
+		const RUNS: usize = 2_000;
+		let mut escapes = 0;
+		for _ in 0..RUNS {
+			let cwd = tempfile::tempdir().unwrap();
+			let (root, parked, outside) =
+				(cwd.path().join("root"), cwd.path().join("parked"), cwd.path().join("outside"));
+			std::fs::create_dir_all(root.join("sub")).unwrap();
+			std::fs::create_dir_all(&outside).unwrap();
+			for i in 0..4 {
+				std::fs::write(root.join(format!("sub/in{i}")), b"").unwrap();
+				std::fs::write(outside.join(format!("victim{i}")), b"").unwrap();
+			}
+			let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+			let swapper = {
+				let (root, parked, outside, stop) =
+					(root.clone(), parked.clone(), outside.clone(), std::sync::Arc::clone(&stop));
+				std::thread::spawn(move || {
+					while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+						if std::fs::rename(&root, &parked).is_err() {
+							std::thread::yield_now();
+							continue;
+						}
+						let _ = std::os::unix::fs::symlink(&outside, &root);
+						for _ in 0..50 {
+							std::hint::spin_loop();
+						}
+						let _ = std::fs::remove_file(&root);
+						let _ = std::fs::rename(&parked, &root);
+					}
+				})
+			};
+			let _ = run_async_util::<Find>(&["root", "-delete"], "", cwd.path()).await;
+			stop.store(true, std::sync::atomic::Ordering::Relaxed);
+			swapper.join().unwrap();
+			if (0..4).any(|i| !outside.join(format!("victim{i}")).exists()) {
+				escapes += 1;
+			}
+		}
+		eprintln!("{RUNS} runs swapping root: {escapes} removed a file outside the tree");
+		assert_eq!(escapes, 0, "find -delete removed files outside the operand through a swapped root");
+	}
+
 	/// `find . -delete` empties the directory and leaves `.` itself, as GNU
 	/// find does, with no diagnostic. Any other spelling of the directory
 	/// (`./`, `.//`, `./.`) is not kept: its removal fails with EINVAL and
