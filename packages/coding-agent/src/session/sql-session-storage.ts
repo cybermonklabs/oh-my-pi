@@ -1,16 +1,30 @@
+import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { type FileLockHandle, logger, toError } from "@oh-my-pi/pi-utils";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
-import { SessionWriteConflictError } from "./session-storage";
-import { enoent } from "./session-storage-errors";
-import type { SessionTitleUpdate } from "./session-title-slot";
+import {
+	type SessionAcquireOptions,
+	type SessionClaimHolder,
+	type SessionClaimOptions,
+	SessionLeaseLostError,
+	type SessionStorage,
+	SessionWriteConflictError,
+	sessionLeaseId,
+	tryAcquireSessionLease,
+} from "./session-storage";
+import { eexist, enoent } from "./session-storage-errors";
+import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-title-slot";
 
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
  * `client.options.adapter`; we detect it once at construction and pick the
- * correct DDL / upsert / concat / byte-slice syntax for the underlying engine.
+ * correct DDL / upsert / byte-slice syntax for the underlying engine.
  */
 export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
 
@@ -25,7 +39,20 @@ export interface SqlSessionStorageTransaction {
 	unsafe(query: string, values?: unknown[]): Promise<SqlSessionStorageResult>;
 }
 
-/** Bun.SQL-compatible client whose transactions make session renames atomic. */
+/**
+ * Bun.SQL-compatible client. PostgreSQL and MySQL writes run in `transaction()`
+ * so a session row and its parts change together; on SQLite the store issues
+ * `BEGIN IMMEDIATE` / `COMMIT` through `unsafe()` itself and runs one call at a
+ * time per client, because Bun's SQLite adapter has a single connection.
+ * On PostgreSQL every write, a single statement included, runs in
+ * `transaction()` and starts with `SET TRANSACTION READ WRITE`, which takes
+ * effect only as the first statement of a real transaction block, so a
+ * wrapper's `transaction()` must open a real transaction before it calls the
+ * callback (one that only calls the callback silently loses `READ WRITE`).
+ * Such a wrapper also loses the start-up lock: in autocommit,
+ * `pg_advisory_xact_lock` is released when its own statement ends, so stores
+ * that start together race on `CREATE TABLE` again, and no error shows it.
+ */
 export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 	transaction(callback: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void>;
 	/**
@@ -52,67 +79,530 @@ export interface SqlSessionStorageOptions {
 	 */
 	adapter?: SqlSessionStorageAdapter;
 	/**
-	 * Table name to use. Default: `omp_session_files`. Must match
-	 * `[A-Za-z_][A-Za-z0-9_]{0,62}` — inlined into prepared statements at
-	 * startup, so we accept identifier-safe inputs only (no quoted/dotted
-	 * names).
+	 * Session table name. Default: `omp_session_files`; appended parts live in
+	 * `<table>_parts`. Must match `[A-Za-z_][A-Za-z0-9_]{0,56}`: at most 57
+	 * characters, so `<table>_parts` fits the 63-character identifier limit.
+	 * Both names are inlined into prepared statements, so we accept
+	 * identifier-safe inputs only (no quoted/dotted names).
 	 */
 	table?: string;
 	/**
-	 * If true, run `CREATE TABLE IF NOT EXISTS` during `create()`.
-	 * Default: true. Disable when the table is owned by an external
-	 * migration.
+	 * If true, create the tables (the session table, `<table>_parts`, and on
+	 * PostgreSQL and MySQL the lease table) and migrate an older session
+	 * table during `create()`. Default: true. With false, `create()` runs no
+	 * DDL and refuses to start unless the schema docs/session.md ("SQL
+	 * session storage") describes is in place; use it when the tables are
+	 * owned by an external migration.
 	 */
 	createTable?: boolean;
+	/**
+	 * Claim the sessions this process writes (`claimSession`,
+	 * `acquireSessionClaim`, `sessionClaimLost`), so a second live process
+	 * that opens one moves to a sibling instead of writing the same journal.
+	 * On PostgreSQL and MySQL a claim is a row of {@link leaseTable} that a
+	 * heartbeat keeps fresh and that every content write checks in its own
+	 * transaction; on a SQLite file it is an OS lock the kernel drops when
+	 * this process dies. An in-memory SQLite database claims nothing. Default:
+	 * false, so a store an SDK caller builds from a client behaves as before;
+	 * the CLI turns it on.
+	 */
+	claims?: boolean;
+	/**
+	 * Lease table name (PostgreSQL and MySQL). Default: `omp_session_leases`.
+	 * Rows are keyed by session id, and session ids are UUIDs, so stores with
+	 * different session tables may share one. Must match
+	 * `[A-Za-z_][A-Za-z0-9_]{0,55}`: at most 56 characters, so its index
+	 * `<leaseTable>_holder` fits the 63-character identifier limit.
+	 */
+	leaseTable?: string;
+	/**
+	 * Lease timings: a lease whose heartbeat is older than `expiryMs` on the
+	 * database clock may be taken over; the holder refreshes it every
+	 * `heartbeatMs`. Default: {@link SESSION_LEASE_EXPIRY_MS} and
+	 * {@link SESSION_LEASE_HEARTBEAT_MS}; `expiryMs` must exceed `heartbeatMs`.
+	 */
+	lease?: { expiryMs: number; heartbeatMs: number };
 }
+
+/** A lease whose heartbeat is older than this, by the database clock, may be taken over. */
+export const SESSION_LEASE_EXPIRY_MS = 30_000;
+/** How often a store refreshes the heartbeat of every lease it holds. */
+export const SESSION_LEASE_HEARTBEAT_MS = 10_000;
+/**
+ * How long opening an existing session waits for another process's lease on
+ * it to go or expire before it moves off (or, under `OMP_SESSION_EXCLUSIVE=1`,
+ * stops): one expiry and 5 s.
+ */
+export const SESSION_OPEN_CLAIM_WAIT_MS = SESSION_LEASE_EXPIRY_MS + 5000;
+
+/** A dialect-rendered statement and the names of the values it binds, in binding order. */
+interface Statement {
+	readonly sql: string;
+	readonly params: readonly string[];
+}
+
+type StatementValues = Readonly<Record<string, string | number | null>>;
 
 interface DialectQueries {
 	createTable: string;
-	/** Add title metadata columns to existing tables created before title fields existed. */
-	addTitleColumns: readonly string[];
-	/** Insert or replace the full content for `path`. Used for `writeText`/`flags="w"` truncate. */
-	upsertReplace: string;
-	/** Insert a full body only when `path` does not exist. */
-	insertIfMissing: string;
-	/** Replace a full body only when its current UTF-8 byte length matches. */
-	replaceIfSize: string;
-	/** Insert if missing; otherwise append the new chunk to existing content. Used for `writeLine`. */
-	upsertAppend: string;
-	/** Update indexed title metadata without rewriting the JSONL body. */
-	updateTitle: string;
-	/** Delete a single row by path. */
-	delete: string;
-	/** Move a row from one path to another. */
-	rename: string;
-	/** Warm the synchronous index without transferring full content. */
+	createPartsTable: string;
+	/** Columns added to session tables created before they existed, each run only when the column is missing. */
+	addColumns: ReadonlyArray<{ column: string; ddl: string }>;
+	/** Any row written before `byte_len` existed; read without locking. */
+	findUnmeasured: string;
+	/** Measure rows written before `byte_len` existed. */
+	backfillByteLen: string;
+	/** Column names of the table named `@table`; none when it does not exist. */
+	columns: Statement;
+	/** Warm the synchronous index from session rows only, never content. */
 	loadIndex: string;
-	/** Read the full content for the async `readText` surface. */
-	readFull: string;
-	/** Read bounded byte windows from the head and tail of the content. */
-	readSlices: string;
+	/**
+	 * One append: grow the session row's `byte_len` (taking its row lock), then
+	 * insert the line as a part at the old length. PostgreSQL does both in one
+	 * statement; every dialect runs its list in one transaction.
+	 */
+	append: readonly Statement[];
+	/** The session's `byte_len`, row-locked for the rest of the transaction where the dialect can. */
+	lockSize: Statement;
+	/** Insert or replace the session row of a full write. */
+	upsertRow: Statement;
+	/** Insert the session row of a full write only when `path` has none. */
+	insertRowIfMissing: Statement;
+	deleteRow: Statement;
+	/** Whether `path` has any parts, read without locking. */
+	hasParts: Statement;
+	deleteParts: Statement;
+	/**
+	 * Delete every session row whose path starts with `@dir` (its first `@len`
+	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
+	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
+	 * case) and exactly those rows' parts. PostgreSQL and MySQL do both in one
+	 * statement, so the parts deleted are those of the rows deleted: a row
+	 * another client commits between two statements would otherwise keep its
+	 * row and lose its parts under READ COMMITTED. SQLite runs the two
+	 * statements inside `BEGIN IMMEDIATE`, where no other writer runs.
+	 */
+	deleteUnder: Statement[];
+	insertPart: Statement;
+	renameRow: Statement;
+	renameParts: Statement;
+	exists: Statement;
+	/** Update indexed title metadata without touching the content. */
+	updateTitle: Statement;
+	/** The session row's content and every part, in one statement so they come from one snapshot. */
+	readFull: Statement;
+	/** Bounded head and tail bytes from the session row and the parts covering each window. */
+	readSlices: Statement;
+	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
+	readFrom: Statement;
+	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
+	lease: LeaseQueries | undefined;
+}
+
+/**
+ * How a MySQL-family server bounds a lease row's lock wait without session
+ * state, as the store finds at start-up: MySQL 8.0 or later (`NOWAIT`
+ * locking reads, `FOR SHARE`), or MariaDB 10.3 or later (`NOWAIT` locking
+ * reads, `LOCK IN SHARE MODE`, and `SET STATEMENT` for an insert). A store
+ * that claims sessions refuses to start on any other (see `mysqlLockForm`).
+ */
+type MysqlLockForm = "mysql" | "mariadb";
+
+/**
+ * The lock form `version` (`SELECT VERSION()`) supports, or `undefined` for
+ * MySQL before 8.0 and MariaDB before 10.3, which bound no lock wait except
+ * through session state.
+ */
+function mysqlLockForm(version: string): MysqlLockForm | undefined {
+	const [major = 0, minor = 0] = (/^(\d+)\.(\d+)/.exec(version) ?? []).slice(1).map(Number);
+	if (/mariadb/i.test(version)) return major > 10 || (major === 10 && minor >= 3) ? "mariadb" : undefined;
+	return major >= 8 ? "mysql" : undefined;
+}
+
+/**
+ * Statements on the lease table: one row per claimed session (`session_id`,
+ * `holder`, `host`, `pid`, `acquired_at`, `heartbeat_at`), every time in
+ * milliseconds since the epoch on the database clock, read in the statement
+ * that writes or compares it.
+ */
+interface LeaseQueries {
+	createTable: string;
+	/**
+	 * PostgreSQL's index on `holder`, made only when the lease table has none
+	 * (see {@link PG_HOLDER_INDEXES}); MySQL declares it in `createTable`.
+	 */
+	createIndex: string | undefined;
+	/**
+	 * PostgreSQL's claim, one statement: insert the lease, or take it over when
+	 * its heartbeat expired or `@holder` already holds it. Returns a row when
+	 * the claim succeeded.
+	 */
+	claim: Statement;
+	/**
+	 * MySQL's claim, one transaction: lock the lease row (`nowait`'s `lock`:
+	 * `holder`, and `stale` 1 when its heartbeat expired), then insert or take
+	 * it over. `take` sets `acquired_at` first, because MySQL assigns left to
+	 * right.
+	 */
+	insert: Statement;
+	take: Statement;
+	/**
+	 * Refresh `@holder`'s leases of the `count` sessions `@sid0` … this store
+	 * still holds a live claim on, and no other row of its: a row whose
+	 * release gave up is left to expire. Returns their `session_id` (MySQL
+	 * reads them back with `heldBy`).
+	 */
+	heartbeat(count: number): Statement;
+	/**
+	 * PostgreSQL's `heartbeat` to run outside a transaction, where the
+	 * connection's `search_path` is not locked: every function and operator
+	 * it names is `pg_catalog`'s, written so, and its table is qualified.
+	 * Unset on MySQL, whose heartbeat runs alone already.
+	 */
+	heartbeatAlone: ((count: number) => Statement) | undefined;
+	heldBy(count: number): Statement;
+	release: Statement;
+	/**
+	 * PostgreSQL's session lock beside the lease row, keyed by the lease
+	 * table and `@sid` (two tables are two claim domains, so the same session
+	 * id in each takes a different lock): taken exclusively by a claim before
+	 * its statement, shared by a write's fence of a session this store holds
+	 * no claim on. A missing row cannot be locked, so without it a claim's
+	 * insert would not wait for such a write in flight (MySQL's share lock of
+	 * the missing row takes its gap instead, per table already). The key is a
+	 * 32-bit hash: a collision only makes two leases take turns.
+	 */
+	claimLock: Statement | undefined;
+	fenceLock: Statement | undefined;
+	/**
+	 * PostgreSQL's database fence: `@holder`'s lease row of `@sid`,
+	 * share-locked for the rest of the write's transaction, so a takeover's
+	 * update waits for the write to commit and then sees it. MySQL's is
+	 * `nowait`'s `held`.
+	 */
+	held: Statement;
+	/**
+	 * PostgreSQL's fence for a write to a path this store holds no claim on:
+	 * another holder's fresh lease row of `@sid`, read after the session's
+	 * shared advisory lock (`fenceLock`). MySQL's is `nowait`'s `foreign`.
+	 */
+	foreign: Statement;
+	/**
+	 * MySQL's and MariaDB's lease locks, by the form the store found at
+	 * start-up: the claim's `lock` of the row, the fences' `held` and
+	 * `foreign` (share-locked: a plain read would fix the transaction's
+	 * snapshot before the session row lock), and a lock of this store's row
+	 * before the release deletes it. Each refuses at once (`NOWAIT`: errno
+	 * 3572 on MySQL 8, 1205 on MariaDB) instead of waiting for another
+	 * transaction's lock, and the store throws that transaction away and runs
+	 * it again within its bound (see {@link retryLockRefusals}): the one
+	 * transaction-scoped bound MySQL has
+	 * on a row lock wait. Unset on PostgreSQL.
+	 */
+	nowait:
+		| Record<MysqlLockForm, { lock: Statement; held: Statement; foreign: Statement; releaseLock: Statement }>
+		| undefined;
+	/**
+	 * MariaDB's `insert`, whose lock wait ends after `seconds` (rounded up to
+	 * a whole second) for that statement alone (`SET STATEMENT
+	 * innodb_lock_wait_timeout = … FOR`); MySQL has no statement-scoped bound
+	 * for an `INSERT`. Unset on PostgreSQL.
+	 */
+	insertWithin: ((seconds: number) => Statement) | undefined;
+	/** The holder of `@sid`'s lease and whether its heartbeat expired. */
+	probe: Statement;
+}
+
+/** `lease.lock` row. */
+interface LeaseLockRow {
+	holder: string;
+	stale: number | bigint | string;
+}
+
+/** `lease.probe` row. */
+interface LeaseProbeRow {
+	host: string;
+	pid: number | bigint | string;
+	stale: number | bigint | string;
 }
 
 interface IndexRow {
 	path: string;
-	byte_len: number | bigint | string;
+	byte_len: number | bigint | string | null;
 	mtime_ms: number | bigint | string;
 	title?: string | null;
 	title_source?: string | null;
 	title_updated_at?: string | null;
 }
 
+interface ColumnRow {
+	column_name: string;
+}
+
+interface SizeRow {
+	byte_len: number | bigint | string;
+}
+
+interface BusyTimeoutRow {
+	timeout: number | bigint | string;
+}
+
+/** {@link READ_ONLY_SETTINGS} row. */
+interface ReadOnlySettingsRow {
+	setting: string;
+	reset_val: string;
+}
+
+/** `readFull` row: kind 0 is the session row's own content, kind 1 a part. */
 interface ContentRow {
+	kind: number | string;
+	start_offset: number | bigint | string;
 	content: string;
 }
 
+/** `readSlices` row: kind 0 is the session row, kind 1 a part in the head window, kind 2 a part in the tail window. */
 interface SliceRow {
-	head: unknown;
-	tail: unknown;
+	kind: number | string;
+	start_offset: number | bigint | string;
+	head: Uint8Array | null;
+	tail: Uint8Array | null;
+}
+
+/** `readFrom` row: kind 0 is the session row (with its size), kind 1 a part covering the window. */
+interface ReadFromRow {
+	kind: number | string;
+	start_offset: number | bigint | string;
+	byte_len: number | bigint | string | null;
+	bytes: Uint8Array | null;
 }
 
 const DEFAULT_TABLE = "omp_session_files";
-const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,56}$/;
+const DEFAULT_LEASE_TABLE = "omp_session_leases";
+const LEASE_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,55}$/;
+/**
+ * How long the database may take to delete a released lease row: PostgreSQL's
+ * `statement_timeout` for that delete, and on MySQL and MariaDB how long the
+ * release retries its `NOWAIT` lock of the row before it deletes it. A delete that
+ * takes longer is rolled back, and the row expires on its own.
+ */
+const LEASE_RELEASE_BOUND_MS = 2000;
+/** How much longer than {@link LEASE_RELEASE_BOUND_MS} a release waits for a database that does not answer at all. */
+const LEASE_RELEASE_GRACE_MS = 250;
+/**
+ * How long a claim statement waits for another transaction's lock of the
+ * lease row (the holder's write in flight, share-locked by its fence) when
+ * its caller set no wait: PostgreSQL's `lock_timeout` for the claim's
+ * transaction; on MySQL and MariaDB how long the claim retries its `NOWAIT`
+ * lock of the row, and on MariaDB its insert's `SET STATEMENT
+ * innodb_lock_wait_timeout`, in whole seconds. MySQL bounds no `INSERT`: a
+ * claim's insert of a new row behind a write in flight from a store that
+ * holds no claim (its fence's share lock on the row's gap) waits for the
+ * server's `innodb_lock_wait_timeout`. An acquire with `waitMs` waits at
+ * most what is left of that wait instead, so a write stalled for minutes
+ * cannot stretch an open's 35 s. A claim that waited this long is refused,
+ * the session held by the other process; a takeover still waits for a write
+ * in flight that commits within it, and sees that write.
+ */
+const LEASE_CLAIM_LOCK_BOUND_MS = 5000;
+/**
+ * How long a write's fence waits for another transaction's lock of the
+ * lease row (a takeover's update in flight): a fence that waited this long
+ * refuses the write, the session held by the other process.
+ */
+const LEASE_FENCE_LOCK_BOUND_MS = 2000;
+/** How often a whole transaction whose MySQL or MariaDB `NOWAIT` lock read was refused runs again within its bound. */
+const NOWAIT_RETRY_MS = 50;
+/** The first key of PostgreSQL's two-key advisory locks the claim and the fence of a session take (`'omp'`). */
+const PG_SESSION_LOCK_CLASS = 0x6f6d70;
+
+/** PostgreSQL `read_only_sql_transaction` (SQLSTATE 25006): a write sent on a connection left read-only. */
+function isReadOnlyTransactionError(error: unknown): boolean {
+	return error instanceof Error && "errno" in error && error.errno === "25006";
+}
+
+/**
+ * Another transaction held the lock a statement waited for past its bound:
+ * PostgreSQL `lock_not_available` (SQLSTATE 55P03), MySQL and MariaDB
+ * `ER_LOCK_WAIT_TIMEOUT` (errno 1205, also MariaDB's `NOWAIT` refusal), and
+ * MySQL's `ER_LOCK_NOWAIT` (errno 3572).
+ */
+function isLockTimeoutError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const errno = "errno" in error ? error.errno : undefined;
+	return errno === "55P03" || errno === 1205 || errno === 3572;
+}
+
+/**
+ * Run `attempt`, one whole transaction that takes a lease lock with a MySQL
+ * or MariaDB `NOWAIT` read, again from its start while a lock wait is
+ * refused, until `boundMs` passed; the last refusal is thrown then. A
+ * refusal is never retried inside its transaction: on MariaDB with
+ * `innodb_rollback_on_timeout` ON a refused `NOWAIT` read (error 1205) rolls
+ * the whole transaction back, so a statement sent after it would run on its
+ * own, holding no lock (measured on MariaDB 11.4: `probes/rot-forms.ts`).
+ * MySQL 8's refusal (error 3572) rolls back only the statement, with the
+ * setting ON or OFF, but its waited 1205 rolls back the whole transaction
+ * with it ON; the attempt is thrown away in every case. The client rolls the
+ * attempt's transaction back, a no-op once the server did. `attempt` gets
+ * the bound's deadline, for a statement that waits within it.
+ */
+async function retryLockRefusals<T>(boundMs: number, attempt: (deadline: number) => Promise<T>): Promise<T> {
+	const deadline = performance.now() + boundMs;
+	for (;;) {
+		try {
+			return await attempt(deadline);
+		} catch (err) {
+			if (!isLockTimeoutError(err) || performance.now() >= deadline) throw err;
+			await Bun.sleep(NOWAIT_RETRY_MS);
+		}
+	}
+}
+
+/**
+ * A write's fence met another transaction's lock of a lease row within the
+ * fence's bound: the write's transaction is thrown away and runs again from
+ * its start (see {@link retryLockRefusals}). Never leaves the store.
+ */
+class FenceLockRefused extends Error {
+	constructor(readonly refusal: unknown) {
+		super("SqlSessionStorage: a fence's lock read was refused within its bound", { cause: refusal });
+	}
+}
+
+/**
+ * `work`'s outcome, or `"timeout"` once `ms` passed without one: the caller
+ * stops waiting and `work` runs on. The timer never keeps the process alive.
+ */
+function withinBound(work: Promise<void>, ms: number): Promise<"done" | "timeout"> {
+	const { promise, resolve, reject } = Promise.withResolvers<"done" | "timeout">();
+	const timer = setTimeout(() => resolve("timeout"), ms);
+	timer.unref();
+	work.then(
+		() => {
+			clearTimeout(timer);
+			resolve("done");
+		},
+		(err: unknown) => {
+			clearTimeout(timer);
+			reject(err);
+		},
+	);
+	return promise;
+}
+/** Bytes of a session's head a claim reads to check that the path still holds that session. */
+const SESSION_HEADER_PREFIX_BYTES = 64 * 1024;
+/** How often a claim waiting for another holder's lease reads that lease again. */
+const LEASE_WAIT_POLL_MS = 1000;
+/** How often a write waiting for its claim's heartbeat to be confirmed again looks. */
+const LAPSE_POLL_MS = 50;
+/** Largest part a full write stores; an append stores its line as one part. */
+const PART_BYTES = 1024 * 1024;
+const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
+/** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
+const SQLITE_BUSY_TIMEOUT_MS = 5000;
+/** Attempts per write when PostgreSQL or MySQL picks it as a deadlock victim. */
+const WRITE_ATTEMPTS = 5;
+/**
+ * Key of the PostgreSQL advisory lock every start-up statement takes (see
+ * `#setup`): the ASCII bytes of "omp_sess" read as one big-endian 64-bit
+ * integer, a value other users of advisory locks are unlikely to pick.
+ */
+const SETUP_LOCK_KEY = 0x6f6d705f73657373n;
+/**
+ * `default_transaction_read_only` of this PostgreSQL connection, read inside
+ * each store transaction (see `#readWrite`). `setting` is the session's own
+ * value; `SET TRANSACTION READ WRITE` does not change it. `reset_val` is the
+ * default the backend session started from: what the database, the role, the
+ * server or the backend connection's start parameters set. Three cases:
+ * - `setting` on, `reset_val` off: a session set read-only over a default
+ *   that is off. The store overrides it and writes.
+ * - both on: the session keeps a read-only default. The store honours it and
+ *   refuses with {@link READ_ONLY_REFUSAL}.
+ * - `setting` off, `reset_val` on: a session turned such a default off. The
+ *   store writes, as it did before it read this setting.
+ * A transaction-mode pooler applies a client's start parameters and its
+ * `connect_query` to the backend with `SET`, so they show as a session value,
+ * which the store overrides.
+ */
+const READ_ONLY_SETTINGS = "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
+const READ_ONLY_REFUSAL =
+	"SqlSessionStorage: this session keeps a read-only default (default_transaction_read_only = on) " +
+	"that a database, role, server or connection-start setting gives it; the store overrides only " +
+	"a read-only value that a session set over a default that is off, so nothing was written.";
 const utf8Decoder = new TextDecoder("utf-8");
+/**
+ * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
+ * lengths, and no stored value reaches it (a value is at most 1 GB there).
+ */
+const MAX_PIECE_BYTES = 0x7fff_ffff;
+
+/** Tail of one SQLite database's call queue; see {@link sqliteQueue}. */
+interface SqliteQueue {
+	tail: Promise<void>;
+}
+
+const sqliteFileQueues = new Map<string, SqliteQueue>();
+const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
+
+/**
+ * The call queue every store in this process shares for `client`'s database.
+ * Bun's SQLite adapter runs each client's statements on one connection, so a
+ * statement issued while another call's transaction is open would join that
+ * transaction. And SQLite's busy wait blocks the thread: a client of a file
+ * waiting for a lock that another client in this process holds freezes the
+ * process for the whole busy timeout, then fails. So calls queue per database
+ * file, by its identity ({@link sqliteFileIdentity} of `options.filename`,
+ * which `Bun.SQL` sets), so two spellings of one file share a queue, and the
+ * busy wait only ever waits on other processes. In-memory databases, and
+ * wrappers that hide `options.filename`, queue per client object.
+ */
+function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
+	const filename = client.options.filename;
+	if (typeof filename !== "string" || filename === "" || filename === ":memory:") {
+		let queue = sqliteClientQueues.get(client);
+		if (!queue) {
+			queue = { tail: Promise.resolve() };
+			sqliteClientQueues.set(client, queue);
+		}
+		return queue;
+	}
+	const key = sqliteFileIdentity(path.resolve(filename), true);
+	let queue = sqliteFileQueues.get(key);
+	if (!queue) {
+		queue = { tail: Promise.resolve() };
+		sqliteFileQueues.set(key, queue);
+	}
+	return queue;
+}
+
+/**
+ * A SQLite database file's identity, which its call queue and its claims' OS
+ * locks are keyed by: its device and inode, so every spelling of one file (a
+ * symlink, a hard link, another mount of it) gives one key, where a resolved
+ * path, or a real path, would still give a hard link or a second mount a key
+ * of its own. With `create`, a file that does not exist yet is made first,
+ * empty, which SQLite reads as an empty database: an `open` with `O_CREAT`
+ * that takes no SQLite lock and needs no call through the queue the key is
+ * for, so stores that open the file before any of them wrote it meet one key
+ * at once, and no queue is ever re-keyed. Its resolved path when the file
+ * cannot be read or made.
+ */
+function sqliteFileIdentity(file: string, create: boolean): string {
+	try {
+		let stat: fs.BigIntStats;
+		try {
+			stat = fs.statSync(file, { bigint: true });
+		} catch (err) {
+			if (!create || !(err instanceof Error && "code" in err && err.code === "ENOENT")) throw err;
+			fs.closeSync(fs.openSync(file, "a"));
+			stat = fs.statSync(file, { bigint: true });
+		}
+		return `sqlite-inode:${stat.dev}:${stat.ino}`;
+	} catch {
+		return `sqlite:${file}`;
+	}
+}
 
 function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapter {
 	const reported = String(client.options?.adapter ?? "").toLowerCase();
@@ -125,98 +615,592 @@ function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapte
 	);
 }
 
-function buildQueries(adapter: SqlSessionStorageAdapter, table: string): DialectQueries {
-	const placeholder = adapter === "postgres" ? (n: number): string => `$${n}` : (_n: number): string => "?";
+/**
+ * Render `@name` markers as the dialect's placeholders: numbered and reused
+ * on PostgreSQL (`$1`) and SQLite (`?1`), one positional `?` per use on MySQL.
+ */
+function statement(adapter: SqlSessionStorageAdapter, template: string): Statement {
+	const params: string[] = [];
+	const sql = template.replace(/@(\w+)/g, (_marker, name: string) => {
+		if (adapter === "mysql") {
+			params.push(name);
+			return "?";
+		}
+		let index = params.indexOf(name);
+		if (index < 0) index = params.push(name) - 1;
+		return adapter === "postgres" ? `$${index + 1}` : `?${index + 1}`;
+	});
+	return { sql, params };
+}
 
-	if (adapter === "mysql") {
-		return {
-			createTable:
-				`CREATE TABLE IF NOT EXISTS ${table} (` +
+function run(
+	executor: SqlSessionStorageTransaction,
+	query: Statement,
+	values: StatementValues,
+): Promise<SqlSessionStorageResult> {
+	return executor.unsafe(
+		query.sql,
+		query.params.map(name => {
+			const value = values[name];
+			if (value === undefined) throw new Error(`SqlSessionStorage: no value bound for @${name}`);
+			return value;
+		}),
+	);
+}
+
+/**
+ * The first statement of every PostgreSQL transaction the store runs, and of
+ * every read it sends on its own: every function, operator and type its
+ * statements name is then found in `pg_catalog` alone (`pg_temp` is never
+ * searched for functions or operators, and comes after `pg_catalog` for
+ * relations), so one that a login with `CREATE` on the store's schema planted
+ * there, an exact match where `pg_catalog` has only one through an implicit
+ * cast (the CVE-2018-1058 class), is never picked. The store's own tables are
+ * named `public.<table>` ({@link PG_SCHEMA}). `SET LOCAL` ends with the
+ * transaction, so a transaction-mode pooler hands nothing on. The CLI's
+ * client sets no connection-level `search_path` (PgBouncer before 1.26
+ * refuses one), so this lock is what every statement runs under.
+ */
+const PG_SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
+/** The schema of the store's PostgreSQL tables, which every statement names them with. */
+const PG_SCHEMA = "public";
+/**
+ * The lease table's indexes keyed by `holder` alone, whatever their names: the
+ * heartbeat's `WHERE holder = …` uses one. Found through `pg_index`, never by
+ * name, since another table's index, or a table, may hold the name.
+ */
+const PG_HOLDER_INDEXES = statement(
+	"postgres",
+	"SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a " +
+		"ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] WHERE i.indrelid = pg_catalog.to_regclass(@table) " +
+		"AND i.indnkeyatts = 1 AND i.indexprs IS NULL AND i.indpred IS NULL AND a.attname = 'holder'",
+);
+/** What holds the lease index's name in the store's schema, if anything, and the table it indexes when an index. */
+const PG_HOLDER_INDEX_NAME = statement(
+	"postgres",
+	"SELECT c.oid::text AS oid, c.relkind::text AS kind, c.oid::pg_catalog.regclass::text AS name, " +
+		"i.indrelid::pg_catalog.regclass::text AS on_table FROM pg_catalog.pg_class c " +
+		"LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid WHERE c.oid = pg_catalog.to_regclass(@index)",
+);
+/**
+ * Whether each of the store's three PostgreSQL tables exists, by name, as
+ * `CREATE TABLE IF NOT EXISTS` finds it (any relation of that name counts;
+ * the table check refuses one that is not an ordinary table),
+ * `default_transaction_read_only`'s `setting` and `reset_val`, as
+ * {@link READ_ONLY_SETTINGS} reads them inside a write, and whether the
+ * server is in recovery (a hot standby or a read replica), which accepts no
+ * write at all.
+ */
+const PG_TABLES_PRESENT = statement(
+	"postgres",
+	"SELECT pg_catalog.to_regclass(@session) IS NOT NULL AS session, " +
+		"pg_catalog.to_regclass(@parts) IS NOT NULL AS parts, pg_catalog.to_regclass(@lease) IS NOT NULL AS lease, " +
+		"s.setting AS read_only_setting, s.reset_val AS read_only_reset_val, " +
+		"pg_catalog.pg_is_in_recovery() AS in_recovery " +
+		"FROM pg_catalog.pg_settings s WHERE s.name = 'default_transaction_read_only'",
+);
+
+/** {@link PG_TABLES_PRESENT} row. A boolean arrives as `true` bound and as `t` in a simple query's text. */
+interface TablesPresentRow {
+	session: boolean | string;
+	parts: boolean | string;
+	lease: boolean | string;
+	read_only_setting: string;
+	read_only_reset_val: string;
+	in_recovery: boolean | string;
+}
+
+/** A PostgreSQL boolean as {@link PG_TABLES_PRESENT} returns it: `true` bound, `t` in a simple query's text. */
+function pgTrue(value: boolean | string | undefined): boolean {
+	return value === true || value === "t";
+}
+/** A relation's kind (`pg_class.relkind`), with its article, as a refusal names it. */
+const PG_RELATION_KINDS: Record<string, string> = {
+	r: "a table",
+	i: "an index",
+	S: "a sequence",
+	t: "a TOAST table",
+	v: "a view",
+	m: "a materialized view",
+	c: "a composite type",
+	f: "a foreign table",
+	p: "a partitioned table",
+	I: "a partitioned index",
+};
+
+/** {@link PG_HOLDER_INDEX_NAME} row. */
+interface HolderIndexNameRow {
+	oid: string;
+	kind: string;
+	name: string;
+	on_table: string | null;
+}
+
+/**
+ * `query` with each bound value written into it as an untyped literal, so it
+ * can go in one simple query with {@link PG_SEARCH_PATH}: Bun neither
+ * pipelines nor binds values in a multi-statement query, and one round trip
+ * per read is what a read cost before the lock. A value is dollar-quoted with
+ * a tag that occurs nowhere in it and that its end cannot make with the
+ * closing `$` (a value ending in `$omp` would close `$omp$…$omp$` early), so
+ * nothing in it is read as SQL whatever `standard_conforming_strings` is; a
+ * space on each side keeps the quote apart from the text around it. As an
+ * untyped literal it takes its type from where it is used, as an unbound
+ * parameter does from its first use. Numbers go in as their decimal digits;
+ * only integers are bound. A string holding NUL, which a simple query cannot
+ * carry, is refused, as PostgreSQL refuses it as a bound text value.
+ */
+function inlinePostgres(query: Statement, values: StatementValues): string {
+	const literals = query.params.map(name => {
+		const value = values[name];
+		if (value === undefined) throw new Error(`SqlSessionStorage: no value bound for @${name}`);
+		if (value === null) return "NULL";
+		let text: string;
+		if (typeof value === "string") text = value;
+		else if (typeof value === "number" && Number.isSafeInteger(value)) text = String(value);
+		else throw new Error(`SqlSessionStorage: cannot write @${name} into a read (${typeof value})`);
+		if (text.includes("\0")) throw new Error(`SqlSessionStorage: @${name} holds a NUL character`);
+		let tag = "omp";
+		for (let n = 0; `${text}$`.includes(`$${tag}$`); n++) tag = `omp${n}`;
+		return ` $${tag}$${text}$${tag}$ `;
+	});
+	// One pass over the statement's own text: a written value is never read again.
+	return query.sql.replace(/\$(\d+)/g, (_marker, index: string) => {
+		const literal = literals[Number(index) - 1];
+		if (literal === undefined) throw new Error(`SqlSessionStorage: no value bound for $${index}`);
+		return literal;
+	});
+}
+
+/** The columns of one of the store's PostgreSQL tables, as {@link SqlSessionStorageBackend}'s table check reads them. */
+const PG_TABLE_COLUMNS = statement(
+	"postgres",
+	"SELECT a.attname AS name, pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, " +
+		"a.atthasdef AS has_default, a.attgenerated::text AS generated, a.attidentity::text AS identity " +
+		"FROM pg_catalog.pg_attribute a WHERE a.attrelid = pg_catalog.to_regclass(@table) AND a.attnum > 0 " +
+		"AND NOT a.attisdropped",
+);
+/**
+ * Everything on one of the store's PostgreSQL tables that runs code on its
+ * writes and is not the store's: a trigger, a rule, a row-level security
+ * policy or the security itself, a relation that is not an ordinary table, a
+ * constraint other than a primary key, unique or not-null one, an index on
+ * an expression or with a predicate, and a table that inherits from it (the
+ * store's updates and deletes reach a child's rows, and so its triggers).
+ */
+const PG_TABLE_OBJECTS = statement(
+	"postgres",
+	"SELECT 'trigger' AS kind, t.tgname::text AS name FROM pg_catalog.pg_trigger t " +
+		"WHERE t.tgrelid = pg_catalog.to_regclass(@table) AND NOT t.tgisinternal " +
+		"UNION ALL SELECT 'rule', r.rulename::text FROM pg_catalog.pg_rewrite r " +
+		"WHERE r.ev_class = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT 'policy', p.polname::text FROM pg_catalog.pg_policy p " +
+		"WHERE p.polrelid = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT 'row-level security', c.relname::text FROM pg_catalog.pg_class c " +
+		"WHERE c.oid = pg_catalog.to_regclass(@table) AND (c.relrowsecurity OR c.relforcerowsecurity) " +
+		"UNION ALL SELECT 'relation kind', c.relkind::text FROM pg_catalog.pg_class c " +
+		"WHERE c.oid = pg_catalog.to_regclass(@table) AND c.relkind <> 'r' " +
+		"UNION ALL SELECT 'constraint', k.conname::text FROM pg_catalog.pg_constraint k " +
+		"WHERE k.conrelid = pg_catalog.to_regclass(@table) AND k.contype NOT IN ('p', 'u', 'n') " +
+		"UNION ALL SELECT 'index', i.indexrelid::pg_catalog.regclass::text FROM pg_catalog.pg_index i " +
+		"WHERE i.indrelid = pg_catalog.to_regclass(@table) AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) " +
+		"UNION ALL SELECT 'inheritance', h.inhrelid::pg_catalog.regclass::text FROM pg_catalog.pg_inherits h " +
+		"WHERE h.inhparent = pg_catalog.to_regclass(@table)",
+);
+/** The columns of the store's three PostgreSQL tables and their declared types, as `format_type` prints them. */
+const PG_DECLARED_COLUMNS = {
+	session: {
+		path: "text",
+		content: "text",
+		mtime_ms: "bigint",
+		title: "text",
+		title_source: "text",
+		title_updated_at: "text",
+		byte_len: "bigint",
+	},
+	parts: { path: "text", start_offset: "bigint", content: "text" },
+	lease: {
+		session_id: "text",
+		holder: "text",
+		host: "text",
+		pid: "bigint",
+		acquired_at: "bigint",
+		heartbeat_at: "bigint",
+	},
+} satisfies Record<string, Record<string, string>>;
+
+/** {@link PG_TABLE_COLUMNS} row. */
+interface TableColumnRow {
+	name: string;
+	type: string;
+	has_default: boolean;
+	generated: string;
+	identity: string;
+}
+
+/** {@link PG_TABLE_OBJECTS} row. */
+interface TableObjectRow {
+	kind: string;
+	name: string;
+}
+
+/** `schema` as a PostgreSQL identifier, quoted. */
+function quoteIdentifier(schema: string): string {
+	return `"${schema.replaceAll('"', '""')}"`;
+}
+
+function buildQueries(
+	adapter: SqlSessionStorageAdapter,
+	name: string,
+	leaseName: string,
+	leaseExpiryMs: number,
+	schema?: string,
+): DialectQueries {
+	// PostgreSQL statements name every table with its schema, since they run under PG_SEARCH_PATH.
+	const relation = (relationName: string): string =>
+		schema === undefined ? relationName : `${quoteIdentifier(schema)}.${relationName}`;
+	const table = relation(name);
+	const parts = relation(`${name}_parts`);
+	const sql = (template: string): Statement => statement(adapter, template);
+	const mysql = adapter === "mysql";
+	const integer = adapter === "sqlite" ? "INTEGER" : "BIGINT";
+	const mysqlTable = ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
+	const contentBytes = {
+		postgres: "convert_to(content, 'UTF8')",
+		mysql: "cast(content AS binary)",
+		sqlite: "cast(content AS blob)",
+	}[adapter];
+	const contentByteLength = {
+		postgres: "octet_length(content)",
+		mysql: "length(content)",
+		sqlite: "length(cast(content AS blob))",
+	}[adapter];
+	const emptyBytes = { postgres: "''::bytea", mysql: "cast('' AS binary)", sqlite: "x''" }[adapter];
+	const greatest = adapter === "sqlite" ? "max" : "greatest";
+	// PostgreSQL's substr takes integer positions; offsets within one value always fit.
+	const position = (expr: string): string => (adapter === "postgres" ? `CAST(${expr} AS integer)` : expr);
+	// PostgreSQL types a bare parameter from its first use; offsets past 2^31 need bigint.
+	const bigint = (expr: string): string => (adapter === "postgres" ? `CAST(${expr} AS bigint)` : expr);
+	const rowColumns = "path, content, mtime_ms, title, title_source, title_updated_at, byte_len";
+	const rowValues = "@path, '', @mtime, @title, @title_source, @title_updated_at, @len";
+	const appendRow = `INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) `;
+	// Scalar subqueries rather than a CTE, so MySQL 5.7 runs this too.
+	const tailStart = `(SELECT byte_len FROM ${table} WHERE path = @path) - @suffix`;
+
+	return {
+		createTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${table} (` +
 				`path VARCHAR(512) NOT NULL PRIMARY KEY, ` +
 				`content LONGTEXT NOT NULL, ` +
 				`mtime_ms BIGINT NOT NULL, ` +
 				`title TEXT NULL, ` +
 				`title_source VARCHAR(16) NULL, ` +
-				`title_updated_at VARCHAR(64) NULL` +
-				`) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
-			addTitleColumns: [
-				`ALTER TABLE ${table} ADD COLUMN title TEXT NULL`,
-				`ALTER TABLE ${table} ADD COLUMN title_source VARCHAR(16) NULL`,
-				`ALTER TABLE ${table} ADD COLUMN title_updated_at VARCHAR(64) NULL`,
-			],
-			upsertReplace:
-				`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) VALUES (?, ?, ?, ?, ?, ?) ` +
-				`ON DUPLICATE KEY UPDATE content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ?`,
-			insertIfMissing: `INSERT IGNORE INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-			replaceIfSize:
-				`UPDATE ${table} SET content = ?, mtime_ms = ?, title = ?, title_source = ?, title_updated_at = ? ` +
-				`WHERE path = ? AND length(content) = ?`,
-			upsertAppend:
-				`INSERT INTO ${table} (path, content, mtime_ms) VALUES (?, ?, ?) ` +
-				`ON DUPLICATE KEY UPDATE content = CONCAT(content, ?), mtime_ms = ?`,
-			updateTitle: `UPDATE ${table} SET title = ?, title_source = ?, title_updated_at = ?, mtime_ms = ? WHERE path = ?`,
-			delete: `DELETE FROM ${table} WHERE path = ?`,
-			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
-			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len, title, title_source, title_updated_at FROM ${table}`,
-			readFull: `SELECT content AS content FROM ${table} WHERE path = ?`,
-			readSlices:
-				`SELECT substring(cast(content AS binary), 1, ?) AS head, ` +
-				`CASE WHEN ? <= 0 THEN cast('' AS binary) ` +
-				`ELSE substring(cast(content AS binary), greatest(1, length(content) - ? + 1)) END AS tail ` +
-				`FROM ${table} WHERE path = ?`,
-		};
-	}
-
-	const mtimeType = adapter === "postgres" ? "BIGINT" : "INTEGER";
-	const tableQualifier = `${table}.content`;
-	const byteLengthExpr = adapter === "postgres" ? "octet_length(content)" : "length(cast(content AS blob))";
-	const readSlices =
-		adapter === "postgres"
-			? `SELECT substring(convert_to(content, 'UTF8') from 1 for ${placeholder(1)}) AS head, ` +
-				`CASE WHEN ${placeholder(2)} <= 0 THEN ''::bytea ` +
-				`ELSE substring(convert_to(content, 'UTF8') from greatest(1, octet_length(content) - ${placeholder(2)} + 1)) END AS tail ` +
-				`FROM ${table} WHERE path = ${placeholder(3)}`
-			: `SELECT substr(cast(content AS blob), 1, ?) AS head, ` +
-				`CASE WHEN ? <= 0 THEN x'' ELSE substr(cast(content AS blob), -?) END AS tail ` +
-				`FROM ${table} WHERE path = ?`;
-
-	return {
-		createTable:
-			`CREATE TABLE IF NOT EXISTS ${table} (` +
-			`path TEXT PRIMARY KEY, ` +
-			`content TEXT NOT NULL, ` +
-			`mtime_ms ${mtimeType} NOT NULL, ` +
-			`title TEXT, ` +
-			`title_source TEXT, ` +
-			`title_updated_at TEXT` +
-			`)`,
-		addTitleColumns: [
-			`ALTER TABLE ${table} ADD COLUMN title TEXT`,
-			`ALTER TABLE ${table} ADD COLUMN title_source TEXT`,
-			`ALTER TABLE ${table} ADD COLUMN title_updated_at TEXT`,
+				`title_updated_at VARCHAR(64) NULL, ` +
+				`byte_len BIGINT NULL` +
+				mysqlTable
+			: `CREATE TABLE IF NOT EXISTS ${table} (` +
+				`path TEXT PRIMARY KEY, ` +
+				`content TEXT NOT NULL, ` +
+				`mtime_ms ${integer} NOT NULL, ` +
+				`title TEXT, ` +
+				`title_source TEXT, ` +
+				`title_updated_at TEXT, ` +
+				`byte_len ${integer}` +
+				`)`,
+		createPartsTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${parts} (` +
+				`path VARCHAR(512) NOT NULL, ` +
+				`start_offset BIGINT NOT NULL, ` +
+				`content LONGTEXT NOT NULL, ` +
+				`PRIMARY KEY (path, start_offset)` +
+				mysqlTable
+			: `CREATE TABLE IF NOT EXISTS ${parts} (` +
+				`path TEXT NOT NULL, ` +
+				`start_offset ${integer} NOT NULL, ` +
+				`content TEXT NOT NULL, ` +
+				`PRIMARY KEY (path, start_offset)` +
+				`)`,
+		addColumns: [
+			{ column: "title", ddl: `ALTER TABLE ${table} ADD COLUMN title TEXT${mysql ? " NULL" : ""}` },
+			{
+				column: "title_source",
+				ddl: `ALTER TABLE ${table} ADD COLUMN title_source ${mysql ? "VARCHAR(16) NULL" : "TEXT"}`,
+			},
+			{
+				column: "title_updated_at",
+				ddl: `ALTER TABLE ${table} ADD COLUMN title_updated_at ${mysql ? "VARCHAR(64) NULL" : "TEXT"}`,
+			},
+			{ column: "byte_len", ddl: `ALTER TABLE ${table} ADD COLUMN byte_len ${integer}${mysql ? " NULL" : ""}` },
 		],
-		upsertReplace:
-			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}) ` +
-			`ON CONFLICT (path) DO UPDATE SET content = excluded.content, mtime_ms = excluded.mtime_ms, title = excluded.title, title_source = excluded.title_source, title_updated_at = excluded.title_updated_at`,
-		insertIfMissing:
-			`INSERT INTO ${table} (path, content, mtime_ms, title, title_source, title_updated_at) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)}, ${placeholder(5)}, ${placeholder(6)}) ` +
-			`ON CONFLICT (path) DO NOTHING RETURNING path`,
-		replaceIfSize:
-			`UPDATE ${table} SET content = ${placeholder(1)}, mtime_ms = ${placeholder(2)}, title = ${placeholder(3)}, ` +
-			`title_source = ${placeholder(4)}, title_updated_at = ${placeholder(5)} ` +
-			`WHERE path = ${placeholder(6)} AND ${byteLengthExpr} = ${placeholder(7)} RETURNING path`,
-		upsertAppend:
-			`INSERT INTO ${table} (path, content, mtime_ms) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}) ` +
-			`ON CONFLICT (path) DO UPDATE SET content = ${tableQualifier} || excluded.content, mtime_ms = excluded.mtime_ms`,
-		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)}`,
-		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
-		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)} RETURNING path`,
-		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len, title, title_source, title_updated_at FROM ${table}`,
-		readFull: `SELECT content AS content FROM ${table} WHERE path = ${placeholder(1)}`,
-		readSlices,
+		findUnmeasured: `SELECT 1 AS unmeasured FROM ${table} WHERE byte_len IS NULL LIMIT 1`,
+		backfillByteLen: `UPDATE ${table} SET byte_len = ${contentByteLength} WHERE byte_len IS NULL`,
+		columns: sql(
+			{
+				postgres:
+					"SELECT attname AS column_name FROM pg_attribute " +
+					"WHERE attrelid = to_regclass(@table) AND attnum > 0 AND NOT attisdropped",
+				mysql:
+					"SELECT column_name AS column_name FROM information_schema.columns " +
+					"WHERE table_schema = DATABASE() AND table_name = @table",
+				sqlite: "SELECT name AS column_name FROM pragma_table_info(@table)",
+			}[adapter],
+		),
+		loadIndex: `SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM ${table}`,
+		append:
+			adapter === "postgres"
+				? [
+						sql(
+							`WITH s AS (${appendRow}` +
+								`ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
+								`mtime_ms = excluded.mtime_ms RETURNING byte_len) ` +
+								`INSERT INTO ${parts} (path, start_offset, content) ` +
+								`SELECT @path, s.byte_len - @len, @content FROM s WHERE @len > 0`,
+						),
+					]
+				: [
+						sql(
+							appendRow +
+								(mysql
+									? "ON DUPLICATE KEY UPDATE byte_len = byte_len + @len, mtime_ms = @mtime"
+									: `ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
+										"mtime_ms = excluded.mtime_ms"),
+						),
+						sql(
+							`INSERT INTO ${parts} (path, start_offset, content) ` +
+								`SELECT path, byte_len - @len, @content FROM ${table} WHERE path = @path AND @len > 0`,
+						),
+					],
+		lockSize: sql(`SELECT byte_len FROM ${table} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`),
+		upsertRow: sql(
+			`INSERT INTO ${table} (${rowColumns}) VALUES (${rowValues}) ` +
+				(mysql
+					? "ON DUPLICATE KEY UPDATE content = '', mtime_ms = @mtime, title = @title, " +
+						"title_source = @title_source, title_updated_at = @title_updated_at, byte_len = @len"
+					: "ON CONFLICT (path) DO UPDATE SET content = excluded.content, mtime_ms = excluded.mtime_ms, " +
+						"title = excluded.title, title_source = excluded.title_source, " +
+						"title_updated_at = excluded.title_updated_at, byte_len = excluded.byte_len"),
+		),
+		insertRowIfMissing: sql(
+			mysql
+				? `INSERT IGNORE INTO ${table} (${rowColumns}) VALUES (${rowValues})`
+				: `INSERT INTO ${table} (${rowColumns}) VALUES (${rowValues}) ON CONFLICT (path) DO NOTHING RETURNING path`,
+		),
+		deleteRow: sql(`DELETE FROM ${table} WHERE path = @path`),
+		hasParts: sql(`SELECT 1 AS found FROM ${parts} WHERE path = @path LIMIT 1`),
+		deleteParts: sql(`DELETE FROM ${parts} WHERE path = @path`),
+		deleteUnder: {
+			postgres: [
+				sql(
+					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
+						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
+				),
+			],
+			mysql: [
+				sql(
+					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
+						`WHERE substr(r.path, 1, @len) = @dir`,
+				),
+			],
+			sqlite: [
+				sql(`DELETE FROM ${parts} WHERE substr(path, 1, @len) = @dir`),
+				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
+			],
+		}[adapter],
+		insertPart: sql(`INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`),
+		renameRow: sql(
+			`UPDATE ${table} SET path = @dst, mtime_ms = @mtime WHERE path = @src${mysql ? "" : " RETURNING path"}`,
+		),
+		renameParts: sql(`UPDATE ${parts} SET path = @dst WHERE path = @src`),
+		exists: sql(`SELECT path FROM ${table} WHERE path = @path`),
+		updateTitle: sql(
+			`UPDATE ${table} SET title = @title, title_source = @title_source, title_updated_at = @title_updated_at, ` +
+				"mtime_ms = @mtime WHERE path = @path",
+		),
+		readFull: sql(
+			`SELECT 0 AS kind, 0 AS start_offset, content FROM ${table} WHERE path = @path ` +
+				`UNION ALL SELECT 1, start_offset, content FROM ${parts} WHERE path = @path`,
+		),
+		// The session row holds bytes [0, length(content)), its parts the rest.
+		// A head part starts before `@prefix`; the tail starts in the last part
+		// starting at or before `byte_len - @suffix` (every part when none
+		// does, i.e. the tail reaches into the row's own content).
+		readSlices: sql(
+			`SELECT 0 AS kind, 0 AS start_offset, ` +
+				`CASE WHEN @prefix > 0 THEN substr(${contentBytes}, 1, @prefix) ELSE ${emptyBytes} END AS head, ` +
+				`CASE WHEN @suffix > 0 AND byte_len - @suffix < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position(`${greatest}(0, byte_len - @suffix) + 1`)}) ` +
+				`ELSE ${emptyBytes} END AS tail FROM ${table} WHERE path = @path ` +
+				`UNION ALL SELECT 1, start_offset, substr(${contentBytes}, 1, ${position("@prefix - start_offset")}), NULL ` +
+				`FROM ${parts} WHERE path = @path AND start_offset < @prefix ` +
+				`UNION ALL SELECT 2, start_offset, NULL, ` +
+				`substr(${contentBytes}, ${position(`${greatest}(0, ${tailStart} - start_offset) + 1`)}) ` +
+				`FROM ${parts} WHERE @suffix > 0 AND path = @path AND start_offset >= (` +
+				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path AND start_offset <= ${tailStart})`,
+		),
+		// The session row holds bytes [0, length(content)), its parts the rest. The
+		// parts read are those that end after `@offset` and start before `@end`,
+		// from the last one starting at or before `@offset` (every part when none
+		// does, i.e. the window starts in the row's own content). Each piece is
+		// at most `@take` bytes from where the window enters it; `@row_from` is
+		// the 1-based row position `@offset + 1`, clamped where the row cannot reach.
+		readFrom: sql(
+			`SELECT 0 AS kind, 0 AS start_offset, byte_len, ` +
+				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position("@row_from")}, ${position("@take")}) ` +
+				`ELSE ${emptyBytes} END AS bytes FROM ${table} WHERE path = @path ` +
+				`UNION ALL SELECT 1, start_offset, NULL, ` +
+				`substr(${contentBytes}, ${position(`${greatest}(0, ${bigint("@offset")} - start_offset) + 1`)}, ` +
+				`${position("@take")}) ` +
+				`FROM ${parts} WHERE path = @path AND start_offset < ${bigint("@end")} ` +
+				`AND start_offset + ${contentByteLength} > ${bigint("@offset")} AND start_offset >= (` +
+				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
+				`AND start_offset <= ${bigint("@offset")})`,
+		),
+		lease:
+			adapter === "sqlite"
+				? undefined
+				: buildLeaseQueries(
+						adapter,
+						relation(leaseName),
+						relation(foldIdentifier(leaseName)),
+						leaseName,
+						leaseExpiryMs,
+					),
+	};
+}
+
+/**
+ * `name` as PostgreSQL resolves it unquoted: ASCII `A`-`Z` folded to lower case and
+ * every other character kept (`downcase_identifier` in a multibyte encoding). The
+ * names the store takes ({@link IDENT_RE}, {@link LEASE_IDENT_RE}) are unquoted ASCII,
+ * so `OMP_X` and `omp_x` are one table; folding `A`-`Z` alone keeps this true if
+ * those patterns ever admit other letters.
+ */
+function foldIdentifier(name: string): string {
+	return name.replace(/[A-Z]/g, letter => letter.toLowerCase());
+}
+
+function buildLeaseQueries(
+	adapter: "postgres" | "mysql",
+	leases: string,
+	/** `leases` as PostgreSQL resolves it ({@link foldIdentifier}): its session lock's key. Unused on MySQL. */
+	resolvedLeases: string,
+	leaseName: string,
+	expiryMs: number,
+): LeaseQueries {
+	const sql = (template: string): Statement => statement(adapter, template);
+	const mysql = adapter === "mysql";
+	// Milliseconds since the epoch on the database clock, read when the
+	// statement runs: PostgreSQL's now() would be the transaction's start.
+	const now = mysql
+		? "CAST(UNIX_TIMESTAMP(NOW(3)) * 1000 AS SIGNED)"
+		: "(extract(epoch from clock_timestamp()) * 1000)::bigint";
+	const expired = `${now} - ${Math.trunc(expiryMs)}`;
+	// A heartbeat more than one expiry ahead of the database clock (another
+	// login wrote it, a clock jumped) is expired too. Written as `now + expiry`:
+	// subtracting `now` from a `bigint` heartbeat near its maximum overflows.
+	const future = `${now} + ${Math.trunc(expiryMs)}`;
+	const stale = (column: string) => `(${column} < ${expired} OR ${column} > ${future})`;
+	const columns = "session_id, holder, host, pid, acquired_at, heartbeat_at";
+	const values = `@sid, @holder, @host, @pid, ${now}, ${now}`;
+	const sessions = (count: number): string => Array.from({ length: count }, (_, index) => `@sid${index}`).join(", ");
+	// The lock is per lease table: its qualified name as PostgreSQL resolves it, as a literal, goes before the session
+	// id, so two spellings of one table take one lock.
+	const leaseKey = `'${resolvedLeases.replace(/'/g, "''")}:'`;
+	const sessionLock = (fn: string): string =>
+		`SELECT pg_catalog.${fn}(${PG_SESSION_LOCK_CLASS}, pg_catalog.hashtext(pg_catalog.textcat(${leaseKey}, @sid)))`;
+	const lockRow = `SELECT holder, CASE WHEN ${stale("heartbeat_at")} THEN 1 ELSE 0 END AS stale FROM ${leases} WHERE session_id = @sid`;
+	const heldRow = `SELECT holder FROM ${leases} WHERE session_id = @sid AND holder = @holder`;
+	const foreignRow = `SELECT holder FROM ${leases} WHERE session_id = @sid AND holder <> @holder AND NOT ${stale("heartbeat_at")}`;
+	return {
+		// `session_id` is declared as the session table declares `path`.
+		createTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${leases} (` +
+				`session_id VARCHAR(512) NOT NULL PRIMARY KEY, ` +
+				`holder VARCHAR(64) NOT NULL, ` +
+				`host VARCHAR(255) NOT NULL, ` +
+				`pid BIGINT NOT NULL, ` +
+				`acquired_at BIGINT NOT NULL, ` +
+				`heartbeat_at BIGINT NOT NULL, ` +
+				// The heartbeat updates one holder's rows; without this index
+				// MySQL's UPDATE would lock every lease row it scans.
+				`INDEX ${leaseName}_holder (holder)` +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+			: `CREATE TABLE IF NOT EXISTS ${leases} (` +
+				`session_id TEXT PRIMARY KEY, ` +
+				`holder TEXT NOT NULL, ` +
+				`host TEXT NOT NULL, ` +
+				`pid BIGINT NOT NULL, ` +
+				`acquired_at BIGINT NOT NULL, ` +
+				`heartbeat_at BIGINT NOT NULL)`,
+		createIndex: mysql ? undefined : `CREATE INDEX IF NOT EXISTS ${leaseName}_holder ON ${leases} (holder)`,
+		claim: sql(
+			`INSERT INTO ${leases} (${columns}) VALUES (${values}) ` +
+				"ON CONFLICT (session_id) DO UPDATE SET holder = excluded.holder, host = excluded.host, pid = excluded.pid, " +
+				`acquired_at = CASE WHEN ${leases}.holder = excluded.holder THEN ${leases}.acquired_at ` +
+				"ELSE excluded.acquired_at END, heartbeat_at = excluded.heartbeat_at " +
+				`WHERE ${stale(`${leases}.heartbeat_at`)} OR ${leases}.holder = excluded.holder RETURNING holder`,
+		),
+		insert: sql(`INSERT INTO ${leases} (${columns}) VALUES (${values})`),
+		take: sql(
+			`UPDATE ${leases} SET acquired_at = CASE WHEN holder = @holder THEN acquired_at ELSE ${now} END, ` +
+				`holder = @holder, host = @host, pid = @pid, heartbeat_at = ${now} WHERE session_id = @sid`,
+		),
+		heartbeat: count =>
+			sql(
+				`UPDATE ${leases} SET heartbeat_at = ${now} WHERE holder = @holder AND session_id IN (${sessions(count)})` +
+					(mysql ? "" : " RETURNING session_id"),
+			),
+		heartbeatAlone: mysql
+			? undefined
+			: count => {
+					const qualifiedNow =
+						"(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) OPERATOR(pg_catalog.*) 1000)::pg_catalog.int8";
+					const mine = Array.from(
+						{ length: count },
+						(_, index) => `session_id OPERATOR(pg_catalog.=) @sid${index}`,
+					).join(" OR ");
+					return sql(
+						`UPDATE ${leases} SET heartbeat_at = ${qualifiedNow} ` +
+							`WHERE holder OPERATOR(pg_catalog.=) @holder AND (${mine}) RETURNING session_id`,
+					);
+				},
+		heldBy: count =>
+			sql(`SELECT session_id FROM ${leases} WHERE holder = @holder AND session_id IN (${sessions(count)})`),
+		release: sql(`DELETE FROM ${leases} WHERE session_id = @sid AND holder = @holder`),
+		claimLock: mysql ? undefined : sql(sessionLock("pg_advisory_xact_lock")),
+		fenceLock: mysql ? undefined : sql(sessionLock("pg_advisory_xact_lock_shared")),
+		held: sql(`${heldRow} FOR SHARE`),
+		foreign: sql(foreignRow),
+		// MySQL 8 and MariaDB refuse a NOWAIT locking read at once instead of waiting; the store retries it within its
+		// bound. MySQL 8 spells the share lock FOR SHARE NOWAIT, MariaDB LOCK IN SHARE MODE NOWAIT.
+		nowait: mysql
+			? {
+					mysql: {
+						lock: sql(`${lockRow} FOR UPDATE NOWAIT`),
+						held: sql(`${heldRow} FOR SHARE NOWAIT`),
+						foreign: sql(`${foreignRow} FOR SHARE NOWAIT`),
+						releaseLock: sql(`${heldRow} FOR UPDATE NOWAIT`),
+					},
+					mariadb: {
+						lock: sql(`${lockRow} FOR UPDATE NOWAIT`),
+						held: sql(`${heldRow} LOCK IN SHARE MODE NOWAIT`),
+						foreign: sql(`${foreignRow} LOCK IN SHARE MODE NOWAIT`),
+						releaseLock: sql(`${heldRow} FOR UPDATE NOWAIT`),
+					},
+				}
+			: undefined,
+		insertWithin: mysql
+			? seconds =>
+					sql(
+						`SET STATEMENT innodb_lock_wait_timeout = ${Math.max(1, Math.ceil(seconds))} FOR ` +
+							`INSERT INTO ${leases} (${columns}) VALUES (${values})`,
+					)
+			: undefined,
+		probe: sql(
+			`SELECT host, pid, CASE WHEN ${stale("heartbeat_at")} THEN 1 ELSE 0 END AS stale ` +
+				`FROM ${leases} WHERE session_id = @sid`,
+		),
 	};
 }
 
@@ -232,73 +1216,355 @@ function isDuplicateColumnError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
 	return message.includes("duplicate column") || message.includes("already exists");
 }
+/** SQLite's refusal of a ROLLBACK after an error that already rolled the transaction back. */
+function isNoActiveTransactionError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+	return message.includes("no transaction is active");
+}
+/** MySQL `ER_LOCK_DEADLOCK` (errno 1213, SQLSTATE 40001) or PostgreSQL `deadlock_detected` / `serialization_failure`. */
+function isDeadlockError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const errno = "errno" in error ? error.errno : undefined;
+	const sqlState = "sqlState" in error ? error.sqlState : undefined;
+	return errno === 1213 || errno === "40P01" || errno === "40001" || sqlState === "40001";
+}
+/**
+ * A primary-key collision, as each dialect reports it: PostgreSQL
+ * `unique_violation` (SQLSTATE 23505), MySQL `ER_DUP_ENTRY` (errno 1062,
+ * SQLSTATE 23000), SQLite `SQLITE_CONSTRAINT_PRIMARYKEY` (extended code 1555).
+ */
+function isPrimaryKeyViolation(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const errno = "errno" in error ? error.errno : undefined;
+	const code = "code" in error ? error.code : undefined;
+	return errno === "23505" || errno === 1062 || code === "SQLITE_CONSTRAINT_PRIMARYKEY";
+}
 
-function decodeSqlBytes(value: unknown): string {
-	if (value === null || value === undefined) return "";
-	if (typeof value === "string") return value;
-	if (value instanceof Uint8Array) return utf8Decoder.decode(value);
-	if (value instanceof ArrayBuffer) return utf8Decoder.decode(new Uint8Array(value));
-	return String(value);
+/** Concatenate a window's pieces in byte-offset order; the session row's own bytes come first. */
+function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number; bytes: Uint8Array | null }>): Buffer {
+	pieces.sort((a, b) => a.offset - b.offset);
+	const chunks: Uint8Array[] = [];
+	for (const bytes of [first, ...pieces.map(piece => piece.bytes)]) {
+		if (bytes) chunks.push(bytes);
+	}
+	return Buffer.concat(chunks);
 }
 
 /**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
- * session JSONL file maps to a row keyed by `path`; one table stores the file
- * contents while this process keeps only a metadata index (`size`, `mtimeMs`) in
- * memory for synchronous `existsSync` / `statSync` / `listFilesSync` calls.
+ * session JSONL file is a row of the session table keyed by `path`, holding
+ * its metadata (`byte_len`, `mtime_ms`, title fields), plus rows of
+ * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts one
+ * part, a full write replaces them with parts of at most 1 MiB. A session's
+ * content is the row's `content` (non-empty only for rows an older version
+ * wrote) followed by its parts in offset order. This process keeps only a
+ * metadata index (`size`, `mtimeMs`) in memory for synchronous `existsSync` /
+ * `statSync` / `listFilesSync` calls.
  *
  * Works against PostgreSQL, MySQL/MariaDB, and SQLite by selecting the
- * dialect-correct DDL, upsert, string-concat, byte-length, and byte-slice syntax
+ * dialect-correct DDL, upsert, row-lock, byte-length, and byte-slice syntax
  * at construction.
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
-	readonly #adapter: SqlSessionStorageAdapter;
-	readonly #table: string;
+	readonly #backend: SqlSessionStorageBackend;
+	/**
+	 * Set only when the store claims sessions (`claims` on a database other
+	 * processes can open): {@link SessionStorage.claimSession}. A claim on
+	 * PostgreSQL or MySQL is optimistic: its claim statement runs in the
+	 * background, every write under it waits for that statement, and
+	 * `onLost` hears when it found another holder.
+	 */
+	readonly claimSession: SessionStorage["claimSession"];
+	/** {@link SessionStorage.acquireSessionClaim}, set as {@link claimSession} is. */
+	readonly acquireSessionClaim: SessionStorage["acquireSessionClaim"];
+	/** {@link SessionStorage.sessionClaimLost}, set as {@link claimSession} is. */
+	readonly sessionClaimLost: SessionStorage["sessionClaimLost"];
+	/** {@link SessionStorage.sessionClaimHolder}, set as {@link claimSession} is. */
+	readonly sessionClaimHolder: SessionStorage["sessionClaimHolder"];
+	/** {@link SessionStorage.retargetWriterClaim}, set as {@link claimSession} is. */
+	readonly retargetWriterClaim: SessionStorage["retargetWriterClaim"];
 
-	constructor(backend: SessionStorageBackend, adapter: SqlSessionStorageAdapter, table: string) {
+	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
-		this.#adapter = adapter;
-		this.#table = table;
+		this.#backend = backend;
+		if (!backend.claims) return;
+		// The last release of a claim waits for this store's queued writes under it.
+		const settle = (paths: readonly string[]) =>
+			Promise.all(paths.map(file => this.confirmWrites(file).catch(() => undefined))).then(() => undefined);
+		const releaser = (claim: LeaseClaim, file: string, onLost: (() => void) | undefined): (() => void) => {
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				backend.release(claim, file, onLost, settle);
+			};
+		};
+		// One writer slot per session in this store; it goes first and comes back last, and a refused claim gives it back at once.
+		const writers: SqlWriterSlots = new Map();
+		const withWriterSlot =
+			(free: () => void, release: () => void): (() => void) =>
+			() => {
+				release();
+				free();
+			};
+		this.claimSession = (sessionId, sessionPath, options) => {
+			const file = path.resolve(sessionPath);
+			const free = takeSqlWriterSlot(writers, sessionId, file, options);
+			if (!free) return null;
+			const claim = backend.claim(sessionId, file, options?.onLost);
+			if (!claim) {
+				free();
+				return null;
+			}
+			return withWriterSlot(free, releaser(claim, file, options?.onLost));
+		};
+		this.acquireSessionClaim = async (sessionId, sessionPath, options) => {
+			const file = path.resolve(sessionPath);
+			const free = takeSqlWriterSlot(writers, sessionId, file, options);
+			if (!free) return null;
+			const claim = await backend.acquire(sessionId, file, options ?? {}, settle).catch((err: unknown) => {
+				free();
+				throw err;
+			});
+			if (!claim) {
+				free();
+				return null;
+			}
+			return withWriterSlot(free, releaser(claim, file, options?.onLost));
+		};
+		this.sessionClaimLost = sessionId => backend.claimLost(sessionId);
+		this.sessionClaimHolder = sessionId => backend.claimHolder(sessionId);
+		this.retargetWriterClaim = (sessionId, sessionPath) => {
+			const slot = writers.get(sessionId);
+			if (slot && slot.count > 0) slot.path = path.resolve(sessionPath);
+		};
 	}
 
 	/**
-	 * Apply the dialect-correct DDL (unless `createTable: false` is set) and warm
-	 * the metadata index with every existing row. Must be awaited before passing
+	 * Apply the dialect-correct DDL and migration (unless `createTable: false`
+	 * is set, which instead verifies the schema is in place) and warm the
+	 * metadata index with every existing row. Must be awaited before passing
 	 * the storage into `SessionManager.create()`.
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
-		const backend = new SqlSessionStorageBackend(options);
-		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table);
+		const storage = new SqlSessionStorage(new SqlSessionStorageBackend(options));
 		await storage.initialize();
 		return storage;
 	}
 
 	get adapter(): SqlSessionStorageAdapter {
-		return this.#adapter;
+		return this.#backend.adapter;
 	}
 
 	get table(): string {
-		return this.#table;
+		return this.#backend.table;
 	}
+
+	/** {@link IndexedSessionStorage.drain}, then the claim releases in flight, so a closed session's lease is gone. */
+	override async drain(): Promise<void> {
+		try {
+			await super.drain();
+		} finally {
+			await this.#backend.releasesSettled();
+		}
+	}
+}
+
+/**
+ * This store's claim on one session's lease. Every claim of the session
+ * through this store shares it (`refs`), as do the paths it was claimed at,
+ * a subagent transcript under the session's artifacts directory among them:
+ * such a transcript is claimed under its enclosing session's lease (see
+ * {@link sessionLeaseId}), never under an id of its own.
+ */
+interface LeaseClaim {
+	/** The lease's id: the session the claimed paths belong to. */
+	readonly sessionId: string;
+	/** The paths written under the claim, each with the number of claims made at it. */
+	readonly paths: Map<string, number>;
+	/** The session id each claimed path's header must name: its own transcript's, which a subagent's differs from the lease's. */
+	readonly headers: Map<string, string>;
+	/** Release callbacks not yet run. */
+	refs: number;
+	/**
+	 * `pending` until the claim statement answers; `held` once it claimed;
+	 * `lost` once it, a fenced write or a heartbeat found another holder, or
+	 * found the path holding another session (`foreign`).
+	 */
+	state: "pending" | "held" | "lost";
+	foreign: boolean;
+	/** The claim statement in flight, or the one that answered. */
+	attempt: Promise<boolean> | undefined;
+	/** Heartbeat round current when the claim statement answered: only a later round can find the lease gone. */
+	heldRound: number;
+	/**
+	 * `performance.now()` until which the claim is proven: the send time of the
+	 * last heartbeat (or claim statement) the database answered, plus the
+	 * expiry less one heartbeat interval. A claim past it is lapsed, not lost:
+	 * its writes wait for the next answered heartbeat.
+	 */
+	validUntil: number;
+	/** How long the claim statement waits for another transaction's lock of the lease row (see {@link LEASE_CLAIM_LOCK_BOUND_MS}). */
+	readonly lockBoundMs: number;
+	/** A SQLite claim's OS lock, shared with every store of this process on that database file. */
+	readonly lock: SqliteLock | undefined;
+	/** The release of this session's previous claim, in flight when this one was made: its delete lands first. */
+	readonly after: Promise<void> | undefined;
+	readonly listeners: Set<() => void>;
+}
+
+/** One OS lock of a SQLite session claim, counted across this process's stores. */
+interface SqliteLock {
+	readonly key: string;
+	readonly lease: FileLockHandle;
+	holders: number;
+}
+
+/** SQLite claims' OS locks by database file and session id, shared by every store of this process. */
+const sqliteLocks = new Map<string, SqliteLock>();
+
+/**
+ * The writer slot of each session one SQL store writes, by the transcript's
+ * own session id (a subagent transcript's, not its lease's): one journal has
+ * one writer per store, as file storage's lease `writers` count keeps one per
+ * process (see {@link SessionClaimOptions.writer}). The CLI opens one store
+ * per process, so that is one writer per process; two stores are two lease
+ * holders, as two processes are. A claim without `writer` (a transfer guard)
+ * takes no slot and shares the lease.
+ */
+type SqlWriterSlots = Map<string, { count: number; path: string }>;
+
+/**
+ * Take `sessionId`'s writer slot in `writers` at `file` for a claim with
+ * `options.writer`, returning the function that gives it back; `null` while
+ * another writer of this store holds the session, unless `options.handover`
+ * takes a slot beside the writer of that same file. A claim without `writer`
+ * gets a no-op.
+ */
+function takeSqlWriterSlot(
+	writers: SqlWriterSlots,
+	sessionId: string,
+	file: string,
+	options: SessionClaimOptions | undefined,
+): (() => void) | null {
+	if (options?.writer !== true) return () => {};
+	const held = writers.get(sessionId);
+	if (held && held.count > 0 && !(options.handover === true && held.path === file)) return null;
+	const slot = held ?? { count: 0, path: file };
+	slot.count++;
+	slot.path = file;
+	writers.set(sessionId, slot);
+	let freed = false;
+	return () => {
+		if (freed) return;
+		freed = true;
+		if (--slot.count === 0 && writers.get(sessionId) === slot) writers.delete(sessionId);
+	};
+}
+
+/**
+ * One lease a write is fenced under: this store's claim on the session when it
+ * holds one, else none, and the write is refused only while another holder's
+ * lease of the session is fresh.
+ */
+interface LeaseFence {
+	readonly claim: LeaseClaim | undefined;
+	readonly sessionId: string;
+	readonly file: string;
+}
+
+/** The session id in the header at the start of `prefix` (past the title slot), or `undefined` when it has none. */
+function headerSessionId(prefix: string): string | undefined {
+	const text = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
+	const end = text.indexOf("\n");
+	if (end === -1) return undefined;
+	try {
+		const entry: unknown = JSON.parse(text.slice(0, end));
+		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
+			return typeof entry.id === "string" ? entry.id : undefined;
+		}
+	} catch {}
+	return undefined;
 }
 
 class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #client: SqlSessionStorageClient;
 	readonly #adapter: SqlSessionStorageAdapter;
 	readonly #table: string;
+	readonly #leaseTable: string;
 	readonly #q: DialectQueries;
+	/** The schema of the store's PostgreSQL tables ({@link PG_SCHEMA}); unset on other dialects. */
+	readonly #schema: string | undefined;
 	readonly #createTable: boolean;
+	/** The shared call queue for this client's SQLite database; unset on other dialects. */
+	readonly #sqliteQueue: SqliteQueue | undefined;
+	/**
+	 * How this store claims sessions: `row`, a lease row (PostgreSQL, MySQL);
+	 * `lock`, an OS lock on the database file and session id (a SQLite file);
+	 * unset when it claims nothing.
+	 */
+	readonly #gate: "row" | "lock" | undefined;
+	/** The SQLite database file a `lock` claim is keyed by. */
+	readonly #sqliteFile: string | undefined;
+	readonly #expiryMs: number;
+	readonly #heartbeatMs: number;
+	/** This store's lease holder token: 128 random bits, made once per store, never the host or the pid. */
+	readonly #holder = randomBytes(16).toString("hex");
+	/** The sessions this store claimed, by session id. */
+	readonly #leases = new Map<string, LeaseClaim>();
+	/** The claim each claimed path is written under. */
+	readonly #leasedPaths = new Map<string, LeaseClaim>();
+	/** Claim releases in flight, by session id; a new claim of the id waits for its release. */
+	readonly #releases = new Map<string, Promise<void>>();
+	#heartbeat: Timer | undefined;
+	#heartbeatRound = 0;
+	#beating = false;
+	/** How this MySQL-family server bounds a lease row's lock wait (see {@link MysqlLockForm}); set at start-up. */
+	#mysqlLocks: MysqlLockForm | undefined;
+	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
+	#mysqlVersion = "";
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
 		this.#adapter = options.adapter ?? detectAdapter(options.client);
 		const table = options.table ?? DEFAULT_TABLE;
 		if (!IDENT_RE.test(table)) {
-			throw new Error(`SqlSessionStorage: table name must match ${IDENT_RE.source} (got ${JSON.stringify(table)})`);
+			throw new Error(
+				`SqlSessionStorage: table name must match ${IDENT_RE.source}, at most 57 characters so ` +
+					`${JSON.stringify(`${table}_parts`)} stays a valid identifier (got ${JSON.stringify(table)})`,
+			);
+		}
+		const leaseTable = options.leaseTable ?? DEFAULT_LEASE_TABLE;
+		if (!LEASE_IDENT_RE.test(leaseTable)) {
+			throw new Error(
+				`SqlSessionStorage: leaseTable must match ${LEASE_IDENT_RE.source}, at most 56 characters so ` +
+					`${JSON.stringify(`${leaseTable}_holder`)} stays a valid identifier (got ${JSON.stringify(leaseTable)})`,
+			);
+		}
+		const lease = options.lease ?? { expiryMs: SESSION_LEASE_EXPIRY_MS, heartbeatMs: SESSION_LEASE_HEARTBEAT_MS };
+		if (!(lease.heartbeatMs > 0 && lease.expiryMs > lease.heartbeatMs)) {
+			throw new Error(
+				`SqlSessionStorage: lease.expiryMs must exceed lease.heartbeatMs, which must be positive (got ${JSON.stringify(lease)})`,
+			);
 		}
 		this.#table = table;
-		this.#q = buildQueries(this.#adapter, table);
+		this.#leaseTable = leaseTable;
+		this.#expiryMs = lease.expiryMs;
+		this.#heartbeatMs = lease.heartbeatMs;
+		this.#schema = this.#adapter === "postgres" ? PG_SCHEMA : undefined;
+		this.#q = buildQueries(this.#adapter, table, leaseTable, lease.expiryMs, this.#schema);
 		this.#createTable = options.createTable !== false;
+		this.#sqliteQueue = this.#adapter === "sqlite" ? sqliteQueue(options.client) : undefined;
+		const filename = options.client.options.filename;
+		this.#sqliteFile =
+			this.#adapter === "sqlite" && typeof filename === "string" && filename !== "" && filename !== ":memory:"
+				? path.resolve(filename)
+				: undefined;
+		if (options.claims === true) {
+			if (this.#adapter !== "sqlite") this.#gate = "row";
+			// An in-memory database is this process's alone: nobody else can open its sessions.
+			else if (this.#sqliteFile) this.#gate = "lock";
+		}
 	}
 
 	get adapter(): SqlSessionStorageAdapter {
@@ -309,46 +1575,1239 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return this.#table;
 	}
 
-	async init(): Promise<void> {
-		if (this.#createTable) {
-			await this.#client.unsafe(this.#q.createTable);
-			for (const query of this.#q.addTitleColumns) {
+	/** Whether this store claims sessions. */
+	get claims(): boolean {
+		return this.#gate !== undefined;
+	}
+
+	init(): Promise<void> {
+		return this.#exclusive(async () => {
+			if (this.#adapter === "sqlite") {
+				// Another process's write lock then makes this one wait instead of failing at once.
+				const [setting] = (await this.#client.unsafe("PRAGMA busy_timeout")) as BusyTimeoutRow[];
+				if (setting && rowNumber(setting.timeout) === 0) {
+					await this.#client.unsafe(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+				}
+			}
+			if (this.#adapter === "mysql" && this.#gate === "row") {
+				// A claim's every lock wait must end within its bound, without session
+				// state a pooled connection would carry to another client.
+				const [row] = (await this.#client.unsafe("SELECT VERSION() AS version")) as Array<{ version: string }>;
+				const version = String(row?.version ?? "");
+				this.#mysqlVersion = version;
+				this.#mysqlLocks = mysqlLockForm(version);
+				if (!this.#mysqlLocks) {
+					throw new Error(
+						`SqlSessionStorage: claiming sessions needs MySQL 8.0 or later, or MariaDB 10.3 or later; this server is ${version || "of an unknown version"}, which bounds no lock wait without session state. Upgrade the server, or open the store without claims.`,
+					);
+				}
+			}
+			// One look at the PostgreSQL tables and the server, for a store that
+			// would write there (claims, or makes tables): a server in recovery
+			// accepts no write, so the store refuses to start on it.
+			const look =
+				this.#adapter === "postgres" && (this.#gate === "row" || this.#createTable)
+					? (((await this.#readOne(PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[])[0] ??
+						undefined)
+					: undefined;
+			if (look && pgTrue(look.in_recovery)) {
+				throw new Error(
+					`SqlSessionStorage: the PostgreSQL server is in recovery (a hot standby or a read replica), which accepts no write, so a store that ${this.#gate === "row" ? "claims sessions" : "makes its tables"} cannot start on it. Point the DSN at the primary.`,
+				);
+			}
+			if (!this.#createTable) {
+				await this.#assertSchema();
+				await this.#checkTables();
+				await this.#checkLockSyntax();
+				return;
+			}
+			// The three tables first, in one step (see #createTables). The lease
+			// table is made here with the other two, by the same login, whether or
+			// not this store claims: never at a first claim.
+			const lease = this.#q.lease;
+			const indexMade = await this.#createTables(look);
+			// Probe before altering: PostgreSQL's ALTER TABLE waits for every open
+			// transaction on the table even when the column exists. PostgreSQL also
+			// checks that the caller owns the table before it reads IF NOT EXISTS, so
+			// a login that does not own the lease table (an external migration's
+			// owner made it) may not run even a no-op CREATE INDEX: look first, in
+			// the same read. The look is by catalog, not by name: IF NOT EXISTS skips
+			// when anything holds the name, so an index of another table, or a
+			// table, under it would leave the lease table without one. #checkTables
+			// then refuses whatever holds the name.
+			const createIndex = indexMade ? undefined : lease?.createIndex;
+			const { columns, holder } = await this.#read(async executor => ({
+				columns: new Set(
+					((await run(executor, this.#q.columns, { table: this.#relation(this.#table) })) as ColumnRow[]).map(
+						row => row.column_name.toLowerCase(),
+					),
+				),
+				holder: createIndex ? await this.#holderIndex(executor) : undefined,
+			}));
+			for (const { column, ddl } of this.#q.addColumns) {
+				if (columns.has(column)) continue;
 				try {
-					await this.#client.unsafe(query);
+					await this.#setup(ddl);
 				} catch (err) {
+					// Another process starting at the same moment added it first.
 					if (!isDuplicateColumnError(err)) throw err;
 				}
+			}
+			// MySQL's UPDATE locks every row it scans, so a no-op backfill would
+			// still wait for, and block, every write in flight.
+			if ((await this.#readOne(this.#q.findUnmeasured)).length > 0) {
+				await this.#setup(this.#q.backfillByteLen);
+			}
+			if (createIndex && holder && !holder.indexed && !holder.nameTakenBy) await this.#setup(createIndex);
+			await this.#checkTables();
+			await this.#checkLockSyntax();
+		});
+	}
+
+	/**
+	 * Register a claim of `sessionId` at `file` and start its claim statement
+	 * unless this store already claimed the session; `null` when a SQLite
+	 * claim's OS lock is held by another process. `onLost` is called when the
+	 * claim is found lost, at once when it already is.
+	 */
+	claim(
+		sessionId: string,
+		file: string,
+		onLost: (() => void) | undefined,
+		lockBoundMs = LEASE_CLAIM_LOCK_BOUND_MS,
+	): LeaseClaim | null {
+		const leaseId = sessionLeaseId(file) ?? sessionId;
+		let claim = this.#leases.get(leaseId);
+		if (!claim) {
+			let lock: SqliteLock | undefined;
+			if (this.#gate === "lock") {
+				const taken = this.#takeSqliteLock(leaseId);
+				if (taken === null) return null;
+				lock = taken;
+			}
+			claim = {
+				sessionId: leaseId,
+				paths: new Map(),
+				headers: new Map(),
+				refs: 0,
+				state: "pending",
+				foreign: false,
+				attempt: undefined,
+				heldRound: 0,
+				validUntil: Number.POSITIVE_INFINITY,
+				lockBoundMs: Math.max(1, Math.ceil(lockBoundMs)),
+				lock,
+				after: this.#releases.get(leaseId),
+				listeners: new Set(),
+			};
+			this.#leases.set(leaseId, claim);
+			if (this.#gate === "row") this.#startHeartbeat();
+			const started = claim;
+			void this.#ensureClaimed(started).catch(err => {
+				// The first write under the claim runs the statement again and reports its failure.
+				logger.debug("SqlSessionStorage could not claim a session", {
+					sessionId: started.sessionId,
+					error: toError(err).message,
+				});
+			});
+		}
+		claim.paths.set(file, (claim.paths.get(file) ?? 0) + 1);
+		claim.headers.set(file, sessionId);
+		this.#leasedPaths.set(file, claim);
+		claim.refs++;
+		if (onLost) {
+			claim.listeners.add(onLost);
+			if (claim.state === "lost") queueMicrotask(onLost);
+		}
+		return claim;
+	}
+
+	/**
+	 * Claim `sessionId` at `file` and wait for the answer: the claim when it
+	 * is held, `null` when `file` holds another session or another holder has
+	 * the session. With `waitMs`, a holder's lease is read again every second
+	 * until it is gone or expired on the database clock, `onWait` hearing the
+	 * holder once, and the session claimed then, all within `waitMs`: a claim
+	 * statement that waited past its lock bound behind another process's
+	 * write is refused, and tried again only while the wait lasts. A claim
+	 * statement that fails for another reason (the database is unreachable)
+	 * counts as held, as a file claim that cannot be probed does: it never
+	 * refuses a session, and the first write under it runs the statement again.
+	 */
+	async acquire(
+		sessionId: string,
+		file: string,
+		options: SessionAcquireOptions,
+		settle: (paths: readonly string[]) => Promise<void>,
+	): Promise<LeaseClaim | null> {
+		const deadline = performance.now() + (options.waitMs ?? 0);
+		let waiting = false;
+		for (;;) {
+			const lockBound = options.waitMs === undefined ? LEASE_CLAIM_LOCK_BOUND_MS : deadline - performance.now();
+			const claim = this.claim(sessionId, file, options.onLost, lockBound);
+			if (!claim) return null;
+			try {
+				if (await this.#ensureClaimed(claim)) return claim;
+			} catch (err) {
+				logger.debug("SqlSessionStorage could not claim a session", { sessionId, error: toError(err).message });
+				return claim;
+			}
+			// Refused: drop this registration; a later claim starts a statement of its own.
+			// A claim another caller of this store still shares stays lost until they release it.
+			const shared = claim.refs > 1;
+			this.release(claim, file, options.onLost, settle);
+			await this.#releases.get(claim.sessionId);
+			if (shared || claim.foreign || options.waitMs === undefined || this.#gate !== "row") return null;
+			let holder: LeaseProbeRow | undefined;
+			try {
+				holder = (await this.#probeLease(claim.sessionId))[0];
+			} catch (err) {
+				logger.debug("SqlSessionStorage could not read a session lease", {
+					sessionId,
+					error: toError(err).message,
+				});
+				return null;
+			}
+			const remaining = deadline - performance.now();
+			// A claim refused behind a lock (a holder's write in flight) finds the
+			// lease stale or gone and tries again, but only while the wait lasts.
+			if (!holder || rowNumber(holder.stale) === 1) {
+				if (remaining <= 0) return null;
+				continue;
+			}
+			if (remaining <= 0) return null;
+			if (!waiting) {
+				waiting = true;
+				options.onWait?.({ host: holder.host, pid: rowNumber(holder.pid) });
+			}
+			await Bun.sleep(Math.min(LEASE_WAIT_POLL_MS, remaining));
+		}
+	}
+
+	/**
+	 * Drop one reference to `claim`, made at `file`. The last one waits until
+	 * `settle` reports this store's queued writes under the claim settled,
+	 * then deletes the lease row this store holds (or releases the SQLite
+	 * lock), unless a new claim revived it meanwhile; `drain()` waits for
+	 * that delete, so a clean exit frees the session at once.
+	 *
+	 * The release callback itself never waits. `SessionManager.close()` gives
+	 * its claim up before it drains, so writes are still queued, and some in
+	 * flight hold the lease row share-locked: a delete it waited for at once
+	 * would wait on this process's own open transactions, and a delete made
+	 * before the queued writes ran would have the fence refuse them.
+	 */
+	release(
+		claim: LeaseClaim,
+		file: string,
+		onLost: (() => void) | undefined,
+		settle: (paths: readonly string[]) => Promise<void>,
+	): void {
+		if (onLost) claim.listeners.delete(onLost);
+		const count = (claim.paths.get(file) ?? 1) - 1;
+		if (count > 0) claim.paths.set(file, count);
+		else {
+			claim.paths.delete(file);
+			claim.headers.delete(file);
+		}
+		if (--claim.refs > 0) return;
+		const { sessionId } = claim;
+		const previous = this.#releases.get(sessionId) ?? Promise.resolve();
+		const released = previous
+			.then(async () => {
+				// The claim's paths stay fenced while their queued writes settle.
+				await settle([...new Set([file, ...claim.paths.keys()])]);
+				if (claim.refs > 0 || this.#leases.get(sessionId) !== claim) return;
+				this.#leases.delete(sessionId);
+				for (const [leased, owner] of this.#leasedPaths) {
+					if (owner === claim) this.#leasedPaths.delete(leased);
+				}
+				this.#stopHeartbeatIfIdle();
+				if (claim.lock) {
+					this.#releaseSqliteLock(claim.lock);
+					return;
+				}
+				const held = await (claim.attempt ?? Promise.resolve(false)).catch(() => false);
+				const lease = this.#q.lease;
+				if (!held || claim.state === "lost" || !lease) return;
+				// The database gives the delete up after 2 s (see #deleteLease); this
+				// stops waiting shortly after, should the database not answer at all.
+				// Either way the unrefreshed row expires on its own.
+				const outcome = await withinBound(
+					this.#deleteLease(lease, sessionId),
+					LEASE_RELEASE_BOUND_MS + LEASE_RELEASE_GRACE_MS,
+				);
+				if (outcome === "timeout") {
+					logger.warn("SqlSessionStorage stopped waiting to release a session lease; it expires on its own", {
+						sessionId,
+					});
+				}
+			})
+			.catch(err => {
+				// The row expires on its own once its heartbeat stops.
+				logger.warn("SqlSessionStorage could not release a session lease", {
+					sessionId,
+					error: toError(err).message,
+				});
+			});
+		this.#releases.set(sessionId, released);
+		void released.finally(() => {
+			if (this.#releases.get(sessionId) === released) this.#releases.delete(sessionId);
+		});
+	}
+
+	/**
+	 * Delete this store's lease row of `sessionId`, which the database gives up
+	 * after {@link LEASE_RELEASE_BOUND_MS} (waiting on another transaction's
+	 * lock of the row, a stalled server): PostgreSQL's `statement_timeout` set
+	 * for this transaction alone; on MySQL and MariaDB a `NOWAIT` lock of the
+	 * row first, the whole transaction run again from its start while that
+	 * lock is refused within the bound (see {@link retryLockRefusals}), so the
+	 * delete itself never waits. A delete given up rolls back and rejects.
+	 */
+	async #deleteLease(lease: LeaseQueries, sessionId: string): Promise<void> {
+		const values = { sid: sessionId, holder: this.#holder };
+		if (this.#adapter === "postgres") {
+			await this.#readWrite(async transaction => {
+				await transaction.unsafe(`SET LOCAL statement_timeout = ${LEASE_RELEASE_BOUND_MS}`);
+				await run(transaction, lease.release, values);
+			});
+			return;
+		}
+		const releaseLock = this.#mysqlForms(lease).releaseLock;
+		await retryLockRefusals(LEASE_RELEASE_BOUND_MS, () =>
+			this.#client.transaction(async transaction => {
+				await run(transaction, releaseLock, values);
+				await run(transaction, lease.release, values);
+			}),
+		);
+	}
+
+	/** Resolve once every claim release in flight has finished. */
+	async releasesSettled(): Promise<void> {
+		while (this.#releases.size > 0) await Promise.allSettled(this.#releases.values());
+	}
+
+	/** Whether this store's claim on the lease `leaseId` (see {@link sessionLeaseId}) is lost to another holder. */
+	claimLost(leaseId: string): boolean {
+		return this.#leases.get(leaseId)?.state === "lost";
+	}
+
+	/** The process that holds `sessionId`'s lease now, as its row names it. */
+	async claimHolder(sessionId: string): Promise<SessionClaimHolder | undefined> {
+		try {
+			const [row] = await this.#probeLease(sessionId);
+			return row ? { host: row.host, pid: rowNumber(row.pid) } : undefined;
+		} catch (err) {
+			logger.debug("SqlSessionStorage could not read a session lease", { sessionId, error: toError(err).message });
+			return undefined;
+		}
+	}
+
+	/** Take the SQLite OS lock of `sessionId`, or share this process's; `null` while another process holds it. */
+	#takeSqliteLock(sessionId: string): SqliteLock | null {
+		const key = `${sqliteFileIdentity(this.#sqliteFile ?? "", false)}\n${sessionId}`;
+		let lock = sqliteLocks.get(key);
+		if (!lock) {
+			let lease: FileLockHandle | null;
+			try {
+				lease = tryAcquireSessionLease(key);
+			} catch (err) {
+				// As a file claim that cannot be probed: counts as held, guards nothing.
+				logger.debug("SqlSessionStorage could not take a session lock", { sessionId, error: toError(err).message });
+				lease = { release: () => {} };
+			}
+			if (!lease) return null;
+			lock = { key, lease, holders: 0 };
+			sqliteLocks.set(key, lock);
+		}
+		lock.holders++;
+		return lock;
+	}
+
+	#releaseSqliteLock(lock: SqliteLock): void {
+		if (--lock.holders > 0) return;
+		if (sqliteLocks.get(lock.key) === lock) sqliteLocks.delete(lock.key);
+		lock.lease.release();
+	}
+
+	/** Whether `claim` holds its session, running its claim statement first when it has not answered. */
+	#ensureClaimed(claim: LeaseClaim): Promise<boolean> {
+		if (claim.state !== "pending") return Promise.resolve(claim.state === "held");
+		claim.attempt ??= this.#runClaim(claim).then(
+			held => {
+				if (claim.state === "pending") {
+					claim.heldRound = this.#heartbeatRound;
+					if (held) claim.state = "held";
+					else this.#markLost(claim);
+				}
+				return claim.state === "held";
+			},
+			(err: unknown) => {
+				claim.attempt = undefined;
+				throw err;
+			},
+		);
+		return claim.attempt;
+	}
+
+	/**
+	 * Run `claim`'s statement: `false` when one of its paths holds another
+	 * session (marked `foreign`), else insert the lease row or take it over
+	 * when its heartbeat expired or this store holds it. A SQLite claim holds
+	 * its OS lock already. PostgreSQL claims in one statement, behind the
+	 * session's exclusive advisory lock (see `claimLock`); MySQL locks the row
+	 * in a transaction, since it assigns `ON DUPLICATE KEY UPDATE` values left
+	 * to right and could not test the old holder after replacing it. Every
+	 * lock wait is bounded (the claim's `lockBoundMs`, see
+	 * {@link LEASE_CLAIM_LOCK_BOUND_MS}): a claim that waited that long behind
+	 * another transaction (the holder's write in flight) is refused, the
+	 * session held by that process.
+	 */
+	async #runClaim(claim: LeaseClaim): Promise<boolean> {
+		await claim.after;
+		for (const file of claim.paths.keys()) {
+			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch(() => [""]);
+			const id = headerSessionId(head ?? "");
+			if (id !== undefined && id !== (claim.headers.get(file) ?? claim.sessionId)) {
+				claim.foreign = true;
+				return false;
+			}
+		}
+		const lease = this.#q.lease;
+		if (!lease) return true;
+		const values = { sid: claim.sessionId, holder: this.#holder, host: os.hostname(), pid: process.pid };
+		const sentAt = performance.now();
+		let held = false;
+		try {
+			if (this.#adapter === "postgres") {
+				await this.#readWrite(async transaction => {
+					await transaction.unsafe(`SET LOCAL lock_timeout = ${claim.lockBoundMs}`);
+					if (lease.claimLock) await run(transaction, lease.claimLock, values);
+					held = (await run(transaction, lease.claim, values)).length > 0;
+				});
+			} else {
+				for (let attempt = 1; ; attempt++) {
+					try {
+						// A refused lock read throws the transaction away and runs it again within the claim's bound.
+						await retryLockRefusals(claim.lockBoundMs, deadline =>
+							this.#client.transaction(async transaction => {
+								held = false;
+								const [row] = (await this.#lockingRead(transaction, "lock", values)) as LeaseLockRow[];
+								if (row && row.holder !== this.#holder && rowNumber(row.stale) !== 1) return;
+								// MariaDB's insert waits at most what is left of the bound.
+								const insert =
+									this.#mysqlLocks === "mariadb" && lease.insertWithin
+										? lease.insertWithin(Math.max(0, deadline - performance.now()) / 1000)
+										: lease.insert;
+								await run(transaction, row ? lease.take : insert, values);
+								held = true;
+							}),
+						);
+						break;
+					} catch (err) {
+						// Two claims of a missing row both insert: one deadlocks or meets the other's row, and runs again.
+						if (attempt >= WRITE_ATTEMPTS || !(isDeadlockError(err) || isPrimaryKeyViolation(err))) throw err;
+						held = false;
+						await Bun.sleep(Math.random() * 20 * attempt);
+					}
+				}
+			}
+		} catch (err) {
+			if (!isLockTimeoutError(err)) throw err;
+			// Another transaction holds the lease row (or the session's lock) for longer than a claim waits: its process holds the session.
+			logger.debug("SqlSessionStorage claim waited past its lock bound", { sessionId: claim.sessionId });
+			return false;
+		}
+		if (held) claim.validUntil = sentAt + this.#expiryMs - this.#heartbeatMs;
+		return held;
+	}
+
+	/** Mark `claim` lost, once, and tell every caller under it. */
+	#markLost(claim: LeaseClaim): void {
+		if (claim.state === "lost") return;
+		claim.state = "lost";
+		logger.warn(
+			claim.foreign ? "Session path holds another session; not claimed" : "Session claim lost to another process",
+			{ sessionId: claim.sessionId, leaseTable: this.#leaseTable },
+		);
+		for (const listener of claim.listeners) queueMicrotask(listener);
+	}
+
+	#startHeartbeat(): void {
+		if (this.#heartbeat) return;
+		this.#heartbeat = setInterval(() => void this.#beat(), this.#heartbeatMs);
+		this.#heartbeat.unref();
+	}
+
+	#stopHeartbeatIfIdle(): void {
+		if (this.#leases.size > 0 || !this.#heartbeat) return;
+		clearInterval(this.#heartbeat);
+		this.#heartbeat = undefined;
+	}
+
+	/**
+	 * Refresh the lease rows of every claim this store still holds, in one
+	 * statement, and no other row of its: a row whose release gave up (see
+	 * {@link release}) is left to expire instead of staying held while the
+	 * store lives. A claim the statement found gone (its row deleted, or
+	 * another holder's now) is lost; one it refreshed is proven until the
+	 * statement's send time plus the expiry less one interval, however late
+	 * the answer came. A failed heartbeat (database unreachable) leaves every
+	 * claim as it is, so a claim the database cannot confirm for long enough
+	 * lapses: its writes wait, and nothing moves.
+	 */
+	async #beat(): Promise<void> {
+		const lease = this.#q.lease;
+		if (this.#beating || !lease) return;
+		const live = [...this.#leases.values()].filter(claim => claim.state === "held");
+		if (live.length === 0) return;
+		this.#beating = true;
+		const round = ++this.#heartbeatRound;
+		const sentAt = performance.now();
+		try {
+			const values: Record<string, string> = { holder: this.#holder };
+			for (const [index, claim] of live.entries()) values[`sid${index}`] = claim.sessionId;
+			let refreshed: Array<{ session_id: string }> = [];
+			if (this.#adapter === "postgres") {
+				refreshed = (await this.#heartbeatAlone(lease, live.length, values)) as Array<{ session_id: string }>;
+			} else {
+				// Two statements on their own, in no transaction: a lock wait timeout of the update (with
+				// `innodb_rollback_on_timeout` ON or OFF) fails this heartbeat alone, and leaves no transaction
+				// for the read after it to run outside. The read takes no lock.
+				await run(this.#client, lease.heartbeat(live.length), values);
+				refreshed = (await run(this.#client, lease.heldBy(live.length), values)) as Array<{ session_id: string }>;
+			}
+			const alive = new Set(refreshed.map(row => row.session_id));
+			const validUntil = sentAt + this.#expiryMs - this.#heartbeatMs;
+			for (const claim of this.#leases.values()) {
+				if (claim.state !== "held" || claim.heldRound >= round) continue;
+				if (alive.has(claim.sessionId)) claim.validUntil = Math.max(claim.validUntil, validUntil);
+				else this.#markLost(claim);
+			}
+		} catch (err) {
+			logger.debug("SqlSessionStorage lease heartbeat failed", { error: toError(err).message });
+		} finally {
+			this.#beating = false;
+		}
+	}
+
+	/**
+	 * PostgreSQL's heartbeat: one statement outside any transaction (see
+	 * `heartbeatAlone`), committed on the server as it ends, so the lease rows
+	 * it locks are free again before its answer leaves, however slow that
+	 * answer: a fence of this store's own write never waits on it. It names
+	 * only `pg_catalog` functions and operators, since the connection's
+	 * `search_path` is not locked outside a transaction, and binds the holder
+	 * token as a parameter, as every statement does. On a connection another
+	 * session left read-only (SQLSTATE 25006) it runs as a transaction instead
+	 * (`#readWrite`), which overrides such a value or refuses a read-only
+	 * default, as every write does.
+	 */
+	async #heartbeatAlone(
+		lease: LeaseQueries,
+		count: number,
+		values: StatementValues,
+	): Promise<SqlSessionStorageResult> {
+		const alone = lease.heartbeatAlone?.(count);
+		if (alone) {
+			try {
+				return await run(this.#client, alone, values);
+			} catch (err) {
+				if (!isReadOnlyTransactionError(err)) throw err;
+			}
+		}
+		let refreshed: SqlSessionStorageResult = [];
+		await this.#readWrite(async transaction => {
+			refreshed = await run(transaction, lease.heartbeat(count), values);
+		});
+		return refreshed;
+	}
+
+	/**
+	 * The lease's locking read `which`, once: on MySQL and MariaDB its `NOWAIT`
+	 * form, whose refusal the caller answers by throwing the whole transaction
+	 * away (see {@link retryLockRefusals}); on PostgreSQL the fence's read,
+	 * whose wait the transaction's `lock_timeout` bounds (PostgreSQL claims in
+	 * one statement, and takes no `lock`).
+	 */
+	#lockingRead(
+		executor: SqlSessionStorageTransaction,
+		which: "lock" | "held" | "foreign",
+		values: StatementValues,
+	): Promise<SqlSessionStorageResult> {
+		const lease = this.#q.lease;
+		if (!lease) throw new Error("SqlSessionStorage: a locking read of a lease without a lease table");
+		if (this.#adapter === "mysql") return run(executor, this.#mysqlForms(lease)[which], values);
+		if (which === "lock")
+			throw new Error("SqlSessionStorage: PostgreSQL claims in one statement, with no lease lock");
+		return run(executor, lease[which], values);
+	}
+
+	/** This MySQL-family server's lease locks; start-up refused a claiming store on a server that has none. */
+	#mysqlForms(lease: LeaseQueries): NonNullable<LeaseQueries["nowait"]>[MysqlLockForm] {
+		if (!this.#mysqlLocks || !lease.nowait) {
+			throw new Error("SqlSessionStorage: a MySQL lease lock before start-up found how the server bounds one");
+		}
+		return lease.nowait[this.#mysqlLocks];
+	}
+
+	#probeLease(sessionId: string): Promise<LeaseProbeRow[]> {
+		const lease = this.#q.lease;
+		if (!lease) return Promise.resolve([]);
+		return this.#readOne(lease.probe, { sid: sessionId }) as Promise<LeaseProbeRow[]>;
+	}
+
+	/**
+	 * The lease each of `files` is written under, once each: this store's
+	 * claim on the path, else the session the path belongs to by its name (see
+	 * {@link sessionLeaseId}), which this store may hold no claim on. A path
+	 * with neither (no session's file or artifact) is under no lease.
+	 */
+	#fencesOf(files: readonly string[]): LeaseFence[] {
+		const fences: LeaseFence[] = [];
+		for (const file of files) {
+			const claim = this.#leasedPaths.get(path.resolve(file));
+			const sessionId = claim?.sessionId ?? sessionLeaseId(file);
+			if (sessionId === undefined || fences.some(fence => fence.sessionId === sessionId)) continue;
+			fences.push({ claim: claim ?? this.#leases.get(sessionId), sessionId, file });
+		}
+		return fences;
+	}
+
+	/**
+	 * Before a write's transaction: wait for each claim's statement, refusing
+	 * a claim another holder has; then, while a claim is lapsed (its last
+	 * answered heartbeat too old to prove it), wait for the next one to be
+	 * answered, at most one expiry. A longer wait would hold the write for an
+	 * outage; past it the write runs, and the lease row it checks decides.
+	 */
+	async #awaitClaims(fences: readonly LeaseFence[]): Promise<void> {
+		for (const { claim, file } of fences) {
+			if (!claim) continue;
+			if (!(await this.#ensureClaimed(claim))) throw new SessionLeaseLostError(file, claim.sessionId);
+			if (this.#gate !== "row") continue;
+			const until = performance.now() + this.#expiryMs;
+			while (claim.state === "held" && performance.now() > claim.validUntil && performance.now() < until) {
+				await Bun.sleep(LAPSE_POLL_MS);
+			}
+			if (claim.state === "lost") throw new SessionLeaseLostError(file, claim.sessionId);
+		}
+	}
+
+	/**
+	 * Run `work` in a write transaction behind the database fence, the first
+	 * statements of the transaction: refuse the write unless this store's
+	 * lease row of each claim is still there, and, for a session this store
+	 * holds no claim on, unless no other holder's lease of it is fresh. A
+	 * claimed row stays share-locked until the write commits, so a takeover's
+	 * update of it waits for the write, and its new holder sees it. A session
+	 * this store holds no claim on is share-locked too: on MySQL its missing
+	 * row's gap, on PostgreSQL the session's advisory lock (see `fenceLock`),
+	 * so a claim of it waits for the write and the write never lands after the
+	 * claim. A fence waits at most {@link LEASE_FENCE_LOCK_BOUND_MS} for
+	 * another transaction's lock (a takeover in flight), then refuses the
+	 * write: another process holds the session. On MySQL and MariaDB a fence
+	 * read refused by another transaction's lock throws the whole transaction
+	 * away, and the write runs again from its start within that bound, so no
+	 * statement of the write ever runs after a refusal in the same
+	 * transaction, which MariaDB with `innodb_rollback_on_timeout` ON has
+	 * already rolled back (see {@link retryLockRefusals}). PostgreSQL's fence
+	 * reads wait within its `lock_timeout`, in one attempt. A SQLite claim has
+	 * no lease row: `BEGIN IMMEDIATE` already keeps every other writer out,
+	 * and its OS lock keeps every other claimant.
+	 */
+	async #fencedTransaction(
+		fences: readonly LeaseFence[],
+		work: (transaction: SqlSessionStorageTransaction) => Promise<void>,
+	): Promise<void> {
+		const lease = this.#q.lease;
+		if (!lease || this.#gate !== "row" || fences.length === 0) return this.#transaction(work);
+		const deadline = performance.now() + LEASE_FENCE_LOCK_BOUND_MS;
+		for (;;) {
+			try {
+				await this.#transaction(async transaction => {
+					await this.#runFences(transaction, lease, fences, deadline);
+					await work(transaction);
+				});
+				return;
+			} catch (err) {
+				if (!(err instanceof FenceLockRefused)) throw err;
+				await Bun.sleep(NOWAIT_RETRY_MS);
 			}
 		}
 	}
 
+	/**
+	 * The fence statements of {@link #fencedTransaction}. On PostgreSQL they alone
+	 * run under the fence's lock bound: the transaction's own `lock_timeout`
+	 * (a client's session setting, or the server's) is read as the bound is
+	 * set, in one statement, and set back after them, so the write that
+	 * follows waits as the client asked. On MySQL and MariaDB a refused read
+	 * before `deadline` throws {@link FenceLockRefused}, so the caller runs the
+	 * whole transaction again; one at or past it refuses the write.
+	 */
+	async #runFences(
+		transaction: SqlSessionStorageTransaction,
+		lease: LeaseQueries,
+		fences: readonly LeaseFence[],
+		deadline: number,
+	): Promise<void> {
+		const postgres = this.#adapter === "postgres";
+		let prior: string | undefined;
+		if (postgres) {
+			const [row] = (await transaction.unsafe(
+				"SELECT p.prior, pg_catalog.set_config('lock_timeout', $1, true) AS bound " +
+					"FROM (SELECT pg_catalog.current_setting('lock_timeout') AS prior OFFSET 0) AS p",
+				[String(LEASE_FENCE_LOCK_BOUND_MS)],
+			)) as Array<{ prior?: unknown }>;
+			prior = typeof row?.prior === "string" ? row.prior : "0";
+		}
+		for (const { claim, sessionId, file } of fences) {
+			const values = { sid: sessionId, holder: this.#holder };
+			try {
+				if (claim) {
+					if ((await this.#lockingRead(transaction, "held", values)).length > 0) continue;
+				} else {
+					if (lease.fenceLock) await run(transaction, lease.fenceLock, values);
+					if ((await this.#lockingRead(transaction, "foreign", values)).length === 0) continue;
+				}
+			} catch (err) {
+				if (!isLockTimeoutError(err)) throw err;
+				// Nothing more runs in this transaction: MariaDB may have rolled it back already.
+				if (!postgres && performance.now() < deadline) throw new FenceLockRefused(err);
+				logger.debug("SqlSessionStorage fence waited past its lock bound", { sessionId });
+			}
+			if (claim) this.#markLost(claim);
+			throw new SessionLeaseLostError(file, sessionId);
+		}
+		if (prior !== undefined) {
+			await transaction.unsafe("SELECT pg_catalog.set_config('lock_timeout', $1, true)", [prior]);
+		}
+	}
+
+	/** After a move: the claim `src` was written under now covers `dst`. */
+	#moveLease(src: string, dst: string): void {
+		const from = path.resolve(src);
+		const to = path.resolve(dst);
+		const claim = this.#leasedPaths.get(from);
+		if (!claim) return;
+		const count = claim.paths.get(from) ?? 1;
+		const header = claim.headers.get(from);
+		claim.paths.delete(from);
+		claim.headers.delete(from);
+		claim.paths.set(to, (claim.paths.get(to) ?? 0) + count);
+		if (header !== undefined) claim.headers.set(to, header);
+		this.#leasedPaths.delete(from);
+		this.#leasedPaths.set(to, claim);
+	}
+
+	/**
+	 * Make whichever of the store's three tables are missing, and the lease
+	 * table's holder index with a lease table this start-up makes; returns
+	 * whether it made that index. On PostgreSQL one look at which tables exist
+	 * goes first, outside any lock: when all three do, nothing more runs, so a
+	 * store starting on made tables never queues on the database-wide start-up
+	 * lock (see {@link #setup}), where a busy database makes every turn slow.
+	 * Else one start-up transaction takes that lock, looks again under it
+	 * (another store may have made them meanwhile), and makes what is still
+	 * missing in one round trip. The index goes with the lease table only when
+	 * this transaction makes that table, so this login owns it; on a lease
+	 * table that was there, init looks for the index first. The look (init's,
+	 * `look`) also reads the connection's read-only default, and refuses to
+	 * start on one the session keeps, as a write would (see
+	 * {@link #readWrite}), though it makes nothing. On MySQL and SQLite each
+	 * table is made on its own, as before.
+	 */
+	async #createTables(look: TablesPresentRow | undefined): Promise<boolean> {
+		const lease = this.#q.lease;
+		if (this.#adapter !== "postgres") {
+			await this.#setup(this.#q.createTable);
+			await this.#setup(this.#q.createPartsTable);
+			if (lease) await this.#setup(lease.createTable);
+			return false;
+		}
+		if (look?.read_only_setting === "on" && look.read_only_reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+		if (pgTrue(look?.session) && pgTrue(look?.parts) && pgTrue(look?.lease)) return false;
+		let indexMade = false;
+		await this.#readWrite(async transaction => {
+			const [now] = (await run(transaction, PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[];
+			const missing: string[] = [];
+			if (!pgTrue(now?.session)) missing.push(this.#q.createTable);
+			if (!pgTrue(now?.parts)) missing.push(this.#q.createPartsTable);
+			if (lease && !pgTrue(now?.lease)) {
+				missing.push(lease.createTable);
+				if (lease.createIndex) {
+					missing.push(lease.createIndex);
+					indexMade = true;
+				}
+			}
+			if (missing.length > 0) await transaction.unsafe(missing.join("; "));
+		}, "start-up");
+		return indexMade;
+	}
+
+	/** The names {@link PG_TABLES_PRESENT} looks up: the session, parts and lease tables (the session table without a lease table). */
+	#pgTableNames(): StatementValues {
+		return {
+			session: this.#relation(this.#table),
+			parts: this.#relation(`${this.#table}_parts`),
+			lease: this.#relation(this.#q.lease ? this.#leaseTable : this.#table),
+		};
+	}
+
+	/**
+	 * For a MySQL-family store that claims sessions: run, once, each lock
+	 * statement whose syntax only the server family the reported version
+	 * names accepts, on the lease table and matching no row (MySQL 8's
+	 * `FOR SHARE NOWAIT`; MariaDB's `LOCK IN SHARE MODE NOWAIT` and
+	 * `SET STATEMENT`), and refuse to start, naming the version and the
+	 * syntax, when the server rejects one: a server reporting another family's
+	 * version (a proxy, a fork) would otherwise fail every claim and fence. A
+	 * lock refusal is no syntax error: the statement parsed.
+	 */
+	async #checkLockSyntax(): Promise<void> {
+		const lease = this.#q.lease;
+		if (this.#adapter !== "mysql" || this.#gate !== "row" || !lease) return;
+		const forms = this.#mysqlForms(lease);
+		const none = { sid: "", holder: "" };
+		const checks: Array<{ syntax: string; check: () => Promise<unknown> }> =
+			this.#mysqlLocks === "mariadb"
+				? [
+						{ syntax: "LOCK IN SHARE MODE NOWAIT", check: () => run(this.#client, forms.held, none) },
+						{
+							syntax: "SET STATEMENT innodb_lock_wait_timeout = <seconds> FOR",
+							check: () =>
+								this.#client.unsafe(
+									`SET STATEMENT innodb_lock_wait_timeout = 1 FOR SELECT holder FROM ${this.#relation(this.#leaseTable)} WHERE false`,
+								),
+						},
+					]
+				: [{ syntax: "FOR SHARE NOWAIT", check: () => run(this.#client, forms.held, none) }];
+		for (const { syntax, check } of checks) {
+			try {
+				await check();
+			} catch (err) {
+				if (isLockTimeoutError(err)) continue;
+				throw new Error(
+					`SqlSessionStorage: the server reports version ${this.#mysqlVersion}, so claims would lock lease rows with ${syntax}, which it refuses (${toError(err).message}). Is it the server family its version names? Open the store without claims, or point the DSN at MySQL 8.0 or later or MariaDB 10.3 or later.`,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Run one start-up statement of `init`. Stores that start at the same
+	 * moment on a PostgreSQL database without the tables would race: two
+	 * `CREATE TABLE IF NOT EXISTS` of one name both find no table, and one
+	 * fails (SQLSTATE 23505, 42P07 or 42710). So there every start-up
+	 * statement runs in its own transaction behind the start-up opening of
+	 * `#readWrite`, which takes one transaction-scoped advisory lock; they run
+	 * one after another, and the lock ends with the transaction. Each
+	 * statement keeps its own transaction, so a duplicate-column error still
+	 * fails only its own ALTER. The tables themselves are made together, by
+	 * {@link #createTables}. On MySQL and SQLite the statement runs straight
+	 * on the client.
+	 */
+	async #setup(query: string): Promise<void> {
+		if (this.#adapter !== "postgres") {
+			await this.#writeAlone(executor => executor.unsafe(query));
+			return;
+		}
+		await this.#readWrite(transaction => transaction.unsafe(query), "start-up");
+	}
+
+	/**
+	 * Run one write outside any store transaction: on PostgreSQL in a
+	 * read-write transaction of its own (see `#readWrite`), elsewhere straight
+	 * on the client. On SQLite it does not use the call queue, so the caller
+	 * must already hold `#exclusive` (`init` does), or
+	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
+	 * connection.
+	 */
+	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
+		if (this.#adapter === "postgres") await this.#readWrite(write);
+		else await write(this.#client);
+	}
+
+	/**
+	 * Run `work` in one PostgreSQL transaction that starts with `opening`.
+	 * Used on PostgreSQL only.
+	 *
+	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of
+	 * `setting` and `reset_val` of `default_transaction_read_only` (see
+	 * {@link READ_ONLY_SETTINGS}). A pooled connection can carry another
+	 * client's session-level `default_transaction_read_only = on` (a
+	 * transaction-mode pooler hands one backend to many clients, and a session
+	 * `SET` stays on it); PostgreSQL then refuses every write, even
+	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
+	 * but honours `READ WRITE` set as a transaction's first statement whatever
+	 * that default is. The read gives three cases:
+	 * - A session value over a default that is off (`setting` on, `reset_val`
+	 *   off): the store overrides it, and `work` runs.
+	 * - A read-only default that the backend session keeps (both on): the
+	 *   store honours it. The database, the role, the server or the backend
+	 *   connection's start parameters set it, so it is an operator's or a
+	 *   provider's decision (a provider can make a database read-only when its
+	 *   disk is nearly full). The transaction fails before `work` runs, with
+	 *   nothing written.
+	 * - A session that turned such a default off (`setting` off, `reset_val`
+	 *   on): `work` runs, as it did before the store read this setting.
+	 * A transaction-mode pooler applies a client's start parameters and its
+	 * `connect_query` to the backend with `SET`, so the store overrides them
+	 * like any session value. Any other answer, no row included, lets `work`
+	 * run.
+	 *
+	 * The start-up opening (see `#setup`) adds `READ COMMITTED` before the
+	 * read and the start-up advisory lock after it. Under a `repeatable read`
+	 * default the snapshot would be taken before the lock wait, and a
+	 * backfill would then fail with SQLSTATE 40001. The lock comes after the
+	 * read, so an honoured default refuses before any wait.
+	 */
+	#readWrite(
+		work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>,
+		opening: "write" | "start-up" = "write",
+	): Promise<void> {
+		return this.#client.transaction(async transaction => {
+			await transaction.unsafe("SET TRANSACTION READ WRITE");
+			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+			await transaction.unsafe(PG_SEARCH_PATH);
+			const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
+			if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
+			await work(transaction);
+		});
+	}
+
+	/**
+	 * Run `task` alone on its SQLite database: every backend call of every
+	 * store in this process on that database goes through one queue (see
+	 * {@link sqliteQueue}). Other dialects run statements on pooled
+	 * connections and need no queue.
+	 */
+	#exclusive<T>(task: () => Promise<T>): Promise<T> {
+		const queue = this.#sqliteQueue;
+		if (!queue) return task();
+		const result = queue.tail.then(task);
+		// The queue only orders tasks; each caller receives its own task's failure.
+		queue.tail = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
+	}
+
+	/**
+	 * Run `work` in one transaction. On SQLite it opens with `BEGIN IMMEDIATE`,
+	 * taking the write lock up front, so a writer in another process makes it
+	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it starts
+	 * with the write opening of `#readWrite`. On PostgreSQL and MySQL a
+	 * transaction the database aborts as a deadlock victim runs again; each
+	 * one recomputes everything under its own locks. A refused read-only
+	 * default is no deadlock and does not run again.
+	 */
+	#transaction(work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> {
+		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#readWrite(work));
+		if (this.#adapter === "mysql") return this.#retryDeadlocks(() => this.#client.transaction(work));
+		return this.#exclusive(async () => {
+			await this.#client.unsafe("BEGIN IMMEDIATE");
+			try {
+				await work(this.#client);
+				await this.#client.unsafe("COMMIT");
+			} catch (err) {
+				// A failed COMMIT (a reader in another process held the file past
+				// the busy timeout) leaves the transaction open, so roll back here.
+				// SQLite refuses the ROLLBACK when the error already rolled the
+				// transaction back (SQLITE_FULL, SQLITE_IOERR, ...); `err` is then
+				// the whole story. Any other ROLLBACK failure leaves the connection
+				// inside a transaction, so it is reported beside `err`.
+				try {
+					await this.#client.unsafe("ROLLBACK");
+				} catch (rollbackErr) {
+					if (!isNoActiveTransactionError(rollbackErr)) {
+						throw new AggregateError(
+							[err, rollbackErr],
+							"SqlSessionStorage: a SQLite transaction failed and its ROLLBACK failed too",
+						);
+					}
+				}
+				throw err;
+			}
+		});
+	}
+
+	async #retryDeadlocks(write: () => Promise<unknown>): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await write();
+				return;
+			} catch (err) {
+				if (attempt >= WRITE_ATTEMPTS || !isDeadlockError(err)) throw err;
+				await Bun.sleep(Math.random() * 20 * attempt);
+			}
+		}
+	}
+
+	/**
+	 * Delete `path`'s parts inside a write transaction. On MySQL, a DELETE that
+	 * matches nothing still takes a gap lock, and two transactions inserting
+	 * into the gaps each other locked deadlock; so look first, without locking.
+	 * Every writer of a path's parts first locks that path's session row. The
+	 * look is a consistent read, and under REPEATABLE READ the transaction's
+	 * first consistent read fixes its snapshot: a caller must lock the row of
+	 * every path it will look at before the first look, or a part a peer
+	 * commits in between is invisible to the look and is left orphaned.
+	 */
+	async #deleteParts(transaction: SqlSessionStorageTransaction, path: string): Promise<void> {
+		if (this.#adapter === "mysql" && (await run(transaction, this.#q.hasParts, { path })).length === 0) return;
+		await run(transaction, this.#q.deleteParts, { path });
+	}
+
+	/** Refuse to start against a schema an external migration has not brought up to date. */
+	async #assertSchema(): Promise<void> {
+		const partsTable = `${this.#table}_parts`;
+		const missing: string[] = [];
+		const sessionColumns = await this.#columns(this.#table);
+		if (sessionColumns.size === 0) missing.push(`table ${this.#table}`);
+		else if (!sessionColumns.has("byte_len")) missing.push(`column ${this.#table}.byte_len`);
+		if ((await this.#columns(partsTable)).size === 0) missing.push(`table ${partsTable}`);
+		// Only a store that claims reads the lease table; one that does not, as before, needs none.
+		if (this.#gate === "row" && (await this.#columns(this.#leaseTable)).size === 0) {
+			missing.push(`table ${this.#leaseTable}`);
+		}
+		if (missing.length === 0) return;
+		throw new Error(
+			`SqlSessionStorage: createTable is false, but the database has no ${missing.join(" and no ")}. ` +
+				`Apply the schema in ${SCHEMA_DOCS}, or let create() apply it.`,
+		);
+	}
+
+	async #columns(table: string): Promise<Set<string>> {
+		const rows = (await this.#read(executor =>
+			run(executor, this.#q.columns, { table: this.#relation(table) }),
+		)) as ColumnRow[];
+		return new Set(rows.map(row => row.column_name.toLowerCase()));
+	}
+
+	/** `name` as the store's statements spell it: with its schema on PostgreSQL once start-up read it. */
+	#relation(name: string): string {
+		return this.#schema === undefined ? name : `${quoteIdentifier(this.#schema)}.${name}`;
+	}
+
+	/**
+	 * Run a read: on PostgreSQL in a transaction of its own that starts with
+	 * {@link PG_SEARCH_PATH}, as every other statement does; elsewhere
+	 * straight on the client.
+	 */
+	async #read<T>(work: (executor: SqlSessionStorageTransaction) => Promise<T>): Promise<T> {
+		if (this.#adapter !== "postgres") return work(this.#client);
+		let result!: T;
+		await this.#client.transaction(async transaction => {
+			await transaction.unsafe(PG_SEARCH_PATH);
+			result = await work(transaction);
+		});
+		return result;
+	}
+
+	/**
+	 * Run one read statement: on PostgreSQL in one simple query behind
+	 * {@link PG_SEARCH_PATH}, which holds for the query's implicit
+	 * transaction, so the read costs the one round trip it did before the lock
+	 * (see {@link inlinePostgres}); elsewhere straight on the client.
+	 */
+	async #readOne(query: Statement | string, values: StatementValues = {}): Promise<SqlSessionStorageResult> {
+		const statement = typeof query === "string" ? { sql: query, params: [] } : query;
+		if (this.#adapter !== "postgres") return run(this.#client, statement, values);
+		const results = await this.#client.unsafe(`${PG_SEARCH_PATH}; ${inlinePostgres(statement, values)}`);
+		const rows = results[1];
+		if (!Array.isArray(rows)) throw new Error("SqlSessionStorage: a PostgreSQL read answered no rows for its query");
+		return rows as SqlSessionStorageResult;
+	}
+
+	/**
+	 * The lease table's holder index on PostgreSQL: whether one exists
+	 * ({@link PG_HOLDER_INDEXES}), and what holds its name `<leaseTable>_holder`
+	 * when that is not one of them.
+	 */
+	async #holderIndex(
+		executor: SqlSessionStorageTransaction,
+	): Promise<{ indexed: boolean; nameTakenBy: string | undefined }> {
+		const table = this.#relation(this.#leaseTable);
+		const indexes = new Set(
+			((await run(executor, PG_HOLDER_INDEXES, { table })) as Array<{ oid: string }>).map(row => row.oid),
+		);
+		const [holder] = (await run(executor, PG_HOLDER_INDEX_NAME, {
+			index: this.#relation(`${this.#leaseTable}_holder`),
+		})) as HolderIndexNameRow[];
+		const nameTakenBy =
+			holder && !indexes.has(holder.oid)
+				? `${PG_RELATION_KINDS[holder.kind] ?? `a relation of kind ${holder.kind}`}` +
+					(holder.on_table ? ` on table ${holder.on_table}` : ` ${holder.name}`)
+				: undefined;
+		return { indexed: indexes.size > 0, nameTakenBy };
+	}
+
+	/**
+	 * PostgreSQL: refuse to start on tables that would run code the store did
+	 * not declare on its writes. A login that owned a table (before an
+	 * external migration moved it to its owner) can give a column a type of its
+	 * own whose assignment cast runs its function, or add a trigger, a rule, a
+	 * row-level security policy, a CHECK constraint or an expression index;
+	 * PostgreSQL finds those through its catalogs, not through search_path, so
+	 * {@link PG_SEARCH_PATH} does not stop them. So every column must be the
+	 * store's, of its declared built-in type, with no default, generation or
+	 * identity, and no other column may exist: the store's inserts leave every
+	 * other column to its default, which the store cannot vet cheaply, and the
+	 * store reads none of them. Runs whatever `createTable` is; a table that
+	 * does not exist is `#assertSchema`'s to report, or one this store never reads.
+	 */
+	async #checkTables(): Promise<void> {
+		if (this.#adapter !== "postgres") return;
+		const tables: Array<[string, Record<string, string>]> = [
+			[this.#table, PG_DECLARED_COLUMNS.session],
+			[`${this.#table}_parts`, PG_DECLARED_COLUMNS.parts],
+		];
+		if (this.#q.lease) tables.push([this.#leaseTable, PG_DECLARED_COLUMNS.lease]);
+		const problems: string[] = [];
+		await this.#read(async executor => {
+			for (const [name, declared] of tables) {
+				const relation = this.#relation(name);
+				const columns = (await run(executor, PG_TABLE_COLUMNS, { table: relation })) as TableColumnRow[];
+				if (columns.length === 0) continue;
+				const found: string[] = [];
+				for (const [column, type] of Object.entries(declared)) {
+					const row = columns.find(candidate => candidate.name === column);
+					if (!row) found.push(`no column ${column}`);
+					else if (row.type !== type) found.push(`column ${column} of type ${row.type}, not ${type}`);
+				}
+				for (const row of columns) {
+					if (!(row.name in declared)) found.push(`column ${row.name}, which the store does not declare`);
+					if (row.has_default) found.push(`a default on column ${row.name}`);
+					if (row.generated !== "") found.push(`column ${row.name} generated from an expression`);
+					if (row.identity !== "") found.push(`identity column ${row.name}`);
+				}
+				for (const object of (await run(executor, PG_TABLE_OBJECTS, { table: relation })) as TableObjectRow[]) {
+					found.push(
+						{
+							trigger: `trigger ${object.name}`,
+							rule: `rule ${object.name}`,
+							policy: `row-level security policy ${object.name}`,
+							"row-level security": "row-level security enabled",
+							"relation kind": `relation kind ${object.name}, not an ordinary table`,
+							constraint: `constraint ${object.name}, not a primary key, unique or not-null constraint`,
+							index: `index ${object.name} on an expression or with a predicate`,
+							inheritance: `table ${object.name} inheriting from it`,
+						}[object.kind] ?? `${object.kind} ${object.name}`,
+					);
+				}
+				// The lease entry by its role, not its name: a lease table that names another of the three is one table.
+				if (declared === PG_DECLARED_COLUMNS.lease) {
+					const { indexed, nameTakenBy } = await this.#holderIndex(executor);
+					if (nameTakenBy) {
+						found.push(
+							`its index name ${this.#relation(`${this.#leaseTable}_holder`)} taken by ${nameTakenBy}, ` +
+								"not by an index of it on holder",
+						);
+					} else if (!indexed) found.push("no index on column holder");
+				}
+				if (found.length > 0) problems.push(`table ${relation} has ${found.join(", ")}`);
+			}
+		});
+		if (problems.length === 0) return;
+		throw new Error(
+			`SqlSessionStorage: ${problems.join("; ")}. The store starts only on tables as ${SCHEMA_DOCS} gives them, ` +
+				"with nothing else on them that could run code on its writes.",
+		);
+	}
+
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
-		const rows = (await this.#client.unsafe(this.#q.loadIndex)) as IndexRow[];
-		return rows.map(row => ({
-			path: row.path,
-			size: rowNumber(row.byte_len),
-			mtimeMs: rowNumber(row.mtime_ms),
-			title: row.title ?? undefined,
-			titleSource: rowTitleSource(row.title_source),
-			titleUpdatedAt: row.title_updated_at ?? undefined,
-		}));
+		const rows = (await this.#exclusive(() => this.#readOne(this.#q.loadIndex))) as IndexRow[];
+		return rows.map(row => {
+			if (row.byte_len === null) {
+				throw new Error(
+					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(row.path)} has no byte_len; ` +
+						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
+				);
+			}
+			return {
+				path: row.path,
+				size: rowNumber(row.byte_len),
+				mtimeMs: rowNumber(row.mtime_ms),
+				title: row.title ?? undefined,
+				titleSource: rowTitleSource(row.title_source),
+				titleUpdatedAt: row.title_updated_at ?? undefined,
+			};
+		});
 	}
 
 	async readFull(path: string): Promise<string | null> {
-		const rows = (await this.#client.unsafe(this.#q.readFull, [path])) as ContentRow[];
-		const row = rows[0];
-		return row ? row.content : null;
+		const rows = (await this.#exclusive(() => this.#readOne(this.#q.readFull, { path }))) as ContentRow[];
+		let head: string | undefined;
+		const parts: Array<{ offset: number; content: string }> = [];
+		for (const row of rows) {
+			if (rowNumber(row.kind) === 0) head = row.content;
+			else parts.push({ offset: rowNumber(row.start_offset), content: row.content });
+		}
+		if (head === undefined) return null;
+		parts.sort((a, b) => a.offset - b.offset);
+		return head + parts.map(part => part.content).join("");
 	}
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const values =
-			this.#adapter === "postgres"
-				? [prefixBytes, suffixBytes, path]
-				: [prefixBytes, suffixBytes, suffixBytes, path];
-		const rows = (await this.#client.unsafe(this.#q.readSlices, values)) as SliceRow[];
-		const row = rows[0];
-		if (!row) throw enoent(path);
-		return [decodeSqlBytes(row.head), decodeSqlBytes(row.tail)];
+		const rows = (await this.#exclusive(() =>
+			this.#readOne(this.#q.readSlices, { path, prefix: prefixBytes, suffix: suffixBytes }),
+		)) as SliceRow[];
+		let session: SliceRow | undefined;
+		const headParts: Array<{ offset: number; bytes: Uint8Array | null }> = [];
+		const tailParts: Array<{ offset: number; bytes: Uint8Array | null }> = [];
+		for (const row of rows) {
+			const kind = rowNumber(row.kind);
+			if (kind === 0) session = row;
+			else if (kind === 1) headParts.push({ offset: rowNumber(row.start_offset), bytes: row.head });
+			else tailParts.push({ offset: rowNumber(row.start_offset), bytes: row.tail });
+		}
+		if (!session) throw enoent(path);
+		return [
+			utf8Decoder.decode(joinSliceBytes(session.head, headParts)),
+			utf8Decoder.decode(joinSliceBytes(session.tail, tailParts)),
+		];
+	}
+
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+		const take = Math.min(
+			maxBytes === undefined ? MAX_PIECE_BYTES : Math.max(0, Math.trunc(maxBytes)),
+			MAX_PIECE_BYTES,
+		);
+		const rows = (await this.#exclusive(() =>
+			this.#readOne(this.#q.readFrom, {
+				path,
+				offset,
+				end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(offset + take, Number.MAX_SAFE_INTEGER),
+				take,
+				row_from: Math.min(offset, MAX_PIECE_BYTES - 1) + 1,
+			}),
+		)) as ReadFromRow[];
+		let size: number | undefined;
+		let head: Uint8Array | null = null;
+		const pieces: Array<{ offset: number; bytes: Uint8Array | null }> = [];
+		for (const row of rows) {
+			if (rowNumber(row.kind) !== 0) {
+				pieces.push({ offset: rowNumber(row.start_offset), bytes: row.bytes });
+				continue;
+			}
+			if (row.byte_len === null) {
+				throw new Error(
+					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
+						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
+				);
+			}
+			size = rowNumber(row.byte_len);
+			head = row.bytes;
+		}
+		if (size === undefined) return null;
+		const bytes = joinSliceBytes(head, pieces);
+		// Each piece is capped on its own; the window is capped as a whole.
+		return { text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)), size };
 	}
 
 	async writeFull(
@@ -358,69 +2817,135 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
 	): Promise<void> {
-		const titleValues = [title?.title ?? null, title?.source ?? null, title?.updatedAt ?? null];
-		if (expectedSize === undefined) {
-			const values = [path, content, mtimeMs, ...titleValues];
-			if (this.#adapter === "mysql") values.push(content, mtimeMs, ...titleValues);
-			await this.#client.unsafe(this.#q.upsertReplace, values);
-			return;
+		const bytes = Buffer.from(content, "utf8");
+		const row = {
+			path,
+			mtime: mtimeMs,
+			title: title?.title ?? null,
+			title_source: title?.source ?? null,
+			title_updated_at: title?.updatedAt ?? null,
+			len: bytes.byteLength,
+		};
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		await this.#fencedTransaction(fences, async transaction => {
+			if (expectedSize === null) {
+				const result = await run(transaction, this.#q.insertRowIfMissing, row);
+				const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+				if (!inserted) throw new SessionWriteConflictError(path, null, await this.#lockSize(transaction, path));
+			} else {
+				// The size check reads `byte_len` under the row lock rather than
+				// trusting a conditional UPDATE's row count, which MySQL reports
+				// as 0 for a matched row whose values did not change.
+				if (expectedSize !== undefined) {
+					const actualSize = await this.#lockSize(transaction, path);
+					if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+				}
+				await run(transaction, this.#q.upsertRow, row);
+			}
+			// A created session also drops parts orphaned under its path.
+			await this.#deleteParts(transaction, path);
+			await this.#insertParts(transaction, path, bytes);
+		});
+	}
+
+	async #lockSize(transaction: SqlSessionStorageTransaction, path: string): Promise<number | null> {
+		const rows = (await run(transaction, this.#q.lockSize, { path })) as SizeRow[];
+		const row = rows[0];
+		return row ? rowNumber(row.byte_len) : null;
+	}
+
+	/** Store `bytes` as parts of at most {@link PART_BYTES}, each ending on a UTF-8 character boundary. */
+	async #insertParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
+		for (let start = 0; start < bytes.byteLength;) {
+			let end = Math.min(start + PART_BYTES, bytes.byteLength);
+			// Back off continuation bytes (0b10xxxxxx) so no character straddles two parts.
+			while (end < bytes.byteLength && (bytes[end] & 0xc0) === 0x80) end--;
+			await run(transaction, this.#q.insertPart, {
+				path,
+				offset: start,
+				content: bytes.toString("utf8", start, end),
+			});
+			start = end;
 		}
-
-		const result =
-			expectedSize === null
-				? await this.#client.unsafe(this.#q.insertIfMissing, [path, content, mtimeMs, ...titleValues])
-				: await this.#client.unsafe(this.#q.replaceIfSize, [content, mtimeMs, ...titleValues, path, expectedSize]);
-		const written = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
-		if (written) return;
-
-		const current = await this.readFull(path);
-		const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
-		// MySQL reports `affectedRows: 0` for a matched-but-unchanged row, so a
-		// byte-identical replace looks unwritten. A size match means the size
-		// precondition holds and there is nothing to conflict about; only a real
-		// size divergence throws. (Same granularity as the size-token contract
-		// everywhere else: same-length different content is not detectable here
-		// on any dialect. Actual MySQL driver/flag behavior is unverified in
-		// this environment; this re-check is exact regardless of it.)
-		if (actualSize === expectedSize) return;
-		throw new SessionWriteConflictError(path, expectedSize, actualSize);
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.updateTitle, [
-			title.title ?? null,
-			title.source ?? null,
-			title.updatedAt,
-			mtimeMs,
-			path,
-		]);
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		await this.#fencedTransaction(fences, async transaction => {
+			await run(transaction, this.#q.updateTitle, {
+				path,
+				title: title.title ?? null,
+				title_source: title.source ?? null,
+				title_updated_at: title.updatedAt,
+				mtime: mtimeMs,
+			});
+		});
 	}
 
-	async append(path: string, line: string, mtimeMs: number): Promise<void> {
-		const values = this.#adapter === "mysql" ? [path, line, mtimeMs, line, mtimeMs] : [path, line, mtimeMs];
-		await this.#client.unsafe(this.#q.upsertAppend, values);
+	async append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void> {
+		const values = { path, content: line, mtime: mtimeMs, len: Buffer.byteLength(line, "utf8") };
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		await this.#fencedTransaction(fences, async transaction => {
+			// A store that claims sessions refuses to append onto bytes it did not
+			// write (another writer that claims nothing, such as an older omp,
+			// changed or replaced the file), so `SessionManager` can read the file
+			// back and keep that writer's entries, or move off, instead of mixing
+			// this session's lines into whatever the file now holds.
+			if (expectedSize !== undefined && this.#gate) {
+				const actualSize = await this.#lockSize(transaction, path);
+				if ((actualSize ?? 0) !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+			}
+			for (const query of this.#q.append) await run(transaction, query, values);
+		});
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
 		await this.writeFull(path, "", mtimeMs);
 	}
 
-	async remove(paths: string[]): Promise<void> {
-		for (const path of paths) {
-			await this.#client.unsafe(this.#q.delete, [path]);
-		}
+	async remove(paths: string[], dir?: string): Promise<void> {
+		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
+		const fences = this.#fencesOf(paths);
+		await this.#awaitClaims(fences);
+		await this.#fencedTransaction(fences, async transaction => {
+			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
+			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
+			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
+			for (const path of paths) await this.#deleteParts(transaction, path);
+		});
 	}
 
-	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
+	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {
 		if (src === dst) {
-			if ((await this.readFull(src)) === null) throw enoent(src);
+			const rows = await this.#exclusive(() => this.#readOne(this.#q.exists, { path: src }));
+			if (rows.length === 0) throw enoent(src);
 			return;
 		}
-		await this.#client.transaction(async transaction => {
-			await transaction.unsafe(this.#q.delete, [dst]);
-			const result = await transaction.unsafe(this.#q.rename, [dst, mtimeMs, src]);
+		const fences = this.#fencesOf([src, dst]);
+		await this.#awaitClaims(fences);
+		await this.#fencedTransaction(fences, async transaction => {
+			if (!noReplace) await run(transaction, this.#q.deleteRow, { path: dst });
+			// One statement renames the row, so the primary key refuses a `dst`
+			// row that exists, or that another client inserts concurrently (the
+			// UPDATE waits on its uncommitted key); the thrown error rolls the
+			// transaction back with both paths untouched.
+			let result: SqlSessionStorageResult;
+			try {
+				result = await run(transaction, this.#q.renameRow, { src, dst, mtime: mtimeMs });
+			} catch (err) {
+				if (noReplace && isPrimaryKeyViolation(err)) throw eexist(dst);
+				throw err;
+			}
 			const moved = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
 			if (!moved) throw enoent(src);
+			// Both rows are locked now, before the parts look (see #deleteParts):
+			// parts orphaned under `dst` go, then `src`'s follow its row.
+			await this.#deleteParts(transaction, dst);
+			await run(transaction, this.#q.renameParts, { src, dst });
 		});
+		this.#moveLease(src, dst);
 	}
 }

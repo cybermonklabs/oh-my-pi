@@ -14,8 +14,13 @@
  * - `init-log-none` / `init-disabled`: the same path with `OTEL_LOG_LEVEL=none`
  *   or `OTEL_SDK_DISABLED=true` in the agent `.env`, which omp itself must
  *   honor through `$otelEnv`.
+ *
+ * The probe runs as a test child (`PI_TEST_RUNTIME=1`), which exports only to a
+ * receiver it declared, so it declares the test's receiver (its second argument)
+ * in every mode: what then keeps a signal off is the configuration under test.
  */
 import {
+	allowTelemetryReceiverForTests,
 	flushTelemetryExport,
 	initTelemetryExport,
 	isTelemetryExportEnabled,
@@ -26,7 +31,9 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
-const mode = process.argv[2];
+const [mode, receiver] = process.argv.slice(2);
+if (!receiver) throw new Error("usage: otel-env-window-probe.ts <mode> <receiver-origin>");
+allowTelemetryReceiverForTests(receiver);
 
 function leakedOtelNames(): string[] {
 	return Object.keys(process.env).filter(name => name.startsWith("OTEL_"));

@@ -3,7 +3,9 @@
  * file reads. Budgets are UTF-8 bytes (what the judge is billed on), so
  * clipping is always done at a code-point boundary.
  */
+import { readFileBeneath } from "@oh-my-pi/pi-natives";
 import type { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
+import type { FileEntry } from "./tree";
 
 /** Split like Rust `str::lines`: `\n`-separated, trailing `\r` stripped, no phantom last line after a final newline. */
 export function lines(text: string): string[] {
@@ -79,15 +81,30 @@ export class ReadTextError extends Error {
 const BINARY_PROBE_BYTES = 8192;
 
 /**
- * Read up to `maxBytes` of a text file (host path or internal URL) through
- * `filesystem`. Rejects binaries (NUL in the first 8 KB) and blank files;
- * trims a truncated read back to the last full line.
+ * Read up to `maxBytes` of a text file through `filesystem`, or, for an entry a
+ * host walk listed, below the walked root with no symlink followed that the
+ * listing did not show. Rejects binaries (NUL in the first 8 KB) and blank
+ * files; trims a truncated read back to the last full line.
  * @throws {ReadTextError} `binary`, `empty`, or `io`.
  */
-export async function readText(filesystem: InternalUrlFilesystem, path: string, maxBytes: number): Promise<ReadText> {
+export async function readText(
+	filesystem: InternalUrlFilesystem,
+	file: Pick<FileEntry, "path" | "rel" | "root" | "symlink">,
+	maxBytes: number,
+): Promise<ReadText> {
 	let buf: Uint8Array;
 	try {
-		buf = await filesystem.readPrefix(path, maxBytes + 1);
+		if (file.root === undefined) {
+			buf = await filesystem.readPrefix(file.path, maxBytes + 1);
+		} else {
+			const read = await readFileBeneath({
+				root: file.root,
+				path: file.rel,
+				followSymlink: file.symlink,
+				prefixBytes: maxBytes + 1,
+			});
+			buf = read.content ?? new Uint8Array();
+		}
 	} catch (error) {
 		throw new ReadTextError("io", error instanceof Error ? error.message : String(error));
 	}

@@ -19,6 +19,10 @@ class FakeKernel {
 	isAlive(): boolean {
 		return this.alive;
 	}
+
+	hasPendingWork(): boolean {
+		return false;
+	}
 }
 
 const OK_RESULT: KernelExecuteResult = {
