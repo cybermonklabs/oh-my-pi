@@ -548,12 +548,13 @@ describe("session blobs in the SQL session storage", () => {
 				await manager.close();
 			});
 
-			it("writes no first, full transcript naming an image before its blob's row commits", async () => {
+			it("writes no first, full transcript naming an image before its blob's row commits, and runs that write once", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				let gate: GatedClient | undefined;
+				const queries: string[] = [];
 				const storage = await db.open({
 					wrap: client => {
-						gate = gatedClient(client, BLOB_INSERT);
+						gate = gatedClient(recordingClient(client, queries), BLOB_INSERT);
 						return gate.client;
 					},
 				});
@@ -578,6 +579,10 @@ describe("session blobs in the SQL session storage", () => {
 				}
 				await flushing;
 				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
+				// The write waited for its blob before it began, so it ran once: without that wait its first
+				// transaction would find the row missing, roll back, and run again once the blob landed.
+				const sessionRow = new RegExp(`^INSERT INTO \\S*\\b${db.table} \\(`);
+				expect(queries.filter(query => sessionRow.test(query))).toHaveLength(1);
 				await manager.close();
 			});
 
