@@ -11,7 +11,12 @@ import {
 import { buildModel } from "./build";
 import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
-import { readModelCache, readModelCacheRowVersion, writeModelCacheInSlices } from "./model-cache";
+import {
+	readModelCache,
+	readModelCacheWithVersion,
+	takeModelCacheWriteTicket,
+	writeModelCacheInSlices,
+} from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { TimeBasedCostShape } from "./pricing";
 import { type Api, type Model, modelKind, type ModelSpec, type Provider } from "./types";
@@ -364,8 +369,19 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		};
 	}
 
-	const [fetchedModelsDevModels, dynamicFetch] = shouldFetchFromNetwork
-		? await Promise.all([fetchModelsDev(options), dynamicFetcher ? fetchDynamicModels(dynamicFetcher) : undefined])
+	const fetched = shouldFetchFromNetwork
+		? await Promise.all([
+				fetchModelsDevPayload(options),
+				dynamicFetcher ? fetchDynamicSpecs(dynamicFetcher) : undefined,
+			])
+		: undefined;
+	// An unsliced resolution wrote the row in the step its fetches resolved, so
+	// concurrent resolutions wrote in the order their fetches resolved. The
+	// ticket, taken before the fetched rows are built in slices, keeps that
+	// order for the sliced writes below.
+	const writeTicket = fetched ? takeModelCacheWriteTicket(cacheProviderId, dbPath) : undefined;
+	const [fetchedModelsDevModels, dynamicFetch] = fetched
+		? await Promise.all([buildModelsDevModels(options, fetched[0]), fetched[1] && buildDynamicModels(fetched[1])])
 		: [null, undefined];
 	const fetchedDynamicModels = dynamicFetch?.models ?? null;
 	const modelsDevFetchSucceeded = fetchedModelsDevModels !== null;
@@ -449,6 +465,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dbPath,
 				staticModels,
 				restorableHeaderFallback,
+				{ ticket: writeTicket },
 			);
 		} else {
 			// Remote fetch failed. Re-persist any prior catalog as a
@@ -464,11 +481,15 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			// mark the remainder fresh, while the untouched row keeps forcing a
 			// refetch that recovers them (#18227).
 			while (sliceExpired()) await nextSlice();
-			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
 			// The guard and the snapshot below come from this row, and the write
 			// lands slices later: another pass for this provider can write the row
 			// in between. The write applies only while the row is still this one.
-			const latestRowVersion = readModelCacheRowVersion(cacheProviderId, dbPath);
+			const { entry: latestCache, version: latestRowVersion } = readModelCacheWithVersion<TApi>(
+				cacheProviderId,
+				ttlMs,
+				now,
+				dbPath,
+			);
 			const latestRestoredCache = await restoreCachedModelHeaders(
 				latestCache?.models ?? cache?.models ?? [],
 				staticModels,
@@ -517,7 +538,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					dbPath,
 					staticModels,
 					restorableHeaderFallback,
-					latestRowVersion,
+					{ ticket: writeTicket, rowVersion: latestRowVersion },
 				);
 			}
 		}
@@ -549,31 +570,56 @@ interface DiscoveredModelSet<TApi extends Api> {
 	explicitKindModels: ReadonlySet<Model<TApi>>;
 }
 
-async function fetchModelsDev<TApi extends Api, TModelsDevPayload>(
+/** The shared models.dev payload, fetched; `null` when there is no models.dev source or the fetch failed. */
+async function fetchModelsDevPayload<TApi extends Api, TModelsDevPayload>(
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
-): Promise<DiscoveredModelSet<TApi> | null> {
+): Promise<{ payload: TModelsDevPayload } | null> {
 	if (!options.modelsDev) {
 		return null;
 	}
-
 	try {
-		const payload = await options.modelsDev.fetch();
-		// Every provider that maps this shared payload resumes here in the same turn.
-		while (sliceExpired()) await nextSlice();
-		return await buildDiscoveredModelSpecs<TApi>(options.modelsDev.map(payload, options.providerId));
+		return { payload: await options.modelsDev.fetch() };
 	} catch {
 		return null;
 	}
 }
 
-/** The endpoint's catalog (`models: null` when it answered none), and why it threw, if it did. */
-async function fetchDynamicModels<TApi extends Api>(
-	fetcher: () => Promise<readonly ModelSpec<TApi>[] | null>,
-): Promise<{ models: DiscoveredModelSet<TApi> | null; error?: string }> {
+async function buildModelsDevModels<TApi extends Api, TModelsDevPayload>(
+	options: ModelManagerOptions<TApi, TModelsDevPayload>,
+	fetched: { payload: TModelsDevPayload } | null,
+): Promise<DiscoveredModelSet<TApi> | null> {
+	if (!fetched || !options.modelsDev) {
+		return null;
+	}
 	try {
-		const models = await fetcher();
-		if (models === null) return { models: null };
-		return { models: await buildDiscoveredModelSpecs<TApi>(models) };
+		// Every provider that maps this shared payload resumes here in the same turn.
+		while (sliceExpired()) await nextSlice();
+		return await buildDiscoveredModelSpecs<TApi>(options.modelsDev.map(fetched.payload, options.providerId));
+	} catch {
+		return null;
+	}
+}
+
+/** The endpoint's rows (`specs: null` when it answered none), and why it threw, if it did. */
+async function fetchDynamicSpecs<TApi extends Api>(
+	fetcher: () => Promise<readonly ModelSpec<TApi>[] | null>,
+): Promise<{ specs: readonly ModelSpec<TApi>[] | null; error?: string }> {
+	try {
+		return { specs: await fetcher() };
+	} catch (error) {
+		return { specs: null, error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/** The endpoint's catalog (`models: null` when it answered none), and why it failed, if it did. */
+async function buildDynamicModels<TApi extends Api>(fetched: {
+	specs: readonly ModelSpec<TApi>[] | null;
+	error?: string;
+}): Promise<{ models: DiscoveredModelSet<TApi> | null; error?: string }> {
+	if (fetched.specs === null)
+		return fetched.error === undefined ? { models: null } : { models: null, error: fetched.error };
+	try {
+		return { models: await buildDiscoveredModelSpecs<TApi>(fetched.specs) };
 	} catch (error) {
 		return { models: null, error: error instanceof Error ? error.message : String(error) };
 	}

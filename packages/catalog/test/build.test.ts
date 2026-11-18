@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,8 +8,10 @@ import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import {
+	getModelCacheWriteStats,
 	readModelCache,
-	readModelCacheRowVersion,
+	readModelCacheWithVersion,
+	takeModelCacheWriteTicket,
 	writeModelCache,
 	writeModelCacheInSlices,
 } from "@oh-my-pi/pi-catalog/model-cache";
@@ -2101,20 +2103,144 @@ describe("model cache materialized round trip", () => {
 		const providerId = "row-version-test";
 		const older = buildModel(completionsSpec({ id: "older-model", provider: providerId }));
 		const newer = buildModel(completionsSpec({ id: "newer-model", provider: providerId }));
-		const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
+		const read = () => readModelCacheWithVersion(providerId, Infinity, () => 0, dbPath);
+		const storedIds = () => read().entry?.models.map(model => model.id);
 		try {
-			expect(readModelCacheRowVersion(providerId, dbPath)).toBeNull();
-			writeModelCache(providerId, 1_000_000, [older], true, "", dbPath);
-			const read = readModelCacheRowVersion(providerId, dbPath);
-			// Another write lands after the caller read the row.
-			writeModelCache(providerId, 1_500_000, [newer], true, "", dbPath);
-			await writeModelCacheInSlices(providerId, 2_000_000, [older], false, "", dbPath, [], undefined, read);
+			// A row created after the caller read "no row" is kept.
+			const absent = read().version;
+			expect(absent).toBeNull();
+			writeModelCache(providerId, 1_000_000, [older], false, "", dbPath);
+			await writeModelCacheInSlices(providerId, 1_200_000, [newer], false, "", dbPath, [], undefined, {
+				rowVersion: absent,
+			});
+			expect(storedIds()).toEqual(["older-model"]);
+			// A payload replaced after the caller read the row is kept.
+			const beforeReplace = read().version;
+			writeModelCache(providerId, 1_500_000, [newer], false, "", dbPath);
+			await writeModelCacheInSlices(providerId, 2_000_000, [older], false, "", dbPath, [], undefined, {
+				rowVersion: beforeReplace,
+			});
 			expect(storedIds()).toEqual(["newer-model"]);
-			// The row's current version lets the same write through.
-			const current = readModelCacheRowVersion(providerId, dbPath);
-			await writeModelCacheInSlices(providerId, 2_000_000, [older], false, "", dbPath, [], undefined, current);
+			// So is a refresh side row: the same payload refreshed as authoritative stays authoritative.
+			const beforeRefresh = read().version;
+			writeModelCache(providerId, 2_500_000, [newer], true, "", dbPath);
+			const staleBefore = getModelCacheWriteStats().staleWrites;
+			await writeModelCacheInSlices(providerId, 3_000_000, [newer], false, "", dbPath, [], undefined, {
+				rowVersion: beforeRefresh,
+			});
+			expect(getModelCacheWriteStats().staleWrites).toBe(staleBefore + 1);
+			expect(read().entry?.authoritative).toBe(true);
+			// The row's current version lets a write through.
+			await writeModelCacheInSlices(providerId, 3_000_000, [older], false, "", dbPath, [], undefined, {
+				rowVersion: read().version,
+			});
 			expect(storedIds()).toEqual(["older-model"]);
 		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a sliced write leaves a row another write changed while the writer was in its own slices", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-row-version-in-slices-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "row-version-in-slices-test";
+		const older = buildModel(completionsSpec({ id: "older-model", provider: providerId }));
+		const newer = buildModel(completionsSpec({ id: "newer-model", provider: providerId }));
+		let raced = false;
+		// The writer reads each model's headers in its slices, before its transaction:
+		// another write lands at that point.
+		const racing = Object.defineProperty({ ...older }, "headers", {
+			enumerable: true,
+			get() {
+				if (!raced) {
+					raced = true;
+					writeModelCache(providerId, 1_500_000, [newer], true, "", dbPath);
+				}
+				return undefined;
+			},
+		});
+		try {
+			writeModelCache(providerId, 1_000_000, [older], true, "", dbPath);
+			const { version } = readModelCacheWithVersion(providerId, Infinity, () => 0, dbPath);
+			await writeModelCacheInSlices(providerId, 2_000_000, [racing], false, "", dbPath, [], undefined, {
+				rowVersion: version,
+			});
+			expect(raced).toBe(true);
+			expect(readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id)).toEqual([
+				"newer-model",
+			]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a sliced write whose ticket is older than one that has written leaves the row alone", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-write-ticket-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "write-ticket-test";
+		const older = buildModel(completionsSpec({ id: "older-model", provider: providerId }));
+		const newer = buildModel(completionsSpec({ id: "newer-model", provider: providerId }));
+		const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
+		try {
+			const first = takeModelCacheWriteTicket(providerId, dbPath);
+			const second = takeModelCacheWriteTicket(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 1_500_000, [newer], true, "", dbPath, [], undefined, {
+				ticket: second,
+			});
+			await writeModelCacheInSlices(providerId, 1_000_000, [older], true, "", dbPath, [], undefined, {
+				ticket: first,
+			});
+			expect(storedIds()).toEqual(["newer-model"]);
+			const third = takeModelCacheWriteTicket(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 2_000_000, [older], true, "", dbPath, [], undefined, {
+				ticket: third,
+			});
+			expect(storedIds()).toEqual(["older-model"]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("concurrent refreshes write the cache in the order their fetches resolved", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-fetch-order-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "fetch-order-test";
+		const earlier = Array.from({ length: 300 }, (_, index) =>
+			completionsSpec({ id: `old-model-${index}`, provider: providerId }),
+		);
+		const later = completionsSpec({ id: "new-model", provider: providerId });
+		const { promise: firstFetched, resolve: markFirstFetched } = Promise.withResolvers<void>();
+		const options = (fetchDynamicModels: () => Promise<readonly ModelSpec<"openai-completions">[]>) => ({
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => 1_000_000,
+			fetchDynamicModels,
+		});
+		// Every clock read ends a slice: the first pass's 300 rows take many turns after its fetch.
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		try {
+			const first = resolveProviderModels(
+				options(async () => {
+					setTimeout(markFirstFetched, 0);
+					return earlier;
+				}),
+				"online",
+			);
+			// The second fetch resolves a timer later, and its one row writes before the first pass's 300.
+			const second = resolveProviderModels(
+				options(async () => {
+					await firstFetched;
+					return [later];
+				}),
+				"online",
+			);
+			await Promise.all([first, second]);
+			vi.restoreAllMocks();
+			expect(readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id)).toEqual([
+				"new-model",
+			]);
+		} finally {
+			vi.restoreAllMocks();
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
