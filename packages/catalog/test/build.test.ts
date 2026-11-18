@@ -2208,6 +2208,18 @@ describe("model cache materialized round trip", () => {
 				ticket: fourth,
 			});
 			expect(storedIds()).toEqual(["newer-model"]);
+			// Nor does it stop a partial write with an earlier ticket.
+			const sixth = takeModelCacheWriteTicket(providerId, dbPath);
+			const seventh = takeModelCacheWriteTicket(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 3_500_000, [newer], false, "", dbPath, [], undefined, {
+				ticket: seventh,
+				copy: true,
+			});
+			await writeModelCacheInSlices(providerId, 4_000_000, [older], true, "", dbPath, [], undefined, {
+				ticket: sixth,
+				partial: true,
+			});
+			expect(storedIds()).toEqual(["older-model"]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
@@ -2416,6 +2428,77 @@ describe("model cache materialized round trip", () => {
 				count: 300,
 				authoritative: true,
 			});
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a partial refresh that read the cache before a complete refresh wrote does not replace its rows", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-partial-read-before-complete-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "partial-read-before-complete-test";
+		const fetched = Array.from({ length: 300 }, (_, index) =>
+			completionsSpec({ id: `fetched-model-${index}`, provider: providerId }),
+		);
+		const { promise: completeWritten, resolve: markCompleteWritten } = Promise.withResolvers<void>();
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			false,
+			"",
+			dbPath,
+		);
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		const staleBefore = getModelCacheWriteStats().staleWrites;
+		try {
+			// The complete refresh fetches 300 rows and builds them over many turns.
+			const complete = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_000_000,
+					fetchDynamicModels: async () => fetched,
+				},
+				"online",
+			);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			// The partial refresh reads the prior row while the complete one builds;
+			// its fetches resolve only after the complete one has written.
+			const partial = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_100_000,
+					modelsDev: {
+						fetch: async () => {
+							await completeWritten;
+							return null;
+						},
+						map: () => [completionsSpec({ id: "dev-model", provider: providerId })],
+					},
+					fetchDynamicModels: async () => {
+						await completeWritten;
+						return null;
+					},
+				},
+				"online",
+			);
+			await complete;
+			markCompleteWritten();
+			await partial;
+			vi.restoreAllMocks();
+			const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
+			expect({
+				count: stored?.models.length,
+				authoritative: stored?.authoritative,
+				stalePartials: getModelCacheWriteStats().staleWrites - staleBefore,
+			}).toEqual({ count: 300, authoritative: true, stalePartials: 1 });
 		} finally {
 			vi.restoreAllMocks();
 			await fs.rm(tempDir, { recursive: true, force: true });

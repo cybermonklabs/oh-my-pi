@@ -13,6 +13,7 @@ import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
 import {
 	readModelCache,
+	readModelCacheCompleteMark,
 	readModelCacheWithVersion,
 	takeModelCacheWriteTicket,
 	writeModelCacheInSlices,
@@ -287,6 +288,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			: undefined;
 	while (sliceExpired()) await nextSlice();
 	const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+	// A partial write below carries rows of this read: it must not land over a
+	// complete write that lands after it.
+	const completeMarkAtRead = readModelCacheCompleteMark(cacheProviderId, dbPath);
 	const dynamicModelsAuthoritative = options.dynamicModelsAuthoritative ?? false;
 	const isAuthoritativeDynamicCache = dynamicModelsAuthoritative && (cache?.payloadAuthoritative ?? false);
 	const restoredCache = await restoreCachedModelHeaders(
@@ -465,7 +469,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dbPath,
 				staticModels,
 				restorableHeaderFallback,
-				{ ticket: writeTicket, partial: !remoteResolutionComplete },
+				{ ticket: writeTicket, partial: !remoteResolutionComplete, completeMarkAtRead },
 			);
 		} else {
 			// Remote fetch failed. Re-persist any prior catalog as a

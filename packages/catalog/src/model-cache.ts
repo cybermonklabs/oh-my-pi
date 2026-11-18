@@ -157,6 +157,15 @@ export function takeModelCacheWriteTicket(providerId: string, dbPath?: string): 
 	return tickets.issued;
 }
 
+/**
+ * The row's complete mark, which changes exactly when a complete sliced write
+ * lands. A resolution reads it with the cache read whose rows a partial write
+ * may carry, and passes it as {@link CacheWriteOrdering.completeMarkAtRead}.
+ */
+export function readModelCacheCompleteMark(providerId: string, dbPath?: string): number {
+	return writeTickets.get(readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId))?.written ?? 0;
+}
+
 type StoredRowState = Pick<
 	CacheRow,
 	"updated_at" | "authoritative" | "refresh_payload_updated_at" | "refresh_updated_at" | "refresh_authoritative"
@@ -835,6 +844,13 @@ export interface CacheWriteOrdering {
 	 */
 	partial?: boolean;
 	/**
+	 * With `partial`: the complete mark ({@link readModelCacheCompleteMark}) when
+	 * the caller read the cached rows it carries. The write is skipped once a
+	 * complete write has landed since, so cached rows never replace rows a
+	 * complete refresh wrote after they were read.
+	 */
+	completeMarkAtRead?: number;
+	/**
 	 * The rows are a copy of a row the caller read (a failed refresh's fallback);
 	 * implied by a `rowVersion`. A copy checks both marks and raises neither:
 	 * any write with fetched rows is newer than the cached rows it carries.
@@ -947,7 +963,7 @@ function* writeModelCacheSteps<TApi extends Api>(
 	// unchanged, so drop the read memo in the step that writes: a reader may
 	// have memoized the old row while this write was in slices.
 	invalidateReadRow(providerId, dbPath);
-	const { ticket, rowVersion: expectedRowVersion, partial = false } = ordering;
+	const { ticket, rowVersion: expectedRowVersion, partial = false, completeMarkAtRead } = ordering;
 	const copy = ordering.copy === true || expectedRowVersion !== undefined;
 	const carriesReadRows = partial || copy;
 	const ticketKey = readCacheKey(resolveCacheDb(dbPath).resolvedPath, providerId);
@@ -955,6 +971,9 @@ function* writeModelCacheSteps<TApi extends Api>(
 		const outcome = db
 			.transaction((): "stale" | "skipped" | "refreshed" | "written" => {
 				const marks = writeTickets.get(ticketKey);
+				if (partial && completeMarkAtRead !== undefined && (marks?.written ?? 0) !== completeMarkAtRead) {
+					return "stale";
+				}
 				if (ticket !== undefined && ticket < (marks?.written ?? 0)) return "stale";
 				if (ticket !== undefined && carriesReadRows && ticket < (marks?.partialWritten ?? 0)) return "stale";
 				if (expectedRowVersion !== undefined && cacheRowVersion(db, providerId) !== expectedRowVersion) {
