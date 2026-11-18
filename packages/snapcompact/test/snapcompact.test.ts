@@ -2132,3 +2132,100 @@ describe("data URL elision", () => {
 		);
 	}, 2_000);
 });
+
+describe("redrawFrames", () => {
+	/** Draw every frame of `archive` again against its own stored bytes; a frame in `unmatched` matches nothing. */
+	function redrawAll(
+		archive: snapcompact.Archive,
+		unmatched: ReadonlySet<number> = new Set(),
+	): Promise<Map<number, string>> {
+		const stored = archive.frames.map(frame => frame.data);
+		return snapcompact.redrawFrames(
+			archive,
+			stored.map((_data, index) => index),
+			(index, data) => !unmatched.has(index) && data === stored[index],
+		);
+	}
+
+	async function archiveOf(messages: Message[], options: snapcompact.Options<Message>): Promise<snapcompact.Archive> {
+		const result = await snapcompact.compact(makePreparation({ messagesToSummarize: messages }), options);
+		const archive = snapcompact.getPreservedArchive(result.preserveData);
+		if (!archive) throw new Error("Expected a snapcompact archive");
+		return archive;
+	}
+
+	it("draws a foveated grid archive's frames again byte for byte, dimmed tool output included", async () => {
+		const archive = await archiveOf(
+			[
+				createUserMessage(`HEAD sentinel. ${"Important fact number one. ".repeat(800)}`),
+				createToolResultMessage("FAIL the suite. ".repeat(300)),
+				createUserMessage("TAIL sentinel."),
+			],
+			{ model: { api: "anthropic-messages" }, frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
+		);
+		expect(archive.truncatedChars).toBeGreaterThan(0);
+		expect(new Set(archive.frames.map(frame => frame.cols)).size).toBe(2);
+		expect([...(await redrawAll(archive)).keys()]).toEqual(archive.frames.map((_frame, index) => index));
+	});
+
+	// A two-column archive keeps its pages' words and drops older pages between the first and the
+	// newest. Lines here are one word each, except where a dropped run meets the next kept page: the
+	// first page's last line `xyz` and a kept page's first line `xyz` fit one line together, so the
+	// middle wrapped as one text would put them on one line and shift every page after it.
+	it("draws a two-column archive's kept pages again after older pages were dropped", async () => {
+		const doc = snapcompact.resolveShape(undefined, "doc-8on16-bw");
+		let dropped = 0;
+		for (let pad = 0; pad < 6; pad++) {
+			const archive = await archiveOf(
+				[createUserMessage(`${"p".repeat(pad)} ${"abcdefgh xyz qrstuvwx ".repeat(60)}`)],
+				{
+					shape: doc,
+					frameSize: 160,
+					maxFrames: 3,
+				},
+			);
+			if (archive.truncatedChars > 0) dropped++;
+			expect(archive.frames.every(frame => frame.columns === 2)).toBe(true);
+			expect({ pad, redrawn: (await redrawAll(archive)).size }).toEqual({ pad, redrawn: archive.frames.length });
+		}
+		expect(dropped).toBe(6);
+	});
+
+	it("settles a frame edge snapcompact never picks with the first missing frame that matches", async () => {
+		const archive = await archiveOf([createUserMessage("An archived fact at an odd edge. ".repeat(120))], {
+			shape: snapcompact.resolveShape(undefined, "11on16-bw"),
+			frameSize: 321,
+			maxFrames: 4,
+		});
+		expect(archive.frames.length).toBeGreaterThan(2);
+		const redrawn = await redrawAll(archive, new Set([0]));
+		expect([...redrawn.keys()].sort()).toEqual(archive.frames.map((_frame, index) => index).slice(1));
+	});
+
+	it("draws an 8on16 archive at 64 px, where an 8x13 cell gives the same grid", async () => {
+		const archive = await archiveOf([createUserMessage("Small frames hold few chars. ".repeat(12))], {
+			shape: snapcompact.resolveShape(undefined, "8on16-bw"),
+			frameSize: 64,
+			maxFrames: 3,
+		});
+		expect(archive.frames.length).toBeGreaterThan(0);
+		expect(archive.frames.every(frame => frame.cols === 8 && frame.rows === 4)).toBe(true);
+		expect((await redrawAll(archive)).size).toBe(archive.frames.length);
+	});
+
+	it("draws no frame its text no longer gives, and none without text", async () => {
+		const archive = await archiveOf([createUserMessage(`HEAD. ${"Important fact number one. ".repeat(400)}TAIL.`)], {
+			frameSize: TEST_FRAME_SIZE,
+			maxFrames: 5,
+		});
+		const head = archive.textHead ?? "";
+		const text = archive.text ?? "";
+		// One character of the first frame's page changed, keeping every page's length.
+		const changed =
+			text.slice(0, head.length + 3) + (text[head.length + 3] === "x" ? "y" : "x") + text.slice(head.length + 4);
+		const redrawn = await redrawAll({ ...archive, text: changed });
+		expect([...redrawn.keys()].sort()).toEqual(archive.frames.map((_frame, index) => index).slice(1));
+		const { text: _text, ...withoutText } = archive;
+		expect((await redrawAll(withoutText)).size).toBe(0);
+	});
+});
