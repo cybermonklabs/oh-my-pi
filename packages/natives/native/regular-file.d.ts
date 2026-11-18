@@ -12,24 +12,34 @@ export type FileKind =
 	| "other";
 
 /**
- * A regular file's bytes, or what stood there instead: its kind, `missing`, or `unreadable` (a
- * regular file that could not be opened).
+ * A regular file's bytes, or what stood there instead: its kind, `missing`, `changed` (a
+ * regular file again, whose `open` met another kind: a link, a socket or nothing), or
+ * `unreadable` (a regular file that could not be opened, with the `open` error). `stat` is what
+ * named the answer: the descriptor's `fstat` for a file read, else the `lstat` that found the
+ * kind.
  */
 export type RegularFileRead =
-	| { kind: "file"; content: Buffer }
-	| { kind: Exclude<FileKind, "file"> | "missing" | "unreadable" };
+	| { kind: "file"; content: Buffer; stat: fs.Stats }
+	| { kind: Exclude<FileKind, "file">; stat: fs.Stats }
+	| { kind: "unreadable"; error: unknown }
+	| { kind: "changed" }
+	| { kind: "missing" };
 
 /**
  * Read `file` if it is a regular file (all of it, or at most its first `length` bytes), never
  * blocking on one that is not: `lstat`, then a non-blocking `open` that follows no link, then
- * `fstat`. Any `open` error is reported as what stands there now, never thrown.
+ * `fstat`. An `open` error is never thrown: it is reported as what stands there now, or as
+ * `unreadable` when that is still a regular file.
  */
 export function readRegularFile(file: string, options?: { length?: number }): RegularFileRead;
 
 /** The text of `file` if it is a regular file, else undefined. */
 export function readRegularFileText(file: string): string | undefined;
 
-/** Replace the file calls the reader makes (`undefined` restores them), for tests. */
+/**
+ * Replace the file calls the reader makes (`undefined` restores them), for tests. It reaches
+ * this module instance only (two under Bun's `--preserve-symlinks`; see the module).
+ */
 export function __setRegularFileIoForTests(
 	replacement:
 		| Partial<Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync">>

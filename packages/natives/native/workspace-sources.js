@@ -56,6 +56,11 @@ import { readRegularFile, readRegularFileText } from "./regular-file.js";
  *   checkout is the record's (when it has an untracked file). A start reads the
  *   sizes and times; it reads the bytes only when the fingerprint, or the
  *   checkout, is one it has not seen, and records the verdict for the next start.
+ *   The verdict is kept only under the fingerprint of the files the read itself
+ *   opened, and only when they still match it once all are read; a file that
+ *   changed during the read, even one put back as it was, keeps nothing.
+ * A regular file that cannot be opened (no permission, no descriptor left) has no
+ * bytes to judge: a start reads `unknown` and keeps nothing, and a build stops.
  * A file changed without a new size or modification time (a copy that keeps
  * both) is not seen, as git and cargo do not see it either. The record also
  * carries the build's settings (`build`: profile, features, flags) to explain an
@@ -411,36 +416,47 @@ function packageBuildScripts(repoRoot, files) {
 }
 
 /**
+ * One listed file's part of a fingerprint: its size and modification time, or `missing`.
+ * @param {string} rel
+ * @param {fs.Stats | undefined} stat
+ */
+function fingerprintLine(rel, stat) {
+	return stat ? `${rel}\0${stat.size}\0${stat.mtimeMs}\n` : `${rel}\0missing\n`;
+}
+
+/** @param {string} lines */
+function fingerprintDigest(lines) {
+	return new Bun.CryptoHasher("sha256").update(lines).digest("hex");
+}
+
+/**
+ * The fingerprint of the listed files as they stand now, by their `lstat`.
  * @param {string} repoRoot
  * @param {readonly string[]} files
  */
 function fingerprintOf(repoRoot, files) {
-	return new Bun.CryptoHasher("sha256")
-		.update(
-			files
-				.map(rel => {
-					const stat = lstatSource(repoRoot, rel);
-					return stat ? `${rel}\0${stat.size}\0${stat.mtimeMs}\n` : `${rel}\0missing\n`;
-				})
-				.join(""),
-		)
-		.digest("hex");
+	return fingerprintDigest(files.map(rel => fingerprintLine(rel, lstatSource(repoRoot, rel))).join(""));
 }
 
 /**
  * SHA-256 of one source as the record identifies it: its bytes, a link's target, a file of
- * another kind (a FIFO, a socket, a device, a directory) by its kind alone, or `missing`. It
- * never blocks and never throws on what it finds: the file is read through
- * `readRegularFile`, which opens only a regular file, without following a link or waiting, and
- * names anything else, also a file swapped for another kind between its `lstat` and its `open`,
- * by what stands there.
+ * another kind (a FIFO, a socket, a device, a directory) by its kind alone, or `missing`, with
+ * the stat of what was read. It never blocks: the file is read through `readRegularFile`, which
+ * opens only a regular file, without following a link or waiting, and names anything else,
+ * also a file swapped for another kind between its `lstat` and its `open`, by what stands
+ * there. A file that is a regular file again by then is `special\0changed`, with no stat, so no
+ * state is kept for it. A regular file that cannot be opened (no permission, no descriptor
+ * left) throws that `open` error: it has no bytes to name, and naming it changed would keep a
+ * verdict of other sources past the moment it is readable again.
  * @param {string} repoRoot
  * @param {string} rel
+ * @returns {{ hash: string; stat: fs.Stats | undefined }}
  */
 function hashSource(repoRoot, rel) {
 	const file = path.join(repoRoot, rel);
 	const read = readRegularFile(file);
-	if (read.kind === "missing") return "missing";
+	if (read.kind === "missing") return { hash: "missing", stat: undefined };
+	if (read.kind === "unreadable") throw read.error;
 	const hasher = new Bun.CryptoHasher("sha256");
 	if (read.kind === "file") {
 		hasher.update(read.content);
@@ -455,7 +471,7 @@ function hashSource(repoRoot, rel) {
 	} else {
 		hasher.update(`special\0${read.kind}`);
 	}
-	return hasher.digest("hex");
+	return { hash: hasher.digest("hex"), stat: read.kind === "changed" ? undefined : read.stat };
 }
 
 /**
@@ -467,12 +483,26 @@ function digestOf(files, hashes) {
 }
 
 /**
+ * Hash every listed file, and take the fingerprint of the state those bytes came from: each
+ * file's size and time as its own read found them (the descriptor it read, or the `lstat` that
+ * named another kind). The fingerprint is null when the files no longer match it once all are
+ * read: a file swapped or edited during the read, even one put back as it was, leaves no state
+ * a later start could take these hashes for. Throws when a regular file cannot be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} files
- * @returns {Record<string, string>}
+ * @returns {{ hashes: Record<string, string>; fingerprint: string | null }}
  */
 function hashSources(repoRoot, files) {
-	return Object.fromEntries(files.map(rel => [rel, hashSource(repoRoot, rel)]));
+	/** @type {Record<string, string>} */
+	const hashes = {};
+	let lines = "";
+	for (const rel of files) {
+		const { hash, stat } = hashSource(repoRoot, rel);
+		hashes[rel] = hash;
+		lines += fingerprintLine(rel, stat);
+	}
+	const fingerprint = fingerprintDigest(lines);
+	return { hashes, fingerprint: fingerprint === fingerprintOf(repoRoot, files) ? fingerprint : null };
 }
 
 /**
@@ -566,7 +596,9 @@ export function checkoutId(repoRoot, create) {
  * The checkout's sources under `roots` now, as a native build records them, read
  * before the build begins. Lists the files once (one `git ls-files`), adds the
  * files of the directories build scripts scan that their globs match, gitignored
- * or not, as sources the build had, and reads every one.
+ * or not, as sources the build had, and reads every one. Its fingerprint is that
+ * of the files it read, or null when one changed while it read them. Throws when a
+ * listed regular file cannot be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} roots
  */
@@ -580,14 +612,14 @@ export function readRustSources(repoRoot, roots) {
 	const files = [...new Set([...listed.files, ...scannedFiles])].sort();
 	// A scanned directory's matched files are compiled whether git tracks them or not.
 	const untracked = listed.untracked.filter(rel => !scannedFiles.has(rel));
-	const hashes = hashSources(repoRoot, files);
+	const { hashes, fingerprint } = hashSources(repoRoot, files);
 	return {
 		roots: [...roots],
 		checkout: checkoutId(repoRoot, true),
 		files,
 		untracked,
 		hashes,
-		fingerprint: fingerprintOf(repoRoot, files),
+		fingerprint,
 		...identities(files, untracked, hashes),
 		scanned: scans.map(({ dir, globs, times }) => ({ dir, globs, dirs: times })),
 		packages: packageBuildScripts(repoRoot, files),
@@ -605,13 +637,13 @@ export function readRustSources(repoRoot, roots) {
  * @returns {ReturnType<typeof readRustSources>}
  */
 export function settleRustSources(repoRoot, before) {
-	const hashes = hashSources(repoRoot, before.files);
+	const { hashes, fingerprint } = hashSources(repoRoot, before.files);
 	const changed = before.files.filter(rel => hashes[rel] !== before.hashes[rel]);
 	if (changed.length === 0 || !changed.every(rel => REWRITTEN_BY_BUILD.has(rel))) return before;
 	return {
 		...before,
 		hashes,
-		fingerprint: fingerprintOf(repoRoot, before.files),
+		fingerprint,
 		...identities(before.files, before.untracked, hashes),
 	};
 }
@@ -676,7 +708,8 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 		sources: sources.digest,
 		scanned: sources.scanned,
 		packages: sources.packages,
-		// The checkout that built the addon is the one judging it now.
+		// The checkout that built the addon is the one judging it now. A fingerprint of null
+		// (a file changed while the build read it) matches no state: the first start reads the bytes.
 		seen: {
 			fingerprint: sources.fingerprint,
 			sameCheckout: sameCheckoutKey(sources.untracked.length > 0, sources.checkout, sources.checkout),
@@ -737,7 +770,7 @@ function isWellFormedStamp(stamp) {
 		globs.every(glob => isPatterns(glob?.include) && glob.include.length > 0 && isPatterns(glob.exclude));
 	return (
 		typeof stamp?.sources === "string" &&
-		typeof stamp.seen?.fingerprint === "string" &&
+		(typeof stamp.seen?.fingerprint === "string" || stamp.seen?.fingerprint === null) &&
 		(stamp.seen.verdict === "current" || stamp.seen.verdict === "other") &&
 		(stamp.seen.sameCheckout === null || typeof stamp.seen.sameCheckout === "boolean") &&
 		(stamp.checkout === null || (typeof stamp.checkout === "string" && /^[0-9a-f-]{36}$/.test(stamp.checkout))) &&
@@ -759,12 +792,14 @@ function isWellFormedStamp(stamp) {
  * Whether the addon at `addonPath` was built from the sources now in the
  * checkout at `repoRoot`: `"current"`, `"other"`, or `"unknown"` when no build
  * record describes this addon file (an addon built before records existed, one
- * copied in from elsewhere, or an unreadable record). Reads the record, the
- * addon's size and time, each package's `build.rs`, each scanned directory's time,
- * and every listed file's size and time. It lists a scanned directory again only
- * when its time changed, and reads the listed files' bytes only for a state it
- * has not seen; then it records what it learned (best-effort), so the next start
- * does neither.
+ * copied in from elsewhere, or an unreadable record), or when a listed regular
+ * file cannot be opened. Reads the record, the addon's size and time, each
+ * package's `build.rs`, each scanned directory's time, and every listed file's
+ * size and time. It lists a scanned directory again only when its time changed,
+ * and reads the listed files' bytes only for a state it has not seen; then it
+ * records what it learned (best-effort), so the next start does neither. A verdict
+ * is recorded only for the state of the files the read opened, and only when the
+ * files still match it once all are read.
  * @param {string} addonPath
  * @param {string} repoRoot
  * @returns {"current" | "other" | "unknown"}
@@ -815,21 +850,27 @@ export function addonSourcesState(addonPath, repoRoot) {
 			stamp.checkout,
 			untracked.length > 0 ? checkoutId(repoRoot, false) : null,
 		);
-		let verdict = stamp.seen.verdict;
+		let { verdict } = stamp.seen;
+		let seen = stamp.seen;
 		if (fingerprint !== stamp.seen.fingerprint || sameCheckout !== stamp.seen.sameCheckout) {
-			const hashes = hashSources(repoRoot, stamp.files);
-			const now = identities(stamp.files, untracked, hashes);
+			const read = hashSources(repoRoot, stamp.files);
+			const now = identities(stamp.files, untracked, read.hashes);
 			// A file untracked at build time may be missing only in another checkout of the
 			// commit (robomp's cache, the image seed); where it was built, missing is a change.
 			const sameUntracked = untracked.every(
-				rel => (hashes[rel] === "missing" && !sameCheckout) || hashes[rel] === stamp.untracked[rel],
+				rel => (read.hashes[rel] === "missing" && !sameCheckout) || read.hashes[rel] === stamp.untracked[rel],
 			);
 			verdict = now.digest === stamp.sources && sameUntracked ? "current" : "other";
-			learned = true;
+			// Kept for the state the bytes came from. A file that changed while they were read,
+			// even one put back as it was, keeps nothing: the next start reads them again.
+			if (read.fingerprint !== null) {
+				seen = { fingerprint: read.fingerprint, sameCheckout, verdict };
+				learned = true;
+			}
 		}
 		if (learned) {
 			try {
-				writeStamp(addonPath, { ...stamp, scanned, seen: { fingerprint, sameCheckout, verdict } });
+				writeStamp(addonPath, { ...stamp, scanned, seen });
 			} catch {
 				// A checkout that cannot be written checks again next start.
 			}

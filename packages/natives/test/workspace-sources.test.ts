@@ -56,16 +56,17 @@ const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSY
 
 /**
  * Run `body` (JS source) in a process of its own, bounded, with `readRustSources`,
- * `writeAddonSourcesStamp`, `addonSourcesState` and `checkoutId` in scope: a read that blocked
- * would hang this test runner otherwise. `swapAtOpen(target, replacement)` renames
- * `replacement` over `target` the first time the shared reader opens `target`, between its
- * `lstat` and its `open`; `listenSocket(path)` binds a Unix socket there. Returns what the body
- * printed, or null when the bound killed it.
+ * `settleRustSources`, `writeAddonSourcesStamp`, `addonSourcesState`, `copyAddonSourcesStamp`,
+ * `checkoutId` and the shared reader's seam (`__setRegularFileIoForTests`) in scope: a read that
+ * blocked would hang this test runner otherwise, and a seam set there cannot reach another test.
+ * `swapAtOpen(target, replacement)` renames `replacement` over `target` the first time the
+ * shared reader opens `target`, between its `lstat` and its `open`; `listenSocket(path)` binds a
+ * Unix socket there. Returns what the body printed, or null when the bound killed it.
  */
 function bounded(body: string): unknown {
 	const sourcesJs = path.join(import.meta.dir, "../native/workspace-sources.js");
 	const regularFileJs = path.join(import.meta.dir, "../native/regular-file.js");
-	const script = `const { readRustSources, writeAddonSourcesStamp, addonSourcesState, checkoutId, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
+	const script = `const { readRustSources, settleRustSources, writeAddonSourcesStamp, addonSourcesState, copyAddonSourcesStamp, checkoutId, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
 const { __setRegularFileIoForTests } = await import(${JSON.stringify(regularFileJs)});
 const nodeFs = await import("node:fs");
 const repo = ${JSON.stringify(repo)};
@@ -105,6 +106,20 @@ function mkfifo(file: string): void {
 	expect(Bun.spawnSync(["mkfifo", file]).exitCode).toBe(0);
 }
 
+/**
+ * JS source for {@link bounded}: the shared reader's `open` of `file` fails with `EACCES`, as a
+ * file this user cannot read, or an `open` with no descriptor left, fails; the file itself stays
+ * a regular file with its bytes.
+ */
+function denyOpen(file: string): string {
+	return `__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (file === ${JSON.stringify(file)}) throw Object.assign(new Error(\`EACCES: permission denied, open '\${file}'\`), { code: "EACCES" });
+		return nodeFs.openSync(file, flags, mode);
+	},
+});`;
+}
+
 describe("the Rust sources a workspace addon was built from", () => {
 	it("are current until a source file's content changes", async () => {
 		await build();
@@ -131,6 +146,176 @@ describe("the Rust sources a workspace addon was built from", () => {
 		mkfifo(record);
 
 		expect(bounded("console.log(JSON.stringify(addonSourcesState(addon, repo)));")).toBe("unknown");
+	}, 60_000);
+
+	it("are unknown, and keep no verdict, while a recorded file cannot be opened, and current once it can", async () => {
+		await build();
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		// A new time on the same bytes: the start reads the sources again, and so opens this one.
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(target, later, later);
+
+		// No permission, or no descriptor left, at this one start; the bytes never changed.
+		expect(
+			bounded(`${denyOpen(target)}
+console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
+		).toBe("unknown");
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	}, 60_000);
+
+	it("stop a build that cannot open a listed file, with the error", () => {
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+
+		expect(
+			bounded(`${denyOpen(target)}
+try {
+	readRustSources(repo, CARGO_SOURCE_ROOTS);
+	console.log(JSON.stringify("recorded"));
+} catch (error) {
+	console.log(JSON.stringify(error.code));
+}`),
+		).toBe("EACCES");
+	}, 60_000);
+
+	it("keep no verdict for a source edited while a start read it, so it is current once put back", async () => {
+		await build();
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(target, later, later);
+		const edited = path.join(repo, "crates/pi-natives/src/edited");
+		const aside = path.join(repo, "crates/pi-natives/src/aside");
+		await Bun.write(edited, "pub fn edited_while_read() {}\n");
+
+		// The start reads the edited bytes; then the original is put back as it was (the same
+		// file, size and time), as a `mv` back does.
+		expect(
+			bounded(`let done = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (!done && file === ${JSON.stringify(target)}) {
+			done = true;
+			nodeFs.renameSync(file, ${JSON.stringify(aside)});
+			nodeFs.renameSync(${JSON.stringify(edited)}, file);
+		}
+		return nodeFs.openSync(file, flags, mode);
+	},
+});
+console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
+		).toBe("other");
+		await fs.rename(aside, target);
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	}, 60_000);
+
+	it("keep no verdict for a source that was a FIFO only while a start read it", async () => {
+		await build();
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(target, later, later);
+		const fifo = path.join(repo, "crates/pi-natives/src/fifo");
+		const aside = path.join(repo, "crates/pi-natives/src/aside");
+		mkfifo(fifo);
+
+		// Between the start's lstat and its open the source is a FIFO, and it is back (the same
+		// file, size and time) before the start takes the files' sizes and times again.
+		expect(
+			bounded(`let done = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (done || file !== ${JSON.stringify(target)}) return nodeFs.openSync(file, flags, mode);
+		done = true;
+		nodeFs.renameSync(file, ${JSON.stringify(aside)});
+		nodeFs.renameSync(${JSON.stringify(fifo)}, file);
+		try {
+			return nodeFs.openSync(file, flags, mode);
+		} finally {
+			nodeFs.renameSync(file, ${JSON.stringify(fifo)});
+			nodeFs.renameSync(${JSON.stringify(aside)}, file);
+		}
+	},
+});
+console.log(JSON.stringify({ state: addonSourcesState(addon, repo), back: nodeFs.lstatSync(${JSON.stringify(target)}).isFile() }));`),
+		).toEqual({ state: "other", back: true });
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	}, 60_000);
+
+	it.each([["a link"], ["a socket"]])(
+		"read other, keep no verdict, and never throw, for a source that was %s only for the start's open",
+		async label => {
+			await build();
+			const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+			const later = new Date(Date.now() + 60_000);
+			await fs.utimes(target, later, later);
+			const staged = path.join(repo, "crates/pi-natives/src/staged");
+			const aside = path.join(repo, "crates/pi-natives/src/aside");
+			let prepare = "";
+			if (label === "a link") await fs.symlink("lib.rs.orig", staged);
+			else prepare = `const server = await listenSocket(${JSON.stringify(staged)});`;
+
+			// The open meets the link or the socket, and the file is back before the reader looks
+			// again: no kind to name, and no reason to call the file unreadable either.
+			const result = bounded(`${prepare}
+let done = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (done || file !== ${JSON.stringify(target)}) return nodeFs.openSync(file, flags, mode);
+		done = true;
+		nodeFs.renameSync(file, ${JSON.stringify(aside)});
+		nodeFs.renameSync(${JSON.stringify(staged)}, file);
+		try {
+			return nodeFs.openSync(file, flags, mode);
+		} finally {
+			nodeFs.renameSync(file, ${JSON.stringify(staged)});
+			nodeFs.renameSync(${JSON.stringify(aside)}, file);
+		}
+	},
+});
+const state = addonSourcesState(addon, repo);
+done = false;
+let built;
+try {
+	built = { fingerprint: readRustSources(repo, CARGO_SOURCE_ROOTS).fingerprint };
+} catch (error) {
+	built = { threw: error.code };
+}
+console.log(JSON.stringify({ state, built }));`);
+
+			expect(result).toEqual({ state: "other", built: { fingerprint: null } });
+			expect(addonSourcesState(addon, repo)).toBe("current");
+		},
+		60_000,
+	);
+
+	it("keep no verdict for a source rewritten in place while a start read it, also once its bytes and time are back", async () => {
+		await build();
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(target, later, later);
+
+		// The same file is rewritten after the start opened it and before it read the bytes.
+		expect(
+			bounded(`let fd;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		const opened = nodeFs.openSync(file, flags, mode);
+		if (file === ${JSON.stringify(target)}) fd = opened;
+		return opened;
+	},
+	readFileSync(reading, options) {
+		if (reading === fd) {
+			fd = undefined;
+			nodeFs.writeFileSync(${JSON.stringify(target)}, "pub fn rewritten_in_place() {}\\n");
+		}
+		return nodeFs.readFileSync(reading, options);
+	},
+});
+console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
+		).toBe("other");
+		await Bun.write(target, "pub fn grep() {}\n");
+		await fs.utimes(target, later, later);
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
 	}, 60_000);
 
 	it("change nothing when a file is added after the build, and see a new module through its parent", async () => {
@@ -162,10 +347,22 @@ describe("the Rust sources a workspace addon was built from", () => {
 
 		expect(addonSourcesState(addon, repo)).toBe("current");
 		// The content check ran once for this state of the tree; its answer is kept, so the
-		// next start reads only file sizes and times.
+		// next start reads only file sizes and times, and opens no source.
 		const stamp = await Bun.file(`${addon}.sources.json`).json();
+		expect(stamp.seen.fingerprint).toEqual(expect.any(String));
 		expect(stamp.seen.fingerprint).toBe(readRustSources(repo, CARGO_SOURCE_ROOTS).fingerprint);
-	});
+		expect(
+			bounded(`const opened = [];
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		opened.push(file);
+		return nodeFs.openSync(file, flags, mode);
+	},
+});
+const state = addonSourcesState(addon, repo);
+console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.endsWith(".sources.json")).length }));`),
+		).toEqual({ state: "current", sourcesOpened: 0 });
+	}, 60_000);
 
 	it("ignore build output and dot files in the source tree", async () => {
 		await build();
@@ -232,6 +429,26 @@ describe("the Rust sources a workspace addon was built from", () => {
 		await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn grep2() {}\n");
 		expect(addonSourcesState(copy, repo)).toBe("other");
 	});
+
+	it("refuse, at once, to copy a record that is a FIFO", async () => {
+		await build();
+		const record = `${addon}.sources.json`;
+		await fs.rm(record);
+		mkfifo(record);
+		const copy = path.join(repo, "dest/pi_natives.linux-x64-modern.node");
+		await fs.mkdir(path.dirname(copy), { recursive: true });
+		await fs.copyFile(addon, copy);
+
+		expect(
+			bounded(`try {
+	copyAddonSourcesStamp(addon, ${JSON.stringify(copy)});
+	console.log(JSON.stringify("copied"));
+} catch (error) {
+	console.log(JSON.stringify(error.message));
+}`),
+		).toBe(`${record} is not a regular file`);
+		expect(await Bun.file(`${copy}.sources.json`).exists()).toBe(false);
+	}, 60_000);
 
 	it("of a git checkout are the files git tracks or would track, never ignored ones", async () => {
 		await Bun.write(path.join(repo, ".gitignore"), "crates/pi-natives/tools/cache/\n");
@@ -308,6 +525,37 @@ describe("the Rust sources a workspace addon was built from", () => {
 
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
+
+	it("keep no verdict for a state the build's read did not see: a source edited just after the settle read it", async () => {
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		const edited = path.join(repo, "crates/pi-natives/src/edited");
+		await Bun.write(edited, "pub fn edited_after_the_build() {}\n");
+
+		// The settle reads lib.rs as the build compiled it, and the edit lands before it takes
+		// the files' sizes and times.
+		expect(
+			bounded(`const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+nodeFs.writeFileSync(${JSON.stringify(path.join(repo, "Cargo.lock"))}, "version = 4\\n# rewritten by cargo\\n");
+let fd;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		const opened = nodeFs.openSync(file, flags, mode);
+		if (file === ${JSON.stringify(target)}) fd = opened;
+		return opened;
+	},
+	closeSync(closing) {
+		nodeFs.closeSync(closing);
+		if (closing !== fd) return;
+		fd = undefined;
+		nodeFs.renameSync(${JSON.stringify(edited)}, ${JSON.stringify(target)});
+	},
+});
+writeAddonSourcesStamp(addon, settleRustSources(repo, before), {});
+console.log(JSON.stringify("recorded"));`),
+		).toBe("recorded");
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	}, 60_000);
 
 	it("name the addon by a whole-second time, so a copy that keeps only seconds still matches", async () => {
 		await fs.utimes(addon, new Date(1_700_000_000_123), new Date(1_700_000_000_456));
@@ -837,7 +1085,7 @@ describe("the checkout a record names", () => {
 	}
 
 	afterEach(async () => {
-		for (const suffix of ["-moved", "-origin", "-saved", "-gitdir", "-super", "-link"])
+		for (const suffix of ["-moved", "-origin", "-saved", "-gitdir", "-gitfile", "-super", "-link"])
 			await fs.rm(`${repo}${suffix}`, { recursive: true, force: true });
 	});
 
@@ -922,6 +1170,19 @@ describe("the checkout a record names", () => {
 
 		expect(id).toMatch(/^[0-9a-f-]{36}$/);
 		expect(checkoutId(link, false)).toBe(id);
+	});
+
+	it("is the checkout's own through a .git that is a link to a .git file", async () => {
+		commitBase();
+		// A worktree's `.git` file reached through a link: git follows the link, then the file.
+		await fs.rename(path.join(repo, ".git"), `${repo}-gitdir`);
+		await Bun.write(`${repo}-gitfile`, `gitdir: ${repo}-gitdir\n`);
+		await fs.symlink(`${repo}-gitfile`, path.join(repo, ".git"));
+		const id = checkoutId(repo, true);
+
+		expect(id).toMatch(/^[0-9a-f-]{36}$/);
+		expect(id).toBe((await Bun.file(`${repo}-gitdir/omp-checkout-id`).text()).trim());
+		expect(checkoutId(repo, false)).toBe(id);
 	});
 
 	it("is the same checkout after it moves, so its missing untracked file reads other", async () => {

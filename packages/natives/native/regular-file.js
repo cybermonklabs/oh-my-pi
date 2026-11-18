@@ -12,10 +12,16 @@ import * as fs from "node:fs";
  * - `lstat` must show a regular file; anything else is never opened, and is reported by its
  *   kind.
  * - The `open` neither follows a link nor waits (`O_RDONLY | O_NONBLOCK | O_NOFOLLOW`), so a
- *   file swapped for a link or a FIFO after the `lstat` cannot block it. Any error from that
- *   `open` (`ELOOP` for a link, `ENXIO` for a socket, `EACCES`, a file gone) is a change of
- *   kind, never thrown: the file is looked at again and reported by what stands there now.
+ *   file swapped for a link or a FIFO after the `lstat` cannot block it. An `open` that fails
+ *   is never thrown: the file is looked at again and reported by what stands there now. A file
+ *   swapped for a link (`ELOOP`), a socket (`ENXIO`) or nothing is that kind, or `missing`; one
+ *   that is a regular file again by then is `changed`. A regular file that `open` refused for
+ *   another reason (`EACCES`, no descriptor left) is `unreadable`, with the error.
  * - `fstat` on the descriptor must show a regular file before anything is read.
+ *
+ * Every result but `missing`, `changed` and `unreadable` carries the stat that named it (the
+ * descriptor's for a file it read), so a caller can tell which state of the file its answer
+ * describes.
  */
 
 /** @type {Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync">} */
@@ -23,7 +29,10 @@ let io = fs;
 
 /**
  * Replace the file calls this module makes (`undefined` restores them), so a test can change a
- * file between the `lstat` and the `open`.
+ * file between the `lstat` and the `open`. The replacement reaches this module instance only:
+ * under Bun's `--preserve-symlinks`, a relative import of this file and one by the package name
+ * (`@oh-my-pi/pi-natives/regular-file`, through the workspace link) load two instances, and a
+ * replacement set through one misses the other. No test or script runs Bun with that flag.
  * @param {Partial<typeof io> | undefined} replacement
  */
 export function __setRegularFileIoForTests(replacement) {
@@ -47,17 +56,30 @@ function kindOf(stat) {
 }
 
 /**
- * What stands at `file` when it cannot be read as a regular file: its kind now, `missing` when
- * it is gone, or `unreadable` for a regular file that cannot be opened (no permission).
- * @param {string} file
- * @returns {{ kind: Exclude<import("./regular-file").FileKind, "file"> | "unreadable" }}
+ * `open` errors that show the path held no regular file when it was opened: a link (`ELOOP`,
+ * under `O_NOFOLLOW`), a socket or a device with no driver (`ENXIO`), nothing (`ENOENT`,
+ * `ENOTDIR`). Any other refusal of a regular file (`EACCES`, `EMFILE`, `EIO`) is the file's own.
  */
-function kindNow(file) {
+const KIND_CHANGE_ERRORS = new Set(["ELOOP", "ENXIO", "ENOENT", "ENOTDIR"]);
+
+/**
+ * What stands at `file` when it cannot be read as a regular file: its kind now, with the `lstat`
+ * that found it, `missing` when it is gone, `changed` for a regular file again whose `open` met
+ * another kind, or `unreadable`, with the `open` error, for a regular file that cannot be opened
+ * (no permission, no descriptor left).
+ * @param {string} file
+ * @param {unknown} error the `open` error
+ * @returns {Exclude<import("./regular-file").RegularFileRead, { kind: "file" }>}
+ */
+function kindNow(file, error) {
 	try {
 		const stat = io.lstatSync(file, { throwIfNoEntry: false });
 		if (!stat) return { kind: "missing" };
 		const kind = kindOf(stat);
-		return { kind: kind === "file" ? "unreadable" : kind };
+		if (kind !== "file") return { kind, stat };
+		const code = /** @type {{ code?: unknown } | null} */ (error)?.code;
+		const changedKind = typeof code === "string" && KIND_CHANGE_ERRORS.has(code);
+		return changedKind ? { kind: "changed" } : { kind: "unreadable", error };
 	} catch {
 		return { kind: "missing" };
 	}
@@ -79,18 +101,19 @@ export function readRegularFile(file, options = {}) {
 	}
 	if (!stat) return { kind: "missing" };
 	const kind = kindOf(stat);
-	if (kind !== "file") return { kind };
+	if (kind !== "file") return { kind, stat };
 	const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
 	let fd;
 	try {
 		fd = io.openSync(file, O_RDONLY | (O_NONBLOCK ?? 0) | (O_NOFOLLOW ?? 0));
-	} catch {
-		return kindNow(file);
+	} catch (error) {
+		return kindNow(file, error);
 	}
 	try {
-		const now = kindOf(io.fstatSync(fd));
-		if (now !== "file") return { kind: now };
-		if (options.length === undefined) return { kind: "file", content: io.readFileSync(fd) };
+		const opened = io.fstatSync(fd);
+		const now = kindOf(opened);
+		if (now !== "file") return { kind: now, stat: opened };
+		if (options.length === undefined) return { kind: "file", content: io.readFileSync(fd), stat: opened };
 		const content = Buffer.alloc(options.length);
 		let read = 0;
 		while (read < content.length) {
@@ -98,7 +121,7 @@ export function readRegularFile(file, options = {}) {
 			if (n === 0) break;
 			read += n;
 		}
-		return { kind: "file", content: content.subarray(0, read) };
+		return { kind: "file", content: content.subarray(0, read), stat: opened };
 	} finally {
 		io.closeSync(fd);
 	}

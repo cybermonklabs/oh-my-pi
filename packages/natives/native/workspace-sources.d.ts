@@ -26,8 +26,11 @@ export interface RustSources {
 	untracked: string[];
 	/** Each listed file's content hash; never written to the record. */
 	hashes: Record<string, string>;
-	/** SHA-256 over each listed file's path, size and modification time, hex. */
-	fingerprint: string;
+	/**
+	 * SHA-256 over each listed file's path, size and modification time as the read of its bytes
+	 * found them, hex; null when a file no longer matched that once all were read.
+	 */
+	fingerprint: string | null;
 	/** SHA-256 over each tracked file's path and content (a link's target, for a link), hex. */
 	digest: string;
 	/** Each untracked file's content hash. */
@@ -52,7 +55,10 @@ export function uniqueTempPath(target: string): string;
  */
 export function checkoutId(repoRoot: string, create: boolean): string | null;
 
-/** The checkout's sources under `roots` now, read before a build begins; lists and reads every source file. */
+/**
+ * The checkout's sources under `roots` now, read before a build begins; lists and reads every
+ * source file. Throws when a listed regular file cannot be opened.
+ */
 export function readRustSources(repoRoot: string, roots: readonly string[]): RustSources;
 
 /**
@@ -76,6 +82,7 @@ export function copyAddonSourcesStamp(fromAddonPath: string, toAddonPath: string
 
 /**
  * Whether the addon at `addonPath` was built from the sources now in `repoRoot`;
- * `"unknown"` when no build record describes this addon file.
+ * `"unknown"` when no build record describes this addon file, or a listed regular file cannot
+ * be opened.
  */
 export function addonSourcesState(addonPath: string, repoRoot: string): "current" | "other" | "unknown";
