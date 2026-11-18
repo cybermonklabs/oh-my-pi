@@ -444,13 +444,20 @@ mod tests {
 
 	/// The same values given to the git binary: a refused value fails with
 	/// git's message, and a system file is read exactly when the value is false.
+	///
+	/// The message's wording is the binary's own (git 2.43 says "bad boolean
+	/// environment value", git 2.39 "bad boolean config value"), so it is read
+	/// from the git this test runs: its refusal of `PROBE`, a value both sides
+	/// refuse, gives the text around the value, and every other refused value
+	/// must give that text with itself in its place.
 	#[test]
 	fn git_env_bool_matches_the_git_binary() {
+		const PROBE: &str = "maybe";
 		let temp = tempfile::tempdir().unwrap();
 		let system = temp.path().join("system-gitconfig");
 		fs::write(&system, "[probe]\n\tsystem = read\n").unwrap();
-		for &(value, expected) in NOSYSTEM_CASES {
-			let output = Command::new("git")
+		let run = |value: &str| {
+			Command::new("git")
 				.args(["config", "--list"])
 				.current_dir(temp.path())
 				.env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -459,15 +466,32 @@ mod tests {
 				.env_remove("GIT_CONFIG_COUNT")
 				.env_remove("GIT_CONFIG_PARAMETERS")
 				.output()
-				.unwrap();
+				.unwrap()
+		};
+
+		assert!(NOSYSTEM_CASES.contains(&(PROBE, None)), "the probe is a value git_env_bool refuses");
+		let probe = run(PROBE);
+		assert!(!probe.status.success(), "git accepted GIT_CONFIG_NOSYSTEM={PROBE:?}");
+		let probe_stderr = String::from_utf8_lossy(&probe.stderr).into_owned();
+		let quoted_probe = format!("'{PROBE}'");
+		let (before, after) = probe_stderr
+			.split_once(&quoted_probe)
+			.unwrap_or_else(|| panic!("git's refusal does not name the value: {probe_stderr}"));
+		assert!(
+			after.contains("GIT_CONFIG_NOSYSTEM"),
+			"git's refusal does not name the variable: {probe_stderr}"
+		);
+
+		for &(value, expected) in NOSYSTEM_CASES {
+			let output = run(value);
 			let stdout = String::from_utf8_lossy(&output.stdout);
 			let git = if output.status.success() {
 				Some(!stdout.contains("probe.system=read"))
 			} else {
-				let stderr = String::from_utf8_lossy(&output.stderr);
-				assert!(
-					stderr.contains(&format!("bad boolean environment value '{value}'")),
-					"GIT_CONFIG_NOSYSTEM={value:?}: {stderr}"
+				assert_eq!(
+					String::from_utf8_lossy(&output.stderr),
+					format!("{before}'{value}'{after}"),
+					"GIT_CONFIG_NOSYSTEM={value:?}"
 				);
 				None
 			};
