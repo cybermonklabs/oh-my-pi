@@ -40,7 +40,7 @@ use crate::grep::{
 	MAX_LINE_BYTES, RecordFormat, SEARCH_HEAP_LIMIT, bound_terminator, check_run,
 	describe_search_error, exit_status, for_each_nonempty_match,
 };
-use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, forward_slash_display};
+use crate::host::{AsyncUtility, Host, StdoutFile, forward_slash_display};
 use crate::stdio;
 
 use ignore::{
@@ -1800,7 +1800,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	clippy::too_many_arguments,
 	reason = "gathers the shared state of one operand's searches"
 )]
-fn dir_search<M: Clone>(
+async fn dir_search<M: Clone>(
 	host: &Host,
 	cli: &Rg,
 	matcher: &M,
@@ -1817,7 +1817,7 @@ fn dir_search<M: Clone>(
 		fs: host.vfs(),
 		halt: halt.flag(),
 		direct,
-		stdout: host.stdout_file(),
+		stdout: host.stdout_file().await,
 		search_zip: cli.search_zip && !cli.no_search_zip,
 		opts: opts.clone(),
 		matcher: matcher.clone(),
@@ -1860,7 +1860,7 @@ async fn search_dir<M: Matcher<Captures: Send> + Clone + Send + Sync + 'static, 
 	let workers = if line_buffered { 1 } else { parallelism };
 	let halt = HaltOnDrop::new();
 	let shared =
-		dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false, walk_root);
+		dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false, walk_root).await;
 	let mut any_match = false;
 	let mut failed = None;
 	let mut pace = host.output_pace();
@@ -1970,7 +1970,7 @@ async fn list_files<W: Write>(
 	let no_messages = cli.no_messages && !cli.messages;
 	let filters = build_path_filters(host, cli).await;
 	let fs = host.vfs();
-	let stdout = host.stdout_file();
+	let stdout = host.stdout_file().await;
 	let mut any = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
@@ -2211,7 +2211,8 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 					&halt,
 					true,
 					None,
-				);
+				)
+				.await;
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
 				let path = resolved.clone();
@@ -2301,13 +2302,11 @@ impl AsyncUtility for Rg {
 		let _ = writeln!(host.stderr, "rg: --json cannot be combined with summary modes");
 		return 2;
 	}
-	let mut out = if cli.line_buffered && !cli.no_line_buffered {
-		StreamWriter::line(host.stdout_clone())
-	} else if cli.no_line_buffered {
-		StreamWriter::block(host.stdout_clone())
-	} else {
-		host.stdout_writer()
-	};
+	// Every mode writes through the async stdout sink. A raw writer over
+	// `host.stdout` blocks on a provider file (an engine pipe), which panics on
+	// a current-thread runtime. `--line-buffered` output is delivered after each
+	// file and each chunk of standard input, as grep's is.
+	let mut out = host.stdout_writer();
 	let (patterns, mut paths) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
 		Err(error) => {

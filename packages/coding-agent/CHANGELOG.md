@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Fixed
+
+- Fixed `omp --resume <id>` under `--mode rpc`, `--mode rpc-ui` and `--mode acp` failing at start when the session's directory no longer exists; the session now opens where it is stored, with the launch directory as its working directory, without asking whether to move it ([#19651](https://github.com/can1357/oh-my-pi/pull/19651) by [@sjawhar](https://github.com/sjawhar))
 - In RPC mode, a `prompt` or `abort_and_prompt` that is refused or fails because the agent is busy now carries `code: "session_busy"` on its error response and `error.code: "session_busy"` on its `prompt_result`, as `fork` and `navigate_tree` already do. The Python SDK client keeps that code on the `RpcCommandError` it raises for a late failure
 
 - Fixed subagent progress probes that could not read the agent's prompt cache: a probe now goes out only when at least 95% of its own prompt is in the agent's cache, the request's tools and thinking level are unchanged since the agent's last request, and the cache entry has more than 30 seconds left of its lifetime (the shorter of the one the model declares and the one the provider named for the entry); with no known lifetime, no probe goes out, and the progress line keeps its last estimate meanwhile

@@ -1715,7 +1715,7 @@ impl Input {
 	/// than from the path it was opened by.
 	async fn metadata(&self) -> Option<pi_vfs::Metadata> {
 		match self {
-			Self::Listed(file) => file.metadata().ok(),
+			Self::Listed(file) => file.metadata_async().await.ok(),
 			Self::Source(source) => source.handle_metadata().await,
 		}
 	}
@@ -2037,7 +2037,7 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 		matcher:  matcher.clone(),
 		searcher: searcher.clone(),
 		opts:     opts.clone(),
-		stdout:   host.stdout_file(),
+		stdout:   host.stdout_file().await,
 	});
 	let mut any = false;
 	let mut failed = None;
@@ -2386,7 +2386,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 			// `--label` names standard input everywhere else, so it names it
 			// in the refusal diagnostic too.
 			let input_name = cli.label.as_deref().unwrap_or_else(|| OsStr::new("(standard input)"));
-			if opts.refuse_output_file && host.stdin_is_stdout() {
+			if opts.refuse_output_file && host.stdin_is_stdout().await {
 				// GNU grep refuses standard input that is the file its output
 				// lands in: the matches it writes would be read back and
 				// matched again, so the input is never read.
@@ -2476,7 +2476,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 					matcher:  matcher.clone(),
 					searcher: builder.clone(),
 					opts:     opts.clone(),
-					stdout:   host.stdout_file(),
+					stdout:   host.stdout_file().await,
 				};
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
@@ -2696,6 +2696,86 @@ mod tests {
 	use crate::host::{Host, run_async_util, run_caught_async};
 	#[cfg(unix)]
 	use crate::host::{SwapTree, tree_with_sparse_file};
+
+	const ONE_FILE: &[u8] = b"needle\n";
+
+	/// One read-only provider file, `mem://d/f`; nothing else exists.
+	#[derive(Debug)]
+	struct OneFile;
+
+	fn one_file_meta() -> pi_vfs::Metadata {
+		pi_vfs::Metadata::new(
+			pi_vfs::FileType::from_kind(pi_vfs::FileKind::File),
+			ONE_FILE.len() as u64,
+			pi_vfs::Permissions::from_mode(0o644),
+		)
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for OneFile {
+		fn is_native_local(&self, path: &Path) -> bool {
+			!pi_vfs::is_virtual_path(path)
+		}
+
+		async fn open(&self, path: &Path, _options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(pi_vfs::File::from_handle(OneFileHandle))
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(one_file_meta())
+		}
+
+		async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			Err(io::ErrorKind::NotFound.into())
+		}
+	}
+
+	#[derive(Debug)]
+	struct OneFileHandle;
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileHandle for OneFileHandle {
+		async fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+			Ok(0)
+		}
+
+		async fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+			Err(io::ErrorKind::PermissionDenied.into())
+		}
+
+		async fn seek(&self, _pos: io::SeekFrom) -> io::Result<u64> {
+			Ok(0)
+		}
+
+		async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+			Ok(one_file_meta())
+		}
+	}
+
+	/// grep asks a walked file's identity (is it the file stdout lands in?)
+	/// from its async body. For a file a walk opened on a provider tree the
+	/// blocking query panicked on a current-thread runtime, so `grep -r` over
+	/// that tree into a regular file ended with `internal error`.
+	#[tokio::test(flavor = "current_thread")]
+	async fn a_listed_provider_file_reports_its_identity_on_a_current_thread_runtime() {
+		let vfs = pi_vfs::Fs::new(Arc::new(OneFile));
+		let mut session = pi_walker::Fs::new(&vfs, Path::new("mem://d")).session();
+		let (file, _) = session
+			.open_file(Path::new("mem://d/f"))
+			.await
+			.expect("open the provider file");
+		let opened = Input::Listed(file)
+			.metadata()
+			.await
+			.expect("the opened file's identity");
+		assert_eq!(opened.len(), ONE_FILE.len() as u64);
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn path_separator_rewrites_the_native_separator_on_windows() {

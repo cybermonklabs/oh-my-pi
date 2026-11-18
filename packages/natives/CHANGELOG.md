@@ -54,6 +54,7 @@
 - `sed`'s `l 0` folds no line, as GNU sed does, where it folded before every byte
 - `sed`'s `y` writes a target outside ASCII as the bytes of its UTF-8 encoding in a line that is not UTF-8, as `s` does (`y/a/é/;s/./X/g` on `a\377` prints `XXX`)
 - `grep` no longer selects the line after one that is not UTF-8 for an empty match past that line's end, as GNU grep does in the C locale (`printf 'a\351b\nz\n' | LC_ALL=C grep '\B'` selects nothing), and searches input with many such lines in time proportional to its size, where each search for the next match ran over the rest of the buffer
+- On a shell running on a single-threaded runtime (the Windows fallback when no worker thread can start), a pipe or `$(…)` on a builtin's input or output no longer ends `grep`, `rg` (also with `--line-buffered`) or `find -help`/`-version` with `internal error`, loses every utility's `--help`, `--version` and usage errors, or breaks `ps`/`pgrep`/`pkill`/`pidwait -t` given a descriptor or virtual path
 
 ### Added
 

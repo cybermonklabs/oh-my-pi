@@ -5389,9 +5389,11 @@ async fn run_find(
 	ret
 }
 
-fn print_help(host: &mut Host) {
+/// Writes through the async stdout sink: on an engine pipe `host.stdout` is a
+/// provider file, whose blocking write panics on a current-thread runtime.
+fn print_help(host: &Host) {
 	let _ = writeln!(
-		&mut host.stdout,
+		host.stdout_writer(),
 		r"Usage: find [path...] [expression]
 
 If no path is supplied then the current working directory is used by default.
@@ -5437,8 +5439,9 @@ Early alpha implementation. Currently the only expressions supported are
 	);
 }
 
-fn print_version(host: &mut Host) {
-	let _ = writeln!(host.stdout, "find (Rust) 0.8.0");
+/// See [`print_help`].
+fn print_version(host: &Host) {
+	let _ = writeln!(host.stdout_writer(), "find (Rust) 0.8.0");
 }
 
 /// pi-uutils: BSD `find -E` compatibility (macOS muscle memory).
