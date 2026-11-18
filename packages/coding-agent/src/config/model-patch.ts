@@ -6,7 +6,7 @@ import { PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models";
 import { openrouterDecisionsBaseUrl } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { apiServesKind, modelKind, type ModelKind, runnerApiKind } from "@oh-my-pi/pi-catalog/types";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, runToCompletion } from "@oh-my-pi/pi-utils";
 import { createConfigHeaderResolver } from "./resolve-config-value";
 import { SPECIAL_MODEL_MANAGER_PROVIDER_IDS } from "./model-provider-discovery";
 import type { ModelOverride } from "./models-config-schema";
@@ -187,12 +187,23 @@ export function mergeByModelKey<T extends { provider: string; id: string }>(
 	incoming: readonly T[],
 	combine: (existing: Model<Api> | undefined, entry: T) => Model<Api>,
 ): Model<Api>[] {
+	return runToCompletion(mergeByModelKeySteps(base, incoming, combine));
+}
+
+/** {@link mergeByModelKey} with one slice unit per base model indexed and per entry merged. */
+export function* mergeByModelKeySteps<T extends { provider: string; id: string }>(
+	base: readonly Model<Api>[],
+	incoming: readonly T[],
+	combine: (existing: Model<Api> | undefined, entry: T) => Model<Api>,
+): Generator<void, Model<Api>[], undefined> {
 	const merged = [...base];
 	const indexByKey = new Map<string, number>();
 	for (let i = 0; i < merged.length; i += 1) {
+		yield;
 		indexByKey.set(`${merged[i].provider}\u0000${merged[i].id}`, i);
 	}
 	for (const entry of incoming) {
+		yield;
 		const key = `${entry.provider}\u0000${entry.id}`;
 		const existingIndex = indexByKey.get(key);
 		if (existingIndex !== undefined) {

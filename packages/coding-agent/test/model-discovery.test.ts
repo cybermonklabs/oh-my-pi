@@ -3620,9 +3620,10 @@ describe("ModelRegistry runtime discovery", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 4 sliced steps per row; 2 with the cached rebuild in one step, 3 with only its
+		// Measured: 7 sliced steps per row (the cached rebuild's 2, and the reference composition's
+		// merges of the cached rows); 5 with the cached rebuild in one step, 6 with only its
 		// remoteCompaction rebuild in one step.
-		expect(readsPerRow).toBeCloseTo(4 * READS_PER_SLICED_STEP, 1);
+		expect(readsPerRow).toBeCloseTo(7 * READS_PER_SLICED_STEP, 1);
 	});
 
 	test("lm-studio discovery serves decision models as judges over /v1/decisions", async () => {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { PROVIDER_DESCRIPTORS } from "@oh-my-pi/pi-catalog/provider-models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -152,6 +153,179 @@ describe("ModelRegistry discovery slicing", () => {
 		churn.stop();
 		expect(registrations).toBeGreaterThan(3);
 		expect(registry.find("sliced-runtime-provider", "dynamic-model")).toBeDefined();
+	});
+
+	describe("a commit over a composed full snapshot", () => {
+		const row = (id: string) => ({
+			id,
+			name: id,
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		/** A registry whose models config exists, so a refresh keeps the composed snapshot. */
+		const snapshotRegistry = (dir: string): ModelRegistry => {
+			const modelsPath = tempDir.join(dir, "models.yml");
+			fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+			fs.writeFileSync(modelsPath, "providers: {}\n");
+			const registry = new ModelRegistry(authStorage, modelsPath, { fetch: offlineFetch });
+			registry.registerProvider(
+				"snapshot-provider",
+				{
+					baseUrl: "https://snapshot.example.com/v1",
+					apiKey: "SNAPSHOT_KEY",
+					api: "openai-completions",
+					fetchDynamicModels: async () => [row("snapshot-model")],
+				},
+				"ext://snapshot",
+			);
+			return registry;
+		};
+		const inSnapshot = (registry: ModelRegistry, provider: string, id: string): boolean =>
+			registry.getAll("all").some(model => model.provider === provider && model.id === id);
+		/**
+		 * Refreshes a new snapshot registry on a clock that moves 1 ms per read, and counts the reads.
+		 * `onTurn` runs on each pass through the event loop with the reads so far.
+		 */
+		const clockReads = async (
+			dir: string,
+			compose: boolean,
+			onTurn?: (registry: ModelRegistry, reads: number) => void,
+		) => {
+			const registry = snapshotRegistry(dir);
+			if (compose) registry.getAll();
+			let now = 1_000;
+			let reads = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => {
+				reads++;
+				return now++;
+			});
+			const loop = countTurns(onTurn && (() => onTurn(registry, reads)));
+			await registry.refresh("online");
+			loop.stop();
+			vi.restoreAllMocks();
+			return { registry, reads };
+		};
+
+		test("rebuilds it in slices, and the snapshot it commits is unchanged", async () => {
+			// Reference: the same refresh on a clock that never ends a slice.
+			mockFrozenClock();
+			const reference = snapshotRegistry("reference");
+			reference.getAll();
+			await reference.refresh("online");
+			const expected = catalogText(reference.getAll());
+			vi.restoreAllMocks();
+
+			// The rebuild checks the slice once per model in each of its per-model steps, so a refresh
+			// over a composed snapshot reads the clock more than once per snapshot model beyond the
+			// same refresh without one.
+			const lazy = await clockReads("lazy", false);
+			const composed = await clockReads("composed", true);
+			const snapshotSize = composed.registry.getAll("all").length;
+			expect(snapshotSize).toBeGreaterThan(1_000);
+			expect(inSnapshot(composed.registry, "snapshot-provider", "snapshot-model")).toBe(true);
+			expect(composed.reads - lazy.reads).toBeGreaterThan(snapshotSize);
+			expect(catalogText(composed.registry.getAll())).toEqual(expected);
+		});
+
+		test("whose inputs change during every rebuild still ends, and keeps every change", async () => {
+			// The rebuild's reads come after the reads a refresh without a snapshot takes in all; start
+			// the changes halfway through them, once the commit has run.
+			const lazy = await clockReads("lazy", false);
+			const composed = await clockReads("composed", true);
+			const churnFrom = lazy.reads + Math.floor((composed.reads - lazy.reads) / 2);
+			// From then on, each turn registers a provider with one model: a change to what the rebuild read.
+			let registrations = 0;
+			const { registry } = await clockReads("churn", true, (target, reads) => {
+				if (reads < churnFrom) return;
+				registrations++;
+				target.registerProvider(
+					`churn-${registrations}`,
+					{
+						baseUrl: "https://churn.example.com/v1",
+						apiKey: "CHURN_KEY",
+						api: "openai-completions",
+						models: [row(`churn-model-${registrations}`)],
+					},
+					"ext://churn",
+				);
+			});
+			expect(registrations).toBeGreaterThan(3);
+			expect(inSnapshot(registry, "snapshot-provider", "snapshot-model")).toBe(true);
+			const missing = Array.from({ length: registrations }, (_, index) => index + 1).filter(
+				index => !inSnapshot(registry, `churn-${index}`, `churn-model-${index}`),
+			);
+			expect(missing).toEqual([]);
+		});
+	});
+
+	describe("the work before a pass's first merge", () => {
+		/**
+		 * For each listed provider in the order their keys were first peeked, the clock reads so far.
+		 * Each slice check reads the clock once, so two providers whose lookups ran back to back in
+		 * one unit of work have the same count.
+		 */
+		const clockReadsAtFirstPeek = async (
+			providers: ReadonlySet<string>,
+			refresh: () => Promise<void>,
+		): Promise<number[]> => {
+			let now = 1_000;
+			let reads = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => {
+				reads++;
+				return now++;
+			});
+			const seen = new Set<string>();
+			const readsAtPeek: number[] = [];
+			const peek = authStorage.keys.peek.bind(authStorage.keys);
+			vi.spyOn(authStorage.keys, "peek").mockImplementation((provider, options) => {
+				if (providers.has(provider) && !seen.has(provider)) {
+					seen.add(provider);
+					readsAtPeek.push(reads);
+				}
+				return peek(provider, options);
+			});
+			await refresh();
+			vi.restoreAllMocks();
+			return readsAtPeek;
+		};
+		/** The fewest clock reads between two consecutive first peeks. */
+		const fewestReadsBetween = (readsAtPeek: number[]): number =>
+			Math.min(...readsAtPeek.slice(1).map((reads, index) => reads - readsAtPeek[index]));
+
+		test("checks the slice before each built-in provider's key lookup", async () => {
+			const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+			const descriptorIds = new Set(PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId));
+			const readsAtPeek = await clockReadsAtFirstPeek(descriptorIds, () => registry.refresh("offline"));
+			expect(readsAtPeek.length).toBeGreaterThan(20);
+			expect(fewestReadsBetween(readsAtPeek)).toBeGreaterThan(0);
+		});
+
+		test("checks the slice before each configured provider's cache read", async () => {
+			const providers = Object.fromEntries(
+				Array.from({ length: 20 }, (_, index) => [
+					`gateway-${index}`,
+					{
+						baseUrl: `https://gateway-${index}.example.com/v1`,
+						api: "openai-completions",
+						apiKey: "GATEWAY_KEY_UNSET",
+						discovery: { type: "openai-models-list" },
+					},
+				]),
+			);
+			const modelsPath = tempDir.join("configured", "models.json");
+			fs.mkdirSync(path.dirname(modelsPath), { recursive: true });
+			fs.writeFileSync(modelsPath, JSON.stringify({ providers }));
+			const registry = new ModelRegistry(authStorage, modelsPath, { fetch: offlineFetch });
+			// Online with no key: each provider reads its cache row, then peeks its key and stops.
+			const readsAtPeek = await clockReadsAtFirstPeek(new Set(Object.keys(providers)), () =>
+				registry.refreshDiscoverableProviders(Object.keys(providers), "online"),
+			);
+			expect(readsAtPeek.length).toBe(20);
+			expect(fewestReadsBetween(readsAtPeek)).toBeGreaterThan(0);
+		});
 	});
 
 	test("a pass whose fetches resolved first does not overwrite the rows of a pass that fetched later", async () => {

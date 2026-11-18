@@ -5,6 +5,7 @@
 ### Added
 
 - Added `writeModelCacheInSlices` and `fingerprintStaticModelsSteps`, which do the work of `writeModelCache` and `fingerprintStaticModels` in slices that return to the event loop, and `takeModelCacheRowTurn`, which orders one cache row's sliced read-merge-write passes in this process
+- Added `collapseVariantsSteps`, `collapseBuiltVariantsSteps` and `applyCatalogMetricsSteps`: the work of `collapseVariants`, `collapseBuiltVariants` and `applyCatalogMetrics` as steps, one per provider collapsed, logical model rebuilt or model scored
 
 ### Fixed
 

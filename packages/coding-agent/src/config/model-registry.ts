@@ -19,13 +19,13 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildDiscoveredModel, buildModel, nextBuildPriceChange } from "@oh-my-pi/pi-catalog/build";
-import { collapseBuiltVariants } from "@oh-my-pi/pi-catalog/compat/collapse";
+import { collapseBuiltVariants, collapseBuiltVariantsSteps } from "@oh-my-pi/pi-catalog/compat/collapse";
 import {
 	clampCodexContextWindow,
 	clampsContextOverride,
 	resolveMaxContextWindow,
 } from "@oh-my-pi/pi-catalog/compat/context-window";
-import { applyCatalogMetrics, CatalogMetricsIndex, catalogMetricsOf } from "@oh-my-pi/pi-catalog/identity/metrics";
+import { applyCatalogMetricsSteps, CatalogMetricsIndex, catalogMetricsOf } from "@oh-my-pi/pi-catalog/identity/metrics";
 import { getModelCacheWriteStats, readModelCache, retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
 import {
 	createModelManager,
@@ -104,7 +104,7 @@ import {
 	applyModelPatch,
 	dropProviderModels,
 	type ModelPatch,
-	mergeByModelKey,
+	mergeByModelKeySteps,
 	mergeCompat,
 	mergeDiscoveredModel,
 	mergeProviderRemoteCompactionConfig,
@@ -164,11 +164,18 @@ setCodexAttestationProvider(generateCodexAttestation);
 /** One built-in discovery pass rewriting more payload rows than this is debug-logged. */
 const MODEL_CACHE_REWRITE_LOG_THRESHOLD = 5;
 /**
- * Sliced discovery merges a pass runs before its last merge runs in one step.
- * Three: a reload during a merge is rare, and three in a row means the
- * configuration keeps changing, so waiting for a quiet moment may never end.
+ * Sliced discovery merges (and sliced rebuilds of the full snapshot after a commit) a pass runs
+ * before its last one runs in one step. Three: a reload during a merge is rare, and three in a
+ * row means the configuration keeps changing, so waiting for a quiet moment may never end.
  */
 const MAX_SLICED_DISCOVERY_MERGES = 3;
+
+/** What a discovery commit changes in the full snapshot, for its rebuild. */
+interface CommittedSnapshotChange {
+	replacedProviderSet: ReadonlySet<string>;
+	authoritativeProviders: ReadonlySet<string>;
+	discoveredModels: Model<Api>[];
+}
 /** `scheme://user:pass@` in free text (e.g. a fetch error echoing the request URL). */
 const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
 const BUILT_IN_MODEL_MANAGER_PROVIDER_IDS: Readonly<Record<string, true>> = Object.freeze(
@@ -499,7 +506,13 @@ export class ModelRegistry {
 
 	/** Final pass over every published model list: catalog metrics, then implicit local providers last. */
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		return this.#orderImplicitProvidersLast(applyCatalogMetrics(models, this.#catalogMetrics));
+		return runToCompletion(this.#finalizeModelSteps(models));
+	}
+
+	*#finalizeModelSteps(models: Model<Api>[]): Generator<void, Model<Api>[], undefined> {
+		const scored = yield* applyCatalogMetricsSteps(models, this.#catalogMetrics);
+		yield;
+		return this.#orderImplicitProvidersLast(scored);
 	}
 
 	/**
@@ -1521,19 +1534,25 @@ export class ModelRegistry {
 			builtInModels = dropProviderModels(builtInModels, this.#cachedAuthoritativeProviders, { kind: "chat" });
 		}
 		yield;
-		return this.#mergeResolvedModels(
-			this.#mergeResolvedModels(builtInModels, cachedStandardModels),
+		const withCachedStandard = yield* this.#mergeResolvedModelSteps(builtInModels, cachedStandardModels);
+		return yield* this.#mergeResolvedModelSteps(
+			withCachedStandard,
 			selectProviderModels(this.#cachedDiscoverableModels, providerFilter),
 		);
 	}
 
 	/** The `#baseModels` stage: cached base models plus runtime discoveries. */
 	#composeBaseModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
-		let resolvedDefaults = this.#composeCachedBaseModels(providerFilter);
+		return runToCompletion(this.#baseModelSteps(providerFilter));
+	}
+
+	*#baseModelSteps(providerFilter?: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
+		let resolvedDefaults = yield* this.#cachedBaseModelSteps(providerFilter);
 		if (this.#runtimeAuthoritativeProviders.size > 0) {
+			yield;
 			resolvedDefaults = dropProviderModels(resolvedDefaults, this.#runtimeAuthoritativeProviders, { kind: "chat" });
 		}
-		return this.#mergeResolvedModels(
+		return yield* this.#mergeResolvedModelSteps(
 			resolvedDefaults,
 			selectProviderModels(this.#runtimeDiscoveredModels, providerFilter),
 		);
@@ -1547,26 +1566,42 @@ export class ModelRegistry {
 	 */
 	*#discoveryReferenceModelSteps(providerFilter: ReadonlySet<string>): Generator<void, Model<Api>[], undefined> {
 		const cachedBaseModels = yield* this.#cachedBaseModelSteps(providerFilter);
-		yield;
-		return this.#mergeCustomModels(
-			this.#mergeCustomModels(cachedBaseModels, selectProviderModels(this.#customModelOverlays, providerFilter)),
+		const withConfigModels = yield* this.#mergeCustomModelSteps(
+			cachedBaseModels,
+			selectProviderModels(this.#customModelOverlays, providerFilter),
+		);
+		return yield* this.#mergeCustomModelSteps(
+			withConfigModels,
 			selectProviderModels(this.#runtimeModelOverlays, providerFilter),
 		);
 	}
 
 	/** Applies custom overlays and every override projection to a `#baseModels` stage. */
 	#projectBaseModels(baseModels: Model<Api>[], providerFilter?: ReadonlySet<string>): Model<Api>[] {
-		const withConfigModels = this.#mergeCustomModels(
+		return runToCompletion(this.#projectBaseModelSteps(baseModels, providerFilter));
+	}
+
+	*#projectBaseModelSteps(
+		baseModels: Model<Api>[],
+		providerFilter?: ReadonlySet<string>,
+	): Generator<void, Model<Api>[], undefined> {
+		const withConfigModels = yield* this.#mergeCustomModelSteps(
 			baseModels,
 			selectProviderModels(this.#customModelOverlays, providerFilter),
 		);
-		const combined = this.#mergeCustomModels(
+		const combined = yield* this.#mergeCustomModelSteps(
 			withConfigModels,
 			selectProviderModels(this.#runtimeModelOverlays, providerFilter),
 		);
-		const withModelOverrides = this.#applyModelOverrides(collapseBuiltVariants(combined), this.#modelOverrides);
+		const collapsed = yield* collapseBuiltVariantsSteps(combined);
+		yield;
+		const withModelOverrides = this.#applyModelOverrides(collapsed, this.#modelOverrides);
+		yield;
 		const withProviderBedrock = this.#applyProviderBedrockOverrides(withModelOverrides);
-		return this.#applyDiscoveryPolicies(this.#applyRuntimeProviderOverrides(withProviderBedrock));
+		yield;
+		const withRuntimeOverrides = this.#applyRuntimeProviderOverrides(withProviderBedrock);
+		yield;
+		return this.#applyDiscoveryPolicies(withRuntimeOverrides);
 	}
 
 	#composeStaticModels(providerFilter?: ReadonlySet<string>): Model<Api>[] {
@@ -1627,7 +1662,14 @@ export class ModelRegistry {
 	}
 
 	#mergeResolvedModels(baseModels: Model<Api>[], replacementModels: Model<Api>[]): Model<Api>[] {
-		return mergeByModelKey(baseModels, replacementModels, (existing, replacementModel) => {
+		return runToCompletion(this.#mergeResolvedModelSteps(baseModels, replacementModels));
+	}
+
+	*#mergeResolvedModelSteps(
+		baseModels: Model<Api>[],
+		replacementModels: Model<Api>[],
+	): Generator<void, Model<Api>[], undefined> {
+		return yield* mergeByModelKeySteps(baseModels, replacementModels, (existing, replacementModel) => {
 			if (!existing) return replacementModel;
 			const contextWindow = replacementModel.contextWindow ?? existing.contextWindow;
 			const maxTokens = replacementModel.maxTokens ?? existing.maxTokens;
@@ -1653,7 +1695,14 @@ export class ModelRegistry {
 
 	/** Merge custom models with built-in, replacing by provider+id match */
 	#mergeCustomModels(builtInModels: Model<Api>[], customModels: CustomModelOverlay[]): Model<Api>[] {
-		return mergeByModelKey(builtInModels, customModels, (existingModel, customModel) => {
+		return runToCompletion(this.#mergeCustomModelSteps(builtInModels, customModels));
+	}
+
+	*#mergeCustomModelSteps(
+		builtInModels: Model<Api>[],
+		customModels: CustomModelOverlay[],
+	): Generator<void, Model<Api>[], undefined> {
+		return yield* mergeByModelKeySteps(builtInModels, customModels, (existingModel, customModel) => {
 			// Same-id custom definitions replace bundled transport behavior, so the
 			// patch is applied with the `replace` transport policy.
 			const model = existingModel
@@ -2388,12 +2437,13 @@ export class ModelRegistry {
 				if (epoch !== this.#compositionEpoch) continue;
 				await earlierCommits;
 				if (epoch !== this.#compositionEpoch) continue;
-				this.#commitRuntimeDiscoveries(
+				const snapshotChange = this.#commitRuntimeDiscoveries(
 					builtInDiscovery,
 					replacedConfiguredProviders,
 					touchedProviders,
 					discoveredModels,
 				);
+				if (snapshotChange) await this.#rebuildCommittedSnapshot(snapshotChange, sliced);
 				return;
 			}
 		} finally {
@@ -2401,13 +2451,17 @@ export class ModelRegistry {
 		}
 	}
 
-	/** Records a discovery pass's merged models; runs in one synchronous step after the pass's last slice. */
+	/**
+	 * Records a discovery pass's merged models in one synchronous step after the pass's last slice.
+	 * With a full snapshot composed, returns what rebuilding it takes: the pass rebuilds it while it
+	 * holds the commit chain, and readers keep the previous snapshot until the rebuilt one replaces it.
+	 */
 	#commitRuntimeDiscoveries(
 		builtInDiscovery: BuiltInDiscoveryResult,
 		replacedConfiguredProviders: readonly string[],
 		touchedProviders: ReadonlySet<string>,
 		discoveredModels: Model<Api>[],
-	): void {
+	): CommittedSnapshotChange | undefined {
 		// A commit changes the cached and discovered slices that a concurrent
 		// pass's sliced merge reads, so that pass must merge again.
 		this.#compositionEpoch++;
@@ -2441,21 +2495,62 @@ export class ModelRegistry {
 			}
 			this.#invalidateProviderModelCache(provider);
 		}
-		if (!this.#hasFullSnapshot) return;
+		if (!this.#hasFullSnapshot) return undefined;
+		return { replacedProviderSet, authoritativeProviders, discoveredModels };
+	}
 
-		let baseModels = this.#baseModels;
-		if (replacedProviderSet.size > 0) {
-			baseModels = this.#mergeResolvedModels(
-				dropProviderModels(baseModels, replacedProviderSet),
-				this.#composeBaseModels(replacedProviderSet),
-			);
+	/**
+	 * Rebuilds the full snapshot after a commit, in slices on a sliced pass. A rebuild during whose
+	 * slices the composition or the snapshot changed starts over from the current snapshot; after
+	 * MAX_SLICED_DISCOVERY_MERGES of them the next runs in one synchronous step, so the loop ends.
+	 */
+	async #rebuildCommittedSnapshot(change: CommittedSnapshotChange, sliced: boolean): Promise<void> {
+		for (let attempt = 1; ; attempt++) {
+			if (!this.#hasFullSnapshot) return;
+			const epoch = this.#compositionEpoch;
+			const baseModels = this.#baseModels;
+			const unprojectedModels = this.#unprojectedModels;
+			const models = this.#models;
+			const steps = this.#committedSnapshotSteps(baseModels, change);
+			const inSlices = sliced && attempt <= MAX_SLICED_DISCOVERY_MERGES;
+			const next = inSlices ? await runInSlices(steps) : runToCompletion(steps);
+			if (
+				inSlices &&
+				(epoch !== this.#compositionEpoch ||
+					baseModels !== this.#baseModels ||
+					unprojectedModels !== this.#unprojectedModels ||
+					models !== this.#models)
+			) {
+				continue;
+			}
+			this.#baseModels = next.baseModels;
+			this.#unprojectedModels = next.unprojectedModels;
+			this.#models = next.models;
+			return;
 		}
-		if (authoritativeProviders.size > 0) {
-			baseModels = dropProviderModels(baseModels, authoritativeProviders, { kind: "chat" });
+	}
+
+	*#committedSnapshotSteps(
+		base: Model<Api>[],
+		change: CommittedSnapshotChange,
+	): Generator<void, { baseModels: Model<Api>[]; unprojectedModels: Model<Api>[]; models: Model<Api>[] }, undefined> {
+		let baseModels = base;
+		if (change.replacedProviderSet.size > 0) {
+			yield;
+			const withoutReplaced = dropProviderModels(baseModels, change.replacedProviderSet);
+			const replacements = yield* this.#baseModelSteps(change.replacedProviderSet);
+			baseModels = yield* this.#mergeResolvedModelSteps(withoutReplaced, replacements);
 		}
-		this.#baseModels = this.#mergeResolvedModels(baseModels, discoveredModels);
-		this.#unprojectedModels = this.#projectBaseModels(this.#baseModels);
-		this.#models = this.#finalizeModels(this.#applyRuntimeModelModifiers(this.#unprojectedModels));
+		if (change.authoritativeProviders.size > 0) {
+			yield;
+			baseModels = dropProviderModels(baseModels, change.authoritativeProviders, { kind: "chat" });
+		}
+		const nextBaseModels = yield* this.#mergeResolvedModelSteps(baseModels, change.discoveredModels);
+		const unprojectedModels = yield* this.#projectBaseModelSteps(nextBaseModels);
+		yield;
+		const modified = this.#applyRuntimeModelModifiers(unprojectedModels);
+		const models = yield* this.#finalizeModelSteps(modified);
+		return { baseModels: nextBaseModels, unprojectedModels, models };
 	}
 
 	#mergeDiscoveredModelMemoized(
@@ -2566,6 +2661,7 @@ export class ModelRegistry {
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
 	): Promise<ConfiguredModelDiscoveryResult> {
+		while (sliceExpired()) await nextSlice();
 		const cacheProviderId = this.#configuredDiscoveryCacheProviderId(providerConfig);
 		const cached = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 		const cacheOlderThanConfig = cached !== null && this.#isDiscoveryCacheOlderThanModelsConfig(cached.updatedAt);
@@ -2925,7 +3021,8 @@ export class ModelRegistry {
 			return providerFilter ? providerFilter.has(descriptor.providerId) : true;
 		});
 		const standardProviderKeys = await Promise.all(
-			standardProviderDescriptors.map(descriptor => {
+			standardProviderDescriptors.map(async descriptor => {
+				while (sliceExpired()) await nextSlice();
 				const cacheProviderId = isCredentialScopedModelCacheProvider(descriptor.providerId)
 					? undefined
 					: this.#resolveStartupModelCacheProviderId(descriptor.providerId);
@@ -2938,14 +3035,15 @@ export class ModelRegistry {
 			}),
 		);
 		const specialKeys = await Promise.all(
-			enabledSpecialProviderDescriptors.map(descriptor =>
-				this.#resolveBuiltInDiscoveryApiKey(
+			enabledSpecialProviderDescriptors.map(async descriptor => {
+				while (sliceExpired()) await nextSlice();
+				return this.#resolveBuiltInDiscoveryApiKey(
 					descriptor.providerId,
 					strategy,
 					descriptor.providerId,
 					AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS.has(descriptor.providerId),
-				),
-			),
+				);
+			}),
 		);
 		const options: ModelManagerOptions<Api>[] = [];
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
