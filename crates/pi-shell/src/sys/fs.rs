@@ -753,8 +753,8 @@ mod fifo {
 	use std::{
 		fs::{self, OpenOptions},
 		io,
-		os::unix::fs::{FileTypeExt, OpenOptionsExt},
-		path::PathBuf,
+		os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+		path::{Path, PathBuf},
 		sync::Arc,
 		task::{Context, Poll, Waker},
 		thread,
@@ -763,6 +763,8 @@ mod fifo {
 	use bstr::BStr;
 	use parking_lot::Mutex;
 
+	#[cfg(target_os = "linux")]
+	use super::custom_flags;
 	use super::{StdFile, host_path, options};
 	use crate::bash::{File, FsPending, OpenFlags};
 
@@ -773,15 +775,99 @@ mod fifo {
 		waker:     Option<Waker>,
 		/// The result was handed to the engine.
 		finished:  bool,
-		/// The engine dropped the open: the helper closes what it gets.
+		/// The engine dropped the open: the helper opens nothing, or closes
+		/// what it gets.
 		cancelled: bool,
+		/// The helper passed its check of `cancelled`: it is in `open(2)`, or
+		/// about to enter it.
+		opening:   bool,
+		/// Test hook: after its check, the helper waits until the drop is
+		/// about to join it.
+		#[cfg(test)]
+		hold:      bool,
+		/// Test hook: the drop holds its end of the FIFO and is about to
+		/// join the helper.
+		#[cfg(test)]
+		joining:   bool,
+	}
+
+	/// The FIFO an open started on, which its helper opens and its drop
+	/// releases.
+	struct Node {
+		/// What both open. On Linux it is `/proc/self/fd/N` of an `O_PATH`
+		/// descriptor of the FIFO (which opens no end of it), so both reach
+		/// this node whatever the original path names later. Elsewhere, or
+		/// without procfs, it is the path itself.
+		path: PathBuf,
+		/// Device and inode.
+		id:   (u64, u64),
+		/// The pin, an `O_PATH` descriptor of the FIFO (Linux).
+		#[cfg(target_os = "linux")]
+		fd:   Option<std::os::fd::OwnedFd>,
+	}
+
+	impl Node {
+		/// The node at `host`, which `meta` describes. With `nofollow` a
+		/// symbolic link at `host` is not pinned, so the helper's own open of
+		/// the path refuses it.
+		fn new(host: &Path, meta: &fs::Metadata, nofollow: bool) -> Self {
+			#[cfg(target_os = "linux")]
+			if let Some(node) = Self::pin(host, nofollow) {
+				return node;
+			}
+			#[cfg(not(target_os = "linux"))]
+			let _ = nofollow;
+			Self {
+				path: host.to_path_buf(),
+				id: (meta.dev(), meta.ino()),
+				#[cfg(target_os = "linux")]
+				fd: None,
+			}
+		}
+
+		/// The FIFO at `host`, pinned with an `O_PATH` descriptor, when
+		/// procfs reaches it through `/proc/self/fd/N`.
+		#[cfg(target_os = "linux")]
+		fn pin(host: &Path, nofollow: bool) -> Option<Self> {
+			use std::os::{
+				fd::{FromRawFd, OwnedFd},
+				unix::ffi::OsStrExt,
+			};
+			let path = std::ffi::CString::new(host.as_os_str().as_bytes()).ok()?;
+			let flags = libc::O_PATH | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+			// SAFETY: `path` is a NUL-terminated string that outlives the call.
+			let fd = unsafe { libc::open(path.as_ptr(), flags) };
+			if fd < 0 {
+				return None;
+			}
+			// SAFETY: `fd` was just opened, and nothing else owns it.
+			let pin = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+			let meta = pin.metadata().ok().filter(|m| m.file_type().is_fifo())?;
+			let node = Self {
+				path: PathBuf::from(format!("/proc/self/fd/{fd}")),
+				id:   (meta.dev(), meta.ino()),
+				fd:   Some(OwnedFd::from(pin)),
+			};
+			node.is(fs::metadata(&node.path)).then_some(node)
+		}
+
+		/// Whether the helper and the drop reach this node through a pin.
+		#[cfg(target_os = "linux")]
+		const fn pinned(&self) -> bool {
+			self.fd.is_some()
+		}
+
+		/// Whether `meta` describes this node.
+		fn is(&self, meta: io::Result<fs::Metadata>) -> bool {
+			meta.is_ok_and(|m| (m.dev(), m.ino()) == self.id)
+		}
 	}
 
 	/// A FIFO open in flight.
 	struct FifoOpen {
-		slot:  Arc<Mutex<Slot>>,
-		path:  PathBuf,
-		write: bool,
+		slot:   Arc<Mutex<Slot>>,
+		node:   Arc<Node>,
+		helper: Option<thread::JoinHandle<()>>,
 	}
 
 	/// `Some` when `path` is a FIFO opened for reading only or writing only
@@ -791,22 +877,70 @@ mod fifo {
 		flags: OpenFlags,
 		mode: u32,
 	) -> Option<Box<dyn FsPending<Box<dyn File>>>> {
+		start(path, flags, mode).map(|open| Box::new(open) as Box<dyn FsPending<Box<dyn File>>>)
+	}
+
+	/// [`pending`]'s open, before it is boxed.
+	fn start(path: &BStr, flags: OpenFlags, mode: u32) -> Option<FifoOpen> {
 		let write = flags.contains(OpenFlags::WRITE);
 		if flags.contains(OpenFlags::READ) == write {
 			return None;
 		}
 		let host = host_path(path).ok()?;
-		if !fs::metadata(host).ok()?.file_type().is_fifo() {
+		let meta = fs::metadata(host).ok()?;
+		if !meta.file_type().is_fifo() {
 			return None;
 		}
+		let node = Arc::new(Node::new(host, &meta, flags.contains(OpenFlags::NOFOLLOW)));
 		let slot = Arc::new(Mutex::new(Slot::default()));
-		let (opts, target, helper) = (options(flags, mode), host.to_path_buf(), Arc::clone(&slot));
-		let spawned = thread::Builder::new()
+		#[cfg_attr(not(target_os = "linux"), expect(unused_mut, reason = "only Linux pins"))]
+		let mut opts = options(flags, mode);
+		// A pin is checked not to be a symbolic link already, and its
+		// `/proc/self/fd/N` always is one.
+		#[cfg(target_os = "linux")]
+		if node.pinned() {
+			opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+		}
+		let helper = match spawn_helper(Arc::clone(&slot), Arc::clone(&node), opts) {
+			Ok(helper) => Some(helper),
+			Err(e) => {
+				slot.lock().result = Some(Err(e));
+				None
+			},
+		};
+		Some(FifoOpen { slot, node, helper })
+	}
+
+	/// Starts the thread that opens `node` with `opts`, unless the open is
+	/// cancelled before it gets there.
+	fn spawn_helper(
+		slot: Arc<Mutex<Slot>>,
+		node: Arc<Node>,
+		opts: OpenOptions,
+	) -> io::Result<thread::JoinHandle<()>> {
+		thread::Builder::new()
 			.name("obash-fifo".into())
 			.stack_size(64 << 10)
 			.spawn(move || {
-				let opened = opts.open(&target);
-				let mut s = helper.lock();
+				{
+					let mut s = slot.lock();
+					if s.cancelled {
+						return;
+					}
+					s.opening = true;
+				}
+				#[cfg(test)]
+				{
+					let held = || {
+						let s = slot.lock();
+						s.hold && !s.joining
+					};
+					while held() {
+						thread::yield_now();
+					}
+				}
+				let opened = opts.open(&node.path);
+				let mut s = slot.lock();
 				if s.cancelled {
 					return;
 				}
@@ -816,11 +950,7 @@ mod fifo {
 				if let Some(w) = waker {
 					w.wake();
 				}
-			});
-		if let Err(e) = spawned {
-			slot.lock().result = Some(Err(e));
-		}
-		Some(Box::new(FifoOpen { slot, path: host.to_path_buf(), write }))
+			})
 	}
 
 	impl FsPending<Box<dyn File>> for FifoOpen {
@@ -836,33 +966,270 @@ mod fifo {
 			Poll::Pending
 		}
 
-		/// Cancelling releases the helper by briefly opening the other end,
-		/// which the real other end can observe (a writer that comes and
-		/// goes reads as end of file).
+		/// Cancelling releases the helper by briefly holding both ends of the
+		/// FIFO, which the real other end can observe (a writer that comes
+		/// and goes reads as end of file).
 		fn reissuable(&self) -> bool {
 			false
 		}
 	}
 
 	impl Drop for FifoOpen {
+		/// Leaves no end of the FIFO behind once it returns. A helper that
+		/// has not passed its check of `cancelled` opens nothing, and an open
+		/// it finished that the engine never took is closed here. A helper
+		/// that passed its check is in `open(2)` or about to enter it:
+		/// holding the node open for reading and writing (which never waits
+		/// on a FIFO) completes that open whether it waits already or not
+		/// yet, and the helper, seeing the cancel, closes what it got before
+		/// the join returns.
+		///
+		/// What is left: a FIFO this process may not open for both reading
+		/// and writing keeps its helper until its other end opens, as before.
+		/// Without procfs the node is reached by its path: a path that no
+		/// longer names it leaves the helper waiting too, and a path that
+		/// another process points at a new FIFO after this drop opened its
+		/// end but before the helper's `open(2)` makes the join wait until
+		/// that new FIFO's other end opens.
 		fn drop(&mut self) {
 			{
 				let mut s = self.slot.lock();
-				if s.finished || s.result.is_some() {
+				if s.finished {
 					return;
 				}
 				s.cancelled = true;
+				let unclaimed = s.result.take();
+				if unclaimed.is_some() || !s.opening {
+					return;
+				}
 			}
-			// Release the helper blocked in open(2): be the other end for a
-			// moment, without blocking ourselves.
-			let mut other = OpenOptions::new();
-			if self.write {
-				other.read(true);
-			} else {
-				other.write(true);
+			let node = &self.node;
+			if !node.is(fs::metadata(&node.path)) {
+				return;
 			}
-			other.custom_flags(libc::O_NONBLOCK);
-			let _ = other.open(&self.path);
+			let Ok(peer) = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&node.path)
+			else {
+				return;
+			};
+			if node.is(peer.metadata())
+				&& let Some(helper) = self.helper.take()
+			{
+				#[cfg(test)]
+				{
+					self.slot.lock().joining = true;
+				}
+				let _ = helper.join();
+			}
+		}
+	}
+
+	/// Whether the FIFO at `path` has a reader: a write-only open that does
+	/// not wait fails with ENXIO when it has none.
+	#[cfg(test)]
+	pub(super) fn has_reader(path: &Path) -> bool {
+		match OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+		{
+			Ok(_) => true,
+			Err(e) if e.raw_os_error() == Some(libc::ENXIO) => false,
+			Err(e) => panic!("{e}"),
+		}
+	}
+
+	/// Whether the FIFO at `path` has a writer: a reader that does not wait
+	/// reads end of file when it has none, and would block when it has one.
+	#[cfg(test)]
+	pub(super) fn has_writer(path: &Path) -> bool {
+		use std::io::Read;
+		let mut reader = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		match reader.read(&mut [0; 1]) {
+			Ok(0) => false,
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::os::unix::ffi::OsStrExt;
+
+		use super::*;
+
+		/// A new FIFO, and the directory that holds it.
+		fn new_fifo() -> (tempfile::TempDir, PathBuf) {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("f");
+			make_fifo(&path);
+			(dir, path)
+		}
+
+		fn make_fifo(path: &Path) {
+			let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `c` is a NUL-terminated string that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+		}
+
+		/// An open of `path` whose helper has passed its check of the cancel.
+		fn opening(path: &Path, flags: OpenFlags) -> (FifoOpen, Arc<Mutex<Slot>>) {
+			let open = start(BStr::new(path.as_os_str().as_bytes()), flags, 0).unwrap();
+			let slot = Arc::clone(&open.slot);
+			while !slot.lock().opening {
+				thread::yield_now();
+			}
+			(open, slot)
+		}
+
+		/// A writer of the FIFO at `path`, once a reader waits on it.
+		fn writer(path: &Path) -> fs::File {
+			loop {
+				match OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(path)
+				{
+					Ok(writer) => return writer,
+					Err(e) if e.raw_os_error() == Some(libc::ENXIO) => thread::yield_now(),
+					Err(e) => panic!("{e}"),
+				}
+			}
+		}
+
+		/// A helper that finds the open cancelled opens nothing: it ends
+		/// (instead of waiting in `open(2)` for a writer) and leaves no reader.
+		#[test]
+		fn a_helper_cancelled_before_its_check_opens_nothing() {
+			let (_dir, path) = new_fifo();
+			let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false));
+			let slot = Arc::new(Mutex::new(Slot { cancelled: true, ..Slot::default() }));
+			let helper = spawn_helper(Arc::clone(&slot), node, options(OpenFlags::READ, 0)).unwrap();
+			helper.join().unwrap();
+			assert!(!slot.lock().opening);
+			assert!(!has_reader(&path));
+		}
+
+		/// A drop after the helper's check, whether the helper waits in
+		/// `open(2)` already or not yet, has ended the helper and left no end
+		/// of the FIFO when it returns.
+		#[test]
+		fn a_drop_after_the_check_ends_the_helper_before_it_returns() {
+			for flags in [OpenFlags::READ, OpenFlags::WRITE] {
+				let (_dir, path) = new_fifo();
+				let (open, slot) = opening(&path, flags);
+				drop(open);
+				assert_eq!(Arc::strong_count(&slot), 1, "the helper outlived the drop");
+				assert!(!has_reader(&path), "a reader is left");
+				assert!(!has_writer(&path), "a writer is left");
+			}
+		}
+
+		/// A drop that comes while the helper is between its check and its
+		/// `open(2)` holds its end of the FIFO until the helper has opened
+		/// and closed. The helper here enters `open(2)` only once the drop is
+		/// about to join it, so a drop that did not join, or did not hold its
+		/// end while it joined, leaves the helper waiting.
+		#[test]
+		fn a_drop_holds_its_end_until_a_helper_about_to_open_has_ended() {
+			for flags in [OpenFlags::READ, OpenFlags::WRITE] {
+				let (_dir, path) = new_fifo();
+				let node = Arc::new(Node::new(&path, &fs::metadata(&path).unwrap(), false));
+				let slot = Arc::new(Mutex::new(Slot { hold: true, ..Slot::default() }));
+				let helper =
+					spawn_helper(Arc::clone(&slot), Arc::clone(&node), options(flags, 0)).unwrap();
+				while !slot.lock().opening {
+					thread::yield_now();
+				}
+				drop(FifoOpen { slot: Arc::clone(&slot), node, helper: Some(helper) });
+				assert_eq!(Arc::strong_count(&slot), 1, "the helper outlived the drop");
+				assert!(!has_reader(&path), "a reader is left");
+				assert!(!has_writer(&path), "a writer is left");
+			}
+		}
+
+		/// An open the helper finished, which the engine never took, is
+		/// closed by the drop, not when the helper's last reference goes.
+		#[test]
+		fn a_drop_closes_an_open_the_engine_never_took() {
+			let (_dir, path) = new_fifo();
+			let (open, slot) = opening(&path, OpenFlags::READ);
+			// Be the writer the helper waits for, once it waits.
+			let writer = writer(&path);
+			while slot.lock().result.is_none() {
+				thread::yield_now();
+			}
+			drop(writer);
+			drop(open);
+			assert!(!has_reader(&path), "the helper's read end outlived the drop");
+		}
+
+		/// With NOFOLLOW, a FIFO opens (on Linux its pin is checked not to be
+		/// a symbolic link, and the pin's `/proc/self/fd/N`, which is one, is
+		/// opened without the flag), and a symbolic link to a FIFO is refused
+		/// with ELOOP, as `open(2)` refuses it.
+		#[test]
+		fn nofollow_opens_a_fifo_and_refuses_a_symbolic_link_to_one() {
+			let (dir, path) = new_fifo();
+			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
+			let (open, slot) = opening(&path, flags);
+			// Be the writer the helper waits for, unless its open failed.
+			let writer = loop {
+				if let Some(Err(e)) = &slot.lock().result {
+					panic!("the FIFO did not open: {e}");
+				}
+				match OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+				{
+					Ok(writer) => break writer,
+					Err(e) if e.raw_os_error() == Some(libc::ENXIO) => thread::yield_now(),
+					Err(e) => panic!("{e}"),
+				}
+			};
+			while slot.lock().result.is_none() {
+				thread::yield_now();
+			}
+			if let Some(Err(e)) = &slot.lock().result {
+				panic!("the FIFO did not open: {e}");
+			}
+			drop(writer);
+			drop(open);
+
+			let link = dir.path().join("l");
+			std::os::unix::fs::symlink(&path, &link).unwrap();
+			let (open, slot) = opening(&link, flags);
+			while slot.lock().result.is_none() {
+				thread::yield_now();
+			}
+			match &slot.lock().result {
+				Some(Err(e)) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
+				Some(Ok(_)) => panic!("the symbolic link was followed"),
+				None => unreachable!(),
+			}
+			drop(open);
+		}
+
+		/// On Linux the drop reaches the node the open started on, though
+		/// its path now names another FIFO.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_drop_releases_a_helper_whose_path_now_names_another_fifo() {
+			let (_dir, path) = new_fifo();
+			let (open, slot) = opening(&path, OpenFlags::READ);
+			fs::remove_file(&path).unwrap();
+			make_fifo(&path);
+			drop(open);
+			assert_eq!(Arc::strong_count(&slot), 1, "the helper outlived the drop");
+			assert!(!has_reader(&path));
 		}
 	}
 }
@@ -1646,25 +2013,23 @@ mod tests {
 			}
 		}
 
+		/// Dropped opens leave no end of the FIFO behind, through
+		/// `StdFs::open` as the engine opens them: each round drops a read
+		/// and a write as soon as they start (in most rounds before their
+		/// helpers run), and a helper any round leaves behind fails a later
+		/// check, or makes a later write open complete at once. A helper the
+		/// drop came before used to enter `open(2)` afterwards and stay on the
+		/// FIFO, so the next writer's data went to it. The tests in `fifo`
+		/// hold each point of the helper's start in turn.
 		#[test]
 		fn dropping_a_pending_fifo_open_releases_the_helper() {
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
-			let p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
-			drop(p);
-			// Once the helper's read end is closed, no reader is left: a
-			// non-blocking write open fails with ENXIO.
-			let deadline = Instant::now() + Duration::from_secs(10);
-			loop {
-				let r = fs::OpenOptions::new()
-					.write(true)
-					.custom_flags(libc::O_NONBLOCK)
-					.open(&host);
-				if r.as_ref().err().and_then(io::Error::raw_os_error) == Some(libc::ENXIO) {
-					break;
-				}
-				assert!(Instant::now() < deadline, "helper still holds the FIFO");
-				thread::sleep(Duration::from_millis(10));
+			for round in 0..200 {
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0)));
+				assert!(!fifo::has_reader(&host), "round {round}: a reader is left on the FIFO");
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0)));
+				assert!(!fifo::has_writer(&host), "round {round}: a writer is left on the FIFO");
 			}
 			fs::remove_file(&host).unwrap();
 		}

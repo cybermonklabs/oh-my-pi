@@ -219,9 +219,8 @@ async fn killed_job_leaves_no_reader_on_its_fifo() {
 	.expect("the killed job ends");
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "done\n"));
 
-	// The release runs on its own thread; give it time, then a writer that
-	// does not wait must find no reader.
-	time::sleep(Duration::from_millis(500)).await;
+	// The drop of the open closed its helper's end before it returned: a
+	// writer that does not wait finds no reader.
 	let writer = std::fs::OpenOptions::new()
 		.write(true)
 		.custom_flags(libc::O_NONBLOCK)
