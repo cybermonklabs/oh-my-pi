@@ -129,7 +129,15 @@ if (process.argv[2] === "restarted") {
 	await import(${JSON.stringify(workerClientTs)});
 	const fs = await import("node:fs");
 	const envFiles = process.execArgv.filter(arg => arg.startsWith("--env-file=")).map(arg => arg.slice(11));
-	console.log(JSON.stringify({ restarted: seen, keptFlags: runtimeFlags(), privateFilesLeft: envFiles.filter(file => /omp-bun-env-/.test(file) && fs.existsSync(file)) }));
+	// The relaunch file names itself in a comment, which Bun loads into no variable: neither this
+	// process nor a program it starts, with its environment or without one, sees the path.
+	const leaks = (text: string) => text.split("\\n").filter(line => line.includes("omp-bun-env-"));
+	const marker = {
+		processEnv: leaks(Object.entries(process.env).map(([k, v]) => k + "=" + v).join("\\n")),
+		childWithEnv: leaks(Bun.spawnSync(["env"], { env: process.env }).stdout.toString()),
+		childWithoutEnv: leaks(Bun.spawnSync(["env"]).stdout.toString()),
+	};
+	console.log(JSON.stringify({ restarted: seen, keptFlags: runtimeFlags(), marker, privateFilesLeft: envFiles.filter(file => /omp-bun-env-/.test(file) && fs.existsSync(file)) }));
 	process.exit(0);
 }
 await Bun.write(${JSON.stringify(firstOut)}, JSON.stringify({ seen, flags: runtimeFlags() }));
@@ -145,16 +153,26 @@ const command = resolveCliEntryCmd();
 // The names the relaunch file holds, read before the new process removes it.
 const fileArg = command.find(arg => arg.startsWith("--env-file="));
 const nodeFs = await import("node:fs");
-const fileNames = fileArg ? nodeFs.readFileSync(fileArg.slice(11), "utf8").split("\\n").filter(Boolean).map(line => line.slice(0, line.indexOf("="))) : null;
-await Bun.write(${JSON.stringify(path.join(tempRoot, "command.json"))}, JSON.stringify({ command, fileNames }));
+const fileLines = fileArg ? nodeFs.readFileSync(fileArg.slice(11), "utf8").split("\\n").filter(Boolean) : null;
+const fileNames = fileLines ? fileLines.filter(line => !line.startsWith("#")).map(line => line.slice(0, line.indexOf("="))) : null;
+const fileMarker = fileLines ? fileLines[0] === "# omp relaunch file: " + fileArg.slice(11) : null;
+await Bun.write(${JSON.stringify(path.join(tempRoot, "command.json"))}, JSON.stringify({ command, fileNames, fileMarker }));
 // As InteractiveMode.restart() does on POSIX.
 execReplace([...command, "restarted"]);
 `,
 		);
-		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		// A private stand-in for `/tmp`, the relaunch file's fallback, so no case needs the host's.
+		const fallback = path.join(tempRoot, "fallback-default");
+		await fs.mkdir(fallback, { recursive: true });
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			USERPROFILE: home,
+			PI_TEST_RELAUNCH_FALLBACK_DIR: fallback,
+		};
 		// The default mode, as a developer's shell has it (bun test sets NODE_ENV=test).
 		for (const name of ["NODE_ENV", "BUN_ENV", "BUN_OPTIONS", ...NAMES]) delete env[name];
-		Object.assign(env, c.env);
+		for (const [name, value] of Object.entries(c.env ?? {})) env[name] = value?.replaceAll("$TEMP_ROOT", tempRoot);
 		for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
 		// Bun's own `.env` loading on, as the npm package's `#!/usr/bin/env bun` script starts.
 		const command = c.shell
@@ -173,9 +191,9 @@ execReplace([...command, "restarted"]);
 			child.exited,
 		]);
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-		const { restarted, keptFlags, privateFilesLeft } = JSON.parse(stdout);
+		const { restarted, keptFlags, privateFilesLeft, marker } = JSON.parse(stdout);
 		const first = JSON.parse(await fs.readFile(firstOut, "utf8"));
-		const relaunch: { command: string[]; fileNames: string[] | null } = JSON.parse(
+		const relaunch: { command: string[]; fileNames: string[] | null; fileMarker: boolean | null } = JSON.parse(
 			await fs.readFile(path.join(tempRoot, "command.json"), "utf8"),
 		);
 		return {
@@ -184,8 +202,10 @@ execReplace([...command, "restarted"]);
 			restarted,
 			keptFlags,
 			privateFilesLeft,
+			marker,
 			relaunch: relaunch.command,
 			fileNames: relaunch.fileNames,
+			fileMarker: relaunch.fileMarker,
 			script,
 			elsewhere,
 			env,
@@ -273,15 +293,19 @@ execReplace([...command, "restarted"]);
 		it.skipIf(process.platform !== "linux")(
 			`starts with the values Bun's own loading gave the first launch: ${label}`,
 			async () => {
-				const { first, firstFlags, restarted, keptFlags, privateFilesLeft, fileNames } = await restart(c);
+				const { first, firstFlags, restarted, keptFlags, privateFilesLeft, fileNames, fileMarker, marker } =
+					await restart(c);
 				expect(first).toMatchObject(c.loads ?? {});
 				for (const flag of c.keeps ?? []) expect(firstFlags).toContain(flag);
 
 				expect(restarted).toEqual(first);
 				expect(keptFlags).toEqual(firstFlags);
 				expect(privateFilesLeft).toEqual([]);
-				// The relaunch file holds only what Bun loaded, never the rest of the environment.
+				// The relaunch file holds only what Bun loaded, never the rest of the environment, and
+				// names itself on its first line, a comment no program's environment gets.
 				expect((fileNames ?? []).filter(name => !NAMES.includes(name))).toEqual([]);
+				expect(fileMarker).toBe(fileNames ? true : null);
+				expect(marker).toEqual({ processEnv: [], childWithEnv: [], childWithoutEnv: [] });
 			},
 			120_000,
 		);
@@ -291,10 +315,17 @@ execReplace([...command, "restarted"]);
 		"removes the relaunch file when omp's own .env loading sets TMPDIR after the launch",
 		async () => {
 			// TMPDIR unset at the launch, then set by `~/.env`, which omp applies outside a test run.
+			// The file goes to the fallback, here a private stand-in for `/tmp`, never to the `.env` one.
 			const dotenvTmp = path.join(tempRoot, "dotenv-tmp");
+			const fallback = path.join(tempRoot, "fallback-tmp");
 			await fs.mkdir(dotenvTmp, { recursive: true });
+			await fs.mkdir(fallback, { recursive: true });
 			const { first, restarted, privateFilesLeft, relaunch } = await restart({
-				env: { TMPDIR: undefined, PI_TEST_RUNTIME: undefined },
+				env: {
+					TMPDIR: undefined,
+					PI_TEST_RUNTIME: undefined,
+					PI_TEST_RELAUNCH_FALLBACK_DIR: "$TEMP_ROOT/fallback-tmp",
+				},
 				homeEnv: "TMPDIR=$TEMP_ROOT/dotenv-tmp\n",
 				loads: { FROM_ENV: "start" },
 			});
@@ -302,9 +333,11 @@ execReplace([...command, "restarted"]);
 
 			expect(restarted).toEqual(first);
 			expect(file).toBeDefined();
+			expect(path.dirname(path.dirname(file!))).toBe(fallback);
 			expect(privateFilesLeft).toEqual([]);
 			expect(await fs.exists(file!)).toBe(false);
 			expect(await fs.readdir(dotenvTmp)).toEqual([]);
+			expect(await fs.readdir(fallback)).toEqual([]);
 		},
 		120_000,
 	);

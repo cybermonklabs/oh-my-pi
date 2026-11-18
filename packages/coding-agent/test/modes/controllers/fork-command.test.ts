@@ -219,7 +219,7 @@ describe("/fork terminal placement", () => {
 		// A private file as `bunRelaunchArgs` writes it: `<tmp>/omp-bun-env-XXXXXX/loaded.env`.
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
 		const file = path.join(dir, "loaded.env");
-		await Bun.write(file, "LOADED='value'\n");
+		await Bun.write(file, `# omp relaunch file: ${file}\nLOADED='value'\n`);
 		const { ctx } = createContext();
 		const controller = new CommandController(ctx, {
 			classifyTerminalMultiplexer: () => "tmux",
@@ -241,7 +241,7 @@ describe("/fork terminal placement", () => {
 	it("removes the relaunch file its command names when the launch plan is refused", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
 		const file = path.join(dir, "loaded.env");
-		await Bun.write(file, "LOADED='value'\n");
+		await Bun.write(file, `# omp relaunch file: ${file}\nLOADED='value'\n`);
 		// A relative working directory: the request is refused before any terminal starts.
 		const { ctx } = createContext({ cwd: "relative/project" });
 		const launchTerminal = vi.fn();
@@ -469,7 +469,11 @@ console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 	 * builds the /fork command with the real relaunch command (the stand-in fork as the entry),
 	 * and the command runs the fork.
 	 */
-	async function forkAfterBunLoadedInput(options: { sessionTmpdir: string; forkTmpdir: string }) {
+	async function forkAfterBunLoadedInput(options: {
+		sessionTmpdir: string;
+		forkTmpdir: string;
+		fallbackDir?: string;
+	}) {
 		const controllerTs = path.join(import.meta.dir, "../../../src/modes/controllers/command-controller.ts");
 		const workerClientTs = path.join(import.meta.dir, "../../../src/subprocess/worker-client.ts");
 		const nativesDirJs = path.join(import.meta.dir, "../../../../natives/native/natives-dir.js");
@@ -527,11 +531,15 @@ await controller.handleForkCommand("pane");
 console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 `,
 		);
+		// A private stand-in for `/tmp`, the relaunch file's fallback, so no run touches the host's.
+		const fallbackDir = options.fallbackDir ?? path.join(tempDirectory, "fallback-tmp");
+		await fs.mkdir(fallbackDir, { recursive: true });
 		const env: Record<string, string | undefined> = {
 			...process.env,
 			HOME: home,
 			USERPROFILE: home,
 			XDG_CACHE_HOME: xdgCache,
+			PI_TEST_RELAUNCH_FALLBACK_DIR: fallbackDir,
 		};
 		for (const name of FORK_NATIVES_DIR_NAMES) if (name !== "XDG_CACHE_HOME") delete env[name];
 		for (const name of ["NODE_ENV", "BUN_ENV", "BUN_OPTIONS"]) delete env[name];
@@ -593,16 +601,44 @@ console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 	);
 
 	it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
-		"records no relaunch value in the fork's handoff when the relaunch file cannot be written",
+		"writes the relaunch file under the fallback when the session's TMPDIR cannot be written",
 		async () => {
-			// A temporary directory the session cannot write: the relaunch carries `--no-env-file`,
-			// so the fork gets no OMP_CONFIG_ROOT, and the handoff must record none either.
 			const readOnlyTmp = path.join(tempDirectory, "read-only-tmp");
+			const fallback = path.join(tempDirectory, "fallback-tmp");
 			await fs.mkdir(readOnlyTmp, { recursive: true, mode: 0o500 });
+			try {
+				const { session, forked, configRoot, relaunchFile, relaunchFileWritten } = await forkAfterBunLoadedInput({
+					sessionTmpdir: readOnlyTmp,
+					forkTmpdir: readOnlyTmp,
+					fallbackDir: fallback,
+				});
+
+				expect(relaunchFileWritten).toBe(true);
+				expect(path.dirname(path.dirname(relaunchFile!))).toBe(fallback);
+				expect(forked.OMP_CONFIG_ROOT).toBe(configRoot);
+				expect(forked.dir).toBe(session.dir);
+				expect(await fs.readdir(fallback)).toEqual([]);
+			} finally {
+				await fs.chmod(readOnlyTmp, 0o700);
+			}
+		},
+		120_000,
+	);
+
+	it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+		"records no relaunch value in the fork's handoff when no relaunch file can be written",
+		async () => {
+			// Neither the session's TMPDIR nor the fallback can be written: the relaunch carries
+			// `--no-env-file`, so the fork gets no OMP_CONFIG_ROOT, and the handoff must record none.
+			const readOnlyTmp = path.join(tempDirectory, "read-only-tmp");
+			const readOnlyFallback = path.join(tempDirectory, "read-only-fallback");
+			await fs.mkdir(readOnlyTmp, { recursive: true, mode: 0o500 });
+			await fs.mkdir(readOnlyFallback, { recursive: true, mode: 0o500 });
 			try {
 				const { session, forked, configRoot } = await forkAfterBunLoadedInput({
 					sessionTmpdir: readOnlyTmp,
 					forkTmpdir: readOnlyTmp,
+					fallbackDir: readOnlyFallback,
 				});
 
 				expect(session.command).toContain("--no-env-file");
@@ -611,6 +647,7 @@ console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 				expect(forked.dir).toBe(session.dir);
 			} finally {
 				await fs.chmod(readOnlyTmp, 0o700);
+				await fs.chmod(readOnlyFallback, 0o700);
 			}
 		},
 		120_000,

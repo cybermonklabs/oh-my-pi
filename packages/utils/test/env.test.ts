@@ -377,6 +377,8 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 			...DIR_RESOLUTION_ENV_RESET,
 			HOME: home,
 			LAUNCH_ONLY: "from the launch environment",
+			// A private stand-in for `/tmp`, the relaunch file's fallback.
+			PI_TEST_RELAUNCH_FALLBACK_DIR: home,
 		};
 		for (const name of NAMES) if (name !== "LAUNCH_ONLY") delete env[name];
 		const child = Bun.spawnSync([process.execPath, ...flags, "-e", probe], { cwd, env, stderr: "pipe" });
@@ -449,29 +451,37 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 
 describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () => {
 	const envTs = path.join(import.meta.dir, "../src/env.ts");
+	const loggerTs = path.join(import.meta.dir, "../src/logger.ts");
 
-	/** A private temporary directory, standing in for `TMPDIR`. */
+	/** A private temporary directory, standing in for `TMPDIR` or `/tmp`. */
 	function tempBase(): string {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-relaunch-"));
 		tempDirs.push(dir);
 		return dir;
 	}
 
-	/** A relaunch directory as `bunRelaunchArgs` makes it, in `parent`. */
-	function relaunchDir(parent: string, name: string): { dir: string; file: string } {
+	/** A relaunch directory in `parent`: as `bunRelaunchArgs` makes it, or, unmarked, a look-alike. */
+	function relaunchDir(parent: string, name: string, marked = true): { dir: string; file: string } {
 		const dir = path.join(parent, name);
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		const file = path.join(dir, "loaded.env");
-		fs.writeFileSync(file, "LOADED='value'\n", { mode: 0o600 });
+		fs.writeFileSync(file, `${marked ? `# omp relaunch file: ${file}\n` : ""}LOADED='value'\n`, { mode: 0o600 });
 		return { dir, file };
 	}
 
-	/** Start a process that loads `env.ts`, with `base` as its `TMPDIR`, from an empty directory. */
-	function loadEnv(base: string, flags: string[] = []): void {
-		const cwd = tempBase();
-		const env: Record<string, string | undefined> = { ...process.env, TMPDIR: base };
+	/**
+	 * Start a process that loads `env.ts` from an empty directory, with `base` as its `TMPDIR` and a
+	 * private fallback in place of `/tmp`, so it never reads or writes the host's.
+	 */
+	function loadEnv(base: string, flags: string[] = [], extra: Record<string, string> = {}): void {
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			TMPDIR: base,
+			PI_TEST_RELAUNCH_FALLBACK_DIR: tempBase(),
+			...extra,
+		};
 		const child = Bun.spawnSync([process.execPath, ...flags, "-e", `await import(${JSON.stringify(envTs)});`], {
-			cwd,
+			cwd: tempBase(),
 			env,
 			stderr: "pipe",
 		});
@@ -479,11 +489,17 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		expect(child.exitCode).toBe(0);
 	}
 
-	it("removes the relaunch file it was started with, wherever it is, and nothing that is not one", () => {
+	it("removes the relaunch file it was started with, wherever it is, and nothing that is not omp's", () => {
 		const base = tempBase();
 		const plain = relaunchDir(base, "omp-bun-env-Plain1");
 		// Written under another temporary directory than this process's (a fork pane's terminal).
 		const elsewhere = relaunchDir(tempBase(), "omp-bun-env-Else01");
+		// A user's look-alike outside every base, named in the arguments (c1) or in BUN_OPTIONS (c2).
+		const c1 = relaunchDir(path.join(tempBase(), "keep"), "omp-bun-env-Keep01", false);
+		const c2 = relaunchDir(path.join(tempBase(), "bo"), "omp-bun-env-Bopt01", false);
+		// A copy of a relaunch file in another directory: it names a path that is not its own.
+		const copied = relaunchDir(tempBase(), "omp-bun-env-Copy01", false);
+		fs.writeFileSync(copied.file, fs.readFileSync(plain.file));
 		// The user's own file beside it: the directory is not only the relaunch file's.
 		const shared = relaunchDir(base, "omp-bun-env-Share1");
 		fs.writeFileSync(path.join(shared.dir, "notes.txt"), "mine\n");
@@ -494,12 +510,17 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		const link = path.join(base, "omp-bun-env-Lnk001");
 		fs.symlinkSync(target.dir, link);
 
-		for (const file of [plain.file, elsewhere.file, shared.file, misnamed.file, path.join(link, "loaded.env")]) {
+		for (const file of [plain.file, elsewhere.file, c1.file, copied.file, shared.file, misnamed.file]) {
 			loadEnv(base, [`--env-file=${file}`]);
 		}
+		loadEnv(base, [`--env-file=${path.join(link, "loaded.env")}`]);
+		loadEnv(base, ["--no-env-file"], { BUN_OPTIONS: `--env-file=${c2.file}` });
 
 		expect(fs.existsSync(plain.dir)).toBe(false);
 		expect(fs.existsSync(elsewhere.dir)).toBe(false);
+		expect(fs.existsSync(c1.file)).toBe(true);
+		expect(fs.existsSync(c2.file)).toBe(true);
+		expect(fs.existsSync(copied.file)).toBe(true);
 		expect(fs.readdirSync(shared.dir).sort()).toEqual(["loaded.env", "notes.txt"]);
 		expect(fs.existsSync(misnamed.file)).toBe(true);
 		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
@@ -512,6 +533,9 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 		const old = relaunchDir(base, "omp-bun-env-Old123");
 		fs.utimesSync(old.dir, hourAgo, hourAgo);
 		const fresh = relaunchDir(base, "omp-bun-env-New123");
+		// A look-alike that does not name itself stays, however old it is.
+		const lookAlike = relaunchDir(base, "omp-bun-env-Lka123", false);
+		fs.utimesSync(lookAlike.dir, hourAgo, hourAgo);
 		// One that also holds another file stays whole, however old it is.
 		const shared = relaunchDir(base, "omp-bun-env-Oth001");
 		fs.writeFileSync(path.join(shared.dir, "notes.txt"), "mine\n");
@@ -531,6 +555,7 @@ describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () 
 
 		expect(fs.existsSync(old.dir)).toBe(false);
 		expect(fs.existsSync(fresh.file)).toBe(true);
+		expect(fs.existsSync(lookAlike.file)).toBe(true);
 		expect(fs.readdirSync(shared.dir).sort()).toEqual(["loaded.env", "notes.txt"]);
 		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
 		expect(fs.existsSync(target.file)).toBe(true);
@@ -551,13 +576,136 @@ await import(${JSON.stringify(envTs)});
 console.log(JSON.stringify({ afterWorker, afterMain: fs.existsSync(${JSON.stringify(old.dir)}) }));`;
 		const child = Bun.spawnSync([process.execPath, "-e", script], {
 			cwd: tempBase(),
-			env: { ...process.env, TMPDIR: base },
+			env: { ...process.env, TMPDIR: base, PI_TEST_RELAUNCH_FALLBACK_DIR: tempBase() },
 			stderr: "pipe",
 		});
 		expect(child.stderr.toString()).toBe("");
 
 		expect(JSON.parse(child.stdout.toString())).toEqual({ afterWorker: true, afterMain: false });
 	});
+
+	/**
+	 * A session that Bun gave one value from its start directory's `.env`, whose launch environment
+	 * is `launch` (over the test's, with no TMPDIR and no test-runtime marker, so omp applies
+	 * `~/.env`): it writes the relaunch file (`bunRelaunchArgs`) and starts nothing.
+	 */
+	function writeRelaunchFile(launch: Record<string, string | undefined>): {
+		args: string[];
+		warnings: { message: string; reasons: string[] }[];
+	} {
+		const start = tempBase();
+		fs.writeFileSync(path.join(start, ".env"), "RELAUNCH_PROBE=loaded\n");
+		const script = `const logger = await import(${JSON.stringify(loggerTs)});
+const warnings = [];
+logger.registerLogSink(event => { if (event.level === "warn") warnings.push({ message: event.message, reasons: event.context?.reasons ?? [] }); });
+const { bunRelaunchArgs } = await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify({ args: bunRelaunchArgs(), warnings }));`;
+		const child = Bun.spawnSync([process.execPath, "-e", script], {
+			cwd: start,
+			env: launchEnv(launch),
+			stderr: "pipe",
+		});
+		expect(child.stderr.toString()).toBe("");
+		return JSON.parse(child.stdout.toString());
+	}
+
+	function launchEnv(launch: Record<string, string | undefined>): Record<string, string> {
+		const env: Record<string, string | undefined> = { ...process.env, ...DIR_RESOLUTION_ENV_RESET, ...launch };
+		for (const name of ["TMPDIR", "PI_TEST_RUNTIME", "NODE_ENV", "BUN_ENV"]) if (!(name in launch)) delete env[name];
+		return Object.fromEntries(
+			Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+		);
+	}
+
+	it("lets a later session sweep the file a dead relaunch left, though `~/.env` set TMPDIR after the launch", () => {
+		// TMPDIR unset at the launch and set by `~/.env`: the file goes to the fallback, a private
+		// stand-in for `/tmp`, where a later session with the same launch environment looks.
+		const home = tempBase();
+		const dotenvTmp = tempBase();
+		const fallback = tempBase();
+		fs.writeFileSync(path.join(home, ".env"), `TMPDIR=${dotenvTmp}\n`);
+		const launch = { HOME: home, PI_TEST_RELAUNCH_FALLBACK_DIR: fallback };
+		const { args } = writeRelaunchFile(launch);
+		const file = args[0]!.slice("--env-file=".length);
+		expect(path.dirname(path.dirname(file))).toBe(fallback);
+		// Nothing relaunched: the new image died before env.ts loaded. Ten minutes pass.
+		const elevenMinutesAgo = new Date(Date.now() - 11 * 60_000);
+		fs.utimesSync(path.dirname(file), elevenMinutesAgo, elevenMinutesAgo);
+
+		const later = Bun.spawnSync([process.execPath, "-e", `await import(${JSON.stringify(envTs)});`], {
+			cwd: tempBase(),
+			env: launchEnv(launch),
+			stderr: "pipe",
+		});
+		expect(later.stderr.toString()).toBe("");
+
+		expect(fs.existsSync(path.dirname(file))).toBe(false);
+		expect(fs.readdirSync(dotenvTmp)).toEqual([]);
+	});
+
+	it.skipIf(process.getuid?.() === 0)(
+		"writes under the fallback when TMPDIR cannot be written, without a warning",
+		() => {
+			const readOnly = tempBase();
+			const fallback = tempBase();
+			fs.chmodSync(readOnly, 0o500);
+			try {
+				const { args, warnings } = writeRelaunchFile({ TMPDIR: readOnly, PI_TEST_RELAUNCH_FALLBACK_DIR: fallback });
+				const file = args[0]!.slice("--env-file=".length);
+
+				expect(path.dirname(path.dirname(file))).toBe(fallback);
+				expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+				expect(fs.statSync(path.dirname(file)).mode & 0o777).toBe(0o700);
+				expect(warnings).toEqual([]);
+				fs.rmSync(path.dirname(file), { recursive: true });
+			} finally {
+				fs.chmodSync(readOnly, 0o700);
+			}
+		},
+	);
+
+	it("removes the directory of a relaunch file it made but could not write, and falls back", () => {
+		// A TMPDIR whose path holds a newline: `mkdtemp` makes the directory there, but the file
+		// cannot name its own path on one line, so the write is given up after the directory exists.
+		const newlineBase = path.join(tempBase(), "a\nb");
+		fs.mkdirSync(newlineBase);
+		const fallback = tempBase();
+		const { args, warnings } = writeRelaunchFile({ TMPDIR: newlineBase, PI_TEST_RELAUNCH_FALLBACK_DIR: fallback });
+		const file = args[0]!.slice("--env-file=".length);
+
+		expect(path.dirname(path.dirname(file))).toBe(fallback);
+		expect(fs.readdirSync(newlineBase)).toEqual([]);
+		expect(warnings).toEqual([]);
+		fs.rmSync(path.dirname(file), { recursive: true });
+	});
+
+	it.skipIf(process.getuid?.() === 0)(
+		"passes --no-env-file, with a warning naming each reason, when neither can be written",
+		() => {
+			const readOnly = tempBase();
+			const readOnlyFallback = tempBase();
+			fs.chmodSync(readOnly, 0o500);
+			fs.chmodSync(readOnlyFallback, 0o500);
+			try {
+				const { args, warnings } = writeRelaunchFile({
+					TMPDIR: readOnly,
+					PI_TEST_RELAUNCH_FALLBACK_DIR: readOnlyFallback,
+				});
+
+				expect(args).toEqual(["--no-env-file"]);
+				expect(warnings).toEqual([
+					{
+						message:
+							"The relaunch starts without the values Bun loaded from .env files: no relaunch file could be written",
+						reasons: [`${readOnly}: EACCES`, `${readOnlyFallback}: EACCES`],
+					},
+				]);
+			} finally {
+				fs.chmodSync(readOnly, 0o700);
+				fs.chmodSync(readOnlyFallback, 0o700);
+			}
+		},
+	);
 });
 
 describe.skipIf(process.platform !== "linux")("bunOptionsWithoutEnvFiles", () => {

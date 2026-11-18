@@ -5,6 +5,7 @@ import { parseEnv } from "node:util";
 import { isMainThread } from "node:worker_threads";
 import { getNativesDir, NATIVES_DIR_HANDOFF_ENV_KEY } from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
+import * as logger from "./logger";
 import { startupEnv } from "./startup-env";
 import { isBunTestRuntime } from "./test-runtime";
 
@@ -154,6 +155,14 @@ export function launchEnvValue(name: string): string | undefined {
 }
 
 /**
+ * The comment line by which a relaunch file names itself (`# omp relaunch file: <its path>`), so
+ * a process can tell a file omp wrote from a look-alike. A comment, so Bun loads nothing from
+ * it: a variable would also reach every program the new process starts without an `env` of
+ * its own, whose environment is the one Bun built at the start, whatever `process.env` does.
+ */
+const RELAUNCH_ENV_MARKER = "# omp relaunch file: ";
+
+/**
  * The entries Bun's own `.env` loading gave this process before any JavaScript ran: those of
  * `process.env` as the process first saw it that the launch environment lacks or holds
  * otherwise, whatever rules and files Bun used (its mode, `bunfig.toml`, `BUN_OPTIONS`,
@@ -173,27 +182,49 @@ const RELAUNCH_ENV_FILE = "loaded.env";
 const RELAUNCH_ENV_STALE_MS = 10 * 60_000;
 
 /**
- * The directories a relaunch file's directory sits directly in: `TMPDIR` as the process was
- * started with it, then `/tmp`, each absolute and with no comma in its path (Bun splits an
- * `--env-file` at commas). They come from the launch environment, never from `os.tmpdir()`,
- * which follows a `TMPDIR` that omp's own `.env` loading sets later: the writer, a later
- * session's sweep and every relaunched process then name the same directories.
- * `bunRelaunchArgs` writes in the first that exists.
+ * Where a relaunch file may go, in order: `TMPDIR` as the process was started with it, then the
+ * fallback, `/tmp` (`PI_TEST_RELAUNCH_FALLBACK_DIR` from the launch environment names another,
+ * for tests). They come from the launch environment, never from `os.tmpdir()`, which follows
+ * a `TMPDIR` that omp's own `.env` loading sets later: the writer, a later session's sweep and
+ * every relaunched process then name the same directories. Each is either a usable base
+ * (absolute, with no comma in its path, as Bun splits an `--env-file` at commas) or the
+ * reason it is not.
  */
+function relaunchEnvBaseCandidates(): { dir: string; base?: string; problem?: string }[] {
+	const tmpdir = launchEnvValue("TMPDIR");
+	const fallback = launchEnvValue("PI_TEST_RELAUNCH_FALLBACK_DIR") || "/tmp";
+	const candidates: { dir: string; base?: string; problem?: string }[] = [];
+	for (const [label, dir] of [
+		["TMPDIR", tmpdir],
+		["fallback", fallback],
+	] as const) {
+		if (!dir) candidates.push({ dir: label, problem: "unset" });
+		else if (!path.isAbsolute(dir)) candidates.push({ dir, problem: "not an absolute path" });
+		else if (path.resolve(dir).includes(",")) candidates.push({ dir, problem: "holds a comma" });
+		else candidates.push({ dir, base: path.resolve(dir) });
+	}
+	return candidates;
+}
+
+/** The usable bases of {@link relaunchEnvBaseCandidates}, each once. */
 function relaunchEnvBases(): string[] {
 	const bases: string[] = [];
-	for (const dir of [launchEnvValue("TMPDIR"), "/tmp"]) {
-		if (!dir || !path.isAbsolute(dir)) continue;
-		const base = path.resolve(dir);
-		if (!base.includes(",") && !bases.includes(base)) bases.push(base);
-	}
+	for (const { base } of relaunchEnvBaseCandidates()) if (base && !bases.includes(base)) bases.push(base);
 	return bases;
+}
+
+/** The marker line a relaunch file at `file` holds, or undefined when its path cannot be one. */
+function relaunchEnvMarkerLine(file: string): string | undefined {
+	return file.includes("\n") || file.includes("\r") ? undefined : `${RELAUNCH_ENV_MARKER}${file}`;
 }
 
 /**
  * Remove the relaunch directory `dir` with its `loaded.env`, and nothing else: only a real
- * directory (not a link) of this user, named like one, that holds `loaded.env`, a real file,
- * and nothing besides. Any other directory stays whole.
+ * directory (not a link) of this user, named like one, that holds `loaded.env` and nothing
+ * besides, where the file names itself on a line of its own ({@link RELAUNCH_ENV_MARKER}), as
+ * every relaunch file omp writes does and no look-alike does. Any other directory stays whole.
+ * (`loaded.env` itself is read and unlinked, never written, so a link there changes nothing:
+ * unlinking it leaves its target.)
  */
 function removeRelaunchEnvDir(dir: string): void {
 	try {
@@ -203,34 +234,36 @@ function removeRelaunchEnvDir(dir: string): void {
 		const entries = fs.readdirSync(dir);
 		if (entries.length !== 1 || entries[0] !== RELAUNCH_ENV_FILE) return;
 		const file = path.join(dir, RELAUNCH_ENV_FILE);
-		if (!fs.lstatSync(file).isFile()) return;
+		const marker = relaunchEnvMarkerLine(file);
+		if (!marker || !fs.readFileSync(file, "utf8").split("\n").includes(marker)) return;
 		fs.unlinkSync(file);
 		fs.rmdirSync(dir);
 	} catch {
-		// Gone already, another user's, or not only ours: leave it.
+		// Gone already, another user's, not omp's, or not only ours: leave it.
 	}
 }
 
 /**
  * Remove the private relaunch file a command names (`--env-file=…/omp-bun-env-XXXXXX/
- * loaded.env`) with its directory, wherever the directory is (`removeRelaunchEnvDir` decides
- * whether it is one): for a start that failed, and by the new process as it starts, which may
- * see another temporary directory than its writer did (a fork pane's terminal, say).
+ * loaded.env`) with its directory, wherever it is, when it is one omp wrote
+ * (`removeRelaunchEnvDir`): for a start that failed, and by the new process as it starts,
+ * which may see another temporary directory than its writer did (a fork pane's terminal, say).
+ * A look-alike named in the arguments, or passed on by a failed `/restart` or `/fork`, stays.
  */
 export function discardBunRelaunchFile(args: readonly string[]): void {
 	for (const arg of args) {
 		if (!arg.startsWith("--env-file=")) continue;
-		const file = arg.slice("--env-file=".length);
+		const file = path.resolve(arg.slice("--env-file=".length));
 		if (path.basename(file) === RELAUNCH_ENV_FILE) removeRelaunchEnvDir(path.dirname(file));
 	}
 }
 
 /**
  * Remove this user's relaunch directories older than {@link RELAUNCH_ENV_STALE_MS} under the
- * bases: those of a new process that died before this module loaded, or of a fork pane that
- * never ran omp. Only a non-compiled omp on Linux writes them, so only such a session start
- * looks, on its main thread: not a worker thread, and not a subprocess worker, which starts
- * with `--no-env-file`.
+ * bases, each only when its file names itself: those of a new process that died before this
+ * module loaded, or of a fork pane that never ran omp. Only a non-compiled omp on Linux writes
+ * them, so only such a session start looks, on its main thread: not a worker thread, and not a
+ * subprocess worker, which starts with `--no-env-file`.
  */
 function sweepStaleRelaunchEnvDirs(): void {
 	if (process.platform !== "linux" || isCompiledBinary() || process.execArgv.includes("--no-env-file")) return;
@@ -444,16 +477,19 @@ export function bunRelaunchValue(name: string): string | undefined {
  * session): `execvp(3)`, which `/restart` uses, and a terminal that starts a fork pass the
  * environment the process was started with, which those values are not in. The values, never
  * the whole environment (a fork leaves things out on purpose), go to a private file, mode 0600
- * in a directory of mode 0700 directly under `TMPDIR` as the process was started with it, else
- * `/tmp` (`relaunchEnvBases`), with no fallback when the write fails;
- * the flag names only it, so Bun loads no other `.env` file, and the new process removes it as
- * soon as this module loads (`discardBunRelaunchFile` removes it when the start fails, and a
- * later start removes one left older than ten minutes). An entry Bun's parser cannot read back
- * (see `BUN_DOTENV_NAME_RE`, `quoteDotenvValue`) is left out. `--no-env-file` when Bun loaded
- * nothing, or when the file cannot be written. No flag at all where the launch environment
- * cannot be read (a non-compiled omp on macOS or Windows started with Bun's loading on): the
- * relaunch is then the command it was before, and Bun loads the `.env` files of the directory
- * the new process starts in.
+ * in a `mkdtemp` directory of mode 0700, with a line naming the file itself
+ * (`RELAUNCH_ENV_MARKER`), directly under `TMPDIR` as the process was started with it; where
+ * that is unset, missing, not absolute, or cannot be written, under `/tmp`
+ * (`relaunchEnvBaseCandidates`). The flag names only it, so Bun loads no other `.env` file,
+ * and the new process removes it as soon as this module loads (`discardBunRelaunchFile`
+ * removes it when the start fails, and a later start removes one left older than ten
+ * minutes). An entry Bun's parser cannot read back (see `BUN_DOTENV_NAME_RE`,
+ * `quoteDotenvValue`) is left out. `--no-env-file` when Bun loaded nothing, or, with a logged
+ * warning that names each reason, when no base takes the file: the new process then starts
+ * without those values. No flag at all where the launch environment cannot be read (a
+ * non-compiled omp on macOS or Windows started with Bun's loading on): the relaunch is then the
+ * command it was before, and Bun loads the `.env` files of the directory the new process
+ * starts in.
  */
 export function bunRelaunchArgs(): string[] {
 	if (!bunLoadedEnv) return [];
@@ -463,18 +499,40 @@ export function bunRelaunchArgs(): string[] {
 		if (line !== undefined) lines.push(line);
 	}
 	if (lines.length === 0) return ["--no-env-file"];
-	const base = relaunchEnvBases().find(dir => fs.existsSync(dir));
-	if (!base) return ["--no-env-file"];
-	let dir: string | undefined;
-	try {
-		dir = fs.mkdtempSync(path.join(base, "omp-bun-env-"));
-		const file = path.join(dir, RELAUNCH_ENV_FILE);
-		fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600, flag: "wx" });
-		return [`--env-file=${file}`];
-	} catch {
-		if (dir) removeRelaunchEnvDir(dir);
-		return ["--no-env-file"];
+	const reasons: string[] = [];
+	const tried: string[] = [];
+	for (const { dir: named, base, problem } of relaunchEnvBaseCandidates()) {
+		if (!base) {
+			reasons.push(`${named}: ${problem}`);
+			continue;
+		}
+		// `TMPDIR` may be `/tmp` itself: one attempt there.
+		if (tried.includes(base)) continue;
+		tried.push(base);
+		let dir: string | undefined;
+		try {
+			dir = fs.mkdtempSync(path.join(base, "omp-bun-env-"));
+			const file = path.join(dir, RELAUNCH_ENV_FILE);
+			const marker = relaunchEnvMarkerLine(file);
+			if (!marker) throw new Error("its path cannot be written on one line");
+			fs.writeFileSync(file, `${[marker, ...lines].join("\n")}\n`, { mode: 0o600, flag: "wx" });
+			return [`--env-file=${file}`];
+		} catch (error) {
+			reasons.push(`${base}: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}`);
+			if (dir) {
+				// Our own directory, made a moment ago: remove whatever the failed write left, never
+				// recursively. A removal that fails leaves it to the sweep; the next base is tried.
+				try {
+					fs.rmSync(path.join(dir, RELAUNCH_ENV_FILE), { force: true });
+					fs.rmdirSync(dir);
+				} catch {}
+			}
+		}
 	}
+	logger.warn("The relaunch starts without the values Bun loaded from .env files: no relaunch file could be written", {
+		reasons,
+	});
+	return ["--no-env-file"];
 }
 
 /**

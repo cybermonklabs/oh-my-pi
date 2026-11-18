@@ -169,11 +169,11 @@ describe("InteractiveMode restart", () => {
 		expect(await Bun.file(file).exists()).toBe(false);
 	});
 
-	/** A relaunch file as `bunRelaunchArgs` writes it: `<tmp>/omp-bun-env-XXXXXX/loaded.env`. */
+	/** A relaunch file as `bunRelaunchArgs` writes it: `<tmp>/omp-bun-env-XXXXXX/loaded.env`, naming itself. */
 	async function relaunchFile(): Promise<{ dir: string; file: string }> {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
 		const file = path.join(dir, "loaded.env");
-		await Bun.write(file, "LOADED='value'\n");
+		await Bun.write(file, `# omp relaunch file: ${file}\nLOADED='value'\n`);
 		return { dir, file };
 	}
 
