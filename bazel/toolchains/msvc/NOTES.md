@@ -117,8 +117,8 @@ exec hosts. Replaces cargo-xwin.
 2. LLVM 20.1.7 Linux-X64 binaries are built on a newish Ubuntu: confirm the
    CI runner template's glibc is ≥ 2.35-ish and has `libtinfo6`/`libstdc++6`
    (usual LLVM release-binary runtime deps).
-3. `ninja` + `cmake` must be on the `opusic-sys` build-script PATH
-   (`/usr/local/bin:/usr/bin:/bin`) on the CI runner template.
+3. `ninja` + `cmake` come from `@cmake_ninja` (`bazel/toolchains/cmake.bzl`),
+   first on the `opusic-sys` build-script PATH, on every exec host.
 4. `opusic-sys` configure should report "Clang with MSVC-like command-line",
    take `toolchain.cmake`, and produce `opus.lib` with `/MT` objects.
 5. tree-sitter grammar compiles via cc-rs: wrapper is picked up as `CC`

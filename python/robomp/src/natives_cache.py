@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from robomp.git_ops import _append_safe_directory
+
 log = logging.getLogger(__name__)
 
 
@@ -101,20 +103,15 @@ def target_triple() -> str:
 
 
 def _git_safe_directory_env(repo_dir: Path) -> dict[str, str]:
-    """Env overlay that whitelists ``repo_dir`` for git's safe.directory check.
+    """Env that whitelists ``repo_dir`` for git's safe.directory check.
 
-    The orchestrator runs as root but workspaces are owned by the slot UID
-    (see ``SandboxManager._chown_workspace``). Without this whitelist, every
-    git invocation from the orchestrator on a slot-owned repo aborts with
-    "fatal: detected dubious ownership". Mirrors
-    ``robomp.sandbox._safe_directory_env`` but kept local to avoid a circular
-    import (sandbox imports this module).
+    robomp runs as root but workspaces are owned by the slot UID (see
+    ``SandboxManager._chown_workspace``). Without this whitelist, every git
+    command robomp runs on a slot-owned repo aborts with "fatal: detected
+    dubious ownership".
     """
     env = os.environ.copy()
-    count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
-    env[f"GIT_CONFIG_VALUE_{count}"] = str(repo_dir)
-    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    _append_safe_directory(env, repo_dir)
     return env
 
 

@@ -157,11 +157,16 @@ describe("jfind readText", () => {
 			await Bun.write(path.join(dir, "bin.dat"), new Uint8Array([0x41, 0x00, 0x42]));
 			await Bun.write(path.join(dir, "text.txt"), "first line\nsecond line\nthird");
 			const filesystem = urlFs(dir);
-			await expect(readText(filesystem, path.join(dir, "bin.dat"), 100)).rejects.toBeInstanceOf(ReadTextError);
-			const read = await readText(filesystem, path.join(dir, "text.txt"), 16);
-			expect(read).toEqual({ text: "first line\n", bytes: 11, truncated: true });
-			const whole = await readText(filesystem, path.join(dir, "text.txt"), 100);
-			expect(whole.truncated).toBe(false);
+			// Through the filesystem, and below a walked host root.
+			for (const root of [undefined, dir]) {
+				const file = (rel: string) => ({ path: path.join(dir, rel), rel, root });
+				await expect(readText(filesystem, file("bin.dat"), 100)).rejects.toBeInstanceOf(ReadTextError);
+				const read = await readText(filesystem, file("text.txt"), 16);
+				expect(read).toEqual({ text: "first line\n", bytes: 11, truncated: true });
+				const whole = await readText(filesystem, file("text.txt"), 100);
+				expect(whole.truncated).toBe(false);
+				expect(whole.text).toBe("first line\nsecond line\nthird");
+			}
 		} finally {
 			await removeWithRetries(dir);
 		}

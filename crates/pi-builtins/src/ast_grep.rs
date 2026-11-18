@@ -770,7 +770,10 @@ impl AstGrep {
 					found
 						.into_iter()
 						.filter(|candidate| self.lang.is_none_or(|lang| SupportLang::from_path(&candidate.path) == Some(lang)))
-						.map(|candidate| Candidate { display: display_path(operand, root_is_dir, &candidate), ..candidate }),
+						.map(|mut candidate| {
+							candidate.display = display_path(operand, root_is_dir, &candidate);
+							candidate
+						}),
 				),
 				Err(SearchError::Stopped) => return Err(1),
 				Err(SearchError::Root { error, .. }) => {
