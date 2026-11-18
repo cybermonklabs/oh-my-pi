@@ -192,17 +192,12 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
  * each text once. A loaded transcript's reports, and those before a reused recall's new one.
  */
 export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): RecallChangesReport[] {
-	let start = 0;
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (
-			entry.type === "reset_boundary" ||
-			(entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE)
-		) {
-			start = index + 1;
-			break;
-		}
-	}
+	const start =
+		branch.findLastIndex(
+			entry =>
+				entry.type === "reset_boundary" ||
+				(entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE),
+		) + 1;
 	const reports: RecallChangesReport[] = [];
 	const seen = new Set<string>();
 	for (let index = start; index < branch.length; index++) {

@@ -14,7 +14,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
-	GATEWAY,
+	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
 	mockGatewayFetch,
@@ -22,18 +22,7 @@ import {
 import { ONE_PIXEL_PNG } from "./helpers/skill-image-vision";
 
 /** The gateway's claude-opus-5-5 on a host that takes four images per request. */
-const MODELS_YML = `providers:
-  anthropic:
-    baseUrl: ${GATEWAY}
-    api: anthropic-messages
-    auth: apiKey
-    apiKey: gateway-test-key
-    compat:
-      replayUnsignedThinking: false
-      supportsLongCacheRetention: true
-    models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], imageCountBudget: 4, contextWindow: 1000000, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
-`;
+const MODELS_YML = gatewayModelsYml(1_000_000, 4);
 
 /** A prompt and the images it attaches. */
 interface Turn {

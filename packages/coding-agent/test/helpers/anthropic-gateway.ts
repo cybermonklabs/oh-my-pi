@@ -7,8 +7,12 @@ import { asGlobalFetch } from "./fetch-mock";
 /** An Anthropic gateway reached on a `.local` host, configured as a deployment's `models.yml` declares it. */
 export const GATEWAY = "http://gateway.test.local:4000";
 
-/** The gateway's `models.yml`: claude-opus-5-5 on its card, with a `contextWindow`-token window. */
-export function gatewayModelsYml(contextWindow = 1_000_000): string {
+/**
+ * The gateway's `models.yml`: claude-opus-5-5 on its card, with a `contextWindow`-token window, and a host that takes
+ * `imageCountBudget` images per request where one is given.
+ */
+export function gatewayModelsYml(contextWindow = 1_000_000, imageCountBudget?: number): string {
+	const imageBudget = imageCountBudget === undefined ? "" : ` imageCountBudget: ${imageCountBudget},`;
 	return `providers:
   anthropic:
     baseUrl: ${GATEWAY}
@@ -19,7 +23,7 @@ export function gatewayModelsYml(contextWindow = 1_000_000): string {
       replayUnsignedThinking: false
       supportsLongCacheRetention: true
     models:
-      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image], contextWindow: ${contextWindow}, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
+      - {id: claude-opus-5-5, name: Claude Opus 5.5, reasoning: true, input: [text, image],${imageBudget} contextWindow: ${contextWindow}, maxTokens: 128000, cost: {input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5}}
 `;
 }
 
@@ -123,6 +127,11 @@ export function textOf(value: unknown): string {
 /** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
 export function withoutCacheControl(value: unknown): string {
 	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
+}
+
+/** How many times `value`, without its cache breakpoints, carries `text`. */
+export function copiesIn(value: unknown, text: string): number {
+	return withoutCacheControl(value).split(text).length - 1;
 }
 
 /**

@@ -21,20 +21,14 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
+	copiesIn,
 	gatewayModelsYml,
 	gatewaySessionOptions,
-	type MessagesRequest,
 	mockGatewayFetch,
-	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
 const PLAN_MARKER = "APPROVED-PLAN-MIGRATE-THE-WORKERS";
 const PLAN_URL = "local://approved-plan.md";
-
-/** How many times `request`'s messages carry the plan. */
-function planCopies(request: MessagesRequest): number {
-	return withoutCacheControl(request.messages).split(PLAN_MARKER).length - 1;
-}
 
 /** Where `sessionManager`'s session keeps the approved plan. */
 function planFile(sessionManager: SessionManager): string {
@@ -81,8 +75,8 @@ describe("approved plan reference after a /tree move", () => {
 			await session.prompt("Continue.");
 			const [first, second] = requests;
 			if (!first || !second) throw new Error("Expected the first two prompts' requests");
-			expect(planCopies(first)).toBe(1);
-			expect(planCopies(second)).toBe(1);
+			expect(copiesIn(first.messages, PLAN_MARKER)).toBe(1);
+			expect(copiesIn(second.messages, PLAN_MARKER)).toBe(1);
 			const firstReply = sessionManager
 				.getBranch()
 				.find(entry => entry.type === "message" && entry.message.role === "assistant");
@@ -93,14 +87,14 @@ describe("approved plan reference after a /tree move", () => {
 			await session.prompt("Start over on the plan.");
 			const third = requests[2];
 			if (!third) throw new Error("Expected the third prompt's request");
-			expect(planCopies(third)).toBe(1);
+			expect(copiesIn(third.messages, PLAN_MARKER)).toBe(1);
 
 			// Forward to the first reply: the branch carries the reference the first prompt sent.
 			await session.navigateTree(firstReply.id);
 			await session.prompt("Pick up from the first reply.");
 			const fourth = requests[3];
 			if (!fourth) throw new Error("Expected the fourth prompt's request");
-			expect(planCopies(fourth)).toBe(1);
+			expect(copiesIn(fourth.messages, PLAN_MARKER)).toBe(1);
 			expect(continuesCachedPrompt(first, fourth)).toBe(true);
 		} finally {
 			await session.dispose();

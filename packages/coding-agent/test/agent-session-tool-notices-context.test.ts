@@ -16,6 +16,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
+	copiesIn,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
@@ -56,11 +57,6 @@ const CASES: NoticeCase[] = [
 		marker: "- xd://mcp__docs_lookup —",
 	},
 ];
-
-/** How many times `request`'s messages carry `text`. */
-function copies(request: MessagesRequest, text: string): number {
-	return withoutCacheControl(request.messages).split(text).length - 1;
-}
 
 /**
  * Opens a session on the gateway's claude-opus-5-5 with `read` and `bash`, whose prompt binds once it answered,
@@ -130,7 +126,7 @@ describe("tool-roster and xd:// mount notices a request's context lacks", () => 
 				if (!first || !second) throw new Error("Expected two requests");
 				// The reply bound the startup prompt: the change is announced, and the prompt keeps its bytes.
 				expect(withoutCacheControl(second.system)).toBe(withoutCacheControl(first.system));
-				expect(copies(second, marker)).toBe(1);
+				expect(copiesIn(second.messages, marker)).toBe(1);
 			} finally {
 				await close();
 			}
@@ -164,17 +160,17 @@ describe("tool-roster and xd:// mount notices a request's context lacks", () => 
 
 				const [first, second, third, fourth, fifth] = requests;
 				if (!first || !second || !third || !fourth || !fifth) throw new Error("Expected five requests");
-				expect(copies(second, marker)).toBe(1);
-				expect(copies(third, marker)).toBe(1);
+				expect(copiesIn(second.messages, marker)).toBe(1);
+				expect(copiesIn(third.messages, marker)).toBe(1);
 				expect(continuesCachedPrompt(second, third)).toBe(true);
-				expect(copies(fourth, marker)).toBe(1);
+				expect(copiesIn(fourth.messages, marker)).toBe(1);
 				// The bound prompt keeps its bytes, and the branch's history goes out as the first request sent it.
 				expect(withoutCacheControl(fourth.system)).toBe(withoutCacheControl(first.system));
 				expect(withoutCacheControl(fourth.tools)).toBe(withoutCacheControl(third.tools));
 				expect(withoutCacheControl(fourth.messages.slice(0, first.messages.length))).toBe(
 					withoutCacheControl(first.messages),
 				);
-				expect(copies(fifth, marker)).toBe(1);
+				expect(copiesIn(fifth.messages, marker)).toBe(1);
 				expect(continuesCachedPrompt(fourth, fifth)).toBe(true);
 			} finally {
 				await close();
@@ -228,11 +224,11 @@ describe("tool-roster and xd:// mount notices a request's context lacks", () => 
 
 				const [, second, third] = requests;
 				if (!second || !third) throw new Error("Expected the second and third prompts' requests");
-				expect(copies(second, marker)).toBe(1);
+				expect(copiesIn(second.messages, marker)).toBe(1);
 				expect(continuesCachedPrompt(second, third)).toBe(true);
-				expect(copies(afterTool, marker)).toBe(1);
+				expect(copiesIn(afterTool.messages, marker)).toBe(1);
 				// The request after carries the notice it was sent once, after the content it follows.
-				expect(copies(next, marker)).toBe(1);
+				expect(copiesIn(next.messages, marker)).toBe(1);
 				expect(continuesCachedPrompt(afterTool, next)).toBe(true);
 			} finally {
 				await close();

@@ -22,6 +22,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
 	continuesCachedPrompt,
+	copiesIn,
 	gatewayModelsYml,
 	gatewaySessionOptions,
 	type MessagesRequest,
@@ -99,7 +100,7 @@ function changedRecallBackend(): MemoryBackend {
 
 /** How many times `request` carries `text`, system prompt and messages together. */
 function copies(request: MessagesRequest, text: string): number {
-	return withoutCacheControl({ system: request.system, messages: request.messages }).split(text).length - 1;
+	return copiesIn({ system: request.system, messages: request.messages }, text);
 }
 
 /** Steps a run takes around its prompts, each given the session and its settings. */

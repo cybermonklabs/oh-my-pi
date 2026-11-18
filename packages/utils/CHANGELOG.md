@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `isStringList()`, a type guard for an array whose every item is a string
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

@@ -2,7 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Agent, AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Model, Tool } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
-import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	isRecord,
+	isStringList,
+	logger,
+	prompt,
+	stringProperty,
+	structuredCloneJSON,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
@@ -557,10 +565,6 @@ function scanNewestRecord(
 		if (value !== null) return { branch, scanned: branch.length, value };
 	}
 	return { branch, scanned: branch.length, value: undefined };
-}
-
-function isStringList(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every(item => typeof item === "string");
 }
 
 /**

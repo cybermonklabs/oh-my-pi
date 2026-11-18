@@ -13,19 +13,14 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
+	copiesIn,
 	gatewayModelsYml,
 	gatewaySessionOptions,
-	type MessagesRequest,
 	mockGatewayFetch,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
 const NOTICE = "No longer available: bash";
-
-/** How many times `request`'s messages carry `text`. */
-function copies(request: MessagesRequest, text: string): number {
-	return withoutCacheControl(request.messages).split(text).length - 1;
-}
 
 describe("a session switch that fails after it rebuilt the prompt", () => {
 	afterEach(() => {
@@ -76,7 +71,7 @@ describe("a session switch that fails after it rebuilt the prompt", () => {
 			if (!first || !second) throw new Error("Expected two requests");
 			// The previous prompt is back, still listing bash, and the request tells the model bash is gone.
 			expect(withoutCacheControl(second.system)).toBe(withoutCacheControl(first.system));
-			expect(copies(second, NOTICE)).toBe(1);
+			expect(copiesIn(second.messages, NOTICE)).toBe(1);
 		} finally {
 			await session.dispose();
 			authStorage.close();

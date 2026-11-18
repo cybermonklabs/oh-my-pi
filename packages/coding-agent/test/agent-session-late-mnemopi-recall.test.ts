@@ -18,9 +18,9 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
 	answer,
+	copiesIn,
 	GATEWAY,
 	gatewaySessionOptions,
-	type MessagesRequest,
 	mockGatewayFetch,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
@@ -45,11 +45,6 @@ function twoModelsYml(): string {
       - {id: claude-opus-5-5, name: Claude Opus 5.5, ${card}, ${cost}}
       - {id: claude-opus-5, name: Claude Opus 5, ${card}, ${cost}}
 `;
-}
-
-/** How many times `request` carries `text`, system prompt and messages together. */
-function copies(request: MessagesRequest, text: string): number {
-	return withoutCacheControl({ system: request.system, messages: request.messages }).split(text).length - 1;
 }
 
 afterEach(() => {
@@ -126,7 +121,7 @@ it("keeps a late Mnemopi recall out of a system prompt rebuilt after its token b
 		const rebuilt = requests.at(-1);
 		if (requests.length !== 4 || !rebuilt) throw new Error("Expected four requests");
 		expect(withoutCacheControl(rebuilt.system)).not.toContain(RECALL_OPENING);
-		expect(copies(rebuilt, RECALL_OPENING)).toBe(1);
+		expect(copiesIn({ system: rebuilt.system, messages: rebuilt.messages }, RECALL_OPENING)).toBe(1);
 	} finally {
 		await session.dispose();
 		authStorage.close();

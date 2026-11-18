@@ -17,7 +17,7 @@ import { decodeDataUri } from "@oh-my-pi/pi-ai/providers/openai-data-uri";
 import { resolveFactoryDroidPolicy } from "@oh-my-pi/pi-catalog/compat/factory-droid";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { resolveInlineImageByteBudget, resolveRequestBodyByteLimit } from "@oh-my-pi/pi-catalog/compat/request-size";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, isStringList } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { capFrameDataBytes, frameDataBytesBudget, providerImageBudget } from "@oh-my-pi/snapcompact";
 import { supportsRemoteImageUrls } from "../blob-broker/context-images";
@@ -353,6 +353,23 @@ function oldestImageTurn(context: Context, metadataWire: boolean): string | unde
 	return message && turnOf(message);
 }
 
+/**
+ * The oldest turn ({@link turnOf}) `context` carries, assistant turns aside, that `lookup` knows, with what it knows
+ * of it; `lookup` is asked of each turn in order until one is known.
+ */
+function oldestKnownTurn<T>(
+	context: Context,
+	lookup: (turn: string) => T | undefined,
+): { turn: string; value: T } | undefined {
+	for (const message of context.messages) {
+		if (message.role === "assistant") continue;
+		const turn = turnOf(message);
+		const value = lookup(turn);
+		if (value) return { turn, value };
+	}
+	return undefined;
+}
+
 /** The images a conversation's count clamp dropped, for the image budget it dropped them for. */
 interface StickyImageDrop {
 	budget: number;
@@ -371,7 +388,7 @@ const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
 export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", before: Context, after: Context) => void;
 
 /** Custom session entry holding a conversation's count-clamp drops as a forced drop left them. */
-export const IMAGE_DROP_ENTRY_TYPE = "provider-image-drop";
+const IMAGE_DROP_ENTRY_TYPE = "provider-image-drop";
 
 /** A conversation's count-clamp drops as a forced drop left them. */
 export interface RecordedImageDrop {
@@ -396,8 +413,7 @@ function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { versi
 		data.version === 1 &&
 		typeof data.turn === "string" &&
 		typeof data.budget === "number" &&
-		Array.isArray(data.dropped) &&
-		data.dropped.every(key => typeof key === "string")
+		isStringList(data.dropped)
 	);
 }
 
@@ -486,13 +502,8 @@ export class ProviderImageClamp {
 	 */
 	#conversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
 		if (this.#drops.size === 0) return undefined;
-		for (const message of context.messages) {
-			if (message.role === "assistant") continue;
-			const turn = turnOf(message);
-			const drop = this.#drops.get(turn);
-			if (drop) return { turn, drop };
-		}
-		return undefined;
+		const known = oldestKnownTurn(context, turn => this.#drops.get(turn));
+		return known && { turn: known.turn, drop: known.value };
 	}
 
 	/**
@@ -504,15 +515,11 @@ export class ProviderImageClamp {
 		const recorded = new Map<string, RecordedImageDrop>();
 		for (const drop of this.#record.read()) recorded.set(drop.turn, drop);
 		if (recorded.size === 0) return undefined;
-		for (const message of context.messages) {
-			if (message.role === "assistant") continue;
-			const found = recorded.get(turnOf(message));
-			if (!found) continue;
-			const drop = { budget: found.budget, dropped: new Set(found.dropped) };
-			this.#drops.set(found.turn, drop);
-			return { turn: found.turn, drop };
-		}
-		return undefined;
+		const known = oldestKnownTurn(context, turn => recorded.get(turn));
+		if (!known) return undefined;
+		const drop = { budget: known.value.budget, dropped: new Set(known.value.dropped) };
+		this.#drops.set(known.turn, drop);
+		return { turn: known.turn, drop };
 	}
 
 	/**
@@ -524,14 +531,17 @@ export class ProviderImageClamp {
 		if (!model.input.includes("image")) return context;
 		const metadataWire = sendsComputerScreenshotMetadata(model);
 		const budget = providerImageBudget(model);
+		// Whether the images pass the budget, where it was counted for a conversation the clamp does not remember.
+		let overBudget: boolean | undefined;
 		let conversation = this.#conversationOf(context);
 		if (!conversation) {
-			if (countImages(context, metadataWire) <= budget) return context;
+			overBudget = countImages(context, metadataWire) > budget;
+			if (!overBudget) return context;
 			// A resumed conversation drops again what the previous process dropped.
 			conversation = this.#recordedConversationOf(context);
 		}
 		const state = conversation?.drop.budget === budget ? conversation.drop : undefined;
-		if (!state && countImages(context, metadataWire) <= budget) return context;
+		if (!state && !(overBudget ?? countImages(context, metadataWire) > budget)) return context;
 		const dropped = state?.dropped ?? new Set<string>();
 		const names = [...imageKeys(context, metadataWire)];
 		let sent = 0;
