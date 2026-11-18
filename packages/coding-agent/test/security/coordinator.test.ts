@@ -14,6 +14,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $ } from "bun";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
 import {
 	createNativeSecurityProvenance,
 	DEFAULT_SECURITY_GIT_ADAPTER,
@@ -22,6 +24,7 @@ import {
 	type SecurityScanBundle,
 	SecurityStore,
 } from "../../src/security";
+import type { AgentSession } from "../../src/session/agent-session";
 import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { SessionManager } from "../../src/session/session-manager";
 
@@ -136,6 +139,47 @@ function coordinatorWithMockSession(responses: MockResponseSource, handler?: Moc
 	return { coordinator, mock };
 }
 
+/**
+ * A scan whose coordinator delegates to a security-reviewer worker, ends its turn while the
+ * worker runs as a background job, and publishes once the worker's result is delivered.
+ */
+const reviewerScanHandler: MockHandler = context => {
+	if (context.tools?.some(tool => tool.name === "yield")) {
+		return {
+			delayMs: 200,
+			content: [
+				{
+					type: "toolCall",
+					name: "yield",
+					arguments: { type: "result", data: { coverage_summary: "Reviewed src/app.ts" } },
+				},
+			],
+		};
+	}
+	const toolResults = context.messages.filter(message => message.role === "toolResult");
+	if (toolResults.some(message => message.toolName === "security_publish")) {
+		return { content: ["Security publication completed."] };
+	}
+	if (!toolResults.some(message => message.toolName === "task")) {
+		return {
+			content: [
+				{
+					type: "toolCall",
+					name: "task",
+					arguments: {
+						context: "Review the fixture repository.",
+						tasks: [{ task: "Review src/app.ts", solutionSpace: "open" }],
+					},
+				},
+			],
+		};
+	}
+	if (context.messages.at(-1)?.role === "toolResult") {
+		return { content: ["Waiting for the security-reviewer result."] };
+	}
+	return { content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] };
+};
+
 describe("native security coordinator", () => {
 	test("preflight accepts provider-owned Bedrock auth without an OAuth row", async () => {
 		const bedrockModel = getBundledModel("amazon-bedrock", "us.anthropic.claude-opus-4-8");
@@ -178,46 +222,61 @@ describe("native security coordinator", () => {
 	test("waits for background security-reviewer workers before ending the scan", async () => {
 		// Coordinator delegates, ends its turn while the worker runs as a background
 		// job, and publishes only once the worker's result is delivered back.
-		const { coordinator, mock } = coordinatorWithMockSession([], context => {
-			if (context.tools?.some(tool => tool.name === "yield")) {
-				return {
-					delayMs: 200,
-					content: [
-						{
-							type: "toolCall",
-							name: "yield",
-							arguments: { type: "result", data: { coverage_summary: "Reviewed src/app.ts" } },
-						},
-					],
-				};
-			}
-			const toolResults = context.messages.filter(message => message.role === "toolResult");
-			if (toolResults.some(message => message.toolName === "security_publish")) {
-				return { content: ["Security publication completed."] };
-			}
-			if (!toolResults.some(message => message.toolName === "task")) {
-				return {
-					content: [
-						{
-							type: "toolCall",
-							name: "task",
-							arguments: {
-								context: "Review the fixture repository.",
-								tasks: [{ task: "Review src/app.ts", solutionSpace: "open" }],
-							},
-						},
-					],
-				};
-			}
-			if (context.messages.at(-1)?.role === "toolResult") {
-				return { content: ["Waiting for the security-reviewer result."] };
-			}
-			return { content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] };
-		});
+		const { coordinator, mock } = coordinatorWithMockSession([], reviewerScanHandler);
 		const plan = await coordinator.preflight({ credentialId, model: mock.model });
 		const started = await coordinator.start({ planId: plan.id });
 		const terminal = await coordinator.wait(started.operationId);
 		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
+	});
+
+	test("ends only the agents the scan spawned, leaving the host session's subagents and agent lifecycle", async () => {
+		// If this regresses, the scan session's end tears down the process-global agent lifecycle as the host's own end
+		// does: it releases the host session's adopted subagents while the host goes on, and replaces the lifecycle,
+		// whose next owner has no reviver for the host's parked subagents.
+		const lifecycle = AgentLifecycleManager.global();
+		const registry = AgentRegistry.global();
+		let hostSubDisposals = 0;
+		const hostSub = {
+			dispose: async () => {
+				hostSubDisposals++;
+			},
+		} as unknown as AgentSession;
+		const hostRef = registry.register({
+			id: "Host-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: hostSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Host-Sub", { idleTtlMs: 0 }, hostRef);
+		const adopt = vi.spyOn(lifecycle, "adopt");
+		const registered: AgentRef[] = [];
+		const unsubscribe = registry.onChange(event => {
+			if (event.type === "registered") registered.push(event.ref);
+		});
+		try {
+			const { coordinator, mock } = coordinatorWithMockSession([], reviewerScanHandler);
+			const plan = await coordinator.preflight({ credentialId, model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			expect(await coordinator.wait(started.operationId)).toMatchObject({ phase: "completed" });
+
+			expect(registry.get("Host-Sub")).toBe(hostRef);
+			expect(hostRef.session).toBe(hostSub);
+			expect(hostSubDisposals).toBe(0);
+			expect(AgentLifecycleManager.global()).toBe(lifecycle);
+			expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
+			// The security-reviewer agents the scan adopted are released with it.
+			const scanAgentId = registered.find(ref => ref.kind === "main" && ref.displayName === "security")?.id;
+			if (!scanAgentId) throw new Error("Expected the scan session to register its own agent");
+			const reviewers = registered.filter(ref => ref.parentId === scanAgentId).map(ref => ref.id);
+			expect(reviewers).not.toEqual([]);
+			expect(adopt.mock.calls.map(([id]) => id)).toEqual(expect.arrayContaining(reviewers));
+			for (const id of reviewers) expect(registry.get(id)).toBeUndefined();
+		} finally {
+			unsubscribe();
+			await AgentLifecycleManager.global().release("Host-Sub", hostRef);
+		}
 	});
 
 	test("records a terminal failure when initial scan persistence fails", async () => {

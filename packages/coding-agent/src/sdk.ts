@@ -5558,10 +5558,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// AgentSession.dispose() would otherwise set its guards.
 					session.beginDispose();
 					if (agentKind === "main") {
-						// Top-level teardown owns the global agent lifecycle: park timers,
-						// adopted subagent sessions, revivers. Tear it down while shared
-						// resources (kernels, MCP, LSP) are still live. Subagent disposal
-						// must NOT touch the global lifecycle.
+						// A top-level session that binds process state owns the global agent lifecycle:
+						// park timers, adopted subagent sessions, revivers. Tear it down while shared
+						// resources (kernels, MCP, LSP) are still live. A helper session (`bindProcessState:
+						// false`) ends only the agents it spawned. Subagent disposal must NOT touch the
+						// global lifecycle.
 						const vibeRegistry = VibeSessionRegistry.global();
 						const vibeParentSession = {
 							getAgentId: () => resolvedAgentId,
@@ -5579,8 +5580,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							scopedAsyncJobManager,
 							"stop",
 						);
-						// Adopted agents end as this dispose says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
-						await AgentLifecycleManager.global().dispose({ ownedJobsEnd: disposeOptions?.ownedJobsEnd });
+						if (bindsProcessState) {
+							// Adopted agents end as this dispose says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+							await AgentLifecycleManager.global().dispose({ ownedJobsEnd: disposeOptions?.ownedJobsEnd });
+						} else {
+							// The host session and the process go on: the helper's own agents stop.
+							await AgentLifecycleManager.global().releaseUnder(resolvedAgentId, {
+								ownedJobsEnd: disposeOptions?.ownedJobsEnd ?? "stop",
+							});
+						}
 					}
 					await originalDispose(disposeOptions);
 				} finally {

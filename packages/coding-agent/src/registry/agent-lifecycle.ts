@@ -146,7 +146,7 @@ export interface AgentReleaseOptions {
 	dispose?: AgentSessionDisposeOptions;
 }
 
-/** How {@link AgentLifecycleApi.dispose} tears every adopted agent down. */
+/** How {@link AgentLifecycleApi.dispose} and {@link AgentLifecycleApi.releaseUnder} release adopted agents. */
 export interface AgentLifecycleDisposeOptions {
 	/** When the teardown stops waiting for a release; later ones go on as late cleanup. */
 	deadlineAt?: number;
@@ -179,6 +179,11 @@ export interface AgentLifecycleApi {
 	release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean>;
 	/** Tear down every adopted agent, as `options` says. */
 	dispose(options?: AgentLifecycleDisposeOptions): Promise<void>;
+	/**
+	 * Release, as {@link dispose} releases each, every adopted agent whose `parentId` chain
+	 * reaches `ancestorId`; the lifecycle and every other agent go on.
+	 */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void>;
 }
 
 export class AgentLifecycleManager implements AgentLifecycleApi {
@@ -721,12 +726,47 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * process serves others), as a park stops them.
 	 */
 	async dispose(options: AgentLifecycleDisposeOptions = {}): Promise<void> {
-		const deadlineAt = options.deadlineAt ?? Date.now() + AGENT_RELEASE_GRACE_MS;
-		const ownedJobsEnd = options.ownedJobsEnd ?? "shutdown";
 		this.#unsubscribe?.();
 		this.#disposed = true;
 		this.#unsubscribe = undefined;
-		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])];
+		await this.#releaseAll(options);
+		this.#revivals.clear();
+		this.#parks.clear();
+		this.#persistedReviverFactory = undefined;
+		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
+	}
+
+	/**
+	 * Release every adopted or parking agent whose `parentId` chain reaches `ancestorId`, each as
+	 * {@link dispose} releases it. A helper session (a `/security` scan) ends the agents it spawned
+	 * this way: the host session's agents, this manager and its revivers go on.
+	 */
+	async releaseUnder(ancestorId: string, options: AgentLifecycleDisposeOptions = {}): Promise<void> {
+		await this.#releaseAll(options, ancestorId);
+	}
+
+	/** Whether the registry's `parentId` chain from `id` reaches `ancestorId`. */
+	#descendsFrom(id: string, ancestorId: string): boolean {
+		const seen = new Set<string>();
+		let parentId = (this.#registry.get(id) ?? this.#adopted.get(id)?.ref ?? this.#parks.get(id)?.ref)?.parentId;
+		while (parentId !== undefined && !seen.has(parentId)) {
+			if (parentId === ancestorId) return true;
+			seen.add(parentId);
+			parentId = this.#registry.get(parentId)?.parentId;
+		}
+		return false;
+	}
+
+	/**
+	 * Release every adopted or parking agent (with `ancestorId`, only those under it) as `options`
+	 * says, waiting for each until the deadline; a release past it goes on as late cleanup.
+	 */
+	async #releaseAll(options: AgentLifecycleDisposeOptions, ancestorId?: string): Promise<void> {
+		const deadlineAt = options.deadlineAt ?? Date.now() + AGENT_RELEASE_GRACE_MS;
+		const ownedJobsEnd = options.ownedJobsEnd ?? "shutdown";
+		const ids = [...new Set([...this.#adopted.keys(), ...this.#parks.keys()])].filter(
+			id => ancestorId === undefined || this.#descendsFrom(id, ancestorId),
+		);
 		// At the process exit, the subagents of an agent's own jobs are parked, not stopped, so
 		// `omp --restore` goes on with them. A turn still running (a revived or woken agent) is
 		// cut off too: its session records a process exit, so `omp --restore` goes on with it. An
@@ -737,8 +777,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			ownedJobsEnd === "stop" ? idle : { dispose: { reason: postmortem.Reason.EXIT, ownedJobsEnd } };
 		await Promise.all(
 			ids.map(async id => {
-				const options = this.#registry.get(id)?.status === "running" ? running : idle;
-				const release = this.release(id, undefined, options).then(() => {});
+				const releaseOptions = this.#registry.get(id)?.status === "running" ? running : idle;
+				const release = this.release(id, undefined, releaseOptions).then(() => {});
 				try {
 					await untilAborted(AbortSignal.timeout(Math.max(0, deadlineAt - Date.now())), () => release);
 				} catch (error) {
@@ -752,10 +792,6 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 				}
 			}),
 		);
-		this.#revivals.clear();
-		this.#parks.clear();
-		this.#persistedReviverFactory = undefined;
-		if (AgentLifecycleManager.#global === this) AgentLifecycleManager.#global = undefined;
 	}
 
 	async #revive(id: string, revive: AgentReviver, ref: AgentRef, adopted: AdoptedAgent): Promise<AgentSessionHandle> {

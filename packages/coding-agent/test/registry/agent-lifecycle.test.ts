@@ -500,6 +500,31 @@ describe("AgentLifecycleManager", () => {
 		await flushAsync();
 	});
 
+	it("releases only the agents under an ancestor and goes on managing the rest", async () => {
+		// If this regresses, a helper session's end (a `/security` scan) releases agents it did not spawn, keeps its own
+		// subagents' subagents alive, or tears down the lifecycle the host session owns.
+		const child = makeSessionStub();
+		const grandchild = makeSessionStub();
+		const hostSub = makeSessionStub();
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		for (const [id, parentId, stub] of [
+			["Helper-Child", "Helper", child],
+			["Helper-Grandchild", "Helper-Child", grandchild],
+			["Host-Sub", MAIN_AGENT_ID, hostSub],
+		] as const) {
+			registry.register({ id, displayName: "task", kind: "sub", parentId, session: stub.session, status: "idle" });
+			lifecycle.adopt(id, { idleTtlMs: 0 });
+		}
+
+		await lifecycle.releaseUnder("Helper", { ownedJobsEnd: "stop" });
+
+		expect([child.disposeCalls(), grandchild.disposeCalls(), hostSub.disposeCalls()]).toEqual([1, 1, 0]);
+		expect(registry.get("Helper-Child")).toBeUndefined();
+		expect(registry.get("Helper-Grandchild")).toBeUndefined();
+		expect(lifecycle.has("Host-Sub")).toBe(true);
+		expect(AgentLifecycleManager.global()).toBe(lifecycle);
+	});
+
 	it("a delayed release cannot remove or mutate a replacement ref with the same id", async () => {
 		const gate = deferred();
 		const oldSession = makeSessionStub(() => gate.promise);

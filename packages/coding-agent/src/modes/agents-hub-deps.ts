@@ -165,6 +165,8 @@ export function createAgentsHubDeps(
 				contextFiles: [],
 				promptTemplates: [],
 				slashCommands: [],
+				// Its own agent id: under the host's `Main` id it would replace the host's registry ref.
+				agentId: `AgentGenerator-${Bun.randomUUIDv7().replaceAll("-", "").slice(-12)}`,
 				// A helper for the host session: the host keeps the process-wide effects and provider toggles.
 				bindProcessState: false,
 			});

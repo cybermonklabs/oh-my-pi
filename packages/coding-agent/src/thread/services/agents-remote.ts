@@ -228,6 +228,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	dispose(_options?: AgentLifecycleDisposeOptions): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
 	}
+
+	releaseUnder(_ancestorId: string, _options?: AgentLifecycleDisposeOptions): Promise<void> {
+		return Promise.reject(new Error("A helper session's agents are released by the main thread"));
+	}
 }
 
 /** Worker proxy of main's {@link IrcBusApi}. */
