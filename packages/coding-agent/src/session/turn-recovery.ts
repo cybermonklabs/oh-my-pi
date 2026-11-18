@@ -452,10 +452,11 @@ interface RetryModelFallbackOptions {
 	wrapAround?: boolean;
 	/**
 	 * This hop is a classifier-refusal walk. It gates only the refusal-credit
-	 * hold: while the refusal's fallback credit is live, the walk passes over a
-	 * same-provider Anthropic candidate that cannot redeem the credit, when the
-	 * latest assistant turn carries signed or redacted thinking, and records it
-	 * in the held entries that `#switchFromSpentFallback` searches last.
+	 * hold: while the refusal's fallback credit is live, the walk passes over an
+	 * Anthropic candidate on the latest assistant turn's provider, other than the
+	 * model that wrote that turn, that cannot redeem the credit, when that turn
+	 * carries signed or redacted thinking, and records it in the held entries
+	 * that `#switchFromSpentFallback` searches last.
 	 */
 	refusalWalk?: boolean;
 	/** The retry policy retries the failed model if this hop does not switch. */
