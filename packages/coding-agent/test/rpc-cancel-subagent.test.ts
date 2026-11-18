@@ -127,11 +127,15 @@ describe("handleRpcCancelSubagent", () => {
 	});
 
 	test("reports a failed tombstone write as an error while the abort is still settling", async () => {
-		// The tombstone sidecar lands next to the transcript; a missing directory
-		// makes the write fail with ENOENT. release() disposes the session after
-		// that failure and then rejects, so the abort stays pending until dispose
-		// ran plus one macrotask hop: the release rejection lands mid-abort.
-		const missingDirSessionFile = path.join(sessionDir, "missing", "SubagentA.jsonl");
+		// The tombstone sidecar lands next to the transcript, and its directory is
+		// created first (under `session.storage: sql` the transcript is a row, so
+		// that directory need not exist). A path component that is a regular file
+		// makes that creation fail with ENOTDIR. release() disposes the session
+		// after that failure and then rejects, so the abort stays pending until
+		// dispose ran plus one macrotask hop: the release rejection lands mid-abort.
+		const blocker = path.join(sessionDir, "blocked");
+		fs.writeFileSync(blocker, "");
+		const missingDirSessionFile = path.join(blocker, "sub", "SubagentA.jsonl");
 		emitLifecycle("SubagentA", "started", missingDirSessionFile);
 		const disposed = Promise.withResolvers<void>();
 		const nextMacrotask = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -157,7 +161,7 @@ describe("handleRpcCancelSubagent", () => {
 		const onUnhandled = (reason: unknown) => unhandled.push(reason);
 		process.on("unhandledRejection", onUnhandled);
 		try {
-			await expect(handleRpcCancelSubagent(registry, "SubagentA")).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(handleRpcCancelSubagent(registry, "SubagentA")).rejects.toMatchObject({ code: "ENOTDIR" });
 			await nextMacrotask();
 		} finally {
 			process.off("unhandledRejection", onUnhandled);

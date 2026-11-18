@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { postmortem } from "@oh-my-pi/pi-utils";
+import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -11,10 +11,22 @@ import { nativeWorkspace, runIsolatedSubprocess } from "@oh-my-pi/pi-coding-agen
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as natives from "@oh-my-pi/pi-natives";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { letRefusedReleaseRun } from "../helpers/release-race";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const tempRoots: string[] = [];
-/** Order of worktree captures and the run's IRC wake release. */
+/** Order of worktree captures, cleanups and branch commits, and of the run's IRC wake release. */
 let events: string[] = [];
+/** The parent whose end releases the agents of the release-race tests below. */
+const RELEASING_PARENT = "IsolationReleaseParent";
+const BASELINE = {
+	root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
+	nested: [],
+};
+/** The agent's work in its worktree, as a capture writes it. */
+const WORK_PATCH = "diff --git a/task.txt b/task.txt\n+work\n";
+/** A nested repo's part of the agent's work. */
+const NESTED_PATCH = "diff --git a/lib.txt b/lib.txt\n+nested\n";
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -40,6 +52,52 @@ function result(id: string): SingleResult {
 	};
 }
 
+function agentSession(dispose: () => Promise<void>): AgentSession {
+	return { ...createSessionDefaults(), dispose } as unknown as AgentSession;
+}
+
+/** The run's own `finalizeSubagentLifecycle` for a kept-alive isolated agent that finished its turn. */
+function finalizeFinished(id: string, session: AgentSession, onRelease?: () => Promise<void>): Promise<void> {
+	return executorModule.finalizeSubagentLifecycle({
+		id,
+		session,
+		aborted: false,
+		keepAlive: true,
+		isolated: true,
+		agentIdleTtlMs: 0,
+		reviveSession: async () => session,
+		onRelease,
+	});
+}
+
+/**
+ * Runs the kept-alive isolated agent `id` in `mergeMode`, its patch files written to `artifactsDir`, for a caller that
+ * takes the run's deferred cleanup over through `onCleanupDeferred` when given.
+ */
+function runIsolated(
+	id: string,
+	mergeMode: "patch" | "branch",
+	artifactsDir: string,
+	onCleanupDeferred?: (completion: Promise<void>) => void,
+): Promise<SingleResult> {
+	return runIsolatedSubprocess({
+		baseOptions: {
+			cwd: "/repo",
+			agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
+			task: "Do work",
+			index: 0,
+			id,
+			onCleanupDeferred,
+		},
+		context: { repoRoot: "/repo" },
+		openWorkspace: nativeWorkspace(undefined),
+		agentId: id,
+		mergeMode,
+		artifactsDir,
+		buildFailureResult: error => ({ ...result(id), exitCode: 1, error: String(error) }),
+	});
+}
+
 /**
  * Runs a kept-alive branch-mode isolated agent whose workspace delta is
  * `runEndPatch` when it finishes and `releasePatch` when it is released, and
@@ -53,28 +111,20 @@ async function commitsAcrossRelease(
 ): Promise<number> {
 	const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-"));
 	tempRoots.push(artifactsDir);
-	const baseline = {
-		root: { repoRoot: "/repo", headCommit: "base", staged: "", unstaged: "", untracked: [], untrackedPatch: "" },
-		nested: [],
-	};
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
 		mergedDir: "/repo/isolated",
 		backend: natives.IsoBackendKind.Rcopy,
 		fellBack: false,
 		fallbackReason: null,
 	});
-	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(baseline);
+	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(BASELINE);
 	vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(options.cleanup ?? (async () => {}));
 	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: releasePatch, nestedPatches: [] });
 	const commitSpy = vi.spyOn(worktreeModule, "commitToBranch").mockImplementation(async () => {
 		events.push("commit");
 		return { branchName: `omp/task/${id}`, baseSha: "base", rootPatch: runEndPatch, nestedPatches: [] };
 	});
-	const session = {
-		prepareForHeadlessAdvisorDrain: () => {},
-		waitForAdvisorCatchup: async () => true,
-		dispose: async () => {},
-	} as unknown as AgentSession;
+	const session = agentSession(async () => {});
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 		AgentRegistry.global().register({
 			id: options.id,
@@ -86,52 +136,154 @@ async function commitsAcrossRelease(
 		});
 		// A held peer message would wake a turn in the worktree once released.
 		options.deferIrcWakeRelease?.(() => events.push("irc wakes released"));
-		await executorModule.finalizeSubagentLifecycle({
-			id: options.id,
-			session,
-			aborted: false,
-			keepAlive: true,
-			isolated: true,
-			agentIdleTtlMs: 0,
-			reviveSession: async () => session,
-			onRelease: options.onRelease,
-		});
+		await finalizeFinished(options.id, session, options.onRelease);
 		return result(options.id);
 	});
 
-	await runIsolatedSubprocess({
-		baseOptions: {
-			cwd: "/repo",
-			agent: { name: "task", description: "Task agent", systemPrompt: "test", source: "bundled" },
-			task: "Do work",
-			index: 0,
-			id,
-		},
-		context: { repoRoot: "/repo" },
-		openWorkspace: nativeWorkspace(undefined),
-		agentId: id,
-		mergeMode: "branch",
-		artifactsDir,
-		buildFailureResult: error => ({ ...result(id), exitCode: 1, error: String(error) }),
-	});
+	await runIsolated(id, "branch", artifactsDir);
 	if (options.afterRun) await options.afterRun();
 	else await AgentLifecycleManager.global().release(id);
 	return commitSpy.mock.calls.length;
 }
 
-describe("isolated agent release", () => {
-	const patch = "diff --git a/task.txt b/task.txt\n+work\n";
+/**
+ * Runs a kept-alive isolated agent (patch mode unless `variant.mergeMode` says otherwise) under
+ * {@link RELEASING_PARENT} in a real worktree directory that holds its work in `task.txt`, beside a nested repo's
+ * fixed patch. A capture reads that file and the cleanup removes the directory, so a capture after the cleanup fails
+ * as git fails in a removed worktree; each capture, cleanup and task-branch commit (which commits the delta it is
+ * given, or throws `variant.commitError` when given) goes to {@link events}. The worktree reports `variant.backend`
+ * (Rcopy unless given). `finish` ends the run once its subagent is registered with `session`, given the release hook
+ * the run hands over; the run then succeeds, or with `variant.failed` fails, or with `variant.failedWithLateCleanup`
+ * fails and leaves that cleanup going on (`onCleanupDeferred`). With `variant.blockRootPatch`, a directory holds the
+ * place of `<id>.patch`, so no root patch can be written. Returns the run's result, the directory holding its worktree
+ * slot, its artifacts directory and worktree, how many captures and task-branch commits were tried so far, the first
+ * cleanup's end, and the last completion the run handed on (`onCleanupDeferred`), which its caller keeps, as
+ * `runStructuredSubagent` does.
+ */
+async function runInWorktree(
+	id: string,
+	session: AgentSession,
+	finish: (onRelease: () => Promise<void>) => Promise<void>,
+	variant: {
+		mergeMode?: "patch" | "branch";
+		commitError?: Error;
+		backend?: natives.IsoBackendKind;
+		failed?: boolean;
+		failedWithLateCleanup?: Promise<void>;
+		blockRootPatch?: boolean;
+	} = {},
+): Promise<{
+	settled: SingleResult;
+	root: string;
+	artifactsDir: string;
+	worktree: string;
+	captures: () => number;
+	commits: () => number;
+	cleanedUp: Promise<void>;
+	handedOn: () => Promise<void> | undefined;
+}> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-release-race-"));
+	tempRoots.push(root);
+	const slot = path.join(root, "slot");
+	const worktree = path.join(slot, "merged");
+	const artifactsDir = path.join(root, "artifacts");
+	await Bun.write(path.join(worktree, "task.txt"), "work\n");
+	await fs.mkdir(artifactsDir);
+	if (variant.blockRootPatch) await fs.mkdir(path.join(artifactsDir, `${id}.patch`));
+	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue({
+		mergedDir: worktree,
+		backend: variant.backend ?? natives.IsoBackendKind.Rcopy,
+		fellBack: false,
+		fallbackReason: null,
+	});
+	vi.spyOn(worktreeModule, "captureIsolationBaseline").mockResolvedValue(BASELINE);
+	const captureSpy = vi.spyOn(worktreeModule, "captureDeltaPatch").mockImplementation(async dir => {
+		let work: string;
+		try {
+			work = await Bun.file(path.join(dir, "task.txt")).text();
+		} catch (error) {
+			events.push("capture of a removed worktree");
+			throw error;
+		}
+		events.push("capture");
+		return {
+			rootPatch: `diff --git a/task.txt b/task.txt\n+${work}`,
+			nestedPatches: [{ relativePath: "vendor/lib", patch: NESTED_PATCH }],
+		};
+	});
+	const cleanedUp = Promise.withResolvers<void>();
+	vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
+		events.push("cleanup");
+		await fs.rm(slot, { recursive: true, force: true });
+		cleanedUp.resolve();
+	});
+	const commitSpy = vi
+		.spyOn(worktreeModule, "commitToBranch")
+		.mockImplementation(async (_dir, _baseline, _taskId, _description, _commitMessage, delta) => {
+			events.push("commit");
+			if (variant.commitError) throw variant.commitError;
+			return {
+				branchName: `omp/task/${id}`,
+				baseSha: "base",
+				rootPatch: delta?.rootPatch ?? "",
+				nestedPatches: delta?.nestedPatches ?? [],
+			};
+		});
+	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			parentId: RELEASING_PARENT,
+			session,
+			sessionFile: path.join(root, `${id}.jsonl`),
+			status: "running",
+		});
+		if (!options.onRelease) throw new Error("Expected a release hook for a kept-alive isolated run");
+		await finish(options.onRelease);
+		if (variant.failedWithLateCleanup) options.onCleanupDeferred?.(variant.failedWithLateCleanup);
+		else if (!variant.failed) return result(id);
+		return { ...result(id), exitCode: 1, error: "agent failed" };
+	});
 
+	let lastCompletion: Promise<void> | undefined;
+	const settled = await runIsolated(id, variant.mergeMode ?? "patch", artifactsDir, completion => {
+		lastCompletion = completion;
+	});
+	return {
+		settled,
+		root,
+		artifactsDir,
+		worktree,
+		captures: () => captureSpy.mock.calls.length,
+		commits: () => commitSpy.mock.calls.length,
+		cleanedUp: cleanedUp.promise,
+		handedOn: () => lastCompletion,
+	};
+}
+
+/**
+ * The caller's removal of its temporary artifacts directory, started once `handedOn` (the last completion the run
+ * handed on) settles, as `runStructuredSubagent` does; it goes to {@link events}.
+ */
+function removeArtifactsAfter(handedOn: Promise<void> | undefined, artifactsDir: string): Promise<void> {
+	return (handedOn ?? Promise.resolve()).then(async () => {
+		events.push("artifacts removal");
+		await fs.rm(artifactsDir, { recursive: true, force: true });
+	});
+}
+
+describe("isolated agent release", () => {
 	it("does not re-commit a workspace that is unchanged since the run-end branch", async () => {
-		expect(await commitsAcrossRelease("ReleaseUnchanged", patch, patch)).toBe(1);
+		expect(await commitsAcrossRelease("ReleaseUnchanged", WORK_PATCH, WORK_PATCH)).toBe(1);
 	});
 
 	it("commits follow-up work made after the run-end branch", async () => {
-		expect(await commitsAcrossRelease("ReleaseChanged", patch, `${patch}+follow-up\n`)).toBe(2);
+		expect(await commitsAcrossRelease("ReleaseChanged", WORK_PATCH, `${WORK_PATCH}+follow-up\n`)).toBe(2);
 	});
 
 	it("lets held peer messages wake the agent only after the run-end branch is committed", async () => {
-		await commitsAcrossRelease("ReleaseAfterCapture", patch, patch);
+		await commitsAcrossRelease("ReleaseAfterCapture", WORK_PATCH, WORK_PATCH);
 		expect(events).toEqual(["commit", "irc wakes released"]);
 	});
 
@@ -140,13 +292,13 @@ describe("isolated agent release", () => {
 		tempRoots.push(sandbox);
 		const finishCleanup = Promise.withResolvers<void>();
 		const registrations = vi.spyOn(postmortem, "register");
-		await commitsAcrossRelease("ReleaseAfterDeadline", patch, patch, {
+		await commitsAcrossRelease("ReleaseAfterDeadline", WORK_PATCH, WORK_PATCH, {
 			cleanup: async () => {
 				await finishCleanup.promise;
 				await fs.rm(sandbox, { recursive: true });
 			},
 			afterRun: async () => {
-				await AgentLifecycleManager.global().dispose(Date.now());
+				await AgentLifecycleManager.global().dispose({ deadlineAt: Date.now() });
 				expect(
 					await fs.stat(sandbox).then(
 						() => true,
@@ -168,5 +320,528 @@ describe("isolated agent release", () => {
 				).toBe(false);
 			},
 		});
+	});
+});
+
+describe("isolated agent released as its run finishes", () => {
+	it("captures the run's patch before the release of a refused adoption removes the worktree", async () => {
+		// If this regresses, the adoption the release refuses starts the agent's release hook at once: it commits a
+		// task branch for the run's own unchanged work and removes the worktree while the run's end still captures
+		// it, so the run reports a failed capture, or names a patch of a half-removed worktree that its parent merges.
+		const id = "ReleasedWhileFinishing";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		let hookCalls = 0;
+		const { settled, artifactsDir, commits } = await runInWorktree(id, session, async onRelease => {
+			// The parent's end (an ACP close) releases the agent, and holds it while it disposes its session.
+			const releasing = AgentLifecycleManager.global().releaseUnder(RELEASING_PARENT);
+			let hook: Promise<void> | undefined;
+			await finalizeFinished(id, session, () => {
+				hookCalls++;
+				hook = onRelease();
+				return hook;
+			});
+			await letRefusedReleaseRun(hook);
+			disposing.resolve();
+			await releasing;
+		});
+
+		expect(settled.error).toBeUndefined();
+		expect(settled.patchPath).toBe(path.join(artifactsDir, `${id}.patch`));
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(WORK_PATCH);
+		expect(events).toEqual(["capture", "capture", "cleanup"]);
+		expect(commits()).toBe(0);
+		expect(hookCalls).toBe(1);
+	});
+
+	it("captures the run's patch of an agent released before its run finalized, whose finalize runs the hook", async () => {
+		// If this regresses, the finalize, which finds the agent gone and runs its release hook itself, lets the hook
+		// commit a task branch and remove the worktree before the run's end captures it, or never returns: the hook
+		// waits for the run's end, which waits for the finalize.
+		const id = "ReleasedBeforeFinalize";
+		const session = agentSession(async () => {});
+		let hookCalls = 0;
+		const { settled, artifactsDir, commits } = await runInWorktree(id, session, async onRelease => {
+			await AgentLifecycleManager.global().release(id);
+			await finalizeFinished(id, session, () => {
+				hookCalls++;
+				return onRelease();
+			});
+		});
+
+		expect(settled.error).toBeUndefined();
+		expect(settled.patchPath).toBe(path.join(artifactsDir, `${id}.patch`));
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(WORK_PATCH);
+		expect(events).toEqual(["capture", "capture", "cleanup"]);
+		expect(commits()).toBe(0);
+		expect(hookCalls).toBe(1);
+	});
+
+	it("captures what the session's shutdown writes when a release still disposes the session as the run ends", async () => {
+		// If this regresses, the run's end removes the worktree while a release of the agent just adopted still
+		// disposes its session, and that release, whose hook comes after the run's end, captures nothing: what the
+		// session's shutdown wrote in the worktree is in no patch and on no task branch.
+		const id = "ReleasedAsRunEnds";
+		// Ends the release's dispose of the session, given the worktree its shutdown writes.
+		const disposing = Promise.withResolvers<string>();
+		const session = agentSession(async () => {
+			await Bun.write(path.join(await disposing.promise, "task.txt"), "work\nshutdown\n");
+		});
+		let releasing: Promise<boolean> | undefined;
+		const { settled, artifactsDir, worktree, commits } = await runInWorktree(id, session, async onRelease => {
+			await finalizeFinished(id, session, onRelease);
+			// The parent's end (an ACP close) releases the agent just adopted, and holds it while it disposes its
+			// session.
+			releasing = AgentLifecycleManager.global().release(id);
+		});
+		// The run has returned; the release's dispose, whose shutdown writes the worktree, ends only now, and its hook
+		// comes after the run's end.
+		disposing.resolve(worktree);
+		await releasing;
+
+		expect(settled.error).toBeUndefined();
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(`${WORK_PATCH}shutdown\n`);
+		expect(events).toEqual(["capture", "capture", "commit", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("captures a failed run's worktree when a release still disposes the session as the run ends", async () => {
+		// If this regresses, the end of a failed run, which captures nothing itself, removes the worktree while a
+		// release of the agent just adopted still disposes its session, and that release, whose hook comes after the
+		// run's end, captures nothing either: the failed run's work is in no patch and on no task branch, and nothing
+		// says so.
+		const id = "FailedReleasedAsRunEnds";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		let releasing: Promise<boolean> | undefined;
+		const { settled, artifactsDir, commits } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await finalizeFinished(id, session, onRelease);
+				// The parent's end (an ACP close) releases the agent just adopted, and holds it while it disposes
+				// its session.
+				releasing = AgentLifecycleManager.global().release(id);
+			},
+			{ failed: true },
+		);
+		expect(events).toEqual([]);
+		disposing.resolve();
+		await releasing;
+
+		expect(settled.error).toBe("agent failed");
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(WORK_PATCH);
+		expect(events).toEqual(["capture", "commit", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("captures a failed run's worktree when a release took its adoption just before the run's end reads it and is still in flight", async () => {
+		// If this regresses, a release that takes the agent's adoption just before the run's end reads it (on a worker,
+		// each read of the run's end is a round trip to the main thread, which goes on meanwhile) is missed: the run's
+		// end finds no adoption, and no release in flight when it asks for one before that read, so it removes the
+		// worktree, and that release, whose hook comes after the run's end, captures nothing: the failed run's work is
+		// in no patch and on no task branch.
+		const id = "ReleasedAsRunEndReadsAdoption";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		const lifecycle = AgentLifecycleManager.global();
+		const has = lifecycle.has.bind(lifecycle);
+		let releasing: Promise<boolean> | undefined;
+		// The parent's end (an ACP close) releases the agent just adopted as the run's end reads its adoption, and holds
+		// the release while it disposes the agent's session.
+		vi.spyOn(lifecycle, "has").mockImplementation((agentId, expected) => {
+			releasing ??= lifecycle.release(agentId);
+			return has(agentId, expected);
+		});
+		const { settled, artifactsDir, commits } = await runInWorktree(
+			id,
+			session,
+			onRelease => finalizeFinished(id, session, onRelease),
+			{ failed: true },
+		);
+		expect(events).toEqual([]);
+		disposing.resolve();
+		await releasing;
+
+		expect(settled.error).toBe("agent failed");
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(WORK_PATCH);
+		expect(events).toEqual(["capture", "commit", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("removes the worktree once a release in flight at the run's end, which calls no hook, is over", async () => {
+		// If this regresses, a run whose agent a release ends before the run finalizes (its session still starting, so
+		// no adoption and no hook) hands its caller a completion that never settles: the worktree stays, and the
+		// caller's removal of its artifacts, or the job manager's disposal of them, waits forever.
+		const id = "ReleasedWithoutHook";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		let releasing: Promise<boolean> | undefined;
+		const { settled, worktree, handedOn } = await runInWorktree(
+			id,
+			session,
+			async () => {
+				// The parent's end releases the agent and holds the release while it disposes the agent's session; the
+				// run is cut off and never finalizes, so nothing calls its hook.
+				releasing = AgentLifecycleManager.global().release(id);
+			},
+			{ failed: true },
+		);
+		expect(events).toEqual([]);
+		disposing.resolve();
+		await releasing;
+		// The regression is a completion that never settles, which only a bound can observe; the removal settles it as
+		// soon as the worktree is gone.
+		const handedSettled = await Promise.race([handedOn()?.then(() => true), Bun.sleep(1000).then(() => false)]);
+
+		expect(settled.error).toBe("agent failed");
+		expect(handedSettled).toBe(true);
+		expect(events).toEqual(["cleanup"]);
+		await expect(fs.stat(worktree)).rejects.toThrow();
+	});
+
+	it("captures a failed run's worktree only once the run's deferred cleanup is done, and returns the result first", async () => {
+		// If this regresses, the release of a failed run, asked for before the run's end, captures and removes the
+		// worktree while the cleanup the run deferred (its owner jobs, its session's shutdown) may still write it, so
+		// what they write is in no patch; or the failed run's result waits for that cleanup.
+		const id = "ReleasedWithLateCleanup";
+		const session = agentSession(async () => {});
+		const lateCleanup = Promise.withResolvers<void>();
+		const { settled, artifactsDir, worktree, captures, commits, cleanedUp } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await AgentLifecycleManager.global().release(id);
+				await finalizeFinished(id, session, onRelease);
+			},
+			{ failedWithLateCleanup: lateCleanup.promise },
+		);
+
+		expect(settled.error).toBe("agent failed");
+		expect(captures()).toBe(0);
+		expect(events).toEqual([]);
+		// An owner job writes the worktree before the deferred cleanup is done.
+		await Bun.write(path.join(worktree, "task.txt"), "work\nlate\n");
+		lateCleanup.resolve();
+		await cleanedUp;
+
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(`${WORK_PATCH}late\n`);
+		expect(events).toEqual(["capture", "commit", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("removes the caller's artifacts directory only after a failed run's late release is done with it", async () => {
+		// If this regresses, a caller that removes its temporary artifacts directory once the run's deferred cleanup
+		// settles (as `runStructuredSubagent` does) removes it while the release of the failed run still captures, and
+		// the release's patch then creates the directory again, with nothing left to remove it.
+		const id = "ReleasedWithLateCleanupUnderCaller";
+		const session = agentSession(async () => {});
+		const lateCleanup = Promise.withResolvers<void>();
+		const { settled, artifactsDir, cleanedUp, handedOn } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await AgentLifecycleManager.global().release(id);
+				await finalizeFinished(id, session, onRelease);
+			},
+			{ failedWithLateCleanup: lateCleanup.promise },
+		);
+		// The caller starts removing its artifacts as the completion settles; any release still going on then would
+		// write into the directory being removed.
+		const removed = removeArtifactsAfter(handedOn(), artifactsDir);
+		lateCleanup.resolve();
+		await Promise.all([removed, cleanedUp]);
+
+		expect(settled.error).toBe("agent failed");
+		expect(events).toEqual(["capture", "commit", "cleanup", "artifacts removal"]);
+		expect(
+			await fs.stat(artifactsDir).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	it("removes the caller's artifacts directory only after a release still disposing the session as a failed run ends is done with it", async () => {
+		// If this regresses, a caller that removes its temporary artifacts directory once the run returns and its
+		// deferred cleanup settles (as `runStructuredSubagent` does) removes it before the release of the failed run,
+		// whose hook comes after the run's end, captures, and the release's patch then creates the directory again,
+		// with nothing left to remove it.
+		const id = "FailedReleasedAsRunEndsUnderCaller";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		let releasing: Promise<boolean> | undefined;
+		const { settled, artifactsDir, handedOn } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await finalizeFinished(id, session, onRelease);
+				releasing = AgentLifecycleManager.global().release(id);
+			},
+			{ failed: true },
+		);
+		const removed = removeArtifactsAfter(handedOn(), artifactsDir);
+		disposing.resolve();
+		await Promise.all([removed, releasing]);
+
+		expect(settled.error).toBe("agent failed");
+		expect(events).toEqual(["capture", "commit", "cleanup", "artifacts removal"]);
+		expect(
+			await fs.stat(artifactsDir).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	});
+
+	it("logs the failure of a failed run's late release", async () => {
+		// If this regresses, the release of a failed run that goes on after the result fails with no log: only the
+		// caller's deferred cleanup awaits it, and takes no notice of its error, so the worktree it retained, which
+		// holds the run's changes, is named nowhere.
+		const id = "LateReleaseFails";
+		const session = agentSession(async () => {});
+		const lateCleanup = Promise.withResolvers<void>();
+		const warn = vi.spyOn(logger, "warn");
+		const { handedOn } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await AgentLifecycleManager.global().release(id);
+				await finalizeFinished(id, session, onRelease);
+			},
+			{ failedWithLateCleanup: lateCleanup.promise, blockRootPatch: true },
+		);
+		lateCleanup.resolve();
+		await handedOn();
+
+		expect(
+			warn.mock.calls.filter(
+				([message, context]) => message === "Deferred cleanup failed" && context?.agentId === id,
+			),
+		).toEqual([
+			[
+				"Deferred cleanup failed",
+				expect.objectContaining({ resource: "isolation", error: expect.stringContaining("Patch capture failed") }),
+			],
+		]);
+	});
+
+	it("keeps a branch-mode run's root patch, named in the agent's history, when a kill's release still disposes the session as the run ends", async () => {
+		// If this regresses, a branch-mode agent killed as its run ends leaves no `<id>.patch`: the kill's release finds
+		// the worktree unchanged since the run's end and writes none, so its history names no patch, and the Agent Hub
+		// shows none.
+		const id = "KilledAfterBranchRunEnd";
+		const disposing = Promise.withResolvers<void>();
+		const session = agentSession(() => disposing.promise);
+		let killing: Promise<boolean> | undefined;
+		const { artifactsDir } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				await finalizeFinished(id, session, onRelease);
+				// An Agent Hub kill releases the agent just adopted, keeps its row, and holds the release while it
+				// disposes the agent's session.
+				killing = AgentLifecycleManager.global().release(id, undefined, { tombstone: true });
+			},
+			{ mergeMode: "branch" },
+		);
+		disposing.resolve();
+		await killing;
+
+		const patchPath = path.join(artifactsDir, `${id}.patch`);
+		expect(await Bun.file(patchPath).text()).toBe(WORK_PATCH);
+		expect(AgentRegistry.global().get(id)?.history?.patchPath).toBe(patchPath);
+		expect(events).toEqual(["capture", "commit", "capture", "cleanup"]);
+		AgentRegistry.global().unregister(id);
+	});
+});
+
+describe("isolated agent released after its run returned", () => {
+	it("leaves the run-end patch files as written when the released workspace is unchanged", async () => {
+		// If this regresses, the release of an unchanged workspace rewrites the run's `<id>.patch` and nested patch
+		// files while the parent may still be reading them to merge, so the parent can read a truncated patch.
+		const id = "ReleasedUnchanged";
+		const session = agentSession(async () => {});
+		const { settled, artifactsDir, commits } = await runInWorktree(id, session, onRelease =>
+			finalizeFinished(id, session, onRelease),
+		);
+		const patchFiles = [path.join(artifactsDir, `${id}.patch`), ...(settled.nestedPatchPaths ?? [])];
+		expect(patchFiles).toHaveLength(2);
+		// Stands for what the run-end capture wrote: any write by the release replaces it.
+		for (const file of patchFiles) await Bun.write(file, "as the run-end capture wrote it\n");
+
+		await AgentLifecycleManager.global().release(id);
+
+		for (const file of patchFiles) expect(await Bun.file(file).text()).toBe("as the run-end capture wrote it\n");
+		expect(events).toEqual(["capture", "capture", "cleanup"]);
+		expect(commits()).toBe(0);
+	});
+
+	it("leaves the patch files of a failed run-end branch commit as written when the released workspace is unchanged", async () => {
+		// If this regresses, a branch-mode run whose task-branch commit failed hands its parent `<id>.patch` (its error
+		// names it), and the release of the unchanged workspace rewrites that patch while the parent may be reading it
+		// and tries the failed commit again.
+		const id = "ReleasedAfterFailedCommit";
+		const session = agentSession(async () => {});
+		const { settled, artifactsDir, commits } = await runInWorktree(
+			id,
+			session,
+			onRelease => finalizeFinished(id, session, onRelease),
+			{ mergeMode: "branch", commitError: new Error("task branch conflict") },
+		);
+		expect(settled.error).toContain("Merge failed: task branch conflict");
+		expect(settled.patchPath).toBe(path.join(artifactsDir, `${id}.patch`));
+		const patchFiles = [path.join(artifactsDir, `${id}.patch`), ...(settled.nestedPatchPaths ?? [])];
+		expect(patchFiles).toHaveLength(2);
+		// Stands for what the run-end capture wrote: any write by the release replaces it.
+		for (const file of patchFiles) await Bun.write(file, "as the run-end capture wrote it\n");
+
+		await AgentLifecycleManager.global().release(id);
+
+		for (const file of patchFiles) expect(await Bun.file(file).text()).toBe("as the run-end capture wrote it\n");
+		expect(events).toEqual(["capture", "commit", "capture", "capture", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("writes a branch-mode run's root patch as the run ends and names it in the agent's history", async () => {
+		// If this regresses, a successful branch-mode run leaves no `<id>.patch`, and its release, which finds the
+		// worktree unchanged since the run's end, writes none either: the agent's history names no patch, so the Agent
+		// Hub shows none for it, and once its merged task branch is deleted no diff of its work is left on disk.
+		const id = "BranchRunEndPatch";
+		const session = agentSession(async () => {});
+		const { artifactsDir } = await runInWorktree(id, session, onRelease => finalizeFinished(id, session, onRelease), {
+			mergeMode: "branch",
+		});
+
+		const patchPath = path.join(artifactsDir, `${id}.patch`);
+		expect(await Bun.file(patchPath).text()).toBe(WORK_PATCH);
+		expect(AgentRegistry.global().get(id)?.history?.patchPath).toBe(patchPath);
+		await AgentLifecycleManager.global().release(id);
+	});
+
+	it("hands its parent the same branch-mode result whether or not the run could write its root patch", async () => {
+		// If this regresses, the root patch a successful branch-mode run writes as the agent's record changes what its
+		// parent gets: the result names it, so the parent's merge, its task summary or the task's rendering differ from
+		// a run whose result names no root patch, and from a run whose root patch could not be written.
+		const id = "BranchRootPatchRecord";
+		for (const blockRootPatch of [false, true]) {
+			const session = agentSession(async () => {});
+			const { settled, artifactsDir } = await runInWorktree(
+				id,
+				session,
+				onRelease => finalizeFinished(id, session, onRelease),
+				{ mergeMode: "branch", blockRootPatch },
+			);
+
+			const rootPatch = await Bun.file(path.join(artifactsDir, `${id}.patch`))
+				.text()
+				.catch(() => undefined);
+			expect(rootPatch).toBe(blockRootPatch ? undefined : WORK_PATCH);
+			expect(settled).toEqual({
+				...result(id),
+				isolated: true,
+				branchName: `omp/task/${id}`,
+				branchBaseSha: "base",
+				nestedPatches: [{ relativePath: "vendor/lib", patch: NESTED_PATCH }],
+				nestedPatchPaths: [path.join(artifactsDir, `${id}.nested-0-vendor_lib.patch`)],
+			});
+			await AgentLifecycleManager.global().release(id);
+		}
+	});
+
+	it("leaves no partial root patch when a branch-mode run's root patch write fails partway", async () => {
+		// If this regresses, a root patch write that fails once it has created or truncated `<id>.patch` (a full disk)
+		// leaves a truncated patch, which the Agent Hub and a later scan of the artifacts take for the agent's patch.
+		const id = "BranchRootPatchPartial";
+		const write = Bun.write.bind(Bun);
+		vi.spyOn(Bun, "write").mockImplementation(((destination: unknown, ...rest: unknown[]) => {
+			if (typeof destination !== "string" || path.basename(destination) !== `${id}.patch`) {
+				return (write as (...args: unknown[]) => Promise<number>)(destination, ...rest);
+			}
+			return write(destination, "diff --git a/ta").then(() => {
+				throw new Error("ENOSPC: no space left on device, write");
+			});
+		}) as typeof Bun.write);
+		const session = agentSession(async () => {});
+		const { artifactsDir } = await runInWorktree(id, session, onRelease => finalizeFinished(id, session, onRelease), {
+			mergeMode: "branch",
+		});
+
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).exists()).toBe(false);
+		expect(AgentRegistry.global().get(id)?.history?.patchPath).toBeUndefined();
+		await AgentLifecycleManager.global().release(id);
+	});
+
+	it("leaves the patch files of a branch-mode run as written when the released workspace is unchanged", async () => {
+		// If this regresses, the release of an unchanged branch-mode workspace rewrites the `<id>.patch` and nested
+		// patch files its run's end wrote, which the parent's summary names when its merge fails, and removes them all
+		// when one write fails.
+		const id = "ReleasedBranchUnchanged";
+		const session = agentSession(async () => {});
+		const { settled, artifactsDir, commits } = await runInWorktree(
+			id,
+			session,
+			onRelease => finalizeFinished(id, session, onRelease),
+			{ mergeMode: "branch" },
+		);
+		const patchFiles = [path.join(artifactsDir, `${id}.patch`), ...(settled.nestedPatchPaths ?? [])];
+		expect(patchFiles).toHaveLength(2);
+		// Stands for what the run-end capture wrote: any write by the release replaces it.
+		for (const file of patchFiles) await Bun.write(file, "as the run-end capture wrote it\n");
+
+		await AgentLifecycleManager.global().release(id);
+
+		for (const file of patchFiles) expect(await Bun.file(file).text()).toBe("as the run-end capture wrote it\n");
+		expect(events).toEqual(["capture", "commit", "capture", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("writes the new patch and commits a task branch when the released workspace has follow-up work", async () => {
+		// If this regresses, work the agent did in its worktree after the run's end is lost when it is released: no
+		// patch file holds it and no task branch carries it.
+		const id = "ReleasedAfterFollowUp";
+		const session = agentSession(async () => {});
+		const { artifactsDir, worktree, commits } = await runInWorktree(id, session, onRelease =>
+			finalizeFinished(id, session, onRelease),
+		);
+		await Bun.write(path.join(worktree, "task.txt"), "work\nfollow-up\n");
+
+		await AgentLifecycleManager.global().release(id);
+
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).text()).toBe(`${WORK_PATCH}follow-up\n`);
+		expect(events).toEqual(["capture", "capture", "commit", "cleanup"]);
+		expect(commits()).toBe(1);
+	});
+
+	it("lets a release hook called after the run's end took the cleanup over only wait for that cleanup", async () => {
+		// If this regresses, a release hook called after the run's end found no release asked for or in flight and no
+		// adoption, and took the cleanup over (the hook must allow for that end having released the worktree itself),
+		// captures the worktree that cleanup removes: it writes a patch and commits a task branch of a half-removed
+		// worktree, or reports a false capture failure and leaves the workspace retained.
+		const id = "HookAfterRunEndCleanup";
+		const session = agentSession(async () => {});
+		const lateCleanup = Promise.withResolvers<void>();
+		const handedHook = Promise.withResolvers<() => Promise<void>>();
+		const { settled, artifactsDir, captures, commits } = await runInWorktree(
+			id,
+			session,
+			async onRelease => {
+				// The run neither adopts the agent nor calls its hook: its end takes the cleanup over, after the
+				// cleanup it deferred.
+				handedHook.resolve(onRelease);
+			},
+			{ failedWithLateCleanup: lateCleanup.promise },
+		);
+		const hook = await handedHook.promise;
+		const hooked = hook().then(() => void events.push("hook resolved"));
+		lateCleanup.resolve();
+		await hooked;
+
+		expect(settled.error).toBe("agent failed");
+		expect(events).toEqual(["cleanup", "hook resolved"]);
+		expect(captures()).toBe(0);
+		expect(commits()).toBe(0);
+		expect(await Bun.file(path.join(artifactsDir, `${id}.patch`)).exists()).toBe(false);
+		AgentRegistry.global().unregister(id);
 	});
 });

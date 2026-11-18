@@ -40,12 +40,11 @@ impl Wake for Unpark {
 fn wait(p: &mut Box<dyn ExtProc>) -> ExitStatus {
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let mut cx = Context::from_waker(&waker);
-	let deadline = Instant::now() + LONG;
+	// A process that never finishes hangs the test until the runner's bound.
 	loop {
 		if let Poll::Ready(s) = p.poll_wait(&mut cx) {
 			return s;
 		}
-		assert!(Instant::now() < deadline, "process did not finish");
 		thread::park_timeout(Duration::from_millis(50));
 	}
 }

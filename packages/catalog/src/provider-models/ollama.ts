@@ -1,4 +1,5 @@
 import { fetchWithRetry } from "@oh-my-pi/pi-utils";
+import { readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
 import type { ModelManagerOptions } from "../model-manager";
 import type { FetchImpl, ModelSpec } from "../types";
 import { discoveryFetch } from "../utils";
@@ -102,7 +103,7 @@ async function fetchShowMetadata(
 	if (!response.ok) {
 		return undefined;
 	}
-	return (await response.json()) as OllamaShowResponse;
+	return (await readJsonInSlices(response)) as OllamaShowResponse;
 }
 
 export function ollamaCloudModelManagerOptions(
@@ -129,7 +130,7 @@ export function ollamaCloudModelManagerOptions(
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status} from ${baseUrl}/api/tags`);
 			}
-			const payload = (await response.json()) as { models?: OllamaTagEntry[] };
+			const payload = (await readJsonInSlices(response)) as { models?: OllamaTagEntry[] };
 			const entries = payload.models ?? [];
 			const models = await Promise.all(
 				entries.map(async entry => {

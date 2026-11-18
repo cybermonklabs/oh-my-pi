@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { $ } from "bun";
+import { createTestChildEnv } from "./test-env";
 
 const RUST_AFFECTING_FILE_NAMES = [
 	"Cargo.toml",
@@ -100,8 +101,13 @@ if (taskName !== "fmt:rs") {
 	if (!decision.run) process.exit(0);
 }
 
+// Cargo's tests get the environment the preload gives a `bun test` process, since cargo has no
+// preload: without it a Rust test ran the developer's git wrapper, read their `~/.gitconfig` and
+// `JJ_CONFIG`, and saw the rest of their machine's environment. Cargo's and rustup's own names
+// (`CARGO_*`, `RUSTUP_*`, `RUST*`) are none the product reads, so they pass unchanged.
+const childEnv = taskName === "test:rs" ? createTestChildEnv(process.env) : process.env;
 for (const command of TASK_COMMANDS[taskName]) {
-	const exitCode = await runCommand(command);
+	const exitCode = await runCommand(command, childEnv);
 	if (exitCode !== 0) {
 		process.exit(exitCode);
 	}
@@ -232,8 +238,14 @@ async function resolveCargoBinary(): Promise<string> {
 	// On macOS runners, Homebrew's `rustup-init` binary is on PATH before the
 	// rustup proxies in `$CARGO_HOME/bin`, and invoking it as `cargo` falls
 	// through to its installer mode ("unexpected argument 'nextest' found").
-	// Ask rustup directly for the cargo binary in the active toolchain.
-	const result = await $`rustup which cargo`.cwd(repoRoot).quiet().nothrow();
+	// Ask rustup directly for the cargo binary of the repository's toolchain.
+	// rustup lets RUSTUP_TOOLCHAIN override `rust-toolchain.toml`, and a
+	// caller's shell can carry one (mise exports its global rust pin into every
+	// shell it starts), so it is left out here: the gates are the pinned
+	// toolchain's, whatever toolchain the caller's shell names.
+	const env: Record<string, string | undefined> = { ...process.env };
+	delete env.RUSTUP_TOOLCHAIN;
+	const result = await $`rustup which cargo`.cwd(repoRoot).env(env).quiet().nothrow();
 	if (result.exitCode === 0) {
 		const resolved = result.stdout.toString().trim();
 		if (resolved !== "") return resolved;
@@ -241,11 +253,23 @@ async function resolveCargoBinary(): Promise<string> {
 	return "cargo";
 }
 
-async function runCommand(command: readonly string[]): Promise<number> {
+/**
+ * The rustup toolchain a resolved cargo belongs to, read from its path
+ * (`<RUSTUP_HOME>/toolchains/<toolchain>/bin/cargo`), or `undefined` when the
+ * cargo is not a rustup toolchain's own binary.
+ */
+function toolchainOfCargo(cargo: string): string | undefined {
+	const bin = path.dirname(cargo);
+	const toolchainDir = path.dirname(bin);
+	if (path.basename(bin) !== "bin" || path.basename(path.dirname(toolchainDir)) !== "toolchains") return undefined;
+	return path.basename(toolchainDir);
+}
+
+async function runCommand(command: readonly string[], baseEnv: Record<string, string | undefined>): Promise<number> {
 	const [head, ...rest] = command;
 	const isCargo = head === "cargo";
 	const argv = isCargo ? [cargoBinary, ...rest] : [head, ...rest];
-	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+	const env = { ...baseEnv };
 	if (isCargo) {
 		// Cargo subprocesses (notably `rustc -vV` from `cargo metadata`) resolve
 		// via PATH; ensure the active toolchain bin dir wins over Homebrew's
@@ -254,6 +278,14 @@ async function runCommand(command: readonly string[]): Promise<number> {
 		const pathSep = process.platform === "win32" ? ";" : ":";
 		const currentPath = env.PATH ?? env.Path ?? "";
 		env.PATH = currentPath === "" ? toolchainBin : `${toolchainBin}${pathSep}${currentPath}`;
+		// cargo reaches its `fmt` and `clippy` subcommands through the rustup
+		// proxies in `$CARGO_HOME/bin`, which take their toolchain from
+		// RUSTUP_TOOLCHAIN when it is set. A caller's RUSTUP_TOOLCHAIN (mise
+		// exports its global rust pin into every shell it starts) then runs
+		// another toolchain's rustfmt and clippy than the cargo resolved above.
+		// Name that cargo's own toolchain, so one toolchain runs the whole task.
+		const toolchain = toolchainOfCargo(cargoBinary);
+		if (toolchain !== undefined) env.RUSTUP_TOOLCHAIN = toolchain;
 	}
 	const proc = Bun.spawn(argv, {
 		cwd: repoRoot,

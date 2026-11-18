@@ -39,6 +39,7 @@ use futures::{Stream, StreamExt, stream};
 use pi_vfs::Fs;
 use pi_walker::{
 	FileType, exec,
+	fs::{Dir, Session},
 	glob::Selector,
 	walk::{self, Action, WalkError},
 };
@@ -149,6 +150,12 @@ fn pool() -> (usize, usize) {
 	(workers, workers * 4)
 }
 
+/// A session for the reads and writes of files that native walks listed; a
+/// per-file pool gives each worker one.
+fn native_session() -> Session {
+	pi_walker::Fs::native().session()
+}
+
 /// Which files below a directory root [`discover`] keeps.
 #[derive(Clone, Debug, Default)]
 pub struct Discover {
@@ -174,13 +181,116 @@ pub struct Discover {
 }
 
 /// A file to search.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Candidate {
-	/// Absolute path in the filesystem's spelling, read and written through.
+	/// Absolute path in the filesystem's spelling; files are read and written
+	/// by it unless [`discover`] listed them in a walk that follows no
+	/// symlink.
 	pub path:    PathBuf,
 	/// Path shown in results: walk-relative and `/`-separated below a
 	/// directory root, the file name for a file root.
 	pub display: String,
+	/// Where a walk that follows no symlink listed the file: it is read and
+	/// written below that walk's open root, following no symlink on the way,
+	/// never by `path`. `None` for a file root and for a walk that follows
+	/// symlinks.
+	beneath:     Option<Beneath>,
+}
+
+impl PartialEq for Candidate {
+	fn eq(&self, other: &Self) -> bool {
+		self.path == other.path
+			&& self.display == other.display
+			&& match (&self.beneath, &other.beneath) {
+				(None, None) => true,
+				(Some(a), Some(b)) => a.rel == b.rel && Arc::ptr_eq(&a.root.dir, &b.root.dir),
+				_ => false,
+			}
+	}
+}
+
+impl Eq for Candidate {}
+
+/// A candidate's place below the open root of the walk that listed it.
+#[derive(Clone, Debug)]
+struct Beneath {
+	root: Arc<WalkRoot>,
+	/// Walk-relative path (`/`-separated raw names).
+	rel:  Box<[u8]>,
+}
+
+/// The open root of one walk that follows no symlink, with the walker layer
+/// it was opened on; the candidates the walk listed share it.
+#[derive(Debug)]
+struct WalkRoot {
+	layer: pi_walker::Fs,
+	dir:   Arc<Dir>,
+}
+
+impl WalkRoot {
+	/// The session that opens below this root: `native`, reused across
+	/// files, for a native walk; otherwise `fresh`, set to a new session of
+	/// the walk's layer.
+	fn session<'s>(
+		&self,
+		native: &'s mut Session,
+		fresh: &'s mut Option<Session>,
+	) -> &'s mut Session {
+		if self.layer.is_native() {
+			native
+		} else {
+			fresh.insert(self.layer.session())
+		}
+	}
+}
+
+impl Candidate {
+	/// Reads the file whole as UTF-8: below the open root of the walk that
+	/// listed it when that walk follows no symlink, so a directory on the way
+	/// or the file swapped for a symlink since the listing fails the read;
+	/// by path otherwise. `native` serves native walks' reads, reused across
+	/// files.
+	async fn read(&self, fs: &Fs, native: &mut Session) -> io::Result<String> {
+		#[cfg(test)]
+		tests::before_read(&self.path);
+		let Some(Beneath { root, rel }) = &self.beneath else {
+			return fs.read_to_string(&self.path).await;
+		};
+		let mut fresh = None;
+		let (mut file, _) = root
+			.session(native, &mut fresh)
+			.open_file_beneath(&root.dir, rel)
+			.await?;
+		let mut bytes = Vec::new();
+		file.read_into(&mut bytes, u64::MAX).await?;
+		String::from_utf8(bytes).map_err(|_| {
+			io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")
+		})
+	}
+}
+
+/// Replaces the contents of the rewritten file at `path` with `content`: below
+/// the open root of the walk that listed it when that walk follows no
+/// symlink, following no symlink on the way or at the file
+/// ([`Session::write_file_beneath`]); by path otherwise. Both rewrite the
+/// file in place.
+async fn write_back(
+	fs: &Fs,
+	native: &mut Session,
+	path: &Path,
+	beneath: Option<&Beneath>,
+	content: &str,
+) -> io::Result<()> {
+	#[cfg(test)]
+	tests::before_write(path);
+	let Some(Beneath { root, rel }) = beneath else {
+		return fs.write(path, content).await;
+	};
+	let mut fresh = None;
+	root
+		.session(native, &mut fresh)
+		.write_file_beneath(&root.dir, rel, content.as_bytes())
+		.await
 }
 
 /// The files below `root` (an absolute host path or `scheme://` URL) that
@@ -207,7 +317,7 @@ pub async fn discover(fs: &Fs, root: &Path, opts: &Discover) -> Result<Vec<Candi
 		let display = pi_vfs::file_name(&root)
 			.and_then(|name| name.to_str().map(str::to_string))
 			.unwrap_or_else(|| root.to_string_lossy().into_owned());
-		return Ok(vec![Candidate { path: root, display }]);
+		return Ok(vec![Candidate { path: root, display, beneath: None }]);
 	}
 	if !metadata.is_dir() {
 		return Err(Error::Invalid(format!(
@@ -257,11 +367,17 @@ pub async fn discover(fs: &Fs, root: &Path, opts: &Discover) -> Result<Vec<Candi
 		}
 	})
 	.await?;
+	let walk_root = collection
+		.root_dir()
+		.map(|dir| Arc::new(WalkRoot { layer: walk_fs.clone(), dir: Arc::clone(dir) }));
 	Ok(collection
 		.iter()
 		.map(|entry| Candidate {
 			path:    walk_fs.join(&root, entry.path),
 			display: entry.path_lossy().into_owned(),
+			beneath: walk_root
+				.as_ref()
+				.map(|root| Beneath { root: Arc::clone(root), rel: entry.path.into() }),
 		})
 		.collect())
 }
@@ -402,7 +518,7 @@ pub struct Report {
 /// The matches in one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileMatches {
-	/// Absolute path the file was read from.
+	/// Absolute path of the file read (how it was read: [`Candidate`]).
 	pub path:     PathBuf,
 	/// Display path ([`Candidate::display`]).
 	pub display:  String,
@@ -501,11 +617,14 @@ pub fn find(fs: &Fs, candidates: Vec<Candidate>, query: &Query<'_>) -> Finder {
 		stream::iter(prepared.files),
 		workers,
 		window,
-		|| (),
-		move |(), resolved| {
-			let task =
-				scan_file(fs.clone(), resolved, Arc::clone(&compiled), Arc::clone(&job), halt.clone());
-			async move { ((), task.await) }
+		native_session,
+		move |mut session, resolved| {
+			let (fs, compiled, job, halt) =
+				(fs.clone(), Arc::clone(&compiled), Arc::clone(&job), halt.clone());
+			async move {
+				let scanned = scan_file(&fs, &mut session, resolved, compiled, job, halt).await;
+				(session, scanned)
+			}
 		},
 	);
 	Finder {
@@ -720,7 +839,9 @@ pub struct Change {
 /// The replacements in one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEdit {
-	/// Absolute path the file was read from (and is written to).
+	/// Absolute path of the file; it is read and written back as its
+	/// [`Candidate`] says (below the walk's root when the walk followed no
+	/// symlink).
 	pub path:     PathBuf,
 	/// Display path ([`Candidate::display`]).
 	pub display:  String,
@@ -805,6 +926,8 @@ pub async fn rewrite(
 	warnings.sort();
 
 	let mut files = Vec::new();
+	// Where each of `files` was listed, for its write-back.
+	let mut placed = Vec::new();
 	let mut total = 0;
 	let mut limit_reached = false;
 	if !rules.is_empty() {
@@ -820,10 +943,13 @@ pub async fn rewrite(
 			stream::iter(prepared.files),
 			workers,
 			window,
-			|| (),
-			move |(), resolved| {
+			native_session,
+			move |mut session, resolved| {
 				let job = Arc::clone(&job);
-				async move { ((), job.run(resolved).await) }
+				async move {
+					let rewritten = job.run(&mut session, resolved).await;
+					(session, rewritten)
+				}
 			},
 		));
 		while let Some(rewritten) = tasks.next().await {
@@ -861,6 +987,7 @@ pub async fn rewrite(
 				Mode::Preview => None,
 				Mode::Render | Mode::Write => Some(render(&source, &staged.edits)?),
 			};
+			placed.push(candidate.beneath);
 			files.push(FileEdit {
 				path: candidate.path,
 				display: candidate.display,
@@ -876,13 +1003,16 @@ pub async fn rewrite(
 	}
 
 	if rewrite.mode == Mode::Write {
-		for file in &files {
+		let mut native = native_session();
+		for (file, beneath) in files.iter().zip(&placed) {
 			if let Some(content) = &file.content
 				&& *content != file.source
 			{
-				fs.write(&file.path, content).await.map_err(|err| {
-					Error::Invalid(format!("Failed to write {}: {err}", file.path.display()))
-				})?;
+				write_back(fs, &mut native, &file.path, beneath.as_ref(), content)
+					.await
+					.map_err(|err| {
+						Error::Invalid(format!("Failed to write {}: {err}", file.path.display()))
+					})?;
 			}
 		}
 	}
@@ -918,16 +1048,19 @@ enum Step {
 
 impl RewriteJob {
 	/// Reads, parses, and stages one file.
-	async fn run(&self, resolved: Resolved) -> Result<Rewritten, Error> {
+	async fn run(&self, session: &mut Session, resolved: Resolved) -> Result<Rewritten, Error> {
 		check(&self.halt)?;
 		let Resolved { candidate, language } = resolved;
 		let mut warnings = Vec::new();
-		let step = self.step(&candidate, language, &mut warnings).await?;
+		let step = self
+			.step(session, &candidate, language, &mut warnings)
+			.await?;
 		Ok(Rewritten { candidate, warnings, step })
 	}
 
 	async fn step(
 		&self,
+		session: &mut Session,
 		candidate: &Candidate,
 		language: Result<SupportLang, String>,
 		warnings: &mut Vec<String>,
@@ -951,7 +1084,7 @@ impl RewriteJob {
 		if runnable.is_empty() {
 			return Ok(Step::Unchanged);
 		}
-		let source = match self.fs.read_to_string(&candidate.path).await {
+		let source = match candidate.read(&self.fs, session).await {
 			Ok(source) => source,
 			Err(err) => return Ok(Step::Skip(format!("{}: {err}", candidate.display))),
 		};
@@ -1159,7 +1292,8 @@ struct Scanned<T> {
 /// Reads and parses `resolved`, then runs `job` over the patterns that apply
 /// to its language. Per-file problems become warnings.
 async fn scan_file<T, J>(
-	fs: Fs,
+	fs: &Fs,
+	session: &mut Session,
 	resolved: Resolved,
 	compiled: Arc<[CompiledPattern]>,
 	job: Arc<J>,
@@ -1181,7 +1315,7 @@ where
 			return Ok(Scanned { candidate, warnings, parsed: None });
 		},
 	};
-	let source = match fs.read_to_string(&candidate.path).await {
+	let source = match candidate.read(fs, session).await {
 		Ok(source) => source,
 		Err(err) => {
 			for pattern in compiled.iter() {
@@ -1243,16 +1377,14 @@ where
 		stream::iter(prepared.files),
 		workers,
 		window,
-		|| (),
-		move |(), resolved| {
-			let task = scan_file(
-				scan_fs.clone(),
-				resolved,
-				Arc::clone(&compiled),
-				Arc::clone(&job),
-				scan_halt.clone(),
-			);
-			async move { ((), task.await) }
+		native_session,
+		move |mut session, resolved| {
+			let (fs, compiled, job, halt) =
+				(scan_fs.clone(), Arc::clone(&compiled), Arc::clone(&job), scan_halt.clone());
+			async move {
+				let scanned = scan_file(&fs, &mut session, resolved, compiled, job, halt).await;
+				(session, scanned)
+			}
 		},
 	));
 	while let Some(scanned) = tasks.next().await {

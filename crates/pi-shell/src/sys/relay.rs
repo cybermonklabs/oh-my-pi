@@ -402,7 +402,6 @@ mod tests {
 		os::{fd::OwnedFd, unix::ffi::OsStrExt},
 		path::Path,
 		sync::Arc,
-		time::Instant,
 	};
 
 	use bstr::BString;
@@ -506,6 +505,7 @@ mod tests {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding,
+			term_grace: crate::host::TERM_GRACE,
 		})
 		.unwrap()
 	}
@@ -514,16 +514,45 @@ mod tests {
 	/// read concurrently on the test's own task; `text` makes that pipe a
 	/// text capture.
 	async fn run(session: &mut Session, command: &str, text: bool) -> Vec<u8> {
-		run_timed(session, command, text).await.0
+		run_with(session, command, text, Stdin::Null).await
 	}
 
-	/// [`run`], and how long the run took (the reader may see the end of the
-	/// pipe later, once leftovers holding it are gone).
-	async fn run_timed(session: &mut Session, command: &str, text: bool) -> (Vec<u8>, Duration) {
+	/// The run's stdin in [`run_with`].
+	enum Stdin {
+		/// `/dev/null`.
+		Null,
+		/// The read end of a [`Gate`](crate::testkit::child::Gate), which the
+		/// test opens once the run has returned.
+		Gated,
+	}
+
+	/// A leftover `sh` keeps the pipe open with: it reads fd 3, its copy of
+	/// the run's stdin, to end of file, then runs `then` (and ends). Under
+	/// [`run_with`] with [`Stdin::Gated`], that stdin is a pipe whose only
+	/// write end the test holds, so the leftover ends when the test lets it
+	/// go, or when the test process ends however it ends: the kernel closes
+	/// the write end then. (fd 3, because an asynchronous list's own stdin is
+	/// `/dev/null`.)
+	fn leftover(then: &str) -> String {
+		format!("exec 3<&0; (while read -r _; do :; done <&3; {then}) &")
+	}
+
+	/// [`run`] with `stdin`. With [`Stdin::Gated`], the test opens the gate
+	/// once the run has returned, while the reader still reads: a
+	/// [`leftover`] waiting for the gate holds the pipe past the run's end,
+	/// whatever the host's speed. A run that waited for the leftover would
+	/// never return, and the test hangs until the runner's timeout; the
+	/// runner's kill closes the gate, and the leftover ends.
+	async fn run_with(session: &mut Session, command: &str, text: bool, stdin: Stdin) -> Vec<u8> {
 		let (reader, writer) = io::pipe().unwrap();
 		let mut reader = Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
+		let gate = matches!(stdin, Stdin::Gated).then(crate::testkit::child::Gate::new);
+		let stdin = match &gate {
+			Some(gate) => gate.reader(),
+			None => std::fs::File::open("/dev/null").unwrap(),
+		};
 		let stdio = RunStdio {
-			stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+			stdin:  Some(stdin),
 			stderr: Some(std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()))),
 			stdout: Some(std::fs::File::from(OwnedFd::from(writer))),
 		};
@@ -535,14 +564,13 @@ mod tests {
 			bytes
 		};
 		let run = async {
-			let started = Instant::now();
 			session
 				.run_with(options, stdio, CancellationToken::new())
 				.await
 				.unwrap();
-			started.elapsed()
+			drop(gate);
 		};
-		tokio::join!(read, run)
+		tokio::join!(read, run).0
 	}
 
 	fn legacy_file(dir: &Path) -> String {
@@ -629,30 +657,24 @@ mod tests {
 	/// the program ended inside: the exit is reported after the short hold
 	/// grace (a timer wakes the drain, nothing else would), and the held byte
 	/// is released at the end of the stream, when the leftover is gone, by the
-	/// relay that outlived the program's `ExtProc`.
+	/// relay that outlived the program's `ExtProc`. The leftover ends only
+	/// once the run returned: `X` before `c` is the exit reported first.
 	#[tokio::test(flavor = "current_thread")]
 	async fn held_bytes_wait_for_the_end_of_a_stream_a_leftover_holds() {
-		let (out, took) =
-			run_timed(&mut session(true), "/bin/sh -c 'printf abc; /bin/sleep 1 &'; printf X", true)
-				.await;
+		let command = format!("/bin/sh -c 'printf abc; {}'; printf X", leftover(":"));
+		let out = run_with(&mut session(true), &command, true, Stdin::Gated).await;
 		assert_eq!(out, b"abXc");
-		assert!(took < Duration::from_millis(800), "waited for the leftover: {took:?}");
 	}
 
 	/// What a process the program left running writes after the program's
 	/// exit was reported (and its `ExtProc` dropped) still reaches the
 	/// capture, through the relay adopted on the session's runtime, as it
-	/// would through a plain pipe.
+	/// would through a plain pipe. It writes only once the run returned.
 	#[tokio::test(flavor = "current_thread")]
 	async fn late_output_of_a_leftover_reaches_the_capture() {
-		let (out, took) = run_timed(
-			&mut session(false),
-			"/bin/sh -c 'echo early; (/bin/sleep 0.5; echo late) &'; echo done",
-			true,
-		)
-		.await;
+		let command = format!("/bin/sh -c 'echo early; {}'; echo done", leftover("echo late"));
+		let out = run_with(&mut session(false), &command, true, Stdin::Gated).await;
 		assert_eq!(out, b"early\ndone\nlate\n");
-		assert!(took < Duration::from_millis(400), "waited for the leftover: {took:?}");
 	}
 
 	/// Relays, input feeds and output pumps are polled by their externals'
@@ -663,14 +685,16 @@ mod tests {
 	/// pipes on the way never blocking the one thread.
 	#[tokio::test(flavor = "current_thread")]
 	async fn relays_and_pumps_run_on_a_current_thread_runtime() {
-		let script = "big=$(/usr/bin/yes 0123456789 | /usr/bin/head -n 20000); printf '%s\\n' \
-		              \"$big\" | /bin/cat";
-		let (out, _) = tokio::time::timeout(
-			Duration::from_secs(20),
-			run_timed(&mut session(false), script, true),
-		)
-		.await
-		.expect("nothing blocks the runtime's only thread");
+		let on_path = crate::testkit::child::on_path;
+		let script = format!(
+			"big=$({} 0123456789 | {} -n 20000); printf '%s\\n' \"$big\" | {}",
+			on_path("yes"),
+			on_path("head"),
+			on_path("cat")
+		);
+		// A block of the runtime's only thread hangs the test until the
+		// runner's bound.
+		let out = run(&mut session(false), &script, true).await;
 		assert_eq!(out, "0123456789\n".repeat(20_000).into_bytes());
 	}
 
@@ -682,27 +706,27 @@ mod tests {
 	/// substitution still writes.
 	#[tokio::test(flavor = "current_thread")]
 	async fn procsub_bytes_a_feed_took_go_back_once_in_order() {
-		let script = "exec 4< <(/usr/bin/yes 0123456789 | /usr/bin/head -n 30000)\n/bin/sh -c : \
-		              <&4\n/bin/sh -c 'exit 0'\nx=$(/bin/cat <&4)\ny=$(/usr/bin/yes 0123456789 | \
-		              /usr/bin/head -n 30000)\n[ \"$x\" = \"$y\" ] && echo same || echo \"differ \
-		              ${#x} ${#y}\"";
-		let (out, _) = tokio::time::timeout(
-			Duration::from_secs(20),
-			run_timed(&mut session_with(None), script, false),
-		)
-		.await
-		.expect("the feeds never block the runtime's only thread");
+		let (yes, head) =
+			(crate::testkit::child::on_path("yes"), crate::testkit::child::on_path("head"));
+		let script = format!(
+			"exec 4< <({yes} 0123456789 | {head} -n 30000)\n/bin/sh -c : <&4\n/bin/sh -c 'exit \
+			 0'\nx=$({} <&4)\ny=$({yes} 0123456789 | {head} -n 30000)\n[ \"$x\" = \"$y\" ] && echo \
+			 same || echo \"differ ${{#x}} ${{#y}}\"",
+			crate::testkit::child::on_path("cat")
+		);
+		// A feed that blocked the runtime's only thread would hang the test
+		// until the runner's bound.
+		let out = run(&mut session_with(None), &script, false).await;
 		assert_eq!(String::from_utf8_lossy(&out), "same\n");
 	}
 
 	/// A process the program left running keeps the relay's pipe open: the
-	/// program's exit is still reported at once, with its output.
+	/// program's exit is still reported, with its output, while it runs (it
+	/// ends only once the run returned).
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exit_is_reported_while_a_leftover_holds_the_pipe() {
-		let (out, took) =
-			run_timed(&mut session(false), "/bin/sh -c 'echo hi; /bin/sleep 2 &'; echo done", true)
-				.await;
+		let command = format!("/bin/sh -c 'echo hi; {}'; echo done", leftover(":"));
+		let out = run_with(&mut session(false), &command, true, Stdin::Gated).await;
 		assert_eq!(out, b"hi\ndone\n");
-		assert!(took < Duration::from_secs(1), "waited for the leftover: {took:?}");
 	}
 }

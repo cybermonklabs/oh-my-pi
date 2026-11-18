@@ -47,7 +47,7 @@ use crate::rsync::flist::FlistOpts;
 use crate::rsync::flists::Flists;
 use crate::rsync::generator::{self, DestTrees, SibOut, Sibling};
 use crate::rsync::handshake::{self, Negotiated, Roles, Setup};
-use crate::rsync::iconv;
+use crate::rsync::iconv::{self, MsgCharset};
 use crate::rsync::log::{self, Info, LogCode, LogConfig, Logger, OutLevels, Role, Stats};
 use crate::rsync::meta::MetaOpts;
 use crate::rsync::mux::{IoCounters, Msg, MuxReader, MuxWriter, ReadConfig, ReadProbe, WriteConfig};
@@ -557,11 +557,18 @@ pub(crate) fn run(host: &mut Host, argv: Vec<OsString>) -> i32 {
 	if io.cancel.load(Ordering::Relaxed) { RERR_SIGNAL } else { code }
 }
 
+/// The charset the shell's locale lets printed messages carry (upstream
+/// setup_iconv's `ic_chck`, from `LC_ALL`/`LC_CTYPE`/`LANG`).
+fn msg_charset(io: &HostIo) -> MsgCharset {
+	MsgCharset::for_locale(&iconv::locale_charset(&|key: &str| io.getenv(key)))
+}
+
 /// A logger for diagnostics before the run's own logger exists.
 fn startup_logger(io: &HostIo, am_server: bool) -> Logger {
 	let cfg = LogConfig {
 		am_server,
 		human_readable: 1,
+		charset: msg_charset(io),
 		time_zone: Some(io.tz.clone()),
 		..LogConfig::default()
 	};
@@ -578,6 +585,7 @@ fn log_config(io: &HostIo, opts: &Options, am_server: bool, local_server: bool) 
 		log_file_format: opts.logfile_format.clone(),
 		human_readable: u8::try_from(opts.human_readable).unwrap_or(u8::MAX),
 		eight_bit_output: opts.allow_8bit_chars,
+		charset: msg_charset(io),
 		stderr_mode: opts.stderr_mode(),
 		am_server,
 		quiet: opts.quiet > 0,
@@ -1936,27 +1944,17 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 	if opts.secluded_pending() {
 		let argv = match handshake::read_secluded_args(&mut streams.reader, &io.fs, &io.cwd, opts.max_alloc) {
 			Ok(argv) => argv,
-			Err(err) => {
-				report(&startup, &err);
-				startup.finish(err.code, err.site, &Stats::default(), false);
-				return err.code;
-			}
+			Err(err) => return server_setup_failed(io, local_server, &startup, None, &err),
 		};
 		let getenv = |k: &str| io.getenv(k);
 		match options::parse_secluded(opts, argv.get(1..).unwrap_or(&[]), &getenv) {
 			Ok(Parsed::Run(o)) => opts = *o,
 			Ok(_) => return 0,
-			Err(err) => {
-				report(&startup, &err);
-				startup.finish(err.code, err.site, &Stats::default(), false);
-				return err.code;
-			}
+			Err(err) => return server_setup_failed(io, local_server, &startup, None, &err),
 		}
 		if opts.args.is_empty() {
 			let err = RsyncError::new(RERR_SYNTAX, usage::help_text().trim_end().to_string()).at("main.c", 1968);
-			report(&startup, &err);
-			startup.finish(err.code, err.site, &Stats::default(), false);
-			return err.code;
+			return server_setup_failed(io, local_server, &startup, None, &err);
 		}
 	}
 	let client_info = if local_server { client_info } else { opts.client_info().into_owned() };
@@ -2022,12 +2020,7 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 			}
 			return killed_exit(&logger, logger.role(), &Stats::default());
 		}
-		Err(err) => {
-			report(&logger, &err);
-			logger.finish(err.code, err.site, &Stats::default(), false);
-			*lock(&sink_writer) = None;
-			return err.code;
-		}
+		Err(err) => return server_setup_failed(io, local_server, &logger, Some(&*sink_writer), &err),
 	};
 	logger.set_protocol(neg.proto.version);
 	logger.set_checksums(neg.xfer_sum, neg.file_sum);
@@ -2073,10 +2066,7 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 		_ => None,
 	};
 	if let Some(err) = setup_err {
-		report(&logger, &err);
-		logger.finish(err.code, err.site, &Stats::default(), false);
-		*lock(&sink_writer) = None;
-		return err.code;
+		return server_setup_failed(io, local_server, &logger, Some(&*sink_writer), &err);
 	}
 
 	// The transfer directory (argv[0]) and the remaining operands.
@@ -2099,10 +2089,7 @@ fn server_main(io: &HostIo, opts: Options, local: Option<LocalServer>) -> i32 {
 				let line = if am_sender { 984 } else { 1216 };
 				let err = RsyncError::new(crate::rsync::exit::RERR_FILESELECT, syserr_text(role, &err, &format!("{what} {name} failed")))
 					.at("main.c", line);
-				report(&ctx_logger, &err);
-				logger.finish(err.code, err.site, &Stats::default(), false);
-				*lock(&sink_writer) = None;
-				return err.code;
+				return server_setup_failed(io, local_server, &ctx_logger, Some(&*sink_writer), &err);
 			}
 		}
 	}
@@ -2239,6 +2226,32 @@ fn live_totals(mut stats: Stats, counters: &IoCounters) -> Stats {
 fn killed_exit(logger: &Logger, role: Role, stats: &Stats) -> i32 {
 	let err = RsyncError::bare(RERR_SIGNAL1).at("main.c", 1687);
 	logger.with_role(role).finish(err.code, err.site, stats, false);
+	err.code
+}
+
+/// Ends the server half on a failure before its transfer. A local half that
+/// its client has already stopped exits as upstream's child does on the
+/// client's SIGUSR1, wherever the signal finds it: the failure is then the
+/// stop's doing (a read or write it cancelled), not the half's own.
+fn server_setup_failed(
+	io: &HostIo,
+	local_server: bool,
+	logger: &Logger,
+	sink: Option<&Mutex<Option<MuxWriter>>>,
+	err: &RsyncError,
+) -> i32 {
+	let close = || {
+		if let Some(sink) = sink {
+			*lock(sink) = None;
+		}
+	};
+	if local_server && io.cancel.load(Ordering::Relaxed) {
+		close();
+		return killed_exit(logger, logger.role(), &Stats::default());
+	}
+	report(logger, err);
+	logger.finish(err.code, err.site, &Stats::default(), false);
+	close();
 	err.code
 }
 

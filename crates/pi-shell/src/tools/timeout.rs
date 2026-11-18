@@ -10,7 +10,14 @@
 //! [`REAP_AFTER_KILL`] after that. Exit status: the command's when it
 //! finishes in time; 124 after the deadline; 137 once `KILL` was sent;
 //! the command's own under `--preserve-status`; 125 for timeout's own
-//! errors (bad usage, interval or signal).
+//! errors (bad usage, interval or signal). As the command of `xargs` or
+//! `find -exec … +`, `timeout` hands a refusal of its command as too long up
+//! to them ([`Phase::TooLong`]), and they retry the line in halves, each with
+//! a `timeout` of its own, as GNU's retry a line whose `timeout` the system
+//! refused. A program it cannot run is reported as coreutils' `timeout`
+//! reports it: `timeout: failed to run command ‘NAME’: strerror` (quoted as
+//! GNU's `quote` does in the locale), status 126, or 127 when nothing is
+//! found (a `#!` interpreter included).
 
 use std::time::Duration;
 
@@ -251,7 +258,16 @@ enum Phase {
 	Signalled { opts: Options, kill_at: Option<u64>, give_up: Option<u64>, recheck: u64 },
 	/// The answer, once the output is written.
 	Exit(i32),
+	/// The system refused the command's line as too long with this error,
+	/// for a caller that retries it ([`ToolCall::too_long_to_caller`]): no
+	/// signal was sent, nothing ran, and the caller hears of it as of a
+	/// `timeout` whose own `exec` the system refused, as GNU's xargs does.
+	TooLong(i32),
 }
+
+/// Environment variable of a test gate ([`Timeout::gate`]).
+#[cfg(test)]
+pub(crate) const GATE_VAR: &str = "PI_TIMEOUT_TEST_GATE";
 
 /// A `timeout` call.
 pub(super) struct Timeout {
@@ -259,6 +275,13 @@ pub(super) struct Timeout {
 	call:             ToolCall,
 	out:              Out,
 	phase:            Phase,
+	/// A test fires this call's deadline by creating this file, instead of
+	/// the duration passing ([`GATE_VAR`] in the call's environment). A
+	/// test of what the deadline does then fixes the order itself — the
+	/// command is up before the deadline comes — rather than racing a
+	/// loaded host with a short duration.
+	#[cfg(test)]
+	gate:             Option<std::path::PathBuf>,
 }
 
 impl Timeout {
@@ -275,7 +298,61 @@ impl Timeout {
 				Phase::Exit(EXIT_FAILURE)
 			},
 		};
-		Self { child: Child::default(), call, out, phase }
+		#[cfg(test)]
+		let gate = call
+			.env
+			.get(GATE_VAR.as_bytes())
+			.and_then(|path| path.to_str().ok())
+			.map(std::path::PathBuf::from);
+		Self {
+			child: Child::default(),
+			call,
+			out,
+			phase,
+			#[cfg(test)]
+			gate,
+		}
+	}
+
+	/// Whether the limit has come at `now`: `deadline` has passed, or the
+	/// test's [`Timeout::gate`] exists.
+	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
+	fn expired(&self, now: u64, deadline: Option<u64>) -> bool {
+		#[cfg(test)]
+		if let Some(gate) = &self.gate {
+			return gate.exists();
+		}
+		deadline.is_some_and(|at| now >= at)
+	}
+
+	/// When the limit of a call that has just started comes: its duration
+	/// from `now`, or the next poll of a test [`Timeout::gate`].
+	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
+	fn limit_at(&self, now: u64, opts: &Options) -> Option<u64> {
+		#[cfg(test)]
+		if self.gate.is_some() {
+			return Some(now.saturating_add(nanos(RECHECK)));
+		}
+		opts.limit.map(|d| now.saturating_add(nanos(d)))
+	}
+
+	/// The deadline of a running call at its next turn: its own, or the
+	/// next poll of a test [`Timeout::gate`].
+	#[cfg_attr(
+		not(test),
+		expect(
+			clippy::unused_self,
+			clippy::missing_const_for_fn,
+			reason = "reads the test gate in tests"
+		)
+	)]
+	fn repoll(&self, now: u64, deadline: Option<u64>) -> Option<u64> {
+		#[cfg(test)]
+		if self.gate.is_some() {
+			return Some(now.saturating_add(nanos(RECHECK)));
+		}
+		let _ = now;
+		deadline
 	}
 
 	pub(super) fn deadline(&self) -> Option<u64> {
@@ -285,7 +362,7 @@ impl Timeout {
 				.into_iter()
 				.flatten()
 				.min(),
-			Phase::Start(_) | Phase::Exit(_) => None,
+			Phase::Start(_) | Phase::Exit(_) | Phase::TooLong(_) => None,
 		}
 	}
 
@@ -312,6 +389,31 @@ impl Timeout {
 		}
 	}
 
+	/// The phase once the command ended before its limit: a line too long
+	/// handed up to a caller that retries it, a command that could not run
+	/// (coreutils' `timeout: failed to run command ‘NAME’: strerror`, 126, or
+	/// 127 when nothing is found), or its status.
+	fn ended(&mut self, opts: &Options) -> Phase {
+		if let Some(errno) = self.child.too_long(&self.call) {
+			return Phase::TooLong(errno);
+		}
+		if let Some((status, text)) = self.child.cannot_run(&self.call) {
+			let env = &self.call.env;
+			// The call's environment, as coreutils' `setlocale(LC_ALL, "")` reads
+			// it.
+			let utf8 = pi_builtins::extras::ctype_is_utf8_in(|var| {
+				env.get(var.as_bytes())
+					.and_then(|value| value.to_str().ok())
+			});
+			let name = pi_builtins::extras::gnu_quote(utf8, &opts.command[0].to_str_lossy());
+			self
+				.out
+				.push(2, format!("timeout: failed to run command {name}: {text}\n"));
+			return Phase::Exit(status);
+		}
+		Phase::Exit(self.child.status.unwrap_or_default())
+	}
+
 	pub(super) fn advance(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -322,13 +424,18 @@ impl Timeout {
 			Phase::Start(opts) => {
 				self
 					.child
-					.start(api, turn, &self.call, opts.command.clone(), false, "");
-				let deadline = opts.limit.map(|d| now.saturating_add(nanos(d)));
-				Phase::Running { opts, deadline }
+					.start(api, turn, &self.call, opts.command.clone(), false, "", true);
+				if self.child.status.is_some() {
+					// Nothing was found to run.
+					self.ended(&opts)
+				} else {
+					let deadline = self.limit_at(now, &opts);
+					Phase::Running { opts, deadline }
+				}
 			},
 			Phase::Running { opts, deadline } => match self.child.status {
-				Some(status) => Phase::Exit(status),
-				None if deadline.is_some_and(|at| now >= at) => {
+				Some(_) => self.ended(&opts),
+				None if self.expired(now, deadline) => {
 					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;
 					Phase::Signalled {
@@ -340,7 +447,7 @@ impl Timeout {
 						opts,
 					}
 				},
-				None => Phase::Running { opts, deadline },
+				None => Phase::Running { opts, deadline: self.repoll(now, deadline) },
 			},
 			Phase::Signalled { opts, mut kill_at, mut give_up, .. } => {
 				if kill_at.is_some_and(|at| now >= at) {
@@ -376,9 +483,11 @@ impl Timeout {
 				}
 			},
 			Phase::Exit(code) => Phase::Exit(code),
+			Phase::TooLong(code) => Phase::TooLong(code),
 		};
 		match self.phase {
 			Phase::Exit(code) if self.out.flush(api) => Some(CallOutcome::Exit(code)),
+			Phase::TooLong(code) if self.out.flush(api) => Some(CallOutcome::TooLong(code)),
 			_ => {
 				// Verbose lines go out as they come.
 				self.out.flush(api);

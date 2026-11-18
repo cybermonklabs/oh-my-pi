@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -20,6 +21,9 @@ from robomp.git_ops import PushResult
 from robomp.github_client import GitHubClient, IssueIndexEntry, IssueInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, build
 from robomp.sandbox import LocalGitTransport, Workspace
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 def _stub_workspace(tmp_path: Path) -> Workspace:
@@ -151,6 +155,95 @@ def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
     assert env["GIT_COMMITTER_NAME"] == bindings.author_name
     assert env["GIT_COMMITTER_EMAIL"] == bindings.author_email
     assert (bindings.workspace.root / ".omp-tmp").is_dir()
+
+
+def test_repo_command_env_replaces_inherited_git_config_with_safe_directory(
+    db: Database, tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # Repo commands run code from the checkout: robomp's own series never
+    # reaches them, and no slot is left past the count.
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
+    assert git_config.past_count(env) == {}
+
+
+def test_repo_command_env_keeps_the_operator_credential_config_out(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_config_channel: str,
+    agent_home: Path,
+) -> None:
+    # Repo commands run code from the checkout. robomp's env names a credential
+    # helper and an Authorization header through each of seven channels; git,
+    # run in a repo command's env, must see neither, with or without an agent
+    # home. With one it reads that home's own config.
+    monkeypatch.setattr(host_tools, "_AGENT_HOME", agent_home)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.credentials(os.environ, tmp_path) != [], "control: git reads the operator's config"
+    assert git_config.credentials(env, tmp_path) == []
+    assert git_config.entries(env) == [("safe.directory", str(bindings.workspace.repo_dir))]
+    expected_user = git_config.AGENT_HOME_USER if agent_home.is_dir() else None
+    assert git_config.get(env, tmp_path, "user.name") == expected_user
+
+
+def test_repo_command_env_gives_its_own_xdg_config_home(
+    db: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    operator_git_ignore: Path,
+    agent_home: Path,
+) -> None:
+    # `GIT_CONFIG_GLOBAL` does not keep git from reading the operator's
+    # per-user ignore file, and gh's token lives under `$XDG_CONFIG_HOME` too.
+    # A repo command's `XDG_CONFIG_HOME` is the agent home's `.config`, else
+    # the workspace's own empty dir, so git in its env still shows the file the
+    # operator's ignore file hides.
+    monkeypatch.setattr(host_tools, "_AGENT_HOME", agent_home)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert git_config.untracked(os.environ, operator_git_ignore) == [], "control: git reads the operator's ignore"
+    assert git_config.untracked(env, operator_git_ignore) == ["untracked.txt"]
+    expected = agent_home / ".config" if agent_home.is_dir() else bindings.workspace.root / ".omp-xdg" / "config"
+    assert env["XDG_CONFIG_HOME"] == str(expected)
+
+
+def test_repo_command_env_keeps_credential_variables_out(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A token, a credential prompt program or the operator's ssh agent in
+    # robomp's env would let code from the checkout authenticate as robomp.
+    credential_env = {
+        "GH_TOKEN": "probe-gh-token",
+        "GIT_ASKPASS": "/probe/askpass",
+        "SSH_ASKPASS": "/probe/ssh-askpass",
+        "SSH_AUTH_SOCK": "/probe/agent.sock",
+    }
+    for key, value in credential_env.items():
+        monkeypatch.setenv(key, value)
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert {key: env.get(key) for key in credential_env} == dict.fromkeys(credential_env, "")
 
 
 def test_run_repo_command_uses_slot_identity_kwargs(

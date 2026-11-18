@@ -27,7 +27,9 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "respx>=0.21",
-  "ruff>=0.13",
+  # Exact: `bun run lint:py` and `fix:py` (scripts/ruff.ts) read this pin and
+  # refuse a `python3 -m ruff` of any other version, or none.
+  "ruff==0.17.5",
 ]
 
 [project.scripts]

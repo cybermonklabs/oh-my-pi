@@ -18,6 +18,7 @@ import { type BankScope, computeBankScope, type HindsightBankSet } from "./bank"
 import { createHindsightClient } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
 import { type HindsightMessage, hasSubstantiveContent } from "./content";
+import { sessionDisposalSignal } from "./session-lifetime";
 import { HindsightSessionState } from "./state";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -37,9 +38,10 @@ export const hindsightBackend: MemoryBackend = {
 		if (!sessionId) return;
 
 		// Subagents alias the parent's state so recall/retain/reflect tool calls
-		// persist to the same Hindsight bank. Auto-recall and auto-retain stay
-		// with the parent — running them per subagent would double-recall and
-		// pollute the bank with internal exploration transcripts.
+		// persist to the same Hindsight bank. First-turn recall and auto-retain
+		// stay with the parent — running them per subagent would double-recall and
+		// pollute the bank with internal exploration transcripts. A subagent's
+		// compaction recall shares the parent's pause after a failed recall.
 		if (options.taskDepth > 0) {
 			const parent = options.parentHindsightSessionState;
 			if (!parent) return;
@@ -60,7 +62,7 @@ export const hindsightBackend: MemoryBackend = {
 					aliasOf: parent,
 				}),
 			);
-			// Aliases don't run auto-recall/auto-retain, so any pending retain
+			// Aliases run no first-turn recall and no auto-retain, so any pending retain
 			// queue belongs to the previous alias and is safe to drop after a
 			// best-effort flush (`flushRetainQueue` is no-op when empty).
 			await previous?.flushRetainQueue();
@@ -270,7 +272,10 @@ async function installPrimaryState(
 	const config = loadHindsightConfig(settings);
 	if (!isHindsightConfigured(config)) return undefined;
 
-	const client = createHindsightClient(config);
+	// A request this client holds for `/pause` belongs to the session, not to
+	// this state: the bank outlives a rebuild, and a rebuild drains the retain
+	// queue first. Only the session going away ends the wait.
+	const client = createHindsightClient(config, sessionDisposalSignal(session));
 	const scope = computeBankScope(config, session.sessionManager.getCwd());
 
 	// Cleanup any stale state for this session (defensive — prevents leaks

@@ -8,6 +8,7 @@ import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-codi
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import { withoutAmbientShellPrefix } from "./helpers/ambient-shell-prefix";
 
 // `getShellConfig()` validates that `shellPath` exists, and `/bin/bash` does not
 // on Windows. The ACP route only forwards the path to the stubbed client
@@ -63,6 +64,9 @@ function shortenAcpWaits(): void {
 afterEach(() => {
 	mock.restore();
 });
+
+// The client terminal receives the exact line the shell config builds, prefix included.
+withoutAmbientShellPrefix();
 
 describe("BashTool ACP terminal routing", () => {
 	it("emits a live terminal update but releases it before the completed result", async () => {
@@ -214,7 +218,8 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("resolves using the last polled output when final output retrieval fails", async () => {
-		shortenAcpWaits();
+		// Real waits: the case ends on the terminal's own exit after one 250 ms poll tick. Compressing the
+		// command's deadline would race it against that exit, and a loaded machine would lose the race.
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		let currentOutputCalls = 0;
 		const handle: ClientBridgeTerminalHandle = {

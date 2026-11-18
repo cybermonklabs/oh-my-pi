@@ -202,11 +202,18 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gh-pr-tool-home-"));
 	vi.spyOn(os, "homedir").mockReturnValue(home);
 	// Clear XDG_*_HOME so the rebuilt resolver routes `dirs.rootSubdir("wt", "data")`
-	// through the spied homedir instead of `$XDG_DATA_HOME/omp/wt` (CI sets these).
-	const xdgKeys = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
-	const xdgPrevious: Partial<Record<(typeof xdgKeys)[number], string | undefined>> = {};
-	for (const key of xdgKeys) {
-		xdgPrevious[key] = process.env[key];
+	// through the spied homedir instead of `$XDG_DATA_HOME/omp/wt` (CI sets these), and
+	// the config-root overrides the test preload sets, which replace the home's `.omp`.
+	const rootEnvKeys = [
+		"XDG_DATA_HOME",
+		"XDG_STATE_HOME",
+		"XDG_CACHE_HOME",
+		"OMP_CONFIG_ROOT",
+		"OMP_DOWNLOAD_ROOT",
+	] as const;
+	const previousRootEnv: Partial<Record<(typeof rootEnvKeys)[number], string | undefined>> = {};
+	for (const key of rootEnvKeys) {
+		previousRootEnv[key] = process.env[key];
 		delete process.env[key];
 	}
 	// `dirs.configRoot` is computed at constructor time from `os.homedir()`, so
@@ -217,12 +224,13 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 	return {
 		home,
 		cleanup: async () => {
-			setAgentDir(originalAgentDir);
-			for (const key of xdgKeys) {
-				const previous = xdgPrevious[key];
+			for (const key of rootEnvKeys) {
+				const previous = previousRootEnv[key];
 				if (previous === undefined) delete process.env[key];
 				else process.env[key] = previous;
 			}
+			// Rebuilt after the restore, so the resolver takes the restored config root again.
+			setAgentDir(originalAgentDir);
 			await removeWithRetries(home);
 		},
 	};

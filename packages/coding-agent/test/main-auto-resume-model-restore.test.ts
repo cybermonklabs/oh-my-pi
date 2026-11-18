@@ -144,6 +144,9 @@ async function runScenario(scenario: Scenario): Promise<Observation> {
 		console.log("OBSERVATION_17043:" + JSON.stringify(observation));
 		process.exit(0);
 	`;
+	// No deadline of its own: how long a cold child takes to start measures the machine, not
+	// startup. A child that hangs is ended at the per-test timeout by the runner, which kills
+	// the processes a timed-out test spawned.
 	const proc = Bun.spawn([process.execPath, "--eval", script], {
 		cwd: temp.path(),
 		env: {
@@ -162,7 +165,6 @@ async function runScenario(scenario: Scenario): Promise<Observation> {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
-		signal: AbortSignal.timeout(20_000),
 	});
 	try {
 		const [exitCode, stdout, stderr] = await Promise.all([
@@ -302,7 +304,7 @@ describe("implicit auto-resume model restoration", () => {
 							rows.map(row => JSON.stringify(row)).join("\\n") + "\\n");
 					`,
 				],
-				{ cwd: temp.path(), env, stdout: "pipe", stderr: "pipe", signal: AbortSignal.timeout(10_000) },
+				{ cwd: temp.path(), env, stdout: "pipe", stderr: "pipe" },
 			);
 			const [prepared, preparationError] = await Promise.all([prepare.exited, new Response(prepare.stderr).text()]);
 			if (prepared !== 0) throw new Error(`Could not seed the saved session: ${preparationError}`);
@@ -349,7 +351,9 @@ describe("implicit auto-resume model restoration", () => {
 					"--no-lsp",
 					"--no-prewalk",
 				],
-				{ cwd: temp.path(), env, terminal, signal: AbortSignal.timeout(20_000) },
+				// No deadline on either child, as in runScenario: how long they take to start measures
+				// the machine, and the runner kills a timed-out test's processes.
+				{ cwd: temp.path(), env, terminal },
 			);
 			try {
 				await Promise.race([

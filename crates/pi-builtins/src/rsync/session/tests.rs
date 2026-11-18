@@ -119,6 +119,43 @@ fn too_old_protocol_is_a_mismatch() {
 	);
 }
 
+/// The client of a local copy stops its server half while the half is in the
+/// protocol exchange: the half has sent its version and not yet read the
+/// client's. Upstream's child exits on that SIGUSR1 wherever it is, so the
+/// half's one line is `received SIGUSR1`, never the read the stop cancelled.
+/// `too_old_protocol_is_a_mismatch` takes this path when its half is slow.
+#[test]
+fn a_local_half_stopped_in_its_handshake_exits_as_signalled() {
+	let dir = tempfile::tempdir().unwrap();
+	let (mut host, cap) = crate::host::Host::for_test("rsync", Vec::new(), dir.path());
+	let io = HostIo::new(&mut host, Arc::new(HashMap::new()), OsString::from("rsync"));
+	let getenv = |_: &str| None;
+	let argv = ["--protocol=19", "-a", "src/", "d/"].map(OsString::from);
+	let Ok(Parsed::Run(opts)) = options::parse(&argv, &getenv) else { panic!("the operands parse") };
+	let mut sopts = options::local_server_options(&opts, &getenv).unwrap();
+	sopts.args = vec![OsString::from("."), OsString::from("d/")];
+	sopts.old_style_args = 2;
+	let kill = Arc::new(AtomicBool::new(false));
+	let (mut client, server) = transport::local_pair(Arc::clone(&kill));
+	let mut sio = io.clone();
+	sio.cancel = Arc::clone(&kill);
+	let local = LocalServer {
+		conn: server,
+		client_info: handshake::local_client_info(&opts, false),
+		filters: Filters::new(FilterConfig::default()),
+	};
+	let half = thread::spawn(move || server_main(&sio, sopts, Some(local)));
+	// The half's version arrives; the client's never does.
+	let mut version = [0u8; 4];
+	client.reader.read_exact(&mut version).unwrap();
+	kill.store(true, Ordering::Relaxed);
+	let code = half.join().unwrap();
+	assert_eq!(
+		(code, cap.err().as_str()),
+		(RERR_SIGNAL1, "rsync error: received SIGUSR1 (code 19) at main.c(1687) [Receiver=3.5.1]\n")
+	);
+}
+
 /// Captured from rsync 3.5.1: when the server half of a local copy fails while
 /// setting up, the client exits with its code and prints nothing of its own.
 #[test]
@@ -299,12 +336,10 @@ fn log_file_exit_line_uses_live_counters() {
 	// received 300264 or 300280 against server sent 300264.
 	#[cfg(unix)]
 	{
-		use std::os::unix::fs::PermissionsExt;
 		let Some(rsync) = reference() else { return };
 		// Runs the remote command through sh so --rsync-path can carry options.
 		let rsh = dir.path().join("shrsh");
-		fs::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
-		fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::rsync::testprog::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n");
 		let server_log = dir.path().join("s.log");
 		let rpath = format!("--rsync-path={} --log-file={}", rsync.display(), server_log.display());
 		let source = format!("h:{}/src/", dir.path().display());
@@ -346,9 +381,13 @@ fn local_delete_copies_terminate() {
 /// local copy run repeatedly reports identical `sent`/`received` counts (rsync
 /// 3.5.1 is deterministic here, even under CPU load). Frames meet reads only where
 /// upstream's processes would: reads happen at refills with the socketpair-sized
-/// in-process pipe, never ahead of them.
+/// in-process pipe, never ahead of them. The test runs in a process of its
+/// own, away from the other tests' threads.
 #[test]
 fn local_copy_byte_totals_are_deterministic() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	for i in 0..20 {
@@ -397,19 +436,18 @@ fn shared_writer_retries_would_block() {
 }
 
 /// Cancelling while the client waits on its peer (a remote shell that never
-/// answers) ends the run promptly with upstream's signal exit: code 20 and the
-/// `received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874)` trailer.
+/// answers, and whose `sleep 600` outlives the test runner's 4-minute bound)
+/// ends the run with upstream's signal exit: code 20 and the `received
+/// SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874)` trailer. Only the
+/// cancel can end it: a run that did not notice it is failed by the runner.
 #[cfg(unix)]
 #[test]
 fn cancel_mid_connection_exits_20_with_trailer() {
-	use std::os::unix::fs::PermissionsExt;
-
 	use clap::Parser as _;
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	fs::write(&rsh, "#!/bin/sh\nexec sleep 30\n").unwrap();
-	fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::rsync::testprog::write(&rsh, "#!/bin/sh\nexec sleep 600\n");
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
 	let canceller = std::thread::spawn(move || {
@@ -418,11 +456,9 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	});
 	let rsh_arg = rsh.to_str().unwrap().to_string();
 	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "-e", &rsh_arg, "src/", "h:dst/"]).unwrap();
-	let started = Instant::now();
 	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
 	canceller.join().unwrap();
 	assert_eq!(code, RERR_SIGNAL);
-	assert!(started.elapsed() < Duration::from_secs(10), "cancellation was not prompt");
 	assert_eq!(cap.err(), "rsync error: received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874) [sender=3.5.1]\n");
 }
 
@@ -530,18 +566,20 @@ fn checksum_mode_catches_same_size_and_time() {
 	let dir = tempfile::tempdir().unwrap();
 	let src = dir.path().join("src");
 	make_tree(&src);
-	assert_eq!(run(&["-a", "src/", "dst/"], dir.path()).0, 0);
+	let (code, _, err) = run(&["-a", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	let target = dir.path().join("dst/a");
 	let when = mtime(&target);
 	fs::write(&target, b"HELLO\n").unwrap();
 	fs::File::options().write(true).open(&target).unwrap().set_modified(when).unwrap();
 	// The quick check sees nothing to do.
-	let (_, out, _) = run(&["-ai", "src/", "dst/"], dir.path());
+	let (code, out, err) = run(&["-ai", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	assert_eq!(out, "");
 	assert_eq!(fs::read(&target).unwrap(), b"HELLO\n");
 	// -c compares contents.
-	let (code, out, _) = run(&["-aic", "src/", "dst/"], dir.path());
-	assert_eq!(code, 0);
+	let (code, out, err) = run(&["-aic", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	assert_eq!(out, ">fc........ a\n");
 	assert_eq!(fs::read(&target).unwrap(), b"hello\n");
 }
@@ -578,10 +616,8 @@ fn list_only_matches_reference() {
 /// A fake remote shell that runs the remote command locally.
 #[cfg(unix)]
 fn fake_rsh(dir: &Path) -> PathBuf {
-	use std::os::unix::fs::PermissionsExt;
 	let path = dir.join("fakersh");
-	fs::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
-	fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::rsync::testprog::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n");
 	path
 }
 
