@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- With session-store masking on, a change written to an older message (an elided tool result, a retry or compaction stamp) is stored masked by that message's rules, so a signed thinking block whose text held a secret no longer comes back with a signature it does not match
 - Fixed subagent progress probes that could not read the agent's prompt cache: a probe now goes out only when at least 95% of its own prompt is in the agent's cache, the request's tools and thinking level are unchanged since the agent's last request, and the cache entry has more than 30 seconds left of its lifetime (the shorter of the one the model declares and the one the provider named for the entry); with no known lifetime, no probe goes out, and the progress line keeps its last estimate meanwhile
 - `--resume <id>` and `omp gc --restore <id>` with a full session id now open only the session whose id is exactly `<id>`, archived sessions included, never another session whose id only starts with it; a shorter prefix still selects by prefix
 - When the Hindsight server does not respond, later prompts no longer each wait out the recall timeout: automatic recall pauses for `hindsight.recallCooldownMs` (also `HINDSIGHT_RECALL_COOLDOWN_MS`, default 1 minute, doubling up to 30 minutes), and a notice says when it tries again. `0` turns the pause off

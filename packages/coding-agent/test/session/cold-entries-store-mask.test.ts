@@ -4,7 +4,10 @@
  * whole. A full write masks each held value of a cold entry, in the values the entry keeps in
  * memory and in those it reads back from its record, as it masks a whole entry, and reads none of
  * the cold entries' images back to do it; with masking off it stores them as written. A clone, a
- * persisted copy and a fork of a cold session keep both its masking binding and its cold store.
+ * persisted copy and a fork of a cold session keep both its masking binding and its cold store,
+ * which serves their cold entries once the source is closed. An appended `entry_patch` record
+ * stores each patch masked as a full write stores the entry it patches: a signed block whose text
+ * masking changed loses its signature, and a field the entry keeps stays as written.
  * The model reads the real values: masking applies to what is stored, never to what a cold entry
  * reads back. Each case runs against file storage and SQLite SQL storage.
  */
@@ -290,6 +293,33 @@ interface Seeded {
 	text: string;
 }
 
+/**
+ * The record a write appended to `seeded` as written, or `undefined` unless the store holds
+ * `seeded` unchanged followed by exactly one more line.
+ */
+function appendedRecord(seeded: Seeded, stored: string): StoredRecord | undefined {
+	if (!stored.startsWith(seeded.text)) return undefined;
+	const added = stored.slice(seeded.text.length);
+	if (added.indexOf("\n") !== added.length - 1) return undefined;
+	const record: unknown = JSON.parse(added);
+	return isRecord(record) ? record : undefined;
+}
+
+/** The stored line of entry `id` in a session body. */
+function lineOf(stored: string, id: string): string {
+	const index = storedRecords(stored).findIndex(record => record.id === id);
+	if (index < 0) throw new Error(`No stored entry ${id}`);
+	return entryLines(stored)[index]!;
+}
+
+/** A reply's content as a patch sets it: a signed thinking block, and a signed text block that holds no value. */
+function signedContent(thinking: string, thinkingSignature: string): AssistantMessage["content"] {
+	return [
+		{ type: "thinking", thinking, thinkingSignature },
+		{ type: "text", text: "the reply", textSignature: "text-signature" },
+	];
+}
+
 for (const backend of backends) {
 	describe(`session store masking of a session whose older entries are cold, under ${backend.name}`, () => {
 		let tmp: TempDir;
@@ -428,8 +458,11 @@ for (const backend of backends) {
 				const source = await resume(await seed("source"), true, masking);
 				const clone = source.cloneCurrentSession();
 				cleanups.push(() => clone.close());
+				// Closed, the source releases its cold store: only the store the clone holds serves the clone's cold entries.
+				await source.close();
 
 				expect(clone.coldStoreStats().coldEntries).toBeGreaterThan(0);
+				expect(clone.coldStoreStats().storeBytes).toBeGreaterThan(0);
 				expect(compactNewTurn(clone, "clone")).toBeGreaterThan(0);
 				await clone.rewriteEntries();
 				await store.storage.drain();
@@ -450,11 +483,14 @@ for (const backend of backends) {
 					store.storage,
 				);
 				cleanups.push(() => copy.close());
+				// Closed, the source releases its cold store: only the store the copy holds serves the copy's cold entries.
+				await source.close();
 				await store.storage.drain();
 
 				// The copy's own first write holds the cold entries it copied.
 				expect(maskedView(await store.read(sessionFileOf(copy)), [])).toEqual(masked([]));
 				expect(copy.coldStoreStats().coldEntries).toBeGreaterThan(0);
+				expect(copy.coldStoreStats().storeBytes).toBeGreaterThan(0);
 				expect(compactNewTurn(copy, "copy")).toBeGreaterThan(0);
 				await copy.rewriteEntries();
 				await store.storage.drain();
@@ -494,6 +530,65 @@ for (const backend of backends) {
 				await store.storage.drain();
 				expect(maskedView(await store.read(sessionFileOf(cold.forked)), ["fork"])).toEqual(masked(["fork"]));
 				expect(cold.forked.storeMasking).toBe(masking);
+			},
+			CASE_TIMEOUT_MS,
+		);
+
+		it(
+			"stores a patch's signed block that holds a value masked and unsigned, in one appended line, as a full write stores its entry",
+			async () => {
+				const masking = binding(true);
+				const patch = { entryId: "a1", message: { content: signedContent(said(ENV_VALUE), "thinking-signature") } };
+				const seeded = await seed("appended");
+				const appended = await resume(seeded, true, masking);
+				await appended.patchEntries([patch]);
+				await appended.close();
+				await store.storage.drain();
+
+				// The record in the shape an older binary reads: the block's text masked, and the signature
+				// that text no longer matches left out; the unchanged block keeps its own.
+				expect(appendedRecord(seeded, await store.read(seeded.file))?.data).toEqual({
+					patches: [
+						{
+							entryId: "a1",
+							message: {
+								content: [
+									{ type: "thinking", thinking: said(ENV_MARKER) },
+									{ type: "text", text: "the reply", textSignature: "text-signature" },
+								],
+							},
+						},
+					],
+				});
+
+				// Loaded with the record, the entry is the one a full write of the patched session stores whole.
+				const reloaded = await resume(seeded, true, masking);
+				await reloaded.rewriteEntries();
+				const whole = await resume(await seed("whole"), false, masking);
+				await whole.patchEntries([patch]);
+				await whole.rewriteEntries();
+				await store.storage.drain();
+				expect(lineOf(await store.read(seeded.file), "a1")).toBe(
+					lineOf(await store.read(sessionFileOf(whole)), "a1"),
+				);
+			},
+			CASE_TIMEOUT_MS,
+		);
+
+		it(
+			"stores a patch whose value lies only in a field its entry keeps as written, in one appended line",
+			async () => {
+				const seeded = await seed("kept");
+				const manager = await resume(seeded, true, binding(true));
+				// A block's signature is kept unscanned, and neither block's text holds the value.
+				await manager.patchEntries([
+					{ entryId: "a1", message: { content: signedContent("the reasoning", `signature ${ENV_VALUE}`) } },
+				]);
+				await store.storage.drain();
+
+				expect(appendedRecord(seeded, await store.read(seeded.file))).toEqual(
+					wire(manager.getEntries().at(-1)) as StoredRecord,
+				);
 			},
 			CASE_TIMEOUT_MS,
 		);

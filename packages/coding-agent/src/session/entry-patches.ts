@@ -30,11 +30,18 @@
  * record with no patches ({@link withoutEntryPatches}), so a field that a
  * later rewrite-only change replaced (images a later pass dropped from an
  * elided result) does not come back when the file is loaded.
+ *
+ * With session-store masking on, each patch reaches the store masked as its
+ * fields are in the stored line of the entry it patches
+ * ({@link maskEntryPatchRecord}), so the entry a load patches is the one a
+ * full write stores.
  */
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantRetryRecovery, ContextSnapshot, Message } from "@oh-my-pi/pi-ai";
 import { cloneJsonTree, isRecord, logger } from "@oh-my-pi/pi-utils";
-import type { CustomMessageEntry, FileEntry, SessionEntry } from "./session-entries";
+import type { SessionStoreMask } from "../secrets/session-store-mask";
+import type { CustomEntry, CustomMessageEntry, FileEntry, SessionEntry } from "./session-entries";
+import { maskEntryFields, maskMessageFields, maskSessionEntry, maskStoredData } from "./session-entry-mask";
 
 export const ENTRY_PATCH_CUSTOM_TYPE = "entry_patch";
 
@@ -255,6 +262,11 @@ function isEntryPatchData(value: unknown): value is EntryPatchData {
 	return isRecord(value) && Array.isArray(value.patches) && value.patches.every(isEntryPatch);
 }
 
+/** Whether `entry` is an `entry_patch` record. */
+export function isEntryPatchRecord(entry: FileEntry): entry is CustomEntry {
+	return entry.type === "custom" && entry.customType === ENTRY_PATCH_CUSTOM_TYPE;
+}
+
 /** Where {@link applyEntryPatches} finds the entry a patch names. */
 export interface EntryPatchTargets {
 	get(entryId: string): SessionEntry | undefined;
@@ -274,7 +286,7 @@ function applyRecords(
 	let lookup = targets;
 	let changed = false;
 	for (const entry of entries) {
-		if (entry.type !== "custom" || entry.customType !== ENTRY_PATCH_CUSTOM_TYPE) continue;
+		if (!isEntryPatchRecord(entry)) continue;
 		const data = entry.data;
 		if (!isEntryPatchData(data)) {
 			logger.warn("Skipping malformed entry patch record", { id: entry.id });
@@ -333,7 +345,78 @@ const NO_PATCHES: EntryPatchData = { patches: [] };
  * rewrite persists.
  */
 export function withoutEntryPatches(entry: FileEntry): FileEntry {
-	return entry.type === "custom" && entry.customType === ENTRY_PATCH_CUSTOM_TYPE
-		? { ...entry, data: NO_PATCHES }
-		: entry;
+	return isEntryPatchRecord(entry) ? { ...entry, data: NO_PATCHES } : entry;
+}
+
+/**
+ * `value` with each own field's value replaced by what `maskField` gives for
+ * it, in key order; `value` itself when every field keeps its value.
+ */
+function maskFields<T extends object>(value: T, maskField: (key: string, field: unknown) => unknown): T {
+	const fields = Object.entries(value);
+	let changed = false;
+	for (const field of fields) {
+		const masked = maskField(field[0], field[1]);
+		if (Object.is(masked, field[1])) continue;
+		field[1] = masked;
+		changed = true;
+	}
+	// `fromEntries` defines each key as its own field, a parsed `__proto__` included.
+	return changed ? (Object.fromEntries(fields) as T) : value;
+}
+
+/**
+ * `record`, an `entry_patch` record, as the store holds it under `mask`; the
+ * live record keeps its values. Its own fields are masked as every entry's
+ * are ({@link maskSessionEntry}). Each patch is masked as its fields are in
+ * the stored line of the entry it names, found in `targets`: that entry's
+ * `type` and its message's `role`, which a cold entry keeps in memory, choose
+ * the rules, so a signed block whose text masking changes loses its signature
+ * as it does there, a field that entry keeps stays as written, and `entryId`
+ * is kept. A patch naming an entry `targets` lacks (one an atomic batch
+ * rolled back) has no such rules: masked as free data, it is left out of the
+ * stored record when masking changes it, so no masked text is stored beside
+ * its signature. Any other field of the data is masked as free data, and data
+ * of another shape as any `custom` entry's is.
+ */
+export function maskEntryPatchRecord(
+	record: CustomEntry,
+	targets: EntryPatchTargets,
+	mask: SessionStoreMask | null,
+): CustomEntry {
+	if (mask === null || mask.empty) return record;
+	const data = record.data;
+	if (!isEntryPatchData(data)) return maskSessionEntry(record, mask);
+	let patches: EntryPatch[] | undefined;
+	for (let index = 0; index < data.patches.length; index++) {
+		const patch = data.patches[index]!;
+		const target = targets.get(patch.entryId);
+		let masked: EntryPatch | undefined;
+		if (target) {
+			masked = maskFields(patch, (key, value) => {
+				// Kept, as the entry's own `id` is.
+				if (key === "entryId") return value;
+				if (key === "entry") return maskEntryFields(value, target.type, mask);
+				if (key === "message" && target.type === "message") {
+					return maskMessageFields(value, target.message.role, mask);
+				}
+				return maskStoredData(value, mask);
+			});
+		} else if (maskStoredData(patch, mask) === patch) {
+			masked = patch;
+		}
+		if (patches === undefined) {
+			if (masked === patch) continue;
+			patches = data.patches.slice(0, index);
+		}
+		if (masked !== undefined) patches.push(masked);
+	}
+	const maskedData = maskFields(data, (key, value) =>
+		key === "patches" ? (patches ?? value) : maskStoredData(value, mask),
+	);
+	// The record's own fields; its data is masked above.
+	const fields = { ...record, data: NO_PATCHES };
+	const maskedFields = maskSessionEntry(fields, mask);
+	if (maskedFields === fields && maskedData === data) return record;
+	return { ...maskedFields, data: maskedData };
 }

@@ -1,6 +1,7 @@
 /**
- * Copy-on-write masking of a session entry or header, and of a `/btw` record, before it reaches
- * the session store (`secrets.maskSessionStore`). Every string is masked except a field that
+ * Copy-on-write masking of a session entry or header, of fields of an entry stored apart from it
+ * (an `entry_patch` record's patches), and of a `/btw` record, before it reaches the session store
+ * (`secrets.maskSessionStore`). Every string is masked except a field that
  * {@link POSITIONS} keeps, and a field is kept only at the position the table names for it: under
  * a tool call's `arguments`, a tool result's `details`, custom data or any other key the table
  * does not name, every string is masked whatever its key or shape. Object keys, numbers, booleans
@@ -609,6 +610,29 @@ export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
 }
 
 /**
+ * `fields`, top-level fields of an entry of `type` stored apart from it, such as a patch of an
+ * `entry_patch` record, masked as the same values are in that entry's own stored line
+ * ({@link maskSessionEntry}): the rules of an entry and of its `type` keep, mask and drop them.
+ * Returns `fields` itself when it holds nothing to mask, or when `mask` is `null` or empty.
+ */
+export function maskEntryFields<T>(fields: T, type: string, mask: SessionStoreMask | null): T {
+	return maskFieldsAt(fields, POSITIONS.entry, type, mask);
+}
+
+/** {@link maskEntryFields} for fields of a `message` entry's message of `role`. */
+export function maskMessageFields<T>(fields: T, role: string, mask: SessionStoreMask | null): T {
+	return maskFieldsAt(fields, POSITIONS.message, role, mask);
+}
+
+/** `fields` masked at `at` as an object there whose `type` or `role` is `tag`. */
+function maskFieldsAt<T>(fields: T, at: Position, tag: string, mask: SessionStoreMask | null): T {
+	if (mask === null || mask.empty) return fields;
+	const walk = new MaskWalk(mask);
+	if (!isPlainObject(fields)) return maskFree(fields, "", walk) as T;
+	return maskObjectAs(fields, walk, at, at.variants === undefined ? undefined : variantOf(tag, at.variants)) as T;
+}
+
+/**
  * `value` with every held secret replaced by its marker, for a stored copy of free data, such as a
  * subagent's yield data: no field in it is kept. The value itself is masked, never dropped.
  */
@@ -705,7 +729,11 @@ function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, k
 			const before = walk.replacements;
 			next = maskChild(item, walk, at);
 			// KR10: the siblings of a server-tool block go with it only when masking changed text in it.
-			if (walk.replacements > before && at.variants !== undefined && variantOf(item, at.variants)?.pair) {
+			if (
+				walk.replacements > before &&
+				at.variants !== undefined &&
+				variantOf(item[at.variants.key], at.variants)?.pair
+			) {
 				droppedPair = item[at.variants.key];
 			}
 		} else {
@@ -726,7 +754,21 @@ function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, k
 
 /** `obj`, an object in its stored form, masked at `at`, a listed position of a plain object, or as free content without one. */
 function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position | undefined): Record<string, unknown> {
-	const variant = at?.variants === undefined ? undefined : variantOf(obj, at.variants);
+	return maskObjectAs(
+		obj,
+		walk,
+		at,
+		at?.variants === undefined ? undefined : variantOf(obj[at.variants.key], at.variants),
+	);
+}
+
+/** {@link maskObject} with `variant`, the row of `at` for `obj`'s `type` or `role`, chosen by the caller. */
+function maskObjectAs(
+	obj: Record<string, unknown>,
+	walk: MaskWalk,
+	at: Position | undefined,
+	variant: Position | undefined,
+): Record<string, unknown> {
 	const signatureKey = signatureKeyOf(obj, variant);
 	const before = walk.replacements;
 	let copy: Record<string, unknown> | undefined;
@@ -792,9 +834,8 @@ function placed(
 	return name === undefined ? undefined : POSITIONS[name];
 }
 
-/** The rules `variants` adds for `obj`, by its `type` or `role`. */
-function variantOf(obj: Record<string, unknown>, variants: NonNullable<Position["variants"]>): Position | undefined {
-	const tag = obj[variants.key];
+/** The rules `variants` adds for an object whose `type` or `role` is `tag`. */
+function variantOf(tag: unknown, variants: NonNullable<Position["variants"]>): Position | undefined {
 	const variant = typeof tag === "string" ? ownValue(variants.by, tag) : undefined;
 	return typeof variant === "string" ? POSITIONS[variant] : variant;
 }

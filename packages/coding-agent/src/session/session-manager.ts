@@ -181,6 +181,8 @@ import {
 	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatch,
 	entryAcceptsPatch,
+	isEntryPatchRecord,
+	maskEntryPatchRecord,
 	setPatchedFields,
 	toEntryPatchData,
 	withoutEntryPatches,
@@ -2376,11 +2378,17 @@ export class SessionManager {
 	/**
 	 * The stored line of `entry`: a cold entry's whole form read back from its
 	 * record, masked with `mask` as a hot entry is ({@link maskSessionEntry}),
-	 * so the store gets the same bytes whether the entry is cold or whole.
+	 * so the store gets the same bytes whether the entry is cold or whole. An
+	 * `entry_patch` record stays one line, each of its patches masked by the
+	 * rules of the entry this manager holds under its id
+	 * ({@link maskEntryPatchRecord}).
 	 */
 	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
 		const source = coldEntryForPersistence(entry) ?? entry;
-		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(source, mask), this.#blobs)) ?? "null"}\n`;
+		const masked = isEntryPatchRecord(source)
+			? maskEntryPatchRecord(source, this.#index, mask)
+			: maskSessionEntry(source, mask);
+		return `${stringifyJson(prepareEntryForPersistence(masked, this.#blobs)) ?? "null"}\n`;
 	}
 
 	/**

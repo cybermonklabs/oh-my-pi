@@ -226,10 +226,9 @@ export class IrcBus implements IrcBusApi {
 		// again before the delivery returned reads parked at both ends. An agent
 		// the bus did not forget records as usual, a parked one or one the
 		// registry never held included; one forgotten and revived since is live.
-		// The receipt names who received it, after any readdressing.
 		if (
 			(flight.fromForgotten && !isLive(this.#registry.get(message.from))) ||
-			(flight.toForgotten && !isLive(this.#registry.get(receipt.to)))
+			(flight.toForgotten && !isLive(this.#registry.get(flight.to)))
 		) {
 			return receipt;
 		}
