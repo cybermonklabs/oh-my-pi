@@ -140,6 +140,16 @@ function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
 }
 
+/** Whether `message` streamed text and nothing a continuation could not pick up from (tool calls, images, server tools). */
+function isTextOnlyTurn(message: AssistantMessage): boolean {
+	let hasText = false;
+	for (const block of message.content) {
+		if (block.type === "toolCall" || block.type === "image" || block.type === "anthropicServerTool") return false;
+		if (block.type === "text" && hasNonWhitespace(block.text)) hasText = true;
+	}
+	return hasText;
+}
+
 /**
  * End of the conversation in `messages`, before trailing context-only custom
  * messages: eval runtime snapshots (appended at startup and on display-context
@@ -380,6 +390,13 @@ type RetryPolicyOptions = {
 	fireworksFastFallback?: boolean;
 	hardErrorFallback?: boolean;
 	preserveFailedTurn?: boolean;
+	/**
+	 * A rate limit after visible text ({@link TurnRecovery.isCommittedTextRateLimit}):
+	 * keep the failed turn, wait as for any rate limit, then continue the answer
+	 * with the stall-continue reminder instead of sending the turn again. Never
+	 * walks `retry.fallbackChains`.
+	 */
+	continueCommittedText?: boolean;
 };
 
 type UsageLimitOutcome = {
@@ -751,13 +768,7 @@ export class TurnRecovery {
 			return false;
 		}
 		if (!this.autoRetryEnabled || this.#host.abortInProgress() || this.#host.isDisposed()) return false;
-		if (!this.#host.textOutputCommitted()) return false;
-		let hasText = false;
-		for (const block of message.content) {
-			if (block.type === "toolCall" || block.type === "image" || block.type === "anthropicServerTool") return false;
-			if (block.type === "text" && hasNonWhitespace(block.text)) hasText = true;
-		}
-		if (!hasText) return false;
+		if (!this.#host.textOutputCommitted() || !isTextOnlyTurn(message)) return false;
 
 		this.#streamStallContinueCount++;
 		if (this.#streamStallContinueCount > STREAM_STALL_CONTINUE_MAX_RETRIES) {
@@ -776,25 +787,35 @@ export class TurnRecovery {
 			provider: message.provider,
 			errorMessage: message.errorMessage,
 		});
-		this.#host.agent.appendMessage({
-			role: "developer",
-			content: [
-				{
-					type: "text",
-					text: prompt.render(streamStallContinueTemplate, {
-						retryCount: this.#streamStallContinueCount,
-						maxRetries: STREAM_STALL_CONTINUE_MAX_RETRIES,
-					}),
-				},
-			],
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
+		this.#appendStreamStallContinueReminder(this.#streamStallContinueCount, STREAM_STALL_CONTINUE_MAX_RETRIES);
 		this.#host.scheduleAgentContinue({
 			source: "stream-stall-continue",
 			generation: this.#host.promptGeneration(),
 		});
 		return true;
+	}
+
+	/**
+	 * A rate limit (an HTTP 429 that is not a usage limit) that ended a text-only
+	 * turn after its text rendered. The turn cannot be sent again, since its text
+	 * is shown, so {@link handleRetryableError} with `continueCommittedText`
+	 * waits the limit out on this model and then continues the answer.
+	 */
+	isCommittedTextRateLimit(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || message.errorStatus !== 429) return false;
+		if (AIError.is(this.#classifyRetryMessage(message), AIError.Flag.UsageLimit)) return false;
+		if (!this.autoRetryEnabled || this.#host.abortInProgress() || this.#host.isDisposed()) return false;
+		return this.#host.textOutputCommitted() && isTextOnlyTurn(message);
+	}
+
+	/** The developer reminder that continues a turn cut off after its text: pick up where the text stopped. */
+	#appendStreamStallContinueReminder(retryCount: number, maxRetries: number): void {
+		this.#host.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: prompt.render(streamStallContinueTemplate, { retryCount, maxRetries }) }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
 	}
 
 	/** Removes a persisted failed assistant turn after its persistence slot settles; returns the dropped branch entry id. */
@@ -2725,6 +2746,7 @@ export class TurnRecovery {
 			requestProvider !== model.provider;
 		const preserveFailedTurn =
 			options?.preserveFailedTurn === true ||
+			options?.continueCommittedText === true ||
 			((classifierRefusal || AIError.is(id, AIError.Flag.MalformedFunctionCall) || AIError.retriable(id)) &&
 				this.#unexecutedToolCallsReplaySafe(message));
 		const rateLimitReason = parseRateLimitReason(errorMessage);
@@ -2912,7 +2934,10 @@ export class TurnRecovery {
 			switchedCredential = false;
 			delayMs = calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#retryAttempt);
 		}
-		const allowModelFallback = options?.allowModelFallback !== false && !this.#host.modelFallbackDisabled?.();
+		const allowModelFallback =
+			options?.allowModelFallback !== false &&
+			!options?.continueCommittedText &&
+			!this.#host.modelFallbackDisabled?.();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
@@ -3252,9 +3277,15 @@ export class TurnRecovery {
 		// tail after the backoff (covering rebuilds during the sleep too) and
 		// strip a still-failed assistant tail by position. Never when preserving
 		// the failed turn — the kept turn ends in synthetic tool results that
-		// continue() accepts — and never once a newer prompt owns the session.
+		// continue() accepts, or in the reminder below — and never once a newer
+		// prompt owns the session.
 		if (!preserveFailedTurn && this.#host.promptGeneration() === generation) {
 			this.#stripFailedAssistantTail();
+		}
+		// A rate limit after visible text continues the answer instead of sending
+		// it again: the kept turn ends in the stall-continue reminder.
+		if (options?.continueCommittedText && this.#host.promptGeneration() === generation) {
+			this.#appendStreamStallContinueReminder(this.#retryAttempt, maxRetries);
 		}
 
 		// Retry via continue() outside the agent_end event callback chain. A

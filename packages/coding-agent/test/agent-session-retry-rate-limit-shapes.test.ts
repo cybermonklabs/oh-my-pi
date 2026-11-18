@@ -8,10 +8,12 @@
  * after the stated wait or the built-in backoff, walks `retry.fallbackChains`
  * only once the attempts are spent or the stated wait is past
  * `retry.maxDelayMs`, and never walks a context over the threshold; an overload
- * keeps the walk at its first failure. The built-in backoff is never read as a
- * stated wait. The primary model's requests run the real `anthropic-messages`
- * provider; only its HTTP client is replaced, so no request leaves the process.
- * Chain models answer from a stub stream.
+ * keeps the walk at its first failure. A rate limit after streamed text waits
+ * the same way, then continues the answer on the same model, and never walks.
+ * The built-in backoff is never read as a stated wait. The primary model's
+ * requests run the real `anthropic-messages` provider; only its HTTP client is
+ * replaced, so no request leaves the process. Chain models answer from a stub
+ * stream.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
@@ -97,7 +99,39 @@ const OVERLOADED_FRAME = sseFrame("error", {
 	error: { type: "overloaded_error", message: "Overloaded" },
 });
 
-/** What every request to the primary answers: a 200 event stream, or an HTTP refusal. */
+const CONTINUED_TEXT = ", and here is the rest of it.";
+
+/** A whole answer, as the continuation after a rate limit gets it. */
+const CONTINUED_ANSWER =
+	MESSAGE_START_FRAME +
+	sseFrame("content_block_start", {
+		type: "content_block_start",
+		index: 0,
+		content_block: { type: "text", text: "" },
+	}) +
+	sseFrame("content_block_delta", {
+		type: "content_block_delta",
+		index: 0,
+		delta: { type: "text_delta", text: CONTINUED_TEXT },
+	}) +
+	sseFrame("content_block_stop", { type: "content_block_stop", index: 0 }) +
+	sseFrame("message_delta", {
+		type: "message_delta",
+		delta: { stop_reason: "end_turn", stop_sequence: null },
+		usage: { output_tokens: 8 },
+	}) +
+	sseFrame("message_stop", { type: "message_stop" });
+
+/** A rate limit after streamed text whose message states a wait past {@link MAX_DELAY_MS}. */
+const LONG_WAIT_RATE_LIMIT_FRAME = sseFrame("error", {
+	type: "error",
+	error: {
+		type: "rate_limit_error",
+		message: `${RATE_LIMIT_MESSAGE} Please retry after ${LONG_STATED_WAIT_SECONDS} seconds.`,
+	},
+});
+
+/** What a request to the primary answers: a 200 event stream, or an HTTP refusal. */
 type PrimaryAnswer =
 	| { stream: string }
 	| { status: number; errorType: string; message: string; retryAfterSeconds?: number };
@@ -106,16 +140,26 @@ type PrimaryAnswer =
  * What the turn does. `waits`: the primary is retried until its attempts are
  * spent, each retry after `waitMs`; then a small context walks to the next
  * chain entry and a large one ends with the provider's error. `walks`: a
- * small context walks at the first failure, a large one ends there. `ends`:
- * every context ends at the first failure on the same model, because a turn
- * whose text is already shown is never sent again, to this model or another.
- * `overload`: every context walks at the first failure.
+ * small context walks at the first failure, a large one ends there.
+ * `continues`: after `waitMs` the primary is asked once more, to continue the
+ * answer it had streamed, and the turn ends with that continuation.
+ * `spent`: every context retries the primary, each after `waitMs`, until its
+ * attempts are spent, then ends with the provider's error. `ends`: every
+ * context ends at the first failure with the provider's error, on the same
+ * model. `overload`: every context walks at the first failure.
  */
-type Outcome = { kind: "waits"; waitMs: number } | { kind: "walks" } | { kind: "ends" } | { kind: "overload" };
+type Outcome =
+	| { kind: "waits"; waitMs: number }
+	| { kind: "walks" }
+	| { kind: "continues"; waitMs: number }
+	| { kind: "spent"; waitMs: number }
+	| { kind: "ends" }
+	| { kind: "overload" };
 
 interface Shape {
 	name: string;
-	answer: PrimaryAnswer;
+	/** The primary's answers, in request order; the last answers every later request. */
+	answers: readonly PrimaryAnswer[];
 	outcome: Outcome;
 	maxDelayMs?: number;
 }
@@ -123,42 +167,59 @@ interface Shape {
 const SHAPES: Shape[] = [
 	{
 		name: "a rate_limit_error frame before message_start",
-		answer: { stream: RATE_LIMIT_FRAME },
+		answers: [{ stream: RATE_LIMIT_FRAME }],
 		outcome: { kind: "waits", waitMs: BACKOFF_MS },
 	},
 	{
 		name: "a rate_limit_error frame after message_start",
-		answer: { stream: MESSAGE_START_FRAME + RATE_LIMIT_FRAME },
+		answers: [{ stream: MESSAGE_START_FRAME + RATE_LIMIT_FRAME }],
 		outcome: { kind: "waits", waitMs: BACKOFF_MS },
 	},
 	{
 		name: "a rate_limit_error frame after a text delta",
-		answer: { stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+		answers: [{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME }, { stream: CONTINUED_ANSWER }],
+		outcome: { kind: "continues", waitMs: BACKOFF_MS },
+	},
+	{
+		name: "a rate_limit_error frame after a text delta on every request",
+		answers: [{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME }],
+		outcome: { kind: "spent", waitMs: BACKOFF_MS },
+	},
+	{
+		name: "a rate_limit_error frame after a text delta stating a wait past retry.maxDelayMs",
+		answers: [
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + LONG_WAIT_RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		],
 		outcome: { kind: "ends" },
 	},
 	{
 		name: "an HTTP 429 that states no wait",
-		answer: { status: 429, errorType: "rate_limit_error", message: RATE_LIMIT_MESSAGE },
+		answers: [{ status: 429, errorType: "rate_limit_error", message: RATE_LIMIT_MESSAGE }],
 		outcome: { kind: "waits", waitMs: BACKOFF_MS },
 	},
 	{
 		name: "an HTTP 429 that states a wait",
-		answer: {
-			status: 429,
-			errorType: "rate_limit_error",
-			message: RATE_LIMIT_MESSAGE,
-			retryAfterSeconds: STATED_WAIT_SECONDS,
-		},
+		answers: [
+			{
+				status: 429,
+				errorType: "rate_limit_error",
+				message: RATE_LIMIT_MESSAGE,
+				retryAfterSeconds: STATED_WAIT_SECONDS,
+			},
+		],
 		outcome: { kind: "waits", waitMs: STATED_WAIT_SECONDS * 1000 },
 	},
 	{
 		name: "an HTTP 429 that states a wait past retry.maxDelayMs",
-		answer: {
-			status: 429,
-			errorType: "rate_limit_error",
-			message: RATE_LIMIT_MESSAGE,
-			retryAfterSeconds: LONG_STATED_WAIT_SECONDS,
-		},
+		answers: [
+			{
+				status: 429,
+				errorType: "rate_limit_error",
+				message: RATE_LIMIT_MESSAGE,
+				retryAfterSeconds: LONG_STATED_WAIT_SECONDS,
+			},
+		],
 		outcome: { kind: "walks" },
 	},
 	// The built-in backoff is not a stated wait: under a retry.maxDelayMs below
@@ -166,24 +227,24 @@ const SHAPES: Shape[] = [
 	// provider asked for.
 	{
 		name: "an HTTP 429 that states no wait, under a retry.maxDelayMs below the backoff",
-		answer: { status: 429, errorType: "rate_limit_error", message: RATE_LIMIT_MESSAGE },
+		answers: [{ status: 429, errorType: "rate_limit_error", message: RATE_LIMIT_MESSAGE }],
 		outcome: { kind: "waits", waitMs: SHORT_MAX_DELAY_MS },
 		maxDelayMs: SHORT_MAX_DELAY_MS,
 	},
 	{
 		name: "a rate_limit_error frame after message_start, under a retry.maxDelayMs below the backoff",
-		answer: { stream: MESSAGE_START_FRAME + RATE_LIMIT_FRAME },
+		answers: [{ stream: MESSAGE_START_FRAME + RATE_LIMIT_FRAME }],
 		outcome: { kind: "waits", waitMs: SHORT_MAX_DELAY_MS },
 		maxDelayMs: SHORT_MAX_DELAY_MS,
 	},
 	{
 		name: "an HTTP 529 overload",
-		answer: { status: 529, errorType: "overloaded_error", message: "Overloaded" },
+		answers: [{ status: 529, errorType: "overloaded_error", message: "Overloaded" }],
 		outcome: { kind: "overload" },
 	},
 	{
 		name: "an overloaded_error frame before message_start",
-		answer: { stream: OVERLOADED_FRAME },
+		answers: [{ stream: OVERLOADED_FRAME }],
 		outcome: { kind: "overload" },
 	},
 ];
@@ -264,10 +325,14 @@ describe("rate-limit retry across the shapes of a refusal", () => {
 		vi.restoreAllMocks();
 	});
 
-	/** Sends `prompt`; every primary request answers `answer`, every chain model answers. */
-	async function runRefusedTurn(answer: PrimaryAnswer, prompt: string, maxDelayMs: number) {
+	/** Sends `prompt`; the primary's requests take `answers` in order (the last repeating), every chain model answers. */
+	async function runRefusedTurn(answers: readonly PrimaryAnswer[], prompt: string, maxDelayMs: number) {
+		let primaryRequests = 0;
 		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
-			() => ({ asResponse: () => primaryResponse(answer) }) as never,
+			() =>
+				({
+					asResponse: () => primaryResponse(answers[Math.min(primaryRequests++, answers.length - 1)]!),
+				}) as never,
 		);
 		const requestedModels: string[] = [];
 		// A request to the primary after the first that no `auto_retry_start`
@@ -352,8 +417,12 @@ describe("rate-limit retry across the shapes of a refusal", () => {
 					: `retries the same model after ${outcome.waitMs}ms until its attempts are spent, then ends without walking`;
 			case "walks":
 				return size === "small" ? "walks the chain at once" : "ends at once without walking";
+			case "continues":
+				return `waits ${outcome.waitMs}ms, then continues the answer on the same model`;
+			case "spent":
+				return `continues on the same model after ${outcome.waitMs}ms until its attempts are spent, then ends without walking`;
 			case "ends":
-				return "ends at once on the same model, sending nothing again";
+				return "ends at once on the same model with the provider's error";
 			case "overload":
 				return "walks the chain at the first failure";
 		}
@@ -362,7 +431,7 @@ describe("rate-limit retry across the shapes of a refusal", () => {
 	for (const shape of SHAPES) {
 		for (const size of ["small", "large"] as const) {
 			it(`${shape.name}, ${size} context: ${describeOutcome(shape.outcome, size)}`, async () => {
-				const result = await runRefusedTurn(shape.answer, CONTEXTS[size], shape.maxDelayMs ?? MAX_DELAY_MS);
+				const result = await runRefusedTurn(shape.answers, CONTEXTS[size], shape.maxDelayMs ?? MAX_DELAY_MS);
 
 				if (size === "large") expect(result.contextTokensAtFirstFailure).toBeGreaterThan(THRESHOLD_TOKENS);
 				else expect(result.contextTokensAtFirstFailure).toBeLessThan(THRESHOLD_TOKENS);
@@ -370,7 +439,9 @@ describe("rate-limit retry across the shapes of a refusal", () => {
 				expect(result.immediatePrimaryResends).toBe(0);
 				// The session never reports a wait the provider did not state.
 				for (const text of [...result.retryEndErrors, result.last.errorMessage ?? ""]) {
-					if (shape.outcome.kind !== "walks") expect(text).not.toMatch(/Provider requested \d+ms wait/);
+					if (shape.outcome.kind !== "walks" && shape.outcome.kind !== "ends") {
+						expect(text).not.toMatch(/Provider requested \d+ms wait/);
+					}
 				}
 
 				const walked = { fallbackTargets: [`${PROVIDER}/${CHAIN[0]}`], model: CHAIN[0] };
@@ -382,8 +453,29 @@ describe("rate-limit retry across the shapes of a refusal", () => {
 					expect(result.last).toMatchObject({ stopReason: "stop", model: CHAIN[0] });
 					return;
 				}
-				if (outcome.kind === "ends") {
-					expect(result.requestedModels).toEqual([PRIMARY]);
+				if (outcome.kind === "continues") {
+					expect(result.requestedModels).toEqual([PRIMARY, PRIMARY]);
+					expect(result.retryDelays).toEqual([outcome.waitMs]);
+					expect(result).toMatchObject(stayed);
+					expect(result.last).toMatchObject({
+						stopReason: "stop",
+						model: PRIMARY,
+						content: [{ type: "text", text: CONTINUED_TEXT }],
+					});
+					return;
+				}
+				if (outcome.kind === "spent" || outcome.kind === "ends") {
+					expect(result.requestedModels).toEqual(outcome.kind === "spent" ? SPENT_ON_PRIMARY : [PRIMARY]);
+					if (outcome.kind === "spent") {
+						expect(result.retryDelays).toEqual(Array.from({ length: MAX_RETRIES }, () => outcome.waitMs));
+					} else {
+						// The turn ends because the stated wait is past the cap, and says so.
+						expect(result.retryEndErrors).toEqual([
+							expect.stringContaining(
+								`Provider requested ${LONG_STATED_WAIT_SECONDS * 1000}ms wait, exceeds retry.maxDelayMs`,
+							),
+						]);
+					}
 					expect(result).toMatchObject(stayed);
 					expect(result.last.stopReason).toBe("error");
 					expect(result.last.errorMessage).toContain("rate_limit_error");
