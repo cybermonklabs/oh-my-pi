@@ -167,9 +167,10 @@ describe("a session manager's load that a full rewrite races", () => {
 		return manager.getEntries().map(entry => [entry.type, entry.type === "custom" ? String(entry.data).length : 0]);
 	}
 
-	it("opens the session with every entry, streaming its header probe and its load again", async () => {
-		// The first stream is the header probe, the third the load's first.
-		const { storage, wholeReads } = racedStorage(pass => pass === 1 || pass === 3);
+	it("opens the session with every entry, its header probe reading one chunk and its load streamed again", async () => {
+		// The first stream is the header probe, which stops in its first chunk, so no race reaches it;
+		// the second is the load's first pass, raced past that chunk.
+		const { storage, wholeReads } = racedStorage(pass => pass <= 2);
 
 		const manager = await SessionManager.open(FILE, path.dirname(FILE), storage, { suppressBreadcrumb: true });
 
@@ -178,7 +179,7 @@ describe("a session manager's load that a full rewrite races", () => {
 			sessionId: manager.getSessionId(),
 			passes: storage.passes,
 			wholeReads: wholeReads(),
-		}).toEqual({ held: [["custom", 9 * MiB]], sessionId: "raced", passes: 4, wholeReads: 0 });
+		}).toEqual({ held: [["custom", 9 * MiB]], sessionId: "raced", passes: 3, wholeReads: 0 });
 	});
 
 	it("switches to the session with every entry, streaming the load again from its start", async () => {

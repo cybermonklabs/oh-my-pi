@@ -515,7 +515,6 @@ export async function visitEntriesFromFileStream(
 		let unread = maxBytes;
 		const chunks = options.chunks ?? transcriptByteChunks(filePath, options.storage ?? defaultSessionStorage());
 		for await (const streamed of chunks) {
-			if (parser.stopped) break;
 			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
 			unread -= chunk.byteLength;
 			bytesSinceYield += chunk.byteLength;
@@ -538,6 +537,8 @@ export async function visitEntriesFromFileStream(
 			parser.append(chunk);
 			parser.peelTitleSlot();
 			await visitParsed(parser.drain());
+			// Stop before the loop pulls another chunk: a stopped visitor reads no further.
+			if (parser.stopped) break;
 			await yieldToMacrotask();
 			if (unread === 0) break;
 		}
@@ -577,13 +578,13 @@ export function visitEntriesFromChunksSync(
 		}
 	};
 	for (const chunk of chunks) {
-		if (parser.stopped) break;
 		options.onChunk?.(chunk);
 		parser.append(chunk);
 		// Parsing before the chunk closes a line re-scans the unfinished record.
 		if (chunk.lastIndexOf(0x0a) === -1) continue;
 		parser.peelTitleSlot();
 		visitParsed(parser.drain());
+		if (parser.stopped) break;
 	}
 	visitParsed(parser.finish());
 	return parser.titleSlot;

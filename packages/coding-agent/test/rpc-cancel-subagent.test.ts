@@ -125,6 +125,8 @@ describe("handleRpcCancelSubagent", () => {
 		/** Queued steers: the text each was sent with and the user message the queue holds for it. */
 		const queuedSteers: Array<{ text: string; message: UserMessage }> = [];
 		const busyPrompts: string[] = [];
+		/** The text of every steer the session received, queued or later taken back. */
+		const steerCalls: string[] = [];
 		let streaming = false;
 		const runTurn = (source: (typeof turns)[number]["source"], during?: () => void) => {
 			streaming = true;
@@ -223,6 +225,7 @@ describe("handleRpcCancelSubagent", () => {
 				return true;
 			},
 			steer: async (text: string, _images?: unknown, options?: SteerOptions) => {
+				steerCalls.push(text);
 				const message: UserMessage = {
 					role: "user",
 					content: [{ type: "text", text }],
@@ -301,6 +304,9 @@ describe("handleRpcCancelSubagent", () => {
 			/** Steers still waiting on the session's queue. */
 			queuedSteers,
 			busyPrompts,
+			steerCalls,
+			/** Listeners subscribed to the subagent's session (the executor's own included). */
+			sessionListenerCount: () => listeners.size,
 			/** The eval `agent()` job on the parent's job manager. */
 			evalJob: () => manager.getJob(childId),
 			/** Resolves once the executor waits for the job with the subagent between turns. */
@@ -719,6 +725,57 @@ describe("handleRpcCancelSubagent", () => {
 			expect(subagent.queuedSteers).toEqual([]);
 			expect(subagent.turns).toHaveLength(1);
 			expect(subagent.evalJob()?.status).toBe("running");
+		} finally {
+			await subagent.stop();
+		}
+	}, 15_000);
+
+	test("steer_subagent answers at once, queueing nothing and leaving no subscription, when the RPC shutdown already began", async () => {
+		const betweenTurnSteers = new AbortController();
+		betweenTurnSteers.abort();
+		const subagent = startSubagentAwaitingEvalJob();
+		try {
+			await subagent.awaitingJob;
+			// The steer's `ensureLive` builds the lifecycle manager on first use, which
+			// subscribes to the registry for good; build it first so only the steer's own count.
+			AgentLifecycleManager.global();
+			/** Subscriptions the steer made and did not end, per source. */
+			const live = { registry: 0, global: 0, shutdown: 0 };
+			const track = (target: { onChange(listener: () => void): () => void }, key: "registry" | "global") => {
+				const onChange = target.onChange.bind(target);
+				vi.spyOn(target, "onChange").mockImplementation(listener => {
+					live[key]++;
+					const unsubscribe = onChange(listener);
+					return () => {
+						live[key]--;
+						unsubscribe();
+					};
+				});
+			};
+			track(registry, "registry");
+			track(AgentRegistry.global(), "global");
+			const signal = betweenTurnSteers.signal;
+			const addEventListener = signal.addEventListener.bind(signal);
+			const removeEventListener = signal.removeEventListener.bind(signal);
+			vi.spyOn(signal, "addEventListener").mockImplementation((type, listener, options) => {
+				if (type === "abort" && listener) live.shutdown++;
+				addEventListener(type, listener, options);
+			});
+			vi.spyOn(signal, "removeEventListener").mockImplementation((type, listener, options) => {
+				if (type === "abort" && listener) live.shutdown--;
+				removeEventListener(type, listener, options);
+			});
+			const sessionListeners = subagent.sessionListenerCount();
+
+			await expect(handleRpcSteerSubagent(registry, subagent.id, "Also check the README.", signal)).resolves.toBe(
+				`Subagent's run ended before the message reached it: ${subagent.id}`,
+			);
+
+			expect(subagent.steerCalls).toEqual([]);
+			expect(subagent.queuedSteers).toEqual([]);
+			expect(live).toEqual({ registry: 0, global: 0, shutdown: 0 });
+			expect(subagent.sessionListenerCount()).toBe(sessionListeners);
+			expect(subagent.turns).toHaveLength(1);
 		} finally {
 			await subagent.stop();
 		}
