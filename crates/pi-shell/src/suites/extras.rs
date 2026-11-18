@@ -617,7 +617,7 @@ async fn the_words_a_callout_generates_take_no_alias_or_disabled_builtin() {
 			"alias {alias}: the arguments did not each run once"
 		);
 	}
-	let printf = on_path("printf");
+	let printf = crate::testkit::child::on_path("printf");
 	for (builtin, command, said) in [
 		("builtin", format!("xargs -a two {printf} '%s\\n'"), "1\n2\n"),
 		("exec", format!("xargs -a two {printf} '%s\\n'"), "1\n2\n"),
@@ -1253,12 +1253,12 @@ async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
 		p.join("b").display(),
 		std::env::var("PATH").unwrap()
 	);
+	let echo = crate::testkit::child::on_path("echo");
 	for wrapper in ["timeout 5", "nohup"] {
 		let path = [("PATH", path.as_str())];
 		assert_wrapper_as_coreutils(p, wrapper, "foo", "C", &path, (0, "B\n", "")).await;
 		let ran =
-			run(&mut session_in(p, &[]), &format!("hash -p /bin/echo myecho; {wrapper} myecho hi"))
-				.await;
+			run(&mut session_in(p, &[]), &format!("hash -p {echo} myecho; {wrapper} myecho hi")).await;
 		assert_eq!(
 			(ran.status, ran.stdout.as_str(), ran.stderr.as_str()),
 			(0, "hi\n", ""),
@@ -1275,18 +1275,19 @@ async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
 async fn timeout_and_nohup_trace_only_their_own_command_line() {
 	let dir = tempfile::tempdir().unwrap();
 	let mut s = session_in(dir.path(), &[]);
+	let (echo, truth) =
+		(crate::testkit::child::on_path("echo"), crate::testkit::child::on_path("true"));
 	for wrapper in ["timeout 5", "nohup"] {
-		let ran = run(&mut s, &format!("set -x; {wrapper} /bin/echo hi")).await;
+		let ran = run(&mut s, &format!("set -x; {wrapper} {echo} hi")).await;
 		assert_eq!(
 			(ran.stdout.as_str(), ran.stderr.as_str()),
-			("hi\n", &*format!("+ {wrapper} /bin/echo hi\n")),
+			("hi\n", &*format!("+ {wrapper} {echo} hi\n")),
 			"{wrapper}"
 		);
 		let ran = run(
 			&mut s,
 			&format!(
-				"set +x -T; trap 'echo \"D:$BASH_COMMAND\" >&2' DEBUG; {wrapper} /bin/true; trap - \
-				 DEBUG"
+				"set +x -T; trap 'echo \"D:$BASH_COMMAND\" >&2' DEBUG; {wrapper} {truth}; trap - DEBUG"
 			),
 		)
 		.await;
@@ -1297,7 +1298,7 @@ async fn timeout_and_nohup_trace_only_their_own_command_line() {
 			.collect();
 		assert_eq!(
 			seen,
-			[format!("D:{wrapper} /bin/true"), "D:trap - DEBUG".to_owned()],
+			[format!("D:{wrapper} {truth}"), "D:trap - DEBUG".to_owned()],
 			"{wrapper}: {}",
 			ran.stderr
 		);
@@ -1610,7 +1611,8 @@ async fn a_refused_line_is_split_through_nohup() {
 		assert_split_through(&mut s, &command, wrapper, &words).await;
 		assert_refused_alone_through(&mut s, &command).await;
 	}
-	let ran = run(&mut s, "printf '1\\n2\\n' | xargs nohup /bin/echo").await;
+	let echo = crate::testkit::child::on_path("echo");
+	let ran = run(&mut s, &format!("printf '1\\n2\\n' | xargs nohup {echo}")).await;
 	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", ""));
 }
 
@@ -1658,7 +1660,8 @@ async fn a_refused_line_is_split_through_timeout() {
 		assert_split_through(&mut s, &command, wrapper, &words).await;
 		assert_refused_alone_through(&mut s, &command).await;
 	}
-	let ran = run(&mut s, "printf '1\\n2\\n' | xargs timeout 5s /bin/echo").await;
+	let echo = crate::testkit::child::on_path("echo");
+	let ran = run(&mut s, &format!("printf '1\\n2\\n' | xargs timeout 5s {echo}")).await;
 	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", ""));
 	let ran = run(&mut s, "printf '1\\n' | xargs timeout 5s false").await;
 	assert_eq!((ran.status, ran.stderr.as_str()), (123, ""));
@@ -1721,8 +1724,8 @@ async fn the_callers_debug_and_err_traps_do_not_run_in_xargs_commands() {
 	let (_long, sh) = sh_at_a_long_path();
 	let debug = "set -T; trap 'echo DBG >&2' DEBUG";
 
-	let ran =
-		run(&mut session_in(dir.path(), &[]), &format!("{debug}; xargs -a two /bin/echo")).await;
+	let echo = crate::testkit::child::on_path("echo");
+	let ran = run(&mut session_in(dir.path(), &[]), &format!("{debug}; xargs -a two {echo}")).await;
 	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "1 2\n", "DBG\n"));
 
 	let refused = format!("{debug}; xargs -t -a words {sh} {SHOW_ARGS}");
@@ -1774,26 +1777,6 @@ fn deeper_than_path_max(root: &Path) -> std::path::PathBuf {
 	path
 }
 
-/// The first executable `name` on the test's `PATH`, as an absolute path: an
-/// external program wherever this machine keeps it (`/usr/bin` on Debian,
-/// `/run/current-system/sw/bin` on NixOS).
-#[cfg(target_os = "linux")]
-fn on_path(name: &str) -> String {
-	use std::os::unix::fs::PermissionsExt as _;
-
-	let path = std::env::var_os("PATH").unwrap_or_default();
-	std::env::split_paths(&path)
-		.map(|dir| dir.join(name))
-		.find(|file| {
-			file.is_absolute()
-				&& std::fs::metadata(file)
-					.is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-		})
-		.unwrap_or_else(|| panic!("no executable {name} on PATH"))
-		.display()
-		.to_string()
-}
-
 /// `ENAMETOOLONG` from a working directory longer than `PATH_MAX` is no
 /// command line too long: the shell reports the program it could not start,
 /// as for any other refusal (status 126), xargs goes on to the next line and
@@ -1805,7 +1788,7 @@ async fn a_working_directory_past_path_max_is_no_line_too_long() {
 	let ten = dir.path().join("ten");
 	std::fs::write(&ten, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
 	let deep = deeper_than_path_max(dir.path());
-	let printf = on_path("printf");
+	let printf = crate::testkit::child::on_path("printf");
 	let command = format!("xargs -t -n5 -a {} {printf} '%s\\n'", ten.display());
 	let ran = run(&mut session_in(&deep, &[]), &command).await;
 	let tried = lines_tried(&ran.stderr, &printf);

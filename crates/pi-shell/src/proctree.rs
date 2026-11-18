@@ -1860,7 +1860,7 @@ mod tests {
 	#[test]
 	fn start_mark_names_one_process() {
 		let mut child = crate::testkit::child::dies_with_this_process(
-			std::process::Command::new("/bin/sleep").arg("600"),
+			std::process::Command::new("sleep").arg("600"),
 		)
 		.spawn()
 		.expect("spawn sleep");
@@ -1900,7 +1900,7 @@ mod tests {
 	fn a_boot_id_that_cannot_be_read_never_changes_a_mark() {
 		use crate::sys::proc::short_of_descriptors;
 		let mut child = crate::testkit::child::dies_with_this_process(
-			std::process::Command::new("/bin/sleep").arg("600"),
+			std::process::Command::new("sleep").arg("600"),
 		)
 		.spawn()
 		.expect("spawn sleep");
@@ -1979,7 +1979,7 @@ mod tests {
 			}
 			let mut command = std::process::Command::new("/bin/sh");
 			command
-				.args(["-c", "/bin/sleep 600 & echo $!; wait"])
+				.args(["-c", "sleep 600 & echo $!; wait"])
 				.stdout(std::process::Stdio::piped());
 			if own_group {
 				command.process_group(0);
@@ -2030,7 +2030,7 @@ mod tests {
 		platform::NO_PIDFD.set(true);
 		let mut root = crate::testkit::child::dies_with_this_process(
 			std::process::Command::new("/bin/sh")
-				.args(["-c", "/bin/sleep 600 & echo $!; wait"])
+				.args(["-c", "sleep 600 & echo $!; wait"])
 				.stdout(std::process::Stdio::piped()),
 		)
 		.spawn()

@@ -830,8 +830,9 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	// The first stage's `sleep 600` (`testkit::child::LIFETIME`) outlives the
 	// test runner's bound, so only the test ends it.
 	let command = format!(
-		"/bin/sh -c 'echo $$ > \"$1\"; exec /bin/sleep 600' _ {} | /bin/sh -c 'echo $$ > \"$1\"; \
-		 sleep 1; exit 9' _ {} >/dev/null 2>&1 & pid=$!",
+		"/bin/sh -c 'echo $$ > \"$1\"; exec {} 600' _ {} | /bin/sh -c 'echo $$ > \"$1\"; sleep 1; \
+		 exit 9' _ {} >/dev/null 2>&1 & pid=$!",
+		crate::testkit::child::on_path("sleep"),
 		quote_arg(&first_pidfile.path().to_string_lossy()),
 		quote_arg(&last_pidfile.path().to_string_lossy())
 	);
@@ -1748,7 +1749,8 @@ async fn a_long_cancel_grace_is_one_shells_own() {
 	let short_abort = short_cancel.emplace_abort_token();
 	let pidfile = root.path().join("sleep.pid");
 	let command = format!(
-		"trap '' TERM; /bin/sleep {} & echo $! > {}; wait",
+		"trap '' TERM; {} {} & echo $! > {}; wait",
+		crate::testkit::child::on_path("sleep"),
 		crate::testkit::child::LIFETIME.as_secs(),
 		pidfile.display()
 	);

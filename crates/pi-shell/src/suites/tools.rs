@@ -338,11 +338,10 @@ async fn kill_refuses_pi_and_its_ancestors() {
 	assert!(r.stdout.contains("probe=0"), "{}", r.stdout);
 	assert!(r.stderr.contains("refusing to signal the shell process"), "{}", r.stderr);
 
-	let mut child = crate::testkit::child::dies_with_this_process(
-		std::process::Command::new("/bin/sleep").arg("600"),
-	)
-	.spawn()
-	.unwrap();
+	let mut child =
+		crate::testkit::child::dies_with_this_process(std::process::Command::new("sleep").arg("600"))
+			.spawn()
+			.unwrap();
 	let r = run(&mut s, &format!("kill -TERM {}; echo child=$?", child.id())).await;
 	assert_eq!(r.stdout, "child=0\n", "{}", r.stderr);
 	assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));

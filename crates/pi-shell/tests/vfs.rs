@@ -875,9 +875,12 @@ fn timeout_stops_a_utility_reading_stalled_provider_stdin() {
 async fn url_spawn_and_output_pumps_run_on_a_current_thread_runtime() {
 	let directory = tempfile::tempdir().expect("isolated provider filesystem");
 	fs::write(directory.path().join("a.txt"), b"alpha\n").expect("document");
+	let cat = pi_shell::testkit::child::on_path("cat");
 	let run = run_virtual(
 		directory.path(),
-		"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | /bin/cat",
+		&format!(
+			"/bin/sh -c 'printf \"%s\\n\" \"$0\"; sleep 0.05; echo late' virtual://a.txt | {cat}"
+		),
 	)
 	.await;
 	assert_eq!(run.status, Some(0), "{}", run.stderr);

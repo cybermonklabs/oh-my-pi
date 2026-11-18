@@ -2312,7 +2312,7 @@ mod tests {
 
 		let dir = tempfile::tempdir().unwrap();
 		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
-		std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+		std::os::unix::fs::symlink(crate::host::on_path("sleep"), &link).unwrap();
 		let mut child = std::process::Command::new(&link).arg("600").spawn().unwrap();
 		let pid = i32::try_from(child.id()).unwrap();
 		// Until the exec named it.

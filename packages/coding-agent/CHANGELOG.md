@@ -5,7 +5,7 @@
 ### Fixed
 
 - Bash tool: `xargs` and `find -exec ... {} +` no longer fail with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, or large exported variables for `find`); like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error
-- Daemons: a daemon record the broker could not write (a full or read-only disk) is written again once the disk takes writes, a daemon's exit too, which was lost before; the failure is warned once, and polls retry it with a backoff of up to 5 s. The broker's waits are timed on the monotonic clock, so a step of the wall clock neither holds nor shortens them
+- Daemons: a daemon record the broker could not write (a full or read-only disk) is written again once the disk takes writes, a daemon's exit too, which was lost before; the failure is warned once, and polls retry it with a backoff of up to 5 s. The broker's waits, a daemon's uptime (which decides whether a crash grows its restart backoff) and the client's wait for the broker it starts are timed on the monotonic clock, so a step of the wall clock neither holds nor shortens them
 
 ## [18.18.6] - 2026-11-09
 

@@ -132,8 +132,10 @@ fn command_strings_and_exit_statuses_match_zsh() {
 /// that takes.
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
+	let sleep = pi_shell::testkit::child::on_path("sleep");
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
-		.args(["-c", "/bin/sleep 600 >/dev/null 2>&1 </dev/null & echo $!"])
+		.arg("-c")
+		.arg(format!("{sleep} 600 >/dev/null 2>&1 </dev/null & echo $!"))
 		.output()
 		.expect("start obash");
 	assert_eq!(out.status.code(), Some(0));

@@ -260,8 +260,9 @@ fn assert_killed_after_the_grace(case: &Case, sid: i32, group: &[ProcInfo]) -> D
 fn cancel_term_reaches_the_externals_whole_group_at_once() {
 	// `sh` does not forward TERM to its children: they die only if the
 	// signal goes to the group.
-	let mut case =
-		Case::start(Sessions::Detach, "/bin/sh -c '/bin/sleep 600 & /bin/sleep 600; wait'", 3, 2);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let script = format!("/bin/sh -c '{sleep} 600 & {sleep} 600; wait'");
+	let mut case = Case::start(Sessions::Detach, &script, 3, 2);
 	let sid = case.leader();
 	let (status, done) = case.cancel();
 	assert_eq!(status, 143);
@@ -274,12 +275,9 @@ fn cancel_term_reaches_the_externals_whole_group_at_once() {
 
 #[test]
 fn cancel_term_kills_a_group_ignoring_term_after_the_default_grace() {
-	let mut case = Case::start(
-		Sessions::Detach,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; wait'",
-		3,
-		2,
-	);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let script = format!("/bin/sh -c 'trap \"\" TERM; {sleep} 600 & {sleep} 600; wait'");
+	let mut case = Case::start(Sessions::Detach, &script, 3, 2);
 	let sid = case.leader();
 	let group = live_session(sid);
 	assert_eq!(group.len(), 3, "{group:?}");
@@ -293,13 +291,11 @@ fn cancel_term_kills_a_group_ignoring_term_after_the_default_grace() {
 /// ignores it) and KILL after the grace.
 #[test]
 fn cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group() {
-	let mut case = Case::start(
-		Sessions::Detach,
-		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; \
-		 wait'",
-		3,
-		2,
+	let sleep = crate::testkit::child::on_path("sleep");
+	let script = format!(
+		"trap 'echo trapped' TERM\n/bin/sh -c 'trap \"\" TERM; {sleep} 600 & {sleep} 600; wait'"
 	);
+	let mut case = Case::start(Sessions::Detach, &script, 3, 2);
 	let sid = case.leader();
 	let group = live_session(sid);
 	assert_eq!(group.len(), 3, "{group:?}");
@@ -314,12 +310,9 @@ fn cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group() {
 /// is swept from the session when the grace is over.
 #[test]
 fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
-	let mut case = Case::start(
-		Sessions::Detach,
-		"/bin/sh -c '(trap \"\" TERM; exec /bin/sleep 600) & wait'",
-		2,
-		1,
-	);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let script = format!("/bin/sh -c '(trap \"\" TERM; exec {sleep} 600) & wait'");
+	let mut case = Case::start(Sessions::Detach, &script, 2, 1);
 	let sid = case.leader();
 	let grandchild: Vec<ProcInfo> = live_session(sid)
 		.into_iter()
@@ -344,12 +337,9 @@ fn cancel_term_sweeps_a_grandchild_that_outlives_its_leader() {
 /// it.
 #[test]
 fn inherit_cancel_reaches_only_the_external_itself() {
-	let mut case = Case::start(
-		Sessions::Inherit,
-		"/bin/sh -c 'trap \"\" TERM; /bin/sleep 600 & /bin/sleep 600; wait'",
-		1,
-		0,
-	);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let script = format!("/bin/sh -c 'trap \"\" TERM; {sleep} 600 & {sleep} 600; wait'");
+	let mut case = Case::start(Sessions::Inherit, &script, 1, 0);
 	let pid = case.leader();
 	let external = proc::read(pid).unwrap().expect("the external runs");
 	let mut children = Vec::new();

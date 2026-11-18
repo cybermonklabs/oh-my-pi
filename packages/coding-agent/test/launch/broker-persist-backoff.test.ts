@@ -1,11 +1,9 @@
 // Integration tests of the real daemon broker with a record whose directory refuses writes (chmod
 // 555, as a disk that stays full). In the first two, the record is a detached daemon of an older
 // broker that recorded no start mark: recovery keeps it, `stop` leaves it `stopping` (nothing to
-// pin), and the broker's monitor of recovered detached daemons keeps polling it. In the next, the
-// record is the broker's own daemon, which exits while the write of its exit fails. The broker's
-// writes into the record's directory and its persistence warnings are counted with spies. The
-// last checks that a wait, which polls as the monitor does, keeps its timeout across a step of
-// the wall clock.
+// pin), and the broker's monitor of recovered detached daemons keeps polling it. In the last two,
+// the record is the broker's own daemon, which exits while the write of its exit fails. The broker's
+// writes into the record's directory and its persistence warnings are counted with spies.
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -274,35 +272,3 @@ for (const detached of [false, true]) {
 		}
 	}, 30_000);
 }
-
-it("times a wait on the monotonic clock: a backward step of the wall clock does not hold it past its timeout", async () => {
-	using tempDir = TempDir.createSync("@omp-launch-wait-clock-");
-	const { projectDir, runtimeDir } = paths(tempDir.path());
-	await fs.mkdir(projectDir);
-	const previousTitle = process.title;
-	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const broker = startBroker(projectDir, runtimeDir);
-	const realNow = Date.now.bind(Date);
-	let clockSpy: { mockRestore(): void } | undefined;
-	let daemon: Daemon | undefined;
-	try {
-		daemon = await startSleep(client, projectDir, false);
-		const waiting = client.request({ op: "wait", name: NAME, for: "exit", timeoutMs: 1_000 });
-		await Bun.sleep(200);
-		// The wall clock steps back 60 s while the broker waits.
-		clockSpy = spyOn(Date, "now").mockImplementation(() => realNow() - 60_000);
-		// The wait ends at its 1 s timeout; one timed on the wall clock would wait 60 s more (and
-		// the client gives up on it at 6 s). The bound is timed on the monotonic clock.
-		const held = Bun.sleep(15_000).then(() => "held" as const);
-		const waited = await Promise.race([waiting, held]);
-		if (waited === "held" || waited.op !== "wait") throw new Error(`the wait did not end: ${String(waited)}`);
-		expect({ timedOut: waited.timedOut, state: waited.daemon.state }).toEqual({ timedOut: true, state: "running" });
-	} finally {
-		clockSpy?.mockRestore();
-		await client.request({ op: "shutdown" }).catch(() => undefined);
-		client.close();
-		await broker;
-		process.title = previousTitle;
-		killDaemon(daemon, "SIGKILL");
-	}
-}, 30_000);

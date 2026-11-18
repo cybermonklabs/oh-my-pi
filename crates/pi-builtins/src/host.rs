@@ -3691,6 +3691,27 @@ mod testing {
 		lines.into_iter().map(|(_, args)| args).collect()
 	}
 
+	/// The first executable `name` on this process's `PATH`, as an absolute path.
+	///
+	/// A test's external program, wherever the machine keeps it (`/usr/bin` on
+	/// Debian, `/run/current-system/sw/bin` on NixOS).
+	#[cfg(unix)]
+	pub(crate) fn on_path(name: &str) -> String {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let path = std::env::var_os("PATH").unwrap_or_default();
+		std::env::split_paths(&path)
+			.map(|dir| dir.join(name))
+			.find(|file| {
+				file.is_absolute()
+					&& std::fs::metadata(file)
+						.is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+			})
+			.unwrap_or_else(|| panic!("no executable {name} on PATH"))
+			.display()
+			.to_string()
+	}
+
 	/// What a [`Refusing`] runner was asked to run: how many arguments past
 	/// its `fixed` words each line had, and the arguments of the lines it
 	/// "ran".
@@ -4564,7 +4585,7 @@ pub(crate) use testing::tree_with_sparse_file;
 pub(crate) use testing::run_extra_with;
 #[cfg(all(test, unix))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Refused, Refusing};
+pub(crate) use testing::{Refused, Refusing, on_path};
 #[cfg(all(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{SHOW_ARGS, lines_run};

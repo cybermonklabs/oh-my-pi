@@ -1723,8 +1723,9 @@ mod tests {
 	async fn a_working_directory_past_path_max_does_not_split_a_line() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		let deep = deeper_than_path_max(dir.path());
-		let (code, stdout, stderr) = xargs_in(&deep, &["-t", "/bin/echo"], "1 2 3 4 5 6 7 8 9 10\n").await;
-		let tried = stderr.lines().filter(|line| line.starts_with("/bin/echo")).count();
+		let echo = crate::host::on_path("echo");
+		let (code, stdout, stderr) = xargs_in(&deep, &["-t", echo.as_str()], "1 2 3 4 5 6 7 8 9 10\n").await;
+		let tried = stderr.lines().filter(|line| line.starts_with(echo.as_str())).count();
 		assert_eq!((code, stdout.as_str(), tried), (126, "", 1), "{stderr}");
 		assert_eq!(stderr.matches("File name too long").count(), 1, "{stderr}");
 	}

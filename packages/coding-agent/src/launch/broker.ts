@@ -114,6 +114,13 @@ interface ManagedDaemon {
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
 	consecutiveFailures: number;
+	/**
+	 * When this broker launched the current generation, on the monotonic clock
+	 * (`performance.now()`), for its uptime at exit; unset for a generation
+	 * another broker launched, whose uptime only the recorded wall-clock
+	 * `startedAt` can give.
+	 */
+	launchedAt?: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
 	completionSubscriptionId?: string;
@@ -943,6 +950,7 @@ class DaemonBroker {
 		record.snapshot.persist = record.spec.persist;
 		record.snapshot.detached = record.spec.detached;
 		record.snapshot.startedAt = Date.now();
+		record.launchedAt = performance.now();
 		record.snapshot.readyAt = undefined;
 		record.snapshot.exitedAt = undefined;
 		record.snapshot.exitCode = undefined;
@@ -1342,7 +1350,12 @@ class DaemonBroker {
 			!record.stopRequested &&
 			(record.spec.restart === "always" || (record.spec.restart === "on-failure" && failed));
 		if (shouldRestart && !this.#shuttingDown) {
-			const uptime = Date.now() - record.snapshot.startedAt;
+			// The monotonic clock, so that a step of the wall clock during the run
+			// neither counts a long run as a crash nor a crash as a long run.
+			const uptime =
+				record.launchedAt === undefined
+					? Date.now() - record.snapshot.startedAt
+					: performance.now() - record.launchedAt;
 			record.consecutiveFailures = uptime >= 30_000 ? 0 : record.consecutiveFailures + 1;
 			record.snapshot.restartCount++;
 			// Readiness belongs to the exited generation; clear it before the backoff

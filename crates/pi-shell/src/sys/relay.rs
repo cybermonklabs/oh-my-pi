@@ -520,7 +520,11 @@ mod tests {
 	/// A leftover `sh` keeps the pipe open with: it runs until `release`
 	/// exists, then runs `then` (and ends).
 	fn leftover(release: &Path, then: &str) -> String {
-		format!("(while [ ! -e {} ]; do /bin/sleep 0.01; done; {then}) &", release.display())
+		format!(
+			"(while [ ! -e {} ]; do {} 0.01; done; {then}) &",
+			release.display(),
+			crate::testkit::child::on_path("sleep")
+		)
 	}
 
 	/// [`run`], creating `release` once the run has returned, while the
@@ -682,10 +686,15 @@ mod tests {
 	/// pipes on the way never blocking the one thread.
 	#[tokio::test(flavor = "current_thread")]
 	async fn relays_and_pumps_run_on_a_current_thread_runtime() {
-		let script = "big=$(/usr/bin/yes 0123456789 | /usr/bin/head -n 20000); printf '%s\\n' \
-		              \"$big\" | /bin/cat";
+		let on_path = crate::testkit::child::on_path;
+		let script = format!(
+			"big=$({} 0123456789 | {} -n 20000); printf '%s\\n' \"$big\" | {}",
+			on_path("yes"),
+			on_path("head"),
+			on_path("cat")
+		);
 		let out =
-			tokio::time::timeout(Duration::from_secs(20), run(&mut session(false), script, true))
+			tokio::time::timeout(Duration::from_secs(20), run(&mut session(false), &script, true))
 				.await
 				.expect("nothing blocks the runtime's only thread");
 		assert_eq!(out, "0123456789\n".repeat(20_000).into_bytes());
@@ -699,14 +708,20 @@ mod tests {
 	/// substitution still writes.
 	#[tokio::test(flavor = "current_thread")]
 	async fn procsub_bytes_a_feed_took_go_back_once_in_order() {
-		let script = "exec 4< <(/usr/bin/yes 0123456789 | /usr/bin/head -n 30000)\n/bin/sh -c : \
-		              <&4\n/bin/sh -c 'exit 0'\nx=$(/bin/cat <&4)\ny=$(/usr/bin/yes 0123456789 | \
-		              /usr/bin/head -n 30000)\n[ \"$x\" = \"$y\" ] && echo same || echo \"differ \
-		              ${#x} ${#y}\"";
-		let out =
-			tokio::time::timeout(Duration::from_secs(20), run(&mut session_with(None), script, false))
-				.await
-				.expect("the feeds never block the runtime's only thread");
+		let (yes, head) =
+			(crate::testkit::child::on_path("yes"), crate::testkit::child::on_path("head"));
+		let script = format!(
+			"exec 4< <({yes} 0123456789 | {head} -n 30000)\n/bin/sh -c : <&4\n/bin/sh -c 'exit \
+			 0'\nx=$({} <&4)\ny=$({yes} 0123456789 | {head} -n 30000)\n[ \"$x\" = \"$y\" ] && echo \
+			 same || echo \"differ ${{#x}} ${{#y}}\"",
+			crate::testkit::child::on_path("cat")
+		);
+		let out = tokio::time::timeout(
+			Duration::from_secs(20),
+			run(&mut session_with(None), &script, false),
+		)
+		.await
+		.expect("the feeds never block the runtime's only thread");
 		assert_eq!(String::from_utf8_lossy(&out), "same\n");
 	}
 

@@ -569,12 +569,13 @@ fn child_of(parent: i32) -> proc::ProcInfo {
 fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, Duration::from_secs(2));
-	let a = sh("/bin/sleep 30 & wait");
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = sh(&format!("{sleep} 30 & wait"));
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid();
 	assert_eq!((pgid(pid), sid(pid)), (pgid(0), our_sid()), "host's group and session");
 	let grandchild = child_of(pid as i32);
-	let b = argv(&["/bin/sleep", "30"]);
+	let b = argv(&[sleep.as_str(), "30"]);
 	let mut joined = s.spawn(spec(&b, &env, PgroupSpec::Join(pid))).unwrap();
 	assert_eq!(pgid(joined.pid()), pgid(0), "Join is ignored too");
 	joined.signal(Signal::Kill).unwrap();
@@ -612,15 +613,13 @@ fn inherit_abandon_escalation_spares_the_hosts_group() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, grace);
 	let mut bystander = Bystander(
-		crate::testkit::child::dies_with_this_process(
-			std::process::Command::new("/bin/sleep").arg("600"),
-		)
-		.spawn()
-		.unwrap(),
+		crate::testkit::child::dies_with_this_process(std::process::Command::new("sleep").arg("600"))
+			.spawn()
+			.unwrap(),
 	);
 	assert_eq!(pgid(bystander.0.id()), pgid(0));
 	// `exec` keeps the ignored TERM: one process that only KILL ends.
-	let a = sh("trap '' TERM; exec /bin/sleep 600");
+	let a = sh(&format!("trap '' TERM; exec {} 600", crate::testkit::child::on_path("sleep")));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	until("exec'd", || proc::info(pid).is_some_and(|i| i.name == "sleep"));
@@ -700,7 +699,7 @@ fn abandon_escalates(grace: Duration) {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, grace);
 	// The trap makes sh and the sleep it starts ignore TERM.
-	let a = sh("trap '' TERM; /bin/sleep 600; exit 0");
+	let a = sh(&format!("trap '' TERM; {} 600; exit 0", crate::testkit::child::on_path("sleep")));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	let mut members = Vec::new();
@@ -722,7 +721,8 @@ fn abandon_escalates(grace: Duration) {
 fn dropped_detached_external_runs_on_and_is_no_leftover() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_millis(100));
-	let a = argv(&["/bin/sleep", "30"]);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = argv(&[sleep.as_str(), "30"]);
 	let mut detached = spec(&a, &env, NEW);
 	detached.lineage = crate::bash::Lineage { label: 7, detached: true };
 	let p = s.spawn(detached).unwrap();
@@ -773,7 +773,8 @@ fn abandoned_external_is_killed_after_the_default_grace() {
 fn abandon_sends_term_to_the_whole_group_at_once() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Share, Duration::from_secs(60));
-	let a = sh("/bin/sleep 600 & /bin/sleep 600 & wait");
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = sh(&format!("{sleep} 600 & {sleep} 600 & wait"));
 	let p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let group = p.pid() as i32;
 	until("members up", || live_group(group).len() == 3);
@@ -789,7 +790,8 @@ fn abandon_sends_term_to_the_whole_group_at_once() {
 fn abandoning_a_paused_job_still_terminates_it() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_secs(60));
-	let a = argv(&["/bin/sleep", "30"]);
+	let sleep = crate::testkit::child::on_path("sleep");
+	let a = argv(&[sleep.as_str(), "30"]);
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	p.stop().unwrap();
@@ -1537,7 +1539,7 @@ fn parked_externals_are_reaped_after_abandon_and_work_without_a_parker() {
 	let env = EnvView::default();
 	let s = parked_spawner(Duration::from_millis(300));
 	let parker = crate::sys::Parker::new();
-	let a = sh("trap '' TERM; exec /bin/sleep 30");
+	let a = sh(&format!("trap '' TERM; exec {} 30", crate::testkit::child::on_path("sleep")));
 	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
 	let pid = p.pid() as i32;
 	let waker = parker.waker().clone();

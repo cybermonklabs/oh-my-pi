@@ -1890,8 +1890,9 @@ mod tests {
 		};
 		// The sleep (600 s, `testkit::child::LIFETIME`) outlives the test
 		// runner's bound, so only the cancel ends it.
+		let sleep = format!("{} 600", crate::testkit::child::on_path("sleep"));
 		let (outcome, (pid, (pgid, sid, own_group))) =
-			tokio::join!(s.run("/bin/sleep 600", RunStdio::default(), cancel.clone()), probe);
+			tokio::join!(s.run(&sleep, RunStdio::default(), cancel.clone()), probe);
 		let outcome = outcome.unwrap();
 		assert!(outcome.cancelled);
 		// 143, not 137: the run ended on the cancel's TERM, inside the
@@ -1959,7 +1960,7 @@ mod tests {
 	#[test]
 	fn signals_are_refused_while_the_ancestors_cannot_be_read() {
 		use crate::{host::check_signal_target, sys::proc::short_of_descriptors};
-		let mut child = std::process::Command::new("/bin/sleep")
+		let mut child = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.unwrap();
@@ -2015,7 +2016,7 @@ mod tests {
 	fn without_proc_the_guard_refuses_only_this_process() {
 		use crate::{host::check_signal_target, sys::proc::fail_reads};
 		let mut child = crate::testkit::child::dies_with_this_process(
-			std::process::Command::new("/bin/sleep").arg("600"),
+			std::process::Command::new("sleep").arg("600"),
 		)
 		.spawn()
 		.unwrap();
@@ -2041,7 +2042,7 @@ mod tests {
 	fn an_ancestor_read_enoent_while_proc_is_mounted_refuses_every_signal() {
 		use crate::{host::check_signal_target, sys::proc::fail_reads};
 		let mut child = crate::testkit::child::dies_with_this_process(
-			std::process::Command::new("/bin/sleep").arg("600"),
+			std::process::Command::new("sleep").arg("600"),
 		)
 		.spawn()
 		.unwrap();
@@ -2071,7 +2072,7 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn a_failed_read_proves_a_process_out_of_reach_only_when_no_signal_reaches_it() {
-		let mut child = std::process::Command::new("/bin/sleep")
+		let mut child = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.unwrap();

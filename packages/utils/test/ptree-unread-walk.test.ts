@@ -23,7 +23,7 @@ it.skipIf(process.platform !== "linux")(
 	async () => {
 		using dir = TempDir.createSync("@omp-ptree-unread-walk-");
 		const pidfile = path.join(dir.path(), "grandchild.pid");
-		const script = `trap '' TERM; setsid sh -c 'trap "" TERM; echo $$ > ${pidfile}; exec /bin/sleep 600' & while [ ! -s ${pidfile} ]; do :; done; echo ready; wait`;
+		const script = `trap '' TERM; setsid sh -c 'trap "" TERM; echo $$ > ${pidfile}; exec sleep 600' & while [ ! -s ${pidfile} ]; do :; done; echo ready; wait`;
 		const child = spawn(["sh", "-c", script], { subreaper: true });
 		const reader = child.stdout.getReader();
 		await reader.read(); // "ready": the grandchild ignores TERM and leads its own session
