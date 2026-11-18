@@ -305,19 +305,30 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 	let path_fs = host.resolve(path);
 	// Base case 1: this is a file or a symbolic link.
 	// Use lstat to avoid race condition between check and use
-	let initial_mode = match host.fs().symlink_metadata(&path_fs) {
+	let (initial_mode, initial_id) = match host.fs().symlink_metadata(&path_fs) {
 		Ok(metadata) if !metadata.is_dir() => {
 			return remove_file(host, path, options, progress_bar);
 		},
-		Ok(metadata) => metadata.permissions().mode(),
+		Ok(metadata) => (metadata.permissions().mode(), metadata.dev().zip(metadata.ino())),
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
 			return show_removal_error(host, e, path);
 		},
 	};
 
-	// Try to open the directory using DirFd for secure traversal
-	let dir_fd = match DirFd::open(&path_fs, SymlinkBehavior::Follow) {
+	// Open the operand as the directory the lstat found, not following a
+	// symlink there: one swapped in since the lstat is refused (`ENOTDIR`)
+	// instead of emptied. The identity is compared as well because gVisor
+	// before release-20261109.0 follows a final symlink to a directory
+	// despite `O_NOFOLLOW` when `O_DIRECTORY` is set (see `open_stat_subdir`).
+	let dir_fd = match DirFd::open(&path_fs, SymlinkBehavior::NoFollow).and_then(|fd| {
+		let info = fd.metadata()?.file_info();
+		if Some((info.device(), info.inode())) == initial_id {
+			Ok(fd)
+		} else {
+			Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
+		}
+	}) {
 		Ok(fd) => fd,
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
