@@ -287,6 +287,48 @@ console.log(JSON.stringify({ state, built }));`);
 		60_000,
 	);
 
+	it("keep no state for a source that was changed at its open and is gone when the read looks again", async () => {
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		const staged = path.join(repo, "crates/pi-natives/src/staged");
+		const aside = path.join(repo, "crates/pi-natives/src/aside");
+		await fs.symlink("lib.rs.orig", staged);
+
+		// The build's open meets a link, the file is back for the reader's second look (`changed`),
+		// and it is gone when the read takes every listed file's size and time again.
+		const result = bounded(`let opened = false;
+let gone = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (opened || file !== ${JSON.stringify(target)}) return nodeFs.openSync(file, flags, mode);
+		opened = true;
+		nodeFs.renameSync(file, ${JSON.stringify(aside)});
+		nodeFs.renameSync(${JSON.stringify(staged)}, file);
+		try {
+			return nodeFs.openSync(file, flags, mode);
+		} finally {
+			nodeFs.renameSync(file, ${JSON.stringify(staged)});
+			nodeFs.renameSync(${JSON.stringify(aside)}, file);
+		}
+	},
+	lstatSync(file, options) {
+		const stat = nodeFs.lstatSync(file, options);
+		if (opened && !gone && file === ${JSON.stringify(target)}) {
+			gone = true;
+			nodeFs.renameSync(file, ${JSON.stringify(aside)});
+		}
+		return stat;
+	},
+});
+const sources = readRustSources(repo, CARGO_SOURCE_ROOTS);
+writeAddonSourcesStamp(addon, sources, {});
+console.log(JSON.stringify({ fingerprint: sources.fingerprint, gone: !nodeFs.existsSync(${JSON.stringify(target)}) }));`);
+
+		expect(result).toEqual({ fingerprint: null, gone: true });
+		// So the record names no state of a tree without lib.rs: a start reads the files, and the
+		// recorded lib.rs is missing.
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	}, 60_000);
+
 	it("keep no verdict for a source rewritten in place while a start read it, also once its bytes and time are back", async () => {
 		await build();
 		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
@@ -363,6 +405,48 @@ const state = addonSourcesState(addon, repo);
 console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.endsWith(".sources.json")).length }));`),
 		).toEqual({ state: "current", sourcesOpened: 0 });
 	}, 60_000);
+
+	it.each([["in place"], ["by a rename over it"]])(
+		"see a same-size edit whose modification time is put back (%s), as git does",
+		async how => {
+			const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+			// A whole-second time, so it can be put back exactly.
+			const time = new Date(1_700_000_000_000);
+			await fs.utimes(target, time, time);
+			await build();
+			const before = await fs.lstat(target);
+			if (how === "in place") {
+				await Bun.write(target, "pub fn grop() {}\n");
+			} else {
+				await Bun.write(`${target}.new`, "pub fn grop() {}\n");
+				await fs.rename(`${target}.new`, target);
+			}
+			await fs.utimes(target, time, time);
+			const after = await fs.lstat(target);
+
+			// The size and the modification time are the build's; the change time and, after a
+			// rename, the inode are not, and on Linux only a change of the clock sets a change time.
+			expect({ size: after.size, mtimeMs: after.mtimeMs }).toEqual({ size: before.size, mtimeMs: before.mtimeMs });
+			expect(addonSourcesState(addon, repo)).toBe("other");
+		},
+	);
+
+	it.each([
+		["no rule", undefined],
+		["another rule", 0],
+	])("read the bytes again for a verdict a record kept under %s", async (_label, version) => {
+		await build();
+		const stampPath = `${addon}.sources.json`;
+		const stamp = await Bun.file(stampPath).json();
+		// A verdict this tree does not have, kept as an earlier build of this loader kept one:
+		// under its own fingerprint rule, which this one cannot vouch for.
+		await Bun.write(stampPath, JSON.stringify({ ...stamp, seen: { ...stamp.seen, version, verdict: "other" } }));
+		expect(addonSourcesState(addon, repo)).toBe("current");
+
+		// Control: the same verdict under this rule is taken as it stands.
+		await Bun.write(stampPath, JSON.stringify({ ...stamp, seen: { ...stamp.seen, verdict: "other" } }));
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
 
 	it("ignore build output and dot files in the source tree", async () => {
 		await build();
@@ -716,6 +800,38 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
+	it("are other sources when a file is added to a scanned directory whose modification time is put back", async () => {
+		const dir = path.join(repo, defs);
+		// A whole-second time, so it can be put back exactly.
+		const time = new Date(1_700_000_000_000);
+		await checkout();
+		await fs.utimes(dir, time, time);
+		await build();
+		await Bun.write(path.join(dir, "zz-probe.toml"), "[filters.zz_probe]\n");
+		await fs.utimes(dir, time, time);
+
+		expect((await fs.lstat(dir)).mtimeMs).toBe(time.getTime());
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("judge a record whose directory times an earlier build kept as numbers, listing those directories again", async () => {
+		await checkout();
+		const stampPath = `${addon}.sources.json`;
+		const stamp = await Bun.file(stampPath).json();
+		const mtime = (await fs.lstat(path.join(repo, defs))).mtimeMs;
+		const scanned = stamp.scanned.map((entry: { dirs: Record<string, string> }) => ({
+			...entry,
+			dirs: Object.fromEntries(Object.keys(entry.dirs).map(rel => [rel, mtime])),
+		}));
+		await Bun.write(stampPath, JSON.stringify({ ...stamp, scanned }));
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		const now = await fs.lstat(path.join(repo, defs));
+		expect((await Bun.file(stampPath).json()).scanned[0].dirs[defs]).toBe(
+			`${now.mtimeMs}\0${now.ctimeMs}\0${now.ino}`,
+		);
+	});
+
 	it("are other sources when a file leaves a scanned directory", async () => {
 		await checkout();
 		await Bun.write(path.join(repo, defs, "b.toml"), "[filters.b]\n");
@@ -748,9 +864,10 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		const later = new Date(Date.now() + 60_000);
 		await fs.utimes(path.join(repo, defs), later, later);
 		expect(addonSourcesState(addon, repo)).toBe("current");
-		// The start remembers the directory's new time, so the next start lists nothing.
+		// The start remembers the directory's new state, so the next start lists nothing.
 		const stamp = await Bun.file(`${addon}.sources.json`).json();
-		expect(stamp.scanned[0].dirs[defs]).toBe((await fs.stat(path.join(repo, defs))).mtimeMs);
+		const now = await fs.stat(path.join(repo, defs));
+		expect(stamp.scanned[0].dirs[defs]).toBe(`${now.mtimeMs}\0${now.ctimeMs}\0${now.ino}`);
 	});
 
 	it("are other sources when a listed file in a scanned directory changes (control)", async () => {

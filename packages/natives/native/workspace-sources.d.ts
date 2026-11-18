@@ -27,8 +27,9 @@ export interface RustSources {
 	/** Each listed file's content hash; never written to the record. */
 	hashes: Record<string, string>;
 	/**
-	 * SHA-256 over each listed file's path, size and modification time as the read of its bytes
-	 * found them, hex; null when a file no longer matched that once all were read.
+	 * SHA-256 over each listed file's path, size, modification time, change time and inode as
+	 * the read of its bytes found them, hex; null when a file no longer matched that once all
+	 * were read, or changed kind during its own read.
 	 */
 	fingerprint: string | null;
 	/** SHA-256 over each tracked file's path and content (a link's target, for a link), hex. */
@@ -37,9 +38,10 @@ export interface RustSources {
 	untrackedHashes: Record<string, string>;
 	/**
 	 * The directories build scripts scan: each with its `cargo_build_script` globs (patterns
-	 * relative to the repository root) and the modification times of it and its subdirectories.
+	 * relative to the repository root) and the state of it and its subdirectories (modification
+	 * time, change time and inode, `\0`-separated).
 	 */
-	scanned: { dir: string; globs: { include: string[]; exclude: string[] }[]; dirs: Record<string, number> }[];
+	scanned: { dir: string; globs: { include: string[]; exclude: string[] }[]; dirs: Record<string, string> }[];
 	/** Each package directory and whether it has a `build.rs`. */
 	packages: { dir: string; buildScript: boolean }[];
 }

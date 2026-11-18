@@ -31,10 +31,10 @@ import { readRegularFile, readRegularFileText } from "./regular-file.js";
  *   gives its `cargo_build_script` through a `glob()`, which Bazel requires and
  *   Cargo's `rerun-if-changed` matches. The record keeps each glob's patterns and
  *   lists the files there they match, gitignored or not, as Bazel gives them to
- *   the build script; it keeps the directories' modification times too. When one
- *   differs, the start lists that directory again, and a matched file added or
- *   removed there means other sources; a file the globs do not match (a README,
- *   a subdirectory, a swap file) changes nothing;
+ *   the build script; it keeps each directory's modification time, change time
+ *   and inode too. When one differs, the start lists that directory again, and a
+ *   matched file added or removed there means other sources; a file the globs do
+ *   not match (a README, a subdirectory, a swap file) changes nothing;
  * - a `build.rs` Cargo finds by itself in a package's directory: the record notes
  *   which packages have one.
  * Any other file added later (an editor backup, a new test, a cache) changes
@@ -51,21 +51,35 @@ import { readRegularFile, readRegularFileText } from "./regular-file.js";
  * Two identities are kept:
  * - the digest, SHA-256 over each tracked file's path and content (a link's
  *   target, for a link), and each untracked file's own SHA-256, which decide;
- * - the fingerprint, SHA-256 over each listed file's path, size and modification
- *   time, which stands for a verdict already reached, with whether the judging
- *   checkout is the record's (when it has an untracked file). A start reads the
- *   sizes and times; it reads the bytes only when the fingerprint, or the
- *   checkout, is one it has not seen, and records the verdict for the next start.
- *   The verdict is kept only under the fingerprint of the files the read itself
- *   opened, and only when they still match it once all are read; a file that
- *   changed during the read, even one put back as it was, keeps nothing.
+ * - the fingerprint, SHA-256 over each listed file's path, size, modification
+ *   time, change time and inode, which stands for a verdict already reached, with
+ *   whether the judging checkout is the record's (when it has an untracked file).
+ *   A start reads the sizes and times; it reads the bytes only when the
+ *   fingerprint, or the checkout, is one it has not seen, and records the verdict
+ *   for the next start. The verdict is kept only under the fingerprint of the
+ *   files the read itself opened, and only when they still match it once all are
+ *   read; a file that changed during the read, even one put back as it was, keeps
+ *   nothing. The kept state names the rule it was kept under
+ *   ({@link SEEN_STATE_VERSION}); one kept under another rule, or under none (a
+ *   record an earlier build of this loader wrote), is not trusted: the bytes are
+ *   read again.
  * A regular file that cannot be opened (no permission, no descriptor left) has no
  * bytes to judge: a start reads `unknown` and keeps nothing, and a build stops.
- * A file changed without a new size or modification time (a copy that keeps
- * both) is not seen, as git and cargo do not see it either. The record also
+ * The change time and the inode see an edit whose size and modification time were
+ * put back (`touch -r`, or a rename over the file), as git's own stat check does:
+ * on Linux nothing but a change of the system clock sets a file's change time.
+ * Not seen is git's "racy" case: a same-size edit in the same timestamp tick as
+ * the read, on a kernel or filesystem whose timestamps are that coarse. The record also
  * carries the build's settings (`build`: profile, features, flags) to explain an
  * addon; they are never compared.
  */
+
+/**
+ * The rule a record's kept state (`seen`) was kept under: what a fingerprint covers (size,
+ * modification time, change time, inode; `changed` for a file whose read met another kind)
+ * and when one is kept. A state kept under another rule is read again.
+ */
+const SEEN_STATE_VERSION = 1;
 
 /** What a Cargo build of the addon compiles, relative to the repository root. */
 export const CARGO_SOURCE_ROOTS = Object.freeze(["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", "crates"]);
@@ -375,13 +389,23 @@ function buildScriptScannedDirs(repoRoot, files) {
 }
 
 /**
+ * A directory's state as a scan keeps it: its modification time, change time and inode, so a
+ * file added or removed there gives a new one, also when the modification time is put back.
+ * @param {fs.Stats} stat
+ */
+function directoryStamp(stat) {
+	return `${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}`;
+}
+
+/**
  * Walk a directory a build script scans, with no filter: Bazel's `glob()` and a
  * Cargo `build.rs` both read every file there, gitignored, dot-named or not. A
  * link, to a directory or not, is an entry, never followed.
  * @param {string} repoRoot
  * @param {string} dir
- * @returns {{ times: Record<string, number>; files: string[] }} the modification
- *   time of `dir` and of every directory below it, and every file and link there
+ * @returns {{ times: Record<string, string>; files: string[] }} the state
+ *   ({@link directoryStamp}) of `dir` and of every directory below it, and every
+ *   file and link there
  */
 function scanDirectory(repoRoot, dir) {
 	const times = {};
@@ -393,7 +417,7 @@ function scanDirectory(repoRoot, dir) {
 			files.push(rel);
 			return;
 		}
-		times[rel] = stat.mtimeMs;
+		times[rel] = directoryStamp(stat);
 		for (const name of fs.readdirSync(path.join(repoRoot, rel))) visit(`${rel}/${name}`);
 	};
 	visit(dir);
@@ -416,12 +440,15 @@ function packageBuildScripts(repoRoot, files) {
 }
 
 /**
- * One listed file's part of a fingerprint: its size and modification time, or `missing`.
+ * One listed file's part of a fingerprint: its size, modification time, change time and inode;
+ * `missing` with no stat; `changed` with a null stat (a file whose read met another kind), a
+ * line no `lstat` gives, so a fingerprint with one never matches a state of the tree.
  * @param {string} rel
- * @param {fs.Stats | undefined} stat
+ * @param {fs.Stats | null | undefined} stat
  */
 function fingerprintLine(rel, stat) {
-	return stat ? `${rel}\0${stat.size}\0${stat.mtimeMs}\n` : `${rel}\0missing\n`;
+	if (stat === null) return `${rel}\0changed\n`;
+	return stat ? `${rel}\0${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}\n` : `${rel}\0missing\n`;
 }
 
 /** @param {string} lines */
@@ -444,13 +471,14 @@ function fingerprintOf(repoRoot, files) {
  * the stat of what was read. It never blocks: the file is read through `readRegularFile`, which
  * opens only a regular file, without following a link or waiting, and names anything else,
  * also a file swapped for another kind between its `lstat` and its `open`, by what stands
- * there. A file that is a regular file again by then is `special\0changed`, with no stat, so no
- * state is kept for it. A regular file that cannot be opened (no permission, no descriptor
- * left) throws that `open` error: it has no bytes to name, and naming it changed would keep a
- * verdict of other sources past the moment it is readable again.
+ * there. A file that is a regular file again by then, or a link gone before its target is read,
+ * is `special\0changed` with a null stat, whose fingerprint line (`changed`) no `lstat` gives,
+ * so no state is kept for it. A regular file that cannot be opened (no permission, no
+ * descriptor left) throws that `open` error: it has no bytes to name, and naming it changed
+ * would keep a verdict of other sources past the moment it is readable again.
  * @param {string} repoRoot
  * @param {string} rel
- * @returns {{ hash: string; stat: fs.Stats | undefined }}
+ * @returns {{ hash: string; stat: fs.Stats | null | undefined }}
  */
 function hashSource(repoRoot, rel) {
 	const file = path.join(repoRoot, rel);
@@ -458,6 +486,7 @@ function hashSource(repoRoot, rel) {
 	if (read.kind === "missing") return { hash: "missing", stat: undefined };
 	if (read.kind === "unreadable") throw read.error;
 	const hasher = new Bun.CryptoHasher("sha256");
+	if (read.kind === "changed") return { hash: hasher.update("special\0changed").digest("hex"), stat: null };
 	if (read.kind === "file") {
 		hasher.update(read.content);
 	} else if (read.kind === "symlink") {
@@ -467,11 +496,12 @@ function hashSource(repoRoot, rel) {
 		} catch {
 			// Changed again since: no target to name.
 		}
-		hasher.update(target === undefined ? "special\0changed" : `symlink\0${target}`);
+		if (target === undefined) return { hash: hasher.update("special\0changed").digest("hex"), stat: null };
+		hasher.update(`symlink\0${target}`);
 	} else {
 		hasher.update(`special\0${read.kind}`);
 	}
-	return { hash: hasher.digest("hex"), stat: read.kind === "changed" ? undefined : read.stat };
+	return { hash: hasher.digest("hex"), stat: read.stat };
 }
 
 /**
@@ -484,10 +514,11 @@ function digestOf(files, hashes) {
 
 /**
  * Hash every listed file, and take the fingerprint of the state those bytes came from: each
- * file's size and time as its own read found them (the descriptor it read, or the `lstat` that
- * named another kind). The fingerprint is null when the files no longer match it once all are
- * read: a file swapped or edited during the read, even one put back as it was, leaves no state
- * a later start could take these hashes for. Throws when a regular file cannot be opened.
+ * file's size, times and inode as its own read found them (the descriptor it read, or the
+ * `lstat` that named another kind). The fingerprint is null when the files no longer match it
+ * once all are read: a file swapped or edited during the read, even one put back as it was,
+ * leaves no state a later start could take these hashes for. Throws when a regular file cannot
+ * be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} files
  * @returns {{ hashes: Record<string, string>; fingerprint: string | null }}
@@ -711,6 +742,7 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 		// The checkout that built the addon is the one judging it now. A fingerprint of null
 		// (a file changed while the build read it) matches no state: the first start reads the bytes.
 		seen: {
+			version: SEEN_STATE_VERSION,
 			fingerprint: sources.fingerprint,
 			sameCheckout: sameCheckoutKey(sources.untracked.length > 0, sources.checkout, sources.checkout),
 			verdict: "current",
@@ -762,7 +794,11 @@ function isWellFormedStamp(stamp) {
 	const isTimes = dirs =>
 		dirs !== null &&
 		typeof dirs === "object" &&
-		Object.entries(dirs).every(([rel, time]) => isCheckoutPath(rel) && typeof time === "number");
+		Object.entries(dirs).every(
+			// A number is a time an earlier build of this loader kept, which no stamp equals: that
+			// directory is listed again.
+			([rel, time]) => isCheckoutPath(rel) && (typeof time === "string" || typeof time === "number"),
+		);
 	const isPatterns = patterns => Array.isArray(patterns) && patterns.every(isCheckoutPath);
 	const isGlobs = globs =>
 		Array.isArray(globs) &&
@@ -770,9 +806,8 @@ function isWellFormedStamp(stamp) {
 		globs.every(glob => isPatterns(glob?.include) && glob.include.length > 0 && isPatterns(glob.exclude));
 	return (
 		typeof stamp?.sources === "string" &&
-		(typeof stamp.seen?.fingerprint === "string" || stamp.seen?.fingerprint === null) &&
-		(stamp.seen.verdict === "current" || stamp.seen.verdict === "other") &&
-		(stamp.seen.sameCheckout === null || typeof stamp.seen.sameCheckout === "boolean") &&
+		stamp.seen !== null &&
+		typeof stamp.seen === "object" &&
 		(stamp.checkout === null || (typeof stamp.checkout === "string" && /^[0-9a-f-]{36}$/.test(stamp.checkout))) &&
 		Array.isArray(stamp.files) &&
 		stamp.files.length > 0 &&
@@ -786,6 +821,23 @@ function isWellFormedStamp(stamp) {
 		stamp.packages.every(entry => typeof entry?.dir === "string" && typeof entry.buildScript === "boolean") &&
 		stamp.packages.every(entry => entry.dir === "." || isCheckoutPath(entry.dir))
 	);
+}
+
+/**
+ * The record's kept state (`seen`) when it was kept under this rule ({@link SEEN_STATE_VERSION})
+ * and has its shape, else undefined. A state kept under another rule, or under none (a record an
+ * earlier build of this loader wrote, whose fingerprint covered less), is read again, not
+ * trusted.
+ * @param {any} seen
+ * @returns {{ fingerprint: string | null; sameCheckout: boolean | null; verdict: "current" | "other" } | undefined}
+ */
+function keptState(seen) {
+	return seen.version === SEEN_STATE_VERSION &&
+		(typeof seen.fingerprint === "string" || seen.fingerprint === null) &&
+		(seen.verdict === "current" || seen.verdict === "other") &&
+		(seen.sameCheckout === null || typeof seen.sameCheckout === "boolean")
+		? seen
+		: undefined;
 }
 
 /**
@@ -827,7 +879,7 @@ export function addonSourcesState(addonPath, repoRoot) {
 		for (const entry of stamp.scanned) {
 			const unchanged = Object.entries(entry.dirs).every(([rel, time]) => {
 				const stat = lstatSource(repoRoot, rel);
-				return stat?.isDirectory() && stat.mtimeMs === time;
+				return stat?.isDirectory() && directoryStamp(stat) === time;
 			});
 			if (unchanged) {
 				scanned.push(entry);
@@ -850,9 +902,10 @@ export function addonSourcesState(addonPath, repoRoot) {
 			stamp.checkout,
 			untracked.length > 0 ? checkoutId(repoRoot, false) : null,
 		);
-		let { verdict } = stamp.seen;
+		const kept = keptState(stamp.seen);
+		let verdict = kept?.verdict;
 		let seen = stamp.seen;
-		if (fingerprint !== stamp.seen.fingerprint || sameCheckout !== stamp.seen.sameCheckout) {
+		if (kept === undefined || fingerprint !== kept.fingerprint || sameCheckout !== kept.sameCheckout) {
 			const read = hashSources(repoRoot, stamp.files);
 			const now = identities(stamp.files, untracked, read.hashes);
 			// A file untracked at build time may be missing only in another checkout of the
@@ -864,7 +917,7 @@ export function addonSourcesState(addonPath, repoRoot) {
 			// Kept for the state the bytes came from. A file that changed while they were read,
 			// even one put back as it was, keeps nothing: the next start reads them again.
 			if (read.fingerprint !== null) {
-				seen = { fingerprint: read.fingerprint, sameCheckout, verdict };
+				seen = { version: SEEN_STATE_VERSION, fingerprint: read.fingerprint, sameCheckout, verdict };
 				learned = true;
 			}
 		}
