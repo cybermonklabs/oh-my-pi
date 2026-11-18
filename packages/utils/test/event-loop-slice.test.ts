@@ -160,6 +160,42 @@ describe("mapInSlices", () => {
 		expect(seen).toEqual([true, true]);
 	});
 
+	it("opens no new slice before the timers close the last one, however many check phases run first", async () => {
+		const clock = mockWorkClock();
+		// Hold back the slice's close and the release's timer leg, as a loop whose timers run late does.
+		const held: Array<() => void> = [];
+		const realSetTimeout = globalThis.setTimeout;
+		const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: (...args: unknown[]) => void,
+			ms?: number,
+			...args: unknown[]
+		) => {
+			if (callback.name === "closeSlice" || callback.name === "releaseWaiters") {
+				held.push(() => callback(...args));
+				return 0;
+			}
+			return realSetTimeout(callback, ms, ...args);
+		}) as unknown as typeof setTimeout);
+		const turns = countTurns();
+		const unitTurns: number[] = [];
+		const pass = mapInSlices(
+			Array.from({ length: UNITS_PER_SLICE * 2 }, (_, index) => index),
+			() => {
+				unitTurns.push(turns.turn());
+				clock.spend(UNIT_MS);
+			},
+		);
+		// Fifty passes through the check phase go by with the close held back.
+		while (turns.turn() < 50) await new Promise(resolve => setImmediate(resolve));
+		const unitsWhileHeld = unitTurns.length;
+		timers.mockRestore();
+		for (const run of held.splice(0)) run();
+		await pass;
+		turns.stop();
+		expect(unitsWhileHeld).toBe(UNITS_PER_SLICE);
+		expect(unitTurns).toHaveLength(UNITS_PER_SLICE * 2);
+	});
+
 	it("closes a slice that a pass finished inside, so the next pass after an idle wait runs a unit at once", async () => {
 		await mapInSlices([0], value => value);
 		await new Promise(resolve => setTimeout(resolve, EVENT_LOOP_SLICE_MS * 2));

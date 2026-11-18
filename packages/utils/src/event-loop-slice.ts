@@ -34,15 +34,8 @@ let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
 let pendingBatch = 0;
 let lastBatch = 0;
-let releaseDeferrals = 0;
-/**
- * How many passes through the check phase a release waits for the timers to
- * close the slice. A busy pass through the event loop outlasts the timers' 1 ms
- * clamp, so the timers close the slice first; an idle loop goes round this many
- * times in microseconds, and the release then goes ahead without the clamp. The
- * bound also covers timers that never run (fake timers with a clock a test moves).
- */
-const MAX_RELEASE_DEFERRALS = 3;
+/** The real clock when the check-phase leg last found the slice open, for the batch it waits to release. */
+let lastOpenSliceCheck: bigint | undefined;
 
 function closeSlice(): void {
 	sliceOpen = false;
@@ -82,15 +75,19 @@ export function sliceExpired(): boolean {
  * until a timer next woke the event loop, so each turn cost up to a timer
  * period. `setTimeout` alone costs its 1 ms clamp on every turn, and fake
  * timers replace it; `setImmediate` still runs under fake timers. While the
- * slice is still open, the `setImmediate` leg waits for the timers, at most
- * {@link MAX_RELEASE_DEFERRALS} passes through the check phase.
+ * slice is still open, the `setImmediate` leg waits for the timers to close it,
+ * however many passes through the check phase that takes: in a gVisor pod,
+ * check phases ran several times before the timers did, and a leg that gave up
+ * waiting opened a second slice in one pass through the event loop. Only
+ * stopped clocks release it while the slice is open: fake timers stop every
+ * clock and never run the close.
  */
 export function nextSlice(): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	if (waiters.length === 0) {
 		const batch = ++lastBatch;
 		pendingBatch = batch;
-		releaseDeferrals = 0;
+		lastOpenSliceCheck = undefined;
 		setImmediate(releaseWaiters, batch, true);
 		setTimeout(releaseWaiters, 0, batch);
 	}
@@ -101,10 +98,15 @@ export function nextSlice(): Promise<void> {
 function releaseWaiters(batch: number, inCheckPhase = false): void {
 	// The other leg of a released batch, or of one a later batch replaced.
 	if (batch !== pendingBatch) return;
-	if (inCheckPhase && sliceOpen && releaseDeferrals < MAX_RELEASE_DEFERRALS) {
-		releaseDeferrals++;
-		setImmediate(releaseWaiters, batch, true);
-		return;
+	if (inCheckPhase && sliceOpen) {
+		// The timers have not run since the slice opened. A real clock moves between two passes
+		// through the check phase; one that reads the same twice is stopped by fake timers.
+		const clock = process.hrtime.bigint();
+		if (clock !== lastOpenSliceCheck) {
+			lastOpenSliceCheck = clock;
+			setImmediate(releaseWaiters, batch, true);
+			return;
+		}
 	}
 	pendingBatch = 0;
 	// This macrotask is a new turn, whether or not the last slice's close ran yet.
