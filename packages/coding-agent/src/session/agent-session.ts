@@ -2319,6 +2319,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			promptGeneration: () => this.#promptGeneration,
 			resolveActiveEditMode: () => this.#tools.resolveActiveEditMode(),
 			syncAfterModelChange: previousEditMode => this.#tools.syncAfterModelChange(previousEditMode),
+			trackModelSwitch: modelSwitch => this.#tools.trackModelSwitch(modelSwitch),
 			setModelWithProviderSessionReset: async (model, selection = "explicit") => {
 				await this.#setModelWithProviderSessionReset(model);
 				// Only a completed explicit selection, including same-model reselection, takes ownership.
@@ -3040,6 +3041,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#maintenance.renderArchiveForModel(context.messages),
 			),
 		);
+		// A request waits for a model switch in progress, so the first request on the new model carries its prompt.
+		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
 		// A held settings rebuild runs at the first request after a cut the cut rule admits under the hold that
 		// rewrites everything after the system prompt and tools anyway (its kept prefix `p` is at most their tokens:
 		// a compaction, a forced rescue), or after the prompt cache entry lapses ({@link #absorbHeldSettingsRebuildIfDue}).

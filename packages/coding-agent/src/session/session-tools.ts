@@ -649,6 +649,8 @@ export class SessionTools {
 	#promptSurfaceScope = new AsyncLocalStorage<PromptSurface>();
 	#toolRegistryMutationTail: Promise<void> = Promise.resolve();
 	#promptModelKey: string | undefined;
+	/** The model switch in progress, settled; see {@link settleModelSwitch}. */
+	#modelSwitch: Promise<void> | undefined;
 	/** Inline-descriptor decision of the model the base prompt was rendered for. */
 	#promptInlineDescriptors: boolean | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
@@ -1333,6 +1335,37 @@ export class SessionTools {
 		if (editModeChanged || modelChanged) {
 			await this.refreshBaseSystemPrompt();
 		}
+	}
+
+	/**
+	 * Runs `modelSwitch`, a model selection from the agent's switch to the new model through its
+	 * {@link syncAfterModelChange}, as one step that main requests wait for ({@link settleModelSwitch}).
+	 */
+	async trackModelSwitch<T>(modelSwitch: () => Promise<T>): Promise<T> {
+		const switching = modelSwitch();
+		const settled = switching.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#modelSwitch = settled;
+		try {
+			return await switching;
+		} finally {
+			if (this.#modelSwitch === settled) this.#modelSwitch = undefined;
+		}
+	}
+
+	/**
+	 * Resolves once the model switch in progress ({@link trackModelSwitch}) has ended, at once when none runs. The agent
+	 * takes the new model before its prompt is rebuilt, so a request sent between the two goes out on the new model with
+	 * the old prompt, and the rebuilt one then rewrites the whole cached conversation a second time at the next request.
+	 * Awaited before each main request; a request made inside a registry mutation does not wait, since the switch's
+	 * rebuild runs after that mutation.
+	 */
+	settleModelSwitch(): Promise<void> {
+		const modelSwitch = this.#modelSwitch;
+		if (!modelSwitch || this.#toolRegistryMutationScope.getStore()) return Promise.resolve();
+		return modelSwitch;
 	}
 
 	/** Enabled MCP tools in their current presentation partition. */
