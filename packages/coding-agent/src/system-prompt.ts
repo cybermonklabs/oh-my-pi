@@ -628,8 +628,8 @@ export interface BuildSystemPromptResult {
 	/**
 	 * Names of `xd://` devices whose catalog/protocol section this prompt renders.
 	 * Empty/undefined when no catalog was emitted (no mounted devices, or a custom
-	 * prompt template that omits the section). Lets the session fold these devices
-	 * into its announced-mount baseline so a same-turn mount notice does not re-list
+	 * prompt template that omits the section). Lets the session count these devices
+	 * as known to a request carrying this prompt, so its mount notice does not re-list
 	 * a catalog the prompt already carries (issue #7139).
 	 */
 	xdevCatalogNames?: readonly string[];

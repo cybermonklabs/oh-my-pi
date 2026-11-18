@@ -7848,8 +7848,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * - the approved-plan reference a compaction re-armed after the turn was prepared (the turn's own pre-prompt
 	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt;
 	 * - the plan, goal and vibe mode instructions of an active mode where no message of their kind is in the context;
-	 * - the notices of what changed since the prompt the model holds that the context no longer tells it
-	 *   ({@link SessionTools.missingContextNotices}).
+	 * - the notices of what changed since the prompt the model holds that the context no longer tells it, the top-level
+	 *   tools and `xd://` devices included ({@link SessionTools.missingContextNotices}).
 	 * The call sends them after its newest content, and later calls replay them from there.
 	 */
 	async #missingContextMessages(context: AgentContext): Promise<AgentMessage[]> {
@@ -7914,7 +7914,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				missing.push(mode);
 			}
 		}
-		missing.push(...this.#tools.missingContextNotices(context.messages));
+		missing.push(...this.#tools.missingContextNotices(context.messages, context.systemPrompt));
 		return missing;
 	}
 
@@ -8448,7 +8448,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
-		this.#tools.resetAnnouncedMounts();
 		// A `/new`, session switch, or tree navigation reuses tool-call ids, so a
 		// still-cached background-task snapshot from the old conversation must not
 		// survive to be replayed by a focus rebuild in the reset session (#10447).
@@ -9616,7 +9615,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		generation: number,
 		signal: AbortSignal | undefined,
 		origin: "direct" | "queued",
-	): Promise<QueuedMessagePreparation & { baseXdevCatalogDelivered: boolean }> {
+	): Promise<QueuedMessagePreparation> {
 		const sessionGeneration = this.#sessionGeneration;
 		const alreadyDisposing = this.#isDisposed && origin === "direct";
 		const isCurrent = () =>
@@ -9624,7 +9623,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#sessionGeneration === sessionGeneration &&
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
-		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
+		const cancelled = { commit: () => undefined };
 		if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
 		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
 		if (pendingMCPDiscovery) {
@@ -9696,7 +9695,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			if (!overrideIsCurrent()) continue;
 			return {
-				baseXdevCatalogDelivered: result?.systemPrompt === undefined,
 				commit: () => {
 					// No await may separate ownership validation from publishing memory and policy.
 					if (!isCurrent() || !overrideIsCurrent()) return undefined;
@@ -9832,13 +9830,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return false;
 			}
 
-			// Pending tool-roster and xd:// deltas accompany the next user-authored
-			// prompt, never an agent-initiated continuation. Reserve their pre-user
-			// position now. Non-consuming previews count toward pre-prompt context
-			// maintenance, while the live deltas are consumed only after maintenance:
-			// promotion/summary can rebuild the base prompt and clear a roster delta
-			// it subsumes, avoiding a contradictory materialized notice.
-			const xdevMountNoticeIndex = messages.length;
+			// Reserve the position before the prompt's message for the hidden
+			// notices built after pre-prompt maintenance (see below).
+			const hiddenNoticeIndex = messages.length;
 			messages.push(message);
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
@@ -9873,7 +9867,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const preparedMessages = preparation.commit();
 			if (!preparedMessages) return false;
 			messages.push(...preparedMessages);
-			const baseXdevCatalogDelivered = preparation.baseXdevCatalogDelivered;
 
 			// Auto thinking: classify this real user turn and set the effective level
 			// before the model request. A user-invoked `/skill:<name>` arrives as a
@@ -9894,16 +9887,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			// Only the xd:// mount notice can carry substantial inline docs (up to
 			// XDEV_DOCS_TOTAL_BUDGET), so preview it in a copy and let context
-			// maintenance see the request's true size without consuming a delta a
-			// rebuild may supersede. The tool-roster notice is a tiny name list with
-			// no budget impact, so it is not previewed here — it must always ship
-			// alongside the schema change it describes (see below).
-			const previewXdevMountNotice = isUserQueuedMessage(message)
-				? this.#tools.peekPendingXdevMountNotice({ baseCatalogDelivered: baseXdevCatalogDelivered })
-				: undefined;
-			const maintenanceMessages = previewXdevMountNotice?.notice ? [...messages] : messages;
-			if (maintenanceMessages !== messages && previewXdevMountNotice?.notice) {
-				maintenanceMessages.splice(xdevMountNoticeIndex, 0, previewXdevMountNotice.notice);
+			// maintenance see the request's true size. The tool-roster notice is a
+			// tiny name list with no budget impact, so it is not previewed here — it
+			// must always ship alongside the schema change it describes (see below).
+			const previewXdevMountNotice = this.#tools.peekXdevMountNotice();
+			const maintenanceMessages = previewXdevMountNotice.notice ? [...messages] : messages;
+			if (previewXdevMountNotice.notice) {
+				maintenanceMessages.splice(hiddenNoticeIndex, 0, previewXdevMountNotice.notice);
 			}
 			await logger.time("prompt:prePromptCompaction", () =>
 				this.#maintenance.runPrePromptCompactionIfNeeded(maintenanceMessages),
@@ -9935,24 +9925,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
-			// Consume the xd:// notice only when its previewed revision still holds.
-			// A mount delta or catalog rebuild during the await invalidates it: any
-			// additions carried by the delivered base are recorded as announced,
-			// while remaining notice content waits for the next context check.
-			// The roster notice is re-derived from the live delta here and always
-			// delivered, keeping the model's stated availability in lockstep with
-			// the wire tool list even when a roster change landed during maintenance.
-			const xdevMountNotice = previewXdevMountNotice
-				? this.#tools.takePendingXdevMountNotice({
-						baseCatalogDelivered: baseXdevCatalogDelivered,
-						expectedContentKey: previewXdevMountNotice.contentKey,
-					})
-				: undefined;
+			// Each hidden notice is derived from the context after maintenance: a
+			// rebuild it ran (promotion, a summary) absorbs what the rebuilt prompt
+			// lists, so the request never carries both a rebuilt roster or catalog and
+			// a contradicting notice. The xd:// notice goes out as its preview
+			// budgeted it, or waits for the next prompt's estimate when it changed
+			// during the await. The roster notice always ships, keeping the model's
+			// stated availability in lockstep with the wire tool list even when a
+			// roster change landed during maintenance. Each later request gets the
+			// ones its context lacks from #missingContextMessages.
 			const hiddenNotices = [
-				xdevMountNotice,
+				this.#tools.takeXdevMountNotice(previewXdevMountNotice),
+				this.#tools.takeToolRosterNotice(),
 				...(isUserQueuedMessage(message)
 					? [
-							this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered }),
 							this.#tools.takeEvalPreludeNotice(),
 							this.#tools.takeSessionAgentNotice(),
 							this.#tools.takeTaskAgentNotice(),
@@ -9962,7 +9948,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						]
 					: []),
 			].filter(notice => notice !== undefined);
-			if (hiddenNotices.length > 0) messages.splice(xdevMountNoticeIndex, 0, ...hiddenNotices);
+			if (hiddenNotices.length > 0) messages.splice(hiddenNoticeIndex, 0, ...hiddenNotices);
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

@@ -1071,25 +1071,21 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(contexts).toHaveLength(1);
 		expect(mountNoticesIn(contexts[0])).toHaveLength(0);
 
-		// The next user prompt consumes the coalesced delta, but both devices are
-		// routed with catalog summaries: the same request's route guidance already
-		// lists them, so a notice would duplicate those lines verbatim. The delta
-		// is still consumed, keeping an eventual unmount announcable.
+		// The next user prompt's request carries both devices, but both are routed
+		// with catalog summaries: the same request's route guidance already lists
+		// them, so a notice would duplicate those lines verbatim.
 		await session.prompt("again");
 		expect(contexts).toHaveLength(2);
 		expect(mountNoticesIn(contexts[1])).toHaveLength(0);
 
-		// A later unmount is likewise held for the following user prompt, and
-		// announces the removal even though the mount never shipped a line.
+		// A later unmount is likewise held for the following user prompt. Its
+		// rebuild drops the device's route line, so that request's prompt lists the
+		// devices as they are and no notice is needed.
 		await session.refreshMCPTools([search]);
 		expect(rebuildCount).toBe(3);
 		expect(contexts).toHaveLength(2);
 		await session.prompt("third");
-		const allNotices = mountNoticesIn(contexts[2]);
-		expect(allNotices).toHaveLength(1);
-		expect(allNotices[0]).toContain("Unmounted; writes fail:");
-		expect(allNotices[0]).toContain("xd://mcp__nucleus_fetch");
-		expect(allNotices[0]).not.toContain("Available tools.");
+		expect(mountNoticesIn(contexts[2])).toHaveLength(0);
 	});
 
 	it("keeps capped summaries for devices the route projection omits", async () => {
@@ -1412,18 +1408,19 @@ These tools became available:
 		expect(mountNoticesIn(contexts[1]).join("\n")).toContain("xd://mcp__nucleus_fetch");
 	});
 
-	it("announces an unmount after a maintenance rebuild delivered the pending addition", async () => {
+	it("announces an unmount of a device a maintenance rebuild delivered in the bound prompt's catalog", async () => {
 		const { session, contexts, systemPrompts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
 			xdev: createTestXdevState(),
 			responses: [{ content: ["ok"] }, { content: ["ok"] }],
 			exposeXdevCatalog: true,
+			prefixBound: true,
 		});
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		await session.refreshMCPTools([search]);
 
-		// The pending addition is previewed, then maintenance rebuilds the base
-		// catalog before delivery. The rebuild carries the device to the provider
-		// but invalidates the preview revision.
+		// The mounted device is previewed, then maintenance rebuilds the base
+		// catalog before delivery. The rebuild carries the device to the provider,
+		// so the request needs no notice for it.
 		const rebuildDuringMaintenance = vi
 			.spyOn(SessionMaintenance.prototype, "runPrePromptCompactionIfNeeded")
 			.mockImplementationOnce(async () => {
@@ -1435,9 +1432,9 @@ These tools became available:
 		expect(mountNoticesIn(contexts[0] ?? [])).toHaveLength(0);
 		rebuildDuringMaintenance.mockRestore();
 
-		// Since the model learned the device from the delivered base, a subsequent
-		// unmount must produce a removal notice rather than cancelling the stale
-		// pending addition as though it had never been announced.
+		// The model learned the device from the delivered base, which the reply
+		// binds: a subsequent unmount leaves that catalog listing it, so the next
+		// request must carry a removal notice.
 		await session.refreshMCPTools([]);
 		await session.prompt("second");
 		const notices = mountNoticesIn(contexts[1] ?? []);
