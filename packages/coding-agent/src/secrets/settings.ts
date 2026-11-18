@@ -24,3 +24,18 @@ export const cfgSecretsEnabled = register({
 // Process-wide fallback for requests outside a session; a session's own requests redact per its
 // settings (`withCredentialRedaction` in `sdk.ts`), whichever instance holds the effects.
 effect(cfgSecretsEnabled, configureCredentialRedaction);
+
+export const cfgSecretsMaskSessionStore = register({
+	id: "secrets.maskSessionStore",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "providers",
+		group: "Privacy",
+		label: "Mask Secrets in Stored Sessions",
+		description:
+			"Replace known secret values (secret-named environment variables, files named by *_FILE variables, secrets.yml) with a marker before this session writes them to the session store, history.db, the /btw history or a subagent's output file",
+	},
+});
+// No effect: each session's writers read the setting from that session's settings
+// (`SessionManager.setStoreMasking`), so one session's project never decides masking for another.

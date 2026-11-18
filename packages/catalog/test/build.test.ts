@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,7 +7,7 @@ import { buildDiscoveredModel, buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { readModelCache, takeModelCacheRowTurn, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels, resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
@@ -2043,6 +2043,379 @@ describe("model cache materialized round trip", () => {
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
+	});
+	it("skips the sliced cache write on a failed refresh while cached header-bearing models are unresolved (#18227)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-header-failed-refresh-row-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "header-failed-refresh-row-test";
+		const model = completionsSpec({ id: "tenant-model", provider: providerId, headers: { "X-Tenant": "tenant-a" } });
+		let clock = 1_000_000;
+		let fail = false;
+		const options = {
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => clock,
+			fetchDynamicModels: async () => (fail ? null : [model]),
+		};
+		const readRows = () => {
+			const db = new Database(dbPath, { readonly: true });
+			try {
+				return {
+					payload: db
+						.query<Record<string, unknown>, [string]>("SELECT * FROM model_cache WHERE provider_id = ?")
+						.get(providerId),
+					refresh: db
+						.query<Record<string, unknown>, [string]>("SELECT * FROM model_cache_refresh WHERE provider_id = ?")
+						.get(providerId),
+				};
+			} finally {
+				db.close();
+			}
+		};
+		try {
+			await resolveProviderModels(options, "online");
+			const written = readRows();
+			expect(written.payload?.updated_at).toBe(1_000_000);
+			expect(written.refresh).toBeNull();
+
+			// The clock advances, so any write on the failed pass would change the
+			// payload row's updated_at or add a refresh side row.
+			clock = 2_000_000;
+			fail = true;
+			await resolveProviderModels(options, "online");
+			expect(readRows()).toEqual(written);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	describe("concurrent refreshes of one provider", () => {
+		type Spec = ModelSpec<"openai-completions">;
+		const specs = (prefix: string, count: number, provider: string) =>
+			Array.from({ length: count }, (_, index) => completionsSpec({ id: `${prefix}-${index}`, provider }));
+		/**
+		 * Runs `refreshes` in a fresh database whose row holds `prior-model`, or
+		 * `priorRows` rows (non-authoritative), on a clock where every few reads
+		 * end a slice, so a refresh with many rows to build or merge takes many
+		 * turns after its fetch. Returns the stored row.
+		 */
+		async function race(
+			name: string,
+			refreshes: (dbPath: string, providerId: string) => Promise<unknown>[],
+			priorRows = 0,
+		): Promise<{ ids: string[]; authoritative: boolean | undefined }> {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `pi-catalog-${name}-`));
+			const dbPath = path.join(tempDir, "models.db");
+			const providerId = `${name}-test`;
+			writeModelCache(
+				providerId,
+				500_000,
+				(priorRows > 0
+					? specs("prior", priorRows, providerId)
+					: [completionsSpec({ id: "prior-model", provider: providerId })]
+				).map(spec => buildModel(spec)),
+				false,
+				"",
+				dbPath,
+			);
+			let clock = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+			try {
+				await Promise.all(refreshes(dbPath, providerId));
+				vi.restoreAllMocks();
+				const stored = readModelCache(providerId, Infinity, () => 0, dbPath);
+				return { ids: stored?.models.map(model => model.id).sort() ?? [], authoritative: stored?.authoritative };
+			} finally {
+				vi.restoreAllMocks();
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		}
+		const refresh = (
+			dbPath: string,
+			providerId: string,
+			now: number,
+			sources: {
+				endpoint?: () => Promise<readonly Spec[] | null>;
+				modelsDev?: () => Promise<readonly Spec[] | null>;
+				authoritative?: boolean;
+				strategy?: "online" | "online-if-uncached";
+				restoreCachedHeaders?: () => { headers: Record<string, string> };
+			},
+		) =>
+			resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: sources.authoritative ?? true,
+					cacheDbPath: dbPath,
+					now: () => now,
+					...(sources.endpoint ? { fetchDynamicModels: sources.endpoint } : {}),
+					...(sources.modelsDev
+						? {
+								modelsDev: {
+									fetch: sources.modelsDev,
+									map: (payload: unknown) => {
+										if (payload === null) throw new Error("models.dev unavailable");
+										return payload as readonly Spec[];
+									},
+								},
+							}
+						: {}),
+					...(sources.restoreCachedHeaders ? { restoreCachedHeaders: sources.restoreCachedHeaders } : {}),
+				},
+				sources.strategy ?? "online",
+			);
+		/** A fetch that resolves with `value` once `after` has, plus one timer. */
+		const later =
+			<T>(after: Promise<void>, value: T) =>
+			async () => {
+				await after;
+				await new Promise(resolve => setTimeout(resolve, 0));
+				return value;
+			};
+
+		it("write the row in the order their fetches resolved", async () => {
+			const { promise: firstFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race("fetch-order", (dbPath, providerId) => [
+				// The first fetches 300 rows and builds them over many turns.
+				refresh(dbPath, providerId, 1_000_000, {
+					endpoint: async () => {
+						resolve();
+						return specs("old", 300, providerId);
+					},
+				}),
+				// The second fetches one row a timer later and is ready to write first.
+				refresh(dbPath, providerId, 1_100_000, { endpoint: later(firstFetched, specs("new", 1, providerId)) }),
+			]);
+			expect(stored).toEqual({ ids: ["new-0"], authoritative: true });
+		});
+		it("let a refresh that starts first but fetches last write last", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-start-order-"));
+			const dbPath = path.join(tempDir, "models.db");
+			const providerId = "start-order-test";
+			const { promise: lateFetchMayResolve, resolve: letLateFetchResolve } = Promise.withResolvers<void>();
+			const { promise: lateFetchCalled, resolve: markLateFetchCalled } = Promise.withResolvers<void>();
+			const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
+			try {
+				// The first refresh starts and its fetch waits.
+				const first = refresh(dbPath, providerId, 1_000_000, {
+					endpoint: async () => {
+						markLateFetchCalled();
+						await lateFetchMayResolve;
+						return specs("late", 1, providerId);
+					},
+				});
+				// Once the first refresh is inside its fetch (past any turn taken before the fetch), a later
+				// refresh fetches and writes without waiting for it.
+				await lateFetchCalled;
+				await refresh(dbPath, providerId, 1_100_000, { endpoint: async () => specs("early", 1, providerId) });
+				expect(storedIds()).toEqual(["early-0"]);
+				letLateFetchResolve();
+				await first;
+				expect(storedIds()).toEqual(["late-0"]);
+			} finally {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		});
+		it("let a failure that fetched after a success copy the success's rows", async () => {
+			const { promise: successFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race("failure-after-success", (dbPath, providerId) => [
+				refresh(dbPath, providerId, 1_000_000, {
+					endpoint: async () => {
+						resolve();
+						return specs("fetched", 300, providerId);
+					},
+				}),
+				refresh(dbPath, providerId, 1_100_000, { endpoint: later(successFetched, null) }),
+			]);
+			// As upstream: the failure copies the success's row, non-authoritative.
+			expect({ count: stored.ids.length, authoritative: stored.authoritative }).toEqual({
+				count: 300,
+				authoritative: false,
+			});
+		});
+		it("let a success that fetched after a failure write over the failure's copy", async () => {
+			const { promise: failureFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race(
+				"success-after-failure",
+				(dbPath, providerId) => [
+					// The endpoint fails; the copy of the 300-row prior row merges over many turns.
+					refresh(dbPath, providerId, 1_000_000, {
+						endpoint: async () => {
+							resolve();
+							return null;
+						},
+					}),
+					refresh(dbPath, providerId, 1_100_000, {
+						endpoint: later(failureFetched, specs("later", 1, providerId)),
+					}),
+				],
+				300,
+			);
+			expect(stored).toEqual({ ids: ["later-0"], authoritative: true });
+		});
+		it("report a refresh that fetched as stale when its own fetch failed", async () => {
+			const { promise: successFetched, resolve } = Promise.withResolvers<void>();
+			let failed: { stale: boolean } | undefined;
+			await race("failure-stale", (dbPath, providerId) => [
+				refresh(dbPath, providerId, 1_000_000, {
+					strategy: "online-if-uncached",
+					endpoint: async () => {
+						resolve();
+						return specs("fetched", 300, providerId);
+					},
+				}),
+				// It fetches because the row it read at its start was not fresh and authoritative;
+				// by its turn the success has written one that is.
+				refresh(dbPath, providerId, 1_100_000, {
+					strategy: "online-if-uncached",
+					endpoint: later(successFetched, null),
+				}).then(result => (failed = result)),
+			]);
+			expect(failed?.stale).toBe(true);
+		});
+		it("let a partial refresh that fetched after a complete one merge the complete rows", async () => {
+			const { promise: completeFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race("partial-after-complete", (dbPath, providerId) => [
+				refresh(dbPath, providerId, 1_000_000, {
+					endpoint: async () => {
+						resolve();
+						return specs("fetched", 300, providerId);
+					},
+				}),
+				// models.dev answers one row, the endpoint fails.
+				refresh(dbPath, providerId, 1_100_000, {
+					authoritative: false,
+					modelsDev: later(completeFetched, specs("dev", 1, providerId)),
+					endpoint: later(completeFetched, null),
+				}),
+			]);
+			// As upstream: the partial refresh's row is the complete rows plus its own, non-authoritative.
+			expect({
+				count: stored.ids.length,
+				dev: stored.ids.includes("dev-0"),
+				authoritative: stored.authoritative,
+			}).toEqual({
+				count: 301,
+				dev: true,
+				authoritative: false,
+			});
+		});
+		it("keep both rows when two partial refreshes failed different sources", async () => {
+			const { promise: firstFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race("partial-sources", (dbPath, providerId) => [
+				// models.dev answers 300 rows, the endpoint fails.
+				refresh(dbPath, providerId, 1_000_000, {
+					authoritative: false,
+					modelsDev: async () => {
+						resolve();
+						return specs("dev", 300, providerId);
+					},
+					endpoint: async () => null,
+				}),
+				// A timer later: models.dev fails, the endpoint answers one row.
+				refresh(dbPath, providerId, 1_100_000, {
+					authoritative: false,
+					modelsDev: later(firstFetched, null),
+					endpoint: later(firstFetched, specs("endpoint", 1, providerId)),
+				}),
+			]);
+			expect({
+				count: stored.ids.length,
+				prior: stored.ids.includes("prior-model"),
+				dev: stored.ids.includes("dev-0"),
+				endpoint: stored.ids.includes("endpoint-0"),
+			}).toEqual({ count: 302, prior: true, dev: true, endpoint: true });
+		});
+		it("let a partial refresh after an empty endpoint answer merge the emptied row", async () => {
+			const { promise: emptyFetched, resolve } = Promise.withResolvers<void>();
+			const stored = await race("empty-then-partial", (dbPath, providerId) => [
+				// The endpoint answers an empty list; models.dev's 300 rows build over many turns.
+				refresh(dbPath, providerId, 1_000_000, {
+					modelsDev: async () => specs("dev", 300, providerId),
+					endpoint: async () => {
+						resolve();
+						return [];
+					},
+				}),
+				refresh(dbPath, providerId, 1_100_000, {
+					modelsDev: later(emptyFetched, specs("partial", 1, providerId)),
+					endpoint: later(emptyFetched, null),
+				}),
+			]);
+			// As upstream: the empty answer removed every row, and the partial refresh adds its one.
+			expect(stored.ids).toEqual(["partial-0"]);
+		});
+		it("let the next refresh write when one throws after its fetch", async () => {
+			const keyed = completionsSpec({
+				id: "keyed-model",
+				provider: "throwing-turn-test",
+				headers: { "X-Key": "key" },
+			});
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-throwing-turn-"));
+			const dbPath = path.join(tempDir, "models.db");
+			const providerId = "throwing-turn-test";
+			const { promise: firstFetched, resolve } = Promise.withResolvers<void>();
+			try {
+				// keyed-model's header has no static source, so each read of the row calls the
+				// restore hook. The first refresh's hook throws on its second read, the one on its turn.
+				await refresh(dbPath, providerId, 900_000, { endpoint: async () => [keyed] });
+				let reads = 0;
+				const first = refresh(dbPath, providerId, 1_000_000, {
+					endpoint: async () => {
+						resolve();
+						return null;
+					},
+					restoreCachedHeaders: () => {
+						if (++reads === 2) throw new Error("restore failed");
+						return { headers: { "X-Key": "key" } };
+					},
+				});
+				const second = refresh(dbPath, providerId, 1_100_000, {
+					endpoint: later(firstFetched, specs("next", 1, providerId)),
+					restoreCachedHeaders: () => ({ headers: { "X-Key": "key" } }),
+				});
+				await expect(first).rejects.toThrow("restore failed");
+				await second;
+				expect(readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id)).toEqual([
+					"next-0",
+				]);
+			} finally {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		}, 5_000);
+		it("get turns in order, also when a later turn is released before its own came", async () => {
+			const dbPath = path.join(os.tmpdir(), "pi-catalog-turn-order-unopened.db");
+			const turn = () => takeModelCacheRowTurn("turn-order-test", dbPath);
+			const first = turn();
+			const second = turn();
+			// The second is released early, as on an error before its turn came.
+			second[Symbol.dispose]();
+			// Let any cleanup the release triggers run before the next turn is taken.
+			await new Promise(resolve => setTimeout(resolve, 0));
+			const third = turn();
+			let thirdReady = false;
+			void third.ready.then(() => (thirdReady = true));
+			await first.ready;
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(thirdReady).toBe(false);
+			first[Symbol.dispose]();
+			await third.ready;
+			expect(thirdReady).toBe(true);
+			third[Symbol.dispose]();
+			// Two spellings of one file share its turns.
+			const plain = turn();
+			const dotted = takeModelCacheRowTurn("turn-order-test", `${os.tmpdir()}/./pi-catalog-turn-order-unopened.db`);
+			let dottedReady = false;
+			void dotted.ready.then(() => (dottedReady = true));
+			await plain.ready;
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(dottedReady).toBe(false);
+			plain[Symbol.dispose]();
+			await dotted.ready;
+			dotted[Symbol.dispose]();
+		});
 	});
 	it("reports an authoritative catalog emptying as non-stale so removed models prune", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-empty-transition-"));

@@ -1,7 +1,9 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { retainModelCacheConnection } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { type Args, parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -10,7 +12,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { buildSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
 import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -47,42 +49,74 @@ async function createSourceSessionFixture(tempDir: TempDir, parentId: string): P
 	return { cwd, sourceFile, sourceHeader, forkSessionDir };
 }
 
+/**
+ * The credential store and the model cache are SQLite databases in memory: this checks which prompt-cache key a
+ * session starts with, not what reaches the disk. On disk, the four sessions below synced it about 250 times, and
+ * on a loaded machine those syncs alone outlasted the test's timeout. The SDK builds the same registry for the
+ * agent dir; only the cache's database differs.
+ */
+const MODEL_CACHE_DB = ":memory:";
+
+/** A session on in-memory stores; disposing it disposes the session and closes both stores. */
 async function createMinimalSession(
 	tempDir: TempDir,
 	options: CreateAgentSessionOptions,
-): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
-	const authStorage = await AuthStorage.create(tempDir.join("sdk-auth.db"));
-	authStorage.keys.setRuntime("openai", "test-key");
-	const shouldSupplyModel = options.sessionManager?.getHeader()?.parentSession === undefined;
-	const result = await createAgentSession({
-		...options,
-		cwd: options.cwd ?? tempDir.path(),
-		agentDir: tempDir.path(),
-		authStorage,
-		modelRegistry: undefined,
-		model: shouldSupplyModel ? (options.model ?? OPENAI_TEST_MODEL) : options.model,
-		settings: Settings.isolated({
+): Promise<{ session: AgentSession } & AsyncDisposable> {
+	const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+	const cache = retainModelCacheConnection(MODEL_CACHE_DB);
+	const closeStores = () => {
+		authStorage.close();
+		cache[Symbol.dispose]();
+	};
+	try {
+		authStorage.keys.setRuntime("openai", "test-key");
+		const settings = Settings.isolated({
 			"async.enabled": false,
 			"marketplace.autoUpdate": "off",
-		}),
-		disableExtensionDiscovery: true,
-		preloadedExtensions: undefined,
-		skills: [],
-		contextFiles: [],
-		promptTemplates: [],
-		slashCommands: [],
-		workspaceTree: {
-			rootPath: options.cwd ?? tempDir.path(),
-			rendered: "",
-			truncated: false,
-			totalLines: 0,
-			agentsMdFiles: [],
-		},
-		enableMCP: false,
-		enableLsp: false,
-		...(options.toolNames !== undefined ? { toolNames: options.toolNames } : {}),
-	});
-	return { session: result.session, authStorage };
+		});
+		const shouldSupplyModel = options.sessionManager?.getHeader()?.parentSession === undefined;
+		const { session } = await createAgentSession({
+			...options,
+			cwd: options.cwd ?? tempDir.path(),
+			agentDir: tempDir.path(),
+			authStorage,
+			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml"), {
+				settings,
+				cacheDbPath: MODEL_CACHE_DB,
+			}),
+			model: shouldSupplyModel ? (options.model ?? OPENAI_TEST_MODEL) : options.model,
+			settings,
+			disableExtensionDiscovery: true,
+			preloadedExtensions: undefined,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			workspaceTree: {
+				rootPath: options.cwd ?? tempDir.path(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+			enableMCP: false,
+			enableLsp: false,
+			...(options.toolNames !== undefined ? { toolNames: options.toolNames } : {}),
+		});
+		return {
+			session,
+			async [Symbol.asyncDispose]() {
+				try {
+					await session.dispose();
+				} finally {
+					closeStores();
+				}
+			},
+		};
+	} catch (error) {
+		closeStores();
+		throw error;
+	}
 }
 
 describe("provider prompt-cache key session affinity", () => {
@@ -104,51 +138,35 @@ describe("provider prompt-cache key session affinity", () => {
 
 	it("creates an agent whose prompt-cache key can differ from provider request lineage", async () => {
 		using tempDir = TempDir.createSync("@omp-prompt-cache-sdk-");
-		let session: AgentSession | undefined;
-		let authStorage: AuthStorage | undefined;
-		try {
-			const created = await createMinimalSession(tempDir, {
-				providerSessionId: "provider-lineage",
-				providerPromptCacheKey: "cache-affinity",
-				sessionManager: SessionManager.inMemory(tempDir.path()),
-			});
-			session = created.session;
-			authStorage = created.authStorage;
+		await using created = await createMinimalSession(tempDir, {
+			providerSessionId: "provider-lineage",
+			providerPromptCacheKey: "cache-affinity",
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+		});
+		const { session } = created;
 
-			expect(session.agent.sessionId).toBe("provider-lineage");
-			expect(session.agent.promptCacheKey).toBe("cache-affinity");
-			expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
-		} finally {
-			await session?.dispose();
-			authStorage?.close();
-		}
+		expect(session.agent.sessionId).toBe("provider-lineage");
+		expect(session.agent.promptCacheKey).toBe("cache-affinity");
+		expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
 	});
 
 	it("initializes a full fork with child request lineage and parent prompt-cache affinity", async () => {
 		using tempDir = TempDir.createSync("@omp-prompt-cache-fork-");
 		const source = await createSourceSessionFixture(tempDir, "parent-cache-session");
 		const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
-		let session: AgentSession | undefined;
-		let authStorage: AuthStorage | undefined;
-		try {
-			const created = await createMinimalSession(tempDir, {
-				cwd: source.cwd,
-				sessionManager: forkedManager,
-			});
-			session = created.session;
-			authStorage = created.authStorage;
-			const childSessionId = forkedManager.getSessionId();
+		await using created = await createMinimalSession(tempDir, {
+			cwd: source.cwd,
+			sessionManager: forkedManager,
+		});
+		const { session } = created;
+		const childSessionId = forkedManager.getSessionId();
 
-			expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
-			expect(childSessionId).toBeString();
-			expect(childSessionId).not.toBe(source.sourceHeader.id);
-			expect(session.agent.sessionId).toBe(childSessionId);
-			expect(session.agent.promptCacheKey).toBe(source.sourceHeader.id);
-			expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
-		} finally {
-			await session?.dispose();
-			authStorage?.close();
-		}
+		expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
+		expect(childSessionId).toBeString();
+		expect(childSessionId).not.toBe(source.sourceHeader.id);
+		expect(session.agent.sessionId).toBe(childSessionId);
+		expect(session.agent.promptCacheKey).toBe(source.sourceHeader.id);
+		expect(session.agent.promptCacheKey).not.toBe(session.agent.sessionId);
 	});
 
 	it("does not auto-inherit parent prompt-cache affinity when fork startup changes request-shaping inputs", async () => {
@@ -175,23 +193,14 @@ describe("provider prompt-cache key session affinity", () => {
 			using tempDir = TempDir.createSync(`@omp-prompt-cache-fork-${entry.name}-`);
 			const source = await createSourceSessionFixture(tempDir, `parent-cache-session-${entry.name}`);
 			const forkedManager = await SessionManager.forkFrom(source.sourceFile, source.cwd, source.forkSessionDir);
-			let session: AgentSession | undefined;
-			let authStorage: AuthStorage | undefined;
-			try {
-				const created = await createMinimalSession(tempDir, {
-					...entry.options,
-					cwd: source.cwd,
-					sessionManager: forkedManager,
-				});
-				session = created.session;
-				authStorage = created.authStorage;
+			await using created = await createMinimalSession(tempDir, {
+				...entry.options,
+				cwd: source.cwd,
+				sessionManager: forkedManager,
+			});
 
-				expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
-				expect(session.agent.promptCacheKey, entry.name).toBeUndefined();
-			} finally {
-				await session?.dispose();
-				authStorage?.close();
-			}
+			expect(forkedManager.getHeader()?.parentSession).toBe(source.sourceHeader.id);
+			expect(created.session.agent.promptCacheKey, entry.name).toBeUndefined();
 		}
 	});
 

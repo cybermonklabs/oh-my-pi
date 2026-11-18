@@ -177,8 +177,64 @@ function ensureDisplayPathSync(blobPath: string, displayPath: string, data: Buff
 	writeFileAtomicSync(displayPath, data);
 }
 
+/**
+ * A second store behind the local blob store, for the blobs a session
+ * references and cannot draw again: the SQL session storage's blob table. A
+ * session resumed on a machine whose blob store lacks them reads them back
+ * from it.
+ */
+export interface SessionBlobTier {
+	/**
+	 * Queue `data` (its SHA-256 `hash`) for the tier. It lands before any
+	 * transcript write that names it, so no transcript the tier's storage
+	 * holds names a blob the tier lacks; bytes that do not hash to `hash` are
+	 * never stored.
+	 */
+	store(hash: string, data: Buffer, mimeType: string | undefined): void;
+	/** Of `hashes`, the ones the tier holds, each with its size in bytes. */
+	sizes(hashes: readonly string[]): Promise<Map<string, number>>;
+	/**
+	 * Read the tier's bytes of `hashes` in batches bounded by bytes, handing each
+	 * blob to `visit` before the next batch is read.
+	 */
+	read(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void>;
+	/**
+	 * Rewrite each of `hashes`' rows whose bytes do not hash to its key, from
+	 * `local`'s bytes when they do; answers how many it rewrote.
+	 */
+	repair(hashes: readonly string[], local: (hash: string) => Promise<Buffer | null>): Promise<number>;
+	/**
+	 * Record that the session at `sessionPath` names `hashes`, once the queued
+	 * ones among them land, so a delete of another session keeps their rows.
+	 * A session written before the tier has no such rows of its own.
+	 */
+	reference(sessionPath: string, hashes: readonly string[]): Promise<void>;
+	/**
+	 * `omp gc`'s sweep: delete the blobs created before `beforeMs` that no
+	 * session's references name and `referenced` (the hashes named in any
+	 * transcript gc read) lacks. Without `apply`, only counts.
+	 */
+	sweep(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep>;
+}
+
+/** What {@link SessionBlobTier.sweep} found and deleted. */
+export interface SessionBlobSweep {
+	candidates: number;
+	deleted: number;
+	bytes: number;
+}
+
 export class BlobStore {
-	constructor(readonly dir: string) {}
+	constructor(
+		readonly dir: string,
+		/** The tier behind this store, if it has one. */
+		readonly tier?: SessionBlobTier,
+	) {}
+
+	/** Hand `data`, stored here under `hash`, to the tier; no-op without a tier. */
+	mirror(hash: string, data: Buffer, mimeType: string | undefined): void {
+		this.tier?.store(hash, data, mimeType);
+	}
 
 	/**
 	 * Write binary data to the blob store.
@@ -329,10 +385,20 @@ export async function externalizeImageDataUrl(blobStore: BlobStore, dataUrl: str
 	return ref;
 }
 
-/** Synchronous variant of {@link externalizeImageDataUrl}. */
-export function externalizeImageDataUrlSync(blobStore: BlobStore, dataUrl: string): string {
+/**
+ * Synchronous variant of {@link externalizeImageDataUrl}. With `mirror`, the
+ * blob also goes to the store's tier (see {@link BlobStore.mirror}).
+ */
+export function externalizeImageDataUrlSync(
+	blobStore: BlobStore,
+	dataUrl: string,
+	options?: { mirror?: boolean },
+): string {
 	if (isBlobRef(dataUrl)) return dataUrl;
-	return blobStore.putSync(Buffer.from(dataUrl, "utf8")).ref;
+	const data = Buffer.from(dataUrl, "utf8");
+	const { hash, ref } = blobStore.putSync(data);
+	if (options?.mirror) blobStore.mirror(hash, data, dataUrl.slice("data:".length, dataUrl.indexOf(";")));
+	return ref;
 }
 
 /**
@@ -352,12 +418,21 @@ export async function externalizeImageData(
 	return ref;
 }
 
-/** Synchronous variant of {@link externalizeImageData}. */
-export function externalizeImageDataSync(blobStore: BlobStore, base64Data: string, mimeType?: string): string {
+/**
+ * Synchronous variant of {@link externalizeImageData}. With `mirror`, the
+ * blob also goes to the store's tier (see {@link BlobStore.mirror}).
+ */
+export function externalizeImageDataSync(
+	blobStore: BlobStore,
+	base64Data: string,
+	mimeType?: string,
+	options?: { mirror?: boolean },
+): string {
 	if (isBlobRef(base64Data)) return base64Data;
-	return blobStore.putSync(Buffer.from(base64Data, "base64"), {
-		extension: blobExtensionForImageMimeType(mimeType),
-	}).ref;
+	const data = Buffer.from(base64Data, "base64");
+	const { hash, ref } = blobStore.putSync(data, { extension: blobExtensionForImageMimeType(mimeType) });
+	if (options?.mirror) blobStore.mirror(hash, data, mimeType);
+	return ref;
 }
 
 /**

@@ -17,6 +17,7 @@ import * as ai from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { startMemoryStartupTask } from "@oh-my-pi/pi-coding-agent/memories";
 import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
+import { FileSessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getAgentDbPath, logger, Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
@@ -26,6 +27,7 @@ interface SessionLike {
 		getSessionDir: () => string;
 		getSessionId: () => string;
 		getCwd: () => string;
+		getStorage: () => SessionStorage;
 	};
 	settings: Settings;
 	model: Model;
@@ -110,6 +112,8 @@ describe("issue #846: phase1 stage1 failures must be logged", () => {
 				getSessionDir: () => sessionDir,
 				getSessionId: () => "current-thread",
 				getCwd: () => agentDir,
+				// Memories read past sessions, and each claimed rollout, through the session's storage.
+				getStorage: () => new FileSessionStorage(),
 			},
 			settings,
 			model,
@@ -117,9 +121,10 @@ describe("issue #846: phase1 stage1 failures must be logged", () => {
 			refreshBaseSystemPrompt: vi.fn(async () => undefined),
 		};
 
-		// Seed a thread whose rolloutPath does not exist on disk -> Bun.file().text()
-		// throws ENOENT inside runStage1Job, which currently catches and silently
-		// records the reason in DB only.
+		// Seed a thread whose rolloutPath does not exist on disk -> opening the
+		// rollout through the session's file storage throws ENOENT inside
+		// runStage1Job, which currently catches and silently records the reason
+		// in DB only.
 		const missingRollout = path.join(sessionDir, "thread-missing.jsonl");
 		const db = memoryStorage.openMemoryDb(getAgentDbPath(agentDir));
 		memoryStorage.upsertThreads(db, [

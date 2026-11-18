@@ -1,4 +1,5 @@
 import { type IpcConnection, IpcServer } from "@oh-my-pi/pi-natives";
+import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { type Component, isFocusable, type OverlayOptions, type TUI } from "./tui";
 import { plainText } from "./native/spans";
 
@@ -282,7 +283,9 @@ export class TuiDebugServer {
 		if (request.op === "quit" && response.ok) {
 			await connection.drained();
 			this.#tui.stop();
-			process.exit(0);
+			// Through postmortem's cleanup, which gives back a SQL session lease the launch holds; past the
+			// extension-load guard, since a quit can arrive while extensions still load.
+			await postmortem.exitAfterCleanup(0, { exit: "native" });
 		}
 	}
 

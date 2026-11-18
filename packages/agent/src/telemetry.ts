@@ -25,9 +25,12 @@
 
 import {
 	type Api,
+	type ApiKey,
+	type ApiKeyResolution,
 	type AssistantMessage,
 	type Context,
 	completeSimple,
+	isApiKeyResolver,
 	type Message,
 	type Model,
 	type OneshotRetryOptions,
@@ -35,10 +38,12 @@ import {
 	type ServiceTier,
 	type SimpleStreamOptions,
 	type StopReason,
+	resolvedApiKeyBearer,
 	shouldSendServiceTier,
 	type ToolChoice,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { $otelEnv } from "@oh-my-pi/pi-utils";
 import {
 	type Attributes,
@@ -101,6 +106,10 @@ export const enum GenAIAttr {
 	UsageOutputTokens = "gen_ai.usage.output_tokens",
 	UsageCacheReadInputTokens = "gen_ai.usage.cache_read.input_tokens",
 	UsageCacheCreationInputTokens = "gen_ai.usage.cache_creation.input_tokens",
+	/** Cache-write tokens at the 5-minute lifetime, including writes the provider did not tier. */
+	UsageCacheCreationEphemeral5mInputTokens = "gen_ai.usage.cache_creation.ephemeral_5m_input_tokens",
+	/** Cache-write tokens at the 1-hour lifetime (priced at twice the input rate). */
+	UsageCacheCreationEphemeral1hInputTokens = "gen_ai.usage.cache_creation.ephemeral_1h_input_tokens",
 	UsageReasoningOutputTokens = "gen_ai.usage.reasoning.output_tokens",
 	// Tools
 	ToolCallId = "gen_ai.tool.call.id",
@@ -128,6 +137,14 @@ export const enum OpenAIAttr {
 export const enum OmpGenAIAttr {
 	AgentStepNumber = "omp.gen_ai.agent.step.number",
 	AgentStepCount = "omp.gen_ai.agent.step.count",
+	/**
+	 * Provider id before OTel normalization (`openai-codex`, `openai`,
+	 * `anthropic`). `gen_ai.provider.name` folds ids that bill differently into
+	 * one label (a ChatGPT-plan `openai-codex` call reads as `openai`).
+	 */
+	ProviderId = "omp.gen_ai.provider.id",
+	/** Credential kind the request used: a {@link TelemetryAuthKind}. */
+	AuthKind = "omp.gen_ai.auth.kind",
 	RequestReasoningEffort = "omp.gen_ai.request.reasoning.effort",
 	RequestToolChoice = "omp.gen_ai.request.tool.choice",
 	RequestAvailableTools = "omp.gen_ai.request.available_tools",
@@ -506,6 +523,7 @@ function startSpan(
 		attrs[GenAIAttr.RequestModel] = options.model.id;
 		const provider = normalizeProviderName(telemetry, options.model.provider);
 		if (provider) attrs[GenAIAttr.ProviderName] = provider;
+		if (options.model.provider) attrs[OmpGenAIAttr.ProviderId] = options.model.provider;
 	}
 	if (telemetry.conversationId) {
 		attrs[GenAIAttr.ConversationId] = telemetry.conversationId;
@@ -723,6 +741,8 @@ export function startChatSpan(
 		readonly parent?: Span;
 		readonly stepNumber: number;
 		readonly request: ChatRequestSnapshot;
+		/** Credential kind of the request; defaults to `unknown`. */
+		readonly authKind?: TelemetryAuthKind;
 	},
 ): Span | undefined {
 	const span = startSpan(telemetry, "chat", `chat ${model.id}`, {
@@ -733,6 +753,7 @@ export function startChatSpan(
 		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model),
 	});
 	if (span) {
+		span.setAttribute(OmpGenAIAttr.AuthKind, options.authKind ?? "unknown");
 		telemetry?.collector.beginChat(span, {
 			stepNumber: options.stepNumber,
 			model,
@@ -744,6 +765,52 @@ export function startChatSpan(
 		}
 	}
 	return span;
+}
+
+/**
+ * Values of {@link OmpGenAIAttr.AuthKind}: how the request's provider bills it.
+ * - `api_key`: a static API key, billed per token.
+ * - `console_oauth`: an Anthropic Console login, billed per token to the Console organization.
+ * - `subscription_oauth`: any other OAuth login (Claude Pro/Max, the ChatGPT plan for `openai-codex`).
+ * - `unknown`: no credential, or a bearer with no provenance.
+ */
+export type TelemetryAuthKind = "api_key" | "console_oauth" | "subscription_oauth" | "unknown";
+
+/** Login whose OAuth grants are billed per token rather than by subscription. */
+const CONSOLE_LOGIN_PROVIDER = "anthropic-console";
+
+/**
+ * Classify the credential a request used from the resolver's
+ * `ResolvedApiKey.credentialType` and `loginProvider`. An Anthropic
+ * `sk-ant-oat` bearer is OAuth wherever it came from: a stored row names its
+ * login, and a bare one (an OAuth-token env var) is a Claude subscription token.
+ */
+export function classifyTelemetryAuthKind(resolved: ApiKeyResolution): TelemetryAuthKind {
+	const bearer = resolvedApiKeyBearer(resolved);
+	if (bearer === undefined) return "unknown";
+	const provenance = typeof resolved === "object" ? resolved : undefined;
+	if (provenance?.credentialType === "oauth" || isAnthropicOAuthToken(bearer)) {
+		return provenance?.loginProvider === CONSOLE_LOGIN_PROVIDER ? "console_oauth" : "subscription_oauth";
+	}
+	return provenance?.credentialType ?? "unknown";
+}
+
+/**
+ * Stamp {@link OmpGenAIAttr.AuthKind} on `span` from `apiKey`: at once for a
+ * static bearer, and on every resolution for a resolver, so a credential the
+ * provider rotates to mid-request is the one recorded. Returns the key to send.
+ */
+export function trackTelemetryAuthKind(span: Span | undefined, apiKey: ApiKey | undefined): ApiKey | undefined {
+	if (!span || apiKey === undefined) return apiKey;
+	if (!isApiKeyResolver(apiKey)) {
+		span.setAttribute(OmpGenAIAttr.AuthKind, classifyTelemetryAuthKind(apiKey));
+		return apiKey;
+	}
+	return async ctx => {
+		const resolved = await apiKey(ctx);
+		if (resolved !== undefined) span.setAttribute(OmpGenAIAttr.AuthKind, classifyTelemetryAuthKind(resolved));
+		return resolved;
+	};
 }
 
 /** Mutable snapshot of every request-side field worth recording. */
@@ -1249,6 +1316,13 @@ function applyUsageAttributes(span: Span, usage: Usage | undefined): void {
 	span.setAttribute(OmpGenAIAttr.UsageTotalTokens, total);
 	if (usage.cacheRead != null) span.setAttribute(GenAIAttr.UsageCacheReadInputTokens, usage.cacheRead);
 	if (usage.cacheWrite != null) span.setAttribute(GenAIAttr.UsageCacheCreationInputTokens, usage.cacheWrite);
+	if (usage.cttl) {
+		// Same split the catalog prices: untiered writes are 5-minute writes.
+		const oneHour = usage.cttl.ephemeral1h ?? 0;
+		const fiveMinute = Math.max(usage.cttl.ephemeral5m ?? 0, (usage.cacheWrite ?? 0) - oneHour);
+		span.setAttribute(GenAIAttr.UsageCacheCreationEphemeral5mInputTokens, fiveMinute);
+		span.setAttribute(GenAIAttr.UsageCacheCreationEphemeral1hInputTokens, oneHour);
+	}
 	if (usage.reasoningTokens != null) {
 		span.setAttribute(GenAIAttr.UsageReasoningOutputTokens, usage.reasoningTokens);
 	}
@@ -1610,6 +1684,8 @@ export interface ManualChatTelemetryOptions {
 	readonly attributes?: Attributes;
 	readonly responseHeaders?: Readonly<Record<string, string>>;
 	readonly endSpan?: boolean;
+	/** Credential kind of the request; a new span defaults to `unknown`. */
+	readonly authKind?: TelemetryAuthKind;
 }
 
 export async function recordManualChatTelemetry(
@@ -1627,6 +1703,7 @@ export async function recordManualChatTelemetry(
 		});
 	if (!span) return undefined;
 	if (options.span && options.attributes) span.setAttributes(options.attributes);
+	if (options.authKind || !options.span) span.setAttribute(OmpGenAIAttr.AuthKind, options.authKind ?? "unknown");
 	if (options.stepNumber != null) span.setAttribute(OmpGenAIAttr.AgentStepNumber, options.stepNumber);
 	span.setAttribute(GenAIAttr.ResponseModel, options.responseModel ?? options.model.name);
 	if (options.responseId) span.setAttribute(GenAIAttr.ResponseId, options.responseId);
@@ -1701,6 +1778,8 @@ export interface JudgmentTelemetryOptions {
 	readonly questions?: number;
 	/** Questions answered from the local cache rather than the provider. */
 	readonly cachedQuestions?: number;
+	/** Credential kind the attempt used; defaults to `unknown`. */
+	readonly authKind?: TelemetryAuthKind;
 }
 
 /**
@@ -1719,6 +1798,8 @@ export async function recordJudgmentTelemetry(
 	const attributes: Attributes = {
 		[GenAIAttr.RequestModel]: options.model,
 		[OmpGenAIAttr.JudgmentPurpose]: options.purpose,
+		[OmpGenAIAttr.ProviderId]: options.provider,
+		[OmpGenAIAttr.AuthKind]: options.authKind ?? "unknown",
 	};
 	const provider = normalizeProviderName(telemetry, options.provider);
 	if (provider) attributes[GenAIAttr.ProviderName] = provider;
@@ -1864,6 +1945,7 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 		if (oneshotKind) chatSpan.setAttribute(OmpGenAIAttr.OneshotKind, oneshotKind);
 		if (span.attributes) chatSpan.setAttributes(span.attributes);
 	}
+	const apiKey = trackTelemetryAuthKind(chatSpan, options.apiKey);
 
 	// Wrap the user-supplied onResponse so we always capture response headers
 	// for the cost / gateway hooks without stealing them from the caller.
@@ -1886,7 +1968,7 @@ export async function instrumentedCompleteSimple<TApi extends Api>(
 				// Clear first so a previous attempt's `retry-after` can never be
 				// reused for a later failure that arrived without headers.
 				capturedHeaders = undefined;
-				return complete(model, ctx, { ...options, onResponse: captureOnResponse });
+				return complete(model, ctx, { ...options, apiKey, onResponse: captureOnResponse });
 			};
 			const message = span.retry
 				? await retryTransientCompletion(runOnce, {

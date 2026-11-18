@@ -10,11 +10,18 @@
 //!   costs nothing extra and each call returns as many entries as possible.
 //! - Names convert from UTF-16 straight into the listing arena as WTF-8, which
 //!   round-trips unpaired surrogates back to the exact on-disk name.
-//! - Following path stats use `NtQueryFullAttributesFile`, which answers
-//!   without the caller opening a handle.
+//! - Stats of an absolute path use `NtQueryFullAttributesFile` (a reparse
+//!   point's target under `follow`: a handle opened by path), which stamp
+//!   `ChangeTime` as a handle's query does, so the listing cache compares like
+//!   with like. A file that refuses them falls back to `std::fs`.
 //!
 //! Reparse points (symlinks, junctions, mount points, cloud placeholders) are
-//! reported as symlinks and never descended.
+//! reported as symlinks and never descended. Opens that do not follow them
+//! (a child directory, a listed file, a path below a walk root) open one
+//! component at a time relative to the directory before it with
+//! `FILE_OPEN_REPARSE_POINT`, which opens a reparse point itself instead of
+//! its target; file opens and opens below a walk root then refuse a reparse
+//! point they reached.
 
 use std::{
 	io,
@@ -30,29 +37,35 @@ use windows_sys::{
 	Wdk::{
 		Foundation::OBJECT_ATTRIBUTES,
 		Storage::FileSystem::{
-			FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_OPEN,
-			FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-			FileDirectoryInformation, FileNetworkOpenInformation, NtCreateFile, NtQueryDirectoryFile,
-			NtQueryFullAttributesFile, NtQueryInformationFile,
+			FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+			FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+			FILE_SYNCHRONOUS_IO_NONALERT, FileDirectoryInformation, FileNetworkOpenInformation,
+			NtCreateFile, NtQueryDirectoryFile, NtQueryFullAttributesFile, NtQueryInformationFile,
 		},
 	},
 	Win32::{
 		Foundation::{
-			ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_INVALID_NAME, HANDLE,
-			NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_NO_MORE_FILES,
-			STATUS_NO_SUCH_FILE, UNICODE_STRING,
+			ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_HANDLE_EOF, ERROR_INVALID_DATA,
+			ERROR_INVALID_FUNCTION, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+			ERROR_SHARING_VIOLATION, ERROR_STOPPED_ON_SYMLINK, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
+			RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING,
 		},
 		Storage::FileSystem::{
-			BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-			FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
+			BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+			FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+			FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+			FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+			FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+			FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo, FileDispositionInfoEx,
+			GetFileInformationByHandle, GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
+			SetFileInformationByHandle,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
 };
 
-use super::{aligned_buf, le32, le64};
+use super::{aligned_buf, le32, le64, rewrite};
 use crate::fs::{
 	Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular,
 	wtf8::{push_wide, push_wtf8},
@@ -84,6 +97,11 @@ const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// Lists entries and reads attributes (for stamps).
 const DIR_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Truncates and writes a file, and reads attributes to refuse a reparse
+/// point first.
+const WRITE_ACCESS: u32 = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Marks an entry for deletion.
+const DELETE_ACCESS: u32 = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
 /// Per-session syscall scratch.
 #[derive(Default)]
@@ -133,12 +151,35 @@ fn open_path(path: &Path, access: u32) -> io::Result<Handle> {
 	Ok(OwnedHandle::from(file))
 }
 
+/// [`open_path`] with `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a reparse
+/// point at `path` itself instead of its target.
+fn open_path_unlinked(path: &Path, access: u32) -> io::Result<Handle> {
+	let file = std::fs::OpenOptions::new()
+		.access_mode(access)
+		.share_mode(SHARE_ALL)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+		.open(path)?;
+	Ok(OwnedHandle::from(file))
+}
+
 /// Opens `name` (WTF-8, `/`-separated components) relative to `parent`.
 fn nt_open(
 	s: &mut Scratch,
 	parent: &Handle,
 	name: &[u8],
 	access: u32,
+	options: u32,
+) -> io::Result<Handle> {
+	nt_create(s, parent, name, access, FILE_OPEN, options)
+}
+
+/// Opens (or, as `disposition` says, creates) `name` relative to `parent`.
+fn nt_create(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	disposition: u32,
 	options: u32,
 ) -> io::Result<Handle> {
 	s.wname.clear();
@@ -173,7 +214,7 @@ fn nt_open(
 			null(),
 			0,
 			SHARE_ALL,
-			FILE_OPEN,
+			disposition,
 			options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
 			null(),
 			0,
@@ -186,9 +227,9 @@ fn nt_open(
 	Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-/// Stamps an open handle and reports its type and size (reparse points
+/// Queries an open handle's attributes, size, and times (reparse points
 /// opened without `FILE_OPEN_REPARSE_POINT` report their target).
-fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
+fn query_handle(h: &Handle) -> io::Result<FILE_NETWORK_OPEN_INFORMATION> {
 	let mut info = FILE_NETWORK_OPEN_INFORMATION::default();
 	let mut iosb = IO_STATUS_BLOCK::default();
 	// SAFETY: `info` is a writable buffer of the size passed.
@@ -204,13 +245,86 @@ fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
 	if status < 0 {
 		return Err(nt_error(status));
 	}
-	Ok(info_of(&info))
+	Ok(info)
+}
+
+/// Stamps an open handle and reports its type and size (reparse points
+/// opened without `FILE_OPEN_REPARSE_POINT` report their target).
+fn stat_handle(h: &Handle) -> io::Result<FileInfo> {
+	query_handle(h).map(|info| info_of(&info))
+}
+
+/// Opens `name` (one component) of `parent` with `FILE_OPEN_REPARSE_POINT`,
+/// so a reparse point there is opened itself rather than followed, and
+/// refuses one (`ERROR_STOPPED_ON_SYMLINK`), as listings report every reparse
+/// point as a symlink.
+fn nt_open_unlinked(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	options: u32,
+) -> io::Result<(Handle, FileInfo)> {
+	nt_create_unlinked(s, parent, name, access, FILE_OPEN, options)
+}
+
+/// [`nt_open_unlinked`] with a create `disposition`.
+fn nt_create_unlinked(
+	s: &mut Scratch,
+	parent: &Handle,
+	name: &[u8],
+	access: u32,
+	disposition: u32,
+	options: u32,
+) -> io::Result<(Handle, FileInfo)> {
+	let h = nt_create(s, parent, name, access, disposition, options | FILE_OPEN_REPARSE_POINT)?;
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
+	Ok((h, info_of(&info)))
+}
+
+/// Opens every directory on the way to the last component of the
+/// walk-relative `rel` (separated by `/` or `\`) below `root`, one component
+/// at a time, following no reparse point ([`nt_open_unlinked`]); returns the
+/// directory reached (`None`: `root` itself) and the last component. At most
+/// two handles are open at once.
+fn parent_beneath<'r>(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &'r [u8],
+) -> io::Result<(Option<Handle>, &'r [u8])> {
+	let mut reached: Option<Handle> = None;
+	let mut rest = rel;
+	while let Some(slash) = memchr::memchr2(b'/', b'\\', rest) {
+		let at = reached.as_ref().unwrap_or(root);
+		let (dir, _) = nt_open_unlinked(s, at, &rest[..slash], DIR_ACCESS, FILE_DIRECTORY_FILE)?;
+		reached = Some(dir);
+		rest = &rest[slash + 1..];
+	}
+	Ok((reached, rest))
 }
 
 pub(crate) fn open_dir(_s: &mut Scratch, path: &Path) -> io::Result<Handle> {
 	let h = open_path(path, DIR_ACCESS)?;
 	// FILE_FLAG_BACKUP_SEMANTICS also opens regular files.
 	if stat_handle(&h)?.file_type != Some(FileType::Dir) {
+		return Err(win_error(ERROR_DIRECTORY));
+	}
+	Ok(h)
+}
+
+/// Opens the directory at `path` without following a reparse point that is
+/// its final component: one there is refused (`ERROR_STOPPED_ON_SYMLINK`),
+/// as listings report every reparse point as a symlink.
+pub(crate) fn open_dir_unlinked(_s: &mut Scratch, path: &Path) -> io::Result<Handle> {
+	let h = open_path_unlinked(path, DIR_ACCESS)?;
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
+	if info_of(&info).file_type != Some(FileType::Dir) {
 		return Err(win_error(ERROR_DIRECTORY));
 	}
 	Ok(h)
@@ -318,24 +432,156 @@ pub(crate) fn list(
 	}
 }
 
+/// `h` and its information when it is a regular file (a reparse point opened
+/// without `FILE_OPEN_REPARSE_POINT` reports its target).
 fn regular(h: Handle) -> io::Result<(Handle, FileInfo)> {
 	let info = stat_handle(&h)?;
-	if info.file_type != Some(FileType::File) {
-		return Err(not_regular());
-	}
-	Ok((h, info))
+	file_of((h, info))
 }
 
+/// Opens the regular file `name` (one component) in `dir`; without `follow`,
+/// a reparse point there is refused ([`nt_open_unlinked`]).
 pub(crate) fn open_file_at(
 	s: &mut Scratch,
 	dir: &Handle,
 	name: &[u8],
+	follow: bool,
 ) -> io::Result<(Handle, FileInfo)> {
-	regular(nt_open(s, dir, name, FILE_ACCESS, 0)?)
+	if follow {
+		return regular(nt_open(s, dir, name, FILE_ACCESS, 0)?);
+	}
+	file_of(nt_open_unlinked(s, dir, name, FILE_ACCESS, 0)?)
 }
 
 pub(crate) fn open_file(_s: &mut Scratch, path: &Path) -> io::Result<(Handle, FileInfo)> {
 	regular(open_path(path, FILE_ACCESS)?)
+}
+
+/// Opens the regular file at the walk-relative `rel` below `root`, following
+/// no reparse point on the way ([`parent_beneath`]).
+pub(crate) fn open_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+) -> io::Result<(Handle, FileInfo)> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	file_of(nt_open_unlinked(s, reached.as_ref().unwrap_or(root), name, FILE_ACCESS, 0)?)
+}
+
+/// Opens the directory at the walk-relative `rel` below `root`, following no
+/// reparse point on the way ([`parent_beneath`]).
+pub(crate) fn open_dir_beneath(s: &mut Scratch, root: &Handle, rel: &[u8]) -> io::Result<Handle> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	nt_open_unlinked(s, at, name, DIR_ACCESS, FILE_DIRECTORY_FILE).map(|(h, _)| h)
+}
+
+/// Rewrites the regular file at the walk-relative `rel` below `root` in place
+/// with `contents`, creating it when missing: every directory on the way and
+/// the file open without following a reparse point ([`parent_beneath`],
+/// [`nt_create_unlinked`]), and the file is truncated only once it is known
+/// to be no reparse point and no directory.
+pub(crate) fn write_file_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	contents: &[u8],
+) -> io::Result<()> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	let (h, _) =
+		nt_create_unlinked(s, at, name, WRITE_ACCESS, FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE)?;
+	rewrite(std::fs::File::from(h), contents)
+}
+
+/// Removes the entry at the walk-relative `rel` below `root`: every directory
+/// on the way opens without following a reparse point ([`parent_beneath`]),
+/// and the entry, opened itself with `FILE_OPEN_REPARSE_POINT`, is marked for
+/// deletion, which happens when its handle closes here. With `dir` the entry
+/// must be a directory, a directory symlink or junction included (removed
+/// itself, as `RemoveDirectoryW` and [`std::fs::remove_dir`] remove it);
+/// without, it must not be one, so a directory symlink or junction fails, as
+/// `DeleteFileW` and [`std::fs::remove_file`] fail on it.
+///
+/// The mark uses POSIX semantics and ignores the read-only attribute, as
+/// [`std::fs::remove_file`] does through its `posix_delete`, so a read-only
+/// file is removed and its name is freed at once. The same mark serves a
+/// directory, so an empty directory with the read-only attribute is removed
+/// too, as `rmdir` removes one on Unix, where [`std::fs::remove_dir`]
+/// (`RemoveDirectoryW`) refuses it. A file system that does not know that
+/// class (`ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED`,
+/// `ERROR_INVALID_FUNCTION`; FAT, for one) gets the classic mark, as `std`
+/// falls back, which refuses a read-only file or directory there as
+/// `DeleteFileW` and `RemoveDirectoryW` do.
+pub(crate) fn remove_beneath(
+	s: &mut Scratch,
+	root: &Handle,
+	rel: &[u8],
+	dir: bool,
+) -> io::Result<()> {
+	let (reached, name) = parent_beneath(s, root, rel)?;
+	let at = reached.as_ref().unwrap_or(root);
+	let kind = if dir {
+		FILE_DIRECTORY_FILE
+	} else {
+		FILE_NON_DIRECTORY_FILE
+	};
+	let h = nt_open(s, at, name, DELETE_ACCESS, kind | FILE_OPEN_REPARSE_POINT)?;
+	let posix = FILE_DISPOSITION_INFO_EX {
+		Flags: FILE_DISPOSITION_FLAG_DELETE
+			| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+			| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+	};
+	// SAFETY: `FileDispositionInfoEx` takes a `FILE_DISPOSITION_INFO_EX`.
+	match unsafe { set_information(&h, FileDispositionInfoEx, &posix) } {
+		Err(err)
+			if err.raw_os_error().is_some_and(|code| {
+				matches!(
+					code as u32,
+					ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION
+				)
+			}) =>
+		{
+			let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+			// SAFETY: `FileDispositionInfo` takes a `FILE_DISPOSITION_INFO`.
+			unsafe { set_information(&h, FileDispositionInfo, &classic) }
+		},
+		result => result,
+	}
+}
+
+/// `SetFileInformationByHandle` of `info` in the class `class` on `h`.
+///
+/// # Safety
+///
+/// `T` must be the structure `class` takes.
+unsafe fn set_information<T>(
+	h: &Handle,
+	class: FILE_INFO_BY_HANDLE_CLASS,
+	info: &T,
+) -> io::Result<()> {
+	// SAFETY: `info` is a live `T` of the size passed, which the caller
+	// vouches is what `class` takes.
+	let ok = unsafe {
+		SetFileInformationByHandle(
+			h.as_raw_handle(),
+			class,
+			std::ptr::from_ref(info).cast(),
+			size_of::<T>() as u32,
+		)
+	};
+	if ok == 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+/// An opened handle and its information when it is a regular file.
+fn file_of((h, info): (Handle, FileInfo)) -> io::Result<(Handle, FileInfo)> {
+	if info.file_type != Some(FileType::File) {
+		return Err(not_regular());
+	}
+	Ok((h, info))
 }
 
 /// `ReadFile` at offset `off`. The offset rides in an OVERLAPPED, which on a
@@ -382,10 +628,79 @@ pub(crate) fn read_at(h: &Handle, buf: &mut [u8], off: u64) -> io::Result<usize>
 	read_raw(h, buf.as_mut_ptr(), buf.len(), off)
 }
 
+/// Identity of an open file, read from its handle rather than from the path it
+/// was opened by.
+pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
+	use std::os::windows::io::AsHandle;
+	let owned = h.as_handle().try_clone_to_owned()?;
+	pi_vfs::Metadata::from_file(&std::fs::File::from(owned))
+}
+
+/// Describes the file at `path`. An absolute path is answered by
+/// [`full_attributes`], which describes a reparse point itself: without
+/// `follow` one is reported as [`FileType::Symlink`]; with `follow` its
+/// target is described through a handle opened by path ([`stat_target`]).
+/// Those stamps have `ChangeTime` as their `ctime`, as the stamps taken from
+/// handles ([`stat_dir`], [`open_file_at`]) have it, which the listing cache
+/// compares them with. A file that refuses those queries
+/// ([`refuses_queries`]; `C:\hiberfil.sys`, for one) and a relative path are
+/// described through `std::fs` instead ([`stat_win32`]), whose stamp has the
+/// last write time as its `ctime`.
 pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<FileInfo> {
-	if !follow || !path.is_absolute() {
+	if !path.is_absolute() {
 		return stat_win32(path, follow);
 	}
+	let info = match full_attributes(s, path) {
+		Ok(info) => info,
+		Err(err) if refuses_queries(&err) => return stat_win32(path, follow),
+		Err(err) => return Err(err),
+	};
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		Ok(info_of(&info))
+	} else if follow {
+		stat_target(path)
+	} else {
+		Ok(symlink_info(&info))
+	}
+}
+
+/// The final target of the reparse point at the absolute `path`, described
+/// through a handle opened by path following reparse points, as
+/// `std::fs::metadata` opens it: a dangling or looping link fails as it fails
+/// there. A target still a reparse point once opened (a cloud placeholder) is
+/// reported as a symlink, as [`stat_win32`] reports it. A target that refuses
+/// the open ([`refuses_queries`]) is described through [`stat_win32`].
+fn stat_target(path: &Path) -> io::Result<FileInfo> {
+	let h = match open_path(path, FILE_READ_ATTRIBUTES) {
+		Ok(h) => h,
+		Err(err) if refuses_queries(&err) => return stat_win32(path, true),
+		Err(err) => return Err(err),
+	};
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+		Ok(info_of(&info))
+	} else {
+		Ok(symlink_info(&info))
+	}
+}
+
+/// A reparse point described by `info`, reported as a symlink.
+const fn symlink_info(info: &FILE_NETWORK_OPEN_INFORMATION) -> FileInfo {
+	FileInfo { file_type: Some(FileType::Symlink), size: 0, ..info_of(info) }
+}
+
+/// Whether `err` is a refusal that `std::fs::metadata` answers from the
+/// directory's entry instead (`FindFirstFileExW`): `ERROR_SHARING_VIOLATION`
+/// from a system file locked even against attribute reads, or
+/// `ERROR_ACCESS_DENIED`.
+fn refuses_queries(err: &io::Error) -> bool {
+	err.raw_os_error()
+		.is_some_and(|code| matches!(code as u32, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED))
+}
+
+/// `NtQueryFullAttributesFile` of the absolute `path`, which describes a
+/// reparse point (symlink, junction) at `path` itself, not its target.
+fn full_attributes(s: &mut Scratch, path: &Path) -> io::Result<FILE_NETWORK_OPEN_INFORMATION> {
 	// The NT layer takes names as spelled; Win32 rewriting (`/`, `.`/`..`,
 	// trailing dots and spaces) must happen first, as `std::fs` does.
 	let normalized;
@@ -430,15 +745,13 @@ pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<Fil
 	if status < 0 {
 		return Err(nt_error(status));
 	}
-	// The attribute query describes a reparse point (symlink, junction)
-	// itself, not its target.
-	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return stat_win32(path, true);
-	}
-	Ok(info_of(&info))
+	Ok(info)
 }
 
-/// [`stat`] through `std::fs`, which follows reparse points when `follow`.
+/// [`stat`] of a relative path, or of a file that refuses the attribute
+/// queries, through `std::fs`, which follows reparse points when `follow` and
+/// answers such a file from its directory's entry. Its stamp's `ctime` is the
+/// last write time: `std::fs` metadata carries no `ChangeTime`.
 fn stat_win32(path: &Path, follow: bool) -> io::Result<FileInfo> {
 	let meta = if follow {
 		std::fs::metadata(path)?
@@ -525,4 +838,61 @@ pub(crate) fn stable_stamps(h: &Handle, _stamp: &Stamp) -> bool {
 	["NTFS", "ReFS"]
 		.iter()
 		.any(|fs| fs.encode_utf16().eq(name.iter().copied()))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{os::windows::fs::OpenOptionsExt, path::PathBuf};
+
+	use super::{Scratch, full_attributes, refuses_queries, stat};
+	use crate::fs::FileType;
+
+	/// A stat of a file that refuses the attribute query falls back to
+	/// `std::fs`, which answers it from the directory's entry, with and
+	/// without `follow`, as `std::fs::metadata` does. The candidates are a
+	/// file this test holds open with share mode 0 and the system files that
+	/// are locked even against attribute reads; a candidate that answers the
+	/// query is not checked, and when none refused it the test prints UNKNOWN.
+	#[test]
+	fn a_file_that_refuses_the_attribute_query_is_stated_through_std() {
+		let held = std::env::temp_dir().join(format!("pi-walker-locked-{}", std::process::id()));
+		std::fs::write(&held, b"held").unwrap();
+		let lock = std::fs::OpenOptions::new()
+			.read(true)
+			.share_mode(0)
+			.open(&held)
+			.unwrap();
+		let mut candidates = vec![held.clone()];
+		candidates.extend(
+			[r"C:\hiberfil.sys", r"C:\pagefile.sys", r"C:\swapfile.sys", r"D:\pagefile.sys"]
+				.map(PathBuf::from),
+		);
+		let mut s = Scratch::default();
+		let (mut reached, mut answered) = (Vec::new(), Vec::new());
+		for path in &candidates {
+			match full_attributes(&mut s, path) {
+				Err(err) if refuses_queries(&err) => {},
+				other => {
+					answered.push(format!("{}: {:?}", path.display(), other.map(|_| "answered")));
+					continue;
+				},
+			}
+			let want = std::fs::symlink_metadata(path).expect("std answers it");
+			for follow in [false, true] {
+				let info = stat(&mut s, path, follow)
+					.unwrap_or_else(|err| panic!("{} (follow {follow}): {err}", path.display()));
+				assert_eq!(info.file_type, Some(FileType::File), "{}", path.display());
+				assert_eq!(info.size, want.len(), "{}", path.display());
+			}
+			reached.push(path.display().to_string());
+		}
+		drop(lock);
+		let _ = std::fs::remove_file(&held);
+		if reached.is_empty() {
+			eprintln!(
+				"UNKNOWN: no candidate refused the attribute query ({}); the fallback was not checked",
+				answered.join("; ")
+			);
+		}
+	}
 }

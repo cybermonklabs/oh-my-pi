@@ -361,7 +361,7 @@ impl Process for PsCommand {
 
 	fn run(&self, context: &ProcContext) -> impl Future<Output = io::Result<i32>> + Send {
 		async move {
-			let options = match parse_ps_args(&self.argv, context.paths()) {
+			let options = match parse_ps_args(&self.argv, context.paths()).await {
 				Ok(ParsePsResult::Options(options)) => *options,
 				Ok(ParsePsResult::Help) => {
 					write_ps_help(context.stdout())?;
@@ -443,7 +443,7 @@ impl Process for PsCommand {
 	}
 }
 
-fn parse_ps_args(argv: &[String], paths: &ShellPaths) -> std::result::Result<ParsePsResult, (u8, String)> {
+async fn parse_ps_args(argv: &[String], paths: &ShellPaths) -> std::result::Result<ParsePsResult, (u8, String)> {
 	let mut options = PsOptions::default();
 	let mut index = 0;
 	let mut options_done = false;
@@ -491,7 +491,7 @@ fn parse_ps_args(argv: &[String], paths: &ShellPaths) -> std::result::Result<Par
 			},
 			_ if arg == "--tty" || arg.starts_with("--tty=") => {
 				let value = take_ps_value(argv, &mut index, arg.strip_prefix("--tty="), "--tty")?;
-				parse_terminal_list(&value, &mut options.terminals, paths)?;
+				parse_terminal_list(&value, &mut options.terminals, paths).await?;
 			},
 			_ if arg == "--format" || arg.starts_with("--format=") => {
 				let value = take_ps_value(argv, &mut index, arg.strip_prefix("--format="), "--format")?;
@@ -510,7 +510,7 @@ fn parse_ps_args(argv: &[String], paths: &ShellPaths) -> std::result::Result<Par
 				if group.is_empty() {
 					return Err((1, "invalid option '-'".to_string()));
 				}
-				parse_ps_flag_group(group, FlagForm::Dashed, argv, &mut index, &mut options, paths)?;
+				parse_ps_flag_group(group, FlagForm::Dashed, argv, &mut index, &mut options, paths).await?;
 			},
 			_ if arg
 				.chars()
@@ -519,7 +519,7 @@ fn parse_ps_args(argv: &[String], paths: &ShellPaths) -> std::result::Result<Par
 				parse_i32_list(arg, &mut options.pids)?;
 			},
 			_ if arg.chars().all(|character| character.is_ascii_alphabetic()) => {
-				parse_ps_flag_group(arg, FlagForm::Bare, argv, &mut index, &mut options, paths)?;
+				parse_ps_flag_group(arg, FlagForm::Bare, argv, &mut index, &mut options, paths).await?;
 			},
 			_ => return Err((1, format!("unsupported operand '{arg}'"))),
 		}
@@ -548,7 +548,7 @@ fn take_ps_value(
 		.ok_or_else(|| (1, format!("option '{option}' requires an argument")))
 }
 
-fn parse_ps_flag_group(
+async fn parse_ps_flag_group(
 	group: &str,
 	form: FlagForm,
 	argv: &[String],
@@ -633,7 +633,7 @@ fn parse_ps_flag_group(
 			't' => {
 				let value =
 					take_ps_value(argv, index, (!remainder.is_empty()).then_some(remainder), "-t")?;
-				parse_terminal_list(&value, &mut options.terminals, paths)?;
+				parse_terminal_list(&value, &mut options.terminals, paths).await?;
 				return Ok(());
 			},
 			'u' => {
@@ -1378,11 +1378,11 @@ fn write_ps_help(mut output: impl Write) -> io::Result<()> {
 mod tests {
 	use super::*;
 
-	#[test]
-	fn parses_output_field_lists_and_overrides() {
+	#[tokio::test]
+	async fn parses_output_field_lists_and_overrides() {
 		let argv = vec!["-o".to_string(), "pid:8=PROCESS,user,args=COMMAND".to_string()];
 		let ParsePsResult::Options(options) =
-			parse_ps_args(&argv, &ShellPaths::default()).expect("valid output fields")
+			parse_ps_args(&argv, &ShellPaths::default()).await.expect("valid output fields")
 		else {
 			panic!("expected parsed options");
 		};
@@ -1412,12 +1412,12 @@ mod tests {
 		assert_eq!(error, (1, "unknown output format specifier 'definitely_not_a_field'".to_string()));
 	}
 
-	#[test]
-	fn dashed_r_sorts_by_cpu_while_bare_r_selects_running() {
+	#[tokio::test]
+	async fn dashed_r_sorts_by_cpu_while_bare_r_selects_running() {
 		for argv in [&["-Ao", "pid,comm", "-r"][..], &["-axr"][..]] {
 			let argv: Vec<String> = argv.iter().map(ToString::to_string).collect();
 			let ParsePsResult::Options(options) =
-				parse_ps_args(&argv, &ShellPaths::default()).expect("valid -r")
+				parse_ps_args(&argv, &ShellPaths::default()).await.expect("valid -r")
 			else {
 				panic!("expected parsed options");
 			};
@@ -1426,7 +1426,7 @@ mod tests {
 		}
 
 		let ParsePsResult::Options(options) =
-			parse_ps_args(&["axr".to_string()], &ShellPaths::default()).expect("valid bare r")
+			parse_ps_args(&["axr".to_string()], &ShellPaths::default()).await.expect("valid bare r")
 		else {
 			panic!("expected parsed options");
 		};
@@ -1434,15 +1434,15 @@ mod tests {
 		assert!(options.sort.is_empty());
 	}
 
-	#[test]
-	fn unknown_options_name_themselves_and_point_at_system_ps() {
+	#[tokio::test]
+	async fn unknown_options_name_themselves_and_point_at_system_ps() {
 		for (args, named) in [
 			(&["-eo", "pid,args", "--forest"][..], "unrecognized option '--forest'"),
 			(&["--cols=200", "-e"][..], "unrecognized option '--cols'"),
 			(&["-eH"][..], "unsupported option '-H'"),
 		] {
 			let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
-			let Err((code, message)) = parse_ps_args(&argv, &ShellPaths::default()) else {
+			let Err((code, message)) = parse_ps_args(&argv, &ShellPaths::default()).await else {
 				panic!("{args:?} must be rejected");
 			};
 			assert_eq!(code, 1, "{args:?}");
@@ -1515,15 +1515,15 @@ mod tests {
 		assert_eq!(format_ps_start(None, None, &TimeZone::UTC, false), "?");
 	}
 
-	#[test]
-	fn non_ascii_option_in_a_cluster_is_reported_not_a_panic() {
+	#[tokio::test]
+	async fn non_ascii_option_in_a_cluster_is_reported_not_a_panic() {
 		for (arg, message) in [
 			("-é", "unsupported option '-é'"),
 			("-eé", "unsupported option '-é'"),
 			// `-o` takes the rest of the cluster, here `é`, as its value.
 			("-eoé", "unknown output format specifier 'é'"),
 		] {
-			let Err((code, error)) = parse_ps_args(&[arg.to_string()], &ShellPaths::default()) else {
+			let Err((code, error)) = parse_ps_args(&[arg.to_string()], &ShellPaths::default()).await else {
 				panic!("{arg:?} must be rejected");
 			};
 			assert_eq!(code, 1, "{arg:?}");

@@ -1127,16 +1127,18 @@ async function runInTabWithSnapshot(
 			return result;
 		} catch (error) {
 			if (error instanceof RendererCrashedError) {
+				let notReattached = "";
 				const reattached = await recoverWorkerTab(
 					tab,
 					name,
 					opts.timeoutMs,
 					"Browser tab's renderer crashed; tab killed",
+					{ onNotReattached: why => (notReattached = why) },
 				);
 				throw new RendererCrashedError(
 					reattached
 						? `${error.message}. The tab was reattached to a new worker and its page reloaded. ${RECYCLE_RESETS}`
-						: `${error.message}; the tab could not be reattached and was closed.`,
+						: `${error.message}; the tab could not be reattached and was closed${notReattached ? ` (${notReattached})` : ""}.`,
 				);
 			}
 			if (error instanceof DebuggerDetachedError) {
@@ -1230,6 +1232,8 @@ async function recoverWorkerTab(
 		recover?: boolean;
 		/** Kill reason when the recycle fails; defaults to a generic recovery failure. */
 		failedReason?: string;
+		/** Told why the tab was not reattached, when it was not. */
+		onNotReattached?: (why: string) => void;
 	} = {},
 ): Promise<boolean> {
 	// The kills go by name: a tab closed meanwhile may have been reopened under it, and that one is not ours to kill.
@@ -1238,12 +1242,17 @@ async function recoverWorkerTab(
 		return false;
 	};
 	try {
-		if (tab.worker.mode === "inline") return await killTab(reason);
-		return await recycleTimedOutWorkerTab(tab, timeoutMs + GRACE_MS, { recover: opts.recover });
+		if (tab.worker.mode === "inline") {
+			opts.onNotReattached?.("the tab ran on the inline worker, which shares this process and cannot be reattached");
+			return await killTab(reason);
+		}
+		const reattached = await recycleTimedOutWorkerTab(tab, timeoutMs + GRACE_MS, { recover: opts.recover });
+		if (!reattached) opts.onNotReattached?.("the tab was closed while its new worker started");
+		return reattached;
 	} catch (recycleError) {
-		logger.warn("Failed to recycle browser tab worker; killing tab", {
-			error: recycleError instanceof Error ? recycleError.message : String(recycleError),
-		});
+		const message = recycleError instanceof Error ? recycleError.message : String(recycleError);
+		opts.onNotReattached?.(message);
+		logger.warn("Failed to recycle browser tab worker; killing tab", { error: message });
 		return await killTab(opts.failedReason ?? "Browser tab worker recovery failed; tab killed");
 	}
 }

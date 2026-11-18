@@ -8,30 +8,40 @@ function resolvePath(filePath: string): string {
 	return path.resolve(filePath);
 }
 
-export async function readFile(filePath: string): Promise<string | null> {
-	const abs = resolvePath(filePath);
-	if (contentCache.has(abs)) {
-		return contentCache.get(abs) ?? null;
-	}
-
-	try {
+export function readFile(filePath: string): Promise<string | null> {
+	return readCachedFile(filePath, async abs => {
 		// Gate on the file type first: discovery scans foreign config dirs
 		// (~/.claude, ~/.cursor, project trees), and reading a FIFO/socket/char
 		// device with `.text()` blocks until EOF — i.e. forever — hanging
 		// startup with zero output. `stat` follows symlinks, so symlinked
 		// context files (CLAUDE.md -> AGENTS.md) still resolve.
 		const stats = await fs.promises.stat(abs);
-		if (!stats.isFile()) {
-			contentCache.set(abs, null);
-			return null;
-		}
-		const content = await Bun.file(abs).text();
-		contentCache.set(abs, content);
-		return content;
-	} catch {
-		contentCache.set(abs, null);
-		return null;
+		return stats.isFile() ? await Bun.file(abs).text() : null;
+	});
+}
+
+/**
+ * The text of `filePath` from the content cache {@link readFile} fills, under the
+ * same key and {@link invalidate}; on a miss `read` reads it (`null` or a throw:
+ * unreadable) and the result is cached.
+ */
+export async function readCachedFile(
+	filePath: string,
+	read: (abs: string) => Promise<string | null>,
+): Promise<string | null> {
+	const abs = resolvePath(filePath);
+	if (contentCache.has(abs)) {
+		return contentCache.get(abs) ?? null;
 	}
+
+	let content: string | null;
+	try {
+		content = await read(abs);
+	} catch {
+		content = null;
+	}
+	contentCache.set(abs, content);
+	return content;
 }
 
 export async function readDirEntries(dirPath: string): Promise<fs.Dirent[]> {

@@ -3,6 +3,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, BinaryHeap},
+	ffi::OsString,
 	future::Future,
 	path::PathBuf,
 	pin::Pin,
@@ -11,9 +12,9 @@ use std::{
 
 use futures::TryStreamExt as _;
 use jj_lib::{
-	backend::CommitId,
+	backend::{CommitId, MergedTreeValue},
 	commit::Commit,
-	config::{ConfigSource, StackedConfig},
+	config::{ConfigLayer, ConfigSource, StackedConfig},
 	conflicts::{ConflictMarkerStyle, ConflictMaterializeOptions, materialize_tree_value},
 	copies::CopyRecords,
 	default_backend_factories::{default_backend_factories, default_working_copy_factories},
@@ -23,7 +24,7 @@ use jj_lib::{
 	},
 	gitignore::GitIgnoreFile,
 	matchers::{EverythingMatcher, NothingMatcher},
-	merge::{Diff, MergedTreeValue},
+	merge::Diff,
 	merged_tree::MergedTree,
 	object_id::{HexPrefix, ObjectId as _, PrefixResolution},
 	repo::{ReadonlyRepo, Repo},
@@ -76,7 +77,7 @@ impl JjWorkspace {
 
 				let mut candidates = BTreeSet::new();
 				for (_, target) in repo.view().local_bookmarks() {
-					for id in target.added_ids() {
+					for id in target.present_adds() {
 						if repo
 							.index()
 							.is_ancestor(id, &wc_id)
@@ -103,6 +104,7 @@ impl JjWorkspace {
 
 				let prefix_len = repo
 					.shortest_unique_change_id_prefix_len(wc_commit.change_id())
+					.await
 					.map_err(|err| Error::backend("jj log", err))?
 					.max(8);
 				let change_id = wc_commit.change_id().reverse_hex();
@@ -236,6 +238,7 @@ impl JjWorkspace {
 				for commit in commits {
 					let prefix_len = repo
 						.shortest_unique_change_id_prefix_len(commit.change_id())
+						.await
 						.map_err(|err| Error::backend("jj log", err))?
 						.max(8);
 					let change_id = commit.change_id().reverse_hex();
@@ -252,7 +255,8 @@ impl JjWorkspace {
 		let rev = rev.to_owned();
 		self.with_current_repo("jj show", move |workspace, repo| {
 			Box::pin(async move {
-				let commit_id = resolve_commit_id(workspace, repo.as_ref(), &rev)?
+				let commit_id = resolve_commit_id(workspace, repo.as_ref(), &rev)
+					.await?
 					.ok_or_else(|| Error::ObjectNotFound { spec: rev.clone() })?;
 				let commit = repo
 					.store()
@@ -415,7 +419,11 @@ fn commit_subject(commit: &Commit) -> String {
 		.to_owned()
 }
 
-fn resolve_commit_id(
+#[allow(
+	clippy::future_not_send,
+	reason = "driven on a per-call current-thread runtime; jj-lib's index futures are !Send"
+)]
+async fn resolve_commit_id(
 	workspace: &Workspace,
 	repo: &dyn Repo,
 	rev: &str,
@@ -429,6 +437,7 @@ fn resolve_commit_id(
 	if let Some(prefix) = HexPrefix::try_from_reverse_hex(rev) {
 		let resolution = repo
 			.resolve_change_id_prefix(&prefix)
+			.await
 			.map_err(|err| Error::backend("jj show", err))?;
 		if let PrefixResolution::SingleMatch(targets) = resolution {
 			let mut visible = targets.visible_with_offsets().map(|(_, id)| id.clone());
@@ -442,6 +451,7 @@ fn resolve_commit_id(
 		let resolution = repo
 			.index()
 			.resolve_commit_id_prefix(&prefix)
+			.await
 			.map_err(|err| Error::backend("jj show", err))?;
 		if let PrefixResolution::SingleMatch(id) = resolution {
 			return Ok(Some(id));
@@ -451,30 +461,71 @@ fn resolve_commit_id(
 }
 
 fn user_settings() -> std::result::Result<UserSettings, jj_lib::config::ConfigGetError> {
-	let mut config = StackedConfig::with_defaults();
-	for path in user_config_paths() {
-		if path.is_dir() {
-			let _ = config.load_dir(ConfigSource::User, &path);
-		} else if path.is_file() {
-			let _ = config.load_file(ConfigSource::User, &path);
-		}
-	}
-	UserSettings::from_config(config)
+	let paths = user_config_paths(
+		std::env::var_os("JJ_CONFIG"),
+		std::env::var_os("XDG_CONFIG_HOME"),
+		std::env::var_os("HOME"),
+	);
+	UserSettings::from_config_and_home_dir(user_config(&paths), std::env::home_dir())
 }
 
-fn user_config_paths() -> Vec<PathBuf> {
-	if let Some(path) = std::env::var_os("JJ_CONFIG") {
-		return vec![PathBuf::from(path)];
+/// jj's defaults with the user configuration at `paths` on top, each a TOML
+/// file or a directory of them; a path that is neither is skipped. A top layer
+/// turns the filesystem monitor off.
+fn user_config(paths: &[PathBuf]) -> StackedConfig {
+	let mut config = StackedConfig::with_defaults();
+	for path in paths {
+		if path.is_dir() {
+			let _ = config.load_dir(ConfigSource::User, path);
+		} else if path.is_file() {
+			let _ = config.load_file(ConfigSource::User, path);
+		}
+	}
+	// This build has no watchman: Cargo.toml builds jj-lib with
+	// `default-features = false`, so a `fsmonitor.backend = "watchman"` in any
+	// configuration makes jj-lib refuse every snapshot ("Cannot query Watchman
+	// because jj was not compiled with the `watchman` feature"). Snapshots scan
+	// the working copy without a monitor instead.
+	config.add_layer(
+		ConfigLayer::parse(ConfigSource::CommandArg, "fsmonitor.backend = \"none\"\n")
+			.expect("a static TOML document parses"),
+	);
+	config
+}
+
+/// The user configuration paths jj reads, from `JJ_CONFIG`, else
+/// `$XDG_CONFIG_HOME/jj` (or `~/.config/jj`) and `~/.jjconfig.toml`. jj 0.46
+/// documents `JJ_CONFIG` (`jj help -k config`):
+///
+/// > If the environment variable is set (even to an empty string), it will be
+/// > used instead of any configuration files in the default locations. It can
+/// > be a path to a TOML file or a directory of TOML files, which will be
+/// > loaded in lexicographic order and merged. Multiple paths can be specified
+/// > by separating them with a platform-specific path separator (`:` on
+/// > Unix-like systems, `;` on Windows).
+///
+/// An empty entry names nothing, so an empty `JJ_CONFIG` reads no user
+/// configuration.
+fn user_config_paths(
+	jj_config: Option<OsString>,
+	config_home: Option<OsString>,
+	home: Option<OsString>,
+) -> Vec<PathBuf> {
+	if let Some(paths) = jj_config {
+		return std::env::split_paths(&paths)
+			.filter(|path| !path.as_os_str().is_empty())
+			.collect();
 	}
 	let mut paths = Vec::new();
-	if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
-		.map(PathBuf::from)
-		.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-	{
+	if let Some(config_home) = config_home.map(PathBuf::from).or_else(|| {
+		home
+			.as_ref()
+			.map(|home| PathBuf::from(home).join(".config"))
+	}) {
 		paths.push(config_home.join("jj").join("config.toml"));
 		paths.push(config_home.join("jj").join("conf.d"));
 	}
-	if let Some(home) = std::env::var_os("HOME") {
+	if let Some(home) = home {
 		paths.push(PathBuf::from(home).join(".jjconfig.toml"));
 	}
 	paths
@@ -991,6 +1042,105 @@ mod tests {
 
 	use super::*;
 
+	/// `user.name` and `user.email` from the user configuration `JJ_CONFIG`,
+	/// `XDG_CONFIG_HOME` and `HOME` select.
+	fn configured_user(
+		jj_config: Option<OsString>,
+		config_home: &Path,
+		home: &Path,
+	) -> (String, String) {
+		let paths = user_config_paths(jj_config, Some(config_home.into()), Some(home.into()));
+		let settings = UserSettings::from_config_and_home_dir(user_config(&paths), None).unwrap();
+		(settings.user_name().to_owned(), settings.user_email().to_owned())
+	}
+
+	/// A home whose default jj configuration names a user, beside a TOML file
+	/// naming another and a directory of TOML files naming an email.
+	fn jj_config_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+		let temp = tempfile::tempdir().unwrap();
+		let home = temp.path().join("home");
+		let config_home = home.join(".config");
+		fs::create_dir_all(config_home.join("jj")).unwrap();
+		fs::write(config_home.join("jj/config.toml"), "user.name = \"Default Home\"\n").unwrap();
+		fs::write(home.join(".jjconfig.toml"), "user.email = \"default@example.com\"\n").unwrap();
+		let file = temp.path().join("file.toml");
+		fs::write(&file, "user.name = \"From File\"\n").unwrap();
+		let dir = temp.path().join("conf.d");
+		fs::create_dir(&dir).unwrap();
+		fs::write(dir.join("10-email.toml"), "user.email = \"dir@example.com\"\n").unwrap();
+		(temp, home, config_home, file, dir)
+	}
+
+	#[test]
+	fn jj_config_names_one_file() {
+		let (_temp, home, config_home, file, _dir) = jj_config_fixture();
+		assert_eq!(
+			configured_user(Some(file.into()), &config_home, &home),
+			("From File".into(), String::new())
+		);
+	}
+
+	#[test]
+	fn jj_config_lists_files_and_directories() {
+		let (_temp, home, config_home, file, dir) = jj_config_fixture();
+		let list = std::env::join_paths([&file, &dir]).unwrap();
+		assert_eq!(
+			configured_user(Some(list), &config_home, &home),
+			("From File".into(), "dir@example.com".into())
+		);
+	}
+
+	#[test]
+	fn empty_jj_config_reads_no_user_configuration() {
+		let (_temp, home, config_home, ..) = jj_config_fixture();
+		assert_eq!(
+			configured_user(Some(OsString::new()), &config_home, &home),
+			(String::new(), String::new())
+		);
+	}
+
+	#[test]
+	fn unset_jj_config_reads_the_default_locations() {
+		let (_temp, home, config_home, ..) = jj_config_fixture();
+		assert_eq!(
+			configured_user(None, &config_home, &home),
+			("Default Home".into(), "default@example.com".into())
+		);
+	}
+
+	#[test]
+	fn user_config_naming_watchman_still_snapshots() {
+		let temp = tempfile::tempdir().unwrap();
+		let watchman = temp.path().join("watchman.toml");
+		fs::write(&watchman, "[fsmonitor]\nbackend = \"watchman\"\n").unwrap();
+		let settings =
+			UserSettings::from_config_and_home_dir(user_config(&[watchman]), None).unwrap();
+		let root = temp.path().join("repo");
+		fs::create_dir(&root).unwrap();
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime
+			.block_on(Workspace::init_internal_git(&settings, &root, gix::hash::Kind::Sha1))
+			.unwrap();
+		fs::write(root.join("alpha.txt"), "one\n").unwrap();
+		let mut workspace = Workspace::load(
+			&settings,
+			&root,
+			&default_backend_factories(),
+			&default_working_copy_factories(),
+		)
+		.unwrap();
+		let snapshot = runtime.block_on(async {
+			let repo = workspace.repo_loader().load_at_head().await.unwrap();
+			snapshot_working_copy(&mut workspace, repo)
+				.await
+				.map(|_| ())
+		});
+		assert!(snapshot.is_ok(), "{snapshot:?}");
+	}
+
 	fn init_internal_jj(root: &Path) {
 		let settings = user_settings().unwrap();
 		let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1255,5 +1405,51 @@ mod tests {
 		let details = workspace.commit_details("@").unwrap();
 		assert_eq!(details.sha, workspace.head_id().unwrap().unwrap());
 		assert_eq!(details.parents.len(), 1);
+	}
+
+	/// A read opens the repo at head, which merges divergent operation heads
+	/// and writes the merged view. Since 0.46, `jj` colocates secondary
+	/// workspaces through Git worktrees and records each one's Git HEAD in that
+	/// view; a jj-lib older than that field dropped it on the write, and the
+	/// workspace's next `jj` command re-imported HEAD and replaced its
+	/// working-copy commit with a new empty one.
+	#[test]
+	fn reading_over_divergent_op_heads_keeps_colocated_workspace_working_copy() {
+		if !jj_available() {
+			return;
+		}
+		let temp = tempfile::tempdir().unwrap();
+		let quiet = ["--config", "fsmonitor.backend=none"];
+		let jj = |root: &Path, args: &[&str]| run_jj(root, &[&quiet[..], args].concat());
+		jj(temp.path(), &["git", "init", "--colocate", "main"]);
+		let main = temp.path().join("main");
+		fs::write(main.join("a.txt"), "a\n").unwrap();
+		jj(&main, &["commit", "-m", "base"]);
+		jj(&main, &["--config", "git.colocate=true", "workspace", "add", "../colocated"]);
+		let colocated = temp.path().join("colocated");
+		if !colocated.join(".git").exists() {
+			// This `jj` predates colocated secondary workspaces, so it records no
+			// Git HEAD for one and the read has nothing to drop.
+			return;
+		}
+		jj(&colocated, &["describe", "-m", "work in colocated"]);
+		// A pure-jj workspace for the reader: with no `.git` beside it,
+		// detection takes the jj path.
+		jj(&main, &["--config", "git.colocate=false", "workspace", "add", "../reader"]);
+
+		// Two operations forked from the same parent: divergent op heads.
+		let op = jj(&main, &["op", "log", "--limit", "1", "--no-graph", "-T", "id"]);
+		jj(&main, &["--at-op", op.trim(), "describe", "-m", "side one"]);
+		jj(&main, &["--at-op", op.trim(), "bookmark", "create", "side", "-r", "@-"]);
+
+		let repo = crate::detect(&temp.path().join("reader")).unwrap().unwrap();
+		assert_eq!(repo.kind(), crate::VcsKind::Jj);
+		repo.head_id().unwrap();
+
+		let description = jj(&colocated, &["log", "-r", "@", "--no-graph", "-T", "description"]);
+		assert_eq!(
+			description, "work in colocated\n",
+			"the colocated workspace moved off its working-copy change"
+		);
 	}
 }

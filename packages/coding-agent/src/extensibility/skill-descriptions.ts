@@ -1,7 +1,8 @@
 import { Database, type Statement } from "bun:sqlite";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type AgentTelemetry, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
+import { type AgentTelemetry, agentPauseGate, instrumentedCompleteSimple } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import {
@@ -13,7 +14,7 @@ import {
 	postmortem,
 	prompt,
 } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import {
 	resolveConfiguredModelPatterns,
 	resolveProviderModelReference,
@@ -99,8 +100,11 @@ export function createSkillDescriptionCompressor(
 		async compress(_name, _description, request) {
 			const model = select();
 			if (!model) throw new Error("No smol or tiny model available");
-			const apiKey = await registry.getApiKey(model, options.sessionId);
+			const apiKey = await probeModelApiKey(registry, model, options.sessionId);
 			if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+			// The 30 s budget bounds the model, not a human's `/pause`: wait a pause
+			// out before arming it.
+			await agentPauseGate.dispatchHold()();
 			const gate = options.getCostGate?.();
 			gate?.admit();
 			// A refusal inside a provider's retry loop aborts the request, so no retry
@@ -113,6 +117,8 @@ export function createSkillDescriptionCompressor(
 				refused.abort(error);
 				throw error;
 			};
+			const signal = AbortSignal.any([AbortSignal.timeout(30_000), refused.signal]);
+			const beforeDispatch = agentPauseGate.dispatchHold(signal, gate ? refuseAttempt : undefined);
 			let response: AssistantMessage;
 			try {
 				response = await instrumentedCompleteSimple(
@@ -126,9 +132,12 @@ export function createSkillDescriptionCompressor(
 						maxTokens: 1024,
 						disableReasoning: true,
 						temperature: 0,
-						signal: AbortSignal.any([AbortSignal.timeout(30_000), refused.signal]),
-						beforeDispatch: gate ? refuseAttempt : undefined,
-						fetch: gate ? transportFetch(model, undefined, refuseAttempt) : undefined,
+						signal,
+						// Held at the provider boundary too. A pause engaged once the
+						// budget runs can still expire it; that compression fails and
+						// is retried at the next prompt render, like any failed one.
+						beforeDispatch,
+						fetch: gate ? transportFetch(model, undefined, beforeDispatch) : undefined,
 						onAttempt: message => gate?.record(message.usage.cost.total),
 					},
 					{ telemetry: options.getTelemetry?.(), oneshotKind: "skill_description" },
@@ -142,7 +151,7 @@ export function createSkillDescriptionCompressor(
 				throw new SkillDescriptionLengthError("Model stopped: length");
 			}
 			if (response.stopReason !== "stop") {
-				throw new Error(`Model stopped: ${response.stopReason} ${response.errorMessage ?? ""}`);
+				throw new Error(`Model stopped: ${response.stopReason} ${errorDisplayText(response) ?? ""}`);
 			}
 			return response.content
 				.filter(block => block.type === "text")
@@ -195,7 +204,30 @@ function pendingForStore(store: SkillDescriptionStore): Promise<void>[] {
 	return [...inFlight].filter(([key]) => key.startsWith(prefix)).map(([, pending]) => pending);
 }
 
-let shared: SkillDescriptionStore | null | undefined;
+/**
+ * Opens a store on the first call and returns that store on every later one. `undefined` when it
+ * cannot be opened: the failure is logged once, at that first call, and never retried.
+ */
+export function openOnFirstUse(open: () => SkillDescriptionStore): () => SkillDescriptionStore | undefined {
+	let store: SkillDescriptionStore | null | undefined;
+	return () => {
+		if (store === undefined) {
+			try {
+				store = open();
+			} catch (error) {
+				logger.warn("Skill description cache unavailable", { error: String(error) });
+				store = null;
+			}
+		}
+		return store ?? undefined;
+	};
+}
+
+const openSharedStore = openOnFirstUse(() => {
+	const store = SkillDescriptionStore.open();
+	postmortem.register("skill-descriptions-db", () => store.close(), { exitOnly: true });
+	return store;
+});
 
 /**
  * Process-wide store at {@link getSkillDescriptionsDbPath}, opened on first use
@@ -207,17 +239,7 @@ let shared: SkillDescriptionStore | null | undefined;
  */
 export function sharedSkillDescriptionStore(): SkillDescriptionStore | undefined {
 	if (isBunTestRuntime()) return undefined;
-	if (shared === undefined) {
-		try {
-			const store = SkillDescriptionStore.open();
-			postmortem.register("skill-descriptions-db", () => store.close(), { exitOnly: true });
-			shared = store;
-		} catch (error) {
-			logger.warn("Skill description cache unavailable", { error: String(error) });
-			shared = null;
-		}
-	}
-	return shared ?? undefined;
+	return openSharedStore();
 }
 
 /**
@@ -385,25 +407,32 @@ export class SkillDescriptionStore {
 
 /** One prompt/session snapshot; completing a background job never mutates its rendered descriptions. */
 export class SkillDescriptionCatalog {
-	readonly #store: SkillDescriptionStore | undefined;
+	/**
+	 * The store, or the function that opens it, called once at the first render that has skills and
+	 * replaced by what it returns: `undefined` when no store could be opened.
+	 */
+	#store: SkillDescriptionStore | (() => SkillDescriptionStore | undefined) | undefined;
 	readonly #compress?: SkillDescriptionCompressor;
 	readonly #snapshot = new Map<string, string>();
 	/** Misses rendered before {@link startCompression}; `undefined` once compression runs. */
 	#deferred: Map<string, Skill> | undefined;
 
 	/**
-	 * `store` defaults to {@link sharedSkillDescriptionStore}; without one, prompts keep previews.
+	 * `store` is a store, or a function that opens one at the first render that has skills and logs
+	 * rather than throws when it cannot. It defaults to {@link sharedSkillDescriptionStore}, so a
+	 * session that never renders a skill never opens the shared database. Without a store, prompts
+	 * keep previews.
 	 * `deferCompression` holds model work until {@link startCompression}: until the owning session's
 	 * cost gate exists, and off a startup path (resolving the compression model composes the catalog).
 	 */
 	constructor(
 		options: {
-			store?: SkillDescriptionStore;
+			store?: SkillDescriptionStore | (() => SkillDescriptionStore | undefined);
 			compress?: SkillDescriptionCompressor;
 			deferCompression?: boolean;
 		} = {},
 	) {
-		this.#store = options.store ?? sharedSkillDescriptionStore();
+		this.#store = options.store ?? sharedSkillDescriptionStore;
 		this.#compress = options.compress;
 		if (options.deferCompression) this.#deferred = new Map();
 	}
@@ -418,6 +447,7 @@ export class SkillDescriptionCatalog {
 
 	render(skills: readonly Skill[]): Array<Skill & { description: string }> {
 		if (skills.length === 0) return [];
+		if (typeof this.#store === "function") this.#store = this.#store();
 		const store = this.#store;
 		const misses = new Map<string, Skill>();
 		const rendered = skills.map(skill => {
@@ -450,13 +480,15 @@ export class SkillDescriptionCatalog {
 	startCompression(): void {
 		const deferred = this.#deferred;
 		this.#deferred = undefined;
-		if (deferred && deferred.size > 0 && this.#store) this.#schedule(this.#store, deferred);
+		const store = this.#store;
+		if (deferred && deferred.size > 0 && store && typeof store !== "function") this.#schedule(store, deferred);
 	}
 
 	/** Await background writes already scheduled by this catalog (for shutdown or tests). */
 	async waitForPending(): Promise<void> {
-		if (!this.#store) return;
-		await Promise.all(pendingForStore(this.#store));
+		const store = this.#store;
+		if (!store || typeof store === "function") return;
+		await Promise.all(pendingForStore(store));
 	}
 
 	#schedule(store: SkillDescriptionStore, misses: ReadonlyMap<string, Skill>): void {
