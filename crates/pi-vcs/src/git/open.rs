@@ -217,11 +217,20 @@ fn base_options() -> Options {
 #[derive(Debug, PartialEq, Eq)]
 struct ConfigScopes {
 	/// The system file is read: `GIT_CONFIG_NOSYSTEM` is unset or false.
-	system:          bool,
-	/// `None` when `GIT_CONFIG_GLOBAL` is unset, which reads
-	/// `$XDG_CONFIG_HOME/git/config` and `~/.gitconfig`; else the one file it
-	/// names, `None` for an empty value.
-	global_override: Option<Option<PathBuf>>,
+	system: bool,
+	/// The global scope `GIT_CONFIG_GLOBAL` chooses.
+	global: GlobalConfig,
+}
+
+/// The global configuration git reads, as `GIT_CONFIG_GLOBAL` chooses it.
+#[derive(Debug, PartialEq, Eq)]
+enum GlobalConfig {
+	/// Unset: `$XDG_CONFIG_HOME/git/config` and `~/.gitconfig`.
+	Home,
+	/// Set to an empty value, which names no file: no global configuration.
+	Skipped,
+	/// Set: the one file it names, in place of the home files.
+	File(PathBuf),
 }
 
 impl ConfigScopes {
@@ -230,10 +239,12 @@ impl ConfigScopes {
 			Some(value) => git_env_bool("GIT_CONFIG_NOSYSTEM", &value)?,
 			None => false,
 		};
-		Ok(Self {
-			system:          !nosystem,
-			global_override: global.map(|path| (!path.is_empty()).then(|| PathBuf::from(path))),
-		})
+		let global = match global {
+			None => GlobalConfig::Home,
+			Some(path) if path.is_empty() => GlobalConfig::Skipped,
+			Some(path) => GlobalConfig::File(PathBuf::from(path)),
+		};
+		Ok(Self { system: !nosystem, global })
 	}
 
 	/// `options` reading these scopes; `system_file` finds the system file git
@@ -242,11 +253,20 @@ impl ConfigScopes {
 		let system_file = if self.system { system_file() } else { None };
 		let config = &mut options.permissions.config;
 		config.system = system_file.is_some();
-		if self.global_override.is_some() {
-			config.git = false;
-			config.user = false;
-		}
-		match (self.global_override.flatten(), system_file) {
+		let global_file = match self.global {
+			GlobalConfig::Home => None,
+			GlobalConfig::Skipped => {
+				config.git = false;
+				config.user = false;
+				None
+			},
+			GlobalConfig::File(path) => {
+				config.git = false;
+				config.user = false;
+				Some(path)
+			},
+		};
+		match (global_file, system_file) {
 			// gix takes no path for the global scope, so the file goes in the
 			// system slot, which gix loads after its installation slot and before
 			// the repository's own configuration, and the system file, when read,
@@ -338,21 +358,21 @@ fn git_parse_int(value: &str) -> Option<i64> {
 mod tests {
 	use std::{collections::BTreeSet, ffi::OsString, fs, path::PathBuf, process::Command};
 
-	use super::{ConfigScopes, base_options, git_env_bool, permissions};
+	use super::{ConfigScopes, GlobalConfig, base_options, git_env_bool, permissions};
 
 	#[test]
 	fn config_scopes_read_the_variables_as_git_does() {
 		let scopes = |global: Option<&str>, nosystem: Option<&str>| {
 			ConfigScopes::from_env(global.map(OsString::from), nosystem.map(OsString::from)).unwrap()
 		};
-		assert_eq!(scopes(None, None), ConfigScopes { system: true, global_override: None });
+		assert_eq!(scopes(None, None), ConfigScopes { system: true, global: GlobalConfig::Home });
 		assert_eq!(scopes(Some("/global"), None), ConfigScopes {
-			system:          true,
-			global_override: Some(Some("/global".into())),
+			system: true,
+			global: GlobalConfig::File("/global".into()),
 		});
 		assert_eq!(scopes(Some(""), None), ConfigScopes {
-			system:          true,
-			global_override: Some(None),
+			system: true,
+			global: GlobalConfig::Skipped,
 		});
 		assert!(!scopes(None, Some("1")).system);
 		assert!(scopes(None, Some("0")).system);
@@ -409,7 +429,7 @@ mod tests {
 			let parsed = git_env_bool("GIT_CONFIG_NOSYSTEM", value.as_ref());
 			match expected {
 				Some(expected) => {
-					assert_eq!(parsed.ok(), Some(expected), "GIT_CONFIG_NOSYSTEM={value:?}")
+					assert_eq!(parsed.ok(), Some(expected), "GIT_CONFIG_NOSYSTEM={value:?}");
 				},
 				None => assert_eq!(
 					parsed.map_err(|error| error.to_string()),
@@ -468,13 +488,35 @@ mod tests {
 				.config
 		};
 		assert_eq!(
-			read(ConfigScopes { system: true, global_override: None }),
+			read(ConfigScopes { system: true, global: GlobalConfig::Home }),
 			permissions::Config::all()
 		);
 		assert_eq!(
-			read(ConfigScopes { system: false, global_override: None }),
+			read(ConfigScopes { system: false, global: GlobalConfig::Home }),
 			permissions::Config { system: false, ..permissions::Config::all() }
 		);
+	}
+
+	/// A set `GIT_CONFIG_GLOBAL`, empty or naming a file, turns off the home
+	/// files (`git` and `user`) whatever the test's own home holds: the
+	/// read tests below pass on a home with no git configuration either way.
+	#[test]
+	fn set_global_drops_the_home_scopes() {
+		let read = |global: GlobalConfig| {
+			ConfigScopes { system: true, global }
+				.apply(base_options(), || Some("/system-gitconfig".into()))
+				.permissions
+				.config
+		};
+		let without_home =
+			permissions::Config { git: false, user: false, ..permissions::Config::all() };
+		assert_eq!(read(GlobalConfig::Skipped), without_home);
+		// The global file takes the system slot, so the system file moves to the
+		// installation slot, which gix reads with `git_binary`.
+		assert_eq!(read(GlobalConfig::File("/global-gitconfig".into())), permissions::Config {
+			git_binary: true,
+			..without_home
+		});
 	}
 
 	/// A repository whose own configuration names the email, beside a system
@@ -513,7 +555,7 @@ mod tests {
 		fs::write(&local, config).expect("write local config");
 
 		let scopes = match global {
-			Some(name) => ConfigScopes { global_override: Some(Some(root.join(name))), ..scopes },
+			Some(name) => ConfigScopes { global: GlobalConfig::File(root.join(name)), ..scopes },
 			None => scopes,
 		};
 		let repo = scopes
@@ -543,7 +585,7 @@ mod tests {
 
 	#[test]
 	fn global_file_replaces_the_home_files_between_system_and_repository() {
-		let set = ConfigScopes { system: true, global_override: None };
+		let set = ConfigScopes { system: true, global: GlobalConfig::Home };
 		let (values, read) = read_scopes(set, Some("global-gitconfig"));
 		// The global file outranks the system file, and the repository both.
 		assert_eq!(values, [
@@ -556,7 +598,7 @@ mod tests {
 
 	#[test]
 	fn nosystem_skips_the_system_file_beside_a_global_file() {
-		let set = ConfigScopes { system: false, global_override: None };
+		let set = ConfigScopes { system: false, global: GlobalConfig::Home };
 		let (values, read) = read_scopes(set, Some("global-gitconfig"));
 		assert_eq!(values, [Some("Global".into()), Some("local@example.com".into()), None]);
 		assert_eq!(read, files(&["global-gitconfig", "repo/.git/config"]));
@@ -565,7 +607,7 @@ mod tests {
 	#[test]
 	fn empty_global_reads_no_global_file() {
 		let (values, read) =
-			read_scopes(ConfigScopes { system: true, global_override: Some(None) }, None);
+			read_scopes(ConfigScopes { system: true, global: GlobalConfig::Skipped }, None);
 		assert_eq!(values, [
 			Some("System".into()),
 			Some("local@example.com".into()),
@@ -574,7 +616,7 @@ mod tests {
 		assert_eq!(read, files(&["system-gitconfig", "repo/.git/config"]));
 
 		let (values, read) =
-			read_scopes(ConfigScopes { system: false, global_override: Some(None) }, None);
+			read_scopes(ConfigScopes { system: false, global: GlobalConfig::Skipped }, None);
 		assert_eq!(values, [None, Some("local@example.com".into()), None]);
 		assert_eq!(read, files(&["repo/.git/config"]));
 	}
