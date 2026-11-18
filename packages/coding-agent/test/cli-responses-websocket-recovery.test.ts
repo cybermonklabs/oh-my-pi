@@ -13,10 +13,13 @@ import {
 	type ResponsesSocket,
 } from "../../ai/test/fixtures/openai-responses-server";
 import { RpcClient } from "../src/modes/rpc/rpc-client";
+import type { RpcPromptResultFrame } from "../src/modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "../src/session/agent-session";
 
 const cliEntry = path.resolve(import.meta.dir, "../src/cli.ts");
-const promptTimeout = 25_000;
+// The one bound on a case is the runner's per-test timeout. A deadline of the test's own on a
+// turn would measure the machine: after `ready`, a prompt waits for the child's own start-up
+// to finish before its turn runs, and both take seconds of CPU on a cold child.
 const testTimeout = 60_000;
 
 /** Launch the real source CLI, never RpcClient's ambient-env-merging default spawn. */
@@ -70,8 +73,12 @@ async function withCli(
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1000, modelFallback: false },
 			providers: {
 				openaiResponsesWebsockets: options.websockets === "default" ? undefined : (options.websockets ?? true),
-				streamFirstEventTimeoutSeconds: options.first ?? 1,
-				streamIdleTimeoutSeconds: options.idle ?? 1,
+				// The stream watchdogs are off (0) unless a case is about them: a 1 s first-event
+				// budget is also the WebSocket connect timeout, and a child that a loaded machine
+				// stalls past it falls back to SSE before the socket frame the case waits for, so
+				// the machine's speed, not the transport, would decide the case.
+				streamFirstEventTimeoutSeconds: options.first ?? 0,
+				streamIdleTimeoutSeconds: options.idle ?? 0,
 				cacheWarming: "off",
 			},
 			compaction: { enabled: false },
@@ -108,6 +115,12 @@ async function withCli(
 	const detachSessionEvents = client.onSessionEvent(event => sessionEvents.push(event));
 	try {
 		await client.start();
+		// A fresh home has no model cache, so the child's start-up refresh rewrites every provider's
+		// catalog in the background. On a slow machine that keeps the child's event loop busy for
+		// seconds, and a WebSocket handshake started meanwhile fails ("socket hang up"), so the turn
+		// falls back to SSE. get_available_models answers only once that refresh has finished: wait
+		// for it rather than race it.
+		await client.getAvailableModels();
 		await run({ client, project, effect: path.join(project, "effect"), events, sessionEvents });
 	} finally {
 		detachEvents();
@@ -116,18 +129,48 @@ async function withCli(
 	}
 }
 
-/** Subscribe before triggering the action; timeout rejection still unwinds every finally. */
+/**
+ * Subscribe before triggering the action. Resolves on the first matching event of the turn and
+ * fails as soon as the turn ends without one, so no clock decides whether it arrived.
+ */
 function waitForEvent(client: RpcClient, matches: (event: AgentEvent) => boolean): Promise<AgentEvent> {
 	const { promise, resolve, reject } = Promise.withResolvers<AgentEvent>();
-	// Failure bound only, never a scheduling delay: the real child-process event must win.
-	const timer = setTimeout(() => reject(new Error("Missing expected real CLI event")), promptTimeout);
 	const unsubscribe = client.onEvent(event => {
 		if (matches(event)) resolve(event);
+		else if (event.type === "agent_end")
+			reject(new Error("Missing expected real CLI event: the turn ended without it"));
 	});
-	return promise.finally(() => {
-		clearTimeout(timer);
-		unsubscribe();
+	return promise.finally(unsubscribe);
+}
+
+/**
+ * `RpcClient.promptAndWait` without its deadline: resolves with the agent events streamed until
+ * the prompt's own `prompt_result`, and rejects on a failed one. promptAndWait needs a timeout, and
+ * any timeout here would let the machine's speed fail a turn the loopback server answers at once.
+ */
+async function promptToResult(client: RpcClient, message: string): Promise<AgentEvent[]> {
+	const events: AgentEvent[] = [];
+	const results = new Map<string, RpcPromptResultFrame>();
+	let arrived = Promise.withResolvers<void>();
+	const offEvents = client.onEvent(event => events.push(event));
+	const offResults = client.onPromptResult(result => {
+		if (result.id !== undefined) results.set(result.id, result);
+		arrived.resolve();
 	});
+	try {
+		const id = await client.prompt(message);
+		let result = results.get(id);
+		while (!result) {
+			await arrived.promise;
+			arrived = Promise.withResolvers<void>();
+			result = results.get(id);
+		}
+		if (result.status === "error") throw new Error(result.error?.message ?? "Prompt failed");
+		return events;
+	} finally {
+		offEvents();
+		offResults();
+	}
 }
 
 function assistantMessages(messages: AgentMessage[]): AssistantMessage[] {
@@ -176,7 +219,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 				await withCli(
 					`${fixture.server.url.origin}/v1`,
 					async ({ client }) => {
-						await client.promptAndWait("USE_CONFIGURED_TRANSPORT", undefined, promptTimeout);
+						await promptToResult(client, "USE_CONFIGURED_TRANSPORT");
 						expect(assistantText(await client.getMessages())).toBe("HTTP");
 						expect(fixture.httpRequests).toHaveLength(1);
 						expect(fixture.upgrades).toHaveLength(0);
@@ -205,9 +248,9 @@ describe("real CLI Responses WebSocket recovery", () => {
 			try {
 				await withCli(`${fixture.server.url.origin}/v1`, async host => {
 					project = host.project;
-					await host.client.promptAndWait("FIRST_USER", undefined, promptTimeout);
-					const events = await host.client.promptAndWait("RUN_BASH", undefined, promptTimeout);
-					await host.client.promptAndWait("NEXT_USER", undefined, promptTimeout);
+					await promptToResult(host.client, "FIRST_USER");
+					const events = await promptToResult(host.client, "RUN_BASH");
+					await promptToResult(host.client, "NEXT_USER");
 					expect(await Bun.file(host.effect).text()).toBe("x");
 					expect(events.filter(event => event.type === "tool_execution_end")).toMatchObject([
 						{ toolName: "bash", isError: false },
@@ -242,10 +285,10 @@ describe("real CLI Responses WebSocket recovery", () => {
 			);
 			try {
 				await withCli(`${fixture.server.url.origin}/v1`, async ({ client }) => {
-					await client.promptAndWait("REMEMBER_FIRST", undefined, promptTimeout);
+					await promptToResult(client, "REMEMBER_FIRST");
 					fixture.sockets.get(1)?.close(1000, "successful terminal socket replacement");
 					await fixture.waitForClosed(1);
-					await client.promptAndWait("SECOND_USER", undefined, promptTimeout);
+					await promptToResult(client, "SECOND_USER");
 					expect(fixture.requests.map(request => request.connection)).toEqual([1, 2]);
 					expect(fixture.requests[1].body.previous_response_id).toBeUndefined();
 					expect(JSON.stringify(fixture.requests[1].body.input)).toContain("REMEMBER_FIRST");
@@ -288,7 +331,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 					project = host.project;
 					events = host.events;
 					sessionEvents = host.sessionEvents;
-					await host.client.promptAndWait("FALLBACK_TOOL", undefined, promptTimeout);
+					await promptToResult(host.client, "FALLBACK_TOOL");
 					expect(fixture.requests).toHaveLength(0);
 					expect(fixture.upgrades).toHaveLength(1);
 					expect(fixture.httpRequests).toHaveLength(3);
@@ -304,12 +347,12 @@ describe("real CLI Responses WebSocket recovery", () => {
 					expect(completed.map(message => message.usage.totalTokens)).toEqual([8, 8]);
 					expect(assistantText(completed)).toBe("SSE_TOOL_ACCEPTED");
 					rejectUpgrade = false;
-					await host.client.promptAndWait("STILL_SSE", undefined, promptTimeout);
+					await promptToResult(host.client, "STILL_SSE");
 					expect(fixture.upgrades).toHaveLength(1);
 					expect(fixture.httpRequests).toHaveLength(4);
 					expect(assistantText(await host.client.getMessages())).toBe("SSE_TOOL_ACCEPTEDSSE_STICKY");
 					expect(await host.client.newSession()).toEqual({ cancelled: false });
-					await host.client.promptAndWait("NEW_SESSION_WS", undefined, promptTimeout);
+					await promptToResult(host.client, "NEW_SESSION_WS");
 					expect(fixture.requests).toHaveLength(1);
 					expect(fixture.upgrades).toHaveLength(2);
 					expect(fixture.requests[0].body.previous_response_id).toBeUndefined();
@@ -352,26 +395,27 @@ describe("real CLI Responses WebSocket recovery", () => {
 			try {
 				await withCli(`${fixture.server.url.origin}/v1`, async ({ client, sessionEvents }) => {
 					const partial = waitForEvent(client, event => hasTextDelta(event, "OUTAGE_PARTIAL"));
-					const result = client.promptAndWait("OUTAGE_USER", undefined, promptTimeout).then(
+					const result = promptToResult(client, "OUTAGE_USER").then(
 						() => ({ error: undefined }),
 						(error: unknown) => ({ error }),
 					);
 					await partial;
 					expect(fixture.requests).toHaveLength(1);
 					await fixture.server.stop(true);
+					// Bounded: the prompt ends in its own failed `prompt_result`, which is the only way
+					// promptToResult rejects, rather than running on with no server.
 					const failed = await result;
 					expect(failed.error).toBeInstanceOf(Error);
-					expect(String(failed.error)).not.toContain("Timeout waiting for prompt_result");
 					expect(sessionEvents.filter(event => event.type === "auto_retry_start").length).toBeLessThanOrEqual(1);
 					expect(assistantText(await client.getMessages())).toContain("OUTAGE_PARTIAL");
 					const replacement = endpoint(undefined, { port });
 					restored = replacement;
-					await client.promptAndWait("RESTORED_SAME_SESSION", undefined, promptTimeout);
+					await promptToResult(client, "RESTORED_SAME_SESSION");
 					expect(replacement.upgrades).toHaveLength(0);
 					expect(replacement.httpRequests).toHaveLength(1);
 					expect(assistantText(await client.getMessages())).toContain("HTTP");
 					await client.newSession();
-					await client.promptAndWait("RESTORED_NEW_SESSION", undefined, promptTimeout);
+					await promptToResult(client, "RESTORED_NEW_SESSION");
 					expect(replacement.requests).toHaveLength(1);
 					expect(replacement.httpRequests).toHaveLength(1);
 					expect(assistantText(await client.getMessages())).toBe("WS");
@@ -398,7 +442,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 			try {
 				await withCli(`${fixture.server.url.origin}/v1`, async ({ client, events }) => {
 					const partial = waitForEvent(client, event => hasTextDelta(event, "VISIBLE_PREFIX"));
-					const result = client.promptAndWait("CONTINUE_USER", undefined, promptTimeout);
+					const result = promptToResult(client, "CONTINUE_USER");
 					await partial;
 					expect(fixture.httpRequests).toHaveLength(0);
 					socket?.terminate();
@@ -450,7 +494,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 						event => event.type === "tool_execution_end" && event.toolName === "bash",
 					);
 					const partial = waitForEvent(host.client, event => hasTextDelta(event, "AFTER_TOOL_PARTIAL"));
-					const result = host.client.promptAndWait("EXECUTE_ONCE", undefined, promptTimeout);
+					const result = promptToResult(host.client, "EXECUTE_ONCE");
 					expect(await executed).toMatchObject({ isError: false });
 					await partial;
 					expect(await Bun.file(host.effect).text()).toBe("x");
@@ -487,7 +531,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 						host.client,
 						event => event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_delta",
 					);
-					const result = host.client.promptAndWait("HALF_TOOL_USER", undefined, promptTimeout);
+					const result = promptToResult(host.client, "HALF_TOOL_USER");
 					await args;
 					socket?.terminate();
 					await result;
@@ -517,14 +561,22 @@ describe("real CLI Responses WebSocket recovery", () => {
 			try {
 				await withCli(`${fixture.server.url.origin}/v1`, async ({ client, sessionEvents }) => {
 					const partial = waitForEvent(client, event => hasTextDelta(event, "CANCEL_PREFIX"));
-					const result = client.promptAndWait("CANCEL_USER", undefined, promptTimeout).then(
+					const result = promptToResult(client, "CANCEL_USER").then(
 						() => undefined,
 						(error: unknown) => error,
 					);
 					await partial;
 					await client.abort();
 					await result;
-					await client.waitForSettled(promptTimeout);
+					// As waitForSettled, without its deadline: subscribed before asking, so a settle
+					// between the two cannot be missed.
+					const settled = Promise.withResolvers<void>();
+					const offSettled = client.onSessionSettled(settled.resolve);
+					try {
+						if (!(await client.getState()).isSettled) await settled.promise;
+					} finally {
+						offSettled();
+					}
 					if (socket) send(socket, textEvents("LATE_SHOULD_NOT_APPEAR", "resp_late"));
 					await client.getState();
 					expect(fixture.httpRequests).toHaveLength(0);
@@ -533,7 +585,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 					const cancelled = assistantMessages(await client.getMessages());
 					expect(cancelled.some(message => message.stopReason === "aborted")).toBe(true);
 					expect(assistantText(cancelled)).not.toContain("LATE_SHOULD_NOT_APPEAR");
-					await client.promptAndWait("AFTER_CANCEL_USER", undefined, promptTimeout);
+					await promptToResult(client, "AFTER_CANCEL_USER");
 					expect(fixture.requests).toHaveLength(2);
 					expect(fixture.requests[1].body.previous_response_id).toBeUndefined();
 					expect(fixture.httpRequests).toHaveLength(0);
@@ -557,7 +609,7 @@ describe("real CLI Responses WebSocket recovery", () => {
 					await withCli(
 						`${fixture.server.url.origin}/v1`,
 						async ({ client, events, sessionEvents }) => {
-							await client.promptAndWait("TIMEOUT_USER", undefined, promptTimeout);
+							await promptToResult(client, "TIMEOUT_USER");
 							expect(fixture.requests).toHaveLength(1);
 							expect(fixture.httpRequests).toHaveLength(1);
 							const failed = events.filter(
@@ -586,13 +638,15 @@ describe("real CLI Responses WebSocket recovery", () => {
 							} else {
 								expect(sessionEvents.some(event => event.type === "auto_retry_start")).toBe(true);
 							}
-							await client.promptAndWait("STICKY_AFTER_TIMEOUT", undefined, promptTimeout);
+							await promptToResult(client, "STICKY_AFTER_TIMEOUT");
 							expect(fixture.requests).toHaveLength(1);
 							expect(fixture.httpRequests).toHaveLength(2);
 						},
-						// A first-event deadline shorter than ~1 s can expire during the WebSocket
-						// handshake on a loaded machine, before the request reaches the socket.
-						{ first: 1, idle: phase === "idle" ? 0.2 : 1 },
+						// Only the budget under test is on. The first-event budget is also the WebSocket
+						// connect timeout, so the idle case turns it off: a loaded machine cannot spend it
+						// on the handshake or before the partial arrives. The first-event case cannot turn
+						// it off, so a handshake slower than 1 s still falls back to SSE before the request.
+						{ first: phase === "idle" ? 0 : 1, idle: phase === "idle" ? 0.2 : 0 },
 					);
 				} finally {
 					await fixture.server.stop(true);

@@ -511,7 +511,7 @@ async fn parse_proc_match(
 	context: &ProcContext,
 	stdin: &mut ProcStdin,
 ) -> std::result::Result<ParseProcResult, (u8, String)> {
-	let mut options = match parse_proc_match_args(mode, argv, context.paths())? {
+	let mut options = match parse_proc_match_args(mode, argv, context.paths()).await? {
 		ParseProcResult::Options(options) => *options,
 		other => return Ok(other),
 	};
@@ -529,7 +529,7 @@ async fn parse_proc_match(
 	Ok(ParseProcResult::Options(Box::new(options)))
 }
 
-fn parse_proc_match_args(
+async fn parse_proc_match_args(
 	mode: ProcMatchMode,
 	argv: &[String],
 	paths: &ShellPaths,
@@ -605,7 +605,7 @@ fn parse_proc_match_args(
 				"--euid" => parse_user_list(value.unwrap_or_default(), &mut options.effective_users)?,
 				"--uid" => parse_user_list(value.unwrap_or_default(), &mut options.real_users)?,
 				"--group" => parse_group_list(value.unwrap_or_default(), &mut options.real_groups)?,
-				"--terminal" => parse_terminal_list(value.unwrap_or_default(), &mut options.terminals, paths)?,
+				"--terminal" => parse_terminal_list(value.unwrap_or_default(), &mut options.terminals, paths).await?,
 				"--pidfile" => options
 					.pid_files
 					.push(value.unwrap_or_default().to_string()),
@@ -692,7 +692,7 @@ fn parse_proc_match_args(
 					'u' => parse_user_list(value, &mut options.effective_users)?,
 					'U' => parse_user_list(value, &mut options.real_users)?,
 					'G' => parse_group_list(value, &mut options.real_groups)?,
-					't' => parse_terminal_list(value, &mut options.terminals, paths)?,
+					't' => parse_terminal_list(value, &mut options.terminals, paths).await?,
 					'F' => options.pid_files.push(value.to_string()),
 					'L' => options.require_lock = true,
 					'p' => {

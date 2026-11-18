@@ -584,7 +584,7 @@ describe("IRC", () => {
 				asyncJobManager: opts.jobManager,
 			} as unknown as AgentSession;
 			registry.register({ id, displayName: "task", kind: "sub", status: "idle", session, parentId: opts.parentId });
-			attachIrcWakeTurnMonitor(session, { id, agent: wakeAgent });
+			attachIrcWakeTurnMonitor(session, { id, agent: wakeAgent, storeMaskCwd: "/tmp" });
 			return {
 				wake,
 				settled: async () => {

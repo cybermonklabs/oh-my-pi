@@ -3,6 +3,7 @@ import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
+import { isReduceMotion } from "@oh-my-pi/pi-tui/reduce-motion";
 import { formatDuration, isRecord, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
@@ -42,7 +43,7 @@ import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { getSymbolTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, ToolCallRunMark } from "../../session/agent-session";
 import {
 	isSilentAbort,
 	isUserInvokedSkillPrompt,
@@ -232,12 +233,37 @@ export class EventController {
 	 *  `blocked` status each reports; cleared at their tool_execution_end so the
 	 *  run returns to `working` once none is left. */
 	#blockingPrompts = new Map<string, RunStatus>();
+	/**
+	 * The tool calls the session last published as waiting on a person
+	 * (`user_wait_start.toolCalls`). A call that leaves this set has had its own
+	 * dialog answered, whatever other dialogs remain open, so its record in
+	 * {@link #blockingPrompts} is retired then — its execution is not its
+	 * approval. A call that never appears here asked somewhere this session
+	 * cannot see (a host that drives its own approval UI), and only its own
+	 * `tool_execution_end` retires it.
+	 */
+	#waitingToolCalls = new Set<string>();
+	/**
+	 * Calls whose dialog was answered before their `tool_execution_start` reached this view: the
+	 * session publishes a wait as soon as the dialog opens, which can be ahead of the start the
+	 * loop emits for the same call. Their prompt is already answered, so the start must not record
+	 * one. Cleared with the call's own end and at turn end.
+	 */
+	#answeredBeforeStart = new Set<string>();
+	/**
+	 * The session-level dialog (`user_wait_start`) waiting on a person, if one
+	 * is open. It outlives a run: a dialog can open with no run behind it (an
+	 * MCP sign-in) and stay open while a run starts, ends and is cleaned up, so
+	 * it is kept out of {@link #blockingPrompts}, which `#finishAgentEnd`
+	 * clears.
+	 */
+	#sessionUserWait: RunStatus | undefined;
 	#approvalPreviewGates = new Map<string, ApprovalPreviewGate>();
 	#pendingStreamPreviews = new Map<string, unknown>();
 	#detachToolApprovalPreviewWaiter: (() => void) | undefined;
 	#readToolCallArgs = new Map<string, Record<string, unknown>>();
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
-	#toolTimelineComponents = new Map<string, Component>();
+	#toolTimelineComponents = new Map<string, ToolExecutionHandle>();
 	// Stable identity for a streamed tool call while its assistant message is
 	// live: maps the tool-call block's position in the streaming message to the
 	// id last seen at that position. A streamed id can CHANGE across cumulative
@@ -286,7 +312,16 @@ export class EventController {
 	// restored when the banner clears at the next `agent_start` (see
 	// #handleMessageEnd / #handleAgentStart).
 	#pinnedErrorComponent: AssistantMessageComponent | undefined = undefined;
-	#pinnedErrorMessage: AssistantMessage | undefined = undefined;
+	/**
+	 * The pinned failure: the live message, and its text as it was when pinned.
+	 * Turn recovery later rewrites the live message. A retry-cap failure gets a
+	 * new text that `auto_retry_end` names; a spent retry budget gets a
+	 * "Retry budget exhausted" prefix while `auto_retry_end` names the text at
+	 * pin time. Either names the pinned failure.
+	 */
+	#pinnedErrorMessage:
+		| { live: AssistantMessage; atPin: Pick<AssistantMessage, "errorMessage" | "errorDisplayMessage"> }
+		| undefined = undefined;
 	#restorePinnedErrorInline = true;
 	#retrySupersededAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#retrySupersededAssistantQueue: AssistantMessageComponent[] = [];
@@ -360,6 +395,7 @@ export class EventController {
 	#dispatchTail: Promise<void> = Promise.resolve();
 	/** Whether a chained run is currently in flight (awaiting its own awaits). */
 	#dispatchInFlight = false;
+	#dispatchGeneration = 0;
 	// Deltas already fed to speech at arrival by the coalescer. `#handleMessageUpdate`
 	// also vocalizes so the direct `handleEvent` path (tests, session focus replay)
 	// keeps working — the WeakSet makes the coalesced path speak each delta exactly
@@ -392,6 +428,7 @@ export class EventController {
 			// paces streamed `md` itself (Tern) gets the text as it arrives: pacing it here too is wasted work.
 			getSmoothStreaming: () =>
 				cfgDisplaySmoothStreaming.get(this.ctx.settings) &&
+				!isReduceMotion() &&
 				!nativePacing() &&
 				!this.ctx.viewSession.extensionRunner?.getAssistantTextRenderers?.().length,
 			getHideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
@@ -399,7 +436,7 @@ export class EventController {
 			requestRender: component => this.ctx.ui.requestComponentRender(component),
 		});
 		this.#toolArgsReveal = new ToolArgsRevealController({
-			getSmoothStreaming: () => cfgDisplaySmoothStreaming.get(this.ctx.settings),
+			getSmoothStreaming: () => cfgDisplaySmoothStreaming.get(this.ctx.settings) && !isReduceMotion(),
 			requestRender: component => this.ctx.ui.requestComponentRender(component),
 		});
 		this.composerPrediction = new ComposerPredictionController(ctx);
@@ -444,6 +481,26 @@ export class EventController {
 			todo_reminder: e => this.#handleTodoReminder(e),
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
+			user_wait_start: async event => {
+				this.#sessionUserWait = { state: "blocked", kind: event.kind ?? "question", msg: event.prompt };
+				this.#syncWaitingToolCalls(event.toolCalls);
+				setRunStatus(this.#reportedStatus());
+				this.ctx.ui.requestRender();
+			},
+			user_wait_end: async () => {
+				if (!this.#sessionUserWait) return;
+				this.#sessionUserWait = undefined;
+				// No dialog waits, so every call that had one has been answered.
+				this.#syncWaitingToolCalls(undefined);
+				const status = this.#reportedStatus();
+				setRunStatus(status);
+				// A run that handed control to background work keeps the OSC `working`
+				// record but an idle title (the async-only policy in #handleAgentEnd).
+				// Ending the dialog must not flip the title back to working for the
+				// rest of the job wait; keep it idle while the async wait stands.
+				if (status.state === "working" && this.#asyncWaitEnd) setTerminalTitleState("idle");
+				this.ctx.ui.requestRender();
+			},
 			notice: e => this.#handleNotice(e),
 			model_changed: async () => {
 				this.ctx.statusLine.invalidate();
@@ -915,9 +972,21 @@ export class EventController {
 			this.#enqueueMessageUpdate(event);
 			return;
 		}
+		await this.runSerialized(async () => {
+			await this.handleEvent(event);
+		});
+	}
+
+	/**
+	 * Run `run` in the serialized session-event dispatch pipeline, flushing any
+	 * pending coalesced `message_update` first. This does not drop work when the
+	 * viewed session changes: a caller that queues across that change must skip
+	 * the stale work itself.
+	 */
+	async runSerialized(run: () => Promise<void>): Promise<void> {
 		await this.#runSerialized(async () => {
 			await this.#flushPendingMessageUpdate();
-			await this.handleEvent(event);
+			await run();
 		});
 	}
 
@@ -1042,18 +1111,124 @@ export class EventController {
 	}
 
 	/**
+	 * What the run reports right now. While a session dialog is open it is the
+	 * whole report, words and classification alike: it is the only live record
+	 * of what a person is being asked, and nothing correlates a per-call
+	 * approval record with the dialog that is open. A record outlives its
+	 * answer — it is dropped at the call's `tool_execution_end`, not when the
+	 * person answered — so borrowing from it names an operation already
+	 * approved, and borrowing its `permission` would contradict the open
+	 * dialog's own classification, including one its opener stated. A dialog
+	 * that named nothing therefore reports its generic label rather than
+	 * another call's words.
+	 *
+	 * `local` is the record the caller holds for a call waiting on the user,
+	 * and defaults to the oldest one still waiting: a call that just raised its
+	 * own prompt passes that prompt, since it is the one now in front. It
+	 * reports only where no dialog is bracketed — a host with no wait tracker
+	 * has nothing else. With neither, the report follows the run: a dialog that
+	 * opened outside any run leaves the session idle rather than claiming work
+	 * nobody started.
+	 */
+	#reportedStatus(local: RunStatus | undefined = this.#blockingPrompts.values().next().value): RunStatus {
+		return this.#sessionUserWait ?? local ?? (this.#runActive ? { state: "working" } : { state: "idle" });
+	}
+
+	/**
+	 * Take the session's list of calls whose dialogs are open and retire the record of every call
+	 * that has left it: that call's own wait is over, whether it was answered alone, behind a
+	 * dialog that is still open, or with the last of them. A record for a call the session never
+	 * listed was raised where the session cannot see it and is untouched here — only its
+	 * `tool_execution_end` retires it, which is the lifetime a host that drives its own approval
+	 * UI needs to keep reporting the answer it is owed.
+	 */
+	#syncWaitingToolCalls(toolCalls: readonly string[] | undefined): void {
+		const waiting = new Set(toolCalls ?? []);
+		for (const toolCallId of this.#waitingToolCalls) {
+			if (waiting.has(toolCallId)) continue;
+			// The call may not have reached this view yet: a dialog is published
+			// when it opens, which can precede the loop's `tool_execution_start`
+			// for the same call. Remember the answer so that start records no
+			// prompt instead of resurrecting one.
+			if (!this.#blockingPrompts.delete(toolCallId)) this.#answeredBeforeStart.add(toolCallId);
+		}
+		this.#waitingToolCalls = waiting;
+	}
+
+	/**
+	 * What a session being left behind knows about calls waiting on a person, kept so returning to
+	 * it reports what it reported before. A host that drives its own approval UI raises no session
+	 * dialog, so these records are the only evidence those calls are owed an answer — and unlike a
+	 * dialog, nothing republishes them on attach. Each record is parked beside the mark of the run
+	 * it describes, because a call id is reused: the run that was waiting can end and another run
+	 * of that id can start while the view is elsewhere, and the record describes neither.
+	 */
+	#parkedApprovalRecords = new WeakMap<
+		object,
+		{
+			prompts: Map<string, RunStatus>;
+			marks: Map<string, ToolCallRunMark | undefined>;
+			answered: Set<string>;
+		}
+	>();
+
+	/**
+	 * Take back what {@link resetTranscriptAnchors} parked for `session`, if anything, and report
+	 * from it. Called by the focus controller once the transcript is pointed at that session.
+	 *
+	 * A parked record describes one run of one call, and the view saw nothing while it was gone:
+	 * that run may have been answered, aborted or disposed, and the id may be running again for
+	 * something else entirely. `runMark` names the run the session is on now, and a record comes
+	 * back only when that is the same run *and* it is still going — two equal terminal marks
+	 * describe a call that is over, which is a reason to drop the record, not to restore it. A
+	 * call the session never ran has no mark on either side and is nobody's to retire.
+	 */
+	adoptApprovalRecords(session: object, runMark?: (toolCallId: string) => ToolCallRunMark | undefined): void {
+		const parked = this.#parkedApprovalRecords.get(session);
+		if (!parked) return;
+		this.#parkedApprovalRecords.delete(session);
+		if (runMark) {
+			for (const [toolCallId, parkedRun] of parked.marks) {
+				const current = runMark(toolCallId);
+				const sameRun = current?.mark === parkedRun?.mark;
+				if (!sameRun || current?.live === false) parked.prompts.delete(toolCallId);
+			}
+		}
+		this.#blockingPrompts = parked.prompts;
+		// Which calls have a dialog open comes from the frame the attach replays, not from here.
+		this.#answeredBeforeStart = parked.answered;
+		setRunStatus(this.#reportedStatus());
+	}
+
+	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
 	 * components, timers, and stream-reveal state all reference the previous
-	 * session's transcript and must not bleed into the new one.
+	 * session's transcript and must not bleed into the new one. `parkFor` is
+	 * the session being left: its approval records are kept aside for a return
+	 * rather than dropped, since nothing else can rebuild them, each against
+	 * the run `runMark` names for it now.
 	 */
-	resetTranscriptAnchors(): void {
+	resetTranscriptAnchors(parkFor?: object, runMark?: (toolCallId: string) => ToolCallRunMark | undefined): void {
+		if (parkFor && (this.#blockingPrompts.size > 0 || this.#answeredBeforeStart.size > 0)) {
+			const marks = new Map<string, ToolCallRunMark | undefined>();
+			for (const toolCallId of this.#blockingPrompts.keys()) marks.set(toolCallId, runMark?.(toolCallId));
+			this.#parkedApprovalRecords.set(parkFor, {
+				prompts: this.#blockingPrompts,
+				marks,
+				answered: this.#answeredBeforeStart,
+			});
+			this.#blockingPrompts = new Map();
+			this.#waitingToolCalls = new Set();
+			this.#answeredBeforeStart = new Set();
+		}
 		if (this.#messageUpdateTimer) {
 			clearTimeout(this.#messageUpdateTimer);
 			this.#messageUpdateTimer = undefined;
 		}
 		this.#pendingMessageUpdate = undefined;
 		this.#pendingMessageRestart = false;
+		this.#dispatchGeneration++;
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
@@ -1070,6 +1245,10 @@ export class EventController {
 		this.#backgroundCallIds.clear();
 		this.#settledBeforeReturn.clear();
 		this.#blockingPrompts.clear();
+		this.#waitingToolCalls.clear();
+		this.#answeredBeforeStart.clear();
+		// The dialog belongs to the session being left behind.
+		this.#sessionUserWait = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
@@ -1098,6 +1277,9 @@ export class EventController {
 	#seedHeldCompletionsFromPendingResults(): void {
 		const pending = this.ctx.viewSession.agent.getPendingToolResults();
 		for (const result of pending) {
+			if (this.#toolTimelineComponents.has(result.toolCallId) && !this.ctx.pendingTools.has(result.toolCallId)) {
+				continue;
+			}
 			this.#orphanedToolCompletions.set(result.toolCallId, {
 				type: "tool_execution_end",
 				toolCallId: result.toolCallId,
@@ -1250,7 +1432,10 @@ export class EventController {
 		this.ctx.ensureLoadingAnimation();
 		this.#runActive = true;
 		this.#syncComposerActivity();
-		setRunStatus({ state: "working" });
+		// A session dialog can already be open when a run starts (an MCP sign-in
+		// answered at leisure, a queued prompt). It still needs the person, so the
+		// title and the OSC record must not report progress over it.
+		setRunStatus(this.#sessionUserWait ?? { state: "working" });
 		this.ctx.ui.requestRender();
 	}
 
@@ -1629,6 +1814,7 @@ export class EventController {
 	}
 
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
+		const generation = this.#dispatchGeneration;
 		this.#ensureWorkingLoaderWhileStreaming();
 		if (!this.#vocalizedMessageUpdates.delete(event)) {
 			this.#vocalizeDelta(event);
@@ -1636,11 +1822,15 @@ export class EventController {
 		if (event.assistantMessageEvent?.type === "start") {
 			await this.#restartAssistantStream(event.message);
 		}
+		// A focus switch reset the view while the restart was in flight: this
+		// update belongs to the previous session's stream.
+		if (generation !== this.#dispatchGeneration) return;
 		if (event.message.role === "assistant") await this.syncAssistantMessage(event.message);
 	}
 
 	/** Resync a cumulative snapshot without replay cleanup or speech side effects. */
 	async syncAssistantMessage(message: AssistantMessage): Promise<void> {
+		const generation = this.#dispatchGeneration;
 		if (this.ctx.streamingComponent) {
 			const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(message);
 			if (unlockedThinkingVisibility) {
@@ -1675,6 +1865,10 @@ export class EventController {
 				!this.ctx.streamingComponent.isTranscriptBlockFinalized()
 			) {
 				const linkTargets = await refreshAssistantMessageLinkTargets(this.ctx, [timeline.beforeTools]);
+				// A focus switch reset the view during link resolution (it waits
+				// behind this run): the streaming state below is gone or the next
+				// session's, so none of this snapshot may be drawn into it.
+				if (generation !== this.#dispatchGeneration || !this.ctx.streamingComponent) return;
 				this.ctx.streamingComponent.setLinkTargets(assistantMessageLinkTargets(timeline.beforeTools, linkTargets));
 				this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			}
@@ -1784,6 +1978,7 @@ export class EventController {
 				if (this.#postToolAssistantComponents.get(toolCallId)?.isTranscriptBlockFinalized()) continue;
 				const closed = toolCallId !== timeline.lastToolCallId;
 				const linkTargets = closed ? await refreshAssistantMessageLinkTargets(this.ctx, [segment]) : undefined;
+				if (generation !== this.#dispatchGeneration || !this.ctx.streamingMessage) return;
 				const component = this.#upsertPostToolAssistantSegment(
 					toolCallId,
 					segment,
@@ -1868,6 +2063,7 @@ export class EventController {
 			}
 		}
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+			const generation = this.#dispatchGeneration;
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();
 			this.#toolArgsReveal.flushAll();
@@ -1897,6 +2093,7 @@ export class EventController {
 				: this.ctx.streamingMessage;
 			const displayTimeline = splitAssistantMessageToolTimeline(displayMessage);
 			const linkTargets = await refreshAssistantMessageLinkTargets(this.ctx, [displayMessage]);
+			if (generation !== this.#dispatchGeneration || !this.ctx.streamingComponent) return;
 			if (!this.ctx.streamingComponent.isTranscriptBlockFinalized()) {
 				this.ctx.streamingComponent.setLinkTargets(
 					assistantMessageLinkTargets(displayTimeline.beforeTools, linkTargets),
@@ -2025,9 +2222,17 @@ export class EventController {
 					AIError.is(AIError.classifyMessage(event.message), AIError.Flag.EmptyResponse);
 				this.#lastAssistantComponent?.setErrorPinned(true);
 				this.#pinnedErrorComponent = this.#lastAssistantComponent;
-				this.#pinnedErrorMessage = event.message;
+				this.#pinnedErrorMessage = {
+					live: event.message,
+					atPin: {
+						errorMessage: event.message.errorMessage,
+						errorDisplayMessage: event.message.errorDisplayMessage,
+					},
+				};
 				this.#restorePinnedErrorInline = !recoverableEmptyOutput;
-				if (!recoverableEmptyOutput) this.ctx.showPinnedError(event.message.errorMessage);
+				if (!recoverableEmptyOutput) {
+					this.ctx.showPinnedError(event.message.errorDisplayMessage ?? event.message.errorMessage);
+				}
 			}
 			this.ctx.statusLine.invalidate();
 			this.ctx.ui.requestRender();
@@ -2042,12 +2247,21 @@ export class EventController {
 		const tool = this.ctx.viewSession.getToolByName(event.toolName);
 		const renderToolName = toolRenderName(event.toolName, tool);
 		const blocked = this.#blockingPrompt(renderToolName, event.args);
-		if (blocked) {
+		if (blocked && this.#answeredBeforeStart.delete(event.toolCallId)) {
+			// This call's dialog opened and was answered before its start reached
+			// the view. The person owes it nothing; the call is running.
+			setRunStatus(this.#reportedStatus());
+		} else if (blocked) {
 			this.#blockingPrompts.set(event.toolCallId, blocked);
-			setRunStatus(blocked);
+			// The dialog this call raises names the call itself in the frame the
+			// session publishes next; nothing is correlated here. An open dialog
+			// outranks this call's own prompt, which has not been raised yet: the
+			// person owes that dialog the answer, and the title and OSC record
+			// must name it.
+			setRunStatus(this.#reportedStatus(blocked));
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
-		if (!this.ctx.pendingTools.has(event.toolCallId)) {
+		if (!this.ctx.pendingTools.has(event.toolCallId) && !this.#toolTimelineComponents.has(event.toolCallId)) {
 			const stale = this.#priorTurnToolComponents.get(event.toolCallId);
 			if (stale) {
 				this.#priorTurnToolComponents.delete(event.toolCallId);
@@ -2058,13 +2272,11 @@ export class EventController {
 			}
 			if (renderToolName === "read" && readArgsCollapseIntoGroup(event.args)) {
 				this.#trackReadToolCall(event.toolCallId, event.args);
-				if (!this.#toolTimelineComponents.has(event.toolCallId)) {
-					const group = this.#getReadGroup();
-					group.updateArgs(event.args, event.toolCallId);
-					this.ctx.pendingTools.set(event.toolCallId, group);
-					this.#toolTimelineComponents.set(event.toolCallId, group);
-					this.#settleHeldCompletionIfPresent(event.toolCallId, group);
-				}
+				const group = this.#getReadGroup();
+				group.updateArgs(event.args, event.toolCallId);
+				this.ctx.pendingTools.set(event.toolCallId, group);
+				this.#toolTimelineComponents.set(event.toolCallId, group);
+				this.#settleHeldCompletionIfPresent(event.toolCallId, group);
 				this.#startToolApprovalPreview(event.toolCallId);
 				this.ctx.ui.requestRender();
 				return;
@@ -2103,16 +2315,22 @@ export class EventController {
 			// authoritative args here and drop any live reveal so a late tick can't
 			// re-truncate them: tool_execution_start is the one event every
 			// execution path emits with the full args immediately before the result.
+			// Also reuses a card already settled in `#toolTimelineComponents` (when
+			// `restoreAssistant` consumed a buffered result ahead of a queued start).
+			// That card stays out of `pendingTools`: call ids are unique within a
+			// run and the timeline is cleared at agent_start/agent_end, so a
+			// timeline-only hit cannot be a fresh execution — its queued
+			// update/end duplicate the settled result and are dropped as such.
 			this.#toolArgsReveal.finish(event.toolCallId);
-			const component = this.ctx.pendingTools.get(event.toolCallId);
-			if (component && typeof component.updateArgs === "function") {
+			if (renderToolName === "read" && readArgsCollapseIntoGroup(event.args)) {
+				this.#trackReadToolCall(event.toolCallId, event.args);
+			}
+			const component =
+				this.ctx.pendingTools.get(event.toolCallId) ?? this.#toolTimelineComponents.get(event.toolCallId);
+			if (component) {
 				component.updateArgs(renderArgsWithIntent(event.args, event.intent), event.toolCallId);
-				if (typeof component.setArgsComplete === "function") {
-					component.setArgsComplete(event.toolCallId);
-				}
-				if (typeof component.setExecutionStarted === "function") {
-					component.setExecutionStarted(event.toolCallId);
-				}
+				component.setArgsComplete(event.toolCallId);
+				component.setExecutionStarted(event.toolCallId);
 				this.#executionStartedCallIds.add(event.toolCallId);
 				this.ctx.ui.requestRender();
 			}
@@ -2293,8 +2511,13 @@ export class EventController {
 		// waits — the run reports that prompt instead. `ask` ids are in the map too
 		// (added at tool_execution_start), so the delete also covers them without
 		// leaking ids until turn end.
+		this.#waitingToolCalls.delete(event.toolCallId);
+		// The answer this call's dialog already received outlives the call's end:
+		// a start can arrive after it on a view fed out of order, and must not
+		// record a prompt for it. The marker is dropped with the turn.
 		if (this.#blockingPrompts.delete(event.toolCallId)) {
-			setRunStatus(this.#blockingPrompts.values().next().value ?? { state: "working" });
+			// An open dialog outranks the remaining records here too.
+			setRunStatus(this.#reportedStatus());
 		}
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
@@ -2470,9 +2693,12 @@ export class EventController {
 			// background-job result can resume it. The title tracks the model, so it
 			// goes idle now — before any await, so a wake landing mid-flush keeps the
 			// `working` its `agent_start` sets. The OSC 7501 record stays `working`:
-			// the run is not over, it resumes or settles without the user.
+			// the run is not over, it resumes or settles without the user. A session
+			// dialog is the exception: it outranks the run on both surfaces, and the
+			// record still reports `blocked`, so the title keeps its attention mark
+			// until the person answers.
 			if (event.awaitingAsyncWork === true) {
-				setTerminalTitleState("idle");
+				setTerminalTitleState(this.#sessionUserWait ? "attention" : "idle");
 				this.#showAsyncWait(event);
 			}
 			void this.#finishWhenRunSettles(event);
@@ -2613,7 +2839,7 @@ export class EventController {
 	#settledRunStatus(event: Extract<AgentSessionEvent, { type: "agent_end" }>): RunStatus {
 		if (this.#retryPending) return { state: "idle" };
 		const last = event.messages.findLast((message): message is AssistantMessage => message.role === "assistant");
-		if (last?.stopReason === "error") return { state: "error", msg: last.errorMessage };
+		if (last?.stopReason === "error") return { state: "error", msg: AIError.errorDisplayText(last) };
 		if (!last || last.stopReason === "aborted") return { state: "idle" };
 		return { state: "done" };
 	}
@@ -2640,6 +2866,8 @@ export class EventController {
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
 		this.#blockingPrompts.clear();
+		this.#waitingToolCalls.clear();
+		this.#answeredBeforeStart.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#priorTurnToolComponents = new Map(this.#toolTimelineComponents);
@@ -2662,6 +2890,10 @@ export class EventController {
 		// When the interrupted/failed turn died on a tool call, this replaces the
 		// torn-down "Working…" row with the "F5 to Retry" affordance.
 		this.ctx.syncRetryHintRow();
+		// The callers above report the settled run (`done`, `idle`) before this
+		// cleanup. A session dialog outlives the run that ran beside it, so the
+		// person still owes an answer and the report has to say so.
+		if (this.#sessionUserWait) setRunStatus(this.#sessionUserWait);
 		this.ctx.ui.requestRender();
 		// The run yielded: a `/compact` queued behind it runs now. A run the user stopped (Esc, including
 		// the loop-mode pause) did not yield: the request goes back to the editor like other queued input.
@@ -2911,12 +3143,19 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-		const pinnedError = this.#pinnedErrorMessage?.errorMessage;
+		const pinned = this.#pinnedErrorMessage;
+		// Show the failure as omp displays it: the live message's text when the
+		// retry end names it, else the text it had when pinned.
+		const pinnedFailure =
+			event.finalError === undefined || pinned === undefined
+				? undefined
+				: pinned.live.errorMessage === event.finalError
+					? pinned.live
+					: pinned.atPin.errorMessage === event.finalError
+						? pinned.atPin
+						: undefined;
 		const terminalFailurePinned =
-			!event.success &&
-			this.#pinnedErrorComponent !== undefined &&
-			pinnedError !== undefined &&
-			pinnedError === event.finalError;
+			!event.success && this.#pinnedErrorComponent !== undefined && pinnedFailure !== undefined;
 		let stalePinnedErrorCleared = false;
 		if (!event.success && this.#pinnedErrorComponent && !terminalFailurePinned) {
 			this.#pinnedErrorComponent.setErrorPinned(false);
@@ -2948,9 +3187,12 @@ export class EventController {
 		this.#clearRetrySupersededAssistantComponents();
 		if (!event.success) {
 			if (terminalFailurePinned) {
+				// The banner shows omp's display text for the same failure, which
+				// names the request dump and any provider explanation.
+				const shown = (pinnedFailure && AIError.errorDisplayText(pinnedFailure)) ?? event.finalError;
 				const terminalError = this.#restorePinnedErrorInline
-					? `Retry failed after ${event.attempt} attempts: ${event.finalError || pinnedError || "Unknown error"}`
-					: (pinnedError ?? event.finalError);
+					? `Retry failed after ${event.attempt} attempts: ${shown || "Unknown error"}`
+					: shown;
 				if (terminalError) this.ctx.showPinnedError(terminalError);
 				this.#restorePinnedErrorInline = true;
 			} else {
