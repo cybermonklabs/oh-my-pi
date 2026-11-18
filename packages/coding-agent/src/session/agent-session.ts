@@ -516,6 +516,8 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import {
+	customMessagesByType,
+	customMessagesOf,
 	promptDigestOfEntry,
 	SessionTools,
 	type SessionToolsHost,
@@ -629,6 +631,10 @@ const cfgWorkspacePromptInputs = combine({
 });
 
 const PLAN_MODE_REMINDER_MAX = 3;
+/** Custom message type of the plan mode instructions. */
+const PLAN_MODE_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
+/** Custom message type of the goal mode instructions. */
+const GOAL_MODE_CONTEXT_MESSAGE_TYPE = "goal-mode-context";
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 /**
@@ -2492,8 +2498,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
-			hiddenRecall: findDeliveredRecall(this.sessionManager.getBranchView()),
-			recallChanges: findDeliveredRecallChanges(this.sessionManager.getBranchView()),
+			hiddenRecall: () => findDeliveredRecall(this.sessionManager.getBranchView()),
+			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -2692,8 +2698,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			toolDefinitionsDigest: () => this.#promptCacheShape(this.model).tools,
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
-			setHiddenMemoryRecall: recall => this.#memory.setHiddenRecall(recall),
-			setMemoryRecallChanges: changes => this.#memory.setRecallChanges(changes),
+			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -7830,11 +7835,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
-	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state): no later
-	 * request sends them again, and a prompt rebuild asks the backend for its whole memory instructions.
+	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state), then
+	 * rebuilds the base prompt: no later request sends them again, and the rebuild asks the backend for its whole
+	 * memory instructions.
 	 */
-	forgetMemoryRecall(): void {
-		this.#memory.forgetRecall();
+	withdrawMemoryRecall(): Promise<void> {
+		this.#memory.adoptRecall(undefined, []);
+		return this.refreshBaseSystemPrompt();
 	}
 
 	/**
@@ -7854,16 +7861,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async #missingContextMessages(context: AgentContext): Promise<AgentMessage[]> {
 		const missing: AgentMessage[] = [];
+		const byType = customMessagesByType(context.messages);
 		const recall = this.#memory.hiddenRecall;
 		if (
 			recall &&
-			!context.systemPrompt.some(block => block.includes(recall)) &&
-			!context.messages.some(
-				message =>
-					message.role === "custom" &&
-					message.customType === MEMORY_RECALL_MESSAGE_TYPE &&
-					message.content === recall,
-			)
+			!customMessagesOf(byType, MEMORY_RECALL_MESSAGE_TYPE).some(message => message.content === recall) &&
+			!context.systemPrompt.some(block => block.includes(recall))
 		) {
 			missing.push({
 				role: "custom",
@@ -7877,12 +7880,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const recallChanges = this.#memory.recallChanges;
 		const newestChanges = recallChanges.at(-1);
 		if (newestChanges) {
-			const carried = new Set<unknown>();
-			for (const message of context.messages) {
-				if (message.role === "custom" && message.customType === MEMORY_RECALL_CHANGES_MESSAGE_TYPE) {
-					carried.add(message.content);
-				}
-			}
+			const carried = new Set<unknown>(
+				customMessagesOf(byType, MEMORY_RECALL_CHANGES_MESSAGE_TYPE).map(message => message.content),
+			);
 			for (const report of recallChanges) {
 				if (carried.has(report.content)) continue;
 				missing.push({
@@ -7902,19 +7902,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#notePlanReferenceSent();
 			missing.push(planReference);
 		}
-		for (const mode of [
-			await this.#buildPlanModeMessage(),
-			this.#buildGoalModeMessage(),
-			this.#buildVibeModeMessage(),
-		]) {
-			if (
-				mode &&
-				!context.messages.some(message => message.role === "custom" && message.customType === mode.customType)
-			) {
-				missing.push(mode);
-			}
+		const enabledToolNames = this.getEnabledToolNames();
+		if (!byType.has(PLAN_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const planMode = await this.#buildPlanModeMessage(enabledToolNames);
+			if (planMode) missing.push(planMode);
 		}
-		missing.push(...this.#tools.missingContextNotices(context.messages, context.systemPrompt));
+		if (!byType.has(GOAL_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const goalMode = this.#buildGoalModeMessage();
+			if (goalMode) missing.push(goalMode);
+		}
+		if (!byType.has(VIBE_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const vibeMode = this.#buildVibeModeMessage();
+			if (vibeMode) missing.push(vibeMode);
+		}
+		missing.push(...this.#tools.missingContextNotices(byType, context.systemPrompt, enabledToolNames));
 		return missing;
 	}
 
@@ -8692,7 +8693,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return isScoutSpawnable(cfgTaskDisabledAgents.get(this.settings), this.#spawns);
 	}
 
-	async #buildPlanModeMessage(): Promise<CustomMessage | null> {
+	/** The plan mode instructions while plan mode is on; `capableToolNames`, when given, are the enabled tool names. */
+	async #buildPlanModeMessage(capableToolNames?: readonly string[]): Promise<CustomMessage | null> {
 		const state = this.#planModeState;
 		if (!state?.enabled) return null;
 		const sessionPlanUrl = "local://PLAN.md";
@@ -8706,15 +8708,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		const planExists = fs.existsSync(resolvedPlanPath);
 		// Capability gates, not the visible surface: `xd://`-mounted tools stay callable.
-		const capableToolNames = this.getEnabledToolNames();
+		const toolNames = capableToolNames ?? this.getEnabledToolNames();
 		const content = prompt.render(planModeActivePrompt, {
 			planFilePath: displayPlanPath,
 			planExists,
 			askToolName: "ask",
 			writeToolName: "write",
 			editToolName: "edit",
-			askAvailable: capableToolNames.includes("ask"),
-			taskAvailable: capableToolNames.includes("task"),
+			askAvailable: toolNames.includes("ask"),
+			taskAvailable: toolNames.includes("task"),
 			isHashlineEditMode: this.#resolveActiveEditMode() === "hashline",
 			reentry: state.reentry ?? false,
 			iterative: state.workflow === "iterative",
@@ -8723,7 +8725,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		return {
 			role: "custom",
-			customType: "plan-mode-context",
+			customType: PLAN_MODE_CONTEXT_MESSAGE_TYPE,
 			content,
 			display: false,
 			attribution: "agent",
@@ -8737,7 +8739,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const todoContext = this.#buildGoalTodoContext();
 		return {
 			role: "custom",
-			customType: "goal-mode-context",
+			customType: GOAL_MODE_CONTEXT_MESSAGE_TYPE,
 			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
 			display: false,
 			attribution: "agent",
@@ -9937,16 +9939,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const hiddenNotices = [
 				this.#tools.takeXdevMountNotice(previewXdevMountNotice),
 				this.#tools.takeToolRosterNotice(),
-				...(isUserQueuedMessage(message)
-					? [
-							this.#tools.takeEvalPreludeNotice(),
-							this.#tools.takeSessionAgentNotice(),
-							this.#tools.takeTaskAgentNotice(),
-							this.#tools.takePerCallModelNotice(),
-							this.#tools.takeSkillNotice(),
-							this.#tools.takeSettingsNotice(),
-						]
-					: []),
+				// This condition only sets where the history notices go: before a user prompt. A continuation the agent
+				// started gets each one its context lacks from the per-request hook, after its message.
+				...(isUserQueuedMessage(message) ? this.#tools.historyNotices() : []),
 			].filter(notice => notice !== undefined);
 			if (hiddenNotices.length > 0) messages.splice(hiddenNoticeIndex, 0, ...hiddenNotices);
 

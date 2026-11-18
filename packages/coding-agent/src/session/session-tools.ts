@@ -168,16 +168,12 @@ export interface SessionToolsHost {
 	clearMemoryPromotionSnapshot(): void;
 	captureMemoryPromotionSnapshot(prompt: string[]): void;
 	/**
-	 * Records where the recall the memory backend adopted goes: `recall` rides the conversation as a hidden
-	 * `memory-recall` message, which each request sends where its context lacks it; undefined when it is a system
-	 * block or the backend adopted none.
+	 * Records what the recall the memory backend adopted leaves the conversation carrying: `hidden` rides it as a
+	 * hidden `memory-recall` message (undefined when it is a system block or the backend adopted none), and `changes`
+	 * are the reports of what changed in a reused recall's memories it carries as hidden `memory-recall-changes`
+	 * messages, oldest first (none for a fresh recall). Each request sends one again where its context lacks it.
 	 */
-	setHiddenMemoryRecall(recall: string | undefined): void;
-	/**
-	 * Records the reports of what changed in a reused recall's memories that the conversation carries as hidden
-	 * `memory-recall-changes` messages, oldest first; each request sends one again where its context lacks it.
-	 */
-	setMemoryRecallChanges(changes: readonly RecallChangesReport[]): void;
+	adoptMemoryRecall(hidden: string | undefined, changes: readonly RecallChangesReport[]): void;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	notifyCommandMetadataChanged(): void;
 	localProtocolOptions(): LocalProtocolOptions;
@@ -469,6 +465,25 @@ function toolDeclaration(tool: Pick<AgentTool, "name" | "label"> & ToolDeclarati
 	return JSON.stringify([tool.name, tool.label, ...TOOL_DECLARATION_FIELD_KEYS.map(key => tool[key])]);
 }
 
+/** Each kept declaration's {@link keptDeclaration} string, with the names it was rendered under. */
+const keptDeclarations = new WeakMap<
+	ToolDeclarationFields,
+	Pick<AgentTool, "name" | "label"> & { declaration: string }
+>();
+
+/**
+ * What a request declares for `own` under the kept declaration `fields`: `own`'s names with `fields`. Kept fields are
+ * a snapshot that never changes, so the string is rendered once for them and the names they go with.
+ */
+function keptDeclaration(own: Pick<AgentTool, "name" | "label">, fields: ToolDeclarationFields): string {
+	const { name, label } = own;
+	const kept = keptDeclarations.get(fields);
+	if (kept?.name === name && kept.label === label) return kept.declaration;
+	const declaration = toolDeclaration({ ...fields, name, label });
+	keptDeclarations.set(fields, { name, label, declaration });
+	return declaration;
+}
+
 /** `tool`'s {@link ToolDeclarationFields} as they read now. */
 function toolDeclarationFields(tool: AgentTool): ToolDeclarationFields {
 	const fields: Partial<Record<keyof ToolDeclarationFields, unknown>> = {};
@@ -548,6 +563,39 @@ function isStringList(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string");
 }
 
+/**
+ * Applies a roster or `xd://` mount notice's `details` to the names the model was told of: adds each name they list
+ * as `added`, then drops each they list as `removed`. False, leaving `known` as it is, when they carry no such lists.
+ */
+function applyNameNotice(known: Set<string>, details: unknown): boolean {
+	if (!isRecord(details) || !isStringList(details.added) || !isStringList(details.removed)) return false;
+	for (const name of details.added) known.add(name);
+	for (const name of details.removed) known.delete(name);
+	return true;
+}
+
+/** A context's custom messages by `customType`, each list in context order ({@link customMessagesByType}). */
+export type CustomMessagesByType = ReadonlyMap<string, readonly CustomMessage[]>;
+
+const NO_CUSTOM_MESSAGES: readonly CustomMessage[] = [];
+
+/** Reads `messages` once into its custom messages by `customType`, each list in the order `messages` holds them. */
+export function customMessagesByType(messages: readonly AgentMessage[]): CustomMessagesByType {
+	const byType = new Map<string, CustomMessage[]>();
+	for (const message of messages) {
+		if (message.role !== "custom") continue;
+		const list = byType.get(message.customType);
+		if (list) list.push(message);
+		else byType.set(message.customType, [message]);
+	}
+	return byType;
+}
+
+/** The custom messages of `customType` in `byType`, in context order. */
+export function customMessagesOf(byType: CustomMessagesByType, customType: string): readonly CustomMessage[] {
+	return byType.get(customType) ?? NO_CUSTOM_MESSAGES;
+}
+
 /** The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one. */
 function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefined {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_CUSTOM_TYPE || !isRecord(entry.data)) {
@@ -567,6 +615,14 @@ function promptHoldOfEntry(entry: SessionEntry): SystemPromptHold | undefined {
 	return typeof digest === "string" && typeof since === "number" ? { digest, since } : undefined;
 }
 
+/** Index of the newest entry of `branch` that records a prompt other than `digest`; -1 when none does. */
+function otherPromptRecordIndex(branch: readonly SessionEntry[], digest: string): number {
+	return branch.findLastIndex(entry => {
+		const recorded = promptDigestOfEntry(entry);
+		return recorded !== null && recorded !== digest;
+	});
+}
+
 /** Tools one hidden {@link TOOL_ROSTER_NOTICE_MESSAGE_TYPE} message announced or withdrew. */
 interface ToolRosterNoticeDetails {
 	added: string[];
@@ -583,6 +639,47 @@ interface ToolRosterNoticeDetails {
 interface XdevMountNoticeDetails {
 	added: string[];
 	removed: string[];
+}
+
+/** A device a legacy mount notice's text lists as mounted (`added`) or no longer mounted (`removed`). */
+type LegacyMountNoticeLine = readonly ["added" | "removed", string];
+
+/** Each legacy mount notice's {@link legacyMountNoticeLines}, parsed once: a saved message is never edited. */
+const legacyMountNoticeParses = new WeakMap<CustomMessage, readonly LegacyMountNoticeLine[]>();
+
+/**
+ * The devices a mount notice saved without structured details lists in the two stable inventory sections of its
+ * rendered text, in order. Releases before structured notice details persisted only the rendered prompt; replaying
+ * these keeps the first resume after upgrading from announcing every dynamic device once.
+ */
+function legacyMountNoticeLines(message: CustomMessage): readonly LegacyMountNoticeLine[] {
+	const { content } = message;
+	if (typeof content !== "string") return [];
+	const parsed = legacyMountNoticeParses.get(message);
+	if (parsed) return parsed;
+	const lines: LegacyMountNoticeLine[] = [];
+	let section: "added" | "removed" | undefined;
+	for (const line of content.split("\n")) {
+		if (line === "These tools became available:") {
+			section = "added";
+			continue;
+		}
+		if (line.startsWith("No longer mounted")) {
+			section = "removed";
+			continue;
+		}
+		if (line === "Configured inline device docs:" || line === "</system-notice>") break;
+		if (line.startsWith("Read `xd://<tool>`")) {
+			section = undefined;
+			continue;
+		}
+		if (!section) continue;
+		const match = /^- xd:\/\/(\S+?)(?:\s+—|$)/.exec(line);
+		const name = match?.[1];
+		if (name) lines.push([section, name]);
+	}
+	legacyMountNoticeParses.set(message, lines);
+	return lines;
 }
 
 /** Prelude names added/removed by one hidden {@link EVAL_PRELUDE_NOTICE_MESSAGE_TYPE} message. */
@@ -812,18 +909,11 @@ export class SessionTools {
 	#extensionMcpTools = new Map<string, AgentTool>();
 	#xdev: XdevState | undefined;
 	/**
-	 * Newest assistant reply restored with the transcript this session was
-	 * created with, and the recorded digest of the prompt that transcript was
-	 * sent with, until this session's first primary model call; see
-	 * {@link #implicitRebuildBinding}.
+	 * Newest assistant reply restored with the transcript this session was created with, and the recorded digest of
+	 * the prompt that transcript was sent with (undefined when it records none), until this session's first primary
+	 * model call; see {@link #implicitRebuildBinding}.
 	 */
-	#restoredTranscript: { reply: AgentMessage; promptDigest: string } | undefined;
-	/**
-	 * Newest assistant reply restored with the transcript this session was created with, recorded prompt or not,
-	 * until this session's first primary model call: a reply not produced under the startup prompt
-	 * ({@link #implicitRebuildBinding}).
-	 */
-	#restoredReply: AgentMessage | undefined;
+	#restoredTranscript: { reply: AgentMessage; promptDigest: string | undefined } | undefined;
 	/** Digests of the last primary model call, until its reply ends. */
 	#capturedCall: ModelCallDigests | undefined;
 	/** Digests of the call each primary reply with provider output was produced by. */
@@ -1028,12 +1118,7 @@ export class SessionTools {
 		// held out of it re-renders against the roster it was built from.
 		this.#recordPromptRoster(this.#startupListing.toolNames);
 		const restoredReply = this.#latestReply();
-		this.#restoredReply = restoredReply;
-		const restoredPromptDigest = restoredReply && this.recordedPromptDigest();
-		this.#restoredTranscript =
-			restoredReply && restoredPromptDigest
-				? { reply: restoredReply, promptDigest: restoredPromptDigest }
-				: undefined;
+		this.#restoredTranscript = restoredReply && { reply: restoredReply, promptDigest: this.recordedPromptDigest() };
 		this.#restoreTranscriptPrompt();
 		this.#skills = options.skills ?? [];
 		this.#promptSkills = this.#skills;
@@ -2025,7 +2110,7 @@ export class SessionTools {
 		if (!held || !fields) return own;
 		let declared = held.declared.get(own);
 		if (!declared) {
-			const kept = toolDeclaration({ ...fields, name: own.name, label: own.label });
+			const kept = keptDeclaration(own, fields);
 			let checkedRevision: number | undefined;
 			let altered = false;
 			// Requests, argument checks and token counts read `fields`; every other member is the tool's own, read and
@@ -2437,7 +2522,6 @@ export class SessionTools {
 	 */
 	recordPrimaryModelCall(prompt: string[]): void {
 		this.#restoredTranscript = undefined;
-		this.#restoredReply = undefined;
 		const promptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
 		this.#capturedCall = { prompt: promptDigest, tools: this.#host.toolDefinitionsDigest() };
 		if (this.#heldSettingsRebuild) return;
@@ -2554,11 +2638,9 @@ export class SessionTools {
 		if (change.recordedOn === branch) return;
 		// The view grows in place with the record and the entries after it.
 		change.recordedOn = branch;
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const entry = branch[index];
-			const recorded = promptDigestOfEntry(entry);
-			if (recorded !== null && recorded !== change.digest) break;
-			const withheld = promptHoldOfEntry(entry);
+		const other = otherPromptRecordIndex(branch, change.digest);
+		for (let index = branch.length - 1; index > other; index--) {
+			const withheld = promptHoldOfEntry(branch[index]);
 			if (withheld?.digest === change.digest && withheld.since <= change.since) return;
 		}
 		const record: SystemPromptHold = { digest: change.digest, since: change.since };
@@ -2575,14 +2657,10 @@ export class SessionTools {
 	 */
 	#withheldChangeSince(digest: string): number | undefined {
 		const branch = this.#host.sessionManager.getBranchView();
-		let other: SessionEntry | undefined;
-		for (let index = branch.length - 1; index >= 0 && other === undefined; index--) {
-			const recorded = promptDigestOfEntry(branch[index]);
-			if (recorded !== null && recorded !== digest) other = branch[index];
-		}
+		const other = otherPromptRecordIndex(branch, digest);
 		const entries = this.#host.sessionManager.getEntries();
 		let since: number | undefined;
-		for (let index = other ? entries.indexOf(other) + 1 : 0; index < entries.length; index++) {
+		for (let index = other < 0 ? 0 : entries.indexOf(branch[other]) + 1; index < entries.length; index++) {
 			const withheld = promptHoldOfEntry(entries[index]);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
 		}
@@ -2618,18 +2696,18 @@ export class SessionTools {
 	 * freely mid-session as well.
 	 */
 	#restoreTranscriptPrompt(): void {
-		const restored = this.#restoredTranscript;
+		const promptDigest = this.#restoredTranscript?.promptDigest;
 		const operatorDigest = this.#operatorPromptDigest;
-		if (!restored || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
-		if (systemPromptDigest(this.#baseSystemPrompt) === restored.promptDigest) return;
-		const stored = this.#storedPrompt(restored.promptDigest);
+		if (!promptDigest || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
+		if (systemPromptDigest(this.#baseSystemPrompt) === promptDigest) return;
+		const stored = this.#storedPrompt(promptDigest);
 		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
-		if (!this.#host.transcriptPromptCacheLive(restored.promptDigest)) return;
+		if (!this.#host.transcriptPromptCacheLive(promptDigest)) return;
 		const restoredPrompt: RestoredPrompt = {
 			base: stored.blocks,
-			digest: restored.promptDigest,
+			digest: promptDigest,
 			// The earliest the session records, else the restore.
-			since: this.#withheldChangeSince(restored.promptDigest) ?? Date.now(),
+			since: this.#withheldChangeSince(promptDigest) ?? Date.now(),
 			due: false,
 			recordedOn: undefined,
 		};
@@ -2703,7 +2781,6 @@ export class SessionTools {
 	 */
 	leaveRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
-		this.#restoredReply = undefined;
 		this.#basePromptRestored = false;
 		const restored = this.#restoredPrompt;
 		if (!restored) return;
@@ -2714,7 +2791,6 @@ export class SessionTools {
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
-		this.#restoredReply = undefined;
 		this.#recordedDigestScan = undefined;
 		this.#recordedToolsDigestScan = undefined;
 		this.#storedPromptScan = undefined;
@@ -2741,9 +2817,10 @@ export class SessionTools {
 		if (this.#host.model()?.thinking?.prefixBinding !== true) return "free";
 		const latest = this.#latestReply();
 		if (latest === undefined) return "free";
-		if (latest === this.#restoredTranscript?.reply) return this.#restoredTranscript;
-		const committed = this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored;
-		return latest === this.#restoredReply && !committed ? "free" : "frozen";
+		const restored = this.#restoredTranscript;
+		if (latest !== restored?.reply) return "frozen";
+		if (restored.promptDigest) return { promptDigest: restored.promptDigest };
+		return this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored ? "frozen" : "free";
 	}
 
 	/**
@@ -2828,10 +2905,7 @@ export class SessionTools {
 		const known = new Set(this.#promptListing(systemPrompt).toolNames);
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== TOOL_ROSTER_NOTICE_MESSAGE_TYPE) continue;
-			const details = message.details;
-			if (!isRecord(details) || !isStringList(details.added) || !isStringList(details.removed)) continue;
-			for (const name of details.added) known.add(name);
-			for (const name of details.removed) known.delete(name);
+			applyNameNotice(known, message.details);
 		}
 		const live = this.getActiveToolNames();
 		const liveNames = new Set(live);
@@ -2853,23 +2927,44 @@ export class SessionTools {
 	}
 
 	/**
-	 * The notices derived from the context that a request lacks, given its `messages` and `systemPrompt`: each one
-	 * {@link #xdevMountNotice} (unless a prompt deferred it, see {@link takeXdevMountNotice}),
-	 * {@link takeToolRosterNotice}, {@link takeEvalPreludeNotice}, {@link takeSessionAgentNotice},
-	 * {@link takeTaskAgentNotice}, {@link takePerCallModelNotice}, {@link takeSkillNotice} and
-	 * {@link takeSettingsNotice} build from them. The prompt carries them before its message; a request whose context
-	 * lost one since (a compaction between tool calls) or that a change since leaves untold gets it here.
+	 * The notices derived from the context that a request lacks, given its custom messages `byType`, its
+	 * `systemPrompt` and the enabled tool names: {@link #xdevMountNotice} (unless a prompt deferred it, see
+	 * {@link takeXdevMountNotice}), {@link takeToolRosterNotice} and the {@link historyNotices}, each built from the
+	 * messages of its own kind. The prompt carries them before its message; a request whose context lost one since (a
+	 * compaction between tool calls) or that a change since leaves untold gets it here.
 	 */
-	missingContextNotices(messages: readonly AgentMessage[], systemPrompt: readonly string[]): AgentMessage[] {
+	missingContextNotices(
+		byType: CustomMessagesByType,
+		systemPrompt: readonly string[],
+		enabledToolNames: readonly string[],
+	): AgentMessage[] {
 		return [
-			this.#xdevMountNoticeDeferred ? undefined : this.#xdevMountNotice(messages, systemPrompt),
-			this.takeToolRosterNotice(messages, systemPrompt),
-			this.takeEvalPreludeNotice(messages),
-			this.takeSessionAgentNotice(messages),
-			this.takeTaskAgentNotice(messages),
-			this.takePerCallModelNotice(messages),
-			this.takeSkillNotice(messages),
-			this.takeSettingsNotice(messages),
+			this.#xdevMountNoticeDeferred
+				? undefined
+				: this.#xdevMountNotice(customMessagesOf(byType, XDEV_MOUNT_NOTICE_MESSAGE_TYPE), systemPrompt),
+			this.takeToolRosterNotice(customMessagesOf(byType, TOOL_ROSTER_NOTICE_MESSAGE_TYPE), systemPrompt),
+			...this.historyNotices(byType, enabledToolNames),
+		].filter(notice => notice !== undefined);
+	}
+
+	/**
+	 * The notices of what changed since the prompt the model holds in the eval preludes
+	 * ({@link takeEvalPreludeNotice}), the session's and the discovered agents ({@link takeSessionAgentNotice},
+	 * {@link takeTaskAgentNotice}), the per-call models ({@link takePerCallModelNotice}), the skills
+	 * ({@link takeSkillNotice}) and a held settings change ({@link takeSettingsNotice}), each built from the messages
+	 * of its own kind in `byType` (the agent's context unless given) and the enabled tool names.
+	 */
+	historyNotices(
+		byType: CustomMessagesByType = customMessagesByType(this.#host.agent.state.messages),
+		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
+	): AgentMessage[] {
+		return [
+			this.takeEvalPreludeNotice(customMessagesOf(byType, EVAL_PRELUDE_NOTICE_MESSAGE_TYPE)),
+			this.takeSessionAgentNotice(customMessagesOf(byType, SESSION_AGENT_NOTICE_TYPE)),
+			this.takeTaskAgentNotice(customMessagesOf(byType, TASK_AGENT_NOTICE_MESSAGE_TYPE), enabledToolNames),
+			this.takePerCallModelNotice(customMessagesOf(byType, PER_CALL_MODEL_NOTICE_MESSAGE_TYPE), enabledToolNames),
+			this.takeSkillNotice(customMessagesOf(byType, SKILL_NOTICE_MESSAGE_TYPE), enabledToolNames),
+			this.takeSettingsNotice(customMessagesOf(byType, SETTINGS_NOTICE_MESSAGE_TYPE)),
 		].filter(notice => notice !== undefined);
 	}
 
@@ -2958,8 +3053,9 @@ export class SessionTools {
 	 */
 	takeTaskAgentNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
 	): CustomMessage<AgentNoticeDetails> | undefined {
-		if (!this.getEnabledToolNames().includes("task")) return undefined;
+		if (!enabledToolNames.includes("task")) return undefined;
 		const committed = this.#promptSurface.discoveredAgents;
 		const live = publishedAgentDiscovery(this.#host.sessionManager.getCwd(), this.#host.effectiveExtensionRoots());
 		// Without a committed scan the description lists the latest one itself.
@@ -3031,11 +3127,12 @@ export class SessionTools {
 	 */
 	takePerCallModelNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
 	): CustomMessage<PerCallModelAdvertisement> | undefined {
 		const settings = this.#host.settings;
 		let known = this.#promptSurface.perCallModels;
 		// Without a committed snapshot the descriptions list the live approvals themselves.
-		if (!known || !this.#perCallModelsAdvertised(this.getEnabledToolNames())) return undefined;
+		if (!known || !this.#perCallModelsAdvertised(enabledToolNames)) return undefined;
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== PER_CALL_MODEL_NOTICE_MESSAGE_TYPE) continue;
 			if (isPerCallModelAdvertisement(message.details)) known = message.details;
@@ -3061,9 +3158,10 @@ export class SessionTools {
 	 */
 	takeSkillNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
+		enabledToolNames: readonly string[] = this.getEnabledToolNames(),
 	): CustomMessage<SkillNoticeDetails> | undefined {
 		if (cfgSkillful.get(this.#host.settings) !== true) return undefined;
-		if (!this.getEnabledToolNames().some(name => toolReadsSkillUris(this.getToolByName(name)))) return undefined;
+		if (!enabledToolNames.some(name => toolReadsSkillUris(this.getToolByName(name)))) return undefined;
 		const listed = (skills: readonly Skill[]) => skills.filter(skill => skill.hide !== true);
 		const known = new Map(listed(this.#promptSkills).map(skill => [skill.name, skill.description]));
 		for (const message of messages) {
@@ -3150,35 +3248,9 @@ export class SessionTools {
 		const known = new Set(this.#promptListing(systemPrompt).xdevNames);
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== XDEV_MOUNT_NOTICE_MESSAGE_TYPE) continue;
-			const details = message.details;
-			if (isRecord(details) && isStringList(details.added) && isStringList(details.removed)) {
-				for (const name of details.added) known.add(name);
-				for (const name of details.removed) known.delete(name);
-				continue;
-			}
-			// Releases before structured notice details persisted only the rendered
-			// prompt. Replay its two stable inventory sections so the first resume
-			// after upgrading does not re-announce every dynamic device once.
-			if (typeof message.content !== "string") continue;
-			let section: "added" | "removed" | undefined;
-			for (const line of message.content.split("\n")) {
-				if (line === "These tools became available:") {
-					section = "added";
-					continue;
-				}
-				if (line.startsWith("No longer mounted")) {
-					section = "removed";
-					continue;
-				}
-				if (line === "Configured inline device docs:" || line === "</system-notice>") break;
-				if (line.startsWith("Read `xd://<tool>`")) {
-					section = undefined;
-					continue;
-				}
-				if (!section) continue;
-				const match = /^- xd:\/\/(\S+?)(?:\s+—|$)/.exec(line);
-				const name = match?.[1];
-				if (!name) continue;
+			if (applyNameNotice(known, message.details)) continue;
+			// A notice an older release saved without structured details: replay what its text lists.
+			for (const [section, name] of legacyMountNoticeLines(message)) {
 				if (section === "added") known.add(name);
 				else known.delete(name);
 			}
@@ -3588,9 +3660,7 @@ export class SessionTools {
 			const own = this.#declaredOwners.get(tool) ?? tool;
 			const fields = kept.get(own.name);
 			const declaration = toolDeclaration(own);
-			return fields && declaration !== toolDeclaration({ ...fields, name: own.name, label: own.label })
-				? [{ own, declaration }]
-				: [];
+			return fields && declaration !== keptDeclaration(own, fields) ? [{ own, declaration }] : [];
 		});
 		if (altered.length === 0) return [];
 		return changes.filter(({ setting, previous }) =>
@@ -3899,7 +3969,7 @@ export class SessionTools {
 				};
 			}
 			// A recall a system block would carry only by rewriting the cached prompt rides the conversation as a hidden
-			// message (`setHiddenMemoryRecall`): a reused one the branch delivered that way, even on resume, and a fresh
+			// message (`adoptMemoryRecall`): a reused one the branch delivered that way, even on resume, and a fresh
 			// one after a prefix-bound model answered a prompt sent without it, where a new block would have the
 			// provider write the whole conversation to its cache again and drop its replayed thinking. Each request
 			// sends it where its context lacks it, and a prompt rebuild leaves it out of the memory instructions
@@ -3967,15 +4037,14 @@ export class SessionTools {
 	 * the branch's and the one this turn delivers. A fresh recall carries none.
 	 */
 	#adoptMemoryRecall(memory: MemoryPromptPreparation, hidden: string | undefined): void {
-		this.#host.setHiddenMemoryRecall(hidden);
 		if (!memory.reused) {
-			this.#host.setMemoryRecallChanges([]);
+			this.#host.adoptMemoryRecall(hidden, []);
 			return;
 		}
 		const changes = findDeliveredRecallChanges(this.#host.sessionManager.getBranchView());
 		const notice = memory.notice;
 		if (notice && !changes.some(report => report.content === notice.content)) changes.push(notice);
-		this.#host.setMemoryRecallChanges(changes);
+		this.#host.adoptMemoryRecall(hidden, changes);
 	}
 
 	/**

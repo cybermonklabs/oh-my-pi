@@ -372,8 +372,7 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 	if (!state) return false;
 	// The fresh state recalls afresh at the next turn: the old state's recall goes out in no later request, and a
 	// destination with no recall injection must not reuse the source bank's prompt.
-	session.forgetMemoryRecall();
-	await session.refreshBaseSystemPrompt();
+	await session.withdrawMemoryRecall();
 	return true;
 }
 

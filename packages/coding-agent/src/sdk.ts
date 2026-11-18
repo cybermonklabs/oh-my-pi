@@ -4187,6 +4187,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// pruning) must agree: every prompt rebuild re-syncs the agent's pruning.
 		const resolveInlineToolDescriptors = (source: Settings): boolean =>
 			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(source), (agent?.state.model ?? model)?.id);
+		// The settings the requests read: the live ones, or while a held settings change keeps the bound prompt, the
+		// ones it was sent with.
+		const requestSettings = (): Settings => (hasSession ? session.requestSettings : settings);
 		// Latest memory backend instructions rendered for advisor system prompts.
 		// Populated by the initial rebuildSystemPrompt below (before the session is
 		// constructed) and refreshed on every later rebuild via
@@ -4294,12 +4297,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
 			const inlineToolDescriptors = resolveInlineToolDescriptors(settings);
 			// Unset only during the initial build; the agent is constructed with them. The request switches follow
-			// the settings the requests read: the live ones, or while a held settings change keeps the bound prompt,
-			// the ones it was sent with, so a switch changes with the prompt that describes it.
+			// the settings the requests read, so a switch changes with the prompt that describes it.
 			if (agent) {
-				const requestSettings = hasSession ? session.requestSettings : settings;
-				agent.pruneToolDescriptions = resolveInlineToolDescriptors(requestSettings);
-				agent.intentTracing = cfgToolsIntentTracing.get(requestSettings);
+				const source = requestSettings();
+				agent.pruneToolDescriptions = resolveInlineToolDescriptors(source);
+				agent.intentTracing = cfgToolsIntentTracing.get(source);
 			}
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
@@ -4985,8 +4987,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Per request against the model actually requested, so `tools.format`
 			// changes and model switches reach the next provider call; a change a
 			// held settings rebuild keeps from the bound prompt waits for the rebuild.
-			dialectResolver: dialectModel =>
-				resolveDialect(cfgToolsFormat.get(hasSession ? session.requestSettings : settings), dialectModel),
+			dialectResolver: dialectModel => resolveDialect(cfgToolsFormat.get(requestSettings()), dialectModel),
 			abortOnFabricatedToolResult: cfgToolsAbortOnFabricatedResult.get(settings),
 			speculativeToolExecution,
 			getToolChoice: () => session?.nextToolChoiceDirective(),

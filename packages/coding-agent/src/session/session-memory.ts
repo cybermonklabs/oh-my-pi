@@ -92,10 +92,10 @@ export class SessionMemory {
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
 			createMemoryTools?: () => Promise<AgentTool[]>;
-			/** The recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
-			hiddenRecall?: string;
-			/** The reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
-			recallChanges?: readonly RecallChangesReport[];
+			/** Reads the recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
+			hiddenRecall?: () => string | undefined;
+			/** Reads the reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
+			recallChanges?: () => readonly RecallChangesReport[];
 		},
 	) {
 		this.#host = host;
@@ -103,11 +103,10 @@ export class SessionMemory {
 		this.#memoryTaskDepth = options.memoryTaskDepth ?? 0;
 		this.#createMemoryTools = options.createMemoryTools;
 		// Only Hindsight and Mnemopi recall into the conversation: under another backend, or with memory off, the
-		// transcript's recall is history the session does not send again.
+		// transcript's recall is history the session does not send again, and its branch is not read for it.
 		const backend = cfgMemoryBackend.get(host.settings);
 		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
-			this.#hiddenRecall = options.hiddenRecall;
-			this.#recallChanges = options.recallChanges ?? [];
+			this.adoptRecall(options.hiddenRecall?.(), options.recallChanges?.() ?? []);
 		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
@@ -213,25 +212,19 @@ export class SessionMemory {
 		return this.#hiddenRecall;
 	}
 
-	/** Records where the recall the backend just adopted goes: `recall` rides the messages, undefined when it does not. */
-	setHiddenRecall(recall: string | undefined): void {
-		this.#hiddenRecall = recall;
+	/**
+	 * Records what the recall the backend just adopted leaves the conversation carrying: `hidden` rides the messages
+	 * (undefined when it does not), with the reports of what changed in a reused recall's memories (none for a fresh
+	 * one). `adoptRecall(undefined, [])` withdraws the conversation's recall, which no later request sends.
+	 */
+	adoptRecall(hidden: string | undefined, changes: readonly RecallChangesReport[]): void {
+		this.#hiddenRecall = hidden;
+		this.#recallChanges = changes;
 	}
 
 	/** The reports of what changed in a reused recall's memories that the conversation carries, oldest first. */
 	get recallChanges(): readonly RecallChangesReport[] {
 		return this.#recallChanges;
-	}
-
-	/** Records the reports the recall the backend just adopted carries: a reused one's, none for a fresh one. */
-	setRecallChanges(changes: readonly RecallChangesReport[]): void {
-		this.#recallChanges = changes;
-	}
-
-	/** Withdraws the conversation's recall: the hidden one and the change reports, which no later request sends. */
-	forgetRecall(): void {
-		this.#hiddenRecall = undefined;
-		this.#recallChanges = [];
 	}
 
 	/** Rekeys every active memory backend to the current provider session. */
@@ -278,7 +271,7 @@ export class SessionMemory {
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */
 	async resetContextForNewTranscript(): Promise<void> {
 		// The new transcript does not carry the old one's recall, and the backend recalls afresh for it.
-		this.forgetRecall();
+		this.adoptRecall(undefined, []);
 		const hadPromotedMemoryPrompt = this.#baseSystemPromptBeforeMemoryPromotion !== undefined;
 		const resetHindsight = this.#resetHindsightConversationTrackingIfHindsight();
 		const resetMnemopi = this.#resetMnemopiConversationTrackingIfMnemopi();
@@ -381,7 +374,7 @@ export class SessionMemory {
 		try {
 			await this.#disposeMemoryBackendState(true, retain);
 			// The backend starts again without a recall and recalls afresh at the next turn.
-			this.forgetRecall();
+			this.adoptRecall(undefined, []);
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);

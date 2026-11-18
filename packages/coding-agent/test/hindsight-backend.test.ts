@@ -96,7 +96,7 @@ function makeFakeSession(deps: FakeSessionDeps) {
 			return () => listeners.delete(listener);
 		},
 		refreshBaseSystemPrompt: vi.fn().mockResolvedValue(undefined),
-		forgetMemoryRecall: () => {},
+		withdrawMemoryRecall: vi.fn().mockResolvedValue(undefined),
 		emitNotice: () => {},
 		settleMemoryBackend: async () => {},
 		getHindsightSessionState: () => hindsightState,
