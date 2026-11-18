@@ -2904,11 +2904,12 @@ export class TurnRecovery {
 		} = this.#activeRetryFallback;
 		const originalSelector = parseRetryFallbackSelector(originalSelectorRaw, this.#host.modelRegistry);
 		if (!originalSelector) {
-			// Defensive: the stored selector is always produced by
-			// `formatRetryFallbackSelector`, so it should never fail to parse. If it
-			// somehow does, nothing is restored and the session keeps running on the
-			// fallback — so drop the chain record but NOT `#fallbackRouted`, whose
-			// clearing would report the fallback's remaining turns as the primary.
+			// Defensive: the stored selector is a model's `formatRetryFallbackSelector`
+			// string or, for a fallback picked at startup, the configured role
+			// string. If it does not parse, nothing is restored and the session keeps
+			// running on the fallback — so drop the chain record but NOT
+			// `#fallbackRouted`, whose clearing would report the fallback's remaining
+			// turns as the primary.
 			this.#activeRetryFallback = undefined;
 			return false;
 		}
