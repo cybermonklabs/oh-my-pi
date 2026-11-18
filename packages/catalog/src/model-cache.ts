@@ -837,10 +837,11 @@ export interface CacheWriteOrdering {
 	 */
 	ticket?: number;
 	/**
-	 * The rows merge fetched data with cached rows the caller read before its
-	 * fetch (one of its sources failed). Such a write is also skipped once a
-	 * partial write with a later ticket has written, and it raises only the
-	 * partial mark, so it never stops a complete write with an earlier ticket.
+	 * The rows are not an authoritative catalog: a source failed, so they merge
+	 * cached rows the caller read before its fetch, or the endpoint answered an
+	 * empty list. Such a write is also skipped once a partial write with a later
+	 * ticket has written, and it raises only the partial mark, so it never stops
+	 * an authoritative complete write with an earlier ticket.
 	 */
 	partial?: boolean;
 	/**

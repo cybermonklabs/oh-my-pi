@@ -469,7 +469,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dbPath,
 				staticModels,
 				restorableHeaderFallback,
-				{ ticket: writeTicket, partial: !remoteResolutionComplete, completeMarkAtRead },
+				// Only an authoritative complete catalog takes the complete write order.
+				{ ticket: writeTicket, partial: !remoteResolutionComplete || !cacheAuthoritative, completeMarkAtRead },
 			);
 		} else {
 			// Remote fetch failed. Re-persist any prior catalog as a

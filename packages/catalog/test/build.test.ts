@@ -2220,6 +2220,18 @@ describe("model cache materialized round trip", () => {
 				partial: true,
 			});
 			expect(storedIds()).toEqual(["older-model"]);
+			// A copy with an earlier ticket, written after a later partial write, is stale.
+			const eighth = takeModelCacheWriteTicket(providerId, dbPath);
+			const ninth = takeModelCacheWriteTicket(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 4_500_000, [newer], false, "", dbPath, [], undefined, {
+				ticket: ninth,
+				partial: true,
+			});
+			await writeModelCacheInSlices(providerId, 5_000_000, [older], false, "", dbPath, [], undefined, {
+				ticket: eighth,
+				copy: true,
+			});
+			expect(storedIds()).toEqual(["newer-model"]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
@@ -2542,6 +2554,7 @@ describe("model cache materialized round trip", () => {
 		);
 		let clock = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		const staleBefore = getModelCacheWriteStats().staleWrites;
 		try {
 			// The first partial refresh fetches first and builds 300 models.dev rows over many turns.
 			const first = resolveProviderModels(
@@ -2562,10 +2575,86 @@ describe("model cache materialized round trip", () => {
 			await Promise.all([first, second]);
 			vi.restoreAllMocks();
 			const ids = readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id) ?? [];
-			expect({ second: ids.includes("second-model"), first: ids.includes("first-model-0") }).toEqual({
-				second: true,
-				first: false,
-			});
+			expect({
+				second: ids.includes("second-model"),
+				first: ids.includes("first-model-0"),
+				staleFirst: getModelCacheWriteStats().staleWrites - staleBefore,
+			}).toEqual({ second: true, first: false, staleFirst: 1 });
+		} finally {
+			vi.restoreAllMocks();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a complete refresh whose endpoint answered nothing does not replace a later-fetched partial refresh", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-empty-endpoint-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "empty-endpoint-test";
+		const { promise: emptyFetched, resolve: markEmptyFetched } = Promise.withResolvers<void>();
+		writeModelCache(
+			providerId,
+			500_000,
+			[buildModel(completionsSpec({ id: "prior-model", provider: providerId }))],
+			false,
+			"",
+			dbPath,
+		);
+		let clock = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => (clock += 1));
+		const staleBefore = getModelCacheWriteStats().staleWrites;
+		try {
+			// The endpoint answers an empty list first; models.dev's 300 rows build over many turns.
+			// The refresh is complete but not authoritative, and its catalog is empty.
+			const empty = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_000_000,
+					modelsDev: {
+						fetch: async () => null,
+						map: () =>
+							Array.from({ length: 300 }, (_, index) =>
+								completionsSpec({ id: `dev-model-${index}`, provider: providerId }),
+							),
+					},
+					fetchDynamicModels: async () => {
+						setTimeout(markEmptyFetched, 0);
+						return [];
+					},
+				},
+				"online",
+			);
+			// A partial refresh fetches a timer later (models.dev answers one row, the endpoint fails) and writes first.
+			const partial = resolveProviderModels(
+				{
+					providerId,
+					staticModels: [],
+					dynamicModelsAuthoritative: true,
+					cacheDbPath: dbPath,
+					now: () => 1_100_000,
+					modelsDev: {
+						fetch: async () => {
+							await emptyFetched;
+							return null;
+						},
+						map: () => [completionsSpec({ id: "partial-model", provider: providerId })],
+					},
+					fetchDynamicModels: async () => {
+						await emptyFetched;
+						return null;
+					},
+				},
+				"online",
+			);
+			await Promise.all([empty, partial]);
+			vi.restoreAllMocks();
+			// Upstream wrote the empty refresh first and the partial one over it.
+			const ids = readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id) ?? [];
+			expect({
+				ids: ids.toSorted(),
+				staleEmpty: getModelCacheWriteStats().staleWrites - staleBefore,
+			}).toEqual({ ids: ["partial-model", "prior-model"], staleEmpty: 1 });
 		} finally {
 			vi.restoreAllMocks();
 			await fs.rm(tempDir, { recursive: true, force: true });
