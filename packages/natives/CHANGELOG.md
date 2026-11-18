@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `grep` and `rg` no longer end with `internal error` and print nothing when a shell running on a single-threaded runtime (the Windows fallback when no worker thread can start) pipes their input or output to another command
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

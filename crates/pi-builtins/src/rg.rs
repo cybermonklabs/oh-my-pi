@@ -1750,7 +1750,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	clippy::too_many_arguments,
 	reason = "gathers the shared state of one operand's searches"
 )]
-fn dir_search<M: Clone>(
+async fn dir_search<M: Clone>(
 	host: &Host,
 	cli: &Rg,
 	matcher: &M,
@@ -1766,7 +1766,7 @@ fn dir_search<M: Clone>(
 		fs: host.vfs(),
 		halt: halt.flag(),
 		direct,
-		stdout: host.stdout_file(),
+		stdout: host.stdout_file().await,
 		search_zip: cli.search_zip && !cli.no_search_zip,
 		opts: opts.clone(),
 		matcher: matcher.clone(),
@@ -1805,7 +1805,8 @@ async fn search_dir<M: Matcher<Captures: Send> + Clone + Send + Sync + 'static, 
 	let line_buffered = cli.line_buffered && !cli.no_line_buffered;
 	let workers = if line_buffered { 1 } else { parallelism };
 	let halt = HaltOnDrop::new();
-	let shared = dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false);
+	let shared =
+		dir_search(host, cli, matcher, searcher, operand, root, show_names, opts, &halt, false).await;
 	let mut any_match = false;
 	let mut failed = None;
 	let mut pace = host.output_pace();
@@ -1915,7 +1916,7 @@ async fn list_files<W: Write>(
 	let no_messages = cli.no_messages && !cli.messages;
 	let filters = build_path_filters(host, cli).await;
 	let fs = host.vfs();
-	let stdout = host.stdout_file();
+	let stdout = host.stdout_file().await;
 	let mut any = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
@@ -2155,7 +2156,8 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 					opts,
 					&halt,
 					true,
-				);
+				)
+				.await;
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
 				let path = resolved.clone();

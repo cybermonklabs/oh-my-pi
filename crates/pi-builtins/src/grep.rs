@@ -1361,7 +1361,7 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 		matcher:  matcher.clone(),
 		searcher: searcher.clone(),
 		opts:     opts.clone(),
-		stdout:   host.stdout_file(),
+		stdout:   host.stdout_file().await,
 	});
 	let mut any = false;
 	let mut failed = None;
@@ -1701,7 +1701,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 			// `--label` names standard input everywhere else, so it names it
 			// in the refusal diagnostic too.
 			let input_name = cli.label.as_deref().unwrap_or_else(|| OsStr::new("(standard input)"));
-			if opts.refuse_output_file && host.stdin_is_stdout() {
+			if opts.refuse_output_file && host.stdin_is_stdout().await {
 				// GNU grep refuses standard input that is the file its output
 				// lands in: the matches it writes would be read back and
 				// matched again, so the input is never read.
@@ -1787,7 +1787,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 					matcher:  matcher.clone(),
 					searcher: builder.clone(),
 					opts:     opts.clone(),
-					stdout:   host.stdout_file(),
+					stdout:   host.stdout_file().await,
 				};
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.

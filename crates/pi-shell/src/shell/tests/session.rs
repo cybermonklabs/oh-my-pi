@@ -160,6 +160,45 @@ async fn session_runs_pipelines_on_a_current_thread_runtime() {
 	assert!(output.trim_end().ends_with('1'), "output: {output:?}");
 }
 
+/// grep and rg run on the session's runtime, and each asks whether an input
+/// is the file its output lands in. On a current-thread runtime that check
+/// must not block the only thread: it read the identity of a pipe end (stdin
+/// from `printf`, stdout into `cat`) with pi-vfs's blocking `File::metadata`,
+/// which panics there, so grep and rg ended with an internal error.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn grep_and_rg_check_their_output_file_on_a_current_thread_runtime() {
+	let root = tempfile::tempdir().expect("scratch directory");
+	std::fs::create_dir(root.path().join("d")).expect("create d");
+	std::fs::write(root.path().join("d/f"), "x\ny\n").expect("write d/f");
+	let _guard = shell_test_lock().lock().await;
+	let (result, output) = time::timeout(
+		Duration::from_secs(10),
+		capture_unlocked(
+			concat!(
+				"printf 'x\\n' | grep x > out; echo \"grep stdin=$?\"; cat out\n",
+				"grep x d/f | cat; echo \"grep file=$?\"\n",
+				"grep -r x d | cat; echo \"grep dir=$?\"\n",
+				"rg x d/f | cat; echo \"rg search=$?\"\n",
+				"rg --files d | cat; echo \"rg files=$?\"\n",
+			),
+			Some(root.path()),
+			None,
+			CancelToken::default(),
+		),
+	)
+	.await
+	.expect("grep and rg must not block the runtime's only thread");
+
+	assert_eq!(
+		(result.exit_code, output.as_str()),
+		(
+			Some(0),
+			"grep stdin=0\nx\nx\ngrep file=0\nd/f:x\ngrep dir=0\nx\nrg search=0\nd/f\nrg files=0\n"
+		)
+	);
+}
+
 /// A background external command's FIFO redirect is opened by its child,
 /// as in bash: the parent shell spawned it and then waited for the FIFO's
 /// other end, which was the next command, so `/bin/cat < f & echo one > f`
