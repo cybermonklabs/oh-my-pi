@@ -231,6 +231,33 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(continuesCachedPrompt(second, fourth)).toBe(true);
 	}, 30_000);
 
+	it("keeps the held prompt through a skill:// read when the reload only reran skill discovery", async () => {
+		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
+		const projectSkills =
+			"skills:\n  enableCodexUser: false\n  enableClaudeUser: false\n  enableClaudeProject: false\n  enablePiUser: false\n  enableAgentsUser: false\n";
+		const harness = await startSession(tempDir, {
+			toolNames: ["read", "eval"],
+			discoverSkills: true,
+			overlay: projectSkills,
+			replies: { 3: turn => toolCallAnswer(turn, "read", { path: "skill://late-skill" }) },
+		});
+		await harness.session.prompt("first");
+		// `disabledProviders` reruns skill discovery and nothing else: the hold it takes is the skill list's alone.
+		await reloadOverlay(harness, `${OVERLAY}${projectSkills}disabledProviders:\n  - ollama\n`);
+		await harness.session.prompt("second");
+
+		await Bun.write(
+			tempDir.join(".omp/skills/late-skill/SKILL.md"),
+			"---\nname: late-skill\ndescription: A skill installed while the session runs.\n---\n\n# Late skill\n\nThe body of the late skill.\n",
+		);
+		await harness.session.prompt("A skill was installed. Read it.");
+
+		const [, second, third, fourth] = harness.requests;
+		if (!second || !third || !fourth) throw new Error("Expected the requests around the skill read");
+		expect(textOf(fourth.messages.slice(third.messages.length))).toContain("The body of the late skill.");
+		expect(continuesCachedPrompt(second, fourth)).toBe(true);
+	}, 30_000);
+
 	it("keeps the held prompt and tools when an extension registers its tool again unchanged", async () => {
 		using tempDir = TempDir.createSync("@pi-settings-reload-cache-prefix-");
 		let extension: ExtensionAPI | undefined;
