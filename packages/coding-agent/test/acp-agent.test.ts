@@ -697,8 +697,8 @@ describe("ACP agent", () => {
 
 	it("stops the jobs of a session it closes while it serves others, and lets its exit cut them off", async () => {
 		// If this regresses, closing one ACP session while the server goes on cuts off its jobs and those of the idle
-		// subagents its lifecycle teardown releases, as the server's exit does: their subagents record a process exit
-		// that did not happen, and `omp --restore` relaunches their turns.
+		// subagents its end releases, as the server's exit does: their subagents record a process exit that did not
+		// happen, and `omp --restore` relaunches their turns.
 		const harness = await createHarness();
 		const closed = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const kept = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });

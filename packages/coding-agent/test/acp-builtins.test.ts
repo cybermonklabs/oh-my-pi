@@ -1706,8 +1706,8 @@ describe("wave 5 — adapters and polish", () => {
 describe("/move preflight flush", () => {
 	it("disposes the session with a stop of its jobs when headless workspace rollback cannot recover", async () => {
 		// If this regresses, the failed move's end of the session cuts off its jobs and those of the idle subagents its
-		// lifecycle teardown releases, as a process exit does, though the process goes on: their subagents record a
-		// process exit that did not happen, and `omp --restore` relaunches their turns.
+		// end releases, as a process exit does, though the process goes on: their subagents record a process exit that
+		// did not happen, and `omp --restore` relaunches their turns.
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-fatal-"));
 		const originalProjectDir = getProjectDir();
 		const { output, runtime, session } = createRuntime();
