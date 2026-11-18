@@ -238,6 +238,29 @@ describe("/fork terminal placement", () => {
 		expect(await fs.exists(dir)).toBe(false);
 	});
 
+	it("removes the relaunch file its command names when the launch plan is refused", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
+		const file = path.join(dir, "loaded.env");
+		await Bun.write(file, "LOADED='value'\n");
+		// A relative working directory: the request is refused before any terminal starts.
+		const { ctx } = createContext({ cwd: "relative/project" });
+		const launchTerminal = vi.fn();
+		const controller = new CommandController(ctx, {
+			classifyTerminalMultiplexer: () => "tmux",
+			environment: () => ({ TMUX: "server,1,0", TMUX_PANE: "%1" }),
+			launchTerminal,
+			resolveCliEntryCmd: () => ["bun", `--env-file=${file}`, "omp-entry"],
+			getActiveProfile: () => undefined,
+			argv: () => [],
+		});
+
+		await controller.handleForkCommand("pane");
+
+		expect(ctx.showError).toHaveBeenCalledWith("A terminal launch working directory must be an absolute path.");
+		expect(launchTerminal).not.toHaveBeenCalled();
+		expect(await fs.exists(dir)).toBe(false);
+	});
+
 	it("drops a startup --goal and pins the parent's prompt-cache key over a startup one", async () => {
 		const { controller, launchTerminal } = createContext({
 			promptCacheKey: "pinned-parent-key",
@@ -437,6 +460,101 @@ console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
 		expect(forked.commandEnv).toBeNull();
 		expect(forked.commandChild).toBe(path.join(cmdHome, ".omp", "natives"));
 	}, 120_000);
+
+	it.skipIf(process.platform !== "linux")(
+		"gives the fork this session's natives directory when Bun loaded one of the directory rule's inputs",
+		async () => {
+			// The session is a non-compiled omp started with Bun's own `.env` loading: its start
+			// directory's `.env` sets OMP_CONFIG_ROOT, which the fork pins at its launch value (unset)
+			// and the relaunch file then sets again. The XDG cache root appears only after the
+			// session resolved its directory, so a fork that resolved for itself would name it.
+			const controllerTs = path.join(import.meta.dir, "../../../src/modes/controllers/command-controller.ts");
+			const workerClientTs = path.join(import.meta.dir, "../../../src/subprocess/worker-client.ts");
+			const nativesDirJs = path.join(import.meta.dir, "../../../../natives/native/natives-dir.js");
+			const envTs = path.join(import.meta.dir, "../../../../utils/src/env.ts");
+			const home = path.join(tempDirectory, "home");
+			const start = path.join(tempDirectory, "start");
+			const elsewhere = path.join(tempDirectory, "elsewhere");
+			const configRoot = path.join(tempDirectory, "config-root");
+			const xdgCache = path.join(tempDirectory, "xdg-cache");
+			await fs.mkdir(home, { recursive: true });
+			await fs.mkdir(elsewhere, { recursive: true });
+			await fs.mkdir(xdgCache, { recursive: true });
+			await Bun.write(path.join(start, ".env"), `OMP_CONFIG_ROOT=${configRoot}\n`);
+			const fork = path.join(tempDirectory, "fork.ts");
+			await Bun.write(
+				fork,
+				`const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
+// As omp's env.ts does when it loads: it removes the relaunch file.
+await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify({ dir, OMP_CONFIG_ROOT: process.env.OMP_CONFIG_ROOT ?? null }));
+`,
+			);
+			const sessionTs = path.join(tempDirectory, "session.ts");
+			await Bun.write(
+				sessionTs,
+				`const { CommandController } = await import(${JSON.stringify(controllerTs)});
+const { resolveCliEntryCmd } = await import(${JSON.stringify(workerClientTs)});
+const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
+const sessionFile = ${JSON.stringify(sourceSessionFile)};
+let request;
+const ctx = {
+	session: { isStreaming: false, fork: async () => true, flushToDisk: async () => undefined, sessionFile, sessionId: "parent-session-id", agent: {}, model: { provider: "provider", id: "model" }, configuredThinkingLevel: () => undefined },
+	sessionManager: { getHeader: () => undefined, getCwd: () => ${JSON.stringify(elsewhere)}, getSessionFile: () => sessionFile, isSessionOnDisk: () => true, getStorage: () => ({ exists: async () => true }), flush: async () => undefined },
+	settings: { getAgentDir: () => ${JSON.stringify(path.join(home, ".omp/agent"))}, getConfigFiles: () => [] },
+	loadingAnimation: undefined,
+	statusContainer: { disposeChildren() {} },
+	statusLine: { invalidate() {} },
+	ui: { requestRender() {} },
+	present() {},
+	showStatus() {},
+	showWarning(message) { throw new Error(String(message)); },
+	showError(message) { throw new Error(String(message)); },
+	showHookConfirm: async () => false,
+};
+const controller = new CommandController(ctx, {
+	classifyTerminalMultiplexer: () => "tmux",
+	environment: () => ({ ...process.env, TMUX: "server,1,0", TMUX_PANE: "%1" }),
+	launchTerminal: async launch => { request = launch; return { multiplexer: launch.multiplexer, placement: launch.placement }; },
+	// The real relaunch command (and its relaunch file), with the stand-in fork as the entry.
+	resolveCliEntryCmd: () => [...resolveCliEntryCmd().slice(0, -1), ${JSON.stringify(fork)}],
+	getActiveProfile: () => undefined,
+	argv: () => [],
+});
+await controller.handleForkCommand("pane");
+console.log(JSON.stringify({ dir: getNativesDir(), command: request.command }));
+`,
+			);
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				XDG_CACHE_HOME: xdgCache,
+			};
+			for (const name of FORK_NATIVES_DIR_NAMES) if (name !== "XDG_CACHE_HOME") delete env[name];
+			for (const name of ["NODE_ENV", "BUN_ENV", "BUN_OPTIONS"]) delete env[name];
+			const run = async (command: string[], cwd: string) => {
+				const child = Bun.spawn(command, { cwd, env, stdout: "pipe", stderr: "pipe" });
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+				return JSON.parse(stdout);
+			};
+
+			// Bun's own loading on, as the npm package's `#!/usr/bin/env bun` script starts.
+			const session = await run([process.execPath, sessionTs], start);
+			await fs.mkdir(path.join(xdgCache, "omp"), { recursive: true });
+			const forked = await run(session.command, elsewhere);
+
+			expect(session.dir).toBe(path.join(configRoot, "natives"));
+			expect(forked.OMP_CONFIG_ROOT).toBe(configRoot);
+			expect(forked.dir).toBe(session.dir);
+		},
+		120_000,
+	);
 
 	it("launches after a cwd move with the original overlay and configured thinking selector", async () => {
 		const oldCwd = path.join(tempDirectory, "old project");

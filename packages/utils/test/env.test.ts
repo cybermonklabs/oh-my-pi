@@ -358,6 +358,10 @@ describe.skipIf(process.platform !== "linux")("bunRelaunchArgs", () => {
 		"T_EMPTY",
 		"T_UNICODE",
 		"T_TRAILING_BACKSLASH",
+		// Names Bun's parser reads with characters a shell name lacks.
+		"WITH-DASH",
+		"DOT.NAME",
+		"1DIGIT",
 		"LAUNCH_ONLY",
 	];
 	// A process that reports the flags and the values Bun's own `.env` loading gave it.
@@ -399,6 +403,9 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 					"T_EMPTY=",
 					"T_UNICODE=héllo ✓",
 					"T_TRAILING_BACKSLASH=x\\",
+					"WITH-DASH=dash",
+					"DOT.NAME=dot",
+					"1DIGIT=digit",
 				].join("\n"),
 			),
 		);
@@ -408,6 +415,7 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 		const first = run([], trickyDotenvDir());
 		expect(first.env.T_DOLLAR).toBe("cost $5, $" + "{HOME} and $HOME");
 		expect(first.env.T_NEWLINE).toBe("line1\nline2");
+		expect([first.env["WITH-DASH"], first.env["DOT.NAME"], first.env["1DIGIT"]]).toEqual(["dash", "dot", "digit"]);
 		const [flag] = first.args;
 		expect(first.args).toHaveLength(1);
 		const file = flag!.slice("--env-file=".length);
@@ -436,6 +444,135 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), env: values }));`;
 
 	it("is --no-env-file for a process Bun loaded nothing into", () => {
 		expect(run(["--no-env-file"], trickyDotenvDir()).args).toEqual(["--no-env-file"]);
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("the relaunch file's removal", () => {
+	const envTs = path.join(import.meta.dir, "../src/env.ts");
+
+	/** A private temporary directory, standing in for `TMPDIR`. */
+	function tempBase(): string {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-relaunch-"));
+		tempDirs.push(dir);
+		return dir;
+	}
+
+	/** A relaunch directory as `bunRelaunchArgs` makes it, in `parent`. */
+	function relaunchDir(parent: string, name: string): { dir: string; file: string } {
+		const dir = path.join(parent, name);
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, "loaded.env");
+		fs.writeFileSync(file, "LOADED='value'\n", { mode: 0o600 });
+		return { dir, file };
+	}
+
+	/** Start a process that loads `env.ts`, with `base` as its `TMPDIR`, from an empty directory. */
+	function loadEnv(base: string, flags: string[] = []): void {
+		const cwd = tempBase();
+		const env: Record<string, string | undefined> = { ...process.env, TMPDIR: base };
+		const child = Bun.spawnSync([process.execPath, ...flags, "-e", `await import(${JSON.stringify(envTs)});`], {
+			cwd,
+			env,
+			stderr: "pipe",
+		});
+		expect(child.stderr.toString()).toBe("");
+		expect(child.exitCode).toBe(0);
+	}
+
+	it("removes only the relaunch file it was started with and that file's own directory, never recursively", () => {
+		const base = tempBase();
+		const plain = relaunchDir(base, "omp-bun-env-Plain1");
+		// The user's own file beside it: the directory is not only the relaunch file's.
+		const shared = relaunchDir(base, "omp-bun-env-Share1");
+		fs.writeFileSync(path.join(shared.dir, "notes.txt"), "mine\n");
+		// A directory of that name that is not directly in the temporary directory is the user's.
+		const nested = relaunchDir(path.join(base, "projects"), "omp-bun-env-Nest01");
+
+		loadEnv(base, [`--env-file=${plain.file}`]);
+		loadEnv(base, [`--env-file=${shared.file}`]);
+		loadEnv(base, [`--env-file=${nested.file}`]);
+
+		expect(fs.existsSync(plain.dir)).toBe(false);
+		expect(fs.existsSync(shared.file)).toBe(false);
+		expect(fs.readFileSync(path.join(shared.dir, "notes.txt"), "utf8")).toBe("mine\n");
+		expect(fs.existsSync(nested.file)).toBe(true);
+	});
+
+	it("removes, as a session starts, this user's relaunch directories left for more than ten minutes", () => {
+		const base = tempBase();
+		const hourAgo = new Date(Date.now() - 60 * 60_000);
+		const old = relaunchDir(base, "omp-bun-env-Old123");
+		fs.utimesSync(old.dir, hourAgo, hourAgo);
+		const fresh = relaunchDir(base, "omp-bun-env-New123");
+		// A link of that name is not followed, however old it is.
+		const target = relaunchDir(tempBase(), "omp-bun-env-Tgt123");
+		const link = path.join(base, "omp-bun-env-Lnk123");
+		fs.symlinkSync(target.dir, link);
+		fs.lutimesSync(link, hourAgo, hourAgo);
+		// A worker (started with `--no-env-file`) leaves them to its session.
+		const forWorker = relaunchDir(tempBase(), "omp-bun-env-Wrk123");
+		fs.utimesSync(forWorker.dir, hourAgo, hourAgo);
+		loadEnv(path.dirname(forWorker.dir), ["--no-env-file"]);
+		expect(fs.existsSync(forWorker.file)).toBe(true);
+
+		loadEnv(base);
+
+		expect(fs.existsSync(old.dir)).toBe(false);
+		expect(fs.existsSync(fresh.file)).toBe(true);
+		expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(target.file)).toBe(true);
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("bunOptionsWithoutEnvFiles", () => {
+	const envTs = path.join(import.meta.dir, "../src/env.ts");
+
+	/** The arguments Bun takes from `BUN_OPTIONS` (`undefined`: unset) in a process it starts. */
+	function bunOptionsArgs(value: string | undefined, script = "console.log(JSON.stringify(process.execArgv))") {
+		const env: Record<string, string | undefined> = { ...process.env, BUN_OPTIONS: value };
+		if (value === undefined) delete env.BUN_OPTIONS;
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-bun-options-"));
+		tempDirs.push(cwd);
+		const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", script], { cwd, env, stderr: "pipe" });
+		expect(child.stderr.toString()).toBe("");
+		return child.stdout.toString();
+	}
+
+	it.each([
+		['--smol --env-file="a b.env"', ["--smol"]],
+		["--env-file='a b.env' --smol", ["--smol"]],
+		["--env-file a.env --smol", ["--smol"]],
+		["--smol\t--env-file=b.env", ["--smol"]],
+		["--env-file=a.env,b.env", []],
+		["--env-file=a.env --smol --env-file=b.env", ["--smol"]],
+		['"--env-file=b.env" --smol', ["--smol"]],
+		["--conditions='x y' --env-file=\"a b.env\" --smol", ["--conditions='x y'", "--smol"]],
+	] as const)("splits %j as Bun does, and keeps every argument but the env-file ones", (value, kept) => {
+		const result = JSON.parse(
+			bunOptionsArgs(
+				value,
+				`const { bunOptionsWithoutEnvFiles } = await import(${JSON.stringify(envTs)}); console.log(JSON.stringify(bunOptionsWithoutEnvFiles() ?? null));`,
+			),
+		) as string | null;
+		expect(result).not.toBeNull();
+
+		// Bun's own arguments from the new value, before the ones on the command line.
+		const execArgv = JSON.parse(bunOptionsArgs(result === "" ? undefined : (result ?? undefined))) as string[];
+		expect(execArgv.slice(0, execArgv.indexOf("--no-env-file"))).toEqual([...kept]);
+	});
+});
+
+describe("startupEnv", () => {
+	it("is taken once per process, so a second evaluation of its module (a --hot reload) keeps it", () => {
+		const startupEnvTs = path.join(import.meta.dir, "../src/startup-env.ts");
+		const script = `const first = await import(${JSON.stringify(startupEnvTs)});
+process.env.STARTUP_ENV_LATE_PROBE = "late";
+const second = await import(${JSON.stringify(`${startupEnvTs}?again`)});
+console.log(JSON.stringify({ twoModules: first !== second, same: first.startupEnv === second.startupEnv, late: second.startupEnv.STARTUP_ENV_LATE_PROBE ?? null }));`;
+		const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", script], { stderr: "pipe" });
+		expect(child.stderr.toString()).toBe("");
+
+		expect(JSON.parse(child.stdout.toString())).toEqual({ twoModules: true, same: true, late: null });
 	});
 });
 

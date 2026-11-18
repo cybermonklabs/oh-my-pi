@@ -25,7 +25,7 @@ import {
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirInputNames } from "@oh-my-pi/pi-natives/natives-dir";
 import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
-import { discardBunRelaunchFile, launchEnvValue } from "@oh-my-pi/pi-utils/env";
+import { bunRelaunchValue, discardBunRelaunchFile, launchEnvValue } from "@oh-my-pi/pi-utils/env";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
@@ -1606,7 +1606,11 @@ export class CommandController {
 				// `forkScopeEnvCommand` unsets an empty value, so the handoff records it unset.
 				scope[name] = (name in scope ? scope[name] : launchEnvValue(name)) || undefined;
 			}
-			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(scope, { parent: null });
+			// The handoff records the inputs the fork will see: where the scope unsets one, the
+			// relaunch file (`resolveCliEntryCmd`) gives it the value Bun loaded here, if any.
+			const forkInputs: Record<string, string | undefined> = {};
+			for (const name of nativesDirInputNames()) forkInputs[name] = scope[name] ?? bunRelaunchValue(name);
+			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(forkInputs, { parent: null });
 			command = [...forkScopeEnvCommand(scope), ...dependencies.resolveCliEntryCmd(), ...childArgs];
 			const launchPlan = createDefaultTerminalLaunchRequest(
 				multiplexer,

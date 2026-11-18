@@ -18,8 +18,16 @@ const NAMES = [
 	"FROM_MODE_LOCAL",
 	"FROM_A",
 	"FROM_B",
+	"FROM_DQ",
+	"FROM_SQ",
 	"FROM_PIPE",
 	"ONLY_ELSEWHERE",
+	// Names Bun's `.env` parser reads with characters a shell name lacks.
+	"WITH-DASH",
+	"DOT.NAME",
+	"1DIGIT",
+	// The test seam, when a project `.env` sets it.
+	"PI_TEST_NO_LAUNCH_ENV",
 ];
 
 /** The start directory: a file for every mode Bun can pick, and `.env.local`. */
@@ -80,6 +88,10 @@ describe("the CLI started again by /restart", () => {
 		flags?: string[];
 		/** A bash command line that starts the session (`$SESSION` is the script), for a pipe. */
 		shell?: string;
+		/** Values the first launch must have had, so the case is not vacuous. */
+		loads?: Record<string, string>;
+		/** Runtime flags `BUN_OPTIONS` must give the first launch and the restarted process alike. */
+		keeps?: string[];
 	}
 
 	/** Start a session as the case says, let it move and `/restart` itself; both views of its values. */
@@ -99,16 +111,25 @@ describe("the CLI started again by /restart", () => {
 			`// Before any import: what Bun's own loading gave this process.
 const values = () => Object.fromEntries(${JSON.stringify(NAMES)}.map(name => [name, process.env[name] ?? null]));
 const seen = values();
+// The runtime flags other than the env-file ones (a bare --env-file takes the next argument).
+const runtimeFlags = () => {
+	const flags = [];
+	for (let i = 0; i < process.execArgv.length; i++) {
+		const arg = process.execArgv[i];
+		if (arg === "--env-file") i++;
+		else if (!arg.startsWith("--env-file") && arg !== "--no-env-file") flags.push(arg);
+	}
+	return flags;
+};
 if (process.argv[2] === "restarted") {
 	// omp's env.ts removes the private file it was started with as soon as it loads.
 	await import(${JSON.stringify(workerClientTs)});
 	const fs = await import("node:fs");
 	const envFiles = process.execArgv.filter(arg => arg.startsWith("--env-file=")).map(arg => arg.slice(11));
-	const keptFlags = process.execArgv.filter(arg => !arg.startsWith("--env-file") && !arg.startsWith("--no-env-file"));
-	console.log(JSON.stringify({ restarted: seen, keptFlags, privateFilesLeft: envFiles.filter(file => /omp-bun-env-/.test(file) && fs.existsSync(file)) }));
+	console.log(JSON.stringify({ restarted: seen, keptFlags: runtimeFlags(), privateFilesLeft: envFiles.filter(file => /omp-bun-env-/.test(file) && fs.existsSync(file)) }));
 	process.exit(0);
 }
-await Bun.write(${JSON.stringify(firstOut)}, JSON.stringify({ seen, flags: process.execArgv.filter(arg => !arg.startsWith("--env-file") && !arg.startsWith("--no-env-file")) }));
+await Bun.write(${JSON.stringify(firstOut)}, JSON.stringify({ seen, flags: runtimeFlags() }));
 for (const [name, text] of Object.entries(${JSON.stringify(c.late ?? {})})) await Bun.write(${JSON.stringify(start)} + "/" + name, text);
 const { declareWorkerHostEntry } = await import(${JSON.stringify(workerHostTs)});
 const { resolveCliEntryCmd } = await import(${JSON.stringify(workerClientTs)});
@@ -118,7 +139,11 @@ declareWorkerHostEntry();
 // The session moved into another project directory (setProjectDir) before /restart.
 process.chdir(${JSON.stringify(elsewhere)});
 const command = resolveCliEntryCmd();
-await Bun.write(${JSON.stringify(path.join(tempRoot, "command.json"))}, JSON.stringify(command));
+// The names the relaunch file holds, read before the new process removes it.
+const fileArg = command.find(arg => arg.startsWith("--env-file="));
+const nodeFs = await import("node:fs");
+const fileNames = fileArg ? nodeFs.readFileSync(fileArg.slice(11), "utf8").split("\\n").filter(Boolean).map(line => line.slice(0, line.indexOf("="))) : null;
+await Bun.write(${JSON.stringify(path.join(tempRoot, "command.json"))}, JSON.stringify({ command, fileNames }));
 // As InteractiveMode.restart() does on POSIX.
 execReplace([...command, "restarted"]);
 `,
@@ -147,14 +172,17 @@ execReplace([...command, "restarted"]);
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 		const { restarted, keptFlags, privateFilesLeft } = JSON.parse(stdout);
 		const first = JSON.parse(await fs.readFile(firstOut, "utf8"));
-		const relaunch: string[] = JSON.parse(await fs.readFile(path.join(tempRoot, "command.json"), "utf8"));
+		const relaunch: { command: string[]; fileNames: string[] | null } = JSON.parse(
+			await fs.readFile(path.join(tempRoot, "command.json"), "utf8"),
+		);
 		return {
 			first: first.seen,
 			firstFlags: first.flags,
 			restarted,
 			keptFlags,
 			privateFilesLeft,
-			relaunch,
+			relaunch: relaunch.command,
+			fileNames: relaunch.fileNames,
 			script,
 			elsewhere,
 			env,
@@ -174,18 +202,83 @@ execReplace([...command, "restarted"]);
 		["bunfig.toml env = false", { extra: { "bunfig.toml": "env = false\n" } }],
 		["an --env-file that is a pipe", { shell: `exec $BUN --env-file=<(printf 'FROM_PIPE=pipe\\n') $SESSION` }],
 		// BUN_OPTIONS applies in every process Bun starts: its other flags stay, its --env-file goes.
-		["BUN_OPTIONS=--smol --env-file=b.env", { env: { BUN_OPTIONS: "--smol --env-file=b.env" } }],
+		[
+			"BUN_OPTIONS=--smol --env-file=b.env",
+			{ env: { BUN_OPTIONS: "--smol --env-file=b.env" }, loads: { FROM_B: "start" }, keeps: ["--smol"] },
+		],
+		// Bun keeps a quoted --env-file value as one argument, quotes and all.
+		[
+			"BUN_OPTIONS with a double-quoted --env-file path that holds a space",
+			{
+				extra: { '"a b.env"': "FROM_DQ=dq\n" },
+				env: { BUN_OPTIONS: '--smol --env-file="a b.env"' },
+				loads: { FROM_DQ: "dq" },
+				keeps: ["--smol"],
+			},
+		],
+		[
+			"BUN_OPTIONS with a single-quoted --env-file path that holds a space",
+			{
+				extra: { "'a b.env'": "FROM_SQ=sq\n" },
+				env: { BUN_OPTIONS: "--env-file='a b.env' --smol" },
+				loads: { FROM_SQ: "sq" },
+				keeps: ["--smol"],
+			},
+		],
+		[
+			"BUN_OPTIONS=--env-file a.env --smol (the value as its own argument)",
+			{ env: { BUN_OPTIONS: "--env-file a.env --smol" }, loads: { FROM_A: "start" }, keeps: ["--smol"] },
+		],
+		[
+			"BUN_OPTIONS separated by a tab",
+			{ env: { BUN_OPTIONS: "--smol\t--env-file=b.env" }, loads: { FROM_B: "start" }, keeps: ["--smol"] },
+		],
+		[
+			"BUN_OPTIONS=--env-file=a.env,b.env",
+			{ env: { BUN_OPTIONS: "--env-file=a.env,b.env" }, loads: { FROM_A: "start", FROM_B: "start" } },
+		],
+		[
+			"BUN_OPTIONS with two --env-files",
+			{
+				env: { BUN_OPTIONS: "--env-file=a.env --smol --env-file=b.env" },
+				loads: { FROM_A: "start", FROM_B: "start" },
+				keeps: ["--smol"],
+			},
+		],
+		[
+			"BUN_OPTIONS with a quoted whole --env-file argument",
+			{ env: { BUN_OPTIONS: '"--env-file=b.env" --smol' }, loads: { FROM_B: "start" }, keeps: ["--smol"] },
+		],
+		// The test seam, set by a file in the repository rather than the user's environment.
+		[
+			"a project .env that sets the test seam",
+			{
+				extra: { ".env": "FROM_ENV=start\nPI_TEST_NO_LAUNCH_ENV=1\n" },
+				loads: { FROM_ENV: "start", FROM_LOCAL: "start", PI_TEST_NO_LAUNCH_ENV: "1" },
+			},
+		],
+		[
+			"names Bun reads with a dash, a dot or a leading digit",
+			{
+				extra: { ".env": "FROM_ENV=start\nWITH-DASH=dash\nDOT.NAME=dot\n1DIGIT=digit\n" },
+				loads: { "WITH-DASH": "dash", "DOT.NAME": "dot", "1DIGIT": "digit" },
+			},
+		],
 	];
 
 	for (const [label, c] of cases) {
 		it.skipIf(process.platform !== "linux")(
 			`starts with the values Bun's own loading gave the first launch: ${label}`,
 			async () => {
-				const { first, firstFlags, restarted, keptFlags, privateFilesLeft } = await restart(c);
+				const { first, firstFlags, restarted, keptFlags, privateFilesLeft, fileNames } = await restart(c);
+				expect(first).toMatchObject(c.loads ?? {});
+				for (const flag of c.keeps ?? []) expect(firstFlags).toContain(flag);
 
 				expect(restarted).toEqual(first);
 				expect(keptFlags).toEqual(firstFlags);
 				expect(privateFilesLeft).toEqual([]);
+				// The relaunch file holds only what Bun loaded, never the rest of the environment.
+				expect((fileNames ?? []).filter(name => !NAMES.includes(name))).toEqual([]);
 			},
 			120_000,
 		);

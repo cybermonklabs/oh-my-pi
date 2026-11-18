@@ -118,22 +118,26 @@ export function stripGitRepoLocationEnv(
 // environment in procfs, which is authoritative everywhere. Elsewhere (a
 // non-compiled omp on macOS or Windows started with Bun's loading on) the launch
 // environment cannot be read: neither procfs nor the addon gives it.
-// `PI_TEST_NO_LAUNCH_ENV=1` makes it unreadable here too, for tests of that case.
+// `PI_TEST_NO_LAUNCH_ENV=1` in the launch environment itself (never a value a
+// `.env` file gave) makes it unreadable here too, for tests of that case.
 function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 	const startedWithoutBunEnv = isCompiledBinary() || process.execArgv.includes("--no-env-file");
-	if (startupEnv.PI_TEST_NO_LAUNCH_ENV === "1" && !startedWithoutBunEnv) return undefined;
+	let values: Map<string, string> | undefined;
 	if (process.platform === "linux") {
 		try {
-			const values = new Map<string, string>();
+			values = new Map();
 			for (const entry of fs.readFileSync("/proc/self/environ", "utf8").split("\0")) {
 				const separator = entry.indexOf("=");
 				if (separator > 0) values.set(entry.slice(0, separator), entry.slice(separator + 1));
 			}
-			return values;
-		} catch {}
+		} catch {
+			values = undefined;
+		}
 	}
-	if (!startedWithoutBunEnv) return undefined;
-	return new Map(Object.entries(startupEnv));
+	if (!values && startedWithoutBunEnv) values = new Map(Object.entries(startupEnv));
+	if (!values) return undefined;
+	if (values.get("PI_TEST_NO_LAUNCH_ENV") === "1" && !startedWithoutBunEnv) return undefined;
+	return values;
 }
 
 const launchEnvValues = readLaunchEnv();
@@ -161,55 +165,221 @@ const bunLoadedEnv: Readonly<Record<string, string>> | undefined = launchEnvValu
 		)
 	: undefined;
 
-/** The private file `bunRelaunchArgs` writes: `<tmp>/omp-bun-env-XXXXXX/loaded.env`. */
+/** The private file `bunRelaunchArgs` writes: `<base>/omp-bun-env-XXXXXX/loaded.env`. */
 const RELAUNCH_ENV_DIR_RE = /^omp-bun-env-[A-Za-z0-9]{6}$/;
 const RELAUNCH_ENV_FILE = "loaded.env";
+/** Age after which a relaunch file nobody removed counts as left by a start that died. */
+const RELAUNCH_ENV_STALE_MS = 10 * 60_000;
 
-function isRelaunchEnvFile(file: string): boolean {
-	return path.basename(file) === RELAUNCH_ENV_FILE && RELAUNCH_ENV_DIR_RE.test(path.basename(path.dirname(file)));
+/**
+ * The directories a relaunch file's directory may sit directly in: the temporary directory,
+ * then `/tmp`, each absolute and with no comma in its path (Bun splits an `--env-file` at
+ * commas). `bunRelaunchArgs` writes in the first that exists.
+ */
+function relaunchEnvBases(): string[] {
+	const bases: string[] = [];
+	for (const dir of [os.tmpdir(), "/tmp"]) {
+		const base = path.resolve(dir);
+		if (path.isAbsolute(dir) && !base.includes(",") && !bases.includes(base)) bases.push(base);
+	}
+	return bases;
 }
 
-/** The relaunch files a command names (`--env-file=<file>`). */
-function relaunchEnvFiles(args: readonly string[]): string[] {
-	return args
-		.filter(arg => arg.startsWith("--env-file="))
-		.map(arg => arg.slice("--env-file=".length))
-		.filter(isRelaunchEnvFile);
+/**
+ * Remove the relaunch directory `dir` and its `loaded.env`, and nothing else: only a real
+ * directory of this user, never through a link, and never one that holds another file (its
+ * `rmdir` then fails and it stays).
+ */
+function removeRelaunchEnvDir(dir: string): void {
+	try {
+		const stat = fs.lstatSync(dir);
+		if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) return;
+		const file = path.join(dir, RELAUNCH_ENV_FILE);
+		const fileStat = fs.lstatSync(file, { throwIfNoEntry: false });
+		if (fileStat?.isFile()) fs.unlinkSync(file);
+		fs.rmdirSync(dir);
+	} catch {
+		// Gone already, another user's, or not only ours: leave it.
+	}
 }
 
-/** Remove the private relaunch file a command names, with its directory: for a start that failed. */
+/**
+ * Remove the private relaunch file a command names (`--env-file=<base>/omp-bun-env-XXXXXX/
+ * loaded.env`, directly under one of {@link relaunchEnvBases}), with its directory: for a
+ * start that failed, and by the new process as it starts. A file of that name anywhere else
+ * is the user's, and stays.
+ */
 export function discardBunRelaunchFile(args: readonly string[]): void {
-	for (const file of relaunchEnvFiles(args)) fs.rmSync(path.dirname(file), { recursive: true, force: true });
+	const bases = relaunchEnvBases();
+	for (const arg of args) {
+		if (!arg.startsWith("--env-file=")) continue;
+		const file = arg.slice("--env-file=".length);
+		const dir = path.dirname(file);
+		if (path.basename(file) !== RELAUNCH_ENV_FILE || !RELAUNCH_ENV_DIR_RE.test(path.basename(dir))) continue;
+		if (bases.includes(path.dirname(dir))) removeRelaunchEnvDir(dir);
+	}
+}
+
+/**
+ * Remove this user's relaunch directories older than {@link RELAUNCH_ENV_STALE_MS} under the
+ * bases: those of a new process that died before this module loaded, or of a fork pane that
+ * never ran omp. Only a non-compiled omp on Linux writes them, so only such a session start
+ * (not a worker, which starts with `--no-env-file`) looks.
+ */
+function sweepStaleRelaunchEnvDirs(): void {
+	if (process.platform !== "linux" || isCompiledBinary() || process.execArgv.includes("--no-env-file")) return;
+	const now = Date.now();
+	for (const base of relaunchEnvBases()) {
+		let names: string[];
+		try {
+			names = fs.readdirSync(base);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (!RELAUNCH_ENV_DIR_RE.test(name)) continue;
+			const dir = path.join(base, name);
+			const stat = fs.lstatSync(dir, { throwIfNoEntry: false });
+			if (stat && now - stat.mtimeMs > RELAUNCH_ENV_STALE_MS) removeRelaunchEnvDir(dir);
+		}
+	}
 }
 
 // A process started with a relaunch file (`/restart`, a `/fork` session) removes it now: Bun
-// read it before any JavaScript ran, and nothing needs it again.
+// read it before any JavaScript ran, and nothing needs it again. Then the ones nobody removed.
 discardBunRelaunchFile(process.execArgv);
+sweepStaleRelaunchEnvDirs();
+
+/** Whether `ch` is whitespace to Bun's `BUN_OPTIONS` splitter (Rust's `is_ascii_whitespace`). */
+function isBunOptionsSpace(ch: string | undefined): boolean {
+	return ch === " " || ch === "\t" || ch === "\n" || ch === "\f" || ch === "\r";
+}
+
+/** One argument as Bun 1.4.4 splits it out of `BUN_OPTIONS`: its source text and its value. */
+interface BunOptionsToken {
+	/** The token's text in `BUN_OPTIONS`: joined by single spaces, the kept tokens split the same. */
+	source: string;
+	/** The argument Bun's argument parser receives. */
+	arg: string;
+}
 
 /**
- * `BUN_OPTIONS` as the process was started with it, without the `--env-file`s it names, for a
- * process that starts the CLI again (`/restart`, a `/fork` session); undefined when it names
- * none, or when the launch environment cannot be read (the relaunch is then the pre-PR
- * command, `bunRelaunchArgs`). Bun reads `BUN_OPTIONS` in every process it starts and would
- * read such a file again, from the directory the new process starts in; the values it gave
- * this process are in the relaunch file already (`bunRelaunchArgs`). Bun splits the value at
- * whitespace and keeps quotes as they are, so these tokens are Bun's own.
+ * `BUN_OPTIONS` split as Bun 1.4.4 splits it (`append_options_env`, `src/bun_core/util.rs`).
+ * A token that starts with `--` runs to the first whitespace or `=`; after `=`, or after
+ * whitespace when a quote follows, it takes a value: a quoted span, kept with its quotes and
+ * ended by its closing quote, or after `=` the text up to the next whitespace. Any other token
+ * is read shell-like: quotes group and are dropped, and a backslash keeps the next character.
+ */
+function splitBunOptions(value: string): BunOptionsToken[] {
+	const tokens: BunOptionsToken[] = [];
+	let i = 0;
+	while (i < value.length) {
+		while (i < value.length && isBunOptionsSpace(value[i])) i++;
+		if (i >= value.length) break;
+		const start = i;
+		if (value.startsWith("--", i)) {
+			let j = i;
+			while (j < value.length && !isBunOptionsSpace(value[j]) && value[j] !== "=") j++;
+			const endOfFlag = j;
+			let foundEquals = false;
+			if (value[j] === "=") {
+				foundEquals = true;
+				j++;
+			} else if (isBunOptionsSpace(value[j])) {
+				while (j < value.length && isBunOptionsSpace(value[j])) j++;
+			}
+			if (value[j] === "'" || value[j] === '"') {
+				const quote = value[j];
+				j++;
+				while (j < value.length && value[j] !== quote) j++;
+				if (j < value.length) j++;
+			} else if (foundEquals) {
+				while (j < value.length && !isBunOptionsSpace(value[j])) j++;
+			} else {
+				j = endOfFlag;
+			}
+			tokens.push({ source: value.slice(start, j), arg: value.slice(start, j) });
+			i = j;
+			continue;
+		}
+		let arg = "";
+		let inSingle = false;
+		let inDouble = false;
+		let escape = false;
+		while (i < value.length) {
+			const ch = value[i]!;
+			i++;
+			if (escape) {
+				arg += ch;
+				escape = false;
+			} else if (ch === "\\") {
+				escape = true;
+			} else if (inSingle) {
+				if (ch === "'") inSingle = false;
+				else arg += ch;
+			} else if (inDouble) {
+				if (ch === '"') inDouble = false;
+				else arg += ch;
+			} else if (ch === "'") {
+				inSingle = true;
+			} else if (ch === '"') {
+				inDouble = true;
+			} else if (isBunOptionsSpace(ch)) {
+				i--;
+				break;
+			} else {
+				arg += ch;
+			}
+		}
+		tokens.push({ source: value.slice(start, i), arg });
+	}
+	return tokens;
+}
+
+/**
+ * `BUN_OPTIONS` for a process that starts the CLI again (`/restart`, a `/fork` session), without
+ * the `--env-file`s it names: undefined to leave it as the process was started with it (it
+ * names none, or the launch environment cannot be read and the relaunch is the pre-PR command,
+ * `bunRelaunchArgs`), or the value to give it, where an empty one means unset. Bun reads
+ * `BUN_OPTIONS` in every process it starts and would read such a file again, from the
+ * directory the new process starts in; the values it gave this process are in the relaunch
+ * file already (`bunRelaunchArgs`). The value is split as Bun splits it (`splitBunOptions`):
+ * an argument `--env-file=…` goes, and so does a bare `--env-file` with the argument after it,
+ * its value. A bare `--env-file` with no argument after it, or with an option there, is one
+ * whose meaning to Bun is not certain: then all of `BUN_OPTIONS` is unset.
  */
 export function bunOptionsWithoutEnvFiles(): string | undefined {
 	if (!launchEnvValues) return undefined;
-	const tokens = (launchEnvValue("BUN_OPTIONS") ?? "").split(/\s+/).filter(Boolean);
+	const tokens = splitBunOptions(launchEnvValue("BUN_OPTIONS") ?? "");
+	// The flag an argument names: its text up to `=` or whitespace, as Bun's parser reads it.
+	const isEnvFileFlag = (token: BunOptionsToken) => {
+		let end = 0;
+		while (end < token.arg.length && token.arg[end] !== "=" && !isBunOptionsSpace(token.arg[end])) end++;
+		return token.arg.slice(0, end) === "--env-file";
+	};
+	if (!tokens.some(isEnvFileFlag)) return undefined;
 	const kept: string[] = [];
-	let dropped = false;
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i]!;
-		if (token.startsWith("--env-file=")) dropped = true;
-		else if (token === "--env-file") {
-			dropped = true;
-			i++;
-		} else kept.push(token);
+		if (!isEnvFileFlag(token)) {
+			kept.push(token.source);
+			continue;
+		}
+		if (token.arg !== "--env-file") continue;
+		// A bare flag takes the next argument as its file; an option there, or none, is not certain.
+		const next = tokens[i + 1];
+		if (next === undefined || next.arg.startsWith("-")) return "";
+		i++;
 	}
-	return dropped ? kept.join(" ") : undefined;
+	return kept.join(" ");
 }
+
+/**
+ * Whether Bun's `.env` parser reads `name` back as written: letters, digits, `_`, `-` and `.`,
+ * in any order (measured on Bun 1.4.4; a name with any other character comes back otherwise,
+ * or not at all).
+ */
+const BUN_DOTENV_NAME_RE = /^[A-Za-z0-9_.-]+$/;
 
 /**
  * `value` as Bun's `.env` parser reads back exactly, or undefined where it cannot. Bun expands
@@ -225,30 +395,48 @@ function quoteDotenvValue(value: string): string | undefined {
 	return value.includes('"') || value.includes("\\") ? undefined : `"${text}"`;
 }
 
+/** `name`'s line in the relaunch file, or undefined for an entry it cannot carry. */
+function relaunchEnvLine(name: string, value: string): string | undefined {
+	const quoted = BUN_DOTENV_NAME_RE.test(name) ? quoteDotenvValue(value) : undefined;
+	return quoted === undefined ? undefined : `${name}=${quoted}`;
+}
+
+/**
+ * The value the relaunch file gives `name` (`bunRelaunchArgs`), or undefined when it gives none:
+ * Bun did not load it, cannot carry it, or there is no relaunch file (the launch environment
+ * cannot be read). Bun applies it in the new process only where its environment leaves `name`
+ * unset.
+ */
+export function bunRelaunchValue(name: string): string | undefined {
+	const value = bunLoadedEnv && Object.hasOwn(bunLoadedEnv, name) ? bunLoadedEnv[name] : undefined;
+	return value !== undefined && relaunchEnvLine(name, value) !== undefined ? value : undefined;
+}
+
 /**
  * Runtime flags that give a new Bun process the values Bun's own `.env` loading gave this one
  * at its start, for a non-compiled omp that starts the CLI again (`/restart`, a `/fork`
  * session): `execvp(3)`, which `/restart` uses, and a terminal that starts a fork pass the
  * environment the process was started with, which those values are not in. The values, never
  * the whole environment (a fork leaves things out on purpose), go to a private file, mode 0600
- * in a directory of mode 0700, whose path holds no comma (Bun splits an `--env-file` at commas);
+ * in a directory of mode 0700 directly under the temporary directory (`relaunchEnvBases`);
  * the flag names only it, so Bun loads no other `.env` file, and the new process removes it as
- * soon as this module loads (`discardBunRelaunchFile` removes it when the start fails). A value
- * Bun's parser cannot read back (see `quoteDotenvValue`) is left out. `--no-env-file` when Bun
- * loaded nothing, or when the file cannot be written. No flag at all where the launch
- * environment cannot be read (a non-compiled omp on macOS or Windows started with Bun's
- * loading on): the relaunch is then the command it was before, and Bun loads the `.env` files
- * of the directory the new process starts in.
+ * soon as this module loads (`discardBunRelaunchFile` removes it when the start fails, and a
+ * later start removes one left older than ten minutes). An entry Bun's parser cannot read back
+ * (see `BUN_DOTENV_NAME_RE`, `quoteDotenvValue`) is left out. `--no-env-file` when Bun loaded
+ * nothing, or when the file cannot be written. No flag at all where the launch environment
+ * cannot be read (a non-compiled omp on macOS or Windows started with Bun's loading on): the
+ * relaunch is then the command it was before, and Bun loads the `.env` files of the directory
+ * the new process starts in.
  */
 export function bunRelaunchArgs(): string[] {
 	if (!bunLoadedEnv) return [];
 	const lines: string[] = [];
 	for (const [name, value] of Object.entries(bunLoadedEnv)) {
-		const quoted = ENV_NAME_RE.test(name) ? quoteDotenvValue(value) : undefined;
-		if (quoted !== undefined) lines.push(`${name}=${quoted}`);
+		const line = relaunchEnvLine(name, value);
+		if (line !== undefined) lines.push(line);
 	}
 	if (lines.length === 0) return ["--no-env-file"];
-	const base = [os.tmpdir(), "/tmp"].find(dir => path.isAbsolute(dir) && !dir.includes(",") && fs.existsSync(dir));
+	const base = relaunchEnvBases().find(dir => fs.existsSync(dir));
 	if (!base) return ["--no-env-file"];
 	let dir: string | undefined;
 	try {
@@ -257,7 +445,7 @@ export function bunRelaunchArgs(): string[] {
 		fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600, flag: "wx" });
 		return [`--env-file=${file}`];
 	} catch {
-		if (dir) fs.rmSync(dir, { recursive: true, force: true });
+		if (dir) removeRelaunchEnvDir(dir);
 		return ["--no-env-file"];
 	}
 }

@@ -175,7 +175,8 @@ function cliEntry(): string {
  * private file (`bunRelaunchArgs`): `/restart`'s `execvp(3)` and the terminal that starts a fork
  * pass the environment this process was started with, which those values are not in. When
  * `BUN_OPTIONS` names an `--env-file`, the command starts through `env` with that file left out
- * of it (`bunOptionsWithoutEnvFiles`), so the new process does not read it again from its own
+ * of it, or with `BUN_OPTIONS` unset where Bun's reading of it is not certain
+ * (`bunOptionsWithoutEnvFiles`), so the new process does not read it again from its own
  * directory. A caller whose start fails removes the private file (`discardBunRelaunchFile`); the
  * new process removes it when it starts. Where the launch environment cannot be read (a
  * non-compiled omp on macOS or Windows), neither applies: the command is the runtime plus the

@@ -8445,6 +8445,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		const sessionFile = this.sessionManager.isSessionOnDisk() ? this.sessionManager.getSessionFile() : undefined;
 		// Pass the profile explicitly: native exec does not inherit Bun's process.env updates.
 		const activeProfile = getActiveProfile();
+		await postmortem.cleanup();
+		await postmortem.drainStdout();
+		// Built last: it may write the relaunch file, which only the new process removes, so the
+		// time between writing it and the exec stays as short as it can be.
 		const cmd = [
 			...resolveCliEntryCmd(),
 			...restartArgv(
@@ -8454,8 +8458,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			),
 		];
 		if (activeProfile) cmd.push("--profile", activeProfile);
-		await postmortem.cleanup();
-		await postmortem.drainStdout();
 		if (process.platform !== "win32") {
 			try {
 				execReplace(cmd); // never returns on success
