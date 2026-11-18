@@ -1686,6 +1686,38 @@ describe("anthropic stream envelope handling", () => {
 		}
 	});
 
+	it("keeps a rate limit inside an open message a 429 refusal, not a stream truncation", async () => {
+		// A rate limit is the provider refusing the request rate, not a cut wire:
+		// read as a truncation, turn recovery would resend the whole context at
+		// once to continue the committed text instead of waiting out the limit.
+		const frames = createOpenMessageSseFrames("Here is the first half");
+		frames.push(
+			sseFrame("error", {
+				type: "error",
+				error: { type: "rate_limit_error", message: "This request would exceed your rate limit." },
+			}),
+		);
+		let created = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			created += 1;
+			return createRawSseRequest(frames) as never;
+		});
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _event of stream) {
+			// Drain.
+		}
+		const result = await stream.result();
+
+		expect(created).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		const errorMessage = result.errorMessage ?? "";
+		expect(errorMessage).toContain("rate_limit_error");
+		expect(AIError.isStreamEnvelopeTruncationText(errorMessage)).toBe(false);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "Here is the first half" }]);
+	});
+
 	it("keeps a deterministic in-band rejection terminal inside an open message", async () => {
 		// The envelope being open says the wire was cut, not that the provider
 		// accepted the request. With nothing streamed yet the provider retry gate is

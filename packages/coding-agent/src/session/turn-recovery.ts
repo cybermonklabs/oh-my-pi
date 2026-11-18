@@ -2757,7 +2757,11 @@ export class TurnRecovery {
 		// (≈500ms, capped at 8s) otherwise re-hits the cap and burns the retry
 		// budget before either window can clear. An explicit provider
 		// retry-after is authoritative in both directions, so the heuristic
-		// window only applies when the error carries no parsed timing.
+		// window only applies when the error carries no parsed timing. That
+		// window is a guess, not a wait the provider stated, so it never runs past
+		// retry.maxDelayMs: the fail-fast cap below is for stated waits, and a
+		// guess over the cap would end the turn, or walk the chain, on a wait
+		// nobody asked for.
 		if (
 			!staleOpenAIResponsesReplayError &&
 			!AIError.is(id, AIError.Flag.UsageLimit) &&
@@ -2771,7 +2775,9 @@ export class TurnRecovery {
 						))))
 		) {
 			const reasonBackoffMs = calculateRateLimitBackoffMs(rateLimitReason);
-			if (reasonBackoffMs > delayMs) delayMs = reasonBackoffMs;
+			const cappedReasonBackoffMs =
+				retrySettings.maxDelayMs > 0 ? Math.min(reasonBackoffMs, retrySettings.maxDelayMs) : reasonBackoffMs;
+			if (cappedReasonBackoffMs > delayMs) delayMs = cappedReasonBackoffMs;
 		}
 		let switchedCredential = false;
 		let switchedModel = false;

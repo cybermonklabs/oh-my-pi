@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A rate limit or overload the Anthropic API reports in its stream before the response starts (an `error` event of type `rate_limit_error` or `overloaded_error`) now carries HTTP status 429 or 529, so it is retried and held on the same model as the HTTP response would be
+- A rate limit the Anthropic API reports in its stream (an `error` event of type `rate_limit_error`), before or after the response starts, now carries HTTP status 429, and an overload it reports before the response starts (`overloaded_error`) status 529, so each is retried and held on the same model as the HTTP response would be
 
 ## [18.18.4] - 2026-11-09
 
