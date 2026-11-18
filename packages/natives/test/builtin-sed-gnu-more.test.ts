@@ -40,7 +40,7 @@ describe("builtin sed: patterns", () => {
 		[String.raw`printf 'aa\n' | sed 's/a\+\?/X/' 2>/dev/null`, "X\n", 0],
 		// Regressed: the same for `.*?`.
 		[String.raw`printf 'ab:cd\n' | sed -E 's/.*?:/X/' 2>/dev/null`, "Xcd\n", 0],
-		// Regressed: a range between the colons is refused as a class name without its brackets.
+		// Regressed: a class between the colons is refused as a class name without its brackets.
 		[String.raw`printf 'a:\n' | sed 's/[:[:digit:]:]/X/' 2>/dev/null`, "aX\n", 0],
 	]);
 });
