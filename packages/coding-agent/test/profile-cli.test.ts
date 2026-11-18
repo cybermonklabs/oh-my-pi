@@ -45,14 +45,26 @@ describe("global --profile flag", () => {
 	let originalOmpProfileEnv: string | undefined;
 	let originalPiProfileEnv: string | undefined;
 	let originalConfigDir: string | undefined;
+	let originalRootEnv: Record<string, string | undefined> = {};
+	let tempHome = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		originalProfile = getActiveProfile();
 		originalAgentDir = getAgentDir();
 		originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 		originalOmpProfileEnv = process.env.OMP_PROFILE;
 		originalPiProfileEnv = process.env.PI_PROFILE;
 		originalConfigDir = process.env.PI_CONFIG_DIR;
+		// Profiles resolve under `<home>/<configDir>`: a home of this test's own, not the
+		// developer's, and not the config root the test preload gave this process.
+		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-profile-cli-home-"));
+		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+		originalRootEnv = {
+			OMP_CONFIG_ROOT: process.env.OMP_CONFIG_ROOT,
+			OMP_DOWNLOAD_ROOT: process.env.OMP_DOWNLOAD_ROOT,
+		};
+		delete process.env.OMP_CONFIG_ROOT;
+		delete process.env.OMP_DOWNLOAD_ROOT;
 		configDir = `.omp-profile-cli-test-${Snowflake.next()}`;
 		process.env.PI_CONFIG_DIR = configDir;
 		process.exitCode = 0;
@@ -65,6 +77,10 @@ describe("global --profile flag", () => {
 			delete process.env.PI_CONFIG_DIR;
 		} else {
 			process.env.PI_CONFIG_DIR = originalConfigDir;
+		}
+		for (const [key, value] of Object.entries(originalRootEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
 		}
 		if (originalProfile) {
 			setProfile(originalProfile);
@@ -90,7 +106,7 @@ describe("global --profile flag", () => {
 		}
 		__resetProfileSnapshotForTests();
 		process.exitCode = 0;
-		await removeWithRetries(path.join(os.homedir(), configDir));
+		await removeWithRetries(tempHome);
 	});
 
 	it("activates a profile before dispatching root flags", async () => {

@@ -19,8 +19,10 @@ import logging
 import os
 import platform
 import re
+import shutil
+import stat
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -130,11 +132,92 @@ def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
     return {"user": slot_uid, "group": slot_uid, "extra_groups": [_SHARED_OMP_GID], "umask": 0o002}
 
 
-def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+_GIT_CONFIG_SLOT_RE = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_(\d+)")
+
+
+def _is_git_config_series_key(name: str) -> bool:
+    return name == "GIT_CONFIG_COUNT" or _GIT_CONFIG_SLOT_RE.fullmatch(name) is not None
+
+
+def _git_config_series(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    """The `GIT_CONFIG_COUNT`/`KEY_<n>`/`VALUE_<n>` entries git reads from ``env``, in order."""
     count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
-    env[f"GIT_CONFIG_VALUE_{count}"] = str(repo_dir)
+    return [(env.get(f"GIT_CONFIG_KEY_{i}", ""), env.get(f"GIT_CONFIG_VALUE_{i}", "")) for i in range(count)]
+
+
+def _append_git_config(env: dict[str, str], key: str, value: str) -> None:
+    """Add ``key=value`` after the `GIT_CONFIG_*` series ``env`` already carries.
+
+    Every inherited entry (a caller's own git config) keeps its slot and the new
+    one takes the next. Any slot ``env`` holds past the new count is dropped, so
+    no stale entry is left for git or a later append to read.
+    """
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    env[f"GIT_CONFIG_KEY_{count}"] = key
+    env[f"GIT_CONFIG_VALUE_{count}"] = value
     env["GIT_CONFIG_COUNT"] = str(count + 1)
+    for name in [name for name in env if (slot := _GIT_CONFIG_SLOT_RE.fullmatch(name)) and int(slot[1]) > count]:
+        del env[name]
+
+
+def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+    _append_git_config(env, "safe.directory", str(repo_dir))
+
+
+def _is_inherited_git_config_key(name: str) -> bool:
+    """A variable that hands git config to a child: the `GIT_CONFIG_*` series or `GIT_CONFIG_PARAMETERS`."""
+    return name == "GIT_CONFIG_PARAMETERS" or _is_git_config_series_key(name)
+
+
+def _replace_git_config_with_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+    """Leave ``safe.directory=<repo_dir>`` as the only git config ``env`` hands a child.
+
+    For the commands that run code from the checkout: robomp's own series and
+    `GIT_CONFIG_PARAMETERS` can carry a credential helper or an
+    `http.extraHeader`, which must not reach them.
+    """
+    for name in [name for name in env if _is_inherited_git_config_key(name)]:
+        del env[name]
+    _append_safe_directory(env, repo_dir)
+
+
+def _safe_directory_overlay(base: Mapping[str, str], repo_dir: Path) -> dict[str, str]:
+    """Overlay that leaves ``safe.directory=<repo_dir>`` as the only git config once merged over ``base``.
+
+    For the agent's env, which omp_rpc assembles as ``{**base, **overlay}``: the
+    agent runs code from the checkout, so robomp's own series and
+    `GIT_CONFIG_PARAMETERS` (a credential helper, an `http.extraHeader`) must
+    not reach it. An overlay cannot remove a key, so each inherited one is
+    blanked; git reads no slot past the count and no config from an empty
+    `GIT_CONFIG_PARAMETERS`.
+    """
+    overlay = dict.fromkeys((name for name in base if _is_inherited_git_config_key(name)), "")
+    overlay.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": str(repo_dir)})
+    return overlay
+
+
+def _operator_config_overlay(base: Mapping[str, str], agent_home: Path | None) -> dict[str, str]:
+    """Overlay that keeps robomp's operator's config from a process that runs code from the checkout.
+
+    Git reads a global config file, a system one and `$XDG_CONFIG_HOME/git/
+    config`, and other tools (gh, lspmux, …) read `$XDG_CONFIG_HOME` too; any
+    of them can carry a credential helper or a token. Merged over ``base``
+    (robomp's env) after the slot runtime env, which points `XDG_CONFIG_HOME`
+    at the workspace's own empty config dir:
+
+    - with no agent home the process keeps robomp's HOME, so git reads an empty
+      global file instead of the operator's `~/.gitconfig`;
+    - with an agent home both name that home's own files, as its HOME would,
+      whatever `GIT_CONFIG_GLOBAL` or `XDG_CONFIG_HOME` ``base`` sets;
+    - a `GIT_CONFIG_SYSTEM` file that ``base`` names is not read
+      (`GIT_CONFIG_NOSYSTEM`); the machine's own system config still is.
+    """
+    overlay = {"GIT_CONFIG_GLOBAL": os.devnull if agent_home is None else str(agent_home / ".gitconfig")}
+    if agent_home is not None:
+        overlay["XDG_CONFIG_HOME"] = str(agent_home / ".config")
+    if "GIT_CONFIG_SYSTEM" in base:
+        overlay["GIT_CONFIG_NOSYSTEM"] = "1"
+    return overlay
 
 
 def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
@@ -221,6 +304,10 @@ def _run_git(
     to another host, following `url.*.insteadOf` to `ext::`/ssh/file helpers,
     or running workspace hooks with the token in the environment.
 
+    The inherited `GIT_CONFIG_*` series (the caller's own git config) is kept;
+    the entries of an `extra_env` series and then `safe_directory` are appended
+    after it rather than written over its slots.
+
     A returncode of 0 returns the populated `CompletedProcess`. Non-zero exit
     returns the same shape; callers either `_check` it or inspect manually
     (e.g. when probing for ref existence). Stdout/stderr are always
@@ -230,7 +317,9 @@ def _run_git(
     if user is not None and _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     if extra_env:
-        env.update(extra_env)
+        env.update({name: value for name, value in extra_env.items() if not _is_git_config_series_key(name)})
+        for key, value in _git_config_series(extra_env):
+            _append_git_config(env, key, value)
     if safe_directory is not None:
         _append_safe_directory(env, safe_directory)
 
@@ -382,57 +471,195 @@ def _bad_refs_from_fetch_output(output: str) -> tuple[str, ...]:
 
 
 def _worktrees_holding_refs(repo_dir: Path, refs: tuple[str, ...]) -> dict[str, list[str]]:
-    """Map each ref in ``refs`` to the worktree paths whose ``HEAD`` is on it.
+    """Map each ref in ``refs`` to the linked worktrees whose ``HEAD`` is on it.
 
     A worktree that has the soon-to-be-deleted branch checked out keeps a
     stale ``HEAD`` pointer after ``update-ref -d`` succeeds in the shared
     refs store. The next ``git fetch`` then re-reports the same "bad object"
     error because git inspects every worktree's ``HEAD`` for connectivity.
-    Removing the offending worktree (or running ``git worktree remove
-    --force`` on it) clears that pointer so the fetch can recover.
+    Removing the offending worktree clears that pointer so the fetch can
+    recover.
+
+    Each `worktrees/<id>` entry's `HEAD` is read as it stands, with no listing
+    parsed, so one oddly named entry cannot stop the repair; the pool's own
+    (main) worktree is never one of them. A path is the worktree's resolved
+    path (see `_registered_worktrees`).
     """
     if not refs:
         return {}
-    proc = _run_git(["worktree", "list", "--porcelain"], cwd=repo_dir, token=None)
-    if proc.returncode != 0:
-        return {}
     refs_set = set(refs)
     by_ref: dict[str, list[str]] = {}
-    current: dict[str, str] = {}
-
-    def _flush() -> None:
-        branch = current.get("branch")
-        path = current.get("worktree")
-        if branch in refs_set and path:
-            by_ref.setdefault(branch, []).append(path)
-
-    for line in proc.stdout.splitlines():
-        if not line.strip():
-            _flush()
-            current.clear()
-            continue
-        key, _, val = line.partition(" ")
-        if key and val:
-            current[key] = val
-    _flush()
+    for entry, worktree in _registered_worktrees(repo_dir):
+        ref = _head_ref(entry)
+        if ref in refs_set:
+            by_ref.setdefault(ref, []).append(worktree)
     return by_ref
 
 
-def _remove_worktrees(repo_dir: Path, paths: list[str]) -> None:
-    for path in paths:
-        proc = _run_git(["worktree", "remove", "--force", path], cwd=repo_dir, token=None)
-        if proc.returncode != 0:
+def _head_ref(entry: str) -> str | None:
+    """The ref a `worktrees/<id>` entry's `HEAD` is on, or None (detached, or unreadable)."""
+    try:
+        head = os.fsdecode(Path(entry, "HEAD").read_bytes()).strip()
+    except OSError:
+        return None
+    return head.removeprefix("ref: ") if head.startswith("ref: ") else None
+
+
+def _real_path(path: str | Path) -> str:
+    """``path`` made absolute, its parents resolved as the kernel walks them, its last part kept as is.
+
+    `os.path.abspath` would drop `<link>/..` as text before resolving the
+    link; the kernel and git resolve `<link>` first and go up from its target.
+    """
+    head, tail = os.path.split(os.path.join(os.getcwd(), path))
+    return os.path.join(os.path.realpath(head), tail)
+
+
+def _registered_worktrees(pool: Path) -> list[tuple[str, str]]:
+    """`(entry, worktree)` for each `worktrees/<id>` entry of ``pool`` and the worktree it registers.
+
+    Each entry's `gitdir` (`<worktree>/.git`, as git writes it) is read as
+    bytes and its worktree resolved as git and the kernel resolve it. No
+    listing is parsed and git does not run, so one unreadable, locked or oddly
+    named entry cannot stop the others. An entry whose `gitdir` cannot be read
+    or is relative (git 2.48's `worktree.useRelativePaths`) is left out. The
+    git directory is resolved first, so an entry's path compares equal to the
+    resolved path a checkout's `.git` file names.
+    """
+    git_dir = _git_dir(pool)
+    if git_dir is None:
+        return []
+    git_dir = Path(os.path.realpath(git_dir))
+    try:
+        entries = list(os.scandir(git_dir / "worktrees"))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    registered: list[tuple[str, str]] = []
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        try:
+            back = os.fsdecode(Path(entry.path, "gitdir").read_bytes().rstrip(b"\r\n"))
+        except OSError:
+            continue
+        if not back.endswith("/.git") or not os.path.isabs(back):
+            continue
+        registered.append((entry.path, _real_path(back.removesuffix("/.git"))))
+    return registered
+
+
+def _dead_registrations(pool: Path, matches: Callable[[str], bool]) -> list[str]:
+    """The `worktrees/<id>` entries of ``pool`` whose worktree is gone and whose resolved path ``matches``."""
+    return [
+        entry for entry, worktree in _registered_worktrees(pool) if not os.path.lexists(worktree) and matches(worktree)
+    ]
+
+
+def _drop_worktree_registration(checkout: Path, pool: Path, *, under: bool = False) -> None:
+    """Delete ``pool``'s registrations of ``checkout`` once it is gone; with ``under``, of everything below it too.
+
+    A failed remove or add leaves a registration behind, and it keeps holding
+    its branch: the next add at that path, or of that branch, fails. Every dead
+    entry whose worktree resolves to ``checkout`` is deleted, locked or not (a
+    `git` wrapper on PATH may lock every `git worktree add`), and every live
+    one, and every other dead one, is left alone. Nothing is deleted while
+    anything is left at a registered path, and git never runs: it would follow
+    a link left there into another worktree. Raises GitCommandError when an
+    entry cannot be deleted; the others are deleted first.
+    """
+    target = _real_path(checkout)
+    if not under and os.path.lexists(target):
+        return
+    prefix = target + os.sep
+    failed: list[str] = []
+    for admin in _dead_registrations(pool, lambda wt: wt == target or (under and wt.startswith(prefix))):
+        try:
+            shutil.rmtree(admin)
+        except OSError as exc:
+            failed.append(f"{admin}: {exc}")
+    if failed:
+        raise GitCommandError(["git", "worktree", "remove", str(checkout)], 1, "", "; ".join(failed))
+
+
+def _checkout_registration(checkout: str) -> str | None:
+    """The resolved `worktrees/<id>` entry the checkout at ``checkout`` points back to, or None.
+
+    It is git's check before `git worktree remove`: ``checkout`` must be a
+    real directory (not a link) holding a `.git` regular file that reads
+    `gitdir: <entry>`. Anything else at the path is no linked worktree's
+    checkout.
+    """
+    dot_git = os.path.join(checkout, ".git")
+    try:
+        if not stat.S_ISDIR(os.lstat(checkout).st_mode) or not stat.S_ISREG(os.lstat(dot_git).st_mode):
+            return None
+        with open(dot_git, "rb") as gitfile:
+            text = gitfile.read(65536)
+    except OSError:
+        return None
+    if not text.startswith(b"gitdir: "):
+        return None
+    return os.path.realpath(os.fsdecode(text.removeprefix(b"gitdir: ").strip()))
+
+
+def _remove_worktrees(repo_dir: Path, paths: list[str], ref: str) -> None:
+    """Remove the linked worktrees holding ``ref``, and drop their registrations.
+
+    Any slot can write a registration naming any path, and robomp runs as
+    root, so a path is removed only when it is the checkout of a registration
+    holding ``ref``: a real directory whose `.git` file names that
+    registration (`_checkout_registration`), and with no registration of the
+    path locked. Then every dead registration at or under the path goes, a
+    worktree nested in the checkout included. In every other case the path is
+    left as it is and only the holding registrations are dropped, which
+    clears the HEAD that blocks the fetch; a locked one, or the one the
+    checkout there points back to, is kept. Git does not run: `git worktree
+    remove` checks a path and opens it again to delete it. `shutil.rmtree`
+    refuses a link swapped in for the checkout after the check; a link swapped
+    in for a parent directory is not guarded. A checkout or registration that
+    cannot be deleted raises GitCommandError, after the other paths are done:
+    a registration left behind keeps holding the ref, and the next fetch fails
+    the same way.
+    """
+    registered = _registered_worktrees(repo_dir)
+    failed: list[str] = []
+    for path in dict.fromkeys(paths):
+        target = _real_path(path)
+        entries = [entry for entry, worktree in registered if worktree == target]
+        holders = {os.path.realpath(entry) for entry in entries if _head_ref(entry) == ref}
+        if not holders:
             log.warning(
-                "failed to remove worktree during fetch repair",
-                extra={"repo_dir": str(repo_dir), "worktree": path, "stderr": proc.stderr[:500]},
+                "left a path no linked worktree on the bad ref registers during fetch repair",
+                extra={"repo_dir": str(repo_dir), "worktree": target},
             )
             continue
+        own = _checkout_registration(target)
+        locked = any(os.path.lexists(os.path.join(entry, "locked")) for entry in entries)
+        try:
+            if own in holders and not locked:
+                shutil.rmtree(target)
+            if not os.path.lexists(target):
+                _drop_worktree_registration(Path(target), repo_dir, under=True)
+                log.warning(
+                    "removed worktree during fetch repair",
+                    extra={"repo_dir": str(repo_dir), "worktree": target},
+                )
+                continue
+            for holder in holders - {own}:
+                if not os.path.lexists(os.path.join(holder, "locked")):
+                    shutil.rmtree(holder)
+        except GitCommandError as exc:
+            failed.append(exc.stderr)
+            continue
+        except OSError as exc:
+            failed.append(f"{target}: {exc}")
+            continue
         log.warning(
-            "removed worktree during fetch repair",
-            extra={"repo_dir": str(repo_dir), "worktree": path},
+            "left a path that is no unlocked holding registration's checkout during fetch repair",
+            extra={"repo_dir": str(repo_dir), "worktree": target},
         )
-    if paths:
-        _run_git(["worktree", "prune"], cwd=repo_dir, token=None)
+    if failed:
+        raise GitCommandError(["git", "worktree", "remove", *paths], 1, "", "; ".join(failed))
 
 
 def _delete_bad_refs(repo_dir: Path, output: str) -> bool:
@@ -444,7 +671,7 @@ def _delete_bad_refs(repo_dir: Path, output: str) -> bool:
     for ref in bad_refs:
         worktrees = holding.get(ref) or []
         if worktrees:
-            _remove_worktrees(repo_dir, worktrees)
+            _remove_worktrees(repo_dir, worktrees, ref)
             changed = True
         proc = _run_git(["update-ref", "-d", ref], cwd=repo_dir, token=None)
         if proc.returncode == 0:
@@ -731,12 +958,7 @@ def fetch_pr_head(
         # payload, so it is only eligible when we can verify the result:
         # same-repo PR, present head ref, present head SHA. Anything else
         # keeps the original failure.
-        if (
-            "couldn't find remote ref" not in exc.stderr
-            or not same_repo
-            or not head_ref
-            or not head_sha
-        ):
+        if "couldn't find remote ref" not in exc.stderr or not same_repo or not head_ref or not head_sha:
             raise
         validate_fetch_ref(head_ref)
         log.warning("PR head ref unavailable; fetching same-repo branch", extra={"pr": pr_number, "head_ref": head_ref})
@@ -776,7 +998,7 @@ def fetch_pr_head(
                 1,
                 probe.stdout,
                 f"PR head SHA mismatch: expected {head_sha}, fetched {probe.stdout.strip()}",
-            )
+            ) from exc
     backfill = _backfill_tip_blobs(
         repo_dir,
         "FETCH_HEAD",

@@ -66,6 +66,25 @@ then a sorted one-level scan. That scan skips declaration files
 (`*.d.ts`, `*.d.mts`, `*.d.cts`); explicitly declared file entries are not
 suffix-filtered.
 
+#### `skills` manifest field
+
+A plugin package may declare `omp.skills` (or, when the package has no `omp` key, legacy `pi.skills`) alongside `omp.extensions`: an array of path strings, each resolved relative to the plugin package root.
+
+```json
+{
+  "name": "my-plugin",
+  "omp": {
+    "extensions": ["./src/main.ts"],
+    "skills": ["./skills/curated", "./skills/standalone-skill"]
+  }
+}
+```
+
+- **Replaces, not merges**: when `skills` is present (even `[]`), it *replaces* the conventional `<plugin>/skills` directory scan entirely for that plugin — the fallback directory is not also scanned.
+- **Resolution**: each entry resolves against the plugin package root, not the caller's cwd.
+- **Containment**: a resolved entry that escapes the plugin root is skipped with a warning; it never contributes skills.
+- Each declared directory is scanned like a normal skills collection (`<dir>/<name>/SKILL.md`), but an entry may also point directly at an individual skill directory containing `SKILL.md` (e.g. `"./skills/standalone-skill"` with `standalone-skill/SKILL.md`) — that shape loads too.
+
 ### 4) Explicitly configured paths
 
 After plugin extension entries, configured paths are appended and resolved.
@@ -281,7 +300,8 @@ registration remain sequential in the discovered order.
 
 Each candidate path is loaded via `loadLegacyPiModule()` (`src/extensibility/plugins/legacy-pi-compat.ts`):
 
-- the entry's realpath is resolved, then dynamically imported with a per-load `?mtime` cache-buster. On POSIX the loader uses filesystem-path specifiers, and the same tag propagates through extension-owned relative imports, package `imports` aliases (`#alias/*`), and extension-local dependencies so same-process re-imports pick up graph edits. Windows uses `file://` specifiers, whose query strings Bun currently ignores, so the same reload guarantee does not apply there. Host-resolved rewrites (pi-package specifiers and the TypeBox shim) stay untagged because they point at in-process host code
+- the entry's realpath is resolved, then dynamically imported with a per-load `?mtime` cache-buster. The loader uses filesystem-path specifiers (on Windows without the extended-length prefix), not `file://` URLs, whose query strings Bun ignores, and the same tag propagates through extension-owned relative imports, package `imports` aliases (`#alias/*`), and extension-local dependencies so same-process re-imports pick up graph edits. Host-resolved rewrites (pi-package specifiers and the TypeBox shim) stay untagged because they point at in-process host code
+- an entry whose path, or realpath, contains `?` is refused before the import, with an error that names the path and says Bun cannot load a module from such a path (`src/extensibility/module-path.ts`): Bun reads the path cut at the `?`, whatever the specifier's form. Paths with `#`, `%`, a space or `'` load and reload. A source module (TypeScript or JavaScript) that the entry imports, whose realpath holds `?` through a link, still loads, because the graph's `onLoad` hooks serve its source; non-source modules (JSON, WASM, assets) are left to Bun's own loaders, where the limit applies. A relative specifier that spells a `?` starts a query, as in any ESM loader. The hooks, custom-commands and share-script loaders make the same check as the entry's
 - a scoped Bun `onLoad` hook rewrites legacy pi-package specifiers (`@mariozechner/*`, `@earendil-works/*`) and bare `@sinclair/typebox` onto the host-bundled copies before evaluation. Legacy Pi package-root imports resolve through compat shims: catalog symbols that moved to `@oh-my-pi/pi-catalog/models` (`calculateCost`, `modelsAreEqual`, `getBundledProviders`, plus `getModel`/`getModels` aliases) are re-exported by the legacy pi-ai shim (`src/extensibility/legacy-pi-ai-shim.ts`), and legacy `@oh-my-pi/pi-coding-agent` imports — including `DefaultResourceLoader` — resolve to the compat loader in `src/extensibility/legacy-pi-coding-agent-shim.ts`
 - graph-owned CommonJS modules use synchronous Bun `onLoad` object modules exposing runtime own-string export keys, including computed and non-enumerable names; `default` remains the complete `module.exports` value. The shared evaluator preserves cycles and `require`/import identity, while required host ESM shims are prepared before synchronous evaluation. No generated facade files or AST named-export reconstruction are needed
 - bundled host modules use Bun's native object loader. Modules exporting `theme` add a thin ESM binding bridge so the existing `theme` import follows host assignments synchronously without replacing the UI's change listener

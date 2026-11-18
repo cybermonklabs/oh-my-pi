@@ -5,6 +5,7 @@
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { gcHelp as commandHelp } from "../cli/command-help";
 import { collectGcErrors, type GcCommandArgs, runGcCommand } from "../cli/gc-cli";
+import { GC_BLOBS_WARNING } from "../cli/gc-settings";
 
 export default class Gc extends Command {
 	static description = commandHelp.description;
@@ -12,7 +13,7 @@ export default class Gc extends Command {
 		apply: Flags.boolean({ description: "Apply changes (default is dry-run)" }),
 		json: Flags.boolean({ description: "Output JSON" }),
 		"agent-dir": Flags.string({ description: "Agent directory to maintain" }),
-		blobs: Flags.boolean({ description: "Sweep unreferenced blobs" }),
+		blobs: Flags.boolean({ description: `Sweep unreferenced blobs. ${GC_BLOBS_WARNING}` }),
 		archive: Flags.boolean({ description: "Archive cold sessions" }),
 		wal: Flags.boolean({ description: "Checkpoint history/model database WAL files" }),
 		stale: Flags.boolean({
@@ -20,6 +21,9 @@ export default class Gc extends Command {
 		}),
 		compress: Flags.boolean({
 			description: "Store idle sessions with filesystem compression in place (APFS, NTFS)",
+		}),
+		restore: Flags.string({
+			description: "Bring an archived session back by id prefix or archive path (runs alone)",
 		}),
 		strip: Flags.boolean({
 			description:
@@ -48,6 +52,7 @@ export default class Gc extends Command {
 				wal: flags.wal,
 				stale: flags.stale,
 				compress: flags.compress,
+				restore: flags.restore,
 				strip: flags.strip,
 				coldArchiveAfterDays: flags["cold-archive-after-days"],
 				retainNewestGlobal: flags["retain-newest-global"],

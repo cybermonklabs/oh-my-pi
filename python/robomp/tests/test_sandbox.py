@@ -9,8 +9,10 @@ import stat
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -31,11 +33,11 @@ from robomp.sandbox import (
     SandboxManager,
     Workspace,
     _chown_workspace,
+    _git_env_for_repo,
     _prepare_slot_runtime_env,
     _prepare_slot_tmpdir,
     _provision_runtime_dirs,
     _reap_slot,
-    _safe_directory_env,
     _share_git_metadata_with_slots,
     _slot_pids,
     _slot_subprocess_kwargs,
@@ -43,6 +45,9 @@ from robomp.sandbox import (
     rename_workspace_branch,
     workspace_key,
 )
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 
 def _git(args: list[str], cwd: Path) -> None:
@@ -352,6 +357,9 @@ def test_delete_bad_refs_removes_worktree_holding_the_ref(tmp_path: Path) -> Non
         text=True,
     )
     assert (work_dir / ".git").exists()
+    # A `git` wrapper on PATH may lock every `git worktree add`, and the repair
+    # keeps a locked worktree whose checkout is there: set the state here.
+    _set_worktree_lock(pool, work_dir, locked=False)
 
     fetch_output = (
         "error: object directory /tmp/git-objects-aux does not exist; check .git/objects/info/alternates\n"
@@ -380,6 +388,435 @@ def test_delete_bad_refs_noop_when_no_bad_ref_in_output(tmp_path: Path) -> None:
     _init_worktree_repo(pool, "main")
     # Output that doesn't match the bad-object regex.
     assert _delete_bad_refs(pool, "fatal: unrelated failure\n") is False
+
+
+_BAD_REF = "refs/heads/farm/badhex/bad-branch"
+_BAD_REF_FETCH_OUTPUT = f"fatal: bad object {_BAD_REF}\nerror: did not send all necessary objects\n"
+
+
+def _pool_with_worktree_on_bad_ref(tmp_path: Path) -> tuple[Path, Path]:
+    """A pool with a worktree, unlocked, checked out on the branch a fetch reports as a bad object."""
+    pool = tmp_path / "pool"
+    _init_worktree_repo(pool, "main")
+    work_dir = tmp_path / "worktree"
+    _git(["-C", str(pool), "worktree", "add", "-b", _BAD_REF.removeprefix("refs/heads/"), str(work_dir), "main"], pool)
+    _set_worktree_lock(pool, work_dir, locked=False)
+    return pool, work_dir
+
+
+def _git_runs(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Record every git command `git_ops._run_git` runs from now on, and let it run."""
+    import robomp.git_ops as g
+
+    runs: list[list[str]] = []
+    real_run_git = g._run_git
+
+    def spy(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(list(args))
+        return real_run_git(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("robomp.git_ops._run_git", spy)
+    return runs
+
+
+def _other_worktree_with_work(pool: Path, tmp_path: Path) -> Path:
+    """Another worktree of ``pool``, unlocked, with an uncommitted file."""
+    other = tmp_path / "other" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(other), "main"], pool)
+    _set_worktree_lock(pool, other, locked=False)
+    (other / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+    return other
+
+
+def test_delete_bad_refs_removes_a_present_worktree_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The repair removes the checkout itself and drops its registration. git
+    # runs no `worktree remove`: it checks a path and then opens it again,
+    # following a link swapped in between into another worktree.
+    import robomp.git_ops as g
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    runs = _git_runs(monkeypatch)
+
+    assert g._delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT) is True
+
+    assert [run for run in runs if run[:2] == ["worktree", "remove"]] == []
+    assert not os.path.lexists(work_dir)
+    assert _worktree_entry(pool, work_dir) is None
+    assert g._worktrees_holding_refs(pool, (_BAD_REF,)) == {}
+
+
+def test_delete_bad_refs_drops_the_registration_of_a_checkout_already_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An earlier removal deleted the checkout and was killed before it
+    # unregistered it. The registration still holds the ref, so the next fetch
+    # fails the same way: the repair must drop it, without a pool-wide `git
+    # worktree prune`, which a git wrapper on PATH may refuse.
+    import robomp.git_ops as g
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    shutil.rmtree(work_dir)
+    runs = _git_runs(monkeypatch)
+
+    assert g._delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT) is True
+
+    assert [run for run in runs if run[0] == "worktree"] == []
+    assert _worktree_entry(pool, work_dir) is None
+    assert g._worktrees_holding_refs(pool, (_BAD_REF,)) == {}
+
+
+def test_delete_bad_refs_leaves_a_link_at_the_registered_path(tmp_path: Path) -> None:
+    # The checkout is the agent's to change: a link left at the registered path
+    # names another worktree, uncommitted work included. The link is no
+    # worktree's checkout, so the repair leaves it and drops only the holding
+    # registration; the other worktree is untouched.
+    import robomp.git_ops as g
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    other = _other_worktree_with_work(pool, tmp_path)
+    shutil.rmtree(work_dir)
+    work_dir.symlink_to(other)
+
+    g._delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT)
+
+    assert (other / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert _worktree_state(pool, other) == "unlocked"
+    assert work_dir.is_symlink()
+    assert g._worktrees_holding_refs(pool, (_BAD_REF,)) == {}
+
+
+@pytest.mark.parametrize("when", ["after-the-first-lstat", "right-before-the-removal"])
+def test_delete_bad_refs_leaves_another_worktree_when_a_link_is_swapped_in_for_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    # The registered path is the holder's checkout when the repair first looks
+    # at it, and a link to another worktree later: right after that first
+    # `lstat`, or right before the removal (`shutil.rmtree`, or a `git worktree
+    # remove`). The other worktree's work must stay; the repair either leaves
+    # the link and drops the holding registration, or raises.
+    import robomp.git_ops as g
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    other = _other_worktree_with_work(pool, tmp_path)
+    real_lstat, real_rmtree, real_run_git = os.lstat, shutil.rmtree, g._run_git
+    swapped: list[bool] = []
+
+    def swap() -> None:
+        swapped.append(True)
+        real_rmtree(work_dir)
+        work_dir.symlink_to(other)
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_lstat(path, *args, **kwargs)
+        if not swapped and isinstance(path, str | os.PathLike) and os.fspath(path) == str(work_dir):
+            swap()
+        return result
+
+    def rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+        if not swapped and os.fspath(path) == str(work_dir):
+            swap()
+        real_rmtree(path, *args, **kwargs)
+
+    def run_git(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if not swapped and args[:2] == ["worktree", "remove"]:
+            swap()
+        return real_run_git(args, **kwargs)  # type: ignore[arg-type]
+
+    if when == "after-the-first-lstat":
+        monkeypatch.setattr(os, "lstat", lstat)
+    else:
+        monkeypatch.setattr("robomp.git_ops.shutil.rmtree", rmtree)
+    monkeypatch.setattr("robomp.git_ops._run_git", run_git)
+
+    try:
+        g._delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT)
+    except GitCommandError as exc:
+        error: GitCommandError | None = exc
+    else:
+        error = None
+
+    assert swapped, "the swap never ran"
+    assert (other / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert _worktree_state(pool, other) == "unlocked"
+    assert (error is not None and str(work_dir) in error.stderr) or (
+        work_dir.is_symlink() and g._worktrees_holding_refs(pool, (_BAD_REF,)) == {}
+    )
+
+
+_FORGED_REF = "refs/heads/farm/bad"
+
+
+def _forgeable_pool(tmp_path: Path) -> SimpleNamespace:
+    """robomp's pool layout, the state a forged registration is planted in.
+
+    `<tmp>/ws/_pool/o__r` is cloned from an upstream that is then one commit
+    ahead, so the next fetch brings objects and git checks every worktree's
+    HEAD. Workspace A (`o__r__1/repo`, on `farm/a`) is the agent's; B
+    (`o__r__2/repo`, detached, with an uncommitted file) is another one. Both
+    are unlocked, whatever a `git` wrapper on PATH did. Beside them: a
+    directory and a file robomp must not delete, a link to that directory, and
+    a directory reached through a link in A's workspace root.
+    """
+    up = tmp_path / "up"
+    _init_worktree_repo(up, "main")
+    root = tmp_path / "ws"
+    pool = root / "_pool" / "o__r"
+    pool.parent.mkdir(parents=True)
+    _git(["clone", "-q", str(up), str(pool)], cwd=tmp_path)
+    (up / "second.txt").write_text("2\n", encoding="utf-8")
+    _git(["-C", str(up), "add", "second.txt"], cwd=up)
+    _git(["-C", str(up), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "2"], cwd=up)
+    a = root / "o__r__1" / "repo"
+    a.parent.mkdir()
+    _git(["-C", str(pool), "worktree", "add", "-q", "-b", "farm/a", str(a), "HEAD"], cwd=pool)
+    b = root / "o__r__2" / "repo"
+    b.parent.mkdir()
+    _git(["-C", str(pool), "worktree", "add", "-q", "--detach", str(b), "HEAD"], cwd=pool)
+    (b / "uncommitted.txt").write_text("B's work\n", encoding="utf-8")
+    for checkout in (a, b):
+        _set_worktree_lock(pool, checkout, locked=False)
+    victim_dir = tmp_path / "victim-dir"
+    victim_dir.mkdir()
+    (victim_dir / "important.txt").write_text("not a worktree\n", encoding="utf-8")
+    victim_file = tmp_path / "victim-file.txt"
+    victim_file.write_text("a file robomp must not delete\n", encoding="utf-8")
+    victim_link = tmp_path / "victim-link"
+    victim_link.symlink_to(victim_dir)
+    behind_link = tmp_path / "victim-parent" / "important-dir"
+    behind_link.mkdir(parents=True)
+    (behind_link / "important.txt").write_text("not a worktree\n", encoding="utf-8")
+    (a.parent / "L").symlink_to(behind_link.parent)
+    return SimpleNamespace(
+        root=root,
+        pool=pool,
+        a=a,
+        b=b,
+        victim_dir=victim_dir,
+        victim_file=victim_file,
+        victim_link=victim_link,
+        behind_link=behind_link,
+    )
+
+
+def _plant_bad_ref(pool: Path) -> None:
+    """`_FORGED_REF` naming an object that does not exist, as a slot can write it."""
+    bad = pool / ".git" / _FORGED_REF
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("1" * 40 + "\n", encoding="utf-8")
+
+
+def _forge_registration(state: SimpleNamespace, named: Path | str) -> Path:
+    """A `worktrees/evil` entry a slot writes: its `gitdir` names ``named``, its HEAD is on the bad ref."""
+    evil = state.pool / ".git" / "worktrees" / "evil"
+    shutil.copytree(_admin(state.a), evil)
+    (evil / "locked").unlink(missing_ok=True)
+    (evil / "gitdir").write_text(f"{named}/.git\n", encoding="utf-8")
+    (evil / "HEAD").write_text(f"ref: {_FORGED_REF}\n", encoding="utf-8")
+    return evil
+
+
+def _intact(state: SimpleNamespace) -> dict[str, bool]:
+    return {
+        "victim-dir": (state.victim_dir / "important.txt").is_file(),
+        "victim-file": state.victim_file.is_file(),
+        "victim-link": state.victim_link.is_symlink(),
+        "behind-link": (state.behind_link / "important.txt").is_file(),
+        "pool": (state.pool / ".git" / "HEAD").is_file(),
+        "B": (state.b / "uncommitted.txt").is_file(),
+    }
+
+
+@pytest.mark.parametrize(
+    "named", ["victim-dir", "victim-file", "victim-link", "behind-link", "pool", "B"], ids=lambda name: f"names-{name}"
+)
+def test_fetch_prune_leaves_what_a_forged_registration_names(tmp_path: Path, named: str) -> None:
+    # Any slot can write a registration naming any path, put its HEAD on a ref,
+    # and write that ref with an object that does not exist. robomp's next
+    # fetch then fails and its repair runs as root. It must delete only a
+    # checkout that points back to a holding registration, as git checks before
+    # `git worktree remove`: here it drops the forged registration, the fetch
+    # recovers, and the path it names is left as it was.
+    from robomp.git_ops import fetch_prune
+
+    state = _forgeable_pool(tmp_path)
+    target = {
+        "victim-dir": state.victim_dir,
+        "victim-file": state.victim_file,
+        "victim-link": state.victim_link,
+        "behind-link": f"{state.a.parent}/L/important-dir",
+        "pool": state.pool,
+        "B": state.b,
+    }[named]
+    evil = _forge_registration(state, target)
+    _plant_bad_ref(state.pool)
+
+    fetch_prune(state.pool, token=None)
+
+    assert _intact(state) == dict.fromkeys(_intact(state), True)
+    assert not evil.exists()
+    fetch_prune(state.pool, token=None)
+
+
+@pytest.mark.parametrize("where", ["own-checkout", "outside-the-workspaces"])
+def test_fetch_prune_removes_a_real_worktree_on_the_bad_ref(tmp_path: Path, where: str) -> None:
+    # A real worktree whose own HEAD is on the bad ref, the agent's checkout or
+    # one outside the workspace root, is removed with its registration, and
+    # the fetch recovers; nothing else is touched.
+    from robomp.git_ops import fetch_prune
+
+    state = _forgeable_pool(tmp_path)
+    checkout = state.a
+    if where == "outside-the-workspaces":
+        checkout = tmp_path / "outside" / "repo"
+        checkout.parent.mkdir()
+        _git(["-C", str(state.pool), "worktree", "add", "-q", "--detach", str(checkout), "HEAD"], cwd=state.pool)
+        _set_worktree_lock(state.pool, checkout, locked=False)
+    (_admin(checkout) / "HEAD").write_text(f"ref: {_FORGED_REF}\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    fetch_prune(state.pool, token=None)
+
+    assert not os.path.lexists(checkout)
+    assert _worktree_entry(state.pool, checkout) is None
+    assert _intact(state) == dict.fromkeys(_intact(state), True)
+    fetch_prune(state.pool, token=None)
+
+
+def test_fetch_prune_drops_the_registration_of_a_worktree_nested_in_the_one_it_removes(tmp_path: Path) -> None:
+    # A worktree the agent added inside its checkout goes with the checkout;
+    # its registration, still holding its branch, must go too, or adding that
+    # branch again fails.
+    from robomp.git_ops import fetch_prune
+
+    state = _forgeable_pool(tmp_path)
+    nested = state.a / "sub" / "n"
+    nested.parent.mkdir(parents=True)
+    _git(["-C", str(state.pool), "worktree", "add", "-q", "-b", "farm/n", str(nested), "HEAD"], cwd=state.pool)
+    _set_worktree_lock(state.pool, nested, locked=False)
+    (_admin(state.a) / "HEAD").write_text(f"ref: {_FORGED_REF}\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    fetch_prune(state.pool, token=None)
+
+    assert not os.path.lexists(state.a)
+    assert _worktree_entry(state.pool, nested) is None
+    readd = state.root / "o__r__9" / "repo"
+    _git(["-C", str(state.pool), "worktree", "add", "-q", str(readd), "farm/n"], cwd=state.pool)
+    assert (readd / ".git").is_file()
+
+
+def test_fetch_prune_keeps_a_locked_forged_registration_of_what_is_no_checkout(tmp_path: Path) -> None:
+    # A locked holding registration whose path is no checkout is kept, not
+    # dropped: the path it names is left alone, and the fetch recovers anyway,
+    # because `update-ref -d` deletes the bad ref.
+    from robomp.git_ops import fetch_prune
+
+    state = _forgeable_pool(tmp_path)
+    evil = _forge_registration(state, state.victim_dir)
+    (evil / "locked").write_text("forged\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    fetch_prune(state.pool, token=None)
+
+    assert (evil / "locked").is_file(), "a locked holding registration was dropped"
+    assert _intact(state) == dict.fromkeys(_intact(state), True)
+    fetch_prune(state.pool, token=None)
+
+
+def test_fetch_prune_keeps_both_registrations_of_a_checkout_one_of_them_locked(tmp_path: Path) -> None:
+    # A present checkout on the bad ref has two registrations, its own and a
+    # locked copy. The lock keeps the checkout; the copy is kept because it is
+    # locked, and the checkout's own registration because the checkout points
+    # back to it: neither is dropped.
+    from robomp.git_ops import _delete_bad_refs
+
+    state = _forgeable_pool(tmp_path)
+    own = _admin(state.a)
+    (own / "HEAD").write_text(f"ref: {_FORGED_REF}\n", encoding="utf-8")
+    duplicate = own.parent / "duplicate"
+    shutil.copytree(own, duplicate)
+    (duplicate / "locked").write_text("a copy someone locked\n", encoding="utf-8")
+    _plant_bad_ref(state.pool)
+
+    _delete_bad_refs(state.pool, f"fatal: bad object {_FORGED_REF}\n")
+
+    assert (state.a / ".git").is_file(), "the locked checkout was removed"
+    assert own.is_dir(), "the checkout's own registration was dropped"
+    assert (duplicate / "locked").is_file(), "the locked duplicate registration was dropped"
+
+
+def test_delete_bad_refs_leaves_the_pools_own_checkout_on_the_bad_ref(tmp_path: Path) -> None:
+    # The pool's main worktree is no linked worktree: whatever its HEAD is on,
+    # the repair must not remove it.
+    from robomp.git_ops import _delete_bad_refs
+
+    pool = tmp_path / "pool"
+    _init_worktree_repo(pool, _BAD_REF.removeprefix("refs/heads/"))
+    (pool / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+
+    _delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT)
+
+    assert (pool / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert (pool / ".git").is_dir()
+
+
+def test_delete_bad_refs_drops_a_locked_registration_whose_checkout_is_gone(tmp_path: Path) -> None:
+    # A locked worktree (the lock can come from a wrapper on PATH) whose
+    # checkout is gone still holds the ref, and a prune keeps it. Its lock
+    # protects nothing once the checkout is gone: the repair must drop exactly
+    # that one registration and leave another dead one alone.
+    from robomp.git_ops import _delete_bad_refs, _worktrees_holding_refs
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    _set_worktree_lock(pool, work_dir, locked=True)
+    shutil.rmtree(work_dir)
+    bystander = tmp_path / "bystander" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(bystander), "main"], pool)
+    _set_worktree_lock(pool, bystander, locked=False)
+    shutil.rmtree(bystander)
+
+    assert _delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT) is True
+
+    assert _worktree_entry(pool, work_dir) is None
+    assert _worktrees_holding_refs(pool, (_BAD_REF,)) == {}
+    assert _worktree_state(pool, bystander) == "unlocked"
+
+
+def test_delete_bad_refs_raises_when_dropping_the_registration_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A registration left behind keeps holding the ref; the repair must not
+    # report success over it.
+    import robomp.git_ops as g
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    _set_worktree_lock(pool, work_dir, locked=True)
+    own = _admin(work_dir)
+    shutil.rmtree(work_dir)
+    monkeypatch.setattr("robomp.git_ops.shutil.rmtree", _failing_rmtree_under(pool / ".git" / "worktrees"))
+
+    with pytest.raises(GitCommandError) as exc:
+        g._delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT)
+    assert str(own) in exc.value.stderr
+    assert own.exists()
+
+
+def test_delete_bad_refs_leaves_a_locked_present_worktree_on_the_bad_ref(tmp_path: Path) -> None:
+    # A locked worktree whose checkout is there is someone's to keep, its
+    # uncommitted work included: the repair leaves both the checkout and its
+    # registration, as `git worktree remove --force` (one `--force`) did.
+    from robomp.git_ops import _delete_bad_refs
+
+    pool, work_dir = _pool_with_worktree_on_bad_ref(tmp_path)
+    _set_worktree_lock(pool, work_dir, locked=True)
+    (work_dir / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+
+    _delete_bad_refs(pool, _BAD_REF_FETCH_OUTPUT)
+
+    assert (work_dir / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert _worktree_state(pool, work_dir) == _TEST_LOCKED
 
 
 def test_ensure_workspace_creates_worktree(tmp_path: Path, upstream_repo: Path) -> None:
@@ -763,14 +1200,26 @@ def test_provision_runtime_dirs_replaces_tmpdir_symlink_and_creates_xdg_tree(tmp
     assert (tmp_path / ".omp-xdg" / "cache" / "bun-install").is_dir()
 
 
-def test_safe_directory_env_scopes_single_repo_path(tmp_path: Path) -> None:
+def test_git_env_for_repo_whitelists_only_the_repo_path(tmp_path: Path, git_config: GitConfigSeries) -> None:
     repo_dir = tmp_path / "repo"
 
-    assert _safe_directory_env(repo_dir) == {
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "safe.directory",
-        "GIT_CONFIG_VALUE_0": str(repo_dir),
-    }
+    env = _git_env_for_repo(repo_dir)
+
+    assert git_config.entries(env) == [("safe.directory", str(repo_dir))]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_env_for_repo_appends_after_inherited_git_config(
+    tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # The caller's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    repo_dir = tmp_path / "repo"
+
+    env = _git_env_for_repo(repo_dir)
+
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(repo_dir))]
+    assert git_config.past_count(env) == {}
 
 
 def test_slot_subprocess_kwargs_run_as_slot_on_linux_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1195,82 +1644,72 @@ def test_remove_workspace(tmp_path: Path, upstream_repo: Path) -> None:
     assert not ws.root.exists()
 
 
-def test_remove_workspace_prunes_pool_after_failed_worktree_remove(
+def _fake_registration(pool: Path, name: str, worktree: Path | str) -> Path:
+    """A `worktrees/<name>` entry in ``pool`` (a dir holding `.git/`) whose `gitdir` names ``worktree``, as git writes it."""
+    admin = pool / ".git" / "worktrees" / name
+    admin.mkdir(parents=True)
+    (admin / "gitdir").write_bytes(os.fsencode(worktree) + b"/.git\n")
+    return admin
+
+
+def _fake_pool_workspace(mgr: SandboxManager, number: int) -> tuple[Path, Path, Path]:
+    """A workspace root, its checkout path and a pool marked as a real clone, without git."""
+    ws_root = mgr.workspace_root("o/r", number)
+    ws_root.mkdir(parents=True)
+    pool = mgr.pool_path("o/r")
+    (pool / ".git").mkdir(parents=True, exist_ok=True)  # mark as a real git pool for the cleanup gate
+    return ws_root, ws_root / "repo", pool
+
+
+def _no_git(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    pytest.fail(f"remove_workspace ran git: {cmd}")
+
+
+def test_remove_workspace_removes_a_present_checkout_without_git(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A present checkout goes with the workspace root, and its registration with
+    # the sweep under that root. git never runs: it would check the path and
+    # then open it again, following a link the agent swaps in between.
     mgr = SandboxManager(tmp_path)
-    # Create a real repo_dir on disk so `repo_dir.exists()` is True on entry.
-    ws_root = mgr.workspace_root("o/r", 7)
-    repo_dir = ws_root / "repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    pool = mgr.pool_path("o/r")
-    pool.mkdir(parents=True, exist_ok=True)
-    (pool / ".git").mkdir(exist_ok=True)  # mark as a real git pool for the cleanup gate
-
-    calls: list[tuple[list[str], object]] = []
-
-    def fake_safe_run(cmd, **k):
-        calls.append((list(cmd), k.get("cwd")))
-        # The `worktree remove` "times out" (124) and does NOT delete repo_dir,
-        # so the code must fall back to rmtree + prune. `prune` succeeds (0).
-        if cmd[:3] == ["git", "worktree", "remove"]:
-            return subprocess.CompletedProcess(cmd, 124, "", "timed out")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
+    ws_root, repo_dir, pool = _fake_pool_workspace(mgr, 7)
+    repo_dir.mkdir()  # the checkout is present on entry
+    own = _fake_registration(pool, "repo", repo_dir)
+    elsewhere = _fake_registration(pool, "elsewhere", tmp_path / "elsewhere" / "repo")  # dead, not this workspace's
+    live = tmp_path / "live" / "repo"
+    live.mkdir(parents=True)
+    live_admin = _fake_registration(pool, "live", live)
+    monkeypatch.setattr("robomp.sandbox._safe_run", _no_git)
 
     mgr.remove_workspace(repo="o/r", number=7)
 
-    cmds = [c for c, _ in calls]
-    # The dangling registration must have been pruned, in the correct pool.
-    assert ["git", "worktree", "prune"] in cmds, (
-        "remove_workspace did not prune pool metadata after a failed worktree remove"
-    )
-    prune_idx = next(i for i, (c, _) in enumerate(calls) if c == ["git", "worktree", "prune"])
-    assert calls[prune_idx][1] == pool, "prune did not run in the repo's pool dir"
-    # And the remove was attempted first (ordering: remove before prune).
-    remove_idx = next(i for i, (c, _) in enumerate(calls) if c[:3] == ["git", "worktree", "remove"])
-    assert remove_idx < prune_idx
-    # The real checkout dir was cleaned up.
-    assert not repo_dir.exists()
+    assert not repo_dir.exists() and not ws_root.exists()
+    assert not own.exists(), "the checkout's registration was left"
+    assert elsewhere.exists() and live_admin.exists(), "another workspace's registration was dropped"
 
 
-def test_remove_workspace_prunes_when_failed_remove_already_deleted_checkout(
+def test_remove_workspace_drops_nothing_when_no_registration_is_left(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The reviewer's case: `git worktree remove` deletes the checkout dir but is
-    # killed (124) before clearing the pool's worktree registration. `repo_dir`
-    # is gone by the time we check, so a guard on `repo_dir.exists()` would skip
-    # the prune and leave dangling metadata; guarding on the return code must not.
+    # With no registration left for this checkout, the cleanup runs no git,
+    # deletes no other entry and does not fail.
     mgr = SandboxManager(tmp_path)
-    ws_root = mgr.workspace_root("o/r", 9)
-    repo_dir = ws_root / "repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    pool = mgr.pool_path("o/r")
-    pool.mkdir(parents=True, exist_ok=True)
-    (pool / ".git").mkdir(exist_ok=True)  # mark as a real git pool for the cleanup gate
+    ws_root, _repo_dir, pool = _fake_pool_workspace(mgr, 11)  # checkout gone, workspace root left
+    elsewhere = _fake_registration(pool, "elsewhere", tmp_path / "elsewhere" / "repo")
 
-    calls: list[tuple[list[str], object]] = []
+    calls: list[list[str]] = []
 
     def fake_safe_run(cmd, **k):
-        calls.append((list(cmd), k.get("cwd")))
-        if cmd[:3] == ["git", "worktree", "remove"]:
-            # Simulate git deleting the checkout, then dying before it could
-            # unregister the worktree from the pool.
-            repo_dir.rmdir()
-            return subprocess.CompletedProcess(cmd, 124, "", "timed out")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: not a working tree")
 
     monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
 
-    mgr.remove_workspace(repo="o/r", number=9)
+    mgr.remove_workspace(repo="o/r", number=11)
 
-    cmds = [c for c, _ in calls]
-    assert ["git", "worktree", "prune"] in cmds, (
-        "prune was skipped after a failed remove that had already deleted the checkout"
-    )
-    prune_idx = next(i for i, (c, _) in enumerate(calls) if c == ["git", "worktree", "prune"])
-    assert calls[prune_idx][1] == pool, "prune did not run in the repo's pool dir"
+    assert calls == []
+    assert elsewhere.exists()
+    assert not ws_root.exists()
 
 
 def test_redact_credentials_strips_userinfo() -> None:
@@ -1431,11 +1870,7 @@ def test_push_force_with_lease_refuses_when_origin_moved(tmp_path: Path, upstrea
     )
 
 
-def test_run_git_injects_safe_directory_and_subprocess_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from robomp.git_ops import _run_git
-
+def _capture_run_git_call(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     captured: dict[str, object] = {}
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1444,6 +1879,15 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr("robomp.git_ops.subprocess.run", fake_run)
+    return captured
+
+
+def test_run_git_injects_safe_directory_and_subprocess_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.git_ops import _run_git
+
+    captured = _capture_run_git_call(monkeypatch)
 
     _run_git(
         ["status"],
@@ -1468,6 +1912,53 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
     assert captured["group"] == 2001
     assert captured["extra_groups"] == [2000]
     assert captured["umask"] == 0o002
+
+
+def test_run_git_appends_safe_directory_after_inherited_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # The caller's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    from robomp.git_ops import _run_git
+
+    captured = _capture_run_git_call(monkeypatch)
+
+    _run_git(["status"], cwd=tmp_path, token=None, safe_directory=Path("/x"))
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", "/x")]
+    assert git_config.past_count(env) == {}
+
+
+def test_run_git_appends_extra_env_series_after_inherited_git_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_config: GitConfigSeries,
+    inherited_git_config: list[tuple[str, str]],
+) -> None:
+    # A local remote's safe.directory reaches `_run_git` as an `extra_env` series
+    # (`_explicit_remote_env`); it goes after the inherited entries, not over them.
+    from robomp.git_ops import _explicit_remote_env, _run_git
+
+    remote = tmp_path / "upstream.git"
+    extra_env = _explicit_remote_env(str(remote), cwd=tmp_path)
+    assert extra_env is not None
+    captured = _capture_run_git_call(monkeypatch)
+
+    _run_git(["fetch", str(remote)], cwd=tmp_path, token=None, extra_env=extra_env, safe_directory=Path("/x"))
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert git_config.entries(env) == [
+        *inherited_git_config,
+        ("safe.directory", str(remote)),
+        ("safe.directory", "/x"),
+    ]
+    assert git_config.past_count(env) == {}
 
 
 def test_run_git_scopes_token_and_scrubs_parent_auth_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2128,67 +2619,426 @@ def test_ensure_workspace_raises_when_symbolic_ref_probe_times_out(
         )
 
 
-def test_remove_workspace_real_prune_clears_dangling_registration(
-    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Integration guard: the other prune tests fully mock `_safe_run`, so the
-    # REAL `git worktree prune` never runs and the stale-metadata risk this
-    # patch targets is not actually exercised. Here we build a real workspace
-    # (real pool clone + real worktree registration), fake ONLY the
-    # `git worktree remove` to "time out" (124), and let the real rmtree+prune
-    # run. The dangling registration must actually be gone afterward, and a
-    # fresh add at the same path must succeed — the real integration risk.
-    import robomp.sandbox as s
-
-    mgr = SandboxManager(tmp_path / "workspaces")
-    ws = mgr.ensure_workspace(
-        repo="octo/widget",
-        number=21,
-        title="t",
-        clone_url=str(upstream_repo),
-        default_branch="main",
-        author_name="robomp-bot",
-        author_email="robomp-bot@example.invalid",
-    )
-    pool = mgr.pool_path("octo/widget")
-    repo_dir = ws.repo_dir
-    assert repo_dir.exists()
+def _worktree_entry(pool: Path, path: Path) -> list[str] | None:
+    """The `git worktree list --porcelain` lines of ``path``'s registration in ``pool``, or None."""
     listed = subprocess.run(
         ["git", "-C", str(pool), "worktree", "list", "--porcelain"],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    assert str(repo_dir) in listed  # sanity: registration exists
+    for block in listed.split("\n\n"):
+        lines = block.splitlines()
+        if lines and lines[0] == f"worktree {path}":
+            return lines
+    return None
 
-    real_safe_run = s._safe_run
 
-    def fake_safe_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        if cmd[:3] == ["git", "worktree", "remove"]:
-            # A remove that "times out" without unregistering — the source must
-            # then rmtree the checkout and run the REAL prune to clear metadata.
-            return subprocess.CompletedProcess(cmd, 124, "", "timed out")
-        return real_safe_run(cmd, **k)  # type: ignore[arg-type]
+_TEST_LOCK_REASON = "test lock"
+_TEST_LOCKED = f"locked {_TEST_LOCK_REASON}"
 
-    monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
+
+def _worktree_state(pool: Path, path: Path) -> str:
+    """`absent`, `unlocked`, or the `locked <reason>` line of ``path``'s registration in ``pool``."""
+    entry = _worktree_entry(pool, path)
+    if entry is None:
+        return "absent"
+    return next((line for line in entry if line.startswith("locked")), "unlocked")
+
+
+def _set_worktree_lock(pool: Path, path: Path, *, locked: bool) -> None:
+    """Leave ``path``'s registration locked by this test, or unlocked, whatever the `git` that added it did.
+
+    The lock carries the test's own reason, so a `git` wrapper that treats its
+    own lock specially leaves it to git.
+    """
+    state = _worktree_state(pool, path)
+    assert state != "absent", f"{path} is not registered in {pool}"
+    if state != "unlocked":
+        _git(["-C", str(pool), "worktree", "unlock", str(path)], cwd=pool)
+    if locked:
+        _git(["-C", str(pool), "worktree", "lock", "--reason", _TEST_LOCK_REASON, str(path)], cwd=pool)
+    assert _worktree_state(pool, path) == (_TEST_LOCKED if locked else "unlocked")
+
+
+def _ensure_test_workspace(mgr: SandboxManager, number: int, upstream_repo: Path) -> Workspace:
+    return mgr.ensure_workspace(
+        repo="octo/widget",
+        number=number,
+        title="t",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["unlocked", "locked"])
+def test_remove_workspace_real_git_clears_dangling_registration(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch, locked: bool
+) -> None:
+    # Integration guard: the other cleanup tests use fake admin entries, so
+    # REAL git never reads what the drop leaves. Here we build a real workspace
+    # (real pool clone + real worktree registration) and run remove_workspace.
+    # The registration must actually be gone afterward, and a fresh add at the
+    # same path must succeed — the real integration risk. A `git` wrapper on
+    # PATH may lock every `git worktree add`, so the test sets the lock state
+    # itself: both states must end with the path reusable. Another dead
+    # registration in the pool is not this workspace's to drop.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = _ensure_test_workspace(mgr, 21, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    repo_dir = ws.repo_dir
+    assert repo_dir.exists()
+    _set_worktree_lock(pool, repo_dir, locked=locked)
+    bystander = tmp_path / "bystander" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(bystander), "HEAD"], cwd=pool)
+    shutil.rmtree(bystander)
+    monkeypatch.setattr("robomp.sandbox._safe_run", _no_git)
 
     mgr.remove_workspace(repo="octo/widget", number=21)
 
-    listed_after = subprocess.run(
-        ["git", "-C", str(pool), "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert str(repo_dir) not in listed_after, listed_after
+    assert _worktree_entry(pool, repo_dir) is None
+    assert _worktree_state(pool, bystander) != "absent"
     # The path is genuinely reusable again — the actual failure the fix prevents.
-    subprocess.run(
-        ["git", "-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"], cwd=pool)
     assert repo_dir.exists()
+
+
+def test_worktree_add_failure_clears_locked_registration(tmp_path: Path, upstream_repo: Path) -> None:
+    # A killed `git worktree add --lock` (the lock can come from a wrapper on
+    # PATH) leaves a locked registration; the failed retry then deletes its
+    # checkout. The cleanup must still drop that registration, or every later
+    # retry fails on the same path, and must leave every other one alone.
+    import robomp.sandbox as s
+
+    pool = tmp_path / "pool"
+    _git(["clone", str(upstream_repo), str(pool)], cwd=tmp_path)
+    repo_dir = tmp_path / "ws" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--lock", "--detach", str(repo_dir), "HEAD"], cwd=tmp_path)
+    _set_worktree_lock(pool, repo_dir, locked=True)
+    bystander = tmp_path / "bystander" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(bystander), "HEAD"], cwd=tmp_path)
+    shutil.rmtree(bystander)
+
+    with pytest.raises(GitCommandError):
+        s._worktree_add(["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"], pool=pool, repo_dir=repo_dir)
+
+    assert not repo_dir.exists()
+    assert _worktree_entry(pool, repo_dir) is None
+    assert _worktree_state(pool, bystander) != "absent"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(repo_dir), "HEAD"], cwd=pool)
+    assert repo_dir.exists()
+
+
+def test_drop_worktree_registration_leaves_the_target_of_a_symlink_alone(tmp_path: Path, upstream_repo: Path) -> None:
+    # A link left where a checkout was names, to git, the worktree it points at;
+    # the cleanup must not drop, unlock or delete that worktree.
+    from robomp.git_ops import _drop_worktree_registration
+
+    pool = tmp_path / "pool"
+    _git(["clone", str(upstream_repo), str(pool)], cwd=tmp_path)
+    other = tmp_path / "other" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", str(other), "HEAD"], cwd=tmp_path)
+    _set_worktree_lock(pool, other, locked=True)
+    link = tmp_path / "ws" / "repo"
+    link.parent.mkdir()
+    link.symlink_to(other)
+
+    _drop_worktree_registration(link, pool)
+
+    assert _worktree_state(pool, other) == _TEST_LOCKED
+    assert (other / "README.md").is_file()
+
+
+def test_drop_worktree_registration_reads_a_relative_path_from_the_process_cwd(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # git runs with the pool as its cwd, where a relative path names another,
+    # live worktree; the cleanup must leave that one alone.
+    from robomp.git_ops import _drop_worktree_registration
+
+    pool = tmp_path / "pool"
+    _git(["clone", str(upstream_repo), str(pool)], cwd=tmp_path)
+    inside_pool = pool / "ws" / "repo"
+    _git(["-C", str(pool), "worktree", "add", "--detach", "ws/repo", "HEAD"], cwd=tmp_path)
+    _set_worktree_lock(pool, inside_pool, locked=True)
+    (tmp_path / "proc").mkdir()
+    monkeypatch.chdir(tmp_path / "proc")
+
+    _drop_worktree_registration(Path("ws/repo"), pool)
+
+    assert _worktree_state(pool, inside_pool) == _TEST_LOCKED
+    assert (inside_pool / "README.md").is_file()
+
+
+@pytest.mark.parametrize("locked", [False, True], ids=["target-unlocked", "target-locked"])
+def test_remove_workspace_leaves_the_target_of_a_symlinked_checkout_alone(
+    tmp_path: Path, upstream_repo: Path, locked: bool
+) -> None:
+    # The workspace is the agent's to change: it can replace its checkout with a
+    # link to another workspace's. Removing the first workspace must not delete,
+    # unlock or unregister the second.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws_a = _ensure_test_workspace(mgr, 21, upstream_repo)
+    ws_b = _ensure_test_workspace(mgr, 22, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    (ws_b.repo_dir / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+    _set_worktree_lock(pool, ws_b.repo_dir, locked=locked)
+    # A's checkout and registration are gone, and a link to B's checkout is in its place.
+    _git(["-C", str(pool), "worktree", "remove", "--force", "--force", str(ws_a.repo_dir)], cwd=pool)
+    ws_a.repo_dir.symlink_to(ws_b.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=21)
+
+    assert (ws_b.repo_dir / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert _worktree_state(pool, ws_b.repo_dir) == (_TEST_LOCKED if locked else "unlocked")
+    assert not os.path.lexists(ws_a.root)
+
+
+def test_sandbox_manager_with_a_relative_root_keeps_worktrees_out_of_the_pool(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every worktree is added with the pool as git's cwd; a relative root would
+    # make git put it inside the pool.
+    monkeypatch.chdir(tmp_path)
+    mgr = SandboxManager(Path("workspaces"))
+
+    ws = _ensure_test_workspace(mgr, 21, upstream_repo)
+
+    expected = Path.cwd() / "workspaces" / workspace_key("octo/widget", 21) / "repo"
+    pool = Path.cwd() / "workspaces" / "_pool" / "octo__widget"
+    assert ws.repo_dir == expected
+    assert (expected / "README.md").is_file()
+    assert _worktree_state(pool, expected) != "absent"
+    assert not (pool / "workspaces").exists()
+
+
+def _admin(checkout: Path) -> Path:
+    """The pool's `worktrees/<id>` entry a checkout's `.git` file names."""
+    return Path((checkout / ".git").read_text(encoding="utf-8").split("gitdir:", 1)[1].strip())
+
+
+def _registrations_of(pool: Path, checkout: Path) -> list[Path]:
+    """Every `worktrees/<id>` entry of ``pool`` whose `gitdir` names ``checkout``, read as bytes.
+
+    Git removes `worktrees/` itself with its last entry: then there are none.
+    """
+    worktrees = pool / ".git" / "worktrees"
+    if not worktrees.is_dir():
+        return []
+    want = os.fsencode(checkout) + b"/.git"
+    return [entry for entry in worktrees.iterdir() if (entry / "gitdir").read_bytes().rstrip(b"\r\n") == want]
+
+
+def test_remove_workspace_leaves_another_workspace_a_dotdot_registration_names(
+    tmp_path: Path, upstream_repo: Path
+) -> None:
+    # The agent in workspace A owns A's root and can write the pool's admin
+    # entries: it links `A/L` to B's checkout and points B's registration at
+    # `<A>/L/../repo`, which the kernel and git resolve to B's checkout and
+    # `os.path.abspath` reads as `<A>/repo`. Removing A must not delete B's
+    # checkout or its uncommitted work, locked or not.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws_a = _ensure_test_workspace(mgr, 1, upstream_repo)
+    ws_b = _ensure_test_workspace(mgr, 2, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    (ws_b.repo_dir / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+    _set_worktree_lock(pool, ws_b.repo_dir, locked=True)
+    a_admin, b_admin = _admin(ws_a.repo_dir), _admin(ws_b.repo_dir)
+    (ws_a.root / "L").symlink_to(ws_b.repo_dir)
+    (b_admin / "gitdir").write_text(f"{ws_a.root}/L/../repo/.git\n", encoding="utf-8")
+    shutil.rmtree(a_admin)
+    shutil.rmtree(ws_a.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert (ws_b.repo_dir / "uncommitted.txt").read_text(encoding="utf-8") == "work in progress\n"
+    assert (ws_b.repo_dir / "README.md").is_file()
+    assert not os.path.lexists(ws_a.root)
+
+
+@pytest.mark.parametrize("bad_lock", ["directory", "dangling-link"])
+def test_remove_workspace_is_not_stopped_by_another_entry_with_an_unreadable_lock(
+    tmp_path: Path, upstream_repo: Path, bad_lock: str
+) -> None:
+    # Any agent can corrupt its own admin entry in the shared pool; `git
+    # worktree list` then fails for the whole pool. Another workspace's cleanup
+    # must still drop its own registration and finish.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws_a = _ensure_test_workspace(mgr, 1, upstream_repo)
+    ws_c = _ensure_test_workspace(mgr, 3, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    _set_worktree_lock(pool, ws_a.repo_dir, locked=False)
+    lock = _admin(ws_a.repo_dir) / "locked"
+    if bad_lock == "directory":
+        lock.mkdir()
+    else:
+        lock.symlink_to(tmp_path / "nowhere")
+    c_admin = _admin(ws_c.repo_dir)
+    shutil.rmtree(ws_c.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=3)
+
+    assert not c_admin.exists()
+    assert not ws_c.root.exists()
+
+
+def test_remove_workspace_is_not_stopped_by_a_worktree_path_that_is_not_utf8(
+    tmp_path: Path, upstream_repo: Path
+) -> None:
+    # A path is bytes to git and the kernel; one that is not UTF-8 in the pool
+    # must not stop another workspace's cleanup.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws_a = _ensure_test_workspace(mgr, 1, upstream_repo)
+    ws_c = _ensure_test_workspace(mgr, 3, upstream_repo)
+    odd = os.fsencode(tmp_path / "extra-") + b"\xff"
+    subprocess.run(
+        [b"git", b"-C", os.fsencode(ws_a.repo_dir), b"worktree", b"add", b"-q", b"--detach", odd, b"HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    c_admin = _admin(ws_c.repo_dir)
+    shutil.rmtree(ws_c.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=3)
+
+    assert not c_admin.exists()
+    assert os.path.isdir(odd), "the live worktree with the odd path was touched"
+
+
+def test_remove_workspace_is_not_stopped_by_a_path_that_reads_as_a_listing_line(
+    tmp_path: Path, upstream_repo: Path
+) -> None:
+    # `str.splitlines` splits at `\x1c`, so a path holding `\x1cworktree <A>/repo`
+    # reads as a registration of A's checkout in `git worktree list`. A's
+    # cleanup must not act on it, and must finish.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws_a = _ensure_test_workspace(mgr, 1, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    injected = Path(f"{tmp_path / 'inj'}\x1cworktree {ws_a.repo_dir}")
+    _git(["-C", str(ws_a.repo_dir), "worktree", "add", "-q", "--detach", str(injected), "HEAD"], cwd=pool)
+    shutil.rmtree(_admin(ws_a.repo_dir))
+    shutil.rmtree(ws_a.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert not ws_a.root.exists()
+    assert (injected / "README.md").is_file(), "the live injected worktree was touched"
+
+
+def test_remove_workspace_drops_registrations_of_worktrees_inside_the_workspace(
+    tmp_path: Path, upstream_repo: Path
+) -> None:
+    # A worktree the agent added inside its own workspace goes with the
+    # workspace root; its registration, still holding the issue branch, must go
+    # too, or every later add of that branch fails.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = _ensure_test_workspace(mgr, 1, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    _git(["-C", str(ws.repo_dir), "switch", "-q", "--detach"], cwd=pool)
+    _git(["-C", str(ws.repo_dir), "worktree", "add", "-q", str(ws.root / ".omp-tmp" / "sub"), ws.branch], cwd=pool)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert _ensure_test_workspace(mgr, 1, upstream_repo).repo_dir.is_dir()
+
+
+@pytest.mark.parametrize("root_kind", ["dotdot", "symlink"])
+def test_remove_workspace_drops_its_registration_under_a_root_reached_through_a_link(
+    tmp_path: Path, upstream_repo: Path, root_kind: str
+) -> None:
+    # git registers the resolved path; the cleanup must find it whatever links
+    # the configured root goes through, `<link>/..` included.
+    (tmp_path / "deep" / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "deep" / "sub")
+    (tmp_path / "real").mkdir()
+    (tmp_path / "symroot").symlink_to(tmp_path / "real")
+    root = {"dotdot": tmp_path / "link" / ".." / "ws", "symlink": tmp_path / "symroot" / "ws"}[root_kind]
+    mgr = SandboxManager(root)
+    ws = _ensure_test_workspace(mgr, 1, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    resolved = Path(os.path.realpath(ws.repo_dir))
+    assert _registrations_of(pool, resolved), "precondition: git registered the resolved path"
+    shutil.rmtree(ws.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert _registrations_of(pool, resolved) == []
+    assert _ensure_test_workspace(mgr, 1, upstream_repo).repo_dir.is_dir()
+
+
+def test_remove_workspace_drops_its_registration_whatever_decoys_link_to_its_root(
+    tmp_path: Path, upstream_repo: Path
+) -> None:
+    # Dead registrations whose parent is a link to A's root resolve to A's
+    # checkout too. A's own registration must go with them, and the next add
+    # at A's path must succeed.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = _ensure_test_workspace(mgr, 1, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    for k in range(8):
+        decoy = tmp_path / f"decoy{k}"
+        decoy.mkdir()
+        _git(["-C", str(ws.repo_dir), "worktree", "add", "-q", "--detach", str(decoy / "repo"), "HEAD"], cwd=pool)
+        shutil.rmtree(decoy)
+        decoy.symlink_to(ws.root)
+    own = _admin(ws.repo_dir)
+    shutil.rmtree(ws.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert not own.exists()
+    assert _ensure_test_workspace(mgr, 1, upstream_repo).repo_dir.is_dir()
+
+
+def test_remove_workspace_drops_every_registration_of_its_checkout(tmp_path: Path, upstream_repo: Path) -> None:
+    # A copied admin entry gives one path two registrations; both must go, or
+    # the next add at that path fails.
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = _ensure_test_workspace(mgr, 1, upstream_repo)
+    own = _admin(ws.repo_dir)
+    copy = own.parent / "copy-of-own"
+    shutil.copytree(own, copy)
+    shutil.rmtree(ws.repo_dir)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+
+    assert not own.exists() and not copy.exists()
+    assert _ensure_test_workspace(mgr, 1, upstream_repo).repo_dir.is_dir()
+
+
+def test_worktree_cleanup_runs_no_git_once_the_checkout_is_gone(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git's own `worktree remove --force --force <path>` checks for the path
+    # twice, and a link made between the checks is followed into another
+    # worktree. Once a checkout is gone the cleanup must run no git at all:
+    # neither `remove_workspace` nor a failed add's cleanup.
+    import robomp.sandbox as s
+
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = _ensure_test_workspace(mgr, 1, upstream_repo)
+    pool = mgr.pool_path("octo/widget")
+    shutil.rmtree(ws.repo_dir)
+    argv: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy(cmd: Any, *args: object, **kwargs: object) -> subprocess.CompletedProcess[Any]:
+        argv.append([os.fsdecode(part) for part in cmd])
+        return real_run(cmd, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "run", spy)
+
+    mgr.remove_workspace(repo="octo/widget", number=1)
+    assert argv == []
+
+    repo_dir = tmp_path / "ws" / "repo"
+    real_run(["git", "-C", str(pool), "worktree", "add", "--lock", "--detach", str(repo_dir), "HEAD"], check=True)
+    with pytest.raises(GitCommandError):
+        s._worktree_add(["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"], pool=pool, repo_dir=repo_dir)
+    assert argv == [["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"]]
+    assert _worktree_entry(pool, repo_dir) is None
 
 
 def test_worktree_add_cleans_partial_state_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2198,59 +3048,64 @@ def test_worktree_add_cleans_partial_state_on_failure(tmp_path: Path, monkeypatc
     import robomp.sandbox as s
 
     pool = tmp_path / "pool"
-    pool.mkdir()
+    (pool / ".git").mkdir(parents=True)
     repo_dir = tmp_path / "ws" / "repo"
     repo_dir.mkdir(parents=True)
     (repo_dir / "leftover").write_text("partial", encoding="utf-8")
+    own = _fake_registration(pool, "repo", repo_dir)
 
     def boom_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         raise s.GitCommandError(cmd, 124, "", "timed out")
 
-    pruned: list[list[str]] = []
-
-    def fake_safe_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        pruned.append(list(cmd))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
     monkeypatch.setattr("robomp.sandbox._run", boom_run)
-    monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
 
     with pytest.raises(GitCommandError) as exc:
         s._worktree_add(["git", "worktree", "add", str(repo_dir), "main"], pool=pool, repo_dir=repo_dir)
 
     assert exc.value.returncode == 124  # the original add failure is surfaced
     assert not repo_dir.exists()  # partial checkout removed
-    assert ["git", "worktree", "prune"] in pruned  # pool pruned
+    assert not own.exists()  # its registration dropped
 
 
-def test_worktree_add_raises_prune_failure_chained_from_add_error(
+def _failing_rmtree_under(root: Path) -> Callable[..., None]:
+    """`shutil.rmtree` that fails for every path under ``root`` and works elsewhere."""
+    real_rmtree = shutil.rmtree
+
+    def rmtree(path: str | os.PathLike[str], *args: Any, **kwargs: Any) -> None:
+        if Path(path).is_relative_to(root):
+            raise PermissionError(13, "Permission denied", str(path))
+        real_rmtree(path, *args, **kwargs)
+
+    return rmtree
+
+
+def test_worktree_add_raises_drop_failure_chained_from_add_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # If the cleanup prune ALSO fails, that failure must be raised (a dangling
-    # registration left behind is what poisons the retry) — chained from the
-    # original add error so the root cause is not lost.
+    # If dropping the registration ALSO fails, that failure must be raised (a
+    # dangling registration left behind is what poisons the retry) — chained
+    # from the original add error so the root cause is not lost.
     import robomp.sandbox as s
 
     pool = tmp_path / "pool"
-    pool.mkdir()
+    (pool / ".git").mkdir(parents=True)
     repo_dir = tmp_path / "ws" / "repo"
     repo_dir.mkdir(parents=True)
+    own = _fake_registration(pool, "repo", repo_dir)
 
     add_err = s.GitCommandError(["git", "worktree", "add"], 1, "", "add failed")
 
     def boom_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         raise add_err
 
-    def fake_safe_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(cmd, 124, "", "prune timed out")
-
     monkeypatch.setattr("robomp.sandbox._run", boom_run)
-    monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
+    monkeypatch.setattr("robomp.git_ops.shutil.rmtree", _failing_rmtree_under(pool / ".git"))
 
     with pytest.raises(GitCommandError) as exc:
         s._worktree_add(["git", "worktree", "add", str(repo_dir), "main"], pool=pool, repo_dir=repo_dir)
 
-    assert exc.value.returncode == 124  # the PRUNE failure (124), not the add (1)
+    assert exc.value is not add_err  # the DROP failure, not the add's
+    assert str(own) in exc.value.stderr
     assert exc.value.__cause__ is add_err  # chained from the add error
 
 
@@ -2286,54 +3141,64 @@ def test_ensure_clone_fails_before_fetch_when_origin_probe_times_out(
     )
 
 
-def test_remove_workspace_raises_when_prune_times_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # After a failed `git worktree remove`, `git worktree prune` is the step that
-    # clears the dangling registration. If prune ITSELF fails (incl. a 124
-    # timeout), remove_workspace must raise so the cleanup event retries — not
-    # record success while stale metadata still blocks the next add.
+def test_remove_workspace_raises_when_dropping_the_registration_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dropping the registration is the step that clears it. If that ITSELF
+    # fails, remove_workspace must raise so the cleanup event retries — not
+    # record success while stale metadata still blocks the next add. The
+    # workspace root is removed first all the same.
     mgr = SandboxManager(tmp_path)
-    ws_root = mgr.workspace_root("o/r", 31)
-    repo_dir = ws_root / "repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    pool = mgr.pool_path("o/r")
-    pool.mkdir(parents=True, exist_ok=True)
-    (pool / ".git").mkdir(exist_ok=True)  # mark as a real git pool for the cleanup gate
-
-    calls: list[list[str]] = []
-
-    def fake_safe_run(cmd: list[str], **k: object) -> subprocess.CompletedProcess[str]:
-        calls.append(list(cmd))
-        if cmd[:3] == ["git", "worktree", "remove"]:
-            # Distinct code (1, NOT 124) so the assertion below proves the raised
-            # error came from PRUNE, not from the remove failure.
-            return subprocess.CompletedProcess(cmd, 1, "", "remove failed")
-        if cmd[:3] == ["git", "worktree", "prune"]:
-            return subprocess.CompletedProcess(cmd, 124, "", "prune timed out")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr("robomp.sandbox._safe_run", fake_safe_run)
+    ws_root, repo_dir, pool = _fake_pool_workspace(mgr, 31)
+    repo_dir.mkdir()
+    own = _fake_registration(pool, "repo", repo_dir)
+    monkeypatch.setattr("robomp.sandbox._safe_run", _no_git)
+    monkeypatch.setattr("robomp.git_ops.shutil.rmtree", _failing_rmtree_under(pool / ".git" / "worktrees"))
 
     with pytest.raises(GitCommandError) as exc:
         mgr.remove_workspace(repo="o/r", number=31)
-    # Prune actually ran, and the surfaced error is prune's (124) — not remove's (1).
-    assert ["git", "worktree", "prune"] in calls, "prune did not run after a failed remove"
-    assert exc.value.returncode == 124
+    assert str(own) in exc.value.stderr
+    assert own.exists()
+    assert not ws_root.exists()
 
 
-def test_remove_workspace_prunes_when_checkout_already_gone_on_entry(
+def test_remove_workspace_keeps_registrations_it_cannot_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An entry whose `gitdir` is missing, relative (git 2.48's
+    # `worktree.useRelativePaths`) or not a `.git` path cannot be resolved
+    # without guessing; it is kept, and the workspace's own entry still goes.
+    mgr = SandboxManager(tmp_path)
+    ws_root, repo_dir, pool = _fake_pool_workspace(mgr, 32)
+    own = _fake_registration(pool, "repo", repo_dir)
+    worktrees = pool / ".git" / "worktrees"
+    no_gitdir = worktrees / "no-gitdir"
+    no_gitdir.mkdir()
+    relative = worktrees / "relative"
+    relative.mkdir()
+    (relative / "gitdir").write_text(f"../../{ws_root.name}/repo/.git\n", encoding="utf-8")
+    not_dot_git = worktrees / "not-dot-git"
+    not_dot_git.mkdir()
+    (not_dot_git / "gitdir").write_text(f"{repo_dir}/elsewhere\n", encoding="utf-8")
+    monkeypatch.setattr("robomp.sandbox._safe_run", lambda cmd, **k: pytest.fail(f"ran git: {cmd}"))
+
+    mgr.remove_workspace(repo="o/r", number=32)
+
+    assert not own.exists()
+    assert no_gitdir.exists() and relative.exists() and not_dot_git.exists()
+    assert not ws_root.exists()
+
+
+def test_remove_workspace_drops_registration_when_checkout_already_gone_on_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A prior remove/worktree-add killed mid-flight can leave the checkout gone
     # but the pool's worktree registration dangling. On the NEXT remove_workspace
     # the checkout is already missing on entry, yet the stale registration must
-    # still be pruned — the old `if repo_dir.exists()` guard skipped it entirely.
+    # still be dropped — the old `if repo_dir.exists()` guard skipped it entirely.
     mgr = SandboxManager(tmp_path)
-    ws_root = mgr.workspace_root("o/r", 33)
-    repo_dir = ws_root / "repo"
-    ws_root.mkdir(parents=True, exist_ok=True)  # ws_root present, but NO repo_dir
-    pool = mgr.pool_path("o/r")
-    pool.mkdir(parents=True, exist_ok=True)
-    (pool / ".git").mkdir(exist_ok=True)  # mark as a real git pool for the cleanup gate
+    ws_root, repo_dir, pool = _fake_pool_workspace(mgr, 33)  # ws_root present, but NO repo_dir
+    own = _fake_registration(pool, "repo", repo_dir)
     assert not repo_dir.exists()  # precondition: checkout already gone
 
     calls: list[list[str]] = []
@@ -2346,12 +3211,9 @@ def test_remove_workspace_prunes_when_checkout_already_gone_on_entry(
 
     mgr.remove_workspace(repo="o/r", number=33)
 
-    # No `git worktree remove` (nothing to remove), but prune MUST run to clear
-    # any dangling registration for the missing path.
-    assert ["git", "worktree", "prune"] in calls, (
-        "prune was skipped for a checkout already gone on entry — dangling registration would persist"
-    )
-    assert not any(c[:3] == ["git", "worktree", "remove"] for c in calls)
+    # Nothing to remove with git, but the dangling registration must go.
+    assert not own.exists(), "the registration of a checkout already gone on entry was left"
+    assert calls == []
     assert not ws_root.exists()  # ws_root still cleaned up
 
 
@@ -2360,8 +3222,8 @@ def test_remove_workspace_no_git_ops_when_pool_is_not_a_real_clone(
 ) -> None:
     # `ensure_clone` mkdir's the pool dir BEFORE cloning, so a failed first clone
     # can leave a non-git dir at pool_path. A later remove_workspace (e.g. on
-    # reopen) must NOT run `git worktree prune` there — it would error on a
-    # non-git dir and raise. It must be a clean no-op that still clears ws_root.
+    # reopen) must NOT run git there — it would error on a non-git dir and
+    # raise. It must be a clean no-op that still clears ws_root.
     mgr = SandboxManager(tmp_path)
     ws_root = mgr.workspace_root("o/r", 41)
     ws_root.mkdir(parents=True, exist_ok=True)
@@ -2383,13 +3245,13 @@ def test_remove_workspace_no_git_ops_when_pool_is_not_a_real_clone(
     assert not ws_root.exists()  # ws_root still cleaned up
 
 
-def test_remove_workspace_skips_prune_on_repeat_close_after_full_cleanup(
+def test_remove_workspace_runs_no_git_on_repeat_close_after_full_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A fully-cleaned workspace has no ws_root. A duplicate/repeat close (GitHub
-    # can redeliver a close webhook) must NOT run a speculative `git worktree
-    # prune` on the shared pool every time — there is no dangling registration
-    # once the first cleanup succeeded. Guarded by `ws_root.exists()`.
+    # can redeliver a close webhook) must NOT run git on the shared pool every
+    # time — there is no dangling registration once the first cleanup
+    # succeeded. remove_workspace runs no git at all.
     mgr = SandboxManager(tmp_path)
     ws_root = mgr.workspace_root("o/r", 43)
     repo_dir = ws_root / "repo"
@@ -2408,7 +3270,7 @@ def test_remove_workspace_skips_prune_on_repeat_close_after_full_cleanup(
 
     mgr.remove_workspace(repo="o/r", number=43)
 
-    assert calls == [], "repeat close ran a spurious git worktree prune on an already-clean workspace"
+    assert calls == [], "repeat close ran git on an already-clean workspace"
 
 
 def _seed_reclaimable_workspace(mgr: SandboxManager, repo: str, number: int) -> Path:

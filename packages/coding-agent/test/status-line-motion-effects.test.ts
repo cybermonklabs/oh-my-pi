@@ -7,15 +7,24 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { setMotionEffects } from "@oh-my-pi/pi-tui/motion-effects";
 import { DEFAULT_SPINNER_INTERVAL_MS, setSpinnerInterval } from "@oh-my-pi/pi-tui/spinner-clock";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
+import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
+// The fade is read off the brand glyph's truecolor foreground, so these cases run on a
+// truecolor terminal; on a 256-color one the glyph takes a palette color with nothing to ease.
+const originalTrueColor = TERMINAL.trueColor;
+
 beforeAll(async () => {
+	Object.defineProperty(TERMINAL, "trueColor", { value: true, configurable: true });
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
 	await initTheme();
 });
 
-afterAll(() => resetSettingsForTest());
+afterAll(() => {
+	resetSettingsForTest();
+	Object.defineProperty(TERMINAL, "trueColor", { value: originalTrueColor, configurable: true });
+});
 afterEach(() => {
 	setMotionEffects(true);
 	setSpinnerInterval(DEFAULT_SPINNER_INTERVAL_MS);

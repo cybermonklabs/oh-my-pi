@@ -206,6 +206,25 @@ describe("IrcBridge broadcast legs reaching a streaming recipient", () => {
 		expect(bridge.drainPending({ keepPeerMessages: true }).map(record => record.timestamp)).toEqual([6, 7]);
 	});
 
+	it("drains a message from a descendant whose parent between them ended, since the recipient's run may wait on it", async () => {
+		// If this regresses, a keep-alive subagent under a subagent that has ended (unregistered) reaches its
+		// ancestor as a peer: its question waits for a turn of its own while the ancestor's run waits on it.
+		const { bridge } = makeStreamingChild();
+		const registry = AgentRegistry.global();
+		registry.register({ id: "Child.Kid", displayName: "kid", kind: "sub", parentId: "Child", session: null });
+		registry.register({
+			id: "Child.Kid.Grand",
+			displayName: "grand",
+			kind: "sub",
+			parentId: "Child.Kid",
+			session: null,
+		});
+		registry.unregister("Child.Kid");
+		await bridge.deliver({ id: "g2", from: "Child.Kid.Grand", to: "Child", body: "question?", ts: 8 });
+
+		expect(bridge.drainPending({ keepPeerMessages: true }).map(record => record.timestamp)).toEqual([8]);
+	});
+
 	it("counts only queued IRC messages as a sender's question still waiting for a turn", async () => {
 		const { bridge } = makeStreamingChild();
 		bridge.queueAside([

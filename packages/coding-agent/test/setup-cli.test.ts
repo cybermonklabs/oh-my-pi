@@ -5,6 +5,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { checkPythonSetup } from "../src/cli/setup-cli";
 import { Settings } from "../src/config/settings";
 import { restoreEnvValue } from "./helpers/settings-test-state";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -62,8 +63,8 @@ async function runSetup(cwd: string, ...setupArgs: string[]): Promise<CliProcess
  * Hide any activated Python environment from the in-process probe for the
  * duration of a test. The resolver reads the live env (`resolveVenvPath`) and
  * the process-wide cached shell env (`Settings#getShellConfig().env`), so both
- * are covered. Returns the restore function; the spy is undone by
- * `vi.restoreAllMocks()` in `afterEach`.
+ * are covered; the shell env's home is one of its own. Returns the restore
+ * function; the spy is undone by `vi.restoreAllMocks()` in `afterEach`.
  */
 function hideActivePythonEnv(): () => void {
 	const previous = new Map<string, string | undefined>(ACTIVE_PYTHON_ENV_VARS.map(name => [name, process.env[name]]));
@@ -71,7 +72,7 @@ function hideActivePythonEnv(): () => void {
 	vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 		shell: "/bin/sh",
 		args: ["-c"],
-		env: { PATH: Bun.env.PATH ?? "", HOME: Bun.env.HOME ?? "" },
+		env: createProductionChildEnv({ PATH: Bun.env.PATH }),
 		prefix: undefined,
 	});
 	return () => {

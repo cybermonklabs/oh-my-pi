@@ -14,7 +14,9 @@ import securityRequestPrompt from "../prompts/security/scan-request.md" with { t
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
+import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
 import type { AuthStorage } from "../session/auth-storage";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager } from "../session/session-manager";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
@@ -125,7 +127,7 @@ export interface SecurityScanSession {
 		premiumRequests: number;
 	};
 	abort(options?: { reason?: string }): Promise<void>;
-	dispose(): Promise<void>;
+	dispose(options?: AgentSessionDisposeOptions): Promise<void>;
 	readonly sessionFile?: string;
 }
 
@@ -256,7 +258,7 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		getApiKey: createSecurityAuthResolver({
 			authStorage: input.host.authStorage,
 			auth: input.plan.account,
-			providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
+			providerResolver: model => input.host.modelRegistry.turnResolver(model, providerSessionId),
 		}),
 		providerSessionId,
 		sessionManager: input.sessionManager,
@@ -544,7 +546,12 @@ export class SecurityCoordinator {
 		if (!record) return false;
 		if (["completed", "partial", "cancelled", "failed"].includes(record.snapshot.phase)) return false;
 		if (record.snapshot.jobId && this.#host.asyncJobManager) {
-			return this.#host.asyncJobManager.cancel(record.snapshot.jobId, { ownerId: this.#host.agentId });
+			// The scan's caller stopped it; the scan session aborts with its own reason (below).
+			return this.#host.asyncJobManager.cancel(
+				record.snapshot.jobId,
+				{ ownerId: this.#host.agentId },
+				plainTurnAbortReason("stop"),
+			);
 		}
 		record.abortController?.abort(new Error("Security scan cancelled"));
 		return true;
@@ -712,7 +719,8 @@ export class SecurityCoordinator {
 			this.#update(record, cancelled ? "cancelled" : "failed", message);
 			await store.putBundle(terminal);
 		} finally {
-			await session?.dispose().catch(() => undefined);
+			// The host session goes on ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+			await session?.dispose({ ownedJobsEnd: "stop" }).catch(() => undefined);
 			await executionTarget?.cleanup().catch(() => undefined);
 			ACTIVE_SECURITY_OPERATIONS.delete(record.snapshot.operationId);
 		}

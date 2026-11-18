@@ -6,7 +6,9 @@
 //! lists a directory, visits its entries, queues all but the first
 //! subdirectory it finds and continues with that first subdirectory itself,
 //! awaiting only filesystem calls and, in a streaming walk, room in the
-//! bounded output channel. The walk is over once no job is queued or running.
+//! bounded output channel. The walk is over once no job is queued or running:
+//! the worker that finishes the last job closes the queue, which ends every
+//! other worker's wait.
 //!
 //! A [`Sink`] may also settle each directory's visited items on the worker
 //! that listed it, before they are sent ([`Sink::settle`]): a search reads
@@ -33,7 +35,7 @@ use std::{
 	},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use super::{
@@ -48,7 +50,9 @@ use crate::{
 };
 
 /// Directory handles kept open so pending children can open relative to
-/// them; past the cap, children open by absolute path.
+/// them; past the cap, children open below the root's handle (by path in a
+/// walk that follows symlinks). The root's own handle, kept for those opens,
+/// counts against the cap.
 const MAX_RETAINED_DIRS: usize = 1024;
 
 /// What a walk does with entries: [`super::walk`] visits and produces output,
@@ -86,8 +90,8 @@ pub(crate) trait Sink: Send + Sync + 'static {
 	/// Settles the non-empty `items` of one directory into its output, on the
 	/// worker that listed it, with that worker's `session` and `state`.
 	/// `dir` is the open listed directory (none for a cached listing), for
-	/// opening files relative to it; otherwise they open by
-	/// [`Worker::abs_rel`]. No output sends nothing.
+	/// opening files relative to it; otherwise they open with
+	/// [`Worker::open_file`]. No output sends nothing.
 	fn settle(
 		&self,
 		state: &mut Self::State,
@@ -404,6 +408,9 @@ struct Ctx<K: Sink> {
 	fs:        Fs,
 	/// Absolute root.
 	root:      PathBuf,
+	/// The open root of a walk that does not follow symlinks, for opening
+	/// entries whose listing carries no handle below it.
+	root_dir:  Option<Arc<Dir>>,
 	opts:      Options,
 	sink:      K,
 	ignorer:   Option<Ignorer>,
@@ -411,13 +418,12 @@ struct Ctx<K: Sink> {
 	/// Device of the root under `same_file_system`.
 	root_dev:  Option<FileId>,
 	retained:  Arc<AtomicUsize>,
-	/// Job queue; `None` tells a worker the walk is over.
-	jobs:      flume::Sender<Option<Job>>,
-	workers:   usize,
+	/// Job queue, taken and dropped (closing it) once the walk is over.
+	jobs:      RwLock<Option<flume::Sender<Job>>>,
 	/// Jobs queued or running; a job's continuation counts as part of it.
 	pending:   AtomicUsize,
 	/// Scratch of workers that ended; every arena is in here or owned by a
-	/// running worker.
+	/// worker task, from its spawn on ([`Owned`]).
 	scratches: Mutex<Vec<Scratch<K::State>>>,
 	shared:    Arc<Shared>,
 	/// Output channel of a streaming walk.
@@ -434,20 +440,24 @@ impl<K: Sink> Drop for Ctx<K> {
 	}
 }
 
-/// A worker's [`Scratch`], handed back to the walk when the worker ends, also
-/// when a visitor panics (which halts the walk) or the task is aborted.
-struct Owned<'c, K: Sink> {
-	ctx:     &'c Ctx<K>,
+/// A worker's [`Scratch`], handed back to the walk when the worker's task
+/// ends: when the worker finishes, when a visitor panics (which halts the
+/// walk), and when the task is aborted, also before its first poll. Jobs
+/// carry paths carved from a scratch's arena (the seed's holds the root's
+/// children), so it is built before the task is spawned: dropping a scratch
+/// with its task would free paths other workers are still reading.
+struct Owned<K: Sink> {
+	ctx:     Arc<Ctx<K>>,
 	scratch: ManuallyDrop<Scratch<K::State>>,
 }
 
-impl<'c, K: Sink> Owned<'c, K> {
-	const fn new(ctx: &'c Ctx<K>, scratch: Scratch<K::State>) -> Self {
+impl<K: Sink> Owned<K> {
+	const fn new(ctx: Arc<Ctx<K>>, scratch: Scratch<K::State>) -> Self {
 		Self { ctx, scratch: ManuallyDrop::new(scratch) }
 	}
 }
 
-impl<K: Sink> Deref for Owned<'_, K> {
+impl<K: Sink> Deref for Owned<K> {
 	type Target = Scratch<K::State>;
 
 	fn deref(&self) -> &Scratch<K::State> {
@@ -455,13 +465,13 @@ impl<K: Sink> Deref for Owned<'_, K> {
 	}
 }
 
-impl<K: Sink> DerefMut for Owned<'_, K> {
+impl<K: Sink> DerefMut for Owned<K> {
 	fn deref_mut(&mut self) -> &mut Scratch<K::State> {
 		&mut self.scratch
 	}
 }
 
-impl<K: Sink> Drop for Owned<'_, K> {
+impl<K: Sink> Drop for Owned<K> {
 	fn drop(&mut self) {
 		if std::thread::panicking() {
 			self.ctx.shared.panicked.store(true, Ordering::Relaxed);
@@ -518,7 +528,7 @@ pub(super) async fn start<K: Sink>(
 		let abs_root = absolute_root(&fs, &given);
 		let workers = opts.parallelism(&fs);
 		let mut st = Scratch::new(&fs, sink.state());
-		let root_dir = st.session.open_dir(&abs_root).await.map_err(root_error)?;
+		let root_dir = Arc::new(st.session.open_dir(&abs_root).await.map_err(root_error)?);
 		let cache = cache
 			.filter(|_| opts.detail == Detail::Minimal && fs.is_native() && !opts.same_file_system);
 		let (ignorer, root_frame) = if opts.gitignore {
@@ -533,17 +543,21 @@ pub(super) async fn start<K: Sink>(
 			None
 		};
 		let (jobs, queue) = flume::unbounded();
+		// A walk that does not follow symlinks keeps the root open for opens
+		// below it, counted as one retained handle.
+		let root_kept = (!opts.follow_links).then(|| Arc::clone(&root_dir));
+		let retained = Arc::new(AtomicUsize::new(usize::from(root_kept.is_some())));
 		let ctx = Arc::new(Ctx {
 			fs,
 			root: abs_root,
+			root_dir: root_kept,
 			opts,
 			sink,
 			ignorer,
 			cache,
 			root_dev,
-			retained: Arc::new(AtomicUsize::new(0)),
-			jobs,
-			workers,
+			retained,
+			jobs: RwLock::new(Some(jobs)),
 			pending: AtomicUsize::new(0),
 			scratches: Mutex::new(Vec::new()),
 			shared,
@@ -587,8 +601,12 @@ pub(super) async fn start<K: Sink>(
 					Some(seed) => seed,
 					None => (Scratch::new(&ctx.fs, ctx.sink.state()), None, None),
 				};
+				let scratch = Owned::new(Arc::clone(&ctx), scratch);
 				let worker =
 					Arc::clone(&ctx).work(scratch, first, listed, queue.clone(), done_tx.clone());
+				// The first worker spawned is the seed.
+				#[cfg(test)]
+				let worker = seam::hold_first(&ctx.root, worker);
 				ctx.shared.adopt(tokio::spawn(worker).abort_handle());
 			}
 		} else {
@@ -605,6 +623,11 @@ pub(super) async fn start<K: Sink>(
 }
 
 impl<K: Sink> Started<K> {
+	/// The open root of a walk that does not follow symlinks.
+	pub(super) fn root_dir(&self) -> Option<Arc<Dir>> {
+		self.ctx.root_dir.clone()
+	}
+
 	/// Resolves once every worker has ended.
 	pub(super) async fn finished(&self) {
 		let _ = self.done.recv_async().await;
@@ -635,29 +658,39 @@ impl<K: Sink> Ctx<K> {
 	/// Queues `job` for any worker.
 	fn enqueue(&self, job: Job) {
 		self.pending.fetch_add(1, Ordering::Relaxed);
-		// The queue is unbounded and a send fails only once every worker is gone.
-		let _ = self.jobs.send(Some(job));
+		// The queue is unbounded: a send fails only once every worker is gone.
+		// A closed queue (a panicking visitor stopped the walk) takes no job.
+		if let Some(jobs) = &*self.jobs.read() {
+			let _ = jobs.send(job);
+		}
 	}
 
-	/// Tells every worker the walk is over.
+	/// Tells every worker the walk is over by closing the queue: a worker's
+	/// wait ends once the queue is empty and closed. A close also reaches a
+	/// worker whose wakeup for a queued message was lost, as one stop message
+	/// per worker would not: flume 0.12's `recv_async`, re-registering after
+	/// another worker took the message it was woken for, misses a message
+	/// sent meanwhile (zesterer/flume#177), but rechecks for a closed queue.
 	fn stop(&self) {
-		for _ in 0..self.workers {
-			let _ = self.jobs.send(None);
-		}
+		let jobs = self.jobs.write().take();
+		drop(jobs);
 	}
 
 	/// One worker: settles the already listed `root` if it has one (counted
 	/// as a job), runs `first`, then jobs from `queue`, until the walk's last
-	/// job has finished. `_done` disconnects when the worker ends.
+	/// job has finished and the queue is closed. `_done` disconnects when the
+	/// worker ends, after its scratch is handed back.
 	async fn work(
 		self: Arc<Self>,
-		scratch: Scratch<K::State>,
+		scratch: Owned<K>,
 		first: Option<Job>,
 		root: Option<Listed<K>>,
-		queue: flume::Receiver<Option<Job>>,
+		queue: flume::Receiver<Job>,
 		_done: flume::Sender<()>,
 	) {
-		let mut scratch = Owned::new(self.as_ref(), scratch);
+		// A body local drops before the parameters, so the scratch is handed
+		// back before `_done` disconnects and `Started::finished` resolves.
+		let mut scratch = scratch;
 		if let Some(root) = root {
 			self.deliver(&mut scratch, root).await;
 			if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -670,8 +703,8 @@ impl<K: Sink> Ctx<K> {
 			let job = match next.take() {
 				Some(job) => job,
 				None => match queue.recv_async().await {
-					Ok(Some(job)) => job,
-					Ok(None) | Err(_) => break,
+					Ok(job) => job,
+					Err(_) => break,
 				},
 			};
 			self.chain(&mut scratch, job).await;
@@ -714,11 +747,17 @@ impl<K: Sink> Ctx<K> {
 		&self,
 		st: &mut Scratch<K::State>,
 		job: Job,
-		opened: Option<Dir>,
+		opened: Option<Arc<Dir>>,
 	) -> io::Result<()> {
 		let listed = self.list_dir(st, job, opened).await?;
 		self.deliver(st, listed).await;
 		Ok(())
+	}
+
+	/// The [`Worker`] view of this walk for visitors and settles, building
+	/// paths in `abs`, the calling worker's scratch.
+	fn worker<'w>(&'w self, abs: &'w mut PathBuf) -> Worker<'w> {
+		Worker { fs: &self.fs, root: &self.root, abs, root_dir: self.root_dir.as_deref() }
 	}
 
 	/// Settles the items of a listed directory on this worker, with its
@@ -731,7 +770,7 @@ impl<K: Sink> Ctx<K> {
 			return;
 		}
 		let Scratch { session, abs, state, .. } = st;
-		let mut worker = Worker { fs: &self.fs, root: &self.root, abs };
+		let mut worker = self.worker(abs);
 		let out = self
 			.sink
 			.settle(state, session, &mut worker, dir.as_deref(), items)
@@ -754,17 +793,20 @@ impl<K: Sink> Ctx<K> {
 		&self,
 		st: &mut Scratch<K::State>,
 		job: Job,
-		opened: Option<Dir>,
+		opened: Option<Arc<Dir>>,
 	) -> io::Result<Listed<K>> {
 		let Job { parent, rel: rel_bytes, name_len, depth, count, frame, out } = job;
 		// SAFETY: job paths live in scratch arenas, which the context keeps
 		// until the walk is finished.
 		let rel = unsafe { rel_bytes.get() };
+		#[cfg(test)]
+		seam::listing(rel_bytes);
 		let dir_job = DirJob { rel: rel_bytes, depth, out };
 		if let Some(cache) = self.cache {
 			join_into(&self.fs, &self.root, rel, &mut st.abs);
+			let (with_ignores, follow) = (self.ignorer.is_some(), self.opts.follow_links);
 			if let Some(cached) = cache
-				.lookup(&mut st.session, &st.abs, self.ignorer.is_some(), &mut st.probe)
+				.lookup(&mut st.session, &st.abs, with_ignores, follow, rel.is_empty(), &mut st.probe)
 				.await
 			{
 				drop(parent);
@@ -790,12 +832,16 @@ impl<K: Sink> Ctx<K> {
 					.open_child(&parent.dir, &rel[rel.len() - name_len..])
 					.await;
 				drop(parent);
-				opened?
+				Arc::new(opened?)
 			},
-			(None, None) => {
+			// A cached or over-cap parent: below the root, or by path when
+			// following symlinks (also for a linked directory).
+			(None, None) => Arc::new(if let Some(root) = &self.root_dir {
+				st.session.open_dir_beneath(root, rel).await?
+			} else {
 				join_into(&self.fs, &self.root, rel, &mut st.abs);
 				st.session.open_dir(&st.abs).await?
-			},
+			}),
 		};
 		if depth > 0
 			&& let Some(root_dev) = self.root_dev
@@ -831,7 +877,8 @@ impl<K: Sink> Ctx<K> {
 		} else if names.is_empty() {
 			Some(DirIgnores::default())
 		} else {
-			Some(DirIgnores::load(&mut st.session, &dir, names, stamp.is_some()).await)
+			let follow = self.opts.follow_links;
+			Some(DirIgnores::load(&mut st.session, &dir, names, stamp.is_some(), follow).await)
 		};
 		let frame = match &ignores {
 			Some(ignores) => ignores.frame(frame.as_ref(), names, rel),
@@ -841,7 +888,6 @@ impl<K: Sink> Ctx<K> {
 			join_into(&self.fs, &self.root, rel, &mut st.abs);
 			cache.store(&mut st.session, &st.abs, &dir, stamp, &listing, names, ignores.as_ref());
 		}
-		let dir = Arc::new(dir);
 		let share = self.retained.load(Ordering::Relaxed) < MAX_RETAINED_DIRS;
 		let items = self
 			.emit(st, dir_job, &listing, frame.as_ref(), share.then_some(&dir))
@@ -853,7 +899,8 @@ impl<K: Sink> Ctx<K> {
 	/// Filters and delivers one directory's listing and queues its
 	/// subdirectories; the output its visits produced. With `dir` (passed
 	/// while the walk may keep handles open), children open relative to it;
-	/// cached and over-cap listings pass `None` and children open by path.
+	/// cached and over-cap listings pass `None` and children open below the
+	/// root's handle ([`Self::list_dir`]).
 	async fn emit(
 		&self,
 		st: &mut Scratch<K::State>,
@@ -923,7 +970,7 @@ impl<K: Sink> Ctx<K> {
 				continue;
 			}
 			let mut entry = Entry { path, file_type, depth, size, mtime };
-			let mut worker = Worker { fs: &self.fs, root: &self.root, abs: &mut *abs };
+			let mut worker = self.worker(&mut *abs);
 			match self.sink.visit(&mut worker, &mut entry, &mut batch) {
 				Action::Stop => {
 					self.shared.halt();
@@ -1042,5 +1089,111 @@ async fn follow(
 			}
 		},
 		FileType::Symlink => None,
+	}
+}
+
+/// Test seams for the start of a walk: hold the seed worker's task before
+/// its first poll, and run a hook when a worker is about to list a job, so a
+/// test can drop the walk exactly between the two.
+#[cfg(test)]
+pub(super) mod seam {
+	use std::{
+		future::Future,
+		path::{Path, PathBuf},
+		pin::Pin,
+		sync::{
+			atomic::{AtomicUsize, Ordering},
+			mpsc,
+		},
+		task::{Context, Poll},
+	};
+
+	use parking_lot::Mutex;
+
+	use super::Bytes;
+
+	type Hook = Box<dyn FnOnce(Bytes) + Send>;
+
+	/// Seams registered and not yet used; with none, walks skip the locks
+	/// below, so the seams leave other tests' timing alone.
+	static ARMED: AtomicUsize = AtomicUsize::new(0);
+	/// Walk roots whose next spawned worker is held, with the sender each
+	/// held task drops when it is dropped.
+	static HELD: Mutex<Vec<(PathBuf, mpsc::Sender<()>)>> = Mutex::new(Vec::new());
+	/// Hooks by the final component of the job a worker lists next.
+	static LISTING: Mutex<Vec<(Vec<u8>, Hook)>> = Mutex::new(Vec::new());
+
+	/// Holds the next worker spawned for a walk of `root` (the seed) before
+	/// its first poll, for good; the receiver disconnects once the held task
+	/// has dropped the worker.
+	pub(crate) fn hold_seed(root: &Path) -> mpsc::Receiver<()> {
+		let (dropped, receiver) = mpsc::channel();
+		HELD.lock().push((root.to_path_buf(), dropped));
+		ARMED.fetch_add(1, Ordering::SeqCst);
+		receiver
+	}
+
+	/// Runs `hook` with the job's walk-relative path just before a worker
+	/// lists the first job named `name`.
+	pub(crate) fn before_listing(name: &str, hook: impl FnOnce(Bytes) + Send + 'static) {
+		LISTING
+			.lock()
+			.push((name.as_bytes().to_vec(), Box::new(hook)));
+		ARMED.fetch_add(1, Ordering::SeqCst);
+	}
+
+	/// `worker`, held for good when [`hold_seed`] asked for `root`'s.
+	pub(super) fn hold_first(
+		root: &Path,
+		worker: impl Future<Output = ()> + Send + 'static,
+	) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+		let held = if ARMED.load(Ordering::SeqCst) == 0 {
+			None
+		} else {
+			let mut held = HELD.lock();
+			let found = held.iter().position(|(hold, _)| hold == root);
+			found.map(|index| held.swap_remove(index).1)
+		};
+		match held {
+			Some(dropped) => {
+				ARMED.fetch_sub(1, Ordering::SeqCst);
+				Box::pin(Held { _worker: worker, _dropped: dropped })
+			},
+			None => Box::pin(worker),
+		}
+	}
+
+	/// Runs (once) the hook registered for the final component of `rel`.
+	pub(super) fn listing(rel: Bytes) {
+		if ARMED.load(Ordering::SeqCst) == 0 {
+			return;
+		}
+		// SAFETY: called where the worker reads the job's path anyway.
+		let path = unsafe { rel.get() };
+		let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+		let hook = {
+			let mut hooks = LISTING.lock();
+			let found = hooks.iter().position(|(hooked, _)| hooked == name);
+			found.map(|index| hooks.swap_remove(index).1)
+		};
+		if let Some(hook) = hook {
+			ARMED.fetch_sub(1, Ordering::SeqCst);
+			hook(rel);
+		}
+	}
+
+	/// A worker task that never polls its worker. Fields drop in order, so
+	/// the worker is gone before `_dropped` disconnects.
+	struct Held<F> {
+		_worker:  F,
+		_dropped: mpsc::Sender<()>,
+	}
+
+	impl<F> Future for Held<F> {
+		type Output = ();
+
+		fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+			Poll::Pending
+		}
 	}
 }

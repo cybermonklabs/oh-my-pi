@@ -10,7 +10,6 @@ import { $ } from "bun";
 // contributor does: whether cargo ran, the line the gate printed, and its exit
 // code. No Rust is built.
 
-const SCRIPT = path.join(import.meta.dir, "run-rs-task.ts");
 const cleanups: (() => Promise<void>)[] = [];
 // Each case builds and clones a repository and spawns bun; on a loaded host
 // that outruns bun's 5 s default.
@@ -51,7 +50,16 @@ async function makeFixture(): Promise<Fixture> {
 	await writeExecutable(path.join(shimDir, "rustup"), "#!/bin/sh\nexit 1\n");
 	await writeExecutable(path.join(shimDir, "cargo"), '#!/bin/sh\necho "cargo-stub $*"\n');
 
-	await Bun.write(path.join(origin, "scripts/run-rs-task.ts"), Bun.file(SCRIPT));
+	// The script with the modules it imports for test:rs's environment, at their repository paths.
+	const repoRoot = path.join(import.meta.dir, "..");
+	for (const file of [
+		"scripts/run-rs-task.ts",
+		"scripts/test-env.ts",
+		"scripts/test-env-names.json",
+		"packages/utils/src/test-runtime.ts",
+	]) {
+		await Bun.write(path.join(origin, file), Bun.file(path.join(repoRoot, file)));
+	}
 	await Bun.write(path.join(origin, "packages/app/src/a.ts"), "export const a = 1;\n");
 	await Bun.write(path.join(origin, "crates/x/src/lib.rs"), "pub fn x() {}\n");
 	await git(origin, "init", "-q", "-b", "main");
@@ -150,6 +158,74 @@ describe.skipIf(process.platform === "win32")("run-rs-task.ts check:rs", () => {
 
 			expect(result.cargoRan).toBe(true);
 			expect(result.output).toContain("crates/newcrate/");
+		},
+		CASE_TIMEOUT_MS,
+	);
+});
+
+/** A cargo stub that prints the RUSTUP_TOOLCHAIN it was started with. */
+const ECHO_TOOLCHAIN_CARGO = '#!/bin/sh\necho "cargo-stub toolchain=$RUSTUP_TOOLCHAIN $*"\n';
+
+/**
+ * A fixture whose `rustup which cargo` behaves as rustup does: it names the
+ * cargo of the toolchain RUSTUP_TOOLCHAIN gives when that is set, else the
+ * cargo of `toolchain`, the repository's pin. Each cargo sits in a
+ * rustup-shaped toolchain directory and prints the RUSTUP_TOOLCHAIN it sees,
+ * which is what cargo's rustup-proxied `fmt` and `clippy` subcommands obey.
+ */
+async function makeToolchainFixture(toolchain: string): Promise<Fixture> {
+	const fixture = await makeFixture();
+	const toolchains = path.join(fixture.root, "rustup-home", "toolchains");
+	for (const name of [toolchain, "1.98.0"]) {
+		await writeExecutable(path.join(toolchains, name, "bin", "cargo"), ECHO_TOOLCHAIN_CARGO);
+	}
+	await writeExecutable(
+		path.join(fixture.shimDir, "rustup"),
+		`#!/bin/sh\n[ "$1 $2" = "which cargo" ] || exit 1\necho ${JSON.stringify(toolchains)}/\${RUSTUP_TOOLCHAIN:-${toolchain}}/bin/cargo\n`,
+	);
+	return fixture;
+}
+
+describe.skipIf(process.platform === "win32")("run-rs-task.ts toolchain", () => {
+	// Failure mode: a shell carries RUSTUP_TOOLCHAIN (mise exports its global rust
+	// pin). rustup obeys it over `rust-toolchain.toml`, so `rustup which cargo`
+	// names that toolchain's cargo, and cargo's rustup proxies run its rustfmt and
+	// clippy too: `check:rs` reports format drift in files nobody touched, or the
+	// build fails on the pinned nightly's features.
+	test(
+		"every cargo command runs the repository's pinned toolchain, not the caller's",
+		async () => {
+			const pinned = "nightly-2099-01-01-x86_64-unknown-linux-gnu";
+			const fixture = await makeToolchainFixture(pinned);
+
+			const result = await runCheckRs(fixture, fixture.work, {
+				OMP_FORCE_RUST_TASKS: "1",
+				RUSTUP_TOOLCHAIN: "1.98.0",
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain(`cargo-stub toolchain=${pinned} fmt --all -- --check`);
+			expect(result.output).toContain(`cargo-stub toolchain=${pinned} clippy --workspace`);
+			expect(result.output).not.toContain("toolchain=1.98.0");
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	// A cargo that is not a rustup toolchain's own binary names no toolchain, so
+	// the caller's choice is left as it is rather than replaced by a guess.
+	test(
+		"a cargo found on PATH leaves the caller's RUSTUP_TOOLCHAIN alone",
+		async () => {
+			const fixture = await makeFixture();
+			await writeExecutable(path.join(fixture.shimDir, "cargo"), ECHO_TOOLCHAIN_CARGO);
+
+			const result = await runCheckRs(fixture, fixture.work, {
+				OMP_FORCE_RUST_TASKS: "1",
+				RUSTUP_TOOLCHAIN: "1.98.0",
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("cargo-stub toolchain=1.98.0 fmt --all -- --check");
 		},
 		CASE_TIMEOUT_MS,
 	);
