@@ -3,14 +3,20 @@
  * a session on the store its arguments name, stores one finished turn, creates
  * the `AgentSession` that registers the exit recorder, prints one JSON line
  * (`sessionFile`, and `storedAt` for the queued store) once those writes are
- * stored, and waits for a signal.
+ * stored, and waits for a signal. With `pending` last it does not wait for the
+ * turn's writes: the line follows as soon as the turn's first publish, a full
+ * write of the new session, is queued, and that publish is still queued when
+ * the signal lands.
  *
- *   session-exit-signal-host.ts queued <work dir> <slow|hang>
+ *   session-exit-signal-host.ts queued <work dir> <slow|hang> [pending]
  *     An indexed store whose backend keeps each session in a file under the
  *     work dir. Once ready, each backend write takes 500 ms (slow) or never
- *     answers (hang).
- *   session-exit-signal-host.ts postgres <work dir> <url> <table>
- *     SQL storage on PostgreSQL, in <table>.
+ *     answers (hang). With `pending` that holds from the first write on, and
+ *     a slow write first waits for the signal.
+ *   session-exit-signal-host.ts postgres <work dir> <url> <table> [pending]
+ *     SQL storage on PostgreSQL, in <table>. With `pending`, the parent has
+ *     created the table and holds a write lock on it, so the store does not
+ *     create it.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -99,6 +105,7 @@ class FileBackend implements SessionStorageBackend {
 
 const [mode, workDir, ...rest] = process.argv.slice(2);
 if (!workDir || (mode !== "queued" && mode !== "postgres")) throw new Error("usage: see the file header");
+const pending = rest.at(-1) === "pending";
 
 let storage: SessionStorage;
 let backend: FileBackend | undefined;
@@ -113,11 +120,22 @@ if (mode === "queued") {
 	await indexed.initialize();
 	storage = indexed;
 	// Real time: the parent signals this process and reads the store after it ends.
-	stall = speed === "slow" ? () => Bun.sleep(500) : () => Promise.withResolvers<void>().promise;
+	if (speed === "hang") stall = () => Promise.withResolvers<void>().promise;
+	else if (!pending) stall = () => Bun.sleep(500);
+	else {
+		// Runs after the cleanup handler's listener, which records the exit first.
+		const signalled = Promise.withResolvers<void>();
+		process.once("SIGTERM", () => signalled.resolve());
+		stall = async () => {
+			await signalled.promise;
+			await Bun.sleep(500);
+		};
+	}
+	if (pending) backend.stall = stall;
 } else {
 	const [url, table] = rest;
 	if (!url || !table) throw new Error("postgres: expected <url> <table>");
-	storage = await SqlSessionStorage.create({ client: new SQL(url), table });
+	storage = await SqlSessionStorage.create({ client: new SQL(url), table, createTable: !pending });
 }
 
 const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -142,7 +160,7 @@ const assistant: AssistantMessage = {
 const sessionManager = SessionManager.create(workDir, path.join(workDir, "sessions"), storage);
 sessionManager.appendMessage({ role: "user", content: "finish", timestamp: Date.now() });
 sessionManager.appendMessage(assistant);
-await sessionManager.flush();
+if (!pending) await sessionManager.flush();
 
 const authStorage = await AuthStorage.create(path.join(workDir, "auth.db"));
 const agent = new Agent({
