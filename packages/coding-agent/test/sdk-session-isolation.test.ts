@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,14 +10,17 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { turnAbortKind } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { finalizeSubagentLifecycle } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { getSessionsDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigRootDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
@@ -758,5 +761,218 @@ describe("createAgentSession session storage isolation", () => {
 				}
 			});
 		});
+	});
+});
+
+describe("a helper session's end releases the agents under it once its own dispose stopped them", () => {
+	const tempDirs: string[] = [];
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+
+	beforeAll(async () => {
+		authStorage = await AuthStorage.create(":memory:");
+		modelRegistry = new ModelRegistry(authStorage);
+	});
+
+	afterAll(() => {
+		authStorage.close();
+	});
+
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
+	});
+
+	afterEach(async () => {
+		await AgentLifecycleManager.global().dispose();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
+		for (const tempDir of tempDirs.splice(0)) {
+			removeSyncWithRetries(tempDir);
+		}
+	});
+
+	/** A helper session for a host session (a `/security` scan) under the agent id `Helper`, with its own job manager. */
+	async function openHelper() {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-helper-end-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir: path.join(tempDir, "agent"),
+			modelRegistry,
+			settings: Settings.isolated(),
+			sessionManager: SessionManager.inMemory(cwd),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			agentId: "Helper",
+			agentDisplayName: "helper",
+			bindProcessState: false,
+		});
+		const manager = session.asyncJobManager;
+		if (!manager) throw new Error("Expected the helper session to own a job manager");
+		return { helper: session, manager };
+	}
+
+	/**
+	 * A keep-alive `task` subagent of the helper whose run is still going: registered `running` with its live session.
+	 * `finalize` settles its run's end as the task executor does after a stop, a resumable abort, with a release hook
+	 * (an isolated run's patch capture and worktree cleanup) that must run once when the agent ends.
+	 */
+	function runningSubagent(id: string) {
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		const disposed = Promise.withResolvers<void>();
+		const session = {
+			dispose: async (options?: AgentSessionDisposeOptions) => {
+				disposals.push(options);
+				disposed.resolve();
+			},
+		} as unknown as AgentSession;
+		AgentRegistry.global().register({
+			id,
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session,
+			status: "running",
+		});
+		let revivals = 0;
+		let releaseHooks = 0;
+		const finalize = () =>
+			finalizeSubagentLifecycle({
+				id,
+				session,
+				aborted: true,
+				abortKind: "signal",
+				keepAlive: true,
+				isolated: false,
+				agentIdleTtlMs: 0,
+				reviveSession: async () => {
+					revivals++;
+					return session;
+				},
+				onRelease: async () => {
+					releaseHooks++;
+				},
+			});
+		return {
+			disposals,
+			disposed: disposed.promise,
+			finalize,
+			revivals: () => revivals,
+			releaseHooks: () => releaseHooks,
+		};
+	}
+
+	it("releases a subagent whose run the helper's own dispose ended and adopted, so nothing revives it", async () => {
+		// If this regresses, the helper releases the agents under it before its own dispose stops its jobs: the stop
+		// ends a subagent's run, whose finalize adopts the subagent idle with its live session after that release, and
+		// nothing releases it any more, so a message wakes it into a billed turn under the ended helper.
+		const { helper, manager } = await openHelper();
+		const sub = runningSubagent("Helper-Sub");
+		let adoptedDuringDispose = false;
+		// The subagent's run is a background job of the helper: the helper's dispose stops it, and the run finalizes.
+		manager.register(
+			"task",
+			"subagent run",
+			async ({ signal }) => {
+				const stopped = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+				await stopped.promise;
+				await sub.finalize();
+				adoptedDuringDispose = AgentLifecycleManager.global().has("Helper-Sub");
+				return "stopped";
+			},
+			{ ownerId: "Helper", agentId: "Helper-Sub" },
+		);
+
+		await helper.dispose({ ownedJobsEnd: "stop" });
+
+		expect(adoptedDuringDispose).toBe(true);
+		expect(AgentRegistry.global().get("Helper-Sub")).toBeUndefined();
+		expect(AgentLifecycleManager.global().has("Helper-Sub")).toBe(false);
+		expect(sub.disposals).toEqual([{ ownedJobsEnd: "stop" }]);
+		await expect(AgentLifecycleManager.global().ensureLive("Helper-Sub")).rejects.toThrow("Unknown agent");
+		const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "Helper-Sub", body: "Go on." });
+		expect(receipt.outcome).toBe("failed");
+		expect(sub.revivals()).toBe(0);
+		expect(sub.releaseHooks()).toBe(1);
+	});
+
+	it("stops and releases a subagent whose run outlives the helper's wait for its jobs, so its finalize does not adopt it", async () => {
+		// If this regresses, a subagent whose run the helper's dispose stopped but did not see end within its bounded
+		// wait stays registered with its live session after the helper's end, and the run's later finalize adopts it:
+		// a live agent under an ended helper that nothing releases. Or the finalize, run while the release disposes the
+		// subagent's session, adopts it and the release's unregister drops that adoption without its release hook: an
+		// isolated run's patch capture and worktree cleanup never run.
+		const { helper, manager } = await openHelper();
+		const sub = runningSubagent("Helper-Sub");
+		const finalized = Promise.withResolvers<void>();
+		// The subagent's run is a background job of the helper that the stop does not end: it ends only once its
+		// session is disposed, after the helper's dispose stopped waiting for its jobs.
+		manager.register(
+			"task",
+			"subagent run",
+			async () => {
+				await sub.disposed;
+				await sub.finalize();
+				finalized.resolve();
+				return "stopped";
+			},
+			{ ownerId: "Helper", agentId: "Helper-Sub" },
+		);
+
+		await helper.dispose({ ownedJobsEnd: "stop" });
+
+		expect(sub.disposals[0]).toEqual({ ownedJobsEnd: "stop" });
+		expect(AgentRegistry.global().get("Helper-Sub")).toBeUndefined();
+		await finalized.promise;
+		expect(AgentRegistry.global().get("Helper-Sub")).toBeUndefined();
+		expect(AgentLifecycleManager.global().has("Helper-Sub")).toBe(false);
+		expect(sub.revivals()).toBe(0);
+		expect(sub.releaseHooks()).toBe(1);
+	}, 30_000);
+
+	it("still disposes the helper when releasing the agents under it fails", async () => {
+		// If this regresses, a lifecycle step that rejects (the release of the helper's agents, as a worker thread's
+		// lifecycle proxy once rejected it) skips the helper's own dispose: its turn, its jobs, its kernels and its
+		// browser tabs stay.
+		class RejectingLifecycle extends AgentLifecycleManager {
+			override releaseUnder(): Promise<void> {
+				return Promise.reject(new Error("the agents under the helper cannot be released here"));
+			}
+		}
+		AgentLifecycleManager.installGlobal(new RejectingLifecycle());
+		const { helper, manager } = await openHelper();
+		let jobSignal: AbortSignal | undefined;
+		manager.register(
+			"task",
+			"background work",
+			async ({ signal }) => {
+				jobSignal = signal;
+				const stopped = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+				await stopped.promise;
+				return "stopped";
+			},
+			{ ownerId: "Helper" },
+		);
+
+		const [disposal] = await Promise.allSettled([helper.dispose({ ownedJobsEnd: "stop" })]);
+
+		// The helper's own dispose ran: it stopped its job and disposed its job manager.
+		expect(jobSignal?.aborted).toBe(true);
+		expect(turnAbortKind(jobSignal?.reason)).toBe("stop");
+		expect(() => manager.register("task", "late work", async () => "late")).toThrow("Async job manager is disposed");
+		// The failed release is logged; the dispose itself completes.
+		expect(disposal?.status).toBe("fulfilled");
 	});
 });

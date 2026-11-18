@@ -3,14 +3,21 @@ import type { Api, ModelSpec } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { mnemopiEmbedClient } from "@oh-my-pi/pi-coding-agent/mnemopi/embed-client";
+import type {
+	MnemopiEmbedServerRequest,
+	MnemopiEmbedServerResponse,
+} from "@oh-my-pi/pi-coding-agent/mnemopi/embed-protocol";
 import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as sharedWorker from "@oh-my-pi/pi-coding-agent/subprocess/shared-worker";
+import type { RefCountedWorkerHandle } from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
 import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as titleClient from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import type { TinyWorkerRequest, TinyWorkerResponse } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const modelSpec: ModelSpec<Api> = {
 	id: "tiny-client-dispose",
@@ -27,6 +34,7 @@ const modelSpec: ModelSpec<Api> = {
 const model = buildModel(modelSpec);
 
 const TINY_MODEL = "qwen3-1.7b";
+const EMBED_MODEL = "fast-bge-base-en-v1.5";
 
 /** Stands in for the tiny-model worker; replies only when the test emits one. */
 class FakeTinyWorker {
@@ -72,9 +80,48 @@ class FakeTinyWorker {
 	}
 }
 
-// The tiny-model client is a process singleton; terminating it fails every request
-// in flight, so only the session that owns process state may shut it down, once.
-describe("tiny-model client shutdown on session dispose", () => {
+/** Stands in for the machine-shared embedding server; answers only when the test emits a reply. */
+class FakeEmbedServer implements RefCountedWorkerHandle<MnemopiEmbedServerRequest, MnemopiEmbedServerResponse> {
+	#handlers = new Set<(message: MnemopiEmbedServerResponse) => void>();
+	#waiters: Array<(id: string) => void> = [];
+	terminated = false;
+
+	send(message: MnemopiEmbedServerRequest): void {
+		if (message.type === "embed") this.#waiters.shift()?.(message.id);
+	}
+
+	/** Resolves with the id of the next embed request the client sends. */
+	nextEmbed(): Promise<string> {
+		const { promise, resolve } = Promise.withResolvers<string>();
+		this.#waiters.push(resolve);
+		return promise;
+	}
+
+	onMessage(handler: (message: MnemopiEmbedServerResponse) => void): () => void {
+		this.#handlers.add(handler);
+		return () => this.#handlers.delete(handler);
+	}
+
+	onError(): () => void {
+		return () => {};
+	}
+
+	ref(): void {}
+
+	unref(): void {}
+
+	emit(message: MnemopiEmbedServerResponse): void {
+		for (const handler of this.#handlers) handler(message);
+	}
+
+	async terminate(): Promise<void> {
+		this.terminated = true;
+	}
+}
+
+// The tiny-model client and the Mnemopi embedding client are process singletons; terminating
+// one fails every request in flight, so only the process exit may shut them down, once.
+describe("process-wide model clients on session dispose", () => {
 	const sessions: AgentSession[] = [];
 
 	afterEach(async () => {
@@ -82,11 +129,12 @@ describe("tiny-model client shutdown on session dispose", () => {
 			if (!session.isDisposed) await session.dispose();
 		}
 		await titleClient.tinyTitleClient.terminate();
+		await mnemopiEmbedClient.terminate();
 		vi.restoreAllMocks();
 	});
 
-	const starter = async (tempDir: TempDir) => {
-		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	const starter = (tempDir: TempDir) => {
+		const authStorage = createInMemoryAuthStorage();
 		authStorage.keys.setRuntime(model.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const start = async (
@@ -118,9 +166,26 @@ describe("tiny-model client shutdown on session dispose", () => {
 		return { start, close: () => authStorage.close() };
 	};
 
+	/**
+	 * The embedding server every embedding request of this process reaches, and an embed in flight on it,
+	 * as another session's memory recall makes, with the id the server got.
+	 */
+	const embedServer = (tempDir: TempDir) => {
+		const server = new FakeEmbedServer();
+		vi.spyOn(sharedWorker, "connectSharedWorker").mockResolvedValue(
+			server as unknown as RefCountedWorkerHandle<unknown, unknown>,
+		);
+		const embedInFlight = async () => {
+			const sent = server.nextEmbed();
+			const vectors = mnemopiEmbedClient.embed(EMBED_MODEL, tempDir.path(), ["recall query"], undefined);
+			return { vectors, id: await sent };
+		};
+		return { server, embedInFlight };
+	};
+
 	it("keeps pending requests alive until the parent's first dispose", async () => {
 		using tempDir = TempDir.createSync("@pi-tiny-client-dispose-");
-		const { start, close } = await starter(tempDir);
+		const { start, close } = starter(tempDir);
 		const worker = new FakeTinyWorker();
 		vi.spyOn(titleClient, "tinyWorkerUsesMlx").mockReturnValue(false);
 		vi.spyOn(titleClient, "connectTinyWorker").mockResolvedValue(worker);
@@ -143,7 +208,7 @@ describe("tiny-model client shutdown on session dispose", () => {
 			worker.emit({ type: "text", id: firstRequest.id, text: "kept" });
 			expect(await first).toBe("kept");
 
-			// The parent owns process state: its dispose fails what is still in flight.
+			// The parent's dispose for the process exit fails what is still in flight.
 			const second = client.complete(TINY_MODEL, "second");
 			await worker.nextRequest();
 			await parent.dispose();
@@ -155,6 +220,99 @@ describe("tiny-model client shutdown on session dispose", () => {
 			await parent.dispose();
 			worker.emit({ type: "text", id: thirdRequest.id, text: "after" });
 			expect(await third).toBe("after");
+		} finally {
+			close();
+		}
+	});
+
+	it("keeps pending requests alive when a session that binds process state ends while the process goes on", async () => {
+		// If this regresses, closing one ACP session (a dispose that says it stops) drops the tiny-model client's
+		// connections as the process exit does: a tiny-model request another session the server serves has in flight
+		// fails.
+		using tempDir = TempDir.createSync("@pi-tiny-client-stop-");
+		const { start, close } = starter(tempDir);
+		const worker = new FakeTinyWorker();
+		vi.spyOn(titleClient, "tinyWorkerUsesMlx").mockReturnValue(false);
+		vi.spyOn(titleClient, "connectTinyWorker").mockResolvedValue(worker);
+		const client = titleClient.tinyTitleClient;
+		try {
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			const closed = await start(settings, { agentId: "acp:closed" });
+			await start(await settings.cloneForCwd(tempDir.path()), { agentId: "acp:kept" });
+
+			const pending = client.complete(TINY_MODEL, "the kept session's request");
+			const request = await worker.nextRequest();
+			await closed.dispose({ ownedJobsEnd: "stop" });
+			worker.emit({ type: "text", id: request.id, text: "kept" });
+			expect(await pending).toBe("kept");
+		} finally {
+			close();
+		}
+	});
+
+	it("keeps another session's embedding request answered when a subagent's session ends", async () => {
+		// If this regresses, every subagent's end drops the process's embedding-server connections: a memory recall
+		// or consolidation the parent or another session has in flight fails.
+		using tempDir = TempDir.createSync("@pi-embed-client-subagent-");
+		const { start, close } = starter(tempDir);
+		const { server, embedInFlight } = embedServer(tempDir);
+		try {
+			const parentSettings = Settings.isolated({ "compaction.enabled": false });
+			await start(parentSettings);
+			const sub = await start(createSubagentSettings(parentSettings), {
+				parentTaskPrefix: "0-Sub",
+				taskDepth: 1,
+				agentId: "0-Sub",
+			});
+
+			const request = await embedInFlight();
+			await sub.dispose();
+			server.emit({ type: "vectors", id: request.id, vectors: [[0.5]] });
+
+			expect(await request.vectors).toEqual([[0.5]]);
+			expect(server.terminated).toBe(false);
+		} finally {
+			close();
+		}
+	});
+
+	it("keeps the other session's embedding request answered when an ACP session closes beside it", async () => {
+		// If this regresses, closing one ACP session (a dispose that says it stops) drops the embedding-server
+		// connections as the process exit does: a memory request the session the server goes on serving has in flight
+		// fails.
+		using tempDir = TempDir.createSync("@pi-embed-client-acp-close-");
+		const { start, close } = starter(tempDir);
+		const { server, embedInFlight } = embedServer(tempDir);
+		try {
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			const closed = await start(settings, { agentId: "acp:closed" });
+			await start(await settings.cloneForCwd(tempDir.path()), { agentId: "acp:kept" });
+
+			const request = await embedInFlight();
+			await closed.dispose({ ownedJobsEnd: "stop" });
+			server.emit({ type: "vectors", id: request.id, vectors: [[0.25]] });
+
+			expect(await request.vectors).toEqual([[0.25]]);
+			expect(server.terminated).toBe(false);
+		} finally {
+			close();
+		}
+	});
+
+	it("drops the embedding-server connections at the process exit", async () => {
+		// If this regresses, the process exit leaves its embedding-server connections open: an SDK embedder that goes
+		// on keeps a transport whose requests can outlive every session that made them.
+		using tempDir = TempDir.createSync("@pi-embed-client-exit-");
+		const { start, close } = starter(tempDir);
+		const { server, embedInFlight } = embedServer(tempDir);
+		try {
+			const parent = await start(Settings.isolated({ "compaction.enabled": false }));
+
+			const request = await embedInFlight();
+			await parent.dispose();
+
+			await expect(request.vectors).rejects.toThrow("mnemopi embed worker terminated");
+			expect(server.terminated).toBe(true);
 		} finally {
 			close();
 		}

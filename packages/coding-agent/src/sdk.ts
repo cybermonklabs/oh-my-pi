@@ -168,6 +168,7 @@ import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } fr
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
+import { shutdownMnemopiEmbedClient } from "./mnemopi/embed-client";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
@@ -5550,19 +5551,25 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		{
 			const originalDispose = session.dispose.bind(session);
-			let tinyClientReleased = false;
+			let processClientsReleased = false;
 			session.dispose = async (disposeOptions?: AgentSessionDisposeOptions) => {
+				// The process exit is the dispose of a session that binds process state and does not say it
+				// stops ({@link AgentSessionDisposeOptions.ownedJobsEnd}); only it tears process-wide state down.
+				// Every other end (a helper session's, an ACP session's close, a failed start) leaves that
+				// state to the sessions the process goes on serving.
+				const processExit = bindsProcessState && disposeOptions?.ownedJobsEnd !== "stop";
 				try {
 					// Reject new session work (eval starts) the moment disposal
 					// begins — the lifecycle await below opens an async gap before
-					// AgentSession.dispose() would otherwise set its guards.
-					session.beginDispose();
+					// AgentSession.dispose() would otherwise set its guards. No step
+					// before `originalDispose` may skip it: each logs its failure and goes on.
+					try {
+						session.beginDispose();
+					} catch (error) {
+						logger.warn("Session dispose: beginDispose failed", { error: String(error) });
+					}
+					// Subagent disposal must NOT touch the global lifecycle.
 					if (agentKind === "main") {
-						// A top-level session that binds process state owns the global agent lifecycle:
-						// park timers, adopted subagent sessions, revivers. Tear it down while shared
-						// resources (kernels, MCP, LSP) are still live. A helper session (`bindProcessState:
-						// false`) ends only the agents it spawned. Subagent disposal must NOT touch the
-						// global lifecycle.
 						const vibeRegistry = VibeSessionRegistry.global();
 						const vibeParentSession = {
 							getAgentId: () => resolvedAgentId,
@@ -5575,33 +5582,61 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						};
 						// The teardown stops the workers' turns and their own jobs: a vibe turn the
 						// parent's teardown interrupts is not resumed (`docs/vibe-mode.md`).
-						await vibeRegistry.suspendScope(
-							vibeRegistry.ownerScope(vibeParentSession),
-							scopedAsyncJobManager,
-							"stop",
-						);
-						if (bindsProcessState) {
-							// Adopted agents end as this dispose says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
-							await AgentLifecycleManager.global().dispose({ ownedJobsEnd: disposeOptions?.ownedJobsEnd });
-						} else {
-							// The host session and the process go on: the helper's own agents stop.
-							await AgentLifecycleManager.global().releaseUnder(resolvedAgentId, {
-								ownedJobsEnd: disposeOptions?.ownedJobsEnd ?? "stop",
-							});
+						try {
+							await vibeRegistry.suspendScope(
+								vibeRegistry.ownerScope(vibeParentSession),
+								scopedAsyncJobManager,
+								"stop",
+							);
+						} catch (error) {
+							logger.warn("Session dispose: suspending vibe workers failed", { error: String(error) });
+						}
+						if (processExit) {
+							// The process exit tears the global agent lifecycle down (park timers, adopted
+							// subagent sessions, revivers) while shared resources (kernels, MCP, LSP) are
+							// still live. Adopted agents end as this dispose says.
+							try {
+								await AgentLifecycleManager.global().dispose({ ownedJobsEnd: disposeOptions?.ownedJobsEnd });
+							} catch (error) {
+								logger.warn("Session dispose: agent lifecycle teardown failed", { error: String(error) });
+							}
 						}
 					}
-					await originalDispose(disposeOptions);
+					try {
+						await originalDispose(disposeOptions);
+					} finally {
+						if (agentKind === "main" && !processExit) {
+							// The process goes on. Once the session's turn and its own jobs have stopped (and a
+							// subagent whose run they ended has finalized), release every agent under it, one
+							// still running too; the lifecycle and every other session's agents go on.
+							try {
+								await AgentLifecycleManager.global().releaseUnder(resolvedAgentId, {
+									ownedJobsEnd: disposeOptions?.ownedJobsEnd ?? "stop",
+								});
+							} catch (error) {
+								logger.warn("Session dispose: releasing the session's agents failed", {
+									agentId: resolvedAgentId,
+									error: String(error),
+								});
+							}
+						}
+					}
 				} finally {
-					// The tiny-model client is a process singleton shared by every session.
-					// Only the session that owns process state drops its connections, once:
-					// that fails every request still in flight, and a repeat dispose must not
-					// cancel requests other sessions made since.
-					if (bindsProcessState && !tinyClientReleased) {
-						tinyClientReleased = true;
+					// The tiny-model client and the Mnemopi embedding client are process singletons shared by every
+					// session: dropping their connections fails every request still in flight. Only the process exit
+					// drops them, once (a repeat dispose must not cancel requests other sessions made since), and
+					// after the session's own dispose, whose memory consolidation may still embed.
+					if (processExit && !processClientsReleased) {
+						processClientsReleased = true;
 						try {
 							await shutdownTinyTitleClient();
 						} catch (error) {
 							logger.warn("Session dispose: tiny-model client shutdown failed", { error: String(error) });
+						}
+						try {
+							await shutdownMnemopiEmbedClient();
+						} catch (error) {
+							logger.warn("Session dispose: Mnemopi embedding client shutdown failed", { error: String(error) });
 						}
 					}
 					unregisterUnlessParked();

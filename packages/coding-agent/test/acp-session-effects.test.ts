@@ -10,6 +10,9 @@ import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import type { AcpSessionHandle } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-mode";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
@@ -75,6 +78,25 @@ async function isolatedAcpFactory(dir: TempDir) {
 		AgentStorage.close();
 	};
 	return { launchSettings, factory, cleanup };
+}
+
+/** An `AcpAgent` over a client that ignores its updates, recording every session `factory` creates for it. */
+function recordingAcpAgent(
+	factory: (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>,
+) {
+	const sessions: AgentSession[] = [];
+	const connection = {
+		sessionUpdate: async () => {},
+		extNotification: async () => {},
+		signal: new AbortController().signal,
+		closed: Promise.withResolvers<void>().promise,
+	} as unknown as AgentSideConnection;
+	const acp = new AcpAgent(connection, async (cwd, options) => {
+		const created = await factory(cwd, options);
+		sessions.push(created.session);
+		return created;
+	});
+	return { acp, sessions };
 }
 
 // An ACP client keeps several `session/new` sessions alive at once, each possibly for a
@@ -180,18 +202,7 @@ describe("an ACP session/close", () => {
 		// did not happen, and `omp --restore` relaunches its turn.
 		using dir = TempDir.createSync("@pi-acp-session-close-");
 		const { factory, cleanup } = await isolatedAcpFactory(dir);
-		const sessions: AgentSession[] = [];
-		const connection = {
-			sessionUpdate: async () => {},
-			extNotification: async () => {},
-			signal: new AbortController().signal,
-			closed: Promise.withResolvers<void>().promise,
-		} as unknown as AgentSideConnection;
-		const acp = new AcpAgent(connection, async (cwd, options) => {
-			const created = await factory(cwd, options);
-			sessions.push(created.session);
-			return created;
-		});
+		const { acp, sessions } = recordingAcpAgent(factory);
 		try {
 			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
 			const { sessionId } = await acp.newSession({ cwd: dir.path(), mcpServers: [] });
@@ -229,6 +240,63 @@ describe("an ACP session/close", () => {
 		} finally {
 			await acp.dispose();
 			cleanup();
+		}
+	});
+
+	it("ends only the closed session's subagents, leaving another session's subagents and the agent lifecycle", async () => {
+		// If this regresses, closing one ACP session tears the process-global agent lifecycle down as the server's exit
+		// does: it releases the subagents of the other sessions the server goes on serving, so a message to one fails
+		// with "Unknown agent", and drops the lifecycle their revives run on.
+		using dir = TempDir.createSync("@pi-acp-session-close-others-");
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		const { factory, cleanup } = await isolatedAcpFactory(dir);
+		const { acp, sessions } = recordingAcpAgent(factory);
+		try {
+			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const closed = await acp.newSession({ cwd: dir.path(), mcpServers: [] });
+			await acp.newSession({ cwd: dir.path(), mcpServers: [] });
+			const closedOwner = sessions[0]?.getAgentId();
+			const keptOwner = sessions[1]?.getAgentId();
+			if (!closedOwner || !keptOwner) throw new Error("Expected two live ACP sessions with their own agent ids");
+			const registry = AgentRegistry.global();
+			const lifecycle = AgentLifecycleManager.global();
+			// An idle keep-alive subagent of each session, adopted by the agent lifecycle, as a finished `task` run leaves it.
+			const idleSubagentOf = (owner: string) => {
+				let disposals = 0;
+				const session = {
+					dispose: async () => {
+						disposals++;
+					},
+				} as unknown as AgentSession;
+				const ref = registry.register({
+					id: `${owner}-Sub`,
+					displayName: "task",
+					kind: "sub",
+					parentId: owner,
+					session,
+					status: "idle",
+				});
+				lifecycle.adopt(ref.id, { idleTtlMs: 0 }, ref);
+				return { ref, session, disposals: () => disposals };
+			};
+			const closedSub = idleSubagentOf(closedOwner);
+			const keptSub = idleSubagentOf(keptOwner);
+
+			await acp.closeSession({ sessionId: closed.sessionId });
+
+			expect(registry.get(keptSub.ref.id)).toBe(keptSub.ref);
+			expect(keptSub.disposals()).toBe(0);
+			expect(AgentLifecycleManager.global()).toBe(lifecycle);
+			expect(lifecycle.has(keptSub.ref.id, keptSub.ref)).toBe(true);
+			expect(await lifecycle.ensureLive(keptSub.ref.id)).toBe(keptSub.session);
+			expect(registry.get(closedSub.ref.id)).toBeUndefined();
+			expect(closedSub.disposals()).toBe(1);
+		} finally {
+			await acp.dispose();
+			cleanup();
+			AgentLifecycleManager.resetGlobalForTests();
+			AgentRegistry.resetGlobalForTests();
 		}
 	});
 });

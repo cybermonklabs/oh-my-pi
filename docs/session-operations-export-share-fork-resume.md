@@ -488,8 +488,11 @@ though the teardown was clean: its owner's shutdown aborts the run with
 `INTERRUPTED_TURN_ERROR` and records its `session_exit` as a process exit
 (`postmortem.Reason.EXIT`), both for a first run the task executor drives and for
 a revived agent's turn the lifecycle teardown disposes. A top-level session that
-ends while the process goes on stops a revived agent's turn instead: no process
-exit is recorded, and `--restore` leaves it.
+ends while the process goes on (an ACP session's close, the end of a `/security`
+scan) stops instead the turns of the subagents under it, a first run's or a
+revived agent's, then releases those subagents: no process exit is recorded,
+`--restore` leaves them, and none of them stays live after the session's end.
+The subagents of the other sessions the process serves go on.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
@@ -552,8 +555,8 @@ result:
   subagent's run (its request budget, its time limit, or a `yield` that waits on
   its jobs), whose parent gets the aborted result. The owner's cancel of a
   background job stops the subagent the job runs. A dispose while the process goes
-  on stops it too: a kill, a park, or a top-level session's end with the subagents
-  its teardown releases.
+  on stops it too: a kill, a park, or the end of a top-level session whose process
+  goes on, with the subagents under it that the end releases.
 - A process exit or shutdown cuts the turn off instead, and `--restore` goes on
   with it: the session's dispose (a quit, a signal, `/restart`), an abort with
   `cutOff` or with `INTERRUPTED_TURN_ERROR` (the reason a shutdown gives), and the

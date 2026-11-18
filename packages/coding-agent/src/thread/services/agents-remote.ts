@@ -180,7 +180,7 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
-/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and teardown are main-only. */
+/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
 
@@ -229,8 +229,9 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
 	}
 
-	releaseUnder(_ancestorId: string, _options?: AgentLifecycleDisposeOptions): Promise<void> {
-		return Promise.reject(new Error("A helper session's agents are released by the main thread"));
+	/** Main's lifecycle releases the agents under `ancestorId` (a helper session hosted here that ends). */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void> {
+		return this.#remote.call("releaseUnder", ancestorId, options);
 	}
 }
 

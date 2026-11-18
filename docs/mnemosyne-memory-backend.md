@@ -215,7 +215,7 @@ Normal interactive and print-mode exit uses a deliberately lighter path than `/m
 
 1. The primary state retains the current transcript with new fact extraction disabled.
 2. It flushes extractions that were already in flight, but does not run per-session sleep or full cross-session promotion.
-3. Only after that drain settles does it close the owned SQLite bank handles; the process drops its embedding-server connection after state disposal because the drain may still embed. The server keeps running for other sessions (and finishes a model download already in flight) until it idles out.
+3. Only after that drain settles does it close the owned SQLite bank handles. At the process exit the process drops its embedding-server connection after the session's dispose, because the drain may still embed; a session that ends while the process goes on (a subagent, an ACP session's close, the end of a `/security` scan) leaves the connection to the sessions still using it. The server keeps running for other sessions (and finishes a model download already in flight) until it idles out.
 
 Aliased subagent states do not own or close the shared banks; the parent state owns final retention, flushing, and handle closure.
 

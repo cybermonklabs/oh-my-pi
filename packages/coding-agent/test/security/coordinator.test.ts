@@ -279,6 +279,69 @@ describe("native security coordinator", () => {
 		}
 	});
 
+	test("a scan cancelled while a security-reviewer runs leaves no reviewer adopted or live", async () => {
+		// If this regresses, the scan's end releases the agents under it before its own dispose stops the reviewer's
+		// job: the stop ends the reviewer's run as a resumable abort, its finalize adopts the reviewer idle with its live
+		// session, and nothing releases it any more, so a message wakes a reviewer of an ended scan into a billed turn.
+		const reviewerRuns = Promise.withResolvers<void>();
+		const handler: MockHandler = context => {
+			const tools = context.tools ?? [];
+			if (tools.length > 0 && !tools.some(tool => tool.name === "security_publish")) {
+				// The reviewer works until the scan's end stops it.
+				reviewerRuns.resolve();
+				return { delayMs: 600_000, content: ["Reviewing src/app.ts."] };
+			}
+			if (!context.messages.some(message => message.role === "toolResult" && message.toolName === "task")) {
+				return {
+					content: [
+						{
+							type: "toolCall",
+							name: "task",
+							arguments: {
+								context: "Review the fixture repository.",
+								tasks: [{ task: "Review src/app.ts", solutionSpace: "open" }],
+							},
+						},
+					],
+				};
+			}
+			return { content: ["Waiting for the security-reviewer result."] };
+		};
+		const registry = AgentRegistry.global();
+		const registered: AgentRef[] = [];
+		const unsubscribe = registry.onChange(event => {
+			if (event.type === "registered") registered.push(event.ref);
+		});
+		let reviewers: string[] = [];
+		try {
+			const { coordinator, mock } = coordinatorWithMockSession([], handler);
+			// The reviewer's model (the scan's, by `task.agentModelOverrides`) resolves to the scripted mock.
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([mock.model]);
+			const plan = await coordinator.preflight({ credentialId, model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			const scanEnd = coordinator.wait(started.operationId);
+			const first = await Promise.race([
+				reviewerRuns.promise.then(() => "a reviewer runs"),
+				scanEnd.then(() => "the scan ended"),
+			]);
+			expect(first).toBe("a reviewer runs");
+			const scanAgentId = registered.find(ref => ref.kind === "main" && ref.displayName === "security")?.id;
+			if (!scanAgentId) throw new Error("Expected the scan session to register its own agent");
+			reviewers = registered.filter(ref => ref.parentId === scanAgentId).map(ref => ref.id);
+			expect(reviewers).not.toEqual([]);
+			expect(reviewers.map(id => registry.get(id)?.status)).toEqual(reviewers.map(() => "running"));
+
+			expect(await coordinator.cancel(started.operationId)).toBeTrue();
+			expect(await scanEnd).toMatchObject({ phase: "cancelled" });
+
+			const lifecycle = AgentLifecycleManager.global();
+			expect(reviewers.filter(id => lifecycle.has(id) || Boolean(registry.get(id)?.session))).toEqual([]);
+		} finally {
+			unsubscribe();
+			for (const id of reviewers) await AgentLifecycleManager.global().release(id);
+		}
+	}, 30_000);
+
 	test("records a terminal failure when initial scan persistence fails", async () => {
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const store = await storeFactory();
@@ -386,9 +449,8 @@ describe("native security coordinator", () => {
 		expect(bundle?.findings).toEqual([]);
 	});
 	test("ends the scan session with a stop of its jobs, as the host session goes on", async () => {
-		// If this regresses, a scan's end cuts off the jobs of the scan session and of the idle subagents its lifecycle
-		// teardown releases, as a process exit does: their subagents record a process exit that did not happen, and
-		// `omp --restore` relaunches their turns.
+		// If this regresses to a bare dispose, the scan session's own task jobs abort with the job manager's shutdown
+		// reason, as a process exit ends them, and their subagents record a process exit that did not happen.
 		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const coordinator = new SecurityCoordinator(

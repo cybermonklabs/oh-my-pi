@@ -31,7 +31,12 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { handleRpcCancelSubagent } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	AgentRegistry,
+	type AgentStatus,
+	agentHasAncestor,
+	MAIN_AGENT_ID,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -554,6 +559,16 @@ function recordsProcessExit(sub: SubSession): boolean {
 	return sub.entries.some(entry => readSessionExit(entry)?.kind === "process_exit");
 }
 
+/** The agents under `ancestorId` that the agent lifecycle still holds adopted or that still hold a live session. */
+function agentsLeftUnder(ancestorId: string): string[] {
+	const registry = AgentRegistry.global();
+	const lifecycle = AgentLifecycleManager.global();
+	return registry
+		.list()
+		.filter(ref => agentHasAncestor(registry, ref, ancestorId) && (ref.session !== null || lifecycle.has(ref.id)))
+		.map(ref => ref.id);
+}
+
 /**
  * Opens the parent with a planner whose run answers at once, so the planner stays adopted and
  * idle, then has the parent message it, as `write agent://<id>` does: a turn of the planner
@@ -638,8 +653,8 @@ describe("omp --restore after the idle TTL parked a subagent whose eval agent() 
 describe("omp --restore after the parent's session ended while its process went on, releasing an idle subagent whose eval agent() job's subagent waited to retry its key", () => {
 	it("stops the job's subagent, which records no process exit, so --restore relaunches nothing", async () => {
 		// If this regresses, a top-level session's end that is no process exit (an ACP session's close, a helper
-		// session's end) cuts off the jobs of the idle subagents its lifecycle teardown releases: their subagents
-		// record a process exit that did not happen, and `omp --restore` relaunches their turns.
+		// session's end) cuts off the jobs of the idle subagents it releases: their subagents record a process exit
+		// that did not happen, and `omp --restore` relaunches their turns.
 		const { parent, runs, backoff } = await openWokenPlannerOwningWaitingReader();
 
 		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
@@ -680,13 +695,17 @@ describe("omp --restore after the parent's session ended while its process went 
 		// If this regresses, the parent's dispose stops only the jobs it owns itself, and its job manager's dispose then
 		// cuts off, with its shutdown reason, the jobs of the subagent a background job runs before that subagent's own
 		// stop reaches them: the job's subagent records a process exit that did not happen and is parked for
-		// `omp --restore`.
+		// `omp --restore`. Or the subagent the job ran stays adopted and live after the parent's end: the stop ended its
+		// run, whose finalize adopted it after the parent had released the agents under it.
 		const { parent, roster, runs, plannerHolds } = await openParentWithPlanner({ plannerInBackground: true });
-		const { turn, backoff } = await startPlannerWithWaitingReader(parent, roster, plannerHolds);
+		const { turn, backoff, plannerId } = await startPlannerWithWaitingReader(parent, roster, plannerHolds);
 		await turn;
+		expect(agentsLeftUnder(MAIN_AGENT_ID)).toContain(plannerId);
 
 		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
 		await parent.dispose({ ownedJobsEnd: "stop" });
+		await Promise.all(runs);
+		expect(agentsLeftUnder(MAIN_AGENT_ID)).toEqual([]);
 
 		const { outcome, reader } = await restoreInNewProcess(parent, runs);
 		backoff.wait.mockRestore();
@@ -701,16 +720,21 @@ describe("omp --restore after the parent's session ended while its process went 
 	it("stops the sync subagent, which records no process exit, so --restore relaunches nothing", async () => {
 		// If this regresses, a top-level session's end that is no process exit (an ACP session's close, a helper
 		// session's end) aborts its turn still in flight with a cut-off: a sync subagent follows its parent's turn,
-		// so it keeps its marked attempt as the process exit leaves it, and `omp --restore` relaunches it.
+		// so it keeps its marked attempt as the process exit leaves it, and `omp --restore` relaunches it. Or the sync
+		// subagent stays adopted and live after the parent's end: the stop ended its run, whose finalize adopted it after
+		// the parent had released the agents under it.
 		const { parent, runs } = await openParentWithPlanner({ plannerWaitsOnKey: true });
 		// The planner's and the reader's backoffs: the parent's turn waits on its sync `task` call, not to retry.
 		const backoff = holdBackoff(2);
 		const turn = parent.prompt("Have the notes read.");
 		await backoff.allHeld;
+		expect(agentsLeftUnder(MAIN_AGENT_ID)).not.toEqual([]);
 
 		// An ACP session's close: the parent's dispose says it stops, and the process goes on.
 		await parent.dispose({ ownedJobsEnd: "stop" });
 		await turn;
+		await Promise.all(runs);
+		expect(agentsLeftUnder(MAIN_AGENT_ID)).toEqual([]);
 
 		const { outcome, planner } = await restoreInNewProcess(parent, runs);
 		backoff.wait.mockRestore();
@@ -766,9 +790,7 @@ describe("a subagent session's dispose ends the jobs it owns as the dispose says
 	it("cuts them off when the dispose names no kind", async () => {
 		// If this regresses, a dispose that names no kind stops its session's jobs: the top-level session's dispose at
 		// the process exit (`sdk.ts`) stops the jobs the exit cut off, their subagents end on "Retry cancelled", and
-		// `omp --restore` leaves that work unfinished. The other disposes that rely on the default are those of
-		// sessions that never ran a turn (a subagent whose start failed in `task/executor.ts`, a revive the agent
-		// lifecycle refused), which own no jobs.
+		// `omp --restore` leaves that work unfinished.
 		const manager = new AsyncJobManager({});
 		cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
 		const { session, abortReason } = await subagentOwningJob(manager);

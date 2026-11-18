@@ -10,6 +10,7 @@ import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
 import type { AgentSessionHandle } from "../../src/session/agent-session-handle";
+import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
@@ -263,6 +264,55 @@ describe("agent bridging across subagent workers", () => {
 		registry.unregister("Helper-Child");
 
 		expect(remote.extensionRunner).toBe(helperRunner);
+	});
+
+	it("releases on main the agents under a helper session that ends on a worker", async () => {
+		// If this regresses, a worker's lifecycle proxy refuses the release that a helper session hosted there (a
+		// `/security` scan a worker-homed subagent started) asks for at its end: the helper's subagents stay live on
+		// main after it ended.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		const lifecycle = AgentLifecycleManager.global();
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		let hostSubDisposals = 0;
+		const helperSub = {
+			dispose: async (options?: AgentSessionDisposeOptions) => {
+				disposals.push(options);
+			},
+		} as unknown as AgentSession;
+		const hostSub = {
+			dispose: async () => {
+				hostSubDisposals++;
+			},
+		} as unknown as AgentSession;
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		const helperRef = registry.register({
+			id: "Helper-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session: helperSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Helper-Sub", { idleTtlMs: 0 }, helperRef);
+		const hostRef = registry.register({
+			id: "Host-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Main",
+			session: hostSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Host-Sub", { idleTtlMs: 0 }, hostRef);
+
+		await probe.releaseUnder("Helper");
+
+		expect(disposals).toEqual([{ ownedJobsEnd: "stop" }]);
+		expect(registry.get("Helper-Sub")).toBeUndefined();
+		expect(lifecycle.has("Helper-Sub")).toBe(false);
+		expect(registry.get("Host-Sub")).toBe(hostRef);
+		expect(hostSubDisposals).toBe(0);
+		expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
 	});
 
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {

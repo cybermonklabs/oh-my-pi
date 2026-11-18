@@ -87,7 +87,10 @@ export interface AgentSessionDisposeOptions {
 	 * and the jobs it owns ({@link OwnedJobsEnd}). Only the process exit cuts them off: every
 	 * dispose while the process goes on says `"stop"`, and a dispose that names none cuts them
 	 * off, as `"shutdown"` does. A top-level session's dispose passes its kind on to every job
-	 * left on the job manager it owns and to the agents its lifecycle teardown releases.
+	 * left on the job manager it owns. At the process exit (a session that binds process state
+	 * and does not say `"stop"`) it passes it on to the agents the lifecycle teardown releases;
+	 * any other end releases the agents under the session once its turn and jobs have stopped,
+	 * and stops them unless it says `"shutdown"`.
 	 * Apart from {@link reason}, so the process teardown cuts off an idle subagent's jobs
 	 * while its `session_exit` record stays a plain dispose.
 	 */

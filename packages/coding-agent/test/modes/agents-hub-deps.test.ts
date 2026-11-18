@@ -23,9 +23,9 @@ afterEach(() => {
 
 describe("the Agent Hub's agent generator", () => {
 	it("ends its helper session with a stop of its jobs, as the host session goes on", async () => {
-		// If this regresses, the helper session's end cuts off the jobs of the idle subagents its lifecycle teardown
-		// releases, as a process exit does: their subagents record a process exit that did not happen, and
-		// `omp --restore` relaunches their turns.
+		// This holds the rule that every dispose while the process goes on says "stop"
+		// (`AgentSessionDisposeOptions.ownedJobsEnd`). The generator starts no job and no subagent, so "stop" decides
+		// only how its own turn ends if one still runs at its end: stopped, instead of cut off as a process exit cuts it.
 		const authStorage = createInMemoryAuthStorage();
 		try {
 			const modelRegistry = new ModelRegistry(authStorage);

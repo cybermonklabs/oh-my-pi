@@ -4,7 +4,7 @@
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { IrcWaitFilter } from "../../irc/bus";
-import type { AdoptOptions, AgentReleaseOptions } from "../../registry/agent-lifecycle";
+import type { AdoptOptions, AgentLifecycleDisposeOptions, AgentReleaseOptions } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
 	AgentRef,
@@ -56,7 +56,7 @@ export type AgentRegistryProtocol = {
 	awaitsSubscribe: RpcMethod<[listener: () => void], () => void>;
 };
 
-/** `AgentLifecycleApi` over the link (the persisted reviver factory and teardown stay main-only). */
+/** `AgentLifecycleApi` over the link (the persisted reviver factory and the process exit's teardown stay main-only). */
 export type AgentLifecycleProtocol = {
 	adopt: RpcMethod<[id: string, opts: AdoptOptions, expected?: AgentRefExpectation], void>;
 	has: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
@@ -66,6 +66,7 @@ export type AgentLifecycleProtocol = {
 	park: RpcMethod<[id: string], void>;
 	ensureLive: RpcMethod<[id: string], AgentSessionHandle>;
 	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions], boolean>;
+	releaseUnder: RpcMethod<[ancestorId: string, options?: AgentLifecycleDisposeOptions], void>;
 };
 
 /** Result row of `IrcBusApi.unansweredSends`. */
