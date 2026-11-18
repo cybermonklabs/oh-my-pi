@@ -14,6 +14,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $ } from "bun";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
 import {
 	createNativeSecurityProvenance,
 	DEFAULT_SECURITY_GIT_ADAPTER,
@@ -22,6 +24,8 @@ import {
 	type SecurityScanBundle,
 	SecurityStore,
 } from "../../src/security";
+import type { AgentSession } from "../../src/session/agent-session";
+import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { SessionManager } from "../../src/session/session-manager";
 
 const MOCK_SOURCE_ID = "security-coordinator-test";
@@ -135,6 +139,47 @@ function coordinatorWithMockSession(responses: MockResponseSource, handler?: Moc
 	return { coordinator, mock };
 }
 
+/**
+ * A scan whose coordinator delegates to a security-reviewer worker, ends its turn while the
+ * worker runs as a background job, and publishes once the worker's result is delivered.
+ */
+const reviewerScanHandler: MockHandler = context => {
+	if (context.tools?.some(tool => tool.name === "yield")) {
+		return {
+			delayMs: 200,
+			content: [
+				{
+					type: "toolCall",
+					name: "yield",
+					arguments: { type: "result", data: { coverage_summary: "Reviewed src/app.ts" } },
+				},
+			],
+		};
+	}
+	const toolResults = context.messages.filter(message => message.role === "toolResult");
+	if (toolResults.some(message => message.toolName === "security_publish")) {
+		return { content: ["Security publication completed."] };
+	}
+	if (!toolResults.some(message => message.toolName === "task")) {
+		return {
+			content: [
+				{
+					type: "toolCall",
+					name: "task",
+					arguments: {
+						context: "Review the fixture repository.",
+						tasks: [{ task: "Review src/app.ts", solutionSpace: "open" }],
+					},
+				},
+			],
+		};
+	}
+	if (context.messages.at(-1)?.role === "toolResult") {
+		return { content: ["Waiting for the security-reviewer result."] };
+	}
+	return { content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] };
+};
+
 describe("native security coordinator", () => {
 	test("preflight accepts provider-owned Bedrock auth without an OAuth row", async () => {
 		const bedrockModel = getBundledModel("amazon-bedrock", "us.anthropic.claude-opus-4-8");
@@ -177,24 +222,76 @@ describe("native security coordinator", () => {
 	test("waits for background security-reviewer workers before ending the scan", async () => {
 		// Coordinator delegates, ends its turn while the worker runs as a background
 		// job, and publishes only once the worker's result is delivered back.
-		const { coordinator, mock } = coordinatorWithMockSession([], context => {
-			if (context.tools?.some(tool => tool.name === "yield")) {
-				return {
-					delayMs: 200,
-					content: [
-						{
-							type: "toolCall",
-							name: "yield",
-							arguments: { type: "result", data: { coverage_summary: "Reviewed src/app.ts" } },
-						},
-					],
-				};
+		const { coordinator, mock } = coordinatorWithMockSession([], reviewerScanHandler);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const started = await coordinator.start({ planId: plan.id });
+		const terminal = await coordinator.wait(started.operationId);
+		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
+	});
+
+	test("ends only the agents the scan spawned, leaving the host session's subagents and agent lifecycle", async () => {
+		// If this regresses, the scan session's end tears down the process-global agent lifecycle as the host's own end
+		// does: it releases the host session's adopted subagents while the host goes on, and replaces the lifecycle,
+		// whose next owner has no reviver for the host's parked subagents.
+		const lifecycle = AgentLifecycleManager.global();
+		const registry = AgentRegistry.global();
+		let hostSubDisposals = 0;
+		const hostSub = {
+			dispose: async () => {
+				hostSubDisposals++;
+			},
+		} as unknown as AgentSession;
+		const hostRef = registry.register({
+			id: "Host-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: hostSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Host-Sub", { idleTtlMs: 0 }, hostRef);
+		const adopt = vi.spyOn(lifecycle, "adopt");
+		const registered: AgentRef[] = [];
+		const unsubscribe = registry.onChange(event => {
+			if (event.type === "registered") registered.push(event.ref);
+		});
+		try {
+			const { coordinator, mock } = coordinatorWithMockSession([], reviewerScanHandler);
+			const plan = await coordinator.preflight({ credentialId, model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			expect(await coordinator.wait(started.operationId)).toMatchObject({ phase: "completed" });
+
+			expect(registry.get("Host-Sub")).toBe(hostRef);
+			expect(hostRef.session).toBe(hostSub);
+			expect(hostSubDisposals).toBe(0);
+			expect(AgentLifecycleManager.global()).toBe(lifecycle);
+			expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
+			// The security-reviewer agents the scan adopted are released with it.
+			const scanAgentId = registered.find(ref => ref.kind === "main" && ref.displayName === "security")?.id;
+			if (!scanAgentId) throw new Error("Expected the scan session to register its own agent");
+			const reviewers = registered.filter(ref => ref.parentId === scanAgentId).map(ref => ref.id);
+			expect(reviewers).not.toEqual([]);
+			expect(adopt.mock.calls.map(([id]) => id)).toEqual(expect.arrayContaining(reviewers));
+			for (const id of reviewers) expect(registry.get(id)).toBeUndefined();
+		} finally {
+			unsubscribe();
+			await AgentLifecycleManager.global().release("Host-Sub", hostRef);
+		}
+	});
+
+	test("a scan cancelled while a security-reviewer runs leaves no reviewer adopted or live", async () => {
+		// If this regresses, the scan's end releases the agents under it before its own dispose stops the reviewer's
+		// job: the stop ends the reviewer's run as a resumable abort, its finalize adopts the reviewer idle with its live
+		// session, and nothing releases it any more, so a message wakes a reviewer of an ended scan into a billed turn.
+		const reviewerRuns = Promise.withResolvers<void>();
+		const handler: MockHandler = context => {
+			const tools = context.tools ?? [];
+			if (tools.length > 0 && !tools.some(tool => tool.name === "security_publish")) {
+				// The reviewer works until the scan's end stops it.
+				reviewerRuns.resolve();
+				return { delayMs: 600_000, content: ["Reviewing src/app.ts."] };
 			}
-			const toolResults = context.messages.filter(message => message.role === "toolResult");
-			if (toolResults.some(message => message.toolName === "security_publish")) {
-				return { content: ["Security publication completed."] };
-			}
-			if (!toolResults.some(message => message.toolName === "task")) {
+			if (!context.messages.some(message => message.role === "toolResult" && message.toolName === "task")) {
 				return {
 					content: [
 						{
@@ -208,16 +305,42 @@ describe("native security coordinator", () => {
 					],
 				};
 			}
-			if (context.messages.at(-1)?.role === "toolResult") {
-				return { content: ["Waiting for the security-reviewer result."] };
-			}
-			return { content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] };
+			return { content: ["Waiting for the security-reviewer result."] };
+		};
+		const registry = AgentRegistry.global();
+		const registered: AgentRef[] = [];
+		const unsubscribe = registry.onChange(event => {
+			if (event.type === "registered") registered.push(event.ref);
 		});
-		const plan = await coordinator.preflight({ credentialId, model: mock.model });
-		const started = await coordinator.start({ planId: plan.id });
-		const terminal = await coordinator.wait(started.operationId);
-		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
-	});
+		let reviewers: string[] = [];
+		try {
+			const { coordinator, mock } = coordinatorWithMockSession([], handler);
+			// The reviewer's model (the scan's, by `task.agentModelOverrides`) resolves to the scripted mock.
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([mock.model]);
+			const plan = await coordinator.preflight({ credentialId, model: mock.model });
+			const started = await coordinator.start({ planId: plan.id });
+			const scanEnd = coordinator.wait(started.operationId);
+			const first = await Promise.race([
+				reviewerRuns.promise.then(() => "a reviewer runs"),
+				scanEnd.then(() => "the scan ended"),
+			]);
+			expect(first).toBe("a reviewer runs");
+			const scanAgentId = registered.find(ref => ref.kind === "main" && ref.displayName === "security")?.id;
+			if (!scanAgentId) throw new Error("Expected the scan session to register its own agent");
+			reviewers = registered.filter(ref => ref.parentId === scanAgentId).map(ref => ref.id);
+			expect(reviewers).not.toEqual([]);
+			expect(reviewers.map(id => registry.get(id)?.status)).toEqual(reviewers.map(() => "running"));
+
+			expect(await coordinator.cancel(started.operationId)).toBeTrue();
+			expect(await scanEnd).toMatchObject({ phase: "cancelled" });
+
+			const lifecycle = AgentLifecycleManager.global();
+			expect(reviewers.filter(id => lifecycle.has(id) || Boolean(registry.get(id)?.session))).toEqual([]);
+		} finally {
+			unsubscribe();
+			for (const id of reviewers) await AgentLifecycleManager.global().release(id);
+		}
+	}, 30_000);
 
 	test("records a terminal failure when initial scan persistence fails", async () => {
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
@@ -324,6 +447,40 @@ describe("native security coordinator", () => {
 		const bundle = await (await storeFactory()).getBundle(terminal.scanId);
 		expect(bundle?.scan.status).toBe("cancelled");
 		expect(bundle?.findings).toEqual([]);
+	});
+	test("ends the scan session with a stop of its jobs, as the host session goes on", async () => {
+		// If this regresses to a bare dispose, the scan session's own task jobs abort with the job manager's shutdown
+		// reason, as a process exit ends them, and their subagents record a process exit that did not happen.
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings,
+				authStorage,
+				modelRegistry,
+				activeModel: mock.model,
+				sessionId: "parent-session",
+			},
+			{
+				openStore: storeFactory,
+				gitAdapter,
+				createSession: async () => ({
+					prompt: async () => true,
+					waitForIdle: async () => undefined,
+					hasPendingAsyncWork: () => false,
+					settleAsyncWork: async () => undefined,
+					abort: async () => undefined,
+					dispose: async options => {
+						disposals.push(options);
+					},
+				}),
+			},
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const started = await coordinator.start({ planId: plan.id });
+		await coordinator.wait(started.operationId);
+		expect(disposals).toEqual([{ ownedJobsEnd: "stop" }]);
 	});
 	test("ref-diff execution checks out the immutable head and supplies the exact diff", async () => {
 		await $`git init --initial-branch=main`.cwd(repositoryRoot).quiet();

@@ -1620,7 +1620,7 @@ mod tests {
 		#[test]
 		fn cancel_kills_the_shell() {
 			let dir = tempfile::tempdir().unwrap();
-			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 30\n");
+			let rsh = script(dir.path(), "sleepy-rsh", "exec sleep 600\n");
 			let logger = logger();
 			let cancel = Arc::new(AtomicBool::new(false));
 			let mut conn =
@@ -1631,12 +1631,13 @@ mod tests {
 				std::thread::sleep(Duration::from_millis(150));
 				flag.store(true, Ordering::Relaxed);
 			});
-			let started = Instant::now();
+			// The read ends with the cancel's error (a shell left to run to
+			// its end would give end of file instead), and `finish` returns it
+			// once it killed and reaped the shell.
 			let mut buf = [0u8; 1];
 			let err = conn.reader.read(&mut buf).unwrap_err();
 			assert_eq!(RsyncError::from_io(&err, 12).code, RERR_SIGNAL);
 			assert_eq!(conn.finish().unwrap_err().code, RERR_SIGNAL);
-			assert!(started.elapsed() < Duration::from_secs(10));
 		}
 	}
 }

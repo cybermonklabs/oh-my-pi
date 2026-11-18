@@ -178,21 +178,23 @@ export function dropProviderModels(
 }
 
 /**
- * Merge `incoming` entries into a copy of `base`, keyed by `provider`+`id`.
- * Matches are replaced with `combine(existing, entry)`; new entries are
- * appended as `combine(undefined, entry)`.
+ * Merge `incoming` entries into a copy of `base`, keyed by `provider`+`id`, with one slice unit per
+ * base model indexed and per entry merged. Matches are replaced with `combine(existing, entry)`; new
+ * entries are appended as `combine(undefined, entry)`.
  */
-export function mergeByModelKey<T extends { provider: string; id: string }>(
+export function* mergeByModelKeySteps<T extends { provider: string; id: string }>(
 	base: readonly Model<Api>[],
 	incoming: readonly T[],
 	combine: (existing: Model<Api> | undefined, entry: T) => Model<Api>,
-): Model<Api>[] {
+): Generator<void, Model<Api>[], undefined> {
 	const merged = [...base];
 	const indexByKey = new Map<string, number>();
 	for (let i = 0; i < merged.length; i += 1) {
+		yield;
 		indexByKey.set(`${merged[i].provider}\u0000${merged[i].id}`, i);
 	}
 	for (const entry of incoming) {
+		yield;
 		const key = `${entry.provider}\u0000${entry.id}`;
 		const existingIndex = indexByKey.get(key);
 		if (existingIndex !== undefined) {
@@ -275,7 +277,7 @@ export interface ModelPatch {
  * - `merge`: fold the patch into the base's (modelOverrides semantics).
  * - `replace`: the patch owns transport wholesale — same-id custom definitions
  *   already folded provider-level headers/compat in during parsing, so bundled
- *   transport metadata must not be re-merged (see `#mergeCustomModels`).
+ *   transport metadata must not be re-merged (see `#mergeCustomModelSteps`).
  */
 type ModelTransportPolicy = "merge" | "replace";
 export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: ModelTransportPolicy): Model<Api> {

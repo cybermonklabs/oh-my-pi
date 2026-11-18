@@ -183,6 +183,16 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.serviceTier).toBe("priority");
 		expect(parsed.options.cacheRetention).toBe("long");
 	});
+
+	it("forwards parentSessionId so a side request keeps its parent's cache affinity behind the gateway", () => {
+		// Providers present a side request's parent id where a conversation id routes it to a prompt cache.
+		const parsed = parseRequest({
+			modelId: "x",
+			context: baseContext,
+			options: { sessionId: "parent-session:side:1", parentSessionId: "parent-session" },
+		});
+		expect(parsed.options.parentSessionId).toBe("parent-session");
+	});
 	it("preserves Bedrock guardrails in the canonical options bag", () => {
 		const parsed = parseRequest({
 			modelId: "amazon-bedrock/amazon.nova-lite-v1:0",

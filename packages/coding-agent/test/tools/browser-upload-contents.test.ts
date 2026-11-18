@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
-import { findFreeCdpPort, gracefulKillTreeOnce, waitForCdp } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
+import { findFreeCdpPort, gracefulKillTreeOnce } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import { prepareElementUpload } from "@oh-my-pi/pi-coding-agent/tools/browser/interactions";
 import { ensureChromiumExecutable, RENDERER_PRIORITY_ARGS } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
@@ -18,7 +18,7 @@ import {
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { ElementHandle, Page } from "puppeteer-core";
 import { rejectionOf } from "../helpers/rejection";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, chromiumDevToolsListening } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -196,7 +196,7 @@ async function openConnectedTab(toolCallId: string, options: { page?: string; pr
 			`--user-data-dir=${root}`,
 			`--remote-debugging-port=${port}`,
 		],
-		{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+		{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 	);
 	const proxy = startCdpProxy(port, options.proxy ?? {});
 	const session = makeSession();
@@ -211,7 +211,8 @@ async function openConnectedTab(toolCallId: string, options: { page?: string; pr
 		await fs.rm(root, { recursive: true, force: true });
 	};
 	try {
-		await waitForCdp(`http://127.0.0.1:${port}`, 15_000);
+		// Chromium's own "DevTools listening" report, not a wait of fixed length.
+		await chromiumDevToolsListening(child);
 		await prelude.invoke(
 			{
 				action: "open",

@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import { nextSlice, readJsonInSlices, sliceExpired } from "@oh-my-pi/pi-utils/event-loop-slice";
 import type { Api, FetchImpl, ModelSpec, Provider } from "../types";
 import { discoveryFetch } from "../utils";
 
@@ -175,7 +176,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 		}
 
 		try {
-			return await response.json();
+			return await readJsonInSlices(response);
 		} catch {
 			return null;
 		}
@@ -204,6 +205,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, ModelSpec<TApi>>();
 	for (const entry of entries) {
+		while (sliceExpired()) await nextSlice();
 		const defaults: ModelSpec<TApi> = {
 			id: entry.id,
 			name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : entry.id,

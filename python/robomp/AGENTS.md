@@ -66,7 +66,7 @@ docker compose --project-directory python/robomp exec robomp robomp cleanup owne
 
 HTTP / sqlite / webhook inspection is unaliased — use `curl http://localhost:${ROBOMP_BIND_PORT:-8080}/{healthz,readyz,events,issues}` and `docker compose --project-directory python/robomp exec robomp sqlite3 /data/robomp.sqlite` directly.
 
-Lint + format: TypeScript via Biome (config in `biome.json`), Python via Ruff (config in `pyproject.toml`). Root recipes cover both languages — `bun run lint` / `bun run fix` apply to the whole monorepo including roboomp. `bun run lint:py` / `bun run fix:py` scope to Python only.
+Lint + format: TypeScript via oxlint/oxfmt (`.oxlintrc.json`, `.oxfmtrc.json`), Python via Ruff (config in each package's `pyproject.toml`). `bun run lint:py` / `bun run fix:py` (`scripts/ruff.ts`) cover `python/` and `sdk/python/` with the ruff pinned exactly in robomp's `dev` extra, run as `python3 -m ruff`; they refuse any other ruff version and say to run `bun run robomp:install`. The root `bun run lint` / `bun run fix` do not include them.
 
 ## Code Conventions & Common Patterns
 

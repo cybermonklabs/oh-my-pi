@@ -96,11 +96,12 @@ describe("issue #3031 — mnemopi embeddings live in an isolated subprocess", ()
 	}, 10_000);
 
 	it("carries (model, cacheDir) on every embed so a respawned worker can self-init", async () => {
-		// Without this contract: after `shutdownMnemopiEmbedClient()` runs on
-		// session dispose, mnemopi still holds the cached `LocalEmbeddingModel`
-		// wrapper. The next embed re-spawns a fresh subprocess that has never
-		// seen `init`, and a bare `embed` request would trip the "embed before
-		// init" guard and break local embeddings for the rest of the process.
+		// Without this contract: after `shutdownMnemopiEmbedClient()` runs at a
+		// session's dispose for the process exit (an SDK embedder that goes on),
+		// mnemopi still holds the cached `LocalEmbeddingModel` wrapper. The next
+		// embed re-spawns a fresh subprocess that has never seen `init`, and a
+		// bare `embed` request would trip the "embed before init" guard and break
+		// local embeddings for the rest of the process.
 		// Drive the protocol with a fake worker so the assertion runs without
 		// fastembed/onnxruntime; we only care about the IPC the client emits.
 		const sentMessages: MnemopiEmbedWorkerInbound[] = [];

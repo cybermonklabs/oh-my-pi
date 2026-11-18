@@ -34,7 +34,7 @@ use pi_walker::{
 	walk,
 };
 use crate::bre;
-use crate::host::{AsyncUtility, Host};
+use crate::host::{AsyncUtility, Host, StdoutFile};
 use crate::stdio;
 
 /// Exit status of a `grep` or `rg` run: 0 when a line was selected, 1 when
@@ -482,6 +482,9 @@ struct Options {
 	group_separator:     Option<Vec<u8>>,
 	line_buffered:       bool,
 	binary_files:        BinaryFiles,
+	/// Whether an input that is the file stdout lands in is refused; see
+	/// [`Grep::run`].
+	refuse_output_file:  bool,
 }
 
 #[derive(Clone)]
@@ -1055,26 +1058,44 @@ struct FileSearch {
 	matched:   io::Result<bool>,
 }
 
-/// What one search worker reuses across files: its searcher, read buffer, output buffer, and the opener of a native tree's files.
+/// What one search worker reuses across files: its searcher, read buffer, output buffer, and the opener of a walked tree's files.
 struct Worker {
 	searcher: Searcher,
 	buf:      Vec<u8>,
 	out:      Vec<u8>,
-	opener:   Option<FileOpener>,
+	opener:   Option<Opener>,
 	/// Reused for the path of each listed file.
 	path:     PathBuf,
 	/// Reused for the displayed name of each listed file.
 	display:  PathBuf,
 }
 
+/// How a worker opens a listed file: below the walk's root handle with no
+/// symlink followed on the way, for a walk that does not follow symlinks
+/// (`-r`); by path through the file's directory, for a native walk that does
+/// (`-R`).
+enum Opener {
+	Beneath(pi_walker::fs::Session, Arc<pi_walker::fs::Dir>),
+	Path(FileOpener),
+}
+
 /// A file being searched.
 enum Input {
-	/// A regular file a native walk listed, opened relative to its directory.
+	/// A regular file a walk listed, opened by the walker.
 	Listed(pi_walker::fs::File),
 	Source(stdio::Source),
 }
 
 impl Input {
+	/// The identity of the file that was opened, read from the handle rather
+	/// than from the path it was opened by.
+	async fn metadata(&self) -> Option<pi_vfs::Metadata> {
+		match self {
+			Self::Listed(file) => file.metadata_async().await.ok(),
+			Self::Source(source) => source.handle_metadata().await,
+		}
+	}
+
 	/// Reads up to `buf.len()` bytes; 0 at end of input.
 	async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		match self {
@@ -1109,8 +1130,8 @@ struct Listed {
 /// Everything the concurrent per-file searches of one directory operand share.
 struct DirSearch<M> {
 	fs:       pi_vfs::Fs,
-	/// The directory operand's files; a native tree's open through each
-	/// worker's [`FileOpener`]. `None` for a file operand.
+	/// The directory operand's files, opened through each worker's
+	/// [`Opener`]. `None` for a file operand.
 	listed:   Option<Listed>,
 	halt:     Halt,
 	operand:  OsString,
@@ -1118,6 +1139,9 @@ struct DirSearch<M> {
 	matcher:  M,
 	searcher: SearcherBuilder,
 	opts:     Options,
+	/// The file stdout lands in, when the refusal in [`DirSearch::refused`]
+	/// is on and stdout is a regular file.
+	stdout:   Option<StdoutFile>,
 }
 
 impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
@@ -1127,11 +1151,13 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			searcher: self.searcher.build(),
 			buf:      vec![0u8; READ_CHUNK],
 			out:      Vec::new(),
-			opener:   self
-				.listed
-				.as_ref()
-				.filter(|listed| listed.layer.is_native())
-				.map(|listed| FileOpener::new(&listed.layer)),
+			opener:   self.listed.as_ref().and_then(|listed| match listed.files.root_dir() {
+				Some(root) => Some(Opener::Beneath(listed.layer.session(), Arc::clone(root))),
+				None => listed
+					.layer
+					.is_native()
+					.then(|| Opener::Path(FileOpener::new(&listed.layer))),
+			}),
 			path:     PathBuf::new(),
 			display:  PathBuf::new(),
 		}
@@ -1198,17 +1224,43 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		Ok(sink.any_match)
 	}
 
-	/// Opens `path`: a listed file of a native tree through the worker's
-	/// opener, anything that fails there (a special file, an error) through
-	/// `fs`, which reports it as a standalone open would.
-	async fn open(&self, worker: &mut Worker, path: &Path) -> io::Result<Input> {
-		if let Some(opener) = &mut worker.opener
-			&& self.fs.is_native_local(path)
-			&& let Ok(file) = opener.open(path).await
-		{
-			return Ok(Input::Listed(file));
+	/// Opens `path`, the listed file at walk-relative `rel` (`None` for a file
+	/// operand). A walk that does not follow symlinks opens it below the
+	/// walk's root with no symlink followed on the way, and never by path, so
+	/// a symlink swapped in since the listing is refused. A symlink that is the
+	/// file itself (its directory still opens below the root) is skipped with
+	/// no message and no error status (`None`), as GNU grep skips a file whose
+	/// `O_NOFOLLOW` open finds a symlink; one on the way to it is an error.
+	/// Otherwise a native tree's file opens through the worker's by-path
+	/// opener, and anything that fails there (a special file, an error)
+	/// through `fs`, which reports it as a standalone open would.
+	async fn open(&self, worker: &mut Worker, rel: Option<&[u8]>, path: &Path) -> io::Result<Option<Input>> {
+		match (&mut worker.opener, rel) {
+			(Some(Opener::Beneath(session, root)), Some(rel)) => {
+				return match session.open_file_beneath(root, rel).await {
+					Ok((file, _)) => Ok(Some(Input::Listed(file))),
+					Err(err) if pi_walker::fs::is_symlink_refusal(&err) => {
+						let parent = rel
+							.iter()
+							.rposition(|&b| pi_walker::fs::is_rel_separator(b))
+							.map(|at| &rel[..at]);
+						let file_is_the_link = match parent {
+							Some(parent) => session.open_dir_beneath(root, parent).await.is_ok(),
+							None => true,
+						};
+						if file_is_the_link { Ok(None) } else { Err(err) }
+					},
+					Err(err) => Err(err),
+				};
+			},
+			(Some(Opener::Path(opener)), Some(_)) if self.fs.is_native_local(path) => {
+				if let Ok(file) = opener.open(path).await {
+					return Ok(Some(Input::Listed(file)));
+				}
+			},
+			_ => {},
 		}
-		stdio::Source::open(&self.fs, path).await.map(Input::Source)
+		stdio::Source::open(&self.fs, path).await.map(|source| Some(Input::Source(source)))
 	}
 
 	/// Searches the `index`th listed file, its paths built in the worker's
@@ -1223,19 +1275,59 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		} else {
 			display = display_path_for_operand(&self.operand, &self.resolved, &path);
 		}
-		let found = self.search_at(worker, &path, &display).await;
+		let found = self.search_at(worker, Some(rel), &path, &display).await;
 		(worker.path, worker.display) = (path, display);
 		found
 	}
 
 	async fn search(&self, worker: &mut Worker, path: &Path) -> FileSearch {
 		let display_path = display_path_for_operand(&self.operand, &self.resolved, path);
-		self.search_at(worker, path, &display_path).await
+		self.search_at(worker, None, path, &display_path).await
 	}
 
-	async fn search_at(&self, worker: &mut Worker, path: &Path, display_path: &Path) -> FileSearch {
-		match self.open(worker, path).await {
-			Ok(mut input) => {
+	/// The search of a file that is also the file stdout lands in, refused
+	/// the way GNU grep refuses it: the matches written into the file would
+	/// be read back and matched again, so the file grows without bound.
+	fn refused(&self, display_path: &Path) -> FileSearch {
+		let mut err = Vec::new();
+		if !self.opts.no_messages {
+			let _ = writeln!(
+				err,
+				"grep: {}: input file is also the output",
+				display_path.display()
+			);
+		}
+		FileSearch { out: Vec::new(), err, had_error: true, matched: Ok(false) }
+	}
+
+	/// Whether `input` — already opened — is the file stdout lands in.
+	///
+	/// The decision is made on the handle that was opened, as GNU grep's
+	/// `SAME_INODE (st, out_stat)` is, so a path replaced or a symlink
+	/// retargeted between the walk and the open cannot slip past the refusal.
+	async fn is_output_file(&self, input: &Input) -> bool {
+		let Some(stdout) = &self.stdout else {
+			return false;
+		};
+		match input.metadata().await {
+			Some(opened) => stdout.matches(&opened),
+			None => false,
+		}
+	}
+
+	async fn search_at(
+		&self,
+		worker: &mut Worker,
+		rel: Option<&[u8]>,
+		path: &Path,
+		display_path: &Path,
+	) -> FileSearch {
+		match self.open(worker, rel, path).await {
+			Ok(None) => FileSearch { out: Vec::new(), err: Vec::new(), had_error: false, matched: Ok(false) },
+			Ok(Some(mut input)) => {
+				if self.opts.refuse_output_file && self.is_output_file(&input).await {
+					return self.refused(display_path);
+				}
 				let searched = self
 					.push_input(&mut input, display_path.as_os_str().as_encoded_bytes(), worker)
 					.await;
@@ -1293,6 +1385,8 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 			return Ok(false);
 		},
 	};
+	#[cfg(test)]
+	crate::host::run_hook(resolved);
 	let mut errors: Vec<_> = files.errors().iter().collect();
 	errors.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 	for error in errors {
@@ -1313,6 +1407,7 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 		matcher:  matcher.clone(),
 		searcher: searcher.clone(),
 		opts:     opts.clone(),
+		stdout:   host.stdout_file().await,
 	});
 	let mut any = false;
 	let mut failed = None;
@@ -1649,11 +1744,24 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 		}
 
 		if operand == OsStr::new("-") {
-			let display = cli
-				.label
-				.as_deref()
-				.unwrap_or_else(|| OsStr::new("(standard input)"))
-				.as_encoded_bytes();
+			// `--label` names standard input everywhere else, so it names it
+			// in the refusal diagnostic too.
+			let input_name = cli.label.as_deref().unwrap_or_else(|| OsStr::new("(standard input)"));
+			if opts.refuse_output_file && host.stdin_is_stdout().await {
+				// GNU grep refuses standard input that is the file its output
+				// lands in: the matches it writes would be read back and
+				// matched again, so the input is never read.
+				had_error = true;
+				if !opts.no_messages {
+					let _ = writeln!(
+						host.stderr,
+						"grep: {}: input file is also the output",
+						input_name.to_string_lossy()
+					);
+				}
+				continue;
+			}
+			let display = input_name.as_encoded_bytes();
 			match search_stdin(host, matcher, &builder, display.to_vec(), opts, &mut out).await {
 				Ok(matched) => any_match |= matched,
 				// Abort remaining work; the host maps the BrokenPipe status.
@@ -1725,6 +1833,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 					matcher:  matcher.clone(),
 					searcher: builder.clone(),
 					opts:     opts.clone(),
+					stdout:   host.stdout_file().await,
 				};
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
@@ -1778,6 +1887,8 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 impl AsyncUtility for Grep {
 	const NAME: &'static str = "grep";
 	const USAGE_ERROR: u8 = 2;
+	/// grep must not read the file its own output lands in.
+	const CHECKS_STDOUT_PATH: bool = true;
 
 	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 		Ok(normalize_context_args(argv))
@@ -1830,6 +1941,18 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	// A search that selects no record never writes to the file it reads, so
+	// that file is not its own output and the refusal below must stay off. An
+	// empty pattern file leaves nothing to match, and an inverted empty
+	// pattern matches every record and so selects none. `-x` and `-w`
+	// constrain the empty pattern, so they can still select records.
+	let zero_patterns = patterns.is_empty();
+	let inverted_empty_pattern = cli.invert
+		&& !cli.line_regexp
+		&& !cli.word
+		&& !zero_patterns
+		&& patterns.iter().all(|pattern| pattern.is_empty());
+	let selects_no_record = (zero_patterns && !cli.invert) || inverted_empty_pattern;
 	patterns.clear();
 
 	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
@@ -1842,6 +1965,18 @@ impl AsyncUtility for Grep {
 	};
 	let prefix_filename = resolve_filename_prefix(&matches)
 		.unwrap_or(directory_action == DirectoryAction::Recurse || files.len() > 1);
+	// GNU grep refuses to search the file its own output lands in: the matches
+	// it writes would be read back and matched again, so the file grows
+	// without bound. It exempts the modes that write at most one line per file
+	// (`-q`, `-c`, `-l`, `-L`) and the bounded `-m1`, which stop before their
+	// output can feed back into the search, and the searches that select no
+	// record at all.
+	let refuse_output_file = !cli.quiet
+		&& !cli.count
+		&& !files_with_matches
+		&& !files_without_match
+		&& max_count.is_none_or(|count| count > 1)
+		&& !selects_no_record;
 	let opts = Options {
 		line_number: cli.line_number,
 		byte_offset: cli.byte_offset,
@@ -1863,6 +1998,7 @@ impl AsyncUtility for Grep {
 		group_separator: resolve_group_separator(&cli, &matches),
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
+		refuse_output_file,
 	};
 	let follow_links = resolve_follow_links(&cli, &matches);
 
@@ -1906,9 +2042,89 @@ mod tests {
 
 	use super::*;
 	use crate::openfile as openfiles;
-	use crate::host::{Host, run_async_util};
+	use crate::host::{Host, run_async_util, run_caught_async};
 	#[cfg(unix)]
-	use crate::host::tree_with_sparse_file;
+	use crate::host::{SwapTree, tree_with_sparse_file};
+
+	const ONE_FILE: &[u8] = b"needle\n";
+
+	/// One read-only provider file, `mem://d/f`; nothing else exists.
+	#[derive(Debug)]
+	struct OneFile;
+
+	fn one_file_meta() -> pi_vfs::Metadata {
+		pi_vfs::Metadata::new(
+			pi_vfs::FileType::from_kind(pi_vfs::FileKind::File),
+			ONE_FILE.len() as u64,
+			pi_vfs::Permissions::from_mode(0o644),
+		)
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for OneFile {
+		fn is_native_local(&self, path: &Path) -> bool {
+			!pi_vfs::is_virtual_path(path)
+		}
+
+		async fn open(&self, path: &Path, _options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(pi_vfs::File::from_handle(OneFileHandle))
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(one_file_meta())
+		}
+
+		async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			Err(io::ErrorKind::NotFound.into())
+		}
+	}
+
+	#[derive(Debug)]
+	struct OneFileHandle;
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileHandle for OneFileHandle {
+		async fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+			Ok(0)
+		}
+
+		async fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+			Err(io::ErrorKind::PermissionDenied.into())
+		}
+
+		async fn seek(&self, _pos: io::SeekFrom) -> io::Result<u64> {
+			Ok(0)
+		}
+
+		async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+			Ok(one_file_meta())
+		}
+	}
+
+	/// grep asks a walked file's identity (is it the file stdout lands in?)
+	/// from its async body. For a file a walk opened on a provider tree the
+	/// blocking query panicked on a current-thread runtime, so `grep -r` over
+	/// that tree into a regular file ended with `internal error`.
+	#[tokio::test(flavor = "current_thread")]
+	async fn a_listed_provider_file_reports_its_identity_on_a_current_thread_runtime() {
+		let vfs = pi_vfs::Fs::new(Arc::new(OneFile));
+		let mut session = pi_walker::Fs::new(&vfs, Path::new("mem://d")).session();
+		let (file, _) = session
+			.open_file(Path::new("mem://d/f"))
+			.await
+			.expect("open the provider file");
+		let opened = Input::Listed(file)
+			.metadata()
+			.await
+			.expect("the opened file's identity");
+		assert_eq!(opened.len(), ONE_FILE.len() as u64);
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn path_separator_rewrites_the_native_separator_on_windows() {
@@ -1972,6 +2188,43 @@ mod tests {
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
 		(code, capture.out(), capture.err())
+	}
+
+	/// `grep -r` reads no file through a directory swapped, between the
+	/// walk's listing and the file's open, for a symlink to a directory
+	/// outside the operand that holds a file of the listed name, and reports
+	/// the refused open (exit 2); `-R`, which follows symlinks, still reads
+	/// through the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_grep_reads_no_file_through_a_directory_swapped_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		tree.swap_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert!(!out.contains("outside"), "read through the swapped link: {out:?} {err:?}");
+		assert!(code == 2 && err.contains("sub/decoy.txt: "), "{code} {err:?}");
+		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
+	}
+
+	/// `grep -r` skips a listed file swapped for a symlink after the walk with
+	/// no message and no error status, as GNU grep 3.11 does (its `O_NOFOLLOW`
+	/// open fails with `ELOOP`), and searches the others; `-R` reads through
+	/// the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_grep_skips_a_file_swapped_for_a_symlink_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		std::fs::write(tree.sub.join("other.txt"), "needle other\n").unwrap();
+		tree.swap_file_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert_eq!((code, out, err), (0, format!("{root_arg}/sub/other.txt:needle other\n"), String::new()));
+		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2098,6 +2351,286 @@ mod tests {
 			drain_bounded(line().chain(&b"\n"[..]).chain(line()).chain(&b"\n"[..]), None),
 			Some("file larger than 256 MiB, not searched".to_owned())
 		);
+	}
+
+	/// Runs `grep` with `args` in `cwd` and stdout redirected (`>>`) into
+	/// `stdout_path`, the way the shell sets it up, returning its exit status
+	/// together with the captured stderr.
+	async fn run_with_stdout_file(
+		args: &[&str],
+		cwd: &std::path::Path,
+		stdout_path: &std::path::Path,
+	) -> (i32, String) {
+		let stdout = std::fs::OpenOptions::new()
+			.append(true)
+			.open(stdout_path)
+			.expect("stdout file");
+		let (mut host, capture) = Host::for_test_async("grep", "", cwd);
+		host.set_test_stdout(openfiles::OpenFile::File(Arc::new(stdout)));
+		let code = run_parsed(args, &mut host).await;
+		(code, capture.err())
+	}
+
+	/// Runs `grep` with `args` and standard input and stdout both on `path`,
+	/// the way `… < out >> out` sets them up, returning its exit status
+	/// together with the captured stderr.
+	async fn run_with_stdin_and_stdout_file(
+		args: &[&str],
+		cwd: &std::path::Path,
+		path: &std::path::Path,
+	) -> (i32, String) {
+		let stdout = std::fs::OpenOptions::new()
+			.append(true)
+			.open(path)
+			.expect("stdout file");
+		let stdin = std::fs::OpenOptions::new()
+			.read(true)
+			.open(path)
+			.expect("stdin file");
+		let (mut host, capture) = Host::for_test_async("grep", "", cwd);
+		host.set_test_stdin(openfiles::OpenFile::File(Arc::new(stdin)));
+		host.set_test_stdout(openfiles::OpenFile::File(Arc::new(stdout)));
+		let code = run_parsed(args, &mut host).await;
+		(code, capture.err())
+	}
+
+	/// Parses `args` as the adapter does, runs `grep` on `host`, and drains
+	/// the output the body buffered.
+	async fn run_parsed(args: &[&str], host: &mut Host) -> i32 {
+		let argv = std::iter::once(OsString::from("grep"))
+			.chain(args.iter().copied().map(OsString::from))
+			.collect::<Vec<_>>();
+		let argv = Grep::rewrite_argv(argv).expect("rewrite argv");
+		let parsed = Grep::try_parse_from(argv).expect("parse");
+		run_caught_async::<Grep>(parsed, host).await
+	}
+
+	/// Contract: grep refuses to search the file its own output lands in.
+	///
+	/// GNU grep rejects that input with exit status 2 and "input file is also
+	/// the output", because the matches it writes would be read back and
+	/// matched again. A consumer that redirects grep's output into a file it
+	/// also searches must see that diagnostic rather than a growing file.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn searching_the_output_file_itself_is_refused() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let (code, err) =
+			run_with_stdout_file(&["-m2", "needle", "out.txt"], tree.path(), &path).await;
+		assert_eq!(code, 2, "{err}");
+		assert!(err.contains("input file is also the output"), "{err}");
+		// The refused input is left exactly as it was.
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: grep refuses standard input that is the file its output lands
+	/// in.
+	///
+	/// GNU grep reports `(standard input): input file is also the output` and
+	/// exits 2, because the matches it writes would be read back and matched
+	/// again; the input is never read at all.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn reading_standard_input_that_is_the_output_file_is_refused() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let (code, err) =
+			run_with_stdin_and_stdout_file(&["needle", "-"], tree.path(), &path).await;
+		assert_eq!(code, 2, "{err}");
+		assert!(
+			err.contains("(standard input): input file is also the output"),
+			"{err}"
+		);
+		// The refused input is left exactly as it was.
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: `--label` names standard input in the refusal diagnostic.
+	///
+	/// GNU grep reports the label it was given, not the generic
+	/// `(standard input)`, when it refuses an input that is also its output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_label_names_standard_input_in_the_refusal_diagnostic() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let (code, err) =
+			run_with_stdin_and_stdout_file(&["--label=foo", "needle", "-"], tree.path(), &path)
+				.await;
+		assert_eq!(code, 2, "{err}");
+		assert!(err.contains("grep: foo: input file is also the output"), "{err}");
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: `--no-messages` silences the refusal but keeps its status.
+	///
+	/// GNU grep still exits 2 for an input that is also its output when `-s`
+	/// is given; only the diagnostic is suppressed.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn no_messages_suppresses_the_refusal_message_but_not_its_status() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let (code, err) =
+			run_with_stdout_file(&["-s", "needle", "out.txt"], tree.path(), &path).await;
+		assert_eq!(code, 2);
+		assert_eq!(err, "");
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: a recursive search refuses the output file it walks into.
+	///
+	/// GNU grep names the offending file by its path under the searched
+	/// directory and exits 2.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_recursive_search_refuses_the_output_file_it_walks_into() {
+		let tree = tempfile::tempdir().unwrap();
+		let dir = tree.path().join("tree");
+		std::fs::create_dir(&dir).unwrap();
+		let path = dir.join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		let (code, err) = run_with_stdout_file(&["-r", "needle", "tree"], tree.path(), &path).await;
+		assert_eq!(code, 2, "{err}");
+		// The name is built with `Path::join`, as the implementation builds
+		// it, so the separator is the native one.
+		let named = Path::new("tree").join("out.txt");
+		assert!(
+			err.contains(&format!("{}: input file is also the output", named.display())),
+			"{err}"
+		);
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: the modes whose output cannot feed back into the search still
+	/// read the file they write to.
+	///
+	/// GNU grep exempts them from the same-file rejection: `-q`, `-c` and the
+	/// list modes write at most one line per file, and `-m1` stops after the
+	/// first match. Each row below checks the record the mode leaves in the
+	/// file it read, and the exit status it reports.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn modes_that_cannot_feed_their_output_back_still_read_the_output_file() {
+		for (args, expected_code, expected_file) in [
+			(&["-q", "needle", "out.txt"][..], 0, &b"needle\n"[..]),
+			(&["-c", "needle", "out.txt"][..], 0, &b"needle\n1\n"[..]),
+			(&["-l", "needle", "out.txt"][..], 0, &b"needle\nout.txt\n"[..]),
+			// A file without a match is the one `-L` lists, so it prints its
+			// name and reports that no line matched.
+			(&["-L", "absent", "out.txt"][..], 1, &b"needle\nout.txt\n"[..]),
+			(&["-m1", "needle", "out.txt"][..], 0, &b"needle\nneedle\n"[..]),
+		] {
+			let tree = tempfile::tempdir().unwrap();
+			let path = tree.path().join("out.txt");
+			std::fs::write(&path, "needle\n").unwrap();
+			let (code, err) = run_with_stdout_file(args, tree.path(), &path).await;
+			assert_eq!(code, expected_code, "{args:?}: {err}");
+			assert_eq!(std::fs::read(&path).unwrap(), *expected_file, "{args:?}: {err}");
+		}
+	}
+
+	/// Contract: the modes whose output cannot feed back into the search still
+	/// read standard input that is also the output file.
+	///
+	/// The exemption holds for standard input as well as for a named file.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn modes_that_cannot_feed_their_output_back_still_read_standard_input() {
+		for (args, expected_code, expected_file) in [
+			(&["-q", "needle"][..], 0, &b"needle\n"[..]),
+			(&["-c", "needle"][..], 0, &b"needle\n1\n"[..]),
+			(&["-l", "needle"][..], 0, &b"needle\n(standard input)\n"[..]),
+			(&["-L", "absent"][..], 1, &b"needle\n(standard input)\n"[..]),
+			(&["-m1", "needle"][..], 0, &b"needle\nneedle\n"[..]),
+		] {
+			let tree = tempfile::tempdir().unwrap();
+			let path = tree.path().join("out.txt");
+			std::fs::write(&path, "needle\n").unwrap();
+			let (code, err) =
+				run_with_stdin_and_stdout_file(args, tree.path(), &path).await;
+			assert_eq!(code, expected_code, "{args:?}: {err}");
+			assert_eq!(std::fs::read(&path).unwrap(), *expected_file, "{args:?}: {err}");
+		}
+	}
+
+	/// Contract: a search with no pattern at all is not reading its own
+	/// output.
+	///
+	/// GNU grep reads a file whose pattern file is empty, reports that no line
+	/// matched, and leaves the file alone: the search selects no record, so it
+	/// writes nothing that could be read back.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_search_with_no_patterns_is_not_refused_as_the_output_file() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		std::fs::write(tree.path().join("patterns"), "").unwrap();
+		let (code, err) =
+			run_with_stdout_file(&["-f", "patterns", "out.txt"], tree.path(), &path).await;
+		assert_eq!(code, 1, "{err}");
+		assert!(!err.contains("input file is also the output"), "{err}");
+		// The file is read, and left exactly as it was.
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: an inverted search with no pattern at all is still refused.
+	///
+	/// The boundary of the exemption above: with no pattern the matcher
+	/// matches nothing, and an inverted search of it selects every record.
+	/// GNU grep therefore still rejects the file it writes into.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_inverted_search_with_no_patterns_is_still_refused() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\n").unwrap();
+		std::fs::write(tree.path().join("patterns"), "").unwrap();
+		let (code, err) =
+			run_with_stdout_file(&["-v", "-f", "patterns", "out.txt"], tree.path(), &path).await;
+		assert_eq!(code, 2, "{err}");
+		assert!(err.contains("input file is also the output"), "{err}");
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
+	}
+
+	/// Contract: an inverted empty pattern is not reading its own output.
+	///
+	/// GNU grep searches a file with `grep -v ''` and writes nothing: the empty
+	/// pattern matches every record, so the inverted search selects none of
+	/// them and the file it reads is not its own output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_inverted_empty_pattern_is_not_refused_as_the_output_file() {
+		let tree = tempfile::tempdir().unwrap();
+		let path = tree.path().join("out.txt");
+		std::fs::write(&path, "needle\nother\n").unwrap();
+		let (code, err) =
+			run_with_stdout_file(&["-v", "-e", "", "out.txt"], tree.path(), &path).await;
+		assert_eq!(code, 1, "{err}");
+		assert!(!err.contains("input file is also the output"), "{err}");
+		assert_eq!(std::fs::read(&path).unwrap(), b"needle\nother\n");
+	}
+
+	/// Contract: an empty pattern constrained by `-x` or `-w` is still refused.
+	///
+	/// The boundary of the exemption above: `-x` limits the empty pattern to
+	/// empty lines and `-w` leaves it matching nothing, so an inverted search
+	/// of either still selects records and can write into the file it reads.
+	/// GNU grep rejects that file.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_constrained_inverted_empty_pattern_is_still_refused() {
+		for args in [
+			&["-v", "-x", "-e", "", "out.txt"][..],
+			&["-v", "-w", "-e", "", "out.txt"][..],
+		] {
+			let tree = tempfile::tempdir().unwrap();
+			let path = tree.path().join("out.txt");
+			std::fs::write(&path, "needle\nother\n").unwrap();
+			let (code, err) = run_with_stdout_file(args, tree.path(), &path).await;
+			assert_eq!(code, 2, "{args:?}: {err}");
+			assert!(err.contains("input file is also the output"), "{args:?}: {err}");
+			assert_eq!(
+				std::fs::read(&path).unwrap(),
+				b"needle\nother\n",
+				"{args:?}: {err}"
+			);
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

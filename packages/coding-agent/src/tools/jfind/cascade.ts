@@ -319,7 +319,7 @@ class Cascade {
 			selected.map(async (node): Promise<FilePlan | undefined> => {
 				const entry = entries[node]!;
 				try {
-					const read = await readText(filesystem, entry.path, READ_LIMIT);
+					const read = await readText(filesystem, entry, READ_LIMIT);
 					const passages = selectWindows(windows(read.text, WINDOW_BYTES, keywords, weights), WINDOWS);
 					if (passages.length === 0) return undefined;
 					return { node, total: lines(read.text).length, truncated: read.truncated, passages };

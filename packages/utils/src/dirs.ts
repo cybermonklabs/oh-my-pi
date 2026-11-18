@@ -2,7 +2,10 @@
  * Centralized path helpers for omp config directories.
  *
  * Uses PI_CONFIG_DIR (default ".omp") for the config root and
- * PI_CODING_AGENT_DIR to override the agent directory.
+ * PI_CODING_AGENT_DIR to override the agent directory. OMP_CONFIG_ROOT, an
+ * absolute path, replaces the home-relative config root on every OS, and
+ * OMP_DOWNLOAD_ROOT names a second config root that holds only the
+ * version-fixed downloads (see getConfigRootOverride and downloadSubdir).
  *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
@@ -112,9 +115,30 @@ function readProfileFromEnvSafe(): string | undefined {
 	}
 }
 
-/** Profile-independent config root (~/.omp), shared by every omp profile. */
+/**
+ * `OMP_CONFIG_ROOT` from `env`: an absolute path that replaces `~/<PI_CONFIG_DIR>` as the
+ * config root, so every profile, the default agent directory, and all state, data and
+ * caches move under it. `~` is expanded; a relative or empty value is ignored.
+ */
+export function getConfigRootOverride(env: Record<string, string | undefined> = process.env): string | undefined {
+	return resolveAbsoluteDir(env.OMP_CONFIG_ROOT);
+}
+
+/** Profile-independent config root (~/.omp, or `OMP_CONFIG_ROOT`), shared by every omp profile. */
 export function getBaseConfigRoot(): string {
-	return path.join(os.homedir(), getConfigDirName());
+	return getConfigRootOverride() ?? path.join(os.homedir(), getConfigDirName());
+}
+
+/**
+ * `OMP_DOWNLOAD_ROOT`: a config root (laid out as `~/.omp` is) that holds omp's
+ * version-fixed downloads in place of the config root, so several config roots can
+ * share one copy. Only downloads whose bytes are fixed by their version live there: the
+ * Chromium build, the native addon and its grammars, the FastEmbed models and runtime, and
+ * the tiny models with their runtimes. `~` is expanded; a relative or empty value is ignored.
+ */
+function downloadSubdir(...subdir: string[]): string | undefined {
+	const root = resolveAbsoluteDir(process.env.OMP_DOWNLOAD_ROOT);
+	return root === undefined ? undefined : path.join(root, ...subdir);
 }
 
 function getProfileConfigRoot(profile: string | undefined): string {
@@ -805,9 +829,9 @@ export function getPythonGatewayDir(): string {
 	return dirs.agentSubdir(undefined, "python-gateway", "state");
 }
 
-/** Get the puppeteer sandbox directory (~/.omp/puppeteer). */
+/** Get the puppeteer sandbox directory, where the managed Chromium is downloaded (~/.omp/puppeteer; `OMP_DOWNLOAD_ROOT` moves it). */
 export function getPuppeteerDir(): string {
-	return dirs.rootSubdir("puppeteer", "cache");
+	return downloadSubdir("puppeteer") ?? dirs.rootSubdir("puppeteer", "cache");
 }
 
 /** Get the browser relay extension install directory (~/.omp/browser-relay). */
@@ -818,6 +842,11 @@ export function getBrowserRelayDir(): string {
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */
 export function getBrowserProfilesDir(): string {
 	return dirs.rootSubdir("browser-profiles", "state");
+}
+
+/** Get the directory of saved browser storage states (~/.omp/browser-state). */
+export function getBrowserStateDir(): string {
+	return path.join(getBaseConfigRoot(), "browser-state");
 }
 
 /** Get DOCS_RS cache directory () */
@@ -898,14 +927,16 @@ export function getAvatarCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "avatars"), "cache");
 }
 
-/** Get the local FastEmbed model cache directory (~/.omp/cache/fastembed). */
+/** Get the local FastEmbed model cache directory (~/.omp/cache/fastembed; `OMP_DOWNLOAD_ROOT` moves it). */
 export function getFastembedCacheDir(): string {
-	return dirs.rootSubdir(path.join("cache", "fastembed"), "cache");
+	return downloadSubdir("cache", "fastembed") ?? dirs.rootSubdir(path.join("cache", "fastembed"), "cache");
 }
 
-/** Get the on-demand fastembed runtime install root (~/.omp/cache/fastembed-runtime). */
+/** Get the on-demand fastembed runtime install root (~/.omp/cache/fastembed-runtime; `OMP_DOWNLOAD_ROOT` moves it). */
 export function getFastembedRuntimeDir(): string {
-	return dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache");
+	return (
+		downloadSubdir("cache", "fastembed-runtime") ?? dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache")
+	);
 }
 
 /**
@@ -917,9 +948,14 @@ export function getNativeGrammarsDir(): string {
 	return path.join(getNativesDir(), "grammars");
 }
 
-/** Get the natives directory. PI_NATIVES_DIR overrides the usual cache root; relative values are ignored. */
+/**
+ * Get the natives directory. PI_NATIVES_DIR overrides it, then `OMP_DOWNLOAD_ROOT`, then the
+ * usual cache root; relative values are ignored.
+ */
 export function getNativesDir(): string {
-	return resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? dirs.rootSubdir("natives", "cache");
+	return (
+		resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? downloadSubdir("natives") ?? dirs.rootSubdir("natives", "cache")
+	);
 }
 
 /** Get the stats database path (~/.omp/stats.db). */
@@ -981,9 +1017,17 @@ export function getModelDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "models.db", "data");
 }
 
-/** Get the tiny title model cache directory (~/.omp/agent/cache/tiny-models). */
+/**
+ * Get the tiny title model cache directory (~/.omp/agent/cache/tiny-models). Its parent holds
+ * the version-keyed runtimes the tiny models run on. Without an explicit `agentDir`,
+ * `OMP_DOWNLOAD_ROOT` moves it to `<download root>/agent/cache/tiny-models`.
+ */
 export function getTinyModelsCacheDir(agentDir?: string): string {
-	return dirs.agentSubdir(agentDir, path.join("cache", "tiny-models"), "cache");
+	const tinyModels = path.join("cache", "tiny-models");
+	return (
+		(agentDir === undefined ? downloadSubdir("agent", tinyModels) : undefined) ??
+		dirs.agentSubdir(agentDir, tinyModels, "cache")
+	);
 }
 
 /** Get the document conversion cache directory (~/.omp/agent/cache/document-conversions; XDG default: $XDG_CACHE_HOME/omp/cache/document-conversions). */

@@ -641,7 +641,7 @@ describe("StdioTransport.notify", () => {
 	it("rejects synchronously when called before connect()", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "process.exit(0)"],
 		});
 
@@ -651,7 +651,7 @@ describe("StdioTransport.notify", () => {
 	it("rejects with 'Transport not connected' after close()", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "await Bun.sleep(60_000)"],
 		});
 
@@ -666,7 +666,7 @@ describe("StdioTransport.notify", () => {
 		const closed = Promise.withResolvers<void>();
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "process.exit(0)"],
 		});
 		transport.onClose = () => {
@@ -702,7 +702,7 @@ describe("StdioTransport request failure diagnostics", () => {
 	it("reports abrupt subprocess termination as EOF instead of a generic close", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "process.stdin.once('data', () => process.exit(23)); process.stdin.resume()"],
 			timeout: 1_000,
 		});
@@ -725,7 +725,7 @@ describe("StdioTransport request failure diagnostics", () => {
 	it("reports malformed subprocess JSON at the decode stage", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "process.stdin.once('data', () => console.log('{not-json')); process.stdin.resume()"],
 			timeout: 1_000,
 		});
@@ -817,7 +817,7 @@ describe("StdioTransport.close", () => {
 		// still null them out instead of early-returning.
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "process.exit(0)"],
 		});
 
@@ -847,7 +847,7 @@ describe("StdioTransport.close", () => {
 	it("is idempotent — repeat close() calls fire onClose exactly once", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
-			command: "bun",
+			command: process.execPath,
 			args: ["-e", "await Bun.sleep(60_000)"],
 		});
 
@@ -893,7 +893,7 @@ describe("StdioTransport.close", () => {
 				);
 				transport = new StdioTransport({
 					type: "stdio",
-					command: "bun",
+					command: process.execPath,
 					args: ["run", scriptPath],
 				});
 

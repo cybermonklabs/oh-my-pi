@@ -27,6 +27,8 @@ import { $which, removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { isShellTrace } from "@oh-my-pi/pi-wire";
 
 import { cfgBashDirenvLoadTimeoutMs, cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
+import { withoutAmbientShellPrefix } from "./helpers/ambient-shell-prefix";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 // Matches the schema default for `tools.artifactHeadBytes` (20 KB) used by
 // OutputSink when bash-executor pulls settings via resolveOutputSinkHeadBytes.
@@ -93,6 +95,9 @@ async function expectMarkerNeverWritten(marker: string, release: string): Promis
 	await Bun.sleep(KILL_REACT_MS);
 	expect(fs.existsSync(marker)).toBe(false);
 }
+
+// Several cases route the native `Shell.run` by the exact command it receives, which a prefix rewrites.
+withoutAmbientShellPrefix();
 
 describe("executeBash", () => {
 	let tempDir: string;
@@ -730,6 +735,11 @@ exit 64
 		if (!zshPath) {
 			return;
 		}
+		// An interactive zsh whose ZDOTDIR holds none of .zshenv, .zprofile, .zshrc and .zlogin
+		// runs zsh-newuser-install where the zsh install ships it (Debian and Ubuntu do), and its
+		// menu waits for a key before the command runs, so the prompt this test answers never
+		// appears. An empty .zshrc is a startup file, so zsh runs the command straight away.
+		fs.writeFileSync(path.join(tempDir, ".zshrc"), "");
 		cfgShellPath.set(Settings.instance, zshPath);
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: zshPath,
@@ -1244,10 +1254,8 @@ exit 64
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
 			args: ["-l", "-c"],
-			env: {
-				PATH: Bun.env.PATH ?? "",
-				HOME: Bun.env.HOME ?? tempDir,
-			},
+			// A login shell in a home of its own reads no `~/.bash_profile` of the developer's.
+			env: createProductionChildEnv({ PATH: Bun.env.PATH }),
 			prefix: undefined,
 		});
 		vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);
@@ -1323,7 +1331,7 @@ exit 64
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
 			args: ["-l", "-c"],
-			env: { PATH: Bun.env.PATH ?? "", HOME: Bun.env.HOME ?? tempDir },
+			env: createProductionChildEnv({ PATH: Bun.env.PATH }),
 			prefix: undefined,
 		});
 		vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);
