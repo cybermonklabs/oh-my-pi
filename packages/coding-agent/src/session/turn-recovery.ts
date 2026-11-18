@@ -2499,8 +2499,8 @@ export class TurnRecovery {
 			}
 		};
 		// Every context fit of this walk, the searches after a spent fallback
-		// included, leaves out the failed turn, and every switch it makes
-		// records the failed request's error.
+		// included, uses `excludedMessage`, and every switch it makes records
+		// the failed request's error.
 		const excludedMessage = options?.preserveFailedTurn ? undefined : failedMessage;
 		const reason = `Request failed: ${failedMessage.errorMessage ?? "provider returned an error without details"}`;
 		// The candidates the credit hold below passes over while a refusal's
