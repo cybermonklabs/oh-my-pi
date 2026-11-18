@@ -418,13 +418,34 @@ fn path_push(buf: &mut Vec<u8>, name: &OsStr) {
 /// Whether `name` is an empty directory in `dir_fd`, asked through the
 /// descriptor rather than the path: past `PATH_MAX` a path-based check fails,
 /// and a failure counts as non-empty. An unreadable directory still counts as
-/// non-empty.
+/// non-empty, and so does one that is not the directory `id` (see
+/// [`open_stat_subdir`]).
 #[cfg(not(target_os = "redox"))]
-fn is_subdir_empty(dir_fd: &DirFd, name: &OsStr) -> bool {
-	dir_fd
-		.open_subdir(name, SymlinkBehavior::NoFollow)
+fn is_subdir_empty(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> bool {
+	open_stat_subdir(dir_fd, name, id)
 		.and_then(|fd| fd.read_dir())
 		.is_ok_and(|entries| entries.is_empty())
+}
+
+/// Opens the subdirectory `name` of `dir_fd`, without following a symlink
+/// there, as the directory `id` (device, inode) that `stat_at` found at the
+/// name: anything else there is `ENOTDIR`, Linux's refusal of a symlink at a
+/// directory open. `open_subdir` opens with `O_DIRECTORY | O_NOFOLLOW`, and
+/// gVisor before release-20261109.0 (GKE Sandbox's among them) follows a
+/// final symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is
+/// set (google/gvisor#14786), so a directory swapped for a symlink since the
+/// stat would take the walk off the tree. gnulib's fts, which GNU rm walks
+/// with, compares the device and inode of each directory it enters the same
+/// way.
+#[cfg(not(target_os = "redox"))]
+fn open_stat_subdir(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> std::io::Result<DirFd> {
+	let fd = dir_fd.open_subdir(name, SymlinkBehavior::NoFollow)?;
+	let info = fd.metadata()?.file_info();
+	if (info.device(), info.inode()) == id {
+		Ok(fd)
+	} else {
+		Err(std::io::Error::from_raw_os_error(libc::ENOTDIR))
+	}
 }
 
 /// GNU's warning for a directory that is its own ancestor.
@@ -560,16 +581,16 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 
 			// Ask user if they want to descend into this directory
 			if options.interactive == InteractiveMode::Always
-				&& !is_subdir_empty(&cur_fd, &entry_name)
+				&& !is_subdir_empty(&cur_fd, &entry_name, entry_id)
 				&& !prompt_descend(host, path_of(&path_buf))
 			{
 				break 'entry false;
 			}
 
-			// Open the just-stat'd subdirectory without following a symlink: one
-			// swapped in since the stat makes the open fail instead of taking the
-			// walk off the tree.
-			let child_fd = match cur_fd.open_subdir(&entry_name, SymlinkBehavior::NoFollow) {
+			// Open the just-stat'd subdirectory as that directory, not
+			// following a symlink: one swapped in since the stat makes the open
+			// fail instead of taking the walk off the tree.
+			let child_fd = match open_stat_subdir(&cur_fd, &entry_name, entry_id) {
 				Ok(fd) => fd,
 				Err(e) => {
 					if e.kind() == std::io::ErrorKind::PermissionDenied {

@@ -16,6 +16,7 @@
 - A walk of a host directory that does not follow symlinks (`grep()`, `grep -r`, `rg`, `find -delete` without `-L`, `ast-grep` and `astGrep`/`astEdit` without following links) no longer reads, rewrites or deletes a file through a symlink swapped in after the walk listed it: the file is reached below the walk's own open root, and a swapped directory makes that file's read, write or removal fail instead of reaching outside the tree
 - `find -delete` reports a failed removal as GNU find does (`find: cannot delete 'path': reason`, exit status 1), and `find . -delete` keeps `.` without an error
 - Under gVisor releases before 20261109.0 (GKE Sandbox among them), which follow a symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set, such a walk and `readFileBeneath()` no longer enter a directory swapped for a symlink, or a symlink on the way to the file: unless the kernel was seen refusing such a link (probed once per process on `/proc/self`), each directory the walk opens is opened with `O_NOFOLLOW` and without `O_DIRECTORY`, which gVisor honours, and refused unless `fstat` shows a directory
+- Under those gVisor releases, the bash tool's `rm -r` no longer deletes files outside the tree it removes through a directory swapped for a symlink while it runs: it enters, and lists for `-i`, only the directory it found at the name, by device and inode, and reports any other as `Not a directory`
 
 ## [18.18.6] - 2026-11-09
 
