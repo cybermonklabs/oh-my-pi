@@ -11,7 +11,7 @@ import {
 import { buildModel } from "./build";
 import { collapseBuiltVariants } from "./compat/collapse";
 import { applyCatalogMetrics, CatalogMetricsIndex } from "./identity/metrics";
-import { readModelCache, writeModelCacheInSlices } from "./model-cache";
+import { readModelCache, readModelCacheRowVersion, writeModelCacheInSlices } from "./model-cache";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import { TimeBasedCostShape } from "./pricing";
 import { type Api, type Model, modelKind, type ModelSpec, type Provider } from "./types";
@@ -465,6 +465,10 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			// refetch that recovers them (#18227).
 			while (sliceExpired()) await nextSlice();
 			const latestCache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
+			// The guard and the snapshot below come from this row, and the write
+			// lands slices later: another pass for this provider can write the row
+			// in between. The write applies only while the row is still this one.
+			const latestRowVersion = readModelCacheRowVersion(cacheProviderId, dbPath);
 			const latestRestoredCache = await restoreCachedModelHeaders(
 				latestCache?.models ?? cache?.models ?? [],
 				staticModels,
@@ -513,6 +517,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					dbPath,
 					staticModels,
 					restorableHeaderFallback,
+					latestRowVersion,
 				);
 			}
 		}

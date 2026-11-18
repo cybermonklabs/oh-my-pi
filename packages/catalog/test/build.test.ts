@@ -7,7 +7,12 @@ import { buildDiscoveredModel, buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	readModelCache,
+	readModelCacheRowVersion,
+	writeModelCache,
+	writeModelCacheInSlices,
+} from "@oh-my-pi/pi-catalog/model-cache";
 import { fingerprintStaticModels, resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
@@ -2086,6 +2091,69 @@ describe("model cache materialized round trip", () => {
 			fail = true;
 			await resolveProviderModels(options, "online");
 			expect(readRows()).toEqual(written);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a sliced write given the row version it read leaves a row another write changed since", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-row-version-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "row-version-test";
+		const older = buildModel(completionsSpec({ id: "older-model", provider: providerId }));
+		const newer = buildModel(completionsSpec({ id: "newer-model", provider: providerId }));
+		const storedIds = () => readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id);
+		try {
+			expect(readModelCacheRowVersion(providerId, dbPath)).toBeNull();
+			writeModelCache(providerId, 1_000_000, [older], true, "", dbPath);
+			const read = readModelCacheRowVersion(providerId, dbPath);
+			// Another write lands after the caller read the row.
+			writeModelCache(providerId, 1_500_000, [newer], true, "", dbPath);
+			await writeModelCacheInSlices(providerId, 2_000_000, [older], false, "", dbPath, [], undefined, read);
+			expect(storedIds()).toEqual(["newer-model"]);
+			// The row's current version lets the same write through.
+			const current = readModelCacheRowVersion(providerId, dbPath);
+			await writeModelCacheInSlices(providerId, 2_000_000, [older], false, "", dbPath, [], undefined, current);
+			expect(storedIds()).toEqual(["older-model"]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("a failed refresh keeps a row another pass wrote between its re-read and its write (#18227)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-failed-refresh-race-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const providerId = "failed-refresh-race-test";
+		const keyed = completionsSpec({ id: "keyed-model", provider: providerId, headers: { "X-Key": "key-a" } });
+		const tenant = completionsSpec({ id: "tenant-model", provider: providerId, headers: { "X-Tenant": "tenant-a" } });
+		let fetchFailed = false;
+		let raced = false;
+		const options = (fetched: readonly ModelSpec<"openai-completions">[] | null) => ({
+			providerId,
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			now: () => 1_000_000,
+			fetchDynamicModels: async () => {
+				if (fetched === null) fetchFailed = true;
+				return fetched;
+			},
+			// keyed-model's header has no static source, so each read of its row
+			// restores it here. The failed pass's second read is the one its
+			// fallback write comes from: another pass writes the row just after it.
+			restoreCachedHeaders: () => {
+				if (fetchFailed && !raced) {
+					raced = true;
+					writeModelCache(providerId, 1_500_000, [buildModel(tenant)], true, "", dbPath);
+				}
+				return { headers: { "X-Key": "key-a" } };
+			},
+		});
+		try {
+			await resolveProviderModels(options([keyed]), "online");
+			await resolveProviderModels(options(null), "online");
+			expect(raced).toBe(true);
+			expect(readModelCache(providerId, Infinity, () => 0, dbPath)?.models.map(model => model.id)).toEqual([
+				"tenant-model",
+			]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

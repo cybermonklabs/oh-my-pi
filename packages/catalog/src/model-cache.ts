@@ -121,11 +121,13 @@ export interface ModelCacheWriteStats {
 	refreshWrites: number;
 	/** Writes that matched the stored row exactly and touched nothing. */
 	skippedWrites: number;
+	/** Writes left undone because another write changed the row after their caller read it. */
+	staleWrites: number;
 	/** Provider ids of the most recent payload writes (bounded). */
 	recentPayloadProviders: readonly string[];
 }
 
-const writeStats = { payloadWrites: 0, payloadBytes: 0, refreshWrites: 0, skippedWrites: 0 };
+const writeStats = { payloadWrites: 0, payloadBytes: 0, refreshWrites: 0, skippedWrites: 0, staleWrites: 0 };
 const recentPayloadProviders: string[] = [];
 const RECENT_PAYLOAD_PROVIDERS_MAX = 64;
 
@@ -575,6 +577,26 @@ function queryRow<T>(db: Database, sql: string, providerId: string): T | null {
 }
 
 /**
+ * The version of a provider's cache row: its scalar columns, payload hash and
+ * refresh side row, or `null` when it has none; `undefined` when the cache
+ * cannot be read. A caller that reads the cache and writes it later in slices
+ * passes the version it read to {@link writeModelCacheInSlices}, which then
+ * writes only if no other write changed the row in between.
+ */
+export function readModelCacheRowVersion(providerId: string, dbPath?: string): string | null | undefined {
+	try {
+		return withModelCacheDb(dbPath, db => cacheRowVersion(db, providerId));
+	} catch {
+		return undefined;
+	}
+}
+
+function cacheRowVersion(db: Database, providerId: string): string | null {
+	const row = queryRow<CacheRowMeta>(db, SELECT_CACHE_ROW_META, providerId);
+	return row === null ? null : JSON.stringify(row);
+}
+
+/**
  * Whether two rows carry the same payload record (refresh side-row columns
  * excluded). Payloads compare by `models_hash`; rows without one never match.
  */
@@ -717,6 +739,7 @@ export function writeModelCache<TApi extends Api>(
 				dbPath,
 				staticHeaderSources,
 				restorableHeaderFallback,
+				undefined,
 			),
 		);
 	} catch {
@@ -728,6 +751,11 @@ export function writeModelCache<TApi extends Api>(
  * {@link writeModelCache} for a pass that must not hold the event loop: it
  * validates the models in slices and returns to the loop before it serializes
  * the row and before the write transaction, which runs in one step.
+ *
+ * Other writes can land while it is in slices. With `expectedRowVersion` (from
+ * {@link readModelCacheRowVersion}, read when the caller read the cache) the
+ * transaction writes only if the row still has that version, so a snapshot
+ * built from an older row never replaces a newer one.
  */
 export async function writeModelCacheInSlices<TApi extends Api>(
 	providerId: string,
@@ -738,6 +766,7 @@ export async function writeModelCacheInSlices<TApi extends Api>(
 	dbPath?: string,
 	staticHeaderSources: readonly Model<TApi>[] = [],
 	restorableHeaderFallback?: Record<string, string>,
+	expectedRowVersion?: string | null,
 ): Promise<void> {
 	try {
 		await runInSlices(
@@ -750,6 +779,7 @@ export async function writeModelCacheInSlices<TApi extends Api>(
 				dbPath,
 				staticHeaderSources,
 				restorableHeaderFallback,
+				expectedRowVersion,
 			),
 		);
 	} catch {
@@ -767,6 +797,7 @@ function* writeModelCacheSteps<TApi extends Api>(
 	dbPath: string | undefined,
 	staticHeaderSources: readonly Model<TApi>[],
 	restorableHeaderFallback: Record<string, string> | undefined,
+	expectedRowVersion: string | null | undefined,
 ): Generator<void, void, undefined> {
 	const headerOmittedModelIds: string[] = [];
 	const unrestorableHeaderModelIds: string[] = [];
@@ -827,7 +858,10 @@ function* writeModelCacheSteps<TApi extends Api>(
 	invalidateReadRow(providerId, dbPath);
 	withModelCacheDb(dbPath, db => {
 		const outcome = db
-			.transaction((): "skipped" | "refreshed" | "written" => {
+			.transaction((): "stale" | "skipped" | "refreshed" | "written" => {
+				if (expectedRowVersion !== undefined && cacheRowVersion(db, providerId) !== expectedRowVersion) {
+					return "stale";
+				}
 				const matchStmt = db.prepare<
 					StoredRowState,
 					[string, number, string, string, string, string, number, string]
@@ -895,7 +929,9 @@ function* writeModelCacheSteps<TApi extends Api>(
 				return "written";
 			})
 			.immediate();
-		if (outcome === "skipped") {
+		if (outcome === "stale") {
+			writeStats.staleWrites++;
+		} else if (outcome === "skipped") {
 			writeStats.skippedWrites++;
 		} else if (outcome === "refreshed") {
 			writeStats.refreshWrites++;
