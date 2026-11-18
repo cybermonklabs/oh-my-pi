@@ -394,6 +394,10 @@ export class ModelRegistry {
 	 * commits only when no such change landed between its merge and commit.
 	 */
 	#compositionEpoch = 0;
+	/** Advances each time a discovery pass's fetches resolve. */
+	#discoverySequence = 0;
+	/** Per provider, the sequence of the pass whose discovered rows are committed. */
+	#providerDiscoverySequence = new Map<string, number>();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
@@ -2287,6 +2291,10 @@ export class ModelRegistry {
 			configuredDiscoveriesPromise,
 			this.#discoverBuiltInProviderModels(strategy, providerFilter),
 		]);
+		// Taken when the pass's fetches resolve, the moment its merge began before
+		// merges ran in slices: of two passes that touch a provider, the one whose
+		// fetches resolved later commits its rows, whichever finishes its merge last.
+		const discoverySequence = ++this.#discoverySequence;
 		this.#captureCatalogMetrics(builtInDiscovery.models, providerFilter === undefined);
 		// The merge runs in slices so the pass never holds the event loop. A static
 		// reload or a provider registration between the merge and the commit
@@ -2336,28 +2344,51 @@ export class ModelRegistry {
 				? await runInSlices(this.#hardcodedModelPolicySteps(await mapInSlices(discovered, merge)))
 				: this.#applyHardcodedModelPolicies(discovered.map(merge));
 			if (epoch !== this.#compositionEpoch) continue;
-			this.#commitRuntimeDiscoveries(builtInDiscovery, replacedConfiguredProviders, touchedProviders, discoveredModels);
+			this.#commitRuntimeDiscoveries(
+				builtInDiscovery,
+				replacedConfiguredProviders,
+				touchedProviders,
+				discoveredModels,
+				discoverySequence,
+			);
 			return;
 		}
 	}
 
-	/** Records a discovery pass's merged models; runs in one synchronous step after the pass's last slice. */
+	/**
+	 * Records a discovery pass's merged models; runs in one synchronous step after
+	 * the pass's last slice. A provider that a pass with newer fetch results
+	 * already committed keeps that pass's rows: a sliced merge can finish after a
+	 * later pass's, and the later fetch must win, as it did when merges ran in the
+	 * step in which their fetches resolved.
+	 */
 	#commitRuntimeDiscoveries(
 		builtInDiscovery: BuiltInDiscoveryResult,
 		replacedConfiguredProviders: readonly string[],
-		touchedProviders: ReadonlySet<string>,
-		discoveredModels: Model<Api>[],
+		allTouchedProviders: ReadonlySet<string>,
+		allDiscoveredModels: Model<Api>[],
+		discoverySequence: number,
 	): void {
+		const isCurrent = (provider: string) =>
+			(this.#providerDiscoverySequence.get(provider) ?? 0) < discoverySequence;
+		const touchedProviders = new Set([...allTouchedProviders].filter(isCurrent));
+		if (touchedProviders.size === 0) return;
+		const discoveredModels =
+			touchedProviders.size === allTouchedProviders.size
+				? allDiscoveredModels
+				: allDiscoveredModels.filter(model => touchedProviders.has(model.provider));
+		for (const provider of touchedProviders) this.#providerDiscoverySequence.set(provider, discoverySequence);
 		// A commit changes the cached and discovered slices that a concurrent
 		// pass's sliced merge reads, so that pass must merge again.
 		this.#compositionEpoch++;
 		const authoritativeProviders = providersWithAuthoritativeProjectCatalog(discoveredModels);
 		for (const provider of builtInDiscovery.authoritativeProviders) {
-			authoritativeProviders.add(provider);
+			if (touchedProviders.has(provider)) authoritativeProviders.add(provider);
 		}
 
-		const replacedProviderSet = new Set(replacedConfiguredProviders);
+		const replacedProviderSet = new Set(replacedConfiguredProviders.filter(provider => touchedProviders.has(provider)));
 		for (const provider of builtInDiscovery.replaceRuntimeProviders) {
+			if (!touchedProviders.has(provider)) continue;
 			replacedProviderSet.add(provider);
 			this.#replacedCacheProviders.add(provider);
 			this.#cachedStandardModelsByProvider.delete(provider);

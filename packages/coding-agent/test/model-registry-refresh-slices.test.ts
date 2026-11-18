@@ -119,6 +119,49 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("sliced-runtime-provider", "dynamic-model")).toBeDefined();
 	});
 
+	test("a pass whose fetches resolved first does not overwrite the rows of a pass that fetched later", async () => {
+		mockSteadyClock();
+		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
+		const row = (id: string) => ({
+			id,
+			name: id,
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		let fetches = 0;
+		const { promise: firstFetchDone, resolve: firstFetchResolved } = Promise.withResolvers<void>();
+		registry.registerProvider(
+			"ordered-provider",
+			{
+				baseUrl: "https://ordered.example.com/v1",
+				apiKey: "ORDERED_KEY",
+				api: "openai-completions",
+				fetchDynamicModels: async () => {
+					fetches++;
+					if (fetches > 1) return [row("model-v2")];
+					// The full pass's other discoveries finish first, so its fetches resolve with this one.
+					await new Promise(resolve => setTimeout(resolve, 300));
+					queueMicrotask(firstFetchResolved);
+					return [row("model-v1")];
+				},
+			},
+			"ext://ordered",
+		);
+		// The full pass fetches v1, and its fetches resolve; it then merges the whole catalog in slices.
+		const fullPass = registry.refresh("online");
+		await firstFetchDone;
+		for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+		// A scoped pass starts during that merge, fetches v2 and commits first.
+		await registry.refreshDiscoverableProviders(["ordered-provider"], "online");
+		await fullPass;
+		expect(fetches).toBe(2);
+		expect(registry.find("ordered-provider", "model-v2")).toBeDefined();
+		expect(registry.find("ordered-provider", "model-v1")).toBeUndefined();
+	});
+
 	test("a refresh awaited by createAgentSession takes its turns without waiting for a pending timer", async () => {
 		// No model has auth here, so creation awaits refresh("online-if-uncached") before it rejects.
 		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });
