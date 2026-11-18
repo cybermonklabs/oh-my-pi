@@ -55,6 +55,15 @@ import type { SessionManager } from "./session-manager";
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
 export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
 
+/**
+ * How a dispose ends the jobs the session owns (its eval `agent()` handles, its workpool
+ * batches), whose subagents read the kind from the abort reason: `"stop"` stops them, so
+ * their subagents end with the session and `omp --restore` leaves them; `"shutdown"` cuts
+ * them off with the job manager's shutdown reason, so the task executor parks their
+ * subagents and `omp --restore` goes on with them.
+ */
+export type OwnedJobsEnd = "stop" | "shutdown";
+
 /** Options controlling session disposal. */
 export interface AgentSessionDisposeOptions {
 	mnemopiConsolidateTimeoutMs?: number;
@@ -73,6 +82,19 @@ export interface AgentSessionDisposeOptions {
 	 * interrupted, so `omp --restore` goes on with it.
 	 */
 	reason?: postmortem.Reason;
+	/**
+	 * How this dispose ends what the session still runs: its turn, also one waiting to retry,
+	 * and the jobs it owns ({@link OwnedJobsEnd}). Only the process exit cuts them off: every
+	 * dispose while the process goes on says `"stop"`, and a dispose that names none cuts them
+	 * off, as `"shutdown"` does. A top-level session's dispose passes its kind on to every job
+	 * left on the job manager it owns. At the process exit (a session that binds process state
+	 * and does not say `"stop"`) it passes it on to the agents the lifecycle teardown releases;
+	 * any other end releases the agents under the session once its turn and jobs have stopped,
+	 * and stops them unless it says `"shutdown"`.
+	 * Apart from {@link reason}, so the process teardown cuts off an idle subagent's jobs
+	 * while its `session_exit` record stays a plain dispose.
+	 */
+	ownedJobsEnd?: OwnedJobsEnd;
 }
 
 /** Listener notified when command metadata changes. */
@@ -166,6 +188,15 @@ export interface InitialRetryFallbackState {
 	originalSelector: string;
 	/** Thinking selector configured for the unavailable primary. */
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+	/**
+	 * Picks the primary's level once restoration finds it, for a primary that
+	 * was not in the catalog at startup: session creation's own precedence for
+	 * a fresh spawn (task effort, `:level`, agent default, the model's own
+	 * default level, settings default) on that model, never the level a revived
+	 * session persisted while the fallback served.
+	 * Replaces `originalThinkingLevel` when set.
+	 */
+	resolveOriginalThinkingLevel?: (primary: Model) => ConfiguredThinkingLevel | undefined;
 	/** Prevent cooldown restoration when startup selected this fallback from live usage health. */
 	pinned?: boolean;
 }
@@ -266,6 +297,13 @@ export interface AgentSessionConfig {
 	skillWarnings?: SkillWarning[];
 	/** Whether runtime reloads may rediscover disk-backed skills. */
 	skillsReloadable?: boolean;
+	/**
+	 * A fixed `skills` snapshot was forwarded for perf (subagent inheriting
+	 * its parent's discovery), not to freeze the set: `discoverStartupSkillPaths`
+	 * still merges directories the subagent's own `resources_discover`
+	 * handlers contribute at its own startup into the inherited snapshot.
+	 */
+	mergeDiscoveredSkillPaths?: boolean;
 	/** Custom TypeScript slash commands. */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
@@ -468,6 +506,8 @@ export interface PromptOptions {
 	userInitiated?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Caller correlation id recorded as `tag` on the user message this prompt submits (see `sendUserInput`). */
+	tag?: string;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */

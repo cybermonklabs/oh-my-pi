@@ -10,7 +10,12 @@ import * as natives from "@oh-my-pi/pi-natives";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { buildPathTree, type PathTreeInput, walkPathTree } from "@oh-my-pi/pi-utils";
 import { InternalUrlRouter } from "../../internal-urls/router";
-import { type InternalUrlFilesystem, type UrlFileStat, UrlFsError } from "../../internal-urls/url-filesystem";
+import {
+	type InternalUrlFilesystem,
+	isUrlPath,
+	type UrlFileStat,
+	UrlFsError,
+} from "../../internal-urls/url-filesystem";
 import { resolveSearchBase, resolveSearchResultPath } from "../path-utils";
 
 /** One eligible file under the search root. */
@@ -20,6 +25,15 @@ export interface FileEntry {
 	/** Root-relative display path with `/` separators; a file root's own {@link path}. */
 	rel: string;
 	size: number;
+	/**
+	 * The host directory the walk listed this file in, which follows no symlink:
+	 * the file is read below it at {@link rel}, so a directory on the way or the
+	 * file swapped for a symlink after the listing is refused. Unset for file
+	 * roots and URL roots, which are read through the filesystem.
+	 */
+	root?: string;
+	/** The listing showed a symlink at {@link rel}, which the read follows (`GlobMatch.symlink`). */
+	symlink?: boolean;
 }
 
 /** Validated `find` scope: a directory to walk, or one file searched alone. */
@@ -247,9 +261,10 @@ export interface ListFilesOptions {
 
 /**
  * Every eligible, non-gitignored regular file under `root`, in path order.
- * Skill mounts follow contained links; host walks do not descend links. A file
- * root is its only entry unless it is credential material, a binary, or empty;
- * being named explicitly admits it even when hidden.
+ * Skill mounts follow contained links; host walks do not descend links, and
+ * their entries carry the walked root so reads stay below it. A file root is
+ * its only entry unless it is credential material, a binary, or empty; being
+ * named explicitly admits it even when hidden.
  */
 export async function listFiles(root: SearchRoot, options: ListFilesOptions): Promise<FileEntry[]> {
 	if (root.type === "file") {
@@ -271,11 +286,17 @@ export async function listFiles(root: SearchRoot, options: ListFilesOptions): Pr
 		filesystem: options.filesystem,
 		signal: options.signal,
 	});
+	const host = !isUrlPath(root.path);
 	const entries: FileEntry[] = [];
 	for (const match of result.matches) {
 		const size = match.size ?? 0;
 		if (!eligibleFile(match.path, size, options.includeHidden)) continue;
-		entries.push({ path: resolveSearchResultPath(root.path, match.path), rel: match.path, size });
+		const entry: FileEntry = { path: resolveSearchResultPath(root.path, match.path), rel: match.path, size };
+		if (host) {
+			entry.root = root.path;
+			entry.symlink = match.symlink;
+		}
+		entries.push(entry);
 	}
 	entries.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
 	return entries;

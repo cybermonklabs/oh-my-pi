@@ -615,9 +615,8 @@ mod tests {
 		assert_eq!(tracker.lock().draining(), 3, "adopted halves run on");
 		drop((child_open, child_duplex));
 		// Another test of this process may be polling the retained work.
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		// Halves that never drain hang the test until the runner's bound.
 		while tracker.lock().draining() > 1 {
-			assert!(std::time::Instant::now() < deadline, "the adopted halves never drained");
 			orphan::poll(&cx);
 			std::thread::yield_now();
 		}

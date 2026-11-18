@@ -26,6 +26,7 @@ import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { SentToolDefinitions } from "./sent-tool-definitions";
 import type { AgentTelemetryConfig } from "./telemetry";
+import type { ToolExecution } from "./tool-context";
 
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
@@ -288,9 +289,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
 	 * Called at injection boundaries only (loop start and after a tool batch
-	 * fully settles), so dequeued messages are immediately injected. The
-	 * mid-batch interrupt poll uses {@link hasSteeringMessages} instead and
-	 * never consumes the queue.
+	 * fully settles). The mid-batch interrupt poll uses
+	 * {@link hasSteeringMessages} instead and never consumes the queue.
+	 *
+	 * Taking a message from the queue does not record it. A turn records it
+	 * when it emits the message's events, and between the two the boundary can
+	 * still park on the pause gate or the run can abort. Nothing answers input
+	 * once the run has aborted, so an aborted run records none of what it took:
+	 * the host owns each message until a turn records it, and puts back
+	 * whatever the run did not record.
 	 */
 	getSteeringMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 
@@ -379,8 +386,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages.
-	 * If messages are returned, they're added to the context and the agent
-	 * continues with another turn.
+	 * If messages are returned, the agent continues with another turn, which
+	 * records them. As with {@link getSteeringMessages}, taking them does not
+	 * record them: a run that aborts first records none of them, and the host
+	 * puts back whatever the run did not record.
 	 */
 	getFollowUpMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 	/**
@@ -679,6 +688,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * capture, cost estimator, agent identity).
 	 */
 	telemetry?: AgentTelemetryConfig;
+	/**
+	 * Whose executions this loop's tool calls are. Work a tool starts is bound to the call and to
+	 * this owner for the length of that one execution ({@link runInToolCall}), so a host can tell
+	 * which of several agents sharing a process is executing a call id — two of them can hold the
+	 * same id at once. Without an owner nothing is bound and no work is attributed.
+	 */
+	owner?: object;
 }
 
 /**
@@ -689,6 +705,12 @@ export interface ToolCallContext {
 	index: number;
 	total: number;
 	toolCalls: Array<{ id: string; name: string }>;
+	/**
+	 * The run this call is about to make, when the executor prepared one. A context built for a
+	 * call keeps this rather than the call's id: the id is reused by a later run of the same call,
+	 * and a context kept past its own run must not speak for that one.
+	 */
+	execution?: ToolExecution;
 	/** Provider-native metadata for the current call, when present. */
 	providerMetadata?: ToolCallProviderMetadata;
 	/**
@@ -1202,8 +1224,6 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM, and unknown root keys a closed schema would drop stay on the args. Malformed argument JSON still returns the parse error. */
-	lenientArgValidation?: boolean;
 	/**
 	 * Whether the agent loop may abort this tool mid-execution — or skip it
 	 * before it starts — to deliver a queued steering message. A function

@@ -17,6 +17,9 @@ try {
 	await $\`git init --initial-branch=main\`.cwd(dir).quiet();
 	await $\`git config user.email tester@example.com\`.cwd(dir).quiet();
 	await $\`git config user.name Tester\`.cwd(dir).quiet();
+	// A developer's global commit.gpgsign would sign these commits with the fixture identity,
+	// which has no key: both the CLI commit and pi-vcs's commitCreate would fail on the signer.
+	await $\`git config commit.gpgsign false\`.cwd(dir).quiet();
 	await fs.writeFile(path.join(dir, "tracked.txt"), "base\\n");
 	await $\`git add tracked.txt\`.cwd(dir).quiet();
 	await $\`git commit -m baseline\`.cwd(dir).quiet();
@@ -80,7 +83,7 @@ try {
 	await fs.rm(dir, { recursive: true, force: true });
 }
 `;
-		const result = await $`bun --eval ${script}`.cwd(packageRoot).quiet().nothrow();
+		const result = await $`${process.execPath} --eval ${script}`.cwd(packageRoot).quiet().nothrow();
 		// `.quiet()` captures the child's output; surface it when the child fails so a
 		// red run names the actual VcsError instead of only "Expected: 0 / Received: 1".
 		if (result.exitCode !== 0) {

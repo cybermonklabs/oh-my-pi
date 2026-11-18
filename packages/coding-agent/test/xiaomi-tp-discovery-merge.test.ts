@@ -80,7 +80,7 @@ describe("mergeDiscoveredModel", () => {
 
 	test("preserves provider override transport on rediscovery (#2555 openrouter gateway regression)", async () => {
 		// Bundled openrouter entry carries transport=pi-native after
-		// applying providerOverride at boot (#loadBuiltInModels). Discovery
+		// applying providerOverride at boot (#builtInModelSteps). Discovery
 		// refetched the same model from /v1/models — provider catalogs
 		// never set transport in defaults, so the discovered model has no
 		// transport hint of its own.

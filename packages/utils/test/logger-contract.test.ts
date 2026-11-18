@@ -57,6 +57,9 @@ async function runScenario(
 				// this the default-file scenario logs into the real profile.
 				USERPROFILE: primaryDir,
 				PI_CONFIG_DIR: ".omp",
+				// The config root is this home's `.omp`, not the test process's own.
+				OMP_CONFIG_ROOT: undefined,
+				OMP_DOWNLOAD_ROOT: undefined,
 				OMP_PROFILE: "",
 				PI_PROFILE: "",
 				XDG_DATA_HOME: "",

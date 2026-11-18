@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `MnemopiOptions.beforeDispatch`, awaited before every remote completion and embedding attempt and handed to a custom completion function, and `RecallOptions.signal`, which cancels a recall's query embedding ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+
+### Changed
+
+- When `OMP_CONFIG_ROOT` is set, mnemopi keeps its data, blobs, plugins and cost log under `<OMP_CONFIG_ROOT>/mnemopi` and never copies in the legacy `~/.hermes` triples database; downloaded models stay in the home directory
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed

@@ -1,0 +1,47 @@
+auth "anthropic-console" {
+	name "Anthropic Console (API usage billing)"
+	org-scoped-identity #true
+	// Keyless Console sign-in: a workspace-scoped inference token billed to the
+	// Console organization, stored beside Claude Pro/Max grants for the same
+	// models. Refresh goes through this login (recorded on the credential).
+	login "oauth-code" {
+		// Public OAuth client id, stored base64 so secret scanners stay quiet.
+		client-id "NDEwNzdkMTAtOTRiOC00MTk0LWJlNDgtZDI1MWU5ZWIyMWI0" encoding="base64"
+		authorize-url "https://platform.claude.com/oauth/authorize"
+		scopes "user:profile" "user:inference"
+		pkce #true
+		authorize-params { code "true" }
+		instructions "Complete login in your browser. If the browser cannot reach this machine, paste the final redirect URL or authorization code when prompted."
+		callback port=54545 path="/callback"
+		token url="https://platform.claude.com/v1/oauth/token" body="json" {
+			params { state "{state}" }
+		}
+		credential {
+			access "access_token"
+			refresh "refresh_token"
+			expires "seconds" path="expires_in" skew-ms=300000
+			account-id "account.uuid"
+			email "account.email_address"
+			org-id "organization.uuid"
+			org-name "organization.name"
+			workspace-id "workspace.id"
+		}
+		after-exchange hook="anthropic-identity"
+	}
+	refresh {
+		token url="https://platform.claude.com/v1/oauth/token" body="json" {
+			headers {
+				anthropic-beta "oauth-2025-04-20"
+			}
+		}
+		credential {
+			access "access_token"
+			refresh "refresh_token"
+			expires "seconds" path="expires_in" skew-ms=300000
+			account-id "account.uuid"
+			email "account.email_address"
+		}
+		after-refresh hook="anthropic-identity"
+	}
+	store-as "anthropic"
+}

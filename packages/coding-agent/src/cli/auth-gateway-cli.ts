@@ -15,7 +15,9 @@
  *   - `status` — prints the locally-stored gateway token and bind hint.
  */
 import * as fs from "node:fs/promises";
+import { errorDisplayText } from "@oh-my-pi/pi-ai/error";
 import * as path from "node:path";
+import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import {
 	type Api,
 	AuthStorage,
@@ -782,13 +784,17 @@ async function probeOneModel(
 			oauthIdentity,
 			maxTokens: 32,
 			signal: attemptSignal,
+			// Only `omp auth-gateway check --strict` sends this, and that process
+			// never engages `/pause`, so the hold is always open. It is here so no
+			// completion omp issues outside an agent loop goes out unheld.
+			beforeDispatch: agentPauseGate.dispatchHold(attemptSignal),
 		},
 	);
 	const latencyMs = Date.now() - start;
 	if (response.stopReason === "error" || response.stopReason === "aborted") {
 		return {
 			ok: false,
-			reason: response.errorMessage ?? `chat probe ended with stopReason=${response.stopReason}`,
+			reason: errorDisplayText(response) ?? `chat probe ended with stopReason=${response.stopReason}`,
 			modelId: model.id,
 			latencyMs,
 		};

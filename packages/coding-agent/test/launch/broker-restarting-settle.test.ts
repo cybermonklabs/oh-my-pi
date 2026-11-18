@@ -22,18 +22,92 @@ function restoreEnv(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
-function startBroker(projectDir: string, runtimeDir: string, options: DaemonBrokerStartOptions = {}): Promise<void> {
+interface EmbeddedBroker {
+	/** Settles once this in-process broker has shut down. */
+	finished: Promise<void>;
+}
+
+/**
+ * Starts the in-process broker and waits until it accepts connections. A client that connects
+ * earlier finds no endpoint and starts a broker process of its own (`client.ts`, `#spawnBroker`),
+ * which can take the scope: the test then talks to a broker without this test's options and spies,
+ * and which outlives the test. When another process holds the scope this fails, and `refused`
+ * leaves neither that broker nor `client` behind.
+ */
+async function startBroker(
+	client: DaemonBrokerClient,
+	projectDir: string,
+	runtimeDir: string,
+	options: DaemonBrokerStartOptions = {},
+): Promise<EmbeddedBroker> {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
 	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
-	const broker = startDaemonBrokerFromEnvironment(options);
+	const listening = Promise.withResolvers<boolean>();
+	const finished = startDaemonBrokerFromEnvironment({ ...options, onListening: () => listening.resolve(true) });
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
-	return broker;
+	if (await Promise.race([listening.promise, finished.then(() => false)])) return { finished };
+	throw await refused(client, runtimeDir);
+}
+
+/**
+ * The failure of an in-process broker that did not claim its scope. It first asks the broker
+ * holding the scope to shut down through `client` (with no broker in the lease, a request would
+ * start one), closes `client`, and waits up to 5 s for the lease to be free and that broker's
+ * process to end (it frees the lease before it exits), so the failing test leaves neither behind.
+ */
+async function refused(client: DaemonBrokerClient, runtimeDir: string): Promise<Error> {
+	const holder = await leaseHolder(runtimeDir);
+	const another = holder !== undefined && holder !== process.pid ? holder : undefined;
+	// Pinned before the request, so its status is that process's and never a later one's.
+	const other = another === undefined ? null : Process.fromPid(another);
+	if (another !== undefined) await client.request({ op: "shutdown" }).catch(() => undefined);
+	client.close();
+	const deadline = performance.now() + 5_000;
+	let left = await leaseHolder(runtimeDir);
+	while ((left !== undefined || other?.status() === "running") && performance.now() < deadline) {
+		await Bun.sleep(20);
+		left = await leaseHolder(runtimeDir);
+	}
+	const state =
+		left !== undefined
+			? `and process ${left} still holds it`
+			: other?.status() === "running"
+				? "and still runs"
+				: "and has shut down";
+	return new Error(`In-process daemon broker did not claim its scope: process ${holder ?? "none"} held it, ${state}`);
+}
+
+/** The pid in the scope's broker lease (`broker.pid`), or `undefined` when no broker holds it. */
+async function leaseHolder(runtimeDir: string): Promise<number | undefined> {
+	try {
+		return JSON.parse(await fs.readFile(path.join(runtimeDir, "broker.pid"), "utf8")).pid;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+/** Fails, naming the holder, unless this process's broker holds the scope. */
+async function expectOwnBroker(runtimeDir: string): Promise<void> {
+	const holder = await leaseHolder(runtimeDir);
+	if (holder !== process.pid) {
+		throw new Error(
+			`the scope's broker is ${holder === undefined ? "no process" : `process ${holder}`}, not this test's ` +
+				`(${process.pid}): it runs without this test's options and spies`,
+		);
+	}
+}
+
+/** Fails unless no broker holds the scope once this process's broker has shut down. */
+async function expectNoBrokerLeft(runtimeDir: string): Promise<void> {
+	const holder = await leaseHolder(runtimeDir);
+	if (holder !== undefined) throw new Error(`broker process ${holder} holds the scope after the test's broker ended`);
 }
 
 async function snapshotOf(client: DaemonBrokerClient, name: string): Promise<DaemonSnapshot> {
@@ -46,6 +120,7 @@ async function snapshotOf(client: DaemonBrokerClient, name: string): Promise<Dae
 
 async function waitForState(
 	client: DaemonBrokerClient,
+	runtimeDir: string,
 	name: string,
 	state: DaemonSnapshot["state"],
 	deadlineMs: number,
@@ -54,6 +129,7 @@ async function waitForState(
 	while (Date.now() < deadline) {
 		const daemon = await snapshotOf(client, name);
 		if (daemon.state === state) return daemon;
+		await expectOwnBroker(runtimeDir);
 		await Bun.sleep(25);
 	}
 	throw new Error(`daemon ${name} never reached state ${state}`);
@@ -69,7 +145,7 @@ describe("daemon broker restart settling", () => {
 		const previousTitle = process.title;
 		// Create the client (writes broker.token) before starting the broker, which reads that token.
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir, {
+		const broker = await startBroker(client, projectDir, runtimeDir, {
 			restartBackoffBaseMs: RESTART_BACKOFF_BASE_MS,
 		});
 		const name = "crash-loop";
@@ -92,7 +168,7 @@ describe("daemon broker restart settling", () => {
 			expect(started.op).toBe("start");
 
 			// Enter the restarting backoff window and record the restart count.
-			const restarting = await waitForState(client, name, "restarting", 5_000);
+			const restarting = await waitForState(client, runtimeDir, name, "restarting", 5_000);
 			const baseline = restarting.restartCount;
 
 			// Poll while restarting. Each op runs #refreshDetached; a re-entrant #settle would
@@ -118,9 +194,10 @@ describe("daemon broker restart settling", () => {
 			await client.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
-			await broker;
+			await broker.finished;
 			process.title = previousTitle;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	}, 20_000);
 
 	it("does not answer exit waits until stopping a restarting daemon is published", async () => {
@@ -130,10 +207,9 @@ describe("daemon broker restart settling", () => {
 		await fs.mkdir(projectDir);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		const previousTitle = process.title;
-		const broker = startBroker(projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
+		const broker = await startBroker(client, projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
 		const name = "stopped-during-backoff";
 		const metadataPath = path.join(runtimeDir, "daemons", name, "meta.json");
-		const writingExit = Promise.withResolvers<void>();
 		const releaseWrite = Promise.withResolvers<void>();
 		const rename = fs.rename;
 		let blocked = false;
@@ -153,18 +229,22 @@ describe("daemon broker restart settling", () => {
 					detached: true,
 				},
 			});
-			await waitForState(client, name, "restarting", 5_000);
+			await waitForState(client, runtimeDir, name, "restarting", 5_000);
 			const renameSpy = spyOn(fs, "rename").mockImplementation(async (from, to) => {
 				if (to === metadataPath && !blocked && (await fs.readFile(from, "utf8")).includes('"state":"exited"')) {
 					blocked = true;
-					writingExit.resolve();
 					await releaseWrite.promise;
 				}
 				return rename(from, to);
 			});
 			restoreRename = () => renameSpy.mockRestore();
 			const stopping = client.request({ op: "stop", name, timeoutMs: 2_000 });
-			await writingExit.promise;
+			// The spy sees only this process's broker: the wait fails at once, naming the
+			// holder, when another broker holds the scope.
+			while (!blocked) {
+				await expectOwnBroker(runtimeDir);
+				await Bun.sleep(25);
+			}
 			const waiting = client.request({ op: "wait", name, for: "exit", timeoutMs: 5_000 });
 			// Real socket polling must get a full interval while the metadata rename stays blocked.
 			expect(await Promise.race([waiting.then(() => "returned"), Bun.sleep(150).then(() => "pending")])).toBe(
@@ -182,9 +262,10 @@ describe("daemon broker restart settling", () => {
 			restoreRename?.();
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
-			await broker;
+			await broker.finished;
 			process.title = previousTitle;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	}, 20_000);
 
 	it("settles a recovered detached daemon once across concurrent refreshes", async () => {
@@ -198,7 +279,7 @@ describe("daemon broker restart settling", () => {
 		let pid: number | undefined;
 
 		const firstClient = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const firstBroker = startBroker(projectDir, runtimeDir);
+		const firstBroker = await startBroker(firstClient, projectDir, runtimeDir);
 		try {
 			const started = await firstClient.request({
 				op: "start",
@@ -220,11 +301,12 @@ describe("daemon broker restart settling", () => {
 		} finally {
 			await firstClient.request({ op: "shutdown" }).catch(() => undefined);
 			firstClient.close();
-			await firstBroker;
+			await firstBroker.finished;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 
 		const secondClient = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const secondBroker = startBroker(projectDir, runtimeDir);
+		const secondBroker = await startBroker(secondClient, projectDir, runtimeDir);
 		try {
 			const recovered = await snapshotOf(secondClient, name);
 			expect(recovered.state).toBe("running");
@@ -250,12 +332,13 @@ describe("daemon broker restart settling", () => {
 			await secondClient.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
 			await secondClient.request({ op: "shutdown" }).catch(() => undefined);
 			secondClient.close();
-			await secondBroker;
+			await secondBroker.finished;
 			const processRef = pid === undefined ? null : Process.fromPid(pid);
 			if (processRef?.status() === "running") {
 				await processRef.terminate({ group: true, gracefulMs: 0, timeoutMs: 2_000 });
 			}
 			process.title = previousTitle;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	}, 20_000);
 });

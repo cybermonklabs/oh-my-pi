@@ -24,10 +24,12 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 	SendMessageHandler,
+	SendUserInputHandler,
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { sendSessionUserInput } from "../../extensibility/extensions/send-user-input-handler";
 import { cfgExtensionAssistantTextRenderers } from "../../extensibility/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { ApprovalDialogComponent } from "@oh-my-pi/pi-tui/overlays/approval-dialog";
@@ -63,12 +65,15 @@ import { extensionLinkClicksAvailable } from "@oh-my-pi/pi-tui/render/extension-
 import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui/overlays/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
+import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { tuiSlashCommandHost } from "../../slash-commands/builtin-registry";
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
 import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
+import { createExtensionAgentActions } from "../runtime-init";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -260,12 +265,23 @@ export class ExtensionUiController {
 			return; // No hooks loaded
 		}
 
+		// session_start and resources_discover handlers share this action context, so
+		// a handler calling sendMessage/sendUserMessage starts an async session send
+		// the action itself never exposes a promise for. Every such send dispatches
+		// through the runner, which holds it until startup discovery below has
+		// rebuilt the prompt (PR #9379 review); `InteractiveMode.init()` extends that
+		// hold until the TUI observes the session and accepts input.
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
+			sendUserInput: this.#sendExtensionUserInput,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
 			},
+			...createExtensionAgentActions({
+				scopeAgentId: this.ctx.session.getAgentId() ?? MAIN_AGENT_ID,
+				getScopeSessionFile: () => this.ctx.sessionManager?.getSessionFile?.() ?? null,
+			}),
 			setLabel: (targetId, label) => {
 				this.ctx.sessionManager.appendLabelChange(targetId, label);
 			},
@@ -404,10 +420,28 @@ export class ExtensionUiController {
 			this.showExtensionError(error.extensionPath, error.error);
 		});
 
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
+		// A `session_start` or `resources_discover` handler can call
+		// sendMessage/sendUserMessage synchronously; a triggered turn would read
+		// the system prompt before `discoverStartupSkillPaths()` has folded any
+		// extension-contributed skill directories into it. Hold those sends until
+		// discovery has rebuilt the prompt.
+		const startupRound = async (): Promise<void> => {
+			await extensionRunner.emit({
+				type: "session_start",
+			});
+			// resources_discover fires after `session_start` (extensibility/extensions/types.ts) —
+			// only now are runtime actions and the error listener above wired, so
+			// extension-contributed skill directories are folded into the session's
+			// skill snapshot before the first prompt.
+			await this.ctx.session.discoverStartupSkillPaths();
+		};
+		// A runner that queues no sends (a stand-in without `sends`) runs the
+		// round unheld — same guard as `InteractiveMode.init()`.
+		const sends = this.ctx.session.extensionRunner?.sends;
+		if (sends) await sends.withHeld(startupRound);
+		else await startupRound();
+		// A turn those sends start is not awaited here: it runs like any other turn,
+		// rendered live and interruptible.
 	}
 
 	/**
@@ -460,29 +494,20 @@ export class ExtensionUiController {
 	}
 
 	#rebuildHookWidgets(): void {
-		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerAbove, this.#hookWidgetsAbove, true, true);
-		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerBelow, this.#hookWidgetsBelow, false, false);
+		// The margin above the editor is the top gap, or a plain spacer over hook
+		// widgets; either way it stays in the one billed root, so installing a
+		// widget never moves that row out of the retirement baseline.
+		this.ctx.editorTopGapContainer.clear();
+		this.ctx.editorTopGapContainer.addChild(
+			this.#hookWidgetsAbove.size === 0 ? new EditorTopGap(() => this.ctx.statusRowOccupied) : new Spacer(1),
+		);
+		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerAbove, this.#hookWidgetsAbove);
+		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerBelow, this.#hookWidgetsBelow);
 		this.ctx.ui.requestRender();
 	}
 
-	#renderHookWidgetContainer(
-		container: Container,
-		widgets: Map<string, ExtensionUiComponent>,
-		spacerWhenEmpty: boolean,
-		leadingSpacer: boolean,
-	): void {
+	#renderHookWidgetContainer(container: Container, widgets: Map<string, ExtensionUiComponent>): void {
 		container.clear();
-
-		if (widgets.size === 0) {
-			if (spacerWhenEmpty) {
-				container.addChild(new EditorTopGap(() => this.ctx.statusRowOccupied));
-			}
-			return;
-		}
-
-		if (leadingSpacer) {
-			container.addChild(new Spacer(1));
-		}
 		for (const widget of widgets.values()) {
 			container.addChild(widget);
 		}
@@ -494,12 +519,19 @@ export class ExtensionUiController {
 			return;
 		}
 
+		// Same runner-routed dispatch as initHooksAndCustomTools: a reload
+		// discovery round (`refreshSkills`) holds these sends until it is applied.
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
+			sendUserInput: this.#sendExtensionUserInput,
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
 			},
+			...createExtensionAgentActions({
+				scopeAgentId: this.ctx.session.getAgentId() ?? MAIN_AGENT_ID,
+				getScopeSessionFile: () => this.ctx.sessionManager?.getSessionFile?.() ?? null,
+			}),
 			setLabel: (targetId, label) => {
 				this.ctx.sessionManager.appendLabelChange(targetId, label);
 			},
@@ -1707,18 +1739,31 @@ export class ExtensionUiController {
 		return true;
 	}
 
-	#sendExtensionMessage: SendMessageHandler = (message, options) => {
-		const startsTurn =
+	#extensionMessageStartsTurn(options: Parameters<SendMessageHandler>[1]): boolean {
+		return (
 			options?.triggerTurn === true ||
 			options?.deliverAs === "steer" ||
 			options?.deliverAs === "followUp" ||
-			options?.deliverAs === "aside";
-		if (startsTurn && this.#rejectGuestExtensionTurn()) return;
+			options?.deliverAs === "aside"
+		);
+	}
+
+	/**
+	 * Extension-originated sends go through {@link ExtensionSendQueue.dispatch} so a
+	 * startup or `/reload-plugins` discovery round can hold them until it has rebuilt
+	 * the system prompt (PR #9379). Without a runner there is nothing holding them.
+	 */
+	#dispatchExtensionSend<T>(send: () => Promise<T>): Promise<T> {
+		const sends = this.ctx.session.extensionRunner?.sends;
+		return sends ? sends.dispatch(send) : send();
+	}
+
+	#sendExtensionMessage: SendMessageHandler = (message, options) => {
+		if (this.#extensionMessageStartsTurn(options) && this.#rejectGuestExtensionTurn()) return;
 		const wasStreaming = this.ctx.session.isStreaming;
 		const messageCountBefore = this.ctx.session.messages.length;
 		const normalized = normalizeCustomMessagePayload(message);
-		this.ctx.session
-			.sendCustomMessage(normalized, options)
+		this.#dispatchExtensionSend(() => this.ctx.session.sendCustomMessage(normalized, options))
 			.then(() => {
 				// `deliverAs: "nextTurn"` without a trigger is the one idle arm that appends
 				// to the session silently (no message_start/message_end), so nothing else
@@ -1738,11 +1783,20 @@ export class ExtensionUiController {
 			denied.catch(() => {});
 			return denied;
 		}
-		const task = this.ctx.session.sendUserMessage(content, options);
+		const task = this.#dispatchExtensionSend(() => this.ctx.session.sendUserMessage(content, options));
 		task.catch((err: unknown) => {
 			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 		});
 		return task;
+	};
+
+	/**
+	 * A collab guest's typed prompts go to the host and its other commands, apart from a few read-only local ones
+	 * (`COLLAB_GUEST_ALLOWED_COMMANDS`), are host-only, so a guest runs none of an extension's input on the replica.
+	 */
+	#sendExtensionUserInput: SendUserInputHandler = async (text, options) => {
+		if (this.#rejectGuestExtensionTurn()) return { handled: "unavailable" };
+		return sendSessionUserInput(this.ctx.session, text, options, tuiSlashCommandHost(this.ctx));
 	};
 
 	/**

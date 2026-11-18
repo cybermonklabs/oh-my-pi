@@ -5,8 +5,10 @@ import { buildAriaSnapshotScript, createBrowserPrelude } from "@oh-my-pi/pi-codi
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { chromiumAvailable } from "./chromium-probe";
+import { holdHeadlessBrowserForFile } from "./held-browser";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
+holdHeadlessBrowserForFile(CHROMIUM_AVAILABLE);
 
 function createHost() {
 	const session: ToolSession = {

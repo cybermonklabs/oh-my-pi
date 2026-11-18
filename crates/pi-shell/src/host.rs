@@ -38,7 +38,8 @@ use crate::{
 mod urls;
 
 /// Time between TERM and KILL when a running external is abandoned (a cancel
-/// unwinds the command that waits for it): pi's `TERM_GRACE`.
+/// unwinds the command that waits for it): pi's `TERM_GRACE`, the default of
+/// [`SessionConfig::term_grace`](crate::session::SessionConfig::term_grace).
 pub const TERM_GRACE: Duration = Duration::from_secs(1);
 
 /// Told about every external a [`PiHost`] spawns, from the engine thread.
@@ -431,18 +432,18 @@ impl PiHost {
 	/// A host over `fs` whose timers run on `runtime`.
 	///
 	/// Externals lead their own sessions; one abandoned while running (a
-	/// cancel) gets TERM, then KILL after [`TERM_GRACE`].
-	pub fn new(fs: Box<dyn Fs + Send>, runtime: tokio::runtime::Handle) -> Self {
+	/// cancel) gets TERM, then KILL after `grace` ([`TERM_GRACE`] for pi).
+	pub fn new(fs: Box<dyn Fs + Send>, runtime: tokio::runtime::Handle, grace: Duration) -> Self {
 		Self {
 			fs,
 			launcher: Launcher {
 				spawner:  NativeSpawner::new(SpawnConfig {
-					grace:    TERM_GRACE,
+					grace,
 					sessions: Sessions::Detach,
 					// The session driver is an async task: exits wake its waker
 					// from waiter threads.
-					exits:    Exits::Thread,
-					umask:    None,
+					exits: Exits::Thread,
+					umask: None,
 				}),
 				streams:  StdStreams::default(),
 				observer: None,
@@ -798,9 +799,21 @@ impl crate::bash::Host for PiHost {
 /// session (the terminal, the harness). The tree is resolved at each call, not
 /// cached: a recycled pid of an ancestor that exited is not protected.
 ///
+/// The walk up fails closed: an ancestor that cannot be read for a reason
+/// that proves nothing ([`crate::sys::proc::read`]: no descriptor left, an
+/// `ENOENT` while it still exists, say) refuses every signal the ancestors
+/// read so far do not already refuse, since the target may be one above
+/// it. One that exited, or another user's, ends the walk: no signal of ours
+/// reaches it. Without `/proc` (this process's own entry is `ENOENT`: none
+/// is mounted, or a sandbox hides it) there is no chain to walk: only this
+/// process and its group are refused, as in a shell without the guard; the
+/// guard needs a mounted `/proc`.
+///
 /// # Errors
 ///
-/// `PermissionDenied` for a protected target.
+/// `PermissionDenied` for a protected target, or for any target while an
+/// ancestor cannot be read (`cannot read process N to check it is not the
+/// shell's ancestor: strerror`).
 pub fn check_signal_target(pid: i32) -> io::Result<()> {
 	let refused = || {
 		// pi's wording (`kill: (PID) - refusing to signal the shell process`).
@@ -809,50 +822,78 @@ pub fn check_signal_target(pid: i32) -> io::Result<()> {
 	if pid == 0 || pid == -1 {
 		return refused();
 	}
-	let protected = protected_processes();
+	let (protected, unread) = protected_processes();
 	let hit = if pid > 0 {
 		protected.iter().any(|&(p, _)| p == pid)
 	} else {
 		protected.iter().any(|&(_, g)| g == -pid)
 	};
-	if hit { refused() } else { Ok(()) }
+	if hit {
+		return refused();
+	}
+	unread.map_or(Ok(()), Err)
 }
 
-/// This process and its ancestors with their process groups, nearest first.
+/// This process and its ancestors with their process groups, nearest first,
+/// and the error of an ancestor the walk could not read for a reason that
+/// proves nothing ([`crate::sys::proc::read`]), above which it could not go.
 /// A recorded parent is followed only while it started no later than its
-/// child: a younger process holding the number is a recycled pid.
+/// child: a younger process holding the number is a recycled pid. When this
+/// process's own entry cannot be read, its parent is the kernel's
+/// (`getppid`, which names the live parent, never a recycled pid).
 #[cfg(unix)]
-fn protected_processes() -> Vec<(i32, i32)> {
+fn protected_processes() -> (Vec<(i32, i32)>, Option<io::Error>) {
+	use crate::sys::proc;
 	let Ok(me) = i32::try_from(std::process::id()) else {
-		return Vec::new();
+		return (Vec::new(), None);
 	};
 	// SAFETY: getpgrp has no preconditions.
 	let own_group = unsafe { libc::getpgrp() };
 	let mut chain = vec![(me, own_group)];
-	let Some(mut cur) = crate::sys::proc::info(me) else {
-		return chain;
+	// The process walked from, its parent, and its start (none for this
+	// process read by `getppid`: its parent is no recycled pid).
+	let (mut pid, mut ppid, mut start) = match proc::read(me) {
+		Ok(Some(own)) => (me, own.ppid, Some(own.start)),
+		// No `/proc`: nothing above this process can be read.
+		Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return (chain, None),
+		// SAFETY: getppid has no preconditions.
+		Ok(None) | Err(_) => (me, unsafe { libc::getppid() }, None),
 	};
 	// A process tree is shallow; the bound only guards a malformed table.
 	for _ in 0..64 {
-		if cur.ppid <= 0 || cur.ppid == cur.pid {
+		if ppid <= 0 || ppid == pid {
 			break;
 		}
-		let Some(parent) = crate::sys::proc::info(cur.ppid) else {
-			break;
+		let parent = match proc::read(ppid) {
+			Ok(Some(parent)) => parent,
+			// Exited, or another user's: no signal of ours reaches it.
+			Ok(None) => break,
+			Err(error) => {
+				if start.is_none() {
+					// The kernel's parent is ours, read or not.
+					// SAFETY: getpgid has no preconditions.
+					chain.push((ppid, unsafe { libc::getpgid(ppid) }));
+				}
+				let why = crate::bash::diag::strerror(&error);
+				let message =
+					format!("cannot read process {ppid} to check it is not the shell's ancestor: {why}");
+				return (chain, Some(io::Error::new(io::ErrorKind::PermissionDenied, message)));
+			},
 		};
-		if parent.start > cur.start {
+		if start.is_some_and(|start| parent.start > start) {
 			break;
 		}
 		chain.push((parent.pid, parent.pgid));
-		cur = parent;
+		(pid, ppid, start) = (parent.pid, parent.ppid, Some(parent.start));
 	}
-	chain
+	(chain, None)
 }
 
 /// Only this process off Unix.
 #[cfg(not(unix))]
-fn protected_processes() -> Vec<(i32, i32)> {
-	i32::try_from(std::process::id()).map_or_else(|_| Vec::new(), |me| vec![(me, me)])
+fn protected_processes() -> (Vec<(i32, i32)>, Option<io::Error>) {
+	let chain = i32::try_from(std::process::id()).map_or_else(|_| Vec::new(), |me| vec![(me, me)]);
+	(chain, None)
 }
 
 /// An external reported to a [`SpawnObserver`].

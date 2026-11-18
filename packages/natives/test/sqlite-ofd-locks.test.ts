@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { grep, HeldFileKind, heldFileKind, Shell } from "../native/index.js";
 import { installSqliteLockShim } from "../native/sqlite-locks.js";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 // Issue #15586: closing any descriptor of a live database or its `-shm` released the
 // connection's POSIX locks, and Bun's own file APIs close with raw syscalls nothing can
@@ -19,14 +20,24 @@ test.skipIf(process.platform !== "linux")(
 		try {
 			db.run("PRAGMA journal_mode=WAL");
 			db.run("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
+			// The types of the locks held through this process's own descriptors of the database and
+			// its `-shm`. Each fd's fdinfo lists them in one read. /proc/locks does not: the kernel
+			// builds it a page per read and walks its global lock list again for each page, so while
+			// other processes take and drop locks (a parallel test run) it skips or repeats entries.
 			const locksOn = () => {
-				const inodes = [dbPath, `${dbPath}-shm`].map(file => `:${fs.statSync(file).ino}`);
+				const files = new Set([dbPath, `${dbPath}-shm`].map(file => fs.realpathSync(file)));
 				return fs
-					.readFileSync("/proc/locks", "utf8")
-					.split("\n")
-					.map(line => line.replace("->", "").trim().split(/\s+/))
-					.filter(fields => inodes.some(ino => fields[5]?.endsWith(ino)))
-					.map(fields => fields[1]);
+					.readdirSync("/proc/self/fd")
+					.filter(fd => {
+						try {
+							return files.has(fs.readlinkSync(`/proc/self/fd/${fd}`));
+						} catch {
+							return false;
+						}
+					})
+					.flatMap(fd => fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8").split("\n"))
+					.filter(line => line.startsWith("lock:"))
+					.map(line => line.slice("lock:".length).trim().split(/\s+/)[1]);
 			};
 			expect(locksOn()).toEqual(["OFDLCK", "OFDLCK"]);
 
@@ -36,7 +47,7 @@ test.skipIf(process.platform !== "linux")(
 			fs.copyFileSync(`${dbPath}-shm`, path.join(dir, "copy"));
 			// The addon's own opens and closes: native grep and the bash tool's builtins.
 			await grep({ pattern: "x", path: dir, hidden: true, gitignore: false });
-			await new Shell({ sessionEnv: { HOME: os.homedir(), PATH: "/usr/bin:/bin" } }).run(
+			await new Shell({ sessionEnv: createProductionChildEnv({ PATH: "/usr/bin:/bin" }) }).run(
 				{ command: `cat agent.db-shm > /dev/null; cp agent.db ${dir}/copy2; grep -rl x . > /dev/null`, cwd: dir },
 				() => {},
 			);
