@@ -126,6 +126,13 @@ pub(crate) fn open_dir(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
 	sys::openat(libc::AT_FDCWD, path, DIR_FLAGS)
 }
 
+/// Opens the directory at `path` without following a symlink that is its
+/// final component ([`sys::openat_dir`]).
+pub(crate) fn open_dir_unlinked(s: &mut Scratch, path: &Path) -> io::Result<Handle> {
+	let path = s.cstr(path.as_os_str().as_bytes())?;
+	sys::openat_dir(libc::AT_FDCWD, path, DIR_FLAGS | libc::O_NOFOLLOW)
+}
+
 /// Opens the subdirectory `name` of `parent` following no symlink there
 /// ([`sys::openat_dir`]).
 pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::Result<Handle> {

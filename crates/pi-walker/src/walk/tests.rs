@@ -1143,6 +1143,44 @@ async fn tree_follow_roots_traverses_a_root_link_only() {
 	]);
 }
 
+/// Under [`Follow::Never`] the traversal checks its root with `lstat`, so a
+/// root swapped for a symlink to a directory outside it between that check
+/// and the root's open is refused, not walked: this is `find -P`'s root,
+/// below which `find -delete` removes. The control: the swap ran, at the
+/// root's open by path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tree_follow_never_refuses_a_root_swapped_for_a_symlink_after_its_check() {
+	let base = TempDir::new("tree-never-root-swap");
+	let name = format!("never-root-{}", std::process::id());
+	let (root, outside) = (base.path().join(&name), base.path().join("outside"));
+	std::fs::create_dir_all(&root).expect("root is created");
+	std::fs::write(root.join("inside.txt"), "").expect("inside is written");
+	std::fs::create_dir_all(&outside).expect("outside is created");
+	std::fs::write(outside.join("secret.txt"), "").expect("secret is written");
+	let never =
+		TreeOptions { follow: Follow::Never, emit_root: true, min_depth: 0, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), &root, &never).await.expect("tree");
+	let opened = Arc::new(parking_lot::Mutex::new(None));
+	let (link, target, parked, seen_open) =
+		(root.clone(), outside.clone(), base.path().join("parked"), Arc::clone(&opened));
+	crate::fs::seam::before_open(&name, move |open| {
+		std::fs::rename(&link, &parked).expect("root is parked");
+		std::os::unix::fs::symlink(&target, &link).expect("root becomes a link");
+		*seen_open.lock() = Some(open);
+	});
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => seen.push(String::from_utf8_lossy(entry.path).into_owned()),
+			Event::Error(error) => errors.push(error.error.raw_os_error()),
+		}
+	}
+	assert_eq!(*opened.lock(), Some(Open::Path), "the root was not opened by path after its check");
+	assert!(!seen.iter().any(|path| path.contains("secret")), "walked the swapped root: {seen:?}");
+	assert_eq!(errors, [Some(libc::ENOTDIR)], "the swapped root was not refused: {seen:?}");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tree_always_reports_symlink_cycles_to_ancestors() {

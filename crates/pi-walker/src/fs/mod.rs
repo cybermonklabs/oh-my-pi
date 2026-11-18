@@ -663,6 +663,22 @@ impl Session {
 		Ok(Dir { repr })
 	}
 
+	/// Opens the directory at an absolute path without following a symlink
+	/// that is its final component, as [`Self::open_child`] opens a listed
+	/// one: a symlink there is refused (`ENOTDIR` on Unix), even on a kernel
+	/// that follows it despite `O_NOFOLLOW`. Earlier components are followed.
+	pub async fn open_dir_unlinked(&mut self, path: &Path) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::fire(seam::last(path), seam::Open::Path);
+		let repr = match &mut self.imp {
+			Imp::Native(s) => DirRepr::Native(native::open_dir_unlinked(s, path)?),
+			Imp::Provider(fs) => {
+				DirRepr::Provider(provider::open_dir_unlinked(fs, path.to_path_buf()).await?)
+			},
+		};
+		Ok(Dir { repr })
+	}
+
 	/// Opens the subdirectory `name` of `parent` without following a symlink
 	/// that replaced it since `parent` was listed.
 	pub async fn open_child(&mut self, parent: &Dir, name: &[u8]) -> io::Result<Dir> {

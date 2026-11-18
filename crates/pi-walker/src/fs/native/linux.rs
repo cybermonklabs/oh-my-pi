@@ -195,19 +195,32 @@ pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Resul
 	})
 }
 
-/// Opens the directory `path` (one component) in `dir` with `flags`, which
-/// carry `O_DIRECTORY | O_NOFOLLOW`, so that no symlink there is opened. A
-/// kernel seen refusing such a symlink ([`directory_links_refused`]) is
-/// trusted with one `openat`. Elsewhere `O_DIRECTORY` is left out: gVisor
-/// before release-20261109.0, GKE Sandbox's among them, follows a final
-/// symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is set
-/// (google/gvisor#14786), and honours `O_NOFOLLOW` without it, as every file
-/// open of the walker already relies on. The open refuses a symlink (`ELOOP`,
-/// returned as Linux's `ENOTDIR` for a symlink there), and one `fstat` refuses
-/// anything else that is not a directory (`ENOTDIR`). `O_NONBLOCK` and
-/// `O_NOCTTY` keep a FIFO or terminal swapped in at the name from blocking
-/// the open or becoming the controlling terminal before `fstat` rejects it.
+/// Opens the directory `path` in `dir` with `flags`, which carry
+/// `O_DIRECTORY | O_NOFOLLOW`, so that no symlink is opened as its final
+/// component. `path` is one component, or a walk root by path, whose earlier
+/// components are followed as `lstat` follows them. A kernel seen refusing
+/// such a symlink ([`directory_links_refused`]) is trusted with one `openat`.
+/// Elsewhere `O_DIRECTORY` is left out: gVisor before release-20261109.0, GKE
+/// Sandbox's among them, follows a final symlink to a directory despite
+/// `O_NOFOLLOW` when `O_DIRECTORY` is set (google/gvisor#14786), and honours
+/// `O_NOFOLLOW` without it, as every file open of the walker already relies
+/// on. The open refuses a symlink (`ELOOP`, returned as Linux's `ENOTDIR` for
+/// a symlink there), and one `fstat` refuses anything else that is not a
+/// directory (`ENOTDIR`). `O_NONBLOCK` and `O_NOCTTY` keep a FIFO or terminal
+/// swapped in at the name from blocking the open or becoming the controlling
+/// terminal before `fstat` rejects it.
+///
+/// One difference from Linux stays, on such a kernel only: a non-directory
+/// that the open itself refuses keeps that open's error, where Linux's
+/// `O_DIRECTORY` open says `ENOTDIR` first. An unreadable regular file is
+/// `EACCES`, and a socket or a terminal with no controlling terminal is
+/// `ENXIO`. Each is still refused, and nothing is opened through a link, so
+/// the error is kept rather than looked up again with a second `fstatat`.
 pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	debug_assert!(
+		flags & libc::O_NOFOLLOW != 0 && flags & libc::O_DIRECTORY != 0,
+		"openat_dir refuses a symlink only with O_DIRECTORY | O_NOFOLLOW"
+	);
 	if directory_links_refused() {
 		return openat(dir, path, flags);
 	}
@@ -632,7 +645,7 @@ mod tests {
 		ffi::{CString, c_int},
 		fs, io,
 		os::{
-			fd::AsRawFd,
+			fd::{AsRawFd, FromRawFd, OwnedFd},
 			unix::{ffi::OsStrExt, fs::MetadataExt},
 		},
 		path::{Path, PathBuf},
@@ -643,7 +656,7 @@ mod tests {
 
 	use super::{
 		DIRECTORY_LINKS, FOLLOWED, NO_OPENAT2, NOATIME, OpenHow, REFUSED, RESOLVE, Scratch, UNPROBED,
-		open_beneath, openat, probe_directory_links,
+		open_beneath, openat, openat_dir, probe_directory_links,
 		seam::{Call, before_open, fail_opens, follow_directory_links},
 	};
 
@@ -906,6 +919,14 @@ mod tests {
 		let opened = super::super::unix::open_child(&mut s, &parent, b"a").expect("open_child of a");
 		assert_eq!(id_of(opened), id_at(&tree.0.join("a")));
 
+		// `open_dir_unlinked`, a walk root by path that `lstat` checked: a
+		// link as its final component is refused too.
+		let err = super::super::unix::open_dir_unlinked(&mut s, &tree.0.join("link")).unwrap_err();
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "a root that is a link: {err:?}");
+		let opened =
+			super::super::unix::open_dir_unlinked(&mut s, &tree.0.join("a")).expect("the root a");
+		assert_eq!(id_of(opened), id_at(&tree.0.join("a")));
+
 		// `a` swapped for a link to `outside`, which holds an `f` too.
 		let (a, parked) = (tree.0.join("a"), tree.0.join("a-parked"));
 		for (rel, flags) in [(&b"a"[..], DIR), (b"a/f", FLAGS)] {
@@ -932,6 +953,73 @@ mod tests {
 		let fd = open_beneath(&mut s, root.as_raw_fd(), b"a", DIR).expect("the renamed directory");
 		assert!(tree.0.join("a-old").exists(), "the rename did not run");
 		assert_eq!(id_of(fd), id_at(&a));
+		reset();
+	}
+
+	/// Opens a pty here, then in a forked child that starts a new session,
+	/// and so has no controlling terminal, runs `open` on the slave's path.
+	/// Returns whether `open` reported what it expected, and whether
+	/// `/dev/tty` opens afterwards, which it does only when the slave became
+	/// the child's controlling terminal.
+	fn controlling_terminal_after(open: fn(*const libc::c_char) -> bool) -> (bool, bool) {
+		// SAFETY: libc calls on descriptors and buffers this function owns;
+		// the child makes no allocation and ends with `_exit`.
+		unsafe {
+			let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+			assert!(master >= 0, "posix_openpt: {}", io::Error::last_os_error());
+			let master = OwnedFd::from_raw_fd(master);
+			assert_eq!(libc::grantpt(master.as_raw_fd()), 0, "grantpt");
+			assert_eq!(libc::unlockpt(master.as_raw_fd()), 0, "unlockpt");
+			let mut slave = [0 as libc::c_char; 128];
+			assert_eq!(
+				libc::ptsname_r(master.as_raw_fd(), slave.as_mut_ptr(), slave.len()),
+				0,
+				"ptsname_r"
+			);
+			let pid = libc::fork();
+			assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+			if pid == 0 {
+				if libc::setsid() < 0 {
+					libc::_exit(9);
+				}
+				let expected = open(slave.as_ptr());
+				let tty =
+					libc::open(c"/dev/tty".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY);
+				libc::_exit(i32::from(expected) | (i32::from(tty >= 0) << 1));
+			}
+			let mut status = 0;
+			assert_eq!(libc::waitpid(pid, &raw mut status, 0), pid, "waitpid");
+			assert!(libc::WIFEXITED(status), "the child did not exit: {status}");
+			let code = libc::WEXITSTATUS(status);
+			assert!(code < 4, "the child could not start a session: {code}");
+			(code & 1 != 0, code & 2 != 0)
+		}
+	}
+
+	/// A terminal swapped in at a directory's name is refused without
+	/// becoming the controlling terminal of a process that has none, which
+	/// `O_NOCTTY` keeps on a kernel [`openat_dir`] does not trust. The
+	/// control: a plain open of a pty slave in a new session makes it the
+	/// controlling terminal, so the check can see one.
+	#[test]
+	fn a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal() {
+		let _serial = SWITCHES.lock();
+		reset();
+		DIRECTORY_LINKS.store(FOLLOWED, Ordering::SeqCst);
+		let (opened, control) = controlling_terminal_after(|slave| {
+			// SAFETY: `slave` is a NUL-terminated path; the descriptor stays open.
+			unsafe { libc::open(slave, libc::O_RDONLY | libc::O_NONBLOCK) >= 0 }
+		});
+		assert!(opened && control, "the control: a plain slave open did not become the terminal");
+		let (refused, became) = controlling_terminal_after(|slave| {
+			const DIR: c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+			openat_dir(libc::AT_FDCWD, slave, DIR)
+				.err()
+				.and_then(|err| err.raw_os_error())
+				== Some(libc::ENOTDIR)
+		});
+		assert!(refused, "openat_dir did not refuse the pty slave with ENOTDIR");
+		assert!(!became, "the pty slave openat_dir refused became the controlling terminal");
 		reset();
 	}
 }

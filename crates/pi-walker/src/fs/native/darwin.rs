@@ -70,9 +70,14 @@ pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Resul
 	openat_plain(dir, path, flags)
 }
 
-/// Opens the directory `path` (one component) in `dir` with `flags`, which
-/// carry `O_DIRECTORY | O_NOFOLLOW`: XNU refuses a symlink there itself.
+/// Opens the directory `path` in `dir` with `flags`, which carry
+/// `O_DIRECTORY | O_NOFOLLOW`: XNU refuses a symlink as its final component
+/// itself.
 pub(super) fn openat_dir(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
+	debug_assert!(
+		flags & libc::O_NOFOLLOW != 0 && flags & libc::O_DIRECTORY != 0,
+		"openat_dir refuses a symlink only with O_DIRECTORY | O_NOFOLLOW"
+	);
 	openat_plain(dir, path, flags)
 }
 
