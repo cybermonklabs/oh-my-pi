@@ -1172,10 +1172,12 @@ mod tests {
 
 	/// The removal that ends a directory move across filesystems goes, on a
 	/// native path, through rm's walk, which keeps only the directory it
-	/// stat'd: `tree/sub`, replaced by another real directory at rm's seam
-	/// just before its open, is refused, and that directory's file stays. The
-	/// kernel refuses nothing here, so this holds on Linux too.
-	/// `std::fs::remove_dir_all` would never reach rm's seam.
+	/// stat'd: `mv-seam-tree/sub`, replaced by another real directory at rm's
+	/// seam just before its open, is refused, and that directory's file
+	/// stays. The kernel refuses nothing here, so this holds on Linux too.
+	/// `std::fs::remove_dir_all` would never reach rm's seam. The seam is
+	/// keyed by the walk's relative path, so no other test walks a tree of
+	/// this name: under `cargo test`, tests share the seam's hooks.
 	#[cfg(unix)]
 	#[test]
 	fn the_moved_tree_removal_keeps_a_directory_swapped_in_after_its_stat() {
@@ -1183,8 +1185,9 @@ mod tests {
 			Arc,
 			atomic::{AtomicBool, Ordering},
 		};
+		const TREE: &str = "mv-seam-tree";
 		let cwd = tempdir().unwrap();
-		let (tree, other) = (cwd.path().join("tree"), cwd.path().join("other"));
+		let (tree, other) = (cwd.path().join(TREE), cwd.path().join("other"));
 		fs::create_dir_all(tree.join("sub")).unwrap();
 		fs::write(tree.join("sub/in"), b"").unwrap();
 		fs::create_dir(&other).unwrap();
@@ -1192,13 +1195,13 @@ mod tests {
 		let swapped = Arc::new(AtomicBool::new(false));
 		let (sub, parked, other_dir, seen) =
 			(tree.join("sub"), cwd.path().join("parked"), other.clone(), Arc::clone(&swapped));
-		crate::host::hook_at(std::path::PathBuf::from("tree/sub"), move || {
+		crate::host::hook_at(std::path::Path::new(TREE).join("sub"), move || {
 			fs::rename(&sub, &parked).unwrap();
 			fs::rename(&other_dir, &sub).unwrap();
 			seen.store(true, Ordering::SeqCst);
 		});
 		let (mut host, _capture) = Host::for_test(Mv::NAME, "", cwd.path());
-		let removed = super::remove_moved_tree(&mut host, std::path::Path::new("tree"), &tree);
+		let removed = super::remove_moved_tree(&mut host, std::path::Path::new(TREE), &tree);
 		assert!(swapped.load(Ordering::SeqCst), "the removal did not go through rm's walk");
 		assert!(tree.join("sub/kept").exists(), "removed a directory that was not the one it stat'd");
 		assert!(removed.is_err(), "a refused directory was reported as removed");
