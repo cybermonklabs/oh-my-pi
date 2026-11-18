@@ -154,3 +154,69 @@ describe.skipIf(process.platform === "win32")("run-rs-task.ts check:rs", () => {
 		CASE_TIMEOUT_MS,
 	);
 });
+
+/** A cargo stub that prints the RUSTUP_TOOLCHAIN it was started with. */
+const ECHO_TOOLCHAIN_CARGO = '#!/bin/sh\necho "cargo-stub toolchain=$RUSTUP_TOOLCHAIN $*"\n';
+
+/**
+ * A fixture whose `rustup which cargo` names a cargo inside a rustup-shaped
+ * toolchain directory; that cargo prints the RUSTUP_TOOLCHAIN it sees, which
+ * is what cargo's rustup-proxied `fmt` and `clippy` subcommands would obey.
+ */
+async function makeToolchainFixture(toolchain: string): Promise<Fixture> {
+	const fixture = await makeFixture();
+	const cargo = path.join(fixture.root, "rustup-home", "toolchains", toolchain, "bin", "cargo");
+	await writeExecutable(cargo, ECHO_TOOLCHAIN_CARGO);
+	await writeExecutable(
+		path.join(fixture.shimDir, "rustup"),
+		`#!/bin/sh\n[ "$1 $2" = "which cargo" ] && { echo ${JSON.stringify(cargo)}; exit 0; }\nexit 1\n`,
+	);
+	return fixture;
+}
+
+describe.skipIf(process.platform === "win32")("run-rs-task.ts toolchain", () => {
+	// Failure mode: a shell carries RUSTUP_TOOLCHAIN (mise exports its global rust
+	// pin), the script runs the repository's pinned cargo, and cargo's rustup
+	// proxies run the other toolchain's rustfmt and clippy, so `check:rs` reports
+	// format drift in files nobody touched.
+	test(
+		"every cargo command runs under the toolchain of the cargo it resolved, not the caller's",
+		async () => {
+			const pinned = "nightly-2099-01-01-x86_64-unknown-linux-gnu";
+			const fixture = await makeToolchainFixture(pinned);
+
+			const result = await runCheckRs(fixture, fixture.work, {
+				OMP_FORCE_RUST_TASKS: "1",
+				RUSTUP_TOOLCHAIN: "1.98.0",
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain(`cargo-stub toolchain=${pinned} fmt --all -- --check`);
+			expect(result.output).toContain(`cargo-stub toolchain=${pinned} clippy --workspace`);
+			expect(result.output).not.toContain("toolchain=1.98.0");
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	// A cargo that is not a rustup toolchain's own binary names no toolchain, so
+	// the caller's choice is left as it is rather than replaced by a guess.
+	test(
+		"a cargo found on PATH leaves the caller's RUSTUP_TOOLCHAIN alone",
+		async () => {
+			const fixture = await makeFixture();
+			await writeExecutable(
+				path.join(fixture.shimDir, "cargo"),
+				ECHO_TOOLCHAIN_CARGO,
+			);
+
+			const result = await runCheckRs(fixture, fixture.work, {
+				OMP_FORCE_RUST_TASKS: "1",
+				RUSTUP_TOOLCHAIN: "1.98.0",
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("cargo-stub toolchain=1.98.0 fmt --all -- --check");
+		},
+		CASE_TIMEOUT_MS,
+	);
+});

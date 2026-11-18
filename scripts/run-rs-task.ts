@@ -241,6 +241,18 @@ async function resolveCargoBinary(): Promise<string> {
 	return "cargo";
 }
 
+/**
+ * The rustup toolchain a resolved cargo belongs to, read from its path
+ * (`<RUSTUP_HOME>/toolchains/<toolchain>/bin/cargo`), or `undefined` when the
+ * cargo is not a rustup toolchain's own binary.
+ */
+function toolchainOfCargo(cargo: string): string | undefined {
+	const bin = path.dirname(cargo);
+	const toolchainDir = path.dirname(bin);
+	if (path.basename(bin) !== "bin" || path.basename(path.dirname(toolchainDir)) !== "toolchains") return undefined;
+	return path.basename(toolchainDir);
+}
+
 async function runCommand(command: readonly string[]): Promise<number> {
 	const [head, ...rest] = command;
 	const isCargo = head === "cargo";
@@ -254,6 +266,14 @@ async function runCommand(command: readonly string[]): Promise<number> {
 		const pathSep = process.platform === "win32" ? ";" : ":";
 		const currentPath = env.PATH ?? env.Path ?? "";
 		env.PATH = currentPath === "" ? toolchainBin : `${toolchainBin}${pathSep}${currentPath}`;
+		// cargo reaches its `fmt` and `clippy` subcommands through the rustup
+		// proxies in `$CARGO_HOME/bin`, which take their toolchain from
+		// RUSTUP_TOOLCHAIN when it is set. A caller's RUSTUP_TOOLCHAIN (mise
+		// exports its global rust pin into every shell it starts) then runs
+		// another toolchain's rustfmt and clippy than the cargo resolved above.
+		// Name that cargo's own toolchain, so one toolchain runs the whole task.
+		const toolchain = toolchainOfCargo(cargoBinary);
+		if (toolchain !== undefined) env.RUSTUP_TOOLCHAIN = toolchain;
 	}
 	const proc = Bun.spawn(argv, {
 		cwd: repoRoot,
