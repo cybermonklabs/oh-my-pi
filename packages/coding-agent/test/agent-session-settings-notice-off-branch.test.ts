@@ -49,7 +49,8 @@ describe("a held settings change reaches the conversation the model continues", 
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) await cleanup();
+		// Last in, first out: each session is disposed before the temp dir it writes to is removed.
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
 	});
 
@@ -97,7 +98,8 @@ describe("a held settings change reaches the conversation the model continues", 
 	}
 
 	it("tells the model of a held change again after /tree moves to a reply the notice came after", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-notice-off-branch-");
+		const tempDir = TempDir.createSync("@pi-settings-notice-off-branch-");
+		cleanups.push(() => tempDir.remove());
 		const harness = await startSession(tempDir);
 		await harness.session.prompt("first");
 		const firstReply = harness.session.sessionManager
@@ -124,7 +126,8 @@ describe("a held settings change reaches the conversation the model continues", 
 	}, 30_000);
 
 	it("tells the model of a held change in a recent session the user switches to", async () => {
-		using tempDir = TempDir.createSync("@pi-settings-notice-off-branch-");
+		const tempDir = TempDir.createSync("@pi-settings-notice-off-branch-");
+		cleanups.push(() => tempDir.remove());
 		const harness = await startSession(tempDir);
 		await harness.session.prompt("first, in the other session");
 		const otherSession = harness.session.sessionFile;

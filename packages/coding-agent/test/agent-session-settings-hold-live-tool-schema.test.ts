@@ -38,7 +38,8 @@ describe("a held settings change on a tool whose definition renders from live se
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) await cleanup();
+		// Last in, first out: each session is disposed before the temp dir it writes to is removed.
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
 	});
 
@@ -95,7 +96,8 @@ describe("a held settings change on a tool whose definition renders from live se
 		{ setting: "async.enabled", before: "async:\n  enabled: true\n", after: "async:\n  enabled: false\n" },
 	]) {
 		it(`sends the tool definitions as written while the notice of a held ${setting} change says they stay`, async () => {
-			using tempDir = TempDir.createSync("@pi-settings-hold-live-tool-");
+			const tempDir = TempDir.createSync("@pi-settings-hold-live-tool-");
+			cleanups.push(() => tempDir.remove());
 			const harness = await startSession(tempDir, before);
 			await harness.session.prompt("first");
 			await reloadOverlay(harness, `${OVERLAY}${after}`);

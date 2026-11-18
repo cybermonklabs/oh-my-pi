@@ -38,7 +38,8 @@ describe("hidden notices about what task and eval agent() can use", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
-		for (const cleanup of cleanups.splice(0)) await cleanup();
+		// Last in, first out: each session is disposed before the temp dir it writes to is removed.
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		vi.restoreAllMocks();
 	});
 
@@ -75,7 +76,8 @@ describe("hidden notices about what task and eval agent() can use", () => {
 	}
 
 	it("does not announce an agent the settings disable as available", async () => {
-		using tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		const tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		cleanups.push(() => tempDir.remove());
 		const settings = Settings.isolated({ "providers.cacheRetention": "long", "task.disabledAgents": ["rec-helper"] });
 		const harness = await startSession(tempDir, settings, ["read", "task"]);
 		await harness.session.prompt("first");
@@ -93,7 +95,8 @@ describe("hidden notices about what task and eval agent() can use", () => {
 	}, 30_000);
 
 	it("tells the model the new description of an agent edited mid-session", async () => {
-		using tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		const tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		cleanups.push(() => tempDir.remove());
 		const harness = await startSession(tempDir, Settings.isolated({ "providers.cacheRetention": "long" }), [
 			"read",
 			"task",
@@ -113,7 +116,8 @@ describe("hidden notices about what task and eval agent() can use", () => {
 	}, 30_000);
 
 	it("tells a session without the task tool nothing about agents task can spawn", async () => {
-		using tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		const tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		cleanups.push(() => tempDir.remove());
 		const harness = await startSession(tempDir, Settings.isolated({ "providers.cacheRetention": "long" }), ["read"]);
 		await harness.session.prompt("first");
 
@@ -128,7 +132,8 @@ describe("hidden notices about what task and eval agent() can use", () => {
 	}, 30_000);
 
 	it("tells a session with neither task nor eval nothing about per-call models", async () => {
-		using tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		const tempDir = TempDir.createSync("@pi-task-agent-notice-policy-");
+		cleanups.push(() => tempDir.remove());
 		const settings = Settings.isolated({
 			"providers.cacheRetention": "long",
 			"task.perCallModel": "on",
