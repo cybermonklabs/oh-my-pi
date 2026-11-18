@@ -44,9 +44,8 @@ import { codeOf, statIfPresent, withGcLock } from "../session/gc-lock";
 import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
-	RACED_READ_RETRIES,
+	retryRacedRead,
 	SESSION_STAGING_RE,
-	SessionReadConflictError,
 	type SessionStorage,
 	tryAcquireSessionLease,
 } from "../session/session-storage";
@@ -992,17 +991,14 @@ async function runBlobGc(
 				);
 			}
 			for (const file of stored) {
-				for (let retries = 0; ; retries++) {
-					try {
-						await collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes);
-						break;
-					} catch (error) {
-						// Removed since the listing: it references nothing anymore.
-						if (codeOf(error) === "ENOENT") break;
-						// Raced by a rewrite: read it again, never skip it, or the blobs only it references would go.
-						if (error instanceof SessionReadConflictError && retries < RACED_READ_RETRIES) continue;
-						throw error;
-					}
+				try {
+					// Raced by a rewrite: read it again, never skip it, or the blobs only it references would go.
+					await retryRacedRead(() =>
+						collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes),
+					);
+				} catch (error) {
+					// Removed since the listing: it references nothing anymore.
+					if (codeOf(error) !== "ENOENT") throw error;
 				}
 			}
 		}

@@ -28,13 +28,7 @@ import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
-import {
-	defaultSessionStorage,
-	FileSessionStorage,
-	RACED_READ_RETRIES,
-	SessionReadConflictError,
-	type SessionStorage,
-} from "./session-storage";
+import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -676,17 +670,11 @@ async function loadWithKnownSize(
 	options?: LoadSessionOptions,
 ): Promise<{ loaded: SessionLoadResult; sourceSize: number }> {
 	if (shouldStreamEntries(storage, filePath, size)) {
-		for (let retries = 0; ; retries++) {
-			try {
-				const loaded = await loadEntriesFromFileStream(filePath, { ...options, storage });
-				const sourceSize = loaded.sourceSize ?? 0;
-				return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
-			} catch (error) {
-				// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
-				// reads do not wait for): stream it again from its start, never as one whole-text read.
-				if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
-			}
-		}
+		// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
+		// reads do not wait for): stream it again from its start, never as one whole-text read.
+		const loaded = await retryRacedRead(() => loadEntriesFromFileStream(filePath, { ...options, storage }));
+		const sourceSize = loaded.sourceSize ?? 0;
+		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}
 	const content = await storage.readText(filePath);
 	const loaded = parseSessionContent(content);
@@ -910,24 +898,20 @@ export async function probeSessionFile(
 		const first = loaded.entries[0];
 		return { header: isValidSessionHeader(first) ? first : undefined, loaded };
 	}
-	for (let retries = 0; ; retries++) {
-		// The stream reads one chunk past the header before it stops, which a rewrite can race.
+	// A full rewrite or delete can race the stream between its chunks.
+	return retryRacedRead(async () => {
 		const probe: { header?: SessionHeader } = {};
-		try {
-			await visitSessionFile(
-				filePath,
-				storage,
-				entry => {
-					probe.header = entry as SessionHeader;
-					return false;
-				},
-				options,
-			);
-			return { header: probe.header, loaded: undefined };
-		} catch (error) {
-			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
-		}
-	}
+		await visitSessionFile(
+			filePath,
+			storage,
+			entry => {
+				probe.header = entry as SessionHeader;
+				return false;
+			},
+			options,
+		);
+		return { header: probe.header, loaded: undefined };
+	});
 }
 
 /**
