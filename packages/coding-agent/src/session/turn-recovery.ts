@@ -1960,9 +1960,17 @@ export class TurnRecovery {
 		this.#fallbackRoutedFor = undefined;
 	}
 
-	/** Checks whether a fallback selector remains in cooldown. */
-	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean {
-		return this.#host.modelRegistry.isSelectorSuppressed(selector.raw);
+	/**
+	 * Whether a fallback entry is in cooldown: by its own string, or by the key of
+	 * `model`, the model it resolves to. A cooldown is keyed by the model that
+	 * failed, its `provider/id` and route (`noteRetryFallbackCooldown`), so an
+	 * alias such as `pi/<role>` is in cooldown while the model it resolves to is.
+	 */
+	isRetryFallbackEntrySuppressed(selector: RetryFallbackSelector, model: Model): boolean {
+		return (
+			this.#host.modelRegistry.isSelectorSuppressed(selector.raw) ||
+			this.#host.modelRegistry.isSelectorSuppressed(formatModelStringWithRouting(model))
+		);
 	}
 
 	/** Records the cooldown that should suppress a failing selector. */
@@ -2244,12 +2252,13 @@ export class TurnRecovery {
 
 	/**
 	 * The check before a model call and the fallback walk share this search. It
-	 * answers the first entry that is not suppressed, neither by its own string
-	 * nor by the model it resolves to (so an alias such as `pi/<role>` of a
-	 * model in cooldown is passed over), has configured auth, fits the effort
-	 * ceiling and the context without `excludedMessage`, reads neither depleted
-	 * nor at the reserve, and gives a key, with that key and the model the
-	 * entry resolves to. A key read that throws passes over the entry.
+	 * answers the first entry that resolves to a model with configured auth, is
+	 * not in cooldown by its own string or by that model
+	 * (`isRetryFallbackEntrySuppressed`, so an alias such as `pi/<role>` of a
+	 * model in cooldown is passed over), fits the effort ceiling and the context
+	 * without `excludedMessage`, reads neither depleted nor at the reserve, and
+	 * gives a key, with that key and the model the entry resolves to. A key read
+	 * that throws passes over the entry.
 	 * Undefined when no entry passes, or once `stale()` is true.
 	 */
 	async #searchKeyedRetryFallback(
@@ -2260,14 +2269,10 @@ export class TurnRecovery {
 	): Promise<(RetryFallbackEntry & { apiKey: string; model: Model }) | undefined> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const { role, selector: candidate } of entries) {
-			if (this.isRetryFallbackSelectorSuppressed(candidate)) continue;
 			const resolved = resolveModelOverride([candidate.raw], this.#host.modelRegistry, this.#host.settings);
 			const candidateModel = resolved.model ?? this.#host.modelRegistry.find(candidate.provider, candidate.id);
 			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
-			// A cooldown is keyed by the model that failed, its `provider/id` and
-			// route (`noteRetryFallbackCooldown`), so an alias such as `pi/<role>`
-			// is checked by the model it resolves to.
-			if (this.#host.modelRegistry.isSelectorSuppressed(formatModelStringWithRouting(candidateModel))) continue;
+			if (this.isRetryFallbackEntrySuppressed(candidate, candidateModel)) continue;
 			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 			// Skip a candidate whose window cannot hold the live context so we
 			// never switch onto an oversized request (issue #8065).
@@ -2508,7 +2513,6 @@ export class TurnRecovery {
 		const heldEntries: RetryFallbackEntry[] = [];
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
-				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
 				// A refusal walk visits any one model at most once per turn. Without this a
 				// pair of chains naming each other alternates: each hop is a model the walk
 				// has already been refused on, and the budget no longer stops it.
@@ -2516,6 +2520,7 @@ export class TurnRecovery {
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate) continue;
+				if (this.isRetryFallbackEntrySuppressed(selector, candidate)) continue;
 				// A candidate that would leave the request exactly as it is — same
 				// routed model, same effective thinking level — is not a switch, and
 				// must never be applied as one: `findRetryFallbackCandidates` excludes
@@ -2759,10 +2764,10 @@ export class TurnRecovery {
 			// true answer resets a spent retry budget. In a refusal walk,
 			// `#refusalWalkTried` ends the next refusal on the model in use. For any
 			// other failure the caller put the model in use in cooldown
-			// (`noteRetryFallbackCooldown`), which bounds the reset: the search
-			// passes over an entry whose resolved model is in cooldown, so an alias
-			// that resolves to the model in use, such as `pi/<role>`, is skipped
-			// too, as in the check before a model call.
+			// (`noteRetryFallbackCooldown`), which bounds the reset: the search, as
+			// every fallback walk, passes over an entry whose resolved model is in
+			// cooldown (`isRetryFallbackEntrySuppressed`), so an alias that resolves
+			// to the model in use, such as `pi/<role>`, is skipped too.
 			if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
 			return true;
 		}
@@ -2912,12 +2917,11 @@ export class TurnRecovery {
 		if (!currentModel) return false;
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
 		if (currentSelector === originalSelector.raw) {
-			if (!this.isRetryFallbackSelectorSuppressed(originalSelector)) {
+			if (!this.isRetryFallbackEntrySuppressed(originalSelector, currentModel)) {
 				this.clearActiveRetryFallback();
 			}
 			return false;
 		}
-		if (this.isRetryFallbackSelectorSuppressed(originalSelector)) return false;
 
 		const resolvedPrimary = resolveModelOverride(
 			[originalSelector.raw],
@@ -2926,6 +2930,7 @@ export class TurnRecovery {
 		);
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
+		if (primaryModel && this.isRetryFallbackEntrySuppressed(originalSelector, primaryModel)) return false;
 		if (!primaryModel) return false;
 		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
 		if (!apiKey) return false;
