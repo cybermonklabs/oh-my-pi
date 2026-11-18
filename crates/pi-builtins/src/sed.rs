@@ -471,14 +471,13 @@ pub enum CommandData {
 }
 
 #[derive(Debug, Clone)]
-/// Action to execute after reading a new input line
+/// What `n` and `N` do with the line they read next
 pub struct InputAction {
 	/// Next command to execute (rather than commands from start)
 	pub next_command: Option<Rc<RefCell<Command>>>,
-	/// Data to prepend to the read contents
-	pub prepend:      String,
-	/// True if `prepend` is byte text
-	pub bytes:        bool,
+	/// The pattern space `N` appends the next line to, or `None` for `n`,
+	/// whose next line replaces the pattern space it printed.
+	pub append_to:    Option<StringSpace>,
 }
 
 #[cfg(test)]
@@ -936,12 +935,14 @@ fn resolve_branch_targets(
 			// Build the replacement
 			let new_data = match old_data {
 				CommandData::Label(Some(label)) => {
+					// GNU sed exits 4 for a jump to a label no `:` defines:
+					// `sed -n 'ba#c'` is "can't find label for jump to `a'".
 					let target = context
 						.label_to_command_map
 						.get(&label)
 						.cloned()
 						.ok_or_else(|| {
-							semantic_error::<()>(&cmd.location, format!("undefined label `{label}'"))
+							location_error::<()>(&cmd.location, format!("undefined label `{label}'"), 4)
 								.unwrap_err()
 						})?;
 					CommandData::BranchTarget(Some(target))
@@ -1233,8 +1234,10 @@ fn parse_number(
 }
 
 /// Parse the end of a command, failing with an error on extra characters.
-/// As in GNU sed, blanks may follow the command, and a `}` ends it as a `;`
-/// does (`/x/{p}`); the `}` is left for the block to read.
+/// As in GNU sed, blanks may follow the command, a `}` ends it as a `;` does
+/// (`/x/{p}`), and so does a `#`, which starts a comment that runs to the end
+/// of the line (`p # c`, `s/a/X/gp#c`); the `}` and the `#` are left for the
+/// sequence to read.
 fn parse_command_ending(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
@@ -1246,7 +1249,7 @@ fn parse_command_ending(
 		return Ok(());
 	}
 
-	if !line.eol() && line.current() != '}' {
+	if !line.eol() && !matches!(line.current(), '}' | '#') {
 		return compilation_error(
 			lines,
 			line,
@@ -1283,19 +1286,22 @@ fn compile_regex(
 	// Translate the dialect into the engine's syntax. A pattern GNU sed
 	// refuses is refused here with GNU's own message and exit status:
 	// `sed 's/[:alpha:]/X/'` is "character class syntax is [[:space:]], not
-	// [:space:]" and exit 4, while an ordinary bad RE exits 1.
+	// [:space:]" and exit 4, while an ordinary bad RE exits 1. Under `M` a
+	// negated bracket expression holds no newline, `-z` or not: `printf
+	// 'ab\nba\n' | sed 'N;s/[^a]/X/Mg'` prints `aX` and `Xa`.
 	let dialect = if context.regex_extended {
 		crate::bre::Dialect::Extended
 	} else {
 		crate::bre::Dialect::Basic
 	};
 	let translate = |text: &str| {
-		crate::bre::translate(
+		crate::bre::translate_multiline(
 			text,
 			dialect,
 			crate::bre::Target::Fancy,
 			icase,
 			crate::bre::Strictness::Sed,
+			multiline,
 		)
 		.map_err(|error| {
 			// GNU sed exits 4 for a class name written without its outer
@@ -1688,8 +1694,9 @@ pub fn compile_subst_flags(
 				return Ok(()); // 'w' is the last flag allowed
 			},
 
-			// A `}` ends the command as in GNU sed (`/x/{s/x/X/p}`).
-			';' | '\n' | '}' => break,
+			// A `}` ends the command as in GNU sed (`/x/{s/x/X/p}`), and so does
+			// a `#`, which starts a comment (`s/a/X/gp # c`).
+			';' | '\n' | '}' | '#' => break,
 
 			other => {
 				return compilation_error(lines, line, format!("invalid substitute flag: '{other}'"));
@@ -1801,17 +1808,16 @@ fn compile_label_command(
 	cmd: &mut Command,
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
-	/// Return true if `c` is in the POSIX portable filename character set.
-	fn is_portable_filename_char(c: char) -> bool {
-		c.is_ascii_alphanumeric()  // A–Z, a–z, 0–9
-        || matches!(c, '.' | '_' | '-')
-	}
-
 	line.advance(); // Skip the command character
 	line.eat_spaces(); // Skip any leading whitespace
 
+	// A label runs to a blank, a `;`, a `}` or a `#`, which starts a comment,
+	// as in GNU sed 4.9: `:a#c` and `ba#c` name `a`, and `:a+b` names `a+b`.
 	let mut label = String::new();
-	while !line.eol() && is_portable_filename_char(line.current()) {
+	while !line.eol()
+		&& !matches!(line.current(), ';' | '}' | '#')
+		&& !line.current().is_whitespace()
+	{
 		label.push(line.current());
 		line.advance();
 	}
@@ -5403,6 +5409,27 @@ pub fn write_text_bytes(out: &mut impl Write, text: &str, bytes: bool) -> io::Re
 	out.write_all(&text.as_bytes()[written..])
 }
 
+/// Writes the pattern space `record` as sed writes it to a `w` file: after
+/// the `delimiter` the line written before it lacked where `missing`, and
+/// ended by its own where its last line has one. GNU sed leaves a last line
+/// that lacks its newline without one: `printf 'a\nb' | sed -n 'w o'` writes
+/// `a\nb` to `o`.
+pub fn write_record(
+	out: &mut impl Write,
+	record: &IOChunk,
+	missing: bool,
+	delimiter: u8,
+) -> io::Result<()> {
+	if missing {
+		out.write_all(&[delimiter])?;
+	}
+	write_text_bytes(out, record.as_str(), record.is_bytes())?;
+	if record.is_newline_terminated() {
+		out.write_all(&[delimiter])?;
+	}
+	Ok(())
+}
+
 /// A character of the script as text: the byte a numeric escape names, which
 /// the script holds as its byte text character (`\xe9`), is the character of
 /// the same code (`é`), as sed has always read it in a line that is UTF-8.
@@ -5566,6 +5593,12 @@ impl<'a> IOChunk<'a> {
 			slice_text: OnceCell::new(),
 			content,
 		}
+	}
+
+	/// Construct an Owned chunk of `text`, byte text when `bytes`, ended by
+	/// its delimiter where `has_newline`.
+	pub fn from_text(text: String, bytes: bool, has_newline: bool) -> Self {
+		Self::from_content(IOChunkContent::new_owned_text(text, bytes, has_newline))
 	}
 
 	/// Clear the object's contents, converting it into Owned if needed.
@@ -6015,6 +6048,23 @@ impl OutputBuffer {
 			}
 		} else {
 			io::copy(&mut reader, &mut self.out)?;
+		}
+		Ok(())
+	}
+
+	/// Write the pattern space `record` for `w /dev/stdout`, as
+	/// [`write_record`] writes it. GNU sed keeps the delimiter that writer's
+	/// last line lacked apart from the one of the lines sed prints, so this
+	/// neither ends a line left pending here nor leaves one: `printf 'a' | sed
+	/// 'p;w /dev/stdout'` prints `aa\na`.
+	pub fn write_record_apart(&mut self, record: &IOChunk, missing: bool) -> io::Result<()> {
+		#[cfg(unix)]
+		{
+			self.flush_slice(WriteRange::Complete)?;
+		}
+		write_record(&mut self.out, record, missing, self.delimiter)?;
+		if record.is_newline_terminated() {
+			self.flush_completed_line()?;
 		}
 		Ok(())
 	}
@@ -8433,9 +8483,13 @@ impl InPlace {
 	/// Return an OutputBuffer for outputting the edits to the specified file.
 	/// The passed file name should have resolved symbolic links according
 	/// to the context settings.
+	///
+	/// Without `-i` every file is written to the one standard output buffer,
+	/// so a last line that lacks its newline gets it before the next file's
+	/// first, as GNU sed writes it: `sed '' nb nd`, where `nb` holds `a\nb`
+	/// and `nd` holds `c\nd`, prints `a\nb\nc\nd`.
 	fn begin_resolved(&mut self, file_name: &Path) -> SedResult<&mut OutputBuffer> {
 		if !self.in_place {
-			self.output = stdout_output(&self.stdout, self.stdout_is_file, self.delimiter);
 			return Ok(&mut self.output);
 		}
 
@@ -8689,17 +8743,12 @@ pub mod named_writer {
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use std::{
-	cell::RefCell,
-	io::{BufWriter, Write},
-	path::PathBuf,
-	rc::Rc,
-};
+use std::{cell::RefCell, io::BufWriter, path::PathBuf, rc::Rc};
 
 use crate::openfile::{DescriptorPath, STDERR_FD, STDOUT_FD};
 use pi_vfs::{File, OpenOptions};
 use crate::host::{Host, ShellPaths};
-use crate::sed::fast_io::{OutputBuffer, write_text_bytes};
+use crate::sed::fast_io::{IOChunk, OutputBuffer, write_record};
 
 use uucore::display::Quotable;
 use crate::sed::error_handling::SedResult;
@@ -8729,15 +8778,14 @@ enum Target {
 /// Writer that tracks its file name for better error messages
 pub struct NamedWriter {
 	/// The file name as the script spelled it.
-	pub path: PathBuf,
-	target:   Target,
-	location: ScriptLocation,
-}
-
-/// Writes `line`, byte text when `bytes`, and `delimiter`.
-fn write_record(out: &mut impl Write, line: &str, bytes: bool, delimiter: u8) -> std::io::Result<()> {
-	write_text_bytes(out, line, bytes)?;
-	out.write_all(&[delimiter])
+	pub path:        PathBuf,
+	target:          Target,
+	location:        ScriptLocation,
+	/// Whether the line last written here lacked its delimiter, which the
+	/// next one written here gets first. GNU sed keeps this for each `w` file
+	/// apart from sed's own output, `w /dev/stdout` too: `printf 'a' | sed
+	/// 'p;w /dev/stdout'` prints `aa\na`.
+	missing_newline: bool,
 }
 
 impl NamedWriter {
@@ -8768,32 +8816,35 @@ impl NamedWriter {
 			},
 		};
 
-		let writer = Rc::new(RefCell::new(NamedWriter { path, target, location }));
+		let writer =
+			Rc::new(RefCell::new(NamedWriter { path, target, location, missing_newline: false }));
 
 		FLUSH_LIST.with(|list| list.borrow_mut().push(Rc::clone(&writer)));
 		Ok(writer)
 	}
 
-	/// Write a line to the file, ended by `delimiter` (the newline, or NUL
-	/// under `-z`), returning descriptive errors. The line is byte text when
-	/// `bytes`, and its bytes are what is written.
+	/// Write the pattern space `record` to the file, ended by `delimiter` (the
+	/// newline, or NUL under `-z`) where its last line has one, returning
+	/// descriptive errors. Its bytes are what is written. A last line that
+	/// lacks its newline is written without one, as GNU sed writes it:
+	/// `printf 'a\nb' | sed -n 'w o'` writes `a\nb` to `o`.
 	///
 	/// `output` is sed's current output: stdout, or the temporary file under
 	/// `-i`, in which case `/dev/stdout` still means the real stdout.
 	pub fn write_line(
 		&mut self,
-		line: &str,
-		bytes: bool,
+		record: &IOChunk,
 		delimiter: u8,
 		output: &mut OutputBuffer,
 		in_place: bool,
 		host: &mut Host,
 	) -> SedResult<()> {
+		let missing = std::mem::replace(&mut self.missing_newline, !record.is_newline_terminated());
 		let result = match &mut self.target {
-			Target::File(writer) => write_record(writer, line, bytes, delimiter),
-			Target::Stdout if in_place => write_record(&mut host.stdout, line, bytes, delimiter),
-			Target::Stdout => output.write_line(line, bytes),
-			Target::Stderr => write_record(&mut host.stderr, line, bytes, delimiter),
+			Target::File(writer) => write_record(writer, record, missing, delimiter),
+			Target::Stdout if in_place => write_record(&mut host.stdout, record, missing, delimiter),
+			Target::Stdout => output.write_record_apart(record, missing),
+			Target::Stderr => write_record(&mut host.stderr, record, missing, delimiter),
 			Target::Closed => Err(std::io::Error::other("file already closed")),
 		};
 		result.map_err(|e| {
@@ -8858,7 +8909,7 @@ pub mod processor {
 
 #[cfg(unix)]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
-use std::{borrow::Cow, cell::RefCell, io, path::PathBuf, process::Command as ProcessCommand, rc::Rc};
+use std::{cell::RefCell, io, path::PathBuf, process::Command as ProcessCommand, rc::Rc};
 
 use pi_vfs::BlockingFs;
 use uucore::display::Quotable;
@@ -8868,7 +8919,8 @@ use crate::sed::error_handling::{IoContext, SedResult};
 
 use crate::sed::{
 	command::{
-		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, Transliteration,
+		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, StringSpace,
+		Transliteration,
 	},
 	error_handling::{ScriptLocation, input_runtime_error},
 	fast_io::{
@@ -8909,16 +8961,23 @@ fn match_address(
 
 		Address::Line(lineno) => Ok(context.line_number == *lineno),
 
-		// Recognize "$" as the last line of last file. This is consistent
-		// with the original 7th Research Edition implementation:
-		// https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665
-		// The FreeBSD version checked for subsequent empty files, but this
-		// can lead to destructive reads (e.g. from named pipes),
-		// and is probably an overkill.
-		Address::Last => Ok(reader.last_line()? && (context.last_file || context.separate)),
+		Address::Last => is_last_line(reader, context),
 
 		_ => panic!("invalid address type in match_address"),
 	}
+}
+
+/// Whether the line read last is the last line: of the last file, or of its
+/// own file under `-s`. It is the line `$` matches, and the one after which
+/// `n` and `N` have no line to read.
+fn is_last_line(reader: &mut LineReader, context: &ProcessingContext) -> SedResult<bool> {
+	// Recognize "$" as the last line of last file. This is consistent
+	// with the original 7th Research Edition implementation:
+	// https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665
+	// The FreeBSD version checked for subsequent empty files, but this
+	// can lead to destructive reads (e.g. from named pipes),
+	// and is probably an overkill.
+	Ok(reader.last_line()? && (context.last_file || context.separate))
 }
 
 #[allow(dead_code)]
@@ -9229,8 +9288,7 @@ fn substitute(
 		// Write to file if needed.
 		if let Some(writer) = &sub.write_file {
 			writer.borrow_mut().write_line(
-				pattern.as_str(),
-				pattern.is_bytes(),
+				pattern,
 				context.delimiter(),
 				output,
 				context.in_place,
@@ -9273,6 +9331,12 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 				output.write_verbatim(text)?;
 			},
 			AppendElement::Path(path) => {
+				// A line printed without its newline gets it first, even
+				// where the file is empty or cannot be read, as GNU sed's `r`
+				// does: `printf 'a' | sed 'r f'` prints `a`, a newline and the
+				// text of `f`. GNU's `0r` does not: under `-s` it writes its
+				// file before the next file's first line without one.
+				output.flush_pending_newline()?;
 				output.copy_file(context.paths.fs(), path)?;
 			},
 		}
@@ -9285,6 +9349,11 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 /// with the delimiter, and a newline or NUL inside the pattern space is an
 /// escape (`\n`, `\000`), as GNU sed lists it: `printf 'x\ny\n' | sed -n
 /// 'N;l'` prints `x\ny$`.
+///
+/// GNU sed lists the line byte by byte, in the C and the C.UTF-8 locale
+/// alike: a character of several bytes is the octal escape of each (`é` is
+/// `\303\251`), and folding the line may part those escapes but never splits
+/// one (`l 5` lists `café` as `caf\`, `\303\` and `\251$`).
 fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResult<()> {
 	// Special case for an empty pattern space
 	if line.is_empty() {
@@ -9295,42 +9364,31 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 	}
 
 	let bytes = line.is_bytes();
-	let line = line.as_str();
 	let mut buff = String::new();
 	let mut line_width = 0;
 
-	for ch in line.chars() {
-		let mut char_buff = [0u8; 1];
-		let out_str: Cow<str> = match char_byte(ch) {
-			// A byte of a line that is not UTF-8, in octal as GNU writes it:
-			// `\351`.
-			Some(byte) if bytes => Cow::Owned(format!("\\{byte:03o}")),
-			_ => match ch {
-				'\x07' => Cow::Borrowed(r"\a"),
-				'\x08' => Cow::Borrowed(r"\b"),
-				'\x0b' => Cow::Borrowed(r"\v"),
-				'\x0c' => Cow::Borrowed(r"\f"),
-				'\\' => Cow::Borrowed(r"\\"),
-				'\r' => Cow::Borrowed(r"\r"),
-				'\n' => Cow::Borrowed(r"\n"),
-				'\t' => Cow::Borrowed(r"\t"),
-				c if c.is_ascii_control() => Cow::Owned(format!("\\{:03o}", ch as u8)),
-				c if c == ' ' || c.is_ascii_graphic() => Cow::Borrowed(ch.encode_utf8(&mut char_buff)),
-				c if (c as u32) <= 0xffff => Cow::Owned(format!("\\u{:04X}", c as u32)),
-				_ => Cow::Owned(format!("\\U{:08X}", ch as u32)),
+	for ch in line.as_str().chars() {
+		let mut encoded = [0u8; 4];
+		let ch_bytes: &[u8] = match char_byte(ch) {
+			// A byte of a line that is not UTF-8.
+			Some(byte) if bytes => {
+				encoded[0] = byte;
+				&encoded[..1]
 			},
+			_ => ch.encode_utf8(&mut encoded).as_bytes(),
 		};
-
-		// See if folding is required before adding out_str and terminator.
-		let out_len = out_str.len();
-		if line_width + out_len + 1 > max_width {
-			buff.push_str("\\\n");
-			output.write_str(&buff)?;
-			line_width = 0;
-			buff.clear();
+		for &byte in ch_bytes {
+			let (listed, out_len) = list_byte(byte);
+			// See if folding is required before adding the byte and terminator.
+			if line_width + out_len + 1 > max_width {
+				buff.push_str("\\\n");
+				output.write_str(&buff)?;
+				line_width = 0;
+				buff.clear();
+			}
+			buff.extend(listed[..out_len].iter().copied().map(char::from));
+			line_width += out_len;
 		}
-		buff.push_str(out_str.as_ref());
-		line_width += out_len;
 	}
 
 	if !buff.is_empty() {
@@ -9338,6 +9396,25 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 		output.write_str(buff)?;
 	}
 	Ok(())
+}
+
+/// What `l` lists `byte` as, as GNU sed lists it: the byte itself where it is
+/// printable ASCII, a C escape such as `\t`, or else a backslash and three
+/// octal digits (`\303`). Returns those bytes, all ASCII, and their count.
+fn list_byte(byte: u8) -> ([u8; 4], usize) {
+	let letter = match byte {
+		0x07 => b'a',
+		0x08 => b'b',
+		b'\t' => b't',
+		b'\n' => b'n',
+		0x0b => b'v',
+		0x0c => b'f',
+		b'\r' => b'r',
+		b'\\' => b'\\',
+		b' '..=b'~' => return ([byte, 0, 0, 0], 1),
+		_ => return ([b'\\', b'0' + (byte >> 6), b'0' + ((byte >> 3) & 7), b'0' + (byte & 7)], 4),
+	};
+	([b'\\', letter, 0, 0], 2)
 }
 
 /// Handle address 0 read at the beginning of each file.
@@ -9395,13 +9472,17 @@ fn process_file(
 		// Set the script command from which to start.
 		let mut current: Option<Rc<RefCell<Command>>> =
 			if let Some(action) = context.input_action.take() {
-				// Continue processing the `N` command.
-				let mut combined_lines = action.prepend;
-				let mut bytes = action.bytes;
-				combined_lines.push(delimiter);
-				append_text(&mut combined_lines, &mut bytes, pattern.as_str(), pattern.is_bytes());
+				// Continue the script after the `n` or `N` that read this line;
+				// `N` appends it to the pattern space, and `n` makes it the
+				// pattern space.
+				if let Some(held) = action.append_to {
+					let mut combined_lines = held.content;
+					let mut bytes = held.bytes;
+					combined_lines.push(delimiter);
+					append_text(&mut combined_lines, &mut bytes, pattern.as_str(), pattern.is_bytes());
 
-				pattern.set_text(combined_lines, bytes, pattern.is_newline_terminated());
+					pattern.set_text(combined_lines, bytes, pattern.is_newline_terminated());
+				}
 				action.next_command
 			} else {
 				// Start from the script top.
@@ -9516,23 +9597,32 @@ fn process_file(
 					let width = *extract_variant!(command, Number);
 					list(output, &pattern, width)?;
 				},
-				'n' => {
-					break;
-				},
-				'N' => {
+				'n' | 'N' => {
+					// With no next line GNU sed ends the cycle without running
+					// the rest of the script: the pattern space is printed,
+					// unless `-n`, and a last line that lacks its newline still
+					// lacks it (`printf 'a' | sed N` prints `a`).
+					if is_last_line(reader, context)? {
+						break;
+					}
+					// `n` prints the pattern space, unless `-n`, before the next
+					// line replaces it: `printf 'a\nb\nc\n' | sed 'n;d'` prints
+					// `a` and `c`.
+					if command.code == 'n' && !context.quiet {
+						write_chunk(output, context, &pattern)?;
+					}
 					flush_appends(output, context)?;
-					// Append to pattern `\n` and the next line
-					// Rather than reading input here, which would result
-					// in a double borrow on reader, modify the action
-					// to perform when the next line is read. This cycle's
-					// `pattern` is discarded, so move its buffer instead of
-					// copying the accumulated pattern space each time.
-					let (prepend, bytes) = pattern.take_text();
-					context.input_action = Some(InputAction {
-						next_command: command.next.clone(),
-						prepend,
-						bytes,
+					// The next line may be the first of the next file, so the
+					// loop over lines reads it, and continues the script after
+					// this command. `N` moves this cycle's pattern space there
+					// instead of copying it, to append the line to.
+					let append_to = (command.code == 'N').then(|| {
+						let has_newline = pattern.is_newline_terminated();
+						let (content, bytes) = pattern.take_text();
+						StringSpace { content, has_newline, bytes }
 					});
+					context.input_action =
+						Some(InputAction { next_command: command.next.clone(), append_to });
 					continue 'lines;
 				},
 				'p' => {
@@ -9587,8 +9677,7 @@ fn process_file(
 					// Append the pattern space to the specified file.
 					let writer = extract_variant!(command, NamedWriter);
 					writer.borrow_mut().write_line(
-						pattern.as_str(),
-						pattern.is_bytes(),
+						&pattern,
 						context.delimiter(),
 						output,
 						context.in_place,
@@ -9641,19 +9730,6 @@ fn process_file(
 		if context.stop_processing {
 			output.flush_pending_newline()?;
 			break;
-		}
-	}
-
-	// Handle any N command remains.
-	if context.separate
-		&& !context.quiet
-		&& let Some(action) = context.input_action.take()
-	{
-		let mut pending = action.prepend;
-		pending.push('\n');
-		output.write_text(pending, action.bytes)?;
-		if context.unbuffered {
-			output.flush()?;
 		}
 	}
 
@@ -9710,15 +9786,16 @@ pub fn process_all_files(
 		context.input_name = path.quote().to_string();
 		process_file(commands.clone(), &mut reader, output, context, host)?;
 
-		// Handle any N command remains.
+		// An `n` or `N` on the last line of a file that only empty files
+		// follow found no line to read: `n` has printed its pattern space, and
+		// `N` prints its own, unless `-n`, its last line's missing newline still
+		// missing.
 		if context.last_file
-			&& !context.separate
-			&& !context.quiet
 			&& let Some(action) = context.input_action.take()
+			&& let Some(held) = action.append_to
+			&& !context.quiet
 		{
-			let mut pending = action.prepend;
-			pending.push('\n');
-			output.write_text(pending, action.bytes)?;
+			write_chunk(output, context, &IOChunk::from_text(held.content, held.bytes, held.has_newline))?;
 		}
 
 		in_place.end()?;
@@ -10845,5 +10922,147 @@ mod tests {
 			crate::host::run_util::<Sed>(&["-n", "-f", "script.sed"], "saved\n", dir.path());
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(std::fs::read(dir.path().join("output.txt")).unwrap(), b"saved\n");
+	}
+
+	/// Runs sed with `args` on `stdin` in `dir`, returning its exit status and
+	/// stdout.
+	fn sed_in(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String) {
+		let (code, capture) = crate::host::run_util::<Sed>(args, stdin, dir);
+		(code, capture.out())
+	}
+
+	#[test]
+	fn builtin_n_prints_and_reads_the_next_line() {
+		// GNU sed 4.9: `n` prints the pattern space, unless `-n`, replaces it
+		// with the next line and goes on with the script; with no next line
+		// it ends without running the rest of the script.
+		let root = std::path::Path::new("/");
+		for (args, expected) in [
+			(&["n;d"][..], "a\nc\n"),
+			(&["-n", "n;p"][..], "b\n"),
+			(&["n;="][..], "a\n2\nb\nc\n"),
+			(&["n;s/^/X/"][..], "a\nXb\nc\n"),
+			(&["1{a\\\nA\nn;s/^/Y/};s/^/X/"][..], "a\nA\nXYb\nXc\n"),
+		] {
+			assert_eq!(sed_in(root, args, "a\nb\nc\n"), (0, expected.to_owned()), "{args:?}");
+		}
+		// It reads on into the next file, but not across files under `-s`.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("in"), "1\n2\n3\n").unwrap();
+		for (args, expected) in [
+			(&["n;n;n;s/^/X/", "in", "in"][..], "1\n2\n3\nX1\n2\n3\n"),
+			(&["-s", "n;n;n;s/^/X/", "in", "in"][..], "1\n2\n3\n1\n2\n3\n"),
+		] {
+			assert_eq!(sed_in(dir.path(), args, ""), (0, expected.to_owned()), "{args:?}");
+		}
+	}
+
+	#[test]
+	fn builtin_reads_a_comment_after_a_command() {
+		// GNU sed 4.9 ends a command, and a label, at a `#`, which starts a
+		// comment; a jump to a label no `:` defines exits 4.
+		let root = std::path::Path::new("/");
+		for (args, expected, status) in [
+			(&["p#c"][..], "a\na\nb\nb\n", 0),
+			(&["d#c"][..], "", 0),
+			(&["2q#c"][..], "a\nb\n", 0),
+			(&["2q5#c"][..], "a\nb\n", 5),
+			(&["y/a/A/#c"][..], "A\nb\n", 0),
+			(&["-n", "p # c"][..], "a\nb\n", 0),
+			(&["-n", "$=#c"][..], "2\n", 0),
+			(&["-n", "l 3#c"][..], "a$\nb$\n", 0),
+			(&["-n", "s/a/X/p#c"][..], "X\n", 0),
+			(&["-n", "s/a/X/gp # c"][..], "X\n", 0),
+			(&["-n", "/a/{p}#c"][..], "a\n", 0),
+			(&["-n", "1{p}#c"][..], "a\n", 0),
+			(&["-n", ":a#c"][..], "", 0),
+			(&["-n", "ba#c"][..], "", 4),
+			(&["-n", "/b/ba#c"][..], "", 4),
+			(&["-n", ":a#c\ns/a/X/;ta;p"][..], "X\nb\n", 0),
+			(&["-n", "/b/ba#c\np;:a"][..], "a\n", 0),
+			(&["-n", ":a+b\ns/a/X/;ta+b;p"][..], "X\nb\n", 0),
+		] {
+			assert_eq!(sed_in(root, args, "a\nb\n"), (status, expected.to_owned()), "{args:?}");
+		}
+	}
+
+	#[test]
+	fn builtin_lists_each_byte_of_a_utf8_character_in_octal() {
+		// GNU sed 4.9, in the C and the C.UTF-8 locale alike: `printf
+		// 'caf\303\251 ok\n' | sed -n l` prints `caf\303\251 ok$`, and folding
+		// at a width parts the escapes without splitting one.
+		let root = std::path::Path::new("/");
+		for (script, expected) in [("l", "caf\\303\\251 ok$\n"), ("l 5", "caf\\\n\\303\\\n\\251\\\n ok$\n")] {
+			assert_eq!(sed_in(root, &["-n", script], "caf\u{e9} ok\n"), (0, expected.to_owned()), "{script}");
+		}
+	}
+
+	#[test]
+	fn builtin_r_ends_a_last_line_left_without_newline() {
+		// GNU sed 4.9 writes the newline a last line lacks before the text of
+		// `r`, even where the file is missing; `N` with no next line prints
+		// the pattern space before that text.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("f"), "x\n").unwrap();
+		for (script, expected) in
+			[("r f", "a\nx\n"), ("$!N;r f", "a\nx\n"), ("r nonexistent", "a\n"), ("1r f\nN", "a\nx\n")]
+		{
+			assert_eq!(sed_in(dir.path(), &[script], "a"), (0, expected.to_owned()), "{script}");
+		}
+	}
+
+	#[test]
+	fn builtin_negated_bracket_holds_no_newline_under_m() {
+		// GNU sed 4.9: under `M` a negated bracket expression matches no
+		// newline, `-z` or not; without `M` it does.
+		let root = std::path::Path::new("/");
+		for (args, input, expected) in [
+			(&["N;N;s/[^x]*$/X/M"][..], "a\nb\nc\n", "X\nb\nc\n"),
+			(&["N;s/[^a]/X/Mg"][..], "ab\nba\n", "aX\nXa\n"),
+			(&["N;s/[^[:alpha:]]/X/Mg"][..], "a1\n2b\n", "aX\nXb\n"),
+			(&["-E", "N;s/[^x]+/X/Mg"][..], "ab\ncd\n", "X\nX\n"),
+			(&["N;s/[^x]*/X/M2"][..], "ab\ncd\n", "ab\nX\n"),
+			(&["-z", "N;s/[^x]*/X/Mg"][..], "a\nb\0c\nd\0", "X\nX\0X\nX\0"),
+			(&["N;s/\\W/X/Mg"][..], "a b\nc\n", "aXbXc\n"),
+			(&["N;s/[^\\n]/X/Mg"][..], "ab\ncd\n", "XX\nXX\n"),
+			(&["N;s/[^a]/X/g"][..], "ab\nba\n", "aXXXa\n"),
+		] {
+			assert_eq!(sed_in(root, args, input), (0, expected.to_owned()), "{args:?}");
+		}
+	}
+
+	#[test]
+	fn builtin_keeps_a_last_line_without_newline() {
+		// GNU sed 4.9 leaves the newline a last line lacks missing through
+		// `w`, `N` with no next line and `-s`, and writes it before the next
+		// line written to the same output.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("nb"), "a\nb").unwrap();
+		std::fs::write(dir.path().join("nd"), "c\nd").unwrap();
+		std::fs::write(dir.path().join("f"), "x\n").unwrap();
+		for (args, stdin, expected) in [
+			(&["N"][..], "a\nb\nc", "a\nb\nc"),
+			(&["N"][..], "a", "a"),
+			(&["-n", "w /dev/stdout"][..], "a\nb", "a\nb"),
+			(&["w /dev/stdout"][..], "a\nb", "a\na\nbb"),
+			(&["p;w /dev/stdout"][..], "a", "aa\na"),
+			(&["", "nb", "nd"][..], "", "a\nb\nc\nd"),
+			(&["-s", "", "nb", "nd"][..], "", "a\nb\nc\nd"),
+			(&["-s", "N", "nb", "nd"][..], "", "a\nb\nc\nd"),
+			(&["-s", "$!N", "nb", "nd"][..], "", "a\nb\nc\nd"),
+			(&["-s", "N;N;N", "nb", "nd"][..], "", "a\nb\nc\nd"),
+			(&["w /dev/stdout", "nb", "nd"][..], "", "a\na\nbb\nc\n\nc\ndd"),
+			(&["-s", "0r f", "nb", "nd"][..], "", "x\na\nbx\n\nc\nd"),
+		] {
+			assert_eq!(sed_in(dir.path(), args, stdin), (0, expected.to_owned()), "{args:?}");
+		}
+		for (args, stdin, expected) in [
+			(&["-n", "w o"][..], "a\nb", "a\nb"),
+			(&["-n", "s/b/X/w o"][..], "a\nb", "X"),
+			(&["-s", "-n", "w o", "nb", "nd"][..], "", "a\nb\nc\nd"),
+		] {
+			assert_eq!(sed_in(dir.path(), args, stdin), (0, String::new()), "{args:?}");
+			assert_eq!(std::fs::read_to_string(dir.path().join("o")).unwrap(), expected, "{args:?}");
+		}
 	}
 }

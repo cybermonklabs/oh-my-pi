@@ -43,6 +43,12 @@
 - `sed` finds an empty match inside a character beside a back-reference too, as GNU sed does: `s/\(x\)*\1*/-/g` on `café` prints `-c-a-f-\303-\251-`
 - `sed -z` reads and writes lines ended by a NUL, as GNU sed does, where it ignored `-z`: `$`, `N`, `G`, `H`, `D`, `P`, `=`, `i`, `c`, `l`, `w`, `-i` and the `^` and `$` of the `M` flag follow the NUL, and `a` ends its text with a newline
 - `sed`'s `l` lists a newline inside the pattern space as `\n`, as GNU sed does (`N;l` on `x` and `y` prints `x\ny$`), where it ended the listed line there
+- `sed`'s `n` prints the pattern space and goes on with the script on the next line, as GNU sed does (`printf 'a\nb\nc\n' | sed 'n;d'` prints `a` and `c`), where it ended the cycle and started the script again
+- `sed` accepts a `#` comment right after a command or a label (`p#c`, `s/a/X/gp # c`, `/a/{p}#c`, `:a#c`), where it refused it with `extra characters at the end of the p command`, reads a label as GNU sed does (`:a+b`), and exits 4 for a jump to a label no `:` defines
+- `sed`'s `l` lists each byte of a UTF-8 character in octal, as GNU sed does (`é` is `\303\251`), where it printed `\u00E9`
+- `sed`'s `r` writes the newline a last line lacks before the file's text, as GNU sed does (`printf 'a' | sed 'r f'` prints `a`, a newline and the file)
+- `sed`'s `M` flag keeps a negated bracket expression such as `[^x]` from matching a newline, as GNU sed does (`N;s/[^a]/X/Mg` on `ab` and `ba` prints `aX` and `Xa`)
+- `sed` keeps a last line's missing newline missing through `w` and `w /dev/stdout`, through `N` with no line left to read, and under `-s`, and writes it before the next line printed, the next file's too, as GNU sed does
 
 ### Added
 

@@ -3387,9 +3387,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			},
 		});
-		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
-			this.#recordSessionExit(reason);
-		});
+		// A signal exit waits, within the cleanup deadline, for the record to reach the store.
+		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason =>
+			this.#recordSessionExit(reason),
+		);
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
 			const sessionId = this.sessionManager.getSessionId();
 			// `--resume <id>` fails on a session that never reached disk (issue #8860), or whose
@@ -4515,7 +4516,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
 	}
 
-	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
+	/**
+	 * Append the exit record and flush it. On a storage that only queues the
+	 * publish (SQL), the returned promise settles once the store has the record,
+	 * and only then is it logged as recorded.
+	 */
+	#recordSessionExit(reason: postmortem.Reason | "dispose"): Promise<void> | undefined {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
 		// A pending call is always in the interrupted tail, after the cut: older bodies stay unread.
@@ -4540,9 +4546,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			recordedAt: new Date().toISOString(),
 		};
 		if (pendingToolCalls.length > 0) data.pendingToolCalls = pendingToolCalls;
-		try {
-			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
-			this.sessionManager.flushSync();
+		const recorded = (): void => {
 			// Only pending tool calls or an abnormal teardown are noteworthy; a
 			// clean dispose logs at debug so routine exits don't read as problems.
 			const exitLog = pendingToolCalls.length > 0 || kind !== "normal" ? logger.warn : logger.debug;
@@ -4553,13 +4557,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				kind,
 				pendingToolCalls: pendingToolCalls.length,
 			});
-		} catch (error) {
+		};
+		const failed = (error: unknown): void => {
 			logger.error("Failed to record session exit", {
 				sessionId: this.sessionManager.getSessionId(),
 				sessionFile: this.sessionManager.getSessionFile(),
 				reason,
 				error: error instanceof Error ? error.message : String(error),
 			});
+		};
+		try {
+			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
+			const stored = this.sessionManager.flushSyncThenConfirm();
+			if (stored) return stored.then(recorded, failed);
+			recorded();
+		} catch (error) {
+			failed(error);
 		}
 	}
 
@@ -7485,7 +7498,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#cacheWarmer.onRefreshEnd = undefined;
 			this.#cacheWarmer.cancel();
 		}
-		this.#recordSessionExit(options.reason ?? "dispose");
+		// The store confirms it by the time the close below has drained the writes.
+		void this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
 		this.#cancelFatalRecoveryHint?.();
