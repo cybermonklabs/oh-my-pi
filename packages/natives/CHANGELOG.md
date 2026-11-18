@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `omp worktree clear` deleting the registration of a locked worktree whose checkout it could not see, such as one on a disk mounted only on another machine; like `git worktree prune`, it now keeps locked registrations, and treats a dangling link where a checkout's `.git` or the `locked` file was as something there
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
