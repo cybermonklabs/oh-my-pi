@@ -1588,16 +1588,11 @@ export class ModelRegistry {
 		return this.#models;
 	}
 
-	/** Load built-in models, applying provider-level overrides only.
-	 *  Per-model overrides are applied later by #applyModelOverrides. */
-	#loadBuiltInModels(overrides: Map<string, ProviderOverride>, providerFilter?: ReadonlySet<string>): Model<Api>[] {
-		return runToCompletion(this.#builtInModelSteps(overrides, providerFilter));
-	}
-
 	/**
-	 * {@link #loadBuiltInModels} with one slice unit per model that a provider
-	 * override rebuilds: an override on a large catalog rebuilds every model
-	 * through the rule cascade.
+	 * Load built-in models, applying provider-level overrides only; per-model
+	 * overrides are applied later by #applyModelOverrides. One slice unit per
+	 * model that a provider override rebuilds: an override on a large catalog
+	 * rebuilds every model through the rule cascade.
 	 */
 	*#builtInModelSteps(
 		overrides: Map<string, ProviderOverride>,
@@ -1838,7 +1833,6 @@ export class ModelRegistry {
 		return { models: cachedModels, authoritativeFresh: cache.fresh && cache.authoritative, discoveryState };
 	}
 
-	/** Records a provider slice that {@link #cachedStandardProviderSteps} read. */
 	#commitCachedStandardProvider(providerId: string, slice: CachedStandardProviderSlice): void {
 		if (slice.discoveryState) this.#providerDiscoveryStates.set(providerId, slice.discoveryState);
 		if (!slice.models) return;
