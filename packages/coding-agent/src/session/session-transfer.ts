@@ -30,9 +30,8 @@ import {
 	type ArchiveMemberContent,
 	ArchiveError,
 	assertInMemorySize,
-	assertValidRange,
-	type ByteSource,
 	formatArchivePathForError,
+	heldFileSource,
 	openArchive,
 	writeChunksToFile,
 	writeTarArchive,
@@ -487,28 +486,6 @@ function blobMemberHash(name: string): string | undefined {
 	if (!name.startsWith(BLOBS_PREFIX)) return undefined;
 	const hash = name.slice(BLOBS_PREFIX.length);
 	return BLOB_HASH_RE.test(hash) ? hash : undefined;
-}
-
-/**
- * The file `handle` holds open, as an archive byte source: every read goes to
- * the file the handle opened, so a file renamed over its path meanwhile is
- * never read.
- */
-async function heldFileSource(handle: fs.promises.FileHandle): Promise<ByteSource> {
-	const { size } = await handle.stat();
-	return {
-		size,
-		async read(start, end) {
-			assertValidRange(start, end);
-			const bytes = new Uint8Array(end - start);
-			for (let filled = 0; filled < bytes.length;) {
-				const { bytesRead } = await handle.read(bytes, filled, bytes.length - filled, start + filled);
-				if (bytesRead === 0) throw new ArchiveError("Invalid archive: truncated data");
-				filled += bytesRead;
-			}
-			return bytes;
-		},
-	};
 }
 
 /**

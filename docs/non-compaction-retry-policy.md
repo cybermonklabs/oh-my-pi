@@ -130,7 +130,9 @@ Backoff sequence with default settings, before jitter:
 
 The actual local sleep is 75–100% of the nominal value, matching Anthropic-style retry jitter so concurrent sessions do not retry in lockstep.
 
-Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Without provider timing, recognized concurrency/rate-limit reasons can impose their own wait windows. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the capped local delay.
+Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Without provider timing, recognized concurrency/rate-limit reasons can impose their own wait windows; such a window is a guess, not a stated wait, so it never runs past `retry.maxDelayMs`. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the capped local delay.
+
+A rate limit (an HTTP 429 that is not a usage limit) that ends a text-only turn after its text is on screen cannot send the turn again. It waits as any rate limit does, then continues the answer on the same model with a developer reminder (`prompts/system/rate-limit-continue.md`); each attempt counts against `retry.maxRetries`, and a stated wait past `retry.maxDelayMs` or spent attempts end the turn with the provider's error. That retry never walks `retry.fallbackChains`, also when a continuation is refused before it streams anything.
 
 If the delay exceeds `retry.maxDelayMs` and no switch succeeds, retry normally fails immediately. `retry.waitForUsageReset: true` permits a longer usage-limit wait only when timing is authoritative (parsed provider reset timing or a complete usage-report future reset), not a guessed exhaustion backoff. Long waits remain abortable and are chunked to avoid timer overflow; they also hold unattended/subagent runs.
 

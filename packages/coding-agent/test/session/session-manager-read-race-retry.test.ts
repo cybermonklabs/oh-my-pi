@@ -220,16 +220,20 @@ describe("a session manager's load that a full rewrite races", () => {
 
 		const manager = await SessionManager.open(FILE, path.dirname(FILE), storage, { suppressBreadcrumb: true });
 
+		const entries = manager.getEntries();
 		expect({
-			entries: manager
-				.getEntries()
-				.map(entry => [entry.id, entry.parentId, entry.type === "custom" ? String(entry.data).charAt(0) : ""]),
+			entries: entries.map(entry => [entry.id, entry.parentId]),
+			// The fill of the pad, which tells the two bodies apart.
+			pads: entries.flatMap(entry =>
+				entry.type === "custom" && entry.customType === "pad" ? [String(entry.data).charAt(0)] : [],
+			),
 			passes: storage.passes,
 		}).toEqual({
 			entries: [
-				["p0", null, "i"],
-				["n1", "p0", "u"],
+				["p0", null],
+				["n1", "p0"],
 			],
+			pads: ["i"],
 			passes: 5,
 		});
 		await manager.close();

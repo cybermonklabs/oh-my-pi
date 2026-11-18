@@ -144,7 +144,6 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
-	RACED_READ_RETRIES,
 	retryRacedRead,
 	SessionReadConflictError,
 	type SessionStorage,
@@ -1094,6 +1093,30 @@ export class ForkSourceNotFoundError extends Error {
 	constructor(sourcePath: string) {
 		super(`Session "${sourcePath}" not found.`);
 		this.name = "ForkSourceNotFoundError";
+	}
+}
+
+/**
+ * A count of a transcript's entries toward its "unindexed" verdict: it has
+ * non-header entries and none of them has an id, so it may predate ids
+ * altogether (see migrateToCurrentVersion).
+ */
+class UnindexedCount {
+	#sawEntry = false;
+	#sawId = false;
+
+	/** Counts `entry`; true when it is a non-header entry with an id, which settles the verdict as false. */
+	add(entry: FileEntry): boolean {
+		if (entry.type === "session") return false;
+		this.#sawEntry = true;
+		if (lacksEntryId(entry)) return false;
+		this.#sawId = true;
+		return true;
+	}
+
+	/** The verdict on the entries counted so far. */
+	get unindexed(): boolean {
+		return this.#sawEntry && !this.#sawId;
 	}
 }
 
@@ -2122,7 +2145,7 @@ export class SessionManager {
 				}
 				if (this.#diskEpoch !== epoch) {
 					try {
-						// Another writer's full write can cut the read-back off mid-read; read it again whole.
+						// Another writer's full write can cut the read-back off mid-read; it streams again from its start.
 						const landed = await retryRacedRead(() =>
 							chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body),
 						);
@@ -2869,26 +2892,24 @@ export class SessionManager {
 	 *
 	 * A full rewrite or delete that replaced the transcript mid-read
 	 * (`SessionReadConflictError`) makes the whole load run again from its
-	 * start, at most {@link RACED_READ_RETRIES} more times before the error
+	 * start, as often as {@link retryRacedRead} allows before the error
 	 * surfaces: each pass builds its entries and its cold store afresh, and a
 	 * pass that throws closes the store it opened, so nothing of it reaches
 	 * the next one.
 	 */
-	async #loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
-		// A current-version file whose first entry has no id may predate ids
-		// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
-		let unindexed: boolean | undefined;
-		for (let retries = 0; ;) {
-			try {
+	#loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
+		return retryRacedRead(async () => {
+			// A current-version file whose first entry has no id may predate ids
+			// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
+			// Each pass learns it afresh: what a raced read found of the transcript
+			// says nothing about the one read next.
+			let unindexed: boolean | undefined;
+			for (;;) {
 				const loaded = await this.#streamTranscript(filePath, options, unindexed);
 				if (loaded) return loaded;
 				unindexed = await this.#transcriptIsUnindexed(filePath, options);
-			} catch (error) {
-				if (!(error instanceof SessionReadConflictError) || retries++ >= RACED_READ_RETRIES) throw error;
-				// What the raced read found of the transcript says nothing about the one read next.
-				unindexed = undefined;
 			}
-		}
+		});
 	}
 
 	/** Visit the transcript at `filePath`, or the copy of it `options.preloaded` already holds. */
@@ -2903,16 +2924,9 @@ export class SessionManager {
 
 	/** Whether `filePath` has non-header entries and none of them has an id. */
 	async #transcriptIsUnindexed(filePath: string, options: TranscriptLoadOptions): Promise<boolean> {
-		let sawEntry = false;
-		let everyEntryLacksId = true;
-		await this.#visitTranscript(filePath, options, entry => {
-			if (entry.type === "session") return;
-			sawEntry = true;
-			if (lacksEntryId(entry)) return;
-			everyEntryLacksId = false;
-			return false;
-		});
-		return sawEntry && everyEntryLacksId;
+		const count = new UnindexedCount();
+		await this.#visitTranscript(filePath, options, entry => !count.add(entry));
+		return count.unindexed;
 	}
 
 	/**
@@ -2920,7 +2934,8 @@ export class SessionManager {
 	 * kept nothing, when `unindexed` is still unknown and the file needs it.
 	 * A known `unindexed` that this pass's own body contradicts came from a
 	 * body another writer replaced between the passes: the pass then fails as
-	 * a raced read (`SessionReadConflictError`), so the load runs again.
+	 * a raced read (`SessionReadConflictError`), so the load runs again. Against
+	 * `unindexed: true` it fails at the first entry with an id.
 	 */
 	async #streamTranscript(
 		filePath: string,
@@ -2931,9 +2946,8 @@ export class SessionManager {
 		let header: SessionHeader | undefined;
 		let migration: SessionEntryMigration | undefined;
 		let needsIndexCheck = false;
-		// What this pass's body says of `unindexed` (see #transcriptIsUnindexed).
-		let sawEntry = false;
-		let everyEntryLacksId = true;
+		// What this pass's body says of a known `unindexed`; an unknown one is not counted.
+		const count = unindexed === undefined ? undefined : new UnindexedCount();
 		let sanitized = false;
 		let repairedUsage = 0;
 		// The entries live only in `intake`, emptied before this returns: an
@@ -2988,10 +3002,8 @@ export class SessionManager {
 					}
 					migration = startMigration(header);
 				}
-				if (raw.type !== "session") {
-					sawEntry = true;
-					if (!lacksEntryId(raw)) everyEntryLacksId = false;
-				}
+				// An entry with an id already contradicts a body without ids.
+				if (count?.add(raw) && unindexed) throw new SessionReadConflictError(filePath);
 				migration.migrate(raw);
 				if (raw.type === "session" && fork) return;
 				let entry = raw as SessionEntry;
@@ -3027,7 +3039,7 @@ export class SessionManager {
 				intake.store?.close();
 				return undefined;
 			}
-			if (unindexed !== undefined && unindexed !== (sawEntry && everyEntryLacksId)) {
+			if (count && count.unindexed !== unindexed) {
 				throw new SessionReadConflictError(filePath);
 			}
 			if (header && !migration) migration = startMigration(header);

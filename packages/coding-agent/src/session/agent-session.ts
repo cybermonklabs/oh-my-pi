@@ -10258,11 +10258,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (options?.nextRun) {
 			for (const message of queued) this.#nextRunSteers.add(message);
 		}
-		const queuedUser = queued.at(-1);
-		if (queuedUser) {
-			if (options?.queueId !== undefined) this.#queuedMessageIds.set(queuedUser, options.queueId);
-			if (options?.onTaken) this.#queuedMessageTaken.set(queuedUser, options.onTaken);
-		}
+		// The group ends in the user message.
+		const queuedUser = queued.at(-1)!;
+		if (options?.queueId !== undefined) this.#queuedMessageIds.set(queuedUser, options.queueId);
+		if (options?.onTaken) this.#queuedMessageTaken.set(queuedUser, options.onTaken);
 		options?.onPromptQueued?.(queued);
 		options?.onPromptAdmitted?.();
 		// joinActiveTurn admission must never start an autonomous turn: the

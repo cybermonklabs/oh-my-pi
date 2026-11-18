@@ -867,7 +867,9 @@ export type RpcSteerSubagentRegistry = Pick<RpcSubagentRegistry, "getSubagents" 
  * accepted.
  *
  * `shutdown` aborts when the RPC session shuts down: a steer still waiting
- * between turns then ends at once, taking its message back.
+ * between turns then takes its message back and answers an error, unless a
+ * run already holds the message; the take-back then waits for that run, and
+ * the steer answers success if the run takes the message.
  */
 export async function handleRpcSteerSubagent(
 	subagentRegistry: RpcSteerSubagentRegistry,
@@ -929,8 +931,11 @@ export async function handleRpcSteerSubagent(
  * first (its result accepted, cancelled, aborted, or its run ended without
  * another turn), or `shutdown` aborts, exactly this message is taken back off
  * the queue, so no later turn delivers it, and the steer answers an error. A
- * message neither taken back nor seen delivered (someone else removed it, or
- * the session is gone) answers an error too.
+ * run that took the message off the queue but not yet into its context holds
+ * it: the take-back waits for that run, and the steer answers success if the
+ * run takes the message, or an error once the take-back removes the message
+ * the run put back. A message neither taken back nor seen delivered (someone
+ * else removed it, or the session is gone) answers an error too.
  */
 async function steerSubagentBetweenTurns(
 	subagentRegistry: RpcSteerSubagentRegistry,

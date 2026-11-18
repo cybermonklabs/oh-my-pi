@@ -358,7 +358,6 @@ describe("agent bridging across subagent workers", () => {
 		await waitFor(() => taken.length === 1);
 		expect(taken).toEqual(["first"]);
 		expect(await probe.settled("W1")).toMatchObject({ steering: [] });
-		expect(taken).toEqual(["first"]);
 	}, 60_000);
 
 	it("queues and takes back a next-run steer on a main-homed session through a worker's peer handle", async () => {
@@ -411,10 +410,10 @@ describe("steer_subagent to a worker-homed subagent idle between turns", () => {
 	}
 
 	it("answers success when the run takes the steer and its executor marks the run ended at once", async () => {
-		// Regression: the subagent's next run takes the steer and its drive ends on
-		// the worker right then, so the parent's take-back and the report that the
-		// run took the message cross the bridge together; a steer that reads the
-		// take-back first tells the host the message was lost although the
+		// Race: the subagent's next run takes the steer and its drive ends on the
+		// worker right then, so the parent's take-back and the report that the
+		// run took the message cross the bridge together. A steer that read the
+		// take-back first would tell the host the message was lost although the
 		// subagent acted on it.
 		const { probe, roster, remote } = await startSubagent();
 		await probe.endRunWhenSteerTaken(id, text);
@@ -458,8 +457,8 @@ describe("steer_subagent to a worker-homed subagent idle between turns", () => {
 	}, 60_000);
 
 	it("answers success when the run starts on the worker the moment the steer is queued", async () => {
-		// Regression: the subagent's next run starts and takes the steer before the
-		// parent hears back that the steer was queued; a steer that followed its
+		// Race: the subagent's next run starts and takes the steer before the
+		// parent hears back that the steer was queued. A steer that followed its
 		// message only from then on would miss the run taking it, and wait until
 		// the subagent stops or tell the host the message was lost.
 		const { probe, roster } = await startSubagent();
