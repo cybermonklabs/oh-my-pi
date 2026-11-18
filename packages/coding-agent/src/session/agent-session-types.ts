@@ -85,7 +85,9 @@ export interface AgentSessionDisposeOptions {
 	/**
 	 * How this dispose ends the jobs the session owns ({@link OwnedJobsEnd}). A dispose that
 	 * names none cuts them off, as `"shutdown"` does: only a path that stops the session
-	 * says `"stop"` (a kill, the release of a subagent whose run a stop or its finish ended).
+	 * says `"stop"` (a kill, which a tombstone release says for its caller; the release of a
+	 * subagent whose run a stop or its finish ended; a `/tan` clone whose job a stop or its
+	 * finish ended).
 	 * Apart from {@link reason}, so the process teardown cuts off an idle subagent's jobs
 	 * while its `session_exit` record stays a plain dispose.
 	 */

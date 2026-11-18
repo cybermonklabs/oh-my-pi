@@ -1212,10 +1212,7 @@ export class CollabHost {
 						await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 					}
 					if (!this.#guestTrafficAllowed() || !this.#guestActionsReady()) return;
-					await AgentLifecycleManager.global().release(agentId, ref, {
-						tombstone: true,
-						dispose: { ownedJobsEnd: "stop" },
-					});
+					await AgentLifecycleManager.global().release(agentId, ref, { tombstone: true });
 				};
 				kill().catch(fail);
 				break;

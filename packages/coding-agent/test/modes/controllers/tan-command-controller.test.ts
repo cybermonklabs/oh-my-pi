@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Model } from "@oh-my-pi/pi-ai";
-import type { AsyncJobRegisterOptions } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import {
+	ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
+	AsyncJobManager,
+	type AsyncJobRegisterOptions,
+} from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
@@ -12,8 +19,11 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { plainTurnAbortReason, turnAbortKind } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 interface CapturedJobRunContext {
 	jobId: string;
@@ -791,5 +801,100 @@ describe("TanCommandController", () => {
 				message.content.some(part => part.type === "text" && part.text === "follow the tangent"),
 		).length;
 		expect(requestCount).toBe(1);
+	});
+});
+
+describe("TanCommandController: the jobs a tan's clone owns", () => {
+	/**
+	 * Runs a tan whose clone (a session on the job manager, as the parent's is) starts a job it
+	 * owns in its turn, as its eval `agent()` handle or background `task` does, and resolves with
+	 * the reason that job aborted with. `endTan` ends the tan's job while the tan waits on the
+	 * clone's job; without it, the clone acknowledged its job's delivery, so the tan finishes
+	 * without waiting for it.
+	 */
+	async function cloneJobAbortReason(endTan?: (tan: AbortController) => void): Promise<unknown> {
+		const harness = createContext({ activeToolNames: [], enabledToolNames: [] });
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected the bundled anthropic/claude-sonnet-4-5 model");
+		const manager = new AsyncJobManager({});
+		const authStorage = createInMemoryAuthStorage();
+		const jobRunning = Promise.withResolvers<void>();
+		const abortReason = Promise.withResolvers<unknown>();
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const cloneId = options?.agentId;
+			const clone = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model: bundledModel, systemPrompt: ["test"], tools: [] },
+					streamFn: createMockModel({ handler: () => ({ content: ["ok"] }) }).stream,
+				}),
+				sessionManager: SessionManager.inMemory(harness.tempDir.path()),
+				settings: Settings.isolated(),
+				modelRegistry: new ModelRegistry(authStorage, path.join(harness.tempDir.path(), "models.yml")),
+				asyncJobManager: manager,
+				agentId: cloneId,
+			});
+			// The clone's tools and its model's turn are not under test: its turn only starts the job.
+			vi.spyOn(clone, "setActiveToolPresentation").mockResolvedValue();
+			vi.spyOn(clone, "prompt").mockImplementation(async () => {
+				const jobId = manager.register(
+					"task",
+					"Reader",
+					async ({ signal }) => {
+						const aborted = Promise.withResolvers<void>();
+						signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+						jobRunning.resolve();
+						await aborted.promise;
+						abortReason.resolve(signal.reason);
+						return "ended";
+					},
+					{ ownerId: cloneId, agentId: "Reader" },
+				);
+				if (!endTan) manager.acknowledgeDeliveries([jobId]);
+				return true;
+			});
+			return { session: clone } as unknown as CreateAgentSessionResult;
+		});
+		try {
+			await new TanCommandController(harness.ctx).start("chase the tangent");
+			const run = harness.capturedRun;
+			if (!run) throw new Error("run function was not captured");
+			const tan = new AbortController();
+			const result = run({ jobId: "job-123", signal: tan.signal, reportProgress: async () => {} });
+			if (endTan) {
+				await jobRunning.promise;
+				endTan(tan);
+			}
+			await result.catch(() => {});
+		} finally {
+			// A job the clone's dispose left running ends here, with the manager's shutdown reason.
+			await manager.dispose({ timeoutMs: 1000 });
+			authStorage.close();
+		}
+		return abortReason.promise;
+	}
+
+	it("stops them when the tan's job is stopped", async () => {
+		// If this regresses, a cancelled `/tan` cuts its clone's jobs off: their subagents are parked with their
+		// turns, as a process exit leaves them, instead of stopping with the tan the user stopped.
+		const reason = await cloneJobAbortReason(tan => tan.abort(plainTurnAbortReason("stop")));
+		expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(turnAbortKind(reason)).toBe("stop");
+	});
+
+	it("cuts them off when the parent's shutdown ends the tan's job", async () => {
+		// If this regresses, the parent's shutdown stops the clone's jobs: their subagents end as stopped work
+		// instead of being parked, as every job a shutdown cuts off is.
+		const reason = await cloneJobAbortReason(tan => tan.abort(ASYNC_JOB_MANAGER_SHUTDOWN_REASON));
+		expect(reason).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+	});
+
+	it("stops the jobs its clone still owns when the tan finishes", async () => {
+		// If this regresses, a finished tan cuts off the jobs its clone did not wait on: their subagents are
+		// parked with their turns, as a process exit leaves them, instead of stopping with the finished tan.
+		const reason = await cloneJobAbortReason();
+		expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(turnAbortKind(reason)).toBe("stop");
 	});
 });

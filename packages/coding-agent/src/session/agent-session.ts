@@ -119,7 +119,7 @@ import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcomp
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { loadAdvisorTranscriptCosts } from "../advisor";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager, type AsyncJobManagerApi } from "../async";
+import { type AsyncJob, AsyncJobManager, type AsyncJobManagerApi } from "../async";
 import { classifyAutoPrewalk } from "../auto-prewalk/classifier";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -394,6 +394,7 @@ import {
 	createInterruptedTurnAbortMessage,
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
+	ownedJobsAbortReason,
 	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
@@ -6692,9 +6693,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// top-level session that owns the manager), cuts them off with the shutdown reason: the
 		// task executor parks (rather than tombstones) their subagents, so `omp --restore` goes
 		// on with them.
-		this.#cancelOwnAsyncJobs(
-			ownedJobsEnd === "stop" ? plainTurnAbortReason("stop") : ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
-		);
+		this.#cancelOwnAsyncJobs(ownedJobsAbortReason(ownedJobsEnd));
 		if (!manager) return;
 
 		try {

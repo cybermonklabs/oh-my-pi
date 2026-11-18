@@ -133,11 +133,15 @@ interface ReopeningAgent {
 
 /** How {@link AgentLifecycleApi.release} ends an agent. */
 export interface AgentReleaseOptions {
-	/** Explicit kill: keep a terminal `aborted` row and persist the kill marker. */
+	/**
+	 * Explicit kill: keep a terminal `aborted` row and persist the kill marker. The kill stops
+	 * the agent's own jobs, so their subagents end with it and `omp --restore` leaves them.
+	 */
 	tombstone?: boolean;
 	/**
 	 * Forwarded to the live session's dispose: the reason its `session_exit` record carries, and
-	 * how its own jobs end (a kill names `ownedJobsEnd: "stop"`; none named cuts them off).
+	 * how its own jobs end. A kill (`tombstone`) stops them unless this names another end; any
+	 * other release that names none cuts them off.
 	 */
 	dispose?: AgentSessionDisposeOptions;
 }
@@ -628,9 +632,9 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * later persisted-subagent scan (e.g. Agent Hub reopen) skips it via its
 	 * `if (!registry.get(id))` guard rather than re-adopting the surviving
 	 * on-disk transcript as a fresh `parked` row. Mirrors
-	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent,
-	 * it does not destroy it: {@link ensureLive} (a message, Hub revive/focus)
-	 * reopens the transcript.
+	 * `finalizeSubagentLifecycle`'s explicit-kill path. The kill stops the agent
+	 * and its own jobs, it does not destroy it: {@link ensureLive} (a message, Hub
+	 * revive/focus) reopens the transcript.
 	 */
 	async release(id: string, expected?: AgentRefExpectation, options?: AgentReleaseOptions): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
@@ -680,7 +684,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			// dispose the captured session, even when tombstone persistence fails.
 			if (live) {
 				try {
-					await live.dispose(options?.dispose);
+					await live.dispose(options?.tombstone ? { ownedJobsEnd: "stop", ...options.dispose } : options?.dispose);
 				} catch (error) {
 					logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
 				}

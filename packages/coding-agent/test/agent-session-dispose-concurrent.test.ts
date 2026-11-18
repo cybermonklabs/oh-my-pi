@@ -104,10 +104,9 @@ describe("AgentSession concurrent disposal", () => {
 
 	it("propagates a stop for a subagent's kill dispose so nested children stay terminal", async () => {
 		// A subagent session leaves `ownedAsyncJobManager` undefined and inherits
-		// the shared manager. The dispose of an explicit hard kill
-		// (`release({ tombstone: true, dispose: { ownedJobsEnd: "stop" } })`) must NOT
-		// tag its owned jobs as shutdown, or nested children would be rediscovered as
-		// parked instead of terminal.
+		// the shared manager. The dispose of an explicit hard kill (`release({ tombstone: true })`,
+		// which disposes with `ownedJobsEnd: "stop"`) must NOT tag its owned jobs as shutdown, or
+		// nested children would be rediscovered as parked instead of terminal.
 		const shared = new AsyncJobManager({ maxRunningJobs: 1 });
 		const started = Promise.withResolvers<void>();
 		let abortReason: unknown;

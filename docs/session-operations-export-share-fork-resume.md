@@ -565,7 +565,9 @@ result:
   running: its parent's process exit or shutdown (which also cuts off the jobs that
   a follow-up or IRC wake turn of an idle subagent started), or its park. A vibe
   worker's turn and its own jobs end the same way: its parent's teardown cuts them
-  off, and a switch of the parent session stops them. `--restore`
+  off, and a switch of the parent session stops them. A `/tan` clone's own jobs
+  follow its background job: a cancel of the job, or the tan's finish, stops them,
+  and the parent's shutdown cuts them off. `--restore`
   also leaves every subagent under a subagent that was killed or whose last turn a
   stop ended (the user's interrupt, or "Retry cancelled"), even one that a cancel
   without a reason cut off. The session itself is no such ancestor: its own stop

@@ -98,7 +98,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
 import {
 	INTERRUPTED_TURN_ERROR,
-	plainTurnAbortReason,
+	ownedJobsAbortReason,
 	type TurnAbortKind,
 	turnAbortKind,
 } from "../session/exit-diagnostics";
@@ -2461,10 +2461,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
-		ownedJobsAbortReason: () => {
-			const endKind = runEndKind();
-			return endKind === "shutdown" ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason(endKind);
-		},
+		ownedJobsAbortReason: () => ownedJobsAbortReason(runEndKind()),
 		isAbortedRun: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -3768,10 +3765,9 @@ export async function finalizeSubagentLifecycle(args: {
 	// process exit, so `omp --restore` goes on with the turn the shutdown cut off.
 	// An explicit kill (Agent Hub, RPC `cancel_subagent`, collab, vibe) publishes
 	// the `aborted` tombstone before the run observes its abort, and stays terminal.
-	// The run's end already reaped the session's own jobs (the monitor's
-	// `ownedJobsAbortReason`); each dispose below ends any it still owns the same way:
-	// a shutdown cuts them off, and every other end of the run (a kill, a stop, its own
-	// limit, a finished run) stops them.
+	// The run's end already reaped the session's own jobs with its end kind (the monitor's
+	// `ownedJobsAbortReason`). Each dispose below stops any job the session started after
+	// that reap, except that a shutdown cuts it off.
 	const stopDispose: AgentSessionDisposeOptions = { ownedJobsEnd: "stop" };
 	const resumableAbort =
 		args.abortKind !== "shutdown" && args.keepAlive && args.reviveSession !== null && ref?.status !== "aborted";
@@ -3795,7 +3791,7 @@ export async function finalizeSubagentLifecycle(args: {
 				// decision is durable and a restart cannot rediscover the transcript
 				// as a revivable parked agent.
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true, dispose: stopDispose });
+					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
 				} catch (error) {
 					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
 					registry.setStatus(args.id, "aborted", ref);

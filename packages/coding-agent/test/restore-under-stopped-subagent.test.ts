@@ -219,8 +219,12 @@ async function openParentWithPlanner(options: { readerOnWake?: boolean } = {}) {
 		id: "planner-model",
 		handler: context => {
 			if (!(context.tools ?? []).some(tool => tool.name === "eval")) return { content: ["label"] };
-			const woken = context.messages.some(message => JSON.stringify(message).includes(WAKE_MESSAGE));
-			if (options.readerOnWake && !woken) return { content: ["Ready."] };
+			if (
+				options.readerOnWake &&
+				!context.messages.some(message => JSON.stringify(message).includes(WAKE_MESSAGE))
+			) {
+				return { content: ["Ready."] };
+			}
 			if (!context.messages.some(message => message.role === "toolResult")) {
 				return { content: [READER_CELL], stopReason: "toolUse" };
 			}
@@ -614,7 +618,31 @@ describe("a subagent session's dispose ends the jobs it owns as the dispose says
 		cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
 		const { session, abortReason } = await subagentOwningJob(manager);
 		await session.dispose({ ownedJobsEnd: "stop" });
-		expect(turnAbortKind(await abortReason)).toBe("stop");
+		// `turnAbortKind` reads the shutdown symbol as a stop too, so the reason must not be the shutdown's.
+		const reason = await abortReason;
+		expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(turnAbortKind(reason)).toBe("stop");
+	});
+
+	it("stops them when a kill releases it with a tombstone", async () => {
+		// If this regresses, the Agent Hub's kill (a release that writes the kill's tombstone and names no kind) cuts
+		// the killed subagent's jobs off: the task executor parks their subagents, which keep their turns as a
+		// process exit leaves them, instead of stopping them with the subagent the user killed.
+		const manager = new AsyncJobManager({});
+		cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
+		const { session, abortReason } = await subagentOwningJob(manager);
+		const ref = AgentRegistry.global().register({
+			id: "Planner",
+			displayName: PLANNER.name,
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session,
+			status: "idle",
+		});
+		await AgentLifecycleManager.global().release("Planner", ref, { tombstone: true });
+		const reason = await abortReason;
+		expect(reason).not.toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
+		expect(turnAbortKind(reason)).toBe("stop");
 	});
 
 	it("shuts them down when the dispose is for the process exit", async () => {

@@ -25,12 +25,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import {
-	ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
-	type AsyncJob,
-	type AsyncJobManagerApi,
-	type AsyncJobRunResult,
-} from "../async/job-manager";
+import type { AsyncJob, AsyncJobManagerApi, AsyncJobRunResult } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
@@ -40,7 +35,7 @@ import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with {
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { OwnedJobsEnd } from "../session/agent-session-types";
-import { plainTurnAbortReason } from "../session/exit-diagnostics";
+import { ownedJobsAbortReason, plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -1038,7 +1033,7 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManagerApi | undefined,
 		end: OwnedJobsEnd,
 	): Promise<number> {
-		const turnAbortReason = end === "shutdown" ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : plainTurnAbortReason("stop");
+		const turnAbortReason = ownedJobsAbortReason(end);
 		const records = [...this.#records.values()].filter(record => matchesScope(record, scope));
 		const teardown = records.map(record => ({
 			record,

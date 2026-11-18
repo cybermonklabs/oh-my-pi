@@ -1,5 +1,6 @@
 import { createSyntheticToolResultMessage, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON } from "../async/job-manager";
 import type { SessionEntry } from "./session-entries";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
@@ -311,6 +312,17 @@ export function plainTurnAbortReason(kind: TurnAbortKind): DOMException {
 	const reason: DOMException = controller.signal.reason;
 	Object.defineProperty(reason, TURN_ABORT_KIND_FIELD, { value: kind, configurable: true });
 	return reason;
+}
+
+/**
+ * The reason the jobs a session owns abort with as it ends, whose kind a subagent of
+ * each job reads: a stop or a cut-off marks the platform's own abort reason with it
+ * ({@link plainTurnAbortReason}); a shutdown, and an end that names no kind, give the
+ * job manager's shutdown reason, which cuts them off, so the task executor parks their
+ * subagents and `omp --restore` goes on with them.
+ */
+export function ownedJobsAbortReason(end: "shutdown" | TurnAbortKind | undefined): unknown {
+	return end === "stop" || end === "cutOff" ? plainTurnAbortReason(end) : ASYNC_JOB_MANAGER_SHUTDOWN_REASON;
 }
 
 /**

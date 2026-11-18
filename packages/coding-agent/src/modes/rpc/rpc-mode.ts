@@ -805,10 +805,7 @@ export async function handleRpcCancelSubagent(
 	// tombstone write is reported here instead of escaping as an unhandled
 	// rejection while the abort is pending.
 	const [released, aborted] = await Promise.allSettled([
-		AgentLifecycleManager.global().release(subagentId, owned.ref, {
-			tombstone: true,
-			dispose: { ownedJobsEnd: "stop" },
-		}),
+		AgentLifecycleManager.global().release(subagentId, owned.ref, { tombstone: true }),
 		owned.session.abort({ reason: USER_INTERRUPT_LABEL }),
 	]);
 	if (released.status === "rejected") throw released.reason;
