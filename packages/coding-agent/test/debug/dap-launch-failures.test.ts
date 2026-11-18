@@ -15,6 +15,8 @@ import type {
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
+import { drive } from "../helpers/fake-clock";
+import { dialAndHold, livenessListener } from "../helpers/liveness-listener";
 
 const TEST_ADAPTER: DapResolvedAdapter = {
 	name: "lldb-dap",
@@ -207,6 +209,26 @@ class FakeDapClient {
 afterEach(() => {
 	vi.restoreAllMocks();
 });
+
+/**
+ * An adapter that never opens the endpoint a socket-mode client waits for. It dials the
+ * returned listener as soon as it runs, then sleeps: `started` resolves on that connection,
+ * and `exited` when the connection closes, which only the process's death does.
+ */
+async function wedgedAdapter(cwd: string, name: string) {
+	const liveness = livenessListener();
+	const script = path.join(cwd, `${name}.mjs`);
+	await fs.writeFile(script, dialAndHold(liveness.port));
+	const adapter: DapResolvedAdapter = {
+		...TEST_ADAPTER,
+		name,
+		command: process.execPath,
+		args: [script],
+		resolvedCommand: process.execPath,
+		connectMode: "socket",
+	};
+	return { adapter, started: liveness.started, exited: liveness.exited, [Symbol.dispose]: liveness[Symbol.dispose] };
+}
 
 describe("DAP launch failure handling", () => {
 	it("preserves adapter launchDefaults args when launch omits args", async () => {
@@ -523,38 +545,26 @@ describe("DAP launch failure handling", () => {
 		}
 	});
 
+	// The readiness waits below run on a faked clock: their timeout can only run out after the
+	// adapter has started, however long the machine's load makes its start take. The adapter's
+	// death is read from its connection closing, not from a sleep.
 	it("kills the detached adapter process when the Unix socket never appears (Linux)", async () => {
 		if (process.platform !== "linux") return;
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-unix-leak-"));
 		try {
-			const adapterPath = path.join(cwd, "wedged-unix-adapter.mjs");
-			const pidFilePath = path.join(cwd, "adapter.pid");
-			// Adapter records its pid and stays alive without ever creating the
-			// socket, forcing #spawnSocketUnix's readiness wait to time out.
-			await fs.writeFile(
-				adapterPath,
-				`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-			);
-			const adapter: DapResolvedAdapter = {
-				...TEST_ADAPTER,
-				name: "wedged-unix-adapter",
-				command: process.execPath,
-				args: [adapterPath],
-				resolvedCommand: process.execPath,
-				connectMode: "socket",
-			};
-			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(/Socket not ready/);
-			// Wait for the kill signal to propagate to the detached adapter.
-			await Bun.sleep(500);
-			const adapterPid = Number(await Bun.file(pidFilePath).text());
-			expect(Number.isFinite(adapterPid)).toBe(true);
-			let alive = true;
+			using wedged = await wedgedAdapter(cwd, "wedged-unix-adapter");
+			vi.useFakeTimers();
 			try {
-				process.kill(adapterPid, 0);
-			} catch {
-				alive = false;
+				const spawned = DapClient.spawn({ adapter: wedged.adapter, cwd, socketReadyTimeoutMs: 300 });
+				await wedged.started;
+				// The faked clock moves only while the spawn is pending, so its readiness timeout runs out
+				// once the test lets it, however slowly the machine runs.
+				await drive(spawned).catch(() => undefined);
+				await expect(spawned).rejects.toThrow(/Socket not ready/);
+			} finally {
+				vi.useRealTimers();
 			}
-			expect(alive).toBe(false);
+			await wedged.exited;
 		} finally {
 			await removeWithRetries(cwd);
 		}
@@ -566,33 +576,17 @@ describe("DAP launch failure handling", () => {
 		try {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-tcp-leak-"));
 			try {
-				const adapterPath = path.join(cwd, "wedged-tcp-adapter.mjs");
-				const pidFilePath = path.join(cwd, "adapter.pid");
-				await fs.writeFile(
-					adapterPath,
-					`await Bun.write(${JSON.stringify(pidFilePath)}, String(process.pid));\nawait Bun.sleep(60_000);\n`,
-				);
-				const adapter: DapResolvedAdapter = {
-					...TEST_ADAPTER,
-					name: "wedged-tcp-adapter",
-					command: process.execPath,
-					args: [adapterPath],
-					resolvedCommand: process.execPath,
-					connectMode: "socket",
-				};
-				await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(
-					/did not connect within/,
-				);
-				await Bun.sleep(500);
-				const adapterPid = Number(await Bun.file(pidFilePath).text());
-				expect(Number.isFinite(adapterPid)).toBe(true);
-				let alive = true;
+				using wedged = await wedgedAdapter(cwd, "wedged-tcp-adapter");
+				vi.useFakeTimers();
 				try {
-					process.kill(adapterPid, 0);
-				} catch {
-					alive = false;
+					const spawned = DapClient.spawn({ adapter: wedged.adapter, cwd, socketReadyTimeoutMs: 300 });
+					await wedged.started;
+					await drive(spawned).catch(() => undefined);
+					await expect(spawned).rejects.toThrow(/did not connect within/);
+				} finally {
+					vi.useRealTimers();
 				}
-				expect(alive).toBe(false);
+				await wedged.exited;
 			} finally {
 				await removeWithRetries(cwd);
 			}

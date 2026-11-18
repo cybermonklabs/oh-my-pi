@@ -1,5 +1,6 @@
-//! Test-only in-memory `mem://` provider, so walks and searches run through a
-//! non-native [`Fs`] with URL roots.
+//! Test-only helpers: an in-memory `mem://` provider, so walks and searches
+//! run through a non-native [`Fs`] with URL roots; the symlink-swap tree
+//! ([`SwapTree`]); and [`settle`] for the listing cache.
 
 use std::{
 	collections::BTreeMap,
@@ -287,4 +288,178 @@ impl FileSystem for MemFs {
 			.collect();
 		Ok(ReadDir::from_entries(entries))
 	}
+
+	/// Removes a non-directory, a symlink itself; ancestor symlinks are
+	/// followed.
+	async fn remove_file(&self, path: &Path) -> io::Result<()> {
+		let mut tree = self.tree.lock();
+		let (real, node) = tree.lookup(path, false)?;
+		if matches!(node.kind, Kind::Dir) {
+			return Err(pi_vfs::is_a_directory());
+		}
+		tree.nodes.remove(&real);
+		Ok(())
+	}
+
+	/// Removes an empty directory; ancestor symlinks are followed.
+	async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+		let mut tree = self.tree.lock();
+		let (real, node) = tree.lookup(path, false)?;
+		if !matches!(node.kind, Kind::Dir) {
+			return Err(pi_vfs::not_a_directory());
+		}
+		if tree
+			.nodes
+			.keys()
+			.any(|child| pi_vfs::parent_path(child) == Some(real.as_path()))
+		{
+			return Err(io::ErrorKind::DirectoryNotEmpty.into());
+		}
+		tree.nodes.remove(&real);
+		Ok(())
+	}
+}
+
+/// Lets every stamp in a tree age past the listing cache's racy window.
+pub fn settle() {
+	std::thread::sleep(Duration::from_millis(120));
+}
+
+/// What the directory a [`SwapTree`] swap links to holds.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outside {
+	/// Case A: only `secret-<tag>.txt`, a name the walk never listed, so
+	/// reading it needs the walk to descend into the swapped link.
+	OtherName,
+	/// Case B: `decoy-<tag>.txt`, the name of the listed file, so reading it
+	/// needs only the file's open to pass through the link.
+	SameName,
+}
+
+/// A tree for the symlink-swap tests, under a fresh temporary base:
+/// `root/<d/ × depth>sub-<tag>/decoy-<tag>.txt` holding `needle inside`, and
+/// `outside/` next to `root` holding [`Outside`]'s file with `needle outside`.
+/// A swap runs once, at the [`crate::fs::seam`] just before the first open of
+/// an entry, and records how that open reaches the entry; dropping the tree
+/// removes it.
+#[cfg(unix)]
+pub struct SwapTree {
+	base:           PathBuf,
+	/// The walk root.
+	pub root:       PathBuf,
+	/// The directory a swap replaces.
+	pub sub:        PathBuf,
+	/// The final component of `sub`.
+	pub sub_name:   String,
+	/// The name of the file listed in `sub`.
+	pub decoy_name: String,
+	outside:        PathBuf,
+	opened:         Arc<Mutex<Option<crate::fs::seam::Open>>>,
+}
+
+#[cfg(unix)]
+impl SwapTree {
+	/// Builds the tree; `tag` makes its names unique in the process.
+	pub fn new(tag: &str, depth: usize, outside: Outside) -> Self {
+		static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let tag = format!("{tag}-{}-{n}", std::process::id());
+		let base = std::env::temp_dir()
+			.canonicalize()
+			.expect("temp dir canonicalizes")
+			.join(format!("pi-walker-swap-{tag}"));
+		let _ = std::fs::remove_dir_all(&base);
+		let root = base.join("root");
+		let sub_name = format!("sub-{tag}");
+		let decoy_name = format!("decoy-{tag}.txt");
+		let mut sub = root.clone();
+		for _ in 0..depth {
+			sub.push("d");
+		}
+		sub.push(&sub_name);
+		std::fs::create_dir_all(&sub).expect("sub is created");
+		std::fs::write(sub.join(&decoy_name), "needle inside\n").expect("decoy is written");
+		let outside_dir = base.join("outside");
+		std::fs::create_dir_all(&outside_dir).expect("outside is created");
+		let outside_name = match outside {
+			Outside::OtherName => format!("secret-{tag}.txt"),
+			Outside::SameName => decoy_name.clone(),
+		};
+		std::fs::write(outside_dir.join(outside_name), "needle outside\n").expect("outside file");
+		Self { base, root, sub, sub_name, decoy_name, outside: outside_dir, opened: Arc::default() }
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` now.
+	pub fn swap_dir(&self) {
+		swap_dir(&self.sub, &self.outside, &self.base.join("parked"));
+	}
+
+	/// Puts the directory [`Self::swap_dir`] parked back in place of the link.
+	pub fn unswap_dir(&self) {
+		std::fs::remove_file(&self.sub).expect("the link is removed");
+		std::fs::rename(self.base.join("parked"), &self.sub).expect("sub is back");
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` just before the first open of
+	/// an entry named `name`.
+	pub fn swap_dir_before_open(&self, name: &str) {
+		crate::fs::seam::before_open(name, self.dir_swap());
+	}
+
+	/// Swaps `sub` for a symlink to `outside/` just before the first stat of
+	/// an entry named `name`.
+	pub fn swap_dir_before_stat(&self, name: &str) {
+		crate::fs::seam::before_stat(name, self.dir_swap());
+	}
+
+	/// A hook that swaps `sub` and records the call it ran before.
+	fn dir_swap(&self) -> impl FnOnce(crate::fs::seam::Open) + Send + 'static {
+		let (sub, outside, parked) =
+			(self.sub.clone(), self.outside.clone(), self.base.join("parked"));
+		let opened = Arc::clone(&self.opened);
+		move |open| {
+			swap_dir(&sub, &outside, &parked);
+			*opened.lock() = Some(open);
+		}
+	}
+
+	/// Swaps the listed file for a symlink to `outside/`'s file of the same
+	/// name ([`Outside::SameName`]) just before its first open.
+	pub fn swap_file_before_open(&self) {
+		let file = self.sub.join(&self.decoy_name);
+		let target = self.outside.join(&self.decoy_name);
+		let opened = Arc::clone(&self.opened);
+		crate::fs::seam::before_open(&self.decoy_name, move |open| {
+			std::fs::remove_file(&file).expect("decoy is removed");
+			std::os::unix::fs::symlink(target, &file).expect("decoy becomes a link");
+			*opened.lock() = Some(open);
+		});
+	}
+
+	/// How the call that ran the swap reached its entry; `None` while no
+	/// hooked swap ran.
+	pub fn swapped(&self) -> Option<crate::fs::seam::Open> {
+		*self.opened.lock()
+	}
+}
+
+/// Parks the directory `sub` at `parked` and links `sub` to `outside`.
+#[cfg(unix)]
+fn swap_dir(sub: &Path, outside: &Path, parked: &Path) {
+	std::fs::rename(sub, parked).expect("sub is parked");
+	std::os::unix::fs::symlink(outside, sub).expect("sub becomes a link");
+}
+
+#[cfg(unix)]
+impl Drop for SwapTree {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_dir_all(&self.base);
+	}
+}
+
+/// Whether any of `texts` came from outside a [`SwapTree`]'s root.
+#[cfg(unix)]
+pub fn escaped<'a>(texts: impl IntoIterator<Item = &'a str>) -> bool {
+	texts.into_iter().any(|text| text.contains("outside"))
 }

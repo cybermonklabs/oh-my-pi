@@ -6,7 +6,7 @@ import {
 	enumeratePythonRuntimes,
 	filterEnv,
 	resolveExplicitPythonRuntime,
-	resolvePythonRuntime,
+	rebasePythonRuntime,
 } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
 import * as piUtils from "@oh-my-pi/pi-utils";
 
@@ -49,6 +49,29 @@ describe("Python gateway environment filtering", () => {
 		expect(filtered.XDG_RUNTIME_DIR).toBe("/run/user/1000");
 		expect(filtered.LC_CTYPE).toBe("UTF-8");
 		expect(filtered.LC_MESSAGES).toBe("en_US.UTF-8");
+	});
+
+	it("allows configured names and prefixes without re-exposing provider keys", () => {
+		const env: Record<string, string | undefined> = {
+			DISPATCH_HOST: "omp",
+			DISPATCH_SESSION_ID: "ses_test",
+			DISPATCH_URL: "https://dispatch.internal.example",
+			ENVOY_CONFIG_FILE: "/run/envoy.json",
+			OPENAI_API_KEY: "secret",
+			UNRELATED_VALUE: "blocked",
+		};
+
+		const filtered = filterEnv(env, {
+			names: ["DISPATCH_URL", "OPENAI_API_KEY"],
+			prefixes: ["DISPATCH_", " ENVOY_ ", "   "],
+		});
+
+		expect(filtered.DISPATCH_HOST).toBe("omp");
+		expect(filtered.DISPATCH_SESSION_ID).toBe("ses_test");
+		expect(filtered.DISPATCH_URL).toBe("https://dispatch.internal.example");
+		expect(filtered.ENVOY_CONFIG_FILE).toBe("/run/envoy.json");
+		expect(filtered.OPENAI_API_KEY).toBeUndefined();
+		expect(filtered.UNRELATED_VALUE).toBeUndefined();
 	});
 });
 
@@ -95,7 +118,6 @@ describe("enumeratePythonRuntimes", () => {
 		});
 
 		expect(runtimes.map(r => r.pythonPath)).toEqual([systemPy]);
-		expect(resolvePythonRuntime(path.join(path.sep, "work"), {}).pythonPath).toBe(systemPy);
 	});
 
 	it("enumerates every python and python3 on PATH so a broken first shim cannot hide a working interpreter", () => {
@@ -144,6 +166,26 @@ describe("enumeratePythonRuntimes", () => {
 		expect(runtime.env.PATH).toBe(`${binDir}${path.delimiter}${path.join(path.sep, "usr", "bin")}`);
 	});
 
+	it("rebuilds a cached venv runtime's environment over a new base and keeps its venv layout", () => {
+		vi.spyOn(piUtils, "getPythonEnvDir").mockReturnValue(managedDir);
+		vi.spyOn(piUtils, "$which").mockReturnValue(null);
+		vi.spyOn(fs, "existsSync").mockImplementation(candidate => candidate === managedPy);
+		const [managed] = enumeratePythonRuntimes(path.join(path.sep, "work"), {
+			PATH: path.join(path.sep, "usr", "bin"),
+			DISPATCH_SESSION_ID: "ses_old",
+		});
+
+		const rebased = rebasePythonRuntime(managed, {
+			PATH: path.join(path.sep, "usr", "bin"),
+			DISPATCH_SESSION_ID: "ses_new",
+		});
+
+		expect(rebased.pythonPath).toBe(managedPy);
+		expect(rebased.env.DISPATCH_SESSION_ID).toBe("ses_new");
+		expect(rebased.env.VIRTUAL_ENV).toBe(managedDir);
+		expect(rebased.env.PATH).toBe(`${managedBin}${path.delimiter}${path.join(path.sep, "usr", "bin")}`);
+	});
+
 	it("expands a home-relative explicit interpreter instead of resolving against cwd", () => {
 		const home = path.join(path.sep, "home", "tester");
 		vi.spyOn(os, "homedir").mockReturnValue(home);
@@ -166,12 +208,11 @@ describe("enumeratePythonRuntimes", () => {
 		expect(runtime.pythonPath).toBe(path.join(path.sep, "work", ".venv", "bin", "python"));
 	});
 
-	it("throws from resolvePythonRuntime when no interpreter can be found", () => {
+	it("enumerates nothing when no interpreter can be found", () => {
 		vi.spyOn(piUtils, "getPythonEnvDir").mockReturnValue(managedDir);
 		vi.spyOn(piUtils, "$whichAll").mockReturnValue([]);
 		vi.spyOn(fs, "existsSync").mockReturnValue(false);
 
 		expect(enumeratePythonRuntimes(path.join(path.sep, "work"), {})).toEqual([]);
-		expect(() => resolvePythonRuntime(path.join(path.sep, "work"), {})).toThrow("Python executable not found");
 	});
 });

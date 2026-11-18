@@ -1442,3 +1442,49 @@ describe("standard OpenAI Responses WebSocket opt-in", () => {
 		expect(fixture.upgrades).toHaveLength(1);
 	});
 });
+
+describe("standard OpenAI Responses WebSocket dispatch hold", () => {
+	it("holds the handshake and each response.create frame, and no deadline counts the held time", async () => {
+		const fixture = endpoint();
+		// Date.now is mocked so the held time can cross the first-event budget
+		// without a real wait; each hold is released from its own call.
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			let asked = Promise.withResolvers<void>();
+			let gate = Promise.withResolvers<void>();
+			const options: OpenAIResponsesOptions = {
+				...fixture.options,
+				preferWebsockets: true,
+				streamFirstEventTimeoutMs: 200,
+				beforeDispatch: () => {
+					asked.resolve();
+					return gate.promise;
+				},
+			};
+			// A fresh socket: the handshake itself waits for the hold.
+			const first = streamOpenAIResponses(fixture.model, fixture.context, options).result();
+			await asked.promise;
+			expect(fixture.upgrades).toHaveLength(0);
+			expect(fixture.requests).toHaveLength(0);
+			now += 10_000;
+			gate.resolve();
+			expect((await first).stopReason).toBe("stop");
+			expect(fixture.upgrades).toHaveLength(1);
+			expect(fixture.requests).toHaveLength(1);
+			// The reused socket opens nothing; its frame waits for the hold instead.
+			asked = Promise.withResolvers<void>();
+			gate = Promise.withResolvers<void>();
+			const second = streamOpenAIResponses(fixture.model, fixture.context, options).result();
+			await asked.promise;
+			expect(fixture.requests).toHaveLength(1);
+			now += 10_000;
+			gate.resolve();
+			expect((await second).stopReason).toBe("stop");
+			expect(fixture.upgrades).toHaveLength(1);
+			expect(fixture.requests).toHaveLength(2);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+});

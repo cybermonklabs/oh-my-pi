@@ -183,6 +183,20 @@ pub struct GlobMatch {
 	/// Modification time in Unix nanoseconds, under `sort_by_mtime` or
 	/// symlink resolution.
 	pub mtime:     Option<i64>,
+	/// The listing shows a symlink at `path`: reported as
+	/// [`FileType::Symlink`], or under a `File` or `Dir` filter as its
+	/// target. A reader that keeps the walk's policy follows the link at
+	/// `path` only then. A walk that follows links reports links as their
+	/// targets and never sets it.
+	pub symlink:   bool,
+}
+
+/// An entry kept for the output, and whether the listing showed a symlink
+/// there ([`GlobMatch::symlink`]).
+#[derive(Clone, Copy)]
+struct Kept<'a> {
+	entry:   Entry<'a>,
+	symlink: bool,
 }
 
 /// Why a [`glob`] failed.
@@ -247,7 +261,10 @@ pub async fn glob(fs: &Fs, root: &Path, opts: &GlobOptions) -> Result<Vec<GlobMa
 	.await
 	.map_err(GlobError::Walk)?;
 
-	let mut order: Vec<Entry<'_>> = entries.iter().collect();
+	let mut order: Vec<Kept<'_>> = entries
+		.iter()
+		.map(|entry| Kept { entry, symlink: entry.file_type == FileType::Symlink })
+		.collect();
 	if let Some(filter) = file_type.filter(|&filter| filter != FileType::Symlink) {
 		resolve_links(fs, root, filter, &mut order).await;
 	}
@@ -264,15 +281,16 @@ pub async fn glob(fs: &Fs, root: &Path, opts: &GlobOptions) -> Result<Vec<GlobMa
 	let resolved = file_type.is_some();
 	Ok(order
 		.into_iter()
-		.map(|entry| {
+		.map(|Kept { entry, symlink }| {
 			let detailed = opts.sort_by_mtime || resolved;
 			GlobMatch {
-				path:      entry.path_lossy().into_owned(),
+				path: entry.path_lossy().into_owned(),
 				file_type: entry.file_type,
-				size:      entry
+				size: entry
 					.size
 					.filter(|_| detailed && entry.file_type == FileType::File),
-				mtime:     entry.mtime.filter(|_| detailed),
+				mtime: entry.mtime.filter(|_| detailed),
+				symlink,
 			}
 		})
 		.collect())
@@ -292,10 +310,11 @@ fn wanted(filter: Option<FileType>, entry: &Entry<'_>) -> bool {
 /// Rewrites each symlink kept for its target's type to describe the target
 /// (type, size, mtime); dangling links and links to the other type are
 /// dropped.
-async fn resolve_links(fs: &Fs, root: &Path, filter: FileType, order: &mut Vec<Entry<'_>>) {
+async fn resolve_links(fs: &Fs, root: &Path, filter: FileType, order: &mut Vec<Kept<'_>>) {
 	let mut session = fs.session();
 	let mut kept = Vec::with_capacity(order.len());
-	for mut entry in order.drain(..) {
+	for mut item in order.drain(..) {
+		let entry = &mut item.entry;
 		if entry.file_type == FileType::Symlink {
 			let abs = fs.join(root, entry.path);
 			let Ok(info) = session.stat(&abs, true).await else {
@@ -308,15 +327,17 @@ async fn resolve_links(fs: &Fs, root: &Path, filter: FileType, order: &mut Vec<E
 			entry.size = (filter == FileType::File).then_some(info.size);
 			entry.mtime = Some(info.stamp.mtime);
 		}
-		kept.push(entry);
+		kept.push(item);
 	}
 	*order = kept;
 }
 
 /// Newest first by millisecond, ties (and equal milliseconds) by path.
-fn newer_first(a: &Entry<'_>, b: &Entry<'_>) -> Ordering {
-	let millis = |e: &Entry<'_>| e.mtime.unwrap_or(0).div_euclid(1_000_000);
-	millis(b).cmp(&millis(a)).then_with(|| a.path.cmp(b.path))
+fn newer_first(a: &Kept<'_>, b: &Kept<'_>) -> Ordering {
+	let millis = |kept: &Kept<'_>| kept.entry.mtime.unwrap_or(0).div_euclid(1_000_000);
+	millis(b)
+		.cmp(&millis(a))
+		.then_with(|| a.entry.path.cmp(b.entry.path))
 }
 
 #[cfg(test)]
@@ -620,6 +641,8 @@ mod tests {
 		std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("scope/dangling.ts"))
 			.expect("dangling link");
 		std::os::unix::fs::symlink(dir.path(), dir.path().join("scope/up")).expect("dir link");
+		let plain = dir.write("scope/plain.ts");
+		set_mtime(&plain, 1_700_000_000, 0);
 		for sort_by_mtime in [false, true] {
 			let opts = GlobOptions {
 				file_type: Some(FileType::File),
@@ -628,19 +651,30 @@ mod tests {
 				..options("*")
 			};
 			let found = run(&dir.path().join("scope"), &opts).await;
-			assert_eq!(found, [GlobMatch {
+			let kinds: Vec<_> = found.iter().map(|m| (m.path.as_str(), m.symlink)).collect();
+			assert_eq!(kinds, [("plain.ts", false), ("source.ts", true)], "{found:?}");
+			assert_eq!(found[1], GlobMatch {
 				path:      "source.ts".to_owned(),
 				file_type: FileType::File,
 				size:      Some(7),
 				mtime:     Some(1_600_000_000_000_000_000),
-			}]);
+				symlink:   true,
+			});
 			let dirs = GlobOptions { file_type: Some(FileType::Dir), ..opts };
-			assert_eq!(paths(&run(&dir.path().join("scope"), &dirs).await), ["up"]);
+			let dirs = run(&dir.path().join("scope"), &dirs).await;
+			assert_eq!(paths(&dirs), ["up"]);
+			assert!(dirs[0].symlink);
 		}
 		let untyped = GlobOptions { recursive: false, ..options("*") };
 		let found = run(&dir.path().join("scope"), &untyped).await;
-		assert!(found.iter().all(|m| m.file_type == FileType::Symlink), "{found:?}");
-		assert_eq!(found.len(), 3);
+		assert!(
+			found
+				.iter()
+				.all(|m| m.symlink == (m.file_type == FileType::Symlink)),
+			"{found:?}"
+		);
+		assert_eq!(found.iter().filter(|m| m.symlink).count(), 3, "{found:?}");
+		assert_eq!(found.len(), 4);
 	}
 
 	#[cfg(unix)]
