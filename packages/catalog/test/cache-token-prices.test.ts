@@ -17,6 +17,9 @@ const tiered: ModelCost = {
 		peakWindows: [{ weekdays: [1, 2, 3, 4, 5], startMinute: 60, endMinute: 240 }],
 	},
 };
+
+// gpt-5.1's card: cached reads at a tenth of input and no cache-write price.
+const readOnlyCache: ModelCost = { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 };
 const peak = Date.parse("2026-09-07T02:00:00Z");
 const offPeak = Date.parse("2026-09-07T05:00:00Z");
 
@@ -55,6 +58,21 @@ describe("getCacheTokenPrices", () => {
 			expect(prices.write * 10_000).toBeCloseTo(billed.cacheWrite, 15);
 			expect(prices.read * cacheRead).toBeCloseTo(billed.cacheRead, 15);
 		}
+	});
+
+	it("prices a write on a card with no cache-write price at the input rate at either lifetime, as the bill charges it", () => {
+		for (const lifetime of ["5m", "1h"] as const) {
+			const prices = getCacheTokenPrices(readOnlyCache, lifetime, 600_000);
+			expect(prices.write * 1_000_000).toBeCloseTo(1.25, 12);
+			expect(prices.read * 1_000_000).toBeCloseTo(0.125, 12);
+		}
+		// Its provider reports the 10,000 tokens a request writes again as uncached input.
+		const rewritten = calculateUsageCost(readOnlyCache, usage(10_000, 590_000, 0));
+		expect(rewritten.input).toBeCloseTo(getCacheTokenPrices(readOnlyCache, "1h", 600_000).write * 10_000, 15);
+		// A write it does report bills no one-hour premium over the five-minute one.
+		const fiveMinute = calculateUsageCost(readOnlyCache, usage(0, 590_000, 10_000)).cacheWrite;
+		const oneHour = calculateUsageCost(readOnlyCache, usage(0, 590_000, 10_000, { ephemeral1h: 10_000 })).cacheWrite;
+		expect(oneHour).toBe(fiveMinute);
 	});
 });
 

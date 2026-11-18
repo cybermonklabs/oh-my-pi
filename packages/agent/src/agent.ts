@@ -521,6 +521,7 @@ export class Agent {
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>;
+	#missingContextMessageProvider?: AgentLoopConfig["getMissingContextMessages"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
@@ -871,7 +872,7 @@ export class Agent {
 		);
 	}
 
-	/** Inject/strip the intent field on tool calls; applies from the next prompt run. */
+	/** Inject/strip the intent field on tool calls; applies from the next model call. */
 	get intentTracing(): boolean {
 		return this.#intentTracing;
 	}
@@ -1287,6 +1288,14 @@ export class Agent {
 		fn: ((boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>) | undefined,
 	): void {
 		this.#asideMessageProvider = fn;
+	}
+
+	/**
+	 * Provide the messages each model call must carry that its context lacks; they join the inputs of the turn the
+	 * call opens. See `AgentLoopConfig.getMissingContextMessages`.
+	 */
+	setMissingContextMessageProvider(fn: AgentLoopConfig["getMissingContextMessages"]): void {
+		this.#missingContextMessageProvider = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -2070,7 +2079,13 @@ export class Agent {
 				context.systemPrompt = this.#state.systemPrompt;
 				this.#onModelCallSystemPrompt?.(context.systemPrompt);
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
+				// The intent field and description pruning follow the agent's switches at each call, as the prompt and
+				// tools above do, so a rebuild that changes them all changes them at the same request. A response's
+				// calls are stripped by the switch of the request that produced it: the next sync runs after them.
+				config.intentTracing = this.#intentTracing;
+				config.pruneToolDescriptions = this.#pruneToolDescriptions;
 			},
+			getMissingContextMessages: context => this.#missingContextMessageProvider?.(context) ?? [],
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
 					? async (context, signal) => {

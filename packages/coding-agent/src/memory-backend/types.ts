@@ -12,6 +12,7 @@ import type { Settings } from "../config/settings";
 import type { HindsightSessionStateApi } from "../hindsight/state";
 import type { MnemopiSessionStateApi } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
+import type { RecallChangesReport } from "./recall-entry";
 
 export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "sharpshooter";
 
@@ -105,7 +106,7 @@ export interface MemoryPromptPreparation {
 	 * memories a reused recall holds. Persisted in the transcript as a hidden custom message
 	 * whose `details` carry the backend's bookkeeping, so both land only once delivered.
 	 */
-	notice?: { content: string; details: unknown };
+	notice?: RecallChangesReport;
 	/** Commit synchronously after delivery validation; false rejects lost ownership without state writes. */
 	commit(): boolean;
 }
@@ -113,8 +114,8 @@ export interface MemoryPromptPreparation {
 /** Options of {@link MemoryBackend.buildDeveloperInstructions}. */
 export interface MemoryInstructionsOptions {
 	/**
-	 * The conversation carries the recall as a hidden message (`findDeliveredRecall`): leave out the recall the
-	 * backend adopted, which the prompt would otherwise send a second time.
+	 * The conversation carries the recall as a hidden message (`AgentSession.hiddenMemoryRecall`): leave out the
+	 * recall the backend adopted, which the prompt would otherwise send a second time.
 	 */
 	recallDelivered?: boolean;
 }

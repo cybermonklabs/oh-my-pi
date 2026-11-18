@@ -243,13 +243,17 @@ export interface CacheTokenPrices {
 }
 
 /**
- * Per-token cache prices for a write not yet made, by the rule usage is billed by: a one-hour
- * write at twice the input rate, a five-minute write at the `cacheWrite` rate, a read at the
- * `cacheRead` rate. `promptInputTokens` selects the long-context tier and `timestamp` (Unix ms)
- * the dated card and peak/off-peak multiplier, exactly as {@link calculateUsageCost} applies
- * them; only scheduled prices default to now. A card that prices neither a cache read nor a
- * cache write at that tier prices no cache, so it has no cache to keep: both prices are 0 at
- * either lifetime.
+ * Per-token cache prices for a write not yet made, by the rule usage is billed by: a read at the `cacheRead` rate;
+ * where the card prices a cache write, a five-minute write at the `cacheWrite` rate and a one-hour write at twice the
+ * input rate ({@link cacheWriteRate}); where it prices none, a write at the input rate at either lifetime.
+ * `promptInputTokens` selects the long-context tier and `timestamp` (Unix ms) the dated card and peak/off-peak
+ * multiplier, exactly as {@link calculateUsageCost} applies them; only scheduled prices default to now.
+ *
+ * A card that prices cache reads but no cache write is one whose provider bills no write premium and reports the
+ * tokens a request writes to its cache as uncached input (OpenAI, DeepSeek), which the bill prices at the input
+ * rate; its cache-write bucket, which such usage leaves empty, bills at the card's write price of nothing. A card
+ * that prices neither a cache read nor a cache write at that tier prices no cache, so it has no cache to keep: both
+ * prices are 0 at either lifetime.
  */
 export function getCacheTokenPrices(
 	cost: ModelCost,
@@ -259,10 +263,8 @@ export function getCacheTokenPrices(
 ): CacheTokenPrices {
 	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
 	if (!(rates.cacheRead > 0) && !(rates.cacheWrite > 0)) return { read: 0, write: 0 };
-	return {
-		read: (rates.cacheRead / 1000000) * multiplier,
-		write: cacheWriteRate(rates, lifetime) * multiplier,
-	};
+	const write = rates.cacheWrite > 0 ? cacheWriteRate(rates, lifetime) : rates.input / 1000000;
+	return { read: (rates.cacheRead / 1000000) * multiplier, write: write * multiplier };
 }
 
 /**
@@ -272,10 +274,12 @@ export function getCacheTokenPrices(
  * 1.25x base input). 1h writes bill at 2x base input. Deriving 1h from
  * `input * 2` (Anthropic's published multiplier) is model-independent and
  * stays correct even for legacy entries whose stored `cacheWrite` scalar
- * drifts from 1.25x input.
+ * drifts from 1.25x input. A card that prices no cache write charges no
+ * one-hour premium either: its writes bill at its `cacheWrite` rate at
+ * either lifetime.
  */
 function cacheWriteRate(rates: TokenCost, lifetime: CacheLifetime): number {
-	return lifetime === "1h" ? (rates.input * 2) / 1000000 : rates.cacheWrite / 1000000;
+	return lifetime === "1h" && rates.cacheWrite > 0 ? (rates.input * 2) / 1000000 : rates.cacheWrite / 1000000;
 }
 
 /**

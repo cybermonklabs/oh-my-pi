@@ -451,7 +451,7 @@ describe("prefix-bound tool roster changes", () => {
 				expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
 			});
 
-			it("announces a tool the stored prompt lists that this process lacks", async () => {
+			it("sends this process's own build at the first request when a tool the stored prompt lists is gone", async () => {
 				const transcript = await liveTranscript(["read", "bash"], operatorPromptDigest);
 				const resumed = newSession(createPrefixBindingModel(), {
 					sessionManager: transcript.sessionManager,
@@ -462,8 +462,10 @@ describe("prefix-bound tool roster changes", () => {
 
 				await resumed.session.prompt("second");
 
-				expect(resumed.systemPrompts[0]).toEqual(transcript.systemPrompt);
-				expect(providerText(resumed.contexts[0])).toContain("No longer available: bash.");
+				// The first request declares other tools than the transcript's last one, so it reads none of the cache
+				// entry the stored prompt was kept for: this process's own build goes out, with nothing to announce.
+				expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+				expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
 			});
 		});
 

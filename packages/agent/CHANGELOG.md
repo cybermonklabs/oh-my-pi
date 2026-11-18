@@ -12,6 +12,7 @@
 - Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input; an unbounded threshold (`Number.POSITIVE_INFINITY`, nothing compacts the context) counts the saved reads over every later request
 - Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
 - Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop
+- Added `AgentLoopConfig.getMissingContextMessages` and `Agent.setMissingContextMessageProvider()`: asked before each model call with the call's context, the messages they return join that turn's input messages, emitted and recorded like the others
 
 ### Fixed
 
@@ -22,6 +23,7 @@
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
 - A per-call context message (`markPerCallContextMessage`) that a main request repeats with the bytes the previous main request had at the same position is now sent as history, so Anthropic prompt caching keeps both rolling breakpoints instead of anchoring one before it; side requests (`buildSideRequestContext`) keep the marks as set
+- `Agent` now applies a change of `intentTracing` or `pruneToolDescriptions` from the next model call, as it does the system prompt and tools, instead of from the next prompt run, so a rebuild that changes all of them in the middle of a run changes them at one request and Anthropic prompt caching writes the prompt once; a response's tool calls are still stripped by the switch of the request that produced it
 
 ### Breaking Changes
 

@@ -18,14 +18,25 @@ export const MEMORY_RECALL_ENTRY_TYPE = "memory_recall";
  * Hidden message reporting what changed in a reused recall's memories. Its details
  * ({@link MemoryRecallChangesDetails}) carry the memories still current, so the
  * report and its bookkeeping reach the transcript together, only once delivered.
+ * The session keeps every report the reused recall carries ({@link findDeliveredRecallChanges}),
+ * and a model call whose context holds no message with a report's text (a compaction
+ * summarized it, a branch it is not on) sends that report again after its newest content.
  */
 export const MEMORY_RECALL_CHANGES_MESSAGE_TYPE = "memory-recall-changes";
+
+/** A {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} message's text and its backend's details. */
+export interface RecallChangesReport {
+	content: string;
+	details: unknown;
+}
 
 /**
  * Hidden message carrying a recall that first succeeded after the conversation's prompt had been
  * sent without one: delivered after the turn's newest content instead of as a new system block, so
- * the cached prompt holds. It stays the recall's one copy for the branch's history
- * ({@link findDeliveredRecall}): a resume does not add the recall to the system prompt, and a prompt
+ * the cached prompt holds. The session keeps that recall as the conversation's own
+ * (`AgentSession.hiddenMemoryRecall`): a model call whose context holds no such message with it (a
+ * branch the message is not on, a compaction that summarized it, an older recall in its place) sends
+ * it again after its newest content, a resume does not add it to the system prompt, and a prompt
  * rebuild asks the backend to leave it out of the memory instructions (`recallDelivered`).
  */
 export const MEMORY_RECALL_MESSAGE_TYPE = "memory-recall";
@@ -157,8 +168,8 @@ export function persistRecall(
 
 /**
  * The recall the branch delivered as a hidden {@link MEMORY_RECALL_MESSAGE_TYPE} message since its
- * last context reset: the newest one. A compaction that summarized it leaves it on the branch, so the
- * session sends it again after the next turn's newest content.
+ * last context reset: the newest one. A loaded transcript's hidden recall, and the sign that a recall
+ * the backend reuses from it went out that way.
  */
 export function findDeliveredRecall(branch: readonly SessionEntry[]): string | undefined {
 	for (let index = branch.length - 1; index >= 0; index--) {
@@ -176,10 +187,40 @@ export function findDeliveredRecall(branch: readonly SessionEntry[]): string | u
 }
 
 /**
- * A memory backend's `instructions` without `recall`, the recall the branch delivered ({@link findDeliveredRecall}),
- * where they carry it verbatim: the fallback for a backend that ignores `recallDelivered`. A backend that re-renders
- * its recall, as Mnemopi cuts its own to the current token budget on every render, may carry text this search
- * misses, so it leaves the recall out itself.
+ * The {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} reports the branch delivered for the recall it
+ * reuses: every one since the newest recall it recorded or its last context reset, oldest first,
+ * each text once. A loaded transcript's reports, and those before a reused recall's new one.
+ */
+export function findDeliveredRecallChanges(branch: readonly SessionEntry[]): RecallChangesReport[] {
+	const start =
+		branch.findLastIndex(
+			entry =>
+				entry.type === "reset_boundary" ||
+				(entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE),
+		) + 1;
+	const reports: RecallChangesReport[] = [];
+	const seen = new Set<string>();
+	for (let index = start; index < branch.length; index++) {
+		const entry = branch[index];
+		if (
+			entry.type !== "custom_message" ||
+			entry.customType !== MEMORY_RECALL_CHANGES_MESSAGE_TYPE ||
+			typeof entry.content !== "string" ||
+			seen.has(entry.content)
+		) {
+			continue;
+		}
+		seen.add(entry.content);
+		reports.push({ content: entry.content, details: entry.details });
+	}
+	return reports;
+}
+
+/**
+ * A memory backend's `instructions` without `recall`, the recall the conversation carries as a hidden message, where
+ * they carry it verbatim: the fallback for a backend that ignores `recallDelivered`. A backend that re-renders its
+ * recall, as Mnemopi cuts its own to the current token budget on every render, may carry text this search misses, so
+ * it leaves the recall out itself.
  */
 export function withoutDeliveredRecall(instructions: string | undefined, recall: string): string | undefined {
 	if (!instructions || !recall) return instructions;

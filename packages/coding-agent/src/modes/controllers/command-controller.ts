@@ -1053,7 +1053,8 @@ export class CommandController {
 		if (action === "reset" || action === "clear") {
 			try {
 				await backend.clear(agentDir, this.ctx.sessionManager.getCwd(), this.ctx.session);
-				await this.ctx.session.refreshBaseSystemPrompt();
+				// The cleared recall must not go out again in a request whose context lost it.
+				await this.ctx.session.withdrawMemoryRecall();
 				this.ctx.showStatus("Memory data cleared and system prompt refreshed.");
 			} catch (error) {
 				this.ctx.showError(`Memory clear failed: ${error instanceof Error ? error.message : String(error)}`);
