@@ -5104,9 +5104,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
 					} catch (error) {
 						// An auth broker older than this client cannot record the removal on a login a
-						// failure disabled: say so, and let the rest of the turn's maintenance run.
+						// failure disabled: say so, and let the rest of the turn's maintenance run. The
+						// error's own text asks the user to remove the login again, but the user removed nothing.
 						if (!(error instanceof AuthBrokerRemovalNotRecordedError)) throw error;
-						this.emitNotice("warning", error.message, CREDENTIAL_DISABLED_NOTICE_SOURCE);
+						this.emitNotice(
+							"warning",
+							"The auth broker must be upgraded before it can record that the rejected GitHub Copilot login was removed.",
+							CREDENTIAL_DISABLED_NOTICE_SOURCE,
+						);
 					}
 				}
 			}

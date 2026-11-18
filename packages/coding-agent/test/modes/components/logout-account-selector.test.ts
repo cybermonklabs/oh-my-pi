@@ -222,6 +222,50 @@ describe("LogoutAccountSelectorComponent", () => {
 		}
 	});
 
+	/** Another account's login beside the active one, sharing one identifier with it and differing in another. */
+	const sharedIdentifierAccounts = [
+		{
+			account: "Codex Team seat that shares the active login's account id",
+			provider: "openai-codex",
+			active: { email: "seat-b@example.test", accountId: "acct-team" },
+			failed: { email: "seat-a@example.test", accountId: "acct-team" },
+		},
+		{
+			account: "Anthropic organization of the active login's email",
+			provider: "anthropic",
+			active: { email: "shared@example.test", orgId: "org-live" },
+			failed: { email: "shared@example.test", orgId: "org-dead" },
+		},
+	];
+
+	for (const { account, provider, active, failed } of sharedIdentifierAccounts) {
+		it(`lists a recoverable tombstone of another ${account} beside it`, async () => {
+			// If this regresses, the active login hides the other account's failure-disabled one when the broker
+			// predates `identityKey`: /logout cannot remove it, and its sessions keep waiting for its key.
+			await using temp = await TempDir.create("@logout-shared-identifier-");
+			const authStorage = await AuthStorage.create(temp.join("auth.db"));
+			try {
+				await authStorage.credentials.set(provider, [
+					{ type: "oauth", access: "access", refresh: "refresh", expires: Date.now() + 60_000, ...active },
+				]);
+				const id = authStorage.credentials.list(provider)[0]!.id;
+				// The other account's login a failure tore down, as a broker that predates `identityKey` reports it.
+				vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+					{ id: id + 100, provider, type: "oauth", ...failed, cause: "oauth refresh failed: invalid_grant" },
+				]);
+
+				const accounts = await listLogoutAccounts(authStorage, provider, "logout-session");
+
+				expect(accounts.map(row => [row.credentialId, row.label.endsWith("(disabled)")])).toEqual([
+					[id, false],
+					[id + 100, true],
+				]);
+			} finally {
+				authStorage.close();
+			}
+		});
+	}
+
 	for (const explicitProvider of [true, false]) {
 		it(`offers and removes a failure-disabled login through the ${explicitProvider ? "account" : "provider"} selector`, async () => {
 			await using temp = await TempDir.create("@logout-selector-disabled-");

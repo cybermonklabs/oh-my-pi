@@ -691,6 +691,23 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(causes).toEqual({ "a@example.com": DELETED_BY_USER, "b@example.com": FAILURE_CAUSE });
 	});
 
+	test("does not record a removal by id on the disabled login of an account outside the pool", async () => {
+		// If this regresses, a pooled client can rewrite another account's failure as the user's removal by its id on
+		// the shared broker: no client waits for that login any more, and `omp usage` stops reporting it as lost.
+		await withPoolOfFailedLoginA(async pooled => {
+			const loginB = (await storage!.credentials.listDisabled("anthropic")).find(
+				row => row.email === "b@example.com",
+			);
+			if (!loginB) throw new Error("expected login b's tombstone");
+			expect(await pooled.credentials.disable(loginB.id, DELETED_BY_USER)).toBe(false);
+		});
+
+		const causes = Object.fromEntries(
+			(await storage!.credentials.listDisabled("anthropic")).map(row => [row.email, row.cause]),
+		);
+		expect(causes).toEqual({ "a@example.com": FAILURE_CAUSE, "b@example.com": FAILURE_CAUSE });
+	});
+
 	test("evicts cold sticky sessions while preserving recently accessed sessions", () => {
 		remote = new RemoteAuthCredentialStore({ client: new AuthBrokerClient({ url: handle!.url, token }) });
 		const expires = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;

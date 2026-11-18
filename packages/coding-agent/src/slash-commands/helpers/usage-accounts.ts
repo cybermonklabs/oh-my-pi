@@ -43,37 +43,35 @@ export function toAccountIdentity(provider: string, credential: AuthCredential):
 	};
 }
 
+/** Identifiers that name a tombstone's account when it carries no `identityKey`. */
+const TOMBSTONE_IDENTIFIERS = ["email", "accountId", "orgId"] as const;
+
 /**
  * Whether one of `accounts` is the account `summary`'s tombstone names: the store's
  * `identityKey` decides when the tombstone carries one (a broker older than the field
- * sends none), else a shared email or account id, else an organization neither email nor
- * account id contradicts (both sides carry one, and they differ: another member of the
- * organization). The user logged that account in again, so the tombstone is lifecycle
- * noise — no lost capacity to report, no second row to log out of.
+ * sends none). Without it, the two must share an email, an account id or an organization,
+ * and none of the three may differ where both sides carry it: Codex Team seats share an
+ * account id, and one email can hold several Anthropic organizations. The user logged that
+ * account in again, so the tombstone is lifecycle noise — no lost capacity to report, no
+ * second row to log out of.
  */
 export function hasActiveAccount(
 	summary: DisabledCredentialSummary,
 	accounts: readonly UsageAccountIdentity[],
 ): boolean {
-	const summaryEmail = summary.email?.toLowerCase();
-	const summaryAccountId = summary.accountId?.toLowerCase();
-	const summaryOrgId = summary.orgId?.toLowerCase();
-
 	return accounts.some(account => {
 		if (account.provider !== summary.provider) return false;
 		if (summary.identityKey) return account.identityKey === summary.identityKey;
-
-		const accountEmail = account.email?.toLowerCase();
-		const accountAccountId = account.accountId?.toLowerCase();
-		const accountOrgId = account.orgId?.toLowerCase();
-
-		// If email or accountId match, it's the same identity
-		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
-		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
-
-		// Fallback: the same orgId, when neither email nor accountId contradicts (both set, so they differ here)
-		if (!summaryOrgId || summaryOrgId !== accountOrgId) return false;
-		return !(summaryEmail && accountEmail) && !(summaryAccountId && accountAccountId);
+		let shared = false;
+		for (const field of TOMBSTONE_IDENTIFIERS) {
+			const ours = summary[field]?.toLowerCase();
+			const theirs = account[field]?.toLowerCase();
+			if (!ours || !theirs) continue;
+			// Both sides carry it and they differ: another seat, organization or account.
+			if (ours !== theirs) return false;
+			shared = true;
+		}
+		return shared;
 	});
 }
 

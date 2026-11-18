@@ -45,9 +45,10 @@ export interface CredentialRowStore {
 	refreshSnapshot?(): Promise<unknown>;
 	/**
 	 * Disabled credential tombstones (see {@link DisabledCredentialSummary}).
-	 * Optional: remote stores forward to the broker's
-	 * `GET /v1/credentials/disabled` (empty list when the broker predates the
-	 * endpoint); stores without tombstones omit it.
+	 * Optional: remote stores read the broker's `GET /v1/credentials/disabled`
+	 * (empty list when the broker predates the endpoint) and keep the tombstones
+	 * their account pool shows, by the rule its active rows follow; stores
+	 * without tombstones omit it.
 	 */
 	listDisabledCredentials?(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]>;
 	updateAuthCredential(id: number, credential: AuthCredential): void;
@@ -57,7 +58,9 @@ export interface CredentialRowStore {
 	 * removal recorded on its tombstone instead. Return false when no row changed.
 	 * Remote stores await broker persistence before updating their snapshot, and
 	 * throw `AuthBrokerRemovalNotRecordedError` when the broker refuses to record
-	 * a user's removal on such a tombstone.
+	 * a user's removal on such a tombstone; under an account pool they record it
+	 * only on a tombstone {@link listDisabledCredentials} lists, and return false
+	 * for any other id.
 	 */
 	deleteAuthCredential(id: number, disabledCause: string): Promise<boolean>;
 	tryDisableAuthCredentialIfMatches(
@@ -88,7 +91,8 @@ export interface CredentialRowStore {
 	/**
 	 * Disable all active rows for a provider (logout), forwarding remote writes to
 	 * the broker before returning. A user's removal cause also records itself on
-	 * the provider's rows a failure disabled; remote stores throw
+	 * the provider's rows a failure disabled; a remote store records it only on
+	 * those {@link listDisabledCredentials} lists, and throws
 	 * `AuthBrokerRemovalNotRecordedError` when the broker refuses that record.
 	 */
 	deleteAuthCredentials(provider: string, disabledCause: string): Promise<void>;

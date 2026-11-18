@@ -2,20 +2,17 @@
 
 ## [Unreleased]
 
-### Breaking Changes
-
-- Custom `SessionsApi` implementations must implement `permitsIdentity(provider, sessionId, identityKey)` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
-
 ### Added
 
 - Added `CredentialUnavailableError`, a transient error for a configured credential source that produced no key; unlike `MissingApiKeyError`, a retry may succeed. It accepts a `cause`, and `OAuthRefreshUnavailableError` is a `CredentialUnavailableError` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar)).
 - Added `AccountPoolUnavailableError` (a `MissingApiKeyError`) for a session restricted to an OAuth account pool none of whose accounts can serve now, the `AssistantMessage` field `credentialUnavailable` for a turn that failed because no credential could give a key (nothing was sent, so a resume can go on with it), `isAutoDisabledCredential` for tombstones of OAuth credentials a failure disabled, and `isUserRemovalCause` with the `DELETED_BY_USER` and `LOGGED_OUT_BY_USER` causes, beside the `REPLACED_BY_CAUSE_PREFIX` and `DEDUPLICATED_CAUSE_PREFIX` cause prefixes; a user's removal or logout now also marks the provider's logins a failure had already disabled ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 - Disabled-credential summaries now include the store's account `identityKey`, locally and through the auth broker to clients that announce the `disabled-identity-key` capability, so older clients keep reading the list; `sessions.permitsIdentity` and `isRecoverableDisabledCredential` let clients distinguish pool membership and later removals without conflating organizations or workspace members ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+- Added the optional `SessionsApi.permitsIdentity(provider, sessionId, identityKey)`, which a custom `SessionsApi` should implement: without it, a session restricted to an OAuth account pool does not wait for a login a failure disabled when its key is missing, and omp logs a warning ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 
 ### Changed
 
 - Upgrade the auth broker before its clients: an older broker does not record a client's removal of a login a failure disabled, and the client now reports that with `AuthBrokerRemovalNotRecordedError` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
-- A broker client's account pool (`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` or `accountPool`) now also filters disabled-credential tombstones: `listDisabledCredentials` lists only the disabled logins of the pool's accounts, and removing a provider records the user's removal only on those ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+- A broker client's account pool (`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` or `accountPool`) now also filters disabled-credential tombstones: `listDisabledCredentials` lists only the disabled logins of the pool's accounts, and removing a provider or one login by id records the user's removal only on those ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.18.4] - 2026-11-09
 

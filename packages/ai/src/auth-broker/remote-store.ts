@@ -965,7 +965,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (!found) {
 			// Not active here, but the broker may hold it as a login a failure disabled: a
 			// user's removal records itself on that tombstone (`isAutoDisabledCredential`).
+			// Under an account pool, only on a tombstone the pool shows: any other id names
+			// another account's login on the shared broker, so it reads as gone.
 			if (!isUserRemovalCause(disabledCause)) return false;
+			if (this.#accountPool && !(await this.listDisabledCredentials()).some(tombstone => tombstone.id === id)) {
+				return false;
+			}
 			if (await this.#recordRemoval(id, disabledCause)) return true;
 			await this.#assertRemovalsRecorded([id]);
 			return false;

@@ -271,8 +271,10 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		},
 		"sessions.permits": (storage, provider, sessionId, credentialId) =>
 			storage.sessions.permits(provider, sessionId, credentialId),
+		// A main `SessionsApi` without `permitsIdentity` cannot place the identity in the session's pool, so it
+		// answers no: a worker's key retry then waits for no disabled login of the provider (fail closed).
 		"sessions.permitsIdentity": (storage, provider, sessionId, identityKey) =>
-			storage.sessions.permitsIdentity(provider, sessionId, identityKey),
+			storage.sessions.permitsIdentity?.(provider, sessionId, identityKey) ?? false,
 		"sessions.release": (storage, provider, sessionId) => storage.sessions.release(provider, sessionId),
 
 		"usage.reports": (storage, options) =>

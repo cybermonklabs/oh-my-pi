@@ -396,6 +396,9 @@ export class ModelRegistry {
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
 	#warnedUnservedOverrideKinds: Set<string> = new Set();
+	// `provider\0sessionId` of restricted sessions already warned that their pool cannot be
+	// read for disabled logins ({@link #poolHoldsTombstone}), so each logs it once.
+	#warnedUnreadablePools: Set<string> = new Set();
 	#configError: ConfigError | undefined = undefined;
 	#warnedCompatKeys = new Set<string>();
 	#configWarnings: string[] = [];
@@ -3584,7 +3587,8 @@ export class ModelRegistry {
 	 * until they log in again, so waiting would only delay the error. A user's
 	 * removal covers the same account only: removing one account of a provider
 	 * leaves another account's failure recoverable.
-	 * Only active credentials and failure identities the session's pool permits count.
+	 * Only active credentials and failure identities the session's pool permits count
+	 * ({@link #poolHoldsTombstone}).
 	 * A tombstone lookup that fails is `unreadable`, since the store could not tell;
 	 * one the caller aborted does not count. Undefined for a disabled provider (in
 	 * settings, or paused by its auth rules: no key comes back until the user or the
@@ -3621,11 +3625,34 @@ export class ModelRegistry {
 		return tombstones.some(
 			failure =>
 				isRecoverableDisabledCredential(failure, tombstones) &&
-				(sessionId === undefined ||
-					this.authStorage.sessions.permitsIdentity(provider, sessionId, failure.identityKey)),
+				(sessionId === undefined || this.#poolHoldsTombstone(provider, sessionId, failure)),
 		)
 			? "cannot-serve"
 			: undefined;
+	}
+
+	/**
+	 * Whether `sessionId`'s account pool for `provider` holds the account of the
+	 * disabled login `failure` (`sessions.permitsIdentity`). A custom `SessionsApi`
+	 * may lack that method. Its `permits`, true for every credential of an unrestricted
+	 * session, then still tells such a session apart, which counts the login as before.
+	 * A restricted session whose `permits` refuses the login's row cannot read its pool
+	 * for disabled logins: the login does not count, so a missing key ends the turn as
+	 * it did before such logins counted, and one warning per provider and session says why.
+	 */
+	#poolHoldsTombstone(provider: string, sessionId: string, failure: DisabledCredentialSummary): boolean {
+		const sessions = this.authStorage.sessions;
+		if (sessions.permitsIdentity) return sessions.permitsIdentity(provider, sessionId, failure.identityKey);
+		if (sessions.permits(provider, sessionId, failure.id)) return true;
+		const warningKey = `${provider}\0${sessionId}`;
+		if (!this.#warnedUnreadablePools.has(warningKey)) {
+			this.#warnedUnreadablePools.add(warningKey);
+			logger.warn(
+				"Session account pool cannot be read for disabled logins (its SessionsApi has no permitsIdentity); a missing key does not wait for them",
+				{ provider, sessionId },
+			);
+		}
+		return false;
 	}
 
 	getDiscoverableProviders(): string[] {

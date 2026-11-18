@@ -157,14 +157,9 @@ export function isUserRemovalCause(cause: string): boolean {
  * login restores, not lifecycle noise.
  */
 export function isAutoDisabledCredential(summary: DisabledCredentialSummary): boolean {
-	if (summary.type !== "oauth") return false;
+	if (summary.type !== "oauth" || isUserRemovalCause(summary.cause)) return false;
 	const cause = summary.cause.toLowerCase();
-	return (
-		!cause.startsWith(DELETED_BY_USER) &&
-		!cause.startsWith(LOGGED_OUT_BY_USER) &&
-		!cause.startsWith(REPLACED_BY_CAUSE_PREFIX) &&
-		!cause.startsWith(DEDUPLICATED_CAUSE_PREFIX)
-	);
+	return !cause.startsWith(REPLACED_BY_CAUSE_PREFIX) && !cause.startsWith(DEDUPLICATED_CAUSE_PREFIX);
 }
 
 /**
@@ -968,14 +963,17 @@ export interface CredentialsApi {
 	upsert(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]>;
 	/**
 	 * Remove credential for a provider, and record the user's removal on the
-	 * provider's logins a failure disabled. A remote store throws
-	 * `AuthBrokerRemovalNotRecordedError` when its broker refuses that record.
+	 * provider's logins a failure disabled; a remote store with an account pool
+	 * records it only on the disabled logins its pool shows ({@link listDisabled}).
+	 * A remote store throws `AuthBrokerRemovalNotRecordedError` when its broker
+	 * refuses that record.
 	 */
 	remove(provider: string): Promise<void>;
 	/**
 	 * Remove one stored credential for a provider, or record the user's removal
-	 * on its tombstone when a failure disabled it. A remote store throws
-	 * `AuthBrokerRemovalNotRecordedError` when its broker refuses that record.
+	 * on its tombstone when a failure disabled it and {@link listDisabled} lists
+	 * it. A remote store throws `AuthBrokerRemovalNotRecordedError` when its
+	 * broker refuses that record.
 	 */
 	removeById(provider: string, credentialId: number): Promise<boolean>;
 	/**
@@ -986,13 +984,16 @@ export interface CredentialsApi {
 	 * but whose tombstone a failure left ({@link isAutoDisabledCredential}) gets
 	 * the removal recorded on that tombstone instead, with no event; a remote
 	 * store throws `AuthBrokerRemovalNotRecordedError` when its broker refuses
-	 * that. Returns `false` when it changed no row.
+	 * that, and under an account pool records it only on a tombstone
+	 * {@link listDisabled} lists. Returns `false` when it changed no row.
 	 */
 	disable(id: number, disabledCause: string): Promise<boolean>;
 	/**
-	 * Disabled credential tombstones for display surfaces (`omp usage`,
-	 * broker `GET /v1/credentials/disabled`). Empty when the backing store
-	 * keeps no tombstones or the remote broker predates the endpoint.
+	 * Disabled credential tombstones (`omp usage`, `/logout`, broker
+	 * `GET /v1/credentials/disabled`). A remote store with an account pool lists
+	 * only the tombstones of the pool's accounts, by the rule its active rows
+	 * follow. Empty when the backing store keeps no tombstones or the remote
+	 * broker predates the endpoint.
 	 */
 	listDisabled(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]>;
 	/**
@@ -1309,8 +1310,11 @@ export interface SessionsApi {
 	 * Whether a stored identity (including a disabled tombstone) belongs to the
 	 * session's account pool. Unrestricted sessions allow every identity; a
 	 * restricted session rejects missing identities and keys outside its list.
+	 * A custom implementation should provide it. Without it, a caller cannot tell
+	 * which disabled logins a restricted session's pool holds: omp's key retry
+	 * then waits for none of them in that session, and logs a warning.
 	 */
-	permitsIdentity(provider: string, sessionId: string, identityKey: string | undefined): boolean;
+	permitsIdentity?(provider: string, sessionId: string, identityKey: string | undefined): boolean;
 	/**
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released
