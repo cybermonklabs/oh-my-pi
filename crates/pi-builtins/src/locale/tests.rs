@@ -336,16 +336,140 @@ fn a_competing_reaper_does_not_turn_the_query_into_a_stray_signal() {
 		);
 	}
 	// Nothing is left for the kernel to carry: every query either reaped
-	// its own child or never started one. The children of *every* task,
-	// because the query ran on a worker and `/proc/self/task/<pid>` is the
-	// main thread's; and a list that cannot be read is a failure here, not
-	// an empty one.
-	let tasks = fs::read_dir("/proc/self/task").expect("this process's task list");
-	for task in tasks {
-		let task = task.expect("a task of this process");
-		let left = fs::read_to_string(task.path().join("children")).expect("a task's children");
-		assert!(left.trim().is_empty(), "children left behind by {:?}: {left}", task.file_name());
+	// its own child or never started one.
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// Fails when any task of this process has a child, as each task's
+/// `/proc/self/task/<tid>/children` lists them; `read` reads one task's
+/// `children` file (a test of this function hooks it).
+///
+/// The children of *every* task, because a query runs on a worker and
+/// `/proc/self/task/<pid>` is the main thread's; and a list that cannot be
+/// read, other than one whose task has gone, is a failure, not an empty one.
+///
+/// Every read is checked, not only the last pass's. A thread that exits
+/// hands its children to a live thread of the same process, the group
+/// leader while it lives (`forget_original_parent` in `kernel/exit.c`). So
+/// within one pass a child can move from a worker not yet read to the main
+/// thread already read, and that pass sees it nowhere. The pass before it
+/// read the child under the worker, unless the worker was new, which changes
+/// the listing; and once moved, the child stays on the main thread, which
+/// every pass reads. The check therefore ends only after two passes in a row
+/// in which every task was read and the listing did not change from before
+/// the pass to after it.
+#[cfg(target_os = "linux")]
+fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<String>) {
+	const MAX_PASSES: usize = 10_000;
+	let list = || -> Vec<std::ffi::OsString> {
+		let mut names: Vec<_> = fs::read_dir("/proc/self/task")
+			.expect("this process's task list")
+			.map(|task| task.expect("a task of this process").file_name())
+			.collect();
+		names.sort();
+		names
+	};
+	let mut previous_quiet: Option<Vec<std::ffi::OsString>> = None;
+	for _ in 0..MAX_PASSES {
+		let before = list();
+		let mut every_task_read = true;
+		for name in &before {
+			match read(&Path::new("/proc/self/task").join(name)) {
+				Ok(children) => {
+					assert!(children.trim().is_empty(), "children left behind by {name:?}: {children}");
+				},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => every_task_read = false,
+				Err(error) => panic!("the children of task {name:?}: {error:?}"),
+			}
+		}
+		let after = list();
+		let quiet = every_task_read && before == after;
+		if quiet && previous_quiet.as_ref() == Some(&after) {
+			return;
+		}
+		previous_quiet = quiet.then_some(after);
+		std::thread::yield_now();
 	}
+	panic!("this process's task list did not hold still for two passes in {MAX_PASSES} passes");
+}
+
+/// [`assert_no_task_has_children`] catches a child whose holder hands it, by
+/// exiting, to a thread the pass already read. The holder's own read in that
+/// pass is empty, so only an earlier pass sees the child: a check of the last
+/// pass alone passes here.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_handed_to_a_task_already_read_is_still_caught() {
+	let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+	let (ids_tx, ids_rx) = std::sync::mpsc::channel();
+	let holder = std::thread::spawn(move || {
+		let child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+		// SAFETY: gettid has no preconditions.
+		let tid = unsafe { libc::gettid() };
+		ids_tx.send((tid, child.id())).unwrap();
+		// The kernel keeps the child, under this thread, until this thread exits.
+		std::mem::forget(child);
+		let _ = exit_rx.recv();
+	});
+	let (holder_tid, child_pid) = ids_rx.recv().unwrap();
+	let holder_name = holder_tid.to_string();
+	let child_name = child_pid.to_string();
+	let holder_task = Path::new("/proc/self/task").join(&holder_name);
+	let child_listed_elsewhere = || {
+		fs::read_dir("/proc/self/task").unwrap().flatten().any(|task| {
+			task.file_name().to_str() != Some(holder_name.as_str())
+				&& fs::read_to_string(task.path().join("children"))
+					.is_ok_and(|children| children.split_whitespace().any(|c| c == child_name))
+		})
+	};
+	let mut holder = Some(holder);
+	let mut exit_tx = Some(exit_tx);
+	let mut holder_reads = 0;
+	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		assert_no_task_has_children(|task| {
+			if task != holder_task {
+				return fs::read_to_string(task.join("children"));
+			}
+			holder_reads += 1;
+			if holder_reads < 2 {
+				return fs::read_to_string(task.join("children"));
+			}
+			// In this pass the other tasks were read first: the holder is the
+			// newest thread, so its tid is normally the largest, and the listing
+			// sorts tids as strings, so it comes last at the same number of
+			// digits. When it does not, the child moves to a task read later in
+			// the pass, which only makes the case easier to catch. Open the
+			// holder's list, let the holder exit and hand its child on, then
+			// read the list it opened.
+			let mut file = fs::File::open(task.join("children"))?;
+			if let Some(exit) = exit_tx.take() {
+				exit.send(()).unwrap();
+			}
+			if let Some(holder) = holder.take() {
+				holder.join().unwrap();
+			}
+			let moved = (0..1_000_000).any(|_| {
+				std::thread::yield_now();
+				child_listed_elsewhere()
+			});
+			assert!(moved, "the holder's child was not handed to another task");
+			let mut children = String::new();
+			std::io::Read::read_to_string(&mut file, &mut children)?;
+			Ok(children)
+		});
+	}));
+	if let Some(exit) = exit_tx.take() {
+		exit.send(()).unwrap();
+	}
+	if let Some(holder) = holder.take() {
+		holder.join().unwrap();
+	}
+	// SAFETY: the child is this process's own; kill and reap it.
+	unsafe {
+		libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+		libc::waitpid(child_pid as libc::pid_t, std::ptr::null_mut(), 0);
+	}
+	assert!(caught.is_err(), "a child handed to a task already read was not caught");
 }
 
 /// Every caller of [`crate::locale::locale_loadable`] models
