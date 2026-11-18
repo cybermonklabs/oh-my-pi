@@ -329,6 +329,60 @@ console.log(JSON.stringify({ fingerprint: sources.fingerprint, gone: !nodeFs.exi
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	}, 60_000);
 
+	it("read other and keep nothing for a listed link removed between its lstat and its readlink", async () => {
+		const link = path.join(repo, "crates/pi-natives/src/link.rs");
+		await fs.symlink("lib.rs", link);
+		await build();
+		// A new time on lib.rs: the start reads the sources again, and so reads the link.
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(path.join(repo, "crates/pi-natives/src/lib.rs"), later, later);
+
+		expect(
+			bounded(`let removed = false;
+__setRegularFileIoForTests({
+	lstatSync(file, options) {
+		const stat = nodeFs.lstatSync(file, options);
+		if (!removed && file === ${JSON.stringify(link)}) {
+			removed = true;
+			nodeFs.unlinkSync(file);
+		}
+		return stat;
+	},
+});
+console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
+		).toBe("other");
+		await fs.symlink("lib.rs", link);
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	}, 60_000);
+
+	it.each([
+		["no longer a link", "EINVAL", "other"],
+		["unreadable", "EIO", "unknown"],
+	])(
+		"keep no verdict for a listed link that is %s at its readlink and the same link again after",
+		async (_label, code, state) => {
+			const link = path.join(repo, "crates/pi-natives/src/link.rs");
+			await fs.symlink("lib.rs", link);
+			await build();
+			const later = new Date(Date.now() + 60_000);
+			await fs.utimes(path.join(repo, "crates/pi-natives/src/lib.rs"), later, later);
+
+			// The link itself never changes: its `readlink` fails as one does on a path that held
+			// another kind for that moment (a mount over it and back) or on an I/O error.
+			expect(
+				bounded(`__setRegularFileIoForTests({
+	readlinkSync(file, options) {
+		if (file === ${JSON.stringify(link)}) throw Object.assign(new Error(\`${code}: readlink '\${file}'\`), { code: ${JSON.stringify(code)} });
+		return nodeFs.readlinkSync(file, options);
+	},
+});
+console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
+			).toBe(state);
+			expect(addonSourcesState(addon, repo)).toBe("current");
+		},
+		60_000,
+	);
+
 	it("keep no verdict for a source rewritten in place while a start read it, also once its bytes and time are back", async () => {
 		await build();
 		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
@@ -610,6 +664,53 @@ console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.e
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
+	it.each([["in place"], ["by a rename over it, as git does"]])(
+		"name other sources until the next build for a file edited during the build and put back, times and all (%s)",
+		async how => {
+			const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+			// A whole-second time, so it can be put back exactly.
+			const time = new Date(1_700_000_000_000);
+			await fs.utimes(target, time, time);
+			const original = await Bun.file(target).text();
+			const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+			// On a kernel whose timestamps are coarse, the clock moves on before the edit.
+			await Bun.sleep(25);
+
+			// The build runs, and the compiler reads the edit.
+			await Bun.write(target, "pub fn edited_during_build() {}\n");
+			// The edit is put back before the build ends (an editor's undo, `git stash` and
+			// `stash pop`), with the time it had (`touch -r`).
+			if (how === "in place") {
+				await Bun.write(target, original);
+			} else {
+				await Bun.write(`${target}.new`, original);
+				await fs.rename(`${target}.new`, target);
+			}
+			await fs.utimes(target, time, time);
+			writeAddonSourcesStamp(addon, settleRustSources(repo, before), CARGO_BUILD);
+
+			expect((await fs.lstat(target)).mtimeMs).toBe(time.getTime());
+			expect(await Bun.file(target).text()).toBe(original);
+			expect(addonSourcesState(addon, repo)).toBe("other");
+			expect(addonSourcesState(addon, repo)).toBe("other");
+			// The next build reads the tree as it is.
+			await build();
+			expect(addonSourcesState(addon, repo)).toBe("current");
+		},
+	);
+
+	it("stay current when the build rewrote Cargo.lock with the same bytes", async () => {
+		const lock = path.join(repo, "Cargo.lock");
+		const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+		await Bun.write(lock, await Bun.file(lock).text());
+		const later = new Date(Date.now() + 60_000);
+		await fs.utimes(lock, later, later);
+
+		writeAddonSourcesStamp(addon, settleRustSources(repo, before), CARGO_BUILD);
+
+		expect(addonSourcesState(addon, repo)).toBe("current");
+	});
+
 	it("keep no verdict for a state the build's read did not see: a source edited just after the settle read it", async () => {
 		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
 		const edited = path.join(repo, "crates/pi-natives/src/edited");
@@ -830,6 +931,22 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		expect((await Bun.file(stampPath).json()).scanned[0].dirs[defs]).toBe(
 			`${now.mtimeMs}\0${now.ctimeMs}\0${now.ino}`,
 		);
+	});
+
+	it("are other sources until the next build for a file added to a scanned directory during the build and removed before its end", async () => {
+		await checkout();
+		const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+		// On a kernel whose timestamps are coarse, the clock moves on before the file comes.
+		await Bun.sleep(25);
+		// The build script compiles every `.toml` there, this one too, while it stands.
+		await Bun.write(path.join(repo, defs, "zz-during.toml"), "[filters.zz_during]\n");
+		await fs.rm(path.join(repo, defs, "zz-during.toml"));
+
+		writeAddonSourcesStamp(addon, settleRustSources(repo, before), CARGO_BUILD);
+
+		expect(addonSourcesState(addon, repo)).toBe("other");
+		await build();
+		expect(addonSourcesState(addon, repo)).toBe("current");
 	});
 
 	it("are other sources when a file leaves a scanned directory", async () => {

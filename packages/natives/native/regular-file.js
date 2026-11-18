@@ -24,7 +24,7 @@ import * as fs from "node:fs";
  * describes.
  */
 
-/** @type {Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync">} */
+/** @type {Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync" | "readlinkSync">} */
 let io = fs;
 
 /**
@@ -135,4 +135,21 @@ export function readRegularFile(file, options = {}) {
 export function readRegularFileText(file) {
 	const read = readRegularFile(file);
 	return read.kind === "file" ? read.content.toString("utf8") : undefined;
+}
+
+/**
+ * The target of the link at `file`, found a link by its `lstat`: its text; `changed` when what
+ * stands there is no longer a link (`EINVAL`) or is gone (`ENOENT`, `ENOTDIR`); or `unreadable`,
+ * with the error, for a link whose target cannot be read (an I/O error).
+ * @param {string} file
+ * @returns {{ kind: "symlink"; target: string } | { kind: "changed" } | { kind: "unreadable"; error: unknown }}
+ */
+export function readLinkTarget(file) {
+	try {
+		return { kind: "symlink", target: io.readlinkSync(file, "utf8") };
+	} catch (error) {
+		const code = /** @type {{ code?: unknown } | null} */ (error)?.code;
+		const changedKind = code === "EINVAL" || code === "ENOENT" || code === "ENOTDIR";
+		return changedKind ? { kind: "changed" } : { kind: "unreadable", error };
+	}
 }

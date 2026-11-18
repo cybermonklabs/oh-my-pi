@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readRegularFile, readRegularFileText } from "./regular-file.js";
+import { readLinkTarget, readRegularFile, readRegularFileText } from "./regular-file.js";
 
 /**
  * Which Rust sources a workspace checkout's addon was built from.
@@ -107,6 +107,14 @@ export const BAZEL_SOURCE_ROOTS = Object.freeze([
  * dependencies changed, so the lock the build compiled against is the one it left.
  */
 const REWRITTEN_BY_BUILD = new Set(["Cargo.lock"]);
+
+/**
+ * The digest a record holds when a listed file moved while the build ran (its bytes, size,
+ * times or inode), even one put back as it was: the compiler may have read anything in
+ * between, so the record names no sources, and the addon reads as built from other sources
+ * until the next build. No content digest (hex) equals it.
+ */
+const CHANGED_DURING_BUILD = "changed during the build";
 
 /**
  * A path a temporary file next to `target` can take: unique to this process and
@@ -471,11 +479,12 @@ function fingerprintOf(repoRoot, files) {
  * the stat of what was read. It never blocks: the file is read through `readRegularFile`, which
  * opens only a regular file, without following a link or waiting, and names anything else,
  * also a file swapped for another kind between its `lstat` and its `open`, by what stands
- * there. A file that is a regular file again by then, or a link gone before its target is read,
- * is `special\0changed` with a null stat, whose fingerprint line (`changed`) no `lstat` gives,
- * so no state is kept for it. A regular file that cannot be opened (no permission, no
- * descriptor left) throws that `open` error: it has no bytes to name, and naming it changed
- * would keep a verdict of other sources past the moment it is readable again.
+ * there. A file that is a regular file again by then, or a link that is no longer one when its
+ * target is read, is `special\0changed` with a null stat, whose fingerprint line (`changed`)
+ * no `lstat` gives, so no state is kept for it. A regular file that cannot be opened (no
+ * permission, no descriptor left), or a link whose target cannot be read, throws that error: it
+ * has nothing to name, and naming it changed would keep a verdict of other sources past the
+ * moment it can be read again.
  * @param {string} repoRoot
  * @param {string} rel
  * @returns {{ hash: string; stat: fs.Stats | null | undefined }}
@@ -490,14 +499,10 @@ function hashSource(repoRoot, rel) {
 	if (read.kind === "file") {
 		hasher.update(read.content);
 	} else if (read.kind === "symlink") {
-		let target;
-		try {
-			target = fs.readlinkSync(file);
-		} catch {
-			// Changed again since: no target to name.
-		}
-		if (target === undefined) return { hash: hasher.update("special\0changed").digest("hex"), stat: null };
-		hasher.update(`symlink\0${target}`);
+		const link = readLinkTarget(file);
+		if (link.kind === "unreadable") throw link.error;
+		if (link.kind === "changed") return { hash: hasher.update("special\0changed").digest("hex"), stat: null };
+		hasher.update(`symlink\0${link.target}`);
 	} else {
 		hasher.update(`special\0${read.kind}`);
 	}
@@ -515,25 +520,26 @@ function digestOf(files, hashes) {
 /**
  * Hash every listed file, and take the fingerprint of the state those bytes came from: each
  * file's size, times and inode as its own read found them (the descriptor it read, or the
- * `lstat` that named another kind). The fingerprint is null when the files no longer match it
- * once all are read: a file swapped or edited during the read, even one put back as it was,
- * leaves no state a later start could take these hashes for. Throws when a regular file cannot
- * be opened.
+ * `lstat` that named another kind), kept per file in `stats`. The fingerprint is null when the
+ * files no longer match it once all are read: a file swapped or edited during the read, even
+ * one put back as it was, leaves no state a later start could take these hashes for. Throws
+ * when a regular file cannot be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} files
- * @returns {{ hashes: Record<string, string>; fingerprint: string | null }}
+ * @returns {{ hashes: Record<string, string>; stats: Record<string, string>; fingerprint: string | null }}
  */
 function hashSources(repoRoot, files) {
 	/** @type {Record<string, string>} */
 	const hashes = {};
-	let lines = "";
+	/** @type {Record<string, string>} */
+	const stats = {};
 	for (const rel of files) {
 		const { hash, stat } = hashSource(repoRoot, rel);
 		hashes[rel] = hash;
-		lines += fingerprintLine(rel, stat);
+		stats[rel] = fingerprintLine(rel, stat);
 	}
-	const fingerprint = fingerprintDigest(lines);
-	return { hashes, fingerprint: fingerprint === fingerprintOf(repoRoot, files) ? fingerprint : null };
+	const fingerprint = fingerprintDigest(files.map(rel => stats[rel]).join(""));
+	return { hashes, stats, fingerprint: fingerprint === fingerprintOf(repoRoot, files) ? fingerprint : null };
 }
 
 /**
@@ -643,13 +649,14 @@ export function readRustSources(repoRoot, roots) {
 	const files = [...new Set([...listed.files, ...scannedFiles])].sort();
 	// A scanned directory's matched files are compiled whether git tracks them or not.
 	const untracked = listed.untracked.filter(rel => !scannedFiles.has(rel));
-	const { hashes, fingerprint } = hashSources(repoRoot, files);
+	const { hashes, stats, fingerprint } = hashSources(repoRoot, files);
 	return {
 		roots: [...roots],
 		checkout: checkoutId(repoRoot, true),
 		files,
 		untracked,
 		hashes,
+		stats,
 		fingerprint,
 		...identities(files, untracked, hashes),
 		scanned: scans.map(({ dir, globs, times }) => ({ dir, globs, dirs: times })),
@@ -661,21 +668,34 @@ export function readRustSources(repoRoot, roots) {
  * The sources to record once the build is done: `before` ({@link readRustSources}
  * before the build), except that a file the build itself rewrites
  * ({@link REWRITTEN_BY_BUILD}: `Cargo.lock`) takes the content the build left. If
- * any other listed file changed while the build ran, `before` stands, so the
- * addon reads as built from other sources until the next build.
+ * any other listed file moved while the build ran (its bytes, or its size, times or
+ * inode, as a file edited and put back as it was has), or a directory a build script
+ * scans did (a file added there and removed again), the record names no sources
+ * ({@link CHANGED_DURING_BUILD}), so the addon reads as built from other sources
+ * until the next build.
  * @param {string} repoRoot
  * @param {ReturnType<typeof readRustSources>} before
  * @returns {ReturnType<typeof readRustSources>}
  */
 export function settleRustSources(repoRoot, before) {
-	const { hashes, fingerprint } = hashSources(repoRoot, before.files);
-	const changed = before.files.filter(rel => hashes[rel] !== before.hashes[rel]);
-	if (changed.length === 0 || !changed.every(rel => REWRITTEN_BY_BUILD.has(rel))) return before;
+	const read = hashSources(repoRoot, before.files);
+	const fileMoved = before.files.some(
+		rel => !REWRITTEN_BY_BUILD.has(rel) && (read.stats[rel] !== before.stats[rel] || read.hashes[rel] !== before.hashes[rel]),
+	);
+	const directoryMoved = before.scanned.some(entry =>
+		Object.entries(entry.dirs).some(([rel, stamp]) => {
+			const stat = lstatSource(repoRoot, rel);
+			return !stat?.isDirectory() || directoryStamp(stat) !== stamp;
+		}),
+	);
+	if (fileMoved || directoryMoved) return { ...before, digest: CHANGED_DURING_BUILD, fingerprint: null };
+	if (before.files.every(rel => read.hashes[rel] === before.hashes[rel])) return before;
 	return {
 		...before,
-		hashes,
-		fingerprint,
-		...identities(before.files, before.untracked, hashes),
+		hashes: read.hashes,
+		stats: read.stats,
+		fingerprint: read.fingerprint,
+		...identities(before.files, before.untracked, read.hashes),
 	};
 }
 
@@ -745,7 +765,7 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 			version: SEEN_STATE_VERSION,
 			fingerprint: sources.fingerprint,
 			sameCheckout: sameCheckoutKey(sources.untracked.length > 0, sources.checkout, sources.checkout),
-			verdict: "current",
+			verdict: sources.digest === CHANGED_DURING_BUILD ? "other" : "current",
 		},
 		build,
 	});
@@ -870,6 +890,8 @@ export function addonSourcesState(addonPath, repoRoot) {
 	} catch {
 		return "unknown";
 	}
+	// A listed file moved while the addon was built: its sources are not known until the next build.
+	if (stamp.sources === CHANGED_DURING_BUILD) return "other";
 	try {
 		for (const { dir, buildScript } of stamp.packages) {
 			if ((lstatSource(repoRoot, path.posix.join(dir, "build.rs")) !== undefined) !== buildScript) return "other";

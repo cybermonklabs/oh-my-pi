@@ -14,6 +14,7 @@ import {
 	readRustSources,
 	writeAddonSourcesStamp,
 } from "../native/workspace-sources.js";
+import { installBuiltAddon } from "../scripts/install-addon";
 
 let repo = "";
 let addon = "";
@@ -100,4 +101,29 @@ describe("installing a locally built addon", () => {
 		expect(await Bun.file(addonSourcesStampPath(addon)).text()).toBe(recordBefore);
 		expect(addonSourcesState(addon, repo)).toBe("current");
 	}, 60_000);
+
+	it("records other sources for a file edited during the build and put back, times and all", async () => {
+		const lib = path.join(repo, "crates/pi-natives/src/lib.rs");
+		// A whole-second time, so it can be put back exactly.
+		const time = new Date(1_700_000_000_000);
+		await fs.utimes(lib, time, time);
+		const sourcesBeforeBuild = readRustSources(repo, CARGO_SOURCE_ROOTS);
+		// On a kernel whose timestamps are coarse, the clock moves on before the edit.
+		await Bun.sleep(25);
+		// The compiler reads an edit that is undone before the build ends.
+		await Bun.write(lib, "pub fn edited_during_build() {}\n");
+		await Bun.write(lib, "pub fn grep() {}\n");
+		await fs.utimes(lib, time, time);
+
+		await installBuiltAddon({
+			builtAddonPath: built,
+			addonPath: addon,
+			repoRoot: repo,
+			sourcesBeforeBuild,
+			build: { builder: "cargo" },
+		});
+
+		expect(await Bun.file(addon).text()).toBe("new addon bytes");
+		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
 });

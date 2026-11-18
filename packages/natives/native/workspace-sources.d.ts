@@ -27,12 +27,21 @@ export interface RustSources {
 	/** Each listed file's content hash; never written to the record. */
 	hashes: Record<string, string>;
 	/**
+	 * Each listed file's fingerprint line (size, modification time, change time and inode) as
+	 * the read of its bytes found it; never written to the record. The settle compares them.
+	 */
+	stats: Record<string, string>;
+	/**
 	 * SHA-256 over each listed file's path, size, modification time, change time and inode as
 	 * the read of its bytes found them, hex; null when a file no longer matched that once all
 	 * were read, or changed kind during its own read.
 	 */
 	fingerprint: string | null;
-	/** SHA-256 over each tracked file's path and content (a link's target, for a link), hex. */
+	/**
+	 * SHA-256 over each tracked file's path and content (a link's target, for a link), hex; or
+	 * `"changed during the build"` after a settle that saw a listed file move during the build,
+	 * which no tree matches.
+	 */
 	digest: string;
 	/** Each untracked file's content hash. */
 	untrackedHashes: Record<string, string>;
@@ -65,7 +74,9 @@ export function readRustSources(repoRoot: string, roots: readonly string[]): Rus
 
 /**
  * The sources to record after the build: `before`, with `Cargo.lock` as the build left it
- * when it is the only listed file that changed; `before` itself when anything else changed.
+ * when it is the only listed file that changed; sources no tree matches when any other listed
+ * file moved during the build (its bytes, size, times or inode), also one put back as it was,
+ * or a directory a build script scans did.
  */
 export function settleRustSources(repoRoot: string, before: RustSources): RustSources;
 

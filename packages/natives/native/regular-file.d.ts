@@ -37,11 +37,21 @@ export function readRegularFile(file: string, options?: { length?: number }): Re
 export function readRegularFileText(file: string): string | undefined;
 
 /**
+ * The target of the link at `file`: its text; `changed` when what stands there is no longer a
+ * link or is gone; or `unreadable`, with the error, when the target cannot be read.
+ */
+export function readLinkTarget(
+	file: string,
+): { kind: "symlink"; target: string } | { kind: "changed" } | { kind: "unreadable"; error: unknown };
+
+/**
  * Replace the file calls the reader makes (`undefined` restores them), for tests. It reaches
  * this module instance only (two under Bun's `--preserve-symlinks`; see the module).
  */
 export function __setRegularFileIoForTests(
 	replacement:
-		| Partial<Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync">>
+		| Partial<
+				Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync" | "readlinkSync">
+		  >
 		| undefined,
 ): void;
