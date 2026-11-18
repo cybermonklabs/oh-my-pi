@@ -1171,6 +1171,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#experimentalContextNotesReminder: { prompt: string; generation: number } | undefined;
 	#planModeState: PlanModeState | undefined;
 	#vibeModeState: VibeModeState | undefined;
+	/**
+	 * The branch entry the newest vibe mode note went out after (null: before the first entry), unset until one goes
+	 * out while vibe mode is on. The note is never persisted, so this is the branch's record that it carried one
+	 * ({@link #branchCarriesVibeModeNote}).
+	 */
+	#vibeModeNoteSentAfter: string | null | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	readonly #advisors: SessionAdvisors;
@@ -4510,7 +4516,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (message.role === "hookMessage" || message.role === "custom") {
 			// One-run instructions must not return from persisted history: prewalk
 			// nudges are consumed once, and Vibe context is rebuilt only while active.
-			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
+			if (message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
+				if (this.#vibeModeState?.enabled) this.#vibeModeNoteSentAfter = this.sessionManager.getLeafId();
+			} else if (!isPrewalkPlanNudge(message)) {
 				this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
@@ -7854,7 +7862,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *   context holds;
 	 * - the approved-plan reference a compaction re-armed after the turn was prepared (the turn's own pre-prompt
 	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt;
-	 * - the plan, goal and vibe mode instructions of an active mode where no message of their kind is in the context;
+	 * - the plan, goal and vibe mode instructions of an active mode where no message of their kind is in the context
+	 *   but the current branch carried one since its last `/clear` (a compaction summarized it): a turn whose history
+	 *   never carried one, such as one an extension started before any prompt, gets none, as the prompt path adds
+	 *   them at each prompt ({@link #branchCarriesCustomMessage}, {@link #branchCarriesVibeModeNote});
 	 * - the notices of what changed since the prompt the model holds that the context no longer tells it, the top-level
 	 *   tools and `xd://` devices included ({@link SessionTools.missingContextNotices}).
 	 * The call sends them after its newest content, and later calls replay them from there.
@@ -7905,18 +7916,50 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const enabledToolNames = this.getEnabledToolNames();
 		if (!byType.has(PLAN_MODE_CONTEXT_MESSAGE_TYPE)) {
 			const planMode = await this.#buildPlanModeMessage(enabledToolNames);
-			if (planMode) missing.push(planMode);
+			if (planMode && this.#branchCarriesCustomMessage(PLAN_MODE_CONTEXT_MESSAGE_TYPE)) missing.push(planMode);
 		}
 		if (!byType.has(GOAL_MODE_CONTEXT_MESSAGE_TYPE)) {
 			const goalMode = this.#buildGoalModeMessage();
-			if (goalMode) missing.push(goalMode);
+			if (goalMode && this.#branchCarriesCustomMessage(GOAL_MODE_CONTEXT_MESSAGE_TYPE)) missing.push(goalMode);
 		}
 		if (!byType.has(VIBE_MODE_CONTEXT_MESSAGE_TYPE)) {
 			const vibeMode = this.#buildVibeModeMessage();
-			if (vibeMode) missing.push(vibeMode);
+			if (vibeMode && this.#branchCarriesVibeModeNote()) missing.push(vibeMode);
 		}
 		missing.push(...this.#tools.missingContextNotices(byType, context.systemPrompt, enabledToolNames));
 		return missing;
+	}
+
+	/**
+	 * Whether the current branch since its newest context reset (`/clear`) holds a `custom_message` entry of
+	 * `customType`: a mode note its history carried, which a context without one lost to a compaction. Scans from the
+	 * newest entry; a note goes out at each prompt, so a hit is near the end.
+	 */
+	#branchCarriesCustomMessage(customType: string): boolean {
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "reset_boundary") return false;
+			if (entry.type === "custom_message" && entry.customType === customType) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the current branch since its newest context reset (`/clear`) carried a vibe mode note. The note is never
+	 * persisted, so the record is the entry the newest one went out after ({@link #vibeModeNoteSentAfter}): the branch
+	 * holds it and grows past it.
+	 */
+	#branchCarriesVibeModeNote(): boolean {
+		const after = this.#vibeModeNoteSentAfter;
+		if (after === undefined) return false;
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.id === after) return index < branch.length - 1;
+			if (entry.type === "reset_boundary") return false;
+		}
+		return after === null && branch.length > 0;
 	}
 
 	/**
@@ -8362,6 +8405,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	setVibeModeState(state: VibeModeState | undefined): void {
 		this.#vibeModeState = state;
 		if (state?.enabled) return;
+		this.#vibeModeNoteSentAfter = undefined;
 
 		const isVibeContext = (message: AgentMessage): boolean =>
 			message.role === "custom" && message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE;
