@@ -19,7 +19,7 @@
 - Under those gVisor releases, the bash tool's `rm -r` no longer deletes files outside the tree it removes through a directory swapped for a symlink while it runs: it enters, and lists for `-i`, only the directory it found at the name, by device and inode, and reports any other as `Not a directory`
 - `find` without `-L` or `-H` no longer walks, or deletes below, a symlink put in place of its starting point after find checked it, on any kernel: the starting point opens without following a symlink there
 - The bash tool's `rm -r` no longer empties the target of a symlink put in place of its operand after rm checked it, on any kernel: the operand opens without following a symlink, as the directory `lstat` found, and any other is reported as `Not a directory`
-- Under those gVisor releases, `mv` of a directory across filesystems no longer deletes files outside the moved tree through a directory swapped for a symlink: it removes the copied source, and a directory it replaces, with `rm -r`'s walk
+- Under gVisor releases before 20261109.0, `mv` of a directory across filesystems no longer deletes files outside the moved tree through a directory swapped for a symlink: it removes the copied source, and a directory it replaces, with `rm -r`'s walk
 
 ## [18.18.6] - 2026-11-09
 
