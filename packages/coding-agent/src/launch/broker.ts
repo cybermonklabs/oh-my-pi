@@ -122,6 +122,12 @@ interface ManagedDaemon {
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+	/**
+	 * While this record's writes keep failing (a full or read-only disk): how
+	 * many failed in a row, and when a polling refresh may try again
+	 * ({@link persistRetryDelay}). Unset once a write succeeds.
+	 */
+	persistFailure?: { failures: number; retryAt: number };
 	/** Completes after a terminal generation's log, metadata, and completion notification are published. */
 	terminalSettled?: Promise<void>;
 	/**
@@ -315,6 +321,21 @@ function syncReadyPending(record: ManagedDaemon): void {
 	if (!record.logReady) pending.push("log");
 	if (!record.portReady) pending.push("port");
 	record.snapshot.readyPending = pending.length > 0 ? pending : undefined;
+}
+
+/** How often the broker refreshes a recovered detached daemon it does not hold, until it settles. */
+const RECOVERED_REFRESH_MS = 100;
+
+/** The longest wait of a polling refresh between two tries of a record's write that keeps failing. */
+const PERSIST_RETRY_MAX_MS = 5_000;
+
+/**
+ * How long a polling refresh waits, after the `failures`-th failed write in a row of a record,
+ * before it tries the write again: one refresh interval, doubled at each failure, capped at
+ * {@link PERSIST_RETRY_MAX_MS}. A request (`list`, `stop`, `send`, …) tries again at once.
+ */
+function persistRetryDelay(failures: number): number {
+	return Math.min(PERSIST_RETRY_MAX_MS, RECOVERED_REFRESH_MS * 2 ** Math.max(0, failures - 1));
 }
 
 /** Replace via a pid-scoped temp file; Windows may briefly deny replacement while a reader holds the target. */
@@ -774,7 +795,7 @@ class DaemonBroker {
 			case "start":
 				return this.#start(operation.spec, operation.owner, operation.replace, operation.awaitReady);
 			case "list": {
-				await Promise.all([...this.#records.values()].map(record => this.#refreshDetached(record)));
+				await Promise.all([...this.#records.values()].map(record => this.#refreshDetached(record, "request")));
 				return {
 					op: "list",
 					daemons: orderDaemonsForListing([...this.#records.values()].map(record => record.snapshot)),
@@ -806,7 +827,7 @@ class DaemonBroker {
 				return this.#mode(operation);
 			case "describe": {
 				const record = this.#record(operation.name);
-				await this.#refreshDetached(record);
+				await this.#refreshDetached(record, "request");
 				return { op: "describe", daemon: record.snapshot, spec: record.spec };
 			}
 			case "shutdown":
@@ -835,7 +856,7 @@ class DaemonBroker {
 		let record: ManagedDaemon;
 		try {
 			const existing = this.#records.get(spec.name);
-			if (existing) await this.#refreshDetached(existing);
+			if (existing) await this.#refreshDetached(existing, "request");
 			if (existing && !terminalState(existing.snapshot.state)) {
 				if (!replace) throw new Error(`Daemon ${spec.name} is already ${existing.snapshot.state}`);
 				await this.#stopRecord(existing, 2_000);
@@ -1143,13 +1164,20 @@ class DaemonBroker {
 	 * ({@link #refreshMark}), retries the kills it could not pin the daemon for
 	 * ({@link ManagedDaemon.pendingKills}), then, for a detached daemon this
 	 * broker does not hold, reads its output and settles it once it is gone.
+	 *
+	 * `retry` is who asks: a `"request"` (`list`, `stop`, `send`, …) tries a
+	 * failed write again at once; a `"poll"` (the recovered-detached monitor,
+	 * a request's wait loop) only once {@link persistRetryDelay} has passed
+	 * since the last failure, so a disk that stays full is not written to at
+	 * each poll.
 	 */
-	async #refreshDetached(record: ManagedDaemon): Promise<void> {
+	async #refreshDetached(record: ManagedDaemon, retry: "request" | "poll"): Promise<void> {
 		if (settledState(record.snapshot.state)) return;
 		// A failed write (a full or read-only disk) left `persistedMeta` unset:
 		// what only memory holds, a mark read at refresh among it, is written
-		// again at each refresh until a write succeeds.
-		if (record.persistedMeta === undefined) {
+		// again until a write succeeds.
+		const retryAt = record.persistFailure?.retryAt ?? 0;
+		if (record.persistedMeta === undefined && (retry === "request" || Date.now() >= retryAt)) {
 			this.#persist(record);
 			await record.persistQueue;
 		}
@@ -1167,10 +1195,11 @@ class DaemonBroker {
 	 * {@link markOwnChild}: a mark read for the broker's own child is given to
 	 * the pending kills of the same daemon, which then pin it, and persisted
 	 * before this returns: a request that refreshed the record (`list`, `stop`,
-	 * `send`) replies once the write is done or has failed (logged), so a
+	 * `send`) replies once the write is done or has failed (logged once), so a
 	 * broker that dies right after a write that succeeded cannot lose the mark
 	 * again (its successor could not read it: the daemon is no longer that
-	 * broker's child). A write that failed is made again at the next refresh.
+	 * broker's child). A write that failed is made again at the next request,
+	 * or at a poll once {@link persistRetryDelay} has passed.
 	 */
 	async #refreshMark(record: ManagedDaemon): Promise<void> {
 		if (!markOwnChild(record)) return;
@@ -1245,9 +1274,9 @@ class DaemonBroker {
 
 	async #monitorRecoveredDetached(record: ManagedDaemon, generation: number): Promise<void> {
 		while (!this.#shuttingDown && generation === record.generation && !settledState(record.snapshot.state)) {
-			await Bun.sleep(100);
+			await Bun.sleep(RECOVERED_REFRESH_MS);
 			if (this.#shuttingDown || generation !== record.generation) return;
-			await this.#refreshDetached(record);
+			await this.#refreshDetached(record, "poll");
 		}
 	}
 
@@ -1373,7 +1402,7 @@ class DaemonBroker {
 
 	async #logs(operation: Extract<DaemonOperation, { op: "logs" }>, signal?: AbortSignal): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		const cursor = operation.cursor ?? record.snapshot.outputBytes;
 		let timedOut = false;
 		if (operation.follow && record.snapshot.outputBytes <= cursor && !terminalState(record.snapshot.state)) {
@@ -1423,7 +1452,7 @@ class DaemonBroker {
 		// relaunches reuse the managed record, so polling the record without this
 		// binding can hang past an exit or consume the replacement's output.
 		const boundGeneration = record.generation;
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		let matched: string | undefined;
 		let pattern: RegExp | undefined;
 		if (operation.pattern) {
@@ -1478,7 +1507,7 @@ class DaemonBroker {
 
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
@@ -1511,7 +1540,7 @@ class DaemonBroker {
 	}
 
 	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state)) return;
 		record.stopRequested = true;
 		if (record.restartTimer) {
@@ -1566,7 +1595,7 @@ class DaemonBroker {
 
 	async #mode(operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "request");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
@@ -1596,12 +1625,12 @@ class DaemonBroker {
 		const deadline = Date.now() + Math.max(0, timeoutMs);
 		while (Date.now() < deadline) {
 			if (signal?.aborted) return condition();
-			await this.#refreshDetached(record);
+			await this.#refreshDetached(record, "poll");
 			if (condition()) return true;
 			if (this.#shuttingDown && terminalState(record.snapshot.state)) return condition();
 			await Bun.sleep(50);
 		}
-		await this.#refreshDetached(record);
+		await this.#refreshDetached(record, "poll");
 		return condition();
 	}
 
@@ -1639,11 +1668,27 @@ class DaemonBroker {
 				// Spec first: recovery must never find metadata whose spec is not on disk.
 				if (writeSpec) await writeFileAtomic(path.join(record.dir, DAEMON_SPEC_FILE), spec);
 				if (writeMeta) await writeFileAtomic(path.join(record.dir, DAEMON_META_FILE), metadata);
+				// Both files are on disk as recorded, unless a failed write queued before this
+				// one has since made that unknown (the retry then writes both again).
+				const failed = record.persistFailure;
+				if (failed && record.persistedSpec !== undefined && record.persistedMeta !== undefined) {
+					record.persistFailure = undefined;
+					logger.warn("Persisted daemon metadata again", {
+						name: record.snapshot.name,
+						failedWrites: failed.failures,
+					});
+				}
 			})
 			.catch(error => {
 				// Unknown on-disk state: force the next persist to write both files.
 				record.persistedSpec = undefined;
 				record.persistedMeta = undefined;
+				// Warned once, at the first failure in a row: a disk that stays full would
+				// otherwise log each retry ({@link persistRetryDelay}), and the recovery is
+				// warned once too, above.
+				const failures = (record.persistFailure?.failures ?? 0) + 1;
+				record.persistFailure = { failures, retryAt: Date.now() + persistRetryDelay(failures) };
+				if (failures > 1) return;
 				logger.warn("Failed to persist daemon metadata", {
 					name: record.snapshot.name,
 					error: error instanceof Error ? error.message : String(error),
