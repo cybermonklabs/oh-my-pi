@@ -7,7 +7,7 @@ import {
 import puppeteer from "puppeteer-core";
 import { pastForeignFrames } from "../../../browser-relay/extension/foreign-frames";
 import { rejectionOf } from "../helpers/rejection";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, TEST_CHROMIUM_ARGS } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -86,7 +86,9 @@ describe("pastForeignFrames", () => {
 			const browser = await puppeteer.launch({
 				executablePath: await ensureChromiumExecutable(),
 				headless: true,
-				args: ["--no-first-run", ...RENDERER_PRIORITY_ARGS],
+				// No launch limit of its own: Chromium's start or exit decides, and the test's timeout bounds a hang.
+				timeout: 0,
+				args: [...TEST_CHROMIUM_ARGS, "--no-first-run", ...RENDERER_PRIORITY_ARGS],
 			});
 			try {
 				const page = await browser.newPage();

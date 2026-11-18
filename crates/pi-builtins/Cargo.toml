@@ -176,6 +176,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 anyhow = "1.0.102"
+pi-shell.workspace = true
 tempfile = "3"
 
 [features]

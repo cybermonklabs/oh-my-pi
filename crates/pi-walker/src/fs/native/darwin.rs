@@ -19,7 +19,7 @@ use std::{
 
 use super::{
 	aligned_buf, is_dot_or_dot_dot, le16, le32, le64,
-	unix::{Scratch, nanos, openat_plain, type_of_dt, type_of_mode},
+	unix::{Scratch, nanos, openat_plain, type_of_dt, type_of_mode, walk_beneath},
 };
 use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
 
@@ -68,6 +68,18 @@ unsafe extern "C" {
 
 pub(super) fn openat(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<OwnedFd> {
 	openat_plain(dir, path, flags)
+}
+
+/// Opens `rel` below `dir` following no symlink on the way: the portable
+/// [`walk_beneath`], which needs nothing newer than `openat` and
+/// `O_NOFOLLOW`.
+pub(super) fn open_beneath(
+	s: &mut Scratch,
+	dir: RawFd,
+	rel: &[u8],
+	flags: c_int,
+) -> io::Result<OwnedFd> {
+	walk_beneath(s, dir, rel, flags)
 }
 
 fn eio() -> io::Error {

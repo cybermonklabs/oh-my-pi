@@ -8,6 +8,7 @@ import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { chromiumAvailable } from "./chromium-probe";
+import { holdHeadlessBrowserForFile } from "./held-browser";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 
@@ -120,6 +121,8 @@ beforeAll(async () => {
 	});
 	url = `http://127.0.0.1:${site.port}/`;
 });
+// After the hook above, which makes the directory the sessions run in.
+holdHeadlessBrowserForFile(CHROMIUM_AVAILABLE, () => tempDir);
 
 afterAll(async () => {
 	await releaseAllTabs({ kill: true });
