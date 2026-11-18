@@ -1414,7 +1414,7 @@ export async function discoverLiteLLMModels(
 	if (richModels === null) {
 		return discoverOpenAIModelsList({ ...providerConfig, baseUrl }, ctx);
 	}
-	return richModels.map(spec => buildDiscoveredModel({ ...spec, headers: baseHeaders }, "litellm"));
+	return mapInSlices(richModels, spec => buildDiscoveredModel({ ...spec, headers: baseHeaders }, "litellm"));
 }
 
 /**

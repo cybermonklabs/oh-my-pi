@@ -284,8 +284,9 @@ describe("ModelRegistry discovery slicing", () => {
 			return reads;
 		};
 		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
-		// Measured: 6.6 reads per row; 5.5 with the relabel unsliced.
-		expect(readsPerRow).toBeGreaterThan(6);
+		// Measured: 6.6 reads per row; 5.5 with the relabel unsliced. An exact count, so a step
+		// that gains a per-row check cannot hide an unsliced relabel.
+		expect(readsPerRow).toBeCloseTo(6.6, 1);
 	});
 
 	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {

@@ -5,7 +5,7 @@
 ### Fixed
 
 - Starting omp no longer freezes timers, network handshakes and the terminal for seconds while model discovery merges the cached model catalog: discovery now gives the event loop a turn after each 10 ms slice of its work (a slice can overrun by one step, such as one provider catalog's parse or write) ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
-- Discovery for providers configured in models.yml (openai-models-list, litellm, lm-studio, proxy, ollama, llama.cpp) decodes, parses, maps and builds each fetched model list in slices, and a shared catalog discovered under another provider id is relabelled in slices
+- Discovery for providers configured in models.yml (openai-models-list, litellm, lm-studio, proxy, ollama, llama.cpp) decodes, parses, maps and builds each fetched model list in slices, ollama, llama.cpp and lm-studio rows are rebuilt in slices after their refresh, and a shared catalog discovered under another provider id is relabelled in slices
 
 ## [18.18.6] - 2026-11-09
 

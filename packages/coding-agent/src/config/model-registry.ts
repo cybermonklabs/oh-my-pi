@@ -1967,24 +1967,53 @@ export class ModelRegistry {
 	}
 
 	#applyProviderCompat(compat: ModelSpec<Api>["compat"] | undefined, models: Model<Api>[]): Model<Api>[] {
+		return runToCompletion(this.#providerCompatSteps(compat, models));
+	}
+
+	/** {@link #applyProviderCompat} with one slice unit per rebuilt model. */
+	*#providerCompatSteps(
+		compat: ModelSpec<Api>["compat"] | undefined,
+		models: Model<Api>[],
+	): Generator<void, Model<Api>[], undefined> {
 		if (!compat) return models;
-		return models.map(model =>
-			buildModel({ ...model, compat: mergeCompat(model.compatConfig, compat) } as ModelSpec<Api>),
-		);
+		const out: Model<Api>[] = [];
+		for (const model of models) {
+			yield;
+			out.push(buildModel({ ...model, compat: mergeCompat(model.compatConfig, compat) } as ModelSpec<Api>));
+		}
+		return out;
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		const withDecoderMetadata =
+		return runToCompletion(this.#normalizeDiscoverableModelSteps(providerConfig, models));
+	}
+
+	/** {@link #normalizeDiscoverableModels} with one slice unit per rebuilt model. */
+	*#normalizeDiscoverableModelSteps(
+		providerConfig: DiscoveryProviderConfig,
+		models: Model<Api>[],
+	): Generator<void, Model<Api>[], undefined> {
+		let out = models;
+		if (
 			providerConfig.discovery.type === "ollama" ||
 			providerConfig.discovery.type === "llama.cpp" ||
 			providerConfig.discovery.type === "lm-studio"
-				? models.map(model =>
-						buildModel({ ...model, imageInputDecoder: "stb", compat: model.compatConfig } as ModelSpec<Api>),
-					)
-				: models;
+		) {
+			const withDecoderMetadata: Model<Api>[] = [];
+			for (const model of out) {
+				yield;
+				withDecoderMetadata.push(
+					buildModel({ ...model, imageInputDecoder: "stb", compat: model.compatConfig } as ModelSpec<Api>),
+				);
+			}
+			out = withDecoderMetadata;
+		}
 
-		const withRemoteCompaction = providerConfig.remoteCompaction
-			? withDecoderMetadata.map(model =>
+		if (providerConfig.remoteCompaction) {
+			const withRemoteCompaction: Model<Api>[] = [];
+			for (const model of out) {
+				yield;
+				withRemoteCompaction.push(
 					buildModel({
 						...model,
 						remoteCompaction: mergeProviderRemoteCompactionConfig(
@@ -1993,18 +2022,22 @@ export class ModelRegistry {
 						),
 						compat: model.compatConfig,
 					} as ModelSpec<Api>),
-				)
-			: withDecoderMetadata;
+				);
+			}
+			out = withRemoteCompaction;
+		}
 
 		// User config plumbing, not catalog policy: an ollama provider configured
 		// for Responses moves its completions-discovered rows onto that API.
 		// KDL `api-routes` key on model ids and cannot see the provider config.
 		if (providerConfig.provider !== "ollama" || providerConfig.api !== "openai-responses") {
-			return withRemoteCompaction;
+			return out;
 		}
 
 		const contextLengthOverride = getOllamaContextLengthOverride();
-		return withRemoteCompaction.map(model => {
+		const onResponses: Model<Api>[] = [];
+		for (const model of out) {
+			yield;
 			const normalized =
 				model.api === "openai-completions"
 					? buildModel({
@@ -2013,15 +2046,17 @@ export class ModelRegistry {
 							compat: model.compatConfig,
 						} as ModelSpec<Api>)
 					: model;
-			if (contextLengthOverride === undefined) {
-				return normalized;
-			}
-			return {
-				...normalized,
-				contextWindow: contextLengthOverride,
-				maxTokens: Math.min(contextLengthOverride, DISCOVERY_DEFAULT_MAX_TOKENS),
-			};
-		});
+			onResponses.push(
+				contextLengthOverride === undefined
+					? normalized
+					: {
+							...normalized,
+							contextWindow: contextLengthOverride,
+							maxTokens: Math.min(contextLengthOverride, DISCOVERY_DEFAULT_MAX_TOKENS),
+						},
+			);
+		}
+		return onResponses;
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
@@ -2555,7 +2590,9 @@ export class ModelRegistry {
 				});
 				this.#lastDiscoveryWarnings.delete(providerConfig.provider);
 				return {
-					models: cached ? this.#normalizeDiscoverableModels(providerConfig, cached.models) : [],
+					models: cached
+						? await runInSlices(this.#normalizeDiscoverableModelSteps(providerConfig, cached.models))
+						: [],
 					replaceRuntimeModels: false,
 				};
 			}
@@ -2627,14 +2664,11 @@ export class ModelRegistry {
 		if (discoveryError) {
 			this.#warnProviderDiscoveryFailure(providerConfig, discoveryError);
 		}
+		// A local server can list thousands of models: rebuild them in slices.
+		const withCompat = await runInSlices(this.#providerCompatSteps(providerConfig.compat, result.models));
+		const normalized = await runInSlices(this.#normalizeDiscoverableModelSteps(providerConfig, withCompat));
 		return {
-			models: this.#applyProviderModelOverrides(
-				providerId,
-				this.#normalizeDiscoverableModels(
-					providerConfig,
-					this.#applyProviderCompat(providerConfig.compat, result.models),
-				),
-			),
+			models: this.#applyProviderModelOverrides(providerId, normalized),
 			replaceRuntimeModels: result.source === "provider",
 		};
 	}

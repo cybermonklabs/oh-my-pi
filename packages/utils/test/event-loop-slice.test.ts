@@ -207,7 +207,8 @@ describe("runInSlices", () => {
 });
 
 describe("readJsonInSlices", () => {
-	// About 10 MB: its parse outlasts a slice's budget, and its decode the timers' 1 ms clamp, on any machine.
+	// About 10 MB: its decode and parse outlast the timers' 1 ms clamp on any machine, so a timer set
+	// before them is due when the slicer next looks. The tests' mocked clocks decide when a slice is spent.
 	const body = JSON.stringify(
 		Array.from({ length: 150_000 }, (_, index) => ({
 			id: `model-${index}`,
@@ -222,13 +223,19 @@ describe("readJsonInSlices", () => {
 			[new Response(body), new Response(body)].map(response => response.arrayBuffer()),
 		);
 		await new Promise(resolve => setTimeout(resolve, 5));
+		// The clock moves only inside a parse, by 11 ms: the decode never spends the slice, whatever the load.
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
 		let fired = false;
 		setTimeout(() => (fired = true), 0);
 		// Whether the timer had fired when each payload's parse started.
 		const firedAtParse: boolean[] = [];
 		const parse = JSON.parse;
 		vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]) => {
-			if (text.length === body.length) firedAtParse.push(fired);
+			if (text.length === body.length) {
+				firedAtParse.push(fired);
+				now += 11;
+			}
 			return parse(text, reviver);
 		});
 		const parsed = await Promise.all(bodies.map(bytes => parseJsonBytesInSlices(bytes)));

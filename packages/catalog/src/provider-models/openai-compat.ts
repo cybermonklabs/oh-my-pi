@@ -1,5 +1,5 @@
 import { USER_AGENT, getInstallId } from "@oh-my-pi/pi-utils";
-import { parseJsonBytesInSlices, readJsonInSlices } from "@oh-my-pi/pi-utils/event-loop-slice";
+import { nextSlice, parseJsonBytesInSlices, readJsonInSlices, sliceExpired } from "@oh-my-pi/pi-utils/event-loop-slice";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { toClinePassPublicModelId } from "../cline-pass-model-id";
 import {
@@ -6284,6 +6284,8 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 	const deduped = new Map<string, LiteLLMRichEndpointModel<TApi>>();
 	const excludedModelIds = new Set<string>();
 	for (const entry of entries) {
+		// A proxy can list thousands of entries: map them in slices.
+		while (sliceExpired()) await nextSlice();
 		if (isLiteLLMUnusableSentinelPlaceholder(entry)) {
 			continue;
 		}
