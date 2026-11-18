@@ -609,6 +609,8 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 			// Open the just-stat'd subdirectory as that directory, not
 			// following a symlink: one swapped in since the stat makes the open
 			// fail instead of taking the walk off the tree.
+			#[cfg(test)]
+			crate::host::run_hook(path_of(&path_buf));
 			let child_fd = match open_stat_subdir(&cur_fd, &entry_name, entry_id) {
 				Ok(fd) => fd,
 				Err(e) => {
