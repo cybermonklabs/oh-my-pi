@@ -72,6 +72,8 @@ async function runConfigSet(tempDir: TempDir, settingsInit: SettingsInitMode): P
 	const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1" };
 	delete env.PI_CODING_AGENT_DIR;
 	delete env.PI_CONFIG_DIR;
+	delete env.OMP_CONFIG_ROOT;
+	delete env.OMP_DOWNLOAD_ROOT;
 	delete env.OMP_PROFILE;
 	delete env.PI_PROFILE;
 	delete env.XDG_CACHE_HOME;

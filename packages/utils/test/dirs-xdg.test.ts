@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,6 +18,8 @@ const ENV_KEYS = [
 	"PI_PROFILE",
 	"PI_CONFIG_DIR",
 	"PI_CODING_AGENT_DIR",
+	"OMP_CONFIG_ROOT",
+	"OMP_DOWNLOAD_ROOT",
 	"XDG_DATA_HOME",
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
@@ -31,6 +33,7 @@ describe("XDG-aware runtime paths", () => {
 	let originalAgentDir = "";
 	let originalProfile: string | undefined;
 	let originalEnv: Partial<Record<(typeof ENV_KEYS)[number], string>> = {};
+	let homedirSpy: Mock<typeof os.homedir> | undefined;
 
 	beforeEach(async () => {
 		originalAgentDir = getAgentDir();
@@ -38,11 +41,16 @@ describe("XDG-aware runtime paths", () => {
 		originalEnv = {};
 		for (const key of ENV_KEYS) originalEnv[key] = process.env[key];
 		tempRoot = path.join(os.tmpdir(), "pi-utils-dirs-xdg", Snowflake.next());
+		// The config root is `<home>/<configDir>`: a home of this test's own, not the one
+		// the test process runs in (whose root the preload replaced).
+		homedirSpy = spyOn(os, "homedir").mockReturnValue(path.join(tempRoot, "home"));
 		configDir = `.omp-dirs-xdg-${Snowflake.next()}`;
 		defaultAgentDir = path.join(os.homedir(), configDir, "agent");
 		await fs.mkdir(tempRoot, { recursive: true });
 		process.env.PI_CONFIG_DIR = configDir;
 		delete process.env.PI_CODING_AGENT_DIR;
+		delete process.env.OMP_CONFIG_ROOT;
+		delete process.env.OMP_DOWNLOAD_ROOT;
 		delete process.env.XDG_DATA_HOME;
 		delete process.env.XDG_STATE_HOME;
 		delete process.env.XDG_CACHE_HOME;
@@ -56,10 +64,10 @@ describe("XDG-aware runtime paths", () => {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
+		homedirSpy?.mockRestore();
 		if (originalProfile) setProfile(originalProfile);
 		setAgentDir(originalAgentDir);
 		await fs.rm(tempRoot, { recursive: true, force: true });
-		await fs.rm(path.join(os.homedir(), configDir), { recursive: true, force: true });
 	});
 
 	it.skipIf(!xdgPlatform)(

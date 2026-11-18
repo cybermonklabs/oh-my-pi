@@ -680,42 +680,6 @@ fn inplace_partial_retry_resolves_the_partial_dir_again() {
 	assert!(!fx.path("f").exists());
 }
 
-/// The same race with the real ownership rule (root only): the swapped-in
-/// symlink belongs to another user, so the retry prints upstream's notice.
-#[cfg(unix)]
-#[test]
-fn inplace_partial_retry_refuses_a_foreign_symlink_swapped_in() {
-	// SAFETY: geteuid has no preconditions.
-	if unsafe { libc::geteuid() } != 0 {
-		return;
-	}
-	let mut o = opts();
-	o.keep_partial = true;
-	o.partial_dir = Some("pdir".into());
-	let proto = Proto { version: 33, compat: CF_INPLACE_PARTIAL_DIR };
-	let fx = Fixture::new(o, proto, SEED);
-	std::fs::create_dir(fx.path("pdir")).unwrap();
-	std::fs::write(fx.path("pdir/f"), b"0123456789").unwrap();
-	std::fs::create_dir(fx.path("secret")).unwrap();
-	std::fs::write(fx.path("secret/f"), b"OTHER-SECRET!!!").unwrap();
-	let (pdir, held) = (fx.path("pdir"), fx.path(".pdir-held"));
-	hooks::fail_next_inplace_open(move || {
-		std::fs::rename(&pdir, &held).unwrap();
-		std::os::unix::fs::symlink("secret", &pdir).unwrap();
-		std::os::unix::fs::lchown(&pdir, Some(65534), Some(65534)).unwrap();
-	});
-	let flists = flists_of(vec![entry("f", 15, 0o100_644, 1_400_000_000)]);
-	let trees = fx.trees();
-	let (result, _) = fx.run(&trees, &flists, partial_basis_stream(proto));
-	result.unwrap();
-	let messages = fx.messages();
-	assert!(messages.contains(crate::rsync::paths::UNTRUSTED_SYMLINK_NOTICE), "{messages}");
-	let shown = format!("open \"{}\" failed: Too many levels of symbolic links", fx.path("pdir/f").display());
-	assert!(messages.contains(&shown), "{messages}");
-	assert_eq!(std::fs::read(fx.path("secret/f")).unwrap(), b"OTHER-SECRET!!!");
-	assert!(!fx.path("f").exists());
-}
-
 /// A one-file stream whose basis is the partial-dir file (10 bytes of block 0 + "abcde").
 #[cfg(unix)]
 fn partial_basis_stream(proto: Proto) -> Vec<u8> {
@@ -766,32 +730,77 @@ fn inplace_partial_dir_output_is_not_followed_through_a_refused_symlink() {
 	assert!(!fx.path("f").exists());
 }
 
-/// B17 with the real ownership rule: a `pdir` symlink owned by another user is
-/// refused even though it stays inside the tree (needs root to chown it).
+/// Tests that plant a symlink owned by another user, so they need a process
+/// that can give a file away: root, outside a one-uid user namespace. Bazel
+/// runs them in `//crates/pi-builtins:pi-builtins_foreign_owner_test`, whose
+/// tests are named by this module.
 #[cfg(unix)]
-#[test]
-fn inplace_partial_dir_refuses_a_foreign_owned_symlink() {
-	// SAFETY: geteuid has no preconditions.
-	if unsafe { libc::geteuid() } != 0 {
-		return;
+mod foreign_owner {
+	use super::*;
+
+	/// The in-place partial-dir race of
+	/// `inplace_partial_retry_resolves_the_partial_dir_again` with the real
+	/// ownership rule: the swapped-in symlink belongs to another user, so the
+	/// retry prints upstream's notice.
+	#[test]
+	fn inplace_partial_retry_refuses_a_foreign_symlink_swapped_in() {
+		if !crate::rsync::paths::can_give_files_away("inplace_partial_retry_refuses_a_foreign_symlink_swapped_in") {
+			return;
+		}
+		let another = Some(crate::rsync::paths::ANOTHER_USER);
+		let mut o = opts();
+		o.keep_partial = true;
+		o.partial_dir = Some("pdir".into());
+		let proto = Proto { version: 33, compat: CF_INPLACE_PARTIAL_DIR };
+		let fx = Fixture::new(o, proto, SEED);
+		std::fs::create_dir(fx.path("pdir")).unwrap();
+		std::fs::write(fx.path("pdir/f"), b"0123456789").unwrap();
+		std::fs::create_dir(fx.path("secret")).unwrap();
+		std::fs::write(fx.path("secret/f"), b"OTHER-SECRET!!!").unwrap();
+		let (pdir, held) = (fx.path("pdir"), fx.path(".pdir-held"));
+		hooks::fail_next_inplace_open(move || {
+			std::fs::rename(&pdir, &held).unwrap();
+			std::os::unix::fs::symlink("secret", &pdir).unwrap();
+			std::os::unix::fs::lchown(&pdir, another, another).unwrap();
+		});
+		let flists = flists_of(vec![entry("f", 15, 0o100_644, 1_400_000_000)]);
+		let trees = fx.trees();
+		let (result, _) = fx.run(&trees, &flists, partial_basis_stream(proto));
+		result.unwrap();
+		let messages = fx.messages();
+		assert!(messages.contains(crate::rsync::paths::UNTRUSTED_SYMLINK_NOTICE), "{messages}");
+		let shown = format!("open \"{}\" failed: Too many levels of symbolic links", fx.path("pdir/f").display());
+		assert!(messages.contains(&shown), "{messages}");
+		assert_eq!(std::fs::read(fx.path("secret/f")).unwrap(), b"OTHER-SECRET!!!");
+		assert!(!fx.path("f").exists());
 	}
-	let mut o = opts();
-	o.keep_partial = true;
-	o.partial_dir = Some("pdir".into());
-	let proto = Proto { version: 33, compat: CF_INPLACE_PARTIAL_DIR };
-	let fx = Fixture::new(o, proto, SEED);
-	std::fs::create_dir(fx.path("secret")).unwrap();
-	std::fs::write(fx.path("secret/f"), b"0123456789").unwrap();
-	std::os::unix::fs::symlink("secret", fx.path("pdir")).unwrap();
-	std::os::unix::fs::lchown(fx.path("pdir"), Some(65534), Some(65534)).unwrap();
-	let flists = flists_of(vec![entry("f", 15, 0o100_644, 1_400_000_000)]);
-	let trees = fx.trees();
-	let (result, _) = fx.run(&trees, &flists, partial_basis_stream(proto));
-	result.unwrap();
-	let messages = fx.messages();
-	assert!(messages.contains(crate::rsync::paths::UNTRUSTED_SYMLINK_NOTICE), "{messages}");
-	assert_eq!(std::fs::read(fx.path("secret/f")).unwrap(), b"0123456789");
-	assert!(!fx.path("f").exists());
+
+	/// B17 with the real ownership rule: a `pdir` symlink owned by another user
+	/// is refused even though it stays inside the tree.
+	#[test]
+	fn inplace_partial_dir_refuses_a_foreign_owned_symlink() {
+		if !crate::rsync::paths::can_give_files_away("inplace_partial_dir_refuses_a_foreign_owned_symlink") {
+			return;
+		}
+		let another = Some(crate::rsync::paths::ANOTHER_USER);
+		let mut o = opts();
+		o.keep_partial = true;
+		o.partial_dir = Some("pdir".into());
+		let proto = Proto { version: 33, compat: CF_INPLACE_PARTIAL_DIR };
+		let fx = Fixture::new(o, proto, SEED);
+		std::fs::create_dir(fx.path("secret")).unwrap();
+		std::fs::write(fx.path("secret/f"), b"0123456789").unwrap();
+		std::os::unix::fs::symlink("secret", fx.path("pdir")).unwrap();
+		std::os::unix::fs::lchown(fx.path("pdir"), another, another).unwrap();
+		let flists = flists_of(vec![entry("f", 15, 0o100_644, 1_400_000_000)]);
+		let trees = fx.trees();
+		let (result, _) = fx.run(&trees, &flists, partial_basis_stream(proto));
+		result.unwrap();
+		let messages = fx.messages();
+		assert!(messages.contains(crate::rsync::paths::UNTRUSTED_SYMLINK_NOTICE), "{messages}");
+		assert_eq!(std::fs::read(fx.path("secret/f")).unwrap(), b"0123456789");
+		assert!(!fx.path("f").exists());
+	}
 }
 
 /// T: a `--temp-dir` that climbs out with ".." is refused per file, as upstream's

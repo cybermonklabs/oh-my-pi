@@ -1730,7 +1730,12 @@ mod tests {
 	/// Runs `df` with `args` and exported `env`, from the repository's
 	/// crate directory. Returns `(status, stdout, stderr)`.
 	fn run(env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
-		let (mut host, capture) = Host::for_test("df", "", env!("CARGO_MANIFEST_DIR"));
+		run_in(Path::new(env!("CARGO_MANIFEST_DIR")), env, args)
+	}
+
+	/// [`run`] from the shell directory `dir`.
+	fn run_in(dir: &Path, env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
+		let (mut host, capture) = Host::for_test("df", "", dir);
 		for (key, value) in env {
 			host.set_test_var(key, value);
 		}
@@ -1755,8 +1760,12 @@ mod tests {
 	/// Mount point printed for the `/` operand: the root, or on Windows the
 	/// drive root holding the crate directory.
 	fn root_target() -> String {
-		let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-		crate_dir.ancestors().last().unwrap_or(crate_dir).to_string_lossy().into_owned()
+		root_of(Path::new(env!("CARGO_MANIFEST_DIR")))
+	}
+
+	/// The root, or on Windows the drive root, holding `dir`.
+	fn root_of(dir: &Path) -> String {
+		dir.ancestors().last().unwrap_or(dir).to_string_lossy().into_owned()
 	}
 
 	#[test]
@@ -1872,16 +1881,57 @@ mod tests {
 
 	#[test]
 	fn operand_selects_the_mount_holding_it() {
-		let (code, out, err) = run(&[], &["--output=file,target", "src", "/"]);
+		// The shell's directory is one this test makes, and the relative
+		// operand names an entry only that directory holds. The crate directory
+		// the test was compiled in (`CARGO_MANIFEST_DIR`) need not hold `src`
+		// where the test runs: under Bazel's test runner, `df` found no `src`
+		// there.
+		let dir = tempfile::tempdir().unwrap();
+		let held = dir.path().join("df-operand");
+		std::fs::create_dir(&held).unwrap();
+		let mut args = vec!["--output=file,target", "df-operand", held.to_str().unwrap(), "/"];
+		// On a file system the root never holds, so a wrong mount shows.
+		if cfg!(target_os = "linux") {
+			args.push("/proc");
+		}
+		let (code, out, err) = run_in(dir.path(), &[], &args);
 		assert_eq!((code, err.as_str()), (0, ""));
-		let lines: Vec<&str> = out.lines().collect();
-		assert_eq!(lines.len(), 3, "{out}");
-		assert!(lines[0].starts_with("File Mounted on"), "{out}");
-		// Relative operands resolve against the shell's directory and print
-		// as given.
-		let root = root_target();
-		assert!(lines[1].starts_with(&format!("src  {root}")), "{out}");
-		assert_eq!(lines[2], format!("/    {root}"));
+		let mut lines = out.lines();
+		let header = lines.next().unwrap_or_default();
+		assert_eq!(header.split_whitespace().collect::<Vec<_>>(), ["File", "Mounted", "on"], "{out}");
+		// The file column is padded to one width, so the target starts where
+		// its heading does.
+		let column = header.find("Mounted on").unwrap();
+		let rows: Vec<(&str, &str)> = lines
+			.map(|line| {
+				let (file, target) = line.split_at_checked(column).unwrap_or((line, ""));
+				(file.trim_end(), target)
+			})
+			.collect();
+		assert_eq!(rows.len(), args.len() - 1, "{out}");
+		// A relative operand resolves against the shell's directory, prints as
+		// given, and selects the mount of the file it names there.
+		assert_eq!(rows[0].0, "df-operand", "{out}");
+		assert_eq!(rows[0].1, rows[1].1, "{out}");
+		let root = root_of(dir.path());
+		assert_eq!(rows[2], ("/", root.as_str()), "{out}");
+		// The mount named for an operand holds the operand's file system. Every
+		// mount point starts with the root, so only the device shows a wrong
+		// mount. A runtime can bind files of the one procfs below `/proc`
+		// (runc's `/proc/sysrq-trigger`), and df may name any of those mounts.
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::MetadataExt as _;
+
+			let dev = |path: &str| std::fs::metadata(path).unwrap_or_else(|e| panic!("{path}: {e}")).dev();
+			assert_eq!(dev(rows[0].1), dev(held.to_str().unwrap()), "{out}");
+			#[cfg(target_os = "linux")]
+			{
+				assert_ne!(dev("/proc"), dev("/"), "the premise: /proc is not on the root's file system");
+				assert_eq!(rows[3].0, "/proc", "{out}");
+				assert_eq!(dev(rows[3].1), dev("/proc"), "{out}");
+			}
+		}
 	}
 
 	#[test]

@@ -506,7 +506,15 @@ pub(crate) fn set_file_attrs_with(
 		let changed = if opts.fake_super || opts.dry_run {
 			true
 		} else {
-			match tree.chmod(rel, new_mode & CHMOD_BITS) {
+			// A symlink's own mode is set with lchmod; anything else is never set
+			// through a symlink in its place (a -K directory symlink): ELOOP, as
+			// upstream's do_chmod_atfd answers.
+			let result = if mode_is_lnk(new_mode) {
+				tree.lchmod(rel, new_mode & CHMOD_BITS)
+			} else {
+				tree.chmod(rel, new_mode & CHMOD_BITS)
+			};
+			match result {
 				Ok(()) => true,
 				// Symlink modes are best effort unless permissions are preserved.
 				Err(_) if mode_is_lnk(new_mode) && !opts.perms && !opts.executability => true,
@@ -771,7 +779,11 @@ fn sync_fake_stat(
 	let plain_mode = (disk_mode & S_IFMT) | (want_mode & ACCESSPERMS) | owner_bits;
 	if disk_mode != plain_mode {
 		// Best effort, like upstream: a failure shows up in the record instead.
-		let _ = tree.chmod(rel, plain_mode & CHMOD_BITS);
+		let _ = if mode_is_lnk(plain_mode) {
+			tree.lchmod(rel, plain_mode & CHMOD_BITS)
+		} else {
+			tree.chmod(rel, plain_mode & CHMOD_BITS)
+		};
 	}
 	let disk_rdev = match real.rdev() {
 		Some(rdev) if mode_is_device(disk_mode) => dev_split(rdev),
@@ -1469,6 +1481,34 @@ mod tests {
 			assert_eq!(mode_of(&path) & 0o7777, 0o2755);
 		}
 
+		/// `-K`: a directory whose destination name is a symlink to a directory
+		/// is never given its mode through the symlink. Upstream's
+		/// do_chmod_atfd refuses it with ELOOP, whatever the platform answers a
+		/// no-follow chmod of a symlink (Linux: EOPNOTSUPP), and the run ends 23.
+		#[test]
+		fn dir_mode_through_a_dirlink_is_refused_with_eloop() {
+			let dir = tempfile::tempdir().unwrap();
+			let real = dir.path().join("real");
+			std::fs::create_dir(&real).unwrap();
+			chmod(&real, 0o700);
+			symlink("real", dir.path().join("sub")).unwrap();
+			let tree = tree(&dir);
+			let (logger, sink) = logger();
+			let rel = Path::new("sub");
+			let opts = MetaOpts { perms: true, keep_dirlinks: true, ..MetaOpts::default() };
+			// The generator stats a -K directory through its symlink.
+			let local = tree.stat(rel).unwrap();
+			let bits = set_file_attrs(&tree, rel, &entry(0o040755), Some(&local), &opts, 0, &logger).unwrap();
+			assert_eq!(bits & ITEM_REPORT_PERMS, 0);
+			logger.flush();
+			let eloop = io::Error::from_raw_os_error(libc::ELOOP);
+			let tail = format!(": {} ({})", log::strerror(&eloop), libc::ELOOP);
+			let want = [&b"failed to set permissions on "[..], &full_fname(&tree, rel), tail.as_bytes()].concat();
+			assert!(sink.contains(&want), "{}", String::from_utf8_lossy(&sink.0.lock().unwrap()));
+			assert!(logger.got_xfer_error());
+			assert_eq!(mode_of(&real) & 0o7777, 0o700);
+		}
+
 		/// Whether the filesystem under `dir` takes our stat xattr at all.
 		fn xattrs_usable(tree: &Tree, rel: &Path) -> bool {
 			match tree.set_xattr(rel, OsStr::new(XSTAT_ATTR), b"0 0,0 0:0", false) {
@@ -1476,7 +1516,10 @@ mod tests {
 					tree.remove_xattr(rel, OsStr::new(XSTAT_ATTR), false).unwrap();
 					true
 				},
-				Err(err) if is_no_xattr(&err) || err.kind() == io::ErrorKind::PermissionDenied => false,
+				Err(err) if is_no_xattr(&err) || err.kind() == io::ErrorKind::PermissionDenied => {
+					eprintln!("skipped: the temporary filesystem refuses rsync's stat xattr: {err}");
+					false
+				},
 				Err(err) => panic!("set_xattr: {err}"),
 			}
 		}

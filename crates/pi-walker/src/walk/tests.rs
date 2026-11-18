@@ -11,7 +11,12 @@ use std::{
 use futures::StreamExt;
 
 use super::*;
-use crate::testing::MemFs;
+use crate::testing::{MemFs, settle};
+#[cfg(unix)]
+use crate::{
+	fs::seam::Open,
+	testing::{Outside, SwapTree, escaped},
+};
 
 /// A unique, canonical temporary directory removed on drop.
 struct TempDir(PathBuf);
@@ -20,7 +25,7 @@ impl TempDir {
 	fn new(name: &str) -> Self {
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let n = NEXT.fetch_add(1, Ordering::Relaxed);
-		let base = std::env::temp_dir()
+		let base = crate::testing::temp_root()
 			.canonicalize()
 			.expect("temp dir canonicalizes");
 		let path = base.join(format!("pi-walker-walk-{}-{n}-{name}", std::process::id()));
@@ -130,7 +135,10 @@ async fn read_through_batches(
 			.dir
 			.expect("an uncached walk keeps its directories open");
 		for (path, name, abs) in batch.items {
-			let (mut file, info) = session.open_file_at(&dir, &name).await.expect("open");
+			let (mut file, info) = session
+				.open_file_at(&dir, &name, false)
+				.await
+				.expect("open");
 			assert_eq!(info.size, file.size());
 			let mut buf = Vec::new();
 			file.read_into(&mut buf, 1 << 20).await.expect("read");
@@ -313,6 +321,158 @@ async fn wide_trees_agree_on_every_worker_count() {
 		let opts = Options { workers: Some(workers), ..Default::default() };
 		assert_eq!(paths(tmp.path(), &opts).await, baseline, "workers={workers}");
 	}
+}
+
+/// Every walk ends, also when a waiting worker's wakeup is lost: flume
+/// 0.12's `recv_async` misses a message sent while it re-registers after
+/// another worker took the message it was woken for (zesterer/flume#177).
+/// Ending the walk with one stop message per worker left such a worker
+/// waiting forever, and its walk with it. The machine's CPU count caps the
+/// walk's workers and the runtime's threads, and with them the test's power:
+/// against the old stop it hung on 8 and 16 CPUs, and was not seen in 5 runs
+/// on 4. `stopping_a_walk_closes_its_job_queue` checks the same fix on any
+/// number of CPUs.
+#[tokio::test(flavor = "multi_thread")]
+async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
+	let tmp = make_tree("ends", &["a.txt", "d1/x", "d2/y", "d3/z", "d4/w", "d5/v/u"]);
+	let fs = Fs::native();
+	let opts = Options { workers: Some(8), ..Default::default() };
+	let (mut complete, mut root_failed, mut dir_failed) = (0, 0, 0);
+	for round in 0..20_000 {
+		let walked = drain(&fs, tmp.path(), &opts, |_, _, out: &mut Vec<()>| {
+			out.push(());
+			Action::Continue
+		});
+		let walked = tokio::time::timeout(Duration::from_secs(30), walked)
+			.await
+			.unwrap_or_else(|_| panic!("walk {round} did not end"));
+		// A walk that cannot open its root or a directory, as past the
+		// open-file limit while other tests in the process hold files, has
+		// still ended: it is counted and skipped.
+		let Ok((visited, errors)) = walked else {
+			root_failed += 1;
+			continue;
+		};
+		if !errors.is_empty() {
+			dir_failed += 1;
+			continue;
+		}
+		assert_eq!(visited.len(), 12, "walk {round}");
+		complete += 1;
+	}
+	// The 30 s limit catches the hang on every walk that runs; the floor
+	// fails a run in which more than 1,000 of the 20,000 walks could not open
+	// their root or a directory.
+	assert!(
+		complete >= 19_000,
+		"{complete} of 20,000 walks complete, fewer than 19,000; {root_failed} could not open the \
+		 root and {dir_failed} could not open a directory"
+	);
+}
+
+/// A visitor panic ends the walk on every worker: the panicking job never
+/// counts itself done, so only the queue's close (`Owned`'s drop) ends the
+/// other workers' waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_visitor_ends_the_walk_on_every_worker() {
+	let paths: Vec<String> = (0..24)
+		.flat_map(|d| (0..4).map(move |s| format!("mem://visitor-panics/dir/d{d:02}/s{s}/f")))
+		.collect();
+	let files: Vec<(&str, &str)> = paths.iter().map(|path| (path.as_str(), "")).collect();
+	let (_mem, blocking) = MemFs::with_files(&files);
+	let fs = Fs::Provider(blocking);
+	let opts = Options { workers: Some(8), ..Default::default() };
+	let run = tokio::spawn(async move {
+		drain(&fs, Path::new("mem://visitor-panics/dir"), &opts, |_, entry, out: &mut Vec<()>| {
+			assert_ne!(entry.path, b"d11/s2", "visitor boom");
+			out.push(());
+			Action::Continue
+		})
+		.await
+	});
+	let joined = tokio::time::timeout(Duration::from_secs(30), run)
+		.await
+		.expect("the walk did not end after a visitor panic");
+	let error = joined.expect_err("the visitor panic did not resume in the consumer");
+	assert!(error.is_panic(), "the walk task ended without the visitor's panic: {error:?}");
+}
+
+/// Stopping a walk closes its job queue, so every worker still waiting on it
+/// leaves, also one whose wakeup flume lost: flume 0.12's `recv_async` checks
+/// again for a closed queue after it re-registers to wait (`src/async.rs`,
+/// lines 432-446). One stop message per worker left the queue open, and such
+/// a worker waiting forever. Unlike the stress test, this needs no lost
+/// wakeup, so it fails against the old stop on any number of CPUs.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_walk_closes_its_job_queue() {
+	let (_mem, blocking) = MemFs::with_files(&[
+		("mem://stop-closes/dir/a.txt", ""),
+		("mem://stop-closes/dir/sub/b.txt", ""),
+	]);
+	let fs = Fs::Provider(blocking);
+	let keep = parallel::CollectSink::new(|_: &mut Worker<'_>, _: &mut Entry<'_>| Action::Continue);
+	let started = parallel::start(
+		&fs,
+		Path::new("mem://stop-closes/dir"),
+		&Options::default(),
+		keep,
+		false,
+		None,
+		None,
+	)
+	.await
+	.expect("walk");
+	tokio::time::timeout(Duration::from_secs(30), started.finished())
+		.await
+		.expect("the walk ends");
+	assert!(
+		started.queue_closed(),
+		"the job queue was still open after the walk stopped; an open queue leaves a worker still \
+		 waiting on it waiting forever"
+	);
+}
+
+/// A walk dropped before its seed worker's first poll frees no path another
+/// worker is reading. The seed's arena holds the root's children, which the
+/// queued jobs name; when the seed's scratch went with its never-polled task,
+/// a worker listing one of those jobs read freed memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_walk_dropped_before_its_seed_runs_keeps_job_paths_alive() {
+	let fs = Fs::native();
+	let opts = Options { workers: Some(2), ..Default::default() };
+	// With one worker there is only the seed, and no other worker to read.
+	if opts.parallelism(&fs) < 2 {
+		return;
+	}
+	let tmp = make_tree("seed-held", &["seed-held-probe/x", "other/y"]);
+	let seed_dropped = parallel::seam::hold_seed(tmp.path());
+	let (paused, reached) = tokio::sync::oneshot::channel();
+	let (verdict, checked) = tokio::sync::oneshot::channel();
+	parallel::seam::before_listing("seed-held-probe", move |rel| {
+		let chunk = arena::seam::chunk_of(rel).expect("a job's path lives in an arena chunk");
+		let _ = paused.send(());
+		// Disconnects once the dropped walk's seed task is gone.
+		let _ = seed_dropped.recv();
+		let _ = verdict.send(arena::seam::is_live(chunk));
+	});
+	// Items for the root's entries make the seed settle the root, so every
+	// subdirectory job goes to the queue, for the other worker.
+	let walked = walk(&fs, tmp.path(), &opts, |_, _, out: &mut Vec<()>| {
+		out.push(());
+		Action::Continue
+	})
+	.await
+	.expect("walk");
+	tokio::time::timeout(Duration::from_secs(30), reached)
+		.await
+		.expect("a worker lists the probe directory")
+		.expect("the probe pauses");
+	drop(walked);
+	let live = tokio::time::timeout(Duration::from_secs(30), checked)
+		.await
+		.expect("the seed task is dropped")
+		.expect("the probe reports");
+	assert!(live, "a worker's job path was freed with the seed worker's task");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -706,11 +866,6 @@ async fn provider_walks_use_raw_relative_names_and_url_spellings() {
 	]);
 }
 
-/// Lets every stamp in a tree age past the cache's racy window.
-fn settle() {
-	std::thread::sleep(Duration::from_millis(120));
-}
-
 /// Walks `root` with and without `cache`, requiring identical results.
 async fn cached_matches_fresh(
 	root: &Path,
@@ -958,37 +1113,373 @@ async fn tree_walks_trees_deeper_than_the_thread_stack() {
 	}
 }
 
-/// Stopping at the leaf of an ignore chain as deep as path syscalls reach
-/// must return rather than overflow the stack while each level's ignore
-/// frame is released.
+/// A walk returns to every directory past the window of open directories
+/// and walks its remaining subdirectories, on every platform: each of 100
+/// levels holds a sibling `z` that the walk reaches only after the whole
+/// chain below it. On Windows a parent opens again below the root, as a
+/// relative open there cannot name `..`; elsewhere through its child's
+/// `..`. A parent lost on the way back reports its sibling as moved or
+/// replaced, or, with no subdirectory left, reports nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_trees_walk_every_sibling_on_the_way_back_up() {
+	const DEPTH: usize = 100;
+	let tmp = TempDir::new("tree-deep-siblings");
+	let mut dir = tmp.path().to_path_buf();
+	let (mut want, mut rel) = (Vec::new(), String::new());
+	for _ in 0..DEPTH {
+		std::fs::create_dir(dir.join("z")).expect("sibling");
+		dir.push("d");
+		std::fs::create_dir(&dir).expect("level");
+		want.push(format!("{rel}d"));
+		want.push(format!("{rel}z"));
+		rel.push_str("d/");
+	}
+	want.sort_unstable();
+	for contents_first in [false, true] {
+		let opts = TreeOptions { contents_first, ..Default::default() };
+		let mut seen = tree_paths(tmp.path(), &opts).await;
+		seen.sort_unstable();
+		assert_eq!(seen, want, "contents_first: {contents_first}");
+	}
+}
+
+/// Builds `depth` levels of `name` below `top`, each one opened relative to
+/// the one above (so building costs no path lookups however deep), each
+/// with an empty sibling directory `z` when `siblings` is set, and an empty
+/// file `leaf` at the bottom. [`remove_chain`] takes it down the same way.
+#[cfg(unix)]
+fn chain_by_descriptor(top: &Path, depth: usize, name: &str, siblings: bool) {
+	let mut dir = open_at(
+		libc::AT_FDCWD,
+		top.as_os_str().as_encoded_bytes(),
+		libc::O_RDONLY | libc::O_DIRECTORY,
+	);
+	for _ in 0..depth {
+		at(&dir, name, At::MakeDir);
+		if siblings {
+			at(&dir, "z", At::MakeDir);
+		}
+		dir = open_at(
+			dir_fd(&dir),
+			name.as_bytes(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+		);
+	}
+	drop(open_at(dir_fd(&dir), b"leaf", libc::O_WRONLY | libc::O_CREAT));
+}
+
+/// Removes what [`chain_by_descriptor`] built below `top`, deepest first,
+/// with two descriptors at most: `std::fs::remove_dir_all` keeps one open
+/// per level.
+#[cfg(unix)]
+fn remove_chain(top: &Path, depth: usize, name: &str, siblings: bool) {
+	let mut dir = open_at(
+		libc::AT_FDCWD,
+		top.as_os_str().as_encoded_bytes(),
+		libc::O_RDONLY | libc::O_DIRECTORY,
+	);
+	for _ in 0..depth {
+		dir = open_at(
+			dir_fd(&dir),
+			name.as_bytes(),
+			libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+		);
+	}
+	at(&dir, "leaf", At::Unlink);
+	for _ in 0..depth {
+		dir = open_at(dir_fd(&dir), b"..", libc::O_RDONLY | libc::O_DIRECTORY);
+		at(&dir, name, At::RemoveDir);
+		if siblings {
+			at(&dir, "z", At::RemoveDir);
+		}
+	}
+}
+
+/// `openat(at, name, flags)`, creating a file with mode 0644.
+#[cfg(unix)]
+fn open_at(at: libc::c_int, name: &[u8], flags: libc::c_int) -> std::os::fd::OwnedFd {
+	use std::os::fd::FromRawFd as _;
+	let c_name = std::ffi::CString::new(name).unwrap();
+	let mode: libc::c_uint = 0o644;
+	// SAFETY: `c_name` is NUL-terminated and outlives the call; `mode` only
+	// counts when `flags` create the file.
+	let fd = unsafe { libc::openat(at, c_name.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+	assert!(
+		fd >= 0,
+		"openat {}: {}",
+		String::from_utf8_lossy(name),
+		std::io::Error::last_os_error()
+	);
+	// SAFETY: `openat` returned a fresh descriptor owned from here.
+	unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
+#[cfg(unix)]
+fn dir_fd(dir: &std::os::fd::OwnedFd) -> libc::c_int {
+	use std::os::fd::AsRawFd as _;
+	dir.as_raw_fd()
+}
+
+/// A `*at` call [`at`] makes.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum At {
+	MakeDir,
+	Unlink,
+	RemoveDir,
+}
+
+/// Runs `call` on `name` in `dir`; it must succeed.
+#[cfg(unix)]
+fn at(dir: &std::os::fd::OwnedFd, name: &str, call: At) {
+	let c_name = std::ffi::CString::new(name).unwrap();
+	let (fd, path) = (dir_fd(dir), c_name.as_ptr());
+	// SAFETY: `path` is NUL-terminated and outlives the call, and `fd` is
+	// the open directory `dir` owns.
+	let done = unsafe {
+		match call {
+			At::MakeDir => libc::mkdirat(fd, path, 0o755),
+			At::Unlink => libc::unlinkat(fd, path, 0),
+			At::RemoveDir => libc::unlinkat(fd, path, libc::AT_REMOVEDIR),
+		}
+	};
+	assert_eq!(done, 0, "{name}: {}", std::io::Error::last_os_error());
+}
+
+/// Every subdirectory opens relative to its parent's handle however deep
+/// the walk goes, and so does a parent the walk returns to: 100 and 300
+/// levels, each with a second subdirectory the walk opens on its way back
+/// up, cost one open that looks every component up, the root's. Opening the
+/// directories below the 64 whose handles stay open by looking every
+/// component up again, below the root's handle, made a walk quadratic in
+/// its depth: 97 seconds for find's 2,000 levels under gVisor (GKE
+/// Sandbox), where each lookup is slow.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_walks_open_every_directory_relative_to_its_parent() {
+	for depth in [100, 300] {
+		let tmp = TempDir::new("tree-relative");
+		chain_by_descriptor(tmp.path(), depth, "d", true);
+		let mut cursor = Tree::new(&Fs::native(), tmp.path(), &TreeOptions::default())
+			.await
+			.expect("tree");
+		let (mut entries, mut errors) = (0, Vec::new());
+		while let Some(event) = cursor.next().await {
+			match event {
+				Event::Entry(_) => entries += 1,
+				Event::Error(error) => errors.push(error.error.to_string()),
+			}
+		}
+		let opens = cursor.opens();
+		drop(cursor);
+		remove_chain(tmp.path(), depth, "d", true);
+		assert!(errors.is_empty(), "{depth} levels: {errors:?}");
+		assert_eq!(entries, 2 * depth + 1, "{depth} levels: every d, every z, and the leaf");
+		assert_eq!(opens.walked, 1, "{depth} levels: {opens:?}");
+		assert!(opens.parent > 0, "{depth} levels: no parent was reopened: {opens:?}");
+	}
+}
+
+/// A directory the walk gave its handle up for, and returns to through its
+/// child's `..`, is taken back only with the identity it recorded (device
+/// and inode). Here the child is moved elsewhere while the walk is below it:
+/// its `..` is then another directory, whose entries must not be walked as
+/// the parent's, so the parent is opened again below the root, and checked
+/// the same way. When that path also names another directory, the parent's
+/// remaining subdirectories are reported, not entered. An identity can be
+/// reused: a directory made after the parent was removed can get its inode
+/// number, and is then taken in its place.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_the_walk_returns_to_is_taken_back_only_with_its_recorded_identity() {
+	for replace_parent in [false, true] {
+		let tmp = make_tree("tree-moved", &["p/z/kept", "o/z/secret"]);
+		std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+		// Far enough below `p` for `p` to give its handle up.
+		chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+		let mut cursor = Tree::new(&Fs::native(), tmp.path(), &TreeOptions::default())
+			.await
+			.expect("tree");
+		let (mut seen, mut errors) = (Vec::new(), Vec::new());
+		while let Some(event) = cursor.next().await {
+			match event {
+				Event::Entry(entry) => {
+					let path = String::from_utf8_lossy(entry.path).into_owned();
+					if path.ends_with("/leaf") {
+						// While the walk is at the bottom of `p/a`.
+						std::fs::rename(tmp.path().join("p/a"), tmp.path().join("o/a")).unwrap();
+						if replace_parent {
+							std::fs::rename(tmp.path().join("p"), tmp.path().join("p-old")).unwrap();
+							std::fs::create_dir_all(tmp.path().join("p/z/impostor")).unwrap();
+						}
+					}
+					if !path.starts_with("p/a/") {
+						seen.push(path);
+					}
+				},
+				Event::Error(error) => {
+					let path = error
+						.path
+						.strip_prefix(tmp.path())
+						.unwrap()
+						.to_string_lossy()
+						.into_owned();
+					errors.push((path, error.error.to_string()));
+				},
+			}
+		}
+		drop(cursor);
+		if replace_parent {
+			assert_eq!(seen, ["o", "o/z", "o/z/secret", "p", "p/a", "p/z"]);
+			assert_eq!(errors, [(
+				"p/z".to_owned(),
+				"the directory was moved or replaced during the walk".to_owned()
+			)]);
+		} else {
+			assert_eq!(seen, ["o", "o/z", "o/z/secret", "p", "p/a", "p/z", "p/z/kept"]);
+			assert!(errors.is_empty(), "{errors:?}");
+		}
+	}
+}
+
+/// A parent the walk gave its handle up for, and cannot open again when it
+/// returns to it, keeps its place: its subdirectories that the walk cannot
+/// open are reported with the open's own error, and those it can open once
+/// the failure ends are walked. Here every directory open on this thread
+/// fails with `EMFILE` from the report of `p/a/d`, the last before the walk
+/// leaves `p/a` for `p`, until the walk reports an error. Losing `p` instead
+/// reported `p/y` and `p/z` as moved or replaced, and walked neither.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
+	let tmp = make_tree("tree-reopen-fails", &["p/y/missed", "p/z/kept"]);
+	std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+	// Far enough below `p` for `p` to give its handle up.
+	chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+	let opts = TreeOptions { contents_first: true, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+		.await
+		.expect("tree");
+	let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+	let mut failing = None;
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => {
+				let path = String::from_utf8_lossy(entry.path).into_owned();
+				if path == "p/a/d" {
+					failing = Some(crate::fs::seam::fail_opens(move |_| Some(emfile())));
+				}
+				if !path.starts_with("p/a/") {
+					seen.push(path);
+				}
+			},
+			Event::Error(error) => {
+				failing = None;
+				let path = error
+					.path
+					.strip_prefix(tmp.path())
+					.unwrap()
+					.to_string_lossy()
+					.into_owned();
+				errors.push((path, error.error.to_string()));
+			},
+		}
+	}
+	drop(cursor);
+	assert!(failing.is_none(), "the walk reported no error while its opens failed");
+	assert_eq!(errors, [("p/y".to_owned(), emfile().to_string())]);
+	assert_eq!(seen, ["p/a", "p/y", "p/z/kept", "p/z", "p"]);
+}
+
+/// Under [`Follow::Always`] too, a lost parent enters none of its
+/// subdirectories, a followed link included: the link opens by path, so it
+/// resolves through whatever now stands at the parent's path. Here `p`'s
+/// child is moved out and `p` replaced while the walk is below it, and the
+/// new `p` holds a link `l` to `u`, where the old one linked to `t`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_parent_follows_no_link() {
+	let tmp = make_tree("tree-lost-link", &["o/z/secret", "t/listed", "u/other"]);
+	std::fs::create_dir_all(tmp.path().join("p/z")).unwrap();
+	symlink("../t", &tmp.path().join("p/l"));
+	std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+	// Far enough below `p` for `p` to give its handle up.
+	chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+	let opts = TreeOptions { follow: Follow::Always, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+		.await
+		.expect("tree");
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => {
+				let path = String::from_utf8_lossy(entry.path).into_owned();
+				if path.ends_with("/leaf") {
+					// While the walk is at the bottom of `p/a`.
+					std::fs::rename(tmp.path().join("p/a"), tmp.path().join("o/a")).unwrap();
+					std::fs::rename(tmp.path().join("p"), tmp.path().join("p-old")).unwrap();
+					std::fs::create_dir_all(tmp.path().join("p/z/impostor")).unwrap();
+					symlink("../u", &tmp.path().join("p/l"));
+				}
+				if path.starts_with("p/") && !path.starts_with("p/a/") {
+					seen.push(path);
+				}
+			},
+			Event::Error(error) => {
+				let path = error
+					.path
+					.strip_prefix(tmp.path())
+					.unwrap()
+					.to_string_lossy()
+					.into_owned();
+				errors.push((path, error.error.to_string()));
+			},
+		}
+	}
+	drop(cursor);
+	let moved = "the directory was moved or replaced during the walk".to_owned();
+	assert_eq!(seen, ["p/a", "p/l", "p/z"]);
+	assert_eq!(errors, [("p/l".to_owned(), moved.clone()), ("p/z".to_owned(), moved)]);
+}
+
+/// A walk stopped at the leaf of a deep ignore chain releases its frames one
+/// level at a time: the stopped cursor is dropped on a thread with a small
+/// stack. Releasing the root's frame first left the deepest frame holding
+/// the whole chain of ignore states, whose release recursed once per level.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_at_the_leaf_of_a_deep_ignore_chain_returns() {
+	const DEPTH: usize = 300;
+	const DROP_STACK: usize = 32 * 1024;
 	let tmp = TempDir::new("deep-ignore");
-	let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
-	let depth = (path_max - 96 - tmp.path().join("leaf").as_os_str().len()) / 2;
 	let mut dir = tmp.path().to_path_buf();
-	for _ in 0..depth {
+	for _ in 0..DEPTH {
 		dir.push("d");
 		std::fs::create_dir(&dir).expect("level");
 		std::fs::write(dir.join(".ignore"), "*.log\n").expect("ignore file");
 	}
 	std::fs::write(dir.join("leaf"), "x").expect("leaf");
-	let root = tmp.path().to_path_buf();
-	let found = on_small_stack(async move {
-		let opts = TreeOptions { gitignore: true, ..Default::default() };
-		let mut found = false;
-		let mut cursor = Tree::new(&Fs::native(), &root, &opts).await.expect("tree");
-		while let Some(event) = cursor.next().await {
-			if matches!(event, Event::Entry(entry) if entry.name() == b"leaf") {
-				found = true;
-				break;
-			}
+	let opts = TreeOptions { gitignore: true, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+		.await
+		.expect("tree");
+	let mut found = false;
+	while let Some(event) = cursor.next().await {
+		if matches!(event, Event::Entry(entry) if entry.name() == b"leaf") {
+			found = true;
+			break;
 		}
-		found
-	})
-	.await;
+	}
 	assert!(found);
+	std::thread::scope(|scope| {
+		std::thread::Builder::new()
+			.stack_size(DROP_STACK)
+			.spawn_scoped(scope, move || drop(cursor))
+			.expect("thread")
+			.join()
+			.expect("the cursor dropped");
+	});
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1140,6 +1631,44 @@ async fn tree_follow_roots_traverses_a_root_link_only() {
 	]);
 }
 
+/// Under [`Follow::Never`] the traversal checks its root with `lstat`, so a
+/// root swapped for a symlink to a directory outside it between that check
+/// and the root's open is refused, not walked: this is `find -P`'s root,
+/// below which `find -delete` removes. The control: the swap ran, at the
+/// root's open by path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tree_follow_never_refuses_a_root_swapped_for_a_symlink_after_its_check() {
+	let base = TempDir::new("tree-never-root-swap");
+	let name = format!("never-root-{}", std::process::id());
+	let (root, outside) = (base.path().join(&name), base.path().join("outside"));
+	std::fs::create_dir_all(&root).expect("root is created");
+	std::fs::write(root.join("inside.txt"), "").expect("inside is written");
+	std::fs::create_dir_all(&outside).expect("outside is created");
+	std::fs::write(outside.join("secret.txt"), "").expect("secret is written");
+	let never =
+		TreeOptions { follow: Follow::Never, emit_root: true, min_depth: 0, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), &root, &never).await.expect("tree");
+	let opened = Arc::new(parking_lot::Mutex::new(None));
+	let (link, target, parked, seen_open) =
+		(root.clone(), outside.clone(), base.path().join("parked"), Arc::clone(&opened));
+	crate::fs::seam::before_open(&name, move |open| {
+		std::fs::rename(&link, &parked).expect("root is parked");
+		std::os::unix::fs::symlink(&target, &link).expect("root becomes a link");
+		*seen_open.lock() = Some(open);
+	});
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => seen.push(String::from_utf8_lossy(entry.path).into_owned()),
+			Event::Error(error) => errors.push(error.error.raw_os_error()),
+		}
+	}
+	assert_eq!(*opened.lock(), Some(Open::Path), "the root was not opened by path after its check");
+	assert!(!seen.iter().any(|path| path.contains("secret")), "walked the swapped root: {seen:?}");
+	assert_eq!(errors, [Some(libc::ENOTDIR)], "the swapped root was not refused: {seen:?}");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tree_always_reports_symlink_cycles_to_ancestors() {
@@ -1255,4 +1784,238 @@ async fn a_caller_held_stop_ends_the_record_loop() {
 	.await
 	.expect("collect");
 	assert_eq!(seen.load(Ordering::Acquire), 0, "a walk started stopped still examined entries");
+}
+
+/// A walk consumer opens a listed file through the directory handle its
+/// batch carries without following a symlink that replaced the file after
+/// the listing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_file_open_refuses_a_file_swapped_for_a_symlink() {
+	let tree = SwapTree::new("walk-batch-file", 0, Outside::SameName);
+	tree.swap_file_before_open();
+	let opts = Options { hidden: true, ..Options::default() };
+	let mut walked = walk(&Fs::native(), &tree.root, &opts, |_, entry, out: &mut Vec<Vec<u8>>| {
+		if entry.file_type == FileType::File {
+			out.push(entry.name().to_vec());
+		}
+		Action::Continue
+	})
+	.await
+	.expect("walk");
+	let mut session = Fs::native().session();
+	let mut read = Vec::new();
+	while let Some(batch) = walked.next().await {
+		let dir = batch
+			.dir
+			.expect("an uncached walk keeps its directories open");
+		for name in batch.items {
+			if let Ok((mut file, _)) = session.open_file_at(&dir, &name, false).await {
+				let mut buf = Vec::new();
+				file.read_into(&mut buf, 1 << 20).await.expect("read");
+				read.push(String::from_utf8(buf).expect("utf-8"));
+			}
+		}
+	}
+	assert_eq!(tree.swapped(), Some(Open::At), "the file opened relative to its directory");
+	assert!(!escaped(read.iter().map(String::as_str)), "read through the swapped link: {read:?}");
+}
+
+/// Case A for a walk whose root listing comes from the cache: `sub` (changed
+/// since, so listed afresh) opens without its parent's handle after it is
+/// swapped for a symlink to a directory outside the root. The walk does not
+/// descend into the link.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_walk_below_a_cached_listing_refuses_a_swapped_directory() {
+	let tree = SwapTree::new("walk-cached-a", 0, Outside::OtherName);
+	let cache = leaked_cache(1 << 20);
+	let opts = Options { hidden: true, ..Options::default() };
+	let filter = |_: &mut Worker<'_>, _: &mut Entry<'_>| Action::Continue;
+	settle();
+	let filled = collect_in(&Fs::native(), &tree.root, &opts, true, filter, Some(cache))
+		.await
+		.expect("fill");
+	assert_eq!(filled.len(), 2, "sub and its file");
+	std::fs::write(tree.sub.join("changed.txt"), "").expect("sub changes");
+	tree.swap_dir_before_open(&tree.sub_name);
+	let got = collect_in(&Fs::native(), &tree.root, &opts, true, filter, Some(cache))
+		.await
+		.expect("cached");
+	let paths: Vec<String> = got.iter().map(|entry| lossy(&entry)).collect();
+	let swapped = tree.swapped();
+	assert!(swapped.is_some_and(|open| open != Open::At), "the root was not cached: {swapped:?}");
+	assert!(
+		!paths.iter().any(|path| path.contains("secret")),
+		"descended into the swapped link: {paths:?}"
+	);
+}
+
+/// Case A for the ordered traversal deeper than the window of directory
+/// handles it keeps ([`tree::MAX_OPEN_DIRS`]): `sub` is swapped for a symlink
+/// to a directory outside the root between its parent's listing and its own
+/// open. The traversal refuses `sub` and reports nothing beneath it. The
+/// control: the swap ran, before `sub`'s open.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tree_past_the_open_directory_limit_refuses_a_swapped_directory() {
+	let tree = SwapTree::new("tree-deep-a", tree::MAX_OPEN_DIRS, Outside::OtherName);
+	tree.swap_dir_before_open(&tree.sub_name);
+	let (seen, errors) = tree_events(&Fs::native(), &tree.root, &TreeOptions::default()).await;
+	assert!(tree.swapped().is_some(), "the swap did not run");
+	let sub = format!("{}{}", "d/".repeat(tree::MAX_OPEN_DIRS), tree.sub_name);
+	let beneath = format!("{sub}/");
+	assert!(
+		!seen.iter().any(|path| path.starts_with(&beneath)),
+		"reported what the swapped link holds: {:?}",
+		seen
+			.iter()
+			.filter(|path| path.starts_with(&sub))
+			.collect::<Vec<_>>()
+	);
+	assert!(
+		errors.iter().any(|(path, _)| path.ends_with(&sub)),
+		"the swapped directory was not refused: {errors:?}"
+	);
+}
+
+/// A `.gitignore` that is a symlink is not read by a walk that does not
+/// follow symlinks, as git 2.32 and later reads no symlinked `.gitignore` in
+/// the working tree, and is read by a walk that follows them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_gitignore_is_read_only_by_a_walk_that_follows_links() {
+	let tmp = make_tree("linked-gitignore", &["rules=*.log\n", "a.log", "b.txt"]);
+	symlink("rules", &tmp.path().join(".gitignore"));
+	let plain = Options { hidden: true, gitignore: true, ..Options::default() };
+	assert_eq!(paths(tmp.path(), &plain).await, [".gitignore", "a.log", "b.txt", "rules"]);
+	let following = Options { follow_links: true, ..plain };
+	assert_eq!(paths(tmp.path(), &following).await, [".gitignore", "b.txt", "rules"]);
+	let roots = TreeOptions { gitignore: true, ..TreeOptions::default() };
+	assert_eq!(tree_paths(tmp.path(), &roots).await, [".gitignore", "a.log", "b.txt", "rules"]);
+	let always = TreeOptions { follow: Follow::Always, ..roots };
+	assert_eq!(tree_paths(tmp.path(), &always).await, [".gitignore", "b.txt", "rules"]);
+}
+
+/// Listings whose `.gitignore` is a symlink, the root's included, are served
+/// from the cache to a walk that does not follow symlinks: the cache stamps
+/// that source as such a walk reads it (not at all). A walk that follows
+/// symlinks reads the link's target, so those listings, cached with other
+/// rules, are listed afresh for it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn listings_with_a_symlinked_gitignore_are_served_from_the_cache() {
+	/// The paths a walk reports, sorted, and how many of its listings came
+	/// from the cache (a batch with no directory, in a tree this small).
+	async fn walk_counting_cached(root: &Path, opts: &Options) -> (Vec<String>, usize) {
+		let mut walked = walk(&Fs::native(), root, opts, |_, entry, out: &mut Vec<String>| {
+			out.push(lossy(entry));
+			Action::Continue
+		})
+		.await
+		.expect("walk");
+		let (mut paths, mut cached) = (Vec::new(), 0);
+		while let Some(batch) = walked.next().await {
+			cached += usize::from(batch.dir.is_none());
+			paths.extend(batch.items);
+		}
+		paths.sort();
+		(paths, cached)
+	}
+
+	let tmp = make_tree("cached-linked-gitignore", &[
+		"rules=*.log\n",
+		"a.log",
+		"sub/rules=*.log\n",
+		"sub/b.log",
+	]);
+	symlink("rules", &tmp.path().join(".gitignore"));
+	symlink("rules", &tmp.path().join("sub/.gitignore"));
+	let plain = Options { hidden: true, gitignore: true, cache: true, ..Options::default() };
+	settle();
+	let (filled, _) = walk_counting_cached(tmp.path(), &plain).await;
+	let (served, cached) = walk_counting_cached(tmp.path(), &plain).await;
+	assert_eq!(served, filled);
+	assert!(served.contains(&"sub/b.log".to_owned()), "a symlinked .gitignore was read: {served:?}");
+	assert_eq!(cached, 2, "a listing with a symlinked .gitignore was listed again");
+
+	let following = Options { follow_links: true, ..plain };
+	let (paths, cached) = walk_counting_cached(tmp.path(), &following).await;
+	assert_eq!(cached, 0, "a following walk was served a listing cached with other rules");
+	assert_eq!(paths, [".gitignore", "rules", "sub", "sub/.gitignore", "sub/rules"]);
+}
+
+/// A walk that follows links caches the listing of a linked directory under
+/// the link's path. A walk that does not follow links is not served that
+/// listing when its own (real) directory of that name is swapped for the
+/// link again between its parent's listing and the cache lookup.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_walk_that_does_not_follow_links_gets_no_cached_listing_through_a_symlink() {
+	let tree = SwapTree::new("walk-cached-link", 0, Outside::OtherName);
+	let cache = leaked_cache(1 << 20);
+	let filter = |_: &mut Worker<'_>, _: &mut Entry<'_>| Action::Continue;
+	tree.swap_dir();
+	settle();
+	let following = Options { hidden: true, follow_links: true, ..Options::default() };
+	let linked = collect_in(&Fs::native(), &tree.root, &following, true, filter, Some(cache))
+		.await
+		.expect("walk through the link");
+	assert!(
+		linked.iter().any(|entry| lossy(&entry).contains("secret")),
+		"the link's target is listed"
+	);
+	tree.unswap_dir();
+	tree.swap_dir_before_stat(&tree.sub_name);
+	let plain = Options { hidden: true, ..Options::default() };
+	let got = collect_in(&Fs::native(), &tree.root, &plain, true, filter, Some(cache))
+		.await
+		.expect("walk");
+	let paths: Vec<String> = got.iter().map(|entry| lossy(&entry)).collect();
+	assert_eq!(tree.swapped(), Some(Open::Stat), "the swap ran at the cache lookup");
+	assert!(
+		!paths.iter().any(|path| path.contains("secret")),
+		"served the link's cached listing: {paths:?}"
+	);
+}
+
+/// A batch served from the cache carries no directory; its consumer opens the
+/// files below the walk's root handle, which refuses a directory swapped for
+/// a symlink since the listing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_batch_opens_its_files_below_the_walk_root() {
+	let tree = SwapTree::new("walk-cached-batch", 0, Outside::SameName);
+	let opts = Options { hidden: true, cache: true, ..Options::default() };
+	let files = |_: &mut Worker<'_>, entry: &Entry<'_>, out: &mut Vec<Vec<u8>>| {
+		if entry.file_type == FileType::File {
+			out.push(entry.path.to_vec());
+		}
+		Action::Continue
+	};
+	settle();
+	drain(&Fs::native(), &tree.root, &opts, files)
+		.await
+		.expect("fill");
+	tree.swap_dir_before_open(&tree.decoy_name);
+	let mut walked = walk(&Fs::native(), &tree.root, &opts, files)
+		.await
+		.expect("walk");
+	let mut session = Fs::native().session();
+	let mut read = Vec::new();
+	while let Some(batch) = walked.next().await {
+		assert!(batch.dir.is_none(), "the listing was not cached");
+		let root = walked
+			.root_dir()
+			.expect("a walk that does not follow links keeps its root");
+		for rel in batch.items {
+			if let Ok((mut file, _)) = session.open_file_beneath(root, &rel).await {
+				let mut buf = Vec::new();
+				file.read_into(&mut buf, 1 << 20).await.expect("read");
+				read.push(String::from_utf8(buf).expect("utf-8"));
+			}
+		}
+	}
+	assert_eq!(tree.swapped(), Some(Open::Beneath));
+	assert!(!escaped(read.iter().map(String::as_str)), "read through the swapped link: {read:?}");
 }

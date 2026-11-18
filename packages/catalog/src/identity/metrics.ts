@@ -16,6 +16,7 @@
  * conflates `gpt-5.5` with `gpt-5.5-pro` and every Llama with the one that
  * happens to be scored.
  */
+import { runToCompletion } from "@oh-my-pi/pi-utils/event-loop-slice";
 import type { ModelIdentity } from "../compat/types";
 import type { Api, Model } from "../types";
 import { bareModelId } from "./id";
@@ -144,9 +145,18 @@ export function applyCatalogMetrics<TApi extends Api>(
 	models: Model<TApi>[],
 	index: CatalogMetricsIndex,
 ): Model<TApi>[] {
+	return runToCompletion(applyCatalogMetricsSteps(models, index));
+}
+
+/** {@link applyCatalogMetrics} with one slice unit per model. */
+export function* applyCatalogMetricsSteps<TApi extends Api>(
+	models: Model<TApi>[],
+	index: CatalogMetricsIndex,
+): Generator<void, Model<TApi>[], undefined> {
 	if (index.isEmpty) return models;
 	let changed: Model<TApi>[] | undefined;
 	for (let position = 0; position < models.length; position++) {
+		yield;
 		const model = models[position];
 		if (model.int != null && model.tps != null) continue;
 		const metrics = index.resolve(model);

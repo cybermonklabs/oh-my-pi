@@ -110,6 +110,9 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true });
 		vi.useFakeTimers();
+		// Spinners tick on the shared clock's wall-clock phase (`Date.now() % interval`). Start the fake
+		// clock on a tick boundary, or the countdown is re-read up to one interval before each advance ends.
+		setSystemTime(new Date("2026-01-01T00:00:00Z"));
 	});
 
 	afterEach(() => {

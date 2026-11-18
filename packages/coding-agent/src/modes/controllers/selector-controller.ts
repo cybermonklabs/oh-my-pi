@@ -73,8 +73,9 @@ import type { SessionEntry, SessionTreeNode } from "../../session/session-entrie
 import { findSessionContinuation, readSessionInfo, type SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds, setSessionPinned } from "../../session/session-pins";
-import { FileSessionStorage } from "../../session/session-storage";
-import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
+import { defaultSessionStorage } from "../../session/session-storage";
+import { assertSessionsOnDisk, STATS_DISK_ONLY_REASON } from "../../session/session-storage-config";
+import { listLogoutAccounts, listLogoutProviders, logoutCredential } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
 import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
@@ -387,7 +388,7 @@ export class SelectorController {
 						onPluginsChanged: async () => {
 							const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
 							clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-							await this.ctx.refreshSkillState();
+							await this.ctx.refreshSkillState({ rediscover: true });
 							await this.ctx.refreshSlashCommandState();
 							resetCapabilities();
 							this.ctx.ui.requestRender();
@@ -447,6 +448,7 @@ export class SelectorController {
 			? this.ctx.session.modelRegistry.authStorage.oauth.identity(currentProvider, this.ctx.session.sessionId)
 			: undefined;
 		const usageModelSelectors = this.ctx.session.getUsageReportingModelSelectors(reports);
+		const storage = this.ctx.sessionManager.getStorage();
 		const done = () => {
 			menu.handle?.hide();
 			this.#releaseMenu("usage-dashboard", menu);
@@ -466,7 +468,12 @@ export class SelectorController {
 					usageModelSelectors,
 					unavailableAccounts,
 				),
-			loadActivity: loadDailyActivity,
+			// The heatmap reads the stats store, which ingests session files: under
+			// `session.storage: sql` it says why it is empty while the quotas still show.
+			loadActivity: (push, signal) => {
+				assertSessionsOnDisk(storage, "/usage activity heatmap", STATS_DISK_ONLY_REASON);
+				return loadDailyActivity(push, signal);
+			},
 			refresh: () => this.ctx.session.fetchUsageReports(),
 			requestRender: () => this.ctx.ui.requestRender(),
 			onClose: done,
@@ -1940,9 +1947,9 @@ export class SelectorController {
 								if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 									return false;
 								}
-								const storage = new FileSessionStorage();
+								const storage = defaultSessionStorage();
 								try {
-									await storage.deleteSessionWithArtifacts(session.path);
+									await SessionManager.deleteSessionFile(session.path, storage);
 									return true;
 								} catch (error) {
 									throw new Error(
@@ -1958,9 +1965,15 @@ export class SelectorController {
 									// claim it; the live rename would then fork onto
 									// a sibling and still report success, leaving the
 									// row here pointing at the old path. Claim the
-									// lease up front and refuse while it is held by
-									// someone else.
-									const claim = new FileSessionStorage().claimSession(session.id, session.path);
+									// lease up front, waiting for SQL storage's answer,
+									// and refuse while someone else holds it. A storage
+									// that claims nothing has no other owner to refuse for.
+									const storage = this.ctx.sessionManager.getStorage();
+									const claim = storage.acquireSessionClaim
+										? await storage.acquireSessionClaim(session.id, session.path)
+										: storage.claimSession
+											? storage.claimSession(session.id, session.path)
+											: () => {};
 									if (!claim) {
 										throw new Error(
 											"Failed to rename session: it is currently in use by another omp process",
@@ -2197,7 +2210,7 @@ export class SelectorController {
 		}
 
 		// Check if session file exists (may not exist for brand new sessions)
-		const storage = new FileSessionStorage();
+		const storage = defaultSessionStorage();
 		const fileExists = await storage.exists(sessionFile);
 		if (!fileExists) {
 			this.ctx.showError("Session has not been saved yet");
@@ -2219,8 +2232,8 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		// Delete the session file and artifacts directory, refusing while another process holds it
+		await SessionManager.deleteSessionFile(sessionFile, storage);
 
 		// Show session selector
 		this.ctx.showStatus("Session deleted");
@@ -2416,13 +2429,14 @@ export class SelectorController {
 		}
 
 		const { getOAuthProviders, OAuthSelectorComponent } = await loadProviderAuthUi();
+		let logoutProviders: ReadonlySet<string> | undefined;
 		if (mode === "logout") {
 			await this.#refreshOAuthProviderAuthState();
-			const oauthProviders = getOAuthProviders();
-			const loggedInProviders = oauthProviders.filter(provider =>
-				this.ctx.session.modelRegistry.authStorage.credentials.has(provider.id),
-			);
-			if (loggedInProviders.length === 0) {
+			const removableProviders = await listLogoutProviders(this.ctx.session.modelRegistry.authStorage);
+			logoutProviders = removableProviders;
+			if (
+				!getOAuthProviders().some(provider => removableProviders.has(provider.storeCredentialsAs ?? provider.id))
+			) {
 				this.ctx.showStatus("No stored provider credentials to log out. Remove env or config auth at its source.");
 				return;
 			}
@@ -2448,6 +2462,7 @@ export class SelectorController {
 				},
 				{
 					disabledProviders: cfgDisabledProviders.get(settings),
+					logoutProviders,
 					validateAuth: async (selectedProviderId: string) => {
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,
@@ -2667,6 +2682,7 @@ export class SelectorController {
 				registry: this.ctx.collabGuest?.agentRegistry,
 				remote: this.ctx.collabGuest?.hubRemote,
 				sessionFile: this.ctx.sessionManager.getSessionFile() ?? null,
+				storage: this.ctx.sessionManager.getStorage(),
 			}),
 			observers,
 			hubKeys,

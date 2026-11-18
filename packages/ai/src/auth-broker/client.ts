@@ -30,7 +30,11 @@ import type {
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
-import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES } from "./types";
+import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY,
+} from "./types";
 import { parseGenerationTag } from "./protocol";
 import {
 	clientUsageReportResponseSchema,
@@ -115,6 +119,9 @@ export type FetchSnapshotResult =
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RETRIES = 1;
+
+/** What the disabled-credentials read announces: the header takes a comma list. */
+const DISABLED_CREDENTIALS_CAPABILITIES = `${AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES},${AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY}`;
 
 export class AuthBrokerClient {
 	readonly #baseUrl: string;
@@ -345,8 +352,9 @@ export class AuthBrokerClient {
 
 	/**
 	 * Disabled-credential tombstones (identity + cause, no token material).
-	 * Returns an empty list against brokers predating `GET
-	 * /v1/credentials/disabled` (404).
+	 * Announces {@link AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY}, so the
+	 * broker includes each summary's `identityKey`. Returns an empty list
+	 * against brokers predating `GET /v1/credentials/disabled` (404).
 	 */
 	async listDisabledCredentials(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]> {
 		const params = new URLSearchParams();
@@ -355,6 +363,7 @@ export class AuthBrokerClient {
 		try {
 			const response = await this.#request<DisabledCredentialsResponse>("GET", path, {
 				schema: "disabledCredentialsResponseSchema",
+				headers: { [AUTH_BROKER_CAPABILITIES_HEADER]: DISABLED_CREDENTIALS_CAPABILITIES },
 				signal,
 			});
 			return response.disabled;
@@ -416,6 +425,7 @@ export class AuthBrokerClient {
 			schema: AuthBrokerResponseSchemaName;
 			auth?: boolean;
 			body?: unknown;
+			headers?: Record<string, string>;
 			signal?: AbortSignal;
 			timeoutMs?: number;
 		},
