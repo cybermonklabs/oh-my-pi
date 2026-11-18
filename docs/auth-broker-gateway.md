@@ -76,8 +76,8 @@ omp auth-broker status    [--json]
 | `GET`    | `/v1/snapshot/stream`        | bearer | SSE snapshot stream with delta events and keepalives               |
 | `POST`   | `/v1/credential`             | bearer | Upsert one OAuth or API-key credential                             |
 | `POST`   | `/v1/credential/:id/refresh` | bearer | Force-refresh one OAuth credential                                 |
-| `POST`   | `/v1/credential/:id/disable` | bearer | Disable one credential with a recorded cause                       |
-| `GET`    | `/v1/credentials/disabled`   | bearer | List disabled credentials; optional `provider` query filter        |
+| `POST`   | `/v1/credential/:id/disable` | bearer | Disable one credential with a recorded cause; a user's removal also marks a failure-disabled one ([below](#disabled-credential-identity-keys)) |
+| `GET`    | `/v1/credentials/disabled`   | bearer | List disabled credentials; optional `provider` query filter; `identityKey` only for the `disabled-identity-key` capability |
 | `POST`   | `/v1/credential/:id/block`   | bearer | Upsert a provider/scope rate-limit block                           |
 | `DELETE` | `/v1/credential/:id/block`   | bearer | Delete one block named by body `providerKey` and `blockScope`      |
 | `DELETE` | `/v1/credential/:id/blocks`  | bearer | Delete all rate-limit blocks for a credential                      |
@@ -135,6 +135,12 @@ Local SQLite schema 8 keeps `chat` and `spark` as the canonical scopes exposed b
 Clients released before this capability, including 17.1.4, receive the conservative `shared` projection until they are upgraded. Those clients are indistinguishable on the existing wire, so mixed-version deployments favor keeping a rate-limited credential blocked over allowing repeated provider requests and 429 responses.
 
 Capability-dependent responses include `Vary: OMP-Auth-Broker-Capabilities` so intermediaries do not reuse one representation for another client. The encrypted client snapshot cache also uses a new format version: older cache files are ignored and fetched again, preventing legacy and meter-scoped representations from being mixed across client versions.
+
+### Disabled-credential identity keys
+
+Clients that read each disabled credential's `identityKey` send `OMP-Auth-Broker-Capabilities: disabled-identity-key` on `GET /v1/credentials/disabled`. The header takes a comma list, so a client sends this capability next to `codex-meter-block-scopes`. Without the capability the broker leaves `identityKey` out of every row, because older clients validate the row strictly and reject a field they do not know. The response carries `Vary: OMP-Auth-Broker-Capabilities`.
+
+`POST /v1/credential/:id/disable` with a user's removal cause (`deleted by user`, `logged out by user`) also records the removal on a credential that a failure already disabled, so turns no longer wait for that login to come back. Upgrade the broker before its clients: an older broker answers `404` for such a credential, and the client then fails the removal with `AuthBrokerRemovalNotRecordedError`, which tells the user to upgrade the broker.
 
 ### Background refresher
 
