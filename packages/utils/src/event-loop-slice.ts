@@ -28,14 +28,12 @@
 export const EVENT_LOOP_SLICE_MS = 10;
 
 let sliceStart = 0;
-/** True from a slice's first check until the event loop next runs its timers. */
 let sliceOpen = false;
 /** Resolvers of the passes waiting for the next turn, in the order they asked. */
 let waiters: Array<() => void> = [];
 /** The batch of waiters a scheduled release is for; 0 once released. */
 let pendingBatch = 0;
 let lastBatch = 0;
-/** How many times a check-phase release of the pending batch waited for the timers. */
 let releaseDeferrals = 0;
 /**
  * How many passes through the check phase a release waits for the timers to
@@ -104,7 +102,6 @@ function releaseWaiters(batch: number, inCheckPhase = false): void {
 	// The other leg of a released batch, or of one a later batch replaced.
 	if (batch !== pendingBatch) return;
 	if (inCheckPhase && sliceOpen && releaseDeferrals < MAX_RELEASE_DEFERRALS) {
-		// The timers have not run since the slice opened: let them run first.
 		releaseDeferrals++;
 		setImmediate(releaseWaiters, batch, true);
 		return;

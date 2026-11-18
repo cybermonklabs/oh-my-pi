@@ -205,7 +205,6 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, ModelSpec<TApi>>();
 	for (const entry of entries) {
-		// An endpoint can list thousands of rows: map them in slices.
 		while (sliceExpired()) await nextSlice();
 		const defaults: ModelSpec<TApi> = {
 			id: entry.id,

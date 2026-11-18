@@ -346,8 +346,7 @@ export interface ModelCacheRowTurn extends Disposable {
 	readonly ready: Promise<void>;
 }
 
-/** Per cache row of this process (database path and provider id): the last turn taken. */
-const rowTurns = new Map<string, Promise<void>>();
+const lastTurnByRow = new Map<string, Promise<void>>();
 
 /**
  * Takes the next turn to read, merge and write a provider's cache row in this
@@ -357,15 +356,13 @@ const rowTurns = new Map<string, Promise<void>>();
  * unsliced resolution read, merged and wrote the row.
  */
 export function takeModelCacheRowTurn(providerId: string, dbPath?: string): ModelCacheRowTurn {
-	// One key per file, however the caller spells its path.
 	const key = readCacheKey(path.resolve(resolveCacheDb(dbPath).resolvedPath), providerId);
-	const earlier = rowTurns.get(key) ?? Promise.resolve();
+	const earlier = lastTurnByRow.get(key) ?? Promise.resolve();
 	const { promise: released, resolve: release } = Promise.withResolvers<void>();
 	const tail = earlier.then(() => released);
-	rowTurns.set(key, tail);
-	// Forget the row once its last turn is through, never while an earlier turn still holds it.
+	lastTurnByRow.set(key, tail);
 	void tail.then(() => {
-		if (rowTurns.get(key) === tail) rowTurns.delete(key);
+		if (lastTurnByRow.get(key) === tail) lastTurnByRow.delete(key);
 	});
 	return {
 		ready: earlier,

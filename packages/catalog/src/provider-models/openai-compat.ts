@@ -6284,7 +6284,6 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 	const deduped = new Map<string, LiteLLMRichEndpointModel<TApi>>();
 	const excludedModelIds = new Set<string>();
 	for (const entry of entries) {
-		// A proxy can list thousands of entries: map them in slices.
 		while (sliceExpired()) await nextSlice();
 		if (isLiteLLMUnusableSentinelPlaceholder(entry)) {
 			continue;

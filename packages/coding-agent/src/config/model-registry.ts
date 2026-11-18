@@ -1970,7 +1970,6 @@ export class ModelRegistry {
 		return runToCompletion(this.#providerCompatSteps(compat, models));
 	}
 
-	/** {@link #applyProviderCompat} with one slice unit per rebuilt model. */
 	*#providerCompatSteps(
 		compat: ModelSpec<Api>["compat"] | undefined,
 		models: Model<Api>[],
@@ -1988,7 +1987,6 @@ export class ModelRegistry {
 		return runToCompletion(this.#normalizeDiscoverableModelSteps(providerConfig, models));
 	}
 
-	/** {@link #normalizeDiscoverableModels} with one slice unit per rebuilt model. */
 	*#normalizeDiscoverableModelSteps(
 		providerConfig: DiscoveryProviderConfig,
 		models: Model<Api>[],
@@ -2664,7 +2662,6 @@ export class ModelRegistry {
 		if (discoveryError) {
 			this.#warnProviderDiscoveryFailure(providerConfig, discoveryError);
 		}
-		// A local server can list thousands of models: rebuild them in slices.
 		const withCompat = await runInSlices(this.#providerCompatSteps(providerConfig.compat, result.models));
 		const normalized = await runInSlices(this.#normalizeDiscoverableModelSteps(providerConfig, withCompat));
 		return {
@@ -3046,7 +3043,6 @@ export class ModelRegistry {
 			const result = await withModelDiscoveryTimeout(RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS, () =>
 				manager.refresh(strategy),
 			);
-			// A shared catalog can list thousands of models: relabel them in slices.
 			const models = await mapInSlices(result.models, model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);

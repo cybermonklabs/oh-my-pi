@@ -306,9 +306,6 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const hasDynamicFetcher = typeof dynamicFetcher === "function";
 	const hasModelsDevFetcher = options.modelsDev !== undefined;
 	const hasRemoteFetcher = hasDynamicFetcher || hasModelsDevFetcher;
-	// The cache row as this resolution sees it. A resolution that fetches reads
-	// it again on its turn to write (below), so it merges the row as the
-	// resolutions that fetched before it left it.
 	const readCacheState = async () => {
 		while (sliceExpired()) await nextSlice();
 		const cache = readModelCache<TApi>(cacheProviderId, ttlMs, now, dbPath);
@@ -354,21 +351,18 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			hasAuthoritativeCache,
 		};
 	};
+	const startCacheState = await readCacheState();
+	const { restoredCache, cacheHasUnresolvedHeaders, hasUsableFreshCache, hasAuthoritativeCache } = startCacheState;
 	let {
 		cache,
 		isAuthoritativeDynamicCache,
-		restoredCache,
 		usableCachedModels,
-		cacheHasUnresolvedHeaders,
 		cacheFingerprintMatches,
 		cacheAdditiveStaticModelIds,
-		hasUsableFreshCache,
-		hasAuthoritativeCache,
-	} = await readCacheState();
+	} = startCacheState;
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
 		hasRemoteFetcher && shouldFetchRemoteSources(strategy, hasUsableFreshCache, hasAuthoritativeCache, cacheAgeMs);
-	// Part of the fetch decision, so it comes from the start read too.
 	const shouldUseFreshCacheAsAuthoritative =
 		strategy === "online-if-uncached" && hasUsableFreshCache && hasAuthoritativeCache;
 
@@ -400,11 +394,6 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				dynamicFetcher ? fetchDynamicSpecs(dynamicFetcher) : undefined,
 			])
 		: undefined;
-	// An unsliced resolution read, merged and wrote the row in the step its
-	// fetches resolved, so concurrent resolutions wrote one at a time, in the
-	// order their fetches resolved, each over the row the earlier ones left.
-	// The turn keeps that: it is taken here, before the fetched rows are built
-	// in slices, and the cache is read again once it comes.
 	using rowTurn = fetched ? takeModelCacheRowTurn(cacheProviderId, dbPath) : undefined;
 	const [fetchedModelsDevModels, dynamicFetch] = fetched
 		? await Promise.all([buildModelsDevModels(options, fetched[0]), fetched[1] && buildDynamicModels(fetched[1])])
@@ -414,13 +403,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		({
 			cache,
 			isAuthoritativeDynamicCache,
-			restoredCache,
 			usableCachedModels,
-			cacheHasUnresolvedHeaders,
 			cacheFingerprintMatches,
 			cacheAdditiveStaticModelIds,
-			hasUsableFreshCache,
-			hasAuthoritativeCache,
 		} = await readCacheState());
 	}
 	const fetchedDynamicModels = dynamicFetch?.models ?? null;
@@ -598,7 +583,6 @@ interface DiscoveredModelSet<TApi extends Api> {
 	explicitKindModels: ReadonlySet<Model<TApi>>;
 }
 
-/** The shared models.dev payload, fetched; `null` when there is no models.dev source or the fetch failed. */
 async function fetchModelsDevPayload<TApi extends Api, TModelsDevPayload>(
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
 ): Promise<{ payload: TModelsDevPayload } | null> {
@@ -628,7 +612,6 @@ async function buildModelsDevModels<TApi extends Api, TModelsDevPayload>(
 	}
 }
 
-/** The endpoint's rows (`specs: null` when it answered none), and why it threw, if it did. */
 async function fetchDynamicSpecs<TApi extends Api>(
 	fetcher: () => Promise<readonly ModelSpec<TApi>[] | null>,
 ): Promise<{ specs: readonly ModelSpec<TApi>[] | null; error?: string }> {
@@ -639,7 +622,6 @@ async function fetchDynamicSpecs<TApi extends Api>(
 	}
 }
 
-/** The endpoint's catalog (`models: null` when it answered none), and why it failed, if it did. */
 async function buildDynamicModels<TApi extends Api>(fetched: {
 	specs: readonly ModelSpec<TApi>[] | null;
 	error?: string;

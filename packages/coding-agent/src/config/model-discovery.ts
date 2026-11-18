@@ -695,7 +695,6 @@ async function discoverLlamaCppModelsAt(
 	const models = parseLlamaCppModelList(payload);
 	const discovered: Model<Api>[] = [];
 	for (const item of models) {
-		// A server can list many models: map them in slices.
 		while (sliceExpired()) await nextSlice();
 		const { id } = item;
 		if (!id) continue;
@@ -1218,7 +1217,6 @@ export async function discoverOpenAIModelsList(
 	const references = getBundledModelReferenceIndex();
 	const specs: ModelSpec<Api>[] = [];
 	for (const item of models) {
-		// A gateway can list thousands of models: map them in slices.
 		while (sliceExpired()) await nextSlice();
 		const id = item.id;
 		if (!id) continue;
@@ -1472,7 +1470,6 @@ export async function discoverProxyModels(
 	const items = payload.data ?? [];
 	const discovered: Model<Api>[] = [];
 	for (const item of items) {
-		// A proxy can list thousands of models: map them in slices.
 		while (sliceExpired()) await nextSlice();
 		const id = item.id;
 		if (!id) continue;
