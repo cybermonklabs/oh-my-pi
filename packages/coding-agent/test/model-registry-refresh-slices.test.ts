@@ -244,6 +244,50 @@ describe("ModelRegistry discovery slicing", () => {
 		expect(registry.find("ordered-provider", "model-early")).toBeUndefined();
 	});
 
+	test("a discovered catalog under another provider id is relabelled in slices", async () => {
+		const row = (index: number) => ({
+			id: `model-${index}`,
+			name: `model-${index}`,
+			provider: "upstream-provider",
+			reasoning: false,
+			input: ["text" as const],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		// Each slice check reads the clock once, and the discovery path checks once per row
+		// in each sliced step. The reads per extra row count those steps, whatever the load.
+		const clockReads = async (count: number): Promise<number> => {
+			const registry = new ModelRegistry(authStorage, tempDir.join(`models-${count}.yml`), {
+				fetch: offlineFetch,
+			});
+			const rows = Array.from({ length: count }, (_, index) => row(index));
+			registry.registerProvider(
+				"relabel-provider",
+				{
+					baseUrl: "https://relabel.example.com/v1",
+					apiKey: "RELABEL_KEY",
+					api: "openai-completions",
+					fetchDynamicModels: async () => rows,
+				},
+				"ext://relabel",
+			);
+			let now = 1_000;
+			let reads = 0;
+			vi.spyOn(performance, "now").mockImplementation(() => {
+				reads++;
+				return now++;
+			});
+			await registry.refreshDiscoverableProviders(["relabel-provider"], "online");
+			vi.restoreAllMocks();
+			expect(registry.find("relabel-provider", `model-${count - 1}`)?.provider).toBe("relabel-provider");
+			return reads;
+		};
+		const readsPerRow = ((await clockReads(2_000)) - (await clockReads(1_000))) / 1_000;
+		// Measured: 6.6 reads per row; 5.5 with the relabel unsliced.
+		expect(readsPerRow).toBeGreaterThan(6);
+	});
+
 	test("a pass that stops before its commit does not let a later pass commit before an earlier one", async () => {
 		const clock = mockClockStillUntilStarted();
 		const registry = new ModelRegistry(authStorage, tempDir.join("models.yml"), { fetch: offlineFetch });

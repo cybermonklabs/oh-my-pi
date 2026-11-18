@@ -3012,7 +3012,8 @@ export class ModelRegistry {
 			const result = await withModelDiscoveryTimeout(RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS, () =>
 				manager.refresh(strategy),
 			);
-			const models = result.models.map(model =>
+			// A shared catalog can list thousands of models: relabel them in slices.
+			const models = await mapInSlices(result.models, model =>
 				model.provider === options.providerId ? model : { ...model, provider: options.providerId },
 			);
 			// An offline pass only reads the cache: a missing row means "not fetched

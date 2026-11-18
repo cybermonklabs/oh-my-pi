@@ -2922,6 +2922,32 @@ describe("ModelRegistry runtime discovery", () => {
 		return maxTokensById;
 	}
 
+	test("openai-models-list maps and builds a long model list in slices that return to the event loop", async () => {
+		const data = Array.from({ length: 2_000 }, (_, index) => ({ id: `openai-test/model-${index}` }));
+		// Each clock read is 1 ms of work, so a slice ends every ten checks.
+		let now = 1_000;
+		vi.spyOn(performance, "now").mockImplementation(() => now++);
+		// Counts passes through the event loop's check phase while discovery runs.
+		let loopTurns = 0;
+		let counting = true;
+		const countTurns = () => {
+			if (!counting) return;
+			loopTurns++;
+			setImmediate(countTurns);
+		};
+		setImmediate(countTurns);
+		try {
+			const maxTokensById = await discoverOutputLimits(data);
+			expect(Object.keys(maxTokensById).length).toBe(2_000);
+		} finally {
+			counting = false;
+			vi.restoreAllMocks();
+		}
+		// The row loop and the build each take about 300 passes (measured: 622 for both,
+		// about 310 with either one unsliced).
+		expect(loopTurns).toBeGreaterThan(450);
+	});
+
 	test("openai-models-list falls back to a usable flat max_tokens when the nested output limit is unusable", async () => {
 		// An invalid nested output limit must not suppress a valid flat
 		// `max_tokens`. `1.5` and `1e30` pass the positive-number check and then

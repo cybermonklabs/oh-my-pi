@@ -35,6 +35,7 @@ import {
 import { Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { parseServiceTierIds } from "@oh-my-pi/pi-catalog/utils";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { mapInSlices, nextSlice, readJsonInSlices, sliceExpired } from "@oh-my-pi/pi-utils/event-loop-slice";
 import type { ProviderDiscovery } from "./models-config-schema";
 
 // Default cap on `max_tokens` for auto-discovered models that do not advertise
@@ -515,7 +516,7 @@ async function discoverOllamaModelMetadata(
 			if (!response.ok) {
 				return null;
 			}
-			return (await response.json()) as unknown;
+			return (await readJsonInSlices(response)) as unknown;
 		});
 		if (!isRecord(payload)) {
 			return null;
@@ -567,7 +568,7 @@ export async function discoverOllamaModels(
 		if (!response.ok) {
 			throw new DiscoveryHttpError(response.status, tagsUrl);
 		}
-		return (await response.json()) as { models?: Array<{ name?: string; model?: string }> };
+		return (await readJsonInSlices(response)) as { models?: Array<{ name?: string; model?: string }> };
 	});
 	const entries = (payload.models ?? []).flatMap(item => {
 		const id = item.model || item.name;
@@ -619,7 +620,7 @@ async function discoverLlamaCppServerMetadata(
 			if (!response.ok) {
 				return null;
 			}
-			return (await response.json()) as unknown;
+			return (await readJsonInSlices(response)) as unknown;
 		});
 		if (!isRecord(payload)) {
 			return null;
@@ -681,7 +682,7 @@ async function discoverLlamaCppModelsAt(
 				if (!response.ok) {
 					throw new DiscoveryHttpError(response.status, modelsUrl);
 				}
-				return (await response.json()) as unknown;
+				return (await readJsonInSlices(response)) as unknown;
 			}),
 			discoverLlamaCppServerMetadata(ctx, baseUrl, h, customTimeoutMs),
 		]);
@@ -694,6 +695,8 @@ async function discoverLlamaCppModelsAt(
 	const models = parseLlamaCppModelList(payload);
 	const discovered: Model<Api>[] = [];
 	for (const item of models) {
+		// A server can list many models: map them in slices.
+		while (sliceExpired()) await nextSlice();
 		const { id } = item;
 		if (!id) continue;
 		const contextWindow =
@@ -748,7 +751,7 @@ export async function discoverLlamaCppModelRuntimeMetadata(
 				if (!response.ok) {
 					return undefined;
 				}
-				return parseLlamaCppModelList(await response.json());
+				return parseLlamaCppModelList(await readJsonInSlices(response));
 			}),
 			discoverLlamaCppServerMetadata(ctx, nativeBaseUrl, headers, customTimeoutMs),
 		]);
@@ -1177,7 +1180,7 @@ export async function discoverOpenAIModelsList(
 				if (!res.ok) {
 					throw new DiscoveryHttpError(res.status, modelsUrl);
 				}
-				return (await res.json()) as {
+				return (await readJsonInSlices(res)) as {
 					data?: Array<{
 						id?: string;
 						max_model_len?: unknown;
@@ -1215,6 +1218,8 @@ export async function discoverOpenAIModelsList(
 	const references = getBundledModelReferenceIndex();
 	const specs: ModelSpec<Api>[] = [];
 	for (const item of models) {
+		// A gateway can list thousands of models: map them in slices.
+		while (sliceExpired()) await nextSlice();
 		const id = item.id;
 		if (!id) continue;
 		if (providerConfig.discovery.type === "litellm" && !isSelectableLiteLLMModelMode(item.mode)) continue;
@@ -1353,8 +1358,8 @@ export async function discoverOpenAIModelsList(
 	}
 	// `discovery.type: "litellm"` keeps LiteLLM provider policy under any alias.
 	return providerConfig.discovery.type === "litellm"
-		? specs.map(spec => buildDiscoveredModel(spec, "litellm"))
-		: specs.map(spec => buildModel(spec));
+		? mapInSlices(specs, spec => buildDiscoveredModel(spec, "litellm"))
+		: mapInSlices(specs, spec => buildModel(spec));
 }
 
 export async function discoverLiteLLMModels(
@@ -1445,7 +1450,7 @@ export async function discoverProxyModels(
 			if (!res.ok) {
 				throw new DiscoveryHttpError(res.status, modelsUrl);
 			}
-			return (await res.json()) as {
+			return (await readJsonInSlices(res)) as {
 				data?: Array<{
 					id?: string;
 					name?: string;
@@ -1467,6 +1472,8 @@ export async function discoverProxyModels(
 	const items = payload.data ?? [];
 	const discovered: Model<Api>[] = [];
 	for (const item of items) {
+		// A proxy can list thousands of models: map them in slices.
+		while (sliceExpired()) await nextSlice();
 		const id = item.id;
 		if (!id) continue;
 		const endpoints = item.supported_endpoint_types ?? [];
