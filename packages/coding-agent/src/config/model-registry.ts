@@ -250,27 +250,38 @@ type ModifyModelsHook = (models: Model<Api>[], credentials: OAuthCredentials) =>
 type StoredCredentialsOutage = "cannot-serve" | "unreadable";
 
 /**
+ * Providers {@link permitsIdentityOrWarn} already warned about. The set belongs to the
+ * module, so every registry and the worker auth handler of a thread share it: one
+ * warning per provider in each thread (a worker thread loads its own copy of the module).
+ */
+const warnedUnreadablePools = new Set<string>();
+
+/**
  * `sessions.permitsIdentity(provider, sessionId, identityKey)`, or false when the
  * `SessionsApi` lacks that optional method (a custom implementation may): it then
  * cannot tell whether the session's account pool holds the identity. The first such
- * answer for `provider` logs a warning; `warned` holds the providers already warned.
+ * answer for `provider` in this thread logs a warning.
  */
 export function permitsIdentityOrWarn(
 	sessions: SessionsApi,
 	provider: string,
 	sessionId: string,
 	identityKey: string | undefined,
-	warned: Set<string>,
 ): boolean {
 	if (sessions.permitsIdentity) return sessions.permitsIdentity(provider, sessionId, identityKey);
-	if (!warned.has(provider)) {
-		warned.add(provider);
+	if (!warnedUnreadablePools.has(provider)) {
+		warnedUnreadablePools.add(provider);
 		logger.warn(
 			"Session account pool cannot be read for disabled logins (its SessionsApi has no permitsIdentity); a missing key does not wait for them",
 			{ provider, sessionId },
 		);
 	}
 	return false;
+}
+
+/** Forget the providers {@link permitsIdentityOrWarn} warned about. Test-only. */
+export function resetUnreadablePoolWarningsForTests(): void {
+	warnedUnreadablePools.clear();
 }
 
 function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<string> {
@@ -427,9 +438,6 @@ export class ModelRegistry {
 	// `provider/id:kind` of modelOverrides kinds already reported as unserved, so
 	// every rebuild does not log the same ignored override again.
 	#warnedUnservedOverrideKinds: Set<string> = new Set();
-	// Providers already warned that a restricted session's pool cannot be read for
-	// disabled logins ({@link permitsIdentityOrWarn}), so each logs it once.
-	#warnedUnreadablePools: Set<string> = new Set();
 	#configError: ConfigError | undefined = undefined;
 	#warnedCompatKeys = new Set<string>();
 	#configWarnings: string[] = [];
@@ -3669,14 +3677,14 @@ export class ModelRegistry {
 	 * the pool, but it may refuse a disabled login inside it (the built-in one reads
 	 * active rows only). `sessions.permitsIdentity` then places the login by its
 	 * account; a `SessionsApi` without it cannot, so the login does not count, a
-	 * missing key ends the turn, and one warning per provider says why
+	 * missing key ends the turn, and one warning per provider in each thread says why
 	 * ({@link permitsIdentityOrWarn}).
 	 */
 	#poolHoldsTombstone(provider: string, sessionId: string, failure: DisabledCredentialSummary): boolean {
 		const sessions = this.authStorage.sessions;
 		return (
 			sessions.permits(provider, sessionId, failure.id) ||
-			permitsIdentityOrWarn(sessions, provider, sessionId, failure.identityKey, this.#warnedUnreadablePools)
+			permitsIdentityOrWarn(sessions, provider, sessionId, failure.identityKey)
 		);
 	}
 

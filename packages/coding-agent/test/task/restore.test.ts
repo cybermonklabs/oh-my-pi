@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
@@ -252,8 +253,8 @@ const laterTurns: Record<string, () => AssistantMessage> = {
 
 /**
  * The records that end the parent's turn after its sync call's result when the parent's process goes away
- * inside the call: exit recovery's, or the agent loop's record of an abort without a reason, which a dispose
- * for a quit, `/restart` or a signal leaves.
+ * inside the call: exit recovery's, or the agent loop's record of an abort without a reason (its flag beside
+ * its text, as the loop writes it), which a dispose for a quit, `/restart` or a signal leaves.
  */
 const exitTurnEnds: Record<string, (branch: SessionEntry[]) => AssistantMessage> = {
 	"the interrupted-turn record exit recovery writes": branch => {
@@ -262,7 +263,11 @@ const exitTurnEnds: Record<string, (branch: SessionEntry[]) => AssistantMessage>
 		return record;
 	},
 	"the record of an abort without a reason that a quit or a signal leaves": () =>
-		assistant({ stopReason: "aborted", errorMessage: GENERIC_ABORT_SENTINEL }),
+		assistant({
+			stopReason: "aborted",
+			errorMessage: GENERIC_ABORT_SENTINEL,
+			errorId: AIError.create(AIError.Flag.Abort),
+		}),
 };
 
 /** The records that hand a parent its background subagent `id`'s settled job result. */

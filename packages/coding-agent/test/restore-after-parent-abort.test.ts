@@ -8,8 +8,8 @@
  * steer started) without a reason stops its subagent too; the parent's process exit
  * during its sync call leaves the subagent for `--restore`, although the call records the
  * run that exit cut off as its result; and a subagent a JavaScript eval cell started
- * through `tool.task` follows the parent's abort the same way: an exit cuts it off, the
- * user's stop ends it.
+ * through `tool.task` follows the parent's abort the same way: an exit, or an abort that
+ * cuts the parent's turn off (the worktree exit's), cuts it off, the user's stop ends it.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -464,6 +464,27 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		await backoff.allHeld;
 		expect(runs).toHaveLength(1);
 		await parent.dispose({ reason: postmortem.Reason.EXIT });
+		await turn;
+
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		const ids = subagents.map(sub => sub.agentId);
+		expect(ids).toHaveLength(1);
+		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
+		expect(outcome.subagents).toEqual(ids);
+	}, 30_000);
+
+	it("relaunches the subagent an abort that cut the parent's turn off left, as the worktree exit's does", async () => {
+		// If this regresses, the session's abort hands the eval cell no reason of the turn's, so the cell stops its
+		// `tool.task` call: the TUI's worktree exit, which cuts the parent's turn off, ends the subagent's turn on an
+		// aborted record, and `omp --restore` leaves the work the exit cut off unfinished.
+		const { parent, runs } = await openParentWithKeyedWorkers("eval");
+		const backoff = holdBackoff(1);
+		const turn = parent.prompt("Delegate reading the notes from a script.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.abort({ cutOff: true });
 		await turn;
 
 		const { outcome, subagents } = await restoreInNewProcess(parent, runs);

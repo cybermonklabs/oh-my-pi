@@ -112,6 +112,13 @@ export function shouldRenderAbortReason(message: Pick<AssistantMessage, "errorId
  *  reason (bare `abort()`). Renderers treat it as "no specific reason given". */
 export const GENERIC_ABORT_SENTINEL = "Request was aborted";
 
+/** Type-guard for an abort that carried no reason of its own: the agent stamps
+ *  `AIError.Flag.Abort` on that record beside {@link GENERIC_ABORT_SENTINEL}, which
+ *  alone marks a record persisted before the flag existed. */
+export function isReasonlessAbort(message: Pick<AssistantMessage, "errorId" | "errorMessage">): boolean {
+	return AIError.is(message.errorId, AIError.Flag.Abort) || message.errorMessage === GENERIC_ABORT_SENTINEL;
+}
+
 /** Resolve the operator-facing label for an aborted assistant turn. A custom
  *  abort reason threaded onto `errorMessage` is returned verbatim; aborts with
  *  no threaded reason fall back to the retry-aware generic label. Call

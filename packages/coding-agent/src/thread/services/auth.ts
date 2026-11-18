@@ -98,8 +98,6 @@ class PeerAuthState {
 	readonly leases = new Map<number, HeldLease>();
 	readonly subscriptions = new Set<() => void>();
 	readonly mirrorHost = Promise.withResolvers<MirrorHost>();
-	/** Providers this worker's `sessions.permitsIdentity` calls already warned about ({@link permitsIdentityOrWarn}). */
-	readonly warnedUnreadablePools = new Set<string>();
 	#nextLease = 1;
 
 	constructor() {
@@ -275,9 +273,9 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 			storage.sessions.permits(provider, sessionId, credentialId),
 		// A worker's key retry asks once `sessions.permits` refused a disabled login. A main `SessionsApi`
 		// without `permitsIdentity` cannot place it in the session's pool: the answer is no, so the worker waits for
-		// no such login (fail closed), and one warning per provider says why, as in-process.
+		// no such login (fail closed), and the main thread's one warning per provider says why, as in-process.
 		"sessions.permitsIdentity": (storage, provider, sessionId, identityKey) =>
-			permitsIdentityOrWarn(storage.sessions, provider, sessionId, identityKey, state.warnedUnreadablePools),
+			permitsIdentityOrWarn(storage.sessions, provider, sessionId, identityKey),
 		"sessions.release": (storage, provider, sessionId) => storage.sessions.release(provider, sessionId),
 
 		"usage.reports": (storage, options) =>

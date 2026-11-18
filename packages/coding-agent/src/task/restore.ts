@@ -22,6 +22,7 @@
  */
 import * as path from "node:path";
 import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
+import { isReasonlessAbort, isUserInterruptAbort } from "@oh-my-pi/pi-tui/chat/messages";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
@@ -33,7 +34,6 @@ import {
 	hasRestorableTurn,
 	isInterruptedTurnAbort,
 } from "../session/exit-diagnostics";
-import { GENERIC_ABORT_SENTINEL, isUserInterruptAbort } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
 import { extractSessionInit, type SessionManager } from "../session/session-manager";
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
@@ -252,7 +252,7 @@ function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
  * on its branch: an assistant message, other than the record that ends a turn when its
  * process goes away. That is the interrupted-turn abort ({@link isInterruptedTurnAbort}),
  * which exit recovery writes and a dispose for the process exit leaves, or the abort
- * without a reason ({@link GENERIC_ABORT_SENTINEL}) that a dispose for anything else leaves
+ * without a reason ({@link isReasonlessAbort}) that a dispose for anything else leaves
  * (a quit, `/restart`, a signal). A stop the session makes itself (`/new`, the task
  * executor ending a parent subagent's run) leaves that record too, but it stops the turn's
  * sync subagents with it, and `--restore` leaves their turns anyway. The user's stop gives
@@ -261,7 +261,7 @@ function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
 function parentWentOn(entry: SessionEntry): boolean {
 	if (entry.type !== "message" || entry.message.role !== "assistant") return false;
 	const { message } = entry;
-	const reasonlessAbort = message.stopReason === "aborted" && message.errorMessage === GENERIC_ABORT_SENTINEL;
+	const reasonlessAbort = message.stopReason === "aborted" && isReasonlessAbort(message);
 	return !isInterruptedTurnAbort(message) && !reasonlessAbort;
 }
 

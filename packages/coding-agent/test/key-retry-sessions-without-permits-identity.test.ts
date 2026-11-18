@@ -1,10 +1,10 @@
 /**
  * A custom `SessionsApi` may lack `permitsIdentity`. A turn's key retry then cannot tell which disabled logins the
  * account pool of a restricted session holds: it waits for none of them in that session, and says so in one warning
- * per provider, while an unrestricted session still waits for one. A subagent's worker thread, whose own sessions
- * API answers through the main thread's, behaves the same.
+ * per provider in each thread, whatever registry or worker asked, while an unrestricted session still waits for one.
+ * A subagent's worker thread, whose own sessions API answers through the main thread's, behaves the same.
  */
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	AuthStorage,
 	type AuthStorageBackend,
@@ -13,16 +13,21 @@ import {
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry, resetUnreadablePoolWarningsForTests } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { authService } from "@oh-my-pi/pi-coding-agent/thread/services/auth";
 import type { AuthProbe } from "./fixtures/auth-service-worker";
 import { startServiceWorker } from "./helpers/service-worker";
 
 const cleanups: Array<() => unknown> = [];
 
+// The thread warns once per provider for as long as it runs: each test starts, and leaves the next file, with no
+// provider warned.
+beforeEach(() => resetUnreadablePoolWarningsForTests());
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	resetUnreadablePoolWarningsForTests();
 });
 
 /** `local` behind a sessions API that an SDK host wrote before `permitsIdentity` existed. */
@@ -101,15 +106,17 @@ function captureUnreadablePoolWarnings() {
 }
 
 describe("a turn's key retry over a SessionsApi without permitsIdentity", () => {
-	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider", async () => {
+	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider in the thread", async () => {
 		// If this regresses, the key lookup of a pooled session on such a host throws instead of ending the turn on
 		// its missing key, waits for a login it cannot place in the session's pool without saying why, or logs a
-		// warning for every pooled session of a long-lived host.
+		// warning for every pooled session, or every registry, of a long-lived host.
 		const unreadablePoolWarnings = captureUnreadablePoolWarnings();
-		const registry = await openRegistry();
+		const registries = [await openRegistry(), await openRegistry()];
 
-		for (const sessionId of ["pooled", "pooled", "pooled-too"]) {
-			expect(await registry.missingKeyMayRecover("anthropic", sessionId)).toBe(false);
+		for (const registry of registries) {
+			for (const sessionId of ["pooled", "pooled", "pooled-too"]) {
+				expect(await registry.missingKeyMayRecover("anthropic", sessionId)).toBe(false);
+			}
 		}
 		expect(unreadablePoolWarnings()).toEqual([[expect.any(String), { provider: "anthropic", sessionId: "pooled" }]]);
 	});
@@ -149,9 +156,9 @@ describe("a subagent thread's key retry over a host SessionsApi without permitsI
 		expect(unreadablePoolWarnings()).toEqual([]);
 	});
 
-	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider", async () => {
-		// If this regresses, a pooled subagent of such a host waits for a login it cannot place in its pool, or ends
-		// its turn on the missing key without saying why.
+	it("does not wait for a disabled login in a session restricted to an account pool, and warns once for the provider in the main thread", async () => {
+		// If this regresses, a pooled subagent of such a host waits for a login it cannot place in its pool, ends
+		// its turn on the missing key without saying why, or the main thread warns again for each worker or registry.
 		const unreadablePoolWarnings = captureUnreadablePoolWarnings();
 		const registry = await openRegistry();
 		const worker = await startAuthWorker(registry);
@@ -162,6 +169,7 @@ describe("a subagent thread's key retry over a host SessionsApi without permitsI
 				retryable: false,
 			});
 		}
+		expect(await registry.missingKeyMayRecover("anthropic", "pooled")).toBe(false);
 		expect(unreadablePoolWarnings()).toEqual([[expect.any(String), { provider: "anthropic", sessionId: "pooled" }]]);
 	});
 });
