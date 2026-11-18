@@ -655,6 +655,36 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, _path: &Path, _dir_fd: Di
 	true // Return error
 }
 
+/// The device-and-inode check on its own, on any kernel: a real directory at
+/// the name that is not the one `stat_at` found is refused, for the descent
+/// and for `-i`'s emptiness listing.
+#[cfg(all(test, not(target_os = "redox")))]
+mod stat_subdir_tests {
+	use std::{ffi::OsStr, os::unix::fs::MetadataExt};
+
+	use uucore::safe_traversal::{DirFd, SymlinkBehavior};
+
+	use super::{is_subdir_empty, open_stat_subdir};
+
+	#[test]
+	fn a_subdirectory_that_is_not_the_one_stat_at_found_is_refused() {
+		let tmp = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tmp.path().join("sub")).unwrap();
+		std::fs::create_dir(tmp.path().join("other")).unwrap();
+		let id = |name: &str| {
+			let meta = std::fs::symlink_metadata(tmp.path().join(name)).unwrap();
+			(meta.dev(), meta.ino())
+		};
+		let dir = DirFd::open(tmp.path(), SymlinkBehavior::NoFollow).unwrap();
+		let sub = OsStr::new("sub");
+		assert!(open_stat_subdir(&dir, sub, id("sub")).is_ok(), "the directory stat_at found");
+		let err = open_stat_subdir(&dir, sub, id("other")).err().expect("another directory's id was accepted");
+		assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+		assert!(is_subdir_empty(&dir, sub, id("sub")), "the empty directory stat_at found");
+		assert!(!is_subdir_empty(&dir, sub, id("other")), "-i listed a directory stat_at did not find");
+	}
+}
+
 }
 #[cfg(all(unix, not(target_os = "redox")))]
 use platform::{safe_remove_dir_recursive, safe_remove_empty_dir, safe_remove_file};
