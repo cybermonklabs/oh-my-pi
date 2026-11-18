@@ -11302,17 +11302,44 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *
 	 * `{ queueId }` removes exactly the steer queued under that
 	 * {@link SteerOptions.queueId}, from `queue` or from a hold that would put it
-	 * back, never another message with the same text.
+	 * back, never another message with the same text. A steer a run already took
+	 * off the queue but has not put into its context yet cannot be taken back
+	 * while that run holds it: the answer waits for the run, and is false once
+	 * the run takes the steer (its `onTaken` called first), or the take-back of
+	 * it once the run ends having put it back on the queue instead.
 	 */
-	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean {
+	removeQueuedMessage(target: string, queue: "steering" | "followUp"): boolean;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean>;
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): boolean | Promise<boolean> {
 		if (typeof target === "string") return this.takeQueuedMessage(target, queue) !== undefined;
-		const named = (messages: Iterable<AgentMessage>): AgentMessage | undefined => {
-			for (const message of messages) if (this.#queuedMessageIds.get(message) === target.queueId) return message;
-			return undefined;
-		};
+		const { queueId } = target;
+		if (this.#removeNamedQueuedMessage(queueId, queue)) return true;
+		const inFlight = this.#namedQueuedMessage(this.agent.peekUndeliveredQueuedMessages(), queueId);
+		if (!inFlight) return false;
+		const taken = Promise.withResolvers<void>();
+		const onTaken = this.#queuedMessageTaken.get(inFlight);
+		this.#queuedMessageTaken.set(inFlight, () => {
+			taken.resolve();
+			return onTaken?.();
+		});
+		return Promise.race([taken.promise, this.agent.waitForIdle()]).then(() =>
+			this.#removeNamedQueuedMessage(queueId, queue),
+		);
+	}
+
+	/** The message among `messages` that a steer named `queueId`. */
+	#namedQueuedMessage(messages: Iterable<AgentMessage>, queueId: string): AgentMessage | undefined {
+		for (const message of messages) if (this.#queuedMessageIds.get(message) === queueId) return message;
+		return undefined;
+	}
+
+	/** Take back the steer named `queueId` from `queue` or from a hold; false when neither has it. */
+	#removeNamedQueuedMessage(queueId: string, queue: "steering" | "followUp"): boolean {
 		const message =
-			named(queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue()) ??
-			named(this.#heldQueuedMessages);
+			this.#namedQueuedMessage(
+				queue === "steering" ? this.agent.peekSteeringQueue() : this.agent.peekFollowUpQueue(),
+				queueId,
+			) ?? this.#namedQueuedMessage(this.#heldQueuedMessages, queueId);
 		if (!message || !this.withdrawQueuedMessage(message)) return false;
 		this.#queuedMessageTaken.delete(message);
 		return true;
