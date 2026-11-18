@@ -174,7 +174,8 @@ pub(crate) struct Host {
 	/// Unwrapped stdout retained for provider-aware self-read detection; only
 	/// kept for [`Utility::CHECKS_STDOUT_PATH`] utilities.
 	stdout_handle:         Option<OpenFile>,
-	/// Populated on the utility worker, where virtual handle queries may block.
+	/// Read on first use through the handle's async API (see
+	/// [`Host::stdout_file`]).
 	stdout_metadata:       OnceLock<Option<Metadata>>,
 	/// The effective umask, read once per invocation (see [`Host::umask`]).
 	umask:                 OnceLock<u32>,
@@ -222,13 +223,16 @@ fn output_handle(file: &OpenFile) -> Option<OpenFile> {
 ///
 /// The metadata is taken from the handle itself rather than from the path it
 /// was opened by, so two descriptors onto one file compare equal however they
-/// were reached.
-fn handle_metadata(file: &OpenFile) -> Option<Metadata> {
+/// were reached. A provider file is asked through its async API: an async
+/// utility runs on the session's runtime, where pi-vfs's blocking query
+/// panics on a current-thread runtime and holds a worker on a multi-thread
+/// one.
+async fn handle_metadata(file: &OpenFile) -> Option<Metadata> {
 	match file {
 		// `Metadata::from_file` keeps the handle identity a Windows path stat
 		// drops; without it `path_is_stdout` can never match on Windows.
 		OpenFile::File(file) => Metadata::from_file(file).ok(),
-		OpenFile::Vfs(file) => file.metadata().ok(),
+		OpenFile::Vfs(file) => file.metadata_async().await.ok(),
 		OpenFile::Stream(_) => None,
 	}
 }
@@ -876,7 +880,7 @@ impl Host {
 	/// Whether `path` identifies the regular file currently backing stdout.
 	/// Always `false` unless the utility set [`Utility::CHECKS_STDOUT_PATH`].
 	pub async fn path_is_stdout(&self, path: &Path) -> bool {
-		match self.stdout_file() {
+		match self.stdout_file().await {
 			Some(stdout) => stdout.is(&self.vfs(), path).await,
 			None => false,
 		}
@@ -885,10 +889,17 @@ impl Host {
 	/// The regular file backing stdout, as a `Sync` value worker threads can
 	/// test paths against; `None` when stdout is no regular file or the
 	/// utility did not set [`Utility::CHECKS_STDOUT_PATH`].
-	pub fn stdout_file(&self) -> Option<StdoutFile> {
+	pub async fn stdout_file(&self) -> Option<StdoutFile> {
+		if self.stdout_metadata.get().is_none() {
+			let metadata = match &self.stdout_handle {
+				Some(handle) => handle_metadata(handle).await,
+				None => None,
+			};
+			let _ = self.stdout_metadata.set(metadata);
+		}
 		self.stdout_metadata
-			.get_or_init(|| self.stdout_handle.as_ref().and_then(handle_metadata))
-			.as_ref()
+			.get()
+			.and_then(Option::as_ref)
 			.filter(|stdout| stdout.is_file())
 			.map(|stdout| StdoutFile(stdout.clone()))
 	}
@@ -904,8 +915,8 @@ impl Host {
 	/// defeated by a path that is replaced, or a symlink that is retargeted,
 	/// between the check and the open.
 	/// Always `false` unless the utility set [`Utility::CHECKS_STDOUT_PATH`].
-	pub fn opened_is_stdout(&self, opened: &Metadata) -> bool {
-		self.stdout_file().is_some_and(|stdout| stdout.matches(opened))
+	pub async fn opened_is_stdout(&self, opened: &Metadata) -> bool {
+		self.stdout_file().await.is_some_and(|stdout| stdout.matches(opened))
 	}
 
 	/// Whether standard input is the regular file currently backing stdout.
@@ -916,11 +927,11 @@ impl Host {
 	/// paths, and a shell redirection (`< file` with `>> file`) is caught
 	/// without ever opening the file again.
 	/// Always `false` unless the utility set [`Utility::CHECKS_STDOUT_PATH`].
-	pub fn stdin_is_stdout(&self) -> bool {
-		let Some(stdout) = self.stdout_file() else {
+	pub async fn stdin_is_stdout(&self) -> bool {
+		let Some(stdout) = self.stdout_file().await else {
 			return false;
 		};
-		handle_metadata(self.stdin.file()).is_some_and(|stdin| stdout.matches(&stdin))
+		handle_metadata(self.stdin.file()).await.is_some_and(|stdin| stdout.matches(&stdin))
 	}
 
 	/// Looks up an exported shell variable.
@@ -2163,11 +2174,36 @@ impl Opened {
 	}
 }
 
-/// Writes `text` to the descriptor `file` when it is open, ignoring failures:
-/// the diagnostics of an invocation that ends before it has a [`Host`].
-fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
-	if let Some(file) = file {
-		let _ = file.clone().write_fmt(text);
+/// How an invocation ends before its body runs: its exit status, and the
+/// text it reports (a usage error, `--help`, a stream it cannot open) with the
+/// descriptor that text goes to.
+///
+/// [`Early::finish`] writes the text through the async output sinks. The
+/// descriptor can be a provider file (an engine pipe, `$(…)`), whose blocking
+/// write would hold the runtime thread the adapter runs on, and panics on a
+/// current-thread runtime.
+struct Early {
+	code:   i32,
+	report: Option<(OpenFile, String)>,
+}
+
+impl Early {
+	/// Ends with `code` and reports nothing.
+	const fn status(code: i32) -> Self {
+		Self { code, report: None }
+	}
+
+	/// Ends with `code` after writing `text` to `file`, when it is open.
+	fn report(code: i32, file: Option<&OpenFile>, text: String) -> Self {
+		Self { code, report: file.map(|file| (file.clone(), text)) }
+	}
+
+	/// Writes the report, ignoring failures, and returns the exit status.
+	async fn finish(self) -> i32 {
+		if let Some((file, text)) = self.report {
+			report_async(Some(file), text).await;
+		}
+		self.code
 	}
 }
 
@@ -2179,7 +2215,7 @@ pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
 		match prepare::<U>(invocation, spec) {
 			Ok(prepared) => prepared,
-			Err(code) => return code,
+			Err(early) => return early.finish().await,
 		};
 
 	let handle = tokio::task::spawn_blocking(move || {
@@ -2204,7 +2240,7 @@ pub(crate) async fn run_async_utility<U: AsyncUtility>(invocation: Invocation) -
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
 		match prepare::<U>(invocation, spec) {
 			Ok(prepared) => prepared,
-			Err(code) => return code,
+			Err(early) => return early.finish().await,
 		};
 
 	// On cancel the body is dropped, which cancels whatever it awaits.
@@ -2229,7 +2265,7 @@ struct Prepared<P> {
 /// Rewrites and parses `argv` and builds the host. `Err` carries the exit
 /// status when the invocation ends early (usage error, `--help`, host
 /// failure).
-fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
+fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, Early> {
 	let mut invocation = invocation.open(spec.name);
 	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 	let [_, stdout, stderr] = &invocation.stdio;
@@ -2237,8 +2273,8 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 	let argv = match (spec.rewrite_argv)(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
-			write_to(stderr.as_ref(), format_args!("{}: {message}\n", spec.name));
-			return Err(spec.usage_error.into());
+			let text = format!("{}: {message}\n", spec.name);
+			return Err(Early::report(spec.usage_error.into(), stderr.as_ref(), text));
 		},
 	};
 
@@ -2247,12 +2283,11 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
-			if err.use_stderr() {
-				write_to(stderr.as_ref(), format_args!("{err}"));
-				return Err(spec.usage_error.into());
-			}
-			write_to(stdout.as_ref(), format_args!("{err}"));
-			return Err(0);
+			return Err(if err.use_stderr() {
+				Early::report(spec.usage_error.into(), stderr.as_ref(), err.to_string())
+			} else {
+				Early::report(0, stdout.as_ref(), err.to_string())
+			});
 		},
 	};
 
@@ -2449,7 +2484,7 @@ fn settle(name: &str, outcome: std::thread::Result<i32>, host: &mut Host) -> i32
 /// environment into an owned [`Host`] that can move to a blocking thread.
 /// `Err` carries the exit status when a closed descriptor cannot be backed by
 /// the null device.
-fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
+fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
@@ -2458,12 +2493,12 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	let (stdin, stdout, stderr_file) = match (or_null(stdin), or_null(stdout), or_null(stderr_file)) {
 		(Ok(stdin), Ok(stdout), Ok(stderr_file)) => (stdin, stdout, stderr_file),
 		(stdin, stdout, stderr_file) => {
-			if let Ok(stderr_file) = &stderr_file
-				&& let Some(error) = stdin.err().or(stdout.err())
-			{
-				write_to(Some(stderr_file), format_args!("{invoked}: {error}\n"));
-			}
-			return Err(1);
+			return Err(match (&stderr_file, stdin.err().or(stdout.err())) {
+				(Ok(stderr_file), Some(error)) => {
+					Early::report(1, Some(stderr_file), format!("{invoked}: {error}\n"))
+				},
+				_ => Early::status(1),
+			});
 		},
 	};
 	// The `OpenFile` is kept alive by the `Stdin` below, so the fd stays valid.
@@ -3145,7 +3180,7 @@ mod testing {
 		std::fs::write(&other, "other\n").unwrap();
 		std::fs::rename(&other, &path).unwrap();
 		assert!(!host.path_is_stdout(&path).await, "the path no longer names the output file");
-		assert!(host.opened_is_stdout(&opened), "the handle still names the output file");
+		assert!(host.opened_is_stdout(&opened).await, "the handle still names the output file");
 	}
 
 	/// Parses `argv` and runs `U` against an in-memory host, mirroring what the

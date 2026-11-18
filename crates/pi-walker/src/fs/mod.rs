@@ -495,10 +495,27 @@ impl File {
 	/// # Errors
 	///
 	/// The handle's (or provider's) status query.
+	///
+	/// A provider file's query blocks the calling thread: async code calls
+	/// [`File::metadata_async`].
 	pub fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
 		match &self.repr {
 			FileRepr::Native(handle) => native::handle_metadata(handle),
 			FileRepr::Provider(file) => file.metadata(),
+		}
+	}
+
+	/// [`File::metadata`] for async code: a provider file is asked through its
+	/// async API, so the query neither holds a runtime worker nor panics on a
+	/// current-thread runtime.
+	///
+	/// # Errors
+	///
+	/// As for [`File::metadata`].
+	pub async fn metadata_async(&self) -> io::Result<pi_vfs::Metadata> {
+		match &self.repr {
+			FileRepr::Native(handle) => native::handle_metadata(handle),
+			FileRepr::Provider(file) => file.metadata_async().await,
 		}
 	}
 }
