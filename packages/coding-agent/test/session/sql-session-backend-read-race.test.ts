@@ -9,8 +9,8 @@
  * - the read-back after a failed atomic publish, which decides whether the
  *   body landed anyway, never takes the other store's body for its own.
  *
- * Runs on SQLite always, and on PostgreSQL when `OMP_TEST_SQL_POSTGRES_URL`
- * names a database.
+ * Runs on SQLite always, and on PostgreSQL and MySQL when
+ * `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -20,15 +20,11 @@ import type {
 	SqlSessionStorageResult,
 	SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { MiB, partRace, STILL, TIMESTAMP } from "./chunked-read-race";
+import { line, MiB, partRace, STILL, TIMESTAMP } from "./chunked-read-race";
 import { LEASE_BACKENDS, openLeaseDb, rejection } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000f1";
 const LOST_REPLY = "the connection closed before the commit's reply came back";
-
-function line(entry: Record<string, unknown>): string {
-	return `${JSON.stringify(entry)}\n`;
-}
 
 /**
  * A session whose first prompt and reply sit past the 4 KiB head window,

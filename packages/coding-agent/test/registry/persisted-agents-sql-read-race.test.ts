@@ -5,21 +5,19 @@
  * transcript in chunks, and another store's full rewrite between two chunks
  * fails a read with `SessionReadConflictError`. The read then starts again
  * from the transcript's start, so the row shows one body's metadata and
- * metrics, never none. Runs on SQLite always and on PostgreSQL when
- * `OMP_TEST_SQL_POSTGRES_URL` names a database.
+ * metrics, never none; a history read raced on every pass leaves that one
+ * row without metrics and the others hydrated. Runs on SQLite always, and on
+ * PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
+ * `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
-import { MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
+import { line, MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
 import { LEASE_BACKENDS, type LeaseDb, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000a1";
-
-function line(entry: Record<string, unknown>): string {
-	return `${JSON.stringify(entry)}\n`;
-}
 
 function sessionInit(agent: string): string {
 	return line({
@@ -91,7 +89,7 @@ async function roster(db: LeaseDb, worker: string[]) {
 		await holder.writeLinesAtomic(workerFile, next, { expectedSize: holder.statSync(workerFile).size });
 		await holder.drain();
 	};
-	return { sessionFile, workerFile, reader, rewrite, registry: new AgentRegistry() };
+	return { sessionFile, workerFile, holder, reader, rewrite, registry: new AgentRegistry() };
 }
 
 for (const { adapter, url } of LEASE_BACKENDS) {
@@ -130,6 +128,48 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 
 				expect(race.ran).toBe(true);
 				expect(["scout", "reviewer"]).toContain(registry.get("Worker")?.history?.agent ?? "no row");
+			}, 120_000);
+
+			it("hydrates the other subagents' metrics when one subagent's history read is raced on every pass", async () => {
+				// If this regresses, one subagent whose SQL transcript another process keeps rewriting fails the
+				// whole hydration, and the Agent Hub and the status line's tree cost miss the other subagents' cost.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const body = (fill: string) => [
+					header,
+					sessionInit("task"),
+					userTurn,
+					pad(fill),
+					...assistantTurns(2, 0.25),
+				];
+				const { sessionFile, workerFile, holder, reader, rewrite, registry } = await roster(db, body("a"));
+				const helperFile = path.join(path.dirname(workerFile), "Zed.jsonl");
+				await holder.writeLinesAtomic(helperFile, body("c"));
+				await holder.drain();
+				await reader.refresh();
+				await registerPersistedSubagents(registry, sessionFile, { hydrateHistory: false, storage: reader });
+				// Every read of Worker's transcript meets a full rewrite after its first chunk.
+				const readChunks = reader.readChunks.bind(reader);
+				let rewrites = 0;
+				spyOn(reader, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
+					(async function* () {
+						let first = true;
+						for await (const chunk of readChunks(chunkPath, fromByte)) {
+							yield chunk;
+							if (!first || chunkPath !== workerFile) continue;
+							first = false;
+							rewrites++;
+							await rewrite(body(rewrites % 2 === 0 ? "a" : "b"));
+						}
+					})(),
+				);
+
+				await registerPersistedSubagents(registry, sessionFile, { storage: reader });
+
+				expect({
+					rewrites,
+					worker: registry.get("Worker")?.history?.metrics?.requests ?? "no metrics",
+					helper: registry.get("Zed")?.history?.metrics?.requests ?? "no metrics",
+				}).toEqual({ rewrites: 4, worker: "no metrics", helper: 2 });
 			}, 120_000);
 		},
 	);

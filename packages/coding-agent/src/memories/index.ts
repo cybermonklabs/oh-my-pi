@@ -802,20 +802,10 @@ async function openRolloutFile(rolloutPath: string): Promise<RolloutBytes> {
 	return { size, read: (start, end) => file.slice(start, end).bytes() };
 }
 
-/** Persistable messages from the start of the rollout, in file order, read window by window. */
-async function* persistableMessagesFromFront(rollout: RolloutBytes): AsyncGenerator<AgentMessage> {
-	const { size } = rollout;
-	const decoder = new TextDecoder();
-	let carry: Uint8Array | undefined;
-	let offset = 0;
-	while (offset < size) {
-		const end = Math.min(size, offset + STAGE1_ROLLOUT_WINDOW_BYTES);
-		const window = await rollout.read(offset, end);
-		offset = end;
-		const bytes = carry ? Buffer.concat([carry, window]) : window;
-		const cut = offset >= size ? bytes.length : bytes.lastIndexOf(0x0a) + 1;
-		carry = cut < bytes.length ? bytes.subarray(cut) : undefined;
-		if (cut > 0) yield* extractPersistableMessages(decoder.decode(bytes.subarray(0, cut)));
+/** The rollout's bytes from its start, read a window of {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time. */
+async function* frontWindows(rollout: RolloutBytes): AsyncGenerator<Uint8Array> {
+	for (let offset = 0; offset < rollout.size; offset += STAGE1_ROLLOUT_WINDOW_BYTES) {
+		yield await rollout.read(offset, Math.min(rollout.size, offset + STAGE1_ROLLOUT_WINDOW_BYTES));
 	}
 }
 
@@ -861,11 +851,71 @@ async function* persistableMessagesFromChunks(chunks: AsyncIterable<Uint8Array>)
 	if (carry) yield* extractPersistableMessages(decoder.decode(carry));
 }
 
-/** The character budgets of a stage-1 payload of `tokenLimit` tokens: the whole, its head, its tail. */
-function stage1Budget(tokenLimit: number): { maxChars: number; headChars: number; tailChars: number } {
+/**
+ * The stage-1 payload of the rollout whose persistable messages `messages`
+ * gives in file order: the head, and when the whole does not fit, the tail,
+ * read from the back windows of `rollout` (a file), or, with no file, kept
+ * from `messages` as they pass: the newest, the fewest whose text reaches the
+ * tail budget, as the back windows would give them.
+ */
+async function stage1Items(
+	messages: AsyncIterable<AgentMessage>,
+	tokenLimit: number,
+	rollout?: RolloutBytes,
+): Promise<string> {
 	const maxChars = tokenLimit * 4;
 	const headChars = Math.floor(maxChars * 0.6);
-	return { maxChars, headChars, tailChars: maxChars - headChars };
+	const tailChars = maxChars - headChars;
+	let head = "[";
+	let truncated = false;
+	// The kept newest messages are `newest` from index `oldest` on; `tailLength` is the
+	// length of their text as the tail joins them: a `,` before each, and the closing `]`.
+	const newest: string[] = [];
+	let oldest = 0;
+	let tailLength = 1;
+	for await (const message of messages) {
+		const json = JSON.stringify(message);
+		if (!truncated) {
+			head += head.length === 1 ? json : `,${json}`;
+			truncated = head.length > maxChars;
+			// A file's tail is read from its end.
+			if (truncated && rollout) break;
+		}
+		if (rollout) continue;
+		newest.push(json);
+		tailLength += json.length + 1;
+		while (newest.length - oldest > 1 && tailLength - (newest[oldest].length + 1) >= tailChars) {
+			tailLength -= newest[oldest].length + 1;
+			oldest++;
+		}
+		// Let go of the dropped messages once they are most of the array.
+		if (oldest > 64 && oldest * 2 > newest.length) {
+			newest.splice(0, oldest);
+			oldest = 0;
+		}
+	}
+	if (!truncated) {
+		const full = `${head}]`;
+		if (full.length <= maxChars) return full;
+	}
+	let tail: string;
+	if (rollout) {
+		tail = "]";
+		let exhausted = true;
+		for await (const message of persistableMessagesFromBack(rollout)) {
+			tail = `,${JSON.stringify(message)}${tail}`;
+			if (tail.length >= tailChars) {
+				exhausted = false;
+				break;
+			}
+		}
+		// Every message consumed: the leading separator is really the array opener.
+		if (exhausted) tail = `[${tail.slice(1)}`;
+	} else {
+		// A tail short of its budget holds every message: its leading separator is really the array opener.
+		tail = `${tailLength < tailChars ? "[" : ","}${newest.slice(oldest).join(",")}]`;
+	}
+	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
 }
 
 /**
@@ -888,87 +938,17 @@ export async function buildStage1RolloutItems(
 	tokenLimit: number,
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<string> {
+	// Opening throws for a missing rollout, matching the previous whole-file read failure.
 	if (!(storage instanceof FileSessionStorage)) {
-		// A missing rollout throws, matching the previous whole-file read failure.
 		storage.statSync(rolloutPath);
 		if (tokenLimit <= 0) return "";
 		return retryRacedRead(() =>
-			stage1ItemsInOnePass(persistableMessagesFromChunks(transcriptByteChunks(rolloutPath, storage)), tokenLimit),
+			stage1Items(persistableMessagesFromChunks(transcriptByteChunks(rolloutPath, storage)), tokenLimit),
 		);
 	}
-	// Opening throws for a missing rollout, matching the previous whole-file read failure.
 	const rollout = await openRolloutFile(rolloutPath);
 	if (tokenLimit <= 0) return "";
-	const { maxChars, headChars, tailChars } = stage1Budget(tokenLimit);
-
-	let head = "[";
-	let truncated = false;
-	for await (const message of persistableMessagesFromFront(rollout)) {
-		head += head.length === 1 ? JSON.stringify(message) : `,${JSON.stringify(message)}`;
-		if (head.length > maxChars) {
-			truncated = true;
-			break;
-		}
-	}
-	if (!truncated) {
-		const full = `${head}]`;
-		if (full.length <= maxChars) return full;
-	}
-
-	let tail = "]";
-	let exhausted = true;
-	for await (const message of persistableMessagesFromBack(rollout)) {
-		tail = `,${JSON.stringify(message)}${tail}`;
-		if (tail.length >= tailChars) {
-			exhausted = false;
-			break;
-		}
-	}
-	// Every message consumed: the leading separator is really the array opener.
-	if (exhausted) tail = `[${tail.slice(1)}`;
-	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
-}
-
-/**
- * The payload {@link buildStage1RolloutItems} builds from the front and back
- * windows of a file, from `messages` in file order, read once: the head as
- * the front windows give it, and the newest messages, the fewest whose text
- * reaches the tail budget, as the back windows give them.
- */
-async function stage1ItemsInOnePass(messages: AsyncIterable<AgentMessage>, tokenLimit: number): Promise<string> {
-	const { maxChars, headChars, tailChars } = stage1Budget(tokenLimit);
-	let head = "[";
-	let truncated = false;
-	// The kept newest messages are `newest` from index `oldest` on; `tailLength` is the
-	// length of their text as the tail joins them: a `,` before each, and the closing `]`.
-	const newest: string[] = [];
-	let oldest = 0;
-	let tailLength = 1;
-	for await (const message of messages) {
-		const json = JSON.stringify(message);
-		if (!truncated) {
-			head += head.length === 1 ? json : `,${json}`;
-			truncated = head.length > maxChars;
-		}
-		newest.push(json);
-		tailLength += json.length + 1;
-		while (newest.length - oldest > 1 && tailLength - (newest[oldest].length + 1) >= tailChars) {
-			tailLength -= newest[oldest].length + 1;
-			oldest++;
-		}
-		// Let go of the dropped messages once they are most of the array.
-		if (oldest > 64 && oldest * 2 > newest.length) {
-			newest.splice(0, oldest);
-			oldest = 0;
-		}
-	}
-	if (!truncated) {
-		const full = `${head}]`;
-		if (full.length <= maxChars) return full;
-	}
-	// A tail short of its budget holds every message: its leading separator is really the array opener.
-	const tail = `${tailLength < tailChars ? "[" : ","}${newest.slice(oldest).join(",")}]`;
-	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
+	return stage1Items(persistableMessagesFromChunks(frontWindows(rollout)), tokenLimit, rollout);
 }
 
 async function runStage1Job(options: {

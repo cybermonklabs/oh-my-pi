@@ -73,8 +73,9 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
  * transcript is never held whole; a caller reads on from `nextByte`. A cursor
  * past the end, or one no record ends right before (the transcript was
  * rewritten since the caller's last read), reads the transcript again from its
- * start and reports `reset`, so the caller never gets a cut-off entry, or one
- * it already has, of a rewritten body.
+ * start and reports `reset`, so the caller drops what it read before. A
+ * rewrite that still ends a record right before the cursor goes unseen: the
+ * read then goes on from the cursor in the new body.
  */
 export async function readRpcSubagentTranscript(
 	sessionFile: string,
@@ -82,10 +83,10 @@ export async function readRpcSubagentTranscript(
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<RpcSubagentMessagesResult> {
 	let startByte = Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0;
-	let read: { text: string; size: number };
+	let text: string;
 	try {
 		// From the byte before the cursor: the newline of the record the caller read last.
-		read = await readSessionLinesFrom(storage, sessionFile, Math.max(0, startByte - 1));
+		({ text } = await readSessionLinesFrom(storage, sessionFile, Math.max(0, startByte - 1)));
 	} catch (err) {
 		if (!isEnoent(err)) throw err;
 		return {
@@ -97,7 +98,6 @@ export async function readRpcSubagentTranscript(
 			messages: [],
 		};
 	}
-	let text = read.text;
 	let reset = false;
 	if (startByte > 0 && text.startsWith("\n")) {
 		text = text.slice(1);

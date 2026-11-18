@@ -177,7 +177,9 @@ function isFilesystemError(error: unknown): boolean {
 /**
  * A transcript read failure the roster must not swallow: a storage fault
  * ({@link isFilesystemError}), or a read full rewrites raced on every pass
- * {@link retryRacedRead} made, which the next roster scan reads again.
+ * {@link retryRacedRead} made. The roster scan's metadata reads throw it, so
+ * the roster latch drops and the next scan reads again; the history
+ * hydration logs a raced read and goes on with the other subagents.
  */
 function isReadFailure(error: unknown): boolean {
 	return isFilesystemError(error) || error instanceof SessionReadConflictError;
@@ -789,7 +791,19 @@ export async function registerPersistedSubagents(
 			if (!ref || ref.sessionFile !== transcript.sessionFile) continue;
 			const stamp = transcriptStamp(transcript.sessionFile, storage);
 			if (stamp !== undefined && historyStamps.get(ref) === stamp) continue;
-			const history = await readPersistedAgentHistory(transcript, shouldContinue, storage);
+			let history: AgentHistorySummary;
+			try {
+				history = await readPersistedAgentHistory(transcript, shouldContinue, storage);
+			} catch (error) {
+				if (!(error instanceof SessionReadConflictError)) throw error;
+				// Raced on every pass: the other subagents' metrics still load, and with no stamp
+				// recorded for this one, the next hydration of the roster reads it again.
+				logger.warn("Persisted subagent history read raced by rewrites", {
+					sessionFile: transcript.sessionFile,
+					error: error.message,
+				});
+				continue;
+			}
 			if (!shouldContinue()) return;
 			if (registry.setHistory(transcript.id, history, transcript.sessionFile) && stamp !== undefined) {
 				historyStamps.set(ref, stamp);

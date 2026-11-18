@@ -21,6 +21,11 @@ export const TIMESTAMP = "2026-11-18T00:00:00.000Z";
 /** Lease timings under which no heartbeat runs during a case. */
 export const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
+/** `entry` as one JSONL line, its newline included. */
+export function line(entry: Record<string, unknown>): string {
+	return `${JSON.stringify(entry)}\n`;
+}
+
 /** Whether a race ran. */
 export interface Race {
 	readonly ran: boolean;

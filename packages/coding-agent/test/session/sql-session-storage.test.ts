@@ -428,7 +428,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		for (let n = 0; n < 82; n++) await writer.append(`${String(n).padStart(2, "0")}:${"x".repeat(part - 4)}\n`);
 		await writer.close();
 
-		// Windows of 1 MiB as memories stage 1 reads them: from the start, and from inside a part.
+		// Reads that stop after 1 MiB: from the start, and from an offset inside a part.
 		for (const offset of [0, 4 * MiB]) {
 			paged = 0;
 			pages = 0;

@@ -24,7 +24,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
+import { line, MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
 import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const previous = defaultSessionStorage();
@@ -140,7 +140,6 @@ describe("loadAdvisorTranscriptCosts", () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const sessionFile = path.join(db.dir.path(), "sessions", "-project-", "sess.jsonl");
 				const advisorFile = path.join(sessionFile.slice(0, -".jsonl".length), advisorTranscriptFilename(""));
-				const line = (entry: Record<string, unknown>) => `${JSON.stringify(entry)}\n`;
 				// A first chunk of 1 MiB holds no turn: the turns come after a large entry.
 				const body = (fill: string, costs: number[]) => [
 					line({ type: "session", version: 3, id: "advisor", timestamp: TIMESTAMP, cwd: "/project" }),

@@ -123,7 +123,7 @@ async function racedRead(
 
 // Another store writes the session between two pages of a chunked read: an
 // append, a rename, or a full rewrite of the same size under a read from an
-// offset, as the memories windows read.
+// offset (`readChunks(path, fromByte)`, which starts inside the transcript).
 for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(`a chunked SQL read raced by another store (${adapter})`, () => {
 		async function sessionOf(
@@ -177,7 +177,7 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 		}, 120_000);
 
 		it("yields one body's bytes from the read's offset, or a read conflict, when the other store rewrites the session to the same size between two pages", async () => {
-			// If this regresses, a memories window of a session rewritten meanwhile reads the start of one body
+			// If this regresses, a read from an offset of a session rewritten meanwhile reads the start of one body
 			// and the rest of another. Both bodies are full writes, so every part of one starts where a part of
 			// the other does, and the parts' offsets and the size cannot tell them apart.
 			await using db = await openLeaseDb(adapter, url ?? "");

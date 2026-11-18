@@ -29,7 +29,7 @@
 ### Fixed
 
 - Resuming a long session from SQL session storage, and rewriting it in full, no longer holds the whole transcript in memory
-- Debug reports, `omp gc --blobs` and memories stage 1 read long transcripts from SQL session storage chunk by chunk instead of whole, and RPC `get_subagent_messages` and the Agent Hub transcript viewer read at most 8 MiB of a transcript at a time (an RPC client repeats the request from `nextByte` to read on)
+- Debug reports, `omp gc --blobs` and memories stage 1 read long transcripts from SQL session storage chunk by chunk instead of whole, and RPC `get_subagent_messages` and the Agent Hub transcript viewer read at most 8 MiB of a transcript at a time (an RPC client repeats the request from `nextByte` to read on; when no record ends right before `fromByte`, as after a rewrite of the transcript, the reply reads again from byte 0 and reports `reset: true`)
 - RPC `get_subagent_messages` and the Agent Hub transcript viewer fetch only the window they read from Redis session storage instead of the whole transcript
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
