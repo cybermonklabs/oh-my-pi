@@ -3459,9 +3459,10 @@ export class SessionManager {
 	 * On such a storage a rewrite queued while this manager's own earlier
 	 * publish is unconfirmed fails the store's size check. That publish's
 	 * confirmation rewrites the transcript, the refused entries included, so
-	 * the wait covers it before {@link flush} reports what is left. When that
-	 * publish itself fails, the wait rejects with the store's error, not the
-	 * size-check conflict the flush still holds.
+	 * the wait covers it before {@link flush} reports what is left. When the
+	 * drain fails and the flush still fails after it, the wait rejects with the
+	 * drain's error (the store's first failed write, which may belong to any
+	 * path) instead of the size-check conflict the flush still holds.
 	 */
 	flushSyncThenConfirm(): Promise<void> | undefined {
 		if (!this.#storage.defersSyncPublish) {
