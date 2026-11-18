@@ -1138,14 +1138,21 @@ class DaemonBroker {
 	}
 
 	/**
-	 * Brings `record` up to date with its process: reads a start mark it could
-	 * not read at spawn ({@link #refreshMark}), retries the kills it could not
-	 * pin the daemon for ({@link ManagedDaemon.pendingKills}), then, for a
-	 * detached daemon this broker does not hold, reads its output and settles
-	 * it once it is gone.
+	 * Brings `record` up to date with its process: writes the record again if
+	 * its last write failed, reads a start mark it could not read at spawn
+	 * ({@link #refreshMark}), retries the kills it could not pin the daemon for
+	 * ({@link ManagedDaemon.pendingKills}), then, for a detached daemon this
+	 * broker does not hold, reads its output and settles it once it is gone.
 	 */
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
 		if (settledState(record.snapshot.state)) return;
+		// A failed write (a full or read-only disk) left `persistedMeta` unset:
+		// what only memory holds, a mark read at refresh among it, is written
+		// again at each refresh until a write succeeds.
+		if (record.persistedMeta === undefined) {
+			this.#persist(record);
+			await record.persistQueue;
+		}
 		await this.#refreshMark(record);
 		if (record.pendingKills.length > 0 && (await this.#retryPendingKills(record))) return;
 		if (!record.spec.detached) return;
@@ -1160,9 +1167,10 @@ class DaemonBroker {
 	 * {@link markOwnChild}: a mark read for the broker's own child is given to
 	 * the pending kills of the same daemon, which then pin it, and persisted
 	 * before this returns: a request that refreshed the record (`list`, `stop`,
-	 * `send`) replies once the mark is on disk, so a broker that dies right
-	 * after cannot lose it again (its successor could not read it: the daemon
-	 * is no longer that broker's child).
+	 * `send`) replies once the write is done or has failed (logged), so a
+	 * broker that dies right after a write that succeeded cannot lose the mark
+	 * again (its successor could not read it: the daemon is no longer that
+	 * broker's child). A write that failed is made again at the next refresh.
 	 */
 	async #refreshMark(record: ManagedDaemon): Promise<void> {
 		if (!markOwnChild(record)) return;

@@ -229,61 +229,104 @@ describe("daemon broker with a detached daemon it cannot pin", () => {
 	}, 20_000);
 });
 
+/**
+ * Starts a `sleep` daemon (detached or not) under a fresh broker while every pin fails (as with
+ * no descriptor left), so its record has no mark; then pins work again, and `body` runs with the
+ * daemon's pid, its real mark, and its record's directory. The daemon is stopped afterwards.
+ */
+async function withMarklessDaemon(
+	detached: boolean,
+	body: (client: DaemonBrokerClient, pid: number, mark: string | null | undefined, dir: string) => Promise<void>,
+): Promise<void> {
+	using tempDir = TempDir.createSync("@omp-launch-nomark-");
+	const projectDir = path.join(tempDir.path(), "project");
+	const runtimeDir = path.join(tempDir.path(), "runtime");
+	await fs.mkdir(projectDir);
+	const previousTitle = process.title;
+	// Every pin fails while `failing.now` (as with no descriptor left) but the test's own.
+	const realFromPid = Process.fromPid.bind(Process);
+	const failing = { now: true };
+	const spy = spyOn(Process, "fromPid").mockImplementation(candidate =>
+		failing.now && candidate !== process.pid ? null : realFromPid(candidate),
+	);
+	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+	const broker = startBroker(projectDir, runtimeDir);
+	const dir = path.join(runtimeDir, "daemons", NAME);
+	try {
+		const started = await client.request({
+			op: "start",
+			spec: {
+				name: NAME,
+				application: "sleep",
+				args: ["600"],
+				env: {},
+				cwd: projectDir,
+				pty: false,
+				restart: "no",
+				persist: true,
+				detached,
+			},
+		});
+		if (started.op !== "start") throw new Error(`unexpected result: ${started.op}`);
+		const pid = started.daemon.pid;
+		if (pid === undefined) throw new Error("the daemon has no pid");
+		expect(started.daemon.processStart).toBeUndefined();
+		failing.now = false;
+		await body(client, pid, realFromPid(pid)?.startMark, dir);
+		// And the daemon stops through its pin.
+		const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 2_000 });
+		if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
+		expect(["exited", "failed"]).toContain(stopped.daemon.state);
+		await untilNotRunning(pid);
+	} finally {
+		spy.mockRestore();
+		await fs.chmod(dir, 0o755).catch(() => undefined);
+		await client.request({ op: "shutdown" }).catch(() => undefined);
+		client.close();
+		await broker;
+		process.title = previousTitle;
+	}
+}
+
+/** The mark `meta.json` in `dir` holds, `null` for none. */
+async function persistedMark(dir: string): Promise<string | null> {
+	const meta = JSON.parse(await Bun.file(path.join(dir, "meta.json")).text());
+	return meta.daemon.processStart ?? null;
+}
+
 describe("daemon broker with a daemon whose mark could not be read at spawn", () => {
 	for (const detached of [true, false]) {
-		it(`reads the mark of its own ${detached ? "detached" : "pipe"} daemon at a later refresh`, async () => {
-			using tempDir = TempDir.createSync("@omp-launch-nomark-");
-			const projectDir = path.join(tempDir.path(), "project");
-			const runtimeDir = path.join(tempDir.path(), "runtime");
-			await fs.mkdir(projectDir);
-			const previousTitle = process.title;
-			// Every pin fails while `failing.now` (as with no descriptor left) but the test's own.
-			const realFromPid = Process.fromPid.bind(Process);
-			const failing = { now: true };
-			const spy = spyOn(Process, "fromPid").mockImplementation(candidate =>
-				failing.now && candidate !== process.pid ? null : realFromPid(candidate),
-			);
-			const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-			const broker = startBroker(projectDir, runtimeDir);
-			let pid: number | undefined;
-			try {
-				const started = await client.request({
-					op: "start",
-					spec: {
-						name: NAME,
-						application: "sleep",
-						args: ["600"],
-						env: {},
-						cwd: projectDir,
-						pty: false,
-						restart: "no",
-						persist: true,
-						detached,
-					},
-				});
-				if (started.op !== "start") throw new Error(`unexpected result: ${started.op}`);
-				pid = started.daemon.pid;
-				if (pid === undefined) throw new Error("the daemon has no pid");
-				expect(started.daemon.processStart).toBeUndefined();
-				failing.now = false;
+		const kind = detached ? "detached" : "pipe";
+		it(`reads the mark of its own ${kind} daemon at a later refresh`, async () => {
+			await withMarklessDaemon(detached, async (client, _pid, mark, dir) => {
 				// The broker still holds its child, which has not exited: the refresh reads
-				// the mark, and the `list` replies once it is persisted.
-				const mark = realFromPid(pid)?.startMark;
+				// the mark, and the `list` replies once its write is done.
 				expect((await snapshotOf(client)).processStart).toBe(mark ?? "no mark");
-				const meta = JSON.parse(await Bun.file(path.join(runtimeDir, "daemons", NAME, "meta.json")).text());
-				expect(meta.daemon.processStart).toBe(mark ?? "no mark");
-				// And the daemon stops through its pin.
-				const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 2_000 });
-				if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
-				expect(["exited", "failed"]).toContain(stopped.daemon.state);
-				await untilNotRunning(pid);
-			} finally {
-				spy.mockRestore();
-				await client.request({ op: "shutdown" }).catch(() => undefined);
-				client.close();
-				await broker;
-				process.title = previousTitle;
-			}
+				expect(await persistedMark(dir)).toBe(mark ?? "no mark");
+			});
+		}, 20_000);
+
+		it(`writes the mark of its own ${kind} daemon again after a write that failed`, async () => {
+			await withMarklessDaemon(detached, async (client, _pid, mark, dir) => {
+				// The record's directory refuses writes for one refresh, as a full or read-only
+				// disk does: the mark is read, but its write fails (and is logged).
+				await fs.chmod(dir, 0o555);
+				const writable = await fs.writeFile(path.join(dir, "probe"), "").then(
+					() => true,
+					() => false,
+				);
+				if (writable) {
+					console.log("skipped: this user can write into a read-only directory (root)");
+					await fs.chmod(dir, 0o755);
+					return;
+				}
+				expect((await snapshotOf(client)).processStart).toBe(mark ?? "no mark");
+				expect(await persistedMark(dir)).toBeNull();
+				// The first refresh after the directory is writable again writes it.
+				await fs.chmod(dir, 0o755);
+				expect((await snapshotOf(client)).processStart).toBe(mark ?? "no mark");
+				expect(await persistedMark(dir)).toBe(mark ?? "no mark");
+			});
 		}, 20_000);
 	}
 });
