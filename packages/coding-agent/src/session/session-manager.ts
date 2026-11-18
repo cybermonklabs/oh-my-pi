@@ -124,6 +124,7 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	retryRacedRead,
 	SESSION_HEADER_PREFIX_BYTES,
 	type SessionStorage,
 	type SessionStorageWriter,
@@ -1977,10 +1978,15 @@ export class SessionManager {
 		return !this.#allEntriesHandedToStorage() && this.#shouldHaveSessionFile();
 	}
 
-	/** Verify a failed acknowledgement chunk by chunk: file bytes exactly, other storage by size and SHA-256. */
+	/**
+	 * Verify a failed acknowledgement chunk by chunk: file bytes exactly, other
+	 * storage by size and SHA-256. A full rewrite or delete that races the read
+	 * (`SessionReadConflictError`) is read again from its start through
+	 * {@link retryRacedRead}, never as one whole-text read.
+	 */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body);
+		return retryRacedRead(() => chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), body));
 	}
 
 	/**
