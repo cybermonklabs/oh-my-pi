@@ -680,8 +680,9 @@ describe("session blobs in the SQL session storage", () => {
 				await flushing;
 				expect((await db.row(sessionFile))?.content ?? "").toContain(IMAGE_HASH);
 				// The write waited for its blob before it began, so it ran once: without that wait its first
-				// transaction would find the row missing, roll back, and run again once the blob landed.
-				const sessionRow = new RegExp(`^INSERT INTO \\S*\\b${db.table} \\(`);
+				// transaction would find the row missing, roll back, and run again once the blob landed. A first
+				// write makes the row if it is missing, which MySQL spells `INSERT IGNORE INTO`.
+				const sessionRow = new RegExp(`^INSERT (?:IGNORE )?INTO \\S*\\b${db.table} \\(`);
 				expect(queries.filter(query => sessionRow.test(query))).toHaveLength(1);
 				await manager.close();
 			});
