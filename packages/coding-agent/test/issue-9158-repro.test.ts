@@ -19,6 +19,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 describe("issue #9158 — malformed worker IPC frame must not terminate the parent", () => {
 	it("contains an advanced-serialization decode failure to the worker instead of exiting the session", async () => {
@@ -55,7 +56,8 @@ describe("issue #9158 — malformed worker IPC frame must not terminate the pare
 			cwd: repoRoot,
 			stdout: "pipe",
 			stderr: "pipe",
-			env: { ...process.env, PI_TEST_RUNTIME: "0" },
+			// The parent runs as the CLI does, as production, in a home of its own.
+			env: createProductionChildEnv(),
 		});
 		const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 		// Before the fix the postmortem handler exited the parent with code 1 and
@@ -81,7 +83,7 @@ describe("issue #9158 — malformed worker IPC frame must not terminate the pare
 			cwd: repoRoot,
 			stdout: "pipe",
 			stderr: "pipe",
-			env: { ...process.env, PI_TEST_RUNTIME: "0" },
+			env: createProductionChildEnv(),
 		});
 		const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 		expect(exitCode).toBe(1);

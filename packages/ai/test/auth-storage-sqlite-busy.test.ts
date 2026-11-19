@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { isSqliteBusyError, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { removeWithRetries } from "../../utils/src/temp";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 interface SqliteBusyShape extends Error {
 	code: string;
@@ -88,7 +89,7 @@ db.close();`,
 				dbPath,
 				sentinel,
 			],
-			{ env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" }, stdout: "ignore", stderr: "pipe" },
+			{ env: createProductionChildEnv({ PATH: process.env.PATH }), stdout: "ignore", stderr: "pipe" },
 		);
 		// Real-time waits are unavoidable here: the lock lives in a separate
 		// process, so fake timers cannot advance the child's sleep or the

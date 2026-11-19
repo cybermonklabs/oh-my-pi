@@ -18,6 +18,7 @@ import {
 	isInsideTerminalMultiplexer,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 import { withFakeTmux } from "./helpers/fake-tmux";
 
 describe("hasTerminalMultiplexerSession", () => {
@@ -275,6 +276,8 @@ describe("tmux client terminal resolution", () => {
 		return withFakeTmux(
 			{ [CLIENT_QUERY]: clientReport, [PASSTHROUGH_QUERY]: "on" },
 			async binDir => {
+				// A production child, in a home of its own, whose tmux is the fake one.
+				const env = createProductionChildEnv(subprocessEnv({}));
 				const proc = Bun.spawn({
 					cmd: [
 						process.execPath,
@@ -282,8 +285,8 @@ describe("tmux client terminal resolution", () => {
 						`import { TERMINAL, TERMINAL_ID } from "@oh-my-pi/pi-tui/terminal-capabilities";
 console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyProtocol, imageProtocol: TERMINAL.imageProtocol }));`,
 					],
-					env: subprocessEnv({
-						PI_TEST_RUNTIME: undefined,
+					env: {
+						...env,
 						BUN_ENV: undefined,
 						NODE_ENV: undefined,
 						TERM: "tmux-256color",
@@ -293,8 +296,8 @@ console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyPro
 						TMUX: "/tmp/tmux-1000/default,4242,0",
 						TMUX_PANE: undefined,
 						SSH_CONNECTION: "client 1 server 22",
-						PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
-					}),
+						PATH: `${binDir}${path.delimiter}${env.PATH}`,
+					},
 					stdout: "pipe",
 					stderr: "pipe",
 				});

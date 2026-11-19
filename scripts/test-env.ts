@@ -9,8 +9,11 @@
  * and its token), so a suite that passes in CI read the developer's machine and failed, or
  * called their services, when they ran it. A test process therefore starts without every
  * name the product reads, except those in {@link KEEP}, with omp directories and git and jj
- * configuration of its own ({@link createTestEnv}), and with the real `git` and `jj` first on
- * PATH ({@link createTestPath}). A test that needs one of these names sets its own value.
+ * configuration of its own ({@link createTestEnv}), and with the directory of the Bun it runs on
+ * and the real `git` and `jj` first on PATH ({@link createTestPath}). A test that needs one of
+ * these names sets its own value. A child a test runs as production starts without the
+ * machine's names too, but with neither the marker nor the test's omp directories, and in a home
+ * of its own ({@link createProductionChildEnv}).
  *
  * The names come from `scripts/test-env-census.ts` (`test-env-names.json`), plus
  * {@link MACHINE_ENV_PREFIXES} and {@link UNSEEN} for the reads the census cannot see.
@@ -142,21 +145,33 @@ export function createTestEnv(): Record<(typeof TEST_ENV_NAMES)[number], string>
 const WRAPPED_TOOLS = ["git", "jj"] as const;
 
 /**
- * The PATH a test process starts with: the developer's own, with directories put first for each
- * of {@link WRAPPED_TOOLS} whose first copy on it is a wrapper ({@link planTestPath}), so every
- * other tool on PATH resolves as before. Undefined when PATH needs no change.
+ * The PATH a test process starts with: the developer's own, with the directory of the Bun this
+ * process runs on (`process.execPath`) first, so a child that runs `bun` by name (an RPC child's
+ * `bun <cli>`) runs that one, never a version manager's shim, which fails in a home of a test's
+ * own ("No version is set for shim: bun"); and before it, directories for each of `tools`
+ * ({@link WRAPPED_TOOLS} unless given) whose first copy on it is a wrapper ({@link planTestPath}).
+ * Every other tool on PATH resolves as before. Undefined when PATH needs no change.
  */
-export function createTestPath(searchPath: string | undefined): string | undefined {
+export function createTestPath(
+	searchPath: string | undefined,
+	tools: readonly string[] = WRAPPED_TOOLS,
+): string | undefined {
 	if (!searchPath) return undefined;
+	const bunDirectory = path.dirname(process.execPath);
+	const withBun =
+		searchPath.split(path.delimiter)[0] === bunDirectory
+			? searchPath
+			: [bunDirectory, searchPath].join(path.delimiter);
 	const probe: PathProbe = {
 		find: (directory, tool) => Bun.which(tool, { PATH: directory }),
 		realpath: file => fs.realpathSync(file),
 		list: directory => fs.readdirSync(directory),
+		ask: (wrapper, tool) => askWrapper(wrapper, tool, withBun),
 	};
 	const first: string[] = [];
 	let links: string | undefined;
-	for (const tool of WRAPPED_TOOLS) {
-		const plan = planTestPath(searchPath, process.platform, probe, tool);
+	for (const tool of tools) {
+		const plan = planTestPath(withBun, process.platform, probe, tool);
 		if (plan === undefined) continue;
 		if (plan.kind === "directory") {
 			first.push(plan.directory);
@@ -170,7 +185,8 @@ export function createTestPath(searchPath: string | undefined): string | undefin
 		if (plan.kind === "link") fs.symlinkSync(plan.file, path.join(links, tool));
 		else fs.writeFileSync(path.join(links, `${tool}.cmd`), windowsLauncher(plan.file));
 	}
-	return first.length === 0 ? undefined : [...first, searchPath].join(path.delimiter);
+	const testPath = [...first, withBun].join(path.delimiter);
+	return testPath === searchPath ? undefined : testPath;
 }
 
 /** What {@link createTestPath} puts first on PATH for one tool. */
@@ -190,6 +206,31 @@ export interface PathProbe {
 	realpath(file: string): string;
 	/** The names in `directory`. */
 	list(directory: string): string[];
+	/**
+	 * The file the wrapper `wrapper` runs for `tool`, as the tool itself says when the wrapper runs
+	 * with this process's environment, whose home the wrapper reads; null when the tool cannot say
+	 * ({@link SELF_REPORT}) or the wrapper fails.
+	 */
+	ask?(wrapper: string, tool: string): string | null;
+}
+
+/** How a tool says which file it runs from: node prints its own executable. */
+const SELF_REPORT: Record<string, readonly string[]> = { node: ["-p", "process.execPath"] };
+
+/**
+ * {@link PathProbe.ask} on this system: runs `wrapper` with {@link SELF_REPORT}'s arguments for
+ * `tool`, this process's environment and `searchPath` as PATH, and takes the file it prints when
+ * that file exists. A wrapper that does not answer within 10 seconds is no answer.
+ */
+function askWrapper(wrapper: string, tool: string, searchPath: string): string | null {
+	const args = SELF_REPORT[tool];
+	if (args === undefined) return null;
+	const env: Record<string, string | undefined> = { ...process.env };
+	// Windows names it `Path`; a plain object's keys keep that case.
+	env[Object.keys(env).find(name => name.toUpperCase() === "PATH") ?? "PATH"] = searchPath;
+	const child = Bun.spawnSync([wrapper, ...args], { env, stdout: "pipe", stderr: "ignore", timeout: 10_000 });
+	const file = child.exitCode === 0 ? child.stdout.toString().trim() : "";
+	return file !== "" && fs.existsSync(file) ? file : null;
 }
 
 /** git's own programs, as Git for Windows installs them in its `cmd` directory. */
@@ -202,10 +243,12 @@ const WINDOWS_GIT_PROGRAM = /^(?:git|gitk|git-gui)(?:\.(?:exe|com|cmd|bat))?$/i;
  * developer's key; the jj one finds the real jj through the home), or mise's, asdf's or Scoop's,
  * which choose a version from the home's config. Each reads the developer's machine, and each
  * failed once a test gave the tool a home of its own (`HOME: dir`). The real one is the first
- * past the wrappers. On POSIX it goes first as a link. On Windows, where a link needs a
- * privilege, git's own directory goes first when that holds only git's programs (Git for
+ * past the wrappers. When none follows them (a login PATH that holds mise's shims but not its
+ * installs), a tool that can say which file it runs (node) is asked through the first wrapper
+ * ({@link PathProbe.ask}). On POSIX the real one goes first as a link. On Windows, where a link
+ * needs a privilege, git's own directory goes first when that holds only git's programs (Git for
  * Windows' `cmd`), else a `<tool>.cmd` launcher. Undefined when the first `tool` is not a
- * wrapper or none follows the wrappers.
+ * wrapper, or when no real one follows the wrappers and none is found by asking.
  */
 export function planTestPath(
 	searchPath: string,
@@ -218,23 +261,27 @@ export function planTestPath(
 		platform === "win32"
 			? paths.basename(directory).toLowerCase() === "shims"
 			: paths.basename(directory) === "shims";
-	let wrapped = false;
-	for (const entry of searchPath.split(paths.delimiter)) {
-		if (!entry) continue;
-		const file = probe.find(entry, tool);
-		if (file === null) continue;
-		if (isShims(entry) || isShims(paths.dirname(probe.realpath(file)))) {
-			wrapped = true;
-			continue;
-		}
-		if (!wrapped) return undefined;
+	const isWrapper = (file: string) => isShims(paths.dirname(file)) || isShims(paths.dirname(probe.realpath(file)));
+	const plan = (file: string): TestPathPlan => {
 		if (platform !== "win32") return { kind: "link", file };
 		const directory = paths.dirname(file);
 		return tool === "git" && probe.list(directory).every(name => WINDOWS_GIT_PROGRAM.test(name))
 			? { kind: "directory", directory }
 			: { kind: "launcher", file };
+	};
+	let wrapper: string | undefined;
+	for (const entry of searchPath.split(paths.delimiter)) {
+		if (!entry) continue;
+		const file = probe.find(entry, tool);
+		if (file === null) continue;
+		if (isWrapper(file)) {
+			wrapper ??= file;
+			continue;
+		}
+		return wrapper === undefined ? undefined : plan(file);
 	}
-	return undefined;
+	const answer = wrapper === undefined ? null : (probe.ask?.(wrapper, tool) ?? null);
+	return answer === null || isWrapper(answer) ? undefined : plan(answer);
 }
 
 /**
@@ -251,9 +298,10 @@ export function windowsLauncher(file: string): string {
 /**
  * The environment a child starts with that no preload sets up: cargo's tests under
  * `scripts/run-rs-task.ts test:rs`, and the `bun test` processes `scripts/ci-test-ts.ts` starts
- * (their preload applies the same again). `base` without the machine's names, with the real
- * `git` and `jj` first on PATH ({@link createTestPath}), the omp directories and git and jj configuration
- * of {@link createTestEnv}, and the test-runtime marker.
+ * (their preload applies the same again). `base` without the machine's names, with the
+ * directory of this Bun and the real `git` and `jj` first on PATH ({@link createTestPath}), the
+ * omp directories and git and jj configuration of {@link createTestEnv}, and the test-runtime
+ * marker.
  */
 export function createTestChildEnv(base: Record<string, string | undefined>): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {};
@@ -271,12 +319,65 @@ export function createTestChildEnv(base: Record<string, string | undefined>): Re
 	};
 }
 
+/** The tools a production child runs from PATH: those a test process runs, and node. */
+const PRODUCTION_CHILD_TOOLS = [...WRAPPED_TOOLS, "node"] as const;
+
 /**
- * Removes `dir` when this process ends. In the test runner, `afterAll` from a preload runs after
- * the process's last test, whatever the file is named or `NODE_ENV` says, and the runner emits no
- * `exit` event (Bun 1.4.4). Outside it, as in a `bun --preload … -e` child, `afterAll` refuses
- * with "outside of the test runner" and the process's `exit` event removes the directory instead;
- * any other error is thrown.
+ * The environment of a child a test starts as production, as a user would run it: an omp CLI,
+ * fixture or `--eval` probe that must not count as a test child (`isBunTestRuntime`). It is
+ * `base` (the test's own environment, unless a site passes less) without the machine's names
+ * ({@link isMachineEnvName}), which takes the test process's own omp directories and git and jj
+ * configuration too, and without the test-runtime marker `PI_TEST_RUNTIME`. A site that needs
+ * one of those, or any other name, sets it on the result. It is the child's whole environment,
+ * as `Bun.spawn` and `node:child_process` take `env`; a native `PtySession` or `Shell` lays `env`
+ * over this process's own environment, which an overlay cannot take a name out of, so a site
+ * that starts one sets `PI_TEST_RUNTIME: "0"` on the result.
+ *
+ * HOME (and USERPROFILE on Windows) is a new empty directory of the child's own, removed when the
+ * test or `describe` block that made it ends, or when the process exits outside the test runner
+ * ({@link removeWhenProcessEnds}). As production, omp loads `~/.env`, `~/.omp/.env` and
+ * `~/.omp/agent/.env` (`packages/utils/src/env.ts`), and writes its logs and state under
+ * `~/.omp`: with the developer's HOME it would take their auth broker and token, provider keys
+ * and collector, and leave its logs in their home, none of which a clean machine has. A test
+ * process keeps the developer's HOME ({@link createTestEnv}) because it cannot change its own:
+ * Bun fixed `os.homedir()` when it started, before the preload ran, and a marked test process
+ * reads none of those files. A child reads HOME when it starts, so it can have its own.
+ *
+ * What the preload keeps HOME for, the version-manager shims on PATH that find their tool through
+ * the home, this keeps through PATH, as a test process's own PATH does ({@link createTestPath}):
+ * the directory of the Bun running the test (`process.execPath`) goes first, so `bun` is that
+ * one, and the real `git`, `jj` and `node` go before their wrappers. No omp code looks for node
+ * itself, so node is found as git is, as the first past the wrappers (where a version manager's
+ * activation puts it: mise's installs directory after its shims), and where none follows them (a
+ * login PATH with mise's shims alone) by asking the first wrapper which node it runs (`node -p
+ * process.execPath`), with this process's environment, whose home the wrapper reads. With no
+ * node on PATH at all, the child has none, as on a machine without node.
+ */
+export function createProductionChildEnv(
+	base: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [name, value] of Object.entries(base)) {
+		if (value !== undefined && name !== "PI_TEST_RUNTIME" && !isMachineEnvName(name)) env[name] = value;
+	}
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-home-"));
+	removeWhenProcessEnds(home);
+	env.HOME = home;
+	if (process.platform === "win32") env.USERPROFILE = home;
+	// Windows names it `Path`; a plain object's keys keep that case.
+	const pathName = Object.keys(env).find(name => name.toUpperCase() === "PATH") ?? "PATH";
+	const searchPath = env[pathName] || path.dirname(process.execPath);
+	env[pathName] = createTestPath(searchPath, PRODUCTION_CHILD_TOOLS) ?? searchPath;
+	return env;
+}
+
+/**
+ * Removes `dir` when this process ends. In the test runner, `afterAll` runs after the last test
+ * of the scope it is called in: the process's, from a preload or a test file's top level, whatever
+ * the file is named or `NODE_ENV` says; a `describe` block's, or that one test's, from inside
+ * them. The runner emits no `exit` event (Bun 1.4.4). Outside it, as in a `bun --preload … -e`
+ * child, `afterAll` refuses with "outside of the test runner" and the process's `exit` event
+ * removes the directory instead; any other error is thrown.
  */
 function removeWhenProcessEnds(dir: string): void {
 	const remove = () => fs.rmSync(dir, { recursive: true, force: true });

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildNonInteractiveEnv, NON_INTERACTIVE_ENV } from "@oh-my-pi/pi-coding-agent/exec/non-interactive-env";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 describe("buildNonInteractiveEnv", () => {
 	it("defaults Windows child-process encoding to UTF-8 when inherited env is unset", () => {
@@ -142,13 +143,12 @@ it("filters expanded dotenv values while preserving matching and empty launcher 
 		for (const bunArgs of bunArgSets) {
 			const proc = Bun.spawn([process.execPath, ...bunArgs, "--no-install", "--eval", script], {
 				cwd: tmp,
+				// As production, in a home of its own, with PATH, SHELL and these launcher values.
 				env: {
-					HOME: process.env.HOME ?? "",
+					...createProductionChildEnv({ PATH: process.env.PATH, SHELL: process.env.SHELL ?? "/bin/bash" }),
 					EMPTY_PARENT_VAR: "",
 					OMP_TEST_INHERITED_MARKER: "keep-me",
 					NODE_ENV: "development",
-					PATH: process.env.PATH ?? "",
-					SHELL: process.env.SHELL ?? "/bin/bash",
 				},
 				stdout: "pipe",
 				stderr: "pipe",

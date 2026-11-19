@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { __internalsForTesting, withFileLock } from "../src/file-lock";
 import { isEnoent } from "../src/fs-error";
 import { removeWithRetries } from "../src/temp";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const { tryAcquireLock, getLockPath } = __internalsForTesting;
 
@@ -65,7 +66,7 @@ describe("native file-lock ownership", () => {
 			[process.execPath, path.join(import.meta.dir, "fixtures/file-lock-holder.ts"), target, readyPath],
 			{
 				cwd: path.resolve(import.meta.dir, "../../.."),
-				env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
+				env: createProductionChildEnv({ PATH: process.env.PATH }),
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "pipe",

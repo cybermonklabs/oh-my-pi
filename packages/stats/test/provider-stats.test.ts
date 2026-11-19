@@ -12,6 +12,7 @@ import {
 	type UsageSnapshotRow,
 } from "@oh-my-pi/omp-stats/usage-windows";
 import { getAgentDbPath } from "@oh-my-pi/pi-utils";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-providers-");
@@ -363,7 +364,7 @@ db.run("COMMIT");
 db.close();`,
 				getAgentDbPath(),
 			],
-			{ env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" }, stdout: "pipe", stderr: "pipe" },
+			{ env: createProductionChildEnv({ PATH: process.env.PATH }), stdout: "pipe", stderr: "pipe" },
 		);
 		const output = locker.stdout.getReader();
 		const ready = await output.read();
