@@ -62,11 +62,6 @@ pub use self::vt::Screen;
 /// The default bound of every wait.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A wait with no deadline of its own, for [`Pty::read_until`],
-/// [`Pty::read_some`], [`Pty::wait_screen`] and [`Pty::zle_sync`]: it ends
-/// when its event comes, and the test runner's timeout is its only bound.
-pub const NO_DEADLINE: Duration = Duration::MAX;
-
 /// The script [`Spawn::zle_sync`] writes into the home directory; a
 /// zsh-like shell (obash as `zsh`, the real zsh) sources it
 /// (`. ~/.zle-sync`) to answer [`Pty::zle_sync`]. It opens a FIFO and
@@ -417,8 +412,7 @@ impl Pty {
 		timeout: Duration,
 		mut done: impl FnMut(&[u8], bool, &Screen) -> bool,
 	) -> io::Result<()> {
-		// `NO_DEADLINE` overflows the addition: no deadline.
-		let deadline = Instant::now().checked_add(timeout);
+		let deadline = Instant::now() + timeout;
 		loop {
 			self.pump()?;
 			{
@@ -427,13 +421,12 @@ impl Pty {
 					return Ok(());
 				}
 				let now = Instant::now();
-				if deadline.is_some_and(|d| now >= d) {
+				if now >= deadline {
 					drop(state);
 					return Err(self.timeout("output"));
 				}
 				// Wake on new output, or every 20 ms for the screen.
-				let poll = Duration::from_millis(20);
-				let wait = deadline.map_or(poll, |d| (d - now).min(poll));
+				let wait = (deadline - now).min(Duration::from_millis(20));
 				let _ = self.shared.more.wait_timeout(state, wait).unwrap();
 			}
 		}
@@ -581,7 +574,7 @@ impl Pty {
 		let Some(fifo) = self.sync.clone() else {
 			return Err(io::Error::other("zle_sync needs Spawn::zle_sync"));
 		};
-		let deadline = Instant::now().checked_add(timeout);
+		let deadline = Instant::now() + timeout;
 		// The shell reads each key before its next wait: were keys still
 		// queued, it could see the request before them.
 		let term = self.open_tty()?;
@@ -590,7 +583,7 @@ impl Pty {
 			if unread(&term)? == 0 {
 				break;
 			}
-			if deadline.is_some_and(|d| Instant::now() >= d) {
+			if Instant::now() >= deadline {
 				return Err(self.timeout("the shell to read the keys"));
 			}
 			thread::sleep(Duration::from_millis(5));
@@ -610,8 +603,9 @@ impl Pty {
 		request.write_all(format!("{}\n", self.syncs).as_bytes())?;
 		drop(request);
 		let answer = format!("\x1b{ZLE_SYNC_TAG}{}\x07", self.syncs);
-		let left = deadline.map_or(NO_DEADLINE, |d| d.saturating_duration_since(Instant::now()));
-		self.read_until(answer, left).map(drop)
+		self
+			.read_until(answer, deadline.saturating_duration_since(Instant::now()))
+			.map(drop)
 	}
 
 	/// The terminal side, opened anew (not as a controlling terminal) to

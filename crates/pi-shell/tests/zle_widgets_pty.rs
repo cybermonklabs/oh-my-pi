@@ -14,7 +14,7 @@ mod zsh_oracle;
 
 use std::{io, time::Duration};
 
-use pty_support::{NO_DEADLINE, Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
@@ -72,12 +72,11 @@ enum Step<'a> {
 	/// [`Step::Asks`], then the [`Pty::zle_sync`] handler runs while the
 	/// question waits for its answer, and the line editor redraws the line
 	/// after it (its display was invalidated by the question). Each wait
-	/// is for an event, with no deadline of its own ([`NO_DEADLINE`]): the
-	/// question on the screen, the handler's answer, then the redraw's
-	/// bytes (the first output after the answer), then the editor waiting
-	/// for a key again (a second answer: the whole redraw was written). An
-	/// editor that does not redraw hangs the test until the runner stops
-	/// it.
+	/// is for an event: the question on the screen, the handler's answer,
+	/// then the redraw's bytes (the first output after the answer), then the
+	/// editor waiting for a key again (a second answer: the whole redraw
+	/// was written). Each is bounded by [`TIMEOUT`], as every wait of the
+	/// harness is: an editor that does not redraw fails the test there.
 	AsksThenHandler(&'a str),
 }
 
@@ -128,10 +127,10 @@ fn same_steps(rc: &str, steps: &[Step<'_>]) -> String {
 				},
 				Step::AsksThenHandler(k) => {
 					pty.type_keys(k, KEY)?;
-					pty.wait_screen_contains(" lines)?", NO_DEADLINE)?;
-					pty.zle_sync(NO_DEADLINE)?;
-					pty.read_some(NO_DEADLINE)?;
-					pty.zle_sync(NO_DEADLINE)?;
+					pty.wait_screen_contains(" lines)?", TIMEOUT)?;
+					pty.zle_sync(TIMEOUT)?;
+					pty.read_some(TIMEOUT)?;
+					pty.zle_sync(TIMEOUT)?;
 				},
 			}
 		}
