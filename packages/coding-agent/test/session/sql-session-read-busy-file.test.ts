@@ -25,8 +25,9 @@ const BUSY_WRITER_PROCESS = path.join(import.meta.dir, "sql-session-busy-writer-
  * Start another process that claims session {@link BUSY_ID} as `file` of
  * `db` and appends to it every 50 ms on its own clock
  * (`sql-session-busy-writer-process.ts`). Returns its stop, which ends the
- * process's stdin and waits until it has exited: "exited 0", or its exit
- * code and what it wrote to stderr.
+ * process's stdin, waits up to 10 s for it to exit and then kills it, and
+ * says how it ended: "exited 0", or its exit code and what it wrote to
+ * stderr. A second call gives the first call's answer.
  */
 function startBusyWriter(db: LeaseDb, file: string): () => Promise<string> {
 	const config = {
@@ -45,10 +46,25 @@ function startBusyWriter(db: LeaseDb, file: string): () => Promise<string> {
 		stderr: "pipe",
 		env: process.env,
 	});
-	return async () => {
-		child.stdin.end();
-		const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-		return code === 0 ? "exited 0" : `exited ${code}: ${stderr}`;
+	const stderr = new Response(child.stderr).text();
+	const stop = async (): Promise<string> => {
+		let killed = false;
+		if (child.exitCode === null && child.signalCode === null) {
+			child.stdin.end();
+			const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(10_000).then(() => false)]);
+			if (!exited) {
+				child.kill("SIGKILL");
+				killed = true;
+			}
+		}
+		const code = await child.exited;
+		if (code === 0 && !killed) return "exited 0";
+		return `exited ${code}${killed ? " when killed, 10 s after its stdin ended" : ""}: ${await stderr}`;
+	};
+	let stopped: Promise<string> | undefined;
+	return () => {
+		stopped ??= stop();
+		return stopped;
 	};
 }
 
@@ -72,13 +88,18 @@ describe("a long SQLite session loaded while another process appends to another 
 		await reader.refresh();
 
 		const stopBusyWriter = startBusyWriter(db, busyFile);
-		let loaded = "not loaded";
-		let busyLines = { before: 0, after: 0 };
+		let loaded: string;
+		let busyLinesBefore: number;
+		let busyLinesAfter: number;
 		let busyWriter: string;
 		try {
 			// Its header, and at least one append on its clock, are stored before the load starts.
-			await until(async () => (await storedLines(db, busyFile)) > 2);
-			busyLines.before = await storedLines(db, busyFile);
+			try {
+				await until(async () => (await storedLines(db, busyFile)) > 2);
+			} catch (err) {
+				throw new Error(`the busy writer stored no append: it ${await stopBusyWriter()}`, { cause: err });
+			}
+			busyLinesBefore = await storedLines(db, busyFile);
 			try {
 				const session = await loadSessionFile(longFile, reader);
 				loaded = `${firstPrompt(session.entries)} ${padFills(session.entries)}`;
@@ -86,12 +107,12 @@ describe("a long SQLite session loaded while another process appends to another 
 				if (!(err instanceof SessionReadConflictError)) throw err;
 				loaded = "read conflict";
 			}
-			busyLines = { ...busyLines, after: await storedLines(db, busyFile) };
+			busyLinesAfter = await storedLines(db, busyFile);
 		} finally {
 			busyWriter = await stopBusyWriter();
 		}
 
-		expect({ loaded, appendedDuringLoad: busyLines.after > busyLines.before, busyWriter }).toEqual({
+		expect({ loaded, appendedDuringLoad: busyLinesAfter > busyLinesBefore, busyWriter }).toEqual({
 			loaded: `first ${"a".repeat(PADS)}`,
 			appendedDuringLoad: true,
 			busyWriter: "exited 0",

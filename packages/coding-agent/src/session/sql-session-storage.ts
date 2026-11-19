@@ -3310,8 +3310,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * there is a read conflict; an append past the range is not. When they
 	 * moved again during that check pass, a write may have made it read the
 	 * same mix the read yielded, so it reads the range once more and accepts
-	 * it only when that second check pass matches too: at most two passes,
-	 * and a pass that differs is a read conflict at once.
+	 * it only when that second check pass matches too: at most two check
+	 * passes, and a pass that differs is a read conflict at once.
 	 *
 	 * MySQL has no row identity: the read checks what it yielded with one
 	 * query, which computes the digest of those bytes as the database holds
@@ -3467,7 +3467,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
 		const before = await this.#exclusive(() => this.#sqliteMark(path));
 		if (before === read.mark) return;
-		const yielded = read.hash?.digest("hex");
+		const yieldedHash = read.hash?.digest("hex");
 		const check = async (): Promise<void> => {
 			let stored: { hash: string; bytes: number };
 			try {
@@ -3479,7 +3479,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				if (isEnoent(err)) throw new SessionReadConflictError(path);
 				throw err;
 			}
-			if (stored.bytes !== read.yielded || stored.hash !== yielded) throw new SessionReadConflictError(path);
+			if (stored.bytes !== read.yielded || stored.hash !== yieldedHash) throw new SessionReadConflictError(path);
 		};
 		await check();
 		// A write that made this pass read the read's mix again would have to do it once more to pass a second one.
