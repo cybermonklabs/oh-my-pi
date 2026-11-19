@@ -675,6 +675,35 @@ describe("AgentLifecycleManager", () => {
 		expect(lifecycle.isReleasing("Overlap-Sub")).toBe(false);
 	});
 
+	it("reads an agent's release as in flight after the released session's dispose unregistered the agent", async () => {
+		// If this regresses, a release whose session's dispose unregisters the agent (a subagent session's own dispose
+		// does, through unregisterUnlessParked) reads as over while it still waits in the release hook: an isolated run's
+		// end in that window finds no release in flight, takes the cleanup over and removes the worktree whose changes
+		// the hook was to capture.
+		const hookGate = deferred();
+		const stub = makeSessionStub(async () => {
+			registry.unregister("Unregistered-Sub");
+		});
+		const ref = registerIdleSub("Unregistered-Sub", stub.session, null);
+		lifecycle.adopt("Unregistered-Sub", { idleTtlMs: 0, onRelease: () => hookGate.promise }, ref);
+
+		const releasing = lifecycle.release("Unregistered-Sub");
+		let waited = false;
+		const waiting = lifecycle.whenReleased("Unregistered-Sub").then(() => {
+			waited = true;
+		});
+		await flushAsync();
+
+		expect(stub.disposeCalls()).toBe(1);
+		expect(registry.get("Unregistered-Sub")).toBeUndefined();
+		expect(lifecycle.isReleasing("Unregistered-Sub")).toBe(true);
+		expect(waited).toBe(false);
+		hookGate.resolve();
+		expect(await releasing).toBe(true);
+		await waiting;
+		expect(lifecycle.isReleasing("Unregistered-Sub")).toBe(false);
+	});
+
 	it("adopt(Main) is a no-op: Main is never adopted or parked", async () => {
 		vi.useFakeTimers();
 		const stub = makeSessionStub();
