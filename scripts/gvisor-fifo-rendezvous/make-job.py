@@ -75,8 +75,11 @@ phase() {{ python3 /tmp/probe.py --procs {procs} "$@" | grep '^TOTAL'; }}
 python3 /tmp/probe.py --form old --control --strand-after 1 --procs 2 5 | grep '^TOTAL'
 for mode in idle loaded; do
   [ $mode = loaded ] && load_on
-  phase --label "FIFO-RDV $mode" --form old --writer blocking {s:g}
-  phase --label "FIFO-RDV $mode" --form old --writer spin {s:g}
+  for order in writer-first reader-first; do
+    for writer in blocking spin; do
+      phase --label "FIFO-RDV $mode" --form old --writer $writer --order $order {s:g}
+    done
+  done
   phase --label "FIFO-RDV $mode" --form new {n:g}
   [ $mode = loaded ] && load_off
 done
