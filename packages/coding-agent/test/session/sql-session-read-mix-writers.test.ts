@@ -214,3 +214,184 @@ describe("a chunked SQLite read raced by its own store re-creating the session w
 		}
 	}, 120_000);
 });
+
+/**
+ * A wrapper of a store's client that only times other writers' commits against the store's own statements:
+ * it runs an armed race once, right after the store's next statement completes (`afterStatement`), or right
+ * after its next statement that returns a stored part (`afterPart`: a value of at least 512 KiB, as every pad
+ * of these bodies is 1 MiB), before the rows go back. It keeps the client's `options`, the database file name
+ * included, so the store queues and checks its calls as it does on the client itself.
+ */
+function statementRaces(): {
+	wrap: (client: SqlSessionStorageClient) => SqlSessionStorageClient;
+	afterStatement: (race: () => Promise<void>) => void;
+	afterPart: (race: () => Promise<void>) => void;
+} {
+	let afterStatement: (() => Promise<void>) | undefined;
+	let afterPart: (() => Promise<void>) | undefined;
+	const holdsPart = (result: unknown): boolean =>
+		Array.isArray(result) &&
+		result.some(
+			row =>
+				typeof row === "object" &&
+				row !== null &&
+				Object.values(row).some(
+					value =>
+						(typeof value === "string" && value.length >= 512 * 1024) ||
+						(value instanceof Uint8Array && value.byteLength >= 512 * 1024),
+				),
+		);
+	return {
+		wrap: client => ({
+			options: client.options,
+			async unsafe(query, values) {
+				const result = await client.unsafe(query, values);
+				let race: (() => Promise<void>) | undefined;
+				if (afterStatement) {
+					race = afterStatement;
+					afterStatement = undefined;
+				} else if (afterPart && holdsPart(result)) {
+					race = afterPart;
+					afterPart = undefined;
+				}
+				if (race) await race();
+				return result;
+			},
+			transaction: callback => client.transaction(callback),
+			end: () => client.end?.() ?? Promise.resolve(),
+		}),
+		afterStatement(race) {
+			afterStatement = race;
+		},
+		afterPart(race) {
+			afterPart = race;
+		},
+	};
+}
+
+/**
+ * Make the reads of `file` through `reader.readChunks` race around the check at their end, by the other
+ * process's re-creates (`recreate`): as `next` right after the first chunk the reads yield (the part the read
+ * starts at gets its rowid back and the last part it fetched is the same, so no page check sees it); once they
+ * have yielded all `size` bytes, as `back` right after the reader's next statement, where the check starts;
+ * and as `next` again right after the reader's next statement after that which returns a stored part, the
+ * first page the check reads again. Returns the re-creates that ran, in order.
+ */
+function raceAroundEndCheck(
+	reader: SqlSessionStorage,
+	file: string,
+	races: ReturnType<typeof statementRaces>,
+	size: number,
+	recreate: (lines: string[]) => Promise<void>,
+	bodies: { back: string[]; next: string[] },
+): string[] {
+	if (!reader.readChunks) throw new Error("the SQL store reads no chunks");
+	const readChunks = reader.readChunks.bind(reader);
+	const ran: string[] = [];
+	let yielded = 0;
+	let armed = false;
+	spyOn(reader, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
+		(async function* () {
+			if (chunkPath !== file) {
+				yield* readChunks(chunkPath, fromByte);
+				return;
+			}
+			for await (const chunk of readChunks(chunkPath, fromByte)) {
+				const first = yielded === 0;
+				yielded += chunk.byteLength;
+				yield chunk;
+				if (first) {
+					await recreate(bodies.next);
+					ran.push("next after the first chunk");
+				}
+				if (!armed && yielded >= size) {
+					armed = true;
+					races.afterStatement(async () => {
+						await recreate(bodies.back);
+						ran.push("back where the end check starts");
+						races.afterPart(async () => {
+							await recreate(bodies.next);
+							ran.push("next after the end check's first page");
+						});
+					});
+				}
+			}
+		})(),
+	);
+	return ran;
+}
+
+// The older release in another process re-creates the session three times around one chunked read: once
+// between its pages, which no page check sees; once more with the old body right where the read's check at its
+// end starts; and once more with the new body right after that check has read its first page again. The check
+// then reads the old body's first page and the new body's rest, the same bytes the read yielded, and finds
+// them unchanged. Only a check that also sees the commits during its own reading can catch it.
+describe("a chunked SQLite read raced by an older release re-creating the session around the check at its end", () => {
+	it("yields the old body, the new one or a read conflict when the other process re-creates it while the check reads it again", async () => {
+		// If this regresses, while an older omp release in another process shares the SQLite database, reading a
+		// session that process re-creates several times meanwhile gives the start of one version of the transcript
+		// followed by the end of another.
+		await using db = await openLeaseDb("sqlite", "sqlite");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const before = sharedPadBody("first", "b");
+		const after = sharedPadBody("FIRST", "c");
+		const release = await startedByOlderWriter(db, file, before);
+		const races = statementRaces();
+		const reader = await db.open({ lease: STILL, wrap: races.wrap });
+		await reader.refresh();
+		const ran = raceAroundEndCheck(
+			reader,
+			file,
+			races,
+			Buffer.byteLength(before.join("")),
+			lines => olderProcessWrites(db, file, lines),
+			{ back: before, next: after },
+		);
+
+		// The re-creates run from raceAroundEndCheck, as the read goes.
+		const outcome = await racedRead(reader, file, 0, async () => {}, {
+			"old body": before.join(""),
+			"new body": after.join(""),
+		});
+
+		expect(ran[0]).toBe("next after the first chunk");
+		expect(["old body", "new body", "read conflict"]).toContain(outcome);
+		release();
+	}, 120_000);
+
+	it("loads one body's entries when the other process re-creates it while the check of the load's read reads it again", async () => {
+		// If this regresses, resuming a session an older omp release in another process re-creates several times
+		// meanwhile opens with the first turn of one version of the transcript followed by the later entries of
+		// another.
+		await using db = await openLeaseDb("sqlite", "sqlite");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const before = sharedPadBody("first", "b");
+		const after = sharedPadBody("FIRST", "c");
+		const release = await startedByOlderWriter(db, file, before);
+		const races = statementRaces();
+		const reader = await db.open({ lease: STILL, wrap: races.wrap });
+		await reader.refresh();
+		const ran = raceAroundEndCheck(
+			reader,
+			file,
+			races,
+			Buffer.byteLength(before.join("")),
+			lines => olderProcessWrites(db, file, lines),
+			{ back: before, next: after },
+		);
+
+		let loaded: string;
+		try {
+			const session = await loadSessionFile(file, reader);
+			loaded = `${firstPrompt(session.entries)} ${padFills(session.entries)}`;
+		} catch (err) {
+			if (!(err instanceof SessionReadConflictError)) throw err;
+			loaded = "read conflict";
+		}
+
+		expect(ran[0]).toBe("next after the first chunk");
+		// "first abbbbbbb" is the old body, "FIRST accccccc" the new one.
+		expect(["first abbbbbbb", "FIRST accccccc", "read conflict"]).toContain(loaded);
+		release();
+	}, 120_000);
+});
