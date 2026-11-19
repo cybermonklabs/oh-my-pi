@@ -8,6 +8,7 @@ import type { Model, Usage } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import {
 	type RecoveryCompactionResult,
 	kUsageLimitRequestProvider,
@@ -1371,8 +1372,8 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 
 			expect(messages[0]).toBe(message);
 			const reminder = messages[1];
-			expect(reminder?.role).toBe("developer");
-			if (reminder?.role !== "developer") throw new Error("expected developer reminder");
+			expect(reminder).toMatchObject({ role: "custom", customType: CONTINUE_REMINDER_MESSAGE_TYPE });
+			if (reminder?.role !== "custom") throw new Error("expected the continue reminder");
 			const text =
 				typeof reminder.content === "string"
 					? reminder.content
@@ -1447,7 +1448,9 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 
 			expect(messages[0]).toBe(message);
 			const reminder = messages[1];
-			if (reminder?.role !== "developer") throw new Error("expected developer reminder");
+			if (reminder?.role !== "custom" || reminder.customType !== CONTINUE_REMINDER_MESSAGE_TYPE) {
+				throw new Error("expected the continue reminder");
+			}
 			const text =
 				typeof reminder.content === "string"
 					? reminder.content

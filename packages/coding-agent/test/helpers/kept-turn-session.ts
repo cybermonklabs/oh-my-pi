@@ -23,6 +23,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { sessionMessagePersistenceKey } from "@oh-my-pi/pi-coding-agent/session/turn-persistence";
@@ -189,6 +190,36 @@ export function conversation(messages: readonly AgentMessage[]): string[] {
 	return shapes;
 }
 
+/**
+ * The conversation the model reads from `messages`: each message as
+ * `convertToLlm` sends it, shown as {@link conversation} shows it, and each
+ * developer message (a continue reminder among them) as `developer:` and its
+ * text. A compaction summary reaches the model as a user message.
+ */
+export function modelConversation(messages: readonly AgentMessage[]): string[] {
+	return convertToLlm([...messages]).map(message => {
+		if (message.role !== "developer") return conversation([message])[0] ?? message.role;
+		const text =
+			typeof message.content === "string"
+				? message.content
+				: message.content.map(block => (block.type === "text" ? block.text : block.type)).join("");
+		return `developer:${text}`;
+	});
+}
+
+/**
+ * What the branch of `sessionManager` records, in file order: each message
+ * entry as {@link conversation} shows it, each custom message entry as
+ * `custom:` and its type.
+ */
+export function branchConversation(sessionManager: SessionManager): string[] {
+	return sessionManager.getBranch().flatMap(entry => {
+		if (entry.type === "message") return conversation([entry.message]);
+		if (entry.type === "custom_message") return [`custom:${entry.customType}`];
+		return [];
+	});
+}
+
 /** The lines the transcript draws for an assistant turn, without colours. */
 export function renderTurn(message: AssistantMessage): string[] {
 	const component = new AssistantMessageComponent(message, false);
@@ -204,7 +235,7 @@ export function failedTurn(messages: readonly AgentMessage[]): AssistantMessage 
 	);
 }
 
-interface KeptTurnSessionOptions {
+export interface KeptTurnSessionOptions {
 	/** The context the session starts from, as a resume builds it from the session file. */
 	messages?: AgentMessage[];
 	/** Settings over the harness's own retry and compaction settings. */
@@ -318,6 +349,8 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 			const agent = new Agent({
 				getApiKey: requested => `${requested.provider}-test-key`,
 				initialState: { model, systemPrompt: ["Test"], tools: [], messages: options.messages ?? [] },
+				// The conversion a CLI session's agent sends with, so custom messages reach the model.
+				convertToLlm,
 				streamFn: (requested, context, streamOptions) => {
 					requestMessages.push([...context.messages]);
 					return streamFn(requested, context, streamOptions);

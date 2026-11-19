@@ -56,6 +56,7 @@ import type {
 } from "./agent-session-types";
 import {
 	assistantTurnProducedOutput,
+	type CustomMessage,
 	isEmptyAssistantStop,
 	isEmptyErrorTurn,
 	isUserAuthoredMessage,
@@ -80,7 +81,7 @@ import {
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
 import { describeUsageFallback } from "./retry-fallback-reason";
-import { getLatestCompactionEntry } from "./session-context";
+import { CONTINUE_REMINDER_MESSAGE_TYPE, getLatestCompactionEntry, isTranscriptEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { isUserQueuedMessage } from "./queued-messages";
@@ -320,7 +321,7 @@ export interface TurnRecoveryHost {
 		shouldContinue?: () => boolean;
 		onError?: (error: unknown) => void;
 	}): void;
-	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
+	waitForSessionMessagePersistence(message: AgentMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
 	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
 	sessionMessageAlreadyPersisted(message: AssistantMessage): boolean;
@@ -415,6 +416,25 @@ function branchAssistantEntry(
 		if (entryId === undefined) break;
 	}
 	return byKey;
+}
+
+/**
+ * Whether the last message of `branch`, tool results aside, is the assistant
+ * entry `entryId` names or one whose message has `persistenceKey`: a rebuilt
+ * context keeps a continue reminder only right after the turn it continues.
+ */
+function branchEndsOnTurn(
+	branch: readonly SessionEntry[],
+	entryId: string | undefined,
+	persistenceKey: string,
+): boolean {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index]!;
+		if (!isTranscriptEntry(entry) || (entry.type === "message" && entry.message.role === "toolResult")) continue;
+		if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+		return entry.id === entryId || sessionMessagePersistenceKey(entry.message) === persistenceKey;
+	}
+	return false;
 }
 
 /** How a retry saga's pending error entries are annotated when it closes. */
@@ -756,9 +776,10 @@ export class TurnRecovery {
 	 * rendered, so {@link isRetryableError} refuses to replay the turn and the
 	 * session stopped on a pinned error. Nothing ran and nothing needs
 	 * replaying: keep the failed turn in context so the model sees its own
-	 * output, append a corrective developer message, and resume; once a
+	 * output, append a hidden corrective reminder, and resume; once a
 	 * continuation succeeds, the turn is marked `continued` if the live context
-	 * still holds it, so a context rebuilt from the session keeps it too.
+	 * still holds it, so a context rebuilt from the session keeps it, and the
+	 * reminder after it, too.
 	 * Bounded per prompt; past the cap the error surfaces as before.
 	 */
 	handleMalformedFunctionCallStop(message: AssistantMessage): boolean {
@@ -786,20 +807,12 @@ export class TurnRecovery {
 			model: message.model,
 			provider: message.provider,
 		});
-		this.#host.agent.appendMessage({
-			role: "developer",
-			content: [
-				{
-					type: "text",
-					text: prompt.render(malformedFunctionCallRetryTemplate, {
-						retryCount: this.#malformedFunctionCallRetryCount,
-						maxRetries: MALFORMED_FUNCTION_CALL_MAX_RETRIES,
-					}),
-				},
-			],
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
+		this.#appendContinueReminder(
+			message,
+			malformedFunctionCallRetryTemplate,
+			this.#malformedFunctionCallRetryCount,
+			MALFORMED_FUNCTION_CALL_MAX_RETRIES,
+		);
 		this.#keepTurn(message);
 		this.#host.scheduleAgentContinue({
 			source: "malformed-function-call-retry",
@@ -815,10 +828,11 @@ export class TurnRecovery {
 	 * text, and {@link classifyResolvedInterruptedToolTurn} only resumes turns
 	 * with tool calls, so the session used to stop on a pinned error. Resuming
 	 * from the trailing assistant message would be a prefill, which newer Claude
-	 * models reject: keep the partial turn in context, append a developer
-	 * reminder to pick up where the text stopped, and continue; once a
-	 * continuation succeeds, the turn is marked `continued` if the live context
-	 * still holds it, so a context rebuilt from the session keeps it too.
+	 * models reject: keep the partial turn in context, append a hidden reminder
+	 * to pick up where the text stopped, and continue; once a continuation
+	 * succeeds, the turn is marked `continued` if the live context still holds
+	 * it, so a context rebuilt from the session keeps it, and the reminder after
+	 * it, too.
 	 * Honors `retry.enabled`; bounded per prompt, past the cap the error
 	 * surfaces as before.
 	 * A socket close counts here but not for tool turns: without tool calls there
@@ -858,6 +872,7 @@ export class TurnRecovery {
 			errorMessage: message.errorMessage,
 		});
 		this.#appendContinueReminder(
+			message,
 			streamStallContinueTemplate,
 			this.#streamStallContinueCount,
 			STREAM_STALL_CONTINUE_MAX_RETRIES,
@@ -897,16 +912,59 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * The developer reminder that continues a turn cut off after its text: pick
-	 * up where the text stopped. `template` says what cut it off.
+	 * Appends the reminder that continues `turn`, a failed turn kept in
+	 * context, to the live context: pick up where it stopped, `template` says
+	 * why. A hidden custom message, so the model gets it as a developer message
+	 * and the transcript draws nothing; recorded after the turn's entry, so a
+	 * context rebuilt from the session holds it where the live one does.
 	 */
-	#appendContinueReminder(template: string, retryCount: number, maxRetries: number): void {
-		this.#host.agent.appendMessage({
-			role: "developer",
-			content: [{ type: "text", text: prompt.render(template, { retryCount, maxRetries }) }],
+	#appendContinueReminder(turn: AssistantMessage, template: string, retryCount: number, maxRetries: number): void {
+		const messages = this.#host.agent.state.messages;
+		const previous = messages[messages.length - 1];
+		const reminder: CustomMessage = {
+			role: "custom",
+			customType: CONTINUE_REMINDER_MESSAGE_TYPE,
+			content: prompt.render(template, { retryCount, maxRetries }),
+			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		});
+		};
+		this.#host.agent.appendMessage(reminder);
+		void this.#recordContinueReminder(turn, previous, reminder).catch(error =>
+			logger.warn("Failed to record a continue reminder in the session", {
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+	}
+
+	/**
+	 * Records `reminder` in the session once the entries of `turn` and of
+	 * `previous` (the live message before the reminder: the turn, or a tool
+	 * result after it) are written: message persistence slots run in order and
+	 * may still be pending when the continuation starts. Nothing is recorded
+	 * when the branch no longer ends on the turn (it was never written, or the
+	 * session changed), since the reminder would follow something else.
+	 */
+	async #recordContinueReminder(
+		turn: AssistantMessage,
+		previous: AgentMessage | undefined,
+		reminder: CustomMessage,
+	): Promise<void> {
+		await this.#host.waitForSessionMessagePersistence(turn);
+		if (previous && previous !== turn) await this.#host.waitForSessionMessagePersistence(previous);
+		const persistenceKey = sessionMessagePersistenceKey(turn);
+		if (persistenceKey === undefined) return;
+		const sessionManager = this.#host.sessionManager;
+		const entryId = this.#host.persistedAssistantEntryId(turn);
+		if (!branchEndsOnTurn(sessionManager.getBranchView(), entryId, persistenceKey)) return;
+		sessionManager.appendCustomMessageEntry(
+			reminder.customType,
+			reminder.content,
+			reminder.display,
+			undefined,
+			reminder.attribution,
+			reminder.timestamp,
+		);
 	}
 
 	/** Removes a persisted failed assistant turn after its persistence slot settles; returns the dropped branch entry id. */
@@ -3443,7 +3501,7 @@ export class TurnRecovery {
 		if (options?.continueCommittedText) {
 			this.#continuingCommittedText = true;
 			if (this.#host.promptGeneration() === generation && isTextOnlyTurn(message)) {
-				this.#appendContinueReminder(rateLimitContinueTemplate, this.#retryAttempt, maxRetries);
+				this.#appendContinueReminder(message, rateLimitContinueTemplate, this.#retryAttempt, maxRetries);
 			}
 		}
 

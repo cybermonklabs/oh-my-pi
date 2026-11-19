@@ -44,6 +44,14 @@ const LEGACY_SNAPCOMPACT_TRUNCATED_CHARS_GUARD = 1_000_000;
 const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided after a newer compaction]";
 const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
 
+/**
+ * Custom message type of the hidden reminder that continues a failed turn the
+ * session kept in context (a rate limit or a cut stream after visible text, a
+ * malformed call): pick up where that turn stopped. A rebuilt context keeps it
+ * exactly while it keeps the turn the reminder follows.
+ */
+export const CONTINUE_REMINDER_MESSAGE_TYPE = "continue-reminder";
+
 function isRolloverRequestEntry(entry: SessionEntry): boolean {
 	return (
 		isUserRequestEntry(entry) ||
@@ -450,6 +458,9 @@ export function buildSessionContext(
 		}
 	}
 
+	// Whether the latest assistant entry was left out of model context: the
+	// continue reminder recorded right after a turn goes with it.
+	let turnLeftOut = false;
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
@@ -459,13 +470,16 @@ export function buildSessionContext(
 			// the continuation succeeded) stays, as it does in the live context.
 			if (!options?.transcript && entry.message.role === "assistant") {
 				const { retryRecovery, continued } = entry.message;
-				if ((retryRecovery && continued !== true) || isEmptyErrorTurn(entry.message)) return;
+				turnLeftOut = (Boolean(retryRecovery) && continued !== true) || isEmptyErrorTurn(entry.message);
+				if (turnLeftOut) return;
 			}
 			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
 			if (
 				!options?.transcript &&
-				(entry.customType === PREWALK_PLAN_MESSAGE_TYPE || entry.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE)
+				(entry.customType === PREWALK_PLAN_MESSAGE_TYPE ||
+					entry.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE ||
+					(entry.customType === CONTINUE_REMINDER_MESSAGE_TYPE && turnLeftOut))
 			) {
 				return;
 			}
@@ -783,10 +797,21 @@ export function buildSessionContext(
 	// Keep the interrupted-thinking continuity pair: convertToLlm strips the
 	// unsafe trailing thinking from that assistant and sends the hidden
 	// continuity note instead. Keep a failed turn a later turn continued from
-	// (`continued`): the turns after it pick up from it.
+	// (`continued`): the turns after it pick up from it. A continue reminder
+	// stays exactly while the turn before it (its tool results aside) is such a
+	// kept turn: after a turn this rebuild leaves out (no continuation finished
+	// it, or a compaction cut it off), it would ask the model to pick up from
+	// nothing.
 	if (!options?.transcript) {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
+			if (message?.role === "custom" && message.customType === CONTINUE_REMINDER_MESSAGE_TYPE) {
+				let turnIndex = i - 1;
+				while (messages[turnIndex]?.role === "toolResult") turnIndex--;
+				const turn = messages[turnIndex];
+				if (turn?.role !== "assistant" || turn.continued !== true) messages.splice(i, 1);
+				continue;
+			}
 			if (message?.role !== "assistant") continue;
 			if (message.stopReason !== "aborted" && message.stopReason !== "error") continue;
 			if (message.continued === true) continue;

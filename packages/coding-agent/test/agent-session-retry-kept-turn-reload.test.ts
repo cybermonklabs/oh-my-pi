@@ -7,18 +7,26 @@
  * picks up from that turn, so without it the model would never see the first
  * half of the answer, or would see a tool result whose call is gone. The file
  * marks such a turn `continued`; a failed turn the retry replaced, or one whose
- * continuations all failed, stays out of that context. The primary model's
- * requests run the real provider; only its HTTP client is replaced, so no
- * request leaves the process.
+ * continuations all failed, stays out of that context. The hidden reminder a
+ * continuation appends after the turn (pick up where it stopped) stays exactly
+ * where and while the turn does. The primary model's requests run the real
+ * provider; only its HTTP client is replaced, so no request leaves the process.
  */
 import { describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
 import {
 	answer,
+	branchConversation,
 	COMPLETE_TOOL_CALL_FRAMES,
 	CONTINUED_ANSWER,
 	CONTINUED_TEXT,
@@ -27,9 +35,12 @@ import {
 	FRESH_TEXT,
 	failedTurn,
 	HTTP_RATE_LIMIT,
+	type KeptTurnSessionOptions,
 	MESSAGE_START_FRAME,
+	modelConversation,
 	OVERLOADED_FRAME,
 	PRIMARY,
+	type PrimaryAnswer,
 	PROVIDER,
 	RATE_LIMIT_FRAME,
 	renderTurn,
@@ -57,6 +68,55 @@ function continuedTurns(sessionManager: SessionManager): string[] {
 				? conversation([entry.message])
 				: [],
 		);
+}
+
+/** A primary turn cut off after {@link FIRST_TEXT}, by the failure the case's continuation follows. */
+const CUT = Symbol("cut after its text");
+
+/** What one primary request answers: a turn {@link CUT} off, or a whole answer with this text. */
+type PrimaryTurn = typeof CUT | string;
+
+/** A case's session when its primary answers `turns` in order, the last repeating. */
+interface PrimarySetup {
+	answers: PrimaryAnswer[];
+	options: KeptTurnSessionOptions;
+}
+
+/** The Anthropic primary, whose cut turns end on `frame` after their text. */
+function anthropicPrimary(turns: PrimaryTurn[], frame: string): PrimarySetup {
+	return {
+		answers: turns.map(turn => ({ stream: turn === CUT ? MESSAGE_START_FRAME + TEXT_FRAMES + frame : answer(turn) })),
+		options: {},
+	};
+}
+
+/**
+ * A Gemini primary on the real `google-generative-ai` provider, whose cut
+ * turns Gemini rejects as a malformed call (MALFORMED_FUNCTION_CALL) after
+ * their text; only its `fetch` is replaced.
+ */
+function geminiPrimary(turns: PrimaryTurn[]): PrimarySetup {
+	const model = getBundledModel("google", "gemini-2.5-flash");
+	if (!model) throw new Error("Expected bundled google/gemini-2.5-flash");
+	const bodies = turns.map(turn =>
+		turn === CUT ? geminiAnswer(FIRST_TEXT, "MALFORMED_FUNCTION_CALL") : geminiAnswer(turn, "STOP"),
+	);
+	const geminiFetch = async (): Promise<Response> => {
+		const body = bodies.length > 1 ? bodies.shift()! : bodies[0]!;
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	};
+	return {
+		answers: [],
+		options: {
+			model,
+			streamFn: (requested, context, options) =>
+				streamGoogle(requested as Model<"google-generative-ai">, context, {
+					...options,
+					apiKey: `${requested.provider}-test-key`,
+					fetch: geminiFetch as FetchImpl,
+				}),
+		},
+	};
 }
 
 describe("a kept and continued turn in the context rebuilt from the session file", () => {
@@ -448,5 +508,201 @@ describe("a kept and continued turn in the context rebuilt from the session file
 			const prompt = entries.findLast(entry => entry.type === "message" && entry.message.role === "user");
 			expect(compaction).toMatchObject({ firstKeptEntryId: prompt?.id });
 		});
+	});
+
+	describe.each([
+		{
+			continuation: "the stream-stall continuation",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, OVERLOADED_FRAME),
+		},
+		{
+			continuation: "the rate-limit continuation",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, RATE_LIMIT_FRAME),
+		},
+		{
+			continuation: "the malformed-call continuation",
+			primary: (turns: PrimaryTurn[]) => {
+				sessions.authStorage.keys.setRuntime("google", "google-test-key");
+				return geminiPrimary(turns);
+			},
+		},
+	])("the reminder $continuation sends after the kept turn", ({ primary }) => {
+		const reminder = expect.stringMatching(/^developer:/);
+		const keptTurn = `assistant[text:${FIRST_TEXT}]`;
+		const continuation = `assistant[text:${CONTINUED_TEXT}]`;
+
+		// Regression: the reminder lived only in the live context, so after a
+		// reload the model read the continuation right after the kept turn, with
+		// nothing between them that asked for it.
+		it("stays between the kept turn and its continuation after a reload, as it is live", async () => {
+			const { answers, options } = primary([CUT, CONTINUED_TEXT]);
+			const result = await runAndReopen(answers, options);
+
+			const live = modelConversation(result.session.agent.state.messages);
+			expect(live).toEqual(["user", keptTurn, reminder, continuation]);
+			// The continuation's own request carried it in that place.
+			expect(modelConversation(sessions.requestMessages.at(-1) ?? [])).toEqual(live.slice(0, -1));
+			expect(modelConversation(result.reopened.buildSessionContext().messages)).toEqual(live);
+			expect(branchConversation(result.reopened)).toEqual([
+				"user",
+				keptTurn,
+				`custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`,
+				continuation,
+			]);
+		});
+
+		// The reminder became a hidden custom message so the file can hold it:
+		// the model must still get the developer message it got before, and the
+		// transcript must still draw nothing for it.
+		it("reaches the model as the developer message it was before the file held it", async () => {
+			const { answers, options } = primary([CUT, CONTINUED_TEXT]);
+			const result = await runAndReopen(answers, options);
+
+			const hidden = result.session.agent.state.messages.find(
+				message => message.role === "custom" && message.customType === CONTINUE_REMINDER_MESSAGE_TYPE,
+			);
+			if (hidden?.role !== "custom" || typeof hidden.content !== "string") {
+				throw new Error("Expected the continue reminder as a custom message in the live context");
+			}
+			expect(hidden.display).toBe(false);
+			const developer: AgentMessage = {
+				role: "developer",
+				content: [{ type: "text", text: hidden.content }],
+				attribution: "agent",
+				timestamp: hidden.timestamp,
+			};
+			expect(convertToLlm([hidden])).toEqual(convertToLlm([developer]));
+		});
+
+		// Regression: after a resume, the next request carried the kept turn and
+		// its continuation without the reminder the model had read between them.
+		it("is sent to the model again after a resume", async () => {
+			const { answers, options } = primary([CUT, CONTINUED_TEXT, FRESH_TEXT]);
+			const result = await runAndReopen(answers, options);
+			const live = modelConversation(result.session.agent.state.messages);
+			const resumed = await sessions.startSession(result.reopened, {
+				...options,
+				messages: result.reopened.buildSessionContext().messages,
+			});
+
+			await resumed.prompt("And then?");
+			await resumed.waitForIdle();
+
+			expect(live).toEqual(["user", keptTurn, reminder, continuation]);
+			expect(modelConversation(sessions.requestMessages.at(-1) ?? [])).toEqual([...live, "user"]);
+		});
+
+		// Regression: a compaction after the continuation keeps the kept turn and
+		// its continuation, and the context it rebuilds drops the reminder between
+		// them. The earlier answer is long and the kept-recent budget small, so the
+		// cut falls on the prompt of the kept turn.
+		it("stays between the kept turn and its continuation after a compaction", async () => {
+			const { answers, options } = primary(["An earlier answer. ".repeat(1_500), CUT, CONTINUED_TEXT]);
+			const result = await runAndReopen(answers, {
+				...options,
+				prompts: ["An earlier question", "Answer in two parts"],
+				settings: { "compaction.keepRecentTokens": 2_000 },
+				compactionSummary: "The earlier question was answered.",
+			});
+			const kept = modelConversation(result.session.agent.state.messages).slice(-4);
+			expect(kept).toEqual(["user", keptTurn, reminder, continuation]);
+
+			await result.session.compact();
+
+			// The summary reaches the model as a user message, then the kept region.
+			const live = modelConversation(result.session.agent.state.messages);
+			expect(live).toEqual(["user", ...kept]);
+			const reopened = await sessions.reopen(result.session.sessionManager);
+			expect(modelConversation(reopened.buildSessionContext().messages)).toEqual(live);
+		});
+
+		// Regression guard: a kept turn no continuation finished stays out of a
+		// rebuilt context, and so must the reminders recorded after it, or the
+		// model would read "continue where you stopped" after nothing.
+		it("leaves out the kept turns and their reminders when every continuation failed", async () => {
+			const { answers, options } = primary([CUT]);
+			const result = await runAndReopen(answers, options);
+
+			expect(sessions.requestMessages.length).toBeGreaterThan(1);
+			expect(branchConversation(result.reopened)).toContain(`custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`);
+			expect(modelConversation(result.reopened.buildSessionContext().messages)).toEqual(["user"]);
+		});
+	});
+
+	// Regression guard: the kept turn's entry is written from a persistence
+	// slot that can still be pending when the session continues the turn. A
+	// reminder recorded first would sit in front of the turn in the file, and
+	// the context rebuilt from it would lose the reminder.
+	it("records a continue reminder only once the kept turn's own entry is written", async () => {
+		const model = getBundledModel(PROVIDER, PRIMARY);
+		if (!model) throw new Error(`Expected bundled ${PROVIDER}/${PRIMARY}`);
+		const sessionManager = SessionManager.inMemory(sessions.tempDir.path());
+		const prompt: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "Answer in two parts" }],
+			timestamp: 1,
+		};
+		const turn: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: FIRST_TEXT }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Anthropic stream stalled while waiting for the next event",
+			errorId: AIError.create(AIError.Flag.Transient),
+			timestamp: 2,
+		};
+		const messages: AgentMessage[] = [prompt, turn];
+		const turnWritten = Promise.withResolvers<void>();
+		// The members a stream-stall continuation reads; the turn's slot settles when
+		// the test says so, and its entry is found by the turn's persistence key.
+		const host = {
+			agent: { state: { messages }, appendMessage: (message: AgentMessage) => messages.push(message) },
+			sessionManager,
+			settings: Settings.isolated(),
+			model: () => model,
+			textOutputCommitted: () => true,
+			abortInProgress: () => false,
+			isDisposed: () => false,
+			streamingEditAbortTriggered: () => false,
+			promptGeneration: () => 0,
+			scheduleAgentContinue: () => {},
+			waitForSessionMessagePersistence: (message: AgentMessage) =>
+				message === turn ? turnWritten.promise : Promise.resolve(),
+			persistedAssistantEntryId: () => undefined,
+		} as unknown as TurnRecoveryHost;
+		const reminderRecorded = Promise.withResolvers<void>();
+		sessionManager.onEntryAppended = entry => {
+			if (entry.type === "custom_message") reminderRecorded.resolve();
+		};
+
+		const recovery = new TurnRecovery(host, { deferFallbackChainValidation: true });
+		expect(recovery.handleCommittedTextStreamStall(turn)).toBe(true);
+		expect(modelConversation(messages)).toEqual([
+			"user",
+			`assistant[text:${FIRST_TEXT}]`,
+			expect.stringMatching(/^developer:/),
+		]);
+
+		// The slot writes the turn's entry and settles.
+		sessionManager.appendMessage(prompt);
+		sessionManager.appendMessage(turn);
+		turnWritten.resolve();
+		await reminderRecorded.promise;
+
+		expect(branchConversation(sessionManager)).toEqual([
+			"user",
+			`assistant[text:${FIRST_TEXT}]`,
+			`custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`,
+		]);
 	});
 });
