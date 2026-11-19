@@ -178,7 +178,7 @@ describe("the natives directory when a directory variable comes from a .env file
 const loaderFirst = initLoaderContext({ isCompiledBinary: true }).nativesDir;
 const { filterChildShellEnv } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/env.ts"))});
 const { getNativesDir } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/dirs.ts"))});
-console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir(), applied: process.env.PI_NATIVES_DIR ?? null, command: filterChildShellEnv(Bun.env).PI_NATIVES_DIR ?? null }));
+console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFirst, loaderLater: initLoaderContext({ isCompiledBinary: true }).nativesDir, piUtils: getNativesDir(), applied: process.env.PI_NATIVES_DIR ?? null, appliedHandoff: process.env.__PI_NATIVES_DIR_HANDOFF ?? null, appliedCache: process.env.__PI_NATIVES_DIR_CACHE ?? null, command: filterChildShellEnv(Bun.env).PI_NATIVES_DIR ?? null }));
 `,
 		);
 		const env: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
@@ -224,5 +224,22 @@ console.log(JSON.stringify({ marker: process.env.NATIVES_DOTENV_PROBE, loaderFir
 		expect(result.marker).toBe("read");
 		expect(result.applied).toBeNull();
 		expect(result.command).toBeNull();
+	});
+
+	it("never applies a .env file's private natives entries, the handoff and the worker-thread cache", async () => {
+		const forged = JSON.stringify({
+			dir: path.join(tempRoot, "forged"),
+			parent: process.pid,
+			parentStart: null,
+			inputs: {},
+		});
+		const result = await probe(
+			`__PI_NATIVES_DIR_HANDOFF='${forged}'\n__PI_NATIVES_DIR_CACHE='${forged}'\nNATIVES_DOTENV_PROBE=read\n`,
+		);
+
+		expect(result.marker).toBe("read");
+		expect(result.appliedHandoff).toBeNull();
+		// The cache holds this process's own answer, never the `.env` file's.
+		expect(result.appliedCache).not.toContain("forged");
 	});
 });
