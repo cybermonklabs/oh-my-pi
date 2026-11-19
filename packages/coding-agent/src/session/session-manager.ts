@@ -3120,7 +3120,8 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const line = manager.#lineFor(withoutEntryPatches(entries[index]!), mask);
+					const entry = entries[index]!;
+					const line = manager.#lineFor(withoutEntryPatches(coldEntryForPersistence(entry) ?? entry), mask);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
 					bytesSinceGc += lineBytes;

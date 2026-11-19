@@ -4,10 +4,10 @@
  * (`secrets.maskSessionStore`). Every string is masked except a field that
  * {@link POSITIONS} keeps, and a field is kept only at the position the table names for it: under
  * a tool call's `arguments`, a tool result's `details`, custom data or any other key the table
- * does not name, every string is masked whatever its key or shape. Object keys, numbers, booleans
- * and `null` are never masked (KR13). An entry made of primitives, plain objects and real arrays
- * with nothing to mask comes back as the same object; a masked one shares every untouched such
- * subtree with the live entry.
+ * does not name, every string is masked whatever its key or shape, except an image's blob reference (KR14).
+ * Object keys, numbers, booleans and `null` are never masked (KR13). An entry made of primitives,
+ * plain objects and real arrays with nothing to mask comes back as the same object; a masked one
+ * shares every untouched such subtree with the live entry.
  *
  * The walk reads a primitive, a plain object or a real array as itself. Any other node (a `bigint`,
  * a boxed primitive, a node with a callable `toJSON`, a class instance) it reads as the plain data
@@ -36,10 +36,17 @@
  * - KR12: outside this walk, `SessionStoreMask.maskText` never cuts one of its own markers: a held value that
  *   overlaps one replaces it whole, and a marker no held value overlaps stays as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
+ * - KR14: in free content, the `data` of an image payload where persistence externalizes it and a
+ *   load resolves it (a `content` image block, an `images` image), when it is a blob reference
+ *   (`blob:sha256:` and a 64-hex content hash). A cold entry's record holds the reference there, where
+ *   the whole entry holds base64, so the store gets the same bytes cold or whole. Any other blob
+ *   reference in free content, and image data that is no blob reference, is masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
 import { countNewlines, isRecord, stringifyJson, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
+import { BLOB_HASH_RE, BLOB_PREFIX, isBlobRef } from "./blob-store";
+import { isExternalizableImagePosition } from "./session-persistence";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /** A child the parent copy leaves out: an object key omitted, an array item removed. */
@@ -666,8 +673,8 @@ function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown
 			return typeof Reflect.get(value, "toJSON") === "function" ? maskStoredForm(value, key, walk) : value;
 		case "object":
 			if (value === null) return value;
-			if (isPlainObject(value)) return maskObject(value, walk, undefined);
-			if (isRealArray(value)) return maskArray(value, walk, undefined, false);
+			if (isPlainObject(value)) return maskFreeObject(value, walk, key);
+			if (isRealArray(value)) return maskArray(value, walk, undefined, false, key);
 			return maskStoredForm(value, key, walk);
 		default:
 			// A number or a boolean is written as it is; `undefined` or a symbol not at all.
@@ -714,10 +721,17 @@ function maskChild(value: Record<string, unknown>, walk: MaskWalk, at: Position)
 }
 
 /**
- * `items`, an array in its stored form, masked: with `at`, each plain-object element at `at`; with
- * `keepStrings`, each primitive-string element kept; every other element free content.
+ * `items`, an array in its stored form under `arrayKey` of its holder, masked: with `at`, each
+ * plain-object element at `at`; with `keepStrings`, each primitive-string element kept; every other
+ * element free content, a plain object as free content under `arrayKey` ({@link maskFreeObject}).
  */
-function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, keepStrings: boolean): unknown[] {
+function maskArray(
+	items: unknown[],
+	walk: MaskWalk,
+	at: Position | undefined,
+	keepStrings: boolean,
+	arrayKey: string | number,
+): unknown[] {
 	let copy: unknown[] | undefined;
 	let droppedPair: unknown;
 	for (let i = 0; i < items.length; i++) {
@@ -736,6 +750,8 @@ function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, k
 			) {
 				droppedPair = item[at.variants.key];
 			}
+		} else if (at === undefined && isPlainObject(item)) {
+			next = maskFreeObject(item, walk, arrayKey);
 		} else {
 			next = maskFree(item, i, walk);
 		}
@@ -762,12 +778,36 @@ function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position |
 	);
 }
 
-/** {@link maskObject} with `variant`, the row of `at` for `obj`'s `type` or `role`, chosen by the caller. */
+/**
+ * `obj`, a plain object of free content under `key` of its holder (an array element under its
+ * array's key), masked as free content, except the blob reference of an image (KR14). Only an image
+ * payload where persistence externalizes its `data` and a load resolves it keeps the reference: a
+ * `content` image block or an `images` image ({@link isExternalizableImagePosition}), not a
+ * snapcompact frame, which a load leaves as a reference. There the reference is what persistence
+ * wrote for the image, which a cold entry's record holds where the whole entry holds base64. A blob
+ * reference anywhere else in free content holds no image a load reads, and is masked as the
+ * out-of-position cases of KR7-KR9 mask it.
+ */
+function maskFreeObject(obj: Record<string, unknown>, walk: MaskWalk, key: string | number): Record<string, unknown> {
+	const keepsRef =
+		typeof key === "string" &&
+		key !== "frames" &&
+		isExternalizableImagePosition(obj, key) &&
+		isBlobRef(obj.data) &&
+		BLOB_HASH_RE.test(obj.data.slice(BLOB_PREFIX.length));
+	return maskObjectAs(obj, walk, undefined, undefined, keepsRef ? "data" : undefined);
+}
+
+/**
+ * {@link maskObject} with `variant`, the row of `at` for `obj`'s `type` or `role`, chosen by the
+ * caller, and with the value under `kept`, when given, stored as written.
+ */
 function maskObjectAs(
 	obj: Record<string, unknown>,
 	walk: MaskWalk,
 	at: Position | undefined,
 	variant: Position | undefined,
+	kept?: string,
 ): Record<string, unknown> {
 	const signatureKey = signatureKeyOf(obj, variant);
 	const before = walk.replacements;
@@ -776,7 +816,12 @@ function maskObjectAs(
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
 		const value = obj[key];
-		const next = at === undefined ? maskFree(value, key, walk) : maskField(value, walk, at, variant, key);
+		const next =
+			key === kept
+				? value
+				: at === undefined
+					? maskFree(value, key, walk)
+					: maskField(value, walk, at, variant, key);
 		if (copy === undefined) {
 			if (Object.is(next, value)) continue;
 			copy = copyBefore(obj, key);
@@ -809,11 +854,11 @@ function maskField(value: unknown, walk: MaskWalk, at: Position, variant: Positi
 	if (isPlainObject(value)) {
 		if (listed(at, variant, "wholeObjects", key)) return value;
 		const child = placed(at, variant, "objects", key);
-		return child === undefined ? maskObject(value, walk, undefined) : maskChild(value, walk, child);
+		return child === undefined ? maskFreeObject(value, walk, key) : maskChild(value, walk, child);
 	}
 	if (isRealArray(value)) {
-		if (listed(at, variant, "stringArrays", key)) return maskArray(value, walk, undefined, true);
-		return maskArray(value, walk, placed(at, variant, "elements", key), false);
+		if (listed(at, variant, "stringArrays", key)) return maskArray(value, walk, undefined, true, key);
+		return maskArray(value, walk, placed(at, variant, "elements", key), false, key);
 	}
 	return maskFree(value, key, walk);
 }
