@@ -485,6 +485,10 @@ interface SpentRetryFallback {
 	reason: string;
 	/** The candidates the refusal-credit hold passed over, in chain order. */
 	heldEntries: readonly RetryFallbackEntry[];
+	/** The provider whose models the walk passes over after a long usage limit; else undefined. */
+	excludeProvider: string | undefined;
+	/** True when the walk wraps around each chain to the entries before the failed model. */
+	wrapAround: boolean;
 	/** True once the walk is stale; a stale search ends the walk with no switch. */
 	usageReadStale: () => boolean;
 	/** Runs a read under the walk's abort controller, which `abortRetry()` stops. */
@@ -517,6 +521,13 @@ export class TurnRecovery {
 	 * model served by another provider shares. Cleared with `#refusalWalkTried`.
 	 */
 	readonly #refusedIdentities = new Set<string>();
+	/**
+	 * The provider of a long usage limit when the walk after it switched with that provider passed
+	 * over. It binds only the check before the call that switch leads to
+	 * (`#maybeApplyUsageAwareFallback`), which passes over that provider's models too and clears it
+	 * as it starts. Each retry policy clears it before its walk, and `resolveRetry()` clears it.
+	 */
+	#walkExcludedProvider: string | undefined;
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
 	readonly #accountPolicyRotationsRemaining = new Map<string, number>();
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
@@ -1035,6 +1046,7 @@ export class TurnRecovery {
 		this.#refusalWalkTried.clear();
 		this.#refusedModels.clear();
 		this.#refusedIdentities.clear();
+		this.#walkExcludedProvider = undefined;
 		this.#accountPolicyRotationsRemaining.clear();
 		if (this.#retryResolve) {
 			this.#retryResolve();
@@ -2132,6 +2144,9 @@ export class TurnRecovery {
 	}
 
 	async #maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<boolean> {
+		// The walk's exclusion binds this one check, so it is read and cleared first.
+		const excludeProvider = this.#walkExcludedProvider;
+		this.#walkExcludedProvider = undefined;
 		if (!cfgRetryUsageAwareFallback.get(this.#host.settings)) return false;
 		const currentModel = this.#host.model();
 		if (!currentModel) return false;
@@ -2190,7 +2205,7 @@ export class TurnRecovery {
 		}
 		if (!cfgRetryModelFallback.get(this.#host.settings) || this.#host.modelFallbackDisabled?.()) return false;
 
-		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal);
+		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal, excludeProvider);
 		if (!fallback) return false;
 
 		let shouldFallback = health.state === "depleted" || reservePolicy === "auto" || !confirmer;
@@ -2241,7 +2256,7 @@ export class TurnRecovery {
 		const currentModel = this.#host.model();
 		if (!currentModel) return false;
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
-		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal);
+		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal, undefined);
 		if (!fallback) return false;
 		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
 			apiKey: fallback.apiKey,
@@ -2294,6 +2309,7 @@ export class TurnRecovery {
 		currentSelector: string,
 		currentModel: Model,
 		signal: AbortSignal,
+		excludeProvider: string | undefined,
 	): Promise<(RetryFallbackEntry & { apiKey: string }) | undefined> {
 		return this.#searchKeyedRetryFallback(
 			this.#retryFallbackEntries(
@@ -2307,6 +2323,7 @@ export class TurnRecovery {
 			// The check before a model call and the switch off a model with no
 			// credential pass over a depleted or reserve fallback.
 			health => health.state === "depleted" || health.state === "reserve",
+			excludeProvider,
 		);
 	}
 
@@ -2315,9 +2332,10 @@ export class TurnRecovery {
 		roles: string[],
 		currentSelector: string,
 		currentModel: Model,
+		options?: { wrapAround?: boolean },
 	): Generator<RetryFallbackEntry> {
 		for (const role of roles) {
-			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel, options)) {
 				yield { role, selector };
 			}
 		}
@@ -2329,10 +2347,11 @@ export class TurnRecovery {
 	 * not in cooldown by its own string or by that model
 	 * (`isRetryFallbackEntrySuppressed`, so another spelling of a model in
 	 * cooldown, such as an alias `pi/<role>`, is passed over), resolves to no
-	 * model that refused in the turn (`#refusedInTurn`), fits the effort ceiling
-	 * and the context without `excludedMessage`, reads no usage `passOverUsage`
-	 * passes over, and gives a key, with that key and the model the entry
-	 * resolves to. A key read that throws passes over the entry.
+	 * model that refused in the turn (`#refusedInTurn`) and to no model of
+	 * `excludeProvider`, fits the effort ceiling and the context without
+	 * `excludedMessage`, reads no usage `passOverUsage` passes over, and gives a
+	 * key, with that key and the model the entry resolves to. A key read that
+	 * throws passes over the entry.
 	 * Undefined when no entry passes, or once `stale()` is true.
 	 */
 	async #searchKeyedRetryFallback(
@@ -2341,6 +2360,7 @@ export class TurnRecovery {
 		excludedMessage: AssistantMessage | undefined,
 		signal: AbortSignal,
 		passOverUsage: (health: ModelUsageHealth) => boolean,
+		excludeProvider: string | undefined,
 	): Promise<(RetryFallbackEntry & { apiKey: string; model: Model }) | undefined> {
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const { role, selector: candidate } of entries) {
@@ -2349,6 +2369,7 @@ export class TurnRecovery {
 			if (!candidateModel || !this.#host.modelRegistry.hasConfiguredAuth(candidateModel)) continue;
 			if (this.isRetryFallbackEntrySuppressed(candidate, candidateModel)) continue;
 			if (this.#refusedInTurn(candidateModel)) continue;
+			if (excludeProvider === candidateModel.provider) continue;
 			if (ceiling !== undefined && !modelSupportsEffortCeiling(candidateModel, ceiling)) continue;
 			// Skip a candidate whose window cannot hold the live context so we
 			// never switch onto an oversized request (issue #8065).
@@ -2701,6 +2722,8 @@ export class TurnRecovery {
 							excludedMessage,
 							reason,
 							heldEntries,
+							excludeProvider: options?.excludeProvider,
+							wrapAround: options?.wrapAround === true,
 							usageReadStale,
 							withUsageReadSignal,
 						});
@@ -2758,6 +2781,11 @@ export class TurnRecovery {
 	 * that check, which picks nothing for a depleted model under
 	 * `retry.usageReservePolicy: "fail-closed"` (it throws), the walk switches to
 	 * what the search finds under every reserve policy.
+	 * It also keeps two rules of the walk after a long usage limit, which that
+	 * check does not have: it passes over every model of the walk's excluded
+	 * provider (`excludeProvider`), and it wraps around each chain it reads to
+	 * the entries before the spent model (`wrapAround`), as the walk's own
+	 * search does.
 	 *
 	 * When that search finds nothing, a live refusal credit counts as absent:
 	 * the candidates its hold passed over are searched the same way, in chain
@@ -2772,6 +2800,8 @@ export class TurnRecovery {
 		excludedMessage,
 		reason,
 		heldEntries,
+		excludeProvider,
+		wrapAround,
 		usageReadStale,
 		withUsageReadSignal,
 	}: SpentRetryFallback): Promise<boolean> {
@@ -2796,11 +2826,12 @@ export class TurnRecovery {
 		if (usageReadStale()) return false;
 		const route = await withUsageReadSignal(signal =>
 			this.#searchKeyedRetryFallback(
-				this.#retryFallbackEntries(spentRoles, spentSelector, candidate),
+				this.#retryFallbackEntries(spentRoles, spentSelector, candidate, { wrapAround }),
 				usageReadStale,
 				excludedMessage,
 				signal,
 				isUsageSpent,
+				excludeProvider,
 			),
 		);
 		if (route) {
@@ -2818,10 +2849,12 @@ export class TurnRecovery {
 		// Then the candidates the credit hold passed over. A held candidate keeps
 		// the session's level and its own walk role. The credit holds candidates
 		// only in a refusal walk, whose searches pass over the model in use (it
-		// refused), so this pick is never the model in use.
+		// refused), so this pick is never the model in use. The walk passes over
+		// a candidate of its excluded provider before the hold, so no held entry
+		// is of that provider.
 		if (usageReadStale()) return false;
 		const held = await withUsageReadSignal(signal =>
-			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal, isUsageSpent),
+			this.#searchKeyedRetryFallback(heldEntries, usageReadStale, excludedMessage, signal, isUsageSpent, undefined),
 		);
 		if (held) return this.#applyPickAfterSpentFallback(held, held.role, currentSelector, reason);
 		return false;
@@ -3089,6 +3122,7 @@ export class TurnRecovery {
 	 * its dead ends leaves the saga for the caller to close.
 	 */
 	async #applyRetryPolicy(message: AssistantMessage, options?: RetryPolicyOptions): Promise<boolean> {
+		this.#walkExcludedProvider = undefined;
 		const retrySettings = cfgRetry.get(this.#host.settings);
 		if (this.#host.abortInProgress() || this.#host.isDisposed()) return false;
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
@@ -3486,6 +3520,9 @@ export class TurnRecovery {
 								: delayMs,
 						),
 				});
+				// After a long usage limit, the check before the call this switch
+				// leads to keeps the walk's exclusion.
+				if (switchedModel && longUsageLimitFallback) this.#walkExcludedProvider = currentModel.provider;
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
 			// of the role-fallback setting: it's intrinsic to the Fast contract (speed
