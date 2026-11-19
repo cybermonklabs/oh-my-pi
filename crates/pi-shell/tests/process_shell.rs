@@ -351,17 +351,19 @@ fn an_untrapped_signal_kills_the_shell_process() {
 	}
 }
 
+/// A shell's stdout, stderr, exit status, and the signal it died of.
+type Outcome = (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>);
+
 /// `args` run as `name` by `program` with `SIGQUIT` at its default, the
 /// signals `ignored` ignored and the core size limit 0 on entry (the test
 /// runner's own dispositions, which a terminal or a CI runner set, do not
-/// reach the shell): stdout, stderr, the exit status, and the signal the
-/// process died of.
+/// reach the shell).
 fn run_entry(
 	program: impl AsRef<OsStr>,
 	name: &str,
 	args: &[&str],
 	ignored: &'static [libc::c_int],
-) -> (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>) {
+) -> Outcome {
 	let mut cmd = Command::new(program);
 	cmd.arg0(name).args(args).env_remove("ZDOTDIR");
 	// SAFETY: signal and setrlimit are async-signal-safe and change only
@@ -381,12 +383,13 @@ fn run_entry(
 }
 
 /// [`run_entry`] as `zsh` with `SIGUSR1` and `SIGHUP` ignored on entry.
-fn run_ignoring(
-	program: impl AsRef<OsStr>,
-	args: &[&str],
-) -> (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>) {
+fn run_ignoring(program: impl AsRef<OsStr>, args: &[&str]) -> Outcome {
 	run_entry(program, "zsh", args, &[libc::SIGUSR1, libc::SIGHUP])
 }
+
+/// A script and what the shell does with it: its stdout, exit status, and
+/// the signal it dies of.
+type SignalCase<'a> = (&'a str, &'a [u8], Option<i32>, Option<i32>);
 
 /// bash catches its fatal signals once an EXIT trap is set: the trap runs
 /// (with `$?` as it was), then the shell dies of the signal; a subshell
@@ -394,7 +397,7 @@ fn run_ignoring(
 /// (`PROF`) and a trapped one behave as without the EXIT trap.
 #[test]
 fn bash_runs_its_exit_trap_before_dying_of_a_fatal_signal() {
-	let cases: [(&str, &[u8], Option<i32>, Option<i32>); 6] = [
+	let cases: [SignalCase<'_>; 6] = [
 		(
 			"trap 'echo x $?' EXIT; kill -TERM $$; echo not-reached",
 			b"x 0\n",
@@ -480,26 +483,33 @@ setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posi
 /// (`removetrap`); bash keeps ignoring it.
 #[test]
 fn the_shell_ignores_quit_and_its_commands_get_it_at_its_default() {
-	let cases: [(&str, &str, &[u8], Option<i32>, Option<i32>); 3] = [
+	let cases: [(&str, SignalCase<'_>); 3] = [
 		(
 			"zsh",
-			"/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
-			 child-alive'; print st=$?",
-			b"alive\nst=131\n",
-			Some(0),
-			None,
+			(
+				"/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
+				 child-alive'; print st=$?",
+				b"alive\nst=131\n",
+				Some(0),
+				None,
+			),
 		),
-		("zsh", "trap - QUIT; /bin/kill -QUIT $$; print not-reached", b"", None, Some(libc::SIGQUIT)),
+		(
+			"zsh",
+			("trap - QUIT; /bin/kill -QUIT $$; print not-reached", b"", None, Some(libc::SIGQUIT)),
+		),
 		(
 			"bash",
-			"/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
-			 child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
-			b"alive\nst=131\nafter-reset\n",
-			Some(0),
-			None,
+			(
+				"/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
+				 child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
+				b"alive\nst=131\nafter-reset\n",
+				Some(0),
+				None,
+			),
 		),
 	];
-	for (name, script, out, code, signal) in cases {
+	for (name, (script, out, code, signal)) in cases {
 		let args = if name == "zsh" {
 			vec!["-f", "-c", script]
 		} else {
