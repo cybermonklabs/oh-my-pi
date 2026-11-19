@@ -52,7 +52,7 @@ export function readLinkTarget(
 
 /**
  * Replace the file calls the reader makes (`undefined` restores them), for tests. It reaches
- * this module instance only (two under Bun's `--preserve-symlinks`; see the module).
+ * this module instance only.
  */
 export function __setRegularFileIoForTests(
 	replacement:

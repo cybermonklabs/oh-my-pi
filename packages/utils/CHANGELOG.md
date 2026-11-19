@@ -13,7 +13,7 @@
 ### Fixed
 
 - Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
-- `getNativesDir()` and `getNativeGrammarsDir()` now name one directory per machine, the one the addon loader uses, instead of a per-profile directory
+- `getNativesDir()` and `getNativeGrammarsDir()` now name the directory the addon loader uses, the same for every profile, instead of a per-profile directory. It still follows `PI_NATIVES_DIR`, `OMP_DOWNLOAD_ROOT`, `OMP_CONFIG_ROOT` and `PI_CONFIG_DIR`, so two omp processes started with different values of those name different directories
 
 ## [18.18.2] - 2026-11-08
 

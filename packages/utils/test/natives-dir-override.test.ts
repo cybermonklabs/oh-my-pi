@@ -72,7 +72,7 @@ describe("native directory override", () => {
 		process.env.PI_CONFIG_DIR = ".alternate";
 		process.env.OMP_PROFILE = "isolated";
 		__resetDirsFromEnvForTests();
-		// One natives directory per machine: a named profile shares the base root's (here the
+		// One natives directory for every profile: a named profile shares the base root's (here the
 		// initialized XDG cache root), the directory the addon loader also uses.
 		const defaultNatives = path.join(
 			xdgPlatform ? path.join(cache, "omp") : path.join(home, ".alternate"),
