@@ -30,6 +30,21 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 	built.is_ok_and(|built| built.status.success()).then_some(locales)
 }
 
+/// Makes every path below `parent` one no process can enter, root
+/// included: `parent` is moved aside and a regular file put in its place,
+/// so a `chdir` below it fails with `ENOTDIR` for every user. A mode bit
+/// would not do it: root enters a directory with mode 000 or 600
+/// (`CAP_DAC_READ_SEARCH`), and a test that shut a directory that way
+/// passed as an ordinary user and failed as root. A process already inside
+/// the directory stays inside it, at its new name.
+#[cfg(target_os = "linux")]
+fn bury(parent: &Path) {
+	let mut aside = parent.as_os_str().to_owned();
+	aside.push(".aside");
+	fs::rename(parent, &aside).unwrap();
+	fs::write(parent, b"not a directory\n").unwrap();
+}
+
 /// A working directory the child cannot be put into ends the query.
 ///
 /// The error says nothing about what the reference resolves from a
@@ -46,28 +61,27 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 /// answers, by dropping the relative entry. That agreement was luck — the
 /// reference is inside a directory no process can enter — and the same
 /// reasoning answered wrongly in every other row here.
+///
+/// Every row's directory is one no process can enter, root included
+/// ([`bury`]); none of them asserts which error the child met.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_working_directory_the_child_cannot_enter_is_reported() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let mixed = format!("missing:{}", locales.display());
 	let listed = format!("locales:{}", locales.display());
-	let open = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o755)).unwrap();
-	let shut = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o600)).unwrap();
 	// Each case is a working directory and the search path the shell set in
 	// it. The last is the one that used to come back from glibc's locale
 	// archive, which an emptied `LOCPATH` turns back on: `en_US.utf8` is
 	// installed, and the reference in that directory still reports the C
 	// locale because its own `LOCPATH` names nothing it can read.
 	let cases: [(&str, &str, &str); 5] = [
-		("unsearchable", SHELL_ONLY_LOCALE, &mixed),
+		("unsearchable/here", SHELL_ONLY_LOCALE, &mixed),
 		("removed", SHELL_ONLY_LOCALE, &mixed),
 		("ancestor/child", SHELL_ONLY_LOCALE, "locales"),
 		("renamed", SHELL_ONLY_LOCALE, &listed),
-		("archive", "en_US.utf8", "missing"),
+		("archive/here", "en_US.utf8", "missing"),
 	];
 	for (at, locale, path) in cases {
 		let cwd = dir.path().join(at);
@@ -79,20 +93,14 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 		let child = host.child_env();
 		match at {
 			"removed" => fs::remove_dir_all(&cwd).unwrap(),
-			"ancestor/child" => shut(&dir.path().join("ancestor")),
 			"renamed" => {
 				fs::rename(&cwd, dir.path().join("renamed-away")).unwrap();
 				fs::write(&cwd, b"not a directory\n").unwrap();
 			},
-			_ => shut(&cwd),
+			_ => bury(cwd.parent().unwrap()),
 		}
 		let env = |key: &str| (key == "LOCPATH").then(|| path.to_owned());
 		let answer = crate::locale::loaded_codeset(locale, &env, Some(&child));
-		match at {
-			"removed" | "renamed" => {},
-			"ancestor/child" => open(&dir.path().join("ancestor")),
-			_ => open(&cwd),
-		}
 		assert!(matches!(&answer, crate::locale::Codeset::Unasked(_)), "{at}: {answer:?}");
 	}
 }
@@ -117,16 +125,15 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_answer_that_needs_no_working_directory_is_still_given() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let absolute = locales.display().to_string();
-	let cwd = dir.path().join("unsearchable");
+	let cwd = dir.path().join("unsearchable").join("here");
 	fs::create_dir_all(&cwd).unwrap();
 	let (host, _) = crate::host::Host::for_test("rsync", "", &cwd);
 	let child = host.child_env();
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o600)).unwrap();
+	// No process can enter it, root included ([`bury`]).
+	bury(cwd.parent().unwrap());
 	let free = |key: &str| match key {
 		"LOCPATH" => Some(absolute.clone()),
 		"PATH_LOCALE" => Some("relative-locales".to_owned()),
@@ -138,7 +145,6 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 	let mixed = format!("{absolute}:missing");
 	let bound = |key: &str| (key == "LOCPATH").then(|| mixed.clone());
 	let reported = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &bound, Some(&child));
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o755)).unwrap();
 	assert!(
 		matches!(&answered, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
 		"{answered:?}"
@@ -878,15 +884,18 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 ///
 /// The storm carries a second signal, one the caller *ignores*. That is
 /// the caller's own instruction and it has to reach the utility, so the
-/// last query here runs a utility that reads its own `/proc` entry,
-/// refuses unless that number is ignored and unblocked, and only then
-/// raises it at itself and answers. Surviving the signal is not proof on
-/// its own — a blocked signal with the default disposition survives too,
-/// and a mutant that reset the readable ignore and then blocked the
-/// number passed the survival form twenty times out of twenty. What this
-/// cannot reach is an ignored disposition whose *read* is denied,
-/// because denying one read needs a kernel filter, which lives in this
-/// lane's harness rather than here.
+/// last query here runs a utility that asks a probe of its own whether
+/// that number is ignored and unblocked, refuses unless it is, and only
+/// then raises it at itself and answers. Surviving the signal is not proof
+/// on its own — a blocked signal with the default disposition survives
+/// too, and a mutant that reset the readable ignore and then blocked the
+/// number passed the survival form twenty times out of twenty. The probe
+/// (`the_ignored_signal_probe`) reads the disposition with `sigaction`
+/// and the mask with `pthread_sigmask`, not from `/proc/<pid>/status`,
+/// whose `SigIgn` and `SigBlk` lines a sandbox such as gVisor does not
+/// write. What this cannot reach is an ignored disposition whose *read*
+/// is denied, because denying one read needs a kernel filter, which lives
+/// in this lane's harness rather than here.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
@@ -982,20 +991,21 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// say it: a *blocked* signal with the default disposition survives
 	// too, and a mutant that reset the readable ignore and then blocked
 	// the number passed that form twenty times out of twenty. So the
-	// utility reads its own `/proc` entry first and refuses unless the
-	// number is in `SigIgn` and out of `SigBlk`, and only then raises it
-	// at itself and answers. What this cannot reach is still said where
-	// it is said above; restoring the *wrong* number, and skipping the
-	// mask read-back, are covered by this lane's harness probes rather
-	// than from here.
-	let bit = 1u64 << (libc::SIGUSR2 - 1);
+	// utility first runs this test binary's probe, which inherits the
+	// utility's disposition and mask and answers by its exit status, and
+	// refuses unless the number is ignored and unblocked; only then does it
+	// raise the number at itself and answer. What this cannot reach is
+	// still said where it is said above; restoring the *wrong* number, and
+	// skipping the mask read-back, are covered by this lane's harness
+	// probes rather than from here.
+	let me = std::env::current_exe().unwrap();
+	let quoted = format!("'{}'", me.display().to_string().replace('\'', "'\\''"));
 	let raises = dir.path().join("locale-raises-the-ignored-signal");
 	let script = format!(
 		"#!/bin/sh\n\
-		 ignored=$(awk '/^SigIgn:/ {{ print $2 }}' /proc/$$/status)\n\
-		 blocked=$(awk '/^SigBlk:/ {{ print $2 }}' /proc/$$/status)\n\
-		 [ $(( 0x$ignored & {bit} )) -ne 0 ] || exit 71\n\
-		 [ $(( 0x$blocked & {bit} )) -eq 0 ] || exit 72\n\
+		 {PROBE_ENV}=1 {quoted} --ignored --exact locale::tests::the_ignored_signal_probe >/dev/null 2>&1\n\
+		 status=$?\n\
+		 [ $status -eq {PROBE_OK} ] || {{ [ $status -eq 0 ] && exit {PROBE_NOT_RUN}; exit $status; }}\n\
 		 kill -{signal} $$\n\
 		 printf 'UTF-8\\n'\n",
 		signal = libc::SIGUSR2
@@ -1023,9 +1033,55 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	assert!(
 		matches!(&ignoring, crate::locale::Codeset::Loaded(found) if found == "UTF-8"),
 		"the signal the caller ignores reached the utility ignored and unblocked, and it survived \
-		 raising it — status 71 is a disposition that is no longer ignored, 72 is a blocked one: \
-		 {ignoring:?}"
+		 raising it — status {PROBE_NOT_IGNORED} is a disposition that is no longer ignored, \
+		 {PROBE_BLOCKED} is a blocked one, {PROBE_NOT_RUN} is a probe that did not run: {ignoring:?}"
 	);
+}
+
+/// The environment variable that turns `the_ignored_signal_probe` on, and its exit statuses.
+#[cfg(target_os = "linux")]
+const PROBE_ENV: &str = "PI_LOCALE_IGNORED_SIGNAL_PROBE";
+#[cfg(target_os = "linux")]
+const PROBE_OK: i32 = 70;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_IGNORED: i32 = 71;
+#[cfg(target_os = "linux")]
+const PROBE_BLOCKED: i32 = 72;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_RUN: i32 = 73;
+
+/// Not a test of its own: the probe that the stand-in utility of
+/// `an_inherited_handler_does_not_run_in_the_child_before_exec` starts.
+/// It runs in a process that inherited the utility's signal disposition
+/// and mask, and says by its exit status whether `SIGUSR2` is ignored
+/// ([`PROBE_NOT_IGNORED`] when not) and unblocked ([`PROBE_BLOCKED`] when
+/// blocked), [`PROBE_OK`] when both hold. It reads them from the kernel, so
+/// it answers in a sandbox whose `/proc/<pid>/status` has no `SigIgn` or
+/// `SigBlk` line. A distinct success status keeps a probe that never ran
+/// (a filter that matched no test exits 0) from reading as a pass.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "started only by an_inherited_handler_does_not_run_in_the_child_before_exec's stand-in utility"]
+fn the_ignored_signal_probe() {
+	if std::env::var_os(PROBE_ENV).is_none() {
+		return;
+	}
+	// SAFETY: reading this process's own disposition and mask, into
+	// zeroed structures of the right types.
+	let (disposition, blocked) = unsafe {
+		let mut old: libc::sigaction = std::mem::zeroed();
+		assert_eq!(libc::sigaction(libc::SIGUSR2, std::ptr::null(), &raw mut old), 0);
+		let mut mask: libc::sigset_t = std::mem::zeroed();
+		assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask), 0);
+		(old.sa_sigaction, libc::sigismember(&raw const mask, libc::SIGUSR2) == 1)
+	};
+	if disposition != libc::SIG_IGN {
+		std::process::exit(PROBE_NOT_IGNORED);
+	}
+	if blocked {
+		std::process::exit(PROBE_BLOCKED);
+	}
+	std::process::exit(PROBE_OK);
 }
 
 /// A name is the name of locale data, whatever punctuation it carries.
