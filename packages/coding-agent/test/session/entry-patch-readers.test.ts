@@ -379,4 +379,79 @@ describe("entry patch records and the readers of a session", () => {
 			await manager.close();
 		}
 	});
+
+	// A continuation marks the failed turn it continued from (`continued`) with a
+	// patch record. If the record loses the marker, a resumed session rebuilds
+	// its model context without that turn, and the continuation follows nothing.
+	it("keeps the continued marker a patch record sets on a failed turn through a resume and a full rewrite", async () => {
+		using dir = TempDir.createSync("@omp-entry-patch-");
+		const file = await writeSession(dir.path(), [
+			{ type: "message", id: "u1", parentId: null, timestamp: TIMESTAMP, message: user("go") },
+			{ type: "message", id: "a1", parentId: "u1", timestamp: TIMESTAMP, message: failedAttempt() },
+			{ type: "message", id: "a2", parentId: "a1", timestamp: TIMESTAMP, message: assistant(" and the rest.") },
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "p1",
+				parentId: "a2",
+				timestamp: TIMESTAMP,
+				data: { patches: [{ entryId: "a1", message: { continued: true } }] },
+			},
+		]);
+		const continuedOf = (manager: SessionManager) =>
+			messagesOf(manager).map(message => (message.role === "assistant" ? message.continued : undefined));
+		const manager = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		let resumed: (true | undefined)[];
+		try {
+			resumed = continuedOf(manager);
+			await manager.rewriteEntries();
+			await manager.flush();
+		} finally {
+			await manager.close();
+		}
+		const rewritten = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		try {
+			expect({ resumed, afterRewrite: continuedOf(rewritten) }).toEqual({
+				resumed: [undefined, true, undefined],
+				afterRewrite: [undefined, true, undefined],
+			});
+		} finally {
+			await rewritten.close();
+		}
+	});
+
+	// The marker belongs to an assistant turn; a record that sets it on another
+	// role is malformed, as one that sets an assistant field there is.
+	it("skips a patch record that sets the continued marker on a user message, with a warning", async () => {
+		using dir = TempDir.createSync("@omp-entry-patch-");
+		const file = await writeSession(dir.path(), [
+			{ type: "message", id: "u1", parentId: null, timestamp: TIMESTAMP, message: user("go") },
+			{ type: "message", id: "a1", parentId: "u1", timestamp: TIMESTAMP, message: assistant("done") },
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "p1",
+				parentId: "a1",
+				timestamp: TIMESTAMP,
+				data: { patches: [{ entryId: "u1", message: { continued: true } }] },
+			},
+		]);
+		const warn = vi.spyOn(logger, "warn");
+		const manager = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		try {
+			const first = messagesOf(manager)[0];
+			expect({
+				warned: warn.mock.calls.some(call => /entry patch/i.test(String(call[0]))),
+				userHasMarker: first !== undefined && "continued" in first,
+			}).toEqual({ warned: true, userHasMarker: false });
+		} finally {
+			await manager.close();
+		}
+	});
 });

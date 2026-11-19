@@ -3,7 +3,8 @@
  * entries it already holds.
  *
  * Some passes change an entry after its line is written: a retry saga marks
- * the attempts it recovered (`retryRecovery`), compaction stamps its dead-end
+ * the attempts it recovered (`retryRecovery`), a continuation marks the failed
+ * turn it continued from (`continued`), compaction stamps its dead-end
  * `warning` and corrects `tokensAfter`, snapcompact stores its archive without
  * reasoning (`preserveData`), and an elide pass replaces heavy content with
  * placeholders. `SessionManager.patchEntries` sets those fields on the live
@@ -54,6 +55,8 @@ export interface EntryFieldsPatch {
 export interface MessageFieldsPatch {
 	/** Assistant `retryRecovery`: how a retry saga settled the attempt. */
 	readonly retryRecovery?: AssistantRetryRecovery;
+	/** Assistant `continued`: a later turn continued from this failed turn, which stays in model context. */
+	readonly continued?: true;
 	/** Assistant `contextSnapshot`: the usage anchor's record of tokens a history rewrite removed. */
 	readonly contextSnapshot?: ContextSnapshot;
 	/** Assistant `elidedOutputTokens`. */
@@ -90,6 +93,7 @@ function toEntryFields({ warning, tokensAfter, preserveData, content }: EntryFie
 
 function toMessageFields({
 	retryRecovery,
+	continued,
 	contextSnapshot,
 	elidedOutputTokens,
 	prunedAt,
@@ -97,6 +101,7 @@ function toMessageFields({
 }: MessageFieldsPatch): MessageFieldsPatch {
 	const fields: Writable<MessageFieldsPatch> = {};
 	if (retryRecovery !== undefined) fields.retryRecovery = cloneJsonTree(retryRecovery);
+	if (continued !== undefined) fields.continued = continued;
 	if (contextSnapshot !== undefined) fields.contextSnapshot = cloneJsonTree(contextSnapshot);
 	if (elidedOutputTokens !== undefined) fields.elidedOutputTokens = elidedOutputTokens;
 	if (prunedAt !== undefined) fields.prunedAt = prunedAt;
@@ -152,6 +157,7 @@ export function entryAcceptsPatch(entry: SessionEntry, patch: EntryPatch): boole
 	const role = entry.message.role;
 	const assistantFields =
 		message.retryRecovery !== undefined ||
+		message.continued !== undefined ||
 		message.contextSnapshot !== undefined ||
 		message.elidedOutputTokens !== undefined;
 	if (assistantFields && role !== "assistant") return false;
@@ -194,6 +200,7 @@ export function setPatchedFields(entry: SessionEntry, patch: EntryPatch): void {
 		if (patched.retryRecovery !== undefined) {
 			message.retryRecovery = ownCopy(message, "retryRecovery", patched.retryRecovery);
 		}
+		if (patched.continued !== undefined) message.continued = patched.continued;
 		if (patched.contextSnapshot !== undefined) {
 			message.contextSnapshot = ownCopy(message, "contextSnapshot", patched.contextSnapshot);
 		}
@@ -235,6 +242,7 @@ function isMessageFields(value: unknown): value is MessageFieldsPatch {
 	return (
 		isRecord(value) &&
 		(value.retryRecovery === undefined || isRecord(value.retryRecovery)) &&
+		(value.continued === undefined || value.continued === true) &&
 		(value.contextSnapshot === undefined || isRecord(value.contextSnapshot)) &&
 		(value.elidedOutputTokens === undefined || typeof value.elidedOutputTokens === "number") &&
 		(value.prunedAt === undefined || typeof value.prunedAt === "number") &&

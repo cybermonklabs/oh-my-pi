@@ -1326,6 +1326,13 @@ export interface AssistantMessage {
 	credentialId?: number;
 	contextSnapshot?: ContextSnapshot;
 	retryRecovery?: AssistantRetryRecovery;
+	/**
+	 * A later turn continued from this failed turn instead of sending it again
+	 * (a rate limit or a cut stream after visible text or after complete tool
+	 * calls, a malformed call), so a model context rebuilt from the session
+	 * keeps it, as the live context does. Set once the continuation succeeded.
+	 */
+	continued?: true;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/**
 	 * Name of the upstream provider an aggregator routed this request to, as
