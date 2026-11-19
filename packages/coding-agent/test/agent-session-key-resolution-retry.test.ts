@@ -641,9 +641,11 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 			expect(delays[0]).toBeLessThanOrEqual(BASE_DELAY_MS);
 			expect(delays[1]).toBeGreaterThan(0);
 			expect(delays[1]).toBeLessThanOrEqual(BASE_DELAY_MS * 2);
-			// The session slept out each backoff, in order (the 1 ms waits schedule the
-			// continuations; a failing OAuth refresh also sleeps between its own attempts).
-			const slept = waits.mock.calls.map(call => call[0]).filter(delayMs => delayMs > 1);
+			// The session slept out each backoff, in order, among its other waits (the 1 ms
+			// waits that schedule the continuations, and the sleeps of a failing OAuth refresh
+			// between its own attempts). No floor is put on the waits read: a jittered backoff
+			// can itself be under 1 ms.
+			const slept = waits.mock.calls.map(call => call[0]);
 			let backoffsSlept = 0;
 			for (const delayMs of slept) {
 				if (backoffsSlept < delays.length && Math.abs(delayMs - delays[backoffsSlept]!) < 0.5) backoffsSlept++;
