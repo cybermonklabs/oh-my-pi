@@ -4,7 +4,7 @@
  * providers while different products of one revision keep their own.
  */
 import { once } from "@oh-my-pi/pi-utils";
-import { collapseVocabulary, discoveryVocabulary } from "../compat/taxonomy";
+import { collapseVocabulary, discoveryVocabulary, routingVariantPlain, stripEffortLane } from "../compat/taxonomy";
 import type { Model } from "../types";
 import { bareModelId } from "./id";
 
@@ -68,14 +68,17 @@ interface RouteWordRule {
 }
 
 interface ProductKeyVocabulary {
-	/** Variant words the catalog strips from any provider's ids. */
+	/** Variant words the catalog strips from every id. */
 	variantWords: Set<string>;
+	/**
+	 * Variant words that come only from suffix rules with an exception, by word, with the exceptions' prefixes: the
+	 * catalog does not strip the word from an id whose bare part starts with one of them (`max` in a `qwen` id).
+	 */
+	exceptedVariantWords: Map<string, string[]>;
 	/** {@link MODEL_PRODUCT_VARIANT_WORDS} by word. */
 	productVariantWords: Map<string, ModelProductVariantWord>;
 	/** Vendor-lineage words: the catalog's canonical family tokens (`claude`, `qwen`). */
 	lineageWords: Set<string>;
-	/** Lane and routing-variant words, by the provider that declares them. */
-	providerWords: Map<string, Set<string>>;
 	/** Route words by their first id word, the longest first. */
 	routeWords: Map<string, RouteWordRule[]>;
 }
@@ -89,37 +92,31 @@ function addWords(target: Set<string>, text: string): void {
 	for (const word of wordsOf(text)) target.add(word);
 }
 
-function addProviderWords(
-	target: Map<string, Set<string>>,
-	rules: readonly { suffix: string; providers: readonly string[] }[],
-): void {
-	for (const rule of rules) {
-		for (const provider of rule.providers) {
-			let words = target.get(provider);
-			if (words === undefined) {
-				words = new Set();
-				target.set(provider, words);
-			}
-			addWords(words, rule.suffix);
-		}
-	}
-}
-
 const getProductKeyVocabulary = once((): ProductKeyVocabulary => {
 	const discovery = discoveryVocabulary();
 	const collapse = collapseVocabulary();
 	const variantWords = new Set<string>();
 	for (const marker of discovery.trailingMarkers) addWords(variantWords, marker);
 	for (const suffix of discovery.billingVariantSuffixes) addWords(variantWords, suffix);
-	for (const rule of collapse.suffixes) addWords(variantWords, rule.suffix);
+	for (const rule of collapse.suffixes) {
+		if (rule.exceptBarePrefix === undefined) addWords(variantWords, rule.suffix);
+	}
 	for (const token of collapse.pairTokens) addWords(variantWords, token);
+	const exceptedVariantWords = new Map<string, string[]>();
+	for (const rule of collapse.suffixes) {
+		if (rule.exceptBarePrefix === undefined) continue;
+		for (const word of wordsOf(rule.suffix)) {
+			// A word that another source strips without an exception stays a variant word in every id.
+			if (variantWords.has(word)) continue;
+			const prefixes = exceptedVariantWords.get(word);
+			if (prefixes === undefined) exceptedVariantWords.set(word, [rule.exceptBarePrefix]);
+			else prefixes.push(rule.exceptBarePrefix);
+		}
+	}
 	const productVariantWords = new Map<string, ModelProductVariantWord>();
 	for (const entry of MODEL_PRODUCT_VARIANT_WORDS) productVariantWords.set(entry.word, entry);
 	const lineageWords = new Set<string>();
 	for (const token of discovery.canonicalFamilyTokens) addWords(lineageWords, token);
-	const providerWords = new Map<string, Set<string>>();
-	addProviderWords(providerWords, collapse.lanes);
-	addProviderWords(providerWords, collapse.routingVariants);
 	const routeWords = new Map<string, RouteWordRule[]>();
 	for (const entry of MODEL_ROUTE_WORDS) {
 		const words = wordsOf(entry.word);
@@ -129,7 +126,7 @@ const getProductKeyVocabulary = once((): ProductKeyVocabulary => {
 		else rules.push({ words, entry });
 	}
 	for (const rules of routeWords.values()) rules.sort((left, right) => right.words.length - left.words.length);
-	return { variantWords, productVariantWords, lineageWords, providerWords, routeWords };
+	return { variantWords, exceptedVariantWords, productVariantWords, lineageWords, routeWords };
 });
 
 // Cache keyed by class and family id (a bounded set from the catalog's rules), so no eviction is needed.
@@ -186,6 +183,21 @@ function isProductVariantWord(
 }
 
 /**
+ * Whether the catalog strips `word` from an id whose lowercase bare part is `lowerBare`. A word that comes only from
+ * suffix rules with an exception is not a variant word in an id that starts with one of their prefixes.
+ */
+function isVariantWord(
+	variantWords: ReadonlySet<string>,
+	exceptedVariantWords: ReadonlyMap<string, readonly string[]>,
+	word: string,
+	lowerBare: string,
+): boolean {
+	if (variantWords.has(word)) return true;
+	const prefixes = exceptedVariantWords.get(word);
+	return prefixes !== undefined && !prefixes.some(prefix => lowerBare.startsWith(prefix));
+}
+
+/**
  * The key of one model product. One model keeps one key across the providers
  * that serve it, the spellings they give its id and the routes they sell it on
  * (`anthropic/claude-opus-4-8`, `amazon-bedrock/us.anthropic.claude-opus-4-8`,
@@ -196,19 +208,24 @@ function isProductVariantWord(
  * The key is `class/family/revision/` followed by the product words of the
  * served id, the id the provider is sent (`requestModelId`, else `id`). The
  * catalog's logical id is not read: it drops variant words such as `max`,
- * which name a product in some classes. The product words start at the first
+ * which name a product in some classes. A provider's lane or routing-variant
+ * suffix is removed from the end of the served id first, as the catalog
+ * removes it (`-fast` from `cursor/grok-4.7-fast`, `-wm` from
+ * `openai-codex/gpt-5.6-luna-wm`); the same word in another place stays
+ * (`fast` in `cursor/grok-code-fast-1`). The product words start at the first
  * class, family or vendor-lineage word of the served id (`anthropic` in
  * `us-gov.anthropic.claude-opus-4-8`, or `qwen3` in `qwen3-coder`), so a vendor
  * or region prefix (`us-gov.`) is left out; when no word qualifies, they start
  * at the first word. They are the words from there on without numbers, class,
- * family and lineage words, the catalog's variant words (except
- * {@link MODEL_PRODUCT_VARIANT_WORDS} in their classes), the provider's lane
- * and routing-variant words, and {@link MODEL_ROUTE_WORDS}. A product word that
- * comes before the family's last word counts too (`live` in
- * `gemini-live-2.5-flash`). A word on no list counts as a product word: keeping
- * a word that only names a route costs one more refused request, but dropping a
- * word that names another product would pass over that product and can end a
- * turn early.
+ * family and lineage words, the catalog's variant words, and
+ * {@link MODEL_ROUTE_WORDS}. A variant word is a product word in the classes of
+ * its {@link MODEL_PRODUCT_VARIANT_WORDS} entry, and in the ids that the
+ * catalog's suffix rule exempts (`max` in an id that starts with `qwen`, as in
+ * Qwen Max). A product word that comes before the family's last word counts too
+ * (`live` in `gemini-live-2.5-flash`). A word on no list counts as a product
+ * word: keeping a word that only names a route costs one more refused request,
+ * but dropping a word that names another product would pass over that product
+ * and can end a turn early.
  *
  * Undefined when the identity names no one model: class `unknown`, or no
  * family, or no revision.
@@ -223,11 +240,15 @@ export function productIdentityKey(
 	const served = bareModelId(model.requestModelId ?? model.id);
 	const at = served.indexOf("@");
 	const bare = at === -1 ? served : served.slice(0, at);
-	const { variantWords, productVariantWords, lineageWords, providerWords, routeWords } = getProductKeyVocabulary();
-	const laneWords = providerWords.get(model.provider.toLowerCase());
+	// The catalog strips a provider's lane and routing variant only from the end of an id.
+	const laneless = stripEffortLane(model.provider, bare);
+	const plain = routingVariantPlain(model.provider, laneless) ?? laneless;
+	const lowerServed = served.toLowerCase();
+	const { variantWords, exceptedVariantWords, productVariantWords, lineageWords, routeWords } =
+		getProductKeyVocabulary();
 	const classWords = nameWords(identity.class);
 	const familyWords = nameWords(identity.family);
-	const words = wordsOf(bare);
+	const words = wordsOf(plain);
 	const kept: string[] = [];
 	// The words before the first class, family or lineage word are a vendor or region prefix (`us-gov.` in
 	// `us-gov.anthropic.claude-opus-4-8`).
@@ -246,8 +267,8 @@ export function productIdentityKey(
 		if (
 			NUMBER_WORD_PATTERN.test(word) ||
 			isNameWord(word, classWords, familyWords, lineageWords) ||
-			(variantWords.has(word) && !isProductVariantWord(productVariantWords, word, identity.class)) ||
-			laneWords?.has(word)
+			(isVariantWord(variantWords, exceptedVariantWords, word, lowerServed) &&
+				!isProductVariantWord(productVariantWords, word, identity.class))
 		) {
 			continue;
 		}

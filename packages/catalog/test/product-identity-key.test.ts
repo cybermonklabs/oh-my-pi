@@ -147,4 +147,16 @@ describe("productIdentityKey", () => {
 	test("starts the product words at a lineage word followed by digits", () => {
 		expectOneKey("vercel-ai-gateway/alibaba/qwen3-coder-30b-a3b", ["amazon-bedrock/qwen.qwen3-coder-30b-a3b-v1:0"]);
 	});
+
+	test("drops a provider's lane word only at the end of the id", () => {
+		expectOneKey("xai/grok-code-fast-1", ["cursor/grok-code-fast-1"]);
+		expectOneKey("xai/grok-4.7", ["cursor/grok-4.7-fast"]);
+		expectOneKey("openai-codex/gpt-5.6-luna", ["openai-codex/gpt-5.6-luna-wm"]);
+	});
+
+	test("keeps max as a product word of a Qwen id", () => {
+		// In an id that starts with `qwen`, the catalog reads `-max` as part of the product (Qwen Max), not an effort.
+		// The catalog gives its Qwen Max ids no family and so no key, so a Coder id stands in for one.
+		expectSeparateKeys(["openrouter/qwen/qwen3-coder", "openrouter/qwen/qwen3-coder-max"]);
+	});
 });
