@@ -27,7 +27,7 @@
  *   OMP_TEST_SQL_SOAK_MS=180000 OMP_TEST_SQL_MYSQL_URL=… bun test test/session/sql-session-storage-deadlock-soak.test.ts
  */
 import { describe, expect, it } from "bun:test";
-import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import type { SqlSessionStorage, SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { LEASE_BACKENDS, openLeaseDb, transcript } from "./sql-session-lease-fixture";
 
@@ -59,6 +59,20 @@ function isDeadlock(error: unknown): boolean {
 	return /deadlock/i.test(message) || /40P01/.test(message);
 }
 
+/** `client`, calling `onDeadlock` for each transaction the server aborts as a deadlock victim, retried or not. */
+function counting(client: SqlSessionStorageClient, onDeadlock: () => void): SqlSessionStorageClient {
+	return {
+		options: client.options,
+		unsafe: (query, values) => client.unsafe(query, values),
+		transaction: callback =>
+			client.transaction(callback).catch((error: unknown) => {
+				if (isDeadlock(error)) onDeadlock();
+				throw error;
+			}),
+		end: () => client.end?.() ?? Promise.resolve(),
+	};
+}
+
 /** The blob tier's queue, past its interface: forget a landed blob so the next store of it inserts again. */
 interface TierInternals {
 	store(hash: string, data: Buffer, mimeType: string | undefined): void;
@@ -78,7 +92,11 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
 					const options = { claims: false, maxBlobBytes: 1024 } as const;
 					const stores: SqlSessionStorage[] = [];
-					for (let index = 0; index < WORKERS; index++) stores.push(await db.open(options));
+					// Transactions each worker's store saw aborted as deadlock victims, which its retries may hide.
+					const aborted = Array.from({ length: WORKERS }, () => 0);
+					for (let index = 0; index < WORKERS; index++) {
+						stores.push(await db.open({ ...options, wrap: client => counting(client, () => aborted[index]++) }));
+					}
 					// Three whole images and four parted ones over three 1 KiB chunks, so parts are shared.
 					const chunks = [1, 2, 3].map(seed => bytes(seed, 1024));
 					const [c0, c1, c2] = chunks as [Buffer, Buffer, Buffer];
@@ -100,7 +118,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					const owned = stores.map((_store, worker) => bytes(100 + worker, 512));
 					const counts = new Map<
 						string,
-						{ ops: number; deadlocks: number; other: number; kinds: Map<string, number> }
+						{ ops: number; deadlocks: number; other: number; aborted: number; kinds: Map<string, number> }
 					>();
 					const failures: string[] = [];
 					const ops: Array<
@@ -190,9 +208,16 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 							const mine = worker === 0 ? ops : ops.filter(([kind]) => kind !== "parted insert");
 							while (performance.now() < deadline) {
 								const [kind, op] = pick(mine);
-								const count = counts.get(kind) ?? { ops: 0, deadlocks: 0, other: 0, kinds: new Map() };
+								const count = counts.get(kind) ?? {
+									ops: 0,
+									deadlocks: 0,
+									other: 0,
+									aborted: 0,
+									kinds: new Map(),
+								};
 								counts.set(kind, count);
 								count.ops++;
+								const before = aborted[worker] ?? 0;
 								try {
 									await op(store, paths, worker);
 								} catch (error) {
@@ -205,13 +230,15 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 										const errorKey = errorKind(error);
 										count.kinds.set(errorKey, (count.kinds.get(errorKey) ?? 0) + 1);
 									}
+								} finally {
+									count.aborted += (aborted[worker] ?? 0) - before;
 								}
 							}
 						}),
 					);
 					const summary = [...counts].map(
 						([kind, count]) =>
-							`${kind} ${count.ops} ops, ${count.deadlocks} deadlocks, ${count.other} other errors`,
+							`${kind} ${count.ops} ops, ${count.deadlocks} deadlocks, ${count.other} other errors, ${count.aborted} transactions aborted`,
 					);
 					console.log(`SOAK ${adapter}: ${summary.join("; ")}`);
 					for (const [kind, count] of counts) {
