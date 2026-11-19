@@ -938,7 +938,8 @@ class DaemonBroker {
 			readyTimedOut = !ready;
 		}
 		await record.persistQueue;
-		return { op: "start", daemon: record.snapshot, readyTimedOut };
+		const launchedMsAgo = record.launchedAt === undefined ? undefined : performance.now() - record.launchedAt;
+		return { op: "start", daemon: record.snapshot, readyTimedOut, launchedMsAgo };
 	}
 
 	async #launch(record: ManagedDaemon): Promise<void> {

@@ -70,7 +70,17 @@ export type DaemonOperation =
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
-	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
+	| {
+			op: "start";
+			daemon: DaemonSnapshot;
+			readyTimedOut: boolean;
+			/**
+			 * How long before this answer the broker launched the process, on its monotonic clock. A client that waits
+			 * for readiness itself counts the spec's timeout from the launch with it, not from its request, which can
+			 * first spawn a broker or stop the service it replaces. Older brokers leave it out.
+			 */
+			launchedMsAgo?: number;
+	  }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
 			op: "logs";
@@ -394,6 +404,7 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				op: "start",
 				daemon: parseDaemonSnapshot(source.daemon),
 				readyTimedOut: booleanValue(source.readyTimedOut, "result.readyTimedOut"),
+				launchedMsAgo: optionalNumber(source.launchedMsAgo, "result.launchedMsAgo"),
 			};
 		case "list": {
 			if (!Array.isArray(source.daemons)) throw new Error("result.daemons must be an array");
