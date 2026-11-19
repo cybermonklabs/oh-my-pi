@@ -646,7 +646,12 @@ export interface ExecutorOptions {
 	keepAlive?: boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
-	/** Releases resources retained for a kept-alive agent when its lifecycle ends. */
+	/**
+	 * Releases resources retained for a kept-alive agent when its lifecycle ends. The run's own
+	 * `finalizeSubagentLifecycle` calls it, and awaits it when it adopts nothing, before the run's end goes
+	 * on; the agent lifecycle may call it while that end still runs. A hook for a resource that end still
+	 * uses holds its work until the end is done (`releaseAfterRunEnd`).
+	 */
 	onRelease?: () => Promise<void>;
 	/**
 	 * Takes over releasing the run's IRC wake hold (see `AgentSession.holdIrcWakes`),

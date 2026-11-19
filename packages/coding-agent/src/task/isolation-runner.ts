@@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { postmortem, prompt } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, prompt } from "@oh-my-pi/pi-utils";
 import isolationErrorTemplate from "../prompts/tools/isolation-error.md" with { type: "text" };
 import isolationSummaryTemplate from "../prompts/tools/isolation-summary.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
@@ -33,6 +33,7 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
+import { releaseAfterRunEnd } from "./run-end-release";
 import type { NestedRepoPatch, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	applyNestedPatches,
@@ -146,7 +147,10 @@ export async function prepareIsolationContext(cwd: string): Promise<IsolationCon
 	return { repoRoot: await getRepoRoot(cwd) };
 }
 
-/** Fingerprint of a captured delta, used to skip re-committing an unchanged workspace on release. */
+/**
+ * Fingerprint of a captured delta, used to skip rewriting the patch files and
+ * re-committing an unchanged workspace on release.
+ */
 function deltaFingerprint(rootPatch: string, nestedPatches: readonly NestedRepoPatch[]): bigint | number {
 	let key = rootPatch;
 	for (const { relativePath, patch } of nestedPatches) key += `\0${relativePath}\0${patch}`;
@@ -251,38 +255,56 @@ interface IsolationPatchArtifacts {
 	nestedPatchPaths: string[];
 }
 
-interface IsolationPatchCapture {
-	artifacts: IsolationPatchArtifacts;
-	/** The delta written. */
+/** An isolation delta as captured, before anything is written. */
+interface IsolationDelta {
 	delta: DeltaPatchResult;
-	/** {@link deltaFingerprint} of the written delta. */
+	/** {@link deltaFingerprint} of {@link delta}. */
 	fingerprint: bigint | number;
 }
 
+interface IsolationPatchCapture extends IsolationDelta {
+	/** Where {@link IsolationDelta.delta} was written. */
+	artifacts: IsolationPatchArtifacts;
+}
+
+/** Capture the isolation delta without writing any of it. */
+async function captureIsolationDelta(changes: RunChanges): Promise<IsolationDelta> {
+	const delta = await changes.delta();
+	return { delta, fingerprint: deltaFingerprint(delta.rootPatch, delta.nestedPatches) };
+}
+
 /**
- * Capture the isolation delta and write every part of it to disk — the root
- * patch and one file per nested repo — before the caller tears the workspace
- * down. Throws when any write fails so nothing captured is ever the only copy.
+ * Write every part of a captured delta to disk — the root patch and one file
+ * per nested repo. Throws when any write fails so nothing captured is ever the
+ * only copy.
+ */
+async function persistIsolationPatch(
+	delta: DeltaPatchResult,
+	artifactsDir: string,
+	agentId: string,
+): Promise<IsolationPatchArtifacts> {
+	const patchPath = path.join(artifactsDir, `${agentId}.patch`);
+	await Bun.write(patchPath, delta.rootPatch);
+	const nestedPatchPaths = await persistNestedPatches(artifactsDir, agentId, delta.nestedPatches);
+	return {
+		patchPath,
+		hasRootChanges: delta.rootPatch.trim().length > 0,
+		nestedPatches: delta.nestedPatches,
+		nestedPatchPaths,
+	};
+}
+
+/**
+ * Capture the isolation delta and write every part of it to disk before the
+ * caller tears the workspace down ({@link persistIsolationPatch}).
  */
 async function writeIsolationPatch(
 	changes: RunChanges,
 	artifactsDir: string,
 	agentId: string,
 ): Promise<IsolationPatchCapture> {
-	const delta = await changes.delta();
-	const patchPath = path.join(artifactsDir, `${agentId}.patch`);
-	await Bun.write(patchPath, delta.rootPatch);
-	const nestedPatchPaths = await persistNestedPatches(artifactsDir, agentId, delta.nestedPatches);
-	return {
-		artifacts: {
-			patchPath,
-			hasRootChanges: delta.rootPatch.trim().length > 0,
-			nestedPatches: delta.nestedPatches,
-			nestedPatchPaths,
-		},
-		delta,
-		fingerprint: deltaFingerprint(delta.rootPatch, delta.nestedPatches),
-	};
+	const captured = await captureIsolationDelta(changes);
+	return { ...captured, artifacts: await persistIsolationPatch(captured.delta, artifactsDir, agentId) };
 }
 
 /** How an isolated run's changes are read: relative to the state its workspace opened in. */
@@ -475,21 +497,23 @@ function renderIsolationError(context: IsolationErrorContext): string {
  * itself routes through {@link IsolatedRunOptions.buildFailureResult}.
  *
  * Kept-alive runs retain the isolation handle through idle/parked lifecycle
- * transitions, then capture final changes and clean up on release. One-shot
- * and failed startup paths clean up in `finally`. If captured changes cannot
- * be written to disk, the workspace is retained under a unique `.retained-*`
- * sibling and its path is named in the resulting error.
+ * transitions, then capture final changes and clean up on release. A release
+ * that comes while the run is still ending (a refused adoption, a release as
+ * the run finishes) waits for the run-end capture, so it never removes the
+ * worktree that capture reads. One-shot and failed startup paths clean up in
+ * `finally`. If captured changes cannot be written to disk, the workspace is
+ * retained under a unique `.retained-*` sibling and its path is named in the
+ * resulting error.
  */
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
 	let changes: RunChanges | undefined;
-	/** Fingerprint of the delta already handed to the caller at run end; release only re-captures on change. */
+	/** Fingerprint of the delta handed to the caller at run end; a release writes and commits only a changed delta. */
 	let handedOff: bigint | number | undefined;
 	let workspace: IsolationWorkspace | undefined;
 	let deferredCleanup: Promise<void> | undefined;
 	let retainWorkspace = false;
 	let baseReleasePromise: Promise<void> | undefined;
 	let cleanupPromise: Promise<void> | undefined;
-	let releasePromise: Promise<void> | undefined;
 	/** The run's IRC wake hold, released only once the run-end capture is done. */
 	let releaseIrcWakes: (() => void) | undefined;
 	const releaseBase = (): Promise<void> => {
@@ -503,17 +527,24 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		})();
 		return cleanupPromise;
 	};
-	const releaseIsolation = (): Promise<void> => {
-		if (releasePromise) return releasePromise;
-		releasePromise = (async () => {
+	/** A kept-alive run's final capture and cleanup, held until the run-end capture below is done with the worktree. */
+	const isolationRelease = releaseAfterRunEnd(
+		async () => {
 			if (!workspace || !changes || retainWorkspace) {
 				await cleanupHandle();
 				return;
 			}
 			try {
-				let capture: IsolationPatchCapture;
+				let captured: IsolationDelta;
+				let patchResult: IsolationPatchArtifacts;
 				try {
-					capture = await writeIsolationPatch(changes, opts.artifactsDir, opts.agentId);
+					captured = await captureIsolationDelta(changes);
+					// Nothing changed since the run-end capture the caller already
+					// merged or applied: its patch files stay as that capture wrote
+					// them (the caller may be reading them now), and a branch would
+					// only duplicate that work.
+					if (captured.fingerprint === handedOff) return;
+					patchResult = await persistIsolationPatch(captured.delta, opts.artifactsDir, opts.agentId);
 				} catch (captureErr) {
 					retainWorkspace = true;
 					const retained = await workspace.retain();
@@ -526,21 +557,17 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 						}),
 					);
 				}
-				const patchResult = capture.artifacts;
 				AgentRegistry.global().setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
 					nestedPatchPaths: patchResult.nestedPatchPaths,
 				});
-				// Nothing changed since the run-end capture the caller already
-				// merged or applied: a branch now would only duplicate that work.
-				if (capture.fingerprint === handedOff) return;
 				const commitResult = await commitToBranch(
 					workspace.dir,
 					await changes.baseline(),
 					opts.agentId,
 					opts.description,
 					undefined,
-					capture.delta,
+					captured.delta,
 				);
 				AgentRegistry.global().setHistory(opts.agentId, {
 					patchPath: patchResult.patchPath,
@@ -550,18 +577,19 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			} finally {
 				await cleanupHandle();
 			}
-		})();
-		// Session teardown has only a short grace period. Once the session has
-		// stopped, let a signal exit wait for the final capture and backend stop
-		// rather than abandoning a large sandbox when that grace period expires.
-		const unregister = postmortem.register(`isolation-release:${opts.agentId}`, () => releasePromise, {
-			exitOnly: true,
-			deadlineMs: 120_000,
-			waitMessage: "Finishing isolated task cleanup",
-		});
-		void releasePromise.then(unregister, unregister);
-		return releasePromise;
-	};
+		},
+		releasing => {
+			// Session teardown has only a short grace period. Once the session has
+			// stopped, let a signal exit wait for the final capture and backend stop
+			// rather than abandoning a large sandbox when that grace period expires.
+			const unregister = postmortem.register(`isolation-release:${opts.agentId}`, () => releasing, {
+				exitOnly: true,
+				deadlineMs: 120_000,
+				waitMessage: "Finishing isolated task cleanup",
+			});
+			void releasing.then(unregister, unregister);
+		},
+	);
 	try {
 		workspace = await opts.openWorkspace(opts.context.repoRoot, opts.agentId);
 		const isolationDir = workspace.dir;
@@ -580,9 +608,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			// One-shot runs get `releaseBase` (never touches the worktree): their
 			// `finalizeSubagentLifecycle` calls `onRelease` before this function's
 			// post-run capture, so the handle must survive until the `finally`
-			// below cleans it up. Only kept-alive runs hand full capture+cleanup
-			// (`releaseIsolation`) to the agent lifecycle.
-			onRelease: opts.baseOptions.keepAlive === false ? releaseBase : releaseIsolation,
+			// below cleans it up. Only kept-alive runs hand full capture+cleanup to
+			// the agent lifecycle, which may also ask for it before that capture:
+			// `isolationRelease` then holds it until the `finally`.
+			onRelease: opts.baseOptions.keepAlive === false ? releaseBase : isolationRelease.onRelease,
 			deferIrcWakeRelease: release => {
 				releaseIrcWakes = release;
 			},
@@ -626,6 +655,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 				try {
 					const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
+					handedOff = capture.fingerprint;
 					return rememberAgentArtifacts({
 						...result,
 						...capture.artifacts,
@@ -703,10 +733,20 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	} catch (err) {
 		return rememberAgentArtifacts(opts.buildFailureResult(err));
 	} finally {
-		if (
+		// The run-end capture is done with the worktree. A release asked for
+		// before now captures and cleans up from here, and owns the cleanup; the
+		// caller gets the result once that is over.
+		const released = isolationRelease.end();
+		if (released) {
+			await released.catch(error => {
+				logger.warn("Isolated task release failed", {
+					agentId: opts.agentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		} else if (
 			workspace &&
 			!retainWorkspace &&
-			!releasePromise &&
 			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
 		) {
 			if (deferredCleanup) {
