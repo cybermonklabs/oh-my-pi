@@ -19,6 +19,10 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	TOOL_RESULT_PRUNE_CUSTOM_TYPE,
+	toToolResultPruneData,
+} from "@oh-my-pi/pi-coding-agent/session/tool-result-prunes";
 import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 interface DetachableWriter extends SessionStorageWriter {
@@ -414,6 +418,60 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		expect(userTurnsOf(reopened.getEntries())).toContain("durable second-writer turn");
 		expect(userTurnsOf(reopened.getBranch())).toEqual(["our turn before the conflict", ...ourTurnsAfter]);
 		await reopened.close();
+	});
+
+	// Another writer of the file (an older omp, a second process) appends the record of its own
+	// prune pass. If this regresses, the live session keeps a tool result in full that a reload of
+	// the same file shows pruned: it sends the stale result to the model, and `/dump anon` exports it.
+	it("blanks a tool result that another writer's prune record names, as a reload of the file does", async () => {
+		using tempDir = TempDir.createSync("@omp-session-rewrite-prune-");
+		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
+		await creator.ensureOnDisk();
+		const contested = creator.getSessionFile();
+		if (!contested) throw new Error("Expected session file");
+		creator.appendMessage(userTurn("list the files"));
+		const resultId = creator.appendMessage({
+			role: "toolResult",
+			toolCallId: "call_ls",
+			toolName: "bash",
+			content: [{ type: "text", text: "a.ts\nb.ts\nc.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		await creator.close();
+
+		const ours = await SessionManager.open(contested, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		const theirs = await SessionManager.open(contested, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		const notice = "[pruned: superseded listing]";
+		theirs.appendCustomEntry(
+			TOOL_RESULT_PRUNE_CUSTOM_TYPE,
+			toToolResultPruneData([{ entryId: resultId, notice, prunedAt: 5 }]),
+		);
+		await theirs.close();
+		const resultOf = (manager: SessionManager) => {
+			const entry = manager.getEntry(resultId);
+			return entry?.type === "message" && entry.message.role === "toolResult"
+				? { content: entry.message.content, prunedAt: entry.message.prunedAt }
+				: undefined;
+		};
+
+		// The rewrite meets the record past what this manager wrote and keeps it.
+		await ours.rewriteEntries();
+		const live = resultOf(ours);
+		await ours.close();
+		const reloaded = await SessionManager.open(contested, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		try {
+			const pruned = { content: [{ type: "text" as const, text: notice }], prunedAt: 5 };
+			expect({ live, reloaded: resultOf(reloaded) }).toEqual({ live: pruned, reloaded: pruned });
+		} finally {
+			await reloaded.close();
+		}
 	});
 
 	/** Runs `race` just before each atomic publish to `raced`, as a writer without the lease appending inside every window. */

@@ -230,6 +230,82 @@ describe("omp anonymize output", () => {
 		}
 	});
 
+	// A continuation marks the failed turn it continued from (`continued`) with an appended
+	// `entry_patch` record. If this regresses, the export writes the marker under a tokenized key,
+	// and a reopened export rebuilds a model context other than the source session's: it leaves
+	// out the failed turn the continuation picked up from.
+	it("keeps the continued marker that the session recorded on a failed turn as an appended record", async () => {
+		const assistant: Omit<AssistantMessage, "content" | "stopReason"> = {
+			role: "assistant",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			timestamp: 1,
+			usage: {
+				input: 120,
+				output: 30,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 150,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+		const writer = SessionManager.create(
+			tempDir.path(),
+			path.join(tempDir.path(), "sessions"),
+			new FileSessionStorage(),
+		);
+		let source: string | undefined;
+		try {
+			writer.appendMessage({ role: "user", content: "Update the invoice parser", timestamp: 1 });
+			const failedId = writer.appendMessage({
+				...assistant,
+				stopReason: "error",
+				errorMessage: "429 rate limit exceeded",
+				content: [{ type: "text", text: "partial answer" }],
+			});
+			writer.appendMessage({
+				...assistant,
+				stopReason: "stop",
+				content: [{ type: "text", text: " and the rest." }],
+			});
+			await writer.flush();
+			// What a continuation appends once it succeeded.
+			await writer.patchEntries([{ entryId: failedId, message: { continued: true } }]);
+			await writer.flush();
+			source = writer.getSessionFile();
+		} finally {
+			await writer.close();
+		}
+		if (!source) throw new Error("Expected a persisted session file");
+		const out = path.join(tempDir.path(), "out");
+		await runAnonymizeCommand({ session: source, out });
+
+		const original = await SessionManager.open(source, tempDir.path(), undefined, { suppressBreadcrumb: true });
+		let originalContext: ContextShape;
+		try {
+			originalContext = contextShape(original);
+		} finally {
+			await original.close();
+		}
+		const exported = await SessionManager.open(path.join(out, "session.jsonl"), tempDir.path(), undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		try {
+			const failed = exported
+				.getEntries()
+				.flatMap(entry => (entry.type === "message" ? [entry.message] : []))
+				.find(message => message.role === "assistant" && message.stopReason === "error");
+			expect({
+				continued: failed?.role === "assistant" ? failed.continued : undefined,
+				exportedContext: contextShape(exported),
+			}).toEqual({ continued: true, exportedContext: originalContext });
+		} finally {
+			await exported.close();
+		}
+	});
+
 	it("refuses an --out directory that would overwrite or bundle the source session", async () => {
 		const source = path.join(tempDir.path(), "session.jsonl");
 		await Bun.write(source, SESSION);

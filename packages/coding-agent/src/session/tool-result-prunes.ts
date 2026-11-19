@@ -9,7 +9,9 @@
  * `SessionManager` resume and `forkFrom`, `loadSessionMessagesReadOnly`
  * (`history://` for parked agents), and the HTML sub-session export. Where the
  * reader migrates and resolves blobs, it applies the records after migration
- * and before blob resolution, so a pruned result's blobs are never read.
+ * and before blob resolution, so a pruned result's blobs are never read. A
+ * `SessionManager` that keeps the entries another writer appended to its file
+ * applies the records among them to the entries it holds.
  *
  * Byte-offset tail readers (the Agent Hub transcript viewer, the collab agent
  * drawer, RPC subagent streaming) parse each line once as it lands and cannot
@@ -20,6 +22,7 @@
  */
 import { blankToolResult, type ToolResultPrune } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { EntryPatchTargets } from "./entry-patches";
 import type { FileEntry, SessionEntry } from "./session-entries";
 
 export const TOOL_RESULT_PRUNE_CUSTOM_TYPE = "tool_result_prune";
@@ -74,29 +77,35 @@ function isToolResultPruneData(value: unknown): value is ToolResultPruneData {
 /**
  * Blank, in place, every tool result a `tool_result_prune` record in
  * `entries` names, so freshly loaded entries rebuild to the context the live
- * session had after its prune passes. Order-independent: a record may precede
- * its target. A malformed record, or a result whose target is missing or not a
- * tool result, is skipped with a warning.
+ * session had after its prune passes. `targets` finds the result a record
+ * names; by default it is one of `entries`. Order-independent: a record may
+ * precede its target. A malformed record, or a result whose target is missing
+ * or not a tool result, is skipped with a warning. Returns whether any result
+ * was blanked.
  */
-export function applyToolResultPrunes(entries: readonly FileEntry[]): void {
-	let byId: Map<string, SessionEntry> | undefined;
+export function applyToolResultPrunes(entries: readonly FileEntry[], targets?: EntryPatchTargets): boolean {
+	let lookup = targets;
+	let blanked = false;
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== TOOL_RESULT_PRUNE_CUSTOM_TYPE) continue;
 		if (!isToolResultPruneData(entry.data)) {
 			logger.warn("Skipping malformed tool-result prune record", { id: entry.id });
 			continue;
 		}
-		if (!byId) {
-			byId = new Map();
+		if (!lookup) {
+			const byId = new Map<string, SessionEntry>();
 			for (const candidate of entries) if (candidate.type !== "session") byId.set(candidate.id, candidate);
+			lookup = byId;
 		}
 		for (const result of entry.data.results) {
-			const target = byId.get(result.entryId);
+			const target = lookup.get(result.entryId);
 			if (target?.type !== "message" || target.message.role !== "toolResult") {
 				logger.warn("Tool-result prune record targets no tool result", { id: entry.id, target: result.entryId });
 				continue;
 			}
 			blankToolResult(target.message, result.notice, result.prunedAt);
+			blanked = true;
 		}
 	}
+	return blanked;
 }

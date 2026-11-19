@@ -1234,9 +1234,10 @@ export class SessionManager {
 	 * Keep the entries another writer added to `#sessionFile`, whose bytes now
 	 * measure `diskSize`. They join this session's tree as a side branch (their
 	 * parents are entries both writers loaded), the active leaf stays this
-	 * session's, and the retried rewrite republishes them with the rest. An
-	 * `entry_patch` record among them sets its fields on the entries it names,
-	 * as a load does: the rewrite writes those fields inline and the record empty.
+	 * session's, and the retried rewrite republishes them with the rest. A
+	 * `tool_result_prune` record among them blanks the tool results it names, and
+	 * an `entry_patch` record sets its fields on the entries it names, as a load
+	 * does: the rewrite writes those effects inline and the patch record empty.
 	 */
 	#adoptForeignEntries(foreign: readonly SessionEntry[], diskSize: number): void {
 		const leaf = this.#index.leafId();
@@ -1250,7 +1251,9 @@ export class SessionManager {
 		}
 		this.#index.setLeaf(leaf);
 		this.#expectedDiskSize = diskSize;
-		if (applyEntryPatches(adopted, this.#index)) this.#bodyRevision++;
+		const pruned = applyToolResultPrunes(adopted, this.#index);
+		const patched = applyEntryPatches(adopted, this.#index);
+		if (pruned || patched) this.#bodyRevision++;
 		if (adopted.length > 0)
 			logger.warn("Kept session entries another writer added", {
 				sessionFile: this.#sessionFile,
