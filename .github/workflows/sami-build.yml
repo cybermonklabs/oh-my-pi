@@ -91,10 +91,16 @@ jobs:
           RELEASE_TARGETS: ${{ matrix.target }}
         run: bun run ci:release:build-binaries
       - name: Smoke test binary
+        # `--version` prints the version without loading the native addon, so
+        # only `--smoke-test` shows that the binary starts with its addon. It
+        # needs no network and no login.
         run: |
           runtime_dir="$(mktemp -d)"
-          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" \
-            ./packages/coding-agent/binaries/omp-${{ matrix.target }} --version
+          bin="./packages/coding-agent/binaries/omp-${{ matrix.target }}"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" "$bin" --version
+          out="$(HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/data" "$bin" --smoke-test)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -qxF 'smoke-test: ok'
       - name: Package mise asset
         env:
           TAG: ${{ needs.version.outputs.tag }}
