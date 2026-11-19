@@ -1178,11 +1178,10 @@ describe("session blobs in the SQL session storage", () => {
 		storage.blobTier.store(sha256(large), large, "image/png");
 		storage.blobTier.store(sha256(small), small, "image/png");
 		await storage.drain();
-		// The bound is the packet less 1 MiB: the large image's own row, then its two parts in hash order (a
-		// delete takes them in that order too), then the small one.
+		// The bound is the packet less 1 MiB: the large image's own row and its two parts, in one pass in hash
+		// order (a delete locks them in that order too), then the small one.
 		expect(inserted).toEqual([
-			sha256(large),
-			...[sha256(large.subarray(0, MIB)), sha256(large.subarray(MIB))].sort(),
+			...[sha256(large), sha256(large.subarray(0, MIB)), sha256(large.subarray(MIB))].sort(),
 			sha256(small),
 		]);
 	});
