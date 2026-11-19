@@ -457,7 +457,8 @@ pub fn func_changing(
 
 /// Ask the host to give the root shell's `sig` the OS disposition its trap
 /// `action` makes (`None`: the trap removed;
-/// [`trap_disposition`](crate::bash::vm::jobctl::trap_disposition)).
+/// [`trap_disposition`](crate::bash::vm::jobctl::trap_disposition); bash
+/// ignores `QUIT` "in all cases", so a removed trap leaves it ignored).
 /// `None` when the shell asks nothing: in a subshell, whose traps change no
 /// disposition of the process, and for `KILL`, `STOP` and `CHLD` (which
 /// comes from the engine, one per reaped child, not from the OS). Else the
@@ -473,6 +474,12 @@ fn os_disposition(
 	if vp.overlay.is_some() || matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld) {
 		return None;
 	}
+	let action = match action {
+		None if sig == Signal::Quit && vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+			Some(BStr::new(b""))
+		},
+		action => action,
+	};
 	let disposition = crate::bash::vm::jobctl::trap_disposition(k, sig, action);
 	Some(cx.host.set_signal_trap(sig, disposition))
 }

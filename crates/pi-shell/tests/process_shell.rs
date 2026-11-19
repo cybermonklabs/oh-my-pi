@@ -261,27 +261,92 @@ fn an_untrapped_signal_kills_the_shell_process() {
 	}
 }
 
-/// `args` run as `zsh` by `program` with `SIGUSR1` and `SIGHUP` ignored
-/// and the core size limit 0 on entry: stdout, stderr, the exit status,
-/// and the signal the process died of.
-fn run_ignoring(
+/// `args` run as `name` by `program` with `SIGQUIT` at its default, the
+/// signals `ignored` ignored and the core size limit 0 on entry (the test
+/// runner's own dispositions, which a terminal or a CI runner set, do not
+/// reach the shell): stdout, stderr, the exit status, and the signal the
+/// process died of.
+fn run_entry(
 	program: impl AsRef<OsStr>,
+	name: &str,
 	args: &[&str],
+	ignored: &'static [libc::c_int],
 ) -> (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>) {
 	let mut cmd = Command::new(program);
-	cmd.arg0("zsh").args(args).env_remove("ZDOTDIR");
+	cmd.arg0(name).args(args).env_remove("ZDOTDIR");
 	// SAFETY: signal and setrlimit are async-signal-safe and change only
 	// the child.
 	unsafe {
-		cmd.pre_exec(|| {
-			libc::signal(libc::SIGUSR1, libc::SIG_IGN);
-			libc::signal(libc::SIGHUP, libc::SIG_IGN);
+		cmd.pre_exec(move || {
+			libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+			for &sig in ignored {
+				libc::signal(sig, libc::SIG_IGN);
+			}
 			libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
 			Ok(())
 		});
 	}
 	let out = cmd.output().expect("start the shell");
 	(out.stdout, out.stderr, out.status.code(), out.status.signal())
+}
+
+/// [`run_entry`] as `zsh` with `SIGUSR1` and `SIGHUP` ignored on entry.
+fn run_ignoring(
+	program: impl AsRef<OsStr>,
+	args: &[&str],
+) -> (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>) {
+	run_entry(program, "zsh", args, &[libc::SIGUSR1, libc::SIGHUP])
+}
+
+/// bash (which ignores `QUIT` "in all cases") and a non-interactive zsh
+/// (`init_signals`) ignore `QUIT` in the shell's own process: one sent by
+/// another process (`/bin/kill`) or by the shell itself does nothing, and
+/// the commands the shell runs get it at its default (the `sh` below dies
+/// of it). A zsh trap removed for it gives it its default
+/// (`removetrap`); bash keeps ignoring it.
+#[test]
+fn the_shell_ignores_quit_and_its_commands_get_it_at_its_default() {
+	let cases: [(&str, &str, &[u8], Option<i32>, Option<i32>); 3] = [
+		(
+			"zsh",
+			"/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
+			 child-alive'; print st=$?",
+			b"alive\nst=131\n",
+			Some(0),
+			None,
+		),
+		("zsh", "trap - QUIT; /bin/kill -QUIT $$; print not-reached", b"", None, Some(libc::SIGQUIT)),
+		(
+			"bash",
+			"/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
+			 child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
+			b"alive\nst=131\nafter-reset\n",
+			Some(0),
+			None,
+		),
+	];
+	for (name, script, out, code, signal) in cases {
+		let args = if name == "zsh" {
+			vec!["-f", "-c", script]
+		} else {
+			vec!["-c", script]
+		};
+		let ours = run_entry(env!("CARGO_BIN_EXE_obash"), name, &args, &[]);
+		// bash also prints a notice of the `sh` that died of `QUIT` (on
+		// stderr), which obash does not: stdout and the status are compared.
+		assert_eq!((ours.0.as_slice(), ours.2, ours.3), (out, code, signal), "{name}: {script}");
+		let real = if name == "zsh" {
+			have_zsh().then(zsh_oracle::path)
+		} else {
+			Some(std::path::PathBuf::from("/bin/bash")).filter(|p| p.is_file())
+		};
+		if let Some(real) = real {
+			let theirs = run_entry(&real, name, &args, &[]);
+			assert_eq!((ours.0, ours.2, ours.3), (theirs.0, theirs.2, theirs.3), "{name}: {script}");
+		} else {
+			zsh_oracle::uncompared(&format!("no {name} to compare the QUIT case with"));
+		}
+	}
 }
 
 /// A non-interactive zsh ignores `QUIT` (`init_signals`) and leaves the
@@ -365,9 +430,10 @@ fn a_parent_shell_reports_its_child_shells_signal_death() {
 	}
 }
 
-/// `args` run as `zsh` by `program` in `dir`, with the core size limit
-/// raised to its hard limit: stdout, stderr, the signal the process died
-/// of, and whether it dumped a core.
+/// `args` run as `zsh` by `program` in `dir`, with `SIGQUIT` at its default
+/// (whatever the test runner's is) and the core size limit raised to its
+/// hard limit: stdout, stderr, the signal the process died of, and whether
+/// it dumped a core.
 fn run_dumping(
 	program: impl AsRef<OsStr>,
 	args: &[&str],
@@ -378,10 +444,11 @@ fn run_dumping(
 		.args(args)
 		.env_remove("ZDOTDIR")
 		.current_dir(dir);
-	// SAFETY: getrlimit and setrlimit are async-signal-safe and change only
-	// the child.
+	// SAFETY: signal, getrlimit and setrlimit are async-signal-safe and
+	// change only the child.
 	unsafe {
 		cmd.pre_exec(|| {
+			libc::signal(libc::SIGQUIT, libc::SIG_DFL);
 			let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 			if libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) == 0 {
 				limit.rlim_cur = limit.rlim_max;

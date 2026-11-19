@@ -1710,6 +1710,16 @@ impl Shell {
 				Some(Record::Trap { mode: init.mode, action: BString::default() }),
 			);
 		}
+		// zsh `init_signals` and bash (which ignores `QUIT` "in all cases")
+		// ignore `QUIT` in the shell's own process; an interactive shell's
+		// handlers come with `jobctl::init_io`. Commands get it at its
+		// default. A zsh trap set or removed for it gives it its own
+		// disposition; bash keeps it ignored ([`builtins::trap`]).
+		if !init.interactive {
+			let _ = cx
+				.host
+				.set_signal_trap(crate::bash::Signal::Quit, Some(BStr::new(b"")));
+		}
 		let vpid = k.vpid(cx.store);
 		if let Some(err) = k.root.take_fault() {
 			return Err(ShellError::Store(err));
@@ -2549,6 +2559,14 @@ impl Shell {
 					interrupt_wait(process, sig.exit_status(platform));
 					continue;
 				}
+			}
+			// bash ignores `QUIT` in the shell itself "in all cases"; its
+			// subshells get it at its default.
+			if sig == Signal::Quit
+				&& self.procs[i].parent.is_none()
+				&& self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Bash
+			{
+				continue;
 			}
 			match sig.default_action() {
 				DefaultAction::Terminate => {
