@@ -255,8 +255,10 @@ interface DialectQueries {
 	deleteDanglingRef: Statement;
 	/** MySQL: lock shared, in path order, the session rows of `count` paths, or their gaps where there is none; answers the rows there are. */
 	lockSessionRows: ((count: number) => Statement) | undefined;
-	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too (a gap where a path has no row, on MySQL). */
+	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too (MySQL's caller names, without `under`, only rows there are). */
 	lockSessionRowsForWrite: ((count: number, under: boolean) => Statement) | undefined;
+	/** MySQL: the paths of `count` paths that have a session row, read without a lock. */
+	sessionRowsOf: ((count: number) => Statement) | undefined;
 	/** MySQL and SQLite: the columns of a table's primary key, in key order (PostgreSQL: {@link PG_PRIMARY_KEY}). */
 	primaryKey: Statement | undefined;
 	/** MySQL: statements that change no row and need, each, one privilege the store's writes need on the blob and reference tables. */
@@ -458,6 +460,11 @@ interface BlobDigestRow {
 /** A row with only a hash column. */
 interface HashRow {
 	sha256: string;
+}
+
+/** A row with only a path column. */
+interface PathRow {
+	path: string;
 }
 
 /** A reference row. */
@@ -1330,6 +1337,9 @@ function buildQueries(
 								(under ? " OR substr(path, 1, @len) = @dir" : "") +
 								" ORDER BY path FOR UPDATE",
 						),
+		sessionRowsOf: mysql
+			? count => sql(`SELECT path FROM ${table} WHERE path IN (${inList("p", count)})`)
+			: undefined,
 		primaryKey: {
 			postgres: undefined,
 			mysql: sql(
@@ -3875,9 +3885,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
-			await this.#lockSessionRowsForWrite(transaction, paths, under);
+			const present = await this.#lockSessionRowsForWrite(transaction, paths, under);
 			const ordered = [...new Set(paths)].sort();
-			for (const path of ordered) await run(transaction, this.#q.deleteRow, { path });
+			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
+			for (const path of ordered) {
+				if (!present || present.has(path)) await run(transaction, this.#q.deleteRow, { path });
+			}
 			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
 			for (const path of ordered) await this.#deleteParts(transaction, path);
 			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
@@ -3894,9 +3907,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([src, dst]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
-			// Both session rows first, in path order, before either changes.
-			await this.#lockSessionRowsForWrite(transaction, [src, dst]);
-			if (!noReplace) await run(transaction, this.#q.deleteRow, { path: dst });
+			// Both session rows first, in path order, before either changes; only rows there are change.
+			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst]);
+			if (present && !present.has(src)) throw enoent(src);
+			if (!noReplace && (!present || present.has(dst))) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
 			// row that exists, or that another client inserts concurrently (the
 			// UPDATE waits on its uncommitted key); the thrown error rolls the
@@ -3913,12 +3927,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// Both rows are locked now, before the parts look (see #deleteParts):
 			// parts orphaned under `dst` go, then `src`'s follow its row.
 			await this.#deleteParts(transaction, dst);
-			await run(transaction, this.#q.renameParts, { src, dst });
+			// On MySQL only when `src` has parts, as #deleteParts: an update that finds no row still locks a gap.
+			if (this.#adapter !== "mysql" || (await run(transaction, this.#q.hasParts, { path: src })).length > 0) {
+				await run(transaction, this.#q.renameParts, { src, dst });
+			}
 			// The references change last, the rows of every blob they name locked first: the replaced session's
 			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared).
 			const moving = (await this.#refsOf(transaction, [src])).map(row => row.sha256);
 			const replaced = await this.#takeRefs(transaction, [dst], undefined, moving);
-			await run(transaction, this.#q.moveRefs, { src, dst });
+			if (moving.length > 0) await run(transaction, this.#q.moveRefs, { src, dst });
 			await this.#deleteOrphans(transaction, replaced);
 		});
 		this.#moveLease(src, dst);
@@ -3970,23 +3987,41 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Lock exclusive, in path order, the session rows of `paths` and, with
 	 * `under`, every row under its directory, before a delete or a rename
 	 * changes any of them: the store's lock order (see {@link #lockBlobRows}).
-	 * On MySQL and MariaDB a path with no row has its gap locked. With
-	 * `under`, MySQL can use no index (`substr`), so it locks every row it
-	 * scans, in path order, as the directory's `DELETE` does anyway. SQLite
-	 * runs one writer at a time.
+	 * On MySQL and MariaDB, without `under`, only rows there are are locked,
+	 * read first without a lock, as {@link #lockBlobRows} does for blob rows:
+	 * a locking read of a missing path locks its gap, and an insert into that
+	 * gap at another path (a rename's destination, a new session) would wait
+	 * for it. Then it answers the paths whose rows it locked, and the caller
+	 * changes only those. With `under` MySQL can use no index (`substr`), so
+	 * the lock scans and locks every row, gaps too, in path order, as the
+	 * directory's `DELETE` that follows does anyway. PostgreSQL locks no gap.
+	 * Elsewhere nothing is answered; SQLite runs one writer at a time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
 		under?: { dir: string; len: number },
-	): Promise<void> {
-		const query = this.#q.lockSessionRowsForWrite;
-		if (!query) return;
+	): Promise<ReadonlySet<string> | undefined> {
+		const lock = this.#q.lockSessionRowsForWrite;
+		if (!lock) return undefined;
 		const ordered = [...new Set(paths)].sort();
-		await run(transaction, query(ordered.length, under !== undefined), {
-			...listValues("p", ordered),
-			...(under ?? {}),
-		});
+		const look = this.#q.sessionRowsOf;
+		if (!look || under) {
+			await run(transaction, lock(ordered.length, under !== undefined), {
+				...listValues("p", ordered),
+				...(under ?? {}),
+			});
+			return undefined;
+		}
+		const there = ((await run(transaction, look(ordered.length), listValues("p", ordered))) as PathRow[])
+			.map(row => row.path)
+			.sort();
+		const present = new Set<string>();
+		for (const batch of batches(there, BLOB_READ_BATCH)) {
+			const rows = (await run(transaction, lock(batch.length, false), listValues("p", batch))) as PathRow[];
+			for (const row of rows) present.add(row.path);
+		}
+		return present;
 	}
 
 	/** The references of `paths`, read without a lock. */

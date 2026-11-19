@@ -1,8 +1,8 @@
 /**
  * A deadlock soak for the blob and reference tables, outside the default
  * suite: it runs only when `OMP_TEST_SQL_SOAK_MS` is set, for that many
- * milliseconds on each row backend whose URL is set (PostgreSQL, MySQL or
- * MariaDB). `OMP_TEST_SQL_SOAK_WORKERS` workers (8 by default), each a store
+ * milliseconds on SQLite and on each row backend whose URL is set
+ * (PostgreSQL, MySQL or MariaDB). `OMP_TEST_SQL_SOAK_WORKERS` workers (8 by default), each a store
  * of its own, run random appends, full writes, deletes, replacing renames,
  * sweeps, and deletes of session rows that leave references dangling (as a
  * build that keeps no references does), and the first worker also inserts
@@ -24,7 +24,7 @@
 import { describe, expect, it } from "bun:test";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { openLeaseDb, ROW_LEASE_BACKENDS, transcript } from "./sql-session-lease-fixture";
+import { LEASE_BACKENDS, openLeaseDb, transcript } from "./sql-session-lease-fixture";
 
 const SOAK_MS = Number(process.env.OMP_TEST_SQL_SOAK_MS ?? 0);
 const WORKERS = Number(process.env.OMP_TEST_SQL_SOAK_WORKERS ?? 8);
@@ -48,7 +48,7 @@ interface TierInternals {
 }
 
 describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
-	for (const { adapter, url } of ROW_LEASE_BACKENDS) {
+	for (const { adapter, url } of LEASE_BACKENDS) {
 		it.skipIf(!url)(
 			`runs ${WORKERS} workers for ${SOAK_MS} ms on ${adapter} with no deadlock`,
 			async () => {
