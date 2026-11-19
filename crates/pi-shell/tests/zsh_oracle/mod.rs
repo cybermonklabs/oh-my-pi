@@ -16,7 +16,7 @@
 
 use std::{
 	collections::HashSet,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::Command,
 	sync::{Mutex, PoisonError},
 };
@@ -53,6 +53,31 @@ pub fn is_zsh_5_9() -> bool {
 		.is_some_and(|out| out.stdout.starts_with(b"zsh 5.9 "));
 	if !found {
 		uncompared(&format!("{} is not zsh 5.9", zsh.display()));
+	}
+	found
+}
+
+/// The file of the function `name` in the real zsh's own `$fpath` (`zsh
+/// -f`), the first directory that has one, wherever this machine installed
+/// zsh's functions. `None`, the calling test reported [`uncompared`], when
+/// the real zsh is missing or its `$fpath` has no such file.
+#[must_use]
+pub fn function_file(name: &str) -> Option<PathBuf> {
+	if !exists() {
+		return None;
+	}
+	let zsh = path();
+	let listed = Command::new(&zsh)
+		.args(["-f", "-c", "print -rl -- $fpath"])
+		.output()
+		.map(|out| out.stdout)
+		.unwrap_or_default();
+	let found = String::from_utf8_lossy(&listed)
+		.lines()
+		.map(|dir| Path::new(dir).join(name))
+		.find(|file| file.is_file());
+	if found.is_none() {
+		uncompared(&format!("the $fpath of {} has no file {name}", zsh.display()));
 	}
 	found
 }

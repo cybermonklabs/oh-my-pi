@@ -19,18 +19,21 @@ use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_
 const KEY: Duration = Duration::from_millis(60);
 
 /// `zsh -f -i` with `PS1`/`RPS1` and the rc file `rc` (sourced with `.`
-/// as the first command, since `-f` skips `.zshrc`).
+/// as the first command, since `-f` skips `.zshrc`), in its own home
+/// directory: the prompt (`%~`) reads `~` wherever the tests run.
 fn spawn(real: bool, rc: &str) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
 	} else {
 		Spawn::zsh()
 	};
+	let home = s.home().to_owned();
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
 		.rc_file(".zshrc", format!("{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
 		.zle_sync()
+		.cwd(home)
 		.size(24, 80)
 }
 

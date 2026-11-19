@@ -22,12 +22,14 @@ use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
 
-/// The history file every case starts with (oldest first).
-const HIST: &str = "echo café crème\necho one\necho two\nls -l /tmp\necho three\nprint -r -- Two \
+/// The history file every case starts with (oldest first). Its `ls` line
+/// lists only `/`, which every machine has.
+const HIST: &str = "echo café crème\necho one\necho two\nls -d /\necho three\nprint -r -- Two \
                     Words\necho two\ngit status\n";
 
 /// `zsh -f -i` with the history file, `PS1`/`RPS1` and the rc file `rc`
-/// (sourced with `.` as the first command, since `-f` skips `.zshrc`).
+/// (sourced with `.` as the first command, since `-f` skips `.zshrc`), in
+/// its own home directory.
 fn spawn(real: bool, rc: &str) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
@@ -39,13 +41,14 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		"HISTSIZE=100\nfc -R ~/hist\nq() {{ BUFFER='cat ~/log'; zle .accept-line }}\nzle -N \
 		 q\nbindkey -M emacs '^Xq' q\nbindkey -M viins '^Xq' q\nbindkey -M vicmd '^Xq' q\n{rc}"
 	);
+	let home = s.home().to_owned();
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
 		.rc_file("hist", HIST)
 		.rc_file(".zshrc", format!("{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
 		.zle_sync()
-		.cwd("/tmp")
+		.cwd(home)
 		.size(24, 80)
 }
 
@@ -167,15 +170,20 @@ fn history_beginning_search_with_histfindnodups() {
 	same_log(&rc, "echo t\x14\x18p\x14\x18p\x14\x18p");
 }
 
+/// The widgets come from each shell's own `$fpath` (zsh's compiled-in one,
+/// obash's from the installed zsh), so the case runs them rather than
+/// their absence.
 #[test]
 fn history_beginning_search_end_functions() {
 	let rc = format!(
-		"{SHOW}fpath=(/usr/share/zsh/5.9/functions)\nautoload -Uz history-search-end\nzle -N \
-		 history-beginning-search-backward-end history-search-end\nzle -N \
-		 history-beginning-search-forward-end history-search-end\nbindkey '^T' \
-		 history-beginning-search-backward-end\nbindkey '^Y' history-beginning-search-forward-end\n"
+		"{SHOW}autoload -Uz history-search-end\nzle -N history-beginning-search-backward-end \
+		 history-search-end\nzle -N history-beginning-search-forward-end \
+		 history-search-end\nbindkey '^T' history-beginning-search-backward-end\nbindkey '^Y' \
+		 history-beginning-search-forward-end\n"
 	);
-	same_log(&rc, "echo t\x14\x18p\x14\x18p\x19\x18p");
+	if let Some(real) = same_log(&rc, "echo t\x14\x18p\x14\x18p\x19\x18p") {
+		assert!(!real.contains("function definition file not found"), "{real}");
+	}
 }
 
 #[test]
@@ -354,7 +362,7 @@ fn insert_last_word_from_the_line_itself() {
 #[test]
 fn infer_next_history_and_accept_and_infer() {
 	let rc = format!("{SHOW}bindkey '^T' accept-and-infer-next-history\n");
-	same(&rc, "ls -l /tmp\x18\x0e\x18p\x15ls -l /tmp\x14");
+	same(&rc, "ls -d /\x18\x0e\x18p\x15ls -d /\x14");
 }
 
 #[test]
