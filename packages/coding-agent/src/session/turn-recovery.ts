@@ -427,6 +427,44 @@ type PendingRetryError = {
 	note: string;
 };
 
+/** The session entry of a failed assistant turn on the current branch, and its message. */
+type RecoveryTarget = {
+	entryId: string;
+	/** The entry's message, which a stamp changes in place. */
+	message: AssistantMessage;
+};
+
+/**
+ * What a recovery writes on the session entry of a failed assistant turn: a
+ * closing retry saga's `retryRecovery`, and `continued` on a turn kept in
+ * context that a later turn has continued from (`AssistantMessage.continued`).
+ */
+type RecoveryStamp = RecoveryTarget & {
+	retryRecovery?: AssistantRetryRecovery;
+	continued?: true;
+};
+
+/**
+ * The assistant entry of `branch` that `entryId` names, else the newest one
+ * whose message has `persistenceKey`.
+ */
+function branchAssistantEntry(
+	branch: readonly SessionEntry[],
+	entryId: string | undefined,
+	persistenceKey: string,
+): RecoveryTarget | undefined {
+	let byKey: RecoveryTarget | undefined;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index]!;
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		if (entry.id === entryId) return { entryId: entry.id, message: entry.message };
+		if (byKey || sessionMessagePersistenceKey(entry.message) !== persistenceKey) continue;
+		byKey = { entryId: entry.id, message: entry.message };
+		if (entryId === undefined) break;
+	}
+	return byKey;
+}
+
 /** How a retry saga's pending error entries are annotated when it closes. */
 type RetryErrorCompletion = { status: "recovered"; supersedingMessage: AssistantMessage } | { status: "superseded" };
 
@@ -442,8 +480,10 @@ type RetryPolicyOptions = {
 	/**
 	 * A rate limit after visible text ({@link TurnRecovery.isCommittedTextRateLimit}):
 	 * keep the failed turn, wait as for any rate limit, then continue the answer
-	 * with the rate-limit reminder instead of sending the turn again. Neither this
-	 * attempt nor any later one of its retry saga walks `retry.fallbackChains`.
+	 * instead of sending the turn again: a text-only turn with the rate-limit
+	 * reminder, a turn with tool calls from their synthetic results, as a stream
+	 * stall continues it. While the saga's attempts keep failing on a rate limit,
+	 * none of them walks `retry.fallbackChains`.
 	 */
 	continueCommittedText?: boolean;
 };
@@ -470,10 +510,12 @@ export class TurnRecovery {
 	#retryAttempt = 0;
 	/**
 	 * The retry saga continues an answer a rate limit cut off after its text
-	 * rendered ({@link RetryPolicyOptions.continueCommittedText}), so every
-	 * attempt of it stays on this model: a continuation refused before it
-	 * streams anything (an HTTP 429 at request time) fails as a plain retryable
-	 * error, and must not walk `retry.fallbackChains` with the cut-off answer.
+	 * rendered ({@link RetryPolicyOptions.continueCommittedText}), so a rate
+	 * limit on any attempt of it stays on this model: a continuation refused
+	 * with an HTTP 429 at request time fails as a plain retryable error, and
+	 * must not walk `retry.fallbackChains` with the cut-off answer. Any other
+	 * refusal of a continuation (an overload, a server error, a usage limit)
+	 * walks the chain as it would after a stream stall.
 	 * Cleared in `resolveRetry()` and wherever `#retryAttempt` goes back to 0.
 	 */
 	#continuingCommittedText = false;
@@ -496,6 +538,14 @@ export class TurnRecovery {
 	};
 	#usageReserveApproval: { model: string; sessionId: string } | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
+	/**
+	 * Failed turns kept in context to be continued from: by a retry
+	 * (`preserveFailedTurn`), or by a stream-stall or malformed-call
+	 * continuation outside any retry. The next successful settle marks
+	 * `continued` those the live context still holds and forgets the rest; a
+	 * new prompt forgets them all.
+	 */
+	#keptTurns: AssistantMessage[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
 	/**
 	 * Credential rows that failed with a usage limit in the current retry saga.
@@ -645,7 +695,7 @@ export class TurnRecovery {
 		}
 	}
 
-	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
+	/** Resets per-prompt recovery counters, terminal-stop acceptance, and the kept turns. */
 	resetForNewPrompt(): void {
 		this.#emptyStopRetryCount = 0;
 		this.#unexpectedStopRetryCount = 0;
@@ -655,6 +705,7 @@ export class TurnRecovery {
 		this.#acceptTerminalEmptyStopForPrompt = false;
 		this.#activeFallbackCreditRedemption = undefined;
 		this.#usageLimitFailedCredentialIds.clear();
+		this.#keptTurns = [];
 	}
 
 	/** Sets whether one terminal empty stop is accepted for the current prompt. */
@@ -679,8 +730,9 @@ export class TurnRecovery {
 	/**
 	 * Records which model produced this turn, re-arms the one-shot Responses
 	 * request-body-timeout recovery, marks an active fallback as having served,
-	 * then closes a successful retry saga and annotates recovered persisted
-	 * errors.
+	 * marks `continued` the kept turns this turn continued from, and closes a
+	 * successful retry saga, annotating recovered persisted errors in the same
+	 * write.
 	 */
 	async onAssistantSettledSuccessfully(message: AssistantMessage): Promise<void> {
 		if (!assistantTurnProducedOutput(message)) {
@@ -719,6 +771,7 @@ export class TurnRecovery {
 			});
 		}
 		if (this.#retryAttempt === 0) {
+			await this.#writeRecoveryStamps(await this.#continuedStamps());
 			return;
 		}
 		await this.#closeRetrySaga(
@@ -766,8 +819,10 @@ export class TurnRecovery {
 	 * rendered, so {@link isRetryableError} refuses to replay the turn and the
 	 * session stopped on a pinned error. Nothing ran and nothing needs
 	 * replaying: keep the failed turn in context so the model sees its own
-	 * output, append a corrective developer message, and resume. Bounded per
-	 * prompt; past the cap the error surfaces as before.
+	 * output, append a corrective developer message, and resume; once a
+	 * continuation succeeds, the turn is marked `continued` if the live context
+	 * still holds it, so a context rebuilt from the session keeps it too.
+	 * Bounded per prompt; past the cap the error surfaces as before.
 	 */
 	handleMalformedFunctionCallStop(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
@@ -808,6 +863,7 @@ export class TurnRecovery {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
+		this.#keepTurn(message);
 		this.#host.scheduleAgentContinue({
 			source: "malformed-function-call-retry",
 			generation: this.#host.promptGeneration(),
@@ -823,8 +879,11 @@ export class TurnRecovery {
 	 * with tool calls, so the session used to stop on a pinned error. Resuming
 	 * from the trailing assistant message would be a prefill, which newer Claude
 	 * models reject: keep the partial turn in context, append a developer
-	 * reminder to pick up where the text stopped, and continue. Honors
-	 * `retry.enabled`; bounded per prompt, past the cap the error surfaces as before.
+	 * reminder to pick up where the text stopped, and continue; once a
+	 * continuation succeeds, the turn is marked `continued` if the live context
+	 * still holds it, so a context rebuilt from the session keeps it too.
+	 * Honors `retry.enabled`; bounded per prompt, past the cap the error
+	 * surfaces as before.
 	 * A socket close counts here but not for tool turns: without tool calls there
 	 * is no executed side effect whose resumption policy it could change. So does a
 	 * Codex native-lane steer rejection: the server dropped the response over our
@@ -866,6 +925,7 @@ export class TurnRecovery {
 			this.#streamStallContinueCount,
 			STREAM_STALL_CONTINUE_MAX_RETRIES,
 		);
+		this.#keepTurn(message);
 		this.#host.scheduleAgentContinue({
 			source: "stream-stall-continue",
 			generation: this.#host.promptGeneration(),
@@ -874,15 +934,19 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * A rate limit that ended a text-only turn after its text rendered. The turn
-	 * cannot be sent again, since its text is shown, so
-	 * {@link handleRetryableError} with `continueCommittedText` waits the limit
-	 * out on this model and then continues the answer.
+	 * A rate limit that ended a turn after its text rendered: a text-only turn,
+	 * or one whose tool calls all have results: a real one for a call that ran,
+	 * a synthetic `executed: false` one the agent loop pairs with a call that
+	 * did not, so a continuation reissues only the calls that never ran and
+	 * repeats nothing. The turn cannot be sent again, since its text is shown,
+	 * so {@link handleRetryableError} with `continueCommittedText` waits the
+	 * limit out on this model and then continues the answer.
 	 */
 	isCommittedTextRateLimit(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !this.#isRateLimit(message)) return false;
 		if (!this.autoRetryEnabled || this.#host.abortInProgress() || this.#host.isDisposed()) return false;
-		return this.#host.textOutputCommitted() && isTextOnlyTurn(message);
+		if (!this.#host.textOutputCommitted()) return false;
+		return isTextOnlyTurn(message) || this.#toolCallsResolved(message);
 	}
 
 	/**
@@ -1149,25 +1213,18 @@ export class TurnRecovery {
 		});
 	}
 
+	/**
+	 * Annotates a closing saga's pending errors with `retryRecovery`. A
+	 * recovered saga closes on a successful turn, which also continued from the
+	 * kept turns: their `continued` stamps go in the same write.
+	 */
 	async #markPendingRetryErrors(completion: RetryErrorCompletion): Promise<RetryErrorUpdate[]> {
-		if (this.#pendingRetryErrors.length === 0) return [];
+		const stamps = completion.status === "recovered" ? await this.#continuedStamps() : [];
 		const branch = this.#host.sessionManager.getBranchView();
-		const branchById = new Map<string, SessionEntry>();
-		for (const entry of branch) {
-			branchById.set(entry.id, entry);
-		}
 		const retryErrors: RetryErrorUpdate[] = [];
 		for (const pending of this.#pendingRetryErrors) {
-			let entry = branchById.get(pending.entryId);
-			if (entry?.type !== "message" || entry.message.role !== "assistant") {
-				entry = branch.findLast(
-					candidate =>
-						candidate.type === "message" &&
-						candidate.message.role === "assistant" &&
-						sessionMessagePersistenceKey(candidate.message) === pending.persistenceKey,
-				);
-			}
-			if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
+			const target = branchAssistantEntry(branch, pending.entryId, pending.persistenceKey);
+			if (!target) continue;
 			let retryRecovery: AssistantRetryRecovery;
 			if (completion.status === "recovered") {
 				retryRecovery = {
@@ -1195,18 +1252,76 @@ export class TurnRecovery {
 					note: pending.note,
 				};
 			}
+			const stamp = stamps.find(candidate => candidate.entryId === target.entryId);
+			if (stamp) {
+				stamp.retryRecovery = retryRecovery;
+			} else {
+				stamps.push({ ...target, retryRecovery });
+			}
 			retryErrors.push({
-				entryId: entry.id,
+				entryId: target.entryId,
 				persistenceKey: pending.persistenceKey,
 				note: retryRecovery.note,
 				retryRecovery,
 			});
 		}
-		// Every marked attempt's `retryRecovery` persists in one appended `entry_patch` record.
-		await this.#host.sessionManager.patchEntries(
-			retryErrors.map(({ entryId, retryRecovery }) => ({ entryId, message: { retryRecovery } })),
-		);
+		await this.#writeRecoveryStamps(stamps);
 		return retryErrors;
+	}
+
+	/** Remembers `message`, a failed turn kept in context, until a successful turn continues from it. */
+	#keepTurn(message: AssistantMessage): void {
+		if (!this.#keptTurns.includes(message)) this.#keptTurns.push(message);
+	}
+
+	/**
+	 * The `continued` stamps for the kept turns a successful turn continued
+	 * from: each one the live context still holds (matched by persistence key)
+	 * and the current branch records. Forgets every kept turn: one the live
+	 * context dropped (a compaction, a switch across a compaction boundary, a
+	 * prune) stays unmarked, as the context rebuilt from the session leaves it
+	 * out too.
+	 */
+	async #continuedStamps(): Promise<RecoveryStamp[]> {
+		if (this.#keptTurns.length === 0) return [];
+		const turns = this.#keptTurns;
+		this.#keptTurns = [];
+		const liveKeys = new Set<string>();
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role !== "assistant") continue;
+			const key = sessionMessagePersistenceKey(message);
+			if (key) liveKeys.add(key);
+		}
+		const held: { turn: AssistantMessage; persistenceKey: string }[] = [];
+		for (const turn of turns) {
+			const persistenceKey = sessionMessagePersistenceKey(turn);
+			if (persistenceKey === undefined || !liveKeys.has(persistenceKey)) continue;
+			await this.#host.waitForSessionMessagePersistence(turn);
+			held.push({ turn, persistenceKey });
+		}
+		const branch = this.#host.sessionManager.getBranchView();
+		const stamps: RecoveryStamp[] = [];
+		for (const { turn, persistenceKey } of held) {
+			const target = branchAssistantEntry(branch, this.#host.persistedAssistantEntryId(turn), persistenceKey);
+			if (target && !stamps.some(stamp => stamp.entryId === target.entryId)) {
+				stamps.push({ ...target, continued: true });
+			}
+		}
+		return stamps;
+	}
+
+	/**
+	 * Sets `stamps` on their entries' messages and persists them in one appended
+	 * `entry_patch` record (`SessionManager.patchEntries`), whose size follows the
+	 * stamps, not the transcript: the write of a closing retry saga's
+	 * `retryRecovery`, and of every `continued` mark, whichever continuation kept
+	 * the turn.
+	 */
+	async #writeRecoveryStamps(stamps: readonly RecoveryStamp[]): Promise<void> {
+		if (stamps.length === 0) return;
+		await this.#host.sessionManager.patchEntries(
+			stamps.map(({ entryId, retryRecovery, continued }) => ({ entryId, message: { retryRecovery, continued } })),
+		);
 	}
 
 	#isRecoverableProviderEmptyOutput(message: AssistantMessage): boolean {
@@ -1813,12 +1928,20 @@ export class TurnRecovery {
 		// race, so unmarked MCP/todo blocks can continue once every emitted
 		// call has a matching result. A reasonless abort ends the turn and
 		// the agent loop pairs leftover calls with `executed: false`.
-		const resolvedToolCallIds: string[] = [];
+		if (!this.#toolCallsResolved(message)) return undefined;
+		return reasonlessAbort ? "reasonless-abort" : "stream-stall";
+	}
+
+	/**
+	 * Whether `message` emitted tool calls and every one of them has a result
+	 * after it in context.
+	 */
+	#toolCallsResolved(message: AssistantMessage): boolean {
+		const unresolvedToolCallIds = new Set<string>();
 		for (const block of message.content) {
-			if (block.type !== "toolCall") continue;
-			resolvedToolCallIds.push(block.id);
+			if (block.type === "toolCall") unresolvedToolCallIds.add(block.id);
 		}
-		if (resolvedToolCallIds.length === 0) return undefined;
+		if (unresolvedToolCallIds.size === 0) return false;
 
 		const messages = this.#host.agent.state.messages;
 		let assistantIndex = -1;
@@ -1829,15 +1952,13 @@ export class TurnRecovery {
 				break;
 			}
 		}
-		if (assistantIndex < 0) return undefined;
+		if (assistantIndex < 0) return false;
 
-		const unresolvedToolCallIds = new Set(resolvedToolCallIds);
 		for (let i = assistantIndex + 1; i < messages.length; i++) {
 			const candidate = messages[i];
 			if (candidate.role === "toolResult") unresolvedToolCallIds.delete(candidate.toolCallId);
 		}
-		if (unresolvedToolCallIds.size > 0) return undefined;
-		return reasonlessAbort ? "reasonless-abort" : "stream-stall";
+		return unresolvedToolCallIds.size === 0;
 	}
 
 	/**
@@ -3212,7 +3333,7 @@ export class TurnRecovery {
 		}
 		const allowModelFallback =
 			options?.allowModelFallback !== false &&
-			!(options?.continueCommittedText || this.#continuingCommittedText) &&
+			!(rateLimited && (options?.continueCommittedText || this.#continuingCommittedText)) &&
 			!this.#host.modelFallbackDisabled?.();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
@@ -3536,6 +3657,7 @@ export class TurnRecovery {
 		}
 
 		await this.#recordPendingRetryError(message, id, { switchedCredential, switchedModel, delayMs });
+		if (preserveFailedTurn) this.#keepTurn(message);
 		// Quota resets elapse while the machine sleeps; capture the deadline before event delivery.
 		const usageResetDeadline = AIError.is(id, AIError.Flag.UsageLimit) ? Date.now() + delayMs : undefined;
 
@@ -3599,11 +3721,13 @@ export class TurnRecovery {
 			this.#stripFailedAssistantTail();
 		}
 		// A rate limit after visible text continues the answer instead of sending
-		// it again: the kept turn ends in the rate-limit reminder, and the rest of
-		// the saga stays on this model.
+		// it again, and a rate limit on any later attempt of the saga stays on
+		// this model. A text-only turn ends in the rate-limit reminder; a turn
+		// with tool calls already ends in their synthetic results, which tell the
+		// next turn to reissue them.
 		if (options?.continueCommittedText) {
 			this.#continuingCommittedText = true;
-			if (this.#host.promptGeneration() === generation) {
+			if (this.#host.promptGeneration() === generation && isTextOnlyTurn(message)) {
 				this.#appendContinueReminder(rateLimitContinueTemplate, this.#retryAttempt, maxRetries);
 			}
 		}

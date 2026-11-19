@@ -10,6 +10,7 @@
 - Added `errorDisplayText`, `editErrorText`, `clearErrorText` and `errorRetryHeaders` for the split error fields, an optional header retry delay on `extractProviderRetryHint`, `parseRateLimitReason`, `matchesUsageLimitText`, `isUsageLimitOutcome`, `is402BillingCapBody` and `isConcurrencyCapExclusion`, and `retryAfterMs` on `RotateCredentialOptions` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - `AIError.Flag.Connection` marks a failure that died on the wire with no HTTP status and no capacity signal — a cut stream, a closed socket, a truncated chunked transfer — so callers can tell it apart from a 429, a 529 or an overload
 - Added `CredentialUnavailableError`, a transient error for a configured credential source that produced no key; unlike `MissingApiKeyError`, a retry may succeed ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+- `AssistantMessage.continued` marks a failed turn a later turn continued from instead of sending it again (a rate limit or a cut stream after visible text, a cut stream or a reasonless abort after complete tool calls, tool calls that provably never ran, a malformed function call), set once the continuation succeeded
 
 ### Fixed
 
@@ -33,7 +34,7 @@
 - For a tool with `lenientArgValidation` (the flag now lives on the base `Tool` type), `validateToolArguments` keeps every argument repair but puts back any unrecognized key it deleted to reach success, so a tool that owns its refusal sees every key the model wrote instead of a silently narrowed "valid" subset (a key the null-is-absent repair drops, such as a null optional field or an unknown null-valued key inside a closed nested object, stays dropped) ([#12871](https://github.com/can1357/oh-my-pi/pull/12871) by [@sjawhar](https://github.com/sjawhar)).
 - A wire failure a runtime reports only as an errno on `err.code` (`ECONNRESET`, `EPIPE`, `ECONNABORTED`, undici's `UND_ERR_SOCKET`) while leaving the message generic is now classified as a connection failure instead of going unrecognised
 - Fixed Anthropic responses through a custom `baseUrl` (a gateway in front of Anthropic) losing their server-side fallback marker and redacted thinking from the saved turn, so the next request replays that turn's reasoning instead of being refused and retried without it ([#12352](https://github.com/can1357/oh-my-pi/pull/12352) by [@sjawhar](https://github.com/sjawhar))
-- A rate limit the Anthropic API reports in its stream (an `error` event of type `rate_limit_error`), before or after the response starts, now carries HTTP status 429, and an overload it reports before the response starts (`overloaded_error`) status 529, so each is retried and held on the same model as the HTTP response would be
+- A rate limit the Anthropic API reports in its stream (an `error` event of type `rate_limit_error`), before or after the response starts, now carries HTTP status 429, and an overload it reports before the response starts (`overloaded_error`) status 529, so each is retried and held on the same model as the HTTP response would be; a streamed rate limit is sent again only by the caller's retry, one request per attempt
 
 ### Breaking Changes
 

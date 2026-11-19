@@ -900,6 +900,9 @@ export type RpcSteerSubagentRegistry = Pick<RpcSubagentRegistry, "getSubagents" 
  * A subagent idle between its turns (a synchronous subagent waiting for its
  * own jobs) gets the message as a next-run steer instead, and the steer
  * resolves once its next run takes it; see {@link steerSubagentBetweenTurns}.
+ * So does one whose ref reads running while its session reports no turn in
+ * flight: the ref reads running from its registration, while the executor
+ * still sets the subagent up, before its first prompt starts a turn.
  *
  * An idle one whose result the parent already accepted, or whose run already
  * ended, is refused, as is an unknown, finished, cancelled or other session's
@@ -936,7 +939,7 @@ export async function handleRpcSteerSubagent(
 	// or the subagent may have finished in the meantime.
 	const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 	if (current?.ref !== owned.ref || current.session !== session) return notRunning;
-	if (current.ref.status !== "running") {
+	if (current.ref.status !== "running" || !session.isStreaming) {
 		return steerSubagentBetweenTurns(subagentRegistry, subagentId, current, message, shutdown);
 	}
 
