@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readLinkTarget, readRegularFile, readRegularFileText } from "./regular-file.js";
+import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from "./regular-file.js";
 
 /**
  * Which Rust sources a workspace checkout's addon was built from.
@@ -68,18 +68,50 @@ import { readLinkTarget, readRegularFile, readRegularFileText } from "./regular-
  * The change time and the inode see an edit whose size and modification time were
  * put back (`touch -r`, or a rename over the file), as git's own stat check does:
  * on Linux nothing but a change of the system clock sets a file's change time.
- * Not seen is git's "racy" case: a same-size edit in the same timestamp tick as
- * the read, on a kernel or filesystem whose timestamps are that coarse. The record also
- * carries the build's settings (`build`: profile, features, flags) to explain an
- * addon; they are never compared.
+ * git's "racy" case, a same-size edit in the same timestamp tick as the read, on a
+ * kernel or filesystem whose timestamps are that coarse, is closed as git closes it:
+ * a state (a file fingerprint, or a scanned directory's state) is kept only when
+ * each modification and change time in it is older than the read's start by more
+ * than two seconds ({@link RACY_MARGIN_MS}); a newer one is read or listed again at
+ * the next start. The record also carries the build's settings (`build`: profile,
+ * features, flags) to explain an addon; they are never compared.
  */
 
 /**
  * The rule a record's kept state (`seen`) was kept under: what a fingerprint covers (size,
  * modification time, change time, inode; `changed` for a file whose read met another kind)
- * and when one is kept. A state kept under another rule is read again.
+ * and when one is kept (only when no time in it is too new to trust, {@link RACY_MARGIN_MS}).
+ * A state kept under another rule is read again, and every scanned directory of its record
+ * listed again.
  */
-const SEEN_STATE_VERSION = 1;
+const SEEN_STATE_VERSION = 2;
+
+/**
+ * How much older than a read a time must be for the read to trust it: git's racy-clean rule.
+ * A kernel stamps a file or a directory from a clock that moves in ticks (milliseconds where
+ * timestamps are coarse, as on Linux before 6.13), and some filesystems keep only whole
+ * seconds, or two (ext3, HFS+, FAT). A change made after a read, in the read's own tick,
+ * leaves every time as the read saw it. So a directory's state or a file's fingerprint is
+ * kept only when each of its modification and change times is older than the read's start by
+ * more than this; a newer one is listed or read again at the next start.
+ */
+const RACY_MARGIN_MS = 2_000;
+
+/**
+ * The state kept for a scanned directory whose times were too new to trust: no directory has
+ * it, so the next start lists that directory again.
+ */
+const UNSETTLED_DIRECTORY = "unsettled";
+
+/**
+ * Whether `stat`'s modification or change time is too new, for a read that began at
+ * `startedAt` (`Date.now()`), to stand for the state it saw ({@link RACY_MARGIN_MS}).
+ * @param {fs.Stats} stat
+ * @param {number} startedAt
+ */
+function isRacy(stat, startedAt) {
+	return Math.max(stat.mtimeMs, stat.ctimeMs) >= startedAt - RACY_MARGIN_MS;
+}
 
 /** What a Cargo build of the addon compiles, relative to the repository root. */
 export const CARGO_SOURCE_ROOTS = Object.freeze(["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", "crates"]);
@@ -127,11 +159,13 @@ export function uniqueTempPath(target) {
 }
 
 /**
+ * The `lstat` of a path in the checkout, through the shared reader's calls (`lstatPath`), so
+ * every `lstat` a build and a start make here goes through one seam.
  * @param {string} repoRoot
  * @param {string} rel
  */
 function lstatSource(repoRoot, rel) {
-	return fs.lstatSync(path.join(repoRoot, rel), { throwIfNoEntry: false });
+	return lstatPath(path.join(repoRoot, rel));
 }
 
 /**
@@ -411,12 +445,15 @@ function directoryStamp(stat) {
  * link, to a directory or not, is an entry, never followed.
  * @param {string} repoRoot
  * @param {string} dir
- * @returns {{ times: Record<string, string>; files: string[] }} the state
- *   ({@link directoryStamp}) of `dir` and of every directory below it, and every
- *   file and link there
+ * @param {number} startedAt when the read this walk is part of began (`Date.now()`)
+ * @returns {{ times: Record<string, string>; racy: string[]; files: string[] }} the
+ *   state ({@link directoryStamp}) of `dir` and of every directory below it, those
+ *   of them whose times are too new to trust ({@link isRacy}), and every file and
+ *   link there
  */
-function scanDirectory(repoRoot, dir) {
+function scanDirectory(repoRoot, dir, startedAt) {
 	const times = {};
+	const racy = [];
 	const files = [];
 	const visit = rel => {
 		const stat = lstatSource(repoRoot, rel);
@@ -426,10 +463,38 @@ function scanDirectory(repoRoot, dir) {
 			return;
 		}
 		times[rel] = directoryStamp(stat);
+		if (isRacy(stat, startedAt)) racy.push(rel);
 		for (const name of fs.readdirSync(path.join(repoRoot, rel))) visit(`${rel}/${name}`);
 	};
 	visit(dir);
-	return { times, files: files.sort() };
+	return { times, racy, files: files.sort() };
+}
+
+/**
+ * `times` as a record keeps them: a directory in `racy` gets {@link UNSETTLED_DIRECTORY}, which
+ * no directory's state equals, so the next start lists it again.
+ * @param {Record<string, string>} times
+ * @param {readonly string[]} racy
+ * @returns {Record<string, string>}
+ */
+function settledTimes(times, racy) {
+	return Object.fromEntries(Object.entries(times).map(([rel, time]) => [rel, racy.includes(rel) ? UNSETTLED_DIRECTORY : time]));
+}
+
+/**
+ * List a scanned directory again (`entry`: its `dir` and `globs`) and compare the files its
+ * globs match now with those of `files` (a record's, or a build's listing).
+ * @param {string} repoRoot
+ * @param {{ dir: string; globs: { include: string[]; exclude: string[] }[] }} entry
+ * @param {readonly string[]} files sorted
+ * @param {number} startedAt
+ * @returns {{ same: boolean; now: ReturnType<typeof scanDirectory> }}
+ */
+function listScannedAgain(repoRoot, entry, files, startedAt) {
+	const recorded = files.filter(rel => rel.startsWith(`${entry.dir}/`) && globsMatch(entry.globs, rel));
+	const now = scanDirectory(repoRoot, entry.dir, startedAt);
+	const matched = now.files.filter(rel => globsMatch(entry.globs, rel));
+	return { same: matched.length === recorded.length && matched.every((rel, i) => rel === recorded[i]), now };
 }
 
 /**
@@ -522,24 +587,29 @@ function digestOf(files, hashes) {
  * file's size, times and inode as its own read found them (the descriptor it read, or the
  * `lstat` that named another kind), kept per file in `stats`. The fingerprint is null when the
  * files no longer match it once all are read: a file swapped or edited during the read, even
- * one put back as it was, leaves no state a later start could take these hashes for. Throws
- * when a regular file cannot be opened.
+ * one put back as it was, leaves no state a later start could take these hashes for. It is
+ * null too when a file's modification or change time is too new for the read that began at
+ * `startedAt` ({@link isRacy}): a same-size edit after the read, in its tick, would leave that
+ * state as it is. Throws when a regular file cannot be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} files
+ * @param {number} startedAt when the read began (`Date.now()`, taken before any `stat`)
  * @returns {{ hashes: Record<string, string>; stats: Record<string, string>; fingerprint: string | null }}
  */
-function hashSources(repoRoot, files) {
+function hashSources(repoRoot, files, startedAt) {
 	/** @type {Record<string, string>} */
 	const hashes = {};
 	/** @type {Record<string, string>} */
 	const stats = {};
+	let racy = false;
 	for (const rel of files) {
 		const { hash, stat } = hashSource(repoRoot, rel);
 		hashes[rel] = hash;
 		stats[rel] = fingerprintLine(rel, stat);
+		if (stat && isRacy(stat, startedAt)) racy = true;
 	}
 	const fingerprint = fingerprintDigest(files.map(rel => stats[rel]).join(""));
-	return { hashes, stats, fingerprint: fingerprint === fingerprintOf(repoRoot, files) ? fingerprint : null };
+	return { hashes, stats, fingerprint: !racy && fingerprint === fingerprintOf(repoRoot, files) ? fingerprint : null };
 }
 
 /**
@@ -634,22 +704,24 @@ export function checkoutId(repoRoot, create) {
  * before the build begins. Lists the files once (one `git ls-files`), adds the
  * files of the directories build scripts scan that their globs match, gitignored
  * or not, as sources the build had, and reads every one. Its fingerprint is that
- * of the files it read, or null when one changed while it read them. Throws when a
- * listed regular file cannot be opened.
+ * of the files it read, or null when one changed while it read them or has a time
+ * too new to trust ({@link isRacy}); `unsettled` names each scanned directory whose
+ * times were too new. Throws when a listed regular file cannot be opened.
  * @param {string} repoRoot
  * @param {readonly string[]} roots
  */
 export function readRustSources(repoRoot, roots) {
+	const startedAt = Date.now();
 	const listed = listBuildSources(repoRoot, roots);
 	const scans = buildScriptScannedDirs(repoRoot, listed.files).map(({ dir, globs }) => {
-		const scan = scanDirectory(repoRoot, dir);
-		return { dir, globs, times: scan.times, files: scan.files.filter(rel => globsMatch(globs, rel)) };
+		const scan = scanDirectory(repoRoot, dir, startedAt);
+		return { dir, globs, times: scan.times, racy: scan.racy, files: scan.files.filter(rel => globsMatch(globs, rel)) };
 	});
 	const scannedFiles = new Set(scans.flatMap(scan => scan.files));
 	const files = [...new Set([...listed.files, ...scannedFiles])].sort();
 	// A scanned directory's matched files are compiled whether git tracks them or not.
 	const untracked = listed.untracked.filter(rel => !scannedFiles.has(rel));
-	const { hashes, stats, fingerprint } = hashSources(repoRoot, files);
+	const { hashes, stats, fingerprint } = hashSources(repoRoot, files, startedAt);
 	return {
 		roots: [...roots],
 		checkout: checkoutId(repoRoot, true),
@@ -660,6 +732,7 @@ export function readRustSources(repoRoot, roots) {
 		fingerprint,
 		...identities(files, untracked, hashes),
 		scanned: scans.map(({ dir, globs, times }) => ({ dir, globs, dirs: times })),
+		unsettled: scans.flatMap(({ racy }) => racy),
 		packages: packageBuildScripts(repoRoot, files),
 	};
 }
@@ -672,21 +745,28 @@ export function readRustSources(repoRoot, roots) {
  * inode, as a file edited and put back as it was has), or a directory a build script
  * scans did (a file added there and removed again), the record names no sources
  * ({@link CHANGED_DURING_BUILD}), so the addon reads as built from other sources
- * until the next build.
+ * until the next build. A scanned directory whose state was too new to trust before
+ * the build (`unsettled`: a file added after that read, in its tick, leaves the state
+ * as it was) is also listed again, and a matched file added or removed there counts as
+ * moved.
  * @param {string} repoRoot
  * @param {ReturnType<typeof readRustSources>} before
  * @returns {ReturnType<typeof readRustSources>}
  */
 export function settleRustSources(repoRoot, before) {
-	const read = hashSources(repoRoot, before.files);
+	const startedAt = Date.now();
+	const read = hashSources(repoRoot, before.files, startedAt);
 	const fileMoved = before.files.some(
 		rel => !REWRITTEN_BY_BUILD.has(rel) && (read.stats[rel] !== before.stats[rel] || read.hashes[rel] !== before.hashes[rel]),
 	);
-	const directoryMoved = before.scanned.some(entry =>
-		Object.entries(entry.dirs).some(([rel, stamp]) => {
-			const stat = lstatSource(repoRoot, rel);
-			return !stat?.isDirectory() || directoryStamp(stat) !== stamp;
-		}),
+	const directoryMoved = before.scanned.some(
+		entry =>
+			Object.entries(entry.dirs).some(([rel, stamp]) => {
+				const stat = lstatSource(repoRoot, rel);
+				return !stat?.isDirectory() || directoryStamp(stat) !== stamp;
+			}) ||
+			(Object.keys(entry.dirs).some(rel => before.unsettled.includes(rel)) &&
+				!listScannedAgain(repoRoot, entry, before.files, startedAt).same),
 	);
 	if (fileMoved || directoryMoved) return { ...before, digest: CHANGED_DURING_BUILD, fingerprint: null };
 	if (before.files.every(rel => read.hashes[rel] === before.hashes[rel])) return before;
@@ -757,10 +837,12 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
 		files: sources.files,
 		untracked: sources.untrackedHashes,
 		sources: sources.digest,
-		scanned: sources.scanned,
+		// A scanned directory whose state was too new to trust is listed again at the first start.
+		scanned: sources.scanned.map(entry => ({ ...entry, dirs: settledTimes(entry.dirs, sources.unsettled) })),
 		packages: sources.packages,
-		// The checkout that built the addon is the one judging it now. A fingerprint of null
-		// (a file changed while the build read it) matches no state: the first start reads the bytes.
+		// The checkout that built the addon is the one judging it now. A fingerprint of null (a file
+		// changed while the build read it, or one too new to trust) matches no state: the first start
+		// reads the bytes.
 		seen: {
 			version: SEEN_STATE_VERSION,
 			fingerprint: sources.fingerprint,
@@ -870,17 +952,22 @@ function keptState(seen) {
  * size and time. It lists a scanned directory again only when its time changed,
  * and reads the listed files' bytes only for a state it has not seen; then it
  * records what it learned (best-effort), so the next start does neither. A verdict
- * is recorded only for the state of the files the read opened, and only when the
- * files still match it once all are read.
+ * is recorded only for the state of the files the read opened, only when the files
+ * still match it once all are read, and only when no time in it is too new to
+ * trust ({@link isRacy}); a directory's state likewise.
  * @param {string} addonPath
  * @param {string} repoRoot
  * @returns {"current" | "other" | "unknown"}
  */
 export function addonSourcesState(addonPath, repoRoot) {
+	// Before any `stat`: a time at or after this, less the margin, is too new to keep.
+	const startedAt = Date.now();
+	const stampPath = addonSourcesStampPath(addonPath);
+	let text;
 	let stamp;
 	try {
 		// A record that is not a regular file (a FIFO, say) is no record, and is never opened.
-		const text = readRegularFileText(addonSourcesStampPath(addonPath));
+		text = readRegularFileText(stampPath);
 		if (text === undefined) return "unknown";
 		stamp = JSON.parse(text);
 		const addon = fs.statSync(addonPath);
@@ -898,22 +985,25 @@ export function addonSourcesState(addonPath, repoRoot) {
 		}
 		let learned = false;
 		const scanned = [];
+		// Directory states kept under an earlier rule may be too new to trust: list them again once.
+		const sameRule = stamp.seen.version === SEEN_STATE_VERSION;
 		for (const entry of stamp.scanned) {
-			const unchanged = Object.entries(entry.dirs).every(([rel, time]) => {
-				const stat = lstatSource(repoRoot, rel);
-				return stat?.isDirectory() && directoryStamp(stat) === time;
-			});
+			const unchanged =
+				sameRule &&
+				Object.entries(entry.dirs).every(([rel, time]) => {
+					const stat = lstatSource(repoRoot, rel);
+					return stat?.isDirectory() && directoryStamp(stat) === time;
+				});
 			if (unchanged) {
 				scanned.push(entry);
 				continue;
 			}
 			// The files there its globs match, gitignored or not, as the build script reads them.
-			const recorded = stamp.files.filter(rel => rel.startsWith(`${entry.dir}/`) && globsMatch(entry.globs, rel));
-			const now = scanDirectory(repoRoot, entry.dir);
-			const matched = now.files.filter(rel => globsMatch(entry.globs, rel));
-			if (matched.length !== recorded.length || matched.some((rel, i) => rel !== recorded[i])) return "other";
-			scanned.push({ dir: entry.dir, globs: entry.globs, dirs: now.times });
-			learned = true;
+			const { same, now } = listScannedAgain(repoRoot, entry, stamp.files, startedAt);
+			if (!same) return "other";
+			const dirs = settledTimes(now.times, now.racy);
+			scanned.push({ dir: entry.dir, globs: entry.globs, dirs });
+			if (JSON.stringify(dirs) !== JSON.stringify(entry.dirs)) learned = true;
 		}
 		const fingerprint = fingerprintOf(repoRoot, stamp.files);
 		const untracked = Object.keys(stamp.untracked);
@@ -928,7 +1018,7 @@ export function addonSourcesState(addonPath, repoRoot) {
 		let verdict = kept?.verdict;
 		let seen = stamp.seen;
 		if (kept === undefined || fingerprint !== kept.fingerprint || sameCheckout !== kept.sameCheckout) {
-			const read = hashSources(repoRoot, stamp.files);
+			const read = hashSources(repoRoot, stamp.files, startedAt);
 			const now = identities(stamp.files, untracked, read.hashes);
 			// A file untracked at build time may be missing only in another checkout of the
 			// commit (robomp's cache, the image seed); where it was built, missing is a change.
@@ -937,7 +1027,8 @@ export function addonSourcesState(addonPath, repoRoot) {
 			);
 			verdict = now.digest === stamp.sources && sameUntracked ? "current" : "other";
 			// Kept for the state the bytes came from. A file that changed while they were read,
-			// even one put back as it was, keeps nothing: the next start reads them again.
+			// even one put back as it was, or one too new to trust, keeps nothing: the next start
+			// reads them again.
 			if (read.fingerprint !== null) {
 				seen = { version: SEEN_STATE_VERSION, fingerprint: read.fingerprint, sameCheckout, verdict };
 				learned = true;

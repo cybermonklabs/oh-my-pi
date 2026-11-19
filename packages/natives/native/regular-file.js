@@ -134,6 +134,17 @@ export function readRegularFileText(file) {
 }
 
 /**
+ * The `lstat` of `file`, or undefined when nothing stands there. It goes through the same
+ * calls as {@link readRegularFile}, so a test that replaces them
+ * (`__setRegularFileIoForTests`) also sees every `lstat` a caller makes this way.
+ * @param {string} file
+ * @returns {fs.Stats | undefined}
+ */
+export function lstatPath(file) {
+	return io.lstatSync(file, { throwIfNoEntry: false });
+}
+
+/**
  * The target of the link at `file`, found a link by its `lstat`: its text; `changed` when what
  * stands there is no longer a link (`EINVAL`) or is gone (`ENOENT`, `ENOTDIR`); or `unreadable`,
  * with the error, for a link whose target cannot be read (an I/O error).

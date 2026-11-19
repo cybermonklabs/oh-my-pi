@@ -51,6 +51,20 @@ async function build(roots: readonly string[] = CARGO_SOURCE_ROOTS, settings: Re
 	writeAddonSourcesStamp(addon, readRustSources(repo, roots), settings);
 }
 
+/**
+ * Run `fn` with `Date.now()` ten seconds on: a read that comes more than two seconds after every
+ * file the test wrote. workspace-sources keeps no state with a time within two seconds of its
+ * read (git's racy-clean rule), so a test of what a build or a start keeps reads at such a time.
+ */
+async function readLater<T>(fn: () => T | Promise<T>): Promise<T> {
+	const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
+	try {
+		return await fn();
+	} finally {
+		clock.mockRestore();
+	}
+}
+
 /** Git with no user or system configuration, so a test repository behaves the same on any machine. */
 const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 
@@ -438,15 +452,16 @@ console.log(JSON.stringify(addonSourcesState(addon, repo)));`),
 
 	it("stay current when files are rewritten with the same content, and remember that", async () => {
 		await build();
-		const later = new Date(Date.now() + 60_000);
-		await fs.utimes(path.join(repo, "crates/pi-natives/src/lib.rs"), later, later);
+		const earlier = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(repo, "crates/pi-natives/src/lib.rs"), earlier, earlier);
 
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		// A start more than two seconds after the rewrite, so the state it read can be kept.
+		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
 		// The content check ran once for this state of the tree; its answer is kept, so the
 		// next start reads only file sizes and times, and opens no source.
 		const stamp = await Bun.file(`${addon}.sources.json`).json();
 		expect(stamp.seen.fingerprint).toEqual(expect.any(String));
-		expect(stamp.seen.fingerprint).toBe(readRustSources(repo, CARGO_SOURCE_ROOTS).fingerprint);
+		expect(stamp.seen.fingerprint).toBe(await readLater(() => readRustSources(repo, CARGO_SOURCE_ROOTS).fingerprint));
 		expect(
 			bounded(`const opened = [];
 __setRegularFileIoForTests({
@@ -459,6 +474,49 @@ const state = addonSourcesState(addon, repo);
 console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.endsWith(".sources.json")).length }));`),
 		).toEqual({ state: "current", sourcesOpened: 0 });
 	}, 60_000);
+
+	it("keep no state whose times are within two seconds of the read, and keep it once they are older", async () => {
+		await build();
+		// The build read files it had just written, so it keeps no fingerprint, and the first
+		// start reads the bytes.
+		const recorded = async () => (await Bun.file(`${addon}.sources.json`).json()).seen.fingerprint;
+		expect(await recorded()).toBeNull();
+		expect(addonSourcesState(addon, repo)).toBe("current");
+		expect(await recorded()).toBeNull();
+		// Control: a start more than two seconds after the writes keeps the state it read.
+		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
+		expect(await recorded()).toEqual(expect.any(String));
+	});
+
+	it("see a same-size edit made in the timestamp tick of the start that read the file (git's racy case)", async () => {
+		await build();
+		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+		// On a kernel whose clock is coarse, a file read and then edited in one tick keeps its
+		// times. The seam gives the file the times it had at the read, for the read and after the
+		// edit, as such a kernel does; the edit keeps the size and the inode.
+		expect(
+			bounded(`const target = ${JSON.stringify(target)};
+const frozen = nodeFs.lstatSync(target);
+let fd;
+__setRegularFileIoForTests({
+	lstatSync(file, options) {
+		return file === target ? frozen : nodeFs.lstatSync(file, options);
+	},
+	openSync(file, flags, mode) {
+		const opened = nodeFs.openSync(file, flags, mode);
+		if (file === target) fd = opened;
+		return opened;
+	},
+	fstatSync(descriptor) {
+		return descriptor === fd ? frozen : nodeFs.fstatSync(descriptor);
+	},
+});
+const first = addonSourcesState(addon, repo);
+nodeFs.writeFileSync(target, "pub fn grop() {}\\n");
+const second = addonSourcesState(addon, repo);
+console.log(JSON.stringify({ first, second, sameSize: nodeFs.statSync(target).size === frozen.size }));`),
+		).toEqual({ first: "current", second: "other", sameSize: true });
+	});
 
 	it.each([["in place"], ["by a rename over it"]])(
 		"see a same-size edit whose modification time is put back (%s), as git does",
@@ -488,8 +546,9 @@ console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.e
 	it.each([
 		["no rule", undefined],
 		["another rule", 0],
+		["the rule before times within two seconds of the read were distrusted", 1],
 	])("read the bytes again for a verdict a record kept under %s", async (_label, version) => {
-		await build();
+		await readLater(() => build());
 		const stampPath = `${addon}.sources.json`;
 		const stamp = await Bun.file(stampPath).json();
 		// A verdict this tree does not have, kept as an earlier build of this loader kept one:
@@ -926,7 +985,7 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		}));
 		await Bun.write(stampPath, JSON.stringify({ ...stamp, scanned }));
 
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
 		const now = await fs.lstat(path.join(repo, defs));
 		expect((await Bun.file(stampPath).json()).scanned[0].dirs[defs]).toBe(
 			`${now.mtimeMs}\0${now.ctimeMs}\0${now.ino}`,
@@ -978,9 +1037,10 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		// A file made and removed in a scanned directory moves its time and nothing else.
 		await Bun.write(path.join(repo, defs, "a.toml.swp-like"), "scratch\n");
 		await fs.rm(path.join(repo, defs, "a.toml.swp-like"));
-		const later = new Date(Date.now() + 60_000);
-		await fs.utimes(path.join(repo, defs), later, later);
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		const earlier = new Date(Date.now() - 60_000);
+		await fs.utimes(path.join(repo, defs), earlier, earlier);
+		// A start more than two seconds after the change, so the state it lists can be kept.
+		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
 		// The start remembers the directory's new state, so the next start lists nothing.
 		const stamp = await Bun.file(`${addon}.sources.json`).json();
 		const now = await fs.stat(path.join(repo, defs));
@@ -1033,6 +1093,84 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		// And a matching file is still seen (control).
 		await Bun.write(path.join(repo, defs, "zz.toml"), "[filters.zz]\n");
 		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	/**
+	 * JS source for {@link bounded}: the shared reader's `lstat` gives the scanned directory the
+	 * state it has now, from then on, as a kernel whose clock is coarse does for every change made
+	 * in the same tick as a look at it.
+	 */
+	function freezeDirectory(): string {
+		const dir = path.join(repo, defs);
+		return `const dir = ${JSON.stringify(dir)};
+const frozen = nodeFs.lstatSync(dir);
+__setRegularFileIoForTests({
+	lstatSync(file, options) {
+		return file === dir ? frozen : nodeFs.lstatSync(file, options);
+	},
+});
+const stampPath = addon + ".sources.json";
+const keptFor = () => JSON.parse(nodeFs.readFileSync(stampPath, "utf8")).scanned[0].dirs[${JSON.stringify(defs)}];`;
+	}
+
+	it("see a matching file added to a scanned directory in the timestamp tick of the start that listed it (git's racy case)", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
+		expect(
+			bounded(`${freezeDirectory()}
+const first = addonSourcesState(addon, repo);
+const kept = keptFor();
+nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
+const second = addonSourcesState(addon, repo);
+console.log(JSON.stringify({ first, kept, second }));`),
+		).toEqual({ first: "current", kept: "unsettled", second: "other" });
+	});
+
+	it("are other sources until the next build for a matching file added to a scanned directory in the tick of the build's first read", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
+		expect(
+			bounded(`${freezeDirectory()}
+const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+// The build script compiles every matching file there, this one too.
+nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
+writeAddonSourcesStamp(addon, settleRustSources(repo, before), {});
+const sources = JSON.parse(nodeFs.readFileSync(stampPath, "utf8")).sources;
+console.log(JSON.stringify({ unsettled: before.unsettled, sources, state: addonSourcesState(addon, repo) }));`),
+		).toEqual({ unsettled: [defs], sources: "changed during the build", state: "other" });
+	});
+
+	it("record a scanned directory whose state was too new at the build's first read as unsettled, so the first start lists it", async () => {
+		await checkout();
+		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
+		expect(
+			bounded(`${freezeDirectory()}
+const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
+writeAddonSourcesStamp(addon, settleRustSources(repo, before), {});
+const kept = keptFor();
+// After the build, in the same tick: the frozen state hides the file from a state check.
+nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
+console.log(JSON.stringify({ kept, state: addonSourcesState(addon, repo) }));`),
+		).toEqual({ kept: "unsettled", state: "other" });
+	});
+
+	it("list a scanned directory again when its state was kept under an earlier rule", async () => {
+		await checkout();
+		expect(
+			bounded(`${freezeDirectory()}
+// A build more than two seconds after the writes keeps the directory's state.
+const realNow = Date.now;
+Date.now = () => realNow.call(Date) + 10_000;
+writeAddonSourcesStamp(addon, readRustSources(repo, CARGO_SOURCE_ROOTS), {});
+Date.now = realNow;
+const record = JSON.parse(nodeFs.readFileSync(stampPath, "utf8"));
+nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
+// Control: under this rule the kept state stands, and the frozen state hides the file.
+const sameRule = addonSourcesState(addon, repo);
+nodeFs.writeFileSync(stampPath, JSON.stringify({ ...record, seen: { ...record.seen, version: 1 } }));
+const earlierRule = addonSourcesState(addon, repo);
+console.log(JSON.stringify({ kept: keptFor() !== "unsettled", sameRule, earlierRule }));`),
+		).toEqual({ kept: true, sameRule: "current", earlierRule: "other" });
 	});
 
 	it("record only the files a scanned directory's glob matches, honouring exclude", async () => {

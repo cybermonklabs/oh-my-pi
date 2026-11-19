@@ -34,7 +34,9 @@ export interface RustSources {
 	/**
 	 * SHA-256 over each listed file's path, size, modification time, change time and inode as
 	 * the read of its bytes found them, hex; null when a file no longer matched that once all
-	 * were read, or changed kind during its own read.
+	 * were read, changed kind during its own read, or had a modification or change time less
+	 * than two seconds before the read began (git's racy case: an edit in that tick, after
+	 * the read, could leave every time as it was).
 	 */
 	fingerprint: string | null;
 	/**
@@ -51,6 +53,12 @@ export interface RustSources {
 	 * time, change time and inode, `\0`-separated).
 	 */
 	scanned: { dir: string; globs: { include: string[]; exclude: string[] }[]; dirs: Record<string, string> }[];
+	/**
+	 * The scanned directories whose state was too new to trust when it was read (as
+	 * `fingerprint`). The settle lists them again, and the record keeps for them a state no
+	 * directory has, so the first start lists them again.
+	 */
+	unsettled: string[];
 	/** Each package directory and whether it has a `build.rs`. */
 	packages: { dir: string; buildScript: boolean }[];
 }

@@ -37,6 +37,12 @@ export function readRegularFile(file: string, options?: { length?: number }): Re
 export function readRegularFileText(file: string): string | undefined;
 
 /**
+ * The `lstat` of `file`, or undefined when nothing stands there, through the reader's calls, so
+ * a test that replaces them sees it.
+ */
+export function lstatPath(file: string): fs.Stats | undefined;
+
+/**
  * The target of the link at `file`: its text; `changed` when what stands there is no longer a
  * link or is gone; or `unreadable`, with the error, when the target cannot be read.
  */
