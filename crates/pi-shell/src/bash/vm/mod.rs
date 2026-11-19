@@ -507,6 +507,8 @@ pub struct Kernel {
 	pub exec_signals:       HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal:    Option<(RunId, i32)>,
+	/// The signal the root shell died of ([`Shell::killed_by`]); not imaged.
+	pub killed_by:          Option<i32>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
@@ -629,6 +631,7 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			killed_by: None,
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
@@ -2512,7 +2515,14 @@ impl Shell {
 				continue;
 			}
 			match sig.default_action() {
-				DefaultAction::Terminate => self.kill(cx, i, sig, sig.exit_status(platform)),
+				DefaultAction::Terminate => {
+					if self.procs[i].parent.is_none() {
+						// The root shell dies of the signal: a process host
+						// dies of it too ([`Shell::killed_by`]).
+						self.k.killed_by = Some(i32::from(sig.number(platform)));
+					}
+					self.kill(cx, i, sig, sig.exit_status(platform));
+				},
 				DefaultAction::Stop | DefaultAction::Continue => {
 					let stop = sig.default_action() == DefaultAction::Stop;
 					let p = &mut self.procs[i];
@@ -2585,6 +2595,14 @@ impl Shell {
 			.reported_signal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, signal)| signal)
+	}
+
+	/// The signal the root shell took the default action of (`kill -TERM
+	/// $$` without a trap), ending its scripts: a process host dies of it
+	/// too, as zsh and bash do, so that its parent sees `WIFSIGNALED`.
+	/// Ordinary `exit 128+n` is not a signal death.
+	pub const fn killed_by(&self) -> Option<i32> {
+		self.k.killed_by
 	}
 
 	/// Number of the root's background jobs that still wait for a running

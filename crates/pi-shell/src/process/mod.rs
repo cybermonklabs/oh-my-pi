@@ -476,6 +476,11 @@ fn zsh_version_text() -> Vec<u8> {
 /// The process shell: the command line `argv` (`argv[0]` names the shell)
 /// to the exit status (0–255) the process should exit with. Standard
 /// output is flushed before it returns.
+///
+/// A standalone shell that died of a signal (`kill -TERM $$` without a
+/// trap, or an `exec`ed program killed by one) does not return: the
+/// process dies of the same signal, as zsh and bash do, so that its parent
+/// sees `WIFSIGNALED`.
 pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOptions) -> i32 {
 	let argv: Vec<BString> = argv.into_iter().map(Into::into).collect();
 	let mut launch = match start(&argv, false) {
@@ -486,9 +491,34 @@ pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOp
 		return status;
 	}
 	let Launch { args, env, input } = *launch;
-	let status = run(&args, env, input, opts);
+	let (status, died_of) = run(&args, env, input, opts);
 	let _ = io::stdout().flush();
+	#[cfg(unix)]
+	if let Some(signal) = died_of
+		&& !opts.embedded
+	{
+		die_of(signal);
+	}
+	#[cfg(not(unix))]
+	let _ = died_of;
 	status
+}
+
+/// End the process by `signal`'s default action: the disposition back to
+/// the default, the signal unblocked, then raised. Returns only when the
+/// signal does not end the process.
+#[cfg(unix)]
+fn die_of(signal: i32) {
+	// SAFETY: plain disposition, mask and raise calls on a valid signal
+	// number and a set initialized by sigemptyset.
+	unsafe {
+		libc::signal(signal, libc::SIG_DFL);
+		let mut set: libc::sigset_t = mem::zeroed();
+		libc::sigemptyset(&raw mut set);
+		libc::sigaddset(&raw mut set, signal);
+		libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+		libc::raise(signal);
+	}
 }
 
 /// bash's `--pretty-print` instead of running: the status when `launch`
@@ -512,8 +542,14 @@ pub fn pretty_print_mode(launch: &mut Launch) -> Option<i32> {
 }
 
 /// Run the shell `args` describes on `input`, with the process environment
-/// `env`; the exit status (0–255).
-fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: ProcessOptions) -> i32 {
+/// `env`; the exit status (0–255), and the signal the shell died of
+/// ([`Shell::killed_by`], [`Shell::exec_signal`]).
+fn run(
+	args: &ShellArgs,
+	env: Vec<(BString, BString)>,
+	input: Input,
+	opts: ProcessOptions,
+) -> (i32, Option<i32>) {
 	// Declared first, dropped last: the runtime gets its dispositions back
 	// after the host has put its trap handlers back.
 	let _runtime = if opts.embedded {
@@ -521,7 +557,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 			Ok(saved) => Some(saved),
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return 2;
+				return (2, None);
 			},
 		}
 	} else {
@@ -545,7 +581,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 			Ok(shell) => shell,
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return 2;
+				return (2, None);
 			},
 		};
 	let root = Vpid(cfg.vpid_base);
@@ -554,6 +590,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 	shell.set_event_mask(EventMask::NONE);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
+	let died_of = shell.killed_by().or_else(|| shell.exec_signal(run));
 	// zsh `zexit`: hang up running jobs, give the terminal back.
 	shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
 	// Standalone, the process exits next: let the OS reclaim the engine's
@@ -569,7 +606,7 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 		mem::forget(store);
 		mem::forget(engine);
 	}
-	status & 0xff
+	(status & 0xff, died_of)
 }
 
 /// The new shell's initial state from the command line `args`.

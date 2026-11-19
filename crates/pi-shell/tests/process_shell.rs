@@ -144,6 +144,50 @@ fn a_trapnal_function_catches_a_real_signal() {
 	}
 }
 
+/// `args` run as `zsh` by `program`: stdout, stderr, and the signal the
+/// process died of (`None`: it exited).
+fn run_signal(program: impl AsRef<OsStr>, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+	use std::os::unix::process::ExitStatusExt;
+	let out = Command::new(program)
+		.arg0("zsh")
+		.args(args)
+		.env_remove("ZDOTDIR")
+		.output()
+		.expect("start the shell");
+	(out.stdout, out.stderr, out.status.signal())
+}
+
+/// A signal without a trap whose default action ends the shell ends the
+/// shell's process by that signal, as zsh's does: its parent sees
+/// `WIFSIGNALED` with the signal, not an exit with 128 + its number.
+#[test]
+fn an_untrapped_signal_kills_the_shell_process() {
+	let args = ["-f", "-c", "print before; kill -TERM $$; print after"];
+	let ours = run_signal(env!("CARGO_BIN_EXE_obash"), &args);
+	assert_eq!(ours, (b"before\n".to_vec(), Vec::new(), Some(libc::SIGTERM)));
+	if have_zsh() {
+		assert_eq!(ours, run_signal(zsh_oracle::path(), &args));
+	}
+}
+
+/// The parent shell of a shell that died of a signal: `$?` is 128 + the
+/// signal's number, and a non-interactive parent prints no job notice.
+#[test]
+fn a_parent_shell_reports_its_child_shells_signal_death() {
+	let dir = tempfile::tempdir().expect("a directory for a `zsh` link");
+	let zsh = dir.path().join("zsh");
+	std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_obash"), &zsh).expect("link obash as zsh");
+	let line = |shell: &std::path::Path| {
+		format!("{} -f -c 'kill -TERM $$'; print -r -- st=$?", shell.display())
+	};
+	let ours = run(&zsh, &["-f", "-c", &line(&zsh)]);
+	assert_eq!(ours, (b"st=143\n".to_vec(), Vec::new(), Some(0)));
+	if have_zsh() {
+		let real = zsh_oracle::path();
+		assert_eq!(ours, run(&real, &["-f", "-c", &line(&real)]));
+	}
+}
+
 /// A standalone shell abandons the externals still running when it exits:
 /// a background job without `nohup` gets `TERM` and is gone shortly after.
 #[test]
