@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The native addon now loads from a directory whose path contains `?`, such as a `HOME`, `PI_NATIVES_DIR` or install directory named that way; the loader opens each `.node` with `process.dlopen`, because Bun's `require` cannot load a module from such a path
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
