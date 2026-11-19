@@ -4988,6 +4988,67 @@ pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc
 	}
 }
 
+/// bash `termsig_handler` for vproc `vp` and the fatal signal `sig`, when
+/// an EXIT trap of its own is set (bash catches its `terminating_signals`
+/// once one is): what it runs gets the signal, its frames go, the EXIT
+/// trap runs with `$?` as it was, and when the trap ends the vproc exits
+/// with `status` (128 + the signal's number). `false`, and nothing done,
+/// without such a trap.
+pub fn bash_termsig(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	sig: crate::bash::signal::Signal,
+	status: i32,
+) -> bool {
+	if vp.parent.is_some() && !vp.own_traps.has(TrapKey::Exit) {
+		return false;
+	}
+	match state::record(cx.store, vp, Key::Trap(TrapKey::Exit)) {
+		Ok(Some(Record::Trap { action, .. })) if !action.is_empty() => {},
+		Ok(_) => return false,
+		Err(err) => {
+			k.fail(err);
+			return false;
+		},
+	}
+	for frame in &mut vp.frames {
+		if let Some(sc) = frame.scratch.as_mut() {
+			match &mut sc.live {
+				super::proc::Live::Task(task) => task.signal(sig),
+				super::proc::Live::Ext(ext) => {
+					let _ = ext.signal(sig);
+					let _ = ext.cont();
+				},
+				_ => {},
+			}
+		}
+	}
+	unwind(&mut k.root, cx.store, vp, 0);
+	vp.blocked = None;
+	vp.stopped = false;
+	if let Some(run) = vp.runs.front_mut() {
+		run.exit_trap_started = true;
+	}
+	if vp.transient {
+		vp.exit_trap_run = true;
+	}
+	if !start_trap(k, vp, cx, TrapKey::Exit) {
+		vp.status = status;
+		return true;
+	}
+	// The trap's end exits with `status`; the trap itself sees `$?`.
+	if let Some(Frame {
+		kind: FrameKind::Script { what: ScriptKind::Trap { status: end, exit, .. }, .. },
+		..
+	}) = vp.frames.last_mut()
+	{
+		*end = status;
+		*exit = true;
+	}
+	true
+}
+
 /// Push a script frame running `src` (`eval`, `source`).
 pub fn push_script(vp: &mut Vproc, src: &[u8], line: u32, what: ScriptKind) {
 	if matches!(what, ScriptKind::Trap { .. }) {

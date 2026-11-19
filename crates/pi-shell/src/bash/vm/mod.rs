@@ -2570,12 +2570,21 @@ impl Shell {
 			}
 			match sig.default_action() {
 				DefaultAction::Terminate => {
+					// bash catches its fatal signals once an EXIT trap is set
+					// (`initialize_terminating_signals`): the trap runs, then
+					// the shell dies of the signal (`termsig_handler`).
+					let status = sig.exit_status(platform);
+					let caught = self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Bash
+						&& bash_fatal(sig)
+						&& exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, sig, status);
 					if self.procs[i].parent.is_none() {
 						// The root shell dies of the signal: a process host
 						// dies of it too ([`Shell::killed_by`]).
 						self.k.killed_by = Some(i32::from(sig.number(platform)));
 					}
-					self.kill(cx, i, sig, sig.exit_status(platform));
+					if !caught {
+						self.kill(cx, i, sig, status);
+					}
 				},
 				DefaultAction::Stop | DefaultAction::Continue => {
 					let stop = sig.default_action() == DefaultAction::Stop;
@@ -2825,6 +2834,33 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			e.status = status;
 		}
 	}
+}
+
+/// bash's `terminating_signals` (`sig.c`): the fatal signals it catches,
+/// to run its EXIT trap first, once one is set. `PROF`, `STKFLT` and `PWR`
+/// are not among them (measured with bash 5.2.21).
+const fn bash_fatal(sig: Signal) -> bool {
+	matches!(
+		sig,
+		Signal::Hup
+			| Signal::Int
+			| Signal::Ill
+			| Signal::Trap
+			| Signal::Abrt
+			| Signal::Emt
+			| Signal::Fpe
+			| Signal::Bus
+			| Signal::Segv
+			| Signal::Sys
+			| Signal::Pipe
+			| Signal::Alrm
+			| Signal::Term
+			| Signal::Xcpu
+			| Signal::Xfsz
+			| Signal::Vtalrm
+			| Signal::Usr1
+			| Signal::Usr2
+	)
 }
 
 /// Pass `sig` on to the builtin tasks and externals `p` runs now.

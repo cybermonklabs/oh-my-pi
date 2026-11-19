@@ -298,6 +298,55 @@ fn run_ignoring(
 	run_entry(program, "zsh", args, &[libc::SIGUSR1, libc::SIGHUP])
 }
 
+/// bash catches its fatal signals once an EXIT trap is set: the trap runs
+/// (with `$?` as it was), then the shell dies of the signal; a subshell
+/// with a trap of its own does the same. A signal bash does not catch
+/// (`PROF`) and a trapped one behave as without the EXIT trap.
+#[test]
+fn bash_runs_its_exit_trap_before_dying_of_a_fatal_signal() {
+	let cases: [(&str, &[u8], Option<i32>, Option<i32>); 6] = [
+		(
+			"trap 'echo x $?' EXIT; kill -TERM $$; echo not-reached",
+			b"x 0\n",
+			None,
+			Some(libc::SIGTERM),
+		),
+		("trap 'echo x $?' EXIT; kill -HUP $$; echo not-reached", b"x 0\n", None, Some(libc::SIGHUP)),
+		(
+			"f() { kill -TERM $$; echo not-reached; }; trap 'echo x $?' EXIT; f",
+			b"x 0\n",
+			None,
+			Some(libc::SIGTERM),
+		),
+		(
+			"( trap 'echo sub-x $?' EXIT; kill -TERM $BASHPID; echo not-reached ); echo st=$?",
+			b"sub-x 0\nst=143\n",
+			Some(0),
+			None,
+		),
+		("trap 'echo x' EXIT; kill -PROF $$; echo not-reached", b"", None, Some(libc::SIGPROF)),
+		(
+			"trap 'echo x' EXIT; trap 'echo t' TERM; kill -TERM $$; echo after",
+			b"t\nafter\nx\n",
+			Some(0),
+			None,
+		),
+	];
+	for (script, out, code, signal) in cases {
+		let args = ["-c", script];
+		let ours = run_entry(env!("CARGO_BIN_EXE_obash"), "bash", &args, &[]);
+		// bash also prints a notice of the subshell that died (on stderr),
+		// which obash does not: stdout and the status are compared.
+		assert_eq!((ours.0.as_slice(), ours.2, ours.3), (out, code, signal), "{script}");
+		if Path::new("/bin/bash").is_file() {
+			let bash = run_entry("/bin/bash", "bash", &args, &[]);
+			assert_eq!((ours.0, ours.2, ours.3), (bash.0, bash.2, bash.3), "{script}");
+		} else {
+			zsh_oracle::uncompared("no /bin/bash to compare the EXIT trap cases with");
+		}
+	}
+}
+
 /// zsh's `entersubsh`: a `( … )`, `&` or `$( )` subshell unsets the traps
 /// it inherits, ignored (`''`) ones too unless `posixtraps` is set, so a
 /// signal sent to it has its default action; a pipeline stage keeps every
