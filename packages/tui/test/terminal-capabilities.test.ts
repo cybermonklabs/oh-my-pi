@@ -277,7 +277,7 @@ describe("tmux client terminal resolution", () => {
 			{ [CLIENT_QUERY]: clientReport, [PASSTHROUGH_QUERY]: "on" },
 			async binDir => {
 				// A production child, in a home of its own, whose tmux is the fake one.
-				const env = createProductionChildEnv(subprocessEnv({}));
+				const env = createProductionChildEnv();
 				const proc = Bun.spawn({
 					cmd: [
 						process.execPath,

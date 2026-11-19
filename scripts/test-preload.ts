@@ -14,11 +14,11 @@
  * config root (`OMP_CONFIG_ROOT`), with the agent directory and mnemopi's state in it, is an
  * empty directory of this process's own; only the version-fixed downloads stay in the
  * developer's `~/.omp` (`OMP_DOWNLOAD_ROOT`). git and jj read configuration of the root's own
- * instead of the home's (no identity, no signing). The directory of the Bun the process runs on
- * goes first on PATH, so a child that runs `bun` by name never runs a version manager's shim,
- * which fails in a home of a test's own; and when the first `git` on PATH is a wrapper (a
- * dotfiles or version-manager shim), a directory holding only the real `git` goes before it.
- * `scripts/test-env.ts` says which names, which wrappers and why.
+ * instead of the home's (no identity, no signing). A directory of the process's own goes first
+ * on PATH when it needs one, holding the Bun the process runs on as `bun` when the first `bun` on
+ * PATH is another (a version manager's shim, which fails in a home of a test's own), and the real
+ * `git` when the first `git` on PATH is a wrapper (a dotfiles or version-manager shim). Every
+ * other tool resolves as before. `scripts/test-env.ts` says which names, which wrappers and why.
  * A marked process does not read the home `.env` or `~/.omp/.env` either
  * (`packages/utils/src/env.ts`), which would put those names back. A test that needs one of
  * them sets its own value; a test that gives a child a home of its own and wants omp to use
@@ -102,7 +102,7 @@ function openLibc(library: string) {
 }
 
 // The environment every test process starts with (scripts/test-env.ts): the machine's names
-// removed, omp directories and git and jj configuration of its own, this Bun's directory and the
+// removed, omp directories and git and jj configuration of its own, this Bun as `bun` and the
 // real git first on PATH, and the test-runtime marker. Each change goes into the C environment
 // and `process.env`.
 const testEnv = createTestChildEnv(process.env);

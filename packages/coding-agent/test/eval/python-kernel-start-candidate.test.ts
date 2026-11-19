@@ -10,6 +10,7 @@ import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { $which, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "../helpers/settings-test-state";
+import { createProductionChildEnv } from "../../../../scripts/test-env";
 
 // An activated venv or conda env outranks PATH (docs/environment-variables.md), so it would
 // hide the PATH order these tests build.
@@ -45,7 +46,10 @@ describe.skipIf(process.platform === "win32" || !HAS_PYTHON3)(
 		let bin: string;
 		let restoreActiveEnv: () => void;
 
-		/** Puts an executable `python` first on PATH, in the shell env the kernel reads too. */
+		/**
+		 * Puts an executable `python` first on PATH, in the shell env the kernel reads too, whose
+		 * home is one of its own: a Python reads none of the developer's user site-packages there.
+		 */
 		function firstPython(script: string): string {
 			const python = path.join(bin, "python");
 			fs.writeFileSync(python, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
@@ -53,7 +57,7 @@ describe.skipIf(process.platform === "win32" || !HAS_PYTHON3)(
 			vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 				shell: "/bin/sh",
 				args: ["-c"],
-				env: { PATH: process.env.PATH, HOME: process.env.HOME ?? "" },
+				env: createProductionChildEnv({ PATH: process.env.PATH }),
 				prefix: undefined,
 			});
 			return python;
