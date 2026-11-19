@@ -24,6 +24,9 @@ import { readStoredSession, readStoredSessions } from "../helpers/sql-session-st
 const SQLITE_SCHEMA = [
 	`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len INTEGER)`,
 	`CREATE TABLE omp_session_files_parts (path TEXT NOT NULL, start_offset INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY (path, start_offset))`,
+	`CREATE TABLE omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BLOB NOT NULL, byte_len INTEGER NOT NULL, mime_type TEXT, created_ms INTEGER NOT NULL)`,
+	`CREATE TABLE omp_session_files_refs (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))`,
+	`CREATE INDEX omp_session_files_rhash ON omp_session_files_refs (sha256)`,
 ];
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
@@ -650,6 +653,12 @@ function capturingClient(
 			if (transaction !== null && sql === READ_ONLY_READ && server.setting && server.resetVal) {
 				return [{ setting: server.setting, reset_val: server.resetVal }];
 			}
+			// MySQL's start-up checks the blob and reference tables' keys: as docs/session.md gives them.
+			if (sql.includes("information_schema.KEY_COLUMN_USAGE")) {
+				return String(values?.[0]).endsWith("_refs")
+					? [{ name: "path" }, { name: "sha256" }]
+					: [{ name: "sha256" }];
+			}
 			// A read sent alone with its search_path lock: one (empty) result per statement.
 			if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
 			return [];
@@ -680,17 +689,24 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres");
 		const storage = await SqlSessionStorage.create({ client });
 
-		// The stub has no tables, so start-up makes all three, with the lease table's index, in one statement batch.
+		// The stub has no tables, so start-up makes all five, with the reference and lease tables' indexes, in one statement batch.
 		const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 		expect(more).toHaveLength(0);
 		const tables = (made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
+		expect(tables).toHaveLength(5);
 		expect(tables[0]).toContain("omp_session_files (path TEXT PRIMARY KEY");
 		expect(tables[0]).toContain("mtime_ms BIGINT");
 		expect(tables[0]).toContain("byte_len BIGINT");
 		expect(tables[1]).toContain("omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL");
 		expect(tables[1]).toContain("PRIMARY KEY (path, start_offset)");
-		expect(tables[2]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
+		expect(tables[2]).toContain("omp_session_files_blobs (sha256 TEXT PRIMARY KEY, content BYTEA NOT NULL");
+		expect(tables[3]).toContain(
+			"omp_session_files_refs (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))",
+		);
+		expect(made?.sql).toMatch(
+			/CREATE INDEX IF NOT EXISTS omp_session_files_rhash ON \S*omp_session_files_refs \(sha256\)/,
+		);
+		expect(tables[4]).toContain("omp_session_leases (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL");
 		// One transaction behind the start-up opening, which takes the start-up lock, looks again and makes them.
 		expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 			...START_UP_OPENING,
@@ -774,7 +790,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 
 			const [made, ...more] = queries.filter(q => q.sql.includes("CREATE TABLE"));
 			expect(more).toHaveLength(0);
-			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(3);
+			expect((made?.sql ?? "").split("; ").filter(sql => sql.startsWith("CREATE TABLE"))).toHaveLength(5);
 			expect(inOneTransaction(queries.filter(query => query.transaction === made?.transaction))).toEqual([
 				...START_UP_OPENING,
 				expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
@@ -788,6 +804,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files /),
 				expect.stringMatching(/^DELETE FROM "public"\.omp_session_files_parts /),
 				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files_parts /),
+				// A full write replaces the session's references too: it reads them first, to lock their blobs'
+				// rows before it deletes them; it names no blob and the stub has none, so it locks, deletes and adds none.
+				expect.stringMatching(/^SELECT sha256, path FROM "public"\.omp_session_files_refs WHERE path IN /),
 			]);
 
 			const appendStart = queries.length;
@@ -810,15 +829,19 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		await writer.close();
 
 		const tables = queries.filter(q => q.sql.startsWith("CREATE TABLE"));
-		expect(tables).toHaveLength(3);
 		for (const table of tables.slice(0, 2)) {
 			expect(table.sql).toContain("path VARCHAR(512) NOT NULL");
 			expect(table.sql).toContain("LONGTEXT");
 			expect(table.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 		}
 		expect(tables[1]?.sql).toContain("PRIMARY KEY (path, start_offset)");
-		expect(tables[2]?.sql).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
-		expect(tables[2]?.sql).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+		const made = (name: string): string | undefined => tables.find(q => q.sql.includes(` ${name} (`))?.sql;
+		expect(made("omp_session_files_blobs")).toContain(
+			"sha256 CHAR(64) NOT NULL PRIMARY KEY, content LONGBLOB NOT NULL",
+		);
+		expect(made("omp_session_files_blobs")).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+		expect(made("omp_session_leases")).toContain("omp_session_leases (session_id VARCHAR(512) NOT NULL PRIMARY KEY");
+		expect(made("omp_session_leases")).toContain("ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
 
 		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
 		expect(loadIndex?.sql).toContain("byte_len");

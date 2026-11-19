@@ -1184,7 +1184,9 @@ export class SessionManager {
 		this.#sessionDir = sessionDir ? path.resolve(sessionDir) : sessionDir;
 		this.#persist = persist;
 		this.#storage = storage;
-		this.#blobs = new BlobStore(getBlobsDir());
+		// A storage that keeps blobs beside the local store (SQL) gets each one a session
+		// persists and cannot draw again, landed before the transcript write that names it.
+		this.#blobs = new BlobStore(getBlobsDir(), storage.blobTier);
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(this.#sessionDir);
 	}
@@ -3122,7 +3124,8 @@ export class SessionManager {
 		}
 
 		const migrated = migrateToCurrentVersion(fileEntries);
-		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
+		// The blobs this session names get its reference rows, so another session's delete keeps them.
+		await resolveBlobRefsInEntries(fileEntries, this.#blobs, resolvedSessionFile);
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
 

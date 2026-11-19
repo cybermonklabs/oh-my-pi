@@ -51,7 +51,7 @@ afterEach(async () => {
 	current = undefined;
 	if (!db) return;
 	try {
-		for (const name of [`${db.table}_parts`, db.table, db.scratch]) {
+		for (const name of [`${db.table}_parts`, `${db.table}_blobs`, db.table, db.scratch]) {
 			await db.other.unsafe(`DROP TABLE IF EXISTS ${name}`);
 		}
 	} finally {
@@ -497,7 +497,8 @@ describe.skipIf(!url)("SqlSessionStorage starting beside other stores on Postgre
 				expect(await columns({ other }, `${table}_parts`)).toEqual(["content", "path", "start_offset"]);
 			} finally {
 				try {
-					for (const name of [`${table}_parts`, table]) await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
+					for (const name of [`${table}_parts`, `${table}_blobs`, table])
+						await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
 				} finally {
 					await Promise.all([...clients, other].map(client => client.end()));
 				}

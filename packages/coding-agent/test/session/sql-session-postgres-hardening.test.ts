@@ -41,8 +41,10 @@ const SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
 const SESSION_TABLE = "omp_session_files";
 const PARTS_TABLE = "omp_session_files_parts";
 const LEASE_TABLE = "omp_session_leases";
+const BLOBS_TABLE = "omp_session_files_blobs";
+const REFS_TABLE = "omp_session_files_refs";
 
-/** The columns of the store's three tables and their declared types. */
+/** The columns of the store's tables and their declared types. */
 const DECLARED: Record<string, Record<string, string>> = {
 	[SESSION_TABLE]: {
 		path: "text",
@@ -54,6 +56,7 @@ const DECLARED: Record<string, Record<string, string>> = {
 		byte_len: "bigint",
 	},
 	[PARTS_TABLE]: { path: "text", start_offset: "bigint", content: "text" },
+	[BLOBS_TABLE]: { sha256: "text", content: "bytea", byte_len: "bigint", mime_type: "text", created_ms: "bigint" },
 	[LEASE_TABLE]: {
 		session_id: "text",
 		holder: "text",
@@ -130,6 +133,9 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 			}));
 		}
 		if (sql.startsWith("SELECT 'trigger' AS kind")) return server.plantedObjects ?? [];
+		// The blob table's primary key, and the INSERT grant the store's login holds on it.
+		if (sql.startsWith("SELECT a.attname::text AS name FROM pg_catalog.pg_index i")) return [{ name: "sha256" }];
+		if (sql.startsWith("SELECT pg_catalog.has_table_privilege(")) return [{ can: true }];
 		if (sql.startsWith("SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i")) {
 			return holderIndex() ? [{ oid: "1" }] : [];
 		}
@@ -443,7 +449,9 @@ async function noCreateLogin(without: readonly string[] = []): Promise<NoCreateL
 	try {
 		await (await SqlSessionStorage.create({ client: owner, claims: true })).drain();
 		for (const table of without) await owner.unsafe(`DROP TABLE ${table}`);
-		const kept = [SESSION_TABLE, PARTS_TABLE, LEASE_TABLE].filter(table => !without.includes(table));
+		const kept = [SESSION_TABLE, PARTS_TABLE, BLOBS_TABLE, REFS_TABLE, LEASE_TABLE].filter(
+			table => !without.includes(table),
+		);
 		for (const statement of [
 			`CREATE ROLE ${agent} LOGIN`,
 			`GRANT CONNECT ON DATABASE ${database} TO ${agent}`,
@@ -689,8 +697,8 @@ describe.skipIf(!pgUrl)("SqlSessionStorage start-up on PostgreSQL", () => {
 		await db.open({ wrap: client => recording(client as unknown as SqlSessionStorageClient, again) });
 
 		expect({ first: startUpLocks(first), again: startUpLocks(again) }).toEqual({
-			// The session, parts and lease tables, and the lease table's holder index.
-			first: { locks: 1, creates: 4 },
+			// The session, parts, blob, reference and lease tables, and the reference and lease tables' indexes.
+			first: { locks: 1, creates: 7 },
 			again: { locks: 0, creates: 0 },
 		});
 	});
@@ -982,7 +990,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 				await db.sql(`CREATE ROLE ${storeRole} LOGIN`);
 				await db.sql(`GRANT USAGE, CREATE ON SCHEMA public TO ${storeRole}`);
 				await db.sql(
-					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${db.table}_parts, ${db.leaseTable} TO ${storeRole}`,
+					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${db.table}_parts, ${db.table}_blobs, ${db.table}_refs, ${db.leaseTable} TO ${storeRole}`,
 				);
 				const client = new SQL(urlAs(db, storeRole));
 				let outcome: string;
@@ -1035,7 +1043,9 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 					ran,
 				}).toEqual({ outcome: plant.opens ? "opened (write landed; delete landed)" : "names it", ran: [] });
 			} finally {
-				await db.sql(`DROP TABLE IF EXISTS ${db.leaseTable}, ${db.table}_parts, ${db.table} CASCADE`);
+				await db.sql(
+					`DROP TABLE IF EXISTS ${db.leaseTable}, ${db.table}_parts, ${db.table}_blobs, ${db.table} CASCADE`,
+				);
 				await db.sql(
 					`DROP TABLE IF EXISTS public.planted_parted_${process.pid}, public.planted_parent_${process.pid}, public.planted_other_${process.pid}, public.planted_fkref_${process.pid} CASCADE`,
 				);
