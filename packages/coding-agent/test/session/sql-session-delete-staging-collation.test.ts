@@ -6,8 +6,15 @@
  * below `<stem>0`. The case makes its own database on the server that
  * `OMP_TEST_SQL_POSTGRES_URL` names, and drops it after; it is skipped when
  * that login may not create a database or the server has no Thai ICU
- * collation.
+ * collation. The last case gives the `path` column a nondeterministic ICU
+ * collation that ignores letter case, and checks that the delete leaves the
+ * staging parts of another session's write alone; it makes a database of its
+ * own too, and is skipped when the server cannot make such a collation.
  */
+import type {
+	SqlSessionStorageClient,
+	SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -164,6 +171,166 @@ describe.skipIf(SKIP !== undefined)(
 				neighbourParts: neighbours,
 			});
 			release?.();
+		}, 120_000);
+	},
+);
+
+const ND_DATABASE = `omp_nd_${process.pid}_${Date.now().toString(36)}`;
+const ND_COLLATION = "path_ci";
+
+/** Why the nondeterministic-collation case cannot run on `SERVER_URL`'s server, or `undefined` when it can. */
+async function nondeterministicSkipReason(): Promise<string | undefined> {
+	if (!SERVER_URL) return "OMP_TEST_SQL_POSTGRES_URL is not set";
+	const admin = new SQL(SERVER_URL);
+	try {
+		const [role] = (await admin.unsafe(
+			"SELECT rolcreatedb OR rolsuper AS can FROM pg_catalog.pg_roles WHERE rolname = current_user",
+		)) as Array<{ can: boolean }>;
+		if (!role?.can) return "the login may not create a database";
+		// Nondeterministic collations exist since PostgreSQL 12, and only with the ICU provider.
+		const [version] = (await admin.unsafe("SELECT current_setting('server_version_num')::int AS num")) as Array<{
+			num: number;
+		}>;
+		if ((version?.num ?? 0) < 120000) return "the server makes no nondeterministic collation (before PostgreSQL 12)";
+		const icu = await admin.unsafe("SELECT 1 FROM pg_catalog.pg_collation WHERE collprovider = 'i' LIMIT 1");
+		if (icu.length === 0) return "the server has no ICU collations";
+		return undefined;
+	} finally {
+		await admin.end();
+	}
+}
+
+const ND_SKIP = await nondeterministicSkipReason();
+if (ND_SKIP) console.warn(`sql-session-delete-staging-collation (nondeterministic): skipped: ${ND_SKIP}`);
+
+/**
+ * A client wrapper under which a staged full write stops between its staging
+ * and its swap: every transaction after the first one that wrote staging
+ * parts waits until `release()`. `staged` resolves once that first one has
+ * committed.
+ */
+function holdSwapAfterStaging(): {
+	wrap: (inner: SqlSessionStorageClient) => SqlSessionStorageClient;
+	staged: Promise<void>;
+	release: () => void;
+} {
+	const staged = Promise.withResolvers<void>();
+	const gate = Promise.withResolvers<void>();
+	let hasStaged = false;
+	return {
+		staged: staged.promise,
+		release: () => gate.resolve(),
+		wrap: inner => ({
+			options: inner.options,
+			unsafe: (query, values) => inner.unsafe(query, values),
+			async transaction(callback) {
+				if (hasStaged) await gate.promise;
+				let stages = false;
+				const result = await inner.transaction(transaction =>
+					callback({
+						unsafe(query, values) {
+							if (values?.some(value => typeof value === "string" && value.includes("#staging-"))) stages = true;
+							return transaction.unsafe(query, values);
+						},
+					} satisfies SqlSessionStorageTransaction),
+				);
+				if (stages && !hasStaged) {
+					hasStaged = true;
+					staged.resolve();
+				}
+				return result;
+			},
+			end: () => inner.end?.() ?? Promise.resolve(),
+		}),
+	};
+}
+
+describe.skipIf(ND_SKIP !== undefined)(
+	`deleting a SQL session on PostgreSQL whose path column has a nondeterministic ICU collation${ND_SKIP ? ` (skipped: ${ND_SKIP})` : ""}`,
+	() => {
+		/** The URL of {@link ND_DATABASE} on `SERVER_URL`'s server. */
+		const ndDatabaseUrl = (): string => {
+			const url = new URL(SERVER_URL ?? "");
+			url.pathname = `/${ND_DATABASE}`;
+			return url.toString();
+		};
+
+		beforeAll(async () => {
+			const admin = new SQL(SERVER_URL ?? "");
+			try {
+				await admin.unsafe(`CREATE DATABASE ${ND_DATABASE} TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'`);
+			} finally {
+				await admin.end();
+			}
+			const db = new SQL(ndDatabaseUrl());
+			try {
+				// Case-insensitive: "a" and "A" compare equal.
+				await db.unsafe(
+					`CREATE COLLATION ${ND_COLLATION} (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+				);
+			} finally {
+				await db.end();
+			}
+		});
+
+		afterAll(async () => {
+			const admin = new SQL(SERVER_URL ?? "");
+			try {
+				await admin.unsafe(`DROP DATABASE IF EXISTS ${ND_DATABASE} WITH (FORCE)`);
+			} finally {
+				await admin.end();
+			}
+		});
+
+		it("lets another session's staged first write under a directory named the same but for letter case finish with its body", async () => {
+			// If this regresses, deleting a session makes another session's subagent transcript, whose first save is
+			// under way in a directory whose name differs only in letter case, fail to save with a write conflict.
+			await using db = await openLeaseDb("postgres", ndDatabaseUrl());
+			// The tables, made by hand before the store starts, compare paths with the nondeterministic collation.
+			await db.sql(
+				`CREATE TABLE ${db.table} (path TEXT COLLATE ${ND_COLLATION} PRIMARY KEY, content TEXT NOT NULL, ` +
+					"mtime_ms BIGINT NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len BIGINT)",
+			);
+			await db.sql(
+				`CREATE TABLE ${db.table}_parts (path TEXT COLLATE ${ND_COLLATION} NOT NULL, start_offset BIGINT NOT NULL, ` +
+					"content TEXT NOT NULL, PRIMARY KEY (path, start_offset))",
+			);
+			const root = path.join(db.dir.path(), "sessions", "-project-");
+			const file = path.join(root, "a.jsonl");
+			const artifacts = `${path.join(root, "a")}/`;
+			const neighbour = path.join(root, "A", "Task.jsonl");
+			const owner = await db.open({ claims: false });
+			await owner.writeText(file, transcript(ID, "parent"));
+			await owner.writeText(`${artifacts}Task.jsonl`, transcript(ID, "child"));
+			await owner.drain();
+
+			// Another store writes the neighbour's first body and stops after staging it, before its swap.
+			const hold = holdSwapAfterStaging();
+			const writer = await db.open({ claims: false, wrap: hold.wrap });
+			await writer.refresh();
+			const lines = transcript(ID, "neighbour")
+				.split("\n")
+				.filter(Boolean)
+				.map(line => `${line}\n`);
+			const write = (async () => {
+				await writer.writeLinesAtomic(neighbour, lines, { expectedSize: null });
+				await writer.drain();
+			})().then(
+				() => "saved",
+				(err: unknown) => (err instanceof Error ? `${err.name}: ${err.message}` : String(err)),
+			);
+			await hold.staged;
+
+			await owner.deleteSessionWithArtifacts(file);
+			await owner.drain();
+			hold.release();
+
+			expect(await write).toBe("saved");
+			const reader = await db.open({ claims: false });
+			await reader.refresh();
+			expect(await reader.readText(neighbour)).toBe(lines.join(""));
+			// The delete did remove the session and its artifacts.
+			expect((await db.paths()).filter(stored => stored === file || stored.startsWith(artifacts))).toEqual([]);
 		}, 120_000);
 	},
 );
