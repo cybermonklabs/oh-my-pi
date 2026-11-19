@@ -298,6 +298,41 @@ fn run_ignoring(
 	run_entry(program, "zsh", args, &[libc::SIGUSR1, libc::SIGHUP])
 }
 
+/// zsh's `entersubsh`: a `( … )`, `&` or `$( )` subshell unsets the traps
+/// it inherits, ignored (`''`) ones too unless `posixtraps` is set, so a
+/// signal sent to it has its default action; a pipeline stage keeps every
+/// trap and runs a caught one itself. (bash keeps `''` traps in every
+/// subshell and resets the others in every one.)
+#[test]
+fn a_zsh_subshell_unsets_its_traps_and_a_pipeline_stage_keeps_them() {
+	let script = "zmodload zsh/system; trap '' TERM; trap 'print caught-usr2' USR2
+( kill -TERM $sysparams[pid]; print not-reached ); print paren=$?
+{ kill -USR2 $sysparams[pid]; print stage-alive } | cat; print stage=$pipestatus
+{ kill -TERM $sysparams[pid]; print not-reached } & wait $!; print bg=$?
+x=$(kill -TERM $sysparams[pid]; print not-reached); print \"subst=$? $x\"
+setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posix=$?
+( trap ); print listed";
+	let args = ["-f", "-c", script];
+	let ours = obash(&args);
+	assert_eq!(
+		(
+			String::from_utf8_lossy(&ours.0).into_owned(),
+			String::from_utf8_lossy(&ours.1).into_owned(),
+			ours.2
+		),
+		(
+			"paren=143\ncaught-usr2\nstage-alive\nstage=0 0\nbg=143\nsubst=143 \
+			 \nposix-alive\nposix=0\ntrap -- '' TERM\nlisted\n"
+				.to_owned(),
+			String::new(),
+			Some(0)
+		)
+	);
+	if have_zsh() {
+		assert_eq!(ours, run(zsh_oracle::path(), &args));
+	}
+}
+
 /// bash (which ignores `QUIT` "in all cases") and a non-interactive zsh
 /// (`init_signals`) ignore `QUIT` in the shell's own process: one sent by
 /// another process (`/bin/kill`) or by the shell itself does nothing, and

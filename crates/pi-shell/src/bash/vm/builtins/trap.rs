@@ -337,6 +337,36 @@ fn release_held(
 	Ok(())
 }
 
+/// zsh `entersubsh` for `child`, a new zsh subshell. Without
+/// `ESUB_KEEPTRAP` (`keep` false: `( … )`, `&`, `$( )`, `<( )`, a
+/// coproc) it unsets every signal trap but the `TRAPNAL` functions,
+/// ignored ones included unless `posixtraps` is set. With it (`keep`: a
+/// pipeline stage) every trap stays, and a caught signal's trap runs in
+/// the child, where bash's subshells reset it.
+///
+/// # Errors
+///
+/// A store failure reading the traps or the option.
+pub fn zsh_enter_subshell(
+	root: &mut state::Root,
+	store: &mut dyn StateStore,
+	child: &mut Vproc,
+	keep: bool,
+) -> Result<(), StoreError> {
+	let posixtraps = state::zsh_option(root, store, child, crate::bash::zshopt::ZshOpt::Posixtraps)?;
+	for (key, rec) in state::listed_traps(root, store, child)? {
+		let (KeyBuf::Trap(key @ TrapKey::Signal(_)), Record::Trap { action, .. }) = (key, rec) else {
+			continue;
+		};
+		if keep {
+			child.own_traps = child.own_traps.with(key);
+		} else if !(posixtraps && action.is_empty()) {
+			state::store_record(root, store, child, KeyBuf::Trap(key), None);
+		}
+	}
+	Ok(())
+}
+
 /// zsh `removetrap`'s save: the trap for `key` is about to change (`trap`,
 /// a `TRAPNAL` function defined or removed). Inside a zsh function with
 /// `localtraps` the function's scope keeps the trap as it was, once.

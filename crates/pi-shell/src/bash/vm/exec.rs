@@ -708,6 +708,16 @@ fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 	}
 }
 
+/// zsh's traps in a new subshell `child` of a zsh shell
+/// ([`builtins::trap::zsh_enter_subshell`]): `keep` for a pipeline stage.
+fn zsh_subshell_traps(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc, keep: bool) {
+	if child.mode.dialect() == Dialect::Zsh
+		&& let Err(err) = builtins::trap::zsh_enter_subshell(&mut k.root, cx.store, child, keep)
+	{
+		k.fail(err);
+	}
+}
+
 /// Start this vproc's EXIT trap, at most once for a forked subshell: it has
 /// no [`Run`](super::proc::Run) to keep `exit_trap_started` on, and
 /// `own_traps`, `trap_frames` and the frame scans all return to their
@@ -2337,6 +2347,7 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			zsh_subshell_traps(k, cx, &mut child, false);
 			// With `-e` already off in the parent the child sees it off and
 			// `SHELLOPTS` is already right: nothing to reset.
 			if !inherit && state::option(&mut k.root, cx.store, vp, OptId::Errexit).unwrap_or(true) {
@@ -2427,6 +2438,7 @@ pub fn start_zsh_sub(
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	zsh_subshell_traps(k, cx, &mut child, false);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
@@ -2471,6 +2483,7 @@ pub fn start_zsh_procsub(
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	zsh_subshell_traps(k, cx, &mut child, false);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -2623,7 +2636,8 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	zsh_subshell_traps(k, cx, &mut child, false);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -4090,6 +4104,29 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				// zsh's `( … ) &` is one process, whose `entersubsh` ran with
+				// the async job's: the `( … )` that is a background job's body
+				// does not unset its traps again (they hold the async ignores).
+				let pc = vp.frames.last().map_or(u32::MAX, |f| f.pc);
+				let async_body = info.kind == SpawnKind::Subshell
+					&& unit.spawns.iter().any(|s| {
+						s.kind == SpawnKind::Background
+							&& s.stages.first().is_some_and(|st| {
+								st.entry <= pc
+									&& unit.ops[st.entry as usize..pc as usize]
+										.iter()
+										.all(|op| matches!(op.code, Opcode::Nop | Opcode::Enter))
+									&& {
+										let code_at = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+										let end =
+											info.end + u32::from(code_at(info.end) == Some(Opcode::Leave));
+										code_at(end) == Some(Opcode::SubExit) && end + 1 == s.end
+									}
+							})
+					});
+				if !async_body {
+					zsh_subshell_traps(k, cx, &mut child, false);
+				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4189,6 +4226,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					zsh_subshell_traps(k, cx, &mut child, true);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
@@ -4399,6 +4437,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	zsh_subshell_traps(k, cx, &mut child, false);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
