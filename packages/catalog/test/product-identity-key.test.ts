@@ -2,12 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { classifyModel } from "../src/compat/taxonomy";
 import { productIdentityKey, productIdentityKeys } from "../src/identity/product";
 
-/** Builds `provider/id` from its catalog identity and returns its product key. */
-function keyOf(model: string, requestModelId?: string): string | undefined {
+/** Builds the row of `provider/id` with its catalog identity. */
+function rowOf(model: string, requestModelId?: string) {
 	const slash = model.indexOf("/");
 	const provider = model.slice(0, slash);
 	const id = model.slice(slash + 1);
-	return productIdentityKey({ provider, id, identity: classifyModel(provider, id), requestModelId });
+	return { provider, id, identity: classifyModel(provider, id), requestModelId };
+}
+
+/** Builds `provider/id` from its catalog identity and returns its product key. */
+function keyOf(model: string, requestModelId?: string): string | undefined {
+	return productIdentityKey(rowOf(model, requestModelId));
 }
 
 function expectOneKey(base: string, others: readonly string[]): void {
@@ -164,10 +169,7 @@ describe("productIdentityKey", () => {
 describe("productIdentityKeys", () => {
 	/** Builds `provider/id` from its catalog identity and returns its product keys. */
 	function keysOf(model: string, requestModelId?: string): readonly string[] {
-		const slash = model.indexOf("/");
-		const provider = model.slice(0, slash);
-		const id = model.slice(slash + 1);
-		return productIdentityKeys({ provider, id, identity: classifyModel(provider, id), requestModelId });
+		return productIdentityKeys(rowOf(model, requestModelId));
 	}
 
 	test("holds the key of the served id and the key of the row's own id", () => {

@@ -1008,8 +1008,8 @@ export class TurnRecovery {
 	 * Whether `model` refused in the current retry saga, under any name: by its `provider/id`,
 	 * which every spelling and route that resolves to it shares (an alias such as `pi/default`,
 	 * an id without the catalog revision suffix, `@upstream`), or by one of its product keys
-	 * (`productIdentityKeys`, of its served id and of its catalog id), which the same model
-	 * served by another provider or on another route shares.
+	 * (`productIdentityKeys`), which the same model served by another provider or on another
+	 * route shares.
 	 */
 	#refusedInTurn(model: Model): boolean {
 		if (this.#refusedModels.has(`${model.provider}/${model.id}`)) return true;
@@ -1017,10 +1017,7 @@ export class TurnRecovery {
 		return productIdentityKeys(model).some(key => this.#refusedIdentities.has(key));
 	}
 
-	/**
-	 * Records `model`, the model a classifier refusal came from, by every key `#refusedInTurn`
-	 * reads: its `provider/id` and the product keys of its served id and of its catalog id.
-	 */
+	/** Records `model`, the model a classifier refusal came from, by every key `#refusedInTurn` reads. */
 	#recordRefusedModel(model: Model): void {
 		this.#refusedModels.add(`${model.provider}/${model.id}`);
 		for (const key of productIdentityKeys(model)) this.#refusedIdentities.add(key);

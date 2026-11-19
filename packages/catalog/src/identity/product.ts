@@ -72,7 +72,7 @@ interface ProductKeyVocabulary {
 	variantWords: Set<string>;
 	/**
 	 * Variant words that come only from suffix rules with an exception, by word, with the exceptions' prefixes: the
-	 * catalog does not strip the word from an id whose bare part starts with one of them (`max` in a `qwen` id).
+	 * catalog does not strip the word from an id whose bare part starts with every one of them (`max` in a `qwen` id).
 	 */
 	exceptedVariantWords: Map<string, string[]>;
 	/** {@link MODEL_PRODUCT_VARIANT_WORDS} by word. */
@@ -184,7 +184,7 @@ function isProductVariantWord(
 
 /**
  * Whether the catalog strips `word` from an id whose lowercase bare part is `lowerBare`. A word that comes only from
- * suffix rules with an exception is not a variant word in an id that starts with one of their prefixes.
+ * suffix rules with an exception is not a variant word in an id that starts with every one of their prefixes.
  */
 function isVariantWord(
 	variantWords: ReadonlySet<string>,
@@ -194,7 +194,7 @@ function isVariantWord(
 ): boolean {
 	if (variantWords.has(word)) return true;
 	const prefixes = exceptedVariantWords.get(word);
-	return prefixes !== undefined && !prefixes.some(prefix => lowerBare.startsWith(prefix));
+	return prefixes !== undefined && prefixes.some(prefix => !lowerBare.startsWith(prefix));
 }
 
 /**
@@ -240,10 +240,9 @@ export function productIdentityKey(
 	const served = bareModelId(model.requestModelId ?? model.id);
 	const at = served.indexOf("@");
 	const bare = at === -1 ? served : served.slice(0, at);
-	// The catalog strips a provider's lane and routing variant only from the end of an id.
 	const laneless = stripEffortLane(model.provider, bare);
 	const plain = routingVariantPlain(model.provider, laneless) ?? laneless;
-	const lowerServed = served.toLowerCase();
+	const lowerBare = bare.toLowerCase();
 	const { variantWords, exceptedVariantWords, productVariantWords, lineageWords, routeWords } =
 		getProductKeyVocabulary();
 	const classWords = nameWords(identity.class);
@@ -267,7 +266,7 @@ export function productIdentityKey(
 		if (
 			NUMBER_WORD_PATTERN.test(word) ||
 			isNameWord(word, classWords, familyWords, lineageWords) ||
-			(isVariantWord(variantWords, exceptedVariantWords, word, lowerServed) &&
+			(isVariantWord(variantWords, exceptedVariantWords, word, lowerBare) &&
 				!isProductVariantWord(productVariantWords, word, identity.class))
 		) {
 			continue;
