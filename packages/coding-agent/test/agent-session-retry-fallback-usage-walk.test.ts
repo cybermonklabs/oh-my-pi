@@ -2136,12 +2136,15 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		// its chain.
 		const WEEKLY_LIMIT_ERROR =
 			"429 Weekly usage limit reached. Resets in 55min. type=GoUsageLimitError retry-after-ms=3242000";
-		const CLAUDE = bundled("anthropic", "claude-sonnet-4-5");
 		const RESERVE: ModelUsageHealth = {
 			state: "reserve",
 			accounts: [{ credentialId: 1, credentialType: "oauth", state: "reserve", remainingFraction: 0.05 }],
 		};
 		const HEALTHY: ModelUsageHealth = { state: "healthy", accounts: [] };
+
+		beforeEach(() => {
+			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
+		});
 
 		/**
 		 * An agent on deepseek-v4-flash that records each requested `provider/id`.
@@ -2174,7 +2177,6 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// The default chain names only the spent fallback, whose own chain names
 			// deepseek-v4-pro and then the next fallback. The step past the spent
 			// fallback keeps the walk's exclusion of OpenCode Go.
-			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
@@ -2199,7 +2201,6 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// The spent fallback's own chain names only deepseek-v4-pro, which the
 			// walk's exclusion passes over, so no candidate passes and the turn ends
 			// on the limit.
-			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
@@ -2228,10 +2229,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// fallback. The step past the spent fallback takes the reserve model.
 			// The check before its call moves off it under the auto reserve policy,
 			// and that check also passes over OpenCode Go.
-			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
 			stubUsageReads({
 				[formatModelString(FALLBACK)]: depletedRead("usage"),
-				[formatModelString(CLAUDE)]: RESERVE,
+				[formatModelString(PRIMARY)]: RESERVE,
 			});
 			const requestedModels: string[] = [];
 			const run = startSession(
@@ -2240,8 +2240,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 					"retry.usageReservePolicy": "auto",
 					"retry.fallbackChains": {
 						default: [formatModelString(FALLBACK)],
-						[formatModelString(FALLBACK)]: [formatModelString(CLAUDE)],
-						[formatModelString(CLAUDE)]: [formatModelString(OPENCODE_PRO), formatModelString(NEXT_FALLBACK)],
+						[formatModelString(FALLBACK)]: [formatModelString(PRIMARY)],
+						[formatModelString(PRIMARY)]: [formatModelString(OPENCODE_PRO), formatModelString(NEXT_FALLBACK)],
 					},
 				}),
 			);
@@ -2249,7 +2249,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			await runTurn(run.session, "Hit the weekly usage limit");
 
 			expect(requestedModels).toEqual([formatModelString(OPENCODE_FLASH), formatModelString(NEXT_FALLBACK)]);
-			expect(run.fallbacks).toEqual([formatModelString(CLAUDE), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
 			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
@@ -2264,11 +2264,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// check switches to deepseek-v4-pro. That request hits the weekly limit
 			// too. The walk after it switches to Claude Sonnet 4.5, and the check
 			// before that call passes over deepseek-v4-pro and the next fallback.
-			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
 			let turn = 1;
 			stubUsageReads({
 				[formatModelString(FALLBACK)]: depletedRead("usage"),
-				[formatModelString(CLAUDE)]: RESERVE,
+				[formatModelString(PRIMARY)]: RESERVE,
 				[formatModelString(NEXT_FALLBACK)]: async () => (turn === 1 ? HEALTHY : RESERVE),
 			});
 			const requestedModels: string[] = [];
@@ -2278,8 +2277,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 					"retry.usageReservePolicy": "auto",
 					"retry.fallbackChains": {
 						default: [formatModelString(FALLBACK)],
-						[formatModelString(FALLBACK)]: [formatModelString(CLAUDE)],
-						[formatModelString(CLAUDE)]: [formatModelString(OPENCODE_PRO), formatModelString(NEXT_FALLBACK)],
+						[formatModelString(FALLBACK)]: [formatModelString(PRIMARY)],
+						[formatModelString(PRIMARY)]: [formatModelString(OPENCODE_PRO), formatModelString(NEXT_FALLBACK)],
 						[formatModelString(NEXT_FALLBACK)]: [formatModelString(OPENCODE_PRO)],
 					},
 				}),
@@ -2293,15 +2292,15 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				formatModelString(OPENCODE_FLASH),
 				formatModelString(NEXT_FALLBACK),
 				formatModelString(OPENCODE_PRO),
-				formatModelString(CLAUDE),
+				formatModelString(PRIMARY),
 			]);
 			expect(run.fallbacks).toEqual([
-				formatModelString(CLAUDE),
+				formatModelString(PRIMARY),
 				formatModelString(NEXT_FALLBACK),
 				formatModelString(OPENCODE_PRO),
-				formatModelString(CLAUDE),
+				formatModelString(PRIMARY),
 			]);
-			expect(modelOf(run.session)).toBe(formatModelString(CLAUDE));
+			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
@@ -2311,12 +2310,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// no own chain. The session runs on deepseek-v4-flash. The walk wraps
 			// around the chain after the long limit, and so does the step past the
 			// spent fallback, so the role's model answers.
-			authStorage.keys.setRuntime(OPENCODE_FLASH.provider, `${OPENCODE_FLASH.provider}-test-key`);
 			stubUsageReads({ [formatModelString(FALLBACK)]: depletedRead("usage") });
 			const requestedModels: string[] = [];
 			const run = startSession(
 				createWeeklyLimitAgent(requestedModels),
-				weeklyLimitSettings(NEXT_FALLBACK, { "retry.fallbackChains": chainOf(CLAUDE, OPENCODE_FLASH, FALLBACK) }),
+				weeklyLimitSettings(NEXT_FALLBACK, { "retry.fallbackChains": chainOf(PRIMARY, OPENCODE_FLASH, FALLBACK) }),
 			);
 
 			await runTurn(run.session, "Hit the weekly usage limit");

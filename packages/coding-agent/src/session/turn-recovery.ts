@@ -1012,6 +1012,7 @@ export class TurnRecovery {
 	 */
 	#refusedInTurn(model: Model): boolean {
 		if (this.#refusedModels.has(`${model.provider}/${model.id}`)) return true;
+		if (this.#refusedIdentities.size === 0) return false;
 		const identity = productIdentityKey(model);
 		return identity !== undefined && this.#refusedIdentities.has(identity);
 	}
@@ -3474,8 +3475,9 @@ export class TurnRecovery {
 					const usageCooldownMs = recordedUsageLimitOutcome?.switchedCredential ? undefined : usageLimitWaitMs;
 					this.noteRetryFallbackCooldown(currentSelector, usageCooldownMs ?? parsedRetryAfterMs, errorMessage);
 				}
+				const excludeProvider = longUsageLimitFallback ? currentModel.provider : undefined;
 				switchedModel = await this.#tryRetryModelFallback(currentSelector, message, {
-					excludeProvider: longUsageLimitFallback ? currentModel.provider : undefined,
+					excludeProvider,
 					pinFallback: classifierRefusal,
 					refusalWalk: classifierRefusal,
 					preserveFailedTurn,
@@ -3504,7 +3506,7 @@ export class TurnRecovery {
 				});
 				// After a long usage limit, the check before the call this switch
 				// leads to keeps the walk's exclusion.
-				if (switchedModel && longUsageLimitFallback) this.#walkExcludedProvider = currentModel.provider;
+				if (switchedModel && excludeProvider !== undefined) this.#walkExcludedProvider = excludeProvider;
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
 			// of the role-fallback setting: it's intrinsic to the Fast contract (speed

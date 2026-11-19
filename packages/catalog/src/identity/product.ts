@@ -3,8 +3,10 @@
  * product words of the id a provider serves, so one model keeps one key across
  * providers while different products of one revision keep their own.
  */
+import { once } from "@oh-my-pi/pi-utils";
 import { collapseVocabulary, discoveryVocabulary } from "../compat/taxonomy";
 import type { Model } from "../types";
+import { bareModelId } from "./id";
 
 /** A route word, and the classes where it names a route. */
 export interface ModelRouteWord {
@@ -57,8 +59,6 @@ interface ProductKeyVocabulary {
 	routeWords: Map<string, RouteWordRule[]>;
 }
 
-let productKeyVocabulary: ProductKeyVocabulary | undefined;
-
 /** The lowercase words of `text`: it splits at every character that is not an ASCII letter or digit. */
 function wordsOf(text: string): readonly string[] {
 	return text.toLowerCase().match(WORD_PATTERN) ?? [];
@@ -84,8 +84,7 @@ function addProviderWords(
 	}
 }
 
-function getProductKeyVocabulary(): ProductKeyVocabulary {
-	if (productKeyVocabulary !== undefined) return productKeyVocabulary;
+const getProductKeyVocabulary = once((): ProductKeyVocabulary => {
 	const discovery = discoveryVocabulary();
 	const collapse = collapseVocabulary();
 	const variantWords = new Set<string>();
@@ -105,9 +104,8 @@ function getProductKeyVocabulary(): ProductKeyVocabulary {
 		else rules.push({ words, entry });
 	}
 	for (const rules of routeWords.values()) rules.sort((left, right) => right.words.length - left.words.length);
-	productKeyVocabulary = { variantWords, providerWords, routeWords };
-	return productKeyVocabulary;
-}
+	return { variantWords, providerWords, routeWords };
+});
 
 // Cache keyed by class and family id (a bounded set from the catalog's rules), so no eviction is needed.
 const nameWordsCache = new Map<string, readonly string[]>();
@@ -165,10 +163,9 @@ export function productIdentityKey(
 	if (!identity || identity.class === "unknown" || identity.family === undefined || identity.revision === undefined) {
 		return undefined;
 	}
-	const served = model.requestModelId ?? identity.logicalId ?? model.id;
-	const start = served.lastIndexOf("/") + 1;
-	const at = served.indexOf("@", start);
-	const bare = at === -1 ? served.slice(start) : served.slice(start, at);
+	const served = bareModelId(model.requestModelId ?? identity.logicalId ?? model.id);
+	const at = served.indexOf("@");
+	const bare = at === -1 ? served : served.slice(0, at);
 	const { variantWords, providerWords, routeWords } = getProductKeyVocabulary();
 	const laneWords = providerWords.get(model.provider.toLowerCase());
 	const classWords = nameWords(identity.class);
