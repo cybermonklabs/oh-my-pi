@@ -2398,19 +2398,14 @@ export class TurnRecovery {
 	 * effective thinking level after the ceiling clamp in
 	 * {@link applyRetryFallbackCandidate} and the per-model clamp in
 	 * `setThinkingLevel`. A different route or a different effective level is a
-	 * real change of request and stays eligible. `inheritedThinkingLevel` stands
-	 * in for the session's level when `selector` names none, as in
-	 * {@link applyRetryFallbackCandidate}.
+	 * real change of request and stays eligible. A selector that names no level
+	 * keeps the session's level.
 	 */
-	#isNoOpRetryFallback(
-		candidate: Model,
-		selector: RetryFallbackSelector,
-		inheritedThinkingLevel?: InheritedThinkingLevel,
-	): boolean {
+	#isNoOpRetryFallback(candidate: Model, selector: RetryFallbackSelector): boolean {
 		const active = this.#host.model();
 		if (!active || formatModelStringWithRouting(candidate) !== formatModelStringWithRouting(active)) return false;
 		const configured = this.#host.configuredThinkingLevel();
-		const requested = selector.thinkingLevel ?? (inheritedThinkingLevel ? inheritedThinkingLevel.level : configured);
+		const requested = selector.thinkingLevel ?? configured;
 		return this.#configuredLevelAfterSwitch(candidate, requested) === configured;
 	}
 
@@ -2791,8 +2786,9 @@ export class TurnRecovery {
 		this.#usageReserveApproval = undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const requestedThinkingLevel = selector.thinkingLevel ?? this.#host.configuredThinkingLevel();
-		// The configured level the switch onto the spent model would leave:
-		// a route found from it takes this level when its selector names none.
+		// The configured level the switch onto the spent model would leave: a
+		// switch to a route found from it takes this level when its selector
+		// names none.
 		const spentThinkingLevel = this.#configuredLevelAfterSwitch(candidate, requestedThinkingLevel);
 		const spentSelector = formatRetryFallbackSelector(
 			candidate,
@@ -2846,9 +2842,10 @@ export class TurnRecovery {
 	/**
 	 * How both searches after a spent fallback end: with the switch to `pick`,
 	 * recorded under `role`, or with no switch, and a false answer, when `pick`
-	 * is the model in use at the level the switch would set.
-	 * `inheritedThinkingLevel` stands in for the session's level when `pick`'s
-	 * selector names none.
+	 * is the model in use at the level its selector names, or at the session's
+	 * level when it names none, as the walk's own search reads it. The switch
+	 * takes `inheritedThinkingLevel` in place of the session's level when
+	 * `pick`'s selector names none.
 	 */
 	async #applyPickAfterSpentFallback(
 		pick: { selector: RetryFallbackSelector; apiKey: string; model: Model },
@@ -2857,11 +2854,13 @@ export class TurnRecovery {
 		reason: string,
 		inheritedThinkingLevel?: InheritedThinkingLevel,
 	): Promise<boolean> {
-		if (this.#isNoOpRetryFallback(pick.model, pick.selector, inheritedThinkingLevel)) {
-			// A pick that is the model in use, at the level the switch would set,
-			// makes no switch, so the walk answers false. It still pins the active
-			// fallback's record, as the switch onto the spent model and the check's
-			// switch back would pin it, so `cooldown-expiry` does not bring back a
+		if (this.#isNoOpRetryFallback(pick.model, pick.selector)) {
+			// A pick that is the model in use, at the level its selector names or at
+			// the session's level when it names none, makes no switch, as in the
+			// walk's own search, so the walk answers false. The spent fallback's
+			// level does not count here. It still pins the active fallback's
+			// record, as the switch onto the spent model and the check's switch
+			// back would pin it, so `cooldown-expiry` does not bring back a
 			// primary the turn moved off; with no record, the model in use is no
 			// fallback and none is made. The retry policy then treats the failure
 			// as with no fallback left: the same model's retry budget and backoff
