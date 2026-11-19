@@ -150,13 +150,17 @@ fn pump_loop(fd: i32, inner: &Inner) {
 				inner.pending.fetch_sub(n, Ordering::AcqRel);
 			});
 			if result.is_err() {
-				inner.dead.store(true, Ordering::Release);
 				// Chunks already written were subtracted above; drop the rest —
-				// the unwritten front remainder plus everything still queued.
+				// the unwritten front remainder plus everything still queued —
+				// and only then mark the writer dead, so a caller that reads
+				// `dead()` as true also reads the drop in `pending()`, as
+				// `dead()` promises. Output appended after this point is
+				// drain-dropped by the branch above on the next pass.
 				let mut back = inner.back.lock();
 				let dropped = back.len() + (front.len() - written);
 				back.clear();
 				inner.pending.fetch_sub(dropped, Ordering::AcqRel);
+				inner.dead.store(true, Ordering::Release);
 			}
 		}
 		front.clear();
