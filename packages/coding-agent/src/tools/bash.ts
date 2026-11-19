@@ -33,7 +33,7 @@ import type {
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { resolveCliChildCmd } from "../subprocess/worker-client";
+import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
@@ -1317,7 +1317,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (interception) throw new ToolError(interception);
 
 		if (cfgWorktreeClone.get(this.session.settings)) {
-			command = rewriteGitWorktreeAdd(command, resolveCliChildCmd());
+			command = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
 		}
 
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR

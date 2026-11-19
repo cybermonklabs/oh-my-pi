@@ -23,9 +23,7 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
-import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirInputNames } from "@oh-my-pi/pi-natives/natives-dir";
 import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
-import { bunRelaunchValue, discardBunRelaunchFile, launchEnvValue } from "@oh-my-pi/pi-utils/env";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
@@ -1568,7 +1566,6 @@ export class CommandController {
 			return;
 		}
 
-		let command: string[] | undefined;
 		try {
 			const activeProfile = dependencies.getActiveProfile();
 			const activeModel = this.ctx.session.model;
@@ -1587,38 +1584,21 @@ export class CommandController {
 			}
 			childArgs.push("--fork", sourceSessionFile);
 			// Pin only non-secret scope variables.
-			const scope: Record<string, string | undefined> = {
-				PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
-				PI_CONFIG_DIR: getConfigDirName(),
-				OMP_PROFILE: activeProfile,
-				PI_PROFILE: activeProfile,
-				PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
-				PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
-				XDG_DATA_HOME: environment.XDG_DATA_HOME,
-				XDG_STATE_HOME: environment.XDG_STATE_HOME,
-				XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
-			};
-			// The fork is omp: it takes this session's natives directory from a handoff
-			// keyed to the directory rule's inputs, which are pinned here, the rest at
-			// their launch values (`PI_NATIVES_DIR` as this session was started with it),
-			// so the commands the fork runs get what this session's commands get.
-			for (const name of nativesDirInputNames()) {
-				// `forkScopeEnvCommand` unsets an empty value, so the handoff records it unset.
-				scope[name] = (name in scope ? scope[name] : launchEnvValue(name)) || undefined;
-			}
-			// Built first, so the handoff can record what the relaunch file it may write gives.
-			const entry = dependencies.resolveCliEntryCmd();
-			command = entry;
-			// The handoff records the inputs the fork will see: where the scope unsets one, the
-			// relaunch file gives it the value Bun loaded here, if any; with no relaunch file (none
-			// was needed, or it could not be written and `--no-env-file` stands there), nothing.
-			const carriesRelaunchFile = entry.some(arg => arg.startsWith("--env-file="));
-			const forkInputs: Record<string, string | undefined> = {};
-			for (const name of nativesDirInputNames()) {
-				forkInputs[name] = scope[name] ?? (carriesRelaunchFile ? bunRelaunchValue(name) : undefined);
-			}
-			scope[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(forkInputs, { parent: null });
-			command = [...forkScopeEnvCommand(scope), ...entry, ...childArgs];
+			const command = [
+				...forkScopeEnvCommand({
+					PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
+					PI_CONFIG_DIR: getConfigDirName(),
+					OMP_PROFILE: activeProfile,
+					PI_PROFILE: activeProfile,
+					PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
+					PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
+					XDG_DATA_HOME: environment.XDG_DATA_HOME,
+					XDG_STATE_HOME: environment.XDG_STATE_HOME,
+					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+				}),
+				...dependencies.resolveCliEntryCmd(),
+				...childArgs,
+			];
 			const launchPlan = createDefaultTerminalLaunchRequest(
 				multiplexer,
 				placement,
@@ -1627,7 +1607,6 @@ export class CommandController {
 				shellGrammar,
 			);
 			if ("error" in launchPlan) {
-				discardBunRelaunchFile(command);
 				this.ctx.showError(launchPlan.error);
 				return;
 			}
@@ -1643,8 +1622,6 @@ export class CommandController {
 				`Opened a fork in ${placementInfo.displayName} (${placementInfo.placementLabel}); this session continues here.`,
 			);
 		} catch (error) {
-			// The fork never started, so the relaunch file its command names stays unread.
-			if (command) discardBunRelaunchFile(command);
 			logger.error("Failed to open a terminal fork", { multiplexer, error });
 			this.ctx.showError(
 				error instanceof TerminalLaunchError

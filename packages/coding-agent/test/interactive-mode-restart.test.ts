@@ -1,6 +1,4 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
@@ -13,7 +11,6 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as natives from "@oh-my-pi/pi-natives";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import * as workerClient from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("InteractiveMode restart", () => {
@@ -44,10 +41,7 @@ describe("InteractiveMode restart", () => {
 		resetSettingsForTest();
 	});
 
-	async function restart(
-		argv: string[],
-		options: { execFails?: boolean; beforeRestart?: () => void } = {},
-	): Promise<string[]> {
+	async function restart(argv: string[]): Promise<string[]> {
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
@@ -62,19 +56,13 @@ describe("InteractiveMode restart", () => {
 		mode.ui.terminal.drainInput = async () => {};
 		process.argv = [originalArgv[0], originalArgv[1], ...argv];
 		// Stop only at the process replacement boundary; teardown and argv production run for real.
-		const exec = vi.spyOn(natives, "execReplace").mockImplementation(() => {
-			if (options.execFails) throw new Error("exec failed");
-			return undefined as never;
-		});
+		const exec = vi.spyOn(natives, "execReplace").mockImplementation(() => undefined as never);
 		const spawn = vi.spyOn(Bun, "spawn").mockReturnValue({ exited: Promise.resolve(0) } as never);
 		vi.spyOn(postmortem, "cleanup").mockResolvedValue();
 		vi.spyOn(postmortem, "drainStdout").mockResolvedValue();
 		vi.spyOn(postmortem, "quit").mockResolvedValue();
-		vi.spyOn(process.stderr, "write").mockReturnValue(true);
-		options.beforeRestart?.();
 		await mode.restart();
-		const spawned = process.platform === "win32" || options.execFails;
-		const command = spawned ? spawn.mock.calls[0]?.[0] : exec.mock.calls[0]?.[0];
+		const command = process.platform === "win32" ? spawn.mock.calls[0]?.[0] : exec.mock.calls[0]?.[0];
 		if (!Array.isArray(command)) throw new Error("expected replacement command");
 		return command;
 	}
@@ -167,47 +155,5 @@ describe("InteractiveMode restart", () => {
 		expect(sessionManager.isSessionOnDisk()).toBe(false);
 		if (!file) throw new Error("expected allocated journal path");
 		expect(await Bun.file(file).exists()).toBe(false);
-	});
-
-	/** A relaunch file as `bunRelaunchArgs` writes it: `<tmp>/omp-bun-env-XXXXXX/loaded.env`, naming itself. */
-	async function relaunchFile(): Promise<{ dir: string; file: string }> {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bun-env-"));
-		const file = path.join(dir, "loaded.env");
-		await Bun.write(file, `# omp relaunch file: ${file}\nLOADED='value'\n`);
-		return { dir, file };
-	}
-
-	it("builds the relaunch command, and so its relaunch file, after the cleanups and the stdout drain", async () => {
-		const order: string[] = [];
-		const { dir, file } = await relaunchFile();
-		vi.spyOn(workerClient, "resolveCliEntryCmd").mockImplementation(() => {
-			order.push("command");
-			return [process.execPath, `--env-file=${file}`, "omp-entry"];
-		});
-		const cleanup = vi.spyOn(postmortem, "cleanup");
-		const drain = vi.spyOn(postmortem, "drainStdout");
-		await restart([], {
-			beforeRestart: () => {
-				cleanup.mockImplementation(async () => void order.push("cleanup"));
-				drain.mockImplementation(async () => void order.push("drain"));
-			},
-		});
-		await fs.rm(dir, { recursive: true, force: true });
-
-		expect(order).toEqual(["cleanup", "drain", "command"]);
-	});
-
-	it("removes the relaunch file after the replacement it spawned exits", async () => {
-		const { dir, file } = await relaunchFile();
-		vi.spyOn(workerClient, "resolveCliEntryCmd").mockReturnValue([
-			process.execPath,
-			`--env-file=${file}`,
-			"omp-entry",
-		]);
-		// The exec fails (as on Windows, where there is none), so the replacement is spawned.
-		const command = await restart([], { execFails: true });
-
-		expect(command).toContain(`--env-file=${file}`);
-		expect(await fs.exists(dir)).toBe(false);
 	});
 });
