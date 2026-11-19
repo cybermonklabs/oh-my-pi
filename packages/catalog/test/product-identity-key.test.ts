@@ -122,4 +122,14 @@ describe("productIdentityKey", () => {
 		expectSeparateKeys(["anthropic/claude-opus-4-8", "anthropic/claude-opus-4-8-preview"]);
 		expectSeparateKeys(["google/gemini-3.1-pro", "google/gemini-3.1-pro-preview"]);
 	});
+
+	test("keeps a product word that comes before the family's last word", () => {
+		// Gemini 2.5 Flash Live and GLM-4.6V-Flash share their catalog class, family
+		// and revision with Gemini 2.5 Flash and GLM-4-Flash, but they are other
+		// products. The word that tells them apart (`live`, `6v`) comes before the
+		// family's last word (`flash`), as `live` comes after it in
+		// `gemini-3.1-flash-live-preview`.
+		expectSeparateKeys(["google/gemini-2.5-flash", "google/gemini-live-2.5-flash"]);
+		expectSeparateKeys(["nanogpt/glm-4-flash", "zai/glm-4.6v-flash"]);
+	});
 });
