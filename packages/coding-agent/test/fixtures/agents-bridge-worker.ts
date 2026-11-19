@@ -69,6 +69,10 @@ export interface AgentsProbe {
 	manages(): Promise<boolean>;
 	/** Release, through this worker's lifecycle proxy, the agents under `ancestorId` as a helper session's end here does. */
 	releaseUnder(ancestorId: string): Promise<void>;
+	/** Whether, through this worker's lifecycle proxy, a release of `id` is in flight. */
+	isReleasing(id: string): Promise<boolean>;
+	/** Wait, through this worker's lifecycle proxy, until no release of `id` is in flight. */
+	whenReleased(id: string): Promise<void>;
 	/**
 	 * Whether a message from `from`, delivered here to a running `to` that is not its parent, is one
 	 * `to`'s run sees (from its descendant), not a peer's that waits for a turn of its own.
@@ -222,6 +226,8 @@ const probe: AgentsProbe = {
 	},
 	manages: async () => AgentLifecycleManager.global().manages(AgentRegistry.global()),
 	releaseUnder: async ancestorId => AgentLifecycleManager.global().releaseUnder(ancestorId, { ownedJobsEnd: "stop" }),
+	isReleasing: async id => AgentLifecycleManager.global().isReleasing(id),
+	whenReleased: async id => AgentLifecycleManager.global().whenReleased(id),
 	inRunFrom: async (to, from) => {
 		const host = {
 			isDisposed: () => false,

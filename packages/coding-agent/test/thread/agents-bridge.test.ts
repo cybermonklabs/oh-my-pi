@@ -315,6 +315,35 @@ describe("agent bridging across subagent workers", () => {
 		expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
 	});
 
+	it("tells a worker that a release on main is in flight, and settles its wait only once that release is over", async () => {
+		// If this regresses, an isolated run that ends on a worker (an isolated task of a worker-homed subagent) reads
+		// no release in flight, or reads one as over before it is: its end removes the worktree that the release's hook
+		// still has to capture, and the agent's changes are lost.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		const lifecycle = AgentLifecycleManager.global();
+		const disposing = Promise.withResolvers<void>();
+		const session = { dispose: () => disposing.promise } as unknown as AgentSession;
+		registry.register({ id: "Releasing", displayName: "task", kind: "sub", parentId: "Main", session, status: "idle" });
+		expect(await probe.isReleasing("Releasing")).toBe(false);
+
+		const release = lifecycle.release("Releasing");
+		expect(await probe.isReleasing("Releasing")).toBe(true);
+		let over = false;
+		const waited = probe.whenReleased("Releasing").then(() => {
+			over = true;
+		});
+		// Each round trip below reaches main after the wait's own call and its answer would, so a wait that settles
+		// at once (on the worker or on main) has settled by the last of them.
+		for (let i = 0; i < 3; i++) expect(await probe.isReleasing("Releasing")).toBe(true);
+		expect(over).toBe(false);
+
+		disposing.resolve();
+		expect(await release).toBe(true);
+		await waited;
+		expect(await probe.isReleasing("Releasing")).toBe(false);
+	});
+
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {
 		const { worker, probe } = await startWorker();
 		await probe.open("Parked", { sessionFile: "/tmp/agents-bridge-parked.jsonl", gated: true });
