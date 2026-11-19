@@ -435,13 +435,13 @@ describe("isolated agent released as its run finishes", () => {
 		expect(commits()).toBe(1);
 	});
 
-	it("captures a failed run's worktree when a release takes its adoption between the run end's two lifecycle reads", async () => {
-		// If this regresses, the run's end asks whether a release is in flight before it asks whether an adoption holds
-		// the agent: a release that the main thread starts between the two (on a worker, each read is a round trip to
-		// it) takes the adoption after the first read and is missed by both, so the run's end removes the worktree,
-		// and that release, whose hook comes after the run's end, captures nothing: the failed run's work is in no
-		// patch and on no task branch.
-		const id = "ReleasedBetweenRunEndReads";
+	it("captures a failed run's worktree when a release took its adoption just before the run's end reads it and is still in flight", async () => {
+		// If this regresses, a release that takes the agent's adoption just before the run's end reads it (on a worker,
+		// each read of the run's end is a round trip to the main thread, which goes on meanwhile) is missed: the run's
+		// end finds no adoption, and no release in flight when it asks for one before that read, so it removes the
+		// worktree, and that release, whose hook comes after the run's end, captures nothing: the failed run's work is
+		// in no patch and on no task branch.
+		const id = "ReleasedAsRunEndReadsAdoption";
 		const disposing = Promise.withResolvers<void>();
 		const session = agentSession(() => disposing.promise);
 		const lifecycle = AgentLifecycleManager.global();

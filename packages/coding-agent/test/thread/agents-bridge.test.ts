@@ -324,7 +324,14 @@ describe("agent bridging across subagent workers", () => {
 		const lifecycle = AgentLifecycleManager.global();
 		const disposing = Promise.withResolvers<void>();
 		const session = { dispose: () => disposing.promise } as unknown as AgentSession;
-		registry.register({ id: "Releasing", displayName: "task", kind: "sub", parentId: "Main", session, status: "idle" });
+		registry.register({
+			id: "Releasing",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Main",
+			session,
+			status: "idle",
+		});
 		expect(await probe.isReleasing("Releasing")).toBe(false);
 
 		const release = lifecycle.release("Releasing");

@@ -799,23 +799,32 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			});
 		} else if (!workspace || retainWorkspace || (keptAlive && lifecycle.has(opts.agentId))) {
 			// Nothing is left to clean up here, or an adoption holds the agent:
-			// its release captures and cleans up. Read before `isReleasing`: a
-			// release that starts between the two reads (on a worker each is a
-			// round trip to the main thread) marks the agent releasing before it
-			// drops the adoption, and cannot end before the second read, since
-			// it calls the hook, which needs this thread, before it ends.
+			// its release captures and cleans up. Read before `isReleasing` (on a
+			// worker each read is a synchronous round trip to the main thread,
+			// which goes on meanwhile): a release that dropped the adoption
+			// before this read marked the agent releasing in the same
+			// synchronous step, and cannot end before the second read, since it
+			// awaits the hook, which on a worker needs this thread. A release
+			// that starts between the reads finds no adoption, calls no hook and
+			// leaves the cleanup to this run's end.
 		} else if (keptAlive && lifecycle.isReleasing(opts.agentId)) {
 			// A release of the agent is in flight, and nothing called the hook
 			// yet. One that took the agent's adoption calls it once it has
 			// disposed the agent's session, and captures and cleans up then,
 			// after the cleanup this run deferred; one that took none calls no
-			// hook. Once no release is left (on a worker, a hook call made before
-			// then reaches this thread first), the completion is the release the
-			// hook started, or, when nothing called the hook, the cleanup this
-			// run's end takes over then. It goes on after the result, and the
-			// caller's deferred cleanup (the removal of the artifacts directory
-			// the release writes to) waits for it; this completion ends after
-			// the earlier one, which the release or that cleanup waits for first.
+			// hook. On a worker, the `adopt` such a release refuses calls the
+			// hook from the main thread asynchronously; when this run's job
+			// manager lives on the main thread, that call reaches this thread
+			// before this `finally`, since the owner-job reap after the run's
+			// finalize is then a round trip on the same ordered link (the
+			// takeover below relies on that too). Once no release is left (on a
+			// worker, a hook call made before then reaches this thread first),
+			// the completion is the release the hook started, or, when nothing
+			// called the hook, the cleanup this run's end takes over then. It
+			// goes on after the result, and the caller's deferred cleanup (the
+			// removal of the artifacts directory the release writes to) waits
+			// for it; this completion ends after the earlier one, which the
+			// release or that cleanup waits for first.
 			const completion = lifecycle
 				.whenReleased(opts.agentId)
 				.then(() => isolationRelease.settled ?? takeCleanupOver());

@@ -634,6 +634,47 @@ describe("AgentLifecycleManager", () => {
 		expect(lifecycle.has("cas-Sub", replacement)).toBe(true);
 	});
 
+	it("settles a wait for an agent's release only once the last of two overlapping releases of it is over", async () => {
+		// If this regresses, of two overlapping releases of an agent, a kill's, which took no adoption and ends first,
+		// settles the wait for the agent's release while the other (an ACP close's, which took the adoption) still waits
+		// in the release hook: an isolated run's end that waits for the release then finds no hook called, takes the
+		// cleanup over and removes the worktree whose changes that hook was to capture.
+		const hookGate = deferred();
+		let hookCalls = 0;
+		const stub = makeSessionStub();
+		const ref = registerIdleSub("Overlap-Sub", stub.session, null);
+		lifecycle.adopt(
+			"Overlap-Sub",
+			{
+				idleTtlMs: 0,
+				onRelease: () => {
+					hookCalls++;
+					return hookGate.promise;
+				},
+			},
+			ref,
+		);
+
+		// The close's release takes the adoption and, once it has disposed the session, waits in the hook.
+		const closing = lifecycle.release("Overlap-Sub");
+		// The kill's release finds no adoption left and calls no hook.
+		const killing = lifecycle.release("Overlap-Sub", ref, { tombstone: true });
+		let waited = false;
+		const waiting = lifecycle.whenReleased("Overlap-Sub").then(() => {
+			waited = true;
+		});
+		expect(await killing).toBe(true);
+		await flushAsync();
+
+		expect(hookCalls).toBe(1);
+		expect(lifecycle.isReleasing("Overlap-Sub")).toBe(true);
+		expect(waited).toBe(false);
+		hookGate.resolve();
+		expect(await closing).toBe(true);
+		await waiting;
+		expect(lifecycle.isReleasing("Overlap-Sub")).toBe(false);
+	});
+
 	it("adopt(Main) is a no-op: Main is never adopted or parked", async () => {
 		vi.useFakeTimers();
 		const stub = makeSessionStub();
