@@ -252,7 +252,8 @@ interface DialectQueries {
 	 * `@anchor_id`, checked in the same statement. On SQLite it is also empty
 	 * unless the part at `@last` (the last one the read has fetched, -1 before
 	 * the first page) still holds `@last_content`. MySQL checks neither; its
-	 * read checks what it yielded once, with {@link readChunksDigest}.
+	 * read checks what it yielded, when it ends or is closed, with
+	 * {@link readChunksDigest}.
 	 */
 	readParts: Statement;
 	/**
@@ -261,12 +262,12 @@ interface DialectQueries {
 	 * same way over what it fetched ({@link addChunkDigest}). Its items are the
 	 * row's own content from `@offset` on (`@row_from` as in
 	 * {@link readChunksStart}), when `@offset` is inside it, and the parts that
-	 * start from `@first` up to, not including, `@size`. An item's digest is
-	 * the first 128 bits of the SHA-256 of its offset in decimal, ":" and its
-	 * bytes; the digest is their XOR, as two 64-bit halves in hex (`high`,
-	 * `low`). One aggregate, so the server never holds the session whole.
-	 * SHA-256 rather than MD5, which a MySQL server in FIPS mode answers with
-	 * NULL.
+	 * start from `@first` up to, not including, `@end`: the end of the last
+	 * part the read yielded. An item's digest is the first 128 bits of the
+	 * SHA-256 of its offset in decimal, ":" and its bytes; the digest is their
+	 * XOR, in 32 upper-case hex digits (`digest`). One aggregate, so the server
+	 * never holds the session whole. SHA-256 rather than MD5, which a MySQL
+	 * server in FIPS mode answers with NULL.
 	 */
 	readChunksDigest: Statement | undefined;
 	/**
@@ -495,10 +496,9 @@ interface StagedPartRow {
 	len: number | bigint | string;
 }
 
-/** `readChunksDigest` row: the digest's two 64-bit halves in hex. */
+/** `readChunksDigest` row: the digest in upper-case hex. */
 interface ChunksDigestRow {
-	high: string;
-	low: string;
+	digest: string;
 }
 
 /** `partRowids.next` row. */
@@ -1334,16 +1334,16 @@ function buildQueries(
 					: "") +
 				"ORDER BY start_offset",
 		),
-		// The halves of each item's SHA-256 in hex, read as unsigned 64-bit integers and XORed. `CAST(content AS
-		// binary)` keeps the bytes (utf8mb4_bin's PAD SPACE only affects comparisons).
+		// The halves of each item's SHA-256 in hex, read as unsigned 64-bit integers, XORed and printed in hex
+		// again. `CAST(content AS binary)` keeps the bytes (utf8mb4_bin's PAD SPACE only affects comparisons).
 		readChunksDigest: mysql
 			? sql(
-					"SELECT LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0') AS high, " +
-						"LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0') AS low FROM (" +
+					"SELECT CONCAT(LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0'), " +
+						"LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0')) AS digest FROM (" +
 						`SELECT SHA2(CONCAT(CAST(@offset AS SIGNED), ':', substr(${contentBytes}, @row_from)), 256) AS h ` +
 						`FROM ${table} WHERE path = @path AND @offset < ${contentByteLength} ` +
 						`UNION ALL SELECT SHA2(CONCAT(start_offset, ':', ${contentBytes}), 256) FROM ${parts} ` +
-						"WHERE path = @path AND start_offset >= @first AND start_offset < @size) AS d",
+						"WHERE path = @path AND start_offset >= @first AND start_offset < @end) AS d",
 				)
 			: undefined,
 		partRowids:
@@ -3155,10 +3155,18 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * there is a replacement within the bounds `partRowids` names, or by such
 	 * a writer, that holds exactly the bytes of that last part at its offset
 	 * while it differs both before and after it. MySQL has no row identity:
-	 * once the read has fetched its last page, one query computes the digest
-	 * of the bytes the read yielded as the database holds them then
-	 * (`DialectQueries.readChunksDigest`), and one that differs from the digest
-	 * the read computed over what it fetched is a read conflict too.
+	 * once the bytes the read yielded come from more than one query (the first
+	 * query's head and a page, or two pages), the read checks them when it
+	 * ends and also when its consumer closes it before that (a `break` out of
+	 * its loop, which resumes the read at its `yield` to return). One query
+	 * then computes the digest of the bytes the read yielded, as the database
+	 * holds them then (`DialectQueries.readChunksDigest`): the head, and every
+	 * part from the one the read started at to the last one it yielded, whole
+	 * even where the read yielded it from `fromByte` on. One that differs from
+	 * the digest the read computed over the same parts, each added before it
+	 * went out, is a read conflict too; a closed read rejects its `return()`
+	 * with it, so the consumer's loop throws it. Bytes from one query alone
+	 * come from one snapshot and need no check.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
@@ -3168,53 +3176,81 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
-		const digestQuery = this.#q.readChunksDigest;
-		// MySQL: the digest of what the read yields, compared with the stored bytes' once it has read them all.
-		const digest = digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined;
-		if (row.head && row.head.byteLength > 0) {
-			if (digest) addChunkDigest(digest, fromByte, row.head);
-			yield row.head;
-		}
-		if (fromByte >= size) return;
 		const firstPart = rowNumber(row.first_part);
 		const anchor = { anchor: firstPart, anchor_id: row.first_id };
 		const first = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
 		let next = first;
 		let skip = Math.max(0, fromByte - next);
-		// The last part fetched, which the next page's query finds unchanged (SQLite); none yet.
-		let last = { last: -1, last_content: "" };
-		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
-			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
-			const end = Math.max(next, fromByte) + span;
-			const parts = (await this.#exclusive(() =>
-				this.#readOne(this.#q.readParts, { path, next, end, ...anchor, ...last }),
-			)) as PartRow[];
-			if (parts.length === 0) throw new SessionReadConflictError(path);
-			for (const part of parts) {
-				const start = rowNumber(part.start_offset);
-				if (start !== next) throw new SessionReadConflictError(path);
-				if (start >= size) break;
-				last = { last: start, last_content: part.content };
-				const bytes = Buffer.from(part.content, "utf8");
-				if (digest) addChunkDigest(digest, start, bytes);
-				next = start + bytes.byteLength;
-				if (skip >= bytes.byteLength) {
-					skip -= bytes.byteLength;
-					continue;
+		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
+		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
+		// MySQL: the digest of what the read yields, checked against the stored bytes' (see above).
+		const query = this.#q.readChunksDigest;
+		const check = query ? { query, digest: Buffer.alloc(CHUNKS_DIGEST_BYTES) } : undefined;
+		// The queries whose bytes the read has yielded: the first one's head, and each page.
+		let sources = 0;
+		let failed = false;
+		try {
+			if (row.head && row.head.byteLength > 0) {
+				if (check) addChunkDigest(check.digest, fromByte, row.head);
+				sources++;
+				yield row.head;
+			}
+			if (fromByte >= size) return;
+			for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
+				// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
+				const end = Math.max(next, fromByte) + span;
+				const parts = (await this.#exclusive(() =>
+					this.#readOne(this.#q.readParts, { path, next, end, ...anchor, ...last }),
+				)) as PartRow[];
+				if (parts.length === 0) throw new SessionReadConflictError(path);
+				sources++;
+				for (const part of parts) {
+					const start = rowNumber(part.start_offset);
+					if (start !== next) throw new SessionReadConflictError(path);
+					if (start >= size) break;
+					if (last) last = { last: start, last_content: part.content };
+					const bytes = Buffer.from(part.content, "utf8");
+					// Whole, before the part goes out: the read may be closed at its `yield`.
+					if (check) addChunkDigest(check.digest, start, bytes);
+					next = start + bytes.byteLength;
+					if (skip >= bytes.byteLength) {
+						skip -= bytes.byteLength;
+						continue;
+					}
+					yield skip > 0 ? bytes.subarray(skip) : bytes;
+					skip = 0;
 				}
-				yield skip > 0 ? bytes.subarray(skip) : bytes;
-				skip = 0;
+			}
+			if (next !== size) throw new SessionReadConflictError(path);
+		} catch (err) {
+			failed = true;
+			throw err;
+		} finally {
+			// At the read's end, or where its consumer closed it, unless it is failing already.
+			if (check && !failed && sources > 1) {
+				await this.#confirmChunksDigest(path, check, {
+					path,
+					offset: fromByte,
+					row_from: rowFrom,
+					first,
+					end: next,
+				});
 			}
 		}
-		if (next !== size) throw new SessionReadConflictError(path);
-		// A read that fetched no page yielded only what its first query returned.
-		if (!digestQuery || !digest || first >= size) return;
-		const [stored] = (await this.#exclusive(() =>
-			this.#readOne(digestQuery, { path, offset: fromByte, row_from: rowFrom, first, size }),
-		)) as ChunksDigestRow[];
-		if (!stored || `${stored.high}${stored.low}`.toLowerCase() !== digest.toString("hex")) {
-			throw new SessionReadConflictError(path);
-		}
+	}
+
+	/**
+	 * MySQL: fail with {@link SessionReadConflictError} unless the database
+	 * computes `check.digest`, the digest of what a chunked read yielded, over
+	 * what it holds now (`check.query`, `DialectQueries.readChunksDigest`).
+	 */
+	async #confirmChunksDigest(
+		path: string,
+		check: { query: Statement; digest: Buffer },
+		values: StatementValues,
+	): Promise<void> {
+		const [stored] = (await this.#exclusive(() => this.#readOne(check.query, values))) as ChunksDigestRow[];
+		if (stored?.digest !== check.digest.toString("hex").toUpperCase()) throw new SessionReadConflictError(path);
 	}
 
 	#unmeasured(path: string): Error {
@@ -3434,8 +3470,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		// "/" made "0": in code-point order and under MySQL's PAD SPACE every path under `dir` sorts within it,
 		// whatever follows the "/" (see DialectQueries.deleteUnder). On PostgreSQL the delete takes the range
 		// only under a code-point collation, and compares the prefix alone under any other (#directoryRange).
-		const stem = dir?.slice(0, -1) ?? "";
-		const under = dir === undefined ? undefined : { dir, len: [...dir].length, stem, dir_end: `${stem}0` };
+		const under =
+			dir === undefined
+				? undefined
+				: { dir, len: [...dir].length, stem: dir.slice(0, -1), dir_end: `${dir.slice(0, -1)}0` };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
