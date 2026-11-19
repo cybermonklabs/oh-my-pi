@@ -6,39 +6,55 @@
 import { collapseVocabulary, discoveryVocabulary } from "../compat/taxonomy";
 import type { Model } from "../types";
 
-/** A route word, and the classes where the same word names a product of its own. */
+/** A route word, and the classes where it names a route. */
 export interface ModelRouteWord {
+	/** The route word; one made of several id words (`non-reasoning`) matches them in that order. */
 	word: string;
-	exceptClasses: readonly string[];
+	/** The only classes where the word names a route; absent for every class. */
+	classes?: readonly string[];
+	/** The classes where the word names a product of its own instead of a route. */
+	exceptClasses?: readonly string[];
 }
 
 /**
  * Words that name a route of one model, not another product: a provider sells
- * the same model in a batch, flex or priority tier, at a discount, on a fast
- * lane, or under a `latest` alias, and adds the word to the model's id. An
- * entry's `exceptClasses` are the classes where its word names a model of its
- * own: xAI's Grok 4 Fast is not Grok 4 on a fast lane.
+ * the same model in a batch, flex or priority tier, at a discount, on a fast,
+ * high-speed or turbo serving, with its thinking off (`nothinking`,
+ * `non-reasoning`), or under a `latest` alias, and adds the word to the model's
+ * id. A word names a route in every class unless its entry limits it: xAI's
+ * Grok 4 Fast is a model of its own, and `turbo` names a route only for Qwen,
+ * while OpenAI's `gpt-4-turbo` is a product.
  */
 export const MODEL_ROUTE_WORDS: readonly ModelRouteWord[] = [
-	{ word: "batch", exceptClasses: [] },
-	{ word: "flex", exceptClasses: [] },
-	{ word: "priority", exceptClasses: [] },
-	{ word: "discounted", exceptClasses: [] },
-	{ word: "cheaper", exceptClasses: [] },
-	{ word: "latest", exceptClasses: [] },
+	{ word: "batch" },
+	{ word: "flex" },
+	{ word: "priority" },
+	{ word: "discounted" },
+	{ word: "cheaper" },
+	{ word: "latest" },
+	{ word: "highspeed" },
+	{ word: "nothinking" },
+	{ word: "non-reasoning" },
 	{ word: "fast", exceptClasses: ["xai"] },
+	{ word: "turbo", classes: ["qwen"] },
 ];
 
 const WORD_PATTERN = /[a-z0-9]+/g;
 const NUMBER_WORD_PATTERN = /^v?[0-9]+$/;
+
+/** A route word split into id words, with its entry. */
+interface RouteWordRule {
+	words: readonly string[];
+	entry: ModelRouteWord;
+}
 
 interface ProductKeyVocabulary {
 	/** Variant words the catalog strips from any provider's ids. */
 	variantWords: Set<string>;
 	/** Lane and routing-variant words, by the provider that declares them. */
 	providerWords: Map<string, Set<string>>;
-	/** Route words, each with the classes it does not apply to. */
-	routeWords: Map<string, readonly string[]>;
+	/** Route words by their first id word, the longest first. */
+	routeWords: Map<string, RouteWordRule[]>;
 }
 
 let productKeyVocabulary: ProductKeyVocabulary | undefined;
@@ -80,8 +96,15 @@ function getProductKeyVocabulary(): ProductKeyVocabulary {
 	const providerWords = new Map<string, Set<string>>();
 	addProviderWords(providerWords, collapse.lanes);
 	addProviderWords(providerWords, collapse.routingVariants);
-	const routeWords = new Map<string, readonly string[]>();
-	for (const entry of MODEL_ROUTE_WORDS) routeWords.set(entry.word, entry.exceptClasses);
+	const routeWords = new Map<string, RouteWordRule[]>();
+	for (const entry of MODEL_ROUTE_WORDS) {
+		const words = wordsOf(entry.word);
+		if (words.length === 0) continue;
+		const rules = routeWords.get(words[0]);
+		if (rules === undefined) routeWords.set(words[0], [{ words, entry }]);
+		else rules.push({ words, entry });
+	}
+	for (const rules of routeWords.values()) rules.sort((left, right) => right.words.length - left.words.length);
 	productKeyVocabulary = { variantWords, providerWords, routeWords };
 	return productKeyVocabulary;
 }
@@ -95,6 +118,24 @@ function nameWords(name: string): readonly string[] {
 		nameWordsCache.set(name, words);
 	}
 	return words;
+}
+
+/** How many of `words` from `start` on make a route word for class `cls`, the longest first; 0 when none does. */
+function routeWordLength(
+	routeWords: ReadonlyMap<string, readonly RouteWordRule[]>,
+	words: readonly string[],
+	start: number,
+	cls: string,
+): number {
+	const rules = routeWords.get(words[start]);
+	if (rules === undefined) return 0;
+	for (const rule of rules) {
+		if (rule.entry.classes?.includes(cls) === false || rule.entry.exceptClasses?.includes(cls)) continue;
+		let length = 0;
+		while (length < rule.words.length && words[start + length] === rule.words[length]) length++;
+		if (length === rule.words.length) return length;
+	}
+	return 0;
 }
 
 /**
@@ -132,16 +173,19 @@ export function productIdentityKey(
 	const laneWords = providerWords.get(model.provider.toLowerCase());
 	const classWords = nameWords(identity.class);
 	const familyWords = nameWords(identity.family);
+	const words = wordsOf(bare);
 	const anchor = familyWords.at(-1);
 	const kept: string[] = [];
-	let anchored = false;
-	for (const word of wordsOf(bare)) {
-		// The words up to the family's last word are a vendor, region or class prefix (`us-gov.anthropic.claude-opus`).
-		if (!anchored && word === anchor) {
-			anchored = true;
-			kept.length = 0;
+	// The words up to the family's last word are a vendor, region or class prefix (`us-gov.anthropic.claude-opus`).
+	let index = anchor === undefined ? 0 : words.indexOf(anchor) + 1;
+	while (index < words.length) {
+		const routeLength = routeWordLength(routeWords, words, index, identity.class);
+		if (routeLength > 0) {
+			index += routeLength;
 			continue;
 		}
+		const word = words[index];
+		index++;
 		if (
 			NUMBER_WORD_PATTERN.test(word) ||
 			classWords.includes(word) ||
@@ -151,8 +195,6 @@ export function productIdentityKey(
 		) {
 			continue;
 		}
-		const exceptClasses = routeWords.get(word);
-		if (exceptClasses !== undefined && !exceptClasses.includes(identity.class)) continue;
 		kept.push(word);
 	}
 	return `${identity.class}/${identity.family}/${identity.revision}/${kept.join("-")}`;

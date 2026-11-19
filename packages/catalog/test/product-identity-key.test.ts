@@ -98,6 +98,26 @@ describe("productIdentityKey", () => {
 		expectSeparateKeys(["xai/grok-4", "xai/grok-4-fast"]);
 	});
 
+	test("drops highspeed from an id", () => {
+		expectOneKey("kimi-code/k3.1-pro", ["kimi-code/k3.1-pro-highspeed"]);
+	});
+
+	test("drops turbo from a Qwen id and keeps it in an OpenAI id", () => {
+		expectOneKey("deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct", [
+			"deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo",
+		]);
+		expectSeparateKeys(["openai/gpt-4", "openai/gpt-4-turbo"]);
+	});
+
+	test("drops nothinking from an id", () => {
+		expectOneKey("google/gemini-2.5-flash", ["nanogpt/gemini-2.5-flash-nothinking"]);
+	});
+
+	test("drops non-reasoning as one route word and keeps a bare non", () => {
+		expectOneKey("xai/grok-4-fast-reasoning", ["xai/grok-4-fast-non-reasoning"]);
+		expectSeparateKeys(["xai/grok-4", "xai/grok-4-non"]);
+	});
+
 	test("keeps preview as a product word", () => {
 		expectSeparateKeys(["anthropic/claude-opus-4-8", "anthropic/claude-opus-4-8-preview"]);
 		expectSeparateKeys(["google/gemini-3.1-pro", "google/gemini-3.1-pro-preview"]);
