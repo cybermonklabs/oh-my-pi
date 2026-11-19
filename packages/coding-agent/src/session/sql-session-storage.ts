@@ -3468,9 +3468,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				// A created session also drops parts orphaned under its path.
 				await this.#deleteParts(transaction, path);
 				await this.#insertParts(transaction, path, bytes);
-				// The content is replaced whole, and so are its references.
-				await run(transaction, this.#q.deleteRefs, { path });
-				await this.#addRefs(transaction, path, named, allowGone);
+				// The content is replaced whole, and so are its references: dropped only after the blob rows' locks.
+				await this.#addRefs(transaction, path, named, allowGone, true);
 			}),
 		);
 	}
@@ -3572,15 +3571,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * the row waits for this write and then sees its reference (see
 	 * {@link #deleteOrphans}); a delete that came first leaves no row, so the
 	 * write throws {@link BlobsGoneError} for the blobs of this store's it
-	 * names, unless `allowGone`, which only warns.
+	 * names, unless `allowGone`, which only warns. With `replace`, `path`'s
+	 * references are dropped first, after the rows' locks: no statement here
+	 * touches the reference table before every blob row lock is held, the
+	 * order a delete takes too (see {@link #takeRefs}), so on MySQL and
+	 * MariaDB neither waits for the other's reference-table locks while
+	 * holding a blob row's lock the other wants.
 	 */
 	async #addRefs(
 		transaction: SqlSessionStorageTransaction,
 		path: string,
 		named: ReadonlySet<string>,
 		allowGone: boolean,
+		replace = false,
 	): Promise<void> {
-		if (named.size === 0) return;
 		const locked = new Set<string>();
 		for (const batch of batches([...named].sort(), BLOB_READ_BATCH)) {
 			// Lock only rows there are: a locking read of a missing key locks a gap on MySQL.
@@ -3598,6 +3602,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			)) as HashRow[];
 			for (const row of rows) locked.add(row.sha256);
 		}
+		if (replace) await run(transaction, this.#q.deleteRefs, { path });
 		for (const sha256 of locked) await run(transaction, this.#q.insertRef, { path, sha256 });
 		const gone = [...named].filter(hash => !locked.has(hash) && this.blobs.knows(hash));
 		if (gone.length === 0) return;
@@ -3781,7 +3786,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		for (const batch of batches([...sizes.keys()], BLOB_READ_BATCH)) {
 			let deleted: string[] = [];
 			await this.#fencedTransaction([], async transaction => {
-				deleted = await this.#deleteOrphans(transaction, batch);
+				deleted = await this.#deleteOrphans(transaction, await this.#lockBlobRows(transaction, batch));
 			});
 			for (const hash of deleted) {
 				const size = sizes.get(hash);
@@ -3806,7 +3811,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
 			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
 			for (const path of paths) await this.#deleteParts(transaction, path);
-			// Then the blobs only the deleted sessions named.
+			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
 			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, paths, under));
 		});
 	}
@@ -3838,7 +3843,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// parts orphaned under `dst` go, then `src`'s follow its row.
 			await this.#deleteParts(transaction, dst);
 			await run(transaction, this.#q.renameParts, { src, dst });
-			// The replaced session's references go, `src`'s follow it, then the blobs only the replaced one named.
+			// The replaced session's references go (its blobs' rows locked first), `src`'s follow it, then the
+			// blobs only the replaced one named.
 			const replaced = await this.#takeRefs(transaction, [dst]);
 			await run(transaction, this.#q.moveRefs, { src, dst });
 			await this.#deleteOrphans(transaction, replaced);
@@ -3846,7 +3852,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#moveLease(src, dst);
 	}
 
-	/** Delete the references of `paths` (and of every path under `under`), answering the hashes they named. */
+	/**
+	 * Delete the references of `paths` (and of every path under `under`),
+	 * answering the blob rows they named that the table holds, each locked
+	 * exclusive before any reference goes: the order a write takes, which
+	 * locks a blob's row shared and then inserts its reference (see
+	 * {@link #addRefs}). Deleting the references first would, on MySQL and
+	 * MariaDB, hold next-key locks on the reference table that a write's
+	 * insert waits for, while this transaction waits for that write's share
+	 * lock on the row: a deadlock.
+	 */
 	async #takeRefs(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
@@ -3859,24 +3874,19 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		if (under)
 			for (const row of (await run(transaction, this.#q.refsUnder, under)) as HashRow[]) hashes.add(row.sha256);
+		const locked = await this.#lockBlobRows(transaction, [...hashes]);
 		for (const path of paths) await run(transaction, this.#q.deleteRefs, { path });
 		if (under) await run(transaction, this.#q.deleteRefsUnder, under);
-		return [...hashes];
+		return locked;
 	}
 
 	/**
-	 * Delete each blob row of `hashes` no reference names any more, with the
-	 * parts of a parted one; answers the hashes deleted. The rows are locked
-	 * exclusive before the references are read, and a write adding a
-	 * reference holds its row shared until it commits (see {@link #addRefs}),
-	 * so this waits for such a write and then reads its reference (PostgreSQL
-	 * reads at each statement's start; MySQL reads the references with a
-	 * shared lock, so it sees the latest); a write that locks after this
-	 * commits finds the row gone and lands it again. SQLite runs one write at
-	 * a time.
+	 * Lock exclusive, in `sha256` order, the blob rows of `hashes` the table
+	 * holds, and answer their hashes. A write adding a reference holds its
+	 * row shared until it commits, so this waits for such a write. SQLite
+	 * runs one write at a time, and only reads which rows there are.
 	 */
-	async #deleteOrphans(transaction: SqlSessionStorageTransaction, hashes: readonly string[]): Promise<string[]> {
-		if (hashes.length === 0) return [];
+	async #lockBlobRows(transaction: SqlSessionStorageTransaction, hashes: readonly string[]): Promise<string[]> {
 		const locked: string[] = [];
 		for (const batch of batches([...new Set(hashes)].sort(), BLOB_READ_BATCH)) {
 			const rows = (await run(
@@ -3886,6 +3896,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			)) as HashRow[];
 			for (const row of rows) locked.push(row.sha256);
 		}
+		return locked;
+	}
+
+	/**
+	 * Delete each blob row of `locked` (rows {@link #lockBlobRows} locked in
+	 * this transaction) that no reference names any more, with the parts of a
+	 * parted one; answers the hashes deleted. Every write that adds a
+	 * reference to one of them has committed before the lock was granted, or
+	 * locks it after this commits, so the read of the references sees each
+	 * one that committed (PostgreSQL reads at each statement's start; MySQL
+	 * reads the references with a shared lock, so it sees the latest); a
+	 * write that locks after this commits finds the row gone and lands it
+	 * again.
+	 */
+	async #deleteOrphans(transaction: SqlSessionStorageTransaction, locked: readonly string[]): Promise<string[]> {
+		if (locked.length === 0) return [];
 		const referenced = new Set<string>();
 		for (const batch of batches(locked, BLOB_READ_BATCH)) {
 			const rows = (await run(transaction, this.#q.referenced(batch.length), listValues("h", batch))) as HashRow[];

@@ -47,6 +47,12 @@ const IMAGE_HASH = sha256(IMAGE_BYTES);
 const BLOB_REF = /blob:sha256:([0-9a-f]{64})/g;
 /** A blob row's insert (not start-up's privilege probe, `INSERT … SELECT … WHERE 1 = 0`), whatever the dialect quotes its table name with. */
 const BLOB_INSERT = /^INSERT INTO \S*_blobs \([^)]*\) VALUES/;
+/** A reference row's insert, whatever the dialect quotes its table name with. */
+const REF_INSERT = /^INSERT INTO \S*_refs\b/;
+/** The drop of one session path's reference rows (not a sweep's, nor the drop of those under a directory). */
+const REF_DELETE = /^DELETE FROM \S*_refs WHERE path = /;
+/** A write's shared lock on the blob rows it names, before it touches the reference table. */
+const BLOB_SHARE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* (?:FOR SHARE|LOCK IN SHARE MODE)$/;
 /** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
@@ -92,6 +98,12 @@ function failing(client: SqlSessionStorageClient, pattern: RegExp, times: number
 
 async function blobHashes(db: LeaseDb): Promise<string[]> {
 	return (await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256)).sort();
+}
+
+/** The image's blob row's `created_ms`: a row deleted and landed again gets a new one. */
+async function blobCreatedMs(db: LeaseDb): Promise<number> {
+	const [row] = await db.sql(`SELECT created_ms FROM ${db.table}_blobs WHERE sha256 = @1`, [IMAGE_HASH]);
+	return Number(row?.created_ms);
 }
 
 /** `size` bytes of an image, distinct for each `seed`. */
@@ -460,6 +472,48 @@ describe("session blobs in the SQL session storage", () => {
 				expect(await blobHashes(db)).toEqual([]);
 			});
 
+			it("sweeps, for omp gc, the rows no session names, after dropping the references of sessions that are gone", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const old = Date.now() - 3 * 86_400_000;
+				// Referenced: a session names it and its reference row says so.
+				const referenced = imageBytes(11);
+				await writeImageSession(db, storage, [referenced]);
+				await db.sql(`UPDATE ${db.table}_blobs SET created_ms = @1`, [old]);
+				const row = async (data: Buffer, createdMs: number) =>
+					db.sql(
+						`INSERT INTO ${db.table}_blobs (sha256, content, byte_len, mime_type, created_ms) VALUES (@1, @2, @3, @4, @5)`,
+						[sha256(data), data, data.byteLength, "image/png", createdMs],
+					);
+				// Named only by a transcript gc read; named only by the reference of a session that is gone; named by
+				// nothing; written within the grace.
+				const [transcriptOnly, dangling, orphan, fresh] = [12, 13, 14, 15].map(seed => imageBytes(seed));
+				await row(transcriptOnly, old);
+				await row(dangling, old);
+				await row(orphan, old);
+				await row(fresh, Date.now());
+				await db.sql(`INSERT INTO ${db.table}_refs (path, sha256) VALUES (@1, @2)`, [
+					db.dir.join("sessions", "gone.jsonl"),
+					sha256(dangling),
+				]);
+				const named = new Set([sha256(transcriptOnly)]);
+				const before = Date.now() - 60_000;
+
+				expect(await storage.blobTier.sweep(named, before, false)).toEqual({
+					candidates: 1,
+					deleted: 0,
+					bytes: orphan.byteLength,
+				});
+				expect(await storage.blobTier.sweep(named, before, true)).toEqual({
+					candidates: 2,
+					deleted: 2,
+					bytes: orphan.byteLength + dangling.byteLength,
+				});
+				expect(await blobHashes(db)).toEqual([sha256(referenced), sha256(transcriptOnly), sha256(fresh)].sort());
+				const refs = (await db.sql(`SELECT sha256 FROM ${db.table}_refs`)).map(found => String(found.sha256));
+				expect(refs).toEqual([sha256(referenced)]);
+			});
+
 			it("stores a blob larger than one row takes in parts, gives it back whole, and deletes the parts with it", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const big = imageBytes(5, 200 * 1024);
@@ -694,7 +748,7 @@ describe("session blobs in the SQL session storage", () => {
 				let gate: GatedClient | undefined;
 				const writer = await db.open({
 					wrap: client => {
-						gate = gatedClient(client, /^INSERT INTO \S*_refs\b/);
+						gate = gatedClient(client, REF_INSERT);
 						return gate.client;
 					},
 				});
@@ -725,6 +779,125 @@ describe("session blobs in the SQL session storage", () => {
 				expect(first).toBe("waiting for the write");
 				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
 				await manager.close();
+			});
+
+			// A delete, or a rename replacing a session, that names a blob a write is referencing: the write paused
+			// before its reference insert (the order case) and after it (the control). The delete takes the blob
+			// rows' locks before it touches the reference table, as the write does, so on MySQL and MariaDB the
+			// write's insert never waits on the delete's next-key locks: no deadlock, so neither side runs its
+			// transaction again (each drops references once, the write inserts its own once), and the row is kept
+			// as it was.
+			for (const remover of ["delete", "replacing rename"] as const) {
+				for (const when of ["before", "after"] as const) {
+					it(`keeps the row, with no deadlock or retry, when a ${remover} meets a write paused ${when} its reference insert`, async () => {
+						await using db = await openLeaseDb(adapter, url ?? "");
+						const removerQueries: string[] = [];
+						const storage = await db.open({ wrap: client => recordingClient(client, removerQueries) });
+						const named = await writeImageSession(db, storage, [IMAGE_BYTES]);
+						const other = remover === "delete" ? undefined : await writeImageSession(db, storage, []);
+						const created = await blobCreatedMs(db);
+						let gate: GatedClient | undefined;
+						const queries: string[] = [];
+						const writer = await db.open({
+							wrap: client => {
+								gate = gatedClient(recordingClient(client, queries), REF_INSERT, when);
+								return gate.client;
+							},
+						});
+						const manager = SessionManager.create(db.dir.join("project"), db.dir.join("sessions"), writer);
+						manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+						manager.appendMessage(assistant("seen"));
+						await manager.flush();
+
+						queries.length = 0;
+						removerQueries.length = 0;
+						gate?.close();
+						manager.appendMessage(imageTurn("the same image"));
+						const flushing = manager.flush();
+						let first: string | undefined;
+						let removing: Promise<void> | undefined;
+						try {
+							// The write holds the blob's row shared, its reference not inserted (or not committed).
+							await Promise.race([gate?.paused(), flushing]);
+							removing = other ? storage.rename(other, named) : storage.unlink(named);
+							// A real wait: the remover must not finish while the write's transaction is open on the server.
+							first = await Promise.race([
+								removing.then(() => "removed"),
+								Bun.sleep(1000).then(() => "waiting for the write"),
+							]);
+						} finally {
+							gate?.open();
+						}
+						await Promise.all([flushing, removing]);
+						expect({
+							first,
+							blobs: await blobHashes(db),
+							created: await blobCreatedMs(db),
+							referenceInserts: queries.filter(query => REF_INSERT.test(query)).length,
+							removerReferenceDeletes: removerQueries.filter(query => REF_DELETE.test(query)).length,
+						}).toEqual({
+							first: "waiting for the write",
+							blobs: [IMAGE_HASH],
+							created,
+							referenceInserts: 1,
+							removerReferenceDeletes: 1,
+						});
+						expect((await db.row(manager.getSessionFile() ?? ""))?.content ?? "").toContain(IMAGE_HASH);
+						await manager.close();
+					});
+				}
+			}
+
+			it("keeps the row, with no deadlock or retry, when a delete meets a full write paused before its blob rows' lock", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const removerQueries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, removerQueries) });
+				let gate: GatedClient | undefined;
+				const queries: string[] = [];
+				const writer = await db.open({
+					wrap: client => {
+						gate = gatedClient(recordingClient(client, queries), BLOB_SHARE_LOCK, "before");
+						return gate.client;
+					},
+				});
+				// Paths sort by creation: the deleted session, one with parts and no reference (so the delete's
+				// look at the parts table stops short of the writer's), then the writer's, whose reference row
+				// comes right after the deleted session's in the reference table.
+				const deleted = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				await writeImageSession(db, storage, []);
+				const written = await writeImageSession(db, writer, [IMAGE_BYTES]);
+				const created = await blobCreatedMs(db);
+				const content = (await db.row(written))?.content ?? "";
+				expect(content).toContain(IMAGE_HASH);
+
+				queries.length = 0;
+				removerQueries.length = 0;
+				gate?.close();
+				// A full write of the session's content: its references are replaced, after its blob rows' locks.
+				const writing = writer.writeText(written, content).then(() => writer.drain());
+				let removing: Promise<void> | undefined;
+				try {
+					await Promise.race([gate?.paused(), writing]);
+					removing = storage.unlink(deleted);
+					// A real wait: what is measured is whether the delete meets a lock of the write's on the server.
+					await Promise.race([removing, Bun.sleep(1000)]);
+				} finally {
+					gate?.open();
+				}
+				await Promise.all([writing, removing]);
+				expect({
+					blobs: await blobHashes(db),
+					created: await blobCreatedMs(db),
+					refs: (await db.sql(`SELECT path FROM ${db.table}_refs`)).map(row => String(row.path)),
+					writerReferenceDeletes: queries.filter(query => REF_DELETE.test(query)).length,
+					removerReferenceDeletes: removerQueries.filter(query => REF_DELETE.test(query)).length,
+				}).toEqual({
+					blobs: [IMAGE_HASH],
+					created,
+					refs: [written],
+					writerReferenceDeletes: 1,
+					removerReferenceDeletes: 1,
+				});
 			});
 
 			it("lands again, from this machine's blob store, a blob a delete took while a write naming it waited", async () => {
