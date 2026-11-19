@@ -132,4 +132,19 @@ describe("productIdentityKey", () => {
 		expectSeparateKeys(["google/gemini-2.5-flash", "google/gemini-live-2.5-flash"]);
 		expectSeparateKeys(["nanogpt/glm-4-flash", "zai/glm-4.6v-flash"]);
 	});
+
+	test("keeps max as a product word of an OpenAI id", () => {
+		// GPT-5.1 Codex Max is another model than GPT-5.1 Codex: providers send it upstream under its own id.
+		expectSeparateKeys(["openai/gpt-5.1-codex", "openai/gpt-5.1-codex-max"]);
+		expectOneKey("openai/gpt-5.1-codex-max", ["cursor/gpt-5.1-codex-max-high"]);
+	});
+
+	test("drops max from a Claude id", () => {
+		// Cursor's Opus 4.8 Max is Opus 4.8 in Max mode.
+		expectOneKey("anthropic/claude-opus-4-8", ["cursor/claude-opus-4-8-max"]);
+	});
+
+	test("starts the product words at a lineage word followed by digits", () => {
+		expectOneKey("vercel-ai-gateway/alibaba/qwen3-coder-30b-a3b", ["amazon-bedrock/qwen.qwen3-coder-30b-a3b-v1:0"]);
+	});
 });
