@@ -2035,6 +2035,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 		 */
 		async function runPrimaryNamedBySpentFallback(
 			maxRetries: number,
+			thinkingLevel?: Effort,
 		): Promise<{ run: WalkRun; requestedModels: string[] }> {
 			let now = Date.now();
 			vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -2069,6 +2070,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 					},
 				}),
 			);
+			if (thinkingLevel !== undefined) run.session.setThinkingLevel(thinkingLevel);
 
 			await runTurn(run.session, "Fail on the primary");
 			return { run, requestedModels };
@@ -2082,6 +2084,23 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
 			expect(run.fallbacks).toEqual([]);
 			expect(modelOf(run.session)).toBe(formatModelString(PRIMARY));
+			const last = lastAssistant(run.session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toBe(`Retry budget exhausted after 0 retries: ${SERVER_ERROR}`);
+		});
+
+		it("ends the turn on the spent retry budget at the session's level when the spent fallback has no thinking", async () => {
+			// The session runs the primary at high. The spent fallback, gpt-4o-mini,
+			// has no thinking, and its own chain names the primary with no level. An
+			// entry that names the model in use with no level is no switch in the
+			// walk's own search, so it is no switch in the step past the spent
+			// fallback either: a budget of no retries ends the turn after the first
+			// request, and the session keeps its level.
+			const { run, requestedModels } = await runPrimaryNamedBySpentFallback(0, Effort.High);
+
+			expect(requestedModels).toEqual([formatModelString(PRIMARY)]);
+			expect(run.fallbacks).toEqual([]);
+			expect(run.session.thinkingLevel).toBe(Effort.High);
 			const last = lastAssistant(run.session);
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(`Retry budget exhausted after 0 retries: ${SERVER_ERROR}`);
