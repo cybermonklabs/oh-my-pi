@@ -1334,10 +1334,15 @@ fn key_step(zw: &mut Zw<'_, '_>, mut t: KeyTask) -> Next {
 		return named_done(zw);
 	}
 	if t.watched {
-		// A `zle -F` handler returned: the display may need redoing.
+		// A `zle -F` handler returned: zsh (`raw_getbyte`) redraws only a
+		// display the handler invalidated (`resetneeded`, as `zle -I`
+		// leaves it). A redraw now would drop what the code waiting for
+		// the key drew once (a menu selection's search status line).
 		t.watched = false;
 		let _ = zw.ed.got.take();
-		refresh(zw);
+		if zw.zle.display.resetneeded {
+			refresh(zw);
+		}
 	}
 	loop {
 		let wait_rest = t.rest > 0;
