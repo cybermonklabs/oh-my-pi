@@ -4016,9 +4016,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const there = ((await run(transaction, look(ordered.length), listValues("p", ordered))) as PathRow[])
 			.map(row => row.path)
 			.sort();
+		// One key per statement (see #lockBlobRows): MySQL may plan an IN list as a scan, which locks other rows.
 		const present = new Set<string>();
-		for (const batch of batches(there, BLOB_READ_BATCH)) {
-			const rows = (await run(transaction, lock(batch.length, false), listValues("p", batch))) as PathRow[];
+		for (const path of there) {
+			const rows = (await run(transaction, lock(1, false), listValues("p", [path]))) as PathRow[];
 			for (const row of rows) present.add(row.path);
 		}
 		return present;
@@ -4046,8 +4047,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const present = new Set<string>();
 		const query = this.#q.lockSessionRows;
 		if (!query) return present;
-		for (const batch of batches([...new Set(paths)].sort(), BLOB_READ_BATCH)) {
-			const rows = (await run(transaction, query(batch.length), listValues("p", batch))) as Array<{ path: string }>;
+		// One key per statement, as in #lockSessionRowsForWrite: each missing path locks its own gap and no other.
+		for (const path of [...new Set(paths)].sort()) {
+			const rows = (await run(transaction, query(1), listValues("p", [path]))) as PathRow[];
 			for (const row of rows) present.add(row.path);
 		}
 		return present;
@@ -4077,8 +4079,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * transaction's statements against this order on every engine.
 	 * Answers the hashes whose rows the table holds and this locked; only rows
 	 * there are are locked, since a locking read of a missing key locks a gap
-	 * on MySQL. SQLite runs one write at a time, and only reads which rows
-	 * there are.
+	 * on MySQL. On MySQL and MariaDB each row is locked by a statement of its
+	 * own, a `const` read of one key: MySQL may plan an `IN` list over a small,
+	 * changing table as a scan of the whole primary key, which waits for and
+	 * locks every row it passes, rows of other keys too, from the lowest key.
+	 * SQLite runs one write at a time, and only reads which rows there are.
 	 */
 	async #lockBlobRows(
 		transaction: SqlSessionStorageTransaction,
@@ -4095,7 +4100,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 					row => row.sha256,
 				),
 			);
-			// One statement per run of rows of one mode, so the rows are locked in `sha256` order across modes.
+			// One statement per run of rows of one mode, so the rows are locked in `sha256` order across modes; on
+			// MySQL one statement per row.
 			let group: string[] = [];
 			const flush = async (): Promise<void> => {
 				if (group.length === 0) return;
@@ -4110,7 +4116,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			};
 			for (const hash of batch) {
 				if (!there.has(hash)) continue;
-				if (group.length > 0 && modes.get(group[0] ?? "") !== modes.get(hash)) await flush();
+				const next = this.#adapter === "mysql" || modes.get(group[0] ?? "") !== modes.get(hash);
+				if (group.length > 0 && next) await flush();
 				group.push(hash);
 			}
 			await flush();
