@@ -990,7 +990,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 				await db.sql(`CREATE ROLE ${storeRole} LOGIN`);
 				await db.sql(`GRANT USAGE, CREATE ON SCHEMA public TO ${storeRole}`);
 				await db.sql(
-					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${db.table}_parts, ${db.leaseTable} TO ${storeRole}`,
+					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${db.table}_parts, ${db.table}_blobs, ${db.table}_refs, ${db.leaseTable} TO ${storeRole}`,
 				);
 				const client = new SQL(urlAs(db, storeRole));
 				let outcome: string;
