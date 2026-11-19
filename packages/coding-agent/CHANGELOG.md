@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- The SDK exports `applyToolResultPrunes` and `applyEntryPatches`, so a caller of `loadSessionFile` or `loadEntriesFromFile` can apply a session's prune and patch records to the raw entries it reads
+
 ### Changed
 
 - When saving pruned tool output fails, the pruning now stays applied in the live context, and the session file catches up on the next successful save.
