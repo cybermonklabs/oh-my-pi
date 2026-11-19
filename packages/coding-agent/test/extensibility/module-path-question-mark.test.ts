@@ -1,10 +1,14 @@
 /**
  * Bun cannot load a module from a path that contains `?`: it reads the path cut
  * at the `?` and reports "Cannot find module …" (with `?mtime=…` for an
- * extension), which names neither the cause nor the fix. Every place that
- * imports user code from a path refuses such a path before importing, with an
- * error that names the path and the limit. These tests pin that message at
- * each of them.
+ * extension), which names neither the cause nor the fix. Through a `?`-free
+ * link into such a directory, a hook, custom command or share script failed
+ * with "ENOENT reading …"; a custom command could load instead, in an order
+ * where a hook load through the same link ran earlier in the process, before
+ * the command's file was written. Every place that imports user code from a
+ * path refuses such a path before importing, with an error that names the
+ * path and the limit, whatever ran before it.
+ * These tests pin that message at each of them.
  */
 import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -125,6 +129,50 @@ describe.skipIf(process.platform === "win32")("a module under a path that contai
 		const command = await writeModule(path.join(questionDir, "agent", "commands", "probe", "index.ts"));
 		const loaded = await loadCustomCommands({ cwd: questionDir, agentDir: path.join(questionDir, "agent") });
 		expect(loaded.errors).toEqual([{ path: command, error: `Failed to load command: ${message(command)}` }]);
+	});
+
+	it("is refused for a custom command through a link, also when a hook load through the link ran first", async () => {
+		// At 9058ab9d this order loaded the command: a hook load through the
+		// link, then the command's file written, then the command load through
+		// the same link. Alone, or with its file written before the hook load,
+		// the command failed with "ENOENT reading". A fresh process, so this
+		// order is the only history its loaders have; the files are written
+		// there, each just before its own load.
+		const { root, questionDir } = await makeQuestionRoot();
+		const link = path.join(root, "plain-link");
+		await fs.symlink(questionDir, link);
+		const probe = [
+			'import * as fs from "node:fs/promises";',
+			'import { loadCustomCommands } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/loader";',
+			'import { loadHooks } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";',
+			"const { PROBE_LINK: link } = process.env;",
+			'await fs.writeFile(link + "/hook.ts", "export default function () {}\\n");',
+			'await loadHooks([link + "/hook.ts"], link);',
+			'await fs.mkdir(link + "/agent/commands/probe", { recursive: true });',
+			'await fs.writeFile(link + "/agent/commands/probe/index.ts",',
+			'  \'export default () => ({ name: "probe-link", description: "probe", execute: async () => {} });\\n\');',
+			'const loaded = await loadCustomCommands({ cwd: link, agentDir: link + "/agent" });',
+			"const loadedProbe = loaded.commands.some(entry => entry.command.name === 'probe-link');",
+			"console.log(JSON.stringify({ loadedProbe, errors: loaded.errors }));",
+		].join("\n");
+		const child = Bun.spawn([process.execPath, "-e", probe], {
+			cwd: path.join(import.meta.dir, "..", ".."),
+			env: { ...process.env, PROBE_LINK: link },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(code, stderr).toBe(0);
+		const linked = path.join(link, "agent", "commands", "probe", "index.ts");
+		const real = path.join(questionDir, "agent", "commands", "probe", "index.ts");
+		expect(JSON.parse(stdout.trim())).toEqual({
+			loadedProbe: false,
+			errors: [{ path: linked, error: `Failed to load command: ${message(linked, real)}` }],
+		});
 	});
 
 	it("is reported by the custom share script's load", async () => {
