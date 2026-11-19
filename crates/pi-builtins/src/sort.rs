@@ -6940,8 +6940,6 @@ fn format_error_message(error: &ParseSizeError, s: &str, option: &str) -> String
 mod tests {
 
 	use super::*;
-	#[cfg(unix)]
-	use crate::locale::locale_loadable;
 	use crate::host::run_util;
 
 	fn tokenize_helper(line: &[u8], separator: Option<u8>) -> Vec<Field> {

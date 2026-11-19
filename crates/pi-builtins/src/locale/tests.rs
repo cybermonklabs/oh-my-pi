@@ -922,7 +922,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// storm from turning this process's own calls into `EINTR`.
 	let (kept, ignored, grouped) = unsafe {
 		let mut catching: libc::sigaction = std::mem::zeroed();
-		catching.sa_sigaction = note_whoever_runs_this as libc::sighandler_t;
+		catching.sa_sigaction = note_whoever_runs_this as extern "C" fn(libc::c_int) as libc::sighandler_t;
 		catching.sa_flags = libc::SA_RESTART;
 		libc::sigemptyset(&raw mut catching.sa_mask);
 		let mut kept: libc::sigaction = std::mem::zeroed();
