@@ -143,9 +143,10 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session after a killed staged writ
 
 describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client writes a name below the space", () => {
 	it("removes the row and the parts of a transcript another client commits under the artifacts directory during the delete", async () => {
-		// If this regresses, deleting a session on MySQL or MariaDB keeps a subagent transcript whose name starts with
-		// a control character when another process wrote it after the delete listed what it deletes: its row and
-		// parts stay, under a session no listing shows any more.
+		// If this regresses, deleting a session on MariaDB 11.8 keeps a subagent transcript whose name starts with a
+		// control character when another process wrote it after the delete listed what it deletes: its row and parts
+		// stay, under a session no listing shows any more. (MySQL 8.4 answers the prefix compare by characters either
+		// way, so there the case passes without the fix; MariaDB 11.8 turns it into a space-padded key range.)
 		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
 		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
 		const artifacts = `${file.slice(0, -".jsonl".length)}/`;

@@ -1133,7 +1133,8 @@ function buildQueries(
 			mysql: [
 				sql(
 					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
-						`WHERE ${startsWith("r.path", "@dir")}`,
+						// The key range first, so the delete reads and locks only the rows under `@dir` (see deleteUnder).
+						`WHERE ${range ? "r.path >= @stem AND r.path < @dir_end AND " : ""}${startsWith("r.path", "@dir")}`,
 				),
 				sql(
 					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
