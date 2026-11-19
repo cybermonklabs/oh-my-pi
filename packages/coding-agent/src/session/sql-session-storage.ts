@@ -177,23 +177,27 @@ interface DialectQueries {
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
 	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
 	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case) and exactly those rows' parts, then every part under `@dir` that
-	 * has no row: a staged full write's parts that its killed writer never
-	 * swapped in, of a path the delete may not know of. PostgreSQL and MySQL
-	 * delete the rows and their parts in one statement, so the parts deleted
-	 * are those of the rows deleted: a row another client commits between two
-	 * statements would otherwise keep its row and lose its parts under READ
-	 * COMMITTED; the second statement deletes only parts whose row it does not
-	 * see, found by a range of the parts' primary key, from `@stem` (`@dir`
-	 * without its final "/") up to `@dir_end` (`@dir` with its final "/" made
-	 * "0"), with the prefix compared by characters too. That range holds every
-	 * path under `@dir` where the `path` column compares by code point: such a
-	 * path extends `@stem`, and differs from `@dir_end` first at its "/". It
-	 * holds under MySQL's `utf8mb4_bin` too, which compares two strings as if
-	 * the shorter were padded with spaces (PAD SPACE): "/" sorts above the
-	 * space, while a path whose character after `@dir` sorts below the space
-	 * sorts below `@dir` itself, so the range starts at `@stem`. PostgreSQL
-	 * takes the range only under a code-point collation (see
+	 * case; on MySQL and MariaDB a comparison of their bytes, see below) and
+	 * exactly those rows' parts, then every part under `@dir` that has no row:
+	 * a staged full write's parts that its killed writer never swapped in, of
+	 * a path the delete may not know of. PostgreSQL and MySQL delete the rows
+	 * and their parts in one statement, so the parts deleted are those of the
+	 * rows deleted: a row another client commits between two statements would
+	 * otherwise keep its row and lose its parts under READ COMMITTED; the
+	 * second statement deletes only parts whose row it does not see, found by
+	 * a range of the parts' primary key, from `@stem` (`@dir` without its
+	 * final "/") up to `@dir_end` (`@dir` with its final "/" made "0"), with
+	 * the prefix compared too. That range holds every path under `@dir` where
+	 * the `path` column compares by code point: such a path extends `@stem`,
+	 * and differs from `@dir_end` first at its "/". It holds under MySQL's
+	 * `utf8mb4_bin` too, which compares two strings as if the shorter were
+	 * padded with spaces (PAD SPACE): "/" sorts above the space, while a path
+	 * whose character after `@dir` sorts below the space sorts below `@dir`
+	 * itself, so the range starts at `@stem`. For the same reason MySQL and
+	 * MariaDB compare the prefix as bytes: MariaDB 11.8 finds no such path by
+	 * `substr(path, 1, n) = @dir`, as a key range from `@dir` in PAD SPACE
+	 * order would not. PostgreSQL takes the range only
+	 * under a code-point collation (see
 	 * {@link pathCollationKeepsDirectoryRange}). SQLite runs its statements
 	 * inside `BEGIN IMMEDIATE`, where no other writer runs; its parts delete
 	 * takes every part under `@dir`.
@@ -213,10 +217,11 @@ interface DialectQueries {
 	/**
 	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
 	 * including, `@high`: a primary-key range, and the prefix compared by
-	 * characters too, so a collation that orders the range otherwise can never
-	 * reach another path's parts. A staging name has a digit after `@low`, and
-	 * a "-" after the epoch `@high` ends with, both above the space, so MySQL's
-	 * PAD SPACE orders these names as code-point order does.
+	 * characters too (on MySQL and MariaDB as bytes, as in
+	 * {@link deleteUnder}), so a collation that orders the range otherwise can
+	 * never reach another path's parts. A staging name has a digit after
+	 * `@low`, and a "-" after the epoch `@high` ends with, both above the
+	 * space, so MySQL's PAD SPACE orders these names as code-point order does.
 	 */
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
@@ -1100,9 +1105,16 @@ function buildQueries(
 	const startPart =
 		`FROM ${parts} AS p WHERE p.path = @path ` +
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
+	// `<column>` starts with `<value>`: its first `@len` characters equal it. On MySQL and MariaDB as bytes, so that no
+	// collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path whose
+	// character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE orders it.
+	const startsWith = (column: string, value: string): string =>
+		mysql
+			? `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`
+			: `substr(${column}, 1, @len) = ${value}`;
 	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
 	const orphanParts = (range: boolean): string =>
-		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}substr(p.path, 1, @len) = @dir`;
+		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}${startsWith("p.path", "@dir")}`;
 	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids.
 	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
 	const nextRowid = "max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024)";
@@ -1110,7 +1122,7 @@ function buildQueries(
 		({
 			postgres: [
 				sql(
-					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
+					`WITH gone AS (DELETE FROM ${table} WHERE ${startsWith("path", "@dir")} RETURNING path) ` +
 						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
 				),
 				sql(
@@ -1121,7 +1133,7 @@ function buildQueries(
 			mysql: [
 				sql(
 					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
-						`WHERE substr(r.path, 1, @len) = @dir`,
+						`WHERE ${startsWith("r.path", "@dir")}`,
 				),
 				sql(
 					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
@@ -1129,8 +1141,8 @@ function buildQueries(
 				),
 			],
 			sqlite: [
-				sql(`DELETE FROM ${parts} WHERE substr(path, 1, @len) = @dir`),
-				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
+				sql(`DELETE FROM ${parts} WHERE ${startsWith("path", "@dir")}`),
+				sql(`DELETE FROM ${table} WHERE ${startsWith("path", "@dir")}`),
 			],
 		})[adapter];
 
@@ -1243,9 +1255,9 @@ function buildQueries(
 		// Only PostgreSQL's `path` column can carry a collation the range misses: MySQL's tables are `utf8mb4_bin`,
 		// whose PAD SPACE the range's start at `@stem` allows for (see DialectQueries.deleteUnder).
 		deleteUnderScan: deleteUnder(adapter !== "postgres"),
-		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low`),
+		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")}`),
 		hasStaging: sql(
-			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low LIMIT 1`,
+			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")} LIMIT 1`,
 		),
 		stagedBytes: sql(
 			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,

@@ -6,13 +6,21 @@
  * session must still remove every part under the session's artifacts
  * directory, staging parts included. Each case runs against SQLite always and
  * against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
- * `OMP_TEST_SQL_MYSQL_URL` name a database; the MySQL-only case runs when the
- * latter does.
+ * `OMP_TEST_SQL_MYSQL_URL` name a database; the MySQL-only cases, of a name
+ * under the directory that starts below the space, run when the latter does.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, transcript, until } from "./sql-session-lease-fixture";
+import {
+	type GatedClient,
+	gatedClient,
+	LEASE_BACKENDS,
+	type LeaseDb,
+	openLeaseDb,
+	transcript,
+	until,
+} from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000e1";
 /** Timings under which no heartbeat runs during a case; the test ages the lease itself. */
@@ -125,6 +133,53 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session after a killed staged writ
 
 		await store.deleteSessionWithArtifacts(file);
 		await store.drain();
+		expect({ paths: await db.paths(), parts: await partPathsUnder(db, artifacts) }).toEqual({
+			paths: [],
+			parts: [],
+		});
+		release?.();
+	}, 120_000);
+});
+
+describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client writes a name below the space", () => {
+	it("removes the row and the parts of a transcript another client commits under the artifacts directory during the delete", async () => {
+		// If this regresses, deleting a session on MySQL or MariaDB keeps a subagent transcript whose name starts with
+		// a control character when another process wrote it after the delete listed what it deletes: its row and
+		// parts stay, under a session no listing shows any more.
+		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+		const child = `${artifacts}\u0001Task.jsonl`;
+		let gate: GatedClient | undefined;
+		const store = await db.open({
+			lease: STILL,
+			wrap: client => {
+				// The delete's first row delete, the session's own: the directory's rows go after it.
+				gate = gatedClient(client, new RegExp(`^DELETE FROM ${db.table} WHERE path = `), "before");
+				return gate.client;
+			},
+		});
+		if (!gate) throw new Error("the deleting store's client was not gated");
+		const release = await store.acquireSessionClaim?.(ID, file);
+		await store.writeText(file, transcript(ID, "parent"));
+		await store.drain();
+		const other = await db.open({ claims: false });
+
+		// The delete's transaction waits past the refresh that listed the session's rows, while the other client
+		// commits the transcript, which only the delete's own statements can find.
+		gate.close();
+		const deleting = store.deleteSessionWithArtifacts(file);
+		await gate.paused();
+		await other.writeText(child, transcript(ID, "child"));
+		await other.drain();
+		expect({ row: (await db.paths()).includes(child), parts: await partPathsUnder(db, artifacts) }).toEqual({
+			row: true,
+			parts: [child],
+		});
+		gate.open();
+		await deleting;
+		await store.drain();
+
 		expect({ paths: await db.paths(), parts: await partPathsUnder(db, artifacts) }).toEqual({
 			paths: [],
 			parts: [],
