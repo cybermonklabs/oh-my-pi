@@ -518,6 +518,39 @@ console.log(JSON.stringify({ first, second, sameSize: nodeFs.statSync(target).si
 		).toEqual({ first: "current", second: "other", sameSize: true });
 	});
 
+	it.each([["a new record"], ["a new addon"]])(
+		"write back nothing when a build left %s while the start read the sources",
+		async what => {
+			await build();
+			const target = path.join(repo, "crates/pi-natives/src/lib.rs");
+			// A time the build did not record, so the start reads the bytes and learns a state.
+			const earlier = new Date(Date.now() - 60_000);
+			await fs.utimes(target, earlier, earlier);
+			expect(
+				bounded(`// A start more than two seconds after the writes, so it learns the state it reads.
+const realNow = Date.now;
+Date.now = () => realNow.call(Date) + 10_000;
+const stampPath = addon + ".sources.json";
+const before = nodeFs.readFileSync(stampPath, "utf8");
+let built = false;
+__setRegularFileIoForTests({
+	openSync(file, flags, mode) {
+		if (!built && file === ${JSON.stringify(target)}) {
+			built = true;
+			// A build installs its addon, or writes its record, while this start reads the sources.
+			if (${JSON.stringify(what)} === "a new addon") nodeFs.writeFileSync(addon, "another addon's bytes");
+			else nodeFs.writeFileSync(stampPath, JSON.stringify({ ...JSON.parse(before), build: { builder: "the new build" } }));
+		}
+		return nodeFs.openSync(file, flags, mode);
+	},
+});
+const state = addonSourcesState(addon, repo);
+const after = nodeFs.readFileSync(stampPath, "utf8");
+console.log(JSON.stringify({ state, built, writtenBack: after !== before && JSON.parse(after).build.builder !== "the new build" }));`),
+			).toEqual({ state: "current", built: true, writtenBack: false });
+		},
+	);
+
 	it.each([["in place"], ["by a rename over it"]])(
 		"see a same-size edit whose modification time is put back (%s), as git does",
 		async how => {

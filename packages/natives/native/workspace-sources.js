@@ -943,6 +943,27 @@ function keptState(seen) {
 }
 
 /**
+ * Whether the record at `stampPath` is still `text`, the one a start read, and the addon at
+ * `addonPath` still has the size and time that record names (`stamp.addon`). A build that
+ * installed a new addon and wrote its record after the start read the old one changed one of
+ * them, and its record must stay.
+ * @param {string} addonPath
+ * @param {string} stampPath
+ * @param {string} text
+ * @param {{ addon: { size: number; mtimeMs: number } }} stamp
+ */
+function isStillRecord(addonPath, stampPath, text, stamp) {
+	try {
+		const addon = fs.statSync(addonPath);
+		return (
+			readRegularFileText(stampPath) === text && addon.size === stamp.addon.size && addon.mtimeMs === stamp.addon.mtimeMs
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Whether the addon at `addonPath` was built from the sources now in the
  * checkout at `repoRoot`: `"current"`, `"other"`, or `"unknown"` when no build
  * record describes this addon file (an addon built before records existed, one
@@ -954,7 +975,9 @@ function keptState(seen) {
  * records what it learned (best-effort), so the next start does neither. A verdict
  * is recorded only for the state of the files the read opened, only when the files
  * still match it once all are read, and only when no time in it is too new to
- * trust ({@link isRacy}); a directory's state likewise.
+ * trust ({@link isRacy}); a directory's state likewise. It writes back only over
+ * the record it read, while that still names the addon there: a build that
+ * installed a new addon and wrote its record meanwhile keeps that record.
  * @param {string} addonPath
  * @param {string} repoRoot
  * @returns {"current" | "other" | "unknown"}
@@ -1034,7 +1057,7 @@ export function addonSourcesState(addonPath, repoRoot) {
 				learned = true;
 			}
 		}
-		if (learned) {
+		if (learned && isStillRecord(addonPath, stampPath, text, stamp)) {
 			try {
 				writeStamp(addonPath, { ...stamp, scanned, seen });
 			} catch {
