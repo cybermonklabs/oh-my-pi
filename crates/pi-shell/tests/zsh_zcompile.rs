@@ -1,11 +1,10 @@
-//! `zcompile` through the obash binary run as `zsh`, against `/bin/zsh`
-//! 5.9 itself: every file of a corpus compiled by both gives the same dump
-//! (padding aside: zsh writes heap garbage after each program's strings)
-//! or the same failure, messages included. The corpus is zsh's own
-//! `Functions` and `Completion` trees (`$PI_ZSH_SRC`, default
-//! `/work/.ref/zsh-5.9`) and the `*.zsh`/`*.zsh-theme` files of
-//! `~/powerlevel10k` and `~/.oh-my-zsh`, whichever exist. Every test is
-//! skipped (passes without checking) when `/bin/zsh` is not zsh 5.9.
+//! `zcompile` through the obash binary run as `zsh`, against the real zsh
+//! 5.9 itself ([`zsh_oracle`]): every file of a corpus compiled by both
+//! gives the same dump (padding aside: zsh writes heap garbage after each
+//! program's strings) or the same failure, messages included. The corpus
+//! is the real zsh's own function files ([`corpus`]). Without zsh 5.9, or
+//! when the corpus is empty, a test compares nothing and says so
+//! (`UNCOMPARED:`).
 
 #![cfg(unix)]
 
@@ -87,35 +86,51 @@ fn masked(mut b: Vec<u8>) -> Vec<u8> {
 	b
 }
 
-/// The corpus files that exist here.
+/// The real zsh's own function files, sorted: every file (but a `.zwc`
+/// digest) of the `$fpath` directories of `zsh -f` that lie in the
+/// directory zsh installed its functions in. That is the directory holding
+/// `compinit`, or the one above it when zsh installed its functions in
+/// subdirectories of their source tree (`--enable-function-subdirs`:
+/// `…/Completion/compinit`). The site and vendor directories, which hold
+/// other packages' functions, are not part of it. Empty (the calling test
+/// reported uncompared) when there is no such file.
 fn corpus() -> Vec<String> {
-	fn walk(dir: &Path, keep: &dyn Fn(&Path) -> bool, out: &mut Vec<String>) {
-		let Ok(entries) = fs::read_dir(dir) else {
-			return;
-		};
-		let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-		entries.sort();
-		for p in entries {
-			if p.is_dir() {
-				walk(&p, keep, out);
-			} else if p.is_file() && keep(&p) {
-				out.push(p.to_string_lossy().into_owned());
+	let (out, err, st) = run(true, "print -rl -- $fpath", &[]);
+	assert_eq!((err.as_str(), st), ("", 0), "zsh's $fpath");
+	let fpath: Vec<PathBuf> = out.lines().map(PathBuf::from).collect();
+	let fndir = fpath
+		.iter()
+		.find(|d| d.join("compinit").is_file())
+		.map(|d| {
+			if d.file_name().is_some_and(|n| n == "Completion") {
+				d.parent().unwrap_or(d).to_owned()
+			} else {
+				d.clone()
 			}
-		}
-	}
-	let src = std::env::var("PI_ZSH_SRC").unwrap_or_else(|_| "/work/.ref/zsh-5.9".into());
+		});
 	let mut files = Vec::new();
-	for sub in ["Functions", "Completion"] {
-		walk(&Path::new(&src).join(sub), &|_| true, &mut files);
-	}
-	if let Some(home) = std::env::var_os("HOME") {
-		let shell_file = |p: &Path| {
-			p.extension()
-				.is_some_and(|e| e == "zsh" || e == "zsh-theme")
+	for dir in fpath
+		.iter()
+		.filter(|d| fndir.as_ref().is_some_and(|f| d.starts_with(f)))
+	{
+		let Ok(entries) = fs::read_dir(dir) else {
+			continue;
 		};
-		for sub in ["powerlevel10k", ".oh-my-zsh"] {
-			walk(&Path::new(&home).join(sub), &shell_file, &mut files);
-		}
+		files.extend(
+			entries
+				.flatten()
+				.map(|e| e.path())
+				.filter(|p| p.is_file() && p.extension().is_none_or(|e| e != "zwc"))
+				.map(|p| p.to_string_lossy().into_owned()),
+		);
+	}
+	files.sort();
+	if files.is_empty() {
+		zsh_oracle::uncompared(&format!(
+			"no corpus files found under the function directory of {}'s $fpath ({})",
+			zsh_oracle::path().display(),
+			fndir.map_or_else(|| "no compinit in it".to_owned(), |d| d.display().to_string())
+		));
 	}
 	files
 }
@@ -190,14 +205,17 @@ fn assert_none(diffs: &[String]) {
 	);
 }
 
-/// Every corpus file, with `-R` (the user's `.zshrc` and powerlevel10k
-/// compile so).
+/// Every corpus file, with `-R` (as a user's `.zshrc` and powerlevel10k
+/// compile).
 #[test]
 fn zcompile_corpus_matches_zsh() {
 	if !have_zsh() {
 		return;
 	}
 	let files = corpus();
+	if files.is_empty() {
+		return;
+	}
 	assert_none(&differences("corpus", "-R", &files));
 }
 
@@ -209,6 +227,9 @@ fn zcompile_switches_match_zsh() {
 		return;
 	}
 	let files: Vec<String> = corpus().into_iter().step_by(97).collect();
+	if files.is_empty() {
+		return;
+	}
 	for flags in ["", "-U", "-M", "-k", "-z", "-Uz -M"] {
 		assert_none(&differences(&format!("flags{}", flags.len()), flags, &files));
 	}
@@ -222,9 +243,13 @@ fn zcompile_digest_and_listing_match_zsh() {
 		return;
 	}
 	let files: Vec<String> = corpus().into_iter().step_by(131).take(12).collect();
+	if files.is_empty() {
+		return;
+	}
 	let mut outs = Vec::new();
 	for real in [true, false] {
-		let dir = scratch(if real { "digest-real" } else { "digest-ours" });
+		// One directory name for both shells: their messages name it.
+		let dir = scratch("digest");
 		let script = format!(
 			r#"unalias run-help which-command 2>/dev/null; d={}/all.zwc
 zcompile $d $1 -k $2 $3 -z ${{@[4,-1]}}; print $?
@@ -251,6 +276,9 @@ fn zcompile_lists_dumps_zsh_wrote() {
 		return;
 	}
 	let files: Vec<String> = corpus().into_iter().step_by(211).take(5).collect();
+	if files.is_empty() {
+		return;
+	}
 	let dir = scratch("list");
 	let d = dir.join("x.zwc").display().to_string();
 	let (_, err, st) = run(true, &format!("zcompile -M {d} \"$@\""), &files);
