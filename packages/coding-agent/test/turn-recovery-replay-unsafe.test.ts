@@ -1362,7 +1362,7 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 			return { host, messages, continues };
 		}
 
-		it("continues with a corrective developer message when replay is refused", () => {
+		it("continues with a hidden corrective reminder when replay is refused", () => {
 			const message = malformedTextTurn();
 			const { host, messages, continues } = continuationHost(message);
 			const recovery = new TurnRecovery(host);

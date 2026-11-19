@@ -165,6 +165,20 @@ function conversationEnd(messages: readonly AgentMessage[]): number {
 	return end;
 }
 
+/**
+ * Whether the conversation in `messages` ends on a continue reminder, trailing
+ * context-only custom messages aside: what {@link conversationEnd} skips over
+ * in front of the kept turn the reminder follows.
+ */
+function endsOnContinueReminder(messages: readonly AgentMessage[]): boolean {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "custom" || isUserAuthoredMessage(message)) return false;
+		if (message.customType === CONTINUE_REMINDER_MESSAGE_TYPE) return true;
+	}
+	return false;
+}
+
 function syntheticToolResultTailStart(messages: readonly AgentMessage[]): number {
 	let index = conversationEnd(messages);
 	while (index > 0 && isSyntheticToolResultMessage(messages[index - 1])) {
@@ -940,10 +954,12 @@ export class TurnRecovery {
 	/**
 	 * Records `reminder` in the session once the entries of `turn` and of
 	 * `previous` (the live message before the reminder: the turn, or a tool
-	 * result after it) are written: message persistence slots run in order and
-	 * may still be pending when the continuation starts. Nothing is recorded
-	 * when the branch no longer ends on the turn (it was never written, or the
-	 * session changed), since the reminder would follow something else.
+	 * result after it) are written. In AgentSession their persistence slots
+	 * have settled by the time the run's `agent_end` gets here; the wait guards
+	 * a host where a slot has not, so the reminder never lands in front of the
+	 * turn. Nothing is recorded when the branch no longer ends on the turn (it
+	 * was never written, or the session changed), since the reminder would
+	 * follow something else.
 	 */
 	async #recordContinueReminder(
 		turn: AssistantMessage,
@@ -3618,6 +3634,7 @@ export class TurnRecovery {
 	): void {
 		if (!AIError.is(id, AIError.Flag.MalformedFunctionCall)) return;
 		if (preserveFailedTurn || switchedModel) return;
+		// Live context only, not saved: this retry drops the failed turn, so a rebuilt context has no turn for it to follow.
 		const reminder = prompt.render(malformedFunctionCallRetryTemplate, {
 			retryCount: this.#retryAttempt,
 			maxRetries,
@@ -3752,7 +3769,11 @@ export class TurnRecovery {
 		if (this.#host.isStreaming() || this.#host.isCompacting() || this.isRetrying) return false;
 
 		const messages = this.#host.agent.state.messages;
-		const activeTurnEnd = retryableAssistantTurnEnd(messages);
+		// A live context that ends on a continue reminder (its continuation was
+		// cancelled or failed locally) still holds the kept turn before it: the
+		// retry continues from both, as it did when the reminder was a developer
+		// message, instead of dropping the turn the reminder asks to pick up from.
+		const activeTurnEnd = endsOnContinueReminder(messages) ? undefined : retryableAssistantTurnEnd(messages);
 		if (activeTurnEnd !== undefined) {
 			const replayStart = toolReplayStart(messages);
 			if (replayStart !== undefined) {
@@ -3768,8 +3789,9 @@ export class TurnRecovery {
 			}
 		} else {
 			// A restored session already dropped the failed assistant turn (and its
-			// paired synthetic tool results) from provider context, so the persisted
-			// display transcript is the source of truth for a retryable failed tail.
+			// paired synthetic tool results) from provider context, and a kept turn
+			// stays before its continue reminder, so the persisted display transcript
+			// is the source of truth for a retryable failed tail.
 			const transcriptMessages = this.#host.sessionManager.buildTranscriptSinceCompaction();
 			if (retryableAssistantTurnEnd(transcriptMessages) === undefined) return false;
 			// The boundary is already gone from active context; when the intact

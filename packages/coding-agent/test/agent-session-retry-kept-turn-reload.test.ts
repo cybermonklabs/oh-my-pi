@@ -336,6 +336,50 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		expect(continuedTurns(reopened)).toEqual(kept);
 	});
 
+	// Regression: an abort (Esc) lands after a rate limit's wait, once the
+	// continuation it scheduled waits its last tick to start, so the live
+	// context ends on the kept turn and its continue reminder. `/retry` then
+	// dropped the kept turn and sent the reminder alone, asking the model to
+	// continue text it could not see.
+	it("continues from the kept turn and its reminder on a retry after the continuation was cancelled", async () => {
+		sessions.answers = [
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		];
+		const sessionManager = sessions.createSessionManager();
+		const session = await sessions.startSession(sessionManager);
+		const wait = sessions.schedulerWait;
+		const advance = wait.getMockImplementation();
+		if (!advance) throw new Error("Expected the harness to mock scheduler.wait");
+		let aborted: Promise<void> | undefined;
+		wait.mockImplementation((delayMs, options) => {
+			// The scheduled continuation waits here once the reminder is the live tail.
+			const tail = session.agent.state.messages.at(-1);
+			if (!aborted && tail?.role === "custom" && tail.customType === CONTINUE_REMINDER_MESSAGE_TYPE) {
+				aborted = session.abort();
+			}
+			return advance(delayMs, options);
+		});
+		await session.prompt("Answer in two parts");
+		await session.waitForIdle();
+		await aborted;
+		const keptTurn = `assistant[text:${FIRST_TEXT}]`;
+		const reminder = expect.stringMatching(/^developer:/);
+		expect(sessions.requests).toBe(1);
+		expect(modelConversation(session.agent.state.messages)).toEqual(["user", keptTurn, reminder]);
+
+		expect(await session.retry()).toBe(true);
+		await session.waitForIdle();
+
+		expect(sessions.requests).toBe(2);
+		expect(modelConversation(sessions.requestMessages.at(-1) ?? [])).toEqual(["user", keptTurn, reminder]);
+		const live = modelConversation(session.agent.state.messages);
+		expect(live).toEqual(["user", keptTurn, reminder, `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(modelConversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual([keptTurn]);
+	});
+
 	// A stream cut after text is continued outside any retry; that
 	// continuation is cut by a rate limit after its text, which a retry
 	// continues. The one successful turn continued from both and closes the

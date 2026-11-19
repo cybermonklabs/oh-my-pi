@@ -52,6 +52,17 @@ const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
  */
 export const CONTINUE_REMINDER_MESSAGE_TYPE = "continue-reminder";
 
+/**
+ * Whether `message` may sit between a kept turn and its continue reminder in a
+ * rebuilt context: the turn's tool results, and the context notes placed after
+ * a retained assistant turn a native Anthropic summary folds.
+ */
+function sitsBetweenTurnAndReminder(message: AgentMessage | undefined): boolean {
+	return (
+		message?.role === "toolResult" || (message?.role === "custom" && message.customType === CONTEXT_NOTES_ENTRY_TYPE)
+	);
+}
+
 function isRolloverRequestEntry(entry: SessionEntry): boolean {
 	return (
 		isUserRequestEntry(entry) ||
@@ -798,16 +809,16 @@ export function buildSessionContext(
 	// unsafe trailing thinking from that assistant and sends the hidden
 	// continuity note instead. Keep a failed turn a later turn continued from
 	// (`continued`): the turns after it pick up from it. A continue reminder
-	// stays exactly while the turn before it (its tool results aside) is such a
-	// kept turn: after a turn this rebuild leaves out (no continuation finished
-	// it, or a compaction cut it off), it would ask the model to pick up from
-	// nothing.
+	// stays exactly while the turn before it (see `sitsBetweenTurnAndReminder`
+	// for what may sit between them) is such a kept turn: after a turn this
+	// rebuild leaves out (no continuation finished it, or a compaction cut it
+	// off), it would ask the model to pick up from nothing.
 	if (!options?.transcript) {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
 			if (message?.role === "custom" && message.customType === CONTINUE_REMINDER_MESSAGE_TYPE) {
 				let turnIndex = i - 1;
-				while (messages[turnIndex]?.role === "toolResult") turnIndex--;
+				while (sitsBetweenTurnAndReminder(messages[turnIndex])) turnIndex--;
 				const turn = messages[turnIndex];
 				if (turn?.role !== "assistant" || turn.continued !== true) messages.splice(i, 1);
 				continue;
