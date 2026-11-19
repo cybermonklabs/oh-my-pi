@@ -15,7 +15,13 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirHandoffDir } from "@oh-my-pi/pi-natives/natives-dir";
-import { filterChildShellEnv, launchEnvValue, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import {
+	bunOptionsWithoutEnvFiles,
+	bunRelaunchArgs,
+	filterChildShellEnv,
+	launchEnvValue,
+	stripGitRepoLocationEnv,
+} from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -146,30 +152,56 @@ export function resolveExecutablePath(): string {
 }
 
 /**
- * Bun's own `.env` loading, off for a subprocess worker and the launch broker that a
- * non-compiled omp starts (a compiled binary is built with it off). Such a child gets its
- * environment from its parent (the values Bun loaded at the parent's start included, for a
- * worker) and applies omp's own `.env` files itself (`@oh-my-pi/pi-utils/env`) after it resolves
- * the natives directory; Bun's would apply the `.env` of whatever directory the child starts in
- * before any omp code runs, so the child would start with values its parent never gave it, and
- * refuse its parent's natives-directory handoff.
+ * Bun's own `.env` loading, off for an omp a non-compiled omp starts with its environment: a
+ * worker, the launch broker, a detached `omp gc`, or the bash tool's `git worktree add`
+ * helper (a compiled binary is built with it off). Such a child gets its environment from its
+ * parent (the values Bun loaded at the parent's start included, for a worker) and applies omp's
+ * own `.env` files itself (`@oh-my-pi/pi-utils/env`) after it resolves the natives directory;
+ * Bun's would apply the `.env` of whatever directory the child starts in before any omp code
+ * runs, so the child would start with values its parent never gave it, and refuse its parent's
+ * natives-directory handoff.
  */
 const NO_BUN_ENV_FILE = "--no-env-file";
 
+/** This CLI's entry: the declared worker-host entry, else `src/cli.ts` by absolute path. */
+function cliEntry(): string {
+	return workerHostEntry() ?? path.resolve(import.meta.dir, "..", "cli.ts");
+}
+
 /**
- * Resolve the command that re-enters this CLI's entrypoint: the compiled
- * binary itself, or the runtime plus the declared worker-host entry. Used by
- * the TUI `/restart` relaunch; workers go through {@link resolveWorkerSpawnCmd},
- * whose no-host fallback deliberately differs (cwd-relative entry pinned to the
- * package root for `bun test` IPC). Outside a CLI host this falls back to the
- * absolute path of `src/cli.ts` so the relaunch keeps the caller's cwd.
+ * Resolve the command that starts this CLI again as the session it is: the TUI `/restart`
+ * relaunch and a `/fork` session. The compiled binary itself, or the runtime plus this CLI's
+ * entry, given the values Bun's own `.env` loading gave this process at its start through a
+ * private file (`bunRelaunchArgs`): `/restart`'s `execvp(3)` and the terminal that starts a fork
+ * pass the environment this process was started with, which those values are not in. When
+ * `BUN_OPTIONS` names an `--env-file`, the command starts through `env` with that file left out
+ * of it, or with `BUN_OPTIONS` unset where Bun's reading of it is not certain
+ * (`bunOptionsWithoutEnvFiles`), so the new process does not read it again from its own
+ * directory. A caller whose start fails removes the private file (`discardBunRelaunchFile`); the
+ * new process removes it when it starts. Where the launch environment cannot be read (a
+ * non-compiled omp on macOS or Windows), neither applies: the command is the runtime plus the
+ * entry, as before this change, and Bun loads the `.env` files of the directory the new process
+ * starts in. Outside a CLI host the entry is the absolute path of `src/cli.ts`, so the relaunch
+ * keeps the caller's cwd.
  */
 export function resolveCliEntryCmd(): string[] {
 	const executable = resolveExecutablePath();
 	if (isCompiledBinary()) return [executable];
-	const hostEntry = workerHostEntry();
-	if (hostEntry) return [executable, hostEntry];
-	return [executable, path.resolve(import.meta.dir, "..", "cli.ts")];
+	const options = process.platform === "win32" ? undefined : bunOptionsWithoutEnvFiles();
+	const prefix =
+		options === undefined ? [] : ["env", ...(options ? [`BUN_OPTIONS=${options}`] : ["-u", "BUN_OPTIONS"])];
+	return [...prefix, executable, ...bunRelaunchArgs(), cliEntry()];
+}
+
+/**
+ * Resolve the command that starts this CLI as a child that gets its environment from its
+ * parent (a detached `omp gc`, the bash tool's `git worktree add` helper): the compiled binary,
+ * or the runtime with its own `.env` loading off plus this CLI's entry.
+ */
+export function resolveCliChildCmd(): string[] {
+	const executable = resolveExecutablePath();
+	if (isCompiledBinary()) return [executable];
+	return [executable, NO_BUN_ENV_FILE, cliEntry()];
 }
 
 /**

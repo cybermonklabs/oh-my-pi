@@ -3,10 +3,11 @@ import * as fs from "node:fs";
 /**
  * Read a file that is expected to be a regular file, without ever blocking on one that is not.
  *
- * Every read the addon loader makes, at a start, of a file a user or another process can put
- * in place (a workspace checkout's sources and its `BUILD.bazel` files, the checkout id in its
- * git directory, an addon's sources record) goes through here. A plain read of a FIFO with no
- * writer waits forever, and so would every omp start that reads one.
+ * Every read the addon loader and pi-utils make, at a start, of a file a user or another
+ * process can put in place (a workspace checkout's sources and its `BUILD.bazel` files, the
+ * checkout id in its git directory, an addon's sources record, a relaunch file) goes through
+ * here. A plain read of a FIFO with no writer waits forever, and so would every omp start
+ * that reads one.
  *
  * - `lstat` must show a regular file; anything else is never opened, and is reported by its
  *   kind.
@@ -28,7 +29,10 @@ let io = fs;
 
 /**
  * Replace the file calls this module makes (`undefined` restores them), so a test can change a
- * file between the `lstat` and the `open`. The replacement reaches this module instance only.
+ * file between the `lstat` and the `open`. The replacement reaches this module instance only:
+ * under Bun's `--preserve-symlinks`, a relative import of this file and one by the package name
+ * (`@oh-my-pi/pi-natives/regular-file`, through the workspace link) load two instances, and a
+ * replacement set through one misses the other. No test or script runs Bun with that flag.
  * @param {Partial<typeof io> | undefined} replacement
  */
 export function __setRegularFileIoForTests(replacement) {
