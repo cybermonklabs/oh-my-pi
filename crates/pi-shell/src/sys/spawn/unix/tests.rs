@@ -25,13 +25,10 @@ use crate::{
 	},
 };
 
-/// How long a parked waiter sleeps before it polls again: not a bound of
-/// any test, which waits for its event however long the host takes (a test
-/// whose event never comes is failed by the test runner,
-/// `.config/nextest.toml`).
-#[cfg(target_os = "linux")]
 /// The parked tests' park timeout: past the runner's bound, so only a wake
-/// (the exit) ends a park, and a missed one fails the test.
+/// (the exit) ends a park, and a test whose wake never comes is failed by
+/// the test runner (`.config/nextest.toml`), never by a bound of its own.
+#[cfg(target_os = "linux")]
 const POLL: Duration = crate::testkit::child::LIFETIME;
 
 /// A detached external is signalled through its session, whose group exists

@@ -651,16 +651,13 @@ mod tests {
 		unsafe { libc::kill(pid, libc::SIGKILL) };
 		// Not yet waited for, so the child stays a zombie of this process.
 		// Waits for the zombie as long as that takes.
-		let mut state = info(pid).map(|p| p.state);
-		while state != Some(ProcState::Zombie) {
+		while info(pid).map(|p| p.state) != Some(ProcState::Zombie) {
 			std::thread::sleep(std::time::Duration::from_millis(10));
-			state = info(pid).map(|p| p.state);
 		}
 		let zombie_ended = ended(pid);
 		let zombie_exists = exists(pid);
 		child.wait().unwrap();
 		assert!(!running_ended, "the running sleep {pid} counts as ended");
-		assert_eq!(state, Some(ProcState::Zombie), "sleep {pid} never became a zombie");
 		assert!(zombie_ended, "the zombie {pid} does not count as ended");
 		assert!(zombie_exists, "the zombie {pid} does not exist");
 		assert!(!exists(pid) && ended(pid), "the reaped sleep {pid} still exists");

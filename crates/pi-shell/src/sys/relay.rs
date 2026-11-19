@@ -400,7 +400,7 @@ impl Drop for Relayed {
 mod tests {
 	use std::{
 		os::{fd::OwnedFd, unix::ffi::OsStrExt},
-		path::{Path, PathBuf},
+		path::Path,
 		sync::Arc,
 	};
 
@@ -514,34 +514,36 @@ mod tests {
 	/// read concurrently on the test's own task; `text` makes that pipe a
 	/// text capture.
 	async fn run(session: &mut Session, command: &str, text: bool) -> Vec<u8> {
-		run_releasing(session, command, text, None).await
+		run_gated(session, command, text, false).await
 	}
 
-	/// A leftover `sh` keeps the pipe open with: it runs until `release`
-	/// exists, then runs `then` (and ends).
-	fn leftover(release: &Path, then: &str) -> String {
-		format!(
-			"(while [ ! -e {} ]; do {} 0.01; done; {then}) &",
-			release.display(),
-			crate::testkit::child::on_path("sleep")
-		)
+	/// A leftover `sh` keeps the pipe open with: it reads fd 3, its copy of
+	/// the run's stdin, to end of file, then runs `then` (and ends). Under
+	/// [`run_gated`] that stdin is a pipe whose only write end the test
+	/// holds, so the leftover ends when the test lets it go, or when the test
+	/// process ends however it ends: the kernel closes the write end then.
+	/// (fd 3, because an asynchronous list's own stdin is `/dev/null`.)
+	fn leftover(then: &str) -> String {
+		format!("exec 3<&0; (while read -r _; do :; done <&3; {then}) &")
 	}
 
-	/// [`run`], creating `release` once the run has returned, while the
-	/// reader still reads: a [`leftover`] waiting for it holds the pipe past
-	/// the run's end, whatever the host's speed. A run that waited for the
+	/// [`run`]; with `gated`, the run's stdin is a gate pipe whose write end
+	/// the test closes once the run has returned, while the reader still
+	/// reads: a [`leftover`] waiting for the gate holds the pipe past the
+	/// run's end, whatever the host's speed. A run that waited for the
 	/// leftover would never return, and the test hangs until the runner's
-	/// timeout.
-	async fn run_releasing(
-		session: &mut Session,
-		command: &str,
-		text: bool,
-		release: Option<&Path>,
-	) -> Vec<u8> {
+	/// timeout; the runner's kill closes the gate, and the leftover ends.
+	async fn run_gated(session: &mut Session, command: &str, text: bool, gated: bool) -> Vec<u8> {
 		let (reader, writer) = io::pipe().unwrap();
 		let mut reader = Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
+		let (stdin, gate) = if gated {
+			let (stdin, gate) = io::pipe().unwrap();
+			(std::fs::File::from(OwnedFd::from(stdin)), Some(gate))
+		} else {
+			(std::fs::File::open("/dev/null").unwrap(), None)
+		};
 		let stdio = RunStdio {
-			stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+			stdin:  Some(stdin),
 			stderr: Some(std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()))),
 			stdout: Some(std::fs::File::from(OwnedFd::from(writer))),
 		};
@@ -557,16 +559,9 @@ mod tests {
 				.run_with(options, stdio, CancellationToken::new())
 				.await
 				.unwrap();
-			if let Some(release) = release {
-				std::fs::write(release, b"").unwrap();
-			}
+			drop(gate);
 		};
 		tokio::join!(read, run).0
-	}
-
-	/// A file in `dir`, not there yet.
-	fn release_file(dir: &tempfile::TempDir) -> PathBuf {
-		dir.path().join("release")
 	}
 
 	fn legacy_file(dir: &Path) -> String {
@@ -657,10 +652,8 @@ mod tests {
 	/// once the run returned: `X` before `c` is the exit reported first.
 	#[tokio::test(flavor = "current_thread")]
 	async fn held_bytes_wait_for_the_end_of_a_stream_a_leftover_holds() {
-		let dir = tempfile::tempdir().unwrap();
-		let release = release_file(&dir);
-		let command = format!("/bin/sh -c 'printf abc; {}'; printf X", leftover(&release, ":"));
-		let out = run_releasing(&mut session(true), &command, true, Some(&release)).await;
+		let command = format!("/bin/sh -c 'printf abc; {}'; printf X", leftover(":"));
+		let out = run_gated(&mut session(true), &command, true, true).await;
 		assert_eq!(out, b"abXc");
 	}
 
@@ -670,11 +663,8 @@ mod tests {
 	/// would through a plain pipe. It writes only once the run returned.
 	#[tokio::test(flavor = "current_thread")]
 	async fn late_output_of_a_leftover_reaches_the_capture() {
-		let dir = tempfile::tempdir().unwrap();
-		let release = release_file(&dir);
-		let command =
-			format!("/bin/sh -c 'echo early; {}'; echo done", leftover(&release, "echo late"));
-		let out = run_releasing(&mut session(false), &command, true, Some(&release)).await;
+		let command = format!("/bin/sh -c 'echo early; {}'; echo done", leftover("echo late"));
+		let out = run_gated(&mut session(false), &command, true, true).await;
 		assert_eq!(out, b"early\ndone\nlate\n");
 	}
 
@@ -726,10 +716,8 @@ mod tests {
 	/// ends only once the run returned).
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exit_is_reported_while_a_leftover_holds_the_pipe() {
-		let dir = tempfile::tempdir().unwrap();
-		let release = release_file(&dir);
-		let command = format!("/bin/sh -c 'echo hi; {}'; echo done", leftover(&release, ":"));
-		let out = run_releasing(&mut session(false), &command, true, Some(&release)).await;
+		let command = format!("/bin/sh -c 'echo hi; {}'; echo done", leftover(":"));
+		let out = run_gated(&mut session(false), &command, true, true).await;
 		assert_eq!(out, b"hi\ndone\n");
 	}
 }

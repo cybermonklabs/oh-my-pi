@@ -464,20 +464,18 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 #[cfg(unix)]
 fn capture_on_single_worker(command: &'static str) -> (ShellExecuteResult, String) {
 	capture_on_runtime(command, None, 512)
-		.expect("read must not wait on a blocking worker it cannot get")
 }
 
 /// Runs `command` in `cwd` on a dedicated single-worker runtime whose
 /// blocking pool holds `max_blocking_threads`, once this thread holds
 /// [`shell_test_lock`]. A builtin that blocks the runtime's only worker
-/// never finishes, and the runner's bound fails the test; `Err` only if the
-/// runtime's thread panicked.
+/// never finishes, and the runner's bound fails the test.
 #[cfg(unix)]
 fn capture_on_runtime(
 	command: &'static str,
 	cwd: Option<std::path::PathBuf>,
 	max_blocking_threads: usize,
-) -> Result<(ShellExecuteResult, String), std::sync::mpsc::RecvError> {
+) -> (ShellExecuteResult, String) {
 	let _guard = shell_test_lock().blocking_lock();
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
@@ -494,7 +492,7 @@ fn capture_on_runtime(
 			CancelToken::default(),
 		)));
 	});
-	rx.recv()
+	rx.recv().expect("the runtime's thread panicked")
 }
 
 #[cfg(unix)]

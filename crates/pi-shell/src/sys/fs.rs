@@ -1423,22 +1423,28 @@ mod tests {
 			&[TempPurpose::HereDoc]
 		};
 		for &purpose in purposes {
-			// `TEMP_SEQ` is only read here; another test of this process may
-			// take names meanwhile, which only moves this one further on.
+			// Other tests of this process (Bazel runs them all in one) take
+			// names too, so one of this window can be held already: by them,
+			// or by a node an earlier process left. Either serves, and only
+			// the names this test made are its to remove.
 			let next = TEMP_SEQ.load(Ordering::Relaxed);
-			let left: Vec<_> = (next..next + 4)
-				.map(|seq| std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id())))
+			let mine: Vec<_> = (next..next + 4)
+				.filter_map(|seq| {
+					let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+					match fs::File::create_new(&path) {
+						Ok(_) => Some(path),
+						Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+						Err(e) => panic!("{path:?}: {e}"),
+					}
+				})
 				.collect();
-			for path in &left {
-				fs::File::create_new(path).expect("a name no node holds yet");
-			}
 			let node = temp(purpose);
-			for path in &left {
+			for path in &mine {
 				fs::remove_file(path).unwrap();
 			}
 			let node = node.unwrap_or_else(|e| panic!("{purpose:?}: {e}"));
 			let path = host_path(node.path.as_ref()).unwrap().to_path_buf();
-			assert!(!left.contains(&path), "{purpose:?} took a name already held: {path:?}");
+			assert!(!mine.contains(&path), "{purpose:?} took a name already held: {path:?}");
 			fs::remove_file(&path).unwrap();
 		}
 	}
@@ -1552,12 +1558,12 @@ mod tests {
 		}
 
 		/// A FIFO opened for writing only goes to the helper thread even when
-		/// a reader has it open, so no `O_NONBLOCK` writer open of a FIFO is
-		/// ever tried: under gVisor before google/gvisor@d6786915 one that
-		/// fails with `ENXIO` (no reader yet) counts as a writer for a moment,
-		/// and a reader then inside a blocking open of the FIFO returns with no
-		/// writer and reads end of file, while the shell's real writer waits
-		/// for a reader for ever.
+		/// a reader has it open, so no `O_NONBLOCK` writer open is tried on a
+		/// FIFO that exists when the open starts: under gVisor before
+		/// google/gvisor@d6786915 one that fails with `ENXIO` (no reader yet)
+		/// counts as a writer for a moment, and a reader then inside a blocking
+		/// open of the FIFO returns with no writer and reads end of file, while
+		/// the shell's real writer waits for a reader for ever.
 		#[test]
 		fn writing_a_fifo_is_left_to_the_helper_even_with_a_reader() {
 			let path = fifo();

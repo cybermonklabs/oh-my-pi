@@ -1634,10 +1634,11 @@ async fn run_shell_command_streams_in_filesystem(
 	// Release the extra writer so the stderr reader can reach EOF.
 	drop(diagnostics);
 
-	// As in `run_shell_command_once`: a short wait for more after the run,
-	// which a cancel ends without losing what the pipes hold, except that a
-	// cancelled run's readers stay open for its TERM traps until the cancel
-	// bridge releases them.
+	// As in `run_shell_command_once`: a short wait for more after the run
+	// (250 ms of quiet, and at most 2 s), which a cancel ends. On Unix it ends
+	// it without losing what the pipes hold; elsewhere the readers stop at the
+	// cancel. A cancelled run's readers stay open for its TERM traps until the
+	// cancel bridge releases them.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
@@ -1674,7 +1675,8 @@ async fn run_shell_command_streams_in_filesystem(
 	if !stdout_finished || !stderr_finished {
 		reader_cancel.cancel();
 	}
-	// Each cancelled reader takes what its pipe holds, then ends.
+	// On Unix each cancelled reader takes what its pipe holds, then ends;
+	// elsewhere it stops at the cancel.
 	if !stdout_finished {
 		let _ = (&mut stdout_handle).await;
 	}
@@ -2006,12 +2008,15 @@ async fn next_read(
 				Err(_) => None,
 			};
 		}
+		// The cancel first, so the snapshot is taken on it and no normal read
+		// comes between.
 		let mut readiness = tokio::select! {
-			ready = reader.readable() => ready.ok()?,
+			biased;
 			() = cancel_token.cancelled() => {
 				*drain = Some(queued_bytes(reader.get_ref()));
 				continue;
 			}
+			ready = reader.readable() => ready.ok()?,
 		};
 		match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), buf)) {
 			Ok(Ok(0)) => return None,
