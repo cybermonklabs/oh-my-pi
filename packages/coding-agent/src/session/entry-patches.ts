@@ -22,8 +22,11 @@
  * of the file and call {@link applyEntryPatchesInWindow} on its entries, so
  * each entry they return carries every record the range holds. A record
  * written after a reader returned its target does not change that entry: the
- * RPC result lists the record among its raw entries, and the viewer shows the
- * field when it next reads the file from its start (on opening it, or after a
+ * RPC result lists the record among its raw entries. The viewer applies the
+ * records of the window it renders: on a transcript over 8 MiB it reads 8 MiB
+ * windows, so a record in a later window does not patch an entry it already
+ * rendered from an earlier one. On a shorter transcript it shows the field
+ * when it next reads the file from its start (on opening it, or after a
  * rewrite). The collab agent drawer and binaries older than the record show
  * the fields as first written.
  *
