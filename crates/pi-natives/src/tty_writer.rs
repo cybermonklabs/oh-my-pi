@@ -455,7 +455,7 @@ mod tests {
 		});
 
 		let reader = std::thread::spawn(move || {
-			let mut buf = [0u8; 64 * 1024];
+			let mut buf = vec![0u8; 64 * 1024];
 			let mut received = 0usize;
 			while received < total {
 				// SAFETY: this thread owns read_fd and buf is valid writable
