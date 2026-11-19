@@ -219,13 +219,73 @@ impl CaseWriter {
 	}
 
 	fn push_char(&mut self, c: char) {
-		match (self.next.take(), self.run) {
-			(Some(CaseFold::UpperFirst), _) => self.out.extend(c.to_uppercase()),
-			(Some(CaseFold::LowerFirst), _) => self.out.extend(c.to_lowercase()),
-			(_, Some(CaseFold::Upper)) => self.out.extend(c.to_uppercase()),
-			(_, Some(CaseFold::Lower)) => self.out.extend(c.to_lowercase()),
-			_ => self.out.push(c),
-		}
+		let folded = match (self.next.take(), self.run) {
+			(Some(CaseFold::UpperFirst), _) => one_char_case(c, c.to_uppercase()),
+			(Some(CaseFold::LowerFirst), _) => one_char_case(c, c.to_lowercase()),
+			(_, Some(CaseFold::Upper)) => one_char_case(c, c.to_uppercase()),
+			(_, Some(CaseFold::Lower)) => one_char_case(c, c.to_lowercase()),
+			_ => c,
+		};
+		self.out.push(folded);
+	}
+}
+
+/// The characters whose full case mapping is several characters in one
+/// direction and that GNU sed 4.9 writes as one other character there, with
+/// that character, sorted. No character's mapping is several characters in
+/// both directions, so one table serves `\U` and `\L`: `İ` is the only one
+/// whose lower case is several characters, and its upper case is itself.
+///
+/// Made in this pod with Python 3.13 (Unicode 15.1): every code point whose
+/// `str.upper()` or `str.lower()` has more than one character was run
+/// through `/usr/bin/sed` (GNU sed 4.9) under `LC_ALL=C.UTF-8` with
+/// `s/.*/\U&/` or `s/.*/\L&/`, and the ones it maps to one other character
+/// kept: 27 of the 102 with a several-character upper case (the Greek
+/// letters with ypogegrammeni, to their capital with prosgegrammeni) and the
+/// one with a several-character lower case. GNU leaves the other 75
+/// unchanged (`ß`, `ﬁ`, `ŉ`, ...).
+const SIMPLE_CASE_MAPPINGS: [(char, char); 28] = [
+	('\u{0130}', '\u{0069}'),
+	('\u{1F80}', '\u{1F88}'),
+	('\u{1F81}', '\u{1F89}'),
+	('\u{1F82}', '\u{1F8A}'),
+	('\u{1F83}', '\u{1F8B}'),
+	('\u{1F84}', '\u{1F8C}'),
+	('\u{1F85}', '\u{1F8D}'),
+	('\u{1F86}', '\u{1F8E}'),
+	('\u{1F87}', '\u{1F8F}'),
+	('\u{1F90}', '\u{1F98}'),
+	('\u{1F91}', '\u{1F99}'),
+	('\u{1F92}', '\u{1F9A}'),
+	('\u{1F93}', '\u{1F9B}'),
+	('\u{1F94}', '\u{1F9C}'),
+	('\u{1F95}', '\u{1F9D}'),
+	('\u{1F96}', '\u{1F9E}'),
+	('\u{1F97}', '\u{1F9F}'),
+	('\u{1FA0}', '\u{1FA8}'),
+	('\u{1FA1}', '\u{1FA9}'),
+	('\u{1FA2}', '\u{1FAA}'),
+	('\u{1FA3}', '\u{1FAB}'),
+	('\u{1FA4}', '\u{1FAC}'),
+	('\u{1FA5}', '\u{1FAD}'),
+	('\u{1FA6}', '\u{1FAE}'),
+	('\u{1FA7}', '\u{1FAF}'),
+	('\u{1FB3}', '\u{1FBC}'),
+	('\u{1FC3}', '\u{1FCC}'),
+	('\u{1FF3}', '\u{1FFC}'),
+];
+
+/// The one character `\U`, `\L`, `\u` or `\l` writes for `c`, whose full
+/// case mapping is `mapped`: that mapping where it is one character, as GNU
+/// sed maps one character to one; else the one [`SIMPLE_CASE_MAPPINGS`]
+/// gives, or `c` unchanged: `printf 'straße\n' | sed 's/.*/\U&/'` prints
+/// `STRAßE`.
+fn one_char_case(c: char, mut mapped: impl Iterator<Item = char>) -> char {
+	match (mapped.next(), mapped.next()) {
+		(Some(one), None) => one,
+		_ => SIMPLE_CASE_MAPPINGS
+			.binary_search_by_key(&c, |&(from, _)| from)
+			.map_or(c, |index| SIMPLE_CASE_MAPPINGS[index].1),
 	}
 }
 
@@ -936,16 +996,12 @@ fn resolve_branch_targets(
 			// Build the replacement
 			let new_data = match old_data {
 				CommandData::Label(Some(label)) => {
-					// GNU sed exits 4 for a jump to a label no `:` defines:
-					// `sed -n 'ba#c'` is "can't find label for jump to `a'".
-					let target = context
-						.label_to_command_map
-						.get(&label)
-						.cloned()
-						.ok_or_else(|| {
-							location_error::<()>(&cmd.location, format!("undefined label `{label}'"), 4)
-								.unwrap_err()
-						})?;
+					// GNU sed exits 4 for a jump to a label no `:` defines,
+					// with no script position: `sed -n 'ba#c'` is "sed: can't
+					// find label for jump to `a'".
+					let target = context.label_to_command_map.get(&label).cloned().ok_or_else(|| {
+						SedError::new(4, format!("can't find label for jump to `{label}'"))
+					})?;
 					CommandData::BranchTarget(Some(target))
 				},
 				CommandData::Label(None) => CommandData::BranchTarget(None),
@@ -3555,8 +3611,10 @@ mod tests {
 		let result = resolve_branch_targets(Some(branch), &mut context);
 
 		assert!(result.is_err());
-		let err = result.unwrap_err().to_string();
-		assert!(err.contains("undefined label `nope'"));
+		let err = result.unwrap_err();
+		// GNU sed 4.9's message and exit status, with no script position.
+		assert_eq!(err.to_string(), "can't find label for jump to `nope'");
+		assert_eq!(err.code(), 4);
 	}
 
 	#[test]
@@ -7086,6 +7144,7 @@ use regex::{
 	Regex as RustRegex,
 	bytes::{CaptureMatches as ByteCaptureMatches, Captures as ByteCaptures, Regex as ByteRegex},
 };
+use crate::bre::{CachedMatch, next_match};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::fast_io::{IOChunk, byte_text};
@@ -7310,30 +7369,6 @@ fn fancy_find(re: &FancyRegex, text: &str, pos: usize) -> SedResult<Option<(usiz
 	re.find_from_pos(text, pos)
 		.map(|found| found.map(|m| (m.start(), m.end())))
 		.map_err(|e| SedError::new(2, e.to_string()))
-}
-
-/// The match a search found last, from the last position searched: `None`
-/// until searched, `Some(None)` where there is none.
-type CachedMatch = Option<Option<(usize, usize)>>;
-
-/// The first match at or after `pos`, where `cached` holds the one found
-/// from a position at or before `pos`: it stands while it starts at or after
-/// `pos`, and otherwise `search` finds the match from `pos`, which `cached`
-/// then keeps. A search asked at each position of a line in turn so scans
-/// the line once.
-fn next_match(
-	cached: &mut CachedMatch,
-	pos: usize,
-	search: impl FnOnce() -> SedResult<Option<(usize, usize)>>,
-) -> SedResult<Option<(usize, usize)>> {
-	if let Some(found) = *cached
-		&& found.is_none_or(|(start, _)| start >= pos)
-	{
-		return Ok(found);
-	}
-	let found = search()?;
-	*cached = Some(found);
-	Ok(found)
 }
 
 /// Where each branch next matches, from the last position searched.
@@ -9371,11 +9406,13 @@ fn substitute(
 				.unwrap_err()
 			})?;
 			let mut shell_out = output_bytes.stdout;
-			if shell_out.ends_with(b"\r\n") {
-				// On windows, both return carriage and newline characters are used
+			// GNU sed strips one delimiter that ends the output, a NUL under
+			// `-z`: `printf 'x\0' | sed -z 's/x/echo y/e'` prints `y`, a
+			// newline and a NUL. A Windows shell ends its lines with `\r\n`.
+			let delimiter = context.delimiter();
+			if cfg!(windows) && delimiter == b'\n' && shell_out.ends_with(b"\r\n") {
 				shell_out.truncate(shell_out.len() - 2);
-			} else if shell_out.ends_with(b"\n") {
-				// Strip the trailing newline, as GNU sed does
+			} else if shell_out.last() == Some(&delimiter) {
 				shell_out.pop();
 			}
 			// Output that is not UTF-8 is kept as its bytes: `echo x | sed
@@ -10620,7 +10657,10 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		length:           matches.get_one::<u32>("length").map_or(70, |v| *v as usize),
 		quiet:            matches.get_flag("quiet"),
 		posix:            matches.get_flag("posix"),
-		separate:         matches.get_flag("separate"),
+		// `-i` implies `-s`, as in GNU sed: each file is edited on its own, so
+		// `$`, `n`, `N` and the line numbers stop at its end, and `sed -i
+		// 'n;d' f1 f2` keeps the first line of `f2`.
+		separate:         matches.get_flag("separate") || matches.contains_id("in-place"),
 		sandbox:          matches.get_flag("sandbox"),
 		unbuffered:       matches.get_flag("unbuffered"),
 		null_data:        matches.get_flag("null-data"),
