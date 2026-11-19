@@ -801,10 +801,11 @@ mod fifo {
 		}
 		let slot = Arc::new(Mutex::new(Slot::default()));
 		let (opts, target, helper) = (options(flags, mode), host.to_path_buf(), Arc::clone(&slot));
-		let spawned = thread::Builder::new()
-			.name("obash-fifo".into())
-			.stack_size(64 << 10)
-			.spawn(move || {
+		let spawned = crate::sys::thread::spawn_helper(
+			thread::Builder::new()
+				.name("obash-fifo".into())
+				.stack_size(64 << 10),
+			move || {
 				let opened = opts.open(&target);
 				let mut s = helper.lock();
 				if s.cancelled {
@@ -816,7 +817,8 @@ mod fifo {
 				if let Some(w) = waker {
 					w.wake();
 				}
-			});
+			},
+		);
 		if let Err(e) = spawned {
 			slot.lock().result = Some(Err(e));
 		}

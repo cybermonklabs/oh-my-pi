@@ -123,6 +123,14 @@ pub trait Host {
 	/// `None` restores the default disposition. Its current disposition
 	/// stays as it is. Hosts without OS signals keep the default: nothing.
 	fn forget_ignored(&mut self, _signal: Signal) {}
+	/// Forward the OS signals caught since the run loop last did, now, to
+	/// the shell's
+	/// [`ControlHandle::signal`](crate::bash::ControlHandle::signal). A run loop
+	/// forwards them between steps; the line editor asks before it answers a
+	/// `zle -F` handler's file, as zsh, whose signal handler has run (a resize
+	/// redrawn) by the time `select` reports the file. Hosts without OS signals
+	/// keep the default: nothing.
+	fn forward_signals(&mut self) {}
 	/// The filesystem (hookable: VFS, devices, `/dev/fd`, `/dev/tcp`).
 	fn fs(&mut self) -> &mut dyn Fs;
 	/// The shell's own standard stream `fd`; `None` leaves it closed.

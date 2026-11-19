@@ -113,11 +113,13 @@ fn watch(pid: i32, tracker: Arc<Tracker>, shared: Arc<Shared>) -> io::Result<()>
 	}
 	let mb =
 		Arc::new(Mailbox { job: Mutex::new(Some((pid, tracker, shared))), ready: Condvar::new() });
-	thread::Builder::new()
-		.name("obash-wait".into())
-		.stack_size(SMALL_STACK)
-		.spawn(move || waiter(&mb))
-		.map(drop)
+	crate::sys::thread::spawn_helper(
+		thread::Builder::new()
+			.name("obash-wait".into())
+			.stack_size(SMALL_STACK),
+		move || waiter(&mb),
+	)
+	.map(drop)
 }
 
 /// A waiter thread: wait for each external handed to `mb`, park in
@@ -1724,10 +1726,12 @@ impl Drop for UnixProc {
 /// started (KILL now rather than never).
 fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant) {
 	let waiter = Arc::clone(tracker);
-	let started = thread::Builder::new()
-		.name("obash-kill".into())
-		.stack_size(SMALL_STACK)
-		.spawn(move || escalate(&waiter, scope, kill_at));
+	let started = crate::sys::thread::spawn_helper(
+		thread::Builder::new()
+			.name("obash-kill".into())
+			.stack_size(SMALL_STACK),
+		move || escalate(&waiter, scope, kill_at),
+	);
 	if started.is_err() {
 		let now = Instant::now();
 		tracker.lock().schedule_kill(now);

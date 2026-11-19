@@ -11,7 +11,10 @@
 mod pty_support;
 mod zsh_oracle;
 
-use std::{io, time::Duration};
+use std::{
+	io::{self, Write as _},
+	time::Duration,
+};
 
 use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
@@ -188,6 +191,59 @@ fn resize_redraws_a_prompt_wrapped_to_three_lines() {
 		pty.zle_sync(TIMEOUT)?;
 		keys(pty, "\rprint $COLUMNS\r")
 	});
+}
+
+/// A resize while shell code runs for the line editor (here a `zle -F`
+/// handler) is redrawn once that code has returned, before the editor
+/// reads anything else, as zsh does (it holds the signal while the handler
+/// runs): the handler waits until the terminal has been resized and
+/// `~/go` exists, then prints a marker; nothing is drawn while it runs,
+/// and the line is redrawn after the marker.
+#[test]
+fn a_resize_while_a_handler_runs_is_redrawn_after_it() {
+	const LOOPING: &str = "\x1b]9999;looping\x07";
+	const DONE: &str = "\x1b]9999;done\x07";
+	let rc = "mkfifo ~/gate\nexec {gate}<>~/gate\n_g() { local n; read -r -u $1 n; print -rn -- \
+	          $'\\e]9999;looping\\a'; while [[ ! -e ~/go ]]; do :; done; print -rn -- \
+	          $'\\e]9999;done\\a'; zle -F $1 }\nzle -F $gate _g\n";
+	let spawns = [spawn(false, rc), spawn(true, rc)];
+	let homes: Vec<std::path::PathBuf> = spawns.iter().map(|s| s.home().to_owned()).collect();
+	// Per shell: what it wrote while the handler ran, and after it.
+	let mut seen: Vec<(String, String)> = Vec::new();
+	let mut run = |pty: &mut Pty| -> io::Result<()> {
+		let home = &homes[seen.len()];
+		pty.wait_raw(TIMEOUT)?;
+		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
+		keys(pty, "\x0c")?;
+		keys(pty, "echo a long line of text")?;
+		std::fs::OpenOptions::new()
+			.write(true)
+			.open(home.join("gate"))?
+			.write_all(b"1\n")?;
+		pty.read_until(LOOPING, TIMEOUT)?;
+		pty.resize(24, 40)?;
+		std::fs::write(home.join("go"), "")?;
+		let during = pty.read_until(DONE, TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
+		let all = pty.output();
+		let after = all[all.rfind(DONE).map_or(0, |at| at + DONE.len())..].to_owned();
+		seen.push((during[..during.len() - DONE.len()].to_owned(), after));
+		Ok(())
+	};
+	let [ours, real] = spawns;
+	if have_real_zsh() {
+		let (o, r) = differential(ours, real, &mut run).expect("pty session");
+		assert_eq!(o, r, "obash screen:\n{o}\n--- zsh screen:\n{r}");
+	} else {
+		let mut ours = ours.spawn().expect("spawn obash");
+		run(&mut ours).expect("pty session");
+	}
+	for (shell, (during, after)) in ["obash", "zsh"].iter().zip(&seen) {
+		assert_eq!(during, "", "{shell} drew while the handler ran");
+		assert!(after.contains("echo a long line of text"), "{shell} did not redraw: {after:?}");
+	}
 }
 
 #[test]

@@ -18,6 +18,7 @@ use super::{Editor, Zle, keymap::Bind, thingy::Kind, wflags, widgets};
 use crate::bash::{
 	event::WaitKey,
 	host::Deadline,
+	signal::Signal,
 	store::{Key, Record, StoreError},
 	vm::{
 		Cx, Kernel,
@@ -1224,6 +1225,16 @@ fn getbyte(zw: &mut Zw<'_, '_>, keytimeout: bool) -> Byte {
 		zw.ed.lastchar = -1;
 		return Byte::Eof;
 	};
+	// zsh takes a `SIGWINCH` that comes while it waits for a key at once:
+	// its handler redraws the line before `select` reports the key or a
+	// `zle -F` file written after the resize. The run loop forwards caught
+	// signals only between steps, so they are taken here before anything
+	// is read, and again after: the read or poll that finds the input is
+	// where a signal sent before it reaches the process. A caught resize
+	// goes to the engine first (the reader redraws); what was found waits.
+	if resize_caught(zw.cx, &zw.k.ctl) {
+		return Byte::Pending(WaitKey::Read { fd: 0 });
+	}
 	// The display is out before the key is waited for.
 	if let Some(key) = tty.flush(zw.k) {
 		return Byte::Pending(key);
@@ -1237,6 +1248,11 @@ fn getbyte(zw: &mut Zw<'_, '_>, keytimeout: bool) -> Byte {
 				b'\n' => b'\r',
 				b => b,
 			};
+			if resize_caught(zw.cx, &zw.k.ctl) {
+				// Read again once the resize is handled.
+				zw.ed.unget.push_front(b);
+				return Byte::Pending(WaitKey::Read { fd: 0 });
+			}
 			zw.ed.lastchar = i32::from(b);
 			// WidgetsVi: the bytes of a vi change are recorded as read.
 			widgets::vi::record_byte(zw.zle, b);
@@ -1255,6 +1271,9 @@ fn getbyte(zw: &mut Zw<'_, '_>, keytimeout: bool) -> Byte {
 			for (i, w) in zw.zle.watches.iter().enumerate() {
 				let h = zw.vp.fds.handle(w.fd);
 				if h.is_open() && h.poll_read(&mut tcx, &mut []).is_ready() {
+					if resize_caught(zw.cx, &zw.k.ctl) {
+						return Byte::Pending(WaitKey::Read { fd: 0 });
+					}
 					return Byte::Watch(i);
 				}
 			}
@@ -1304,6 +1323,14 @@ fn getbyte(zw: &mut Zw<'_, '_>, keytimeout: bool) -> Byte {
 			Byte::Pending(WaitKey::Read { fd: 0 })
 		},
 	}
+}
+
+/// The OS signals the host caught, forwarded to the engine now
+/// ([`crate::bash::Host::forward_signals`]): whether a resize is among the
+/// signals forwarded and not yet delivered ([`getbyte`]).
+fn resize_caught(cx: &mut Cx<'_>, ctl: &crate::bash::vm::control::Ctl) -> bool {
+	cx.host.forward_signals();
+	ctl.signal_pending(Signal::Winch)
 }
 
 /// zsh's lookup of `seq` in the local keymap, then the current one

@@ -320,6 +320,12 @@ impl crate::bash::Host for NativeHost {
 		self.signals.forget_ignored(signal);
 	}
 
+	fn forward_signals(&mut self) {
+		if let Some((ctl, root)) = &self.bridge {
+			Signals::dispatch(ctl, *root);
+		}
+	}
+
 	fn fs(&mut self) -> &mut dyn Fs {
 		&mut *self.fs
 	}

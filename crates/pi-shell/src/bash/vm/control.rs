@@ -72,6 +72,12 @@ impl Ctl {
 		std::mem::take(&mut *self.signals.lock())
 	}
 
+	/// Whether `sig` is forwarded ([`ControlHandle::signal`]) and not yet
+	/// delivered (the next safepoint delivers it).
+	pub(crate) fn signal_pending(&self, sig: Signal) -> bool {
+		self.signals.lock().iter().any(|&(_, s)| s == sig)
+	}
+
 	#[inline]
 	pub(crate) fn wakes(&self) -> u64 {
 		self.wakes.load(Ordering::Acquire)
