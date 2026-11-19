@@ -70,6 +70,12 @@ export interface AgentRef {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	/**
+	 * The ids above this agent, nearest first, as its registry knew them when it minted this ref; an
+	 * agent in between that is unregistered since (a one-shot subagent that ended) stays in them. Absent
+	 * on a ref no registry minted. Read them through {@link agentAncestors}.
+	 */
+	readonly ancestors?: readonly string[];
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
 	session: AgentSessionHandle | null;
@@ -101,6 +107,42 @@ export function isMintedAgentRef(value: unknown): value is AgentRef {
 export function isResumable(ref: AgentRef | undefined): boolean {
 	if (ref?.status === "idle") return true;
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
+
+/** {@link agentAncestors}' ids one at a time: `registry` is read only once every recorded one is passed. */
+function* ancestorIds(registry: AgentRegistryApi, ref: AgentRef | undefined): Generator<string> {
+	const seen = new Set<string>();
+	for (let next = ref; next;) {
+		const recorded = next.ancestors ?? (next.parentId === undefined ? [] : [next.parentId]);
+		for (const id of recorded) {
+			if (seen.has(id)) return;
+			seen.add(id);
+			yield id;
+		}
+		const last = recorded.at(-1);
+		next = last === undefined ? undefined : registry.get(last);
+	}
+}
+
+/**
+ * The ids above `ref`, nearest first: its recorded {@link AgentRef.ancestors}, so an agent in between
+ * that was unregistered since does not cut them short, continued through `registry` from the last one
+ * (whose own ref may know more: it registered after `ref`, or `ref` records only its parent). Stops at
+ * a repeated id.
+ */
+export function agentAncestors(registry: AgentRegistryApi, ref: AgentRef | undefined): string[] {
+	return [...ancestorIds(registry, ref)];
+}
+
+/**
+ * Whether `ancestorId` is among the ids above `ref` ({@link agentAncestors}); looks no further up
+ * the registry once it is found.
+ */
+export function agentHasAncestor(registry: AgentRegistryApi, ref: AgentRef | undefined, ancestorId: string): boolean {
+	for (const id of ancestorIds(registry, ref)) {
+		if (id === ancestorId) return true;
+	}
+	return false;
 }
 
 export type RegistryEvent =
@@ -215,6 +257,13 @@ export class AgentRegistry implements AgentRegistryApi {
 	}
 
 	register(input: RegisterInput): AgentRef {
+		const ancestors =
+			input.parentId === undefined ? [] : [input.parentId, ...agentAncestors(this, this.#refs.get(input.parentId))];
+		return this.#mint(input, ancestors);
+	}
+
+	/** Mint and register the ref for `input.id`, with the ancestry it records. */
+	#mint(input: RegisterInput, ancestors: readonly string[]): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
@@ -222,6 +271,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
+			ancestors,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
@@ -259,17 +309,21 @@ export class AgentRegistry implements AgentRegistryApi {
 	reopen(id: string, expected: AgentRef): AgentRef | undefined {
 		const current = this.#refs.get(id);
 		if (current !== expected || current.status !== "aborted" || current.session) return undefined;
-		return this.register({
-			id,
-			displayName: current.displayName,
-			kind: current.kind,
-			parentId: current.parentId,
-			session: null,
-			sessionFile: current.sessionFile,
-			status: "parked",
-			createdAt: current.createdAt,
-			history: current.history,
-		});
+		// The killed generation's ancestry, recorded while its parents were registered: they may be gone since.
+		return this.#mint(
+			{
+				id,
+				displayName: current.displayName,
+				kind: current.kind,
+				parentId: current.parentId,
+				session: null,
+				sessionFile: current.sessionFile,
+				status: "parked",
+				createdAt: current.createdAt,
+				history: current.history,
+			},
+			agentAncestors(this, current),
+		);
 	}
 
 	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */

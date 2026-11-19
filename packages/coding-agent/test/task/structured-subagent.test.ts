@@ -52,6 +52,7 @@ import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { letRefusedReleaseRun } from "../helpers/release-race";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgRetryModelFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -138,6 +139,53 @@ function result(): SingleResult {
 
 function mockDiscovery(agent: AgentDefinition = AGENT): void {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+}
+
+/** A source session's saved default model. */
+const SAVED_DEFAULT_MODEL = {
+	type: "model_change",
+	id: "default-model",
+	parentId: null,
+	timestamp: "2026-10-01T00:00:01.000Z",
+	model: "anthropic/claude-sonnet-4-5",
+	role: "default",
+};
+
+/** A seance's source session in a temp dir, and a caller session that can fork it. */
+interface SeanceSource {
+	caller: ToolSession;
+	sourceFile: string;
+	/** Close the caller's auth storage and remove the temp dir. */
+	dispose(): Promise<void>;
+}
+
+/**
+ * Discover the bundled seance agent and write the source session `id`, its header then `entries`, in a temp dir, for a
+ * caller whose model registry holds an Anthropic key when `anthropicKey` is set.
+ */
+async function seanceSource(
+	id: string,
+	entries: readonly Record<string, unknown>[],
+	options: { anthropicKey?: boolean } = {},
+): Promise<SeanceSource> {
+	const seanceAgent = getBundledAgent("seance");
+	if (!seanceAgent) throw new Error("Expected the bundled seance agent");
+	mockDiscovery(seanceAgent);
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-"));
+	const authStorage = createInMemoryAuthStorage();
+	if (options.anthropicKey) authStorage.keys.setRuntime("anthropic", "test-key");
+	const cwd = path.join(tempDir, "project");
+	const sourceFile = path.join(tempDir, "sessions", `${id}.jsonl`);
+	const header = { type: "session", version: 3, id, timestamp: "2026-10-01T00:00:00.000Z", cwd };
+	await Bun.write(sourceFile, `${[header, ...entries].map(entry => JSON.stringify(entry)).join("\n")}\n`);
+	return {
+		caller: Object.assign(session({ cwd }), { modelRegistry: new ModelRegistry(authStorage) }),
+		sourceFile,
+		dispose: async () => {
+			authStorage.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		},
+	};
 }
 
 afterEach(() => {
@@ -227,28 +275,10 @@ describe("structured subagent primitive", () => {
 	});
 
 	it("uses saved seance models in active-role/default order and honors an explicit available override", async () => {
-		const seanceAgent = getBundledAgent("seance");
-		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
-		mockDiscovery(seanceAgent);
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-policy-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		authStorage.keys.setRuntime("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage);
-		const cwd = path.join(tempDir, "project");
-		const sourceFile = path.join(tempDir, "sessions", "source.jsonl");
-		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
-		await Bun.write(
-			sourceFile,
-			`${[
-				{ type: "session", version: 3, id: "saved-source", timestamp: "2026-10-01T00:00:00.000Z", cwd },
-				{
-					type: "model_change",
-					id: "default-model",
-					parentId: null,
-					timestamp: "2026-10-01T00:00:01.000Z",
-					model: "anthropic/claude-sonnet-4-5",
-					role: "default",
-				},
+		const { caller, sourceFile, dispose } = await seanceSource(
+			"saved-source",
+			[
+				SAVED_DEFAULT_MODEL,
 				{
 					type: "model_change",
 					id: "active-model",
@@ -257,11 +287,9 @@ describe("structured subagent primitive", () => {
 					model: "anthropic/claude-sonnet-4-6",
 					role: "fast",
 				},
-			]
-				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
+			],
+			{ anthropicKey: true },
 		);
-		const caller = Object.assign(session({ cwd }), { modelRegistry });
 		try {
 			const saved = await resolveEffectiveSubagentPolicy(
 				request({ session: caller, agent: "seance", sourceSession: sourceFile }),
@@ -282,26 +310,12 @@ describe("structured subagent primitive", () => {
 			);
 			expect(overridden.modelOverride).toEqual(["anthropic/claude-sonnet-4-5"]);
 		} finally {
-			authStorage.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await dispose();
 		}
 	});
 
 	it("fails closed when the source has no saved model or an explicit model is unavailable", async () => {
-		const seanceAgent = getBundledAgent("seance");
-		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
-		mockDiscovery(seanceAgent);
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-model-fail-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		const modelRegistry = new ModelRegistry(authStorage);
-		const cwd = path.join(tempDir, "project");
-		const sourceFile = path.join(tempDir, "sessions", "no-model.jsonl");
-		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
-		await Bun.write(
-			sourceFile,
-			`${JSON.stringify({ type: "session", version: 3, id: "no-model-source", timestamp: "2026-10-01T00:00:00.000Z", cwd })}\n`,
-		);
-		const caller = Object.assign(session({ cwd }), { modelRegistry });
+		const { caller, sourceFile, dispose } = await seanceSource("no-model-source", []);
 		try {
 			await expect(
 				resolveEffectiveSubagentPolicy(request({ session: caller, agent: "seance", sourceSession: sourceFile })),
@@ -317,8 +331,7 @@ describe("structured subagent primitive", () => {
 				),
 			).rejects.toThrow("No available saved model can serve this source.");
 		} finally {
-			authStorage.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await dispose();
 		}
 	});
 
@@ -803,6 +816,121 @@ describe("structured subagent primitive", () => {
 		expect(settled.result.structuredOutput?.status).toBe("valid");
 		await expect(fs.stat(settled.artifactsDir)).resolves.toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("hands a detached run's owner a disposal of its temporary artifacts that waits for the cleanup the run left going on", async () => {
+		// If this regresses, the job manager removes a background subagent's temporary artifacts directory as it evicts
+		// the job's row while the cleanup the run deferred still goes on (owner jobs, a failed isolated run's late
+		// release), and the late release's patch then creates the directory again, with nothing left to remove it.
+		mockDiscovery();
+		const lateCleanup = Promise.withResolvers<void>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.onCleanupDeferred?.(lateCleanup.promise);
+			return result();
+		});
+		let dispose: (() => Promise<void>) | undefined;
+		const settled = await runStructuredSubagent(
+			request({
+				detached: true,
+				retainArtifacts: true,
+				onArtifactsRetained: cleanup => {
+					dispose = cleanup;
+				},
+			}),
+		);
+		try {
+			expect(settled.temporaryArtifacts).toBe(true);
+			const removals = vi.spyOn(fs, "rm");
+			// The job's row is evicted, and the disposal starts, while the run's deferred cleanup still goes on.
+			const disposed = dispose?.();
+			expect(removals.mock.calls.some(([target]) => target === settled.artifactsDir)).toBe(false);
+
+			lateCleanup.resolve();
+			await disposed;
+			await expect(fs.stat(settled.artifactsDir)).rejects.toThrow();
+		} finally {
+			lateCleanup.resolve();
+			await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("removes a seance's temporary artifacts only after its run published its result, when a release ends it as it finishes", async () => {
+		// If this regresses, the adoption the release refuses runs the seance's release hook at once: the temporary
+		// artifacts directory is gone when the run's end publishes its result there, or a directory is left behind.
+		const { caller, sourceFile, dispose } = await seanceSource("released-seance-source", [SAVED_DEFAULT_MODEL], {
+			anthropicKey: true,
+		});
+		const parent = "ReleasedSeanceParent";
+		const disposing = Promise.withResolvers<void>();
+		const seanceSession = {
+			...createSessionDefaults(),
+			dispose: () => disposing.promise,
+		} as unknown as AgentSession;
+		const onArtifactsRetained = vi.fn();
+		let artifactsDir: string | undefined;
+		let presentAtPublish: boolean | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			artifactsDir = options.artifactsDir;
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: parent,
+				session: seanceSession,
+				status: "running",
+			});
+			// The parent's end (an ACP close) releases the seance, and holds it while it disposes its session.
+			const releasing = AgentLifecycleManager.global().releaseUnder(parent);
+			let hook: Promise<void> | undefined;
+			await executorModule.finalizeSubagentLifecycle({
+				id: options.id,
+				session: seanceSession,
+				aborted: false,
+				keepAlive: true,
+				isolated: false,
+				agentIdleTtlMs: 0,
+				reviveSession: async () => seanceSession,
+				onRelease: () => {
+					hook = options.onRelease?.() ?? Promise.resolve();
+					return hook;
+				},
+			});
+			await letRefusedReleaseRun(hook);
+			// The run's end publishes its result in the artifacts directory, as `finalizeRunResult` does.
+			const dir = options.artifactsDir ?? "";
+			presentAtPublish = await fs.stat(dir).then(
+				() => true,
+				() => false,
+			);
+			const outputPath = path.join(dir, `${options.id}.md`);
+			await Bun.write(outputPath, '{"ok":true}');
+			disposing.resolve();
+			await releasing;
+			return { ...result(), id: options.id, agent: "seance", outputPath };
+		});
+
+		try {
+			const settled = await runStructuredSubagent(
+				request({
+					session: caller,
+					agent: "seance",
+					sourceSession: sourceFile,
+					identity: { id: "ReleasedSeance" },
+					onArtifactsRetained,
+				}),
+			);
+
+			expect(settled.policy.preparedSession).toBeDefined();
+			expect(settled.temporaryArtifacts).toBe(true);
+			expect(presentAtPublish).toBe(true);
+			await expect(fs.stat(settled.artifactsDir)).rejects.toThrow();
+			expect(artifactsDirsFromRegistry()).not.toContain(settled.artifactsDir);
+			// The release removed the artifacts: no one is handed a cleanup of a directory that is gone.
+			expect(onArtifactsRetained).not.toHaveBeenCalled();
+		} finally {
+			await dispose();
+			if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
+		}
 	});
 	it("uses identical non-plan LSP and IRC policy for task and eval invocations", async () => {
 		mockDiscovery();
@@ -1413,6 +1541,65 @@ describe("structured subagent primitive", () => {
 		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	/**
+	 * Mock an isolated run that holds peer messages back for its whole run and, as `runIsolatedSubprocess` does at its
+	 * end, hands that hold to its caller when the caller takes it over, else lets them wake the agent before it returns;
+	 * the merge records its turn in `order` before it ends as `merge` says.
+	 */
+	function mockIsolatedRunAndMerge(order: string[], merge: () => Promise<void>): void {
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
+			const releaseWakes = (): void => {
+				order.push("wakes released");
+			};
+			if (baseOptions.deferIrcWakeRelease) baseOptions.deferIrcWakeRelease(releaseWakes);
+			else releaseWakes();
+			return { ...result(), patchPath: "/artifacts/Worker.patch", hasRootChanges: true };
+		});
+		vi.spyOn(isolationRunner, "mergeIsolatedChanges").mockImplementation(async () => {
+			order.push("merge");
+			await merge();
+			return { summary: "", changesApplied: true, hadAnyChanges: true, mergedBranchForNestedPatches: false };
+		});
+		vi.spyOn(isolationRunner, "applyEligibleNestedPatches").mockImplementation(async () => {
+			order.push("nested apply");
+			return "";
+		});
+	}
+
+	it("lets held peer messages wake an isolated agent only after its parent merged its changes", async () => {
+		// If this regresses, a peer message held during the run wakes a turn in the worktree while the parent still
+		// applies the run's patch, and a release can then write that turn's change into the patch being applied.
+		mockDiscovery();
+		const order: string[] = [];
+		mockIsolatedRunAndMerge(order, async () => {});
+
+		const settled = await runStructuredSubagent(
+			request({ session: session({ isolationEnabled: true }), isolation: { requested: true } }),
+		);
+
+		expect(settled.changesApplied).toBe(true);
+		expect(order).toEqual(["merge", "nested apply", "wakes released"]);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("lets held peer messages wake an isolated agent once its parent's merge threw", async () => {
+		// If this regresses, a merge that throws leaves the run's held peer messages held: they never wake the agent.
+		mockDiscovery();
+		const order: string[] = [];
+		mockIsolatedRunAndMerge(order, async () => {
+			throw new Error("apply failed");
+		});
+
+		await expect(
+			runStructuredSubagent(
+				request({ session: session({ isolationEnabled: true }), isolation: { requested: true } }),
+			),
+		).rejects.toThrow("apply failed");
+
+		expect(order).toEqual(["merge", "wakes released"]);
 	});
 });
 

@@ -36,6 +36,7 @@ import type {
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -115,13 +116,10 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	return tokens.has(match[1].trim());
 }
 
-function supportsCodexMeterBlockScopes(req: Request): boolean {
+/** Whether the request's `OMP-Auth-Broker-Capabilities` comma list names `capability`. */
+function announcesCapability(req: Request, capability: string): boolean {
 	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
-	return (
-		capabilities
-			?.split(",")
-			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
-	);
+	return capabilities?.split(",").some(entry => entry.trim() === capability) ?? false;
 }
 
 /**
@@ -483,7 +481,10 @@ async function serveSnapshot(
 	peer: string,
 ): Promise<Response> {
 	await source.reload();
-	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const clientSupportsCodexMeterBlockScopes = announcesCapability(
+		req,
+		AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	);
 	let currentGeneration = source.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
@@ -763,7 +764,7 @@ function serveSnapshotStream(
 
 	const subscriber: SnapshotStreamSubscriber = {
 		peer,
-		codexMeterBlockScopes: supportsCodexMeterBlockScopes(req),
+		codexMeterBlockScopes: announcesCapability(req, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES),
 		sent: new Map(),
 		lastGeneration: -1,
 		write,
@@ -929,9 +930,13 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				}
 				if (req.method === "GET" && pathname === "/v1/credentials/disabled") {
 					const provider = url.searchParams.get("provider") ?? undefined;
-					const disabled = await opts.storage.credentials.listDisabled(provider, req.signal);
+					const summaries = await opts.storage.credentials.listDisabled(provider, req.signal);
+					// A client that predates `identityKey` validates summaries strictly and would reject the field.
+					const disabled = announcesCapability(req, AUTH_BROKER_CAPABILITY_DISABLED_IDENTITY_KEY)
+						? summaries
+						: summaries.map(({ identityKey: _identityKey, ...summary }) => summary);
 					const body: DisabledCredentialsResponse = { generatedAt: Date.now(), disabled };
-					return json(200, body);
+					return json(200, body, { Vary: AUTH_BROKER_CAPABILITIES_HEADER });
 				}
 				const refreshMatch = req.method === "POST" ? pathname.match(REFRESH_ROUTE) : null;
 				if (refreshMatch) {

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON } from "../../async/job-manager";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -320,14 +321,18 @@ export class TanCommandController {
 						// flip the ref to parked BEFORE dispose so the sdk dispose wrapper
 						// skips its unregister, then null the disposed session so the hub
 						// treats it as a transcript-only parked agent. An aborted tan is
-						// terminal — let dispose unregister it.
+						// terminal — let dispose unregister it. The clone's own jobs end as its
+						// tan job ended: a stop (its cancel) or the tan's finish stops them, and
+						// a shutdown (the parent's teardown) cuts them off.
 						if (clone) {
 							if (signal.aborted) {
 								agentRegistry.setStatus(cloneId, "aborted");
-								await clone.dispose();
+								await clone.dispose({
+									ownedJobsEnd: signal.reason === ASYNC_JOB_MANAGER_SHUTDOWN_REASON ? "shutdown" : "stop",
+								});
 							} else {
 								agentRegistry.setStatus(cloneId, "parked");
-								await clone.dispose();
+								await clone.dispose({ ownedJobsEnd: "stop" });
 								agentRegistry.detachSession(cloneId);
 							}
 						}

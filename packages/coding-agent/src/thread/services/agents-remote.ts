@@ -15,6 +15,7 @@ import type { AgentAwaitsApi } from "../../registry/agent-awaits";
 import type {
 	AdoptOptions,
 	AgentLifecycleApi,
+	AgentLifecycleDisposeOptions,
 	AgentReleaseOptions,
 	PersistedSubagentReviverFactory,
 } from "../../registry/agent-lifecycle";
@@ -179,7 +180,7 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
-/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and teardown are main-only. */
+/** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
 
@@ -212,6 +213,14 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.callSync("isParking", id, expected);
 	}
 
+	isReleasing(id: string): boolean {
+		return this.#remote.callSync("isReleasing", id);
+	}
+
+	whenReleased(id: string): Promise<void> {
+		return this.#remote.call("whenReleased", id);
+	}
+
 	park(id: string): Promise<void> {
 		return this.#remote.call("park", id);
 	}
@@ -224,8 +233,13 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.call("release", id, expected, options);
 	}
 
-	dispose(_deadlineAt?: number): Promise<void> {
+	dispose(_options?: AgentLifecycleDisposeOptions): Promise<void> {
 		return Promise.reject(new Error("The agent lifecycle is torn down by the main thread"));
+	}
+
+	/** Main's lifecycle releases the agents under `ancestorId` (a helper session hosted here that ends). */
+	releaseUnder(ancestorId: string, options?: AgentLifecycleDisposeOptions): Promise<void> {
+		return this.#remote.call("releaseUnder", ancestorId, options);
 	}
 }
 

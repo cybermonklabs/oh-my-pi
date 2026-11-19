@@ -19,7 +19,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, agentAncestors, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
@@ -203,15 +203,12 @@ export function createPersistedSubagentReviverFactory(
 			return undefined;
 		}
 		// taskDepth drives real capability gating (task-spawn allowance, memory
-		// startup, …); derive it from the persisted parent chain rather than
-		// assuming a fixed level.
+		// startup, …); derive it from the recorded parent chain, which keeps a
+		// parent that ended since, rather than assuming a fixed level.
 		let taskDepth = 1;
-		let parentId = ref.parentId;
-		const seen = new Set<string>();
-		while (parentId && parentId !== MAIN_AGENT_ID && !seen.has(parentId)) {
-			seen.add(parentId);
+		for (const ancestorId of agentAncestors(registry, ref)) {
+			if (ancestorId === MAIN_AGENT_ID) break;
 			taskDepth++;
-			parentId = registry.get(parentId)?.parentId;
 		}
 		return async expectedRef => {
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.

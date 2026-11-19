@@ -492,12 +492,120 @@ describe("AgentLifecycleManager", () => {
 		lifecycle.adopt("stuck-Sub", { idleTtlMs: TTL });
 		lifecycle.adopt("sibling-Sub", { idleTtlMs: TTL });
 
-		await lifecycle.dispose(Date.now());
+		await lifecycle.dispose({ deadlineAt: Date.now() });
 
 		expect(stuck.disposeCalls()).toBe(1);
 		expect(sibling.disposeCalls()).toBe(1);
 		gate.resolve();
 		await flushAsync();
+	});
+
+	it("releases only the agents under an ancestor and goes on managing the rest", async () => {
+		// If this regresses, a helper session's end (a `/security` scan) releases agents it did not spawn, keeps its own
+		// subagents' subagents alive, or tears down the lifecycle the host session owns.
+		const child = makeSessionStub();
+		const grandchild = makeSessionStub();
+		const hostSub = makeSessionStub();
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		for (const [id, parentId, stub] of [
+			["Helper-Child", "Helper", child],
+			["Helper-Grandchild", "Helper-Child", grandchild],
+			["Host-Sub", MAIN_AGENT_ID, hostSub],
+		] as const) {
+			registry.register({ id, displayName: "task", kind: "sub", parentId, session: stub.session, status: "idle" });
+			lifecycle.adopt(id, { idleTtlMs: 0 });
+		}
+
+		await lifecycle.releaseUnder("Helper", { ownedJobsEnd: "stop" });
+
+		expect([child.disposeCalls(), grandchild.disposeCalls(), hostSub.disposeCalls()]).toEqual([1, 1, 0]);
+		expect(registry.get("Helper-Child")).toBeUndefined();
+		expect(registry.get("Helper-Grandchild")).toBeUndefined();
+		expect(lifecycle.has("Host-Sub")).toBe(true);
+		expect(AgentLifecycleManager.global()).toBe(lifecycle);
+	});
+
+	for (const { start, name } of [
+		{ start: "during", name: "a revive that starts while the agent's release waits in its release hook" },
+		{ start: "before", name: "a revive whose factory returns while the agent's release waits in its release hook" },
+	] as const) {
+		it(`${name} does not bring the agent back live`, async () => {
+			// If this regresses, an agent revived (a message, an Agent Hub focus) while its release still waits on its
+			// release hook (a workspace cleanup) is adopted and gets a live session that the release never disposes:
+			// a live agent nothing owns any more.
+			const releaseGate = deferred();
+			const factoryGate = deferred();
+			const revived = makeSessionStub();
+			let built = 0;
+			const ref = registerIdleSub("Releasing-Sub", null);
+			registry.setStatus("Releasing-Sub", "parked", ref);
+			lifecycle.adopt("Releasing-Sub", { idleTtlMs: 0, onRelease: () => releaseGate.promise }, ref);
+			lifecycle.setPersistedSubagentReviverFactory(
+				async () => {
+					await factoryGate.promise;
+					return async () => {
+						built++;
+						return revived.session;
+					};
+				},
+				() => 0,
+			);
+			const revive = () =>
+				lifecycle.ensureLive("Releasing-Sub").then(
+					() => "revived",
+					() => "refused",
+				);
+
+			const early = start === "before" ? revive() : undefined;
+			await flushAsync(); // an early revive waits in the factory
+			const releasing = lifecycle.release("Releasing-Sub");
+			await flushAsync(); // the release waits in its hook
+			const revival = early ?? revive();
+			factoryGate.resolve();
+			// The revive settles while the release still waits.
+			const outcome = await revival;
+			releaseGate.resolve();
+			await releasing;
+
+			expect(outcome).toBe("refused");
+			// Every session the revive built is disposed: none is left live.
+			expect(revived.disposeCalls()).toBe(built);
+			expect(lifecycle.has("Releasing-Sub")).toBe(false);
+			expect(registry.get("Releasing-Sub")).toBeUndefined();
+		});
+	}
+
+	it("a kill that completes while a cold revive is prepared leaves the agent unadopted and its release hook run once", async () => {
+		// If this regresses, an agent killed while a message revives it stays adopted after the revive fails: a later
+		// release (the session's end, a helper's end) runs its release hook (a workspace cleanup) a second time.
+		using tempDir = TempDir.createSync("@omp-lifecycle-kill-prepare-");
+		const sessionFile = path.join(tempDir.path(), "Killed-Preparing.jsonl");
+		await Bun.write(sessionFile, "");
+		const factoryGate = deferred();
+		const releaseWorkspace = vi.fn(async () => {});
+		const ref = registerIdleSub("Killed-Preparing", null, sessionFile);
+		registry.setStatus("Killed-Preparing", "parked", ref);
+		lifecycle.adopt("Killed-Preparing", { idleTtlMs: 0, onRelease: releaseWorkspace }, ref);
+		lifecycle.setPersistedSubagentReviverFactory(
+			async () => {
+				await factoryGate.promise;
+				return async () => makeSessionStub().session;
+			},
+			() => 0,
+		);
+
+		const revival = lifecycle.ensureLive("Killed-Preparing").then(
+			() => "revived",
+			() => "refused",
+		);
+		await flushAsync(); // the revive waits in the persisted factory
+		expect(await lifecycle.release("Killed-Preparing", ref, { tombstone: true })).toBe(true);
+		factoryGate.resolve();
+
+		expect(await revival).toBe("refused");
+		expect(lifecycle.has("Killed-Preparing")).toBe(false);
+		await lifecycle.dispose();
+		expect(releaseWorkspace).toHaveBeenCalledTimes(1);
 	});
 
 	it("a delayed release cannot remove or mutate a replacement ref with the same id", async () => {
@@ -524,6 +632,76 @@ describe("AgentLifecycleManager", () => {
 		expect(replacement.session).toBe(replacementSession.session);
 		expect(replacementSession.disposeCalls()).toBe(0);
 		expect(lifecycle.has("cas-Sub", replacement)).toBe(true);
+	});
+
+	it("settles a wait for an agent's release only once the last of two overlapping releases of it is over", async () => {
+		// If this regresses, of two overlapping releases of an agent, a kill's, which took no adoption and ends first,
+		// settles the wait for the agent's release while the other (an ACP close's, which took the adoption) still waits
+		// in the release hook: an isolated run's end that waits for the release then finds no hook called, takes the
+		// cleanup over and removes the worktree whose changes that hook was to capture.
+		const hookGate = deferred();
+		let hookCalls = 0;
+		const stub = makeSessionStub();
+		const ref = registerIdleSub("Overlap-Sub", stub.session, null);
+		lifecycle.adopt(
+			"Overlap-Sub",
+			{
+				idleTtlMs: 0,
+				onRelease: () => {
+					hookCalls++;
+					return hookGate.promise;
+				},
+			},
+			ref,
+		);
+
+		// The close's release takes the adoption and, once it has disposed the session, waits in the hook.
+		const closing = lifecycle.release("Overlap-Sub");
+		// The kill's release finds no adoption left and calls no hook.
+		const killing = lifecycle.release("Overlap-Sub", ref, { tombstone: true });
+		let waited = false;
+		const waiting = lifecycle.whenReleased("Overlap-Sub").then(() => {
+			waited = true;
+		});
+		expect(await killing).toBe(true);
+		await flushAsync();
+
+		expect(hookCalls).toBe(1);
+		expect(lifecycle.isReleasing("Overlap-Sub")).toBe(true);
+		expect(waited).toBe(false);
+		hookGate.resolve();
+		expect(await closing).toBe(true);
+		await waiting;
+		expect(lifecycle.isReleasing("Overlap-Sub")).toBe(false);
+	});
+
+	it("reads an agent's release as in flight after the released session's dispose unregistered the agent", async () => {
+		// If this regresses, a release whose session's dispose unregisters the agent (a subagent session's own dispose
+		// does, through unregisterUnlessParked) reads as over while it still waits in the release hook: an isolated run's
+		// end in that window finds no release in flight, takes the cleanup over and removes the worktree whose changes
+		// the hook was to capture.
+		const hookGate = deferred();
+		const stub = makeSessionStub(async () => {
+			registry.unregister("Unregistered-Sub");
+		});
+		const ref = registerIdleSub("Unregistered-Sub", stub.session, null);
+		lifecycle.adopt("Unregistered-Sub", { idleTtlMs: 0, onRelease: () => hookGate.promise }, ref);
+
+		const releasing = lifecycle.release("Unregistered-Sub");
+		let waited = false;
+		const waiting = lifecycle.whenReleased("Unregistered-Sub").then(() => {
+			waited = true;
+		});
+		await flushAsync();
+
+		expect(stub.disposeCalls()).toBe(1);
+		expect(registry.get("Unregistered-Sub")).toBeUndefined();
+		expect(lifecycle.isReleasing("Unregistered-Sub")).toBe(true);
+		expect(waited).toBe(false);
+		hookGate.resolve();
+		expect(await releasing).toBe(true);
+		await waiting;
+		expect(lifecycle.isReleasing("Unregistered-Sub")).toBe(false);
 	});
 
 	it("adopt(Main) is a no-op: Main is never adopted or parked", async () => {
@@ -597,6 +775,26 @@ describe("AgentLifecycleManager", () => {
 		expect(lifecycle.isParking("Race-Keep")).toBe(false);
 		expect(registry.get("Race-Keep")?.status).toBe("idle");
 		expect(registry.get("Race-Keep")?.session).toBe(stub.session);
+	});
+
+	it("ensureLive while a release disposes the session of the park it cancelled does not get that session", async () => {
+		// If this regresses, a message to an agent whose release (a helper's end, the session's teardown) cancelled its
+		// idle park is delivered into the session that release is disposing, and is lost with it.
+		const disposeGate = deferred();
+		const stub = makeSessionStub(() => disposeGate.promise);
+		registerIdleSub("Released-Parking", stub.session);
+		lifecycle.adopt("Released-Parking", { idleTtlMs: 0 });
+
+		// Same tick: the release cancels the park before it detaches, then disposes the session slowly.
+		const parking = lifecycle.park("Released-Parking");
+		const releasing = lifecycle.release("Released-Parking");
+		const handedOut = await lifecycle.ensureLive("Released-Parking").catch(() => undefined);
+		disposeGate.resolve();
+		await Promise.all([parking, releasing]);
+
+		expect(handedOut).toBeUndefined();
+		expect(stub.disposeCalls()).toBe(1);
+		expect(registry.get("Released-Parking")).toBeUndefined();
 	});
 
 	it("ensureLive after park detaches waits for dispose then revives once", async () => {
@@ -858,6 +1056,45 @@ describe("AgentLifecycleManager", () => {
 		expect(restoredRegistry.get(workerId)?.status).toBe("parked");
 	});
 
+	it("a killed agent reopened as its helper ends does not come back live", async () => {
+		// If this regresses, a message that reopens a killed subagent of a helper session (a `/security` scan) brings
+		// it back live after the helper's end: the end came between the reopen and its revive and found neither.
+		using tempDir = TempDir.createSync("@omp-lifecycle-reopen-release-");
+		const sessionFile = path.join(tempDir.path(), "Helper-Killed.jsonl");
+		await Bun.write(sessionFile, "");
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		const killed = registry.register({
+			id: "Helper-Killed",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session: makeSessionStub().session,
+			sessionFile,
+			status: "running",
+		});
+		expect(await lifecycle.release("Helper-Killed", killed, { tombstone: true })).toBe(true);
+		const revived = makeSessionStub();
+		const helperEnds: Promise<void>[] = [];
+		lifecycle.setPersistedSubagentReviverFactory(
+			async ref => {
+				// The reopened generation's revive starts, before ensureLive tracks it: the helper ends now.
+				if (ref !== killed) helperEnds.push(lifecycle.releaseUnder("Helper", { ownedJobsEnd: "stop" }));
+				return async () => revived.session;
+			},
+			() => 0,
+		);
+
+		const outcome = await lifecycle.ensureLive("Helper-Killed").then(
+			() => "revived",
+			() => "refused",
+		);
+		await Promise.all(helperEnds);
+
+		expect(outcome).toBe("refused");
+		expect(registry.get("Helper-Killed")).toBeUndefined();
+		expect(lifecycle.has("Helper-Killed")).toBe(false);
+	});
+
 	it("a killed transcript no reviver can rebuild stays killed", async () => {
 		using tempDir = TempDir.createSync("@omp-lifecycle-reopen-refused-");
 		const workerSessionFile = path.join(tempDir.path(), "Refused-Sub.jsonl");
@@ -1004,7 +1241,7 @@ describe("AgentLifecycleManager", () => {
 
 		const revival = lifecycle.ensureLive("Cold-DisposeRace");
 		await flushAsync(); // reach the factory await
-		await lifecycle.dispose(Date.now()); // teardown while the factory is in flight
+		await lifecycle.dispose({ deadlineAt: Date.now() }); // teardown while the factory is in flight
 		gate.resolve(); // factory completes for a superseded owner
 
 		await expect(revival).rejects.toThrow(/disposed/);
@@ -1043,7 +1280,7 @@ describe("AgentLifecycleManager", () => {
 
 		const revival = lifecycle.ensureLive("Cold-SessionRace");
 		await flushAsync(); // reach the reviver await
-		await lifecycle.dispose(Date.now()); // teardown while the reviver is in flight
+		await lifecycle.dispose({ deadlineAt: Date.now() }); // teardown while the reviver is in flight
 		gate.resolve(); // reviver hands back a live session for a disposed owner
 
 		await expect(revival).rejects.toThrow(/disposed/);
@@ -1053,7 +1290,7 @@ describe("AgentLifecycleManager", () => {
 	});
 
 	it("a new top-level owner can cold-revive after the previous global lifecycle was disposed", async () => {
-		await lifecycle.dispose(Date.now());
+		await lifecycle.dispose({ deadlineAt: Date.now() });
 		const revived = makeSessionStub();
 		registry.register({
 			id: "Next-Owner",

@@ -15,6 +15,7 @@ import {
 } from "./job-manager";
 
 import { renderStructuredJson, structuredStatusLabel, taskAgentHandles } from "../session/async-job-delivery";
+import { plainTurnAbortReason } from "../session/exit-diagnostics";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -545,7 +546,8 @@ export async function executeCancel(
 			);
 			continue;
 		}
-		const cancelled = manager.cancel(id, { ownerId });
+		// The owner's cancel stops the job's run: a subagent of the job reads its kind from the reason.
+		const cancelled = manager.cancel(id, { ownerId }, plainTurnAbortReason("stop"));
 		cancelOutcomes.push(
 			cancelled
 				? { id, status: "cancelled", message: `Cancelled background job ${id}.` }
@@ -588,10 +590,11 @@ export async function cancelAgentRegistration(
 		if (ref.status === "running" && ref.session) {
 			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 		}
+		// A kill: the agent's own jobs stop with it, so their subagents end and `--restore` leaves them.
 		if (lifecycle) {
-			await lifecycle.release(id);
+			await lifecycle.release(id, undefined, { dispose: { ownedJobsEnd: "stop" } });
 		} else {
-			await ref.session?.dispose();
+			await ref.session?.dispose({ ownedJobsEnd: "stop" });
 			registry?.unregister(id);
 		}
 	} catch (error) {

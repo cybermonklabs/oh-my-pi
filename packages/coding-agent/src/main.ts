@@ -627,8 +627,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			args.rawArgs,
 		);
 		const effectiveArgs = reparsedArgs ?? args.parsedArgs;
+		// The ACP server goes on serving its other sessions ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 		if (effectiveArgs.invalidFlagValues.length > 0) {
-			await nextSession.dispose();
+			await nextSession.dispose({ ownedJobsEnd: "stop" });
 			throw new CliUsageError(effectiveArgs.invalidFlagValues.join("\n"));
 		}
 		const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
@@ -636,7 +637,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			try {
 				validateToolNames(requestedTools, nextSession.getAllToolNames());
 			} catch (error) {
-				await nextSession.dispose();
+				await nextSession.dispose({ ownedJobsEnd: "stop" });
 				throw error;
 			}
 		}

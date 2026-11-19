@@ -1944,9 +1944,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			},
 			signal,
 		);
-		// A worker never invoked (call aborted first) never attached its adopted run.
+		// A worker never invoked (call aborted first) never attached its adopted run: it follows
+		// the call's abort, a stop or a cut-off (the parent's process exit), as an attached run does.
 		spawns.forEach((spawn, position) => {
-			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started");
+			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started", signal?.reason);
 		});
 		return results.map((settled, position) => {
 			if (!settled) return undefined;

@@ -263,9 +263,11 @@ export async function invokeJsTool(
 		if (pending.settled) return;
 		pending.aborted = true;
 		pending.settled = true;
-		const error = abortReasonError(options.signal?.reason, "Tool invocation aborted");
-		for (const controller of pending.toolCalls.values()) controller.abort(error);
-		reject(error);
+		// Bridged host calls abort with the caller's own reason, so a sync subagent stops or is cut
+		// off with its parent's turn; the invocation itself fails with an error naming that reason.
+		const reason = options.signal?.reason;
+		for (const controller of pending.toolCalls.values()) controller.abort(reason);
+		reject(abortReasonError(reason, "Tool invocation aborted"));
 	};
 	if (options.signal?.aborted) onAbort();
 	else options.signal?.addEventListener("abort", onAbort, { once: true });
@@ -543,9 +545,11 @@ async function runOnce(
 		const abortError = abortReasonError(reason, "Execution aborted");
 		// Stop delegated work at once — this is what kills spawned subagents —
 		// and refuse further bridge calls so the drain below stays bounded to
-		// phases that had already started.
+		// phases that had already started. Delegated work aborts with the cell's
+		// own reason, not `abortError`: a sync subagent reads from it whether its
+		// parent's turn was stopped or cut off (the process exiting).
 		pending.aborted = true;
-		for (const ctrl of pending.toolCalls.values()) ctrl.abort(abortError);
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(reason);
 		// A critical host phase ignores its abort once started (isolation
 		// worktree setup, merge/cherry-pick). Killing the worker now would
 		// settle the cell on top of a git operation still in progress, so wait
@@ -553,10 +557,10 @@ async function runOnce(
 		// code, hence it stays the terminal step either way.
 		const drained = pending.deferDepth > 0 ? pending.deferDrained?.promise : undefined;
 		if (drained) {
-			void drained.then(() => killSessionFor(session, abortError, { force: true }));
+			void drained.then(() => killSessionFor(session, abortError, { force: true, abortReason: reason }));
 			return;
 		}
-		void killSessionFor(session, abortError, { force: true });
+		void killSessionFor(session, abortError, { force: true, abortReason: reason });
 	};
 
 	if (options.runState.signal?.aborted) {
@@ -887,7 +891,17 @@ function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: 
 	finishPending(pending, msg);
 }
 
-async function killSessionFor(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
+interface KillSessionOptions {
+	force: boolean;
+	/**
+	 * What the runs' bridged host calls abort with; `error` without one. A cell's abort
+	 * passes its signal's own reason, so a sync subagent of another run on the same
+	 * runtime stops or is cut off as the cell's turn was.
+	 */
+	abortReason?: unknown;
+}
+
+async function killSessionFor(session: JsSession, error: Error, options: KillSessionOptions): Promise<void> {
 	if (sessions.get(session.sessionKey) === session) {
 		sessions.delete(session.sessionKey);
 		lostSessions.set(session.sessionKey, new Set(session.ownerIds));
@@ -895,7 +909,7 @@ async function killSessionFor(session: JsSession, error: Error, options: { force
 	await killSession(session, error, options);
 }
 
-async function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
+async function killSession(session: JsSession, error: Error, options: KillSessionOptions): Promise<void> {
 	if (session.state === "dead") return;
 	session.state = "dead";
 	for (const toolSession of session.stateSessions) {
@@ -910,7 +924,7 @@ async function killSession(session: JsSession, error: Error, options: { force: b
 	for (const pending of session.pending.values()) pending.aborted = true;
 	// Stop delegated host work at once; the runtime itself goes next.
 	for (const pending of session.pending.values()) {
-		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(options.abortReason ?? error);
 	}
 	// Settle the runs only once the runtime is gone and everything it sent before has been handled:
 	// a cell's last output (often the only clue why it was killed) belongs to the cancelled run, and

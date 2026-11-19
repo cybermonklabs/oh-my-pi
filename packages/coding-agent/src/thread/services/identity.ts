@@ -98,6 +98,7 @@ interface RefSnapshot {
 	readonly displayName: string;
 	readonly kind: AgentRef["kind"];
 	readonly parentId: AgentRef["parentId"];
+	readonly ancestors: AgentRef["ancestors"];
 	readonly status: AgentRef["status"];
 	readonly session: AgentSessionHandle | null;
 	readonly sessionFile: string | null;
@@ -152,6 +153,7 @@ const mainRefCodec: RpcCodec<AgentRef> = {
 			displayName: ref.displayName,
 			kind: ref.kind,
 			parentId: ref.parentId,
+			ancestors: ref.ancestors,
 			status: ref.status,
 			session: ref.session,
 			sessionFile: ref.sessionFile,
@@ -178,7 +180,7 @@ function isWorkerRef(value: unknown): value is AgentRef {
 	return typeof value === "object" && value !== null && Reflect.get(value, kWorkerRef) === true;
 }
 
-/** Copy every snapshot field onto `ref` (generation is fixed per object). */
+/** Copy every snapshot field onto `ref` (generation and ancestors are fixed per object). */
 function refresh(ref: AgentRef, snapshot: RefSnapshot): AgentRef {
 	ref.displayName = snapshot.displayName;
 	ref.kind = snapshot.kind;
