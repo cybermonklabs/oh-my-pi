@@ -30,6 +30,21 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 	built.is_ok_and(|built| built.status.success()).then_some(locales)
 }
 
+/// Makes every path below `parent` one no process can enter, root
+/// included: `parent` is moved aside and a regular file put in its place,
+/// so a `chdir` below it fails with `ENOTDIR` for every user. A mode bit
+/// would not do it: root enters a directory with mode 000 or 600
+/// (`CAP_DAC_READ_SEARCH`), and a test that shut a directory that way
+/// passed as an ordinary user and failed as root. A process already inside
+/// the directory stays inside it, at its new name.
+#[cfg(target_os = "linux")]
+fn bury(parent: &Path) {
+	let mut aside = parent.as_os_str().to_owned();
+	aside.push(".aside");
+	fs::rename(parent, &aside).unwrap();
+	fs::write(parent, b"not a directory\n").unwrap();
+}
+
 /// A working directory the child cannot be put into ends the query.
 ///
 /// The error says nothing about what the reference resolves from a
@@ -46,28 +61,27 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 /// answers, by dropping the relative entry. That agreement was luck — the
 /// reference is inside a directory no process can enter — and the same
 /// reasoning answered wrongly in every other row here.
+///
+/// Every row's directory is one no process can enter, root included
+/// ([`bury`]); none of them asserts which error the child met.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_working_directory_the_child_cannot_enter_is_reported() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let mixed = format!("missing:{}", locales.display());
 	let listed = format!("locales:{}", locales.display());
-	let open = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o755)).unwrap();
-	let shut = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o600)).unwrap();
 	// Each case is a working directory and the search path the shell set in
 	// it. The last is the one that used to come back from glibc's locale
 	// archive, which an emptied `LOCPATH` turns back on: `en_US.utf8` is
 	// installed, and the reference in that directory still reports the C
 	// locale because its own `LOCPATH` names nothing it can read.
 	let cases: [(&str, &str, &str); 5] = [
-		("unsearchable", SHELL_ONLY_LOCALE, &mixed),
+		("unsearchable/here", SHELL_ONLY_LOCALE, &mixed),
 		("removed", SHELL_ONLY_LOCALE, &mixed),
 		("ancestor/child", SHELL_ONLY_LOCALE, "locales"),
 		("renamed", SHELL_ONLY_LOCALE, &listed),
-		("archive", "en_US.utf8", "missing"),
+		("archive/here", "en_US.utf8", "missing"),
 	];
 	for (at, locale, path) in cases {
 		let cwd = dir.path().join(at);
@@ -79,20 +93,14 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 		let child = host.child_env();
 		match at {
 			"removed" => fs::remove_dir_all(&cwd).unwrap(),
-			"ancestor/child" => shut(&dir.path().join("ancestor")),
 			"renamed" => {
 				fs::rename(&cwd, dir.path().join("renamed-away")).unwrap();
 				fs::write(&cwd, b"not a directory\n").unwrap();
 			},
-			_ => shut(&cwd),
+			_ => bury(cwd.parent().unwrap()),
 		}
 		let env = |key: &str| (key == "LOCPATH").then(|| path.to_owned());
 		let answer = crate::locale::loaded_codeset(locale, &env, Some(&child));
-		match at {
-			"removed" | "renamed" => {},
-			"ancestor/child" => open(&dir.path().join("ancestor")),
-			_ => open(&cwd),
-		}
 		assert!(matches!(&answer, crate::locale::Codeset::Unasked(_)), "{at}: {answer:?}");
 	}
 }
@@ -117,16 +125,15 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_answer_that_needs_no_working_directory_is_still_given() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let absolute = locales.display().to_string();
-	let cwd = dir.path().join("unsearchable");
+	let cwd = dir.path().join("unsearchable").join("here");
 	fs::create_dir_all(&cwd).unwrap();
 	let (host, _) = crate::host::Host::for_test("rsync", "", &cwd);
 	let child = host.child_env();
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o600)).unwrap();
+	// No process can enter it, root included ([`bury`]).
+	bury(cwd.parent().unwrap());
 	let free = |key: &str| match key {
 		"LOCPATH" => Some(absolute.clone()),
 		"PATH_LOCALE" => Some("relative-locales".to_owned()),
@@ -138,7 +145,6 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 	let mixed = format!("{absolute}:missing");
 	let bound = |key: &str| (key == "LOCPATH").then(|| mixed.clone());
 	let reported = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &bound, Some(&child));
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o755)).unwrap();
 	assert!(
 		matches!(&answered, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
 		"{answered:?}"
