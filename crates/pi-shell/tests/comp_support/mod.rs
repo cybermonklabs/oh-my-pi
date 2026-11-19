@@ -7,9 +7,7 @@
 //! - `PI_COMP_ORACLE=1` runs the real zsh ([`crate::zsh_oracle::path`]) instead
 //!   of obash, checking the stored expectations against zsh itself.
 //! - `PI_COMP_BLESS=1` (with `PI_COMP_ORACLE=1`) rewrites the stored screen
-//!   snapshots of `zsh_comp_pty` from `/bin/zsh`.
-//! - `PI_COMP_QUIET_MS` how long output must stay quiet before a screen is read
-//!   (default 400).
+//!   snapshots of `zsh_comp_pty` from the real zsh.
 
 #![allow(dead_code, reason = "each test crate uses a subset")]
 
@@ -18,7 +16,6 @@ pub mod comptest;
 use std::{
 	env,
 	path::{Path, PathBuf},
-	time::Duration,
 };
 
 use crate::pty_support::{Spawn, have_real_zsh};
@@ -37,16 +34,6 @@ pub fn bless() -> bool {
 
 fn flag(name: &str) -> bool {
 	env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
-}
-
-/// How long output must stay quiet before a screen is read.
-#[must_use]
-pub fn quiet() -> Duration {
-	let ms = env::var("PI_COMP_QUIET_MS")
-		.ok()
-		.and_then(|v| v.parse().ok())
-		.unwrap_or(400);
-	Duration::from_millis(ms)
 }
 
 /// The shell under test: obash as `zsh`, or the real zsh in oracle mode.

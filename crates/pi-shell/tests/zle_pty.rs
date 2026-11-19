@@ -3,22 +3,20 @@
 //! (same keys, same rc file): the final screens must match.
 //!
 //! Each case types keys with short pauses (zsh skips redisplays while keys
-//! are queued), waits for the output to settle, and compares what the
-//! terminal shows.
+//! are queued), waits until the line editor has handled them and waits for
+//! the next key ([`Pty::zle_sync`]), and compares what the terminal shows.
 
 #![cfg(unix)]
 
 mod pty_support;
 mod zsh_oracle;
 
-use std::{io, thread, time::Duration};
+use std::{io, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// How long output must stay quiet before the screen is read.
-const QUIET: Duration = Duration::from_millis(300);
 
 /// `zsh -f -i` with `PS1`/`RPS1` and the rc file `rc` (sourced with `.`
 /// as the first command, since `-f` skips `.zshrc`).
@@ -31,14 +29,15 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
-		.rc_file(".zshrc", format!("{rc}\nprint -r -- RCDONE\n"))
+		.rc_file(".zshrc", format!("{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
+		.zle_sync()
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.zle_sync(TIMEOUT)
 }
 
 /// Run `drive` against both shells after sourcing the rc file; the final
@@ -49,13 +48,11 @@ fn screens(
 ) -> io::Result<(String, Option<String>)> {
 	let run = |pty: &mut Pty| -> io::Result<()> {
 		pty.wait_raw(TIMEOUT)?;
-		if !rc.is_empty() {
-			pty.type_keys(". ~/.zshrc\r", KEY)?;
-			pty.read_until("RCDONE", TIMEOUT)?;
-			pty.wait_raw(TIMEOUT)?;
-			// A clean screen for the case itself.
-			keys(pty, "\x0c")?;
-		}
+		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
+		// A clean screen for the case itself.
+		keys(pty, "\x0c")?;
 		drive(pty)
 	};
 	if !have_real_zsh() {
@@ -125,14 +122,12 @@ fn widget_listing_and_keymap_parameters() {
 #[test]
 fn zle_fd_handler_fires() {
 	// `/dev/null` is always readable: the handler runs as soon as the
-	// editor waits for a key, once (it removes itself).
+	// editor waits for a key, once (it removes itself), so it has run when
+	// the editor first answers [`Pty::zle_sync`] (handlers run in the order
+	// they were added). The listing leaves out the harness's own handler.
 	let rc = "exec {pfd}</dev/null\nh() { zle -I; print -r -- \"fired $# $(( $1 == pfd ))\"; zle \
 	          -F $1; }\nzle -F $pfd h\n";
-	same(rc, |pty| {
-		thread::sleep(Duration::from_millis(300));
-		pty.settle(QUIET, TIMEOUT)?;
-		keys(pty, "zle -F; echo after\r")
-	});
+	same(rc, |pty| keys(pty, "zle -F | grep -v _zle_sync; echo after\r"));
 }
 
 #[test]
@@ -145,12 +140,14 @@ fn ctrl_c_abandons_a_continued_command() {
 	same("PS2='%_> '", |pty| keys(pty, "if true\recho x\x03echo $?\r"));
 }
 
+/// The shell redraws the line at the new width before it handles the next
+/// key, so the screen is read once the editor waits for one.
 #[test]
 fn resize_redraws() {
 	same("", |pty| {
 		keys(pty, "echo a long line of text")?;
 		pty.resize(24, 40)?;
-		pty.settle(QUIET, TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
 		keys(pty, "\rprint $COLUMNS\r")
 	});
 }
@@ -195,7 +192,7 @@ fn eof_on_an_empty_line_exits() {
 	};
 	let r = pty
 		.wait_raw(TIMEOUT)
-		.and_then(|()| keys(&mut pty, "\x04"))
+		.and_then(|()| pty.write("\x04"))
 		.and_then(|()| pty.wait(TIMEOUT));
 	match r {
 		Ok(status) => assert_eq!(status.code(), Some(0)),

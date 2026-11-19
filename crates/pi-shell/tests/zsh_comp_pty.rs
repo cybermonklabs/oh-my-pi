@@ -5,7 +5,8 @@
 //! Each case sources an rc file (fixture directory `~/fx`, fixture commands
 //! in `~/bin`, and for compsys cases `compinit -u -D` from zsh 5.9's
 //! installed completion functions), clears the screen, then types its
-//! steps; after each step it waits for the output to settle and records the
+//! steps; after each step it waits until the line editor has handled the
+//! keys and waits for the next one ([`Pty::zle_sync`]) and records the
 //! screen (rows without trailing blanks) and the cursor, and for colour
 //! cases the text and SGR sequences the step wrote
 //! (`comp_support::sgr_transcript`). The record must equal the snapshot in
@@ -22,14 +23,14 @@ mod zsh_oracle;
 
 use std::{fmt::Write as _, fs, io, path::PathBuf, time::Duration};
 
-use comp_support::{bless, compsys_fpath, fpath_words, oracle, quiet, sgr_transcript, shell};
-use pty_support::Pty;
+use comp_support::{bless, compsys_fpath, fpath_words, oracle, sgr_transcript, shell};
+use pty_support::{Pty, ZLE_SYNC_SCRIPT};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
 /// Bound of the startup and the rc file (obash's `compinit`).
 const STARTUP: Duration = Duration::from_secs(60);
-/// Bound of one step's output settling.
+/// Bound of one step (completion functions print nothing while they work).
 const STEP: Duration = Duration::from_secs(30);
 
 /// The fixture every case starts from (after `fpath`).
@@ -63,10 +64,10 @@ fn snapshot_path(name: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/zsh_comp_pty/{name}.txt"))
 }
 
-/// Type `keys` and wait for the output to settle.
+/// Type `keys` and wait until the line editor has handled them.
 fn step(pty: &mut Pty, keys: &str) -> io::Result<()> {
 	pty.type_keys(keys, KEY)?;
-	pty.settle(quiet(), STEP)
+	pty.zle_sync(STEP)
 }
 
 /// Run the case on the shell under test; the record of its steps.
@@ -76,19 +77,19 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 		rcfile.push_str("autoload -U compinit; compinit -u -D\n");
 	}
 	rcfile.push_str(rc);
-	rcfile.push_str("\nprint -r -- RE''ADY\n");
+	let _ = write!(rcfile, "\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RE''ADY\n");
 	let mut pty = shell()
 		.args(["-f", "-i"])
 		.env("PS1", "%# ")
 		.env("LC_ALL", "en_US.UTF-8")
 		.rc_file(".zshrc", rcfile)
+		.zle_sync()
 		.size(24, 80)
 		.spawn()?;
-	pty.read_until("%", STARTUP)?;
-	pty.settle(quiet(), STARTUP)?;
+	pty.wait_raw(STARTUP)?;
 	pty.type_keys(". ~/.zshrc\r", Duration::from_millis(20))?;
 	pty.read_until("READY", STARTUP)?;
-	pty.settle(quiet(), STARTUP)?;
+	pty.zle_sync(STARTUP)?;
 	// A clean screen for the case itself.
 	step(&mut pty, "\x0c")?;
 	let mut text = String::new();

@@ -14,12 +14,10 @@ mod zsh_oracle;
 
 use std::{io, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
+use pty_support::{NO_DEADLINE, Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// Named-command minibuffers can consume ZLE fd-handler output as input.
-const QUIET: Duration = Duration::from_millis(300);
 
 /// Bindings for the widgets emacs mode leaves unbound.
 const BINDS: &str =
@@ -50,10 +48,34 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
 	pty.zle_sync(TIMEOUT)
+}
+
+/// One step of a case: keys, and what to wait for once they are typed.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+	/// The line editor has handled the keys ([`keys`]).
+	Keys(&'a str),
+	/// The keys end at zsh's question before a long listing (`zsh: do you
+	/// wish to see all …?`), shown in full. The [`Pty::zle_sync`] handler
+	/// does not run while the question waits for its answer: zsh redraws
+	/// the line then (`raw_getbyte` after a handler), which uses up the
+	/// redraw the listing asked for, so after the listing zsh would wait in
+	/// the cooked mode the listing printed in.
+	Asks(&'a str),
+	/// [`Step::Asks`], then the [`Pty::zle_sync`] handler runs while the
+	/// question waits for its answer, and the line editor redraws the line
+	/// after it (its display was invalidated by the question). Each wait
+	/// is for an event, with no deadline of its own ([`NO_DEADLINE`]): the
+	/// question on the screen, the handler's answer, then the redraw's
+	/// bytes (the first output after the answer), then the editor waiting
+	/// for a key again (a second answer: the whole redraw was written). An
+	/// editor that does not redraw hangs the test until the runner stops
+	/// it.
+	AsksThenHandler(&'a str),
 }
 
 /// Run `drive` against both shells after sourcing the rc file; the final
@@ -82,25 +104,32 @@ fn screens(
 	Ok((ours, Some(real)))
 }
 
-/// Assert both screens are the same after typing each of `lines`.
+/// Assert both screens are the same after typing each of `lines`, each
+/// read once the line editor has handled the keys and waits for the next
+/// one ([`Step::Keys`]).
 fn same(rc: &str, lines: &[&str]) {
-	same_with(rc, lines, false);
+	let steps: Vec<Step<'_>> = lines.iter().map(|l| Step::Keys(l)).collect();
+	same_steps(rc, &steps);
 }
 
-/// Named-command minibuffers and their listing questions are recursive
-/// reads, so they must not receive a ZLE fd-handler request between keys.
-fn same_minibuffer(rc: &str, lines: &[&str]) {
-	same_with(rc, lines, true);
-}
-
-fn same_with(rc: &str, lines: &[&str], minibuffer: bool) {
+/// [`same`] for cases with [`Step::Asks`] steps.
+fn same_steps(rc: &str, steps: &[Step<'_>]) {
 	let drive = |pty: &mut Pty| -> io::Result<()> {
-		for l in lines {
-			if minibuffer {
-				pty.type_keys(l, KEY)?;
-				pty.settle(QUIET, TIMEOUT)?;
-			} else {
-				keys(pty, l)?;
+		for step in steps {
+			match *step {
+				Step::Keys(k) => keys(pty, k)?,
+				Step::Asks(k) => {
+					pty.type_keys(k, KEY)?;
+					// The screen drops trailing blanks: the question ends `?`.
+					pty.wait_screen_contains(" lines)?", TIMEOUT)?;
+				},
+				Step::AsksThenHandler(k) => {
+					pty.type_keys(k, KEY)?;
+					pty.wait_screen_contains(" lines)?", NO_DEADLINE)?;
+					pty.zle_sync(NO_DEADLINE)?;
+					pty.read_some(NO_DEADLINE)?;
+					pty.zle_sync(NO_DEADLINE)?;
+				},
 			}
 		}
 		Ok(())
@@ -260,21 +289,22 @@ fn undo_redo_and_split_undo() {
 
 #[test]
 fn execute_named_cmd() {
-	same_minibuffer("", &[
+	use Step::{Asks, Keys};
+	same_steps("", &[
 		// A unique prefix completes on accept.
-		"echo aa bb\x01\x1bxforward-wo\r,\x1bz,\r",
+		Keys("echo aa bb\x01\x1bxforward-wo\r,\x1bz,\r"),
 		// Space completes as far as it is unique; ^D lists the matches.
-		"\x1bxkill-\x04",
-		"\x07",
-		"\x1bxup \x07",
-		"\x1bxkill-w\x17\x08\x08",
-		"\x07echo end\r",
+		Keys("\x1bxkill-\x04"),
+		Keys("\x07"),
+		Keys("\x1bxup \x07"),
+		Keys("\x1bxkill-w\x17\x08\x08"),
+		Keys("\x07echo end\r"),
 		// Every name: too many for the screen, so zsh asks first.
-		"\x1bx\x04",
-		"n",
-		"\x04",
-		"y",
-		"\x07echo after\r",
+		Asks("\x1bx\x04"),
+		Keys("n"),
+		Asks("\x04"),
+		Keys("y"),
+		Keys("\x07echo after\r"),
 	]);
 }
 
@@ -282,7 +312,7 @@ fn execute_named_cmd() {
 fn execute_named_cmd_listing_options() {
 	// The name list laid out packed, rows first, and without
 	// ALWAYS_LAST_PROMPT; AUTO_LIST off lists only on request.
-	same_minibuffer("setopt listpacked\n", &[
+	same("setopt listpacked\n", &[
 		"\x1bxvi-\x04",
 		"\x07setopt listrowsfirst\r",
 		"\x1bxhistory-\x04",
@@ -297,12 +327,7 @@ fn execute_named_cmd_listing_options() {
 fn execute_named_cmd_from_vi_command_mode() {
 	// `:` in vicmd reads the name in `main` (viins), where `vi-cmd-mode`
 	// accepts it; the keymap goes back to vicmd afterwards.
-	same_minibuffer("bindkey -v\n", &[
-		"echo abc\x1b:backward-ch\x1bx",
-		"i,\r",
-		"\x1b:nosuch\x1b\x07",
-		"i,\r",
-	]);
+	same("bindkey -v\n", &["echo abc\x1b:backward-ch\x1bx", "i,\r", "\x1b:nosuch\x1b\x07", "i,\r"]);
 }
 
 #[test]
@@ -404,6 +429,22 @@ fn pound_insert_and_unmeta() {
 
 #[test]
 fn read_command_from_a_widget() {
+	// The second `read-command` reads `execute-named-cmd`; an empty name
+	// lists every widget, so zsh asks first.
 	let rc = "rcw() { zle read-command; BUFFER+=\"<$REPLY>\" }\nzle -N rcw\nbindkey '^Xq' rcw\n";
-	same_minibuffer(rc, &["echo \x18q\x01\x18q\x1bx\r"]);
+	same_steps(rc, &[Step::Asks("echo \x18q\x01\x18q\x1bx\r")]);
+}
+
+/// A `zle -F` handler that runs while the question before a long listing
+/// waits for its answer (here the harness's own, [`Pty::zle_sync`]) makes
+/// the line editor redraw the line after it, as zsh 5.9 does
+/// (`raw_getbyte`: `trashzle` left `resetneeded`). Both shells write the
+/// same bytes for it; the test waits for them ([`Step::AsksThenHandler`]).
+/// (After the listing zsh then waits in cooked mode where obash waits in
+/// raw mode; no test compares the terminal modes.)
+#[test]
+fn a_handler_while_the_listing_question_waits_redraws_as_zsh() {
+	let rc = "rcw() { zle read-command; BUFFER+=\"<$REPLY>\" }\nzle -N rcw\nbindkey '^Xq' rcw\n";
+	same_steps(rc, &[Step::AsksThenHandler("echo \x18q\x01\x18q\x1bx\r")]);
+	same_steps("", &[Step::AsksThenHandler("echo x\x1bx\x04")]);
 }

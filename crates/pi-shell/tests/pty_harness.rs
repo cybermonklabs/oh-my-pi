@@ -118,7 +118,8 @@ fn a_resize_is_seen_by_both() -> io::Result<()> {
 		Spawn::zsh().args(["-f", "-c", script]),
 		Spawn::real_zsh().args(["-f", "-c", script]),
 		|pty| {
-			pty.settle(Duration::from_millis(200), TIMEOUT)?;
+			// `stty size` reads the size once `read` returns: the resize
+			// may come before the shell even started.
 			pty.resize(30, 100)?;
 			pty.write("\r")?;
 			pty.read_until("30 100", TIMEOUT)?;

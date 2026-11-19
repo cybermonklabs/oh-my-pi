@@ -62,6 +62,11 @@ pub use self::vt::Screen;
 /// The default bound of every wait.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A wait with no deadline of its own, for [`Pty::read_until`],
+/// [`Pty::read_some`], [`Pty::wait_screen`] and [`Pty::zle_sync`]: it ends
+/// when its event comes, and the test runner's timeout is its only bound.
+pub const NO_DEADLINE: Duration = Duration::MAX;
+
 /// The script [`Spawn::zle_sync`] writes into the home directory; a
 /// zsh-like shell (obash as `zsh`, the real zsh) sources it
 /// (`. ~/.zle-sync`) to answer [`Pty::zle_sync`]. It opens a FIFO and
@@ -412,7 +417,8 @@ impl Pty {
 		timeout: Duration,
 		mut done: impl FnMut(&[u8], bool, &Screen) -> bool,
 	) -> io::Result<()> {
-		let deadline = Instant::now() + timeout;
+		// `NO_DEADLINE` overflows the addition: no deadline.
+		let deadline = Instant::now().checked_add(timeout);
 		loop {
 			self.pump()?;
 			{
@@ -421,12 +427,13 @@ impl Pty {
 					return Ok(());
 				}
 				let now = Instant::now();
-				if now >= deadline {
+				if deadline.is_some_and(|d| now >= d) {
 					drop(state);
 					return Err(self.timeout("output"));
 				}
 				// Wake on new output, or every 20 ms for the screen.
-				let wait = (deadline - now).min(Duration::from_millis(20));
+				let poll = Duration::from_millis(20);
+				let wait = deadline.map_or(poll, |d| (d - now).min(poll));
 				let _ = self.shared.more.wait_timeout(state, wait).unwrap();
 			}
 		}
@@ -467,6 +474,26 @@ impl Pty {
 			})
 			.map_err(|_| self.timeout(&format!("{:?}", String::from_utf8_lossy(pattern))))?;
 		let end = end.unwrap_or(mark);
+		self.mark = end;
+		let state = self.shared.state.lock().unwrap();
+		Ok(String::from_utf8_lossy(&state.0[mark..end]).into_owned())
+	}
+
+	/// Wait for any output after what earlier calls consumed; that output
+	/// (consumed).
+	///
+	/// # Errors
+	///
+	/// `TimedOut` (with the output so far) when none comes in time.
+	pub fn read_some(&mut self, timeout: Duration) -> io::Result<String> {
+		let mark = self.mark;
+		let mut end = mark;
+		self
+			.wait_output(timeout, |out, _, _| {
+				end = out.len();
+				end > mark
+			})
+			.map_err(|_| self.timeout("output after the last read"))?;
 		self.mark = end;
 		let state = self.shared.state.lock().unwrap();
 		Ok(String::from_utf8_lossy(&state.0[mark..end]).into_owned())
@@ -542,7 +569,9 @@ impl Pty {
 	/// Once the shell has read the keys, a request goes to the FIFO. ZLE
 	/// serves `zle -F` handlers only while it waits for a key and none is
 	/// typed, so the answer comes after the work the keys started (a
-	/// completion function, a command line) and its output.
+	/// completion function, a command line) and its output. The terminal
+	/// modes are the shell's own business then: zsh 5.9 waits for the key
+	/// after a listing longer than the screen in cooked, echoing mode.
 	///
 	/// # Errors
 	///
@@ -552,7 +581,7 @@ impl Pty {
 		let Some(fifo) = self.sync.clone() else {
 			return Err(io::Error::other("zle_sync needs Spawn::zle_sync"));
 		};
-		let deadline = Instant::now() + timeout;
+		let deadline = Instant::now().checked_add(timeout);
 		// The shell reads each key before its next wait: were keys still
 		// queued, it could see the request before them.
 		let term = self.open_tty()?;
@@ -561,7 +590,7 @@ impl Pty {
 			if unread(&term)? == 0 {
 				break;
 			}
-			if Instant::now() >= deadline {
+			if deadline.is_some_and(|d| Instant::now() >= d) {
 				return Err(self.timeout("the shell to read the keys"));
 			}
 			thread::sleep(Duration::from_millis(5));
@@ -581,8 +610,8 @@ impl Pty {
 		request.write_all(format!("{}\n", self.syncs).as_bytes())?;
 		drop(request);
 		let answer = format!("\x1b{ZLE_SYNC_TAG}{}\x07", self.syncs);
-		self.read_until(answer, deadline.saturating_duration_since(Instant::now()))?;
-		Ok(())
+		let left = deadline.map_or(NO_DEADLINE, |d| d.saturating_duration_since(Instant::now()));
+		self.read_until(answer, left).map(drop)
 	}
 
 	/// The terminal side, opened anew (not as a controlling terminal) to
@@ -651,6 +680,61 @@ impl Pty {
 		Ok(())
 	}
 
+	/// Wait until `programs` all run in the terminal's foreground process
+	/// group, a job's and not the shell's: the command just typed has
+	/// started every process the keys `^Z` and `^C` are meant to signal.
+	///
+	/// # Errors
+	///
+	/// When the group cannot be read, or `TimedOut` (with the output so
+	/// far).
+	pub fn wait_job_running(&mut self, programs: &[&str], timeout: Duration) -> io::Result<()> {
+		let what = format!("{programs:?} running in the terminal's foreground");
+		let shell = self.pid();
+		self.wait_processes(timeout, &what, |fg, procs| {
+			fg != shell
+				&& programs.iter().all(|p| {
+					procs
+						.iter()
+						.any(|q| q.pgid == fg && !q.stopped && q.comm == *p)
+				})
+		})
+	}
+
+	/// Wait until no process the shell started is left (dead processes the
+	/// shell has not reaped yet are still listed, as zombies).
+	///
+	/// # Errors
+	///
+	/// `TimedOut` (with the output so far).
+	pub fn wait_processes_gone(&mut self, timeout: Duration) -> io::Result<()> {
+		self.wait_processes(timeout, "every process the shell started to be reaped", |_, procs| {
+			procs.is_empty()
+		})
+	}
+
+	/// Wait until `done` holds for the terminal's foreground process group
+	/// and the processes the shell started (its descendants).
+	fn wait_processes(
+		&mut self,
+		timeout: Duration,
+		what: &str,
+		mut done: impl FnMut(i32, &[Proc]) -> bool,
+	) -> io::Result<()> {
+		let deadline = Instant::now() + timeout;
+		loop {
+			self.pump()?;
+			let fg = tty::foreground(self.master.as_raw_fd())?;
+			if done(fg, &descendants(self.pid())) {
+				return Ok(());
+			}
+			if Instant::now() >= deadline {
+				return Err(self.timeout(what));
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+	}
+
 	/// The terminal's modes now (as the shell left them).
 	///
 	/// # Errors
@@ -696,6 +780,100 @@ impl Drop for Pty {
 			let _ = self.child.wait();
 		}
 	}
+}
+
+/// A process a shell started ([`descendants`]).
+#[derive(Debug)]
+struct Proc {
+	/// Its process group.
+	pgid:    i32,
+	/// Stopped (by a signal).
+	stopped: bool,
+	/// Its command name (the program file's name, at most 15 bytes).
+	comm:    String,
+}
+
+/// The processes below `pid`: its children, theirs, and so on. Linux lists
+/// each thread's children in `/proc/PID/task/TID/children`.
+#[cfg(target_os = "linux")]
+fn descendants(pid: i32) -> Vec<Proc> {
+	let mut out = Vec::new();
+	let mut todo = vec![pid];
+	while let Some(p) = todo.pop() {
+		let Ok(tasks) = fs::read_dir(format!("/proc/{p}/task")) else {
+			continue;
+		};
+		for task in tasks.flatten() {
+			let Ok(kids) = fs::read_to_string(task.path().join("children")) else {
+				continue;
+			};
+			for kid in kids
+				.split_whitespace()
+				.filter_map(|k| k.parse::<i32>().ok())
+			{
+				// `PID (COMM) STATE PPID PGRP …`; COMM may hold spaces.
+				let Ok(stat) = fs::read_to_string(format!("/proc/{kid}/stat")) else {
+					continue;
+				};
+				let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+					continue;
+				};
+				let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+				let (Some(state), Some(pgid)) =
+					(rest.first(), rest.get(2).and_then(|g| g.parse().ok()))
+				else {
+					continue;
+				};
+				out.push(Proc { pgid, stopped: *state == "T", comm: stat[open + 1..close].to_owned() });
+				todo.push(kid);
+			}
+		}
+	}
+	out
+}
+
+/// The processes below `pid`: its children, theirs, and so on
+/// (`proc_listchildpids`, `proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn descendants(pid: i32) -> Vec<Proc> {
+	/// `SSTOP` of `<sys/proc.h>`: stopped.
+	const SSTOP: u32 = 4;
+	let mut out = Vec::new();
+	let mut todo = vec![pid];
+	while let Some(p) = todo.pop() {
+		let mut kids = vec![0 as libc::pid_t; 256];
+		let size =
+			libc::c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
+		// SAFETY: `kids` has room for `size` bytes.
+		let n = unsafe { libc::proc_listchildpids(p, kids.as_mut_ptr().cast(), size) };
+		let n = usize::try_from(n).unwrap_or(0).min(kids.len());
+		for &kid in &kids[..n] {
+			let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+			let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(0);
+			// SAFETY: `info` has room for one `proc_bsdinfo`.
+			let got = unsafe {
+				libc::proc_pidinfo(kid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), want)
+			};
+			if got != want {
+				continue;
+			}
+			// SAFETY: proc_pidinfo filled it.
+			let info = unsafe { info.assume_init() };
+			let comm: Vec<u8> = info
+				.pbi_comm
+				.iter()
+				.take_while(|&&c| c != 0)
+				.map(|&c| c as u8)
+				.collect();
+			out.push(Proc {
+				pgid:    i32::try_from(info.pbi_pgid).unwrap_or(-1),
+				stopped: info.pbi_status == SSTOP,
+				comm:    String::from_utf8_lossy(&comm).into_owned(),
+			});
+			todo.push(kid);
+		}
+	}
+	out
 }
 
 /// Run the same session against obash and the real zsh: `drive` gets each

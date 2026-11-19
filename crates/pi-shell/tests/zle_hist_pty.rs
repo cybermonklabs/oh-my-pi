@@ -5,7 +5,10 @@
 //!
 //! Cases end where the screen shows what the widget did (the line, the
 //! cursor, the incremental search status line, `zle -M` messages from
-//! hooks), or run a command printing the editor state afterwards.
+//! hooks), or run a command printing the editor state afterwards. Each
+//! screen is read once the line editor has handled every key typed and
+//! waits for the next one ([`Pty::zle_sync`]; zsh serves `zle -F` handlers
+//! in every key read, an incremental search's too).
 
 #![cfg(unix)]
 
@@ -18,8 +21,6 @@ use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// Incremental searches can remain in a recursive key read.
-const QUIET: Duration = Duration::from_millis(300);
 
 /// The history file every case starts with (oldest first).
 const HIST: &str = "echo café crème\necho one\necho two\nls -l /tmp\necho three\nprint -r -- Two \
@@ -48,7 +49,7 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
 	pty.zle_sync(TIMEOUT)
@@ -80,32 +81,23 @@ fn screens(
 	Ok((ours, Some(real)))
 }
 
-/// Assert both screens (with the cursor position) are the same.
-fn same(rc: &str, typed: &str) {
-	same_with(rc, typed, false);
-}
-
-fn same_with(rc: &str, typed: &str, returns_to_main: bool) {
-	let (ours, real) = match screens(rc, |pty| {
-		if returns_to_main {
-			keys(pty, typed)
-		} else {
-			pty.type_keys(typed, KEY)?;
-			pty.settle(QUIET, TIMEOUT)
-		}
-	}) {
+/// Assert both screens (with the cursor position) are the same; zsh's
+/// screen when the screens were compared.
+fn same(rc: &str, typed: &str) -> Option<String> {
+	let (ours, real) = match screens(rc, |pty| keys(pty, typed)) {
 		Ok(s) => s,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
-	if let Some(real) = real {
-		assert_eq!(ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
+	if let Some(real) = &real {
+		assert_eq!(&ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
 	}
+	real
 }
 
 /// [`same`], then `~/log` shown in place of the line: what the widgets
-/// logged on the way.
-fn same_log(rc: &str, typed: &str) {
-	same_with(rc, &format!("{typed}\x18q"), true);
+/// logged on the way. zsh's screen when the screens were compared.
+fn same_log(rc: &str, typed: &str) -> Option<String> {
+	same(rc, &format!("{typed}\x18q"))
 }
 
 /// A widget logging `BUFFER`, `CURSOR` and `HISTNO` to `~/log`, bound to
