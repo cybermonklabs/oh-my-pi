@@ -126,6 +126,48 @@ fn command_strings_and_exit_statuses_match_zsh() {
 	}
 }
 
+/// The name and home directory of the user running the tests: their
+/// password database entry.
+fn passwd_entry() -> (String, String) {
+	// SAFETY: getpwuid returns a pointer into static storage (or null),
+	// read before any other call can replace it.
+	unsafe {
+		let pw = libc::getpwuid(libc::getuid());
+		assert!(!pw.is_null(), "the user running the tests has a password database entry");
+		let text =
+			|p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+		(text((*pw).pw_name), text((*pw).pw_dir))
+	}
+}
+
+/// zsh names the user (`USERNAME`, `%n`) and sets the default `HOME` from
+/// the password database, not from `USER` and `HOME`: with both unset the
+/// shell still knows who runs it, and `~` is that user's home.
+#[test]
+fn the_user_name_and_home_come_from_the_password_database() {
+	let (name, home) = passwd_entry();
+	let args = ["-f", "-c", "print -r -- $USERNAME $HOME ~ ${(%):-%n}"];
+	let run_without_user = |program: &std::ffi::OsStr| {
+		let out = Command::new(program)
+			.arg0("zsh")
+			.args(args)
+			.env_remove("USER")
+			.env_remove("HOME")
+			.env_remove("ZDOTDIR")
+			.output()
+			.expect("start the shell");
+		(out.stdout, out.stderr, out.status.code())
+	};
+	let ours = run_without_user(env!("CARGO_BIN_EXE_obash").as_ref());
+	assert_eq!(
+		(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
+		(format!("{name} {home} {home} {name}\n"), Some(0))
+	);
+	if have_zsh() {
+		assert_eq!(ours, run_without_user(zsh_oracle::path().as_os_str()));
+	}
+}
+
 /// A `TRAPNAL` function is the signal's trap (zsh `settrap` with
 /// `ZSIG_FUNC`): a real `SIGUSR1` sent to the shell calls `TRAPUSR1` with
 /// the signal's number, and the shell goes on.

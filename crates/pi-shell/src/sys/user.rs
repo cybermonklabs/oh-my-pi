@@ -1,5 +1,5 @@
 //! The current user as the shell reports it (`UID`, `EUID`, `GID`,
-//! `GROUPS`, `USER`/`HOME`).
+//! `GROUPS`, the user name and home directory).
 //!
 //! Windows has no numeric ids: the user's and primary group's ids are the
 //! relative ids (RIDs, the last sub-authority) of their SIDs, as MSYS2 and
@@ -11,8 +11,13 @@ use bstr::BString;
 
 use crate::bash::UserInfo;
 
-/// The current user: ids, groups, and `USER`/`HOME` (`USERNAME`/
-/// `USERPROFILE` on Windows) of the process environment.
+/// The current user: ids, groups, and the name and home directory.
+///
+/// On Unix the name and home are the real uid's password database entry,
+/// as zsh (`USERNAME`, the default `HOME`) and bash (`\u`, `~` without
+/// `HOME`) take them, whatever `USER` and `HOME` the environment holds; a
+/// uid without an entry falls back to `USER` and `HOME`. On Windows,
+/// `USERNAME` and `USERPROFILE`.
 pub fn read_user() -> UserInfo {
 	let var = |k: &str| {
 		std::env::var_os(k).map_or_else(BString::default, |v| BString::from(v.as_encoded_bytes()))
@@ -22,12 +27,47 @@ pub fn read_user() -> UserInfo {
 	let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
 	#[cfg(windows)]
 	let (uid, euid, gid) = windows::ids();
-	let (name, home) = if cfg!(windows) {
-		(var("USERNAME"), var("USERPROFILE"))
-	} else {
-		(var("USER"), var("HOME"))
-	};
+	#[cfg(unix)]
+	let (name, home) = passwd_entry(uid).unwrap_or_else(|| (var("USER"), var("HOME")));
+	#[cfg(windows)]
+	let (name, home) = (var("USERNAME"), var("USERPROFILE"));
 	UserInfo { uid, euid, gid, groups: groups(), name, home }
+}
+
+/// The name and home directory of `uid`'s password database entry
+/// (`getpwuid_r`); `None` without one.
+#[cfg(unix)]
+fn passwd_entry(uid: libc::uid_t) -> Option<(BString, BString)> {
+	use std::ffi::CStr;
+	let mut buf = vec![0u8; 4096];
+	loop {
+		let mut pw = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+		let mut found: *mut libc::passwd = std::ptr::null_mut();
+		// SAFETY: `pw` and `buf` are valid for writes of their sizes;
+		// getpwuid_r fills them and sets `found`.
+		let rc = unsafe {
+			libc::getpwuid_r(uid, pw.as_mut_ptr(), buf.as_mut_ptr().cast(), buf.len(), &raw mut found)
+		};
+		if rc == libc::ERANGE && buf.len() < 1 << 20 {
+			buf.resize(buf.len() * 2, 0);
+			continue;
+		}
+		if rc != 0 || found.is_null() {
+			return None;
+		}
+		// SAFETY: getpwuid_r succeeded, so `pw` is initialized and its
+		// strings are null or NUL-terminated inside `buf`.
+		let pw = unsafe { pw.assume_init() };
+		let text = |p: *const libc::c_char| {
+			if p.is_null() {
+				BString::default()
+			} else {
+				// SAFETY: as above.
+				BString::from(unsafe { CStr::from_ptr(p) }.to_bytes())
+			}
+		};
+		return Some((text(pw.pw_name), text(pw.pw_dir)));
+	}
 }
 
 /// The effective uid and gid files read as owned by. Windows reports no
