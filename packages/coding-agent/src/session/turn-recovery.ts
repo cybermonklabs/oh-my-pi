@@ -2829,8 +2829,8 @@ export class TurnRecovery {
 
 	/**
 	 * How both searches after a spent fallback end: with the switch to `pick`,
-	 * recorded under `role`, or with no switch when `pick` is the model in use at
-	 * the level the switch would set.
+	 * recorded under `role`, or with no switch, and a false answer, when `pick`
+	 * is the model in use at the level the switch would set.
 	 * `inheritedThinkingLevel` stands in for the session's level when `pick`'s
 	 * selector names none.
 	 */
@@ -2843,11 +2843,13 @@ export class TurnRecovery {
 	): Promise<boolean> {
 		if (this.#isNoOpRetryFallback(pick.model, pick.selector, inheritedThinkingLevel)) {
 			// A pick that is the model in use, at the level the switch would set,
-			// makes no switch. The walk still answers true, so the retry goes on as
-			// after a switch, and it pins the active fallback's record, as the
-			// switch onto the spent model and the check's switch back would pin it;
-			// with no record, the model in use is no fallback and none is made. A
-			// true answer resets a spent retry budget. A refusal walk never picks
+			// makes no switch, so the walk answers false. It still pins the active
+			// fallback's record, as the switch onto the spent model and the check's
+			// switch back would pin it, so `cooldown-expiry` does not bring back a
+			// primary the turn moved off; with no record, the model in use is no
+			// fallback and none is made. The retry policy then treats the failure
+			// as with no fallback left: the same model's retry budget and backoff
+			// apply, and a spent budget ends the turn. A refusal walk never picks
 			// the model in use: it refused, and the searches pass over every model
 			// that refused in the turn. Any other failure put the model in use in
 			// cooldown (`noteRetryFallbackCooldown`) before its walk, and the
@@ -2858,7 +2860,7 @@ export class TurnRecovery {
 			// which can be as short as a provider's retry-after hint, ended while
 			// the walk read keys and usage.
 			if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
-			return true;
+			return false;
 		}
 		// Like the check before a model call, this switch is pinned, so
 		// `cooldown-expiry` does not bring the primary back after it, and sets
