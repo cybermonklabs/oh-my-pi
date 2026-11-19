@@ -162,6 +162,13 @@ impl Poller {
 	/// lost), while the real reader goes on waiting for a writer.
 	fn forget(&self, id: u64) {
 		let mut entries = self.entries.lock();
+		#[cfg(test)]
+		if let Some(e) = entries.iter().find(|e| e.id == id) {
+			// SAFETY: F_GETFD only inspects the descriptor table.
+			if unsafe { libc::fcntl(e.fd, libc::F_GETFD) } < 0 {
+				FORGOTTEN_AFTER_CLOSE.fetch_add(1, Ordering::Relaxed);
+			}
+		}
 		entries.retain(|e| e.id != id);
 		let mut polling = self.polling.lock();
 		drop(entries);
@@ -178,6 +185,13 @@ impl Poller {
 		}
 	}
 }
+
+/// Watches forgotten after their descriptor had closed (tests only). A
+/// holder forgets its watch before it closes the descriptor: closed first,
+/// the number is free while the readiness thread may still poll it, so its
+/// next wait can hold whatever file another open gave that number.
+#[cfg(test)]
+pub(crate) static FORGOTTEN_AFTER_CLOSE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
 	/// This is the readiness thread, which is between waits whenever it runs

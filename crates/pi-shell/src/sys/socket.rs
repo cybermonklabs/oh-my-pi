@@ -573,4 +573,38 @@ mod tests {
 			assert_eq!(from_c(&ss, len).unwrap(), addr);
 		}
 	}
+
+	/// Drops `pending` once it waits on the readiness thread, and returns how
+	/// many watches were forgotten after their descriptor had closed meanwhile.
+	fn forgotten_after_close<T>(mut pending: impl FsPending<T>) -> u64 {
+		let waker = std::task::Waker::noop();
+		let mut cx = Context::from_waker(waker);
+		assert!(pending.poll(&mut cx).is_pending(), "nothing to accept or write yet");
+		let before = ready::FORGOTTEN_AFTER_CLOSE.load(std::sync::atomic::Ordering::Relaxed);
+		drop(pending);
+		ready::FORGOTTEN_AFTER_CLOSE.load(std::sync::atomic::Ordering::Relaxed) - before
+	}
+
+	/// A dropped accept forgets its readiness watch before it closes its
+	/// duplicate of the listener: closed first, the number is free while the
+	/// readiness thread may still poll it.
+	#[test]
+	fn a_dropped_accept_forgets_its_watch_before_its_descriptor_closes() {
+		let dir = tempfile::tempdir().unwrap();
+		let listener = std::os::unix::net::UnixListener::bind(dir.path().join("s")).unwrap();
+		let pending = Accepting { watch: None, listener: OwnedFd::from(listener) };
+		assert_eq!(forgotten_after_close(pending), 0);
+	}
+
+	/// The same for a connect still waiting for writability (here a stream
+	/// whose send buffer is full).
+	#[test]
+	fn a_dropped_connect_forgets_its_watch_before_its_descriptor_closes() {
+		let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+		a.set_nonblocking(true).unwrap();
+		let chunk = [0u8; 4096];
+		while std::io::Write::write(&mut &a, &chunk).is_ok() {}
+		let pending = Connecting { watch: None, fd: Some(OwnedFd::from(a)) };
+		assert_eq!(forgotten_after_close(pending), 0);
+	}
 }
