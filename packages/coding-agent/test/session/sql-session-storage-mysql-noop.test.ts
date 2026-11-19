@@ -134,9 +134,9 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 				return mysqlResult(rows.delete(values[0] as string) ? 1 : 0);
 			}
 			// The blob and reference tables, which hold nothing here: start-up's privilege probes, which change
-			// no row, a full write's reference reset, and a delete's look for the references it drops.
+			// no row, a full write's read of the references it replaces, and a delete's look for those it drops.
 			if (
-				/^(INSERT INTO|DELETE FROM|UPDATE|SELECT sha256(, byte_len)? FROM) omp_session_files_(blobs|refs)\b/.test(
+				/^(INSERT INTO|DELETE FROM|UPDATE|SELECT sha256(, byte_len|, path)? FROM) omp_session_files_(blobs|refs)\b/.test(
 					sql,
 				)
 			) {
