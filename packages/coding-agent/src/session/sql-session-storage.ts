@@ -243,8 +243,13 @@ interface DialectQueries {
 	refsOf(count: number): Statement;
 	/** The hashes the paths under `@dir` (its first `@len` characters) reference. */
 	refsUnder: Statement;
-	/** Of `count` hashes, the ones a reference row names; MySQL reads them with a shared lock, so it sees the latest. */
+	/** Of `count` hashes, the ones a reference row names (PostgreSQL and SQLite; MySQL's is {@link referencedOne}). */
 	referenced(count: number): Statement;
+	/**
+	 * MySQL: whether a reference row names `@h`, read with a shared lock through the `sha256` index, so it sees
+	 * the latest commits, and locks only the first entry of `@h` (or, with none, the gap where it would be).
+	 */
+	referencedOne: Statement | undefined;
 	deleteRefs: Statement;
 	deleteRefsUnder: Statement;
 	/** Hand `@src`'s references to `@dst`. */
@@ -1305,8 +1310,8 @@ function buildQueries(
 		),
 		refsOf: count => sql(`SELECT sha256, path FROM ${refs} WHERE path IN (${inList("p", count)})`),
 		refsUnder: sql(`SELECT sha256 FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
-		referenced: count =>
-			sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})${mysql ? " LOCK IN SHARE MODE" : ""}`),
+		referenced: count => sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})`),
+		referencedOne: mysql ? sql(`SELECT sha256 FROM ${refs} WHERE sha256 = @h LIMIT 1 LOCK IN SHARE MODE`) : undefined,
 		deleteRefs: sql(`DELETE FROM ${refs} WHERE path = @path`),
 		deleteRefsUnder: sql(`DELETE FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
 		moveRefs: sql(`UPDATE ${refs} SET path = @dst WHERE path = @src`),
@@ -4135,14 +4140,30 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * start; MySQL reads the references with a shared lock, so it sees the
 	 * latest); a write that locks after this commits finds the row gone and
 	 * lands it again. The parts' rows were locked in the same pass as their
-	 * parents, so taking their references locks nothing new.
+	 * parents, so taking their references locks nothing new. MySQL reads one
+	 * hash per statement, its first entry in the `sha256` index: a read of
+	 * several hashes, or of all of one hash's entries, locks next-key ranges
+	 * (or, on a small table, scans the primary key) into other blobs'
+	 * entries, which other transactions change under their own blob locks.
+	 * This one's row lock alone keeps every reference to it from changing.
 	 */
 	async #deleteOrphans(transaction: SqlSessionStorageTransaction, locked: readonly string[]): Promise<string[]> {
 		if (locked.length === 0) return [];
 		const referenced = new Set<string>();
-		for (const batch of batches(locked, BLOB_READ_BATCH)) {
-			const rows = (await run(transaction, this.#q.referenced(batch.length), listValues("h", batch))) as HashRow[];
-			for (const row of rows) referenced.add(row.sha256);
+		const one = this.#q.referencedOne;
+		if (one) {
+			for (const hash of [...locked].sort()) {
+				if ((await run(transaction, one, { h: hash })).length > 0) referenced.add(hash);
+			}
+		} else {
+			for (const batch of batches(locked, BLOB_READ_BATCH)) {
+				const rows = (await run(
+					transaction,
+					this.#q.referenced(batch.length),
+					listValues("h", batch),
+				)) as HashRow[];
+				for (const row of rows) referenced.add(row.sha256);
+			}
 		}
 		const orphans = locked.filter(hash => !referenced.has(hash));
 		if (orphans.length === 0) return [];
