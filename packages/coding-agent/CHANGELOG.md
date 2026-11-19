@@ -50,6 +50,7 @@
 - Under `session.storage: sql`, a subagent transcript whose session another omp process holds forks to a session of its own beside it instead of keeping its entries only in memory.
 - Under `session.storage: sql` on PostgreSQL with a nondeterministic (such as case-insensitive) collation on the `path` columns, deleting a session no longer deletes the sessions, or fails the in-progress saves, under another directory whose name differs only in letter case.
 - Under `session.storage: sql` on SQLite, a parts table holding a rowid past 2^53 (as a copy or restore tool that keeps rowids can leave) no longer makes a session's appends and rewrites fail (`datatype mismatch`, `UNIQUE constraint failed`) or its chunked reads fail with a read conflict.
+- Under `session.storage: sql` on SQLite, resuming, opening, forking or exporting a long session that an older omp sharing the database (or this process itself) re-creates while it is read no longer gives the old transcript's first entries followed by the new one's: the read checks what it read when it ends and reads the session again.
 
 ### Security
 
