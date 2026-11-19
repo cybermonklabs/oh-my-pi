@@ -3,10 +3,11 @@ import { stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
 
 /**
  * Bun cannot import or require a module from a path that contains `?`: it
- * reads the path cut at the `?` and fails with "Cannot find module", whatever
- * the specifier's form (a raw path, a `file://` URL, with or without a query)
- * and also when a `?`-free symbolic link leads to such a path. No other path
- * character has this limit.
+ * reads the path cut at the `?`, whatever the specifier's form (a raw path, a
+ * `file://` URL, with or without a query), and also when a `?`-free symbolic
+ * link leads to such a path. It fails with "Cannot find module", or, for a
+ * plain `import()` through such a link, with "ENOENT reading" the cut path. No
+ * other path character has this limit.
  */
 export class UnloadableModulePathError extends Error {
 	constructor(

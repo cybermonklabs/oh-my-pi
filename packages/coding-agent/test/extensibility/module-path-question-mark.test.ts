@@ -1,9 +1,10 @@
 /**
  * Bun cannot load a module from a path that contains `?`: it reads the path cut
- * at the `?` and reports "Cannot find module …?mtime=…", which names neither
- * the cause nor the fix. Every place that imports user code from a path
- * refuses such a path before importing, with an error that names the path and
- * the limit. These tests pin that message at each of them.
+ * at the `?` and reports "Cannot find module …" (with `?mtime=…` for an
+ * extension), which names neither the cause nor the fix. Every place that
+ * imports user code from a path refuses such a path before importing, with an
+ * error that names the path and the limit. These tests pin that message at
+ * each of them.
  */
 import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
