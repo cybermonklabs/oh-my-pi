@@ -98,6 +98,26 @@ function failing(client: SqlSessionStorageClient, pattern: RegExp, times: number
 	};
 }
 
+/** `client`, adding to `into` each deadlock its transactions' statements meet. */
+function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessionStorageClient {
+	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		async unsafe(query, values) {
+			try {
+				return await executor.unsafe(query, values);
+			} catch (err) {
+				if (err instanceof Error && /deadlock/i.test(err.message)) into.push(query.slice(0, 80));
+				throw err;
+			}
+		},
+	});
+	return {
+		options: client.options,
+		unsafe: (query, values) => client.unsafe(query, values),
+		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
+		end: () => client.end?.() ?? Promise.resolve(),
+	};
+}
+
 async function blobHashes(db: LeaseDb): Promise<string[]> {
 	return (await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256)).sort();
 }
@@ -106,6 +126,32 @@ async function blobHashes(db: LeaseDb): Promise<string[]> {
 async function blobCreatedMs(db: LeaseDb): Promise<number> {
 	const [row] = await db.sql(`SELECT created_ms FROM ${db.table}_blobs WHERE sha256 = @1`, [IMAGE_HASH]);
 	return Number(row?.created_ms);
+}
+
+/**
+ * Keep a read view open on a connection of its own, so InnoDB purges no row a
+ * delete marks after it, until the returned function runs (any number of times).
+ */
+async function holdPurge(db: LeaseDb): Promise<() => Promise<void>> {
+	const holder = new SQL(db.dsn);
+	const opened = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const held = holder.transaction(async transaction => {
+		await transaction.unsafe(`SELECT COUNT(*) AS n FROM ${db.table}`);
+		opened.resolve();
+		await release.promise;
+	});
+	held.catch((err: unknown) => opened.reject(err));
+	await opened.promise;
+	let ended: Promise<void> | undefined;
+	return () => {
+		release.resolve();
+		ended ??= held.then(
+			() => holder.end(),
+			() => holder.end(),
+		);
+		return ended;
+	};
 }
 
 /** `size` bytes of an image, distinct for each `seed`. */
@@ -875,7 +921,8 @@ describe("session blobs in the SQL session storage", () => {
 				queries.length = 0;
 				removerQueries.length = 0;
 				gate?.close();
-				// A full write of the session's content: its references are replaced, after its blob rows' locks.
+				// A full write of the session's content: it locks its blob rows, then deletes only the references the
+				// content no longer names (none here) and inserts the ones it names.
 				const writing = writer.writeText(written, content).then(() => writer.drain());
 				let removing: Promise<void> | undefined;
 				try {
@@ -897,7 +944,7 @@ describe("session blobs in the SQL session storage", () => {
 					blobs: [IMAGE_HASH],
 					created,
 					refs: [written],
-					writerReferenceDeletes: 1,
+					writerReferenceDeletes: 0,
 					removerReferenceDeletes: 1,
 				});
 			});
@@ -978,10 +1025,10 @@ describe("session blobs in the SQL session storage", () => {
 
 			// The sweep against a write to a dangling reference's path: P named A, and a build that keeps no
 			// references deleted P's row, so (P, A) is dangling. A write that re-creates P naming A is paused just
-			// after its session row insert, and the sweep runs. The sweep takes P's session row (or its gap) before
-			// A's row, as the write does, so on MySQL and MariaDB it waits for the write and then keeps the write's
-			// reference, with no deadlock. The control: the write creates another session naming A, so the sweep
-			// does not wait, and drops (P, A).
+			// after its session row insert, and the sweep runs. The sweep locks no session row on any engine: it
+			// locks A's row, which the write takes only after its own, drops (P, A), since the write's row is not
+			// committed, and does not wait; the write then references A again, with no deadlock. The control: the
+			// write creates another session naming A.
 			for (const target of ["the dangling path", "another path"] as const) {
 				it(`sweeps, with no deadlock or retry, the dangling references while a write to ${target} naming the blob is open`, async () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
@@ -1021,9 +1068,7 @@ describe("session blobs in the SQL session storage", () => {
 						gate?.open();
 					}
 					await Promise.all([writing, sweeping]);
-					// PostgreSQL locks no gap and its look takes no lock: its sweep drops (P, A) without waiting, and
-					// the write then adds its own reference again.
-					const waits = target === "the dangling path" && adapter === "mysql";
+					// No engine's sweep waits: it locks no session row, and the write takes A's row only after the sweep.
 					expect({
 						first,
 						blobs: await blobHashes(db),
@@ -1036,7 +1081,7 @@ describe("session blobs in the SQL session storage", () => {
 						writerReferenceInserts: queries.filter(query => REF_INSERT.test(query)).length,
 						sweeperBlobLocks: sweeperQueries.filter(query => BLOB_EXCLUSIVE_LOCK.test(query)).length,
 					}).toEqual({
-						first: waits ? "waiting for the write" : "swept",
+						first: "swept",
 						blobs: [IMAGE_HASH],
 						created,
 						refs: [[written, IMAGE_HASH]],
@@ -1046,6 +1091,321 @@ describe("session blobs in the SQL session storage", () => {
 					});
 				});
 			}
+
+			// Two writes create again, at once, two dangling paths of one blob that sort next to each other, while
+			// the sweep runs, paused before its first blob-table statement. A build that keeps no references deleted
+			// the two rows; InnoDB keeps them delete-marked until purge, held back here by a read view another
+			// connection keeps open until both writes have reached the server. At 726a4311 the sweep held a share lock
+			// on each delete-marked row (`lockSessionRows`), so each write waited in its insert's duplicate check;
+			// purge then removed both rows and made each write's waiting lock a gap lock before the next row, and
+			// each write waited to insert into the gap the other held: a deadlock, after which one write ran again.
+			// The sweep now locks no session row, so neither write waits for it.
+			it.skipIf(adapter !== "mysql")(
+				"creates again two dangling paths of one gap while the sweep runs and purge removes their rows, with no deadlock or retry",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const storage = await db.open();
+					let gate: GatedClient | undefined;
+					const sweeper = await db.open({
+						wrap: client => {
+							gate = gatedClient(client, /^SELECT .* FROM \S*_blobs\b/, "before");
+							return gate.client;
+						},
+					});
+					const deadlocks: string[] = [];
+					const queries: string[][] = [[], []];
+					const writers = [
+						await db.open({
+							wrap: client => deadlockLog(recordingClient(client, queries[0] as string[]), deadlocks),
+						}),
+						await db.open({
+							wrap: client => deadlockLog(recordingClient(client, queries[1] as string[]), deadlocks),
+						}),
+					];
+					const sessionRow = new RegExp(`^INSERT (?:IGNORE )?INTO \\S*\\b${db.table} \\(`);
+					const p = await writeImageSession(db, storage, [IMAGE_BYTES]);
+					const content = (await db.row(p))?.content ?? "";
+					const [a, k1, k2, z] = ["a", "k1", "k2", "z"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [
+						string,
+						string,
+						string,
+						string,
+					];
+					for (const path of [a, k1, k2, z]) await storage.writeText(path, content);
+					await storage.drain();
+
+					const releasePurge = await holdPurge(db);
+					let early: string | undefined;
+					let sweeping: Promise<unknown> | undefined;
+					let writing: Promise<unknown> | undefined;
+					try {
+						for (const path of [k1, k2]) {
+							await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [path]);
+							await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [path]);
+						}
+						gate?.close();
+						sweeping = sweeper.blobTier.sweep(new Set(), 0, true);
+						await Promise.race([gate?.paused(), sweeping]);
+						let settled = false;
+						writing = Promise.all(
+							writers.map((writer, index) =>
+								writer.writeText(index === 0 ? k1 : k2, content).then(() => writer.drain()),
+							),
+						).finally(() => {
+							settled = true;
+						});
+						// A real wait: what is measured is whether the writes meet a lock of the sweep's on the server.
+						early = await Promise.race([
+							writing.then(() => "written"),
+							Bun.sleep(1000).then(() => "waiting for the sweep"),
+						]);
+						await releasePurge();
+						// Purge runs when InnoDB schedules it, and shows only in what it does to writes still waiting
+						// here: both waiting writes deadlock once it has removed the rows.
+						await until(() => settled || deadlocks.length > 0, 30_000).catch(() => undefined);
+					} finally {
+						await releasePurge();
+						gate?.open();
+					}
+					await Promise.all([writing, sweeping]);
+					expect({
+						early,
+						deadlocks,
+						writerSessionRowInserts: queries.map(list => list.filter(query => sessionRow.test(query)).length),
+						paths: await db.paths(),
+						refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs ORDER BY path`)).map(found => [
+							String(found.path),
+							String(found.sha256),
+						]),
+					}).toEqual({
+						early: "written",
+						deadlocks: [],
+						writerSessionRowInserts: [1, 1],
+						paths: [p, a, k1, k2, z],
+						refs: [p, a, k1, k2, z].map(path => [path, IMAGE_HASH]),
+					});
+				},
+			);
+
+			// The sweep reads the session rows only after it locks the blob's row: a write that creates a dangling
+			// path again, naming the blob, and commits while the sweep waits at that lock keeps its reference. A read
+			// before the lock (of the blob rows or the session rows) would fix MySQL's snapshot before that write
+			// committed, and the sweep would drop the reference the write had just added.
+			it("keeps the reference of a write that creates a dangling path again while the sweep waits to lock the blob's row", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				let gate: GatedClient | undefined;
+				const sweeper = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, BLOB_EXCLUSIVE_LOCK, "before");
+						return gate.client;
+					},
+				});
+				const p = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				const content = (await db.row(p))?.content ?? "";
+				await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [p]);
+				await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [p]);
+
+				gate?.close();
+				const sweeping = sweeper.blobTier.sweep(new Set(), 0, true);
+				let writing: Promise<unknown> | undefined;
+				let first: string | undefined;
+				try {
+					await Promise.race([gate?.paused(), sweeping]);
+					writing = storage.writeText(p, content).then(() => storage.drain());
+					// A real wait: what is measured is whether the write meets a lock of the sweep's on the server.
+					first = await Promise.race([
+						writing.then(() => "written"),
+						Bun.sleep(1000).then(() => "waiting for the sweep"),
+					]);
+				} finally {
+					gate?.open();
+				}
+				await Promise.all([writing, sweeping]);
+				expect({
+					first,
+					blobs: await blobHashes(db),
+					refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs`)).map(found => [
+						String(found.path),
+						String(found.sha256),
+					]),
+				}).toEqual({
+					// SQLite runs one writer at a time.
+					first: adapter === "sqlite" ? "waiting for the sweep" : "written",
+					blobs: [IMAGE_HASH],
+					refs: [[p, IMAGE_HASH]],
+				});
+			});
+
+			// A rename onto a dangling path whose row InnoDB keeps delete-marked (purge held back) while the sweep
+			// runs: S sorts after D, and both had references to the blob. At 726a4311 the sweep, paused after locking
+			// D's delete-marked row shared, then wanted S's row, which the rename held; the rename held S and its
+			// UPDATE waited for D's key, outside path order: a deadlock (seen on MariaDB in the soak). The sweep now
+			// locks no session row, so there is nothing for it to pause at, and neither transaction waits for the other.
+			it.skipIf(adapter !== "mysql")(
+				"renames a session onto a dangling path, delete-marked until purge, while the sweep runs, with no deadlock or retry",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					const storage = await db.open({ wrap: client => deadlockLog(client, deadlocks) });
+					let gate: GatedClient | undefined;
+					const sweeper = await db.open({
+						wrap: client => {
+							gate = gatedClient(
+								deadlockLog(client, deadlocks),
+								new RegExp(`FROM \\S*\\b${db.table} WHERE .*LOCK IN SHARE MODE$`),
+							);
+							return gate.client;
+						},
+					});
+					const p = await writeImageSession(db, storage, [IMAGE_BYTES]);
+					const content = (await db.row(p))?.content ?? "";
+					const [d, s] = ["d", "s"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [string, string];
+					for (const path of [d, s]) await storage.writeText(path, content);
+					await storage.drain();
+
+					const releasePurge = await holdPurge(db);
+					let renaming: Promise<unknown> | undefined;
+					let sweeping: Promise<unknown> | undefined;
+					try {
+						for (const path of [d, s]) {
+							await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [path]);
+							await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [path]);
+						}
+						await storage.refresh();
+						gate?.close();
+						sweeping = sweeper.blobTier.sweep(new Set(), 0, true);
+						await Promise.race([gate?.paused(), sweeping]);
+						await storage.writeText(s, content);
+						renaming = storage.rename(s, d);
+						// A real wait: what is measured is whether the rename meets a lock of the sweep's on the server.
+						await Promise.race([renaming, Bun.sleep(1000)]);
+					} finally {
+						gate?.open();
+						await releasePurge();
+					}
+					await Promise.all([renaming, sweeping]);
+					expect({
+						deadlocks,
+						paths: await db.paths(),
+						d: (await db.row(d))?.content,
+						refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs ORDER BY path`)).map(found => [
+							String(found.path),
+							String(found.sha256),
+						]),
+					}).toEqual({
+						deadlocks: [],
+						paths: [p, d],
+						d: content,
+						refs: [p, d].map(path => [path, IMAGE_HASH]),
+					});
+				},
+			);
+
+			// A replacing rename whose destination another client creates after the rename read which rows there
+			// are: on MySQL and MariaDB a destination with no row is not locked, and PostgreSQL locks no row that is
+			// not there, so the UPDATE meets the new row on the primary key (1062, 23505). `rename` replaces its
+			// destination, so it runs again, and the next attempt locks and replaces that row.
+			it.skipIf(adapter === "sqlite")(
+				"replaces, through rename, a destination another client creates after the rename read which rows there are",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					let gate: GatedClient | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								client,
+								new RegExp(`^SELECT path FROM \\S*\\b${db.table} WHERE path IN \\(.* FOR UPDATE$`),
+							);
+							return gate.client;
+						},
+					});
+					const other = await db.open({ claims: false });
+					const [src, dst] = ["a-src", "b-dst"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [
+						string,
+						string,
+					];
+					const moved = transcript(ID, "moved");
+					await renamer.writeText(src, moved);
+					await renamer.drain();
+
+					gate?.close();
+					const renaming = renamer.rename(src, dst).then(
+						() => undefined,
+						(err: unknown) => err,
+					);
+					try {
+						await Promise.race([gate?.paused(), renaming]);
+						await other.writeText(dst, transcript(ID, "created meanwhile"));
+						await other.drain();
+					} finally {
+						gate?.open();
+					}
+					const error = await renaming;
+					expect({
+						error: error instanceof Error ? error.message : error,
+						paths: await db.paths(),
+						dst: (await db.row(dst))?.content,
+					}).toEqual({ error: undefined, paths: [dst], dst: moved });
+				},
+			);
+
+			// A rename moves its source's references one key at a time, from a read after it locks the source's row:
+			// another client's append that adds a reference to the source and commits while the rename waits to lock
+			// it is in that read, so its reference moves too. On MySQL a read without a lock inside the rename's
+			// transaction before that lock would fix the snapshot first, and the appended reference would stay behind.
+			it.skipIf(adapter === "sqlite")(
+				"moves every reference of a source another client appends to while the rename waits to lock it",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					let gate: GatedClient | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								client,
+								new RegExp(`^SELECT path FROM \\S*\\b${db.table} WHERE path IN \\(.* FOR UPDATE$`),
+								"before",
+							);
+							return gate.client;
+						},
+					});
+					const appender = await db.open({ claims: false });
+					const [first, second] = [imageBytes(1), imageBytes(2)];
+					for (const data of [first, second]) renamer.blobTier.store(sha256(data), data, "image/png");
+					await renamer.drain();
+					const [src, dst] = ["a-src", "b-dst"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [
+						string,
+						string,
+					];
+					await renamer.writeText(src, transcript(ID, `blob:sha256:${sha256(first)}`));
+					await renamer.drain();
+					await appender.refresh();
+
+					gate?.close();
+					const renaming = renamer.rename(src, dst);
+					try {
+						await Promise.race([gate?.paused(), renaming]);
+						const writer = appender.openWriter(src);
+						await writer.append(transcript(ID, `blob:sha256:${sha256(second)}`));
+						await writer.close();
+					} finally {
+						gate?.open();
+					}
+					await renaming;
+					expect({
+						paths: await db.paths(),
+						refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs ORDER BY sha256`)).map(found => [
+							String(found.path),
+							String(found.sha256),
+						]),
+					}).toEqual({
+						paths: [dst],
+						refs: [sha256(first), sha256(second)].sort().map(hash => [dst, hash]),
+					});
+				},
+			);
 
 			it("lands again, from this machine's blob store, a blob a delete took while a write naming it waited", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");

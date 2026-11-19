@@ -241,7 +241,7 @@ interface DialectQueries {
 	insertRef: Statement;
 	/** The references of `count` paths (path and hash), bound as `@p0` to `@p<count - 1>`. */
 	refsOf(count: number): Statement;
-	/** The hashes the paths under `@dir` (its first `@len` characters) reference. */
+	/** The references (path and hash) of the paths under `@dir` (its first `@len` characters). */
 	refsUnder: Statement;
 	/** Of `count` hashes, the ones a reference row names (PostgreSQL and SQLite; MySQL's is {@link referencedOne}). */
 	referenced(count: number): Statement;
@@ -250,16 +250,12 @@ interface DialectQueries {
 	 * the latest commits, and locks only the first entry of `@h` (or, with none, the gap where it would be).
 	 */
 	referencedOne: Statement | undefined;
-	deleteRefs: Statement;
-	deleteRefsUnder: Statement;
-	/** Hand `@src`'s references to `@dst`. */
-	moveRefs: Statement;
+	/** Drop the reference of `@path` to `@sha256`. */
+	deleteRef: Statement;
 	/** The references (path and hash) of session paths that have no session row (deleted by a build that kept no references). */
 	danglingRefs: Statement;
-	/** Drop the reference of `@path` to `@sha256`; except on MySQL, only while `@path` has no session row (MySQL's caller has locked that row's gap). */
+	/** PostgreSQL and SQLite: drop the reference of `@path` to `@sha256` while `@path` has no session row. */
 	deleteDanglingRef: Statement;
-	/** MySQL: lock shared, in path order, the session rows of `count` paths, or their gaps where there is none; answers the rows there are. */
-	lockSessionRows: ((count: number) => Statement) | undefined;
 	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too (MySQL's caller names, without `under`, only rows there are). */
 	lockSessionRowsForWrite: ((count: number, under: boolean) => Statement) | undefined;
 	/** MySQL: the paths of `count` paths that have a session row, read without a lock. */
@@ -1309,30 +1305,22 @@ function buildQueries(
 				(mysql ? "ON DUPLICATE KEY UPDATE path = path" : "ON CONFLICT (path, sha256) DO NOTHING"),
 		),
 		refsOf: count => sql(`SELECT sha256, path FROM ${refs} WHERE path IN (${inList("p", count)})`),
-		refsUnder: sql(`SELECT sha256 FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
+		refsUnder: sql(`SELECT sha256, path FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
 		referenced: count => sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})`),
 		referencedOne: mysql ? sql(`SELECT sha256 FROM ${refs} WHERE sha256 = @h LIMIT 1 LOCK IN SHARE MODE`) : undefined,
-		deleteRefs: sql(`DELETE FROM ${refs} WHERE path = @path`),
-		deleteRefsUnder: sql(`DELETE FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
-		moveRefs: sql(`UPDATE ${refs} SET path = @dst WHERE path = @src`),
+		deleteRef: sql(`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256`),
 		danglingRefs: sql(
 			`SELECT r.path AS path, r.sha256 AS sha256 FROM ${refs} AS r ` +
 				`WHERE substr(r.path, 1, ${BLOB_PARTS_PATH.length}) <> '${BLOB_PARTS_PATH}' ` +
 				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = r.path)`,
 		),
-		// MySQL: the sweep has locked the path's session row, or its gap, shared (`lockSessionRows`) and found none,
-		// so no row appears before it commits. Elsewhere the statement looks again: PostgreSQL's look takes no lock
-		// (and PostgreSQL locks no gap), and SQLite runs one writer at a time.
+		// The statement looks for the session row again: PostgreSQL's look sees every commit before it, and SQLite
+		// runs one writer at a time. MySQL's sweep reads the rows itself and drops each reference by its key (see
+		// #dropDanglingRefs).
 		deleteDanglingRef: sql(
-			mysql
-				? `DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256`
-				: `DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
-						`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
+			`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
 		),
-		lockSessionRows: mysql
-			? count =>
-					sql(`SELECT path FROM ${table} WHERE path IN (${inList("p", count)}) ORDER BY path LOCK IN SHARE MODE`)
-			: undefined,
 		lockSessionRowsForWrite:
 			adapter === "sqlite"
 				? undefined
@@ -3619,8 +3607,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * names, unless `allowGone`, which only warns. With `replace`, `path`'s
 	 * references are replaced: they are read first, the rows of the blobs
 	 * they name are locked shared together with those of `named` (see
-	 * {@link #lockBlobRows}), and only then are they deleted (when there are
-	 * any) and `named`'s inserted. So every reference this deletes or inserts
+	 * {@link #lockBlobRows}), and only then are those `named` lacks deleted,
+	 * each by its key, and `named`'s inserted. So every reference this deletes or inserts
 	 * names a row this transaction holds, as on every other path that
 	 * changes references.
 	 */
@@ -3633,7 +3621,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	): Promise<void> {
 		const current = replace ? (await this.#refsOf(transaction, [path])).map(row => row.sha256) : [];
 		const locked = await this.#lockBlobRows(transaction, [...named, ...current]);
-		if (current.length > 0) await run(transaction, this.#q.deleteRefs, { path });
+		// Only the references the content no longer names (or whose blob is gone) go, each by its key: a delete of
+		// the path's whole range locks, on MySQL, the gap after it, even when the content names the same blobs.
+		for (const sha256 of current) {
+			if (!named.has(sha256) || !locked.has(sha256)) await run(transaction, this.#q.deleteRef, { path, sha256 });
+		}
 		for (const sha256 of named) if (locked.has(sha256)) await run(transaction, this.#q.insertRef, { path, sha256 });
 		const gone = [...named].filter(hash => !locked.has(hash) && this.blobs.knows(hash));
 		if (gone.length === 0) return;
@@ -3826,19 +3818,23 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 */
 	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
 		if (apply) {
-			// The references of paths that have no session row, each dropped in the lock order every path takes:
-			// the paths' session rows (or their gaps) first, then the blobs' rows, then the reference.
+			// The references of paths that have no session row, each dropped with its blob's row locked exclusive.
 			const dangling = (await this.#exclusive(() => this.#readOne(this.#q.danglingRefs, {}))) as RefRow[];
 			const byHash = new Map<string, string[]>();
 			for (const row of dangling) byHash.set(row.sha256, [...(byHash.get(row.sha256) ?? []), row.path]);
 			for (const batch of batches([...byHash.keys()].sort(), BLOB_READ_BATCH)) {
 				await this.#fencedTransaction([], async transaction => {
-					const paths = [...new Set(batch.flatMap(sha256 => byHash.get(sha256) ?? []))];
-					const present = await this.#lockSessionRows(transaction, paths);
+					const look = this.#q.sessionRowsOf;
+					if (look) {
+						await this.#dropDanglingRefs(transaction, look, batch, byHash);
+						return;
+					}
+					// PostgreSQL's delete looks for the session row itself (see deleteDanglingRef); SQLite runs one
+					// writer at a time.
 					await this.#lockBlobRows(transaction, [], batch);
 					for (const sha256 of batch) {
 						for (const path of byHash.get(sha256) ?? []) {
-							if (!present.has(path)) await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
+							await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
 						}
 					}
 				});
@@ -3887,10 +3883,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
+		const there = under ? undefined : await this.#sessionRowsThere(paths);
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
-			const present = await this.#lockSessionRowsForWrite(transaction, paths, under);
+			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
 			const ordered = [...new Set(paths)].sort();
 			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
 			for (const path of ordered) {
@@ -3911,22 +3908,42 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		const fences = this.#fencesOf([src, dst]);
 		await this.#awaitClaims(fences);
+		// A replacing rename whose `dst` another client creates after the read of which rows there are (on MySQL a
+		// `dst` with no row is not locked; PostgreSQL locks no row that is not there) meets that row in its
+		// UPDATE, on the primary key. It runs again, bounded as a deadlock's retry: the next attempt reads `dst`,
+		// locks it in path order, and replaces it. `noReplace` rejects with EEXIST instead.
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await this.#moveOnce(src, dst, mtimeMs, noReplace, fences);
+				break;
+			} catch (err) {
+				if (!isPrimaryKeyViolation(err)) throw err;
+				if (noReplace) throw eexist(dst);
+				if (attempt >= WRITE_ATTEMPTS) throw err;
+			}
+		}
+		this.#moveLease(src, dst);
+	}
+
+	async #moveOnce(
+		src: string,
+		dst: string,
+		mtimeMs: number,
+		noReplace: boolean,
+		fences: readonly LeaseFence[],
+	): Promise<void> {
+		const there = await this.#sessionRowsThere([src, dst]);
 		await this.#fencedTransaction(fences, async transaction => {
-			// Both session rows first, in path order, before either changes; only rows there are change.
-			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst]);
+			// Both session rows first, in path order, before either changes; only rows there are change. A `dst`
+			// with no row is taken by the UPDATE below, after `src`'s (see docs/session.md, "Races").
+			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
 			if (present && !present.has(src)) throw enoent(src);
 			if (!noReplace && (!present || present.has(dst))) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
 			// row that exists, or that another client inserts concurrently (the
 			// UPDATE waits on its uncommitted key); the thrown error rolls the
 			// transaction back with both paths untouched.
-			let result: SqlSessionStorageResult;
-			try {
-				result = await run(transaction, this.#q.renameRow, { src, dst, mtime: mtimeMs });
-			} catch (err) {
-				if (noReplace && isPrimaryKeyViolation(err)) throw eexist(dst);
-				throw err;
-			}
+			const result = await run(transaction, this.#q.renameRow, { src, dst, mtime: mtimeMs });
 			const moved = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
 			if (!moved) throw enoent(src);
 			// Both rows are locked now, before the parts look (see #deleteParts):
@@ -3937,13 +3954,19 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				await run(transaction, this.#q.renameParts, { src, dst });
 			}
 			// The references change last, the rows of every blob they name locked first: the replaced session's
-			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared).
+			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared). Each moves by
+			// its key: an UPDATE of `src`'s range would lock, on MySQL, next-key ranges over it and the gap after,
+			// then insert into `dst`'s gap, where another rename's range can lie. `src`'s row is locked before this
+			// transaction's first read, and every write that adds a path's references takes its row first (the
+			// open-time write-back aside, which adds what the transcript names already), so the read misses none.
 			const moving = (await this.#refsOf(transaction, [src])).map(row => row.sha256);
 			const replaced = await this.#takeRefs(transaction, [dst], undefined, moving);
-			if (moving.length > 0) await run(transaction, this.#q.moveRefs, { src, dst });
+			for (const sha256 of moving) {
+				await run(transaction, this.#q.deleteRef, { path: src, sha256 });
+				await run(transaction, this.#q.insertRef, { path: dst, sha256 });
+			}
 			await this.#deleteOrphans(transaction, replaced);
 		});
-		this.#moveLease(src, dst);
 	}
 
 	/**
@@ -3952,7 +3975,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * and the rows of their parts, are locked exclusive in one pass before any
 	 * reference goes, with the rows of `alsoShared` (blobs whose references
 	 * the caller changes next) locked shared in the same pass (see
-	 * {@link #lockBlobRows}).
+	 * {@link #lockBlobRows}). Each reference goes by its key: a delete of a
+	 * path's range, or of a directory's (a scan of the whole table), locks on
+	 * MySQL every row and gap it passes. The caller locked the paths' session
+	 * rows before the read, so it misses no reference a write of them added.
 	 */
 	async #takeRefs(
 		transaction: SqlSessionStorageTransaction,
@@ -3961,15 +3987,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		alsoShared: readonly string[] = [],
 	): Promise<string[]> {
 		const rows = await this.#refsOf(transaction, paths);
-		const below = under ? ((await run(transaction, this.#q.refsUnder, under)) as HashRow[]) : [];
+		const below = under ? ((await run(transaction, this.#q.refsUnder, under)) as RefRow[]) : [];
 		const hashes = [...new Set([...rows, ...below].map(row => row.sha256))];
 		const locked = await this.#lockBlobRows(transaction, alsoShared, [
 			...hashes,
 			...(await this.#partsOf(transaction, hashes)),
 		]);
-		// Only paths that have references: a delete that finds no row still locks a gap on MySQL.
-		for (const path of new Set(rows.map(row => row.path))) await run(transaction, this.#q.deleteRefs, { path });
-		if (under && below.length > 0) await run(transaction, this.#q.deleteRefsUnder, under);
+		const taken = new Map([...rows, ...below].map(row => [`${row.sha256} ${row.path}`, row]));
+		for (const row of taken.values()) {
+			await run(transaction, this.#q.deleteRef, { path: row.path, sha256: row.sha256 });
+		}
 		return hashes.filter(hash => locked.has(hash));
 	}
 
@@ -3989,41 +4016,56 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
+	 * MySQL and MariaDB: which of `paths` have a session row, read without a
+	 * lock before the transaction that locks them (see
+	 * {@link #lockSessionRowsForWrite}). Read outside it, so that
+	 * transaction's first consistent read, which fixes its REPEATABLE READ
+	 * snapshot, comes after its locks: the parts and references it then reads
+	 * hold every write of those paths that committed. Elsewhere `undefined`.
+	 */
+	async #sessionRowsThere(paths: readonly string[]): Promise<ReadonlySet<string> | undefined> {
+		const look = this.#q.sessionRowsOf;
+		if (!look) return undefined;
+		const ordered = [...new Set(paths)].sort();
+		const rows = (await this.#readOne(look(ordered.length), listValues("p", ordered))) as PathRow[];
+		return new Set(rows.map(row => row.path));
+	}
+
+	/**
 	 * Lock exclusive, in path order, the session rows of `paths` and, with
 	 * `under`, every row under its directory, before a delete or a rename
 	 * changes any of them: the store's lock order (see {@link #lockBlobRows}).
-	 * On MySQL and MariaDB, without `under`, only rows there are are locked,
-	 * read first without a lock, as {@link #lockBlobRows} does for blob rows:
-	 * a locking read of a missing path locks its gap, and an insert into that
-	 * gap at another path (a rename's destination, a new session) would wait
-	 * for it. Then it answers the paths whose rows it locked, and the caller
-	 * changes only those. With `under` MySQL can use no index (`substr`), so
-	 * the lock scans and locks every row, gaps too, in path order, as the
-	 * directory's `DELETE` that follows does anyway. PostgreSQL locks no gap.
-	 * Elsewhere nothing is answered; SQLite runs one writer at a time.
+	 * On MySQL and MariaDB, without `under`, only the rows `there` names are
+	 * locked (see {@link #sessionRowsThere}), as {@link #lockBlobRows} does for
+	 * blob rows: a locking read of a missing path locks its gap, and an insert
+	 * into that gap at another path (a rename's destination, a new session)
+	 * would wait for it. Then it answers the paths whose rows it locked, and
+	 * the caller changes only those. With `under` MySQL can use no index
+	 * (`substr`), so the lock scans and locks every row, gaps too, in path
+	 * order, as the directory's `DELETE` that follows does anyway. PostgreSQL
+	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
+	 * time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
+		there: ReadonlySet<string> | undefined,
 		under?: { dir: string; len: number },
 	): Promise<ReadonlySet<string> | undefined> {
 		const lock = this.#q.lockSessionRowsForWrite;
 		if (!lock) return undefined;
 		const ordered = [...new Set(paths)].sort();
-		const look = this.#q.sessionRowsOf;
-		if (!look || under) {
+		if (!there || under) {
 			await run(transaction, lock(ordered.length, under !== undefined), {
 				...listValues("p", ordered),
 				...(under ?? {}),
 			});
 			return undefined;
 		}
-		const there = ((await run(transaction, look(ordered.length), listValues("p", ordered))) as PathRow[])
-			.map(row => row.path)
-			.sort();
 		// One key per statement (see #lockBlobRows): MySQL may plan an IN list as a scan, which locks other rows.
 		const present = new Set<string>();
-		for (const path of there) {
+		for (const path of ordered) {
+			if (!there.has(path)) continue;
 			const rows = (await run(transaction, lock(1, false), listValues("p", [path]))) as PathRow[];
 			for (const row of rows) present.add(row.path);
 		}
@@ -4040,24 +4082,50 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * Lock shared, in path order, the session rows of `paths`, and on MySQL
-	 * and MariaDB the gap of each that has none, so no session row appears
-	 * at those paths until this transaction ends; answers the paths whose
-	 * rows there are. Elsewhere nothing is locked and nothing is answered:
-	 * PostgreSQL locks no gap, so the statement that relies on a path having
-	 * no row looks again itself, without a lock, and SQLite runs one writer
-	 * at a time.
+	 * MySQL and MariaDB: drop the references of `batch`'s blobs from the
+	 * paths `byHash` lists for each, paths that had no session row when the
+	 * sweep read them. The blobs' rows are locked exclusive first, with no
+	 * read before the locks (see {@link #lockBlobRows}); only then are the
+	 * paths' session rows (by `look`) and references read, without a lock.
+	 * Those reads are the transaction's first consistent read, so its
+	 * REPEATABLE READ snapshot is taken after the locks. Every write that
+	 * adds, moves or deletes a reference to one of these blobs takes the
+	 * blob's row before and keeps it until it commits, so the snapshot holds
+	 * each such write that committed, and none runs until this one commits.
+	 * A reference is dropped only where the snapshot has it and has no
+	 * session row at its path: a write creating the path meanwhile, not yet
+	 * committed, then waits for the blob's row and references it again.
+	 *
+	 * No session row is locked, nor a gap. A dangling path's row is often one
+	 * that was just deleted, which InnoDB keeps, delete-marked, until purge
+	 * removes it. A lock on that row made a write that creates the path again
+	 * wait in its insert's duplicate check; when purge removed the row, InnoDB
+	 * turned the waiting lock into a gap lock granted to the write (it keeps a
+	 * constraint check's lock that way), and two writes creating paths in one
+	 * gap each waited to insert into the gap the other held: a deadlock.
 	 */
-	async #lockSessionRows(transaction: SqlSessionStorageTransaction, paths: readonly string[]): Promise<Set<string>> {
+	async #dropDanglingRefs(
+		transaction: SqlSessionStorageTransaction,
+		look: (count: number) => Statement,
+		batch: readonly string[],
+		byHash: ReadonlyMap<string, readonly string[]>,
+	): Promise<void> {
+		await this.#lockBlobRows(transaction, [], batch, false);
+		const paths = [...new Set(batch.flatMap(sha256 => byHash.get(sha256) ?? []))];
 		const present = new Set<string>();
-		const query = this.#q.lockSessionRows;
-		if (!query) return present;
-		// One key per statement, as in #lockSessionRowsForWrite: each missing path locks its own gap and no other.
-		for (const path of [...new Set(paths)].sort()) {
-			const rows = (await run(transaction, query(1), listValues("p", [path]))) as PathRow[];
-			for (const row of rows) present.add(row.path);
+		for (const group of batches(paths, BLOB_READ_BATCH)) {
+			for (const row of (await run(transaction, look(group.length), listValues("p", group))) as PathRow[]) {
+				present.add(row.path);
+			}
 		}
-		return present;
+		// Only references there are: a delete that finds no row still locks a gap on MySQL.
+		const there = new Set((await this.#refsOf(transaction, paths)).map(row => `${row.sha256} ${row.path}`));
+		for (const sha256 of batch) {
+			for (const path of byHash.get(sha256) ?? []) {
+				if (present.has(path) || !there.has(`${sha256} ${path}`)) continue;
+				await run(transaction, this.#q.deleteRef, { path, sha256 });
+			}
+		}
 	}
 
 	/**
@@ -4067,8 +4135,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *   1. the lease rows of a fenced write (the member's fence);
 	 *   2. session rows (and the parts under them), in path order, all locked
 	 *      before any of them changes: a write's own row, a delete's and a
-	 *      rename's rows (see {@link #lockSessionRowsForWrite}), the sweep's
-	 *      dangling paths' rows or gaps (see {@link #lockSessionRows});
+	 *      rename's rows (see {@link #lockSessionRowsForWrite}), but for a
+	 *      rename's destination with no row, which its UPDATE takes after the
+	 *      source's (see docs/session.md, "Races"); the sweep locks none (see
+	 *      {@link #dropDanglingRefs});
 	 *   3. blob rows, here, in one pass in `sha256` order, parents and parts
 	 *      together (shared for `shared`, exclusive for `exclusive`; a hash in
 	 *      both is locked exclusive); a delete reads a parted blob's part list
@@ -4089,22 +4159,28 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * changing table as a scan of the whole primary key, which waits for and
 	 * locks every row it passes, rows of other keys too, from the lowest key.
 	 * SQLite runs one write at a time, and only reads which rows there are.
+	 * Without `look`, every key is locked with no read before, for a caller
+	 * whose first consistent read must come after the locks (see
+	 * {@link #dropDanglingRefs}); its keys are rows a reference named when it
+	 * read them, and a key whose row went since locks only the gap where the
+	 * row was, keeping out an insert of a blob there until this commits.
 	 */
 	async #lockBlobRows(
 		transaction: SqlSessionStorageTransaction,
 		shared: Iterable<string>,
 		exclusive: Iterable<string> = [],
+		look = true,
 	): Promise<Set<string>> {
 		const modes = new Map<string, boolean>();
 		for (const hash of shared) modes.set(hash, false);
 		for (const hash of exclusive) modes.set(hash, true);
 		const locked = new Set<string>();
 		for (const batch of batches([...modes.keys()].sort(), BLOB_READ_BATCH)) {
-			const there = new Set(
-				((await run(transaction, this.#q.selectBlobSizes(batch.length), listValues("h", batch))) as HashRow[]).map(
-					row => row.sha256,
-				),
-			);
+			let there = new Set(batch);
+			if (look) {
+				const rows = await run(transaction, this.#q.selectBlobSizes(batch.length), listValues("h", batch));
+				there = new Set((rows as HashRow[]).map(row => row.sha256));
+			}
 			// One statement per run of rows of one mode, so the rows are locked in `sha256` order across modes; on
 			// MySQL one statement per row.
 			let group: string[] = [];
