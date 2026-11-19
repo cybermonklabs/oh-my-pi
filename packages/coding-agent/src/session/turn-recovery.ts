@@ -24,6 +24,7 @@ import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-credit";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
+import { productIdentityKey } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong, sleepUntil } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -406,28 +407,6 @@ function isUsageSpent(health: ModelUsageHealth): boolean {
 	);
 }
 
-/**
- * The key of the one model `model` is by its catalog identity: vendor class,
- * product family and revision, which the same model served by another
- * provider shares (`anthropic/claude-opus-4-8` and
- * `google-vertex/claude-opus-4-8@default`). Undefined when the identity names
- * no one model: an id the catalog does not classify (class `unknown`), or one
- * with no family or no revision, whose class, or class and family, span
- * several models (`openai/gpt-4o` and `openai/gpt-4o-mini` carry no revision).
- * The key is as fine as the catalog's taxonomy: where one family and revision
- * span several products (OpenAI's `gpt` 5.6 covers `gpt-5.6`, `gpt-5.6-sol`
- * and `gpt-5.6-luna`), those share one key. The effort tier and the thinking
- * variant are left out, as the refusal walk leaves out the thinking level:
- * they mark the same model at another effort.
- */
-function refusalIdentityKey(model: Model): string | undefined {
-	const { identity } = model;
-	if (!identity || identity.class === "unknown" || identity.family === undefined || identity.revision === undefined) {
-		return undefined;
-	}
-	return `${identity.class}/${identity.family}/${identity.revision}`;
-}
-
 /** A fallback candidate and the chain key it was found under. */
 interface RetryFallbackEntry {
 	role: string;
@@ -517,8 +496,10 @@ export class TurnRecovery {
 	 */
 	readonly #refusedModels = new Set<string>();
 	/**
-	 * `refusalIdentityKey` of each such model whose identity names one model, which the same
-	 * model served by another provider shares. Cleared with `#refusalWalkTried`.
+	 * The catalog's product key (`productIdentityKey`) of each such model that has one, which the
+	 * same model on another provider, under another spelling or on a route of it shares, and which
+	 * different products that share a class, family and revision do not. Cleared with
+	 * `#refusalWalkTried`.
 	 */
 	readonly #refusedIdentities = new Set<string>();
 	/**
@@ -1025,19 +1006,20 @@ export class TurnRecovery {
 	/**
 	 * Whether `model` refused in the current retry saga, under any name: by its `provider/id`,
 	 * which every spelling and route that resolves to it shares (an alias such as `pi/default`,
-	 * an id without the catalog revision suffix, `@upstream`), or by `refusalIdentityKey`, which
-	 * the same model served by another provider shares.
+	 * an id without the catalog revision suffix, `@upstream`), or by its product key
+	 * (`productIdentityKey`), which the same model served by another provider or on another route
+	 * shares.
 	 */
 	#refusedInTurn(model: Model): boolean {
 		if (this.#refusedModels.has(`${model.provider}/${model.id}`)) return true;
-		const identity = refusalIdentityKey(model);
+		const identity = productIdentityKey(model);
 		return identity !== undefined && this.#refusedIdentities.has(identity);
 	}
 
 	/** Records `model`, the model a classifier refusal came from, by both keys `#refusedInTurn` reads. */
 	#recordRefusedModel(model: Model): void {
 		this.#refusedModels.add(`${model.provider}/${model.id}`);
-		const identity = refusalIdentityKey(model);
+		const identity = productIdentityKey(model);
 		if (identity !== undefined) this.#refusedIdentities.add(identity);
 	}
 
