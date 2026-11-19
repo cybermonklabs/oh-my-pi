@@ -10,6 +10,7 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{io, time::Duration};
 

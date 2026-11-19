@@ -1,5 +1,6 @@
 //! Drive a shell on a pseudo-terminal (Unix): obash under any name (`zsh`,
-//! `bash`, `sh`) or a real shell (`/bin/zsh`) for differential runs.
+//! `bash`, `sh`) or the real zsh ([`crate::zsh_oracle`]) for differential
+//! runs.
 //!
 //! [`Spawn`] describes the process: program, `argv[0]`, arguments, a
 //! hermetic environment (`PATH` of the runner, `HOME` and `ZDOTDIR` a fresh
@@ -61,9 +62,6 @@ pub use self::vt::Screen;
 /// The default bound of every wait.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The real zsh for differential runs.
-pub const REAL_ZSH: &str = "/bin/zsh";
-
 /// The script [`Spawn::zle_sync`] writes into the home directory; a
 /// zsh-like shell (obash as `zsh`, the real zsh) sources it
 /// (`. ~/.zle-sync`) to answer [`Pty::zle_sync`]. It opens a FIFO and
@@ -85,10 +83,11 @@ pub fn obash() -> &'static str {
 	env!("CARGO_BIN_EXE_obash")
 }
 
-/// Whether the real zsh exists here (differential tests skip without it).
+/// Whether the real zsh exists here; differential tests compare nothing
+/// without it, and say so ([`crate::zsh_oracle::exists`]).
 #[must_use]
 pub fn have_real_zsh() -> bool {
-	Path::new(REAL_ZSH).exists()
+	crate::zsh_oracle::exists()
 }
 
 /// A shell process to start on a pty.
@@ -150,10 +149,10 @@ impl Spawn {
 		Self::obash_as("zsh")
 	}
 
-	/// The real zsh ([`REAL_ZSH`]), invoked as `zsh`.
+	/// The real zsh ([`crate::zsh_oracle::path`]), invoked as `zsh`.
 	#[must_use]
 	pub fn real_zsh() -> Self {
-		Self::new(REAL_ZSH).argv0("zsh")
+		Self::new(crate::zsh_oracle::path()).argv0("zsh")
 	}
 
 	/// `argv[0]` (default: the program path).

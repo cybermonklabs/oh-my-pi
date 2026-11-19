@@ -10,23 +10,21 @@
 #![cfg(unix)]
 
 mod obash_support;
+mod zsh_oracle;
 
 use std::{
 	fs,
 	os::unix::process::CommandExt,
 	path::{Path, PathBuf},
-	process::Command,
 	time::Duration,
 };
 
 use crate::obash_support::{command, finish, obash};
 
-/// Whether `/bin/zsh` is the oracle.
+/// Whether the real zsh is zsh 5.9, the oracle (it reports the test
+/// uncompared when not).
 fn have_zsh() -> bool {
-	let Ok(out) = Command::new("/bin/zsh").arg("--version").output() else {
-		return false;
-	};
-	String::from_utf8_lossy(&out.stdout).starts_with("zsh 5.9 ")
+	zsh_oracle::is_zsh_5_9()
 }
 
 /// A scratch directory of its own.
@@ -41,7 +39,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// zsh (`real`) or obash: stdout, stderr, status.
 fn run(real: bool, script: &str, args: &[String]) -> (String, String, i32) {
 	let mut cmd = if real {
-		command("/bin/zsh")
+		command(zsh_oracle::path())
 	} else {
 		let mut c = obash();
 		c.arg0("zsh");

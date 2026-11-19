@@ -7,8 +7,9 @@
 #![cfg(unix)]
 
 mod obash_support;
+mod zsh_oracle;
 
-use std::{os::unix::process::CommandExt, path::Path, process::Command};
+use std::{os::unix::process::CommandExt, process::Command};
 
 use crate::obash_support::{command, obash, output};
 
@@ -79,8 +80,8 @@ zsh:chown:5: 4294967: no such user
 zsh:chown:6: d: no such file or directory
 "
 	);
-	if Path::new("/bin/zsh").exists() {
-		assert_eq!(ours, run_in_tempdir(command("/bin/zsh"), script));
+	if zsh_oracle::exists() {
+		assert_eq!(ours, run_in_tempdir(command(zsh_oracle::path()), script));
 	}
 }
 

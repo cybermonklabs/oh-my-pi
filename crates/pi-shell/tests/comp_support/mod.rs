@@ -4,8 +4,8 @@
 //! the port of zsh's `Test/comptest` harness ([`comptest`]).
 //!
 //! Environment switches (both crates read them):
-//! - `PI_COMP_ORACLE=1` runs `/bin/zsh` instead of obash, checking the stored
-//!   expectations against zsh itself.
+//! - `PI_COMP_ORACLE=1` runs the real zsh ([`crate::zsh_oracle::path`]) instead
+//!   of obash, checking the stored expectations against zsh itself.
 //! - `PI_COMP_BLESS=1` (with `PI_COMP_ORACLE=1`) rewrites the stored screen
 //!   snapshots of `zsh_comp_pty` from `/bin/zsh`.
 //! - `PI_COMP_QUIET_MS` how long output must stay quiet before a screen is read
@@ -21,9 +21,9 @@ use std::{
 	time::Duration,
 };
 
-use crate::pty_support::{REAL_ZSH, Spawn, have_real_zsh};
+use crate::pty_support::{Spawn, have_real_zsh};
 
-/// Whether `/bin/zsh` runs instead of obash (`PI_COMP_ORACLE`).
+/// Whether the real zsh runs instead of obash (`PI_COMP_ORACLE`).
 #[must_use]
 pub fn oracle() -> bool {
 	flag("PI_COMP_ORACLE")
@@ -53,11 +53,11 @@ pub fn quiet() -> Duration {
 ///
 /// # Panics
 ///
-/// In oracle mode without `/bin/zsh`.
+/// In oracle mode without the real zsh ([`crate::zsh_oracle::path`]).
 #[must_use]
 pub fn shell() -> Spawn {
 	if oracle() {
-		assert!(have_real_zsh(), "PI_COMP_ORACLE needs {REAL_ZSH}");
+		assert!(have_real_zsh(), "PI_COMP_ORACLE needs {}", crate::zsh_oracle::path().display());
 		Spawn::real_zsh()
 	} else {
 		Spawn::zsh()
@@ -68,10 +68,12 @@ pub fn shell() -> Spawn {
 /// (`_main_complete`, `compinit`, ...) as installed: one flat directory
 /// (macOS, `/usr/share/zsh/5.9/functions`) or the source-tree layout
 /// (Debian, `/usr/share/zsh/functions/Completion/Base`, ...). `None` when
-/// neither exists; the tests then skip.
+/// neither exists: the tests then compare nothing, and the calling test
+/// is reported [`crate::zsh_oracle::uncompared`].
 #[must_use]
 pub fn compsys_fpath() -> Option<Vec<PathBuf>> {
-	for root in ["/usr/share/zsh/5.9/functions", "/usr/share/zsh/functions"] {
+	const ROOTS: [&str; 2] = ["/usr/share/zsh/5.9/functions", "/usr/share/zsh/functions"];
+	for root in ROOTS {
 		let root = Path::new(root);
 		if root.join("_main_complete").is_file() && root.join("compinit").is_file() {
 			return Some(vec![root.to_owned()]);
@@ -85,6 +87,10 @@ pub fn compsys_fpath() -> Option<Vec<PathBuf>> {
 			return Some(dirs);
 		}
 	}
+	crate::zsh_oracle::uncompared(&format!(
+		"zsh 5.9's completion functions are not installed (no _main_complete under {})",
+		ROOTS.join(" or ")
+	));
 	None
 }
 

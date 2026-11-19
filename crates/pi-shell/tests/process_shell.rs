@@ -1,15 +1,16 @@
 //! `pi_shell::process` command-line behavior and interactive prompts,
-//! with zsh parity checked against `/bin/zsh`.
+//! with zsh parity checked against the real zsh ([`zsh_oracle`]).
 
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
-use std::{io, os::unix::process::CommandExt, path::Path, process::Command};
+use std::{ffi::OsStr, io, os::unix::process::CommandExt, process::Command};
 
 use pty_support::{Spawn, TIMEOUT};
 
-fn run(program: &str, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+fn run(program: impl AsRef<OsStr>, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
 	let out = Command::new(program)
 		.arg0("zsh")
 		.args(args)
@@ -23,8 +24,9 @@ fn obash(args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
 	run(env!("CARGO_BIN_EXE_obash"), args)
 }
 
+/// Whether the real zsh exists (it reports the test uncompared when not).
 fn have_zsh() -> bool {
-	Path::new("/bin/zsh").exists()
+	zsh_oracle::exists()
 }
 
 #[test]
@@ -91,7 +93,7 @@ fn help_is_zshs_in_each_emulation() {
 		let (out, err, status) = obash(args);
 		assert_eq!(
 			String::from_utf8_lossy(&out),
-			String::from_utf8_lossy(&run("/bin/zsh", args).0),
+			String::from_utf8_lossy(&run(zsh_oracle::path(), args).0),
 			"{args:?}"
 		);
 		assert!(err.is_empty(), "{args:?}: {}", String::from_utf8_lossy(&err));
@@ -120,7 +122,7 @@ fn command_strings_and_exit_statuses_match_zsh() {
 		&["-f", "-c", "yes | head -1"],
 		&["-f", "--no-such-option"],
 	] {
-		assert_eq!(obash(args), run("/bin/zsh", args), "{args:?}");
+		assert_eq!(obash(args), run(zsh_oracle::path(), args), "{args:?}");
 	}
 }
 
@@ -157,6 +159,6 @@ fn a_background_pipelines_bang_is_its_last_process() {
 	let ours = obash(&args);
 	assert_eq!(ours, (b"last\n".to_vec(), Vec::new(), Some(0)));
 	if have_zsh() {
-		assert_eq!(ours, run("/bin/zsh", &args));
+		assert_eq!(ours, run(zsh_oracle::path(), &args));
 	}
 }

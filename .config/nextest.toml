@@ -49,3 +49,17 @@ threads-required = "num-test-threads"
 [[profile.ci.overrides]]
 filter = 'test(/^rsync::conformance::/)'
 threads-required = "num-test-threads"
+
+# pi-shell's differential tests compare obash with the real zsh 5.9 and its
+# completion functions where the machine has them, and compare nothing where
+# it does not. Such a test passes either way, so it says so on stderr:
+# `UNCOMPARED: <test>: <reason>` (tests/zsh_oracle). A passing test's output
+# is hidden by default, so show these tests' output: a run on a machine
+# without zsh 5.9 names every test that compared nothing.
+[[profile.default.overrides]]
+filter = 'package(pi-shell) & binary(/^(process_shell|pty_harness|zle_hist_pty|zle_pty|zle_widgets_pty|zsh_comp_pty|zsh_comp_y0[123]|zsh_compctl_pty|zsh_computil_args_pty|zsh_computil_pty|zsh_jobs_pty|zsh_mod_curses|zsh_mod_files|zsh_mod_rlimits|zsh_mod_watch|zsh_parity_pty|zsh_zcompile)$/)'
+success-output = "immediate"
+
+[[profile.ci.overrides]]
+filter = 'package(pi-shell) & binary(/^(process_shell|pty_harness|zle_hist_pty|zle_pty|zle_widgets_pty|zsh_comp_pty|zsh_comp_y0[123]|zsh_compctl_pty|zsh_computil_args_pty|zsh_computil_pty|zsh_jobs_pty|zsh_mod_curses|zsh_mod_files|zsh_mod_rlimits|zsh_mod_watch|zsh_parity_pty|zsh_zcompile)$/)'
+success-output = "immediate"

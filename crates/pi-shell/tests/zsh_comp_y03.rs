@@ -15,6 +15,7 @@
 
 mod comp_support;
 mod pty_support;
+mod zsh_oracle;
 
 use comp_support::comptest::{
 	Case,

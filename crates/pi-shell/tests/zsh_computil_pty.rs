@@ -15,6 +15,7 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{fs, io, path::Path, time::Duration};
 

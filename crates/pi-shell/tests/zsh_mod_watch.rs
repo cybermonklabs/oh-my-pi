@@ -1,13 +1,15 @@
 //! zsh/watch on the real host's login database (utmpx), through the obash
 //! binary run as `zsh -f -c SCRIPT`. The sessions depend on the machine,
-//! so each script is compared with `/bin/zsh -f -c SCRIPT` 5.9 run the
-//! same way (skipped where there is no `/bin/zsh`).
+//! so each script is compared with the real zsh 5.9 (`zsh -f -c SCRIPT`,
+//! [`zsh_oracle`]) run the same way; nothing is compared, and the test
+//! says so, where there is none.
 
 #![cfg(unix)]
 
 mod obash_support;
+mod zsh_oracle;
 
-use std::{os::unix::process::CommandExt, path::Path, process::Command};
+use std::{os::unix::process::CommandExt, process::Command};
 
 use crate::obash_support::{command, obash, output};
 
@@ -22,13 +24,13 @@ fn run(mut shell: Command, script: &str) -> (String, String, i32) {
 	)
 }
 
-/// `script` under obash and under `/bin/zsh` give the same output and
+/// `script` under obash and under the real zsh give the same output and
 /// status.
 fn same_as_zsh(script: &str) {
-	if !Path::new("/bin/zsh").exists() {
+	if !zsh_oracle::exists() {
 		return;
 	}
-	let want = run(command("/bin/zsh"), script);
+	let want = run(command(zsh_oracle::path()), script);
 	let mut cmd = obash();
 	cmd.arg0("zsh");
 	assert_eq!(run(cmd, script), want, "{script}");

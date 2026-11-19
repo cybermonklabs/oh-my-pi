@@ -18,6 +18,7 @@
 
 mod comp_support;
 mod pty_support;
+mod zsh_oracle;
 
 use std::{fmt::Write as _, fs, io, path::PathBuf, time::Duration};
 
@@ -108,7 +109,6 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 /// Record the case and compare it with (or, blessing, write) its snapshot.
 fn check(name: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) {
 	let Some(fpath) = compsys_fpath() else {
-		eprintln!("skipped: zsh 5.9 completion functions are not installed");
 		return;
 	};
 	let got = match record(&fpath_words(&fpath), setup, rc, steps, what) {
