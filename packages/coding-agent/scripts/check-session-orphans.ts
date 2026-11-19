@@ -11,16 +11,21 @@
  * `stored orphans` counts what is on disk; `replayed orphans` counts what the
  * rebuilt model context still sends. The fix leaves the file untouched and
  * makes the second number 0, so one run shows the before and the after. Exit
- * status is 1 when any session still replays one.
+ * status is 1 when any session still replays one. Both counts read the
+ * entries as a resume holds them: with the session's `tool_result_prune` and
+ * `entry_patch` records applied, so a failed turn a later turn continued from
+ * stays in the replayed context.
  *
  * Read-only: no lock is taken and nothing is written, so it is safe against a
  * session a live agent is writing.
  */
 import { isSyntheticToolResultMessage, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { applyEntryPatches } from "../src/session/entry-patches";
 import { buildSessionContext } from "../src/session/session-context";
 import { loadEntriesFromFile } from "../src/session/session-loader";
 import { migrateToCurrentVersion } from "../src/session/session-migrations";
 import type { SessionEntry } from "../src/session/session-entries";
+import { applyToolResultPrunes } from "../src/session/tool-result-prunes";
 
 interface Report {
 	file: string;
@@ -57,6 +62,9 @@ function countOrphans(messages: AgentMessage[]): { synthetic: number; orphans: n
 async function inspect(file: string): Promise<Report> {
 	const entries = await loadEntriesFromFile(file, undefined, { throwIfMissing: true });
 	migrateToCurrentVersion(entries);
+	// The records a resume applies, in its order: blanked results, then patched fields (`continued` among them).
+	applyToolResultPrunes(entries);
+	applyEntryPatches(entries);
 	const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
 
 	// On disk: every persisted message, no pairing repair of any kind.
