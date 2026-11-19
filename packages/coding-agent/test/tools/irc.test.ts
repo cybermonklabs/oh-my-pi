@@ -632,8 +632,8 @@ describe("IRC", () => {
 
 			// Regressed: a subagent answers the peer that woke it, its earlier job is evicted after the
 			// turn went idle, and the wake relay sends the peer that answer a second time; or a parked
-			// subagent keeps its IRC state, or its owner's question outlives the answer to it.
-			it("keeps an idle agent's marks when its last job is evicted, and forgets both sides once it parks", async () => {
+			// subagent keeps its own IRC state, or its owner's question outlives the answer to it.
+			it("keeps an idle agent's marks when its last job is evicted; once it parks, drops its own and the direct marks on both sides, and keeps a live sender's sent marks", async () => {
 				registerAgents("0-Main", "0-Sub", "0-Peer");
 				const manager = jobManager();
 				const job = startSubJob(manager);
@@ -652,7 +652,8 @@ describe("IRC", () => {
 
 				expect(registry.get("0-Sub")?.status).toBe("parked");
 				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the parked agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 				expect(bus.unansweredSends("0-Peer", 0)).toEqual([]);
 			});
@@ -683,7 +684,8 @@ describe("IRC", () => {
 				const lifecycle = AgentLifecycleManager.global();
 				lifecycle.adopt("0-Sub", { idleTtlMs: 0, revive: async () => revived.session });
 				await lifecycle.park("0-Sub");
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the parked agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 
 				const question = await bus.send({ from: "0-Main", to: "0-Sub", body: "and the second word?" });
 				expect(question.outcome).toBe("revived");
@@ -705,7 +707,8 @@ describe("IRC", () => {
 
 				expect(registry.get("0-Sub")).toBeUndefined();
 				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the released agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 			});
 
 			// Regressed: a killed subagent keeps its IRC state for the rest of the session.
@@ -718,7 +721,8 @@ describe("IRC", () => {
 
 				expect(registry.get("0-Sub")?.status).toBe("aborted");
 				expect(bus.sentSince("0-Sub", "0-Peer", 0)).toBe(false);
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent the killed agent.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 			});
 
 			// Regressed: a subagent parked while a message to it is delivered keeps that message's

@@ -860,30 +860,15 @@ export async function loadEntriesFromFile(
 }
 
 /**
- * Visit session entries, using bounded streaming for large file-backed journals.
- * Small files and non-file backends keep the existing full-load path.
+ * Visit session entries, using bounded streaming for large journals: a
+ * {@link visitSessionFile} whose missing path throws.
  */
 export async function visitEntriesFromFile(
 	filePath: string,
 	visit: (entry: FileEntry) => void | boolean,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<void> {
-	const size = storage.statSync(filePath).size;
-	if (shouldStreamEntries(storage, size)) {
-		let sawFirstEntry = false;
-		await visitEntriesFromFileStream(filePath, entry => {
-			if (!sawFirstEntry) {
-				sawFirstEntry = true;
-				if (!isValidSessionHeader(entry)) return false;
-			}
-			return visit(entry);
-		});
-		return;
-	}
-
-	for (const entry of (await loadWithKnownSize(filePath, storage, size)).loaded.entries) {
-		if (visit(entry) === false) return;
-	}
+	await visitSessionFile(filePath, storage, visit, { throwIfMissing: true });
 }
 
 function hasImageUrl(value: unknown): value is { image_url: string } {

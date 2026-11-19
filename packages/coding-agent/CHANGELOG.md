@@ -38,6 +38,11 @@
 - On Windows, the temporary file of older entry bodies that a killed omp process left behind is deleted by the next omp process that opens one
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
 - After `/delete` while a backgrounded command still runs, closing the session frees the temporary file of older entry bodies at once instead of at the next garbage collection
+- A subagent that answers an IRC message in the turn that message woke it for no longer sends the sender that answer a second time, reviving it, when the sender was parked before the turn ended
+- Waiting for a lock another omp process holds (settings, the browser daemon, a session write) no longer freezes the TUI or RPC loop for about 50 ms on every retry
+- A rate limit after a long thinking block no longer keeps a session whose request fits `retry.rateLimitFallbackMaxContextTokens` off `retry.fallbackChains`: the cap no longer counts the failed attempt's output, which the retry does not send again
+- RPC `cancel_subagent` answers `{"cancelled": false}` for a subagent whose IRC wake turn just ended, or whose run failed with an exception, while it is being cleaned up, instead of killing it
+- `RpcClient.steerSubagent` no longer gives up after 30 seconds while its message waits for a subagent between turns; its new `timeoutMs` option bounds the wait
 
 ## [18.18.6] - 2026-11-09
 

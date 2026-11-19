@@ -1035,9 +1035,10 @@ export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>
 
 /**
  * Write {@link encodeTar}'s archive of `members` to `destPath` (parent
- * directories created, an existing file replaced) member by member, so the
- * archive is never held in memory: a `Blob` payload streams from its source.
- * A `Blob` whose stream does not yield exactly its `size` bytes fails the write.
+ * directories created, an existing file emptied first, so a failure leaves it
+ * truncated) member by member, so the archive is never held in memory: a
+ * `Blob` payload streams from its source. A `Blob` whose stream does not yield
+ * exactly its `size` bytes fails the write.
  */
 export async function writeTarFile(
 	destPath: string,

@@ -3310,12 +3310,18 @@ export class TurnRecovery {
 			// The rate-limit wait (see `rateLimited`), measured on the context the
 			// turn sends (see `TurnRecoveryHost.getContextUsage`): a large prompt no
 			// request has answered yet counts, and a usage from before a compaction
-			// that shrank the context does not. A function, so the `if` below reads
-			// the usage only once its earlier terms hold.
+			// that shrank the context does not. A failed turn the retry removes is
+			// never sent again, so its output (thinking, uncommitted text) comes off
+			// at the count the measure gave it, as `contextFitsModel` leaves it out.
+			// A function, so the `if` below reads the usage only once its earlier
+			// terms hold.
+			const sentContextTokens = (): number => {
+				const tokens = this.#host.getContextUsage()?.tokens ?? 0;
+				if (preserveFailedTurn || !this.#host.agent.state.messages.includes(message)) return tokens;
+				return Math.max(0, tokens - this.#host.agent.tokenizer.countMessage(message));
+			};
 			const rateLimitHoldsModel = (): boolean =>
-				rateLimited &&
-				(deferToSameModel ||
-					(this.#host.getContextUsage()?.tokens ?? 0) > retrySettings.rateLimitFallbackMaxContextTokens);
+				rateLimited && (deferToSameModel || sentContextTokens() > retrySettings.rateLimitFallbackMaxContextTokens);
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&

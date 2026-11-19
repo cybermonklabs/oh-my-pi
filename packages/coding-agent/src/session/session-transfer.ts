@@ -288,9 +288,14 @@ async function* collectingBlobHashes<C extends Uint8Array>(
  * A transcript file as an archive member that adds the blob hashes its bytes
  * reference to `hashes` as the archive writer streams them, so the blobs
  * packed after it are the ones the packed bytes name, whatever another writer
- * does to the file meanwhile. The writer reads a `Blob` member only through
- * `size` (taken when it writes the member's header) and `stream()`, and fails
- * on a stream that does not yield that size.
+ * does to the file meanwhile. Only a streaming writer (`writeTarArchive`) can
+ * take it: the member is read through `stream()` and `size`, which the writer
+ * reads for the member's header, again for its padding, on each chunk and
+ * once the stream ends, and fails on a stream that does not yield that size.
+ * `size` is the wrapped `Bun.file`'s, which stats the file once, at its first
+ * read, so every read gives the size the header holds. Every other read
+ * (`arrayBuffer()`, `bytes()`, `text()`, `slice()`) throws: this class holds no
+ * bytes of its own, so it would give 0 bytes and collect no hashes.
  */
 class BlobScannedFile extends Blob {
 	readonly #file: Blob;
@@ -319,6 +324,26 @@ class BlobScannedFile extends Blob {
 			},
 		});
 	}
+
+	override async arrayBuffer(): Promise<ArrayBuffer> {
+		throw unstreamedRead("arrayBuffer");
+	}
+
+	override async bytes(): Promise<Uint8Array<ArrayBuffer>> {
+		throw unstreamedRead("bytes");
+	}
+
+	override async text(): Promise<string> {
+		throw unstreamedRead("text");
+	}
+
+	slice(): Blob {
+		throw unstreamedRead("slice");
+	}
+}
+
+function unstreamedRead(method: string): Error {
+	return new Error(`A scanned transcript archive member is only streamed; ${method}() cannot read it`);
 }
 
 /** `chunks`, each fed to `digest` as it passes. */

@@ -990,14 +990,21 @@ export class RpcClient {
 	}
 
 	/**
-	 * Send a message to a running subagent as its user, the same way Agent Hub
-	 * chat does: a mid-turn subagent is steered at its next step boundary and one
-	 * between turns starts its next turn. Resolves once the message is queued or
-	 * the subagent's turn starts; rejects when the subagent is not running or the
-	 * message is dropped or refused before that.
+	 * Send a message to a running subagent as its user. A mid-turn subagent is
+	 * steered the same way Agent Hub chat does, at its next step boundary, and
+	 * the answer comes once the message is queued into that turn. One between
+	 * turns takes it as a next-run steer, which waits on the subagent's queue:
+	 * the answer comes when the subagent's next run takes the message, which can
+	 * be much later, or as an error once its run ends or the RPC session shuts
+	 * down first (the message is then taken back off the queue). Rejects when the
+	 * subagent is not running, or the message is refused or never delivered.
+	 *
+	 * No client-side timeout applies unless `options.timeoutMs` sets one; the
+	 * request still rejects once the RPC process exits or the client stops. A
+	 * timeout ends only this wait: a message held for the next run stays queued.
 	 */
-	async steerSubagent(subagentId: string, message: string): Promise<void> {
-		this.#getData(await this.#send({ type: "steer_subagent", subagentId, message }));
+	async steerSubagent(subagentId: string, message: string, options?: { timeoutMs?: number }): Promise<void> {
+		this.#getData(await this.#send({ type: "steer_subagent", subagentId, message }, options?.timeoutMs ?? null));
 	}
 
 	/**
@@ -1672,21 +1679,35 @@ export class RpcClient {
 		}
 	}
 
-	#send(command: RpcCommandBody, timeoutMs = 30_000, id = `req_${++this.#requestId}`): Promise<RpcResponse> {
+	/**
+	 * Send `command` and resolve with its response. `timeoutMs` bounds the wait;
+	 * `null` sets no bound, and the request still rejects once the process exits
+	 * or the client stops.
+	 */
+	#send(
+		command: RpcCommandBody,
+		timeoutMs: number | null = 30_000,
+		id = `req_${++this.#requestId}`,
+	): Promise<RpcResponse> {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
 		const fullCommand = { ...command, id } as RpcCommand;
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
-		const timeoutId = this.#startTimeout(timeoutMs, () => {
-			if (settled) return;
-			this.#pendingRequests.delete(id);
-			settled = true;
-			reject(
-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-			);
-		});
+		const timeoutId =
+			timeoutMs === null
+				? undefined
+				: this.#startTimeout(timeoutMs, () => {
+						if (settled) return;
+						this.#pendingRequests.delete(id);
+						settled = true;
+						reject(
+							new Error(
+								`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+							),
+						);
+					});
 
 		this.#pendingRequests.set(id, {
 			resolve: response => {
