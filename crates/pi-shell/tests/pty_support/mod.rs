@@ -688,6 +688,14 @@ impl Pty {
 	/// group, a job's and not the shell's: the command just typed has
 	/// started every process the keys `^Z` and `^C` are meant to signal.
 	///
+	/// Where the foreground group cannot be read ([`foreground_group`]),
+	/// the wait is for `programs` all running, not stopped, in one group
+	/// that is not the shell's. That is the same fact there: a job-control
+	/// shell gives a job a group of its own, and each of the job's
+	/// processes makes that group the terminal's foreground before it
+	/// execs (zsh's `entersubsh`, obash's spawner), so a process that runs
+	/// its program already has the terminal.
+	///
 	/// # Errors
 	///
 	/// When the group cannot be read, or `TimedOut` (with the output so
@@ -696,12 +704,18 @@ impl Pty {
 		let what = format!("{programs:?} running in the terminal's foreground");
 		let shell = self.pid();
 		self.wait_processes(timeout, &what, |fg, procs| {
-			fg != shell
-				&& programs.iter().all(|p| {
-					procs
-						.iter()
-						.any(|q| q.pgid == fg && !q.stopped && q.comm == *p)
-				})
+			let running_in = |group: i32| {
+				group != shell
+					&& programs.iter().all(|p| {
+						procs
+							.iter()
+							.any(|q| q.pgid == group && !q.stopped && q.comm == *p)
+					})
+			};
+			match fg {
+				Some(fg) => running_in(fg),
+				None => procs.iter().any(|q| running_in(q.pgid)),
+			}
 		})
 	}
 
@@ -718,18 +732,19 @@ impl Pty {
 	}
 
 	/// Wait until `done` holds for the terminal's foreground process group
-	/// and the processes the shell started (its descendants).
+	/// (`None` where it cannot be read: [`foreground_group`]) and the
+	/// processes the shell started (its descendants).
 	fn wait_processes(
 		&mut self,
 		timeout: Duration,
 		what: &str,
-		mut done: impl FnMut(i32, &[Proc]) -> bool,
+		mut done: impl FnMut(Option<i32>, &[Proc]) -> bool,
 	) -> io::Result<()> {
 		let deadline = Instant::now() + timeout;
 		loop {
 			self.pump()?;
-			let fg = tty::foreground(self.master.as_raw_fd())?;
-			if done(fg, &descendants(self.pid())) {
+			let fg = foreground_group(&self.master)?;
+			if done(fg, &descendants(self.pid())?) {
 				return Ok(());
 			}
 			if Instant::now() >= deadline {
@@ -786,6 +801,21 @@ impl Drop for Pty {
 	}
 }
 
+/// The foreground process group of the terminal whose master is `master`
+/// (`tcgetpgrp`), or `None` where the master does not answer: gVisor (GKE
+/// Sandbox) gives `ENOTTY` for `TIOCGPGRP` on any descriptor of a terminal
+/// that is not the caller's controlling terminal, the master included
+/// (`ThreadGroup::ForegroundProcessGroup`,
+/// `pkg/sentry/kernel/thread_group.go`), where Linux answers on the master to
+/// anyone holding it.
+fn foreground_group(master: &fs::File) -> io::Result<Option<i32>> {
+	match tty::foreground(master.as_raw_fd()) {
+		Ok(group) => Ok(Some(group)),
+		Err(e) if e.raw_os_error() == Some(libc::ENOTTY) => Ok(None),
+		Err(e) => Err(e),
+	}
+}
+
 /// A process a shell started ([`descendants`]).
 #[derive(Debug)]
 struct Proc {
@@ -798,48 +828,103 @@ struct Proc {
 }
 
 /// The processes below `pid`: its children, theirs, and so on. Linux lists
-/// each thread's children in `/proc/PID/task/TID/children`.
+/// each thread's children in `/proc/PID/task/TID/children`; where the
+/// kernel has no such file for `pid`, every process's parent is read from
+/// its `/proc/PID/stat` instead.
+///
+/// # Errors
+///
+/// When `pid`'s children cannot be read: an empty list would read as
+/// "nothing left".
 #[cfg(target_os = "linux")]
-fn descendants(pid: i32) -> Vec<Proc> {
+fn descendants(pid: i32) -> io::Result<Vec<Proc>> {
+	match fs::metadata(format!("/proc/{pid}/task/{pid}/children")) {
+		Ok(_) => {},
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return descendants_by_parent(pid),
+		Err(e) => return Err(e),
+	}
 	let mut out = Vec::new();
 	let mut todo = vec![pid];
 	while let Some(p) = todo.pop() {
+		// A process below the shell may have exited meanwhile, and so may a
+		// thread of any of them; of the shell's own, one must be read.
 		let Ok(tasks) = fs::read_dir(format!("/proc/{p}/task")) else {
 			continue;
 		};
+		let mut read_one = false;
 		for task in tasks.flatten() {
 			let Ok(kids) = fs::read_to_string(task.path().join("children")) else {
 				continue;
 			};
+			read_one = true;
 			for kid in kids
 				.split_whitespace()
 				.filter_map(|k| k.parse::<i32>().ok())
 			{
-				// `PID (COMM) STATE PPID PGRP …`; COMM may hold spaces.
-				let Ok(stat) = fs::read_to_string(format!("/proc/{kid}/stat")) else {
-					continue;
-				};
-				let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
-					continue;
-				};
-				let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-				let (Some(state), Some(pgid)) =
-					(rest.first(), rest.get(2).and_then(|g| g.parse().ok()))
-				else {
-					continue;
-				};
-				out.push(Proc { pgid, stopped: *state == "T", comm: stat[open + 1..close].to_owned() });
-				todo.push(kid);
+				if let Some((proc, _)) = proc_stat(kid) {
+					out.push(proc);
+					todo.push(kid);
+				}
 			}
 		}
+		if p == pid && !read_one && fs::metadata(format!("/proc/{pid}")).is_ok() {
+			return Err(io::Error::other(format!("no /proc/{pid}/task/*/children could be read")));
+		}
 	}
-	out
+	Ok(out)
+}
+
+/// [`descendants`] from every process's parent (`/proc/PID/stat`).
+#[cfg(target_os = "linux")]
+fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
+	let mut by_parent: std::collections::HashMap<i32, Vec<(i32, Proc)>> =
+		std::collections::HashMap::new();
+	for entry in fs::read_dir("/proc")?.flatten() {
+		let Some(p) = entry
+			.file_name()
+			.to_str()
+			.and_then(|n| n.parse::<i32>().ok())
+		else {
+			continue;
+		};
+		if let Some((proc, parent)) = proc_stat(p) {
+			by_parent.entry(parent).or_default().push((p, proc));
+		}
+	}
+	let mut out = Vec::new();
+	let mut todo = vec![pid];
+	while let Some(p) = todo.pop() {
+		for (kid, proc) in by_parent.remove(&p).unwrap_or_default() {
+			out.push(proc);
+			todo.push(kid);
+		}
+	}
+	Ok(out)
+}
+
+/// Process `pid` as `/proc/PID/stat` gives it, and its parent; `None` when
+/// it is gone.
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: i32) -> Option<(Proc, i32)> {
+	// `PID (COMM) STATE PPID PGRP …`; COMM may hold spaces.
+	let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+	let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+	let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+	let state = rest.first()?;
+	let parent = rest.get(1)?.parse().ok()?;
+	let pgid = rest.get(2)?.parse().ok()?;
+	Some((Proc { pgid, stopped: *state == "T", comm: stat[open + 1..close].to_owned() }, parent))
 }
 
 /// The processes below `pid`: its children, theirs, and so on
 /// (`proc_listchildpids`, `proc_pidinfo`).
+///
+/// # Errors
+///
+/// None here; the Linux version's signature.
 #[cfg(target_os = "macos")]
-fn descendants(pid: i32) -> Vec<Proc> {
+#[allow(clippy::unnecessary_wraps, reason = "the Linux version can fail")]
+fn descendants(pid: i32) -> io::Result<Vec<Proc>> {
 	/// `SSTOP` of `<sys/proc.h>`: stopped.
 	const SSTOP: u32 = 4;
 	let mut out = Vec::new();
@@ -877,7 +962,7 @@ fn descendants(pid: i32) -> Vec<Proc> {
 			todo.push(kid);
 		}
 	}
-	out
+	Ok(out)
 }
 
 /// Run the same session against obash and the real zsh: `drive` gets each
