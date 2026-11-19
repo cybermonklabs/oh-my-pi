@@ -19,6 +19,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
+	SessionRenameRaceError,
 	SqlSessionStorage,
 	type SqlSessionStorageClient,
 	type SqlSessionStorageResult,
@@ -830,11 +831,12 @@ describe("session blobs in the SQL session storage", () => {
 			});
 
 			// A delete, or a rename replacing a session, that names a blob a write is referencing: the write paused
-			// before its reference insert (the order case) and after it (the control). The delete takes the blob
-			// rows' locks before it touches the reference table, as the write does, so on MySQL and MariaDB the
-			// write's insert never waits on the delete's next-key locks: no deadlock, so neither side runs its
-			// transaction again (each drops references once, the write inserts its own once), and the row is kept
-			// as it was.
+			// before its reference insert and after it. The delete locks the blob's row before it deletes a reference
+			// or looks for a remaining one, so on MySQL and MariaDB it waits there for the write's shared lock and then sees
+			// the write's reference: no deadlock, so neither side runs its transaction again (each drops references
+			// once, the write inserts its own once), and the row is kept as it was. The delete takes each reference
+			// by its key, which locks no gap the write's insert could meet, so this pair alone does not show the
+			// order; the two deletes below do.
 			for (const remover of ["delete", "replacing rename"] as const) {
 				for (const when of ["before", "after"] as const) {
 					it(`keeps the row, with no deadlock or retry, when a ${remover} meets a write paused ${when} its reference insert`, async () => {
@@ -895,6 +897,56 @@ describe("session blobs in the SQL session storage", () => {
 					});
 				}
 			}
+
+			// Two deletes, at once, of two sessions that name one blob. The first is paused before it locks the
+			// blob's row; the second then runs whole. Each locks the blob's row before it deletes a reference or
+			// looks for a remaining one, so the second takes the row, drops its own reference, sees the first's, keeps
+			// the row and commits, and the first then drops its reference and the row. Out of that order (a
+			// delete's references deleted before its blob locks), on MySQL and MariaDB the first holds its deleted
+			// reference's index entry, the second's look for a remaining reference waits on it while holding the
+			// blob's row, and the first then waits for that row: a deadlock.
+			it.skipIf(adapter === "sqlite")(
+				"deletes at once two sessions that name one blob, with no deadlock or retry",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					const storage = await db.open({ wrap: client => deadlockLog(client, deadlocks) });
+					let gate: GatedClient | undefined;
+					const first = await db.open({
+						wrap: client => {
+							gate = gatedClient(deadlockLog(client, deadlocks), BLOB_EXCLUSIVE_LOCK, "before");
+							return gate.client;
+						},
+					});
+					const p = await writeImageSession(db, storage, [IMAGE_BYTES]);
+					const q = await writeImageSession(db, storage, [IMAGE_BYTES]);
+					await first.refresh();
+
+					gate?.close();
+					const deletingP = first.unlink(p);
+					let deletingQ: Promise<void> | undefined;
+					let early: string | undefined;
+					try {
+						await Promise.race([gate?.paused(), deletingP]);
+						deletingQ = storage.unlink(q);
+						// A real wait: what is measured is whether the second delete meets a lock of the first's on the server.
+						early = await Promise.race([
+							deletingQ.then(() => "deleted"),
+							Bun.sleep(1000).then(() => "waiting for the first delete"),
+						]);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([deletingP, deletingQ]);
+					expect({
+						early,
+						deadlocks,
+						paths: await db.paths(),
+						blobs: await blobHashes(db),
+						refs: await db.sql(`SELECT path FROM ${db.table}_refs`),
+					}).toEqual({ early: "deleted", deadlocks: [], paths: [], blobs: [], refs: [] });
+				},
+			);
 
 			it("keeps the row, with no deadlock or retry, when a delete meets a full write paused before its blob rows' lock", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
@@ -1303,9 +1355,10 @@ describe("session blobs in the SQL session storage", () => {
 			);
 
 			// A replacing rename whose destination another client creates after the rename read which rows there
-			// are: on MySQL and MariaDB a destination with no row is not locked, and PostgreSQL locks no row that is
-			// not there, so the UPDATE meets the new row on the primary key (1062, 23505). `rename` replaces its
-			// destination, so it runs again, and the next attempt locks and replaces that row.
+			// are, paused just before its UPDATE: on MySQL and MariaDB a destination with no row is not locked, and
+			// PostgreSQL locks no row that is not there, so the UPDATE meets the new row on the primary key (1062,
+			// 23505). `rename` replaces its destination, so it runs again, and the next attempt locks and replaces
+			// that row.
 			it.skipIf(adapter === "sqlite")(
 				"replaces, through rename, a destination another client creates after the rename read which rows there are",
 				async () => {
@@ -1314,10 +1367,7 @@ describe("session blobs in the SQL session storage", () => {
 					const renamer = await db.open({
 						claims: false,
 						wrap: client => {
-							gate = gatedClient(
-								client,
-								new RegExp(`^SELECT path FROM \\S*\\b${db.table} WHERE path IN \\(.* FOR UPDATE$`),
-							);
+							gate = gatedClient(client, new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`), "before");
 							return gate.client;
 						},
 					});
@@ -1348,6 +1398,122 @@ describe("session blobs in the SQL session storage", () => {
 						paths: await db.paths(),
 						dst: (await db.row(dst))?.content,
 					}).toEqual({ error: undefined, paths: [dst], dst: moved });
+				},
+			);
+
+			// A replacing rename whose every attempt meets a destination created after its read: the collision is
+			// injected into each attempt's UPDATE (T4 above is the real one). After as many attempts as a
+			// deadlock's retry (5), the rename rejects with SessionRenameRaceError, the last collision its cause,
+			// and nothing changed.
+			it("rejects with SessionRenameRaceError, changing nothing, a rename whose every attempt meets a new destination", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const renameRow = new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`);
+				let collisions = 0;
+				const collide = (query: string): void => {
+					if (!renameRow.test(query)) return;
+					collisions++;
+					throw Object.assign(
+						new Error("Duplicate entry (injected)"),
+						{
+							mysql: { errno: 1062 },
+							postgres: { errno: "23505" },
+							sqlite: { code: "SQLITE_CONSTRAINT_PRIMARYKEY" },
+						}[adapter],
+					);
+				};
+				const renamer = await db.open({
+					claims: false,
+					wrap: client => ({
+						options: client.options,
+						unsafe: (query, values) => client.unsafe(query, values),
+						transaction: callback =>
+							client.transaction(transaction =>
+								callback({
+									unsafe(query, values) {
+										collide(query);
+										return transaction.unsafe(query, values);
+									},
+								}),
+							),
+						end: () => client.end?.() ?? Promise.resolve(),
+					}),
+				});
+				const [src, dst] = ["a-src", "b-dst"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [
+					string,
+					string,
+				];
+				const content = transcript(ID, "not moved");
+				await renamer.writeText(src, content);
+				await renamer.drain();
+
+				const error = await rejection(renamer.rename(src, dst));
+				expect({
+					name: error instanceof Error ? error.name : undefined,
+					raced: error instanceof SessionRenameRaceError ? [error.src, error.dst, error.attempts] : undefined,
+					cause: error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined,
+					collisions,
+					paths: await db.paths(),
+					src: (await db.row(src))?.content,
+				}).toEqual({
+					name: "SessionRenameRaceError",
+					raced: [src, dst, 5],
+					cause: "Duplicate entry (injected)",
+					collisions: 5,
+					paths: [src],
+					src: content,
+				});
+			});
+
+			// The one deadlock the lock order leaves (docs/session.md, "Races"): a rename whose destination has no
+			// row takes that key by its UPDATE, after the source's lock, and a delete with the artifacts directory
+			// locks every row and gap of the session table in path order on MySQL and MariaDB (it can use no index).
+			// The rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
+			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
+			// gap. InnoDB rolls one back, and the deadlock retry runs it again: both end as they would alone.
+			it.skipIf(adapter !== "mysql")(
+				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					let gate: GatedClient | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								deadlockLog(client, deadlocks),
+								new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`),
+								"before",
+							);
+							return gate.client;
+						},
+					});
+					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
+					const [a, b, c, d] = ["a", "b-dst", "c", "d-src"].map(name =>
+						db.dir.join("sessions", `${name}.jsonl`),
+					) as [string, string, string, string];
+					const moved = transcript(ID, "moved");
+					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
+					await renamer.writeText(d, moved);
+					await renamer.drain();
+					await deleter.refresh();
+
+					gate?.close();
+					const renaming = renamer.rename(d, b);
+					let deleting: Promise<void> | undefined;
+					try {
+						await Promise.race([gate?.paused(), renaming]);
+						deleting = deleter.deleteSessionWithArtifacts(a);
+						// A real wait: the delete's scan must reach the rename's row on the server before the UPDATE runs.
+						await Promise.race([deleting, Bun.sleep(1000)]);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([renaming, deleting]);
+					expect({
+						deadlocks: deadlocks.length,
+						paths: await db.paths(),
+						b: (await db.row(b))?.content,
+					}).toEqual({ deadlocks: 1, paths: [b, c], b: moved });
 				},
 			);
 

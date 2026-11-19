@@ -1550,6 +1550,28 @@ function isPrimaryKeyViolation(error: unknown): boolean {
 	return errno === "23505" || errno === 1062 || code === "SQLITE_CONSTRAINT_PRIMARYKEY";
 }
 
+/**
+ * A replacing rename met, on every one of its `attempts`, a destination row
+ * another client created after the attempt read which rows there are: each
+ * attempt's rename of the source's row collided with it on the primary key
+ * (`cause` is the last collision), and nothing changed.
+ */
+export class SessionRenameRaceError extends Error {
+	readonly src: string;
+	readonly dst: string;
+	readonly attempts: number;
+
+	constructor(src: string, dst: string, attempts: number, cause: unknown) {
+		super(`Session rename of ${src} met a new session at ${dst} on each of ${attempts} attempts; nothing changed.`, {
+			cause,
+		});
+		this.name = "SessionRenameRaceError";
+		this.src = src;
+		this.dst = dst;
+		this.attempts = attempts;
+	}
+}
+
 /** Concatenate a window's pieces in byte-offset order; the session row's own bytes come first. */
 function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number; bytes: Uint8Array | null }>): Buffer {
 	pieces.sort((a, b) => a.offset - b.offset);
@@ -3911,7 +3933,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		// A replacing rename whose `dst` another client creates after the read of which rows there are (on MySQL a
 		// `dst` with no row is not locked; PostgreSQL locks no row that is not there) meets that row in its
 		// UPDATE, on the primary key. It runs again, bounded as a deadlock's retry: the next attempt reads `dst`,
-		// locks it in path order, and replaces it. `noReplace` rejects with EEXIST instead.
+		// locks it in path order, and replaces it; past the bound it throws SessionRenameRaceError. `noReplace`
+		// rejects with EEXIST instead.
 		for (let attempt = 1; ; attempt++) {
 			try {
 				await this.#moveOnce(src, dst, mtimeMs, noReplace, fences);
@@ -3919,7 +3942,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			} catch (err) {
 				if (!isPrimaryKeyViolation(err)) throw err;
 				if (noReplace) throw eexist(dst);
-				if (attempt >= WRITE_ATTEMPTS) throw err;
+				if (attempt >= WRITE_ATTEMPTS) throw new SessionRenameRaceError(src, dst, attempt, err);
 			}
 		}
 		this.#moveLease(src, dst);
