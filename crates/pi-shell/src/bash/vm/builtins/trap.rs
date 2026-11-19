@@ -77,6 +77,27 @@ fn func_name(key: TrapKey, platform: crate::bash::ids::Platform) -> Option<BStri
 	func_names(key, platform).into_iter().next()
 }
 
+/// Whether a `TRAPNAL` function is the trap for `sig` in `vp` (zsh
+/// `ZSIG_FUNC`): one of [`func_names`] is defined.
+///
+/// # Errors
+///
+/// A store failure reading the functions.
+pub fn has_func_trap(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	sig: Signal,
+	platform: crate::bash::ids::Platform,
+) -> Result<bool, StoreError> {
+	for name in func_names(TrapKey::Signal(sig), platform) {
+		if matches!(state::record(store, vp, Key::Func(BStr::new(&name)))?, Some(Record::Func { .. }))
+		{
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
 /// The trap key a zsh function name makes a trap of (`TRAPINT` → `INT`,
 /// `TRAPZERR` → ZERR, `TRAPIO` → `POLL` on Linux), if any: the signal
 /// names zsh knows ([`Signal::from_zsh_name`]).
@@ -321,29 +342,54 @@ pub fn save_local(
 	Ok(())
 }
 
-/// A zsh `TRAPNAL` function named `name` is about to be defined or removed
-/// (function definition, `unfunction`, `unset -f`): under `localtraps` the
-/// enclosing function saves the trap ([`save_local`]); a definition
-/// replaces a `trap` action for the same signal and makes the trap known
-/// to the DEBUG/ZERR fast path. `None` when `name` names no trap.
+/// How a `TRAPNAL` function changes ([`func_changing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuncChange {
+	/// Defined with a body: it replaces a `trap` action for its signal.
+	Defined,
+	/// Defined as an autoload stub.
+	Autoloaded,
+	/// Removed (`unfunction`, `unset -f`).
+	Removed,
+}
+
+/// A zsh `TRAPNAL` function named `name` is about to change (`how`): under
+/// `localtraps` the enclosing function saves the trap ([`save_local`]); a
+/// definition replaces a `trap` action for the same signal and makes the
+/// trap known to the DEBUG/ZERR fast path. The root shell asks the host to
+/// catch the signal while the function exists and gives it back its
+/// default once it is removed, as zsh's `settrap`/`unsettrap` do: without
+/// that a real signal ended the shell instead of calling the function.
+/// `None` when `name` names no trap.
 ///
 /// # Errors
 ///
 /// A store failure reading the option, the scopes or the trap.
 pub fn func_changing(
 	k: &mut Kernel,
-	store: &mut dyn StateStore,
+	cx: &mut crate::bash::vm::Cx<'_>,
 	vp: &mut Vproc,
 	name: &[u8],
-	defining: bool,
+	how: FuncChange,
 ) -> Result<Option<TrapKey>, StoreError> {
 	let Some(key) = func_key(name, k.engine.config().platform) else {
 		return Ok(None);
 	};
-	save_local(&mut k.root, store, vp, key)?;
-	if defining {
-		state::store_record(&mut k.root, store, vp, KeyBuf::Trap(key), None);
+	save_local(&mut k.root, cx.store, vp, key)?;
+	if how == FuncChange::Defined {
+		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
 		k.pseudo_traps.note(key);
+	}
+	if vp.overlay.is_none()
+		&& let TrapKey::Signal(sig) = key
+		&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
+	{
+		let action = (how != FuncChange::Removed).then(|| BStr::new(name));
+		let disposition = crate::bash::vm::jobctl::trap_disposition(k, sig, action);
+		if let Err(err) = cx.host.set_signal_trap(sig, disposition) {
+			let line = crate::bash::vm::exec::current_line(vp);
+			k.diag(cx, vp, line, Diag::SignalSetup { sig, err });
+		}
 	}
 	Ok(Some(key))
 }

@@ -3257,7 +3257,8 @@ fn zsh_funcdef_expanded(
 /// zsh: defining function `name` (`TRAPNAL`) sets that trap.
 #[inline(never)]
 fn zsh_trap_funcdef(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, name: &[u8]) {
-	if let Err(err) = builtins::trap::func_changing(k, cx.store, vp, name, true) {
+	let defined = builtins::trap::FuncChange::Defined;
+	if let Err(err) = builtins::trap::func_changing(k, cx, vp, name, defined) {
 		k.fail(err);
 	}
 }

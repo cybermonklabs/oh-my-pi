@@ -126,6 +126,24 @@ fn command_strings_and_exit_statuses_match_zsh() {
 	}
 }
 
+/// A `TRAPNAL` function is the signal's trap (zsh `settrap` with
+/// `ZSIG_FUNC`): a real `SIGUSR1` sent to the shell calls `TRAPUSR1` with
+/// the signal's number, and the shell goes on.
+#[test]
+fn a_trapnal_function_catches_a_real_signal() {
+	let args = ["-f", "-c", "TRAPUSR1() { print got $1 }; kill -USR1 $$; print after"];
+	let ours = obash(&args);
+	assert_eq!(
+		(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
+		(format!("got {}\nafter\n", libc::SIGUSR1), Some(0)),
+		"{}",
+		String::from_utf8_lossy(&ours.1)
+	);
+	if have_zsh() {
+		assert_eq!(ours, run(zsh_oracle::path(), &args));
+	}
+}
+
 /// A standalone shell abandons the externals still running when it exits:
 /// a background job without `nohup` gets `TERM` and is gone shortly after.
 #[test]

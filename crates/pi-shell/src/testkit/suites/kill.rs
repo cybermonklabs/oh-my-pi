@@ -72,6 +72,19 @@ fn zsh_names_the_signals_as_its_macos_build() {
 	assert_eq!(err, "zsh:kill:1: unknown signal: SIGIOT\n");
 }
 
+/// A `TRAPNAL` function named by zsh's name of a signal on Linux
+/// (`TRAPIOT`) or one of its alternates (`TRAPIO` for `POLL`) is the
+/// signal's trap: the signal sent to the shell calls it with the number.
+#[test]
+fn a_trapnal_function_is_found_by_zshs_names_on_linux() {
+	let (out, err) = zsh_on(
+		Platform::Linux,
+		"TRAPIOT() { print got $1 }; kill -IOT $$; TRAPIO() { print io $1 }; kill -POLL $$; print \
+		 st=$?",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("got 6\nio 29\nst=0\n", ""));
+}
+
 #[test]
 fn signal_specs_follow_the_configured_platform() {
 	assert_eq!(Signal::parse_spec(b"SIGUSR1", Platform::Linux), Some(Signal::Usr1));

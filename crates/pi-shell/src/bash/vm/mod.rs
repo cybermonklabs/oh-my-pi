@@ -2418,9 +2418,22 @@ impl Shell {
 				None
 			} else {
 				let key = crate::bash::store::TrapKey::Signal(sig);
-				match state::record(cx.store, &self.procs[i], crate::bash::store::Key::Trap(key)) {
-					Ok(Some(Record::Trap { action, .. })) => Some(action.is_empty()),
-					Ok(_) => None,
+				let p = &self.procs[i];
+				let recorded = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
+					Ok(Some(Record::Trap { action, .. })) => Ok(Some(action.is_empty())),
+					Ok(_) => Ok(None),
+					Err(err) => Err(err),
+				};
+				// zsh: a `TRAPNAL` function is the trap (`ZSIG_FUNC`).
+				let found = recorded.and_then(|trap| match trap {
+					None if p.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
+						builtins::trap::has_func_trap(cx.store, p, sig, platform)
+							.map(|f| f.then_some(false))
+					},
+					trap => Ok(trap),
+				});
+				match found {
+					Ok(trap) => trap,
 					Err(err) => {
 						self.k.fail(err);
 						return;

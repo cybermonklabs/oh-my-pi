@@ -360,7 +360,8 @@ fn remove(ctx: &mut Ctx<'_, '_>, ht: Ht, name: &[u8]) -> Result<bool, Need> {
 			let found = ctx.function(name)?.is_some();
 			if found {
 				// A `TRAPxxx` function is its trap.
-				super::trap::func_changing(ctx.k, ctx.cx.store, ctx.vp, name, false)?;
+				let removed = super::trap::FuncChange::Removed;
+				super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, removed)?;
 				ctx.store_record(KeyBuf::Func(name.into()), None);
 			}
 			found
@@ -1130,7 +1131,8 @@ fn add_autoload_function(ctx: &mut Ctx<'_, '_>, arg: &[u8], on: Attrs) -> Result
 		attrs,
 		file,
 	};
-	super::trap::func_changing(ctx.k, ctx.cx.store, ctx.vp, &name, false)?;
+	let autoloaded = super::trap::FuncChange::Autoloaded;
+	super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, &name, autoloaded)?;
 	ctx.store_record(KeyBuf::Func(name.clone()), Some(rec));
 	Ok(name)
 }
