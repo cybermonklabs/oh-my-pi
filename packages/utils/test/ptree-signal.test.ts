@@ -97,7 +97,13 @@ describe("ptree signal abort handling", () => {
 			process.on("unhandledRejection", onUnhandled);
 
 			try {
-				const child = spawn(["bun", "-e", "setInterval(() => {}, 1000)"]);
+				const child = spawn([process.execPath, "-e", "console.log('ready'); setInterval(() => {}, 1000)"]);
+				// The child must be running when the kill lands; a child that never started would pass the
+				// abort checks below too, so the test reads its first line before it kills it.
+				const reader = child.stdout.getReader();
+				const first = await reader.read();
+				reader.releaseLock();
+				expect(new TextDecoder().decode(first.value)).toContain("ready");
 				if (how === "kill") child.kill(new AbortError(new Error("stop"), ""));
 				else child[Symbol.dispose]();
 				await child.proc.exited;
