@@ -391,6 +391,99 @@ fn run_ignoring(program: impl AsRef<OsStr>, args: &[&str]) -> Outcome {
 /// the signal it dies of.
 type SignalCase<'a> = (&'a str, &'a [u8], Option<i32>, Option<i32>);
 
+/// `err` with the pid after each `NAME: line N: ` (bash's notice of a
+/// killed command) replaced by `PID`: each shell prints its own child's.
+fn mask_pids(err: &[u8]) -> String {
+	let text = String::from_utf8_lossy(err);
+	let mut out = String::new();
+	for l in text.split_inclusive('\n') {
+		let at = l
+			.find(": line ")
+			.and_then(|i| l[i + 7..].find(": ").map(|j| i + 7 + j + 2));
+		match at {
+			Some(at) => {
+				let rest = l[at..].trim_start_matches(' ');
+				let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+				out.push_str(&l[..at]);
+				out.push_str("PID");
+				out.push_str(&rest[digits..]);
+			},
+			None => out.push_str(l),
+		}
+	}
+	out
+}
+
+/// A non-interactive bash reports a foreground command a signal killed
+/// (`notify_of_job_status`): `TERM`, or a signal the shell traps, prints
+/// its description; `INT`, `PIPE` and a command substitution print
+/// nothing; any other signal prints `NAME: line N: `, the pid, the
+/// description padded to 24 columns and the command as bash prints it.
+/// zsh prints nothing in the same case.
+#[test]
+fn bash_reports_a_foreground_command_killed_by_a_signal() {
+	let cases: [(&str, &str, &str); 11] = [
+		("bash", "/bin/sh -c 'kill -TERM $$'; echo st=$?", "Terminated\n"),
+		(
+			"bash",
+			"/bin/sh -c 'kill -KILL $$'; echo st=$?",
+			"bash: line 1: PID Killed                  /bin/sh -c 'kill -KILL $$'\n",
+		),
+		(
+			"bash",
+			"/bin/sh -c 'kill -QUIT $$'; echo st=$?",
+			"bash: line 1: PID Quit                    /bin/sh -c 'kill -QUIT $$'\n",
+		),
+		(
+			"bash",
+			"/bin/sh -c 'kill -USR1 $$'; echo st=$?",
+			"bash: line 1: PID User defined signal 1   /bin/sh -c 'kill -USR1 $$'\n",
+		),
+		("bash", "/bin/sh -c 'kill -INT $$'; /bin/sh -c 'kill -PIPE $$'; echo st=$?", ""),
+		(
+			"bash",
+			"trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo st=$?",
+			"User defined signal 1\n",
+		),
+		("bash", "x=$(/bin/sh -c 'kill -KILL $$'); echo st=$?", ""),
+		(
+			"bash",
+			"true\n/bin/sh   -c 'kill -HUP $$'   ; echo st=$?",
+			"bash: line 2: PID Hangup                  /bin/sh -c 'kill -HUP $$'\n",
+		),
+		("bash", "exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?", ""),
+		("zsh", "/bin/sh -c 'kill -KILL $$'; print st=$?", ""),
+		("zsh", "/bin/sh -c 'kill -TERM $$'; print st=$?", ""),
+	];
+	for (name, script, want) in cases {
+		let args = if name == "zsh" {
+			vec!["-f", "-c", script]
+		} else {
+			vec!["-c", script]
+		};
+		let ours = run_entry(env!("CARGO_BIN_EXE_obash"), name, &args, &[]);
+		assert_eq!(mask_pids(&ours.1), want, "{name}: {script}");
+		let real = if name == "zsh" {
+			have_zsh().then(zsh_oracle::path)
+		} else {
+			Some(std::path::PathBuf::from("/bin/bash")).filter(|p| p.is_file())
+		};
+		match real {
+			Some(real) => {
+				let theirs = run_entry(&real, name, &args, &[]);
+				assert_eq!(
+					(mask_pids(&ours.0), mask_pids(&ours.1), ours.2),
+					(mask_pids(&theirs.0), mask_pids(&theirs.1), theirs.2),
+					"{name}: {script}"
+				);
+			},
+			None => {
+				zsh_oracle::uncompared(&format!("no {name} to compare the killed-command notice with"))
+			},
+		}
+	}
+}
+
 /// bash catches its fatal signals once an EXIT trap is set: the trap runs
 /// (with `$?` as it was), then the shell dies of the signal; a subshell
 /// with a trap of its own does the same. A signal bash does not catch
