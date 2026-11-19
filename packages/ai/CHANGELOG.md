@@ -4,7 +4,7 @@
 
 ### Added
 
-- Model usage health now names why an account is depleted (`depletedBy`: `usage`, `account-policy` or `auth`).
+- Model usage health now names why an account is depleted (`depletedBy`: `usage`, `account-policy` or `auth`) ([#19682](https://github.com/can1357/oh-my-pi/pull/19682) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.18.4] - 2026-11-09
 
