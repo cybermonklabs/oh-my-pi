@@ -17,16 +17,12 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { getBundledAgentsMap } from "../task/agents";
 import { BUILTIN_TOOL_NAMES, isMCPToolName } from "../tools/builtin-names";
 import { lexShellCommand } from "../tools/shell-tokenize";
-import { ENTRY_PATCH_CUSTOM_TYPE, type EntryPatchData } from "./entry-patches";
+import { ENTRY_PATCH_CUSTOM_TYPE, NO_PATCHES } from "./entry-patches";
 import type { SessionEntry, SessionHeader } from "./session-entries";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import { TOOL_RESULT_PRUNE_CUSTOM_TYPE, type ToolResultPruneData } from "./tool-result-prunes";
+import { EMPTY_TOOL_RESULT_PRUNE_DATA, TOOL_RESULT_PRUNE_CUSTOM_TYPE } from "./tool-result-prunes";
 
 type JsonObject = Record<string, unknown>;
-
-/** Payloads of the record kinds whose effects every input already carries inline ({@link AnonymizeSessionInput}). */
-const NO_ENTRY_PATCHES: EntryPatchData = { patches: [] };
-const NO_TOOL_RESULT_PRUNES: ToolResultPruneData = { results: [] };
 
 /** Shown wherever an anonymized export is written: the redaction is rule-based, not a guarantee. */
 export const ANONYMIZED_REVIEW_NOTE =
@@ -1501,9 +1497,9 @@ export class SessionAnonymizer {
 				switch (parent.customType) {
 					// The entries already hold these records' effects; an empty payload reopens as a no-op record.
 					case ENTRY_PATCH_CUSTOM_TYPE:
-						return NO_ENTRY_PATCHES;
+						return NO_PATCHES;
 					case TOOL_RESULT_PRUNE_CUSTOM_TYPE:
-						return NO_TOOL_RESULT_PRUNES;
+						return EMPTY_TOOL_RESULT_PRUNE_DATA;
 					// omp's execution log mirrors the tool call; every other custom entry is extension state.
 					case "tool_execution_start":
 						return isObject(value) ? this.#executionLog(value) : this.#opaque(value);

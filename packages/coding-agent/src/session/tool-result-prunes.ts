@@ -11,7 +11,9 @@
  * reader migrates and resolves blobs, it applies the records after migration
  * and before blob resolution, so a pruned result's blobs are never read. A
  * `SessionManager` that keeps the entries another writer appended to its file
- * applies the records among them to the entries it holds.
+ * works in the other order: it resolves their blob references first and then
+ * applies the records among them to the entries it holds, so a pruned foreign
+ * result's blobs are read once.
  *
  * Byte-offset tail readers (the Agent Hub transcript viewer, the collab agent
  * drawer, RPC subagent streaming) parse each line once as it lands and cannot
@@ -41,6 +43,9 @@ export interface ToolResultPruneRecord {
 export interface ToolResultPruneData {
 	readonly results: readonly ToolResultPruneRecord[];
 }
+
+/** `data` of a `tool_result_prune` record that blanks no result. */
+export const EMPTY_TOOL_RESULT_PRUNE_DATA: ToolResultPruneData = { results: [] };
 
 /**
  * The `data` to persist for one prune pass. Copies each field explicitly, so a
