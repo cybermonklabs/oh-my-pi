@@ -4,7 +4,7 @@
 
 ### Added
 
-- `AssistantRetryRecovery.kept` marks a failed turn an automatic retry kept in context and continued from, instead of sending it again
+- `AssistantRetryRecovery.kept` marks a kept turn whose continuation succeeded: a failed turn an automatic retry kept in context and continued from instead of sending it again
 
 ### Fixed
 

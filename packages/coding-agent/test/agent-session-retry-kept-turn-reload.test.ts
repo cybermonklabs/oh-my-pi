@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as envApiKey from "@oh-my-pi/pi-ai/env-api-key";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { AnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -31,6 +32,10 @@ const PRIMARY = "claude-opus-5-5";
 const TOOL_CALL_ID = "toolu_kept_turn";
 const FIRST_TEXT = "Here is the first part of the answer";
 const CONTINUED_TEXT = ", and here is the rest of it.";
+const FRESH_TEXT = "A fresh answer.";
+const MAX_RETRIES = 2;
+const MAX_DELAY_MS = 120_000;
+const RATE_LIMIT_MESSAGE = "This request would exceed your organization's rate limit.";
 
 function sseFrame(event: string, data: unknown): string {
 	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -91,26 +96,51 @@ const OVERLOADED_FRAME = sseFrame("error", {
 	error: { type: "overloaded_error", message: "Overloaded" },
 });
 
+/** A whole answer whose only text is `text`. */
+function answer(text: string): string {
+	return (
+		MESSAGE_START_FRAME +
+		sseFrame("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		}) +
+		sseFrame("content_block_delta", {
+			type: "content_block_delta",
+			index: 0,
+			delta: { type: "text_delta", text },
+		}) +
+		sseFrame("content_block_stop", { type: "content_block_stop", index: 0 }) +
+		sseFrame("message_delta", {
+			type: "message_delta",
+			delta: { stop_reason: "end_turn", stop_sequence: null },
+			usage: { output_tokens: 8 },
+		}) +
+		sseFrame("message_stop", { type: "message_stop" })
+	);
+}
+
 /** A whole answer, as the continuation gets it. */
-const CONTINUED_ANSWER =
-	MESSAGE_START_FRAME +
-	sseFrame("content_block_start", {
-		type: "content_block_start",
-		index: 0,
-		content_block: { type: "text", text: "" },
-	}) +
-	sseFrame("content_block_delta", {
-		type: "content_block_delta",
-		index: 0,
-		delta: { type: "text_delta", text: CONTINUED_TEXT },
-	}) +
-	sseFrame("content_block_stop", { type: "content_block_stop", index: 0 }) +
-	sseFrame("message_delta", {
-		type: "message_delta",
-		delta: { stop_reason: "end_turn", stop_sequence: null },
-		usage: { output_tokens: 8 },
-	}) +
-	sseFrame("message_stop", { type: "message_stop" });
+const CONTINUED_ANSWER = answer(CONTINUED_TEXT);
+
+/** What a request to the primary answers: a 200 event stream, or an HTTP refusal. */
+type PrimaryAnswer = { stream: string } | { status: number; retryAfterSeconds?: number };
+
+/** An HTTP 429 rate limit at request time. */
+const HTTP_RATE_LIMIT: PrimaryAnswer = { status: 429 };
+
+async function primaryResponse(primary: PrimaryAnswer): Promise<Response> {
+	const headers = new Headers({ "request-id": "req_kept_turn" });
+	if ("stream" in primary) {
+		headers.set("content-type", "text/event-stream");
+		return new Response(new TextEncoder().encode(primary.stream), { status: 200, headers });
+	}
+	headers.set("content-type", "application/json");
+	if (primary.retryAfterSeconds !== undefined) headers.set("retry-after", String(primary.retryAfterSeconds));
+	const body = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: RATE_LIMIT_MESSAGE } });
+	// What the HTTP client throws for a refused request.
+	throw await AIError.AnthropicApiError.fromResponse(new Response(body, { status: primary.status, headers }));
+}
 
 /** The conversation a model request is built from: what each user, assistant and tool-result message holds. */
 function conversation(messages: readonly AgentMessage[]): string[] {
@@ -134,8 +164,11 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
-	let session: AgentSession | undefined;
+	let sessions: AgentSession[];
 	let managers: SessionManager[];
+	/** What the primary's next requests answer, in order; the last answers every later one. */
+	let primaryAnswers: PrimaryAnswer[];
+	let primaryRequests: number;
 
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-retry-kept-turn-reload-");
@@ -151,42 +184,33 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 	});
 
 	beforeEach(() => {
+		sessions = [];
 		managers = [];
+		primaryAnswers = [];
+		primaryRequests = 0;
 		modelRegistry.clearSuppressedSelectors();
 		vi.spyOn(envApiKey, "getEnvApiKey").mockReturnValue(undefined);
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			primaryRequests++;
+			const next = primaryAnswers.length > 1 ? primaryAnswers.shift()! : primaryAnswers[0]!;
+			return { asResponse: () => primaryResponse(next) } as never;
+		});
+		mockSchedulerWaitWithClock();
 	});
 
 	afterEach(async () => {
-		await session?.dispose();
-		session = undefined;
+		for (const session of sessions.splice(0).reverse()) await session.dispose();
 		for (const manager of managers.splice(0).reverse()) await manager.close();
 		vi.restoreAllMocks();
 	});
 
-	/**
-	 * Sends a prompt whose first primary request streams `failedStream` and
-	 * every later one {@link CONTINUED_ANSWER}; then opens the session file
-	 * again. Returns the conversation the session holds live and the one it
-	 * rebuilds from the file, and the reopened file's failed entry.
-	 */
-	async function runAndReopen(failedStream: string) {
-		let requests = 0;
-		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
-			const stream = requests++ === 0 ? failedStream : CONTINUED_ANSWER;
-			return {
-				async asResponse() {
-					return new Response(new TextEncoder().encode(stream), {
-						status: 200,
-						headers: { "content-type": "text/event-stream", "request-id": "req_kept_turn" },
-					});
-				},
-			} as never;
-		});
+	/** A session on `sessionManager` whose context starts as `messages`, as a resume builds it. */
+	function startSession(sessionManager: SessionManager, messages: AgentMessage[] = []): AgentSession {
 		const model = getBundledModel(PROVIDER, PRIMARY);
 		if (!model) throw new Error(`Expected bundled ${PROVIDER}/${PRIMARY}`);
 		const agent = new Agent({
 			getApiKey: requested => `${requested.provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages },
 			streamFn: (requested, context, options) =>
 				streamAnthropic(requested as Model<"anthropic-messages">, context, {
 					...options,
@@ -194,30 +218,49 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 					providerRetryWait: async () => {},
 				}),
 		});
-		const sessionsDir = path.join(tempDir.path(), "sessions");
-		const sessionManager = SessionManager.create(tempDir.path(), sessionsDir);
-		managers.push(sessionManager);
-		session = new AgentSession({
+		const session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({
 				"compaction.enabled": false,
 				"retry.baseDelayMs": 1,
-				"retry.maxRetries": 2,
-				"retry.maxDelayMs": 120_000,
+				"retry.maxRetries": MAX_RETRIES,
+				"retry.maxDelayMs": MAX_DELAY_MS,
 			}),
 			modelRegistry,
 		});
-		mockSchedulerWaitWithClock();
+		sessions.push(session);
+		return session;
+	}
+
+	/** Writes what `sessionManager` holds to its file and opens that file again, as a resume does. */
+	async function reopen(sessionManager: SessionManager): Promise<SessionManager> {
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected the session to persist a file");
+		const reopened = await SessionManager.open(sessionFile, path.dirname(sessionFile), undefined, {
+			suppressBreadcrumb: true,
+		});
+		managers.push(reopened);
+		return reopened;
+	}
+
+	/**
+	 * Sends a prompt whose primary requests take `answers` in order (the last
+	 * repeating); then opens the session file again. Returns the conversation
+	 * the session holds live and the one it rebuilds from the file, and the
+	 * reopened file's first failed assistant entry.
+	 */
+	async function runAndReopen(answers: PrimaryAnswer[]) {
+		primaryAnswers = answers;
+		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+		managers.push(sessionManager);
+		const session = startSession(sessionManager);
 
 		await session.prompt("Answer in two parts");
 		await session.waitForIdle();
-		await sessionManager.flush();
 
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) throw new Error("Expected the session to persist a file");
-		const reopened = await SessionManager.open(sessionFile, sessionsDir, undefined, { suppressBreadcrumb: true });
-		managers.push(reopened);
+		const reopened = await reopen(sessionManager);
 		const failedEntry = reopened
 			.getEntries()
 			.find(
@@ -225,7 +268,8 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 					entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error",
 			);
 		return {
-			requests,
+			requests: primaryRequests,
+			reopened,
 			live: conversation(session.agent.state.messages),
 			rebuilt: conversation(reopened.buildSessionContext().messages),
 			failedEntry,
@@ -236,7 +280,10 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 	// the session waits and the model continues it, and after a resume the
 	// model no longer sees the first half of its own answer.
 	it("keeps the text of a turn a rate limit cut off, before its continuation", async () => {
-		const result = await runAndReopen(MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME);
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
 
 		expect(result.requests).toBe(2);
 		expect(result.rebuilt).toEqual(["user", `assistant[text:${FIRST_TEXT}]`, `assistant[text:${CONTINUED_TEXT}]`]);
@@ -250,9 +297,10 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 	// resume the model sees a tool result whose call is gone, and no longer the
 	// first half of its answer.
 	it("keeps a turn a rate limit cut off after a complete tool call, with its call and result", async () => {
-		const result = await runAndReopen(
-			MESSAGE_START_FRAME + TEXT_FRAMES + COMPLETE_TOOL_CALL_FRAMES + RATE_LIMIT_FRAME,
-		);
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + COMPLETE_TOOL_CALL_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
 
 		expect(result.requests).toBe(2);
 		expect(result.rebuilt).toEqual([
@@ -269,9 +317,10 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 	// continues the turn from its tool result, and after a resume the model
 	// sees a tool result whose call is gone.
 	it("keeps a turn a cut stream ended after a complete tool call, with its call and result", async () => {
-		const result = await runAndReopen(
-			MESSAGE_START_FRAME + TEXT_FRAMES + COMPLETE_TOOL_CALL_FRAMES + OVERLOADED_FRAME,
-		);
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + COMPLETE_TOOL_CALL_FRAMES + OVERLOADED_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
 
 		expect(result.requests).toBe(2);
 		expect(result.rebuilt).toEqual([
@@ -284,13 +333,48 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 		expect(result.failedEntry).toMatchObject({ message: { retryRecovery: { status: "recovered", kept: true } } });
 	});
 
+	// Regression: a rate limit cuts off an answer and every continuation is
+	// refused until the attempts are spent; the user resumes the session and
+	// retries, and after the next resume the model sees the abandoned first
+	// half of the answer in front of the fresh one.
+	it("leaves out a kept turn whose continuations all failed, after a resume and a retry", async () => {
+		const first = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			HTTP_RATE_LIMIT,
+		]);
+		expect(first.failedEntry).toMatchObject({ message: { retryRecovery: { status: "superseded" } } });
+
+		primaryAnswers = [{ stream: answer(FRESH_TEXT) }];
+		const resumed = startSession(first.reopened, first.reopened.buildSessionContext().messages);
+		expect(await resumed.retry()).toBe(true);
+		await resumed.waitForIdle();
+		const reopened = await reopen(first.reopened);
+
+		const rebuilt = conversation(reopened.buildSessionContext().messages);
+		expect(rebuilt).toEqual(["user", `assistant[text:${FRESH_TEXT}]`]);
+		expect(rebuilt).toEqual(conversation(resumed.agent.state.messages));
+	});
+
+	// Every other end of a run that kept a turn (here a stated wait past
+	// retry.maxDelayMs on its continuation) marks no `kept`, so the rebuild
+	// leaves the turn out, as it did before `kept` existed.
+	it("leaves out a kept turn whose continuation stated a wait past retry.maxDelayMs", async () => {
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ ...HTTP_RATE_LIMIT, retryAfterSeconds: 600 },
+		]);
+
+		expect(result.rebuilt).toEqual(["user"]);
+		expect(result.failedEntry).toMatchObject({ message: { content: [{ type: "text", text: FIRST_TEXT }] } });
+		expect(result.failedEntry).not.toMatchObject({ message: { retryRecovery: { kept: true } } });
+	});
+
 	// Regression guard: a failed tool-call turn the retry replaced (its marker
 	// does not say kept) has its entries, its synthetic result included, on
 	// the path on disk; the rebuilt context must not bring the turn back, or the
 	// model would see a turn its live context dropped.
 	it("leaves out a failed tool-call turn the retry replaced", async () => {
-		const sessionsDir = path.join(tempDir.path(), "sessions");
-		const sessionManager = SessionManager.create(tempDir.path(), sessionsDir);
+		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
 		managers.push(sessionManager);
 		const usage: AssistantMessage["usage"] = {
 			input: 0,
@@ -336,12 +420,7 @@ describe("automatic retry: a kept turn in the context rebuilt from the session f
 			stopReason: "stop",
 			timestamp: 4,
 		});
-		await sessionManager.flush();
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) throw new Error("Expected the session to persist a file");
-
-		const reopened = await SessionManager.open(sessionFile, sessionsDir, undefined, { suppressBreadcrumb: true });
-		managers.push(reopened);
+		const reopened = await reopen(sessionManager);
 
 		const rebuilt = conversation(reopened.buildSessionContext().messages);
 		expect(rebuilt.filter(message => message.startsWith("assistant"))).toEqual([`assistant[text:${CONTINUED_TEXT}]`]);

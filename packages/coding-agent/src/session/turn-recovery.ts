@@ -1111,7 +1111,6 @@ export class TurnRecovery {
 			}
 			if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
 			let retryRecovery: AssistantRetryRecovery;
-			const kept = pending.kept ? { kept: true as const } : {};
 			if (completion.status === "recovered") {
 				retryRecovery = {
 					kind: "auto-retry",
@@ -1120,7 +1119,8 @@ export class TurnRecovery {
 					recoveredAt: new Date().toISOString(),
 					recovery: pending.recovery,
 					note: pending.note,
-					...kept,
+					// Only a recovered kept turn is followed by its successful continuation.
+					...(pending.kept ? { kept: true as const } : {}),
 					supersededBy: {
 						timestamp: completion.supersedingMessage.timestamp,
 						...(completion.supersedingMessage.responseId === undefined
@@ -1137,7 +1137,6 @@ export class TurnRecovery {
 					attempt: pending.attempt,
 					recovery: pending.recovery,
 					note: pending.note,
-					...kept,
 				};
 			}
 			entry.message.retryRecovery = retryRecovery;

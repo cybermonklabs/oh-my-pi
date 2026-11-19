@@ -1266,12 +1266,13 @@ export type AssistantRetryRecoveryKind = "credential" | "model" | "wait" | "plai
 /**
  * Persisted presentation state for an assistant error superseded by an automatic retry saga.
  *
- * `kept` marks a failed turn the retry kept in context and continued from
- * instead of sending again (a rate limit after visible text, a cut stream after
- * complete tool calls): a model context rebuilt from the session keeps it, as
- * the live context does. Any other marked turn is left out of that rebuild.
- * Sessions written before `kept` existed carry no such marker, so a rebuild
- * leaves their kept turns out too.
+ * `kept` marks a recovered failed turn the retry kept in context and continued
+ * from instead of sending again (a rate limit after visible text, a cut stream
+ * after complete tool calls), whose continuation succeeded: a model context
+ * rebuilt from the session keeps it, as the live context does. Any other
+ * marked turn, a kept one whose continuations all failed included, is left out
+ * of that rebuild. Sessions written before `kept` existed carry no such
+ * marker, so a rebuild leaves their kept turns out too.
  */
 export type AssistantRetryRecovery =
 	| {
@@ -1295,7 +1296,6 @@ export type AssistantRetryRecovery =
 			attempt: number;
 			recovery: AssistantRetryRecoveryKind;
 			note: string;
-			kept?: true;
 	  };
 
 export interface ContextSnapshot {

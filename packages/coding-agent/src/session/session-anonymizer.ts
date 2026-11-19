@@ -178,6 +178,7 @@ const FIELD_RULES: Record<string, Rule> = {
 		"__interrupted",
 		"__synthetic",
 		"executed",
+		"kept",
 		"interrupted",
 		"conflictCount",
 		"madeExecutable",

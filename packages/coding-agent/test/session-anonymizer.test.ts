@@ -191,6 +191,30 @@ describe("SessionAnonymizer", () => {
 		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
+	test("keeps a retried turn's kept marker, so a reload of the export keeps the turn", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "the first half of an answer about acme" }],
+				stopReason: "error",
+				retryRecovery: {
+					kind: "auto-retry",
+					status: "recovered",
+					attempt: 1,
+					recoveredAt: "2026-11-19T00:00:00.000Z",
+					recovery: "plain",
+					note: "error; retried",
+					kept: true,
+				},
+			},
+		});
+
+		expect(at(result, "message", "retryRecovery", "kept")).toBe(true);
+		expect(at(result, "message", "retryRecovery", "status")).toBe("recovered");
+	});
+
 	test.each([null, "high"])("preserves per-call revival metadata with %s thinking", perCallThinkingLevel => {
 		const anonymizer = new SessionAnonymizer();
 		const metadata = {
