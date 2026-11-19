@@ -1859,7 +1859,7 @@ pub fn line_of(vp: &Vproc, node: u32) -> u32 {
 /// [`line_of`] in frame `fi`. zsh numbers no lines in a function body
 /// that is a lone command without braces (`f() cmd`, `() cmd`): `lineno`
 /// stays the caller's.
-fn line_in(vp: &Vproc, fi: usize, node: u32) -> u32 {
+pub(super) fn line_in(vp: &Vproc, fi: usize, node: u32) -> u32 {
 	let f = &vp.frames[fi];
 	let Some(u) = f.unit.as_ref() else {
 		return 0;

@@ -1009,7 +1009,9 @@ impl Kernel {
 	pub fn render_quiet(&mut self, cx: &mut Cx<'_>, vp: &Vproc, line: u32, diag: &Diag) -> Vec<u8> {
 		if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			let (mut prefix, mut zline) = self.zsh_site(cx, vp, line);
-			if self.zsh_shinstdin(cx, vp) {
+			if let Some(caller) = widget_caller_line(vp) {
+				zline = caller;
+			} else if self.zsh_shinstdin(cx, vp) {
 				prefix.clear();
 				zline = 0;
 			}
@@ -1063,9 +1065,14 @@ impl Kernel {
 	/// zsh `zwarning`'s `isset(SHINSTDIN) && !locallevel`: commands read
 	/// from standard input, outside functions (`locallevel`) and sourced
 	/// files (`source` turns `shinstdin` off), report without a script name
-	/// or line ([`crate::bash::diag::ZshSite`] with an empty prefix). A subshell
-	/// decides by the site it inherited.
+	/// or line ([`crate::bash::diag::ZshSite`] with an empty prefix). A
+	/// widget runs in a parameter scope of its own (`execzlefunc` and
+	/// `callcompfunc` call `startparamscope`, which raises `locallevel`). A
+	/// subshell decides by the site it inherited.
 	fn zsh_shinstdin(&mut self, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+		if zle::editor(vp).is_some_and(|ed| ed.in_widget > 0) {
+			return false;
+		}
 		let mut top = false;
 		for f in &vp.frames {
 			match f.kind {
@@ -1155,6 +1162,30 @@ impl Kernel {
 	/// Record a store failure; the next scheduler turn abandons every script.
 	pub fn fail(&mut self, err: StoreError) {
 		self.root.fail(err);
+	}
+}
+
+/// zsh's `lineno` for a diagnostic of the code the line editor runs for a
+/// widget ([`ScriptKind::Hook`] frames on top of the stack, inside a
+/// widget): zsh calls the widget's function directly, so before the
+/// function runs (its autoload stub failing, zsh `loadautofn`) the line is
+/// that of the code the editor runs for: the line being read at the
+/// prompt (the reader's next line), or the line of the command that
+/// started the editor (`vared`). `None` outside that case.
+fn widget_caller_line(vp: &Vproc) -> Option<u32> {
+	let hook = |f: &Frame| matches!(f.kind, FrameKind::Script { what: ScriptKind::Hook, .. });
+	if zle::editor(vp).is_none_or(|ed| ed.in_widget == 0) || !vp.frames.last().is_some_and(hook) {
+		return None;
+	}
+	let fi = vp.frames.iter().rposition(|f| !hook(f))?;
+	let caller = &vp.frames[fi];
+	match (&caller.unit, &caller.kind) {
+		(Some(u), _) => u
+			.ops
+			.get(caller.pc as usize)
+			.map(|op| exec::line_in(vp, fi, op.node)),
+		(None, FrameKind::Script { pos, .. }) => Some(pos.1),
+		(None, _) => None,
 	}
 }
 

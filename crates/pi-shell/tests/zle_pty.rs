@@ -143,6 +143,28 @@ fn ctrl_c_abandons_a_continued_command() {
 	same("PS2='%_> '", |pty| keys(pty, "if true\recho x\x03echo $?\r"));
 }
 
+/// A widget whose autoloaded function has no definition file: zsh runs a
+/// widget in a parameter scope of its own (`execzlefunc`'s
+/// `startparamscope`), so even at the prompt its message names the shell
+/// and the line being edited (`zsh:3:`), as a function's would, where a
+/// command typed at the prompt reports neither.
+#[test]
+fn a_widget_whose_function_file_is_missing_names_the_line() {
+	let rc =
+		"mkdir -p ~/empty\nfpath=(~/empty)\nautoload -Uz nowhere\nzle -N w nowhere\nbindkey '^T' w\n";
+	let (ours, real) = match screens(rc, |pty| {
+		keys(pty, "print one\r")?;
+		keys(pty, "echo x\x14")
+	}) {
+		Ok(s) => s,
+		Err(e) => panic!("pty session failed: {e}"),
+	};
+	assert!(ours.contains("zsh:3: nowhere: function definition file not found"), "{ours}");
+	if let Some(real) = real {
+		assert_eq!(ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
+	}
+}
+
 /// The shell redraws the line at the new width before it handles the next
 /// key, so the screen is read once the editor waits for one.
 #[test]
