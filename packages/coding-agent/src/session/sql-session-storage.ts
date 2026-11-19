@@ -158,8 +158,9 @@ interface DialectQueries {
 	loadIndex: string;
 	/**
 	 * One append: grow the session row's `byte_len` (taking its row lock), then
-	 * insert the line as a part at the old length. PostgreSQL does both in one
-	 * statement; every dialect runs its list in one transaction.
+	 * insert the line as a part at the old length, on SQLite with a rowid from
+	 * `@now` (see {@link partRowids}). PostgreSQL does both in one statement;
+	 * every dialect runs its list in one transaction.
 	 */
 	append: readonly Statement[];
 	/** The session's `byte_len`, row-locked for the rest of the transaction where the dialect can. */
@@ -183,12 +184,17 @@ interface DialectQueries {
 	 * are those of the rows deleted: a row another client commits between two
 	 * statements would otherwise keep its row and lose its parts under READ
 	 * COMMITTED; the second statement deletes only parts whose row it does not
-	 * see, found by a range of the parts' primary key, from `@dir` up to
-	 * `@dir_end` (`@dir` with its final "/" made "0"), with the prefix compared
-	 * by characters too. That range holds every path under `@dir` only where
-	 * the `path` column's collation sorts "/" before "0" and compares the
-	 * characters in order (see {@link pathCollationKeepsDirectoryRange}); MySQL's
-	 * tables are `utf8mb4_bin`, code-point order. SQLite runs its statements
+	 * see, found by a range of the parts' primary key, from `@stem` (`@dir`
+	 * without its final "/") up to `@dir_end` (`@dir` with its final "/" made
+	 * "0"), with the prefix compared by characters too. That range holds every
+	 * path under `@dir` where the `path` column compares by code point: such a
+	 * path extends `@stem`, and differs from `@dir_end` first at its "/". It
+	 * holds under MySQL's `utf8mb4_bin` too, which compares two strings as if
+	 * the shorter were padded with spaces (PAD SPACE): "/" sorts above the
+	 * space, while a path whose character after `@dir` sorts below the space
+	 * sorts below `@dir` itself, so the range starts at `@stem`. PostgreSQL
+	 * takes the range only under a code-point collation (see
+	 * {@link pathCollationKeepsDirectoryRange}). SQLite runs its statements
 	 * inside `BEGIN IMMEDIATE`, where no other writer runs; its parts delete
 	 * takes every part under `@dir`.
 	 */
@@ -196,23 +202,28 @@ interface DialectQueries {
 	/**
 	 * {@link deleteUnder} without the key range: on PostgreSQL the second
 	 * statement compares the prefix alone, a scan of the parts, for a `path`
-	 * column whose collation orders paths otherwise (a libc locale such as
-	 * `en_US.UTF-8` ignores "/" at its first level, so a path under `@dir`
-	 * can sort above `@dir_end`). The other dialects' statements are
-	 * {@link deleteUnder}'s.
+	 * column whose collation does not compare by code point. Such a collation
+	 * can sort a path under `@dir` outside the range: a libc locale such as
+	 * `en_US.UTF-8` ignores "/" at its first level, ICU's Thai collation
+	 * ignores punctuation there (`'/s/a/b' < '/s/a0'` is false under
+	 * `th-x-icu`), and any locale's tailoring or rules can do the same. The
+	 * other dialects' statements are {@link deleteUnder}'s.
 	 */
 	deleteUnderScan: Statement[];
 	/**
 	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
 	 * including, `@high`: a primary-key range, and the prefix compared by
 	 * characters too, so a collation that orders the range otherwise can never
-	 * reach another path's parts.
+	 * reach another path's parts. A staging name has a digit after `@low`, and
+	 * a "-" after the epoch `@high` ends with, both above the space, so MySQL's
+	 * PAD SPACE orders these names as code-point order does.
 	 */
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
 	hasStaging: Statement;
 	/** The byte length of each staging part of `@path`, row-locked where the dialect can, so no peer deletes one before the swap. */
 	stagedBytes: Statement;
+	/** Insert a part; on SQLite with a rowid from `@now` (see {@link partRowids}). */
 	insertPart: Statement;
 	renameRow: Statement;
 	renameParts: Statement;
@@ -238,21 +249,46 @@ interface DialectQueries {
 	 * The parts that start from `@next` up to, not including, `@end`, in
 	 * `start_offset` order: one page. On PostgreSQL and SQLite the page is
 	 * empty unless the part at `@anchor` still has the row identity
-	 * `@anchor_id`, checked in the same statement; MySQL does not check it. On
-	 * SQLite and MySQL it is also empty unless the part at `@last` (the last
-	 * one the read has fetched, -1 before the first page) still holds
-	 * `@last_content`.
+	 * `@anchor_id`, checked in the same statement. On SQLite it is also empty
+	 * unless the part at `@last` (the last one the read has fetched, -1 before
+	 * the first page) still holds `@last_content`. MySQL checks neither; its
+	 * read checks what it yielded once, with {@link readChunksDigest}.
 	 */
 	readParts: Statement;
 	/**
-	 * SQLite only: the largest rowid of the parts table, and an insert that
-	 * sets a part's rowid. A part's row identity, which a chunked read checks,
-	 * is its `xmin` on PostgreSQL (the transaction that wrote it) and its
-	 * `rowid` on SQLite; SQLite hands the rowid of a deleted last row out
-	 * again, so a full write gives its parts rowids above every existing one,
-	 * the replaced parts' included.
+	 * MySQL only, which has no row identity: the digest of what a chunked read
+	 * yielded, as the parts table holds it now, which the read computes the
+	 * same way over what it fetched ({@link addChunkDigest}). Its items are the
+	 * row's own content from `@offset` on (`@row_from` as in
+	 * {@link readChunksStart}), when `@offset` is inside it, and the parts that
+	 * start from `@first` up to, not including, `@size`. An item's digest is
+	 * the first 128 bits of the SHA-256 of its offset in decimal, ":" and its
+	 * bytes; the digest is their XOR, as two 64-bit halves in hex (`high`,
+	 * `low`). One aggregate, so the server never holds the session whole.
+	 * SHA-256 rather than MD5, which a MySQL server in FIPS mode answers with
+	 * NULL.
 	 */
-	partRowids: { last: Statement; insert: Statement } | undefined;
+	readChunksDigest: Statement | undefined;
+	/**
+	 * SQLite only: the first rowid a full write's parts take, and an insert
+	 * that sets a part's rowid. A part's row identity, which a chunked read
+	 * checks, is its `xmin` on PostgreSQL (the transaction that wrote it) and
+	 * its `rowid` on SQLite. SQLite gives a new row the largest rowid plus one,
+	 * which hands the rowid of a deleted last row out again; so every part
+	 * insert on SQLite (the append's, {@link insertPart}'s, and a full write's
+	 * through these) takes a rowid above every one handed out before the
+	 * current millisecond `@now`: the largest rowid plus one, or `@now * 1024`
+	 * when that is more. A full write reads its first rowid before it deletes
+	 * the parts it replaces and counts up from there, so none of its parts
+	 * takes the rowid of one of those. A part inserted in a later millisecond
+	 * than a deleted one never takes its rowid as long as the table takes at
+	 * most 1024 rowids a millisecond, far more than SQLite inserts. It can
+	 * when the clock goes back (or another process's clock, on a database file
+	 * several hosts share, is behind), or when a part is deleted and another
+	 * inserted in the millisecond of the deleted part's own insert. A writer
+	 * older than this rule still hands out the largest rowid plus one.
+	 */
+	partRowids: { next: Statement; insert: Statement } | undefined;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
 	lease: LeaseQueries | undefined;
 }
@@ -459,9 +495,15 @@ interface StagedPartRow {
 	len: number | bigint | string;
 }
 
-/** `partRowids.last` row. */
+/** `readChunksDigest` row: the digest's two 64-bit halves in hex. */
+interface ChunksDigestRow {
+	high: string;
+	low: string;
+}
+
+/** `partRowids.next` row. */
 interface RowidRow {
-	last_rowid: number | bigint | string;
+	next_rowid: number | bigint | string;
 }
 
 const DEFAULT_TABLE = "omp_session_files";
@@ -967,8 +1009,7 @@ interface TableObjectRow {
  * database's, as `to_jsonb` prints their catalog rows: the column's own
  * collation, or for the default collation (provider `d`) the database's. The
  * rows are read whole so the columns of every version since PostgreSQL 10
- * can be read by name (`datlocprovider` since 15, `colllocale` and `datlocale`
- * since 17, `colliculocale` and `daticulocale` before, the ICU rules since 16).
+ * can be read by name (`datlocprovider` exists since 15).
  */
 const PG_PATH_COLLATION = statement(
 	"postgres",
@@ -985,17 +1026,16 @@ interface PathCollationRow {
 }
 
 /**
- * Whether the collation of {@link PG_PATH_COLLATION}'s row sorts every path
- * under a directory `<stem>/` at or above `<stem>/` and below `<stem>0`, so
- * the directory delete may find them by a key range (see `deleteUnder`). That
- * holds where "/" sorts before "0" and the characters compare in order: the
- * builtin provider and libc's `C` and `POSIX` (code-point order), and ICU
- * with its default attributes (punctuation before digits, compared where it
- * stands). A libc locale such as `en_US.UTF-8` ignores "/" at its first
- * level, and an ICU locale with an extension keyword (`-u-ka-shifted` makes
- * punctuation ignorable, `-u-kr-` reorders the digits) or its own rules can
- * sort a path under the directory above `<stem>0`; the delete then compares
- * the prefix alone.
+ * Whether the collation of {@link PG_PATH_COLLATION}'s row compares by code
+ * point, so that it sorts every path under a directory `<stem>/` above
+ * `<stem>` and below `<stem>0`, and the directory delete may find them by a
+ * key range (see `deleteUnder`): the builtin provider, and libc's `C` and
+ * `POSIX`. Any other collation may sort a path under the directory outside
+ * that range, and the delete then compares the prefix alone. A libc locale
+ * such as `en_US.UTF-8` ignores "/" at its first level; ICU's Thai collation
+ * makes punctuation ignorable at its first level (`'/s/a/b' < '/s/a0'` is
+ * false under `th-x-icu`), and any ICU locale's tailoring, extension keywords
+ * (`-u-ka-shifted`, `-u-kr-`) or rules can do the same.
  */
 function pathCollationKeepsDirectoryRange(row: PathCollationRow | undefined): boolean {
 	if (!row) return false;
@@ -1004,15 +1044,9 @@ function pathCollationKeepsDirectoryRange(row: PathCollationRow | undefined): bo
 	const own = collation.collprovider !== "d";
 	const provider = own ? collation.collprovider : (database.datlocprovider ?? "c");
 	if (provider === "b") return true;
-	if (provider === "c") {
-		const locale = own ? collation.collcollate : database.datcollate;
-		return locale === "C" || locale === "POSIX";
-	}
-	const locale = own
-		? (collation.colllocale ?? collation.colliculocale)
-		: (database.datlocale ?? database.daticulocale);
-	const rules = own ? collation.collicurules : database.daticurules;
-	return provider === "i" && typeof locale === "string" && !/-u-|@/i.test(locale) && !rules;
+	if (provider !== "c") return false;
+	const locale = own ? collation.collcollate : database.datcollate;
+	return locale === "C" || locale === "POSIX";
 }
 
 /** `schema` as a PostgreSQL identifier, quoted. */
@@ -1068,7 +1102,10 @@ function buildQueries(
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
 	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
 	const orphanParts = (range: boolean): string =>
-		`${range ? "p.path >= @dir AND p.path < @dir_end AND " : ""}substr(p.path, 1, @len) = @dir`;
+		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}substr(p.path, 1, @len) = @dir`;
+	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids.
+	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
+	const nextRowid = "max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024)";
 	const deleteUnder = (range: boolean): Statement[] =>
 		({
 			postgres: [
@@ -1176,8 +1213,12 @@ function buildQueries(
 										"mtime_ms = excluded.mtime_ms"),
 						),
 						sql(
-							`INSERT INTO ${parts} (path, start_offset, content) ` +
-								`SELECT path, byte_len - @len, @content FROM ${table} WHERE path = @path AND @len > 0`,
+							mysql
+								? `INSERT INTO ${parts} (path, start_offset, content) ` +
+										`SELECT path, byte_len - @len, @content FROM ${table} WHERE path = @path AND @len > 0`
+								: `INSERT INTO ${parts} (rowid, path, start_offset, content) ` +
+										`SELECT (SELECT ${nextRowid} FROM ${parts}), path, byte_len - @len, @content ` +
+										`FROM ${table} WHERE path = @path AND @len > 0`,
 						),
 					],
 		lockSize: sql(`SELECT byte_len FROM ${table} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`),
@@ -1199,7 +1240,8 @@ function buildQueries(
 		hasParts: sql(`SELECT 1 AS found FROM ${parts} WHERE path = @path LIMIT 1`),
 		deleteParts: sql(`DELETE FROM ${parts} WHERE path = @path`),
 		deleteUnder: deleteUnder(true),
-		// Only PostgreSQL's `path` column can carry a collation the range misses (MySQL's tables are `utf8mb4_bin`).
+		// Only PostgreSQL's `path` column can carry a collation the range misses: MySQL's tables are `utf8mb4_bin`,
+		// whose PAD SPACE the range's start at `@stem` allows for (see DialectQueries.deleteUnder).
 		deleteUnderScan: deleteUnder(adapter !== "postgres"),
 		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND substr(path, 1, @len) = @low`),
 		hasStaging: sql(
@@ -1208,7 +1250,12 @@ function buildQueries(
 		stagedBytes: sql(
 			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,
 		),
-		insertPart: sql(`INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`),
+		insertPart: sql(
+			adapter === "sqlite"
+				? `INSERT INTO ${parts} (rowid, path, start_offset, content) ` +
+						`VALUES ((SELECT ${nextRowid} FROM ${parts}), @path, @offset, @content)`
+				: `INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`,
+		),
 		renameRow: sql(
 			`UPDATE ${table} SET path = @dst, mtime_ms = @mtime WHERE path = @src${mysql ? "" : " RETURNING path"}`,
 		),
@@ -1279,20 +1326,30 @@ function buildQueries(
 					? `AND EXISTS (SELECT 1 FROM ${parts} AS p WHERE p.path = @path ` +
 						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
 					: "") +
-				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there.
-				// MySQL compares bytes: utf8mb4_bin pads with spaces, so `=` there ignores trailing ones.
-				(adapter === "postgres"
-					? ""
-					: `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
-						(adapter === "mysql"
-							? "AND CAST(q.content AS BINARY) = CAST(@last_content AS BINARY))) "
-							: "AND q.content = @last_content)) ")) +
+				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there. SQLite
+				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids.
+				(adapter === "sqlite"
+					? `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
+						"AND q.content = @last_content)) "
+					: "") +
 				"ORDER BY start_offset",
 		),
+		// The halves of each item's SHA-256 in hex, read as unsigned 64-bit integers and XORed. `CAST(content AS
+		// binary)` keeps the bytes (utf8mb4_bin's PAD SPACE only affects comparisons).
+		readChunksDigest: mysql
+			? sql(
+					"SELECT LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0') AS high, " +
+						"LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0') AS low FROM (" +
+						`SELECT SHA2(CONCAT(CAST(@offset AS SIGNED), ':', substr(${contentBytes}, @row_from)), 256) AS h ` +
+						`FROM ${table} WHERE path = @path AND @offset < ${contentByteLength} ` +
+						`UNION ALL SELECT SHA2(CONCAT(start_offset, ':', ${contentBytes}), 256) FROM ${parts} ` +
+						"WHERE path = @path AND start_offset >= @first AND start_offset < @size) AS d",
+				)
+			: undefined,
 		partRowids:
 			adapter === "sqlite"
 				? {
-						last: sql(`SELECT coalesce(max(rowid), 0) AS last_rowid FROM ${parts}`),
+						next: sql(`SELECT ${nextRowid} AS next_rowid FROM ${parts}`),
 						insert: sql(
 							`INSERT INTO ${parts} (rowid, path, start_offset, content) VALUES (@rowid, @path, @offset, @content)`,
 						),
@@ -1547,6 +1604,20 @@ async function decodeChunks(chunks: AsyncIterable<Uint8Array>): Promise<{ text: 
 		bytes += chunk.byteLength;
 	}
 	return { text: text + decoder.decode(), bytes };
+}
+
+/** Bytes of a chunked read's digest on MySQL (see `DialectQueries.readChunksDigest`). */
+const CHUNKS_DIGEST_BYTES = 16;
+
+/**
+ * XOR into `digest` the digest of one item a chunked read yielded, as
+ * `DialectQueries.readChunksDigest` computes it: the first
+ * {@link CHUNKS_DIGEST_BYTES} of the SHA-256 of `offset` in decimal, ":" and
+ * `bytes`.
+ */
+function addChunkDigest(digest: Buffer, offset: number, bytes: Uint8Array): void {
+	const item = new Bun.CryptoHasher("sha256").update(`${offset}:`).update(bytes).digest();
+	for (let i = 0; i < CHUNKS_DIGEST_BYTES; i++) digest[i] ^= item[i];
 }
 
 /**
@@ -3067,45 +3138,50 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * A full write or a delete replaces every part of the session, the one the
 	 * read starts at included. So on PostgreSQL and SQLite the query of each
 	 * page also checks, in the same statement, that this part still has the row
-	 * identity the first query saw (its `xmin`; or its rowid, which a full
-	 * write never hands to a new part, see `DialectQueries.partRowids`), and
-	 * finds no parts when it does not. A page with no part where the read is,
-	 * a part that does not start where the previous one ended, or parts that
-	 * end short of the size mean a full write or a delete replaced the parts
-	 * during the read; it then fails with {@link SessionReadConflictError}
-	 * instead of yielding a mix of two bodies.
+	 * identity the first query saw, and finds no parts when it does not: its
+	 * `xmin`, which changes with every insert, or its rowid, which no part
+	 * inserted in a later millisecond takes over (see
+	 * `DialectQueries.partRowids`). A page with no part where the read is, a
+	 * part that does not start where the previous one ended, or parts that end
+	 * short of the size mean a full write or a delete replaced the parts during
+	 * the read; it then fails with {@link SessionReadConflictError} instead of
+	 * yielding a mix of two bodies.
 	 *
-	 * PostgreSQL's `xmin` changes with every insert, so that check sees every
-	 * replacement there. SQLite gives a new row the largest rowid plus one, so
-	 * after a delete, or a full write that leaves no part (a truncate), new
-	 * parts reuse the deleted ones' rowids when those were the table's newest,
-	 * and offsets and size can come out the same too; MySQL has no row
-	 * identity at all. So on SQLite and MySQL the query of each page also
-	 * checks, in the same statement, that the last part already fetched is
-	 * still at its offset with the same bytes: a replacement whose bytes
-	 * differ there is a read conflict whatever its rowids, offsets and size.
-	 * What can go unseen on those two is a replacement that holds exactly the
-	 * bytes of that last part at its offset while it differs both before and
-	 * after it.
+	 * A writer older than SQLite's rowid rule still hands a new part the
+	 * largest rowid plus one, which after a delete or a truncate can be the
+	 * rowid of the part the read started at. So on SQLite the query of each
+	 * page also checks, in the same statement, that the last part already
+	 * fetched is still at its offset with the same bytes; what can go unseen
+	 * there is a replacement within the bounds `partRowids` names, or by such
+	 * a writer, that holds exactly the bytes of that last part at its offset
+	 * while it differs both before and after it. MySQL has no row identity:
+	 * once the read has fetched its last page, one query computes the digest
+	 * of the bytes the read yielded as the database holds them then
+	 * (`DialectQueries.readChunksDigest`), and one that differs from the digest
+	 * the read computed over what it fetched is a read conflict too.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
 		const [row] = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readChunksStart, {
-				path,
-				offset: fromByte,
-				row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
-			}),
+			this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom }),
 		)) as ChunksStartRow[];
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
-		if (row.head && row.head.byteLength > 0) yield row.head;
+		const digestQuery = this.#q.readChunksDigest;
+		// MySQL: the digest of what the read yields, compared with the stored bytes' once it has read them all.
+		const digest = digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined;
+		if (row.head && row.head.byteLength > 0) {
+			if (digest) addChunkDigest(digest, fromByte, row.head);
+			yield row.head;
+		}
 		if (fromByte >= size) return;
 		const firstPart = rowNumber(row.first_part);
 		const anchor = { anchor: firstPart, anchor_id: row.first_id };
-		let next = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
+		const first = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
+		let next = first;
 		let skip = Math.max(0, fromByte - next);
-		// The last part fetched, which the next page's query finds unchanged (SQLite and MySQL); none yet.
+		// The last part fetched, which the next page's query finds unchanged (SQLite); none yet.
 		let last = { last: -1, last_content: "" };
 		for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
 			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
@@ -3120,6 +3196,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				if (start >= size) break;
 				last = { last: start, last_content: part.content };
 				const bytes = Buffer.from(part.content, "utf8");
+				if (digest) addChunkDigest(digest, start, bytes);
 				next = start + bytes.byteLength;
 				if (skip >= bytes.byteLength) {
 					skip -= bytes.byteLength;
@@ -3130,6 +3207,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 		}
 		if (next !== size) throw new SessionReadConflictError(path);
+		// A read that fetched no page yielded only what its first query returned.
+		if (!digestQuery || !digest || first >= size) return;
+		const [stored] = (await this.#exclusive(() =>
+			this.#readOne(digestQuery, { path, offset: fromByte, row_from: rowFrom, first, size }),
+		)) as ChunksDigestRow[];
+		if (!stored || `${stored.high}${stored.low}`.toLowerCase() !== digest.toString("hex")) {
+			throw new SessionReadConflictError(path);
+		}
 	}
 
 	#unmeasured(path: string): Error {
@@ -3203,7 +3288,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				const parts = batch;
 				batch = [];
 				await fenced(async transaction => {
-					for (const part of parts) await run(transaction, this.#q.insertPart, { path: staging, ...part });
+					for (const part of parts) {
+						await run(transaction, this.#q.insertPart, { path: staging, ...part, now: Date.now() });
+					}
 				});
 			};
 			for await (const part of utf8Parts(chunks, PART_BYTES)) {
@@ -3284,14 +3371,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Replace `path`'s parts with `bytes`, as parts of at most
 	 * {@link PART_BYTES}, each ending on a UTF-8 character boundary. On SQLite
-	 * the new parts take rowids above every part's, read before the old ones
-	 * go, so none takes the rowid of a part it replaces (see
-	 * {@link readChunks}).
+	 * the new parts take rowids counting up from the first one free above
+	 * every part's and the clock's floor, read before the old ones go, so none
+	 * takes the rowid of a part it replaces (see `DialectQueries.partRowids`).
 	 */
 	async #replaceParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
 		const rowids = this.#q.partRowids;
-		const [last] = rowids ? ((await run(transaction, rowids.last, {})) as RowidRow[]) : [];
-		let rowid = last ? rowNumber(last.last_rowid) : 0;
+		const [first] = rowids ? ((await run(transaction, rowids.next, { now: Date.now() })) as RowidRow[]) : [];
+		let rowid = first ? rowNumber(first.next_rowid) : 0;
 		await this.#deleteParts(transaction, path);
 		for (let start = 0; start < bytes.byteLength;) {
 			const end = utf8PartEnd(bytes, start, PART_BYTES);
@@ -3299,7 +3386,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				path,
 				offset: start,
 				content: bytes.toString("utf8", start, end),
-				rowid: ++rowid,
+				rowid: rowid++,
 			});
 			start = end;
 		}
@@ -3333,7 +3420,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				const actualSize = await this.#lockSize(transaction, path);
 				if ((actualSize ?? 0) !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
 			}
-			for (const query of this.#q.append) await run(transaction, query, values);
+			// On SQLite the part's rowid comes from the clock read here, after any delete it follows (see partRowids).
+			for (const query of this.#q.append) await run(transaction, query, { ...values, now: Date.now() });
 		});
 	}
 
@@ -3342,12 +3430,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async remove(paths: string[], dir?: string): Promise<void> {
-		// `@dir_end` bounds the key range of the parts under `dir` from above: `dir` with its final "/"
-		// made "0". Where the `path` collation sorts "/" before "0" and compares the characters in order
-		// (code-point order, ICU's defaults), every path under `dir` sorts below it whatever follows the
-		// "/"; no character after `dir` can do that in both (ICU sorts U+FFFD and U+FFFF after U+10FFFF).
-		// Under any other collation the delete compares the prefix alone (#directoryRange).
-		const under = dir === undefined ? undefined : { dir, len: [...dir].length, dir_end: `${dir.slice(0, -1)}0` };
+		// The key range of the parts under `dir` runs from `dir` without its final "/" up to `dir` with that
+		// "/" made "0": in code-point order and under MySQL's PAD SPACE every path under `dir` sorts within it,
+		// whatever follows the "/" (see DialectQueries.deleteUnder). On PostgreSQL the delete takes the range
+		// only under a code-point collation, and compares the prefix alone under any other (#directoryRange).
+		const stem = dir?.slice(0, -1) ?? "";
+		const under = dir === undefined ? undefined : { dir, len: [...dir].length, stem, dir_end: `${stem}0` };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
