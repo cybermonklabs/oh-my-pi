@@ -302,14 +302,14 @@ impl Signal {
 	/// table, which zsh's build makes from the C library's headers
 	/// (`Src/signames1.awk` lists every `#define SIG…` of them,
 	/// `Src/signames2.awk` keeps the first name per number, except that
-	/// `CHLD` replaces `CLD` and `POLL` replaces `IO`). On Linux `POLL`
-	/// names 29; glibc 2.32 and later define `SIGIOT` (in
-	/// `bits/signum-arch.h`, which zsh's configure lists before
-	/// `bits/signum-generic.h`) before `SIGABRT`, so zsh 5.9 names 6 `IOT`
-	/// there. Elsewhere the name is the signal's own.
+	/// `CHLD` replaces `CLD`, `POLL` replaces `IO` and `ABRT` replaces
+	/// `IOT`). On Linux `POLL` names 29. That `ABRT` replaces `IOT` is zsh
+	/// after 5.9 (zsh-users/zsh@6d40d9b6): zsh 5.9 built against glibc 2.32
+	/// or later, which defines `SIGIOT` first, names 6 `IOT` and refuses
+	/// `ABRT`; zsh after it, zsh on macOS and bash name 6 `ABRT`.
+	/// Elsewhere the name is the signal's own.
 	pub fn zsh_name(self, platform: Platform) -> &'static str {
 		match (self, platform) {
-			(Self::Abrt, Platform::Linux) => "IOT",
 			(Self::Io, Platform::Linux) => "POLL",
 			_ => self.into(),
 		}
@@ -318,21 +318,22 @@ impl Signal {
 	/// zsh's `alt_sigs` for the signal on `platform`: other names zsh takes
 	/// for it (as input, and as `TRAPNAL` function names). On Linux `CLD`
 	/// names `SIGCHLD` and `IO` names `SIGPOLL` (`SIGCLD` and `SIGIO` are
-	/// defined as those); zsh's `ERR` names its `ZERR` pseudo-signal, not a
-	/// signal.
+	/// defined as those); `IOT` names `SIGABRT`, as in zsh after 5.9 where
+	/// the C library defines both as one number (Linux and macOS); zsh's
+	/// `ERR` names its `ZERR` pseudo-signal, not a signal.
 	pub const fn zsh_alternates(self, platform: Platform) -> &'static [&'static str] {
 		match (self, platform) {
 			(Self::Chld, Platform::Linux) => &["CLD"],
 			(Self::Io, Platform::Linux) => &["IO"],
+			(Self::Abrt, _) => &["IOT"],
 			_ => &[],
 		}
 	}
 
 	/// The signal zsh's `getsigidx` finds for `name` (without `SIG`): a name
 	/// of zsh's `sigs` table ([`Self::zsh_name`]; zsh 5.9 has no real-time
-	/// signals), else one of its alternates ([`Self::zsh_alternates`]). So
-	/// `ABRT` names no signal of zsh's on Linux. `nocase` compares ignoring
-	/// case (`kill -l`).
+	/// signals), else one of its alternates ([`Self::zsh_alternates`]).
+	/// `nocase` compares ignoring case (`kill -l`).
 	pub fn from_zsh_name(name: &[u8], platform: Platform, nocase: bool) -> Option<Self> {
 		use strum::IntoEnumIterator;
 		let eq = |a: &str| {

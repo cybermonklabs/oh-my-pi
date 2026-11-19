@@ -17,14 +17,14 @@ fn zsh_on(platform: Platform, src: &str) -> (String, String) {
 	)
 }
 
-/// zsh 5.9's signal names on Linux, as its build makes them from glibc's
-/// headers (`Src/signames1.awk`, `Src/signames2.awk`): glibc 2.32 and later
-/// define `SIGIOT` before `SIGABRT` (`bits/signum-arch.h`), so 6 is `IOT`,
-/// and zsh prefers `POLL` to `IO` for 29. The Debian/Ubuntu zsh 5.9 on
-/// glibc 2.39 prints exactly these.
-const LINUX_SIGNALS: &str = "EXIT HUP INT QUIT ILL TRAP IOT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM \
-                             TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF \
-                             WINCH POLL PWR SYS ZERR DEBUG";
+/// zsh's signal names on Linux, as its build makes them from glibc's
+/// headers (`Src/signames1.awk`, `Src/signames2.awk`): zsh prefers `POLL`
+/// to `IO` for 29 and, after 5.9 (zsh-users/zsh@6d40d9b6), `ABRT` to
+/// `IOT` for 6. (zsh 5.9 against glibc 2.32 or later, which defines
+/// `SIGIOT` first, has `IOT` there.)
+const LINUX_SIGNALS: &str = "EXIT HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE \
+                             ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM \
+                             PROF WINCH POLL PWR SYS ZERR DEBUG";
 
 /// zsh 5.9's signal names on macOS: Darwin's `sys/signal.h` defines
 /// `SIGABRT` 6 before `SIGIOT` (`SIGABRT`), `SIGEMT` 7, `SIGIO` 23 and
@@ -33,56 +33,52 @@ const MACOS_SIGNALS: &str = "EXIT HUP INT QUIT ILL TRAP ABRT EMT FPE KILL BUS SE
                              TERM URG STOP TSTP CONT CHLD TTIN TTOU IO XCPU XFSZ VTALRM PROF \
                              WINCH INFO USR1 USR2 ZERR DEBUG";
 
-/// `$signals`, `kill -l` and `trap` name the signals as zsh 5.9 does on
-/// Linux; zsh's alternate names (`CLD`, `IO`) are taken as input, and
-/// `ABRT` is not a signal of zsh's there.
+/// `$signals`, `kill -l` and `trap` name the signals as zsh after 5.9 does
+/// on Linux; zsh's alternate names (`CLD`, `IO`, `IOT`) are taken as
+/// input.
 #[test]
-fn zsh_names_the_signals_as_its_linux_build() {
+fn zsh_names_the_signals_on_linux() {
 	let (out, err) = zsh_on(
 		Platform::Linux,
-		"print -r -- $signals; kill -l; kill -l 6 29 17; kill -l IOT POLL IO CLD iot; kill -l ABRT; \
-		 print st=$?; trap 'print x' IOT; trap 'print y' POLL; trap; trap '' ABRT; print st=$?; \
-		 trap - IOT POLL; kill -ABRT $$; print st=$?",
+		"print -r -- $signals; kill -l; kill -l 6 29 17; kill -l IOT POLL IO CLD iot ABRT; print \
+		 st=$?; trap 'print x' IOT; trap 'print y' POLL; trap; trap - ABRT POLL; trap; print st=$?",
 	);
 	let kill_l = LINUX_SIGNALS
 		.strip_prefix("EXIT ")
 		.and_then(|s| s.strip_suffix(" ZERR DEBUG"))
 		.unwrap();
 	assert_eq!(
-		out,
-		format!(
-			"{LINUX_SIGNALS}\n{kill_l}\nIOT\nPOLL\nCHLD\n6\n29\n29\n17\n6\nst=1\ntrap -- 'print x' \
-			 IOT\ntrap -- 'print y' POLL\nst=1\nst=1\n"
+		(out, err.as_str()),
+		(
+			format!(
+				"{LINUX_SIGNALS}\n{kill_l}\nABRT\nPOLL\nCHLD\n6\n29\n29\n17\n6\n6\nst=0\ntrap -- \
+				 'print x' ABRT\ntrap -- 'print y' POLL\nst=0\n"
+			),
+			""
 		)
-	);
-	assert_eq!(
-		err,
-		"zsh:kill:1: unknown signal: SIGABRT\nzsh:trap:1: undefined signal: ABRT\nzsh:kill:1: \
-		 unknown signal: SIGABRT\nzsh:kill:1: type kill -l for a list of signals\n"
 	);
 }
 
 /// On macOS zsh's names are the signals' own: 6 is `ABRT`, 23 `IO`, and
-/// `IOT` names nothing.
+/// after 5.9 `IOT` is a second name of `ABRT` there too.
 #[test]
-fn zsh_names_the_signals_as_its_macos_build() {
-	let (out, err) =
-		zsh_on(Platform::MacOs, "print -r -- $signals; kill -l 6 23 ABRT IO; kill -l IOT");
-	assert_eq!(out, format!("{MACOS_SIGNALS}\nABRT\nIO\n6\n23\n"));
-	assert_eq!(err, "zsh:kill:1: unknown signal: SIGIOT\n");
+fn zsh_names_the_signals_on_macos() {
+	let (out, err) = zsh_on(Platform::MacOs, "print -r -- $signals; kill -l 6 23 ABRT IO IOT");
+	assert_eq!((out, err.as_str()), (format!("{MACOS_SIGNALS}\nABRT\nIO\n6\n23\n6\n"), ""));
 }
 
 /// A `TRAPNAL` function named by zsh's name of a signal on Linux
-/// (`TRAPIOT`) or one of its alternates (`TRAPIO` for `POLL`) is the
-/// signal's trap: the signal sent to the shell calls it with the number.
+/// (`TRAPABRT`) or one of its alternates (`TRAPIOT`, `TRAPIO` for `POLL`)
+/// is the signal's trap: the signal sent to the shell calls it with the
+/// number.
 #[test]
 fn a_trapnal_function_is_found_by_zshs_names_on_linux() {
 	let (out, err) = zsh_on(
 		Platform::Linux,
-		"TRAPIOT() { print got $1 }; kill -IOT $$; TRAPIO() { print io $1 }; kill -POLL $$; print \
-		 st=$?",
+		"TRAPABRT() { print abrt $1 }; kill -ABRT $$; TRAPIOT() { print iot $1 }; kill -IOT $$; \
+		 TRAPIO() { print io $1 }; kill -POLL $$; print st=$?",
 	);
-	assert_eq!((out.as_str(), err.as_str()), ("got 6\nio 29\nst=0\n", ""));
+	assert_eq!((out.as_str(), err.as_str()), ("abrt 6\niot 6\nio 29\nst=0\n", ""));
 }
 
 #[test]

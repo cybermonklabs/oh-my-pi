@@ -287,21 +287,31 @@ fn compsys_ssh_hosts_and_options() {
 }
 
 /// zsh 5.9's screen for `kill -<Tab>` on Linux: the signal names of its
-/// build against glibc 2.32 or later (6 is `IOT`, 29 `POLL`; see the
-/// engine's `Signal::zsh_name`), as the Debian/Ubuntu zsh 5.9 shows them.
-/// A live `/bin/zsh` would test the C library it was built against, not
-/// obash.
+/// build against glibc 2.32 or later (6 is `IOT`, 29 `POLL`), as the
+/// Debian/Ubuntu zsh 5.9 shows them. A live `/bin/zsh` would test the C
+/// library it was built against, not obash.
 #[cfg(target_os = "linux")]
-const KILL_SIGNALS: &str = "% kill -\n-l  -- list signal names or numbers of specified \
-                            signals\n-n  -- specify signal number\n-s  -- specify signal \
-                            name\n-ALRM    -FPE     -IOT     -PROF    -STKFLT  -TRAP    -URG     \
-                            -WINCH\n-BUS     -HUP     -KILL    -PWR     -STOP    -TSTP    -USR1    \
-                            -XCPU\n-CHLD    -ILL     -PIPE    -QUIT    -SYS     -TTIN    -USR2    \
-                            -XFSZ\n-CONT    -INT     -POLL    -SEGV    -TERM    -TTOU    -VTALRM";
+const KILL_SIGNALS_5_9: &str =
+	"% kill -\n-l  -- list signal names or numbers of specified signals\n-n  -- specify signal \
+	 number\n-s  -- specify signal name\n-ALRM    -FPE     -IOT     -PROF    -STKFLT  -TRAP    \
+	 -URG     -WINCH\n-BUS     -HUP     -KILL    -PWR     -STOP    -TSTP    -USR1    -XCPU\n-CHLD    \
+	 -ILL     -PIPE    -QUIT    -SYS     -TTIN    -USR2    -XFSZ\n-CONT    -INT     -POLL    -SEGV    \
+	 -TERM    -TTOU    -VTALRM";
 
-/// On Linux obash's screen is pinned ([`KILL_SIGNALS`]), with zsh 5.9's
-/// installed completion functions; elsewhere it is compared with the real
-/// zsh.
+/// The same screen with zsh after 5.9's names (zsh-users/zsh@6d40d9b6):
+/// 6 is `ABRT`, which sorts first.
+#[cfg(target_os = "linux")]
+const KILL_SIGNALS_AFTER_5_9: &str =
+	"% kill -\n-l  -- list signal names or numbers of specified signals\n-n  -- specify signal \
+	 number\n-s  -- specify signal name\n-ABRT    -CONT    -INT     -PROF    -STKFLT  -TRAP    \
+	 -URG     -WINCH\n-ALRM    -FPE     -KILL    -PWR     -STOP    -TSTP    -USR1    -XCPU\n-BUS     \
+	 -HUP     -PIPE    -QUIT    -SYS     -TTIN    -USR2    -XFSZ\n-CHLD    -ILL     -POLL    -SEGV    \
+	 -TERM    -TTOU    -VTALRM";
+
+/// On Linux obash's screen is zsh 5.9's or zsh after 5.9's, which differ in
+/// the name of 6 ([`KILL_SIGNALS_5_9`], [`KILL_SIGNALS_AFTER_5_9`]), with
+/// zsh 5.9's installed completion functions; elsewhere it is compared with
+/// the real zsh.
 #[test]
 fn compsys_kill_signals() {
 	let drive = |pty: &mut Pty| keys(pty, "kill -\t");
@@ -319,7 +329,11 @@ fn compsys_kill_signals() {
 		let mut ours = spawn(false, &rc, &dir).spawn().expect("spawn obash");
 		prepared(&mut ours, &drive).expect("pty session");
 		let screen = ours.screen().contents();
-		assert_eq!(screen, KILL_SIGNALS, "obash screen:\n{screen}\n--- zsh 5.9:\n{KILL_SIGNALS}");
+		assert!(
+			[KILL_SIGNALS_5_9, KILL_SIGNALS_AFTER_5_9].contains(&screen.as_str()),
+			"obash screen:\n{screen}\n--- zsh 5.9:\n{KILL_SIGNALS_5_9}\n--- zsh after \
+			 5.9:\n{KILL_SIGNALS_AFTER_5_9}"
+		);
 	}
 }
 

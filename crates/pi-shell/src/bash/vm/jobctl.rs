@@ -128,11 +128,10 @@ impl JobCtl {
 
 /// zsh `sigmsg`: how a signal is named in job notices on `platform`. The
 /// text is that of the name zsh's build gave the signal's number
-/// ([`Signal::zsh_name`]): on Linux 6 is `IOT` (`IOT instruction`) and 29
-/// `POLL` (`pollable event occurred`).
+/// ([`Signal::zsh_name`]): on Linux 29 is `POLL` (`pollable event
+/// occurred`), and 6 is `ABRT` (`abort`), as in zsh after 5.9.
 pub const fn sigmsg(sig: Signal, platform: Platform) -> &'static str {
 	match sig {
-		Signal::Abrt if matches!(platform, Platform::Linux) => "IOT instruction",
 		Signal::Io if matches!(platform, Platform::Linux) => "pollable event occurred",
 		Signal::Hup => "hangup",
 		Signal::Int => "interrupt",
@@ -1594,11 +1593,13 @@ impl Shell {
 mod tests {
 	use super::{Platform, Signal, sigmsg};
 
-	/// zsh 5.9's `sig_msg` texts, which follow its build's name for the
-	/// number (`Src/signames2.awk`): on Linux 6 is `IOT` and 29 `POLL`.
+	/// zsh's `sig_msg` texts, which follow its build's name for the number
+	/// (`Src/signames2.awk`): on Linux 29 is `POLL`, and 6 `ABRT` as in zsh
+	/// after 5.9 (zsh 5.9 against glibc 2.32 or later says `IOT
+	/// instruction`).
 	#[test]
 	fn job_messages_follow_zshs_names_on_each_platform() {
-		assert_eq!(sigmsg(Signal::Abrt, Platform::Linux), "IOT instruction");
+		assert_eq!(sigmsg(Signal::Abrt, Platform::Linux), "abort");
 		assert_eq!(sigmsg(Signal::Io, Platform::Linux), "pollable event occurred");
 		assert_eq!(sigmsg(Signal::Abrt, Platform::MacOs), "abort");
 		assert_eq!(sigmsg(Signal::Io, Platform::MacOs), "i/o ready");
