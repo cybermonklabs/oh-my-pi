@@ -491,27 +491,49 @@ pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOp
 		return status;
 	}
 	let Launch { args, env, input } = *launch;
-	let (status, died_of) = run(&args, env, input, opts);
+	let (status, death) = run(&args, env, input, opts);
 	let _ = io::stdout().flush();
 	#[cfg(unix)]
-	if let Some(signal) = died_of
+	if let Some(death) = death
 		&& !opts.embedded
 	{
-		die_of(signal);
+		die_of(death);
 	}
 	#[cfg(not(unix))]
-	let _ = died_of;
+	let _ = death;
 	status
 }
 
-/// End the process by `signal`'s default action: the disposition back to
-/// the default, the signal unblocked, then raised. Returns only when the
-/// signal does not end the process.
+/// The signal a standalone shell dies of ([`run`]).
+#[derive(Clone, Copy, Debug)]
+struct Death {
+	/// The signal's number.
+	signal:    i32,
+	/// An `exec`ed program died of it ([`Shell::exec_signal`]): the shell
+	/// passes that death on, and dumps no core of its own beside the
+	/// program's (zsh and bash `exec` the program, so one core exists).
+	passed_on: bool,
+}
+
+/// End the process by `death`'s signal's default action: the disposition
+/// back to the default, the signal unblocked, then raised. A death passed
+/// on from an `exec`ed program first makes the process dump no core
+/// (`PR_SET_DUMPABLE` 0 on Linux, whatever `core_pattern` says; a core
+/// size limit of 0 elsewhere). Returns only when the signal does not end
+/// the process.
 #[cfg(unix)]
-fn die_of(signal: i32) {
-	// SAFETY: plain disposition, mask and raise calls on a valid signal
-	// number and a set initialized by sigemptyset.
+fn die_of(death: Death) {
+	let Death { signal, passed_on } = death;
+	// SAFETY: plain prctl, rlimit, disposition, mask and raise calls on a
+	// valid signal number, an initialized limit and a set initialized by
+	// sigemptyset.
 	unsafe {
+		if passed_on {
+			#[cfg(target_os = "linux")]
+			libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+			#[cfg(not(target_os = "linux"))]
+			libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
+		}
 		libc::signal(signal, libc::SIG_DFL);
 		let mut set: libc::sigset_t = mem::zeroed();
 		libc::sigemptyset(&raw mut set);
@@ -549,7 +571,7 @@ fn run(
 	env: Vec<(BString, BString)>,
 	input: Input,
 	opts: ProcessOptions,
-) -> (i32, Option<i32>) {
+) -> (i32, Option<Death>) {
 	// Declared first, dropped last: the runtime gets its dispositions back
 	// after the host has put its trap handlers back.
 	let _runtime = if opts.embedded {
@@ -590,7 +612,14 @@ fn run(
 	shell.set_event_mask(EventMask::NONE);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
-	let died_of = shell.killed_by().or_else(|| shell.exec_signal(run));
+	let death = shell
+		.killed_by()
+		.map(|signal| Death { signal, passed_on: false })
+		.or_else(|| {
+			shell
+				.exec_signal(run)
+				.map(|signal| Death { signal, passed_on: true })
+		});
 	// zsh `zexit`: hang up running jobs, give the terminal back.
 	shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
 	// Standalone, the process exits next: let the OS reclaim the engine's
@@ -606,7 +635,7 @@ fn run(
 		mem::forget(store);
 		mem::forget(engine);
 	}
-	(status & 0xff, died_of)
+	(status & 0xff, death)
 }
 
 /// The new shell's initial state from the command line `args`.

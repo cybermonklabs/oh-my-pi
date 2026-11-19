@@ -6,7 +6,13 @@
 mod pty_support;
 mod zsh_oracle;
 
-use std::{ffi::OsStr, io, os::unix::process::CommandExt, process::Command};
+use std::{
+	ffi::OsStr,
+	fs, io,
+	os::unix::process::{CommandExt, ExitStatusExt},
+	path::Path,
+	process::Command,
+};
 
 use pty_support::{Spawn, TIMEOUT};
 
@@ -189,7 +195,6 @@ fn a_trapnal_function_catches_a_real_signal() {
 /// `args` run as `zsh` by `program`: stdout, stderr, and the signal the
 /// process died of (`None`: it exited).
 fn run_signal(program: impl AsRef<OsStr>, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-	use std::os::unix::process::ExitStatusExt;
 	let out = Command::new(program)
 		.arg0("zsh")
 		.args(args)
@@ -227,6 +232,79 @@ fn a_parent_shell_reports_its_child_shells_signal_death() {
 	if have_zsh() {
 		let real = zsh_oracle::path();
 		assert_eq!(ours, run(&real, &["-f", "-c", &line(&real)]));
+	}
+}
+
+/// `args` run as `zsh` by `program` in `dir`, with the core size limit
+/// raised to its hard limit: stdout, stderr, the signal the process died
+/// of, and whether it dumped a core.
+fn run_dumping(
+	program: impl AsRef<OsStr>,
+	args: &[&str],
+	dir: &Path,
+) -> (Vec<u8>, Vec<u8>, Option<i32>, bool) {
+	let mut cmd = Command::new(program);
+	cmd.arg0("zsh")
+		.args(args)
+		.env_remove("ZDOTDIR")
+		.current_dir(dir);
+	// SAFETY: getrlimit and setrlimit are async-signal-safe and change only
+	// the child.
+	unsafe {
+		cmd.pre_exec(|| {
+			let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			if libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) == 0 {
+				limit.rlim_cur = limit.rlim_max;
+				libc::setrlimit(libc::RLIMIT_CORE, &raw const limit);
+			}
+			Ok(())
+		});
+	}
+	let out = cmd.output().expect("start the shell");
+	(out.stdout, out.stderr, out.status.signal(), out.status.core_dumped())
+}
+
+/// The `core*` files in `dir`.
+fn cores(dir: &Path) -> Vec<String> {
+	fs::read_dir(dir)
+		.expect("read the directory")
+		.flatten()
+		.map(|e| e.file_name().to_string_lossy().into_owned())
+		.filter(|name| name.starts_with("core"))
+		.collect()
+}
+
+/// An `exec`ed program that dies of a core-dumping signal ends the shell's
+/// process by that signal with no core of the shell's own: zsh `exec`s the
+/// program, so one process dies and at most its own core exists. The
+/// program here sets its core size limit to 0, so neither shell leaves a
+/// core. The control: `/bin/sh` killed by `SIGQUIT` with the limit raised
+/// dumps a core here; where it does not (no core dump can be seen, as
+/// under gVisor), the test says so.
+#[test]
+fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
+	let args = ["-f", "-c", "exec /bin/sh -c 'ulimit -c 0; kill -QUIT $$'"];
+	let control_dir = tempfile::tempdir().expect("a directory for the control's core");
+	let control = run_dumping("/bin/sh", &["-c", "kill -QUIT $$"], control_dir.path());
+	if !control.3 {
+		zsh_oracle::uncompared(&format!(
+			"no core dump can be seen here: /bin/sh killed by SIGQUIT with its core size limit \
+			 raised dumped no core (it died of {:?})",
+			control.2
+		));
+	}
+	let dir = tempfile::tempdir().expect("a directory for the shell's core");
+	let ours = run_dumping(env!("CARGO_BIN_EXE_obash"), &args, dir.path());
+	assert_eq!(
+		(ours.2, ours.3, cores(dir.path())),
+		(Some(libc::SIGQUIT), false, Vec::new()),
+		"{}",
+		String::from_utf8_lossy(&ours.1)
+	);
+	if have_zsh() {
+		let zsh_dir = tempfile::tempdir().expect("a directory for zsh's core");
+		let real = run_dumping(zsh_oracle::path(), &args, zsh_dir.path());
+		assert_eq!((ours.2, ours.3), (real.2, real.3));
 	}
 }
 
