@@ -539,8 +539,14 @@ interface DataVersionRow {
 interface ChunksPass {
 	/** MySQL: the digest of the head and of every part the pass read, each part whole (see `DialectQueries.readChunksDigest`). */
 	readonly digest?: Buffer;
-	/** SQLite: the SHA-256 of the bytes the pass yielded. */
+	/** SQLite, the read's own pass: the SHA-256 of the bytes the pass yielded. */
 	readonly hash?: Bun.CryptoHasher;
+	/**
+	 * SQLite, the pass with `hash`: the read's start mark (see
+	 * `SqlSessionStorageBackend.#sqliteMark`), which the pass takes in the call
+	 * queue's turn of its first query, right before it.
+	 */
+	mark?: string;
 	/** Bytes the pass yielded. */
 	yielded: number;
 	/** Where the parts the pass read start: the part it started in, or the end of the row's own content. */
@@ -753,6 +759,16 @@ const sqliteFileQueues = new Map<string, SqliteQueue>();
 const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
 
 /**
+ * Whether a SQLite `filename` opens a database that only its own connection
+ * sees: `":memory:"`, an in-memory database, or `""`, a private temporary one
+ * that SQLite deletes when the connection closes. No other connection can
+ * open it, so none can commit to it.
+ */
+function isPrivateSqliteDatabase(filename: unknown): boolean {
+	return filename === "" || filename === ":memory:";
+}
+
+/**
  * The call queue every store in this process shares for `client`'s database.
  * Bun's SQLite adapter runs each client's statements on one connection, so a
  * statement issued while another call's transaction is open would join that
@@ -761,12 +777,13 @@ const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
  * process for the whole busy timeout, then fails. So calls queue per database
  * file, by its identity ({@link sqliteFileIdentity} of `options.filename`,
  * which `Bun.SQL` sets), so two spellings of one file share a queue, and the
- * busy wait only ever waits on other processes. In-memory databases, and
- * wrappers that hide `options.filename`, queue per client object.
+ * busy wait only ever waits on other processes. Private databases
+ * ({@link isPrivateSqliteDatabase}), and wrappers that hide
+ * `options.filename`, queue per client object.
  */
 function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 	const filename = client.options.filename;
-	if (typeof filename !== "string" || filename === "" || filename === ":memory:") {
+	if (typeof filename !== "string" || isPrivateSqliteDatabase(filename)) {
 		let queue = sqliteClientQueues.get(client);
 		if (!queue) {
 			queue = { tail: Promise.resolve() };
@@ -783,21 +800,35 @@ function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 	return queue;
 }
 
+/** Slots of {@link SqliteWrites.slots}: a client keeps this many write counts, however many paths it writes. */
+const SQLITE_WRITE_SLOTS = 1024;
+
 /**
  * SQLite: the writes one client made that can change the bytes of a session
  * path. A chunked read compares them, with `PRAGMA data_version`, before its
  * first query and at its end (see `SqlSessionStorageBackend.readChunks`). The
  * pragma moves when another connection, of this process or another, commits
  * to the database file, and never for the connection's own commits; these
- * counts cover those. Counted per path, so a parent's appends never make its
- * subagents' reads check again; a directory delete, which can change every
- * path under the directory, counts once for every path.
+ * counts cover those. A write counts in the slot of its path
+ * ({@link sqliteWriteSlot}), one of {@link SQLITE_WRITE_SLOTS}, so the counts
+ * hold the same memory however many paths a process writes in its life. Two
+ * paths that share a slot only cause an extra check of a read, never a
+ * missed one: a parent's appends make its subagents' reads check again only
+ * when their paths share a slot. A slot's count wraps at 2^32, which makes a
+ * read's end mark equal its start mark only when 2^32 writes of its slot land
+ * between them. A directory delete, which can change every path under the
+ * directory, counts once for every path.
  */
 interface SqliteWrites {
 	/** Writes that can change every path: directory deletes. */
 	every: number;
-	/** Writes of each path: appends, full writes and the swaps of staged ones, deletes, both paths of a rename. */
-	readonly paths: Map<string, number>;
+	/** Writes of the paths of each slot: appends, full writes and the swaps of staged ones, deletes, both paths of a rename. */
+	readonly slots: Uint32Array;
+}
+
+/** The slot of {@link SqliteWrites.slots} that counts the writes of `path`. */
+function sqliteWriteSlot(path: string): number {
+	return Bun.hash.xxHash32(path) % SQLITE_WRITE_SLOTS;
 }
 
 /** {@link SqliteWrites} by client: a store has one client, and stores that share a client share its connection. */
@@ -807,7 +838,7 @@ const sqliteClientWrites = new WeakMap<SqlSessionStorageClient, SqliteWrites>();
 function sqliteWrites(client: SqlSessionStorageClient): SqliteWrites {
 	let writes = sqliteClientWrites.get(client);
 	if (!writes) {
-		writes = { every: 0, paths: new Map() };
+		writes = { every: 0, slots: new Uint32Array(SQLITE_WRITE_SLOTS) };
 		sqliteClientWrites.set(client, writes);
 	}
 	return writes;
@@ -1908,8 +1939,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #sqliteQueue: SqliteQueue | undefined;
 	/** This client's writes of session paths on SQLite (see {@link SqliteWrites}); unset on other dialects. */
 	readonly #sqliteWrites: SqliteWrites | undefined;
-	/** Whether the SQLite database is in memory: its connection's alone, where no other connection commits. */
-	readonly #sqliteInMemory: boolean;
+	/** Whether the SQLite database is private ({@link isPrivateSqliteDatabase}): its connection's alone, where no other connection commits. */
+	readonly #sqlitePrivate: boolean;
 	/**
 	 * How this store claims sessions: `row`, a lease row (PostgreSQL, MySQL);
 	 * `lock`, an OS lock on the database file and session id (a SQLite file);
@@ -1977,13 +2008,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#sqliteWrites = this.#adapter === "sqlite" ? sqliteWrites(options.client) : undefined;
 		const filename = options.client.options.filename;
 		this.#sqliteFile =
-			this.#adapter === "sqlite" && typeof filename === "string" && filename !== "" && filename !== ":memory:"
+			this.#adapter === "sqlite" && typeof filename === "string" && !isPrivateSqliteDatabase(filename)
 				? path.resolve(filename)
 				: undefined;
-		this.#sqliteInMemory = this.#adapter === "sqlite" && filename === ":memory:";
+		this.#sqlitePrivate = this.#adapter === "sqlite" && isPrivateSqliteDatabase(filename);
 		if (options.claims === true) {
 			if (this.#adapter !== "sqlite") this.#gate = "row";
-			// An in-memory database is this process's alone: nobody else can open its sessions.
+			// A private database is this connection's alone: nobody else can open its sessions.
 			else if (this.#sqliteFile) this.#gate = "lock";
 		}
 	}
@@ -3266,11 +3297,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * gives the part the read started at its rowid back and holds exactly the
 	 * bytes of that last part at its offset, while it differs before and
 	 * after it, passes both page checks; the check at the read's end catches
-	 * it. Before its first query the read takes `PRAGMA data_version`, which
-	 * moves when any other connection commits to the database file and never
-	 * for this connection's own commits (an in-memory database has no other
-	 * connection, so there the read takes no pragma), and this client's counts of
-	 * its writes of the path (see {@link SqliteWrites}); at its end it takes
+	 * it. Right before its first query, in the same turn of the call queue,
+	 * the read takes `PRAGMA data_version`, which moves when any other
+	 * connection commits to the database file and never for this
+	 * connection's own commits (a private database has no other connection,
+	 * so there the read takes no pragma), and this client's counts of its
+	 * writes of the path (see {@link SqliteWrites}); at its end it takes
 	 * them again. When any of them moved, it reads exactly the bytes it yielded
 	 * again, from `fromByte` for as many bytes, with the same page checks,
 	 * and compares their SHA-256 with that of the bytes it yielded: a
@@ -3295,11 +3327,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const digestQuery = this.#q.readChunksDigest;
-		// SQLite: what the check at the read's end compares, taken before its first query (see above).
-		const mark = this.#sqliteWrites ? await this.#sqliteMark(path) : undefined;
 		const pass: ChunksPass = {
 			digest: digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined,
-			hash: mark === undefined ? undefined : new Bun.CryptoHasher("sha256"),
+			// SQLite: with it the pass takes the mark the check at the read's end compares (see above).
+			hash: this.#sqliteWrites ? new Bun.CryptoHasher("sha256") : undefined,
 			yielded: 0,
 			first: 0,
 			next: 0,
@@ -3326,8 +3357,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 							end: pass.next,
 						},
 					);
-				} else if (mark !== undefined) {
-					await this.#confirmChunks(path, fromByte, mark, pass);
+				} else if (pass.mark !== undefined) {
+					await this.#confirmChunks(path, fromByte, pass);
 				}
 			}
 		}
@@ -3342,9 +3373,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 */
 	async *#readPass(path: string, fromByte: number, pass: ChunksPass, length?: number): AsyncGenerator<Uint8Array> {
 		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
-		const [row] = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom }),
-		)) as ChunksStartRow[];
+		const [row] = (await this.#exclusive(async () => {
+			// The read's own pass on SQLite: its start mark, with no write of this client between it and the query.
+			if (pass.hash) pass.mark = await this.#sqliteMark(path);
+			return this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom });
+		})) as ChunksStartRow[];
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
@@ -3398,35 +3431,34 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * SQLite: what a chunked read of `path` compares before its first query
-	 * and at its end (see {@link readChunks}): this client's writes of every
-	 * path and of `path` (see {@link SqliteWrites}), and `PRAGMA data_version`
-	 * of the store's connection, taken through the call queue, so no write of
-	 * this client runs between the counts and the pragma. An in-memory
-	 * database is the connection's alone, where no other connection commits:
-	 * there the counts are all.
+	 * SQLite: what a chunked read of `path` compares right before its first
+	 * query and at its end (see {@link readChunks}): this client's writes of
+	 * every path and of `path`'s slot (see {@link SqliteWrites}), and
+	 * `PRAGMA data_version` of the store's connection. Its caller holds the
+	 * call queue, so no write of this client runs between the counts and the
+	 * pragma. A private database ({@link isPrivateSqliteDatabase}) is the
+	 * connection's alone, where no other connection commits: there the counts
+	 * are all.
 	 */
-	#sqliteMark(path: string): Promise<string> {
-		return this.#exclusive(async () => {
-			const writes = this.#sqliteWrites;
-			const counts = `${writes?.every ?? 0}:${writes?.paths.get(path) ?? 0}`;
-			if (this.#sqliteInMemory) return counts;
-			const [row] = (await this.#readOne("PRAGMA data_version")) as DataVersionRow[];
-			if (!row) throw new Error("SqlSessionStorage: SQLite answered PRAGMA data_version with no row");
-			return `${counts}:${row.data_version}`;
-		});
+	async #sqliteMark(path: string): Promise<string> {
+		const writes = this.#sqliteWrites;
+		const counts = `${writes?.every ?? 0}:${writes?.slots[sqliteWriteSlot(path)] ?? 0}`;
+		if (this.#sqlitePrivate) return counts;
+		const [row] = (await this.#readOne("PRAGMA data_version")) as DataVersionRow[];
+		if (!row) throw new Error("SqlSessionStorage: SQLite answered PRAGMA data_version with no row");
+		return `${counts}:${row.data_version}`;
 	}
 
 	/**
 	 * SQLite: fail with {@link SessionReadConflictError} unless the bytes a
 	 * chunked read yielded (`read`, from `fromByte`) are still stored there,
 	 * when the database or this client's writes of `path` moved since the read
-	 * took `mark` (see {@link #sqliteMark}). A second pass then reads exactly
+	 * took `read.mark` (see {@link #sqliteMark}). A second pass then reads exactly
 	 * that range again, with the checks of every page, and must give as many
 	 * bytes with the same SHA-256.
 	 */
-	async #confirmChunks(path: string, fromByte: number, mark: string, read: ChunksPass): Promise<void> {
-		if ((await this.#sqliteMark(path)) === mark) return;
+	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
+		if ((await this.#exclusive(() => this.#sqliteMark(path))) === read.mark) return;
 		let stored: { hash: string; bytes: number };
 		try {
 			stored = await digestStream(
@@ -3743,14 +3775,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * SQLite: count a write of `path` by this client. Called inside the
-	 * write's transaction, which holds the call queue, so a chunked read of
-	 * `path` that this write lands within takes another count at its end (see
-	 * {@link SqliteWrites}).
+	 * SQLite: count a write of `path` by this client, in its slot (wrapping at
+	 * 2^32). Called inside the write's transaction, which holds the call
+	 * queue, so a chunked read of `path` that this write lands within takes
+	 * another count at its end (see {@link SqliteWrites}).
 	 */
 	#wrote(path: string): void {
-		const paths = this.#sqliteWrites?.paths;
-		paths?.set(path, (paths.get(path) ?? 0) + 1);
+		const slots = this.#sqliteWrites?.slots;
+		if (slots) slots[sqliteWriteSlot(path)]++;
 	}
 
 	/** Delete every staging set of `path`, whatever its age: a path that goes takes its unfinished full writes with it. */
