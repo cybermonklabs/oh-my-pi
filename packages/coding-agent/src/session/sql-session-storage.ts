@@ -251,8 +251,10 @@ interface DialectQueries {
 	moveRefs: Statement;
 	/** The references (path and hash) of session paths that have no session row (deleted by a build that kept no references). */
 	danglingRefs: Statement;
-	/** Drop the reference of `@path` to `@sha256` while `@path` has no session row. */
+	/** Drop the reference of `@path` to `@sha256`; except on MySQL, only while `@path` has no session row (MySQL's caller has locked that row's gap). */
 	deleteDanglingRef: Statement;
+	/** MySQL: lock shared, in path order, the session rows of `count` paths, or their gaps where there is none; answers the rows there are. */
+	lockSessionRows: ((count: number) => Statement) | undefined;
 	/** MySQL and SQLite: the columns of a table's primary key, in key order (PostgreSQL: {@link PG_PRIMARY_KEY}). */
 	primaryKey: Statement | undefined;
 	/** MySQL: statements that change no row and need, each, one privilege the store's writes need on the blob and reference tables. */
@@ -1304,10 +1306,19 @@ function buildQueries(
 				`WHERE substr(r.path, 1, ${BLOB_PARTS_PATH.length}) <> '${BLOB_PARTS_PATH}' ` +
 				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = r.path)`,
 		),
+		// MySQL: the sweep has locked the path's session row, or its gap, shared (`lockSessionRows`) and found none,
+		// so no row appears before it commits. Elsewhere the statement looks again: PostgreSQL's look takes no lock
+		// (and PostgreSQL locks no gap), and SQLite runs one writer at a time.
 		deleteDanglingRef: sql(
-			`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
-				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
+			mysql
+				? `DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256`
+				: `DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
+						`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
 		),
+		lockSessionRows: mysql
+			? count =>
+					sql(`SELECT path FROM ${table} WHERE path IN (${inList("p", count)}) ORDER BY path LOCK IN SHARE MODE`)
+			: undefined,
 		primaryKey: {
 			postgres: undefined,
 			mysql: sql(
@@ -3779,16 +3790,19 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 */
 	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
 		if (apply) {
-			// The references of paths that have no session row, each dropped with its blob's row locked first.
+			// The references of paths that have no session row, each dropped in the lock order every path takes:
+			// the paths' session rows (or their gaps) first, then the blobs' rows, then the reference.
 			const dangling = (await this.#exclusive(() => this.#readOne(this.#q.danglingRefs, {}))) as RefRow[];
 			const byHash = new Map<string, string[]>();
 			for (const row of dangling) byHash.set(row.sha256, [...(byHash.get(row.sha256) ?? []), row.path]);
 			for (const batch of batches([...byHash.keys()].sort(), BLOB_READ_BATCH)) {
 				await this.#fencedTransaction([], async transaction => {
+					const paths = [...new Set(batch.flatMap(sha256 => byHash.get(sha256) ?? []))];
+					const present = await this.#lockSessionRows(transaction, paths);
 					await this.#lockBlobRows(transaction, [], batch);
 					for (const sha256 of batch) {
 						for (const path of byHash.get(sha256) ?? []) {
-							await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
+							if (!present.has(path)) await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
 						}
 					}
 				});
@@ -3908,18 +3922,44 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * The reference table's one lock rule: a transaction that inserts or
-	 * deletes `<table>_refs` rows first holds the row of every blob those
-	 * references name, all taken here in one pass in `sha256` order (shared
-	 * for `shared`, exclusive for `exclusive`; a hash in both is locked
-	 * exclusive). A statement that deletes a path's references reads them
-	 * first, without a lock, so their blobs are among these. Every path
-	 * follows it: a transcript write (append and full write), the write-back
-	 * when a session opens, a delete, a rename, the sweep, and a parted
-	 * blob's insert. So a transaction holding a reference-table lock never
-	 * waits for a blob row's lock, and a transaction waiting for one holds no
-	 * reference-table lock: on MySQL and MariaDB a write's reference insert
-	 * and a delete's next-key locks on the same table cannot deadlock.
+	 * Lock shared, in path order, the session rows of `paths`, and on MySQL
+	 * and MariaDB the gap of each that has none, so no session row appears
+	 * at those paths until this transaction ends; answers the paths whose
+	 * rows there are. Elsewhere nothing is locked and nothing is answered:
+	 * PostgreSQL locks no gap, so the statement that relies on a path having
+	 * no row looks again itself, without a lock, and SQLite runs one writer
+	 * at a time.
+	 */
+	async #lockSessionRows(transaction: SqlSessionStorageTransaction, paths: readonly string[]): Promise<Set<string>> {
+		const present = new Set<string>();
+		const query = this.#q.lockSessionRows;
+		if (!query) return present;
+		for (const batch of batches([...new Set(paths)].sort(), BLOB_READ_BATCH)) {
+			const rows = (await run(transaction, query(batch.length), listValues("p", batch))) as Array<{ path: string }>;
+			for (const row of rows) present.add(row.path);
+		}
+		return present;
+	}
+
+	/**
+	 * The store's lock order, which every transaction that changes the
+	 * reference table follows, so that on MySQL and MariaDB none of them
+	 * deadlocks another:
+	 *   1. the lease rows of a fenced write (the member's fence);
+	 *   2. session rows (and the parts under them): a write's own row, a
+	 *      delete's and a rename's rows, the sweep's dangling paths' rows or
+	 *      gaps (see {@link #lockSessionRows});
+	 *   3. blob rows, here, in `sha256` order, each parted blob's own row
+	 *      before its parts' rows (shared for `shared`, exclusive for
+	 *      `exclusive`; a hash in both is locked exclusive);
+	 *   4. reference rows.
+	 * No statement after step 3 takes a lock in the session table. A
+	 * transaction locks every blob row the references it inserts or deletes
+	 * name before the first of them; a statement that deletes a path's
+	 * references reads them first, without a lock, so their blobs are among
+	 * these. The one later blob lock is a deleted blob's parts, which
+	 * {@link #deleteOrphans} locks after the parent's references; no path
+	 * takes a part's row before its parent's, so that wait closes no cycle.
 	 * Answers the hashes whose rows the table holds and this locked; only rows
 	 * there are are locked, since a locking read of a missing key locks a gap
 	 * on MySQL. SQLite runs one write at a time, and only reads which rows

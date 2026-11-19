@@ -53,6 +53,8 @@ const REF_INSERT = /^INSERT INTO \S*_refs\b/;
 const REF_DELETE = /^DELETE FROM \S*_refs WHERE path = /;
 /** A write's shared lock on the blob rows it names, before it touches the reference table. */
 const BLOB_SHARE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* (?:FOR SHARE|LOCK IN SHARE MODE)$/;
+/** An exclusive lock on blob rows. */
+const BLOB_EXCLUSIVE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* FOR UPDATE$/;
 /** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
 const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
@@ -970,6 +972,77 @@ describe("session blobs in the SQL session storage", () => {
 						writerReferenceDeletes: 1,
 						writerReferenceInserts: 1,
 						removerReferenceDeletes: 1,
+					});
+				});
+			}
+
+			// The sweep against a write to a dangling reference's path: P named A, and a build that keeps no
+			// references deleted P's row, so (P, A) is dangling. A write that re-creates P naming A is paused just
+			// after its session row insert, and the sweep runs. The sweep takes P's session row (or its gap) before
+			// A's row, as the write does, so on MySQL and MariaDB it waits for the write and then keeps the write's
+			// reference, with no deadlock. The control: the write creates another session naming A, so the sweep
+			// does not wait, and drops (P, A).
+			for (const target of ["the dangling path", "another path"] as const) {
+				it(`sweeps, with no deadlock or retry, the dangling references while a write to ${target} naming the blob is open`, async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const sweeperQueries: string[] = [];
+					const storage = await db.open({ wrap: client => recordingClient(client, sweeperQueries) });
+					const sessionRow = new RegExp(`^INSERT (?:IGNORE )?INTO \\S*\\b${db.table} \\(`);
+					let gate: GatedClient | undefined;
+					const queries: string[] = [];
+					const writer = await db.open({
+						wrap: client => {
+							gate = gatedClient(recordingClient(client, queries), sessionRow, "after");
+							return gate.client;
+						},
+					});
+					const p = await writeImageSession(db, storage, [IMAGE_BYTES]);
+					const content = (await db.row(p))?.content ?? "";
+					await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [p]);
+					await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [p]);
+					const written = target === "the dangling path" ? p : db.dir.join("sessions", "other.jsonl");
+					const created = await blobCreatedMs(db);
+
+					queries.length = 0;
+					sweeperQueries.length = 0;
+					gate?.close();
+					const writing = writer.writeText(written, content).then(() => writer.drain());
+					let first: string | undefined;
+					let sweeping: Promise<unknown> | undefined;
+					try {
+						await Promise.race([gate?.paused(), writing]);
+						sweeping = storage.blobTier.sweep(new Set(), 0, true);
+						// A real wait: what is measured is whether the sweep meets a lock of the write's on the server.
+						first = await Promise.race([
+							sweeping.then(() => "swept"),
+							Bun.sleep(1000).then(() => "waiting for the write"),
+						]);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([writing, sweeping]);
+					// PostgreSQL locks no gap and its look takes no lock: its sweep drops (P, A) without waiting, and
+					// the write then adds its own reference again.
+					const waits = target === "the dangling path" && adapter === "mysql";
+					expect({
+						first,
+						blobs: await blobHashes(db),
+						created: await blobCreatedMs(db),
+						refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs`)).map(found => [
+							String(found.path),
+							String(found.sha256),
+						]),
+						writerSessionRowInserts: queries.filter(query => sessionRow.test(query)).length,
+						writerReferenceInserts: queries.filter(query => REF_INSERT.test(query)).length,
+						sweeperBlobLocks: sweeperQueries.filter(query => BLOB_EXCLUSIVE_LOCK.test(query)).length,
+					}).toEqual({
+						first: waits ? "waiting for the write" : "swept",
+						blobs: [IMAGE_HASH],
+						created,
+						refs: [[written, IMAGE_HASH]],
+						writerSessionRowInserts: 1,
+						writerReferenceInserts: 1,
+						sweeperBlobLocks: 1,
 					});
 				});
 			}
