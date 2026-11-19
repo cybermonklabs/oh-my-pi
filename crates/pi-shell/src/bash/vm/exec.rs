@@ -5529,23 +5529,20 @@ pub fn set_try_block_error(vp: &mut Vproc, value: i64) -> bool {
 
 /// Start zsh's function trap for `key` (`TRAPINT`, `TRAPZERR`, `TRAPEXIT`,
 /// …: zsh `ZSIG_FUNC`), if that function is defined under one of the
-/// signal's names ([`builtins::trap::func_names`]).
+/// signal's names ([`builtins::trap::find_func_trap`]).
 #[inline(never)]
 fn start_func_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey) -> bool {
-	for name in builtins::trap::func_names(key, k.engine.config().platform) {
-		match state::record(cx.store, vp, Key::Func(BStr::new(&name))) {
-			Ok(Some(rec @ Record::Func { .. })) => {
-				let rec = rec.clone();
-				return run_func_trap(k, vp, cx, key, name, rec);
-			},
-			Ok(_) => {},
-			Err(err) => {
-				k.fail(err);
-				return false;
-			},
-		}
+	let platform = k.engine.config().platform;
+	match builtins::trap::find_func_trap(cx.store, vp, key, platform, |name, rec| {
+		(name, rec.clone())
+	}) {
+		Ok(Some((name, rec))) => run_func_trap(k, vp, cx, key, name, rec),
+		Ok(None) => false,
+		Err(err) => {
+			k.fail(err);
+			false
+		},
 	}
-	false
 }
 
 /// zsh `dotrapargs` for a function trap: a trap frame without text, and

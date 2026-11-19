@@ -2446,8 +2446,7 @@ impl Shell {
 				// zsh: a `TRAPNAL` function is the trap (`ZSIG_FUNC`).
 				let found = recorded.and_then(|trap| match trap {
 					None if p.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
-						builtins::trap::has_func_trap(cx.store, p, sig, platform)
-							.map(|f| f.then_some(false))
+						builtins::trap::find_func_trap(cx.store, p, key, platform, |_, _| false)
 					},
 					trap => Ok(trap),
 				});

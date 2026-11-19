@@ -307,6 +307,10 @@ pub struct FakeHost {
 	/// The login database [`Host::logins`](crate::bash::Host::logins)
 	/// reports (`None`: none, `Unsupported`).
 	pub logins:  Option<crate::bash::Logins>,
+	/// Signals whose disposition the host cannot change:
+	/// [`Host::set_signal_trap`](crate::bash::Host::set_signal_trap)
+	/// answers `false` for them, as for a signal ignored on entry.
+	pub fixed:   crate::bash::SigSet,
 }
 
 impl Default for FakeHost {
@@ -340,6 +344,7 @@ impl FakeHost {
 			pipe_tap:    None,
 			child_opens: false,
 			logins:      None,
+			fixed:       crate::bash::SigSet::EMPTY,
 		}
 	}
 
@@ -730,6 +735,10 @@ impl crate::bash::Host for FakeHost {
 			.logins
 			.clone()
 			.ok_or_else(|| io::ErrorKind::Unsupported.into())
+	}
+
+	fn set_signal_trap(&mut self, signal: Signal, _action: Option<&BStr>) -> io::Result<bool> {
+		Ok(!self.fixed.contains(signal))
 	}
 
 	fn event(&mut self, ev: &Event<'_>) -> Verdict {

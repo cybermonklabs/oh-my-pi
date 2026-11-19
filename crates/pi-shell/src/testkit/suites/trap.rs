@@ -239,3 +239,38 @@ fn bash_command_kept_inside_trap_and_resumed_after() {
 	assert_eq!(out.stdout, b"usr1 kill -USR1 $$\nafter echo \"after $BASH_COMMAND\"\n");
 	assert_eq!(out.status, 0);
 }
+
+/// A signal whose disposition the host cannot change (as for one ignored
+/// on entry) has its trap recorded as ignored, whatever sets it: bash's
+/// `trap`, zsh's `trap`, or a zsh `TRAPNAL` function, which stays defined.
+#[test]
+fn a_signal_the_host_keeps_ignored_has_its_trap_recorded_as_ignored() {
+	use crate::{
+		bash::{ModeId, Script, ShellInit, SigSet, Signal},
+		testkit::Rig,
+	};
+	let run = |zsh: bool, src: &str| {
+		let mut host = FakeHost::new();
+		host.fixed = SigSet::EMPTY.with(Signal::Usr1);
+		let init = if zsh {
+			ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..ShellInit::default() }
+		} else {
+			ShellInit::default()
+		};
+		let mut rig = Rig::new(host, init);
+		rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+		String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned()
+	};
+	assert_eq!(
+		run(false, "trap 'echo caught' USR1; kill -USR1 $$; trap -p USR1; echo done"),
+		"trap -- '' SIGUSR1\ndone\n"
+	);
+	assert_eq!(
+		run(true, "trap 'print caught' USR1; kill -USR1 $$; trap; print done"),
+		"trap -- '' USR1\ndone\n"
+	);
+	assert_eq!(
+		run(true, "TRAPUSR1() { print caught }; kill -USR1 $$; whence -w TRAPUSR1; print done"),
+		"TRAPUSR1: function\ndone\n"
+	);
+}

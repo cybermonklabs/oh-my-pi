@@ -79,25 +79,28 @@ fn func_name(key: TrapKey, platform: crate::bash::ids::Platform) -> Option<BStri
 	func_names(key, platform).into_iter().next()
 }
 
-/// Whether a `TRAPNAL` function is the trap for `sig` in `vp` (zsh
-/// `ZSIG_FUNC`): one of [`func_names`] is defined.
+/// zsh `gettrapnode`: the function that is the trap for `key` in `vp`,
+/// the first of [`func_names`] defined, passed to `found` with its name;
+/// `None` when there is none.
 ///
 /// # Errors
 ///
 /// A store failure reading the functions.
-pub fn has_func_trap(
+pub fn find_func_trap<T>(
 	store: &mut dyn StateStore,
 	vp: &Vproc,
-	sig: Signal,
+	key: TrapKey,
 	platform: crate::bash::ids::Platform,
-) -> Result<bool, StoreError> {
-	for name in func_names(TrapKey::Signal(sig), platform) {
-		if matches!(state::record(store, vp, Key::Func(BStr::new(&name)))?, Some(Record::Func { .. }))
+	found: impl FnOnce(BString, &Record) -> T,
+) -> Result<Option<T>, StoreError> {
+	for name in func_names(key, platform) {
+		if let Some(rec @ Record::Func { .. }) =
+			state::record(store, vp, Key::Func(BStr::new(&name)))?
 		{
-			return Ok(true);
+			return Ok(Some(found(name, rec)));
 		}
 	}
-	Ok(false)
+	Ok(None)
 }
 
 /// The trap key a zsh function name makes a trap of (`TRAPINT` → `INT`,
@@ -168,14 +171,7 @@ fn current(
 	if let Some(rec @ Record::Trap { .. }) = state::record(store, vp, Key::Trap(key))? {
 		return Ok(Some(rec.clone()));
 	}
-	for name in func_names(key, root.platform()) {
-		if let Some(rec @ Record::Func { .. }) =
-			state::record(store, vp, Key::Func(BStr::new(&name)))?
-		{
-			return Ok(Some(rec.clone()));
-		}
-	}
-	Ok(None)
+	find_func_trap(store, vp, key, root.platform(), |_, rec| rec.clone())
 }
 
 /// Remove the trap for `key`: its record and its `TRAPNAL` function.
@@ -440,18 +436,45 @@ pub fn func_changing(
 		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
 		k.pseudo_traps.note(key);
 	}
-	if vp.overlay.is_none()
-		&& let TrapKey::Signal(sig) = key
-		&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
-	{
+	if let TrapKey::Signal(sig) = key {
 		let action = (how != FuncChange::Removed).then(|| BStr::new(name));
-		let disposition = crate::bash::vm::jobctl::trap_disposition(k, sig, action);
-		if let Err(err) = cx.host.set_signal_trap(sig, disposition) {
-			let line = crate::bash::vm::exec::current_line(vp);
-			k.diag(cx, vp, line, Diag::SignalSetup { sig, err });
+		match os_disposition(k, cx, vp, sig, action) {
+			// The host keeps the signal ignored: the trap is recorded as
+			// ignored, beside the function.
+			Some(Ok(false)) if how != FuncChange::Removed => {
+				let ignored = Record::Trap { mode: mode_of(vp), action: BString::default() };
+				state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), Some(ignored));
+			},
+			Some(Err(err)) => {
+				let line = crate::bash::vm::exec::current_line(vp);
+				k.diag(cx, vp, line, Diag::SignalSetup { sig, err });
+			},
+			Some(Ok(_)) | None => {},
 		}
 	}
 	Ok(Some(key))
+}
+
+/// Ask the host to give the root shell's `sig` the OS disposition its trap
+/// `action` makes (`None`: the trap removed;
+/// [`trap_disposition`](crate::bash::vm::jobctl::trap_disposition)).
+/// `None` when the shell asks nothing: in a subshell, whose traps change no
+/// disposition of the process, and for `KILL`, `STOP` and `CHLD` (which
+/// comes from the engine, one per reaped child, not from the OS). Else the
+/// host's answer: `Ok(false)` when the signal stays ignored as it was on
+/// entry, and the caller then records the trap as ignored.
+fn os_disposition(
+	k: &Kernel,
+	cx: &mut crate::bash::vm::Cx<'_>,
+	vp: &Vproc,
+	sig: Signal,
+	action: Option<&BStr>,
+) -> Option<std::io::Result<bool>> {
+	if vp.overlay.is_some() || matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld) {
+		return None;
+	}
+	let disposition = crate::bash::vm::jobctl::trap_disposition(k, sig, action);
+	Some(cx.host.set_signal_trap(sig, disposition))
 }
 
 /// zsh's trap key for `spec` (zsh `getsignum`): a number (0 is `EXIT`), a
@@ -550,19 +573,14 @@ fn zsh_change(
 		release_held(&mut ctx.k.root, ctx.cx.store, ctx.vp, sig)?;
 	}
 	let mut effective = action;
-	if ctx.vp.overlay.is_none()
-		&& let TrapKey::Signal(sig) = key
-		&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
-	{
-		let disposition =
-			crate::bash::vm::jobctl::trap_disposition(ctx.k, sig, effective.as_ref().map(BStr::new));
-		match ctx.cx.host.set_signal_trap(sig, disposition) {
-			Ok(true) => {},
-			Ok(false) => effective = effective.map(|_| BString::default()),
-			Err(err) => {
+	if let TrapKey::Signal(sig) = key {
+		match os_disposition(ctx.k, ctx.cx, ctx.vp, sig, effective.as_ref().map(BStr::new)) {
+			Some(Ok(false)) => effective = effective.map(|_| BString::default()),
+			Some(Err(err)) => {
 				ctx.err(Diag::SignalSetup { sig, err });
 				return Ok(false);
 			},
+			Some(Ok(true)) | None => {},
 		}
 	}
 	let record = effective.map(|action| Record::Trap { mode: mode_of(ctx.vp), action });
@@ -764,26 +782,17 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			continue;
 		}
 		let mut effective = action.clone();
-		if ctx.vp.overlay.is_none()
-			&& let TrapKey::Signal(sig) = key
-			// `CHLD` comes from the engine (one per reaped child), not the OS.
-			&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
-		{
+		if let TrapKey::Signal(sig) = key {
 			// The root shell's OS disposition follows its traps (signals
 			// ignored on entry stay ignored, as in a non-interactive bash).
-			let disposition = crate::bash::vm::jobctl::trap_disposition(
-				ctx.k,
-				sig,
-				effective.as_ref().map(BStr::new),
-			);
-			match ctx.cx.host.set_signal_trap(sig, disposition) {
-				Ok(true) => {},
-				Ok(false) => effective = Some(BString::default()),
-				Err(err) => {
+			match os_disposition(ctx.k, ctx.cx, ctx.vp, sig, effective.as_ref().map(BStr::new)) {
+				Some(Ok(false)) => effective = Some(BString::default()),
+				Some(Err(err)) => {
 					ctx.err(Diag::SignalSetup { sig, err });
 					status = 1;
 					continue;
 				},
+				Some(Ok(true)) | None => {},
 			}
 		}
 		let record = effective.map(|action| Record::Trap { mode: mode_of(ctx.vp), action });
