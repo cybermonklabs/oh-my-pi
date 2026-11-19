@@ -279,7 +279,8 @@ describe("a kept and continued turn in the context rebuilt from the session file
 	// A stream cut after text is continued outside any retry; that
 	// continuation is cut by a rate limit after its text, which a retry
 	// continues. The one successful turn continued from both and closes the
-	// retry: both marks and the retry's note go to the file in one rewrite.
+	// retry: both marks and the retry's note go to the file in one write (a
+	// rewrite, or one appended `entry_patch` record in a build that has them).
 	it("marks both turns with one write when one turn continues a stream cut and a retry", async () => {
 		sessions.answers = [
 			{ stream: MESSAGE_START_FRAME + textFrames("One.") + OVERLOADED_FRAME },
@@ -287,12 +288,16 @@ describe("a kept and continued turn in the context rebuilt from the session file
 			{ stream: CONTINUED_ANSWER },
 		];
 		const sessionManager = sessions.createSessionManager();
-		const rewrites = vi.spyOn(sessionManager, "rewriteEntries");
+		const writes: Array<{ mock: { calls: unknown[] } }> = [vi.spyOn(sessionManager, "rewriteEntries")];
+		const patching = sessionManager as unknown as { patchEntries?: (...args: never[]) => unknown };
+		if (patching.patchEntries) {
+			writes.push(vi.spyOn(patching as { patchEntries: (...args: never[]) => unknown }, "patchEntries"));
+		}
 		const session = await sessions.startSession(sessionManager);
 		await session.prompt("Answer in two parts");
 		await session.waitForIdle();
 
-		expect(rewrites).toHaveBeenCalledTimes(1);
+		expect(writes.reduce((count, spy) => count + spy.mock.calls.length, 0)).toBe(1);
 		const kept = ["assistant[text:One.]", "assistant[text:Two.]"];
 		const live = conversation(session.agent.state.messages);
 		expect(live).toEqual(["user", ...kept, `assistant[text:${CONTINUED_TEXT}]`]);
