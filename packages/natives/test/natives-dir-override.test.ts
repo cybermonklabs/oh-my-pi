@@ -274,17 +274,16 @@ console.log(JSON.stringify({ main, worker }));`;
 			expect(await run("")).toEqual({ main: false, worker: false });
 		});
 
-		it("is not taken when it names no parent, even with the recorded variables", async () => {
+		it("with no parent recorded, is taken by whichever process has the recorded variables", async () => {
 			const handedOver = path.join(tempRoot, "handed-over");
 			const env: Record<string, string | undefined> = {
 				...process.env,
 				PI_NATIVES_DIR: path.join(tempRoot, "child"),
 			};
-			// Every handoff omp writes names its parent; one with none is not omp's.
-			const handoff = JSON.parse(nativesDirHandoff(env, { parent: process.pid, dir: handedOver }));
-			env.__PI_NATIVES_DIR_HANDOFF = JSON.stringify({ ...handoff, parent: null, parentStart: null });
+			// A forked session's: the terminal, not this process, starts it.
+			env.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(env, { parent: null, dir: handedOver });
 
-			expect((await runChild(env)).own).toBe(path.join(tempRoot, "child"));
+			expect((await runChild(env)).own).toBe(handedOver);
 		});
 
 		it("is taken by a child its parent left before the child's first call (re-parented)", async () => {

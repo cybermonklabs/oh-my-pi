@@ -26,7 +26,7 @@ import {
 	SessionStorageUnsupportedError,
 } from "../session/session-storage-config";
 import { spawnDetached } from "../subprocess/shared-worker";
-import { resolveCliEntryCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { resolveCliChildCmd, workerEnvFromParent } from "../subprocess/worker-client";
 import { compressMethod } from "./gc-compress";
 
 /** Minimum time between background runs. Sessions qualify only after days idle, so daily is enough. */
@@ -64,7 +64,7 @@ export async function scheduleGcAutoCompress(agentDir: string): Promise<Subproce
 			return undefined;
 		}
 
-		const cmd = [...resolveCliEntryCmd(), "gc", "--compress", "--apply", "--agent-dir", agentDir];
+		const cmd = [...resolveCliChildCmd(), "gc", "--compress", "--apply", "--agent-dir", agentDir];
 		let proc: Subprocess;
 		try {
 			({ proc } = spawnDetached(cmd, undefined, workerEnvFromParent(), logPath));

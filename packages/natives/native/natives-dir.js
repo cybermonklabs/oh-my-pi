@@ -133,20 +133,20 @@ function adopt(dir, withHandoff) {
 
 /**
  * Hidden variable by which omp hands its answer to a child process that is omp (a subprocess
- * worker, its launch broker, an omp daemon the broker runs),
- * `{"dir":…,"parent":…,"parentStart":…,"inputs":{…}}`. Only this module reads it, and
- * `PI_NATIVES_DIR` stays as omp was started with it, so the commands such a child runs never
- * carry the directory.
+ * worker, an omp daemon its launch broker runs, a forked session),
+ * `{"dir":…,"parent":…,"inputs":{…}}`. Only this module reads it, and `PI_NATIVES_DIR` stays
+ * as omp was started with it, so the commands such a child runs never carry the directory.
  *
  * A process takes the answer only when it is the one it was written for:
  * - `inputs`, the values the rule reads ({@link nativesDirInputNames}), match its own
  *   environment, so a program started with a home or directory variables of its own resolves
  *   its own directory;
- * - `parent` is the process that started it: its parent now, or, after that parent exited and
- *   it was re-parented, a recorded parent (`parent` and its start time `parentStart`) that no
- *   longer runs. A program the child starts (one the agent's code starts in the JS eval kernel,
- *   say) resolves for itself even with the same environment, since the recorded parent still
- *   runs.
+ * - `parent`, when not null, is the process that started it: its parent now, or, after that
+ *   parent exited and it was re-parented, a recorded parent (`parent` and its start time
+ *   `parentStart`) that no longer runs. A program the child starts (one the agent's code starts
+ *   in the JS eval kernel, say) resolves for itself even with the same environment, since the
+ *   recorded parent still runs. A forked session's handoff has no parent: the terminal starts
+ *   the fork.
  */
 export const NATIVES_DIR_HANDOFF_ENV_KEY = "__PI_NATIVES_DIR_HANDOFF";
 
@@ -170,15 +170,15 @@ export function nativesDirInputNames() {
 /**
  * The {@link NATIVES_DIR_HANDOFF_ENV_KEY} value for a child process whose environment is `env`
  * (its values of the rule's inputs are recorded from it): this process's answer, or `dir`, for
- * a process whose parent is `parent` (this process's pid).
+ * a process whose parent is `parent` (this process's pid; null: any parent).
  * @param {Record<string, string | undefined>} env
- * @param {{ parent: number; dir?: string }} options
+ * @param {{ parent: number | null; dir?: string }} options
  * @returns {string}
  */
 export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
 	const inputs = {};
 	for (const name of nativesDirInputNames()) inputs[name] = env[name] ?? null;
-	const parentStart = processStartTime(parent === process.pid ? "self" : parent) ?? null;
+	const parentStart = parent === null ? null : (processStartTime(parent === process.pid ? "self" : parent) ?? null);
 	return JSON.stringify({ dir, parent, parentStart, inputs });
 }
 
@@ -222,7 +222,7 @@ export function nativesDirHandoffDir(value, addressee) {
 	}
 	if (typeof handoff?.dir !== "string" || !path.isAbsolute(handoff.dir)) return undefined;
 	if (!addressee) return handoff.dir;
-	if (!isStartedByRecordedParent(handoff, addressee.ppid)) return undefined;
+	if (handoff.parent !== null && !isStartedByRecordedParent(handoff, addressee.ppid)) return undefined;
 	const inputs = handoff.inputs;
 	if (inputs === null || typeof inputs !== "object") return undefined;
 	const names = nativesDirInputNames();
@@ -275,7 +275,7 @@ export function getNativesDir() {
 	// spawn with no `env`, and the native shell, start from the startup environment, which
 	// keeps it: commands get it empty (`filterChildShellEnv`, when
 	// {@link startedWithNativesDirHandoff}); a program started with no `env` keeps it, which the
-	// parent check refuses while the recorded parent runs.
+	// parent check refuses while the recorded parent runs (a fork's names no parent).
 	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
 	return adopt(handedOver ?? resolveNativesDir(), Boolean(value));
 }

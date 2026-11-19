@@ -300,9 +300,10 @@ console.log(JSON.stringify({ first, cwd: spawn.cwd ?? null, worker: JSON.parse(w
 		expect(result.worker).toEqual({ dir: sessionDir, PI_NATIVES_DIR: null });
 	}, 120_000);
 
-	it("gives the commands of an omp started with a handoff (a worker) no handoff", async () => {
-		// omp removes its handoff from process.env at its first call, but the bash tool's native
-		// shell starts from the process's C environment, where it remains.
+	it("gives a forked session's commands no handoff, though the fork was started with one", async () => {
+		// A fork starts with a handoff that names no parent (the terminal starts it). omp removes
+		// it from process.env at its first call, but the bash tool's native shell starts from the
+		// process's C environment, where it remains.
 		const printer = path.join(tempRoot, "print-natives-dir.ts");
 		const handedOver = path.join(tempRoot, "handed-over");
 		const home = path.join(tempRoot, "home");
@@ -310,7 +311,7 @@ console.log(JSON.stringify({ first, cwd: spawn.cwd ?? null, worker: JSON.parse(w
 		await fs.mkdir(project, { recursive: true });
 		await Bun.write(path.join(home, ".omp/agent/.env"), "");
 		await Bun.write(
-			path.join(tempRoot, "worker.ts"),
+			path.join(tempRoot, "fork.ts"),
 			`const { getNativesDir } = await import(${JSON.stringify(nativesDirJs)});
 const dir = getNativesDir();
 const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
@@ -325,13 +326,13 @@ const [seen, omp] = out.trim().split("\\n");
 console.log(JSON.stringify({ dir, seen, command: JSON.parse(omp) }));
 `,
 		);
-		const workerEnv: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
-		for (const key of DIRECTORY_NAMES) delete workerEnv[key];
+		const forkEnv: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		for (const key of DIRECTORY_NAMES) delete forkEnv[key];
 		const { nativesDirHandoff } = await import(nativesDirJs);
-		workerEnv.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(workerEnv, { parent: process.pid, dir: handedOver });
-		const child = Bun.spawn([process.execPath, "--no-env-file", path.join(tempRoot, "worker.ts")], {
+		forkEnv.__PI_NATIVES_DIR_HANDOFF = nativesDirHandoff(forkEnv, { parent: null, dir: handedOver });
+		const child = Bun.spawn([process.execPath, "--no-env-file", path.join(tempRoot, "fork.ts")], {
 			cwd: project,
-			env: workerEnv,
+			env: forkEnv,
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -343,8 +344,8 @@ console.log(JSON.stringify({ dir, seen, command: JSON.parse(omp) }));
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 		const result = JSON.parse(stdout);
 
-		// The worker takes its handoff; a command it runs sees none, and an omp the command starts
-		// resolves its own directory.
+		// The fork takes its handoff; a command it runs sees none, and an omp the command starts
+		// resolves its own directory, though its inputs are the fork's.
 		expect(result.dir).toBe(handedOver);
 		expect(result.seen).toBe("handoff=");
 		expect(result.command.dir).toBe(path.join(home, ".omp", "natives"));
