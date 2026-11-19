@@ -1718,6 +1718,77 @@ describe("anthropic stream envelope handling", () => {
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "Here is the first half" }]);
 	});
 
+	it("hands a rate_limit_error frame before message_start on after one request, and still retries an HTTP 429 and an overload frame", async () => {
+		// Regression: a rate limit the API streams before the response begins is
+		// sent again by the provider up to ten times within a minute, the whole
+		// request each time, before turn recovery can wait out the limit; every
+		// resend is one more request against the same per-minute limit.
+		let created = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			created += 1;
+			return createRawSseRequest([
+				sseFrame("error", {
+					type: "error",
+					error: { type: "rate_limit_error", message: "This request would exceed your rate limit." },
+				}),
+			]) as never;
+		});
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "sk-ant-test",
+			providerRetryWait,
+		}).result();
+
+		expect(created).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("rate_limit_error");
+		vi.restoreAllMocks();
+
+		// The provider still sends the request again for an HTTP 429 response and
+		// for an overload it streams before the response begins.
+		const refusals: Array<() => Promise<Response>> = [
+			async () => {
+				throw await AIError.AnthropicApiError.fromResponse(
+					new Response(
+						JSON.stringify({
+							type: "error",
+							error: { type: "rate_limit_error", message: "This request would exceed your rate limit." },
+						}),
+						{ status: 429, headers: { "content-type": "application/json", "request-id": "req_http_429" } },
+					),
+				);
+			},
+			() =>
+				createRawSseRequest([
+					sseFrame("error", { type: "error", error: { type: "overloaded_error", message: "Overloaded" } }),
+				]).asResponse(),
+		];
+		for (const refusal of refusals) {
+			let attempts = 0;
+			vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+				attempts += 1;
+				return (
+					attempts === 1
+						? { asResponse: refusal }
+						: createRawSseRequest(createTextSuccessSseFrames("after the retry"))
+				) as never;
+			});
+
+			const retried = await streamAnthropic(model, context, {
+				apiKey: "sk-ant-test",
+				providerRetryWait: async () => {},
+			}).result();
+
+			expect(attempts).toBe(2);
+			expect(retried.stopReason).toBe("stop");
+			expect(JSON.parse(JSON.stringify(retried.content))).toEqual([{ type: "text", text: "after the retry" }]);
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("keeps a deterministic in-band rejection terminal inside an open message", async () => {
 		// The envelope being open says the wire was cut, not that the provider
 		// accepted the request. With nothing streamed yet the provider retry gate is

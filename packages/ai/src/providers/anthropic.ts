@@ -994,6 +994,17 @@ const ANTHROPIC_STREAM_ERROR_STATUS: Readonly<Record<string, number>> = {
 };
 
 /**
+ * A `rate_limit_error` the API streamed in an `error` frame of a 200 response:
+ * the HTTP 429 refusal, which the provider loop below does not send again
+ * itself. Turn recovery owns that wait (the wait the message states, its
+ * backoff, `retry.maxRetries`, the fallback chain), so each of its attempts is
+ * one request; the loop's own backoff would resend the whole request up to
+ * {@link PROVIDER_MAX_RETRIES} times against the same per-minute limit first.
+ * An HTTP 429 response is not this error and keeps the loop's retry.
+ */
+class AnthropicStreamRateLimitError extends AIError.ProviderHttpError {}
+
+/**
  * In-stream `error` SSE frames carry an Anthropic error envelope:
  * `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`.
  * Surface the structured type, code and message instead of the raw JSON blob;
@@ -1052,7 +1063,9 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 	const rejection =
 		httpStatus === undefined
 			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
-			: new AIError.ProviderHttpError(text, httpStatus, { code: errorType });
+			: httpStatus === 429
+				? new AnthropicStreamRateLimitError(text, httpStatus, { code: errorType })
+				: new AIError.ProviderHttpError(text, httpStatus, { code: errorType });
 	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}
@@ -3720,6 +3733,7 @@ const streamAnthropicOnce = (
 						!isLocalIdleTimeout &&
 						firstTokenTime === undefined &&
 						!streamedReplayUnsafeContent &&
+						!(streamFailure instanceof AnthropicStreamRateLimitError) &&
 						AIError.isProviderRetryableError(streamFailure);
 					if (
 						activeAbortTracker.wasCallerAbort() ||

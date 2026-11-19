@@ -816,7 +816,7 @@ export const cfgRetryRateLimitWalksChain = register({
 		group: "Retry & Fallback",
 		label: "Rate Limit Walks Chain",
 		description:
-			"On a rate limit, walk retry.fallbackChains at once. Off (the default), a rate limit retries the rate-limited model after the wait the provider states, and reaches the chain only once retry.maxRetries is spent or the stated wait is past retry.maxDelayMs. retry.rateLimitFallbackMaxContextTokens applies either way.",
+			"On a rate limit, walk retry.fallbackChains at once. Off (the default), a rate limit retries the rate-limited model after the wait the provider states, and reaches the chain only once retry.maxRetries is spent or the stated wait is past retry.maxDelayMs. retry.rateLimitFallbackMaxContextTokens applies either way. A rate limit after visible text still waits, then continues on the same model, also when this is on.",
 	},
 });
 

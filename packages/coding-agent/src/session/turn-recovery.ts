@@ -394,8 +394,10 @@ type RetryPolicyOptions = {
 	/**
 	 * A rate limit after visible text ({@link TurnRecovery.isCommittedTextRateLimit}):
 	 * keep the failed turn, wait as for any rate limit, then continue the answer
-	 * with the rate-limit reminder instead of sending the turn again. Neither this
-	 * attempt nor any later one of its retry saga walks `retry.fallbackChains`.
+	 * instead of sending the turn again: a text-only turn with the rate-limit
+	 * reminder, a turn with tool calls from their synthetic results, as a stream
+	 * stall continues it. While the saga's attempts keep failing on a rate limit,
+	 * none of them walks `retry.fallbackChains`.
 	 */
 	continueCommittedText?: boolean;
 };
@@ -422,10 +424,12 @@ export class TurnRecovery {
 	#retryAttempt = 0;
 	/**
 	 * The retry saga continues an answer a rate limit cut off after its text
-	 * rendered ({@link RetryPolicyOptions.continueCommittedText}), so every
-	 * attempt of it stays on this model: a continuation refused before it
-	 * streams anything (an HTTP 429 at request time) fails as a plain retryable
-	 * error, and must not walk `retry.fallbackChains` with the cut-off answer.
+	 * rendered ({@link RetryPolicyOptions.continueCommittedText}), so a rate
+	 * limit on any attempt of it stays on this model: a continuation refused
+	 * with an HTTP 429 at request time fails as a plain retryable error, and
+	 * must not walk `retry.fallbackChains` with the cut-off answer. Any other
+	 * refusal of a continuation (an overload, a server error, a usage limit)
+	 * walks the chain as it would after a stream stall.
 	 * Cleared in `resolveRetry()` and wherever `#retryAttempt` goes back to 0.
 	 */
 	#continuingCommittedText = false;
@@ -811,15 +815,18 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * A rate limit that ended a text-only turn after its text rendered. The turn
-	 * cannot be sent again, since its text is shown, so
-	 * {@link handleRetryableError} with `continueCommittedText` waits the limit
-	 * out on this model and then continues the answer.
+	 * A rate limit that ended a turn after its text rendered: a text-only turn,
+	 * or one whose tool calls all have results (the agent loop pairs each with a
+	 * synthetic `executed: false` one, so a continuation reissues the call and
+	 * repeats nothing). The turn cannot be sent again, since its text is shown,
+	 * so {@link handleRetryableError} with `continueCommittedText` waits the
+	 * limit out on this model and then continues the answer.
 	 */
 	isCommittedTextRateLimit(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !this.#isRateLimit(message)) return false;
 		if (!this.autoRetryEnabled || this.#host.abortInProgress() || this.#host.isDisposed()) return false;
-		return this.#host.textOutputCommitted() && isTextOnlyTurn(message);
+		if (!this.#host.textOutputCommitted()) return false;
+		return isTextOnlyTurn(message) || this.#toolCallsResolved(message);
 	}
 
 	/**
@@ -1743,12 +1750,20 @@ export class TurnRecovery {
 		// race, so unmarked MCP/todo blocks can continue once every emitted
 		// call has a matching result. A reasonless abort ends the turn and
 		// the agent loop pairs leftover calls with `executed: false`.
-		const resolvedToolCallIds: string[] = [];
+		if (!this.#toolCallsResolved(message)) return undefined;
+		return reasonlessAbort ? "reasonless-abort" : "stream-stall";
+	}
+
+	/**
+	 * Whether `message` emitted tool calls and every one of them has a result
+	 * after it in context.
+	 */
+	#toolCallsResolved(message: AssistantMessage): boolean {
+		const unresolvedToolCallIds = new Set<string>();
 		for (const block of message.content) {
-			if (block.type !== "toolCall") continue;
-			resolvedToolCallIds.push(block.id);
+			if (block.type === "toolCall") unresolvedToolCallIds.add(block.id);
 		}
-		if (resolvedToolCallIds.length === 0) return undefined;
+		if (unresolvedToolCallIds.size === 0) return false;
 
 		const messages = this.#host.agent.state.messages;
 		let assistantIndex = -1;
@@ -1759,15 +1774,13 @@ export class TurnRecovery {
 				break;
 			}
 		}
-		if (assistantIndex < 0) return undefined;
+		if (assistantIndex < 0) return false;
 
-		const unresolvedToolCallIds = new Set(resolvedToolCallIds);
 		for (let i = assistantIndex + 1; i < messages.length; i++) {
 			const candidate = messages[i];
 			if (candidate.role === "toolResult") unresolvedToolCallIds.delete(candidate.toolCallId);
 		}
-		if (unresolvedToolCallIds.size > 0) return undefined;
-		return reasonlessAbort ? "reasonless-abort" : "stream-stall";
+		return unresolvedToolCallIds.size === 0;
 	}
 
 	/**
@@ -2967,7 +2980,8 @@ export class TurnRecovery {
 		}
 		const allowModelFallback =
 			options?.allowModelFallback !== false &&
-			!(options?.continueCommittedText || this.#continuingCommittedText) &&
+			!options?.continueCommittedText &&
+			!(this.#continuingCommittedText && rateLimited) &&
 			!this.#host.modelFallbackDisabled?.();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
@@ -3314,11 +3328,13 @@ export class TurnRecovery {
 			this.#stripFailedAssistantTail();
 		}
 		// A rate limit after visible text continues the answer instead of sending
-		// it again: the kept turn ends in the rate-limit reminder, and the rest of
-		// the saga stays on this model.
+		// it again, and a rate limit on any later attempt of the saga stays on
+		// this model. A text-only turn ends in the rate-limit reminder; a turn
+		// with tool calls already ends in their synthetic results, which tell the
+		// next turn to reissue them.
 		if (options?.continueCommittedText) {
 			this.#continuingCommittedText = true;
-			if (this.#host.promptGeneration() === generation) {
+			if (this.#host.promptGeneration() === generation && isTextOnlyTurn(message)) {
 				this.#appendContinueReminder(rateLimitContinueTemplate, this.#retryAttempt, maxRetries);
 			}
 		}
