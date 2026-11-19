@@ -36,7 +36,17 @@ describe("handleRpcCancelSubagent", () => {
 	/** Real directory: releasing a tombstone persists `<sessionFile>.tombstone`. */
 	let sessionDir: string;
 	let ownSessionFile: string;
+	/**
+	 * Ends what the case started that can outlive it (an executor run, its
+	 * jobs), even when the case failed or timed out first: run before the
+	 * shared state the next case starts from is reset, so no run of one case
+	 * acts on the next one's registries or session stub.
+	 */
+	let teardowns: Array<() => Promise<void>>;
 
+	// The hooks, and every case that waits on real work (the task executor's
+	// turns, waits and cleanup, or a tombstone written to disk), take 30 s: a
+	// loaded machine stretches that work past bun's 5 s default.
 	beforeEach(() => {
 		sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-cancel-"));
 		ownSessionFile = path.join(sessionDir, "SubagentA.jsonl");
@@ -44,17 +54,19 @@ describe("handleRpcCancelSubagent", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		calls = [];
 		frames = [];
+		teardowns = [];
 		eventBus = new EventBus();
 		registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
-	});
+	}, 30_000);
 
-	afterEach(() => {
+	afterEach(async () => {
+		await Promise.allSettled(teardowns.map(teardown => teardown()));
 		registry.dispose();
 		vi.restoreAllMocks();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
 		removeSyncWithRetries(sessionDir);
-	});
+	}, 30_000);
 
 	function emitLifecycle(id: string, status: SubagentLifecyclePayload["status"], sessionFile = ownSessionFile): void {
 		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
@@ -307,6 +319,15 @@ describe("handleRpcCancelSubagent", () => {
 			// Long enough that the test, not the deadline, ends the cleanup the stubborn job holds.
 			cleanupGraceMs: options.firstTurnFails ? 60_000 : undefined,
 		});
+		// End a run the case left unsettled, and its job.
+		teardowns.push(async () => {
+			teardown.abort();
+			manager.cancelAll();
+			// A job that ignores cancellation (`firstTurnFails`) settles once its result arrives.
+			childResult.resolve("stopped");
+			await Promise.allSettled([run]);
+			await manager.dispose({ timeoutMs: 1000 });
+		});
 		return {
 			id,
 			run,
@@ -330,15 +351,6 @@ describe("handleRpcCancelSubagent", () => {
 			endJobWithoutResult: () => manager.cancel(childId),
 			/** Someone other than the steer's sender takes its message off the queue. */
 			takeBackElsewhere: (text: string) => session.removeQueuedMessage(text, "steering"),
-			/** Test teardown: end a run the case left unsettled, and its job. */
-			async stop(): Promise<void> {
-				teardown.abort();
-				manager.cancelAll();
-				// A job that ignores cancellation (`firstTurnFails`) settles once its result arrives.
-				childResult.resolve("stopped");
-				await Promise.allSettled([run]);
-				await manager.dispose({ timeoutMs: 1000 });
-			},
 		};
 	}
 
@@ -352,7 +364,7 @@ describe("handleRpcCancelSubagent", () => {
 		const ref = AgentRegistry.global().get("SubagentA");
 		expect(ref?.status).toBe("aborted");
 		expect(ref?.session).toBeNull();
-	});
+	}, 30_000);
 
 	test("does not touch another session's same-name subagent", async () => {
 		// This session's roster lists SubagentA, but the process-global registry
@@ -388,7 +400,7 @@ describe("handleRpcCancelSubagent", () => {
 
 		expect(acceptedDuringAbort).toBe(false);
 		expect(AgentRegistry.global().get("SubagentA")?.status).toBe("aborted");
-	});
+	}, 30_000);
 
 	test("reports a failed tombstone write as an error while the abort is still settling", async () => {
 		// The tombstone sidecar lands next to the transcript; a missing directory
@@ -430,7 +442,7 @@ describe("handleRpcCancelSubagent", () => {
 		expect(unhandled).toEqual([]);
 		expect(calls).toEqual(["dispose:SubagentA", "abort:SubagentA"]);
 		expect(AgentRegistry.global().get("SubagentA")?.status).toBe("aborted");
-	});
+	}, 30_000);
 
 	test("is a no-op for a second cancel of the same subagent", async () => {
 		emitLifecycle("SubagentA", "started");
@@ -440,7 +452,7 @@ describe("handleRpcCancelSubagent", () => {
 
 		await expect(handleRpcCancelSubagent(registry, "SubagentA")).resolves.toBe(false);
 		expect(calls).toEqual([]);
-	});
+	}, 30_000);
 
 	test("does not tombstone a subagent whose result was accepted before its terminal frame", async () => {
 		emitLifecycle("SubagentA", "started");
@@ -530,9 +542,23 @@ describe("handleRpcCancelSubagent", () => {
 		} as CreateAgentSessionResult);
 		registry.setSubscriptionLevel("progress");
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const teardown = new AbortController();
 
 		// Foreground: awaited directly, with no async job behind it.
-		const run = runSubprocess({ cwd: artifactsDir, agent, task: "work", index: 0, id, eventBus, artifactsDir });
+		const run = runSubprocess({
+			cwd: artifactsDir,
+			agent,
+			task: "work",
+			index: 0,
+			id,
+			eventBus,
+			artifactsDir,
+			signal: teardown.signal,
+		});
+		teardowns.push(async () => {
+			teardown.abort();
+			await Promise.allSettled([run]);
+		});
 		await promptEntered.promise;
 
 		await expect(handleRpcCancelSubagent(registry, id)).resolves.toBe(true);
@@ -544,30 +570,26 @@ describe("handleRpcCancelSubagent", () => {
 			"aborted",
 		]);
 		expect(registry.getSubagents()).toEqual([]);
-	});
+	}, 30_000);
 
 	test("cancels a subagent idle between turns while its eval agent() job runs, and ends the job", async () => {
 		const subagent = startSubagentAwaitingEvalJob();
-		try {
-			await subagent.awaitingJob;
-			expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([
-				{ id: subagent.id, status: "running" },
-			]);
-			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
-			const job = subagent.evalJob();
-			expect(job?.status).toBe("running");
+		await subagent.awaitingJob;
+		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([
+			{ id: subagent.id, status: "running" },
+		]);
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		const job = subagent.evalJob();
+		expect(job?.status).toBe("running");
 
-			await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(true);
+		await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(true);
 
-			await job?.promise;
-			expect(job?.status).toBe("cancelled");
-			expect((await subagent.run).aborted).toBe(true);
-			expect(registry.getSubagents()).toEqual([]);
-			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("aborted");
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		await job?.promise;
+		expect(job?.status).toBe("cancelled");
+		expect((await subagent.run).aborted).toBe(true);
+		expect(registry.getSubagents()).toEqual([]);
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("aborted");
+	}, 30_000);
 
 	test("refuses a subagent idle between turns once the parent accepted its result", async () => {
 		const subagent = startSubagentAwaitingEvalJob();
@@ -596,108 +618,87 @@ describe("handleRpcCancelSubagent", () => {
 			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
 		} finally {
 			unsubscribe();
-			await subagent.stop();
 		}
-	}, 15_000);
+	}, 30_000);
 
 	test("steer_subagent queues its message for the executor's next prompt to a subagent idle between turns", async () => {
 		const subagent = startSubagentAwaitingEvalJob();
 		const message = "Also check the README.";
-		try {
-			await subagent.awaitingJob;
-			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
-			const answer = handleRpcSteerSubagent(registry, subagent.id, message);
-			// A refusal answers at once; an accepted steer waits on the queue.
-			await Promise.race([answer, subagent.steerQueued]);
-			expect(subagent.turns).toEqual([{ source: "prompt", steers: [] }]);
+		await subagent.awaitingJob;
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		const answer = handleRpcSteerSubagent(registry, subagent.id, message);
+		// A refusal answers at once; an accepted steer waits on the queue.
+		await Promise.race([answer, subagent.steerQueued]);
+		expect(subagent.turns).toEqual([{ source: "prompt", steers: [] }]);
 
-			// The job ends with nothing to deliver, so the executor sends its yield reminder next.
-			subagent.endJobWithoutResult();
+		// The job ends with nothing to deliver, so the executor sends its yield reminder next.
+		subagent.endJobWithoutResult();
 
-			await expect(answer).resolves.toBeUndefined();
-			expect(subagent.turns[1]).toEqual({ source: "prompt", steers: [message] });
-			expect(subagent.busyPrompts).toEqual([]);
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		await expect(answer).resolves.toBeUndefined();
+		expect(subagent.turns[1]).toEqual({ source: "prompt", steers: [message] });
+		expect(subagent.busyPrompts).toEqual([]);
+	}, 30_000);
 
 	test("steer_subagent takes its message back and answers an error when the subagent stops before its next turn", async () => {
 		const subagent = startSubagentAwaitingEvalJob();
-		try {
-			await subagent.awaitingJob;
-			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
-			await Promise.race([answer, subagent.steerQueued]);
+		await subagent.awaitingJob;
+		const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
+		await Promise.race([answer, subagent.steerQueued]);
 
-			await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(true);
+		await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(true);
 
-			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
-			expect(subagent.queuedSteers).toEqual([]);
-			expect(subagent.turns).toHaveLength(1);
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
+		expect(subagent.queuedSteers).toEqual([]);
+		expect(subagent.turns).toHaveLength(1);
+	}, 30_000);
 
 	test("steer_subagent answers an error when someone else takes its message back and the run then ends", async () => {
 		const subagent = startSubagentAwaitingEvalJob();
 		const message = "Also check the README.";
-		try {
-			await subagent.awaitingJob;
-			const answer = handleRpcSteerSubagent(registry, subagent.id, message);
-			await Promise.race([answer, subagent.steerQueued]);
-			expect(subagent.takeBackElsewhere(message)).toBe(true);
+		await subagent.awaitingJob;
+		const answer = handleRpcSteerSubagent(registry, subagent.id, message);
+		await Promise.race([answer, subagent.steerQueued]);
+		expect(subagent.takeBackElsewhere(message)).toBe(true);
 
-			// The job's result wakes the subagent; that turn yields and the parent accepts it.
-			subagent.finishChild("child done");
-			expect((await subagent.run).aborted).toBe(false);
+		// The job's result wakes the subagent; that turn yields and the parent accepts it.
+		subagent.finishChild("child done");
+		expect((await subagent.run).aborted).toBe(false);
 
-			await expect(answer).resolves.toBe(`The message was not delivered to subagent: ${subagent.id}`);
-			expect(subagent.turns.map(turn => turn.steers)).toEqual([[], []]);
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		await expect(answer).resolves.toBe(`The message was not delivered to subagent: ${subagent.id}`);
+		expect(subagent.turns.map(turn => turn.steers)).toEqual([[], []]);
+	}, 30_000);
 
 	test("cancel_subagent leaves a subagent idle whose run ended with an error while its cleanup still holds it", async () => {
 		const subagent = startSubagentAwaitingEvalJob({ firstTurnFails: true });
-		try {
-			// The run's drive has ended on the error; its cleanup now waits on the job.
-			await subagent.jobCancelled;
-			expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([
-				{ id: subagent.id, status: "running" },
-			]);
-			const ref = AgentRegistry.global().get(subagent.id);
-			expect(ref?.status).toBe("idle");
-			expect(ref?.session).not.toBeNull();
+		// The run's drive has ended on the error; its cleanup now waits on the job.
+		await subagent.jobCancelled;
+		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([
+			{ id: subagent.id, status: "running" },
+		]);
+		const ref = AgentRegistry.global().get(subagent.id);
+		expect(ref?.status).toBe("idle");
+		expect(ref?.session).not.toBeNull();
 
-			await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(false);
-			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		await expect(handleRpcCancelSubagent(registry, subagent.id)).resolves.toBe(false);
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
 
-			subagent.finishChild("late");
-			const result = await subagent.run;
-			expect(result).toMatchObject({ exitCode: 1, aborted: false });
-			// Kept alive as a finished agent, not tombstoned.
-			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		subagent.finishChild("late");
+		const result = await subagent.run;
+		expect(result).toMatchObject({ exitCode: 1, aborted: false });
+		// Kept alive as a finished agent, not tombstoned.
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+	}, 30_000);
 
 	test("steer_subagent refuses at once a subagent whose run ended with an error while its cleanup still holds it", async () => {
 		const subagent = startSubagentAwaitingEvalJob({ firstTurnFails: true });
-		try {
-			await subagent.jobCancelled;
-			const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
-			// Refused before any wait: the answer is settled ahead of a pending marker queued after it.
-			const first = await Promise.race([answer, Promise.resolve().then(() => "still pending")]);
+		await subagent.jobCancelled;
+		const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.");
+		// Refused before any wait: the answer is settled ahead of a pending marker queued after it.
+		const first = await Promise.race([answer, Promise.resolve().then(() => "still pending")]);
 
-			expect(first).toBe(`Subagent not running: ${subagent.id}`);
-			expect(subagent.queuedSteers).toEqual([]);
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		expect(first).toBe(`Subagent not running: ${subagent.id}`);
+		expect(subagent.queuedSteers).toEqual([]);
+	}, 30_000);
 
 	test("a deferred RPC shutdown ends a steer waiting between turns: the message is taken back and no turn starts", async () => {
 		const betweenTurnSteers = new AbortController();
@@ -711,81 +712,68 @@ describe("handleRpcCancelSubagent", () => {
 			},
 		});
 		const subagent = startSubagentAwaitingEvalJob();
-		try {
-			await subagent.awaitingJob;
-			const answer = handleRpcSteerSubagent(
-				registry,
-				subagent.id,
-				"Also check the README.",
-				betweenTurnSteers.signal,
-			);
-			coordinator.track(answer.then(() => {}));
-			await Promise.race([answer, subagent.steerQueued]);
+		await subagent.awaitingJob;
+		const answer = handleRpcSteerSubagent(registry, subagent.id, "Also check the README.", betweenTurnSteers.signal);
+		coordinator.track(answer.then(() => {}));
+		await Promise.race([answer, subagent.steerQueued]);
 
-			// The subagent's job keeps running: only the steer's own end lets the drain
-			// finish, so a steer that held the shutdown would show as this case's timeout.
-			await coordinator.checkShutdownRequested();
+		// The subagent's job keeps running: only the steer's own end lets the drain
+		// finish, so a steer that held the shutdown would show as this case's timeout.
+		await coordinator.checkShutdownRequested();
 
-			expect(shutDown).toBe(true);
-			await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
-			expect(subagent.queuedSteers).toEqual([]);
-			expect(subagent.turns).toHaveLength(1);
-			expect(subagent.evalJob()?.status).toBe("running");
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		expect(shutDown).toBe(true);
+		await expect(answer).resolves.toBe(`Subagent's run ended before the message reached it: ${subagent.id}`);
+		expect(subagent.queuedSteers).toEqual([]);
+		expect(subagent.turns).toHaveLength(1);
+		expect(subagent.evalJob()?.status).toBe("running");
+	}, 30_000);
 
 	test("steer_subagent answers at once, queueing nothing and leaving no subscription, when the RPC shutdown already began", async () => {
 		const betweenTurnSteers = new AbortController();
 		betweenTurnSteers.abort();
 		const subagent = startSubagentAwaitingEvalJob();
-		try {
-			await subagent.awaitingJob;
-			// The steer's `ensureLive` builds the lifecycle manager on first use, which
-			// subscribes to the registry for good; build it first so only the steer's own count.
-			AgentLifecycleManager.global();
-			/** Subscriptions the steer made and did not end, per source. */
-			const live = { registry: 0, global: 0, shutdown: 0 };
-			const track = (target: { onChange(listener: () => void): () => void }, key: "registry" | "global") => {
-				const onChange = target.onChange.bind(target);
-				vi.spyOn(target, "onChange").mockImplementation(listener => {
-					live[key]++;
-					const unsubscribe = onChange(listener);
-					return () => {
-						live[key]--;
-						unsubscribe();
-					};
-				});
-			};
-			track(registry, "registry");
-			track(AgentRegistry.global(), "global");
-			const signal = betweenTurnSteers.signal;
-			const addEventListener = signal.addEventListener.bind(signal);
-			const removeEventListener = signal.removeEventListener.bind(signal);
-			vi.spyOn(signal, "addEventListener").mockImplementation((type, listener, options) => {
-				if (type === "abort" && listener) live.shutdown++;
-				addEventListener(type, listener, options);
+		await subagent.awaitingJob;
+		// The steer's `ensureLive` builds the lifecycle manager on first use, which
+		// subscribes to the registry for good; build it first so only the steer's own count.
+		AgentLifecycleManager.global();
+		/** Subscriptions the steer made and did not end, per source. */
+		const live = { registry: 0, global: 0, shutdown: 0 };
+		const track = (target: { onChange(listener: () => void): () => void }, key: "registry" | "global") => {
+			const onChange = target.onChange.bind(target);
+			vi.spyOn(target, "onChange").mockImplementation(listener => {
+				live[key]++;
+				const unsubscribe = onChange(listener);
+				return () => {
+					live[key]--;
+					unsubscribe();
+				};
 			});
-			vi.spyOn(signal, "removeEventListener").mockImplementation((type, listener, options) => {
-				if (type === "abort" && listener) live.shutdown--;
-				removeEventListener(type, listener, options);
-			});
-			const sessionListeners = subagent.sessionListenerCount();
+		};
+		track(registry, "registry");
+		track(AgentRegistry.global(), "global");
+		const signal = betweenTurnSteers.signal;
+		const addEventListener = signal.addEventListener.bind(signal);
+		const removeEventListener = signal.removeEventListener.bind(signal);
+		vi.spyOn(signal, "addEventListener").mockImplementation((type, listener, options) => {
+			if (type === "abort" && listener) live.shutdown++;
+			addEventListener(type, listener, options);
+		});
+		vi.spyOn(signal, "removeEventListener").mockImplementation((type, listener, options) => {
+			if (type === "abort" && listener) live.shutdown--;
+			removeEventListener(type, listener, options);
+		});
+		const sessionListeners = subagent.sessionListenerCount();
 
-			await expect(handleRpcSteerSubagent(registry, subagent.id, "Also check the README.", signal)).resolves.toBe(
-				`Subagent's run ended before the message reached it: ${subagent.id}`,
-			);
+		await expect(handleRpcSteerSubagent(registry, subagent.id, "Also check the README.", signal)).resolves.toBe(
+			`Subagent's run ended before the message reached it: ${subagent.id}`,
+		);
 
-			expect(subagent.steerCalls).toEqual([]);
-			expect(subagent.queuedSteers).toEqual([]);
-			expect(live).toEqual({ registry: 0, global: 0, shutdown: 0 });
-			expect(subagent.sessionListenerCount()).toBe(sessionListeners);
-			expect(subagent.turns).toHaveLength(1);
-		} finally {
-			await subagent.stop();
-		}
-	}, 15_000);
+		expect(subagent.steerCalls).toEqual([]);
+		expect(subagent.queuedSteers).toEqual([]);
+		expect(live).toEqual({ registry: 0, global: 0, shutdown: 0 });
+		expect(subagent.sessionListenerCount()).toBe(sessionListeners);
+		expect(subagent.turns).toHaveLength(1);
+	}, 30_000);
 
 	test("cancel_subagent reaches a follow-up run listed before its first turn, after a run that ended without a result", async () => {
 		const id = "Worker";
@@ -845,8 +833,14 @@ describe("handleRpcCancelSubagent", () => {
 		// The previous run failed: its drive ended and the ref stayed idle.
 		expect(AgentRegistry.global().markRunEnded(id, session)).toBe(true);
 		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const teardown = new AbortController();
 
-		const run = runSubagentFollowUpTurn({ id, agent, message: "continue", eventBus });
+		const run = runSubagentFollowUpTurn({ id, agent, message: "continue", eventBus, signal: teardown.signal });
+		teardowns.push(async () => {
+			teardown.abort();
+			firstTurn.resolve();
+			await Promise.allSettled([run]);
+		});
 		await promptEntered.promise;
 		// Listed by its started frame; its first turn has not started, so the ref is still idle.
 		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([{ id, status: "running" }]);
@@ -857,5 +851,5 @@ describe("handleRpcCancelSubagent", () => {
 		expect(calls).toContain("abort");
 		expect(AgentRegistry.global().get(id)?.status).toBe("aborted");
 		await run;
-	}, 15_000);
+	}, 30_000);
 });

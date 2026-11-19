@@ -26,6 +26,7 @@
 - A rate limit that states no wait, under a `retry.maxDelayMs` below the 30-second rate-limit backoff, is retried on the same model after `retry.maxDelayMs`, instead of ending the turn, or walking `retry.fallbackChains` at once, on a `Provider requested 30000ms wait` the provider never stated
 - RPC `cancel_subagent` now cancels a subagent that `get_subagents` reports running while it waits between turns for its own background work, such as an eval `agent()` job, and ends that work, instead of answering `{"cancelled": false}`
 - RPC `steer_subagent` now reaches a subagent that `get_subagents` reports running while it waits between turns, instead of answering `Subagent not running`: the message waits for the subagent's next turn, which its task executor or a finished job starts, and the command answers an error if the subagent stops, or the RPC session shuts down, before any turn takes it
+- RPC `steer_subagent` sent to a subagent that `get_subagents` lists running before its first turn starts no longer makes that run fail with `AgentBusyError`: the message waits for the turn the subagent's task executor starts
 
 ## [18.18.6] - 2026-11-09
 
