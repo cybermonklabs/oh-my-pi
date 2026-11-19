@@ -5,9 +5,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getProjectDir, isEnoent, pathIsWithin } from "@oh-my-pi/pi-utils";
+import { applyEntryPatches } from "../session/entry-patches";
 import { ANONYMIZED_REVIEW_NOTE, anonymizeSessionTranscripts } from "../session/session-anonymizer";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 import { loadSessionFile } from "../session/session-loader";
+import { applyToolResultPrunes } from "../session/tool-result-prunes";
 import { resolveSessionFileArg } from "./session-arg";
 import { CliUsageError } from "./usage-error";
 
@@ -34,6 +36,9 @@ export async function runAnonymizeCommand(args: AnonymizeCommandArgs): Promise<v
 	// The loader returns [] for a file without a valid session header.
 	const header = records.find((record): record is SessionHeader => record.type === "session");
 	if (!header) throw new CliUsageError(`${sourcePath} is not a valid session file`);
+	// The export writes prune and patch records empty, so their effects go inline first.
+	applyToolResultPrunes(records);
+	applyEntryPatches(records);
 	const result = await anonymizeSessionTranscripts({
 		header,
 		entries: records.filter((record): record is SessionEntry => record.type !== "session"),

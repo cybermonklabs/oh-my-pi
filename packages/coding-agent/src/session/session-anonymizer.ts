@@ -17,10 +17,16 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { getBundledAgentsMap } from "../task/agents";
 import { BUILTIN_TOOL_NAMES, isMCPToolName } from "../tools/builtin-names";
 import { lexShellCommand } from "../tools/shell-tokenize";
+import { ENTRY_PATCH_CUSTOM_TYPE, type EntryPatchData } from "./entry-patches";
 import type { SessionEntry, SessionHeader } from "./session-entries";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
+import { TOOL_RESULT_PRUNE_CUSTOM_TYPE, type ToolResultPruneData } from "./tool-result-prunes";
 
 type JsonObject = Record<string, unknown>;
+
+/** Payloads of the record kinds whose effects every input already carries inline ({@link AnonymizeSessionInput}). */
+const NO_ENTRY_PATCHES: EntryPatchData = { patches: [] };
+const NO_TOOL_RESULT_PRUNES: ToolResultPruneData = { results: [] };
 
 /** Shown wherever an anonymized export is written: the redaction is rule-based, not a guarantee. */
 export const ANONYMIZED_REVIEW_NOTE =
@@ -39,7 +45,8 @@ export const ANONYMIZED_REVIEW_NOTE =
  * - `tool`/`name`/`customType`: code-chosen identifiers kept; MCP (user-configured) names tokenized.
  * - `content`: string or content blocks. `struct`: nested omp structure.
  * - `args`/`details`/`data`: tool-call args, tool-result details, custom-entry data — walked only
- *   for built-in tools / omp's own entries, otherwise opaque.
+ *   for built-in tools / omp's own entries, otherwise opaque; `entry_patch` and `tool_result_prune`
+ *   records export their kind's empty payload.
  * - `runtime`: the build stamp; version and commit kept, branch/diff/label tokenized.
  * - `opaque`: replaced whole by a marker.
  */
@@ -1489,10 +1496,19 @@ export class SessionAnonymizer {
 					? this.#struct(value, true)
 					: this.#opaque(value);
 			case "data":
-				// omp's execution log mirrors the tool call; every other custom entry is extension state.
-				return parent.type === "custom" && parent.customType === "tool_execution_start" && isObject(value)
-					? this.#executionLog(value)
-					: this.#opaque(value);
+				if (parent.type !== "custom") return this.#opaque(value);
+				switch (parent.customType) {
+					// The entries already hold these records' effects; an empty payload reopens as a no-op record.
+					case ENTRY_PATCH_CUSTOM_TYPE:
+						return NO_ENTRY_PATCHES;
+					case TOOL_RESULT_PRUNE_CUSTOM_TYPE:
+						return NO_TOOL_RESULT_PRUNES;
+					// omp's execution log mirrors the tool call; every other custom entry is extension state.
+					case "tool_execution_start":
+						return isObject(value) ? this.#executionLog(value) : this.#opaque(value);
+					default:
+						return this.#opaque(value);
+				}
 			case "runtime":
 				return isObject(value) ? this.#runtimeStamp(value) : this.#opaque(value);
 			case "name":
@@ -1758,6 +1774,11 @@ export class SessionAnonymizer {
 /** A session transcript to anonymize: its header, entries, and file (for subagent discovery). */
 export interface AnonymizeSessionInput {
 	header: SessionHeader | null;
+	/**
+	 * Entries carrying the effects of their `entry_patch` and `tool_result_prune` records inline, as live
+	 * entries do or as `applyToolResultPrunes` then `applyEntryPatches` leave loaded ones: the export
+	 * writes those records with empty payloads.
+	 */
 	entries: readonly SessionEntry[];
 	sessionFile?: string;
 	/** Malformed records the caller skipped while loading the main transcript. */

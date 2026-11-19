@@ -11,6 +11,7 @@
 - Stopped long sessions from rewriting their entire session file on every turn that prunes tool output (superseded reads, uneventful results, or the context-size prune), so the disk writes of those turns no longer grow with session length.
 - A subagent's transcript read over RPC (`get_subagent_messages`) or in the Agent Hub now shows a recovered retry as recovered and an elided tool result as its placeholder, as the session itself does
 - A retry marker or other stamp that another process appended to the session file is no longer dropped when this session next rewrites the file, and a stamp whose content does not fit its entry is skipped with a warning instead of corrupting that entry
+- An `omp anonymize` export shows a recovered retry as recovered and a pruned tool result as pruned, and reopens without malformed-record warnings
 
 ## [18.18.6] - 2026-11-09
 
