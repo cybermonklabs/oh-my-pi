@@ -1263,7 +1263,16 @@ export interface DeveloperMessage {
 /** How an automatic retry recovered or ultimately settled a failed attempt. */
 export type AssistantRetryRecoveryKind = "credential" | "model" | "wait" | "plain";
 
-/** Persisted presentation state for an assistant error superseded by an automatic retry saga. */
+/**
+ * Persisted presentation state for an assistant error superseded by an automatic retry saga.
+ *
+ * `kept` marks a failed turn the retry kept in context and continued from
+ * instead of sending again (a rate limit after visible text, a cut stream after
+ * complete tool calls): a model context rebuilt from the session keeps it, as
+ * the live context does. Any other marked turn is left out of that rebuild.
+ * Sessions written before `kept` existed carry no such marker, so a rebuild
+ * leaves their kept turns out too.
+ */
 export type AssistantRetryRecovery =
 	| {
 			kind: "auto-retry";
@@ -1272,6 +1281,7 @@ export type AssistantRetryRecovery =
 			recoveredAt: string;
 			recovery: AssistantRetryRecoveryKind;
 			note: string;
+			kept?: true;
 			supersededBy?: {
 				timestamp: number;
 				responseId?: string;
@@ -1285,6 +1295,7 @@ export type AssistantRetryRecovery =
 			attempt: number;
 			recovery: AssistantRetryRecoveryKind;
 			note: string;
+			kept?: true;
 	  };
 
 export interface ContextSnapshot {

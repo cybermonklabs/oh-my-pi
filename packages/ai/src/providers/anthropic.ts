@@ -1060,12 +1060,11 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 		errorType !== undefined && Object.hasOwn(ANTHROPIC_STREAM_ERROR_STATUS, errorType)
 			? ANTHROPIC_STREAM_ERROR_STATUS[errorType]
 			: undefined;
+	const HttpError = httpStatus === 429 ? AnthropicStreamRateLimitError : AIError.ProviderHttpError;
 	const rejection =
 		httpStatus === undefined
 			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
-			: httpStatus === 429
-				? new AnthropicStreamRateLimitError(text, httpStatus, { code: errorType })
-				: new AIError.ProviderHttpError(text, httpStatus, { code: errorType });
+			: new HttpError(text, httpStatus, { code: errorType });
 	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AssistantRetryRecovery.kept` marks a failed turn an automatic retry kept in context and continued from, instead of sending it again
+
 ### Fixed
 
 - A rate limit the Anthropic API reports in its stream (an `error` event of type `rate_limit_error`), before or after the response starts, now carries HTTP status 429, and an overload it reports before the response starts (`overloaded_error`) status 529, so each is retried and held on the same model as the HTTP response would be; a streamed rate limit is sent again only by the caller's retry, one request per attempt

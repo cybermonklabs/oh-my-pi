@@ -377,6 +377,8 @@ type PendingRetryError = {
 	recovery: AssistantRetryRecoveryKind;
 	attempt: number;
 	note: string;
+	/** The retry kept the failed turn in context and continued from it (`AssistantRetryRecovery.kept`). */
+	kept: boolean;
 };
 
 /** How a retry saga's pending error entries are annotated when it closes. */
@@ -816,9 +818,10 @@ export class TurnRecovery {
 
 	/**
 	 * A rate limit that ended a turn after its text rendered: a text-only turn,
-	 * or one whose tool calls all have results (the agent loop pairs each with a
-	 * synthetic `executed: false` one, so a continuation reissues the call and
-	 * repeats nothing). The turn cannot be sent again, since its text is shown,
+	 * or one whose tool calls all have results: a real one for a call that ran,
+	 * a synthetic `executed: false` one the agent loop pairs with a call that
+	 * did not, so a continuation reissues only the calls that never ran and
+	 * repeats nothing. The turn cannot be sent again, since its text is shown,
 	 * so {@link handleRetryableError} with `continueCommittedText` waits the
 	 * limit out on this model and then continues the answer.
 	 */
@@ -1060,7 +1063,7 @@ export class TurnRecovery {
 	async #recordPendingRetryError(
 		message: AssistantMessage,
 		id: number,
-		options: { switchedCredential: boolean; switchedModel: boolean; delayMs: number },
+		options: { switchedCredential: boolean; switchedModel: boolean; delayMs: number; kept: boolean },
 	): Promise<void> {
 		await this.persistTerminalEmptyErrorTurn(message);
 		const persistenceKey = sessionMessagePersistenceKey(message);
@@ -1084,6 +1087,7 @@ export class TurnRecovery {
 			recovery,
 			attempt: this.#retryAttempt,
 			note,
+			kept: options.kept,
 		});
 	}
 
@@ -1107,6 +1111,7 @@ export class TurnRecovery {
 			}
 			if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
 			let retryRecovery: AssistantRetryRecovery;
+			const kept = pending.kept ? { kept: true as const } : {};
 			if (completion.status === "recovered") {
 				retryRecovery = {
 					kind: "auto-retry",
@@ -1115,6 +1120,7 @@ export class TurnRecovery {
 					recoveredAt: new Date().toISOString(),
 					recovery: pending.recovery,
 					note: pending.note,
+					...kept,
 					supersededBy: {
 						timestamp: completion.supersedingMessage.timestamp,
 						...(completion.supersedingMessage.responseId === undefined
@@ -1131,6 +1137,7 @@ export class TurnRecovery {
 					attempt: pending.attempt,
 					recovery: pending.recovery,
 					note: pending.note,
+					...kept,
 				};
 			}
 			entry.message.retryRecovery = retryRecovery;
@@ -2980,8 +2987,7 @@ export class TurnRecovery {
 		}
 		const allowModelFallback =
 			options?.allowModelFallback !== false &&
-			!options?.continueCommittedText &&
-			!(this.#continuingCommittedText && rateLimited) &&
+			!(rateLimited && (options?.continueCommittedText || this.#continuingCommittedText)) &&
 			!this.#host.modelFallbackDisabled?.();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
@@ -3264,7 +3270,12 @@ export class TurnRecovery {
 			return false;
 		}
 
-		await this.#recordPendingRetryError(message, id, { switchedCredential, switchedModel, delayMs });
+		await this.#recordPendingRetryError(message, id, {
+			switchedCredential,
+			switchedModel,
+			delayMs,
+			kept: preserveFailedTurn,
+		});
 		// Quota resets elapse while the machine sleeps; capture the deadline before event delivery.
 		const usageResetDeadline = AIError.is(id, AIError.Flag.UsageLimit) ? Date.now() + delayMs : undefined;
 

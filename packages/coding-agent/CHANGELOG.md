@@ -27,6 +27,7 @@
 - RPC `cancel_subagent` now cancels a subagent that `get_subagents` reports running while it waits between turns for its own background work, such as an eval `agent()` job, and ends that work, instead of answering `{"cancelled": false}`
 - RPC `steer_subagent` now reaches a subagent that `get_subagents` reports running while it waits between turns, instead of answering `Subagent not running`: the message waits for the subagent's next turn, which its task executor or a finished job starts, and the command answers an error if the subagent stops, or the RPC session shuts down, before any turn takes it
 - RPC `steer_subagent` sent to a subagent that `get_subagents` lists running before its first turn starts no longer makes that run fail with `AgentBusyError`: the message waits for the turn the subagent's task executor starts
+- A failed turn that automatic retry kept and continued from (an answer a rate limit cut off, or a turn a dropped stream cut off after complete tool calls) stays in what the model sees after a resume, reload or compaction, instead of being left out so that the continuation, or a tool result, follows nothing; sessions saved before this release still leave such turns out
 
 ## [18.18.6] - 2026-11-09
 

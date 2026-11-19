@@ -453,10 +453,13 @@ export function buildSessionContext(
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
+			// A failed turn automatic retry replaced carries `retryRecovery` and
+			// leaves model context; one it kept and continued from (`kept`) stays,
+			// as it does in the live context.
 			if (
 				!options?.transcript &&
 				entry.message.role === "assistant" &&
-				(entry.message.retryRecovery || isEmptyErrorTurn(entry.message))
+				((entry.message.retryRecovery && !entry.message.retryRecovery.kept) || isEmptyErrorTurn(entry.message))
 			) {
 				return;
 			}
@@ -781,12 +784,14 @@ export function buildSessionContext(
 	// and can spend minutes reprocessing old context before the new prompt.
 	// Keep the interrupted-thinking continuity pair: convertToLlm strips the
 	// unsafe trailing thinking from that assistant and sends the hidden
-	// continuity note instead.
+	// continuity note instead. Keep a failed turn automatic retry kept and
+	// continued from (`retryRecovery.kept`): the turns after it pick up from it.
 	if (!options?.transcript) {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
 			if (message?.role !== "assistant") continue;
 			if (message.stopReason !== "aborted" && message.stopReason !== "error") continue;
+			if (message.retryRecovery?.kept) continue;
 			const next = messages[i + 1];
 			if (next?.role === "custom" && next.customType === INTERRUPTED_THINKING_MESSAGE_TYPE) continue;
 			// A failed turn that emitted tool calls persists paired synthetic
