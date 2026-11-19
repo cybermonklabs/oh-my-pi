@@ -40,6 +40,7 @@ import {
 	validateRetryFallbackChains,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -8911,7 +8912,8 @@ describe("AgentSession retry fallback", () => {
 		expect(reminderText).toContain("malformed");
 
 		const messages = session.agent.state.messages;
-		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "developer", "assistant"]);
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "custom", "assistant"]);
+		expect(messages[2]).toMatchObject({ role: "custom", customType: CONTINUE_REMINDER_MESSAGE_TYPE });
 		const recovered = messages[3];
 		if (recovered.role !== "assistant") throw new Error(`Expected assistant, got ${recovered.role}`);
 		expect(recovered.content).toEqual([{ type: "text", text: "Recovered after transcribed function call" }]);

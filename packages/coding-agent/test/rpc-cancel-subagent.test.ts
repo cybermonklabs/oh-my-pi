@@ -18,7 +18,11 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { QueuedMessageTarget, SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type {
+	PromptOptions,
+	QueuedMessageTarget,
+	SteerOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
@@ -235,7 +239,14 @@ describe("handleRpcCancelSubagent", () => {
 				listeners.add(listener);
 				return () => listeners.delete(listener);
 			},
-			prompt: async (text: string) => {
+			prompt: async (text: string, options?: PromptOptions) => {
+				// As AgentSession: a steer that finds no turn in flight is held for the next run.
+				if (!streaming && options?.streamingBehavior === "steer" && options.idleSteer) {
+					const { queueId, onTaken, onHeld } = options.idleSteer;
+					await session.steer(text, undefined, { holdUntilNextRun: true, queueId, onTaken });
+					onHeld();
+					return true;
+				}
 				if (streaming) {
 					busyPrompts.push(text);
 					throw new AgentBusyError();

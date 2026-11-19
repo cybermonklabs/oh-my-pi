@@ -15,7 +15,11 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { QueuedMessageTarget, SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type {
+	PromptOptions,
+	QueuedMessageTarget,
+	SteerOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -57,34 +61,42 @@ const id = "Worker";
 const sessionFile = path.join(cwd, `${id}.jsonl`);
 /** Queued next-run steers: each one's text and the name its sender gave it. */
 const queued: Array<{ text: string; queueId?: string }> = [];
+const worker = {
+	subscribe: () => () => {},
+	steer: async (text: string, _images: unknown, options?: SteerOptions) => {
+		queued.push({ text, queueId: options?.queueId });
+		note(`queued ${text}`);
+	},
+	removeQueuedMessage: (target: QueuedMessageTarget) => {
+		const index = queued.findIndex(steer =>
+			typeof target === "string" ? steer.text === target : steer.queueId === target.queueId,
+		);
+		if (index < 0) return false;
+		const [steer] = queued.splice(index, 1);
+		note(`taken back ${steer.text}`);
+		return true;
+	},
+	prompt: async (text: string, options?: PromptOptions) => {
+		// As AgentSession: a steer that finds no turn in flight (this double never runs one) is held for the next run.
+		if (options?.streamingBehavior === "steer" && options.idleSteer) {
+			const { queueId, onTaken, onHeld } = options.idleSteer;
+			await worker.steer(text, undefined, { holdUntilNextRun: true, queueId, onTaken });
+			onHeld();
+			return true;
+		}
+		note("prompt");
+		return true;
+	},
+	abort: async () => {},
+	dispose: async () => {},
+};
 AgentRegistry.global().register({
 	id,
 	displayName: id,
 	kind: "sub",
 	sessionFile,
 	status: "idle",
-	session: {
-		subscribe: () => () => {},
-		steer: async (text: string, _images: unknown, options?: SteerOptions) => {
-			queued.push({ text, queueId: options?.queueId });
-			note(`queued ${text}`);
-		},
-		removeQueuedMessage: (target: QueuedMessageTarget) => {
-			const index = queued.findIndex(steer =>
-				typeof target === "string" ? steer.text === target : steer.queueId === target.queueId,
-			);
-			if (index < 0) return false;
-			const [steer] = queued.splice(index, 1);
-			note(`taken back ${steer.text}`);
-			return true;
-		},
-		prompt: async () => {
-			note("prompt");
-			return true;
-		},
-		abort: async () => {},
-		dispose: async () => {},
-	} as never,
+	session: worker as never,
 });
 
 const subagentEventBus = new EventBus();

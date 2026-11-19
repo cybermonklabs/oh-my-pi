@@ -1156,6 +1156,9 @@ subagent waiting for its own eval `agent()` job) does not start a turn for the
 message: it is queued as a next-run steer, which waits on the subagent's queue
 and reaches its next turn, which its task executor starts (a yield reminder) or
 a finished job's result starts, before that turn's first model call. The
+subagent's own session decides which of the two applies, when the message
+reaches it; the parent's view of the subagent, which can lag behind a subagent
+running on a worker thread, does not decide. The
 message is recorded in the subagent's own transcript; it is not attributed to
 the parent agent, and the parent sees only the subagent's eventual result.
 Isolated (worktree) subagents run in-process and are steered the same way.
@@ -1166,11 +1169,13 @@ Isolated (worktree) subagents run in-process and are steered the same way.
 ```
 
 The response arrives once the message is accepted: for a mid-turn subagent,
-queued into the running turn or its new turn started; for a subagent between
+once it is queued into the running turn; for a subagent between
 turns, once its next turn has taken the message into its context. Each
 `steer_subagent` answers for its own message: two sent with the same text are
 two messages, and a turn that takes one answers only that one. It does
-not wait for the turn to finish. Like `prompt`, the command starts in queue
+not wait for the turn to finish, except for an extension command that itself
+waits for one, since a mid-turn message answers once the subagent's `prompt()`
+has handled it. Like `prompt`, the command starts in queue
 order but waits for acceptance in the background, so later commands
 (including `abort`) are not held behind it. For a mid-turn subagent, as in
 Agent Hub chat (not RPC `steer`), the message goes through the subagent's
