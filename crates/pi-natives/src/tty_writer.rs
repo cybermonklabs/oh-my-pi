@@ -150,13 +150,17 @@ fn pump_loop(fd: i32, inner: &Inner) {
 				inner.pending.fetch_sub(n, Ordering::AcqRel);
 			});
 			if result.is_err() {
-				inner.dead.store(true, Ordering::Release);
 				// Chunks already written were subtracted above; drop the rest —
-				// the unwritten front remainder plus everything still queued.
+				// the unwritten front remainder plus everything still queued —
+				// and only then mark the writer dead, so a caller that reads
+				// `dead()` as true also reads the drop in `pending()`, as
+				// `dead()` promises. Output appended after this point is
+				// drain-dropped by the branch above on the next pass.
 				let mut back = inner.back.lock();
 				let dropped = back.len() + (front.len() - written);
 				back.clear();
 				inner.pending.fetch_sub(dropped, Ordering::AcqRel);
+				inner.dead.store(true, Ordering::Release);
 			}
 		}
 		front.clear();
@@ -372,6 +376,24 @@ mod tests {
 		(fds[0], fds[1])
 	}
 
+	/// Polls until `done` holds. The test runner's own timeout bounds the wait:
+	/// a deadline here would turn a loaded machine's late scheduling of the
+	/// pump thread into a failure the writer did not cause.
+	fn wait_until(mut done: impl FnMut() -> bool) {
+		while !done() {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	/// Flushes with no deadline: draining is the only way out, so a writer that
+	/// never drains hangs the test for the runner to stop, instead of failing
+	/// because the machine was slow.
+	fn flush(writer: &TtyWriter) {
+		while !writer.flush_sync(1_000) {
+			assert!(!writer.dead(), "the writer died with output still queued");
+		}
+	}
+
 	#[test]
 	fn spawned_children_do_not_inherit_the_writer_fd() {
 		let (read_fd, write_fd) = pipe_pair();
@@ -401,7 +423,7 @@ mod tests {
 		let mut writer = TtyWriter::new(write_fd).unwrap();
 		push(&writer, b"hello ");
 		push(&writer, b"world");
-		assert!(writer.flush_sync(2_000));
+		flush(&writer);
 		assert_eq!(writer.pending(), 0);
 		let mut buf = [0u8; 64];
 		// SAFETY: buf is a valid out-buffer for read(2).
@@ -430,19 +452,14 @@ mod tests {
 		let total = 512 * 1024;
 		push(&writer, &vec![b'x'; total]);
 
-		let deadline = Instant::now() + Duration::from_secs(2);
-		loop {
-			let pending = writer.pending();
+		wait_until(|| {
 			assert!(!writer.dead(), "temporary backpressure killed the terminal writer");
-			if pending > 0 && pending < total as u32 {
-				break;
-			}
-			assert!(Instant::now() < deadline, "pump made no write progress");
-			std::thread::sleep(Duration::from_millis(10));
-		}
+			let pending = writer.pending();
+			pending > 0 && pending < total as u32
+		});
 
 		let reader = std::thread::spawn(move || {
-			let mut buf = [0u8; 64 * 1024];
+			let mut buf = vec![0u8; 64 * 1024];
 			let mut received = 0usize;
 			while received < total {
 				// SAFETY: this thread owns read_fd and buf is valid writable
@@ -457,7 +474,7 @@ mod tests {
 			unsafe { libc::close(read_fd) };
 			received
 		});
-		assert!(writer.flush_sync(5_000));
+		flush(&writer);
 		assert!(!writer.dead());
 		writer.stop(1_000);
 		// SAFETY: the pump has stopped and no longer accesses write_fd.
@@ -470,12 +487,12 @@ mod tests {
 		let (read_fd, write_fd) = pipe_pair();
 		let mut writer = TtyWriter::new(write_fd).unwrap();
 		// Overwhelm the kernel pipe buffer (64 KiB default) without a reader:
-		// enqueue must return immediately and report a growing backlog.
+		// enqueue must return and report a backlog. With no reader a blocking
+		// enqueue never returns, so returning at all is the proof; a time limit
+		// would only measure how busy the machine is.
 		let chunk = vec![b'x'; 256 * 1024];
-		let start = Instant::now();
 		push(&writer, &chunk);
 		push(&writer, &chunk);
-		assert!(start.elapsed() < Duration::from_millis(200), "enqueue blocked on a full pipe");
 		assert!(writer.pending() > 0);
 		// Drain concurrently, then the queue must empty.
 		let reader = std::thread::spawn(move || {
@@ -491,7 +508,7 @@ mod tests {
 			}
 			total
 		});
-		assert!(writer.flush_sync(5_000));
+		flush(&writer);
 		writer.stop(1_000);
 		// SAFETY: closing the test-owned write fd unblocks the reader at EOF.
 		unsafe { libc::close(write_fd) };
@@ -503,32 +520,43 @@ mod tests {
 	#[test]
 	fn pending_tracks_partial_drain_progress() {
 		let (read_fd, write_fd) = pipe_pair();
+		// The pipe's capacity is not the test's to assume. Linux gives a user's
+		// new pipes 2 pages instead of 16 once that user's pipes hold more than
+		// `pipe-user-pages-soft` pages (a box running many agents gets there),
+		// and the pump's blocking write of one chunk cannot return until a
+		// reader makes room for all of it. Shrink the pipe to one page, so every
+		// run sees that small case, and let a reader drain a first part, so the
+		// pump's progress comes from the reader and not from the capacity.
+		#[cfg(target_os = "linux")]
+		// SAFETY: write_fd is a pipe this test owns.
+		assert!(unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096) } >= 4096);
 		let mut writer = TtyWriter::new(write_fd).unwrap();
-		// Far larger than any kernel pipe buffer, so the pump writes what fits
-		// and then blocks on the remainder with no reader draining.
 		let total = 1024 * 1024;
 		push(&writer, &vec![b'x'; total]);
-		// Wait until the pump has written at least one chunk, but remains blocked
-		// on the undrained tail. Do not treat one unchanged sample as stability:
-		// under full-suite load the pump thread may not be scheduled before the
-		// first poll.
-		let deadline = Instant::now() + Duration::from_secs(2);
-		loop {
-			std::thread::sleep(Duration::from_millis(20));
-			let pending = writer.pending();
-			if pending > 0 && pending < total as u32 {
-				break;
-			}
-			assert!(
-				Instant::now() < deadline,
-				"pump made no observable partial progress; pending {pending} of {total}"
-			);
+		// Read a first part well short of the whole, then stop reading: the pump
+		// has then written at least that much and is blocked on the rest.
+		const FIRST: usize = 256 * 1024;
+		let mut buf = vec![0u8; 64 * 1024];
+		let mut got = 0usize;
+		while got < FIRST {
+			let want = (FIRST - got).min(buf.len());
+			// SAFETY: buf is a valid out-buffer of at least `want` bytes.
+			let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), want) };
+			assert!(n > 0, "reading the first part failed: {n}");
+			got += n as usize;
 		}
+		// The pump may not be scheduled for a while on a loaded machine, so this
+		// waits for the state with no deadline of its own.
+		wait_until(|| {
+			let pending = writer.pending();
+			pending > 0 && pending < total as u32
+		});
 		// Drain the rest so stop() can join the pump thread.
+		let rest = total - got;
 		let reader = std::thread::spawn(move || {
 			let mut buf = vec![0u8; 64 * 1024];
 			let mut got = 0usize;
-			while got < total {
+			while got < rest {
 				// SAFETY: buf is a valid out-buffer for read(2).
 				let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
 				if n <= 0 {
@@ -538,11 +566,11 @@ mod tests {
 			}
 			got
 		});
-		assert!(writer.flush_sync(5_000));
+		flush(&writer);
 		writer.stop(1_000);
 		// SAFETY: closing the test-owned write fd unblocks the reader at EOF.
 		unsafe { libc::close(write_fd) };
-		assert_eq!(reader.join().unwrap(), total);
+		assert_eq!(reader.join().unwrap(), rest);
 		// SAFETY: closing test-owned fd.
 		unsafe { libc::close(read_fd) };
 	}
@@ -572,7 +600,7 @@ mod tests {
 		for _ in 0..WRITES {
 			push(&writer, b"x");
 		}
-		assert!(writer.flush_sync(5_000));
+		flush(&writer);
 		assert_eq!(writer.pending(), 0);
 		writer.stop(1_000);
 		// SAFETY: closing the test-owned original write fd lets the reader
@@ -594,10 +622,7 @@ mod tests {
 		unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 		let mut writer = TtyWriter::new(write_fd).unwrap();
 		push(&writer, b"doomed");
-		let deadline = Instant::now() + Duration::from_secs(2);
-		while !writer.dead() && Instant::now() < deadline {
-			std::thread::sleep(Duration::from_millis(5));
-		}
+		wait_until(|| writer.dead());
 		assert!(writer.dead());
 		assert_eq!(writer.pending(), 0);
 		writer.stop(100);
