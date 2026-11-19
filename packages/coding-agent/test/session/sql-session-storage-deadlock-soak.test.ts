@@ -4,10 +4,17 @@
  * milliseconds on each row backend whose URL is set (PostgreSQL, MySQL or
  * MariaDB). `OMP_TEST_SQL_SOAK_WORKERS` workers (8 by default), each a store
  * of its own, run random appends, full writes, deletes, replacing renames,
- * sweeps, deletes of session rows that leave references dangling (as a build
- * that keeps no references does), and inserts of parted blobs that share
- * parts, over four paths and seven images. Every store claims nothing, so no
- * lease row takes part. It counts the operations that failed with a
+ * sweeps, and deletes of session rows that leave references dangling (as a
+ * build that keeps no references does), and the first worker also inserts
+ * parted blobs that share parts, over seven shared images. Each worker writes
+ * three session paths of its own, as a session's lease gives one process its
+ * writes, so what the workers meet is the shared blob and reference tables,
+ * the sweep, and the session table's gaps. One worker inserts blobs: two
+ * inserts of one blob row at once, just after a delete marked it, both take
+ * InnoDB's shared lock for the duplicate check and then wait for the
+ * exclusive one, a race on the row itself that no lock order changes and the
+ * blob tier's tries absorb. Every store claims nothing, so no lease row takes
+ * part. It counts the operations that failed with a
  * deadlock, and passes only with none; run it with the store's
  * `WRITE_ATTEMPTS` at 1 so the deadlock retry hides none, and read the
  * server's own deadlock reports (`innodb_print_all_deadlocks`) beside it:
@@ -65,16 +72,17 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					];
 					const hashes = images.map(sha256);
 					const dir = db.dir.join("sessions");
-					const paths = ["p", "q", "r", "s"].map(name => `${dir}/2026-11-19T00-00-00-000Z_${name}.jsonl`);
+					const pathsOf = (worker: number) =>
+						["a", "b", "c"].map(name => `${dir}/2026-11-19T00-00-00-000Z_w${worker}${name}.jsonl`);
 					const pick = <T>(items: readonly T[]): T => items[Math.floor(Math.random() * items.length)] as T;
 					const naming = () =>
 						transcript(ID, [pick(hashes), pick(hashes)].map(hash => `blob:sha256:${hash}`).join(" "));
 					const counts = new Map<string, { ops: number; deadlocks: number; other: number }>();
 					const failures: string[] = [];
-					const ops: Array<[string, (store: SqlSessionStorage) => Promise<unknown>]> = [
+					const ops: Array<[string, (store: SqlSessionStorage, paths: string[]) => Promise<unknown>]> = [
 						[
 							"append",
-							async store => {
+							async (store, paths) => {
 								const writer = store.openWriter(pick(paths));
 								try {
 									await writer.append(naming());
@@ -83,11 +91,11 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 								}
 							},
 						],
-						["full write", store => store.writeText(pick(paths), naming()).then(() => store.drain())],
-						["delete", store => store.refresh().then(() => store.unlink(pick(paths)))],
+						["full write", (store, paths) => store.writeText(pick(paths), naming()).then(() => store.drain())],
+						["delete", (store, paths) => store.refresh().then(() => store.unlink(pick(paths)))],
 						[
 							"replacing rename",
-							store => {
+							(store, paths) => {
 								const src = pick(paths);
 								const dst = pick(paths.filter(path => path !== src));
 								return store.refresh().then(() => store.rename(src, dst));
@@ -96,7 +104,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 						["sweep", store => store.blobTier.sweep(new Set(), Date.now() + 60_000, true)],
 						[
 							"dangling",
-							async () => {
+							async (_store, paths) => {
 								const path = pick(paths);
 								await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [path]);
 								await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [path]);
@@ -116,14 +124,16 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					];
 					const deadline = performance.now() + SOAK_MS;
 					await Promise.all(
-						stores.map(async store => {
+						stores.map(async (store, worker) => {
+							const paths = pathsOf(worker);
+							const mine = worker === 0 ? ops : ops.filter(([kind]) => kind !== "parted insert");
 							while (performance.now() < deadline) {
-								const [kind, op] = pick(ops);
+								const [kind, op] = pick(mine);
 								const count = counts.get(kind) ?? { ops: 0, deadlocks: 0, other: 0 };
 								counts.set(kind, count);
 								count.ops++;
 								try {
-									await op(store);
+									await op(store, paths);
 								} catch (error) {
 									const message = error instanceof Error ? error.message : String(error);
 									if (/deadlock/i.test(message) || /40P01/.test(message)) {
