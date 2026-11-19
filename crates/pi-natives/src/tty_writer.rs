@@ -425,28 +425,17 @@ mod tests {
 		(fds[0], fds[1])
 	}
 
-	/// Read from `fd` until the received bytes end with `marker` or `timeout`
-	/// passes, whichever comes first.
-	fn read_until(fd: i32, marker: &[u8], timeout: Duration) -> Vec<u8> {
-		let deadline = Instant::now() + timeout;
+	/// Read from `fd` until the received bytes end with `marker`. The test
+	/// runner's own timeout bounds the wait: a deadline here would turn a
+	/// loaded machine's late scheduling of the pump thread into a failure the
+	/// writer did not cause.
+	fn read_until(fd: i32, marker: &[u8]) -> Vec<u8> {
 		let mut received = Vec::new();
 		let mut buf = vec![0u8; 64 * 1024];
 		while !received.ends_with(marker) {
-			let now = Instant::now();
-			if now >= deadline {
-				break;
-			}
-			let wait_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-			let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-			// SAFETY: pollfd points to one valid element; fd is test-owned.
-			if unsafe { libc::poll(&mut pollfd, 1, wait_ms) } <= 0 {
-				continue;
-			}
 			// SAFETY: buf is a valid out-buffer for read(2); fd is test-owned.
 			let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-			if n <= 0 {
-				break;
-			}
+			assert!(n > 0, "the pipe closed before {marker:?} arrived: {n}");
 			received.extend_from_slice(&buf[..n as usize]);
 		}
 		received
@@ -503,20 +492,23 @@ mod tests {
 		// fills.
 		push(&writer, &vec![b'x'; 4 * 1024 * 1024]);
 		// Discard only once the pump has claimed the push, so the in-flight
-		// abort path runs rather than the unclaimed-`back` clear alone.
-		let deadline = Instant::now() + Duration::from_secs(5);
+		// abort path runs rather than the unclaimed-`back` clear alone. No
+		// deadline: the claim is the event, and the runner bounds the wait.
 		while !writer.inner.back.lock().is_empty() {
-			assert!(Instant::now() < deadline, "pump never claimed the queued output");
 			std::thread::sleep(Duration::from_millis(1));
 		}
 		writer.discard();
 		push(&writer, b"TAIL");
-		let received = read_until(read_fd, b"TAIL", Duration::from_secs(5));
+		let received = read_until(read_fd, b"TAIL");
 		assert!(received.ends_with(b"TAIL"));
 		// At most the pipe buffer plus one in-flight chunk of the discarded bytes
 		// arrived.
 		assert!(received.len() < 1024 * 1024, "discarded bytes were written: {}", received.len());
-		assert!(writer.flush_sync(1000));
+		// Drained is the event; a writer that never drains hangs the test for the
+		// runner to stop, and one that dies with output queued fails it at once.
+		while !writer.flush_sync(1_000) {
+			assert!(!writer.dead(), "the writer died with output still queued");
+		}
 		assert_eq!(writer.pending(), 0);
 		writer.stop(1_000);
 		// SAFETY: the pump has stopped; closing test-owned fds.
