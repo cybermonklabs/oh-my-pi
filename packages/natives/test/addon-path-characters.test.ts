@@ -108,7 +108,17 @@ afterAll(async () => {
 
 async function probe(env: Record<string, string>): Promise<ProbeResult> {
 	const childEnv: Record<string, string | undefined> = { ...process.env, PI_COMPILED: "1", ...env };
-	for (const key of ["PI_NATIVES_DIR", "XDG_DATA_HOME", "__PI_NATIVE_VARIANT_CACHE"]) {
+	// The child finds the addon from the `HOME` or `PI_NATIVES_DIR` a row gives
+	// it, so nothing else that names omp's directories may reach it: a test
+	// preload can set `OMP_CONFIG_ROOT` and `OMP_DOWNLOAD_ROOT`, which the
+	// loader reads before `HOME`.
+	for (const key of [
+		"PI_NATIVES_DIR",
+		"XDG_DATA_HOME",
+		"__PI_NATIVE_VARIANT_CACHE",
+		"OMP_CONFIG_ROOT",
+		"OMP_DOWNLOAD_ROOT",
+	]) {
 		if (!(key in env)) delete childEnv[key];
 	}
 	if (variant) childEnv.PI_NATIVE_VARIANT = variant;
