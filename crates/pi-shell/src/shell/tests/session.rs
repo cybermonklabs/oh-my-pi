@@ -328,30 +328,55 @@ async fn deferred_duplications_read_the_descriptors_the_parent_holds() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn builtins_waiting_on_a_fifo_see_its_writer_close() {
+	let (status, output) = run_with_held_fifo_writers(concat!(
+		"mapfile -t lines < f1; echo \"mapfile=${#lines[@]}\"\n",
+		"while read -r l; do echo \"read=$l\"; done < f2\n",
+		"read -t 5 -r x < f3; echo \"read-t=$? $x\"",
+	))
+	.await;
+	assert_eq!((status, output.as_str()), (Some(0), "mapfile=1\nread=b\nread-t=1 c\n"));
+}
+
+/// A command that ends before it reads every FIFO still ends the test, with
+/// its status and output: the writers it never read from close when it ends,
+/// instead of the test waiting for a read that never comes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_ends_before_reading_every_fifo_still_ends_the_test() {
+	let (status, output) = run_with_held_fifo_writers(concat!(
+		"mapfile -t lines < f1; echo \"mapfile=${#lines[@]}\"; exit 3\n",
+		"while read -r l; do echo \"read=$l\"; done < f2\n",
+		"read -t 5 -r x < f3; echo \"read-t=$? $x\"",
+	))
+	.await;
+	assert_eq!((status, output.as_str()), (Some(3), "mapfile=1\n"));
+}
+
+/// Runs `command` in a directory with the FIFOs `f1` (holding `a\n`), `f2`
+/// (`b\n`) and `f3` (`c`), whose writers the test holds
+/// ([`HeldFifoWriter`]), and returns its status and output once every
+/// writer is closed. A writer the command never read from closes when the
+/// command ends, so a command that ends early leaves the caller its result
+/// to assert at once.
+#[cfg(unix)]
+async fn run_with_held_fifo_writers(command: &'static str) -> (Option<i32>, String) {
 	let root = tempfile::tempdir().expect("scratch directory");
+	let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 	let closers: Vec<_> = [("f1", "a\n"), ("f2", "b\n"), ("f3", "c")]
 		.into_iter()
 		.map(|(name, bytes)| {
 			let writer = HeldFifoWriter::open(&root.path().join(name), bytes.as_bytes());
-			std::thread::spawn(move || writer.close_once_read())
+			let ended = std::sync::Arc::clone(&ended);
+			std::thread::spawn(move || writer.close_once_read(&ended))
 		})
 		.collect();
-	let (result, output) = run_command_capture(
-		concat!(
-			"mapfile -t lines < f1; echo \"mapfile=${#lines[@]}\"\n",
-			"while read -r l; do echo \"read=$l\"; done < f2\n",
-			"read -t 5 -r x < f3; echo \"read-t=$? $x\"",
-		),
-		Some(root.path()),
-		None,
-		CancelToken::default(),
-	)
-	.await;
+	let (result, output) =
+		run_command_capture(command, Some(root.path()), None, CancelToken::default()).await;
+	ended.store(true, std::sync::atomic::Ordering::Release);
 	for closer in closers {
 		closer.join().expect("closer thread");
 	}
-
-	assert_eq!((result.exit_code, output.as_str()), (Some(0), "mapfile=1\nread=b\nread-t=1 c\n"));
+	(result.exit_code, output)
 }
 
 /// A FIFO with a writer end the test holds: a reader of the test's own
@@ -388,11 +413,15 @@ impl HeldFifoWriter {
 	}
 
 	/// Closes the writer 0.2 s after the shell's reader has taken every byte,
-	/// so it closes while that reader waits for more. Waits as long as that
-	/// takes: a reader that never comes is failed by the test runner.
-	fn close_once_read(self) {
+	/// so it closes while that reader waits for more; or at once when `ended`
+	/// is set (the command ended before it took them), so no wait outlives
+	/// the command.
+	fn close_once_read(self, ended: &std::sync::atomic::AtomicBool) {
 		use std::os::fd::AsRawFd as _;
 		loop {
+			if ended.load(std::sync::atomic::Ordering::Acquire) {
+				return;
+			}
 			let mut queued: libc::c_int = 0;
 			// SAFETY: FIONREAD writes one c_int through the pointer.
 			let rc = unsafe { libc::ioctl(self.reader.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
