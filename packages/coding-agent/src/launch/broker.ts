@@ -265,19 +265,31 @@ function signalDaemonTree(process: Process, signal: number, name: string): void 
 	}
 }
 
-/** `process.terminate` of a daemon's tree, going on past a walk it could not finish ({@link signalDaemonTree}). */
+/**
+ * The words `Process.terminate` rejects with when its walk could not read the whole tree (pi-shell
+ * `proctree::partly_signalled`): what it read and the process group the root leads were killed, but a
+ * descendant it could not read may still run.
+ */
+const PARTLY_SIGNALLED = "but one the walk could not read may not have been";
+
+/**
+ * `process.terminate` of a daemon's tree. A refusal rejects, as at `9058ab9d`, so the stop it serves
+ * fails with it. Only a walk that could not read the whole tree (no descriptor left), once the daemon
+ * itself has stopped, is logged and goes on ({@link signalDaemonTree}).
+ */
 async function terminateDaemonTree(
 	process: Process,
 	gracefulMs: number,
 	timeoutMs: number,
 	name: string,
 ): Promise<void> {
-	await process.terminate({ group: true, gracefulMs, timeoutMs }).catch(error => {
-		logger.warn("Daemon stopped, but part of its process tree could not be read", {
-			name,
-			error: error instanceof Error ? error.message : String(error),
-		});
-	});
+	try {
+		await process.terminate({ group: true, gracefulMs, timeoutMs });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (!message.includes(PARTLY_SIGNALLED) || process.status() === "running") throw error;
+		logger.warn("Daemon stopped, but part of its process tree could not be read", { name, error: message });
+	}
 }
 
 function publishesCompletionOwners(request: DaemonWireRequest): boolean {
@@ -1243,13 +1255,24 @@ class DaemonBroker {
 		return results.some(Boolean);
 	}
 
-	/** One retry of `pending` (see {@link #retryPendingKills}). */
+	/**
+	 * One retry of `pending` (see {@link #retryPendingKills}). A refused kill stays pending, logged: it
+	 * runs from a refresh, which a poll can make, so the next refresh tries it again.
+	 */
 	async #attemptPendingKill(record: ManagedDaemon, pending: PendingKill): Promise<boolean> {
 		const current = (): boolean => pending.generation === record.generation;
 		const pin = pinDaemon(pending.target);
 		if (pin.kind === "unpinned") return current();
 		if (pin.kind === "pinned") {
-			await terminateDaemonTree(pin.process, pending.gracefulMs, pending.timeoutMs, record.snapshot.name);
+			try {
+				await terminateDaemonTree(pin.process, pending.gracefulMs, pending.timeoutMs, record.snapshot.name);
+			} catch (error) {
+				logger.warn("Daemon kill refused; it stays pending", {
+					name: record.snapshot.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return current();
+			}
 			if (pin.process.status() === "running") return current();
 		}
 		const at = record.pendingKills.indexOf(pending);
