@@ -639,17 +639,21 @@ impl Pty {
 		String::from_utf8_lossy(&self.shared.state.lock().unwrap().0).into_owned()
 	}
 
-	/// Resize the terminal (the kernel sends `SIGWINCH` to its foreground
-	/// process group) and the screen model.
+	/// Resize the screen model, then the terminal (the kernel sends
+	/// `SIGWINCH` to its foreground process group): what the shell draws
+	/// for the new size meets a model of that size. Call it when the shell
+	/// waits with all its output read ([`Self::zle_sync`]): output written
+	/// before the resize and read after it would be drawn at the new size.
+	/// (Resizing the terminal first let a fast shell's redraw for the new
+	/// size be fed to the model at the old one.)
 	///
 	/// # Errors
 	///
 	/// When the size cannot be set.
 	pub fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
-		tty::set_window_size(self.master.as_raw_fd(), TtyInfo { rows, cols })?;
 		self.pump()?;
 		self.screen.resize(rows, cols);
-		Ok(())
+		tty::set_window_size(self.master.as_raw_fd(), TtyInfo { rows, cols })
 	}
 
 	/// Send `signal` to the shell's process.

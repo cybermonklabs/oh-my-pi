@@ -152,6 +152,19 @@ fn resize_redraws() {
 	});
 }
 
+/// A prompt two lines long at 80 columns wraps to three at 40: the
+/// resized screen shows it once, as zsh redraws it.
+#[test]
+fn resize_redraws_a_prompt_wrapped_to_three_lines() {
+	let prompt = format!("PS1='{} %# '", "p".repeat(86));
+	same(&prompt, |pty| {
+		keys(pty, "echo a long line of text")?;
+		pty.resize(24, 40)?;
+		pty.zle_sync(TIMEOUT)?;
+		keys(pty, "\rprint $COLUMNS\r")
+	});
+}
+
 #[test]
 fn vared_edits_a_parameter() {
 	same("x=hello\n", |pty| {
