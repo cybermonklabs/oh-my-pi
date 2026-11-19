@@ -223,7 +223,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					// The end state: every reference names a blob row (no delete took a blob a reference names), and every
 					// parted blob row has its parts' references, each naming a row by the check before.
 					const stored = adapter === "postgres" ? "octet_length(content)" : "length(content)";
-					const blobRows = await db.sql(`SELECT sha256, byte_len, ${stored} AS stored FROM ${db.table}_blobs`);
+					const blobRows = await db.sql(`SELECT sha256, byte_len, ${stored} AS stored_len FROM ${db.table}_blobs`);
 					const there = new Set(blobRows.map(row => String(row.sha256)));
 					const refs = await db.sql(`SELECT path, sha256 FROM ${db.table}_refs`);
 					const broken: string[] = [];
@@ -231,7 +231,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 						if (!there.has(String(ref.sha256))) broken.push(`${String(ref.path)} names a blob with no row`);
 					}
 					for (const row of blobRows) {
-						if (Number(row.byte_len) === Number(row.stored)) continue;
+						if (Number(row.byte_len) === Number(row.stored_len)) continue;
 						const partsPath = `blob:sha256:${String(row.sha256)}`;
 						if (!refs.some(ref => String(ref.path) === partsPath)) broken.push(`${partsPath} has no parts`);
 					}
