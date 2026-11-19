@@ -1363,15 +1363,16 @@ pub fn zsh_startup_values(
 	for (name, value) in integers {
 		out.push((name, Var::scalar(value, Attrs::INTEGER), false));
 	}
-	// zsh exports `HOME` and `LOGNAME` (`addenv` when not imported).
-	if !user.home.is_empty() {
-		let home = if platform == crate::bash::ids::Platform::Windows {
-			builtins::zsh_dir::windows_spelling(&user.home, &user.home)
-		} else {
-			user.home.clone()
-		};
-		out.push((&b"HOME"[..], Var::scalar(home, Attrs::EXPORT), false));
-	}
+	// zsh exports `HOME` and `LOGNAME` (`addenv` when not imported); `HOME`
+	// is `/` for a user without a password database entry (`setupvals`).
+	let home = if user.home.is_empty() {
+		BString::from("/")
+	} else if platform == crate::bash::ids::Platform::Windows {
+		builtins::zsh_dir::windows_spelling(&user.home, &user.home)
+	} else {
+		user.home.clone()
+	};
+	out.push((&b"HOME"[..], Var::scalar(home, Attrs::EXPORT), false));
 	out.push((&b"LOGNAME"[..], Var::scalar(user.name, Attrs::EXPORT), false));
 	let (_, release, machine) = cx.host.uname().unwrap_or_default();
 	let macos = cfg!(target_os = "macos");
@@ -1481,7 +1482,7 @@ pub fn startup_values(
 	} else {
 		BString::default()
 	};
-	let defaults: [(&'static [u8], BString); 17] = [
+	let defaults: [(&'static [u8], BString); 16] = [
 		(b"IFS", BString::from(" \t\n")),
 		(b"PS2", BString::from("> ")),
 		(b"PS4", BString::from("+ ")),
@@ -1495,7 +1496,6 @@ pub fn startup_values(
 		(b"EUID", BString::from(user.euid.to_string())),
 		(b"HOSTTYPE", BString::from(std::env::consts::ARCH)),
 		(b"OSTYPE", BString::from(std::env::consts::OS)),
-		(b"HOME", user.home),
 		(b"SHELL", shell),
 		(b"TERM", BString::from("dumb")),
 		// bash's `DEFAULT_PATH_VALUE` when the environment has no PATH.
@@ -1506,8 +1506,9 @@ pub fn startup_values(
 		out.push((&b"PS1"[..], Var::scalar(BString::from(r"\s-\v\$ "), Attrs::NONE), false));
 	}
 	for (name, value) in defaults {
-		// bash sets HOME and SHELL from the passwd entry only when known.
-		if matches!(name, b"HOME" | b"SHELL") && value.is_empty() {
+		// bash sets SHELL from the passwd entry only when known, and never
+		// sets HOME: `~` reads the entry without it.
+		if name == b"SHELL" && value.is_empty() {
 			continue;
 		}
 		// `PPID` and `EUID` (and `UID` when not imported) are readonly

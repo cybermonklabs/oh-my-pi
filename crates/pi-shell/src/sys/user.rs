@@ -16,22 +16,34 @@ use crate::bash::UserInfo;
 /// On Unix the name and home are the real uid's password database entry,
 /// as zsh (`USERNAME`, the default `HOME`) and bash (`\u`, `~` without
 /// `HOME`) take them, whatever `USER` and `HOME` the environment holds; a
-/// uid without an entry falls back to `USER` and `HOME`. On Windows,
-/// `USERNAME` and `USERPROFILE`.
+/// uid without an entry has [`no_entry`]'s. On Windows, `USERNAME` and
+/// `USERPROFILE`.
 pub fn read_user() -> UserInfo {
-	let var = |k: &str| {
-		std::env::var_os(k).map_or_else(BString::default, |v| BString::from(v.as_encoded_bytes()))
-	};
 	#[cfg(unix)]
 	// SAFETY: getuid/geteuid/getgid have no preconditions.
 	let (uid, euid, gid) = unsafe { (libc::getuid(), libc::geteuid(), libc::getgid()) };
 	#[cfg(windows)]
 	let (uid, euid, gid) = windows::ids();
 	#[cfg(unix)]
-	let (name, home) = passwd_entry(uid).unwrap_or_else(|| (var("USER"), var("HOME")));
+	let (name, home) = passwd_entry(uid).unwrap_or_else(no_entry);
 	#[cfg(windows)]
-	let (name, home) = (var("USERNAME"), var("USERPROFILE"));
+	let (name, home) = {
+		let var = |k: &str| {
+			std::env::var_os(k).map_or_else(BString::default, |v| BString::from(v.as_encoded_bytes()))
+		};
+		(var("USERNAME"), var("USERPROFILE"))
+	};
 	UserInfo { uid, euid, gid, groups: groups(), name, home }
+}
+
+/// The name and home of a uid without a password database entry: none
+/// known, and `USER` and `HOME` are not read for them (neither zsh nor
+/// bash does). Each shell gives its own defaults then: zsh an empty
+/// `USERNAME` and `HOME=/`, bash `I have no name!` for `\u` and `/` for
+/// `~`.
+#[cfg(unix)]
+fn no_entry() -> (BString, BString) {
+	(BString::default(), BString::default())
 }
 
 /// The name and home directory of `uid`'s password database entry

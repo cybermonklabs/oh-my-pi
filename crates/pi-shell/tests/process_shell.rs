@@ -133,44 +133,134 @@ fn command_strings_and_exit_statuses_match_zsh() {
 }
 
 /// The name and home directory of the user running the tests: their
-/// password database entry.
-fn passwd_entry() -> (String, String) {
+/// password database entry, if they have one.
+fn passwd_entry() -> Option<(String, String)> {
 	// SAFETY: getpwuid returns a pointer into static storage (or null),
 	// read before any other call can replace it.
 	unsafe {
 		let pw = libc::getpwuid(libc::getuid());
-		assert!(!pw.is_null(), "the user running the tests has a password database entry");
+		if pw.is_null() {
+			return None;
+		}
 		let text =
 			|p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
-		(text((*pw).pw_name), text((*pw).pw_dir))
+		Some((text((*pw).pw_name), text((*pw).pw_dir)))
 	}
 }
 
-/// zsh names the user (`USERNAME`, `%n`) and sets the default `HOME` from
-/// the password database, not from `USER` and `HOME`: with both unset the
-/// shell still knows who runs it, and `~` is that user's home.
+/// `script` run as `name` (`zsh -f -c` or `bash -c`) by `program`, with
+/// `USER=nobody-by-env` and neither `HOME` nor `LOGNAME` set, under
+/// `wrap` (a command and its arguments the shell runs under, or none):
+/// stdout, stderr and the exit status.
+fn run_without_home(
+	wrap: &[&str],
+	program: &OsStr,
+	name: &str,
+	script: &str,
+) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+	let args: &[&str] = if name == "zsh" {
+		&["-f", "-c"]
+	} else {
+		&["-c"]
+	};
+	// Named `name` by a link: a wrapper runs the shell by its path.
+	let dir = tempfile::tempdir().expect("a directory for the shell's link");
+	let link = dir.path().join(name);
+	std::os::unix::fs::symlink(program, &link).expect("link the shell");
+	let mut cmd = match wrap.split_first() {
+		Some((first, rest)) => {
+			let mut cmd = Command::new(first);
+			cmd.args(rest).arg(&link);
+			cmd
+		},
+		None => Command::new(&link),
+	};
+	let out = cmd
+		.args(args)
+		.arg(script)
+		.env("USER", "nobody-by-env")
+		.env_remove("HOME")
+		.env_remove("LOGNAME")
+		.env_remove("ZDOTDIR")
+		.output()
+		.expect("start the shell");
+	(out.stdout, out.stderr, out.status.code())
+}
+
+const ZSH_USER: &str = "print -r -- \"[$USERNAME] [$HOME] [$(print ~)] [${(%):-%n}] [$LOGNAME]\"";
+const BASH_USER: &str = "PS1='\\u'; echo \"[${PS1@P}] [${HOME-unset}] [$(echo ~)]\"";
+
+/// zsh names the user (`USERNAME`, `%n`, `LOGNAME`) and sets the default
+/// `HOME` from the password database, and bash names the user (`\u`) and
+/// expands `~` from it without setting `HOME`; neither reads `USER`. Where
+/// the uid running the tests has no entry, the case is reported
+/// `UNCOMPARED:` (the next test checks that case under a user namespace).
 #[test]
 fn the_user_name_and_home_come_from_the_password_database() {
-	let (name, home) = passwd_entry();
-	let args = ["-f", "-c", "print -r -- $USERNAME $HOME ~ ${(%):-%n}"];
-	let run_without_user = |program: &std::ffi::OsStr| {
-		let out = Command::new(program)
-			.arg0("zsh")
-			.args(args)
-			.env_remove("USER")
-			.env_remove("HOME")
-			.env_remove("ZDOTDIR")
-			.output()
-			.expect("start the shell");
-		(out.stdout, out.stderr, out.status.code())
+	let Some((name, home)) = passwd_entry() else {
+		zsh_oracle::uncompared("the uid running the tests has no password database entry");
+		return;
 	};
-	let ours = run_without_user(env!("CARGO_BIN_EXE_obash").as_ref());
-	assert_eq!(
-		(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
-		(format!("{name} {home} {home} {name}\n"), Some(0))
-	);
-	if have_zsh() {
-		assert_eq!(ours, run_without_user(zsh_oracle::path().as_os_str()));
+	let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+	for (shell, script, want) in [
+		("zsh", ZSH_USER, format!("[{name}] [{home}] [{home}] [{name}] [{name}]\n")),
+		("bash", BASH_USER, format!("[{name}] [unset] [{home}]\n")),
+	] {
+		let ours = run_without_home(&[], obash, shell, script);
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
+			(want, Some(0)),
+			"{shell}: {}",
+			String::from_utf8_lossy(&ours.1)
+		);
+		let real = if shell == "zsh" {
+			have_zsh().then(zsh_oracle::path)
+		} else {
+			Some(std::path::PathBuf::from("/bin/bash")).filter(|p| p.is_file())
+		};
+		match real {
+			Some(real) => assert_eq!(ours, run_without_home(&[], real.as_os_str(), shell, script)),
+			None => zsh_oracle::uncompared(&format!("no {shell} to compare the user case with")),
+		}
+	}
+}
+
+/// A uid without a password database entry, under a user namespace that
+/// maps one (`unshare --map-user`): zsh has an empty `USERNAME`, `%n` and
+/// `LOGNAME` and `HOME=/`, bash says `I have no name!` for `\u` and `/` for
+/// `~`, and neither takes `USER`. Where no such namespace can be made (no
+/// `unshare`, or user namespaces refused), the test says so.
+#[test]
+fn a_uid_without_a_password_entry_has_each_shells_defaults() {
+	let wrap = ["unshare", "--user", "--map-user=54321", "--map-group=54321"];
+	let probe = Command::new(wrap[0]).args(&wrap[1..]).arg("true").output();
+	if !probe.as_ref().is_ok_and(|out| out.status.success()) {
+		zsh_oracle::uncompared(&format!(
+			"no user namespace to map a uid without an entry: {probe:?}"
+		));
+		return;
+	}
+	let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+	for (shell, script, want) in [
+		("zsh", ZSH_USER, "[] [/] [/] [] []\n"),
+		("bash", BASH_USER, "[I have no name!] [unset] [/]\n"),
+	] {
+		let ours = run_without_home(&wrap, obash, shell, script);
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
+			(want.to_owned(), Some(0)),
+			"{shell}: {}",
+			String::from_utf8_lossy(&ours.1)
+		);
+		let real = if shell == "zsh" {
+			have_zsh().then(zsh_oracle::path)
+		} else {
+			Some(std::path::PathBuf::from("/bin/bash")).filter(|p| p.is_file())
+		};
+		match real {
+			Some(real) => assert_eq!(ours, run_without_home(&wrap, real.as_os_str(), shell, script)),
+			None => zsh_oracle::uncompared(&format!("no {shell} to compare the no-entry case with")),
+		}
 	}
 }
 
