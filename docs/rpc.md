@@ -1176,6 +1176,7 @@ Failure responses:
   `pi.shutdown()`) → the next-run steer is taken back off the subagent's queue,
   so no later turn delivers it, and
   `error: "Subagent's run ended before the message reached it: <id>"`
+- the RPC session's shutdown has already begun when the command runs, whatever the subagent's state (mid-turn or between turns) → nothing is sent, and `error: "Subagent's run ended before the message reached it: <id>"`
 - the subagent stops, and the message is no longer on its queue although no
   turn took it (someone else removed it, or the subagent's session is gone) →
   `error: "The message was not delivered to subagent: <id>"`
