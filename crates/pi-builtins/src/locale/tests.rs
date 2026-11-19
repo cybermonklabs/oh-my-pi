@@ -878,15 +878,18 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 ///
 /// The storm carries a second signal, one the caller *ignores*. That is
 /// the caller's own instruction and it has to reach the utility, so the
-/// last query here runs a utility that reads its own `/proc` entry,
-/// refuses unless that number is ignored and unblocked, and only then
-/// raises it at itself and answers. Surviving the signal is not proof on
-/// its own — a blocked signal with the default disposition survives too,
-/// and a mutant that reset the readable ignore and then blocked the
-/// number passed the survival form twenty times out of twenty. What this
-/// cannot reach is an ignored disposition whose *read* is denied,
-/// because denying one read needs a kernel filter, which lives in this
-/// lane's harness rather than here.
+/// last query here runs a utility that asks a probe of its own whether
+/// that number is ignored and unblocked, refuses unless it is, and only
+/// then raises it at itself and answers. Surviving the signal is not proof
+/// on its own — a blocked signal with the default disposition survives
+/// too, and a mutant that reset the readable ignore and then blocked the
+/// number passed the survival form twenty times out of twenty. The probe
+/// (`the_ignored_signal_probe`) reads the disposition with `sigaction`
+/// and the mask with `pthread_sigmask`, not from `/proc/<pid>/status`,
+/// whose `SigIgn` and `SigBlk` lines a sandbox such as gVisor does not
+/// write. What this cannot reach is an ignored disposition whose *read*
+/// is denied, because denying one read needs a kernel filter, which lives
+/// in this lane's harness rather than here.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
@@ -982,20 +985,21 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// say it: a *blocked* signal with the default disposition survives
 	// too, and a mutant that reset the readable ignore and then blocked
 	// the number passed that form twenty times out of twenty. So the
-	// utility reads its own `/proc` entry first and refuses unless the
-	// number is in `SigIgn` and out of `SigBlk`, and only then raises it
-	// at itself and answers. What this cannot reach is still said where
-	// it is said above; restoring the *wrong* number, and skipping the
-	// mask read-back, are covered by this lane's harness probes rather
-	// than from here.
-	let bit = 1u64 << (libc::SIGUSR2 - 1);
+	// utility first runs this test binary's probe, which inherits the
+	// utility's disposition and mask and answers by its exit status, and
+	// refuses unless the number is ignored and unblocked; only then does it
+	// raise the number at itself and answer. What this cannot reach is
+	// still said where it is said above; restoring the *wrong* number, and
+	// skipping the mask read-back, are covered by this lane's harness
+	// probes rather than from here.
+	let me = std::env::current_exe().unwrap();
+	let quoted = format!("'{}'", me.display().to_string().replace('\'', "'\\''"));
 	let raises = dir.path().join("locale-raises-the-ignored-signal");
 	let script = format!(
 		"#!/bin/sh\n\
-		 ignored=$(awk '/^SigIgn:/ {{ print $2 }}' /proc/$$/status)\n\
-		 blocked=$(awk '/^SigBlk:/ {{ print $2 }}' /proc/$$/status)\n\
-		 [ $(( 0x$ignored & {bit} )) -ne 0 ] || exit 71\n\
-		 [ $(( 0x$blocked & {bit} )) -eq 0 ] || exit 72\n\
+		 {PROBE_ENV}=1 {quoted} --ignored --exact locale::tests::the_ignored_signal_probe >/dev/null 2>&1\n\
+		 status=$?\n\
+		 [ $status -eq {PROBE_OK} ] || {{ [ $status -eq 0 ] && exit {PROBE_NOT_RUN}; exit $status; }}\n\
 		 kill -{signal} $$\n\
 		 printf 'UTF-8\\n'\n",
 		signal = libc::SIGUSR2
@@ -1023,9 +1027,55 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	assert!(
 		matches!(&ignoring, crate::locale::Codeset::Loaded(found) if found == "UTF-8"),
 		"the signal the caller ignores reached the utility ignored and unblocked, and it survived \
-		 raising it — status 71 is a disposition that is no longer ignored, 72 is a blocked one: \
-		 {ignoring:?}"
+		 raising it — status {PROBE_NOT_IGNORED} is a disposition that is no longer ignored, \
+		 {PROBE_BLOCKED} is a blocked one, {PROBE_NOT_RUN} is a probe that did not run: {ignoring:?}"
 	);
+}
+
+/// The environment variable that turns `the_ignored_signal_probe` on, and its exit statuses.
+#[cfg(target_os = "linux")]
+const PROBE_ENV: &str = "PI_LOCALE_IGNORED_SIGNAL_PROBE";
+#[cfg(target_os = "linux")]
+const PROBE_OK: i32 = 70;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_IGNORED: i32 = 71;
+#[cfg(target_os = "linux")]
+const PROBE_BLOCKED: i32 = 72;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_RUN: i32 = 73;
+
+/// Not a test of its own: the probe that the stand-in utility of
+/// `an_inherited_handler_does_not_run_in_the_child_before_exec` starts.
+/// It runs in a process that inherited the utility's signal disposition
+/// and mask, and says by its exit status whether `SIGUSR2` is ignored
+/// ([`PROBE_NOT_IGNORED`] when not) and unblocked ([`PROBE_BLOCKED`] when
+/// blocked), [`PROBE_OK`] when both hold. It reads them from the kernel, so
+/// it answers in a sandbox whose `/proc/<pid>/status` has no `SigIgn` or
+/// `SigBlk` line. A distinct success status keeps a probe that never ran
+/// (a filter that matched no test exits 0) from reading as a pass.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "started only by an_inherited_handler_does_not_run_in_the_child_before_exec's stand-in utility"]
+fn the_ignored_signal_probe() {
+	if std::env::var_os(PROBE_ENV).is_none() {
+		return;
+	}
+	// SAFETY: reading this process's own disposition and mask, into
+	// zeroed structures of the right types.
+	let (disposition, blocked) = unsafe {
+		let mut old: libc::sigaction = std::mem::zeroed();
+		assert_eq!(libc::sigaction(libc::SIGUSR2, std::ptr::null(), &raw mut old), 0);
+		let mut mask: libc::sigset_t = std::mem::zeroed();
+		assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask), 0);
+		(old.sa_sigaction, libc::sigismember(&raw const mask, libc::SIGUSR2) == 1)
+	};
+	if disposition != libc::SIG_IGN {
+		std::process::exit(PROBE_NOT_IGNORED);
+	}
+	if blocked {
+		std::process::exit(PROBE_BLOCKED);
+	}
+	std::process::exit(PROBE_OK);
 }
 
 /// A name is the name of locale data, whatever punctuation it carries.
