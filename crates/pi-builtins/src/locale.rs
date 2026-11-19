@@ -580,11 +580,13 @@ struct Unanswered(String);
 /// system's `locale` utility, which reports `nl_langinfo(CODESET)` after
 /// `setlocale(LC_CTYPE, "")` — the two calls rsync itself makes for this.
 ///
-/// The utility is started with `posix_spawn`, so it runs in a fresh address
-/// space: no lock copied out of a thread that held it, and no restriction to
-/// async-signal-safe calls. It inherits this thread's signal mask, as any
-/// exec'd program does; that cannot strand the query, because the deadline is
-/// the parent's and the child has no part in enforcing it. It is named by an
+/// The utility is started by `start_locale_utility`, whose child makes only
+/// async-signal-safe calls before its `execve`, so the utility runs in a
+/// fresh address space: no lock copied out of a thread that held it, and no
+/// restriction to async-signal-safe calls. It starts with this thread's
+/// signal mask, as any exec'd program does, plus any signal whose handler
+/// could not be replaced; that cannot strand the query, because the deadline
+/// is the parent's and the child has no part in enforcing it. It is named by an
 /// absolute path, put in its own process group so that neither it nor a
 /// descendant it leaves *in that group* outlives the query — one that calls
 /// `setsid` leaves the group and is beyond this, as process-group semantics
@@ -593,7 +595,7 @@ struct Unanswered(String);
 /// or `LD_*` of anyone else's reaches it.
 ///
 /// Its working directory is the shell's whenever a value is relative to one,
-/// set by the spawn's `chdir` file action rather than by rewriting the
+/// set by the child's `chdir` before its `execve` rather than by rewriting the
 /// value: a directory name is not a list element, and one containing `:` has
 /// no spelling inside `LOCPATH` at all.
 ///
@@ -913,8 +915,9 @@ fn locale_utility_output_at(
 ///
 /// Nothing is started: the whole of the query's process lifetime — making
 /// the child and the handle together, watching it, ending its group and
-/// reaping it — is Linux's `clone3` and `pidfd`, and a child that could
-/// only be reached by a recyclable number is one this code will not make.
+/// reaping it — is Linux's `clone3` or `clone` with `CLONE_PIDFD`, and
+/// `pidfd`, and a child that could only be reached by a recyclable number is
+/// one this code will not make.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn locale_utility_output_at(
 	_program: &std::path::Path,
@@ -1069,13 +1072,14 @@ enum Completion {
 /// three times out of three, against a process with nothing to do with this
 /// query. No ordering of a separate acquisition closes that, so there is no
 /// separate acquisition: `clone3(CLONE_PIDFD)` returns the handle and the
-/// child together, and watching, ending the group and reaping all go
+/// child together — or, where `clone3` answers `ENOSYS`, `clone` with
+/// `CLONE_PIDFD` does — and watching, ending the group and reaping all go
 /// through the handle, where a signal fails with `ESRCH` once that process
 /// is gone rather than reaching whoever took its number.
 ///
-/// Where this does not exist — a kernel without `clone3`, or any Unix that
-/// is not Linux — no query is started, because its child could not be
-/// ended safely afterwards.
+/// Where neither exists — a kernel without `CLONE_PIDFD` or without waiting
+/// by handle, or any Unix that is not Linux — no query is started, because
+/// its child could not be ended safely afterwards.
 #[cfg(target_os = "linux")]
 struct ChildHandle(std::os::fd::OwnedFd);
 
@@ -1121,47 +1125,140 @@ struct CloneArgs {
 	tls: u64,
 }
 
-/// Whether this kernel has `clone3`, asked once with arguments it must
-/// refuse: a kernel that knows the call answers `EINVAL`, one that does not
-/// answers `ENOSYS`, and neither makes a process.
-///
-/// Asked *before* anything is started. A capability discovered afterwards
-/// leaves a child that nothing here can end — five refusals used to leave
-/// five of them.
+/// Which calls the asking thread can make the child and the handle on it
+/// with, as that thread's own probe ([`CHILD_CALLS`]) found.
 #[cfg(target_os = "linux")]
-static CAN_HOLD_A_CHILD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-	// Each probe has to answer with the error that only a kernel knowing
-	// the call can give. "Anything but `ENOSYS`" and "anything but
-	// `EINVAL`" are not that: a `clone3` or a `waitid` denied by a seccomp
-	// filter answers `EPERM`, `EACCES` or `ENOSYS`, and reading those as
-	// capability left five real children and five zombies behind.
-	//
-	// SAFETY: a null argument block with a zero size is refused before the
-	// kernel reads anything, so this makes no process either way.
-	let cloned = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgs>(), 0usize) };
-	let clone3 = cloned < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
-	// SAFETY: a descriptor number no process can have open answers `EBADF`
-	// where the kernel knows `P_PIDFD`, and `EINVAL` where it does not;
-	// neither waits for anything. A negative number is refused as an
-	// identifier before the kernel looks at the kind at all, so it has to be
-	// a large positive one. `P_PIDFD` is 3.
-	let mut ended: libc::siginfo_t = unsafe { std::mem::zeroed() };
-	let watched = unsafe {
-		libc::syscall(
-			libc::SYS_waitid,
-			3,
-			libc::c_int::MAX,
-			&raw mut ended,
-			libc::WEXITED | libc::WNOHANG,
-			std::ptr::null_mut::<libc::c_void>(),
-		)
+#[derive(Clone, Copy)]
+struct ChildCalls {
+	/// `clone3` with `CLONE_PIDFD`.
+	clone3: bool,
+	/// `clone` with `CLONE_PIDFD`, which writes the handle through its
+	/// `parent_tid` argument ([`clone_with_handle`]).
+	clone:  bool,
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+	/// What this thread can make a child and its handle with, asked once and
+	/// *before* anything is started. A capability discovered afterwards leaves
+	/// a child that nothing here can end — five refusals used to leave five of
+	/// them.
+	///
+	/// A seccomp filter belongs to a thread, not the process. One thread's
+	/// refusal must not choose `clone` for another that permits only `clone3`.
+	/// A thread's filters only grow, so its own "unusable" stays true; a later
+	/// `ENOSYS` where its probe found `clone3` reaches the call-time fallback.
+	///
+	/// The kernel facts this rests on: `clone` took `CLONE_PIDFD` in Linux
+	/// 5.2, `clone3` arrived in 5.3, and waiting by handle (`waitid` with
+	/// `P_PIDFD`) in 5.4. Neither clone is any use without the wait, so both
+	/// answers need it.
+	///
+	/// `clone3` is asked with arguments it must refuse: a kernel that knows
+	/// the call answers `EINVAL`, one that does not answers `ENOSYS`, and
+	/// neither makes a process. `clone` cannot be asked that way, because
+	/// `clone` has always ignored a flag it does not know: a kernel older than
+	/// 5.2 makes the child, with no handle, and no refusal of its arguments
+	/// can tell the two kernels apart beforehand. Its answer is the kernel's
+	/// version instead: a kernel that waits by handle is 5.4 or later, and has
+	/// had `CLONE_PIDFD` in `clone` since 5.2. A filter that refuses `clone`
+	/// makes no process. The one filter that can turn the answer into a child
+	/// without a handle is one that answers `waitid` with `EBADF` itself, on
+	/// a kernel older than 5.2: that `clone` then ignores `CLONE_PIDFD` and
+	/// leaves `parent_tid` at -1, and [`start_locale_utility`] takes that for
+	/// a child with no handle, which it never signals. It waits for that
+	/// child by number until the query's deadline and refuses the query, so
+	/// the outcome is a refusal and never an answer. Docker's default profile
+	/// answers `clone3` with `ENOSYS` so that a C library falls back to
+	/// `clone`, which it lets through.
+	static CHILD_CALLS: ChildCalls = {
+		// Each probe has to answer with the error that only a kernel knowing
+		// the call can give. "Anything but `ENOSYS`" and "anything but
+		// `EINVAL`" are not that: a `clone3` or a `waitid` denied by a seccomp
+		// filter answers `EPERM`, `EACCES` or `ENOSYS`, and reading those as
+		// capability left five real children and five zombies behind.
+		//
+		// SAFETY: a null argument block with a zero size is refused before the
+		// kernel reads anything, so this makes no process either way.
+		let cloned = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgs>(), 0usize) };
+		let clone3 = cloned < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+		// SAFETY: a descriptor number no process can have open answers `EBADF`
+		// where the kernel knows `P_PIDFD`, and `EINVAL` where it does not;
+		// neither waits for anything. A negative number is refused as an
+		// identifier before the kernel looks at the kind at all, so it has to be
+		// a large positive one. `P_PIDFD` is 3.
+		let mut ended: libc::siginfo_t = unsafe { std::mem::zeroed() };
+		let watched = unsafe {
+			libc::syscall(
+				libc::SYS_waitid,
+				3,
+				libc::c_int::MAX,
+				&raw mut ended,
+				libc::WEXITED | libc::WNOHANG,
+				std::ptr::null_mut::<libc::c_void>(),
+			)
+		};
+		let by_handle = watched < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+		// Each with the wait, and asked together: a kernel between 5.3 and 5.4
+		// has `clone3` and would make a child this code could then neither
+		// watch nor reap. `clone` only where the raw call's argument order is
+		// known (`CLONE_ARGUMENTS_KNOWN`).
+		ChildCalls { clone3: clone3 && by_handle, clone: CLONE_ARGUMENTS_KNOWN && by_handle }
 	};
-	let by_handle = watched < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
-	// Both, and asked together: `clone3` arrived in Linux 5.3 and waiting
-	// by handle in 5.4, so a kernel between them would make a child this
-	// code could then neither watch nor reap.
-	clone3 && by_handle
-});
+}
+
+/// Whether the raw `clone` call on this architecture takes its arguments
+/// where [`clone_with_handle`] puts them (Linux 6.12 `kernel/fork.c`, the
+/// `SYSCALL_DEFINE5(clone, …)` variants, and each architecture's
+/// `Kconfig`). `parent_tid` is the third argument on every architecture
+/// listed. s390 swaps the first two (`CONFIG_CLONE_BACKWARDS2`); x86,
+/// arm, arm64, powerpc and riscv swap `tls` and `child_tid`
+/// (`CONFIG_CLONE_BACKWARDS`), which are both zero here; x86-64 and
+/// loongarch take the generic order. On any other architecture — sparc
+/// returns to the child through a register pair `syscall` does not read,
+/// microblaze takes `parent_tid` fourth — only `clone3` is used.
+#[cfg(target_os = "linux")]
+const CLONE_ARGUMENTS_KNOWN: bool = cfg!(any(
+	target_arch = "x86_64",
+	target_arch = "x86",
+	target_arch = "aarch64",
+	target_arch = "arm",
+	target_arch = "riscv64",
+	target_arch = "riscv32",
+	target_arch = "powerpc",
+	target_arch = "powerpc64",
+	target_arch = "loongarch64",
+	target_arch = "s390x",
+));
+
+/// `clone` with `CLONE_PIDFD` and `SIGCHLD`, writing the handle to
+/// `handle`, which is also the address `clone` reads as `parent_tid`. No
+/// new stack and no `CLONE_VM`, so the child returns on its copy of this
+/// thread's stack, as from `fork`.
+///
+/// Linux 5.2 alone also required `*handle` to be 0 on entry; this is only
+/// called where waiting by handle shows 5.4 or later ([`CHILD_CALLS`]), so
+/// `handle` keeps the -1 that tells a child the kernel gave no handle.
+///
+/// # Safety
+///
+/// `handle` is valid for writes; this architecture is one
+/// [`CLONE_ARGUMENTS_KNOWN`] names, the only ones where `parent_tid` is
+/// known to be where the kernel reads it and the child to be the one
+/// given 0; and the caller treats a return of 0 as the child: it makes
+/// only async-signal-safe calls and ends in `execve` or `_exit`.
+#[cfg(target_os = "linux")]
+unsafe fn clone_with_handle(handle: *mut libc::c_int) -> libc::c_long {
+	let flags = libc::c_long::from(libc::CLONE_PIDFD) | libc::c_long::from(libc::SIGCHLD);
+	let none: libc::c_long = 0;
+	#[cfg(not(target_arch = "s390x"))]
+	let (first, second) = (flags, none);
+	#[cfg(target_arch = "s390x")]
+	let (first, second) = (none, flags);
+	// SAFETY: the caller's contract; the new stack, `child_tid` and `tls`
+	// are all zero, so the order of the last two does not matter.
+	unsafe { libc::syscall(libc::SYS_clone, first, second, handle, none, none) }
+}
 
 /// Starts the locale utility, in its own process group, with `answer` as
 /// the stream `ask` names, its own `/dev/null` for the other two, and `cwd`
@@ -1169,10 +1266,10 @@ static CAN_HOLD_A_CHILD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
 ///
 /// The two `/dev/null`s are opened by the child, not here, which keeps this
 /// process's cost at the one answer file — the whole margin the lookup has
-/// under a descriptor limit that leaves two free. `clone3` without
-/// `CLONE_VM` leaves the child a copy of this process, as `fork` does, so
-/// everything it does before `execve` is async-signal-safe and reads only
-/// values built before the call.
+/// under a descriptor limit that leaves two free. Neither `clone3` nor
+/// `clone` is given `CLONE_VM`, which leaves the child a copy of this
+/// process, as `fork` does, so everything it does before `execve` is
+/// async-signal-safe and reads only values built before the call.
 ///
 /// Every step of that setup is required, and a child that cannot take one
 /// of them ends instead of carrying on: a `/dev/null` that would not open
@@ -1200,7 +1297,8 @@ fn start_locale_utility(
 ) -> Result<ChildHandle, std::io::Error> {
 	use std::os::fd::FromRawFd as _;
 
-	if !*CAN_HOLD_A_CHILD {
+	let calls = CHILD_CALLS.with(|calls| *calls);
+	if !calls.clone3 && !calls.clone {
 		return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
 	}
 	let (taken, discarded) = match ask {
@@ -1236,8 +1334,23 @@ fn start_locale_utility(
 	// SAFETY: the argument block is initialised and outlives the call; the
 	// kernel writes `handle` in this process. The child branch below ends in
 	// `execve` or `_exit`, so no destructor and no `atexit` handler of this
-	// process's runs there.
-	let child = unsafe { libc::syscall(libc::SYS_clone3, &raw const args, size_of::<CloneArgs>()) };
+	// process's runs there, whichever call made it.
+	let mut child = match calls.clone3 {
+		true => unsafe { libc::syscall(libc::SYS_clone3, &raw const args, size_of::<CloneArgs>()) },
+		false => -1,
+	};
+	// A thread can gain a seccomp filter after its probe, so `clone3` can
+	// answer `ENOSYS` here where the probe was answered `EINVAL`. That
+	// answer made no process, so `clone` is asked in its place, as it is
+	// where the probe found no `clone3`. Other refusals are reported as
+	// they are, without a second attempt.
+	let clone3_unknown = !calls.clone3
+		|| (child < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS));
+	if calls.clone && clone3_unknown {
+		// SAFETY: as above; `handle` outlives the call, and `calls.clone`
+		// is only ever true where `CLONE_ARGUMENTS_KNOWN` is.
+		child = unsafe { clone_with_handle(&raw mut handle) };
+	}
 	if child == 0 {
 		// SAFETY: this is the whole of the child, and every call here is
 		// async-signal-safe.
@@ -1439,16 +1552,19 @@ fn start_locale_utility(
 	// sleeping past the query that started it.
 	//
 	// SAFETY: a fresh descriptor the kernel wrote for a child it made,
-	// owned from here. `clone3` fills it in whenever it succeeds with
-	// `CLONE_PIDFD`.
+	// owned from here. Either call fills it in whenever it succeeds with
+	// `CLONE_PIDFD`: `clone3` through `pidfd`, `clone` through `parent_tid`.
 	let started = (child > 0 && handle >= 0)
 		.then(|| ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(handle) }));
 	// Read before the mask call below, which reports through its return
 	// value and leaves `errno` as it finds it.
 	let spawned = match (child < 0, started.is_some()) {
 		(true, _) => Err(std::io::Error::last_os_error()),
-		// A child with no handle: not something `clone3` with
-		// `CLONE_PIDFD` produces, and nothing this code can hold.
+		// A child with no handle: not something either call with
+		// `CLONE_PIDFD` produces on a kernel that waits by handle, and
+		// nothing this code can hold. A `clone` on a kernel older than 5.2,
+		// reached only where a filter answered the `waitid` probe itself,
+		// leaves `handle` at -1 and ends here.
 		(false, false) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
 		(false, true) => Ok(()),
 	};
