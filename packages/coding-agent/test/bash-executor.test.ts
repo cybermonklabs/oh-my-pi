@@ -28,6 +28,7 @@ import { isShellTrace } from "@oh-my-pi/pi-wire";
 
 import { cfgBashDirenvLoadTimeoutMs, cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { withoutAmbientShellPrefix } from "./helpers/ambient-shell-prefix";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 // Matches the schema default for `tools.artifactHeadBytes` (20 KB) used by
 // OutputSink when bash-executor pulls settings via resolveOutputSinkHeadBytes.
@@ -1248,10 +1249,8 @@ exit 64
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
 			args: ["-l", "-c"],
-			env: {
-				PATH: Bun.env.PATH ?? "",
-				HOME: Bun.env.HOME ?? tempDir,
-			},
+			// A login shell in a home of its own reads no `~/.bash_profile` of the developer's.
+			env: createProductionChildEnv({ PATH: Bun.env.PATH }),
 			prefix: undefined,
 		});
 		vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);
@@ -1327,7 +1326,7 @@ exit 64
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
 			args: ["-l", "-c"],
-			env: { PATH: Bun.env.PATH ?? "", HOME: Bun.env.HOME ?? tempDir },
+			env: createProductionChildEnv({ PATH: Bun.env.PATH }),
 			prefix: undefined,
 		});
 		vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(snapshotPath);

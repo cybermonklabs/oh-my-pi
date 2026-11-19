@@ -637,7 +637,7 @@ describe("test environment", () => {
 					"let started;",
 					"try { await client.start(); started = 'started'; } catch (error) { started = String(error?.message ?? error).split('\\n')[0]; }",
 					"await client.stop();",
-					"process.stdout.write(JSON.stringify({ started, bun: Bun.which('bun') }));",
+					"process.stdout.write(JSON.stringify({ started, bun: require('node:fs').realpathSync(Bun.which('bun')) }));",
 				].join("\n");
 
 				const result = await probe<{ started: string; bun: string | null }>(preloadedEval(script), {
@@ -645,8 +645,67 @@ describe("test environment", () => {
 					env: { ...process.env, PATH: `${shims}${path.delimiter}${process.env.PATH}` },
 				});
 
-				expect(result).toEqual({ started: "started", bun: path.join(path.dirname(process.execPath), "bun") });
+				expect(result).toEqual({ started: "started", bun: fs.realpathSync(process.execPath) });
 				expect(fs.existsSync(calls)).toBe(false);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"links this Bun alone, so the tools beside it in its own directory keep their place on PATH",
+		() => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-bun-neighbours-"));
+			try {
+				// Bun as Homebrew or /usr/local/bin installs it, beside a node and a python3; first on
+				// PATH the user's own node and python3, and a version manager's bun shim that fails.
+				const brew = path.join(dir, "brew", "bin");
+				const user = path.join(dir, "user", "bin");
+				fs.mkdirSync(brew, { recursive: true });
+				fs.mkdirSync(user, { recursive: true });
+				const bun = path.join(brew, "bun");
+				try {
+					fs.linkSync(process.execPath, bun);
+				} catch {
+					fs.copyFileSync(process.execPath, bun, fs.constants.COPYFILE_FICLONE);
+					fs.chmodSync(bun, 0o755);
+				}
+				for (const tool of ["node", "python3"]) {
+					fs.writeFileSync(path.join(brew, tool), `#!/bin/sh\necho brew-${tool}\n`, { mode: 0o755 });
+					fs.writeFileSync(path.join(user, tool), `#!/bin/sh\necho user-${tool}\n`, { mode: 0o755 });
+				}
+				fs.writeFileSync(
+					path.join(user, "bun"),
+					"#!/bin/sh\necho 'No version is set for shim: bun' >&2\nexit 1\n",
+					{
+						mode: 0o755,
+					},
+				);
+				const searchPath = [user, brew].join(path.delimiter);
+				// That Bun builds a test process's PATH and a production child's, and names what each runs.
+				const script = [
+					'import * as fs from "node:fs";',
+					`import { createProductionChildEnv, createTestPath } from ${JSON.stringify(path.join(import.meta.dir, "test-env.ts"))};`,
+					`const searchPath = ${JSON.stringify(searchPath)};`,
+					'const runs = PATH => Object.fromEntries(["node", "python3", "bun"].map(tool => [tool, fs.realpathSync(Bun.which(tool, { PATH }) ?? "none")]));',
+					"process.stdout.write(JSON.stringify({ test: runs(createTestPath(searchPath)), production: runs(createProductionChildEnv({ PATH: searchPath }).PATH) }));",
+				].join("\n");
+				const child = Bun.spawnSync([bun, "--no-install", "--no-env-file", "--eval", script], {
+					cwd: dir,
+					env: { PATH: searchPath, HOME: dir, TMPDIR: dir },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+
+				expect({ exitCode: child.exitCode, stderr: child.stderr.toString() }).toEqual({ exitCode: 0, stderr: "" });
+				const expected = {
+					node: fs.realpathSync(path.join(user, "node")),
+					python3: fs.realpathSync(path.join(user, "python3")),
+					bun: fs.realpathSync(bun),
+				};
+				expect(JSON.parse(child.stdout.toString())).toEqual({ test: expected, production: expected });
 			} finally {
 				fs.rmSync(dir, { recursive: true, force: true });
 			}
@@ -685,14 +744,11 @@ describe("test environment", () => {
 				const version = Bun.spawnSync(["git", "--version"], { stdout: "pipe" }).stdout.toString().trim();
 				expect(version).toMatch(/^git version /);
 				expect(result.versions).toEqual({ defaultEnv: version, homeEnv: version, nodeChild: version });
-				// One directory of the child's own went first, holding the git it ran; then the
-				// directory of the Bun it runs on; then every entry of the PATH it was given, in order.
-				// Native children see the same PATH.
-				const [first, bunDirectory, ...rest] = result.processPath.split(path.delimiter);
-				expect({ bunDirectory, rest: rest.join(path.delimiter) }).toEqual({
-					bunDirectory: path.dirname(process.execPath),
-					rest: searchPath,
-				});
+				// One directory of the child's own went first, holding the git it ran (and this Bun as
+				// `bun`, when the first bun on the PATH it was given is not this Bun); then every entry
+				// of the PATH it was given, in order. Native children see the same PATH.
+				const [first, ...rest] = result.processPath.split(path.delimiter);
+				expect(rest.join(path.delimiter)).toBe(searchPath);
 				expect(result.which).toBe(path.join(first, "git"));
 				expect(result.cPath).toBe(result.processPath);
 			} finally {
@@ -703,7 +759,7 @@ describe("test environment", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"finds the real git past each kind of wrapper, puts this Bun's directory first, and changes nothing else",
+		"finds the real git past each kind of wrapper, links it alone, and changes nothing else",
 		() => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-git-path-"));
 			const made = [dir];
@@ -720,21 +776,21 @@ describe("test environment", () => {
 
 				const testPath = createTestPath(searchPath);
 
-				const [first, bunDirectory, ...rest] = (testPath ?? "").split(path.delimiter);
-				if (testPath !== undefined) made.push(first);
-				expect({ bunDirectory, rest: rest.join(path.delimiter) }).toEqual({
-					bunDirectory: path.dirname(process.execPath),
-					rest: searchPath,
-				});
-				// The developer's own PATH may wrap jj too; its link then sits beside git's.
-				expect(fs.readdirSync(first).filter(name => name !== "jj")).toEqual(["git"]);
+				const [first, ...rest] = testPath.split(path.delimiter);
+				made.push(first);
+				expect(rest.join(path.delimiter)).toBe(searchPath);
+				// The developer's own PATH may wrap jj, or start with another bun; their links then sit
+				// beside git's.
+				expect(fs.readdirSync(first).filter(name => !["jj", "bun", "bunx"].includes(name))).toEqual(["git"]);
 				expect(fs.realpathSync(path.join(first, "git"))).toBe(realGit);
-				// A PATH whose first git is already the real one gets the Bun directory alone, and one
-				// that starts with that directory too stays as it is.
-				const realGitFirst = `${path.dirname(realGit)}${path.delimiter}${searchPath}`;
-				const bunFirst = `${path.dirname(process.execPath)}${path.delimiter}${realGitFirst}`;
-				expect(createTestPath(realGitFirst)).toBe(bunFirst);
-				expect(createTestPath(bunFirst)).toBeUndefined();
+				// A PATH whose first git is already the real one, and whose first bun is this Bun, stays as
+				// it is, and so does the PATH this made.
+				const gitOnly = path.join(dir, "git-only");
+				fs.mkdirSync(gitOnly);
+				fs.symlinkSync(realGit, path.join(gitOnly, "git"));
+				const realGitFirst = `${gitOnly}${path.delimiter}${testPath}`;
+				expect(createTestPath(realGitFirst)).toBe(realGitFirst);
+				expect(createTestPath(testPath)).toBe(testPath);
 			} finally {
 				for (const madeDir of made) fs.rmSync(madeDir, { recursive: true, force: true });
 			}
@@ -758,6 +814,7 @@ describe("test environment", () => {
 				},
 				realpath: file => links[file] ?? file,
 				list: dir => dirs[dir] ?? [],
+				ask: () => null,
 			};
 			return probe;
 		};
@@ -858,6 +915,9 @@ describe("test environment", () => {
 			'@"C:\\Program Files\\Git\\mingw64\\bin\\git.exe" %*\r\n@exit /b %ERRORLEVEL%\r\n',
 		);
 		expect(windowsLauncher("C:\\100%\\git.cmd")).toBe('@call "C:\\100%%\\git.cmd" %*\r\n@exit /b %ERRORLEVEL%\r\n');
+		expect(windowsLauncher("C:\\Users\\dev\\.bun\\bin\\bun.exe", ["x"])).toBe(
+			'@"C:\\Users\\dev\\.bun\\bin\\bun.exe" x %*\r\n@exit /b %ERRORLEVEL%\r\n',
+		);
 	});
 
 	it("leaves none of its temporary directories behind, in or out of the test runner", async () => {
