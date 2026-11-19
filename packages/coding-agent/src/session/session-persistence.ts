@@ -647,7 +647,10 @@ function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: strin
  * The JSON text of `entry` as the manager holds it, with image payloads
  * replaced by blob references (the blob store keeps their bytes). Unlike
  * {@link prepareEntryForPersistence} nothing is truncated, stripped or masked:
- * parsing the text and resolving its blob references gives the entry back.
+ * parsing the text and resolving its blob references gives the entry back,
+ * but for snapcompact frames, which resolving leaves as references where the
+ * entry may have held their base64 data; their readers resolve a reference as
+ * they read it (`lazyImageDataSync`).
  */
 export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
 	let externalized: unknown;

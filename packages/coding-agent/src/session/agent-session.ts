@@ -502,6 +502,7 @@ import {
 	copySessionArtifacts,
 	extractSessionInit,
 	type PersistedSessionInit,
+	type SessionContextBuildOptions,
 	type SessionManager,
 } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -2986,7 +2987,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
-			buildDisplaySessionContext: model => this.buildDisplaySessionContext(model),
+			buildDisplaySessionContext: (model, options) => this.buildDisplaySessionContext(model, options),
 			replaceMessagesFromSessionContext: messages => this.replaceMessagesFromSessionContext(messages),
 			persistEvalStateContext: () => {
 				// The rewritten history carries no snapshot yet, so always build one.
@@ -7893,8 +7894,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#providerBoundary.getImageAttachments();
 	}
 
-	buildDisplaySessionContext(model = this.model): SessionContext {
-		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+	/** The stored context as `model` reads it; `measureOnly` for a build that does not become the agent's context. */
+	buildDisplaySessionContext(
+		model = this.model,
+		options?: Pick<SessionContextBuildOptions, "measureOnly">,
+	): SessionContext {
+		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model, options));
 	}
 
 	/** Snapshots a rebuild appended that no session entry records yet. */

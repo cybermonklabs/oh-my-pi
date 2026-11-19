@@ -139,6 +139,10 @@ Regex entries always scan globally (the `g` flag is enforced automatically). The
 
 Environment variables are collected first, file-defined entries follow, and the built-in credential regex runs last so configured entries see matching content before the generic detector. Duplicate environment values are collapsed within the environment scan. Environment and file entries are not deduplicated against each other, so a plain value present in both is registered twice; both placeholders restore to the same secret, so deobfuscation is unaffected.
 
+## Older entry bodies on disk
+
+A persisted session keeps the bodies of its older entries in a temporary file under `os.tmpdir()/omp-cold-<uid>/` instead of in memory (see [the cold store](./session.md#older-entry-bodies-the-cold-store)). That file holds each entry as the session holds it in memory: no secret in it is obfuscated or masked, whatever is masked in the session file. The directory is one the account owns alone (mode 0700) and each file is mode 0600. On POSIX the file is unlinked as soon as it is open, so nothing of it stays on disk once the process ends. On Windows the file stays until its session closes or the process exits; a process killed before that leaves it on disk until the next omp process that opens such a file deletes it.
+
 ## Key files
 
 - `packages/coding-agent/src/secrets/index.ts` -- loading, merging, env var collection

@@ -30,6 +30,14 @@
 - RPC `steer_subagent` sent to a subagent running on a worker thread just as one of its turns ends no longer makes the run's next prompt fail with `AgentBusyError`: the message waits for the next turn the subagent's task executor starts
 - A failed turn the session kept and continued from, once a continuation succeeded (a `/retry` after the run failed included) while the live context still held the turn, stays in what the model sees after a resume, reload or compaction, instead of being left out so that the continuation, or a tool result, follows nothing: an answer a rate limit or a dropped stream cut off after its text, a turn a dropped stream or an abort with no reason cut off after complete tool calls, a turn whose tool calls provably never ran, or text Gemini rejected as a malformed function call. The session file marks such a turn `continued`; nothing on screen changes, and sessions saved before this release still leave such turns out
 - The reminder the session sends before it continues a kept failed turn (pick up where a rate limit or a dropped stream cut the answer off, or reissue a call Gemini rejected as malformed) is now saved with the session, so after a resume, reload or compaction the model still reads it between that turn and its continuation, and it is left out with any turn the rebuilt context leaves out
+- A compaction after an elide pass (`/shake`, or a shake before compaction) no longer keeps every elided body in memory through the patch record that holds them
+- After `/model` or a fallback moves a session to another provider following an OpenAI remote compaction, and in a session with an experimental context-rollover compaction, requests no longer read older messages back from disk each time
+- Rebuilding the context after a compaction, a branch move or a model change no longer fails when an older message's image cannot be written to a full disk as the message leaves memory; that message stays in memory instead
+- A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
+- omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them in memory instead
+- On Windows, the temporary file of older entry bodies that a killed omp process left behind is deleted by the next omp process that opens one
+- Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
+- After `/delete` while a backgrounded command still runs, closing the session frees the temporary file of older entry bodies at once instead of at the next garbage collection
 
 ## [18.18.6] - 2026-11-09
 

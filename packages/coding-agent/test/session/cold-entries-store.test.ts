@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { TextContent } from "@oh-my-pi/pi-ai";
 import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
 import {
 	CURRENT_SESSION_VERSION,
@@ -450,6 +451,86 @@ describe("cold entry store", () => {
 		for (const shared of runtimes) expect(shared).toBe(runtimes[0]);
 	});
 
+	// /resume --from-claude persists an imported in-memory session; that live session must still free older bodies.
+	it("cools the entries before the cut of a copy persisted from an in-memory session", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const source = SessionManager.inMemory(dir.path());
+		source.appendMessage({ role: "user", content: `u1 ${BODY}`, timestamp: 1 });
+		source.appendMessage(assistant(`a1 ${BODY}`));
+		const u2 = source.appendMessage({ role: "user", content: `u2 ${BODY}`, timestamp: 3 });
+		source.appendCompaction(`c1 ${BODY}`, undefined, u2, 1000);
+		source.appendMessage(assistant(`a2 ${BODY}`));
+		expect(source.coldStoreStats().coldEntries).toBe(0);
+
+		const copy = await source.persistCopy(
+			{ sessionDir: path.join(dir.path(), "sessions"), suppressBreadcrumb: true },
+			new FileSessionStorage(),
+		);
+		try {
+			expect(copy.buildSessionContext().messages.map(message => message.role)).toEqual([
+				"compactionSummary",
+				"user",
+				"assistant",
+			]);
+			expect(copy.coldStoreStats().coldEntries).toBe(2);
+		} finally {
+			await copy.close();
+		}
+	});
+
+	// bash detach on /delete keeps a clone of the dropped session; closing both must free the store's disk now.
+	it.skipIf(!fs.existsSync("/proc/self/fd"))(
+		"closes the store once the manager and a clone made without persistence are both closed",
+		async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			using tmp = TempDir.createSync("@omp-cold-tmpdir-");
+			const file = await writeSession(dir.path());
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+			const coldDir = coldDirIn(tmp.path());
+
+			const manager = await open(file);
+			const clone = manager.cloneCurrentSession({ persist: false });
+			expect(clone.coldStoreStats().coldEntries).toBe(2);
+			expect(coldStoreDescriptors(coldDir).size).toBe(1);
+			await manager.close();
+			expect(coldStoreDescriptors(coldDir).size).toBe(1);
+			await clone.close();
+			expect(coldStoreDescriptors(coldDir).size).toBe(0);
+		},
+	);
+
+	// On Windows a killed process leaves its store file, which holds the entries unmasked.
+	it("removes the store files of processes that are gone when a store opens on Windows, keeping a live one's", () => {
+		using tmp = TempDir.createSync("@omp-cold-tmpdir-");
+		vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+		const coldDir = coldDirIn(tmp.path());
+		fs.mkdirSync(coldDir, { mode: 0o700 });
+		// Above every pid limit: no process has it.
+		const gone = path.join(coldDir, `${2 ** 31 - 1}-${crypto.randomUUID()}.jsonl`);
+		const live = path.join(coldDir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
+		fs.writeFileSync(gone, "{}\n");
+		fs.writeFileSync(live, "{}\n");
+
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!platform) throw new Error("process.platform has no descriptor");
+		Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+		let store: ColdEntryStore | undefined;
+		try {
+			store = ColdEntryStore.open(new BlobStore(path.join(tmp.path(), "blobs")));
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+		if (!store) throw new Error("the store did not open");
+		try {
+			const files = fs.readdirSync(coldDir);
+			expect(files).not.toContain(path.basename(gone));
+			expect(files).toContain(path.basename(live));
+		} finally {
+			store.close();
+		}
+		expect(fs.readdirSync(coldDir)).toEqual([path.basename(live)]);
+	});
+
 	describe("full rewrites of entries with images", () => {
 		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 		let agentDir: TempDir;
@@ -533,6 +614,107 @@ describe("cold entry store", () => {
 			const text = await Bun.file(file).text();
 			for (const image of images) expect(text).toContain(image.ref);
 			await manager.close();
+		});
+	});
+
+	describe("records read back with their images", () => {
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		let agentDir: TempDir;
+
+		beforeEach(() => {
+			agentDir = TempDir.createSync("@omp-cold-agent-");
+			setAgentDir(agentDir.path());
+		});
+
+		afterEach(() => {
+			if (originalAgentDir) {
+				setAgentDir(originalAgentDir);
+			} else {
+				setAgentDir(path.join(getConfigRootDir(), "agent"));
+				delete process.env.PI_CODING_AGENT_DIR;
+			}
+			agentDir.removeSync();
+		});
+
+		// One loop over older screenshots must not keep eight resolved images in memory.
+		it("are kept no more than the cache bound holds, counted with their images resolved", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const cacheBytes = 16 * 1024 * 1024;
+			const blobs = new BlobStore(getBlobsDir());
+			const imageBytes = 3 * 1024 * 1024;
+			const timestamp = "2026-01-01T00:00:00.000Z";
+			const lines: object[] = [
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: path.basename(dir.path()),
+					timestamp,
+					cwd: dir.path(),
+				},
+			];
+			let parentId: string | null = null;
+			const ids: string[] = [];
+			for (let index = 0; index < 8; index++) {
+				const { ref } = blobs.putSync(Buffer.alloc(imageBytes, index + 1), { extension: "png" });
+				const id = `u${index}`;
+				lines.push({
+					type: "message",
+					id,
+					parentId,
+					timestamp,
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: `${id} screenshot` },
+							{ type: "image", data: ref, mimeType: "image/png" },
+						],
+						timestamp: 1,
+					},
+				});
+				ids.push(id);
+				parentId = id;
+			}
+			lines.push(
+				{
+					type: "message",
+					id: "keep",
+					parentId,
+					timestamp,
+					message: { role: "user", content: "keep", timestamp: 2 },
+				},
+				{
+					type: "compaction",
+					id: "c1",
+					parentId: "keep",
+					timestamp,
+					summary: "summary",
+					firstKeptEntryId: "keep",
+					tokensBefore: 1000,
+				},
+			);
+			const file = path.join(dir.path(), "session.jsonl");
+			await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
+			const manager = await open(file);
+			try {
+				expect(manager.coldStoreStats().coldEntries).toBe(8);
+				const readAll = (): void => {
+					for (const id of ids) {
+						const content = contentOf(entry(manager, id));
+						expect(Array.isArray(content) ? content.length : 0).toBe(2);
+					}
+				};
+				readAll();
+				const afterFirstPass = manager.coldStoreStats().materializations;
+				readAll();
+				// Each record holds a reference in the store but its whole image once read.
+				const resolvedBytes = Math.ceil(imageBytes / 3) * 4;
+				const fitting = Math.floor(cacheBytes / resolvedBytes);
+				expect(manager.coldStoreStats().materializations - afterFirstPass).toBeGreaterThanOrEqual(
+					ids.length - fitting,
+				);
+			} finally {
+				await manager.close();
+			}
 		});
 	});
 });

@@ -63,7 +63,7 @@ function sitsBetweenTurnAndReminder(message: AgentMessage | undefined): boolean 
 	);
 }
 
-function isRolloverRequestEntry(entry: SessionEntry): boolean {
+export function isRolloverRequestEntry(entry: SessionEntry): boolean {
 	return (
 		isUserRequestEntry(entry) ||
 		(entry.type === "custom_message" &&

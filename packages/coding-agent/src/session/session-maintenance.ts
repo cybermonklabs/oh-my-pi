@@ -119,7 +119,7 @@ import {
 	getReadableCompactionEntry,
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
-import type { SessionManager } from "./session-manager";
+import type { SessionContextBuildOptions, SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 import experimentalContextNotesReminderPrompt from "../prompts/system/experimental-context-notes-reminder.md" with { type: "text" };
@@ -471,8 +471,11 @@ export interface SessionMaintenanceHost {
 	disconnectFromAgent(): void;
 	reconnectToAgent(): void;
 	drainStrandedQueuedMessages(): void;
-	/** The stored context as `model` reads it (the active model when omitted). */
-	buildDisplaySessionContext(model?: Model): SessionContext;
+	/**
+	 * The stored context as `model` reads it (the active model when omitted); `measureOnly` for a build
+	 * that only measures and does not become the agent's context.
+	 */
+	buildDisplaySessionContext(model?: Model, options?: Pick<SessionContextBuildOptions, "measureOnly">): SessionContext;
 	/** Adopt a {@link buildDisplaySessionContext} result as the live history, persisting any snapshot it appended. */
 	replaceMessagesFromSessionContext(messages: AgentMessage[]): void;
 	/** Preserve the eval runtime snapshot at the history rewrite boundary for replay. */
@@ -4491,8 +4494,9 @@ export class SessionMaintenance {
 			// `model` stands on another compaction boundary than the active model
 			// (it cannot replay a provider-native compaction, or can replay one the
 			// active model cannot), so neither the provider usage nor the live
-			// messages describe what it would be sent: count its own context.
-			const readerMessages = this.#host.buildDisplaySessionContext(model).messages;
+			// messages describe what it would be sent: count its own context. Only
+			// counted: the session stays on its model, so the cut stays on it too.
+			const readerMessages = this.#host.buildDisplaySessionContext(model, { measureOnly: true }).messages;
 			// The rebuild can return copies (secret deobfuscation), so the failed turn also matches by what
 			// it holds; at most one message is dropped, newest first, so an earlier reply sharing its
 			// millisecond stays counted.
