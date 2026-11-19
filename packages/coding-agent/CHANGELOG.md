@@ -48,6 +48,8 @@
 - Fixed SQL session storage holding Bun's default ten database connections per omp process; configured PostgreSQL and MySQL stores now use at most two and release them after five seconds of inactivity. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - Under `session.storage: sql`, a session whose file an older omp (or any writer that claims nothing) appended to or replaced no longer erases that writer's entries or writes itself over the other session when its next append or queued save lands: it keeps the other writer's entries and saves again, or moves to a new session id (`replaced`, or `contested` after repeated conflicts). A rewrite computed from a stale view (`rewriteEntries()`) still rejects with `SessionWriteConflictError`.
 - Under `session.storage: sql`, a subagent transcript whose session another omp process holds forks to a session of its own beside it instead of keeping its entries only in memory.
+- Under `session.storage: sql` on PostgreSQL with a nondeterministic (such as case-insensitive) collation on the `path` columns, deleting a session no longer deletes the sessions, or fails the in-progress saves, under another directory whose name differs only in letter case.
+- Under `session.storage: sql` on SQLite, a parts table holding a rowid past 2^53 (as a copy or restore tool that keeps rowids can leave) no longer makes a session's appends and rewrites fail (`datatype mismatch`, `UNIQUE constraint failed`) or its chunked reads fail with a read conflict.
 
 ### Security
 

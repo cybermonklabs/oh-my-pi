@@ -141,7 +141,7 @@ interface Statement {
 	readonly params: readonly string[];
 }
 
-type StatementValues = Readonly<Record<string, string | number | null>>;
+type StatementValues = Readonly<Record<string, string | number | bigint | null>>;
 
 interface DialectQueries {
 	createTable: string;
@@ -175,10 +175,12 @@ interface DialectQueries {
 	deleteParts: Statement;
 	/**
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
-	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
-	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case; on MySQL and MariaDB a comparison of their bytes, see below) and
-	 * exactly those rows' parts, then every part under `@dir` that has no row:
+	 * characters equal it, compared exactly whatever the `path` column's
+	 * collation: not by `LIKE`, so `%` and `_` stay literal and SQLite's
+	 * ASCII-insensitive `LIKE` cannot match another case; on PostgreSQL as
+	 * code points, as a nondeterministic collation finds "R/A/" equal to
+	 * "R/a/"; on MySQL and MariaDB as bytes, see below) and exactly those
+	 * rows' parts, then every part under `@dir` that has no row:
 	 * a staged full write's parts that its killed writer never swapped in, of
 	 * a path the delete may not know of. PostgreSQL and MySQL delete the rows
 	 * and their parts in one statement, so the parts deleted are those of the
@@ -216,12 +218,13 @@ interface DialectQueries {
 	deleteUnderScan: Statement[];
 	/**
 	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
-	 * including, `@high`: a primary-key range, and the prefix compared by
-	 * characters too (on MySQL and MariaDB as bytes, as in
-	 * {@link deleteUnder}), so a collation that orders the range otherwise can
-	 * never reach another path's parts. A staging name has a digit after
-	 * `@low`, and a "-" after the epoch `@high` ends with, both above the
-	 * space, so MySQL's PAD SPACE orders these names as code-point order does.
+	 * including, `@high`: a primary-key range, and the prefix compared exactly
+	 * too (on PostgreSQL as code points, on MySQL and MariaDB as bytes, as in
+	 * {@link deleteUnder}), so a collation that orders the range otherwise, or
+	 * finds two paths equal, can never reach another path's parts. A staging
+	 * name has a digit after `@low`, and a "-" after the epoch `@high` ends
+	 * with, both above the space, so MySQL's PAD SPACE orders these names as
+	 * code-point order does.
 	 */
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
@@ -276,8 +279,10 @@ interface DialectQueries {
 	 */
 	readChunksDigest: Statement | undefined;
 	/**
-	 * SQLite only: the first rowid a full write's parts take, and an insert
-	 * that sets a part's rowid. A part's row identity, which a chunked read
+	 * SQLite only: the first rowid a full write's parts take, as decimal text
+	 * (a rowid can reach 2^63 - 1, which a JavaScript number holds exactly only
+	 * up to 2^53, so the write counts up in a `bigint`), and an insert that
+	 * sets a part's rowid. A part's row identity, which a chunked read
 	 * checks, is its `xmin` on PostgreSQL (the transaction that wrote it) and
 	 * its `rowid` on SQLite. SQLite gives a new row the largest rowid plus one,
 	 * which hands the rowid of a deleted last row out again; so every part
@@ -293,6 +298,18 @@ interface DialectQueries {
 	 * several hosts share, is behind), or when a part is deleted and another
 	 * inserted in the millisecond of the deleted part's own insert. A writer
 	 * older than this rule still hands out the largest rowid plus one.
+	 *
+	 * A part whose rowid by the rule would pass {@link SQLITE_MAX_ROWID}, the
+	 * largest SQLite has (as when another program stored a row under it), goes
+	 * in with no rowid of its own: `next_rowid` is null when the largest rowid
+	 * is that already, and a full write binds null for every part it would
+	 * count past it. SQLite then picks one, as it does for an older writer: the
+	 * largest rowid plus one, or, while the table holds rowid 2^63 - 1, an
+	 * unused one at random. The rule does not hold for that table then, and a
+	 * new part can take the rowid of a deleted one: what still finds a
+	 * replacement during a chunked read is the part at its anchor no longer
+	 * having the rowid the read started with, or the last part it fetched no
+	 * longer holding the same bytes at its offset (see {@link readParts}).
 	 */
 	partRowids: { next: Statement; insert: Statement } | undefined;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
@@ -479,8 +496,9 @@ interface ReadFromRow {
 /**
  * `readChunksStart` row: `head` is the row's own content from the offset on,
  * `first_part` the start of the part the read starts at, -1 when there is none,
- * and `first_id` that part's row identity (a rowid on SQLite, `xmin` as text
- * on PostgreSQL), null on MySQL or when there is no such part.
+ * and `first_id` that part's row identity (a rowid on SQLite, as text past
+ * 2^53, which a JavaScript number does not hold exactly; `xmin` as text on
+ * PostgreSQL), null on MySQL or when there is no such part.
  */
 interface ChunksStartRow {
 	byte_len: number | bigint | string | null;
@@ -506,9 +524,9 @@ interface ChunksDigestRow {
 	digest: string;
 }
 
-/** `partRowids.next` row. */
+/** `partRowids.next` row: the rowid in decimal, or null when SQLite is to pick it (see `DialectQueries.partRowids`). */
 interface RowidRow {
-	next_rowid: number | bigint | string;
+	next_rowid: string | null;
 }
 
 const DEFAULT_TABLE = "omp_session_files";
@@ -633,6 +651,8 @@ const LEASE_WAIT_POLL_MS = 1000;
 const LAPSE_POLL_MS = 50;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
+/** The largest rowid SQLite has, 2^63 - 1 (see `DialectQueries.partRowids`). */
+const SQLITE_MAX_ROWID = 2n ** 63n - 1n;
 /**
  * Bytes the first page of a `readChunks` read spans, from the byte it starts
  * at. A reader that stops within this window (the Agent Hub roster's
@@ -1087,8 +1107,15 @@ function buildQueries(
 			sqlite: `length(cast(${column} AS blob))`,
 		})[adapter];
 	const contentByteLength = byteLengthOf("content");
-	// A part's row identity (see DialectQueries.partRowids); MySQL has none.
-	const partId = { postgres: "CAST(p.xmin AS text)", mysql: undefined, sqlite: "p.rowid" }[adapter];
+	// A part's row identity (see DialectQueries.partRowids), which readChunksStart reads and readParts compares with
+	// what it read; MySQL has none. A SQLite rowid past 2^53, which a JavaScript number does not hold exactly, is text.
+	const partId = {
+		postgres: "CAST(p.xmin AS text)",
+		mysql: undefined,
+		sqlite:
+			`CASE WHEN p.rowid BETWEEN ${-Number.MAX_SAFE_INTEGER} AND ${Number.MAX_SAFE_INTEGER} THEN p.rowid ` +
+			"ELSE CAST(p.rowid AS text) END",
+	}[adapter];
 	const emptyBytes = { postgres: "''::bytea", mysql: "cast('' AS binary)", sqlite: "x''" }[adapter];
 	const greatest = adapter === "sqlite" ? "max" : "greatest";
 	// PostgreSQL's substr takes integer positions; offsets within one value always fit.
@@ -1105,19 +1132,28 @@ function buildQueries(
 	const startPart =
 		`FROM ${parts} AS p WHERE p.path = @path ` +
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
-	// `<column>` starts with `<value>`: its first `@len` characters equal it. On MySQL and MariaDB as bytes, so that no
-	// collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path whose
-	// character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE orders it.
+	// `<column>` starts with `<value>`: its first `@len` characters equal it, exactly, whatever the column's collation.
+	// On PostgreSQL as code points (`COLLATE "C"`): `substr` of a column takes the column's collation, and under a
+	// nondeterministic one (a case-insensitive ICU collation, say) "R/A/" equals "R/a/". On MySQL and MariaDB as bytes,
+	// so that no collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path
+	// whose character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE
+	// orders it. SQLite compares a function's result, which is not a column, with BINARY (memcmp), whatever the
+	// column's collation (https://www.sqlite.org/datatype3.html#assigning_collating_sequences_from_sql).
 	const startsWith = (column: string, value: string): string =>
-		mysql
-			? `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`
-			: `substr(${column}, 1, @len) = ${value}`;
+		({
+			postgres: `substr(${column}, 1, @len) COLLATE "C" = ${value}`,
+			mysql: `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`,
+			sqlite: `substr(${column}, 1, @len) = ${value}`,
+		})[adapter];
 	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
 	const orphanParts = (range: boolean): string =>
 		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}${startsWith("p.path", "@dir")}`;
-	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids.
+	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids; null,
+	// for SQLite to pick one, when the largest rowid is SQLITE_MAX_ROWID already, whose `+ 1` is a REAL no rowid takes.
 	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
-	const nextRowid = "max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024)";
+	const nextRowid =
+		`CASE WHEN coalesce(max(rowid), 0) < ${SQLITE_MAX_ROWID} ` +
+		"THEN max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024) END";
 	const deleteUnder = (range: boolean): Statement[] =>
 		({
 			postgres: [
@@ -1340,7 +1376,8 @@ function buildQueries(
 						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
 					: "") +
 				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there. SQLite
-				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids.
+				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids, and so
+				// does SQLite for a part the rule has no room for (see DialectQueries.partRowids).
 				(adapter === "sqlite"
 					? `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
 						"AND q.content = @last_content)) "
@@ -1362,7 +1399,7 @@ function buildQueries(
 		partRowids:
 			adapter === "sqlite"
 				? {
-						next: sql(`SELECT ${nextRowid} AS next_rowid FROM ${parts}`),
+						next: sql(`SELECT CAST(${nextRowid} AS TEXT) AS next_rowid FROM ${parts}`),
 						insert: sql(
 							`INSERT INTO ${parts} (rowid, path, start_offset, content) VALUES (@rowid, @path, @offset, @content)`,
 						),
@@ -3162,11 +3199,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *
 	 * A writer older than SQLite's rowid rule still hands a new part the
 	 * largest rowid plus one, which after a delete or a truncate can be the
-	 * rowid of the part the read started at. So on SQLite the query of each
-	 * page also checks, in the same statement, that the last part already
-	 * fetched is still at its offset with the same bytes; what can go unseen
-	 * there is a replacement within the bounds `partRowids` names, or by such
-	 * a writer, that holds exactly the bytes of that last part at its offset
+	 * rowid of the part the read started at, and so does SQLite itself for a
+	 * part the rule finds no room for below 2^63 (see `partRowids`). So on
+	 * SQLite the query of each page also checks, in the same statement, that
+	 * the last part already fetched is still at its offset with the same
+	 * bytes; what can go unseen there is a replacement within the bounds
+	 * `partRowids` names, by such a writer, or in a table without room for
+	 * the rule, that holds exactly the bytes of that last part at its offset
 	 * while it differs both before and after it. MySQL has no row identity:
 	 * once the bytes the read yielded come from more than one query (the first
 	 * query's head and a page, or two pages), the read checks them when it
@@ -3420,14 +3459,18 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Replace `path`'s parts with `bytes`, as parts of at most
 	 * {@link PART_BYTES}, each ending on a UTF-8 character boundary. On SQLite
-	 * the new parts take rowids counting up from the first one free above
-	 * every part's and the clock's floor, read before the old ones go, so none
-	 * takes the rowid of a part it replaces (see `DialectQueries.partRowids`).
+	 * the new parts take rowids counting up, exactly in a `bigint`, from the
+	 * first one free above every part's and the clock's floor, read before the
+	 * old ones go, so none takes the rowid of a part it replaces. A part the
+	 * count would take past {@link SQLITE_MAX_ROWID}, and every part when the
+	 * largest rowid is that already, goes in with none, for SQLite to pick
+	 * (see `DialectQueries.partRowids`).
 	 */
 	async #replaceParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
 		const rowids = this.#q.partRowids;
 		const [first] = rowids ? ((await run(transaction, rowids.next, { now: Date.now() })) as RowidRow[]) : [];
-		let rowid = first ? rowNumber(first.next_rowid) : 0;
+		const next = first?.next_rowid;
+		let rowid = typeof next === "string" ? BigInt(next) : undefined;
 		await this.#deleteParts(transaction, path);
 		for (let start = 0; start < bytes.byteLength;) {
 			const end = utf8PartEnd(bytes, start, PART_BYTES);
@@ -3435,7 +3478,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				path,
 				offset: start,
 				content: bytes.toString("utf8", start, end),
-				rowid: rowid++,
+				rowid: rowid !== undefined && rowid <= SQLITE_MAX_ROWID ? rowid++ : null,
 			});
 			start = end;
 		}
