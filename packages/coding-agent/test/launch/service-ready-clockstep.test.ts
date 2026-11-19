@@ -125,37 +125,64 @@ it("times a service's ready wait on the monotonic clock: a backward step of the 
 	});
 }, 30_000);
 
-it("counts a service's ready wait from its launch: the stop of the service it replaces does not use it up", async () => {
-	await withBroker("@omp-service-ready-launch-", async session => {
-		const neverInterrupted = new AbortController();
-		// A service that ignores TERM, ready once its trap is set: replacing it takes the broker's 2 s stop grace
-		// before the KILL, all before the new service's launch.
-		const ignoring = await startService(
-			session,
-			{
-				name: NAME,
-				command: "trap '' TERM; echo armed; sleep 600",
-				pty: false,
-				ready: { log: "armed", timeout: 60 },
-			},
-			undefined,
-			neverInterrupted.signal,
-		);
-		expect(ignoring.readyTimedOut).toBe(false);
-		const requested = performance.now();
-		const outcome = await startService(
-			session,
-			{ name: NAME, command: "sleep 600", pty: false, ready: { log: "never printed", timeout: 3 } },
-			undefined,
-			neverInterrupted.signal,
-		);
-		const took = performance.now() - requested;
-		expect({ readyTimedOut: outcome.readyTimedOut, interrupted: outcome.readyInterrupted }).toEqual({
-			readyTimedOut: true,
-			interrupted: false,
+/**
+ * Replaces a service that ignores TERM, ready once its trap is set, with one that never becomes ready: the replace takes
+ * the broker's 2 s stop grace before the KILL, all before the new service's launch. Returns how long the second start
+ * took from its request. With `released`, the start answers lose `launchedMsAgo`, as a released broker's do.
+ */
+async function replaceTakes(
+	session: ToolSession,
+	client: brokerClients.DaemonBrokerClient,
+	released: boolean,
+): Promise<number> {
+	if (released) {
+		const realRequest = client.request.bind(client);
+		vi.spyOn(client, "request").mockImplementation(async (operation: DaemonOperation, signal?: AbortSignal) => {
+			const result = await realRequest(operation, signal);
+			if (result.op === "start") delete result.launchedMsAgo;
+			return result;
 		});
-		// At least the 2 s stop and then the whole 3 s wait; a wait counted from the request ends about 1 s after
-		// the launch, 3 s after the request. 50 ms is the timers' own slack.
-		expect(took).toBeGreaterThanOrEqual(2_000 + 3_000 - 50);
+	}
+	const neverInterrupted = new AbortController();
+	const ignoring = await startService(
+		session,
+		{
+			name: NAME,
+			command: "trap '' TERM; echo armed; sleep 600",
+			pty: false,
+			ready: { log: "armed", timeout: 60 },
+		},
+		undefined,
+		neverInterrupted.signal,
+	);
+	expect(ignoring.readyTimedOut).toBe(false);
+	const requested = performance.now();
+	const outcome = await startService(
+		session,
+		{ name: NAME, command: "sleep 600", pty: false, ready: { log: "never printed", timeout: 3 } },
+		undefined,
+		neverInterrupted.signal,
+	);
+	const took = performance.now() - requested;
+	expect({ readyTimedOut: outcome.readyTimedOut, interrupted: outcome.readyInterrupted }).toEqual({
+		readyTimedOut: true,
+		interrupted: false,
+	});
+	return took;
+}
+
+// At least the 2 s stop and then the whole 3 s wait; a wait counted from the request ends about 1 s after the launch,
+// 3 s after the request. 50 ms is the timers' own slack.
+const STOP_THEN_WAIT_MS = 2_000 + 3_000 - 50;
+
+it("counts a service's ready wait from its launch: the stop of the service it replaces does not use it up", async () => {
+	await withBroker("@omp-service-ready-launch-", async (session, client) => {
+		expect(await replaceTakes(session, client, false)).toBeGreaterThanOrEqual(STOP_THEN_WAIT_MS);
+	});
+}, 30_000);
+
+it("counts a service's ready wait from its launch with a broker that does not say when it launched", async () => {
+	await withBroker("@omp-service-ready-released-", async (session, client) => {
+		expect(await replaceTakes(session, client, true)).toBeGreaterThanOrEqual(STOP_THEN_WAIT_MS);
 	});
 }, 30_000);
