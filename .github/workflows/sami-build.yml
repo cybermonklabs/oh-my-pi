@@ -65,7 +65,10 @@ jobs:
           - runner: ubuntu-22.04
             target: linux-x64
             native_targets: linux-x64-baseline linux-x64-modern
-          - runner: macos-14
+          # GitHub retired the macOS 14 image on 2026-11-02, and refuses
+          # macos-14 since. macos-15 is the host upstream's CI builds
+          # darwin-arm64 on; a newer host can raise the binary's minimum macOS.
+          - runner: macos-15
             target: darwin-arm64
             native_targets: darwin-arm64
     runs-on: ${{ matrix.runner }}
