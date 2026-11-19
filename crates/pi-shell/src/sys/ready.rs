@@ -39,14 +39,69 @@ pub const READ: i16 = libc::POLLIN;
 /// Wait for output space.
 pub const WRITE: i16 = libc::POLLOUT;
 
-/// Bytes a write may carry after [`now`] reported `WRITE` without risking a
-/// wait: `PIPE_BUF` (POSIX: a pipe that polls writable takes this much).
+/// The most a write carries after [`now`] reported `WRITE`: `PIPE_BUF`. A
+/// Linux pipe polls writable only with a free page, which takes that much.
 #[cfg(target_os = "linux")]
-pub const WRITE_CHUNK: usize = libc::PIPE_BUF;
-/// Bytes a write may carry after [`now`] reported `WRITE` without risking a
-/// wait: `PIPE_BUF` of `<sys/syslimits.h>`.
+pub(crate) const WRITE_CHUNK: usize = libc::PIPE_BUF;
+/// The most a write carries after [`now`] reported `WRITE`: `PIPE_BUF` of
+/// `<sys/syslimits.h>` (POSIX: a pipe that polls writable takes this much).
 #[cfg(not(target_os = "linux"))]
-pub const WRITE_CHUNK: usize = 512;
+pub(crate) const WRITE_CHUNK: usize = 512;
+
+/// Bytes a write to `fd` may carry without waiting once [`now`] reported
+/// `WRITE`: at most [`WRITE_CHUNK`], and for a pipe no more than it has
+/// free (its capacity less what it holds). A pipe can poll writable with
+/// less than `PIPE_BUF` free: gVisor reports `POLLOUT` with one byte free,
+/// and then holds a blocking write of up to `PIPE_BUF` bytes until all of
+/// it fits. 0 when a pipe that still has a reader is full: another writer
+/// took the room after the check.
+///
+/// `cached_capacity` skips the `F_GETPIPE_SZ` syscall when the pipe's
+/// capacity is known from construction (it does not change).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn write_room_with_capacity(fd: RawFd, cached_capacity: Option<i32>) -> usize {
+	let capacity = cached_capacity.unwrap_or_else(|| {
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `fd` is the caller's open
+		// descriptor.
+		unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) }
+	});
+	let mut queued: libc::c_int = 0;
+	// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which is
+	// valid for the call; `fd` is the caller's open descriptor.
+	let status = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &raw mut queued) };
+	if capacity < 0 || status < 0 {
+		// Not a pipe (a socket or a terminal).
+		return WRITE_CHUNK;
+	}
+	match usize::try_from(capacity.saturating_sub(queued)).unwrap_or(0) {
+		// A pipe whose reader left fails a write at once (`EPIPE`).
+		0 if failed(fd) => WRITE_CHUNK,
+		free => free.min(WRITE_CHUNK),
+	}
+}
+
+/// [`write_room_with_capacity`] without a cached capacity.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn write_room(fd: RawFd) -> usize {
+	write_room_with_capacity(fd, None)
+}
+
+/// Bytes a write to `fd` may carry without waiting once [`now`] reported
+/// `WRITE`: [`WRITE_CHUNK`], which POSIX promises a writable pipe takes.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const fn write_room(_fd: RawFd) -> usize {
+	WRITE_CHUNK
+}
+
+/// Whether `fd` reports an error or a hang-up now (a pipe's write end whose
+/// reader closed).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn failed(fd: RawFd) -> bool {
+	let mut p = libc::pollfd { fd, events: 0, revents: 0 };
+	// SAFETY: one valid pollfd; a zero timeout never waits.
+	let n = unsafe { libc::poll(&raw mut p, 1, 0) };
+	n > 0 && (p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+}
 
 /// Whether `fd` is ready for `events` right now (also when it hung up or
 /// failed: the I/O then reports end of file or the error without waiting).

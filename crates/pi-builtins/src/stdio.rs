@@ -543,11 +543,17 @@ mod descriptor {
 		os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
 		time::Duration,
 	};
+	#[cfg(target_os = "linux")]
+	use std::{
+		ffi::CString,
+		os::fd::FromRawFd,
+	};
 
 	use tokio::io::unix::AsyncFd;
 
-	/// Bytes written at once when a descriptor's free space is unknown: what
-	/// a pipe accepts atomically.
+	/// The most a gated write carries at once: what a pipe that polls
+	/// writable is sure to take (`PIPE_BUF`), also when its free space is
+	/// unknown.
 	const ATOMIC_WRITE: usize = if cfg!(any(target_os = "linux", target_os = "android")) { 4096 } else { 512 };
 
 	/// How often a read waiting on a named FIFO rechecks it on Apple
@@ -560,9 +566,11 @@ mod descriptor {
 	pub(super) struct Descriptor {
 		afd:   AsyncFd<OwnedFd>,
 		/// The open file description is shared (or left blocking): every
-		/// syscall is preceded by a zero-timeout readiness check, so it cannot
-		/// block and `O_NONBLOCK` is never needed.
+		/// read syscall is preceded by a zero-timeout readiness check.
 		gated: bool,
+		/// Writes on a description that cannot be privately reopened run on
+		/// Tokio's blocking pool, never the shared runtime worker.
+		blocking_writes: bool,
 		/// The reactor never reports this descriptor's end of input (a named
 		/// FIFO on an Apple platform); waits recheck it periodically.
 		eof_unreported: bool,
@@ -570,22 +578,26 @@ mod descriptor {
 
 	impl Descriptor {
 		/// Registers `fd`, whose description may be shared with other
-		/// processes: its flags stay as they are. Hands `fd` back when the
-		/// reactor cannot watch it (a device without `poll` support, which is
-		/// always ready).
+		/// processes. Linux reopens a pipe through procfs into a private
+		/// non-blocking description; on Darwin and when that fails, writes use
+		/// the blocking pool.
 		pub fn gated(fd: OwnedFd) -> Result<Self, OwnedFd> {
-			Self::register(fd, true)
+			#[cfg(target_os = "linux")]
+			if let Ok(private) = reopen_nonblocking(fd.as_fd()) {
+				return Self::register(private, false, false);
+			}
+			Self::register(fd, true, true)
 		}
 
 		/// Registers `fd`, whose description this process opened `O_NONBLOCK`.
 		pub fn nonblocking(fd: OwnedFd) -> Result<Self, OwnedFd> {
-			Self::register(fd, false)
+			Self::register(fd, false, false)
 		}
 
-		fn register(fd: OwnedFd, gated: bool) -> Result<Self, OwnedFd> {
+		fn register(fd: OwnedFd, gated: bool, blocking_writes: bool) -> Result<Self, OwnedFd> {
 			let eof_unreported = is_named_fifo(fd.as_fd());
 			match AsyncFd::try_new(fd) {
-				Ok(afd) => Ok(Self { afd, gated, eof_unreported }),
+				Ok(afd) => Ok(Self { afd, gated, blocking_writes, eof_unreported }),
 				Err(error) => Err(error.into_parts().0),
 			}
 		}
@@ -641,8 +653,10 @@ mod descriptor {
 			self.afd.readable().await.map(Some)
 		}
 
-		/// Writes all of `buf`, waiting for room: at most the free space of a
-		/// pipe at a time, so a gated write never blocks.
+		/// Writes all of `buf`, waiting for room. Linux pipes use a private
+		/// non-blocking description, so a competing writer returns EAGAIN
+		/// rather than blocking. Darwin and unreopenable descriptors write on
+		/// Tokio's blocking pool, never a shared scheduler worker.
 		pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
 			while !buf.is_empty() {
 				let mut guard = self.afd.writable().await?;
@@ -652,10 +666,26 @@ mod descriptor {
 					continue;
 				}
 				let room = if self.gated {
-					free_space(fd).unwrap_or(ATOMIC_WRITE).clamp(1, buf.len())
+					free_space(fd).unwrap_or(ATOMIC_WRITE).min(ATOMIC_WRITE).clamp(1, buf.len())
 				} else {
 					buf.len()
 				};
+				if self.blocking_writes {
+					guard.clear_ready();
+					drop(guard);
+					let file = self.afd.get_ref().try_clone()?;
+					let bytes = buf[..room].to_vec();
+					let written = tokio::task::spawn_blocking(move || {
+						sys_write(file.as_raw_fd(), &bytes)
+					})
+					.await
+					.map_err(io::Error::other)??;
+					if written == 0 {
+						return Err(io::ErrorKind::WriteZero.into());
+					}
+					buf = &buf[written..];
+					continue;
+				}
 				match guard.try_io(|afd| sys_write(afd.get_ref().as_raw_fd(), &buf[..room])) {
 					Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
 					Ok(Ok(written)) => buf = &buf[written..],
@@ -680,6 +710,32 @@ mod descriptor {
 		// live descriptor owned by the caller's `AsyncFd` for the call.
 		let count = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
 		usize::try_from(count).map_err(|_| io::Error::last_os_error())
+	}
+
+	/// A Linux procfs fd link opens a fresh description, so setting
+	/// `O_NONBLOCK` cannot leak to an external that inherited `fd`.
+	#[cfg(target_os = "linux")]
+	fn reopen_nonblocking(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+		let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("fd path has no NUL");
+		// SAFETY: `F_GETFL` only inspects the original descriptor.
+		let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+		if flags < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `path` is NUL-terminated. `open` returns an owned fd on
+		// success and does not change the original description's flags.
+		let reopened = unsafe {
+			libc::open(
+				path.as_ptr(),
+				(flags & libc::O_ACCMODE) | libc::O_NONBLOCK | libc::O_CLOEXEC,
+			)
+		};
+		if reopened < 0 {
+			Err(io::Error::last_os_error())
+		} else {
+			// SAFETY: `open` returned one fresh descriptor.
+			Ok(unsafe { OwnedFd::from_raw_fd(reopened) })
+		}
 	}
 
 	/// Whether `fd` is a FIFO with a name on an Apple platform (an anonymous
@@ -827,6 +883,59 @@ mod tests {
 		let (count, ()) = tokio::join!(read, write);
 		assert_eq!(count.unwrap(), 4);
 		assert_eq!(bytes, b"fifo");
+	}
+
+	/// A gated write to a pipe takes no more than a writable pipe is sure to
+	/// take. Here a page and one byte were read from a full pipe, so it
+	/// reports 4,097 bytes free but takes 4,096: the second page stays
+	/// until it is read to its end. A blocking write of all 4,097 would wait
+	/// for the last byte on the runtime's only thread, which the reader
+	/// below needs. The bound runs on a thread of its own.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[test]
+	fn a_gated_write_takes_no_more_than_a_writable_pipe_takes() {
+		use std::{
+			os::fd::AsRawFd,
+			sync::mpsc::{RecvTimeoutError, channel},
+			time::Duration,
+		};
+
+		let (mut reader, writer) = std::io::pipe().unwrap();
+		let writer = OwnedFd::from(writer);
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		assert!(capacity >= 2 * 4096, "a pipe of {capacity} bytes holds no second page");
+		std::fs::File::from(writer.try_clone().unwrap())
+			.write_all(&vec![b'q'; capacity])
+			.unwrap();
+		reader.read_exact(&mut [0; 4097]).unwrap();
+		let (done, finished) = channel::<()>();
+		std::thread::spawn(move || {
+			if finished.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
+				eprintln!(
+					"DEADLINE fired: the gated write to a pipe of {capacity} bytes did not finish within 5s"
+				);
+				std::process::exit(1);
+			}
+		});
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let descriptor = descriptor::Descriptor::gated(writer).unwrap();
+			let write = descriptor.write_all(&[b'x'; 4097]);
+			let drain = async {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+				// Only what the fill left, which is in the pipe whatever the
+				// write did: this read does not wait.
+				reader.read_exact(&mut vec![0; capacity - 4097]).unwrap();
+			};
+			let (written, ()) = tokio::join!(write, drain);
+			written.unwrap();
+		});
+		drop(done);
 	}
 }
 

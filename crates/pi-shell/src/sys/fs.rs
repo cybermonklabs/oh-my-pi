@@ -22,6 +22,7 @@
 
 use std::{
 	fs::{self, OpenOptions},
+	future::Future,
 	io::{self, IsTerminal, Read, Seek, Write},
 	path::Path,
 	sync::atomic::{AtomicU32, Ordering},
@@ -53,13 +54,62 @@ pub struct StdFile {
 	/// Pending readiness wait (pipes and sockets). Declared first so it is
 	/// dropped, and forgotten by the waiting thread, before `file` closes.
 	#[cfg(unix)]
-	watch:  Option<crate::sys::ready::Watch>,
-	file:   fs::File,
-	kind:   FileKind,
+	watch:          Option<crate::sys::ready::Watch>,
+	/// A write running outside the scheduler worker where Linux cannot make
+	/// a private non-blocking pipe description. Declared before `file`, so a
+	/// detached blocking task keeps its clone rather than this descriptor.
+	#[cfg(unix)]
+	pending_write:  Option<PendingWrite>,
+	/// Linux only: a fresh non-blocking open file description of a pipe's
+	/// write end. Externals retain the blocking description they inherited.
+	#[cfg(target_os = "linux")]
+	private_writer: Option<fs::File>,
+	file:           fs::File,
+	kind:           FileKind,
 	/// Access mode of the open file description (`O_ACCMODE` bits of
 	/// `F_GETFL`; `None` when unknown).
 	#[cfg(unix)]
-	access: Option<libc::c_int>,
+	access:         Option<libc::c_int>,
+	/// Advisory pipe capacity cached at construction; saves one
+	/// `fcntl(F_GETPIPE_SZ)` per write. `F_SETPIPE_SZ` can change it, but a
+	/// stale value reaches a private `O_NONBLOCK` write (EAGAIN) or the
+	/// blocking-pool fallback, never a shared runtime worker.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	pipe_capacity:  Option<i32>,
+}
+
+/// A write moved off the shared scheduler worker. Tokio's blocking pool
+/// serves real shell runs; the thread fallback lets direct engine tests run
+/// without a Tokio runtime.
+#[cfg(unix)]
+#[derive(Debug)]
+enum PendingWrite {
+	Blocking(tokio::task::JoinHandle<io::Result<usize>>),
+	Thread(tokio::sync::oneshot::Receiver<io::Result<usize>>),
+}
+
+/// Exercises the portable blocking-pool path on Linux too. Each nextest case
+/// runs in a separate process, so the test-only switch cannot affect another
+/// case.
+#[cfg(test)]
+static FORCE_BLOCKING_POOL_WRITES: std::sync::atomic::AtomicBool =
+	std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn force_blocking_pool_writes_for_test(on: bool) {
+	FORCE_BLOCKING_POOL_WRITES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reopen a Linux pipe through procfs, producing a distinct non-blocking open
+/// file description. `dup` would share the flags with an external child.
+#[cfg(target_os = "linux")]
+fn private_nonblocking_writer(file: &fs::File) -> io::Result<fs::File> {
+	use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+	OpenOptions::new()
+		.write(true)
+		.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+		.open(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 impl StdFile {
@@ -85,13 +135,41 @@ impl StdFile {
 				(flags >= 0).then_some(flags & libc::O_ACCMODE)
 			})
 			.flatten();
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		let pipe_capacity = (kind == FileKind::Pipe)
+			.then(|| {
+				use std::os::fd::AsRawFd;
+				// SAFETY: F_GETPIPE_SZ only inspects this live descriptor.
+				let cap = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPIPE_SZ) };
+				(cap > 0).then_some(cap)
+			})
+			.flatten();
+		#[cfg(all(target_os = "linux", test))]
+		let force_blocking_pool =
+			FORCE_BLOCKING_POOL_WRITES.load(std::sync::atomic::Ordering::Relaxed);
+		#[cfg(all(target_os = "linux", not(test)))]
+		let force_blocking_pool = false;
+		#[cfg(target_os = "linux")]
+		let private_writer = (!force_blocking_pool
+			&& kind == FileKind::Pipe
+			&& access.is_none_or(|access| access == libc::O_WRONLY || access == libc::O_RDWR))
+		.then(|| private_nonblocking_writer(&file))
+		.transpose()
+		.ok()
+		.flatten();
 		Self {
 			file,
 			kind,
 			#[cfg(unix)]
 			watch: None,
 			#[cfg(unix)]
+			pending_write: None,
+			#[cfg(target_os = "linux")]
+			private_writer,
+			#[cfg(unix)]
 			access,
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			pipe_capacity,
 		}
 	}
 
@@ -145,21 +223,35 @@ impl StdFile {
 		}
 	}
 
-	/// Write what fits without waiting: `ready::WRITE_CHUNK` bytes per
-	/// readiness check, as long as the descriptor stays writable.
+	/// Write what fits without waiting, as long as the descriptor stays
+	/// writable: per readiness check, at most the room
+	/// [`ready::write_room`](crate::sys::ready::write_room) measures. On
+	/// Linux a private non-blocking open file description closes the measure →
+	/// write race; elsewhere a blocking write runs on the blocking pool.
 	#[cfg(unix)]
-	fn write_ready(&mut self, buf: &[u8]) -> io::Result<usize> {
+	fn write_ready(&self, buf: &[u8]) -> io::Result<usize> {
 		use std::os::fd::AsRawFd;
 
 		use crate::sys::ready;
 		let fd = self.file.as_raw_fd();
+		#[cfg(target_os = "linux")]
+		let mut writer = self.private_writer.as_ref().unwrap_or(&self.file);
+		#[cfg(not(target_os = "linux"))]
+		let mut writer = &self.file;
 		let mut done = 0;
 		while done < buf.len() {
 			if done > 0 && !ready::now(fd, ready::WRITE)? {
 				break;
 			}
-			let end = buf.len().min(done + ready::WRITE_CHUNK);
-			match self.file.write(&buf[done..end]) {
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			let room = ready::write_room_with_capacity(fd, self.pipe_capacity);
+			#[cfg(not(any(target_os = "linux", target_os = "android")))]
+			let room = ready::write_room(fd);
+			if room == 0 {
+				break;
+			}
+			let end = buf.len().min(done + room);
+			match writer.write(&buf[done..end]) {
 				Ok(n) => done += n,
 				Err(e) if done > 0 && e.kind() != io::ErrorKind::Interrupted => break,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
@@ -167,6 +259,98 @@ impl StdFile {
 			}
 		}
 		Ok(done)
+	}
+
+	/// Poll a blocking write outside the shared scheduler worker. This is the
+	/// Darwin and procfs-unavailable fallback: it can occupy a blocking-pool
+	/// thread, never the worker that drains the pipe or fires its timeout.
+	#[cfg(unix)]
+	fn poll_blocking_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		if let Some(pending) = &mut self.pending_write {
+			let result = match pending {
+				PendingWrite::Blocking(task) => std::pin::Pin::new(task)
+					.poll(cx)
+					.map(|result| result.unwrap_or_else(|error| Err(io::Error::other(error)))),
+				PendingWrite::Thread(receiver) => std::pin::Pin::new(receiver)
+					.poll(cx)
+					.map(|result| result.unwrap_or_else(|_| Err(io::ErrorKind::Interrupted.into()))),
+			};
+			if let Poll::Ready(result) = result {
+				self.pending_write = None;
+				return Poll::Ready(result);
+			}
+			return Poll::Pending;
+		}
+
+		let mut file = match self.file.try_clone() {
+			Ok(file) => file,
+			Err(error) => return Poll::Ready(Err(error)),
+		};
+		let bytes = buf.to_vec();
+		let pending = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			PendingWrite::Blocking(handle.spawn_blocking(move || file.write(&bytes)))
+		} else {
+			let (sender, receiver) = tokio::sync::oneshot::channel();
+			match std::thread::Builder::new()
+				.name("obash-write".into())
+				.spawn(move || {
+					let _ = sender.send(file.write(&bytes));
+				}) {
+				Ok(_) => PendingWrite::Thread(receiver),
+				Err(error) => return Poll::Ready(Err(error)),
+			}
+		};
+		self.pending_write = Some(pending);
+		cx.waker().wake_by_ref();
+		Poll::Pending
+	}
+
+	/// Writes `buf` as one atomic pipe record, or waits without writing
+	/// anything. The caller must keep `buf` at most [`WRITE_CHUNK`]; this is
+	/// used for status lines, which must not be left as fragments.
+	#[cfg(unix)]
+	pub(crate) fn poll_write_atomic(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<()>> {
+		if buf.len() > crate::sys::ready::WRITE_CHUNK {
+			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+		}
+		if self.gated(true) && !buf.is_empty() {
+			if let Err(error) = std::task::ready!(self.ready(cx, crate::sys::ready::WRITE)) {
+				return Poll::Ready(Err(error));
+			}
+			#[cfg(target_os = "linux")]
+			if let Some(writer) = self.private_writer.as_mut() {
+				use std::os::fd::AsRawFd;
+
+				if crate::sys::ready::write_room_with_capacity(
+					self.file.as_raw_fd(),
+					self.pipe_capacity,
+				) < buf.len()
+				{
+					cx.waker().wake_by_ref();
+					return Poll::Pending;
+				}
+				return match writer.write(buf) {
+					Ok(n) if n == buf.len() => Poll::Ready(Ok(())),
+					Ok(_) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+					Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+						cx.waker().wake_by_ref();
+						Poll::Pending
+					},
+					Err(error) => Poll::Ready(Err(error)),
+				};
+			}
+			return match self.poll_blocking_write(cx, buf) {
+				Poll::Ready(Ok(n)) if n == buf.len() => Poll::Ready(Ok(())),
+				Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+				Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+				Poll::Pending => Poll::Pending,
+			};
+		}
+		Poll::Ready(self.file.write_all(buf))
 	}
 }
 
@@ -255,7 +439,32 @@ impl File for StdFile {
 			if let Err(e) = std::task::ready!(self.ready(cx, crate::sys::ready::WRITE)) {
 				return Poll::Ready(Err(e));
 			}
-			return Poll::Ready(self.write_ready(buf));
+			#[cfg(target_os = "linux")]
+			if self.private_writer.is_some() {
+				return match self.write_ready(buf) {
+					Ok(0) => {
+						// A competing writer consumed the room.
+						cx.waker().wake_by_ref();
+						Poll::Pending
+					},
+					Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+						// The private description returned EAGAIN instead of
+						// sleeping in the kernel.
+						cx.waker().wake_by_ref();
+						Poll::Pending
+					},
+					done => Poll::Ready(done),
+				};
+			}
+			#[cfg(unix)]
+			{
+				use std::os::fd::AsRawFd;
+
+				// Darwin has no procfs re-open route; a failed Linux reopen
+				// also reaches this safe fallback.
+				let room = crate::sys::ready::write_room(self.file.as_raw_fd()).max(1);
+				return self.poll_blocking_write(cx, &buf[..buf.len().min(room)]);
+			}
 		}
 		#[cfg(not(unix))]
 		let _ = cx;
@@ -1055,6 +1264,169 @@ mod tests {
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
 		}
 
+		/// Ends the test process, naming `what`, unless the returned sender
+		/// is dropped within `limit`. The clock runs on a thread of its own:
+		/// the call it bounds may wait in the kernel on the test's thread.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn deadline(what: &'static str, limit: Duration) -> std::sync::mpsc::Sender<()> {
+			let (done, finished) = std::sync::mpsc::channel::<()>();
+			thread::spawn(move || {
+				if finished.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+					eprintln!("DEADLINE fired: {what} did not return within {limit:?}");
+					std::process::exit(1);
+				}
+			});
+			done
+		}
+
+		/// A pipe's write end, wrapped, and its read end, with all but `free`
+		/// bytes of the pipe's capacity queued.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn pipe_with_free(free: usize) -> (StdFile, io::PipeReader) {
+			use std::os::fd::AsRawFd;
+
+			let (r, w) = io::pipe().unwrap();
+			let mut fill = fs::File::from(std::os::fd::OwnedFd::from(w));
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `fill` owns the fd.
+			let capacity = unsafe { libc::fcntl(fill.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+			fill.write_all(&vec![b'q'; capacity - free]).unwrap();
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer; `r`
+			// owns the fd.
+			assert_eq!(unsafe { libc::ioctl(r.as_raw_fd(), libc::FIONREAD as _, &raw mut queued) }, 0);
+			assert_eq!(
+				usize::try_from(queued).unwrap(),
+				capacity - free,
+				"all but {free} bytes queued"
+			);
+			let writer = StdFile::new(fill);
+			assert_eq!(writer.kind(), FileKind::Pipe);
+			(writer, r)
+		}
+
+		/// The room query itself is a Linux control: it is independent of
+		/// readiness and fails if `write_room` is replaced by `PIPE_BUF`.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		#[test]
+		fn write_room_reports_free_full_and_reader_gone_pipes() {
+			use std::os::fd::AsRawFd;
+
+			let (writer, reader) = pipe_with_free(100);
+			assert_eq!(crate::sys::ready::write_room(writer.file.as_raw_fd()), 100);
+			drop(reader);
+
+			let (writer, reader) = pipe_with_free(0);
+			assert_eq!(crate::sys::ready::write_room(writer.file.as_raw_fd()), 0);
+			drop(reader);
+
+			let (writer, reader) = pipe_with_free(0);
+			drop(reader);
+			assert_eq!(
+				crate::sys::ready::write_room(writer.file.as_raw_fd()),
+				crate::sys::ready::WRITE_CHUNK
+			);
+		}
+
+		/// Linux output pipes get a fresh non-blocking description; setting a
+		/// flag on `dup` would leak it to the original description externals
+		/// inherit.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn pipe_writer_has_a_private_nonblocking_description() {
+			use std::os::fd::AsRawFd;
+
+			let (_reader, writer) = io::pipe().unwrap();
+			let writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(writer)));
+			let private = writer
+				.private_writer
+				.as_ref()
+				.expect("reopen /proc/self/fd pipe writer");
+			// SAFETY: F_GETFL only reads this live inherited descriptor.
+			let inherited = unsafe { libc::fcntl(writer.file.as_raw_fd(), libc::F_GETFL) };
+			// SAFETY: F_GETFL only reads this live private descriptor.
+			let private = unsafe { libc::fcntl(private.as_raw_fd(), libc::F_GETFL) };
+			assert_eq!(inherited & libc::O_NONBLOCK, 0, "externals keep blocking stdout");
+			assert_ne!(private & libc::O_NONBLOCK, 0, "shell's private writer is nonblocking");
+		}
+
+		/// A writer can consume the room after `POLLOUT` but before this
+		/// writer reaches `write(2)`. The private description returns EAGAIN
+		/// in that window instead of sleeping in the kernel.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn competing_writer_after_poll_gets_eagain_not_a_wait() {
+			use std::os::fd::AsRawFd;
+
+			let (mut writer, reader) = pipe_with_free(libc::PIPE_BUF);
+			assert!(
+				crate::sys::ready::now(writer.file.as_raw_fd(), crate::sys::ready::WRITE).unwrap()
+			);
+			writer
+				.file
+				.try_clone()
+				.unwrap()
+				.write_all(&vec![b'c'; libc::PIPE_BUF])
+				.unwrap();
+			let private = writer.private_writer.as_mut().unwrap();
+			let error = private.write(b"x").unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+			drop(reader);
+		}
+
+		/// A pipe with less than `PIPE_BUF` bytes free can still poll
+		/// writable (gVisor reports `POLLOUT` with one byte free), and a
+		/// blocking write of at most `PIPE_BUF` bytes then waits until all of
+		/// it fits. Nothing reads this pipe, so such a wait never ends:
+		/// `poll_write` must write at most the free space, or be `Pending`.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		#[test]
+		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_never_waits() {
+			let free = libc::PIPE_BUF - 1;
+			let (mut writer, reader) = pipe_with_free(free);
+			let buf = vec![b'x'; 2 * libc::PIPE_BUF];
+			let finished = deadline("poll_write with PIPE_BUF - 1 bytes free", Duration::from_secs(1));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), &buf);
+			drop(finished);
+			match wrote {
+				Poll::Pending => {},
+				Poll::Ready(Ok(n)) => {
+					assert!((1..=free).contains(&n), "wrote {n} with {free} bytes free");
+				},
+				Poll::Ready(Err(e)) => panic!("{e}"),
+			}
+			drop(reader);
+		}
+
+		/// The Darwin route is selectable on Linux: it moves the write to
+		/// Tokio's blocking pool, where the same full-pipe reproducer must
+		/// return Pending rather than hold a scheduler worker.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_through_blocking_pool_never_waits() {
+			force_blocking_pool_writes_for_test(true);
+			a_write_to_a_pipe_with_less_than_pipe_buf_free_never_waits();
+			force_blocking_pool_writes_for_test(false);
+		}
+
+		/// A full pipe whose reader left has no room, yet a write to it does
+		/// not wait: it fails with `EPIPE` at once, and must not poll again
+		/// forever for room that never comes.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		#[test]
+		fn a_write_to_a_full_pipe_whose_reader_left_fails_at_once() {
+			let (mut writer, reader) = pipe_with_free(0);
+			drop(reader);
+			let finished =
+				deadline("poll_write to a full pipe with no reader", Duration::from_secs(1));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(
+				matches!(&wrote, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe),
+				"{wrote:?}"
+			);
+		}
+
 		/// `exec 3</etc/passwd; echo foo >&3` (and the same on a pipe's read
 		/// end): writing in a direction the fd was not opened for fails at once
 		/// with EBADF, as in bash; readiness for it would never come.
@@ -1121,10 +1493,21 @@ mod tests {
 				panic!("a line is available");
 			};
 			assert_eq!(&buf[..n], b"typed\n");
-			assert!(
-				matches!(tty.poll_write(&mut cx, b"out\n"), Poll::Ready(Ok(4))),
-				"terminal output fits"
-			);
+			let mut write = tty.poll_write(&mut cx, b"out\n");
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				match write {
+					Poll::Ready(result) => {
+						assert_eq!(result.unwrap(), 4, "terminal output fits");
+						break;
+					},
+					Poll::Pending => {
+						flag.wait("terminal writer finished off the scheduler worker");
+						assert!(Instant::now() < deadline, "terminal writer stayed pending");
+						write = tty.poll_write(&mut cx, b"out\n");
+					},
+				}
+			}
 		}
 
 		/// A waker that records being woken.

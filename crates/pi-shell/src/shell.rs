@@ -1038,19 +1038,41 @@ async fn drain_dropped_files(slot: &VfsFs, cancel_token: &CancellationToken) -> 
 	}
 }
 
+/// How long a report of a failed close waits for room on the run's output
+/// pipe. A pipe nothing drains (a consumer that stopped reading) must not
+/// hold the run, whose own post-exit drain gives up on its readers.
+const CLOSE_FAILURE_REPORT_LIMIT: Duration = Duration::from_secs(2);
+
 /// A failed close lost data the command believed written: say so on the
-/// command's stderr and fail a command that otherwise succeeded.
-fn report_close_failure(
-	stderr: &mut fs::File,
+/// command's stderr and fail a command that otherwise succeeded. The status
+/// line is one `PIPE_BUF`-sized record: cancellation or the time bound leaves
+/// no partial line in output.
+async fn report_close_failure(
+	stderr: &mut crate::sys::StdFile,
 	err: &io::Error,
 	result: &mut std::result::Result<RunOutcome, SessionError>,
+	cancel_token: &CancellationToken,
 ) {
-	use std::io::Write as _;
-	let _ = writeln!(stderr, "pi-shell: closing a file failed: {err}");
 	if let Ok(outcome) = result
 		&& outcome.status == 0
 	{
 		outcome.status = 1;
+	}
+	let mut line = format!("pi-shell: closing a file failed: {err}\n");
+	let limit = crate::sys::WRITE_CHUNK;
+	if line.len() > limit {
+		let mut end = limit.saturating_sub(1);
+		while !line.is_char_boundary(end) {
+			end -= 1;
+		}
+		line.truncate(end);
+		line.push('\n');
+	}
+	let write = std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes()));
+	tokio::select! {
+		_ = write => {},
+		() = cancel_token.cancelled() => {},
+		() = time::sleep(CLOSE_FAILURE_REPORT_LIMIT) => {},
 	}
 }
 
@@ -1310,9 +1332,11 @@ async fn run_shell_command_once(
 	let stdout_file = writer_file
 		.try_clone()
 		.map_err(|err| Error::msg(format!("Failed to clone pipe: {err}")))?;
-	let mut diagnostics = writer_file
-		.try_clone()
-		.map_err(|err| Error::msg(format!("Failed to clone pipe: {err}")))?;
+	let mut diagnostics = crate::sys::StdFile::new(
+		writer_file
+			.try_clone()
+			.map_err(|err| Error::msg(format!("Failed to clone pipe: {err}")))?,
+	);
 	let stdio =
 		RunStdio { stdin: Some(null_file()?), stdout: Some(stdout_file), stderr: Some(writer_file) };
 	// Only a buffered capture can be minimized, so only it asks for the report.
@@ -1367,7 +1391,7 @@ async fn run_shell_command_once(
 	}
 
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
-		report_close_failure(&mut diagnostics, &err, &mut result);
+		report_close_failure(&mut diagnostics, &err, &mut result, &cancel_token).await;
 	}
 	// Release the extra writer so the reader can reach EOF.
 	drop(diagnostics);
@@ -1460,9 +1484,11 @@ async fn run_shell_command_streams_in_filesystem(
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
 	let (stderr_reader, stderr_writer) = pipe_to_files("stderr")?;
 
-	let mut diagnostics = stderr_writer
-		.try_clone()
-		.map_err(|err| Error::msg(format!("Failed to clone pipe: {err}")))?;
+	let mut diagnostics = crate::sys::StdFile::new(
+		stderr_writer
+			.try_clone()
+			.map_err(|err| Error::msg(format!("Failed to clone pipe: {err}")))?,
+	);
 	let stdio = RunStdio {
 		stdin:  Some(null_file()?),
 		stdout: Some(stdout_writer),
@@ -1506,7 +1532,7 @@ async fn run_shell_command_streams_in_filesystem(
 	}
 
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
-		report_close_failure(&mut diagnostics, &err, &mut result);
+		report_close_failure(&mut diagnostics, &err, &mut result, &cancel_token).await;
 	}
 	// Release the extra writer so the stderr reader can reach EOF.
 	drop(diagnostics);

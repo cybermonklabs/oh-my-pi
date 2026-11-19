@@ -41,6 +41,11 @@ pub mod rlimit;
 pub mod shebang;
 mod spawn;
 
+#[cfg(test)]
+pub(crate) use fs::force_blocking_pool_writes_for_test;
+#[cfg(unix)]
+pub(crate) use ready::WRITE_CHUNK;
+
 pub use crate::sys::{
 	fs::{StdFile, StdFs, std_stream},
 	park::Parker,

@@ -718,14 +718,20 @@ impl File {
 
 	pub async fn write_async(&self, buf: &[u8]) -> io::Result<usize> {
 		match &self.repr {
-			Repr::Native(file) => host(file).write(buf),
+			Repr::Native(file) => {
+				let (file, bytes) = (file.try_clone()?, buf.to_vec());
+				offload(move || host(&file).write(&bytes)).await
+			},
 			Repr::Virtual(shared) => shared.guard(shared.handle().write(buf)).await,
 		}
 	}
 
 	pub async fn write_all_async(&self, buf: &[u8]) -> io::Result<()> {
 		match &self.repr {
-			Repr::Native(file) => host(file).write_all(buf),
+			Repr::Native(file) => {
+				let (file, bytes) = (file.try_clone()?, buf.to_vec());
+				offload(move || host(&file).write_all(&bytes)).await
+			},
 			Repr::Virtual(shared) => shared.guard(write_all_handle(shared.handle(), buf)).await,
 		}
 	}

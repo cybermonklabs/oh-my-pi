@@ -2033,13 +2033,6 @@ impl Opened {
 	}
 }
 
-/// Writes `text` to the descriptor `file` when it is open, ignoring failures:
-/// the diagnostics of an invocation that ends before it has a [`Host`].
-fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
-	if let Some(file) = file {
-		let _ = file.clone().write_fmt(text);
-	}
-}
 
 /// Drives a utility from raw arguments to an exit status.
 ///
@@ -2047,7 +2040,7 @@ fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
 pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_sync::<U>();
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U>(invocation, spec) {
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
 			Err(code) => return code,
 		};
@@ -2072,7 +2065,7 @@ pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 pub(crate) async fn run_async_utility<U: AsyncUtility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_async::<U>();
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U>(invocation, spec) {
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
 			Err(code) => return code,
 		};
@@ -2099,7 +2092,7 @@ struct Prepared<P> {
 /// Rewrites and parses `argv` and builds the host. `Err` carries the exit
 /// status when the invocation ends early (usage error, `--help`, host
 /// failure).
-fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
+async fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
 	let mut invocation = invocation.open(spec.name);
 	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 	let [_, stdout, stderr] = &invocation.stdio;
@@ -2107,28 +2100,27 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 	let argv = match (spec.rewrite_argv)(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
-			write_to(stderr.as_ref(), format_args!("{}: {message}\n", spec.name));
+			report_async(stderr.clone(), format!("{}: {message}\n", spec.name)).await;
 			return Err(spec.usage_error.into());
 		},
 	};
-
 	let parsed = match P::try_parse_from(&argv) {
 		Ok(parsed) => parsed,
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
 			if err.use_stderr() {
-				write_to(stderr.as_ref(), format_args!("{err}"));
+				report_async(stderr.clone(), err.to_string()).await;
 				return Err(spec.usage_error.into());
 			}
-			write_to(stdout.as_ref(), format_args!("{err}"));
+			report_async(stdout.clone(), err.to_string()).await;
 			return Err(0);
 		},
 	};
 
 	let runner = invocation.commands.take().filter(|_| spec.runs_commands);
 	let cancel = invocation.cancel.clone();
-	let mut host = build_host(invocation, spec)?;
+	let mut host = build_host(invocation, spec).await?;
 	let cancel_flag = host.cancel_flag();
 	let cancel_on_drop = CancelOnDrop(Arc::clone(&cancel_flag));
 	let commands = runner.map(|runner| {
@@ -2259,7 +2251,7 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 /// All output the body left pending is delivered before the status is
 /// settled, so a closed reader still ends it with [`SIGPIPE_EXIT_CODE`]; a
 /// cancelled command delivers nothing more.
-async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
+pub(crate) async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 	let outcome = {
 		let body = AssertUnwindSafe(async { parsed.run(host).await }).catch_unwind();
 		let mut body = pin!(body);
@@ -2319,7 +2311,7 @@ fn settle(name: &str, outcome: std::thread::Result<i32>, host: &mut Host) -> i32
 /// environment into an owned [`Host`] that can move to a blocking thread.
 /// `Err` carries the exit status when a closed descriptor cannot be backed by
 /// the null device.
-fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
+async fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
@@ -2331,7 +2323,7 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 			if let Ok(stderr_file) = &stderr_file
 				&& let Some(error) = stdin.err().or(stdout.err())
 			{
-				write_to(Some(stderr_file), format_args!("{invoked}: {error}\n"));
+				report_async(Some(stderr_file.clone()), format!("{invoked}: {error}\n")).await;
 			}
 			return Err(1);
 		},
@@ -2771,9 +2763,10 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AsyncStreams, AsyncUtility, AtomicBool, CommandCancel, GuardedStream, HashMap, Host, OpenFile,
-		OsString, PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Spec, Stdin, StreamWriter, Utility, Write,
-		async_out_for, io, openfile, output_handle, run_caught, run_caught_async,
+		Arc, AsyncStreams, AsyncUtility, AtomicBool, CommandCancel, Fd, GuardedStream, HashMap, Host,
+		Invocation, OpenFile, OsString, PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Spec, Stdin,
+		StreamWriter, Utility, Write, async_out_for, io, openfile, output_handle, run_async_utility,
+		run_caught, run_caught_async, run_utility,
 	};
 
 	/// Captured in-memory output from [`Host::for_test`].
@@ -3786,6 +3779,115 @@ mod testing {
 		}
 	}
 
+
+	/// `--help` is rendered before a Host exists. It must yield to a reader
+	/// when stdout is the full capture pipe; the old `write_to` called
+	/// `write_fmt` directly on this runtime worker and never reached that
+	/// reader.
+	#[cfg(unix)]
+	#[test]
+	fn help_to_a_full_output_pipe_yields_to_the_reader() {
+		use std::{
+			os::fd::{AsRawFd, OwnedFd},
+			sync::mpsc::channel,
+			time::Duration,
+		};
+
+		let (reader, writer) = std::io::pipe().unwrap();
+		let mut writer = std::fs::File::from(OwnedFd::from(writer));
+		// SAFETY: F_GETPIPE_SZ takes no argument; `writer` owns this fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		writer.write_all(&vec![b'x'; capacity]).unwrap();
+		let mut invocation = Invocation::new(
+			vec!["cat".into(), "--help".into()],
+			std::env::temp_dir(),
+			pi_vfs::Fs::native(),
+		);
+		invocation.stdio[1] = Fd::from(writer);
+		let (done, finished) = channel();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let result = runtime.block_on(async {
+				let run = run_utility::<crate::cat::Cat>(invocation);
+				let drain = async {
+					tokio::time::sleep(Duration::from_millis(100)).await;
+					let mut reader = std::fs::File::from(OwnedFd::from(reader));
+					reader.read_exact(&mut vec![0; capacity]).unwrap();
+				};
+				let (status, ()) = tokio::join!(run, drain);
+				status
+			});
+			let _ = done.send(result);
+		});
+		assert_eq!(
+			finished.recv_timeout(Duration::from_secs(5)).expect("DEADLINE fired: help did not return"),
+			0
+		);
+	}
+
+	/// An async utility writing a full stdout pipe must yield its one-worker
+	/// runtime to the reader. This drives the real utility adapter, rather
+	/// than a test Host, so it covers rg's explicit buffering flags.
+	#[cfg(unix)]
+	fn async_utility_to_a_full_stdout_pipe_yields<U: AsyncUtility>(argv: Vec<String>, cwd: PathBuf) {
+		use std::{
+			os::fd::{AsRawFd, OwnedFd},
+			sync::mpsc::channel,
+			time::Duration,
+		};
+
+		let (reader, writer) = std::io::pipe().unwrap();
+		let mut writer = std::fs::File::from(OwnedFd::from(writer));
+		// SAFETY: F_GETPIPE_SZ takes no argument; `writer` owns this fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		writer.write_all(&vec![b'x'; capacity]).unwrap();
+		let mut invocation = Invocation::new(argv, cwd, pi_vfs::Fs::native());
+		invocation.stdio[1] = Fd::from(writer);
+		let (done, finished) = channel();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let result = runtime.block_on(async {
+				let run = run_async_utility::<U>(invocation);
+				let drain = async {
+					tokio::time::sleep(Duration::from_millis(100)).await;
+					let mut reader = std::fs::File::from(OwnedFd::from(reader));
+					reader.read_exact(&mut vec![0; capacity]).unwrap();
+					reader
+				};
+				let (status, _reader) = tokio::join!(run, drain);
+				status
+			});
+			let _ = done.send(result);
+		});
+		assert_eq!(
+			finished.recv_timeout(Duration::from_secs(5)).expect("DEADLINE fired: async utility did not return"),
+			0
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn rg_line_buffered_to_a_full_output_pipe_yields_to_the_reader() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "hit\n").unwrap();
+		async_utility_to_a_full_stdout_pipe_yields::<crate::rg::Rg>(
+			vec!["rg".into(), "--line-buffered".into(), "hit".into(), "f".into()],
+			tree.path().to_path_buf(),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn rg_no_line_buffered_to_a_full_output_pipe_yields_to_the_reader() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "hit\n").unwrap();
+		async_utility_to_a_full_stdout_pipe_yields::<crate::rg::Rg>(
+			vec!["rg".into(), "--no-line-buffered".into(), "hit".into(), "f".into()],
+			tree.path().to_path_buf(),
+		);
+	}
 	#[cfg(unix)]
 	mod sigpipe {
 		use std::ffi::OsString;

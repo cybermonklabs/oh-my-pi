@@ -368,6 +368,186 @@ fn async_utility_waiting_on_stdin_is_cancelled_by_timeout() {
 	assert_eq!((result.exit_code, output.as_str()), (Some(124), ""));
 }
 
+/// A builtin keeps writing to the output pipe while nothing drains it (the
+/// output channel is bounded and never read), so the pipe fills. The run
+/// must still end at its timeout: a write that waits in the kernel for room
+/// would hold the runtime's only worker, and then neither the timeout nor
+/// the end of the run could come. The bound runs on this thread.
+#[cfg(unix)]
+#[test]
+fn a_builtin_writing_to_a_full_output_pipe_still_times_out() {
+	const BOUND: Duration = Duration::from_secs(10);
+	let _guard = shell_test_lock().blocking_lock();
+	let (chunks, undrained) = flume::bounded::<String>(1);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let options = ShellExecuteOptions {
+			command: "while :; do echo 0123456789abcdefghi; done".to_string(),
+			timeout_ms: Some(1000),
+			..Default::default()
+		};
+		let _ = tx.send(runtime.block_on(execute_shell(
+			options,
+			Some(chunks),
+			CancelToken::new(Some(1000)),
+		)));
+	});
+	let result = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within {BOUND:?}"))
+		.expect("execute_shell");
+	drop(undrained);
+	assert!(result.timed_out, "{result:?}");
+}
+
+/// The Darwin blocking-pool route is selectable on Linux too. The same
+/// one-worker output-pipe run must reach its native timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_builtin_writing_to_a_full_output_pipe_through_blocking_pool_still_times_out() {
+	crate::sys::force_blocking_pool_writes_for_test(true);
+	a_builtin_writing_to_a_full_output_pipe_still_times_out();
+	crate::sys::force_blocking_pool_writes_for_test(false);
+}
+
+/// An external command that floods stdout while nothing drains the output
+/// pipe must not leave a zombie. The fix prevents the write from blocking
+/// the runtime; without it, `UnixProc::drop` → `reap` → `waitpid`
+/// (`crates/pi-shell/src/sys/spawn/unix.rs:1315-1370`) is never reached
+/// because the future holding `UnixProc` cannot be polled.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie() {
+	const BOUND: Duration = Duration::from_secs(15);
+	let _guard = shell_test_lock().blocking_lock();
+	let (chunks, undrained) = flume::bounded::<String>(1);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let options = ShellExecuteOptions {
+			command: "yes 0123456789abcdefghijklmnopqrstuvwxyz".to_string(),
+			timeout_ms: Some(2000),
+			..Default::default()
+		};
+		let result =
+			runtime.block_on(execute_shell(options, Some(chunks), CancelToken::new(Some(2000))));
+		// Let the runtime clean up externals before we check for zombies.
+		runtime.shutdown_timeout(Duration::from_secs(3));
+		let _ = tx.send(result);
+	});
+	let result = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within {BOUND:?}"))
+		.expect("execute_shell");
+	drop(undrained);
+	assert!(result.timed_out, "{result:?}");
+	// After cleanup, no child of this process should be a zombie.
+	// /proc/PID/task/TID/children lists direct children; a zombie has
+	// state Z in /proc/PID/stat.
+	std::thread::sleep(Duration::from_millis(500));
+	let pid = std::process::id();
+	let children_path = format!("/proc/{pid}/task/{pid}/children");
+	let zombies: Vec<u32> = std::fs::read_to_string(&children_path)
+		.unwrap_or_default()
+		.split_whitespace()
+		.filter_map(|s| s.parse::<u32>().ok())
+		.filter(|&child| {
+			std::fs::read_to_string(format!("/proc/{child}/stat"))
+				.ok()
+				.and_then(|stat| {
+					let rest = stat.rsplit_once(')')?.1;
+					rest.trim_start().starts_with('Z').then_some(())
+				})
+				.is_some()
+		})
+		.collect();
+	assert!(zombies.is_empty(), "children left as zombies: {zombies:?}");
+}
+
+/// Runs the zombie control through the portable Darwin blocking-pool route.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_external_flooding_a_full_output_pipe_through_blocking_pool_is_reaped() {
+	crate::sys::force_blocking_pool_writes_for_test(true);
+	an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie();
+	crate::sys::force_blocking_pool_writes_for_test(false);
+}
+
+/// A run that succeeded, as a failed close finds it.
+#[cfg(unix)]
+fn succeeded() -> RunOutcome {
+	RunOutcome { status: 0, cancelled: false, exited: false, cwd: BString::default() }
+}
+
+/// A failed close is said on the command's stderr and fails the command.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_close_failure_is_reported_on_stderr_and_fails_the_command() {
+	use std::io::Read as _;
+
+	let (mut reader, writer) = pipe_to_files("output").expect("pipe");
+	let mut stderr = crate::sys::StdFile::new(writer);
+	let mut result = Ok(succeeded());
+	let err = io::Error::other("lost");
+	report_close_failure(&mut stderr, &err, &mut result, &CancellationToken::new()).await;
+	drop(stderr);
+	let mut said = String::new();
+	reader.read_to_string(&mut said).expect("read the report");
+	assert_eq!(said, "pi-shell: closing a file failed: lost\n");
+	assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
+}
+
+/// The report of a failed close goes to the run's output pipe. With that
+/// pipe full and nothing draining it, the report must give up at its limit:
+/// a write that waited in the kernel would hold the runtime's only worker
+/// for good. The bound runs on this thread.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_close_failure_report_to_a_full_output_pipe_gives_up_at_its_limit() {
+	use std::{io::Write as _, os::fd::AsRawFd};
+
+	const BOUND: Duration = Duration::from_secs(10);
+	let (reader, writer) = pipe_to_files("output").expect("pipe");
+	// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+	let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+	let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+	(&writer)
+		.write_all(&vec![b'q'; capacity])
+		.expect("fill the pipe");
+	let mut stderr = crate::sys::StdFile::new(writer);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let mut result = Ok(succeeded());
+		let err = io::Error::other("lost");
+		runtime.block_on(report_close_failure(
+			&mut stderr,
+			&err,
+			&mut result,
+			&CancellationToken::new(),
+		));
+		let _ = tx.send(result.map(|outcome| outcome.status).ok());
+	});
+	let status = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the report did not return within {BOUND:?}"));
+	assert_eq!(status, Some(1));
+	drop(reader);
+}
+
 #[cfg(unix)]
 #[test]
 fn read_process_substitution_assigns_line() {

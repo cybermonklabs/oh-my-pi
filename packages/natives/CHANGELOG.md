@@ -9,6 +9,7 @@
 ### Fixed
 
 - Fixed associative arrays slowing down quadratically as they grow: 100,000 inserts and lookups took about 90 seconds and now take about a tenth of a second
+- Fixed the bash tool's shell freezing for good under gVisor (GKE Sandbox) once a command's output filled its pipe, with every later bash and grep call hanging: a pipe there reports room with one byte free, and the shell's write of up to 4 KiB then waited in the kernel on a thread the rest of the shell needs. The shell now writes no more than the pipe has free
 ### Fixed
 
 - Fixed `el.type` and `el.press(keys)` on Wayland moving focus inside the element's app (GNOME showed "… is ready") before refusing the call: they are now refused before anything reaches the app ([#17915](https://github.com/can1357/oh-my-pi/pull/17915) by [@will-bogusz](https://github.com/will-bogusz))
