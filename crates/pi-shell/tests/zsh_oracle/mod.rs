@@ -21,8 +21,7 @@ use std::{
 	sync::{Mutex, PoisonError},
 };
 
-/// The real zsh: `$PI_TEST_REAL_ZSH`, or `/bin/zsh`. (`PI_TEST_*` reaches
-/// the tests through `bun run test:rs`, which drops other `PI_*` names.)
+/// The real zsh: `$PI_TEST_REAL_ZSH`, or `/bin/zsh`.
 #[must_use]
 pub fn path() -> PathBuf {
 	std::env::var_os("PI_TEST_REAL_ZSH")
@@ -60,18 +59,23 @@ pub fn is_zsh_5_9() -> bool {
 /// The file of the function `name` in the real zsh's own `$fpath` (`zsh
 /// -f`), the first directory that has one, wherever this machine installed
 /// zsh's functions. `None`, the calling test reported [`uncompared`], when
-/// the real zsh is missing or its `$fpath` has no such file.
+/// the real zsh is missing, cannot list its `$fpath`, or has no such file.
 #[must_use]
 pub fn function_file(name: &str) -> Option<PathBuf> {
 	if !exists() {
 		return None;
 	}
 	let zsh = path();
-	let listed = Command::new(&zsh)
+	let listed = match Command::new(&zsh)
 		.args(["-f", "-c", "print -rl -- $fpath"])
 		.output()
-		.map(|out| out.stdout)
-		.unwrap_or_default();
+	{
+		Ok(out) => out.stdout,
+		Err(e) => {
+			uncompared(&format!("{} could not list its $fpath: {e}", zsh.display()));
+			return None;
+		},
+	};
 	let found = String::from_utf8_lossy(&listed)
 		.lines()
 		.map(|dir| Path::new(dir).join(name))
