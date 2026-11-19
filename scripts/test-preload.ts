@@ -14,9 +14,11 @@
  * config root (`OMP_CONFIG_ROOT`), with the agent directory and mnemopi's state in it, is an
  * empty directory of this process's own; only the version-fixed downloads stay in the
  * developer's `~/.omp` (`OMP_DOWNLOAD_ROOT`). git and jj read configuration of the root's own
- * instead of the home's (no identity, no signing). When the first `git` on PATH is a wrapper
- * (a dotfiles or version-manager shim), a directory holding only the real `git` goes first on
- * PATH. `scripts/test-env.ts` says which names, which wrappers and why.
+ * instead of the home's (no identity, no signing). The directory of the Bun the process runs on
+ * goes first on PATH, so a child that runs `bun` by name never runs a version manager's shim,
+ * which fails in a home of a test's own; and when the first `git` on PATH is a wrapper (a
+ * dotfiles or version-manager shim), a directory holding only the real `git` goes before it.
+ * `scripts/test-env.ts` says which names, which wrappers and why.
  * A marked process does not read the home `.env` or `~/.omp/.env` either
  * (`packages/utils/src/env.ts`), which would put those names back. A test that needs one of
  * them sets its own value; a test that gives a child a home of its own and wants omp to use
@@ -37,7 +39,8 @@
  *   leaves.
  * A call that builds its `env` from nothing, or that removes the marker to run a child as
  * production, still decides for itself, and must keep the developer's broker variables,
- * `OTEL_*` collector and home directory from that child.
+ * `OTEL_*` collector and home directory from that child: `createProductionChildEnv` in
+ * `scripts/test-env.ts` builds that environment.
  */
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { createTestChildEnv } from "./test-env";
@@ -99,8 +102,9 @@ function openLibc(library: string) {
 }
 
 // The environment every test process starts with (scripts/test-env.ts): the machine's names
-// removed, omp directories and git and jj configuration of its own, the real git first on PATH,
-// and the test-runtime marker. Each change goes into the C environment and `process.env`.
+// removed, omp directories and git and jj configuration of its own, this Bun's directory and the
+// real git first on PATH, and the test-runtime marker. Each change goes into the C environment
+// and `process.env`.
 const testEnv = createTestChildEnv(process.env);
 for (const name of Object.keys(process.env)) {
 	if (name in testEnv) continue;

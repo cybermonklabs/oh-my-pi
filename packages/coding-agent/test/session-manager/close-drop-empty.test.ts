@@ -7,6 +7,7 @@ import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-st
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { isEnoent, TempDir } from "@oh-my-pi/pi-utils";
 import { UnleasedSessionStorage } from "../helpers/unleased-session-storage";
+import { createProductionChildEnv } from "../../../../scripts/test-env";
 
 async function fileExists(p: string): Promise<boolean> {
 	try {
@@ -165,7 +166,7 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 			],
 			{
 				cwd: path.resolve(import.meta.dir, "../../../.."),
-				env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
+				env: createProductionChildEnv({ PATH: process.env.PATH }),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "ignore",

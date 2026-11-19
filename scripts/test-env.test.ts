@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	createProductionChildEnv,
 	createTestPath,
 	isMachineEnvName,
 	type PathProbe,
@@ -506,6 +507,166 @@ describe("test environment", () => {
 	}, 20_000);
 
 	it.skipIf(process.platform === "win32")(
+		"starts a production child without the marker or the machine, in an empty home, with the real tools",
+		() => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-production-child-"));
+			try {
+				// Version-manager wrappers first, as on a developer's PATH, each recording its calls and
+				// failing; past them the machine's own node (a stand-in here) and git.
+				const shims = path.join(dir, "shims");
+				const calls = path.join(dir, "calls");
+				writeRefusingGit(shims, calls);
+				for (const tool of ["node", "bun"]) {
+					fs.writeFileSync(path.join(shims, tool), `#!/bin/sh\necho "$0 $*" >> '${calls}'\nexit 1\n`, {
+						mode: 0o755,
+					});
+				}
+				const tools = path.join(dir, "tools");
+				fs.mkdirSync(tools);
+				fs.writeFileSync(path.join(tools, "node"), "#!/bin/sh\necho real-node\n", { mode: 0o755 });
+				const searchPath = [shims, tools, process.env.PATH].join(path.delimiter);
+
+				const env = createProductionChildEnv({
+					...process.env,
+					PATH: searchPath,
+					PI_TEST_RUNTIME: "1",
+					OMP_AUTH_BROKER_TOKEN: "broker-token-not-a-secret",
+				});
+				const child = Bun.spawnSync(
+					["/bin/sh", "-c", "command -v git; command -v node; command -v bun; git --version; node; bun --version"],
+					{ env, stdout: "pipe", stderr: "pipe" },
+				);
+
+				expect({ exitCode: child.exitCode, stderr: child.stderr.toString() }).toEqual({ exitCode: 0, stderr: "" });
+				const [git, node, bun, ...versions] = child.stdout.toString().trim().split("\n");
+				const realGit = Bun.which("git", { PATH: process.env.PATH }) ?? "no git on this PATH";
+				expect({
+					wrapperCalls: fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").split("\n").filter(Boolean) : [],
+					git: fs.realpathSync(git),
+					node: fs.realpathSync(node),
+					bun: fs.realpathSync(bun),
+					versions,
+				}).toEqual({
+					wrapperCalls: [],
+					git: fs.realpathSync(realGit),
+					node: path.join(fs.realpathSync(tools), "node"),
+					bun: fs.realpathSync(process.execPath),
+					versions: [
+						Bun.spawnSync([realGit, "--version"], { stdout: "pipe" }).stdout.toString().trim(),
+						"real-node",
+						Bun.version,
+					],
+				});
+				// No marker, no machine name, none of this process's omp directories; a home of its own.
+				expect(Object.keys(env).filter(name => name === "PI_TEST_RUNTIME" || isMachineEnvName(name))).toEqual([]);
+				expect(env.HOME).not.toBe(os.homedir());
+				expect(fs.readdirSync(env.HOME!)).toEqual([]);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"gives a production child the node its wrapper runs when no real node follows it",
+		() => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-production-node-"));
+			try {
+				// A shim as mise's behaves on a login PATH: it answers in this process's home and fails in
+				// a home of the child's own. The node it names is on no PATH.
+				const shims = path.join(dir, "shims");
+				const installs = path.join(dir, "installs");
+				const calls = path.join(dir, "calls");
+				fs.mkdirSync(shims);
+				fs.mkdirSync(installs);
+				const realNode = path.join(fs.realpathSync(installs), "node");
+				fs.writeFileSync(realNode, "#!/bin/sh\necho real-node\n", { mode: 0o755 });
+				const shim = path.join(shims, "node");
+				fs.writeFileSync(
+					shim,
+					`#!/bin/sh\nif [ "$HOME" = '${os.homedir()}' ] && [ "$1 $2" = "-p process.execPath" ]; then echo '${realNode}'; exit 0; fi\necho "$0 $*" >> '${calls}'\nexit 1\n`,
+					{ mode: 0o755 },
+				);
+				// Besides the shim, only git: no real node follows it.
+				const gitOnly = path.join(dir, "git-only");
+				fs.mkdirSync(gitOnly);
+				fs.symlinkSync(fs.realpathSync(Bun.which("git") ?? "no git on this PATH"), path.join(gitOnly, "git"));
+				const searchPath = [shims, gitOnly].join(path.delimiter);
+
+				const env = createProductionChildEnv({ PATH: searchPath });
+				const child = Bun.spawnSync(["/bin/sh", "-c", "command -v node; node"], {
+					env,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				// The control: the same child with PATH as it was runs the shim, which fails in its home.
+				const control = Bun.spawnSync(["/bin/sh", "-c", "node"], { env: { ...env, PATH: searchPath } });
+
+				expect({ exitCode: child.exitCode, stderr: child.stderr.toString() }).toEqual({ exitCode: 0, stderr: "" });
+				const [node, output] = child.stdout.toString().trim().split("\n");
+				expect({ node: fs.realpathSync(node ?? ""), output }).toEqual({ node: realNode, output: "real-node" });
+				expect(control.exitCode).toBe(1);
+				// The child never ran the shim; the control did, once.
+				expect(fs.readFileSync(calls, "utf8").split("\n").filter(Boolean)).toEqual([`${shim} `]);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"starts an RPC child with a home of its own when the first bun on PATH is a shim that fails there",
+		async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-rpc-bun-"));
+			try {
+				// A shim as mise's is in a home it has no version for: it refuses every call.
+				const shims = path.join(dir, "shims");
+				const calls = path.join(dir, "calls");
+				fs.mkdirSync(shims);
+				fs.writeFileSync(
+					path.join(shims, "bun"),
+					`#!/bin/sh\necho "$0 $*" >> '${calls}'\necho "No version is set for shim: bun" >&2\nexit 1\n`,
+					{ mode: 0o755 },
+				);
+				const home = path.join(dir, "home");
+				fs.mkdirSync(home);
+				// As a test starts one: RpcClient runs `bun <cli>` by name, here the mock RPC agent.
+				const script = [
+					`const { RpcClient } = await import(${JSON.stringify(path.join(REPO_ROOT, "packages/coding-agent/src/modes/rpc/rpc-client.ts"))});`,
+					`const client = new RpcClient({ cliPath: ${JSON.stringify(path.join(REPO_ROOT, "packages/coding-agent/test/fixtures/mock-rpc-agent.ts"))}, cwd: ${JSON.stringify(home)}, env: { HOME: ${JSON.stringify(home)}, USERPROFILE: ${JSON.stringify(home)} } });`,
+					"let started;",
+					"try { await client.start(); started = 'started'; } catch (error) { started = String(error?.message ?? error).split('\\n')[0]; }",
+					"await client.stop();",
+					"process.stdout.write(JSON.stringify({ started, bun: Bun.which('bun') }));",
+				].join("\n");
+
+				const result = await probe<{ started: string; bun: string | null }>(preloadedEval(script), {
+					cwd: REPO_ROOT,
+					env: { ...process.env, PATH: `${shims}${path.delimiter}${process.env.PATH}` },
+				});
+
+				expect(result).toEqual({ started: "started", bun: path.join(path.dirname(process.execPath), "bun") });
+				expect(fs.existsSync(calls)).toBe(false);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
+	it("removes the production child's home when the process that made it exits", () => {
+		const script = `import { createProductionChildEnv } from ${JSON.stringify(path.join(import.meta.dir, "test-env.ts"))};\nprocess.stdout.write(createProductionChildEnv().HOME);`;
+		const child = Bun.spawnSync([process.execPath, "--no-install", "--no-env-file", "--eval", script], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect({ exitCode: child.exitCode, stderr: child.stderr.toString() }).toEqual({ exitCode: 0, stderr: "" });
+		const home = child.stdout.toString();
+		expect(home.startsWith(path.join(os.tmpdir(), "omp-test-home-"))).toBe(true);
+		expect(fs.existsSync(home)).toBe(false);
+	});
+
+	it.skipIf(process.platform === "win32")(
 		"runs the real git in a test and its children, not a wrapper first on PATH",
 		async () => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-git-wrapper-"));
@@ -524,10 +685,14 @@ describe("test environment", () => {
 				const version = Bun.spawnSync(["git", "--version"], { stdout: "pipe" }).stdout.toString().trim();
 				expect(version).toMatch(/^git version /);
 				expect(result.versions).toEqual({ defaultEnv: version, homeEnv: version, nodeChild: version });
-				// One directory of the child's own went first, holding the git it ran; every entry
-				// of the PATH it was given follows, in order, and native children see the same PATH.
-				const [first, ...rest] = result.processPath.split(path.delimiter);
-				expect(rest.join(path.delimiter)).toBe(searchPath);
+				// One directory of the child's own went first, holding the git it ran; then the
+				// directory of the Bun it runs on; then every entry of the PATH it was given, in order.
+				// Native children see the same PATH.
+				const [first, bunDirectory, ...rest] = result.processPath.split(path.delimiter);
+				expect({ bunDirectory, rest: rest.join(path.delimiter) }).toEqual({
+					bunDirectory: path.dirname(process.execPath),
+					rest: searchPath,
+				});
 				expect(result.which).toBe(path.join(first, "git"));
 				expect(result.cPath).toBe(result.processPath);
 			} finally {
@@ -538,7 +703,7 @@ describe("test environment", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
-		"finds the real git past each kind of wrapper and changes nothing else",
+		"finds the real git past each kind of wrapper, puts this Bun's directory first, and changes nothing else",
 		() => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-git-path-"));
 			const made = [dir];
@@ -555,14 +720,21 @@ describe("test environment", () => {
 
 				const testPath = createTestPath(searchPath);
 
-				const [first, ...rest] = (testPath ?? "").split(path.delimiter);
+				const [first, bunDirectory, ...rest] = (testPath ?? "").split(path.delimiter);
 				if (testPath !== undefined) made.push(first);
-				expect(rest.join(path.delimiter)).toBe(searchPath);
+				expect({ bunDirectory, rest: rest.join(path.delimiter) }).toEqual({
+					bunDirectory: path.dirname(process.execPath),
+					rest: searchPath,
+				});
 				// The developer's own PATH may wrap jj too; its link then sits beside git's.
 				expect(fs.readdirSync(first).filter(name => name !== "jj")).toEqual(["git"]);
 				expect(fs.realpathSync(path.join(first, "git"))).toBe(realGit);
-				// A PATH whose first git is already the real one stays as it is.
-				expect(createTestPath(`${path.dirname(realGit)}${path.delimiter}${searchPath}`)).toBeUndefined();
+				// A PATH whose first git is already the real one gets the Bun directory alone, and one
+				// that starts with that directory too stays as it is.
+				const realGitFirst = `${path.dirname(realGit)}${path.delimiter}${searchPath}`;
+				const bunFirst = `${path.dirname(process.execPath)}${path.delimiter}${realGitFirst}`;
+				expect(createTestPath(realGitFirst)).toBe(bunFirst);
+				expect(createTestPath(bunFirst)).toBeUndefined();
 			} finally {
 				for (const madeDir of made) fs.rmSync(madeDir, { recursive: true, force: true });
 			}
@@ -655,6 +827,30 @@ describe("test environment", () => {
 			kind: "launcher",
 			file: "C:\\Users\\dev\\scoop\\apps\\jj\\current\\jj.exe",
 		});
+		// node with no real one past mise's shim, as on a login PATH: the shim is asked which node it
+		// runs. An answer that is itself a wrapper, or no answer, changes nothing.
+		const loginPath = "/home/dev/.mise/shims:/usr/bin";
+		const shimOnly = fakeProbe("linux", { "/home/dev/.mise/shims": ["node", "jj"], "/usr/bin": ["ls"] });
+		const answering = (answer: string | null): PathProbe => ({
+			...shimOnly,
+			ask: (wrapper, tool) => (wrapper === "/home/dev/.mise/shims/node" && tool === "node" ? answer : null),
+		});
+		expect(planTestPath(loginPath, "linux", answering("/home/dev/.mise/installs/node/22/bin/node"), "node")).toEqual({
+			kind: "link",
+			file: "/home/dev/.mise/installs/node/22/bin/node",
+		});
+		expect(planTestPath(loginPath, "linux", answering("/home/dev/.mise/shims/node"), "node")).toBeUndefined();
+		expect(planTestPath(loginPath, "linux", answering(null), "node")).toBeUndefined();
+		expect(planTestPath(loginPath, "linux", shimOnly, "node")).toBeUndefined();
+		// A real node past the shim is taken as git's is, and the shim is never asked.
+		const pastShim = fakeProbe("linux", { "/home/dev/.mise/shims": ["node"], "/usr/bin": ["node"] });
+		const neverAsked: PathProbe = {
+			...pastShim,
+			ask: () => {
+				throw new Error("asked a wrapper while a real node follows it");
+			},
+		};
+		expect(planTestPath(loginPath, "linux", neverAsked, "node")).toEqual({ kind: "link", file: "/usr/bin/node" });
 	});
 
 	it("writes a Windows launcher that passes its arguments and exit status on", () => {

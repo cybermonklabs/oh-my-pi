@@ -14,6 +14,7 @@ import {
 	stripGitRepoLocationEnv,
 	withOmpOtelEnv,
 } from "@oh-my-pi/pi-utils/env";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const tempDirs: string[] = [];
 
@@ -67,6 +68,10 @@ describe("getDbBusyTimeoutMs", () => {
 		}
 	});
 });
+/**
+ * What `isBunTestRuntime()` answers in a child started as production, in a home of its own, with
+ * `env` (the runner signals each case sets or removes) on top.
+ */
 async function runRuntimeProbe(
 	env: Record<string, string | undefined>,
 	probePath = runtimeProbePath,
@@ -74,7 +79,7 @@ async function runRuntimeProbe(
 	const cwd = path.dirname(writeTempEnv(""));
 	const proc = Bun.spawn([process.execPath, probePath], {
 		cwd,
-		env: { ...process.env, ...env },
+		env: { ...createProductionChildEnv(), ...env },
 		stdout: "pipe",
 		stderr: "pipe",
 	});

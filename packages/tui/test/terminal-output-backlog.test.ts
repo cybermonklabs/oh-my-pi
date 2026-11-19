@@ -11,6 +11,7 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { PtySession } from "@oh-my-pi/pi-natives";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const PROBE = path.join(import.meta.dir, "fixtures/tty-backlog-probe.ts");
 
@@ -24,8 +25,10 @@ describe.skipIf(process.platform === "win32")("ProcessTerminal output backlog ov
 				args: [PROBE],
 				cwd: import.meta.dir,
 				// The probe must not look like a test child, or the pump it
-				// measures is never built (`isBunTestRuntime`).
-				env: { ...process.env, PI_TEST_RUNTIME: "0", NODE_ENV: "", BUN_ENV: "" },
+				// measures is never built (`isBunTestRuntime`): it runs as
+				// production, in a home of its own. A PtySession lays `env`
+				// over this process's environment, so the marker is overridden.
+				env: { ...createProductionChildEnv(), PI_TEST_RUNTIME: "0", NODE_ENV: "", BUN_ENV: "" },
 				cols: 100,
 				rows: 30,
 			},
