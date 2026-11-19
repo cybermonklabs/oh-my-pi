@@ -183,6 +183,8 @@ export interface StructuredSubagentRequest {
 	 * call — e.g. an async job body — take ownership of the returned
 	 * disposal closure and MUST eventually run it once the retained handle
 	 * is no longer needed, or the directory leaks for the process lifetime.
+	 * The closure removes the directory only once the cleanup the run left
+	 * going on (`ExecutorOptions.onCleanupDeferred`) is done.
 	 */
 	onArtifactsRetained?: (cleanup: () => Promise<void>) => void;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
@@ -1199,6 +1201,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				});
 			});
 		} else {
+			// The cleanup the run left going on may still write here (a failed
+			// isolated run's late release), so the artifacts go only after it.
+			const lateCleanup = deferredCleanup;
+			const removeArtifacts = lateCleanup ? () => lateCleanup.then(cleanupArtifacts) : cleanupArtifacts;
 			const shouldRetainArtifacts =
 				request.detached === true ||
 				retainSalvagedArtifact ||
@@ -1207,19 +1213,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 			const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 			if (shouldCleanup) {
-				if (deferredCleanup) {
-					trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
-						resource: "artifacts",
-						artifactsDir: lease.artifactsDir,
-					});
+				if (lateCleanup) {
+					trackLateCleanup(removeArtifacts(), { resource: "artifacts", artifactsDir: lease.artifactsDir });
 				} else {
-					await cleanupArtifacts();
+					await removeArtifacts();
 				}
 			} else if (lease.temporary && request.onArtifactsRetained) {
 				// Retained rather than cleaned up now: the caller (e.g. an async
 				// job body) owns disposing it once the retained handle is no
 				// longer needed, instead of it leaking for the process lifetime.
-				request.onArtifactsRetained(cleanupArtifacts);
+				request.onArtifactsRetained(removeArtifacts);
 			}
 		}
 	}

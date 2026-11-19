@@ -268,6 +268,11 @@ async function captureIsolationDelta(changes: RunChanges): Promise<IsolationDelt
 	return { delta, fingerprint: deltaFingerprint(delta.rootPatch, delta.nestedPatches) };
 }
 
+/** `${artifactsDir}/${agentId}.patch`: where an isolated run and its release write the root repo's patch. */
+function rootPatchPath(artifactsDir: string, agentId: string): string {
+	return path.join(artifactsDir, `${agentId}.patch`);
+}
+
 /**
  * Write every part of a captured delta to disk — the root patch and one file
  * per nested repo. Throws when any write fails so nothing captured is ever the
@@ -278,7 +283,7 @@ async function persistIsolationPatch(
 	artifactsDir: string,
 	agentId: string,
 ): Promise<IsolationPatchArtifacts> {
-	const patchPath = path.join(artifactsDir, `${agentId}.patch`);
+	const patchPath = rootPatchPath(artifactsDir, agentId);
 	await Bun.write(patchPath, delta.rootPatch);
 	const nestedPatchPaths = await persistNestedPatches(artifactsDir, agentId, delta.nestedPatches);
 	return {
@@ -485,15 +490,20 @@ function renderIsolationError(context: IsolationErrorContext): string {
  * transitions, then capture final changes and clean up on release. A release
  * that comes while the run is still ending (a refused adoption, a release as
  * the run finishes) waits for the run-end capture, so it never removes the
- * worktree that capture reads; a release that comes after the run's end
- * cleaned up itself (it found no release asked for and no adoption) captures
- * nothing. A release also waits for the cleanup the run deferred (owner jobs,
- * shutdown hooks), which may still write the worktree; a failed run's result
- * does not, and the caller's deferred cleanup then waits for that release
- * ({@link ExecutorOptions.onCleanupDeferred}). One-shot and failed startup
- * paths clean up in `finally`. If captured changes cannot be written to disk,
- * the workspace is retained under a unique `.retained-*` sibling and its path
- * is named in the resulting error.
+ * worktree that capture reads. A release that took the agent's adoption
+ * before the run's end calls the hook only once it has disposed the agent's
+ * session, and the run's end leaves the cleanup to it. A run's end that found
+ * no release asked for and no adoption takes the cleanup over: at once when no
+ * release is in flight, else once none is left, if none of them called the
+ * hook. A release called after that captures nothing. A release also waits for
+ * the cleanup the run deferred (owner jobs, shutdown hooks), which may still
+ * write the worktree. A failed run's end does not wait for it, so a release
+ * asked for before that end, which waits for it, goes on after the result; so
+ * does a release still in flight as any run ends. The caller's deferred
+ * cleanup waits for either ({@link ExecutorOptions.onCleanupDeferred}).
+ * One-shot and failed startup paths clean up in `finally`. If captured
+ * changes cannot be written to disk, the workspace is retained under a unique
+ * `.retained-*` sibling and its path is named in the resulting error.
  */
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
 	let changes: RunChanges | undefined;
@@ -507,7 +517,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	let retainWorkspace = false;
 	let baseReleasePromise: Promise<void> | undefined;
 	let cleanupPromise: Promise<void> | undefined;
-	/** The cleanup the run's end took over, having found no release asked for and no adoption of the agent. */
+	/**
+	 * The cleanup the run's end took over, having found no release asked for and no adoption, and no release in flight
+	 * or none that called the hook.
+	 */
 	let runEndCleanup: Promise<void> | undefined;
 	/** The run's IRC wake hold, released only once the run-end capture is done. */
 	let releaseIrcWakes: (() => void) | undefined;
@@ -522,6 +535,11 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		})();
 		return cleanupPromise;
 	};
+	/** The run's end takes the cleanup over ({@link runEndCleanup}), after the cleanup the run deferred. */
+	const takeCleanupOver = (): Promise<void> => {
+		runEndCleanup = deferredCleanup ? deferredCleanup.then(cleanupHandle) : cleanupHandle();
+		return runEndCleanup;
+	};
 	/**
 	 * Capture the run's delta and write all of it to disk for the caller, which then holds it ({@link handedOff}).
 	 * Throws when a write fails ({@link persistIsolationPatch}).
@@ -535,7 +553,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	/** A kept-alive run's final capture and cleanup, held until the run-end capture below is done with the worktree. */
 	const isolationRelease = releaseAfterRunEnd(
 		async () => {
-			// Asked for once the run's end had cleaned up itself: nothing is left to capture.
+			// Asked for after the run's end took the cleanup over: nothing is left to capture, only that cleanup to wait for.
 			if (runEndCleanup) return runEndCleanup;
 			// Owner jobs or shutdown hooks the run left going on may still write the worktree.
 			if (deferredCleanup) await deferredCleanup;
@@ -692,7 +710,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			// the artifacts), as every successful end writes one. The result
 			// does not name it, so the merge reads the branch alone, and a record
 			// that cannot be written loses no work.
-			const patchPath = path.join(opts.artifactsDir, `${opts.agentId}.patch`);
+			const patchPath = rootPatchPath(opts.artifactsDir, opts.agentId);
 			try {
 				await Bun.write(patchPath, commitResult?.rootPatch ?? "");
 				AgentRegistry.global().setHistory(opts.agentId, { patchPath });
@@ -766,6 +784,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		// release writes to) waits for it. The caller keeps the last completion
 		// it is handed, and this one ends only after the earlier one, which the
 		// release waits for first.
+		const keptAlive = opts.baseOptions.keepAlive !== false;
+		const lifecycle = AgentLifecycleManager.global();
 		const released = isolationRelease.end();
 		if (released && deferredCleanup && !deferredCleanupAwaited) {
 			trackLateCleanup(released, { agentId: opts.agentId, resource: "isolation" });
@@ -777,22 +797,39 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					error: error instanceof Error ? error.message : String(error),
 				});
 			});
-		} else if (
-			workspace &&
-			!retainWorkspace &&
-			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
-		) {
-			// No release was asked for and no adoption holds the agent: this
-			// run's end owns the cleanup, and a release asked for later (once a
-			// release of the agent has disposed its session) only waits for it.
-			runEndCleanup = deferredCleanup ? deferredCleanup.then(cleanupHandle) : cleanupHandle();
-			if (deferredCleanup) {
-				trackLateCleanup(runEndCleanup, { agentId: opts.agentId, resource: "isolation" });
-			} else {
-				await runEndCleanup;
-			}
+		} else if (!workspace || retainWorkspace || (keptAlive && lifecycle.has(opts.agentId))) {
+			// Nothing is left to clean up here, or an adoption holds the agent:
+			// its release captures and cleans up. Read before `isReleasing`: a
+			// release that starts between the two reads (on a worker each is a
+			// round trip to the main thread) marks the agent releasing before it
+			// drops the adoption, and cannot end before the second read, since
+			// it calls the hook, which needs this thread, before it ends.
+		} else if (keptAlive && lifecycle.isReleasing(opts.agentId)) {
+			// A release of the agent is in flight, and nothing called the hook
+			// yet. One that took the agent's adoption calls it once it has
+			// disposed the agent's session, and captures and cleans up then,
+			// after the cleanup this run deferred; one that took none calls no
+			// hook. Once no release is left (on a worker, a hook call made before
+			// then reaches this thread first), the completion is the release the
+			// hook started, or, when nothing called the hook, the cleanup this
+			// run's end takes over then. It goes on after the result, and the
+			// caller's deferred cleanup (the removal of the artifacts directory
+			// the release writes to) waits for it; this completion ends after
+			// the earlier one, which the release or that cleanup waits for first.
+			const completion = lifecycle
+				.whenReleased(opts.agentId)
+				.then(() => isolationRelease.settled ?? takeCleanupOver());
+			trackLateCleanup(completion, { agentId: opts.agentId, resource: "isolation" });
+			opts.baseOptions.onCleanupDeferred?.(completion.catch(() => undefined));
+		} else {
+			// No release was asked for or is in flight, and no adoption holds
+			// the agent: this run's end takes the cleanup over, which a release
+			// called later only waits for.
+			const cleanup = takeCleanupOver();
+			if (deferredCleanup) trackLateCleanup(cleanup, { agentId: opts.agentId, resource: "isolation" });
+			else await cleanup;
 		}
-		// The worktree is captured: a held peer message may now wake a turn in it.
+		// The run's end is done with the worktree: a held peer message may now wake a turn in it.
 		if (releaseIrcWakes && opts.baseOptions.deferIrcWakeRelease)
 			opts.baseOptions.deferIrcWakeRelease(releaseIrcWakes);
 		else releaseIrcWakes?.();

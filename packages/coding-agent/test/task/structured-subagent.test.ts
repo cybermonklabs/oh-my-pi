@@ -818,6 +818,42 @@ describe("structured subagent primitive", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
+	it("hands a detached run's owner a disposal of its temporary artifacts that waits for the cleanup the run left going on", async () => {
+		// If this regresses, the job manager removes a background subagent's temporary artifacts directory as it evicts
+		// the job's row while the cleanup the run deferred still goes on (owner jobs, a failed isolated run's late
+		// release), and the late release's patch then creates the directory again, with nothing left to remove it.
+		mockDiscovery();
+		const lateCleanup = Promise.withResolvers<void>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.onCleanupDeferred?.(lateCleanup.promise);
+			return result();
+		});
+		let dispose: (() => Promise<void>) | undefined;
+		const settled = await runStructuredSubagent(
+			request({
+				detached: true,
+				retainArtifacts: true,
+				onArtifactsRetained: cleanup => {
+					dispose = cleanup;
+				},
+			}),
+		);
+		try {
+			expect(settled.temporaryArtifacts).toBe(true);
+			const removals = vi.spyOn(fs, "rm");
+			// The job's row is evicted, and the disposal starts, while the run's deferred cleanup still goes on.
+			const disposed = dispose?.();
+			expect(removals.mock.calls.some(([target]) => target === settled.artifactsDir)).toBe(false);
+
+			lateCleanup.resolve();
+			await disposed;
+			await expect(fs.stat(settled.artifactsDir)).rejects.toThrow();
+		} finally {
+			lateCleanup.resolve();
+			await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("removes a seance's temporary artifacts only after its run published its result, when a release ends it as it finishes", async () => {
 		// If this regresses, the adoption the release refuses runs the seance's release hook at once: the temporary
 		// artifacts directory is gone when the run's end publishes its result there, or a directory is left behind.

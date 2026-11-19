@@ -172,6 +172,10 @@ export interface AgentLifecycleApi {
 	manages(registry: AgentRegistryApi): boolean;
 	/** True while a park is disposing this agent's session. */
 	isParking(id: string, expected?: AgentRefExpectation): boolean;
+	/** True while a {@link release} of the agent is in flight. */
+	isReleasing(id: string): boolean;
+	/** Settles once no {@link release} of the agent is in flight; at once when none is. */
+	whenReleased(id: string): Promise<void>;
 	/** Dispose the live session of an adopted agent and mark it `parked`. */
 	park(id: string): Promise<void>;
 	/** Return the live session, reviving it if parked or killed. */
@@ -259,6 +263,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * revive may adopt one or attach a session to it. Keyed by ref, so a newer same-id generation stays revivable.
 	 */
 	readonly #releasing = new Map<AgentRef, number>();
+	/** Waiters of {@link whenReleased}, per agent id, settled once no release of that id is left in flight. */
+	readonly #releaseWaiters = new Map<string, PromiseWithResolvers<void>>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** Resolves the TTL applied when a cold-revived ref is adopted on demand (read per revive). */
@@ -403,6 +409,31 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		return Boolean(
 			park && !park.cancelled && (expected === undefined || park.ref === expected || park.ref.session === expected),
 		);
+	}
+
+	/**
+	 * True while a {@link release} of the agent `id` is in flight: from the moment it marks the ref as releasing, before
+	 * it drops the agent's adoption if there is one, until it has ended. A release that took an adoption calls that
+	 * adoption's release hook before it ends; one that took none calls no hook. Matched by id, not by the registered
+	 * ref, which the released session's dispose may unregister while the release goes on; a release of an earlier ref
+	 * of that id counts too.
+	 */
+	isReleasing(id: string): boolean {
+		for (const ref of this.#releasing.keys()) {
+			if (ref.id === id) return true;
+		}
+		return false;
+	}
+
+	/** Settles once no release of the agent `id` is left in flight ({@link isReleasing}); at once when none is. */
+	whenReleased(id: string): Promise<void> {
+		if (!this.isReleasing(id)) return Promise.resolve();
+		let waiting = this.#releaseWaiters.get(id);
+		if (!waiting) {
+			waiting = Promise.withResolvers<void>();
+			this.#releaseWaiters.set(id, waiting);
+		}
+		return waiting.promise;
 	}
 
 	/**
@@ -762,6 +793,11 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			const releases = (this.#releasing.get(ref) ?? 1) - 1;
 			if (releases > 0) this.#releasing.set(ref, releases);
 			else this.#releasing.delete(ref);
+			// Waiters for the agent settle once no release of its id is left.
+			if (!this.isReleasing(id)) {
+				this.#releaseWaiters.get(id)?.resolve();
+				this.#releaseWaiters.delete(id);
+			}
 		}
 	}
 

@@ -7,9 +7,9 @@
  * holds and calls its hook at once, and a release of an agent adopted a moment before calls it once that release has
  * disposed the agent's session. A call before the run's end is done ({@link RunEndRelease.end}) starts a release that
  * waits for that end. A call after it starts the release at once, and that end may already have released the resource
- * itself, having found no hook called and the agent no longer adopted: the release must allow for that (an isolated
- * run's then captures nothing). The run's own `finalizeSubagentLifecycle` calls the hook and awaits it when it adopts
- * nothing, before the run's end can go on, so a hook that waited there for the run's end would wait for itself.
+ * itself, by its own rule, having found no hook called: the release must allow for that (an isolated run's then
+ * captures nothing). The run's own `finalizeSubagentLifecycle` calls the hook and awaits it when it adopts nothing,
+ * before the run's end can go on, so a hook that waited there for the run's end would wait for itself.
  */
 
 /** A kept-alive run's release hook, held until the run's own end is done with what it releases. */
@@ -25,6 +25,11 @@ export interface RunEndRelease {
 	 * not called.
 	 */
 	end(): Promise<void> | undefined;
+	/**
+	 * The release the hook started, settling (never rejecting) once it is over; `undefined` while the hook has not been
+	 * called.
+	 */
+	readonly settled: Promise<void> | undefined;
 }
 
 /**
@@ -50,6 +55,12 @@ export function releaseAfterRunEnd(
 			ended = true;
 			runEnd.resolve();
 			return releasing;
+		},
+		get settled() {
+			return releasing?.then(
+				() => undefined,
+				() => undefined,
+			);
 		},
 	};
 }

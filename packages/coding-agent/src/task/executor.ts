@@ -646,8 +646,8 @@ export interface ExecutorOptions {
 	keepAlive?: boolean;
 	/**
 	 * Internal ownership handoff for cleanup that outlives the visible Task result. It may be called again
-	 * (`runIsolatedSubprocess` hands on a failed run's late release too); each completion ends only after the
-	 * ones before it, so the last one covers all of the run's cleanup.
+	 * (`runIsolatedSubprocess` hands on a release of the agent that goes on after its run's end too); each completion
+	 * ends only after the ones before it, so waiting for the last one waits for every one handed on.
 	 */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/**

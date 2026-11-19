@@ -213,6 +213,14 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.callSync("isParking", id, expected);
 	}
 
+	isReleasing(id: string): boolean {
+		return this.#remote.callSync("isReleasing", id);
+	}
+
+	whenReleased(id: string): Promise<void> {
+		return this.#remote.call("whenReleased", id);
+	}
+
 	park(id: string): Promise<void> {
 		return this.#remote.call("park", id);
 	}

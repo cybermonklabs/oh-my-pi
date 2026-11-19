@@ -278,6 +278,8 @@ function serveLifecycle(bridge: MainSessionBridge): RpcServe<AgentLifecycleManag
 		reclaimDeadCorpse: (lifecycle, id, expected) => lifecycle.reclaimDeadCorpse(id, expected),
 		manages: (lifecycle, registry) => lifecycle.manages(registry),
 		isParking: (lifecycle, id, expected) => lifecycle.isParking(id, expected),
+		isReleasing: (lifecycle, id) => lifecycle.isReleasing(id),
+		whenReleased: (lifecycle, id) => lifecycle.whenReleased(id),
 		park: (lifecycle, id) => lifecycle.park(id),
 		ensureLive: (lifecycle, id) => lifecycle.ensureLive(id),
 		release: (lifecycle, id, expected, options) => lifecycle.release(id, expected, options),
