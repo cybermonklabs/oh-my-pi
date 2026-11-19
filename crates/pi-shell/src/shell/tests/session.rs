@@ -317,26 +317,94 @@ async fn deferred_duplications_read_the_descriptors_the_parent_holds() {
 /// a builtin waiting for more input hung once the writer closed: `mapfile`
 /// and `read` until cancelled, and `read -t` timed out instead of reading
 /// EOF. Each writer here closes while its reader waits.
+///
+/// The writers are the test's own ([`HeldFifoWriter`]), each opened before
+/// the shell opens its FIFO to read, so that open (the shell's blocking open
+/// on its helper thread) finds a writer and never waits for one: under
+/// gVisor before google/gvisor@d6786915 a reader waiting in `open(2)` can miss
+/// a writer that opens and closes meanwhile, and wait for ever. A writer
+/// closes 0.2 s after its reader has taken its bytes, as the shell's
+/// `{ echo a; sleep 0.2; } > f &` did.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn builtins_waiting_on_a_fifo_see_its_writer_close() {
 	let root = tempfile::tempdir().expect("scratch directory");
-	pi_vfs::BlockingFs::native()
-		.make_node(root.path().join("f"), pi_vfs::NodeKind::Fifo, 0o600)
-		.expect("create FIFO");
+	let closers: Vec<_> = [("f1", "a\n"), ("f2", "b\n"), ("f3", "c")]
+		.into_iter()
+		.map(|(name, bytes)| {
+			let writer = HeldFifoWriter::open(&root.path().join(name), bytes.as_bytes());
+			std::thread::spawn(move || writer.close_once_read())
+		})
+		.collect();
 	let (result, output) = run_command_capture(
 		concat!(
-			"{ echo a; sleep 0.2; } > f & mapfile -t lines < f; wait; echo \"mapfile=${#lines[@]}\"\n",
-			"{ echo b; sleep 0.2; } > f & while read -r l; do echo \"read=$l\"; done < f; wait\n",
-			"{ printf c; sleep 0.2; } > f & read -t 5 -r x < f; echo \"read-t=$? $x\"; wait",
+			"mapfile -t lines < f1; echo \"mapfile=${#lines[@]}\"\n",
+			"while read -r l; do echo \"read=$l\"; done < f2\n",
+			"read -t 5 -r x < f3; echo \"read-t=$? $x\"",
 		),
 		Some(root.path()),
 		None,
 		CancelToken::default(),
 	)
 	.await;
+	for closer in closers {
+		closer.join().expect("closer thread");
+	}
 
 	assert_eq!((result.exit_code, output.as_str()), (Some(0), "mapfile=1\nread=b\nread-t=1 c\n"));
+}
+
+/// A FIFO with a writer end the test holds: a reader of the test's own
+/// opens it first (`O_NONBLOCK` never waits for a writer), then the writer
+/// (`O_NONBLOCK`, which a reader lets succeed), so no open of the test's
+/// waits for the other end. The test's reader only counts the bytes still
+/// queued (`FIONREAD`); it never reads them.
+#[cfg(unix)]
+struct HeldFifoWriter {
+	reader: std::fs::File,
+	writer: std::fs::File,
+}
+
+#[cfg(unix)]
+impl HeldFifoWriter {
+	/// Makes the FIFO `path`, opens both ends, and writes `bytes`.
+	fn open(path: &std::path::Path, bytes: &[u8]) -> Self {
+		use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+		pi_vfs::BlockingFs::native()
+			.make_node(path, pi_vfs::NodeKind::Fifo, 0o600)
+			.expect("create FIFO");
+		let open = |read: bool| {
+			std::fs::OpenOptions::new()
+				.read(read)
+				.write(!read)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(path)
+				.expect("open the test's end of the FIFO")
+		};
+		let reader = open(true);
+		let mut writer = open(false);
+		writer.write_all(bytes).expect("write the FIFO");
+		Self { reader, writer }
+	}
+
+	/// Closes the writer 0.2 s after the shell's reader has taken every byte,
+	/// so it closes while that reader waits for more. Waits as long as that
+	/// takes: a reader that never comes is failed by the test runner.
+	fn close_once_read(self) {
+		use std::os::fd::AsRawFd as _;
+		loop {
+			let mut queued: libc::c_int = 0;
+			// SAFETY: FIONREAD writes one c_int through the pointer.
+			let rc = unsafe { libc::ioctl(self.reader.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+			assert_eq!(rc, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+			if queued == 0 {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+		std::thread::sleep(std::time::Duration::from_millis(200));
+		drop(self.writer);
+	}
 }
 
 /// Owned-shell pipeline stages already hold a blocking worker. Two `read`
