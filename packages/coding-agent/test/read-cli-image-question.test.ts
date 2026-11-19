@@ -17,8 +17,8 @@ const PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8B
 
 // Custom vision provider with a real (dummy) inline key so it counts as
 // available; its baseUrl points at a dead local port, so the completion attempt
-// fails fast with a connection error — never the registry guard, and never a
-// real network call.
+// gets no answer and ends at the image question's timeout (3 s, set below) —
+// never the registry guard, and never a real network call.
 const MODELS_YML = `providers:
   testvision:
     api: openai-completions
