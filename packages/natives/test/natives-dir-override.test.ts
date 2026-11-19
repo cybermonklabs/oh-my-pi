@@ -239,6 +239,41 @@ describe("one natives directory per process", () => {
 			expect((await runChild(env)).own).toBe(path.join(ownHome, ".omp", "natives"));
 		});
 
+		it("is known to have been given, taken or not, in the process and its worker threads", async () => {
+			const report = `const mod = await import(${nativesDirJs});
+const main = mod.startedWithNativesDirHandoff();
+const worker = await new Promise(resolve => {
+	const w = new Worker(URL.createObjectURL(new Blob([\`const mod = await import(${nativesDirJs.replaceAll("`", "\\`")}); postMessage(mod.startedWithNativesDirHandoff());\`], { type: "application/javascript" })));
+	w.onmessage = event => { w.terminate(); resolve(event.data); };
+});
+console.log(JSON.stringify({ main, worker }));`;
+			const run = async (handoff: string | undefined) => {
+				const env: Record<string, string | undefined> = {
+					...process.env,
+					PI_NATIVES_DIR: path.join(tempRoot, "child"),
+				};
+				delete env.__PI_NATIVES_DIR_CACHE;
+				if (handoff === undefined) delete env.__PI_NATIVES_DIR_HANDOFF;
+				else env.__PI_NATIVES_DIR_HANDOFF = handoff;
+				const child = Bun.spawn([process.execPath, "-e", report], { env, stdout: "pipe", stderr: "inherit" });
+				const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+				expect(exitCode).toBe(0);
+				return JSON.parse(output.trim());
+			};
+			const recorded = { ...process.env, PI_NATIVES_DIR: path.join(tempRoot, "child") };
+			const taken = nativesDirHandoff(recorded, { parent: process.pid, dir: path.join(tempRoot, "handed-over") });
+			const refused = nativesDirHandoff(
+				{ ...recorded, PI_NATIVES_DIR: path.join(tempRoot, "other") },
+				{ parent: process.pid },
+			);
+
+			expect(await run(taken)).toEqual({ main: true, worker: true });
+			// A handoff the child refuses still stands in the environment it was started with.
+			expect(await run(refused)).toEqual({ main: true, worker: true });
+			expect(await run(undefined)).toEqual({ main: false, worker: false });
+			expect(await run("")).toEqual({ main: false, worker: false });
+		});
+
 		it("is not taken when it names no parent, even with the recorded variables", async () => {
 			const handedOver = path.join(tempRoot, "handed-over");
 			const env: Record<string, string | undefined> = {

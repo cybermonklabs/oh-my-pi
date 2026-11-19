@@ -2,7 +2,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseEnv } from "node:util";
-import { getNativesDir, NATIVES_DIR_HANDOFF_ENV_KEY } from "@oh-my-pi/pi-natives/natives-dir";
+import {
+	getNativesDir,
+	NATIVES_DIR_HANDOFF_ENV_KEY,
+	startedWithNativesDirHandoff,
+} from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
 import { isBunTestRuntime } from "./test-runtime";
 
@@ -196,11 +200,12 @@ function filterChildShellEnvInternal(
 		if (nativesDirAtLaunch === undefined) delete result.PI_NATIVES_DIR;
 		else result.PI_NATIVES_DIR = nativesDirAtLaunch;
 	}
-	// omp's own handoff to a child that is omp; a command is no such child. Empty, not
-	// absent: the native shell starts from the process's own C environment, where the
-	// handoff omp was started with remains (a worker's, a daemon's), and this value
-	// replaces it there. An empty handoff is none.
-	result[NATIVES_DIR_HANDOFF_ENV_KEY] = "";
+	// omp's own handoff to a child that is omp; a command is no such child. In a process started
+	// with one (a worker, the broker, a daemon), empty, not absent: the native shell starts from
+	// the process's own C environment, where it remains, and this value replaces it there (an
+	// empty handoff is none). Elsewhere a command gets none, as before handoffs existed.
+	if (startedWithNativesDirHandoff()) result[NATIVES_DIR_HANDOFF_ENV_KEY] = "";
+	else delete result[NATIVES_DIR_HANDOFF_ENV_KEY];
 	const projectEnv = parseEnvFile(path.join(cwd, ".env"));
 	const launchNodeEnv = runtimeLaunchEnvValues ? runtimeLaunchEnvValues.get("NODE_ENV") : env.NODE_ENV;
 	const nodeEnvName = `.env.${launchNodeEnv || "development"}`;

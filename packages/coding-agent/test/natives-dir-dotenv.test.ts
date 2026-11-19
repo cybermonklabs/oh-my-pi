@@ -200,7 +200,8 @@ console.log(JSON.stringify({
 		// OMP_DOWNLOAD_ROOT), and with a home of their own.
 		expect(result.worker.program).toBe(path.join(tempRoot, "dl", "natives"));
 		expect(result.worker.programOwnHome).toBe(ownDir);
-		expect(result.commandEnv).toEqual({ PI_NATIVES_DIR: null, handoff: "" });
+		// The session was started with no handoff, so its commands get none (the worker's get it empty).
+		expect(result.commandEnv).toEqual({ PI_NATIVES_DIR: null, handoff: null });
 		expect(result.command).toBe(ownDir);
 		expect(result.spread.PI_NATIVES_DIR).toBeNull();
 		expect(result.spreadOwnHome).toBe(ownDir);

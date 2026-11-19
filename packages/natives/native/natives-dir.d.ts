@@ -45,5 +45,12 @@ export function nativesDirHandoffDir(
 	addressee?: { env: Record<string, string | undefined>; ppid: number },
 ): string | undefined;
 
+/**
+ * Whether this process was started with a natives-directory handoff, taken or not (an omp
+ * worker, its launch broker, an omp daemon): its native shell and its spawns with no `env`
+ * start from an environment that holds one, which a command must not carry.
+ */
+export function startedWithNativesDirHandoff(): boolean;
+
 /** Forget this process's answer, so a test can resolve again from a changed environment. */
 export function __resetNativesDirForTests(): void;

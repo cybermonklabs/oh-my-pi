@@ -48,6 +48,12 @@ const NATIVES_DIR_CACHE_ENV_KEY = "__PI_NATIVES_DIR_CACHE";
 let processNativesDir;
 
 /**
+ * Whether this process was started with a non-empty {@link NATIVES_DIR_HANDOFF_ENV_KEY}, taken or
+ * not: the native shell and a spawn with no `env` start from that environment, where it stays.
+ */
+let startedWithHandoff = false;
+
+/**
  * A process's state and start time on Linux (`/proc/<pid>/stat` fields 3 and 22, the start in
  * clock ticks since boot), this process's by default: with the pid, the start time names one
  * process for its whole life, in every thread. Undefined elsewhere, or when `/proc` cannot be
@@ -106,17 +112,21 @@ function isThisProcess(cached) {
 
 /**
  * Make `dir` this process's answer: kept for later calls, and carried to worker threads
- * through {@link NATIVES_DIR_CACHE_ENV_KEY}. `PI_NATIVES_DIR` is left as it is, so the
- * commands the agent runs carry it as omp was started with it.
+ * through {@link NATIVES_DIR_CACHE_ENV_KEY}, with whether the process was started with a
+ * handoff. `PI_NATIVES_DIR` is left as it is, so the commands the agent runs carry it as omp
+ * was started with it.
  * @param {string} dir
+ * @param {boolean} withHandoff
  */
-function adopt(dir) {
+function adopt(dir, withHandoff) {
 	processNativesDir = dir;
+	startedWithHandoff = withHandoff;
 	process.env[NATIVES_DIR_CACHE_ENV_KEY] = JSON.stringify({
 		pid: process.pid,
 		ppid: process.ppid,
 		start: processStartTime(),
 		dir,
+		startedWithHandoff: withHandoff,
 	});
 	return dir;
 }
@@ -253,24 +263,38 @@ export function getNativesDir() {
 	if (processNativesDir !== undefined) return processNativesDir;
 	try {
 		const cached = JSON.parse(process.env[NATIVES_DIR_CACHE_ENV_KEY] ?? "null");
-		if (isThisProcess(cached) && typeof cached.dir === "string") return adopt(cached.dir);
+		if (isThisProcess(cached) && typeof cached.dir === "string") {
+			return adopt(cached.dir, cached.startedWithHandoff === true);
+		}
 	} catch {
 		// Not this module's value; resolve below and replace it.
 	}
-	const handedOver = nativesDirHandoffDir(process.env[NATIVES_DIR_HANDOFF_ENV_KEY], {
-		env: process.env,
-		ppid: process.ppid,
-	});
+	const value = process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
+	const handedOver = nativesDirHandoffDir(value, { env: process.env, ppid: process.ppid });
 	// Read once: the children this process starts with `process.env` must not take it. A
 	// spawn with no `env`, and the native shell, start from the startup environment, which
-	// keeps it: commands get it empty (`filterChildShellEnv`); a program started with no `env`
-	// keeps it, which the parent check refuses while the recorded parent runs.
+	// keeps it: commands get it empty (`filterChildShellEnv`, when
+	// {@link startedWithNativesDirHandoff}); a program started with no `env` keeps it, which the
+	// parent check refuses while the recorded parent runs.
 	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
-	return adopt(handedOver ?? resolveNativesDir());
+	return adopt(handedOver ?? resolveNativesDir(), Boolean(value));
+}
+
+/**
+ * Whether this process was started with a natives-directory handoff, taken or not (an omp
+ * worker, its launch broker, an omp daemon), in this thread or in the process's main thread:
+ * the environment its native shell and its spawns with no `env` start from then holds one,
+ * which a command must not carry. Resolves the directory first, if no call has yet.
+ * @returns {boolean}
+ */
+export function startedWithNativesDirHandoff() {
+	getNativesDir();
+	return startedWithHandoff;
 }
 
 /** Forget this process's answer, so a test can resolve again from a changed environment. */
 export function __resetNativesDirForTests() {
 	processNativesDir = undefined;
+	startedWithHandoff = false;
 	delete process.env[NATIVES_DIR_CACHE_ENV_KEY];
 }

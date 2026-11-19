@@ -207,10 +207,6 @@ describe("filterProcessEnv", () => {
 });
 
 describe("filterChildShellEnv", () => {
-	// Every command environment blanks omp's natives-directory handoff (an empty one is none), so
-	// it replaces the handoff the native shell's startup environment may hold.
-	const NO_HANDOFF = { __PI_NATIVES_DIR_HANDOFF: "" };
-
 	it("removes quoted multiline project values without a launch snapshot", () => {
 		const cwd = path.dirname(
 			writeTempEnv(['MULTILINE="first', 'second"', 'ESCAPED_NEWLINE="first\\nsecond"'].join("\n")),
@@ -225,7 +221,7 @@ describe("filterChildShellEnv", () => {
 				},
 				cwd,
 			),
-		).toEqual({ UNCHANGED: "parent-value", ...NO_HANDOFF });
+		).toEqual({ UNCHANGED: "parent-value" });
 	});
 
 	it("uses the supplied mode for an isolated environment and cwd", async () => {
@@ -255,7 +251,7 @@ describe("filterChildShellEnv", () => {
 		]);
 
 		expect(exitCode, stderr).toBe(0);
-		expect(JSON.parse(stdout)).toEqual({ UNCHANGED: "parent-value", ...NO_HANDOFF });
+		expect(JSON.parse(stdout)).toEqual({ UNCHANGED: "parent-value" });
 	});
 
 	it("drops inherited git repo-location overrides", () => {
@@ -277,7 +273,7 @@ describe("filterChildShellEnv", () => {
 				},
 				cwd,
 			),
-		).toEqual({ GIT_EDITOR: "true", GIT_AUTHOR_NAME: "Agent", ...NO_HANDOFF });
+		).toEqual({ GIT_EDITOR: "true", GIT_AUTHOR_NAME: "Agent" });
 	});
 
 	it("uses the launch mode when dotenv changes NODE_ENV", async () => {
@@ -343,7 +339,7 @@ describe("filterChildShellEnv", () => {
 			]);
 
 			expect(exitCode, stderr).toBe(0);
-			expect(JSON.parse(stdout)).toEqual({ UNCHANGED: "parent-value", ...NO_HANDOFF });
+			expect(JSON.parse(stdout)).toEqual({ UNCHANGED: "parent-value" });
 		},
 	);
 });
