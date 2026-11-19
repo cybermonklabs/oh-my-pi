@@ -45,18 +45,23 @@ async fn pkill_accepts_platform_signal_names() {
 	let signal = "WINCH";
 	let dir = tempfile::tempdir().expect("signal test directory");
 	let ready = dir.path().join("ready");
-	let script = format!("trap '' {signal}; : > \"$1\"; while :; do sleep 0.05; done");
+	// The child reads its stdin to end of file, whose write end only the test
+	// holds: it ends when the test lets it go, or with the test process,
+	// however that ends (a loop of sleeps would outlive a killed test).
+	let script = format!("trap '' {signal}; : > \"$1\"; while read -r _; do :; done");
 	let mut command = Command::new("sh");
 	command
 		.args(["-c", &script, "sh", ready.to_str().expect("utf8 ready path")])
+		.stdin(std::process::Stdio::piped())
 		.kill_on_drop(true);
 	let mut child = command.spawn().expect("signal test process");
+	let gate = child.stdin.take().expect("the child's stdin");
 	let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits i32");
 	exists(&ready).await;
 
 	let (result, _) = execute_captured(format!("pkill -{signal} -p {pid}")).await;
 	let still_running = child.try_wait().expect("signal child status").is_none();
-	let _ = child.start_kill();
+	drop(gate);
 	let _ = child.wait().await;
 	assert_eq!(result.exit_code, Some(0));
 	assert!(still_running, "{signal} should be ignored by the test process");
@@ -158,31 +163,37 @@ async fn pgrep_requires_an_externally_locked_pidfile() {
 	let pidfile = files.path().join("service.pid");
 	let ready = files.path().join("locked");
 	let pid_arg = pid.to_string();
+	// The locker holds the lock until end of file on its stdin, whose write
+	// end only the test holds: closed after the locked `pgrep`, however long
+	// that takes, or by the kernel when the test process ends.
 	let mut locker = Command::new("python3")
 		.args([
 			"-c",
-			"import fcntl,pathlib,sys,time; f=open(sys.argv[1],'w'); f.write(sys.argv[2]+'\\n'); \
+			"import fcntl,pathlib,sys; f=open(sys.argv[1],'w'); f.write(sys.argv[2]+'\\n'); \
 			 f.flush(); fcntl.lockf(f,fcntl.LOCK_EX); pathlib.Path(sys.argv[3]).touch(); \
-			 time.sleep(30)",
+			 sys.stdin.buffer.read()",
 			pidfile.to_str().expect("utf8 pidfile"),
 			&pid_arg,
 			ready.to_str().expect("utf8 ready path"),
 		])
+		.stdin(std::process::Stdio::piped())
 		.spawn()
 		.expect("pidfile locker");
+	let gate = locker.stdin.take().expect("the locker's stdin");
 	exists(&ready).await;
 
 	let command =
 		format!("pgrep -L -F {} -x {name}", quote_arg(pidfile.to_str().expect("utf8 pidfile")));
 	let (locked_result, locked_output) = execute_captured(command.clone()).await;
-	let _ = locker.start_kill();
-	let _ = locker.wait().await;
+	drop(gate);
+	let locker_status = locker.wait().await.expect("the locker's exit");
 	let (unlocked_result, unlocked_output) = execute_captured(command).await;
 	let _ = child.start_kill();
 	let _ = child.wait().await;
 
-	assert_eq!(locked_result.exit_code, Some(0));
+	assert_eq!(locked_result.exit_code, Some(0), "{locked_output:?}");
 	assert_eq!(locked_output, format!("{pid}\n"));
+	assert!(locker_status.success(), "the locker ends at its stdin's end: {locker_status:?}");
 	assert_eq!(unlocked_result.exit_code, Some(3));
 	assert!(unlocked_output.contains("is not locked"), "{unlocked_output:?}");
 }

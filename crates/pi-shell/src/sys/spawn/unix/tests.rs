@@ -3,7 +3,7 @@
 
 use std::{
 	io,
-	os::unix::process::CommandExt,
+	os::{fd::AsRawFd as _, unix::process::CommandExt},
 	sync::Arc,
 	task::{Context, Poll, Wake, Waker},
 	thread,
@@ -809,10 +809,17 @@ fn abandoning_a_paused_job_still_terminates_it() {
 fn a_scripts_term_does_not_escalate() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Detach, Duration::from_millis(100));
-	let a = sh("trap '' TERM; while :; do /bin/sleep 1; done");
-	let mut p = s.spawn(spec(&a, &env, NEW)).unwrap();
+	// `cat` reads the test's gate to end of file: the script ends with a killed
+	// test, where a loop of sleeps that ignores TERM would live on. The `:`
+	// keeps `sh` from running `cat` in its own place.
+	let gate = crate::testkit::child::Gate::new();
+	let a = sh("trap '' TERM; /bin/cat; :");
+	let mut sp = spec(&a, &env, NEW);
+	let gate_reader = gate.reader();
+	sp.stdio[0] = StdioSpec::Inherit(OsHandle(u64::try_from(gate_reader.as_raw_fd()).unwrap()));
+	let mut p = s.spawn(sp).unwrap();
 	let pid = p.pid() as i32;
-	// The first sleep is forked after the trap is set: TERM is ignored now.
+	// `cat` is forked after the trap is set: TERM is ignored now.
 	until("trap set", || {
 		proc::session_members(pid)
 			.unwrap()

@@ -1202,13 +1202,17 @@ mod tests {
 	async fn trace_quiet_external_output_advances_revision_before_command_end() {
 		let mut session = session();
 		let gates = tempfile::tempdir().unwrap();
-		let next = gates.path().join("next");
-		let end = gates.path().join("end");
+		let (mut next, mut end) =
+			(crate::testkit::child::Gate::new(), crate::testkit::child::Gate::new());
+		next.link(&gates.path().join("next"));
+		end.link(&gates.path().join("end"));
+		// The second wait is the same as `AWAIT_GATE`, on fd 4.
 		let script = format!(
-			"/bin/sh -c 'printf first; while [ ! -e \"{}\" ]; do sleep 0.01; done; printf second; \
-			 while [ ! -e \"{}\" ]; do sleep 0.01; done'",
-			next.display(),
-			end.display()
+			"/bin/sh -c 'printf first; {}; printf second; while read -r _; do :; done <&4' 3< {} 4< \
+			 {}",
+			crate::testkit::child::AWAIT_GATE,
+			gates.path().join("next").display(),
+			gates.path().join("end").display()
 		);
 		let trace = Arc::new(crate::bash::trace::RunTrace::new(script.as_str()));
 		let options = RunOptions {
@@ -1220,7 +1224,7 @@ mod tests {
 			let first = loop {
 				if trace_output(&trace.snapshot()) == "first" {
 					let revision = trace.version();
-					std::fs::write(&next, []).unwrap();
+					next.open();
 					break revision;
 				}
 				tokio::task::yield_now().await;
@@ -1230,7 +1234,7 @@ mod tests {
 				if trace_output(&snapshot) == "firstsecond" {
 					assert!(trace.version() > first, "coalescing changes the poll revision");
 					assert!(snapshot.status.is_none(), "output is visible before CmdEnd/RunEnd");
-					std::fs::write(&end, []).unwrap();
+					end.open();
 					break;
 				}
 				tokio::task::yield_now().await;
@@ -1447,11 +1451,12 @@ mod tests {
 		use crate::bash::trace::history::HistoryData;
 		let mut session = session();
 		let gates = tempfile::tempdir().unwrap();
-		let gate = gates.path().join("finish");
+		let mut gate = crate::testkit::child::Gate::new();
+		gate.link(&gates.path().join("finish"));
 		let script = format!(
-			"timeout 1 /usr/bin/printf hi; /bin/sh -c 'while [ ! -e \"{}\" ]; do sleep 0.01; done'; \
-			 /usr/bin/false",
-			gate.display()
+			"timeout 1 /usr/bin/printf hi; /bin/sh -c '{}' 3< {}; /usr/bin/false",
+			crate::testkit::child::AWAIT_GATE,
+			gates.path().join("finish").display()
 		);
 		let trace = Arc::new(crate::bash::trace::RunTrace::new(script.as_str()));
 		let options = RunOptions {
@@ -1469,7 +1474,7 @@ mod tests {
 				{
 					assert_eq!(snapshot.status, None, "a tool child cannot complete the root snapshot");
 					assert_eq!(trace_output(&snapshot), "hi");
-					std::fs::write(&gate, []).unwrap();
+					gate.open();
 					break;
 				}
 				tokio::task::yield_now().await;

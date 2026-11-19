@@ -75,6 +75,65 @@ pub fn on_path(name: &str) -> String {
 		.to_string()
 }
 
+/// `sh` text that waits until the [`Gate`] on its fd 3 opens: it reads fd 3
+/// to end of file. `sh` runs a TERM trap during the read.
+#[cfg(unix)]
+pub const AWAIT_GATE: &str = "while read -r _; do :; done <&3";
+
+/// A gate a fixture process waits on ([`AWAIT_GATE`]).
+///
+/// A pipe whose write end only the test holds. The fixture reads the read
+/// end to end of file, which comes when the test opens the gate
+/// ([`Gate::open`]), or when the test process ends, however it ends: the
+/// kernel closes the write end then. A fixture that waits for a file, or
+/// loops, instead lives on after a killed test, as nothing ends a process
+/// the shell started in a session of its own.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Gate {
+	reader: std::fs::File,
+	writer: Option<std::io::PipeWriter>,
+}
+
+#[cfg(unix)]
+impl Gate {
+	/// A closed gate.
+	pub fn new() -> Self {
+		let (reader, writer) = std::io::pipe().expect("the gate's pipe");
+		Self { reader: std::fs::File::from(std::os::fd::OwnedFd::from(reader)), writer: Some(writer) }
+	}
+
+	/// A symlink at `path` to the read end (`/dev/fd/N` of this process),
+	/// for a redirection the shell opens in this process: `sh x.sh 3< gate`.
+	/// The shell takes `/dev/fd/N` itself for its own fd `N`, but opens the
+	/// symlink on the host.
+	pub fn link(&self, path: &std::path::Path) {
+		use std::os::fd::AsRawFd as _;
+		std::os::unix::fs::symlink(format!("/dev/fd/{}", self.reader.as_raw_fd()), path)
+			.expect("the gate's symlink");
+	}
+
+	/// A copy of the read end, for a child's stdin.
+	pub fn reader(&self) -> std::fs::File {
+		self
+			.reader
+			.try_clone()
+			.expect("a copy of the gate's read end")
+	}
+
+	/// Lets every fixture waiting on the gate go on.
+	pub fn open(&mut self) {
+		self.writer = None;
+	}
+}
+
+#[cfg(unix)]
+impl Default for Gate {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Ask for `SIGKILL` when this child's parent thread ends (Linux only).
 #[cfg(unix)]
 #[cfg_attr(
