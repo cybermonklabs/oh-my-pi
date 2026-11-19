@@ -585,7 +585,8 @@ impl Kernel {
 			.insert(BString::from(path), (stamp, funcs));
 	}
 
-	fn new(engine: &Arc<Engine>, root: Root, argv0: BString, shell_pid: u32) -> Self {
+	fn new(engine: &Arc<Engine>, mut root: Root, argv0: BString, shell_pid: u32) -> Self {
+		root.set_platform(engine.config().platform);
 		let ctl = Ctl::new();
 		Self {
 			engine: Arc::clone(engine),
@@ -1426,11 +1427,11 @@ pub fn zsh_startup_values(
 	for (name, value, forced) in fixed {
 		out.push((name, Var::scalar(value, Attrs::NONE), forced));
 	}
-	// `signals`: `EXIT`, the signal names by number, `ZERR`, `DEBUG`.
+	// `signals`: `EXIT`, zsh's signal names by number, `ZERR`, `DEBUG`.
 	let mut signals = vec![BString::from("EXIT")];
 	for n in 1..=31u8 {
 		match crate::bash::signal::Signal::from_number(n, platform) {
-			Some(s) => signals.push(BString::from(s.to_string())),
+			Some(s) => signals.push(BString::from(s.zsh_name(platform))),
 			None => signals.push(BString::from(format!("SIG{n}"))),
 		}
 	}

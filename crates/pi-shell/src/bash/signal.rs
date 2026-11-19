@@ -298,6 +298,57 @@ impl Signal {
 		})
 	}
 
+	/// zsh's name of the signal on `platform`: its entry in zsh's `sigs`
+	/// table, which zsh's build makes from the C library's headers
+	/// (`Src/signames1.awk` lists every `#define SIG…` of them,
+	/// `Src/signames2.awk` keeps the first name per number, except that
+	/// `CHLD` replaces `CLD` and `POLL` replaces `IO`). On Linux `POLL`
+	/// names 29; glibc 2.32 and later define `SIGIOT` (in
+	/// `bits/signum-arch.h`, which zsh's configure lists before
+	/// `bits/signum-generic.h`) before `SIGABRT`, so zsh 5.9 names 6 `IOT`
+	/// there. Elsewhere the name is the signal's own.
+	pub fn zsh_name(self, platform: Platform) -> &'static str {
+		match (self, platform) {
+			(Self::Abrt, Platform::Linux) => "IOT",
+			(Self::Io, Platform::Linux) => "POLL",
+			_ => self.into(),
+		}
+	}
+
+	/// zsh's `alt_sigs` for the signal on `platform`: other names zsh takes
+	/// for it (as input, and as `TRAPNAL` function names). On Linux `CLD`
+	/// names `SIGCHLD` and `IO` names `SIGPOLL` (`SIGCLD` and `SIGIO` are
+	/// defined as those); zsh's `ERR` names its `ZERR` pseudo-signal, not a
+	/// signal.
+	pub const fn zsh_alternates(self, platform: Platform) -> &'static [&'static str] {
+		match (self, platform) {
+			(Self::Chld, Platform::Linux) => &["CLD"],
+			(Self::Io, Platform::Linux) => &["IO"],
+			_ => &[],
+		}
+	}
+
+	/// The signal zsh's `getsigidx` finds for `name` (without `SIG`): a name
+	/// of zsh's `sigs` table ([`Self::zsh_name`]; zsh 5.9 has no real-time
+	/// signals), else one of its alternates ([`Self::zsh_alternates`]). So
+	/// `ABRT` names no signal of zsh's on Linux. `nocase` compares ignoring
+	/// case (`kill -l`).
+	pub fn from_zsh_name(name: &[u8], platform: Platform, nocase: bool) -> Option<Self> {
+		use strum::IntoEnumIterator;
+		let eq = |a: &str| {
+			if nocase {
+				a.as_bytes().eq_ignore_ascii_case(name)
+			} else {
+				a.as_bytes() == name
+			}
+		};
+		let zsh =
+			|| Self::iter().filter(|s| s.number(platform) != 0 && (*s as u8) < Self::Rtmin as u8);
+		zsh()
+			.find(|s| eq(s.zsh_name(platform)))
+			.or_else(|| zsh().find(|s| s.zsh_alternates(platform).iter().any(|a| eq(a))))
+	}
+
 	/// Exit status of a process killed by this signal.
 	pub const fn exit_status(self, platform: Platform) -> i32 {
 		128 + self.number(platform) as i32

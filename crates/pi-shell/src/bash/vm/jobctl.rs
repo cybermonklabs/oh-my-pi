@@ -126,9 +126,14 @@ impl JobCtl {
 	}
 }
 
-/// zsh `sigmsg`: how a signal is named in job notices.
-pub const fn sigmsg(sig: Signal) -> &'static str {
+/// zsh `sigmsg`: how a signal is named in job notices on `platform`. The
+/// text is that of the name zsh's build gave the signal's number
+/// ([`Signal::zsh_name`]): on Linux 6 is `IOT` (`IOT instruction`) and 29
+/// `POLL` (`pollable event occurred`).
+pub const fn sigmsg(sig: Signal, platform: Platform) -> &'static str {
 	match sig {
+		Signal::Abrt if matches!(platform, Platform::Linux) => "IOT instruction",
+		Signal::Io if matches!(platform, Platform::Linux) => "pollable event occurred",
 		Signal::Hup => "hangup",
 		Signal::Int => "interrupt",
 		Signal::Quit => "quit",
@@ -198,10 +203,10 @@ pub fn format_job(vp: &Vproc, number: u32, how: JobLine, platform: Platform) -> 
 	let word: String = match job.state {
 		JobState::Running if how.conted => "continued".into(),
 		JobState::Running => "running".into(),
-		JobState::Stopped(sig) => sigmsg(sig).into(),
+		JobState::Stopped(sig) => sigmsg(sig, platform).into(),
 		JobState::Done(0) => "done".into(),
 		JobState::Done(status) => match death_signal(status, platform) {
-			Some(sig) => sigmsg(sig).into(),
+			Some(sig) => sigmsg(sig, platform).into(),
 			None => format!("exit {status:<4}"),
 		},
 	};
@@ -1000,7 +1005,8 @@ pub fn fg_done(
 		Some(Signal::Int) => notice(k, vp, b"\n"),
 		Some(Signal::Pipe) | None => {},
 		Some(sig) => {
-			let line = format!("zsh: {:<w$}", sigmsg(sig), w = sigmsg(sig).len().max(9) + 2);
+			let msg = sigmsg(sig, k.engine.config().platform);
+			let line = format!("zsh: {msg:<w$}", w = msg.len().max(9) + 2);
 			let mut line = line.into_bytes();
 			line.extend_from_slice(text);
 			line.push(b'\n');
@@ -1581,5 +1587,21 @@ impl Shell {
 			let _ = term.set_process_group(0, pgrp.orig);
 		}
 		self.k.jobctl.pgrp = None;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{Platform, Signal, sigmsg};
+
+	/// zsh 5.9's `sig_msg` texts, which follow its build's name for the
+	/// number (`Src/signames2.awk`): on Linux 6 is `IOT` and 29 `POLL`.
+	#[test]
+	fn job_messages_follow_zshs_names_on_each_platform() {
+		assert_eq!(sigmsg(Signal::Abrt, Platform::Linux), "IOT instruction");
+		assert_eq!(sigmsg(Signal::Io, Platform::Linux), "pollable event occurred");
+		assert_eq!(sigmsg(Signal::Abrt, Platform::MacOs), "abort");
+		assert_eq!(sigmsg(Signal::Io, Platform::MacOs), "i/o ready");
+		assert_eq!(sigmsg(Signal::Kill, Platform::Linux), "killed");
 	}
 }

@@ -53,30 +53,40 @@ fn print(ctx: &mut Ctx<'_, '_>, key: TrapKey, action: &[u8]) {
 	ctx.out(&line);
 }
 
-/// The zsh function that is the trap for `key` (`TRAPINT`, `TRAPZERR`,
-/// `TRAPEXIT`, `TRAPDEBUG`); `None` for bash's `RETURN`.
-pub fn func_name(key: TrapKey) -> Option<BString> {
-	Some(match key {
-		TrapKey::Signal(sig) => BString::from(format!("TRAP{sig}")),
-		TrapKey::Exit => BString::from("TRAPEXIT"),
-		TrapKey::Err => BString::from("TRAPZERR"),
-		TrapKey::Debug => BString::from("TRAPDEBUG"),
-		TrapKey::Return => return None,
-	})
+/// The zsh functions that are the trap for `key`, in the order zsh's
+/// `gettrapnode` looks for them: `TRAP` and zsh's name of the signal
+/// ([`Signal::zsh_name`]: `TRAPINT`, `TRAPIOT` on Linux), then its
+/// alternate names ([`Signal::zsh_alternates`]: `TRAPIO` for `POLL`), or
+/// `TRAPEXIT`, `TRAPZERR`, `TRAPDEBUG`. None for bash's `RETURN`.
+pub fn func_names(key: TrapKey, platform: crate::bash::ids::Platform) -> Vec<BString> {
+	match key {
+		TrapKey::Signal(sig) => std::iter::once(sig.zsh_name(platform))
+			.chain(sig.zsh_alternates(platform).iter().copied())
+			.map(|name| BString::from(format!("TRAP{name}")))
+			.collect(),
+		TrapKey::Exit => vec![BString::from("TRAPEXIT")],
+		TrapKey::Err => vec![BString::from("TRAPZERR")],
+		TrapKey::Debug => vec![BString::from("TRAPDEBUG")],
+		TrapKey::Return => Vec::new(),
+	}
+}
+
+/// The trap function `func_names` puts first: the one a saved trap is put
+/// back as.
+fn func_name(key: TrapKey, platform: crate::bash::ids::Platform) -> Option<BString> {
+	func_names(key, platform).into_iter().next()
 }
 
 /// The trap key a zsh function name makes a trap of (`TRAPINT` → `INT`,
-/// `TRAPZERR` → ZERR), if any.
+/// `TRAPZERR` → ZERR, `TRAPIO` → `POLL` on Linux), if any: the signal
+/// names zsh knows ([`Signal::from_zsh_name`]).
 pub fn func_key(name: &[u8], platform: crate::bash::ids::Platform) -> Option<TrapKey> {
 	let sig = name.strip_prefix(b"TRAP")?;
 	match sig {
 		b"EXIT" => Some(TrapKey::Exit),
 		b"ZERR" | b"ERR" => Some(TrapKey::Err),
 		b"DEBUG" => Some(TrapKey::Debug),
-		_ if !sig.is_empty() && sig.iter().all(u8::is_ascii_uppercase) => {
-			Signal::parse_spec(sig, platform).map(TrapKey::Signal)
-		},
-		_ => None,
+		_ => Signal::from_zsh_name(sig, platform, false).map(TrapKey::Signal),
 	}
 }
 
@@ -127,6 +137,7 @@ fn exit_posix(
 /// The trap record for `key` now and its `TRAPNAL` function: what a scope
 /// saves (`None`: neither).
 fn current(
+	root: &state::Root,
 	store: &mut dyn StateStore,
 	vp: &Vproc,
 	key: TrapKey,
@@ -134,19 +145,20 @@ fn current(
 	if let Some(rec @ Record::Trap { .. }) = state::record(store, vp, Key::Trap(key))? {
 		return Ok(Some(rec.clone()));
 	}
-	let Some(name) = func_name(key) else {
-		return Ok(None);
-	};
-	Ok(match state::record(store, vp, Key::Func(BStr::new(&name)))? {
-		Some(rec @ Record::Func { .. }) => Some(rec.clone()),
-		_ => None,
-	})
+	for name in func_names(key, root.platform()) {
+		if let Some(rec @ Record::Func { .. }) =
+			state::record(store, vp, Key::Func(BStr::new(&name)))?
+		{
+			return Ok(Some(rec.clone()));
+		}
+	}
+	Ok(None)
 }
 
 /// Remove the trap for `key`: its record and its `TRAPNAL` function.
 fn clear(root: &mut state::Root, store: &mut dyn StateStore, vp: &mut Vproc, key: TrapKey) {
 	state::store_record(root, store, vp, KeyBuf::Trap(key), None);
-	if let Some(name) = func_name(key) {
+	for name in func_names(key, root.platform()) {
 		state::store_record(root, store, vp, KeyBuf::Func(name), None);
 	}
 }
@@ -166,7 +178,7 @@ fn put(
 			state::store_record(root, store, vp, KeyBuf::Trap(key), Some(rec));
 		},
 		Some(rec @ Record::Func { .. }) => {
-			if let Some(name) = func_name(key) {
+			if let Some(name) = func_name(key, root.platform()) {
 				state::store_record(root, store, vp, KeyBuf::Func(name), Some(rec));
 			}
 		},
@@ -190,7 +202,7 @@ pub fn start_scope(
 	if vp.trap_frames != 0 {
 		return Ok(Vec::new());
 	}
-	let Some(rec) = current(store, vp, TrapKey::Exit)? else {
+	let Some(rec) = current(root, store, vp, TrapKey::Exit)? else {
 		return Ok(Vec::new());
 	};
 	if exit_posix(root, store, vp, Some(&rec))? {
@@ -213,7 +225,7 @@ pub fn take_scope_exit(
 	cx: &mut crate::bash::vm::Cx<'_>,
 	vp: &mut Vproc,
 ) -> Result<Option<ScopeExit>, StoreError> {
-	let Some(rec) = current(cx.store, vp, TrapKey::Exit)? else {
+	let Some(rec) = current(&k.root, cx.store, vp, TrapKey::Exit)? else {
 		return Ok(None);
 	};
 	if exit_posix(&mut k.root, cx.store, vp, Some(&rec))? {
@@ -242,7 +254,7 @@ pub fn end_scope(
 	traps: Vec<(TrapKey, Option<Record>)>,
 ) -> Result<(), StoreError> {
 	if vp.trap_frames == 0 {
-		let rec = current(store, vp, TrapKey::Exit)?;
+		let rec = current(root, store, vp, TrapKey::Exit)?;
 		if rec.is_some() && !exit_posix(root, store, vp, rec.as_ref())? {
 			clear(root, store, vp, TrapKey::Exit);
 		}
@@ -292,7 +304,7 @@ pub fn save_local(
 			continue;
 		};
 		if !z.traps.iter().any(|(k, _)| *k == key) {
-			let mut now = current(store, vp, key)?;
+			let mut now = current(root, store, vp, key)?;
 			// zsh `endtrapscope` restores only a trap with text: not the
 			// ignored-on-entry `QUIT`.
 			if let TrapKey::Signal(sig) = key
@@ -337,9 +349,10 @@ pub fn func_changing(
 }
 
 /// zsh's trap key for `spec` (zsh `getsignum`): a number (0 is `EXIT`), a
-/// signal name as zsh spells it (upper case, with or without `SIG`),
-/// `EXIT`, `ZERR` (or `ERR`), `DEBUG`. Anything else is not a signal (so
-/// `trap int INT` takes `int` as the action).
+/// signal name as zsh spells it (upper case, with or without `SIG`, one
+/// of zsh's names or alternates: [`Signal::from_zsh_name`]), `EXIT`,
+/// `ZERR` (or `ERR`), `DEBUG`. Anything else is not a signal (so `trap
+/// int INT` takes `int` as the action).
 fn zsh_key(spec: &[u8], platform: crate::bash::ids::Platform) -> Option<TrapKey> {
 	if spec == b"0" {
 		return Some(TrapKey::Exit);
@@ -352,21 +365,15 @@ fn zsh_key(spec: &[u8], platform: crate::bash::ids::Platform) -> Option<TrapKey>
 		b"EXIT" => Some(TrapKey::Exit),
 		b"ZERR" | b"ERR" => Some(TrapKey::Err),
 		b"DEBUG" => Some(TrapKey::Debug),
-		_ if !name.is_empty()
-			&& name
-				.iter()
-				.all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'+') =>
-		{
-			Signal::parse_spec(name, platform).map(TrapKey::Signal)
-		},
-		_ => None,
+		_ => Signal::from_zsh_name(name, platform, false).map(TrapKey::Signal),
 	}
 }
 
-/// zsh's name of a trap in listings (`INT`, `EXIT`, `ZERR`, `DEBUG`).
-fn zsh_name(key: TrapKey) -> String {
+/// zsh's name of a trap in listings (`INT`, `EXIT`, `ZERR`, `DEBUG`;
+/// [`Signal::zsh_name`]).
+fn zsh_name(key: TrapKey, platform: crate::bash::ids::Platform) -> String {
 	match key {
-		TrapKey::Signal(sig) => sig.to_string(),
+		TrapKey::Signal(sig) => sig.zsh_name(platform).to_owned(),
 		TrapKey::Exit => "EXIT".into(),
 		TrapKey::Err => "ZERR".into(),
 		TrapKey::Debug => "DEBUG".into(),
@@ -427,7 +434,7 @@ fn zsh_change(
 	action: Option<BString>,
 ) -> Result<bool, super::Need> {
 	save_local(&mut ctx.k.root, ctx.cx.store, ctx.vp, key)?;
-	if let Some(name) = func_name(key) {
+	for name in func_names(key, ctx.k.engine.config().platform) {
 		ctx.store_record(KeyBuf::Func(name), None);
 	}
 	if let TrapKey::Signal(sig) = key
@@ -478,7 +485,7 @@ pub fn zsh_trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 					let mut line = b"trap -- ".to_vec();
 					line.extend_from_slice(&zsh_quote(&action));
 					line.push(b' ');
-					line.extend_from_slice(zsh_name(key).as_bytes());
+					line.extend_from_slice(zsh_name(key, platform).as_bytes());
 					line.push(b'\n');
 					ctx.out(&line);
 				},
