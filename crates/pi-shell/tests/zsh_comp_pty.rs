@@ -12,6 +12,13 @@
 //! (`comp_support::sgr_transcript`). The record must equal the snapshot in
 //! `tests/fixtures/zsh_comp_pty/<case>.txt`.
 //!
+//! The characters are UTF-8 (`LANG=en_US.UTF-8`) and the collation is the
+//! `C` locale's (`LC_COLLATE=C`): byte order, the same in every C library.
+//! A named locale's collation is the machine's locale data (glibc's
+//! `en_US.UTF-8` ignores punctuation, so `-a` sorts before `--color`;
+//! macOS's ignores case), so a snapshot recorded under one did not hold on
+//! the other.
+//!
 //! `PI_COMP_ORACLE=1` runs `/bin/zsh` against the snapshots;
 //! `PI_COMP_ORACLE=1 PI_COMP_BLESS=1` rewrites them from `/bin/zsh`.
 
@@ -81,7 +88,7 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 	let mut pty = shell()
 		.args(["-f", "-i"])
 		.env("PS1", "%# ")
-		.env("LC_ALL", "en_US.UTF-8")
+		.env("LC_COLLATE", "C")
 		.rc_file(".zshrc", rcfile)
 		.zle_sync()
 		.size(24, 80)
