@@ -6,6 +6,8 @@ describe("OAuth barrel imports", () => {
 	it("loads with the Anthropic provider and auth storage while preserving public exports", async () => {
 		const child = Bun.spawn([process.execPath, STATIC_IMPORT_FIXTURE], {
 			cwd: import.meta.dir,
+			// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+			env: { ...process.env, PI_TEST_RUNTIME: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});

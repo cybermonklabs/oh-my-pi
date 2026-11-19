@@ -15,6 +15,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 import { runCli } from "../src/cli";
 import * as profileAliasCli from "../src/cli/profile-alias";
 
@@ -179,8 +180,9 @@ describe("global --profile flag", () => {
 				].join("\n"),
 			);
 
+			// As production: a test process reads no agent dir's .env.
 			const childEnv: Record<string, string | undefined> = {
-				...process.env,
+				...createProductionChildEnv(),
 				HOME: home,
 				// os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
 				USERPROFILE: home,

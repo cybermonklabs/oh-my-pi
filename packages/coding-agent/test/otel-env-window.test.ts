@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 /**
  * OTEL_* values from OMP's own `.env` files stay out of `process.env`; the
@@ -76,11 +77,14 @@ async function runProbe(mode: ProbeMode, extraAgentEnv: string[] = []) {
 		);
 		const proc = Bun.spawn([process.execPath, probePath, mode], {
 			cwd,
+			// As production: a test process reads none of the home's dotenv files. Drop every inherited
+			// OTEL_* name, not a fixed list: a developer's shell may export others (OTEL_LOG_LEVEL,
+			// OTEL_PROPAGATORS, ...) that would change what the probe sees.
 			env: {
-				// Drop every inherited OTEL_* name, not a fixed list: a developer's shell may export
-				// others (OTEL_LOG_LEVEL, OTEL_PROPAGATORS, ...) that would change what the probe sees.
-				...Object.fromEntries(
-					Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith("OTEL_")),
+				...createProductionChildEnv(
+					Object.fromEntries(
+						Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith("OTEL_")),
+					),
 				),
 				HOME: home,
 				USERPROFILE: home,

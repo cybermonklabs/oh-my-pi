@@ -753,6 +753,8 @@ describe("LoopWatchdog with the JSC sampler", () => {
 				"process.stdout.write(JSON.stringify({ recordsWhileSecondRuns, samplesAfterLastStop, recordsAfterRestart }));",
 			].join("\n");
 			const proc = Bun.spawn([process.execPath, "--no-env-file", "--no-install", "--eval", script], {
+				// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+				env: { ...process.env, PI_TEST_RUNTIME: "1" },
 				stdout: "pipe",
 				stderr: "pipe",
 				timeout: 4_000,

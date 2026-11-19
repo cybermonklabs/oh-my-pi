@@ -7,7 +7,8 @@ describe("completion event retention", () => {
 			test(`${completion} releases events before ${outcome} settles the response`, async () => {
 				const child = Bun.spawn(
 					[process.execPath, path.join(import.meta.dir, "fixtures/completion-retention.ts"), completion, outcome],
-					{ stdout: "pipe", stderr: "pipe" },
+					// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+					{ env: { ...process.env, PI_TEST_RUNTIME: "1" }, stdout: "pipe", stderr: "pipe" },
 				);
 				const timeout = setTimeout(() => child.kill(), 10_000);
 				try {

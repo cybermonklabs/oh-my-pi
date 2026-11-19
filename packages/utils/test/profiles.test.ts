@@ -18,6 +18,7 @@ import {
 	setProfile,
 } from "@oh-my-pi/pi-utils/dirs";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 async function readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
 	const reader = stream.getReader();
@@ -336,8 +337,9 @@ describe("dirs module import behavior", () => {
 				].join("\n"),
 			);
 
+			// As production, in a home of its own: a test process reads no agent dir's .env.
 			const childEnv: Record<string, string | undefined> = {
-				...process.env,
+				...createProductionChildEnv(),
 				PI_CODING_AGENT_DIR: agentDir,
 			};
 			delete childEnv.OMP_WORKER_HOST_PROBE;
@@ -446,8 +448,9 @@ describe("dirs module import behavior", () => {
 				].join("\n"),
 			);
 
+			// As production: a test process reads no agent dir's .env.
 			const childEnv: Record<string, string | undefined> = {
-				...process.env,
+				...createProductionChildEnv(),
 				HOME: homeDir,
 				PI_CONFIG_DIR: profileConfigDir,
 				OMP_PROFILE: "work",

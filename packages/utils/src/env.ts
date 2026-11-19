@@ -286,10 +286,16 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
+// Eagerly parse the user's $HOME/.env, the config root's and the agent dir's .env, and the current
+// project's .env (from cwd). A `bun test` run reads only the project's: the other three are the
+// developer's own (provider keys, an auth broker, a telemetry collector), which a test must not
+// depend on. The run also sets the marker scripts/ci-test-ts.ts gives its children, so a child
+// started with this process's `process.env` is a test process too and reads none of them either.
+const isTestRun = isBunTestRuntime();
+if (isTestRun) Bun.env.PI_TEST_RUNTIME = "1";
+const homeEnv = isTestRun ? {} : parseEnvFile(path.join(os.homedir(), ".env"));
+const piEnv = isTestRun ? {} : parseEnvFile(path.join(getConfigRootDir(), ".env"));
+const agentEnv = isTestRun ? {} : parseEnvFile(path.join(getAgentDir(), ".env"));
 const projectEnv = parseEnvFile(path.join(getProjectDir(), ".env"));
 
 for (const key of Object.keys(Bun.env)) {

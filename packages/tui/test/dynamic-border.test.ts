@@ -28,7 +28,13 @@ describe("DynamicBorder", () => {
 			].join("\n");
 			const file = path.join(dir, "uninitialized-theme.ts");
 			await Bun.write(file, script);
-			const proc = Bun.spawn(["bun", file], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+			// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+			const proc = Bun.spawn(["bun", file], {
+				env: { ...process.env, PI_TEST_RUNTIME: "1" },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
 			const [exitCode, stderr] = await Promise.all([
 				proc.exited,
 				new Response(proc.stderr as ReadableStream<Uint8Array>).text(),

@@ -258,6 +258,8 @@ describe("SvgFigure", () => {
 		`;
 		const proc = Bun.spawn([process.execPath, "--eval", script], {
 			cwd: path.resolve(import.meta.dir, ".."),
+			// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+			env: { ...process.env, PI_TEST_RUNTIME: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 /**
  * OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT set in OMP's own agent
@@ -43,8 +44,9 @@ async function probeContentCapture(agentEnv: string, shellEnv: Record<string, st
 	].join("\n");
 	const proc = Bun.spawn([process.execPath, "--no-install", "--eval", script], {
 		cwd: home,
+		// As production: a test process reads none of the home's dotenv files.
 		env: {
-			...process.env,
+			...createProductionChildEnv(),
 			HOME: home,
 			USERPROFILE: home,
 			PI_CODING_AGENT_DIR: agentDir,

@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { COMPOSER_DEFAULTS, type ComposerStatusCache } from "@oh-my-pi/pi-tui/prompt/composer";
 import { ComposerCache } from "@oh-my-pi/pi-tui/prompt/composer-cache";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 function statusFor(thinkingLevel: ThinkingLevel): ComposerStatusCache {
 	return {
@@ -150,8 +151,9 @@ describe("composer startup cache", () => {
 		].join("\n");
 		const proc = Bun.spawn([process.execPath, "--no-env-file", "--no-install", "--eval", script], {
 			cwd: root,
+			// As production: a test process reads none of the home's dotenv files.
 			env: {
-				...process.env,
+				...createProductionChildEnv(),
 				HOME: home,
 				XDG_CACHE_HOME: undefined,
 				PI_CODING_AGENT_DIR: undefined,

@@ -14,6 +14,7 @@ import {
 	stripGitRepoLocationEnv,
 	withOmpOtelEnv,
 } from "@oh-my-pi/pi-utils/env";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const tempDirs: string[] = [];
 
@@ -71,7 +72,8 @@ async function runRuntimeProbe(
 	const cwd = path.dirname(writeTempEnv(""));
 	const proc = Bun.spawn([process.execPath, probePath], {
 		cwd,
-		env: { ...process.env, ...env },
+		// As production, in a home of its own, with the runner signals of each case on top.
+		env: { ...createProductionChildEnv(), ...env },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -321,6 +323,8 @@ describe("filterChildShellEnv", () => {
 			].join("\n");
 			const proc = Bun.spawn([process.execPath, "--no-install", "--eval", script], {
 				cwd,
+				// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+				env: { ...process.env, PI_TEST_RUNTIME: "1" },
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -374,6 +378,59 @@ describe("isBunTestRuntime", () => {
 				underscoreProbePath,
 			),
 		).toBe(true);
+	});
+});
+
+describe("the home's dotenv files", () => {
+	const names = ["HOME_DOTENV_PROBE", "CONFIG_ROOT_DOTENV_PROBE", "AGENT_DOTENV_PROBE"];
+
+	// A probe in a home whose `.env`, `.omp/.env` and `.omp/agent/.env` each set one of `names`. It
+	// prints the names it loaded, and the names loaded by a child it gives its environment.
+	async function probeHome(env: Record<string, string>, probeName = "probe.ts"): Promise<Record<string, string[]>> {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-home-dotenv-"));
+		tempDirs.push(home);
+		fs.mkdirSync(path.join(home, ".omp", "agent"), { recursive: true });
+		fs.mkdirSync(path.join(home, "project"));
+		fs.writeFileSync(path.join(home, ".env"), `${names[0]}=1\n`);
+		fs.writeFileSync(path.join(home, ".omp", ".env"), `${names[1]}=1\n`);
+		fs.writeFileSync(path.join(home, ".omp", "agent", ".env"), `${names[2]}=1\n`);
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		const loaded = `${JSON.stringify(names)}.filter(name => process.env[name] !== undefined)`;
+		const child = `import ${JSON.stringify(envModulePath)}; process.stdout.write(JSON.stringify(${loaded}));`;
+		const probePath = path.join(home, probeName);
+		fs.writeFileSync(
+			probePath,
+			[
+				`import ${JSON.stringify(envModulePath)};`,
+				`const child = Bun.spawnSync([process.execPath, "-e", ${JSON.stringify(child)}], { env: process.env });`,
+				`process.stdout.write(JSON.stringify({ self: ${loaded}, child: JSON.parse(child.stdout.toString()) }));`,
+			].join("\n"),
+		);
+		const proc = Bun.spawn([process.execPath, probePath], {
+			cwd: path.join(home, "project"),
+			env: { ...createProductionChildEnv(), HOME: home, USERPROFILE: home, ...env },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		return JSON.parse(stdout);
+	}
+
+	it("are loaded by a production process and its children", async () => {
+		expect(await probeHome({})).toEqual({ self: names, child: names });
+	});
+
+	it("are loaded by neither a test child nor its children", async () => {
+		expect(await probeHome({ PI_TEST_RUNTIME: "1" })).toEqual({ self: [], child: [] });
+	});
+
+	it("are not loaded by a bun test entry, which marks its children as test children", async () => {
+		expect(await probeHome({ NODE_ENV: "test" }, "probe_test.ts")).toEqual({ self: [], child: [] });
 	});
 });
 
@@ -438,7 +495,8 @@ describe("OTEL_* from omp's own .env files", () => {
 	}
 
 	// The dotenv loader runs at module load, so each case needs a fresh process
-	// whose agent dir and HOME are temp dirs.
+	// whose agent dir and HOME are temp dirs. It runs as production: a test
+	// process reads none of the home's dotenv files.
 	async function runProbe(shellEnv: Record<string, string>): Promise<ProbeResult> {
 		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-utils-otel-home-"));
 		const agentDir = path.join(home, "agent");
@@ -488,7 +546,7 @@ describe("OTEL_* from omp's own .env files", () => {
 		const proc = Bun.spawn([process.execPath, "--no-install", "--no-env-file", "--eval", script], {
 			cwd,
 			env: {
-				...process.env,
+				...createProductionChildEnv(),
 				HOME: home,
 				USERPROFILE: home,
 				PI_CODING_AGENT_DIR: agentDir,

@@ -5,6 +5,8 @@ describe("Cursor proxy resolution", () => {
 	it("tunnels the run through HTTPS_PROXY when no PI_PROXY is set", async () => {
 		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures/cursor-proxy-env.ts")], {
 			cwd: path.resolve(import.meta.dir, "../../.."),
+			// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+			env: { ...process.env, PI_TEST_RUNTIME: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});

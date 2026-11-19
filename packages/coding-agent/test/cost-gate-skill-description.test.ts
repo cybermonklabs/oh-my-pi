@@ -1,15 +1,14 @@
 import { expect, it } from "bun:test";
 import * as path from "node:path";
 import { $ } from "bun";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const fixture = path.join(import.meta.dir, "fixtures/cost-gate-skill-description.ts");
 
 async function run(mode: "supplied" | "root" | "metered" | "queued"): Promise<{ calls: number; spent: number }> {
-	// The fixture must run outside the test runtime, which the CI runner marks on every child via PI_TEST_RUNTIME.
-	const result = await $`${process.execPath} ${fixture} ${mode}`
-		.env({ ...process.env, PI_TEST_RUNTIME: undefined })
-		.quiet()
-		.nothrow();
+	// The fixture must run outside the test runtime, which the CI runner marks on every child via PI_TEST_RUNTIME:
+	// it runs as production, in a home of its own.
+	const result = await $`${process.execPath} ${fixture} ${mode}`.env(createProductionChildEnv()).quiet().nothrow();
 	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
 	return JSON.parse(result.stdout.toString());
 }

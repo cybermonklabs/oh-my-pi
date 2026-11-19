@@ -142,7 +142,11 @@ describe("terminal notifications", () => {
 			for (let i = 0; i < 2; i++) console.log(kitty.formatNotification({ title: "omp", body: "Complete" }));
 		`;
 		const idsFromProcess = () => {
-			const result = Bun.spawnSync([process.execPath, "-e", script], { cwd: import.meta.dir });
+			// Marked as a test child, so it reads none of the home's dotenv files (packages/utils/src/env.ts).
+			const result = Bun.spawnSync([process.execPath, "-e", script], {
+				cwd: import.meta.dir,
+				env: { ...process.env, PI_TEST_RUNTIME: "1" },
+			});
 			expect(result.exitCode).toBe(0);
 			return [...result.stdout.toString().matchAll(/\x1b\]99;i=([^:;]+):f=/gu)].map(m => m[1]);
 		};
