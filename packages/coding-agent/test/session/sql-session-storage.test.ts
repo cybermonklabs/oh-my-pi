@@ -804,8 +804,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files /),
 				expect.stringMatching(/^DELETE FROM "public"\.omp_session_files_parts /),
 				expect.stringMatching(/^INSERT INTO "public"\.omp_session_files_parts /),
-				// A full write replaces the session's references too; it names no blob, so it adds none.
-				expect.stringMatching(/^DELETE FROM "public"\.omp_session_files_refs /),
+				// A full write replaces the session's references too: it reads them first, to lock their blobs'
+				// rows before it deletes them; it names no blob and the stub has none, so it locks, deletes and adds none.
+				expect.stringMatching(/^SELECT sha256, path FROM "public"\.omp_session_files_refs WHERE path IN /),
 			]);
 
 			const appendStart = queries.length;

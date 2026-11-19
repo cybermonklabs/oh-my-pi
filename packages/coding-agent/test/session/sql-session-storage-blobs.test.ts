@@ -900,6 +900,80 @@ describe("session blobs in the SQL session storage", () => {
 				});
 			});
 
+			// A full write that stops naming a blob: session P named T and is rewritten to name only U; session Q
+			// also names T, sorts just before P, and is deleted while P's write is paused after it deleted its
+			// references. The write read those references first and locked T's row too, so the delete waits for
+			// the write's commit and then takes T with its last reference. With U before T, the write's insert of
+			// (P, U) falls in the gap the delete's reference delete would lock (on MySQL and MariaDB, the
+			// deadlock of a write that locks only U's row); with U after T, the control, it does not.
+			for (const order of ["before", "after"] as const) {
+				it(`drops, with no deadlock or retry, the row of a blob a full write stops naming, when a delete of another session naming it meets the write (U sorts ${order} T)`, async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const removerQueries: string[] = [];
+					const storage = await db.open({ wrap: client => recordingClient(client, removerQueries) });
+					let gate: GatedClient | undefined;
+					const queries: string[] = [];
+					const writer = await db.open({
+						wrap: client => {
+							gate = gatedClient(recordingClient(client, queries), REF_DELETE, "after");
+							return gate.client;
+						},
+					});
+					const [low, high] = [imageBytes(21), imageBytes(22)].sort((a, b) => (sha256(a) < sha256(b) ? -1 : 1));
+					const [kept, dropped] = order === "before" ? [low, high] : [high, low];
+					// Q, then P: Q's references sort right before P's in the reference table.
+					const q = await writeImageSession(db, storage, [dropped]);
+					const p = await writeImageSession(db, writer, [dropped]);
+					writer.blobTier.store(sha256(kept), kept, "image/png");
+					await writer.drain();
+					const [row] = await db.sql(`SELECT created_ms FROM ${db.table}_blobs WHERE sha256 = @1`, [sha256(kept)]);
+					const created = Number(row?.created_ms);
+					const content = ((await db.row(p))?.content ?? "").replaceAll(sha256(dropped), sha256(kept));
+
+					queries.length = 0;
+					removerQueries.length = 0;
+					gate?.close();
+					const writing = writer.writeText(p, content).then(() => writer.drain());
+					let first: string | undefined;
+					let removing: Promise<void> | undefined;
+					try {
+						await Promise.race([gate?.paused(), writing]);
+						removing = storage.unlink(q);
+						// A real wait: the delete must not finish while the write's transaction is open on the server.
+						first = await Promise.race([
+							removing.then(() => "removed"),
+							Bun.sleep(1000).then(() => "waiting for the write"),
+						]);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([writing, removing]);
+					const [keptRow] = await db.sql(`SELECT created_ms FROM ${db.table}_blobs WHERE sha256 = @1`, [
+						sha256(kept),
+					]);
+					expect({
+						first,
+						blobs: await blobHashes(db),
+						created: Number(keptRow?.created_ms),
+						refs: (await db.sql(`SELECT path, sha256 FROM ${db.table}_refs`)).map(found => [
+							String(found.path),
+							String(found.sha256),
+						]),
+						writerReferenceDeletes: queries.filter(query => REF_DELETE.test(query)).length,
+						writerReferenceInserts: queries.filter(query => REF_INSERT.test(query)).length,
+						removerReferenceDeletes: removerQueries.filter(query => REF_DELETE.test(query)).length,
+					}).toEqual({
+						first: "waiting for the write",
+						blobs: [sha256(kept)],
+						created,
+						refs: [[p, sha256(kept)]],
+						writerReferenceDeletes: 1,
+						writerReferenceInserts: 1,
+						removerReferenceDeletes: 1,
+					});
+				});
+			}
+
 			it("lands again, from this machine's blob store, a blob a delete took while a write naming it waited", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				let gate: GatedClient | undefined;
@@ -1031,11 +1105,11 @@ describe("session blobs in the SQL session storage", () => {
 		storage.blobTier.store(sha256(large), large, "image/png");
 		storage.blobTier.store(sha256(small), small, "image/png");
 		await storage.drain();
-		// The bound is the packet less 1 MiB: two parts of the large image, then its own row, then the small one.
+		// The bound is the packet less 1 MiB: the large image's own row, then its two parts in hash order (a
+		// delete takes them in that order too), then the small one.
 		expect(inserted).toEqual([
-			sha256(large.subarray(0, MIB)),
-			sha256(large.subarray(MIB)),
 			sha256(large),
+			...[sha256(large.subarray(0, MIB)), sha256(large.subarray(MIB))].sort(),
 			sha256(small),
 		]);
 	});

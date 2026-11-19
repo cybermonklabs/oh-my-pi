@@ -239,7 +239,7 @@ interface DialectQueries {
 	createRefsIndex: string | undefined;
 	/** Add the reference of `@path` to `@sha256` unless it is there. */
 	insertRef: Statement;
-	/** The hashes `count` paths reference, bound as `@p0` to `@p<count - 1>`. */
+	/** The references of `count` paths (path and hash), bound as `@p0` to `@p<count - 1>`. */
 	refsOf(count: number): Statement;
 	/** The hashes the paths under `@dir` (its first `@len` characters) reference. */
 	refsUnder: Statement;
@@ -249,8 +249,10 @@ interface DialectQueries {
 	deleteRefsUnder: Statement;
 	/** Hand `@src`'s references to `@dst`. */
 	moveRefs: Statement;
-	/** Drop the references of session paths that have no session row (deleted by a build that kept no references). */
-	deleteDanglingRefs: Statement;
+	/** The references (path and hash) of session paths that have no session row (deleted by a build that kept no references). */
+	danglingRefs: Statement;
+	/** Drop the reference of `@path` to `@sha256` while `@path` has no session row. */
+	deleteDanglingRef: Statement;
 	/** MySQL and SQLite: the columns of a table's primary key, in key order (PostgreSQL: {@link PG_PRIMARY_KEY}). */
 	primaryKey: Statement | undefined;
 	/** MySQL: statements that change no row and need, each, one privilege the store's writes need on the blob and reference tables. */
@@ -451,6 +453,12 @@ interface BlobDigestRow {
 
 /** A row with only a hash column. */
 interface HashRow {
+	sha256: string;
+}
+
+/** A reference row. */
+interface RefRow {
+	path: string;
 	sha256: string;
 }
 
@@ -1284,21 +1292,21 @@ function buildQueries(
 			`INSERT INTO ${refs} (path, sha256) VALUES (@path, @sha256) ` +
 				(mysql ? "ON DUPLICATE KEY UPDATE path = path" : "ON CONFLICT (path, sha256) DO NOTHING"),
 		),
-		refsOf: count => sql(`SELECT sha256 FROM ${refs} WHERE path IN (${inList("p", count)})`),
+		refsOf: count => sql(`SELECT sha256, path FROM ${refs} WHERE path IN (${inList("p", count)})`),
 		refsUnder: sql(`SELECT sha256 FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
 		referenced: count =>
 			sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})${mysql ? " LOCK IN SHARE MODE" : ""}`),
 		deleteRefs: sql(`DELETE FROM ${refs} WHERE path = @path`),
 		deleteRefsUnder: sql(`DELETE FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
 		moveRefs: sql(`UPDATE ${refs} SET path = @dst WHERE path = @src`),
-		deleteDanglingRefs: sql(
-			(mysql
-				? `DELETE r FROM ${refs} AS r`
-				: adapter === "postgres"
-					? `DELETE FROM ${refs} AS r`
-					: `DELETE FROM ${refs}`) +
-				` WHERE substr(${adapter === "sqlite" ? refs : "r"}.path, 1, ${BLOB_PARTS_PATH.length}) <> '${BLOB_PARTS_PATH}' ` +
-				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = ${adapter === "sqlite" ? refs : "r"}.path)`,
+		danglingRefs: sql(
+			`SELECT r.path AS path, r.sha256 AS sha256 FROM ${refs} AS r ` +
+				`WHERE substr(r.path, 1, ${BLOB_PARTS_PATH.length}) <> '${BLOB_PARTS_PATH}' ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = r.path)`,
+		),
+		deleteDanglingRef: sql(
+			`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
 		),
 		primaryKey: {
 			postgres: undefined,
@@ -3572,11 +3580,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * {@link #deleteOrphans}); a delete that came first leaves no row, so the
 	 * write throws {@link BlobsGoneError} for the blobs of this store's it
 	 * names, unless `allowGone`, which only warns. With `replace`, `path`'s
-	 * references are dropped first, after the rows' locks: no statement here
-	 * touches the reference table before every blob row lock is held, the
-	 * order a delete takes too (see {@link #takeRefs}), so on MySQL and
-	 * MariaDB neither waits for the other's reference-table locks while
-	 * holding a blob row's lock the other wants.
+	 * references are replaced: they are read first, the rows of the blobs
+	 * they name are locked shared together with those of `named` (see
+	 * {@link #lockBlobRows}), and only then are they deleted (when there are
+	 * any) and `named`'s inserted. So every reference this deletes or inserts
+	 * names a row this transaction holds, as on every other path that
+	 * changes references.
 	 */
 	async #addRefs(
 		transaction: SqlSessionStorageTransaction,
@@ -3585,25 +3594,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		allowGone: boolean,
 		replace = false,
 	): Promise<void> {
-		const locked = new Set<string>();
-		for (const batch of batches([...named].sort(), BLOB_READ_BATCH)) {
-			// Lock only rows there are: a locking read of a missing key locks a gap on MySQL.
-			const there = (await run(
-				transaction,
-				this.#q.selectBlobSizes(batch.length),
-				listValues("h", batch),
-			)) as HashRow[];
-			if (there.length === 0) continue;
-			const keys = there.map(row => row.sha256).sort();
-			const rows = (await run(
-				transaction,
-				this.#q.lockBlobs(keys.length, false),
-				listValues("h", keys),
-			)) as HashRow[];
-			for (const row of rows) locked.add(row.sha256);
-		}
-		if (replace) await run(transaction, this.#q.deleteRefs, { path });
-		for (const sha256 of locked) await run(transaction, this.#q.insertRef, { path, sha256 });
+		const current = replace ? (await this.#refsOf(transaction, [path])).map(row => row.sha256) : [];
+		const locked = await this.#lockBlobRows(transaction, [...named, ...current]);
+		if (current.length > 0) await run(transaction, this.#q.deleteRefs, { path });
+		for (const sha256 of named) if (locked.has(sha256)) await run(transaction, this.#q.insertRef, { path, sha256 });
 		const gone = [...named].filter(hash => !locked.has(hash) && this.blobs.knows(hash));
 		if (gone.length === 0) return;
 		if (!allowGone) throw new BlobsGoneError(gone);
@@ -3617,31 +3611,48 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Add the blob row of `hash` unless the table has one, in a transaction of
 	 * its own under no session's fence: the row is keyed by its content and
 	 * never changes. A blob larger than `limit` is stored as parts, each a row
-	 * of its own hash referenced from `blob:sha256:<hash>`, and then the row of
-	 * `hash`, whose content lists the parts' keys and whose `byte_len` is the
-	 * whole blob's (see {@link BLOB_PARTS_PATH}). Answers whether this call
-	 * added the row of `hash`.
+	 * of its own hash referenced from `blob:sha256:<hash>`: the row of `hash`
+	 * goes first, whose content lists the parts' keys and whose `byte_len` is
+	 * the whole blob's (see {@link BLOB_PARTS_PATH}), then the parts' rows,
+	 * locked, then their references: the order a delete takes them in (see
+	 * {@link #deleteOrphans}). Answers whether this call added the row of
+	 * `hash`.
 	 */
 	async insertBlob(hash: string, data: Uint8Array, mimeType: string | undefined, limit: number): Promise<boolean> {
 		const created = Date.now();
 		let added = false;
 		await this.#fencedTransaction([], async transaction => {
-			let content = data;
+			const parts = new Map<string, Uint8Array>();
+			const keys: string[] = [];
 			if (data.byteLength > limit) {
-				const keys: string[] = [];
 				for (let start = 0; start < data.byteLength; start += limit) {
 					const part = data.subarray(start, Math.min(start + limit, data.byteLength));
 					const key = blobSha256(part);
 					keys.push(key);
-					const values = { sha256: key, content: part, len: part.byteLength, mime: null, created };
-					await run(transaction, this.#q.insertBlob, values);
-					await run(transaction, this.#q.insertRef, { path: `${BLOB_PARTS_PATH}${hash}`, sha256: key });
+					parts.set(key, part);
 				}
-				content = Buffer.from(keys.join(""), "latin1");
 			}
+			const content = keys.length > 0 ? Buffer.from(keys.join(""), "latin1") : data;
 			const values = { sha256: hash, content, len: data.byteLength, mime: mimeType ?? null, created };
 			const result = await run(transaction, this.#q.insertBlob, values);
 			added = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+			if (parts.size === 0) return;
+			// A part already there is locked shared, so no delete takes it; a missing one is inserted, which locks it.
+			const locked = await this.#lockBlobRows(transaction, parts.keys());
+			for (const key of [...parts.keys()].sort()) {
+				if (locked.has(key)) continue;
+				const part = parts.get(key) ?? new Uint8Array();
+				await run(transaction, this.#q.insertBlob, {
+					sha256: key,
+					content: part,
+					len: part.byteLength,
+					mime: null,
+					created,
+				});
+			}
+			for (const key of parts.keys()) {
+				await run(transaction, this.#q.insertRef, { path: `${BLOB_PARTS_PATH}${hash}`, sha256: key });
+			}
 		});
 		return added;
 	}
@@ -3768,9 +3779,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 */
 	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
 		if (apply) {
-			await this.#fencedTransaction([], transaction =>
-				run(transaction, this.#q.deleteDanglingRefs, {}).then(() => undefined),
-			);
+			// The references of paths that have no session row, each dropped with its blob's row locked first.
+			const dangling = (await this.#exclusive(() => this.#readOne(this.#q.danglingRefs, {}))) as RefRow[];
+			const byHash = new Map<string, string[]>();
+			for (const row of dangling) byHash.set(row.sha256, [...(byHash.get(row.sha256) ?? []), row.path]);
+			for (const batch of batches([...byHash.keys()].sort(), BLOB_READ_BATCH)) {
+				await this.#fencedTransaction([], async transaction => {
+					await this.#lockBlobRows(transaction, [], batch);
+					for (const sha256 of batch) {
+						for (const path of byHash.get(sha256) ?? []) {
+							await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
+						}
+					}
+				});
+			}
 		}
 		const rows = (await this.#exclusive(() =>
 			this.#readOne(this.#q.sweepCandidates, { before: beforeMs }),
@@ -3786,7 +3808,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		for (const batch of batches([...sizes.keys()], BLOB_READ_BATCH)) {
 			let deleted: string[] = [];
 			await this.#fencedTransaction([], async transaction => {
-				deleted = await this.#deleteOrphans(transaction, await this.#lockBlobRows(transaction, batch));
+				deleted = await this.#deleteOrphans(transaction, [...(await this.#lockBlobRows(transaction, [], batch))]);
 			});
 			for (const hash of deleted) {
 				const size = sizes.get(hash);
@@ -3843,9 +3865,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// parts orphaned under `dst` go, then `src`'s follow its row.
 			await this.#deleteParts(transaction, dst);
 			await run(transaction, this.#q.renameParts, { src, dst });
-			// The replaced session's references go (its blobs' rows locked first), `src`'s follow it, then the
-			// blobs only the replaced one named.
-			const replaced = await this.#takeRefs(transaction, [dst]);
+			// The references change last, the rows of every blob they name locked first: the replaced session's
+			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared).
+			const moving = (await this.#refsOf(transaction, [src])).map(row => row.sha256);
+			const replaced = await this.#takeRefs(transaction, [dst], undefined, moving);
 			await run(transaction, this.#q.moveRefs, { src, dst });
 			await this.#deleteOrphans(transaction, replaced);
 		});
@@ -3854,47 +3877,88 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * Delete the references of `paths` (and of every path under `under`),
-	 * answering the blob rows they named that the table holds, each locked
-	 * exclusive before any reference goes: the order a write takes, which
-	 * locks a blob's row shared and then inserts its reference (see
-	 * {@link #addRefs}). Deleting the references first would, on MySQL and
-	 * MariaDB, hold next-key locks on the reference table that a write's
-	 * insert waits for, while this transaction waits for that write's share
-	 * lock on the row: a deadlock.
+	 * answering the blob rows they named that the table holds. Those rows are
+	 * locked exclusive before any reference goes, with the rows of `alsoShared`
+	 * (blobs whose references the caller changes next) locked shared in the
+	 * same pass (see {@link #lockBlobRows}).
 	 */
 	async #takeRefs(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
 		under?: { dir: string; len: number },
+		alsoShared: readonly string[] = [],
 	): Promise<string[]> {
-		const hashes = new Set<string>();
+		const rows = await this.#refsOf(transaction, paths);
+		const below = under ? ((await run(transaction, this.#q.refsUnder, under)) as HashRow[]) : [];
+		const hashes = new Set([...rows, ...below].map(row => row.sha256));
+		const locked = await this.#lockBlobRows(transaction, alsoShared, hashes);
+		// Only paths that have references: a delete that finds no row still locks a gap on MySQL.
+		for (const path of new Set(rows.map(row => row.path))) await run(transaction, this.#q.deleteRefs, { path });
+		if (under && below.length > 0) await run(transaction, this.#q.deleteRefsUnder, under);
+		return [...hashes].filter(hash => locked.has(hash));
+	}
+
+	/** The references of `paths`, read without a lock. */
+	async #refsOf(transaction: SqlSessionStorageTransaction, paths: readonly string[]): Promise<RefRow[]> {
+		const rows: RefRow[] = [];
 		for (const batch of batches(paths, BLOB_READ_BATCH)) {
-			const rows = (await run(transaction, this.#q.refsOf(batch.length), listValues("p", batch))) as HashRow[];
-			for (const row of rows) hashes.add(row.sha256);
+			rows.push(...((await run(transaction, this.#q.refsOf(batch.length), listValues("p", batch))) as RefRow[]));
 		}
-		if (under)
-			for (const row of (await run(transaction, this.#q.refsUnder, under)) as HashRow[]) hashes.add(row.sha256);
-		const locked = await this.#lockBlobRows(transaction, [...hashes]);
-		for (const path of paths) await run(transaction, this.#q.deleteRefs, { path });
-		if (under) await run(transaction, this.#q.deleteRefsUnder, under);
-		return locked;
+		return rows;
 	}
 
 	/**
-	 * Lock exclusive, in `sha256` order, the blob rows of `hashes` the table
-	 * holds, and answer their hashes. A write adding a reference holds its
-	 * row shared until it commits, so this waits for such a write. SQLite
-	 * runs one write at a time, and only reads which rows there are.
+	 * The reference table's one lock rule: a transaction that inserts or
+	 * deletes `<table>_refs` rows first holds the row of every blob those
+	 * references name, all taken here in one pass in `sha256` order (shared
+	 * for `shared`, exclusive for `exclusive`; a hash in both is locked
+	 * exclusive). A statement that deletes a path's references reads them
+	 * first, without a lock, so their blobs are among these. Every path
+	 * follows it: a transcript write (append and full write), the write-back
+	 * when a session opens, a delete, a rename, the sweep, and a parted
+	 * blob's insert. So a transaction holding a reference-table lock never
+	 * waits for a blob row's lock, and a transaction waiting for one holds no
+	 * reference-table lock: on MySQL and MariaDB a write's reference insert
+	 * and a delete's next-key locks on the same table cannot deadlock.
+	 * Answers the hashes whose rows the table holds and this locked; only rows
+	 * there are are locked, since a locking read of a missing key locks a gap
+	 * on MySQL. SQLite runs one write at a time, and only reads which rows
+	 * there are.
 	 */
-	async #lockBlobRows(transaction: SqlSessionStorageTransaction, hashes: readonly string[]): Promise<string[]> {
-		const locked: string[] = [];
-		for (const batch of batches([...new Set(hashes)].sort(), BLOB_READ_BATCH)) {
-			const rows = (await run(
-				transaction,
-				this.#q.lockBlobs(batch.length, true),
-				listValues("h", batch),
-			)) as HashRow[];
-			for (const row of rows) locked.push(row.sha256);
+	async #lockBlobRows(
+		transaction: SqlSessionStorageTransaction,
+		shared: Iterable<string>,
+		exclusive: Iterable<string> = [],
+	): Promise<Set<string>> {
+		const modes = new Map<string, boolean>();
+		for (const hash of shared) modes.set(hash, false);
+		for (const hash of exclusive) modes.set(hash, true);
+		const locked = new Set<string>();
+		for (const batch of batches([...modes.keys()].sort(), BLOB_READ_BATCH)) {
+			const there = new Set(
+				((await run(transaction, this.#q.selectBlobSizes(batch.length), listValues("h", batch))) as HashRow[]).map(
+					row => row.sha256,
+				),
+			);
+			// One statement per run of rows of one mode, so the rows are locked in `sha256` order across modes.
+			let group: string[] = [];
+			const flush = async (): Promise<void> => {
+				if (group.length === 0) return;
+				const exclusiveGroup = modes.get(group[0] ?? "") === true;
+				const rows = (await run(
+					transaction,
+					this.#q.lockBlobs(group.length, exclusiveGroup),
+					listValues("h", group),
+				)) as HashRow[];
+				for (const row of rows) locked.add(row.sha256);
+				group = [];
+			};
+			for (const hash of batch) {
+				if (!there.has(hash)) continue;
+				if (group.length > 0 && modes.get(group[0] ?? "") !== modes.get(hash)) await flush();
+				group.push(hash);
+			}
+			await flush();
 		}
 		return locked;
 	}
