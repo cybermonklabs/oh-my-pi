@@ -4,7 +4,7 @@
 
 ### Added
 
-- `AssistantRetryRecovery.kept` marks a kept turn whose continuation succeeded: a failed turn an automatic retry kept in context and continued from instead of sending it again
+- `AssistantMessage.continued` marks a failed turn a later turn continued from instead of sending it again (a rate limit or a cut stream after visible text, a cut stream or a reasonless abort after complete tool calls, tool calls that provably never ran, a malformed function call), set once the continuation succeeded
 
 ### Fixed
 

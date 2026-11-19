@@ -377,8 +377,21 @@ type PendingRetryError = {
 	recovery: AssistantRetryRecoveryKind;
 	attempt: number;
 	note: string;
-	/** The retry kept the failed turn in context and continued from it (`AssistantRetryRecovery.kept`). */
+	/** The retry kept the failed turn in context to continue from it: marked `continued` if the saga recovers. */
 	kept: boolean;
+};
+
+/**
+ * What a recovery writes on the session entry of a failed assistant turn: a
+ * closing retry saga's `retryRecovery`, and `continued` on a turn kept in
+ * context that a later turn has continued from (`AssistantMessage.continued`).
+ */
+type RecoveryStamp = {
+	entryId: string;
+	/** The entry's message, which the stamp changes in place. */
+	message: AssistantMessage;
+	retryRecovery?: AssistantRetryRecovery;
+	continued?: true;
 };
 
 /** How a retry saga's pending error entries are annotated when it closes. */
@@ -454,6 +467,13 @@ export class TurnRecovery {
 	};
 	#usageReserveApproval: { model: string; sessionId: string } | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
+	/**
+	 * Failed turns a stream-stall or malformed-call continuation kept in context
+	 * and continued from, outside any retry saga: marked `continued` on the next
+	 * successful settle, forgotten when an error ends the run or a new prompt
+	 * starts.
+	 */
+	#continuedTurns: AssistantMessage[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
@@ -591,7 +611,7 @@ export class TurnRecovery {
 		}
 	}
 
-	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
+	/** Resets per-prompt recovery counters, terminal-stop acceptance, and the turns a continuation kept. */
 	resetForNewPrompt(): void {
 		this.#emptyStopRetryCount = 0;
 		this.#unexpectedStopRetryCount = 0;
@@ -599,6 +619,7 @@ export class TurnRecovery {
 		this.#streamStallContinueCount = 0;
 		this.#acceptTerminalEmptyStopForPrompt = false;
 		this.#activeFallbackCreditRedemption = undefined;
+		this.#continuedTurns = [];
 	}
 
 	/** Sets whether one terminal empty stop is accepted for the current prompt. */
@@ -623,7 +644,8 @@ export class TurnRecovery {
 	/**
 	 * Records which model produced this turn, re-arms the one-shot Responses
 	 * request-body-timeout recovery, marks an active fallback as having served,
-	 * then closes a successful retry saga and annotates recovered persisted
+	 * marks `continued` the turns a stream-stall or malformed-call continuation
+	 * kept, then closes a successful retry saga and annotates recovered persisted
 	 * errors.
 	 */
 	async onAssistantSettledSuccessfully(message: AssistantMessage): Promise<void> {
@@ -662,6 +684,7 @@ export class TurnRecovery {
 				role: this.#activeRetryFallback.role,
 			});
 		}
+		await this.#markContinuedTurns();
 		if (this.#retryAttempt === 0) {
 			return;
 		}
@@ -671,9 +694,15 @@ export class TurnRecovery {
 		);
 	}
 
-	/** Closes a failed retry saga when no compaction continuation took ownership. */
+	/**
+	 * Forgets the turns a continuation kept, which this error leaves unmarked,
+	 * and closes a failed retry saga when no compaction continuation took
+	 * ownership.
+	 */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
-		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
+		if (message.stopReason !== "error") return;
+		this.#continuedTurns = [];
+		if (this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		this.#continuingCommittedText = false;
@@ -709,8 +738,10 @@ export class TurnRecovery {
 	 * rendered, so {@link isRetryableError} refuses to replay the turn and the
 	 * session stopped on a pinned error. Nothing ran and nothing needs
 	 * replaying: keep the failed turn in context so the model sees its own
-	 * output, append a corrective developer message, and resume. Bounded per
-	 * prompt; past the cap the error surfaces as before.
+	 * output, append a corrective developer message, and resume; once a
+	 * continuation succeeds the turn is marked `continued`, so a context rebuilt
+	 * from the session keeps it too. Bounded per prompt; past the cap the error
+	 * surfaces as before.
 	 */
 	handleMalformedFunctionCallStop(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
@@ -751,6 +782,7 @@ export class TurnRecovery {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
+		this.#continuedTurns.push(message);
 		this.#host.scheduleAgentContinue({
 			source: "malformed-function-call-retry",
 			generation: this.#host.promptGeneration(),
@@ -766,8 +798,10 @@ export class TurnRecovery {
 	 * with tool calls, so the session used to stop on a pinned error. Resuming
 	 * from the trailing assistant message would be a prefill, which newer Claude
 	 * models reject: keep the partial turn in context, append a developer
-	 * reminder to pick up where the text stopped, and continue. Honors
-	 * `retry.enabled`; bounded per prompt, past the cap the error surfaces as before.
+	 * reminder to pick up where the text stopped, and continue; once a
+	 * continuation succeeds the turn is marked `continued`, so a context rebuilt
+	 * from the session keeps it too. Honors `retry.enabled`; bounded per
+	 * prompt, past the cap the error surfaces as before.
 	 * A socket close counts here but not for tool turns: without tool calls there
 	 * is no executed side effect whose resumption policy it could change. So does a
 	 * Codex native-lane steer rejection: the server dropped the response over our
@@ -809,6 +843,7 @@ export class TurnRecovery {
 			this.#streamStallContinueCount,
 			STREAM_STALL_CONTINUE_MAX_RETRIES,
 		);
+		this.#continuedTurns.push(message);
 		this.#host.scheduleAgentContinue({
 			source: "stream-stall-continue",
 			generation: this.#host.promptGeneration(),
@@ -1099,6 +1134,7 @@ export class TurnRecovery {
 			branchById.set(entry.id, entry);
 		}
 		const retryErrors: RetryErrorUpdate[] = [];
+		const stamps: RecoveryStamp[] = [];
 		for (const pending of this.#pendingRetryErrors) {
 			let entry = branchById.get(pending.entryId);
 			if (entry?.type !== "message" || entry.message.role !== "assistant") {
@@ -1111,6 +1147,8 @@ export class TurnRecovery {
 			}
 			if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
 			let retryRecovery: AssistantRetryRecovery;
+			// Only a recovered kept turn is followed by its successful continuation.
+			const continued = completion.status === "recovered" && pending.kept;
 			if (completion.status === "recovered") {
 				retryRecovery = {
 					kind: "auto-retry",
@@ -1119,8 +1157,6 @@ export class TurnRecovery {
 					recoveredAt: new Date().toISOString(),
 					recovery: pending.recovery,
 					note: pending.note,
-					// Only a recovered kept turn is followed by its successful continuation.
-					...(pending.kept ? { kept: true as const } : {}),
 					supersededBy: {
 						timestamp: completion.supersedingMessage.timestamp,
 						...(completion.supersedingMessage.responseId === undefined
@@ -1139,7 +1175,12 @@ export class TurnRecovery {
 					note: pending.note,
 				};
 			}
-			entry.message.retryRecovery = retryRecovery;
+			stamps.push({
+				entryId: entry.id,
+				message: entry.message,
+				retryRecovery,
+				...(continued ? { continued: true as const } : {}),
+			});
 			retryErrors.push({
 				entryId: entry.id,
 				persistenceKey: pending.persistenceKey,
@@ -1147,10 +1188,41 @@ export class TurnRecovery {
 				retryRecovery,
 			});
 		}
-		if (retryErrors.length > 0) {
-			await this.#host.sessionManager.rewriteEntries();
-		}
+		await this.#writeRecoveryStamps(stamps);
 		return retryErrors;
+	}
+
+	/**
+	 * Marks `continued` each turn a stream-stall or malformed-call continuation
+	 * kept, now that a continuation succeeded.
+	 */
+	async #markContinuedTurns(): Promise<void> {
+		if (this.#continuedTurns.length === 0) return;
+		const turns = this.#continuedTurns;
+		this.#continuedTurns = [];
+		const stamps: RecoveryStamp[] = [];
+		for (const turn of turns) {
+			await this.#host.waitForSessionMessagePersistence(turn);
+			const entryId = this.#host.persistedAssistantEntryId(turn);
+			const entry = entryId === undefined ? undefined : this.#host.sessionManager.getEntry(entryId);
+			if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
+			stamps.push({ entryId: entry.id, message: entry.message, continued: true });
+		}
+		await this.#writeRecoveryStamps(stamps);
+	}
+
+	/**
+	 * Sets `stamps` on their entries' messages and persists them with one
+	 * rewrite: the write of a closing retry saga's `retryRecovery`, and of every
+	 * `continued` mark, whichever continuation kept the turn.
+	 */
+	async #writeRecoveryStamps(stamps: readonly RecoveryStamp[]): Promise<void> {
+		if (stamps.length === 0) return;
+		for (const stamp of stamps) {
+			if (stamp.retryRecovery) stamp.message.retryRecovery = stamp.retryRecovery;
+			if (stamp.continued) stamp.message.continued = true;
+		}
+		await this.#host.sessionManager.rewriteEntries();
 	}
 
 	#isRecoverableProviderEmptyOutput(message: AssistantMessage): boolean {

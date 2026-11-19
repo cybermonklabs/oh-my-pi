@@ -454,13 +454,12 @@ export function buildSessionContext(
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
 			// A failed turn automatic retry replaced carries `retryRecovery` and
-			// leaves model context; one it kept and continued from, whose
-			// continuation succeeded (`recovered` and `kept`), stays, as it does in
-			// the live context.
+			// leaves model context; one a later turn continued from (`continued`:
+			// a retry, a stream-stall or a malformed-call continuation kept it, and
+			// the continuation succeeded) stays, as it does in the live context.
 			if (!options?.transcript && entry.message.role === "assistant") {
-				const { retryRecovery } = entry.message;
-				const kept = retryRecovery?.status === "recovered" && retryRecovery.kept === true;
-				if ((retryRecovery && !kept) || isEmptyErrorTurn(entry.message)) return;
+				const { retryRecovery, continued } = entry.message;
+				if ((retryRecovery && continued !== true) || isEmptyErrorTurn(entry.message)) return;
 			}
 			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
@@ -783,15 +782,14 @@ export function buildSessionContext(
 	// and can spend minutes reprocessing old context before the new prompt.
 	// Keep the interrupted-thinking continuity pair: convertToLlm strips the
 	// unsafe trailing thinking from that assistant and sends the hidden
-	// continuity note instead. Keep a failed turn automatic retry kept and
-	// continued from, whose continuation succeeded (`retryRecovery` `recovered`
-	// with `kept`): the turns after it pick up from it.
+	// continuity note instead. Keep a failed turn a later turn continued from
+	// (`continued`): the turns after it pick up from it.
 	if (!options?.transcript) {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
 			if (message?.role !== "assistant") continue;
 			if (message.stopReason !== "aborted" && message.stopReason !== "error") continue;
-			if (message.retryRecovery?.status === "recovered" && message.retryRecovery.kept) continue;
+			if (message.continued === true) continue;
 			const next = messages[i + 1];
 			if (next?.role === "custom" && next.customType === INTERRUPTED_THINKING_MESSAGE_TYPE) continue;
 			// A failed turn that emitted tool calls persists paired synthetic

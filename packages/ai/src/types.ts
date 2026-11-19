@@ -1263,17 +1263,7 @@ export interface DeveloperMessage {
 /** How an automatic retry recovered or ultimately settled a failed attempt. */
 export type AssistantRetryRecoveryKind = "credential" | "model" | "wait" | "plain";
 
-/**
- * Persisted presentation state for an assistant error superseded by an automatic retry saga.
- *
- * `kept` marks a recovered failed turn the retry kept in context and continued
- * from instead of sending again (a rate limit after visible text, a cut stream
- * after complete tool calls), whose continuation succeeded: a model context
- * rebuilt from the session keeps it, as the live context does. Any other
- * marked turn, a kept one whose continuations all failed included, is left out
- * of that rebuild. Sessions written before `kept` existed carry no such
- * marker, so a rebuild leaves their kept turns out too.
- */
+/** Persisted presentation state for an assistant error superseded by an automatic retry saga. */
 export type AssistantRetryRecovery =
 	| {
 			kind: "auto-retry";
@@ -1282,7 +1272,6 @@ export type AssistantRetryRecovery =
 			recoveredAt: string;
 			recovery: AssistantRetryRecoveryKind;
 			note: string;
-			kept?: true;
 			supersededBy?: {
 				timestamp: number;
 				responseId?: string;
@@ -1337,6 +1326,13 @@ export interface AssistantMessage {
 	credentialId?: number;
 	contextSnapshot?: ContextSnapshot;
 	retryRecovery?: AssistantRetryRecovery;
+	/**
+	 * A later turn continued from this failed turn instead of sending it again
+	 * (a rate limit or a cut stream after visible text or after complete tool
+	 * calls, a malformed call), so a model context rebuilt from the session
+	 * keeps it, as the live context does. Set once the continuation succeeded.
+	 */
+	continued?: true;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/**
 	 * Name of the upstream provider an aggregator routed this request to, as
