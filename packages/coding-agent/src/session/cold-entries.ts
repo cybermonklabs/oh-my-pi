@@ -12,7 +12,7 @@
  * read ({@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}); its other fields are
  * accessors whatever their size. A cold to-do edit or tool start marker keeps
  * as data only its tree fields, `customType` and a small `runtime`
- * ({@link CORE_CUSTOM_TYPES_COLD}). `JSON.stringify`, spread and
+ * ({@link isCoreColdCustom}). `JSON.stringify`, spread and
  * `structuredClone` still see every field. A read returns a deep-frozen value,
  * so a place that writes into a nested value of a cold body fails with a
  * `TypeError` instead of losing the write; assigning a field
@@ -123,14 +123,13 @@ const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
  * ({@link entriesKeptWholeOnPath}); a tool start marker is read only for the
  * calls left pending at the end of the branch, which lie after the cut.
  */
-const CORE_CUSTOM_TYPES_COLD: ReadonlySet<string> = new Set([
-	USER_TODO_EDIT_CUSTOM_TYPE,
-	TOOL_EXECUTION_START_CUSTOM_TYPE,
-]);
-
-/** Whether `entry` is a `custom` entry of a type of {@link CORE_CUSTOM_TYPES_COLD}. */
 function isCoreColdCustom(entry: SessionEntry): boolean {
-	return entry.type === "custom" && CORE_CUSTOM_TYPES_COLD.has(entry.customType);
+	// Compared when called, not gathered into a set when this module loads: the modules that
+	// define these types can still be loading then, in an import cycle through this one.
+	return (
+		entry.type === "custom" &&
+		(entry.customType === USER_TODO_EDIT_CUSTOM_TYPE || entry.customType === TOOL_EXECUTION_START_CUSTOM_TYPE)
+	);
 }
 
 /** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
@@ -141,9 +140,9 @@ export function keptWholeByKind(entry: SessionEntry): boolean {
 
 /** Fields that always stay data: the tree structure every walk reads. */
 const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
-/** The fields of a cold entry of {@link CORE_CUSTOM_TYPES_COLD} that stay data. */
+/** The fields of a cold entry of {@link isCoreColdCustom} that stay data. */
 const CORE_CUSTOM_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set([...ENTRY_FIELDS_IN_MEMORY, "customType"]);
-/** The fields of a cold entry of {@link CORE_CUSTOM_TYPES_COLD} that stay data while small. */
+/** The fields of a cold entry of {@link isCoreColdCustom} that stay data while small. */
 const CORE_CUSTOM_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set(["runtime"]);
 const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
 /**
@@ -967,7 +966,7 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * each value of the entry too large to keep ({@link COLD_STRING_MAX_UNITS},
  * {@link COLD_JSON_MAX_BYTES}), each value of its `message` but the small ones
  * of {@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}, and for a type of
- * {@link CORE_CUSTOM_TYPES_COLD} every value but the tree fields, `customType`
+ * {@link isCoreColdCustom} every value but the tree fields, `customType`
  * and a small `runtime`. An entry made whole from this
  * store whose values are unchanged takes its former record back instead of
  * writing a new one. Pass `imagesExternalized` for an entry parsed from a
