@@ -3307,7 +3307,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * again, from `fromByte` for as many bytes, with the same page checks,
 	 * and compares their SHA-256 with that of the bytes it yielded: a
 	 * difference, a page check that fails, or a range that is no longer all
-	 * there is a read conflict; an append past the range is not.
+	 * there is a read conflict; an append past the range is not. When they
+	 * moved again during that check pass, a write may have made it read the
+	 * same mix the read yielded, so it reads the range once more and accepts
+	 * it only when that second check pass matches too: at most two passes,
+	 * and a pass that differs is a read conflict at once.
 	 *
 	 * MySQL has no row identity: the read checks what it yielded with one
 	 * query, which computes the digest of those bytes as the database holds
@@ -3453,25 +3457,33 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * SQLite: fail with {@link SessionReadConflictError} unless the bytes a
 	 * chunked read yielded (`read`, from `fromByte`) are still stored there,
 	 * when the database or this client's writes of `path` moved since the read
-	 * took `read.mark` (see {@link #sqliteMark}). A second pass then reads exactly
+	 * took `read.mark` (see {@link #sqliteMark}). A check pass then reads exactly
 	 * that range again, with the checks of every page, and must give as many
-	 * bytes with the same SHA-256.
+	 * bytes with the same SHA-256, or the read is a conflict at once. A write
+	 * during that pass can make it read the same mix the read yielded, so when
+	 * the mark moved during it a second check pass must match too: a read end
+	 * runs at most two check passes.
 	 */
 	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
-		if ((await this.#exclusive(() => this.#sqliteMark(path))) === read.mark) return;
-		let stored: { hash: string; bytes: number };
-		try {
-			stored = await digestStream(
-				this.#readPass(path, fromByte, { yielded: 0, first: 0, next: 0, sources: 0 }, read.yielded),
-			);
-		} catch (err) {
-			// The session is gone: what the read yielded is no longer all there.
-			if (isEnoent(err)) throw new SessionReadConflictError(path);
-			throw err;
-		}
-		if (stored.bytes !== read.yielded || stored.hash !== read.hash?.digest("hex")) {
-			throw new SessionReadConflictError(path);
-		}
+		const before = await this.#exclusive(() => this.#sqliteMark(path));
+		if (before === read.mark) return;
+		const yielded = read.hash?.digest("hex");
+		const check = async (): Promise<void> => {
+			let stored: { hash: string; bytes: number };
+			try {
+				stored = await digestStream(
+					this.#readPass(path, fromByte, { yielded: 0, first: 0, next: 0, sources: 0 }, read.yielded),
+				);
+			} catch (err) {
+				// The session is gone: what the read yielded is no longer all there.
+				if (isEnoent(err)) throw new SessionReadConflictError(path);
+				throw err;
+			}
+			if (stored.bytes !== read.yielded || stored.hash !== yielded) throw new SessionReadConflictError(path);
+		};
+		await check();
+		// A write that made this pass read the read's mix again would have to do it once more to pass a second one.
+		if ((await this.#exclusive(() => this.#sqliteMark(path))) !== before) await check();
 	}
 
 	/**
