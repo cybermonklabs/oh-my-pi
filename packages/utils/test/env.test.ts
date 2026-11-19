@@ -710,8 +710,8 @@ console.log(JSON.stringify({ afterWorker, afterMain: fs.existsSync(${JSON.string
 
 	/**
 	 * A session that Bun gave one value from its start directory's `.env`, whose launch environment
-	 * is `launch` (over the test's, with no TMPDIR and no test-runtime marker, so omp applies
-	 * `~/.env`): it writes the relaunch file (`bunRelaunchArgs`) and starts nothing.
+	 * is `launch` over a production child's ({@link launchEnv}): it writes the relaunch file
+	 * (`bunRelaunchArgs`) and starts nothing.
 	 */
 	function writeRelaunchFile(launch: Record<string, string | undefined>): {
 		args: string[];
@@ -733,9 +733,18 @@ console.log(JSON.stringify({ args: bunRelaunchArgs(), warnings }));`;
 		return JSON.parse(child.stdout.toString());
 	}
 
+	/**
+	 * `launch` over the environment of a child started as production, in a home of its own unless
+	 * `launch` names one (`createProductionChildEnv`), with no TMPDIR, NODE_ENV or BUN_ENV unless
+	 * `launch` sets them: omp applies that home's `~/.env`, and writes its logs under that home.
+	 */
 	function launchEnv(launch: Record<string, string | undefined>): Record<string, string> {
-		const env: Record<string, string | undefined> = { ...process.env, ...DIR_RESOLUTION_ENV_RESET, ...launch };
-		for (const name of ["TMPDIR", "PI_TEST_RUNTIME", "NODE_ENV", "BUN_ENV"]) if (!(name in launch)) delete env[name];
+		const env: Record<string, string | undefined> = {
+			...createProductionChildEnv(),
+			...DIR_RESOLUTION_ENV_RESET,
+			...launch,
+		};
+		for (const name of ["TMPDIR", "NODE_ENV", "BUN_ENV"]) if (!(name in launch)) delete env[name];
 		return Object.fromEntries(
 			Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
 		);
