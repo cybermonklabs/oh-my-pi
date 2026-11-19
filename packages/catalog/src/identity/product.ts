@@ -276,3 +276,25 @@ export function productIdentityKey(
 	}
 	return `${identity.class}/${identity.family}/${identity.revision}/${kept.join("-")}`;
 }
+
+/**
+ * The product keys of a model row: the key of the served id ({@link productIdentityKey}) and the key of the row's own
+ * catalog id (`id`), each when it is defined, with no key twice. Empty when neither key is defined.
+ *
+ * A row needs both keys. A provider that sends another id for a row serves the model of that id: OpenAI sends
+ * `gpt-5.6-luna-pro` as `gpt-5.6-luna`. Other providers name the same model by the row's id:
+ * `openrouter/openai/gpt-5.6-luna-pro`. The catalog's logical id gives no key, because it drops variant words that
+ * name a product: the logical id of `gpt-5.1-codex-max` is `gpt-5.1-codex`, so its key would put GPT-5.1 Codex Max on
+ * the key of GPT-5.1 Codex.
+ */
+export function productIdentityKeys(
+	model: Pick<Model, "provider" | "id" | "identity" | "requestModelId">,
+): readonly string[] {
+	const keys: string[] = [];
+	const served = productIdentityKey(model);
+	if (served !== undefined) keys.push(served);
+	if (model.requestModelId === undefined) return keys;
+	const own = productIdentityKey({ provider: model.provider, id: model.id, identity: model.identity });
+	if (own !== undefined && own !== served) keys.push(own);
+	return keys;
+}

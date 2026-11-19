@@ -24,7 +24,7 @@ import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-credit";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
-import { productIdentityKey } from "@oh-my-pi/pi-catalog/identity";
+import { productIdentityKeys } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong, sleepUntil } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -496,9 +496,10 @@ export class TurnRecovery {
 	 */
 	readonly #refusedModels = new Set<string>();
 	/**
-	 * The catalog's product key (`productIdentityKey`) of each such model that has one, which the
-	 * same model on another provider, under another spelling or on a route of it shares, and which
-	 * different products that share a class, family and revision do not. Cleared with
+	 * The catalog's product keys (`productIdentityKeys`) of each such model: the key of the id
+	 * its provider is sent and the key of its own catalog id, each when it has one. The same
+	 * model on another provider, under another spelling or on a route of it shares one of them,
+	 * and different products that share a class, family and revision do not. Cleared with
 	 * `#refusalWalkTried`.
 	 */
 	readonly #refusedIdentities = new Set<string>();
@@ -1006,22 +1007,23 @@ export class TurnRecovery {
 	/**
 	 * Whether `model` refused in the current retry saga, under any name: by its `provider/id`,
 	 * which every spelling and route that resolves to it shares (an alias such as `pi/default`,
-	 * an id without the catalog revision suffix, `@upstream`), or by its product key
-	 * (`productIdentityKey`), which the same model served by another provider or on another route
-	 * shares.
+	 * an id without the catalog revision suffix, `@upstream`), or by one of its product keys
+	 * (`productIdentityKeys`, of its served id and of its catalog id), which the same model
+	 * served by another provider or on another route shares.
 	 */
 	#refusedInTurn(model: Model): boolean {
 		if (this.#refusedModels.has(`${model.provider}/${model.id}`)) return true;
 		if (this.#refusedIdentities.size === 0) return false;
-		const identity = productIdentityKey(model);
-		return identity !== undefined && this.#refusedIdentities.has(identity);
+		return productIdentityKeys(model).some(key => this.#refusedIdentities.has(key));
 	}
 
-	/** Records `model`, the model a classifier refusal came from, by both keys `#refusedInTurn` reads. */
+	/**
+	 * Records `model`, the model a classifier refusal came from, by every key `#refusedInTurn`
+	 * reads: its `provider/id` and the product keys of its served id and of its catalog id.
+	 */
 	#recordRefusedModel(model: Model): void {
 		this.#refusedModels.add(`${model.provider}/${model.id}`);
-		const identity = productIdentityKey(model);
-		if (identity !== undefined) this.#refusedIdentities.add(identity);
+		for (const key of productIdentityKeys(model)) this.#refusedIdentities.add(key);
 	}
 
 	/** Resolve the pending retry promise; the saga is over, and so is its refusal walk. */

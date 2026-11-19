@@ -2418,5 +2418,88 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
+
+		// OpenAI sends gpt-5.6-luna-pro upstream as gpt-5.6-luna, so its served id
+		// names the base model, while OpenRouter sends the same model under the
+		// row's own id.
+		const LUNA = bundled("openai", "gpt-5.6-luna");
+		const LUNA_PRO = bundled("openai", "gpt-5.6-luna-pro");
+		const OPENROUTER_LUNA_PRO = bundled("openrouter", "openai/gpt-5.6-luna-pro");
+
+		for (const [refusing, other] of [
+			[LUNA_PRO, OPENROUTER_LUNA_PRO],
+			[OPENROUTER_LUNA_PRO, LUNA_PRO],
+		] as const) {
+			it(`passes over ${formatModelString(other)} after ${formatModelString(refusing)} refuses, to the model after it`, async () => {
+				// The two rows are one model. The chain entry has a key, so only the
+				// refusal can pass it over.
+				expect(LUNA_PRO.requestModelId).toBe(LUNA.id);
+				expect(OPENROUTER_LUNA_PRO.requestModelId).toBeUndefined();
+				authStorage.keys.setRuntime(OPENROUTER_LUNA_PRO.provider, `${OPENROUTER_LUNA_PRO.provider}-test-key`);
+				expect(modelRegistry.hasConfiguredAuth(other)).toBe(true);
+				stubUsageReads({});
+				const requestedModels: string[] = [];
+				const run = startSession(
+					createRefusalAgent(refusing, requestedModels, [refusing]),
+					walkSettings(refusing, {
+						"retry.maxRetries": 1,
+						"retry.fallbackChains": chainOf(other, NEXT_FALLBACK),
+					}),
+				);
+
+				await runTurn(run.session, "Recover from the refusal");
+
+				expect(requestedModels).toEqual([formatModelString(refusing), formatModelString(NEXT_FALLBACK)]);
+				expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+				expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			});
+		}
+
+		it("passes over the model that served a refused row's request, to the model after it", async () => {
+			// OpenAI served the refused request of gpt-5.6-luna-pro with gpt-5.6-luna.
+			expect(LUNA_PRO.requestModelId).toBe(LUNA.id);
+			expect(modelRegistry.hasConfiguredAuth(LUNA)).toBe(true);
+			stubUsageReads({});
+			const requestedModels: string[] = [];
+			const run = startSession(
+				createRefusalAgent(LUNA_PRO, requestedModels, [LUNA_PRO]),
+				walkSettings(LUNA_PRO, { "retry.maxRetries": 1, "retry.fallbackChains": chainOf(LUNA, NEXT_FALLBACK) }),
+			);
+
+			await runTurn(run.session, "Recover from the refusal");
+
+			expect(requestedModels).toEqual([formatModelString(LUNA_PRO), formatModelString(NEXT_FALLBACK)]);
+			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
+		});
+
+		const CODEX_5_1 = bundled("openai", "gpt-5.1-codex");
+		const CODEX_5_1_MAX = bundled("openai", "gpt-5.1-codex-max");
+
+		for (const [refusing, product] of [
+			[CODEX_5_1_MAX, CODEX_5_1],
+			[CODEX_5_1, CODEX_5_1_MAX],
+		] as const) {
+			it(`steps a refusal of ${refusing.id} to ${product.id}, another product`, async () => {
+				// The catalog's logical id of GPT-5.1 Codex Max is gpt-5.1-codex, but
+				// the two are different products, so a refusal of one does not pass
+				// over the other.
+				stubUsageReads({});
+				const requestedModels: string[] = [];
+				const run = startSession(
+					createRefusalAgent(refusing, requestedModels, [refusing]),
+					walkSettings(refusing, { "retry.maxRetries": 1, "retry.fallbackChains": chainOf(product) }),
+				);
+
+				await runTurn(run.session, "Recover from the refusal");
+
+				expect(requestedModels).toEqual([formatModelString(refusing), formatModelString(product)]);
+				expect(run.fallbacks).toEqual([formatModelString(product)]);
+				expect(modelOf(run.session)).toBe(formatModelString(product));
+				expect(lastAssistant(run.session).stopReason).toBe("stop");
+			});
+		}
 	});
 });

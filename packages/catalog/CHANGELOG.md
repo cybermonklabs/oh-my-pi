@@ -4,7 +4,7 @@
 
 ### Added
 
-- `productIdentityKey` (`@oh-my-pi/pi-catalog/identity`) gives one key to a model across its providers, spellings and routes, and separate keys to products that share a class, family and revision ([#19682](https://github.com/can1357/oh-my-pi/pull/19682) by [@sjawhar](https://github.com/sjawhar))
+- `productIdentityKey` (`@oh-my-pi/pi-catalog/identity`) gives one key to a model across its providers, spellings and routes, and separate keys to products that share a class, family and revision; `productIdentityKeys` gives a row the keys of both the id its provider is sent and its own catalog id ([#19682](https://github.com/can1357/oh-my-pi/pull/19682) by [@sjawhar](https://github.com/sjawhar))
 
 ## [18.18.6] - 2026-11-09
 

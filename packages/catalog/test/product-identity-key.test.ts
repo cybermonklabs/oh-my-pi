@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { classifyModel } from "../src/compat/taxonomy";
-import { productIdentityKey } from "../src/identity/product";
+import { productIdentityKey, productIdentityKeys } from "../src/identity/product";
 
 /** Builds `provider/id` from its catalog identity and returns its product key. */
 function keyOf(model: string, requestModelId?: string): string | undefined {
@@ -158,5 +158,31 @@ describe("productIdentityKey", () => {
 		// In an id that starts with `qwen`, the catalog reads `-max` as part of the product (Qwen Max), not an effort.
 		// The catalog gives its Qwen Max ids no family and so no key, so a Coder id stands in for one.
 		expectSeparateKeys(["openrouter/qwen/qwen3-coder", "openrouter/qwen/qwen3-coder-max"]);
+	});
+});
+
+describe("productIdentityKeys", () => {
+	/** Builds `provider/id` from its catalog identity and returns its product keys. */
+	function keysOf(model: string, requestModelId?: string): readonly string[] {
+		const slash = model.indexOf("/");
+		const provider = model.slice(0, slash);
+		const id = model.slice(slash + 1);
+		return productIdentityKeys({ provider, id, identity: classifyModel(provider, id), requestModelId });
+	}
+
+	test("holds the key of the served id and the key of the row's own id", () => {
+		// OpenAI sends gpt-5.6-luna-pro as gpt-5.6-luna, and OpenRouter sends it under its own id.
+		const keys: readonly (string | undefined)[] = keysOf("openai/gpt-5.6-luna-pro", "gpt-5.6-luna");
+		expect(keys).toHaveLength(2);
+		expect(keys).toContain(keyOf("openai/gpt-5.6-luna"));
+		expect(keys).toContain(keyOf("openrouter/openai/gpt-5.6-luna-pro"));
+	});
+
+	test("gives GPT-5.1 Codex Max no key of GPT-5.1 Codex", () => {
+		const max = keysOf("openai/gpt-5.1-codex-max");
+		const codex = keysOf("openai/gpt-5.1-codex");
+		expect(max).not.toHaveLength(0);
+		expect(codex).not.toHaveLength(0);
+		expect(max.filter(key => codex.includes(key))).toEqual([]);
 	});
 });
