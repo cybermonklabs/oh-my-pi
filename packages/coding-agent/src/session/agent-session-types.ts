@@ -460,6 +460,18 @@ export interface PromptOptions {
 	 *  an in-flight tool batch, injecting at the next step boundary instead (see
 	 *  AgentSession.sendUserMessage's `deliverAs: "aside"`). */
 	streamingBehavior?: "steer" | "followUp" | "aside";
+	/**
+	 * With `streamingBehavior: "steer"`: a session that is not streaming where this prompt
+	 * would start a turn (at its entry, or at a later re-check before dispatch) starts none.
+	 * It holds the message as a next-run steer, as
+	 * `steer(text, images, { holdUntilNextRun: true, queueId, onTaken })` queues it, calls
+	 * `onHeld`, and resolves. Held at entry, the message is handled as `steer` handles it
+	 * (prompt templates expand, an extension command is refused); held at a re-check, it keeps
+	 * what this prompt already did to it. A streaming session queues the message into its
+	 * running turn as without this option, and `onHeld` is not called. Not for use with
+	 * {@link followUps}.
+	 */
+	idleSteer?: IdleSteerOptions;
 	/** Optional tool choice override for the next LLM call. */
 	toolChoice?: ToolChoice;
 	/** Send as a developer/system message instead of user. */
@@ -501,6 +513,16 @@ export interface PromptOptions {
 	 * prompt before anything is sent.
 	 */
 	followUps?: readonly string[];
+}
+
+/** {@link PromptOptions.idleSteer}: how a steer that finds its session idle waits for the next run. */
+export interface IdleSteerOptions {
+	/** {@link SteerOptions.queueId} of the held message. */
+	queueId: string;
+	/** {@link SteerOptions.onTaken} of the held message. */
+	onTaken: () => void;
+	/** Called synchronously once the message is held on the steering queue for the next run. */
+	onHeld: () => void;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled

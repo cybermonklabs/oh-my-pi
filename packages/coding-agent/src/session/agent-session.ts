@@ -684,6 +684,20 @@ export class SessionBusyError extends Error {
 	}
 }
 
+/**
+ * Call back the sender of a steer ({@link SteerOptions.onTaken}, the `onHeld`
+ * of {@link PromptOptions.idleSteer}). A sender on another thread answers with
+ * a Promise nobody awaits; a failure is logged as `label`, never thrown into the run.
+ */
+function callSteerSender(callback: () => void, label: string): void {
+	try {
+		const result = callback() as unknown;
+		if (isPromise(result)) result.catch(err => logger.warn(`${label} rejected`, { error: String(err) }));
+	} catch (err) {
+		logger.warn(`${label} threw`, { error: String(err) });
+	}
+}
+
 /** Result of {@link AgentSession.navigateTree}. */
 export interface NavigateTreeResult {
 	editorText?: string;
@@ -8659,8 +8673,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * A prompt dropped before dispatch also resolves `true` (RPC reports it as
 	 * aborted once no run started); pass `throwOnDrop: true` to reject with
 	 * {@link PromptDroppedError} instead.
+	 *
+	 * A steer with {@link PromptOptions.idleSteer} that finds the session idle
+	 * starts no turn: it is held for the next run, as {@link steer} with
+	 * `holdUntilNextRun` holds it, and resolves `true`.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const idleSteer = options?.streamingBehavior === "steer" && !this.isStreaming ? options.idleSteer : undefined;
+		if (idleSteer) {
+			await this.steer(text, options?.images, {
+				attribution: options?.attribution,
+				holdUntilNextRun: true,
+				queueId: idleSteer.queueId,
+				onTaken: idleSteer.onTaken,
+				onPromptQueued: queued => {
+					options?.onPromptQueued?.(queued);
+					options?.onPromptAdmitted?.();
+					callSteerSender(idleSteer.onHeld, "Held steer callback");
+				},
+			});
+			return true;
+		}
 		return this.#admitSubmission(() => this.#prompt(text, options));
 	}
 
@@ -8865,8 +8898,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 
-		// If streaming, queue via steer()/followUp()/aside based on option
-		if (this.isStreaming) {
+		// If streaming, queue via steer()/followUp()/aside based on option; an idle
+		// session holds a steer for its next run when asked to (PromptOptions.idleSteer).
+		const heldSteer = options?.streamingBehavior === "steer" && !this.isStreaming ? options.idleSteer : undefined;
+		if (this.isStreaming || heldSteer) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) {
 				// Busy because the agent owns a turn: that turn supersedes the interrupted
@@ -8885,10 +8920,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: prependNotices,
 				rawText: typedText,
 				onPromptQueued: options?.onPromptQueued,
-				onPromptAdmitted: onPromptQueuedAdmitted,
+				onPromptAdmitted: heldSteer
+					? () => {
+							onPromptQueuedAdmitted?.();
+							callSteerSender(heldSteer.onHeld, "Held steer callback");
+						}
+					: onPromptQueuedAdmitted,
 				promptGeneration: queueGeneration,
+				nextRun: heldSteer !== undefined,
+				queueId: heldSteer?.queueId,
+				onTaken: heldSteer?.onTaken,
 			});
-			outcome.sessionClaimed = queued;
+			// A held steer starts no turn, so it claims nothing.
+			outcome.sessionClaimed = queued && !heldSteer;
 			if (!queued) this.#reportDroppedPrompt(typedText, options, followUps);
 			if (!queued && options?.throwOnDrop) throw new PromptDroppedError();
 			return true;
@@ -8946,7 +8990,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Re-check before dispatch so the loser queues exactly like the early
 		// branch instead of racing #promptWithMessage into AgentBusyError. No
 		// await sits between this check and #beginInFlight, so the winner's
-		// in-flight increment is visible to every later re-check.
+		// in-flight increment is visible to every later re-check. (A steer with
+		// `idleSteer` never gets here: the early branch queued or held it.)
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) {
@@ -11349,15 +11394,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const onTaken = this.#queuedMessageTaken.get(message);
 		if (!onTaken) return;
 		this.#queuedMessageTaken.delete(message);
-		try {
-			const result = onTaken() as unknown;
-			// A sender on another thread answers with a Promise nobody awaits.
-			if (isPromise(result)) {
-				result.catch(err => logger.warn("Queued steer taken callback rejected", { error: String(err) }));
-			}
-		} catch (err) {
-			logger.warn("Queued steer taken callback threw", { error: String(err) });
-		}
+		callSteerSender(onTaken, "Queued steer taken callback");
 	}
 
 	/**

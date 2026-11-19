@@ -54,7 +54,7 @@ import { type AgentSession, type NavigateTreeResult, SessionBusyError } from "..
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
-import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import type { IdleSteerOptions, RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
 import { probeSessionLeases } from "../../session/session-storage";
@@ -842,21 +842,25 @@ export type RpcSteerSubagentRegistry = Pick<RpcSubagentRegistry, "getSubagents" 
  * session lists as running in `get_subagents`, as its user. The message is
  * recorded in the subagent's transcript, never attributed to the parent.
  *
- * A running subagent is steered the same way Agent Hub chat does:
- * `AgentLifecycleManager.ensureLive`, then
- * `prompt(message, { streamingBehavior: "steer" })` on its own session, so a
- * mid-turn subagent takes the message at its next step boundary, and extension,
- * custom and file slash commands run and prompt templates expand as in Agent
- * Hub chat (unlike RPC `steer`, which rejects extension commands). Resolves
- * once the message is queued into the running turn or a new turn started
- * (`agent_start`).
+ * The message goes to the subagent's own session, after
+ * `AgentLifecycleManager.ensureLive`, as
+ * `prompt(message, { streamingBehavior: "steer", idleSteer })`, and that
+ * session decides, when the message reaches it, whether the subagent is
+ * mid-turn or between turns (`PromptOptions.idleSteer`). The main
+ * thread's view of the session never decides: for a subagent homed on a
+ * worker it is a mirror the worker's reports update after the fact.
  *
- * A subagent idle between its turns (a synchronous subagent waiting for its
- * own jobs) gets the message as a next-run steer instead, and the steer
- * resolves once its next run takes it; see {@link steerSubagentBetweenTurns}.
- * So does one whose ref reads running while its session reports no turn in
- * flight: the ref reads running from its registration, while the executor
- * still sets the subagent up, before its first prompt starts a turn.
+ * A mid-turn subagent is steered the same way Agent Hub chat does: it takes
+ * the message at its next step boundary, and extension, custom and file slash
+ * commands run and prompt templates expand as in Agent Hub chat (unlike RPC
+ * `steer`, which rejects extension commands). Resolves once its `prompt()`
+ * resolves, with the message queued into the running turn.
+ *
+ * A subagent between turns (a synchronous subagent waiting for its own jobs,
+ * or one its executor still sets up before its first prompt, whose ref
+ * already reads running) holds the message as a next-run steer instead, and
+ * the steer resolves once its next run takes it; see
+ * {@link steerOwnedSubagent}.
  *
  * An idle one whose result the parent already accepted, or whose run already
  * ended, is refused, as is an unknown, finished, cancelled or other session's
@@ -865,9 +869,8 @@ export type RpcSteerSubagentRegistry = Pick<RpcSubagentRegistry, "getSubagents" 
  * idle park.
  *
  * A refusal — including a prompt dropped by an abort, disposal or usage
- * preflight — is returned as the error; the rest of the turn is not awaited and
- * later failures are logged. Returns an error message, or `undefined` once
- * accepted.
+ * preflight — is returned as the error. Returns an error message, or
+ * `undefined` once accepted.
  *
  * `shutdown` aborts when the RPC session shuts down: a steer still waiting
  * between turns then takes its message back and answers an error, unless a
@@ -893,77 +896,54 @@ export async function handleRpcSteerSubagent(
 	// or the subagent may have finished in the meantime.
 	const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 	if (current?.ref !== owned.ref || current.session !== session) return notRunning;
-	if (current.ref.status !== "running" || !session.isStreaming) {
-		return steerSubagentBetweenTurns(subagentRegistry, subagentId, current, message, shutdown);
-	}
-
-	const accepted = Promise.withResolvers<void>();
-	const unsubscribe = session.subscribe(event => {
-		if (event.type === "agent_start") accepted.resolve();
-	});
-	session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true }).then(
-		() => accepted.resolve(),
-		err => {
-			accepted.reject(err);
-			logger.warn("steer_subagent message failed", { subagentId, error: String(err) });
-		},
-	);
-	try {
-		await accepted.promise;
-		return undefined;
-	} catch (err) {
-		return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
-	} finally {
-		unsubscribe();
-	}
+	return steerOwnedSubagent(subagentRegistry, subagentId, current, message, shutdown);
 }
 
 /**
- * Steer a subagent idle between its turns. Starting a turn here would race the
- * prompt its executor sends next (a yield reminder) into `AgentBusyError`, so
- * the message is queued as a next-run steer (`SteerOptions.holdUntilNextRun`):
- * the executor's next prompt, or the turn a finished job's result starts,
- * carries it into its first model call. Like RPC `steer`, this rejects
- * extension commands and expands prompt templates.
+ * Send a steer to a reachable subagent's session, which queues it into its
+ * running turn, or, idle between turns, holds it as a next-run steer
+ * (`SteerOptions.holdUntilNextRun`): starting a turn there would race the
+ * prompt its executor sends next (a yield reminder) into `AgentBusyError`.
+ * The executor's next prompt, or the turn a finished job's result starts,
+ * carries a held message into its first model call. Like RPC `steer`, a held
+ * message rejects extension commands and expands prompt templates.
  *
- * The queued message is named (`SteerOptions.queueId`) and followed by its own
- * identity, never by its text or timestamp: two steers of the same text sent
- * in one millisecond are two messages. Resolves once a run takes exactly this
- * message into its context (`SteerOptions.onTaken`, reported by the subagent's
- * session, wherever it is homed). When the subagent stops being reachable
- * first (its result accepted, cancelled, aborted, or its run ended without
- * another turn), or `shutdown` aborts, exactly this message is taken back off
- * the queue, so no later turn delivers it, and the steer answers an error. A
- * run that took the message off the queue but not yet into its context holds
- * it: the take-back waits for that run, and the steer answers success if the
- * run takes the message, or an error once the take-back removes the message
- * the run put back. A message neither taken back nor seen delivered (someone
- * else removed it, or the session is gone) answers an error too.
+ * A message queued into the running turn answers success once queued, when
+ * the prompt resolves. A held message is named (`SteerOptions.queueId`)
+ * and followed by its own identity, never by its text or timestamp: two
+ * steers of the same text sent in one millisecond are two messages. It
+ * answers success once a run takes exactly this message into its context
+ * (`SteerOptions.onTaken`, reported by the subagent's session, wherever it is
+ * homed). When the subagent stops being reachable first (its result
+ * accepted, cancelled, aborted, or its run ended without another turn), or
+ * `shutdown` aborts, exactly this message is taken back off the queue, so no
+ * later turn delivers it, and the steer answers an error. A run that took the
+ * message off the queue but not yet into its context holds it: the take-back
+ * waits for that run, and the steer answers success if the run takes the
+ * message, or an error once the take-back removes the message the run put
+ * back. A message neither taken back nor seen delivered (someone else removed
+ * it, or the session is gone) answers an error too.
  */
-async function steerSubagentBetweenTurns(
+async function steerOwnedSubagent(
 	subagentRegistry: RpcSteerSubagentRegistry,
 	subagentId: string,
 	owned: RpcOwnedSubagent,
 	message: string,
 	shutdown: AbortSignal | undefined,
 ): Promise<string | undefined> {
+	const runEnded = `Subagent's run ended before the message reached it: ${subagentId}`;
+	// A shutdown already under way sends nothing.
+	if (shutdown?.aborted) return runEnded;
+	let held = false;
 	let delivered = false;
 	const outcome = Promise.withResolvers<"delivered" | "ended">();
-	const markDelivered = () => {
-		delivered = true;
-		outcome.resolve("delivered");
-	};
 	const end = () => outcome.resolve("ended");
-	const runEnded = `Subagent's run ended before the message reached it: ${subagentId}`;
-	// A shutdown already under way queues nothing.
-	if (shutdown?.aborted) return runEnded;
-	const queueId = crypto.randomUUID();
 	const checkReachable = () => {
 		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
 		if (current?.ref !== owned.ref || current.session !== owned.session) end();
 	};
-	// Subscribe before queueing, so a shutdown or an end of the run that lands
-	// while the message is queued cannot be missed.
+	// Subscribe before sending, so a shutdown or an end of the run that lands
+	// while the message is held cannot be missed.
 	shutdown?.addEventListener("abort", end, { once: true });
 	const unsubscribers = [
 		subagentRegistry.onChange(checkReachable),
@@ -971,16 +951,28 @@ async function steerSubagentBetweenTurns(
 		() => shutdown?.removeEventListener("abort", end),
 	];
 	try {
+		const idleSteer: IdleSteerOptions = {
+			queueId: crypto.randomUUID(),
+			onTaken: () => {
+				delivered = true;
+				outcome.resolve("delivered");
+			},
+			onHeld: () => {
+				held = true;
+			},
+		};
 		try {
-			await owned.session.steer(message, undefined, { holdUntilNextRun: true, queueId, onTaken: markDelivered });
+			await owned.session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true, idleSteer });
 		} catch (err) {
 			return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
 		}
+		// The session reports a hold before its prompt resolves, wherever it is homed.
+		if (!held) return undefined;
 		checkReachable();
 		if ((await outcome.promise) === "delivered") return undefined;
 		let withdrawn = false;
 		try {
-			withdrawn = await owned.session.removeQueuedMessage({ queueId }, "steering");
+			withdrawn = await owned.session.removeQueuedMessage({ queueId: idleSteer.queueId }, "steering");
 		} catch (err) {
 			logger.debug("steer_subagent could not take back a queued message", { subagentId, error: String(err) });
 		}
