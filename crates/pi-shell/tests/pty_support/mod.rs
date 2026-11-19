@@ -17,11 +17,11 @@
 //! Every wait is bounded; a timeout reports the output so far. Dropping a
 //! [`Pty`] kills the session's process group.
 //!
-//! [`Pty::settle`] guesses that a shell is done when its output pauses; a
-//! zsh-like shell can say so instead: [`Spawn::zle_sync`] adds a `zle -F`
-//! handler script ([`ZLE_SYNC_SCRIPT`], sourced by the test), and
-//! [`Pty::zle_sync`] returns once the line editor has handled every key
-//! typed and waits for the next one.
+//! No wait guesses that a shell is done because its output paused: a
+//! zsh-like shell says so. [`Spawn::zle_sync`] adds a `zle -F` handler
+//! script ([`ZLE_SYNC_SCRIPT`], sourced by the test), and [`Pty::zle_sync`]
+//! returns once the line editor has handled every key typed and waits for
+//! the next one.
 //!
 //! ```ignore
 //! mod pty_support;
@@ -512,21 +512,6 @@ impl Pty {
 	/// As [`Self::wait_screen`].
 	pub fn wait_screen_contains(&mut self, text: &str, timeout: Duration) -> io::Result<()> {
 		self.wait_screen(timeout, |s| s.contents().contains(text))
-	}
-
-	/// Wait until no output arrives for `quiet` (bounded by `timeout`).
-	///
-	/// # Errors
-	///
-	/// `TimedOut` when output keeps arriving.
-	pub fn settle(&mut self, quiet: Duration, timeout: Duration) -> io::Result<()> {
-		let mut last = (usize::MAX, Instant::now());
-		self.wait_output(timeout, |out, hung_up, _| {
-			if out.len() != last.0 {
-				last = (out.len(), Instant::now());
-			}
-			hung_up || last.1.elapsed() >= quiet
-		})
 	}
 
 	/// Wait until the program has disabled canonical mode and echo: a line
