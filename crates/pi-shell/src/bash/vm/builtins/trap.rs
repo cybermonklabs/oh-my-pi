@@ -297,6 +297,50 @@ fn entry_ignored(store: &mut dyn StateStore, vp: &Vproc, sig: Signal) -> Result<
 	))
 }
 
+/// Whether the root zsh shell ignores `sig` while it has no trap for it
+/// ([`MiscKey::ZshHeldIgnored`]: `QUIT`, and what was ignored on entry).
+///
+/// # Errors
+///
+/// A store failure reading the record.
+pub fn held_ignored(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	sig: Signal,
+) -> Result<bool, StoreError> {
+	Ok(matches!(
+		state::record(store, vp, Key::Misc(MiscKey::ZshHeldIgnored))?,
+		Some(Record::Words(names)) if names.iter().any(|n| n.as_slice() == sig.to_string().as_bytes())
+	))
+}
+
+/// A trap for `sig` is set or removed: zsh holds it ignored no more
+/// ([`MiscKey::ZshHeldIgnored`]; `settrap` gives it a handler,
+/// `removetrap` its default).
+fn release_held(
+	root: &mut state::Root,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	sig: Signal,
+) -> Result<(), StoreError> {
+	let name = sig.to_string();
+	let Some(Record::Words(names)) = state::record(store, vp, Key::Misc(MiscKey::ZshHeldIgnored))?
+	else {
+		return Ok(());
+	};
+	if !names.iter().any(|n| n.as_slice() == name.as_bytes()) {
+		return Ok(());
+	}
+	let rest: Vec<BString> = names
+		.iter()
+		.filter(|n| n.as_slice() != name.as_bytes())
+		.cloned()
+		.collect();
+	let record = (!rest.is_empty()).then_some(Record::Words(rest));
+	state::store_record(root, store, vp, KeyBuf::Misc(MiscKey::ZshHeldIgnored), record);
+	Ok(())
+}
+
 /// zsh `removetrap`'s save: the trap for `key` is about to change (`trap`,
 /// a `TRAPNAL` function defined or removed). Inside a zsh function with
 /// `localtraps` the function's scope keeps the trap as it was, once.
@@ -382,6 +426,9 @@ pub fn func_changing(
 		return Ok(None);
 	};
 	save_local(&mut k.root, cx.store, vp, key)?;
+	if let TrapKey::Signal(sig) = key {
+		release_held(&mut k.root, cx.store, vp, sig)?;
+	}
 	if how != FuncChange::Removed {
 		for other in func_names(key, platform) {
 			if other.as_slice() != name {
@@ -496,10 +543,11 @@ fn zsh_change(
 	for name in func_names(key, ctx.k.engine.config().platform) {
 		ctx.store_record(KeyBuf::Func(name), None);
 	}
-	if let TrapKey::Signal(sig) = key
-		&& entry_ignored(ctx.cx.store, ctx.vp, sig)?
-	{
-		ctx.store_record(KeyBuf::Misc(MiscKey::ZshEntryIgnored), None);
+	if let TrapKey::Signal(sig) = key {
+		if entry_ignored(ctx.cx.store, ctx.vp, sig)? {
+			ctx.store_record(KeyBuf::Misc(MiscKey::ZshEntryIgnored), None);
+		}
+		release_held(&mut ctx.k.root, ctx.cx.store, ctx.vp, sig)?;
 	}
 	let mut effective = action;
 	if ctx.vp.overlay.is_none()

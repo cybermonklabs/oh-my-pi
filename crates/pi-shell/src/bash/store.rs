@@ -1309,6 +1309,14 @@ pub enum MiscKey {
 	/// (`Record::Misc`); absent for a user's shell. Nested shells see the
 	/// root's record.
 	Profile,
+	/// zsh: the signals the root shell ignores while it has no trap for
+	/// them (`Record::Words` of signal names): `QUIT`, which zsh's
+	/// `init_signals` ignores, and the signals ignored when the shell
+	/// started, which a non-interactive zsh leaves ignored. A trap set or
+	/// removed for one takes it out (zsh `settrap`, `removetrap`: a
+	/// handler, then the default). An interactive shell has none: its own
+	/// handlers decide.
+	ZshHeldIgnored,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);

@@ -261,6 +261,92 @@ fn an_untrapped_signal_kills_the_shell_process() {
 	}
 }
 
+/// `args` run as `zsh` by `program` with `SIGUSR1` and `SIGHUP` ignored
+/// and the core size limit 0 on entry: stdout, stderr, the exit status,
+/// and the signal the process died of.
+fn run_ignoring(
+	program: impl AsRef<OsStr>,
+	args: &[&str],
+) -> (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>) {
+	let mut cmd = Command::new(program);
+	cmd.arg0("zsh").args(args).env_remove("ZDOTDIR");
+	// SAFETY: signal and setrlimit are async-signal-safe and change only
+	// the child.
+	unsafe {
+		cmd.pre_exec(|| {
+			libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+			libc::signal(libc::SIGHUP, libc::SIG_IGN);
+			libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
+			Ok(())
+		});
+	}
+	let out = cmd.output().expect("start the shell");
+	(out.stdout, out.stderr, out.status.code(), out.status.signal())
+}
+
+/// A non-interactive zsh ignores `QUIT` (`init_signals`) and leaves the
+/// signals ignored when it started ignored: such a signal sent to the
+/// shell while it has no trap for it does nothing. A trap set or removed
+/// for one gives it its own disposition (`settrap`, `removetrap`), so the
+/// signal then ends the shell.
+#[test]
+fn zsh_ignores_quit_and_the_signals_ignored_on_entry_while_untrapped() {
+	let held = [
+		"-f",
+		"-c",
+		"kill -QUIT $$; kill -USR1 $$; kill -HUP $$; print alive; trap - USR1; kill -USR1 $$; print \
+		 not-reached",
+	];
+	let released = ["-f", "-c", "trap : QUIT; trap - QUIT; kill -QUIT $$; print not-reached"];
+	let obash = env!("CARGO_BIN_EXE_obash");
+	let ours_held = run_ignoring(obash, &held);
+	assert_eq!(ours_held, (b"alive\n".to_vec(), Vec::new(), None, Some(libc::SIGUSR1)));
+	let ours_released = run_ignoring(obash, &released);
+	assert_eq!(ours_released, (Vec::new(), Vec::new(), None, Some(libc::SIGQUIT)));
+	if have_zsh() {
+		assert_eq!(ours_held, run_ignoring(zsh_oracle::path(), &held));
+		assert_eq!(ours_released, run_ignoring(zsh_oracle::path(), &released));
+	}
+}
+
+/// zsh handles a `HUP` it has no trap for (`zhandler`): `zexit(SIGHUP)`,
+/// an exit with status 1, not a death by the signal (its exit status is
+/// `Some`). The EXIT trap in effect runs first, and no other: inside a
+/// function the function's own (zsh keeps the shell's away while a
+/// function runs); in a subshell the subshell's, and the shell goes on.
+#[test]
+fn an_untrapped_hup_makes_zsh_exit_with_status_1_after_the_exit_trap_in_effect() {
+	let cases: [(&str, &[u8], i32); 4] = [
+		("trap 'print root-exit $?' EXIT; kill -HUP $$; print not-reached", b"root-exit 1\n", 1),
+		(
+			"f() { trap 'print f-exit $?' EXIT; kill -HUP $$; print not-reached }; trap 'print \
+			 root-exit $?' EXIT; f; print not-reached",
+			b"f-exit 1\n",
+			1,
+		),
+		(
+			"f() { kill -HUP $$; print not-reached }; trap 'print root-exit $?' EXIT; f; print \
+			 not-reached",
+			b"",
+			1,
+		),
+		(
+			"zmodload zsh/system; ( trap 'print sub-exit $?' EXIT; kill -HUP $sysparams[pid]; print \
+			 not-reached ); print st=$?; exit 3",
+			b"sub-exit 1\nst=1\n",
+			3,
+		),
+	];
+	for (script, out, status) in cases {
+		let args = ["-f", "-c", script];
+		let ours = obash(&args);
+		assert_eq!(ours, (out.to_vec(), Vec::new(), Some(status)), "{script}");
+		if have_zsh() {
+			assert_eq!(ours, run(zsh_oracle::path(), &args), "{script}");
+		}
+	}
+}
+
 /// The parent shell of a shell that died of a signal: `$?` is 128 + the
 /// signal's number, and a non-interactive parent prints no job notice.
 #[test]

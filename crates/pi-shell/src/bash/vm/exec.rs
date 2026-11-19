@@ -109,6 +109,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				if start_trap(k, vp, cx, TrapKey::Signal(sig)) {
 					continue;
 				}
+				if sig == crate::bash::signal::Signal::Hup
+					&& vp.mode.dialect() == Dialect::Zsh
+					&& matches!(state::record(cx.store, vp, Key::Trap(TrapKey::Signal(sig))), Ok(None))
+				{
+					zsh_hup_exit(k, vp, cx);
+					continue;
+				}
 			}
 		}
 		if !vp.restore_opts.is_empty() {
@@ -677,6 +684,27 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	}
 	if !in_exit_trap && vp.transient && vp.runs.is_empty() {
 		start_exit_trap_once(k, vp, cx);
+	}
+}
+
+/// zsh `zhandler` for a `HUP` without a trap, `zexit(SIGHUP)`: the shell
+/// exits with status 1 now, after the EXIT trap in effect, and runs no
+/// other. Inside a function that is the function's own EXIT trap, if any:
+/// zsh's `starttrapscope` keeps the shell's away while a function runs,
+/// and unlike `exit` the signal does not wait for the function to return.
+fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	let in_function = vp
+		.frames
+		.iter()
+		.any(|f| matches!(f.kind, FrameKind::Function { .. }));
+	exit_shell(k, vp, cx, 1);
+	if in_function {
+		if let Some(run) = vp.runs.front_mut() {
+			run.exit_trap_started = true;
+		}
+		if vp.transient {
+			vp.exit_trap_run = true;
+		}
 	}
 }
 

@@ -1673,6 +1673,22 @@ impl Shell {
 		k.root
 			.set_misc(cx.store, MiscKey::Umask, format!("{:04o}", cx.host.umask() & 0o7777));
 		k.root.set_positional(cx.store, init.args);
+		if zsh {
+			// zsh `init_signals`: the shell ignores `QUIT`, and the signals
+			// ignored on entry stay ignored, until a trap for one is set or
+			// removed; while untrapped, a signal to the shell does nothing.
+			let held = cx.host.ignored_signals().with(crate::bash::Signal::Quit);
+			k.root.set_record(
+				cx.store,
+				KeyBuf::Misc(MiscKey::ZshHeldIgnored),
+				Some(Record::Words(
+					held
+						.iter()
+						.map(|sig| BString::from(sig.to_string()))
+						.collect(),
+				)),
+			);
+		}
 		for sig in cx.host.ignored_signals().iter() {
 			// zsh `init_signals`: of the signals ignored on entry only `QUIT`
 			// is recorded as ignored (`ZSIG_IGNORED`), and any of them may be
@@ -2447,17 +2463,7 @@ impl Shell {
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
 			if target != SigTarget::Vpid(root.0) && !terminating {
-				for frame in &mut self.procs[i].frames {
-					if let Some(sc) = frame.scratch.as_mut() {
-						match &mut sc.live {
-							Live::Task(task) => task.signal(sig),
-							Live::Ext(ext) => {
-								let _ = ext.signal(sig);
-							},
-							_ => {},
-						}
-					}
-				}
+				signal_lives(&mut self.procs[i], sig);
 			}
 			// A vproc that is just its program (bash would have `exec`'d it:
 			// `cmd &`, a pipeline stage, `( cmd )`, `exec cmd`) or just waits
@@ -2513,6 +2519,37 @@ impl Shell {
 				&& jobctl::untrapped(&mut self.k, cx, &mut self.procs[i], sig)
 			{
 				continue;
+			}
+			// zsh's own dispositions of a signal it has no trap for (zsh
+			// `init_signals`, `zhandler`): the root ignores `QUIT` and what was
+			// ignored on entry, and `HUP` makes the shell exit with status 1
+			// (`zexit(SIGHUP)`, its EXIT trap first) once the command it runs
+			// is done, a command the signal reaches too when it was sent to
+			// more than the shell.
+			if self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Zsh {
+				let held = self.procs[i].parent.is_none()
+					&& match builtins::trap::held_ignored(cx.store, &self.procs[i], sig) {
+						Ok(held) => held,
+						Err(err) => {
+							self.k.fail(err);
+							return;
+						},
+					};
+				if held {
+					continue;
+				}
+				if sig == Signal::Hup {
+					let process = &mut self.procs[i];
+					if target != SigTarget::Vpid(root.0) {
+						signal_lives(process, sig);
+					}
+					process.pending_traps = process.pending_traps.with(sig);
+					if !process.waiting_foreground() {
+						process.blocked = None;
+					}
+					interrupt_wait(process, sig.exit_status(platform));
+					continue;
+				}
 			}
 			match sig.default_action() {
 				DefaultAction::Terminate => {
@@ -2769,6 +2806,21 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;
+		}
+	}
+}
+
+/// Pass `sig` on to the builtin tasks and externals `p` runs now.
+fn signal_lives(p: &mut Vproc, sig: Signal) {
+	for frame in &mut p.frames {
+		if let Some(sc) = frame.scratch.as_mut() {
+			match &mut sc.live {
+				Live::Task(task) => task.signal(sig),
+				Live::Ext(ext) => {
+					let _ = ext.signal(sig);
+				},
+				_ => {},
+			}
 		}
 	}
 }

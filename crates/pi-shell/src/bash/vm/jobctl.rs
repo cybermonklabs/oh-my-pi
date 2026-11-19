@@ -41,7 +41,7 @@ use crate::bash::{
 	ids::{Dialect, JobId, Platform, Vpid},
 	ir::{Opcode, Unit},
 	signal::{SigSet, Signal},
-	store::{KeyBuf, OptId, TrapKey},
+	store::{KeyBuf, MiscKey, OptId, TrapKey},
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
 };
@@ -268,7 +268,8 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	k.jobctl.fg = Some(vp.vpid);
 	// zsh `init_signals`: an interactive zsh starts every signal at its
 	// default, so what was ignored on entry is not passed on to its
-	// commands (except `QUIT`, which it records as ignored).
+	// commands (except `QUIT`, which it records as ignored), and its own
+	// handlers decide what an untrapped signal does ([`untrapped`]).
 	if vp.mode.dialect() == Dialect::Zsh {
 		for sig in cx.host.ignored_signals().iter() {
 			if sig != Signal::Quit {
@@ -276,6 +277,8 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 					.set_record(cx.store, KeyBuf::Trap(TrapKey::Signal(sig)), None);
 			}
 		}
+		k.root
+			.set_record(cx.store, KeyBuf::Misc(MiscKey::ZshHeldIgnored), None);
 	}
 	open_shtty(k, cx);
 	let monitor = state::option(&mut k.root, cx.store, vp, OptId::Monitor).unwrap_or(false);
