@@ -289,7 +289,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 * When `expected` is given, the adoption is refused if the id no longer
 	 * resolves to that ref (or that ref's session). A ref a {@link release} is
 	 * ending (its run finalized while the release disposed its session) is not
-	 * adopted: its release hook runs now, as the release would have run it.
+	 * adopted: its release hook starts now, as late cleanup, without waiting for
+	 * the release's dispose of its session.
 	 */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
 		if (id === MAIN_AGENT_ID) {

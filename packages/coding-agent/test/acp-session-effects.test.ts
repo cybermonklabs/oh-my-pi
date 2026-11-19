@@ -159,9 +159,9 @@ describe("concurrent ACP sessions", () => {
 
 describe("an ACP session the factory rejects", () => {
 	it("stops its jobs, since the server goes on serving its other sessions", async () => {
-		// If this regresses, a rejected `session/new` (a bad flag value, an unknown tool) cuts off the jobs of the idle
-		// subagents its end releases, as the server's exit does: their subagents record a process exit that did not
-		// happen, and `omp --restore` relaunches their turns.
+		// If this regresses to a bare dispose, a rejected `session/new` (a bad flag value, an unknown tool) counts as the
+		// process exit (`sdk.ts`): it tears down the agent lifecycle the server's other sessions use, so their subagents
+		// are released and their jobs cut off, and it drops the tiny-model and embedding connections their requests use.
 		using dir = TempDir.createSync("@pi-acp-session-rejected-");
 		const settings = Settings.isolated();
 		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
