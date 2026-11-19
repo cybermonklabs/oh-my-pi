@@ -2297,9 +2297,10 @@ export class SessionManager {
 	 * manager's first entries, at least the durable frontier's, followed by
 	 * them, the frontier extends over all of them, so this manager's next
 	 * entries follow as an append; otherwise the retried rewrite republishes
-	 * them with the rest. An `entry_patch` record among them sets its fields on
-	 * the entries it names, as a load does: the rewrite writes those fields
-	 * inline and the record empty.
+	 * them with the rest. A `tool_result_prune` record among them blanks the
+	 * tool results it names, and an `entry_patch` record sets its fields on
+	 * the entries it names, as a load does: the rewrite writes those effects
+	 * inline and the patch record empty.
 	 */
 	#adoptForeignEntries(found: ForeignEntries, diskSize: number): void {
 		const leaf = this.#index.leafId();
@@ -2314,7 +2315,9 @@ export class SessionManager {
 		this.#index.setLeaf(leaf);
 		this.#entries = [...this.#entries.slice(0, found.at), ...kept, ...this.#entries.slice(found.at)];
 		this.#expectedDiskSize = diskSize;
-		if (applyEntryPatches(kept, this.#index)) this.#bodyRevision++;
+		const pruned = applyToolResultPrunes(kept, this.#index);
+		const patched = applyEntryPatches(kept, this.#index);
+		if (pruned || patched) this.#bodyRevision++;
 		this.#durable =
 			found.extendsFrontier && durable && kept.length === found.foreign.length
 				? durableFrontier(this.#entriesGeneration, found.shared + kept.length, diskSize)

@@ -16,7 +16,11 @@ import {
 	type AgentSessionEvent,
 	PromptDroppedError,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { QueuedMessageTarget, SteerOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import type {
+	PromptOptions,
+	QueuedMessageTarget,
+	SteerOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
@@ -37,7 +41,7 @@ interface SentMessage {
  * prompt dropped before dispatch (abort, disposal, usage preflight denial)
  * resolves `true` unless `throwOnDrop` asks for a {@link PromptDroppedError}.
  */
-type Delivery = "queued" | "turn-started" | "dropped";
+type Delivery = "queued" | "dropped";
 
 describe("handleRpcSteerSubagent", () => {
 	let registry: RpcSubagentRegistry;
@@ -77,9 +81,8 @@ describe("handleRpcSteerSubagent", () => {
 
 	/**
 	 * Register a live subagent whose session records `prompt` calls.
-	 * `queued` resolves as a mid-turn steer does; `turn-started` emits
-	 * `agent_start` and never settles, like a whole new turn. `isStreaming`
-	 * says whether the session is in a turn, which a steer goes into.
+	 * `queued` resolves as a mid-turn steer does. `isStreaming` says whether
+	 * the session is in a turn, which a steer goes into.
 	 */
 	function registerLiveAgent(
 		id: string,
@@ -87,23 +90,14 @@ describe("handleRpcSteerSubagent", () => {
 		delivery: Delivery = "queued",
 		isStreaming = true,
 	): void {
-		const listeners: Array<(event: { type: string }) => void> = [];
 		AgentRegistry.global().register({
 			id,
 			displayName: id,
 			kind: "sub",
 			session: {
 				isStreaming,
-				subscribe: (listener: (event: { type: string }) => void) => {
-					listeners.push(listener);
-					return () => listeners.splice(listeners.indexOf(listener), 1);
-				},
 				prompt: async (text: unknown, options: { streamingBehavior?: unknown; throwOnDrop?: boolean }) => {
 					sent.push({ id, text, streamingBehavior: options.streamingBehavior });
-					if (delivery === "turn-started") {
-						for (const listener of listeners) listener({ type: "agent_start" });
-						await Promise.withResolvers<void>().promise;
-					}
 					if (delivery === "dropped" && options.throwOnDrop) throw new PromptDroppedError();
 					return true;
 				},
@@ -121,13 +115,6 @@ describe("handleRpcSteerSubagent", () => {
 		await expect(handleRpcSteerSubagent(registry, "SubagentA", message)).resolves.toBeUndefined();
 
 		expect(sent).toEqual([{ id: "SubagentA", text: message, streamingBehavior: "steer" }]);
-	});
-
-	test("accepts once a new turn starts, without waiting for the turn", async () => {
-		emitLifecycle("SubagentA", "started");
-		registerLiveAgent("SubagentA", ownSessionFile, "turn-started");
-
-		await expect(handleRpcSteerSubagent(registry, "SubagentA", "go")).resolves.toBeUndefined();
 	});
 
 	test("reports a prompt the subagent dropped before dispatch as refused", async () => {
@@ -240,7 +227,14 @@ describe("handleRpcSteerSubagent", () => {
 				listeners.add(listener);
 				return () => listeners.delete(listener);
 			},
-			prompt: async (text: string) => {
+			prompt: async (text: string, options?: PromptOptions) => {
+				// As AgentSession: a steer that finds no turn in flight is held for the next run.
+				if (!streaming && options?.streamingBehavior === "steer" && options.idleSteer) {
+					const { queueId, onTaken, onHeld } = options.idleSteer;
+					await session.steer(text, undefined, { holdUntilNextRun: true, queueId, onTaken });
+					onHeld();
+					return true;
+				}
 				if (streaming) throw new AgentBusyError();
 				streaming = true;
 				emit({ type: "agent_start" });

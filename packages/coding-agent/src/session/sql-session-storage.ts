@@ -2,7 +2,8 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type FileLockHandle, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { type FileLockHandle, isEnoent, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { digestStream } from "../utils/file-hash";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -142,7 +143,7 @@ interface Statement {
 	readonly params: readonly string[];
 }
 
-type StatementValues = Readonly<Record<string, string | number | null>>;
+type StatementValues = Readonly<Record<string, string | number | bigint | null>>;
 
 interface DialectQueries {
 	createTable: string;
@@ -176,10 +177,12 @@ interface DialectQueries {
 	deleteParts: Statement;
 	/**
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
-	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
-	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case; on MySQL and MariaDB a comparison of their bytes, see below) and
-	 * exactly those rows' parts, then every part under `@dir` that has no row:
+	 * characters equal it, compared exactly whatever the `path` column's
+	 * collation: not by `LIKE`, so `%` and `_` stay literal and SQLite's
+	 * ASCII-insensitive `LIKE` cannot match another case; on PostgreSQL as
+	 * code points, as a nondeterministic collation finds "R/A/" equal to
+	 * "R/a/"; on MySQL and MariaDB as bytes, see below) and exactly those
+	 * rows' parts, then every part under `@dir` that has no row:
 	 * a staged full write's parts that its killed writer never swapped in, of
 	 * a path the delete may not know of. PostgreSQL and MySQL delete the rows
 	 * and their parts in one statement, so the parts deleted are those of the
@@ -217,12 +220,13 @@ interface DialectQueries {
 	deleteUnderScan: Statement[];
 	/**
 	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
-	 * including, `@high`: a primary-key range, and the prefix compared by
-	 * characters too (on MySQL and MariaDB as bytes, as in
-	 * {@link deleteUnder}), so a collation that orders the range otherwise can
-	 * never reach another path's parts. A staging name has a digit after
-	 * `@low`, and a "-" after the epoch `@high` ends with, both above the
-	 * space, so MySQL's PAD SPACE orders these names as code-point order does.
+	 * including, `@high`: a primary-key range, and the prefix compared exactly
+	 * too (on PostgreSQL as code points, on MySQL and MariaDB as bytes, as in
+	 * {@link deleteUnder}), so a collation that orders the range otherwise, or
+	 * finds two paths equal, can never reach another path's parts. A staging
+	 * name has a digit after `@low`, and a "-" after the epoch `@high` ends
+	 * with, both above the space, so MySQL's PAD SPACE orders these names as
+	 * code-point order does.
 	 */
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
@@ -277,8 +281,10 @@ interface DialectQueries {
 	 */
 	readChunksDigest: Statement | undefined;
 	/**
-	 * SQLite only: the first rowid a full write's parts take, and an insert
-	 * that sets a part's rowid. A part's row identity, which a chunked read
+	 * SQLite only: the first rowid a full write's parts take, as decimal text
+	 * (a rowid can reach 2^63 - 1, which a JavaScript number holds exactly only
+	 * up to 2^53, so the write counts up in a `bigint`), and an insert that
+	 * sets a part's rowid. A part's row identity, which a chunked read
 	 * checks, is its `xmin` on PostgreSQL (the transaction that wrote it) and
 	 * its `rowid` on SQLite. SQLite gives a new row the largest rowid plus one,
 	 * which hands the rowid of a deleted last row out again; so every part
@@ -294,6 +300,18 @@ interface DialectQueries {
 	 * several hosts share, is behind), or when a part is deleted and another
 	 * inserted in the millisecond of the deleted part's own insert. A writer
 	 * older than this rule still hands out the largest rowid plus one.
+	 *
+	 * A part whose rowid by the rule would pass {@link SQLITE_MAX_ROWID}, the
+	 * largest SQLite has (as when another program stored a row under it), goes
+	 * in with no rowid of its own: `next_rowid` is null when the largest rowid
+	 * is that already, and a full write binds null for every part it would
+	 * count past it. SQLite then picks one, as it does for an older writer: the
+	 * largest rowid plus one, or, while the table holds rowid 2^63 - 1, an
+	 * unused one at random. The rule does not hold for that table then, and a
+	 * new part can take the rowid of a deleted one: what still finds a
+	 * replacement during a chunked read is the part at its anchor no longer
+	 * having the rowid the read started with, or the last part it fetched no
+	 * longer holding the same bytes at its offset (see {@link readParts}).
 	 */
 	partRowids: { next: Statement; insert: Statement } | undefined;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
@@ -480,8 +498,9 @@ interface ReadFromRow {
 /**
  * `readChunksStart` row: `head` is the row's own content from the offset on,
  * `first_part` the start of the part the read starts at, -1 when there is none,
- * and `first_id` that part's row identity (a rowid on SQLite, `xmin` as text
- * on PostgreSQL), null on MySQL or when there is no such part.
+ * and `first_id` that part's row identity (a rowid on SQLite, as text past
+ * 2^53, which a JavaScript number does not hold exactly; `xmin` as text on
+ * PostgreSQL), null on MySQL or when there is no such part.
  */
 interface ChunksStartRow {
 	byte_len: number | bigint | string | null;
@@ -507,9 +526,36 @@ interface ChunksDigestRow {
 	digest: string;
 }
 
-/** `partRowids.next` row. */
+/** `partRowids.next` row: the rowid in decimal, or null when SQLite is to pick it (see `DialectQueries.partRowids`). */
 interface RowidRow {
-	next_rowid: number | bigint | string;
+	next_rowid: string | null;
+}
+
+/** `PRAGMA data_version` row (SQLite). */
+interface DataVersionRow {
+	data_version: number | bigint | string;
+}
+
+/** What one pass of a chunked read read (see `SqlSessionStorageBackend.readChunks`), which the checks at its end compare. */
+interface ChunksPass {
+	/** MySQL: the digest of the head and of every part the pass read, each part whole (see `DialectQueries.readChunksDigest`). */
+	readonly digest?: Buffer;
+	/** SQLite, the read's own pass: the SHA-256 of the bytes the pass yielded. */
+	readonly hash?: Bun.CryptoHasher;
+	/**
+	 * SQLite, the pass with `hash`: the read's start mark (see
+	 * `SqlSessionStorageBackend.#sqliteMark`), which the pass takes in the call
+	 * queue's turn of its first query, right before it.
+	 */
+	mark?: string;
+	/** Bytes the pass yielded. */
+	yielded: number;
+	/** Where the parts the pass read start: the part it started in, or the end of the row's own content. */
+	first: number;
+	/** The end of the last part the pass read. */
+	next: number;
+	/** The queries whose bytes the pass yielded: the first one's head, and each page. */
+	sources: number;
 }
 
 const DEFAULT_TABLE = "omp_session_files";
@@ -634,6 +680,8 @@ const LEASE_WAIT_POLL_MS = 1000;
 const LAPSE_POLL_MS = 50;
 /** Largest part a full write stores; an append stores its line as one part. */
 const PART_BYTES = 1024 * 1024;
+/** The largest rowid SQLite has, 2^63 - 1 (see `DialectQueries.partRowids`). */
+const SQLITE_MAX_ROWID = 2n ** 63n - 1n;
 /**
  * Bytes the first page of a `readChunks` read spans, from the byte it starts
  * at. A reader that stops within this window (the Agent Hub roster's
@@ -712,6 +760,16 @@ const sqliteFileQueues = new Map<string, SqliteQueue>();
 const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
 
 /**
+ * Whether a SQLite `filename` opens a database that only its own connection
+ * sees: `":memory:"`, an in-memory database, or `""`, a private temporary one
+ * that SQLite deletes when the connection closes. No other connection can
+ * open it, so none can commit to it.
+ */
+function isPrivateSqliteDatabase(filename: unknown): boolean {
+	return filename === "" || filename === ":memory:";
+}
+
+/**
  * The call queue every store in this process shares for `client`'s database.
  * Bun's SQLite adapter runs each client's statements on one connection, so a
  * statement issued while another call's transaction is open would join that
@@ -720,12 +778,13 @@ const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
  * process for the whole busy timeout, then fails. So calls queue per database
  * file, by its identity ({@link sqliteFileIdentity} of `options.filename`,
  * which `Bun.SQL` sets), so two spellings of one file share a queue, and the
- * busy wait only ever waits on other processes. In-memory databases, and
- * wrappers that hide `options.filename`, queue per client object.
+ * busy wait only ever waits on other processes. Private databases
+ * ({@link isPrivateSqliteDatabase}), and wrappers that hide
+ * `options.filename`, queue per client object.
  */
 function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 	const filename = client.options.filename;
-	if (typeof filename !== "string" || filename === "" || filename === ":memory:") {
+	if (typeof filename !== "string" || isPrivateSqliteDatabase(filename)) {
 		let queue = sqliteClientQueues.get(client);
 		if (!queue) {
 			queue = { tail: Promise.resolve() };
@@ -740,6 +799,50 @@ function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 		sqliteFileQueues.set(key, queue);
 	}
 	return queue;
+}
+
+/** Slots of {@link SqliteWrites.slots}: a client keeps this many write counts, however many paths it writes. */
+const SQLITE_WRITE_SLOTS = 1024;
+
+/**
+ * SQLite: the writes one client made that can change the bytes of a session
+ * path. A chunked read compares them, with `PRAGMA data_version`, before its
+ * first query and at its end (see `SqlSessionStorageBackend.readChunks`). The
+ * pragma moves when another connection, of this process or another, commits
+ * to the database file, and never for the connection's own commits; these
+ * counts cover those. A write counts in the slot of its path
+ * ({@link sqliteWriteSlot}), one of {@link SQLITE_WRITE_SLOTS}, so the counts
+ * hold the same memory however many paths a process writes in its life. Two
+ * paths that share a slot only cause an extra check of a read, never a
+ * missed one: a parent's appends make its subagents' reads check again only
+ * when their paths share a slot. A slot's count wraps at 2^32, which makes a
+ * read's end mark equal its start mark only when 2^32 writes of its slot land
+ * between them. A directory delete, which can change every path under the
+ * directory, counts once for every path.
+ */
+interface SqliteWrites {
+	/** Writes that can change every path: directory deletes. */
+	every: number;
+	/** Writes of the paths of each slot: appends, full writes and the swaps of staged ones, deletes, both paths of a rename. */
+	readonly slots: Uint32Array;
+}
+
+/** The slot of {@link SqliteWrites.slots} that counts the writes of `path`. */
+function sqliteWriteSlot(path: string): number {
+	return Bun.hash.xxHash32(path) % SQLITE_WRITE_SLOTS;
+}
+
+/** {@link SqliteWrites} by client: a store has one client, and stores that share a client share its connection. */
+const sqliteClientWrites = new WeakMap<SqlSessionStorageClient, SqliteWrites>();
+
+/** The write counts of `client`'s connection (see {@link SqliteWrites}), shared by every store on that client. */
+function sqliteWrites(client: SqlSessionStorageClient): SqliteWrites {
+	let writes = sqliteClientWrites.get(client);
+	if (!writes) {
+		writes = { every: 0, slots: new Uint32Array(SQLITE_WRITE_SLOTS) };
+		sqliteClientWrites.set(client, writes);
+	}
+	return writes;
 }
 
 /**
@@ -1088,8 +1191,15 @@ function buildQueries(
 			sqlite: `length(cast(${column} AS blob))`,
 		})[adapter];
 	const contentByteLength = byteLengthOf("content");
-	// A part's row identity (see DialectQueries.partRowids); MySQL has none.
-	const partId = { postgres: "CAST(p.xmin AS text)", mysql: undefined, sqlite: "p.rowid" }[adapter];
+	// A part's row identity (see DialectQueries.partRowids), which readChunksStart reads and readParts compares with
+	// what it read; MySQL has none. A SQLite rowid past 2^53, which a JavaScript number does not hold exactly, is text.
+	const partId = {
+		postgres: "CAST(p.xmin AS text)",
+		mysql: undefined,
+		sqlite:
+			`CASE WHEN p.rowid BETWEEN ${-Number.MAX_SAFE_INTEGER} AND ${Number.MAX_SAFE_INTEGER} THEN p.rowid ` +
+			"ELSE CAST(p.rowid AS text) END",
+	}[adapter];
 	const emptyBytes = { postgres: "''::bytea", mysql: "cast('' AS binary)", sqlite: "x''" }[adapter];
 	const greatest = adapter === "sqlite" ? "max" : "greatest";
 	// PostgreSQL's substr takes integer positions; offsets within one value always fit.
@@ -1106,19 +1216,28 @@ function buildQueries(
 	const startPart =
 		`FROM ${parts} AS p WHERE p.path = @path ` +
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
-	// `<column>` starts with `<value>`: its first `@len` characters equal it. On MySQL and MariaDB as bytes, so that no
-	// collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path whose
-	// character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE orders it.
+	// `<column>` starts with `<value>`: its first `@len` characters equal it, exactly, whatever the column's collation.
+	// On PostgreSQL as code points (`COLLATE "C"`): `substr` of a column takes the column's collation, and under a
+	// nondeterministic one (a case-insensitive ICU collation, say) "R/A/" equals "R/a/". On MySQL and MariaDB as bytes,
+	// so that no collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path
+	// whose character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE
+	// orders it. SQLite compares a function's result, which is not a column, with BINARY (memcmp), whatever the
+	// column's collation (https://www.sqlite.org/datatype3.html#assigning_collating_sequences_from_sql).
 	const startsWith = (column: string, value: string): string =>
-		mysql
-			? `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`
-			: `substr(${column}, 1, @len) = ${value}`;
+		({
+			postgres: `substr(${column}, 1, @len) COLLATE "C" = ${value}`,
+			mysql: `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`,
+			sqlite: `substr(${column}, 1, @len) = ${value}`,
+		})[adapter];
 	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
 	const orphanParts = (range: boolean): string =>
 		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}${startsWith("p.path", "@dir")}`;
-	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids.
+	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids; null,
+	// for SQLite to pick one, when the largest rowid is SQLITE_MAX_ROWID already, whose `+ 1` is a REAL no rowid takes.
 	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
-	const nextRowid = "max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024)";
+	const nextRowid =
+		`CASE WHEN coalesce(max(rowid), 0) < ${SQLITE_MAX_ROWID} ` +
+		"THEN max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024) END";
 	const deleteUnder = (range: boolean): Statement[] =>
 		({
 			postgres: [
@@ -1341,7 +1460,8 @@ function buildQueries(
 						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
 					: "") +
 				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there. SQLite
-				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids.
+				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids, and so
+				// does SQLite for a part the rule has no room for (see DialectQueries.partRowids).
 				(adapter === "sqlite"
 					? `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
 						"AND q.content = @last_content)) "
@@ -1363,7 +1483,7 @@ function buildQueries(
 		partRowids:
 			adapter === "sqlite"
 				? {
-						next: sql(`SELECT ${nextRowid} AS next_rowid FROM ${parts}`),
+						next: sql(`SELECT CAST(${nextRowid} AS TEXT) AS next_rowid FROM ${parts}`),
 						insert: sql(
 							`INSERT INTO ${parts} (rowid, path, start_offset, content) VALUES (@rowid, @path, @offset, @content)`,
 						),
@@ -1886,6 +2006,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #createTable: boolean;
 	/** The shared call queue for this client's SQLite database; unset on other dialects. */
 	readonly #sqliteQueue: SqliteQueue | undefined;
+	/** This client's writes of session paths on SQLite (see {@link SqliteWrites}); unset on other dialects. */
+	readonly #sqliteWrites: SqliteWrites | undefined;
+	/** Whether the SQLite database is private ({@link isPrivateSqliteDatabase}): its connection's alone, where no other connection commits. */
+	readonly #sqlitePrivate: boolean;
 	/**
 	 * How this store claims sessions: `row`, a lease row (PostgreSQL, MySQL);
 	 * `lock`, an OS lock on the database file and session id (a SQLite file);
@@ -1950,14 +2074,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#q = buildQueries(this.#adapter, table, leaseTable, lease.expiryMs, this.#schema);
 		this.#createTable = options.createTable !== false;
 		this.#sqliteQueue = this.#adapter === "sqlite" ? sqliteQueue(options.client) : undefined;
+		this.#sqliteWrites = this.#adapter === "sqlite" ? sqliteWrites(options.client) : undefined;
 		const filename = options.client.options.filename;
 		this.#sqliteFile =
-			this.#adapter === "sqlite" && typeof filename === "string" && filename !== "" && filename !== ":memory:"
+			this.#adapter === "sqlite" && typeof filename === "string" && !isPrivateSqliteDatabase(filename)
 				? path.resolve(filename)
 				: undefined;
+		this.#sqlitePrivate = this.#adapter === "sqlite" && isPrivateSqliteDatabase(filename);
 		if (options.claims === true) {
 			if (this.#adapter !== "sqlite") this.#gate = "row";
-			// An in-memory database is this process's alone: nobody else can open its sessions.
+			// A private database is this connection's alone: nobody else can open its sessions.
 			else if (this.#sqliteFile) this.#gate = "lock";
 		}
 	}
@@ -3231,93 +3357,189 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *
 	 * A writer older than SQLite's rowid rule still hands a new part the
 	 * largest rowid plus one, which after a delete or a truncate can be the
-	 * rowid of the part the read started at. So on SQLite the query of each
+	 * rowid of the part the read started at; so does SQLite itself for a part
+	 * the rule finds no room for below 2^63, and so can the rule in the cases
+	 * `partRowids` names (a part deleted and another inserted in the same
+	 * millisecond, a clock that went back). So on SQLite the query of each
 	 * page also checks, in the same statement, that the last part already
-	 * fetched is still at its offset with the same bytes; what can go unseen
-	 * there is a replacement within the bounds `partRowids` names, or by such
-	 * a writer, that holds exactly the bytes of that last part at its offset
-	 * while it differs both before and after it. MySQL has no row identity:
-	 * once the bytes the read yielded come from more than one query (the first
-	 * query's head and a page, or two pages), the read checks them when it
-	 * ends and also when its consumer closes it before that (a `break` out of
-	 * its loop, which resumes the read at its `yield` to return). One query
-	 * then computes the digest of the bytes the read yielded, as the database
-	 * holds them then (`DialectQueries.readChunksDigest`): the head, and every
-	 * part from the one the read started at to the last one it yielded, whole
-	 * even where the read yielded it from `fromByte` on. One that differs from
-	 * the digest the read computed over the same parts, each added before it
-	 * went out, is a read conflict too; a closed read rejects its `return()`
-	 * with it, so the consumer's loop throws it. Bytes from one query alone
-	 * come from one snapshot and need no check.
+	 * fetched is still at its offset with the same bytes. A re-create that
+	 * gives the part the read started at its rowid back and holds exactly the
+	 * bytes of that last part at its offset, while it differs before and
+	 * after it, passes both page checks; the check at the read's end catches
+	 * it. Right before its first query, in the same turn of the call queue,
+	 * the read takes `PRAGMA data_version`, which moves when any other
+	 * connection commits to the database file and never for this
+	 * connection's own commits (a private database has no other connection,
+	 * so there the read takes no pragma), and this client's counts of its
+	 * writes of the path (see {@link SqliteWrites}); at its end it takes
+	 * them again. When any of them moved, it reads exactly the bytes it yielded
+	 * again, from `fromByte` for as many bytes, with the same page checks,
+	 * and compares their SHA-256 with that of the bytes it yielded: a
+	 * difference, a page check that fails, or a range that is no longer all
+	 * there is a read conflict; an append past the range is not.
+	 *
+	 * MySQL has no row identity: the read checks what it yielded with one
+	 * query, which computes the digest of those bytes as the database holds
+	 * them then (`DialectQueries.readChunksDigest`): the head, and every part
+	 * from the one the read started at to the last one it yielded, whole even
+	 * where the read yielded it from `fromByte` on. One that differs from the
+	 * digest the read computed over the same parts, each added before it went
+	 * out, is a read conflict too.
+	 *
+	 * Both end checks run once the bytes the read yielded come from more than
+	 * one query (the first query's head and a page, or two pages): when the
+	 * read ends, and also when its consumer closes it before that (a `break`
+	 * out of its loop, which resumes the read at its `yield` to return). A
+	 * closed read rejects its `return()` with the conflict, so the consumer's
+	 * loop throws it. Bytes from one query alone come from one snapshot and
+	 * need no check.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
-		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
-		const [row] = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom }),
-		)) as ChunksStartRow[];
-		if (!row) throw enoent(path);
-		if (row.byte_len === null) throw this.#unmeasured(path);
-		const size = rowNumber(row.byte_len);
-		const firstPart = rowNumber(row.first_part);
-		const anchor = { anchor: firstPart, anchor_id: row.first_id };
-		const first = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
-		let next = first;
-		let skip = Math.max(0, fromByte - next);
-		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
-		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
-		// MySQL: the digest of what the read yields, checked against the stored bytes' (see above).
-		const query = this.#q.readChunksDigest;
-		const check = query ? { query, digest: Buffer.alloc(CHUNKS_DIGEST_BYTES) } : undefined;
-		// The queries whose bytes the read has yielded: the first one's head, and each page.
-		let sources = 0;
+		const digestQuery = this.#q.readChunksDigest;
+		const pass: ChunksPass = {
+			digest: digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined,
+			// SQLite: with it the pass takes the mark the check at the read's end compares (see above).
+			hash: this.#sqliteWrites ? new Bun.CryptoHasher("sha256") : undefined,
+			yielded: 0,
+			first: 0,
+			next: 0,
+			sources: 0,
+		};
 		let failed = false;
 		try {
-			if (row.head && row.head.byteLength > 0) {
-				if (check) addChunkDigest(check.digest, fromByte, row.head);
-				sources++;
-				yield row.head;
-			}
-			if (fromByte >= size) return;
-			for (let span = FIRST_PAGE_SPAN_BYTES; next < size; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
-				// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
-				const end = Math.max(next, fromByte) + span;
-				const parts = (await this.#exclusive(() =>
-					this.#readOne(this.#q.readParts, { path, next, end, ...anchor, ...last }),
-				)) as PartRow[];
-				if (parts.length === 0) throw new SessionReadConflictError(path);
-				sources++;
-				for (const part of parts) {
-					const start = rowNumber(part.start_offset);
-					if (start !== next) throw new SessionReadConflictError(path);
-					if (start >= size) break;
-					if (last) last = { last: start, last_content: part.content };
-					const bytes = Buffer.from(part.content, "utf8");
-					// Whole, before the part goes out: the read may be closed at its `yield`.
-					if (check) addChunkDigest(check.digest, start, bytes);
-					next = start + bytes.byteLength;
-					if (skip >= bytes.byteLength) {
-						skip -= bytes.byteLength;
-						continue;
-					}
-					yield skip > 0 ? bytes.subarray(skip) : bytes;
-					skip = 0;
-				}
-			}
-			if (next !== size) throw new SessionReadConflictError(path);
+			yield* this.#readPass(path, fromByte, pass);
 		} catch (err) {
 			failed = true;
 			throw err;
 		} finally {
 			// At the read's end, or where its consumer closed it, unless it is failing already.
-			if (check && !failed && sources > 1) {
-				await this.#confirmChunksDigest(path, check, {
-					path,
-					offset: fromByte,
-					row_from: rowFrom,
-					first,
-					end: next,
-				});
+			if (!failed && pass.sources > 1) {
+				if (digestQuery && pass.digest) {
+					await this.#confirmChunksDigest(
+						path,
+						{ query: digestQuery, digest: pass.digest },
+						{
+							path,
+							offset: fromByte,
+							row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
+							first: pass.first,
+							end: pass.next,
+						},
+					);
+				} else if (pass.mark !== undefined) {
+					await this.#confirmChunks(path, fromByte, pass);
+				}
 			}
+		}
+	}
+
+	/**
+	 * One pass of {@link readChunks} over `path` from `fromByte`, with the
+	 * checks of every page, recording in `pass` what the checks at the read's
+	 * end compare. It ends at the size its first query saw; with `length` (the
+	 * SQLite end check), after `length` bytes, or where the session ends when
+	 * that is sooner.
+	 */
+	async *#readPass(path: string, fromByte: number, pass: ChunksPass, length?: number): AsyncGenerator<Uint8Array> {
+		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
+		const [row] = (await this.#exclusive(async () => {
+			// The read's own pass on SQLite: its start mark, with no write of this client between it and the query.
+			if (pass.hash) pass.mark = await this.#sqliteMark(path);
+			return this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom });
+		})) as ChunksStartRow[];
+		if (!row) throw enoent(path);
+		if (row.byte_len === null) throw this.#unmeasured(path);
+		const size = rowNumber(row.byte_len);
+		const stop = length === undefined ? size : Math.min(size, fromByte + length);
+		const firstPart = rowNumber(row.first_part);
+		const anchor = { anchor: firstPart, anchor_id: row.first_id };
+		pass.first = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
+		pass.next = pass.first;
+		let skip = Math.max(0, fromByte - pass.next);
+		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
+		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
+		if (row.head && row.head.byteLength > 0) {
+			if (pass.digest) addChunkDigest(pass.digest, fromByte, row.head);
+			pass.sources++;
+			const head = row.head.subarray(0, Math.max(0, stop - fromByte));
+			pass.hash?.update(head);
+			pass.yielded += head.byteLength;
+			yield head;
+		}
+		if (fromByte >= stop) return;
+		for (let span = FIRST_PAGE_SPAN_BYTES; pass.next < stop; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
+			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
+			const end = Math.max(pass.next, fromByte) + span;
+			const parts = (await this.#exclusive(() =>
+				this.#readOne(this.#q.readParts, { path, next: pass.next, end, ...anchor, ...last }),
+			)) as PartRow[];
+			if (parts.length === 0) throw new SessionReadConflictError(path);
+			pass.sources++;
+			for (const part of parts) {
+				const start = rowNumber(part.start_offset);
+				if (start !== pass.next) throw new SessionReadConflictError(path);
+				if (start >= stop) break;
+				if (last) last = { last: start, last_content: part.content };
+				const bytes = Buffer.from(part.content, "utf8");
+				// Whole, before the part goes out: the read may be closed at its `yield`.
+				if (pass.digest) addChunkDigest(pass.digest, start, bytes);
+				pass.next = start + bytes.byteLength;
+				if (skip >= bytes.byteLength) {
+					skip -= bytes.byteLength;
+					continue;
+				}
+				// The end check's range can end inside a part.
+				const out = skip > 0 || pass.next > stop ? bytes.subarray(skip, stop - start) : bytes;
+				skip = 0;
+				pass.hash?.update(out);
+				pass.yielded += out.byteLength;
+				yield out;
+			}
+		}
+		if (length === undefined && pass.next !== size) throw new SessionReadConflictError(path);
+	}
+
+	/**
+	 * SQLite: what a chunked read of `path` compares right before its first
+	 * query and at its end (see {@link readChunks}): this client's writes of
+	 * every path and of `path`'s slot (see {@link SqliteWrites}), and
+	 * `PRAGMA data_version` of the store's connection. Its caller holds the
+	 * call queue, so no write of this client runs between the counts and the
+	 * pragma. A private database ({@link isPrivateSqliteDatabase}) is the
+	 * connection's alone, where no other connection commits: there the counts
+	 * are all.
+	 */
+	async #sqliteMark(path: string): Promise<string> {
+		const writes = this.#sqliteWrites;
+		const counts = `${writes?.every ?? 0}:${writes?.slots[sqliteWriteSlot(path)] ?? 0}`;
+		if (this.#sqlitePrivate) return counts;
+		const [row] = (await this.#readOne("PRAGMA data_version")) as DataVersionRow[];
+		if (!row) throw new Error("SqlSessionStorage: SQLite answered PRAGMA data_version with no row");
+		return `${counts}:${row.data_version}`;
+	}
+
+	/**
+	 * SQLite: fail with {@link SessionReadConflictError} unless the bytes a
+	 * chunked read yielded (`read`, from `fromByte`) are still stored there,
+	 * when the database or this client's writes of `path` moved since the read
+	 * took `read.mark` (see {@link #sqliteMark}). A second pass then reads exactly
+	 * that range again, with the checks of every page, and must give as many
+	 * bytes with the same SHA-256.
+	 */
+	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
+		if ((await this.#exclusive(() => this.#sqliteMark(path))) === read.mark) return;
+		let stored: { hash: string; bytes: number };
+		try {
+			stored = await digestStream(
+				this.#readPass(path, fromByte, { yielded: 0, first: 0, next: 0, sources: 0 }, read.yielded),
+			);
+		} catch (err) {
+			// The session is gone: what the read yielded is no longer all there.
+			if (isEnoent(err)) throw new SessionReadConflictError(path);
+			throw err;
+		}
+		if (stored.bytes !== read.yielded || stored.hash !== read.hash?.digest("hex")) {
+			throw new SessionReadConflictError(path);
 		}
 	}
 
@@ -3353,6 +3575,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
+			this.#wrote(path);
 			await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
 			// A created session also drops parts orphaned under its path.
 			await this.#replaceParts(transaction, path, bytes);
@@ -3421,6 +3644,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
 			}
 			await fenced(async transaction => {
+				this.#wrote(path);
 				// The session's size as this write finds it under the row lock: the
 				// size check's, or, for a write without one, read here.
 				const sessionSize = expectedSize === undefined ? await this.#lockSize(transaction, path) : expectedSize;
@@ -3489,14 +3713,18 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Replace `path`'s parts with `bytes`, as parts of at most
 	 * {@link PART_BYTES}, each ending on a UTF-8 character boundary. On SQLite
-	 * the new parts take rowids counting up from the first one free above
-	 * every part's and the clock's floor, read before the old ones go, so none
-	 * takes the rowid of a part it replaces (see `DialectQueries.partRowids`).
+	 * the new parts take rowids counting up, exactly in a `bigint`, from the
+	 * first one free above every part's and the clock's floor, read before the
+	 * old ones go, so none takes the rowid of a part it replaces. A part the
+	 * count would take past {@link SQLITE_MAX_ROWID}, and every part when the
+	 * largest rowid is that already, goes in with none, for SQLite to pick
+	 * (see `DialectQueries.partRowids`).
 	 */
 	async #replaceParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
 		const rowids = this.#q.partRowids;
 		const [first] = rowids ? ((await run(transaction, rowids.next, { now: Date.now() })) as RowidRow[]) : [];
-		let rowid = first ? rowNumber(first.next_rowid) : 0;
+		const next = first?.next_rowid;
+		let rowid = typeof next === "string" ? BigInt(next) : undefined;
 		await this.#deleteParts(transaction, path);
 		for (let start = 0; start < bytes.byteLength;) {
 			const end = utf8PartEnd(bytes, start, PART_BYTES);
@@ -3504,7 +3732,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				path,
 				offset: start,
 				content: bytes.toString("utf8", start, end),
-				rowid: rowid++,
+				rowid: rowid !== undefined && rowid <= SQLITE_MAX_ROWID ? rowid++ : null,
 			});
 			start = end;
 		}
@@ -3529,6 +3757,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
+			this.#wrote(path);
 			// A store that claims sessions refuses to append onto bytes it did not
 			// write (another writer that claims nothing, such as an older omp,
 			// changed or replaced the file), so `SessionManager` can read the file
@@ -3560,8 +3789,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
-			for (const path of paths) await run(transaction, this.#q.deleteRow, { path });
+			for (const path of paths) {
+				this.#wrote(path);
+				await run(transaction, this.#q.deleteRow, { path });
+			}
 			if (under) {
+				if (this.#sqliteWrites) this.#sqliteWrites.every++;
 				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
 				for (const query of deletes) await run(transaction, query, under);
 			}
@@ -3582,6 +3815,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([src, dst]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction(fences, async transaction => {
+			this.#wrote(src);
+			this.#wrote(dst);
 			if (!noReplace) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
 			// row that exists, or that another client inserts concurrently (the
@@ -3606,6 +3841,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (!noReplace) await this.#deleteStagingOf(transaction, dst);
 		});
 		this.#moveLease(src, dst);
+	}
+
+	/**
+	 * SQLite: count a write of `path` by this client, in its slot (wrapping at
+	 * 2^32). Called inside the write's transaction, which holds the call
+	 * queue, so a chunked read of `path` that this write lands within takes
+	 * another count at its end (see {@link SqliteWrites}).
+	 */
+	#wrote(path: string): void {
+		const slots = this.#sqliteWrites?.slots;
+		if (slots) slots[sqliteWriteSlot(path)]++;
 	}
 
 	/** Delete every staging set of `path`, whatever its age: a path that goes takes its unfinished full writes with it. */

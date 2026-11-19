@@ -8,7 +8,8 @@
  * Call {@link useKeptTurnSessions} inside a `describe`: it registers the hooks
  * that own the temporary directory, the auth store and the mocks.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, type Mock, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
@@ -23,6 +24,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { sessionMessagePersistenceKey } from "@oh-my-pi/pi-coding-agent/session/turn-persistence";
@@ -189,6 +191,36 @@ export function conversation(messages: readonly AgentMessage[]): string[] {
 	return shapes;
 }
 
+/**
+ * The conversation the model reads from `messages`: each message as
+ * `convertToLlm` sends it, shown as {@link conversation} shows it, and each
+ * developer message (a continue reminder among them) as `developer:` and its
+ * text. A compaction summary reaches the model as a user message.
+ */
+export function modelConversation(messages: readonly AgentMessage[]): string[] {
+	return convertToLlm([...messages]).map(message => {
+		if (message.role !== "developer") return conversation([message])[0] ?? message.role;
+		const text =
+			typeof message.content === "string"
+				? message.content
+				: message.content.map(block => (block.type === "text" ? block.text : block.type)).join("");
+		return `developer:${text}`;
+	});
+}
+
+/**
+ * What the branch of `sessionManager` records, in file order: each message
+ * entry as {@link conversation} shows it, each custom message entry as
+ * `custom:` and its type.
+ */
+export function branchConversation(sessionManager: SessionManager): string[] {
+	return sessionManager.getBranch().flatMap(entry => {
+		if (entry.type === "message") return conversation([entry.message]);
+		if (entry.type === "custom_message") return [`custom:${entry.customType}`];
+		return [];
+	});
+}
+
 /** The lines the transcript draws for an assistant turn, without colours. */
 export function renderTurn(message: AssistantMessage): string[] {
 	const component = new AssistantMessageComponent(message, false);
@@ -204,7 +236,7 @@ export function failedTurn(messages: readonly AgentMessage[]): AssistantMessage 
 	);
 }
 
-interface KeptTurnSessionOptions {
+export interface KeptTurnSessionOptions {
 	/** The context the session starts from, as a resume builds it from the session file. */
 	messages?: AgentMessage[];
 	/** Settings over the harness's own retry and compaction settings. */
@@ -239,6 +271,11 @@ interface KeptTurnSessions {
 	readonly requestMessages: readonly AgentMessage[][];
 	/** Settles once a `held` answer of this case has sent its frames and waits for the abort. */
 	readonly answerHeld: Promise<void>;
+	/**
+	 * The case's `scheduler.wait`, which ends at once and moves the mocked
+	 * clocks on by its delay; a case may wrap its implementation.
+	 */
+	readonly schedulerWait: Mock<typeof scheduler.wait>;
 	readonly tempDir: TempDir;
 	readonly authStorage: AuthStorage;
 	/** A new persisted session in the case's temporary directory. */
@@ -272,6 +309,7 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 	let requests = 0;
 	let requestMessages: AgentMessage[][] = [];
 	let answerHeld = Promise.withResolvers<void>();
+	let schedulerWait: Mock<typeof scheduler.wait> | undefined;
 	const drawn = new WeakMap<AgentSession, AssistantMessage[]>();
 
 	const setUp = <T>(value: T | undefined, name: string): T => {
@@ -296,6 +334,9 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 		get authStorage() {
 			return setUp(authStorage, "authStorage");
 		},
+		get schedulerWait() {
+			return setUp(schedulerWait, "schedulerWait");
+		},
 
 		createSessionManager() {
 			const dir = harness.tempDir.path();
@@ -318,6 +359,8 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 			const agent = new Agent({
 				getApiKey: requested => `${requested.provider}-test-key`,
 				initialState: { model, systemPrompt: ["Test"], tools: [], messages: options.messages ?? [] },
+				// The conversion a CLI session's agent sends with, so custom messages reach the model.
+				convertToLlm,
 				streamFn: (requested, context, streamOptions) => {
 					requestMessages.push([...context.messages]);
 					return streamFn(requested, context, streamOptions);
@@ -459,7 +502,7 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 			const held = answerHeld;
 			return { asResponse: () => primaryResponse(next, options?.signal, () => held.resolve()) } as never;
 		});
-		mockSchedulerWaitWithClock();
+		schedulerWait = mockSchedulerWaitWithClock();
 	});
 
 	afterEach(async () => {

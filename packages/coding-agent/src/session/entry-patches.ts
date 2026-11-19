@@ -275,7 +275,7 @@ export function isEntryPatchRecord(entry: FileEntry): entry is CustomEntry {
 	return entry.type === "custom" && entry.customType === ENTRY_PATCH_CUSTOM_TYPE;
 }
 
-/** Where {@link applyEntryPatches} finds the entry a patch names. */
+/** A session's entries by id: where a patch or prune record finds the entry it names. */
 export interface EntryPatchTargets {
 	get(entryId: string): SessionEntry | undefined;
 }
@@ -344,7 +344,8 @@ export function applyEntryPatchesInWindow(entries: readonly FileEntry[]): void {
 	applyRecords(entries, undefined, false);
 }
 
-const NO_PATCHES: EntryPatchData = { patches: [] };
+/** `data` of an `entry_patch` record that sets no field. */
+export const NO_PATCHES: EntryPatchData = { patches: [] };
 
 /**
  * `entry` as a full rewrite writes it: an `entry_patch` record loses its
