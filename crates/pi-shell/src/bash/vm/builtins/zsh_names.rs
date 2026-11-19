@@ -357,12 +357,24 @@ fn remove(ctx: &mut Ctx<'_, '_>, ht: Ht, name: &[u8]) -> Result<bool, Need> {
 			found
 		},
 		Ht::Func => {
-			let found = ctx.function(name)?.is_some();
+			let platform = ctx.k.engine.config().platform;
+			// A `TRAPxxx` function is its signal's trap, under any of the
+			// signal's names: removing one name removes the trap function
+			// there is (zsh's `removeshfuncnode` calls `removetrap`).
+			let names = super::trap::func_key(name, platform).map_or_else(
+				|| vec![BString::from(name)],
+				|key| super::trap::func_names(key, platform),
+			);
+			let mut found = false;
+			for n in &names {
+				found |= ctx.function(n)?.is_some();
+			}
 			if found {
-				// A `TRAPxxx` function is its trap.
 				let removed = super::trap::FuncChange::Removed;
 				super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, removed)?;
-				ctx.store_record(KeyBuf::Func(name.into()), None);
+				for n in names {
+					ctx.store_record(KeyBuf::Func(n), None);
+				}
 			}
 			found
 		},

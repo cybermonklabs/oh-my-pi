@@ -57,7 +57,9 @@ fn print(ctx: &mut Ctx<'_, '_>, key: TrapKey, action: &[u8]) {
 /// `gettrapnode` looks for them: `TRAP` and zsh's name of the signal
 /// ([`Signal::zsh_name`]: `TRAPINT`, `TRAPIOT` on Linux), then its
 /// alternate names ([`Signal::zsh_alternates`]: `TRAPIO` for `POLL`), or
-/// `TRAPEXIT`, `TRAPZERR`, `TRAPDEBUG`. None for bash's `RETURN`.
+/// `TRAPEXIT`, `TRAPZERR` then `TRAPERR` (zsh's `ERR` names `ZERR`),
+/// `TRAPDEBUG`. None for bash's `RETURN`. A signal has one trap function
+/// at a time, under one of these names ([`func_changing`]).
 pub fn func_names(key: TrapKey, platform: crate::bash::ids::Platform) -> Vec<BString> {
 	match key {
 		TrapKey::Signal(sig) => std::iter::once(sig.zsh_name(platform))
@@ -65,7 +67,7 @@ pub fn func_names(key: TrapKey, platform: crate::bash::ids::Platform) -> Vec<BSt
 			.map(|name| BString::from(format!("TRAP{name}")))
 			.collect(),
 		TrapKey::Exit => vec![BString::from("TRAPEXIT")],
-		TrapKey::Err => vec![BString::from("TRAPZERR")],
+		TrapKey::Err => vec![BString::from("TRAPZERR"), BString::from("TRAPERR")],
 		TrapKey::Debug => vec![BString::from("TRAPDEBUG")],
 		TrapKey::Return => Vec::new(),
 	}
@@ -355,12 +357,15 @@ pub enum FuncChange {
 
 /// A zsh `TRAPNAL` function named `name` is about to change (`how`): under
 /// `localtraps` the enclosing function saves the trap ([`save_local`]); a
-/// definition replaces a `trap` action for the same signal and makes the
-/// trap known to the DEBUG/ZERR fast path. The root shell asks the host to
-/// catch the signal while the function exists and gives it back its
-/// default once it is removed, as zsh's `settrap`/`unsettrap` do: without
-/// that a real signal ended the shell instead of calling the function.
-/// `None` when `name` names no trap.
+/// definition replaces a `trap` action for the same signal and the
+/// signal's trap function under any other of its names ([`func_names`]:
+/// zsh's `settrap` calls `removetrap`, which removes the function
+/// `gettrapnode` finds, so one trap function per signal stays), and makes
+/// the trap known to the DEBUG/ZERR fast path. The root shell asks the
+/// host to catch the signal while the function exists and gives it back
+/// its default once it is removed, as zsh's `settrap`/`unsettrap` do:
+/// without that a real signal ended the shell instead of calling the
+/// function. `None` when `name` names no trap.
 ///
 /// # Errors
 ///
@@ -372,10 +377,18 @@ pub fn func_changing(
 	name: &[u8],
 	how: FuncChange,
 ) -> Result<Option<TrapKey>, StoreError> {
-	let Some(key) = func_key(name, k.engine.config().platform) else {
+	let platform = k.engine.config().platform;
+	let Some(key) = func_key(name, platform) else {
 		return Ok(None);
 	};
 	save_local(&mut k.root, cx.store, vp, key)?;
+	if how != FuncChange::Removed {
+		for other in func_names(key, platform) {
+			if other.as_slice() != name {
+				state::store_record(&mut k.root, cx.store, vp, KeyBuf::Func(other), None);
+			}
+		}
+	}
 	if how == FuncChange::Defined {
 		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
 		k.pseudo_traps.note(key);

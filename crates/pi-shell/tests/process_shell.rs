@@ -204,6 +204,50 @@ fn run_signal(program: impl AsRef<OsStr>, args: &[&str]) -> (Vec<u8>, Vec<u8>, O
 	(out.stdout, out.stderr, out.status.signal())
 }
 
+/// A signal has one trap function at a time, under any of its zsh names
+/// (`TRAPPOLL` and `TRAPIO` for 29 on Linux, `TRAPZERR` and `TRAPERR`):
+/// defining one removes the other, as zsh's `settrap` does, so the newest
+/// runs; and `unfunction` of either name removes the trap function there
+/// is, so a real signal gets its default action back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signals_trap_function_is_one_under_any_of_its_names() {
+	let newest = [
+		"-f",
+		"-c",
+		"TRAPPOLL() { print poll $1 }; TRAPIO() { print io $1 }; kill -POLL $$; whence -w TRAPPOLL \
+		 TRAPIO; print w=$?; TRAPERR() { print err }; false; TRAPZERR() { print zerr }; whence -w \
+		 TRAPERR TRAPZERR; print w=$?",
+	];
+	let ours = obash(&newest);
+	assert_eq!(
+		(String::from_utf8_lossy(&ours.0).into_owned(), ours.2),
+		(
+			"io 29\nTRAPPOLL: none\nTRAPIO: function\nw=1\nerr\nTRAPERR: none\nTRAPZERR: \
+			 function\nzerr\nw=1\n"
+				.to_owned(),
+			Some(0)
+		),
+		"{}",
+		String::from_utf8_lossy(&ours.1)
+	);
+	let removed = [
+		"-f",
+		"-c",
+		"TRAPPOLL() { print poll $1 }; TRAPIO() { print io $1 }; unfunction TRAPPOLL; print unf=$?; \
+		 whence -w TRAPPOLL TRAPIO; kill -POLL $$; print after",
+	];
+	let ours_removed = run_signal(env!("CARGO_BIN_EXE_obash"), &removed);
+	assert_eq!(
+		ours_removed,
+		(b"unf=0\nTRAPPOLL: none\nTRAPIO: none\n".to_vec(), Vec::new(), Some(libc::SIGPOLL))
+	);
+	if have_zsh() {
+		assert_eq!(ours, run(zsh_oracle::path(), &newest));
+		assert_eq!(ours_removed, run_signal(zsh_oracle::path(), &removed));
+	}
+}
+
 /// A signal without a trap whose default action ends the shell ends the
 /// shell's process by that signal, as zsh's does: its parent sees
 /// `WIFSIGNALED` with the signal, not an exit with 128 + its number.
