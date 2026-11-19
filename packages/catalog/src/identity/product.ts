@@ -8,10 +8,7 @@ import { collapseVocabulary, discoveryVocabulary } from "../compat/taxonomy";
 import type { Model } from "../types";
 import { bareModelId } from "./id";
 
-/**
- * A route word, and the classes where it names a route. {@link MODEL_PRODUCT_VARIANT_WORDS} uses the same shape
- * for the classes where a variant word names a product.
- */
+/** A route word, and the classes where it names a route. */
 export interface ModelRouteWord {
 	/** The route word; one made of several id words (`non-reasoning`) matches them in that order. */
 	word: string;
@@ -44,14 +41,21 @@ export const MODEL_ROUTE_WORDS: readonly ModelRouteWord[] = [
 	{ word: "turbo", classes: ["qwen"] },
 ];
 
+/** A variant word of the catalog, and the classes where it names a product of its own. */
+export interface ModelProductVariantWord {
+	/** The variant word, one id word. */
+	word: string;
+	/** The classes where the word names a product of its own; it is a variant word in every other class. */
+	classes: readonly string[];
+}
+
 /**
  * Variant words of the catalog that name a product of their own in some classes: a word on this list is a product
  * word in the classes its entry names and a variant word elsewhere. Each is one id word. The catalog strips `max`
  * as an effort or mode word, as in Cursor's `claude-opus-4-8-max` (Claude Opus 4.8 in Max mode), but GPT-5.1 Codex
- * Max is another model than GPT-5.1 Codex: providers send it upstream as `gpt-5.1-codex-max`, and NanoGPT charges
- * 2.5/20 for it per million input/output tokens against 1.25/10.
+ * Max is another model than GPT-5.1 Codex: providers send it upstream as `gpt-5.1-codex-max`.
  */
-export const MODEL_PRODUCT_VARIANT_WORDS: readonly ModelRouteWord[] = [{ word: "max", classes: ["openai"] }];
+export const MODEL_PRODUCT_VARIANT_WORDS: readonly ModelProductVariantWord[] = [{ word: "max", classes: ["openai"] }];
 
 const WORD_PATTERN = /[a-z0-9]+/g;
 const NUMBER_WORD_PATTERN = /^v?[0-9]+$/;
@@ -67,7 +71,7 @@ interface ProductKeyVocabulary {
 	/** Variant words the catalog strips from any provider's ids. */
 	variantWords: Set<string>;
 	/** {@link MODEL_PRODUCT_VARIANT_WORDS} by word. */
-	productVariantWords: Map<string, ModelRouteWord>;
+	productVariantWords: Map<string, ModelProductVariantWord>;
 	/** Vendor-lineage words: the catalog's canonical family tokens (`claude`, `qwen`). */
 	lineageWords: Set<string>;
 	/** Lane and routing-variant words, by the provider that declares them. */
@@ -109,7 +113,7 @@ const getProductKeyVocabulary = once((): ProductKeyVocabulary => {
 	for (const suffix of discovery.billingVariantSuffixes) addWords(variantWords, suffix);
 	for (const rule of collapse.suffixes) addWords(variantWords, rule.suffix);
 	for (const token of collapse.pairTokens) addWords(variantWords, token);
-	const productVariantWords = new Map<string, ModelRouteWord>();
+	const productVariantWords = new Map<string, ModelProductVariantWord>();
 	for (const entry of MODEL_PRODUCT_VARIANT_WORDS) productVariantWords.set(entry.word, entry);
 	const lineageWords = new Set<string>();
 	for (const token of discovery.canonicalFamilyTokens) addWords(lineageWords, token);
@@ -174,12 +178,11 @@ function isNameWord(
 
 /** Whether `word` is on {@link MODEL_PRODUCT_VARIANT_WORDS} for class `cls`. */
 function isProductVariantWord(
-	productVariantWords: ReadonlyMap<string, ModelRouteWord>,
+	productVariantWords: ReadonlyMap<string, ModelProductVariantWord>,
 	word: string,
 	cls: string,
 ): boolean {
-	const entry = productVariantWords.get(word);
-	return entry !== undefined && entry.classes?.includes(cls) !== false && !entry.exceptClasses?.includes(cls);
+	return productVariantWords.get(word)?.classes.includes(cls) === true;
 }
 
 /**
@@ -194,17 +197,18 @@ function isProductVariantWord(
  * served id, the id the provider is sent (`requestModelId`, else `id`). The
  * catalog's logical id is not read: it drops variant words such as `max`,
  * which name a product in some classes. The product words start at the first
- * class, family or vendor-lineage word of the served id (`claude`, or `qwen3`
- * in `qwen.qwen3-coder`), so a vendor or region prefix (`us-gov.anthropic.`) is
- * left out; when no word qualifies, they start at the first word. They are the
- * words from there on without numbers, class, family and lineage words, the
- * catalog's variant words (except {@link MODEL_PRODUCT_VARIANT_WORDS} in their
- * classes), the provider's lane and routing-variant words, and
- * {@link MODEL_ROUTE_WORDS}. A product word that comes before the family's last
- * word counts too (`live` in `gemini-live-2.5-flash`). A word on no list counts
- * as a product word: keeping a word that only names a route costs one more
- * refused request, but dropping a word that names another product would pass
- * over that product and can end a turn early.
+ * class, family or vendor-lineage word of the served id (`anthropic` in
+ * `us-gov.anthropic.claude-opus-4-8`, or `qwen3` in `qwen3-coder`), so a vendor
+ * or region prefix (`us-gov.`) is left out; when no word qualifies, they start
+ * at the first word. They are the words from there on without numbers, class,
+ * family and lineage words, the catalog's variant words (except
+ * {@link MODEL_PRODUCT_VARIANT_WORDS} in their classes), the provider's lane
+ * and routing-variant words, and {@link MODEL_ROUTE_WORDS}. A product word that
+ * comes before the family's last word counts too (`live` in
+ * `gemini-live-2.5-flash`). A word on no list counts as a product word: keeping
+ * a word that only names a route costs one more refused request, but dropping a
+ * word that names another product would pass over that product and can end a
+ * turn early.
  *
  * Undefined when the identity names no one model: class `unknown`, or no
  * family, or no revision.
@@ -225,10 +229,12 @@ export function productIdentityKey(
 	const familyWords = nameWords(identity.family);
 	const words = wordsOf(bare);
 	const kept: string[] = [];
-	// The words before the first class, family or lineage word are a vendor or region prefix (`us-gov.anthropic.`).
-	let index = 0;
-	while (index < words.length && !isNameWord(words[index], classWords, familyWords, lineageWords)) index++;
-	if (index === words.length) index = 0;
+	// The words before the first class, family or lineage word are a vendor or region prefix (`us-gov.` in
+	// `us-gov.anthropic.claude-opus-4-8`).
+	let index = Math.max(
+		0,
+		words.findIndex(word => isNameWord(word, classWords, familyWords, lineageWords)),
+	);
 	while (index < words.length) {
 		const routeLength = routeWordLength(routeWords, words, index, identity.class);
 		if (routeLength > 0) {

@@ -2855,25 +2855,24 @@ export class TurnRecovery {
 		inheritedThinkingLevel?: InheritedThinkingLevel,
 	): Promise<boolean> {
 		if (this.#isNoOpRetryFallback(pick.model, pick.selector)) {
-			// A pick that is the model in use, at the level its selector names or at
-			// the session's level when it names none, makes no switch, as in the
-			// walk's own search, so the walk answers false. The spent fallback's
-			// level does not count here. It still pins the active fallback's
-			// record, as the switch onto the spent model and the check's switch
-			// back would pin it, so `cooldown-expiry` does not bring back a
-			// primary the turn moved off; with no record, the model in use is no
-			// fallback and none is made. The retry policy then treats the failure
-			// as with no fallback left: the same model's retry budget and backoff
-			// apply, and a spent budget ends the turn. A refusal walk never picks
-			// the model in use: it refused, and the searches pass over every model
-			// that refused in the turn. Any other failure put the model in use in
-			// cooldown (`noteRetryFallbackCooldown`) before its walk, and the
-			// search, as every fallback walk, passes over an entry whose resolved
-			// model is in cooldown (`isRetryFallbackEntrySuppressed`), so another
-			// spelling of the model in use, such as an alias `pi/<role>`, is
-			// skipped too. The pick is the model in use only when that cooldown,
-			// which can be as short as a provider's retry-after hint, ended while
-			// the walk read keys and usage.
+			// The check reads the session's level, not `inheritedThinkingLevel`,
+			// as the walk's own search does, so the walk answers false. It still
+			// pins the active fallback's record, as the switch onto the spent
+			// model and the check's switch back would pin it, so `cooldown-expiry`
+			// does not bring back a primary the turn moved off; with no record,
+			// the model in use is no fallback and none is made. The retry policy
+			// then treats the failure as with no fallback left: the same model's
+			// retry budget and backoff apply, and a spent budget ends the turn. A
+			// refusal walk never picks the model in use: it refused, and the
+			// searches pass over every model that refused in the turn. Any other
+			// failure put the model in use in cooldown
+			// (`noteRetryFallbackCooldown`) before its walk, and the search, as
+			// every fallback walk, passes over an entry whose resolved model is in
+			// cooldown (`isRetryFallbackEntrySuppressed`), so another spelling of
+			// the model in use, such as an alias `pi/<role>`, is skipped too. The
+			// pick is the model in use only when that cooldown, which can be as
+			// short as a provider's retry-after hint, ended while the walk read
+			// keys and usage.
 			if (this.#activeRetryFallback) this.#activeRetryFallback.pinned = true;
 			return false;
 		}
