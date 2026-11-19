@@ -1,8 +1,10 @@
 // Integration tests of a service's ready wait when the client waits for readiness itself (`startService` with a
 // ready interrupt): it asks the broker to launch the service without waiting, then waits for what is left of the
-// spec's timeout. What is left is counted from the launch, on monotonic clocks: a wait measured from the broker's
-// wall-clock `startedAt` would grow by a backward step of the wall clock (and be cut to nothing by a forward one), and
-// one counted from the client's request would also spend the time the broker took before the launch.
+// spec's timeout. What is left is counted from the launch, on monotonic clocks: the broker's answer says how long ago
+// it launched the process (`launchedMsAgo`). A broker that does not say (a released one) gets the time since its
+// wall-clock `startedAt`, at least 0 and at most the time since the client's request, so a backward step of the wall
+// clock does not hold the wait and a forward one does not cut it to nothing. A count from the request alone would
+// also spend the time the broker took before the launch.
 import { expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -91,37 +93,69 @@ async function withBroker(
 	}
 }
 
+/**
+ * Starts a service that never becomes ready, with a 1 s ready wait, and steps the wall clock by `stepMs` once the
+ * broker has launched it. With `released`, the start answer loses `launchedMsAgo`, as a released broker's does.
+ * Returns how long the start took from its request, or fails if the wait is still open after 15 s.
+ */
+async function waitAcrossAStep(
+	session: ToolSession,
+	client: brokerClients.DaemonBrokerClient,
+	stepMs: number,
+	released: boolean,
+): Promise<number> {
+	const realNow = Date.now.bind(Date);
+	const realRequest = client.request.bind(client);
+	vi.spyOn(client, "request").mockImplementation(async (operation: DaemonOperation, signal?: AbortSignal) => {
+		const result = await realRequest(operation, signal);
+		if (result.op === "start") {
+			if (released) delete result.launchedMsAgo;
+			spyOn(Date, "now").mockImplementation(() => realNow() + stepMs);
+		}
+		return result;
+	});
+	const neverInterrupted = new AbortController();
+	const requested = performance.now();
+	const started = startService(
+		session,
+		{ name: NAME, command: "sleep 600", ready: { log: "never printed", timeout: 1 } },
+		undefined,
+		neverInterrupted.signal,
+	);
+	// The bound is timed on the monotonic clock, which the step does not move.
+	const held = Bun.sleep(15_000).then(() => "held" as const);
+	const outcome = await Promise.race([started, held]);
+	const took = performance.now() - requested;
+	if (outcome === "held") throw new Error("the ready wait did not end");
+	expect({ readyTimedOut: outcome.readyTimedOut, interrupted: outcome.readyInterrupted }).toEqual({
+		readyTimedOut: true,
+		interrupted: false,
+	});
+	return took;
+}
+
+// The whole 1 s wait, less the timers' own slack.
+const WHOLE_WAIT_MS = 1_000 - 50;
+
 it("times a service's ready wait on the monotonic clock: a backward step of the wall clock does not hold it", async () => {
 	await withBroker("@omp-service-ready-clock-", async (session, client) => {
-		const realNow = Date.now.bind(Date);
-		let clockSpy: { mockRestore(): void } | undefined;
-		try {
-			const realRequest = client.request.bind(client);
-			vi.spyOn(client, "request").mockImplementation(async (operation: DaemonOperation, signal?: AbortSignal) => {
-				const result = await realRequest(operation, signal);
-				// The wall clock steps back 60 s once the broker has launched the service.
-				if (operation.op === "start") clockSpy = spyOn(Date, "now").mockImplementation(() => realNow() - 60_000);
-				return result;
-			});
-			const neverInterrupted = new AbortController();
-			const started = startService(
-				session,
-				{ name: NAME, command: "sleep 600", ready: { log: "never printed", timeout: 1 } },
-				undefined,
-				neverInterrupted.signal,
-			);
-			// The wait ends at the spec's 1 s timeout; one measured from the broker's wall-clock start would wait
-			// 60 s more. The bound is timed on the monotonic clock, which the step does not move.
-			const held = Bun.sleep(15_000).then(() => "held" as const);
-			const outcome = await Promise.race([started, held]);
-			if (outcome === "held") throw new Error("the ready wait did not end");
-			expect({ readyTimedOut: outcome.readyTimedOut, interrupted: outcome.readyInterrupted }).toEqual({
-				readyTimedOut: true,
-				interrupted: false,
-			});
-		} finally {
-			clockSpy?.mockRestore();
-		}
+		// A wait measured from the broker's wall-clock start would last 60 s more.
+		expect(await waitAcrossAStep(session, client, -60_000, false)).toBeGreaterThanOrEqual(WHOLE_WAIT_MS);
+	});
+}, 30_000);
+
+it("does not hold a service's ready wait across a backward step with a broker that does not say when it launched", async () => {
+	await withBroker("@omp-service-ready-released-back-", async (session, client) => {
+		// The time since `startedAt` reads -60 s: without its floor of 0 the wait would last 61 s.
+		expect(await waitAcrossAStep(session, client, -60_000, true)).toBeGreaterThanOrEqual(WHOLE_WAIT_MS);
+	});
+}, 30_000);
+
+it("does not cut a service's ready wait across a forward step with a broker that does not say when it launched", async () => {
+	await withBroker("@omp-service-ready-released-fwd-", async (session, client) => {
+		// The time since `startedAt` reads 60 s: without its bound by the time since the request, nothing would be
+		// left of the 1 s wait.
+		expect(await waitAcrossAStep(session, client, 60_000, true)).toBeGreaterThanOrEqual(WHOLE_WAIT_MS);
 	});
 }, 30_000);
 

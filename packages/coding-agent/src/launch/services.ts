@@ -269,8 +269,9 @@ export async function startService(
 	// The broker's `startedAt` is a wall-clock time, which a step of the clock
 	// would move. A broker that does not say (a released one) gets the time
 	// since `startedAt`, bounded by the time since the request: without a step
-	// that is the launch count; a forward step falls back to the request count,
-	// and a backward one adds at most the time from the request to the answer.
+	// that is the launch count; a forward step counts at most from the
+	// request, and a backward one adds at most the time from the request to
+	// the answer.
 	const requestedAt = performance.now();
 	const result = await request(
 		session,
