@@ -1256,3 +1256,226 @@ async fn a_missing_category_leaves_the_utilities_in_c() {
 	assert_eq!(lines[9].trim(), "c3 0a a9 0a", "fold splits the bytes of a character");
 	assert_eq!(lines[10], "X=''$'\\303\\251'", "env escapes a byte C cannot print");
 }
+
+/// Puts a seccomp filter on the calling thread, and on it alone, that
+/// answers each of `calls` with `ENOSYS` and lets every other call through.
+/// Docker's default profile answers `clone3` that way, so that a C library
+/// falls back to `clone`. Once `no_new_privs` is set this needs no
+/// privilege. A filter cannot be taken off again, so the thread keeps it:
+/// the test's own process under nextest, its own thread under `cargo test`.
+///
+/// With `probe_finds_clone3`, a `clone3` whose size is zero — the
+/// capability probe's question — is answered `EINVAL`, as a kernel that has
+/// the call answers it, and only a real `clone3` gets `ENOSYS`. That holds
+/// under a profile that refuses every `clone3` as well: of two filters that
+/// answer one call with an error, the newer one's error is returned
+/// (`seccomp_run_filters` walks from the newest filter and takes an older
+/// one's answer only when its action is stronger).
+#[cfg(target_os = "linux")]
+fn answer_enosys_on_this_thread(calls: &[libc::c_long], probe_finds_clone3: bool) {
+	let statement =
+		|code: u32, k: u32| libc::sock_filter { code: u16::try_from(code).unwrap(), jt: 0, jf: 0, k };
+	let load =
+		|at: usize| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, u32::try_from(at).unwrap());
+	let answer = |errno: libc::c_int| {
+		statement(
+			libc::BPF_RET | libc::BPF_K,
+			libc::SECCOMP_RET_ERRNO | u32::try_from(errno).unwrap(),
+		)
+	};
+	// Equal to `k`: on to the next instruction. Anything else: over `skip`.
+	let unless = |k: u32, skip: u8| libc::sock_filter {
+		jf: skip,
+		..statement(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, k)
+	};
+	// The call's number, a word (`BPF_W`, as its `int` is), and the low word
+	// of its second argument, which is `clone3`'s size.
+	let number = std::mem::offset_of!(libc::seccomp_data, nr);
+	let low_word = if cfg!(target_endian = "big") { 4 } else { 0 };
+	let size = std::mem::offset_of!(libc::seccomp_data, args) + size_of::<u64>() + low_word;
+	let clone3 = u32::try_from(libc::SYS_clone3).unwrap();
+	let mut program = vec![load(number)];
+	for call in calls {
+		let call = u32::try_from(*call).unwrap();
+		if probe_finds_clone3 && call == clone3 {
+			// Each of the four after the first returns, so another call's
+			// number skips all of them.
+			program.extend([
+				unless(call, 4),
+				load(size),
+				unless(0, 1),
+				answer(libc::EINVAL),
+				answer(libc::ENOSYS),
+			]);
+		} else {
+			program.extend([unless(call, 1), answer(libc::ENOSYS)]);
+		}
+	}
+	program.push(statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW));
+	let filter = libc::sock_fprog {
+		len:    u16::try_from(program.len()).unwrap(),
+		filter: program.as_mut_ptr(),
+	};
+	let (on, none): (libc::c_ulong, libc::c_ulong) = (1, 0);
+	let mode = libc::c_ulong::from(libc::SECCOMP_MODE_FILTER);
+	// SAFETY: `prctl` reads these as `unsigned long`, and the kernel copies
+	// the program, which outlives the call.
+	unsafe {
+		let quiet = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, none, none, none);
+		assert_eq!(quiet, 0, "{}", std::io::Error::last_os_error());
+		let filtered = libc::prctl(libc::PR_SET_SECCOMP, mode, &raw const filter, none, none);
+		assert_eq!(filtered, 0, "{}", std::io::Error::last_os_error());
+	}
+}
+
+/// A stand-in for the locale utility that answers `ISO-8859-1`, so the
+/// tests of how its child is made need no generated locale data and cannot
+/// pass by finding none.
+#[cfg(target_os = "linux")]
+fn latin_utility(dir: &Path) -> PathBuf {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let program = dir.join("latin-locale");
+	fs::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n").unwrap();
+	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	program
+}
+
+/// One query of the utility at `program`, from this thread.
+#[cfg(target_os = "linux")]
+fn ask(program: &Path) -> crate::locale::Codeset {
+	crate::locale::codeset_from_utility_for_test(program, "C.UTF-8", &|_: &str| None)
+}
+
+/// Whether `answer` is the stand-in's.
+#[cfg(target_os = "linux")]
+fn is_latin(answer: &crate::locale::Codeset) -> bool {
+	matches!(answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1")
+}
+
+/// Whether `answer` is a refusal to start the utility that names `why`.
+#[cfg(target_os = "linux")]
+fn not_started(answer: &crate::locale::Codeset, why: &str) -> bool {
+	matches!(
+		answer,
+		crate::locale::Codeset::Unasked(said) if said.contains("could not be started") && said.contains(why)
+	)
+}
+
+/// This process's open descriptors, as `/proc/self/fd` lists them.
+#[cfg(target_os = "linux")]
+fn open_descriptors() -> usize {
+	fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+/// What this thread's `clone3` answers to the capability probe's question:
+/// `EINVAL` where it has the call.
+#[cfg(target_os = "linux")]
+fn clone3_answer() -> Option<i32> {
+	// SAFETY: a null argument block with a zero size is refused before the
+	// kernel reads anything, so this makes no process.
+	let made =
+		unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<super::CloneArgs>(), 0usize) };
+	assert!(made < 0, "{made}");
+	std::io::Error::last_os_error().raw_os_error()
+}
+
+/// Whether this thread's probe, which its first query ran, found `clone3`.
+#[cfg(target_os = "linux")]
+fn probe_found_clone3() -> bool {
+	super::CHILD_CALLS.with(|calls| calls.clone3)
+}
+
+/// Where `clone3` answers `ENOSYS` from the start, as under Docker's default
+/// seccomp profile, the probe finds no `clone3` and `clone` with
+/// `CLONE_PIDFD` starts the utility; only a `clone` refused as well refuses
+/// the query, and neither leaves a child or a descriptor behind. Where this
+/// code does not make the raw `clone` call ([`super::CLONE_ARGUMENTS_KNOWN`])
+/// the query is refused, as every such query was before `clone` was used.
+///
+/// Under that profile a query that could start its child through `clone3`
+/// alone was refused for every locale, and 16 of the 24 `locale::` tests
+/// failed. The probe is this thread's own and runs at its first query,
+/// after the filter is on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let enosys = format!("os error {}", libc::ENOSYS);
+	let descriptors = open_descriptors();
+	answer_enosys_on_this_thread(&[libc::SYS_clone3], false);
+	assert_eq!(clone3_answer(), Some(libc::ENOSYS));
+	let cloned = ask(&program);
+	assert!(!probe_found_clone3());
+	if super::CLONE_ARGUMENTS_KNOWN {
+		assert!(is_latin(&cloned), "{cloned:?}");
+	} else {
+		assert!(not_started(&cloned, "unsupported"), "{cloned:?}");
+	}
+	answer_enosys_on_this_thread(&[libc::SYS_clone], false);
+	let refused = ask(&program);
+	let why = if super::CLONE_ARGUMENTS_KNOWN {
+		enosys.as_str()
+	} else {
+		"unsupported"
+	};
+	assert!(not_started(&refused, why), "{refused:?}");
+	assert_eq!(open_descriptors(), descriptors);
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// A thread can gain a seccomp filter after its probe found `clone3`, and
+/// `clone3` then answers `ENOSYS` at the call itself. That answer made no
+/// process, and `clone` starts the utility in its place, leaving no child or
+/// descriptor behind. The filter answers the probe's own question as a
+/// kernel with `clone3` does and refuses only a real `clone3`, so the order
+/// is the same on any machine: under Docker's default profile the probe
+/// would otherwise find no `clone3`, and this path would never run.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let descriptors = open_descriptors();
+	answer_enosys_on_this_thread(&[libc::SYS_clone3], true);
+	assert_eq!(clone3_answer(), Some(libc::EINVAL));
+	let cloned = ask(&program);
+	assert!(probe_found_clone3(), "the probe found no clone3, so the call-time path did not run");
+	if super::CLONE_ARGUMENTS_KNOWN {
+		assert!(is_latin(&cloned), "{cloned:?}");
+	} else {
+		assert!(not_started(&cloned, &format!("os error {}", libc::ENOSYS)), "{cloned:?}");
+	}
+	assert_eq!(open_descriptors(), descriptors);
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// A probe is the asking thread's own: another thread whose `clone3` is
+/// refused does not send this one, whose `clone3` is not refused but whose
+/// `clone` is, down `clone`. Under a profile that refuses every `clone3`,
+/// this thread has neither call, and its query is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let other = program.clone();
+	std::thread::spawn(move || {
+		answer_enosys_on_this_thread(&[libc::SYS_clone3], false);
+		let _ = ask(&other);
+		assert!(!probe_found_clone3());
+	})
+	.join()
+	.unwrap();
+	answer_enosys_on_this_thread(&[libc::SYS_clone], false);
+	let own_clone3 = clone3_answer() == Some(libc::EINVAL);
+	let answer = ask(&program);
+	if own_clone3 {
+		assert!(probe_found_clone3());
+		assert!(is_latin(&answer), "{answer:?}");
+	} else {
+		assert!(not_started(&answer, &format!("os error {}", libc::ENOSYS)), "{answer:?}");
+	}
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
