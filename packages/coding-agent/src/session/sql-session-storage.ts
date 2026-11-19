@@ -786,6 +786,18 @@ const PG_HOLDER_INDEX_NAME = statement(
 		"LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid WHERE c.oid = pg_catalog.to_regclass(@index)",
 );
 /**
+ * The reference table's indexes led by `sha256`, whatever their names: a
+ * delete's look for the references of the blobs it would take, and the
+ * sweep's, read by `sha256` alone (the primary key leads with `path`).
+ * Found through `pg_index`, as {@link PG_HOLDER_INDEXES} are.
+ */
+const PG_RHASH_INDEXES = statement(
+	"postgres",
+	"SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a " +
+		"ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] WHERE i.indrelid = pg_catalog.to_regclass(@table) " +
+		"AND i.indexprs IS NULL AND i.indpred IS NULL AND a.attname = 'sha256'",
+);
+/**
  * Whether each of the store's PostgreSQL tables exists, by name, as
  * `CREATE TABLE IF NOT EXISTS` finds it (any relation of that name counts;
  * the table check refuses one that is not an ordinary table),
@@ -3262,6 +3274,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 						}>;
 						if (grant?.can !== true) found.push(`no ${privilege} privilege for the store's login`);
 					}
+				}
+				// A delete reads a blob's references by sha256; without the index each read scans the table, under the delete's locks.
+				if (declared === PG_DECLARED_COLUMNS.refs) {
+					const indexes = (await run(executor, PG_RHASH_INDEXES, { table: relation })) as unknown[];
+					if (indexes.length === 0) found.push("no index on column sha256");
 				}
 				// The lease entry by its role, not its name: a lease table that names another of the store's is one table.
 				if (declared === PG_DECLARED_COLUMNS.lease) {

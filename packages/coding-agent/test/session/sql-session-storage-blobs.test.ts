@@ -384,6 +384,8 @@ describe("session blobs in the SQL session storage", () => {
 								? "sha256 text NOT NULL, content bytea NOT NULL, byte_len bigint NOT NULL, mime_type text, created_ms bigint NOT NULL"
 								: "path text NOT NULL, sha256 text NOT NULL";
 						const key = suffix === "blobs" ? "sha256" : "path, sha256";
+						// The reference table's index goes with it, so each case's only problem is its parent.
+						const index = suffix === "refs" ? `CREATE INDEX ${db.table}_rhash ON ${table} (sha256)` : undefined;
 						try {
 							// The table as the store declares it, but a child of another table.
 							await db.sql(`DROP TABLE ${table}`);
@@ -391,7 +393,10 @@ describe("session blobs in the SQL session storage", () => {
 							await db.sql(
 								`CREATE TABLE ${table} (${columns}, PRIMARY KEY (${key})) INHERITS (${table}_parent)`,
 							);
-							expect(String(await rejection(db.open({ createTable: false })))).toContain(table);
+							if (index) await db.sql(index);
+							expect(String(await rejection(db.open({ createTable: false })))).toMatch(
+								new RegExp(`${table} inherits from \\S*${table}_parent\\b`),
+							);
 
 							// The table as the store declares it, but a partition of another table.
 							await db.sql(`DROP TABLE ${table}`);
@@ -401,13 +406,29 @@ describe("session blobs in the SQL session storage", () => {
 								`CREATE TABLE ${table} PARTITION OF ${table}_parent FOR VALUES WITH (MODULUS 1, REMAINDER 0)`,
 							);
 							await db.sql(`ALTER TABLE ${table} ADD PRIMARY KEY (${key})`);
-							expect(String(await rejection(db.open({ createTable: false })))).toContain(table);
+							if (index) await db.sql(index);
+							expect(String(await rejection(db.open({ createTable: false })))).toMatch(
+								new RegExp(`${table} is a partition of \\S*${table}_parent\\b`),
+							);
 						} finally {
 							await db.sql(`DROP TABLE IF EXISTS ${table}_parent CASCADE`);
 						}
 					},
 				);
 			}
+
+			it.skipIf(adapter !== "postgres")(
+				"refuses to start on a reference table without its index on sha256",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					await (await db.open()).drain();
+					// A delete's and the sweep's look for a blob's references reads by sha256 alone.
+					await db.sql(`DROP INDEX ${db.table}_rhash`);
+					expect(String(await rejection(db.open({ createTable: false })))).toContain(
+						`${db.table}_refs has no index on column sha256`,
+					);
+				},
+			);
 
 			it("deletes a session's blob rows with the session, and keeps one another session still names", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
@@ -457,7 +478,7 @@ describe("session blobs in the SQL session storage", () => {
 				expect(await blobHashes(db)).toEqual([]);
 			});
 
-			it("never stores local bytes that do not hash to their key, and rewrites a wrong row from the right bytes", async () => {
+			it("never stores local bytes that do not hash to their key, and rewrites a wrong row from the right bytes only", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const { sessionFile, sessionDir } = await writeSession(db);
 				const wrong = Buffer.alloc(IMAGE_BYTES.byteLength, 9);
@@ -476,6 +497,17 @@ describe("session blobs in the SQL session storage", () => {
 				await again.flush();
 				await again.close();
 				expect(await blobHashes(db)).toEqual([]);
+
+				// A wrong row, and this machine holds other wrong bytes under the hash: the row is left as it is.
+				const other = Buffer.alloc(IMAGE_BYTES.byteLength, 5);
+				await db.sql(
+					`INSERT INTO ${db.table}_blobs (sha256, content, byte_len, mime_type, created_ms) VALUES (@1, @2, @3, @4, @5)`,
+					[IMAGE_HASH, other, other.byteLength, "image/png", Date.now()],
+				);
+				const third = await SessionManager.open(sessionFile, sessionDir, await db.open());
+				await third.close();
+				const [kept] = await db.sql(`SELECT content FROM ${db.table}_blobs WHERE sha256 = @1`, [IMAGE_HASH]);
+				expect(Buffer.from(kept?.content as Uint8Array).equals(other)).toBe(true);
 			});
 
 			it("fails only the writes that name a blob that cannot be written", async () => {

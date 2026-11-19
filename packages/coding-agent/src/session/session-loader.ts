@@ -885,11 +885,13 @@ async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobSt
  * left out and warned about. With `writeBack`, each blob this machine holds
  * and the tier lacks (one written before the tier, or whose write never
  * landed) is queued for the tier, so it lands before the session's next
- * transcript write; with `sessionPath` too, the session at that path then
- * gets its reference rows for every blob it names that the tier holds, so
- * another session's delete keeps them (a session written before the tier has
- * none). Snapcompact frames are not in the tier; they are drawn again from
- * their archive's text.
+ * transcript write, and each row whose bytes do not hash to its key is
+ * rewritten from this machine's bytes; the tier stores no bytes that do not
+ * hash to their key, whichever of the two hands them over. With
+ * `sessionPath` too, the session at that path then gets its reference rows
+ * for every blob it names that the tier holds, so another session's delete
+ * keeps them (a session written before the tier has none). Snapcompact frames
+ * are not in the tier; they are drawn again from their archive's text.
  */
 async function restoreTierBlobs(
 	values: readonly unknown[],
@@ -907,10 +909,6 @@ async function restoreTierBlobs(
 		mimeTypes.set(hash, typeof mimeType === "string" ? mimeType : undefined);
 	}
 	if (mimeTypes.size === 0) return;
-	const verifiedLocal = async (hash: string): Promise<Buffer | null> => {
-		const data = await blobStore.get(hash);
-		return data && new Bun.SHA256().update(data).digest("hex") === hash ? data : null;
-	};
 	const named: string[] = [];
 	try {
 		const held = await tier.sizes([...mimeTypes.keys()]);
@@ -925,7 +923,7 @@ async function restoreTierBlobs(
 				continue;
 			}
 			if (!writeBack) continue;
-			const data = await verifiedLocal(hash);
+			const data = await blobStore.get(hash);
 			if (!data) continue;
 			tier.store(hash, data, mimeType);
 			named.push(hash);
@@ -934,8 +932,8 @@ async function restoreTierBlobs(
 		if (writtenBack > 0) {
 			logger.info("Writing local session blobs the session database lacks back to it", { blobs: writtenBack });
 		}
-		// A row whose bytes do not hash to its key is rewritten from this machine's right bytes.
-		if (writeBack && heldHere.length > 0) await tier.repair(heldHere, verifiedLocal);
+		// A row whose bytes do not hash to its key is rewritten from this machine's bytes, when they hash to it.
+		if (writeBack && heldHere.length > 0) await tier.repair(heldHere, hash => blobStore.get(hash));
 		await tier.read(missing, async (hash, data) => {
 			if (new Bun.SHA256().update(data).digest("hex") !== hash) {
 				logger.warn("A session blob in the session database does not hash to its key; left missing", { hash });

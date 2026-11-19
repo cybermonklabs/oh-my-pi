@@ -149,6 +149,8 @@ describe("omp gc --blobs under session.storage: sql", () => {
 		await row("named", old);
 		await row("orphan", old);
 		await row("fresh", Date.now());
+		// A machine that stored an image has a blob directory; a blob phase that cannot identify one deletes nothing.
+		await fs.mkdir(getBlobsDir(root), { recursive: true });
 
 		const result = await runGcCommand({ flags: { agentDir: root, blobs: true, apply: true } });
 
