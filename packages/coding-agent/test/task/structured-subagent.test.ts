@@ -52,6 +52,7 @@ import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { letRefusedReleaseRun } from "../helpers/release-race";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
 import { cfgRetryModelFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -138,6 +139,53 @@ function result(): SingleResult {
 
 function mockDiscovery(agent: AgentDefinition = AGENT): void {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+}
+
+/** A source session's saved default model. */
+const SAVED_DEFAULT_MODEL = {
+	type: "model_change",
+	id: "default-model",
+	parentId: null,
+	timestamp: "2026-10-01T00:00:01.000Z",
+	model: "anthropic/claude-sonnet-4-5",
+	role: "default",
+};
+
+/** A seance's source session in a temp dir, and a caller session that can fork it. */
+interface SeanceSource {
+	caller: ToolSession;
+	sourceFile: string;
+	/** Close the caller's auth storage and remove the temp dir. */
+	dispose(): Promise<void>;
+}
+
+/**
+ * Discover the bundled seance agent and write the source session `id`, its header then `entries`, in a temp dir, for a
+ * caller whose model registry holds an Anthropic key when `anthropicKey` is set.
+ */
+async function seanceSource(
+	id: string,
+	entries: readonly Record<string, unknown>[],
+	options: { anthropicKey?: boolean } = {},
+): Promise<SeanceSource> {
+	const seanceAgent = getBundledAgent("seance");
+	if (!seanceAgent) throw new Error("Expected the bundled seance agent");
+	mockDiscovery(seanceAgent);
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-"));
+	const authStorage = createInMemoryAuthStorage();
+	if (options.anthropicKey) authStorage.keys.setRuntime("anthropic", "test-key");
+	const cwd = path.join(tempDir, "project");
+	const sourceFile = path.join(tempDir, "sessions", `${id}.jsonl`);
+	const header = { type: "session", version: 3, id, timestamp: "2026-10-01T00:00:00.000Z", cwd };
+	await Bun.write(sourceFile, `${[header, ...entries].map(entry => JSON.stringify(entry)).join("\n")}\n`);
+	return {
+		caller: Object.assign(session({ cwd }), { modelRegistry: new ModelRegistry(authStorage) }),
+		sourceFile,
+		dispose: async () => {
+			authStorage.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		},
+	};
 }
 
 afterEach(() => {
@@ -227,28 +275,10 @@ describe("structured subagent primitive", () => {
 	});
 
 	it("uses saved seance models in active-role/default order and honors an explicit available override", async () => {
-		const seanceAgent = getBundledAgent("seance");
-		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
-		mockDiscovery(seanceAgent);
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-policy-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		authStorage.keys.setRuntime("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage);
-		const cwd = path.join(tempDir, "project");
-		const sourceFile = path.join(tempDir, "sessions", "source.jsonl");
-		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
-		await Bun.write(
-			sourceFile,
-			`${[
-				{ type: "session", version: 3, id: "saved-source", timestamp: "2026-10-01T00:00:00.000Z", cwd },
-				{
-					type: "model_change",
-					id: "default-model",
-					parentId: null,
-					timestamp: "2026-10-01T00:00:01.000Z",
-					model: "anthropic/claude-sonnet-4-5",
-					role: "default",
-				},
+		const { caller, sourceFile, dispose } = await seanceSource(
+			"saved-source",
+			[
+				SAVED_DEFAULT_MODEL,
 				{
 					type: "model_change",
 					id: "active-model",
@@ -257,11 +287,9 @@ describe("structured subagent primitive", () => {
 					model: "anthropic/claude-sonnet-4-6",
 					role: "fast",
 				},
-			]
-				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
+			],
+			{ anthropicKey: true },
 		);
-		const caller = Object.assign(session({ cwd }), { modelRegistry });
 		try {
 			const saved = await resolveEffectiveSubagentPolicy(
 				request({ session: caller, agent: "seance", sourceSession: sourceFile }),
@@ -282,26 +310,12 @@ describe("structured subagent primitive", () => {
 			);
 			expect(overridden.modelOverride).toEqual(["anthropic/claude-sonnet-4-5"]);
 		} finally {
-			authStorage.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await dispose();
 		}
 	});
 
 	it("fails closed when the source has no saved model or an explicit model is unavailable", async () => {
-		const seanceAgent = getBundledAgent("seance");
-		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
-		mockDiscovery(seanceAgent);
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-model-fail-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		const modelRegistry = new ModelRegistry(authStorage);
-		const cwd = path.join(tempDir, "project");
-		const sourceFile = path.join(tempDir, "sessions", "no-model.jsonl");
-		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
-		await Bun.write(
-			sourceFile,
-			`${JSON.stringify({ type: "session", version: 3, id: "no-model-source", timestamp: "2026-10-01T00:00:00.000Z", cwd })}\n`,
-		);
-		const caller = Object.assign(session({ cwd }), { modelRegistry });
+		const { caller, sourceFile, dispose } = await seanceSource("no-model-source", []);
 		try {
 			await expect(
 				resolveEffectiveSubagentPolicy(request({ session: caller, agent: "seance", sourceSession: sourceFile })),
@@ -317,8 +331,7 @@ describe("structured subagent primitive", () => {
 				),
 			).rejects.toThrow("No available saved model can serve this source.");
 		} finally {
-			authStorage.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await dispose();
 		}
 	});
 
@@ -806,35 +819,11 @@ describe("structured subagent primitive", () => {
 	});
 
 	it("removes a seance's temporary artifacts only after its run published its result, when a release ends it as it finishes", async () => {
-		// If this regresses, the adoption the release refuses runs the seance's release hook at once: it removes the
-		// temporary artifacts directory while the run's end still publishes its result there, so the result names a
-		// removed file, or that end creates the directory again, unregistered, and nothing removes it any more.
-		const seanceAgent = getBundledAgent("seance");
-		if (!seanceAgent) throw new Error("Expected the bundled seance agent");
-		mockDiscovery(seanceAgent);
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-seance-release-"));
-		const authStorage = await AuthStorage.create(":memory:");
-		authStorage.keys.setRuntime("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage);
-		const cwd = path.join(tempDir, "project");
-		const sourceFile = path.join(tempDir, "sessions", "source.jsonl");
-		await Bun.write(
-			sourceFile,
-			`${[
-				{ type: "session", version: 3, id: "released-seance-source", timestamp: "2026-10-01T00:00:00.000Z", cwd },
-				{
-					type: "model_change",
-					id: "default-model",
-					parentId: null,
-					timestamp: "2026-10-01T00:00:01.000Z",
-					model: "anthropic/claude-sonnet-4-5",
-					role: "default",
-				},
-			]
-				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-		const caller = Object.assign(session({ cwd }), { modelRegistry });
+		// If this regresses, the adoption the release refuses runs the seance's release hook at once: the temporary
+		// artifacts directory is gone when the run's end publishes its result there, or a directory is left behind.
+		const { caller, sourceFile, dispose } = await seanceSource("released-seance-source", [SAVED_DEFAULT_MODEL], {
+			anthropicKey: true,
+		});
 		const parent = "ReleasedSeanceParent";
 		const disposing = Promise.withResolvers<void>();
 		const seanceSession = {
@@ -870,10 +859,7 @@ describe("structured subagent primitive", () => {
 					return hook;
 				},
 			});
-			// Let a release the refused adoption started go as far as it can before the run's end goes on.
-			// A release that waits for that end would hold the run here, so the wait is bounded (only such a
-			// release reaches the bound); a fake clock would also stop the lifecycle's own release deadline.
-			if (hook) await Promise.race([hook, Bun.sleep(1000)]);
+			await letRefusedReleaseRun(hook);
 			// The run's end publishes its result in the artifacts directory, as `finalizeRunResult` does.
 			const dir = options.artifactsDir ?? "";
 			presentAtPublish = await fs.stat(dir).then(
@@ -906,8 +892,7 @@ describe("structured subagent primitive", () => {
 			// The release removed the artifacts: no one is handed a cleanup of a directory that is gone.
 			expect(onArtifactsRetained).not.toHaveBeenCalled();
 		} finally {
-			authStorage.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await dispose();
 			if (artifactsDir) await fs.rm(artifactsDir, { recursive: true, force: true });
 		}
 	});

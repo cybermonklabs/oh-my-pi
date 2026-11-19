@@ -644,7 +644,11 @@ export interface ExecutorOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
-	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
+	/**
+	 * Internal ownership handoff for cleanup that outlives the visible Task result. It may be called again
+	 * (`runIsolatedSubprocess` hands on a failed run's late release too); each completion ends only after the
+	 * ones before it, so the last one covers all of the run's cleanup.
+	 */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/**
 	 * Releases resources retained for a kept-alive agent when its lifecycle ends. The run's own

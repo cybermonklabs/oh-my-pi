@@ -198,7 +198,7 @@ export interface IsolatedRunOptions {
 	agentId: string;
 	/** Merge mode driving how changes are captured ("branch" commits, "patch" diffs). */
 	mergeMode: "patch" | "branch";
-	/** Output dir for `${agentId}.patch` artifacts (patch mode and branch-mode commit failures). */
+	/** Output dir for `${agentId}.patch` and the nested patch files the run and its release write. */
 	artifactsDir: string;
 	/** Human description carried onto the branch commit (branch mode). */
 	description?: string;
@@ -262,11 +262,6 @@ interface IsolationDelta {
 	fingerprint: bigint | number;
 }
 
-interface IsolationPatchCapture extends IsolationDelta {
-	/** Where {@link IsolationDelta.delta} was written. */
-	artifacts: IsolationPatchArtifacts;
-}
-
 /** Capture the isolation delta without writing any of it. */
 async function captureIsolationDelta(changes: RunChanges): Promise<IsolationDelta> {
 	const delta = await changes.delta();
@@ -292,19 +287,6 @@ async function persistIsolationPatch(
 		nestedPatches: delta.nestedPatches,
 		nestedPatchPaths,
 	};
-}
-
-/**
- * Capture the isolation delta and write every part of it to disk before the
- * caller tears the workspace down ({@link persistIsolationPatch}).
- */
-async function writeIsolationPatch(
-	changes: RunChanges,
-	artifactsDir: string,
-	agentId: string,
-): Promise<IsolationPatchCapture> {
-	const captured = await captureIsolationDelta(changes);
-	return { ...captured, artifacts: await persistIsolationPatch(captured.delta, artifactsDir, agentId) };
 }
 
 /** How an isolated run's changes are read: relative to the state its workspace opened in. */
@@ -482,7 +464,10 @@ function renderIsolationError(context: IsolationErrorContext): string {
  * Run a subagent inside an isolation worktree and capture its changes.
  *
  * Branch mode: on success, commits the diff onto `omp/task/${agentId}` and
- * returns `branchName` + `nestedPatches` (+ `nestedPatchPaths`). On commit
+ * returns `branchName` + `nestedPatches` (+ `nestedPatchPaths`). It also
+ * writes the committed root diff to `${artifactsDir}/${agentId}.patch` and
+ * names it in the agent's registry history (`patchPath`), as a record for the
+ * Agent Hub; the result does not name it. On commit
  * failure the still-live isolation diff is written to
  * `${artifactsDir}/${agentId}.patch`, the task branch is kept when it already
  * carries commits (deleted otherwise), and `result.error` carries the
@@ -500,20 +485,30 @@ function renderIsolationError(context: IsolationErrorContext): string {
  * transitions, then capture final changes and clean up on release. A release
  * that comes while the run is still ending (a refused adoption, a release as
  * the run finishes) waits for the run-end capture, so it never removes the
- * worktree that capture reads. One-shot and failed startup paths clean up in
- * `finally`. If captured changes cannot be written to disk, the workspace is
- * retained under a unique `.retained-*` sibling and its path is named in the
- * resulting error.
+ * worktree that capture reads; a release that comes after the run's end
+ * cleaned up itself (it found no release asked for and no adoption) captures
+ * nothing. A release also waits for the cleanup the run deferred (owner jobs,
+ * shutdown hooks), which may still write the worktree; a failed run's result
+ * does not, and the caller's deferred cleanup then waits for that release
+ * ({@link ExecutorOptions.onCleanupDeferred}). One-shot and failed startup
+ * paths clean up in `finally`. If captured changes cannot be written to disk,
+ * the workspace is retained under a unique `.retained-*` sibling and its path
+ * is named in the resulting error.
  */
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
 	let changes: RunChanges | undefined;
 	/** Fingerprint of the delta handed to the caller at run end; a release writes and commits only a changed delta. */
 	let handedOff: bigint | number | undefined;
 	let workspace: IsolationWorkspace | undefined;
+	/** Owner jobs or shutdown hooks still going on after the run (`onCleanupDeferred`), which may write the worktree. */
 	let deferredCleanup: Promise<void> | undefined;
+	/** Set once the run's end has waited for {@link deferredCleanup}; a failed run's end goes on without it. */
+	let deferredCleanupAwaited = false;
 	let retainWorkspace = false;
 	let baseReleasePromise: Promise<void> | undefined;
 	let cleanupPromise: Promise<void> | undefined;
+	/** The cleanup the run's end took over, having found no release asked for and no adoption of the agent. */
+	let runEndCleanup: Promise<void> | undefined;
 	/** The run's IRC wake hold, released only once the run-end capture is done. */
 	let releaseIrcWakes: (() => void) | undefined;
 	const releaseBase = (): Promise<void> => {
@@ -527,9 +522,23 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		})();
 		return cleanupPromise;
 	};
+	/**
+	 * Capture the run's delta and write all of it to disk for the caller, which then holds it ({@link handedOff}).
+	 * Throws when a write fails ({@link persistIsolationPatch}).
+	 */
+	const handOffPatch = async (runChanges: RunChanges): Promise<IsolationPatchArtifacts> => {
+		const captured = await captureIsolationDelta(runChanges);
+		const artifacts = await persistIsolationPatch(captured.delta, opts.artifactsDir, opts.agentId);
+		handedOff = captured.fingerprint;
+		return artifacts;
+	};
 	/** A kept-alive run's final capture and cleanup, held until the run-end capture below is done with the worktree. */
 	const isolationRelease = releaseAfterRunEnd(
 		async () => {
+			// Asked for once the run's end had cleaned up itself: nothing is left to capture.
+			if (runEndCleanup) return runEndCleanup;
+			// Owner jobs or shutdown hooks the run left going on may still write the worktree.
+			if (deferredCleanup) await deferredCleanup;
 			if (!workspace || !changes || retainWorkspace) {
 				await cleanupHandle();
 				return;
@@ -539,10 +548,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				let patchResult: IsolationPatchArtifacts;
 				try {
 					captured = await captureIsolationDelta(changes);
-					// Nothing changed since the run-end capture the caller already
-					// merged or applied: its patch files stay as that capture wrote
-					// them (the caller may be reading them now), and a branch would
-					// only duplicate that work.
+					// Unchanged since the run's end: the caller already holds this
+					// delta (its patch files and, in branch mode, its task branch, or
+					// the error that names them), so the release writes and commits
+					// nothing.
 					if (captured.fingerprint === handedOff) return;
 					patchResult = await persistIsolationPatch(captured.delta, opts.artifactsDir, opts.agentId);
 				} catch (captureErr) {
@@ -622,6 +631,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		// so their cleanup remains asynchronous.
 		if (deferredCleanup && result.exitCode === 0) {
 			await deferredCleanup;
+			deferredCleanupAwaited = true;
 		}
 		if (opts.mergeMode === "branch" && result.exitCode === 0) {
 			let commitResult: CommitToBranchResult | null;
@@ -654,11 +664,10 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					: undefined;
 				const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 				try {
-					const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
-					handedOff = capture.fingerprint;
+					const artifacts = await handOffPatch(runChanges);
 					return rememberAgentArtifacts({
 						...result,
-						...capture.artifacts,
+						...artifacts,
 						error: renderIsolationError({ kind: "merge-failed", message: msg, rescueBranch }),
 					});
 				} catch (patchErr) {
@@ -678,8 +687,24 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				}
 			}
 			handedOff = deltaFingerprint(commitResult?.rootPatch ?? "", commitResult?.nestedPatches ?? []);
-			// The branch holds the root-repo work, but nested-repo patches exist
-			// only in memory until written; the workspace goes away in `finally`.
+			// The task branch holds the root-repo work; its diff in `<id>.patch`
+			// is only the agent's record (the Agent Hub's patch, a later scan of
+			// the artifacts), as every successful end writes one. The result
+			// does not name it, so the merge reads the branch alone, and a record
+			// that cannot be written loses no work.
+			const patchPath = path.join(opts.artifactsDir, `${opts.agentId}.patch`);
+			try {
+				await Bun.write(patchPath, commitResult?.rootPatch ?? "");
+				AgentRegistry.global().setHistory(opts.agentId, { patchPath });
+			} catch (patchErr) {
+				await fs.rm(patchPath, { force: true }).catch(() => undefined);
+				logger.warn("Isolated task root patch could not be written", {
+					agentId: opts.agentId,
+					error: patchErr instanceof Error ? patchErr.message : String(patchErr),
+				});
+			}
+			// Nested-repo patches exist only in memory until written; the
+			// workspace goes away in `finally`.
 			try {
 				const nestedPatchPaths = await persistNestedPatches(
 					opts.artifactsDir,
@@ -712,9 +737,8 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		}
 		if (result.exitCode === 0) {
 			try {
-				const capture = await writeIsolationPatch(runChanges, opts.artifactsDir, opts.agentId);
-				handedOff = capture.fingerprint;
-				return rememberAgentArtifacts({ ...result, ...capture.artifacts });
+				const artifacts = await handOffPatch(runChanges);
+				return rememberAgentArtifacts({ ...result, ...artifacts });
 			} catch (patchErr) {
 				retainWorkspace = true;
 				const retained = await workspace.retain();
@@ -735,9 +759,18 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 	} finally {
 		// The run-end capture is done with the worktree. A release asked for
 		// before now captures and cleans up from here, and owns the cleanup; the
-		// caller gets the result once that is over.
+		// caller gets the result once that is over, unless the release waits for
+		// a deferred cleanup this run's end went on without (a failed run's):
+		// it then goes on as late cleanup, as the cleanup below does, and the
+		// caller's deferred cleanup (the removal of the artifacts directory the
+		// release writes to) waits for it. The caller keeps the last completion
+		// it is handed, and this one ends only after the earlier one, which the
+		// release waits for first.
 		const released = isolationRelease.end();
-		if (released) {
+		if (released && deferredCleanup && !deferredCleanupAwaited) {
+			trackLateCleanup(released, { agentId: opts.agentId, resource: "isolation" });
+			opts.baseOptions.onCleanupDeferred?.(released.catch(() => undefined));
+		} else if (released) {
 			await released.catch(error => {
 				logger.warn("Isolated task release failed", {
 					agentId: opts.agentId,
@@ -749,13 +782,14 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			!retainWorkspace &&
 			!(opts.baseOptions.keepAlive !== false && AgentLifecycleManager.global().has(opts.agentId))
 		) {
+			// No release was asked for and no adoption holds the agent: this
+			// run's end owns the cleanup, and a release asked for later (once a
+			// release of the agent has disposed its session) only waits for it.
+			runEndCleanup = deferredCleanup ? deferredCleanup.then(cleanupHandle) : cleanupHandle();
 			if (deferredCleanup) {
-				trackLateCleanup(deferredCleanup.then(cleanupHandle), {
-					agentId: opts.agentId,
-					resource: "isolation",
-				});
+				trackLateCleanup(runEndCleanup, { agentId: opts.agentId, resource: "isolation" });
 			} else {
-				await cleanupHandle();
+				await runEndCleanup;
 			}
 		}
 		// The worktree is captured: a held peer message may now wake a turn in it.
