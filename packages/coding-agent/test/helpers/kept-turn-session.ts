@@ -38,8 +38,8 @@ export const TOOL_CALL_ID = "toolu_kept_turn";
 export const FIRST_TEXT = "Here is the first part of the answer";
 export const CONTINUED_TEXT = ", and here is the rest of it.";
 export const FRESH_TEXT = "A fresh answer.";
-export const MAX_RETRIES = 2;
-export const MAX_DELAY_MS = 120_000;
+const MAX_RETRIES = 2;
+const MAX_DELAY_MS = 120_000;
 const RATE_LIMIT_MESSAGE = "This request would exceed your organization's rate limit.";
 const RENDER_WIDTH = 120;
 
@@ -61,17 +61,23 @@ export const MESSAGE_START_FRAME = sseFrame("message_start", {
 	},
 });
 
-export const TEXT_FRAMES =
-	sseFrame("content_block_start", {
-		type: "content_block_start",
-		index: 0,
-		content_block: { type: "text", text: "" },
-	}) +
-	sseFrame("content_block_delta", {
-		type: "content_block_delta",
-		index: 0,
-		delta: { type: "text_delta", text: FIRST_TEXT },
-	});
+/** Opens a text block and streams `text` into it, leaving the block and the message open. */
+export function textFrames(text: string): string {
+	return (
+		sseFrame("content_block_start", {
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "text", text: "" },
+		}) +
+		sseFrame("content_block_delta", {
+			type: "content_block_delta",
+			index: 0,
+			delta: { type: "text_delta", text },
+		})
+	);
+}
+
+export const TEXT_FRAMES = textFrames(FIRST_TEXT);
 
 /** Closes the text block and streams a whole `read` tool call after it. */
 export const COMPLETE_TOOL_CALL_FRAMES =
@@ -129,17 +135,34 @@ export function answer(text: string): string {
 /** A whole answer, as the continuation gets it. */
 export const CONTINUED_ANSWER = answer(CONTINUED_TEXT);
 
-/** What a request to the primary answers: a 200 event stream, or an HTTP refusal. */
-export type PrimaryAnswer = { stream: string } | { status: number; retryAfterSeconds?: number };
+/**
+ * What a request to the primary answers: a 200 event stream, or an HTTP
+ * refusal. A `held` stream stays open after its frames until the request is
+ * aborted.
+ */
+export type PrimaryAnswer = { stream: string; held?: true } | { status: number; retryAfterSeconds?: number };
 
 /** An HTTP 429 rate limit at request time. */
 export const HTTP_RATE_LIMIT: PrimaryAnswer = { status: 429 };
 
-async function primaryResponse(primary: PrimaryAnswer): Promise<Response> {
+async function primaryResponse(
+	primary: PrimaryAnswer,
+	signal: AbortSignal | undefined,
+	onHeld: () => void,
+): Promise<Response> {
 	const headers = new Headers({ "request-id": "req_kept_turn" });
 	if ("stream" in primary) {
 		headers.set("content-type", "text/event-stream");
-		return new Response(new TextEncoder().encode(primary.stream), { status: 200, headers });
+		const frames = new TextEncoder().encode(primary.stream);
+		if (!primary.held) return new Response(frames, { status: 200, headers });
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(frames);
+				signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+				onHeld();
+			},
+		});
+		return new Response(body, { status: 200, headers });
 	}
 	headers.set("content-type", "application/json");
 	if (primary.retryAfterSeconds !== undefined) headers.set("retry-after", String(primary.retryAfterSeconds));
@@ -181,7 +204,7 @@ export function failedTurn(messages: readonly AgentMessage[]): AssistantMessage 
 	);
 }
 
-export interface KeptTurnSessionOptions {
+interface KeptTurnSessionOptions {
 	/** The context the session starts from, as a resume builds it from the session file. */
 	messages?: AgentMessage[];
 	/** Settings over the harness's own retry and compaction settings. */
@@ -193,7 +216,7 @@ export interface KeptTurnSessionOptions {
 	compactionSummary?: string;
 }
 
-export interface KeptTurnRun {
+interface KeptTurnRun {
 	/** Requests the primary received. */
 	requests: number;
 	session: AgentSession;
@@ -207,13 +230,15 @@ export interface KeptTurnRun {
 	failedEntry: SessionEntry | undefined;
 }
 
-export interface KeptTurnSessions {
+interface KeptTurnSessions {
 	/** What the primary's next requests answer, in order; the last answers every later one. */
 	answers: PrimaryAnswer[];
 	/** Requests the primary received in this case. */
 	readonly requests: number;
 	/** The messages of each request the primary received in this case, as the provider got them. */
 	readonly requestMessages: readonly AgentMessage[][];
+	/** Settles once a `held` answer of this case has sent its frames and waits for the abort. */
+	readonly answerHeld: Promise<void>;
 	readonly tempDir: TempDir;
 	readonly authStorage: AuthStorage;
 	/** A new persisted session in the case's temporary directory. */
@@ -246,9 +271,10 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 	let managers: SessionManager[] = [];
 	let requests = 0;
 	let requestMessages: AgentMessage[][] = [];
+	let answerHeld = Promise.withResolvers<void>();
 	const drawn = new WeakMap<AgentSession, AssistantMessage[]>();
 
-	const require = <T>(value: T | undefined, name: string): T => {
+	const setUp = <T>(value: T | undefined, name: string): T => {
 		if (value === undefined) throw new Error(`${name} is set up in beforeAll`);
 		return value;
 	};
@@ -261,11 +287,14 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 		get requestMessages() {
 			return requestMessages;
 		},
+		get answerHeld() {
+			return answerHeld.promise;
+		},
 		get tempDir() {
-			return require(tempDir, "tempDir");
+			return setUp(tempDir, "tempDir");
 		},
 		get authStorage() {
-			return require(authStorage, "authStorage");
+			return setUp(authStorage, "authStorage");
 		},
 
 		createSessionManager() {
@@ -294,7 +323,7 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 					return streamFn(requested, context, streamOptions);
 				},
 			});
-			const registry = require(modelRegistry, "modelRegistry");
+			const registry = setUp(modelRegistry, "modelRegistry");
 			const session = new AgentSession({
 				agent,
 				sessionManager,
@@ -420,13 +449,15 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 		harness.answers = [];
 		requests = 0;
 		requestMessages = [];
+		answerHeld = Promise.withResolvers<void>();
 		modelRegistry?.clearSuppressedSelectors();
 		vi.spyOn(envApiKey, "getEnvApiKey").mockReturnValue(undefined);
-		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((_params, options) => {
 			requests++;
 			const answers = harness.answers;
 			const next = answers.length > 1 ? answers.shift()! : answers[0]!;
-			return { asResponse: () => primaryResponse(next) } as never;
+			const held = answerHeld;
+			return { asResponse: () => primaryResponse(next, options?.signal, () => held.resolve()) } as never;
 		});
 		mockSchedulerWaitWithClock();
 	});

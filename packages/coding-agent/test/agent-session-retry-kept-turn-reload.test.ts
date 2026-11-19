@@ -11,11 +11,12 @@
  * requests run the real provider; only its HTTP client is replaced, so no
  * request leaves the process.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	answer,
 	COMPLETE_TOOL_CALL_FRAMES,
@@ -34,6 +35,7 @@ import {
 	renderTurn,
 	TEXT_FRAMES,
 	TOOL_CALL_ID,
+	textFrames,
 	useKeptTurnSessions,
 } from "./helpers/kept-turn-session";
 
@@ -44,6 +46,17 @@ function geminiAnswer(text: string, finishReason: string): string {
 		usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
 	};
 	return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+/** The conversation shape of each assistant entry of `sessionManager` marked `continued`, in file order. */
+function continuedTurns(sessionManager: SessionManager): string[] {
+	return sessionManager
+		.getEntries()
+		.flatMap(entry =>
+			entry.type === "message" && entry.message.role === "assistant" && entry.message.continued
+				? conversation([entry.message])
+				: [],
+		);
 }
 
 describe("a kept and continued turn in the context rebuilt from the session file", () => {
@@ -201,6 +214,95 @@ describe("a kept and continued turn in the context rebuilt from the session file
 			.getEntries()
 			.filter(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.continued);
 		expect(continued).toEqual([]);
+	});
+
+	// Regression: a cut stream's continuation is aborted and `/compact`
+	// rebuilds the live context without the unmarked kept turn; a later turn
+	// that no new prompt starts then marked the turn anyway, so the context
+	// rebuilt from the file held a turn the live one had dropped.
+	it("leaves unmarked a kept turn the live context dropped before a later turn succeeded", async () => {
+		sessions.answers = [
+			{ stream: answer("An earlier answer. ".repeat(1_500)) },
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + OVERLOADED_FRAME },
+			{ stream: MESSAGE_START_FRAME + textFrames(" and"), held: true },
+			{ stream: CONTINUED_ANSWER },
+		];
+		const sessionManager = sessions.createSessionManager();
+		const session = await sessions.startSession(sessionManager, {
+			settings: { "compaction.keepRecentTokens": 2_000 },
+			compactionSummary: "The earlier question was answered.",
+		});
+		await session.prompt("An earlier question");
+		await session.waitForIdle();
+		const prompt = session.prompt("Answer in two parts");
+		await sessions.answerHeld;
+		await session.abort();
+		await prompt;
+		await session.waitForIdle();
+		await session.compact();
+		expect(conversation(session.agent.state.messages)).toEqual(["user"]);
+
+		await session.sendCustomMessage({ customType: "go-on", content: "Go on.", display: true }, { triggerTurn: true });
+		await session.waitForIdle();
+
+		const live = conversation(session.agent.state.messages);
+		expect(live).toEqual(["user", `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(conversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual([]);
+	});
+
+	// Regression: cut streams end the run at the continuation cap, `/retry`
+	// continues from the turns the continuations kept, and after a resume the
+	// model no longer sees them: the run's error had forgotten them before
+	// the retry succeeded.
+	it("marks the kept turns a manual retry continued from after the run ended at its cap", async () => {
+		const cut = (text: string) => ({ stream: MESSAGE_START_FRAME + textFrames(text) + OVERLOADED_FRAME });
+		sessions.answers = [cut("One."), cut("Two."), cut("Three."), cut("Four."), { stream: CONTINUED_ANSWER }];
+		const sessionManager = sessions.createSessionManager();
+		const session = await sessions.startSession(sessionManager);
+		await session.prompt("Answer in two parts");
+		await session.waitForIdle();
+		expect(sessions.requests).toBe(4);
+
+		expect(await session.retry()).toBe(true);
+		await session.waitForIdle();
+
+		const kept = ["assistant[text:One.]", "assistant[text:Two.]", "assistant[text:Three.]"];
+		const live = conversation(session.agent.state.messages);
+		expect(live).toEqual(["user", ...kept, `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(conversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual(kept);
+	});
+
+	// A stream cut after text is continued outside any retry; that
+	// continuation is cut by a rate limit after its text, which a retry
+	// continues. The one successful turn continued from both and closes the
+	// retry: both marks and the retry's note go to the file in one rewrite.
+	it("marks both turns with one write when one turn continues a stream cut and a retry", async () => {
+		sessions.answers = [
+			{ stream: MESSAGE_START_FRAME + textFrames("One.") + OVERLOADED_FRAME },
+			{ stream: MESSAGE_START_FRAME + textFrames("Two.") + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		];
+		const sessionManager = sessions.createSessionManager();
+		const rewrites = vi.spyOn(sessionManager, "rewriteEntries");
+		const session = await sessions.startSession(sessionManager);
+		await session.prompt("Answer in two parts");
+		await session.waitForIdle();
+
+		expect(rewrites).toHaveBeenCalledTimes(1);
+		const kept = ["assistant[text:One.]", "assistant[text:Two.]"];
+		const live = conversation(session.agent.state.messages);
+		expect(live).toEqual(["user", ...kept, `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(conversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual(kept);
+		const retried = reopened
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.retryRecovery);
+		expect(retried).toMatchObject({ message: { content: [{ type: "text", text: "Two." }] } });
 	});
 
 	// Every other end of a run that kept a turn (here a stated wait past
