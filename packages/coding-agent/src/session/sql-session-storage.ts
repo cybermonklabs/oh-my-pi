@@ -3034,16 +3034,26 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * statement keeps its own transaction, so a duplicate-column error still
 	 * fails only its own ALTER. The tables themselves are made together, by
 	 * {@link #createTables}. On MySQL and SQLite the statement runs straight
-	 * on the client. On SQLite it does not use the call queue, so the caller
-	 * must already hold `#exclusive` (`init` does), or the statement can join
-	 * another call's `BEGIN IMMEDIATE` on SQLite's one connection.
+	 * on the client.
 	 */
 	async #setup(query: string): Promise<void> {
 		if (this.#adapter !== "postgres") {
-			await this.#client.unsafe(query);
+			await this.#writeAlone(executor => executor.unsafe(query));
 			return;
 		}
 		await this.#postgres("open", "start-up", transaction => transaction.unsafe(query));
+	}
+
+	/**
+	 * Run one write outside any store transaction, straight on the client
+	 * (MySQL and SQLite: PostgreSQL runs every statement in {@link #postgres}).
+	 * On SQLite it does not use the call queue, so the caller
+	 * must already hold `#exclusive` (`init` does), or
+	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
+	 * connection.
+	 */
+	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
+		await write(this.#client);
 	}
 
 	/**
