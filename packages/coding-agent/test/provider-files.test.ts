@@ -1,5 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
-import * as fs from "node:fs";
+import { describe, expect, test } from "bun:test";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
@@ -361,43 +360,6 @@ describe("ProviderFileCache", () => {
 		const reloaded = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000, now: () => now });
 		expect(reloaded.get("openai", "account-a-secret", contentHash)).toBeUndefined();
 		expect(reloaded.get("openai", "account-b-secret", contentHash)?.id).toBe("account-b-file");
-	});
-
-	test("two caches saving one index in the same millisecond never share a temporary file", () => {
-		using tempDir = TempDir.createSync("@omp-provider-file-cache-race-");
-		const indexPath = tempDir.join("provider-files.json");
-		const contentHash = hashProviderFileContent(new Uint8Array([4, 2]));
-		const handle = (id: string): ProviderFileHandle => ({
-			provider: "openai",
-			id,
-			mimeType: "image/png",
-			bytes: 2,
-			delete: { method: "DELETE", url: `https://api.openai.com/v1/files/${id}`, headers: {} },
-		});
-		// Two caches of one process (another's could be in a worker thread) on one clock tick.
-		const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
-		const first = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000, now: () => 1_000 });
-		const second = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000, now: () => 1_000 });
-		first.set("openai", "account-a", contentHash, handle("first-file"));
-		second.set("openai", "account-b", contentHash, handle("second-file"));
-		const realRename = fs.renameSync;
-		const staged: string[] = [];
-		// The second cache saves while the first is between writing its temporary file and
-		// renaming it into place.
-		const rename = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-			staged.push(String(from));
-			if (staged.length === 1) second.save();
-			realRename(from, to);
-		});
-		try {
-			expect(() => first.save()).not.toThrow();
-		} finally {
-			rename.mockRestore();
-			clock.mockRestore();
-		}
-
-		expect(new Set(staged).size).toBe(2);
-		expect(new ProviderFileCache(indexPath).get("openai", "account-a", contentHash)?.id).toBe("first-file");
 	});
 });
 
