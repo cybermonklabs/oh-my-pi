@@ -5714,10 +5714,20 @@ mod tests {
 
 	/// `-exec ... {} +` sizes its batches against the process's environment
 	/// (`argmax`), but its commands get the shell's: a large exported
-	/// variable the process lacks makes the kernel refuse a full batch, which
-	/// runs again as two halves, as GNU xargs retries a line. Every file
-	/// still goes to a command once, in find's order; a line that fits (a
-	/// short last one) is left whole.
+	/// variable the process lacks can make the kernel refuse a full batch,
+	/// which then runs again as two halves, as GNU xargs retries a line.
+	/// Every file still goes to a command once, in find's order; a line that
+	/// fits (a short last one) is left whole.
+	///
+	/// Whether the kernel refuses the full batch is the kernel's rule
+	/// ([`crate::host::exec_refusal`]): Linux counts the variable and a
+	/// pointer per word, and refuses; gVisor counts the environment apart
+	/// from the arguments and no pointers, and runs it. So after the run the
+	/// test asks the kernel about the full batch itself, with the same
+	/// program, environment and directory, and holds find to the answer:
+	/// split when refused, run whole when not. It says on stderr which it
+	/// saw. The halving itself is proved on any kernel by
+	/// `exec_plus_halves_a_refused_line_for_e2big_and_enametoolong`.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn exec_plus_runs_a_batch_the_kernel_refuses_as_halves() {
@@ -5729,7 +5739,7 @@ mod tests {
 			fs::write(root.join("many").join(format!("{i:06}{}", "f".repeat(240))), b"").unwrap();
 		}
 		// The lines find builds, from `echo`, which runs in-process: no exec
-		// limit refuses it (gVisor refuses even a plain `/bin/sh` line here).
+		// limit refuses it.
 		let (code, out, err) =
 			crate::host::run_extra(&["find", "many", "-type", "f", "-exec", "echo", "{}", "+"], "", &root, &[])
 				.await;
@@ -5743,19 +5753,58 @@ mod tests {
 		let (code, err, ran) = files_run(&root, &[("FIND_TEST_PAD", &pad)]).await;
 		assert_eq!((code, err.as_str()), (0, ""), "every line runs, and nothing is reported");
 		assert!(ran.concat() == echoed.concat(), "the files did not each run once, in find's order");
-		assert!(
-			ran[0].len() + 1 < full,
-			"the first, full line was not refused and split: {} of about {full} files ran first",
-			ran[0].len()
-		);
-		let mut pieces = 0;
-		assert!(
-			ran.iter().any(|line| {
-				pieces += line.len();
-				pieces + 1 >= full && pieces <= full
-			}),
-			"the first lines run are not the pieces of the refused one"
-		);
+		// The kernel's answer for the full batch, asked as the test runner
+		// asked it (`run_extra`: this process's environment and the pad).
+		let line: Vec<&str> = ["/bin/sh", "-c", crate::host::SHOW_ARGS, "sh"]
+			.into_iter()
+			.chain(echoed[0].iter().copied())
+			.collect();
+		let strings: usize = line.iter().map(|word| word.len() + 1).sum();
+		let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+		env.insert("FIND_TEST_PAD".into(), pad.clone());
+		let limits = crate::host::exec_limits();
+		// Past libtest's capture, so a passing run's log says which it saw.
+		use std::io::Write as _;
+		let mut said = std::io::stderr().lock();
+		match crate::host::exec_refusal(&line, &env, &root) {
+			Some(errno) => {
+				assert!(
+					ran[0].len() + 1 < full,
+					"{limits}: the kernel refuses the full line, which was not split: {} of about {full} files ran first",
+					ran[0].len()
+				);
+				let mut pieces = 0;
+				assert!(
+					ran.iter().any(|line| {
+						pieces += line.len();
+						pieces + 1 >= full && pieces <= full
+					}),
+					"the first lines run are not the pieces of the refused one"
+				);
+				let _ = writeln!(
+					said,
+					"{limits}: the kernel refused the full line of {full} files ({strings} bytes of strings, with a \
+					 {}-byte variable find does not count) with {}, and find ran it as halves",
+					pad.len(),
+					std::io::Error::from_raw_os_error(errno)
+				);
+			},
+			None => {
+				assert!(
+					ran[0].len() + 1 >= full,
+					"{limits}: the kernel runs the full line, so find must run it whole: {} of about {full} files ran \
+					 first",
+					ran[0].len()
+				);
+				let _ = writeln!(
+					said,
+					"{limits}: the kernel ran the full line of {full} files ({strings} bytes of strings, with a \
+					 {}-byte variable find does not count) whole: it counts less than find does (gVisor counts the \
+					 environment apart and no pointers), so nothing was split",
+					pad.len()
+				);
+			},
+		}
 	}
 
 	/// A line of one file the kernel refuses is find's error, reported once.

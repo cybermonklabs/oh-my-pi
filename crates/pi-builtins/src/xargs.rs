@@ -1450,11 +1450,11 @@ mod tests {
 	}
 
 	/// `sh` behind a symlink at a path of about 3500 bytes (the directory goes
-	/// with the guard). `execve` copies the program's path onto the new stack
-	/// with the command line, while xargs counts only the command line and
-	/// the environment against `sysconf(_SC_ARG_MAX)`, with 2048 bytes to
-	/// spare: the kernel refuses a line xargs filled, as a sandbox whose limit
-	/// is below `sysconf` (gVisor) refuses every full line.
+	/// with the guard). Linux's `execve` counts the program's path with the
+	/// command line, while xargs counts only the command line and the
+	/// environment against `sysconf(_SC_ARG_MAX)`, with 2048 bytes to spare:
+	/// Linux refuses a line xargs filled ([`crate::host::exec_refusal`] has
+	/// both kernels' rules).
 	#[cfg(target_os = "linux")]
 	fn sh_at_a_long_path() -> (tempfile::TempDir, String) {
 		let dir = tempfile::tempdir().expect("tempdir");
@@ -1473,6 +1473,16 @@ mod tests {
 	/// A full line the kernel refuses as too long runs again as two halves,
 	/// first half first, as GNU xargs retries it: every input argument still
 	/// runs once, in order. Lines that fit (a short last one) are left whole.
+	///
+	/// Whether the kernel refuses the line xargs filled is the kernel's rule
+	/// ([`crate::host::exec_refusal`]): Linux does here, for the long path of
+	/// `sh` it copies a second time; gVisor counts no pointers and not the
+	/// environment with the arguments, and
+	/// runs it. So after the run the test asks the kernel about that first,
+	/// full line itself, with the same program, environment and directory,
+	/// and holds xargs to the answer: halved when refused, run whole when
+	/// not. It says on stderr which it saw. The halving itself is proved on
+	/// any kernel by `a_refused_line_is_halved_in_order_for_e2big_and_enametoolong`.
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn a_line_the_kernel_refuses_as_too_long_runs_as_halves() {
@@ -1481,8 +1491,10 @@ mod tests {
 		let words: Vec<String> = (0..arg_max / 256).map(|i| format!("{i:07}{}", "x".repeat(248))).collect();
 		let input = words.join("\n") + "\n";
 		let (_dir, sh) = sh_at_a_long_path();
-		let (code, stdout, stderr) =
-			xargs_in(&std::env::temp_dir(), &["-t", &sh, "-c", crate::host::SHOW_ARGS, "sh"], &input).await;
+		let command = [sh.as_str(), "-c", crate::host::SHOW_ARGS, "sh"];
+		let cwd = std::env::temp_dir();
+		let argv: Vec<&str> = std::iter::once("-t").chain(command).collect();
+		let (code, stdout, stderr) = xargs_in(&cwd, &argv, &input).await;
 		// `-t` traces each line before it is tried.
 		let (traces, reported): (Vec<&str>, Vec<&str>) = stderr.lines().partition(|line| line.starts_with(&sh));
 		assert_eq!((code, reported), (0, vec![]), "every line runs, and nothing else is reported");
@@ -1490,21 +1502,48 @@ mod tests {
 		assert_ran_once_in_order(&ran, &words);
 		let tried: Vec<usize> = traces.iter().map(|trace| traced_words(trace)).collect();
 		let full = tried[0];
-		assert!(
-			ran[0].len() < full && tried.get(1) == Some(&(full / 2)),
-			"the first, full line of {full} arguments was not refused and halved: {} ran first, and the \
-			 next line tried had {:?}",
-			ran[0].len(),
-			tried.get(1)
-		);
-		let mut pieces = 0;
-		assert!(
-			ran.iter().any(|line| {
-				pieces += line.len();
-				pieces == full
-			}),
-			"the first lines run are not the pieces of the refused one"
-		);
+		// The kernel's answer for that first, full line, asked as the test
+		// runner asked it (`run_extra`: this process's environment).
+		let line: Vec<&str> = command.into_iter().chain(words[..full].iter().map(String::as_str)).collect();
+		let strings: usize = line.iter().map(|word| word.len() + 1).sum();
+		let env: HashMap<String, String> = std::env::vars().collect();
+		let limits = crate::host::exec_limits();
+		// Past libtest's capture, so a passing run's log says which it saw.
+		let mut said = std::io::stderr().lock();
+		match crate::host::exec_refusal(&line, &env, &cwd) {
+			Some(errno) => {
+				assert!(
+					ran[0].len() < full && tried.get(1) == Some(&(full / 2)),
+					"{limits}: the kernel refuses the first, full line of {full} arguments, which was not halved: {} \
+					 ran first, and the next line tried had {:?}",
+					ran[0].len(),
+					tried.get(1)
+				);
+				let mut pieces = 0;
+				assert!(
+					ran.iter().any(|line| {
+						pieces += line.len();
+						pieces == full
+					}),
+					"the first lines run are not the pieces of the refused one"
+				);
+				let _ = writeln!(
+					said,
+					"{limits}: the kernel refused the full line of {full} arguments ({strings} bytes of strings) \
+					 with {}, and xargs ran it as halves",
+					io::Error::from_raw_os_error(errno)
+				);
+			},
+			None => {
+				assert_eq!(ran[0].len(), full, "{limits}: the kernel runs the full line, so xargs must run it whole");
+				let _ = writeln!(
+					said,
+					"{limits}: the kernel ran the full line of {full} arguments ({strings} bytes of strings) whole: it \
+					 counts less than xargs does (gVisor counts no pointers, and the environment apart), so \
+					 nothing was halved"
+				);
+			},
+		}
 	}
 
 	/// One input argument the kernel refuses even on its own is GNU's error,

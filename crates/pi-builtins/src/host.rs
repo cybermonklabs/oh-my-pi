@@ -3755,6 +3755,70 @@ mod testing {
 		lines.into_iter().map(|(_, args)| args).collect()
 	}
 
+	/// How the running kernel answers an `execve` of `argv` with exactly the
+	/// environment `env` from `cwd`, as [`TestRunner`] starts a command:
+	/// `Some(errno)` when it refuses the line as too long (`E2BIG`, or
+	/// `ENAMETOOLONG` as GKE's gVisor says it), `None` when the program
+	/// starts (it runs to its end, its output discarded). Panics on any other
+	/// failure.
+	///
+	/// The kernels count different things (measured on Linux 6.12 and on GKE's
+	/// gVisor at stack rlimits of 8 MiB, 128 MiB and none). Linux (fs/exec.c,
+	/// `bprm_stack_limits` and `do_execveat_common`) refuses with `E2BIG` once
+	/// the program's path, every argument and environment string with its
+	/// NUL, and a pointer for each argument and environment entry pass a
+	/// quarter of the stack rlimit (at least 128 KiB, at most 6 MiB), or once
+	/// one string passes 128 KiB. gVisor (pkg/sentry/syscalls/linux/
+	/// sys_thread.go, `ExecMaxTotalSize`) counts no pointers, does not count
+	/// the path apart from `argv[0]`, and counts the environment on its own:
+	/// it refuses once the argument strings with their NULs pass 2 MiB, or the
+	/// environment's do, whatever the stack rlimit. GKE's gVisor allows one
+	/// string up to 512 KiB and says `ENAMETOOLONG`. xargs and find size their
+	/// lines by glibc's `sysconf(_SC_ARG_MAX)`, a quarter of the stack rlimit
+	/// (6 MiB at most), counting the strings, the pointers and the
+	/// environment, less 2,048 bytes.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn exec_refusal(argv: &[&str], env: &HashMap<String, String>, cwd: &std::path::Path) -> Option<i32> {
+		let spawned = std::process::Command::new(argv[0])
+			.args(&argv[1..])
+			.current_dir(cwd)
+			.env_clear()
+			.envs(env)
+			.stdin(std::process::Stdio::null())
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn();
+		match spawned {
+			Ok(mut child) => {
+				child.wait().expect("wait for the probe");
+				None
+			},
+			Err(error) => match error.raw_os_error() {
+				Some(errno @ (libc::E2BIG | libc::ENAMETOOLONG)) => Some(errno),
+				_ => panic!("exec of a {}-word line failed otherwise: {error}", argv.len()),
+			},
+		}
+	}
+
+	/// The kernel and the limits this process execs under, for a test to say
+	/// which rule it saw: the kernel's release, the stack rlimit, and
+	/// `sysconf(_SC_ARG_MAX)`.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn exec_limits() -> String {
+		let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+		let mut stack = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: getrlimit writes into the struct it is given.
+		unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut stack) };
+		// SAFETY: sysconf has no preconditions.
+		let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+		format!(
+			"kernel {}, stack rlimit {} (hard {}), sysconf(_SC_ARG_MAX) {arg_max}",
+			release.trim(),
+			stack.rlim_cur,
+			stack.rlim_max
+		)
+	}
+
 	/// The first executable `name` on this process's `PATH`, as an absolute path.
 	///
 	/// A test's external program, wherever the machine keeps it (`/usr/bin` on
@@ -4648,5 +4712,5 @@ pub(crate) use testing::run_extra_with;
 pub(crate) use testing::{Refused, Refusing, on_path, widowed_pipe};
 #[cfg(all(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{SHOW_ARGS, lines_run};
+pub(crate) use testing::{SHOW_ARGS, exec_limits, exec_refusal, lines_run};
 
