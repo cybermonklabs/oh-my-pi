@@ -9,8 +9,13 @@ import { openLeaseDb } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-00000000c001";
 const HOLDER_SCRIPT = path.join(import.meta.dir, "sql-session-claim-holder-process.ts");
-/** How long after it is told to the holder lets the session go. */
-const RELEASE_AFTER_MS = 25;
+/**
+ * How long after it is told to the holder lets the session go: well past the
+ * fraction of a millisecond in which a claim that probes first refuses, and
+ * far inside the 50 ms a claim waits on a live holder before it answers
+ * "taken", so a loaded host still lets the claim through.
+ */
+const RELEASE_AFTER_MS = 5;
 
 /** A reader of `child`'s stdout, one JSON line per call. */
 function jsonLines(child: Bun.Subprocess<"pipe", "pipe", "pipe">): () => Promise<Record<string, unknown>> {
@@ -35,7 +40,7 @@ describe("SqlSessionStorage SQLite session claims", () => {
 	// If this regresses, an omp process that opens a session on a SQLite store in the moment another
 	// process lets it go finds the session held, and its next write moves to a sibling session with a
 	// new id instead of resuming the one the user asked for.
-	it("takes a claim of a session whose other holder lets it go 25 ms after the claim began", async () => {
+	it("takes a claim of a session whose other holder lets it go about 5 ms after the claim began", async () => {
 		await using db = await openLeaseDb("sqlite", "sqlite");
 		const storage = await db.open();
 		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-19T00-00-00-000Z_${ID}.jsonl`);

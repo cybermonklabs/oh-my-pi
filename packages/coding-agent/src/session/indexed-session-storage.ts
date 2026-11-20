@@ -584,15 +584,30 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * or full, or its spool directory not private to this account), the joined
 	 * lines, as {@link writeTextSync} publishes them, with one warning per
 	 * store. The join reads `lines` again, so an iterator, which yields its
-	 * lines only once, is read into an array first.
+	 * lines only once, is read into an array first. A throw from `lines`
+	 * itself (an entry that cannot be read or serialized) is no spool failure:
+	 * it propagates as it is, with no join and no warning.
 	 */
 	#linesBody(path: string, lines: Iterable<string>): FullBody {
 		// An iterator is its own iterable, and yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
-		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
+		const once = iterator === lines ? Array.from(lines) : undefined;
+		const readable: Iterable<string> = once ?? lines;
+		let linesFailed = false;
+		// Only a throw from `readable` lands in the catch: a throw from the spool's
+		// own writes ends the iteration through `return`, which runs no catch.
+		function* noteLinesFailure(): Generator<string> {
+			try {
+				yield* readable;
+			} catch (err) {
+				linesFailed = true;
+				throw err;
+			}
+		}
 		try {
-			return this.#spoolBody(path, spoolLines(readable));
+			return this.#spoolBody(path, spoolLines(noteLinesFailure()));
 		} catch (err) {
+			if (linesFailed) throw err;
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
 				logger.warn("Session rewrites are joined in memory: their spool file cannot be used", {
@@ -600,7 +615,7 @@ export class IndexedSessionStorage implements SessionStorage {
 					error: toError(err).message,
 				});
 			}
-			return this.#textBody(path, Array.from(readable).join(""));
+			return this.#textBody(path, (once ?? Array.from(lines)).join(""));
 		}
 	}
 

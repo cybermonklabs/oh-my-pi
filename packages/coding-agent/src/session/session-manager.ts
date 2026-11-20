@@ -1459,8 +1459,9 @@ export class SessionManager {
 	#coldCutModel: Model | undefined;
 	/**
 	 * The leaf, the entries, the newest compaction or the model changed since
-	 * the cut was last applied: set by {@link #setLeaf}, {@link #reindexEntries},
-	 * {@link #recordEntry} for a compaction or a model change, and
+	 * the cut was last applied: set by {@link #setLeaf} when the leaf moves,
+	 * {@link #reindexEntries}, {@link #recordEntry} for a compaction,
+	 * {@link #staleColdBoundary} when it adopts a model, and
 	 * {@link #resetColdCut} when asked.
 	 */
 	#coldCutStale = false;
@@ -3845,12 +3846,12 @@ export class SessionManager {
 
 	/**
 	 * The boundary to apply before the next context build, or undefined when
-	 * the last one still holds. A trigger (load, compaction, branch move, model
-	 * change) marks it stale. A build that names a model whose provider or API
-	 * differs from the model the cut was computed for adopts that model, whose
-	 * readable compaction can start the context earlier, and computes the cut
-	 * again: the context built for a model switched to reads no cold entry. A
-	 * build that only measures (`measureOnly`) changes neither.
+	 * the last one still holds. A trigger (load, compaction, branch move) marks
+	 * it stale. A build that names a model whose provider or API differs from
+	 * the model the cut was computed for adopts that model, whose readable
+	 * compaction can start the context earlier, and computes the cut again: the
+	 * first build for a model switched to reads no cold entry. A build that only
+	 * measures (`measureOnly`) changes neither.
 	 */
 	#staleColdBoundary(options: SessionContextBuildOptions | undefined): ColdBoundary | undefined {
 		if (!this.#coldStoreEnabled || options?.measureOnly) return undefined;
@@ -3874,10 +3875,10 @@ export class SessionManager {
 		};
 	}
 
-	/** Move the leaf; the cut is computed again at the next context build. */
+	/** Move the leaf; when it moves, the cut is computed again at the next context build. */
 	#setLeaf(id: string | null): void {
+		if (this.#index.leafId() !== id) this.#coldCutStale = true;
 		this.#index.setLeaf(id);
-		this.#coldCutStale = true;
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
 			batch.externalLeafChanged = true;
@@ -3896,9 +3897,9 @@ export class SessionManager {
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		// A compaction moves the cut once the agent's context is rebuilt from it
-		// (the next context build), and a model change can move it to the
-		// compaction the new model replays.
-		if (entry.type === "compaction" || entry.type === "model_change") this.#coldCutStale = true;
+		// (the next context build). A model change moves it at the first build
+		// for the new model, which adopts that model.
+		if (entry.type === "compaction") this.#coldCutStale = true;
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
 		if (batch && !batch.collecting) {
@@ -5536,8 +5537,7 @@ export class SessionManager {
 		await this.#pendingDrop?.settled.promise;
 		if (!this.#persist) {
 			// A clone made without persistence shares its source's store.
-			this.#coldStore?.release(true);
-			this.#coldStore = undefined;
+			this.#releaseColdStore();
 			return;
 		}
 		try {
@@ -5623,11 +5623,16 @@ export class SessionManager {
 			}).catch(() => undefined);
 		}
 		// The writes above read older entries from the store; nothing reads them after close.
-		this.#coldStore?.release(true);
-		this.#coldStore = undefined;
+		this.#releaseColdStore();
 		// After a terminal release the entries are gone, so a latched failure
 		// cannot be shown harmless.
 		if (this.#diskFailure && (this.#entriesReleased || !this.#allEntriesHandedToStorage())) throw this.#diskFailure;
+	}
+
+	/** Drop this manager's hold on its cold store, closing the store when no other manager holds it. */
+	#releaseColdStore(): void {
+		this.#coldStore?.release(true);
+		this.#coldStore = undefined;
 	}
 
 	/**

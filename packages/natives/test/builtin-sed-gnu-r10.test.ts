@@ -89,8 +89,15 @@ describe("builtin sed: errors as GNU reports them", () => {
 	cases([
 		// Regressed: a class name without its outer brackets is reported (exit 4) before the backwards range after it; GNU reports "Invalid range end" and exits 1.
 		[String.raw`echo x | sed 's/[:alpha:][z-a]/x/'`, "", 1],
-		// Alone it is the class-syntax error, exit 4.
+		// Regressed: the same before a group that never closes; GNU reports "Unmatched ( or \(" and exits 1.
+		[String.raw`echo x | sed 's/[:alpha:]\(/x/'`, "", 1],
+		// Regressed: the same in an ERE.
+		[String.raw`echo x | sed -E 's/[:alpha:](/x/'`, "", 1],
+		// Regressed: the same inside the group.
+		[String.raw`echo x | sed 's/\([:alpha:]/x/'`, "", 1],
+		// Alone, or in a group that closes, it is the class-syntax error, exit 4.
 		[String.raw`echo x | sed 's/[:alpha:]/x/'`, "", 4],
+		[String.raw`echo x | sed 's/\([:alpha:]\)/x/'`, "", 4],
 		// Regressed: a jump to a label no `:` defines is "undefined label", with a script position.
 		[String.raw`echo a | sed -n 'ba' 2>&1`, "sed: can't find label for jump to `a'\n", 4],
 	]);

@@ -235,7 +235,7 @@ Masking reduces the exposure of a secret. It does not remove it. To remove it, h
 
 ## Older entry bodies on disk
 
-A persisted session keeps the bodies of its older entries in a temporary file under `os.tmpdir()/omp-cold-<uid>/` instead of in memory (see [the cold store](./session.md#older-entry-bodies-the-cold-store)). That file holds each entry as the session holds it in memory: no secret in it is obfuscated or masked, whatever is masked in the session file. The directory is one the account owns alone (mode 0700) and each file is mode 0600. On POSIX the file is unlinked as soon as it is open, so nothing of it stays on disk once the process ends. On Windows the file stays until its session closes or the process exits; a process killed before that leaves it on disk until the next omp process that opens such a file deletes it.
+A persisted session keeps the bodies of its older entries in a temporary file under `os.tmpdir()/omp-cold-<uid>/` instead of in memory (see [the cold store](./session.md#older-entry-bodies-the-cold-store)). That file holds each entry as the session holds it in memory: no secret in it is obfuscated or masked, whatever is masked in the session file. The directory is one the account owns alone (mode 0700) and each file is mode 0600. On POSIX the file is unlinked as soon as it is open, so nothing of it stays on disk once the process ends. On Windows the file stays until its session closes or the process exits; a process killed before that leaves it on disk until a later omp process opens its first such file and deletes the files of processes that are gone. While another live process has taken the killed process's pid, its file stays on disk longer.
 
 ## Key files
 
