@@ -186,10 +186,10 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 
 /**
  * The launch's startup on file storage under `OMP_SESSION_EXCLUSIVE=1`, in `dir` with `home`'s directories (those a
- * `LeaseProcess` started with `home` uses), the picker answering {@link RECENT}; once the agent session would start
+ * `LeaseProcess` started with `home` uses), the picker answering session `id`; once the agent session would start
  * it writes one turn and stops. The running process, whose stderr the caller reads.
  */
-function startFileLaunch(dir: TempDir, home: string): Bun.Subprocess<"ignore", "pipe", "pipe"> {
+function startFileLaunch(dir: TempDir, home: string, id: string): Bun.Subprocess<"ignore", "pipe", "pipe"> {
 	const script = `
 		import { parseArgs } from ${JSON.stringify(path.join(sourceDir, "cli/args.ts"))};
 		import { runRootCommand } from ${JSON.stringify(path.join(sourceDir, "main.ts"))};
@@ -210,7 +210,7 @@ function startFileLaunch(dir: TempDir, home: string): Bun.Subprocess<"ignore", "
 			await runRootCommand(parseArgs(args), args, {
 				settings,
 				discoverAuthStorage: async () => authStorage,
-				selectSession: async sessions => sessions.find(session => session.id === ${JSON.stringify(RECENT)}) ?? null,
+				selectSession: async sessions => sessions.find(session => session.id === ${JSON.stringify(id)}) ?? null,
 				createAgentSession: async options => {
 					manager = options.sessionManager;
 					observation.sessionId = manager?.getSessionId();
@@ -264,12 +264,14 @@ describe("omp --resume with autoResume on, picking the session it resumed, under
 		await using holder = await LeaseProcess.start(config, home);
 		const { sessionDir } = await holder.run({ op: "defaultSessionDir", cwd: dir.path() });
 		if (!sessionDir) throw new Error("the holder named no session directory");
-		const file = path.join(sessionDir, `2026-11-19T00-00-00-000Z_${RECENT}.jsonl`);
-		await Bun.write(file, transcript(RECENT, "the most recent", dir.path()));
-		expect((await holder.run({ op: "hold", file, sessionDir })).sessionId).toBe(RECENT);
+		// A new id each run: a file lease is keyed by the session id alone, machine-wide.
+		const id = Bun.randomUUIDv7();
+		const file = path.join(sessionDir, `2026-11-19T00-00-00-000Z_${id}.jsonl`);
+		await Bun.write(file, transcript(id, "the most recent", dir.path()));
+		expect((await holder.run({ op: "hold", file, sessionDir })).sessionId).toBe(id);
 
-		const launch = startFileLaunch(dir, home);
-		const waitLine = `Session ${RECENT} is held by another omp process; waiting up to 35 s for its lease to go`;
+		const launch = startFileLaunch(dir, home, id);
+		const waitLine = `Session ${id} is held by another omp process; waiting up to 35 s for its lease to go`;
 		const decoder = new TextDecoder();
 		const reader = launch.stderr.getReader();
 		let stderr = "";
@@ -290,7 +292,7 @@ describe("omp --resume with autoResume on, picking the session it resumed, under
 		expect({ waited, exitCode, observation }, stderr).toEqual({
 			waited: true,
 			exitCode: 0,
-			observation: { sessionId: RECENT, sessionFile: file },
+			observation: { sessionId: id, sessionFile: file },
 		});
 		expect(await Bun.file(file).text()).toContain("written by the launch");
 	}, 90_000);

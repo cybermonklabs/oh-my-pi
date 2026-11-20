@@ -675,4 +675,35 @@ describe("omp --resume <id> under OMP_SESSION_EXCLUSIVE=1 on file storage", () =
 			heldAfterSettle: false,
 		});
 	}, 60_000);
+
+	it("does not stop the process when its manager closes as the claim starts to wait and the wait is over before it looks again", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-close-early-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const before = await Bun.file(session.file).text();
+
+		const waiter = await LeaseProcess.start(session.config, dir.join("waiter"), EXCLUSIVE);
+		const opened = await waiter
+			.run({ op: "openWaiting", file: session.file, sessionDir: session.dir, waitMs: 50, closeOnWait: true })
+			.then(
+				report => ({ waiting: report.waiting }),
+				(err: unknown) => ({ error: String(err) }),
+			);
+		// The claim settles without stopping the process; the holder still holds the session.
+		const settled = await waiter.run({ op: "settleWaiting" }).then(
+			() => "settled",
+			(err: unknown) => String(err),
+		);
+		await waiter[Symbol.asyncDispose]();
+		const stderr = await waiter.stderr();
+
+		expect({
+			opened,
+			settled,
+			exitCode: await waiter.exited,
+			stopped: stderr.includes(`Session ${ID} stops (`),
+		}).toEqual({ opened: { waiting: true }, settled: "settled", exitCode: 0, stopped: false });
+		expect(await Bun.file(session.file).text()).toBe(before);
+	}, 60_000);
 });

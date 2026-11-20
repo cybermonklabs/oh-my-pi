@@ -1425,20 +1425,8 @@ export class SessionManager {
 		const closes = this.#closes;
 		let waiting = false;
 		for (;;) {
-			this.#claimSession();
-			const claim = this.#sessionClaim;
-			if (claim?.sessionId === sessionId && claim.release) break;
-			if (!waiting) {
-				if ((await readSessionHeaderId(sessionFile, this.#storage)) !== sessionId) return;
-				waiting = true;
-				options.onWait?.(undefined);
-			}
-			const left = deadline - Date.now();
-			if (left <= 0) {
-				this.#moveOffSessionFile("open-elsewhere");
-				return;
-			}
-			await Bun.sleep(Math.min(OPEN_FILE_CLAIM_RETRY_MS, left));
+			// Every pass starts here, after each await and after `onWait`: a close, seal or switch since the wait began
+			// (during the header read or the sleep, or one `onWait` itself started) ends it before it claims or stops.
 			if (
 				this.#released ||
 				this.#closes !== closes ||
@@ -1447,6 +1435,21 @@ export class SessionManager {
 			) {
 				return;
 			}
+			this.#claimSession();
+			const claim = this.#sessionClaim;
+			if (claim?.sessionId === sessionId && claim.release) break;
+			if (!waiting) {
+				if ((await readSessionHeaderId(sessionFile, this.#storage)) !== sessionId) return;
+				waiting = true;
+				options.onWait?.(undefined);
+				continue;
+			}
+			const left = deadline - Date.now();
+			if (left <= 0) {
+				this.#moveOffSessionFile("open-elsewhere");
+				return;
+			}
+			await Bun.sleep(Math.min(OPEN_FILE_CLAIM_RETRY_MS, left));
 		}
 		await this.#reloadIfWrittenElsewhere();
 	}

@@ -821,8 +821,8 @@ export class LeaseProcess implements AsyncDisposable {
 		return this.#child.exited;
 	}
 
-	/** The command's answer; it fails when the process exits first. */
-	run(command: Record<string, unknown>): Promise<LeaseProcessReport> {
+	/** The command's answer; it fails when the process exits first, also when it exited before the command was sent. */
+	async run(command: Record<string, unknown>): Promise<LeaseProcessReport> {
 		this.#child.stdin.write(`${JSON.stringify(command)}\n`);
 		this.#child.stdin.flush();
 		return this.#next();

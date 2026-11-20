@@ -33,9 +33,11 @@
  *   `dir` as RPC `open_session` does (`via: "rpc"`), recording every `session_start` and
  *   `session_switch` with the id it saw and when, and the manager's id once a second while it
  *   switches (as an extension's heartbeat reads it), then write one turn.
- * - `{ op: "openWaiting", file, sessionDir, waitMs }`: open the session file and start the claim an explicit
- *   resume takes (`claimOpenedSession` with `waitMs`); answer once the claim says it waits for another holder
- *   (`waiting: true`), or once it settled without waiting (`waiting: false`).
+ * - `{ op: "openWaiting", file, sessionDir, waitMs, closeOnWait? }`: open the session file and start the claim an
+ *   explicit resume takes (`claimOpenedSession` with `waitMs`); answer once the claim says it waits for another
+ *   holder (`waiting: true`), or once it settled without waiting (`waiting: false`). With `closeOnWait`, the
+ *   claim's `onWait` starts closing the manager and then blocks the thread until `waitMs` has passed, so the wait
+ *   is over by the time it looks at the clock again.
  * - `{ op: "closeWaiting" }`: close that manager while its claim may still wait.
  * - `{ op: "settleWaiting" }`: wait for that claim to settle; `held` is whether any process, this one
  *   included, holds the session's lease then.
@@ -351,9 +353,16 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 				}),
 			);
 			const waits = Promise.withResolvers<boolean>();
+			const waitMs = Number(command.waitMs);
 			const settled = manager.claimOpenedSession({
-				waitMs: Number(command.waitMs),
-				onWait: () => waits.resolve(true),
+				waitMs,
+				onWait: () => {
+					if (command.closeOnWait === true) {
+						void manager.close();
+						Bun.sleepSync(waitMs + 20);
+					}
+					waits.resolve(true);
+				},
 			});
 			waitingClaim = { sessionId: manager.getSessionId(), settled };
 			return { waiting: await Promise.race([waits.promise, settled.then(() => false)]) };
