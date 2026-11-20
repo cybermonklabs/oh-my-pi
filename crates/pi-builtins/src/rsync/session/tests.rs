@@ -468,13 +468,15 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 /// exactly these two lines, exit 20.
 ///
 /// The test cancels once the copy is under way (the receiver's file in `dst`
-/// holds bytes), not at a fixed time, and asserts what the cancellation did,
-/// not the wall clock: exit 20, both lines, and a copy that stopped short.
-/// `--bwlimit=100` makes the whole copy take about 80 s, so a slow machine
-/// lengthens the run but cannot finish the copy before the cancel. The bound
-/// the product itself keeps is in the second line: the client waits at most
-/// 10 s for its server half to stop, and reports the first line alone when
-/// it does not.
+/// holds bytes), not at a fixed time, and asserts what the cancellation did:
+/// exit 20, both lines, a copy that stopped short, and a run that ended
+/// within 30 s of the cancel. `--bwlimit=100` makes the whole copy take about
+/// 80 s, so a slow machine lengthens the run but cannot finish the copy
+/// before the cancel. The 30 s is generous on purpose: the measured runs
+/// ended about 3 s after the cancel, and a cancel noticed late but before
+/// the copy's end fails it. The client's own bound is in the second
+/// line: it waits at most 10 s for its server half to stop, and reports the
+/// first line alone when it does not.
 #[test]
 fn cancel_local_copy_reports_like_upstream() {
 	use clap::Parser as _;
@@ -497,12 +499,15 @@ fn cancel_local_copy_reports_like_upstream() {
 		while !under_way() && !run_ended.load(Ordering::Relaxed) && Instant::now() < deadline {
 			std::thread::sleep(Duration::from_millis(10));
 		}
+		let cancelled_at = Instant::now();
 		cancel.store(true, Ordering::Relaxed);
+		cancelled_at
 	});
 	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "--bwlimit=100", "bigsrc/", "dst/"]).unwrap();
 	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
+	let run_ended_at = Instant::now();
 	ended.store(true, Ordering::Relaxed);
-	canceller.join().unwrap();
+	let cancelled_at = canceller.join().unwrap();
 	assert_eq!(code, RERR_SIGNAL);
 	assert_eq!(
 		cap.err(),
@@ -511,6 +516,8 @@ fn cancel_local_copy_reports_like_upstream() {
 	);
 	let copied = fs::metadata(dir.path().join("dst/f")).map_or(0, |meta| meta.len());
 	assert!(copied < 8 << 20, "the copy ran to its end: the cancellation did not stop it");
+	let after_cancel = run_ended_at.saturating_duration_since(cancelled_at);
+	assert!(after_cancel < Duration::from_secs(30), "the run ended {after_cancel:?} after the cancel");
 }
 
 /// A cancelled run ends with upstream's signal exit (code 20).

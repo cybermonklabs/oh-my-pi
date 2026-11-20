@@ -139,8 +139,8 @@ const C_LOCALE: &str = "C";
 /// byte-for-byte 3.5.1's. The rsync daemon tests use it too.
 ///
 /// A run that cannot compare says so instead of passing:
-/// - with `RSYNC_REFERENCE_REQUIRED` set (the test Jobs set it), no 3.5.1
-///   fails the caller;
+/// - with `RSYNC_REFERENCE_REQUIRED` set (by a test run that must compare,
+///   such as the fork's builds Jobs), no 3.5.1 fails the caller;
 /// - a 3.5.1 built without the checksums and compressors the builtin
 ///   offers (xxhash, lz4, zstd) fails it too, since its transfers differ
 ///   from the builtin's for that reason alone.

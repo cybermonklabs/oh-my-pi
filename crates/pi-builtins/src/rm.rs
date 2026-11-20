@@ -2134,12 +2134,13 @@ mod tests {
 	/// Redox removes through the provider walk rather than the descriptor
 	/// walk, so it is not covered.
 	///
-	/// 400 levels: rm's walk before 6d543cb1, which recursed once per level,
-	/// overflowed a 256 KiB stack from 201 levels. Keep the chain shallow
-	/// beyond that: on macOS every file operation slows with its directory's
-	/// depth, so building and removing the chain grows quadratically, and
-	/// 5,000 levels took over five minutes; and a Bazel server that removed a
-	/// chain of 1,215 levels a killed test had left in its sandbox died.
+	/// 400 levels: before rm's walk kept its directories on a stack of its
+	/// own, it recursed once per level and overflowed a 256 KiB stack from
+	/// 201 levels. Keep the chain shallow beyond that: on macOS every file
+	/// operation slows with its directory's depth, so building and removing
+	/// the chain grows quadratically, and 5,000 levels took over five
+	/// minutes; and a Bazel server that removed a chain of 1,215 levels left
+	/// in its sandbox died.
 	#[cfg(all(unix, not(target_os = "redox")))]
 	#[test]
 	fn removes_a_directory_chain_deeper_than_the_stack() {

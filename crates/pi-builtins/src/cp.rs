@@ -3972,9 +3972,10 @@ mod tests {
 
 	/// `cp -r` copies a tree deeper than the open-file limit, as GNU cp does:
 	/// the walk reads each directory whole before it goes below, so it holds
-	/// no descriptor per level (100 levels under a limit of 32, where the walk
-	/// before 7445a6c6 failed with "Too many open files"). In a process of its
-	/// own, since the limit belongs to the whole process.
+	/// no descriptor per level (100 levels under a limit of 32, where cp's
+	/// walk failed with "Too many open files" while it still held a descriptor
+	/// per level). In a process of its own, since the limit belongs to the
+	/// whole process.
 	#[cfg(unix)]
 	#[test]
 	fn copies_a_tree_deeper_than_the_descriptor_limit() {
@@ -3994,7 +3995,7 @@ mod tests {
 
 	/// `cp -r` copies a chain of 200 levels on a thread with 256 KiB of
 	/// stack: the walk keeps its directories on a stack of its own, so depth
-	/// costs no thread stack. The walk before 7445a6c6 recursed per level and
+	/// costs no thread stack. Before it did, the walk recursed per level and
 	/// overflowed that stack by 63 levels in a debug build; deeper chains
 	/// prove nothing more, and each level's lookups by path cost more. An
 	/// overflow ends the process, so the test runs in a process of its own.

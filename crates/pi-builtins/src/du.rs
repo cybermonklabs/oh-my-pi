@@ -1487,9 +1487,10 @@ mod tests {
 
 	/// A chain deeper than du's walk could recurse through on a 256 KiB stack
 	/// must be summed, not overflow the stack of the thread the shell runs
-	/// on. The walk before 6d543cb1 recursed once per level and overflowed
-	/// that stack by 70 levels in a debug build; 200 leave it a margin, and
-	/// deeper chains prove nothing more while every lookup by path grows.
+	/// on. Before du's walk kept its directories on a stack of its own, it
+	/// recursed once per level and overflowed that stack by 70 levels in a
+	/// debug build; 200 leave it a margin, and deeper chains prove nothing
+	/// more while every lookup by path grows.
 	#[test]
 	fn sums_a_directory_chain_deeper_than_the_stack() {
 		let dir = crate::deep_tree::tempdir();
