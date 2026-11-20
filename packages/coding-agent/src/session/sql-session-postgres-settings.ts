@@ -45,7 +45,10 @@ export interface PgSessionSetting {
 	readonly left: string;
 	/** true, or why no value of the setting is hostile. */
 	readonly hostile: true | { readonly none: string };
-	/** Set exactly for names PostgreSQL 16 lacks: "Cloud SQL only", "PostgreSQL 17 and later", "PostgreSQL 18 and later". */
+	/**
+	 * Set exactly for names PostgreSQL 16.0, the oldest server the store supports, lacks: "PostgreSQL 16.4 and
+	 * later", "Cloud SQL only", "PostgreSQL 17 and later", "PostgreSQL 18 and later".
+	 */
 	readonly conditional?: string;
 }
 
@@ -347,7 +350,11 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 	plan("random_page_cost", "1000"),
 	exempt("recursive_worktable_factor", "It plans only WITH RECURSIVE queries, and the store sends none.", "0.001"),
 	// It refuses each read of a view or a foreign table, as a store table replaced by one after the open check would be.
-	toDefault("restrict_nonsystem_relation_kind", "'view, foreign-table'"),
+	// PostgreSQL 16.4 added it (the fix of CVE-2024-7348); PostgreSQL 16.0 to 16.3 lack it.
+	{
+		...toDefault("restrict_nonsystem_relation_kind", "'view, foreign-table'"),
+		conditional: "PostgreSQL 16.4 and later",
+	},
 	// Off, a statement on a table with a row security policy fails instead of seeing the policy's rows.
 	toDefault("row_security", "off"),
 	exempt("scram_iterations", PASSWORD_ONLY, "1"),

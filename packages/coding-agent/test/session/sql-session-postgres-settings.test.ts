@@ -1,10 +1,11 @@
 /**
  * The list module beside `SqlSessionStorage` that names every PostgreSQL
  * session setting the store's statements could depend on, and the opening
- * built from it. Read against the setting names of context `user` three
- * servers report (`fixtures/postgres-settings`): PostgreSQL 16, Cloud SQL
- * for PostgreSQL 16 and PostgreSQL 18. A server whose list gains a name
- * fails here until the name has an entry. No database is needed.
+ * built from it. Read against the setting names of context `user` four
+ * servers report (`fixtures/postgres-settings`): PostgreSQL 16.0, the oldest
+ * the store supports, PostgreSQL 16.16, Cloud SQL for PostgreSQL 16 and
+ * PostgreSQL 18. A server whose list gains a name fails here until the name
+ * has an entry. No database is needed.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -22,7 +23,12 @@ import {
 const FIXTURES = path.join(import.meta.dir, "fixtures", "postgres-settings");
 
 /** The captured lists, each the names one server's `pg_settings` holds with context `user`. */
-const CAPTURES = ["postgresql-16.txt", "cloud-sql-postgresql-16.txt", "postgresql-18.txt"] as const;
+const CAPTURES = [
+	"postgresql-16.0.txt",
+	"postgresql-16.txt",
+	"cloud-sql-postgresql-16.txt",
+	"postgresql-18.txt",
+] as const;
 
 /** The setting names of a captured list: one per line; `#` lines say how it was captured. */
 async function capturedNames(file: string): Promise<string[]> {
@@ -31,15 +37,17 @@ async function capturedNames(file: string): Promise<string[]> {
 }
 
 const CAPTURED = new Map(await Promise.all(CAPTURES.map(async file => [file, await capturedNames(file)] as const)));
-const POSTGRESQL_16 = new Set(CAPTURED.get("postgresql-16.txt"));
+/** The oldest server the store supports: an entry whose name it lacks is conditional. */
+const POSTGRESQL_16_0 = new Set(CAPTURED.get("postgresql-16.0.txt"));
 const CLOUD_SQL = new Set(CAPTURED.get("cloud-sql-postgresql-16.txt"));
 const EVERY_CAPTURED = new Set([...CAPTURED.values()].flat());
 
 /** The two entries that are no `pg_settings` name, which every server has. */
 const NOT_SETTINGS: Record<string, true> = { role: true, "temporary table": true };
 
-/** The release each name PostgreSQL 16 lacks came with, after the PostgreSQL 17 and 18 release notes. */
+/** The release each name PostgreSQL 16.0 lacks came with, after the PostgreSQL 16.4, 17 and 18 release notes. */
 const LATER_RELEASES: Record<string, string> = {
+	restrict_nonsystem_relation_kind: "PostgreSQL 16.4 and later",
 	enable_group_by_reordering: "PostgreSQL 17 and later",
 	io_combine_limit: "PostgreSQL 17 and later",
 	transaction_timeout: "PostgreSQL 17 and later",
@@ -191,11 +199,13 @@ describe("PG_SESSION_SETTINGS", () => {
 		expect(problems).toEqual([]);
 	});
 
-	it("conditional is set exactly for the names postgresql-16.txt lacks", () => {
+	it("conditional is set exactly for the names postgresql-16.0.txt, the oldest supported server, lacks", () => {
 		const expected = (name: string): string | undefined => {
-			if (Object.hasOwn(NOT_SETTINGS, name) || POSTGRESQL_16.has(name)) return undefined;
+			if (Object.hasOwn(NOT_SETTINGS, name) || POSTGRESQL_16_0.has(name)) return undefined;
+			// A later release's name is in Cloud SQL's list too when its PostgreSQL has it.
+			if (Object.hasOwn(LATER_RELEASES, name)) return LATER_RELEASES[name];
 			if (CLOUD_SQL.has(name)) return "Cloud SQL only";
-			return LATER_RELEASES[name] ?? `a release this test does not name for ${name}`;
+			return `a release this test does not name for ${name}`;
 		};
 		const wrong = PG_SESSION_SETTINGS.filter(entry => entry.conditional !== expected(entry.name)).map(
 			entry => `${entry.name}: ${String(entry.conditional)}, not ${String(expected(entry.name))}`,
