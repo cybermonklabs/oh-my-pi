@@ -163,9 +163,11 @@ jobs:
           # `sudo -E` (--run_under; GitHub's runner has passwordless sudo),
           # and every other target runs as the runner's user.
           roots=()
-          while read -r target _; do
+          declare -A root_tests=()
+          while read -r target count _; do
             case "$target" in "" | "#"*) continue ;; esac
             roots+=("$target")
+            root_tests["$target"]="$count"
           done <.github/sami/rust-test-root-targets.txt
           not_roots=()
           for target in "${roots[@]}"; do not_roots+=("-$target"); done
@@ -365,13 +367,25 @@ jobs:
                   continue
                 fi
                 # A root target runs as root, so a test in it that printed
-                # `not run:` skipped itself on a broken precondition.
+                # `not run:` skipped itself on a broken precondition, and it
+                # must pass the number of tests its list line names. libtest
+                # captures the tests' stderr into the record; a raw `not run:`
+                # line outside the record (a write to fd 2) fails it too.
                 for target in "${roots[@]}"; do
                   [ "$target" = "$label" ] || continue
                   while read -r skipped; do
                     echo "::error title=Rust tests::$label $skipped printed 'not run:', though it runs as root"
                     bad=1
                   done < <(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and ((.stdout // "") | test("not run:"))) | .name' "$log")
+                  if grep -v '^{' "$log" | grep -q 'not run:'; then
+                    echo "::error title=Rust tests::$label printed 'not run:' outside libtest's record, though it runs as root: $(grep -v '^{' "$log" | grep -m1 'not run:')"
+                    bad=1
+                  fi
+                  passed="$(jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object" and .type == "test" and .event == "ok")] | length' "$log")"
+                  if [ "$passed" != "${root_tests[$target]}" ]; then
+                    echo "::error title=Rust tests::$label passed $passed tests, and .github/sami/rust-test-root-targets.txt names ${root_tests[$target]}"
+                    bad=1
+                  fi
                 done
                 if [ "$kind" = passed ]; then
                   if [ "$ended" != ok ]; then
