@@ -79,10 +79,19 @@ const ZLE_SYNC_FIFO: &str = ".zle-sync.fifo";
 /// number, `BEL`.
 const ZLE_SYNC_TAG: &str = "]9999;zle-sync ";
 
-/// The obash binary under test.
+/// The obash binary under test, as an absolute path. Cargo gives one; Bazel
+/// gives one relative to the test's runfiles directory, which a shell started
+/// in another directory ([`Spawn::cwd`]) would not find.
 #[must_use]
 pub fn obash() -> &'static str {
-	env!("CARGO_BIN_EXE_obash")
+	static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+		std::path::absolute(env!("CARGO_BIN_EXE_obash"))
+			.expect("the obash path")
+			.into_os_string()
+			.into_string()
+			.expect("the obash path is UTF-8")
+	});
+	&PATH
 }
 
 /// Whether the real zsh exists here (differential tests skip without it).

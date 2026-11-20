@@ -81,9 +81,23 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 	cmd
 }
 
+/// The obash binary under test, as an absolute path. Cargo gives one; Bazel
+/// gives one relative to the test's runfiles directory, which a child started
+/// in another directory, or handed the path, would not find.
+pub fn obash_path() -> &'static str {
+	static PATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+		std::path::absolute(env!("CARGO_BIN_EXE_obash"))
+			.expect("the obash path")
+			.into_os_string()
+			.into_string()
+			.expect("the obash path is UTF-8")
+	});
+	&PATH
+}
+
 /// [`command`] for the obash under test.
 pub fn obash() -> Command {
-	command(env!("CARGO_BIN_EXE_obash"))
+	command(obash_path())
 }
 
 /// Run `cmd` (from [`command`]) to its end within [`LIMIT`]: its output and

@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test", "rust_test_suite")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 
 package(default_visibility = ["//visibility:public"])
@@ -113,4 +113,52 @@ rust_test(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + [":pi-shell"],
+)
+
+# The other integration tests: one rust_test per tests/*.rs, as cargo builds
+# them, each with the helpers under tests/*_support. Many start obash: cargo
+# names its path in CARGO_BIN_EXE_obash, and so does this target, relative to
+# the runfiles root; the support modules make it absolute.
+rust_test_suite(
+    name = "pi-shell_integration_tests",
+    srcs = glob(
+        ["tests/*.rs"],
+        exclude = [
+            "tests/minimizer_fixtures.rs",
+            "tests/vfs.rs",
+        ],
+    ),
+    aliases = aliases(),
+    data = glob([
+        "src/testkit/fixtures/**",
+        "tests/fixtures/**",
+    ]) + [":obash"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_BIN_EXE_obash": "$(rootpath :obash)"},
+    rustc_flags = select({
+        # As pi-shell_test: the engine runs in some of these test processes.
+        "//bazel:fastbuild": ["-Copt-level=1"],
+        "//conditions:default": [],
+    }),
+    shared_srcs = glob(["tests/*_support/**/*.rs"]),
+    deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
+        ":pi-shell",
+        "//crates/pi-vfs",
+    ],
+)
+
+# obash's own unit tests (src/bin/obash), which cargo runs as the bin target.
+rust_test(
+    name = "obash_test",
+    crate = ":obash",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "pi-shell_doc_test",
+    crate = ":pi-shell",
+    deps = all_crate_deps(normal_dev = True),
 )
