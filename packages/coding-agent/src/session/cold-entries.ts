@@ -831,11 +831,13 @@ export class ColdEntryStore {
 	/**
 	 * The record parsed fresh and unfrozen, its blob references resolved when
 	 * `resolveBlobs`. Its bytes count toward the next full collection
-	 * ({@link COLLECT_AFTER_RECORD_BYTES}).
+	 * ({@link COLLECT_AFTER_RECORD_BYTES}). With `onRestored`, a blob the
+	 * store's tier restores later is not resolved into the parsed record:
+	 * `onRestored` runs instead ({@link resolveBlobRefsInEntriesSync}).
 	 */
-	parse(record: ColdRecord, resolveBlobs: boolean): Record<string, unknown> {
+	parse(record: ColdRecord, resolveBlobs: boolean, onRestored?: () => void): Record<string, unknown> {
 		const entry = JSON.parse(this.#read(record).toString("utf8")) as Record<string, unknown>;
-		if (resolveBlobs) resolveBlobRefsInEntriesSync([entry as unknown as SessionEntry], this.#blobs);
+		if (resolveBlobs) resolveBlobRefsInEntriesSync([entry as unknown as SessionEntry], this.#blobs, onRestored);
 		paceCollection(record.length);
 		return entry;
 	}
@@ -843,12 +845,14 @@ export class ColdEntryStore {
 	/**
 	 * The record parsed, its blob references resolved and deep-frozen; the 8
 	 * most recent are cached while together they hold at most
-	 * {@link CACHE_BYTES}.
+	 * {@link CACHE_BYTES}. A blob the store's tier restores after the parse is
+	 * not written into the frozen record: the record leaves the cache, and the
+	 * next read parses it again with the blob in the local store.
 	 */
 	materialize(record: ColdRecord): Readonly<Record<string, unknown>> {
 		const cached = this.#cache.get(record.offset);
 		if (cached) return cached.entry;
-		const entry = this.parse(record, true);
+		const entry = this.parse(record, true, () => this.#cache.delete(record.offset));
 		const bytes = Math.max(record.length, freezeAndMeasure(entry));
 		this.#materializations++;
 		this.#cache.set(record.offset, { entry, bytes });

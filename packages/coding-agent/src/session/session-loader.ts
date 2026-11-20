@@ -30,10 +30,10 @@ import {
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
 import {
+	activeBranch,
 	type CompactionEntry,
 	type FileEntry,
 	type RawFileEntry,
-	resolveSessionLeafId,
 	type SessionEntry,
 	type SessionHeader,
 } from "./session-entries";
@@ -1088,24 +1088,18 @@ function entriesForBlobResolution(entries: FileEntry[]): SessionEntry[] {
 
 /**
  * The newest compaction on the active branch, when it holds a snapcompact
- * archive: the one a rebuilt context draws frames from.
+ * archive: the one a rebuilt context draws frames from, its legacy truncated
+ * frames repaired. Finding it reads only the entries' tree fields (`type`,
+ * `id`, `parentId`, `activeLeafId`), which a cold entry keeps as data.
  */
 function activeSnapcompactCompaction(
 	entries: readonly SessionEntry[],
 ): { entry: CompactionEntry; archive: snapcompact.Archive } | undefined {
-	const byId = new Map(entries.map(entry => [entry.id, entry]));
-	const leafId = resolveSessionLeafId(entries);
-	const seen = new Set<string>();
-	let current = leafId === null ? undefined : byId.get(leafId);
-	while (current && !seen.has(current.id)) {
-		if (current.type === "compaction") {
-			const archive = snapcompact.getPreservedArchive(current.preserveData);
-			return archive ? { entry: current, archive } : undefined;
-		}
-		seen.add(current.id);
-		current = current.parentId ? byId.get(current.parentId) : undefined;
-	}
-	return undefined;
+	const compaction = activeBranch(entries).findLast((entry): entry is CompactionEntry => entry.type === "compaction");
+	if (!compaction) return undefined;
+	repairTruncatedSnapcompactFrames(compaction);
+	const archive = snapcompact.getPreservedArchive(compaction.preserveData);
+	return archive ? { entry: compaction, archive } : undefined;
 }
 
 /**
@@ -1185,6 +1179,7 @@ async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobSt
  * keeps them (a session written before the tier has none). Snapcompact frames
  * are not in the tier; they are drawn again from their archive's text. Each
  * of `collected`'s blobs counts as one the references in `values` name.
+ * Answers whether it wrote a blob to the local store.
  */
 async function restoreTierBlobs(
 	values: readonly unknown[],
@@ -1192,13 +1187,14 @@ async function restoreTierBlobs(
 	writeBack: boolean,
 	sessionPath?: string,
 	collected?: ReadonlyMap<string, string | undefined>,
-): Promise<void> {
+): Promise<boolean> {
 	const tier = blobStore.tier;
-	if (!tier) return;
+	if (!tier) return false;
 	const mimeTypes = new Map(collected);
 	addBlobRefNames(values, mimeTypes);
-	if (mimeTypes.size === 0) return;
+	if (mimeTypes.size === 0) return false;
 	const named: string[] = [];
+	let restored = false;
 	try {
 		const held = await tier.sizes([...mimeTypes.keys()]);
 		const missing: string[] = [];
@@ -1229,6 +1225,7 @@ async function restoreTierBlobs(
 				return;
 			}
 			await blobStore.put(data, { hash, extension: blobExtensionForImageMimeType(mimeTypes.get(hash)) });
+			restored = true;
 			logger.info("Restored a session blob from the session database", { hash, bytes: data.byteLength });
 		});
 	} catch (error) {
@@ -1237,7 +1234,7 @@ async function restoreTierBlobs(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
-	if (!writeBack || !sessionPath || named.length === 0) return;
+	if (!writeBack || !sessionPath || named.length === 0) return restored;
 	try {
 		await tier.reference(sessionPath, named);
 	} catch (error) {
@@ -1247,39 +1244,59 @@ async function restoreTierBlobs(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
+	return restored;
 }
 
 /**
- * Restore the image data that persistence externalized to the blob store, in
- * place: first each blob the local store lacks from the store's tier (and
+ * Restore in place the image data that persistence externalized to the blob
+ * store: first each blob the local store lacks from the store's tier (and
  * each one the tier lacks back to it, referenced from `sessionPath` when it is
- * given), then the references, then the active snapcompact archive's missing
- * frames, drawn again from its text.
+ * given), then the references. Then draw again, from its text, each frame of
+ * the active snapcompact archive whose blob the local store lacks, and store
+ * there each one whose bytes hash to its reference; the frames stay
+ * references, which a context build reads when it selects them.
  *
  * `collected` adds blobs, by hash with their MIME types, that entries the caller
  * no longer holds whole name (a streamed load's entries moved out of memory),
  * found with {@link collectBlobRefNames} while it held them: the tier pass
  * (restore, write-back and references) covers them too.
+ *
+ * `transcript`, every entry of the session with `entries` among them (a
+ * streamed load's cold entries too), is where the active snapcompact archive
+ * is found; only `entries` are walked for references.
  */
 export async function resolveBlobRefsInEntries(
 	entries: FileEntry[],
 	blobStore: BlobStore,
 	sessionPath?: string,
 	collected?: ReadonlyMap<string, string | undefined>,
+	transcript?: readonly FileEntry[],
 ): Promise<void> {
 	const sessionEntries = entriesForBlobResolution(entries);
 	await restoreTierBlobs(sessionEntries, blobStore, true, sessionPath, collected);
 	await resolveBlobRefs(sessionEntries, blobStore);
-	await restoreSnapcompactFrames(sessionEntries, blobStore);
+	await restoreSnapcompactFrames(
+		transcript ? transcript.filter((entry): entry is SessionEntry => entry.type !== "session") : sessionEntries,
+		blobStore,
+	);
 }
 
 /**
- * Synchronous {@link resolveBlobRefsInEntries}: it resolves what the local
- * blob store holds. A reference it leaves is resolved in place later, once
- * the store's tier is read and the missing snapcompact frames are drawn
- * again, which are both asynchronous.
+ * Synchronous {@link resolveBlobRefsInEntries}: it resolves the references
+ * whose blobs the local store holds and leaves the others. When it leaves one
+ * and the store has a tier, an asynchronous pass then restores from the tier
+ * the blobs it holds, resolves in place the references they answer, and draws
+ * again the active snapcompact archive's missing frames, storing their blobs;
+ * the frames stay references, which a context build reads. With `onRestored`
+ * (a caller that freezes `entries`), the pass writes nothing into `entries`:
+ * it calls `onRestored` once it has restored a blob to the local store, where
+ * the caller's next parse of the entries finds it.
  */
-export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: BlobStore): void {
+export function resolveBlobRefsInEntriesSync(
+	entries: FileEntry[],
+	blobStore: BlobStore,
+	onRestored?: () => void,
+): void {
 	const sessionEntries = entriesForBlobResolution(entries);
 	const resolved = new Map<string, string>();
 	let unresolved = false;
@@ -1297,7 +1314,10 @@ export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: Bl
 	}
 	if (!unresolved || !blobStore.tier) return;
 	void restoreTierBlobs(sessionEntries, blobStore, false)
-		.then(() => resolveBlobRefs(sessionEntries, blobStore))
+		.then(restored => {
+			if (!onRestored) return resolveBlobRefs(sessionEntries, blobStore);
+			if (restored) onRestored();
+		})
 		.then(() => restoreSnapcompactFrames(sessionEntries, blobStore))
 		.catch(error => {
 			logger.warn("Restoring the missing blobs of adopted session entries failed", {

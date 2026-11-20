@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as blobStore from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getAgentDir, getBlobsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -218,6 +219,42 @@ describe("lazy snapcompact frame resolution", () => {
 		const messages = resumed.buildSessionContext().messages;
 		expect(new Set(imageDataIn(messages))).toEqual(new Set(frames));
 		expect(JSON.stringify(messages)).not.toContain("unavailable here");
+		await resumed.close();
+	});
+
+	it("draws missing frame blobs again when a cold patch record lies between the compaction and the leaf", async () => {
+		const archive = await compactedArchive();
+		const cwd = await makeTempDir();
+		const sessionDir = path.join(cwd, "sessions");
+		const session = SessionManager.create(cwd, sessionDir);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage("hi"));
+		const kept = session.appendMessage({ role: "user", content: "kept", timestamp: 3 });
+		// The compaction keeps `kept` on, so the session has a cut and a patch record past it goes cold.
+		const compactionId = session.appendCompaction("summary", undefined, kept, 1000, {
+			preserveData: { [snapcompact.PRESERVE_KEY]: structuredClone(archive) },
+		});
+		// A patch of the compaction appended at the leaf, too large for the record to stay whole.
+		const warning = "The context is still above the window after compaction. ".repeat(8);
+		await session.patchEntries([{ entryId: compactionId, entry: { warning } }]);
+		session.appendMessage({ role: "user", content: "after", timestamp: 4 });
+		await session.flush();
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		await session.close();
+		const hashes = [...(await Bun.file(sessionFile).text()).matchAll(/blob:sha256:([0-9a-f]{64})/g)].map(
+			match => match[1] ?? "",
+		);
+		expect(hashes.length).toBeGreaterThan(1);
+		await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+
+		const resumed = await SessionManager.open(sessionFile, sessionDir, undefined, { suppressBreadcrumb: true });
+		// The lookup of the compaction read no cold body back.
+		expect(resumed.coldStoreStats().materializations).toBe(0);
+		const patch = resumed.getEntries().find(entry => entry.type === "custom" && entry.customType === "entry_patch");
+		expect(patch !== undefined && isColdEntry(patch)).toBe(true);
+		for (const hash of hashes) expect(await Bun.file(path.join(getBlobsDir(), hash)).exists()).toBe(true);
+		expect(resumed.coldStoreStats().materializations).toBe(0);
 		await resumed.close();
 	});
 });

@@ -2,9 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { TextContent } from "@oh-my-pi/pi-ai";
-import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
-import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { ColdEntryStore, convertToColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
 import {
 	CURRENT_SESSION_VERSION,
@@ -13,7 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { getBlobsDir, getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, getConfigRootDir, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 /** Larger than any value a cold entry keeps in memory. */
 const BODY = "x".repeat(4096);
@@ -746,6 +746,64 @@ describe("cold entry store", () => {
 				);
 			} finally {
 				await manager.close();
+			}
+		});
+
+		// A record is frozen once read: the tier pass that restores its image later must not write into it.
+		it("give an image only the blob tier holds once the tier has restored it, writing nothing into a read record", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const bytes = Buffer.alloc(3000, 9);
+			const hash = new Bun.SHA256().update(bytes).digest("hex");
+			const ref = `blob:sha256:${hash}`;
+			const tierRead = Promise.withResolvers<void>();
+			const tier: SessionBlobTier = {
+				store: () => {},
+				sizes: async hashes => new Map(hashes.filter(name => name === hash).map(name => [name, bytes.length])),
+				read: async (hashes, visit) => {
+					for (const name of hashes) if (name === hash) await visit(name, bytes);
+					tierRead.resolve();
+				},
+				repair: async () => 0,
+				reference: async () => {},
+				sweep: async () => ({ candidates: 0, deleted: 0, bytes: 0 }),
+			};
+			const store = ColdEntryStore.open(new BlobStore(dir.path(), tier));
+			if (!store) throw new Error("the store did not open");
+			const warn = vi.spyOn(logger, "warn");
+			try {
+				const cold: SessionEntry = {
+					type: "message",
+					id: "u1",
+					parentId: null,
+					timestamp: "2026-01-01T00:00:00.000Z",
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: "look" },
+							{ type: "image", data: ref, mimeType: "image/png" },
+						],
+						timestamp: 1,
+					},
+				};
+				expect(convertToColdEntry(cold, () => store, { imagesExternalized: true })).toBe(true);
+				const image = (): string | undefined => {
+					const message = messageOf(cold);
+					if (message.role !== "user" || typeof message.content === "string") return undefined;
+					return message.content.find((block): block is ImageContent => block.type === "image")?.data;
+				};
+
+				expect(image()).toBe(ref);
+				await tierRead.promise;
+				// One event-loop turn: what the pass does after the tier's read runs in microtasks.
+				await Bun.sleep(0);
+				expect(image()).toBe(bytes.toString("base64"));
+				expect(store.materializations).toBe(2);
+				expect(warn.mock.calls.map(call => call[0])).not.toContain(
+					"Restoring the missing blobs of adopted session entries failed",
+				);
+			} finally {
+				warn.mockRestore();
+				store.close();
 			}
 		});
 	});

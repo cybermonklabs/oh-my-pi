@@ -4613,11 +4613,14 @@ export class SessionManager {
 			if (boundary) convertColdEntries(intake.entries, boundary, openStore, { paced: true });
 			// The blobs this session names get its reference rows, so another session's delete keeps them: those
 			// of every entry the stream read (`named`), the ones now cold included. A fork's come with its own write.
+			// The active snapcompact compaction is looked up among every entry, since a cold entry (a patch record)
+			// can lie on its branch, by tree fields a cold entry keeps; only the whole entries are walked for blobs.
 			await resolveBlobRefsInEntries(
 				intake.entries.filter(entry => !isColdEntry(entry)),
 				this.#blobs,
 				fork ? undefined : filePath,
 				named,
+				intake.entries,
 			);
 			if (intake.store && !intake.entries.some(isColdEntry)) {
 				intake.store.close();

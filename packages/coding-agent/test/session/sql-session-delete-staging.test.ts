@@ -155,8 +155,14 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client write
 		const store = await db.open({
 			lease: STILL,
 			wrap: client => {
-				// The delete's first row delete, the session's own: the directory's rows go after it.
-				gate = gatedClient(client, new RegExp(`^DELETE FROM ${db.table} WHERE path = `), "before");
+				// The delete's lock of the session's rows and of every row under its directory, its first statement
+				// on the session table: on MySQL and MariaDB it locks every row and gap it scans, so another
+				// client's write under the directory after it waits for the delete to end.
+				gate = gatedClient(
+					client,
+					new RegExp(`^SELECT path FROM ${db.table} WHERE path IN .* FOR UPDATE$`),
+					"before",
+				);
 				return gate.client;
 			},
 		});
@@ -166,8 +172,8 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client write
 		await store.drain();
 		const other = await db.open({ claims: false });
 
-		// The delete's transaction waits past the refresh that listed the session's rows, while the other client
-		// commits the transcript, which only the delete's own statements can find.
+		// The delete's transaction waits before its locks, while the other client commits the transcript, which
+		// only the delete's own statements can find.
 		gate.close();
 		const deleting = store.deleteSessionWithArtifacts(file);
 		await gate.paused();
