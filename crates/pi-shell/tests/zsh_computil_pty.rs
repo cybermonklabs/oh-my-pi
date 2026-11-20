@@ -308,10 +308,10 @@ const KILL_SIGNALS_AFTER_5_9: &str =
 	 -HUP     -PIPE    -QUIT    -SYS     -TTIN    -USR2    -XFSZ\n-CHLD    -ILL     -POLL    -SEGV    \
 	 -TERM    -TTOU    -VTALRM";
 
-/// On Linux obash's screen is zsh 5.9's or zsh after 5.9's, which differ in
-/// the name of 6 ([`KILL_SIGNALS_5_9`], [`KILL_SIGNALS_AFTER_5_9`]), with
-/// zsh 5.9's installed completion functions; elsewhere it is compared with
-/// the real zsh.
+/// On Linux obash's screen is zsh after 5.9's ([`KILL_SIGNALS_AFTER_5_9`]),
+/// which names 6 `ABRT` where zsh 5.9's names it `IOT`
+/// ([`KILL_SIGNALS_5_9`]), with zsh 5.9's installed completion functions;
+/// elsewhere it is compared with the real zsh.
 #[test]
 fn compsys_kill_signals() {
 	let drive = |pty: &mut Pty| keys(pty, "kill -\t");
@@ -328,11 +328,12 @@ fn compsys_kill_signals() {
 		let dir = tempdir();
 		let mut ours = spawn(false, &rc, &dir).spawn().expect("spawn obash");
 		prepared(&mut ours, &drive).expect("pty session");
+		// obash names 6 `ABRT` (`IOT` its second name), as zsh after 5.9
+		// does: a screen with `-IOT`, zsh 5.9's, is a regression.
 		let screen = ours.screen().contents();
-		assert!(
-			[KILL_SIGNALS_5_9, KILL_SIGNALS_AFTER_5_9].contains(&screen.as_str()),
-			"obash screen:\n{screen}\n--- zsh 5.9:\n{KILL_SIGNALS_5_9}\n--- zsh after \
-			 5.9:\n{KILL_SIGNALS_AFTER_5_9}"
+		assert_eq!(
+			screen, KILL_SIGNALS_AFTER_5_9,
+			"obash screen:\n{screen}\n--- zsh 5.9 (6 is IOT there):\n{KILL_SIGNALS_5_9}"
 		);
 	}
 }
