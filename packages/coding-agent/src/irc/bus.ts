@@ -101,8 +101,10 @@ export interface IrcBusApi {
 	/** Count a settled job of agent `from` owned by `to` as `from`'s reply to `to`. */
 	recordReply(from: string, to: string): void;
 	/**
-	 * Drop every send mark from or to `agentId`, its buffered messages and its
-	 * pending waits, which end with `null`, unless it is live; see {@link IrcBus.forgetAgent}.
+	 * Drop the marks of what `agentId` sent, the direct marks of what was sent
+	 * to it, the other marks of what agents no longer live sent it, its
+	 * buffered messages and its pending waits, which end with `null`, unless it
+	 * is live; see {@link IrcBus.forgetAgent}.
 	 */
 	forgetAgent(agentId: string): void;
 }
@@ -150,10 +152,11 @@ export class IrcBus implements IrcBusApi {
 
 	/**
 	 * Forget agent `agentId` once a job manager evicted the last job that ran
-	 * it: the marks of what it sent and of what was sent to it answer nothing
+	 * it: the marks of what it sent, and of what was sent to it, answer nothing
 	 * any more, and a later message to it (a revived agent) records fresh ones.
-	 * An agent still live keeps them until it is parked, killed or unregistered.
-	 * With no bus yet nothing was recorded.
+	 * A live sender keeps its mark of what it sent the agent, which its wake
+	 * turn's relay still asks. An agent still live keeps everything until it is
+	 * parked, killed or unregistered. With no bus yet nothing was recorded.
 	 */
 	static forgetAgent(agentId: string): void {
 		IrcBus.#global?.forgetAgent(agentId);
@@ -265,22 +268,30 @@ export class IrcBus implements IrcBusApi {
 	}
 
 	/**
-	 * Instance half of {@link IrcBus.forgetAgent}: drops the agent's row and its
-	 * entry in every other agent's row from each mark table, and each row left
-	 * empty, its mailbox, and its pending waits, which end with `null` as a
-	 * timeout does. Both sides go at once, so {@link unansweredSends} never meets
-	 * a send whose answer was dropped. A live agent (`running` or `idle`: it has
-	 * a session) keeps its marks, mail and waits, as a turn of it may still read
-	 * them: the wake-turn relay asks {@link sentSince} after the turn has gone
-	 * idle. They go once this bus's registry reports it parked, aborted or gone;
-	 * a send still delivering to or from it then records no mark and buffers
-	 * nothing for it.
+	 * Instance half of {@link IrcBus.forgetAgent}: drops the agent's row from
+	 * each mark table; its entry in every other agent's direct and job-reply
+	 * rows, and in the sent and progress rows of every agent not live; each row
+	 * left empty; its mailbox; and its pending waits, which end with `null` as a
+	 * timeout does. A live agent (`running` or `idle`: it has a session) keeps
+	 * its marks, mail and waits, as a turn of it may still read them: the
+	 * wake-turn relay asks {@link sentSince} after the turn has gone idle. For
+	 * the same reason a live sender keeps its sent and progress marks for the
+	 * forgotten agent, so a waker that parked during the turn that answered it
+	 * is not sent that answer again, which would revive it; those go once the
+	 * sender itself is forgotten. The direct marks go on both sides at once, so
+	 * {@link unansweredSends} never meets a question whose answer was dropped,
+	 * and a question the agent asks once revived orders after every mark kept
+	 * for it ({@link SendMark.seq}). Nothing goes until this bus's registry
+	 * reports the agent parked, aborted or gone; a send still delivering to or
+	 * from it then records no mark and buffers nothing for it.
 	 */
 	forgetAgent(agentId: string): void {
 		if (isLive(this.#registry.get(agentId))) return;
 		for (const table of [this.#lastSent, this.#lastDirect, this.#lastProgress, this.#lastJobReply]) {
 			table.delete(agentId);
+			const liveSendersKeep = table === this.#lastSent || table === this.#lastProgress;
 			for (const [from, marks] of table) {
+				if (liveSendersKeep && isLive(this.#registry.get(from))) continue;
 				if (marks.delete(agentId) && marks.size === 0) table.delete(from);
 			}
 		}

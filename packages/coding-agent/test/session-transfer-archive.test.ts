@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -16,6 +16,7 @@ import {
 	unpackSession,
 } from "@oh-my-pi/pi-coding-agent/session/session-transfer";
 import { getBlobsDir, getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import * as ar from "@oh-my-pi/pi-utils/ar";
 import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
@@ -60,6 +61,7 @@ describe("omp session pack/unpack archive", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		closeSessionIndex();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
@@ -144,6 +146,18 @@ describe("omp session pack/unpack archive", () => {
 
 		expect(await findSessionFiles(id)).toEqual([]);
 		expect(await new BlobStore(getBlobsDir()).has(blobName.slice("blobs/".length))).toBe(false);
+	});
+
+	// Regression: an archive writer that reads its members whole (`writeArchive`, whose encoder takes
+	// a `Blob` member through `arrayBuffer()`) packs the transcript as 0 bytes, with none of its blobs,
+	// and reports success; the archive unpacks to an empty session.
+	it("refuses to pack a transcript through an archive writer that does not stream it", async () => {
+		const source = await createLaptopSession();
+		const archive = path.join(root, "session.tar");
+		vi.spyOn(ar, "writeTarArchive").mockImplementation((destPath, entries) => writeArchive(destPath, "tar", entries));
+
+		await expect(packSession(source, archive)).rejects.toThrow(/only streamed/);
+		expect(fs.existsSync(archive)).toBe(false);
 	});
 
 	it("rejects an archive from a newer format version", async () => {

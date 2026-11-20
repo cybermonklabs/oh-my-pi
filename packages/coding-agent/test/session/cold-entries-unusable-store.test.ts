@@ -1,15 +1,19 @@
 /**
  * A resumed or running session keeps working when the place it keeps older
  * entry bodies in cannot be used: `os.tmpdir()` read-only or impossible to
- * create, or every write to it failing (a full disk). The entries read back
- * as the session file holds them, and a full disk does not make a resume do
- * more work than the transcript's size calls for.
+ * create, its store directory one that other accounts can enter, every write
+ * to it failing (a full disk), or an image of an entry going cold that cannot
+ * be stored in the blob store. The entries read back as the session file
+ * holds them, and a full disk does not make a resume do more work than the
+ * transcript's size calls for.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import {
 	CURRENT_SESSION_VERSION,
 	type SessionEntry,
@@ -25,6 +29,14 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
 const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+/** Windows has no account ids or POSIX modes, so a shared store directory cannot be made there. */
+const HAS_POSIX_OWNERS = process.platform !== "win32" && process.getuid !== undefined;
+
+/** This account's store directory under `tmp`. */
+function coldDirIn(tmp: string): string {
+	const uid = process.getuid?.();
+	return path.join(tmp, uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
+}
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -273,4 +285,70 @@ describe("a resume and a running session work when the older-entry store cannot 
 			await manager.close();
 		},
 	);
+
+	// On a shared host another account can make the store directory first; entries must not go where it can read them.
+	it.skipIf(!HAS_POSIX_OWNERS)(
+		"keeps every entry whole and the session working when the store directory lets other accounts in",
+		async () => {
+			using dir = TempDir.createSync("@omp-cold-unusable-");
+			using tmp = TempDir.createSync("@omp-cold-unusable-tmp-");
+			const file = await writeSession(dir.path(), compactedSession());
+			const coldDir = coldDirIn(tmp.path());
+			fs.mkdirSync(coldDir);
+			fs.chmodSync(coldDir, 0o755);
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+
+			const manager = await open(file);
+			expect(manager.coldStoreStats().coldEntries).toBe(0);
+			expect(readEntries(manager)).toEqual(await entriesInFile(file));
+			const u3 = manager.appendMessage(user(`u3 ${BODY}`));
+			manager.appendCompaction(`c2 ${BODY}`, undefined, u3, 2000);
+			expect(manager.buildSessionContext().messages.map(message => message.role)).toEqual([
+				"compactionSummary",
+				"user",
+			]);
+			expect(manager.coldStoreStats().coldEntries).toBe(0);
+			expect(fs.readdirSync(coldDir)).toEqual([]);
+			await manager.close();
+		},
+	);
+
+	// A full disk under the blob store must not stop the context rebuild after a compaction.
+	it("builds the context after a compaction and keeps an entry whole when its image cannot be stored as it goes cold", async () => {
+		using dir = TempDir.createSync("@omp-cold-unusable-");
+		const image: ImageContent = {
+			type: "image",
+			data: Buffer.alloc(3000, 7).toString("base64"),
+			mimeType: "image/png",
+		};
+		const withImage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: `u1 ${BODY}` }, image],
+			timestamp: 1,
+		};
+		const file = await writeSession(dir.path(), [
+			{ type: "message", id: "u1", parentId: null, timestamp: TIMESTAMP, message: withImage },
+			{ type: "message", id: "a1", parentId: "u1", timestamp: TIMESTAMP, message: assistant(`a1 ${BODY}`) },
+			{ type: "message", id: "u2", parentId: "a1", timestamp: TIMESTAMP, message: user(`u2 ${BODY}`) },
+		]);
+		const manager = await open(file);
+		vi.spyOn(BlobStore.prototype, "putSync").mockImplementation(() => {
+			throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+		});
+
+		manager.appendCompaction(`summary ${BODY}`, undefined, "u2", 1000);
+		expect(manager.buildSessionContext().messages.map(message => message.role)).toEqual([
+			"compactionSummary",
+			"user",
+		]);
+		const u1 = manager.getEntry("u1");
+		if (!u1) throw new Error("missing entry u1");
+		expect(isColdEntry(u1)).toBe(false);
+		expect(u1.type === "message" ? u1.message : undefined).toEqual(withImage);
+		const a1 = manager.getEntry("a1");
+		if (!a1) throw new Error("missing entry a1");
+		expect(isColdEntry(a1)).toBe(true);
+		vi.restoreAllMocks();
+		await manager.close();
+	});
 });

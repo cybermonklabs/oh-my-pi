@@ -23,7 +23,11 @@ import type {
 	QueuedMessageTarget,
 	SteerOptions,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
-import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	attachIrcWakeTurnMonitor,
+	runSubagentFollowUpTurn,
+	runSubprocess,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	type AgentDefinition,
 	type SubagentLifecyclePayload,
@@ -31,6 +35,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { createSessionDefaults } from "./helpers/session-defaults";
 
 describe("handleRpcCancelSubagent", () => {
 	let registry: RpcSubagentRegistry;
@@ -702,6 +707,87 @@ describe("handleRpcCancelSubagent", () => {
 		expect(result).toMatchObject({ exitCode: 1, aborted: false });
 		// Kept alive as a finished agent, not tombstoned.
 		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+	}, 30_000);
+
+	// Regression: a host cancels a subagent whose run's drive threw (here the acceptance of its
+	// yielded result, a registry call, failed) while the run's cleanup still holds it, and the
+	// cancel kills and tombstones a subagent whose run already ended, where `cancel_subagent`
+	// answers `cancelled: false` for a run that is only being cleaned up.
+	test("cancel_subagent leaves a subagent idle whose run's drive threw while its cleanup still holds it", async () => {
+		const subagent = startSubagentAwaitingEvalJob();
+		vi.spyOn(AgentRegistry.global(), "markResultAccepted").mockImplementation(() => {
+			throw new Error("registry unreachable");
+		});
+		let atCleanup:
+			| { listed: string | undefined; refStatus: string | undefined; cancelled: Promise<boolean> }
+			| undefined;
+		// The host's cancel lands as the run's cleanup reaps its jobs, before the terminal
+		// lifecycle frame prunes the roster.
+		const reap = AsyncJobManager.prototype.cancelAndReapOwnerJobs;
+		vi.spyOn(AsyncJobManager.prototype, "cancelAndReapOwnerJobs").mockImplementation(function (
+			this: AsyncJobManager,
+			ownerId: string,
+			deadlineAt: number,
+		) {
+			atCleanup ??= {
+				listed: registry.getSubagents().find(snapshot => snapshot.id === subagent.id)?.status,
+				refStatus: AgentRegistry.global().get(subagent.id)?.status,
+				cancelled: handleRpcCancelSubagent(registry, subagent.id),
+			};
+			return reap.call(this, ownerId, deadlineAt);
+		});
+		await subagent.awaitingJob;
+		subagent.finishChild("child done");
+		const result = await subagent.run;
+
+		expect(atCleanup).toMatchObject({ listed: "running", refStatus: "idle" });
+		await expect(atCleanup?.cancelled).resolves.toBe(false);
+		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		// The yield the run delivered stands; the cancel did not stop the run.
+		expect(result).toMatchObject({ exitCode: 0, aborted: false });
+	}, 30_000);
+
+	// Regression: a host cancels a kept-alive subagent as its IRC wake turn ends, before the
+	// turn's terminal lifecycle frame prunes the roster, and the cancel kills and tombstones a
+	// subagent whose turn already ended, where `cancel_subagent` answers `cancelled: false`.
+	test("cancel_subagent leaves a subagent idle whose IRC wake turn ended while the turn's end is processed", async () => {
+		const id = "Worker";
+		let observer: ((records: unknown[]) => ((turnError?: unknown) => Promise<void>) | undefined) | undefined;
+		let cancelled: Promise<boolean> | undefined;
+		const session = {
+			...createSessionDefaults(),
+			subscribe: () => () => {},
+			setIrcWakeTurnObserver: (next: typeof observer) => {
+				observer = next;
+			},
+			trackIrcReply: () => {},
+			getLastAssistantMessage: () => {
+				// Read once the turn has ended: the host's cancel lands here.
+				cancelled ??= handleRpcCancelSubagent(registry, id);
+				return undefined;
+			},
+		} as unknown as AgentSession;
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			session,
+			sessionFile: path.join(sessionDir, `${id}.jsonl`),
+			status: "idle",
+		});
+		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		attachIrcWakeTurnMonitor(session, { id, agent, eventBus, storeMaskCwd: "/tmp" });
+		const turnEnded = observer?.([{ role: "user", content: "wake up" }]);
+		if (!turnEnded) throw new Error("wake-turn observer was not registered");
+		expect(registry.getSubagents().map(({ id, status }) => ({ id, status }))).toEqual([{ id, status: "running" }]);
+		// The turn runs and settles; the run-state mirror moves the ref.
+		AgentRegistry.global().setStatus(id, "running", session);
+		AgentRegistry.global().setStatus(id, "idle", session);
+
+		await turnEnded();
+
+		await expect(cancelled).resolves.toBe(false);
+		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 	}, 30_000);
 
 	test("steer_subagent refuses at once a subagent whose run ended with an error while its cleanup still holds it", async () => {

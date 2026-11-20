@@ -283,10 +283,6 @@ export async function* transcriptByteChunks(filePath: string, storage: SessionSt
 		yield* storage.readChunks(filePath);
 		return;
 	}
-	if (storage instanceof FileSessionStorage) {
-		yield* Bun.file(filePath).stream();
-		return;
-	}
 	yield new TextEncoder().encode(await storage.readText(filePath));
 }
 
@@ -785,19 +781,6 @@ async function missingSessionVisit(
 	throw err;
 }
 
-/**
- * Whether a transcript of `size` bytes streams from `storage` instead of being
- * read whole. An archived (gzipped) transcript is read whole, as
- * {@link shouldStreamEntries} reads it.
- */
-function streamsTranscript(storage: SessionStorage, filePath: string, size: number): boolean {
-	return (
-		size >= STREAM_LOAD_THRESHOLD_BYTES &&
-		(storage.readChunks !== undefined || storage instanceof FileSessionStorage) &&
-		!isArchivedSessionPath(filePath)
-	);
-}
-
 /** Visit the entries of a session read whole, as {@link visitSessionFile} visits a streamed one. */
 export function visitLoadedSession(
 	loaded: SessionLoadResult,
@@ -835,7 +818,7 @@ export async function visitSessionFile(
 	} catch (caught) {
 		return missingSessionVisit(caught, filePath, storage, options);
 	}
-	if (!streamsTranscript(storage, filePath, size))
+	if (!shouldStreamEntries(storage, filePath, size))
 		return visitLoadedSession(await loadSessionFile(filePath, storage, options), visit);
 
 	let malformedRecords = 0;
@@ -898,7 +881,7 @@ export async function probeSessionFile(
 ): Promise<{ header: SessionHeader | undefined; loaded: SessionLoadResult | undefined }> {
 	let streamed = false;
 	try {
-		streamed = streamsTranscript(storage, filePath, storage.statSync(filePath).size);
+		streamed = shouldStreamEntries(storage, filePath, storage.statSync(filePath).size);
 	} catch {
 		// A missing or unreadable path: the read below applies loadSessionFile's rules.
 	}
@@ -937,33 +920,14 @@ export async function loadEntriesFromFile(
 
 /**
  * Visit session entries, streaming large journals from any storage that has
- * `readChunks`. Small files and other storages keep the full-load path.
+ * `readChunks`: a {@link visitSessionFile} whose missing path throws.
  */
 export async function visitEntriesFromFile(
 	filePath: string,
 	visit: (entry: FileEntry) => void | boolean,
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<void> {
-	const size = storage.statSync(filePath).size;
-	if (shouldStreamEntries(storage, filePath, size)) {
-		let sawFirstEntry = false;
-		await visitEntriesFromFileStream(
-			filePath,
-			entry => {
-				if (!sawFirstEntry) {
-					sawFirstEntry = true;
-					if (!isValidSessionHeader(entry)) return false;
-				}
-				return visit(entry);
-			},
-			{ storage },
-		);
-		return;
-	}
-
-	for (const entry of (await loadWithKnownSize(filePath, storage, size)).loaded.entries) {
-		if (visit(entry) === false) return;
-	}
+	await visitSessionFile(filePath, storage, visit, { throwIfMissing: true });
 }
 
 function hasImageUrl(value: unknown): value is { image_url: string } {

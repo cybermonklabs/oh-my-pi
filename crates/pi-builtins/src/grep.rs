@@ -200,38 +200,30 @@ fn for_each_match_with<M: Matcher>(
 }
 
 /// The longest non-empty match that one of `patterns`, each compiled alone,
-/// finds starting at `start` in `line`.
-///
-/// `next` holds, for each pattern, its leftmost match at or after the last
-/// position asked in this line (`Some(None)`: none), or `None` until asked.
-/// A pattern is searched again only once `start` passes that match, so asked
-/// at each position of a long line, each pattern scans the line once.
+/// finds starting at `start` in `line`. `next` holds, for each pattern, its
+/// next match in this line; see [`bre::next_match`].
 fn longest_match_at(
 	patterns: &[Engine],
-	next: &mut [Option<Option<grep_matcher::Match>>],
+	next: &mut [bre::CachedMatch],
 	line: &[u8],
 	start: usize,
 ) -> io::Result<Option<grep_matcher::Match>> {
-	let mut longest: Option<grep_matcher::Match> = None;
+	let mut longest: Option<(usize, usize)> = None;
 	for (pattern, cached) in patterns.iter().zip(next.iter_mut()) {
-		let found = match *cached {
-			Some(found) if found.is_none_or(|found| found.start() >= start) => found,
-			_ => {
-				let found = pattern
-					.find_at(line, start)
-					.map_err(|error| io::Error::other(error.to_string()))?;
-				*cached = Some(found);
-				found
-			},
-		};
-		if let Some(found) = found
-			&& found.start() == start
-			&& found.end() > longest.map_or(start, |best| best.end())
+		let found = bre::next_match(cached, start, || {
+			pattern
+				.find_at(line, start)
+				.map(|found| found.map(|found| (found.start(), found.end())))
+				.map_err(|error| io::Error::other(error.to_string()))
+		})?;
+		if let Some((at, end)) = found
+			&& at == start
+			&& end > longest.map_or(start, |(_, best)| best)
 		{
-			longest = Some(found);
+			longest = Some((at, end));
 		}
 	}
-	Ok(longest)
+	Ok(longest.map(|(at, end)| grep_matcher::Match::new(at, end)))
 }
 
 #[derive(Parser, Debug)]
@@ -564,9 +556,13 @@ struct Options {
 }
 
 /// The alternatives of a `-o` search - the branches of each pattern's
-/// alternation - compiled one by one at the first match that needs them,
-/// once for every file and worker of the search.
+/// alternation - compiled at the first match that needs them, once for
+/// every file and worker of the search; see [`pattern_alternatives`].
 struct Alternatives {
+	/// The alternatives that are plain strings, longest first, searched as
+	/// one engine.
+	literals:     Vec<String>,
+	/// The other alternatives, each searched alone.
 	patterns:     Vec<String>,
 	spec:         MatcherSpec,
 	engines:      OnceLock<Option<Vec<Engine>>>,
@@ -575,8 +571,9 @@ struct Alternatives {
 }
 
 impl Alternatives {
-	/// Each alternative's engine, for a line that is not UTF-8 when `bytes`,
-	/// compiled on the first call.
+	/// The engine of the plain strings, if any, then each other
+	/// alternative's, for a line that is not UTF-8 when `bytes`, compiled on
+	/// the first call.
 	fn engines(&self, bytes: bool) -> Option<&[Engine]> {
 		let (engines, spec) = if bytes {
 			(&self.byte_engines, MatcherSpec { bytes: true, ..self.spec })
@@ -585,12 +582,21 @@ impl Alternatives {
 		};
 		engines
 			.get_or_init(|| {
-				// An alternative that fails to compile alone gives up the
+				// At a position the plain strings' engine takes the first
+				// string that matches there, which is the longest. An
+				// alternative that fails to compile gives up the
 				// longest-match search; the engine's own match is printed
 				// then.
-				self.patterns
-					.iter()
-					.map(|pattern| build_matcher(std::slice::from_ref(pattern), spec).ok())
+				let literals = (!self.literals.is_empty())
+					.then(|| build_matcher(&self.literals, MatcherSpec { mode: MatchMode::Fixed, ..spec }));
+				literals
+					.into_iter()
+					.chain(
+						self.patterns
+							.iter()
+							.map(|pattern| build_matcher(std::slice::from_ref(pattern), spec)),
+					)
+					.map(Result::ok)
 					.collect()
 			})
 			.as_deref()
@@ -802,30 +808,58 @@ struct LongOption {
 	takes_value: bool,
 }
 
+/// The parser's own definition, built, which the option tables below read.
+fn built_command() -> clap::Command {
+	let mut command = GrepArgs::command();
+	command.build();
+	command
+}
+
+/// Whether `arg` takes the next argument as its value: it needs one, where
+/// `--color`'s is optional.
+fn takes_value(arg: &clap::Arg) -> bool {
+	arg.get_num_args().is_some_and(|range| range.min_values() > 0)
+}
+
 /// Every long option, read from the parser's own definition, so whether a
 /// long option takes the next argument is known for every name and
 /// abbreviation clap accepts (`--bef 1` is `--before-context 1`). An option
 /// whose value is optional (`--color`) does not take the next argument.
 static LONG_OPTIONS: LazyLock<Vec<LongOption>> = LazyLock::new(|| {
-	let mut command = GrepArgs::command();
-	command.build();
-	command
+	built_command()
 		.get_arguments()
 		.filter_map(|arg| {
 			let mut names = vec![arg.get_long()?.to_owned()];
 			if let Some(aliases) = arg.get_all_aliases() {
 				names.extend(aliases.into_iter().map(str::to_owned));
 			}
-			let takes_value = arg.get_num_args().is_some_and(|range| range.min_values() > 0);
-			Some(LongOption { names, takes_value })
+			Some(LongOption { names, takes_value: takes_value(arg) })
 		})
 		.collect()
 });
 
+/// The short options that take a value (`-e`, `-m`, `-A`, ...), read from
+/// the parser's own definition as [`LONG_OPTIONS`] is.
+static SHORT_VALUE_OPTIONS: LazyLock<Vec<char>> = LazyLock::new(|| {
+	built_command()
+		.get_arguments()
+		.filter(|arg| takes_value(arg))
+		.filter_map(clap::Arg::get_short)
+		.collect()
+});
+
+/// The long options `grep` has and GNU grep 3.11 does not. getopt reads a
+/// prefix as the one option it begins, so where a prefix also begins one of
+/// these it is read as GNU's option: `--inc` is `--include`, where it also
+/// begins `--include-dir`, and `--m` is `--max-count`, where it also begins
+/// `--mmap`.
+const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = ["include-dir", "mmap"];
+
 /// The long option `name` names, exactly or as the abbreviation getopt
 /// accepts: a prefix of the names of one option alone, so `--regex` is
 /// `--regexp` and `--col` is `--color`, whose alias `--colour` is the same
-/// option.
+/// option, or, where it also begins one of [`BUILTIN_ONLY_LONG_OPTIONS`], of
+/// one of GNU's options alone.
 fn long_option(name: &str) -> Option<&'static LongOption> {
 	if name.is_empty() {
 		return None;
@@ -833,26 +867,31 @@ fn long_option(name: &str) -> Option<&'static LongOption> {
 	if let Some(option) = LONG_OPTIONS.iter().find(|option| option.names.iter().any(|n| n == name)) {
 		return Some(option);
 	}
-	let mut named = LONG_OPTIONS
-		.iter()
-		.filter(|option| option.names.iter().any(|n| n.starts_with(name)));
-	let option = named.next()?;
-	named.next().is_none().then_some(option)
+	let begins = |option: &&LongOption| option.names.iter().any(|n| n.starts_with(name));
+	only(LONG_OPTIONS.iter().filter(begins)).or_else(|| {
+		only(
+			LONG_OPTIONS
+				.iter()
+				.filter(begins)
+				.filter(|option| !BUILTIN_ONLY_LONG_OPTIONS.contains(&option.names[0].as_str())),
+		)
+	})
 }
 
-/// Whether `long`, a long option or the abbreviation of one without its
-/// `--`, takes the next argument as its value: one with no value attached
-/// that needs one.
-fn long_option_takes_next_value(long: &str) -> bool {
-	!long.contains('=') && long_option(long).is_some_and(|option| option.takes_value)
+/// The one item `items` yields, `None` where it yields none or several.
+fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+	let item = items.next()?;
+	items.next().is_none().then_some(item)
 }
 
 /// Rewrites what clap reads otherwise than GNU grep: a context count becomes
 /// `--context=N`, as an argument of digits (`-5`) and as each run of digits
-/// in a group of short options (`-5e mid`, `-n2e mid`), and an option's value
+/// in a group of short options (`-5e mid`, `-n2e mid`), an option's value
 /// attached with a leading `=` (`-e=x`, `-ve=x`) is passed apart, as clap
-/// would drop the `=`. clap itself reads an abbreviated long option
-/// (`--regex=zz`), and refuses an ambiguous one, as GNU does.
+/// would drop the `=`, and an abbreviated long option is written out in full
+/// as getopt resolves it (`--regex=zz` is `--regexp=zz`, and `--inc` is
+/// `--include`; see [`long_option`]). clap refuses an ambiguous one, as GNU
+/// does.
 ///
 /// A group is read as getopt reads it with GNU grep's digit options: a run of
 /// digits is one count (`-15`), and a later count replaces it (`-5n3` is
@@ -874,8 +913,17 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		let Some(text) = arg.to_str() else { normalized.push(arg); continue };
 		if text == "--" { literal = true; normalized.push(arg); continue }
 		if let Some(long) = text.strip_prefix("--") {
-			value_pending = long_option_takes_next_value(long);
-			normalized.push(arg);
+			let (name, value) =
+				long.split_once('=').map_or((long, None), |(name, value)| (name, Some(value)));
+			let option = long_option(name);
+			value_pending = value.is_none() && option.is_some_and(|option| option.takes_value);
+			match option.filter(|option| !option.names.iter().any(|n| n == name)) {
+				Some(option) => normalized.push(OsString::from(match value {
+					Some(value) => format!("--{}={value}", option.names[0]),
+					None => format!("--{}", option.names[0]),
+				})),
+				None => normalized.push(arg),
+			}
 			continue;
 		}
 		let Some(group) = text.strip_prefix('-') else { normalized.push(arg); continue };
@@ -883,7 +931,7 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		// and the rest of the group, its value.
 		let (options, valued) = group.split_at(
 			group
-				.find(|option: char| matches!(option, 'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'D' | 'd'))
+				.find(|option: char| SHORT_VALUE_OPTIONS.contains(&option))
 				.unwrap_or(group.len()),
 		);
 		value_pending = valued.len() == 1;
@@ -1030,9 +1078,11 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 		// A fixed string, `-P` having been compiled above. The longest come
 		// first, so at the leftmost position a match starts the engine takes
 		// the longest string that matches there, as GNU's `-o` prints it:
-		// `grep -oF -e a -e ab` prints `ab`.
+		// `grep -oF -e a -e ab` prints `ab`. They are counted in characters,
+		// as many as a string matches without case too, where its bytes may
+		// differ (`ſ` folds to `s`).
 		let mut longest_first: Vec<&String> = patterns.iter().collect();
-		longest_first.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
+		longest_first.sort_by_cached_key(|pattern| std::cmp::Reverse(pattern.chars().count()));
 		let escaped: Vec<String> = longest_first
 			.into_iter()
 			.map(|pattern| regex_syntax(regex::escape(pattern), spec))
@@ -1047,7 +1097,8 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 	// pattern is compiled with PCRE2 - the engine `-P` already uses - rather
 	// than refused or searched as the text `\1`.
 	if patterns.iter().any(|pattern| bre::has_backreference(pattern)) {
-		let translated = translate_patterns(patterns, dialect, bre::Target::Pcre, spec.ignore_case)?;
+		let target = if spec.bytes { bre::Target::PcreBytes } else { bre::Target::Pcre };
+		let translated = translate_patterns(patterns, dialect, target, spec.ignore_case)?;
 		return build_pcre_matcher(&translated, spec);
 	}
 	let target = if spec.bytes { bre::Target::RustBytes } else { bre::Target::Rust };
@@ -1061,17 +1112,29 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 		.map_err(|error| error.to_string())
 }
 
+/// The most alternatives that are not plain strings `-o` searches one by
+/// one. Each is an engine of its own, compiled once and run at every match
+/// printed, so `grep -o -f` of thousands of patterns would compile and run
+/// thousands; past this many the patterns are searched as one engine, which
+/// prints the match its alternation prefers where two alternatives match at
+/// one position, not always the longest that GNU prints.
+const SEPARATE_ALTERNATIVE_LIMIT: usize = 64;
+
 /// The alternatives of every pattern, for the longest match `-o` prints at
 /// each position, or `None` where searching them apart can print nothing the
-/// patterns together do not.
-fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Vec<String>> {
+/// patterns together do not, or where more than
+/// [`SEPARATE_ALTERNATIVE_LIMIT`] would be searched alone.
+///
+/// The alternatives that are plain strings are searched as one engine,
+/// longest first, which at a position takes the longest that matches there;
+/// each other alternative is searched alone.
+fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Alternatives> {
 	// `-P` is PCRE2, which prefers the first branch of an alternation as
 	// GNU's own `-P` does. Under `-x` a match is the whole line, so there is
 	// no longer one. Fixed strings come longest first (see `build_matcher`),
-	// which picks the longest at each position by itself; under `-i` a
-	// folded string can match more or fewer bytes than it holds, and under
-	// `-w` the word test sits outside the alternation, so there each string
-	// is still searched alone.
+	// which picks the longest at each position by itself, except where `-i`
+	// or `-w` make the main engine's strings longer or shorter than their
+	// text.
 	if spec.mode == MatchMode::Perl
 		|| spec.line_regexp
 		|| (spec.mode == MatchMode::Fixed && !spec.ignore_case && !spec.word)
@@ -1079,20 +1142,48 @@ fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Vec<St
 		return None;
 	}
 	let dialect = dialect_of(spec.mode);
-	let mut all = Vec::with_capacity(patterns.len());
+	let mut literals = Vec::new();
+	let mut others = Vec::new();
 	for pattern in patterns {
-		match dialect {
-			Some(dialect) => all.extend(bre::alternatives(pattern, dialect, bre::Split::Grep)),
-			None => all.push(pattern.clone()),
+		let split = match dialect {
+			Some(dialect) => bre::alternatives(pattern, dialect, bre::Split::Grep),
+			None => vec![pattern.clone()],
+		};
+		for alternative in split {
+			// An alternative that can only match the empty string is never
+			// printed; `grep -o -e '' -e zz` prints the matches of `zz`.
+			if alternative.is_empty() {
+				continue;
+			}
+			if dialect.is_none_or(|dialect| bre::is_literal(&alternative, dialect)) {
+				literals.push(alternative);
+			} else {
+				others.push(alternative);
+			}
 		}
 	}
-	// An alternative that can only match the empty string is never printed;
-	// `grep -o -e '' -e zz` prints the matches of `zz`.
-	all.retain(|alternative| !alternative.is_empty());
+	if others.len() > SEPARATE_ALTERNATIVE_LIMIT {
+		return None;
+	}
 	// One alternative that is the whole pattern answers exactly what the
 	// search already found, so there is nothing to compile for it.
-	let trivial = all.len() == 1 && patterns.len() == 1 && all[0] == patterns[0];
-	(!all.is_empty() && !trivial).then_some(all)
+	let sole = match (literals.as_slice(), others.as_slice()) {
+		([alternative], []) | ([], [alternative]) => Some(alternative),
+		_ => None,
+	};
+	let trivial = patterns.len() == 1 && sole == patterns.first();
+	if trivial || (literals.is_empty() && others.is_empty()) {
+		return None;
+	}
+	// Counted in characters, as `build_matcher` counts fixed strings.
+	literals.sort_by_cached_key(|literal| std::cmp::Reverse(literal.chars().count()));
+	Some(Alternatives {
+		literals,
+		patterns: others,
+		spec,
+		engines: OnceLock::new(),
+		byte_engines: OnceLock::new(),
+	})
 }
 
 /// Whether `patterns` read a line that is not UTF-8 as they read text: none
@@ -1372,7 +1463,7 @@ struct GrepSink<'a, M: Matcher, W: Write> {
 	after_left:   Option<usize>,
 	/// Where each alternative alone next matches in the line `-o` prints;
 	/// see [`longest_match_at`]. Kept to be reused from line to line.
-	next_matches: Vec<Option<Option<grep_matcher::Match>>>,
+	next_matches: Vec<bre::CachedMatch>,
 }
 
 impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
@@ -1417,11 +1508,13 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 	}
 
 	/// Writes the `--` (or `--group-separator`) between two groups of lines,
-	/// unless `--no-group-separator` asked for none.
+	/// unless `--no-group-separator` asked for none. It ends with a newline
+	/// under `-z` too, as GNU ends it: `printf 'a\0x\0y\0a\0' | grep -z -C0
+	/// a` prints `a\0--\na\0`.
 	fn write_group_separator(&mut self) -> io::Result<()> {
 		if let Some(separator) = &self.opts.group_separator {
 			self.out.write_all(separator)?;
-			self.out.write_all(&[self.opts.record.terminator])?;
+			self.out.write_all(b"\n")?;
 			self.flush_record()?;
 		}
 		Ok(())
@@ -2613,17 +2706,8 @@ impl AsyncUtility for Grep {
 	// `GrepSink::print_only_matching`. The lines `-v` selects hold no match,
 	// and `-c`, `-l`, `-L` and `-q` print none.
 	let prints_matches = cli.only_matching && !cli.invert && !output_suppressed;
-	let alternatives = prints_matches
-		.then(|| pattern_alternatives(&patterns, spec))
-		.flatten()
-		.map(|patterns| {
-			Arc::new(Alternatives {
-				patterns,
-				spec,
-				engines: OnceLock::new(),
-				byte_engines: OnceLock::new(),
-			})
-		});
+	let alternatives =
+		prints_matches.then(|| pattern_alternatives(&patterns, spec)).flatten().map(Arc::new);
 	let terminator = if cli.null_data { b'\0' } else { b'\n' };
 
 	// `-o` prints no context line, and GNU still groups its output by the
@@ -3990,6 +4074,87 @@ mod tests {
 		assert_eq!(selected.0, 2000);
 		let read = read.load(Ordering::Relaxed);
 		assert!(read <= 4 * haystack.len(), "the engines read {read} bytes of a {}-byte input", haystack.len());
+	}
+
+	/// The spec of a plain BRE search.
+	const BRE_SPEC: MatcherSpec = MatcherSpec {
+		mode:        MatchMode::Default,
+		ignore_case: false,
+		word:        false,
+		line_regexp: false,
+		null_data:   false,
+		jit:         false,
+		bytes:       false,
+	};
+
+	#[test]
+	fn only_matching_searches_the_plain_strings_as_one_engine() {
+		// If this regresses, `grep -o -f words` of thousands of plain words
+		// compiles an engine per word and runs each at every match printed,
+		// where one engine of them all, longest first, prints the same.
+		let words: Vec<String> = (0..1000).map(|n| format!("w{n}")).collect();
+		let alternatives = pattern_alternatives(&words, BRE_SPEC).expect("searched apart");
+		assert_eq!(alternatives.literals.len(), 1000);
+		assert!(alternatives.patterns.is_empty());
+		assert_eq!(alternatives.engines(false).map(<[Engine]>::len), Some(1));
+		// Longest first, counted in characters.
+		let words = ["a", "ab", "\u{17f}\u{17f}", "abc"].map(str::to_owned);
+		let alternatives = pattern_alternatives(&words, BRE_SPEC).expect("searched apart");
+		assert_eq!(alternatives.literals, ["abc", "ab", "\u{17f}\u{17f}", "a"]);
+		// The others are searched alone, beside the strings' one engine.
+		let mixed = ["ab", "a\\+", "b*c", "x"].map(str::to_owned);
+		let alternatives = pattern_alternatives(&mixed, BRE_SPEC).expect("searched apart");
+		assert_eq!(alternatives.literals, ["ab", "x"]);
+		assert_eq!(alternatives.patterns, ["a\\+", "b*c"]);
+		assert_eq!(alternatives.engines(false).map(<[Engine]>::len), Some(3));
+	}
+
+	#[test]
+	fn only_matching_searches_at_most_the_limit_of_other_alternatives_alone() {
+		// If this regresses, `grep -o -f` of thousands of patterns that are
+		// not plain strings compiles and runs an engine per pattern at every
+		// match printed; past the limit they are searched as one engine.
+		let patterns = |count: usize| -> Vec<String> { (0..count).map(|n| format!("w{n}.")).collect() };
+		let alternatives = pattern_alternatives(&patterns(SEPARATE_ALTERNATIVE_LIMIT), BRE_SPEC);
+		assert_eq!(alternatives.map(|alternatives| alternatives.patterns.len()), Some(SEPARATE_ALTERNATIVE_LIMIT));
+		assert!(pattern_alternatives(&patterns(SEPARATE_ALTERNATIVE_LIMIT + 1), BRE_SPEC).is_none());
+		// Plain strings do not count against it.
+		let mut mixed = patterns(SEPARATE_ALTERNATIVE_LIMIT);
+		mixed.extend((0..1000).map(|n| format!("p{n}")));
+		assert!(pattern_alternatives(&mixed, BRE_SPEC).is_some());
+	}
+
+	#[test]
+	fn a_long_option_abbreviation_is_read_as_gnu_grep_reads_it() {
+		// If this regresses, `grep -r --inc='*.x' foo tree` exits 2 because
+		// `--inc` also begins `--include-dir`, an option GNU grep lacks,
+		// where GNU reads it as `--include`.
+		let argv = ["grep", "--inc=*.x", "--m", "1", "--regex=zz", "--colo", "--in", "-n2e", "--x"];
+		let normalized = normalize_context_args(argv.into_iter().map(OsString::from).collect());
+		assert_eq!(normalized, [
+			"grep",
+			"--include=*.x",
+			"--max-count",
+			"1",
+			"--regexp=zz",
+			"--color",
+			// Ambiguous to GNU as well.
+			"--in",
+			"-n",
+			"--context=2",
+			"-e",
+			// The value of `-e`.
+			"--x",
+		]);
+	}
+
+	#[test]
+	fn the_short_options_that_take_a_value_are_read_from_the_parser() {
+		// If this regresses, a group such as `-n2e mid` no longer passes
+		// `mid` to `-e`, or reads an option's value as options.
+		let mut short = SHORT_VALUE_OPTIONS.clone();
+		short.sort_unstable();
+		assert_eq!(short, ['A', 'B', 'C', 'D', 'd', 'e', 'f', 'm']);
 	}
 }
 

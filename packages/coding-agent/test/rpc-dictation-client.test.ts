@@ -1,61 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-
-interface Request {
-	id: string;
-	type: string;
-	captureId?: string;
-}
-
-function fakeAgent() {
-	const exited = Promise.withResolvers<number>();
-	const requests: Request[] = [];
-	const encoder = new TextEncoder();
-	let output!: ReadableStreamDefaultController<Uint8Array>;
-	const proc: RpcAgentProcess = {
-		stdin: {
-			write(data) {
-				requests.push(JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data)) as Request);
-				return 0;
-			},
-		},
-		stdout: new ReadableStream<Uint8Array>({
-			start(controller) {
-				output = controller;
-				controller.enqueue(encoder.encode('{"type":"ready"}\n'));
-			},
-		}),
-		peekStderr: () => "",
-		kill: () => exited.resolve(0),
-		exited: exited.promise,
-	};
-	return {
-		proc,
-		requests,
-		emit(frame: unknown) {
-			output.enqueue(encoder.encode(`${JSON.stringify(frame)}\n`));
-		},
-		reply(request: Request, data?: unknown) {
-			output.enqueue(
-				encoder.encode(
-					`${JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data })}\n`,
-				),
-			);
-		},
-	};
-}
-
-// Only scale timers while issuing a request; restore the global before awaiting anything.
-function withScaledDeadline<T>(send: () => T): T {
-	const original = globalThis.setTimeout;
-	globalThis.setTimeout = ((callback: () => void, delay?: number) =>
-		original(callback, (delay ?? 0) / 300)) as typeof setTimeout;
-	try {
-		return send();
-	} finally {
-		globalThis.setTimeout = original;
-	}
-}
+import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { fakeRpcAgent as fakeAgent, withScaledDeadline } from "./helpers/fake-rpc-agent";
 
 describe("RpcClient dictation start deadlines", () => {
 	test("cold start can finish after an ordinary request has timed out", async () => {

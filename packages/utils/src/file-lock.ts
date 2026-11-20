@@ -40,6 +40,27 @@ function tryAcquireLock(lockPath: string): NativeFileLock | null {
 }
 
 /**
+ * One attempt of a waiting loop: claim the lease unless the native probe finds
+ * it held. On Linux a claim of a lease another process holds blocks the thread
+ * for about 50 ms before it answers (see {@link tryAcquireFileLock}), while the
+ * probe answers at once, so a loop that waits for a holder does not stall its
+ * thread on every attempt. A wrong "held" (under gVisor a probe can still reach
+ * a just-released name) costs the loop one retry delay, so the loop's last
+ * attempt claims without the probe, and a probe that fails leaves the answer to
+ * the claim.
+ */
+function attemptLock(lockPath: string, lastAttempt: boolean): NativeFileLock | null {
+	if (!lastAttempt) {
+		try {
+			if (NativeFileLock.isHeld(lockPath)) return null;
+		} catch {
+			// No probe on this platform, or it failed: the claim decides.
+		}
+	}
+	return tryAcquireLock(lockPath);
+}
+
+/**
  * Acquire an exclusive lease without waiting for its holder to release it;
  * `null` while another holder owns it. On Linux a refused claim is retried,
  * because under gVisor a probe can make a free lease look taken for a few
@@ -62,14 +83,18 @@ export function isFileLockHeld(filePath: string): boolean {
 	return NativeFileLock.isHeld(getLockPath(filePath));
 }
 
-/** Acquire an exclusive lease; callers must release it when their operation ends. */
+/**
+ * Acquire an exclusive lease; callers must release it when their operation ends.
+ * While another holder owns it, each attempt but the last only probes the lease,
+ * so the wait does not block the event loop between the retry delays.
+ */
 export async function acquireFileLock(filePath: string, options: FileLockOptions = {}): Promise<FileLockHandle> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		opts.signal?.throwIfAborted();
-		const lock = tryAcquireLock(lockPath);
+		const lock = attemptLock(lockPath, attempt + 1 === opts.retries);
 		if (lock) return lock;
 		if (attempt + 1 < opts.retries) await scheduler.wait(opts.retryDelayMs, { signal: opts.signal });
 	}
@@ -83,7 +108,7 @@ function acquireLockSync(filePath: string, options: FileLockOptions = {}): Nativ
 
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		opts.signal?.throwIfAborted();
-		const lock = tryAcquireLock(lockPath);
+		const lock = attemptLock(lockPath, attempt + 1 === opts.retries);
 		if (lock) return lock;
 		if (attempt + 1 < opts.retries && opts.retryDelayMs > 0) Bun.sleepSync(opts.retryDelayMs);
 	}

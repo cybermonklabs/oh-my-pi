@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ConcatSink, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { ConcatSink, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
 import {
 	childDirNames,
@@ -297,11 +297,22 @@ function sweepStaleSpools(dir: string): void {
 
 /**
  * Spool `lines` to a new file under {@link spoolDir}, iterating them once,
- * counting its bytes and reading the title slot from its first line.
+ * counting its bytes and reading the title slot from its first line. Throws
+ * when the directory or the file cannot be made, opened or written, and,
+ * where accounts have ids, when the directory is not one this account owns
+ * that no other account can enter: another account can make the shared name
+ * first, or plant a symlink there. A file it opened is closed and removed.
  */
 function spoolLines(lines: Iterable<string>): BodySpool {
 	const dir = spoolDir();
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const uid = process.getuid?.();
+	if (uid !== undefined) {
+		const st = fs.lstatSync(dir);
+		if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) {
+			throw new Error(`Session spool directory ${dir} is not a private directory owned by this user`);
+		}
+	}
 	const windows = process.platform === "win32";
 	if (windows) sweepStaleSpools(dir);
 	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
@@ -391,6 +402,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
 	readonly #refreshWindows = new Set<Set<string>>();
 	#firstDrainError: Error | undefined;
+	/** Set once this store warned that a full rewrite could not use the spool. */
+	#spoolFailureLogged = false;
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		const actualSize = this.#index.get(path)?.size ?? null;
@@ -502,10 +515,12 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextSync}: spools `lines`, iterated once, to a
-	 * temporary file and publishes it from there, so the body is never one
-	 * string. A subclass or spy that intercepts {@link writeTextSync} still sees
-	 * every full rewrite: the lines are then joined and routed through it.
+	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
+	 * publishes it from there, so the body is never one string. When the spool
+	 * cannot be used it publishes the joined lines instead (see
+	 * {@link #linesBody}). A subclass or spy that intercepts
+	 * {@link writeTextSync} still sees every full rewrite: the lines are then
+	 * joined and routed through it.
 	 */
 	writeLinesSync(path: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void {
 		if (this.writeTextSync !== IndexedSessionStorage.prototype.writeTextSync) {
@@ -513,7 +528,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			return;
 		}
 		this.#assertExpectedSize(path, options?.expectedSize);
-		this.#queueFullWrite(path, this.#spoolBody(path, spoolLines(lines)), options?.expectedSize);
+		this.#queueFullWrite(path, this.#linesBody(path, lines), options?.expectedSize);
 	}
 
 	/** Install `body` in the index and queue its publish, tracked by {@link drain}. */
@@ -561,6 +576,32 @@ export class IndexedSessionStorage implements SessionStorage {
 			},
 			release: () => spool.close(),
 		};
+	}
+
+	/**
+	 * The body of a full rewrite of `lines`: spooled to a temporary file, or,
+	 * when the spool cannot be made, opened or written (`os.tmpdir()` read-only
+	 * or full, or its spool directory not private to this account), the joined
+	 * lines, as {@link writeTextSync} publishes them, with one warning per
+	 * store. The join reads `lines` again, so an iterator, which yields its
+	 * lines only once, is read into an array first.
+	 */
+	#linesBody(path: string, lines: Iterable<string>): FullBody {
+		// An iterator is its own iterable, and yields its lines only once.
+		const iterator: unknown = lines[Symbol.iterator]();
+		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
+		try {
+			return this.#spoolBody(path, spoolLines(readable));
+		} catch (err) {
+			if (!this.#spoolFailureLogged) {
+				this.#spoolFailureLogged = true;
+				logger.warn("Session rewrites are joined in memory: their spool file cannot be used", {
+					dir: spoolDir(),
+					error: toError(err).message,
+				});
+			}
+			return this.#textBody(path, Array.from(readable).join(""));
+		}
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
@@ -741,17 +782,18 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextAtomic}: spools `lines`, iterated once, to a
-	 * temporary file and publishes it from there, and after a failed publish
-	 * compares the stored bytes with the spool by size and SHA-256. A subclass or
-	 * spy that intercepts {@link writeTextAtomic} still sees every full rewrite:
-	 * the lines are then joined and routed through it.
+	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
+	 * publishes it from there, and after a failed publish compares the stored
+	 * bytes with the spool by size and SHA-256. When the spool cannot be used
+	 * it publishes the joined lines instead (see {@link #linesBody}). A
+	 * subclass or spy that intercepts {@link writeTextAtomic} still sees every
+	 * full rewrite: the lines are then joined and routed through it.
 	 */
 	async writeLinesAtomic(path: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void> {
 		if (this.writeTextAtomic !== IndexedSessionStorage.prototype.writeTextAtomic) {
 			return this.writeTextAtomic(path, Array.from(lines).join(""), options);
 		}
-		await this.#publishAtomic(path, options, () => this.#spoolBody(path, spoolLines(lines)));
+		await this.#publishAtomic(path, options, () => this.#linesBody(path, lines));
 	}
 
 	/**

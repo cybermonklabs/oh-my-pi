@@ -41,7 +41,6 @@ import {
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import {
-	belongsCold,
 	type ColdBoundary,
 	ColdEntryStore,
 	coldBoundary,
@@ -51,6 +50,7 @@ import {
 	convertToColdEntry,
 	copyColdEntry,
 	hydrateColdEntry,
+	hydrateKeptEntries,
 	keptWholeByKind,
 	LoadedValueInterner,
 	isColdEntry,
@@ -992,6 +992,17 @@ export interface ColdStoreStats {
 	hydrations: number;
 }
 
+/** Options of {@link SessionManager.buildSessionContext}. */
+export interface SessionContextBuildOptions extends BuildSessionContextOptions {
+	/**
+	 * The build only measures the context (`model`'s, for a fit check) and does
+	 * not become the agent's context: it adopts no model and moves no cut, so
+	 * every entry stays cold or whole as it is, and a cold one is read through
+	 * its accessors.
+	 */
+	measureOnly?: boolean;
+}
+
 /** A session file streamed into memory, its older entries cold; see `SessionManager.#loadTranscript`. */
 interface LoadedTranscript extends SessionFileVisit {
 	/** `undefined` when the file holds no entries (or is missing). */
@@ -1446,7 +1457,12 @@ export class SessionManager {
 	#coldStoreUnavailable = false;
 	/** The model the cut was last computed for (see `coldCutPathIndex`); unset until a context build names one. */
 	#coldCutModel: Model | undefined;
-	/** The leaf, the entries or the newest compaction changed since the cut was last applied. */
+	/**
+	 * The leaf, the entries, the newest compaction or the model changed since
+	 * the cut was last applied: set by {@link #setLeaf}, {@link #reindexEntries},
+	 * {@link #recordEntry} for a compaction or a model change, and
+	 * {@link #resetColdCut} when asked.
+	 */
 	#coldCutStale = false;
 
 	/** A full body reached the session file and nothing has replaced it since; crosses the lazy file-creation gate. */
@@ -3720,7 +3736,7 @@ export class SessionManager {
 
 		this.#entries = [];
 		this.#index.clear();
-		this.#resetColdCut(undefined);
+		this.#resetColdCut(undefined, false);
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#loadedMalformedRecords = 0;
@@ -3753,7 +3769,13 @@ export class SessionManager {
 		this.#adoptHeader(header);
 		this.#entries = entries;
 		warnRepairedUsage(normalizeLoadedUsage(entries));
-		this.#index.rebuild(entries);
+		this.#reindexEntries();
+	}
+
+	/** Index `#entries` again after they changed as a whole; the cut is computed again at the next context build. */
+	#reindexEntries(): void {
+		this.#index.rebuild(this.#entries);
+		this.#coldCutStale = true;
 	}
 
 	/** Take the session's identity and title from a loaded `header`. */
@@ -3765,12 +3787,16 @@ export class SessionManager {
 		this.#titleUpdatedAt = header.timestamp;
 	}
 
-	/** Start over with `store` as the cold store: the cut is computed again, for no model yet. */
-	#resetColdCut(store: ColdEntryStore | undefined): void {
+	/**
+	 * Start over with `store` as the cold store: the cut is computed again, for
+	 * no model yet, at the next context build when `stale`, else once a trigger
+	 * marks it stale.
+	 */
+	#resetColdCut(store: ColdEntryStore | undefined, stale: boolean): void {
 		this.#adoptColdStore(store);
 		this.#coldStoreUnavailable = false;
 		this.#coldCutModel = undefined;
-		this.#coldCutStale = false;
+		this.#coldCutStale = stale;
 	}
 
 	/** Make `store` the one new cold entries go to, holding it in place of the previous one. */
@@ -3814,28 +3840,25 @@ export class SessionManager {
 			convertColdEntries(entries, boundary, () => this.#openColdStore());
 			return;
 		}
-		for (let index = 0; index < entries.length; index++) {
-			if (!belongsCold(boundary, index)) hydrateColdEntry(entries[index]!);
-		}
+		hydrateKeptEntries(entries, boundary);
 	}
 
 	/**
 	 * The boundary to apply before the next context build, or undefined when
 	 * the last one still holds. A trigger (load, compaction, branch move, model
-	 * change) marks it stale; the first build that names a model after one
-	 * adopts that model, whose readable compaction can start the context
-	 * earlier.
+	 * change) marks it stale. A build that names a model whose provider or API
+	 * differs from the model the cut was computed for adopts that model, whose
+	 * readable compaction can start the context earlier, and computes the cut
+	 * again: the context built for a model switched to reads no cold entry. A
+	 * build that only measures (`measureOnly`) changes neither.
 	 */
-	#staleColdBoundary(options: BuildSessionContextOptions | undefined): ColdBoundary | undefined {
-		if (!this.#coldStoreEnabled) return undefined;
+	#staleColdBoundary(options: SessionContextBuildOptions | undefined): ColdBoundary | undefined {
+		if (!this.#coldStoreEnabled || options?.measureOnly) return undefined;
 		const model = options?.transcript ? undefined : options?.model;
 		const current = this.#coldCutModel;
-		if (model && (this.#coldCutStale || current === undefined)) {
-			const key = `${model.provider}\u0000${model.api}`;
-			if (current === undefined || key !== `${current.provider}\u0000${current.api}`) {
-				this.#coldCutModel = model;
-				this.#coldCutStale = true;
-			}
+		if (model && (current === undefined || model.provider !== current.provider || model.api !== current.api)) {
+			this.#coldCutModel = model;
+			this.#coldCutStale = true;
 		}
 		if (!this.#coldCutStale) return undefined;
 		this.#coldCutStale = false;
@@ -3851,8 +3874,10 @@ export class SessionManager {
 		};
 	}
 
+	/** Move the leaf; the cut is computed again at the next context build. */
 	#setLeaf(id: string | null): void {
 		this.#index.setLeaf(id);
+		this.#coldCutStale = true;
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
 			batch.externalLeafChanged = true;
@@ -3870,6 +3895,10 @@ export class SessionManager {
 		}
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		// A compaction moves the cut once the agent's context is rebuilt from it
+		// (the next context build), and a model change can move it to the
+		// compaction the new model replays.
+		if (entry.type === "compaction" || entry.type === "model_change") this.#coldCutStale = true;
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
 		if (batch && !batch.collecting) {
@@ -3909,9 +3938,8 @@ export class SessionManager {
 			this.#entries.slice(0, durable.issued).every(entry => !batch.entryIds.has(entry.id));
 		this.#entries = retained;
 		if (durable && keepsFrontier) durable.generation = this.#entriesGeneration;
-		this.#index.rebuild(retained);
+		this.#reindexEntries();
 		this.#index.setLeaf(restoredLeaf && this.#index.has(restoredLeaf) ? restoredLeaf : null);
-		this.#coldCutStale = true;
 	}
 
 	#draftPath(): string | null {
@@ -4102,8 +4130,7 @@ export class SessionManager {
 		this.#durable = snapshot.durable
 			? durableFrontier(this.#entriesGeneration, snapshot.durable.count, snapshot.durable.size)
 			: undefined;
-		this.#resetColdCut(snapshot.coldStore);
-		this.#coldCutStale = true;
+		this.#resetColdCut(snapshot.coldStore, true);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		// A rolled-back switch gives up the claim it took on the session it opened.
@@ -4345,7 +4372,7 @@ export class SessionManager {
 		this.#adoptHeader(header);
 		this.#entries = loaded.entries;
 		this.#index = loaded.index;
-		this.#resetColdCut(loaded.coldStore);
+		this.#resetColdCut(loaded.coldStore, false);
 		warnRepairedUsage(loaded.repairedUsage);
 		SessionManager.#releaseLoadedTranscript(loaded);
 	}
@@ -4532,12 +4559,7 @@ export class SessionManager {
 			const boundary = this.#coldStoreEnabled
 				? coldBoundary(intake.entries, intake.index.branchView(), undefined)
 				: undefined;
-			if (boundary) {
-				for (let position = 0; position < intake.entries.length; position++) {
-					if (belongsCold(boundary, position)) continue;
-					hydrateColdEntry(intake.entries[position]!, { resolveBlobs: false });
-				}
-			}
+			if (boundary) hydrateKeptEntries(intake.entries, boundary, { resolveBlobs: false });
 			// Prune records, then patch records, apply after migration; a record
 			// whose target is cold writes through its accessor, which makes it
 			// whole until #coolLoadedEntries below returns it to the store.
@@ -5191,7 +5213,9 @@ export class SessionManager {
 		storage: SessionStorage = defaultSessionStorage(),
 	): Promise<SessionManager> {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
-		const manager = new SessionManager(this.#cwd, sessionDir, true, storage, this.#coldStoreEnabled);
+		// An in-memory source holds every entry, and the copy persists: it moves older ones to a store.
+		const coldStore = this.#persist ? this.#coldStoreEnabled : true;
+		const manager = new SessionManager(this.#cwd, sessionDir, true, storage, coldStore);
 		manager.#storeMasking = this.#storeMasking;
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession({ taskPromptCacheKey: this.#header.taskPromptCacheKey });
@@ -5208,8 +5232,7 @@ export class SessionManager {
 			isColdEntry(entry) ? copyColdEntry(entry) : structuredClone(entry),
 		);
 		manager.#adoptColdStore(this.#coldStore);
-		manager.#coldCutStale = true;
-		manager.#index.rebuild(manager.#entries);
+		manager.#reindexEntries();
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
@@ -5502,7 +5525,8 @@ export class SessionManager {
 	/**
 	 * Write the entries storage is missing, then close the append writer and,
 	 * unless a clone still holds it, the store of older entry bodies, so its
-	 * descriptor and disk are freed now rather than at a collection. Close a
+	 * descriptor and disk are freed now rather than at a collection. A manager
+	 * that does not persist only lets go of the store. Close a
 	 * manager last: an older entry of it cannot be read once its store is
 	 * closed. Rejects only while storage is still not proven to hold every
 	 * entry. While a {@link dropSession} deletes the current file, this waits
@@ -5510,7 +5534,12 @@ export class SessionManager {
 	 */
 	async close(): Promise<void> {
 		await this.#pendingDrop?.settled.promise;
-		if (!this.#persist) return;
+		if (!this.#persist) {
+			// A clone made without persistence shares its source's store.
+			this.#coldStore?.release(true);
+			this.#coldStore = undefined;
+			return;
+		}
 		try {
 			await this.#closeLocked();
 		} finally {
@@ -5644,7 +5673,7 @@ export class SessionManager {
 		this.#refusedSessionSwitch = undefined;
 		this.#index.clear();
 		// A clone or a snapshot taken for a rollback can still read the store; it closes once collected.
-		this.#resetColdCut(undefined);
+		this.#resetColdCut(undefined, false);
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
@@ -6281,7 +6310,6 @@ export class SessionManager {
 			resolvedModelIsFallback,
 		};
 		this.#recordEntry(entry);
-		this.#coldCutStale = true;
 		return entry.id;
 	}
 
@@ -6342,8 +6370,6 @@ export class SessionManager {
 			preserveData: options.preserveData,
 		};
 		this.#recordEntry(entry);
-		// The cut moves once the agent's context is rebuilt from this compaction (the next context build).
-		this.#coldCutStale = true;
 		return entry.id;
 	}
 
@@ -6588,8 +6614,9 @@ export class SessionManager {
 	/**
 	 * The active-leaf branch from the cut on: the first entry the model context
 	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
-	 * bodies stay in memory, except a user's to-do edit older than the newest
-	 * to-do snapshot, so a reader of the recent turns reads no older body.
+	 * bodies stay in memory, except patch records and a user's to-do edit older
+	 * than the newest to-do snapshot, so a reader of the recent turns reads no
+	 * older body.
 	 * The whole branch when the context uses no compaction.
 	 */
 	getBranchFromCut(): SessionEntry[] {
@@ -6601,7 +6628,7 @@ export class SessionManager {
 	 * Build the session context (LLM messages), or — with `{ transcript: true }` —
 	 * the full-history display transcript, from the current leaf path.
 	 */
-	buildSessionContext(options?: BuildSessionContextOptions): SessionContext {
+	buildSessionContext(options?: SessionContextBuildOptions): SessionContext {
 		// Entries the new cut keeps become whole before the build reads them;
 		// the ones it leaves behind go cold once the context no longer holds them.
 		const boundary = this.#staleColdBoundary(options);
@@ -6767,13 +6794,11 @@ export class SessionManager {
 	branch(branchFromId: string): void {
 		if (!this.#index.has(branchFromId)) throw new Error(`Entry ${branchFromId} not found`);
 		this.#setLeaf(branchFromId);
-		this.#coldCutStale = true;
 	}
 
 	/** Reset the leaf to null so the next append creates a new root entry. */
 	resetLeaf(): void {
 		this.#setLeaf(null);
-		this.#coldCutStale = true;
 	}
 
 	/**
@@ -6807,7 +6832,6 @@ export class SessionManager {
 		if (branchFromId !== null && !this.#index.has(branchFromId)) throw new Error(`Entry ${branchFromId} not found`);
 
 		this.#setLeaf(branchFromId);
-		this.#coldCutStale = true;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.#index),
@@ -6895,8 +6919,7 @@ export class SessionManager {
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
 		this.#hasTitleSlot = true;
-		this.#index.rebuild(this.#entries);
-		this.#coldCutStale = true;
+		this.#reindexEntries();
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#forceFileCreation = this.#persist;
@@ -7122,7 +7145,7 @@ export class SessionManager {
 		const history = loaded.entries;
 		manager.#entries = history;
 		manager.#index = loaded.index;
-		manager.#resetColdCut(loaded.coldStore);
+		manager.#resetColdCut(loaded.coldStore, false);
 		SessionManager.#releaseLoadedTranscript(loaded);
 		if (options?.repairInterruptedTail) {
 			const repairedFrom = history.length;
@@ -7373,8 +7396,6 @@ export class SessionManager {
 		storage: SessionStorage = defaultSessionStorage(),
 		options: {
 			onSessionContinuation?: (continuation: SessionContinuation) => void;
-			/** @internal `false` holds every entry in memory instead of moving older ones to a cold store. */
-			coldStore?: boolean;
 		} = {},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -7394,7 +7415,7 @@ export class SessionManager {
 				!breadcrumb.exists &&
 				(!sessionDir || pathIsWithin(dir, path.dirname(breadcrumb.sessionFile)))
 			) {
-				const manager = new SessionManager(cwd, dir, true, storage, options.coldStore);
+				const manager = new SessionManager(cwd, dir, true, storage);
 				manager.#resetToNewSession();
 				return manager;
 			}
@@ -7454,7 +7475,7 @@ export class SessionManager {
 						continuation?.session.path ?? breadcrumb.sessionFile,
 						undefined,
 						storage,
-						{ initialCwd: breadcrumbCwd, coldStore: options.coldStore },
+						{ initialCwd: breadcrumbCwd },
 					);
 					try {
 						await manager.moveTo(cwd, sessionDir);
@@ -7494,7 +7515,7 @@ export class SessionManager {
 			}
 		}
 
-		const manager = new SessionManager(cwd, dir, true, storage, options.coldStore);
+		const manager = new SessionManager(cwd, dir, true, storage);
 		if (chosenSession) await manager.setSessionFile(chosenSession);
 		else manager.#resetToNewSession();
 		return manager;

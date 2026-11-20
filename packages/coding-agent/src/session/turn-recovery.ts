@@ -442,11 +442,9 @@ type PendingRetryError = {
 	note: string;
 };
 
-/** The session entry of a failed assistant turn on the current branch, and its message. */
+/** The session entry of a failed assistant turn on the current branch; a stamp is written through `patchEntries` by its id. */
 type RecoveryTarget = {
 	entryId: string;
-	/** The entry's message, which a stamp changes in place. */
-	message: AssistantMessage;
 };
 
 /**
@@ -472,9 +470,9 @@ function branchAssistantEntry(
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index]!;
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-		if (entry.id === entryId) return { entryId: entry.id, message: entry.message };
+		if (entry.id === entryId) return { entryId: entry.id };
 		if (byKey || sessionMessagePersistenceKey(entry.message) !== persistenceKey) continue;
-		byKey = { entryId: entry.id, message: entry.message };
+		byKey = { entryId: entry.id };
 		if (entryId === undefined) break;
 	}
 	return byKey;
@@ -3562,12 +3560,18 @@ export class TurnRecovery {
 			// The rate-limit wait (see `rateLimited`), measured on the context the
 			// turn sends (see `TurnRecoveryHost.getContextUsage`): a large prompt no
 			// request has answered yet counts, and a usage from before a compaction
-			// that shrank the context does not. A function, so the `if` below reads
-			// the usage only once its earlier terms hold.
+			// that shrank the context does not. A failed turn the retry removes is
+			// never sent again, so its output (thinking, uncommitted text) comes off
+			// at the count the measure gave it, as `contextFitsModel` leaves it out.
+			// A function, so the `if` below reads the usage only once its earlier
+			// terms hold.
+			const sentContextTokens = (): number => {
+				const tokens = this.#host.getContextUsage()?.tokens ?? 0;
+				if (preserveFailedTurn || !this.#host.agent.state.messages.includes(message)) return tokens;
+				return Math.max(0, tokens - this.#host.agent.tokenizer.countMessage(message));
+			};
 			const rateLimitHoldsModel = (): boolean =>
-				rateLimited &&
-				(deferToSameModel ||
-					(this.#host.getContextUsage()?.tokens ?? 0) > retrySettings.rateLimitFallbackMaxContextTokens);
+				rateLimited && (deferToSameModel || sentContextTokens() > retrySettings.rateLimitFallbackMaxContextTokens);
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&

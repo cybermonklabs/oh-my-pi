@@ -853,7 +853,7 @@ export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
  * Reaches a subagent this session lists as running or pending whose ref is
  * `running`, or `idle` between two turns of a run still being driven, as a
  * synchronous subagent waiting for its own jobs is (see
- * {@link resolveOwnedLiveSubagent} with `betweenTurns`). Returns `false` (a
+ * {@link resolveOwnedLiveSubagent}). Returns `false` (a
  * no-op) for unknown, finished, cancelled or other sessions' subagents, and
  * for an idle one whose result was accepted or whose run already ended, so
  * hosts can treat cancelling a vanished subagent as success. Rejects when the
@@ -864,7 +864,7 @@ export async function handleRpcCancelSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
 	subagentId: string,
 ): Promise<boolean> {
-	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
+	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 	if (!owned) return false;
 	// Start the release first: it publishes the `aborted` tombstone synchronously,
 	// so the executor cannot accept the run's result (flipping the ref to idle)
@@ -930,7 +930,7 @@ export async function handleRpcSteerSubagent(
 	shutdown?: AbortSignal,
 ): Promise<string | undefined> {
 	const notRunning = `Subagent not running: ${subagentId}`;
-	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
+	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 	if (!owned) return notRunning;
 	let session: AgentSessionHandle;
 	try {
@@ -940,7 +940,7 @@ export async function handleRpcSteerSubagent(
 	}
 	// ensureLive awaits; the id may now belong to a different (same-name) agent,
 	// or the subagent may have finished in the meantime.
-	const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
+	const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 	if (current?.ref !== owned.ref || current.session !== session) return notRunning;
 	return steerOwnedSubagent(subagentRegistry, subagentId, current, message, shutdown);
 }
@@ -985,7 +985,7 @@ async function steerOwnedSubagent(
 	const outcome = Promise.withResolvers<"delivered" | "ended">();
 	const end = () => outcome.resolve("ended");
 	const checkReachable = () => {
-		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId, { betweenTurns: true });
+		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 		if (current?.ref !== owned.ref || current.session !== owned.session) end();
 	};
 	// Subscribe before sending, so a shutdown or an end of the run that lands

@@ -68,6 +68,21 @@ const TEXT_FRAMES =
 		delta: { type: "text_delta", text: "Here is the first part of the answer" },
 	});
 
+/** A thinking block of roughly 67,500 tokens, which with {@link MID_PROMPT} takes the context over the cap. */
+const THINKING_FRAMES =
+	sseFrame("content_block_start", {
+		type: "content_block_start",
+		index: 0,
+		content_block: { type: "thinking", thinking: "" },
+	}) +
+	sseFrame("content_block_delta", {
+		type: "content_block_delta",
+		index: 0,
+		delta: { type: "thinking_delta", thinking: "word ".repeat(45_000) },
+	});
+/** Roughly 87,500 tokens of prompt text: under the default 100,000-token cap. */
+const MID_PROMPT = "word ".repeat(70_000);
+
 /** The frame the Anthropic API streams for a per-minute rate limit; it states no wait. */
 const RATE_LIMIT_FRAME = sseFrame("error", {
 	type: "error",
@@ -261,6 +276,19 @@ describe("rate-limit retry: a rate limit reported after the response stream bega
 
 		expect(result.providerRequests).toBeGreaterThan(0);
 		expect(result.contextTokensAtFirstFailure).toBeLessThan(100_000);
+		expect(result.requestedModels).toEqual([...SPENT_ON_PRIMARY, CHAIN[0]]);
+		expect(result.fallbackTargets).toEqual([`${PROVIDER}/${CHAIN[0]}`]);
+		expect(result.last).toMatchObject({ stopReason: "stop", model: CHAIN[0] });
+	});
+
+	// Regression: a user whose request fits under retry.rateLimitFallbackMaxContextTokens hits a
+	// rate limit after the model has streamed a long thinking block, and the turn ends with the
+	// rate-limit error instead of moving down the chain, because the cap counted the failed
+	// attempt's thinking, which the retry removes and never sends again.
+	it("moves a context under the cap down the chain although the failed attempt's thinking takes it over", async () => {
+		const result = await runRateLimitedTurn(MESSAGE_START_FRAME + THINKING_FRAMES + RATE_LIMIT_FRAME, MID_PROMPT);
+
+		expect(result.contextTokensAtFirstFailure).toBeGreaterThan(100_000);
 		expect(result.requestedModels).toEqual([...SPENT_ON_PRIMARY, CHAIN[0]]);
 		expect(result.fallbackTargets).toEqual([`${PROVIDER}/${CHAIN[0]}`]);
 		expect(result.last).toMatchObject({ stopReason: "stop", model: CHAIN[0] });

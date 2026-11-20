@@ -1029,7 +1029,7 @@ export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null
  * `tryAcquireFileLock` for how long a refused claim waits). Throws when the
  * lock cannot be taken.
  */
-function claimSessionLease(sessionId: string): FileLockHandle | null {
+export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
 }
 

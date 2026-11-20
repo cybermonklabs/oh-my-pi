@@ -8,7 +8,7 @@
  *
  * Usage: bun packages/coding-agent/scripts/check-session-orphans.ts <session.jsonl> [...]
  *
- * `stored orphans` counts what is on disk; `replayed orphans` counts what the
+ * `stored orphans` counts the stored messages; `replayed orphans` counts what the
  * rebuilt model context still sends. The fix leaves the file untouched and
  * makes the second number 0, so one run shows the before and the after. Exit
  * status is 1 when any session still replays one. Both counts read the
@@ -67,7 +67,7 @@ async function inspect(file: string): Promise<Report> {
 	applyEntryPatches(entries);
 	const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
 
-	// On disk: every persisted message, no pairing repair of any kind.
+	// Stored: every persisted message, with the records applied, and no pairing repair of any kind.
 	const stored: AgentMessage[] = [];
 	for (const entry of sessionEntries) {
 		if (entry.type === "message") stored.push(entry.message);

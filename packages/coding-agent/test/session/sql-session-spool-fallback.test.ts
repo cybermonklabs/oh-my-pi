@@ -1,0 +1,218 @@
+/**
+ * SQL session storage saves a full rewrite when the spool it streams the
+ * lines through cannot be used: `os.tmpdir()` read-only, a spool write that
+ * fails as a full disk does, or a spool directory that another account could
+ * enter. The rewrite then stores the joined lines, as `writeTextSync` does,
+ * and the store warns once, not on every rewrite.
+ */
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
+
+/** Root ignores directory permissions, so a read-only directory cannot be made for it. */
+const RUNS_AS_ROOT = process.getuid?.() === 0;
+const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+const ID = "01a1f000-0000-7000-8000-00000000f001";
+const TIMESTAMP = "2026-11-19T00:00:00.000Z";
+const SYNC_FILE = `/sessions/-project-/2026-11-19T00-00-00-000Z_${ID}.jsonl`;
+const ATOMIC_FILE = `/sessions/-project-/2026-11-19T00-00-01-000Z_${ID}.jsonl`;
+
+const originalTmpdir = process.env.TMPDIR;
+
+/** A session's lines: its header, then `count` entries carrying `text`. */
+function sessionLines(text: string, count = 3): string[] {
+	const header = { type: "session", version: CURRENT_SESSION_VERSION, id: ID, timestamp: TIMESTAMP, cwd: "/project" };
+	return [
+		`${JSON.stringify(header)}\n`,
+		...Array.from(
+			{ length: count },
+			(_, n) =>
+				`${JSON.stringify({ type: "custom", customType: "note", id: `n${n}`, parentId: n === 0 ? null : `n${n - 1}`, timestamp: TIMESTAMP, data: { text } })}\n`,
+		),
+	];
+}
+
+async function withSqliteStorage(run: (storage: SqlSessionStorage) => Promise<void>): Promise<void> {
+	const client = new SQL("sqlite::memory:");
+	try {
+		await run(await SqlSessionStorage.create({ client }));
+	} finally {
+		await client.end();
+	}
+}
+
+/**
+ * Rewrite one stored session in full through `writeLinesSync` and another
+ * through `writeLinesAtomic`: what `readText` gives for each, and the bodies written.
+ */
+async function rewriteBothWays(storage: SqlSessionStorage): Promise<{ stored: string[]; written: string[] }> {
+	const before = sessionLines("before", 1).join("");
+	await storage.writeText(SYNC_FILE, before);
+	await storage.writeText(ATOMIC_FILE, before);
+	const syncLines = sessionLines("written by writeLinesSync");
+	const atomicLines = sessionLines("written by writeLinesAtomic");
+
+	storage.writeLinesSync(SYNC_FILE, syncLines, { expectedSize: Buffer.byteLength(before) });
+	await storage.drain();
+	await storage.writeLinesAtomic(ATOMIC_FILE, atomicLines, { expectedSize: Buffer.byteLength(before) });
+
+	return {
+		stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+		written: [syncLines.join(""), atomicLines.join("")],
+	};
+}
+
+/** The warnings among `calls` (a `logger.warn` spy's) that are about the spool. */
+function spoolWarnings(calls: ReadonlyArray<readonly unknown[]>): ReadonlyArray<readonly unknown[]> {
+	return calls.filter(([message]) => String(message).includes("spool"));
+}
+
+/** Whether descriptor `fd` of this process is open on a file under `dir`. */
+function isUnder(fd: number, dir: string): boolean {
+	try {
+		return fs.readlinkSync(`/proc/self/fd/${fd}`).startsWith(`${dir}${path.sep}`);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Fail every `writeFileSync` to a descriptor open on a file under `dir`, the
+ * write the spool fills its file with, with ENOSPC after half its bytes
+ * landed, as a disk that fills during the write does. Counts those writes.
+ */
+function failSpoolWritesUnder(dir: string): { refused: () => number } {
+	let refused = 0;
+	const writeFileSync = fs.writeFileSync;
+	vi.spyOn(fs, "writeFileSync").mockImplementation(((
+		file: fs.PathOrFileDescriptor,
+		data: string | NodeJS.ArrayBufferView,
+		...rest: unknown[]
+	) => {
+		if (typeof file !== "number" || !isUnder(file, dir)) {
+			Reflect.apply(writeFileSync, fs, [file, data, ...rest]);
+			return;
+		}
+		refused++;
+		const bytes =
+			typeof data === "string" ? Buffer.from(data) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+		writeFileSync(file, bytes.subarray(0, bytes.byteLength >> 1));
+		throw Object.assign(new Error("ENOSPC: no space left on device, write"), {
+			code: "ENOSPC",
+			errno: -28,
+			syscall: "write",
+		});
+	}) as typeof fs.writeFileSync);
+	return { refused: () => refused };
+}
+
+describe("SQL session storage full rewrites when the spool cannot be used", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (originalTmpdir === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = originalTmpdir;
+	});
+
+	// If this regresses, a session on SQL storage in a container whose TMPDIR is read-only is never
+	// saved: every full rewrite throws EACCES and the session the user resumes later is missing.
+	it.skipIf(RUNS_AS_ROOT)(
+		"stores a rewrite through writeLinesSync and writeLinesAtomic when os.tmpdir() is read-only, warning once",
+		async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			fs.chmodSync(tmp.path(), 0o500);
+			process.env.TMPDIR = tmp.path();
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				await withSqliteStorage(async storage => {
+					const { stored, written } = await rewriteBothWays(storage);
+
+					expect(stored).toEqual(written);
+					expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
+				});
+			} finally {
+				fs.chmodSync(tmp.path(), 0o700);
+			}
+		},
+	);
+
+	// If this regresses, a session on SQL storage whose TMPDIR fills up (the spool holds a whole copy of
+	// the transcript) is never saved again, and each failed rewrite leaves a descriptor open.
+	it.skipIf(!HAS_PROC_FD)(
+		"stores a rewrite through writeLinesSync and writeLinesAtomic when a spool write fails with ENOSPC, and closes the spool",
+		async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			process.env.TMPDIR = tmp.path();
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const disk = failSpoolWritesUnder(tmp.path());
+
+			await withSqliteStorage(async storage => {
+				const { stored, written } = await rewriteBothWays(storage);
+
+				expect(stored).toEqual(written);
+				// Both rewrites tried the spool, and the partly written files are closed and gone.
+				expect(disk.refused()).toBe(2);
+				expect(
+					fs
+						.readdirSync("/proc/self/fd")
+						.map(Number)
+						.filter(fd => isUnder(fd, tmp.path())),
+				).toEqual([]);
+				expect(fs.readdirSync(path.join(tmp.path(), `omp-spool-${process.getuid?.()}`))).toEqual([]);
+				expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
+			});
+		},
+	);
+
+	// If this regresses, a rewrite handed its lines by a generator, which yields them only once, stores
+	// only the lines the failed spool left unread (here none) when the spool write fails.
+	it.skipIf(!HAS_PROC_FD)(
+		"stores every line a generator yields when the spool write of its rewrite fails",
+		async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			process.env.TMPDIR = tmp.path();
+			vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const disk = failSpoolWritesUnder(tmp.path());
+			const lines = sessionLines("yielded once");
+			function* yieldOnce(): Generator<string> {
+				yield* lines;
+			}
+
+			await withSqliteStorage(async storage => {
+				storage.writeLinesSync(SYNC_FILE, yieldOnce());
+				await storage.drain();
+				await storage.writeLinesAtomic(ATOMIC_FILE, yieldOnce());
+
+				expect(disk.refused()).toBe(2);
+				expect([await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)]).toEqual([
+					lines.join(""),
+					lines.join(""),
+				]);
+			});
+		},
+	);
+
+	// If this regresses, full rewrites spool the transcript into a directory other accounts can enter,
+	// or one another account made first and controls, instead of keeping it out of their reach.
+	it.skipIf(process.getuid === undefined)(
+		"does not spool into a directory others can enter that was made first, and still stores the rewrite",
+		async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			const spoolDir = path.join(tmp.path(), `omp-spool-${process.getuid?.()}`);
+			fs.mkdirSync(spoolDir);
+			fs.chmodSync(spoolDir, 0o755);
+			process.env.TMPDIR = tmp.path();
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+			await withSqliteStorage(async storage => {
+				const { stored, written } = await rewriteBothWays(storage);
+
+				expect(stored).toEqual(written);
+				expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
+			});
+		},
+	);
+});

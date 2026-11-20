@@ -1170,7 +1170,11 @@ Isolated (worktree) subagents run in-process and are steered the same way.
 
 The response arrives once the message is accepted: for a mid-turn subagent,
 once it is queued into the running turn; for a subagent between
-turns, once its next turn has taken the message into its context. Each
+turns, once its next turn has taken the message into its context. A client
+must allow for that wait, which lasts until the subagent's next run: the
+Python, Go and Rust SDKs time a request out after 30 s by default, so give
+this command a longer timeout (the TypeScript `RpcClient.steerSubagent` sets
+none unless its `timeoutMs` option asks for one). Each
 `steer_subagent` answers for its own message: two sent with the same text are
 two messages, and a turn that takes one answers only that one. It does
 not wait for the turn to finish, except for an extension command that itself

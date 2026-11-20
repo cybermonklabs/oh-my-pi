@@ -72,6 +72,10 @@ export async function writeArchive(
  * {@link writeArchive} for a plain tar, written member by member: the same
  * bytes, but a `Blob` member (e.g. `Bun.file`) streams from its source, so the
  * archive is never built in memory. Parent directories are auto-created.
+ * Unlike `writeArchive`, which builds the whole archive before it writes,
+ * this empties `destPath` first, so a failure leaves a truncated file there:
+ * write to a staging file and rename it over the target on success, as its
+ * one caller (`packSession`) does.
  */
 export async function writeTarArchive(
 	destPath: string,

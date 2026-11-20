@@ -39,9 +39,15 @@ pub(crate) enum Target {
 	/// outside ASCII as the escapes of its UTF-8 bytes.
 	RustBytes,
 	/// PCRE2, which `grep` compiles a back-reference with. It runs with
-	/// PCRE2_UCP, where a POSIX class already means the Unicode one, and it
-	/// has the look-around the word edges need.
+	/// PCRE2_UCP, where its own POSIX classes are Unicode categories that are
+	/// not GNU's - `[:digit:]` holds the digits of every script - so each
+	/// class is written to mean what it means for [`Self::Rust`] (see
+	/// [`push_bracket_class`]). It has the look-around the word edges need.
 	Pcre,
+	/// PCRE2 without PCRE2_UTF and PCRE2_UCP, for a line that is not UTF-8,
+	/// which GNU grep reads a byte to a character in the C locale: its POSIX
+	/// classes hold ASCII alone, as GNU's do there.
+	PcreBytes,
 	/// `fancy-regex`, which `sed` and `nl` compile with: the `regex` crate's
 	/// syntax plus back-references and look-around.
 	Fancy,
@@ -56,10 +62,11 @@ impl Target {
 	/// Whether a POSIX letter class is written as the Unicode property of the
 	/// same name. The `regex` crate reads `[[:alpha:]]` as ASCII alone, while
 	/// GNU in a UTF-8 locale counts every letter (`printf '\303\237\n' |
-	/// grep -c '[[:alpha:]]'` is 1); PCRE2 already does with PCRE2_UCP, and in
-	/// the C locale a byte from 0x80 up is no letter.
+	/// grep -c '[[:alpha:]]'` is 1), and PCRE2_UCP reads it as `\p{L}`, which
+	/// leaves out `Ⅻ`, a letter to GNU; in the C locale a byte from 0x80 up
+	/// is no letter.
 	const fn unicode_letters(self) -> bool {
-		!matches!(self, Self::Pcre | Self::RustBytes)
+		!matches!(self, Self::RustBytes | Self::PcreBytes)
 	}
 }
 
@@ -82,7 +89,7 @@ pub(crate) enum BreError {
 	/// A `[:name:]` naming no POSIX character class.
 	ClassNameInvalid,
 	/// A bracket expression that is a class name without its outer brackets,
-	/// as in `grep '[:alpha:]'`.
+	/// as in `grep '[:alpha:]'`, in a pattern that holds no other error.
 	ClassSyntaxConfused,
 	/// A `[.c.]` or `[=c=]` holding other than one single-byte character.
 	CollationInvalid,
@@ -90,8 +97,14 @@ pub(crate) enum BreError {
 	/// or that has a class for an end, or a `-` after a range or class in a
 	/// bracket expression that is not its last member.
 	RangeEndInvalid,
-	/// A `\{` that opens no interval where an interval must follow.
+	/// An interval after an atom that the pattern ends inside of: `a\{1`.
 	BraceUnmatched,
+	/// An interval after an atom whose counts make no interval: none at all
+	/// (`a\{\}`), a second comma (`a\{1,2,3\}`), a maximum below the minimum
+	/// (`a\{2,1\}`), or, where the dialect does not read the brace as an
+	/// ordinary character instead, a count that holds other than digits
+	/// (`a\{1x\}`); see [`NoInterval`].
+	IntervalInvalid,
 	/// A repetition operator with nothing to repeat, or one more repetition
 	/// than the dialect allows, which `sed` refuses where `grep` reads the
 	/// text itself or drops the operator.
@@ -115,6 +128,7 @@ impl BreError {
 			Self::CollationInvalid => "Invalid collation character",
 			Self::RangeEndInvalid => "Invalid range end",
 			Self::BraceUnmatched => "Unmatched \\{",
+			Self::IntervalInvalid => "Invalid content of \\{\\}",
 			Self::RepetitionOperandMissing => "Invalid preceding regular expression",
 			Self::ParenUnmatched => "Unmatched ) or \\)",
 			Self::BackReferenceInvalid => "Invalid back reference",
@@ -164,7 +178,8 @@ pub(crate) fn translate_multiline(
 		multiline,
 		atom: None,
 		quantified: false,
-		anchored: false,
+		branch_start: true,
+		confused: false,
 		groups: Vec::new(),
 		opened: 0,
 		completed: 0,
@@ -226,6 +241,14 @@ fn opens_group(pattern: &str, dialect: Dialect) -> bool {
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 const ALTERNATIVE_LIMIT: usize = 64;
 
+/// The deepest [`expand`] reads groups inside groups, fancy-regex's own
+/// nesting limit: it recurses once for each group, and a `sed -E` pattern
+/// nested tens of thousands of groups deep with a `|` overflowed the stack,
+/// an abort no error handler catches, where such a pattern is left whole
+/// for the engine to refuse.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+const NESTING_LIMIT: usize = 64;
+
 /// Who splits a pattern into its alternatives; see [`alternatives`].
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -256,15 +279,15 @@ pub(crate) enum Split {
 ///
 /// The pattern itself is the only alternative when it holds no alternation,
 /// when a back-reference keeps it whole (see [`Split`]), when a group never
-/// closes, or when it would expand into more than [`ALTERNATIVE_LIMIT`]
-/// branches.
+/// closes, when groups nest deeper than [`NESTING_LIMIT`], or when it would
+/// expand into more than [`ALTERNATIVE_LIMIT`] branches.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn alternatives(pattern: &str, dialect: Dialect, split: Split) -> Vec<String> {
 	if !pattern.contains('|') || (split == Split::Grep && has_backreference(pattern)) {
 		return vec![pattern.to_owned()];
 	}
 	let mut chars = pattern.chars().peekable();
-	match expand(&mut chars, dialect, split == Split::Grep, false) {
+	match expand(&mut chars, dialect, split == Split::Grep, 0) {
 		Some((branches, _)) if branches.len() > 1 && !renumbers_reference(&branches, dialect) => {
 			branches
 		},
@@ -283,16 +306,59 @@ fn renumbers_reference(branches: &[String], dialect: Dialect) -> bool {
 	})
 }
 
+/// Where one alternative, searched alone, matched last: `None` until it is
+/// searched, `Some(None)` where it has no match from the position searched,
+/// else the match's start and end.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+pub(crate) type CachedMatch = Option<Option<(usize, usize)>>;
+
+/// The first match of one alternative at or after `pos`, for the callers
+/// that search each alternative alone to take the longest match (see
+/// [`alternatives`]). `cached` holds the match found from a position at or
+/// before `pos`: it stands while it starts at or after `pos`, and otherwise
+/// `search` finds the match from `pos`, which `cached` then keeps. Asked at
+/// each position of a line in turn, an alternative so scans the line once.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+pub(crate) fn next_match<E>(
+	cached: &mut CachedMatch,
+	pos: usize,
+	search: impl FnOnce() -> Result<Option<(usize, usize)>, E>,
+) -> Result<Option<(usize, usize)>, E> {
+	if let Some(found) = *cached
+		&& found.is_none_or(|(start, _)| start >= pos)
+	{
+		return Ok(found);
+	}
+	let found = search()?;
+	*cached = Some(found);
+	Ok(found)
+}
+
+/// Whether `pattern`, written in `dialect`, holds no character the dialect
+/// reads otherwise than as itself, so that it matches its own text alone, as
+/// a fixed string does. A character that is ordinary only where it stands
+/// (a BRE's leading `*`, an ERE's unmatched `)`) counts as special.
+#[cfg(feature = "util.grep")]
+pub(crate) fn is_literal(pattern: &str, dialect: Dialect) -> bool {
+	let special: &[char] = match dialect {
+		Dialect::Basic => &['\\', '.', '[', '*', '^', '$'],
+		Dialect::Extended => &['\\', '.', '[', '*', '^', '$', '+', '?', '{', '(', ')', '|'],
+	};
+	!pattern.contains(special)
+}
+
 /// Expands the alternation the iterator holds into its branches, stopping at
-/// the end of the pattern or, when `nested`, after the group's closing text.
-/// Returns the branches and the raw text consumed before that closing text.
+/// the end of the pattern or, inside a group (`depth` above 0), after the
+/// group's closing text. Returns the branches and the raw text consumed
+/// before that closing text.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 fn expand(
 	chars: &mut Peekable<Chars<'_>>,
 	dialect: Dialect,
 	distribute: bool,
-	nested: bool,
+	depth: usize,
 ) -> Option<(Vec<String>, String)> {
+	let nested = depth > 0;
 	let basic = dialect == Dialect::Basic;
 	let (open, close) = if basic { ("\\(", "\\)") } else { ("(", ")") };
 	let mut done: Vec<String> = Vec::new();
@@ -334,7 +400,10 @@ fn expand(
 				if basic {
 					chars.next();
 				}
-				let (inner, inner_raw) = expand(chars, dialect, distribute, true)?;
+				if depth == NESTING_LIMIT {
+					return None;
+				}
+				let (inner, inner_raw) = expand(chars, dialect, distribute, depth + 1)?;
 				if distribute && inner.len() > 1 && !repetition_follows(chars, dialect) {
 					let mut next = Vec::with_capacity(current.len() * inner.len());
 					for prefix in &current {
@@ -522,7 +591,7 @@ fn zero_count_follows(chars: &Peekable<Chars<'_>>, dialect: Dialect) -> bool {
 		return false;
 	}
 	// The operator is `{n}`, `{n,}` or `{n,m}`, its last number the most.
-	read_interval(&mut ahead, dialect).is_some_and(|(operator, _)| {
+	read_interval(&mut ahead, dialect).is_ok_and(|(operator, _)| {
 		operator
 			.trim_end_matches('}')
 			.rsplit(['{', ','])
@@ -572,10 +641,17 @@ struct Translator<'a> {
 	/// one repeats the repetition instead of reading as the engine's lazy
 	/// flag: GNU reads `a\+\?` as `(a+)?`, which matches the empty string.
 	quantified: bool,
-	/// Whether the branch's `^` anchor has been read: in a BRE only the first
-	/// caret of a branch anchors, and `grep -c '^^'` counts the lines that
-	/// start with a caret.
-	anchored:   bool,
+	/// Whether the token just read opens a branch: the start of the pattern,
+	/// `\(` or `\|`, as glibc tells it. In a BRE only there does `^` anchor;
+	/// after any other token, an assertion included, it is an ordinary
+	/// character: `grep -c '^^'` counts the lines that start with a caret,
+	/// and ``grep '\`^a'`` selects the line `^a`.
+	branch_start: bool,
+	/// Whether a bracket expression was a class name written without its
+	/// outer brackets, which is reported only once the rest of the pattern
+	/// has translated: GNU reports any other error first, so `sed
+	/// 's/[:alpha:][z-a]/x/'` is "Invalid range end" and exit 1, not 4.
+	confused:   bool,
 	/// The groups that are still open, innermost last.
 	groups:     Vec<OpenGroup>,
 	/// How many groups have opened.
@@ -592,11 +668,13 @@ impl Translator<'_> {
 	fn run(mut self) -> Result<String, BreError> {
 		let extended = self.dialect == Dialect::Extended;
 		while let Some(c) = self.chars.next() {
+			// Every token ends the start of a branch; `(` and `|` open one.
+			let branch_start = std::mem::take(&mut self.branch_start);
 			match c {
 				'\\' => self.escape()?,
 				'[' => {
 					let start = self.out.len();
-					take_bracket_expression(
+					self.confused |= take_bracket_expression(
 						&mut self.chars,
 						&mut self.out,
 						self.icase,
@@ -612,10 +690,13 @@ impl Translator<'_> {
 				'(' if extended => self.open_group(),
 				')' if extended => self.close_group()?,
 				'|' if extended => self.alternate(),
-				'^' => self.caret(),
+				'^' => self.caret(branch_start),
 				'$' => self.dollar(),
 				_ => self.literal(c),
 			}
+		}
+		if self.confused {
+			return Err(BreError::ClassSyntaxConfused);
 		}
 		Ok(self.out)
 	}
@@ -671,19 +752,24 @@ impl Translator<'_> {
 	/// are `{0,m}` and `{0,}`.
 	fn brace(&mut self) -> Result<(), BreError> {
 		match read_interval(&mut self.chars, self.dialect) {
-			Some((operator, literal)) => self.repeat(&operator, &literal),
-			// `grep 'a\{1'` and `grep 'a\{x'` are "Unmatched \{", while a
-			// `\{` with nothing to repeat is an ordinary brace
-			// (`grep -c '\{'` counts the lines holding one).
-			None if self.dialect == Dialect::Basic && self.atom.is_some() => {
-				Err(BreError::BraceUnmatched)
-			},
-			// An ERE takes a brace that opens no interval literally:
-			// `grep -cE 'a{1'` counts the lines holding the text `a{1`.
-			None => {
+			Ok((operator, literal)) => self.repeat(&operator, &literal),
+			// With nothing to repeat glibc reads no interval, and the brace is
+			// an ordinary character: `grep -c '\{'` counts the lines holding
+			// one, and so does `grep -cE '{1,2,3}'`.
+			Err(_) if self.atom.is_none() => {
 				self.literal('{');
 				Ok(())
 			},
+			// GNU grep's ERE takes such a brace literally: `grep -cE 'a{1'`
+			// counts the lines holding the text `a{1`.
+			Err(NoInterval::Interrupted { .. })
+				if self.dialect == Dialect::Extended && !self.strict() =>
+			{
+				self.literal('{');
+				Ok(())
+			},
+			Err(NoInterval::Interrupted { ended: true }) => Err(BreError::BraceUnmatched),
+			Err(_) => Err(BreError::IntervalInvalid),
 		}
 	}
 
@@ -732,7 +818,7 @@ impl Translator<'_> {
 		self.out.push('(');
 		self.atom = None;
 		self.quantified = false;
-		self.anchored = false;
+		self.branch_start = true;
 	}
 
 	/// A group's closing text. GNU refuses an unmatched `\)` in a BRE, and
@@ -772,7 +858,7 @@ impl Translator<'_> {
 		}
 		self.atom = None;
 		self.quantified = false;
-		self.anchored = false;
+		self.branch_start = true;
 	}
 
 	/// A back-reference to group `digit`, one of `1` to `9`.
@@ -814,13 +900,12 @@ impl Translator<'_> {
 		self.quantified = false;
 	}
 
-	/// In a BRE `^` anchors only at the start of a branch, and only once
-	/// there; in an ERE it always anchors.
-	fn caret(&mut self) {
-		if self.dialect == Dialect::Extended || (self.atom.is_none() && !self.anchored) {
+	/// In a BRE `^` anchors only where a branch starts (see
+	/// [`Self::branch_start`]); in an ERE it always anchors.
+	fn caret(&mut self, branch_start: bool) {
+		if self.dialect == Dialect::Extended || branch_start {
 			let start = self.out.len();
 			self.out.push('^');
-			self.anchored = true;
 			self.anchor_atom(start);
 			return;
 		}
@@ -867,42 +952,103 @@ impl Translator<'_> {
 	}
 }
 
-/// Reads the interval after an opening brace, leaving the iterator where it
-/// was when the text that follows is no interval. Returns the operator the
-/// engines read and the text GNU matches where there is nothing to repeat.
-fn read_interval(chars: &mut Peekable<Chars<'_>>, dialect: Dialect) -> Option<(String, String)> {
-	let mut ahead = chars.clone();
-	let mut low = String::new();
-	while let Some(digit) = ahead.next_if(char::is_ascii_digit) {
-		low.push(digit);
-	}
-	let high = ahead.next_if_eq(&',').map(|_| {
-		let mut text = String::new();
-		while let Some(digit) = ahead.next_if(char::is_ascii_digit) {
-			text.push(digit);
+/// Why the text after an opening brace makes no interval, told apart as
+/// glibc's `parse_dup_op` tells it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoInterval {
+	/// A character other than a digit or a comma interrupts a count, or the
+	/// pattern ends inside the interval (`ended`). GNU grep's ERE then reads
+	/// the brace as an ordinary character (glibc's RE_INVALID_INTERVAL_ORD):
+	/// `grep -cE 'a{1x}'` and `grep -cE 'a{1'` count the lines holding that
+	/// text. Elsewhere it is "Unmatched \{" where the pattern ends, and
+	/// "Invalid content of \{\}" otherwise.
+	Interrupted { ended: bool },
+	/// The counts are read but make no interval: none at all (`a{}`), a
+	/// second comma (`a{1,2,3}`), or a maximum below the minimum (`a{2,1}`).
+	/// "Invalid content of \{\}" in every dialect.
+	Invalid,
+}
+
+/// What ends one count of an interval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CountEnd {
+	Comma,
+	Close,
+}
+
+/// Reads one count of an interval as glibc's `fetch_number` does: up to the
+/// comma or the closing brace that ends it, the whole of it even where a
+/// character other than a digit interrupts it. Returns its digits, none
+/// where it is empty, and what ended it.
+fn read_count(
+	chars: &mut Peekable<Chars<'_>>,
+	dialect: Dialect,
+) -> Result<(String, CountEnd), NoInterval> {
+	let mut digits = String::new();
+	let mut interrupted = false;
+	let end = loop {
+		match chars.next() {
+			None => return Err(NoInterval::Interrupted { ended: true }),
+			Some(',') => break CountEnd::Comma,
+			Some('}') if dialect == Dialect::Extended => break CountEnd::Close,
+			Some('\\') => match chars.next() {
+				Some('}') if dialect == Dialect::Basic => break CountEnd::Close,
+				// A pattern that ends in a backslash ends inside the interval.
+				None => return Err(NoInterval::Interrupted { ended: true }),
+				Some(_) => interrupted = true,
+			},
+			Some(digit @ '0'..='9') => digits.push(digit),
+			Some(_) => interrupted = true,
 		}
-		text
-	});
-	// `{` followed by neither a digit nor a comma opens no interval; GNU
-	// reads `{,}` as `{0,}` (`grep -cE 'a{,}'` counts every line).
-	if low.is_empty() && high.is_none() {
-		return None;
+	};
+	if interrupted {
+		return Err(NoInterval::Interrupted { ended: false });
 	}
-	if dialect == Dialect::Basic && ahead.next_if_eq(&'\\').is_none() {
-		return None;
+	Ok((digits, end))
+}
+
+/// The number a count's digits spell, capped one past glibc's RE_DUP_MAX
+/// (32767), as glibc caps it.
+fn count_value(digits: &str) -> u32 {
+	digits.bytes().fold(0, |value, digit| (value * 10 + u32::from(digit - b'0')).min(0x8000))
+}
+
+/// Reads the interval after an opening brace, as glibc's `parse_dup_op`
+/// reads it, leaving the iterator where it was when the text that follows
+/// makes none. Returns the operator the engines read and the text GNU
+/// matches where there is nothing to repeat.
+fn read_interval(
+	chars: &mut Peekable<Chars<'_>>,
+	dialect: Dialect,
+) -> Result<(String, String), NoInterval> {
+	let mut ahead = chars.clone();
+	let (low, end) = read_count(&mut ahead, dialect)?;
+	let high = match end {
+		// `a{}` holds no count at all.
+		CountEnd::Close if low.is_empty() => return Err(NoInterval::Invalid),
+		CountEnd::Close => None,
+		CountEnd::Comma => match read_count(&mut ahead, dialect)? {
+			(high, CountEnd::Close) => Some(high),
+			// A second comma: `a{1,2,3}`, `a{1,,}`.
+			(_, CountEnd::Comma) => return Err(NoInterval::Invalid),
+		},
+	};
+	// A maximum below the minimum: `a{2,1}`.
+	if high.as_deref().is_some_and(|high| !high.is_empty() && count_value(high) < count_value(&low)) {
+		return Err(NoInterval::Invalid);
 	}
-	ahead.next_if_eq(&'}')?;
 	let literal = match &high {
 		Some(high) => format!("{{{low},{high}}}"),
 		None => format!("{{{low}}}"),
 	};
-	// GNU reads `{,m}` as `{0,m}`: `grep -cE 'a{,2}'` counts every line.
+	// GNU reads `{,m}` as `{0,m}` and `{,}` as `{0,}`: `grep -cE 'a{,2}'`
+	// and `grep -cE 'a{,}'` count every line.
 	let operator = match &high {
 		Some(high) if low.is_empty() => format!("{{0,{high}}}"),
 		_ => literal.clone(),
 	};
 	*chars = ahead;
-	Some((operator, literal))
+	Ok((operator, literal))
 }
 
 /// Whether the rest of the pattern ends the current branch of a BRE.
@@ -968,8 +1114,9 @@ enum BracketMember {
 /// class name POSIX does not define, a collating symbol or equivalence class
 /// of other than one single-byte character, a range that runs backwards or
 /// has a class for an end, or a `-` after a range or class that does not
-/// close the list, and a list that is a class name without the outer
-/// brackets.
+/// close the list. Returns whether the list is a class name without the
+/// outer brackets, which the caller reports only where the rest of the
+/// pattern holds no error.
 ///
 /// A list that negates holds no newline where `multiline` (GNU sed's `M`
 /// flag): `[^x]*$` stops at the end of a line there.
@@ -979,7 +1126,7 @@ fn take_bracket_expression(
 	icase: bool,
 	target: Target,
 	multiline: bool,
-) -> Result<(), BreError> {
+) -> Result<bool, BreError> {
 	out.push('[');
 	if chars.next_if_eq(&'^').is_some() {
 		out.push('^');
@@ -1025,7 +1172,9 @@ fn take_bracket_expression(
 				// a range of its own and "Invalid range end" under `-i`,
 				// while `[a-Z]` is the other way round. One the engine cannot
 				// express is refused here rather than searched as something
-				// else.
+				// else. It is written as checked, which the engine's own
+				// folding widens back: `grep -ic '[a-Z]'` selects `b`, and
+				// `grep -ic '[A-z]'` does not select `_`.
 				let (low, high) = if icase {
 					(start.to_ascii_uppercase(), end.to_ascii_uppercase())
 				} else {
@@ -1034,23 +1183,19 @@ fn take_bracket_expression(
 				if high < low {
 					return Err(BreError::RangeEndInvalid);
 				}
-				push_bracket_char(out, start);
+				push_bracket_char(out, low);
 				out.push('-');
-				push_bracket_char(out, end);
+				push_bracket_char(out, high);
 			},
 			BracketMember::Char(c) | BracketMember::Equivalence(c) => push_bracket_char(out, c),
-			BracketMember::Class(name) => push_bracket_class(out, name, target),
+			BracketMember::Class(name) => push_bracket_class(out, name, target, icase),
 		}
 		match chars.peek() {
 			None => return Err(BreError::BracketUnmatched),
 			Some(']') => {
 				chars.next();
 				out.push(']');
-				return if opens_colon && ends_colon && other_member && !special {
-					Err(BreError::ClassSyntaxConfused)
-				} else {
-					Ok(())
-				};
+				return Ok(opens_colon && ends_colon && other_member && !special);
 			},
 			Some(_) => {},
 		}
@@ -1129,31 +1274,39 @@ fn push_bracket_char(out: &mut String, c: char) {
 	out.push(c);
 }
 
-/// Append the POSIX class `name` as a member of a class.
+/// Append the POSIX class `name` as a member of a class, with the meaning
+/// GNU gives it in a UTF-8 locale.
+///
+/// Without case `upper` and `lower` are `alpha`, as glibc and GNU's dfa read
+/// them: `printf '中\n' | grep -ci '[[:lower:]]'` is 1. (PCRE2 folds no
+/// Unicode property, so `\p{Lowercase}` would not match an `A` there.)
 ///
 /// The letter classes are written as the Unicode property of the same name
-/// where the engine's own POSIX class holds ASCII alone: GNU in a UTF-8
-/// locale counts `ß` as a letter, so `printf '\303\237\n' | grep -cw
-/// '[[:alpha:]]'` is 1. The others keep their POSIX definition, which is what
-/// GNU gives them in the C locale and, for `digit` and `xdigit`, in C.UTF-8
-/// as well.
-fn push_bracket_class(out: &mut String, name: &str, target: Target) {
-	let unicode = match name {
-		_ if !target.unicode_letters() => None,
-		"alpha" => Some(r"\p{Alphabetic}"),
-		"alnum" => Some(r"\p{Alphabetic}\p{Nd}"),
-		"lower" => Some(r"\p{Lowercase}"),
-		"upper" => Some(r"\p{Uppercase}"),
-		_ => None,
-	};
-	match unicode {
-		Some(property) => out.push_str(property),
-		None => {
+/// where the engine's own POSIX class is not GNU's (see
+/// [`Target::unicode_letters`]): GNU in a UTF-8 locale counts `ß` as a
+/// letter, so `printf '\303\237\n' | grep -cw '[[:alpha:]]'` is 1. `digit`
+/// and `xdigit` are ASCII to GNU in every locale, which they are not to
+/// PCRE2_UCP, so for [`Target::Pcre`] they are written as their ranges:
+/// `printf '\331\240\n' | grep -c '\(x\)\1\|[[:digit:]]'` is 0. The other
+/// classes keep their POSIX definition, which is what GNU gives them in the
+/// C locale.
+fn push_bracket_class(out: &mut String, name: &str, target: Target, icase: bool) {
+	let name = if icase && matches!(name, "lower" | "upper") { "alpha" } else { name };
+	let written = match name {
+		"alpha" if target.unicode_letters() => r"\p{Alphabetic}",
+		"alnum" if target.unicode_letters() => r"\p{Alphabetic}\p{Nd}",
+		"lower" if target.unicode_letters() => r"\p{Lowercase}",
+		"upper" if target.unicode_letters() => r"\p{Uppercase}",
+		"digit" if target == Target::Pcre => "0-9",
+		"xdigit" if target == Target::Pcre => "0-9A-Fa-f",
+		_ => {
 			out.push_str("[:");
 			out.push_str(name);
 			out.push_str(":]");
+			return;
 		},
-	}
+	};
+	out.push_str(written);
 }
 
 #[cfg(test)]
@@ -1329,13 +1482,49 @@ mod tests {
 		// GNU reads `{,}` as `{0,}`: `grep -cE 'a{,}'` counts every line.
 		assert_eq!(ere("a{,}"), "a{0,}");
 		assert_eq!(bre(r"a\{,\}"), "a{0,}");
-		// An interval that opens is left for the engine, which refuses
-		// `a{2,1}` as GNU does ("Invalid content of \{\}").
+		// An interval that opens is an operator.
 		assert_eq!(ere("a{2}"), "a{2}");
 		assert_eq!(ere("a{2,}"), "a{2,}");
 		// GNU reads `{,m}` as `{0,m}`: `grep -cE 'a{,2}'` counts every line.
 		assert_eq!(ere("a{,2}"), "a{0,2}");
 		assert_eq!(bre(r"a\{,2\}"), "a{0,2}");
+	}
+
+	#[test]
+	fn a_malformed_interval_is_refused_as_glibc_refuses_it() {
+		// If this regresses, `grep -cE 'a{1,2,3}'` counts the lines holding
+		// that text and exits 0, where GNU grep 3.11 prints "Invalid content
+		// of \{\}" and exits 2: once its counts are read, an interval with a
+		// second comma, none at all or a maximum below its minimum is refused
+		// in every dialect.
+		for pattern in ["a{1,2,3}", "a{1,2,", "a{1,,}", "a{}", "a{2,1}", "(){1,2,3}", "a{1,2,3"] {
+			assert_eq!(ere_err(pattern), Some(BreError::IntervalInvalid), "{pattern}");
+		}
+		for pattern in [r"a\{1,2,3\}", r"a\{\}", r"a\{2,1\}", r"a\{1,2,"] {
+			assert_eq!(bre_err(pattern), Some(BreError::IntervalInvalid), "{pattern}");
+		}
+		// A count a character other than a digit or a comma interrupts is
+		// text in grep's ERE (`grep -cE 'a{1x}'` counts the lines holding
+		// `a{1x}`), and "Invalid content of \{\}" in a BRE, or "Unmatched \{"
+		// where the pattern ends inside it.
+		assert_eq!(ere("a{1x}"), r"a\{1x\}");
+		assert_eq!(ere("a{1,x}"), r"a\{1,x\}");
+		assert_eq!(ere("a{x,2,3}"), r"a\{x,2,3\}");
+		assert_eq!(ere("a{,"), r"a\{,");
+		assert_eq!(bre_err(r"a\{x\}"), Some(BreError::IntervalInvalid));
+		assert_eq!(bre_err(r"a\{1,x\}"), Some(BreError::IntervalInvalid));
+		assert_eq!(bre_err(r"a\{1,2x"), Some(BreError::BraceUnmatched));
+		// GNU sed's ERE reads it as its BRE does.
+		let sed_ere = |pattern: &str| translate(pattern, Dialect::Extended, Target::Fancy, false, Strictness::Sed).err();
+		assert_eq!(sed_ere("a{x}"), Some(BreError::IntervalInvalid));
+		assert_eq!(sed_ere("a{1"), Some(BreError::BraceUnmatched));
+		// With nothing to repeat the brace is text: `grep -cE '{1,2,3}'`
+		// counts the lines holding `{1,2,3}`.
+		assert_eq!(ere("{1,2,3}"), r"\{1,2,3\}");
+		assert_eq!(
+			translate(r"\{1,2,3\}", Dialect::Basic, Target::Rust, false, Strictness::Lenient).ok(),
+			Some(r"\{1,2,3\}".to_owned())
+		);
 	}
 
 	#[test]
@@ -1380,6 +1569,24 @@ mod tests {
 		// Still a literal where an atom precedes it.
 		assert_eq!(bre(r"a^b"), r"a\^b");
 		assert_eq!(bre(r"^a^"), r"^a\^");
+	}
+
+	#[test]
+	fn caret_after_an_assertion_is_a_literal() {
+		// If this regresses, `printf 'a\n^a\n' | grep -n '\<^a'` selects
+		// `a`, where GNU selects nothing: glibc anchors `^` only first in a
+		// branch, and `\<`, `\>`, `` \` `` and `\'` are tokens before it.
+		assert_eq!(bre(r"\<^a"), r"\b(?=\w)\^a");
+		assert_eq!(bre(r"\>^a"), r"\b(?<=\w)\^a");
+		assert_eq!(bre(r"\`^a"), r"\A\^a");
+		assert_eq!(bre(r"\'^a"), r"\z\^a");
+		assert_eq!(bre(r"x\|\<^a"), r"x|\b(?=\w)\^a");
+		assert_eq!(
+			translate(r"\(\<^a\)", Dialect::Basic, Target::Rust, false, Strictness::Lenient).ok(),
+			Some(r"(\<\^a)".to_owned())
+		);
+		// An ERE anchors it anywhere.
+		assert_eq!(ere(r"\<^a"), r"\<^a");
 	}
 
 	#[test]
@@ -1578,11 +1785,42 @@ mod tests {
 		// The other classes keep their POSIX definition.
 		assert_eq!(bre("[[:digit:]]"), "[[:digit:]]");
 		assert_eq!(bre("[[:space:]]"), "[[:space:]]");
-		// PCRE2 runs with PCRE2_UCP, where the POSIX class already means the
-		// Unicode one.
+		// PCRE2 for a line that is not UTF-8 runs without PCRE2_UCP, where
+		// its POSIX class is ASCII, as GNU's is in the C locale.
 		assert_eq!(
-			translate("[[:alpha:]]", Dialect::Basic, Target::Pcre, false, Strictness::Lenient).unwrap(),
+			translate("[[:alpha:]]", Dialect::Basic, Target::PcreBytes, false, Strictness::Lenient).unwrap(),
 			"[[:alpha:]]"
+		);
+	}
+
+	#[test]
+	fn pcre2_classes_mean_what_they_mean_to_the_regex_crate() {
+		// If this regresses, one back-reference among the patterns sends
+		// them all to PCRE2, whose PCRE2_UCP classes are not GNU's:
+		// `printf 'x\331\240\n' | grep -c -e '[[:digit:]]$' -e '\(y\)\1'`
+		// counts the line, where GNU counts 0, and `Ⅻ` is no `[[:alpha:]]`.
+		let pcre = |pattern: &str, icase: bool| {
+			translate(pattern, Dialect::Basic, Target::Pcre, icase, Strictness::Lenient).unwrap()
+		};
+		assert_eq!(pcre("[[:digit:]]", false), "[0-9]");
+		assert_eq!(pcre("[^[:xdigit:]]", false), "[^0-9A-Fa-f]");
+		assert_eq!(pcre("[[:alpha:]]", false), r"[\p{Alphabetic}]");
+		assert_eq!(pcre("[[:alnum:]]", false), r"[\p{Alphabetic}\p{Nd}]");
+		assert_eq!(pcre("[[:lower:]]", false), r"[\p{Lowercase}]");
+		assert_eq!(pcre("[[:upper:]]", false), r"[\p{Uppercase}]");
+		assert_eq!(pcre("[[:space:]]", false), "[[:space:]]");
+		// Without case `lower` and `upper` are `alpha`, as glibc reads them:
+		// PCRE2 folds no Unicode property, and `printf 'A\n' | grep -ci -e
+		// '^[[:lower:]]$' -e '\(y\)\1'` counts the line.
+		assert_eq!(pcre("[[:lower:]]", true), r"[\p{Alphabetic}]");
+		assert_eq!(pcre("[[:upper:]]", true), r"[\p{Alphabetic}]");
+		assert_eq!(
+			translate("[[:lower:]]", Dialect::Basic, Target::Rust, true, Strictness::Lenient).unwrap(),
+			r"[\p{Alphabetic}]"
+		);
+		assert_eq!(
+			translate("[[:digit:]]", Dialect::Basic, Target::PcreBytes, false, Strictness::Lenient).unwrap(),
+			"[[:digit:]]"
 		);
 	}
 
@@ -1628,6 +1866,18 @@ mod tests {
 	}
 
 	#[test]
+	fn the_confused_class_syntax_is_reported_after_every_other_error() {
+		// If this regresses, `echo x | sed 's/[:alpha:][z-a]/x/'` exits 4
+		// with the class-syntax message, where GNU sed prints "Invalid range
+		// end" and exits 1: GNU reports an error of the rest of the pattern
+		// first.
+		assert_eq!(bre_err("[:alpha:][z-a]"), Some(BreError::RangeEndInvalid));
+		assert_eq!(bre_err(r"[:alpha:]a\{1"), Some(BreError::BraceUnmatched));
+		assert_eq!(ere_err("[:alpha:](a|b)x[[:foo:]]"), Some(BreError::ClassNameInvalid));
+		assert_eq!(bre_err("[:alpha:]x"), Some(BreError::ClassSyntaxConfused));
+	}
+
+	#[test]
 	fn a_list_of_colons_alone_is_not_the_confused_class_syntax() {
 		// Measured: `grep -c '[::]'`, `grep -c '[:]'`, `grep -c '[:ab]'`,
 		// `grep -c '[a:b:]'` and `grep -c '[:-:]'` all search and exit 0 or 1,
@@ -1664,6 +1914,23 @@ mod tests {
 		);
 		// `[A-z]` folds to `A` and `Z`, a range either way.
 		assert!(translate("[A-z]", Dialect::Basic, Target::Rust, true, Strictness::Lenient).is_ok());
+	}
+
+	#[test]
+	fn a_range_is_written_with_the_ends_it_was_checked_with() {
+		// If this regresses, `printf 'b\n' | grep -ic '[a-Z]'` exits 2 on the
+		// engine's refusal of `[a-Z]`, where GNU counts 1, and `grep -ic
+		// '[A-z]'` selects `_`, where GNU does not: GNU's range under `-i`
+		// runs between the folded ends.
+		let icase = |pattern: &str, target: Target| {
+			translate(pattern, Dialect::Basic, target, true, Strictness::Lenient).unwrap()
+		};
+		assert_eq!(icase("[a-Z]", Target::Rust), "[A-Z]");
+		assert_eq!(icase("[A-z]", Target::Rust), "[A-Z]");
+		assert_eq!(icase("[a-~]", Target::Pcre), "[A-\\~]");
+		assert_eq!(icase("[!--]", Target::Fancy), r"[!-\-]");
+		// Read with case the range is written as it stands.
+		assert_eq!(bre("[a-z]"), "[a-z]");
 	}
 
 	/// GNU grep 3.11 refuses each with "Unmatched [, [^, [:, [., or [=".
@@ -1788,5 +2055,55 @@ mod tests {
 	fn an_expansion_beyond_the_limit_leaves_the_pattern_whole() {
 		let pattern = "(a|b)(c|d)(e|f)(g|h)(i|j)(k|l)(m|n)";
 		assert_eq!(alternatives(pattern, Dialect::Extended, Split::Grep), vec![pattern.to_owned()]);
+	}
+
+	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+	#[test]
+	fn groups_nested_past_the_limit_leave_the_pattern_whole() {
+		// If this regresses, a `sed -E` pattern nested 100,000 groups deep
+		// with a `|` overflows the stack while it is split and aborts the
+		// whole process, where it should fail as an invalid regex.
+		let deep = format!("{}a|b{}", "(".repeat(100_000), ")".repeat(100_000));
+		assert_eq!(alternatives(&deep, Dialect::Extended, Split::Sed), [deep.as_str()]);
+		let unclosed = format!("{}a|b", "(".repeat(100_000));
+		assert_eq!(alternatives(&unclosed, Dialect::Extended, Split::Grep), [unclosed.as_str()]);
+		let basic = format!("{}a\\|b", r"\(".repeat(100_000));
+		assert_eq!(alternatives(&basic, Dialect::Basic, Split::Sed), [basic.as_str()]);
+		// Up to the limit a top-level alternation is still split.
+		let nested = |depth: usize| format!("x|{}a{}", "(".repeat(depth), ")".repeat(depth));
+		assert_eq!(alternatives(&nested(64), Dialect::Extended, Split::Sed).len(), 2);
+		assert_eq!(alternatives(&nested(65), Dialect::Extended, Split::Sed), [nested(65)]);
+	}
+
+	#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+	#[test]
+	fn a_cached_match_is_searched_again_only_once_it_is_passed() {
+		// If this regresses, `grep -o` and `sed` search each alternative
+		// again at every position of a line, or miss a match they kept.
+		let mut cached = None;
+		assert_eq!(next_match(&mut cached, 0, || Ok::<_, ()>(Some((3, 5)))), Ok(Some((3, 5))));
+		// A position at or before the match keeps it without a search.
+		assert_eq!(next_match(&mut cached, 3, || Err(())), Ok(Some((3, 5))));
+		// A position past its start is searched again.
+		assert_eq!(next_match(&mut cached, 4, || Ok::<_, ()>(None)), Ok(None));
+		// No match from a position is none from a later one either.
+		assert_eq!(next_match(&mut cached, 9, || Err(())), Ok(None));
+	}
+
+	#[cfg(feature = "util.grep")]
+	#[test]
+	fn a_literal_holds_no_character_its_dialect_reads_as_special() {
+		// If this regresses, `grep -o` searches a pattern holding an operator
+		// as a plain string, and prints its text instead of its matches.
+		assert!(is_literal("abc def", Dialect::Basic));
+		assert!(is_literal("a+b?{c}(d)|e]", Dialect::Basic));
+		assert!(is_literal("a}b]", Dialect::Extended));
+		for pattern in [r"a\.b", "a.b", "[ab]", "a*", "^a", "a$"] {
+			assert!(!is_literal(pattern, Dialect::Basic), "{pattern}");
+			assert!(!is_literal(pattern, Dialect::Extended), "{pattern}");
+		}
+		for pattern in ["a+", "a?", "a{2}", "(a)", "a|b"] {
+			assert!(!is_literal(pattern, Dialect::Extended), "{pattern}");
+		}
 	}
 }
