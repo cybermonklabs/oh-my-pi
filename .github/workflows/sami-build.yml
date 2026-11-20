@@ -123,9 +123,8 @@ jobs:
     # the same `bazel test //crates/...` on a GitHub-hosted runner, uncached as
     # release_binary builds, and release_github waits for it. It needs no
     # earlier job, so it starts beside carry rather than after the version.
-    # It runs the Bazel test targets only, as rust_validate does: the files
-    # under crates/*/tests that no BUILD.bazel names, and the doctests, do not
-    # run here.
+    # It runs every Bazel test target, and the parity step fails while a test
+    # target of the repository's own Rust suite has none.
     # A test that fails at a release for a reason being fixed elsewhere is
     # named in .github/sami/rust-test-known-failures.txt. The job fails when a
     # test that is not named fails, when a target fails to build, and when a
@@ -145,6 +144,75 @@ jobs:
       - uses: ./.github/actions/bun-install
       - id: bazel
         uses: ./.github/actions/bazel-cache
+      # pi-builtins' rsync conformance and daemon tests compare the builtin
+      # byte for byte with rsync 3.5.1 built with every checksum and
+      # compressor the builtin offers, and skip without one; the runner's
+      # rsync is 3.2.7, so they ran nowhere. The test step puts this build
+      # first on the tests' PATH and sets RSYNC_REFERENCE_REQUIRED, with which
+      # a missing or incomplete reference fails them instead.
+      - name: Libraries of the reference rsync
+        run: |
+          sudo apt-get -q update
+          sudo apt-get -q install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
+      - id: rsync-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/rsync-ref
+          # The tarball's sha256: the build is a function of it and of the
+          # runner image's libraries.
+          key: rsync-3.5.1-c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef-ubuntu-22.04
+      - name: Build the reference rsync 3.5.1
+        if: steps.rsync-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # download.samba.org has timed out or answered 504 for hours at a
+          # time (2026-11-20), so the UK mirror of rsync.samba.org comes first;
+          # each source is tried with retries, and only the tarball with the
+          # pinned sha256 is used.
+          sha=c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef
+          tarball="$RUNNER_TEMP/rsync-3.5.1.tar.gz"
+          got=""
+          for url in \
+            https://www.mirrorservice.org/sites/rsync.samba.org/src/rsync-3.5.1.tar.gz \
+            https://download.samba.org/pub/rsync/src/rsync-3.5.1.tar.gz; do
+            if curl -fsSL --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 20 --max-time 120 -o "$tarball" "$url" &&
+              echo "$sha  $tarball" | sha256sum -c -; then
+              got="$url"
+              break
+            fi
+            echo "::warning title=Reference rsync::$url gave no tarball with sha256 $sha"
+          done
+          if [ -z "$got" ]; then
+            echo "::error title=Reference rsync::no source gave rsync-3.5.1.tar.gz with sha256 $sha"
+            exit 1
+          fi
+          echo "rsync-3.5.1.tar.gz from $got"
+          mkdir -p "$RUNNER_TEMP/rsync-build" "$HOME/rsync-ref/bin"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/rsync-build"
+          cd "$RUNNER_TEMP/rsync-build/rsync-3.5.1"
+          ./configure --disable-md2man
+          make -j "$(nproc)"
+          cp rsync "$HOME/rsync-ref/bin/rsync"
+      - name: Check the reference rsync
+        shell: bash
+        run: |
+          version="$("$HOME/rsync-ref/bin/rsync" --version)"
+          printf '%s\n' "$version" | head -n 1
+          checksums="$(printf '%s\n' "$version" | sed -n '/Checksum list/{n;p}')"
+          compressors="$(printf '%s\n' "$version" | sed -n '/Compress list/{n;p}')"
+          echo "checksums: $checksums"
+          echo "compressors: $compressors"
+          case "$version" in "rsync  version 3.5.1  protocol version 33"*) ;; *)
+            echo "::error title=Reference rsync::$HOME/rsync-ref/bin/rsync is not rsync 3.5.1"
+            exit 1
+            ;;
+          esac
+          for need in xxh128 xxh3 xxh64; do
+            case " $checksums " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need checksum"; exit 1 ;; esac
+          done
+          for need in zstd lz4; do
+            case " $compressors " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need compressor"; exit 1 ;; esac
+          done
       - name: Rust tests against the known-failure list
         # bash with pipefail: a failed jq or awk must fail the step, never read
         # as "no test failed".
@@ -172,6 +240,12 @@ jobs:
           not_roots=()
           for target in "${roots[@]}"; do not_roots+=("-$target"); done
           rc=0
+          # The reference rsync goes first on the tests' PATH (the rest is the
+          # PATH Bazel's strict action env gives a test), and
+          # RSYNC_REFERENCE_REQUIRED makes an rsync test without it fail
+          # rather than skip.
+          test_path="$HOME/rsync-ref/bin:/usr/local/bin:/usr/bin:/bin"
+          env_flags=(--test_env=PATH="$test_path" --test_env=RSYNC_REFERENCE_REQUIRED=1)
           # --keep_going: the ci config stops at the first target that fails to
           # build, and so skipped 7 of the 17 test targets in run 44694233578;
           # a release gate names every failure in one run.
@@ -181,13 +255,14 @@ jobs:
           # binary that exits 0 before its tests end shows, whatever a child
           # process printed. rules_rust's doctest runner passes the arguments
           # on to the doctest binaries and writes libtest's text summary itself.
-          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" -- //crates/... "${not_roots[@]}" || rc=$?
+          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" -- //crates/... "${not_roots[@]}" || rc=$?
           # --show-output puts each passed test's output in its record, so a
           # root test that printed `not run:` (its precondition, root, broke)
-          # can be failed below.
+          # can be failed below. sudo resets PATH to its secure_path, so the
+          # test's PATH is given again after it.
           rc_root=0
           if [ "${#roots[@]}" -gt 0 ]; then
-            bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --run_under="sudo -E" --test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output --build_event_json_file="$bep_root" -- "${roots[@]}" || rc_root=$?
+            bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" --run_under="sudo -E env PATH=$test_path" --test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output --build_event_json_file="$bep_root" -- "${roots[@]}" || rc_root=$?
           fi
           # Bazel exits 0 when every test passed, 3 when every target built and
           # a test failed, and 1 when a target failed to build (the others
