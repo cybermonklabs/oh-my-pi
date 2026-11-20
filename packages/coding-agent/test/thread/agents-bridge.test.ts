@@ -5,6 +5,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { IrcBus } from "../../src/irc/bus";
 import { handleRpcSteerSubagent } from "../../src/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry } from "../../src/modes/rpc/rpc-subagents";
@@ -12,6 +13,7 @@ import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
 import type { AgentSessionHandle } from "../../src/session/agent-session-handle";
+import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
 import { SessionManager } from "../../src/session/session-manager";
@@ -265,6 +267,141 @@ describe("agent bridging across subagent workers", () => {
 		await waitFor(() =>
 			remote.messages.some(message => message.role === "custom" && message.customType === "irc:incoming"),
 		);
+	});
+
+	it("tells IRC delivered on a worker a message from a descendant past an ended parent", async () => {
+		// If this regresses, a worker reads refs without their recorded ancestry: a keep-alive subagent under a
+		// subagent that has ended (unregistered) reaches its worker-homed ancestor as a peer, its question waiting
+		// for a turn of its own while the ancestor's run waits on it.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		registry.register({ id: "Child", displayName: "task", kind: "sub", parentId: "Main", session: null });
+		registry.register({ id: "Child.Kid", displayName: "task", kind: "sub", parentId: "Child", session: null });
+		registry.register({
+			id: "Child.Kid.Grand",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Child.Kid",
+			session: null,
+		});
+		registry.unregister("Child.Kid");
+
+		expect(await probe.inRunFrom("Child", "Child.Kid.Grand")).toBe(true);
+	});
+
+	it("lends a worker-homed agent its nearest main-thread ancestor's extensions past an ended parent", async () => {
+		// If this regresses, a worker-homed subagent under a subagent that has ended (unregistered) takes the `Main`
+		// session's extension runner, for a helper session's subagent the host's, instead of its nearest main-thread
+		// ancestor's.
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		const helperRunner = {} as ExtensionRunner;
+		const registry = AgentRegistry.global();
+		registry.register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			session: { extensionRunner: {} } as unknown as AgentSession,
+			status: "idle",
+		});
+		registry.register({
+			id: "Helper",
+			displayName: "helper",
+			kind: "main",
+			session: { extensionRunner: helperRunner } as unknown as AgentSession,
+			status: "idle",
+		});
+		registry.register({ id: "Helper-Child", displayName: "task", kind: "sub", parentId: "Helper", session: null });
+		registry.register({ id: "W1", displayName: "W1", kind: "sub", parentId: "Helper-Child", session: remote });
+		registry.unregister("Helper-Child");
+
+		expect(remote.extensionRunner).toBe(helperRunner);
+	});
+
+	it("releases on main the agents under a helper session that ends on a worker", async () => {
+		// If this regresses, a worker's lifecycle proxy refuses the release that a helper session hosted there (a
+		// `/security` scan a worker-homed subagent started) asks for at its end: the helper's subagents stay live on
+		// main after it ended.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		const lifecycle = AgentLifecycleManager.global();
+		const disposals: Array<AgentSessionDisposeOptions | undefined> = [];
+		let hostSubDisposals = 0;
+		const helperSub = {
+			dispose: async (options?: AgentSessionDisposeOptions) => {
+				disposals.push(options);
+			},
+		} as unknown as AgentSession;
+		const hostSub = {
+			dispose: async () => {
+				hostSubDisposals++;
+			},
+		} as unknown as AgentSession;
+		registry.register({ id: "Helper", displayName: "helper", kind: "main", session: null, status: "running" });
+		const helperRef = registry.register({
+			id: "Helper-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Helper",
+			session: helperSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Helper-Sub", { idleTtlMs: 0 }, helperRef);
+		const hostRef = registry.register({
+			id: "Host-Sub",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Main",
+			session: hostSub,
+			status: "idle",
+		});
+		lifecycle.adopt("Host-Sub", { idleTtlMs: 0 }, hostRef);
+
+		await probe.releaseUnder("Helper");
+
+		expect(disposals).toEqual([{ ownedJobsEnd: "stop" }]);
+		expect(registry.get("Helper-Sub")).toBeUndefined();
+		expect(lifecycle.has("Helper-Sub")).toBe(false);
+		expect(registry.get("Host-Sub")).toBe(hostRef);
+		expect(hostSubDisposals).toBe(0);
+		expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
+	});
+
+	it("tells a worker that a release on main is in flight, and settles its wait only once that release is over", async () => {
+		// If this regresses, an isolated run that ends on a worker (an isolated task of a worker-homed subagent) reads
+		// no release in flight, or reads one as over before it is: its end removes the worktree that the release's hook
+		// still has to capture, and the agent's changes are lost.
+		const { probe } = await startWorker();
+		const registry = AgentRegistry.global();
+		const lifecycle = AgentLifecycleManager.global();
+		const disposing = Promise.withResolvers<void>();
+		const session = { dispose: () => disposing.promise } as unknown as AgentSession;
+		registry.register({
+			id: "Releasing",
+			displayName: "task",
+			kind: "sub",
+			parentId: "Main",
+			session,
+			status: "idle",
+		});
+		expect(await probe.isReleasing("Releasing")).toBe(false);
+
+		const release = lifecycle.release("Releasing");
+		expect(await probe.isReleasing("Releasing")).toBe(true);
+		let over = false;
+		const waited = probe.whenReleased("Releasing").then(() => {
+			over = true;
+		});
+		// Each round trip below reaches main after the wait's own call and its answer would, so a wait that settles
+		// at once (on the worker or on main) has settled by the last of them.
+		for (let i = 0; i < 3; i++) expect(await probe.isReleasing("Releasing")).toBe(true);
+		expect(over).toBe(false);
+
+		disposing.resolve();
+		expect(await release).toBe(true);
+		await waited;
+		expect(await probe.isReleasing("Releasing")).toBe(false);
 	});
 
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {

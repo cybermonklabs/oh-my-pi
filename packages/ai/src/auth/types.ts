@@ -122,6 +122,8 @@ export interface DisabledCredentialSummary {
 	id: number;
 	provider: string;
 	type: AuthCredential["type"];
+	/** Store-defined account identity, identical to the key used by snapshots and session account pools. */
+	identityKey?: string;
 	email?: string;
 	accountId?: string;
 	/** Organization/workspace the credential was scoped to (Anthropic/ChatGPT multi-subscription). */
@@ -131,6 +133,54 @@ export interface DisabledCredentialSummary {
 	cause: string;
 	/** Epoch ms the row was disabled (SQLite `updated_at`), when known. */
 	disabledAtMs?: number;
+}
+
+/** Disable cause of a credential the user deleted (`omp` auth commands, `/logout`). */
+export const DELETED_BY_USER = "deleted by user";
+/** Disable cause of a credential the user logged out of on the auth broker (`omp auth-broker logout`). */
+export const LOGGED_OUT_BY_USER = "logged out by user";
+/** Disable cause prefix of a credential a newer one replaced (`replaced by newer credential`, `replaced by oauth login`). */
+export const REPLACED_BY_CAUSE_PREFIX = "replaced by";
+/** Disable cause prefix of a duplicate row of an account merged away (`deduplicated duplicate credential`). */
+export const DEDUPLICATED_CAUSE_PREFIX = "deduplicated";
+
+/** Whether a disable cause records the user's own removal of a credential. */
+export function isUserRemovalCause(cause: string): boolean {
+	const lower = cause.toLowerCase();
+	return lower.startsWith(DELETED_BY_USER) || lower.startsWith(LOGGED_OUT_BY_USER);
+}
+
+/**
+ * Whether a tombstone records an OAuth credential torn down automatically
+ * (refresh failure, upstream invalidation) rather than one the user replaced,
+ * deleted or logged out of, or a duplicate merged away: lost capacity a new
+ * login restores, not lifecycle noise.
+ */
+export function isAutoDisabledCredential(summary: DisabledCredentialSummary): boolean {
+	if (summary.type !== "oauth" || isUserRemovalCause(summary.cause)) return false;
+	const cause = summary.cause.toLowerCase();
+	return !cause.startsWith(REPLACED_BY_CAUSE_PREFIX) && !cause.startsWith(DEDUPLICATED_CAUSE_PREFIX);
+}
+
+/**
+ * A failure-disabled login remains recoverable until a later removal or
+ * replacement of the same store identity. Missing identities match the whole
+ * provider conservatively; unknown timestamps sort first and removal wins ties.
+ */
+export function isRecoverableDisabledCredential(
+	failure: DisabledCredentialSummary,
+	tombstones: readonly DisabledCredentialSummary[],
+): boolean {
+	return (
+		isAutoDisabledCredential(failure) &&
+		!tombstones.some(
+			removal =>
+				removal.provider === failure.provider &&
+				!isAutoDisabledCredential(removal) &&
+				(!failure.identityKey || !removal.identityKey || failure.identityKey === removal.identityKey) &&
+				(removal.disabledAtMs ?? 0) >= (failure.disabledAtMs ?? 0),
+		)
+	);
 }
 
 /**
@@ -455,6 +505,19 @@ export interface UsageLimitMarkResult {
 /** Combined model availability state across stored accounts. */
 export type ModelUsageHealthState = "healthy" | "reserve" | "depleted" | "unknown";
 
+/**
+ * Why {@link HealthApi.model} reads one account `depleted`:
+ * - `"usage"`: an exhausted current usage window in the report, or a
+ *   usage-limit block (the catch-all scope or a usage scope of the provider's
+ *   ranking strategy, which `limits.markReached` writes).
+ * - `"account-policy"`: account-policy blocks (the `account-policy` scope or a
+ *   `model-policy:<model>` scope) and no usage block; an `auth` block may hold
+ *   the account too.
+ * - `"auth"`: an `auth` block (a 401 or a failed OAuth refresh) and no other
+ *   block.
+ */
+export type ModelUsageDepletionCause = "usage" | "account-policy" | "auth";
+
 /** Usage health of one stored credential for a model. */
 export interface ModelUsageAccountHealth {
 	credentialId: number;
@@ -464,6 +527,12 @@ export interface ModelUsageAccountHealth {
 	state: ModelUsageHealthState;
 	remainingFraction?: number;
 	resetsAt?: number;
+	/**
+	 * Set on every `depleted` account and on no other. An account held by a
+	 * usage block and any other block reads `"usage"`; one held by
+	 * account-policy and auth blocks reads `"account-policy"`.
+	 */
+	depletedBy?: ModelUsageDepletionCause;
 }
 
 /** Aggregate model usage health and account detail. */
@@ -918,24 +987,38 @@ export interface CredentialsApi {
 	 */
 	upsert(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]>;
 	/**
-	 * Remove credential for a provider.
+	 * Remove credential for a provider, and record the user's removal on the
+	 * provider's logins a failure disabled; a remote store with an account pool
+	 * records it only on the disabled logins its pool shows ({@link listDisabled}).
+	 * A remote store throws `AuthBrokerRemovalNotRecordedError` when its broker
+	 * refuses that record.
 	 */
 	remove(provider: string): Promise<void>;
 	/**
-	 * Remove one stored credential for a provider.
+	 * Remove one stored credential for a provider, or record the user's removal
+	 * on its tombstone when a failure disabled it and {@link listDisabled} lists
+	 * it. A remote store throws `AuthBrokerRemovalNotRecordedError` when its
+	 * broker refuses that record.
 	 */
 	removeById(provider: string, credentialId: number): Promise<boolean>;
 	/**
-	 * Disable the credential with the given id and emit a
+	 * Disable the active credential with the given id and emit a
 	 * {@link CredentialDisabledEvent}. Used by the auth-broker server to honour
-	 * `POST /v1/credential/:id/disable`. Resolves after persistence; returns
-	 * `false` when no active row with this ID exists.
+	 * `POST /v1/credential/:id/disable`. Resolves after persistence. For a user's
+	 * removal cause ({@link isUserRemovalCause}), an id that is no longer active
+	 * but whose tombstone a failure left ({@link isAutoDisabledCredential}) gets
+	 * the removal recorded on that tombstone instead, with no event; a remote
+	 * store throws `AuthBrokerRemovalNotRecordedError` when its broker refuses
+	 * that, and under an account pool records it only on a tombstone
+	 * {@link listDisabled} lists. Returns `false` when it changed no row.
 	 */
 	disable(id: number, disabledCause: string): Promise<boolean>;
 	/**
-	 * Disabled credential tombstones for display surfaces (`omp usage`,
-	 * broker `GET /v1/credentials/disabled`). Empty when the backing store
-	 * keeps no tombstones or the remote broker predates the endpoint.
+	 * Disabled credential tombstones (`omp usage`, `/logout`, broker
+	 * `GET /v1/credentials/disabled`). A remote store with an account pool lists
+	 * only the tombstones of the pool's accounts, by the rule its active rows
+	 * follow. Empty when the backing store keeps no tombstones or the remote
+	 * broker predates the endpoint.
 	 */
 	listDisabled(provider?: string, signal?: AbortSignal): Promise<DisabledCredentialSummary[]>;
 	/**
@@ -1248,6 +1331,16 @@ export interface SessionsApi {
 	 * {@link restrict} list names.
 	 */
 	permits(provider: string, sessionId: string, credentialId: number): boolean;
+	/**
+	 * Whether a stored identity (including a disabled tombstone) belongs to the
+	 * session's account pool. Unrestricted sessions allow every identity; a
+	 * restricted session rejects missing identities and keys outside its list.
+	 * A custom implementation should provide it. Without it, a caller cannot tell
+	 * which disabled logins a restricted session's pool holds: omp's key retry
+	 * then waits for none of them in that session, and logs one warning per provider
+	 * in each thread.
+	 */
+	permitsIdentity?(provider: string, sessionId: string, identityKey: string | undefined): boolean;
 	/**
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released

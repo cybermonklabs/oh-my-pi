@@ -2,8 +2,9 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type FileLockHandle, isEnoent, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
+import type { SessionBlobSweep, SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -82,8 +83,9 @@ export interface SqlSessionStorageOptions {
 	adapter?: SqlSessionStorageAdapter;
 	/**
 	 * Session table name. Default: `omp_session_files`; appended parts live in
-	 * `<table>_parts`. Must match `[A-Za-z_][A-Za-z0-9_]{0,56}`: at most 57
-	 * characters, so `<table>_parts` fits the 63-character identifier limit.
+	 * `<table>_parts`, and blobs a session cannot draw again in `<table>_blobs`.
+	 * Must match `[A-Za-z_][A-Za-z0-9_]{0,56}`: at most 57 characters, so
+	 * `<table>_parts` and `<table>_blobs` fit the 63-character identifier limit.
 	 * Both names are inlined into prepared statements, so we accept
 	 * identifier-safe inputs only (no quoted/dotted names).
 	 */
@@ -97,6 +99,12 @@ export interface SqlSessionStorageOptions {
 	 * owned by an external migration.
 	 */
 	createTable?: boolean;
+	/**
+	 * Largest blob one row of `<table>_blobs` holds; a larger one is stored
+	 * as parts of at most this size. Default: 512 MiB, or the server's
+	 * `max_allowed_packet` less 1 MiB on MySQL and MariaDB when that is smaller.
+	 */
+	maxBlobBytes?: number;
 	/**
 	 * Claim the sessions this process writes (`claimSession`,
 	 * `acquireSessionClaim`, `sessionClaimLost`), so a second live process
@@ -143,7 +151,7 @@ interface Statement {
 	readonly params: readonly string[];
 }
 
-type StatementValues = Readonly<Record<string, string | number | bigint | null>>;
+type StatementValues = Readonly<Record<string, string | number | bigint | Uint8Array | null>>;
 
 interface DialectQueries {
 	createTable: string;
@@ -314,6 +322,68 @@ interface DialectQueries {
 	 * longer holding the same bytes at its offset (see {@link readParts}).
 	 */
 	partRowids: { next: Statement; insert: Statement } | undefined;
+	/** The blob table, `<table>_blobs`: one row per SHA-256 of a blob a session references and cannot draw again. */
+	createBlobsTable: string;
+	/** Add a blob row unless its hash has one; answers a row only when it added one (MySQL: `affectedRows`). */
+	insertBlob: Statement;
+	/** The hash, bytes and size of `count` hashes' rows, bound as `@h0` to `@h<count - 1>`. */
+	selectBlobs(count: number): Statement;
+	/** The hash and size of `count` hashes' rows, bound as `@h0` to `@h<count - 1>`; reads no content. */
+	selectBlobSizes(count: number): Statement;
+	/**
+	 * PostgreSQL and MySQL: each of `count` hashes' whole rows (not a parted
+	 * blob's list of parts) with the hex SHA-256 the server computes of its
+	 * bytes; SQLite has no such function, so its rows are read and hashed here.
+	 */
+	blobDigests: ((count: number) => Statement) | undefined;
+	/** Rewrite a row's bytes and size, for a row whose bytes do not hash to its key. */
+	repairBlob: Statement;
+	/** Delete `count` hashes' rows. */
+	deleteBlobs(count: number): Statement;
+	/**
+	 * Lock `count` hashes' rows in key order: shared for a write that adds a
+	 * reference to them, exclusive for a delete that may remove them.
+	 */
+	lockBlobs(count: number, exclusive: boolean): Statement;
+	/** Blob rows created before `@before` that no reference row names, with their sizes. */
+	sweepCandidates: Statement;
+	/** MySQL and MariaDB: the server's `max_allowed_packet`, which bounds the blob an insert can carry. */
+	maxPacket: Statement | undefined;
+	/**
+	 * The reference table, `<table>_refs`: one row per session path and blob
+	 * hash its transcript names, and per parted blob (`blob:sha256:<hash>`)
+	 * and each of its parts.
+	 */
+	createRefsTable: string;
+	/** The reference table's index on `sha256` (PostgreSQL and SQLite; MySQL's is in its `CREATE TABLE`). */
+	createRefsIndex: string | undefined;
+	/** Add the reference of `@path` to `@sha256` unless it is there. */
+	insertRef: Statement;
+	/** The references of `count` paths (path and hash), bound as `@p0` to `@p<count - 1>`. */
+	refsOf(count: number): Statement;
+	/** The references (path and hash) of the paths under `@dir` (its first `@len` characters, compared as {@link deleteUnder} compares them). */
+	refsUnder: Statement;
+	/** Of `count` hashes, the ones a reference row names (PostgreSQL and SQLite; MySQL's is {@link referencedOne}). */
+	referenced(count: number): Statement;
+	/**
+	 * MySQL: whether a reference row names `@h`, read with a shared lock through the `sha256` index, so it sees
+	 * the latest commits, and locks only the first entry of `@h` (or, with none, the gap where it would be).
+	 */
+	referencedOne: Statement | undefined;
+	/** Drop the reference of `@path` to `@sha256`. */
+	deleteRef: Statement;
+	/** The references (path and hash) of session paths that have no session row (deleted by a build that kept no references). */
+	danglingRefs: Statement;
+	/** PostgreSQL and SQLite: drop the reference of `@path` to `@sha256` while `@path` has no session row. */
+	deleteDanglingRef: Statement;
+	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too, as {@link deleteUnder} compares the prefix (MySQL's caller names, without `under`, only rows there are). */
+	lockSessionRowsForWrite: ((count: number, under: boolean) => Statement) | undefined;
+	/** MySQL: the paths of `count` paths that have a session row, read without a lock. */
+	sessionRowsOf: ((count: number) => Statement) | undefined;
+	/** MySQL and SQLite: the columns of a table's primary key, in key order (PostgreSQL: {@link PG_PRIMARY_KEY}). */
+	primaryKey: Statement | undefined;
+	/** MySQL: statements that change no row and need, each, one privilege the store's writes need on the blob and reference tables. */
+	privilegeProbes: Array<{ table: string; privilege: string; probe: Statement }>;
 	/** The lease table's statements: PostgreSQL and MySQL only; a SQLite claim is an OS lock. */
 	lease: LeaseQueries | undefined;
 }
@@ -558,6 +628,41 @@ interface ChunksPass {
 	sources: number;
 }
 
+/** `selectBlobs` row. */
+interface BlobRow {
+	sha256: string;
+	content: Uint8Array;
+	byte_len: number | bigint | string;
+}
+
+/** `blobDigests` row. */
+interface BlobDigestRow {
+	sha256: string;
+	digest: string | Uint8Array;
+}
+
+/** A row with only a hash column. */
+interface HashRow {
+	sha256: string;
+}
+
+/** A row with only a path column. */
+interface PathRow {
+	path: string;
+}
+
+/** A reference row. */
+interface RefRow {
+	path: string;
+	sha256: string;
+}
+
+/** `selectBlobSizes` row. */
+interface BlobSizeRow {
+	sha256: string;
+	byte_len: number | bigint | string;
+}
+
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,56}$/;
 const DEFAULT_LEASE_TABLE = "omp_session_leases";
@@ -712,6 +817,25 @@ const STAGING_MARK = "#staging-";
 const STAGING_EPOCH_DIGITS = 13;
 /** Age at which a staging set is a dead writer's: a live full write finishes far sooner. */
 const STALE_STAGING_MS = 60 * 60 * 1000;
+/** Hashes one blob size read asks for. */
+const BLOB_READ_BATCH = 100;
+/** Bytes one blob read asks for (a larger blob is read alone), so a read holds at most about this much at a time. */
+const BLOB_READ_BYTES = 16 * 1024 * 1024;
+/** Tries of one blob write before the transcript write waiting for it fails; the blob stays queued for the next. */
+const BLOB_WRITE_ATTEMPTS = 3;
+/** Wait before the second try of a blob write, doubled before each later one. */
+const BLOB_RETRY_MS = 250;
+/** Largest blob the table takes on PostgreSQL and SQLite (both bound one value near 1 GB). */
+const MAX_BLOB_BYTES = 512 * 1024 * 1024;
+/** Room in a MySQL packet for the insert's statement and its other values, beside the blob. */
+const MYSQL_PACKET_HEADROOM = 1024 * 1024;
+/**
+ * The path prefix of a parted blob's references: a blob larger than one row
+ * takes is stored as parts, each a blob row under its own hash, and the row
+ * of its own hash lists them; `<prefix><hash>` references each part, so no
+ * sweep takes a part of a kept blob.
+ */
+const BLOB_PARTS_PATH = "blob:sha256:";
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -952,7 +1076,19 @@ const PG_HOLDER_INDEX_NAME = statement(
 		"LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid WHERE c.oid = pg_catalog.to_regclass(@index)",
 );
 /**
- * Whether each of the store's three PostgreSQL tables exists, by name, as
+ * The reference table's indexes led by `sha256`, whatever their names: a
+ * delete's look for the references of the blobs it would take, and the
+ * sweep's, read by `sha256` alone (the primary key leads with `path`).
+ * Found through `pg_index`, as {@link PG_HOLDER_INDEXES} are.
+ */
+const PG_RHASH_INDEXES = statement(
+	"postgres",
+	"SELECT i.indexrelid::text AS oid FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a " +
+		"ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] WHERE i.indrelid = pg_catalog.to_regclass(@table) " +
+		"AND i.indexprs IS NULL AND i.indpred IS NULL AND a.attname = 'sha256'",
+);
+/**
+ * Whether each of the store's PostgreSQL tables exists, by name, as
  * `CREATE TABLE IF NOT EXISTS` finds it (any relation of that name counts;
  * the table check refuses one that is not an ordinary table),
  * `default_transaction_read_only`'s `setting` and `reset_val`, as
@@ -964,6 +1100,7 @@ const PG_TABLES_PRESENT = statement(
 	"postgres",
 	"SELECT pg_catalog.to_regclass(@session) IS NOT NULL AS session, " +
 		"pg_catalog.to_regclass(@parts) IS NOT NULL AS parts, pg_catalog.to_regclass(@lease) IS NOT NULL AS lease, " +
+		"pg_catalog.to_regclass(@blobs) IS NOT NULL AS blobs, pg_catalog.to_regclass(@refs) IS NOT NULL AS refs, " +
 		"s.setting AS read_only_setting, s.reset_val AS read_only_reset_val, " +
 		"pg_catalog.pg_is_in_recovery() AS in_recovery " +
 		"FROM pg_catalog.pg_settings s WHERE s.name = 'default_transaction_read_only'",
@@ -974,6 +1111,8 @@ interface TablesPresentRow {
 	session: boolean | string;
 	parts: boolean | string;
 	lease: boolean | string;
+	blobs: boolean | string;
+	refs: boolean | string;
 	read_only_setting: string;
 	read_only_reset_val: string;
 	in_recovery: boolean | string;
@@ -1050,12 +1189,20 @@ const PG_TABLE_COLUMNS = statement(
 		"AND NOT a.attisdropped",
 );
 /**
- * Everything on one of the store's PostgreSQL tables that runs code on its
- * writes and is not the store's: a trigger, a rule, a row-level security
- * policy or the security itself, a relation that is not an ordinary table, a
- * constraint other than a primary key, unique or not-null one, an index on
- * an expression or with a predicate, and a table that inherits from it (the
- * store's updates and deletes reach a child's rows, and so its triggers).
+ * Everything on one of the store's PostgreSQL tables, or above it, that runs
+ * code on its writes and is not the store's: a trigger, a rule, a row-level
+ * security policy or the security itself, a relation that is not an ordinary
+ * table, a constraint other than a primary key, unique or not-null one, an
+ * index on an expression or with a predicate, a table that inherits from it
+ * (the store's updates and deletes reach a child's rows, and so its
+ * triggers), a table it is a partition or an inheritance child of: each
+ * insert into a partition checks the partition constraint, which evaluates
+ * the parent's partition key, a function of the parent's owner's choosing,
+ * as the writer. A partition that `pg_inherits` does not name (`relispartition`
+ * alone) is refused too, so the check fails closed. And a foreign key of
+ * another table that references it: the store's updates and deletes fire that
+ * key's referential action on the other table, and so the other table's
+ * triggers.
  */
 const PG_TABLE_OBJECTS = statement(
 	"postgres",
@@ -1074,9 +1221,48 @@ const PG_TABLE_OBJECTS = statement(
 		"UNION ALL SELECT 'index', i.indexrelid::pg_catalog.regclass::text FROM pg_catalog.pg_index i " +
 		"WHERE i.indrelid = pg_catalog.to_regclass(@table) AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL) " +
 		"UNION ALL SELECT 'inheritance', h.inhrelid::pg_catalog.regclass::text FROM pg_catalog.pg_inherits h " +
-		"WHERE h.inhparent = pg_catalog.to_regclass(@table)",
+		"WHERE h.inhparent = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT CASE WHEN c.relispartition THEN 'partition of' ELSE 'inherits from' END, " +
+		"h.inhparent::pg_catalog.regclass::text FROM pg_catalog.pg_inherits h " +
+		"JOIN pg_catalog.pg_class c ON c.oid = h.inhrelid WHERE h.inhrelid = pg_catalog.to_regclass(@table) " +
+		"UNION ALL SELECT 'partition of', 'a parent pg_inherits does not name' FROM pg_catalog.pg_class c " +
+		"WHERE c.oid = pg_catalog.to_regclass(@table) AND c.relispartition " +
+		"AND NOT EXISTS (SELECT FROM pg_catalog.pg_inherits h WHERE h.inhrelid = c.oid) " +
+		"UNION ALL SELECT 'referenced by', k.conrelid::pg_catalog.regclass::text || ' (' || k.conname::text || ')' " +
+		"FROM pg_catalog.pg_constraint k WHERE k.confrelid = pg_catalog.to_regclass(@table) AND k.contype = 'f' " +
+		"AND k.conrelid <> k.confrelid",
 );
-/** The columns of the store's three PostgreSQL tables and their declared types, as `format_type` prints them. */
+/**
+ * The columns of a table's primary key. The blob table's insert names its
+ * `sha256` key in `ON CONFLICT`, which refuses a table without that key.
+ */
+const PG_PRIMARY_KEY = statement(
+	"postgres",
+	"SELECT a.attname::text AS name FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a " +
+		"ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) " +
+		"WHERE i.indrelid = pg_catalog.to_regclass(@table) AND i.indisprimary",
+);
+/** Whether the store's login holds `@privilege` on a table, through a grant to it, to PUBLIC or to a role it is a member of. */
+const PG_HAS_PRIVILEGE = statement(
+	"postgres",
+	"SELECT pg_catalog.has_table_privilege(pg_catalog.to_regclass(@table), @privilege) AS can",
+);
+/**
+ * What the blob writes, reference writes and session deletes need of the
+ * blob and reference tables (by suffix): the key their `ON CONFLICT` names,
+ * and the privileges they use.
+ */
+const BLOB_TABLE_NEEDS = {
+	blobs: { key: ["sha256"], privileges: ["INSERT", "UPDATE", "DELETE"] },
+	refs: { key: ["path", "sha256"], privileges: ["INSERT", "DELETE", "UPDATE"] },
+} as const;
+
+/** What is wrong with a table's primary key `found`, compared as a set with `wanted`; undefined when nothing. */
+function primaryKeyProblem(found: readonly string[], wanted: readonly string[]): string | undefined {
+	if ([...found].sort().join(", ") === [...wanted].sort().join(", ")) return undefined;
+	return found.length === 0 ? "no primary key" : `primary key (${found.join(", ")}), not (${wanted.join(", ")})`;
+}
+/** The columns of the store's PostgreSQL tables and their declared types, as `format_type` prints them. */
 const PG_DECLARED_COLUMNS = {
 	session: {
 		path: "text",
@@ -1088,6 +1274,8 @@ const PG_DECLARED_COLUMNS = {
 		byte_len: "bigint",
 	},
 	parts: { path: "text", start_offset: "bigint", content: "text" },
+	blobs: { sha256: "text", content: "bytea", byte_len: "bigint", mime_type: "text", created_ms: "bigint" },
+	refs: { path: "text", sha256: "text" },
 	lease: {
 		session_id: "text",
 		holder: "text",
@@ -1175,7 +1363,13 @@ function buildQueries(
 		schema === undefined ? relationName : `${quoteIdentifier(schema)}.${relationName}`;
 	const table = relation(name);
 	const parts = relation(`${name}_parts`);
+	const blobs = relation(`${name}_blobs`);
+	const refs = relation(`${name}_refs`);
 	const sql = (template: string): Statement => statement(adapter, template);
+	/** `@<prefix>0, …, @<prefix><count - 1>`, an IN list's bound values. */
+	const inList = (prefix: string, count: number): string =>
+		Array.from({ length: count }, (_unused, index) => `@${prefix}${index}`).join(", ");
+	const blobByteLength = adapter === "postgres" ? "octet_length(content)" : "length(content)";
 	const mysql = adapter === "mysql";
 	const integer = adapter === "sqlite" ? "INTEGER" : "BIGINT";
 	const mysqlTable = ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
@@ -1489,6 +1683,126 @@ function buildQueries(
 						),
 					}
 				: undefined,
+		createBlobsTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${blobs} (` +
+				`sha256 CHAR(64) NOT NULL PRIMARY KEY, ` +
+				`content LONGBLOB NOT NULL, ` +
+				`byte_len BIGINT NOT NULL, ` +
+				`mime_type VARCHAR(127) NULL, ` +
+				`created_ms BIGINT NOT NULL` +
+				mysqlTable
+			: `CREATE TABLE IF NOT EXISTS ${blobs} (` +
+				`sha256 TEXT PRIMARY KEY, ` +
+				`content ${adapter === "sqlite" ? "BLOB" : "BYTEA"} NOT NULL, ` +
+				`byte_len ${integer} NOT NULL, ` +
+				`mime_type TEXT, ` +
+				`created_ms ${integer} NOT NULL` +
+				`)`,
+		insertBlob: sql(
+			`INSERT INTO ${blobs} (sha256, content, byte_len, mime_type, created_ms) ` +
+				`VALUES (@sha256, @content, @len, @mime, @created) ` +
+				(mysql ? "ON DUPLICATE KEY UPDATE sha256 = sha256" : "ON CONFLICT (sha256) DO NOTHING RETURNING sha256"),
+		),
+		selectBlobs: count =>
+			sql(`SELECT sha256, content, byte_len FROM ${blobs} WHERE sha256 IN (${inList("h", count)})`),
+		selectBlobSizes: count => sql(`SELECT sha256, byte_len FROM ${blobs} WHERE sha256 IN (${inList("h", count)})`),
+		blobDigests:
+			adapter === "sqlite"
+				? undefined
+				: count =>
+						sql(
+							`SELECT sha256, ${mysql ? "SHA2(content, 256)" : "encode(sha256(content), 'hex')"} AS digest ` +
+								`FROM ${blobs} WHERE sha256 IN (${inList("h", count)}) AND byte_len = ${blobByteLength}`,
+						),
+		repairBlob: sql(`UPDATE ${blobs} SET content = @content, byte_len = @len WHERE sha256 = @sha256`),
+		deleteBlobs: count => sql(`DELETE FROM ${blobs} WHERE sha256 IN (${inList("h", count)})`),
+		lockBlobs: (count, exclusive) =>
+			sql(
+				`SELECT sha256 FROM ${blobs} WHERE sha256 IN (${inList("h", count)}) ORDER BY sha256` +
+					(adapter === "sqlite" ? "" : exclusive ? " FOR UPDATE" : mysql ? " LOCK IN SHARE MODE" : " FOR SHARE"),
+			),
+		sweepCandidates: sql(
+			`SELECT b.sha256 AS sha256, b.byte_len AS byte_len FROM ${blobs} AS b WHERE b.created_ms < @before ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${refs} AS r WHERE r.sha256 = b.sha256)`,
+		),
+		// Not through `sql`, which reads `@name` as a bound value.
+		maxPacket: mysql ? { sql: "SELECT @@max_allowed_packet AS max_packet", params: [] } : undefined,
+		createRefsTable: mysql
+			? `CREATE TABLE IF NOT EXISTS ${refs} (` +
+				`path VARCHAR(512) NOT NULL, sha256 CHAR(64) NOT NULL, PRIMARY KEY (path, sha256), ` +
+				`INDEX ${name}_rhash (sha256)` +
+				mysqlTable
+			: `CREATE TABLE IF NOT EXISTS ${refs} (path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (path, sha256))`,
+		createRefsIndex: mysql ? undefined : `CREATE INDEX IF NOT EXISTS ${name}_rhash ON ${refs} (sha256)`,
+		insertRef: sql(
+			`INSERT INTO ${refs} (path, sha256) VALUES (@path, @sha256) ` +
+				(mysql ? "ON DUPLICATE KEY UPDATE path = path" : "ON CONFLICT (path, sha256) DO NOTHING"),
+		),
+		refsOf: count => sql(`SELECT sha256, path FROM ${refs} WHERE path IN (${inList("p", count)})`),
+		// Exactly the paths whose rows the directory delete takes (see deleteUnder), whatever the column's collation.
+		refsUnder: sql(`SELECT sha256, path FROM ${refs} WHERE ${startsWith("path", "@dir")}`),
+		referenced: count => sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})`),
+		referencedOne: mysql ? sql(`SELECT sha256 FROM ${refs} WHERE sha256 = @h LIMIT 1 LOCK IN SHARE MODE`) : undefined,
+		deleteRef: sql(`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256`),
+		danglingRefs: sql(
+			`SELECT r.path AS path, r.sha256 AS sha256 FROM ${refs} AS r ` +
+				`WHERE substr(r.path, 1, ${BLOB_PARTS_PATH.length}) <> '${BLOB_PARTS_PATH}' ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = r.path)`,
+		),
+		// The statement looks for the session row again: PostgreSQL's look sees every commit before it, and SQLite
+		// runs one writer at a time. MySQL's sweep reads the rows itself and drops each reference by its key (see
+		// #dropDanglingRefs).
+		deleteDanglingRef: sql(
+			`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256 ` +
+				`AND NOT EXISTS (SELECT 1 FROM ${table} AS f WHERE f.path = @path)`,
+		),
+		lockSessionRowsForWrite:
+			adapter === "sqlite"
+				? undefined
+				: (count, under) =>
+						sql(
+							`SELECT path FROM ${table} WHERE path IN (${inList("p", count)})` +
+								// The rows under `@dir` that the directory delete takes: those whose prefix is exactly
+								// `@dir`, whatever the column's collation (see deleteUnder).
+								(under ? ` OR ${startsWith("path", "@dir")}` : "") +
+								" ORDER BY path FOR UPDATE",
+						),
+		sessionRowsOf: mysql
+			? count => sql(`SELECT path FROM ${table} WHERE path IN (${inList("p", count)})`)
+			: undefined,
+		primaryKey: {
+			postgres: undefined,
+			mysql: sql(
+				"SELECT COLUMN_NAME AS name FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() " +
+					"AND TABLE_NAME = @table AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
+			),
+			sqlite: sql("SELECT name FROM pragma_table_info(@table) WHERE pk > 0 ORDER BY pk"),
+		}[adapter],
+		privilegeProbes: mysql
+			? [
+					{
+						table: `${name}_blobs`,
+						privilege: "INSERT",
+						probe: sql(
+							`INSERT INTO ${blobs} (sha256, content, byte_len, mime_type, created_ms) ` +
+								`SELECT sha256, content, byte_len, mime_type, created_ms FROM ${blobs} WHERE 1 = 0`,
+						),
+					},
+					{
+						table: `${name}_blobs`,
+						privilege: "UPDATE",
+						probe: sql(`UPDATE ${blobs} SET sha256 = sha256 WHERE 1 = 0`),
+					},
+					{ table: `${name}_blobs`, privilege: "DELETE", probe: sql(`DELETE FROM ${blobs} WHERE 1 = 0`) },
+					{
+						table: `${name}_refs`,
+						privilege: "INSERT",
+						probe: sql(`INSERT INTO ${refs} (path, sha256) SELECT path, sha256 FROM ${refs} WHERE 1 = 0`),
+					},
+					{ table: `${name}_refs`, privilege: "DELETE", probe: sql(`DELETE FROM ${refs} WHERE 1 = 0`) },
+					{ table: `${name}_refs`, privilege: "UPDATE", probe: sql(`UPDATE ${refs} SET path = path WHERE 1 = 0`) },
+				]
+			: [],
 		lease:
 			adapter === "sqlite"
 				? undefined
@@ -1673,6 +1987,28 @@ function isPrimaryKeyViolation(error: unknown): boolean {
 	return errno === "23505" || errno === 1062 || code === "SQLITE_CONSTRAINT_PRIMARYKEY";
 }
 
+/**
+ * A replacing rename met, on every one of its `attempts`, a destination row
+ * another client created after the attempt read which rows there are: each
+ * attempt's rename of the source's row collided with it on the primary key
+ * (`cause` is the last collision), and nothing changed.
+ */
+export class SessionRenameRaceError extends Error {
+	readonly src: string;
+	readonly dst: string;
+	readonly attempts: number;
+
+	constructor(src: string, dst: string, attempts: number, cause: unknown) {
+		super(`Session rename of ${src} met a new session at ${dst} on each of ${attempts} attempts; nothing changed.`, {
+			cause,
+		});
+		this.name = "SessionRenameRaceError";
+		this.src = src;
+		this.dst = dst;
+		this.attempts = attempts;
+	}
+}
+
 /** Concatenate a window's pieces in byte-offset order; the session row's own bytes come first. */
 function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number; bytes: Uint8Array | null }>): Buffer {
 	pieces.sort((a, b) => a.offset - b.offset);
@@ -1791,6 +2127,8 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly sessionClaimHolder: SessionStorage["sessionClaimHolder"];
 	/** {@link SessionStorage.retargetWriterClaim}, set as {@link claimSession} is. */
 	readonly retargetWriterClaim: SessionStorage["retargetWriterClaim"];
+	/** {@link SessionStorage.releaseHeldClaims}, set as {@link claimSession} is: within the release's bound. */
+	readonly releaseHeldClaims: SessionStorage["releaseHeldClaims"];
 
 	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
@@ -1799,6 +2137,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		// The last release of a claim waits for this store's queued writes under it.
 		const settle = (paths: readonly string[]) =>
 			Promise.all(paths.map(file => this.confirmWrites(file).catch(() => undefined))).then(() => undefined);
+		backend.bindExitSettle(settle);
 		const releaser = (claim: LeaseClaim, file: string, onLost: (() => void) | undefined): (() => void) => {
 			let released = false;
 			return () => {
@@ -1846,6 +2185,9 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 			const slot = writers.get(sessionId);
 			if (slot && slot.count > 0) slot.path = path.resolve(sessionPath);
 		};
+		this.releaseHeldClaims = async () => {
+			await withinBound(backend.releaseHeld(), LEASE_RELEASE_BOUND_MS + LEASE_RELEASE_GRACE_MS);
+		};
 	}
 
 	/**
@@ -1868,13 +2210,267 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		return this.#backend.table;
 	}
 
-	/** {@link IndexedSessionStorage.drain}, then the claim releases in flight, so a closed session's lease is gone. */
+	/** {@link SessionStorage.blobTier}: the blob table, `<table>_blobs`. */
+	get blobTier(): SessionBlobTier {
+		return this.#backend.blobs;
+	}
+
+	/**
+	 * {@link IndexedSessionStorage.drain}, then the blob writes queued so far,
+	 * then the claim releases in flight, so a closed session's lease is gone.
+	 */
 	override async drain(): Promise<void> {
 		try {
 			await super.drain();
+			// A blob that still does not land was warned about, and failed the transcript write that named it.
+			await this.#backend.blobs.land().catch(() => undefined);
 		} finally {
 			await this.#backend.releasesSettled();
 		}
+	}
+}
+
+/**
+ * {@link SessionBlobTier} over the blob table. A blob it is handed lands in
+ * a transaction of its own, outside every session's write fence: rows are
+ * keyed by content hash and never change, so a fence would only lose an
+ * image a takeover raced. A transcript write first waits for the queued
+ * blobs its content names ({@link land}), so no committed transcript names a
+ * blob the table lacks, whatever stops the writer; a write that names none
+ * waits for none. A blob write is tried {@link BLOB_WRITE_ATTEMPTS} times;
+ * one that still fails stays queued and fails the transcript writes naming
+ * it, which the session reports as a persistence error, and the next such
+ * write tries it again. Writes run one after another, so a burst of images
+ * holds one connection at a time; one that fails does not stop the others.
+ * Bytes that do not hash to their reference are never stored. A blob larger
+ * than one row takes is stored as parts (see {@link BLOB_PARTS_PATH}).
+ */
+class SqlBlobTier implements SessionBlobTier {
+	readonly #backend: SqlSessionStorageBackend;
+	/** Hashes the table holds, each with its MIME type when known: written by this store, or found there. */
+	readonly #landed = new Map<string, string | undefined>();
+	readonly #queued = new Map<string, { data: Buffer; mimeType: string | undefined }>();
+	/** The last error of each queued blob whose write failed. */
+	readonly #failed = new Map<string, Error>();
+	#tail: Promise<void> = Promise.resolve();
+
+	constructor(backend: SqlSessionStorageBackend) {
+		this.#backend = backend;
+	}
+
+	store(hash: string, data: Buffer, mimeType: string | undefined): void {
+		if (this.#landed.has(hash) || this.#queued.has(hash)) return;
+		this.#queued.set(hash, { data, mimeType });
+		// Start now, ahead of the transcript write that names it; that write tries a failure again.
+		this.land([hash]).catch(() => undefined);
+	}
+
+	/** Whether `hash` is a blob of this store's: landed by it, found in the table, or queued. A write naming one needs its row. */
+	knows(hash: string): boolean {
+		return this.#landed.has(hash) || this.#queued.has(hash);
+	}
+
+	/** Forget `hashes` as landed: a delete took their rows. */
+	forget(hashes: Iterable<string>): void {
+		for (const hash of hashes) this.#landed.delete(hash);
+	}
+
+	/**
+	 * Land the queued blobs among `hashes` (every queued blob, without
+	 * `hashes`), behind the ones queued before them. Rejects when one of
+	 * `hashes` did not land in {@link BLOB_WRITE_ATTEMPTS} tries; it stays
+	 * queued. Another blob that fails does not reject it.
+	 */
+	async land(hashes?: Iterable<string>): Promise<void> {
+		const wanted =
+			hashes === undefined ? [...this.#queued.keys()] : [...hashes].filter(hash => this.#queued.has(hash));
+		if (wanted.length === 0) return;
+		const landing = this.#tail.then(() => this.#landQueued());
+		this.#tail = landing;
+		await landing;
+		for (const hash of wanted) {
+			if (!this.#queued.has(hash)) continue;
+			throw this.#failed.get(hash) ?? new Error(`SqlSessionStorage: session image ${hash} is still queued`);
+		}
+	}
+
+	/**
+	 * Queue again, from this machine's blob store, each of `hashes` whose row a
+	 * delete took after it landed. Answers the hashes it queued; one this
+	 * machine no longer holds is not among them.
+	 */
+	async reland(hashes: readonly string[]): Promise<string[]> {
+		const queued: string[] = [];
+		for (const hash of hashes) {
+			const mimeType = this.#landed.get(hash);
+			this.#landed.delete(hash);
+			const data = await localBlob(hash);
+			if (!data) continue;
+			this.store(hash, data, mimeType);
+			queued.push(hash);
+		}
+		return queued;
+	}
+
+	async #landQueued(): Promise<void> {
+		for (const [hash, blob] of [...this.#queued]) {
+			if (this.#queued.get(hash) !== blob) continue;
+			try {
+				await this.#landOne(hash, blob.data, blob.mimeType);
+				this.#failed.delete(hash);
+			} catch (err) {
+				this.#failed.set(hash, toError(err));
+			}
+		}
+	}
+
+	async #landOne(hash: string, data: Buffer, mimeType: string | undefined): Promise<void> {
+		// A row is never replaced by a later write, so bytes that do not hash to their key are kept out.
+		if (blobSha256(data) !== hash) {
+			this.#queued.delete(hash);
+			logger.warn(
+				"A session image's bytes do not hash to its reference, so the session database does not store them",
+				{
+					hash,
+					bytes: data.byteLength,
+				},
+			);
+			return;
+		}
+		for (let attempt = 1; ; attempt++) {
+			try {
+				const limit = await this.#backend.maxBlobBytes();
+				const added = await this.#backend.insertBlob(hash, data, mimeType, limit);
+				this.#queued.delete(hash);
+				this.#landed.set(hash, mimeType);
+				if (added) {
+					logger.info("Stored a session blob in the session database", {
+						hash,
+						bytes: data.byteLength,
+						mimeType,
+						parts: data.byteLength > limit ? Math.ceil(data.byteLength / limit) : 1,
+						attempts: attempt,
+					});
+				}
+				return;
+			} catch (err) {
+				if (attempt < BLOB_WRITE_ATTEMPTS) {
+					await Bun.sleep(BLOB_RETRY_MS * 2 ** (attempt - 1));
+					continue;
+				}
+				const error = toError(err);
+				logger.warn("Storing a session blob in the session database failed; the next write naming it tries again", {
+					hash,
+					bytes: data.byteLength,
+					attempts: attempt,
+					error: error.message,
+				});
+				throw new Error(
+					`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
+						`so no transcript naming it is written yet: ${error.message}`,
+					{ cause: error },
+				);
+			}
+		}
+	}
+
+	async sizes(hashes: readonly string[]): Promise<Map<string, number>> {
+		const sizes = await this.#backend.blobSizes(hashes);
+		for (const hash of sizes.keys()) if (!this.#landed.has(hash)) this.#landed.set(hash, undefined);
+		return sizes;
+	}
+
+	read(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void> {
+		return this.#backend.readBlobs(hashes, visit);
+	}
+
+	async repair(hashes: readonly string[], local: (hash: string) => Promise<Buffer | null>): Promise<number> {
+		let repaired = 0;
+		for (const hash of await this.#backend.wrongBlobs(hashes)) {
+			const data = await local(hash);
+			if (!data || blobSha256(data) !== hash) continue;
+			if (!(await this.#backend.repairBlob(hash, data, await this.#backend.maxBlobBytes()))) continue;
+			repaired++;
+			logger.warn("Repaired a session blob whose bytes in the session database did not hash to its key", {
+				hash,
+				bytes: data.byteLength,
+			});
+		}
+		return repaired;
+	}
+
+	async reference(sessionPath: string, hashes: readonly string[]): Promise<void> {
+		await this.land(hashes);
+		await this.#backend.addReferences(sessionPath, hashes);
+	}
+
+	sweep(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
+		return this.#backend.sweepBlobs(referenced, beforeMs, apply);
+	}
+}
+
+/** The SHA-256 of `data`, in hex: the key of its blob row. */
+function blobSha256(data: Uint8Array): string {
+	return new Bun.SHA256().update(data).digest("hex");
+}
+
+/** This machine's copy of the blob `hash`, when its local blob store holds bytes that hash to it. */
+async function localBlob(hash: string): Promise<Buffer | null> {
+	try {
+		const data = Buffer.from(await Bun.file(path.join(getBlobsDir(), hash)).arrayBuffer());
+		return blobSha256(data) === hash ? data : null;
+	} catch {
+		return null;
+	}
+}
+
+/** `items` in runs of at most `size`. */
+function batches<T>(items: readonly T[], size: number): T[][] {
+	const runs: T[][] = [];
+	for (let start = 0; start < items.length; start += size) runs.push(items.slice(start, start + size));
+	return runs;
+}
+
+/** `items` bound as `@<prefix>0` … for an IN list built with the same prefix. */
+function listValues(prefix: string, items: readonly string[]): StatementValues {
+	return Object.fromEntries(items.map((item, index) => [`${prefix}${index}`, item]));
+}
+
+const BLOB_REF_IN_TEXT = /blob:sha256:([0-9a-f]{64})/g;
+
+/** The blob hashes `text` (a transcript, or one line of it) names. */
+function namedBlobHashes(text: string): Set<string> {
+	const hashes = new Set<string>();
+	if (!text.includes("blob:sha256:")) return hashes;
+	for (const match of text.matchAll(BLOB_REF_IN_TEXT)) hashes.add(match[1] ?? "");
+	return hashes;
+}
+
+/** Characters a blob reference spans in text: `blob:sha256:` and its 64 hex digits. */
+const BLOB_REF_CHARS = "blob:sha256:".length + 64;
+
+/**
+ * The blob hashes a text that arrives in pieces names, as {@link namedBlobHashes} finds them in the whole text: a
+ * reference that straddles two pieces too, found where the end of the text so far meets the next piece.
+ */
+class StreamedBlobHashes {
+	readonly hashes = new Set<string>();
+	/** The last characters of the text so far, where a reference that ends in a later piece can start. */
+	#tail = "";
+
+	add(piece: string): void {
+		for (const hash of namedBlobHashes(this.#tail + piece.slice(0, BLOB_REF_CHARS))) this.hashes.add(hash);
+		for (const hash of namedBlobHashes(piece)) this.hashes.add(hash);
+		this.#tail =
+			piece.length >= BLOB_REF_CHARS ? piece.slice(-BLOB_REF_CHARS) : (this.#tail + piece).slice(-BLOB_REF_CHARS);
+	}
+}
+
+/** A write names blobs of this store's that a delete took after they landed; they are landed again, and the write runs once more. */
+class BlobsGoneError extends Error {
+	constructor(readonly hashes: readonly string[]) {
+		super(`SqlSessionStorage: ${hashes.length} session image(s) this write names were deleted meanwhile`);
+		this.name = "BlobsGoneError";
 	}
 }
 
@@ -2028,6 +2624,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #leasedPaths = new Map<string, LeaseClaim>();
 	/** Claim releases in flight, by session id; a new claim of the id waits for its release. */
 	readonly #releases = new Map<string, Promise<void>>();
+	/**
+	 * Cancels this store's exit release (see {@link #armExitRelease}): set while it holds a lease row, unset once it
+	 * holds none.
+	 */
+	#cancelExitRelease: (() => void) | undefined;
+	/** How the store waits for its queued writes under a claim; the exit release waits for them as a release does. */
+	#exitSettle: ((paths: readonly string[]) => Promise<void>) | undefined;
 	#heartbeat: Timer | undefined;
 	#heartbeatRound = 0;
 	#beating = false;
@@ -2042,6 +2645,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * from the `path` column's collation ({@link pathCollationKeepsDirectoryRange}).
 	 */
 	#directoryRange = true;
+	/** The largest blob the table takes on this server, once read (see {@link maxBlobBytes}). */
+	#maxBlobBytes: Promise<number> | undefined;
+	/** The `maxBlobBytes` option, or {@link MAX_BLOB_BYTES}. */
+	readonly #maxRowBlobBytes: number;
+	/** The blob table's writes and reads; every content write below waits for the blobs queued before it. */
+	readonly blobs: SqlBlobTier = new SqlBlobTier(this);
 
 	constructor(options: SqlSessionStorageOptions) {
 		this.#client = options.client;
@@ -2050,7 +2659,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!IDENT_RE.test(table)) {
 			throw new Error(
 				`SqlSessionStorage: table name must match ${IDENT_RE.source}, at most 57 characters so ` +
-					`${JSON.stringify(`${table}_parts`)} stays a valid identifier (got ${JSON.stringify(table)})`,
+					`${JSON.stringify(`${table}_parts`)} and ${JSON.stringify(`${table}_blobs`)} stay valid identifiers (got ${JSON.stringify(table)})`,
 			);
 		}
 		const leaseTable = options.leaseTable ?? DEFAULT_LEASE_TABLE;
@@ -2073,6 +2682,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#schema = this.#adapter === "postgres" ? PG_SCHEMA : undefined;
 		this.#q = buildQueries(this.#adapter, table, leaseTable, lease.expiryMs, this.#schema);
 		this.#createTable = options.createTable !== false;
+		this.#maxRowBlobBytes = options.maxBlobBytes ?? MAX_BLOB_BYTES;
 		this.#sqliteQueue = this.#adapter === "sqlite" ? sqliteQueue(options.client) : undefined;
 		this.#sqliteWrites = this.#adapter === "sqlite" ? sqliteWrites(options.client) : undefined;
 		const filename = options.client.options.filename;
@@ -2143,9 +2753,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				await this.#checkLockSyntax();
 				return;
 			}
-			// The three tables first, in one step (see #createTables). The lease
-			// table is made here with the other two, by the same login, whether or
-			// not this store claims: never at a first claim.
+			// Every table first, in one step (see #createTables). The lease table
+			// is made here with the others, by the same login, whether or not this
+			// store claims: never at a first claim.
 			const lease = this.#q.lease;
 			const indexMade = await this.#createTables(look);
 			// Probe before altering: PostgreSQL's ALTER TABLE waits for every open
@@ -2224,7 +2834,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				listeners: new Set(),
 			};
 			this.#leases.set(leaseId, claim);
-			if (this.#gate === "row") this.#startHeartbeat();
+			if (this.#gate === "row") {
+				this.#startHeartbeat();
+				this.#armExitRelease();
+			}
 			const started = claim;
 			void this.#ensureClaimed(started).catch(err => {
 				// The first write under the claim runs the statement again and reports its failure.
@@ -2376,7 +2989,58 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#releases.set(sessionId, released);
 		void released.finally(() => {
 			if (this.#releases.get(sessionId) === released) this.#releases.delete(sessionId);
+			if (this.#leases.size === 0 && this.#releases.size === 0) {
+				this.#cancelExitRelease?.();
+				this.#cancelExitRelease = undefined;
+			}
 		});
+	}
+
+	/** How the store waits for its queued writes under a claim, for {@link #releaseAtExit}. */
+	bindExitSettle(settle: (paths: readonly string[]) => Promise<void>): void {
+		this.#exitSettle = settle;
+	}
+
+	/**
+	 * Register, once while this store holds a lease row, the release a signal or exit runs: whatever took the
+	 * lease (an opened session, a subagent's, a delete, a rename, a move's destination) may never reach the release
+	 * it owns, since a signal ends the process from postmortem without running a `finally`. The callback is
+	 * `afterOthers`, so the modes' own teardowns, which dispose their sessions (`session_shutdown`, then the
+	 * manager's close, which releases its claim), run first and their writes keep the lease; it finds those claims
+	 * released and gives back only what is still held. Its `deadlineMs` is the release's own bound: the pass waits
+	 * that long for it once the others settle, also past postmortem's 10 s deadline when another callback's
+	 * `deadlineMs` held the pass open that long. When another callback never settles, it does not start: a release
+	 * before that callback (a mode's dispose) settled would let it write after the release, so the row stays and
+	 * expires. `exitOnly`: a keep-alive cleanup releases nothing.
+	 */
+	#armExitRelease(): void {
+		if (this.#cancelExitRelease) return;
+		this.#cancelExitRelease = postmortem.register("sql-session-leases", () => this.releaseHeld(), {
+			exitOnly: true,
+			afterOthers: true,
+			deadlineMs: LEASE_RELEASE_BOUND_MS + LEASE_RELEASE_GRACE_MS,
+		});
+	}
+
+	/**
+	 * Release every claim this store still holds, however many references its holders keep: at exit (the postmortem
+	 * callback {@link #armExitRelease} registers), and before an exclusive stop's `process.exit` (the facade's
+	 * `releaseHeldClaims`). Each release waits for the store's queued writes under the claim, then deletes the lease
+	 * row within the release bound, and logs a release that fails or is not answered (the row then expires on its
+	 * own). Entries a session manager holds but never handed to the store are not written.
+	 */
+	async releaseHeld(): Promise<void> {
+		const settle = this.#exitSettle ?? (async () => {});
+		for (const claim of [...this.#leases.values()]) {
+			// A claim whose last reference is gone is releasing already.
+			if (claim.refs <= 0) continue;
+			const [file] = claim.paths.keys();
+			if (file === undefined) continue;
+			claim.listeners.clear();
+			claim.refs = 1;
+			this.release(claim, file, undefined, settle);
+		}
+		await this.releasesSettled();
 	}
 
 	/**
@@ -2826,10 +3490,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * Make whichever of the store's three tables are missing, and the lease
+	 * Make whichever of the store's tables are missing, and the lease
 	 * table's holder index with a lease table this start-up makes; returns
 	 * whether it made that index. On PostgreSQL one look at which tables exist
-	 * goes first, outside any lock: when all three do, nothing more runs, so a
+	 * goes first, outside any lock: when all of them do, nothing more runs, so a
 	 * store starting on made tables never queues on the database-wide start-up
 	 * lock (see {@link #setup}), where a busy database makes every turn slow.
 	 * Else one start-up transaction takes that lock, looks again under it
@@ -2847,17 +3511,34 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (this.#adapter !== "postgres") {
 			await this.#setup(this.#q.createTable);
 			await this.#setup(this.#q.createPartsTable);
+			await this.#setup(this.#q.createBlobsTable);
+			await this.#setup(this.#q.createRefsTable);
+			if (this.#q.createRefsIndex) await this.#setup(this.#q.createRefsIndex);
 			if (lease) await this.#setup(lease.createTable);
 			return false;
 		}
 		if (look?.read_only_setting === "on" && look.read_only_reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
-		if (pgTrue(look?.session) && pgTrue(look?.parts) && pgTrue(look?.lease)) return false;
+		if (
+			pgTrue(look?.session) &&
+			pgTrue(look?.parts) &&
+			pgTrue(look?.lease) &&
+			pgTrue(look?.blobs) &&
+			pgTrue(look?.refs)
+		) {
+			return false;
+		}
 		let indexMade = false;
 		await this.#readWrite(async transaction => {
 			const [now] = (await run(transaction, PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[];
 			const missing: string[] = [];
 			if (!pgTrue(now?.session)) missing.push(this.#q.createTable);
 			if (!pgTrue(now?.parts)) missing.push(this.#q.createPartsTable);
+			if (!pgTrue(now?.blobs)) missing.push(this.#q.createBlobsTable);
+			// The index goes with the table, so the login that makes the table owns both.
+			if (!pgTrue(now?.refs)) {
+				missing.push(this.#q.createRefsTable);
+				if (this.#q.createRefsIndex) missing.push(this.#q.createRefsIndex);
+			}
 			if (lease && !pgTrue(now?.lease)) {
 				missing.push(lease.createTable);
 				if (lease.createIndex) {
@@ -2870,12 +3551,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return indexMade;
 	}
 
-	/** The names {@link PG_TABLES_PRESENT} looks up: the session, parts and lease tables (the session table without a lease table). */
+	/** The names {@link PG_TABLES_PRESENT} looks up: the session, parts, lease, blob and reference tables (the session table without a lease table). */
 	#pgTableNames(): StatementValues {
 		return {
 			session: this.#relation(this.#table),
 			parts: this.#relation(`${this.#table}_parts`),
 			lease: this.#relation(this.#q.lease ? this.#leaseTable : this.#table),
+			blobs: this.#relation(`${this.#table}_blobs`),
+			refs: this.#relation(`${this.#table}_refs`),
 		};
 	}
 
@@ -3089,11 +3772,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** Refuse to start against a schema an external migration has not brought up to date. */
 	async #assertSchema(): Promise<void> {
 		const partsTable = `${this.#table}_parts`;
+		const blobsTable = `${this.#table}_blobs`;
+		const refsTable = `${this.#table}_refs`;
 		const missing: string[] = [];
 		const sessionColumns = await this.#columns(this.#table);
 		if (sessionColumns.size === 0) missing.push(`table ${this.#table}`);
 		else if (!sessionColumns.has("byte_len")) missing.push(`column ${this.#table}.byte_len`);
 		if ((await this.#columns(partsTable)).size === 0) missing.push(`table ${partsTable}`);
+		if ((await this.#columns(blobsTable)).size === 0) missing.push(`table ${blobsTable}`);
+		if ((await this.#columns(refsTable)).size === 0) missing.push(`table ${refsTable}`);
 		// Only a store that claims reads the lease table; one that does not, as before, needs none.
 		if (this.#gate === "row" && (await this.#columns(this.#leaseTable)).size === 0) {
 			missing.push(`table ${this.#leaseTable}`);
@@ -3184,20 +3871,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * not declare on its writes. A login that owned a table (before an
 	 * external migration moved it to its owner) can give a column a type of its
 	 * own whose assignment cast runs its function, or add a trigger, a rule, a
-	 * row-level security policy, a CHECK constraint or an expression index;
+	 * row-level security policy, a CHECK constraint or an expression index, or
+	 * make the table a partition of a table of its own whose partition key
+	 * calls its function;
 	 * PostgreSQL finds those through its catalogs, not through search_path, so
 	 * {@link PG_SEARCH_PATH} does not stop them. So every column must be the
 	 * store's, of its declared built-in type, with no default, generation or
 	 * identity, and no other column may exist: the store's inserts leave every
 	 * other column to its default, which the store cannot vet cheaply, and the
-	 * store reads none of them. Runs whatever `createTable` is; a table that
-	 * does not exist is `#assertSchema`'s to report, or one this store never reads.
+	 * store reads none of them. The blob table must also have its `sha256`
+	 * primary key and let this login insert: every transcript write waits for
+	 * the blobs it names to land there. Runs whatever `createTable` is; a table
+	 * that does not exist is `#assertSchema`'s to report, or one this store never reads.
 	 */
 	async #checkTables(): Promise<void> {
-		if (this.#adapter !== "postgres") return;
+		if (this.#adapter !== "postgres") {
+			await this.#checkKeysAndGrants();
+			return;
+		}
 		const tables: Array<[string, Record<string, string>]> = [
 			[this.#table, PG_DECLARED_COLUMNS.session],
 			[`${this.#table}_parts`, PG_DECLARED_COLUMNS.parts],
+			[`${this.#table}_blobs`, PG_DECLARED_COLUMNS.blobs],
+			[`${this.#table}_refs`, PG_DECLARED_COLUMNS.refs],
 		];
 		if (this.#q.lease) tables.push([this.#leaseTable, PG_DECLARED_COLUMNS.lease]);
 		const problems: string[] = [];
@@ -3219,6 +3915,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 					if (row.identity !== "") found.push(`identity column ${row.name}`);
 				}
 				for (const object of (await run(executor, PG_TABLE_OBJECTS, { table: relation })) as TableObjectRow[]) {
+					// A parent is not on the table: say what the table is, as its own problem.
+					if (object.kind === "partition of" || object.kind === "inherits from") {
+						const is = object.kind === "partition of" ? "is a partition of" : "inherits from";
+						problems.push(`table ${relation} ${is} ${object.name}`);
+						continue;
+					}
 					found.push(
 						{
 							trigger: `trigger ${object.name}`,
@@ -3229,10 +3931,35 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 							constraint: `constraint ${object.name}, not a primary key, unique or not-null constraint`,
 							index: `index ${object.name} on an expression or with a predicate`,
 							inheritance: `table ${object.name} inheriting from it`,
+							"referenced by": `a foreign key of table ${object.name} referencing it`,
 						}[object.kind] ?? `${object.kind} ${object.name}`,
 					);
 				}
-				// The lease entry by its role, not its name: a lease table that names another of the three is one table.
+				const needs =
+					declared === PG_DECLARED_COLUMNS.blobs
+						? BLOB_TABLE_NEEDS.blobs
+						: declared === PG_DECLARED_COLUMNS.refs
+							? BLOB_TABLE_NEEDS.refs
+							: undefined;
+				if (needs) {
+					const key = ((await run(executor, PG_PRIMARY_KEY, { table: relation })) as TableObjectRow[]).map(
+						row => row.name,
+					);
+					const keyProblem = primaryKeyProblem(key, needs.key);
+					if (keyProblem) found.push(keyProblem);
+					for (const privilege of needs.privileges) {
+						const [grant] = (await run(executor, PG_HAS_PRIVILEGE, { table: relation, privilege })) as Array<{
+							can: unknown;
+						}>;
+						if (grant?.can !== true) found.push(`no ${privilege} privilege for the store's login`);
+					}
+				}
+				// A delete reads a blob's references by sha256; without the index each read scans the table, under the delete's locks.
+				if (declared === PG_DECLARED_COLUMNS.refs) {
+					const indexes = (await run(executor, PG_RHASH_INDEXES, { table: relation })) as unknown[];
+					if (indexes.length === 0) found.push("no index on column sha256");
+				}
+				// The lease entry by its role, not its name: a lease table that names another of the store's is one table.
 				if (declared === PG_DECLARED_COLUMNS.lease) {
 					const { indexed, nameTakenBy } = await this.#holderIndex(executor);
 					if (nameTakenBy) {
@@ -3248,7 +3975,45 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (problems.length === 0) return;
 		throw new Error(
 			`SqlSessionStorage: ${problems.join("; ")}. The store starts only on tables as ${SCHEMA_DOCS} gives them, ` +
-				"with nothing else on them that could run code on its writes.",
+				"with nothing else on them that could run code on its writes, and blob and reference tables " +
+				"this login can write.",
+		);
+	}
+
+	/**
+	 * MySQL and SQLite: the blob and reference tables' primary keys, and on
+	 * MySQL the privileges the store's blob writes and deletes need, each
+	 * proved by a statement that changes no row ({@link DialectQueries.privilegeProbes}).
+	 * A table without its key would take duplicate rows (MySQL) or refuse
+	 * every insert (`ON CONFLICT` names the key); a missing grant would fail
+	 * every write that names an image, or every session delete.
+	 */
+	async #checkKeysAndGrants(): Promise<void> {
+		const problems: string[] = [];
+		const keyQuery = this.#q.primaryKey;
+		if (keyQuery) {
+			for (const [suffix, needs] of Object.entries(BLOB_TABLE_NEEDS)) {
+				const table = `${this.#table}_${suffix}`;
+				// Start-up already holds the SQLite queue (see init), so this reads straight through.
+				const rows = (await this.#read(executor => run(executor, keyQuery, { table }))) as Array<{ name: unknown }>;
+				const keyProblem = primaryKeyProblem(
+					rows.map(row => String(row.name).toLowerCase()),
+					needs.key,
+				);
+				if (keyProblem) problems.push(`table ${table} has ${keyProblem}`);
+			}
+		}
+		for (const { table, privilege, probe } of this.#q.privilegeProbes) {
+			try {
+				await this.#fencedTransaction([], transaction => run(transaction, probe, {}).then(() => undefined));
+			} catch (err) {
+				problems.push(`the store's login cannot ${privilege} on table ${table} (${toError(err).message})`);
+			}
+		}
+		if (problems.length === 0) return;
+		throw new Error(
+			`SqlSessionStorage: ${problems.join("; ")}. The store starts only on blob and reference tables as ` +
+				`${SCHEMA_DOCS} gives them, which this login can write.`,
 		);
 	}
 
@@ -3585,14 +4350,21 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		expectedSize?: number | null,
 	): Promise<void> {
 		const bytes = Buffer.from(content, "utf8");
+		// The blobs this content names land first (see SqlBlobTier); no other blob holds it up.
+		const named = namedBlobHashes(content);
+		await this.blobs.land(named);
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
-		await this.#fencedTransaction(fences, async transaction => {
-			this.#wrote(path);
-			await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
-			// A created session also drops parts orphaned under its path.
-			await this.#replaceParts(transaction, path, bytes);
-		});
+		await this.#withBlobRefs(named, allowGone =>
+			this.#fencedTransaction(fences, async transaction => {
+				this.#wrote(path);
+				await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
+				// A created session also drops parts orphaned under its path.
+				await this.#replaceParts(transaction, path, bytes);
+				// The content is replaced whole, and so are its references: dropped only after the blob rows' locks.
+				await this.#addRefs(transaction, path, named, allowGone, true);
+			}),
+		);
 	}
 
 	/**
@@ -3638,6 +4410,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		try {
 			let staged = 0;
 			let batch: Array<{ offset: number; content: string }> = [];
+			// The blobs the content names, as writeFull finds them in its whole text.
+			const named = new StreamedBlobHashes();
 			const insertBatch = async (): Promise<void> => {
 				const parts = batch;
 				batch = [];
@@ -3648,6 +4422,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				});
 			};
 			for await (const part of utf8Parts(chunks, PART_BYTES)) {
+				named.add(part.text);
 				batch.push({ offset: staged, content: part.text });
 				staged += part.byteLength;
 				if (batch.length === STAGING_PARTS_PER_TRANSACTION) await insertBatch();
@@ -3656,20 +4431,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (staged !== byteLength) {
 				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
 			}
-			await fenced(async transaction => {
-				this.#wrote(path);
-				// The session's size as this write finds it under the row lock: the
-				// size check's, or, for a write without one, read here.
-				const sessionSize = expectedSize === undefined ? await this.#lockSize(transaction, path) : expectedSize;
-				await this.#replaceRow(transaction, path, mtimeMs, title, byteLength, expectedSize);
-				await this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS));
-				const stagedParts = (await run(transaction, this.#q.stagedBytes, { path: staging })) as StagedPartRow[];
-				const found = stagedParts.reduce((total, part) => total + rowNumber(part.len), 0);
-				// A delete or rename of the session deleted this write's staging parts after they were written.
-				if (found !== byteLength) throw new SessionWriteConflictError(path, sessionSize, sessionSize);
-				await this.#deleteParts(transaction, path);
-				await run(transaction, this.#q.renameParts, { src: staging, dst: path });
-			});
+			// As in writeFull, the blobs this content names land first (see SqlBlobTier); no other blob holds it up.
+			await this.blobs.land(named.hashes);
+			await this.#withBlobRefs(named.hashes, allowGone =>
+				fenced(async transaction => {
+					this.#wrote(path);
+					// The session's size as this write finds it under the row lock: the
+					// size check's, or, for a write without one, read here.
+					const sessionSize = expectedSize === undefined ? await this.#lockSize(transaction, path) : expectedSize;
+					await this.#replaceRow(transaction, path, mtimeMs, title, byteLength, expectedSize);
+					await this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS));
+					const stagedParts = (await run(transaction, this.#q.stagedBytes, { path: staging })) as StagedPartRow[];
+					const found = stagedParts.reduce((total, part) => total + rowNumber(part.len), 0);
+					// A delete or rename of the session deleted this write's staging parts after they were written.
+					if (found !== byteLength) throw new SessionWriteConflictError(path, sessionSize, sessionSize);
+					await this.#deleteParts(transaction, path);
+					// As a rename moves `src`'s parts (see #moveOnce), only when there are some: on MySQL an update
+					// that finds no row still locks a gap.
+					if (stagedParts.length > 0) await run(transaction, this.#q.renameParts, { src: staging, dst: path });
+					// As in writeFull, the content is replaced whole, and so are its references: dropped only after
+					// the blob rows' locks.
+					await this.#addRefs(transaction, path, named.hashes, allowGone, true);
+				}),
+			);
 		} catch (err) {
 			try {
 				await fenced(transaction => this.#deleteParts(transaction, staging));
@@ -3767,22 +4551,337 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void> {
 		const values = { path, content: line, mtime: mtimeMs, len: Buffer.byteLength(line, "utf8") };
+		// The blobs this line names land first (see SqlBlobTier); no other blob holds it up.
+		const named = namedBlobHashes(line);
+		await this.blobs.land(named);
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
-		await this.#fencedTransaction(fences, async transaction => {
-			this.#wrote(path);
-			// A store that claims sessions refuses to append onto bytes it did not
-			// write (another writer that claims nothing, such as an older omp,
-			// changed or replaced the file), so `SessionManager` can read the file
-			// back and keep that writer's entries, or move off, instead of mixing
-			// this session's lines into whatever the file now holds.
-			if (expectedSize !== undefined && this.#gate) {
-				const actualSize = await this.#lockSize(transaction, path);
-				if ((actualSize ?? 0) !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
-			}
-			// On SQLite the part's rowid comes from the clock read here, after any delete it follows (see partRowids).
-			for (const query of this.#q.append) await run(transaction, query, { ...values, now: Date.now() });
+		await this.#withBlobRefs(named, allowGone =>
+			this.#fencedTransaction(fences, async transaction => {
+				this.#wrote(path);
+				// A store that claims sessions refuses to append onto bytes it did not
+				// write (another writer that claims nothing, such as an older omp,
+				// changed or replaced the file), so `SessionManager` can read the file
+				// back and keep that writer's entries, or move off, instead of mixing
+				// this session's lines into whatever the file now holds.
+				if (expectedSize !== undefined && this.#gate) {
+					const actualSize = await this.#lockSize(transaction, path);
+					if ((actualSize ?? 0) !== expectedSize)
+						throw new SessionWriteConflictError(path, expectedSize, actualSize);
+				}
+				// On SQLite the part's rowid comes from the clock read here, after any delete it follows (see partRowids).
+				for (const query of this.#q.append) await run(transaction, query, { ...values, now: Date.now() });
+				await this.#addRefs(transaction, path, named, allowGone);
+			}),
+		);
+	}
+
+	/**
+	 * Reference `hashes` from `path` in a transaction of their own under the
+	 * session's fence, as a transcript write does (see {@link #addRefs}): for a
+	 * session written before the reference table, whose blobs the open wrote
+	 * back, so a delete of another session keeps them.
+	 */
+	async addReferences(path: string, hashes: readonly string[]): Promise<void> {
+		const named = new Set(hashes);
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		await this.#withBlobRefs(named, allowGone =>
+			this.#fencedTransaction(fences, transaction => this.#addRefs(transaction, path, named, allowGone)),
+		);
+	}
+
+	/**
+	 * Run `write` (a transcript write that adds references to `named`). When a
+	 * delete took a blob of this store's that it names after the blob landed
+	 * ({@link BlobsGoneError}), land the blob again from this machine's blob
+	 * store and run `write` once more, then with no such check.
+	 */
+	async #withBlobRefs(named: ReadonlySet<string>, write: (allowGone: boolean) => Promise<void>): Promise<void> {
+		try {
+			await write(named.size === 0);
+		} catch (err) {
+			if (!(err instanceof BlobsGoneError)) throw err;
+			await this.blobs.land(await this.blobs.reland(err.hashes));
+			await write(true);
+		}
+	}
+
+	/**
+	 * Reference, from `path`, each of `named` the blob table holds, with its
+	 * row locked shared until this transaction ends: a delete that would take
+	 * the row waits for this write and then sees its reference (see
+	 * {@link #deleteOrphans}); a delete that came first leaves no row, so the
+	 * write throws {@link BlobsGoneError} for the blobs of this store's it
+	 * names, unless `allowGone`, which only warns. With `replace`, `path`'s
+	 * references are replaced: they are read first, the rows of the blobs
+	 * they name are locked shared together with those of `named` (see
+	 * {@link #lockBlobRows}), and only then are those `named` lacks deleted,
+	 * each by its key, and `named`'s inserted. So every reference this deletes or inserts
+	 * names a row this transaction holds, as on every other path that
+	 * changes references.
+	 */
+	async #addRefs(
+		transaction: SqlSessionStorageTransaction,
+		path: string,
+		named: ReadonlySet<string>,
+		allowGone: boolean,
+		replace = false,
+	): Promise<void> {
+		const current = replace ? (await this.#refsOf(transaction, [path])).map(row => row.sha256) : [];
+		const locked = await this.#lockBlobRows(transaction, [...named, ...current]);
+		// Only the references the content no longer names (or whose blob is gone) go, each by its key: a delete of
+		// the path's whole range locks, on MySQL, the gap after it, even when the content names the same blobs.
+		for (const sha256 of current) {
+			if (!named.has(sha256) || !locked.has(sha256)) await run(transaction, this.#q.deleteRef, { path, sha256 });
+		}
+		for (const sha256 of named) if (locked.has(sha256)) await run(transaction, this.#q.insertRef, { path, sha256 });
+		const gone = [...named].filter(hash => !locked.has(hash) && this.blobs.knows(hash));
+		if (gone.length === 0) return;
+		if (!allowGone) throw new BlobsGoneError(gone);
+		logger.warn("Session images this transcript names are gone from the session database and from this machine", {
+			path,
+			hashes: gone,
 		});
+	}
+
+	/**
+	 * Add the blob row of `hash` unless the table has one, in a transaction of
+	 * its own under no session's fence: the row is keyed by its content and
+	 * never changes. A blob larger than `limit` is stored as parts, each a row
+	 * of its own hash referenced from `blob:sha256:<hash>`; the row of `hash`
+	 * lists the parts' keys, and its `byte_len` is the whole blob's (see
+	 * {@link BLOB_PARTS_PATH}). The rows go in one pass in `sha256` order, the
+	 * store's lock order (see {@link #lockBlobRows}): the row of `hash` is
+	 * inserted in its place, and each part is locked shared where the table
+	 * holds it (a part can be another blob's too), else inserted. Then the
+	 * parts' references. Answers whether this call added the row of `hash`.
+	 */
+	async insertBlob(hash: string, data: Uint8Array, mimeType: string | undefined, limit: number): Promise<boolean> {
+		const created = Date.now();
+		let added = false;
+		await this.#fencedTransaction([], async transaction => {
+			const parts = new Map<string, Uint8Array>();
+			const keys: string[] = [];
+			if (data.byteLength > limit) {
+				for (let start = 0; start < data.byteLength; start += limit) {
+					const part = data.subarray(start, Math.min(start + limit, data.byteLength));
+					const key = blobSha256(part);
+					keys.push(key);
+					parts.set(key, part);
+				}
+			}
+			const content = keys.length > 0 ? Buffer.from(keys.join(""), "latin1") : data;
+			const insert = async (sha256: string, bytes: Uint8Array, len: number, mime: string | null) => {
+				const result = await run(transaction, this.#q.insertBlob, { sha256, content: bytes, len, mime, created });
+				return this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+			};
+			// Which parts the table holds, read without a lock, so a part there is not sent again.
+			const there = new Set<string>();
+			for (const batch of batches([...parts.keys()], BLOB_READ_BATCH)) {
+				const rows = (await run(
+					transaction,
+					this.#q.selectBlobSizes(batch.length),
+					listValues("h", batch),
+				)) as HashRow[];
+				for (const row of rows) there.add(row.sha256);
+			}
+			for (const key of [hash, ...parts.keys()].sort()) {
+				if (key === hash) {
+					added = await insert(hash, content, data.byteLength, mimeType ?? null);
+					continue;
+				}
+				if (!parts.has(key)) continue;
+				// A part there is locked shared, so no delete takes it; one that went meanwhile is inserted.
+				if (there.has(key) && (await this.#lockBlobRows(transaction, [key])).has(key)) continue;
+				const part = parts.get(key) ?? new Uint8Array();
+				// Inserted by another blob meanwhile: the insert took no lock on PostgreSQL, so lock it shared.
+				if (!(await insert(key, part, part.byteLength, null))) await this.#lockBlobRows(transaction, [key]);
+			}
+			for (const key of parts.keys()) {
+				await run(transaction, this.#q.insertRef, { path: `${BLOB_PARTS_PATH}${hash}`, sha256: key });
+			}
+		});
+		return added;
+	}
+
+	/**
+	 * The largest blob one row of the table holds: the `maxBlobBytes` option,
+	 * else {@link MAX_BLOB_BYTES}, or less where MySQL's or MariaDB's
+	 * `max_allowed_packet` is smaller (16 MiB by default on MariaDB, 64 MiB on
+	 * MySQL 8). Read once; a failed read is tried again by the next call.
+	 */
+	maxBlobBytes(): Promise<number> {
+		const bound = Math.min(this.#maxRowBlobBytes, MAX_BLOB_BYTES);
+		const query = this.#q.maxPacket;
+		if (!query) return Promise.resolve(bound);
+		this.#maxBlobBytes ??= this.#exclusive(() => this.#readOne(query, {})).then(
+			rows => {
+				const packet = Number((rows as Array<{ max_packet?: unknown }>)[0]?.max_packet);
+				if (!Number.isFinite(packet) || packet <= 0) {
+					throw new Error("SqlSessionStorage: the server answered no max_allowed_packet");
+				}
+				return Math.min(bound, packet - MYSQL_PACKET_HEADROOM);
+			},
+			err => {
+				this.#maxBlobBytes = undefined;
+				throw err;
+			},
+		);
+		return this.#maxBlobBytes;
+	}
+
+	/** Of `hashes`, the ones the table holds, each with its size; reads no blob's bytes. */
+	async blobSizes(hashes: readonly string[]): Promise<Map<string, number>> {
+		const sizes = new Map<string, number>();
+		for (const batch of batches(hashes, BLOB_READ_BATCH)) {
+			const query = this.#q.selectBlobSizes(batch.length);
+			const rows = (await this.#exclusive(() => this.#readOne(query, listValues("h", batch)))) as BlobSizeRow[];
+			for (const row of rows) sizes.set(row.sha256, rowNumber(row.byte_len));
+		}
+		return sizes;
+	}
+
+	/**
+	 * Read the rows of `hashes` the table holds, in batches of at most
+	 * {@link BLOB_READ_BYTES} (a larger blob alone), handing each blob to
+	 * `visit` before the next batch is read, so a read holds one batch. A
+	 * parted blob is read from its parts and handed on whole.
+	 */
+	async readBlobs(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void> {
+		let batch: string[] = [];
+		let bytes = 0;
+		const readBatch = async (): Promise<void> => {
+			const query = this.#q.selectBlobs(batch.length);
+			const values = listValues("h", batch);
+			batch = [];
+			bytes = 0;
+			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[];
+			for (const row of rows) await visit(row.sha256, await this.#wholeBlob(row));
+		};
+		for (const [hash, size] of await this.blobSizes(hashes)) {
+			if (batch.length > 0 && (bytes + size > BLOB_READ_BYTES || batch.length >= BLOB_READ_BATCH)) await readBatch();
+			batch.push(hash);
+			bytes += size;
+		}
+		if (batch.length > 0) await readBatch();
+	}
+
+	/** A blob row's bytes; for a parted blob, its parts' bytes in order (a missing part leaves bytes that do not hash to the key). */
+	async #wholeBlob(row: BlobRow): Promise<Buffer> {
+		const content = Buffer.from(row.content.buffer, row.content.byteOffset, row.content.byteLength);
+		if (rowNumber(row.byte_len) === content.byteLength) return content;
+		const keys = content.toString("latin1").match(/[0-9a-f]{64}/g) ?? [];
+		const parts = new Map<string, Buffer>();
+		for (const batch of batches(keys, BLOB_READ_BATCH)) {
+			const query = this.#q.selectBlobs(batch.length);
+			const rows = (await this.#exclusive(() => this.#readOne(query, listValues("h", batch)))) as BlobRow[];
+			for (const part of rows) {
+				parts.set(part.sha256, Buffer.from(part.content.buffer, part.content.byteOffset, part.content.byteLength));
+			}
+		}
+		return Buffer.concat(keys.map(key => parts.get(key) ?? Buffer.alloc(0)));
+	}
+
+	/** Of `hashes`, the rows whose bytes do not hash to their key (a parted blob's row is not checked). */
+	async wrongBlobs(hashes: readonly string[]): Promise<string[]> {
+		const wrong: string[] = [];
+		const digests = this.#q.blobDigests;
+		for (const batch of batches(hashes, BLOB_READ_BATCH)) {
+			const values = listValues("h", batch);
+			if (digests) {
+				const query = digests(batch.length);
+				for (const row of (await this.#exclusive(() => this.#readOne(query, values))) as BlobDigestRow[]) {
+					const digest = typeof row.digest === "string" ? row.digest : Buffer.from(row.digest).toString("latin1");
+					if (digest.toLowerCase() !== row.sha256) wrong.push(row.sha256);
+				}
+				continue;
+			}
+			const query = this.#q.selectBlobs(batch.length);
+			for (const row of (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[]) {
+				if (rowNumber(row.byte_len) === row.content.byteLength && blobSha256(row.content) !== row.sha256) {
+					wrong.push(row.sha256);
+				}
+			}
+		}
+		return wrong;
+	}
+
+	/** Rewrite the row of `hash` with `data`, bytes that hash to it; answers false for one over `limit`, left as it is. */
+	async repairBlob(hash: string, data: Uint8Array, limit: number): Promise<boolean> {
+		if (data.byteLength > limit) return false;
+		await this.#fencedTransaction([], transaction =>
+			run(transaction, this.#q.repairBlob, { sha256: hash, content: data, len: data.byteLength }).then(
+				() => undefined,
+			),
+		);
+		return true;
+	}
+
+	/**
+	 * `omp gc`'s sweep of the blob table: drop the references of session paths
+	 * that have no session row, then delete each blob row created before
+	 * `beforeMs` that no reference names and `referenced` (the hashes gc found
+	 * named in any session's transcript) lacks, as a session delete does (see
+	 * {@link #deleteOrphans}). Without `apply`, only counts.
+	 */
+	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
+		if (apply) {
+			// The references of paths that have no session row, each dropped with its blob's row locked exclusive.
+			const dangling = (await this.#exclusive(() => this.#readOne(this.#q.danglingRefs, {}))) as RefRow[];
+			const byHash = new Map<string, string[]>();
+			for (const row of dangling) byHash.set(row.sha256, [...(byHash.get(row.sha256) ?? []), row.path]);
+			for (const batch of batches([...byHash.keys()].sort(), BLOB_READ_BATCH)) {
+				await this.#fencedTransaction([], async transaction => {
+					const look = this.#q.sessionRowsOf;
+					if (look) {
+						await this.#dropDanglingRefs(transaction, look, batch, byHash);
+						return;
+					}
+					// PostgreSQL's delete looks for the session row itself (see deleteDanglingRef); SQLite runs one
+					// writer at a time.
+					await this.#lockBlobRows(transaction, [], batch);
+					for (const sha256 of batch) {
+						for (const path of byHash.get(sha256) ?? []) {
+							await run(transaction, this.#q.deleteDanglingRef, { path, sha256 });
+						}
+					}
+				});
+			}
+		}
+		const rows = (await this.#exclusive(() =>
+			this.#readOne(this.#q.sweepCandidates, { before: beforeMs }),
+		)) as BlobSizeRow[];
+		const sizes = new Map(
+			rows.filter(row => !referenced.has(row.sha256)).map(row => [row.sha256, rowNumber(row.byte_len)]),
+		);
+		const sweep: SessionBlobSweep = { candidates: sizes.size, deleted: 0, bytes: 0 };
+		if (!apply) {
+			for (const size of sizes.values()) sweep.bytes += size;
+			return sweep;
+		}
+		for (const batch of batches([...sizes.keys()], BLOB_READ_BATCH)) {
+			let deleted: string[] = [];
+			await this.#fencedTransaction([], async transaction => {
+				// The candidates' rows and their parts' rows, in one pass, before any reference goes.
+				const locked = await this.#lockBlobRows(
+					transaction,
+					[],
+					[...batch, ...(await this.#partsOf(transaction, batch))],
+				);
+				deleted = await this.#deleteOrphans(
+					transaction,
+					batch.filter(hash => locked.has(hash)),
+				);
+			});
+			for (const hash of deleted) {
+				const size = sizes.get(hash);
+				if (size === undefined) continue;
+				sweep.deleted++;
+				sweep.bytes += size;
+			}
+		}
+		return sweep;
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
@@ -3800,22 +4899,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				: { dir, len: [...dir].length, stem: dir.slice(0, -1), dir_end: `${dir.slice(0, -1)}0` };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
+		const there = under ? undefined : await this.#sessionRowsThere(paths);
 		await this.#fencedTransaction(fences, async transaction => {
-			// Every row first: their locks must all be held before the first parts look (see #deleteParts).
-			for (const path of paths) {
+			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
+			// all their locks are then held before the first parts look (see #deleteParts).
+			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
+			const ordered = [...new Set(paths)].sort();
+			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
+			for (const path of ordered) {
 				this.#wrote(path);
-				await run(transaction, this.#q.deleteRow, { path });
+				if (!present || present.has(path)) await run(transaction, this.#q.deleteRow, { path });
 			}
 			if (under) {
 				if (this.#sqliteWrites) this.#sqliteWrites.every++;
 				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
 				for (const query of deletes) await run(transaction, query, under);
 			}
-			for (const path of paths) {
+			for (const path of ordered) {
 				await this.#deleteParts(transaction, path);
 				// The directory delete took the staging sets of every path under `dir`, which have no row.
 				if (!under || !path.startsWith(under.dir)) await this.#deleteStagingOf(transaction, path);
 			}
+			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
+			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, ordered, under));
 		});
 	}
 
@@ -3827,33 +4933,357 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		const fences = this.#fencesOf([src, dst]);
 		await this.#awaitClaims(fences);
+		// A replacing rename whose `dst` another client creates after the read of which rows there are (on MySQL a
+		// `dst` with no row is not locked; PostgreSQL locks no row that is not there) meets that row in its
+		// UPDATE, on the primary key. It runs again, bounded as a deadlock's retry: the next attempt reads `dst`,
+		// locks it in path order, and replaces it; past the bound it throws SessionRenameRaceError. `noReplace`
+		// rejects with EEXIST instead.
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await this.#moveOnce(src, dst, mtimeMs, noReplace, fences);
+				break;
+			} catch (err) {
+				if (!isPrimaryKeyViolation(err)) throw err;
+				if (noReplace) throw eexist(dst);
+				if (attempt >= WRITE_ATTEMPTS) throw new SessionRenameRaceError(src, dst, attempt, err);
+			}
+		}
+		this.#moveLease(src, dst);
+	}
+
+	async #moveOnce(
+		src: string,
+		dst: string,
+		mtimeMs: number,
+		noReplace: boolean,
+		fences: readonly LeaseFence[],
+	): Promise<void> {
+		const there = await this.#sessionRowsThere([src, dst]);
 		await this.#fencedTransaction(fences, async transaction => {
 			this.#wrote(src);
 			this.#wrote(dst);
-			if (!noReplace) await run(transaction, this.#q.deleteRow, { path: dst });
+			// Both session rows first, in path order, before either changes; only rows there are change. A `dst`
+			// with no row is taken by the UPDATE below, after `src`'s (see docs/session.md, "Races").
+			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
+			if (present && !present.has(src)) throw enoent(src);
+			if (!noReplace && (!present || present.has(dst))) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
 			// row that exists, or that another client inserts concurrently (the
 			// UPDATE waits on its uncommitted key); the thrown error rolls the
 			// transaction back with both paths untouched.
-			let result: SqlSessionStorageResult;
-			try {
-				result = await run(transaction, this.#q.renameRow, { src, dst, mtime: mtimeMs });
-			} catch (err) {
-				if (noReplace && isPrimaryKeyViolation(err)) throw eexist(dst);
-				throw err;
-			}
+			const result = await run(transaction, this.#q.renameRow, { src, dst, mtime: mtimeMs });
 			const moved = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
 			if (!moved) throw enoent(src);
 			// Both rows are locked now, before the parts look (see #deleteParts):
 			// parts orphaned under `dst` go, then `src`'s follow its row.
 			await this.#deleteParts(transaction, dst);
-			await run(transaction, this.#q.renameParts, { src, dst });
+			// On MySQL only when `src` has parts, as #deleteParts: an update that finds no row still locks a gap.
+			if (this.#adapter !== "mysql" || (await run(transaction, this.#q.hasParts, { path: src })).length > 0) {
+				await run(transaction, this.#q.renameParts, { src, dst });
+			}
 			// Staging sets stay under the name their writer staged them for: the
 			// source's are left with no session, and so are a replaced destination's.
+			// They are parts under those paths, so they go before any blob row is locked.
 			await this.#deleteStagingOf(transaction, src);
 			if (!noReplace) await this.#deleteStagingOf(transaction, dst);
+			// The references change last, the rows of every blob they name locked first: the replaced session's
+			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared). Each moves by
+			// its key: an UPDATE of `src`'s range would lock, on MySQL, next-key ranges over it and the gap after,
+			// then insert into `dst`'s gap, where another rename's range can lie. `src`'s row is locked before this
+			// transaction's first read, and every write that adds a path's references takes its row first (the
+			// open-time write-back aside, which adds what the transcript names already), so the read misses none.
+			const moving = (await this.#refsOf(transaction, [src])).map(row => row.sha256);
+			const replaced = await this.#takeRefs(transaction, [dst], undefined, moving);
+			for (const sha256 of moving) {
+				await run(transaction, this.#q.deleteRef, { path: src, sha256 });
+				await run(transaction, this.#q.insertRef, { path: dst, sha256 });
+			}
+			await this.#deleteOrphans(transaction, replaced);
 		});
-		this.#moveLease(src, dst);
+	}
+
+	/**
+	 * Delete the references of `paths` (and of every path under `under`),
+	 * answering the blob rows they named that the table holds. Those rows,
+	 * and the rows of their parts, are locked exclusive in one pass before any
+	 * reference goes, with the rows of `alsoShared` (blobs whose references
+	 * the caller changes next) locked shared in the same pass (see
+	 * {@link #lockBlobRows}). Each reference goes by its key: a delete of a
+	 * path's range, or of a directory's (a scan of the whole table), locks on
+	 * MySQL every row and gap it passes. The caller locked the paths' session
+	 * rows before the read, so it misses no reference a write of them added.
+	 */
+	async #takeRefs(
+		transaction: SqlSessionStorageTransaction,
+		paths: readonly string[],
+		under?: { dir: string; len: number },
+		alsoShared: readonly string[] = [],
+	): Promise<string[]> {
+		const rows = await this.#refsOf(transaction, paths);
+		const below = under ? ((await run(transaction, this.#q.refsUnder, under)) as RefRow[]) : [];
+		const hashes = [...new Set([...rows, ...below].map(row => row.sha256))];
+		const locked = await this.#lockBlobRows(transaction, alsoShared, [
+			...hashes,
+			...(await this.#partsOf(transaction, hashes)),
+		]);
+		const taken = new Map([...rows, ...below].map(row => [`${row.sha256} ${row.path}`, row]));
+		for (const row of taken.values()) {
+			await run(transaction, this.#q.deleteRef, { path: row.path, sha256: row.sha256 });
+		}
+		return hashes.filter(hash => locked.has(hash));
+	}
+
+	/**
+	 * The parts of the parted blobs among `hashes`, read from their parts'
+	 * references without a lock: a delete locks them in the same pass as
+	 * their parents. The list cannot change once the parent's row is locked,
+	 * since only the parent's own insert writes it.
+	 */
+	async #partsOf(transaction: SqlSessionStorageTransaction, hashes: readonly string[]): Promise<string[]> {
+		return (
+			await this.#refsOf(
+				transaction,
+				hashes.map(hash => `${BLOB_PARTS_PATH}${hash}`),
+			)
+		).map(row => row.sha256);
+	}
+
+	/**
+	 * MySQL and MariaDB: which of `paths` have a session row, read without a
+	 * lock before the transaction that locks them (see
+	 * {@link #lockSessionRowsForWrite}). Read outside it, so that
+	 * transaction's first consistent read, which fixes its REPEATABLE READ
+	 * snapshot, comes after its locks: the parts and references it then reads
+	 * hold every write of those paths that committed. Elsewhere `undefined`.
+	 */
+	async #sessionRowsThere(paths: readonly string[]): Promise<ReadonlySet<string> | undefined> {
+		const look = this.#q.sessionRowsOf;
+		if (!look) return undefined;
+		const ordered = [...new Set(paths)].sort();
+		const rows = (await this.#readOne(look(ordered.length), listValues("p", ordered))) as PathRow[];
+		return new Set(rows.map(row => row.path));
+	}
+
+	/**
+	 * Lock exclusive, in path order, the session rows of `paths` and, with
+	 * `under`, every row under its directory, before a delete or a rename
+	 * changes any of them: the store's lock order (see {@link #lockBlobRows}).
+	 * On MySQL and MariaDB, without `under`, only the rows `there` names are
+	 * locked (see {@link #sessionRowsThere}), as {@link #lockBlobRows} does for
+	 * blob rows: a locking read of a missing path locks its gap, and an insert
+	 * into that gap at another path (a rename's destination, a new session)
+	 * would wait for it. Then it answers the paths whose rows it locked, and
+	 * the caller changes only those. With `under` MySQL can use no index (the
+	 * prefix is compared as bytes, as {@link DialectQueries.deleteUnder} compares
+	 * it), so the lock scans and locks every row, gaps too, in path order. PostgreSQL
+	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
+	 * time.
+	 */
+	async #lockSessionRowsForWrite(
+		transaction: SqlSessionStorageTransaction,
+		paths: readonly string[],
+		there: ReadonlySet<string> | undefined,
+		under?: { dir: string; len: number },
+	): Promise<ReadonlySet<string> | undefined> {
+		const lock = this.#q.lockSessionRowsForWrite;
+		if (!lock) return undefined;
+		const ordered = [...new Set(paths)].sort();
+		if (!there || under) {
+			await run(transaction, lock(ordered.length, under !== undefined), {
+				...listValues("p", ordered),
+				...(under ?? {}),
+			});
+			return undefined;
+		}
+		// One key per statement (see #lockBlobRows): MySQL may plan an IN list as a scan, which locks other rows.
+		const present = new Set<string>();
+		for (const path of ordered) {
+			if (!there.has(path)) continue;
+			const rows = (await run(transaction, lock(1, false), listValues("p", [path]))) as PathRow[];
+			for (const row of rows) present.add(row.path);
+		}
+		return present;
+	}
+
+	/** The references of `paths`, read without a lock. */
+	async #refsOf(transaction: SqlSessionStorageTransaction, paths: readonly string[]): Promise<RefRow[]> {
+		const rows: RefRow[] = [];
+		for (const batch of batches(paths, BLOB_READ_BATCH)) {
+			rows.push(...((await run(transaction, this.#q.refsOf(batch.length), listValues("p", batch))) as RefRow[]));
+		}
+		return rows;
+	}
+
+	/**
+	 * MySQL and MariaDB: drop the references of `batch`'s blobs from the
+	 * paths `byHash` lists for each, paths that had no session row when the
+	 * sweep read them. The blobs' rows are locked exclusive first, with no
+	 * read before the locks (see {@link #lockBlobRows}); only then are the
+	 * paths' session rows (by `look`) and references read, without a lock.
+	 * Those reads are the transaction's first consistent read, so its
+	 * REPEATABLE READ snapshot is taken after the locks. Every write that
+	 * adds, moves or deletes a reference to one of these blobs takes the
+	 * blob's row before and keeps it until it commits, so the snapshot holds
+	 * each such write that committed, and none runs until this one commits.
+	 * A reference is dropped only where the snapshot has it and has no
+	 * session row at its path: a write creating the path meanwhile, not yet
+	 * committed, then waits for the blob's row and references it again.
+	 *
+	 * No session row is locked, nor a gap. A dangling path's row is often one
+	 * that was just deleted, which InnoDB keeps, delete-marked, until purge
+	 * removes it. A lock on that row made a write that creates the path again
+	 * wait in its insert's duplicate check; when purge removed the row, InnoDB
+	 * turned the waiting lock into a gap lock granted to the write (it keeps a
+	 * constraint check's lock that way), and two writes creating paths in one
+	 * gap each waited to insert into the gap the other held: a deadlock.
+	 */
+	async #dropDanglingRefs(
+		transaction: SqlSessionStorageTransaction,
+		look: (count: number) => Statement,
+		batch: readonly string[],
+		byHash: ReadonlyMap<string, readonly string[]>,
+	): Promise<void> {
+		await this.#lockBlobRows(transaction, [], batch, false);
+		const paths = [...new Set(batch.flatMap(sha256 => byHash.get(sha256) ?? []))];
+		const present = new Set<string>();
+		for (const group of batches(paths, BLOB_READ_BATCH)) {
+			for (const row of (await run(transaction, look(group.length), listValues("p", group))) as PathRow[]) {
+				present.add(row.path);
+			}
+		}
+		// Only references there are: a delete that finds no row still locks a gap on MySQL.
+		const there = new Set((await this.#refsOf(transaction, paths)).map(row => `${row.sha256} ${row.path}`));
+		for (const sha256 of batch) {
+			for (const path of byHash.get(sha256) ?? []) {
+				if (present.has(path) || !there.has(`${sha256} ${path}`)) continue;
+				await run(transaction, this.#q.deleteRef, { path, sha256 });
+			}
+		}
+	}
+
+	/**
+	 * The store's lock order, which every transaction that changes the
+	 * session, blob or reference tables follows, so that on MySQL and MariaDB
+	 * none of them deadlocks another:
+	 *   1. the lease rows of a fenced write (the member's fence);
+	 *   2. session rows (and the parts under them), in path order, all locked
+	 *      before any of them changes: a write's own row, a delete's and a
+	 *      rename's rows (see {@link #lockSessionRowsForWrite}), but for a
+	 *      rename's destination with no row, which its UPDATE takes after the
+	 *      source's (see docs/session.md, "Races"); the sweep locks none (see
+	 *      {@link #dropDanglingRefs});
+	 *   3. blob rows, here, in one pass in `sha256` order, parents and parts
+	 *      together (shared for `shared`, exclusive for `exclusive`; a hash in
+	 *      both is locked exclusive); a delete reads a parted blob's part list
+	 *      first, without a lock (see {@link #partsOf}), and a parted blob's
+	 *      insert takes its own row in its place among its parts';
+	 *   4. reference rows.
+	 * No statement after step 3 takes a lock in the session table, and no
+	 * statement after step 4's first takes a blob row's lock it does not
+	 * hold. A transaction locks every blob row the references it inserts or
+	 * deletes name before the first of them; a statement that deletes a
+	 * path's references reads them first, without a lock, so their blobs are
+	 * among these. `sql-session-storage-lock-order.test.ts` checks each
+	 * transaction's statements against this order on every engine.
+	 * Answers the hashes whose rows the table holds and this locked; only rows
+	 * there are are locked, since a locking read of a missing key locks a gap
+	 * on MySQL. On MySQL and MariaDB each row is locked by a statement of its
+	 * own, a `const` read of one key: MySQL may plan an `IN` list over a small,
+	 * changing table as a scan of the whole primary key, which waits for and
+	 * locks every row it passes, rows of other keys too, from the lowest key.
+	 * SQLite runs one write at a time, and only reads which rows there are.
+	 * Without `look`, every key is locked with no read before, for a caller
+	 * whose first consistent read must come after the locks (see
+	 * {@link #dropDanglingRefs}); its keys are rows a reference named when it
+	 * read them, and a key whose row went since locks only the gap where the
+	 * row was, keeping out an insert of a blob there until this commits.
+	 */
+	async #lockBlobRows(
+		transaction: SqlSessionStorageTransaction,
+		shared: Iterable<string>,
+		exclusive: Iterable<string> = [],
+		look = true,
+	): Promise<Set<string>> {
+		const modes = new Map<string, boolean>();
+		for (const hash of shared) modes.set(hash, false);
+		for (const hash of exclusive) modes.set(hash, true);
+		const locked = new Set<string>();
+		for (const batch of batches([...modes.keys()].sort(), BLOB_READ_BATCH)) {
+			let there = new Set(batch);
+			if (look) {
+				const rows = await run(transaction, this.#q.selectBlobSizes(batch.length), listValues("h", batch));
+				there = new Set((rows as HashRow[]).map(row => row.sha256));
+			}
+			// One statement per run of rows of one mode, so the rows are locked in `sha256` order across modes; on
+			// MySQL one statement per row.
+			let group: string[] = [];
+			const flush = async (): Promise<void> => {
+				if (group.length === 0) return;
+				const exclusiveGroup = modes.get(group[0] ?? "") === true;
+				const rows = (await run(
+					transaction,
+					this.#q.lockBlobs(group.length, exclusiveGroup),
+					listValues("h", group),
+				)) as HashRow[];
+				for (const row of rows) locked.add(row.sha256);
+				group = [];
+			};
+			for (const hash of batch) {
+				if (!there.has(hash)) continue;
+				const next = this.#adapter === "mysql" || modes.get(group[0] ?? "") !== modes.get(hash);
+				if (group.length > 0 && next) await flush();
+				group.push(hash);
+			}
+			await flush();
+		}
+		return locked;
+	}
+
+	/**
+	 * Delete each blob row of `locked` (rows {@link #lockBlobRows} locked in
+	 * this transaction, with their parts) that no reference names any more,
+	 * with the parts of a parted one; answers the hashes deleted. Every write
+	 * that adds a reference to one of them has committed before the lock was
+	 * granted, or locks it after this commits, so the read of the references
+	 * sees each one that committed (PostgreSQL reads at each statement's
+	 * start; MySQL reads the references with a shared lock, so it sees the
+	 * latest); a write that locks after this commits finds the row gone and
+	 * lands it again. The parts' rows were locked in the same pass as their
+	 * parents, so taking their references locks nothing new. MySQL reads one
+	 * hash per statement, its first entry in the `sha256` index: a read of
+	 * several hashes, or of all of one hash's entries, locks next-key ranges
+	 * (or, on a small table, scans the primary key) into other blobs'
+	 * entries, which other transactions change under their own blob locks.
+	 * This one's row lock alone keeps every reference to it from changing.
+	 */
+	async #deleteOrphans(transaction: SqlSessionStorageTransaction, locked: readonly string[]): Promise<string[]> {
+		if (locked.length === 0) return [];
+		const referenced = new Set<string>();
+		const one = this.#q.referencedOne;
+		if (one) {
+			for (const hash of [...locked].sort()) {
+				if ((await run(transaction, one, { h: hash })).length > 0) referenced.add(hash);
+			}
+		} else {
+			for (const batch of batches(locked, BLOB_READ_BATCH)) {
+				const rows = (await run(
+					transaction,
+					this.#q.referenced(batch.length),
+					listValues("h", batch),
+				)) as HashRow[];
+				for (const row of rows) referenced.add(row.sha256);
+			}
+		}
+		const orphans = locked.filter(hash => !referenced.has(hash));
+		if (orphans.length === 0) return [];
+		const partPaths = orphans.map(hash => `${BLOB_PARTS_PATH}${hash}`);
+		const parts = await this.#takeRefs(transaction, partPaths);
+		for (const batch of batches(orphans, BLOB_READ_BATCH)) {
+			await run(transaction, this.#q.deleteBlobs(batch.length), listValues("h", batch));
+		}
+		this.blobs.forget(orphans);
+		logger.info("Deleted session blobs no session names any more", { blobs: orphans.length });
+		return [...orphans, ...(await this.#deleteOrphans(transaction, parts))];
 	}
 
 	/**

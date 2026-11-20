@@ -728,13 +728,14 @@ describe("handleRpcCancelSubagent", () => {
 			this: AsyncJobManager,
 			ownerId: string,
 			deadlineAt: number,
+			reason: unknown,
 		) {
 			atCleanup ??= {
 				listed: registry.getSubagents().find(snapshot => snapshot.id === subagent.id)?.status,
 				refStatus: AgentRegistry.global().get(subagent.id)?.status,
 				cancelled: handleRpcCancelSubagent(registry, subagent.id),
 			};
-			return reap.call(this, ownerId, deadlineAt);
+			return reap.call(this, ownerId, deadlineAt, reason);
 		});
 		await subagent.awaitingJob;
 		subagent.finishChild("child done");

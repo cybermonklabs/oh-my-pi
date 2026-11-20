@@ -18,6 +18,7 @@ import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { inflateArchivedBytes, isArchivedSessionPath } from "./session-archive";
+import type { SessionBlobTier } from "./blob-store";
 import {
 	overlayTitleSlotContent,
 	parseTitleSlotFromContent,
@@ -299,6 +300,12 @@ export interface SessionStorage {
 	/** A worker may use its own file-storage default for these same transcripts; omitted means keep runs inline. */
 	readonly crossesWorkerBoundary?: boolean;
 	/**
+	 * Where the blobs a session references and cannot draw again are kept
+	 * beside the local blob store, so a session resumed on another machine
+	 * gets them back; unset when the storage keeps none (file storage).
+	 */
+	readonly blobTier?: SessionBlobTier;
+	/**
 	 * `true` when synchronous writes ({@link writeTextSync} and a writer's
 	 * {@link SessionStorageWriter.appendSync}) have reached the backing store by
 	 * the time they return. File and memory backends apply them in-body and
@@ -495,6 +502,12 @@ export interface SessionStorage {
 	 * {@link claimSession}, whose claims it retargets.
 	 */
 	retargetWriterClaim?(sessionId: string, sessionPath: string): void;
+	/**
+	 * Give back every claim this process still holds through this storage, whoever took it, within the release's
+	 * bound: for a caller about to end the process by `process.exit`, which runs no asynchronous cleanup. A claim
+	 * found lost or never held deletes nothing. Only SQL storage implements it.
+	 */
+	releaseHeldClaims?(): Promise<void>;
 	/**
 	 * Atomically delete a session and its artifacts only when `shouldDelete`
 	 * accepts the current session content. Optional because backends without a

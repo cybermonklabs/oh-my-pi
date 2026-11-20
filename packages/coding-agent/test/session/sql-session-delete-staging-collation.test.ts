@@ -6,10 +6,11 @@
  * below `<stem>0`. The case makes its own database on the server that
  * `OMP_TEST_SQL_POSTGRES_URL` names, and drops it after; it is skipped when
  * that login may not create a database or the server has no Thai ICU
- * collation. The last case gives the `path` column a nondeterministic ICU
- * collation that ignores letter case, and checks that the delete leaves the
- * staging parts of another session's write alone; it makes a database of its
- * own too, and is skipped when the server cannot make such a collation.
+ * collation. The last cases give the `path` columns a nondeterministic ICU
+ * collation that ignores letter case, and check that the delete leaves the
+ * staging parts of another session's write, and another session's image
+ * references and rows, alone; they make a database of their own too, and are
+ * skipped when the server cannot make such a collation.
  */
 import type {
 	SqlSessionStorageClient,
@@ -331,6 +332,45 @@ describe.skipIf(ND_SKIP !== undefined)(
 			expect(await reader.readText(neighbour)).toBe(lines.join(""));
 			// The delete did remove the session and its artifacts.
 			expect((await db.paths()).filter(stored => stored === file || stored.startsWith(artifacts))).toEqual([]);
+		}, 120_000);
+
+		it("keeps the image row, and the reference, of another session under a directory named the same but for letter case", async () => {
+			// If this regresses, deleting a session with its artifacts drops the image references of a session whose
+			// directory differs only in letter case, and deletes the image rows only that session names: resumed on
+			// another machine, it shows its images as missing.
+			await using db = await openLeaseDb("postgres", ndDatabaseUrl());
+			// The tables whose `path` the delete compares, made by hand before the store starts, with the collation.
+			for (const ddl of [
+				`CREATE TABLE ${db.table} (path TEXT COLLATE ${ND_COLLATION} PRIMARY KEY, content TEXT NOT NULL, ` +
+					"mtime_ms BIGINT NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len BIGINT)",
+				`CREATE TABLE ${db.table}_parts (path TEXT COLLATE ${ND_COLLATION} NOT NULL, start_offset BIGINT NOT NULL, ` +
+					"content TEXT NOT NULL, PRIMARY KEY (path, start_offset))",
+				`CREATE TABLE ${db.table}_refs (path TEXT COLLATE ${ND_COLLATION} NOT NULL, sha256 TEXT NOT NULL, ` +
+					"PRIMARY KEY (path, sha256))",
+				`CREATE INDEX ${db.table}_rhash ON ${db.table}_refs (sha256)`,
+			]) {
+				await db.sql(ddl);
+			}
+			const root = path.join(db.dir.path(), "sessions", "-project-");
+			const file = path.join(root, "a.jsonl");
+			const artifacts = `${path.join(root, "a")}/`;
+			const neighbour = path.join(root, "A", "Other.jsonl");
+			const store = await db.open({ claims: false });
+			const image = Buffer.alloc(4096, 5);
+			const hash = new Bun.SHA256().update(image).digest("hex");
+			store.blobTier.store(hash, image, "image/png");
+			await store.drain();
+			await store.writeText(file, transcript(ID, "parent"));
+			await store.writeText(`${artifacts}Task.jsonl`, transcript(ID, "child"));
+			await store.writeText(neighbour, transcript(ID, `blob:sha256:${hash}`));
+			await store.drain();
+
+			await store.deleteSessionWithArtifacts(file);
+			await store.drain();
+
+			expect(await db.paths()).toEqual([neighbour]);
+			expect(await db.sql(`SELECT path, sha256 FROM ${db.table}_refs`)).toEqual([{ path: neighbour, sha256: hash }]);
+			expect(await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).toEqual([{ sha256: hash }]);
 		}, 120_000);
 	},
 );

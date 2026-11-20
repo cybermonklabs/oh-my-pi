@@ -84,6 +84,16 @@ Three search-related builtins are worth calling out:
 - `fd` is backed by `pi-walker`'s ordered `walk::tree` traversal, `globset`, and `regex`.
 - `ast-grep` (also `sg`) runs ast-grep 0.50's `run` command (`-p`/`-r`/`-U`, `--json`, context, `--heading`, `--files-with-matches`, `--stdin`) on the `pi-ast` search engine with ast-grep's piped (uncolored) output; `scan`, `test`, `new`, `lsp`, `outline`, `--config`, `--interactive`, `--kind`, `--debug-query`, and `--inspect` exit 2 as unsupported.
 
+Symlinks swapped in during a walk:
+
+- `grep -r`, `rg`, `fd` and `find` walk with `pi-walker`. A walk that does not follow symlinks opens each directory relative to its parent, without following a symlink there. `find` without `-L` or `-H` checks its starting point with `lstat`, and opens it the same way. `grep -r`, `rg` and `fd` follow a starting point that is a symlink, as GNU grep, ripgrep and fd do.
+- `rm -r`, and `mv` of a directory across filesystems, remove with `rm`'s descriptor walk. It opens each directory, the operand included, only as the directory that `lstat` found.
+- `chmod -R` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `du` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `cp -r` walks its source and destination by path, so it follows a directory that is swapped for a symlink at any depth.
+- `ls -R` walks by path, so it follows a directory that is swapped for a symlink at any depth.
+- `diff -r` walks both trees by path, so it follows a directory that is swapped for a symlink at any depth.
+
 Each builtin runs inside the shell process (no `fork`/`exec`) against the `pi-builtins` `Host` view of the shell (`src/host.rs`): stdio routes through the command's (possibly piped/redirected) file descriptors, path operands resolve against the shell working directory, the shell's exported environment is visible, and abort/timeout cancellation is honored. Because these builtins shadow system binaries, registration is gated (`ExtrasGate` in `crates/pi-shell/src/extras.rs`, built in `crates/pi-shell/src/tools/mod.rs`):
 
 - `PI_DISABLE_UUTILS_BUILTINS` disables the whole utility set (bare names resolve to system binaries again),

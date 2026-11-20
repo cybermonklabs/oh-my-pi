@@ -30,6 +30,21 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 	built.is_ok_and(|built| built.status.success()).then_some(locales)
 }
 
+/// Makes every path below `parent` one no process can enter, root
+/// included: `parent` is moved aside and a regular file put in its place,
+/// so a `chdir` below it fails with `ENOTDIR` for every user. A mode bit
+/// would not do it: root enters a directory with mode 000 or 600
+/// (`CAP_DAC_READ_SEARCH`), and a test that shut a directory that way
+/// passed as an ordinary user and failed as root. A process already inside
+/// the directory stays inside it, at its new name.
+#[cfg(target_os = "linux")]
+fn bury(parent: &Path) {
+	let mut aside = parent.as_os_str().to_owned();
+	aside.push(".aside");
+	fs::rename(parent, &aside).unwrap();
+	fs::write(parent, b"not a directory\n").unwrap();
+}
+
 /// A working directory the child cannot be put into ends the query.
 ///
 /// The error says nothing about what the reference resolves from a
@@ -46,28 +61,27 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 /// answers, by dropping the relative entry. That agreement was luck — the
 /// reference is inside a directory no process can enter — and the same
 /// reasoning answered wrongly in every other row here.
+///
+/// Every row's directory is one no process can enter, root included
+/// ([`bury`]); none of them asserts which error the child met.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_working_directory_the_child_cannot_enter_is_reported() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let mixed = format!("missing:{}", locales.display());
 	let listed = format!("locales:{}", locales.display());
-	let open = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o755)).unwrap();
-	let shut = |at: &Path| fs::set_permissions(at, fs::Permissions::from_mode(0o600)).unwrap();
 	// Each case is a working directory and the search path the shell set in
 	// it. The last is the one that used to come back from glibc's locale
 	// archive, which an emptied `LOCPATH` turns back on: `en_US.utf8` is
 	// installed, and the reference in that directory still reports the C
 	// locale because its own `LOCPATH` names nothing it can read.
 	let cases: [(&str, &str, &str); 5] = [
-		("unsearchable", SHELL_ONLY_LOCALE, &mixed),
+		("unsearchable/here", SHELL_ONLY_LOCALE, &mixed),
 		("removed", SHELL_ONLY_LOCALE, &mixed),
 		("ancestor/child", SHELL_ONLY_LOCALE, "locales"),
 		("renamed", SHELL_ONLY_LOCALE, &listed),
-		("archive", "en_US.utf8", "missing"),
+		("archive/here", "en_US.utf8", "missing"),
 	];
 	for (at, locale, path) in cases {
 		let cwd = dir.path().join(at);
@@ -79,20 +93,14 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 		let child = host.child_env();
 		match at {
 			"removed" => fs::remove_dir_all(&cwd).unwrap(),
-			"ancestor/child" => shut(&dir.path().join("ancestor")),
 			"renamed" => {
 				fs::rename(&cwd, dir.path().join("renamed-away")).unwrap();
 				fs::write(&cwd, b"not a directory\n").unwrap();
 			},
-			_ => shut(&cwd),
+			_ => bury(cwd.parent().unwrap()),
 		}
 		let env = |key: &str| (key == "LOCPATH").then(|| path.to_owned());
 		let answer = crate::locale::loaded_codeset(locale, &env, Some(&child));
-		match at {
-			"removed" | "renamed" => {},
-			"ancestor/child" => open(&dir.path().join("ancestor")),
-			_ => open(&cwd),
-		}
 		assert!(matches!(&answer, crate::locale::Codeset::Unasked(_)), "{at}: {answer:?}");
 	}
 }
@@ -117,16 +125,15 @@ fn a_working_directory_the_child_cannot_enter_is_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn an_answer_that_needs_no_working_directory_is_still_given() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let absolute = locales.display().to_string();
-	let cwd = dir.path().join("unsearchable");
+	let cwd = dir.path().join("unsearchable").join("here");
 	fs::create_dir_all(&cwd).unwrap();
 	let (host, _) = crate::host::Host::for_test("rsync", "", &cwd);
 	let child = host.child_env();
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o600)).unwrap();
+	// No process can enter it, root included ([`bury`]).
+	bury(cwd.parent().unwrap());
 	let free = |key: &str| match key {
 		"LOCPATH" => Some(absolute.clone()),
 		"PATH_LOCALE" => Some("relative-locales".to_owned()),
@@ -138,7 +145,6 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 	let mixed = format!("{absolute}:missing");
 	let bound = |key: &str| (key == "LOCPATH").then(|| mixed.clone());
 	let reported = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &bound, Some(&child));
-	fs::set_permissions(&cwd, fs::Permissions::from_mode(0o755)).unwrap();
 	assert!(
 		matches!(&answered, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
 		"{answered:?}"
@@ -336,16 +342,140 @@ fn a_competing_reaper_does_not_turn_the_query_into_a_stray_signal() {
 		);
 	}
 	// Nothing is left for the kernel to carry: every query either reaped
-	// its own child or never started one. The children of *every* task,
-	// because the query ran on a worker and `/proc/self/task/<pid>` is the
-	// main thread's; and a list that cannot be read is a failure here, not
-	// an empty one.
-	let tasks = fs::read_dir("/proc/self/task").expect("this process's task list");
-	for task in tasks {
-		let task = task.expect("a task of this process");
-		let left = fs::read_to_string(task.path().join("children")).expect("a task's children");
-		assert!(left.trim().is_empty(), "children left behind by {:?}: {left}", task.file_name());
+	// its own child or never started one.
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// Fails when any task of this process has a child, as each task's
+/// `/proc/self/task/<tid>/children` lists them; `read` reads one task's
+/// `children` file (a test of this function hooks it).
+///
+/// The children of *every* task, because a query runs on a worker and
+/// `/proc/self/task/<pid>` is the main thread's; and a list that cannot be
+/// read, other than one whose task has gone, is a failure, not an empty one.
+///
+/// Every read is checked, not only the last pass's. A thread that exits
+/// hands its children to a live thread of the same process, the group
+/// leader while it lives (`forget_original_parent` in `kernel/exit.c`). So
+/// within one pass a child can move from a worker not yet read to the main
+/// thread already read, and that pass sees it nowhere. The pass before it
+/// read the child under the worker, unless the worker was new, which changes
+/// the listing; and once moved, the child stays on the main thread, which
+/// every pass reads. The check therefore ends only after two passes in a row
+/// in which every task was read and the listing did not change from before
+/// the pass to after it.
+#[cfg(target_os = "linux")]
+fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<String>) {
+	const MAX_PASSES: usize = 10_000;
+	let list = || -> Vec<std::ffi::OsString> {
+		let mut names: Vec<_> = fs::read_dir("/proc/self/task")
+			.expect("this process's task list")
+			.map(|task| task.expect("a task of this process").file_name())
+			.collect();
+		names.sort();
+		names
+	};
+	let mut previous_quiet: Option<Vec<std::ffi::OsString>> = None;
+	for _ in 0..MAX_PASSES {
+		let before = list();
+		let mut every_task_read = true;
+		for name in &before {
+			match read(&Path::new("/proc/self/task").join(name)) {
+				Ok(children) => {
+					assert!(children.trim().is_empty(), "children left behind by {name:?}: {children}");
+				},
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => every_task_read = false,
+				Err(error) => panic!("the children of task {name:?}: {error:?}"),
+			}
+		}
+		let after = list();
+		let quiet = every_task_read && before == after;
+		if quiet && previous_quiet.as_ref() == Some(&after) {
+			return;
+		}
+		previous_quiet = quiet.then_some(after);
+		std::thread::yield_now();
 	}
+	panic!("this process's task list did not hold still for two passes in {MAX_PASSES} passes");
+}
+
+/// [`assert_no_task_has_children`] catches a child whose holder hands it, by
+/// exiting, to a thread the pass already read. The holder's own read in that
+/// pass is empty, so only an earlier pass sees the child: a check of the last
+/// pass alone passes here.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_handed_to_a_task_already_read_is_still_caught() {
+	let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+	let (ids_tx, ids_rx) = std::sync::mpsc::channel();
+	let holder = std::thread::spawn(move || {
+		let child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+		// SAFETY: gettid has no preconditions.
+		let tid = unsafe { libc::gettid() };
+		ids_tx.send((tid, child.id())).unwrap();
+		// The kernel keeps the child, under this thread, until this thread exits.
+		std::mem::forget(child);
+		let _ = exit_rx.recv();
+	});
+	let (holder_tid, child_pid) = ids_rx.recv().unwrap();
+	let holder_name = holder_tid.to_string();
+	let child_name = child_pid.to_string();
+	let holder_task = Path::new("/proc/self/task").join(&holder_name);
+	let child_listed_elsewhere = || {
+		fs::read_dir("/proc/self/task").unwrap().flatten().any(|task| {
+			task.file_name().to_str() != Some(holder_name.as_str())
+				&& fs::read_to_string(task.path().join("children"))
+					.is_ok_and(|children| children.split_whitespace().any(|c| c == child_name))
+		})
+	};
+	let mut holder = Some(holder);
+	let mut exit_tx = Some(exit_tx);
+	let mut holder_reads = 0;
+	let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		assert_no_task_has_children(|task| {
+			if task != holder_task {
+				return fs::read_to_string(task.join("children"));
+			}
+			holder_reads += 1;
+			if holder_reads < 2 {
+				return fs::read_to_string(task.join("children"));
+			}
+			// In this pass the other tasks were read first: the holder is the
+			// newest thread, so its tid is normally the largest, and the listing
+			// sorts tids as strings, so it comes last at the same number of
+			// digits. When it does not, the child moves to a task read later in
+			// the pass, which only makes the case easier to catch. Open the
+			// holder's list, let the holder exit and hand its child on, then
+			// read the list it opened.
+			let mut file = fs::File::open(task.join("children"))?;
+			if let Some(exit) = exit_tx.take() {
+				exit.send(()).unwrap();
+			}
+			if let Some(holder) = holder.take() {
+				holder.join().unwrap();
+			}
+			let moved = (0..1_000_000).any(|_| {
+				std::thread::yield_now();
+				child_listed_elsewhere()
+			});
+			assert!(moved, "the holder's child was not handed to another task");
+			let mut children = String::new();
+			std::io::Read::read_to_string(&mut file, &mut children)?;
+			Ok(children)
+		});
+	}));
+	if let Some(exit) = exit_tx.take() {
+		exit.send(()).unwrap();
+	}
+	if let Some(holder) = holder.take() {
+		holder.join().unwrap();
+	}
+	// SAFETY: the child is this process's own; kill and reap it.
+	unsafe {
+		libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+		libc::waitpid(child_pid as libc::pid_t, std::ptr::null_mut(), 0);
+	}
+	assert!(caught.is_err(), "a child handed to a task already read was not caught");
 }
 
 /// Every caller of [`crate::locale::locale_loadable`] models
@@ -754,15 +884,18 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 ///
 /// The storm carries a second signal, one the caller *ignores*. That is
 /// the caller's own instruction and it has to reach the utility, so the
-/// last query here runs a utility that reads its own `/proc` entry,
-/// refuses unless that number is ignored and unblocked, and only then
-/// raises it at itself and answers. Surviving the signal is not proof on
-/// its own — a blocked signal with the default disposition survives too,
-/// and a mutant that reset the readable ignore and then blocked the
-/// number passed the survival form twenty times out of twenty. What this
-/// cannot reach is an ignored disposition whose *read* is denied,
-/// because denying one read needs a kernel filter, which lives in this
-/// lane's harness rather than here.
+/// last query here runs a utility that asks a probe of its own whether
+/// that number is ignored and unblocked, refuses unless it is, and only
+/// then raises it at itself and answers. Surviving the signal is not proof
+/// on its own — a blocked signal with the default disposition survives
+/// too, and a mutant that reset the readable ignore and then blocked the
+/// number passed the survival form twenty times out of twenty. The probe
+/// (`the_ignored_signal_probe`) reads the disposition with `sigaction`
+/// and the mask with `pthread_sigmask`, not from `/proc/<pid>/status`,
+/// whose `SigIgn` and `SigBlk` lines a sandbox such as gVisor does not
+/// write. What this cannot reach is an ignored disposition whose *read*
+/// is denied, because denying one read needs a kernel filter, which lives
+/// in this lane's harness rather than here.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
@@ -798,7 +931,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// storm from turning this process's own calls into `EINTR`.
 	let (kept, ignored, grouped) = unsafe {
 		let mut catching: libc::sigaction = std::mem::zeroed();
-		catching.sa_sigaction = note_whoever_runs_this as libc::sighandler_t;
+		catching.sa_sigaction = note_whoever_runs_this as extern "C" fn(libc::c_int) as libc::sighandler_t;
 		catching.sa_flags = libc::SA_RESTART;
 		libc::sigemptyset(&raw mut catching.sa_mask);
 		let mut kept: libc::sigaction = std::mem::zeroed();
@@ -858,20 +991,21 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// say it: a *blocked* signal with the default disposition survives
 	// too, and a mutant that reset the readable ignore and then blocked
 	// the number passed that form twenty times out of twenty. So the
-	// utility reads its own `/proc` entry first and refuses unless the
-	// number is in `SigIgn` and out of `SigBlk`, and only then raises it
-	// at itself and answers. What this cannot reach is still said where
-	// it is said above; restoring the *wrong* number, and skipping the
-	// mask read-back, are covered by this lane's harness probes rather
-	// than from here.
-	let bit = 1u64 << (libc::SIGUSR2 - 1);
+	// utility first runs this test binary's probe, which inherits the
+	// utility's disposition and mask and answers by its exit status, and
+	// refuses unless the number is ignored and unblocked; only then does it
+	// raise the number at itself and answer. What this cannot reach is
+	// still said where it is said above; restoring the *wrong* number, and
+	// skipping the mask read-back, are covered by this lane's harness
+	// probes rather than from here.
+	let me = std::env::current_exe().unwrap();
+	let quoted = format!("'{}'", me.display().to_string().replace('\'', "'\\''"));
 	let raises = dir.path().join("locale-raises-the-ignored-signal");
 	let script = format!(
 		"#!/bin/sh\n\
-		 ignored=$(awk '/^SigIgn:/ {{ print $2 }}' /proc/$$/status)\n\
-		 blocked=$(awk '/^SigBlk:/ {{ print $2 }}' /proc/$$/status)\n\
-		 [ $(( 0x$ignored & {bit} )) -ne 0 ] || exit 71\n\
-		 [ $(( 0x$blocked & {bit} )) -eq 0 ] || exit 72\n\
+		 {PROBE_ENV}=1 {quoted} --ignored --exact locale::tests::the_ignored_signal_probe >/dev/null 2>&1\n\
+		 status=$?\n\
+		 [ $status -eq {PROBE_OK} ] || {{ [ $status -eq 0 ] && exit {PROBE_NOT_RUN}; exit $status; }}\n\
 		 kill -{signal} $$\n\
 		 printf 'UTF-8\\n'\n",
 		signal = libc::SIGUSR2
@@ -899,9 +1033,55 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	assert!(
 		matches!(&ignoring, crate::locale::Codeset::Loaded(found) if found == "UTF-8"),
 		"the signal the caller ignores reached the utility ignored and unblocked, and it survived \
-		 raising it — status 71 is a disposition that is no longer ignored, 72 is a blocked one: \
-		 {ignoring:?}"
+		 raising it — status {PROBE_NOT_IGNORED} is a disposition that is no longer ignored, \
+		 {PROBE_BLOCKED} is a blocked one, {PROBE_NOT_RUN} is a probe that did not run: {ignoring:?}"
 	);
+}
+
+/// The environment variable that turns `the_ignored_signal_probe` on, and its exit statuses.
+#[cfg(target_os = "linux")]
+const PROBE_ENV: &str = "PI_LOCALE_IGNORED_SIGNAL_PROBE";
+#[cfg(target_os = "linux")]
+const PROBE_OK: i32 = 70;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_IGNORED: i32 = 71;
+#[cfg(target_os = "linux")]
+const PROBE_BLOCKED: i32 = 72;
+#[cfg(target_os = "linux")]
+const PROBE_NOT_RUN: i32 = 73;
+
+/// Not a test of its own: the probe that the stand-in utility of
+/// `an_inherited_handler_does_not_run_in_the_child_before_exec` starts.
+/// It runs in a process that inherited the utility's signal disposition
+/// and mask, and says by its exit status whether `SIGUSR2` is ignored
+/// ([`PROBE_NOT_IGNORED`] when not) and unblocked ([`PROBE_BLOCKED`] when
+/// blocked), [`PROBE_OK`] when both hold. It reads them from the kernel, so
+/// it answers in a sandbox whose `/proc/<pid>/status` has no `SigIgn` or
+/// `SigBlk` line. A distinct success status keeps a probe that never ran
+/// (a filter that matched no test exits 0) from reading as a pass.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "started only by an_inherited_handler_does_not_run_in_the_child_before_exec's stand-in utility"]
+fn the_ignored_signal_probe() {
+	if std::env::var_os(PROBE_ENV).is_none() {
+		return;
+	}
+	// SAFETY: reading this process's own disposition and mask, into
+	// zeroed structures of the right types.
+	let (disposition, blocked) = unsafe {
+		let mut old: libc::sigaction = std::mem::zeroed();
+		assert_eq!(libc::sigaction(libc::SIGUSR2, std::ptr::null(), &raw mut old), 0);
+		let mut mask: libc::sigset_t = std::mem::zeroed();
+		assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask), 0);
+		(old.sa_sigaction, libc::sigismember(&raw const mask, libc::SIGUSR2) == 1)
+	};
+	if disposition != libc::SIG_IGN {
+		std::process::exit(PROBE_NOT_IGNORED);
+	}
+	if blocked {
+		std::process::exit(PROBE_BLOCKED);
+	}
+	std::process::exit(PROBE_OK);
 }
 
 /// A name is the name of locale data, whatever punctuation it carries.
@@ -1131,4 +1311,227 @@ async fn a_missing_category_leaves_the_utilities_in_c() {
 	assert_eq!(df_grouping(lines[8]), None, "df groups no digits: {out}");
 	assert_eq!(lines[9].trim(), "c3 0a a9 0a", "fold splits the bytes of a character");
 	assert_eq!(lines[10], "X=''$'\\303\\251'", "env escapes a byte C cannot print");
+}
+
+/// Puts a seccomp filter on the calling thread, and on it alone, that
+/// answers each of `calls` with `ENOSYS` and lets every other call through.
+/// Docker's default profile answers `clone3` that way, so that a C library
+/// falls back to `clone`. Once `no_new_privs` is set this needs no
+/// privilege. A filter cannot be taken off again, so the thread keeps it:
+/// the test's own process under nextest, its own thread under `cargo test`.
+///
+/// With `probe_finds_clone3`, a `clone3` whose size is zero — the
+/// capability probe's question — is answered `EINVAL`, as a kernel that has
+/// the call answers it, and only a real `clone3` gets `ENOSYS`. That holds
+/// under a profile that refuses every `clone3` as well: of two filters that
+/// answer one call with an error, the newer one's error is returned
+/// (`seccomp_run_filters` walks from the newest filter and takes an older
+/// one's answer only when its action is stronger).
+#[cfg(target_os = "linux")]
+fn answer_enosys_on_this_thread(calls: &[libc::c_long], probe_finds_clone3: bool) {
+	let statement =
+		|code: u32, k: u32| libc::sock_filter { code: u16::try_from(code).unwrap(), jt: 0, jf: 0, k };
+	let load =
+		|at: usize| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, u32::try_from(at).unwrap());
+	let answer = |errno: libc::c_int| {
+		statement(
+			libc::BPF_RET | libc::BPF_K,
+			libc::SECCOMP_RET_ERRNO | u32::try_from(errno).unwrap(),
+		)
+	};
+	// Equal to `k`: on to the next instruction. Anything else: over `skip`.
+	let unless = |k: u32, skip: u8| libc::sock_filter {
+		jf: skip,
+		..statement(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, k)
+	};
+	// The call's number, a word (`BPF_W`, as its `int` is), and the low word
+	// of its second argument, which is `clone3`'s size.
+	let number = std::mem::offset_of!(libc::seccomp_data, nr);
+	let low_word = if cfg!(target_endian = "big") { 4 } else { 0 };
+	let size = std::mem::offset_of!(libc::seccomp_data, args) + size_of::<u64>() + low_word;
+	let clone3 = u32::try_from(libc::SYS_clone3).unwrap();
+	let mut program = vec![load(number)];
+	for call in calls {
+		let call = u32::try_from(*call).unwrap();
+		if probe_finds_clone3 && call == clone3 {
+			// Each of the four after the first returns, so another call's
+			// number skips all of them.
+			program.extend([
+				unless(call, 4),
+				load(size),
+				unless(0, 1),
+				answer(libc::EINVAL),
+				answer(libc::ENOSYS),
+			]);
+		} else {
+			program.extend([unless(call, 1), answer(libc::ENOSYS)]);
+		}
+	}
+	program.push(statement(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW));
+	let filter = libc::sock_fprog {
+		len:    u16::try_from(program.len()).unwrap(),
+		filter: program.as_mut_ptr(),
+	};
+	let (on, none): (libc::c_ulong, libc::c_ulong) = (1, 0);
+	let mode = libc::c_ulong::from(libc::SECCOMP_MODE_FILTER);
+	// SAFETY: `prctl` reads these as `unsigned long`, and the kernel copies
+	// the program, which outlives the call.
+	unsafe {
+		let quiet = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, none, none, none);
+		assert_eq!(quiet, 0, "{}", std::io::Error::last_os_error());
+		let filtered = libc::prctl(libc::PR_SET_SECCOMP, mode, &raw const filter, none, none);
+		assert_eq!(filtered, 0, "{}", std::io::Error::last_os_error());
+	}
+}
+
+/// A stand-in for the locale utility that answers `ISO-8859-1`, so the
+/// tests of how its child is made need no generated locale data and cannot
+/// pass by finding none.
+#[cfg(target_os = "linux")]
+fn latin_utility(dir: &Path) -> PathBuf {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let program = dir.join("latin-locale");
+	fs::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n").unwrap();
+	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	program
+}
+
+/// One query of the utility at `program`, from this thread.
+#[cfg(target_os = "linux")]
+fn ask(program: &Path) -> crate::locale::Codeset {
+	crate::locale::codeset_from_utility_for_test(program, "C.UTF-8", &|_: &str| None)
+}
+
+/// Whether `answer` is the stand-in's.
+#[cfg(target_os = "linux")]
+fn is_latin(answer: &crate::locale::Codeset) -> bool {
+	matches!(answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1")
+}
+
+/// Whether `answer` is a refusal to start the utility that names `why`.
+#[cfg(target_os = "linux")]
+fn not_started(answer: &crate::locale::Codeset, why: &str) -> bool {
+	matches!(
+		answer,
+		crate::locale::Codeset::Unasked(said) if said.contains("could not be started") && said.contains(why)
+	)
+}
+
+/// This process's open descriptors, as `/proc/self/fd` lists them.
+#[cfg(target_os = "linux")]
+fn open_descriptors() -> usize {
+	fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+/// What this thread's `clone3` answers to the capability probe's question:
+/// `EINVAL` where it has the call.
+#[cfg(target_os = "linux")]
+fn clone3_answer() -> Option<i32> {
+	// SAFETY: a null argument block with a zero size is refused before the
+	// kernel reads anything, so this makes no process.
+	let made =
+		unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<super::CloneArgs>(), 0usize) };
+	assert!(made < 0, "{made}");
+	std::io::Error::last_os_error().raw_os_error()
+}
+
+/// Whether this thread's probe, which its first query ran, found `clone3`.
+#[cfg(target_os = "linux")]
+fn probe_found_clone3() -> bool {
+	super::CHILD_CALLS.with(|calls| calls.clone3)
+}
+
+/// Where `clone3` answers `ENOSYS` from the start, as under Docker's default
+/// seccomp profile, the probe finds no `clone3` and `clone` with
+/// `CLONE_PIDFD` starts the utility; only a `clone` refused as well refuses
+/// the query, and neither leaves a child or a descriptor behind. Where this
+/// code does not make the raw `clone` call ([`super::CLONE_ARGUMENTS_KNOWN`])
+/// the query is refused, as every such query was before `clone` was used.
+///
+/// Under that profile a query that could start its child through `clone3`
+/// alone was refused for every locale, and 16 of the 24 `locale::` tests
+/// failed. The probe is this thread's own and runs at its first query,
+/// after the filter is on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let enosys = format!("os error {}", libc::ENOSYS);
+	let descriptors = open_descriptors();
+	answer_enosys_on_this_thread(&[libc::SYS_clone3], false);
+	assert_eq!(clone3_answer(), Some(libc::ENOSYS));
+	let cloned = ask(&program);
+	assert!(!probe_found_clone3());
+	if super::CLONE_ARGUMENTS_KNOWN {
+		assert!(is_latin(&cloned), "{cloned:?}");
+	} else {
+		assert!(not_started(&cloned, "unsupported"), "{cloned:?}");
+	}
+	answer_enosys_on_this_thread(&[libc::SYS_clone], false);
+	let refused = ask(&program);
+	let why = if super::CLONE_ARGUMENTS_KNOWN {
+		enosys.as_str()
+	} else {
+		"unsupported"
+	};
+	assert!(not_started(&refused, why), "{refused:?}");
+	assert_eq!(open_descriptors(), descriptors);
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// A thread can gain a seccomp filter after its probe found `clone3`, and
+/// `clone3` then answers `ENOSYS` at the call itself. That answer made no
+/// process, and `clone` starts the utility in its place, leaving no child or
+/// descriptor behind. The filter answers the probe's own question as a
+/// kernel with `clone3` does and refuses only a real `clone3`, so the order
+/// is the same on any machine: under Docker's default profile the probe
+/// would otherwise find no `clone3`, and this path would never run.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let descriptors = open_descriptors();
+	answer_enosys_on_this_thread(&[libc::SYS_clone3], true);
+	assert_eq!(clone3_answer(), Some(libc::EINVAL));
+	let cloned = ask(&program);
+	assert!(probe_found_clone3(), "the probe found no clone3, so the call-time path did not run");
+	if super::CLONE_ARGUMENTS_KNOWN {
+		assert!(is_latin(&cloned), "{cloned:?}");
+	} else {
+		assert!(not_started(&cloned, &format!("os error {}", libc::ENOSYS)), "{cloned:?}");
+	}
+	assert_eq!(open_descriptors(), descriptors);
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
+}
+
+/// A probe is the asking thread's own: another thread whose `clone3` is
+/// refused does not send this one, whose `clone3` is not refused but whose
+/// `clone` is, down `clone`. Under a profile that refuses every `clone3`,
+/// this thread has neither call, and its query is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = latin_utility(dir.path());
+	let other = program.clone();
+	std::thread::spawn(move || {
+		answer_enosys_on_this_thread(&[libc::SYS_clone3], false);
+		let _ = ask(&other);
+		assert!(!probe_found_clone3());
+	})
+	.join()
+	.unwrap();
+	answer_enosys_on_this_thread(&[libc::SYS_clone], false);
+	let own_clone3 = clone3_answer() == Some(libc::EINVAL);
+	let answer = ask(&program);
+	if own_clone3 {
+		assert!(probe_found_clone3());
+		assert!(is_latin(&answer), "{answer:?}");
+	} else {
+		assert!(not_started(&answer, &format!("os error {}", libc::ENOSYS)), "{answer:?}");
+	}
+	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
 }

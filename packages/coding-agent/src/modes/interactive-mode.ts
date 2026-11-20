@@ -144,7 +144,7 @@ import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type:
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentHubRegistry } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, agentAncestors, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents } from "../registry/persisted-agents";
 import type { AgentCostSnapshot } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { sumSubagentTreeCost } from "./agent-hub-runtime";
@@ -4988,18 +4988,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 	}
 
-	/** The focused subagent and its live ancestors below main, outermost first; undefined on the main session. */
+	/**
+	 * The focused subagent and its live ancestors below main, outermost first, also those above a
+	 * parent that ended; undefined on the main session.
+	 */
 	#viewingLineage(): string[] | undefined {
 		const id = this.focusedAgentId;
 		if (!id) return undefined;
 		const registry = AgentRegistry.global();
 		const lineage = [id];
-		for (
-			let parent = registry.get(id)?.parentId;
-			parent && parent !== MAIN_AGENT_ID && !lineage.includes(parent) && registry.get(parent);
-			parent = registry.get(parent)?.parentId
-		) {
-			lineage.unshift(parent);
+		for (const ancestorId of agentAncestors(registry, registry.get(id))) {
+			if (ancestorId === MAIN_AGENT_ID || ancestorId === id) break;
+			if (registry.get(ancestorId)) lineage.unshift(ancestorId);
 		}
 		return lineage;
 	}
@@ -5791,7 +5791,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #quiesceVibeForSessionSwitch(): Promise<void> {
 		const ownerScope = this.#vibeModeOwnerScope;
 		if (!this.vibeModeEnabled || !ownerScope) return;
-		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
+		// A switch of the parent session stops the workers' turns and their own jobs.
+		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
 		this.#vibeScopeSuspendedForSwitch = true;
 	}
 
@@ -6024,7 +6025,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModePreviousTools = undefined;
 			this.#vibeModeOwnerScope = undefined;
 			if (ownerScope && !options?.vibeScopeAlreadySuspended) {
-				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
+				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
 			}
 			this.#updateVibeModeStatus();
 		}
@@ -8406,7 +8407,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#abortLoopCondition();
 		this.#cancelLoopAutoSubmit();
 		try {
-			await this.session.abort();
+			// The session is closing, as the teardown's dispose would: a turn waiting to
+			// retry is cut off for `omp --restore`, not stopped.
+			await this.session.abort({ cutOff: true });
 			await this.#liveCommandController.stop();
 		} catch (err) {
 			this.showWarning(err instanceof Error ? err.message : String(err));

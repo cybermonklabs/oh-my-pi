@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { grep, HeldFileKind, heldFileKind, Shell } from "../native/index.js";
 import { installSqliteLockShim } from "../native/sqlite-locks.js";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 // Issue #15586: closing any descriptor of a live database or its `-shm` released the
 // connection's POSIX locks, and Bun's own file APIs close with raw syscalls nothing can
@@ -46,7 +47,7 @@ test.skipIf(process.platform !== "linux")(
 			fs.copyFileSync(`${dbPath}-shm`, path.join(dir, "copy"));
 			// The addon's own opens and closes: native grep and the bash tool's builtins.
 			await grep({ pattern: "x", path: dir, hidden: true, gitignore: false });
-			await new Shell({ sessionEnv: { HOME: os.homedir(), PATH: "/usr/bin:/bin" } }).run(
+			await new Shell({ sessionEnv: createProductionChildEnv({ PATH: "/usr/bin:/bin" }) }).run(
 				{ command: `cat agent.db-shm > /dev/null; cp agent.db ${dir}/copy2; grep -rl x . > /dev/null`, cwd: dir },
 				() => {},
 			);

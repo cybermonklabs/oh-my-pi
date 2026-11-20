@@ -526,16 +526,31 @@ A subagent whose turn the process teardown cut off counts as left mid-turn, even
 though the teardown was clean: its owner's shutdown aborts the run with
 `INTERRUPTED_TURN_ERROR` and records its `session_exit` as a process exit
 (`postmortem.Reason.EXIT`), both for a first run the task executor drives and for
-a revived agent's turn the lifecycle teardown disposes.
+a revived agent's turn the lifecycle teardown disposes. A top-level session that
+ends while the process goes on (an ACP session's close, the end of a `/security`
+scan) stops instead the turns of the subagents under it, a first run's or a
+revived agent's, then releases those subagents: no process exit is recorded,
+`--restore` leaves them, and none of them stays live after the session's end.
+The subagents of the other sessions the process serves go on.
 
 1. **Subagents first.** Every persisted subagent transcript under the session
    (`<session>/<AgentId>.jsonl`, nested ones included) that its process left
-   mid-turn, that was not killed (no tombstone) and that a cold revive can rebuild
+   mid-turn, or whose turn ended because its provider key could not be resolved
+   (see below), that was not killed (no tombstone), that has no subagent above it
+   that was killed or stopped (see below), and that a cold revive can rebuild
    (a `session_init` contract, not isolated) runs one more monitored turn as a
    background job of its parent, under the subagent's id. The lifecycle reviver
    rebuilds it from its transcript, the turn goes on as below, and the parent
    receives the result as the job's ordinary `async-result`, so a parent waiting on
-   that job finds it again.
+   that job finds it again. A subagent is judged by the branch its transcript
+   selects, as its own session reopens it: a turn on another branch (an abandoned
+   turn, or a `/clear` that was rolled back) does not count. It must also belong to
+   its parent's current conversation: a `task` result on the parent's active branch,
+   after the parent's last `/clear`, names it. A subagent whose `task` result sits
+   before that `/clear`, or on a branch the parent left, is work the parent left
+   behind: it is not relaunched, and neither are the subagents it spawned. When no
+   `task` result names a subagent (the parent's process ended inside the call that
+   spawned it), it belongs when its transcript began after that `/clear`.
 2. **Then the session's own turn** (`AgentSession.restoreInterruptedTurn`). A turn
    cut off without a `session_exit` record (a crash, SIGKILL or power loss records
    none) is first closed the way exit recovery closes one whose exit was recorded:
@@ -544,10 +559,77 @@ a revived agent's turn the lifecycle teardown disposes.
    call was cut off runs again; otherwise the model answers from where the
    transcript stops.
 
-Nothing is continued when the last turn finished, failed, or the user interrupted
+A turn that ended because no request could resolve its provider key, even after
+its retries (a `!command` apiKey that produced nothing, stored credentials that
+were disabled or cannot serve, or that could not be read, an OAuth account pool
+with no account that can serve, a failed OAuth refresh), is retried too,
+whatever exit followed it: nothing was sent, and a subagent's process exits
+normally on such a turn. Such a subagent's parent got the failed result at once,
+so the subagent is relaunched only while its parent still waits on it, judged
+by its own parent's current conversation (after that parent's last `/clear`, on
+its active branch): a sync subagent while no `task` result there settles it, a
+background one while no delivery of its job's result (an `async-result` message,
+or a `wait` that returned the settled job) is there. When the parent's process
+ended inside a sync call, the call recorded no result, or one that settles
+nothing: the result of a run that exit cut off (`aborted`) or that was lost with
+its worker thread (`workerLost`), followed at most by the record that ends the
+turn as the process goes away. That record is the interrupted-turn abort, which
+exit recovery writes and a dispose for the process exit leaves, or an abort
+without a reason (`Request was aborted`), which a dispose for a quit, `/restart`
+or a signal leaves. Any other assistant message after such a result (a reply, an
+error, the user's stop) is a turn the parent took after reading it, as when a
+worker crashed while the parent ran on: the result then settles the subagent.
+The `task` result that only started a background job settles nothing, nor does
+a result written before the subagent's last turn began (its task prompt, or the
+message that woke it again): that result answered an earlier turn, and the
+parent waits on this one. A parent that holds the failed result acts on it
+itself.
+
+An abort while such a turn waits to retry ends it or leaves it by who gets its
+result:
+
+- A stop by whoever gets the result ends the turn with an aborted record ("Retry
+  cancelled") after its failed attempt, and `--restore` leaves it: the user's stop
+  (Esc, or an RPC `abort` or `abort_retry`), or the task executor ending a
+  subagent's run (its request budget, its time limit, or a `yield` that waits on
+  its jobs), whose parent gets the aborted result. The owner's cancel of a
+  background job stops the subagent the job runs. A dispose while the process goes
+  on stops it too: a kill, a park, or the end of a top-level session whose process
+  goes on, with the subagents under it that the end releases.
+- A process exit or shutdown cuts the turn off instead, and `--restore` goes on
+  with it: the session's dispose (a quit, a signal, `/restart`), an abort with
+  `cutOff` or with `INTERRUPTED_TURN_ERROR` (the reason a shutdown gives), and the
+  owner's shutdown of its subagents.
+- A sync subagent follows its parent's turn, whose abort reason says which it is:
+  any stop of the parent (the user's, one the session makes itself such as `/new`,
+  or the task executor's stop of a parent subagent) stops it too, and the
+  parent's process exit or shutdown cuts it off. An abort reason that says
+  neither cuts it off.
+- A subagent's own jobs (its eval `agent()` handles, its workpool batches) follow
+  how it ended: its kill, its park, or the end of its run after a stop or a finish,
+  stops their subagents; its parent's process exit cuts them off, whether the
+  subagent is idle or running (which also cuts off the jobs that a follow-up or IRC
+  wake turn of an idle subagent started). Only the process exit cuts them off: a
+  top-level session that ends while the process goes on (an ACP session's close,
+  the end of a `/security` scan or another helper session, a headless session that
+  a failed `/move` ends) stops them instead, and a turn such a subagent still runs,
+  its own background jobs and their subagents' jobs too, so no process exit is
+  recorded for their subagents and `--restore` does not relaunch them. A vibe
+  worker's turn and its own jobs stop at its parent's teardown and at a
+  switch of the parent session, so `--restore` does not relaunch a vibe turn. A
+  `/tan` clone's own jobs follow its background job: a cancel of the job, or the
+  tan's finish, stops them, and the parent's process exit cuts them off.
+  `--restore` also leaves every subagent under a subagent that was
+  killed or whose last turn a stop ended (the user's interrupt, or "Retry
+  cancelled"), even one that a cancel without a reason cut off. The session itself
+  is no such ancestor: its own stop leaves its background jobs running.
+
+Nothing else is continued when the last turn finished, failed, or the user interrupted
 it, or when a normal exit was recorded after it (the user quit with it
-interrupted). `--restore` is interactive only, takes no prompt, and cannot be
-combined with `--continue`, `--fork`, imports, `--goal` or `--no-session`.
+interrupted). Nothing behind a `/clear` is restored, not even a turn whose key
+could not be resolved: the user ended that conversation. `--restore` is
+interactive only, takes no prompt, and cannot be combined with `--continue`,
+`--fork`, imports, `--goal` or `--no-session`.
 `/restart` drops a launch `--restore` like the other one-shot selectors and adds
 its own for the current session.
 

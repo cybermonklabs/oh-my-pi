@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, isEnoent, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isEnoent, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import {
@@ -61,6 +61,7 @@ import { generateTaskName, sanitizeAgentId } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { ovnfsWorkspace } from "./ovnfs";
 import { resolveSpawnPolicy } from "./spawn-policy";
+import { releaseAfterRunEnd } from "./run-end-release";
 import { isBundledSeance, prepareSeance, type PreparedSeanceSession } from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
 import { type AgentDefinition, canSpawnAtDepth } from "./types";
@@ -184,6 +185,8 @@ export interface StructuredSubagentRequest {
 	 * call — e.g. an async job body — take ownership of the returned
 	 * disposal closure and MUST eventually run it once the retained handle
 	 * is no longer needed, or the directory leaks for the process lifetime.
+	 * The closure removes the directory only once the cleanup the run left
+	 * going on (`ExecutorOptions.onCleanupDeferred`) is done.
 	 */
 	onArtifactsRetained?: (cleanup: () => Promise<void>) => void;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
@@ -917,7 +920,6 @@ function buildExecutorOptions(
 		parentArtifactManager: preparedSession ? undefined : (session.getArtifactManager?.() ?? undefined),
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
-		onRelease: preparedSession !== undefined && lease.temporary ? () => removeTemporaryLease(lease) : undefined,
 		parentTelemetry: session.getTelemetry?.(),
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 		parentPromptCacheKey: session.getPromptCacheKey?.(),
@@ -1074,12 +1076,20 @@ function describeSalvagedWork(result: SingleResult): string {
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
 	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
+	const cleanupArtifacts = (): Promise<void> => removeTemporaryLease(lease);
+	// A seance's temporary artifacts end with its agent, but this run's end
+	// still publishes its result there: a release of the agent as its run
+	// finishes removes them only once this run has ended.
+	const artifactsRelease =
+		policy.preparedSession !== undefined && lease.temporary ? releaseAfterRunEnd(cleanupArtifacts) : undefined;
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
 	let hasValidStructuredOutput = false;
 	let deferredCleanup: Promise<void> | undefined;
+	/** An isolated run's IRC wake hold, kept until its merge is over (the `finally`). */
+	let releaseIrcWakes: (() => void) | undefined;
 	// Set once the child returns: every later step (structured-output
 	// metadata, isolation merge, nested patch apply) can still throw, and the
 	// failure must carry the exit status and artifact the child produced.
@@ -1099,6 +1109,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
 		};
+		baseOptions.onRelease = artifactsRelease?.onRelease;
 		baseOptions.planReference = await loadPlanReference(request, policy);
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
@@ -1129,6 +1140,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				result = await runSubprocess(baseOptions);
 				onSubprocessResult?.(result);
 			} else {
+				baseOptions.deferIrcWakeRelease = release => {
+					releaseIrcWakes = release;
+				};
 				result = await runIsolatedSubprocess({
 					baseOptions,
 					context: isolationContext,
@@ -1216,30 +1230,44 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			{ cause: error, result: settled },
 		);
 	} finally {
-		const shouldRetainArtifacts =
-			request.detached === true ||
-			retainSalvagedArtifact ||
-			((request.retainArtifacts || policy.preparedSession !== undefined) &&
-				(completedSuccessfully || hasValidStructuredOutput)) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
-		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
-		if (shouldCleanup) {
-			if (deferredCleanup) {
-				trackLateCleanup(
-					deferredCleanup.then(() => removeTemporaryLease(lease)),
-					{
-						resource: "artifacts",
-						artifactsDir: lease.artifactsDir,
-					},
-				);
-			} else {
-				await removeTemporaryLease(lease);
+		// The merge and the nested-patch apply are over: a held peer message may
+		// now wake a turn in the worktree.
+		releaseIrcWakes?.();
+		// This run's end is done with its artifacts: a release of its seance
+		// asked for before now removes them from here, and that removal is the
+		// only one.
+		const released = artifactsRelease?.end();
+		if (released) {
+			await released.catch(error => {
+				logger.warn("Seance artifacts release failed", {
+					artifactsDir: lease.artifactsDir,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		} else {
+			// The cleanup the run left going on may still write here (a failed
+			// isolated run's late release), so the artifacts go only after it.
+			const lateCleanup = deferredCleanup;
+			const removeArtifacts = lateCleanup ? () => lateCleanup.then(cleanupArtifacts) : cleanupArtifacts;
+			const shouldRetainArtifacts =
+				request.detached === true ||
+				retainSalvagedArtifact ||
+				((request.retainArtifacts || policy.preparedSession !== undefined) &&
+					(completedSuccessfully || hasValidStructuredOutput)) ||
+				(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
+			if (shouldCleanup) {
+				if (lateCleanup) {
+					trackLateCleanup(removeArtifacts(), { resource: "artifacts", artifactsDir: lease.artifactsDir });
+				} else {
+					await removeArtifacts();
+				}
+			} else if (lease.temporary && request.onArtifactsRetained) {
+				// Retained rather than cleaned up now: the caller (e.g. an async
+				// job body) owns disposing it once the retained handle is no
+				// longer needed, instead of it leaking for the process lifetime.
+				request.onArtifactsRetained(removeArtifacts);
 			}
-		} else if (lease.temporary && request.onArtifactsRetained) {
-			// Retained rather than cleaned up now: the caller (e.g. an async
-			// job body) owns disposing it once the retained handle is no
-			// longer needed, instead of it leaking for the process lifetime.
-			request.onArtifactsRetained(() => removeTemporaryLease(lease));
 		}
 	}
 }

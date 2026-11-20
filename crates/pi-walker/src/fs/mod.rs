@@ -24,7 +24,9 @@
 //! entries below the root the same way ([`Session::write_file_beneath`],
 //! [`Session::remove_file_beneath`], [`Session::remove_dir_beneath`]). Only
 //! the root itself, and files named outside it (git's global excludes,
-//! ancestors' ignore files), open by path.
+//! ancestors' ignore files), open by path; a root that a walk which does not
+//! follow symlinks checked with `lstat` opens without following a symlink
+//! that is its final component ([`Session::open_dir_unlinked`]).
 //!
 //! ```ignore
 //! let fs = Fs::native();
@@ -676,6 +678,22 @@ impl Session {
 		let repr = match &mut self.imp {
 			Imp::Native(s) => DirRepr::Native(native::open_dir(s, path)?),
 			Imp::Provider(fs) => DirRepr::Provider(provider::open_dir(fs, path).await?),
+		};
+		Ok(Dir { repr })
+	}
+
+	/// Opens the directory at an absolute path without following a symlink
+	/// that is its final component, as [`Self::open_child`] opens a listed
+	/// one: a symlink there is refused (`ENOTDIR` on Unix), even on a kernel
+	/// that follows it despite `O_NOFOLLOW`. Earlier components are followed.
+	pub async fn open_dir_unlinked(&mut self, path: &Path) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::fire(seam::last(path), seam::Open::Path);
+		let repr = match &mut self.imp {
+			Imp::Native(s) => DirRepr::Native(native::open_dir_unlinked(s, path)?),
+			Imp::Provider(fs) => {
+				DirRepr::Provider(provider::open_dir_unlinked(fs, path.to_path_buf()).await?)
+			},
 		};
 		Ok(Dir { repr })
 	}

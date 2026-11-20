@@ -15,6 +15,8 @@ import type { AuthProbe, AuthTestGlobals } from "../fixtures/auth-service-worker
 
 const PROVIDER = "unit-oauth-thread";
 const LANE = "cred:thread-test";
+/** What a failed refresh records on the login it disables. */
+const LOGIN_DISABLED_CAUSE = 'oauth refresh failed: HTTP 400 {"error":"invalid_grant"}';
 
 function oauthCredential(suffix: string) {
 	return {
@@ -138,12 +140,41 @@ describe("auth thread service", () => {
 		expect(storage.sessions.permits(PROVIDER, "child", b)).toBe(true);
 	});
 
-	it("rebuilds main-thread auth errors by class in the worker", async () => {
+	it("row 14: keeps a pooled worker's key lookup retryable while a failure disabled its pool's accounts, by the main thread's restriction", async () => {
+		// If this regresses, a subagent thread reads a plain missing-key error and its turn ends instead of retrying.
+		const { a, b } = await storeAccounts();
+		const handle = await probe.restrict(PROVIDER, "child", ["account:acc-b"]);
+		await storage.credentials.disable(a, LOGIN_DISABLED_CAUSE);
+		await storage.credentials.disable(b, LOGIN_DISABLED_CAUSE);
+
+		// A new login of acc-b, the pool's account, brings a key back.
+		expect(await probe.turnKeyFailure(registry, PROVIDER, "child")).toEqual({
+			name: "CredentialUnavailableError",
+			retryable: true,
+		});
+
+		// The user removes acc-b: acc-a's failure is outside the pool the worker's lease made, so the lookup is final.
+		expect(await storage.credentials.removeById(PROVIDER, b)).toBe(true);
+		expect(await probe.turnKeyFailure(registry, PROVIDER, "child")).toEqual({
+			name: "AccountPoolUnavailableError",
+			retryable: false,
+		});
+
+		// Once the worker lifts its lease, acc-a's failure counts for the session again.
+		await probe.unrestrict(PROVIDER, "child", handle);
+		expect(await probe.turnKeyFailure(registry, PROVIDER, "child")).toEqual({
+			name: "CredentialUnavailableError",
+			retryable: true,
+		});
+	});
+
+	it("row 14: rebuilds main-thread auth errors by class in the worker", async () => {
+		// If this regresses, a worker reads a pool with no usable account as a plain missing key.
 		await storeAccounts();
 		await probe.restrict(PROVIDER, "nowhere", ["account:acc-z"]);
 
 		const outcome = await probe.keyError(PROVIDER, "nowhere");
-		expect(outcome.missingApiKey).toBe(true);
+		expect(outcome).toMatchObject({ missingApiKey: true, name: "AccountPoolUnavailableError" });
 		expect(outcome.message).toContain(`No API key for provider: ${PROVIDER}`);
 	});
 

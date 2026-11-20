@@ -70,6 +70,7 @@ class Db implements AsyncDisposable {
 
 	async [Symbol.asyncDispose](): Promise<void> {
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
+		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
 		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
 		for (const client of this.#clients) await client.end();
 	}

@@ -87,6 +87,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { AuthBrokerRemovalNotRecordedError } from "@oh-my-pi/pi-ai/auth-broker/remote-store";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
@@ -121,7 +122,7 @@ import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcomp
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { loadAdvisorTranscriptCosts } from "../advisor";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager, type AsyncJobManagerApi } from "../async";
+import { type AsyncJob, AsyncJobManager, type AsyncJobManagerApi } from "../async";
 import { classifyAutoPrewalk } from "../auto-prewalk/classifier";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -191,7 +192,6 @@ import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
-import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
@@ -331,6 +331,7 @@ import type {
 	FreshSessionResult,
 	HandoffResult,
 	ModelCycleResult,
+	OwnedJobsEnd,
 	Prewalk,
 	PromptOptions,
 	QueuedMessageTarget,
@@ -393,6 +394,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
+import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
@@ -402,6 +404,8 @@ import {
 	createInterruptedTurnAbortMessage,
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
+	ownedJobsAbortReason,
+	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -3467,7 +3471,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#recovery.retryFallbackChainKeys(selector, model, options),
 			findRetryFallbackCandidates: (role, selector, model) =>
 				this.#recovery.findRetryFallbackCandidates(role, selector, model),
-			isRetryFallbackSelectorSuppressed: selector => this.#recovery.isRetryFallbackSelectorSuppressed(selector),
+			isRetryFallbackEntrySuppressed: (selector, model) =>
+				this.#recovery.isRetryFallbackEntrySuppressed(selector, model),
 			noteRetryFallbackCooldown: (selector, retryAfterMs, errorMessage) =>
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
@@ -4201,8 +4206,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * dispose time (issue #1923).
 	 *
 	 * No-op when no manager is reachable or this session has no agent id.
+	 *
+	 * Each job aborts with `reason`, whose kind a subagent of the job reads
+	 * ({@link turnAbortKind}): a lifecycle transition of the session itself (`/new`,
+	 * a switch, a branch, a context reset) stops it; a dispose ends it as the dispose
+	 * says ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 	 */
-	#cancelOwnAsyncJobs(reason?: unknown): void {
+	#cancelOwnAsyncJobs(reason: unknown): void {
 		if (!this.#agentId) return;
 		releaseCompletionHandles(this.#agentId);
 		releaseJudgmentBatches(this.#agentId);
@@ -5735,17 +5745,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// a short backoff without touching the credential pool. Model-policy 403s
 			// (plan, model policy, org restriction) also preserve the credential: the
 			// token is valid, and wiping it hides the provider from `/model` (#11275).
+			// A lookup that produced no key sent nothing to reject: the turn retries
+			// it, and wiping the stored credential would make that retry fail.
 			if (msg.stopReason === "error" && msg.provider === "github-copilot") {
 				const errorId = AIError.classifyMessage(msg);
 				const isConcurrencyCap =
 					AIError.parseRateLimitReason(msg.errorMessage ?? "", msg.errorRetryAfterMs) === "CONCURRENT_LIMIT";
 				if (
 					AIError.is(errorId, AIError.Flag.AuthFailed) &&
+					msg.credentialUnavailable !== true &&
 					!AIError.is(errorId, AIError.Flag.UsageLimit) &&
 					!isConcurrencyCap &&
 					!AIError.isGitHubCopilotPolicyDenial(msg.provider, msg.errorStatus, msg.errorMessage)
 				) {
-					await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
+					try {
+						await this.#modelRegistry.authStorage.credentials.remove("github-copilot");
+					} catch (error) {
+						// An auth broker older than this client cannot record the removal on a login a
+						// failure disabled: say so, and let the rest of the turn's maintenance run. The
+						// error's own text asks the user to remove the login again, but the user removed nothing.
+						if (!(error instanceof AuthBrokerRemovalNotRecordedError)) throw error;
+						this.emitNotice(
+							"warning",
+							"The auth broker must be upgraded before it can record that the rejected GitHub Copilot login was removed.",
+							CREDENTIAL_DISABLED_NOTICE_SOURCE,
+						);
+					}
 				}
 			}
 
@@ -6374,8 +6399,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
-	/** Cancel scheduled continuations; `reason` labels a continuation already running, as `agent.abort(reason)` does. */
-	async #cancelPostPromptTasks(reason?: string): Promise<void> {
+	/**
+	 * Cancel scheduled continuations. `reason` is the abort reason of a continuation already
+	 * running, as `agent.abort(reason)` gives its turn: its text labels the turn's end, and its
+	 * kind ({@link turnAbortKind}) stops a sync subagent of that turn or cuts it off. Give the
+	 * reason the turn's own abort gives, or the platform's reason marked with its kind.
+	 */
+	async #cancelPostPromptTasks(reason: string | DOMException): Promise<void> {
 		this.#postPromptTasksAbortController.abort(reason);
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#ttsr.resolveResume();
@@ -7403,20 +7433,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#disposeCall;
 	}
 
-	async #disposeOwnedAsyncJobs(): Promise<void> {
+	/** Ends the jobs this session owns as it is disposed, the way `ownedJobsEnd` says ({@link OwnedJobsEnd}). */
+	async #disposeOwnedAsyncJobs(ownedJobsEnd: OwnedJobsEnd | undefined): Promise<void> {
 		// Unregister before cancelling: a job completing during teardown must
 		// dead-letter rather than enqueue a follow-up into a disposing session.
 		this.#unregisterAsyncDeliverySink?.();
 		this.#unregisterAsyncDeliverySink = undefined;
 		const manager = this.#ownedAsyncJobManager;
-		// The shutdown reason is reserved for the top-level session that OWNS the
-		// manager — the genuine process/handled-shutdown path — so the task
-		// executor parks (rather than tombstones) interrupted subagents. A
-		// subagent session dispose (e.g. `release({ tombstone: true })` during an
-		// explicit hard kill) leaves `#ownedAsyncJobManager` undefined and must
-		// propagate a generic cancellation so its nested children stay terminal.
-		this.#cancelOwnAsyncJobs(manager ? ASYNC_JOB_MANAGER_SHUTDOWN_REASON : undefined);
+		// The kind of the session's end reaches the subagents of its jobs (eval `agent()`
+		// handles, workpool batches; {@link turnAbortKind}): the dispose says it
+		// ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
+		const reason = ownedJobsAbortReason(ownedJobsEnd);
+		this.#cancelOwnAsyncJobs(reason);
 		if (!manager) return;
+		// A stop ends every job still running on the manager this session owns, its subagents'
+		// own jobs too: the manager's dispose would cut them off with its shutdown reason before
+		// each subagent's own stop reaches them.
+		if (ownedJobsEnd === "stop") manager.cancelAll(undefined, reason);
 
 		try {
 			const drained = await manager.dispose({ timeoutMs: 3_000 });
@@ -7516,18 +7549,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	async #disposeMnemopi(
-		state: MnemopiSessionState | undefined,
-		consolidateTimeoutMs: number | undefined,
-	): Promise<void> {
-		try {
-			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
-		} finally {
-			// Consolidation may embed final memories, so drop the embedding-server connection only afterward.
-			await shutdownMnemopiEmbedClient();
-		}
-	}
-
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
 		// Stop cache warming before the drain windows below: an armed tick firing
@@ -7553,11 +7574,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
-		this.abortRetry();
+		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
+		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}). Any other dispose cuts it off,
+		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt, and a
+		// process exit labels a turn still in flight as interrupted. The reason says the kind to a
+		// sync subagent of the turn or of a continuation already running.
+		const stop = options.ownedJobsEnd === "stop";
+		this.#recovery.abortRetry({ cutOff: !stop });
 		this.abortCompaction();
-		// A process exit cuts a turn still in flight off instead of stopping it:
-		// label it as interrupted so `omp --restore` goes on with it.
-		const abortReason = options.reason === postmortem.Reason.EXIT ? INTERRUPTED_TURN_ERROR : undefined;
+		const abortReason = stop
+			? plainTurnAbortReason("stop")
+			: options.reason === postmortem.Reason.EXIT
+				? INTERRUPTED_TURN_ERROR
+				: plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
 		this.agent.abort(abortReason);
 		try {
@@ -7585,14 +7614,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const advisorRecorderClosed = this.#advisors.recorderClosed();
 		releaseShellSessions(this.sessionManager.getSessionId());
 		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(),
+			this.#disposeOwnedAsyncJobs(options.ownedJobsEnd),
 			this.#eval.disposeKernels(),
 			this.#releaseOwnedBrowserTabs(this.#eval.getKernelOwnerId()),
 			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
 			this.#disconnectOwnedMcp(),
 			advisorRecorderClosed,
 			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
-			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+			mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs }) ?? Promise.resolve(),
 			sharpshooterFlushed,
 		]);
 		for (const result of results) {
@@ -7790,8 +7819,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		//     re-deliver stale tool output into the cleared conversation
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
-		await this.#cancelPostPromptTasks();
-		this.#cancelOwnAsyncJobs();
+		await this.#cancelPostPromptTasks(plainTurnAbortReason("stop"));
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -9823,7 +9852,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			});
 		} catch (error) {
 			turnError = error;
-			if (error instanceof AgentStartPolicyChangedError || error instanceof PromptPreflightError) {
+			// A refusal before dispatch hands the prompt back; a pool's refusal is its own error.
+			if (
+				error instanceof AgentStartPolicyChangedError ||
+				error instanceof PromptPreflightError ||
+				error instanceof AIError.AccountPoolUnavailableError
+			) {
 				this.#reportDroppedPrompt(typedText, options, followUps);
 			}
 			throw error;
@@ -10308,16 +10342,28 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			}
 
-			// Validate API key; a provider without one walks the retry fallback chain first.
-			// A `!command` key that produced nothing is left to the turn, whose resolver
-			// fails retryably so auto-retry covers the helper.
-			const apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
+			// Validate API key. A key that may come back without the user configuring
+			// one (a `!command` apiKey that produced nothing, stored credentials that
+			// cannot serve now, including an OAuth account pool none of whose accounts
+			// can) is left to the turn, whose resolver fails retryably so auto-retry
+			// covers it. Any other provider without a key, a pool whose credentials the
+			// user removed included, walks the retry fallback chain first; a pool that
+			// refuses then names itself, not the provider.
+			let apiKey: string | undefined;
+			let poolRefusal: AIError.AccountPoolUnavailableError | undefined;
+			try {
+				apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
+			} catch (error) {
+				if (!(error instanceof AIError.AccountPoolUnavailableError)) throw error;
+				poolRefusal = error;
+			}
 			if (
 				!apiKey &&
-				!this.#modelRegistry.retriesFailedCommandKey(model.provider) &&
+				!(await this.#modelRegistry.missingKeyMayRecover(model.provider, this.sessionId, setupAbort.signal)) &&
 				!(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))
 			) {
 				if (setupAbort.signal.aborted) return false;
+				if (poolRefusal) throw poolRefusal;
 				throw new PromptPreflightError(
 					`No API key found for ${model.provider}.\n\n` +
 						`Use /login, set an API key environment variable, or create ${getAgentDbPath()}`,
@@ -10613,8 +10659,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// Await the idempotent dispose() before exiting so the browser
 				// reaper and other bounded teardown complete — a fire-and-forget
 				// `void this.dispose()` raced process.exit() and could leave an
-				// OMP-owned Chromium alive (#5643).
-				void this.dispose().finally(() => process.exit(0));
+				// OMP-owned Chromium alive (#5643). The exit then runs postmortem's
+				// cleanup, which gives back any session lease the dispose left.
+				void this.dispose().finally(() => postmortem.exitAfterCleanup(0));
 			},
 			resolvePlanReview: () => false,
 			getPendingPlanReview: () => undefined,
@@ -13180,16 +13227,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * and surfaces verbatim on the aborted assistant message's `errorMessage`, so
 	 * the transcript can distinguish a deliberate user interrupt from an opaque
 	 * abort. Omit it for internal/lifecycle aborts.
+	 *
+	 * The abort stops a turn waiting to retry: the turn ends with an aborted record
+	 * after its failed attempt, and `omp --restore` leaves it. That is right when
+	 * whoever aborts takes the aborted result: the user's stop, or an owner whose
+	 * own turn goes on. `cutOff` is for a session that is going away instead. The
+	 * agent's abort reason tells the turn's tools which it is ({@link turnAbortKind}),
+	 * so a sync subagent stops or is cut off with its parent.
 	 */
 	async abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/**
+		 * The session's process is going away (an exit, a signal, a shutdown): a turn
+		 * waiting to retry is cut off, not stopped, and keeps its failed attempt as its
+		 * tail, so `omp --restore` goes on with it. The interrupted-turn reason
+		 * (`INTERRUPTED_TURN_ERROR`), which a shutdown gives, cuts the turn off too; a
+		 * cut-off gives no other reason.
+		 */
+		cutOff?: boolean;
 		/** Force queued user follow-ups into the continuation after a user interrupt. */
 		deliverQueuedMessages?: boolean;
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
+		const cutOff = options?.cutOff === true || options?.reason === INTERRUPTED_TURN_ERROR;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		// Counted for every user interrupt, live run or not: a `triggerTurn` aside sent before
 		// this point must not start a turn the interrupt has since overtaken.
@@ -13222,7 +13285,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#abortAutolearnCapture();
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			for (const controller of this.#imageDescriptionAbortControllers) controller.abort(options?.reason);
-			this.abortRetry();
+			this.#recovery.abortRetry({ cutOff });
 			this.#promptGeneration++;
 			// Cancel any awaited pre-dispatch setup (e.g. Hindsight auto-recall) so the
 			// admitted submission unwinds now instead of at the recall timeout (#12668).
@@ -13243,11 +13306,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} else {
 				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
 			}
+			// Without a reason of the caller's, the reason still says whether this stops the turn or cuts it off,
+			// to the turn and to a continuation already running, which aborts first (`AbortSignal.any` keeps it).
+			// An eval cell of the turn aborts first too, from the eval abort below: it gets the same reason.
+			const turnAbortReason = options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop");
 			this.abortBash();
-			this.abortEval();
+			this.abortEval(turnAbortReason);
 			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
-			const postPromptDrain = this.#cancelPostPromptTasks(options?.reason);
-			this.agent.abort(options?.reason);
+			const postPromptDrain = this.#cancelPostPromptTasks(turnAbortReason);
+			this.agent.abort(turnAbortReason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
 			this.#persistToolResultsEndedWhileDisconnected();
@@ -13257,8 +13324,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// agent_end is awaited: a message_end stalled in an extension hook would
 			// otherwise hold /new and every abort for the full handler timeout.
 			await this.#drainAgentEndMaintenance();
-			this.abortRetry();
-			await this.#cancelPostPromptTasks();
+			this.#recovery.abortRetry({ cutOff });
+			await this.#cancelPostPromptTasks(turnAbortReason);
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
@@ -13340,7 +13407,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
@@ -14444,7 +14511,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	// Auto-Retry
 	// =========================================================================
 
-	/** Cancel an in-progress retry. */
+	/** Cancel an in-progress retry: the user stops the turn, so it ends as aborted and `omp --restore` leaves it. */
 	abortRetry(): void {
 		this.#recovery.abortRetry();
 	}
@@ -14486,8 +14553,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
 	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
 	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A turn that finished, failed, or the user interrupted stays
-	 * as it is.
+	 * transcript stops. A turn that failed because no request could resolve its
+	 * provider key is retried the same way, even after a normal exit: nothing was
+	 * sent, and a worker that exits on it has nothing else to resume it. A turn
+	 * that finished, failed otherwise, or the user interrupted stays as it is.
 	 *
 	 * @returns whether a continuation was scheduled; false while a turn runs, without
 	 * a model, or with nothing left unfinished.
@@ -14585,10 +14654,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Cancel running Python execution.
+	 * Cancel running eval executions (user Python, eval tool cells) with `reason`, by
+	 * default the platform's reason marked as a stop: a sync subagent a cell started
+	 * stops or is cut off by its kind ({@link turnAbortKind}).
 	 */
-	abortEval(): void {
-		this.#eval.abort();
+	abortEval(reason: unknown = plainTurnAbortReason("stop")): void {
+		this.#eval.abort(reason);
 	}
 
 	/** Whether a Python execution is currently running */
@@ -15315,7 +15386,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// results would otherwise land in the resumed transcript. Cancelled after the cwd and
 			// model checks, so a rejected switch keeps them, and before hooks hear of the switch,
 			// so jobs they start belong to the resumed session. Deliveries are held until now.
-			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs();
+			if (switchingToDifferentSession) this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 			this.#reseedCostGate();
 			// Emit session_switch event to hooks
@@ -15666,7 +15737,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -15780,7 +15851,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			: undefined;
 
 		await withTimeout(
-			this.#cancelPostPromptTasks(),
+			this.#cancelPostPromptTasks(plainTurnAbortReason("stop")),
 			POST_PROMPT_DRAIN_TIMEOUT_MS,
 			"Timed out draining post-prompt tasks before /btw branch",
 		);
@@ -15795,7 +15866,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
+		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -16285,7 +16356,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isIdle: () => !this.isStreaming,
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
 			abort: () => {
-				this.agent.abort();
+				this.agent.abort(plainTurnAbortReason("stop"));
 			},
 			settings: this.settings,
 			ui: uiContext,

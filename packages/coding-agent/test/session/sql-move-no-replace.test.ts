@@ -74,6 +74,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	const { client, storage } = await connect();
 	cleanups.push(async () => {
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
+		await client.unsafe(`DROP TABLE IF EXISTS ${table}_blobs`);
 		await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
 	});
 	const cwd = tempDir.join("from");
@@ -337,7 +338,8 @@ describe.skipIf(!process.env.OMP_TEST_SQL_POSTGRES_URL)("deleting a postgres-sto
 		// After each statement of the delete that matches the artifacts prefix,
 		// another client creates and commits a child there once.
 		const afterPrefixStatement = async (query: string): Promise<void> => {
-			if (created || !query.includes("substr(path, 1,")) return;
+			// The directory's DELETE, not the lock of its rows that comes before it (a SELECT … FOR UPDATE).
+			if (created || !query.includes("substr(path, 1,") || query.includes("FOR UPDATE")) return;
 			created = true;
 			await creator.storage.writeText(fresh, transcript("fresh"));
 			await creator.storage.drain();

@@ -574,7 +574,9 @@ impl Cx {
 		Emit::Error
 	}
 
-	/// Opens and lists the root into its frame.
+	/// Opens and lists the root into its frame. Under [`Follow::Never`],
+	/// where [`Tree::new`] found the root a directory with `lstat`, it opens
+	/// without following a symlink put there since, which is refused.
 	async fn open_root(&mut self) -> io::Result<Frame> {
 		if self.opts.same_file_system {
 			self.root_dev = self.session.identify(&self.root).await.ok();
@@ -587,7 +589,11 @@ impl Cx {
 			None
 		};
 		let saved = (0, self.abs.len());
-		let dir = self.session.open_dir(&self.root).await?;
+		let dir = if self.opts.follow == Follow::Never {
+			self.session.open_dir_unlinked(&self.root).await?
+		} else {
+			self.session.open_dir(&self.root).await?
+		};
 		let mut frame = self
 			.open_frame(dir, 0, inherited.as_ref(), 0, None, saved)
 			.await?;

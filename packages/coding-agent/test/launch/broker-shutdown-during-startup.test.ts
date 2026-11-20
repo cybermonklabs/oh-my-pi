@@ -127,6 +127,9 @@ async function seedRunningRecord(runtimeDir: string, cwd: string, name: string, 
 		id: name,
 		state: "running",
 		pid,
+		// The child's kernel start mark, as a broker records it at spawn: recovery kills a
+		// non-detached daemon only through a pin whose mark matches, never by its bare pid.
+		processStart: Process.fromPid(pid)?.startMark ?? undefined,
 		createdAt: 1,
 		startedAt: 1,
 		restartCount: 0,

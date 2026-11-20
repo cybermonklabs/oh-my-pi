@@ -68,14 +68,14 @@ export async function copyTranscriptTree(
 
 /**
  * Copy `from` to `to` chunk by chunk, appending through a writer in batches of
- * about {@link LINE_STREAM_CHUNK}, so a transcript is never held whole and a
- * store that yields a chunk per stored part (SQL: about one per line) is not
- * appended to once per part; a title slot at its head is set on `to` as a
- * whole write would set it. Returns false, leaving nothing at `to`, when
- * `from` is gone; any other failure removes the partial copy and throws. A
- * full rewrite or delete of `from` between two chunks removes the partial
- * copy and copies `from` again from its start, as often as
- * {@link retryRacedRead} allows.
+ * whole lines of about {@link LINE_STREAM_CHUNK}, so a transcript is never held
+ * whole (a line at most) and a store that yields a chunk per stored part (SQL:
+ * about one per line) is not appended to once per part; a title slot at its
+ * head is set on `to` as a whole write would set it. Returns false, leaving
+ * nothing at `to`, when `from` is gone; any other failure removes the partial
+ * copy and throws. A full rewrite or delete of `from` between two chunks
+ * removes the partial copy and copies `from` again from its start, as often
+ * as {@link retryRacedRead} allows.
  */
 export async function copyTranscript(storage: SessionStorage, from: string, to: string): Promise<boolean> {
 	let head: string;
@@ -104,8 +104,12 @@ async function copyTranscriptPass(storage: SessionStorage, from: string, to: str
 			if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
 			batch += text;
 			if (batch.length < LINE_STREAM_CHUNK) continue;
-			await writer.append(batch);
-			batch = "";
+			// Whole lines only: a store that records the blobs each append names (SQL storage's references) then
+			// finds every reference whole, as a reference never spans lines.
+			const cut = batch.lastIndexOf("\n") + 1;
+			if (cut === 0) continue;
+			await writer.append(batch.slice(0, cut));
+			batch = batch.slice(cut);
 		}
 		writer ??= storage.openWriter(to, { flags: "w" });
 		batch += decoder.decode();

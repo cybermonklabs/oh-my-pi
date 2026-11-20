@@ -615,10 +615,11 @@ fn open(path: &BStr, flags: OpenFlags, mode: u32, umask: Option<u32>) -> io::Res
 	Ok(Box::new(StdFile::opened(create_with_mode(path, flags, mode, umask, false)?, flags)))
 }
 
-/// [`open`] for writing only, without waiting for a FIFO's reader: such a
-/// FIFO fails at once with `ENXIO` (the caller then waits on the helper
-/// thread), and nothing is stat'ed first. The descriptor is left blocking,
-/// as a plain open leaves it, since externals inherit its flags.
+/// [`open`] for writing only, without waiting for a FIFO's reader: the
+/// caller has sent a FIFO to the helper thread already, and one made since
+/// (no reader yet) fails at once with `ENXIO` for the caller to send there
+/// too. The descriptor is left blocking, as a plain open leaves it, since
+/// externals inherit its flags.
 #[cfg(unix)]
 fn open_for_writing(
 	path: &BStr,
@@ -747,42 +748,26 @@ const fn custom_flags(flags: OpenFlags) -> libc::c_int {
 }
 
 /// Opening a FIFO in one direction blocks until the other end opens; it runs
-/// on a helper thread and completes as a pending fs op.
+/// on a helper thread ([`pi_vfs::FifoOpen`], which also says what a dropped
+/// open leaves) and completes as a pending fs op.
 #[cfg(unix)]
 mod fifo {
 	use std::{
-		fs::{self, OpenOptions},
-		io,
+		fs, io,
 		os::unix::fs::{FileTypeExt, OpenOptionsExt},
-		path::PathBuf,
-		sync::Arc,
-		task::{Context, Poll, Waker},
-		thread,
+		task::{Context, Poll},
 	};
+	#[cfg(test)]
+	use std::{fs::OpenOptions, path::Path};
 
 	use bstr::BStr;
-	use parking_lot::Mutex;
+	use pi_vfs::FifoOpen;
 
-	use super::{StdFile, host_path, options};
+	use super::{StdFile, custom_flags, host_path, options};
 	use crate::bash::{File, FsPending, OpenFlags};
 
-	/// Result slot shared with the helper thread.
-	#[derive(Default)]
-	struct Slot {
-		result:    Option<io::Result<fs::File>>,
-		waker:     Option<Waker>,
-		/// The result was handed to the engine.
-		finished:  bool,
-		/// The engine dropped the open: the helper closes what it gets.
-		cancelled: bool,
-	}
-
 	/// A FIFO open in flight.
-	struct FifoOpen {
-		slot:  Arc<Mutex<Slot>>,
-		path:  PathBuf,
-		write: bool,
-	}
+	struct Pending(FifoOpen<fs::File>);
 
 	/// `Some` when `path` is a FIFO opened for reading only or writing only
 	/// (`O_RDWR` never blocks on a FIFO).
@@ -796,73 +781,127 @@ mod fifo {
 			return None;
 		}
 		let host = host_path(path).ok()?;
-		if !fs::metadata(host).ok()?.file_type().is_fifo() {
+		let meta = fs::metadata(host).ok()?;
+		if !meta.file_type().is_fifo() {
 			return None;
 		}
-		let slot = Arc::new(Mutex::new(Slot::default()));
-		let (opts, target, helper) = (options(flags, mode), host.to_path_buf(), Arc::clone(&slot));
-		let spawned = thread::Builder::new()
-			.name("obash-fifo".into())
-			.stack_size(64 << 10)
-			.spawn(move || {
-				let opened = opts.open(&target);
-				let mut s = helper.lock();
-				if s.cancelled {
-					return;
-				}
-				s.result = Some(opened);
-				let waker = s.waker.take();
-				drop(s);
-				if let Some(w) = waker {
-					w.wake();
-				}
-			});
-		if let Err(e) = spawned {
-			slot.lock().result = Some(Err(e));
-		}
-		Some(Box::new(FifoOpen { slot, path: host.to_path_buf(), write }))
+		let mut opts = options(flags, mode);
+		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
+		let open = FifoOpen::start(host, &meta, nofollow, move |path, pinned| {
+			// A pin is checked not to be a symbolic link already, and its
+			// `/proc/self/fd/N` always is one.
+			if pinned {
+				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+			}
+			opts.open(path)
+		});
+		Some(Box::new(Pending(open)))
 	}
 
-	impl FsPending<Box<dyn File>> for FifoOpen {
+	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
-			let mut s = self.slot.lock();
-			if let Some(r) = s.result.take() {
-				s.finished = true;
-				return Poll::Ready(r.map(|f| Box::new(StdFile::new(f)) as Box<dyn File>));
-			}
-			if !s.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-				s.waker = Some(cx.waker().clone());
-			}
-			Poll::Pending
+			self
+				.0
+				.poll(cx)
+				.map(|r| r.map(|f| Box::new(StdFile::new(f)) as Box<dyn File>))
 		}
 
-		/// Cancelling releases the helper by briefly opening the other end,
-		/// which the real other end can observe (a writer that comes and
-		/// goes reads as end of file).
+		/// Cancelling releases the helper by briefly holding both ends of the
+		/// FIFO, which the real other end can observe (a writer that comes
+		/// and goes reads as end of file).
 		fn reissuable(&self) -> bool {
 			false
 		}
 	}
 
-	impl Drop for FifoOpen {
-		fn drop(&mut self) {
-			{
-				let mut s = self.slot.lock();
-				if s.finished || s.result.is_some() {
-					return;
+	/// Whether the FIFO at `path` has a reader: a write-only open that does
+	/// not wait fails with ENXIO when it has none.
+	#[cfg(test)]
+	pub(super) fn has_reader(path: &Path) -> bool {
+		match OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+		{
+			Ok(_) => true,
+			Err(e) if e.raw_os_error() == Some(libc::ENXIO) => false,
+			Err(e) => panic!("{e}"),
+		}
+	}
+
+	/// Whether the FIFO at `path` has a writer: a reader that does not wait
+	/// reads end of file when it has none, and would block when it has one.
+	#[cfg(test)]
+	pub(super) fn has_writer(path: &Path) -> bool {
+		use std::io::Read;
+		let mut reader = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(path)
+			.unwrap();
+		match reader.read(&mut [0; 1]) {
+			Ok(0) => false,
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{os::unix::ffi::OsStrExt, task::Waker, thread};
+
+		use super::*;
+
+		/// The open's result, polling it as the engine does; while it has
+		/// none, `connect` runs.
+		fn result(
+			open: &mut dyn FsPending<Box<dyn File>>,
+			mut connect: impl FnMut(),
+		) -> io::Result<Box<dyn File>> {
+			loop {
+				if let Poll::Ready(r) = open.poll(&mut Context::from_waker(Waker::noop())) {
+					return r;
 				}
-				s.cancelled = true;
+				connect();
+				thread::yield_now();
 			}
-			// Release the helper blocked in open(2): be the other end for a
-			// moment, without blocking ourselves.
-			let mut other = OpenOptions::new();
-			if self.write {
-				other.read(true);
-			} else {
-				other.write(true);
+		}
+
+		/// With NOFOLLOW, a FIFO opens (on Linux its pin is checked not to be
+		/// a symbolic link, and the pin's `/proc/self/fd/N`, which is one, is
+		/// opened without the flag), and a symbolic link to a FIFO is refused
+		/// with ELOOP, as `open(2)` refuses it.
+		#[test]
+		fn nofollow_opens_a_fifo_and_refuses_a_symbolic_link_to_one() {
+			let dir = tempfile::tempdir().unwrap();
+			let path = dir.path().join("f");
+			let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `c` is a NUL-terminated string that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
+			let start = |p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0).unwrap();
+
+			let mut open = start(&path);
+			// Be the writer the helper waits for, once it waits.
+			let mut writer = None;
+			let opened = result(&mut *open, || {
+				if writer.is_none() {
+					writer = OpenOptions::new()
+						.write(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.ok();
+				}
+			});
+			assert!(opened.is_ok(), "the FIFO did not open: {:?}", opened.err());
+
+			let link = dir.path().join("l");
+			std::os::unix::fs::symlink(&path, &link).unwrap();
+			let mut open = start(&link);
+			match result(&mut *open, || {}) {
+				Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
+				Ok(_) => panic!("the symbolic link was followed"),
 			}
-			other.custom_flags(libc::O_NONBLOCK);
-			let _ = other.open(&self.path);
 		}
 	}
 }
@@ -937,17 +976,37 @@ fn read_dir(path: &BStr) -> io::Result<Box<dyn DirIter>> {
 	Ok(Box::new(StdDir(entries.into_iter())))
 }
 
-/// Unique temp names within this process.
+/// Temp names within this process: `obash-<pid>-<seq>`.
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// A new FIFO (process substitution on Unix) or empty file in the temp
+/// directory. A name that exists already is skipped: an earlier process
+/// with this pid (one killed, or a test that failed, before it removed its
+/// nodes) can have left it.
 fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
-	let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-	#[cfg(windows)]
-	if let TempPurpose::ProcSub { output } = purpose {
-		return pipe::create(output, seq);
+	temp_in(&TEMP_SEQ, purpose)
+}
+
+/// [`temp`], with the name's number drawn from `seq_from`.
+fn temp_in(seq_from: &AtomicU32, purpose: TempPurpose) -> io::Result<TempNode> {
+	loop {
+		let seq = seq_from.fetch_add(1, Ordering::Relaxed);
+		#[cfg(windows)]
+		if let TempPurpose::ProcSub { output } = purpose {
+			return pipe::create(output, seq);
+		}
+		let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+		match make_temp(&path, fifo) {
+			Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {},
+			Err(err) => return Err(err),
+			Ok(()) => return Ok(TempNode { path: engine_path(&path), fifo }),
+		}
 	}
-	let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
-	let fifo = matches!(purpose, TempPurpose::ProcSub { .. }) && cfg!(unix);
+}
+
+/// Creates the FIFO or the empty file at `path`, failing when it exists.
+fn make_temp(path: &std::path::Path, fifo: bool) -> io::Result<()> {
 	if fifo {
 		#[cfg(unix)]
 		{
@@ -960,9 +1019,9 @@ fn temp(purpose: TempPurpose) -> io::Result<TempNode> {
 			}
 		}
 	} else {
-		fs::File::create_new(&path)?;
+		fs::File::create_new(path)?;
 	}
-	Ok(TempNode { path: engine_path(&path), fifo })
+	Ok(())
 }
 
 fn chdir_check(path: &BStr) -> io::Result<()> {
@@ -1136,17 +1195,28 @@ impl Fs for StdFs {
 		if path.as_bytes() == b"/dev/tty" {
 			return FsPoll::Ready(crate::sys::console::open_tty());
 		}
-		#[cfg(unix)]
-		if flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::READ) {
-			match open_for_writing(path, flags, mode, self.umask) {
-				// No reader (or not a FIFO at all: the checks below tell).
-				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
-				opened => return FsPoll::Ready(opened),
-			}
-		}
+		// A FIFO opened one way goes to the helper thread, which may wait for
+		// the other end, before the write-only open below tries `O_NONBLOCK`:
+		// under gVisor before google/gvisor@d6786915 that open, failing with
+		// `ENXIO` for want of a reader, counts as a writer for a moment, and a
+		// reader then inside a blocking open of the FIFO returns with no writer
+		// and reads end of file, while this writer waits for a reader for ever.
 		#[cfg(unix)]
 		if let Some(pending) = fifo::pending(path, flags, mode) {
 			return FsPoll::Pending(pending);
+		}
+		#[cfg(unix)]
+		if flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::READ) {
+			match open_for_writing(path, flags, mode, self.umask) {
+				// A FIFO made since the check above, with no reader yet (or no
+				// FIFO at all: `pending` tells).
+				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+					if let Some(pending) = fifo::pending(path, flags, mode) {
+						return FsPoll::Pending(pending);
+					}
+				},
+				opened => return FsPoll::Ready(opened),
+			}
 		}
 		FsPoll::Ready(open(path, flags, mode, self.umask))
 	}
@@ -1382,6 +1452,46 @@ mod tests {
 		}
 	}
 
+	/// A temp name is this process's pid and a counter, so a node an earlier
+	/// process with the same pid left (one killed before its cleanup; pids
+	/// are reused within minutes on a busy machine) holds a name this
+	/// process would take: the next free name is taken instead of failing
+	/// with `EEXIST`. Both kinds: a file, and on Unix the FIFO of a process
+	/// substitution (Windows makes a named pipe there).
+	#[test]
+	fn a_temp_node_skips_names_another_process_left() {
+		let purposes: &[TempPurpose] = if cfg!(unix) {
+			&[TempPurpose::HereDoc, TempPurpose::ProcSub { output: false }]
+		} else {
+			&[TempPurpose::HereDoc]
+		};
+		for &purpose in purposes {
+			// Other tests of this process (Bazel runs them all in one) take
+			// names too, so one of this window can be held already: by them,
+			// or by a node an earlier process left. Either serves, and only
+			// the names this test made are its to remove.
+			let next = TEMP_SEQ.load(Ordering::Relaxed);
+			let mine: Vec<_> = (next..next + 4)
+				.filter_map(|seq| {
+					let path = std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+					match fs::File::create_new(&path) {
+						Ok(_) => Some(path),
+						Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+						Err(e) => panic!("{path:?}: {e}"),
+					}
+				})
+				.collect();
+			let node = temp(purpose);
+			for path in &mine {
+				fs::remove_file(path).unwrap();
+			}
+			let node = node.unwrap_or_else(|e| panic!("{purpose:?}: {e}"));
+			let path = host_path(node.path.as_ref()).unwrap().to_path_buf();
+			assert!(!mine.contains(&path), "{purpose:?} took a name already held: {path:?}");
+			fs::remove_file(&path).unwrap();
+		}
+	}
+
 	#[test]
 	fn stat_and_access_distinguish_files_dirs_and_missing_paths() {
 		let dir = std::env::temp_dir();
@@ -1401,7 +1511,7 @@ mod tests {
 			sync::Arc,
 			task::{Wake, Waker},
 			thread,
-			time::{Duration, Instant},
+			time::Duration,
 		};
 
 		use super::*;
@@ -1424,19 +1534,21 @@ mod tests {
 		fn pending(p: FsPoll<Box<dyn File>>) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
 			match p {
 				FsPoll::Pending(p) => p,
-				FsPoll::Ready(_) => panic!("a one-way FIFO open must not complete synchronously"),
+				FsPoll::Ready(_) => {
+					panic!("a one-way FIFO open with no other end must not complete synchronously")
+				},
 			}
 		}
 
 		fn finish(p: &mut Box<dyn crate::bash::FsPending<Box<dyn File>>>) -> Box<dyn File> {
 			let waker = Waker::from(Arc::new(Unpark(thread::current())));
 			let mut cx = Context::from_waker(&waker);
-			let deadline = Instant::now() + Duration::from_secs(10);
+			// An open that never completes hangs the test until the runner's
+			// bound.
 			loop {
 				if let Poll::Ready(r) = p.poll(&mut cx) {
 					return r.unwrap();
 				}
-				assert!(Instant::now() < deadline, "open never completed");
 				thread::park_timeout(Duration::from_millis(100));
 			}
 		}
@@ -1490,13 +1602,45 @@ mod tests {
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
 		}
 
+		/// A FIFO opened for writing only goes to the helper thread even when
+		/// a reader has it open, so no `O_NONBLOCK` writer open is tried on a
+		/// FIFO that exists when the open starts: under gVisor before
+		/// google/gvisor@d6786915 one that fails with `ENXIO` (no reader yet)
+		/// counts as a writer for a moment, and a reader then inside a blocking
+		/// open of the FIFO returns with no writer and reads end of file, while
+		/// the shell's real writer waits for a reader for ever.
+		#[test]
+		fn writing_a_fifo_is_left_to_the_helper_even_with_a_reader() {
+			let path = fifo();
+			let host = host_path(&path).unwrap().to_path_buf();
+			let mut reader = fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&host)
+				.unwrap();
+			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut writer = finish(&mut w);
+			let waker = Waker::noop();
+			assert!(matches!(
+				writer.poll_write(&mut Context::from_waker(waker), b"x"),
+				Poll::Ready(Ok(1))
+			));
+			drop(writer);
+			let mut got = Vec::new();
+			reader.read_to_end(&mut got).unwrap();
+			assert_eq!(got, b"x");
+			fs::remove_file(&host).unwrap();
+		}
+
 		/// `mkfifo f; echo x > f & . f` in one engine thread: both ends live
 		/// on this thread, so neither read nor write may wait in the kernel.
+		/// The writer opens first, as the background `echo` does; each open
+		/// is pending, as every one-way FIFO open is.
 		#[test]
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
 			let path = fifo();
-			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut reader = finish(&mut r);
 			let mut writer = finish(&mut w);
 			assert_eq!(reader.kind(), FileKind::Pipe);
@@ -1625,34 +1769,32 @@ mod tests {
 		}
 
 		impl Flag {
-			fn wait(&self, what: &str) {
-				let deadline = Instant::now() + Duration::from_secs(10);
+			/// Waits for the wake `_what` names; one that never comes hangs the
+			/// test until the runner's bound fails it.
+			fn wait(&self, _what: &str) {
 				while !self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-					assert!(Instant::now() < deadline, "not woken: {what}");
 					thread::sleep(Duration::from_millis(5));
 				}
 			}
 		}
 
+		/// Dropped opens leave no end of the FIFO behind, through
+		/// `StdFs::open` as the engine opens them: each round drops a read
+		/// and a write as soon as they start (in most rounds before their
+		/// helpers run), and a helper any round leaves behind fails a later
+		/// check, or makes a later write open complete at once. A helper the
+		/// drop came before used to enter `open(2)` afterwards and stay on the
+		/// FIFO, so the next writer's data went to it. The tests in `fifo`
+		/// hold each point of the helper's start in turn.
 		#[test]
 		fn dropping_a_pending_fifo_open_releases_the_helper() {
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
-			let p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
-			drop(p);
-			// Once the helper's read end is closed, no reader is left: a
-			// non-blocking write open fails with ENXIO.
-			let deadline = Instant::now() + Duration::from_secs(10);
-			loop {
-				let r = fs::OpenOptions::new()
-					.write(true)
-					.custom_flags(libc::O_NONBLOCK)
-					.open(&host);
-				if r.as_ref().err().and_then(io::Error::raw_os_error) == Some(libc::ENXIO) {
-					break;
-				}
-				assert!(Instant::now() < deadline, "helper still holds the FIFO");
-				thread::sleep(Duration::from_millis(10));
+			for round in 0..200 {
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0)));
+				assert!(!fifo::has_reader(&host), "round {round}: a reader is left on the FIFO");
+				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0)));
+				assert!(!fifo::has_writer(&host), "round {round}: a writer is left on the FIFO");
 			}
 			fs::remove_file(&host).unwrap();
 		}
@@ -1685,6 +1827,46 @@ mod tests {
 			.unwrap();
 		assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 		std::fs::remove_file(host_path(&node.path).unwrap()).unwrap();
+	}
+
+	/// A temp name that an earlier process with this pid left in the temp
+	/// directory (`obash-<pid>-<n>`, kept by a test or a shell that failed or
+	/// was killed before it removed it) is skipped, instead of failing the
+	/// process substitution or the here-document with EEXIST. Each purpose
+	/// draws from a counter of its own, whose next four names exist.
+	#[cfg(unix)]
+	#[test]
+	fn a_temp_name_left_behind_is_skipped() {
+		/// Removes the names this test made, also when it fails.
+		struct Made(Vec<std::path::PathBuf>);
+		impl Drop for Made {
+			fn drop(&mut self) {
+				for path in &self.0 {
+					let _ = fs::remove_file(path);
+				}
+			}
+		}
+		let name =
+			|seq: u32| std::env::temp_dir().join(format!("obash-{}-{seq}", std::process::id()));
+		let mut made = Made(Vec::new());
+		let (fifo_base, file_base) = (1 << 31, (1 << 31) + 64);
+		let mut got = Vec::new();
+		for (base, purpose) in
+			[(fifo_base, TempPurpose::ProcSub { output: false }), (file_base, TempPurpose::HereDoc)]
+		{
+			for seq in base..base + 4 {
+				if fs::File::create_new(name(seq)).is_ok() {
+					made.0.push(name(seq));
+				}
+			}
+			let node = temp_in(&AtomicU32::new(base), purpose).map(|node| {
+				let host = host_path(&node.path).unwrap().to_path_buf();
+				made.0.push(host.clone());
+				(host, node.fifo)
+			});
+			got.push(node.map_err(|e| e.kind()));
+		}
+		assert_eq!(got, [Ok((name(fifo_base + 4), true)), Ok((name(file_base + 4), false))]);
 	}
 
 	/// A Windows pipe classified as a regular file made the line reader read

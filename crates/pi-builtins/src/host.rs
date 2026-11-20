@@ -34,7 +34,7 @@
 use std::{
 	cell::Cell,
 	collections::HashMap,
-	ffi::OsString,
+	ffi::{OsStr, OsString},
 	future::poll_fn,
 	io::{self, BufWriter, LineWriter, Read, Write},
 	panic::{AssertUnwindSafe, catch_unwind},
@@ -42,7 +42,7 @@ use std::{
 	pin::pin,
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicI32, Ordering},
 	},
 	time::{Duration, Instant},
 };
@@ -194,10 +194,12 @@ pub(crate) struct Host {
 	sigpipe:               Arc<Sigpipe>,
 	/// Requests to the adapter's [`CommandRunner`]; `None` unless the utility
 	/// set [`Utility::RUNS_COMMANDS`].
-	commands:              Option<flume::Sender<CommandRequest>>,
+	commands:              Option<CommandLink>,
 	/// Raised when the utility reports an error yet goes on; `None` when the
 	/// shell asked for no such report.
 	reported_error:        Option<Arc<AtomicBool>>,
+	/// [`Invocation::too_long_to_caller`].
+	too_long_to_caller:    Option<Arc<AtomicI32>>,
 	/// The memory-backed stdout and stderr of an async utility; `None` for a
 	/// sync one, whose writers deliver on every write.
 	async_out:             Option<AsyncStreams>,
@@ -969,6 +971,31 @@ impl Host {
 		self.reported_error.clone()
 	}
 
+	/// Whether the utility's caller retries a command line the system
+	/// refuses as too long ([`Invocation::too_long_to_caller`]): a utility
+	/// that has done nothing a retry would repeat when it runs its command
+	/// (`env` without `--env0-from`, `ifne`) then runs it with
+	/// [`ShellCommand::too_long_as_error`] and hands such a refusal up
+	/// ([`Host::hand_up_too_long`]).
+	#[must_use]
+	pub fn too_long_to_caller(&self) -> bool {
+		self.too_long_to_caller.is_some()
+	}
+
+	/// Hands `error`, a refusal of the utility's command as too long, to the
+	/// caller that retries it ([`Host::too_long_to_caller`]); `false` when
+	/// none asked or `error` carries no error number, and the utility
+	/// reports it itself.
+	pub fn hand_up_too_long(&self, error: &io::Error) -> bool {
+		match (&self.too_long_to_caller, error.raw_os_error()) {
+			(Some(slot), Some(code)) if code != 0 => {
+				slot.store(code, Ordering::Relaxed);
+				true
+			},
+			_ => false,
+		}
+	}
+
 	/// The async facade of the host filesystem, for utilities awaiting
 	/// provider I/O.
 	pub fn vfs(&self) -> pi_vfs::Fs {
@@ -1220,7 +1247,9 @@ impl Host {
 	///   [`Utility::RUNS_COMMANDS`].
 	/// - Any other shell failure (bad working directory, redirection error).
 	pub fn run_command(&mut self, command: ShellCommand) -> io::Result<CommandStatus> {
-		self.spawn_command(command)?.wait()
+		let (requests, request, response) = self.enqueue(command, false)?;
+		requests.send(request).map_err(|_| cancelled_command())?;
+		response.recv().map_err(|_| cancelled_command())?
 	}
 
 	/// Starts `command` as [`Host::run_command`] does, without waiting for it.
@@ -1239,9 +1268,13 @@ impl Host {
 	///
 	/// Failures to run the command itself surface from [`RunningCommand::wait`].
 	pub fn spawn_command(&mut self, command: ShellCommand) -> io::Result<RunningCommand> {
-		let (commands, request, response) = self.enqueue(command)?;
-		commands.send(request).map_err(|_| cancelled_command())?;
-		Ok(RunningCommand { response })
+		let (requests, request, response) = self.enqueue(command, true)?;
+		let (Some(finished), Some(link)) = (&request.finished, &self.commands) else {
+			return Err(cancelled_command());
+		};
+		let (id, done) = (finished.id, link.finished.1.clone());
+		requests.send(request).map_err(|_| cancelled_command())?;
+		Ok(RunningCommand { response, id, done })
 	}
 
 	/// Async twin of [`Host::run_command`]; the adapter keeps serving command
@@ -1261,27 +1294,70 @@ impl Host {
 	/// As for [`Host::spawn_command`], with [`AsyncUtility::RUNS_COMMANDS`].
 	pub async fn spawn_command_async(&mut self, command: ShellCommand) -> io::Result<RunningCommandAsync> {
 		let _ = self.drain_output(true).await;
-		let (commands, request, response) = self.enqueue(command)?;
-		commands.send_async(request).await.map_err(|_| cancelled_command())?;
+		let (requests, request, response) = self.enqueue(command, false)?;
+		requests.send_async(request).await.map_err(|_| cancelled_command())?;
 		Ok(RunningCommandAsync { response })
 	}
 
 	/// Builds the request for `command`, flushing pending diagnostics first so
-	/// output stays in order.
+	/// output stays in order; `tracked` gives it a [`Finished`] for
+	/// [`RunningCommand::try_wait_any`] and [`RunningCommand::wait_any`].
 	fn enqueue(
 		&mut self,
 		mut command: ShellCommand,
+		tracked: bool,
 	) -> io::Result<(flume::Sender<CommandRequest>, CommandRequest, flume::Receiver<io::Result<CommandStatus>>)> {
-		let Some(commands) = self.commands.clone() else {
+		let Some(link) = self.commands.as_mut() else {
 			return Err(io::Error::new(
 				io::ErrorKind::Unsupported,
 				format!("{} cannot run commands", self.name),
 			));
 		};
+		let finished = tracked.then(|| link.finished());
+		let requests = link.requests.clone();
 		command.cwd = command.cwd.map(|dir| self.paths.resolve(dir));
 		let (reply, response) = flume::bounded(1);
 		let _ = self.stderr.flush();
-		Ok((commands, CommandRequest { command, reply }, response))
+		Ok((requests, CommandRequest { command, reply, finished }, response))
+	}
+}
+
+/// A host's end of the adapter's command requests ([`Host::run_command`]).
+struct CommandLink {
+	requests: flume::Sender<CommandRequest>,
+	/// The ids of the commands started with [`Host::spawn_command`] whose
+	/// reply is in (or will never come), in the order they finished: what
+	/// [`RunningCommand::try_wait_any`] reads instead of asking every
+	/// command it holds.
+	finished: (flume::Sender<u64>, flume::Receiver<u64>),
+	/// The id of the next command started.
+	next:     u64,
+}
+
+impl CommandLink {
+	fn new(requests: flume::Sender<CommandRequest>) -> Self {
+		Self { requests, finished: flume::unbounded(), next: 0 }
+	}
+
+	/// The [`Finished`] of the next command started.
+	fn finished(&mut self) -> Finished {
+		let id = self.next;
+		self.next += 1;
+		Finished { id, to: self.finished.0.clone() }
+	}
+}
+
+/// Sends its command's id to its host's [`CommandLink::finished`] when
+/// dropped: after the adapter sent the command's reply, or with the
+/// adapter, which then never sends it.
+struct Finished {
+	id: u64,
+	to: flume::Sender<u64>,
+}
+
+impl Drop for Finished {
+	fn drop(&mut self) {
+		let _ = self.to.send(self.id);
 	}
 }
 
@@ -1306,6 +1382,9 @@ impl RunningCommandAsync {
 #[must_use = "a started command should be waited for"]
 pub(crate) struct RunningCommand {
 	response: flume::Receiver<io::Result<CommandStatus>>,
+	/// Its id in its host's [`CommandLink::finished`], and that channel.
+	id:       u64,
+	done:     flume::Receiver<u64>,
 }
 
 impl RunningCommand {
@@ -1318,38 +1397,45 @@ impl RunningCommand {
 		self.response.recv().map_err(|_| cancelled_command())?
 	}
 
-	/// Removes a finished command without waiting, if one is ready.
-	pub fn try_wait_any(running: &mut Vec<Self>) -> Option<io::Result<CommandStatus>> {
-		let (index, response) = running.iter().enumerate().find_map(|(index, command)| {
-			match command.response.try_recv() {
-				Ok(status) => Some((index, status)),
-				Err(flume::TryRecvError::Disconnected) => Some((index, Err(cancelled_command()))),
-				Err(flume::TryRecvError::Empty) => None,
+	/// Removes a finished command without waiting, if one is ready, with
+	/// its index in `running`: it goes as by [`Vec::swap_remove`], so a
+	/// caller keeping per-command data in a parallel `Vec` removes the same
+	/// index. Every command of `running` comes from one host: the host's
+	/// [`CommandLink::finished`] names the commands that finished, so no
+	/// command is asked that has not.
+	pub fn try_wait_any(running: &mut Vec<Self>) -> Option<(usize, io::Result<CommandStatus>)> {
+		loop {
+			let id = running.first()?.done.try_recv().ok()?;
+			if let Some(finished) = Self::take(running, id) {
+				return Some(finished);
 			}
-		})?;
-		drop(running.swap_remove(index));
-		Some(response)
+		}
 	}
 
 	/// Waits for whichever of `running` finishes first and removes it from
-	/// the list; `None` when `running` is empty.
+	/// the list as [`RunningCommand::try_wait_any`] does, returning its
+	/// index; `None` when `running` is empty.
 	///
 	/// # Errors
 	///
 	/// As for [`Host::run_command`], for the command that finished.
-	pub fn wait_any(running: &mut Vec<Self>) -> Option<io::Result<CommandStatus>> {
-		if running.is_empty() {
-			return None;
+	pub fn wait_any(running: &mut Vec<Self>) -> Option<(usize, io::Result<CommandStatus>)> {
+		loop {
+			let id = running.first()?.done.recv().ok()?;
+			if let Some(finished) = Self::take(running, id) {
+				return Some(finished);
+			}
 		}
-		let (index, response) = running
-			.iter()
-			.enumerate()
-			.fold(flume::Selector::new(), |selector, (index, command)| {
-				selector.recv(&command.response, move |response| (index, response))
-			})
-			.wait();
-		drop(running.swap_remove(index));
-		Some(response.map_err(|_| cancelled_command()).flatten())
+	}
+
+	/// Removes the command `id` from `running`, with how it ended; `None`
+	/// when it is not there (it was waited for already, or dropped). Its
+	/// reply is in: the id comes after it, or once the adapter is gone.
+	fn take(running: &mut Vec<Self>, id: u64) -> Option<(usize, io::Result<CommandStatus>)> {
+		let index = running.iter().position(|command| command.id == id)?;
+		let command = running.swap_remove(index);
+		let status = command.response.try_recv().unwrap_or_else(|_| Err(cancelled_command()));
+		Some((index, status))
 	}
 }
 
@@ -1363,6 +1449,8 @@ pub struct ShellCommand {
 	cwd:   Option<PathBuf>,
 	stdin: Option<Fd>,
 	env:   Vec<EnvChange>,
+	too_long_as_error: bool,
+	refusal_as_error: bool,
 }
 
 /// One environment change a [`ShellCommand`] makes for its own command,
@@ -1381,7 +1469,15 @@ impl ShellCommand {
 	/// A command running `argv`; `argv[0]` names the builtin or program.
 	#[must_use]
 	pub fn new(argv: Vec<OsString>) -> Self {
-		Self { argv, argv0: None, cwd: None, stdin: None, env: Vec::new() }
+		Self {
+			argv,
+			argv0: None,
+			cwd: None,
+			stdin: None,
+			env: Vec::new(),
+			too_long_as_error: false,
+			refusal_as_error: false,
+		}
 	}
 
 	/// The command line; `argv[0]` names the builtin or program to look up.
@@ -1465,6 +1561,238 @@ impl ShellCommand {
 		self.stdin = Some(stdin);
 		self
 	}
+
+	/// Reports a program the system refuses to run because the command line
+	/// is too long (`E2BIG`, `ENAMETOOLONG`) as that error from
+	/// [`RunningCommand::wait`], with nothing printed for it, so the utility
+	/// can retry with fewer arguments (`xargs`). Only the program the command
+	/// names counts: a builtin's own `exec` (`eval '…; exec prog'`) keeps the
+	/// shell's diagnostic and status 126, since a retry would repeat what the
+	/// builtin did first. Otherwise, and on Windows, the shell prints its
+	/// diagnostic and the command ends with status 126.
+	pub fn too_long_as_error(mut self) -> Self {
+		self.too_long_as_error = true;
+		self
+	}
+
+	/// Whether [`ShellCommand::too_long_as_error`] was asked for (or
+	/// [`ShellCommand::refusal_as_error`]).
+	#[must_use]
+	pub fn too_long_is_error(&self) -> bool {
+		self.too_long_as_error
+	}
+
+	/// Reports every refusal of the system to start the program the command
+	/// names as that error from [`RunningCommand::wait`], with nothing
+	/// printed for it: a line too long, as [`ShellCommand::too_long_as_error`]
+	/// does, and any other (`EACCES`, `ENOENT` of a `#!` interpreter,
+	/// `ENAMETOOLONG` of a path), so the utility reports a command it cannot
+	/// run in its own words (`env`, in coreutils'). `ENOEXEC` is no refusal:
+	/// the shell runs such a file as a script, as `execvp` does. A builtin's
+	/// own `exec` keeps the shell's diagnostic, as for
+	/// [`ShellCommand::too_long_as_error`]; so does every refusal on Windows.
+	pub fn refusal_as_error(mut self) -> Self {
+		self.too_long_as_error = true;
+		self.refusal_as_error = true;
+		self
+	}
+
+	/// Whether [`ShellCommand::refusal_as_error`] was asked for.
+	#[must_use]
+	pub fn refusal_is_error(&self) -> bool {
+		self.refusal_as_error
+	}
+}
+
+/// Whether `error`, the failure to start `program` in the working directory
+/// `cwd` with a command line whose arguments take `line` bytes
+/// ([`line_bytes`]), is the system refusing the line as too long, as a
+/// command run with [`ShellCommand::too_long_as_error`] reports it: `E2BIG`,
+/// or `ENAMETOOLONG` as GKE Sandbox (gVisor) says it. A utility that batches
+/// arguments retries such a line in halves, as GNU xargs does.
+///
+/// `ENAMETOOLONG` counts only when nothing else can have caused it:
+/// - The line is longer than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
+///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG`
+///   is a path's, such as a `#!` interpreter's past `NAME_MAX`.
+/// - The program's path and the working directory are each shorter than
+///   `PATH_MAX`, with no name in them longer than `NAME_MAX`: a working
+///   directory past `PATH_MAX` refuses every command alike, however few its
+///   arguments.
+/// - A program named by its path is no `#!` script whose interpreter the
+///   system cannot reach by its path ([`interpreter_path_too_long`]),
+///   whatever the line's size, as GNU's xargs never splits it.
+///
+/// `program` is the name the utility gave: a relative path runs from `cwd`,
+/// and a bare name is looked up on `PATH`, where only a path that fits is
+/// found (the shell's twin reads that program: a refusal it finds to be the
+/// interpreter's reaches the utility without its `errno`). `cwd` is taken
+/// lexically normalized (`-execdir`'s `<dir>/./sub` is `<dir>/sub`), as the
+/// shell enters it.
+///
+/// The shell's twin, `refused_as_too_long` in pi-shell's VM
+/// (`bash/vm/command.rs`), decides which refusals reach the utility; the
+/// two apply the same rule.
+#[cfg(unix)]
+pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
+	use std::os::unix::ffi::OsStrExt as _;
+	match error.raw_os_error() {
+		Some(libc::E2BIG) => true,
+		Some(libc::ENAMETOOLONG) if line > POSIX_ARG_MAX => {
+			let cwd = pi_vfs::normalize_lexically(cwd);
+			let named = program.as_os_str().as_bytes().contains(&b'/');
+			let program = if named { cwd.join(program) } else { program.to_path_buf() };
+			path_fits(&program) && path_fits(&cwd) && !(named && interpreter_path_too_long(&program, &cwd))
+		},
+		_ => false,
+	}
+}
+
+/// Whether the program at `path` is a `#!` script whose interpreter the
+/// system cannot reach by its path: the interpreter its first line names
+/// (read as the kernel reads it, from the file's first 256 bytes; relative
+/// to `cwd` when relative) is past `PATH_MAX` or holds a name past
+/// `NAME_MAX`, or looking it up fails with `ENAMETOOLONG` (a symlink on its
+/// way names one). Only read for an `ENAMETOOLONG` of a long line, the one
+/// refusal it decides. The shell's twin is `interpreter_path_too_long` in
+/// pi-shell's VM.
+#[cfg(unix)]
+fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let Ok(file) = std::fs::File::open(path) else {
+		return false;
+	};
+	let mut head = Vec::with_capacity(256);
+	if file.take(256).read_to_end(&mut head).is_err() {
+		return false;
+	}
+	let Some(line) = head.strip_prefix(b"#!") else {
+		return false;
+	};
+	let line = &line[line.iter().take_while(|&&c| c == b' ' || c == b'\t').count()..];
+	let end = line
+		.iter()
+		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
+		.unwrap_or(line.len());
+	if end == 0 {
+		return false;
+	}
+	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(&line[..end]));
+	!path_fits(&interpreter)
+		|| std::fs::metadata(&interpreter).is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
+}
+
+/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`): no system refuses a command
+/// line whose arguments take no more.
+#[cfg(unix)]
+const POSIX_ARG_MAX: usize = 4096;
+
+/// The bytes the arguments `argv` take in a command line: each string and
+/// its terminating NUL, as the system counts them.
+pub(crate) fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
+	argv.into_iter().map(|arg| arg.as_ref().len() + 1).sum()
+}
+
+/// Whether the system takes `path` as a name: shorter than `PATH_MAX`, with
+/// no name in it longer than `NAME_MAX` (255 on Linux and macOS; the `libc`
+/// crate has no macOS constant).
+#[cfg(unix)]
+fn path_fits(path: &Path) -> bool {
+	use std::os::unix::ffi::OsStrExt as _;
+	const NAME_MAX: usize = 255;
+	let bytes = path.as_os_str().as_bytes();
+	bytes.len() < libc::PATH_MAX as usize && bytes.split(|&b| b == b'/').all(|name| name.len() <= NAME_MAX)
+}
+
+/// Windows commands are not split (the shell keeps its diagnostic for every
+/// refused start): see the Unix twin.
+#[cfg(not(unix))]
+pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
+	false
+}
+
+#[cfg(all(test, unix))]
+mod too_long_tests {
+	use std::{io, path::Path};
+
+	use super::{POSIX_ARG_MAX, command_line_too_long};
+
+	/// `E2BIG` is always a line too long; `ENAMETOOLONG` only for a line
+	/// longer than `_POSIX_ARG_MAX` when neither the program's path nor the
+	/// (normalized) working directory is past `PATH_MAX` or holds a name past
+	/// `NAME_MAX`; any other error never is.
+	#[test]
+	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
+		let e2big = io::Error::from_raw_os_error(libc::E2BIG);
+		let enametoolong = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let path_max = libc::PATH_MAX as usize;
+		let longest = format!("/{}", "d/".repeat((path_max - 2) / 2));
+		let longest = &longest[..path_max - 1];
+		let too_long = format!("{longest}d");
+		let name = "n".repeat(255);
+		let long = POSIX_ARG_MAX + 1;
+		let fits = |program: &str, cwd: &str| {
+			command_line_too_long(&enametoolong, Path::new(program), long, Path::new(cwd))
+		};
+		assert!(command_line_too_long(&e2big, Path::new(&too_long), 2, Path::new(&too_long)));
+		assert!(fits("/usr/bin/printf", "/tmp"));
+		assert!(fits("printf", longest), "a bare name is looked up on PATH, not under the directory");
+		assert!(fits(&format!("/{name}"), &format!("/{name}")));
+		assert!(fits("/usr/bin/printf", longest));
+		assert!(!fits("/usr/bin/printf", &too_long), "a working directory past PATH_MAX");
+		assert!(!fits(&too_long, "/tmp"), "a program path past PATH_MAX");
+		assert!(!fits("./sub/printf", longest), "a relative program path runs from the directory");
+		assert!(!fits("/usr/bin/printf", &format!("/{name}n")), "a directory name past NAME_MAX");
+		assert!(!fits(&format!("{name}n"), "/tmp"), "a program name past NAME_MAX");
+		// `-execdir`'s `<dir>/./sub` is entered as `<dir>/sub`: `PATH_MAX`
+		// bytes as given, two fewer normalized.
+		let dir = &longest[..path_max - 4];
+		assert!(fits("/usr/bin/printf", &format!("{dir}/./d")), "the directory is taken normalized");
+		let short = |errno: i32, line: usize| {
+			command_line_too_long(&io::Error::from_raw_os_error(errno), Path::new("./s"), line, Path::new("/tmp"))
+		};
+		assert!(!short(libc::ENAMETOOLONG, POSIX_ARG_MAX), "a line no system refuses: a path's error");
+		assert!(short(libc::ENAMETOOLONG, POSIX_ARG_MAX + 1));
+		assert!(short(libc::E2BIG, 2), "E2BIG is the line's, however short");
+		let other = io::Error::from_raw_os_error(libc::ENOMEM);
+		assert!(!command_line_too_long(&other, Path::new("/usr/bin/printf"), long, Path::new("/tmp")));
+	}
+
+	/// An `ENAMETOOLONG` of a long line whose program is a `#!` script with
+	/// an interpreter the system cannot reach by its path (a symlink to a
+	/// name past `NAME_MAX`) is the interpreter's, whatever the line's size;
+	/// a script whose interpreter is reachable, and a program with no `#!`,
+	/// keep the line's (gVisor's `ENAMETOOLONG` for `E2BIG`).
+	#[test]
+	fn enametoolong_of_a_shebang_interpreter_is_no_line_too_long() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let dir = tempfile::tempdir().unwrap();
+		let at = |name: &str| dir.path().join(name);
+		std::os::unix::fs::symlink(at(&"0".repeat(256)), at("ll")).unwrap();
+		for (name, text) in [
+			("s", format!("#!{}\n", at("ll").display())),
+			("tab", format!("#! \t{} -x\n", at("ll").display())),
+			("relative", "#!ll\n".to_owned()),
+			("sh", "#!/bin/sh\n".to_owned()),
+			("plain", "echo hi\n".to_owned()),
+		] {
+			std::fs::write(at(name), text).unwrap();
+			std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let enametoolong = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+		let too_long =
+			|program: &str, line: usize| command_line_too_long(&enametoolong, Path::new(program), line, dir.path());
+		let long = POSIX_ARG_MAX * 4;
+		for program in ["./s", "./tab", "./relative"] {
+			assert!(!too_long(program, long), "{program}: the interpreter's path is the error");
+		}
+		for program in ["./sh", "./plain", "./missing", "/usr/bin/printf"] {
+			assert!(too_long(program, long), "{program}: the line's");
+		}
+		let e2big = io::Error::from_raw_os_error(libc::E2BIG);
+		assert!(command_line_too_long(&e2big, Path::new("./s"), long, dir.path()), "E2BIG is the line's");
+	}
 }
 
 /// How a command run through [`Host::run_command`] ended.
@@ -1509,8 +1837,11 @@ impl From<std::process::ExitStatus> for CommandStatus {
 /// A [`Host::spawn_command`] call in flight from the utility's blocking worker
 /// to the adapter's [`CommandRunner`].
 struct CommandRequest {
-	command: ShellCommand,
-	reply:   flume::Sender<io::Result<CommandStatus>>,
+	command:  ShellCommand,
+	reply:    flume::Sender<io::Result<CommandStatus>>,
+	/// For a command started with [`Host::spawn_command`]: dropped once the
+	/// reply went out.
+	finished: Option<Finished>,
 }
 
 /// The error a utility sees once the adapter stops serving commands: the
@@ -1542,7 +1873,12 @@ pub trait CommandRunner: Send {
 	///
 	/// The future fails with [`io::ErrorKind::NotFound`] when nothing is named
 	/// `argv[0]`, [`io::ErrorKind::PermissionDenied`] when it cannot be
-	/// executed, and any other kind for other failures to run it.
+	/// executed, and any other kind for other failures to run it. A command
+	/// line the system refuses as too long fails with that error (`E2BIG`,
+	/// `ENAMETOOLONG`) at least for a command that asks for it
+	/// ([`ShellCommand::too_long_is_error`]), and so does any other refusal
+	/// to start its program for a command that asks for that
+	/// ([`ShellCommand::refusal_is_error`]).
 	fn start(&mut self, command: ShellCommand) -> BoxFuture<'static, io::Result<CommandStatus>>;
 }
 
@@ -1990,6 +2326,18 @@ pub(crate) fn strip_errno(error: &io::Error) -> String {
 	message
 }
 
+/// The `strerror` text of a failure to run a command, as GNU's xargs and
+/// find print it: [`strip_errno`], with POSIX's words for the bare kinds a
+/// [`CommandRunner`] reports for its own lookup (`NotFound`: nothing has
+/// the name; `PermissionDenied`: nothing with it can be executed).
+pub(crate) fn run_strerror(error: &io::Error) -> String {
+	match (error.raw_os_error(), error.kind()) {
+		(None, io::ErrorKind::NotFound) => "No such file or directory".to_owned(),
+		(None, io::ErrorKind::PermissionDenied) => "Permission denied".to_owned(),
+		_ => strip_errno(error),
+	}
+}
+
 /// POSIX `strerror` text for an OS error kind. Kinds that cover several errnos
 /// on unix (`PermissionDenied` is both `EPERM` and `EACCES`) keep the native
 /// text there, which is already exact.
@@ -2126,6 +2474,14 @@ pub struct Invocation {
 	/// Raised when the extra reports an error yet goes on (so a caller
 	/// minimizing output knows to keep it); `None` when nobody asks.
 	pub reported_error: Option<Arc<AtomicBool>>,
+	/// Set when the extra's caller retries a command line the system refuses
+	/// as too long (the extra runs as the command of `xargs` or `find -exec
+	/// … +`): an extra that has done nothing a retry would repeat when it
+	/// runs its command (`env` without `--env0-from`, `ifne`) then stores
+	/// here the error of such a refusal of its command
+	/// ([`Host::hand_up_too_long`]), prints nothing for it, and exits 126.
+	/// Zero until then; `None` when nobody asks.
+	pub too_long_to_caller: Option<Arc<AtomicI32>>,
 }
 
 impl Invocation {
@@ -2144,13 +2500,15 @@ impl Invocation {
 			cancel: None,
 			commands: None,
 			reported_error: None,
+			too_long_to_caller: None,
 		}
 	}
 
 	/// Opens the descriptors as shareable [`OpenFile`]s; `default_name` stands
 	/// in for an empty [`Invocation::name`].
 	pub(crate) fn open(self, default_name: &str) -> Opened {
-		let Self { name, argv, env, cwd, stdio, fds, fs, cancel, commands, reported_error } = self;
+		let Self { name, argv, env, cwd, stdio, fds, fs, cancel, commands, reported_error, too_long_to_caller } =
+			self;
 		Opened {
 			name: if name.is_empty() { default_name.to_string() } else { name },
 			argv,
@@ -2165,6 +2523,7 @@ impl Invocation {
 			cancel,
 			commands,
 			reported_error,
+			too_long_to_caller,
 		}
 	}
 }
@@ -2182,6 +2541,7 @@ pub(crate) struct Opened {
 	pub cancel:         Option<CancellationToken>,
 	pub commands:       Option<Box<dyn CommandRunner>>,
 	pub reported_error: Option<Arc<AtomicBool>>,
+	pub too_long_to_caller: Option<Arc<AtomicI32>>,
 }
 
 impl Opened {
@@ -2318,7 +2678,7 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 	let cancel_on_drop = CancelOnDrop(Arc::clone(&cancel_flag));
 	let commands = runner.map(|runner| {
 		let (sender, requests) = flume::unbounded();
-		host.commands = Some(sender);
+		host.commands = Some(CommandLink::new(sender));
 		(runner, requests)
 	});
 	Ok(Prepared { parsed, host, commands, cancel, cancel_flag, _cancel_on_drop: cancel_on_drop })
@@ -2375,10 +2735,12 @@ async fn drive(
 				if let Some((runner, _)) = commands.as_mut() {
 					// The answer goes nowhere once the utility stopped waiting
 					// (it was cancelled); the command still runs to its end.
-					let CommandRequest { command, reply } = request;
+					let CommandRequest { command, reply, finished } = request;
 					let started = runner.start(command);
 					running.push(async move {
 						let _ = reply.send(started.await);
+						// After the reply: whoever reads the id finds it in.
+						drop(finished);
 					});
 				}
 			},
@@ -2508,7 +2870,13 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
-		name: invoked, env, stdio: [stdin, stdout, stderr_file], cancel: token, reported_error, ..
+		name: invoked,
+		env,
+		stdio: [stdin, stdout, stderr_file],
+		cancel: token,
+		reported_error,
+		too_long_to_caller,
+		..
 	} = invocation;
 	let (stdin, stdout, stderr_file) = match (or_null(stdin), or_null(stdout), or_null(stderr_file)) {
 		(Ok(stdin), Ok(stdout), Ok(stderr_file)) => (stdin, stdout, stderr_file),
@@ -2611,6 +2979,7 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 		sigpipe,
 		commands: None,
 		reported_error,
+		too_long_to_caller,
 		async_out,
 		stdin_source: None,
 	})
@@ -3097,6 +3466,7 @@ mod testing {
 				sigpipe,
 				commands:              None,
 				reported_error:        None,
+				too_long_to_caller:    None,
 				async_out,
 				stdin_source:          None,
 			};
@@ -3314,6 +3684,7 @@ mod testing {
 			vfs: None,
 			runtime: tokio::runtime::Handle::current(),
 			output_decoding: None,
+			term_grace: pi_shell::host::TERM_GRACE,
 		})
 		.expect("test shell");
 
@@ -3342,15 +3713,21 @@ mod testing {
 	}
 
 	/// Hooks keyed by path, each run once by the first [`run_hook`] for its
-	/// path ([`SwapTree::swap_at`] registers them).
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	/// path ([`SwapTree::swap_at`] and [`hook_at`] register them).
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` at the first [`run_hook`] for `path`.
+	#[cfg(all(unix, feature = "util.rm"))]
+	pub(crate) fn hook_at(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+		HOOKS.lock().push((path, Box::new(hook)));
+	}
 
 	/// Runs (once) the hook a test registered for `path`, if any: the seam
 	/// where a test swaps an entry a walk listed before the utility reaches it.
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	pub(crate) fn run_hook(path: &std::path::Path) {
 		let hook = {
 			let mut hooks = HOOKS.lock();
@@ -3443,6 +3820,27 @@ mod testing {
 		cwd: &std::path::Path,
 		env: &[(&str, &str)],
 	) -> (i32, String, String) {
+		run_extra_with(argv, stdin, cwd, env, |vars, cwd, stdout, stderr| {
+			Box::new(TestRunner::new(vars, cwd, stdout, stderr))
+		})
+		.await
+	}
+
+	/// [`run_extra`] with the commands served by the runner `runner` makes
+	/// from the environment, the working directory, and the utility's stdout
+	/// and stderr.
+	pub(crate) async fn run_extra_with(
+		argv: &[&str],
+		stdin: &str,
+		cwd: &std::path::Path,
+		env: &[(&str, &str)],
+		runner: impl FnOnce(
+			HashMap<String, String>,
+			PathBuf,
+			std::fs::File,
+			std::fs::File,
+		) -> Box<dyn super::CommandRunner>,
+	) -> (i32, String, String) {
 		use std::io::Seek;
 
 		let mut input = tempfile::tempfile().expect("stdin file");
@@ -3452,7 +3850,7 @@ mod testing {
 		let error = tempfile::tempfile().expect("stderr file");
 		let mut vars: HashMap<String, String> = std::env::vars().collect();
 		vars.extend(env.iter().map(|(name, value)| ((*name).to_string(), (*value).to_string())));
-		let runner = TestRunner::new(
+		let runner = runner(
 			vars.clone(),
 			cwd.to_path_buf(),
 			output.try_clone().expect("stdout"),
@@ -3469,7 +3867,7 @@ mod testing {
 			crate::extras::Fd::File(output.try_clone().expect("stdout")),
 			crate::extras::Fd::File(error.try_clone().expect("stderr")),
 		];
-		invocation.commands = Some(Box::new(runner));
+		invocation.commands = Some(runner);
 		let code = crate::extras::run(invocation).await;
 
 		let read = |mut file: std::fs::File| {
@@ -3479,6 +3877,178 @@ mod testing {
 			text
 		};
 		(code, read(output), read(error))
+	}
+
+	/// A `sh -c` script that prints an `@ N` line for its N arguments, then
+	/// each of them on a line of its own.
+	#[cfg(target_os = "linux")]
+	pub(crate) const SHOW_ARGS: &str = "echo \"@ $#\"; printf '%s\\n' \"$@\"";
+
+	/// The arguments of each line [`SHOW_ARGS`] ran, in order.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn lines_run(stdout: &str) -> Vec<Vec<&str>> {
+		let mut lines: Vec<(usize, Vec<&str>)> = Vec::new();
+		for row in stdout.lines() {
+			match row.strip_prefix("@ ") {
+				Some(count) => lines.push((count.parse().unwrap(), Vec::new())),
+				None => lines.last_mut().expect("an argument before any line").1.push(row),
+			}
+		}
+		for (count, args) in &lines {
+			assert_eq!(*count, args.len(), "a line printed its arguments whole");
+		}
+		lines.into_iter().map(|(_, args)| args).collect()
+	}
+
+	/// The first executable `name` on this process's `PATH`, as an absolute path.
+	///
+	/// A test's external program, wherever the machine keeps it (`/usr/bin` on
+	/// Debian, `/run/current-system/sw/bin` on NixOS).
+	#[cfg(unix)]
+	pub(crate) fn on_path(name: &str) -> String {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let path = std::env::var_os("PATH").unwrap_or_default();
+		std::env::split_paths(&path)
+			.map(|dir| dir.join(name))
+			.find(|file| {
+				file.is_absolute()
+					&& std::fs::metadata(file)
+						.is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+			})
+			.unwrap_or_else(|| panic!("no executable {name} on PATH"))
+			.display()
+			.to_string()
+	}
+
+	/// What a [`Refusing`] runner was asked to run: how many arguments past
+	/// its `fixed` words each line had, and the arguments of the lines it
+	/// "ran".
+	#[cfg(unix)]
+	#[derive(Default)]
+	pub(crate) struct Refused {
+		pub(crate) tried: Vec<usize>,
+		pub(crate) ran:   Vec<String>,
+		/// The argument counts of the lines asked for after the reply to the
+		/// first refusal of a single argument went out: once the utility
+		/// reads that reply, nothing more may start.
+		pub(crate) after_lone_refusal: Vec<usize>,
+		lone_refusal_answered: bool,
+	}
+
+	/// A reply of a [`Refusing`] runner.
+	#[cfg(unix)]
+	type Reply = io::Result<super::CommandStatus>;
+
+	/// A [`CommandRunner`](super::CommandRunner) standing in for a system
+	/// that refuses, with the error `errno`, every command line with more
+	/// than `most` arguments after its first `fixed` words, and runs every
+	/// other line as a command that succeeds without doing anything. A
+	/// refusal reaches the utility as the shell's does: as the error when the
+	/// command asked to hear of it ([`ShellCommand::too_long_as_error`] for a
+	/// line too long by [`command_line_too_long`](super::command_line_too_long),
+	/// [`ShellCommand::refusal_as_error`] for any), else as status 126 (the
+	/// shell's diagnostic, not written here).
+	#[cfg(unix)]
+	pub(crate) struct Refusing {
+		fixed:      usize,
+		most:       usize,
+		errno:      i32,
+		seen:       Arc<Mutex<Refused>>,
+		/// Replies are held back until this many lines were asked for.
+		hold_until: usize,
+		/// The held replies, in the order their lines were asked for, each
+		/// with whether it refuses a single argument.
+		held:       Vec<(flume::Sender<Reply>, Reply, bool)>,
+		/// Disconnects once the last held reply so far has gone out: the
+		/// next one waits for it.
+		delivered:  Option<flume::Receiver<()>>,
+	}
+
+	#[cfg(unix)]
+	impl Refusing {
+		/// The runner, and what it records.
+		pub(crate) fn new(fixed: usize, most: usize, errno: i32) -> (Self, Arc<Mutex<Refused>>) {
+			let seen = Arc::new(Mutex::new(Refused::default()));
+			let runner = Self {
+				fixed,
+				most,
+				errno,
+				seen: Arc::clone(&seen),
+				hold_until: 0,
+				held: Vec::new(),
+				delivered: None,
+			};
+			(runner, seen)
+		}
+
+		/// Answers none of the first `count` lines until the last of them is
+		/// asked for, then all at once, in the order they were asked for: the
+		/// utility finds them all ended together, as when many commands in
+		/// flight finish in one burst.
+		pub(crate) fn holding_replies_until(mut self, count: usize) -> Self {
+			self.hold_until = count;
+			self
+		}
+	}
+
+	#[cfg(unix)]
+	impl super::CommandRunner for Refusing {
+		fn start(&mut self, command: super::ShellCommand) -> futures::future::BoxFuture<'static, Reply> {
+			let args = &command.args()[self.fixed..];
+			let mut seen = self.seen.lock();
+			if seen.lone_refusal_answered {
+				seen.after_lone_refusal.push(args.len());
+			}
+			seen.tried.push(args.len());
+			let refused = args.len() > self.most;
+			let outcome = if refused {
+				let error = io::Error::from_raw_os_error(self.errno);
+				let cwd = command.dir().map_or_else(
+					|| std::env::current_dir().unwrap_or_default(),
+					std::path::Path::to_path_buf,
+				);
+				let program = std::path::Path::new(&command.args()[0]);
+				let line = super::line_bytes(command.args());
+				let too_long = super::command_line_too_long(&error, program, line, &cwd);
+				if command.refusal_is_error() || (command.too_long_is_error() && too_long) {
+					Err(error)
+				} else {
+					Ok(super::CommandStatus::Exited(126))
+				}
+			} else {
+				seen.ran.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
+				Ok(super::CommandStatus::Exited(0))
+			};
+			let lone = outcome.is_err() && args.len() == 1;
+			let asked = seen.tried.len();
+			if asked > self.hold_until {
+				seen.lone_refusal_answered |= lone;
+				return Box::pin(std::future::ready(outcome));
+			}
+			// A held line, or the last of them: each reply waits for the one
+			// before to go out (the utility's adapter sends a reply in the
+			// poll that completes it).
+			let (reply, replied) = flume::bounded(1);
+			let (done, delivered) = flume::bounded::<()>(0);
+			let before = self.delivered.replace(delivered);
+			self.held.push((reply, outcome, lone));
+			if asked == self.hold_until {
+				for (reply, outcome, lone) in self.held.drain(..) {
+					seen.lone_refusal_answered |= lone;
+					let _ = reply.send(outcome);
+				}
+			}
+			drop(seen);
+			Box::pin(async move {
+				if let Some(before) = before {
+					let _ = before.recv_async().await;
+				}
+				let outcome = replied.recv_async().await.unwrap_or_else(|_| Err(io::ErrorKind::Interrupted.into()));
+				drop(done);
+				outcome
+			})
+		}
 	}
 
 	/// Runs the process builtin `P` with `argv` (`argv[0]` naming it), the
@@ -3936,7 +4506,7 @@ mod testing {
 		use super::MemStream;
 		use crate::host::{
 			Arc, AsyncUtility, AtomicBool, CommandCancel, GuardedStream, Host, OpenFile, Sigpipe, StreamWriter,
-			Write, async_out_for, run_caught_async,
+			Write, async_out_for,
 		};
 
 		/// Writes a line to stdout and a note to stderr, knowing nothing of
@@ -3992,7 +4562,7 @@ mod testing {
 			drop(reader);
 			host.set_test_stdout(OpenFile::from(writer));
 
-			let code = run_caught_async::<Chatty>(Chatty, &mut host).await;
+			let code = crate::host::run_caught_async::<Chatty>(Chatty, &mut host).await;
 
 			assert_eq!(code, crate::host::SIGPIPE_EXIT_CODE);
 			assert_eq!(capture.err(), "");
@@ -4219,8 +4789,19 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_script, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
-#[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+#[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm")))]
 pub(crate) use testing::run_hook;
+#[cfg(all(test, unix, feature = "util.rm"))]
+pub(crate) use testing::hook_at;
 #[cfg(all(test, unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
 pub(crate) use testing::SwapTree;
+#[cfg(test)]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::run_extra_with;
+#[cfg(all(test, unix))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::{Refused, Refusing, on_path};
+#[cfg(all(test, target_os = "linux"))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::{SHOW_ARGS, lines_run};
 

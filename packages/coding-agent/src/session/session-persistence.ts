@@ -96,7 +96,9 @@ function shouldExternalizeImagePayload(
  */
 function externalizeImageNode(value: unknown, blobStore: BlobStore, key: string | undefined): unknown {
 	if (typeof value === "string") {
-		return key === "image_url" && isImageDataUrl(value) ? externalizeImageDataUrlSync(blobStore, value) : undefined;
+		return key === "image_url" && isImageDataUrl(value)
+			? externalizeImageDataUrlSync(blobStore, value, { mirror: true })
+			: undefined;
 	}
 	if (typeof value !== "object" || value === null) return undefined;
 	if (
@@ -107,10 +109,12 @@ function externalizeImageNode(value: unknown, blobStore: BlobStore, key: string 
 		!isBlobRef(value.result) &&
 		value.result.length >= BLOB_EXTERNALIZE_THRESHOLD
 	) {
-		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined) };
+		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined, true) };
 	}
 	if (shouldExternalizeImagePayload(value, key)) {
-		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType) };
+		// A snapcompact frame never goes to the tier: its archive's text draws it again.
+		const mirror = key !== SNAPCOMPACT_FRAMES_KEY;
+		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType, mirror) };
 	}
 	return undefined;
 }
@@ -137,16 +141,23 @@ interface ExternalizedImage {
  */
 const externalizedImageRefs = new WeakMap<BlobStore, WeakMap<object, ExternalizedImage>>();
 
+/**
+ * Externalize one image payload, once per live payload object. `mirror`
+ * also hands it to the blob store's tier, which keeps it until it lands, so
+ * this once-per-object cache never drops a write; a snapcompact frame never
+ * goes there, since its archive's text draws it again.
+ */
 function externalizeImagePayloadSync(
 	blobStore: BlobStore,
 	payload: object,
 	data: string,
 	mimeType: string | undefined,
+	mirror: boolean,
 ): string {
 	let refs = externalizedImageRefs.get(blobStore);
 	const cached = refs?.get(payload);
 	if (cached && cached.data === data && cached.mimeType === mimeType) return cached.ref;
-	const ref = externalizeImageDataSync(blobStore, data, mimeType);
+	const ref = externalizeImageDataSync(blobStore, data, mimeType, { mirror });
 	if (!refs) {
 		refs = new WeakMap();
 		externalizedImageRefs.set(blobStore, refs);

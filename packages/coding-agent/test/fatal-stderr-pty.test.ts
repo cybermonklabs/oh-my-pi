@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Terminal as VirtualTerminal } from "@oh-my-pi/pi-utils/vterm";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const COLUMNS = 120;
 const ROWS = 30;
@@ -33,19 +34,15 @@ describe.skipIf(process.platform === "win32")("fatal stderr terminal handoff", (
 		try {
 			const proc = Bun.spawn([process.execPath, `${import.meta.dir}/fixtures/fatal-tui.ts`], {
 				cwd: process.cwd(),
-				// This is a real-terminal contract test: shed the test-runtime markers so
-				// the fixture's ProcessTerminal paints instead of going headless
-				// (ci-test-ts children inherit PI_TEST_RUNTIME=1).
+				// This is a real-terminal contract test: the fixture runs as production, in a home of
+				// its own, so its ProcessTerminal paints instead of going headless (a test child is
+				// headless); the terminal identity of the parent (a Tern pane among them) is not passed.
 				env: {
-					...process.env,
-					OMP_TUI_DEBUG: undefined,
-					PI_TEST_RUNTIME: undefined,
+					...createProductionChildEnv(),
 					BUN_ENV: undefined,
 					NODE_ENV: undefined,
 					// Bun's PTY and the VT parser do not implement native TSP surfaces.
-					// A parent running in Tern must not turn the fixture's rows into APC JSON.
 					TERM: "xterm-256color",
-					TERM_PROGRAM: undefined,
 					OMP_TUI_NATIVE: "0",
 					PI_TUI_NATIVE: "0",
 				},

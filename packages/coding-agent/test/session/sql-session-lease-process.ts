@@ -9,6 +9,8 @@
  * - `{ op: "release", sessionId }`: give that claim up and drain.
  * - `{ op: "hold", file, sessionDir, subagent? }`: open the session file, claim it at open and write one
  *   turn; with `subagent`, also open that subagent transcript (under the session's artifacts directory).
+ * - `{ op: "open", file, sessionDir }`: open the session file as the held session without claiming it, as
+ *   inspection does; its first write claims it.
  * - `{ op: "append", text, contested? }`: write one more turn to the held session; `error` names a
  *   failure. With `contested`, another store that claims nothing (an older build) appends an entry to
  *   the session first, and again right before each full write, so the append and every full write meet
@@ -53,6 +55,8 @@ interface Config {
 	lease?: { expiryMs: number; heartbeatMs: number };
 	/** `file`: run on file storage instead, for the paths only it has. */
 	storage?: "file";
+	/** See `LeaseProcessConfig.holderLookupMs`. */
+	holderLookupMs?: number;
 }
 
 const config = JSON.parse(process.argv[2] ?? "{}") as Config;
@@ -67,6 +71,14 @@ const storage: SessionStorage & { refresh?: () => Promise<void> } = client
 		})
 	: new FileSessionStorage();
 setDefaultSessionStorage(storage);
+if (config.holderLookupMs !== undefined) {
+	const lookup = storage.sessionClaimHolder?.bind(storage);
+	const delayMs = config.holderLookupMs;
+	(storage as { sessionClaimHolder?: SessionStorage["sessionClaimHolder"] }).sessionClaimHolder = async sessionId => {
+		await Bun.sleep(delayMs);
+		return lookup?.(sessionId);
+	};
+}
 
 const releases = new Map<string, () => void>();
 const managers: SessionManager[] = [];
@@ -267,6 +279,14 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 			await storage.drain();
 			return {};
 		}
+		case "open":
+			return describe(
+				adopt(
+					await SessionManager.open(String(command.file), String(command.sessionDir), storage, {
+						suppressBreadcrumb: true,
+					}),
+				),
+			);
 		case "hold": {
 			const manager = adopt(
 				await SessionManager.open(String(command.file), String(command.sessionDir), storage, {

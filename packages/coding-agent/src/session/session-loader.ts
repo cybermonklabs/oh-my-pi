@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { blobExtensionForImageMimeType } from "@oh-my-pi/pi-tui/prompt/image-format";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -8,6 +9,7 @@ import {
 	isEnoent,
 	isEnotdir,
 	jsonContainerEnd,
+	logger,
 	parseJsonlLenient,
 	peekFile,
 	tryParseJson,
@@ -17,15 +19,24 @@ import { Semaphore } from "../task/parallel";
 import { isArchivedSessionPath } from "./session-archive";
 import {
 	BlobStore,
+	externalizeImageData,
 	isBlobRef,
 	lazyImageDataSync,
+	parseBlobRef,
 	resolveImageData,
 	resolveImageDataSync,
 	resolveImageDataUrl,
 	resolveImageDataUrlSync,
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import {
+	type CompactionEntry,
+	type FileEntry,
+	type RawFileEntry,
+	resolveSessionLeafId,
+	type SessionEntry,
+	type SessionHeader,
+} from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
@@ -1025,6 +1036,24 @@ function blobSiteKey(site: BlobRefSite): string {
 	return `${site.asDataUrl ? "url" : "base64"}:${site.ref}`;
 }
 
+/** Add to `into` the hash of each blob `values` reference where a resolve finds one, with its holder's MIME type. */
+function addBlobRefNames(values: readonly unknown[], into: Map<string, string | undefined>): void {
+	for (const site of blobRefSites(values)) {
+		const hash = parseBlobRef(site.ref);
+		if (!hash || into.has(hash)) continue;
+		const mimeType = site.holder.mimeType;
+		into.set(hash, typeof mimeType === "string" ? mimeType : undefined);
+	}
+}
+
+/**
+ * Add to `into` the blobs `entry` names, as {@link resolveBlobRefsInEntries}
+ * finds them, for a caller that lets go of the entry before that runs.
+ */
+export function collectBlobRefNames(entry: FileEntry, into: Map<string, string | undefined>): void {
+	if (entry.type !== "session") addBlobRefNames([entry], into);
+}
+
 async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore): Promise<void> {
 	const semaphore = new Semaphore(BLOB_READ_CONCURRENCY);
 	const resolved = new Map<string, Promise<string>>();
@@ -1051,21 +1080,210 @@ async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore)
 }
 
 /** The non-header entries, with legacy truncated snapcompact frames repaired before their blobs resolve. */
-function entriesForBlobResolution(entries: FileEntry[]): FileEntry[] {
-	const sessionEntries = entries.filter(entry => entry.type !== "session");
+function entriesForBlobResolution(entries: FileEntry[]): SessionEntry[] {
+	const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
 	for (const entry of sessionEntries) repairTruncatedSnapcompactFrames(entry);
 	return sessionEntries;
 }
 
-/** Restore the image data that persistence externalized to the blob store, in place. */
-export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
-	await resolveBlobRefs(entriesForBlobResolution(entries), blobStore);
+/**
+ * The newest compaction on the active branch, when it holds a snapcompact
+ * archive: the one a rebuilt context draws frames from.
+ */
+function activeSnapcompactCompaction(
+	entries: readonly SessionEntry[],
+): { entry: CompactionEntry; archive: snapcompact.Archive } | undefined {
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const leafId = resolveSessionLeafId(entries);
+	const seen = new Set<string>();
+	let current = leafId === null ? undefined : byId.get(leafId);
+	while (current && !seen.has(current.id)) {
+		if (current.type === "compaction") {
+			const archive = snapcompact.getPreservedArchive(current.preserveData);
+			return archive ? { entry: current, archive } : undefined;
+		}
+		seen.add(current.id);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return undefined;
 }
 
-/** Synchronous {@link resolveBlobRefsInEntries}. */
+/**
+ * Draw again, from the archive's kept source text, each frame whose blob this
+ * machine lacks, and store each one whose bytes hash to its reference. A
+ * frame that does not draw so keeps its missing blob, which the rebuilt
+ * context reports as unavailable.
+ */
+async function restoreArchiveFrames(
+	archive: snapcompact.Archive,
+	blobStore: BlobStore,
+	entryId: string,
+): Promise<void> {
+	const missing: number[] = [];
+	for (const [index, frame] of archive.frames.entries()) {
+		const hash = parseBlobRef(frame.data);
+		if (hash && !(await blobStore.has(hash))) missing.push(index);
+	}
+	if (missing.length === 0) return;
+	const redrawn = await snapcompact.redrawFrames(
+		archive,
+		missing,
+		(index, data) =>
+			new Bun.SHA256().update(Buffer.from(data, "base64")).digest("hex") ===
+			parseBlobRef(archive.frames[index]?.data ?? ""),
+	);
+	for (const index of missing) {
+		const frame = archive.frames[index];
+		const data = redrawn.get(index);
+		if (frame && data !== undefined) {
+			await externalizeImageData(blobStore, data, frame.mimeType);
+			continue;
+		}
+		logger.warn("Snapcompact frame blob is missing, and the archive text does not draw it again", {
+			entryId,
+			frame: index + 1,
+			frames: archive.frames.length,
+			ref: frame?.data,
+		});
+	}
+}
+
+/**
+ * Restore the frames of the active snapcompact archive whose blobs this
+ * machine lacks: a session resumed on another machine brings its frame
+ * references but not the blob store that held them.
+ */
+async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobStore: BlobStore): Promise<void> {
+	const active = activeSnapcompactCompaction(entries);
+	if (!active) return;
+	for (const archive of [active.archive, active.archive.withoutThinking?.archive]) {
+		if (!archive) continue;
+		try {
+			await restoreArchiveFrames(archive, blobStore, active.entry.id);
+		} catch (error) {
+			logger.warn("Restoring missing snapcompact frames failed", {
+				entryId: active.entry.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
+
+/**
+ * Write to the local blob store each blob the references in `values` name
+ * that it lacks and the store's tier holds (the SQL session storage's blob
+ * table): a session resumed on another machine brings its references but not
+ * the blob store that held them. A row whose bytes do not hash to its key is
+ * left out and warned about. With `writeBack`, each blob this machine holds
+ * and the tier lacks (one written before the tier, or whose write never
+ * landed) is queued for the tier, so it lands before the session's next
+ * transcript write, and each row whose bytes do not hash to its key is
+ * rewritten from this machine's bytes; the tier stores no bytes that do not
+ * hash to their key, whichever of the two hands them over. With
+ * `sessionPath` too, the session at that path then gets its reference rows
+ * for every blob it names that the tier holds, so another session's delete
+ * keeps them (a session written before the tier has none). Snapcompact frames
+ * are not in the tier; they are drawn again from their archive's text. Each
+ * of `collected`'s blobs counts as one the references in `values` name.
+ */
+async function restoreTierBlobs(
+	values: readonly unknown[],
+	blobStore: BlobStore,
+	writeBack: boolean,
+	sessionPath?: string,
+	collected?: ReadonlyMap<string, string | undefined>,
+): Promise<void> {
+	const tier = blobStore.tier;
+	if (!tier) return;
+	const mimeTypes = new Map(collected);
+	addBlobRefNames(values, mimeTypes);
+	if (mimeTypes.size === 0) return;
+	const named: string[] = [];
+	try {
+		const held = await tier.sizes([...mimeTypes.keys()]);
+		const missing: string[] = [];
+		const heldHere: string[] = [];
+		let writtenBack = 0;
+		for (const [hash, mimeType] of mimeTypes) {
+			if (held.has(hash)) {
+				named.push(hash);
+				if (await blobStore.has(hash)) heldHere.push(hash);
+				else missing.push(hash);
+				continue;
+			}
+			if (!writeBack) continue;
+			const data = await blobStore.get(hash);
+			if (!data) continue;
+			tier.store(hash, data, mimeType);
+			named.push(hash);
+			writtenBack++;
+		}
+		if (writtenBack > 0) {
+			logger.info("Writing local session blobs the session database lacks back to it", { blobs: writtenBack });
+		}
+		// A row whose bytes do not hash to its key is rewritten from this machine's bytes, when they hash to it.
+		if (writeBack && heldHere.length > 0) await tier.repair(heldHere, hash => blobStore.get(hash));
+		await tier.read(missing, async (hash, data) => {
+			if (new Bun.SHA256().update(data).digest("hex") !== hash) {
+				logger.warn("A session blob in the session database does not hash to its key; left missing", { hash });
+				return;
+			}
+			await blobStore.put(data, { hash, extension: blobExtensionForImageMimeType(mimeTypes.get(hash)) });
+			logger.info("Restored a session blob from the session database", { hash, bytes: data.byteLength });
+		});
+	} catch (error) {
+		logger.warn("Reading missing session blobs from the session database failed", {
+			blobs: mimeTypes.size,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	if (!writeBack || !sessionPath || named.length === 0) return;
+	try {
+		await tier.reference(sessionPath, named);
+	} catch (error) {
+		logger.warn("Writing a session's blob references to the session database failed", {
+			sessionPath,
+			blobs: named.length,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * Restore the image data that persistence externalized to the blob store, in
+ * place: first each blob the local store lacks from the store's tier (and
+ * each one the tier lacks back to it, referenced from `sessionPath` when it is
+ * given), then the references, then the active snapcompact archive's missing
+ * frames, drawn again from its text.
+ *
+ * `collected` adds blobs, by hash with their MIME types, that entries the caller
+ * no longer holds whole name (a streamed load's entries moved out of memory),
+ * found with {@link collectBlobRefNames} while it held them: the tier pass
+ * (restore, write-back and references) covers them too.
+ */
+export async function resolveBlobRefsInEntries(
+	entries: FileEntry[],
+	blobStore: BlobStore,
+	sessionPath?: string,
+	collected?: ReadonlyMap<string, string | undefined>,
+): Promise<void> {
+	const sessionEntries = entriesForBlobResolution(entries);
+	await restoreTierBlobs(sessionEntries, blobStore, true, sessionPath, collected);
+	await resolveBlobRefs(sessionEntries, blobStore);
+	await restoreSnapcompactFrames(sessionEntries, blobStore);
+}
+
+/**
+ * Synchronous {@link resolveBlobRefsInEntries}: it resolves what the local
+ * blob store holds. A reference it leaves is resolved in place later, once
+ * the store's tier is read and the missing snapcompact frames are drawn
+ * again, which are both asynchronous.
+ */
 export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: BlobStore): void {
+	const sessionEntries = entriesForBlobResolution(entries);
 	const resolved = new Map<string, string>();
-	for (const site of blobRefSites(entriesForBlobResolution(entries))) {
+	let unresolved = false;
+	for (const site of blobRefSites(sessionEntries)) {
 		const key = blobSiteKey(site);
 		let data = resolved.get(key);
 		if (data === undefined) {
@@ -1075,7 +1293,17 @@ export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: Bl
 			resolved.set(key, data);
 		}
 		site.holder[site.key] = data;
+		if (containsBlobRef(data)) unresolved = true;
 	}
+	if (!unresolved || !blobStore.tier) return;
+	void restoreTierBlobs(sessionEntries, blobStore, false)
+		.then(() => resolveBlobRefs(sessionEntries, blobStore))
+		.then(() => restoreSnapcompactFrames(sessionEntries, blobStore))
+		.catch(error => {
+			logger.warn("Restoring the missing blobs of adopted session entries failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 }
 
 /**
@@ -1098,8 +1326,10 @@ export async function loadSessionMessagesReadOnly(
 	applyToolResultPrunes(entries);
 	applyEntryPatches(entries);
 	for (const entry of entries) repairTruncatedSnapcompactFrames(entry);
-	const blobs = new BlobStore(getBlobsDir());
+	const blobs = new BlobStore(getBlobsDir(), storage.blobTier);
 	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
+	// Frames resolve lazily below, so the ones this machine lacks are drawn first.
+	await restoreSnapcompactFrames(sessionEntries, blobs);
 	const { messages } = buildSessionContext(sessionEntries, undefined, undefined, {
 		transcript: true,
 		collapseCompactedHistory: true,
@@ -1114,6 +1344,8 @@ export async function loadSessionMessagesReadOnly(
 			? { ...message, providerPayload: undefined }
 			: message,
 	);
+	// Read only: a blob the tier lacks is not written back from here.
+	await restoreTierBlobs(displayMessages, blobs, false);
 	await resolveBlobRefs(displayMessages, blobs);
 	return displayMessages;
 }
