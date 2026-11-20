@@ -957,7 +957,7 @@ export function getNativeGrammarsDir(): string {
  * function, at the first use, so the addon and the agent never name different directories,
  * even after a `.env` file sets a directory variable. omp's children that are omp take it from
  * a handoff (`NATIVES_DIR_HANDOFF_ENV_KEY`: `workerEnvFromParent`, `brokerEnvFromParent`,
- * `ompDaemonSpecEnv`, the fork command); other children resolve for themselves.
+ * `ompDaemonSpecEnv`); other children resolve for themselves.
  */
 export { getNativesDir };
 
