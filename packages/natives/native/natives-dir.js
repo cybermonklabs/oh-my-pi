@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getEnvironmentData, setEnvironmentData } from "node:worker_threads";
 
 /**
  * An absolute directory from an override variable (`~` expanded), or undefined for a
@@ -36,13 +37,15 @@ function resolveNativesDir() {
 }
 
 /**
- * Hidden variable carrying this process's answer to its worker threads,
- * `{"pid":…,"ppid":…,"start":…,"dir":…}`: a worker starts with a copy of the environment,
- * which may hold directory variables the main thread's first answer predates. It is keyed to
- * this process's life (see {@link isThisProcess}), so a child process, with another pid,
- * never takes it.
+ * Key of this process's answer in its worker-thread environment data (`setEnvironmentData`),
+ * `{ dir, startedWithHandoff }`: a worker thread starts with a copy of it, and with a copy of
+ * the environment, which may hold directory variables the main thread's first answer
+ * predates. Environment data stays in the process, so no child process, and no command the
+ * agent runs, is given it. (Bun passes a worker thread's copy on to the worker threads it
+ * starts only once the thread has loaded `node:worker_threads`, as loading this module does;
+ * every omp thread loads it, through `@oh-my-pi/pi-utils`.)
  */
-const NATIVES_DIR_CACHE_ENV_KEY = "__PI_NATIVES_DIR_CACHE";
+const NATIVES_DIR_THREAD_DATA_KEY = "@oh-my-pi/pi-natives/natives-dir";
 
 /** This process's answer, once the first call has given it. */
 let processNativesDir;
@@ -94,40 +97,17 @@ function isLiveProcess(pid) {
 }
 
 /**
- * Whether an inherited answer was written by this process (by its main thread or another of
- * its threads). With a start time (Linux): the same pid and start time. Without one: the same
- * pid, and either the same parent or a recorded parent that no longer runs. A process whose
- * parent exits is re-parented, so its live parent changes while it lives; a later process
- * given the same pid has a parent that runs, since that parent started it. Without a start
- * time only `kill(pid, 0)` tells, and a zombie parent counts as running: a re-parented process
- * whose old parent is unreaped refuses its own answer and resolves again.
- * @param {{ pid?: unknown; ppid?: unknown; start?: unknown }} cached
- */
-function isThisProcess(cached) {
-	if (cached?.pid !== process.pid) return false;
-	const start = processStartTime();
-	if (start !== undefined && typeof cached.start === "string") return cached.start === start;
-	return cached.ppid === process.ppid || (typeof cached.ppid === "number" && !isLiveProcess(cached.ppid));
-}
-
-/**
- * Make `dir` this process's answer: kept for later calls, and carried to worker threads
- * through {@link NATIVES_DIR_CACHE_ENV_KEY}, with whether the process was started with a
- * handoff. `PI_NATIVES_DIR` is left as it is, so the commands the agent runs carry it as omp
- * was started with it.
+ * Make `dir` this process's answer: kept for later calls, and carried to the worker threads it
+ * starts afterwards through {@link NATIVES_DIR_THREAD_DATA_KEY}, with whether the process was
+ * started with a handoff. `PI_NATIVES_DIR` is left as it is, so the commands the agent runs
+ * carry it as omp was started with it.
  * @param {string} dir
  * @param {boolean} withHandoff
  */
 function adopt(dir, withHandoff) {
 	processNativesDir = dir;
 	startedWithHandoff = withHandoff;
-	process.env[NATIVES_DIR_CACHE_ENV_KEY] = JSON.stringify({
-		pid: process.pid,
-		ppid: process.ppid,
-		start: processStartTime(),
-		dir,
-		startedWithHandoff: withHandoff,
-	});
+	setEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY, { dir, startedWithHandoff: withHandoff });
 	return dir;
 }
 
@@ -261,14 +241,9 @@ export function nativesDirHandoffDir(value, addressee) {
  */
 export function getNativesDir() {
 	if (processNativesDir !== undefined) return processNativesDir;
-	try {
-		const cached = JSON.parse(process.env[NATIVES_DIR_CACHE_ENV_KEY] ?? "null");
-		if (isThisProcess(cached) && typeof cached.dir === "string") {
-			return adopt(cached.dir, cached.startedWithHandoff === true);
-		}
-	} catch {
-		// Not this module's value; resolve below and replace it.
-	}
+	// The answer of the thread that started this worker thread, if any.
+	const inherited = getEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY);
+	if (typeof inherited?.dir === "string") return adopt(inherited.dir, inherited.startedWithHandoff === true);
 	const value = process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
 	const handedOver = nativesDirHandoffDir(value, { env: process.env, ppid: process.ppid });
 	// Read once: the children this process starts with `process.env` must not take it. A
@@ -296,5 +271,5 @@ export function startedWithNativesDirHandoff() {
 export function __resetNativesDirForTests() {
 	processNativesDir = undefined;
 	startedWithHandoff = false;
-	delete process.env[NATIVES_DIR_CACHE_ENV_KEY];
+	setEnvironmentData(NATIVES_DIR_THREAD_DATA_KEY, undefined);
 }

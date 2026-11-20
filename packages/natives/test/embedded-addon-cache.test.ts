@@ -243,7 +243,6 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 	async function probe(nativesDir: string, claim: "" | "stay" | "putback") {
 		const env: Record<string, string | undefined> = { ...process.env, PI_NATIVES_DIR: nativesDir };
 		delete env.__PI_NATIVE_VARIANT_CACHE;
-		delete env.__PI_NATIVES_DIR_CACHE;
 		if (process.arch === "x64") env.PI_NATIVE_VARIANT = realAddon?.includes("-baseline") ? "baseline" : "modern";
 		if (claim) env.PROBE_CLAIM = claim;
 		else delete env.PROBE_CLAIM;

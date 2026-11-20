@@ -159,17 +159,16 @@ export function launchEnvValue(name: string): string | undefined {
 const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
 
 /**
- * Whether `name` is `PI_NATIVES_DIR` or one of the natives module's private entries (the
- * handoff, `__PI_NATIVES_DIR_HANDOFF`, and the worker-thread cache, `__PI_NATIVES_DIR_CACHE`),
- * which omp's own `.env` loading never applies: the natives directory is fixed before `.env`
- * files are read, so such a value could only mislead the programs omp starts, and a handoff
- * from a `.env` file would replace the empty one commands get. (Bun's own loading, in a
- * non-compiled omp, runs before this module, and the workers and the broker omp starts run
- * with it off.)
+ * Whether `name` is `PI_NATIVES_DIR` or the natives module's handoff
+ * (`__PI_NATIVES_DIR_HANDOFF`), which omp's own `.env` loading never applies: the natives
+ * directory is fixed before `.env` files are read, so such a value could only mislead the
+ * programs omp starts, and a handoff from a `.env` file would replace the empty one commands
+ * get. (Bun's own loading, in a non-compiled omp, runs before this module, and the workers and
+ * the broker omp starts run with it off.)
  */
 function isNativesDirEnvName(name: string): boolean {
 	const upper = process.platform === "win32" ? name.toUpperCase() : name;
-	return upper === "PI_NATIVES_DIR" || upper.startsWith("__PI_NATIVES_DIR_");
+	return upper === "PI_NATIVES_DIR" || upper === NATIVES_DIR_HANDOFF_ENV_KEY;
 }
 
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {

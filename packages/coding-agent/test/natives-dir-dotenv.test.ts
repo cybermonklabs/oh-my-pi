@@ -23,7 +23,6 @@ const DIRECTORY_NAMES = [
 	"XDG_DATA_HOME",
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
-	"__PI_NATIVES_DIR_CACHE",
 	"__PI_NATIVES_DIR_HANDOFF",
 ];
 
@@ -103,9 +102,11 @@ describe("the natives directory of omp's children", () => {
 
 	beforeEach(async () => {
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-natives-children-"));
+		// `given`: the natives module's private names the program was started with, read before
+		// its own first call. Only a child that is omp is given one, the handoff.
 		await Bun.write(
 			path.join(tempRoot, "print-natives-dir.ts"),
-			`console.log(JSON.stringify({ dir: (await import(${JSON.stringify(nativesDirJs)})).getNativesDir(), PI_NATIVES_DIR: process.env.PI_NATIVES_DIR ?? null, OMP_DOWNLOAD_ROOT: process.env.OMP_DOWNLOAD_ROOT ?? null }));\n`,
+			`const given = Object.keys(process.env).filter(name => name.startsWith("__PI_NATIVES_DIR") && process.env[name]);\nconsole.log(JSON.stringify({ dir: (await import(${JSON.stringify(nativesDirJs)})).getNativesDir(), PI_NATIVES_DIR: process.env.PI_NATIVES_DIR ?? null, OMP_DOWNLOAD_ROOT: process.env.OMP_DOWNLOAD_ROOT ?? null, given }));\n`,
 		);
 	});
 
@@ -160,8 +161,10 @@ const run = (env, home) => {
 		await Bun.write(
 			path.join(tempRoot, "worker.ts"),
 			`${helpers(printer)}
+const given = Object.keys(process.env).filter(name => name.startsWith("__PI_NATIVES_DIR") && process.env[name]);
 const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
-console.log(JSON.stringify({ dir, PI_NATIVES_DIR: process.env.PI_NATIVES_DIR ?? null, program: run(process.env).dir, programOwnHome: run(process.env, ${JSON.stringify(ownHome)}).dir }));
+const program = run(process.env);
+console.log(JSON.stringify({ given, dir, PI_NATIVES_DIR: process.env.PI_NATIVES_DIR ?? null, program: program.dir, programGiven: program.given, programOwnHome: run(process.env, ${JSON.stringify(ownHome)}).dir }));
 `,
 		);
 		const { home, result } = await session(
@@ -178,7 +181,7 @@ console.log(JSON.stringify({
 	applied: process.env.PI_NATIVES_DIR ?? null,
 	worker: JSON.parse(worker.stdout.toString()),
 	commandEnv: { PI_NATIVES_DIR: commandEnv.PI_NATIVES_DIR ?? null, handoff: commandEnv.__PI_NATIVES_DIR_HANDOFF ?? null },
-	command: run(commandEnv, ${JSON.stringify(ownHome)}).dir,
+	command: run(commandEnv, ${JSON.stringify(ownHome)}),
 	spread: run({ ...Bun.env }),
 	spreadOwnHome: run({ ...Bun.env }, ${JSON.stringify(ownHome)}).dir,
 }));
@@ -196,14 +199,19 @@ console.log(JSON.stringify({
 		// The worker takes the session's directory; its environment has PI_NATIVES_DIR as launched.
 		expect(result.worker.dir).toBe(sessionDir);
 		expect(result.worker.PI_NATIVES_DIR).toBeNull();
+		// A worker is omp: it is given the handoff, and nothing else of the session's answer.
+		expect(result.worker.given).toEqual(["__PI_NATIVES_DIR_HANDOFF"]);
 		// The programs it starts resolve their own: with its environment (the agent `.env`'s
-		// OMP_DOWNLOAD_ROOT), and with a home of their own.
+		// OMP_DOWNLOAD_ROOT), and with a home of their own. None is given anything of its answer.
 		expect(result.worker.program).toBe(path.join(tempRoot, "dl", "natives"));
+		expect(result.worker.programGiven).toEqual([]);
 		expect(result.worker.programOwnHome).toBe(ownDir);
 		// The session was started with no handoff, so its commands get none (the worker's get it empty).
 		expect(result.commandEnv).toEqual({ PI_NATIVES_DIR: null, handoff: null });
-		expect(result.command).toBe(ownDir);
+		expect(result.command.dir).toBe(ownDir);
+		expect(result.command.given).toEqual([]);
 		expect(result.spread.PI_NATIVES_DIR).toBeNull();
+		expect(result.spread.given).toEqual([]);
 		expect(result.spreadOwnHome).toBe(ownDir);
 	}, 120_000);
 
@@ -219,10 +227,11 @@ console.log(JSON.stringify({
 		await Bun.write(
 			path.join(tempRoot, "broker.ts"),
 			`${helpers(printer)}
+const given = Object.keys(process.env).filter(name => name.startsWith("__PI_NATIVES_DIR") && process.env[name]);
 const { managedDaemonEnv } = await import(${JSON.stringify(workerClientTs)});
 const dir = (await import(${JSON.stringify(nativesDirJs)})).getNativesDir();
 const specs = JSON.parse(process.argv[2]);
-console.log(JSON.stringify({ dir, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? null, service: run(managedDaemonEnv(specs.service)), daemon: run(managedDaemonEnv(specs.daemon)) }));
+console.log(JSON.stringify({ given, dir, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? null, service: run(managedDaemonEnv(specs.service)), daemon: run(managedDaemonEnv(specs.daemon)) }));
 `,
 		);
 		const { home, result } = await session(
@@ -253,11 +262,17 @@ console.log(JSON.stringify({ first, applied: process.env.OMP_DOWNLOAD_ROOT ?? nu
 		expect(result.broker.XDG_CACHE_HOME).toBe(agentCache);
 		expect(result.broker.dir).toBe(sessionDir);
 		expect(result.broker.daemon.dir).toBe(sessionDir);
+		// The broker and the daemon are omp: each is given the handoff, and nothing else of the
+		// session's answer.
+		expect(result.broker.given).toEqual(["__PI_NATIVES_DIR_HANDOFF"]);
+		expect(result.broker.daemon.given).toEqual(["__PI_NATIVES_DIR_HANDOFF"]);
 		// The service gets what the same command run directly gets: the agent `.env`'s input,
-		// not the project `.env`'s.
+		// not the project `.env`'s, and nothing of the session's answer or the broker's.
 		expect(result.direct.dir).toBe(path.join(agentCache, "omp", "natives"));
+		expect(result.direct.given).toEqual([]);
 		expect(result.broker.service.OMP_DOWNLOAD_ROOT).toBeNull();
 		expect(result.broker.service.dir).toBe(result.direct.dir);
+		expect(result.broker.service.given).toEqual([]);
 	}, 120_000);
 
 	it("gives a worker started in a directory whose .env sets an input the session's directory", async () => {
@@ -343,10 +358,11 @@ console.log(JSON.stringify({ dir, seen, command: JSON.parse(omp) }));
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 		const result = JSON.parse(stdout);
 
-		// The worker takes its handoff; a command it runs sees none, and an omp the command starts
-		// resolves its own directory.
+		// The worker takes its handoff; a command it runs sees none, nor anything else of the
+		// worker's answer, and an omp the command starts resolves its own directory.
 		expect(result.dir).toBe(handedOver);
 		expect(result.seen).toBe("handoff=");
+		expect(result.command.given).toEqual([]);
 		expect(result.command.dir).toBe(path.join(home, ".omp", "natives"));
 	}, 120_000);
 });
