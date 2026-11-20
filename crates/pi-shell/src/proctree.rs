@@ -53,6 +53,45 @@ mod platform {
 	thread_local! {
 		/// Pin this thread's processes as where `pidfd_open` is unavailable.
 		pub(crate) static NO_PIDFD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+		/// Listing the threads of the paired pid on this thread fails with
+		/// the paired `errno` while the process is still there: gVisor's
+		/// `ENOENT` once the process's leader thread has exited, or a list
+		/// the system refuses (`EACCES`), which Linux gives neither of.
+		pub(crate) static FAIL_THREAD_LISTS: std::cell::RefCell<Vec<(i32, i32)>> =
+			const { std::cell::RefCell::new(Vec::new()) };
+
+		/// Reading the children of the paired thread id on this thread fails
+		/// with the paired `errno`, as when that thread exits between the
+		/// thread list and the read.
+		pub(crate) static FAIL_CHILDREN_READS: std::cell::RefCell<Vec<(i32, i32)>> =
+			const { std::cell::RefCell::new(Vec::new()) };
+	}
+
+	/// `Err` with the `errno` a test hook pairs with `id` in `fails`.
+	#[cfg(test)]
+	fn failed(
+		fails: &'static std::thread::LocalKey<std::cell::RefCell<Vec<(i32, i32)>>>,
+		id: i32,
+	) -> io::Result<()> {
+		fails.with_borrow(|fails| match fails.iter().find(|&&(at, _)| at == id) {
+			Some(&(_, errno)) => Err(io::Error::from_raw_os_error(errno)),
+			None => Ok(()),
+		})
+	}
+
+	/// The entries of `/proc/<pid>/task`.
+	fn list_threads(pid: i32) -> io::Result<fs::ReadDir> {
+		#[cfg(test)]
+		failed(&FAIL_THREAD_LISTS, pid)?;
+		fs::read_dir(format!("/proc/{pid}/task"))
+	}
+
+	/// `/proc/<pid>/task/<tid>/children`.
+	fn read_children(pid: i32, tid: &str) -> io::Result<String> {
+		#[cfg(test)]
+		failed(&FAIL_CHILDREN_READS, tid.parse().unwrap_or(0))?;
+		fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
 	}
 
 	/// `pidfd_open(pid)`.
@@ -145,14 +184,23 @@ mod platform {
 			// a worker thread appears under that thread's `tid`, not the tgid.
 			// Walk every task subdir and union the lists, then re-validate
 			// parentage.
-			let task_dir = format!("/proc/{}/task", self.pid);
 			let mut seen: HashSet<i32> = HashSet::new();
 			let mut children_file_available = false;
-			match fs::read_dir(&task_dir) {
+			// The thread list was gone while `/proc` still showed this process
+			// ([`Self::thread_list_gone`]), or a thread left between the list
+			// and the read of its children, which the kernel then gave to
+			// another thread, maybe one already read: the children are found
+			// by their parent instead.
+			let mut by_parent = false;
+			match list_threads(self.pid) {
 				Ok(entries) => {
 					for entry in entries {
 						let entry = match entry {
 							Ok(entry) => entry,
+							Err(error) if self.thread_list_gone(&error) => {
+								by_parent = true;
+								break;
+							},
 							Err(error) => {
 								self.note(&mut walk, &error, "list the threads of");
 								continue;
@@ -162,7 +210,7 @@ mod platform {
 						let Some(tid) = name.to_str().filter(|tid| tid.parse::<i32>().is_ok()) else {
 							continue;
 						};
-						match fs::read_to_string(format!("{task_dir}/{tid}/children")) {
+						match read_children(self.pid, tid) {
 							Ok(content) => {
 								// The file is readable -> this kernel has
 								// CONFIG_PROC_CHILDREN.
@@ -175,11 +223,15 @@ mod platform {
 							},
 							// The thread exited since the listing.
 							Err(error)
-								if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {},
+								if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
+							{
+								by_parent = true;
+							},
 							Err(error) => self.note(&mut walk, &error, "read the children of"),
 						}
 					}
 				},
+				Err(error) if self.thread_list_gone(&error) => by_parent = true,
 				Err(error) => self.note(&mut walk, &error, "list the threads of"),
 			}
 
@@ -189,9 +241,10 @@ mod platform {
 			// signaling (cancellation cleanup) into a no-op inside such
 			// containers. Fall back to scanning `/proc` and grouping
 			// by parent pid, the same primitive the macOS path uses. Only taken
-			// when no `children` file was readable, so kernels that support it
-			// keep the cheap per-task fast path.
-			if !children_file_available
+			// when no `children` file was readable, or a thread list or file
+			// was gone, so kernels that support it keep the cheap per-task
+			// fast path.
+			if (!children_file_available || by_parent)
 				&& walk.complete.is_ok()
 				&& self.status() == ProcessStatus::Running
 			{
@@ -224,6 +277,24 @@ mod platform {
 			walk
 		}
 
+		/// Whether `error`, a failure to list this process's threads, says
+		/// only that the list is gone while `/proc` still shows this process,
+		/// read by its start time. gVisor answers `ENOENT` from the moment the
+		/// leader thread (the one whose id is the pid) exits, while the
+		/// process runs on until its last thread exits, and its pidfd reads
+		/// as running until then (`fsimpl/proc/subtasks.go`,
+		/// `kernel/pidfd.go`); Linux, only once the process is reaped, when
+		/// the pidfd reads as exited. A process `/proc` does not show (no
+		/// `/proc`, another pid namespace's, one `hidepid` hides) was not
+		/// read, which proves nothing.
+		fn thread_list_gone(&self, error: &io::Error) -> bool {
+			matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+				&& matches!(
+					crate::sys::proc::read(self.pid),
+					Ok(Some(info)) if info.start == self.start_time
+				)
+		}
+
 		/// Records `error`, a failure to read what this process's children
 		/// are, unless this process has exited meanwhile.
 		fn note(&self, walk: &mut Walk<Self>, error: &io::Error, what: &str) {
@@ -235,8 +306,9 @@ mod platform {
 		/// Validate a candidate child pid — dedup, still running, and currently
 		/// parented to `self` — then push it onto `walk`. Shared by the
 		/// `/proc/<pid>/task/<tid>/children` fast path and the `/proc`-scan
-		/// fallback for kernels without `CONFIG_PROC_CHILDREN`. A candidate
-		/// that cannot be pinned or read makes the walk incomplete.
+		/// fallback (kernels without `CONFIG_PROC_CHILDREN`, or a thread list
+		/// gone from `/proc`). A candidate that cannot be pinned or read makes
+		/// the walk incomplete.
 		fn push_validated_child(
 			&self,
 			child_pid: i32,
@@ -2059,6 +2131,190 @@ mod tests {
 		assert_eq!(signal, Some(KILL_SIGNAL), "the root was killed");
 		assert_eq!(pinned.status(), ProcessStatus::Exited, "the reaped root reads as exited");
 		assert!(crate::sys::proc::ended(sleep_pid), "the sleep was killed");
+	}
+
+	/// Starts `sh`, which runs a `sleep 600` and waits for it, then `exec`s
+	/// a second `sleep 600`, so that only a KILL of its own ends it; in a
+	/// process group of its own when `own_group`. Returns the `sh` and the
+	/// first sleep's pid.
+	#[cfg(target_os = "linux")]
+	fn sh_with_a_sleep(own_group: bool) -> (std::process::Child, i32) {
+		use std::{io::BufRead as _, os::unix::process::CommandExt as _};
+
+		let mut command = std::process::Command::new("sh");
+		command
+			.args(["-c", "sleep 600 & echo $!; wait; exec sleep 600"])
+			.stdout(std::process::Stdio::piped());
+		if own_group {
+			command.process_group(0);
+		}
+		let mut root = crate::testkit::child::dies_with_this_process(&mut command)
+			.spawn()
+			.unwrap();
+		let mut line = String::new();
+		std::io::BufReader::new(root.stdout.take().unwrap())
+			.read_line(&mut line)
+			.unwrap();
+		(root, line.trim().parse().unwrap())
+	}
+
+	/// gVisor answers a listing of `/proc/<pid>/task` with `ENOENT` from the
+	/// moment the process's leader thread exits, while the process, and so
+	/// its pidfd, runs on until its last thread exits
+	/// (`fsimpl/proc/subtasks.go`, `kernel/pidfd.go`). A kill that met a
+	/// multi-threaded daemon in that state refused: `cannot list the threads
+	/// of process N: No such file or directory`. Here the root's thread list
+	/// gives that answer while the root runs: the walk finds the root's
+	/// child by its parent, so `kill_tree` kills both and succeeds.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_thread_list_gone_from_proc_finds_the_children_by_their_parent() {
+		let (mut root, sleep_pid) = sh_with_a_sleep(false);
+		let root_pid = i32::try_from(root.id()).unwrap();
+		let pinned = Process::from_pid(root_pid).expect("pin the root");
+		let sleep = Process::from_pid(sleep_pid).expect("pin the sleep");
+		platform::FAIL_THREAD_LISTS.set(vec![(root_pid, libc::ENOENT)]);
+		let killed = pinned.kill_tree(Some(KILL_SIGNAL));
+		platform::FAIL_THREAD_LISTS.take();
+		if !matches!(killed, Ok(2)) {
+			let _ = sleep.signal(KILL_SIGNAL);
+		}
+		let status = root.wait().unwrap();
+		assert!(matches!(killed, Ok(2)), "the root and its sleep: {killed:?}");
+		let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+		assert_eq!(signal, Some(KILL_SIGNAL), "the root was killed");
+		while sleep.status() == ProcessStatus::Running {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	/// A thread list the walk cannot read while the process is still there
+	/// proves nothing, so `kill_tree` still fails, naming it, once it has
+	/// killed the root and the group the root leads: a list the system
+	/// refuses (`EACCES`), and an `ENOENT` for a process `/proc` does not
+	/// show either (no `/proc`, another pid namespace's, or one `hidepid`
+	/// hides: here its `stat` read fails too).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_thread_list_the_walk_cannot_read_fails_the_kill() {
+		for (errno, stat_hidden, said) in [
+			(libc::EACCES, false, "Permission denied"),
+			(libc::ENOENT, true, "No such file or directory"),
+		] {
+			let (mut root, sleep_pid) = sh_with_a_sleep(true);
+			let root_pid = i32::try_from(root.id()).unwrap();
+			let pinned = Process::from_pid(root_pid).expect("pin the root");
+			let sleep = Process::from_pid(sleep_pid).expect("pin the sleep");
+			platform::FAIL_THREAD_LISTS.set(vec![(root_pid, errno)]);
+			let hidden =
+				stat_hidden.then(|| crate::sys::proc::fail_reads(vec![(Some(root_pid), libc::ENOENT)]));
+			let killed = pinned.kill_tree(Some(KILL_SIGNAL));
+			drop(hidden);
+			platform::FAIL_THREAD_LISTS.take();
+			let status = root.wait().unwrap();
+			// The sleep is in the root's group, which needs no read.
+			while sleep.status() == ProcessStatus::Running {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			let text = killed
+				.expect_err("kill_tree reported a whole tree it could not read")
+				.to_string();
+			let unread = format!("cannot list the threads of process {root_pid}: {said}");
+			assert!(text.starts_with(&unread), "{text}");
+			assert!(text.contains(&format!("and process group {root_pid}")), "{text}");
+			let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+			assert_eq!(signal, Some(KILL_SIGNAL), "{said}: the root was killed");
+		}
+	}
+
+	/// The variable that lets [`a_thread_that_forked_a_sleep`] run.
+	#[cfg(target_os = "linux")]
+	const FORKING_THREAD: &str = "PI_SHELL_TEST_FORKING_THREAD";
+
+	/// A child is listed in the `children` file of the thread that forked
+	/// it. When that thread exits between the thread list and the read of
+	/// its file, the kernel gives its children to another thread of the
+	/// process, whose file the walk may have read already: the walk then
+	/// missed the child, and reported a whole tree. Here the root is a test
+	/// process whose second thread forked a `sleep`, and the read of that
+	/// thread's file fails as when the thread has exited. The walk finds
+	/// the sleep by its parent, so `kill_tree` kills both.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_thread_that_left_before_its_children_were_read_loses_no_child() {
+		use std::io::BufRead as _;
+
+		let mut root = crate::testkit::child::dies_with_this_process(
+			std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--exact",
+					"proctree::tests::a_thread_that_forked_a_sleep",
+					"--ignored",
+					"--nocapture",
+					"--test-threads=1",
+				])
+				.env(FORKING_THREAD, "1")
+				.stdout(std::process::Stdio::piped()),
+		)
+		.spawn()
+		.unwrap();
+		// The harness writes `test <name> ... ` before the test runs, so the
+		// helper's words follow it on the same line.
+		let forked = std::io::BufReader::new(root.stdout.take().unwrap())
+			.lines()
+			.map(Result::unwrap)
+			.find_map(|line| {
+				let (tid, sleep) = line.split_once("FORKED ")?.1.split_once(' ')?;
+				Some((tid.parse::<i32>().unwrap(), sleep.parse::<i32>().unwrap()))
+			});
+		let (tid, sleep_pid) = forked.expect("the root's thread forked a sleep");
+		let root_pid = i32::try_from(root.id()).unwrap();
+		let pinned = Process::from_pid(root_pid).expect("pin the root");
+		let sleep = Process::from_pid(sleep_pid).expect("pin the sleep");
+		platform::FAIL_CHILDREN_READS.set(vec![(tid, libc::ENOENT)]);
+		let killed = pinned.kill_tree(Some(KILL_SIGNAL));
+		platform::FAIL_CHILDREN_READS.take();
+		if !matches!(killed, Ok(2)) {
+			let _ = sleep.signal(KILL_SIGNAL);
+		}
+		let status = root.wait().unwrap();
+		assert!(matches!(killed, Ok(2)), "the root and its sleep: {killed:?}");
+		let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+		assert_eq!(signal, Some(KILL_SIGNAL), "the root was killed");
+		while sleep.status() == ProcessStatus::Running {
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	/// Run by [`a_thread_that_left_before_its_children_were_read_loses_no_child`]
+	/// in a child process: a second thread forks a `sleep 600`, prints its
+	/// own thread id and the sleep's pid, and waits for the sleep; the first
+	/// thread waits until the process is killed.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run in a child process by \
+	            a_thread_that_left_before_its_children_were_read_loses_no_child"]
+	fn a_thread_that_forked_a_sleep() {
+		if std::env::var_os(FORKING_THREAD).is_none() {
+			return;
+		}
+		std::thread::spawn(|| {
+			let mut sleep = std::process::Command::new("sleep")
+				.arg("600")
+				.stdout(std::process::Stdio::null())
+				.spawn()
+				.unwrap();
+			// SAFETY: gettid takes no arguments.
+			let tid = unsafe { libc::gettid() };
+			println!("FORKED {tid} {}", sleep.id());
+			let _ = sleep.wait();
+			loop {
+				std::thread::park();
+			}
+		});
+		loop {
+			std::thread::park();
+		}
 	}
 
 	/// Run by [`kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish`]
