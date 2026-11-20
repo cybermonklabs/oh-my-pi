@@ -27,8 +27,11 @@ import packageJson from "../package.json" with { type: "json" };
 let repo = "";
 let nativeDir = "";
 let addon = "";
+/** `Date.now()` as the test began writing its repository, before any file of it existed. */
+let writesBegan = 0;
 
 beforeEach(async () => {
+	writesBegan = Date.now();
 	repo = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-sources-"));
 	nativeDir = path.join(repo, "packages/natives/native");
 	addon = path.join(nativeDir, "pi_natives.linux-x64-modern.node");
@@ -63,6 +66,26 @@ async function readLater<T>(fn: () => T | Promise<T>): Promise<T> {
 	} finally {
 		clock.mockRestore();
 	}
+}
+
+/**
+ * Run `fn` with `Date.now()` at {@link writesBegan}: a read within two seconds of every file the
+ * test wrote, however long a loaded machine took to get to it. A test of what a build or a start
+ * keeps from a state too new to trust reads at such a time; {@link pinnedClockSource} does the
+ * same in a {@link bounded} process.
+ */
+async function readSoon<T>(fn: () => T | Promise<T>): Promise<T> {
+	const clock = vi.spyOn(Date, "now").mockReturnValue(writesBegan);
+	try {
+		return await fn();
+	} finally {
+		clock.mockRestore();
+	}
+}
+
+/** JS source for {@link bounded}: `Date.now()` is {@link writesBegan} from here on (see {@link readSoon}). */
+function pinnedClockSource(): string {
+	return `Date.now = () => ${writesBegan};`;
 }
 
 /** Git with no user or system configuration, so a test repository behaves the same on any machine. */
@@ -476,12 +499,12 @@ console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.e
 	}, 60_000);
 
 	it("keep no state whose times are within two seconds of the read, and keep it once they are older", async () => {
-		await build();
-		// The build read files it had just written, so it keeps no fingerprint, and the first
+		// The build reads files it has just written, so it keeps no fingerprint, and the first
 		// start reads the bytes.
+		await readSoon(() => build());
 		const recorded = async () => (await Bun.file(`${addon}.sources.json`).json()).seen.fingerprint;
 		expect(await recorded()).toBeNull();
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		expect(await readSoon(() => addonSourcesState(addon, repo))).toBe("current");
 		expect(await recorded()).toBeNull();
 		// Control: a start more than two seconds after the writes keeps the state it read.
 		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
@@ -489,13 +512,15 @@ console.log(JSON.stringify({ state, sourcesOpened: opened.filter(file => !file.e
 	});
 
 	it("see a same-size edit made in the timestamp tick of the start that read the file (git's racy case)", async () => {
-		await build();
+		await readSoon(() => build());
 		const target = path.join(repo, "crates/pi-natives/src/lib.rs");
 		// On a kernel whose clock is coarse, a file read and then edited in one tick keeps its
 		// times. The seam gives the file the times it had at the read, for the read and after the
-		// edit, as such a kernel does; the edit keeps the size and the inode.
+		// edit, as such a kernel does; the edit keeps the size and the inode. Both starts read
+		// within two seconds of the writes, as in one tick.
 		expect(
-			bounded(`const target = ${JSON.stringify(target)};
+			bounded(`${pinnedClockSource()}
+const target = ${JSON.stringify(target)};
 const frozen = nodeFs.lstatSync(target);
 let fd;
 __setRegularFileIoForTests({
@@ -1150,7 +1175,8 @@ const keptFor = () => JSON.parse(nodeFs.readFileSync(stampPath, "utf8")).scanned
 		await checkout();
 		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
 		expect(
-			bounded(`${freezeDirectory()}
+			bounded(`${pinnedClockSource()}
+${freezeDirectory()}
 const first = addonSourcesState(addon, repo);
 const kept = keptFor();
 nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
@@ -1163,7 +1189,8 @@ console.log(JSON.stringify({ first, kept, second }));`),
 		await checkout();
 		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
 		expect(
-			bounded(`${freezeDirectory()}
+			bounded(`${pinnedClockSource()}
+${freezeDirectory()}
 const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
 // The build script compiles every matching file there, this one too.
 nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
@@ -1177,7 +1204,8 @@ console.log(JSON.stringify({ unsettled: before.unsettled, sources, state: addonS
 		await checkout();
 		await Bun.write(path.join(repo, defs, "README.md"), "# filter defs\n");
 		expect(
-			bounded(`${freezeDirectory()}
+			bounded(`${pinnedClockSource()}
+${freezeDirectory()}
 const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
 writeAddonSourcesStamp(addon, settleRustSources(repo, before), {});
 const kept = keptFor();
