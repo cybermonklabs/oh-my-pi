@@ -666,22 +666,28 @@ impl Pty {
 	/// Wait until `programs` all run in the terminal's foreground process
 	/// group, a job's and not the shell's: the command just typed has
 	/// started every process the keys `^Z` and `^C` are meant to signal.
+	/// `true` when the foreground group was read.
 	///
-	/// Where the foreground group cannot be read ([`foreground_group`]),
-	/// the wait is for `programs` all running, not stopped, in one group
-	/// that is not the shell's. That is the same fact there: a job-control
-	/// shell gives a job a group of its own, and each of the job's
-	/// processes makes that group the terminal's foreground before it
+	/// Where it cannot be read ([`foreground_group`]; `false`), the wait is
+	/// for `programs` all running, not stopped, in one group that is not the
+	/// shell's. That is the same fact for a job that has just started: a
+	/// job-control shell gives a job a group of its own, and each of the
+	/// job's processes makes that group the terminal's foreground before it
 	/// execs (zsh's `entersubsh`, obash's spawner), so a process that runs
-	/// its program already has the terminal.
+	/// its program already has the terminal. It is not the same fact for a
+	/// job `bg` already continued: after `fg` the job runs before the shell
+	/// gives it the terminal (zsh's `bin_fg` prints the `running` line
+	/// before `attachtty`), so a caller that needs the terminal handed over
+	/// treats `false` there as nothing compared.
 	///
 	/// # Errors
 	///
 	/// When the group cannot be read, or `TimedOut` (with the output so
 	/// far).
-	pub fn wait_job_running(&mut self, programs: &[&str], timeout: Duration) -> io::Result<()> {
+	pub fn wait_job_running(&mut self, programs: &[&str], timeout: Duration) -> io::Result<bool> {
 		let what = format!("{programs:?} running in the terminal's foreground");
 		let shell = self.pid();
+		let mut read = false;
 		self.wait_processes(timeout, &what, |fg, procs| {
 			let running_in = |group: i32| {
 				group != shell
@@ -691,11 +697,13 @@ impl Pty {
 							.any(|q| q.pgid == group && !q.stopped && q.comm == *p)
 					})
 			};
+			read = fg.is_some();
 			match fg {
 				Some(fg) => running_in(fg),
 				None => procs.iter().any(|q| running_in(q.pgid)),
 			}
-		})
+		})?;
+		Ok(read)
 	}
 
 	/// Wait until no process the shell started is left (dead processes the

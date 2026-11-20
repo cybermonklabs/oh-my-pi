@@ -6,8 +6,9 @@
 //!
 //! A key that signals a job is typed once the job's processes run in the
 //! terminal's foreground process group ([`Pty::wait_job_running`]), not a
-//! fixed time after the command line; a session ends at a marker the shell
-//! prints after every job line before it ([`end`]).
+//! fixed time after the command line; a command line is typed once the
+//! line editor waits for a key ([`line`]); a session ends at a marker the
+//! shell prints after every job line before it ([`end`]).
 
 #![cfg(unix)]
 
@@ -30,14 +31,19 @@ fn shell(real: bool) -> io::Result<Pty> {
 	let mut pty = spawn.args(["-f", "-i"]).env("PS1", "").zle_sync().spawn()?;
 	pty.wait_raw(TIMEOUT)?;
 	// The marker (quoted apart in the echoed line) says the handler is set.
-	line(&mut pty, &format!(". ~/{ZLE_SYNC_SCRIPT}; print -r -- SYNC''READY"))?;
+	pty.write(format!(". ~/{ZLE_SYNC_SCRIPT}; print -r -- SYNC''READY\r"))?;
 	pty.read_until("SYNCREADY", TIMEOUT)?;
 	pty.zle_sync(TIMEOUT)?;
 	Ok(pty)
 }
 
-/// Type `line` and a return.
+/// Type `text` and a return once the line editor waits for a key
+/// ([`Pty::zle_sync`]): the command before has ended and its job reports
+/// are out. Keys typed while a command runs are echoed by the terminal
+/// itself, in zsh as in obash, wherever that command's output has got to
+/// (`[1]  + suspended  sleep 100kill -9 %1`).
 fn line(pty: &mut Pty, text: &str) -> io::Result<()> {
+	pty.zle_sync(TIMEOUT)?;
 	pty.write(format!("{text}\r"))
 }
 
@@ -83,10 +89,16 @@ fn job_lines(out: &str) -> Vec<String> {
 		.collect()
 }
 
-/// Run `drive` against obash and, when present, the real zsh (`drive`'s
-/// second argument: whether it is the real zsh); the job lines of each. A
-/// failed session names its shell.
+/// Run `drive` against obash and, when present, the real zsh; the job
+/// lines of each. A failed session names its shell.
 fn both(
+	drive: impl Fn(&mut Pty) -> io::Result<()>,
+) -> io::Result<(Vec<String>, Option<Vec<String>>)> {
+	each(|pty, _| drive(pty))
+}
+
+/// [`both`], telling `drive` whether it drives the real zsh.
+fn each(
 	drive: impl Fn(&mut Pty, bool) -> io::Result<()>,
 ) -> io::Result<(Vec<String>, Option<Vec<String>>)> {
 	let named = |shell: &str, e: io::Error| io::Error::new(e.kind(), format!("{shell}: {e}"));
@@ -105,7 +117,7 @@ fn both(
 /// stopped job, and `kill -9 %1` reports it killed before the next command.
 #[test]
 fn ctrl_z_suspends_a_foreground_job_and_jobs_lists_it() -> io::Result<()> {
-	let (ours, real) = both(|pty, _| {
+	let (ours, real) = both(|pty| {
 		line(pty, "sleep 100")?;
 		pty.wait_job_running(&["sleep"], TIMEOUT)?;
 		pty.write("\x1a")?;
@@ -116,7 +128,8 @@ fn ctrl_z_suspends_a_foreground_job_and_jobs_lists_it() -> io::Result<()> {
 		pty.read_until("suspended  sleep 100", TIMEOUT)?;
 		line(pty, "kill -9 %1")?;
 		line(pty, "echo next")?;
-		pty.read_until("killed     sleep 100", TIMEOUT)?;
+		// On the screen: `line`'s wait may already have read past it.
+		pty.wait_screen_contains("killed     sleep 100", TIMEOUT)?;
 		end(pty)
 	})?;
 	assert_eq!(ours, [
@@ -135,7 +148,7 @@ fn ctrl_z_suspends_a_foreground_job_and_jobs_lists_it() -> io::Result<()> {
 /// brings it back to the terminal, and `^C` interrupts it: `$?` is 130.
 #[test]
 fn bg_then_fg_then_ctrl_c() -> io::Result<()> {
-	let (ours, real) = both(|pty, _| {
+	let (ours, real) = both(|pty| {
 		line(pty, "sleep 100")?;
 		pty.wait_job_running(&["sleep"], TIMEOUT)?;
 		pty.write("\x1a")?;
@@ -146,7 +159,15 @@ fn bg_then_fg_then_ctrl_c() -> io::Result<()> {
 		pty.read_until("running    sleep 100", TIMEOUT)?;
 		line(pty, "fg")?;
 		pty.read_until("running    sleep 100", TIMEOUT)?;
-		pty.wait_job_running(&["sleep"], TIMEOUT)?;
+		// The job already runs: only the terminal's foreground group tells
+		// that the shell has handed it over (`attachtty`), so `^C` reaches
+		// the job and not the shell.
+		if !pty.wait_job_running(&["sleep"], TIMEOUT)? {
+			zsh_oracle::uncompared(
+				"the terminal's foreground group cannot be read here, so `^C` after `fg` is not sent",
+			);
+			return Ok(());
+		}
 		pty.write("\x03")?;
 		line(pty, "echo st=$?")?;
 		pty.read_until("st=130", TIMEOUT)?;
@@ -162,12 +183,12 @@ fn bg_then_fg_then_ctrl_c() -> io::Result<()> {
 /// zsh's does (`[1] 1846 1847`), not only the one `$!` names.
 #[test]
 fn a_background_pipeline_names_each_process() -> io::Result<()> {
-	let (ours, real) = both(|pty, _| {
+	let (ours, real) = both(|pty| {
 		line(pty, "sleep 100 | sleep 100 &")?;
 		pty.read_until("[1] ", TIMEOUT)?;
 		line(pty, "kill %1")?;
 		line(pty, "echo next")?;
-		pty.read_until("terminated", TIMEOUT)?;
+		pty.wait_screen_contains("terminated", TIMEOUT)?;
 		end(pty)
 	})?;
 	assert_eq!(ours.first().map(String::as_str), Some("[1] PID PID"), "{ours:?}");
@@ -181,7 +202,7 @@ fn a_background_pipeline_names_each_process() -> io::Result<()> {
 /// by the shell itself); `fg` continues both, `^C` ends both.
 #[test]
 fn a_suspended_pipeline_is_one_job() -> io::Result<()> {
-	let (ours, real) = both(|pty, _| {
+	let (ours, real) = both(|pty| {
 		line(pty, "sleep 100 | cat")?;
 		pty.wait_job_running(&["sleep", "cat"], TIMEOUT)?;
 		pty.write("\x1a")?;
@@ -220,7 +241,7 @@ fn a_suspended_pipeline_is_one_job() -> io::Result<()> {
 /// is fixed; zsh's last line is checked to be one of its two.
 #[test]
 fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
-	let (ours, real) = both(|pty, real| {
+	let (ours, real) = each(|pty, real| {
 		line(pty, "for i in 1 2; do sleep 100; echo it$i; done; echo after")?;
 		pty.wait_job_running(&["sleep"], TIMEOUT)?;
 		pty.write("\x1a")?;
@@ -235,7 +256,8 @@ fn a_suspended_loop_takes_the_rest_of_the_loop_with_it() -> io::Result<()> {
 			pty.wait_processes_gone(TIMEOUT)?;
 			pty.zle_sync(TIMEOUT)?;
 		} else {
-			pty.read_until("killed", TIMEOUT)?;
+			// On the screen: `line`'s wait may already have read past it.
+			pty.wait_screen_contains("killed", TIMEOUT)?;
 		}
 		end(pty)
 	})?;
@@ -276,7 +298,7 @@ fn a_suspended_job_does_not_leave_its_terminal_modes() -> io::Result<()> {
 /// an `exit` right after leaves.
 #[test]
 fn exit_with_a_stopped_job_warns_once() -> io::Result<()> {
-	let (ours, real) = both(|pty, _| {
+	let (ours, real) = both(|pty| {
 		line(pty, "sleep 100")?;
 		pty.wait_job_running(&["sleep"], TIMEOUT)?;
 		pty.write("\x1a")?;
