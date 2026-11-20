@@ -116,9 +116,11 @@ rust_test(
 )
 
 # The other integration tests: one rust_test per tests/*.rs, as cargo builds
-# them, each with the helpers under tests/*_support. Many start obash: cargo
-# names its path in CARGO_BIN_EXE_obash, and so does this target, relative to
-# the runfiles root; the support modules make it absolute.
+# them, each with every module under a directory of tests/ (cargo makes a
+# test target of a tests/*.rs file or a tests/<dir>/main.rs, and pi-shell has
+# no such main.rs), such as tests/*_support and tests/zsh_oracle. Many start
+# obash: cargo names its path in CARGO_BIN_EXE_obash, and so does this target,
+# relative to the runfiles root; the support modules make it absolute.
 rust_test_suite(
     name = "pi-shell_integration_tests",
     srcs = glob(
@@ -141,7 +143,10 @@ rust_test_suite(
         "//bazel:fastbuild": ["-Copt-level=1"],
         "//conditions:default": [],
     }),
-    shared_srcs = glob(["tests/*_support/**/*.rs"]),
+    shared_srcs = glob(
+        ["tests/*/**/*.rs"],
+        exclude = ["tests/fixtures/**"],
+    ),
     deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
         ":pi-shell",
         "//crates/pi-vfs",
