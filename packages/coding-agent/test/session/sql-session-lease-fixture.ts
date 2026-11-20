@@ -38,14 +38,15 @@ export const MYSQL57_URL = process.env.OMP_TEST_SQL_MYSQL57_URL;
 export const MYSQL_ROT_URL = process.env.OMP_TEST_SQL_MYSQL_ROT_URL;
 
 /**
- * Whether `OMP_TEST_SQL_POSTGRES_URL` reaches PostgreSQL through a
- * transaction-mode pooler, as a run declares with
- * `OMP_TEST_SQL_POSTGRES_POOLER=transaction`. Such a pooler gives each
- * transaction whichever server connection is free, resets none of them
- * between clients, and passes on none of a client's start parameters. So a
- * test whose premise is one server connection's own state cannot hold there:
- * a start parameter, or a session-level `SET` that the test's later
- * transactions must meet. That `SET` would also stay on a connection that
+ * Whether the run's PostgreSQL test URLs (`OMP_TEST_SQL_POSTGRES_URL`,
+ * `OMP_TEST_POSTGRES_DSN`) reach the server through a transaction-mode
+ * pooler, as a run declares with `OMP_TEST_SQL_POSTGRES_POOLER=transaction`.
+ * Such a pooler gives each transaction whichever server connection is free,
+ * resets none of them between clients, and passes on none of a client's
+ * start parameters. So a test whose premise is one server connection's own
+ * state cannot hold there: a start parameter, a session-level `SET` that the
+ * test's later transactions must meet, or the client's own server
+ * connections. That `SET` would also stay on a connection that
  * another test then gets. Each such test runs on a direct connection only,
  * and skips under this declaration, with a comment that says why. Any other
  * value fails the run, so a misspelt declaration cannot run those tests
