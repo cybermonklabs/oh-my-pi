@@ -39,10 +39,14 @@ fn free_port() -> u16 {
 	l.local_addr().unwrap().port()
 }
 
-/// Runs `script`, whose second line listens on `$PORT` (`ztcp -l $PORT`), on
-/// a free port. `ztcp` takes no port 0, so the port is probed first, and
-/// another process can take it before the script's listen: only a failure of
-/// that line is retried, on a fresh port. Any other output is the test's.
+/// Runs `script` on a free port. The script listens on `$PORT` on its second
+/// line (`ztcp -l $PORT`), and its last two lines connect to the port once it
+/// has closed every socket there, expecting a refusal (each `echo $?` prints
+/// 1). `ztcp` takes no port 0, so the port is probed first, and another
+/// process can take it before the listen or after the close. A run that lost
+/// the port either way is retried on a fresh port: the listen failed, or one
+/// of those last connects reached a listener (its `echo $?` printed 0). Any
+/// other output is the test's, and after 5 lost ports the test fails.
 fn zsh_tcp_on_a_free_port(script: &str) -> (u16, (String, String, i32)) {
 	let mut lost = Vec::new();
 	for _ in 0..5 {
@@ -52,9 +56,16 @@ fn zsh_tcp_on_a_free_port(script: &str) -> (u16, (String, String, i32)) {
 			lost.push(format!("port {port}: {}", run.1.lines().next().unwrap_or_default()));
 			continue;
 		}
+		let last: Vec<&str> = run.0.lines().rev().take(2).collect();
+		if last.contains(&"0") {
+			lost.push(format!(
+				"port {port}: a connect after the close was accepted ({last:?}, last first)"
+			));
+			continue;
+		}
 		return (port, run);
 	}
-	panic!("the script's listen failed on 5 fresh ports: {lost:?}");
+	panic!("the script lost its port on 5 fresh ports: {lost:?}");
 }
 
 #[test]
