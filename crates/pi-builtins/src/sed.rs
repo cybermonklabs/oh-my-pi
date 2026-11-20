@@ -481,9 +481,10 @@ pub struct Command {
 	pub addr2:      Option<Address>,              // End address
 	pub non_select: bool,                         // True if '!'
 	pub start_line: Option<usize>,                // Start line number (or None if unlatched)
-	/// Whether a range whose first address is a line number has ended, so
-	/// it starts no more until the next file under `-s` (GNU's
-	/// `RANGE_CLOSED`): it starts on the first line at or past that number.
+	/// Whether the range has ended since the input began (each file's,
+	/// under `-s` and `-i`), which a range whose first address is a line
+	/// number reads: it starts once, on the first line at or past that
+	/// number (GNU's `RANGE_CLOSED`).
 	pub range_ended: bool,
 	pub data:       CommandData,                  // Command-specific data
 	pub next:       Option<Rc<RefCell<Command>>>, // Pointer to next command
@@ -1215,7 +1216,7 @@ fn compile_address_range(
 	}
 
 	line.eat_spaces();
-	if n_addr == 1 && cmd.addr2.is_none() && !line.eol() && line.current() == ',' {
+	if n_addr == 1 && !line.eol() && line.current() == ',' {
 		line.advance();
 		line.eat_spaces();
 		// E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is
@@ -1865,16 +1866,14 @@ fn compile_empty_command(
 
 /// Compile a comment after a `!`, which GNU sed 4.9 reads as a comment: `sed
 /// '!#foo'` changes nothing. After an address it is refused (see
-/// `get_verified_cmd_spec`); anywhere else `compile_sequence` skips it.
+/// `get_verified_cmd_spec`). `compile_sequence` skips the rest of the line
+/// from the `#`, as it skips any comment.
 fn compile_comment_command(
 	_lines: &mut ScriptLineProvider,
-	line: &mut ScriptCharProvider,
+	_line: &mut ScriptCharProvider,
 	_cmd: &mut Command,
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
-	while !line.eol() {
-		line.advance();
-	}
 	Ok(CommandHandling::Continue)
 }
 
@@ -5280,6 +5279,21 @@ pub fn line_text(line: Vec<u8>) -> (String, bool) {
 /// writes the name: `sed -f $'n\xff'` is "file n\377 line 1: ...".
 pub fn name_text(name: &std::ffi::OsStr) -> String {
 	line_text(crate::host::os_bytes_lossy(name).into_owned()).0
+}
+
+/// A failure to open, write or close the file `path`, which GNU sed 4.9
+/// reports without a script position, the name as its bytes, and exits 4
+/// for: `sed 'w /nonexistent/x'` and `sed -f /nonexistent/x` are "couldn't
+/// open file /nonexistent/x: No such file or directory".
+pub(crate) fn file_error(
+	what: &str,
+	path: &Path,
+	error: &io::Error,
+) -> crate::sed::error_handling::SedError {
+	crate::sed::error_handling::SedError::new(
+		4,
+		format!("{what} {}: {}", name_text(path.as_os_str()), crate::host::strip_errno(error)),
+	)
 }
 
 /// Appends `text`, byte text when `bytes`, to `content`, byte text when
@@ -8712,10 +8726,10 @@ use std::{cell::RefCell, io::BufWriter, path::PathBuf, rc::Rc};
 
 use crate::openfile::{DescriptorPath, STDERR_FD, STDOUT_FD};
 use pi_vfs::{File, OpenOptions};
-use crate::host::{Host, ShellPaths, strip_errno};
-use crate::sed::fast_io::{IOChunk, OutputBuffer, write_record};
+use crate::host::{Host, ShellPaths};
+use crate::sed::fast_io::{IOChunk, OutputBuffer, file_error, write_record};
 
-use crate::sed::error_handling::{SedError, SedResult};
+use crate::sed::error_handling::SedResult;
 
 thread_local! {
 	 /// Global list of all writers that should be flushed at shutdown
@@ -8747,13 +8761,6 @@ pub struct NamedWriter {
 	/// apart from sed's own output, `w /dev/stdout` too: `printf 'a' | sed
 	/// 'p;w /dev/stdout'` prints `aa\na`.
 	missing_newline: bool,
-}
-
-/// A failure to open, write or close a `w` file, which GNU sed 4.9 reports
-/// without a script position and exits 4 for: `sed 'w /nonexistent/x'` is
-/// "couldn't open file /nonexistent/x: No such file or directory".
-fn file_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> SedError {
-	SedError::new(4, format!("{what} {}: {}", path.display(), strip_errno(error)))
 }
 
 impl NamedWriter {
@@ -8993,8 +9000,7 @@ fn applies(
 					Ok(true)
 				},
 			};
-			let first_is_line = matches!(command.addr1, Some(Address::Line(_)));
-			command.range_ended |= first_is_line && command.start_line.is_none();
+			command.range_ended |= command.start_line.is_none();
 			selected
 		} else if let Some(addr1) = &command.addr1 {
 			// See if latch must start. GNU sed 4.9 starts a range whose first
@@ -9016,18 +9022,14 @@ fn applies(
 					_ => false,
 				};
 				if ends_here {
+					command.range_ended = true;
 					match (addr1, addr2) {
 						// Started past the line it names, at or past a second
 						// line number, the range selects that line alone where
 						// it is the second line's: `seq 10 | sed -n
 						// '$!N;3,4p'` prints `3` and `4`, `$!N;3,3p` nothing.
 						(Address::Line(first), Address::Line(last)) => {
-							command.range_ended = true;
 							Ok(linenum == *first || linenum <= *last)
-						},
-						(Address::Line(_), _) => {
-							command.range_ended = true;
-							Ok(true)
 						},
 						_ => Ok(true),
 					}
@@ -10009,10 +10011,10 @@ use std::{
 
 use crate::openfile::OpenFile;
 use crate::{
-	host::{ShellPaths, strip_errno},
+	host::ShellPaths,
 	sed::{
-		error_handling::{ScriptLocation, ScriptSource, SedError, SedResult},
-		fast_io::name_text,
+		error_handling::{ScriptLocation, ScriptSource, SedResult},
+		fast_io::{file_error, name_text},
 		script_char_provider::ScriptCharProvider,
 	},
 };
@@ -10214,11 +10216,11 @@ impl ScriptLineProvider {
 						input_name: "<stdin>".to_string(),
 					};
 				} else {
-					// GNU sed 4.9: `sed -f /nonexistent/s` is "couldn't open
-					// file /nonexistent/s: No such file or directory", exit 4.
-					let file = self.paths.fs().open(self.paths.resolve(p)).map_err(|e| {
-						SedError::new(4, format!("couldn't open file {name}: {}", strip_errno(&e)))
-					})?;
+					let file = self
+						.paths
+						.fs()
+						.open(self.paths.resolve(p))
+						.map_err(|e| file_error("couldn't open file", p, &e))?;
 					self.state = State::Active {
 						index:      next_index,
 						reader:     Box::new(BufReader::new(file)),

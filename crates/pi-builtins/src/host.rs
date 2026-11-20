@@ -2071,26 +2071,40 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 	}
 }
 
+/// The bytes of a file's start the kernel reads for a `#!` line
+/// (`BINPRM_BUF_SIZE`).
+const SHEBANG_BUFFER: usize = 256;
+
+/// The interpreter the `#!` line of the file at `path` names, read from its
+/// first [`SHEBANG_BUFFER`] bytes as the kernel reads them
+/// ([`shebang_interpreter`]). `None` for a file that names none or cannot be
+/// read.
+#[cfg(unix)]
+pub fn script_interpreter(path: &Path) -> Option<PathBuf> {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let mut head = [0; SHEBANG_BUFFER];
+	let len = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+	shebang_interpreter(&head[..len]).map(|name| PathBuf::from(std::ffi::OsStr::from_bytes(name)))
+}
+
 /// The interpreter a `#!` line names, read from `head`, the file's first
-/// bytes, as Linux's `binfmt_script` reads its first 256: the first word
-/// after `#!` and any blanks (spaces and tabs), up to a blank, a NUL or the
-/// end of the line. `None` where the file does not start with `#!`, where
-/// the line names nothing (blanks alone, or a NUL first, as in `#! \0x`),
-/// and where no newline comes in the 256 bytes and nothing ends the name
-/// there, which the kernel takes for a name cut short. For each of these
-/// `execve` fails with `ENOEXEC`, and `execvp` runs the file with
+/// bytes, as Linux's `binfmt_script` reads its first [`SHEBANG_BUFFER`]: the
+/// first word after `#!` and any blanks (spaces and tabs), up to a blank, a
+/// NUL or the end of the line. `None` where the file does not start with
+/// `#!`, where the line names nothing (blanks alone, or a NUL first, as in
+/// `#! \0x`), and where no newline comes in those bytes and nothing ends the
+/// name there, which the kernel takes for a name cut short. For each of
+/// these `execve` fails with `ENOEXEC`, and `execvp` runs the file with
 /// `/bin/sh`. (GKE Sandbox, gVisor, reads a NUL as part of the name and
 /// fails with `EINVAL` or `ENOENT` where Linux reads no name.)
-pub fn shebang_interpreter(head: &[u8]) -> Option<&[u8]> {
-	/// The bytes the kernel reads (`BINPRM_BUF_SIZE`).
-	const BUFFER: usize = 256;
-	let head = &head[..head.len().min(BUFFER)];
+fn shebang_interpreter(head: &[u8]) -> Option<&[u8]> {
+	let head = &head[..head.len().min(SHEBANG_BUFFER)];
 	let rest = head.strip_prefix(b"#!")?;
 	let blank = |byte: u8| matches!(byte, b' ' | b'\t');
 	let line = match rest.iter().position(|&byte| byte == b'\n') {
 		Some(end) => &rest[..end],
 		// A shorter file is followed by the NULs the kernel pads it with.
-		None if head.len() < BUFFER => rest,
+		None if head.len() < SHEBANG_BUFFER => rest,
 		// A blank or a NUL must end the name within the buffer, whose last
 		// byte the kernel then drops.
 		None => {

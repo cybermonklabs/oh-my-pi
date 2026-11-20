@@ -5599,9 +5599,6 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 			.any(|arg| arg.get_short() == Some(short))
 			.then(|| OPTIONS.short_valued.contains(&short))
 	};
-	// The arguments are written out by their full names already
-	// ([`OptionTable::spell_out_all`]), so the table names each one.
-	let long_takes_value = |name: &str| OPTIONS.long_option(name).is_some_and(|option| option.takes_value);
 
 	let mut out = Vec::with_capacity(argv.len() + 1);
 	let mut args = argv.into_iter();
@@ -5613,9 +5610,10 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 			out.extend(args);
 			break;
 		}
-		if let Some(long) = bytes.strip_prefix(b"--") {
-			let value_follows = !long.contains(&b'=')
-				&& std::str::from_utf8(long).is_ok_and(|name| long_takes_value(name));
+		if bytes.starts_with(b"--") {
+			// The arguments are written out by their full names already
+			// ([`OptionTable::spell_out_all`]), so the table names each one.
+			let value_follows = arg.to_str().is_some_and(|text| OPTIONS.value_follows(text));
 			out.push(arg);
 			if value_follows {
 				out.extend(args.next());

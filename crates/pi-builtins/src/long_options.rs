@@ -15,9 +15,9 @@ use itertools::Itertools;
 /// A long option a utility accepts: its names - the long name first, then
 /// its aliases, which getopt counts as the same option - and whether it takes
 /// the next argument as its value.
-pub(crate) struct LongOption {
-	names:           Vec<String>,
-	pub takes_value: bool,
+struct LongOption {
+	names:       Vec<String>,
+	takes_value: bool,
 }
 
 /// The options of a utility, read from its parser's own definition, and
@@ -67,7 +67,7 @@ impl OptionTable {
 	/// `--regexp` and `--col` is `--color`, whose alias `--colour` is the
 	/// same option, or, where it also begins one the builtin alone has, of
 	/// one of the others alone.
-	pub(crate) fn long_option(&self, name: &str) -> Option<&LongOption> {
+	fn long_option(&self, name: &str) -> Option<&LongOption> {
 		if name.is_empty() {
 			return None;
 		}
@@ -106,7 +106,7 @@ impl OptionTable {
 	/// takes a value ends the group (`-n`, `-qn`; `-n5` holds its value).
 	pub fn value_follows(&self, arg: &str) -> bool {
 		if let Some(long) = arg.strip_prefix("--") {
-			return self.spell_out(long).is_some_and(|(_, value_follows)| value_follows);
+			return !long.contains('=') && self.long_option(long).is_some_and(|option| option.takes_value);
 		}
 		arg.strip_prefix('-').is_some_and(|group| {
 			group
