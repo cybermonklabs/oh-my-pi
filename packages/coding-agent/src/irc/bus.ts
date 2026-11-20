@@ -202,13 +202,15 @@ export class IrcBus implements IrcBusApi {
 		} finally {
 			this.#inFlight.delete(flight);
 		}
-		// An agent parked, killed or unregistered during the delivery was already
-		// forgotten (see forgetAgent), so a mark recorded now would outlive it.
-		// Comparing its registry entry before and after cannot tell: a revival
-		// reuses the parked entry, so a recipient the send revived and that parked
-		// again before the delivery returned reads parked at both ends. An agent
-		// the bus did not forget records as usual, a parked one or one the
-		// registry never held included; one forgotten and revived since is live.
+		// The bus forgets an agent parked, killed or unregistered during the
+		// delivery (see forgetAgent). A sender forgotten so records nothing, as a
+		// mark recorded now would outlive it; a recipient forgotten so is handled
+		// below. Comparing an agent's registry entry before and after cannot tell:
+		// a revival reuses the parked entry, so a recipient the send revived and
+		// that parked again before the delivery returned reads parked at both
+		// ends. An agent the bus did not forget records as usual, a parked one or
+		// one the registry never held included; one forgotten and revived since
+		// is live.
 		if (receipt.outcome === "failed" || (flight.fromForgotten && !isLive(this.#registry.get(message.from)))) {
 			return receipt;
 		}
@@ -257,8 +259,10 @@ export class IrcBus implements IrcBusApi {
 	 * {@link unansweredSends} never meets a question whose answer was dropped,
 	 * and a question the agent asks once revived orders after every mark kept
 	 * for it ({@link SendMark.seq}). Nothing goes until this bus's registry
-	 * reports the agent parked, aborted or gone; a send still delivering to or
-	 * from it then records no mark and buffers nothing for it.
+	 * reports the agent parked, aborted or gone. A send still delivering from
+	 * it then records no mark; one still delivering to it records only a live
+	 * sender's sent or progress mark, no direct mark, and buffers nothing for
+	 * it.
 	 */
 	forgetAgent(agentId: string): void {
 		if (isLive(this.#registry.get(agentId))) return;
