@@ -1257,4 +1257,93 @@ mod tests {
 		eprintln!("{RUNS} runs swapping tree/sub: {escapes} removed a file outside the tree");
 		assert_eq!(escapes, 0, "the moved tree's removal went outside it through a swapped symlink");
 	}
+
+	/// A directory moved into a directory that holds a regular file, or a
+	/// symlink to a directory, at its name is refused as GNU mv 9.4 refuses it,
+	/// with exit status 1, and the file and the link stay. On one file system
+	/// `rename(2)` refuses it too (`ENOTDIR`).
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_does_not_replace_a_non_directory() {
+		let cwd = tempdir().unwrap();
+		refuses_to_replace_non_directories(cwd.path(), cwd.path());
+	}
+
+	/// The same from /dev/shm to the temporary directory, two file systems:
+	/// there `rename(2)` fails with `EXDEV` before it looks at the types, and
+	/// the move removed the file or the link to copy the directory in its
+	/// place.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_directory_moved_across_file_systems_does_not_replace_a_non_directory() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let to = tempdir().unwrap();
+		refuses_to_replace_non_directories(from.path(), to.path());
+		// The copy fallback refuses on its own too: a non-directory put at
+		// the destination after the move's check is not removed.
+		let (mut host, _capture) = Host::for_test(Mv::NAME, "", to.path());
+		let (src, dest) = (from.path().join("src"), to.path().join("file-dest/src"));
+		let err = super::rename_with_fallback(
+			&mut host,
+			&src,
+			&dest,
+			None,
+			&mut crate::cp::MoveCopier::new(false),
+		)
+		.expect_err("the copy fallback replaced a regular file with a directory");
+		assert!(err.to_string().starts_with("cannot overwrite non-directory"), "{err}");
+		assert_eq!(fs::read(&dest).unwrap(), b"kept", "the fallback removed the file");
+		assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "the source changed");
+	}
+
+	/// Moves `from/src`, a directory, into `to/file-dest`, which holds a
+	/// regular file `src`, and into `to/link-dest`, which holds a symlink `src`
+	/// to a directory: each move must fail with GNU's message and leave both
+	/// sides as they were.
+	#[cfg(unix)]
+	fn refuses_to_replace_non_directories(from: &std::path::Path, to: &std::path::Path) {
+		let src = from.join("src");
+		fs::create_dir(&src).unwrap();
+		fs::write(src.join("moved"), b"moved").unwrap();
+		fs::create_dir_all(to.join("file-dest")).unwrap();
+		fs::write(to.join("file-dest/src"), b"kept").unwrap();
+		fs::create_dir_all(to.join("link-dest")).unwrap();
+		fs::create_dir(to.join("elsewhere")).unwrap();
+		std::os::unix::fs::symlink(to.join("elsewhere"), to.join("link-dest/src")).unwrap();
+		for dest in ["file-dest", "link-dest"] {
+			let target = to.join(dest);
+			let (code, capture) =
+				run_util::<Mv>(&[src.to_str().unwrap(), target.to_str().unwrap()], "", to);
+			assert_eq!(
+				(code, capture.err()),
+				(
+					1,
+					format!(
+						"mv: cannot overwrite non-directory '{}' with directory '{}'\n",
+						target.join("src").display(),
+						src.display()
+					)
+				),
+				"{dest}"
+			);
+			assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "{dest}: the source changed");
+		}
+		assert_eq!(fs::read(to.join("file-dest/src")).unwrap(), b"kept", "the file was replaced");
+		assert_eq!(
+			fs::read_link(to.join("link-dest/src")).unwrap(),
+			to.join("elsewhere"),
+			"the link was replaced"
+		);
+		assert!(!to.join("elsewhere/moved").exists(), "the move went through the link");
+	}
 }
