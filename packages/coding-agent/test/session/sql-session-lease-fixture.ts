@@ -729,6 +729,8 @@ export interface LeaseProcessReport {
 	sessionId?: string;
 	sessionFile?: string;
 	held?: boolean;
+	/** An `openWaiting`'s answer: whether its claim waits for another holder. */
+	waiting?: boolean;
 	/** The session's stored content a `claim` with `read` saw right after claiming, `null` when there was none. */
 	content?: string | null;
 	/** Persistence notices its manager raised, in order. */
@@ -758,10 +760,27 @@ export class LeaseProcess implements AsyncDisposable {
 	readonly #child: Bun.Subprocess<"pipe", "pipe", "pipe">;
 	readonly #stdout: { read(): Promise<{ done: boolean; value?: Uint8Array }> };
 	#buffered = "";
+	/** Everything the process wrote to stderr so far, read as it arrives. */
+	#stderrText = "";
+	/** Settles when stderr ends. */
+	readonly #stderrEnded: Promise<void>;
+	#stderrDone = false;
+	/** Settles at the next stderr chunk or its end; replaced at each chunk. */
+	#stderrChanged = Promise.withResolvers<void>();
 
 	private constructor(child: Bun.Subprocess<"pipe", "pipe", "pipe">) {
 		this.#child = child;
 		this.#stdout = child.stdout.getReader();
+		this.#stderrEnded = (async () => {
+			const decoder = new TextDecoder();
+			for await (const chunk of child.stderr) {
+				this.#stderrText += decoder.decode(chunk, { stream: true });
+				this.#stderrChanged.resolve();
+				this.#stderrChanged = Promise.withResolvers<void>();
+			}
+			this.#stderrDone = true;
+			this.#stderrChanged.resolve();
+		})();
 	}
 
 	/** Start the process; `home` isolates its agent directory and breadcrumbs; `env` adds to its environment. */
@@ -800,8 +819,8 @@ export class LeaseProcess implements AsyncDisposable {
 		return this.#child.exited;
 	}
 
-	/** The command's answer; it fails when the process exits first. */
-	run(command: Record<string, unknown>): Promise<LeaseProcessReport> {
+	/** The command's answer; it fails when the process exits first, also when it exited before the command was sent. */
+	async run(command: Record<string, unknown>): Promise<LeaseProcessReport> {
 		this.#child.stdin.write(`${JSON.stringify(command)}\n`);
 		this.#child.stdin.flush();
 		return this.#next();
@@ -813,8 +832,22 @@ export class LeaseProcess implements AsyncDisposable {
 		await this.#child.exited;
 	}
 
+	/** What the process wrote to stderr, once it closed stderr (it exited). */
 	async stderr(): Promise<string> {
-		return new Response(this.#child.stderr).text();
+		await this.#stderrEnded;
+		return this.#stderrText;
+	}
+
+	/**
+	 * Whether the process writes `text` to stderr before it closes stderr: resolves `true` as soon as it has,
+	 * `false` once stderr ended without it. A test waits on what the process says, not on a clock.
+	 */
+	async stderrShows(text: string): Promise<boolean> {
+		for (;;) {
+			if (this.#stderrText.includes(text)) return true;
+			if (this.#stderrDone) return false;
+			await this.#stderrChanged.promise;
+		}
 	}
 
 	async #next(): Promise<LeaseProcessReport> {

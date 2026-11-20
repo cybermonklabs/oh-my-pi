@@ -575,4 +575,135 @@ describe("omp --resume <id> under OMP_SESSION_EXCLUSIVE=1 on file storage", () =
 		]);
 		expect(await Bun.file(session.file).text()).toBe(replacement);
 	}, 60_000);
+
+	/** What a resume that waits on another holder's file lease says on stderr when it starts to wait. */
+	const WAIT_LINE = `Session ${ID} is held by another omp process; waiting up to 35 s for its lease to go`;
+
+	// A launcher starts the next process on a session while the one before it is still ending (`--resume=<file>
+	// --mode rpc`, with OMP_SESSION_EXCLUSIVE=1).
+	it("waits for a holder that ends within the wait, then resumes the session under its own id", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const holderPid = holder.pid;
+
+		await using resumed = await LeaseProcess.start(session.config, dir.join("resumed"), EXCLUSIVE);
+		const resuming = resumed.run(resumeById(session));
+		// The holder ends only once the resume says it waits on the holder's lease.
+		const waiting = await resumed.stderrShows(WAIT_LINE);
+		await holder[Symbol.asyncDispose]();
+		const report = await resuming;
+		const after = await resumed.run({ op: "append", text: "after the wait" });
+
+		expect({
+			waiting,
+			error: report.error,
+			sessionId: report.sessionId,
+			sessionFile: report.sessionFile,
+			sessionStartId: report.sessionStartId,
+			afterSessionId: after.sessionId,
+			afterSessionFile: after.sessionFile,
+		}).toEqual({
+			waiting: true,
+			error: undefined,
+			sessionId: ID,
+			sessionFile: session.file,
+			sessionStartId: ID,
+			afterSessionId: ID,
+			afterSessionFile: session.file,
+		});
+		expect(fs.readdirSync(session.dir).filter(name => name.endsWith(".jsonl"))).toEqual([
+			path.basename(session.file),
+		]);
+		const content = await Bun.file(session.file).text();
+		expect([
+			content.includes(`held by ${holderPid}`),
+			content.includes(`resumed by ${resumed.pid}`),
+			content.includes("after the wait"),
+		]).toEqual([true, true, true]);
+	}, 60_000);
+
+	it("exits non-zero naming open-elsewhere when the holder still holds the session after the wait, and writes nothing", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-bound-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const before = await Bun.file(session.file).text();
+
+		await using resumed = await LeaseProcess.start(session.config, dir.join("resumed"), EXCLUSIVE);
+		const started = performance.now();
+		const failure = await resumed.run(resumeById(session)).then(
+			done => `resumed ${done.sessionId} ${done.error ?? ""}`,
+			(err: unknown) => String(err),
+		);
+		const exitCode = await exitOf(resumed, 20_000);
+		const elapsedMs = performance.now() - started;
+
+		expect({
+			exitCode,
+			waited: failure.includes(WAIT_LINE),
+			stopped: failure.includes(`Session ${ID} stops (open-elsewhere): another omp process holds it.`),
+			waitedOut: elapsedMs >= RESUME_WAIT_MS,
+		}).toEqual({ exitCode: 1, waited: true, stopped: true, waitedOut: true });
+		expect(fs.readdirSync(session.dir).filter(name => name.endsWith(".jsonl"))).toEqual([
+			path.basename(session.file),
+		]);
+		expect(await Bun.file(session.file).text()).toBe(before);
+	}, 90_000);
+
+	it("gives the session up when its manager closes while the claim waits, so the closed manager never takes it back", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-close-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+
+		await using waiter = await LeaseProcess.start(session.config, dir.join("waiter"), EXCLUSIVE);
+		const opened = await waiter.run({
+			op: "openWaiting",
+			file: session.file,
+			sessionDir: session.dir,
+			waitMs: RESUME_WAIT_MS,
+		});
+		await waiter.run({ op: "closeWaiting" });
+		// The holder ends after the close, while the closed manager's claim would still be waiting.
+		await holder[Symbol.asyncDispose]();
+		const settled = await waiter.run({ op: "settleWaiting" });
+
+		expect({ waiting: opened.waiting, heldAfterSettle: settled.held }).toEqual({
+			waiting: true,
+			heldAfterSettle: false,
+		});
+	}, 60_000);
+
+	it("does not stop the process when its manager closes as the claim starts to wait and the wait is over before it looks again", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-close-early-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const before = await Bun.file(session.file).text();
+
+		const waiter = await LeaseProcess.start(session.config, dir.join("waiter"), EXCLUSIVE);
+		const opened = await waiter
+			.run({ op: "openWaiting", file: session.file, sessionDir: session.dir, waitMs: 50, closeOnWait: true })
+			.then(
+				report => ({ waiting: report.waiting }),
+				(err: unknown) => ({ error: String(err) }),
+			);
+		// The claim settles without stopping the process; the holder still holds the session.
+		const settled = await waiter.run({ op: "settleWaiting" }).then(
+			() => "settled",
+			(err: unknown) => String(err),
+		);
+		await waiter[Symbol.asyncDispose]();
+		const stderr = await waiter.stderr();
+
+		expect({
+			opened,
+			settled,
+			exitCode: await waiter.exited,
+			stopped: stderr.includes(`Session ${ID} stops (`),
+		}).toEqual({ opened: { waiting: true }, settled: "settled", exitCode: 0, stopped: false });
+		expect(await Bun.file(session.file).text()).toBe(before);
+	}, 60_000);
 });

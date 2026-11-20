@@ -1465,7 +1465,9 @@ async function forkIfMovedAwayUnlessExclusive(manager: SessionManager, sessionDi
  * expire, telling the person on stderr, so a resume after its holder was
  * killed keeps the id; the automatic resume (`wait: false`) does not. One
  * still held then moves to a minted id, or, under `OMP_SESSION_EXCLUSIVE=1`,
- * ends the process non-zero naming the holder.
+ * ends the process non-zero naming the holder. On file storage only a
+ * launcher-named session (`OMP_SESSION_EXCLUSIVE=1`) waits, for a holder that
+ * is still ending; a file lease does not name its holder.
  */
 async function claimOpenedSession(manager: SessionManager, options: { wait?: boolean } = {}): Promise<SessionManager> {
 	if (options.wait === false) {
@@ -1475,9 +1477,10 @@ async function claimOpenedSession(manager: SessionManager, options: { wait?: boo
 	await manager.claimOpenedSession({
 		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
 		onWait: holder => {
+			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
 			process.stderr.write(
-				`Session ${manager.getSessionId()} is held by another omp process (host ${holder.host}, pid ${holder.pid}); ` +
-					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to expire…\n`,
+				`Session ${manager.getSessionId()} is held by another omp process${by}; ` +
+					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
 			);
 		},
 	});
@@ -2422,11 +2425,12 @@ export async function runRootCommand(
 			// The pick replaces the session `createSessionManager` resumed on its own (`autoResume`): that one is closed
 			// once the pick holds its claim, so its lease goes back and another process can open it. A pick of that
 			// same session keeps its manager and opens no second one: a second manager of one session would be refused
-			// wherever a session has one writer, and move the pick to a new id.
+			// wherever a session has one writer, and move the pick to a new id. It is an explicit resume all the same,
+			// so it claims as one, with the wait the automatic resume skipped (a no-op where that one already holds it).
 			const replaced = sessionManager;
 			let pickedManager: SessionManager;
 			if (replaced !== undefined && replaced.getSessionFile() === chosen.path) {
-				pickedManager = replaced;
+				pickedManager = await claimOpenedSession(replaced);
 			} else {
 				try {
 					pickedManager = await claimOpenedSession(

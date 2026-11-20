@@ -395,7 +395,8 @@ export interface SessionStorage {
 	 * expire) or when `sessionPath` now holds a different session. Only SQL
 	 * storage implements it; `SessionManager` claims an opened session through
 	 * it before anything else runs, and through `claimSession` at the first
-	 * write on other backends.
+	 * write on other backends (or at open, for a launcher-named session that
+	 * waits for its holder; see `SessionManager.claimOpenedSession`).
 	 */
 	acquireSessionClaim?(
 		sessionId: string,

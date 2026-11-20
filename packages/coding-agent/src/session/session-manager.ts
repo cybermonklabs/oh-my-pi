@@ -191,6 +191,9 @@ const PARENT_MOVE_WAIT_MS = 1000;
 /** How long an `OMP_SESSION_EXCLUSIVE=1` stop waits to learn who holds the session before it ends the process without naming them. */
 const EXCLUSIVE_STOP_HOLDER_LOOKUP_MS = 2000;
 
+/** How often an open that waits on a session's file lease (see `#waitForOpenFileClaim`) tries to take it again. */
+const OPEN_FILE_CLAIM_RETRY_MS = 100;
+
 /**
  * `moveTo` refused and left the session where it was: another live omp
  * process writes the session, or the session file at the destination, or
@@ -1161,6 +1164,8 @@ export class SessionManager {
 	#sessionClaim: { sessionId: string; release: (() => void) | undefined } | undefined;
 	/** Set once an `OMP_SESSION_EXCLUSIVE=1` session began to stop (see {@link #stopExclusive}). */
 	#exclusiveStopping = false;
+	/** How many times {@link close} has begun: a file-lease wait that began before a close ends without the claim. */
+	#closes = 0;
 	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
 	#parentMoveFollow: Promise<void> | undefined;
 	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
@@ -1362,12 +1367,15 @@ export class SessionManager {
 	 * for the holder's lease to go or expire, `onWait` hearing the holder. Once
 	 * it holds the claim it reads the session again when the stored size is
 	 * not what it loaded, since another holder may have written until it let
-	 * go. Other storages claim at the first write, as before.
+	 * go. Other storages claim at the first write, as before, except a
+	 * launcher-named session's wait on its file lease
+	 * ({@link #waitForOpenFileClaim}).
 	 */
 	async claimOpenedSession(
-		options: { waitMs?: number; onWait?: (holder: SessionClaimHolder) => void } = {},
+		options: { waitMs?: number; onWait?: (holder: SessionClaimHolder | undefined) => void } = {},
 	): Promise<void> {
-		if (!this.#storage.acquireSessionClaim || this.#released) return;
+		if (this.#released) return;
+		if (!this.#storage.acquireSessionClaim) return this.#waitForOpenFileClaim(options);
 		let holder: SessionClaimHolder | undefined;
 		const outcome = await this.#holdClaim({
 			waitMs: options.waitMs,
@@ -1384,6 +1392,66 @@ export class SessionManager {
 		} else if (outcome === "held") {
 			await this.#reloadIfWrittenElsewhere();
 		}
+	}
+
+	/**
+	 * {@link claimOpenedSession} on a storage that claims only at a write (file
+	 * storage), under `OMP_SESSION_EXCLUSIVE=1` and with `waitMs`: take the
+	 * claim now, and while another live process holds the session's lease,
+	 * take it again every {@link OPEN_FILE_CLAIM_RETRY_MS} until that process
+	 * lets go or `waitMs` runs out, `onWait` hearing once that it waits (a file
+	 * lease does not name its holder). A launcher starts the next process on a
+	 * session while the one before it is still ending, and without the wait
+	 * the next process's first write stops it. A session still held after the
+	 * wait stops there, before anything writes it. A refusal for a file that no
+	 * longer holds this session is left to the first write, which stops it as
+	 * `replaced`. A {@link close}, {@link seal} or session switch during the
+	 * wait ends it without the claim: a closed manager must not take the
+	 * session back from the next process. Without `OMP_SESSION_EXCLUSIVE=1`
+	 * nothing changes: the kernel drops a dead holder's lease at once, so the
+	 * wait would serve only a holder that is still ending, and a resume of a
+	 * session another process holds moves to a sibling at its first write, as
+	 * before.
+	 */
+	async #waitForOpenFileClaim(options: {
+		waitMs?: number;
+		onWait?: (holder: SessionClaimHolder | undefined) => void;
+	}): Promise<void> {
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const waitMs = options.waitMs ?? 0;
+		if (!isSessionExclusive() || waitMs <= 0 || !this.#persist || !sessionFile || !this.#storage.claimSession) return;
+		const deadline = Date.now() + waitMs;
+		const closes = this.#closes;
+		let waiting = false;
+		for (;;) {
+			// Every pass starts here, after each await and after `onWait`: a close, seal or switch since the wait began
+			// (during the header read or the sleep, or one `onWait` itself started) ends it before it claims or stops.
+			if (
+				this.#released ||
+				this.#closes !== closes ||
+				this.#sessionId !== sessionId ||
+				this.#sessionFile !== sessionFile
+			) {
+				return;
+			}
+			this.#claimSession();
+			const claim = this.#sessionClaim;
+			if (claim?.sessionId === sessionId && claim.release) break;
+			if (!waiting) {
+				if ((await readSessionHeaderId(sessionFile, this.#storage)) !== sessionId) return;
+				waiting = true;
+				options.onWait?.(undefined);
+				continue;
+			}
+			const left = deadline - Date.now();
+			if (left <= 0) {
+				this.#moveOffSessionFile("open-elsewhere");
+				return;
+			}
+			await Bun.sleep(Math.min(OPEN_FILE_CLAIM_RETRY_MS, left));
+		}
+		await this.#reloadIfWrittenElsewhere();
 	}
 
 	/**
@@ -3775,6 +3843,7 @@ export class SessionManager {
 
 	/** Flush, then close the append writer. */
 	async close(): Promise<void> {
+		this.#closes++;
 		if (!this.#persist) return;
 		try {
 			// Close and drain despite a latched failure, so a queued publish can
