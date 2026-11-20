@@ -5543,6 +5543,8 @@ export class SessionManager {
 		try {
 			await this.#closeLocked();
 		} finally {
+			// Also when the close fails early (a marker unlink that throws): nothing reads older entries after close.
+			this.#releaseColdStore();
 			// Closing gives up this process's ownership claim; a later write
 			// reclaims it. It goes last: until the final publish has run, the
 			// claim keeps the session's write fence in place, so no write of this
