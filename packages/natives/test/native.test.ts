@@ -419,16 +419,7 @@ try {
 			}
 		}, 10_000);
 
-		it("delivers a completed result after the JS thread resumes past its deadline", async () => {
-			const pending = grep({
-				pattern: "TODO",
-				path: testDir,
-				timeoutMs: 1_000,
-			});
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_200);
-
-			await expect(pending).resolves.toMatchObject({ totalMatches: 1 });
-		});
+		// Delivery of a finished walk past its deadline: settle_walk_delivers_a_finished_walk_past_its_deadline in crates/pi-natives/src/task.rs.
 
 		it("discards a completed result when an AbortSignal fires before settlement", async () => {
 			const controller = new AbortController();

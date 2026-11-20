@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -13,8 +13,9 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 // Real RPC dispatch and extension startup; only the model response is scripted.
-// A `session_start` handler starts a turn whose model call streams until aborted,
-// so the startup turn outlasts any command the client sends after `ready`.
+// A `session_start` handler starts a turn whose model call stays open until the
+// client aborts it, so the startup turn outlasts every command the client sends
+// after `ready`, however slowly this process runs: no timer decides when it ends.
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
@@ -36,7 +37,15 @@ const extension = await loadExtensionFromFactory(
 );
 const extensionRunner = new ExtensionRunner([extension], runtime, process.cwd(), sessionManager, modelRegistry);
 const mock = createMockModel({
-	responses: [{ content: ["startup turn"], delayMs: 60_000 }],
+	responses: [
+		(_context, options) => {
+			const { promise, resolve } = Promise.withResolvers<MockResponse>();
+			const aborted = () => resolve({ stopReason: "aborted", errorMessage: "Mock aborted before responding." });
+			if (options?.signal?.aborted) aborted();
+			else options?.signal?.addEventListener("abort", aborted, { once: true });
+			return promise;
+		},
+	],
 	handler: { content: ["ok"] },
 });
 const agent = new Agent({

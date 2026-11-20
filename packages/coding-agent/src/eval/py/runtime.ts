@@ -318,16 +318,3 @@ export function enumeratePythonRuntimes(cwd: string, baseEnv: Record<string, str
 
 	return runtimes;
 }
-
-/**
- * Resolve the highest-priority Python runtime. Prefer {@link enumeratePythonRuntimes}
- * when you can probe candidates; this returns only the first one and throws when
- * no interpreter exists.
- */
-export function resolvePythonRuntime(cwd: string, baseEnv: Record<string, string | undefined>): PythonRuntime {
-	const [runtime] = enumeratePythonRuntimes(cwd, baseEnv);
-	if (!runtime) {
-		throw new Error("Python executable not found on PATH");
-	}
-	return runtime;
-}

@@ -10,7 +10,6 @@ import { $ } from "bun";
 // contributor does: whether cargo ran, the line the gate printed, and its exit
 // code. No Rust is built.
 
-const SCRIPT = path.join(import.meta.dir, "run-rs-task.ts");
 const cleanups: (() => Promise<void>)[] = [];
 // Each case builds and clones a repository and spawns bun; on a loaded host
 // that outruns bun's 5 s default.
@@ -51,7 +50,16 @@ async function makeFixture(): Promise<Fixture> {
 	await writeExecutable(path.join(shimDir, "rustup"), "#!/bin/sh\nexit 1\n");
 	await writeExecutable(path.join(shimDir, "cargo"), '#!/bin/sh\necho "cargo-stub $*"\n');
 
-	await Bun.write(path.join(origin, "scripts/run-rs-task.ts"), Bun.file(SCRIPT));
+	// The script with the modules it imports for test:rs's environment, at their repository paths.
+	const repoRoot = path.join(import.meta.dir, "..");
+	for (const file of [
+		"scripts/run-rs-task.ts",
+		"scripts/test-env.ts",
+		"scripts/test-env-names.json",
+		"packages/utils/src/test-runtime.ts",
+	]) {
+		await Bun.write(path.join(origin, file), Bun.file(path.join(repoRoot, file)));
+	}
 	await Bun.write(path.join(origin, "packages/app/src/a.ts"), "export const a = 1;\n");
 	await Bun.write(path.join(origin, "crates/x/src/lib.rs"), "pub fn x() {}\n");
 	await git(origin, "init", "-q", "-b", "main");

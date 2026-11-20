@@ -171,6 +171,8 @@ async function launchRelayFixture(
 		const browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
 			headless: true,
+			// No launch limit of its own: Chromium's start or exit decides, and the test's timeout bounds a hang.
+			timeout: 0,
 			pipe: true,
 			userDataDir,
 			enableExtensions: [extensionDir, ...extensions],

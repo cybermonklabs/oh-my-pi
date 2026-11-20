@@ -65,6 +65,13 @@ function heldFirstResponse() {
 	};
 }
 
+/** Resolves when `signal` aborts; call it before letting the test abort, so the listener is in place. */
+function abortOf(signal: AbortSignal | undefined): Promise<void> {
+	const aborted = Promise.withResolvers<void>();
+	signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+	return aborted.promise;
+}
+
 function lastUserText(messages: readonly Message[]): unknown {
 	return messages.findLast(message => message.role === "user")?.content;
 }
@@ -317,10 +324,9 @@ describe("queued input drained before a paused turn", () => {
 			preparations++;
 			if (preparations !== 2) return;
 			// Holds like a hook awaiting slow work, until the run aborts.
-			const aborted = Promise.withResolvers<void>();
-			signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+			const aborted = abortOf(signal);
 			preparing.resolve();
-			await aborted.promise;
+			await aborted;
 		});
 		const steering = createUserMessage("queued task");
 
@@ -333,6 +339,40 @@ describe("queued input drained before a paused turn", () => {
 		await run;
 
 		expect(agent.peekSteeringQueue()).toEqual([steering]);
+		expect(agent.state.messages.map(message => message.role)).toEqual(["user", "assistant"]);
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("returns input a continuation took when the run aborts during its first dequeue", async () => {
+		const mock = createMockModel({ responses: [{ content: ["first response"] }, { content: ["later response"] }] });
+		const agent = new Agent({ initialState: { model: mock.model }, streamFn: mock.stream });
+		await agent.prompt("initial request");
+		const followUp = createUserMessage("follow-up task");
+		const steering = createUserMessage("queued task");
+		const polling = Promise.withResolvers<void>();
+		let dequeues = 0;
+		// The continuation takes the follow-up; the steer queued meanwhile makes the run's first
+		// steering poll run this hook again, which holds like slow preflight work and fails on the abort.
+		agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (++dequeues === 1) {
+				agent.steer(steering);
+				return;
+			}
+			const aborted = abortOf(signal);
+			polling.resolve();
+			await aborted;
+			signal?.throwIfAborted();
+		});
+		agent.followUp(followUp);
+
+		const run = agent.continue();
+		await polling.promise;
+		agent.abort();
+		await run;
+
+		expect(agent.peekFollowUpQueue()).toEqual([followUp]);
+		expect(agent.peekSteeringQueue()).toEqual([steering]);
+		// Nothing but the returned input was owed an answer: no empty aborted turn.
 		expect(agent.state.messages.map(message => message.role)).toEqual(["user", "assistant"]);
 		expect(mock.calls).toHaveLength(1);
 	});

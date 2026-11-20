@@ -1514,9 +1514,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#recordsInTurn = 0;
 	/** Latest `session_init` of the transcript the model calls ran on; `init` is null when it has none. */
 	#sessionInit: { sessionFile: string | undefined; init: PersistedSessionInit | null } | undefined;
-	/** Settles when switchSession commits or restores its previous generation on rollback.
-	 *  newSession never rolls its generation back, so it does not delay stale aside/SDK calls. */
-	#sessionGenerationSettled: Promise<void> | undefined;
+	/** The generation changes switchSession has made and may still undo, each settling when its
+	 *  switch commits or restores its previous generation on rollback. A switch started from
+	 *  another one's hooks and not awaited outlives it, so they settle in any order: each switch
+	 *  removes only its own (see #beginSessionGenerationChange), and every promise held here is
+	 *  still pending. newSession never rolls its generation back, so it does not delay stale
+	 *  aside/SDK calls. */
+	readonly #pendingSessionGenerationChanges = new Set<Promise<void>>();
 	/** Readiness barrier for the outermost session/transcript transition, including all
 	 *  hooks and rollback reconciliation, independently of when its generation settles. */
 	#sessionTransitionSettled: Promise<void> | undefined;
@@ -2019,16 +2023,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Re-validates a #sessionGeneration snapshot captured before an aside/SDK call's await.
 	 *  A mismatch alone does not mean the record's source session is gone —
 	 *  switchSession() restores the exact prior generation on rollback — so wait out any in-flight
-	 *  generation change (#sessionGenerationSettled) and recheck rather than discarding immediately.
+	 *  generation change (#pendingSessionGenerationChanges) and recheck rather than discarding immediately.
 	 *  Returns true when the caller should drop its record (no in-flight transition to wait for, or
 	 *  the generation is still different once one settles); false once the generation matches again. */
 	async #sessionGenerationChanged(sessionGeneration: number): Promise<boolean> {
 		while (this.#sessionGeneration !== sessionGeneration) {
-			const settled = this.#sessionGenerationSettled;
-			if (!settled) return true;
-			await settled;
+			if (this.#pendingSessionGenerationChanges.size === 0) return true;
+			// Every change held here is still pending, so each pass waits for a real settle: the loop
+			// cannot spin on a settled promise, which would starve the event loop and every timer.
+			await Promise.race(this.#pendingSessionGenerationChanges);
 		}
 		return false;
+	}
+
+	/**
+	 * Records a generation change a switch may still undo, for {@link #sessionGenerationChanged}.
+	 * The switch settles it once it commits or restores the previous generation; disposing settles
+	 * it too, so no exit path leaves it pending for good.
+	 */
+	#beginSessionGenerationChange(): Disposable & { settle: () => void } {
+		const change = Promise.withResolvers<void>();
+		this.#pendingSessionGenerationChanges.add(change.promise);
+		const settle = (): void => {
+			this.#pendingSessionGenerationChanges.delete(change.promise);
+			change.resolve();
+		};
+		return { settle, [Symbol.dispose]: settle };
 	}
 
 	/** Fire-and-forget wake turn for incoming IRC — idle delivery and stranded-aside resume both
@@ -14957,9 +14977,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// record on success but stays valid if the switch is rolled back to this same session.
 		const previousIrcPending = this.#discardOutgoingIrcRecords(false);
 		const previousSessionGeneration = this.#sessionGeneration++;
-		const generationSettled = Promise.withResolvers<void>();
-		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
-		this.#sessionGenerationSettled = generationSettled.promise;
+		using generationChange = this.#beginSessionGenerationChange();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
@@ -15190,8 +15208,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}
-			generationSettled.resolve();
-			this.#sessionGenerationSettled = previousSessionGenerationSettled;
+			generationChange.settle();
 			// Past the rollback window: the records this switch cleared are not coming back, so
 			// settle an end an earlier run left open for a turn one of them promised, as newSession
 			// does. Before this point a rollback would restore them and they still wake.
@@ -15217,8 +15234,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			);
 			this.#irc.restorePending(previousIrcPending);
 			this.#sessionGeneration = previousSessionGeneration;
-			generationSettled.resolve();
-			this.#sessionGenerationSettled = previousSessionGenerationSettled;
+			generationChange.settle();
 			// The records are back in the live session, but the abort above ran while the agent was
 			// disconnected, so its own stranded-aside drain refused them and nothing else resumes
 			// them: they would ride the next unrelated prompt into context, and a record promised a

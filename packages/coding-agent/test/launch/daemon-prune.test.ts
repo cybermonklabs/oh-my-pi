@@ -4,6 +4,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createDaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerEndpoint } from "../../src/launch/paths";
 import {
 	hasLiveDaemonProjectPresence,
 	pruneDeadDaemonRuntimeDirs,
@@ -53,6 +54,18 @@ async function scope(
 	}
 	if (init.stale) await fs.utimes(dir, STALE, STALE);
 	return dir;
+}
+
+/**
+ * The endpoint the prune probes for the scope at `dir`, its parent directory
+ * made. When `<dir>/broker.sock` does not fit `sun_path` (a deep temp
+ * directory, say), the endpoint is relocated to a shared directory outside the
+ * scope, which may not exist yet; a socket bound anywhere else is never probed.
+ */
+async function scopeEndpoint(dir: string): Promise<string> {
+	const endpoint = daemonBrokerEndpoint(dir);
+	await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
+	return endpoint;
 }
 
 /** Start the stalled listener fixture on `socketPath` once it listens there. */
@@ -243,7 +256,7 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 			const current = path.join(daemons, "aaaaaaaaaaaaaaaa");
 			await fs.mkdir(current, { recursive: true });
 			const busy = await scope(daemons, "bbbbbbbbbbbbbbbb", { pid: "dead", clients: [deadPid] });
-			const endpoint = path.join(busy, "broker.sock");
+			const endpoint = await scopeEndpoint(busy);
 			const server = net.createServer(socket => socket.destroy());
 			const listening = Promise.withResolvers<void>();
 			server.listen(endpoint, () => listening.resolve());
@@ -260,6 +273,8 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 				expect(await fs.exists(busy)).toBe(true);
 			} finally {
 				server.close();
+				// A relocated endpoint outlives the temp directory.
+				await fs.rm(endpoint, { force: true });
 			}
 		},
 	);
@@ -329,23 +344,26 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 			// socket file behind.
 			const crashed = await scope(daemons, "cccccccccccccccc", {});
 			await Bun.write(path.join(crashed, "broker.pid"), JSON.stringify({ pid: deadPid, domain: own.domain }));
-			const crashedListener = await startStalledListener(path.join(crashed, "broker.sock"));
-			crashedListener.kill("SIGKILL");
-			await crashedListener.exited;
 			// The same leftover socket behind a lease without a domain: a refused
 			// connect cannot tell a dead older broker from a live one in another PID
 			// namespace that refuses, so the scope stays.
 			const legacy = await scope(daemons, "dddddddddddddddd", { pid: "dead" });
-			const legacyListener = await startStalledListener(path.join(legacy, "broker.sock"));
-			legacyListener.kill("SIGKILL");
-			await legacyListener.exited;
-			const busyListener = await startStalledListener(path.join(busy, "broker.sock"));
+			const endpoints = await Promise.all([busy, crashed, legacy].map(scopeEndpoint));
+			const [busyEndpoint, crashedEndpoint, legacyEndpoint] = endpoints;
 			let held: net.Socket[] = [];
+			let busyListener: Bun.Subprocess | undefined;
 			try {
+				const crashedListener = await startStalledListener(crashedEndpoint);
+				crashedListener.kill("SIGKILL");
+				await crashedListener.exited;
+				const legacyListener = await startStalledListener(legacyEndpoint);
+				legacyListener.kill("SIGKILL");
+				await legacyListener.exited;
+				busyListener = await startStalledListener(busyEndpoint);
 				// Once the busy broker's accept queue is full, a node:net connect to it
 				// is refused exactly as one to the dead broker's socket is. (The prune's
 				// own probe may see EAGAIN there instead, depending on the platform.)
-				const queue = await fillAcceptQueue(path.join(busy, "broker.sock"));
+				const queue = await fillAcceptQueue(busyEndpoint);
 				held = queue.held;
 				expect(queue.refusal).toBe("ECONNREFUSED");
 				for (const dir of [busy, crashed, legacy]) await fs.utimes(dir, STALE, STALE);
@@ -359,8 +377,12 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 				}).toEqual({ busy: true, legacy: true, crashed: false });
 			} finally {
 				for (const socket of held) socket.destroy();
-				busyListener.kill("SIGKILL");
-				await busyListener.exited;
+				if (busyListener) {
+					busyListener.kill("SIGKILL");
+					await busyListener.exited;
+				}
+				// A relocated endpoint outlives the temp directory.
+				for (const endpoint of endpoints) await fs.rm(endpoint, { force: true });
 			}
 		},
 		30_000,

@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import * as path from "node:path";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 const fixture = path.join(import.meta.dir, "fixtures/power-assertion-pause.ts");
 
 test("keeps sleep prevention released through a paused setting change, then holds the new mode for resumed work", async () => {
 	// A child process exercises AgentSession's real assertion path; bun test itself deliberately disables it.
+	// It runs as production, in a home of its own.
 	const child = Bun.spawn([process.execPath, fixture], {
-		env: { ...process.env, BUN_ENV: "production", NODE_ENV: "production", PI_TEST_RUNTIME: "0" },
+		env: { ...createProductionChildEnv(), BUN_ENV: "production", NODE_ENV: "production" },
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

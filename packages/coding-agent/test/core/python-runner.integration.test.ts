@@ -7,26 +7,31 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	disposeAllKernelSessions,
 	executePython,
 	executePythonWithKernel,
 	type PythonExecutorOptions,
 } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
-import { PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
-import { filterEnv, resolvePythonRuntime } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
+import { checkPythonKernelAvailability, PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
+import type { PythonRuntime } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
 import { setSupersededKernelGraceMs } from "@oh-my-pi/pi-coding-agent/eval/superseded-reclaim";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const SHOULD_RUN = Bun.env.PI_PYTHON_INTEGRATION === "1";
 const MATPLOTLIB_TEST_CWD = process.cwd();
 
+/** The interpreter a checked kernel start uses: the first candidate that runs, not the first found. */
+async function workingPythonRuntime(cwd: string): Promise<PythonRuntime> {
+	const availability = await checkPythonKernelAvailability(cwd, undefined, { forceProbe: true });
+	if (!availability.ok || !availability.runtime) throw new Error(availability.reason ?? "no working Python");
+	return availability.runtime;
+}
+
 async function hasModule(cwd: string, module: string): Promise<boolean> {
 	if (!SHOULD_RUN) return false;
 	try {
-		const { env } = (await Settings.init()).getShellConfig();
-		const runtime = resolvePythonRuntime(cwd, filterEnv(env));
+		const runtime = await workingPythonRuntime(cwd);
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;
@@ -49,8 +54,7 @@ const HAS_ENSUREPIP = await hasModule(MATPLOTLIB_TEST_CWD, "ensurepip");
 
 /** A venv like the ones `uv venv` makes: no pip installed. Returns its interpreter. */
 async function createPiplessVenv(dir: string): Promise<string> {
-	const { env } = (await Settings.init()).getShellConfig();
-	const base = resolvePythonRuntime(dir, filterEnv(env)).pythonPath;
+	const base = (await workingPythonRuntime(dir)).pythonPath;
 	const venv = path.join(dir, "venv");
 	const created = Bun.spawnSync([base, "-m", "venv", "--without-pip", venv], { stdout: "ignore", stderr: "pipe" });
 	if (created.exitCode !== 0) throw new Error(`venv creation failed: ${created.stderr.toString()}`);

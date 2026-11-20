@@ -272,6 +272,8 @@ describe("relay tabs Chrome detaches omp from", () => {
 		chromium = await puppeteer.launch({
 			executablePath,
 			headless: true,
+			// No launch limit of its own: Chromium's start or exit decides, and the test's timeout bounds a hang.
+			timeout: 0,
 			args: [...buildHeadlessLaunchArgs(DEFAULT_VIEWPORT), "--no-first-run"],
 		});
 		site = Bun.serve({

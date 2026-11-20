@@ -27,6 +27,8 @@ describe("EvalTool timeout semantics", () => {
 		await disposeAllVmContexts();
 	});
 	afterEach(() => {
+		// Also after a timed-out test, so afterAll's worker teardown runs on the real clock.
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
@@ -71,6 +73,14 @@ describe("EvalTool timeout semantics", () => {
 	});
 
 	it("reports a dead JS worker instead of waiting for the cell timeout", async () => {
+		// The cell's 1 s watchdog (IdleTimeout) runs on the host clock and is armed before the
+		// worker is spawned, so on the real clock a cold start that a loaded host stretches past
+		// 1 s times the cell out before `process.exit` runs. Freeze the host clock instead: the
+		// watchdog stays armed but cannot expire, so only the worker's death can end the cell. A
+		// dead worker that went unreported would leave the cell waiting on a watchdog that never
+		// fires, and the test fails on its own timeout. The worker is a separate process on its
+		// own clock, so its start and exit are untouched.
+		vi.useFakeTimers();
 		const tool = new EvalTool(makeSession());
 		const result = await tool.execute("call-worker-exit", {
 			language: "js",

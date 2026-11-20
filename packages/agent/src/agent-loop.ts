@@ -1303,6 +1303,14 @@ async function runLoopBody(
 		for (const message of messages) unrecordedQueueInput.delete(message);
 		return messages;
 	};
+	// Whether a model call is owed apart from dequeued input: the run opened on
+	// input to answer, or resumes a tail whose calls still need running and
+	// answering; later, whether the last turn left work for another call. When an
+	// abort sends dequeued input back to its host, this decides whether the run
+	// still makes the call that ends aborted.
+	const resumeTail = unpairedToolCallTail(currentContext.messages);
+	const lastMessage = currentContext.messages.at(-1);
+	let modelCallOwed = resumeTail !== undefined || (lastMessage !== undefined && lastMessage.role !== "assistant");
 	const endAbortedBeforeModel = async (messages: AgentMessage[], turnOpen: boolean): Promise<boolean> => {
 		if (!signal?.aborted || !config.isUndeliveredQueuedMessage) return false;
 		const undelivered = new Set(
@@ -1313,14 +1321,17 @@ async function runLoopBody(
 				if (undelivered.has(list[i])) list.splice(i, 1);
 			}
 		}
-		if (!turnOpen) stream.push({ type: "turn_start" });
-		emitInputMessages(
-			stream,
-			messages.filter(message => !undelivered.has(message)),
-		);
-		const aborted = emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal);
-		newMessages.push(aborted);
-		await emitTurnEnd(stream, currentContext, aborted, [], config, signal, { willContinue: false });
+		const recorded = messages.filter(message => !undelivered.has(message));
+		// With its dequeued input back with the host and nothing else to answer, the
+		// run ends as an abort before that dequeue would have: without a turn, as at
+		// the boundary park below. A turn already open still closes aborted.
+		if (turnOpen || modelCallOwed || recorded.length > 0) {
+			if (!turnOpen) stream.push({ type: "turn_start" });
+			emitInputMessages(stream, recorded);
+			const aborted = emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal);
+			newMessages.push(aborted);
+			await emitTurnEnd(stream, currentContext, aborted, [], config, signal, { willContinue: false });
+		}
 		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 		return true;
 	};
@@ -1364,7 +1375,6 @@ async function runLoopBody(
 		// steering stays parked until after the batch — injecting a message
 		// between the tool_use blocks and their results would break the
 		// provider's pairing invariant.
-		const resumeTail = unpairedToolCallTail(currentContext.messages);
 		if (resumeTail) {
 			stream.push({ type: "turn_start" });
 			emitInputMessages(stream, messagesToEmit);
@@ -1402,13 +1412,6 @@ async function runLoopBody(
 				return;
 			}
 		}
-
-		// Whether a model call is owed apart from dequeued input: the run opened on
-		// input to answer, or the last turn left work for another call. When an
-		// abort sends dequeued input back to its host, this decides whether the run
-		// still makes the call that ends aborted.
-		const lastMessage = currentContext.messages.at(-1);
-		let modelCallOwed = lastMessage !== undefined && lastMessage.role !== "assistant";
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
 		while (true) {

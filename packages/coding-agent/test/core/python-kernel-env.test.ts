@@ -7,7 +7,6 @@ import {
 	filterEnv,
 	resolveExplicitPythonRuntime,
 	rebasePythonRuntime,
-	resolvePythonRuntime,
 } from "@oh-my-pi/pi-coding-agent/eval/py/runtime";
 import * as piUtils from "@oh-my-pi/pi-utils";
 
@@ -119,7 +118,6 @@ describe("enumeratePythonRuntimes", () => {
 		});
 
 		expect(runtimes.map(r => r.pythonPath)).toEqual([systemPy]);
-		expect(resolvePythonRuntime(path.join(path.sep, "work"), {}).pythonPath).toBe(systemPy);
 	});
 
 	it("enumerates every python and python3 on PATH so a broken first shim cannot hide a working interpreter", () => {
@@ -210,12 +208,11 @@ describe("enumeratePythonRuntimes", () => {
 		expect(runtime.pythonPath).toBe(path.join(path.sep, "work", ".venv", "bin", "python"));
 	});
 
-	it("throws from resolvePythonRuntime when no interpreter can be found", () => {
+	it("enumerates nothing when no interpreter can be found", () => {
 		vi.spyOn(piUtils, "getPythonEnvDir").mockReturnValue(managedDir);
 		vi.spyOn(piUtils, "$whichAll").mockReturnValue([]);
 		vi.spyOn(fs, "existsSync").mockReturnValue(false);
 
 		expect(enumeratePythonRuntimes(path.join(path.sep, "work"), {})).toEqual([]);
-		expect(() => resolvePythonRuntime(path.join(path.sep, "work"), {})).toThrow("Python executable not found");
 	});
 });
