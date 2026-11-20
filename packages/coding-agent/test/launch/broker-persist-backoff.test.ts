@@ -3,7 +3,9 @@
 // broker that recorded no start mark: recovery keeps it, `stop` leaves it `stopping` (nothing to
 // pin), and the broker's monitor of recovered detached daemons keeps polling it. In the last two,
 // the record is the broker's own daemon, which exits while the write of its exit fails. The broker's
-// writes into the record's directory and its persistence warnings are counted with spies.
+// writes into the record's directory and its persistence warnings are counted with spies, so each
+// test's client connects only once its in-process broker listens, every wait on a spy fails at once
+// when another broker holds the scope, and no broker may hold it after the test's broker ended.
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -15,19 +17,63 @@ import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV }
 
 const NAME = "persist-backoff";
 
-function startBroker(projectDir: string, runtimeDir: string): Promise<void> {
+interface EmbeddedBroker {
+	/** Settles once this in-process broker has shut down. */
+	finished: Promise<void>;
+}
+
+/**
+ * Starts the in-process broker and waits until it accepts connections. A client that connects
+ * earlier finds no endpoint and starts a broker process of its own (`client.ts`, `#spawnBroker`),
+ * which can take the scope: the test then talks to a broker whose warnings never reach the spy
+ * here, and which outlives the test.
+ */
+async function startBroker(projectDir: string, runtimeDir: string): Promise<EmbeddedBroker> {
 	const saved = [DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV, DAEMON_IDLE_GRACE_ENV].map(
 		name => [name, process.env[name]] as const,
 	);
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
 	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
-	const broker = startDaemonBrokerFromEnvironment();
+	const listening = Promise.withResolvers<boolean>();
+	const finished = startDaemonBrokerFromEnvironment({ onListening: () => listening.resolve(true) });
 	for (const [name, value] of saved) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
 	}
-	return broker;
+	if (!(await Promise.race([listening.promise, finished.then(() => false)])))
+		throw new Error("In-process daemon broker did not claim its scope");
+	return { finished };
+}
+
+/** The pid in the scope's broker lease (`broker.pid`), or `undefined` when no broker holds it. */
+async function leaseHolder(runtimeDir: string): Promise<number | undefined> {
+	try {
+		return JSON.parse(await fs.readFile(path.join(runtimeDir, "broker.pid"), "utf8")).pid;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+/**
+ * Fails, naming the holder, unless this process's broker holds the scope: the spies count only
+ * its writes and warnings.
+ */
+async function expectOwnBroker(runtimeDir: string): Promise<void> {
+	const holder = await leaseHolder(runtimeDir);
+	if (holder !== process.pid) {
+		throw new Error(
+			`the scope's broker is ${holder === undefined ? "no process" : `process ${holder}`}, not this test's ` +
+				`(${process.pid}): its writes and warnings are not the ones counted here`,
+		);
+	}
+}
+
+/** Fails unless no broker holds the scope once this process's broker has shut down. */
+async function expectNoBrokerLeft(runtimeDir: string): Promise<void> {
+	const holder = await leaseHolder(runtimeDir);
+	if (holder !== undefined) throw new Error(`broker process ${holder} holds the scope after the test's broker ended`);
 }
 
 async function stateOf(client: DaemonBrokerClient): Promise<string | undefined> {
@@ -68,15 +114,16 @@ async function startSleep(client: DaemonBrokerClient, projectDir: string, detach
 /** A detached daemon, recorded by a broker that then exits, as an older broker recorded it: no mark. */
 async function recordUnpinnable(projectDir: string, runtimeDir: string, metaPath: string): Promise<Daemon> {
 	const first = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const firstBroker = startBroker(projectDir, runtimeDir);
+	const firstBroker = await startBroker(projectDir, runtimeDir);
 	let daemon: Daemon;
 	try {
 		daemon = await startSleep(first, projectDir, true);
 	} finally {
 		await first.request({ op: "shutdown" }).catch(() => undefined);
 		first.close();
-		await firstBroker;
+		await firstBroker.finished;
 	}
+	await expectNoBrokerLeft(runtimeDir);
 	const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
 	delete meta.daemon.processStart;
 	await fs.writeFile(metaPath, JSON.stringify(meta));
@@ -111,12 +158,24 @@ function countWarnings(): { warned: { failed: number; again: number }; restore()
 }
 
 /**
+ * Waits until `done`, with no bound of its own: the runner bounds the wait. The spies count only
+ * this process's broker, so a wait fails at once, naming the holder, when another process holds
+ * the scope, instead of waiting for a warning that cannot come.
+ */
+async function untilOwnBroker(runtimeDir: string, done: () => boolean | Promise<boolean>): Promise<void> {
+	while (!(await done())) {
+		await expectOwnBroker(runtimeDir);
+		await Bun.sleep(20);
+	}
+}
+
+/**
  * Waits until the broker has handled a write that failed, which it warns at the first failure
  * in a row. A reply does not wait for the write its request queued, so on a loaded host the
- * failure may land after it. The runner bounds the wait.
+ * failure may land after it.
  */
-async function failureHandled(warned: { failed: number }): Promise<void> {
-	while (warned.failed === 0) await Bun.sleep(20);
+async function failureHandled(warned: { failed: number }, runtimeDir: string): Promise<void> {
+	await untilOwnBroker(runtimeDir, () => warned.failed > 0);
 }
 
 it("backs off a write that keeps failing, warns once, and writes once the disk takes writes", async () => {
@@ -128,7 +187,7 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 	try {
 		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(projectDir, runtimeDir);
 		const writes = { n: 0 };
 		const realWrite = Bun.write;
 		const writeSpy = spyOn(Bun, "write").mockImplementation(((destination: unknown, ...rest: unknown[]) => {
@@ -143,7 +202,7 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 			const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 300 });
 			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
 			expect(stopped.daemon.state).toBe("stopping");
-			await failureHandled(warned);
+			await failureHandled(warned, runtimeDir);
 			expect(warned).toEqual({ failed: 1, again: 0 });
 
 			// 3 s with no request, while the monitor polls every 100 ms: the retries back off
@@ -165,10 +224,10 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 			expect(warned).toEqual({ failed: 1, again: 0 });
 
 			// Once the directory takes writes again, a poll (no request) writes the record,
-			// within one backoff, and the recovery is warned once. The runner bounds the wait.
+			// within one backoff, and the recovery is warned once.
 			await fs.chmod(dir, 0o755);
-			while ((await diskState(metaPath)) !== "stopping") await Bun.sleep(20);
-			while (warned.again === 0) await Bun.sleep(20);
+			await untilOwnBroker(runtimeDir, async () => (await diskState(metaPath)) === "stopping");
+			await untilOwnBroker(runtimeDir, () => warned.again > 0);
 			expect(warned).toEqual({ failed: 1, again: 1 });
 		} finally {
 			writeSpy.mockRestore();
@@ -176,8 +235,9 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 			await fs.chmod(dir, 0o755).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
-			await broker;
+			await broker.finished;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	} finally {
 		process.title = previousTitle;
 		killDaemon(daemon, "SIGKILL");
@@ -193,7 +253,7 @@ it("times the backoff on the monotonic clock: a backward step of the wall clock 
 	try {
 		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(projectDir, runtimeDir);
 		const realNow = Date.now.bind(Date);
 		let clockSpy: { mockRestore(): void } | undefined;
 		const { warned, restore: restoreWarnings } = countWarnings();
@@ -202,7 +262,7 @@ it("times the backoff on the monotonic clock: a backward step of the wall clock 
 			await fs.chmod(dir, 0o555);
 			const stopped = await client.request({ op: "stop", name: NAME, timeoutMs: 300 });
 			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
-			await failureHandled(warned);
+			await failureHandled(warned, runtimeDir);
 			expect({ memory: stopped.daemon.state, disk: await diskState(metaPath) }).toEqual({
 				memory: "stopping",
 				disk: "running",
@@ -225,8 +285,9 @@ it("times the backoff on the monotonic clock: a backward step of the wall clock 
 			await fs.chmod(dir, 0o755).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
-			await broker;
+			await broker.finished;
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	} finally {
 		process.title = previousTitle;
 		killDaemon(daemon, "SIGKILL");
@@ -240,7 +301,7 @@ for (const detached of [false, true]) {
 		await fs.mkdir(projectDir);
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(projectDir, runtimeDir);
 		const { warned, restore: restoreWarnings } = countWarnings();
 		let daemon: Daemon | undefined;
 		try {
@@ -255,7 +316,7 @@ for (const detached of [false, true]) {
 				timedOut: false,
 				settled: true,
 			});
-			await failureHandled(warned);
+			await failureHandled(warned, runtimeDir);
 			expect(await diskState(metaPath)).toBe("running");
 			// Once the directory takes writes again, a request writes the settled record.
 			await fs.chmod(dir, 0o755);
@@ -266,9 +327,10 @@ for (const detached of [false, true]) {
 			await fs.chmod(dir, 0o755).catch(() => undefined);
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
-			await broker;
+			await broker.finished;
 			process.title = previousTitle;
 			killDaemon(daemon, "SIGKILL");
 		}
+		await expectNoBrokerLeft(runtimeDir);
 	}, 30_000);
 }
