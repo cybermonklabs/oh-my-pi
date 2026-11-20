@@ -3506,6 +3506,7 @@ use uucore::{
 use crate::{
 	host::{Host, Utility, format_usage, rayon_global_pool_available},
 	locale::{collation_locale_failed, numeric_symbols, shell_collator, shell_locale},
+	long_options::OptionTable,
 	sort::{
 		buffer_hint::automatic_buffer_size,
 		tmp_dir::{TmpDirWrapper, TmpFile},
@@ -5670,12 +5671,18 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 	out
 }
 
+/// The options `sort` accepts, of which `--check-silent` is the builtin's
+/// alone: GNU sort 9.7 reads `--ch` and `--che` as `--check`, where both
+/// also begin it.
+static OPTIONS: LazyLock<OptionTable> =
+	LazyLock::new(|| OptionTable::new(uu_app(), &[options::check::CHECK_SILENT]));
+
 impl Utility for Sort {
 	const NAME: &'static str = "sort";
 	const USAGE_ERROR: u8 = 2;
 
 	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
-		Ok(split_attached_separator(argv))
+		Ok(split_attached_separator(OPTIONS.spell_out_all(argv)))
 	}
 
 	fn run(self, host: &mut Host) -> i32 {

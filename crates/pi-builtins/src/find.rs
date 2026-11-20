@@ -4198,7 +4198,7 @@ pub mod matchers {
 		config: &mut Config,
 		host: &mut Host,
 	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
-		let (_, top_level_matcher) = build_matcher_tree(args, config, 0, false, host).await?;
+		let top_level_matcher = build_matcher_tree(args, config, host).await?;
 
 		// if the matcher doesn't have any side-effects, then we default to printing
 		if !top_level_matcher.has_side_effects() {
@@ -4382,17 +4382,26 @@ pub mod matchers {
 		Ok(file)
 	}
 
-	/// The main "translate command-line args into a matcher" function. Will call
-	/// itself recursively if it encounters an opening bracket. A successful return
-	/// consists of a tuple containing the new index into the args array to use (if
-	/// called recursively) and the resulting matcher.
+	/// The main "translate command-line args into a matcher" function.
+	///
+	/// A parenthesized expression is read as an expression of its own, with
+	/// the default regex type, and becomes one condition of the expression
+	/// it is in. The expressions a `(` interrupted are kept on a stack, not
+	/// by recursion, so a nest of parentheses 10,000 deep, which GNU find
+	/// reads, does not overflow the stack, nor does one deeper.
 	async fn build_matcher_tree(
 		args: &[&str],
 		config: &mut Config,
-		arg_index: usize,
-		mut expecting_bracket: bool,
 		host: &mut Host,
-	) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
+	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+		/// An expression a `(` interrupted, to go on with once `)` closes
+		/// the expression inside.
+		struct Outer {
+			matcher:             ListMatcherBuilder,
+			regex_type:          regex::RegexType,
+			invert_next_matcher: bool,
+		}
+		let mut outer: Vec<Outer> = Vec::new();
 		let mut top_level_matcher = ListMatcherBuilder::new();
 
 		let mut regex_type = regex::RegexType::default();
@@ -4401,7 +4410,7 @@ pub mod matchers {
 		// order of arguments is important
 		// arguments can start with + as well as -
 		// multiple-character flags don't start with a double dash
-		let mut i = arg_index;
+		let mut i = 0;
 		let mut invert_next_matcher = false;
 		while i < args.len() {
 			let possible_submatcher = match args[i] {
@@ -4750,24 +4759,34 @@ pub mod matchers {
 					None
 				},
 				"(" => {
-					let (new_arg_index, sub_matcher) =
-						Box::pin(build_matcher_tree(args, config, i + 1, true, host)).await?;
-					i = new_arg_index;
-					Some(sub_matcher)
+					outer.push(Outer {
+						matcher:             std::mem::replace(
+							&mut top_level_matcher,
+							ListMatcherBuilder::new(),
+						),
+						regex_type:          std::mem::take(&mut regex_type),
+						invert_next_matcher: std::mem::take(&mut invert_next_matcher),
+					});
+					None
 				},
 				")" => {
-					if !expecting_bracket {
+					let Some(enclosing) = outer.pop() else {
 						return Err(From::from(
 							"invalid expression: expected expression before closing parentheses ')'.",
 						));
-					}
+					};
 
 					let bracket = args[i - 1];
 					if bracket == "(" {
 						return Err(From::from("invalid expression; empty parentheses are not allowed."));
 					}
 
-					return Ok((i, top_level_matcher.build()));
+					// The expression inside becomes one condition of the one
+					// the `(` interrupted, which goes on as it was.
+					let inner = std::mem::replace(&mut top_level_matcher, enclosing.matcher);
+					regex_type = enclosing.regex_type;
+					invert_next_matcher = enclosing.invert_next_matcher;
+					Some(inner.build())
 				},
 				"-follow" => {
 					// This option affects multiple matchers.
@@ -4883,7 +4902,7 @@ pub mod matchers {
 			i += 1;
 			if config.help_requested || config.version_requested {
 				// Ignore anything, even invalid expressions, after -help/-version
-				expecting_bracket = false;
+				outer.clear();
 				break;
 			}
 			if let Some(submatcher) = possible_submatcher {
@@ -4895,7 +4914,7 @@ pub mod matchers {
 				}
 			}
 		}
-		if expecting_bracket {
+		if !outer.is_empty() {
 			return Err(From::from(
 				"invalid expression; I was expecting to find a ')' somewhere but did not see one.",
 			));
@@ -4903,7 +4922,7 @@ pub mod matchers {
 		if config.files0_argument.is_some() {
 			parse_files0_args(config, host).await?;
 		}
-		Ok((i, top_level_matcher.build()))
+		Ok(top_level_matcher.build())
 	}
 
 	// https://www.gnu.org/software/findutils/manual/html_node/find_html/Starting-points.html
@@ -5976,5 +5995,27 @@ mod tests {
 		assert_eq!(code, 1);
 		assert!(capture.err().contains("No space left on device"), "stderr: {}", capture.err());
 		assert!(!capture.err().contains("internal error"), "stderr: {}", capture.err());
+	}
+
+	/// A nest of parentheses as deep as GNU find reads, and deeper, must be
+	/// read without overflowing the stack of the thread the shell runs on.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn reads_a_nest_of_parentheses_deeper_than_the_stack() {
+		// If this regresses, `find . \( … -name a.txt … \)` nested 100,000
+		// deep overflows the stack and aborts the process, where GNU find
+		// 4.10 prints `./a.txt` (measured 10,000 deep), and refuses the nest
+		// left unclosed with exit 1.
+		let (_dir, root) = fixture();
+		let depth = 100_000;
+		let mut args = vec![".".to_owned()];
+		args.extend(std::iter::repeat_n("(".to_owned(), depth));
+		args.extend(["-name".to_owned(), "a.txt".to_owned()]);
+		let unclosed = args.clone();
+		args.extend(std::iter::repeat_n(")".to_owned(), depth));
+		let (code, capture) = run(&root, &args).await;
+		assert_eq!((code, capture.out().as_str()), (0, "./a.txt\n"), "{}", capture.err());
+		let (code, capture) = run(&root, &unclosed).await;
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("expecting to find a ')'"), "{}", capture.err());
 	}
 }

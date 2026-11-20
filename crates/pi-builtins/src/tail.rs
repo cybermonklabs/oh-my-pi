@@ -2995,6 +2995,7 @@ use std::{
 	ffi::OsString,
 	io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
+	sync::LazyLock,
 };
 
 use clap::ArgMatches;
@@ -3002,6 +3003,7 @@ use memchr::{memchr_iter, memrchr_iter};
 use uucore::display::Quotable;
 
 use crate::host::{Host, Utility, matches_parser};
+use crate::long_options::OptionTable;
 
 use args::{FilterMode, Settings, Signum};
 use chunks::ReverseChunks;
@@ -3155,9 +3157,22 @@ pub(crate) struct Tail {
 
 matches_parser!(Tail, args::uu_app);
 
+/// The options `tail` accepts, of which these are the builtin's alone, or
+/// hidden behind a third dash in GNU tail 9.7 (`---presume-input-pipe`): GNU
+/// reads `--p=1` as `--pid=1`, and `--r` and `--re` as `--retry`, where they
+/// also begin `--presume-input-pipe` and `--reverse`.
+static OPTIONS: LazyLock<OptionTable> = LazyLock::new(|| {
+	OptionTable::new(args::uu_app(), &[
+		"presume-input-pipe",
+		args::options::REVERSE,
+		args::options::USE_POLLING,
+		args::options::DEBUG,
+	])
+});
+
 impl Utility for Tail {
 	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
-		rewrite_tail_argv(argv)
+		rewrite_tail_argv(OPTIONS.spell_out_all(argv))
 	}
 	const NAME: &'static str = "tail";
 

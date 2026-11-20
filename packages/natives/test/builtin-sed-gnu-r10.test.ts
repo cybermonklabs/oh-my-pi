@@ -103,6 +103,78 @@ describe("builtin sed: errors as GNU reports them", () => {
 	]);
 });
 
+/** GNU sed's line for an error at `place`: `sed: PLACE: MESSAGE`. */
+const error = (place: string, message: string) => `sed: ${place}: ${message}\n`;
+/** The place of a character in the first `-e` expression. */
+const char = (n: number) => `-e expression #1, char ${n}`;
+
+describe("builtin sed: errors written as GNU writes them", () => {
+	// Regressed, unless a case says otherwise: each message was the builtin's
+	// own, after a place of its own, `<script argument 1>:1:C: error:` or
+	// `FILE:L:C: error:`. GNU names the `-e` expression and the character at
+	// which it stopped reading, or the script file and the line.
+	cases([
+		["echo a | sed k 2>&1", error(char(1), "unknown command: `k'"), 1],
+		["echo a | sed -e p -e k 2>&1", error("-e expression #2, char 1", "unknown command: `k'"), 1],
+		["printf 'p\\nk\\n' >s.sed; echo a | sed -f s.sed 2>&1", error("file s.sed line 2", "unknown command: `k'"), 1],
+		// A regex error is glibc's message alone, without "invalid regex '...'", placed past the `;` that ends the command.
+		["echo a | sed 's/[z-a]/x/;p' 2>&1", error(char(11), "Invalid range end"), 1],
+		["echo a | sed -n '/[z-a]/p' 2>&1", error(char(7), "Invalid range end"), 1],
+		// The interval was checked before the bracket expression ahead of it ("Invalid content of \{\}").
+		[String.raw`echo a | sed 's/[z-a]a\{2,1\}/x/' 2>&1`, error(char(18), "Invalid range end"), 1],
+		// The engine's own parse error, several lines long.
+		["echo a | sed -E 's/(a/x/' 2>&1", error(char(7), "Unmatched ( or \\("), 1],
+		["echo a | sed 's/a' 2>&1", error(char(3), "unterminated `s' command"), 1],
+		["echo a | sed '/a' 2>&1", error(char(2), "unterminated address regex"), 1],
+		["echo a | sed 'y/a/' 2>&1", error(char(4), "unterminated `y' command"), 1],
+		// "internal error": the builtin read past the end of the line.
+		["echo a | sed s 2>&1", error(char(1), "unterminated `s' command"), 1],
+		["echo a | sed 'p;y' 2>&1", error(char(3), "unterminated `y' command"), 1],
+		["echo a | sed 'y/ab/c/' 2>&1", error(char(7), "strings for `y' command are different lengths"), 1],
+		["echo a | sed 's/a/b/z' 2>&1", error(char(7), "unknown option to `s'"), 1],
+		// Accepted, and the line printed twice.
+		["echo a | sed 's/a/b/pp' 2>&1", error(char(8), "multiple `p' options to `s' command"), 1],
+		["echo a | sed --posix 's/a/b/e' 2>&1", error(char(7), "unknown option to `s'"), 1],
+		["echo a | sed --sandbox 'w x' 2>&1", error(char(1), "e/r/w commands disabled in sandbox mode"), 1],
+		["echo a | sed '!!p' 2>&1", error(char(2), "multiple `!'s"), 1],
+		["echo a | sed ': ;' 2>&1", error(char(2), '":" lacks a label'), 1],
+		["echo a | sed r 2>&1", error(char(1), "missing filename in r/R/w/W commands"), 1],
+		["echo a | sed 'p x' 2>&1", error(char(3), "extra characters after command"), 1],
+		["echo a | sed '1:a' 2>&1", error(char(2), ": doesn't want any addresses"), 1],
+		["echo a | sed 1 2>&1", error(char(1), "missing command"), 1],
+		// "internal error" for these two.
+		["echo a | sed '1,p' 2>&1", error(char(3), "unexpected `,'"), 1],
+		["echo a | sed '1,' 2>&1", error(char(2), "unexpected `,'"), 1],
+		["echo a | sed '}' 2>&1", error(char(1), "unexpected `}'"), 1],
+		// A block left open was reported with no place at all.
+		["echo a | sed -e '{' -e p 2>&1", error(char(0), "unmatched `{'"), 1],
+		["printf '{\\np\\n{\\np\\n' >b.sed; echo a | sed -f b.sed 2>&1", error("file b.sed line 3", "unmatched `{'"), 1],
+		// Reported as a jump to a missing label, exit 4: GNU checks the blocks first.
+		["echo a | sed '{ba' 2>&1", error(char(0), "unmatched `{'"), 1],
+		["echo a | sed a 2>&1", error(char(1), "expected \\ after `a', `c' or `i'"), 1],
+		["echo a | sed 0p 2>&1", error(char(2), "invalid usage of line address 0"), 1],
+		["echo a | sed '0,5 p' 2>&1", error(char(5), "invalid usage of line address 0"), 1],
+		["echo a | sed --posix '0,/a/p' 2>&1", error(char(6), "invalid usage of line address 0"), 1],
+		// Under --posix, `~` is no step but a command, and after a `,` no address.
+		["echo a | sed --posix '1~2p' 2>&1", error(char(2), "unknown command: `~'"), 1],
+		["echo a | sed --posix '1,~2p' 2>&1", error(char(3), "unexpected `,'"), 1],
+		[String.raw`echo a | sed 's/\(a\)/\2/' 2>&1`, error(char(11), "invalid reference \\2 on `s' command's RHS"), 1],
+		["echo a | sed 's//x/I' 2>&1", error(char(6), "cannot specify modifiers on empty regexp"), 1],
+		// Found only as the script runs, these exited 2; GNU places them at the end of the script and exits 1.
+		[
+			String.raw`printf 'ab\n' | sed '/a/s//[\1]/' 2>&1`,
+			error(char(0), "invalid reference \\1 on `s' command's RHS"),
+			1,
+		],
+		["echo a | sed -e '$!d' -e 's//x/' 2>&1", error("-e expression #2, char 0", "no previous regular expression"), 1],
+		[
+			"printf 's//x/\\n' >e.sed; echo a | sed -f e.sed 2>&1",
+			error("file e.sed line 2", "no previous regular expression"),
+			1,
+		],
+	]);
+});
+
 describe("builtin sed: a brace with nothing to repeat, and a count above 32767", () => {
 	cases([
 		// Regressed: with `{` the delimiter, `\{` reaches the pattern as a brace that sed's own interval check never sees, and it is read as text; GNU prints "Invalid preceding regular expression" and exits 1.
@@ -135,29 +207,66 @@ describe("builtin sed: the pattern dialect shared with grep", () => {
 	]);
 });
 
+/**
+ * Runs `command` in the builtin shell of a child process, which a crash of
+ * the builtin ends alone, with stdout sent to `out`. Returns the child's own
+ * exit status (0 when it lived to report), the builtin's, and the output.
+ */
+async function runInChild(command: string): Promise<{ child: number; exitCode: number; output: Buffer }> {
+	const addon = path.join(import.meta.dir, "../native/index.js");
+	const script = path.join(dir, "child.mjs");
+	await fs.writeFile(
+		script,
+		[
+			`import { executeShell } from ${JSON.stringify(addon)};`,
+			`const command = ${JSON.stringify(`{ ${command}\n} >out 2>/dev/null`)};`,
+			`const result = await executeShell({ command, cwd: ${JSON.stringify(dir)} }, () => {});`,
+			"console.log(result.exitCode);",
+		].join("\n"),
+	);
+	await fs.rm(path.join(dir, "out"), { force: true });
+	const shell = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
+	const [stdout, child] = await Promise.all([new Response(shell.stdout).text(), shell.exited]);
+	const output = await fs.readFile(path.join(dir, "out")).catch(() => Buffer.alloc(0));
+	return { child, exitCode: Number(stdout), output };
+}
+
 describe("builtin sed: a pattern of groups nested past the engine's limit", () => {
 	// GNU sed 4.9 itself crashes on this pattern (exit 139), so the
 	// expectation is the builtin's own refusal: an invalid regex, exit 1, and
-	// no output. The shell runs in a child process, which a crash ends alone.
+	// no output.
 	it("is refused with exit 1, and the process lives on", async () => {
 		// Regressed: splitting the pattern into its branches recurses once a group, so 100,000 nested groups with a `|` overflow the stack, which aborts the whole process, the bash tool's host with it.
 		const depth = 100_000;
 		await fs.writeFile(path.join(dir, "deep.sed"), `s/${"(".repeat(depth)}a|b${")".repeat(depth)}/X/\n`);
-		const addon = path.join(import.meta.dir, "../native/index.js");
-		const child = path.join(dir, "deep.mjs");
-		await fs.writeFile(
-			child,
-			[
-				`import { executeShell } from ${JSON.stringify(addon)};`,
-				`const command = "echo a | sed -E -f deep.sed >out 2>/dev/null";`,
-				`const result = await executeShell({ command, cwd: ${JSON.stringify(dir)} }, () => {});`,
-				"console.log(result.exitCode);",
-			].join("\n"),
-		);
-		await fs.rm(path.join(dir, "out"), { force: true });
-		const shell = Bun.spawn([process.execPath, child], { stdout: "pipe", stderr: "ignore" });
-		const [stdout, exitCode] = await Promise.all([new Response(shell.stdout).text(), shell.exited]);
-		expect({ exitCode, stdout }).toEqual({ exitCode: 0, stdout: "1\n" });
-		expect(await fs.readFile(path.join(dir, "out"))).toEqual(Buffer.alloc(0));
+		expect(await runInChild("echo a | sed -E -f deep.sed")).toEqual({
+			child: 0,
+			exitCode: 1,
+			output: Buffer.alloc(0),
+		});
+	}, 60_000);
+});
+
+describe("builtin sed: blocks nested 100,000 deep", () => {
+	// GNU sed 4.9 runs such a script, and refuses one left unclosed with
+	// "unmatched `{'" and exit 1.
+	it("are run, and the process lives on", async () => {
+		// Regressed: compiling the blocks recursed once a block, so the stack overflowed, which aborts the whole process.
+		await fs.writeFile(path.join(dir, "blocks.sed"), `${"{".repeat(100_000)}p${"}".repeat(100_000)}\n`);
+		expect(await runInChild("echo a | sed -n -f blocks.sed")).toEqual({
+			child: 0,
+			exitCode: 0,
+			output: Buffer.from("a\n"),
+		});
+	}, 60_000);
+
+	it("left unclosed are refused with exit 1, and the process lives on", async () => {
+		// Regressed: the same before the unmatched `{` is reported.
+		await fs.writeFile(path.join(dir, "open.sed"), `${"{".repeat(100_000)}p\n`);
+		expect(await runInChild("echo a | sed -n -f open.sed")).toEqual({
+			child: 0,
+			exitCode: 1,
+			output: Buffer.alloc(0),
+		});
 	}, 60_000);
 });

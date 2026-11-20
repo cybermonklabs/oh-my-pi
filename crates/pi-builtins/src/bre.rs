@@ -121,6 +121,8 @@ pub(crate) enum BreError {
 	RepetitionOperandMissing,
 	/// A `)` or `\)` that closes no group, where the dialect refuses one.
 	ParenUnmatched,
+	/// A `(` or `\(` that the pattern never closes.
+	GroupUnclosed,
 	/// A back-reference to a group that has not closed in the branch it is
 	/// in, or to none at all.
 	BackReferenceInvalid,
@@ -142,6 +144,7 @@ impl BreError {
 			Self::TooBig => "Regular expression too big",
 			Self::RepetitionOperandMissing => "Invalid preceding regular expression",
 			Self::ParenUnmatched => "Unmatched ) or \\)",
+			Self::GroupUnclosed => "Unmatched ( or \\(",
 			Self::BackReferenceInvalid => "Invalid back reference",
 			Self::TrailingBackslash => "Trailing backslash",
 		}
@@ -714,9 +717,13 @@ impl Translator<'_> {
 				_ => self.literal(c),
 			}
 		}
-		// A group still open is an error the engine reports, as GNU does
-		// before this one.
-		if self.confused && self.groups.is_empty() {
+		// A group still open is refused before a class name written without
+		// its outer brackets: `sed 's/[:alpha:]\(/x/'` is "Unmatched ( or
+		// \(" and exit 1.
+		if !self.groups.is_empty() {
+			return Err(BreError::GroupUnclosed);
+		}
+		if self.confused {
 			return Err(BreError::ClassSyntaxConfused);
 		}
 		Ok(self.out)
@@ -2036,14 +2043,16 @@ mod tests {
 		assert_eq!(bre_err(r"[:alpha:]a\{1"), Some(BreError::BraceUnmatched));
 		assert_eq!(ere_err("[:alpha:](a|b)x[[:foo:]]"), Some(BreError::ClassNameInvalid));
 		assert_eq!(bre_err("[:alpha:]x"), Some(BreError::ClassSyntaxConfused));
-		// A group still open is left for the engine, which refuses it as GNU
-		// does: `sed 's/[:alpha:]\(/x/'` is "Unmatched ( or \(", exit 1.
-		assert_eq!(bre_err(r"[:alpha:]\("), None);
-		assert_eq!(bre_err(r"\([:alpha:]"), None);
+		// A group still open is reported first, with glibc's message: `sed
+		// 's/[:alpha:]\(/x/'` is "Unmatched ( or \(", exit 1.
+		assert_eq!(bre_err(r"[:alpha:]\("), Some(BreError::GroupUnclosed));
+		assert_eq!(bre_err(r"\([:alpha:]"), Some(BreError::GroupUnclosed));
 		assert_eq!(
 			translate("[:alpha:](", Dialect::Extended, Target::Fancy, false, Strictness::Sed).err(),
-			None
+			Some(BreError::GroupUnclosed)
 		);
+		// As in grep: `grep -E '(a'` is "Unmatched ( or \(".
+		assert_eq!(ere_err("(a"), Some(BreError::GroupUnclosed));
 		assert_eq!(bre_err(r"\([:alpha:]\)"), Some(BreError::ClassSyntaxConfused));
 	}
 

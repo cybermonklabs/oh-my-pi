@@ -192,6 +192,26 @@ describe("builtin grep: the group separator under -z", () => {
 	]);
 });
 
+describe("builtin grep: count and file-name records under -z", () => {
+	const files = String.raw`printf 'a\0a\0' >in1; printf 'b\0' >in2;`;
+	cases([
+		// Regressed: each count ends with a NUL; GNU ends it with a newline.
+		[`${files} grep -zc a in1 in2`, "in1:2\nin2:0\n", 0],
+		// Regressed: the same for a count of standard input.
+		[String.raw`printf 'a\0a\0' | grep -zc a`, "2\n", 0],
+		// Regressed: a file name -l prints ends with a NUL; GNU ends it with a newline.
+		[`${files} grep -zl a in1 in2`, "in1\n", 0],
+		// Regressed: the same for -L.
+		[`${files} grep -zL a in1 in2`, "in2\n", 0],
+		// Regressed: under -Z the name ends with a NUL, and the count after it with a newline.
+		[`${files} grep -zcZ a in1 in2`, "in1\x002\nin2\x000\n", 0],
+		// -Z ends a file name -l prints with a NUL.
+		[`${files} grep -zlZ a in1 in2`, "in1\0", 0],
+		// A selected record still ends with a NUL.
+		[String.raw`printf 'a\0b\0' | grep -z a`, "a\0", 0],
+	]);
+});
+
 describe("builtin grep: -o with several patterns", () => {
 	cases([
 		// The longest of several plain strings at each position.

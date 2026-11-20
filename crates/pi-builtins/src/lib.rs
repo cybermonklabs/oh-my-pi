@@ -31,6 +31,16 @@ mod stdio;
 	feature = "util.uniq"
 ))]
 mod locale;
+/// GNU getopt's reading of a long option's abbreviation, shared by the
+/// utilities whose parser holds long options GNU's tool lacks.
+#[cfg(any(
+	feature = "util.cp",
+	feature = "util.grep",
+	feature = "util.rm",
+	feature = "util.sort",
+	feature = "util.tail"
+))]
+mod long_options;
 /// GNU `QUOTING_STYLE` names, shared by the utilities that honor them.
 #[cfg(any(feature = "util.du", feature = "util.env"))]
 mod quoting_style;
