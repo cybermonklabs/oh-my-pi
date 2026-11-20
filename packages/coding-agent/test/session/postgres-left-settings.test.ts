@@ -1474,6 +1474,27 @@ describe("SQL session store under a session setting another client left on Postg
 			const lineOf = (pattern: RegExp) => log.split("\n").find(line => pattern.test(line)) ?? "";
 			return { log, openings, lineOf };
 		};
+		/** `log` with `records` put right after pid 46's opening line. */
+		const afterOpening = (log: string, records: readonly string[]) => {
+			const physical = log.split("\n");
+			const opening = physical.findIndex(line => line.includes("pid=46 ") && line.includes(" statement: BEGIN"));
+			return [...physical.slice(0, opening + 1), ...records, ...physical.slice(opening + 1)].join("\n");
+		};
+		/** Pid 46 as a store backend of a case of `entry`, with the fixture's other store backends. */
+		const storePids = (entry: string) =>
+			new Map([
+				[46, { messages: 3, entry }],
+				[52, { messages: 2 }],
+				[64, { messages: 2 }],
+				[70, { messages: 0 }],
+			]);
+		const debugLog = "2026-11-20 03:36:19.267 UTC pid=46 app=psql code=00000 LOG:  parse tree:";
+		const debugDetail =
+			"2026-11-20 03:36:19.267 UTC pid=46 app=[unknown] code=00000 DETAIL:     {QUERY \n" +
+			"\t   :commandType 5 \n" +
+			"\t   }";
+		const debugStatement = (openings: readonly string[]) =>
+			`2026-11-20 03:36:19.267 UTC pid=46 app=[unknown] code=00000 STATEMENT:  ${openings[0]}`;
 
 		test("passes every line of the store's backends in the captured log, and their counts", async () => {
 			const { log, openings } = await load();
@@ -1527,31 +1548,43 @@ describe("SQL session store under a session setting another client left on Postg
 
 		test("accepts a parse tree line only on a backend of a debug print case", async () => {
 			const { log, openings } = await load();
-			const parseTree =
-				"2026-11-20 03:36:19.267 UTC pid=46 app=psql code=00000 LOG:  parse tree:\n" +
-				"\t   {QUERY \n" +
-				"\t   :commandType 5 \n" +
-				"\t   }";
-			const physical = log.split("\n");
-			const opening = physical.findIndex(line => line.includes("pid=46 ") && line.includes(" statement: BEGIN"));
-			const withTree = [...physical.slice(0, opening + 1), parseTree, ...physical.slice(opening + 1)].join("\n");
-			const pids = (entry: string) =>
-				new Map([
-					[46, { messages: 3, entry }],
-					[52, { messages: 2 }],
-					[64, { messages: 2 }],
-					[70, { messages: 0 }],
-				]);
+			const records = [debugLog, debugDetail, debugStatement(openings)];
+			const withTree = afterOpening(log, records);
 
-			const elsewhere = checkServerLog(withTree, pids("statement_timeout"), openings, FIXTURE_MARKER);
-			expect(elsewhere.flagged.map(line => line.line)).toEqual([parseTree]);
+			const elsewhere = checkServerLog(withTree, storePids("statement_timeout"), openings, FIXTURE_MARKER);
+			expect(elsewhere.flagged.map(line => line.line)).toEqual(records);
 			expect(elsewhere.debugPrint).toEqual([]);
 			expect(elsewhere.counts).toEqual([]);
 
-			const debugPrint = checkServerLog(withTree, pids("debug_print_parse"), openings, FIXTURE_MARKER);
+			const debugPrint = checkServerLog(withTree, storePids("debug_print_parse"), openings, FIXTURE_MARKER);
 			expect(debugPrint.flagged).toEqual([]);
 			expect(debugPrint.debugPrint).toEqual([{ pid: 46, entry: "debug_print_parse" }]);
 			expect(debugPrint.counts).toEqual([]);
+		});
+
+		test("flags a STATEMENT record on a debug print backend that no accepted debug print LOG record directly precedes", async () => {
+			const { log, openings, lineOf } = await load();
+			const statement = debugStatement(openings);
+
+			const alone = checkServerLog(
+				afterOpening(log, [statement]),
+				storePids("debug_print_parse"),
+				openings,
+				FIXTURE_MARKER,
+			);
+			expect(alone.flagged.map(line => line.line)).toEqual([statement]);
+			expect(alone.debugPrint).toEqual([]);
+			expect(alone.counts).toEqual([]);
+
+			// Another record of the same backend between the debug print and the STATEMENT ends what follows it.
+			const execute = lineOf(/pid=46 .* execute /);
+			const physical = afterOpening(log, [debugLog, debugDetail]).split("\n");
+			const at = physical.indexOf(execute);
+			const broken = [...physical.slice(0, at + 1), statement, ...physical.slice(at + 1)].join("\n");
+			const after = checkServerLog(broken, storePids("debug_print_parse"), openings, FIXTURE_MARKER);
+			expect(after.flagged.map(line => line.line)).toEqual([statement]);
+			expect(after.debugPrint).toEqual([{ pid: 46, entry: "debug_print_parse" }]);
+			expect(after.counts).toEqual([]);
 		});
 	});
 });

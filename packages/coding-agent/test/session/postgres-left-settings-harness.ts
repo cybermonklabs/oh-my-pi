@@ -390,6 +390,11 @@ export interface LeftLogVerdict {
 const LOG_PREFIX = /^.*? pid=(\d+) app=(.*?) code=([0-9A-Z]{5}) ([A-Z0-9]+): {2}/;
 const EXECUTE = /^execute [^:]+: /;
 const DEBUG_PRINT_MESSAGES = ["parse tree:", "rewritten parse tree:", "plan:"];
+/**
+ * The records PostgreSQL writes with a debug print's `LOG` record, in order:
+ * the tree or plan as `DETAIL`, then the query as `STATEMENT`.
+ */
+const DEBUG_PRINT_FOLLOWERS = ["DETAIL", "STATEMENT"];
 
 interface ParsedLine extends LeftLogLine {
 	/** The message after the level, continuation lines joined with newlines. */
@@ -429,9 +434,11 @@ function* logLines(log: string): Generator<ParsedLine> {
  * `statement:` line whose text is one of `openings`, `COMMIT`, `ROLLBACK` or
  * begins with `marker`. On a backend of a {@link DEBUG_PRINT_ENTRIES} case, a
  * `LOG` line holding a parse tree, a rewritten parse tree or a plan is
- * allowed too. Every other line of those backends is flagged. Each backend's
- * `statement:` and `execute` lines, less those that begin with `marker`, must
- * number its recorded messages. Lines of other backends are not read.
+ * allowed too, with the `DETAIL` and `STATEMENT` records that directly follow
+ * it on that backend. Every other line of those backends is flagged. Each
+ * backend's `statement:` and `execute` lines, less those that begin with
+ * `marker`, must number its recorded messages. Lines of other backends are
+ * not read.
  */
 export function checkServerLog(
 	log: string,
@@ -444,6 +451,8 @@ export function checkServerLog(
 	const errors: LeftLogLine[] = [];
 	const seen = new Set<string>();
 	const accepted = new Map<number, string>();
+	/** For a backend whose last record was part of an accepted debug print: the levels its next record may have. */
+	const follows = new Map<number, readonly string[]>();
 	const lines = new Map<number, number>();
 	for (const parsed of logLines(log)) {
 		const store = pids.get(parsed.pid);
@@ -456,6 +465,13 @@ export function checkServerLog(
 		}
 		if (line.level === "ERROR") errors.push(line);
 		if (statement !== undefined && allowed.has(statement)) seen.add(statement);
+		const followers = follows.get(line.pid) ?? [];
+		follows.delete(line.pid);
+		const follower = followers.indexOf(line.level);
+		if (follower !== -1) {
+			follows.set(line.pid, followers.slice(follower + 1));
+			continue;
+		}
 		if (line.app === PG_APPLICATION_NAME) continue;
 		if (
 			statement !== undefined &&
@@ -470,6 +486,7 @@ export function checkServerLog(
 			DEBUG_PRINT_MESSAGES.some(prefix => message.startsWith(prefix))
 		) {
 			accepted.set(line.pid, store.entry);
+			follows.set(line.pid, DEBUG_PRINT_FOLLOWERS);
 			continue;
 		}
 		flagged.push(line);
