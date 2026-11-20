@@ -255,6 +255,10 @@ impl ExtProc for CountedExt {
 	fn cont(&mut self) -> io::Result<()> {
 		self.ext.cont()
 	}
+
+	fn release(&mut self) {
+		self.ext.release();
+	}
 }
 
 impl Drop for CountedExt {

@@ -692,11 +692,26 @@ pub fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 		.frames
 		.iter()
 		.any(|f| matches!(f.kind, FrameKind::Function { .. }));
+	release_externals(vp);
 	exit_shell(k, vp, cx, 1);
 	vp.blocked = None;
 	vp.stopped = false;
 	if in_function {
 		spend_exit_trap(vp);
+	}
+}
+
+/// Let the externals `vp`'s frames wait for outlive it: the shell's own end
+/// after a signal it caught leaves its foreground command running, as bash's
+/// `termsig_handler` and zsh's `zexit` do ([`crate::bash::ExtProc::release`]).
+/// Every other end of a vproc (cancel, a host's stop) still ends them.
+fn release_externals(vp: &mut Vproc) {
+	for frame in &mut vp.frames {
+		if let Some(sc) = frame.scratch.as_mut()
+			&& let super::proc::Live::Ext(ext) = &mut sc.live
+		{
+			ext.release();
+		}
 	}
 }
 
@@ -5017,6 +5032,7 @@ pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc
 /// is set): its frames go, the EXIT trap runs with `$?` as it was, and when
 /// the trap ends the vproc exits with `status` (128 + the signal's number).
 pub fn bash_termsig(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	release_externals(vp);
 	unwind(&mut k.root, cx.store, vp, 0);
 	vp.blocked = None;
 	vp.stopped = false;

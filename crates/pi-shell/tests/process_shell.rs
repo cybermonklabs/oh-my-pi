@@ -1154,6 +1154,71 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	]);
 }
 
+/// A signal the shell catches ends it (bash's EXIT trap, zsh's `HUP`
+/// handler) while it waits for a foreground command: the command outlives
+/// the shell, as bash's `termsig_handler` and zsh's `zexit` leave it. The
+/// command makes `$F`, then prints `child-done` a second later, which the
+/// run reads to the end of its output. One the shell does not catch ends it
+/// at its default action, and the command goes on too.
+#[test]
+fn a_caught_signal_that_ends_the_shell_leaves_its_foreground_command_running() {
+	let child =
+		"/bin/sh -c 'trap \"echo child-int\" INT; : > \"$F\"; /bin/sleep 1; echo child-done'";
+	let case = |shell, script: String, sig, stdout, end| SentCase {
+		shell,
+		script,
+		sig,
+		group: false,
+		stdout,
+		end,
+	};
+	run_sent(vec![
+		case(
+			"bash",
+			format!("trap 'echo x' EXIT; {child}; echo after"),
+			libc::SIGTERM,
+			b"x\nchild-done\n",
+			Signal(libc::SIGTERM),
+		),
+		case(
+			"bash",
+			format!("set -m; trap 'echo x' EXIT; {child}; echo after"),
+			libc::SIGINT,
+			b"x\nchild-done\n",
+			Signal(libc::SIGINT),
+		),
+		case(
+			"bash",
+			format!("{child}; echo after"),
+			libc::SIGTERM,
+			b"child-done\n",
+			Signal(libc::SIGTERM),
+		),
+		case(
+			"zsh",
+			format!("trap 'print x' EXIT; {child}; print after"),
+			libc::SIGHUP,
+			b"x\nchild-done\n",
+			Exit(1),
+		),
+		case(
+			"zsh",
+			format!("TRAPEXIT() {{ print x }}; {child}; print after"),
+			libc::SIGHUP,
+			b"x\nchild-done\n",
+			Exit(1),
+		),
+		case("zsh", format!("{child}; print after"), libc::SIGHUP, b"child-done\n", Exit(1)),
+		case(
+			"zsh",
+			format!("trap 'print x' EXIT; {child}; print after"),
+			libc::SIGTERM,
+			b"child-done\n",
+			Signal(libc::SIGTERM),
+		),
+	]);
+}
+
 /// An interactive shell's `HUP` from outside, with an EXIT trap that
 /// writes `$F`: bash runs the trap, then dies of the signal (its
 /// `terminating_signals` are caught interactive or not); zsh's handler

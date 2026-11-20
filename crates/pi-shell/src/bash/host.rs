@@ -640,6 +640,14 @@ pub trait ExtProc: Send {
 	fn stop(&mut self) -> io::Result<()>;
 	/// Continue after [`ExtProc::stop`].
 	fn cont(&mut self) -> io::Result<()>;
+	/// Let the process outlive this handle: dropping it then leaves the
+	/// process running, as a [`crate::bash::Lineage::detached`] one is,
+	/// where a drop otherwise ends it (`TERM`, then `KILL`). The shell's own
+	/// end after bash's EXIT trap or zsh's `HUP` handler leaves its
+	/// foreground command running, as bash and zsh do. A host keeps it among
+	/// the processes a sweep of the shell's leftovers reaches. The default
+	/// does nothing (a host whose processes end with the handle).
+	fn release(&mut self) {}
 }
 
 /// Opens a [`PipeMirror`] per pipeline pipe ([`Host::pipe_tap`]).

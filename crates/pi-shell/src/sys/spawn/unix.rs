@@ -1663,6 +1663,12 @@ impl ExtProc for UnixProc {
 	fn cont(&mut self) -> io::Result<()> {
 		self.scope.signal(Signal::Cont)
 	}
+
+	/// Drop then releases it as a detached one ([`Self::detached`]); its
+	/// scope stays recorded, so [`kill_leftovers`] still reaches it.
+	fn release(&mut self) {
+		self.detached = true;
+	}
 }
 
 impl Drop for UnixProc {

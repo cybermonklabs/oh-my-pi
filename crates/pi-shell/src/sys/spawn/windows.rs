@@ -1174,6 +1174,11 @@ impl ExtProc for WinProc {
 		let job = &self.inner.job;
 		job.pause.lock().resume(&Ops(job))
 	}
+
+	/// Drop then leaves the job alone, as a detached one's ([`Self::detached`]).
+	fn release(&mut self) {
+		self.detached = true;
+	}
 }
 
 impl Drop for WinProc {
