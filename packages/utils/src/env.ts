@@ -142,21 +142,23 @@ const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
 
 /**
- * `name` as omp was started with it, before omp applied its own `.env` files (undefined when
- * it was not set). Where the platform keeps no copy of the launch environment (procfs) and
- * Bun loaded none of its own, the value now.
- */
-export function launchEnvValue(name: string): string | undefined {
-	return launchEnvValues ? launchEnvValues.get(name) : Bun.env[name];
-}
-
-/**
- * `PI_NATIVES_DIR` as omp was started with it. The commands the agent runs get this value,
+ * `PI_NATIVES_DIR` as omp was started with it, before omp applied its own `.env` files
+ * (undefined when it was not set; where the platform keeps no copy of the launch environment
+ * and Bun loaded none of its own, the value now). The commands the agent runs get this value,
  * never the directory omp resolved, so a command, and an omp it starts with its own `HOME`,
  * resolves the natives directory for itself. omp's children that are omp take the resolved
  * directory from a handoff instead (`NATIVES_DIR_HANDOFF_ENV_KEY`), which commands never get.
  */
-const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
+const nativesDirAtLaunch = launchEnvValues ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
+
+/**
+ * Puts `PI_NATIVES_DIR` in `env` as omp was started with it, or takes it out when omp was
+ * started without it: what a command the agent runs, and an omp worker's own programs, get.
+ */
+export function setLaunchNativesDir(env: Record<string, string | undefined>): void {
+	if (nativesDirAtLaunch === undefined) delete env.PI_NATIVES_DIR;
+	else env.PI_NATIVES_DIR = nativesDirAtLaunch;
+}
 
 /**
  * Whether `name` is `PI_NATIVES_DIR` or the natives module's handoff
@@ -194,11 +196,8 @@ function filterChildShellEnvInternal(
 ): Record<string, string> {
 	const runtimeLaunchEnvValues = env === Bun.env || env === process.env ? launchEnvValues : undefined;
 	const result = filterProcessEnv(env);
-	if (env === Bun.env || env === process.env) {
-		// Before the dotenv merge below, which still removes a value the project's `.env` set.
-		if (nativesDirAtLaunch === undefined) delete result.PI_NATIVES_DIR;
-		else result.PI_NATIVES_DIR = nativesDirAtLaunch;
-	}
+	// Before the dotenv merge below, which still removes a value the project's `.env` set.
+	if (env === Bun.env || env === process.env) setLaunchNativesDir(result);
 	// omp's own handoff to a child that is omp; a command is no such child. In a process started
 	// with one (a worker, the broker, a daemon), empty, not absent: the native shell starts from
 	// the process's own C environment, where it remains, and this value replaces it there (an

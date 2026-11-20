@@ -15,7 +15,7 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import { NATIVES_DIR_HANDOFF_ENV_KEY, nativesDirHandoff, nativesDirHandoffDir } from "@oh-my-pi/pi-natives/natives-dir";
-import { filterChildShellEnv, launchEnvValue, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { filterChildShellEnv, setLaunchNativesDir, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
 import type { Subprocess } from "bun";
 
 /**
@@ -195,13 +195,13 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
 }
 
 /**
- * Hand this process's natives directory to `env`, the whole environment of a child that is
- * omp and that this process starts itself. The handoff names this process as the child's
- * parent and records the child's values of the directory rule's inputs, so a program the
- * child starts, with the same environment or its own, does not take it.
+ * Hand this process's natives directory, or `dir`, to `env`, the whole environment of a child
+ * that is omp and that this process starts itself. The handoff names this process as the
+ * child's parent and records the child's values of the directory rule's inputs, so a program
+ * the child starts, with the same environment or its own, does not take it.
  */
-function withNativesDirHandoff(env: Record<string, string>): Record<string, string> {
-	env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid });
+function withNativesDirHandoff(env: Record<string, string>, dir?: string): Record<string, string> {
+	env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid, dir });
 	return env;
 }
 
@@ -226,9 +226,7 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	// Inherited repo-location overrides must not reach a worker or the PTY
 	// daemons it hosts (issue #11082); an explicit overlay still wins below.
 	stripGitRepoLocationEnv(merged);
-	const nativesDirAtLaunch = launchEnvValue("PI_NATIVES_DIR");
-	if (nativesDirAtLaunch === undefined) delete merged.PI_NATIVES_DIR;
-	else merged.PI_NATIVES_DIR = nativesDirAtLaunch;
+	setLaunchNativesDir(merged);
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
@@ -253,7 +251,7 @@ export function brokerEnvFromParent(overlay: Record<string, string>): Record<str
  * own environment ({@link managedDaemonEnv}).
  */
 export function ompDaemonSpecEnv(env: Record<string, string>): Record<string, string> {
-	return { ...env, [NATIVES_DIR_HANDOFF_ENV_KEY]: nativesDirHandoff(env, { parent: process.pid }) };
+	return withNativesDirHandoff({ ...env });
 }
 
 /**
@@ -269,8 +267,7 @@ export function ompDaemonSpecEnv(env: Record<string, string>): Record<string, st
 export function managedDaemonEnv(specEnv: Record<string, string>): Record<string, string> {
 	const env = Object.assign(filterChildShellEnv($env), specEnv);
 	const handedOver = nativesDirHandoffDir(specEnv[NATIVES_DIR_HANDOFF_ENV_KEY]);
-	if (handedOver) env[NATIVES_DIR_HANDOFF_ENV_KEY] = nativesDirHandoff(env, { parent: process.pid, dir: handedOver });
-	return env;
+	return handedOver ? withNativesDirHandoff(env, handedOver) : env;
 }
 
 /**
