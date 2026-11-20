@@ -19,10 +19,11 @@
  *   value shorter than a positive default for the login ends none, and with a
  *   longer one the default still ends it. Both run only when
  *   `OMP_TEST_SQL_POSTGRES_URL` (the store's database, on PostgreSQL directly)
- *   and `OMP_TEST_SQL_POSTGRES_ADMIN_URL` (the same database, as a login that
- *   may alter the defaults of the store's login there: that login itself or a
- *   superuser) are set. The file then reads the store's server once, when it
- *   loads, since Bun skips a case only on what it knows then. Both are skipped,
+ *   is set. `OMP_TEST_SQL_POSTGRES_ADMIN_URL`, when set, is the same database
+ *   as a login that may alter the defaults of the store's login there (a
+ *   superuser); without it the store's own login alters its own. The file
+ *   then reads the store's server once, when it loads, since Bun skips a case
+ *   only on what it knows then. Both are skipped,
  *   and the file logs why once, when the store's URL does not reach PostgreSQL
  *   directly (through a pooler such as PgBouncer a new connection can get a
  *   server connection that started with another default, and the store's
@@ -1728,20 +1729,19 @@ async function readStoreServer(url: string): Promise<StoreServer> {
 }
 
 /**
- * The store's server, read once when the file loads and only when both URLs
- * are set. A read no server answers keeps its error, which fails the two
+ * The store's server, read once when the file loads and only when the store's
+ * URL is set. A read no server answers keeps its error, which fails the two
  * server cases alone: the file still loads and every other case runs.
  */
-const storeServer: { readonly read: StoreServer } | { readonly failed: unknown } | undefined =
-	STORE_URL && ADMIN_URL
-		? await readStoreServer(STORE_URL).then(
-				read => ({ read }),
-				(failed: unknown) => ({ failed }),
-			)
-		: undefined;
+const storeServer: { readonly read: StoreServer } | { readonly failed: unknown } | undefined = STORE_URL
+	? await readStoreServer(STORE_URL).then(
+			read => ({ read }),
+			(failed: unknown) => ({ failed }),
+		)
+	: undefined;
 const unfit = storeServer && "read" in storeServer ? storeServer.read.unfit : undefined;
 if (unfit) console.log(`transaction_timeout cases skipped: ${unfit}`);
-/** Neither URL or one of them unset, or a server the cases cannot use. */
+/** The store's URL unset, or a server the cases cannot use. */
 const skipServerCases = !storeServer || unfit !== undefined;
 
 /** What a server case runs on: a store of {@link LeaseDb}'s tables that wrote {@link FILE}. */
@@ -1767,12 +1767,13 @@ async function withLeftTimeout(
 	left: string,
 	check: (setup: LeftTimeout) => Promise<void>,
 ): Promise<void> {
-	if (!storeServer) throw new Error("set OMP_TEST_SQL_POSTGRES_URL and OMP_TEST_SQL_POSTGRES_ADMIN_URL");
+	if (!storeServer) throw new Error("set OMP_TEST_SQL_POSTGRES_URL");
 	if ("failed" in storeServer) throw storeServer.failed;
 	const { target } = storeServer.read;
 	const storeUrl = STORE_URL ?? "";
 	await using db = await openLeaseDb("postgres", storeUrl);
-	const admin = new SQL(ADMIN_URL ?? "", { max: 2 });
+	// The admin URL's login, else the store's own: a login may alter its own defaults.
+	const admin = new SQL(ADMIN_URL ?? storeUrl, { max: 2 });
 	let client: SQL | undefined;
 	let storage: SqlSessionStorage | undefined;
 	const held: Array<Promise<void>> = [];
