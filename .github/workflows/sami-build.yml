@@ -155,6 +155,20 @@ jobs:
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           list=.github/sami/rust-test-known-failures.txt
           bep="$RUNNER_TEMP/rust-test-bep.json"
+          bep_root="$RUNNER_TEMP/rust-test-bep-root.json"
+          # Tests that need root (to chown a file to another uid) are named in
+          # .github/sami/rust-test-root-targets.txt; each target is tagged
+          # no-sandbox, since linux-sandbox maps one uid. They run in a second
+          # invocation on the same server and cache, the test binary under
+          # `sudo -E` (--run_under; GitHub's runner has passwordless sudo),
+          # and every other target runs as the runner's user.
+          roots=()
+          while read -r target _; do
+            case "$target" in "" | "#"*) continue ;; esac
+            roots+=("$target")
+          done <.github/sami/rust-test-root-targets.txt
+          not_roots=()
+          for target in "${roots[@]}"; do not_roots+=("-$target"); done
           rc=0
           # --keep_going: the ci config stops at the first target that fails to
           # build, and so skipped 7 of the 17 test targets in run 44694233578;
@@ -165,28 +179,45 @@ jobs:
           # binary that exits 0 before its tests end shows, whatever a child
           # process printed. rules_rust's doctest runner passes the arguments
           # on to the doctest binaries and writes libtest's text summary itself.
-          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" //crates/... || rc=$?
+          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" -- //crates/... "${not_roots[@]}" || rc=$?
+          # --show-output puts each passed test's output in its record, so a
+          # root test that printed `not run:` (its precondition, root, broke)
+          # can be failed below.
+          rc_root=0
+          if [ "${#roots[@]}" -gt 0 ]; then
+            bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --run_under="sudo -E" --test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output --build_event_json_file="$bep_root" -- "${roots[@]}" || rc_root=$?
+          fi
           # Bazel exits 0 when every test passed, 3 when every target built and
           # a test failed, and 1 when a target failed to build (the others
           # still built and ran). Any other code is Bazel itself failing, and
           # its event log cannot be trusted.
-          case "$rc" in
-            0 | 1 | 3) ;;
-            *)
-              echo "::error title=Rust tests::bazel test exited $rc, which is neither a test nor a build failure"
-              exit "$rc"
-              ;;
-          esac
+          for code in "$rc" "$rc_root"; do
+            case "$code" in
+              0 | 1 | 3) ;;
+              *)
+                echo "::error title=Rust tests::bazel test exited $code, which is neither a test nor a build failure"
+                exit "$code"
+                ;;
+            esac
+          done
+          if [ "$rc" = 1 ] || [ "$rc_root" = 1 ]; then
+            rc=1
+          elif [ "$rc_root" = 3 ]; then
+            rc=3
+          fi
           # A list line is `<test target> <test name>  <reason>`.
           known="$RUNNER_TEMP/rust-test-known.txt"
           failed="$RUNNER_TEMP/rust-test-failed.txt"
           rows="$RUNNER_TEMP/rust-test-logs.tsv"
           awk '!/^[[:space:]]*(#|$)/ { print $1, $2 }' "$list" | LC_ALL=C sort -u >"$known"
-          # Bazel's build event log names every test target with its rule, its
-          # status and its test.log files: one row per log, target, rule,
-          # status, which list Bazel put the log in (passed or failed) and its
-          # path. The runner's jq is 1.6, which refuses a keyword such as
-          # `label` as a variable name (run 44696018007).
+          # Bazel's build event logs (the root invocation's too) name every
+          # test target with its rule, its status and its test.log files: one
+          # row per log, target, rule, status, which list Bazel put the log in
+          # (passed or failed) and its path. The runner's jq is 1.6, which
+          # refuses a keyword such as `label` as a variable name (run
+          # 44696018007).
+          beps=("$bep")
+          if [ "${#roots[@]}" -gt 0 ]; then beps+=("$bep_root"); fi
           jq -rs '
             (map(select(.id.targetConfigured))
              | map({key: .id.targetConfigured.label, value: (.configured.targetKind // "unknown")})
@@ -200,7 +231,7 @@ jobs:
                + [(.testSummary.failed // [])[] | ["failed", .uri]]) as $logs
             | if ($logs | length) == 0 then [$target, $rule, $status, "none", ""]
               else ($logs[] | [$target, $rule, $status, .[0], (.[1] | sub("^file://"; ""))]) end
-            | @tsv' "$bep" >"$rows"
+            | @tsv' "${beps[@]}" >"$rows"
           if [ ! -s "$rows" ]; then
             echo "::error title=Rust tests::the build event log names no test target, so nothing shows that any test ran"
             exit 1
@@ -333,6 +364,15 @@ jobs:
                   bad=1
                   continue
                 fi
+                # A root target runs as root, so a test in it that printed
+                # `not run:` skipped itself on a broken precondition.
+                for target in "${roots[@]}"; do
+                  [ "$target" = "$label" ] || continue
+                  while read -r skipped; do
+                    echo "::error title=Rust tests::$label $skipped printed 'not run:', though it runs as root"
+                    bad=1
+                  done < <(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and ((.stdout // "") | test("not run:"))) | .name' "$log")
+                done
                 if [ "$kind" = passed ]; then
                   if [ "$ended" != ok ]; then
                     echo "::error title=Rust tests::$label is $status, but libtest's suite ended $ended"
