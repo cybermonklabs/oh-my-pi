@@ -930,6 +930,41 @@ describe("the transaction runner's state table", () => {
 		expect(error).toMatchObject({ errno: "42501", message: serverMessage("42501", tried.at(-1)?.number ?? 0) });
 	});
 
+	it("12, for a blob land: on repairless connections alone, one land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more, and rejects with the fourth attempt's error as its cause", async () => {
+		const repairs = watchRepairs();
+		const { fake, storage, from } = await openOnFake();
+		const attempts = PG_REPAIR_RETRIES + 1;
+		// From now on every opening is refused, as on connections left with `cloudsql_session_read_only = locked`.
+		fake.server.refuse.push({ match: /^BEGIN /, sqlstate: "25006" });
+		// `store()` starts the blob's land at once; the case reads that land's outcome.
+		const land = vi.spyOn(storage.blobTier as unknown as { land(hashes?: Iterable<string>): Promise<void> }, "land");
+		storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
+		expect(land).toHaveBeenCalledTimes(1);
+		const [landing] = land.mock.results;
+		const error = await rejection(landing?.value as Promise<void>);
+		const tried = fake.connections.slice(from);
+		const closes = tried.reduce((sum, connection) => sum + connection.closes, 0);
+		expect({ reserved: tried.length, closes }).toEqual({ reserved: attempts, closes: attempts });
+		expect(tried.map(ends)).toEqual(tried.map(() => ({ releases: 0, closes: 1 })));
+		expect(tried.map(sqls)).toEqual(tried.map(() => [WRITE_OPENING]));
+		expect(repairs()).toEqual(
+			tried.map((connection, index) => ({
+				operation: "blob.insert",
+				sqlstate: "25006",
+				message: serverMessage("25006", connection.number),
+				attempt: index + 1,
+			})),
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toStartWith(
+			`SqlSessionStorage: session image ${IMAGE_HASH} did not reach omp_session_files_blobs, `,
+		);
+		expect((error as Error).cause).toMatchObject({
+			errno: "25006",
+			message: serverMessage("25006", tried.at(-1)?.number ?? 0),
+		});
+	});
+
 	it("13. any repairless, three repairless attempts then a clean one: three close() calls, the operation resolves on the fourth reservation", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
