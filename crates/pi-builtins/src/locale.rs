@@ -7,7 +7,7 @@
 //! change the C locale of the whole host process.
 //!
 //! Used by `sort` and `comm` (collation), `sort` (numerics), `uniq`, `date`,
-//! `du`, `df`, `env`, `fold`, and `grep`.
+//! `du`, `df`, `env`, `fold`, `grep`, and `sed`.
 
 #![allow(dead_code, reason = "each utility uses a subset")]
 
@@ -45,9 +45,12 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 /// Whether the shell's `LC_CTYPE` is a UTF-8 locale the system can load: the
 /// multibyte character rules GNU utilities switch on after `setlocale`.
 pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
-	let Some(name) = shell_locale(host, "LC_CTYPE") else {
-		return false;
-	};
+	shell_locale(host, "LC_CTYPE").is_some_and(ctype_name_is_utf8)
+}
+
+/// Whether the locale `name`, an `LC_CTYPE` value, is a UTF-8 locale the
+/// system can load; see [`ctype_is_utf8`].
+pub(crate) fn ctype_name_is_utf8(name: &str) -> bool {
 	#[cfg(unix)]
 	if !locale_loadable(name, libc::LC_CTYPE_MASK) {
 		return false;

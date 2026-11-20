@@ -436,41 +436,74 @@ describe("builtin sed: a `w` file that cannot be written", () => {
 		[`yes ${"a".repeat(104)} | head -n 1000 | sed -n 'w /dev/full' 2>&1`, full("104 items"), 4],
 		["yes abc | head -n 1025 | sed -n 'w /dev/full' 2>&1", full("3 items"), 4],
 		["head -c 5000 /dev/zero | tr '\\0' a | sed -n 'w /dev/full' 2>&1", full("5000 items"), 4],
+		// Regressed: "couldn't write 4 items", each command buffering the file apart.
+		["seq 100000 | sed -n -e 'w /dev/full' -e 'w /dev/full' 2>&1", full("3 items"), 4],
+		// Regressed: "couldn't write 1 item to /dev/stdout", sed's output flushed at each line.
+		[
+			"seq 100000 | sed -n 'w /dev/stdout' 2>&1 >/dev/full",
+			"sed: couldn't write 4 items to stdout: No space left on device\n",
+			4,
+		],
+	]);
+});
+
+describe("builtin sed: one `w` file for each name", () => {
+	cases([
+		// Regressed: the second `w` opened the file again, and each line was written once.
+		["seq 3 | sed -n -e 'w o' -e 'w o'; cat o", "1\n1\n2\n2\n3\n3\n", 0],
+	]);
+});
+
+describe("builtin sed: `y` reads its strings by the locale", () => {
+	// GNU sed 4.9 reads the strings, and the line, a character at a time in
+	// C.UTF-8, a line that is not UTF-8 too where it can be, and a byte at a
+	// time in the C locale.
+	cases([
+		// Regressed: refused as strings of different lengths.
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C sed 'y/\xc3\xa9/eE/' 2>&1`, "cafeE\n", 0],
+		// Regressed: `é` was one character, where the C locale reads two bytes.
+		[
+			String.raw`printf 'caf\303\251\n' | LC_ALL=C sed $'y/\303\251/e/' 2>&1`,
+			error(char(7), "strings for `y' command are different lengths"),
+			1,
+		],
+		// Regressed: the line was read a byte at a time, which `é` is no member of.
+		[String.raw`printf 'caf\303\251\377\n' | LC_ALL=C.UTF-8 sed $'y/\303\251/e/' 2>&1`, "cafe\xff\n", 0],
+		[String.raw`printf 'caf\303\251\377\n' | LC_ALL=C.UTF-8 sed 'y/\xc3\xa9/e/' 2>&1`, "cafe\xff\n", 0],
 	]);
 });
 
 describe("builtin sed: the escapes of `y`", () => {
 	// GNU sed 4.9 reads `\a`, `\f`, `\n`, `\r`, `\t`, `\v`, `\cX`, `\dNNN`,
 	// `\oNNN` and `\xHH` in a string of `y`, and any other `\X` as the `X`;
-	// the bytes the escapes write are then read as characters. The base
-	// answered none of these as GNU, and the head answered as the base but
-	// for its own messages.
+	// the bytes the escapes write are then read as characters in C.UTF-8,
+	// and each as one in the C locale.
 	const lengths = (n: number) => error(char(n), "strings for `y' command are different lengths");
 	cases([
-		// Was `xbc`: `\u0061` was `a`, which GNU reads as `u0061`.
+		// Regressed: `\u0061` was read as `a`, which GNU reads as `u0061`.
 		["echo abc | sed 'y/\\u0061/x/' 2>&1", lengths(11), 1],
 		["echo abc | sed 'y/a/\\u0078/' 2>&1", lengths(11), 1],
-		// Was "strings ... are different lengths": an escape GNU does not define kept its backslash.
+		// Regressed: an escape GNU does not define kept its backslash, two characters.
 		["echo aqc | sed 'y/\\q/x/' 2>&1", "axc\n", 0],
 		["echo 'a&c' | sed 'y/\\&/x/' 2>&1", "axc\n", 0],
-		// Was `xbz`: `\b` was a backspace.
+		// Regressed: `\b` was a backspace.
 		["echo abc | sed 'y/a\\bc/xyz/' 2>&1", "xyz\n", 0],
-		// Was "unterminated `y' command" for `\c\\`, `\c/` and `\c` before the delimiter.
+		// Regressed: "unterminated `y' command" for `\c\\`, `\c/` and `\c` before the delimiter.
 		[String.raw`printf 'a\034c\n' | sed 'y/\c\\/x/' 2>&1`, "axc\n", 0],
 		["echo abo | sed 'y/\\c\\//x/' 2>&1", "abx\n", 0],
 		["echo abc | sed 'y/\\c//' 2>&1", "abc\n", 0],
-		// Was "strings ... are different lengths".
+		// Regressed: refused as strings of different lengths.
 		["echo abc | sed 'y/a/\\c\\q/' 2>&1", error(char(9), "recursive escaping after \\c not allowed"), 1],
-		// `\d300` was the character U+012C; GNU writes the byte 300 mod 256, a comma.
+		// Regressed: `\d300` was the character U+012C; GNU writes the byte 300 mod 256, a comma.
 		["printf 'a,c\\n' | sed 'y/\\d300/x/' 2>&1", "axc\n", 0],
 		["echo abc | sed 'y/a/\\d300/' 2>&1", ",bc\n", 0],
-		// Was "strings ... are different lengths": the two bytes of `é` were two characters.
-		[String.raw`printf 'caf\303\251\n' | sed 'y/\xc3\xa9/e/' 2>&1`, "cafe\n", 0],
-		[String.raw`printf 'cafe\n' | sed 'y/e/\xc3\xa9/' 2>&1`, "caf\xc3\xa9\n", 0],
-		// The byte 0xE9 was the character `é`, which it is not in a line that is UTF-8.
-		[String.raw`printf 'caf\303\251\n' | sed 'y/\xe9/e/' 2>&1`, "caf\xc3\xa9\n", 0],
-		[String.raw`printf 'cafe\n' | sed 'y/e/\xe9/' 2>&1`, "caf\xe9\n", 0],
-		// Was "unterminated `y' command"; an escaped newline is a newline.
+		// Regressed: the two bytes of `é` were two characters, refused as strings of different lengths.
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 sed 'y/\xc3\xa9/e/' 2>&1`, "cafe\n", 0],
+		[String.raw`printf 'cafe\n' | LC_ALL=C.UTF-8 sed 'y/e/\xc3\xa9/' 2>&1`, "caf\xc3\xa9\n", 0],
+		// Regressed: the byte 0xE9 was the character `é`, which it is not in a line that is UTF-8.
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 sed 'y/\xe9/e/' 2>&1`, "caf\xc3\xa9\n", 0],
+		[String.raw`printf 'cafe\n' | LC_ALL=C.UTF-8 sed 'y/e/\xe9/' 2>&1`, "caf\xe9\n", 0],
+		// Regressed: "unterminated `y' command"; an escaped newline is a newline.
 		[String.raw`printf 'a\nb\n' | sed $'N;y/\\\n/x/' 2>&1`, "axb\n", 0],
 	]);
 });

@@ -140,12 +140,12 @@ describe("builtin grep: a pattern that is UTF-8, on a line that is not UTF-8, in
 	// The same as for a pattern with a pattern byte: GNU grep 3.11 reads a
 	// bracket member outside ASCII, and `.`, as a whole character.
 	cases([
-		// Regressed (the base counted 0): `[é]` was written as its two bytes, each a member, so 0xA9 matched.
+		// Regressed: `[é]` was written as its two bytes, each a member, so 0xA9 matched.
 		// `é` is written `\303\251` here: bun writes a raw template's `é` as the text `\u00E9`.
 		[String.raw`printf 'x\251\n' | LC_ALL=C.UTF-8 grep -c $'[\303\251]'`, "0\n", 1],
 		[String.raw`printf '\377\303\251\n' | LC_ALL=C.UTF-8 grep -o $'[\303\251]'`, "\xc3\xa9\n", 0],
 		[String.raw`printf '\303\251\377x\n' | LC_ALL=C.UTF-8 grep -o $'[^\303\251]'`, "x\n", 0],
-		// Regressed (the base answered as GNU): `.` matched the byte 0xFF and a lone 0xC3, and not `é`.
+		// Regressed: `.` matched the byte 0xFF and a lone 0xC3, and not `é`.
 		[String.raw`printf 'x\377y\n' | LC_ALL=C.UTF-8 grep -c 'x.y'`, "0\n", 1],
 		[String.raw`printf 'x\303(\n' | LC_ALL=C.UTF-8 grep -o 'x.('`, "", 1],
 		[String.raw`printf 'x\303\251y\377\n' | LC_ALL=C.UTF-8 grep -o 'x.y'`, "x\xc3\xa9y\n", 0],
@@ -157,8 +157,8 @@ describe("builtin grep: without case, on a line that is not UTF-8, in the C.UTF-
 	// the lower-case letters with no upper case of their own (`ς`, `ſ`,
 	// `ı`) for their upper case's other forms.
 	cases([
-		// Regressed (the base counted 1, but 0 for `ı`): each counted 0, the other case dropped where Rust's
-		// case mapping is not one character or is ASCII.
+		// Regressed: each counted 0, the other case dropped where Rust's case mapping is not one
+		// character or is ASCII.
 		[String.raw`printf '\317\202\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\316\243\351]'`, "1\n", 0],
 		[String.raw`printf '\317\203\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\317\202\351]'`, "1\n", 0],
 		[String.raw`printf '\316\274\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\302\265\351]'`, "1\n", 0],
@@ -166,8 +166,47 @@ describe("builtin grep: without case, on a line that is not UTF-8, in the C.UTF-
 		[String.raw`printf 'I\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\304\261\351]'`, "1\n", 0],
 		[String.raw`printf '\305\277\377\n' | LC_ALL=C.UTF-8 grep -ic $'[s\351]'`, "1\n", 0],
 		[String.raw`printf '\341\276\210\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\341\276\200\351]'`, "1\n", 0],
-		// Regressed (the base counted 0): a list that negates matched `ς`, the other case of `Σ`.
+		// Regressed: a list that negates matched `ς`, the other case of `Σ`.
 		[String.raw`printf '\317\202\377\n' | LC_ALL=C.UTF-8 grep -ic $'[^\316\243\351]'`, "0\n", 1],
+	]);
+});
+
+describe("builtin grep: a pattern that is UTF-8, on a line that is not UTF-8, without case or at word edges", () => {
+	// GNU grep 3.11 reads the characters of such a line in the C.UTF-8
+	// locale: their other case, and whether they are word characters.
+	cases([
+		// Regressed: a character outside ASCII outside a bracket expression matched its own case alone.
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic $'\303\251'`, "1\n", 0],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -c -i -e $'\303\251' -e zz`, "1\n", 0],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -iFc $'\303\251'`, "1\n", 0],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -io $'\303\251'`, "\xc3\x89\n", 0],
+		[String.raw`printf '\317\203\377\n' | LC_ALL=C.UTF-8 grep -ic $'\316\243'`, "1\n", 0],
+		[String.raw`printf '\305\277\377\n' | LC_ALL=C.UTF-8 grep -ic s`, "1\n", 0],
+		[String.raw`printf 'S\377\n' | LC_ALL=C.UTF-8 grep -ic $'\305\277'`, "1\n", 0],
+		// Regressed: `é` was no word character.
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c '^\w'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c '^\W'`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -cw a`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -c 'a\b'`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
+		[String.raw`printf '\303\251a\377\n' | LC_ALL=C.UTF-8 grep -c '\<a'`, "0\n", 1],
+	]);
+});
+
+describe("builtin grep: without case, a range whose ends are pattern bytes, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 matches a character whose upper case is in the range:
+	// `[\300-\301]` matches `á`, and `[\340-\341]` neither `á` nor `Á`.
+	cases([
+		// Regressed: the range's characters matched in either case.
+		[String.raw`printf '\303\201\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\340-\341]'`, "0\n", 1],
+		[String.raw`printf '\303\241\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\340-\341]'`, "0\n", 1],
+		[String.raw`printf '\303\201\n' | LC_ALL=C.UTF-8 grep -ic $'[\340-\341]'`, "0\n", 1],
+		[String.raw`printf '\303\241\n' | LC_ALL=C.UTF-8 grep -ic $'[\340-\341]'`, "0\n", 1],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\341-\351]'`, "0\n", 1],
+		[String.raw`printf '\303\211\n' | LC_ALL=C.UTF-8 grep -ic $'[\341-\351]'`, "0\n", 1],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\341-\351]'`, "0\n", 1],
+		[String.raw`printf '\303\241\n' | LC_ALL=C.UTF-8 grep -ic $'[^\340-\341]'`, "1\n", 0],
+		[String.raw`printf '\303\241\n' | LC_ALL=C.UTF-8 grep -ic $'[a\340-\341]'`, "0\n", 1],
 	]);
 });
 

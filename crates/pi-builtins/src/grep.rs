@@ -582,7 +582,7 @@ impl Alternatives {
 	/// the first call.
 	fn engines(&self, bytes: bool) -> Option<&[Engine]> {
 		let (engines, spec) = if bytes {
-			(&self.byte_engines, MatcherSpec { bytes: true, ..self.spec })
+			(&self.byte_engines, byte_lines_spec(self.spec))
 		} else {
 			(&self.engines, self.spec)
 		};
@@ -1133,9 +1133,9 @@ struct MatcherSpec {
 	/// expression is no member, and the engine for a line that is not UTF-8
 	/// matches a bracket member outside ASCII, and `.`, as a whole character
 	/// (see [`bre::translate_raw`]); else it is GNU's C locale, where every
-	/// byte is a character. Asked only where it decides something: where a
-	/// pattern holds such a byte, or such a line is read by an engine of its
-	/// own ([`reads_bytes_as_text`]).
+	/// byte is a character. Asked up front only where a pattern holds such a
+	/// byte; for any other patterns it is true but for the engine of a line
+	/// that is not UTF-8 ([`byte_lines_spec`]).
 	utf8_locale: bool,
 }
 
@@ -1306,10 +1306,15 @@ fn reads_bytes_as_text(patterns: &[String], spec: MatcherSpec) -> bool {
 }
 
 /// The matcher of a search. A line that is UTF-8 is read by `text`, and one
-/// that is not by an engine that reads each byte as one character, as GNU
-/// grep reads every line in the C locale: `grep -o 'x.('` prints `x\303(`
-/// from a line holding the bytes 0xC3 0x28, which `.` in `text` does not
-/// match. That engine is compiled at the first such line.
+/// that is not, in the C locale, by an engine that reads each byte as one
+/// character, as GNU grep reads every line there: `LC_ALL=C grep -o 'x.('`
+/// prints `x\303(` from a line holding the bytes 0xC3 0x28, which `.` in
+/// `text` does not match. In a UTF-8 locale `text` reads such a line, where
+/// the patterns hold no pattern byte: `printf 'x\251\n' | grep -c '[é]'` is
+/// 0, and `-i` and `\w` read its characters outside ASCII as GNU does; where
+/// they hold one, that engine reads a bracket member outside ASCII, and
+/// `.`, as a whole character (see `bre::translate_raw`). That engine is
+/// compiled at the first such line.
 #[derive(Clone)]
 struct LineMatcher<M> {
 	text:         M,
@@ -1324,8 +1329,16 @@ struct LineMatcher<M> {
 }
 
 /// The engine for a line that is not UTF-8, compiled at its first use;
-/// `None` where the patterns compile only as text.
+/// `None` where `text` reads such a line: in a UTF-8 locale for patterns
+/// that hold no pattern byte, or where the patterns compile only as text.
 type BytesEngine<M> = LazyLock<Option<M>, Box<dyn FnOnce() -> Option<M> + Send>>;
+
+/// The spec of the engine for a line that is not UTF-8 of a search with
+/// `spec`. Only patterns that hold a pattern byte have one in a UTF-8 locale
+/// (see [`LineMatcher`]), so any other's is the C locale's.
+const fn byte_lines_spec(spec: MatcherSpec) -> MatcherSpec {
+	MatcherSpec { bytes: true, utf8_locale: spec.raw_bytes && spec.utf8_locale, ..spec }
+}
 
 /// The size of the first window [`LineMatcher::search`] reads, in bytes.
 const FIRST_WINDOW: usize = 256;
@@ -1333,21 +1346,27 @@ const FIRST_WINDOW: usize = 256;
 /// The matcher of a search for `text`, which `build_matcher` compiled from
 /// `patterns` with `spec` and which `engine` takes out of what it returns.
 /// Where `text` already reads a byte to a character (`spec.bytes`), it reads
-/// every line.
+/// every line. `ctype` is the shell's `LC_CTYPE`, which a search of patterns
+/// that hold no pattern byte asks whether it is UTF-8 at its first line that
+/// is not UTF-8.
 fn line_matcher<M: Send + Sync + 'static>(
 	text: M,
 	patterns: Vec<String>,
 	spec: MatcherSpec,
 	terminator: u8,
 	engine: fn(Engine) -> Option<M>,
+	ctype: Option<String>,
 ) -> LineMatcher<M>
 where
 	M: Matcher,
 {
 	let bytes = (!spec.bytes && !reads_bytes_as_text(&patterns, spec)).then(|| {
-		let spec = MatcherSpec { bytes: true, ..spec };
-		let build: Box<dyn FnOnce() -> Option<M> + Send> =
-			Box::new(move || build_matcher(&patterns, spec).ok().and_then(engine));
+		let build: Box<dyn FnOnce() -> Option<M> + Send> = Box::new(move || {
+			if !spec.raw_bytes && ctype.as_deref().is_some_and(crate::locale::ctype_name_is_utf8) {
+				return None;
+			}
+			build_matcher(&patterns, byte_lines_spec(spec)).ok().and_then(engine)
+		});
 		Arc::new(LazyLock::new(build))
 	});
 	let mut non_matching = ByteSet::empty();
@@ -1371,10 +1390,12 @@ impl<M: Matcher> LineMatcher<M> {
 			.unwrap_or(&self.text)
 	}
 
-	/// Whether `line`, a whole line, is read by the engine for a line that
-	/// is not UTF-8.
+	/// Whether `line`, a whole line, is read by an engine of its own, which
+	/// a line that is not UTF-8 is where the patterns have one for it.
 	fn reads_as_bytes(&self, line: &[u8]) -> bool {
-		self.bytes.is_some() && std::str::from_utf8(line).is_err()
+		self.bytes.as_deref().is_some_and(|bytes| {
+			std::str::from_utf8(line).is_err() && LazyLock::force(bytes).is_some()
+		})
 	}
 
 	/// Where the line holding `at` starts.
@@ -2778,9 +2799,8 @@ impl AsyncUtility for Grep {
 	// locale alike. In the C locale every byte is a character, so where a
 	// pattern holds such a byte every line is read so, as GNU reads it: `.`
 	// and `[^\351]` match one byte of the line `é` there, not its character.
-	// In a UTF-8 locale a line that is not UTF-8 is read a whole character
-	// at a time where it can be. Only where one of these decides something
-	// is the locale asked.
+	// Only such patterns ask the locale here; any other asks it at its first
+	// line that is not UTF-8 (see `LineMatcher`).
 	let mut spec = MatcherSpec {
 		mode:        resolve_match_mode(&matches),
 		ignore_case: resolve_ignore_case(&matches),
@@ -2792,10 +2812,11 @@ impl AsyncUtility for Grep {
 		raw_bytes,
 		utf8_locale: true,
 	};
-	if raw_bytes || !reads_bytes_as_text(&patterns, spec) {
+	if raw_bytes {
 		spec.utf8_locale = crate::locale::ctype_is_utf8(host);
-		spec.bytes = raw_bytes && !spec.utf8_locale;
+		spec.bytes = !spec.utf8_locale;
 	}
+	let ctype = crate::locale::shell_locale(host, "LC_CTYPE").map(str::to_owned);
 	let matcher = match build_matcher(&patterns, spec) {
 		Ok(matcher) => matcher,
 		Err(error) => {
@@ -2857,18 +2878,32 @@ impl AsyncUtility for Grep {
 
 	match matcher {
 		Engine::Rust(text) => {
-			let matcher = line_matcher(text, patterns, spec, terminator, |engine| match engine {
-				Engine::Rust(engine) => Some(engine),
-				Engine::Pcre(_) => None,
-			});
+			let matcher = line_matcher(
+				text,
+				patterns,
+				spec,
+				terminator,
+				|engine| match engine {
+					Engine::Rust(engine) => Some(engine),
+					Engine::Pcre(_) => None,
+				},
+				ctype,
+			);
 			execute_search(host, &cli, &matcher, &files, directory_action, follow_links, &rules, &opts)
 				.await
 		},
 		Engine::Pcre(text) => {
-			let matcher = line_matcher(text, patterns, spec, terminator, |engine| match engine {
-				Engine::Pcre(engine) => Some(engine),
-				Engine::Rust(_) => None,
-			});
+			let matcher = line_matcher(
+				text,
+				patterns,
+				spec,
+				terminator,
+				|engine| match engine {
+					Engine::Pcre(engine) => Some(engine),
+					Engine::Rust(_) => None,
+				},
+				ctype,
+			);
 			execute_search(host, &cli, &matcher, &files, directory_action, follow_links, &rules, &opts)
 				.await
 		},

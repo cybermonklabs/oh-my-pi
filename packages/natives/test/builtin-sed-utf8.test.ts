@@ -52,7 +52,7 @@ describe("builtin sed: a line cut inside a character and joined back is UTF-8 ag
 		// template's `é` as the text `\u00E9`.
 		[String.raw`printf 'caf\303\251 au lait\n' | sed "s/ *//g;y/$(printf '\303\251')/e/"`, "cafeaulait\n", 0],
 		// GNU reads `\u00E9` as `u00E9`: "strings for `y' command are different lengths", exit 1.
-		// Was `cafeaulait`, `\u00E9` read as `é`; in the base "internal error".
+		// Regressed: `\u00E9` was read as `é`, and the line printed as `cafeaulait`.
 		[String.raw`printf 'caf\303\251 au lait\n' | sed 's/ *//g;y/\u00E9/e/'`, "", 1],
 		// `X X X \n`: the fourth empty match is the one after the `a`, and the second, inside the `é`,
 		// is left as it was. In C: `X X X X \n`. Regressed: `XXXX`.
