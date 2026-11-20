@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- When the session database's server refuses the first connection, the start-up refusal now names the SQLSTATE it sent beside the driver's code, for example `(ERR_POSTGRES_SERVER_ERROR 57P03)` for a PostgreSQL server that is starting up and `(ERR_POSTGRES_SERVER_ERROR 28P01)` for a refused password, so a refusal that will pass can be told from one that will not; a MySQL server's refusal names its SQLSTATE the same way. A connection that reached no server reads as before, `(ERR_POSTGRES_CONNECTION_REFUSED)`.
 - A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
