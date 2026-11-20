@@ -1411,15 +1411,40 @@ describe("SQL session store under a session setting another client left on Postg
 						}
 						seen.push(left.pid);
 						expect(left.role).toBe(norights);
-						await opened.storage.updateSessionTitle(opened.file, TITLE);
-						expect(harness.record.closes.map(close => ({ pid: close.pid, errno: close.error?.errno }))).toEqual([
+						const first = harness.record.reservations.length;
+						const warn = vi.spyOn(logger, "warn");
+						let warnings: Array<Record<string, unknown>>;
+						try {
+							await opened.storage.updateSessionTitle(opened.file, TITLE);
+							warnings = repairWarnings(warn.mock.calls);
+						} finally {
+							warn.mockRestore();
+						}
+						const closes = harness.record.closes;
+						expect(closes.map(close => ({ pid: close.pid, errno: close.error?.errno }))).toEqual([
 							{ pid: left.pid, errno: "42501" },
+						]);
+						// The reservations of the title update: one on the left backend, closed and not released; the next on
+						// another backend, released and not closed.
+						const during = harness.record.reservations.slice(first);
+						expect(during.filter(reservation => reservation.pid === left.pid)).toEqual([
+							{ pid: left.pid, releases: 0, closes: 1 },
+						]);
+						const next = during[during.findIndex(reservation => reservation.pid === left.pid) + 1];
+						expect(next?.pid).not.toBe(left.pid);
+						expect(next).toMatchObject({ releases: 1, closes: 0 });
+						expect(warnings).toEqual([
+							{
+								operation: "updateSessionTitle",
+								sqlstate: "42501",
+								message: closes[0]?.error?.message,
+								attempt: 1,
+							},
 						]);
 						await until(() => backendGone(db, left.pid), READ_BOUND_MS, {
 							what: `the end of backend ${left.pid}`,
 							pollMs: POLL_MS,
 						});
-						expect(harness.record.releases.length).toBeGreaterThan(0);
 						expect(await adminTitle(db, tables, opened.file)).toBe(TITLE.title);
 						await settle([opened.storage]);
 					} finally {
@@ -1465,6 +1490,8 @@ describe("SQL session store under a session setting another client left on Postg
 						for (const holder of holders) await holder.connection.unsafe(`${LEFT_MARKER} COMMIT`);
 						await opened.storage.updateSessionTitle(opened.file, TITLE);
 						const closes = harness.record.closes;
+						// The clean connection commits first, so the pool hands a left one first: one close is always met.
+						expect(closes.length).toBeGreaterThanOrEqual(1);
 						expect(closes.length).toBeLessThanOrEqual(PG_REPAIR_RETRIES);
 						expect(closes.map(close => close.error?.errno)).toEqual(Array(closes.length).fill("42501"));
 						for (const close of closes) {

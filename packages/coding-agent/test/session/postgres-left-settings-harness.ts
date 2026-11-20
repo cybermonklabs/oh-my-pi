@@ -9,8 +9,9 @@
  * pid and the setting's value, leaves the setting with a session-level
  * statement, and reads the value again. So the same client drives a store that
  * calls `transaction()` and `unsafe()` and one that calls `reserve()`. It
- * records each message the store sends with the backend pid it went to, and
- * each `close()` and `release()` the store calls on a reserved connection.
+ * records each message the store sends with the backend pid it went to, each
+ * `close()` the store calls on a reserved connection, and each reservation
+ * with the times the store released and closed it.
  *
  * {@link checkServerLog} judges the lines of the store's backends in a server
  * log written with `log_statement = 'all'` and
@@ -67,6 +68,13 @@ export interface LeftClose {
 	readonly error: LeftError | undefined;
 }
 
+/** One `reserve()` of the store's: the backend it got, and how many times the store released and closed it. */
+export interface LeftReservation {
+	readonly pid: number;
+	releases: number;
+	closes: number;
+}
+
 /** The test's own read of a backend: its value before the left statement, and after it. */
 export interface LeftRead {
 	readonly pid: number;
@@ -83,8 +91,8 @@ export interface LeftRecord {
 	readonly messages: LeftMessage[];
 	readonly errors: Array<LeftError & { readonly pid: number }>;
 	readonly closes: LeftClose[];
-	/** The backend of each `release()` the store called. */
-	readonly releases: number[];
+	/** Each `reserve()` the store made, in the order the client handed the connections out. */
+	readonly reservations: LeftReservation[];
 	/** Each left statement the client sent, with the reads around it. */
 	readonly lefts: Array<LeftRead & { readonly statement: string }>;
 }
@@ -195,7 +203,7 @@ export function leftClient(options: LeftClientOptions): LeftClient {
 		messages: [],
 		errors: [],
 		closes: [],
-		releases: [],
+		reservations: [],
 		lefts: [],
 	};
 	const reads = new Map<number, LeftRead>();
@@ -290,6 +298,8 @@ export function leftClient(options: LeftClientOptions): LeftClient {
 
 	const reserve = async (): Promise<LeftReservedConnection> => {
 		const { connection, pid } = await take();
+		const reservation: LeftReservation = { pid, releases: 0, closes: 0 };
+		record.reservations.push(reservation);
 		let last: LeftError | undefined;
 		return {
 			unsafe: (query, values) =>
@@ -297,10 +307,11 @@ export function leftClient(options: LeftClientOptions): LeftClient {
 					last = error;
 				}),
 			release: async () => {
-				record.releases.push(pid);
+				reservation.releases++;
 				connection.release();
 			},
 			close: async () => {
+				reservation.closes++;
 				record.closes.push({ pid, error: last });
 				await connection.close();
 			},
