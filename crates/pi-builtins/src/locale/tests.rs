@@ -1,10 +1,46 @@
 //! The shell's locale as a command it starts would see it: its search
 //! path, its working directory, and the locale utility that answers for
-//! it. Each test runs in its own process under nextest.
+//! it. A test that changes or reads what belongs to the whole process runs
+//! in a process of its own, whatever runs it ([`own_process`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The variable that names the one test a process [`own_process`] started
+/// is to run.
+#[cfg(target_os = "linux")]
+const OWN_PROCESS: &str = "PI_BUILTINS_LOCALE_TEST_OWN_PROCESS";
+
+/// Whether the test `name` of this module is to run its body here: `true`
+/// in the process this started for it. Otherwise this starts that process,
+/// this test binary again for `name` alone, waits for it, fails unless it
+/// ran that test and the test passed, and returns `false`.
+///
+/// Such a test changes, or asserts, what belongs to the whole process:
+/// signal dispositions, the process group, `RLIMIT_NOFILE`, `LOCPATH`, the
+/// children and the open descriptors of every task. nextest gives every
+/// test a process of its own, but libtest (`cargo test`, Bazel's
+/// `rust_test`) runs all of a binary's tests in one process, in parallel.
+/// There one test's signal storm killed another's utility, and one test's
+/// children and descriptors failed another's count.
+#[cfg(target_os = "linux")]
+fn own_process(name: &str) -> bool {
+	if std::env::var_os(OWN_PROCESS).is_some_and(|test| test == name) {
+		return true;
+	}
+	let test = format!("locale::tests::{name}");
+	let ran = Command::new(std::env::current_exe().unwrap())
+		.args(["--exact", &test, "--test-threads=1", "--nocapture"])
+		.env(OWN_PROCESS, name)
+		.output()
+		.unwrap();
+	let out = String::from_utf8_lossy(&ran.stdout);
+	let err = String::from_utf8_lossy(&ran.stderr);
+	assert!(ran.status.success(), "{test} failed in its own process:\n{out}{err}");
+	assert!(out.contains("1 passed"), "{test} did not run in its own process:\n{out}{err}");
+	false
+}
 
 /// A locale name no installed locale archive can answer for, so only the
 /// directory the test generates can supply it.
@@ -164,6 +200,9 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
+	if !own_process("a_process_whose_children_are_reaped_for_it_asks_nothing") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -171,7 +210,7 @@ fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
 	// The same query answers under the ordinary disposition, so what the
 	// second half measures is the disposition and nothing else.
 	let ordinary = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
-	// SAFETY: nextest gives this test its own process, which starts no other
+	// SAFETY: this test has a process of its own (`own_process`), which starts no other
 	// child; the disposition is put back below.
 	let kept = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 	let reaped_for_us = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
@@ -224,13 +263,16 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_refused_query_falls_back_to_the_name_and_says_so() {
+	if !own_process("a_refused_query_falls_back_to_the_name_and_says_so") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let (host, capture) = crate::host::Host::for_test("fold", "", dir.path());
 	let mut host = host;
 	host.set_test_var("LC_ALL", "C.UTF-8");
 	host.set_test_var("LOCPATH", locales.to_str().unwrap());
-	// SAFETY: nextest gives this test its own process, which starts no other
+	// SAFETY: this test has a process of its own (`own_process`), which starts no other
 	// child; the disposition is put back below.
 	let kept = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
 	let utf8 = crate::locale::ctype_is_utf8(&host);
@@ -316,6 +358,9 @@ fn a_locale_missing_a_category_leaves_the_utilities_in_c() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_competing_reaper_does_not_turn_the_query_into_a_stray_signal() {
+	if !own_process("a_competing_reaper_does_not_turn_the_query_into_a_stray_signal") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -406,6 +451,9 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_handed_to_a_task_already_read_is_still_caught() {
+	if !own_process("a_child_handed_to_a_task_already_read_is_still_caught") {
+		return;
+	}
 	let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
 	let (ids_tx, ids_rx) = std::sync::mpsc::channel();
 	let holder = std::thread::spawn(move || {
@@ -494,6 +542,9 @@ fn a_child_handed_to_a_task_already_read_is_still_caught() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
+	if !own_process("a_composite_looking_name_is_loadable_only_as_the_reference_loads_it") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let mut copy = Command::new("cp");
@@ -506,7 +557,7 @@ fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
 		.arg(locales.join(ascii))
 		.output()
 		.is_ok_and(|built| built.status.success());
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	let absent = crate::locale::locale_loadable("LC_CTYPE=C;LC_TIME=C.UTF-8", libc::LC_CTYPE_MASK);
@@ -539,6 +590,9 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	use std::sync::mpsc;
 	use std::time::Duration;
 
+	if !own_process("a_locale_lock_another_thread_holds_does_not_reach_the_lookup") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	// A locale whose `LC_CTYPE` is a FIFO nobody writes to: the thread that
@@ -547,7 +601,7 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	fs::create_dir_all(blocking.join("omp_rsync_fifo")).unwrap();
 	let fifo = blocking.join("omp_rsync_fifo/LC_CTYPE");
 	nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
-	// SAFETY: nextest gives this test its own process, and nothing else in it
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in it
 	// reads `LOCPATH` concurrently. libc reads it from the process
 	// environment, so this is the only way to aim the holding thread at the
 	// FIFO.
@@ -591,6 +645,9 @@ fn a_descriptor_limit_with_two_to_spare_still_answers() {
 
 	use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
+	if !own_process("a_descriptor_limit_with_two_to_spare_still_answers") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -769,6 +826,9 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_closed_standard_descriptor_never_becomes_the_answer() {
+	if !own_process("a_closed_standard_descriptor_never_becomes_the_answer") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	// A name only the utility can answer for, so the diagnostics stream is
@@ -779,7 +839,7 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 	assert!(copy.output().unwrap().status.success());
 	let shell_path = locales.to_str().unwrap().to_owned();
 	let env = move |key: &str| (key == "LOCPATH").then(|| shell_path.clone());
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	for closed in 1..8u32 {
@@ -825,6 +885,9 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 fn a_query_leaves_the_callers_signal_settings_alone() {
 	use std::os::unix::fs::PermissionsExt as _;
 
+	if !own_process("a_query_leaves_the_callers_signal_settings_alone") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let shell_path = locales.to_str().unwrap().to_owned();
@@ -836,7 +899,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let mut usr1 = nix::sys::signal::SigSet::empty();
 	usr1.add(nix::sys::signal::SIGUSR1);
 	usr1.thread_block().unwrap();
-	// SAFETY: nextest gives this test its own process; the disposition is
+	// SAFETY: this test has a process of its own (`own_process`); the disposition is
 	// put back below.
 	let kept = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 	let before = blocked(nix::sys::signal::SIGUSR1);
@@ -903,6 +966,9 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	use std::os::unix::fs::PermissionsExt as _;
 	use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+	if !own_process("an_inherited_handler_does_not_run_in_the_child_before_exec") {
+		return;
+	}
 	/// This test's own number, and the descriptor the handler writes to.
 	static OWNER: AtomicI32 = AtomicI32::new(0);
 	static RECORD: AtomicI32 = AtomicI32::new(-1);
@@ -926,7 +992,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// SAFETY: reading this process's own number.
 	OWNER.store(unsafe { libc::getpid() }, Ordering::Relaxed);
 	RECORD.store(file.as_raw_fd(), Ordering::Relaxed);
-	// SAFETY: nextest gives this test its own process; the disposition and
+	// SAFETY: this test has a process of its own (`own_process`); the disposition and
 	// the process group are both put back below. `SA_RESTART` keeps the
 	// storm from turning this process's own calls into `EINTR`.
 	let (kept, ignored, grouped) = unsafe {
@@ -1096,6 +1162,9 @@ fn the_ignored_signal_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_name_is_the_name_of_the_data_whatever_punctuation_it_carries() {
+	if !own_process("a_name_is_the_name_of_the_data_whatever_punctuation_it_carries") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = shell_only_locale(dir.path()) else { return };
 	let literal = ["astra=latin", "astra;latin", "LC_CTYPE=astra;LC_TIME=C"];
@@ -1124,7 +1193,7 @@ fn a_name_is_the_name_of_the_data_whatever_punctuation_it_carries() {
 		);
 		// In process: neither search path is set, so the same name has to
 		// read the same way through `newlocale` or not be answered there.
-		// SAFETY: nextest gives this test its own process, and nothing else
+		// SAFETY: this test has a process of its own (`own_process`), and nothing else
 		// in it reads `LOCPATH` concurrently.
 		unsafe { std::env::set_var("LOCPATH", &locales) };
 		let here = crate::locale::loaded_codeset(name, &env, None);
@@ -1245,6 +1314,9 @@ fn df_grouping(line: &str) -> Option<char> {
 ))]
 #[tokio::test]
 async fn the_utilities_honour_a_locale_only_the_shell_exports() {
+	if !own_process("the_utilities_honour_a_locale_only_the_shell_exports") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = utility_locales(dir.path()) else { return };
 	assert!(std::env::var_os("LOCPATH").is_none(), "the premise: this process has no LOCPATH");
@@ -1286,9 +1358,12 @@ async fn the_utilities_honour_a_locale_only_the_shell_exports() {
 ))]
 #[tokio::test]
 async fn a_missing_category_leaves_the_utilities_in_c() {
+	if !own_process("a_missing_category_leaves_the_utilities_in_c") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let Some(locales) = utility_locales(dir.path()) else { return };
-	// SAFETY: nextest gives this test its own process, and nothing else in
+	// SAFETY: this test has a process of its own (`own_process`), and nothing else in
 	// it reads `LOCPATH` concurrently.
 	unsafe { std::env::set_var("LOCPATH", &locales) };
 	let script = format!(
@@ -1318,7 +1393,7 @@ async fn a_missing_category_leaves_the_utilities_in_c() {
 /// Docker's default profile answers `clone3` that way, so that a C library
 /// falls back to `clone`. Once `no_new_privs` is set this needs no
 /// privilege. A filter cannot be taken off again, so the thread keeps it:
-/// the test's own process under nextest, its own thread under `cargo test`.
+/// the test's own process (`own_process`) under any runner.
 ///
 /// With `probe_finds_clone3`, a `clone3` whose size is zero — the
 /// capability probe's question — is answered `EINVAL`, as a kernel that has
@@ -1456,6 +1531,9 @@ fn probe_found_clone3() -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
+	if !own_process("a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let enosys = format!("os error {}", libc::ENOSYS);
@@ -1491,6 +1569,9 @@ fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() {
+	if !own_process("a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let descriptors = open_descriptors();
@@ -1514,6 +1595,9 @@ fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() 
 #[cfg(target_os = "linux")]
 #[test]
 fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
+	if !own_process("another_threads_refused_clone3_does_not_choose_this_threads_call") {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let program = latin_utility(dir.path());
 	let other = program.clone();
