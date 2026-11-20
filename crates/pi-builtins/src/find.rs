@@ -5557,26 +5557,21 @@ mod tests {
 		run_async_util::<Find>(&args, "", root).await
 	}
 
-	/// A chain as deep as path syscalls reach must be walked, in both visit
-	/// orders, not overflow the stack of the thread the shell runs on.
+	/// A chain deeper than find's walk could recurse through on a 256 KiB
+	/// stack must be walked, in both visit orders, not overflow the stack of
+	/// the thread the shell runs on. The walk before 6d543cb1 recursed once per
+	/// level and overflowed that stack by 55 levels in a debug build; 200 leave
+	/// it a margin, and deeper chains prove nothing more while every lookup by
+	/// path below the walk's open directories grows.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn walks_a_directory_chain_deeper_than_the_stack() {
 		let (_dir, root) = fixture();
 		// Removed before `_dir` drops, whose `remove_dir_all` would hold one
 		// descriptor per level of the chain.
 		let _chain = crate::deep_tree::RemoveTree(root.join("deep"));
-		// Stay under the host's PATH_MAX: every level adds "/d".
-		#[cfg(unix)]
-		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
-		#[cfg(not(unix))]
-		let path_max = 4096;
-		let depth = (path_max - 96 - root.join("deep/f").as_os_str().len()) / 2;
-		let mut chain = PathBuf::from("deep");
-		for _ in 0..depth {
-			chain.push("d");
-		}
-		fs::create_dir_all(root.join(&chain)).unwrap();
-		let leaf = chain.join("f");
+		let depth = 200;
+		crate::deep_tree::dir_chain(&root.join("deep"), depth);
+		let leaf = (0..depth).fold(PathBuf::from("deep"), |path, _| path.join("d")).join("f");
 		fs::write(root.join(&leaf), b"x").unwrap();
 
 		let runtime = tokio::runtime::Builder::new_multi_thread()

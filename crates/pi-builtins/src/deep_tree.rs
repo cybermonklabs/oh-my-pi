@@ -1,4 +1,5 @@
-//! Removing a test's deep directory tree without one descriptor per level.
+//! A test's deep directory trees: built, checked and removed level by level
+//! through descriptors, never by path.
 //!
 //! `tempfile::TempDir`'s drop calls `std::fs::remove_dir_all`, which keeps one
 //! descriptor open per level. For the chains of about 2,000 levels that find's
@@ -7,6 +8,12 @@
 //! files", and under a lower limit the drop failed, silently, and left the
 //! chain behind. The tests remove their chains through the host filesystem's
 //! `remove_dir_all`, which keeps at most three open (pi-vfs's `remove_tree`).
+//!
+//! Building or checking a chain by path looks every component up again at
+//! every level, so the cost grows with the square of the depth, and gVisor
+//! (GKE Sandbox) makes each lookup slow: creating 2,000 levels took about
+//! 9 seconds there, and checking 1,500 about 5. A [`Level`] opens each
+//! level relative to the one above.
 
 use std::path::PathBuf;
 
@@ -28,27 +35,105 @@ impl Drop for RemoveTree {
 	}
 }
 
+/// A directory open by descriptor, one level of a chain.
+#[cfg(unix)]
+pub(crate) struct Level(std::os::fd::OwnedFd);
+
+#[cfg(unix)]
+impl Level {
+	/// Opens the directory at `path`.
+	pub(crate) fn open(path: &std::path::Path) -> Self {
+		use std::os::unix::ffi::OsStrExt as _;
+		Self(open_at(libc::AT_FDCWD, path.as_os_str().as_bytes(), libc::O_RDONLY | libc::O_DIRECTORY))
+	}
+
+	/// Makes the subdirectory `name` and opens it.
+	pub(crate) fn make_dir(&self, name: &str) -> Self {
+		use std::os::fd::AsRawFd as _;
+		let c_name = std::ffi::CString::new(name).unwrap();
+		// SAFETY: `c_name` is NUL-terminated and outlives the call.
+		let made = unsafe { libc::mkdirat(self.0.as_raw_fd(), c_name.as_ptr(), 0o755) };
+		assert_eq!(made, 0, "mkdirat {name}: {}", std::io::Error::last_os_error());
+		self.dir(name)
+	}
+
+	/// Opens the subdirectory `name`, refusing a symbolic link.
+	pub(crate) fn dir(&self, name: &str) -> Self {
+		use std::os::fd::AsRawFd as _;
+		Self(open_at(self.0.as_raw_fd(), name.as_bytes(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW))
+	}
+
+	/// Writes the new file `name`.
+	pub(crate) fn write(&self, name: &str, contents: &[u8]) {
+		use std::{io::Write as _, os::fd::AsRawFd as _};
+		let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+		std::fs::File::from(open_at(self.0.as_raw_fd(), name.as_bytes(), flags)).write_all(contents).unwrap();
+	}
+
+	/// The contents of the file `name`.
+	pub(crate) fn read(&self, name: &str) -> Vec<u8> {
+		use std::{io::Read as _, os::fd::AsRawFd as _};
+		let mut contents = Vec::new();
+		let flags = libc::O_RDONLY | libc::O_NOFOLLOW;
+		std::fs::File::from(open_at(self.0.as_raw_fd(), name.as_bytes(), flags))
+			.read_to_end(&mut contents)
+			.unwrap();
+		contents
+	}
+}
+
+/// `openat(at, name, flags)`, with a mode of 0644 for a created file.
+#[cfg(unix)]
+fn open_at(at: libc::c_int, name: &[u8], flags: libc::c_int) -> std::os::fd::OwnedFd {
+	use std::os::fd::FromRawFd as _;
+	let c_name = std::ffi::CString::new(name).unwrap();
+	let mode: libc::c_uint = 0o644;
+	// SAFETY: `c_name` is NUL-terminated and outlives the call; `mode` only
+	// counts when `flags` create the file.
+	let fd = unsafe { libc::openat(at, c_name.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+	assert!(fd >= 0, "openat {}: {}", String::from_utf8_lossy(name), std::io::Error::last_os_error());
+	// SAFETY: `openat` returned a fresh descriptor owned from here.
+	unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
 /// Makes the directory `top` and a chain of `depth` directories `d` below
 /// it, with a file `f` at each level that holds the level's number.
+#[cfg(unix)]
 pub(crate) fn file_chain(top: &std::path::Path, depth: usize) {
-	let mut path = top.to_path_buf();
-	std::fs::create_dir(&path).unwrap();
-	for level in 0..depth {
-		std::fs::write(path.join("f"), level.to_string()).unwrap();
-		path.push("d");
-		std::fs::create_dir(&path).unwrap();
+	std::fs::create_dir(top).unwrap();
+	let mut level = Level::open(top);
+	for number in 0..depth {
+		level.write("f", number.to_string().as_bytes());
+		level = level.make_dir("d");
 	}
 }
 
 /// Asserts that `copy` holds what [`file_chain`] made: each level's file,
 /// and nothing below the last level.
+#[cfg(unix)]
 pub(crate) fn assert_file_chain(copy: &std::path::Path, depth: usize) {
-	let mut path = copy.to_path_buf();
-	for level in 0..depth {
-		assert_eq!(std::fs::read_to_string(path.join("f")).unwrap(), level.to_string(), "level {level}");
-		path.push("d");
+	let mut level = Level::open(copy);
+	for number in 0..depth {
+		assert_eq!(level.read("f"), number.to_string().as_bytes(), "level {number}");
+		level = level.dir("d");
 	}
-	assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0, "the last level is empty");
+	let last: PathBuf = (0..depth).fold(copy.to_path_buf(), |path, _| path.join("d"));
+	assert_eq!(std::fs::read_dir(last).unwrap().count(), 0, "the last level is empty");
+}
+
+/// Makes the directory `top` and a chain of `depth` directories `d` below
+/// it, nothing else. Through descriptors on Unix, by path elsewhere.
+pub(crate) fn dir_chain(top: &std::path::Path, depth: usize) {
+	#[cfg(unix)]
+	{
+		std::fs::create_dir(top).unwrap();
+		let mut level = Level::open(top);
+		for _ in 0..depth {
+			level = level.make_dir("d");
+		}
+	}
+	#[cfg(not(unix))]
+	std::fs::create_dir_all((0..depth).fold(top.to_path_buf(), |path, _| path.join("d"))).unwrap();
 }
 
 /// Lowers the open-file limit of this process to `limit`. The limit belongs
@@ -70,13 +155,7 @@ mod tests {
 	/// A chain of `depth` directories `d` below `root/deep`, a file at each
 	/// level.
 	fn chain(root: &Path, depth: usize) {
-		let mut path = root.join("deep");
-		fs::create_dir(&path).unwrap();
-		for _ in 0..depth {
-			fs::write(path.join("f"), b"x").unwrap();
-			path.push("d");
-			fs::create_dir(&path).unwrap();
-		}
+		super::file_chain(&root.join("deep"), depth);
 	}
 
 	/// Under an open-file limit of 32 the host filesystem removes a chain of

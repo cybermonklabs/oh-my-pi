@@ -3972,8 +3972,9 @@ mod tests {
 
 	/// `cp -r` copies a tree deeper than the open-file limit, as GNU cp does:
 	/// the walk reads each directory whole before it goes below, so it holds
-	/// no descriptor per level (300 levels under a limit of 32). In a process
-	/// of its own, since the limit belongs to the whole process.
+	/// no descriptor per level (100 levels under a limit of 32, where the walk
+	/// before 7445a6c6 failed with "Too many open files"). In a process of its
+	/// own, since the limit belongs to the whole process.
 	#[cfg(unix)]
 	#[test]
 	fn copies_a_tree_deeper_than_the_descriptor_limit() {
@@ -3984,17 +3985,19 @@ mod tests {
 		}
 		let fixture = tempdir().unwrap();
 		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
-		file_chain(&fixture.path().join("src"), 300);
+		file_chain(&fixture.path().join("src"), 100);
 		limit_descriptors(32);
 		let (code, capture) = run_util::<Cp>(&["-r", "src", "dst"], "", fixture.path());
 		assert_eq!((code, capture.err().as_str()), (0, ""));
-		assert_file_chain(&fixture.path().join("dst"), 300);
+		assert_file_chain(&fixture.path().join("dst"), 100);
 	}
 
-	/// `cp -r` copies a chain of 1,500 levels on a thread with 256 KiB of
+	/// `cp -r` copies a chain of 200 levels on a thread with 256 KiB of
 	/// stack: the walk keeps its directories on a stack of its own, so depth
-	/// costs no thread stack. A walk that recursed per level would overflow it
-	/// and end the process, so the test runs in a process of its own.
+	/// costs no thread stack. The walk before 7445a6c6 recursed per level and
+	/// overflowed that stack by 63 levels in a debug build; deeper chains
+	/// prove nothing more, and each level's lookups by path cost more. An
+	/// overflow ends the process, so the test runs in a process of its own.
 	#[cfg(unix)]
 	#[test]
 	fn copies_a_tree_deeper_than_the_stack() {
@@ -4005,7 +4008,7 @@ mod tests {
 		}
 		let fixture = tempdir().unwrap();
 		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
-		file_chain(&fixture.path().join("src"), 1_500);
+		file_chain(&fixture.path().join("src"), 200);
 		let cwd = fixture.path().to_path_buf();
 		let (code, err) = std::thread::Builder::new()
 			.stack_size(256 * 1024)
@@ -4017,7 +4020,7 @@ mod tests {
 			.join()
 			.unwrap();
 		assert_eq!((code, err.as_str()), (0, ""));
-		assert_file_chain(&fixture.path().join("dst"), 1_500);
+		assert_file_chain(&fixture.path().join("dst"), 200);
 	}
 
 	/// The walk follows a symbolic link deep in the tree only when asked: `-r`

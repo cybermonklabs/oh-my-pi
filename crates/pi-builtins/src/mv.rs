@@ -1153,7 +1153,7 @@ mod tests {
 	}
 
 	/// `mv` to another file system copies, then removes the source: a tree
-	/// deeper than the open-file limit moves whole (300 levels under a limit of
+	/// deeper than the open-file limit moves whole (100 levels under a limit of
 	/// 32, from /dev/shm to the temporary directory). In a process of its own,
 	/// since the limit belongs to the whole process. It needs the two to be
 	/// different file systems, which is decided before the process starts.
@@ -1180,11 +1180,11 @@ mod tests {
 		let src = from.path().join("src");
 		let dst = to.path().join("dst");
 		let _trees = [RemoveTree(src.clone()), RemoveTree(dst.clone())];
-		file_chain(&src, 300);
+		file_chain(&src, 100);
 		limit_descriptors(32);
 		let (code, capture) = run_util::<Mv>(&[src.to_str().unwrap(), dst.to_str().unwrap()], "", to.path());
 		assert_eq!((code, capture.err().as_str()), (0, ""));
 		assert!(!src.exists(), "the source is gone");
-		assert_file_chain(&dst, 300);
+		assert_file_chain(&dst, 100);
 	}
 }
