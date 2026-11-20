@@ -54,6 +54,7 @@ import {
 	LEFT_MARKER,
 	type LeftClient,
 	type LeftRecord,
+	type LeftReservation,
 	type LeftSetting,
 	type LeftStoreClient,
 	leftClient,
@@ -160,7 +161,8 @@ function errorText(err: unknown): string {
 }
 
 async function readServer(url: string): Promise<Server> {
-	const sql = new SQL(url, { max: 1 });
+	// A server that never answers holds the file's load 5 s at most, as the transaction test's own read.
+	const sql = new SQL(url, { max: 1, connectionTimeout: 5 });
 	try {
 		const direct = await reachesPostgresDirectly(sql, url);
 		const [where] = (await sql.unsafe("SELECT session_user::text AS login")) as Rows;
@@ -1040,6 +1042,15 @@ function repairWarnings(
 		}));
 }
 
+/**
+ * The reservations of `record` the store closed, in the order the client
+ * handed them out. The store closes a connection at most once, and each case
+ * asserts `closes: 1` on every one, so the list has one entry per `close()`.
+ */
+function closedReservations(record: LeftRecord): LeftReservation[] {
+	return record.reservations.filter(reservation => reservation.closes > 0);
+}
+
 async function adminTitle(db: SQL, tables: CaseTables, file: string): Promise<unknown> {
 	const [row] = (await db.unsafe(`SELECT title FROM public.${tables.table} WHERE path = $1`, [file])) as Rows;
 	return row?.title;
@@ -1255,7 +1266,7 @@ describe("SQL session store under a session setting another client left on Postg
 					const error = await rejection(SqlSessionStorage.create(storeOptions(harness.client, tables)));
 					expect(errorText(error)).toContain("keeps a read-only default");
 					expect(await presentTables(look, tables)).toEqual([]);
-					expect(harness.record.closes).toEqual([]);
+					expect(closedReservations(harness.record)).toEqual([]);
 				} finally {
 					await harness.end();
 					if (look !== db) await look.close();
@@ -1304,13 +1315,18 @@ describe("SQL session store under a session setting another client left on Postg
 						ordinal => ordinal <= PG_REPAIR_RETRIES + 1,
 						async ({ error, harness, warnings }) => {
 							expect(error).toBeUndefined();
-							const closes = harness.record.closes;
-							expect(closes.map(close => close.error?.errno)).toEqual(Array(PG_REPAIR_RETRIES).fill("42501"));
+							const closed = closedReservations(harness.record);
+							expect(
+								closed.map(reservation => ({
+									closes: reservation.closes,
+									errno: reservation.closeError?.errno,
+								})),
+							).toEqual(Array(PG_REPAIR_RETRIES).fill({ closes: 1, errno: "42501" }));
 							expect(warnings).toEqual(
-								closes.map((close, index) => ({
+								closed.map((reservation, index) => ({
 									operation: "updateSessionTitle",
 									sqlstate: "42501",
-									message: close.error?.message,
+									message: reservation.closeError?.message,
 									attempt: index + 1,
 								})),
 							);
@@ -1327,15 +1343,18 @@ describe("SQL session store under a session setting another client left on Postg
 						() => true,
 						async ({ error, harness, warnings }) => {
 							expect(leftError(error).errno).toBe("42501");
-							const closes = harness.record.closes;
-							expect(closes.map(close => close.error?.errno)).toEqual(
-								Array(PG_REPAIR_RETRIES + 1).fill("42501"),
-							);
+							const closed = closedReservations(harness.record);
+							expect(
+								closed.map(reservation => ({
+									closes: reservation.closes,
+									errno: reservation.closeError?.errno,
+								})),
+							).toEqual(Array(PG_REPAIR_RETRIES + 1).fill({ closes: 1, errno: "42501" }));
 							expect(warnings).toEqual(
-								closes.map((close, index) => ({
+								closed.map((reservation, index) => ({
 									operation: "updateSessionTitle",
 									sqlstate: "42501",
-									message: close.error?.message,
+									message: reservation.closeError?.message,
 									attempt: index + 1,
 								})),
 							);
@@ -1435,15 +1454,20 @@ describe("SQL session store under a session setting another client left on Postg
 						} finally {
 							warn.mockRestore();
 						}
-						const closes = harness.record.closes;
-						expect(closes.map(close => ({ pid: close.pid, errno: close.error?.errno }))).toEqual([
-							{ pid: left.pid, errno: "42501" },
-						]);
+						// Every reservation of the client, the open's included: one closed, once, on the left backend after 42501.
+						const closed = closedReservations(harness.record);
+						expect(
+							closed.map(reservation => ({
+								pid: reservation.pid,
+								closes: reservation.closes,
+								errno: reservation.closeError?.errno,
+							})),
+						).toEqual([{ pid: left.pid, closes: 1, errno: "42501" }]);
 						// The reservations of the title update: one on the left backend, closed and not released; the next on
 						// another backend, released and not closed.
 						const during = harness.record.reservations.slice(first);
 						expect(during.filter(reservation => reservation.pid === left.pid)).toEqual([
-							{ pid: left.pid, releases: 0, closes: 1 },
+							{ pid: left.pid, releases: 0, closes: 1, closeError: expect.objectContaining({ errno: "42501" }) },
 						]);
 						const next = during[during.findIndex(reservation => reservation.pid === left.pid) + 1];
 						expect(next?.pid).not.toBe(left.pid);
@@ -1452,7 +1476,7 @@ describe("SQL session store under a session setting another client left on Postg
 							{
 								operation: "updateSessionTitle",
 								sqlstate: "42501",
-								message: closes[0]?.error?.message,
+								message: closed[0]?.closeError?.message,
 								attempt: 1,
 							},
 						]);
@@ -1504,14 +1528,19 @@ describe("SQL session store under a session setting another client left on Postg
 						// The clean one goes back first, so PgBouncer (server_round_robin = 0) hands out the three left ones first.
 						for (const holder of holders) await holder.connection.unsafe(`${LEFT_MARKER} COMMIT`);
 						await opened.storage.updateSessionTitle(opened.file, TITLE);
-						const closes = harness.record.closes;
+						const closed = closedReservations(harness.record);
 						// The clean connection commits first, so the pool hands a left one first: one close is always met.
-						expect(closes.length).toBeGreaterThanOrEqual(1);
-						expect(closes.length).toBeLessThanOrEqual(PG_REPAIR_RETRIES);
-						expect(closes.map(close => close.error?.errno)).toEqual(Array(closes.length).fill("42501"));
-						for (const close of closes) {
-							await until(() => backendGone(db, close.pid), READ_BOUND_MS, {
-								what: `the end of backend ${close.pid}`,
+						expect(closed.length).toBeGreaterThanOrEqual(1);
+						expect(closed.length).toBeLessThanOrEqual(PG_REPAIR_RETRIES);
+						expect(
+							closed.map(reservation => ({
+								closes: reservation.closes,
+								errno: reservation.closeError?.errno,
+							})),
+						).toEqual(Array(closed.length).fill({ closes: 1, errno: "42501" }));
+						for (const reservation of closed) {
+							await until(() => backendGone(db, reservation.pid), READ_BOUND_MS, {
+								what: `the end of backend ${reservation.pid}`,
 								pollMs: POLL_MS,
 							});
 						}
