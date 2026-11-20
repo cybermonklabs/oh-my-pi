@@ -1112,24 +1112,40 @@ mod tests {
 		let (ctx, trees, _) = setup(&dest, confined, &OUT);
 		assert!(backup_path(&ctx, &trees, b"f0").unwrap().is_none());
 		assert!(!base.join("escape").exists(), "nothing created outside --confine-root");
+	}
 
-		// As root, symlinks owned by another user are untrusted: one on the way to the
-		// destination does not matter (upstream starts at the destination), one inside
-		// the backup path is refused.
-		if crate::rsync::ids::effective_uid() != Some(0) {
-			return;
+	/// Tests that plant a symlink owned by another user, so they need a process
+	/// that can give a file away: root, outside a one-uid user namespace. Bazel
+	/// runs them in `//crates/pi-builtins:pi-builtins_foreign_owner_test`, whose
+	/// tests are named by this module.
+	mod foreign_owner {
+		use super::*;
+
+		/// As root, symlinks owned by another user are untrusted: one on the way to
+		/// the destination does not matter (upstream starts at the destination), one
+		/// inside the backup path is refused.
+		#[test]
+		fn relative_backup_dir_walk_refuses_another_users_symlink() {
+			if !crate::rsync::paths::can_give_files_away("relative_backup_dir_walk_refuses_another_users_symlink") {
+				return;
+			}
+			let another = Some(crate::rsync::paths::ANOTHER_USER);
+			let base = tempfile::tempdir().unwrap();
+			let base = std::fs::canonicalize(base.path()).unwrap();
+			let dest = base.join("dest");
+			put(&dest, "f0", "OLD");
+			link(&base, "via", dest.to_str().unwrap());
+			std::os::unix::fs::lchown(base.join("via"), another, another).unwrap();
+			let (ctx, trees, _) = setup(&base.join("via"), backup_opts(Some("bk"), ""), &OUT);
+			assert!(backup_path(&ctx, &trees, b"f0").unwrap().is_some());
+			assert!(dest.join("bk").is_dir());
+
+			link(&dest, "foreign", base.to_str().unwrap());
+			std::os::unix::fs::lchown(dest.join("foreign"), another, another).unwrap();
+			let (ctx, trees, _) = setup(&dest, backup_opts(Some("foreign/sub"), ""), &OUT);
+			assert!(backup_path(&ctx, &trees, b"f0").unwrap().is_none());
+			assert!(!base.join("sub").exists());
 		}
-		link(&base, "via", dest.to_str().unwrap());
-		std::os::unix::fs::lchown(base.join("via"), Some(1), Some(1)).unwrap();
-		let (ctx, trees, _) = setup(&base.join("via"), backup_opts(Some("bk"), ""), &OUT);
-		assert!(backup_path(&ctx, &trees, b"f0").unwrap().is_some());
-		assert!(dest.join("bk").is_dir());
-
-		link(&dest, "foreign", base.to_str().unwrap());
-		std::os::unix::fs::lchown(dest.join("foreign"), Some(1), Some(1)).unwrap();
-		let (ctx, trees, _) = setup(&dest, backup_opts(Some("foreign/sub"), ""), &OUT);
-		assert!(backup_path(&ctx, &trees, b"f0").unwrap().is_none());
-		assert!(!base.join("sub").exists());
 	}
 
 	/// B11: under `--fake-super` a special file is a regular placeholder plus the

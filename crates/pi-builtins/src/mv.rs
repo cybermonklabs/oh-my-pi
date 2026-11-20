@@ -1151,4 +1151,40 @@ mod tests {
 		assert_eq!(code, 1);
 		assert_eq!(capture.err(), "mv: cannot stat 'missing': No such file or directory\n");
 	}
+
+	/// `mv` to another file system copies, then removes the source: a tree
+	/// deeper than the open-file limit moves whole (100 levels under a limit of
+	/// 32, from /dev/shm to the temporary directory). In a process of its own,
+	/// since the limit belongs to the whole process. It needs the two to be
+	/// different file systems, which is decided before the process starts.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn moves_a_tree_deeper_than_the_descriptor_limit_to_another_file_system() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		use crate::deep_tree::{RemoveTree, assert_file_chain, file_chain, limit_descriptors};
+
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&crate::deep_tree::temp_root())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		if !crate::own_process::own_process() {
+			return;
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let to = crate::deep_tree::tempdir();
+		let src = from.path().join("src");
+		let dst = to.path().join("dst");
+		let _trees = [RemoveTree(src.clone()), RemoveTree(dst.clone())];
+		file_chain(&src, 100);
+		limit_descriptors(32);
+		let (code, capture) = run_util::<Mv>(&[src.to_str().unwrap(), dst.to_str().unwrap()], "", to.path());
+		assert_eq!((code, capture.err().as_str()), (0, ""));
+		assert!(!src.exists(), "the source is gone");
+		assert_file_chain(&dst, 100);
+	}
 }
