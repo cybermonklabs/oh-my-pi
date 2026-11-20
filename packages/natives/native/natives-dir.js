@@ -5,11 +5,14 @@ import { getEnvironmentData, setEnvironmentData } from "node:worker_threads";
 
 /**
  * An absolute directory from an override variable (`~` expanded), or undefined for a
- * relative or empty value.
+ * relative or empty value. The natives directory and pi-utils' process-global roots (the
+ * config and download roots, the worktree base) all read their overrides with it: every omp
+ * process must name the same directories, and a relative value would resolve against whatever
+ * directory omp was started in.
  * @param {string | null | undefined} value
  * @returns {string | undefined}
  */
-function resolveAbsoluteDir(value) {
+export function resolveAbsoluteDir(value) {
 	let dir = value?.trim();
 	if (!dir) return undefined;
 	if (dir === "~") dir = os.homedir();

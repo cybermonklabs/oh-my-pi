@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __resetNativesDirForTests, getNativesDir } from "@oh-my-pi/pi-natives/natives-dir";
+import { __resetNativesDirForTests, getNativesDir, resolveAbsoluteDir } from "@oh-my-pi/pi-natives/natives-dir";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
@@ -761,27 +761,6 @@ export function getPluginsLockfile(home?: string): string {
 /** Get the remote mount directory (~/.omp/remote). */
 export function getRemoteDir(): string {
 	return dirs.rootSubdir("remote", "data");
-}
-
-/**
- * Expand a leading `~` and require an absolute result. Returns `undefined` for
- * empty/whitespace input or a path that is still relative after expansion.
- *
- * Worktree bases and the config and download roots are process-global: a
- * worktree base is consumed by both creation (PR checkout, task isolation) and
- * cleanup (`omp worktree`), and every omp process must name the same roots. A
- * relative value would resolve against whatever cwd happened to launch `omp`,
- * so those readers could disagree — we refuse it rather than silently bind it
- * to cwd. (The natives directory applies the same rule in
- * `@oh-my-pi/pi-natives/natives-dir`.)
- */
-function resolveAbsoluteDir(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	let p = trimmed;
-	if (p === "~") p = os.homedir();
-	else if (p.startsWith("~/") || p.startsWith("~\\")) p = os.homedir() + p.slice(1);
-	return path.isAbsolute(p) ? path.normalize(p) : undefined;
 }
 
 let worktreesDirOverride: string | undefined;

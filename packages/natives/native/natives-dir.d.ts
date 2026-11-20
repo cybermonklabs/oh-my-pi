@@ -1,4 +1,11 @@
 /**
+ * An absolute directory from an override variable (`~` expanded), or undefined for a relative
+ * or empty value. The natives directory and pi-utils' process-global roots read their
+ * overrides with it.
+ */
+export function resolveAbsoluteDir(value: string | null | undefined): string | undefined;
+
+/**
  * The natives directory: the native addon's cached copies (`<dir>/<version>-<digest prefix>`
  * per compiled build and per Windows install's leaf package) and the
  * downloaded tree-sitter grammars (`<dir>/grammars`). Shared by the addon loader and
