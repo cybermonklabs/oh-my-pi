@@ -8,7 +8,7 @@ import {
 	startedWithNativesDirHandoff,
 } from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
-import { isBunTestRuntime } from "./test-runtime";
+import { isBunTestProcess, isBunTestRuntime } from "./test-runtime";
 
 export * from "./test-runtime";
 export * from "./worker-host";
@@ -148,8 +148,13 @@ const projectEnvNamesLoadedByOmp = new Set<string>();
  * never the directory omp resolved, so a command, and an omp it starts with its own `HOME`,
  * resolves the natives directory for itself. omp's children that are omp take the resolved
  * directory from a handoff instead (`NATIVES_DIR_HANDOFF_ENV_KEY`), which commands never get.
+ *
+ * In the process `bun test` runs its files in, the value the test preload left, which is the
+ * one this module sees as it loads: the preload removes the developer's value from the process,
+ * and `/proc/self/environ` still lists it.
  */
-const nativesDirAtLaunch = launchEnvValues ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
+const nativesDirAtLaunch =
+	launchEnvValues && !isBunTestProcess() ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
 
 /**
  * Puts `PI_NATIVES_DIR` in `env` as omp was started with it, or takes it out when omp was

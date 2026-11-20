@@ -366,3 +366,55 @@ console.log(JSON.stringify({ dir, seen, command: JSON.parse(omp) }));
 		expect(result.command.dir).toBe(path.join(home, ".omp", "natives"));
 	}, 120_000);
 });
+
+describe("a direct bun test run", () => {
+	let tempRoot = "";
+
+	beforeEach(async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-natives-bun-test-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(tempRoot, { recursive: true, force: true });
+	});
+
+	it("gives commands and workers the PI_NATIVES_DIR the test preload left, not the developer's", async () => {
+		// The preload removes the developer's PI_NATIVES_DIR from the test process before any
+		// test module loads; /proc/self/environ still lists the environment it started with.
+		const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
+		const workerClientTs = path.join(import.meta.dir, "../src/subprocess/worker-client.ts");
+		const preload = path.join(import.meta.dir, "../../../scripts/test-preload.ts");
+		await Bun.write(
+			path.join(tempRoot, "probe.test.ts"),
+			`import { test } from "bun:test";
+const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
+const { workerEnvFromParent } = await import(${JSON.stringify(workerClientTs)});
+test("probe", () => {
+	console.log("PROBE " + JSON.stringify({ seen: process.env.PI_NATIVES_DIR ?? null, command: filterChildShellEnv(process.env).PI_NATIVES_DIR ?? null, worker: workerEnvFromParent().PI_NATIVES_DIR ?? null }));
+});
+`,
+		);
+		const run = async (launch: string | undefined) => {
+			const child = Bun.spawn([process.execPath, "test", "--preload", preload, "./probe.test.ts"], {
+				cwd: tempRoot,
+				env: { ...process.env, PI_NATIVES_DIR: launch },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ exitCode, stderr: exitCode === 0 ? "" : stderr }).toEqual({ exitCode: 0, stderr: "" });
+			const line = `${stdout}\n${stderr}`.split("\n").find(entry => entry.startsWith("PROBE "));
+			if (!line) throw new Error(`the probe printed nothing:\n${stdout}\n${stderr}`);
+			return JSON.parse(line.slice("PROBE ".length));
+		};
+
+		const cleared = { seen: null, command: null, worker: null };
+		expect(await run(path.join(tempRoot, "developer-natives"))).toEqual(cleared);
+		// Control: a run started without it.
+		expect(await run(undefined)).toEqual(cleared);
+	}, 120_000);
+});
