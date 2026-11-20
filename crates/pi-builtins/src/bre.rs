@@ -39,10 +39,11 @@ pub(crate) enum Target {
 	/// outside ASCII as the escapes of its UTF-8 bytes.
 	RustBytes,
 	/// PCRE2, which `grep` compiles a back-reference with. It runs with
-	/// PCRE2_UCP, where its own POSIX classes are Unicode categories that are
-	/// not GNU's - `[:digit:]` holds the digits of every script - so each
-	/// class is written to mean what it means for [`Self::Rust`] (see
-	/// [`push_bracket_class`]). It has the look-around the word edges need.
+	/// PCRE2_UCP, where its own POSIX classes are Unicode categories, so each
+	/// class is written to match what it matches for [`Self::Rust`] (see
+	/// [`push_bracket_class`]): one back-reference among the patterns does
+	/// not change what the others match. It has the look-around the word
+	/// edges need.
 	Pcre,
 	/// PCRE2 without PCRE2_UTF and PCRE2_UCP, for a line that is not UTF-8,
 	/// which GNU grep reads a byte to a character in the C locale: its POSIX
@@ -178,6 +179,7 @@ pub(crate) fn translate_multiline(
 		multiline,
 		atom: None,
 		quantified: false,
+		atom_is_anchor: false,
 		branch_start: true,
 		confused: false,
 		groups: Vec::new(),
@@ -641,6 +643,12 @@ struct Translator<'a> {
 	/// one repeats the repetition instead of reading as the engine's lazy
 	/// flag: GNU reads `a\+\?` as `(a+)?`, which matches the empty string.
 	quantified: bool,
+	/// Whether that atom is an anchor - `^` or `$` in GNU grep's ERE, or `\b`
+	/// or `\B` - after which glibc parses no repetition, so that GNU grep
+	/// reads a brace that makes no interval there as text: `grep -cE
+	/// '^{1,2,3}'` counts the lines starting with `{1,2,3}`, where after any
+	/// other atom it is "Invalid content of \{\}".
+	atom_is_anchor: bool,
 	/// Whether the token just read opens a branch: the start of the pattern,
 	/// `\(` or `\|`, as glibc tells it. In a BRE only there does `^` anchor;
 	/// after any other token, an assertion included, it is an ordinary
@@ -649,8 +657,9 @@ struct Translator<'a> {
 	branch_start: bool,
 	/// Whether a bracket expression was a class name written without its
 	/// outer brackets, which is reported only once the rest of the pattern
-	/// has translated: GNU reports any other error first, so `sed
-	/// 's/[:alpha:][z-a]/x/'` is "Invalid range end" and exit 1, not 4.
+	/// has translated and closed every group: GNU reports any other error
+	/// first, so `sed 's/[:alpha:][z-a]/x/'` is "Invalid range end" and `sed
+	/// 's/[:alpha:]\(/x/'` "Unmatched ( or \(", each exit 1, not 4.
 	confused:   bool,
 	/// The groups that are still open, innermost last.
 	groups:     Vec<OpenGroup>,
@@ -695,7 +704,9 @@ impl Translator<'_> {
 				_ => self.literal(c),
 			}
 		}
-		if self.confused {
+		// A group still open is an error the engine reports, as GNU does
+		// before this one.
+		if self.confused && self.groups.is_empty() {
 			return Err(BreError::ClassSyntaxConfused);
 		}
 		Ok(self.out)
@@ -737,7 +748,14 @@ impl Translator<'_> {
 			// GNU's own classes and boundaries, which the engines share, and
 			// punctuation, which an escape keeps a literal in the engines.
 			// Before anything else a backslash is the character itself.
-			_ if matches!(c, 'w' | 'W' | 's' | 'S' | 'b' | 'B') || c.is_ascii_punctuation() => {
+			'b' | 'B' => {
+				let start = self.out.len();
+				self.out.push('\\');
+				self.out.push(c);
+				self.set_atom(start);
+				self.atom_is_anchor = true;
+			},
+			_ if matches!(c, 'w' | 'W' | 's' | 'S') || c.is_ascii_punctuation() => {
 				let start = self.out.len();
 				self.out.push('\\');
 				self.out.push(c);
@@ -757,6 +775,13 @@ impl Translator<'_> {
 			// an ordinary character: `grep -c '\{'` counts the lines holding
 			// one, and so does `grep -cE '{1,2,3}'`.
 			Err(_) if self.atom.is_none() => {
+				self.literal('{');
+				Ok(())
+			},
+			// So it is after an anchor, which glibc gives no repetition:
+			// `grep -cE '^{}'` counts the lines starting with `{}`, and `grep
+			// -c '\B\{\}'` those holding it.
+			Err(_) if self.atom_is_anchor && !self.strict() => {
 				self.literal('{');
 				Ok(())
 			},
@@ -934,6 +959,7 @@ impl Translator<'_> {
 		if self.dialect == Dialect::Extended && !self.strict() {
 			self.atom = Some(start);
 			self.quantified = true;
+			self.atom_is_anchor = true;
 		} else {
 			self.atom = None;
 			self.quantified = false;
@@ -949,6 +975,7 @@ impl Translator<'_> {
 	fn set_atom(&mut self, start: usize) {
 		self.atom = Some(start);
 		self.quantified = false;
+		self.atom_is_anchor = false;
 	}
 }
 
@@ -1274,8 +1301,10 @@ fn push_bracket_char(out: &mut String, c: char) {
 	out.push(c);
 }
 
-/// Append the POSIX class `name` as a member of a class, with the meaning
-/// GNU gives it in a UTF-8 locale.
+/// Append the POSIX class `name` as a member of a class, with the meaning it
+/// has for [`Target::Rust`] whichever engine `target` is, and for
+/// [`Target::RustBytes`] and [`Target::PcreBytes`] the ASCII one GNU gives
+/// it in the C locale.
 ///
 /// Without case `upper` and `lower` are `alpha`, as glibc and GNU's dfa read
 /// them: `printf '中\n' | grep -ci '[[:lower:]]'` is 1. (PCRE2 folds no
@@ -1284,21 +1313,32 @@ fn push_bracket_char(out: &mut String, c: char) {
 /// The letter classes are written as the Unicode property of the same name
 /// where the engine's own POSIX class is not GNU's (see
 /// [`Target::unicode_letters`]): GNU in a UTF-8 locale counts `ß` as a
-/// letter, so `printf '\303\237\n' | grep -cw '[[:alpha:]]'` is 1. `digit`
-/// and `xdigit` are ASCII to GNU in every locale, which they are not to
-/// PCRE2_UCP, so for [`Target::Pcre`] they are written as their ranges:
-/// `printf '\331\240\n' | grep -c '\(x\)\1\|[[:digit:]]'` is 0. The other
-/// classes keep their POSIX definition, which is what GNU gives them in the
-/// C locale.
+/// letter, so `printf '\303\237\n' | grep -cw '[[:alpha:]]'` is 1.
+///
+/// The other classes hold ASCII alone, as the `regex` crate reads them. GNU
+/// reads `digit` and `xdigit` so in every locale, and holds characters
+/// outside ASCII in the others in a UTF-8 locale (`　` is a space to it,
+/// `—` punctuation). PCRE2_UCP reads them as Unicode categories, so for
+/// [`Target::Pcre`] they are written as their ASCII ranges: `printf
+/// 'x\331\240\n' | grep -c -e '[[:digit:]]$' -e '\(y\)\1'` is 0, and so is
+/// `printf 'x\302\240\n' | grep -c -e '[[:space:]]$' -e '\(y\)\1'`, as for
+/// GNU.
 fn push_bracket_class(out: &mut String, name: &str, target: Target, icase: bool) {
 	let name = if icase && matches!(name, "lower" | "upper") { "alpha" } else { name };
+	let pcre = target == Target::Pcre;
 	let written = match name {
 		"alpha" if target.unicode_letters() => r"\p{Alphabetic}",
 		"alnum" if target.unicode_letters() => r"\p{Alphabetic}\p{Nd}",
 		"lower" if target.unicode_letters() => r"\p{Lowercase}",
 		"upper" if target.unicode_letters() => r"\p{Uppercase}",
-		"digit" if target == Target::Pcre => "0-9",
-		"xdigit" if target == Target::Pcre => "0-9A-Fa-f",
+		"digit" if pcre => "0-9",
+		"xdigit" if pcre => "0-9A-Fa-f",
+		"space" if pcre => r"\x09-\x0D\x20",
+		"blank" if pcre => r"\x09\x20",
+		"cntrl" if pcre => r"\x00-\x1F\x7F",
+		"graph" if pcre => r"\x21-\x7E",
+		"print" if pcre => r"\x20-\x7E",
+		"punct" if pcre => r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E",
 		_ => {
 			out.push_str("[:");
 			out.push_str(name);
@@ -1524,6 +1564,33 @@ mod tests {
 		assert_eq!(
 			translate(r"\{1,2,3\}", Dialect::Basic, Target::Rust, false, Strictness::Lenient).ok(),
 			Some(r"\{1,2,3\}".to_owned())
+		);
+	}
+
+	#[test]
+	fn a_brace_that_makes_no_interval_after_an_anchor_is_text_to_grep() {
+		// If this regresses, `grep -cE '^{1,2,3}'` and `grep -cE 'x|^{}'` exit
+		// 2 with "Invalid content of \{\}", where GNU grep, which parses no
+		// repetition after an anchor, reads the brace as text and searches.
+		assert_eq!(ere("^{1,2,3}"), r"^\{1,2,3\}");
+		assert_eq!(ere("^{}"), r"^\{\}");
+		assert_eq!(ere("x|^{}"), r"x|^\{\}");
+		assert_eq!(ere("a${1,2,3}"), r"a$\{1,2,3\}");
+		assert_eq!(ere("^*{1,2,3}"), r"(?:^)*\{1,2,3\}");
+		assert_eq!(ere(r"\b{1,2,3}"), r"\b\{1,2,3\}");
+		assert_eq!(ere(r"\B{}"), r"\B\{\}");
+		assert_eq!(
+			translate(r"\B\{\}", Dialect::Basic, Target::Rust, false, Strictness::Lenient).ok(),
+			Some(r"\B\{\}".to_owned())
+		);
+		// After any other atom, a group closing on an anchor included, GNU
+		// refuses it, and so does GNU sed after an anchor.
+		for pattern in [r"\w{1,2,3}", "(^){1,2,3}", "a{1,2}{1,2,3}", "^{1,2,3}x{}"] {
+			assert_eq!(ere_err(pattern), Some(BreError::IntervalInvalid), "{pattern}");
+		}
+		assert_eq!(
+			translate(r"\b{}", Dialect::Extended, Target::Fancy, false, Strictness::Sed).err(),
+			Some(BreError::IntervalInvalid)
 		);
 	}
 
@@ -1808,7 +1875,14 @@ mod tests {
 		assert_eq!(pcre("[[:alnum:]]", false), r"[\p{Alphabetic}\p{Nd}]");
 		assert_eq!(pcre("[[:lower:]]", false), r"[\p{Lowercase}]");
 		assert_eq!(pcre("[[:upper:]]", false), r"[\p{Uppercase}]");
-		assert_eq!(pcre("[[:space:]]", false), "[[:space:]]");
+		// The other classes are the regex crate's ASCII ones: `printf
+		// 'x\302\240\n' | grep -c -e '[[:space:]]$' -e '\(y\)\1'` is 0.
+		assert_eq!(pcre("[[:space:]]", false), r"[\x09-\x0D\x20]");
+		assert_eq!(pcre("[^[:blank:]]", false), r"[^\x09\x20]");
+		assert_eq!(pcre("[[:cntrl:]]", false), r"[\x00-\x1F\x7F]");
+		assert_eq!(pcre("[[:graph:]]", false), r"[\x21-\x7E]");
+		assert_eq!(pcre("[[:print:]]", false), r"[\x20-\x7E]");
+		assert_eq!(pcre("[[:punct:]]", false), r"[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]");
 		// Without case `lower` and `upper` are `alpha`, as glibc reads them:
 		// PCRE2 folds no Unicode property, and `printf 'A\n' | grep -ci -e
 		// '^[[:lower:]]$' -e '\(y\)\1'` counts the line.
@@ -1875,6 +1949,15 @@ mod tests {
 		assert_eq!(bre_err(r"[:alpha:]a\{1"), Some(BreError::BraceUnmatched));
 		assert_eq!(ere_err("[:alpha:](a|b)x[[:foo:]]"), Some(BreError::ClassNameInvalid));
 		assert_eq!(bre_err("[:alpha:]x"), Some(BreError::ClassSyntaxConfused));
+		// A group still open is left for the engine, which refuses it as GNU
+		// does: `sed 's/[:alpha:]\(/x/'` is "Unmatched ( or \(", exit 1.
+		assert_eq!(bre_err(r"[:alpha:]\("), None);
+		assert_eq!(bre_err(r"\([:alpha:]"), None);
+		assert_eq!(
+			translate("[:alpha:](", Dialect::Extended, Target::Fancy, false, Strictness::Sed).err(),
+			None
+		);
+		assert_eq!(bre_err(r"\([:alpha:]\)"), Some(BreError::ClassSyntaxConfused));
 	}
 
 	#[test]

@@ -559,8 +559,8 @@ struct Options {
 /// alternation - compiled at the first match that needs them, once for
 /// every file and worker of the search; see [`pattern_alternatives`].
 struct Alternatives {
-	/// The alternatives that are plain strings, longest first, searched as
-	/// one engine.
+	/// The alternatives that are plain strings, searched as one engine of
+	/// fixed strings, which `build_matcher` sorts longest first.
 	literals:     Vec<String>,
 	/// The other alternatives, each searched alone.
 	patterns:     Vec<String>,
@@ -808,44 +808,40 @@ struct LongOption {
 	takes_value: bool,
 }
 
-/// The parser's own definition, built, which the option tables below read.
-fn built_command() -> clap::Command {
+/// The options `grep` accepts, read once from the parser's own definition.
+struct OptionTables {
+	/// Every long option, so whether a long option takes the next argument
+	/// is known for every name and abbreviation clap accepts (`--bef 1` is
+	/// `--before-context 1`).
+	long:         Vec<LongOption>,
+	/// The short options that take a value (`-e`, `-m`, `-A`, ...).
+	short_valued: Vec<char>,
+}
+
+static OPTIONS: LazyLock<OptionTables> = LazyLock::new(|| {
 	let mut command = GrepArgs::command();
 	command.build();
-	command
-}
-
-/// Whether `arg` takes the next argument as its value: it needs one, where
-/// `--color`'s is optional.
-fn takes_value(arg: &clap::Arg) -> bool {
-	arg.get_num_args().is_some_and(|range| range.min_values() > 0)
-}
-
-/// Every long option, read from the parser's own definition, so whether a
-/// long option takes the next argument is known for every name and
-/// abbreviation clap accepts (`--bef 1` is `--before-context 1`). An option
-/// whose value is optional (`--color`) does not take the next argument.
-static LONG_OPTIONS: LazyLock<Vec<LongOption>> = LazyLock::new(|| {
-	built_command()
-		.get_arguments()
-		.filter_map(|arg| {
-			let mut names = vec![arg.get_long()?.to_owned()];
-			if let Some(aliases) = arg.get_all_aliases() {
-				names.extend(aliases.into_iter().map(str::to_owned));
-			}
-			Some(LongOption { names, takes_value: takes_value(arg) })
-		})
-		.collect()
-});
-
-/// The short options that take a value (`-e`, `-m`, `-A`, ...), read from
-/// the parser's own definition as [`LONG_OPTIONS`] is.
-static SHORT_VALUE_OPTIONS: LazyLock<Vec<char>> = LazyLock::new(|| {
-	built_command()
-		.get_arguments()
-		.filter(|arg| takes_value(arg))
-		.filter_map(clap::Arg::get_short)
-		.collect()
+	// An option whose value is optional (`--color`) does not take the next
+	// argument.
+	let takes_value =
+		|arg: &clap::Arg| arg.get_num_args().is_some_and(|range| range.min_values() > 0);
+	OptionTables {
+		long:         command
+			.get_arguments()
+			.filter_map(|arg| {
+				let mut names = vec![arg.get_long()?.to_owned()];
+				if let Some(aliases) = arg.get_all_aliases() {
+					names.extend(aliases.into_iter().map(str::to_owned));
+				}
+				Some(LongOption { names, takes_value: takes_value(arg) })
+			})
+			.collect(),
+		short_valued: command
+			.get_arguments()
+			.filter(|&arg| takes_value(arg))
+			.filter_map(clap::Arg::get_short)
+			.collect(),
+	}
 });
 
 /// The long options `grep` has and GNU grep 3.11 does not. getopt reads a
@@ -864,14 +860,14 @@ fn long_option(name: &str) -> Option<&'static LongOption> {
 	if name.is_empty() {
 		return None;
 	}
-	if let Some(option) = LONG_OPTIONS.iter().find(|option| option.names.iter().any(|n| n == name)) {
+	let long = &OPTIONS.long;
+	if let Some(option) = long.iter().find(|option| option.names.iter().any(|n| n == name)) {
 		return Some(option);
 	}
 	let begins = |option: &&LongOption| option.names.iter().any(|n| n.starts_with(name));
-	only(LONG_OPTIONS.iter().filter(begins)).or_else(|| {
+	only(long.iter().filter(begins)).or_else(|| {
 		only(
-			LONG_OPTIONS
-				.iter()
+			long.iter()
 				.filter(begins)
 				.filter(|option| !BUILTIN_ONLY_LONG_OPTIONS.contains(&option.names[0].as_str())),
 		)
@@ -888,8 +884,8 @@ fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
 /// `--context=N`, as an argument of digits (`-5`) and as each run of digits
 /// in a group of short options (`-5e mid`, `-n2e mid`), an option's value
 /// attached with a leading `=` (`-e=x`, `-ve=x`) is passed apart, as clap
-/// would drop the `=`, and an abbreviated long option is written out in full
-/// as getopt resolves it (`--regex=zz` is `--regexp=zz`, and `--inc` is
+/// would drop the `=`, and a long option is written out by its full name as
+/// getopt resolves it (`--regex=zz` is `--regexp=zz`, and `--inc` is
 /// `--include`; see [`long_option`]). clap refuses an ambiguous one, as GNU
 /// does.
 ///
@@ -917,7 +913,7 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 				long.split_once('=').map_or((long, None), |(name, value)| (name, Some(value)));
 			let option = long_option(name);
 			value_pending = value.is_none() && option.is_some_and(|option| option.takes_value);
-			match option.filter(|option| !option.names.iter().any(|n| n == name)) {
+			match option {
 				Some(option) => normalized.push(OsString::from(match value {
 					Some(value) => format!("--{}={value}", option.names[0]),
 					None => format!("--{}", option.names[0]),
@@ -931,7 +927,7 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		// and the rest of the group, its value.
 		let (options, valued) = group.split_at(
 			group
-				.find(|option: char| SHORT_VALUE_OPTIONS.contains(&option))
+				.find(|option: char| OPTIONS.short_valued.contains(&option))
 				.unwrap_or(group.len()),
 		);
 		value_pending = valued.len() == 1;
@@ -1130,32 +1126,28 @@ const SEPARATE_ALTERNATIVE_LIMIT: usize = 64;
 /// each other alternative is searched alone.
 fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Alternatives> {
 	// `-P` is PCRE2, which prefers the first branch of an alternation as
-	// GNU's own `-P` does. Under `-x` a match is the whole line, so there is
-	// no longer one. Fixed strings come longest first (see `build_matcher`),
-	// which picks the longest at each position by itself, except where `-i`
-	// or `-w` make the main engine's strings longer or shorter than their
-	// text.
-	if spec.mode == MatchMode::Perl
-		|| spec.line_regexp
-		|| (spec.mode == MatchMode::Fixed && !spec.ignore_case && !spec.word)
-	{
+	// GNU's own `-P` does. Fixed strings come longest first (see
+	// `build_matcher`), so at a position the engine takes the longest that
+	// matches there by itself: under `-i` too, as they are counted in
+	// characters, and under `-w`, whose word test is tried after each string
+	// in turn. Under `-x` a match is the whole line, so there is no longer
+	// one.
+	let Some(dialect) = dialect_of(spec.mode) else {
+		return None;
+	};
+	if spec.line_regexp {
 		return None;
 	}
-	let dialect = dialect_of(spec.mode);
 	let mut literals = Vec::new();
 	let mut others = Vec::new();
 	for pattern in patterns {
-		let split = match dialect {
-			Some(dialect) => bre::alternatives(pattern, dialect, bre::Split::Grep),
-			None => vec![pattern.clone()],
-		};
-		for alternative in split {
+		for alternative in bre::alternatives(pattern, dialect, bre::Split::Grep) {
 			// An alternative that can only match the empty string is never
 			// printed; `grep -o -e '' -e zz` prints the matches of `zz`.
 			if alternative.is_empty() {
 				continue;
 			}
-			if dialect.is_none_or(|dialect| bre::is_literal(&alternative, dialect)) {
+			if bre::is_literal(&alternative, dialect) {
 				literals.push(alternative);
 			} else {
 				others.push(alternative);
@@ -1175,8 +1167,7 @@ fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Altern
 	if trivial || (literals.is_empty() && others.is_empty()) {
 		return None;
 	}
-	// Counted in characters, as `build_matcher` counts fixed strings.
-	literals.sort_by_cached_key(|literal| std::cmp::Reverse(literal.chars().count()));
+	// `build_matcher` sorts the plain strings as it sorts fixed strings.
 	Some(Alternatives {
 		literals,
 		patterns: others,
@@ -3934,10 +3925,15 @@ mod tests {
 		assert_eq!(alternatives.literals.len(), 1000);
 		assert!(alternatives.patterns.is_empty());
 		assert_eq!(alternatives.engines(false).map(<[Engine]>::len), Some(1));
-		// Longest first, counted in characters.
-		let words = ["a", "ab", "\u{17f}\u{17f}", "abc"].map(str::to_owned);
-		let alternatives = pattern_alternatives(&words, BRE_SPEC).expect("searched apart");
-		assert_eq!(alternatives.literals, ["abc", "ab", "\u{17f}\u{17f}", "a"]);
+		// Fixed strings are already that one engine, which `build_matcher`
+		// sorts longest first, under `-i` and `-w` too.
+		for spec in [
+			MatcherSpec { mode: MatchMode::Fixed, ..BRE_SPEC },
+			MatcherSpec { mode: MatchMode::Fixed, ignore_case: true, ..BRE_SPEC },
+			MatcherSpec { mode: MatchMode::Fixed, word: true, ..BRE_SPEC },
+		] {
+			assert!(pattern_alternatives(&words, spec).is_none());
+		}
 		// The others are searched alone, beside the strings' one engine.
 		let mixed = ["ab", "a\\+", "b*c", "x"].map(str::to_owned);
 		let alternatives = pattern_alternatives(&mixed, BRE_SPEC).expect("searched apart");
@@ -3966,7 +3962,8 @@ mod tests {
 		// If this regresses, `grep -r --inc='*.x' foo tree` exits 2 because
 		// `--inc` also begins `--include-dir`, an option GNU grep lacks,
 		// where GNU reads it as `--include`.
-		let argv = ["grep", "--inc=*.x", "--m", "1", "--regex=zz", "--colo", "--in", "-n2e", "--x"];
+		let argv =
+			["grep", "--inc=*.x", "--m", "1", "--regex=zz", "--colo", "--silent", "--in", "-n2e", "--x"];
 		let normalized = normalize_context_args(argv.into_iter().map(OsString::from).collect());
 		assert_eq!(normalized, [
 			"grep",
@@ -3975,6 +3972,8 @@ mod tests {
 			"1",
 			"--regexp=zz",
 			"--color",
+			// An alias is written as the option's own name.
+			"--quiet",
 			// Ambiguous to GNU as well.
 			"--in",
 			"-n",
@@ -3989,7 +3988,7 @@ mod tests {
 	fn the_short_options_that_take_a_value_are_read_from_the_parser() {
 		// If this regresses, a group such as `-n2e mid` no longer passes
 		// `mid` to `-e`, or reads an option's value as options.
-		let mut short = SHORT_VALUE_OPTIONS.clone();
+		let mut short = OPTIONS.short_valued.clone();
 		short.sort_unstable();
 		assert_eq!(short, ['A', 'B', 'C', 'D', 'd', 'e', 'f', 'm']);
 	}

@@ -69,6 +69,30 @@ describe("builtin grep: a malformed interval", () => {
 	]);
 });
 
+describe("builtin grep: a brace that makes no interval after an anchor", () => {
+	cases([
+		// Regressed: refused with "Invalid content of \{\}" and exit 2; GNU parses no repetition after `^` and reads the brace as text.
+		[String.raw`printf '{1,2,3}\n' | grep -cE '^{1,2,3}'`, "1\n", 0],
+		// Regressed: the same for an interval with no count.
+		[String.raw`printf '{}\n' | grep -cE '^{}'`, "1\n", 0],
+		// Regressed: the same at the start of a later branch.
+		[String.raw`printf '{}\n' | grep -cE 'x|^{}'`, "1\n", 0],
+		// Regressed: the same after `$`, where the text cannot follow. (Joined: in a template `${` opens a substitution.)
+		[String.raw`printf 'a{1,2,3}\n' | grep -cE 'a$` + "{1,2,3}'", "0\n", 1],
+		// Regressed: the same after a repeated `^`.
+		[String.raw`printf '{1,2,3}\n' | grep -cE '^*{1,2,3}'`, "1\n", 0],
+		// Regressed: the same after `\b`.
+		[String.raw`printf 'x{1,2,3}\n' | grep -cE '\b{1,2,3}'`, "1\n", 0],
+		// Regressed: the same after `\B`.
+		[String.raw`printf '{}\n' | grep -cE '\B{}'`, "1\n", 0],
+		// The same in a BRE.
+		[String.raw`printf '{}\n' | grep -c '\B\{\}'`, "1\n", 0],
+		// After any other atom GNU refuses it, a group that holds an anchor included.
+		[String.raw`printf 'x{1,2,3}\n' | grep -cE '\w{1,2,3}'`, "", 2],
+		[String.raw`printf 'x\n' | grep -cE '(^){1,2,3}'`, "", 2],
+	]);
+});
+
 describe("builtin grep: `^` after an assertion in a BRE", () => {
 	cases([
 		// Regressed: `^` after `\<` anchors, so the line `a` is selected; GNU reads it as a caret and selects nothing.
@@ -98,6 +122,12 @@ describe("builtin grep: the classes of a pattern list holding a back-reference",
 		[String.raw`printf 'A\n' | grep -ci -e '^[[:lower:]]$' -e '\(y\)\1'`, "1\n", 0],
 		// Regressed: `中` has no case, and GNU counts it all the same.
 		[String.raw`printf '\344\270\255\n' | grep -ci '^[[:lower:]]$'`, "1\n", 0],
+		// Regressed: a no-break space is a space to PCRE2, which a back-reference sends the patterns to, and not to GNU.
+		[String.raw`printf 'x\302\240\n' | grep -c -e '[[:space:]]$' -e '\(y\)\1'`, "0\n", 1],
+		// Regressed: the same for a list that negates it.
+		[String.raw`printf 'x\302\240\n' | grep -c -e 'x[^[:space:]]$' -e '\(y\)\1'`, "1\n", 0],
+		// A tab is a space either way.
+		[String.raw`printf 'x\t\n' | grep -c -e 'x[[:space:]]$' -e '\(y\)\1'`, "1\n", 0],
 	]);
 });
 
