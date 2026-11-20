@@ -85,13 +85,16 @@ pub(super) fn killed(
 	let pad = (24 - i64::try_from(desc.len()).unwrap_or(24)).unsigned_abs();
 	let msg = format!("{pid:>5} {desc}{:w$}", "", w = usize::try_from(pad).unwrap_or(0));
 	let line = wait_line(vp, op.node);
-	let mut bytes = k.render_diag(cx, vp, line, &Diag::Warning { msg: msg.into() });
-	// The command text goes in as bytes: a diagnostic's text is UTF-8.
+	let diag = Diag::Warning { msg: msg.into() };
+	let mut bytes = k.render_quiet(cx, vp, line, &diag);
+	// The command text goes in as bytes: a diagnostic's text is UTF-8. The
+	// `Diag` event carries the whole notice, the command too.
 	if bytes.last() == Some(&b'\n') {
 		bytes.pop();
 	}
 	bytes.extend_from_slice(&text);
 	bytes.push(b'\n');
+	k.diag_event(cx, vp, &diag, &text);
 	Killed { notice: Some(BString::from(bytes)), no_fork: false }
 }
 

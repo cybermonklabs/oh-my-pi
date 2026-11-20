@@ -1023,7 +1023,7 @@ impl Kernel {
 	/// queue the bytes with their own output to keep stdout/stderr order.
 	pub fn render_diag(&mut self, cx: &mut Cx<'_>, vp: &Vproc, line: u32, diag: &Diag) -> Vec<u8> {
 		let bytes = self.render_quiet(cx, vp, line, diag);
-		self.diag_event(cx, vp, diag);
+		self.diag_event(cx, vp, diag, b"");
 		bytes
 	}
 
@@ -1065,10 +1065,13 @@ impl Kernel {
 		render(diag, DiagSite { shell_name, origin, line, utf8 })
 	}
 
-	/// The `Diag` event of a diagnostic `vp` prints.
-	fn diag_event(&mut self, cx: &mut Cx<'_>, vp: &Vproc, diag: &Diag) {
+	/// The `Diag` event of a diagnostic `vp` prints, `tail` after its text
+	/// (bytes, which a diagnostic's text is not: the command of bash's
+	/// killed-command notice).
+	fn diag_event(&mut self, cx: &mut Cx<'_>, vp: &Vproc, diag: &Diag, tail: &[u8]) {
 		if self.mask.contains(crate::bash::event::EventKind::Diag) {
-			let message = BString::from(diag.to_string());
+			let mut message = BString::from(diag.to_string());
+			message.extend_from_slice(tail);
 			self.emit(cx, (vp.vpid, vp.mode), vp.runs.front(), EventData::Diag {
 				code:    diag.code(),
 				message: BStr::new(&message),
