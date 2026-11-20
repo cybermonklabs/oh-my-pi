@@ -747,14 +747,85 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_descendant_of_the_utility_does_not_outlive_the_query() {
+	let dir = tempfile::tempdir().unwrap();
+	let descendant = query_leaving_a_descendant(dir.path());
+	assert_ended(descendant);
+}
+
+/// The same on a kernel before Linux 6.9, which cannot signal a process
+/// group through a handle: there each member of the group is signalled
+/// through a handle of its own. The test thread sees such a kernel
+/// ([`as_linux_6_8`]), whatever kernel it runs on; GitHub's Ubuntu runners
+/// run 6.8, where the descendant survived every query.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_descendant_of_the_utility_does_not_outlive_the_query_before_linux_6_9() {
+	as_linux_6_8();
+	let dir = tempfile::tempdir().unwrap();
+	let descendant = query_leaving_a_descendant(dir.path());
+	assert_ended(descendant);
+}
+
+/// Before Linux 6.9 the group's members are found by its number, so a group
+/// whose utility was reaped elsewhere — another thread's `waitpid(-1)` can
+/// do that — is not one the query may touch: the number may be anyone's by
+/// then. A member of such a group is left alone, and the same member of a
+/// group whose utility is still unreaped is ended.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
+	use std::io::BufRead as _;
+	use std::os::fd::FromRawFd as _;
+	use std::os::unix::process::CommandExt as _;
+
+	as_linux_6_8();
+	for reaped_elsewhere in [true, false] {
+		// The utility leads its own group and leaves a member in it.
+		let mut utility = Command::new("/bin/sh")
+			.args(["-c", "sleep 30 & echo $!; exec sleep 30"])
+			.process_group(0)
+			.stdout(std::process::Stdio::piped())
+			.spawn()
+			.unwrap();
+		let number = libc::pid_t::try_from(utility.id()).unwrap();
+		let mut line = String::new();
+		std::io::BufReader::new(utility.stdout.take().unwrap()).read_line(&mut line).unwrap();
+		let member: i32 = line.trim().parse().unwrap();
+		// SAFETY: a handle on this test's own unreaped child, owned from here.
+		let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+		let handle = super::ChildHandle(
+			unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) },
+			number,
+		);
+		if reaped_elsewhere {
+			utility.kill().unwrap();
+			utility.wait().unwrap();
+		}
+		handle.end_group();
+		if reaped_elsewhere {
+			std::thread::sleep(std::time::Duration::from_millis(200));
+			// SAFETY: a signal-free existence probe for this test's process.
+			let alive = unsafe { libc::kill(member, 0) } == 0;
+			// SAFETY: the test cleans up what it started.
+			unsafe { libc::kill(member, libc::SIGKILL) };
+			assert!(alive, "a member of a group whose utility was reaped elsewhere was signalled");
+		} else {
+			utility.wait().unwrap();
+			assert_ended(member);
+		}
+	}
+}
+
+/// Runs a query whose utility leaves a descendant that closes the pipe it
+/// inherited and sleeps, records that descendant's process id (`$!`; `$$`
+/// in a subshell is still the shell's), answers, and exits 0. Asserts the
+/// answer, and returns the descendant's process id.
+#[cfg(target_os = "linux")]
+fn query_leaving_a_descendant(dir: &Path) -> i32 {
 	use std::os::unix::fs::PermissionsExt as _;
 
-	let dir = tempfile::tempdir().unwrap();
-	let program = dir.path().join("locale");
-	let marker = dir.path().join("descendant");
-	// The utility leaves a descendant that closes the pipe it inherited and
-	// sleeps, records that descendant's process id (`$$` in a subshell is
-	// still the shell's), answers, and exits 0.
+	let program = dir.join("locale");
+	let marker = dir.join("descendant");
 	let body = format!(
 		"#!/bin/sh\n(exec 1>&-; exec sleep 30) &\necho $! > '{}'\nprintf 'ISO-8859-1\\n'\nexit 0\n",
 		marker.display()
@@ -763,10 +834,20 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
 	let env = |_: &str| None;
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
-	assert!(matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"), "{answer:?}");
 	let descendant: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
-	// The kill is delivered as the group leader is reaped; give it the
-	// moment the scheduler needs, then insist the process is gone.
+	if !matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1") {
+		// SAFETY: the test cleans up what it started before failing.
+		unsafe { libc::kill(descendant, libc::SIGKILL) };
+		panic!("{answer:?}");
+	}
+	descendant
+}
+
+/// Fails unless the process `descendant` is gone. The kill is delivered as
+/// the group leader is reaped; this gives it the moment the scheduler
+/// needs, then insists.
+#[cfg(target_os = "linux")]
+fn assert_ended(descendant: i32) {
 	for _ in 0..200 {
 		// SAFETY: a signal-free existence probe for a process this test
 		// started and does not reap.
@@ -778,6 +859,60 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 	// SAFETY: as above; the test cleans up what it started before failing.
 	unsafe { libc::kill(descendant, libc::SIGKILL) };
 	panic!("the descendant {descendant} outlived the query");
+}
+
+/// Makes this thread, and every process and thread it starts from now on,
+/// see a kernel before Linux 6.9 in the one way the locale query depends
+/// on: `pidfd_send_signal` with `PIDFD_SIGNAL_PROCESS_GROUP` (4) fails with
+/// `EINVAL`, as 6.8 answers any flag (`kernel/signal.c:3890-3892`). A
+/// seccomp filter belongs to the thread that installs it and lasts until
+/// that thread ends, so the rest of the test binary is untouched.
+///
+/// Before it returns it checks the filter took: a call with flag 4 and a
+/// descriptor no process can have open answers `EINVAL`, where Linux 6.9
+/// and later answer `EBADF`.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn as_linux_6_8() {
+	// `linux/filter.h`, `linux/bpf_common.h` and `linux/audit.h`:
+	// `BPF_LD | BPF_W | BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_RET | BPF_K`.
+	const LD_W_ABS: u16 = 0x20;
+	const JMP_JEQ_K: u16 = 0x15;
+	const RET_K: u16 = 0x06;
+	const ARCH: u32 = if cfg!(target_arch = "x86_64") { 0xc000_003e } else { 0xc000_00b7 };
+	// `struct seccomp_data`: `nr` at 0, `arch` at 4, `args[3]` at 40 (its
+	// low 32 bits on these little-endian architectures).
+	const NR: u32 = 0;
+	const ARCH_AT: u32 = 4;
+	const FLAGS_AT: u32 = 16 + 3 * 8;
+	let at = |code, k| libc::sock_filter { code, jt: 0, jf: 0, k };
+	let jeq = |k, jt, jf| libc::sock_filter { code: JMP_JEQ_K, jt, jf, k };
+	let mut filter = [
+		at(LD_W_ABS, ARCH_AT),
+		jeq(ARCH, 1, 0),
+		at(RET_K, libc::SECCOMP_RET_ALLOW),
+		at(LD_W_ABS, NR),
+		jeq(u32::try_from(libc::SYS_pidfd_send_signal).unwrap(), 0, 3),
+		at(LD_W_ABS, FLAGS_AT),
+		jeq(4, 0, 1),
+		at(RET_K, libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EINVAL).unwrap()),
+		at(RET_K, libc::SECCOMP_RET_ALLOW),
+	];
+	let program = libc::sock_fprog { len: u16::try_from(filter.len()).unwrap(), filter: filter.as_mut_ptr() };
+	// SAFETY: `no_new_privs` and a filter for this thread, from a program
+	// that outlives the call; neither touches memory of this process.
+	unsafe {
+		assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+		assert_eq!(
+			libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const program),
+			0,
+			"{}",
+			std::io::Error::last_os_error()
+		);
+	}
+	// SAFETY: signals nothing: the descriptor is not open.
+	let sent = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, libc::c_int::MAX, 0, 0usize, 4u32) };
+	let err = std::io::Error::last_os_error();
+	assert!(sent < 0 && err.raw_os_error() == Some(libc::EINVAL), "the filter did not take: {sent}, {err}");
 }
 
 /// A standard descriptor the caller has closed must not become the answer.

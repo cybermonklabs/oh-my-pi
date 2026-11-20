@@ -1077,11 +1077,16 @@ enum Completion {
 /// through the handle, where a signal fails with `ESRCH` once that process
 /// is gone rather than reaching whoever took its number.
 ///
+/// The second field is the child's number, which is also its process
+/// group's. It is only ever compared, never signalled: on a kernel before
+/// Linux 6.9 [`ChildHandle::end_group`] uses it to find the group's members,
+/// and signals each through a handle of its own.
+///
 /// Where neither exists — a kernel without `CLONE_PIDFD` or without waiting
 /// by handle, or any Unix that is not Linux — no query is started, because
 /// its child could not be ended safely afterwards.
 #[cfg(target_os = "linux")]
-struct ChildHandle(std::os::fd::OwnedFd);
+struct ChildHandle(std::os::fd::OwnedFd, libc::pid_t);
 
 /// `CLONE_PIDFD`: hand back a handle on the new child.
 #[cfg(target_os = "linux")]
@@ -1554,8 +1559,12 @@ fn start_locale_utility(
 	// SAFETY: a fresh descriptor the kernel wrote for a child it made,
 	// owned from here. Either call fills it in whenever it succeeds with
 	// `CLONE_PIDFD`: `clone3` through `pidfd`, `clone` through `parent_tid`.
-	let started = (child > 0 && handle >= 0)
-		.then(|| ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(handle) }));
+	let started = (child > 0 && handle >= 0).then(|| {
+		ChildHandle(
+			unsafe { std::os::fd::OwnedFd::from_raw_fd(handle) },
+			libc::pid_t::try_from(child).unwrap_or_default(),
+		)
+	});
 	// Read before the mask call below, which reports through its return
 	// value and leaves `errno` as it finds it.
 	let spawned = match (child < 0, started.is_some()) {
@@ -1662,31 +1671,20 @@ impl ChildHandle {
 
 	/// Ends the utility and everything left in its process group.
 	///
-	/// A kernel that does not know `PIDFD_SIGNAL_PROCESS_GROUP` (before
-	/// Linux 6.9) ends the utility alone; a descendant it left in the group
-	/// outlives the query there, which is the one thing this handle buys
-	/// less of than a group signal by number — and a group signal by number
-	/// is what reached somebody else's processes.
+	/// From Linux 6.9 the group is signalled through the handle
+	/// (`PIDFD_SIGNAL_PROCESS_GROUP`). An older kernel refuses that flag with
+	/// `EINVAL` (6.8 `kernel/signal.c:3890-3892`); GitHub's Ubuntu runners
+	/// run 6.8, where a descendant outlived every query. There each member
+	/// is signalled through a handle of its own ([`end_members`]), and the
+	/// utility through this one, in case it left its group.
 	#[cfg(unix)]
 	fn end_group(&self) {
-		use std::os::fd::AsRawFd as _;
-
-		for flags in [PIDFD_SIGNAL_PROCESS_GROUP, 0] {
-			// SAFETY: the descriptor is this handle's and the siginfo
-			// pointer is null, which asks the kernel to synthesise one.
-			let sent = unsafe {
-				libc::syscall(
-					libc::SYS_pidfd_send_signal,
-					self.0.as_raw_fd(),
-					libc::SIGKILL,
-					std::ptr::null_mut::<libc::siginfo_t>(),
-					flags,
-				)
-			};
-			if sent >= 0 {
-				return;
-			}
+		match pidfd_signal(&self.0, libc::SIGKILL, PIDFD_SIGNAL_PROCESS_GROUP) {
+			Ok(()) => return,
+			Err(err) if err.raw_os_error() == Some(libc::EINVAL) => end_members(self),
+			Err(_) => {},
 		}
+		let _ = pidfd_signal(&self.0, libc::SIGKILL, 0);
 	}
 
 	/// Reaps the utility and reports how it ended.
@@ -1717,6 +1715,110 @@ impl ChildHandle {
 			}
 		}
 	}
+}
+
+/// Signals the process `handle` names; `flags` as `pidfd_send_signal` takes
+/// them.
+#[cfg(target_os = "linux")]
+fn pidfd_signal(handle: &std::os::fd::OwnedFd, signal: libc::c_int, flags: libc::c_uint) -> std::io::Result<()> {
+	use std::os::fd::AsRawFd as _;
+
+	// SAFETY: the descriptor is the caller's and the siginfo pointer is
+	// null, which asks the kernel to synthesise one.
+	let sent = unsafe {
+		libc::syscall(
+			libc::SYS_pidfd_send_signal,
+			handle.as_raw_fd(),
+			signal,
+			std::ptr::null_mut::<libc::siginfo_t>(),
+			flags,
+		)
+	};
+	if sent >= 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// Ends every live process in the utility's process group, each through a
+/// handle of its own, on a kernel that cannot signal a group through a
+/// handle. No signal goes by number: a group signalled by its number reaches
+/// whoever holds that number by then, and another thread's `waitpid(-1)` can
+/// reap the utility at any moment and free it (see
+/// `a_competing_reaper_does_not_turn_the_query_into_a_stray_signal`). Exit
+/// signal 0 does not stop that: `execve` puts `SIGCHLD` back (6.8
+/// `fs/exec.c:1180`).
+///
+/// A member is signalled only when this has shown it to be one, with the
+/// utility still holding the group's number (Linux 6.8):
+/// 1. a handle is opened on a process `/proc` lists in the group;
+/// 2. `/proc/<number>/stat` is read again and names the group;
+/// 3. the handle's process is still there (a signal 0 through the handle
+///    succeeds), so the number was not released between 1 and 3, and the
+///    read in 2 was that process's: a number is released only when no task
+///    holds it (`__change_pid`, `kernel/pid.c:340-357`), and a zombie holds
+///    its own until it is reaped (`release_task` → `__unhash_process`,
+///    `kernel/exit.c:127-134`);
+/// 4. after every member is read, the utility is still unreaped, so it held
+///    the group's number at each read in 2, and the group was this query's.
+///    A utility reaped elsewhere ends the walk with nothing signalled.
+///
+/// A member can fork while the others are ended, so the walk is repeated
+/// until it finds none alive, a bounded number of times. One that calls
+/// `setsid` or `setpgid` has left the group and is beyond this, as it is
+/// from Linux 6.9 on.
+#[cfg(target_os = "linux")]
+fn end_members(utility: &ChildHandle) {
+	use std::os::fd::FromRawFd as _;
+
+	let group = utility.1;
+	if group <= 0 {
+		return;
+	}
+	for round in 0..16 {
+		let Ok(listing) = std::fs::read_dir("/proc") else { return };
+		let mut members = Vec::new();
+		for entry in listing.flatten() {
+			let Some(number) = entry.file_name().to_str().and_then(|name| name.parse::<libc::pid_t>().ok()) else {
+				continue;
+			};
+			if !live_member(number, group) {
+				continue;
+			}
+			// SAFETY: opening a handle signals nothing.
+			let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+			let Ok(fd) = libc::c_int::try_from(opened) else { continue };
+			if fd < 0 {
+				continue;
+			}
+			// SAFETY: a descriptor the kernel just opened, owned from here.
+			let handle = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+			if live_member(number, group) && pidfd_signal(&handle, 0, 0).is_ok() {
+				members.push(handle);
+			}
+		}
+		if members.is_empty() || utility.ended().is_err() {
+			return;
+		}
+		for member in &members {
+			let _ = pidfd_signal(member, libc::SIGKILL, 0);
+		}
+		if round > 0 {
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+	}
+}
+
+/// Whether `/proc` shows the process `number` alive (not a zombie) in the
+/// process group `group`. `stat`'s second field is the command in
+/// parentheses, which can hold anything, so the fields are read after the
+/// last `)`: the state, the parent, then the process group.
+#[cfg(target_os = "linux")]
+fn live_member(number: libc::pid_t, group: libc::pid_t) -> bool {
+	let Ok(stat) = std::fs::read(format!("/proc/{number}/stat")) else { return false };
+	let Some(end) = stat.iter().rposition(|byte| *byte == b')') else { return false };
+	let mut fields = stat[end + 1..].split(u8::is_ascii_whitespace).filter(|field| !field.is_empty());
+	let (Some(state), Some(_parent), Some(pgrp)) = (fields.next(), fields.next(), fields.next()) else {
+		return false;
+	};
+	state != b"Z" && state != b"X" && std::str::from_utf8(pgrp).ok().and_then(|pgrp| pgrp.parse().ok()) == Some(group)
 }
 
 /// Ends the locale utility and everything left in its process group, within
