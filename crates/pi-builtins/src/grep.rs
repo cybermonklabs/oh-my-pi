@@ -932,11 +932,12 @@ fn translate_patterns(
 /// that is not UTF-8 each character outside ASCII is written as the escapes
 /// of its UTF-8 bytes, which that crate reads with Unicode off as those
 /// bytes, in a bracket expression too, as GNU grep reads them in the C
-/// locale. A pattern byte that is no UTF-8 (`spec.raw_bytes`; one that is
-/// still a character here, of a fixed string) is written as that byte.
+/// locale. A fixed string's byte that is no UTF-8 (`spec.raw_bytes`) is
+/// written as that byte; [`bre::translate_raw`] has already written every
+/// such byte of a pattern of either dialect.
 fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 	use std::fmt::Write as _;
-	if !(spec.bytes || spec.raw_bytes) || pattern.is_ascii() {
+	if !(spec.bytes || (spec.raw_bytes && spec.mode == MatchMode::Fixed)) || pattern.is_ascii() {
 		return pattern;
 	}
 	let target = if spec.bytes { bre::Target::RustBytes } else { bre::Target::Rust };
@@ -946,7 +947,7 @@ fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 			escaped.push(c);
 			continue;
 		}
-		if let Some(byte) = bre::raw_byte(c).filter(|_| spec.raw_bytes) {
+		if let Some(byte) = bre::char_byte(c).filter(|_| spec.raw_bytes) {
 			bre::push_raw_byte(&mut escaped, byte, target);
 			continue;
 		}
@@ -962,17 +963,21 @@ fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 }
 
 /// The `-P` pattern `pattern` - in PCRE2's own syntax - as PCRE2 reads the
-/// bytes GNU's `grep -P` passes it, where it holds a byte that is no UTF-8
-/// (`spec.raw_bytes`). In a UTF-8 locale GNU compiles it with PCRE2_UTF,
-/// which refuses it with PCRE2's message: `grep -P $'\351'` is "UTF-8
-/// error: 2 bytes missing at end", exit 2. In the C locale (`spec.bytes`)
-/// such a byte is written as PCRE2's escape of it, which it reads without
-/// PCRE2_UTF as that byte: after a backslash the escape is completed, as
-/// `\` before the byte is the byte, and in `\Q…\E` the quoting is closed
-/// around it.
+/// bytes GNU's `grep -P` passes it, where a pattern holds a byte that is no
+/// UTF-8 (`spec.raw_bytes`, which the caller checks). In a UTF-8 locale GNU
+/// compiles it with PCRE2_UTF, which refuses such a byte with PCRE2's
+/// message: `grep -P $'\351'` is "UTF-8 error: 2 bytes missing at end", exit
+/// 2. In the C locale (`spec.bytes`) such a byte is written as PCRE2's
+/// escape of it, which it reads without PCRE2_UTF as that byte: after a
+/// backslash the escape is completed, as `\` before the byte is the byte,
+/// and in `\Q…\E` the quoting is closed around it. The character after `\c`
+/// is its operand, taken as it is, so the byte is written there as the
+/// character of its value, which PCRE2 refuses as it refuses GNU's byte:
+/// `LC_ALL=C grep -P $'\\c\351'` is "\c must be followed by a printable
+/// ASCII character", exit 2, and in `\c\` the backslash opens no escape.
 fn perl_syntax(pattern: &str, spec: MatcherSpec) -> Result<String, String> {
 	use std::fmt::Write as _;
-	if !spec.raw_bytes || !pattern.chars().any(|c| bre::raw_byte(c).is_some()) {
+	if !pattern.chars().any(|c| bre::char_byte(c).is_some()) {
 		return Ok(pattern.to_owned());
 	}
 	if !spec.bytes {
@@ -982,14 +987,28 @@ fn perl_syntax(pattern: &str, spec: MatcherSpec) -> Result<String, String> {
 	let mut out = String::with_capacity(pattern.len() * 2);
 	let mut escaped = false;
 	let mut quoted = false;
+	// Whether `\c` came last, whose operand the next character is.
+	let mut control = false;
 	let mut chars = pattern.chars().peekable();
 	while let Some(c) = chars.next() {
-		if let Some(byte) = bre::raw_byte(c) {
-			let _ = match (escaped, quoted) {
-				(true, _) => write!(out, "x{{{byte:02X}}}"),
-				(false, true) => write!(out, r"\E\x{{{byte:02X}}}\Q"),
-				(false, false) => write!(out, r"\x{{{byte:02X}}}"),
-			};
+		let raw = bre::char_byte(c);
+		if control {
+			control = false;
+			out.push(raw.map_or(c, char::from));
+			continue;
+		}
+		if let Some(byte) = raw {
+			match (escaped, quoted) {
+				(true, _) => {
+					let _ = write!(out, "x{{{byte:02X}}}");
+				},
+				(false, true) => {
+					out.push_str(r"\E");
+					bre::push_raw_byte(&mut out, byte, bre::Target::PcreBytes);
+					out.push_str(r"\Q");
+				},
+				(false, false) => bre::push_raw_byte(&mut out, byte, bre::Target::PcreBytes),
+			}
 			escaped = false;
 			continue;
 		}
@@ -1003,6 +1022,7 @@ fn perl_syntax(pattern: &str, spec: MatcherSpec) -> Result<String, String> {
 		} else if escaped {
 			escaped = false;
 			quoted = c == 'Q';
+			control = c == 'c';
 		} else {
 			escaped = c == '\\';
 		}
@@ -2241,8 +2261,7 @@ async fn read_auxiliary_file(host: &mut Host, path: &OsStr) -> Result<Vec<u8>, S
 /// The lines of a pattern or glob file: none for an empty file, and none
 /// after a last newline.
 fn file_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-	let lines = if bytes.is_empty() { None } else { Some(bytes.strip_suffix(b"\n").unwrap_or(bytes)) };
-	lines.into_iter().flat_map(|lines| lines.split(|&byte| byte == b'\n'))
+	bytes.split_inclusive(|&byte| byte == b'\n').map(|line| line.strip_suffix(b"\n").unwrap_or(line))
 }
 
 /// The patterns of a search, each as [`bre::pattern_text`] writes it: GNU
@@ -4146,6 +4165,15 @@ mod tests {
 		assert_eq!(written(b"\\\xe9", spec), Ok(r"\x{E9}".to_owned()));
 		assert_eq!(written(b"\\\\\xe9", spec), Ok(r"\\\x{E9}".to_owned()));
 		assert_eq!(written(b"\\Qa\xe9b\\E", spec), Ok(r"\Qa\E\x{E9}\Qb\E".to_owned()));
+		// After `\c` the byte is itself, which PCRE2 refuses, as it does for
+		// GNU grep 3.11 ("\c must be followed by a printable ASCII
+		// character", exit 2); in `\c\` the backslash is the operand of `\c`,
+		// and in `\c\\` the second backslash escapes the byte.
+		assert_eq!(written(b"\\c\xe9", spec), Ok("\\c\u{e9}".to_owned()));
+		assert!(build_matcher(&[bre::pattern_text(b"\\c\xe9").0], spec).is_err());
+		assert_eq!(written(b"\\c\\\xe9", spec), Ok(r"\c\\x{E9}".to_owned()));
+		assert_eq!(written(b"\\c\\\\\xe9", spec), Ok(r"\c\\x{E9}".to_owned()));
+		assert_eq!(written(b"\\cA\xe9", spec), Ok(r"\cA\x{E9}".to_owned()));
 		let utf8 = MatcherSpec { bytes: false, ..spec };
 		assert_eq!(written(b"\xe9", utf8), Err("UTF-8 error: 2 bytes missing at end".to_owned()));
 		// PCRE2's own check, as GNU grep 3.11 reports it.
@@ -4161,6 +4189,27 @@ mod tests {
 			assert_eq!(pcre2_utf8_error(bytes), Some(message), "{bytes:?}");
 		}
 		assert_eq!(pcre2_utf8_error("café".as_bytes()), None);
+	}
+
+	#[test]
+	fn a_pattern_file_holds_a_line_per_newline_and_none_after_the_last() {
+		// If this regresses, `grep -f` of an empty file searches for the
+		// empty pattern, which selects every line, or the newline that ends
+		// a file adds the empty pattern, as GNU grep 3.11 does not.
+		let cases: [(&str, &[&str]); 7] = [
+			("", &[]),
+			("a", &["a"]),
+			("a\n", &["a"]),
+			("a\n\n", &["a", ""]),
+			("\n", &[""]),
+			("\n\n", &["", ""]),
+			("a\nb", &["a", "b"]),
+		];
+		for (text, lines) in cases {
+			let read: Vec<&str> =
+				file_lines(text.as_bytes()).map(|line| std::str::from_utf8(line).unwrap()).collect();
+			assert_eq!(read, lines, "{text:?}");
+		}
 	}
 }
 

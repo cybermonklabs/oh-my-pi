@@ -20,6 +20,8 @@ beforeAll(async () => {
 	await fs.writeFile(path.join(dir, "u8"), "café\nabc\nnaïve\n");
 	await fs.writeFile(path.join(dir, "g"), "a\nb\nc\na\n");
 	await fs.writeFile(path.join(dir, "pf"), Buffer.from("\xe9\n", "latin1"));
+	// `ctl` holds the control character 0x1C, which `\c\` is, before 0xE9 and before the text `x{E9}`.
+	await fs.writeFile(path.join(dir, "ctl"), Buffer.from("a\x1c\xe9b\nx\x1cx{E9}\n", "latin1"));
 });
 
 afterAll(async () => {
@@ -55,6 +57,11 @@ describe("builtin grep: a pattern byte that is not UTF-8, in the C locale", () =
 		[String.raw`LC_ALL=C grep $'\351' inv`, "caf\xe9\n", 0],
 		[String.raw`LC_ALL=C grep -E $'a|\377\376' inv`, "caf\xe9\nab\xffc\n\xff\xfe\n", 0],
 		[String.raw`LC_ALL=C grep -P $'.\377' inv`, "ab\xffc\n", 0],
+		// The byte after `\c` is its operand, taken as it is, which PCRE2 refuses ("\c must be followed by a
+		// printable ASCII character"); in `\c\` the backslash is that operand, and the byte after it is itself.
+		[String.raw`LC_ALL=C grep -P $'\\c\351' inv`, "", 2],
+		[String.raw`LC_ALL=C grep -P $'\\c\\\351' ctl`, "a\x1c\xe9b\n", 0],
+		[String.raw`LC_ALL=C grep -P $'\\c\\\\\351' ctl`, "a\x1c\xe9b\n", 0],
 		// Already so: a negated list of U+FFFD held every byte of these lines too.
 		[String.raw`LC_ALL=C grep -c $'[^\351]' inv`, "5\n", 0],
 		// Regressed: the same for a pattern file.
