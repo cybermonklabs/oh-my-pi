@@ -230,9 +230,12 @@ describe("published legal payloads", () => {
 			}
 			// The modules a shipped module imports, followed to every module they import in turn.
 			const queue = [...needed].filter(file => file.endsWith(".js"));
+			const transpiler = new Bun.Transpiler({ loader: "js" });
 			for (let file = queue.pop(); file !== undefined; file = queue.pop()) {
 				const source = await Bun.file(path.join(nativesDir, file)).text();
-				for (const [, specifier] of source.matchAll(/\bfrom\s+"(\.{1,2}\/[^"]+)"/g)) {
+				// Bun's own parse: static, side-effect, re-export and dynamic imports and require calls.
+				for (const { path: specifier } of transpiler.scanImports(source)) {
+					if (!specifier.startsWith("./") && !specifier.startsWith("../")) continue;
 					const imported = path.posix.join(path.posix.dirname(file), specifier);
 					if (imported === "package.json" || needed.has(imported)) continue;
 					needed.add(imported);
