@@ -24,6 +24,7 @@ import * as path from "node:path";
 import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
+import { readEvalAgentJobRecord } from "../eval/agent-job-records";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
@@ -127,8 +128,8 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 			logger.debug("Interrupted subagent belongs to work its parent left; not restored", { id });
 			continue;
 		}
-		if (endsOnCredentialUnavailableTurn(branch) && !spawns.awaitedByParent(sub, lastTurnStartedAt(branch))) {
-			logger.debug("Subagent's parent holds its failed result; not restored", { id });
+		if (endsOnCredentialUnavailableTurn(branch) && !spawns.parentStillWaits(sub, lastTurnStartedAt(branch))) {
+			logger.debug("Key-stranded subagent has no positive parent wait record; not restored", { id });
 			continue;
 		}
 		const ref = registry.get(id);
@@ -194,7 +195,10 @@ function endsOnStop(branch: readonly SessionEntry[]): boolean {
  * `current`, those its `task` results name in the conversation on the active branch
  * after its last `/clear` (`reset_boundary`); `named`, those of every `task` result,
  * on any branch; `held`, those whose result that conversation holds
- * ({@link heldResultAgentIds}), each with when its latest such result was written, in epoch ms.
+ * ({@link heldResultAgentIds}), each with when its latest such result was written, in epoch ms;
+ * `waitsOnSpawnsSince`, from when (epoch ms) that conversation still waits on every subagent
+ * spawned: the start of a `task` call that has no result (the call its process ended inside),
+ * or of a last turn its process cut off ({@link liveTurnStartedAt}); undefined without either.
  */
 interface SpawnedSubagents {
 	current: Set<string>;
@@ -202,6 +206,11 @@ interface SpawnedSubagents {
 	held: Map<string, number>;
 	/** When that last `/clear` was written, in epoch ms; undefined without one. */
 	clearedAt: number | undefined;
+	waitsOnSpawnsSince: number | undefined;
+	/** Eval `agent()` jobs whose latest record in that conversation is `owed`: a result still owed to the parent. */
+	owedJobs: Set<string>;
+	/** Eval `agent()` jobs whose latest record is `delivered`, each with when it was written, in epoch ms. */
+	deliveredJobs: Map<string, number>;
 }
 
 /** The subagent ids a persisted `task` tool result names: its settled results and its spawns' progress. */
@@ -234,7 +243,20 @@ function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
 			.filter(result => wentOn || (!result.aborted && !result.workerLost))
 			.map(result => result.id);
 	}
+	if (toolName === "eval") return evalHeldAgentIds(details, wentOn);
 	return toolName === "wait" ? settledJobAgentIds(details) : [];
+}
+
+/** The subagent ids an `eval` result's `agentResults` names, read as a `task` result's ({@link heldResultAgentIds}). */
+function evalHeldAgentIds(details: unknown, wentOn: boolean): string[] {
+	if (!isRecord(details) || !Array.isArray(details.agentResults)) return [];
+	const ids: string[] = [];
+	for (const held of details.agentResults) {
+		if (!isRecord(held)) continue;
+		const id = stringProperty(held, "id");
+		if (id && (wentOn || (held.aborted !== true && held.workerLost !== true))) ids.push(id);
+	}
+	return ids;
 }
 
 /**
@@ -291,12 +313,40 @@ function lastTurnStartedAt(branch: readonly SessionEntry[]): number | undefined 
 	return undefined;
 }
 
+/**
+ * When the conversation's last turn began (epoch ms), while that turn was still live when the
+ * transcript was last written: it has no reply yet, ends in a tool call or a tool result, or ends
+ * on the record a process going away leaves ({@link isInterruptedTurnAbort}, {@link isReasonlessAbort}).
+ * Such a parent still waits on what that turn started. Undefined for a turn that ended.
+ */
+function liveTurnStartedAt(conversation: readonly SessionEntry[]): number | undefined {
+	const tail = conversation.findLast(entry => entry.type === "message" || entry.type === "custom_message");
+	if (!tail) return undefined;
+	if (tail.type === "message" && tail.message.role === "assistant") {
+		const { message } = tail;
+		const endsInCall = message.content.some(part => part.type === "toolCall");
+		const exitRecord =
+			isInterruptedTurnAbort(message) ||
+			(message.stopReason === "aborted" &&
+				!isUserInterruptAbort(message) &&
+				message.errorMessage !== RETRY_CANCELLED);
+		if (!endsInCall && !exitRecord) return undefined;
+	}
+	return lastTurnStartedAt(conversation);
+}
+
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
 	const named = new Set<string>();
 	for (const entry of entries) for (const id of taskResultAgentIds(entry)) named.add(id);
 	const current = new Set<string>();
 	const held = new Map<string, number>();
 	let clearedAt: number | undefined;
+	let conversationStart = 0;
+	let pendingTaskCallAt: number | undefined;
+	const answeredCalls = new Set<string>();
+	const owedJobs = new Set<string>();
+	const deliveredJobs = new Map<string, number>();
+	const seenJobs = new Set<string>();
 	// Whether the parent took a turn after the entry being read ({@link parentWentOn}).
 	let wentOn = false;
 	const branch = activeBranch(entries, leafId);
@@ -304,14 +354,43 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		const entry = branch[index]!;
 		if (entry.type === "reset_boundary") {
 			clearedAt = Date.parse(entry.timestamp);
+			conversationStart = index + 1;
 			break;
+		}
+		if (entry.type === "message" && entry.message.role === "toolResult") answeredCalls.add(entry.message.toolCallId);
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const pending = entry.message.content.some(
+				part => part.type === "toolCall" && part.name === "task" && !answeredCalls.has(part.id),
+			);
+			// The message starts before the call is saved, and a streamed launch can spawn in between.
+			if (pending)
+				pendingTaskCallAt = Number.isFinite(entry.message.timestamp)
+					? entry.message.timestamp
+					: Date.parse(entry.timestamp);
+		}
+		const job = readEvalAgentJobRecord(entry);
+		// Read from the leaf back: the first record of a job is its latest.
+		if (job && !seenJobs.has(job.agentId)) {
+			seenJobs.add(job.agentId);
+			if (job.state === "owed") owedJobs.add(job.agentId);
+			else deliveredJobs.set(job.agentId, Date.parse(entry.timestamp));
 		}
 		for (const id of taskResultAgentIds(entry)) current.add(id);
 		// Read from the leaf back: the first result naming a subagent is its latest.
 		for (const id of heldResultAgentIds(entry, wentOn)) if (!held.has(id)) held.set(id, Date.parse(entry.timestamp));
 		if (parentWentOn(entry)) wentOn = true;
 	}
-	return { current, named, held, clearedAt };
+	const liveTurnAt = liveTurnStartedAt(branch.slice(conversationStart));
+	const since = [pendingTaskCallAt, liveTurnAt].filter((at): at is number => at !== undefined && Number.isFinite(at));
+	return {
+		current,
+		named,
+		held,
+		clearedAt,
+		waitsOnSpawnsSince: since.length > 0 ? Math.min(...since) : undefined,
+		owedJobs,
+		deliveredJobs,
+	};
 }
 
 /**
@@ -366,20 +445,31 @@ class SpawnRecords {
 	}
 
 	/**
-	 * Whether `sub`'s own parent still waits on its turn that began at `turnStartedAt`
-	 * (epoch ms): its current conversation holds no result that settles `sub`'s run
-	 * ({@link heldResultAgentIds}) written since. A sync spawn's parent whose process ended
-	 * inside the call has none: the call got no result, or the agent loop recorded the
-	 * result of the run that exit cut off, or of one lost with its worker thread, and the
-	 * parent took no turn after it. Nor has the parent of a background spawn whose job
-	 * result was never delivered. A result written before the turn began answered an
-	 * earlier turn, one the parent then messaged `sub` to go on from.
+	 * Whether `sub`'s own parent positively records that it still waits on `sub`'s turn that began
+	 * at `turnStartedAt` (epoch ms): a result in its current conversation names `sub`'s run and none
+	 * written since settles it, or no record names `sub` and the parent still waited on what it
+	 * spawned when `sub` was spawned ({@link SpawnedSubagents.waitsOnSpawnsSince}). Missing records
+	 * are not evidence: a parent can background a cell, leave a branch, or wait through another tool.
 	 */
-	awaitedByParent(sub: SubSession, turnStartedAt: number | undefined): boolean {
-		const heldAt = this.#ofParent(sub.parent)?.held.get(sub.agentId);
-		if (heldAt === undefined) return true;
-		// An unreadable or unknown time judges nothing, and the result stands.
-		return turnStartedAt !== undefined && heldAt < turnStartedAt;
+	parentStillWaits(sub: SubSession, turnStartedAt: number | undefined): boolean {
+		const parent = this.#ofParent(sub.parent);
+		if (!parent) return false;
+		// A job result handed over (or being handed over: `delivered` is written first) never runs again;
+		// a later turn the parent messaged the subagent for is a new run.
+		const deliveredAt = parent.deliveredJobs.get(sub.agentId);
+		if (deliveredAt !== undefined && !(turnStartedAt !== undefined && deliveredAt < turnStartedAt)) return false;
+		if (parent.current.has(sub.agentId)) {
+			const heldAt = parent.held.get(sub.agentId);
+			if (heldAt === undefined) return true;
+			// An unreadable or unknown time judges nothing, and the result stands.
+			return turnStartedAt !== undefined && heldAt < turnStartedAt;
+		}
+		if (parent.named.has(sub.agentId) || parent.held.has(sub.agentId)) return false;
+		if (parent.owedJobs.has(sub.agentId)) return true;
+		const since = parent.waitsOnSpawnsSince;
+		if (since === undefined || !sub.header) return false;
+		const spawnedAt = Date.parse(sub.header.timestamp);
+		return Number.isFinite(spawnedAt) && spawnedAt >= since;
 	}
 
 	/** What the parent `key` records (`null`: the session itself); undefined for a parent not collected. */

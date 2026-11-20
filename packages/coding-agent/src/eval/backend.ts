@@ -3,7 +3,7 @@ import { contextLocalProtocolOptions } from "../internal-urls/context";
 import type { OutputArtifactError } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../tools";
 import type { BackendProbeOptions } from "./probe";
-import type { EvalLanguage, EvalStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
+import type { EvalHeldAgentResult, EvalLanguage, EvalStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
 import type { EvalDisplayOutput } from "./types";
 
 /** Per-cell execute() options. */
@@ -43,6 +43,8 @@ export interface ExecutorBackendExecOptions {
 	 * `> out://`). Throws to refuse a reply; absent, such calls fail instead of replying unseen.
 	 */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results the cell's bridged calls hand it. */
+	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
 }
 
 /** Result returned by a backend's execute(). */

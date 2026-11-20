@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { AsyncJobManager } from "../../src/async";
-import { runEvalWait } from "../../src/eval/handle-bridge";
+import { EVAL_STATUS_BRIDGE_NAME, runEvalStatus, runEvalWait } from "../../src/eval/handle-bridge";
+import { callSessionTool } from "../../src/eval/js/tool-bridge";
 import type { ToolSession } from "../../src/tools";
 
 test("settled eval progress is emitted once", async () => {
@@ -27,6 +28,66 @@ test("settled eval progress is emitted once", async () => {
 		},
 	);
 	expect(events.filter(event => event.op === "agent")).toHaveLength(1);
+	await manager.dispose();
+});
+
+test("settled eval wait and status report the agent result the cell holds", async () => {
+	const manager = new AsyncJobManager({});
+	const id = manager.register("task", "Scout", async () => "done", {
+		id: "settled-agent-result",
+		ownerId: "Main",
+		agentId: "Scout",
+	});
+	const job = manager.getJob(id);
+	if (!job) throw new Error("missing job");
+	await job.promise;
+	const held: Array<{ id: string }> = [];
+	const options = {
+		session: { asyncJobManager: manager, getAgentId: () => "Main" } as Partial<ToolSession> as ToolSession,
+		onAgentResults: (results: Array<{ id: string }>) => held.push(...results),
+	};
+
+	runEvalStatus({ item: { kind: "agent", id } }, options);
+	await runEvalWait({ items: [{ kind: "agent", id }] }, options);
+
+	expect(held).toEqual([{ id: "Scout" }, { id: "Scout" }]);
+	await manager.dispose();
+});
+
+test("eval wait and status write `delivered` to disk before the cell gets a settled agent's result", async () => {
+	// If this regresses, a process that goes away after the cell read the result but before anything recorded it
+	// leaves the job `owed`, and `omp --restore` runs a subagent whose result the parent already has.
+	const manager = new AsyncJobManager({});
+	const ids = ["Waited", "Statused"].map(agentId =>
+		manager.register("task", agentId, async () => "done", { id: agentId, ownerId: "Main", agentId }),
+	);
+	await Promise.all(ids.map(id => manager.getJob(id)?.promise));
+	const log: string[] = [];
+	const sessionManager = {
+		appendCustomEntry: (customType: string, data?: unknown) => {
+			log.push(`append ${customType} ${JSON.stringify(data)}`);
+			return "entry";
+		},
+		flush: async () => {
+			await Promise.resolve();
+			log.push("flushed");
+		},
+	};
+	const session = { asyncJobManager: manager, getAgentId: () => "Main", sessionManager } as unknown as ToolSession;
+
+	await runEvalWait({ items: [{ kind: "agent", id: "Waited" }] }, { session });
+	log.push("wait returned");
+	await callSessionTool(EVAL_STATUS_BRIDGE_NAME, { item: { kind: "agent", id: "Statused" } }, { session });
+	log.push("status returned");
+
+	expect(log).toEqual([
+		'append eval-agent-job {"agentId":"Waited","state":"delivered"}',
+		"flushed",
+		"wait returned",
+		'append eval-agent-job {"agentId":"Statused","state":"delivered"}',
+		"flushed",
+		"status returned",
+	]);
 	await manager.dispose();
 });
 

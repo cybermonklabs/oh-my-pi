@@ -31,7 +31,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { hasRestorableTurn, plainTurnAbortReason } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { hasRestorableTurn } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -42,6 +42,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { type RestoreOutcome, restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { isTaskToolDetails, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import { __resetDirsFromEnvForTests, postmortem, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "./helpers/settings-test-state";
 
@@ -170,7 +171,11 @@ function holdBackoff(expected: number) {
  * every later request has no key and its turn waits out a retry backoff. Every subagent
  * run's result is collected in `runs`.
  */
-async function openParentWithKeyedWorkers(delegation: "task" | "eval" = "task") {
+async function openParentWithKeyedWorkers(
+	delegation: "task" | "eval" = "task",
+	options: { openSpeculation?: boolean; workerNames?: readonly string[] } = {},
+) {
+	const workerNames = options.workerNames ?? ["SteeredWorker"];
 	const cwd = root.join("home", "work");
 	await Bun.write(path.join(cwd, NOTES_FILE), "the notes\n");
 	const authStorage = await AuthStorage.create(root.join("parentauth.db"), { usageProviderResolver: () => undefined });
@@ -189,7 +194,7 @@ async function openParentWithKeyedWorkers(delegation: "task" | "eval" = "task") 
 				content: [
 					delegation === "eval"
 						? CELL_CALL
-						: { type: "toolCall", id: CALL.id, name: "task", arguments: batchCall(["SteeredWorker"]) },
+						: { type: "toolCall", id: CALL.id, name: "task", arguments: batchCall(workerNames) },
 				],
 				stopReason: "toolUse",
 			};
@@ -261,8 +266,12 @@ async function openParentWithKeyedWorkers(delegation: "task" | "eval" = "task") 
 	cleanups.push(() => session.dispose());
 	if (delegation === "eval") cleanups.push(() => disposeAllVmContexts());
 	const task = session.getToolByName("task");
-	const launches = await task?.speculation?.stream?.open({ coordinator: launchSink, parentToolCallId: CALL.id });
-	if (!task || !launches) throw new Error("Expected the task tool to launch streamed items");
+	const launches =
+		options.openSpeculation === false
+			? undefined
+			: await task?.speculation?.stream?.open({ coordinator: launchSink, parentToolCallId: CALL.id });
+	if (!task || (options.openSpeculation !== false && !launches))
+		throw new Error("Expected the task tool to launch streamed items");
 	return { parent: session, task, launches, runs };
 }
 
@@ -275,7 +284,7 @@ async function restoreInNewProcess(
 	parent: AgentSession,
 	runs: readonly Promise<SingleResult>[],
 ): Promise<{ outcome: RestoreOutcome; parentEntries: SessionEntry[]; subagents: SubSession[] }> {
-	await Promise.all(runs);
+	await Promise.allSettled(runs);
 	const parentFile = parent.sessionManager.getSessionFile();
 	if (!parentFile) throw new Error("Expected a persisted parent session file");
 	await parent.dispose();
@@ -344,6 +353,7 @@ describe("omp --restore after a streamed task call discarded a sync launch waiti
 		const { parent, launches, runs } = await openParentWithKeyedWorkers();
 		const backoff = holdBackoff(1);
 		const launched = batchCall(["KeyedWorker"]);
+		if (!launches) throw new Error("Expected streamed launches");
 		await launches.update(CALL, JSON.stringify(launched));
 		// The worker's first request went out; its next one has no key and waits out the backoff.
 		await backoff.allHeld;
@@ -364,39 +374,65 @@ describe("omp --restore after a streamed task call discarded a sync launch waiti
 	}, 30_000);
 });
 
-describe("omp --restore after a sync task call was aborted before the launches it adopted started", () => {
-	const aborts = [
-		{ name: "the parent's process exit", reason: () => plainTurnAbortReason("cutOff"), restorable: true },
-		{ name: "the parent's stop", reason: () => plainTurnAbortReason("stop"), restorable: false },
-	];
-	for (const abort of aborts) {
-		it(`follows ${abort.name}`, async () => {
-			// If this regresses, the subagents the call adopted read every abort of the call as a stop (or every
-			// one as a cut-off): a process exit loses their turns, or a stop leaves them for `--restore`.
-			const { parent, task, launches, runs } = await openParentWithKeyedWorkers();
-			const backoff = holdBackoff(2);
-			const launched = batchCall(["FirstWorker", "SecondWorker"]);
-			await launches.update(CALL, JSON.stringify(launched));
-			await backoff.allHeld;
-			expect(runs).toHaveLength(2);
-			await launches.finalize({ toolCall: CALL, args: launched });
-			// The parent's turn was aborted while the call was being dispatched, before its spawns started.
-			const call = new AbortController();
-			call.abort(abort.reason());
-			await task.execute(CALL.id, launched, call.signal);
+describe("omp --restore after a real parent task turn is cut off while its two sync subagents wait to retry their keys", () => {
+	it("relaunches both subagents", async () => {
+		// A real message_end persists the pending task call before the tool runs (agent-loop.ts:1660-1663,
+		// :1800; agent-session.ts:5378-5379, :4927-4930). A process exit writes the interrupt record,
+		// supplying evidence (b) and (c) for both launches.
+		const { parent, runs } = await openParentWithKeyedWorkers("task", {
+			openSpeculation: false,
+			workerNames: ["FirstWorker", "SecondWorker"],
+		});
+		const backoff = holdBackoff(2);
+		const turn = parent.prompt("Delegate reading the notes.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(2);
 
-			const { outcome, subagents } = await restoreInNewProcess(parent, runs);
-			backoff.wait.mockRestore();
+		await parent.dispose({ reason: postmortem.Reason.EXIT });
+		await turn.catch(() => undefined);
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
 
-			const ids = subagents.map(sub => sub.agentId).sort();
-			expect(ids).toHaveLength(2);
-			expect([...outcome.subagents].sort()).toEqual(abort.restorable ? ids : []);
-			const end: TurnEnd = abort.restorable
-				? { stopReason: "error", credentialUnavailable: true, restorable: true }
-				: { stopReason: "aborted", credentialUnavailable: undefined, restorable: false };
-			expect(subagents.map(turnEnd)).toEqual([end, end]);
-		}, 30_000);
-	}
+		const ids = subagents.map(sub => sub.agentId).sort();
+		expect(ids).toHaveLength(2);
+		expect([...outcome.subagents].sort()).toEqual(ids);
+		expect(subagents.map(turnEnd)).toEqual([
+			{ stopReason: "error", credentialUnavailable: true, restorable: true },
+			{ stopReason: "error", credentialUnavailable: true, restorable: true },
+		]);
+	}, 30_000);
+
+	it("does not relaunch either subagent after their parent got its task result before the cutoff", async () => {
+		const { parent, runs } = await openParentWithKeyedWorkers("task", {
+			openSpeculation: false,
+			workerNames: ["FirstWorker", "SecondWorker"],
+		});
+		// Both workers' backoffs pass at once. Turn recovery sleeps through sleepLong, which rechecks the real
+		// clock, so an instant scheduler.wait alone would be called again and again until the real deadline.
+		const waits = [
+			vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+				options?.signal?.throwIfAborted();
+			}),
+			vi.spyOn(piUtils, "sleepLong").mockImplementation(async (_delayMs, signal) => {
+				signal?.throwIfAborted();
+			}),
+			vi.spyOn(piUtils, "sleepUntil").mockImplementation(async (_deadlineMs, signal) => {
+				signal?.throwIfAborted();
+			}),
+		];
+		await parent.prompt("Delegate reading the notes.");
+		expect(runs).toHaveLength(2);
+
+		await parent.dispose({ reason: postmortem.Reason.EXIT });
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		for (const wait of waits) wait.mockRestore();
+
+		expect(subagents.map(turnEnd)).toEqual([
+			{ stopReason: "error", credentialUnavailable: true, restorable: true },
+			{ stopReason: "error", credentialUnavailable: true, restorable: true },
+		]);
+		expect(outcome.subagents).toEqual([]);
+	}, 30_000);
 });
 
 describe("omp --restore after a stop without a reason ended a continuation turn's sync subagent waiting to retry its key", () => {

@@ -112,6 +112,15 @@ export interface EvalCellResult {
 	/** Evictable events dropped from the front of `statusEvents` (see {@link recordStatusEvent}). */
 	statusEventsElided?: number;
 }
+/**
+ * A subagent whose result a bridged call handed the cell (`tool.task`, `wait()`, a handle's
+ * status), with the run-end flags its `task` result records.
+ */
+export interface EvalHeldAgentResult {
+	id: string;
+	aborted?: boolean;
+	workerLost?: boolean;
+}
 
 /** Tool result detail object surfaced to the UI/transcript. */
 export interface EvalToolDetails {
@@ -134,6 +143,8 @@ export interface EvalToolDetails {
 	languages?: EvalLanguage[];
 	/** Optional human-readable notice (e.g. fallback explanation). */
 	notice?: string;
+	/** Subagents whose results the cell's bridged calls handed it; `omp --restore` reads them as the parent's. */
+	agentResults?: EvalHeldAgentResult[];
 	/** Present when the cell was auto-backgrounded as an async job; `cancelled`: killed before it finished. */
 	async?: {
 		state: "running" | "completed" | "failed" | "cancelled";

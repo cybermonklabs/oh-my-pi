@@ -10,7 +10,9 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
+import { isTaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
@@ -61,6 +63,8 @@ export interface ToolBridgeOptions {
 	 * would draw them, so such calls fail instead of reporting a reply nobody sees.
 	 */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results a bridged call hands the cell. */
+	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
 }
 
 type ToolValue =
@@ -276,7 +280,10 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		return await runEvalWait(args, options);
 	}
 	if (name === EVAL_STATUS_BRIDGE_NAME) {
-		return runEvalStatus(args, options);
+		const status = runEvalStatus(args, options);
+		// A settled agent's `delivered` record reaches the disk before the cell reads its result.
+		await options.session.sessionManager?.flush();
+		return status;
 	}
 	if (name === EVAL_CANCEL_BRIDGE_NAME) {
 		return runEvalCancel(args, options);
@@ -367,6 +374,15 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			// next resume/rewind/fork and stale todos trigger a false reminder.
 			const phases = committedTodoPhases(result);
 			if (phases) options.session.commitTodoPhases?.(phases);
+		}
+		if (name === "task" && isTaskToolDetails(result.details) && result.details.results.length > 0) {
+			options.onAgentResults?.(
+				result.details.results.map(agent => ({
+					id: agent.id,
+					...(agent.aborted ? { aborted: true } : {}),
+					...(agent.workerLost ? { workerLost: true } : {}),
+				})),
+			);
 		}
 		const replies = reply === undefined ? toolResultReplies(result.details) : [reply];
 		if (replies.length > 0) {

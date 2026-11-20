@@ -28,7 +28,7 @@ import type { ShadowPlan } from "../speculation/types";
 import type { EvalDisplayOutput, EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import { type ShadowSnapshot, shadowSnapshotDigest } from "./shared/runtime";
 import { projectJavaScriptShadowPlan } from "./speculation";
-import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
+import { callSessionTool, type JsStatusEvent, type ToolBridgeOptions } from "./tool-bridge";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
@@ -49,6 +49,8 @@ export interface VmRunState {
 	onDisplay?: (output: EvalDisplayOutput) => void;
 	/** Shows the user `out://` replies of the run's bridged tool calls; absent, those calls are refused. */
 	onReply?: (text: string) => void;
+	/** Receives the subagents whose results the run's bridged calls hand it. */
+	onAgentResults?: ToolBridgeOptions["onAgentResults"];
 }
 
 /** Isolated runtime transport used by the context manager and startup regression fixtures. */
@@ -844,6 +846,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
 			onReply: pending.runState.onReply,
+			onAgentResults: pending.runState.onAgentResults,
 			emitStatus: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);
 				pending.runState.onDisplay?.({ type: "status", event });
