@@ -257,6 +257,16 @@ jobs:
             bad=1
           done <"$RUNNER_TEMP/rust-test-stale.txt"
           exit "$bad"
+      - name: Every Rust test has a Bazel test target
+        # `bazel test //crates/...` runs only Bazel test targets, and most of
+        # pi-edit's, pi-shell's and pi-vcs's tests/*.rs files, obash's unit
+        # tests and every doctest had none, so they ran nowhere. This fails
+        # while any target of the repo's own suite (`bun run test:rs`) lacks
+        # one, and names it. It runs after the tests, even when they failed,
+        # so one run shows both.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash .github/sami/rust-test-parity.sh
 
   release_github:
     # A red Rust test stops the release: rust_test is a need like the builds.
