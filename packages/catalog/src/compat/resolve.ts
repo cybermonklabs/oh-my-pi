@@ -870,6 +870,7 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
 		supportsObfuscationOptOut: compat.supportsObfuscationOptOut,
 		storeResponses: compat.storeResponses,
+		toolNamePrefix: compat.toolNamePrefix,
 		connectionBoundNativeHistory: compat.connectionBoundNativeHistory,
 		supportsAllTurnsReasoningContext: compat.supportsAllTurnsReasoningContext,
 		supportsConfigurationUpdate: compat.supportsConfigurationUpdate,
@@ -938,6 +939,7 @@ function resolveAnthropicPolicy(
 		// Present as keys so models.yml `compat` can set them; unset unless a rule assigns them.
 		stripThinkingHistory: undefined,
 		fastMode: undefined,
+		disabledThinking: undefined,
 		streamIdleTimeoutMs: spec.compat?.streamIdleTimeoutMs,
 	};
 	applyWireAxes(compat, axes.wire, "anthropic-messages");
@@ -1006,6 +1008,8 @@ function resolveGooglePolicy(
 		// a KDL rule or a user `compat` block can declare one.
 		maxImageDimension: undefined,
 		maxImagePayloadBytes: undefined,
+		// Unset keeps the bundled catalog rows byte-identical; the key must exist for `compat` overrides to apply.
+		base64SkipThoughtSignature: undefined,
 	};
 	applyWireAxes(compat, axes.wire, spec.api);
 	applyCompatOverrides(compat, spec.compat);
