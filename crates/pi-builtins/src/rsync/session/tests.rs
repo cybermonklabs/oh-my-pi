@@ -529,18 +529,20 @@ fn checksum_mode_catches_same_size_and_time() {
 	let dir = tempfile::tempdir().unwrap();
 	let src = dir.path().join("src");
 	make_tree(&src);
-	assert_eq!(run(&["-a", "src/", "dst/"], dir.path()).0, 0);
+	let (code, _, err) = run(&["-a", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	let target = dir.path().join("dst/a");
 	let when = mtime(&target);
 	fs::write(&target, b"HELLO\n").unwrap();
 	fs::File::options().write(true).open(&target).unwrap().set_modified(when).unwrap();
 	// The quick check sees nothing to do.
-	let (_, out, _) = run(&["-ai", "src/", "dst/"], dir.path());
+	let (code, out, err) = run(&["-ai", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	assert_eq!(out, "");
 	assert_eq!(fs::read(&target).unwrap(), b"HELLO\n");
 	// -c compares contents.
-	let (code, out, _) = run(&["-aic", "src/", "dst/"], dir.path());
-	assert_eq!(code, 0);
+	let (code, out, err) = run(&["-aic", "src/", "dst/"], dir.path());
+	assert_eq!((code, err.as_str()), (0, ""));
 	assert_eq!(out, ">fc........ a\n");
 	assert_eq!(fs::read(&target).unwrap(), b"hello\n");
 }
