@@ -607,9 +607,11 @@ fn has_separator(name: &OsStr) -> bool {
 /// it, and the shell reports that refusal, or hands it to a utility that
 /// asked for it (`env ./script` is `env: ‘./script’: File name too long`,
 /// status 126, as in coreutils).
-/// A `#!` line that names no interpreter (`#! \0x`) is `Some(true)`: Linux
-/// fails with `ENOEXEC`, so the file runs as a shell script, and whatever
-/// else the system says (gVisor: `EINVAL`) is the shell's to report.
+/// The interpreter is read as the kernel reads it
+/// (`pi_builtins::extras::script_interpreter`). A `#!` line that names no
+/// interpreter (`#! \0x`) is `Some(true)`: Linux fails with `ENOEXEC`, so
+/// the file runs as a shell script, and whatever else the system says
+/// (gVisor: `EINVAL`) is the shell's to report.
 #[cfg(unix)]
 fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
@@ -620,7 +622,7 @@ fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 	if !runs(path).ok()? {
 		return Some(false);
 	}
-	let Some(interpreter) = interpreter(path) else {
+	let Some(interpreter) = pi_builtins::extras::script_interpreter(path) else {
 		return Some(true);
 	};
 	match runs(&cwd.join(interpreter)) {
@@ -628,17 +630,6 @@ fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 		Err(error) if error.kind() == io::ErrorKind::NotFound => None,
 		Err(_) => Some(true),
 	}
-}
-
-/// The interpreter a `#!` line at the start of the file at `path` names, as
-/// the kernel reads it (`pi_builtins::extras::shebang_interpreter`). `None`
-/// for a file that names none or cannot be read.
-#[cfg(unix)]
-fn interpreter(path: &Path) -> Option<PathBuf> {
-	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
-	let mut head = Vec::with_capacity(256);
-	std::fs::File::open(path).ok()?.take(256).read_to_end(&mut head).ok()?;
-	Some(PathBuf::from(OsStr::from_bytes(pi_builtins::extras::shebang_interpreter(&head)?)))
 }
 
 #[cfg(not(unix))]

@@ -14,10 +14,11 @@ use futures::future::BoxFuture;
 
 #[allow(unused_imports, reason = "the table names whichever modules the enabled features compile")]
 use super::*;
+#[cfg(unix)]
+pub use crate::host::script_interpreter;
 pub use crate::{
 	host::{
 		CommandRunner, CommandStatus, EnvChange, Invocation, ShellCommand, command_line_too_long, line_bytes,
-		shebang_interpreter,
 	},
 	locale::{ctype_is_utf8_in, gnu_quote, gnu_quote_shell},
 	openfile::Fd,

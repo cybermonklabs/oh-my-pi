@@ -906,23 +906,25 @@ const fn dialect_of(mode: MatchMode) -> Option<bre::Dialect> {
 }
 
 /// Translates every pattern for `target`, reporting the first one GNU
-/// refuses with the message GNU prints for it. With `raw_bytes` the patterns
-/// are [`bre::pattern_text`]'s, some holding bytes that are no UTF-8.
+/// refuses with the message GNU prints for it. With `spec.raw_bytes` the
+/// patterns are [`bre::pattern_text`]'s, some holding bytes that are no
+/// UTF-8, read as the locale reads them.
 fn translate_patterns(
 	patterns: &[String],
 	dialect: bre::Dialect,
 	target: bre::Target,
 	spec: MatcherSpec,
 ) -> Result<Vec<String>, String> {
+	let raw = if spec.c_locale {
+		bre::RawBytes::CLocale
+	} else if spec.raw_bytes {
+		bre::RawBytes::Utf8Locale
+	} else {
+		bre::RawBytes::Absent
+	};
 	patterns
 		.iter()
-		.map(|pattern| {
-			if spec.raw_bytes {
-				bre::translate_raw(pattern, dialect, target, spec.ignore_case, spec.c_locale)
-			} else {
-				bre::translate(pattern, dialect, target, spec.ignore_case, bre::Strictness::Lenient)
-			}
-		})
+		.map(|pattern| bre::translate_raw(pattern, dialect, target, spec.ignore_case, raw))
 		.collect::<Result<_, _>>()
 		.map_err(|error: bre::BreError| error.message().to_owned())
 }
@@ -1132,10 +1134,11 @@ struct MatcherSpec {
 	/// Whether the patterns are [`bre::pattern_text`]'s, some holding a byte
 	/// that is no UTF-8.
 	raw_bytes:   bool,
-	/// Whether the locale reads a byte to a character (GNU's C locale),
-	/// where such a pattern byte in a bracket expression is a member of that
-	/// byte; in a UTF-8 locale it is none, for a line that is not UTF-8 too
-	/// (see [`bre::translate_raw`]).
+	/// Whether the patterns hold such a byte and the locale reads a byte to
+	/// a character (GNU's C locale), where such a pattern byte in a bracket
+	/// expression is a member of that byte; in a UTF-8 locale it is none,
+	/// for a line that is not UTF-8 too (see [`bre::translate_raw`]). False
+	/// where no pattern holds such a byte, whatever the locale.
 	c_locale:    bool,
 }
 
@@ -2822,7 +2825,8 @@ impl AsyncUtility for Grep {
 	// locale alike. In the C locale every byte is a character, so where a
 	// pattern holds such a byte every line is read so, as GNU reads it: `.`
 	// and `[^\351]` match one byte of the line `é` there, not its character.
-	let c_locale = !crate::locale::ctype_is_utf8(host);
+	// Only such a pattern asks the locale.
+	let c_locale = raw_bytes && !crate::locale::ctype_is_utf8(host);
 	let spec = MatcherSpec {
 		mode:        resolve_match_mode(&matches),
 		ignore_case: resolve_ignore_case(&matches),
@@ -2830,7 +2834,7 @@ impl AsyncUtility for Grep {
 		line_regexp: cli.line_regexp,
 		null_data:   cli.null_data,
 		jit:         pcre2_jit_enabled(host.var("OMP_PCRE2_JIT")),
-		bytes:       raw_bytes && c_locale,
+		bytes:       c_locale,
 		raw_bytes,
 		c_locale,
 	};
@@ -4335,11 +4339,18 @@ mod tests {
 		assert_eq!(find(b"[^\xc3]\xa9", false, false, line), None);
 		assert_eq!(find(b"f.\xa9", true, true, line), Some((2, 5)));
 		assert_eq!(find(b"f.\xa9", false, false, line), None);
-		// The engine for a line that is not UTF-8, in a UTF-8 locale.
+		// The engine for a line that is not UTF-8, in a UTF-8 locale: a
+		// member outside ASCII is the whole UTF-8 sequence of a character.
 		assert_eq!(find(b"[\xe9]", false, true, b"caf\xe9"), None);
 		assert_eq!(find(b"f[\xe9]", false, true, b"caf\xe9"), None);
 		assert_eq!(find(b"[\xc0-\xff]", false, true, b"caf\xe9"), None);
+		assert_eq!(find(b"[\xc0-\xff]", false, true, b"x\xa9"), None);
+		assert_eq!(find(b"[\xc0-\xff]", false, true, b"\xff\xc3\xa9"), Some((1, 3)));
+		assert_eq!(find(b"[^\xc0-\xff]", false, true, b"\xc3\xa9\xffx"), Some((3, 4)));
 		assert_eq!(find(b"[^\xe9]", false, true, b"\xe9"), None);
+		// So is `.`, which matches no encoding error.
+		assert_eq!(find(b"x.y\xe9", false, true, b"x\xffy\xe9"), None);
+		assert_eq!(find(b"x.y\xe9", false, true, b"x\xc3\xa9y\xe9"), Some((0, 5)));
 		// In the C locale a range is the bytes the engine gets.
 		assert_eq!(find(b"[\xc3-\xc3\xa9]", true, true, line), Some((3, 4)));
 	}

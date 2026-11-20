@@ -23,9 +23,9 @@ afterAll(async () => {
  * Runs `command` in the builtin shell with stdout sent to a file, whose bytes
  * are returned with the shell's exit status.
  */
-async function run(command: string): Promise<{ output: string; exitCode: number | undefined }> {
+async function run(command: string): Promise<{ output: Buffer; exitCode: number | undefined }> {
 	const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
-	return { output: await fs.readFile(path.join(dir, "out"), "utf8"), exitCode: result.exitCode };
+	return { output: await fs.readFile(path.join(dir, "out")), exitCode: result.exitCode };
 }
 
 /** Makes `noexec` (not executable) and `d`, then runs `echo a | xargs ARGS`. */
@@ -56,16 +56,14 @@ describe("builtin xargs: a command it cannot run, or that exits 255", () => {
 			126,
 		],
 	])("%s", async (command, output, exitCode) => {
-		expect(await run(command)).toEqual({ output, exitCode });
+		expect(await run(command)).toEqual({ output: Buffer.from(output, "latin1"), exitCode });
 	});
 });
 
 describe("builtin xargs: a command name that is not UTF-8", () => {
 	it("is written as its bytes", async () => {
 		// Regressed: written with U+FFFD for the byte 0xFF.
-		const command = String.raw`echo a | xargs $'n\377' 2>&1; echo $?`;
-		const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
-		expect({ output: await fs.readFile(path.join(dir, "out")), exitCode: result.exitCode }).toEqual({
+		expect(await run(String.raw`echo a | xargs $'n\377' 2>&1; echo $?`)).toEqual({
 			output: Buffer.from("xargs: n\xff: No such file or directory\n127\n", "latin1"),
 			exitCode: 0,
 		});

@@ -100,6 +100,42 @@ describe("builtin grep: a pattern byte that is not UTF-8, in the C.UTF-8 locale"
 	]);
 });
 
+describe("builtin grep: a pattern with a pattern byte, on a line that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 matches a member of a bracket expression outside ASCII,
+	// and `.`, only as the whole UTF-8 sequence of a character, and nothing
+	// of an encoding error, in a line that is not UTF-8 as in one that is.
+	cases([
+		// Regressed: `[À-ÿ]` was written as bytes, {0xC3, 0x80-0xC3, 0xBF}, so the bytes 0xA9 and 0x90 matched.
+		[String.raw`printf 'x\251\nq\220z\n' | LC_ALL=C.UTF-8 grep -c $'[\300-\377]'`, "0\n", 1],
+		// Regressed: the two bytes of `é` matched one by one.
+		[String.raw`printf '\377\303\251\n' | LC_ALL=C.UTF-8 grep -o $'[\300-\377]'`, "\xc3\xa9\n", 0],
+		[
+			String.raw`printf '\377\303\251\303\251\n' | LC_ALL=C.UTF-8 grep -o $'[\300-\377]\\{2\\}'`,
+			"\xc3\xa9\xc3\xa9\n",
+			0,
+		],
+		// Regressed: a byte of `中` matched.
+		[String.raw`printf '\377\344\270\255\n' | LC_ALL=C.UTF-8 grep -o $'[\300-\377]'`, "", 1],
+		// Regressed: under `-i`, the first byte of `É` matched.
+		[String.raw`printf '\377\303\211\n' | LC_ALL=C.UTF-8 grep -io $'[\303\251\351]'`, "\xc3\x89\n", 0],
+		// Regressed: a list that negates matched the byte 0xFF and each byte of `é`.
+		[String.raw`printf '\303\251\377x\n' | LC_ALL=C.UTF-8 grep -o $'[^\300-\377]'`, "x\n", 0],
+		[String.raw`printf '\377\303\251b\n' | LC_ALL=C.UTF-8 grep -o $'[^a\351]'`, "\xc3\xa9\nb\n", 0],
+		// Regressed: the same for the engine a back-reference among the patterns uses.
+		[String.raw`printf 'x\251\nq\220z\n' | LC_ALL=C.UTF-8 grep -c -e $'[\300-\377]' -e '\(k\)\1'`, "0\n", 1],
+		[String.raw`printf '\377\303\251\n' | LC_ALL=C.UTF-8 grep -o -e $'[\300-\377]' -e '\(k\)\1'`, "\xc3\xa9\n", 0],
+		// Regressed: `.` matched one byte, so it matched the byte 0xFF, a lone 0xC3, and half of `é`.
+		[String.raw`printf 'x\377y\n' | LC_ALL=C.UTF-8 grep -c $'x.y\\|\351'`, "0\n", 1],
+		[String.raw`printf 'x\303(\n' | LC_ALL=C.UTF-8 grep -o $'x.(\\|\351'`, "", 1],
+		[String.raw`printf 'x\303\251y\377\n' | LC_ALL=C.UTF-8 grep -o $'x.y\\|\351'`, "x\xc3\xa9y\n", 0],
+		[
+			String.raw`printf 'a\303\251\303\251b\377\n' | LC_ALL=C.UTF-8 grep -o $'a.[\300-\377]b'`,
+			"a\xc3\xa9\xc3\xa9b\n",
+			0,
+		],
+	]);
+});
+
 describe("builtin grep: a back-reference beside a pattern byte that is not UTF-8, in the C.UTF-8 locale", () => {
 	// GNU grep 3.11 counts 1: the byte 0xC3 starts `é`. PCRE2, which runs a
 	// back-reference, matches no such byte inside a character, so the
