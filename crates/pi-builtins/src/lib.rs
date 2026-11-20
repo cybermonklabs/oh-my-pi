@@ -28,6 +28,7 @@ mod stdio;
 	feature = "util.env",
 	feature = "util.find",
 	feature = "util.fold",
+	feature = "util.grep",
 	feature = "util.sort",
 	feature = "util.uniq"
 ))]

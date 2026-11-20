@@ -1,0 +1,96 @@
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { executeShell } from "../native/index.js";
+
+// The bash tool's shell runs `grep` as a builtin. Each expectation below is
+// the bytes GNU grep 3.11 writes on stdout, and the status it exits with, for
+// the same command in the locale the case names, where a pattern, a file name
+// or another argument holds a byte that is not UTF-8. stderr is dropped. The
+// outputs are Latin-1 strings, one character to a byte: `"caf\xe9"` is c, a,
+// f and 0xE9.
+
+let dir: string;
+
+beforeAll(async () => {
+	dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-grep-pattern-bytes-"));
+	// `inv` holds lines that are not UTF-8, `u8` UTF-8 ones (`café`, `naïve`).
+	await fs.writeFile(path.join(dir, "inv"), Buffer.from("caf\xe9\nab\xffc\nok\nx\xc3(y\n\xff\xfe\n", "latin1"));
+	await fs.writeFile(path.join(dir, "u8"), "café\nabc\nnaïve\n");
+	await fs.writeFile(path.join(dir, "g"), "a\nb\nc\na\n");
+	await fs.writeFile(path.join(dir, "pf"), Buffer.from("\xe9\n", "latin1"));
+});
+
+afterAll(async () => {
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+/**
+ * Runs `command` in the builtin shell beside the input files. stdout goes to
+ * a file, whose bytes are returned: the shell streams its output to the
+ * callback as text.
+ */
+async function run(command: string): Promise<{ output: Buffer; exitCode: number | undefined }> {
+	const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
+	return { output: await fs.readFile(path.join(dir, "out")), exitCode: result.exitCode };
+}
+
+type Case = [command: string, output: string, exitCode: number];
+
+function cases(list: Case[]) {
+	it.each(list)("%s", async (command, output, exitCode) => {
+		expect(await run(command)).toEqual({ output: Buffer.from(output, "latin1"), exitCode });
+	});
+}
+
+describe("builtin grep: a pattern byte that is not UTF-8, in the C locale", () => {
+	cases([
+		// Regressed: `-e` refused the argument ("invalid UTF-8 was detected in one or more arguments", exit 2).
+		[String.raw`LC_ALL=C grep -e $'\351' inv`, "caf\xe9\n", 0],
+		[String.raw`LC_ALL=C grep -w -e $'\351' inv`, "", 1],
+		[String.raw`LC_ALL=C grep -x -e $'\377' inv`, "", 1],
+		[String.raw`LC_ALL=C grep -F -e $'.\377' inv`, "", 1],
+		// Regressed: the pattern was read as U+FFFD, so no line matched (exit 1).
+		[String.raw`LC_ALL=C grep $'\351' inv`, "caf\xe9\n", 0],
+		[String.raw`LC_ALL=C grep -E $'a|\377\376' inv`, "caf\xe9\nab\xffc\n\xff\xfe\n", 0],
+		[String.raw`LC_ALL=C grep -P $'.\377' inv`, "ab\xffc\n", 0],
+		// Already so: a negated list of U+FFFD held every byte of these lines too.
+		[String.raw`LC_ALL=C grep -c $'[^\351]' inv`, "5\n", 0],
+		// Regressed: the same for a pattern file.
+		[String.raw`LC_ALL=C grep -f pf inv`, "caf\xe9\n", 0],
+		// Regressed: in the C locale each byte of `é` is a character, which the
+		// line `café` was not read as.
+		[String.raw`LC_ALL=C grep -o $'[\303]' u8`, "\xc3\n\xc3\n", 0],
+		[String.raw`LC_ALL=C grep -o $'f.\251' u8`, "f\xc3\xa9\n", 0],
+		[String.raw`LC_ALL=C grep -i -e $'\303' u8`, "caf\xc3\xa9\nna\xc3\xafve\n", 0],
+	]);
+});
+
+describe("builtin grep: a pattern byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	cases([
+		// Regressed: refused, exit 2.
+		[String.raw`LC_ALL=C.UTF-8 grep -a -e $'\351' inv`, "caf\xe9\n", 0],
+		// Regressed: read as U+FFFD; GNU matches the byte, in a character too.
+		[String.raw`LC_ALL=C.UTF-8 grep -c $'\303' u8`, "2\n", 0],
+		[String.raw`LC_ALL=C.UTF-8 grep -c -F $'\303' u8`, "2\n", 0],
+		// No character is such a byte: no member of a bracket expression (already
+		// so, as U+FFFD), and a range's end is the character of its value (U+00E9
+		// to U+00FF; regressed: no line matched).
+		[String.raw`LC_ALL=C.UTF-8 grep -o $'[\303]' u8`, "", 1],
+		[String.raw`LC_ALL=C.UTF-8 grep -c $'[^\303]' u8`, "3\n", 0],
+		[String.raw`LC_ALL=C.UTF-8 grep -o $'[\351-\377]' u8`, "\xc3\xa9\n\xc3\xaf\n", 0],
+		// PCRE2 refuses a pattern that is not UTF-8 ("UTF-8 error: 2 bytes missing at end").
+		[String.raw`LC_ALL=C.UTF-8 grep -P $'\351' u8`, "", 2],
+	]);
+});
+
+describe("builtin grep: other arguments that are not UTF-8", () => {
+	cases([
+		// A file operand opens the file of that name, and is printed as its bytes;
+		// already so.
+		[String.raw`printf 'x\n' >$'\377'; LC_ALL=C grep -H x $'\377'`, "\xff:x\n", 0],
+		// Regressed: the separator was refused, exit 2.
+		[String.raw`LC_ALL=C grep -A0 --group-separator=$'\351' a g`, "a\n\xe9\na\n", 0],
+	]);
+});
