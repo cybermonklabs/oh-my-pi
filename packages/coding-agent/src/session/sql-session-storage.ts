@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
-import type { SessionBlobSweep, SessionBlobTier } from "./blob-store";
+import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -832,10 +832,10 @@ const MYSQL_PACKET_HEADROOM = 1024 * 1024;
 /**
  * The path prefix of a parted blob's references: a blob larger than one row
  * takes is stored as parts, each a blob row under its own hash, and the row
- * of its own hash lists them; `<prefix><hash>` references each part, so no
- * sweep takes a part of a kept blob.
+ * of its own hash lists them; `<prefix><hash>`, the parted blob's own
+ * reference, references each part, so no sweep takes a part of a kept blob.
  */
-const BLOB_PARTS_PATH = "blob:sha256:";
+const BLOB_PARTS_PATH = BLOB_PREFIX;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -2436,18 +2436,18 @@ function listValues(prefix: string, items: readonly string[]): StatementValues {
 	return Object.fromEntries(items.map((item, index) => [`${prefix}${index}`, item]));
 }
 
-const BLOB_REF_IN_TEXT = /blob:sha256:([0-9a-f]{64})/g;
+const BLOB_REF_IN_TEXT = new RegExp(`${BLOB_PREFIX}([0-9a-f]{64})`, "g");
 
 /** The blob hashes `text` (a transcript, or one line of it) names. */
 function namedBlobHashes(text: string): Set<string> {
 	const hashes = new Set<string>();
-	if (!text.includes("blob:sha256:")) return hashes;
+	if (!text.includes(BLOB_PREFIX)) return hashes;
 	for (const match of text.matchAll(BLOB_REF_IN_TEXT)) hashes.add(match[1] ?? "");
 	return hashes;
 }
 
-/** Characters a blob reference spans in text: `blob:sha256:` and its 64 hex digits. */
-const BLOB_REF_CHARS = "blob:sha256:".length + 64;
+/** Characters a blob reference spans in text: {@link BLOB_PREFIX} and its 64 hex digits. */
+const BLOB_REF_CHARS = BLOB_PREFIX.length + 64;
 
 /**
  * The blob hashes a text that arrives in pieces names, as {@link namedBlobHashes} finds them in the whole text: a

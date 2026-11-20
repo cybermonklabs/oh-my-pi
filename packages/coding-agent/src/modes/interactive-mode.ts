@@ -5792,7 +5792,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const ownerScope = this.#vibeModeOwnerScope;
 		if (!this.vibeModeEnabled || !ownerScope) return;
 		// A switch of the parent session stops the workers' turns and their own jobs.
-		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
+		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
 		this.#vibeScopeSuspendedForSwitch = true;
 	}
 
@@ -6025,7 +6025,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModePreviousTools = undefined;
 			this.#vibeModeOwnerScope = undefined;
 			if (ownerScope && !options?.vibeScopeAlreadySuspended) {
-				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
+				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
 			}
 			this.#updateVibeModeStatus();
 		}

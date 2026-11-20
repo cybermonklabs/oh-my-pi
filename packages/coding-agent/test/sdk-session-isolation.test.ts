@@ -376,7 +376,6 @@ describe("createAgentSession session storage isolation", () => {
 		expect(suspend).toHaveBeenCalledWith(
 			{ ownerId: "Main", parentSessionId, parentSessionFile },
 			session.asyncJobManager,
-			"stop",
 		);
 		expect(suspend.mock.invocationCallOrder[0]).toBeLessThan(lifecycleDispose.mock.invocationCallOrder[0]);
 	});
