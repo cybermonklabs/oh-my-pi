@@ -3,7 +3,8 @@
  * lines through cannot be used: `os.tmpdir()` read-only, a spool write that
  * fails as a full disk does, or a spool directory that another account could
  * enter. The rewrite then stores the joined lines, as `writeTextSync` does,
- * and the store warns once, not on every rewrite.
+ * and the store warns once, not on every rewrite. A throw from the lines
+ * themselves is no spool failure, and fails the rewrite as it is.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -210,6 +211,48 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			await withSqliteStorage(async storage => {
 				const { stored, written } = await rewriteBothWays(storage);
 
+				expect(stored).toEqual(written);
+				expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
+			});
+		},
+	);
+
+	// If this regresses, a rewrite whose own lines fail (an entry that cannot be read back or
+	// serialized) is reported as an unusable spool, reads the whole transcript a second time to join
+	// it, and uses up the store's one warning, so a real spool failure later goes unreported.
+	it.skipIf(process.getuid === undefined)(
+		"rethrows a throw from the lines of a rewrite without joining them or using up the spool warning",
+		async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			process.env.TMPDIR = tmp.path();
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const unwritable = new Error("an entry cannot be serialized");
+			let reads = 0;
+			// Read anew on each iteration, as a session's serialized body is.
+			const failing: Iterable<string> = {
+				*[Symbol.iterator]() {
+					reads++;
+					yield* sessionLines("partial", 0);
+					throw unwritable;
+				},
+			};
+
+			await withSqliteStorage(async storage => {
+				const before = sessionLines("before", 1).join("");
+				await storage.writeText(SYNC_FILE, before);
+				await storage.writeText(ATOMIC_FILE, before);
+
+				expect(() => storage.writeLinesSync(SYNC_FILE, failing)).toThrow(unwritable);
+				await expect(storage.writeLinesAtomic(ATOMIC_FILE, failing)).rejects.toBe(unwritable);
+				expect({
+					reads,
+					warnings: spoolWarnings(warn.mock.calls).length,
+					stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+				}).toEqual({ reads: 2, warnings: 0, stored: [before, before] });
+
+				// A spool that fails after them still gets its warning.
+				fs.chmodSync(path.join(tmp.path(), `omp-spool-${process.getuid?.()}`), 0o755);
+				const { stored, written } = await rewriteBothWays(storage);
 				expect(stored).toEqual(written);
 				expect(spoolWarnings(warn.mock.calls)).toHaveLength(1);
 			});

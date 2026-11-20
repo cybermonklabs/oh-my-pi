@@ -812,8 +812,8 @@ const SQLITE_WRITE_SLOTS = 1024;
  * counts cover those. A write counts in the slot of its path
  * ({@link sqliteWriteSlot}), one of {@link SQLITE_WRITE_SLOTS}, so the counts
  * hold the same memory however many paths a process writes in its life. Two
- * paths that share a slot only cause an extra check of a read, never a
- * missed one: a parent's appends make its subagents' reads check again only
+ * paths that share a slot only cause extra check passes of a read (at most
+ * two), never a missed one: a parent's appends make its subagents' reads check again only
  * when their paths share a slot. A slot's count wraps at 2^32, which makes a
  * read's end mark equal its start mark only when 2^32 writes of its slot land
  * between them. A directory delete, which can change every path under the
