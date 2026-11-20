@@ -103,6 +103,23 @@ describe("builtin sed: errors as GNU reports them", () => {
 	]);
 });
 
+describe("builtin sed: a brace with nothing to repeat, and a count above 32767", () => {
+	cases([
+		// Regressed: with `{` the delimiter, `\{` reaches the pattern as a brace that sed's own interval check never sees, and it is read as text; GNU prints "Invalid preceding regular expression" and exits 1.
+		[String.raw`echo a | sed -E 's{\{x{Y{'`, "", 1],
+		// Regressed: the same for a brace that would open an interval.
+		[String.raw`echo a | sed -E 's{\{1,2,3}{Y{'`, "", 1],
+		// Regressed: the same after an anchor.
+		[String.raw`echo a | sed -E 's{^\{x{Y{'`, "", 1],
+		// Regressed: the same in an address.
+		[String.raw`echo a | sed -E -n '\{\{x{p'`, "", 1],
+		// Regressed: past the same check, a maximum above 32767 is searched; GNU prints "Regular expression too big".
+		[String.raw`echo a | sed -E 's{a\{1,32768}{Y{'`, "", 1],
+		// sed's own check refuses one with any delimiter.
+		[String.raw`echo a | sed 's/a\{32768\}/Y/'`, "", 1],
+	]);
+});
+
 describe("builtin sed: the pattern dialect shared with grep", () => {
 	cases([
 		// Regressed: `^` after `\<` anchors, so `a` is replaced; GNU reads the caret as text and changes nothing.
