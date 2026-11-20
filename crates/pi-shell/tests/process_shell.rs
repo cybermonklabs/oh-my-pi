@@ -947,14 +947,18 @@ fn run_sent(cases: Vec<SentCase>) {
 /// of a `-c` string run without a fork:
 /// [`bash_reports_a_foreground_command_killed_by_a_signal`]) is the shell's
 /// process: a signal sent to the shell is the program's, even one the
-/// shell traps (the program has no trap), and the shell ends as the program
-/// does. zsh's `HUP` handler and bash's EXIT trap went with the shell: a
-/// server the program runs goes on after a `HUP` it handles. The program
-/// makes `$F` once it has started.
+/// shell traps (the program has no trap) and one the shell has no catch of
+/// its own for (`TERM`) or holds ignored for itself (`QUIT`), and the shell
+/// ends as the program does. zsh's `HUP` handler and bash's EXIT trap went
+/// with the shell: a server the program runs goes on after a `HUP` it
+/// handles. zsh runs a last `( … )` in place too. The program makes `$F`
+/// once it has started.
 #[test]
 fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 	let program = "/bin/sh -c ': > \"$F\"; exec /bin/sleep 5 >/dev/null 2>&1'";
 	let server = "/bin/sh -c 'trap \"echo reload\" HUP; : > \"$F\"; /bin/sleep 1; echo done'";
+	let counter =
+		"/bin/sh -c 'trap \"echo got\" HUP TERM QUIT; : > \"$F\"; /bin/sleep 1; echo done'";
 	let case = |shell, script: String, sig, stdout, end| SentCase {
 		shell,
 		script,
@@ -968,6 +972,11 @@ fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 		case("zsh", format!("exec {program}"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
 		case("zsh", format!("true; {program}"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
 		case("zsh", server.into(), libc::SIGHUP, b"reload\ndone\n", Exit(0)),
+		case("zsh", format!("( {program} )"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
+		case("zsh", counter.into(), libc::SIGTERM, b"got\ndone\n", Exit(0)),
+		case("zsh", counter.into(), libc::SIGQUIT, b"got\ndone\n", Exit(0)),
+		case("bash", counter.into(), libc::SIGTERM, b"got\ndone\n", Exit(0)),
+		case("bash", format!("exec {counter}"), libc::SIGQUIT, b"got\ndone\n", Exit(0)),
 		case(
 			"bash",
 			format!("trap 'echo x' EXIT; exec {program}"),
@@ -992,6 +1001,46 @@ fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 	]);
 }
 
+/// A terminal's `^C` is the kernel's `INT` to its foreground process group,
+/// which the program the shell runs in place of itself gets from the kernel
+/// too: the shell gives it no second time, and does not die of it while the
+/// program handles it. The program prints `ready`, then `got` for each `INT`
+/// and `done` a second later.
+#[test]
+fn a_terminal_interrupt_reaches_the_program_the_shell_runs_in_place_once() -> io::Result<()> {
+	let program = "/bin/sh -c 'trap \"echo got\" INT; echo ready; /bin/sleep 1; echo done'";
+	for (name, script) in [("zsh", program.to_owned()), ("bash", format!("exec {program}"))] {
+		let flags: &[&str] = if name == "zsh" {
+			&["-f", "-c"]
+		} else {
+			&["-c"]
+		};
+		let ours = Spawn::obash_as(name);
+		let real = if name == "zsh" {
+			have_zsh().then(Spawn::real_zsh)
+		} else {
+			real_bash().map(|bash| Spawn::new(bash).argv0("bash"))
+		};
+		let shells =
+			std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+		for (who, spawn) in shells {
+			let mut shell = spawn
+				.args(flags.iter().copied().chain([script.as_str()]))
+				.spawn()?;
+			shell.read_until("ready\r\n", TIMEOUT)?;
+			shell.write("\x03")?;
+			let status = shell.wait(TIMEOUT)?;
+			let out = shell.output();
+			assert_eq!(
+				(status.code(), out.matches("got").count(), out.contains("done")),
+				(Some(0), 1, true),
+				"{who}: {name} -c {script}: {status:?} {out:?}"
+			);
+		}
+	}
+	Ok(())
+}
+
 /// A program the shell `exec`s replaces it, so no EXIT trap of the shell's
 /// runs after the program (bash 5.2.21, zsh 5.9), in a subshell either.
 #[test]
@@ -1014,11 +1063,13 @@ fn an_execd_program_leaves_no_exit_trap_to_run() {
 }
 
 /// bash with an EXIT trap catches `INT` (`terminating_signals`), but while
-/// it waits for a foreground command it only notes one
+/// it waits for a foreground command without job control it only notes one
 /// (`wait_sigint_handler`): once the command has ended it acts on it (runs
 /// the trap, then dies of `SIGINT`) only if the command died of `SIGINT`
-/// too; else the command caught it and the script goes on. The command
-/// makes `$F` once it has started, notes an `INT` and goes on.
+/// too; else the command caught it and the script goes on. A subshell, or a
+/// pipeline stage that is shell code, dies of the `INT` the group gets, so
+/// bash acts on it; under `set -m` bash acts at once. The command makes `$F`
+/// once it has started.
 #[test]
 fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	let child =
@@ -1032,6 +1083,11 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		stdout,
 		end,
 	};
+	let died = Signal(libc::SIGINT);
+	// A pipeline's last stage: it makes `$F` once the first has made `$F.a`,
+	// which it removes for the next run.
+	let last = "/bin/sh -c 'until [ -e \"$F.a\" ]; do /bin/sleep 0.01; done; rm -f \"$F.a\"; : > \
+	            \"$F\"; exec /bin/cat'";
 	run_sent(vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
@@ -1039,7 +1095,61 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			"trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; exec /bin/sleep 3'; echo after".into(),
 			true,
 			b"x\n",
-			Signal(libc::SIGINT),
+			died,
+		),
+		case(
+			"trap 'echo x' EXIT; ( : > \"$F\"; /bin/sleep 2; echo after-sleep ); echo after".into(),
+			true,
+			b"x\n",
+			died,
+		),
+		case(
+			"trap 'echo x' EXIT; printf 'a\\nb\\n' | while read -r l; do : > \"$F\"; /bin/sleep 1; \
+			 echo $l; done; echo after"
+				.into(),
+			true,
+			b"x\n",
+			died,
+		),
+		case(
+			"trap 'echo x' EXIT; ( : > \"$F\"; while :; do :; done ); echo after".into(),
+			true,
+			b"x\n",
+			died,
+		),
+		// A pipeline of externals: the last of its processes to end decides
+		// (bash's `waitchld` sets `child_caught_sigint` again for each child
+		// it reaps). A stage that catches `INT` and exits 130 half a second
+		// after `cat` died of it did not die of it, so the script goes on;
+		// when every stage dies of it, the shell acts. The last stage makes
+		// `$F` once the first has made `$F.a`: both have started (a stage bash
+		// has forked but not yet `exec`ed runs the EXIT trap itself).
+		case(
+			format!(
+				"trap 'echo x' EXIT; /bin/sh -c 'trap \"/bin/sleep 0.5; exit 130\" INT; : > \"$F.a\"; \
+				 /bin/sleep 3' | {last}; echo after"
+			),
+			true,
+			b"after\nx\n",
+			Exit(0),
+		),
+		case(
+			format!(
+				"trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; exec /bin/sleep 3' | {last}; echo after"
+			),
+			true,
+			b"x\n",
+			died,
+		),
+		// Under `set -m` bash holds nothing (its child, in a group of its own,
+		// gets nothing either).
+		case(
+			"set -m; trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; exec /bin/sleep 3 >/dev/null 2>&1'; \
+			 echo after"
+				.into(),
+			false,
+			b"x\n",
+			died,
 		),
 	]);
 }

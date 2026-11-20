@@ -278,7 +278,9 @@ fn a_signal_the_host_keeps_ignored_has_its_trap_recorded_as_ignored() {
 /// A restore in a new process starts with default dispositions, so the root
 /// asks the host again for every signal's: a trap's, a zsh `TRAPNAL`
 /// function's, and those of the shell's own rules: zsh's `HUP` catch,
-/// bash's EXIT-trap catches, `QUIT` ignored.
+/// bash's EXIT-trap catches, `QUIT` ignored; and for none the platform
+/// lacks (number 0). A disposition is compared as the host reads it: the
+/// default, ignored (an empty action) or caught (any other).
 #[test]
 fn a_restore_asks_the_host_again_for_every_signals_disposition() {
 	use crate::{
@@ -288,7 +290,14 @@ fn a_restore_asks_the_host_again_for_every_signals_disposition() {
 		},
 		testkit::run::{Stop, advance},
 	};
+	/// A disposition as the host reads it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum Class {
+		Ignored,
+		Caught,
+	}
 	let engine = Engine::new(EngineConfig::default());
+	let platform = engine.config().platform;
 	let after_restore = |init: ShellInit, src: &str| {
 		let mut host = FakeHost::new();
 		let mut store = MemStore::new();
@@ -309,28 +318,38 @@ fn a_restore_asks_the_host_again_for_every_signals_disposition() {
 			RestoreOpts::default(),
 		)
 		.unwrap();
+		let missing: Vec<Signal> = fresh
+			.asked
+			.iter()
+			.map(|&(sig, _)| sig)
+			.filter(|sig| sig.number(platform) == 0)
+			.collect();
+		assert!(missing.is_empty(), "asked for signals the platform lacks: {missing:?}");
 		fresh
 			.asked
 			.into_iter()
-			.map(|(sig, action)| (sig, action.map(|a| a.to_string())))
+			.filter_map(|(sig, action)| {
+				let class = if action?.is_empty() {
+					Class::Ignored
+				} else {
+					Class::Caught
+				};
+				Some((sig, class))
+			})
 			.collect::<Vec<_>>()
 	};
-	let has = |asked: &[(Signal, Option<String>)], sig, action: &str| {
-		assert!(
-			asked.contains(&(sig, Some(action.to_owned()))),
-			"{sig:?} {action:?} not asked for: {asked:?}"
-		);
+	let has = |asked: &[(Signal, Class)], sig, class| {
+		assert!(asked.contains(&(sig, class)), "{sig:?} not asked for as {class:?}: {asked:?}");
 	};
 	let zsh = ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..ShellInit::default() };
 	let asked = after_restore(zsh, "TRAPUSR1() print u; trap 'print t' TERM");
-	has(&asked, Signal::Hup, "caught");
-	has(&asked, Signal::Quit, "");
-	has(&asked, Signal::Usr1, "TRAPUSR1");
-	has(&asked, Signal::Term, "print t");
-	let asked = after_restore(ShellInit::default(), "trap 'echo x' EXIT; trap 'echo t' USR2");
-	has(&asked, Signal::Quit, "");
-	for sig in [Signal::Hup, Signal::Term, Signal::Usr1, Signal::Segv] {
-		has(&asked, sig, "caught");
+	for sig in [Signal::Hup, Signal::Usr1, Signal::Term] {
+		has(&asked, sig, Class::Caught);
 	}
-	has(&asked, Signal::Usr2, "echo t");
+	has(&asked, Signal::Quit, Class::Ignored);
+	let asked = after_restore(ShellInit::default(), "trap 'echo x' EXIT; trap 'echo t' USR2");
+	has(&asked, Signal::Quit, Class::Ignored);
+	for sig in [Signal::Hup, Signal::Term, Signal::Usr1, Signal::Segv, Signal::Usr2] {
+		has(&asked, sig, Class::Caught);
+	}
 }

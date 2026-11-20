@@ -27,21 +27,20 @@ use std::{
 	task::{Context, Poll, Waker},
 };
 
-use bstr::{BStr, BString};
+use bstr::BString;
 
 use super::{
 	Cx, Kernel, Shell,
 	exec::{self, Flow},
 	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Scratch, ScriptKind, Vproc},
-	state,
-	untrapped::CATCH,
+	state, untrapped as rule,
 };
 use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	host::{ExtProc, OsHandle, PgroupSpec, ProcEvent},
 	ids::{Dialect, JobId, Platform, Vpid},
 	ir::{Opcode, Unit},
-	signal::{SigSet, Signal},
+	signal::Signal,
 	store::{KeyBuf, MiscKey, OptId, TrapKey},
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
@@ -284,11 +283,12 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	{
 		k.fail(err);
 	}
-	for sig in [Signal::Int, Signal::Winch, Signal::Alrm] {
-		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(CATCH)));
-	}
-	for sig in interactive_ignored(k).iter() {
-		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
+	// Its own catches and ignores ([`catches`], [`ignores`]), asked for
+	// through the one rule ([`rule::reinstall_these`]).
+	let own = [Signal::Int, Signal::Winch, Signal::Alrm, Signal::Quit, Signal::Term];
+	let own = own.into_iter().chain(STOPS);
+	if let Err(err) = rule::reinstall_these(k, cx, vp, own) {
+		k.fail(err);
 	}
 }
 
@@ -308,15 +308,21 @@ fn open_shtty(k: &mut Kernel, cx: &mut Cx<'_>) {
 	}
 }
 
-/// The signals the interactive shell ignores itself (zsh `init_signals`):
-/// `QUIT` and `TERM`, and the terminal stop signals while it does job
-/// control.
-const fn interactive_ignored(k: &Kernel) -> SigSet {
-	let mut set = SigSet::EMPTY.with(Signal::Quit).with(Signal::Term);
-	if k.jobctl.pgrp.is_some() {
-		set = set.with(Signal::Tstp).with(Signal::Ttin).with(Signal::Ttou);
-	}
-	set
+/// The terminal stop signals a shell doing job control ignores.
+const STOPS: [Signal; 3] = [Signal::Tstp, Signal::Ttin, Signal::Ttou];
+
+/// Whether the root catches `sig` for its interactive handler
+/// ([`untrapped`]): `INT`, `WINCH` and `ALRM`, interactive only.
+pub const fn catches(k: &Kernel, sig: Signal) -> bool {
+	k.jobctl.interactive && matches!(sig, Signal::Int | Signal::Winch | Signal::Alrm)
+}
+
+/// Whether the root ignores `sig` itself (zsh `init_signals`,
+/// `acquire_pgrp`): `QUIT` and `TERM` when interactive, and the terminal
+/// stop signals while it does job control.
+pub const fn ignores(k: &Kernel, sig: Signal) -> bool {
+	(k.jobctl.interactive && matches!(sig, Signal::Quit | Signal::Term))
+		|| (k.jobctl.pgrp.is_some() && matches!(sig, Signal::Tstp | Signal::Ttin | Signal::Ttou))
 }
 
 /// zsh `acquire_pgrp`: wait until the shell's group owns the terminal (a
@@ -396,22 +402,13 @@ pub fn enable_monitor(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		k.jobctl.root = Some(vp.vpid);
 		k.jobctl.fg = Some(vp.vpid);
 	}
-	if k.jobctl.pgrp.is_none() && acquire(k, cx) {
-		for sig in [Signal::Tstp, Signal::Ttin, Signal::Ttou] {
-			let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
-		}
+	if k.jobctl.pgrp.is_none()
+		&& acquire(k, cx)
+		&& let Err(err) = rule::reinstall_these(k, cx, vp, STOPS.into_iter())
+	{
+		k.fail(err);
 	}
 	true
-}
-
-/// The OS disposition the interactive root shell asks for when it has no
-/// trap for `sig`: its own (`INT`, `WINCH`, `ALRM` caught; `QUIT`, `TERM`
-/// and, with job control, `TSTP`/`TTIN`/`TTOU` ignored), else the default.
-pub fn interactive_disposition(k: &Kernel, sig: Signal) -> Option<&'static BStr> {
-	if matches!(sig, Signal::Int | Signal::Winch | Signal::Alrm) {
-		return Some(BStr::new(CATCH));
-	}
-	interactive_ignored(k).contains(sig).then(|| BStr::new(b""))
 }
 
 /// The interactive root got `sig` with no trap set: what zsh's handler
@@ -1274,14 +1271,17 @@ pub fn check_before_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> boo
 /// zsh `bin_suspend` in a shell doing job control: stop ignoring the
 /// terminal stop signals, give the terminal back to the group the shell
 /// came from (`release_pgrp`), stop with `SIGTSTP` to that group, and when
-/// continued take the terminal over again (`acquire_pgrp`). `false` without
-/// job control (the caller stops the shell as a plain process).
-pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>) -> bool {
+/// continued take the terminal over again (`acquire_pgrp`), the stop
+/// signals asked for again through the one rule ([`rule::reinstall_these`]).
+/// `false` without job control (the caller stops the shell as a plain
+/// process).
+pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	let Some(pgrp) = k.jobctl.pgrp else {
 		return false;
 	};
-	let stops = [Signal::Ttin, Signal::Tstp, Signal::Ttou];
-	for sig in stops {
+	// zsh `signal_default` of each, trapped or not, so that the stop below
+	// stops the shell: the rule's disposition does not apply here.
+	for sig in STOPS {
 		let _ = cx.host.set_signal_trap(sig, None);
 	}
 	if pgrp.orig != pgrp.mine
@@ -1294,10 +1294,10 @@ pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>) -> bool {
 	}
 	let _ = cx.host.signal_process(-pgrp.orig, Some(Signal::Tstp));
 	k.jobctl.pgrp = None;
-	if acquire(k, cx) {
-		for sig in stops {
-			let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
-		}
+	if acquire(k, cx)
+		&& let Err(err) = rule::reinstall_these(k, cx, vp, STOPS.into_iter())
+	{
+		k.fail(err);
 	}
 	true
 }

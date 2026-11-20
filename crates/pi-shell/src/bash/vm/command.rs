@@ -2421,6 +2421,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let child_redirs = redirs.is_some();
 			// Known before the spawn: a signal can come while it is in flight.
 			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
+			// The root's process becomes the program's: each signal that would
+			// end it is caught, to be the program's
+			// ([`super::untrapped::program_in_place`]). Before the spawn, so
+			// the program starts with its default.
+			if (vp.parent.is_none() || vp.in_place()) && super::runs_in_place(vp) {
+				super::untrapped::program_in_place(k, cx, vp, true);
+			}
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2538,6 +2545,14 @@ fn spawned_external(
 	if spawned.is_err() && !k.bangs.is_empty() {
 		k.settle_bang(vp.vpid, None);
 	}
+	// No program to give them to: the signals sent while it was spawned go
+	// ([`super::Kernel::forward`]).
+	if spawned.is_err() && (vp.parent.is_none() || vp.in_place()) {
+		k.forward = crate::bash::SigSet::EMPTY;
+		if k.program_in_place {
+			super::untrapped::program_in_place(k, cx, vp, false);
+		}
+	}
 	match spawned {
 		Err(_) if child_redirs => {
 			// The redirections are applied here after all, then the spawn
@@ -2562,7 +2577,7 @@ fn spawned_external(
 			}
 			// Sent to the shell while the program it runs in place of itself
 			// was being spawned: the program's.
-			if vp.parent.is_none() {
+			if vp.parent.is_none() || vp.in_place() {
 				for sig in std::mem::take(&mut k.forward).iter() {
 					let _ = child.signal(sig);
 				}
@@ -2571,6 +2586,10 @@ fn spawned_external(
 			let s = st(vp);
 			s.waiting = Some(Awaited::Ext { pid });
 			s.stage = Stage::Await;
+			// bash `wait_for` clears `wait_sigint_received` as each wait starts.
+			if vp.parent.is_none() {
+				k.held_sigint = None;
+			}
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
 		Err(err)
@@ -4577,7 +4596,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				}
 				st(vp).notice = end.notice.map(Box::new);
 			}
-			super::end_held_sigint(k, vp, killed == Some(crate::bash::Signal::Int));
+			super::external_ended(k, vp, killed);
 			status
 		},
 		None => st(vp).status,

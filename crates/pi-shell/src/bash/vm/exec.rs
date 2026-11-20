@@ -4267,6 +4267,10 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			},
 		}
 		scratch(vp).children = children.into_iter().map(|v| (v, None)).collect();
+		// bash `wait_for` clears `wait_sigint_received` as each wait starts.
+		if vp.parent.is_none() {
+			k.held_sigint = None;
+		}
 	}
 	let status = vp.status;
 	let sc = scratch(vp);
@@ -4287,10 +4291,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		statuses.push(last);
 	}
 	clear_scratch(&mut k.root, cx.store, vp);
-	// A stage or subshell that died of `SIGINT` ends with 130 (a vproc has no
-	// signal death of its own).
-	let int = crate::bash::Signal::Int.exit_status(k.engine.config().platform);
-	super::end_held_sigint(k, vp, statuses.contains(&int));
+	// The job's end decides on an `INT` the root held for it.
+	super::end_held_sigint(k, vp);
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
 		super::jobctl::fg_done(k, cx, vp, None, b"");
 	}

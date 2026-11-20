@@ -464,7 +464,7 @@ pub fn suspend(ctx: &mut Ctx<'_, '_>, ops: &Ops) -> R {
 		ctx.usage("can't suspend login shell");
 		return done(1);
 	}
-	if crate::bash::vm::jobctl::suspend_shell(ctx.k, ctx.cx) {
+	if crate::bash::vm::jobctl::suspend_shell(ctx.k, ctx.cx, ctx.vp) {
 		return done(0);
 	}
 	let vpid = ctx.vp.vpid;

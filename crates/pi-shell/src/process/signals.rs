@@ -23,6 +23,13 @@ mod unix {
 	// lock, or call the shell: the CLI drains the bits at scheduler boundaries.
 	static PENDING: AtomicU64 = AtomicU64::new(0);
 
+	/// The signals of `PENDING` the kernel itself sent: a terminal's `INT`,
+	/// `QUIT` or hangup `HUP` to its foreground process group, which every
+	/// process of that group gets (Linux `si_code` `SI_KERNEL`). A `kill`
+	/// of the group by another process is `SI_USER`, as a `kill` of this
+	/// process alone is, so it is not told apart.
+	static FROM_KERNEL: AtomicU64 = AtomicU64::new(0);
+
 	/// `PENDING`'s bit of signal `number`.
 	const fn bit(number: libc::c_int) -> u64 {
 		1 << (number - 1)
@@ -38,12 +45,28 @@ mod unix {
 		| bit(libc::SIGSEGV)
 		| bit(libc::SIGSYS);
 
+	/// Whether a delivery's `si_code` says the kernel sent it ([`FROM_KERNEL`]).
+	#[cfg(target_os = "linux")]
+	const fn sent_by_kernel(code: libc::c_int) -> bool {
+		code == libc::SI_KERNEL
+	}
+
+	/// Other systems give a terminal's signals no code of their own.
+	#[cfg(not(target_os = "linux"))]
+	const fn sent_by_kernel(_code: libc::c_int) -> bool {
+		false
+	}
+
 	/// bash `termsig_sighandler`: the same fault signal again before the
 	/// shell handled it ends the process. Its default action comes back, so
 	/// a real fault, which repeats, ends the process the next time.
-	extern "C" fn on_signal(number: libc::c_int) {
+	extern "C" fn on_signal(number: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
 		if (1..=64).contains(&number) {
 			let mask = bit(number);
+			// SAFETY: with `SA_SIGINFO` the kernel passes a valid siginfo.
+			if !info.is_null() && sent_by_kernel(unsafe { (*info).si_code }) {
+				FROM_KERNEL.fetch_or(mask, Ordering::Relaxed);
+			}
 			if PENDING.fetch_or(mask, Ordering::Relaxed) & mask & FAULTS != 0 {
 				// SAFETY: signal is async-signal-safe and takes a valid
 				// signal number and disposition.
@@ -126,6 +149,45 @@ mod unix {
 			] {
 				assert_eq!(ignored_from_status(status), None);
 			}
+		}
+
+		/// The handler marks a delivery the kernel sent (`SI_KERNEL`: a
+		/// terminal's `^C`) and no other (`SI_USER`: a `kill`).
+		#[test]
+		fn the_handler_marks_a_signal_the_kernel_sent() {
+			let deliver = |code| {
+				// SAFETY: a zeroed siginfo is valid; only its code is read.
+				let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+				info.si_code = code;
+				PENDING.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				FROM_KERNEL.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				on_signal(libc::SIGUSR2, &raw mut info, ptr::null_mut());
+				let marked = FROM_KERNEL.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				let pending = PENDING.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				(pending & bit(libc::SIGUSR2) != 0, marked & bit(libc::SIGUSR2) != 0)
+			};
+			assert_eq!(deliver(libc::SI_KERNEL), (true, true));
+			assert_eq!(deliver(libc::SI_USER), (true, false));
+		}
+
+		/// A kernel-sent signal reaches the whole process group, but for a
+		/// session leader's `HUP`: a terminal's hangup sends it to the leader
+		/// alone.
+		#[test]
+		fn a_kernel_hup_reaches_the_group_unless_the_shell_leads_its_session() {
+			let pending = bit(libc::SIGHUP) | bit(libc::SIGINT) | bit(libc::SIGTERM);
+			let kernel = bit(libc::SIGHUP) | bit(libc::SIGINT);
+			let (hup, int, term) = (libc::SIGHUP as u8, libc::SIGINT as u8, libc::SIGTERM as u8);
+			assert_eq!(batch(pending, kernel, false).collect::<Vec<_>>(), [
+				(hup, true),
+				(int, true),
+				(term, false)
+			]);
+			assert_eq!(batch(pending, kernel, true).collect::<Vec<_>>(), [
+				(hup, false),
+				(int, true),
+				(term, false)
+			]);
 		}
 
 		/// A real fault ends the process though the shell catches its signal
@@ -235,10 +297,11 @@ mod unix {
 			next.sa_sigaction = if action.is_some_and(|s| s.is_empty()) {
 				libc::SIG_IGN
 			} else {
-				let handler: extern "C" fn(libc::c_int) = on_signal;
+				let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+					on_signal;
 				handler as libc::sighandler_t
 			};
-			next.sa_flags = libc::SA_RESTART;
+			next.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
 			// SAFETY: next is initialized and the mask is a valid writable
 			// sigset_t.
 			unsafe { libc::sigemptyset(&raw mut next.sa_mask) };
@@ -260,17 +323,51 @@ mod unix {
 			}
 		}
 
-		/// Deliver the OS signals caught since the last call to the root vproc.
+		/// Deliver the OS signals caught since the last call to the root
+		/// vproc; one the kernel sent the whole process group as
+		/// [`SigTarget::Group`] ([`batch`]).
 		pub fn dispatch(ctl: &ControlHandle, root: Vpid) {
-			let mut pending = PENDING.swap(0, Ordering::AcqRel);
-			while pending != 0 {
-				let number = pending.trailing_zeros() as u8 + 1;
-				pending &= pending - 1;
+			let pending = PENDING.swap(0, Ordering::AcqRel);
+			// Those of this batch; a later delivery's mark stays for the next.
+			let kernel = FROM_KERNEL.fetch_and(!pending, Ordering::AcqRel) & pending;
+			// SAFETY: getsid and getpid take no pointer and cannot fail here.
+			let leads_session = unsafe { libc::getsid(0) == libc::getpid() };
+			for (number, group) in batch(pending, kernel, leads_session) {
 				if let Some(signal) = Signal::from_number(number, Platform::current()) {
-					ctl.signal(SigTarget::Vpid(root), signal);
+					let target = if group {
+						SigTarget::Group(root)
+					} else {
+						SigTarget::Vpid(root)
+					};
+					ctl.signal(target, signal);
 				}
 			}
 		}
+	}
+
+	/// The signal numbers of `pending`, lowest first, each with whether the
+	/// kernel sent it to the whole process group: marked in `kernel`
+	/// ([`FROM_KERNEL`]), except a `HUP` to a shell that leads its session. A
+	/// terminal's hangup sends its `HUP` to the session leader alone (Linux
+	/// `tty_signal_session_leader`); to a shell that does not lead it, a
+	/// kernel's `HUP` is the one the foreground group gets when the leader
+	/// exits (`disassociate_ctty`).
+	fn batch(
+		mut pending: u64,
+		mut kernel: u64,
+		leads_session: bool,
+	) -> impl Iterator<Item = (u8, bool)> {
+		if leads_session {
+			kernel &= !bit(libc::SIGHUP);
+		}
+		std::iter::from_fn(move || {
+			if pending == 0 {
+				return None;
+			}
+			let low = pending.isolate_lowest_one();
+			pending &= pending - 1;
+			Some((low.trailing_zeros() as u8 + 1, kernel & low != 0))
+		})
 	}
 
 	impl Drop for Signals {
@@ -282,6 +379,7 @@ mod unix {
 			}
 			crate::sys::dispositions_changed();
 			PENDING.store(0, Ordering::Relaxed);
+			FROM_KERNEL.store(0, Ordering::Relaxed);
 		}
 	}
 

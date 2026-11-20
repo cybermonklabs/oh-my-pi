@@ -483,6 +483,10 @@ impl SigSet {
 pub enum SigTarget {
 	/// One virtual process.
 	Vpid(Vpid),
+	/// One virtual process, as the kernel signalled its OS process group (a
+	/// terminal's `INT`, `QUIT` or hangup `HUP`): a program it runs in place
+	/// of itself, in that group too, has the signal from the kernel already.
+	Group(Vpid),
 	/// Every process of a job (and its externals' process group).
 	Job(JobId),
 	/// Every virtual process of the shell.
