@@ -26,13 +26,15 @@
 //! matches; the failure report names how many distinct outcomes each client
 //! produced and diffs the first of each.
 //!
-//! The reference client runs with an empty environment (plus `TZ` when set, so
-//! local-time output uses one zone on both sides, and [`UTF8_LOCALE`], so both
-//! sides print non-ASCII file names the same way), matching the test host's
-//! empty shell environment; the fake remote shell, the reference server, and
-//! the password files are named by the same absolute paths on both sides. The
-//! reference daemon keeps the bare empty environment: one is started per side
-//! from the same binary, so whatever it prints, it prints alike for both.
+//! Both clients run with the same empty environment (plus `TZ` when set, so
+//! local-time output uses one zone on both sides) and the same `LC_ALL`: the
+//! locale decides which bytes of a file name either side escapes, so a
+//! scenario pins it ([`UTF8_LOCALE`], or [`C_LOCALE`] for the rows that cover
+//! the C locale) and the fake remote shell passes it to both remote servers.
+//! The fake remote shell, the reference server, and the password files are
+//! named by the same absolute paths on both sides. The reference daemon keeps
+//! the bare empty environment: one is started per side from the same binary,
+//! so whatever it prints, it prints alike for both.
 //! The suite skips itself when no rsync 3.5.1 is installed, unless
 //! `RSYNC_REFERENCE_REQUIRED` is set; a 3.5.1 without xxhash, lz4 or zstd
 //! fails it (see [`reference`]). Set `RSYNC_CONFORMANCE_FILTER=<substring>`
@@ -58,7 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use self::daemon::Daemon;
 use self::normalize::normalize;
 use self::snapshot::Snapshot;
-use crate::host::run_util;
+use crate::host::run_util_env;
 use crate::rsync::Rsync;
 
 /// How many extra runs of each client a mismatch gets.
@@ -70,18 +72,25 @@ struct Case {
 	exit: i32,
 	tweaks: &'static str,
 	args: &'static [&'static str],
+	/// `LC_ALL` for both clients and both remote servers.
+	locale: &'static str,
 	/// Compare stdout as a sorted multiset of lines.
 	unordered: bool,
 }
 
 /// A table row.
 const fn c(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, unordered: false }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: false }
+}
+
+/// A table row run in the C locale instead of [`UTF8_LOCALE`].
+const fn cc(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
+	Case { name, exit, tweaks, args, locale: C_LOCALE, unordered: false }
 }
 
 /// A table row whose stdout order is racy in the reference.
 const fn u(name: &'static str, exit: i32, tweaks: &'static str, args: &'static [&'static str]) -> Case {
-	Case { name, exit, tweaks, args, unordered: true }
+	Case { name, exit, tweaks, args, locale: UTF8_LOCALE, unordered: true }
 }
 
 /// How the scenario reaches its peer.
@@ -110,20 +119,20 @@ struct Outcome {
 	tree: Snapshot,
 }
 
-/// The locale the reference client runs under — and, through the fake remote
-/// shell, both sides' remote servers: the C locale with a UTF-8 charmap, in
-/// libc's spelling (glibc and musl: `C.UTF-8`; Darwin: `UTF-8`).
-///
-/// A cleared environment leaves the reference in the C locale, where no byte
-/// above 0x7F is printable, so it escapes every one of them in the names it
-/// prints (`ünï cødé.txt` becomes `\#303\#274n\#303\#257 c\#303\#270d\#303\#251.txt`),
-/// while the builtin prints file names as the UTF-8 text they are. Naming one
-/// fixed locale keeps the run hermetic — nothing ambient reaches either side —
-/// while pinning the one setting they disagreed about. The builtin reads
-/// `LC_ALL`/`LC_CTYPE`/`LANG` in one other place, the default charset of
-/// `--iconv` (`iconv::locale_charset`), which no scenario exercises; one that
-/// did would have to give the builtin the same locale rather than assume it.
+/// The locale most scenarios run under: the C locale with a UTF-8 charmap, in
+/// libc's spelling (glibc and musl: `C.UTF-8`; Darwin: `UTF-8`). Both clients
+/// print the UTF-8 file names of the fixture as the text they are.
 const UTF8_LOCALE: &str = if cfg!(target_os = "macos") { "UTF-8" } else { "C.UTF-8" };
+
+/// The locale of the scenarios that cover the other half of the contract: in
+/// the C locale no byte above 0x7F is printable, so both clients escape every
+/// one of them in the names they print (`ünï cødé.txt` becomes
+/// `\#303\#274n\#303\#257 c\#303\#270d\#303\#251.txt`), and `-8` turns that
+/// off on both. Naming the locale on both sides keeps the run hermetic —
+/// nothing ambient reaches either side — and leaves the escaping a scenario
+/// can compare. The builtin reads `LC_ALL`/`LC_CTYPE`/`LANG` in one other
+/// place, the default charset of `--iconv` (`iconv::locale_charset`).
+const C_LOCALE: &str = "C";
 
 /// The reference rsync 3.5.1 binary, when one is installed (Homebrew's, or
 /// the first on `PATH`). Other versions are skipped: the builtin's output is
@@ -165,27 +174,26 @@ struct Bench {
 	base: PathBuf,
 	reference: PathBuf,
 	mode: Mode,
+	locale: &'static str,
 }
 
 impl Bench {
-	fn new(base: &Path, reference: &Path, mode: Mode) -> Self {
+	fn new(base: &Path, reference: &Path, mode: Mode, locale: &'static str) -> Self {
 		let bin = base.join("bin");
 		fs::create_dir_all(&bin).unwrap();
 		// Like ssh, the fake remote shell drops the host name and hands the
 		// rest to a shell as one command line (so `--old-args` word splitting
 		// happens remotely). The remote command runs in the client's cwd. It
-		// sets the locale itself because each client hands its own environment
-		// down: the builtin's remote side starts from an empty one, the
-		// reference's from UTF8_LOCALE, and a server-side message naming a
-		// non-ASCII file would otherwise be escaped on one side only.
+		// sets the locale itself so that both remote servers have it whatever
+		// each client hands down.
 		let rsh = bin.join("fakersh");
-		crate::rsync::testprog::write(&rsh, &format!("#!/bin/sh\nshift\nLC_ALL={UTF8_LOCALE}\nexport LC_ALL\nexec /bin/sh -c \"$*\"\n"));
+		crate::rsync::testprog::write(&rsh, &format!("#!/bin/sh\nshift\nLC_ALL={locale}\nexport LC_ALL\nexec /bin/sh -c \"$*\"\n"));
 		for (name, password) in [("pw", "sekrit\n"), ("badpw", "wrong\n")] {
 			let file = bin.join(name);
 			fs::write(&file, password).unwrap();
 			fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
 		}
-		Self { base: base.to_path_buf(), reference: reference.to_path_buf(), mode }
+		Self { base: base.to_path_buf(), reference: reference.to_path_buf(), mode, locale }
 	}
 
 	/// The scenario's argv for a daemon on `port`.
@@ -220,12 +228,12 @@ impl Bench {
 		let (code, out, err) = match client {
 			Client::Ours => {
 				let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-				let (code, cap) = run_util::<Rsync>(&refs, "", &w);
+				let (code, cap) = run_util_env::<Rsync>(&refs, "", &w, &[("LC_ALL", self.locale)]);
 				(code, cap.stdout(), cap.stderr())
 			}
 			Client::Reference => {
 				let mut cmd = Command::new(&self.reference);
-				cmd.args(&argv).current_dir(&w).env_clear().env("LC_ALL", UTF8_LOCALE);
+				cmd.args(&argv).current_dir(&w).env_clear().env("LC_ALL", self.locale);
 				if let Some(tz) = std::env::var_os("TZ") {
 					cmd.env("TZ", tz);
 				}
@@ -263,7 +271,7 @@ fn check(reference: &Path, mode: Mode, case: &Case) -> Result<(), String> {
 	// Canonical, so the paths both clients print agree with what `getcwd`
 	// reports to the reference (macOS: /var → /private/var).
 	let base = fs::canonicalize(dir.path()).unwrap();
-	let bench = Bench::new(&base, reference, mode);
+	let bench = Bench::new(&base, reference, mode, case.locale);
 	// Distinct outcomes per client so far, first run first.
 	let mut mine: Vec<Outcome> = Vec::new();
 	let mut seen: Vec<Outcome> = Vec::new();
