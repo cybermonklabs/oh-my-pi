@@ -21,7 +21,7 @@ mod platform {
 	use std::{
 		collections::HashSet,
 		fs, io,
-		os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+		os::fd::{AsFd, AsRawFd, OwnedFd},
 		sync::Arc,
 	};
 
@@ -34,19 +34,11 @@ mod platform {
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
-		/// `None` where `pidfd_open` is unavailable ([`pidfd_unavailable`]):
-		/// the process is then pinned by `start_time` alone, as
-		/// `sys::proc::signal_pinned` does there.
+		/// `None` where `pidfd_open` is unavailable
+		/// ([`sys::Pidfd::Unavailable`]): the process is then pinned by
+		/// `start_time` alone, as `sys::proc::signal_pinned` does there.
 		pidfd:      Option<Arc<OwnedFd>>,
 		start_time: u64,
-	}
-
-	/// Whether `error` from `pidfd_open` says the system provides no pidfd,
-	/// rather than anything about the process: `ENOSYS` (kernels before
-	/// 5.3) or `EPERM` (a seccomp or LSM filter; `pidfd_open` checks no
-	/// permission on its target).
-	fn pidfd_unavailable(error: &io::Error) -> bool {
-		matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM))
 	}
 
 	#[cfg(test)]
@@ -94,21 +86,13 @@ mod platform {
 		fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
 	}
 
-	/// `pidfd_open(pid)`.
-	fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+	/// `pidfd_open(pid)`, sorted ([`crate::sys::proc::pidfd_open`]).
+	fn pidfd_open(pid: i32) -> io::Result<sys::Pidfd> {
 		#[cfg(test)]
 		if NO_PIDFD.get() {
-			return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+			return Ok(sys::Pidfd::Unavailable);
 		}
-		// SAFETY: pidfd_open takes scalar arguments and returns a new owned
-		// fd.
-		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-		if fd < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: a successful pidfd_open returned a uniquely owned
-		// descriptor that fits an `i32`.
-		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+		crate::sys::proc::pidfd_open(pid, None)
 	}
 
 	impl Process {
@@ -129,11 +113,10 @@ mod platform {
 			if pid <= 0 {
 				return Ok(None);
 			}
-			let pidfd = match pidfd_open(pid) {
-				Ok(fd) => Some(Arc::new(fd)),
-				Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
-				Err(error) if pidfd_unavailable(&error) => None,
-				Err(error) => return Err(error),
+			let pidfd = match pidfd_open(pid)? {
+				sys::Pidfd::Open(fd) => Some(Arc::new(fd)),
+				sys::Pidfd::Gone => return Ok(None),
+				sys::Pidfd::Unavailable => None,
 			};
 			let Some(info) = crate::sys::proc::read(pid)? else {
 				return Ok(None);
@@ -1779,6 +1762,43 @@ mod tests {
 		let _ = child.wait();
 		drop(child);
 		assert!(matches!(platform::Process::open(pid), Ok(None)), "the reaped child is not gone");
+	}
+
+	/// A kernel before 6.16 answers `pidfd_open` with `EINVAL` for a pid whose
+	/// process was reaped after the call found it. Injected here: `open`
+	/// reports the reaped child gone, and a live process the same `EINVAL`
+	/// cannot pin is an error, not a process gone.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn open_counts_a_pidfd_einval_as_gone_only_for_a_reaped_process() {
+		let spawn = || {
+			std::process::Command::new("sleep")
+				.arg("30")
+				.spawn()
+				.expect("spawn sleeper")
+		};
+		let mut reaped = spawn();
+		let gone = i32::try_from(reaped.id()).unwrap();
+		let _ = reaped.kill();
+		let _ = reaped.wait();
+		let mut live = spawn();
+		let running = i32::try_from(live.id()).unwrap();
+		let fails =
+			crate::sys::proc::fail_pidfds(vec![(gone, libc::EINVAL), (running, libc::EINVAL)]);
+		let reaped_open = platform::Process::open(gone);
+		let live_open = platform::Process::open(running);
+		drop(fails);
+		let _ = live.kill();
+		let _ = live.wait();
+		assert!(
+			matches!(reaped_open, Ok(None)),
+			"the reaped child is not gone: {:?}",
+			reaped_open.map(|p| p.map(|p| p.pid()))
+		);
+		let error = live_open
+			.map(|p| p.map(|p| p.pid()))
+			.expect_err("an EINVAL for a running process counted as gone");
+		assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
 	}
 
 	/// `kill_process_group` is the last line of defense: even if a future

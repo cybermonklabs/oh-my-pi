@@ -1612,14 +1612,14 @@ fn wait_exit(pid: i32, tracker: &Tracker) -> ExitStatus {
 }
 
 /// A pidfd of child `pid` (close-on-exec; readable once it exited); `None`
-/// where the kernel has none (before 5.3) or refuses it.
+/// where the kernel has none (before 5.3) or refuses it. The child is
+/// unreaped, so no failure means it is gone: each leaves it to a waiter.
 #[cfg(target_os = "linux")]
 fn pidfd_open(pid: i32) -> Option<OwnedFd> {
-	// SAFETY: plain syscall without pointer arguments; the result is checked.
-	let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-	let fd = RawFd::try_from(fd).ok().filter(|&fd| fd >= 0)?;
-	// SAFETY: a successful pidfd_open returned a descriptor we own.
-	Some(unsafe { OwnedFd::from_raw_fd(fd) })
+	match crate::sys::proc::pidfd_open(pid, None) {
+		Ok(pi_builtins::proc_sys::Pidfd::Open(fd)) => Some(fd),
+		_ => None,
+	}
 }
 
 /// The exit status of `pid` if it has exited, leaving it unreaped (Linux

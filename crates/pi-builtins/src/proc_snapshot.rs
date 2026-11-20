@@ -119,7 +119,7 @@ fn parse_procargs2(buffer: &[u8]) -> Vec<String> {
 #[cfg(target_os = "linux")]
 pub mod sys {
 	use std::{
-		fs,
+		fs, io,
 		os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 		str::{FromStr, SplitWhitespace},
 	};
@@ -133,15 +133,89 @@ pub mod sys {
 			.filter_map(|entry| entry.file_name().to_str()?.parse().ok())
 	}
 
-	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
-	/// by re-checking [`start_time`] after the open.
-	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+	/// What [`pidfd_open`] gave.
+	#[derive(Debug)]
+	pub enum Pidfd {
+		/// A pidfd of whichever process holds the pid now; callers pin
+		/// identity by re-checking [`start_time`] after the open.
+		Open(OwnedFd),
+		/// No process of this identity is left: the pid names none, or
+		/// another one.
+		Gone,
+		/// This system gives no pidfd: `ENOSYS` (kernels before 5.3) or
+		/// `EPERM` (a seccomp or LSM filter).
+		Unavailable,
+	}
+
+	/// `pidfd_open(pid, 0)`: a pidfd of the process `pid` names, the process
+	/// `start` pins (its start time, field 22 of `/proc/<pid>/stat`; `None`:
+	/// whichever holds the pid), or what kept it from one
+	/// ([`sort_pidfd_open`]).
+	///
+	/// # Errors
+	///
+	/// A failure that does not show the process gone or pidfds unavailable
+	/// ([`sort_pidfd_open`]).
+	pub fn pidfd_open(pid: i32, start: Option<u64>) -> io::Result<Pidfd> {
 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-		(fd >= 0).then(|| {
+		let opened = if fd < 0 {
+			Err(io::Error::last_os_error())
+		} else {
 			// SAFETY: a successful pidfd_open returned a uniquely owned descriptor.
-			unsafe { OwnedFd::from_raw_fd(fd as i32) }
-		})
+			Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+		};
+		sort_pidfd_open(pid, start, opened)
+	}
+
+	/// What the result `opened` of `pidfd_open(pid, 0)` says, for the process
+	/// `start` pins (`None`: whichever holds the pid).
+	///
+	/// - `ESRCH`: no process has the pid: [`Pidfd::Gone`].
+	/// - `EINVAL` or `ENOENT`: gone only when `/proc/<pid>` is (`ENOENT`,
+	///   `ESRCH`), or names a process of another start time than `start`.
+	///   Kernels before 6.16 return `EINVAL` for a pid whose process was
+	///   reaped after `pidfd_open` found the pid (`pidfd_prepare`: `if (!pid ||
+	///   !pid_has_task(pid, PIDTYPE_TGID)) return -EINVAL;`); 6.16 returns
+	///   `ESRCH` there ("Task has already been reaped") and `ENOENT` for a
+	///   pid that is no thread-group leader. `EINVAL` also means bad flags (0
+	///   here) or `pid <= 0` (the syscall's own checks), and before 6.16 a pid
+	///   that is no thread-group leader: those leave `/proc/<pid>` as it
+	///   was, so they stay errors.
+	/// - `ENOSYS`, `EPERM`: [`Pidfd::Unavailable`].
+	///
+	/// # Errors
+	///
+	/// Any other failure (`EMFILE`: no descriptor left), and an `EINVAL` or
+	/// `ENOENT` while `/proc/<pid>` shows the process.
+	pub fn sort_pidfd_open(
+		pid: i32,
+		start: Option<u64>,
+		opened: io::Result<OwnedFd>,
+	) -> io::Result<Pidfd> {
+		let error = match opened {
+			Ok(fd) => return Ok(Pidfd::Open(fd)),
+			Err(error) => error,
+		};
+		match error.raw_os_error() {
+			Some(libc::ESRCH) => Ok(Pidfd::Gone),
+			Some(libc::ENOSYS | libc::EPERM) => Ok(Pidfd::Unavailable),
+			Some(libc::EINVAL | libc::ENOENT) if pid > 0 && gone(pid, start) => Ok(Pidfd::Gone),
+			_ => Err(error),
+		}
+	}
+
+	/// Whether `/proc/<pid>` shows no process of start time `start`: none
+	/// at all, or (when `start` is given) one of another start time.
+	fn gone(pid: i32, start: Option<u64>) -> bool {
+		match fs::read(format!("/proc/{pid}/stat")) {
+			Err(error) => matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)),
+			Ok(line) => start.is_some_and(|start| {
+				stat_fields(&String::from_utf8_lossy(&line))
+					.and_then(|mut fields| fields.nth(19)?.parse::<u64>().ok())
+					!= Some(start)
+			}),
+		}
 	}
 
 	/// Sends `signal` through `pidfd`, which can never reach a recycled pid.
@@ -371,7 +445,8 @@ mod proc_snapshot {
 			if signal == 0 {
 				return alive();
 			}
-			let Some(pidfd) = sys::open_pidfd(self.pid) else {
+			let Ok(sys::Pidfd::Open(pidfd)) = sys::pidfd_open(self.pid, Some(self.stat.start_time))
+			else {
 				return false;
 			};
 			if !alive() {

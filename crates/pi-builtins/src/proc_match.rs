@@ -383,7 +383,8 @@ async fn wait_for_watchable_exits(
 	let mut polled = Vec::new();
 	let mut watched = Vec::new();
 	for process in processes {
-		let Some(fd) = proc_snapshot::sys::open_pidfd(process.pid()) else {
+		let Ok(proc_snapshot::sys::Pidfd::Open(fd)) = proc_snapshot::sys::pidfd_open(process.pid(), None)
+		else {
 			polled.push(process);
 			continue;
 		};

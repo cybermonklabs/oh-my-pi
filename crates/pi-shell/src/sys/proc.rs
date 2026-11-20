@@ -30,6 +30,21 @@ pub(crate) fn fail_reads(fails: Vec<(Option<i32>, i32)>) -> impl Drop {
 	Restore
 }
 
+/// Makes this thread's `pidfd_open` calls fail with `errno` for `pid`, each
+/// failure sorted as the kernel's own
+/// ([`pi_builtins::proc_sys::sort_pidfd_open`]), until the guard is dropped.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fail_pidfds(fails: Vec<(i32, i32)>) -> impl Drop {
+	struct Restore;
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			sys::FAIL_PIDFDS.with_borrow_mut(Vec::clear);
+		}
+	}
+	sys::FAIL_PIDFDS.set(fails);
+	Restore
+}
+
 /// One process of the table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProcInfo {
@@ -237,6 +252,19 @@ pub fn signal_pinned(p: &ProcInfo, sig: Signal) -> io::Result<bool> {
 	sys::signal_pinned(p, i32::from(sig.number(Platform::current())))
 }
 
+/// A pidfd of the process `pid` names, the one `start` pins (its start
+/// time; `None`: whichever holds the pid), sorted by
+/// [`pi_builtins::proc_sys::sort_pidfd_open`]: every `pidfd_open` of
+/// pi-shell goes through it.
+///
+/// # Errors
+///
+/// A failure that shows neither the process gone nor pidfds unavailable.
+#[cfg(target_os = "linux")]
+pub(crate) fn pidfd_open(pid: i32, start: Option<u64>) -> io::Result<pi_builtins::proc_sys::Pidfd> {
+	sys::pidfd_open(pid, start)
+}
+
 /// Split a Linux `/proc/<pid>/stat` line into `(comm, fields after comm)`.
 /// The command name may itself contain spaces and parentheses, so it ends at
 /// the *last* `)`.
@@ -291,8 +319,10 @@ mod sys {
 	use std::{
 		fs,
 		io::{self, Read},
-		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+		os::fd::AsRawFd,
 	};
+
+	use pi_builtins::proc_sys::{self, Pidfd};
 
 	use super::{ProcInfo, gone_or_foreign, parse_stat};
 
@@ -339,6 +369,26 @@ mod sys {
 		/// process's read refused, without the kernel's help.
 		pub(crate) static FAIL_READS: std::cell::RefCell<Vec<(Option<i32>, i32)>> =
 			const { std::cell::RefCell::new(Vec::new()) };
+		/// `pidfd_open` on this thread fails with the paired `errno` for that
+		/// pid, sorted as the kernel's own failure would be: a kernel before
+		/// 6.16 refusing a pid its process was reaped from (`EINVAL`).
+		pub(crate) static FAIL_PIDFDS: std::cell::RefCell<Vec<(i32, i32)>> =
+			const { std::cell::RefCell::new(Vec::new()) };
+	}
+
+	/// [`proc_sys::pidfd_open`] for the process `start` pins (`None`:
+	/// whichever holds `pid`).
+	pub fn pidfd_open(pid: i32, start: Option<u64>) -> io::Result<Pidfd> {
+		#[cfg(test)]
+		if let Some(errno) = FAIL_PIDFDS.with_borrow(|fails| {
+			fails
+				.iter()
+				.find(|&&(at, _)| at == pid)
+				.map(|&(_, errno)| errno)
+		}) {
+			return proc_sys::sort_pidfd_open(pid, start, Err(io::Error::from_raw_os_error(errno)));
+		}
+		proc_sys::pidfd_open(pid, start)
 	}
 
 	/// `/proc/<pid>/stat`, parsed; `InvalidData` for a line that does not
@@ -382,24 +432,12 @@ mod sys {
 		Ok((ns * hz / 1_000_000_000) as u64)
 	}
 
-	fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
-		// SAFETY: pidfd_open takes scalar arguments and returns a new fd.
-		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-		if fd < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: a successful pidfd_open returned a descriptor we now own.
-		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-	}
-
 	pub fn signal_pinned(p: &ProcInfo, sig: i32) -> io::Result<bool> {
-		let pidfd = match pidfd_open(p.pid) {
-			Ok(fd) => Some(fd),
-			Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-			// No pidfd from this system (kernels before 5.3: `ENOSYS`; a seccomp
-			// or LSM filter: `EPERM`): fall back to a start-time recheck.
-			Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => None,
-			Err(e) => return Err(e),
+		let pidfd = match pidfd_open(p.pid, Some(p.start))? {
+			Pidfd::Open(fd) => Some(fd),
+			Pidfd::Gone => return Ok(false),
+			// No pidfd from this system: fall back to a start-time recheck.
+			Pidfd::Unavailable => None,
 		};
 		// With the pidfd open the pid cannot be reused for another process
 		// while we check that it still names the scanned one. A read that
@@ -633,6 +671,53 @@ mod tests {
 		assert!(signal_pinned(&p, Signal::Kill).unwrap());
 		let status = child.wait().unwrap();
 		assert!(!status.success());
+	}
+
+	/// A kernel before 6.16 answers `pidfd_open` with `EINVAL` for a pid whose
+	/// process was reaped after the call found the pid: GitHub's 6.8 runner
+	/// did in the KILL sweep of a group that had just died (`the sweep read
+	/// the process table: "Invalid argument (os error 22)"`). Injected here,
+	/// for a reaped sleep: a pinned signal counts it gone, and a sweep that
+	/// meets it signals the rest and reports no failure. The same `EINVAL`
+	/// for a pid that now names a process of another start time counts as
+	/// gone too; for a running process `/proc` still shows it is an error,
+	/// and nothing is signalled.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_pidfd_einval_counts_as_gone_only_when_proc_no_longer_shows_the_process() {
+		let spawn = || {
+			std::process::Command::new("/bin/sleep")
+				.arg("30")
+				.spawn()
+				.unwrap()
+		};
+		let mut reaped = spawn();
+		let gone = info(reaped.id() as i32).unwrap();
+		reaped.kill().unwrap();
+		reaped.wait().unwrap();
+		let (mut live, mut bystander) = (spawn(), spawn());
+		let alive = info(live.id() as i32).unwrap();
+		let other = info(bystander.id() as i32).unwrap();
+		let mut reused = alive.clone();
+		reused.start = reused.start.wrapping_add(1);
+		let fails = fail_pidfds(vec![(gone.pid, libc::EINVAL), (alive.pid, libc::EINVAL)]);
+		let reaped_sent = signal_pinned(&gone, Signal::Kill);
+		let reused_sent = signal_pinned(&reused, Signal::Kill);
+		let live_sent = signal_pinned(&alive, Signal::Kill);
+		let (swept, sweep) = signal_all(vec![gone.clone(), other.clone()], Signal::Kill);
+		drop(fails);
+		let live_ran = live.try_wait().unwrap().is_none();
+		let _ = live.kill();
+		live.wait().unwrap();
+		let bystander_status = bystander.wait().unwrap();
+		assert!(!reaped_sent.unwrap(), "the reaped sleep {} was signalled", gone.pid);
+		assert!(!reused_sent.unwrap(), "a pid of another start time was signalled");
+		let error = live_sent.expect_err("an EINVAL for a running process counted as gone");
+		assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
+		assert!(live_ran, "the running sleep {} was signalled", alive.pid);
+		sweep.unwrap();
+		assert_eq!(swept, [other], "the sweep's KILL");
+		assert!(!bystander_status.success(), "the sweep's KILL did not end the bystander");
 	}
 
 	/// [`ended`] tells a running process from one that has ended and waits
@@ -880,18 +965,8 @@ pub(crate) mod short_of_descriptors {
 	/// filter against it): without it, a pin is by start time, which needs
 	/// the `stat` read a pidfd would otherwise have spared.
 	pub(crate) fn pidfd_available() -> bool {
-		// SAFETY: pidfd_open takes scalar arguments; a descriptor it returns
-		// is closed at once.
-		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-		if fd < 0 {
-			return !matches!(
-				std::io::Error::last_os_error().raw_os_error(),
-				Some(libc::ENOSYS | libc::EPERM)
-			);
-		}
-		// SAFETY: `fd` is the descriptor pidfd_open just returned.
-		unsafe { libc::close(fd as i32) };
-		true
+		let me = std::process::id() as i32;
+		!matches!(super::pidfd_open(me, None), Ok(pi_builtins::proc_sys::Pidfd::Unavailable))
 	}
 
 	/// One more file opens from now on in this process, and no other.
