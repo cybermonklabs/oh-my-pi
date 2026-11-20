@@ -1,222 +1,26 @@
 //! `pi_shell::process` command-line behavior and interactive prompts,
-//! with zsh parity checked against the real zsh ([`zsh_oracle`]).
+//! with zsh parity checked against the real zsh ([`zsh_oracle`]) and bash
+//! parity against the real bash ([`process_support::real_bash`]).
 
 #![cfg(unix)]
 
+mod process_support;
 mod pty_support;
 mod zsh_oracle;
 
 use std::{
 	ffi::{OsStr, OsString},
 	fs, io,
-	os::unix::{
-		ffi::OsStringExt,
-		process::{CommandExt, ExitStatusExt},
-	},
-	path::{Path, PathBuf},
+	os::unix::{ffi::OsStringExt, process::CommandExt},
+	path::Path,
 	process::Command,
 };
 
+use process_support::{
+	End::{self, Exit, Signal},
+	Outcome, Run, have_zsh, real, real_bash,
+};
 use pty_support::{Spawn, TIMEOUT};
-
-/// What a shell run gave.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Outcome {
-	stdout: Vec<u8>,
-	stderr: Vec<u8>,
-	/// The exit status; `None` when a signal ended the shell.
-	code:   Option<i32>,
-	/// The signal that ended the shell.
-	signal: Option<i32>,
-	/// Whether it dumped a core.
-	core:   bool,
-}
-
-/// The signals the tests send. Each run starts with them at their
-/// defaults, whatever the test runner's are (a terminal, `nohup` or a CI
-/// runner starts children with some ignored).
-const SENT: [libc::c_int; 8] = [
-	libc::SIGHUP,
-	libc::SIGINT,
-	libc::SIGQUIT,
-	libc::SIGTERM,
-	libc::SIGUSR1,
-	libc::SIGUSR2,
-	libc::SIGALRM,
-	libc::SIGPIPE,
-];
-
-/// One run of a shell: `program` named `name` (`argv[0]`; through a link
-/// named so under a wrapper, which runs it by its path), with `ZDOTDIR`
-/// unset, the signals in [`SENT`] at their defaults and a core size limit
-/// of 0 on entry, unless set otherwise.
-struct Run {
-	program: PathBuf,
-	name:    &'static str,
-	args:    Vec<OsString>,
-	ignored: Vec<libc::c_int>,
-	cores:   bool,
-	dir:     Option<PathBuf>,
-	wrap:    Vec<&'static str>,
-	env:     Vec<(&'static str, Option<&'static str>)>,
-}
-
-impl Run {
-	fn new(program: impl AsRef<OsStr>, name: &'static str, args: &[impl AsRef<OsStr>]) -> Self {
-		Self {
-			program: PathBuf::from(program.as_ref()),
-			name,
-			args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
-			ignored: Vec::new(),
-			cores: false,
-			dir: None,
-			wrap: Vec::new(),
-			env: Vec::new(),
-		}
-	}
-
-	/// obash as `name`.
-	fn obash(name: &'static str, args: &[impl AsRef<OsStr>]) -> Self {
-		Self::new(env!("CARGO_BIN_EXE_obash"), name, args)
-	}
-
-	/// `script` as `name` runs a `-c` string: `zsh -f -c` or `bash -c`.
-	fn script(program: impl AsRef<OsStr>, name: &'static str, script: impl AsRef<OsStr>) -> Self {
-		let flags: &[&str] = if name == "zsh" {
-			&["-f", "-c"]
-		} else {
-			&["-c"]
-		};
-		let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
-		args.push(script.as_ref().to_owned());
-		Self::new(program, name, &args)
-	}
-
-	/// These signals ignored on entry.
-	fn ignoring(mut self, signals: &[libc::c_int]) -> Self {
-		self.ignored.extend_from_slice(signals);
-		self
-	}
-
-	/// Run in `dir`, with the core size limit raised to its hard limit.
-	fn dumping_in(mut self, dir: &Path) -> Self {
-		self.cores = true;
-		self.dir = Some(dir.to_owned());
-		self
-	}
-
-	/// Run under `wrap`, a command and its arguments.
-	fn under(mut self, wrap: &[&'static str]) -> Self {
-		self.wrap = wrap.to_vec();
-		self
-	}
-
-	/// Set (`Some`) or unset (`None`) the variable `key`.
-	fn env(mut self, key: &'static str, value: Option<&'static str>) -> Self {
-		self.env.push((key, value));
-		self
-	}
-
-	fn go(&self) -> Outcome {
-		let link_dir = tempfile::tempdir().expect("a directory for the shell's link");
-		let mut cmd = if let Some((first, rest)) = self.wrap.split_first() {
-			let link = link_dir.path().join(self.name);
-			std::os::unix::fs::symlink(&self.program, &link).expect("link the shell");
-			let mut cmd = Command::new(first);
-			cmd.args(rest).arg(link);
-			cmd
-		} else {
-			let mut cmd = Command::new(&self.program);
-			cmd.arg0(self.name);
-			cmd
-		};
-		cmd.args(&self.args).env_remove("ZDOTDIR");
-		for (key, value) in &self.env {
-			match value {
-				Some(value) => cmd.env(key, value),
-				None => cmd.env_remove(key),
-			};
-		}
-		if let Some(dir) = &self.dir {
-			cmd.current_dir(dir);
-		}
-		let (ignored, cores) = (self.ignored.clone(), self.cores);
-		// SAFETY: signal, getrlimit and setrlimit are async-signal-safe and
-		// change only the child; nothing here allocates.
-		unsafe {
-			cmd.pre_exec(move || {
-				for sig in SENT {
-					libc::signal(sig, libc::SIG_DFL);
-				}
-				for &sig in &ignored {
-					libc::signal(sig, libc::SIG_IGN);
-				}
-				let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-				if libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) == 0 {
-					limit.rlim_cur = if cores { limit.rlim_max } else { 0 };
-					libc::setrlimit(libc::RLIMIT_CORE, &raw const limit);
-				}
-				Ok(())
-			});
-		}
-		let out = cmd.output().expect("start the shell");
-		Outcome {
-			stdout: out.stdout,
-			stderr: out.stderr,
-			code:   out.status.code(),
-			signal: out.status.signal(),
-			core:   out.status.core_dumped(),
-		}
-	}
-}
-
-/// Whether the real zsh exists (it reports the test uncompared when not).
-fn have_zsh() -> bool {
-	zsh_oracle::exists()
-}
-
-/// The real bash: `$PI_TEST_REAL_BASH`, or `/bin/bash`. `None`, the test
-/// reported [`zsh_oracle::uncompared`], when it is missing or older than
-/// bash 5 (the cases were measured with bash 5.2; `${PS1@P}` needs 4.4 and
-/// `$BASHPID` 4.0, and macOS ships 3.2).
-fn real_bash() -> Option<PathBuf> {
-	let path = std::env::var_os("PI_TEST_REAL_BASH")
-		.filter(|p| !p.is_empty())
-		.map_or_else(|| PathBuf::from("/bin/bash"), PathBuf::from);
-	let version = Command::new(&path).arg("--version").output();
-	let first = version.as_ref().ok().and_then(|out| {
-		String::from_utf8_lossy(&out.stdout)
-			.lines()
-			.next()
-			.map(str::to_owned)
-	});
-	let major = first
-		.as_deref()
-		.and_then(|line| line.split("version ").nth(1))
-		.and_then(|v| v.split('.').next())
-		.and_then(|m| m.parse::<u32>().ok());
-	match major {
-		Some(major) if major >= 5 => Some(path),
-		_ => {
-			zsh_oracle::uncompared(&format!(
-				"{} is not bash 5 or later ({}), so nothing is compared with bash",
-				path.display(),
-				first.unwrap_or_else(|| format!("{version:?}"))
-			));
-			None
-		},
-	}
-}
-
-/// The real shell `name` (`zsh` or `bash`) the case compares with, or
-/// `None` and the test reported uncompared.
-fn real(name: &str) -> Option<PathBuf> {
-	if name == "zsh" {
-		have_zsh().then(zsh_oracle::path)
-	} else {
-		real_bash()
-	}
-}
 
 #[test]
 fn interactive_bash_and_sh_show_a_prompt_before_and_after_commands() -> io::Result<()> {
@@ -346,9 +150,9 @@ fn without_home(
 ) -> Outcome {
 	Run::script(program, name, script)
 		.under(wrap)
-		.env("USER", Some("nobody-by-env"))
-		.env("HOME", None)
-		.env("LOGNAME", None)
+		.env("USER", "nobody-by-env")
+		.env_remove("HOME")
+		.env_remove("LOGNAME")
 		.go()
 }
 
@@ -493,9 +297,13 @@ fn an_untrapped_signal_kills_the_shell_process() {
 	}
 }
 
-/// A script and what the shell does with it: its stdout, exit status, and
-/// the signal it dies of.
-type SignalCase<'a> = (&'a str, &'a [u8], Option<i32>, Option<i32>);
+/// A script and what the shell does with it: its standard output and how
+/// it ends.
+struct SignalCase<'a> {
+	script: &'a str,
+	stdout: &'a [u8],
+	end:    End,
+}
 
 /// `err` with the pid after each `NAME: line N: ` (bash's notice of a
 /// killed command) replaced by `PID`: each shell prints its own child's.
@@ -557,9 +365,14 @@ fn long_notice(line: u32, desc: &str, text: &[u8]) -> Vec<u8> {
 	out
 }
 
-/// A notice case: the shell, the script, its standard error as obash must
-/// print it (pids as `PID`), and the exit status and signal it ends by.
-type NoticeCase = (&'static str, Vec<u8>, Vec<u8>, Option<i32>, Option<i32>);
+/// A notice case: `shell` runs `script` with `-c`; its standard error is
+/// `stderr` as obash must print it (pids as `PID`), and it ends by `end`.
+struct NoticeCase {
+	shell:  &'static str,
+	script: Vec<u8>,
+	stderr: Vec<u8>,
+	end:    End,
+}
 
 /// A non-interactive bash reports a foreground command a signal killed
 /// (`notify_of_job_status`), on its own standard error: `TERM`, or a signal
@@ -575,129 +388,105 @@ type NoticeCase = (&'static str, Vec<u8>, Vec<u8>, Option<i32>, Option<i32>);
 #[test]
 fn bash_reports_a_foreground_command_killed_by_a_signal() {
 	const K: &[u8] = b"/bin/sh -c 'kill -KILL $$'";
+	const KILLED: End = Signal(libc::SIGKILL);
 	let cat = |parts: &[&[u8]]| parts.concat();
 	let killed = |line| long_notice(line, "Killed", K);
+	let case =
+		|shell, script: Vec<u8>, stderr: Vec<u8>, end| NoticeCase { shell, script, stderr, end };
+	let bash = |script, stderr, end| case("bash", script, stderr, end);
+	let zsh = |script, end| case("zsh", script, Vec::new(), end);
 	let cases: Vec<NoticeCase> = vec![
-		(
-			"bash",
-			b"/bin/sh -c 'kill -TERM $$'; echo st=$?".to_vec(),
-			b"Terminated\n".to_vec(),
-			Some(0),
-			None,
-		),
-		("bash", cat(&[K, b"; echo st=$?"]), killed(1), Some(0), None),
-		(
-			"bash",
+		bash(b"/bin/sh -c 'kill -TERM $$'; echo st=$?".to_vec(), b"Terminated\n".to_vec(), Exit(0)),
+		bash(cat(&[K, b"; echo st=$?"]), killed(1), Exit(0)),
+		bash(
 			b"/bin/sh -c 'kill -QUIT $$'; echo st=$?".to_vec(),
 			long_notice(1, "Quit", b"/bin/sh -c 'kill -QUIT $$'"),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		(
-			"bash",
+		bash(
 			b"/bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
 			long_notice(1, "User defined signal 1", b"/bin/sh -c 'kill -USR1 $$'"),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		(
-			"bash",
+		bash(
 			b"/bin/sh -c 'kill -INT $$'; /bin/sh -c 'kill -PIPE $$'; echo st=$?".to_vec(),
-			b"".to_vec(),
-			Some(0),
-			None,
+			Vec::new(),
+			Exit(0),
 		),
-		(
-			"bash",
+		bash(
 			b"trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
 			b"User defined signal 1\n".to_vec(),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		("bash", cat(&[b"trap '' KILL; ", K, b"; echo st=$?"]), b"Killed\n".to_vec(), Some(0), None),
-		("bash", cat(&[b"x=$(", K, b"); echo st=$?"]), b"".to_vec(), Some(0), None),
-		(
-			"bash",
+		bash(cat(&[b"trap '' KILL; ", K, b"; echo st=$?"]), b"Killed\n".to_vec(), Exit(0)),
+		bash(cat(&[b"x=$(", K, b"); echo st=$?"]), Vec::new(), Exit(0)),
+		bash(
 			b"true\n/bin/sh   -c 'kill -HUP $$'   ; echo st=$?".to_vec(),
 			long_notice(2, "Hangup", b"/bin/sh -c 'kill -HUP $$'"),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		(
-			"bash",
-			b"exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?".to_vec(),
-			b"".to_vec(),
-			Some(0),
-			None,
-		),
+		bash(b"exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?".to_vec(), Vec::new(), Exit(0)),
 		// The last command: no fork, no notice, the shell dies of it.
-		("bash", K.to_vec(), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("bash", cat(&[b"true && ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("bash", cat(&[b"true; ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("bash", cat(&[b"true &&\n", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("bash", cat(&[b"trap '' USR1; ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("bash", cat(&[b"trap 'echo t' USR1; ", K]), killed(1), Some(137), None),
-		("bash", cat(&[b"! ", K]), killed(1), Some(0), None),
+		bash(K.to_vec(), Vec::new(), KILLED),
+		bash(cat(&[b"true && ", K]), Vec::new(), KILLED),
+		bash(cat(&[b"true; ", K]), Vec::new(), KILLED),
+		bash(cat(&[b"true &&\n", K]), Vec::new(), KILLED),
+		bash(cat(&[b"trap '' USR1; ", K]), Vec::new(), KILLED),
+		bash(cat(&[b"trap 'echo t' USR1; ", K]), killed(1), Exit(137)),
+		bash(cat(&[b"! ", K]), killed(1), Exit(0)),
 		// Through the shell's own standard error, not the command's.
-		(
-			"bash",
+		bash(
 			cat(&[K, b" 2>/dev/null; echo st=$?"]),
 			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		(
-			"bash",
+		bash(
 			cat(&[K, b" 2>/dev/null"]),
 			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
-			Some(137),
-			None,
+			Exit(137),
 		),
-		("bash", cat(&[b"set -o posix; ", K, b"; echo st=$?"]), b"".to_vec(), Some(0), None),
+		bash(cat(&[b"set -o posix; ", K, b"; echo st=$?"]), Vec::new(), Exit(0)),
 		// bash's line when it waits.
-		("bash", cat(&[b"{\n", K, b"\n}; echo st=$?"]), killed(3), Some(0), None),
-		("bash", cat(&[b"if true; then\n", K, b"\nfi; echo st=$?"]), killed(3), Some(0), None),
-		("bash", cat(&[b"for x in 1\ndo\n", K, b"\ndone; echo st=$?"]), killed(1), Some(0), None),
-		("bash", cat(&[b"f()\n{\n", K, b"\n}\nf; echo st=$?"]), killed(2), Some(0), None),
-		("bash", b"/bin/sh -c \\\n'kill -KILL $$'; echo st=$?".to_vec(), killed(2), Some(0), None),
-		(
-			"bash",
+		bash(cat(&[b"{\n", K, b"\n}; echo st=$?"]), killed(3), Exit(0)),
+		bash(cat(&[b"if true; then\n", K, b"\nfi; echo st=$?"]), killed(3), Exit(0)),
+		bash(cat(&[b"for x in 1\ndo\n", K, b"\ndone; echo st=$?"]), killed(1), Exit(0)),
+		bash(cat(&[b"f()\n{\n", K, b"\n}\nf; echo st=$?"]), killed(2), Exit(0)),
+		bash(b"/bin/sh -c \\\n'kill -KILL $$'; echo st=$?".to_vec(), killed(2), Exit(0)),
+		bash(
 			cat(&[K, b" <<EOF\nx\nEOF\necho st=$?"]),
 			long_notice(3, "Killed", &cat(&[K, b" <<EOF\nx\nEOF\n"])),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		(
-			"bash",
+		bash(
 			cat(&[K, b" \xe9x; echo st=$?"]),
 			long_notice(1, "Killed", &cat(&[K, b" \xe9x"])),
-			Some(0),
-			None,
+			Exit(0),
 		),
-		("zsh", cat(&[K, b"; print st=$?"]), b"".to_vec(), Some(0), None),
-		("zsh", b"/bin/sh -c 'kill -TERM $$'; print st=$?".to_vec(), b"".to_vec(), Some(0), None),
-		("zsh", cat(&[b"true && ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
-		("zsh", cat(&[b"trap 'print x' EXIT; ", K]), b"".to_vec(), Some(137), None),
+		zsh(cat(&[K, b"; print st=$?"]), Exit(0)),
+		zsh(b"/bin/sh -c 'kill -TERM $$'; print st=$?".to_vec(), Exit(0)),
+		zsh(cat(&[b"true && ", K]), KILLED),
+		zsh(cat(&[b"trap 'print x' EXIT; ", K]), Exit(137)),
 	];
-	for (name, script, want, code, signal) in cases {
+	for NoticeCase { shell, script, stderr, end } in cases {
 		let script = OsString::from_vec(script);
-		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), name, &script).go();
-		let shown = format!("{name}: {script:?}");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), shell, &script).go();
+		let shown = format!("{shell}: {script:?}");
 		assert_eq!(
-			(String::from_utf8_lossy(&mask_pids(&ours.stderr)), ours.code, ours.signal),
-			(String::from_utf8_lossy(&want), code, signal),
+			(String::from_utf8_lossy(&mask_pids(&ours.stderr)), ours.end()),
+			(String::from_utf8_lossy(&stderr), Some(end)),
 			"{shown}"
 		);
-		if let Some(real) = real(name) {
-			assert_eq!(masked(&ours), masked(&Run::script(real, name, &script).go()), "{shown}");
+		if let Some(real) = real(shell) {
+			assert_eq!(masked(&ours), masked(&Run::script(real, shell, &script).go()), "{shown}");
 		}
 	}
 }
 
-/// `o` with its pids and shell names masked ([`mask_pids`], [`mask_names`]).
-fn masked(o: &Outcome) -> (String, String, Option<i32>, Option<i32>) {
-	let mask = |b: &[u8]| String::from_utf8_lossy(&mask_names(&mask_pids(b))).into_owned();
-	(mask(&o.stdout), mask(&o.stderr), o.code, o.signal)
+/// `o` with the pids and shell names of both streams masked ([`mask_pids`],
+/// [`mask_names`]).
+fn masked(o: &Outcome) -> Outcome {
+	let mask = |b: &[u8]| mask_names(&mask_pids(b));
+	Outcome { stdout: mask(&o.stdout), stderr: mask(&o.stderr), ..o.clone() }
 }
 
 /// A `/bin/sh` script, run as `sh -c SHELL_ONLY sh SIG PID [FILE]`: it
@@ -725,59 +514,61 @@ const SHELL_ONLY: &str = "trap \"\" TERM HUP; [ -n \"$3\" ] && : > \"$3\"; kill 
 fn bash_runs_its_exit_trap_before_dying_of_a_fatal_signal() {
 	let from_outside =
 		format!("trap 'echo x $?' EXIT; /bin/sh -c '{SHELL_ONLY}' sh TERM $$; echo not-reached");
-	let cases: [SignalCase<'_>; 9] = [
-		(
-			"trap 'echo x $?' EXIT; kill -TERM $$; echo not-reached",
-			b"x 0\n",
-			None,
-			Some(libc::SIGTERM),
-		),
-		("trap 'echo x $?' EXIT; kill -HUP $$; echo not-reached", b"x 0\n", None, Some(libc::SIGHUP)),
-		(
-			"trap 'echo x $?' EXIT; /bin/kill -TERM $$; echo not-reached",
-			b"x 0\n",
-			None,
-			Some(libc::SIGTERM),
-		),
-		(
-			"trap 'echo x $?' EXIT; /bin/kill -HUP $$; echo not-reached",
-			b"x 0\n",
-			None,
-			Some(libc::SIGHUP),
-		),
-		(&from_outside, b"x 0\nshell-gone\n", None, Some(libc::SIGTERM)),
-		(
-			"f() { kill -TERM $$; echo not-reached; }; trap 'echo x $?' EXIT; f",
-			b"x 0\n",
-			None,
-			Some(libc::SIGTERM),
-		),
-		(
-			"( trap 'echo sub-x $?' EXIT; kill -TERM $BASHPID; echo not-reached ); echo st=$?",
-			b"sub-x 0\nst=143\n",
-			Some(0),
-			None,
-		),
-		("trap 'echo x' EXIT; kill -PROF $$; echo not-reached", b"", None, Some(libc::SIGPROF)),
-		(
-			"trap 'echo x' EXIT; trap 'echo t' TERM; kill -TERM $$; echo after",
-			b"t\nafter\nx\n",
-			Some(0),
-			None,
-		),
+	let cases = [
+		SignalCase {
+			script: "trap 'echo x $?' EXIT; kill -TERM $$; echo not-reached",
+			stdout: b"x 0\n",
+			end:    Signal(libc::SIGTERM),
+		},
+		SignalCase {
+			script: "trap 'echo x $?' EXIT; kill -HUP $$; echo not-reached",
+			stdout: b"x 0\n",
+			end:    Signal(libc::SIGHUP),
+		},
+		SignalCase {
+			script: "trap 'echo x $?' EXIT; /bin/kill -TERM $$; echo not-reached",
+			stdout: b"x 0\n",
+			end:    Signal(libc::SIGTERM),
+		},
+		SignalCase {
+			script: "trap 'echo x $?' EXIT; /bin/kill -HUP $$; echo not-reached",
+			stdout: b"x 0\n",
+			end:    Signal(libc::SIGHUP),
+		},
+		SignalCase {
+			script: &from_outside,
+			stdout: b"x 0\nshell-gone\n",
+			end:    Signal(libc::SIGTERM),
+		},
+		SignalCase {
+			script: "f() { kill -TERM $$; echo not-reached; }; trap 'echo x $?' EXIT; f",
+			stdout: b"x 0\n",
+			end:    Signal(libc::SIGTERM),
+		},
+		SignalCase {
+			script: "( trap 'echo sub-x $?' EXIT; kill -TERM $BASHPID; echo not-reached ); echo st=$?",
+			stdout: b"sub-x 0\nst=143\n",
+			end:    Exit(0),
+		},
+		SignalCase {
+			script: "trap 'echo x' EXIT; kill -PROF $$; echo not-reached",
+			stdout: b"",
+			end:    Signal(libc::SIGPROF),
+		},
+		SignalCase {
+			script: "trap 'echo x' EXIT; trap 'echo t' TERM; kill -TERM $$; echo after",
+			stdout: b"t\nafter\nx\n",
+			end:    Exit(0),
+		},
 	];
-	for (script, out, code, signal) in cases {
+	for SignalCase { script, stdout, end } in cases {
 		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", script).go();
 		// bash also prints a notice of the subshell that died (on stderr),
-		// which obash does not: stdout and the status are compared.
-		assert_eq!((ours.stdout.as_slice(), ours.code, ours.signal), (out, code, signal), "{script}");
+		// which obash does not: stdout and the end are compared.
+		assert_eq!((ours.stdout.as_slice(), ours.end()), (stdout, Some(end)), "{script}");
 		if let Some(bash) = real_bash() {
 			let theirs = Run::script(bash, "bash", script).go();
-			assert_eq!(
-				(ours.stdout, ours.code, ours.signal),
-				(theirs.stdout, theirs.code, theirs.signal),
-				"{script}"
-			);
+			assert_eq!((&ours.stdout, ours.end()), (&theirs.stdout, theirs.end()), "{script}");
 		}
 	}
 }
@@ -824,39 +615,28 @@ setopt posixtraps; ( kill -TERM $sysparams[pid]; print posix-alive ); print posi
 /// (`removetrap`); bash keeps ignoring it.
 #[test]
 fn the_shell_ignores_quit_and_its_commands_get_it_at_its_default() {
-	let cases: [(&str, SignalCase<'_>); 3] = [
-		(
-			"zsh",
-			(
-				"/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
-				 child-alive'; print st=$?",
-				b"alive\nst=131\n",
-				Some(0),
-				None,
-			),
-		),
-		(
-			"zsh",
-			("trap - QUIT; /bin/kill -QUIT $$; print not-reached", b"", None, Some(libc::SIGQUIT)),
-		),
-		(
-			"bash",
-			(
-				"/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
-				 child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
-				b"alive\nst=131\nafter-reset\n",
-				Some(0),
-				None,
-			),
-		),
+	let cases = [
+		("zsh", SignalCase {
+			script: "/bin/kill -QUIT $$; kill -QUIT $$; print alive; /bin/sh -c 'kill -QUIT $$; echo \
+			         child-alive'; print st=$?",
+			stdout: b"alive\nst=131\n",
+			end:    Exit(0),
+		}),
+		("zsh", SignalCase {
+			script: "trap - QUIT; /bin/kill -QUIT $$; print not-reached",
+			stdout: b"",
+			end:    Signal(libc::SIGQUIT),
+		}),
+		("bash", SignalCase {
+			script: "/bin/kill -QUIT $$; kill -QUIT $$; echo alive; /bin/sh -c 'kill -QUIT $$; echo \
+			         child-alive'; echo st=$?; trap - QUIT; /bin/kill -QUIT $$; echo after-reset",
+			stdout: b"alive\nst=131\nafter-reset\n",
+			end:    Exit(0),
+		}),
 	];
-	for (name, (script, out, code, signal)) in cases {
+	for (name, SignalCase { script, stdout, end }) in cases {
 		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), name, script).go();
-		assert_eq!(
-			(ours.stdout.as_slice(), ours.code, ours.signal),
-			(out, code, signal),
-			"{name}: {script}"
-		);
+		assert_eq!((ours.stdout.as_slice(), ours.end()), (stdout, Some(end)), "{name}: {script}");
 		// bash also prints its notice of the `sh` that died of `QUIT`
 		// ([`bash_reports_a_foreground_command_killed_by_a_signal`]).
 		if let Some(real) = real(name) {
@@ -1067,4 +847,61 @@ fn a_background_pipelines_bang_is_its_last_process() {
 	if have_zsh() {
 		assert_eq!(ours, Run::script(zsh_oracle::path(), "zsh", script).go());
 	}
+}
+
+/// The bash cases need bash 5.2 or later
+/// ([`process_support::BASH_OLDEST`]): an older bash is refused, and the
+/// test says so on an `UNCOMPARED:` line. Here a stand-in reports the bash
+/// of Ubuntu 22.04, 5.1.16.
+#[test]
+fn the_real_bash_must_be_5_2_or_later() {
+	use std::os::unix::fs::PermissionsExt;
+	for (line, new_enough) in [
+		("GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)", true),
+		("GNU bash, version 5.3.0(1)-release (aarch64-apple-darwin24)", true),
+		("GNU bash, version 5.10.0(1)-release", true),
+		("GNU bash, version 6.0.0(1)-release", true),
+		("GNU bash, version 5.1.16(1)-release (x86_64-pc-linux-gnu)", false),
+		("GNU bash, version 5.0.17(1)-release (x86_64-pc-linux-gnu)", false),
+		("GNU bash, version 3.2.57(1)-release (arm64-apple-darwin23)", false),
+		("zsh 5.9 (x86_64-ubuntu-linux-gnu)", false),
+	] {
+		assert_eq!(
+			process_support::bash_version(line).is_some_and(|v| v >= process_support::BASH_OLDEST),
+			new_enough,
+			"{line}"
+		);
+	}
+	let dir = tempfile::tempdir().expect("a directory for a stand-in bash");
+	let fake = dir.path().join("bash");
+	for (version, accepted) in [("5.1.16", false), ("5.2.21", true)] {
+		fs::write(
+			&fake,
+			format!(
+				"#!/bin/sh\necho 'GNU bash, version {version}(1)-release (x86_64-pc-linux-gnu)'\n"
+			),
+		)
+		.expect("write the stand-in");
+		fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+		assert_eq!(process_support::bash_at(fake.clone()).is_some(), accepted, "bash {version}");
+	}
+}
+
+/// A run starts with a core size limit of 1 byte ([`Run`]): a pipe
+/// `core_pattern` refuses a dump at 1 and takes any other limit as none,
+/// and a file dump needs more than 1 byte. (A hard limit of 0 allows only
+/// 0.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_starts_with_a_core_size_limit_of_one_byte() {
+	let out = Run::new("/bin/cat", "cat", &["/proc/self/limits"]).go();
+	let text = String::from_utf8_lossy(&out.stdout);
+	let fields: Vec<&str> = text
+		.lines()
+		.find(|l| l.starts_with("Max core file size"))
+		.unwrap_or_else(|| panic!("no core limit in /proc/self/limits: {out:?}"))
+		.split_whitespace()
+		.collect();
+	let (soft, hard) = (fields[4], fields[5]);
+	assert_eq!(soft, if hard == "0" { "0" } else { "1" }, "{fields:?}");
 }
