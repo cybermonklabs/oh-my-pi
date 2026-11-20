@@ -299,12 +299,10 @@ fn log_file_exit_line_uses_live_counters() {
 	// received 300264 or 300280 against server sent 300264.
 	#[cfg(unix)]
 	{
-		use std::os::unix::fs::PermissionsExt;
 		let Some(rsync) = reference() else { return };
 		// Runs the remote command through sh so --rsync-path can carry options.
 		let rsh = dir.path().join("shrsh");
-		fs::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
-		fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::rsync::testprog::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n");
 		let server_log = dir.path().join("s.log");
 		let rpath = format!("--rsync-path={} --log-file={}", rsync.display(), server_log.display());
 		let source = format!("h:{}/src/", dir.path().display());
@@ -404,14 +402,11 @@ fn shared_writer_retries_would_block() {
 #[cfg(unix)]
 #[test]
 fn cancel_mid_connection_exits_20_with_trailer() {
-	use std::os::unix::fs::PermissionsExt;
-
 	use clap::Parser as _;
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	fs::write(&rsh, "#!/bin/sh\nexec sleep 600\n").unwrap();
-	fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::rsync::testprog::write(&rsh, "#!/bin/sh\nexec sleep 600\n");
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
 	let canceller = std::thread::spawn(move || {
@@ -578,10 +573,8 @@ fn list_only_matches_reference() {
 /// A fake remote shell that runs the remote command locally.
 #[cfg(unix)]
 fn fake_rsh(dir: &Path) -> PathBuf {
-	use std::os::unix::fs::PermissionsExt;
 	let path = dir.join("fakersh");
-	fs::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
-	fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::rsync::testprog::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n");
 	path
 }
 

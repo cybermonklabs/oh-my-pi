@@ -139,8 +139,7 @@ impl Bench {
 		// rest to a shell as one command line (so `--old-args` word splitting
 		// happens remotely). The remote command runs in the client's cwd.
 		let rsh = bin.join("fakersh");
-		fs::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
-		fs::set_permissions(&rsh, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::rsync::testprog::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n");
 		for (name, password) in [("pw", "sekrit\n"), ("badpw", "wrong\n")] {
 			let file = bin.join(name);
 			fs::write(&file, password).unwrap();

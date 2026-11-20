@@ -1421,7 +1421,7 @@ mod tests {
 
 	#[cfg(unix)]
 	mod shell {
-		use std::{os::unix::fs::PermissionsExt, path::Path};
+		use std::path::Path;
 
 		use super::*;
 		use crate::rsync::log::{LogConfig, Logger};
@@ -1430,10 +1430,11 @@ mod tests {
 			Logger::local(Box::new(io::sink()), Box::new(io::sink()), LogConfig::default())
 		}
 
+		/// Writes `#!/bin/sh` and `body` as the program `dir/name`, through
+		/// [`crate::rsync::testprog`], and returns its path.
 		fn script(dir: &Path, name: &str, body: &str) -> String {
 			let path = dir.join(name);
-			std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+			crate::rsync::testprog::write(&path, &format!("#!/bin/sh\n{body}"));
 			path.to_string_lossy().into_owned()
 		}
 
@@ -1597,6 +1598,32 @@ mod tests {
 				let got = conn.finish().err().map(|e| e.code);
 				assert_eq!(got, code, "{body}");
 			}
+		}
+
+		/// A child forked while a script is written, as another test's thread
+		/// can fork at any time, keeps no hold on the script: here one is forked
+		/// in the middle of the write and lives until the script has run. When
+		/// this process wrote the script itself, that child kept its descriptor
+		/// and the run failed: `Failed to exec ...: Text file busy (26)`.
+		#[test]
+		fn a_child_forked_while_the_script_is_written_leaves_it_runnable() {
+			use crate::rsync::testprog::{LINGER, LINGERING, end_lingering};
+
+			let dir = tempfile::tempdir().unwrap();
+			let logger = logger();
+			LINGER.set(true);
+			let rsh = script(dir.path(), "forked-rsh", "exit 3\n");
+			LINGER.set(false);
+			let lingering = LINGERING.get().expect("a child was forked during the write");
+			// SAFETY: signal 0 sends nothing.
+			let alive = unsafe { libc::kill(lingering, 0) } == 0;
+			let cancel = Arc::new(AtomicBool::new(false));
+			let got = spawn_shell(&child_env(dir.path()), &base_cfg(&rsh, &logger), cancel)
+				.map(|conn| conn.finish().err().map(|e| e.code))
+				.map_err(|e| e.message);
+			end_lingering();
+			assert!(alive, "the child forked during the write ran on while the script ran");
+			assert_eq!(got, Ok(Some(3)));
 		}
 
 		#[test]
