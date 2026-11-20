@@ -519,7 +519,9 @@ describe("terminal frame plans", () => {
 			composer.ui.start();
 			await renderScheduler.settle(terminal);
 			shown!.hide();
-			await renderScheduler.settle(terminal);
+			// Closing the overlay retires the held rows by pressure, in as many frames
+			// as the retirement budget (wall-clock) splits them into: run them all.
+			await renderScheduler.runUntilIdle(terminal);
 		}
 		expect(plainBuffer(handoff.terminal).filter(Boolean)).toEqual(plainBuffer(full.terminal).filter(Boolean));
 		handoff.composer.ui.stop();
@@ -553,8 +555,9 @@ describe("terminal frame plans", () => {
 		composer.start({ playWelcomeIntro: false });
 		for (let i = 0; i < 30; i++) transcript.addChild(new Text(`row-${i}`, 0, 0));
 		composer.ui.requestRender();
-		await renderScheduler.settle(terminal);
-		// Pressure has already written the older blocks to scrollback.
+		// Pressure writes the older blocks to scrollback, over as many frames as the
+		// retirement budget (wall-clock) splits them into.
+		await renderScheduler.runUntilIdle(terminal);
 		expect(transcript.blockStates().filter(state => state === "committed")).toHaveLength(25);
 
 		const shown = composer.ui.showOverlay(new FullscreenOverlay(), { fullscreen: true });
@@ -565,7 +568,7 @@ describe("terminal frame plans", () => {
 		composer.ui.start();
 		await renderScheduler.settle(terminal);
 		shown.hide();
-		await renderScheduler.settle(terminal);
+		await renderScheduler.runUntilIdle(terminal);
 
 		expect(plainBuffer(terminal).filter(Boolean)).toEqual([
 			...Array.from({ length: 30 }, (_, i) => `row-${i}`),
