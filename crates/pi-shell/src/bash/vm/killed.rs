@@ -16,9 +16,12 @@
 //! `-c` shell prints nothing. zsh prints nothing in any of these cases.
 
 use bstr::BString;
+use strum::IntoEnumIterator as _;
 
 use super::{
-	Cx, Kernel, exec, nested,
+	Cx, Kernel,
+	builtins::trap,
+	exec, nested,
 	proc::{FrameKind, ScriptKind, Vproc},
 	state,
 };
@@ -26,9 +29,9 @@ use crate::bash::{
 	diag::Diag,
 	event::NodeKind,
 	ids::Dialect,
-	ir::{Op, RedirTargetIr, Unit},
+	ir::{NodeInfo, Op, RedirTargetIr, Unit},
 	signal::Signal,
-	store::{Key, KeyBuf, MiscKey, OptId, Record, TrapKey},
+	store::{Key, KeyBuf, MiscKey, OptId, Record, StoreError, TrapKey},
 };
 
 /// What the end of a foreground external command that `sig` killed means
@@ -126,13 +129,11 @@ fn trapped(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
 
 /// Whether the real shell runs the command with `exec` and no fork: it is
 /// the last of the `-c` string (nothing is left to parse), run at its top
-/// level (no function, `eval`, `source` or trap), as the whole complete
-/// command or the last of its top-level `&&`, `||` or `;` chain, with no
-/// `!` or `time`, while no EXIT or ERR trap and no signal trap other than
-/// an ignored one is set. bash (`evalstring.c` `should_suppress_fork`,
+/// level (no function, `eval`, `source` or trap), as the last command of
+/// the complete command ([`last_of_chain`]), while no trap that counts is
+/// set ([`counts_a_trap`]). bash (`evalstring.c` `should_suppress_fork`,
 /// `can_optimize_connection`) also wants no redirection; zsh (`exec.c`
-/// `execcmd_exec`: `last1 == 1 && !nsigtrapped`) takes one, and counts its
-/// other traps too (`DEBUG`).
+/// `execcmd_exec`) takes one.
 fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 	let Some(f) = vp.frames.last() else {
 		return false;
@@ -149,65 +150,102 @@ fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 		return false;
 	};
 	let bash = vp.mode.dialect() == Dialect::Bash;
-	if (bash && cmd.redirs.is_some()) || !last_of_chain(u, op.node) {
+	if (bash && cmd.redirs.is_some()) || !last_of_chain(u, op.node, bash) {
 		return false;
 	}
-	let Ok(traps) = state::listed_traps(&k.root, cx.store, vp) else {
-		return false;
-	};
-	!traps.iter().any(|(key, rec)| match (key, rec) {
-		(KeyBuf::Trap(TrapKey::Exit | TrapKey::Err), _) => true,
-		(KeyBuf::Trap(TrapKey::Signal(_)), Record::Trap { action, .. }) => !action.is_empty(),
-		(KeyBuf::Trap(_), _) => !bash,
-		_ => false,
-	})
+	!counts_a_trap(k, cx, vp, bash).unwrap_or(true)
 }
 
-/// Whether simple command `node` of the complete command `u` is what bash
-/// runs without a fork: a pipeline of its own (no `!`, `time` or second
-/// stage) that ends the complete command, either alone or as the last of
-/// an and-or list that is the whole complete command, or alone after a
-/// top-level `;`.
-fn last_of_chain(u: &Unit, node: u32) -> bool {
+/// Whether a trap is set that makes the real shell fork its last command.
+/// bash: an EXIT or ERR trap, or a signal trap that is not ignored (`trap
+/// '' SIG`). zsh (`nsigtrapped`, which `settrap` counts): a trap with an
+/// action (`trap '' SIG` is `ZSIG_IGNORED`, not counted) or a trap function
+/// (`TRAPNAL`, `ZSIG_FUNC`), of a signal, `EXIT`, `ZERR` or `DEBUG`.
+fn counts_a_trap(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, bash: bool) -> Result<bool, StoreError> {
+	let traps = state::listed_traps(&k.root, cx.store, vp)?;
+	let counted = traps.iter().any(|(key, rec)| match (key, rec) {
+		(KeyBuf::Trap(TrapKey::Exit | TrapKey::Err), _) if bash => true,
+		(KeyBuf::Trap(TrapKey::Signal(_)), Record::Trap { action, .. }) if bash => !action.is_empty(),
+		(KeyBuf::Trap(_), Record::Trap { action, .. }) if !bash => !action.is_empty(),
+		_ => false,
+	});
+	if counted || bash {
+		return Ok(counted);
+	}
+	let platform = k.engine.config().platform;
+	let keys = [TrapKey::Exit, TrapKey::Err, TrapKey::Debug]
+		.into_iter()
+		.chain(Signal::iter().map(TrapKey::Signal));
+	for key in keys {
+		if trap::find_func_trap(cx.store, vp, key, platform, |_, _| ())?.is_some() {
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// Whether simple command `node` of the complete command `u` is the last
+/// command the real shell runs: a pipeline of its own (no `!`, `time` or
+/// second stage) that ends its and-or list, itself the last of its list.
+/// bash: the complete command's own list, after a top-level `;` only alone
+/// ([`top_level_last`]). zsh passes `last1` on into the body of an `if`, a
+/// `{ }` and a `;;` arm of a `case` that is itself the last command
+/// (`execif`, `execcursh`, `execcase`; [`ends_body`]).
+fn last_of_chain(u: &Unit, node: u32, bash: bool) -> bool {
 	let Some(n) = u.nodes.get(node as usize) else {
 		return false;
 	};
-	let around = |kind: NodeKind| {
-		u.nodes
-			.iter()
-			.filter(|m| m.kind == kind && m.lo <= n.lo && n.hi <= m.hi)
-			.min_by_key(|m| m.hi - m.lo)
-	};
-	let (Some(p), Some(ao)) = (around(NodeKind::Pipeline), around(NodeKind::AndOr)) else {
-		return false;
-	};
-	let compound = |m: &crate::bash::ir::NodeInfo| {
-		!matches!(
-			m.kind,
-			NodeKind::AndOr
-				| NodeKind::Pipeline
-				| NodeKind::Simple
-				| NodeKind::Assign
-				| NodeKind::Word
-		)
-	};
-	let span = |m: &crate::bash::ir::NodeInfo| (m.lo, m.hi);
-	if span(p) != span(n)
-		|| ao.hi != n.hi
-		|| u
+	let mut span = (n.lo, n.hi);
+	loop {
+		let around = |kind: NodeKind| {
+			u.nodes
+				.iter()
+				.filter(|m| m.kind == kind && m.lo <= span.0 && span.1 <= m.hi)
+				.min_by_key(|m| m.hi - m.lo)
+		};
+		let (Some(p), Some(ao)) = (around(NodeKind::Pipeline), around(NodeKind::AndOr)) else {
+			return false;
+		};
+		if (p.lo, p.hi) != span || ao.hi != span.1 {
+			return false;
+		}
+		// The compound command whose list holds the and-or list.
+		let outer = u
 			.nodes
 			.iter()
-			.any(|m| compound(m) && m.lo <= ao.lo && ao.hi <= m.hi)
-		|| u
-			.nodes
-			.iter()
-			.any(|m| m.kind == NodeKind::AndOr && m.lo >= ao.hi)
+			.filter(|m| {
+				compound(m) && m.lo <= ao.lo && ao.hi <= m.hi && (m.lo, m.hi) != (ao.lo, ao.hi)
+			})
+			.min_by_key(|m| m.hi - m.lo);
+		match outer {
+			None => return top_level_last(u, ao, span, bash),
+			Some(m) if !bash && ends_body(u, ao.hi, m) => span = (m.lo, m.hi),
+			Some(_) => return false,
+		}
+	}
+}
+
+/// Whether `m` is a compound command (not a part of a simple one).
+const fn compound(m: &NodeInfo) -> bool {
+	!matches!(
+		m.kind,
+		NodeKind::AndOr | NodeKind::Pipeline | NodeKind::Simple | NodeKind::Assign | NodeKind::Word
+	)
+}
+
+/// Whether the top-level and-or list `ao`, which the command spanning
+/// `span` ends, is the last item of the complete command. After another
+/// item, bash's tree is `connection(earlier, this, sep)`, optimized only
+/// for `;` and a simple command as its second part; zsh's last list item
+/// gets `last1` whatever comes before it.
+fn top_level_last(u: &Unit, ao: &NodeInfo, span: (u32, u32), bash: bool) -> bool {
+	if u
+		.nodes
+		.iter()
+		.any(|m| m.kind == NodeKind::AndOr && m.lo >= ao.hi)
 	{
 		return false;
 	}
-	// An and-or list after another top-level item: bash's tree is
-	// `connection(earlier, this, sep)`, optimized only for `;` and a simple
-	// command as its second part.
 	let earlier = u
 		.nodes
 		.iter()
@@ -215,14 +253,56 @@ fn last_of_chain(u: &Unit, node: u32) -> bool {
 		.map(|m| m.hi)
 		.max();
 	match earlier {
-		None => true,
-		Some(end) => {
+		Some(end) if bash => {
 			let sep = u
 				.source
 				.get(end as usize..ao.lo as usize)
 				.unwrap_or_default();
-			!sep.contains(&b'&') && (ao.lo, ao.hi) == (n.lo, n.hi)
+			!sep.contains(&b'&') && (ao.lo, ao.hi) == span
 		},
+		_ => true,
+	}
+}
+
+/// zsh: whether the list item ending at `from` is the last of the body of
+/// compound command `m` that zsh runs with `last1`: what follows it, past
+/// blanks, newlines, comments and a `;`, ends the body: the `}` of a `{ }`
+/// (not a `{ } always { }`) or of an `if`'s short form; the `fi`, `else` or
+/// `elif` of an `if` (a condition is followed by `then`); the `;;` or
+/// `esac` of a `case` arm (`;&` and `;|` run on, so zsh forks).
+fn ends_body(u: &Unit, from: u32, m: &NodeInfo) -> bool {
+	let rest = skip_separators(
+		u.source
+			.get(from as usize..m.hi as usize)
+			.unwrap_or_default(),
+	);
+	let word = |w: &[u8]| {
+		rest.starts_with(w)
+			&& !rest
+				.get(w.len())
+				.is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_')
+	};
+	match m.kind {
+		NodeKind::Brace => {
+			rest.starts_with(b"}") && !skip_separators(&rest[1..]).starts_with(b"always")
+		},
+		NodeKind::If => rest.starts_with(b"}") || word(b"fi") || word(b"else") || word(b"elif"),
+		NodeKind::Case => rest.starts_with(b";;") || word(b"esac"),
+		_ => false,
+	}
+}
+
+/// `s` past blanks, newlines (escaped ones too), comments and `;`
+/// separators; a `;;`, `;&` or `;|` stays.
+fn skip_separators(mut s: &[u8]) -> &[u8] {
+	loop {
+		match s {
+			[b' ' | b'\t' | b'\r' | b'\n', rest @ ..] | [b'\\', b'\n', rest @ ..] => s = rest,
+			[b';', b';' | b'&' | b'|', ..] => return s,
+			[b';', rest @ ..] => s = rest,
+			[b'#', ..] => s = &s[s.iter().position(|&b| b == b'\n').unwrap_or(s.len())..],
+			_ => return s,
+		}
 	}
 }
 

@@ -386,8 +386,10 @@ struct NoticeCase {
 /// as they are. `N` is bash's line when it waits: the end of the complete
 /// command, a `for` header, a function body's first line. The last command
 /// of the `-c` string bash runs with `exec` and no fork, so it prints
-/// nothing and the shell's process dies of the signal; zsh does the same,
-/// and prints no notice anywhere.
+/// nothing and the shell's process dies of the signal; zsh does the same
+/// (`last1`, which it passes on into the body of an `if`, a `{ }` and a
+/// `;;` arm of a `case`, and which a trap with an action or a trap function
+/// takes away, an empty trap not), and prints no notice anywhere.
 #[test]
 fn bash_reports_a_foreground_command_killed_by_a_signal() {
 	const K: &[u8] = b"/bin/sh -c 'kill -KILL $$'";
@@ -465,10 +467,36 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 			long_notice(1, "Killed", &cat(&[K, b" \xe9x"])),
 			Exit(0),
 		),
+		// bash forks the last command of an `if` or a `{ }`.
+		bash(cat(&[b"if true; then ", K, b"; fi"]), killed(1), Exit(137)),
+		bash(cat(&[b"{ ", K, b"; }"]), killed(1), Exit(137)),
 		zsh(cat(&[K, b"; print st=$?"]), Exit(0)),
 		zsh(b"/bin/sh -c 'kill -TERM $$'; print st=$?".to_vec(), Exit(0)),
 		zsh(cat(&[b"true && ", K]), KILLED),
+		zsh(cat(&[b"true; true && ", K]), KILLED),
+		zsh(cat(&[b"true & ", K]), KILLED),
+		// zsh's traps that take `last1` away: an action or a function.
 		zsh(cat(&[b"trap 'print x' EXIT; ", K]), Exit(137)),
+		zsh(cat(&[b"TRAPEXIT() { print x }; ", K]), Exit(137)),
+		zsh(cat(&[b"TRAPUSR1() { print u }; ", K]), Exit(137)),
+		zsh(cat(&[b"trap '' EXIT; ", K]), KILLED),
+		zsh(cat(&[b"trap '' USR1; ", K]), KILLED),
+		// zsh's `last1` in an `if` body, a `{ }` and a `;;` arm.
+		zsh(cat(&[b"if true; then ", K, b"; fi"]), KILLED),
+		zsh(cat(&[b"if true; then true; ", K, b"; fi; "]), KILLED),
+		zsh(cat(&[b"if false; then true; else ", K, b"; fi"]), KILLED),
+		zsh(cat(&[b"if false; then true; elif true; then ", K, b"; fi"]), KILLED),
+		zsh(cat(&[b"if ", K, b"; then true; fi; print after"]), Exit(0)),
+		zsh(cat(&[b"{ ", K, b" }"]), KILLED),
+		zsh(cat(&[b"{ true; ", K, b"; }"]), KILLED),
+		zsh(cat(&[b"{ ", K, b"; true; }"]), Exit(0)),
+		zsh(cat(&[b"{ ", K, b" } > /dev/null"]), KILLED),
+		zsh(cat(&[b"true && { ", K, b" }"]), KILLED),
+		zsh(cat(&[b"if true; then { ", K, b" }; fi"]), KILLED),
+		zsh(cat(&[b"case a in a) ", K, b";; esac"]), KILLED),
+		zsh(cat(&[b"case a in (a) true; ", K, b"; esac"]), KILLED),
+		zsh(cat(&[b"case a in a) ", K, b";& b) true;; esac"]), Exit(0)),
+		zsh(cat(&[b"case a in a) ", K, b";| b) true;; esac"]), Exit(137)),
 	];
 	for NoticeCase { shell, script, stderr, end } in cases {
 		let script = OsString::from_vec(script);
