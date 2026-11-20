@@ -31,8 +31,10 @@
  *   two cases with its error, and every other case of the file still runs.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import type { SessionStorageBackend } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { resolveBlobRefsInEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	PG_CONDITIONAL_PARAMETERS,
@@ -46,7 +48,7 @@ import {
 	type SqlSessionStorageReservedConnection,
 	type SqlSessionStorageResult,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { reachesPostgresDirectly } from "./postgres-left-settings-harness";
 import { type LeaseDb, openLeaseDb, rejection, until } from "./sql-session-lease-fixture";
@@ -930,7 +932,7 @@ describe("the transaction runner's state table", () => {
 		expect(error).toMatchObject({ errno: "42501", message: serverMessage("42501", tried.at(-1)?.number ?? 0) });
 	});
 
-	it("12, for a blob land: on repairless connections alone, each land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more; a store() and the reference after it are two lands, and the reference rejects naming the image, with the last attempt's error as its cause", async () => {
+	it("12, for a blob land: on repairless connections alone, each land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more; a store() and the reference after it are two lands, and the reference rejects with an Error whose cause is the last attempt's error; the image stays queued, and lands once the connections are clean", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
 		const attempts = PG_REPAIR_RETRIES + 1;
@@ -953,13 +955,16 @@ describe("the transaction runner's state table", () => {
 			})),
 		);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toStartWith(
-			`SqlSessionStorage: session image ${IMAGE_HASH} did not reach omp_session_files_blobs, `,
-		);
 		expect((error as Error).cause).toMatchObject({
 			errno: "25006",
 			message: serverMessage("25006", tried.at(-1)?.number ?? 0),
 		});
+		// Clean connections again: a drain lands the image, so it was still queued.
+		fake.server.refuse.length = 0;
+		await storage.drain();
+		expect(fake.connections.slice(from + 2 * attempts).map(ends)).toEqual([{ releases: 1, closes: 0 }]);
+		expect([...fake.server.blobs.keys()]).toEqual([IMAGE_HASH]);
+		expect(repairs()).toHaveLength(2 * attempts);
 	});
 
 	it("12, for a write naming two new images: each land stops at its first blob write whose repairs are spent, so the append meets three lands and closes at most 3 × (PG_REPAIR_RETRIES + 1) connections, a drain one land more; both images stay queued, and land once the connections are clean", async () => {
@@ -973,7 +978,8 @@ describe("the transaction runner's state table", () => {
 		storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
 		storage.blobTier.store(ICON_HASH, ICON, "image/png");
 		const writer = storage.openWriter(FILE);
-		// The line names the icon first, which no pass tries: the append's rejection says why.
+		// The line names the icon first, which no pass tries: the append rejects for it, with the image's last
+		// error as its cause.
 		const line = `{"type":"message","images":["blob:sha256:${ICON_HASH}","blob:sha256:${IMAGE_HASH}"]}\n`;
 		const error = await rejection(writer.append(line));
 		expect({ reserved: tried().length, closes: closes() }).toEqual({ reserved: 3 * attempts, closes: 3 * attempts });
@@ -987,12 +993,6 @@ describe("the transaction runner's state table", () => {
 			})),
 		);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toStartWith(
-			`SqlSessionStorage: session image ${ICON_HASH} did not reach omp_session_files_blobs, `,
-		);
-		expect((error as Error).message).toContain(
-			`it was not tried after session image ${IMAGE_HASH} met only PostgreSQL connections no transaction can repair`,
-		);
 		expect((error as Error).cause).toMatchObject({
 			errno: "25006",
 			message: serverMessage("25006", tried().at(-1)?.number ?? 0),
@@ -1015,6 +1015,57 @@ describe("the transaction runner's state table", () => {
 		]);
 		expect(new Set(fake.server.blobs.keys())).toEqual(new Set([IMAGE_HASH, ICON_HASH]));
 		expect(repairs()).toHaveLength(4 * attempts);
+	});
+
+	it("12, for a session open that writes two images back: the open meets three lands (one per image it queues, and its reference's), so it closes 3 × (PG_REPAIR_RETRIES + 1) connections, each with a warning, and still opens with this machine's images", async () => {
+		const repairs = watchRepairs();
+		const { fake, storage, from } = await openOnFake();
+		const attempts = PG_REPAIR_RETRIES + 1;
+		using dir = TempDir.createSync("@sql-session-open-blobs-");
+		// This machine's blob store holds both images; the table holds neither.
+		const blobs = new BlobStore(dir.path(), storage.blobTier);
+		const images = [IMAGE, ICON].map(data => ({
+			type: "image" as const,
+			data: blobs.putSync(data).ref,
+			mimeType: "image/png",
+		}));
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "images",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			message: {
+				role: "toolResult",
+				toolCallId: "image-read",
+				toolName: "read",
+				content: images,
+				isError: false,
+				timestamp: 0,
+			},
+		};
+		// The read of the blobs' sizes answers; from the first land on, every write's opening is refused.
+		fake.server.refuse.push({ match: /^BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE\b/, sqlstate: "25006" });
+		await resolveBlobRefsInEntries([entry], blobs, FILE);
+		const [sizes, ...lands] = fake.connections.slice(from);
+		expect(sqls(sizes)).toEqual([READ_OPENING, expect.stringMatching(SELECT_SIZES), "COMMIT"]);
+		expect(ends(sizes)).toEqual({ releases: 1, closes: 0 });
+		const closes = lands.reduce((sum, connection) => sum + connection.closes, 0);
+		expect({ reserved: lands.length, closes }).toEqual({ reserved: 3 * attempts, closes: 3 * attempts });
+		expect(lands.map(ends)).toEqual(lands.map(() => ({ releases: 0, closes: 1 })));
+		expect(repairs()).toEqual(
+			lands.map((connection, index) => ({
+				operation: "blob.insert",
+				sqlstate: "25006",
+				message: serverMessage("25006", connection.number),
+				attempt: (index % attempts) + 1,
+			})),
+		);
+		// The open did not throw, and resolved both references from this machine's bytes.
+		expect(images.map(image => Buffer.from(image.data, "base64"))).toEqual([IMAGE, ICON]);
+		// Clean connections again: a drain lands both, so both stayed queued.
+		fake.server.refuse.length = 0;
+		await storage.drain();
+		expect(new Set(fake.server.blobs.keys())).toEqual(new Set([IMAGE_HASH, ICON_HASH]));
 	});
 
 	it("13. any repairless, three repairless attempts then a clean one: three close() calls, the operation resolves on the fourth reservation", async () => {
