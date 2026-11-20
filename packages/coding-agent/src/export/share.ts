@@ -322,9 +322,8 @@ function redactShareEntry(
 				details: undefined,
 			};
 		case "custom":
-			return { ...entry, data: undefined };
 		case "mode_change":
-			return { ...entry, data: undefined };
+			return withoutData(entry);
 		case "session_init":
 			return {
 				...entry,
@@ -355,6 +354,22 @@ function redactShareEntry(
 		default:
 			return entry;
 	}
+}
+
+/**
+ * `entry` with its opaque `data` dropped, the fields and their order those of
+ * `{ ...entry, data: undefined }`, built without reading `data`: on a cold
+ * entry that read parses the entry's record from the cold store, only for the
+ * share to throw it away.
+ */
+function withoutData<T extends SessionEntry>(entry: T): T {
+	const fields: [string, unknown][] = Object.keys(entry).map(key => [
+		key,
+		key === "data" ? undefined : Reflect.get(entry, key),
+	]);
+	fields.push(["data", undefined]);
+	// `entry`'s own fields with `data` cleared, which is what `T` allows of it.
+	return Object.fromEntries(fields) as unknown as T;
 }
 
 function redactShareContent(

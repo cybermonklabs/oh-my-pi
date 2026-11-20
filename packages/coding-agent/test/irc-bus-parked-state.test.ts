@@ -39,10 +39,10 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 	});
 
 	// Regression: a question revives a parked subagent, which parks again before
-	// the delivery returns; the bus keeps the send's mark for the parked agent for
-	// the rest of the session, and the owner's wait counts the parked agent as
-	// owing a reply it will never send.
-	it("records no mark for a recipient the send revived and that parked again during the delivery", async () => {
+	// the delivery returns; the bus keeps the send's direct mark for the parked
+	// agent for the rest of the session, and the owner's wait counts the parked
+	// agent as owing a reply it will never send.
+	it("records no direct mark for a recipient the send revived and that parked again during the delivery", async () => {
 		registry.register({ id: "0-Sub", displayName: "sub", kind: "sub", parentId: "0-Main", session: fakeSession() });
 		const lifecycle = AgentLifecycleManager.global();
 		let parkDuringDelivery = true;
@@ -63,7 +63,8 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 
 		expect(receipt.outcome).toBe("revived");
 		expect(registry.get("0-Sub")?.status).toBe("parked");
-		expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+		// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+		expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 		expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 	});
 
@@ -119,12 +120,19 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 		expect(bus.take("0-Sub")).toBeUndefined();
 	});
 
-	// Regression: L asks X, X answers L in the wake turn L's message started, and L's idle TTL parks
-	// it before that turn ends; the bus drops X's mark of the answer with L's state, so the wake-turn
-	// relay sends L the same answer again, which revives the parked L for a model turn on an answer
-	// it already has.
-	it("keeps a live agent's answer to a waker that parked, so the wake-turn relay does not revive it", async () => {
-		registry.register({ id: "0-L", displayName: "L", kind: "sub", parentId: "0-Main", session: fakeSession() });
+	/**
+	 * `0-L` asks `0-X`, which starts a wake turn of `0-X` watched by the task executor's wake-turn monitor, as a
+	 * kept-alive subagent's is. `0-L` is adopted to park as soon as it is idle; `deliverToL` runs each delivery to
+	 * it. Returns when the turn started, the turn's end, and how often `0-L` was revived.
+	 */
+	async function peerWakeTurn(deliverToL?: (msg: IrcMessage) => Promise<"injected" | "woken">) {
+		registry.register({
+			id: "0-L",
+			displayName: "L",
+			kind: "sub",
+			parentId: "0-Main",
+			session: fakeSession(deliverToL),
+		});
 		let observer: ((records: unknown[]) => ((turnError?: unknown) => Promise<void>) | undefined) | undefined;
 		const x = {
 			...createSessionDefaults(),
@@ -142,9 +150,8 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 			id: "0-X",
 			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
 		});
-		const lifecycle = AgentLifecycleManager.global();
 		let revivals = 0;
-		lifecycle.adopt("0-L", {
+		AgentLifecycleManager.global().adopt("0-L", {
 			idleTtlMs: 0,
 			revive: async () => {
 				revivals++;
@@ -152,7 +159,6 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 			},
 		});
 
-		// L's question wakes X, and X's wake turn answers it.
 		expect((await bus.send({ from: "0-L", to: "0-X", body: "is auth.ts yours?" })).outcome).toBe("woken");
 		const turnStart = Date.now();
 		const turnEnded = observer?.([
@@ -166,17 +172,52 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 			},
 		]);
 		if (!turnEnded) throw new Error("the wake-turn observer was not registered");
+		return { turnStart, turnEnded, revivals: () => revivals };
+	}
+
+	// Regression: L asks X, X answers L in the wake turn L's message started, and L's idle TTL parks
+	// it before that turn ends; the bus drops X's mark of the answer with L's state, so the wake-turn
+	// relay sends L the same answer again, which revives the parked L for a model turn on an answer
+	// it already has.
+	it("keeps a live agent's answer to a waker that parked, so the wake-turn relay does not revive it", async () => {
+		const turn = await peerWakeTurn();
 		await bus.send({ from: "0-X", to: "0-L", body: "yes, leave it to me" });
 		// L goes idle, and its idle TTL parks it before X's turn ends.
 		registry.setStatus("0-L", "idle");
-		await lifecycle.park("0-L");
+		await AgentLifecycleManager.global().park("0-L");
 		expect(registry.get("0-L")?.status).toBe("parked");
 		// What the relay asks once the turn ends.
-		expect(bus.sentSince("0-X", "0-L", turnStart)).toBe(true);
+		expect(bus.sentSince("0-X", "0-L", turn.turnStart)).toBe(true);
 
-		await turnEnded();
+		await turn.turnEnded();
 
-		expect(revivals).toBe(0);
+		expect(turn.revivals()).toBe(0);
+		expect(registry.get("0-L")?.status).toBe("parked");
+	});
+
+	// Regression: as above, but L's idle TTL parks it while X's answer is being delivered to it; the
+	// bus records no mark of an answer whose recipient was forgotten during the delivery, so the
+	// wake-turn relay sends L the same answer again and revives it.
+	it("keeps a live agent's answer to a waker that parked while the answer was delivered, so the wake-turn relay does not revive it", async () => {
+		const lifecycle = AgentLifecycleManager.global();
+		const turn = await peerWakeTurn(async () => {
+			registry.setStatus("0-L", "idle");
+			await lifecycle.park("0-L");
+			return "injected";
+		});
+
+		const answer = await bus.send({ from: "0-X", to: "0-L", body: "yes, leave it to me" });
+
+		expect(answer.outcome).toBe("injected");
+		expect(registry.get("0-L")?.status).toBe("parked");
+		// What the relay asks once the turn ends.
+		expect(bus.sentSince("0-X", "0-L", turn.turnStart)).toBe(true);
+		// L asks nothing any more, and owes X nothing.
+		expect(bus.unansweredSends("0-X", 0)).toEqual([]);
+
+		await turn.turnEnded();
+
+		expect(turn.revivals()).toBe(0);
 		expect(registry.get("0-L")?.status).toBe("parked");
 	});
 });

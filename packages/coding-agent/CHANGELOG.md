@@ -43,6 +43,7 @@
 - A rate limit after a long thinking block no longer keeps a session whose request fits `retry.rateLimitFallbackMaxContextTokens` off `retry.fallbackChains`: the cap no longer counts the failed attempt's output, which the retry does not send again
 - RPC `cancel_subagent` answers `{"cancelled": false}` for a subagent whose IRC wake turn just ended, or whose run failed with an exception, while it is being cleaned up, instead of killing it
 - `RpcClient.steerSubagent` no longer gives up after 30 seconds while its message waits for a subagent between turns; its new `timeoutMs` option bounds the wait
+- A share with secret masking on no longer reads older tool start markers and to-do list edits back from disk only to drop their data
 
 ## [18.18.6] - 2026-11-09
 

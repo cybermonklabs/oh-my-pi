@@ -726,8 +726,8 @@ describe("IRC", () => {
 			});
 
 			// Regressed: a subagent parked while a message to it is delivered keeps that message's
-			// mark, and its owner's wait counts the parked agent as owing a reply.
-			it("records no mark for a recipient parked during the delivery", async () => {
+			// direct mark, and its owner's wait counts the parked agent as owing a reply.
+			it("records no direct mark for a recipient parked during the delivery, and keeps the live sender's sent mark", async () => {
 				registerAgents("0-Main", "0-Sub");
 				raceDelivery("0-Sub", () => {
 					registry.detachSession("0-Sub");
@@ -737,20 +737,22 @@ describe("IRC", () => {
 				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
 				expect(receipt.outcome).toBe("injected");
 
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 			});
 
 			// Regressed: a subagent released while a message to it is delivered keeps that message's
-			// mark for the rest of the session.
-			it("records no mark for a recipient removed during the delivery", async () => {
+			// direct mark for the rest of the session.
+			it("records no direct mark for a recipient removed during the delivery, and keeps the live sender's sent mark", async () => {
 				registerAgents("0-Main", "0-Sub");
 				raceDelivery("0-Sub", () => registry.unregister("0-Sub"));
 
 				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
 				expect(receipt.outcome).toBe("injected");
 
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 			});
 
