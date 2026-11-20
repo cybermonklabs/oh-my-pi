@@ -2148,6 +2148,9 @@ mod tests {
 		const { assert!(DEPTH * (NAME.len() + 1) > libc::PATH_MAX as usize) };
 		let cwd = tempdir().unwrap();
 		let root = cwd.path().join("deep");
+		// Whatever rm leaves is removed before `cwd` drops, whose
+		// `remove_dir_all` would hold one descriptor per level of the chain.
+		let _chain = crate::deep_tree::RemoveTree(root.clone());
 		std::fs::create_dir(&root).unwrap();
 		let mut dir = DirFd::open(&root, SymlinkBehavior::NoFollow).unwrap();
 		for _ in 0..DEPTH {

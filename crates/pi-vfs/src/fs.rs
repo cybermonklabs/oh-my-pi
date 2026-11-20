@@ -1113,7 +1113,7 @@ impl Fs {
 	pub async fn remove_dir_all(&self, path: impl AsRef<Path>) -> io::Result<()> {
 		let path = path.as_ref();
 		match self.route(path)? {
-			Route::Native => std::fs::remove_dir_all(path),
+			Route::Native => native::remove_dir_all(path),
 			Route::Provider(provider) => self.guard(provider.remove_dir_all(path)).await,
 			Route::Mounted(_) => Err(not_permitted()),
 		}
@@ -1723,7 +1723,7 @@ impl BlockingFs {
 	pub fn remove_dir_all(&self, path: impl AsRef<Path>) -> io::Result<()> {
 		let path = path.as_ref();
 		match self.fs.route(path)? {
-			Route::Native => std::fs::remove_dir_all(path),
+			Route::Native => native::remove_dir_all(path),
 			Route::Provider(provider) => self.run(provider.remove_dir_all(path)),
 			Route::Mounted(_) => Err(not_permitted()),
 		}

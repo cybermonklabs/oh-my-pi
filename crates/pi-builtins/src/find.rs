@@ -5562,6 +5562,9 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn walks_a_directory_chain_deeper_than_the_stack() {
 		let (_dir, root) = fixture();
+		// Removed before `_dir` drops, whose `remove_dir_all` would hold one
+		// descriptor per level of the chain.
+		let _chain = crate::deep_tree::RemoveTree(root.join("deep"));
 		// Stay under the host's PATH_MAX: every level adds "/d".
 		#[cfg(unix)]
 		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
