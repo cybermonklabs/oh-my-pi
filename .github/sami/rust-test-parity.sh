@@ -83,6 +83,26 @@ jq -r --arg root "$root/" --rawfile excludes "$tmp/excludes" '
 	| @tsv' "$tmp/metadata.json" | LC_ALL=C sort -u >"$tmp/required" || fail "could not read the test targets from cargo metadata"
 [ -s "$tmp/required" ] || fail "cargo metadata names no test target"
 
+# A Cargo.toml outside the root workspace is a workspace Bazel does not
+# build, whose tests the test step runs under cargo only when
+# .github/sami/rust-test-cargo-workspaces.txt lists it. Every tracked
+# Cargo.toml must be the root's, a root member's, or listed.
+jq -r --arg root "$root/" '.packages[].manifest_path | ltrimstr($root)' "$tmp/metadata.json" >"$tmp/members" ||
+	fail "could not read the root workspace's manifests from cargo metadata"
+echo Cargo.toml >>"$tmp/members"
+[ -f .github/sami/rust-test-cargo-workspaces.txt ] || fail ".github/sami/rust-test-cargo-workspaces.txt is missing"
+awk '!/^[[:space:]]*(#|$)/ { print $1 }' .github/sami/rust-test-cargo-workspaces.txt >>"$tmp/members"
+LC_ALL=C sort -u -o "$tmp/members" "$tmp/members"
+git ls-files -- 'Cargo.toml' '*/Cargo.toml' >"$tmp/manifests" || fail "git ls-files failed"
+[ -s "$tmp/manifests" ] || fail "git ls-files names no Cargo.toml"
+LC_ALL=C sort -u -o "$tmp/manifests" "$tmp/manifests"
+unlisted=0
+while read -r manifest; do
+	echo "::error title=Rust test parity::$manifest is outside the root workspace and not in .github/sami/rust-test-cargo-workspaces.txt, so no job runs its tests"
+	unlisted=$((unlisted + 1))
+done < <(LC_ALL=C comm -23 "$tmp/manifests" "$tmp/members")
+echo "Cargo manifests: $(wc -l <"$tmp/manifests") tracked, $unlisted outside the root workspace and unlisted"
+
 # The crate roots the Bazel tests build, as repository paths, from each test
 # rule and each crate a test names. One JSON object per rule, with its
 # attributes as written and globs expanded.
@@ -149,4 +169,4 @@ while IFS=$'\t' read -r kind package name src; do
 	fi
 done <"$tmp/required"
 echo "Rust test parity: $total test targets in the suite, $missing without a Bazel test target"
-[ "$missing" = 0 ]
+[ "$missing" = 0 ] && [ "$unlisted" = 0 ]

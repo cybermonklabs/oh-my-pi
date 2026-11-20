@@ -209,6 +209,54 @@ jobs:
             echo "::error title=Rust tests::bazel test reported a failed test, but its build event log names no target that did not pass"
             exit 1
           fi
+          # Cargo workspaces Bazel does not build (sdk/ is in .bazelignore),
+          # listed in .github/sami/rust-test-cargo-workspaces.txt: every test
+          # target of each runs under cargo with the root's pinned nightly, one
+          # log per target, and each log is read as a rust_test log below.
+          # The target is `<directory>:<kind>:<name>` (kind lib, bin, test,
+          # example, bench or doc). A failed cargo metadata stops the step.
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "::error title=Rust tests::rust-toolchain.toml names no channel"
+            exit 1
+          fi
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          n=0
+          while read -r manifest _; do
+            case "$manifest" in "" | "#"*) continue ;; esac
+            dir="$(dirname "$manifest")"
+            rustup run "$channel" cargo metadata --locked --no-deps --format-version 1 --manifest-path "$manifest" >"$RUNNER_TEMP/cargo-metadata.json"
+            jq -r --arg dir "$dir" '
+              .packages[] | .targets[]
+              | (.kind[0]) as $kind
+              | (if .test then [($dir + ":" + $kind + ":" + .name), (if $kind == "lib" then "--lib" else "--" + $kind end), (if $kind == "lib" then "" else .name end)] else empty end),
+                (if .doctest and ([.crate_types[] | select(. == "lib" or . == "rlib" or . == "proc-macro")] | length > 0)
+                 then [($dir + ":doc:" + .name), "--doc", ""] else empty end)
+              | @tsv' "$RUNNER_TEMP/cargo-metadata.json" >"$RUNNER_TEMP/cargo-targets.tsv"
+            if [ ! -s "$RUNNER_TEMP/cargo-targets.tsv" ]; then
+              echo "::error title=Rust tests::$manifest names no test target"
+              exit 1
+            fi
+            while IFS=$'\t' read -r label selector name; do
+              n=$((n + 1))
+              log="$RUNNER_TEMP/cargo-test-$n.log"
+              code=0
+              # shellcheck disable=SC2086 # $name is empty for --lib and --doc
+              rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$selector" $name -- -Zunstable-options --format=json >"$log" 2>"$log.err" || code=$?
+              if [ "$code" = 0 ]; then
+                printf '%s\tcargo test\tPASSED\tpassed\t%s\n' "$label" "$log" >>"$rows"
+              else
+                echo "::group::$label: cargo test exited $code"
+                tail -n 50 "$log.err"
+                echo "::endgroup::"
+                printf '%s\tcargo test\tFAILED\tfailed\t%s\n' "$label" "$log" >>"$rows"
+              fi
+            done <"$RUNNER_TEMP/cargo-targets.tsv"
+          done <.github/sami/rust-test-cargo-workspaces.txt
+          if [ "$n" = 0 ]; then
+            echo "::error title=Rust tests::.github/sami/rust-test-cargo-workspaces.txt names no workspace with a test target"
+            exit 1
+          fi
           : >"$failed"
           bad=0
           if [ "$rc" = 1 ]; then
@@ -259,12 +307,20 @@ jobs:
               continue
             fi
             case "$rule" in
-              "rust_test rule")
+              "rust_test rule" | "cargo test")
+                # A log can hold several suites (`cargo test --doc` runs one
+                # binary per doctest that cannot be merged): the planned count
+                # is the sum of every suite's test_count, and every started
+                # suite must end.
                 record="$(jq -R -s -r '
                   [split("\n")[] | fromjson? | select(type == "object")] as $events
-                  | [($events | map(select(.type == "suite" and .event == "started")) | .[0].test_count // -1),
+                  | ($events | map(select(.type == "suite" and .event == "started"))) as $starts
+                  | ($events | map(select(.type == "suite" and (.event == "ok" or .event == "failed")))) as $ends
+                  | [(if ($starts | length) == 0 then -1 else ($starts | map(.test_count // 0) | add) end),
                      ($events | map(select(.type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored"))) | length),
-                     ($events | map(select(.type == "suite" and (.event == "ok" or .event == "failed"))) | .[-1].event // "none")]
+                     (if ($ends | length) != ($starts | length) then "none"
+                      elif ($ends | map(select(.event == "failed")) | length) > 0 then "failed"
+                      else "ok" end)]
                   | @tsv' "$log")"
                 IFS=$'\t' read -r planned reported ended <<<"$record"
                 if [ "$planned" -lt 0 ]; then
