@@ -34,7 +34,7 @@ fn zsh(script: &str) -> (String, String, i32) {
 #[test]
 fn zsh_mod_files_moves_links_modes_and_removes() {
 	let (out, err, st) = zsh(
-		"zmodload zsh/files zsh/stat
+		"umask 022; zmodload zsh/files zsh/stat
 mkdir -p src/sub dst; print -n data > src/sub/f; print -n x > src/g
 mv src/sub dst; print -l dst/*/*
 mv src/g dst/sub/; print -l dst/sub/*
@@ -103,7 +103,7 @@ mapfile[f]=; print -r -- $mapfile[f]; unset 'mapfile[f]'; print -l *(N)",
 #[test]
 fn zsh_mod_attr_extended_attributes() {
 	let (out, err, st) = zsh(
-		"zmodload zsh/attr zsh/stat
+		"umask 022; zmodload zsh/attr zsh/stat
 print > f; zsetattr f user.k val; echo $?; zgetattr f user.k; zgetattr f user.k v; print -r -- $v
 zlistattr f l; print -l ${l:#com.apple.*}; zdelattr f user.k; echo $?; zgetattr f user.k; echo $?
 ln -s f l2; zsetattr -h l2 user.s 1; echo $?; zlistattr -h l2 a; print -l ${a:#com.apple.*}; \
