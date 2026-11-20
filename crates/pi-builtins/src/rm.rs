@@ -894,7 +894,7 @@ static OPT_PROMPT_ALWAYS: &str = "prompt-always";
 static OPT_PROMPT_ONCE: &str = "prompt-once";
 static OPT_RECURSIVE: &str = "recursive";
 static OPT_VERBOSE: &str = "verbose";
-static OPT_PROGRESS: &str = "progress";
+const OPT_PROGRESS: &str = "progress";
 static PRESUME_INPUT_TTY: &str = "-presume-input-tty";
 
 static ARG_FILES: &str = "files";
@@ -909,7 +909,7 @@ matches_parser!(Rm, uu_app);
 /// The long options `rm` has and GNU rm 9.7 does not, or hides behind a
 /// third dash (`---presume-input-tty`): GNU reads `--p`, `--pr` and `--pres`
 /// as `--preserve-root`, where each also begins one of these.
-const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = ["progress", "presume-input-tty"];
+const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = [OPT_PROGRESS, "presume-input-tty"];
 
 /// The options `rm` accepts.
 static OPTIONS: LazyLock<OptionTable> =

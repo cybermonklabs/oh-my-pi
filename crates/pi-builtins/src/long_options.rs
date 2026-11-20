@@ -10,11 +10,13 @@
 
 use std::ffi::OsString;
 
+use itertools::Itertools;
+
 /// A long option a utility accepts: its names - the long name first, then
 /// its aliases, which getopt counts as the same option - and whether it takes
 /// the next argument as its value.
 pub(crate) struct LongOption {
-	pub names:       Vec<String>,
+	names:           Vec<String>,
 	pub takes_value: bool,
 }
 
@@ -24,7 +26,7 @@ pub(crate) struct OptionTable {
 	/// Every long option, so whether one takes the next argument is known
 	/// for every name and abbreviation clap accepts (`--bef 1` is
 	/// `--before-context 1`).
-	pub long:         Vec<LongOption>,
+	long:             Vec<LongOption>,
 	/// The short options that take a value (`-e`, `-m`, `-A`, ...).
 	pub short_valued: Vec<char>,
 	/// The long options the builtin has and GNU's tool does not, or hides
@@ -65,7 +67,7 @@ impl OptionTable {
 	/// `--regexp` and `--col` is `--color`, whose alias `--colour` is the
 	/// same option, or, where it also begins one the builtin alone has, of
 	/// one of the others alone.
-	pub fn long_option(&self, name: &str) -> Option<&LongOption> {
+	pub(crate) fn long_option(&self, name: &str) -> Option<&LongOption> {
 		if name.is_empty() {
 			return None;
 		}
@@ -73,13 +75,13 @@ impl OptionTable {
 			return Some(option);
 		}
 		let begins = |option: &&LongOption| option.names.iter().any(|n| n.starts_with(name));
-		only(self.long.iter().filter(begins)).or_else(|| {
-			only(
-				self.long
-					.iter()
-					.filter(begins)
-					.filter(|option| !self.builtin_only.contains(&option.names[0].as_str())),
-			)
+		self.long.iter().filter(begins).exactly_one().ok().or_else(|| {
+			self.long
+				.iter()
+				.filter(begins)
+				.filter(|option| !self.builtin_only.contains(&option.names[0].as_str()))
+				.exactly_one()
+				.ok()
 		})
 	}
 
@@ -144,10 +146,4 @@ impl OptionTable {
 		}
 		spelled
 	}
-}
-
-/// The one item `items` yields, `None` where it yields none or several.
-fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
-	let item = items.next()?;
-	items.next().is_none().then_some(item)
 }

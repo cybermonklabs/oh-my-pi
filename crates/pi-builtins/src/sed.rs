@@ -86,8 +86,6 @@ pub struct ProcessingContext {
 	pub input_action: Option<InputAction>,
 	/// Hold space
 	pub hold:                 StringSpace,
-	/// Nesting of { } at compile time
-	pub parsed_block_nesting: usize,
 	/// Command associated with each label
 	pub label_to_command_map: HashMap<String, Rc<RefCell<Command>>>,
 	/// Commands with a (latchable and resetable) address range
@@ -321,6 +319,14 @@ impl ReplacementTemplate {
 		Self { parts, max_group_number: max_group_number.try_into().unwrap() }
 	}
 
+	/// GNU sed's refusal of a reference to a group an RE of `captures`
+	/// captures (group 0 counted) lacks, where it checks one: "invalid
+	/// reference \2 on `s' command's RHS". `None` where every group exists.
+	pub fn missing_group(&self, captures: usize) -> Option<String> {
+		(self.max_group_number >= captures)
+			.then(|| format!("invalid reference \\{} on `s' command's RHS", self.max_group_number))
+	}
+
 	/// Apply the template to the given RE captures, for a line held as byte
 	/// text when `bytes`.
 	/// Example:
@@ -502,7 +508,7 @@ impl Command {
 
 	/// Construct with position information from the given providers.
 	pub fn at_position(lines: &ScriptLineProvider, line: &ScriptCharProvider) -> Self {
-		Self::at(ScriptLocation::at_position(lines, line))
+		Self::at(lines.locate(line))
 	}
 }
 
@@ -790,10 +796,10 @@ use crate::sed::{
 		ReplacementTemplate, Substitution, Transliteration,
 	},
 	delimited_parser::{
-		UNTERMINATED_ADDRESS, UNTERMINATED_S, UNTERMINATED_Y, parse_byte_escape, parse_char_escape,
+		UNTERMINATED_ADDRESS, UNTERMINATED_S, parse_byte_escape, parse_char_escape,
 		parse_regex, parse_transliteration,
 	},
-	error_handling::{ScriptLocation, compilation_error, location_error, semantic_error},
+	error_handling::{command_end_error, compilation_error, script_end_error, semantic_error},
 	fast_io::{script_byte_text, script_text},
 	fast_regex::{Regex, ScriptRegex},
 	named_writer::NamedWriter,
@@ -808,13 +814,16 @@ const ERR_SANDBOX: &str = "e/r/w commands disabled in sandbox mode";
 
 const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to `s'";
 
+/// GNU sed 4.9's error for an `a`, `c` or `i` with no text or no `\`.
+const ERR_TEXT_EXPECTED: &str = "expected \\ after `a', `c' or `i'";
+
 // Handling required after processing a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandHandling {
-	GetNext,   // Get next command and process that: !
-	Return,    // Return from the sequence parser: }
-	Continue,  // Continue sequence parsing: all other commands
-	OpenBlock, // Parse the commands of a block, which `}` closes: {
+	GetNext,    // Get next command and process that: !
+	CloseBlock, // Close the innermost block: }
+	Continue,   // Continue sequence parsing: all other commands
+	OpenBlock,  // Parse the commands of a block, which `}` closes: {
 }
 
 /// The type of functions that compile individual commands
@@ -866,7 +875,7 @@ fn compile_with_provider(
 
 	// Link branch commands to the target label commands.
 	populate_label_map(result.clone(), context)?;
-	populate_range_commands(result.clone(), context);
+	populate_range_commands(result.clone(), context)?;
 	resolve_branch_targets(result.clone(), context)?;
 
 	// Link the ends of command blocks to their following commands.
@@ -939,10 +948,9 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
 }
 
 /// Calls `visit` with every command of the chain at `head`, the commands of
-/// a block before the block itself, as the passes over the compiled script
-/// visited them when they recursed into each block. The blocks are walked
-/// with a stack of their own, so a script of blocks nested 100,000 deep
-/// does not overflow the stack.
+/// a block before the block itself. The blocks are walked with a stack of
+/// their own, so a script of blocks nested 100,000 deep does not overflow
+/// the stack.
 fn visit_commands(
 	head: Option<Rc<RefCell<Command>>>,
 	mut visit: impl FnMut(&Rc<RefCell<Command>>) -> SedResult<()>,
@@ -997,15 +1005,14 @@ fn populate_label_map(
 
 /// Populate the context's address range command list with references to
 /// associated commands.
-fn populate_range_commands(cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
-	let walked = visit_commands(cur, |rc_cmd| {
+fn populate_range_commands(cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) -> SedResult<()> {
+	visit_commands(cur, |rc_cmd| {
 		if rc_cmd.borrow().addr2.is_some() {
 			// Save detected range command.
 			context.range_commands.push(Rc::clone(rc_cmd));
 		}
 		Ok(())
-	});
-	debug_assert!(walked.is_ok(), "the visit fails for no command");
+	})
 }
 
 /// Replace branch labels with references to the corresponding commands.
@@ -1065,14 +1072,15 @@ fn compile_sequence(
 		}
 	}
 
-	/// Closes the innermost open block, if any: its '{' command takes the
-	/// chain compiled since it opened, and joins the chain that holds it.
-	fn close_block(open: &mut Vec<(Chain, Rc<RefCell<Command>>)>, chain: &mut Chain) -> bool {
-		let Some((outer, block)) = open.pop() else { return false };
+	/// Closes the innermost open block: its '{' command takes the chain
+	/// compiled since it opened, and joins the chain that holds it.
+	fn close_block(open: &mut Vec<(Chain, Rc<RefCell<Command>>)>, chain: &mut Chain) {
+		let (outer, block) = open
+			.pop()
+			.expect("a `}` with no block open is refused before it compiles");
 		let body = mem::replace(chain, outer);
 		block.borrow_mut().data = CommandData::BranchTarget(body.head);
 		chain.push(block);
-		true
 	}
 
 	// The blocks open, innermost last, each with the chain that holds it.
@@ -1104,8 +1112,7 @@ fn compile_sequence(
 					// is "-e expression #1, char 0: unmatched `{'", and a
 					// script file names the line of that `{`.
 					if let Some((_, block)) = open.last() {
-						let location = block.borrow().location.described_by_line();
-						return Err(SedError::new(1, format!("{location}: unmatched `{{'")));
+						return script_end_error(&block.borrow().location, "unmatched `{'");
 					}
 					return Ok(chain.head);
 				},
@@ -1122,31 +1129,30 @@ fn compile_sequence(
 		let mut cmd = Rc::new(RefCell::new(Command::at_position(lines, line)));
 		let n_addr = compile_address_range(lines, line, &mut cmd, context)?;
 		line.eat_spaces();
+		// A `}` that closes no block is refused before its addresses, as in
+		// GNU sed 4.9: `sed '1}'` and `sed '!}'` are "unexpected `}'".
+		let unexpected_close = |line: &ScriptCharProvider| !line.eol() && line.current() == '}' && open.is_empty();
+		if unexpected_close(line) {
+			return compilation_error(lines, line, "unexpected `}'");
+		}
 		let mut cmd_spec = get_verified_cmd_spec(lines, line, n_addr, context.posix)?;
 		// Compile the command according to its specification.
 		let mut cmd_mut = cmd.borrow_mut();
 		cmd_mut.code = line.current();
 		let mut handling = (cmd_spec.handler)(lines, line, &mut cmd_mut, context)?;
 		if handling == CommandHandling::GetNext {
+			// The command `!` negates, which a second `!` cannot be.
+			if unexpected_close(line) {
+				return compilation_error(lines, line, "unexpected `}'");
+			}
 			cmd_spec = get_verified_cmd_spec(lines, line, n_addr, context.posix)?;
 			cmd_mut.code = line.current();
-			// The command `!` negates joins the chain, unless it opens a
-			// block.
-			handling = match (cmd_spec.handler)(lines, line, &mut cmd_mut, context)? {
-				CommandHandling::OpenBlock => CommandHandling::OpenBlock,
-				_ => CommandHandling::Continue,
-			};
+			handling = (cmd_spec.handler)(lines, line, &mut cmd_mut, context)?;
 		}
 		drop(cmd_mut);
 
 		match handling {
-			// `}` closes the innermost block; the script itself has none to
-			// close, as `}` is refused there.
-			CommandHandling::Return => {
-				if !close_block(&mut open, &mut chain) {
-					return Ok(chain.head);
-				}
-			},
+			CommandHandling::CloseBlock => close_block(&mut open, &mut chain),
 			CommandHandling::OpenBlock => open.push((mem::take(&mut chain), cmd)),
 			CommandHandling::Continue | CommandHandling::GetNext => chain.push(cmd),
 		}
@@ -1188,7 +1194,7 @@ fn compile_address_range(
 		if is_line && !context.posix && !line.eol() && line.current() == '~' {
 			line.advance();
 			line.eat_spaces();
-			let step = parse_number(lines, line, false)?.unwrap_or(0);
+			let step = parse_number(lines, line)?.unwrap_or(0);
 			// `first~step` is one address, held as a range that starts at
 			// `first`: `sed '1~2q'` is accepted, as `q` takes one address.
 			if step > 0 {
@@ -1207,11 +1213,11 @@ fn compile_address_range(
 		let addr2 = if !context.posix && !line.eol() && line.current() == '~' {
 			line.advance();
 			line.eat_spaces();
-			Address::StepEnd(parse_number(lines, line, false)?.unwrap_or(0))
+			Address::StepEnd(parse_number(lines, line)?.unwrap_or(0))
 		} else {
 			// GNU sed 4.9 refuses a `,` that no address follows: `sed '1,p'`
 			// is "-e expression #1, char 3: unexpected `,'".
-			if line.eol() || !matches!(line.current(), '/' | '\\' | '$' | '+' | '0'..='9') {
+			if line.eol() || !(is_address_char(line.current()) || line.current() == '+') {
 				return compilation_error(lines, line, "unexpected `,'");
 			}
 			compile_address(lines, line, context)?
@@ -1304,27 +1310,22 @@ fn compile_address(
 			line.advance();
 			// GNU sed reads `addr,+` as `addr,+0`; the builtin refuses it,
 			// naming what it lacks.
-			let Some(number) = parse_number(lines, line, false)? else {
+			let Some(number) = parse_number(lines, line)? else {
 				return compilation_error(lines, line, "expected a line count after `+'");
 			};
 			Ok(Address::RelLine(number))
 		},
 		c if c.is_ascii_digit() => {
-			let number = parse_number(lines, line, true)?.unwrap();
+			let number = parse_number(lines, line)?.expect("a digit starts the number");
 			Ok(Address::Line(number))
 		},
 		_ => panic!("invalid context address"),
 	}
 }
 
-/// Parse and return the decimal number at the current line position.
-/// Advance the line to first non-digit or EOL.
-/// Issue an error if the number is required.
-fn parse_number(
-	lines: &ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-	required: bool,
-) -> SedResult<Option<usize>> {
+/// Parse and return the decimal number at the current line position, if
+/// any. Advance the line to first non-digit or EOL.
+fn parse_number(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> SedResult<Option<usize>> {
 	let mut num_str = String::new();
 
 	while !line.eol() && line.current().is_ascii_digit() {
@@ -1333,12 +1334,8 @@ fn parse_number(
 	}
 
 	if num_str.is_empty() {
-		if required {
-			return compilation_error(lines, line, "number expected");
-		}
 		return Ok(None);
 	}
-
 	num_str
 		.parse::<usize>()
 		.map_err(|_| format!("invalid number '{num_str}'"))
@@ -1417,7 +1414,7 @@ fn compile_regex(
 			if error == crate::bre::BreError::ClassSyntaxConfused {
 				return SedError::new(4, error.message());
 			}
-			location_error::<()>(&lines.locate_command_end(line), error.message(), 1).unwrap_err()
+			command_end_error::<()>(lines, line, error.message()).unwrap_err()
 		})
 	};
 	// Under `-z` GNU sed searches an `M` pattern in each line of the pattern
@@ -1461,7 +1458,7 @@ fn compile_regex(
 		};
 		compiled
 			.map(|re| if nul_lines { Regex::NulLines(Box::new(re)) } else { re })
-			.map_err(|e| location_error::<Regex>(&lines.locate_command_end(line), e, 1).unwrap_err())
+			.map_err(|e| command_end_error::<Regex>(lines, line, e).unwrap_err())
 	};
 	let text_pattern = script_text(pattern);
 	let text = compile(&text_pattern)?;
@@ -1612,14 +1609,9 @@ fn compile_subst_command(
 	context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past 's'
-	// GNU sed 4.9: `sed s` is "-e expression #1, char 1: unterminated `s'
-	// command".
-	if line.eol() {
-		return compilation_error(lines, line, UNTERMINATED_S);
-	}
-
-	let delimiter = line.current();
-	if delimiter == '\0' || delimiter == '\\' {
+	// A line that ends here is `scan_delimiter`'s: `sed s` is "-e
+	// expression #1, char 1: unterminated `s' command".
+	if !line.eol() && matches!(line.current(), '\0' | '\\') {
 		return compilation_error(
 			lines,
 			line,
@@ -1635,11 +1627,7 @@ fn compile_subst_command(
 
 	// GNU sed reports these once the command, its end included, is read.
 	if pattern.is_empty() && (subst.ignore_case || subst.multiline) {
-		return location_error(
-			&lines.locate_command_end(line),
-			"cannot specify modifiers on empty regexp",
-			1,
-		);
+		return command_end_error(lines, line, "cannot specify modifiers on empty regexp");
 	}
 
 	// Compile regex with now known modifier flags.
@@ -1651,13 +1639,9 @@ fn compile_subst_command(
 	// empty: `sed --posix 's/a/[\1]/'` prints `[]`.
 	if let Some(regex) = &subst.regex
 		&& !context.posix
-		&& subst.replacement.max_group_number > regex.captures_len() - 1
+		&& let Some(message) = subst.replacement.missing_group(regex.captures_len())
 	{
-		return location_error(
-			&lines.locate_command_end(line),
-			format!("invalid reference \\{} on `s' command's RHS", subst.replacement.max_group_number),
-			1,
-		);
+		return command_end_error(lines, line, message);
 	}
 	cmd.data = CommandData::Substitution(subst);
 
@@ -1673,14 +1657,9 @@ fn compile_trans_command(
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past 'y'
-	// GNU sed 4.9: `sed y` is "-e expression #1, char 1: unterminated `y'
-	// command".
-	if line.eol() {
-		return compilation_error(lines, line, UNTERMINATED_Y);
-	}
-
-	let delimiter = line.current();
-	if delimiter == '\0' || delimiter == '\\' {
+	// A line that ends here is `scan_delimiter`'s: `sed y` is "-e
+	// expression #1, char 1: unterminated `y' command".
+	if !line.eol() && matches!(line.current(), '\0' | '\\') {
 		return compilation_error(
 			lines,
 			line,
@@ -1807,7 +1786,7 @@ pub fn compile_subst_flags(
 				if sandbox {
 					return compilation_error(lines, line, ERR_SANDBOX);
 				}
-				let location = ScriptLocation::at_position(lines, line);
+				let location = lines.locate(line);
 				let path = read_file_path(lines, line)?;
 				subst.write_file = Some(NamedWriter::new(path, paths, location)?);
 				return Ok(()); // 'w' is the last flag allowed
@@ -1831,21 +1810,17 @@ fn compile_end_group_command(
 	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	cmd: &mut Command,
-	context: &mut ProcessingContext,
+	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
-	// GNU sed 4.9 refuses a `}` that closes no block before one with an
-	// address: `sed '1}'` is "unexpected `}'", `sed '{p;1}'` "`}' doesn't
-	// want any addresses".
-	if context.parsed_block_nesting == 0 {
-		return compilation_error(lines, line, "unexpected `}'");
-	}
+	// A `}` that closes no block was refused before it compiled; GNU sed
+	// 4.9 refuses one with an address after that: `sed '{p;1}'` is "`}'
+	// doesn't want any addresses".
 	if cmd.addr1.is_some() {
 		return compilation_error(lines, line, "`}' doesn't want any addresses");
 	}
-	context.parsed_block_nesting -= 1;
 	line.advance();
 	parse_command_ending(lines, line)?;
-	Ok(CommandHandling::Return)
+	Ok(CommandHandling::CloseBlock)
 }
 
 // Handles !
@@ -1904,7 +1879,7 @@ fn compile_write_file_command(
 	if context.sandbox {
 		return compilation_error(lines, line, ERR_SANDBOX);
 	}
-	let location = ScriptLocation::at_position(lines, line);
+	let location = lines.locate(line);
 	let path = read_file_path(lines, line)?;
 	cmd.data = CommandData::NamedWriter(NamedWriter::new(path, &context.paths, location)?);
 	Ok(CommandHandling::Continue)
@@ -1916,10 +1891,9 @@ fn compile_block_command(
 	_lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	_cmd: &mut Command,
-	context: &mut ProcessingContext,
+	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past '{'
-	context.parsed_block_nesting += 1;
 	Ok(CommandHandling::OpenBlock)
 }
 
@@ -1981,7 +1955,7 @@ fn compile_number_command(
 	line.advance(); // Skip the command character
 	line.eat_spaces(); // Skip any leading whitespace
 
-	match parse_number(lines, line, false)? {
+	match parse_number(lines, line)? {
 		Some(n) => {
 			cmd.data = CommandData::Number(n);
 		},
@@ -2035,11 +2009,7 @@ fn compile_text_command_gnu(
 	let mut escaped_newline = false;
 
 	if line.eol() {
-		return compilation_error(
-			lines,
-			line,
-			"expected \\ after `a', `c' or `i'",
-		);
+		return compilation_error(lines, line, ERR_TEXT_EXPECTED);
 	}
 
 	// Skip optional \.
@@ -2104,11 +2074,7 @@ fn compile_text_command_posix(
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	if line.eol() || line.current() != '\\' {
-		return compilation_error(
-			lines,
-			line,
-			"expected \\ after `a', `c' or `i'",
-		);
+		return compilation_error(lines, line, ERR_TEXT_EXPECTED);
 	}
 
 	line.advance(); // Skip \.
@@ -2376,28 +2342,21 @@ mod tests {
 	#[test]
 	fn test_parse_number_basic() {
 		let (lines, mut chars) = make_providers("123abc");
-		assert_eq!(parse_number(&lines, &mut chars, true).unwrap(), Some(123));
+		assert_eq!(parse_number(&lines, &mut chars).unwrap(), Some(123));
 		assert_eq!(chars.current(), 'a'); // Should stop at first non-digit
 	}
 
 	#[test]
 	fn test_parse_optional_number_missing() {
 		let (lines, mut chars) = make_providers(" ;");
-		assert_eq!(parse_number(&lines, &mut chars, false).unwrap(), None);
+		assert_eq!(parse_number(&lines, &mut chars).unwrap(), None);
 	}
 
 	#[test]
 	fn test_parse_number_invalid() {
 		let (lines, mut chars) = make_providers("537654897563495734653453434534534534545");
-		let err = parse_number(&lines, &mut chars, true).unwrap_err();
+		let err = parse_number(&lines, &mut chars).unwrap_err();
 		assert!(err.to_string().contains("invalid number"));
-	}
-
-	#[test]
-	fn test_parse_required_number_missing() {
-		let (lines, mut chars) = make_providers("");
-		let err = parse_number(&lines, &mut chars, true).unwrap_err();
-		assert!(err.to_string().contains("number expected"));
 	}
 
 	// compile_re
@@ -3622,7 +3581,7 @@ mod tests {
 		let mut context = ProcessingContext::default();
 		assert_eq!(context.range_commands.len(), 0);
 
-		populate_range_commands(Some(cmd.clone()), &mut context);
+		populate_range_commands(Some(cmd.clone()), &mut context).unwrap();
 
 		assert_eq!(context.range_commands.len(), 1);
 
@@ -3644,14 +3603,14 @@ mod tests {
 		// Zero-address command
 		let cmd0 = command_with_code('p');
 
-		populate_range_commands(Some(cmd0), &mut context);
+		populate_range_commands(Some(cmd0), &mut context).unwrap();
 		assert!(context.range_commands.is_empty());
 
 		// One-address command
 		let cmd1 = command_with_code('p');
 		cmd1.borrow_mut().addr1 = Some(Address::Line(3));
 
-		populate_range_commands(Some(cmd1), &mut context);
+		populate_range_commands(Some(cmd1), &mut context).unwrap();
 		assert!(context.range_commands.is_empty());
 	}
 
@@ -3672,7 +3631,7 @@ mod tests {
 		let mut context = ProcessingContext::default();
 		assert_eq!(context.range_commands.len(), 0);
 
-		populate_range_commands(Some(outer.clone()), &mut context);
+		populate_range_commands(Some(outer.clone()), &mut context).unwrap();
 
 		// Two range commands must be found.
 		assert_eq!(context.range_commands.len(), 2);
@@ -3876,7 +3835,7 @@ mod tests {
 		let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
 		assert!(result.is_err());
 		let err = result.unwrap_err().to_string();
-		assert!(err.contains("expected \\ after `a', `c' or `i'"));
+		assert!(err.contains(ERR_TEXT_EXPECTED));
 	}
 
 	#[test]
@@ -3953,7 +3912,7 @@ mod tests {
 		let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
 		assert!(result.is_err());
 		let err = result.unwrap_err().to_string();
-		assert!(err.contains("expected \\ after `a', `c' or `i'"));
+		assert!(err.contains(ERR_TEXT_EXPECTED));
 	}
 
 	#[test]
@@ -4189,10 +4148,9 @@ pub fn parse_byte_escape(line: &mut ScriptCharProvider) -> Option<char> {
 /// This functionality is needed to avoid terminating delimited
 /// sequences when a delimiter appears within a character class.
 /// While at it, handle escaped characters for the sake of consistency.
-fn parse_character_class(
-	lines: &ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-) -> SedResult<String> {
+/// `None` for a class the line ends inside of, which leaves the whole regex
+/// unterminated (see [`parse_regex`]).
+fn parse_character_class(line: &mut ScriptCharProvider) -> Option<String> {
 	let mut result = String::new();
 
 	assert!(!line.eol() && line.current() == '[', "Invalid character class.");
@@ -4218,7 +4176,7 @@ fn parse_character_class(
 		if ch == ']' {
 			result.push(']');
 			line.advance();
-			return Ok(result);
+			return Some(result);
 		}
 
 		if ch == '[' {
@@ -4255,11 +4213,7 @@ fn parse_character_class(
 				}
 
 				if !terminated {
-					return compilation_error(
-						lines,
-						line,
-						"Unterminated POSIX character class, equivalence or collating symbol",
-					);
+					return None;
 				}
 
 				continue;
@@ -4289,7 +4243,7 @@ fn parse_character_class(
 		}
 	}
 
-	compilation_error(lines, line, "Unterminated bracket expression")
+	None
 }
 
 /// Scan and return the opening delimiter of a delimited string
@@ -4341,7 +4295,7 @@ pub fn parse_regex(
 			'[' if delimiter != '[' => {
 				// A bracket expression that never closes leaves the regex
 				// unterminated: `sed 's/[a/x/'` is "unterminated `s' command".
-				let Ok(cc) = parse_character_class(lines, line) else {
+				let Some(cc) = parse_character_class(line) else {
 					return compilation_error(lines, line, unterminated);
 				};
 				result.push_str(&cc);
@@ -4672,63 +4626,52 @@ mod tests {
 		ScriptCharProvider::new(input)
 	}
 
-	fn test_lines() -> ScriptLineProvider {
-		ScriptLineProvider::with_active_state("test.sed", 3)
-	}
-
 	#[test]
 	fn test_basic_character_class() {
 		let mut line = char_provider_from("[qr]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[qr]");
 	}
 
 	#[test]
 	fn test_negated_class() {
 		let mut line = char_provider_from("[^abc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[^abc]");
 	}
 
 	#[test]
 	fn test_leading_close_bracket() {
 		let mut line = char_provider_from("[]abc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[]abc]");
 	}
 
 	#[test]
 	fn test_leading_negated_close_bracket() {
 		let mut line = char_provider_from("[^]abc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[^]abc]");
 	}
 
 	#[test]
 	fn test_escaped_character_begin() {
 		let mut line = char_provider_from("[\\nabc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[\nabc]");
 	}
 
 	#[test]
 	fn test_escaped_character_middle() {
 		let mut line = char_provider_from("[a\\nbc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[a\nbc]");
 	}
 
 	#[test]
 	fn test_escaped_character_end() {
 		let mut line = char_provider_from("[abc\\n]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[abc\n]");
 	}
 
@@ -4738,64 +4681,53 @@ mod tests {
 		// ordinary member, so the list is `[a\]` and `bc]` is the text after
 		// it: `sed 's/[a\]bc]/X/'` replaces nothing in `a]bc]`.
 		let mut line = char_provider_from("[a\\]bc]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[a\\]");
 	}
 
 	#[test]
 	fn test_posix_class() {
 		let mut line = char_provider_from("[[:digit:]]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[[:digit:]]");
 	}
 
 	#[test]
 	fn test_equivalence_class() {
 		let mut line = char_provider_from("[[=a=]]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[[=a=]]");
 	}
 
 	#[test]
 	fn test_collating_symbol() {
 		let mut line = char_provider_from("[[.ch.]]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[[.ch.]]");
 	}
 
 	#[test]
 	fn test_unterminated_class_error() {
 		let mut line = char_provider_from("[abc"); // missing closing ]
-		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
-		assert!(err.is_err());
+		assert!(parse_character_class(&mut line).is_none());
 	}
 
 	#[test]
 	fn test_unterminated_posix_class_error() {
 		let mut line = char_provider_from("[[:digit:]");
-		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
-		assert!(err.is_err());
+		assert!(parse_character_class(&mut line).is_none());
 	}
 
 	#[test]
 	fn test_unterminated_escape_error() {
 		let mut line = char_provider_from("[abc\\"); // missing closing ]
-		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
-		assert!(err.is_err());
+		assert!(parse_character_class(&mut line).is_none());
 	}
 
 	#[test]
 	fn test_malformed_posix_like_pattern_treated_as_literal() {
 		let mut line = char_provider_from("[[x]yz]");
-		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&mut line).unwrap();
 		assert_eq!(result, "[[x]");
 	}
 
@@ -5168,11 +5100,6 @@ impl Default for ScriptLocation {
 }
 
 impl ScriptLocation {
-	/// Constructs a location from the current script providers.
-	pub fn at_position(lines: &ScriptLineProvider, line: &ScriptCharProvider) -> Self {
-		lines.locate(line)
-	}
-
 	/// The location as GNU sed writes it before a compile error: `-e
 	/// expression #1, char 3` or `file s.sed line 2`.
 	pub fn described(&self) -> String {
@@ -5205,6 +5132,18 @@ pub fn compilation_error<T>(
 	location_error(&lines.locate(line), msg, 1)
 }
 
+/// Fails with a compile error found once the command, its end included,
+/// has been read, where GNU sed compiles a command's regex: at
+/// [`ScriptLineProvider::locate_command_end`]. `sed 's/[z-a]/x/;p'` is "-e
+/// expression #1, char 11: Invalid range end".
+pub fn command_end_error<T>(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	msg: impl ToString,
+) -> SedResult<T> {
+	semantic_error(&lines.locate_command_end(line), msg)
+}
+
 /// Fails with a compile error at `location`, written as GNU sed writes it:
 /// `-e expression #1, char 3: MESSAGE`.
 pub(crate) fn location_error<T>(location: &ScriptLocation, msg: impl ToString, code: i32) -> SedResult<T> {
@@ -5216,10 +5155,11 @@ pub fn semantic_error<T>(location: &ScriptLocation, msg: impl ToString) -> SedRe
 	location_error(location, msg, 1)
 }
 
-/// Fails with an error in the script that GNU sed finds only as it runs,
-/// which it reports, exit 1, at the end of the script: `sed -e p -e 's//x/'`
-/// is "-e expression #2, char 0: no previous regular expression", and a
-/// script file of two lines, each ended, names "line 3".
+/// Fails with an error GNU sed places by line alone, exit 1: one it finds
+/// only as the script runs, at the end of the script (`sed -e p -e
+/// 's//x/'` is "-e expression #2, char 0: no previous regular expression",
+/// and a script file of two lines, each ended, names "line 3"), or a block
+/// left open, at its `{`.
 pub fn script_end_error<T>(script_end: &ScriptLocation, msg: impl ToString) -> SedResult<T> {
 	Err(SedError::new(1, format!("{}: {}", script_end.described_by_line(), msg.to_string())))
 }
@@ -9184,12 +9124,9 @@ fn substitute(
 	// for is otherwise empty.
 	if regex.take_reference_check()
 		&& !posix
-		&& sub.replacement.max_group_number > regex.captures_len() - 1
+		&& let Some(message) = sub.replacement.missing_group(regex.captures_len())
 	{
-		return script_end_error(
-			script_end,
-			format!("invalid reference \\{} on `s' command's RHS", sub.replacement.max_group_number),
-		);
+		return script_end_error(script_end, message);
 	}
 
 	// The following let block allows a common input_runtime_error to be
@@ -9889,13 +9826,19 @@ pub mod script_char_provider {
 
 #[derive(Debug)]
 pub struct ScriptCharProvider {
-	line: Vec<char>,
-	pos:  usize,
+	line:    Vec<char>,
+	/// The bytes the first `n` characters take in UTF-8, at `n`, from 0 to
+	/// the whole line: a compile error's place is looked up, not summed.
+	offsets: Vec<usize>,
+	pos:     usize,
 }
 
 impl ScriptCharProvider {
 	pub fn new(line_string: &str) -> Self {
-		Self { line: line_string.chars().collect(), pos: 0 }
+		let offsets = std::iter::once(0)
+			.chain(line_string.char_indices().map(|(at, c)| at + c.len_utf8()))
+			.collect();
+		Self { line: line_string.chars().collect(), offsets, pos: 0 }
 	}
 
 	/// Advances to the next character, if not at end of line.
@@ -9934,7 +9877,7 @@ impl ScriptCharProvider {
 
 	/// The bytes the first `count` characters of the line take in UTF-8.
 	pub fn bytes_through(&self, count: usize) -> usize {
-		self.line[..count.min(self.line.len())].iter().map(|c| c.len_utf8()).sum()
+		self.offsets[count.min(self.line.len())]
 	}
 }
 
@@ -10089,10 +10032,9 @@ impl Place {
 enum State {
 	NotStarted, // Processing has not yet started
 	Active {
-		index:       usize,
-		reader:      Box<dyn BufRead>, // Object on which read_line is called
-		input_name:  String,           // Input description (path or script string)
-		line_number: usize,            // Current line number
+		index:      usize,
+		reader:     Box<dyn BufRead>, // Object on which read_line is called
+		input_name: String,           // Input description (path or script string)
 	},
 	Done, // All scripts have been processed
 }
@@ -10123,7 +10065,7 @@ impl ScriptLineProvider {
 	/// Return the currently processed script line number.
 	pub fn get_line_number(&self) -> usize {
 		match &self.state {
-			State::Active { line_number, .. } => *line_number,
+			State::Active { .. } => self.place.line_number,
 			_ => 0,
 		}
 	}
@@ -10186,13 +10128,12 @@ impl ScriptLineProvider {
 		loop {
 			let advance = match &mut self.state {
 				State::NotStarted => Some(0),
-				State::Active { index, reader, line_number, .. } => {
+				State::Active { index, reader, .. } => {
 					line.clear();
 					let bytes = reader.read_line(&mut line)?;
 					if bytes == 0 {
 						Some(*index + 1) // finished reading this source
 					} else {
-						*line_number += 1;
 						// Remove trailing newline
 						let newline = line.ends_with('\n');
 						if newline {
@@ -10230,20 +10171,18 @@ impl ScriptLineProvider {
 				self.expressions += 1;
 				self.place = Place::start(ScriptSource::Expression(self.expressions));
 				self.state = State::Active {
-					index:       next_index,
-					reader:      Box::new(BufReader::new(cursor)),
-					input_name:  format!("<script argument {}>", next_index + 1),
-					line_number: 0,
+					index:      next_index,
+					reader:     Box::new(BufReader::new(cursor)),
+					input_name: format!("<script argument {}>", next_index + 1),
 				};
 			},
 			ScriptValue::PathVal(p) => {
 				self.place = Place::start(ScriptSource::File(Rc::from(p.to_string_lossy().as_ref())));
 				if p.to_string_lossy() == "-" {
 					self.state = State::Active {
-						index:       next_index,
-						reader:      Box::new(BufReader::new(self.stdin.as_ref().expect("stdin stream missing").clone())),
-						input_name:  "<stdin>".to_string(),
-						line_number: 0,
+						index:      next_index,
+						reader:     Box::new(BufReader::new(self.stdin.as_ref().expect("stdin stream missing").clone())),
+						input_name: "<stdin>".to_string(),
 					};
 				} else {
 					let file = self
@@ -10252,10 +10191,9 @@ impl ScriptLineProvider {
 						.open(self.paths.resolve(p))
 						.map_err_context(|| format!("error opening script file {}", p.quote()))?;
 					self.state = State::Active {
-						index:       next_index,
-						reader:      Box::new(BufReader::new(file)),
-						input_name:  p.to_string_lossy().to_string(),
-						line_number: 0,
+						index:      next_index,
+						reader:     Box::new(BufReader::new(file)),
+						input_name: p.to_string_lossy().to_string(),
 					};
 				}
 			},
@@ -10270,11 +10208,10 @@ impl fmt::Debug for State {
 		match self {
 			State::NotStarted => f.debug_struct("NotStarted").finish(),
 			State::Done => f.debug_struct("Done").finish(),
-			State::Active { index, input_name, line_number, .. } => f
+			State::Active { index, input_name, .. } => f
 				.debug_struct("Active")
 				.field("index", index)
 				.field("input_name", input_name)
-				.field("line_number", line_number)
 				.finish_non_exhaustive(),
 		}
 	}
@@ -10286,9 +10223,8 @@ impl ScriptLineProvider {
 		let mut provider = Self::build(vec![], None, ShellPaths::default());
 		provider.state = State::Active {
 			input_name: input_name.to_string(),
-			line_number,
-			index: 0,
-			reader: Box::new(BufReader::new(std::io::Cursor::new(Vec::<u8>::new()))),
+			index:      0,
+			reader:     Box::new(BufReader::new(std::io::Cursor::new(Vec::<u8>::new()))),
 		};
 		provider.place = Place::start(ScriptSource::File(Rc::from(input_name)));
 		provider.place.line_number = line_number;
@@ -10685,7 +10621,6 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		script_end:           Default::default(),
 		input_action:         None,
 		hold:                 StringSpace { content: String::new(), has_newline: true, bytes: false },
-		parsed_block_nesting: 0,
 		label_to_command_map: HashMap::new(),
 		range_commands:       Vec::new(),
 		substitution_made:    false,
@@ -10979,8 +10914,8 @@ mod tests {
 		let (code, capture) = crate::host::run_util::<Sed>(&["-n", &unclosed], "a\n", "/");
 		assert_eq!(code, 1);
 		assert!(capture.err().contains("unmatched `{'"), "{}", capture.err());
-		// A label and a range inside the blocks are found as before: GNU
-		// prints `a+b+c` and `a` for these 3 deep.
+		// A label and a range inside the blocks are found: GNU sed 4.9
+		// prints `a+b+c` and `a` for these, measured 3 deep.
 		let labelled = format!("{}:x;$!{{N;bx}};s/\\n/+/g{}", "{".repeat(depth), "}".repeat(depth));
 		let (code, capture) = crate::host::run_util::<Sed>(&[&labelled], "a\nb\nc\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "a+b+c\n"), "{}", capture.err());

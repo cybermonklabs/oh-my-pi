@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { executeShell } from "../native/index.js";
+import { runInChild } from "./builtin-child";
 
 // The bash tool's shell runs `sed` as a builtin. Each expectation below is
 // the bytes GNU sed 4.9 writes on stdout, and the status it exits with, for
@@ -225,6 +226,10 @@ describe("builtin sed: how many addresses a command takes", () => {
 		// Regressed: "} doesn't want any addresses" for both; GNU first refuses a `}` that closes no block.
 		["echo a | sed '1}' 2>&1", error(char(2), "unexpected `}'"), 1],
 		["echo a | sed -n '{p;1}' 2>&1", error(char(5), "`}' doesn't want any addresses"), 1],
+		// Regressed: after `!` the `}` no longer closed its block, so the script was "unmatched `{'".
+		["echo a | sed -n '{p;!}' 2>&1", "a\n", 0],
+		// A `!}` that closes no block is refused as a bare `}` is.
+		["echo a | sed -n '!}' 2>&1", error(char(2), "unexpected `}'"), 1],
 	]);
 });
 
@@ -304,30 +309,6 @@ describe("builtin sed: the pattern dialect shared with grep", () => {
 	]);
 });
 
-/**
- * Runs `command` in the builtin shell of a child process, which a crash of
- * the builtin ends alone, with stdout sent to `out`. Returns the child's own
- * exit status (0 when it lived to report), the builtin's, and the output.
- */
-async function runInChild(command: string): Promise<{ child: number; exitCode: number; output: Buffer }> {
-	const addon = path.join(import.meta.dir, "../native/index.js");
-	const script = path.join(dir, "child.mjs");
-	await fs.writeFile(
-		script,
-		[
-			`import { executeShell } from ${JSON.stringify(addon)};`,
-			`const command = ${JSON.stringify(`{ ${command}\n} >out 2>/dev/null`)};`,
-			`const result = await executeShell({ command, cwd: ${JSON.stringify(dir)} }, () => {});`,
-			"console.log(result.exitCode);",
-		].join("\n"),
-	);
-	await fs.rm(path.join(dir, "out"), { force: true });
-	const shell = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
-	const [stdout, child] = await Promise.all([new Response(shell.stdout).text(), shell.exited]);
-	const output = await fs.readFile(path.join(dir, "out")).catch(() => Buffer.alloc(0));
-	return { child, exitCode: Number(stdout), output };
-}
-
 describe("builtin sed: a pattern of groups nested past the engine's limit", () => {
 	// GNU sed 4.9 itself crashes on this pattern (exit 139), so the
 	// expectation is the builtin's own refusal: an invalid regex, exit 1, and
@@ -336,7 +317,7 @@ describe("builtin sed: a pattern of groups nested past the engine's limit", () =
 		// Regressed: splitting the pattern into its branches recurses once a group, so 100,000 nested groups with a `|` overflow the stack, which aborts the whole process, the bash tool's host with it.
 		const depth = 100_000;
 		await fs.writeFile(path.join(dir, "deep.sed"), `s/${"(".repeat(depth)}a|b${")".repeat(depth)}/X/\n`);
-		expect(await runInChild("echo a | sed -E -f deep.sed")).toEqual({
+		expect(await runInChild(dir, "echo a | sed -E -f deep.sed")).toEqual({
 			child: 0,
 			exitCode: 1,
 			output: Buffer.alloc(0),
@@ -350,7 +331,7 @@ describe("builtin sed: blocks nested 100,000 deep", () => {
 	it("are run, and the process lives on", async () => {
 		// Regressed: compiling the blocks recursed once a block, so the stack overflowed, which aborts the whole process.
 		await fs.writeFile(path.join(dir, "blocks.sed"), `${"{".repeat(100_000)}p${"}".repeat(100_000)}\n`);
-		expect(await runInChild("echo a | sed -n -f blocks.sed")).toEqual({
+		expect(await runInChild(dir, "echo a | sed -n -f blocks.sed")).toEqual({
 			child: 0,
 			exitCode: 0,
 			output: Buffer.from("a\n"),
@@ -360,7 +341,7 @@ describe("builtin sed: blocks nested 100,000 deep", () => {
 	it("left unclosed are refused with exit 1, and the process lives on", async () => {
 		// Regressed: the same before the unmatched `{` is reported.
 		await fs.writeFile(path.join(dir, "open.sed"), `${"{".repeat(100_000)}p\n`);
-		expect(await runInChild("echo a | sed -n -f open.sed")).toEqual({
+		expect(await runInChild(dir, "echo a | sed -n -f open.sed")).toEqual({
 			child: 0,
 			exitCode: 1,
 			output: Buffer.alloc(0),

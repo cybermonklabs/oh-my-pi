@@ -3054,11 +3054,10 @@ fn consumes_separate_value(token: &str) -> bool {
 		if long.is_empty() || long.contains('=') {
 			return false;
 		}
-		// clap infers unambiguous long-option prefixes; `--follow` requires
-		// `=` for its value and never consumes the next token.
-		return ["lines", "bytes", "pid", "sleep-interval", "max-unchanged-stats"]
-			.iter()
-			.any(|name| name.starts_with(long));
+		// The options of the table that take the next argument (`--lines`,
+		// `--bytes`, `--pid`, `--sleep-interval`, `--max-unchanged-stats`);
+		// `--follow` requires `=` for its value and never consumes it.
+		return OPTIONS.long_option(long).is_some_and(|option| option.takes_value);
 	}
 	let Some(cluster) = token.strip_prefix('-') else {
 		return false;

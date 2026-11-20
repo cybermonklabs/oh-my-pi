@@ -1561,7 +1561,9 @@ mod tests {
 		let (code, _, err) = run_simple(&["cd"], "definitely-missing-dir\n").await;
 		assert_eq!(code, 123);
 		assert!(err.contains("cd:"), "got: {err:?}");
-		assert!(!err.contains("could not be run"), "got: {err:?}");
+		// xargs' own report of a command it could not run names it after
+		// `xargs: `; the shell's diagnostic does not.
+		assert!(!err.contains("xargs: cd"), "got: {err:?}");
 	}
 
 	#[tokio::test]

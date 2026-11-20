@@ -5598,18 +5598,9 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 			.find(|arg| arg.get_short() == Some(char::from(short)))
 			.map(takes_value)
 	};
-	// Mirrors clap's `infer_long_args`: an exact name wins, else a unique prefix.
-	let long_takes_value = |name: &str| {
-		let exact = app.get_arguments().find(|arg| arg.get_long() == Some(name));
-		let arg = exact.or_else(|| {
-			let mut prefixed = app
-				.get_arguments()
-				.filter(|arg| arg.get_long().is_some_and(|long| long.starts_with(name)));
-			let first = prefixed.next();
-			if prefixed.next().is_none() { first } else { None }
-		});
-		arg.is_some_and(takes_value)
-	};
+	// The arguments are written out by their full names already
+	// ([`OptionTable::spell_out_all`]), so the table names each one.
+	let long_takes_value = |name: &str| OPTIONS.long_option(name).is_some_and(|option| option.takes_value);
 
 	let mut out = Vec::with_capacity(argv.len() + 1);
 	let mut args = argv.into_iter();

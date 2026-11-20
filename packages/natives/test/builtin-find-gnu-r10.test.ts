@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { executeShell } from "../native/index.js";
+import { runInChild } from "./builtin-child";
 
 // The bash tool's shell runs `find` as a builtin. Each expectation below is
 // the bytes GNU find 4.10 writes on stdout, and the status it exits with, for
@@ -20,43 +21,19 @@ afterAll(async () => {
 	await fs.rm(dir, { recursive: true, force: true });
 });
 
-/**
- * Runs `command` in the builtin shell of a child process, which a crash of
- * the builtin ends alone, with stdout sent to `out`. Returns the child's own
- * exit status (0 when it lived to report), the builtin's, and the output.
- */
-async function runInChild(command: string): Promise<{ child: number; exitCode: number; output: Buffer }> {
-	const addon = path.join(import.meta.dir, "../native/index.js");
-	const script = path.join(dir, "child.mjs");
-	await fs.writeFile(
-		script,
-		[
-			`import { executeShell } from ${JSON.stringify(addon)};`,
-			`const command = ${JSON.stringify(`{ ${command}\n} >out 2>/dev/null`)};`,
-			`const result = await executeShell({ command, cwd: ${JSON.stringify(dir)} }, () => {});`,
-			"console.log(result.exitCode);",
-		].join("\n"),
-	);
-	await fs.rm(path.join(dir, "out"), { force: true });
-	const shell = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
-	const [stdout, child] = await Promise.all([new Response(shell.stdout).text(), shell.exited]);
-	const output = await fs.readFile(path.join(dir, "out")).catch(() => Buffer.alloc(0));
-	return { child, exitCode: Number(stdout), output };
-}
-
 describe("builtin find: parentheses nested 10,000 deep", () => {
 	const depth = 10_000;
 
 	it("are read, and the process lives on", async () => {
 		// Regressed: reading the expression recursed once a `(`, so the stack overflowed (from 1,000 deep), which aborts the whole process, the bash tool's host with it.
 		const command = `find . ${"\\( ".repeat(depth)}-name f${" \\)".repeat(depth)}`;
-		expect(await runInChild(command)).toEqual({ child: 0, exitCode: 0, output: Buffer.from("./f\n") });
+		expect(await runInChild(dir, command)).toEqual({ child: 0, exitCode: 0, output: Buffer.from("./f\n") });
 	}, 60_000);
 
 	it("left unclosed are refused with exit 1, and the process lives on", async () => {
 		// Regressed: the same before the missing `)` is reported.
 		const command = `find . ${"\\( ".repeat(depth)}-name f`;
-		expect(await runInChild(command)).toEqual({ child: 0, exitCode: 1, output: Buffer.alloc(0) });
+		expect(await runInChild(dir, command)).toEqual({ child: 0, exitCode: 1, output: Buffer.alloc(0) });
 	}, 60_000);
 });
 
@@ -86,7 +63,51 @@ describe("builtin find: a command -exec cannot run, or a signal kills", () => {
 		// Regressed: a command killed by a signal was not reported.
 		[exec("-exec ./xkill {} \\;"), "find: ‘./xkill’ terminated by signal 9\n", 0],
 		[exec("-exec ./xkill {} +"), "find: ‘./xkill’ terminated by signal 9\n", 1],
+		// Regressed: a script whose interpreter is missing ran in the shell, which wrote its own "bad interpreter" message; GNU's execvp fails with ENOENT.
+		[
+			`printf '#!/nonexistent/sh\\n' >badint; chmod +x badint; ${exec("-exec ./badint {} \\;")}`,
+			"find: ‘./badint’: No such file or directory\n",
+			0,
+		],
 	])("%s", async (command, output, exitCode) => {
 		expect(await run(command)).toEqual({ output, exitCode });
+	});
+});
+
+/**
+ * Runs `-execdir` on the start point `start`, with a command that prints its
+ * `{}` only where it runs in the directory `start` names: `.` here, or `sub`
+ * with `inside`.
+ */
+const execdir = (start: string, end = "\\;", inside = "") =>
+	`mkdir -p sub/inner; find ${start} -maxdepth 0 -execdir sh -c '[ "$PWD" = "$0" ] && echo "$@"' "$PWD${inside}" {} ${end} 2>&1`;
+
+describe("builtin find: -execdir on a start point", () => {
+	it.each([
+		// Regressed: a start point ran in the parent of the directory its operand names; GNU splits the operand as written.
+		[execdir("."), "./.\n", 0],
+		[execdir("./"), "././\n", 0],
+		[execdir("sub/"), "./sub/\n", 0],
+		[execdir(".", "+"), "./.\n", 0],
+		[execdir("sub/.", "\\;", "/sub"), "./.\n", 0],
+		// A start point with a directory before its name already ran there.
+		[execdir("sub/inner", "\\;", "/sub"), "./inner\n", 0],
+		// Regressed: `./noexec` was looked for in the parent, "No such file or directory".
+		[exec("-execdir ./noexec {} \\;"), "find: ‘./noexec’: Permission denied\n", 0],
+	])("%s", async (command, output, exitCode) => {
+		expect(await run(command)).toEqual({ output, exitCode });
+	});
+});
+
+describe("builtin find: a start point that is missing", () => {
+	it.each([
+		// Regressed: `Error: /abs/path/nosuch: No such file or directory (os error 2)`; GNU names the operand as given, in the locale's quotes.
+		["find nosuch 2>&1", "find: ‘nosuch’: No such file or directory\n", 1],
+		["LC_ALL=C find nosuch 2>&1", "find: 'nosuch': No such file or directory\n", 1],
+		// The walk goes on to the next start point. Its stderr goes to a file of its own: with `2>&1`, find, cat and
+		// grep deliver stdout before stderr (`cat nosuch abc 2>&1` prints `a b c` first), where GNU keeps write order.
+		["find nosuch . -maxdepth 0 2>err; echo $?; cat err", ".\n1\nfind: ‘nosuch’: No such file or directory\n", 0],
+	])("%s", async (command, output, exitCode) => {
+		expect(await run(`export LC_ALL=C.UTF-8; ${command}`)).toEqual({ output, exitCode });
 	});
 });

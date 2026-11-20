@@ -43,6 +43,18 @@ describe("builtin xargs: a command it cannot run, or that exits 255", () => {
 		[xargs("sh -c 'exit 255'"), "xargs: sh: exited with status 255; aborting\n", 124],
 		// Nothing has the name: already as GNU.
 		[xargs("nosuch"), "xargs: nosuch: No such file or directory\n", 127],
+		// Regressed: a script whose interpreter is missing ran in the shell, which wrote its own "bad interpreter" message and exited 126, so xargs exited 123; GNU's execvp fails with ENOENT.
+		[
+			`printf '#!/nonexistent/sh\\n' >badint; chmod +x badint; ${xargs("./badint")}`,
+			"xargs: ./badint: No such file or directory\n",
+			127,
+		],
+		// Regressed: the same for an interpreter that cannot be executed: EACCES.
+		[
+			`printf '#!/etc/passwd\\n' >badint2; chmod +x badint2; ${xargs("./badint2")}`,
+			"xargs: ./badint2: Permission denied\n",
+			126,
+		],
 	])("%s", async (command, output, exitCode) => {
 		expect(await run(command)).toEqual({ output, exitCode });
 	});

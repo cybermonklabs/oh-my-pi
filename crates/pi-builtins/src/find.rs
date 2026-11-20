@@ -564,33 +564,65 @@ pub mod matchers {
 		/// ‘./cmd’ terminated by signal 9`), quoted as GNU quotes in the
 		/// locale: `'nosuch'` outside a UTF-8 one.
 		fn exec_succeeded(host: &mut Host, name: &str, outcome: io::Result<CommandStatus>) -> bool {
-			let (open, close) = if crate::locale::ctype_is_utf8(host) { ('‘', '’') } else { ('\'', '\'') };
 			match outcome {
-				Ok(status) => {
-					if let CommandStatus::Signaled(signal) = status {
-						let _ = writeln!(host.stderr, "find: {open}{name}{close} terminated by signal {signal}");
-					}
-					status.success()
+				Ok(CommandStatus::Signaled(signal)) => {
+					let name = super::super::quoted(host, name);
+					let _ = writeln!(host.stderr, "find: {name} terminated by signal {signal}");
+					false
 				},
+				Ok(status) => status.success(),
 				Err(error) => {
-					let _ = writeln!(host.stderr, "find: {open}{name}{close}: {}", run_strerror(&error));
+					let name = super::super::quoted(host, name);
+					let _ = writeln!(host.stderr, "find: {name}: {}", run_strerror(&error));
 					false
 				},
 			}
 		}
 
-		/// `{}` replacement for `-execdir`: the entry name relative to its parent.
-		fn execdir_arg(path: &Path) -> PathBuf {
+		/// A start point split as GNU find splits its operand for `-execdir`,
+		/// as written: the directory before its last name (`.` where it has
+		/// none) and that name with any trailing `/`. `None` below the start
+		/// points, for `/`, and for an operand that is not UTF-8.
+		fn split_start(entry: &WalkEntry) -> Option<(&str, &str)> {
+			if entry.depth() != 0 {
+				return None;
+			}
+			let operand = entry.display_path().to_str()?;
+			let trimmed = operand.trim_end_matches('/');
+			if trimmed.is_empty() {
+				return None;
+			}
+			Some(match trimmed.rfind('/') {
+				Some(slash) => (&operand[..slash.max(1)], &operand[slash + 1..]),
+				None => (".", operand),
+			})
+		}
+
+		/// `{}` replacement for `-execdir`: the entry name relative to its
+		/// parent, and for a start point its last name as written: `find .
+		/// -execdir` passes `./.`, `find sub/ -execdir` `./sub/`.
+		fn execdir_arg(entry: &WalkEntry) -> PathBuf {
+			if let Some((_, name)) = split_start(entry) {
+				return PathBuf::from(format!("./{name}"));
+			}
+			let path = entry.path();
 			match pi_vfs::file_name(path) {
 				Some(name) => Path::new(".").join(name),
 				None => Path::new(".").join(path),
 			}
 		}
 
-		/// Working directory for running `-execdir` on `path`; `None` keeps the
-		/// current directory. Provider directories are fine: builtins run there,
-		/// and the shell refuses external programs with its own diagnostic.
-		fn execdir_dir(path: &Path) -> Option<&Path> {
+		/// Working directory for running `-execdir` on `entry`; `None` keeps the
+		/// current directory. A start point runs in the directory its operand
+		/// names, as in GNU find: `find . -execdir` in `.`, `find sub/inner
+		/// -execdir` in `sub`. Provider directories are fine: builtins run
+		/// there, and the shell refuses external programs with its own
+		/// diagnostic.
+		pub(crate) fn execdir_dir(entry: &WalkEntry) -> Option<&Path> {
+			if let Some((dir, _)) = split_start(entry) {
+				return Some(Path::new(dir));
+			}
+			let path = entry.path();
 			match pi_vfs::parent_path(path) {
 				// Root paths like "/" have no parent.  Run them from the root to match GNU
 				// find.
@@ -639,7 +671,7 @@ pub mod matchers {
 		impl Matcher for SingleExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info.path())
+					execdir_arg(file_info)
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -656,7 +688,7 @@ pub mod matchers {
 				// shell's; `-execdir` moves to the entry's parent.
 				let mut command = ShellCommand::new(argv);
 				if self.exec_in_parent_dir
-					&& let Some(dir) = execdir_dir(file_info.path())
+					&& let Some(dir) = execdir_dir(file_info)
 				{
 					command = command.current_dir(dir);
 				}
@@ -739,7 +771,7 @@ pub mod matchers {
 		impl Matcher for MultiExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info.path())
+					execdir_arg(file_info)
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -755,7 +787,7 @@ pub mod matchers {
 				};
 				if let Some(mut full) = full {
 					if self.exec_in_parent_dir
-						&& let Some(dir) = execdir_dir(file_info.path())
+						&& let Some(dir) = execdir_dir(file_info)
 					{
 						full.current_dir(dir);
 					}
@@ -4986,8 +5018,14 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};
 
-use crate::host::{AsyncUtility, Host, matches_parser};
+use crate::host::{AsyncUtility, Host, matches_parser, strip_errno};
 use matchers::{Follow, WalkEntry};
+
+/// `name` in the quotes GNU findutils 4.10 puts around a name in a
+/// diagnostic: `‘name’` in a UTF-8 locale, `'name'` elsewhere.
+fn quoted(host: &Host, name: &str) -> String {
+	if crate::locale::ctype_is_utf8(host) { format!("‘{name}’") } else { format!("'{name}'") }
+}
 
 pub struct Config {
 	same_file_system:  bool,
@@ -5155,7 +5193,9 @@ async fn apply_find_entry(
 
 	// Allocated only when the directory changes, not for every entry. Every
 	// path comes from one walk, so the same directory is spelled the same.
-	let new_dir = pi_vfs::parent_path(entry.path());
+	// `-execdir ... +` runs a batch in the directory of its entries, where
+	// a start point names its own (see `execdir_dir`).
+	let new_dir = matchers::exec::execdir_dir(&entry);
 	if new_dir.map(Path::as_os_str) != current_dir.as_deref().map(Path::as_os_str) {
 		if let Some(dir) = current_dir.take() {
 			matcher.finished_dir(dir.as_path(), &mut matcher_io).await;
@@ -5227,9 +5267,12 @@ async fn process_dir_walk_request(
 	let mut ret = 0;
 	let tree_options = find_tree_options(config);
 	match pi_walker::walk::Tree::new(&layer, resolved_root, &tree_options).await {
-		Err(pi_walker::walk::WalkError::Root { path, error }) => {
+		// GNU names the start point as given: `find nosuch` is `find:
+		// ‘nosuch’: No such file or directory`, exit 1.
+		Err(pi_walker::walk::WalkError::Root { error, .. }) => {
 			ret = 1;
-			let _ = writeln!(host.stderr, "Error: {}: {error}", path.display());
+			let name = quoted(host, &operand.to_string_lossy());
+			let _ = writeln!(host.stderr, "find: {name}: {}", strip_errno(&error));
 		},
 		Ok(mut tree) => {
 			let mut pace = host.output_pace();

@@ -362,7 +362,7 @@ impl Lookup {
 			.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
 		let cwd = command.dir().unwrap_or(&self.cwd);
 		if has_separator(name) {
-			return match executable(&cwd.join(name)) {
+			return match executable(&cwd.join(name), cwd) {
 				Some(true) => Ok(Program::Path(cwd.join(name))),
 				Some(false) => Err(io::ErrorKind::PermissionDenied.into()),
 				None => Err(io::ErrorKind::NotFound.into()),
@@ -384,7 +384,7 @@ impl Lookup {
 		let mut denied = false;
 		for dir in std::env::split_paths(OsStr::new(path)) {
 			let candidate = cwd.join(dir).join(name);
-			match executable(&candidate) {
+			match executable(&candidate, cwd) {
 				Some(true) => return Ok(Program::Path(candidate)),
 				Some(false) => denied = true,
 				None => {},
@@ -413,19 +413,46 @@ fn has_separator(name: &OsStr) -> bool {
 	bytes.contains(&b'/') || (cfg!(windows) && bytes.contains(&b'\\'))
 }
 
-/// `Some(true)` for an executable file at `path`, `Some(false)` for anything
-/// else there, `None` for nothing. `execve` of a directory fails with
-/// `EACCES`, which GNU's xargs and find report as "Permission denied":
-/// `echo a | xargs ./dir` is `xargs: ./dir: Permission denied`, status 126.
+/// How `execve` of `path` fares, as GNU's xargs, find and env report it:
+/// `Some(true)` where it runs, `Some(false)` where it fails with `EACCES`
+/// ("Permission denied"), `None` where it fails with `ENOENT` ("No such
+/// file or directory"). A directory, or a file without execute permission,
+/// is `EACCES`: `echo a | xargs ./dir` is `xargs: ./dir: Permission
+/// denied`, status 126. A script fails as its `#!` interpreter, resolved
+/// from `cwd`, does: one that is missing is `ENOENT`, `echo a | xargs
+/// ./script` is `xargs: ./script: No such file or directory`, status 127.
 #[cfg(unix)]
-fn executable(path: &Path) -> Option<bool> {
+fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
-	let meta = std::fs::metadata(path).ok()?;
-	Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+	let runs = |path: &Path| {
+		let meta = std::fs::metadata(path).ok()?;
+		Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+	};
+	if runs(path)? {
+		return interpreter(path).map_or(Some(true), |interpreter| runs(&cwd.join(interpreter)));
+	}
+	Some(false)
+}
+
+/// The interpreter a `#!` line at the start of the file at `path` names, as
+/// the kernel reads it: the first word after `#!`, in the first 256 bytes.
+/// `None` for a file that has no such line or cannot be read.
+#[cfg(unix)]
+fn interpreter(path: &Path) -> Option<PathBuf> {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let mut head = [0; 256];
+	let len = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+	let line = head[..len].strip_prefix(b"#!")?;
+	let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+	let blank = |b: &u8| matches!(b, b' ' | b'\t');
+	let start = line.iter().position(|b| !blank(b))?;
+	let word = &line[start..];
+	let end = word.iter().position(|b| blank(b) || *b == 0).unwrap_or(word.len());
+	Some(PathBuf::from(OsStr::from_bytes(&word[..end])))
 }
 
 #[cfg(not(unix))]
-fn executable(path: &Path) -> Option<bool> {
+fn executable(path: &Path, _cwd: &Path) -> Option<bool> {
 	(path.is_file() || path.with_extension("exe").is_file()).then_some(true)
 }
 
@@ -447,5 +474,32 @@ mod tests {
 		assert!(!is_name("1x"));
 		assert!(!is_name("a-b"));
 		assert!(!is_name(""));
+	}
+
+	/// Each answer is how `execve` fails, which GNU findutils 4.10's xargs
+	/// and find report: `None` "No such file or directory" (127),
+	/// `Some(false)` "Permission denied" (126).
+	#[cfg(unix)]
+	#[test]
+	fn executable_answers_as_execve_fails() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let cwd = dir.path();
+		let write = |name: &str, text: &str, mode: u32| {
+			let file = cwd.join(name);
+			std::fs::write(&file, text).expect("write");
+			std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+			file
+		};
+		assert_eq!(executable(&cwd.join("missing"), cwd), None);
+		// A directory cannot be executed.
+		assert_eq!(executable(cwd, cwd), Some(false));
+		assert_eq!(executable(&write("plain", "x\n", 0o644), cwd), Some(false));
+		assert_eq!(executable(&write("binary", "\x7fELF", 0o755), cwd), Some(true));
+		assert_eq!(executable(&write("script", "#!/bin/sh\necho hi\n", 0o755), cwd), Some(true));
+		// A script fails as its interpreter does: missing, or not executable
+		// (`#!/etc/passwd`), here named from `cwd`.
+		assert_eq!(executable(&write("lost", "#! /nonexistent/sh -e\n", 0o755), cwd), None);
+		assert_eq!(executable(&write("denied", "#!plain\n", 0o755), cwd), Some(false));
 	}
 }
