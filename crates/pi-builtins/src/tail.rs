@@ -42,6 +42,9 @@ mod args {
 		pub const MAX_UNCHANGED_STATS: &str = "max-unchanged-stats";
 		pub const ARG_FILES: &str = "files";
 		pub const PRESUME_INPUT_PIPE: &str = "-presume-input-pipe"; // NOTE: three hyphens is correct
+		/// The long name of [`PRESUME_INPUT_PIPE`], whose alias, the id, has
+		/// the third dash GNU tail 9.7 spells it with.
+		pub const PRESUME_INPUT_PIPE_LONG: &str = "presume-input-pipe";
 		pub const DEBUG: &str = "debug";
 		pub const REVERSE: &str = "reverse";
 		pub const BLOCKS: &str = "blocks";
@@ -485,7 +488,7 @@ mod args {
 			)
 			.arg(
 				Arg::new(options::PRESUME_INPUT_PIPE)
-					.long("presume-input-pipe")
+					.long(options::PRESUME_INPUT_PIPE_LONG)
 					.alias(options::PRESUME_INPUT_PIPE)
 					.hide(true)
 					.action(ArgAction::SetTrue),
@@ -3046,35 +3049,6 @@ pub(crate) fn map_output_error(error: io::Error) -> TailError {
 	error.into()
 }
 
-/// True when `token` is an option that takes its value from the *next* argv
-/// token, so that value must never be mistaken for an obsolete `-N`/`+N` form
-/// (e.g. the `+5` in `tail -n +5 file`).
-fn consumes_separate_value(token: &str) -> bool {
-	if let Some(long) = token.strip_prefix("--") {
-		if long.is_empty() || long.contains('=') {
-			return false;
-		}
-		// The options of the table that take the next argument (`--lines`,
-		// `--bytes`, `--pid`, `--sleep-interval`, `--max-unchanged-stats`);
-		// `--follow` requires `=` for its value and never consumes it.
-		return OPTIONS.long_option(long).is_some_and(|option| option.takes_value);
-	}
-	let Some(cluster) = token.strip_prefix('-') else {
-		return false;
-	};
-	let mut chars = cluster.chars();
-	while let Some(c) = chars.next() {
-		match c {
-			// Value-taking shorts: a trailing `-n`/`-c`/`-s` consumes the next
-			// token; anything after them in the cluster is an attached value.
-			'n' | 'c' | 's' => return chars.next().is_none(),
-			'q' | 'v' | 'z' | 'f' | 'F' | 'r' | 'b' => {},
-			_ => return false,
-		}
-	}
-	false
-}
-
 /// Rewrites every obsolete `-N[bcl][f]` / `+N[bcl][f]` token (before `--`)
 /// into modern options, wherever it appears among flags and operands: GNU/BSD
 /// accept `tail -20 f1 f2`, `tail -f -5 file`, and `tail -5 -q file`.
@@ -3133,7 +3107,9 @@ fn rewrite_tail_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
 			}
 		}
 		if bytes.len() > 1 && bytes[0] == b'-' {
-			skip_value = consumes_separate_value(&token);
+			// An option that takes the next argument as its value (`-n` of
+			// `tail -n +5 file`), which is then no obsolete `+N` form.
+			skip_value = OPTIONS.value_follows(&token);
 		} else {
 			has_operand = true;
 		}
@@ -3162,7 +3138,7 @@ matches_parser!(Tail, args::uu_app);
 /// also begin `--presume-input-pipe` and `--reverse`.
 static OPTIONS: LazyLock<OptionTable> = LazyLock::new(|| {
 	OptionTable::new(args::uu_app(), &[
-		"presume-input-pipe",
+		args::options::PRESUME_INPUT_PIPE_LONG,
 		args::options::REVERSE,
 		args::options::USE_POLLING,
 		args::options::DEBUG,

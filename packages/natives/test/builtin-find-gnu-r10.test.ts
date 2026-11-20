@@ -37,6 +37,24 @@ describe("builtin find: parentheses nested 10,000 deep", () => {
 	}, 60_000);
 });
 
+describe("builtin find: an expression that keeps a level for each of 100,000 parentheses", () => {
+	// GNU find 4.10 reads such a nest 10,000 deep, and does not finish one
+	// 50,000 deep within 120 seconds. Evaluating the tree recurses once a
+	// level, so the builtin refuses one deeper than 1,000 levels: its own
+	// message, exit 1, and no output.
+	const depth = 100_000;
+
+	it.each(["! \\( ", "-true \\( "])(
+		"opened by `%s` is refused with exit 1, and the process lives on",
+		async open => {
+			// Regressed: the tree was read, then evaluating it overflowed the stack, which aborts the whole process.
+			const command = `find . ${open.repeat(depth)}-name f${" \\)".repeat(depth)}`;
+			expect(await runInChild(dir, command)).toEqual({ child: 0, exitCode: 1, output: Buffer.alloc(0) });
+		},
+		60_000,
+	);
+});
+
 /**
  * Runs `command` in the builtin shell with stdout sent to a file, whose bytes
  * are returned with the shell's exit status.
@@ -104,8 +122,8 @@ describe("builtin find: a start point that is missing", () => {
 		// Regressed: `Error: /abs/path/nosuch: No such file or directory (os error 2)`; GNU names the operand as given, in the locale's quotes.
 		["find nosuch 2>&1", "find: ‘nosuch’: No such file or directory\n", 1],
 		["LC_ALL=C find nosuch 2>&1", "find: 'nosuch': No such file or directory\n", 1],
-		// The walk goes on to the next start point. Its stderr goes to a file of its own: with `2>&1`, find, cat and
-		// grep deliver stdout before stderr (`cat nosuch abc 2>&1` prints `a b c` first), where GNU keeps write order.
+		// The walk goes on to the next start point, and the status is 1. Its stderr goes to a file of its own, read
+		// after the status.
 		["find nosuch . -maxdepth 0 2>err; echo $?; cat err", ".\n1\nfind: ‘nosuch’: No such file or directory\n", 0],
 	])("%s", async (command, output, exitCode) => {
 		expect(await run(`export LC_ALL=C.UTF-8; ${command}`)).toEqual({ output, exitCode });

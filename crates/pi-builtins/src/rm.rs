@@ -896,6 +896,9 @@ static OPT_RECURSIVE: &str = "recursive";
 static OPT_VERBOSE: &str = "verbose";
 const OPT_PROGRESS: &str = "progress";
 static PRESUME_INPUT_TTY: &str = "-presume-input-tty";
+/// The long name of `PRESUME_INPUT_TTY`, whose alias, the id, has the third
+/// dash GNU rm 9.7 spells it with.
+const OPT_PRESUME_INPUT_TTY: &str = "presume-input-tty";
 
 static ARG_FILES: &str = "files";
 
@@ -909,7 +912,7 @@ matches_parser!(Rm, uu_app);
 /// The long options `rm` has and GNU rm 9.7 does not, or hides behind a
 /// third dash (`---presume-input-tty`): GNU reads `--p`, `--pr` and `--pres`
 /// as `--preserve-root`, where each also begins one of these.
-const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = [OPT_PROGRESS, "presume-input-tty"];
+const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = [OPT_PROGRESS, OPT_PRESUME_INPUT_TTY];
 
 /// The options `rm` accepts.
 static OPTIONS: LazyLock<OptionTable> =
@@ -1125,7 +1128,7 @@ pub fn uu_app() -> Command {
 		// hyphens. Therefore it supports 3 leading hyphens.
 		.arg(
 			Arg::new(PRESUME_INPUT_TTY)
-				.long("presume-input-tty")
+				.long(OPT_PRESUME_INPUT_TTY)
 				.alias(PRESUME_INPUT_TTY)
 				.hide(true)
 				.action(ArgAction::SetTrue),

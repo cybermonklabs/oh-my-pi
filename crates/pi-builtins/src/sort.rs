@@ -5591,12 +5591,13 @@ impl clap::Parser for Sort {
 /// `--`, and the separate value of an option such as `-o` are left untouched.
 fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 	let app = uu_app();
-	let takes_value =
-		|arg: &Arg| arg.get_action().takes_values() && !arg.is_require_equals_set();
+	// Whether the short option `short` takes a value, by the table's rule;
+	// `None` where sort has no such option.
 	let short_takes_value = |short: u8| {
+		let short = char::from(short);
 		app.get_arguments()
-			.find(|arg| arg.get_short() == Some(char::from(short)))
-			.map(takes_value)
+			.any(|arg| arg.get_short() == Some(short))
+			.then(|| OPTIONS.short_valued.contains(&short))
 	};
 	// The arguments are written out by their full names already
 	// ([`OptionTable::spell_out_all`]), so the table names each one.

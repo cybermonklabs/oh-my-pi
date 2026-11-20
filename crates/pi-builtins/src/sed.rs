@@ -70,8 +70,6 @@ pub struct ProcessingContext {
 	pub input_name:           String,
 	/// Current input line number
 	pub line_number:          usize,
-	/// True if this is the last address of a range
-	pub last_address:         bool,
 	/// True if the line read is the last line
 	pub last_line:            bool,
 	/// True if the file is the last file of the ones specified
@@ -131,7 +129,7 @@ pub enum Address {
 	Line(usize),       // Specific line
 	RelLine(usize),    // Relative line
 	Last,              // Last line
-	StepMatch(usize),  // Lines matching specified step from first
+	Step(usize, usize), // `first~step`: line `first` and every `step`th line after it
 	StepEnd(usize),    // Range ending at specified step from first
 }
 
@@ -483,6 +481,10 @@ pub struct Command {
 	pub addr2:      Option<Address>,              // End address
 	pub non_select: bool,                         // True if '!'
 	pub start_line: Option<usize>,                // Start line number (or None if unlatched)
+	/// Whether a range whose first address is a line number has ended, so
+	/// it starts no more until the next file under `-s` (GNU's
+	/// `RANGE_CLOSED`): it starts on the first line at or past that number.
+	pub range_ended: bool,
 	pub data:       CommandData,                  // Command-specific data
 	pub next:       Option<Rc<RefCell<Command>>>, // Pointer to next command
 	pub location:   ScriptLocation,               // Command's definition location
@@ -504,6 +506,7 @@ impl Command {
 			addr2: None,
 			non_select: false,
 			start_line: None,
+			range_ended: false,
 			data: CommandData::None,
 			next: None,
 			location,
@@ -1183,11 +1186,7 @@ fn compile_address_range(
 
 	line.eat_spaces();
 	if !line.eol() && is_address_char(line.current()) {
-		let addr1 = compile_address(lines, line, context)?;
-		is_line0 = matches!(addr1, Address::Line(0));
-		let is_line = matches!(addr1, Address::Line(_));
-		cmd.addr1 = Some(addr1);
-		n_addr += 1;
+		let mut addr1 = compile_address(lines, line, context)?;
 
 		// GNU sed 4.9 reads a `~` after a line number, outside `--posix`, as
 		// a step, `first~step`, and the digits after it, none being a step
@@ -1195,16 +1194,24 @@ fn compile_address_range(
 		// line 1. After any other address, or under `--posix`, the `~` is a
 		// command: `sed '$~p'` is "unknown command: `~'".
 		line.eat_spaces();
-		if is_line && !context.posix && !line.eol() && line.current() == '~' {
+		if let Address::Line(first) = addr1
+			&& !context.posix
+			&& !line.eol()
+			&& line.current() == '~'
+		{
 			line.advance();
 			line.eat_spaces();
 			let step = parse_number(lines, line)?.unwrap_or(0);
-			// `first~step` is one address, held as a range that starts at
-			// `first`: `sed '1~2q'` is accepted, as `q` takes one address.
+			// `first~step` is one address, which GNU tests on each line:
+			// `sed '1~2q'` is accepted, as `q` takes one address, and
+			// `sed -n '2~3,+1p'` is a range that starts at each of its lines.
 			if step > 0 {
-				cmd.addr2 = Some(Address::StepMatch(step));
+				addr1 = Address::Step(first, step);
 			}
 		}
+		is_line0 = matches!(addr1, Address::Line(0));
+		cmd.addr1 = Some(addr1);
+		n_addr += 1;
 	}
 
 	line.eat_spaces();
@@ -1790,9 +1797,8 @@ pub fn compile_subst_flags(
 				if sandbox {
 					return compilation_error(lines, line, ERR_SANDBOX);
 				}
-				let location = lines.locate(line);
 				let path = read_file_path(lines, line)?;
-				subst.write_file = Some(NamedWriter::new(path, paths, location)?);
+				subst.write_file = Some(NamedWriter::new(path, paths)?);
 				return Ok(()); // 'w' is the last flag allowed
 			},
 
@@ -1857,6 +1863,21 @@ fn compile_empty_command(
 	Ok(CommandHandling::Continue)
 }
 
+/// Compile a comment after a `!`, which GNU sed 4.9 reads as a comment: `sed
+/// '!#foo'` changes nothing. After an address it is refused (see
+/// `get_verified_cmd_spec`); anywhere else `compile_sequence` skips it.
+fn compile_comment_command(
+	_lines: &mut ScriptLineProvider,
+	line: &mut ScriptCharProvider,
+	_cmd: &mut Command,
+	_context: &mut ProcessingContext,
+) -> SedResult<CommandHandling> {
+	while !line.eol() {
+		line.advance();
+	}
+	Ok(CommandHandling::Continue)
+}
+
 // Handles r
 fn compile_read_file_command(
 	lines: &mut ScriptLineProvider,
@@ -1883,9 +1904,8 @@ fn compile_write_file_command(
 	if context.sandbox {
 		return compilation_error(lines, line, ERR_SANDBOX);
 	}
-	let location = lines.locate(line);
 	let path = read_file_path(lines, line)?;
-	cmd.data = CommandData::NamedWriter(NamedWriter::new(path, &context.paths, location)?);
+	cmd.data = CommandData::NamedWriter(NamedWriter::new(path, &context.paths)?);
 	Ok(CommandHandling::Continue)
 }
 
@@ -2129,10 +2149,12 @@ fn get_verified_cmd_spec(
 
 	// `}` checks its own addresses (see `compile_end_group_command`).
 	if n_addr > cmd_spec.n_addr && ch != '}' {
-		let message = if cmd_spec.n_addr == 0 {
-			format!("{ch} doesn't want any addresses")
-		} else {
-			"command only uses one address".to_owned()
+		let message = match (ch, cmd_spec.n_addr) {
+			// GNU sed 4.9: `sed '1#foo'` is "-e expression #1, char 2:
+			// comments don't accept any addresses".
+			('#', _) => "comments don't accept any addresses".to_owned(),
+			(_, 0) => format!("{ch} doesn't want any addresses"),
+			_ => "command only uses one address".to_owned(),
 		};
 		return compilation_error(lines, line, message);
 	}
@@ -2151,6 +2173,7 @@ fn get_cmd_spec(
 		'!' => Ok(CommandSpec { n_addr: 2, handler: compile_negation_command }),
 		'=' => Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_empty_command }),
 		':' => Ok(CommandSpec { n_addr: 0, handler: compile_label_command }),
+		'#' => Ok(CommandSpec { n_addr: 0, handler: compile_comment_command }),
 		'{' => Ok(CommandSpec { n_addr: 2, handler: compile_block_command }),
 		'}' => Ok(CommandSpec { n_addr: 0, handler: compile_end_group_command }),
 		'a' | 'i' => {
@@ -2594,10 +2617,10 @@ mod tests {
 		let mut cmd = Rc::new(RefCell::new(Command::default()));
 		let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
-		// `first~step` is one address to GNU sed, held as a range.
+		// `first~step` is one address to GNU sed, which a range may start.
 		assert_eq!(n_addr, 1);
-		assert!(matches!(cmd.borrow().addr1, Some(Address::Line(0))));
-		assert!(matches!(cmd.borrow().addr2, Some(Address::StepMatch(2))));
+		assert!(matches!(cmd.borrow().addr1, Some(Address::Step(0, 2))));
+		assert!(cmd.borrow().addr2.is_none());
 	}
 
 	#[test]
@@ -5167,17 +5190,6 @@ pub fn script_end_error<T>(script_end: &ScriptLocation, msg: impl ToString) -> S
 	Err(SedError::new(1, format!("{}: {}", script_end.described_by_line(), msg.to_string())))
 }
 
-/// Fails with a runtime error at the command location.
-pub fn runtime_error<T>(location: &ScriptLocation, msg: impl ToString) -> SedResult<T> {
-	Err(SedError::new(
-		2,
-		format!(
-			"{}:{}:{}: error: {}",
-			location.input_name, location.line_number, location.column_number, msg.to_string()
-		),
-	))
-}
-
 /// Fails with a runtime error including command and input locations.
 pub fn input_runtime_error<T>(
 	location: &ScriptLocation,
@@ -5261,6 +5273,13 @@ pub fn line_text(line: Vec<u8>) -> (String, bool) {
 		Ok(text) => (text, false),
 		Err(error) => (byte_text(error.as_bytes()), true),
 	}
+}
+
+/// A file name as sed holds it in an error message: its text where it is
+/// UTF-8, else its byte text, whose bytes `Sed::run` writes, as GNU sed
+/// writes the name: `sed -f $'n\xff'` is "file n\377 line 1: ...".
+pub fn name_text(name: &std::ffi::OsStr) -> String {
+	line_text(crate::host::os_bytes_lossy(name).into_owned()).0
 }
 
 /// Appends `text`, byte text when `bytes`, to `content`, byte text when
@@ -8693,13 +8712,10 @@ use std::{cell::RefCell, io::BufWriter, path::PathBuf, rc::Rc};
 
 use crate::openfile::{DescriptorPath, STDERR_FD, STDOUT_FD};
 use pi_vfs::{File, OpenOptions};
-use crate::host::{Host, ShellPaths};
+use crate::host::{Host, ShellPaths, strip_errno};
 use crate::sed::fast_io::{IOChunk, OutputBuffer, write_record};
 
-use uucore::display::Quotable;
-use crate::sed::error_handling::SedResult;
-
-use crate::sed::error_handling::{ScriptLocation, runtime_error};
+use crate::sed::error_handling::{SedError, SedResult};
 
 thread_local! {
 	 /// Global list of all writers that should be flushed at shutdown
@@ -8726,7 +8742,6 @@ pub struct NamedWriter {
 	/// The file name as the script spelled it.
 	pub path:        PathBuf,
 	target:          Target,
-	location:        ScriptLocation,
 	/// Whether the line last written here lacked its delimiter, which the
 	/// next one written here gets first. GNU sed keeps this for each `w` file
 	/// apart from sed's own output, `w /dev/stdout` too: `printf 'a' | sed
@@ -8734,16 +8749,19 @@ pub struct NamedWriter {
 	missing_newline: bool,
 }
 
+/// A failure to open, write or close a `w` file, which GNU sed 4.9 reports
+/// without a script position and exits 4 for: `sed 'w /nonexistent/x'` is
+/// "couldn't open file /nonexistent/x: No such file or directory".
+fn file_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> SedError {
+	SedError::new(4, format!("{what} {}: {}", path.display(), strip_errno(error)))
+}
+
 impl NamedWriter {
 	/// Create a new writer, truncate the file, and register it for flushing.
 	///
 	/// `paths` resolves `path` the way the shell would open it and supplies
 	/// the filesystem that opens it.
-	pub fn new(
-		path: PathBuf,
-		paths: &ShellPaths,
-		location: ScriptLocation,
-	) -> SedResult<Rc<RefCell<Self>>> {
+	pub fn new(path: PathBuf, paths: &ShellPaths) -> SedResult<Rc<RefCell<Self>>> {
 		let target = match DescriptorPath::parse(&path) {
 			Some(DescriptorPath::Fd(STDOUT_FD)) => Target::Stdout,
 			Some(DescriptorPath::Fd(STDERR_FD)) => Target::Stderr,
@@ -8754,16 +8772,12 @@ impl NamedWriter {
 						paths.resolve(&path),
 						OpenOptions::new().create(true).write(true).truncate(true),
 					)
-					.map_err(|e| {
-						runtime_error::<()>(&location, format!("creating file {}: {}", path.quote(), e))
-							.unwrap_err()
-					})?;
+					.map_err(|e| file_error("couldn't open file", &path, &e))?;
 				Target::File(BufWriter::new(file))
 			},
 		};
 
-		let writer =
-			Rc::new(RefCell::new(NamedWriter { path, target, location, missing_newline: false }));
+		let writer = Rc::new(RefCell::new(NamedWriter { path, target, missing_newline: false }));
 
 		FLUSH_LIST.with(|list| list.borrow_mut().push(Rc::clone(&writer)));
 		Ok(writer)
@@ -8793,10 +8807,10 @@ impl NamedWriter {
 			Target::Stderr => write_record(&mut host.stderr, record, missing, delimiter),
 			Target::Closed => Err(std::io::Error::other("file already closed")),
 		};
-		result.map_err(|e| {
-			runtime_error::<()>(&self.location, format!("writing to file {}: {e}", self.path.quote()))
-				.unwrap_err()
-		})
+		// GNU sed writes each line apart, and names the item it failed to
+		// write: `sed 'w /dev/full'` on a long input is "couldn't write 1
+		// item to /dev/full: No space left on device".
+		result.map_err(|e| file_error("couldn't write 1 item to", &self.path, &e))
 	}
 
 	/// Flush the writer and close its file, returning a descriptive error.
@@ -8811,13 +8825,14 @@ impl NamedWriter {
 				return Ok(());
 			},
 		};
-		writer.into_inner().map_err(|e| e.into_error()).and_then(File::close).map_err(|e| {
-			runtime_error::<()>(
-				&self.location,
-				format!("writing to file {}: {}", self.path.quote(), e),
-			)
-			.unwrap_err()
-		})
+		// GNU sed names the file `<unknown>` where it fails to flush it at
+		// its end ("couldn't flush <unknown>: No space left on device");
+		// this names it.
+		writer
+			.into_inner()
+			.map_err(|e| e.into_error())
+			.and_then(File::close)
+			.map_err(|e| file_error("couldn't flush", &self.path, &e))
 	}
 }
 
@@ -8905,6 +8920,11 @@ fn match_address(
 
 		Address::Line(lineno) => Ok(context.line_number == *lineno),
 
+		Address::Step(first, step) => {
+			let linenum = context.line_number;
+			Ok(linenum >= *first && (linenum - first).is_multiple_of(*step))
+		},
+
 		Address::Last => is_last_line(reader, context),
 
 		_ => panic!("invalid address type in match_address"),
@@ -8940,29 +8960,28 @@ fn applies(
 	} else if let Some(addr2) = &command.addr2 {
 		// Two addresses
 		if let Some(start) = command.start_line {
-			// Range is already latched active.
-			match addr2 {
+			// Range is already latched active. As in GNU sed 4.9, a range
+			// ends on the line its second address names, or, where the
+			// command did not see that line (`3d;2,4p`), on the first line
+			// after it, which a line number leaves out and `+N` or `~N`
+			// selects: `seq 5 | sed -n '3d;2,3p'` prints `2`, and `seq 5 |
+			// sed -n '3d;2,+1p'` prints `2` and `4`.
+			let selected = match addr2 {
 				Address::RelLine(n) => {
-					if linenum - start > *n {
+					if linenum - start >= *n {
 						command.start_line = None;
-						Ok(false)
-					} else {
-						Ok(true)
 					}
+					Ok(true)
 				},
 				Address::Line(n) => {
-					// Special case: already ended
-					if linenum > *n {
+					if linenum >= *n {
 						command.start_line = None;
-						Ok(false)
-					} else {
-						Ok(true)
 					}
+					Ok(linenum <= *n)
 				},
-				Address::StepMatch(step) => Ok((linenum - start).is_multiple_of(*step)),
 				Address::StepEnd(step) => {
-					// Inclusive end on multiple of step
-					if linenum.is_multiple_of(*step) {
+					// The first multiple of `step` past the first line.
+					if linenum >= (start / step + 1) * step {
 						command.start_line = None;
 					}
 					Ok(true)
@@ -8970,28 +8989,52 @@ fn applies(
 				_ => {
 					if match_address(addr2, reader, pattern, context, &command.location)? {
 						command.start_line = None;
-						context.last_address = true;
 					}
 					Ok(true)
 				},
-			}
+			};
+			let first_is_line = matches!(command.addr1, Some(Address::Line(_)));
+			command.range_ended |= first_is_line && command.start_line.is_none();
+			selected
 		} else if let Some(addr1) = &command.addr1 {
-			// See if latch must start.
-			if match_address(addr1, reader, pattern, context, &command.location)? {
-				match addr2 {
-					Address::Line(n) if linenum >= *n => {
-						context.last_address = true;
-					},
-					// `addr,+0` and `addr,~0` are the first line alone, as in
-					// GNU sed 4.9: `seq 5 | sed -n '2,~0p'` prints `2`.
-					Address::RelLine(0) | Address::StepEnd(0) => {
-						context.last_address = true;
-					},
-					_ => {
-						command.start_line = Some(linenum);
-					},
+			// See if latch must start. GNU sed 4.9 starts a range whose first
+			// address is a line number on the first line at or past it that
+			// the command sees, once: `seq 10 | sed -n '$!N;3,5p'` prints `3`
+			// and `4`, from the line 4 `N` read.
+			let starts = match addr1 {
+				Address::Line(first) => !command.range_ended && linenum >= *first,
+				_ => match_address(addr1, reader, pattern, context, &command.location)?,
+			};
+			if starts {
+				// A range whose second address is a line number it has
+				// reached is its first line alone, and so are `addr,+0` and
+				// `addr,~0`, as in GNU sed 4.9: `seq 5 | sed -n '2,~0p'`
+				// prints `2`.
+				let ends_here = match addr2 {
+					Address::Line(n) => linenum >= *n,
+					Address::RelLine(n) | Address::StepEnd(n) => *n == 0,
+					_ => false,
+				};
+				if ends_here {
+					match (addr1, addr2) {
+						// Started past the line it names, at or past a second
+						// line number, the range selects that line alone where
+						// it is the second line's: `seq 10 | sed -n
+						// '$!N;3,4p'` prints `3` and `4`, `$!N;3,3p` nothing.
+						(Address::Line(first), Address::Line(last)) => {
+							command.range_ended = true;
+							Ok(linenum == *first || linenum <= *last)
+						},
+						(Address::Line(_), _) => {
+							command.range_ended = true;
+							Ok(true)
+						},
+						_ => Ok(true),
+					}
+				} else {
+					command.start_line = Some(linenum);
+					Ok(true)
 				}
-				Ok(true)
 			} else {
 				Ok(false)
 			}
@@ -9508,15 +9551,15 @@ fn process_file(
 					break;
 				},
 				'c' => {
-					// At range end replace pattern space with text and
-					// start the next cycle. `first~step` is one address,
-					// whose every line is replaced, as in GNU sed.
+					// Delete the pattern space, write the text unless the
+					// command's range is still active, and start the next
+					// cycle, as GNU sed 4.9 does: the text replaces a range
+					// on its last line (`seq 5 | sed '3,4c\X'` is `1 2 X 5`),
+					// never where the input ends first (`seq 5 | sed
+					// '3,9c\X'` is `1 2`), and each line of an address that
+					// is no range, `first~step` included.
 					pattern.clear();
-					if command.addr2.is_none()
-						|| matches!(command.addr2, Some(Address::StepMatch(_)))
-						|| context.last_address
-						|| reader.last_line()?
-					{
+					if command.start_line.is_none() {
 						let text = extract_variant!(command, Text);
 						output.write_str(text.as_ref())?;
 					}
@@ -9694,8 +9737,8 @@ fn process_file(
 					let (pat_content, _) = pattern.fields_mut();
 					pat_content.clear();
 				},
-				':' => {
-					// Branch target; do nothing.
+				':' | '#' => {
+					// Branch target or comment; do nothing.
 				},
 				'=' => {
 					// Output current line number.
@@ -9723,11 +9766,12 @@ fn process_file(
 	Ok(())
 }
 
-/// Mark all address ranges non-active (and 0-starting ones as active).
+/// Mark all address ranges non-active (and 0-starting ones as active), and
+/// let each start again.
 fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
 	for cmd_rc in range_commands.iter() {
 		let mut cmd = cmd_rc.borrow_mut();
-
+		cmd.range_ended = false;
 		cmd.start_line =
             // Check for address-spec line 0 pre-latch extension.
             if let Some(addr1) = &cmd.addr1 && matches!(addr1, Address::Line(0)) {
@@ -9963,13 +10007,12 @@ use std::{
 	rc::Rc,
 };
 
-use uucore::display::Quotable;
-
 use crate::openfile::OpenFile;
 use crate::{
-	host::ShellPaths,
+	host::{ShellPaths, strip_errno},
 	sed::{
-		error_handling::{IoContext, ScriptLocation, ScriptSource, SedResult},
+		error_handling::{ScriptLocation, ScriptSource, SedError, SedResult},
+		fast_io::name_text,
 		script_char_provider::ScriptCharProvider,
 	},
 };
@@ -10162,23 +10205,24 @@ impl ScriptLineProvider {
 				};
 			},
 			ScriptValue::PathVal(p) => {
-				self.place = Place::start(ScriptSource::File(Rc::from(p.to_string_lossy().as_ref())));
-				if p.to_string_lossy() == "-" {
+				let name = name_text(p.as_os_str());
+				self.place = Place::start(ScriptSource::File(Rc::from(name.as_str())));
+				if p.as_os_str() == "-" {
 					self.state = State::Active {
 						index:      next_index,
 						reader:     Box::new(BufReader::new(self.stdin.as_ref().expect("stdin stream missing").clone())),
 						input_name: "<stdin>".to_string(),
 					};
 				} else {
-					let file = self
-						.paths
-						.fs()
-						.open(self.paths.resolve(p))
-						.map_err_context(|| format!("error opening script file {}", p.quote()))?;
+					// GNU sed 4.9: `sed -f /nonexistent/s` is "couldn't open
+					// file /nonexistent/s: No such file or directory", exit 4.
+					let file = self.paths.fs().open(self.paths.resolve(p)).map_err(|e| {
+						SedError::new(4, format!("couldn't open file {name}: {}", strip_errno(&e)))
+					})?;
 					self.state = State::Active {
 						index:      next_index,
 						reader:     Box::new(BufReader::new(file)),
-						input_name: p.to_string_lossy().to_string(),
+						input_name: name,
 					};
 				}
 			},
@@ -10358,6 +10402,7 @@ use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::{
 	command::{ProcessingContext, StringSpace},
+	fast_io::write_text_bytes,
 	processor::process_all_files,
 	script_line_provider::ScriptValue,
 };
@@ -10597,7 +10642,6 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		// Other context
 		input_name:           "<stdin>".to_string(),
 		line_number:          0,
-		last_address:         false,
 		last_line:            false,
 		last_file:            false,
 		stop_processing:      false,
@@ -10638,7 +10682,12 @@ impl Utility for Sed {
 			Ok(()) => host.exit_code(),
 			Err(error) => {
 				let code = error.code();
-				host.error(error, if code == 0 { 1 } else { code });
+				// A name that is not UTF-8 is held in the message as byte
+				// text (see `fast_io::name_text`), whose bytes are written.
+				let _ = host.stderr.write_all(b"sed: ");
+				let _ = write_text_bytes(&mut host.stderr, &error.to_string(), true);
+				let _ = host.stderr.write_all(b"\n");
+				host.fail(if code == 0 { 1 } else { code });
 				host.exit_code()
 			}
 		}

@@ -71,6 +71,10 @@ describe("builtin grep: a pattern byte that is not UTF-8, in the C locale", () =
 		[String.raw`LC_ALL=C grep -o $'[\303]' u8`, "\xc3\n\xc3\n", 0],
 		[String.raw`LC_ALL=C grep -o $'f.\251' u8`, "f\xc3\xa9\n", 0],
 		[String.raw`LC_ALL=C grep -i -e $'\303' u8`, "caf\xc3\xa9\nna\xc3\xafve\n", 0],
+		// Regressed: a range's ends were checked as characters (the byte 0xC3 as one above `é`), "Invalid range end",
+		// exit 2; GNU reads the bytes C3 - C3 A9 as the range C3-C3 and the byte A9.
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C grep -c $'[\303-\303\251]'`, "1\n", 0],
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C grep -o $'[\303-\303\251]'`, "\xc3\n\xa9\n", 0],
 	]);
 });
 
@@ -89,6 +93,24 @@ describe("builtin grep: a pattern byte that is not UTF-8, in the C.UTF-8 locale"
 		[String.raw`LC_ALL=C.UTF-8 grep -o $'[\351-\377]' u8`, "\xc3\xa9\n\xc3\xaf\n", 0],
 		// PCRE2 refuses a pattern that is not UTF-8 ("UTF-8 error: 2 bytes missing at end").
 		[String.raw`LC_ALL=C.UTF-8 grep -P $'\351' u8`, "", 2],
+		// Regressed: a line that is not UTF-8 was read with the C locale's rule, where the byte is a member.
+		[String.raw`printf 'caf\351\nab\377c\n' | LC_ALL=C.UTF-8 grep -c $'[\351]'`, "0\n", 1],
+		[String.raw`printf 'caf\351\nab\377c\n' | LC_ALL=C.UTF-8 grep -c $'f[\351]'`, "0\n", 1],
+		[String.raw`printf 'caf\351\n' | LC_ALL=C.UTF-8 grep -c $'[\300-\377]'`, "0\n", 1],
+	]);
+});
+
+describe("builtin grep: a back-reference beside a pattern byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 counts 1: the byte 0xC3 starts `é`. PCRE2, which runs a
+	// back-reference, matches no such byte inside a character, so the
+	// builtin refuses the patterns, exit 2, rather than count 0.
+	cases([
+		// Regressed: counted 0, exit 1.
+		[
+			String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\1' 2>&1`,
+			"grep: a back-reference beside a pattern byte that is not UTF-8 is not supported in a UTF-8 locale\n",
+			2,
+		],
 	]);
 });
 
