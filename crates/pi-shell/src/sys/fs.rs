@@ -1494,13 +1494,37 @@ mod tests {
 
 		/// `mkfifo f; echo x > f & . f` in one engine thread: both ends live
 		/// on this thread, so neither read nor write may wait in the kernel.
+		///
+		/// The read open is pending until a writer opens. The write open is
+		/// pending too, unless the read open's helper already waits in its
+		/// `open`: a reader is then present and the write open completes at
+		/// once. Which one happens depends on when that thread runs, so both
+		/// are accepted; neither waits.
+		///
+		/// End of file comes when the last writer closes, which need not be
+		/// ours: a process that inherited a copy of the write end (one that
+		/// another thread forked meanwhile, which holds the copy until it
+		/// execs) keeps the FIFO open. Here a child holds such a copy across
+		/// our close: the read stays `Pending` while it lives, and the reader
+		/// is woken when it exits.
 		#[test]
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
+			use std::{
+				os::fd::{FromRawFd, OwnedFd},
+				process::{Command, Stdio},
+			};
+
 			let path = fifo();
 			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
-			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let w = match StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0) {
+				FsPoll::Ready(opened) => Err(opened.unwrap()),
+				FsPoll::Pending(p) => Ok(p),
+			};
 			let mut reader = finish(&mut r);
-			let mut writer = finish(&mut w);
+			let mut writer = match w {
+				Ok(mut p) => finish(&mut p),
+				Err(opened) => opened,
+			};
 			assert_eq!(reader.kind(), FileKind::Pipe);
 			let flag = Arc::new(Flag::default());
 			let waker = Waker::from(Arc::clone(&flag));
@@ -1536,7 +1560,28 @@ mod tests {
 				}
 			}
 			flag.wait("writer woken once space freed up");
+
+			let fd = writer.os_handle().expect("the write end's descriptor").0;
+			// SAFETY: `fd` is the writer's open descriptor; `dup` returns a new
+			// one, which `OwnedFd` then owns.
+			let copy = unsafe { libc::dup(i32::try_from(fd).unwrap()) };
+			assert!(copy >= 0, "dup: {}", io::Error::last_os_error());
+			// SAFETY: `copy` is a new descriptor nothing else owns.
+			let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+			let mut holder = Command::new("/bin/sh")
+				.args(["-c", "read _; exit 0"])
+				.stdin(Stdio::piped())
+				.stdout(Stdio::from(copy))
+				.spawn()
+				.expect("start a child holding a copy of the write end");
 			drop(writer);
+			assert!(
+				reader.poll_read(&mut cx, &mut buf).is_pending(),
+				"a writer is left: Pending, not end of file or a wait"
+			);
+			drop(holder.stdin.take());
+			assert!(holder.wait().expect("the child ends").success());
+			flag.wait("reader woken when the last writer closed");
 			assert!(
 				matches!(reader.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))),
 				"end of file after the writer closed"
