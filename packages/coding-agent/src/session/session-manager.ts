@@ -4495,8 +4495,9 @@ export class SessionManager {
 		// engine call-site cache holding the last visitor) can keep alive, and
 		// that scope must not keep the transcript alive once the manager lets go.
 		const interner = new LoadedValueInterner();
-		// The blobs every entry names, cold ones too, by hash with their MIME types (see the end of the pass).
-		const named = new Map<string, string | undefined>();
+		// The blobs every entry names, cold ones too, by hash with their MIME types (see the end of the pass); only
+		// the blob tier's pass reads them, so without a tier none are collected.
+		const named = this.#blobs.tier ? new Map<string, string | undefined>() : undefined;
 		const intake: {
 			entries: SessionEntry[];
 			index: SessionEntryIndex;
@@ -4569,7 +4570,7 @@ export class SessionManager {
 				intake.entries.push(entry);
 				intake.index.insert(entry);
 				// Before the entry can go cold: the blobs it names, which the open writes back and references.
-				collectBlobRefNames(entry, named);
+				if (named) collectBlobRefNames(entry, named);
 				if (this.#coldStoreEnabled && entry.type === "compaction") {
 					const keptStart = streamedKeptStart(intake.entries, entry, intake.cooled, id => intake.index.has(id));
 					for (; intake.cooled < keptStart; intake.cooled++) {
@@ -4619,8 +4620,7 @@ export class SessionManager {
 				intake.entries.filter(entry => !isColdEntry(entry)),
 				this.#blobs,
 				fork ? undefined : filePath,
-				named,
-				intake.entries,
+				{ collected: named, transcript: intake.entries },
 			);
 			if (intake.store && !intake.entries.some(isColdEntry)) {
 				intake.store.close();
@@ -5584,7 +5584,8 @@ export class SessionManager {
 		try {
 			await this.#closeLocked();
 		} finally {
-			// Also when the close fails early (a marker unlink that throws): nothing reads older entries after close.
+			// The close's writes read older entries from the store; nothing reads them after close, also when the
+			// close fails early (a marker unlink that throws).
 			this.#releaseColdStore();
 			// Closing gives up this process's ownership claim; a later write
 			// reclaims it. It goes last: until the final publish has run, the
@@ -5668,8 +5669,6 @@ export class SessionManager {
 				this.#closeOwesPublish = false;
 			}).catch(() => undefined);
 		}
-		// The writes above read older entries from the store; nothing reads them after close.
-		this.#releaseColdStore();
 		// After a terminal release the entries are gone, so a latched failure
 		// cannot be shown harmless.
 		if (this.#diskFailure && (this.#entriesReleased || !this.#allEntriesHandedToStorage())) throw this.#diskFailure;

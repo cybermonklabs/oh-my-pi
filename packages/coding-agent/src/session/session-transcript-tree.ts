@@ -97,19 +97,24 @@ async function copyTranscriptPass(storage: SessionStorage, from: string, to: str
 	let writer: SessionStorageWriter | undefined;
 	let head = "";
 	let batch = "";
+	// Just past the batch's last newline, 0 while it holds none. Only each new chunk is searched for it, so a line
+	// longer than a batch is not scanned again as each of its chunks arrives.
+	let cut = 0;
 	try {
 		for await (const chunk of transcriptByteChunks(from, storage)) {
 			writer ??= storage.openWriter(to, { flags: "w" });
 			const text = decoder.decode(chunk, { stream: true });
 			if (head.length < SESSION_TITLE_SLOT_BYTES) head += text.slice(0, SESSION_TITLE_SLOT_BYTES - head.length);
+			const newline = text.lastIndexOf("\n");
+			if (newline !== -1) cut = batch.length + newline + 1;
 			batch += text;
 			if (batch.length < LINE_STREAM_CHUNK) continue;
 			// Whole lines only: a store that records the blobs each append names (SQL storage's references) then
 			// finds every reference whole, as a reference never spans lines.
-			const cut = batch.lastIndexOf("\n") + 1;
 			if (cut === 0) continue;
 			await writer.append(batch.slice(0, cut));
 			batch = batch.slice(cut);
+			cut = 0;
 		}
 		writer ??= storage.openWriter(to, { flags: "w" });
 		batch += decoder.decode();

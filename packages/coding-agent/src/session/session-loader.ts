@@ -30,10 +30,10 @@ import {
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
 import {
-	activeBranch,
 	type CompactionEntry,
 	type FileEntry,
 	type RawFileEntry,
+	sessionEntryLeafId,
 	type SessionEntry,
 	type SessionHeader,
 } from "./session-entries";
@@ -1089,17 +1089,38 @@ function entriesForBlobResolution(entries: FileEntry[]): SessionEntry[] {
 /**
  * The newest compaction on the active branch, when it holds a snapcompact
  * archive: the one a rebuilt context draws frames from, its legacy truncated
- * frames repaired. Finding it reads only the entries' tree fields (`type`,
- * `id`, `parentId`, `activeLeafId`), which a cold entry keeps as data.
+ * frames repaired. The walk goes from the active leaf (as
+ * `resolveSessionLeafId` resolves it, headers skipped) up to the first
+ * compaction, and stops at a repeat, so a parent cycle cannot hold it.
+ * Finding it reads only the entries' tree fields (`type`, `id`, `parentId`,
+ * `activeLeafId`), which a cold entry keeps as data.
  */
 function activeSnapcompactCompaction(
-	entries: readonly SessionEntry[],
+	entries: readonly FileEntry[],
 ): { entry: CompactionEntry; archive: snapcompact.Archive } | undefined {
-	const compaction = activeBranch(entries).findLast((entry): entry is CompactionEntry => entry.type === "compaction");
-	if (!compaction) return undefined;
-	repairTruncatedSnapcompactFrames(compaction);
-	const archive = snapcompact.getPreservedArchive(compaction.preserveData);
-	return archive ? { entry: compaction, archive } : undefined;
+	const byId = new Map<string, SessionEntry>();
+	let leafId: string | null = null;
+	let selfSelectedId: string | null = null;
+	for (const entry of entries) {
+		if (entry.type === "session") continue;
+		byId.set(entry.id, entry);
+		leafId = sessionEntryLeafId(entry);
+		if (leafId === entry.id) selfSelectedId = entry.id;
+	}
+	// A captured leaf that no longer exists falls back to the newest self-selecting entry.
+	if (leafId !== null && !byId.has(leafId)) leafId = selfSelectedId;
+	const seen = new Set<string>();
+	let current = leafId === null ? undefined : byId.get(leafId);
+	while (current && !seen.has(current.id)) {
+		if (current.type === "compaction") {
+			repairTruncatedSnapcompactFrames(current);
+			const archive = snapcompact.getPreservedArchive(current.preserveData);
+			return archive ? { entry: current, archive } : undefined;
+		}
+		seen.add(current.id);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return undefined;
 }
 
 /**
@@ -1147,7 +1168,7 @@ async function restoreArchiveFrames(
  * machine lacks: a session resumed on another machine brings its frame
  * references but not the blob store that held them.
  */
-async function restoreSnapcompactFrames(entries: readonly SessionEntry[], blobStore: BlobStore): Promise<void> {
+async function restoreSnapcompactFrames(entries: readonly FileEntry[], blobStore: BlobStore): Promise<void> {
 	const active = activeSnapcompactCompaction(entries);
 	if (!active) return;
 	for (const archive of [active.archive, active.archive.withoutThinking?.archive]) {
@@ -1269,16 +1290,15 @@ export async function resolveBlobRefsInEntries(
 	entries: FileEntry[],
 	blobStore: BlobStore,
 	sessionPath?: string,
-	collected?: ReadonlyMap<string, string | undefined>,
-	transcript?: readonly FileEntry[],
+	options?: {
+		collected?: ReadonlyMap<string, string | undefined>;
+		transcript?: readonly FileEntry[];
+	},
 ): Promise<void> {
 	const sessionEntries = entriesForBlobResolution(entries);
-	await restoreTierBlobs(sessionEntries, blobStore, true, sessionPath, collected);
+	await restoreTierBlobs(sessionEntries, blobStore, true, sessionPath, options?.collected);
 	await resolveBlobRefs(sessionEntries, blobStore);
-	await restoreSnapcompactFrames(
-		transcript ? transcript.filter((entry): entry is SessionEntry => entry.type !== "session") : sessionEntries,
-		blobStore,
-	);
+	await restoreSnapcompactFrames(options?.transcript ?? sessionEntries, blobStore);
 }
 
 /**
