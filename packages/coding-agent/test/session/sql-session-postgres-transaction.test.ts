@@ -21,12 +21,14 @@
  *   `OMP_TEST_SQL_POSTGRES_URL` (the store's database, on PostgreSQL directly)
  *   and `OMP_TEST_SQL_POSTGRES_ADMIN_URL` (the same database, as a login that
  *   may alter the defaults of the store's login there: that login itself or a
- *   superuser) are set. Each reads the server when it runs, not when the file
- *   loads, and checks nothing, saying why, when the store's URL does not reach
- *   PostgreSQL directly (through a pooler such as PgBouncer a new connection
- *   can get a server connection that started with another default, and the
- *   store's reservation another server connection than the test's `SET`) or
- *   the server is older than PostgreSQL 17.
+ *   superuser) are set. The file then reads the store's server once, when it
+ *   loads, since Bun skips a case only on what it knows then. Both are skipped,
+ *   and the file logs why once, when the store's URL does not reach PostgreSQL
+ *   directly (through a pooler such as PgBouncer a new connection can get a
+ *   server connection that started with another default, and the store's
+ *   reservation another server connection than the test's `SET`) or the
+ *   server is older than PostgreSQL 17. A read no server answers fails these
+ *   two cases with its error, and every other case of the file still runs.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
@@ -1668,15 +1670,13 @@ function countingReservations(client: SQL): { client: SqlSessionStorageClient; r
 interface StoreServer {
 	/** The store's login in its database alone, as `ALTER ROLE` names it: the server may serve other databases. */
 	readonly target: string;
-	/** Why the server cases check nothing on this URL, when they do not. */
+	/** Why the server cases cannot use this URL, when they cannot: they are skipped. */
 	readonly unfit?: string;
 }
 
-/** Read by the first server case that runs, and shared with the other. */
-let storeServer: Promise<StoreServer> | undefined;
-
 async function readStoreServer(url: string): Promise<StoreServer> {
-	const sql = new SQL(url, { max: 1 });
+	// A server that never answers holds the file's load 5 s at most, well under the cases' 30 s.
+	const sql = new SQL(url, { max: 1, connectionTimeout: 5 });
 	try {
 		const direct = await reachesPostgresDirectly(sql, url);
 		const [where] = (await sql.unsafe(
@@ -1691,6 +1691,23 @@ async function readStoreServer(url: string): Promise<StoreServer> {
 		await sql.close();
 	}
 }
+
+/**
+ * The store's server, read once when the file loads and only when both URLs
+ * are set. A read no server answers keeps its error, which fails the two
+ * server cases alone: the file still loads and every other case runs.
+ */
+const storeServer: { readonly read: StoreServer } | { readonly failed: unknown } | undefined =
+	STORE_URL && ADMIN_URL
+		? await readStoreServer(STORE_URL).then(
+				read => ({ read }),
+				(failed: unknown) => ({ failed }),
+			)
+		: undefined;
+const unfit = storeServer && "read" in storeServer ? storeServer.read.unfit : undefined;
+if (unfit) console.log(`transaction_timeout cases skipped: ${unfit}`);
+/** Neither URL or one of them unset, or a server the cases cannot use. */
+const skipServerCases = !storeServer || unfit !== undefined;
 
 /** What a server case runs on: a store of {@link LeaseDb}'s tables that wrote {@link FILE}. */
 interface LeftTimeout {
@@ -1707,23 +1724,18 @@ interface LeftTimeout {
 /**
  * Run `check` on a store whose login's default `transaction_timeout` in its
  * database is `loginDefault` and whose one connection holds `left`, set with
- * `SET` as another client of a pool leaves it. When the store's URL does not
- * reach PostgreSQL 17 or later directly, log why and check nothing: Bun skips
- * a case only on what it knows when the file loads, and a server read then
- * fails the whole file when the server does not answer.
+ * `SET` as another client of a pool leaves it. It takes the server the file
+ * read when it loaded, and throws that read's error when no server answered.
  */
 async function withLeftTimeout(
 	loginDefault: string,
 	left: string,
 	check: (setup: LeftTimeout) => Promise<void>,
 ): Promise<void> {
+	if (!storeServer) throw new Error("set OMP_TEST_SQL_POSTGRES_URL and OMP_TEST_SQL_POSTGRES_ADMIN_URL");
+	if ("failed" in storeServer) throw storeServer.failed;
+	const { target } = storeServer.read;
 	const storeUrl = STORE_URL ?? "";
-	storeServer ??= readStoreServer(storeUrl);
-	const { target, unfit } = await storeServer;
-	if (unfit) {
-		console.log(`transaction_timeout case checks nothing: ${unfit}`);
-		return;
-	}
 	await using db = await openLeaseDb("postgres", storeUrl);
 	const admin = new SQL(ADMIN_URL ?? "", { max: 2 });
 	let client: SQL | undefined;
@@ -1774,7 +1786,7 @@ async function withLeftTimeout(
 }
 
 describe("on a PostgreSQL server", () => {
-	it.skipIf(!STORE_URL || !ADMIN_URL)(
+	it.skipIf(skipServerCases)(
 		"transaction_timeout: a left value shorter than a positive default ends no store transaction",
 		() =>
 			withLeftTimeout("10min", "1s", async ({ db, client, storage, lockRow }) => {
@@ -1804,7 +1816,7 @@ describe("on a PostgreSQL server", () => {
 		30_000,
 	);
 
-	it.skipIf(!STORE_URL || !ADMIN_URL)(
+	it.skipIf(skipServerCases)(
 		"transaction_timeout: a left value longer than a positive default leaves the default to end a store transaction",
 		() =>
 			withLeftTimeout("1s", "10min", async ({ db, storage, reservations, lockRow }) => {
