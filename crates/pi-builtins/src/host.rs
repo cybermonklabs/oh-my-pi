@@ -1551,6 +1551,11 @@ pub(crate) enum StreamWriter {
 	/// capture pipe): one buffer means diagnostics and output interleave in
 	/// exactly the order they were written.
 	Shared(Arc<Mutex<StreamWriter>>),
+	/// Stderr's handle onto the writer it shares with stdout: each write is
+	/// flushed at once with the output buffered before it, as glibc's `error`
+	/// flushes stdout and stderr is unbuffered. So a diagnostic also lands
+	/// ahead of output a utility then writes to the raw descriptor.
+	Diagnostics(Arc<Mutex<StreamWriter>>),
 	/// Memory-backed output of an async utility: writes append to a buffer
 	/// the host delivers asynchronously (see [`Host::flush_output`]).
 	Async(AsyncOut),
@@ -1585,8 +1590,18 @@ impl StreamWriter {
 		match self {
 			Self::Block(w) => w.get_ref().clone(),
 			Self::Line(w) => w.get_ref().clone(),
-			Self::Shared(shared) => shared.lock().dup_file(),
+			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().dup_file(),
 			Self::Async(out) => out.dup_file(),
+		}
+	}
+
+	/// Another handle onto this writer where it is shared by stdout and
+	/// stderr, with the same flush rule; `None` for a writer of its own.
+	pub fn share(&self) -> Option<Self> {
+		match self {
+			Self::Shared(shared) => Some(Self::Shared(Arc::clone(shared))),
+			Self::Diagnostics(shared) => Some(Self::Diagnostics(Arc::clone(shared))),
+			Self::Block(_) | Self::Line(_) | Self::Async(_) => None,
 		}
 	}
 
@@ -1596,7 +1611,7 @@ impl StreamWriter {
 		match self {
 			Self::Block(w) => w.get_ref().is_terminal(),
 			Self::Line(w) => w.get_ref().is_terminal(),
-			Self::Shared(shared) => shared.lock().is_terminal(),
+			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().is_terminal(),
 			Self::Async(out) => out.is_terminal(),
 		}
 	}
@@ -1608,6 +1623,12 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write(buf),
 			Self::Line(w) => w.write(buf),
 			Self::Shared(shared) => shared.lock().write(buf),
+			Self::Diagnostics(shared) => {
+				let mut shared = shared.lock();
+				let written = shared.write(buf)?;
+				shared.flush()?;
+				Ok(written)
+			},
 			Self::Async(out) => out.write(buf),
 		}
 	}
@@ -1616,7 +1637,7 @@ impl Write for StreamWriter {
 		match self {
 			Self::Block(w) => w.flush(),
 			Self::Line(w) => w.flush(),
-			Self::Shared(shared) => shared.lock().flush(),
+			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().flush(),
 			Self::Async(out) => out.flush(),
 		}
 	}
@@ -1626,6 +1647,12 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_vectored(bufs),
 			Self::Line(w) => w.write_vectored(bufs),
 			Self::Shared(shared) => shared.lock().write_vectored(bufs),
+			Self::Diagnostics(shared) => {
+				let mut shared = shared.lock();
+				let written = shared.write_vectored(bufs)?;
+				shared.flush()?;
+				Ok(written)
+			},
 			Self::Async(out) => out.write_vectored(bufs),
 		}
 	}
@@ -1641,6 +1668,11 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_all(buf),
 			Self::Line(w) => w.write_all(buf),
 			Self::Shared(shared) => shared.lock().write_all(buf),
+			Self::Diagnostics(shared) => {
+				let mut shared = shared.lock();
+				shared.write_all(buf)?;
+				shared.flush()
+			},
 			Self::Async(out) => out.write_all(buf),
 		}
 	}
@@ -1650,6 +1682,11 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_fmt(args),
 			Self::Line(w) => w.write_fmt(args),
 			Self::Shared(shared) => shared.lock().write_fmt(args),
+			Self::Diagnostics(shared) => {
+				let mut shared = shared.lock();
+				shared.write_fmt(args)?;
+				shared.flush()
+			},
 			Self::Async(out) => out.write_fmt(args),
 		}
 	}
@@ -2083,8 +2120,9 @@ pub struct Invocation {
 	/// The name the extra was invoked as: selects the extra and names it in
 	/// diagnostics (`sg` runs `ast-grep` and still says `sg`).
 	pub name:           String,
-	/// The arguments, `argv[0]` included.
-	pub argv:           Vec<String>,
+	/// The arguments, `argv[0]` included, as the shell has them: a byte that
+	/// is not UTF-8 stays itself (`cat $'\xff'` opens the file of that name).
+	pub argv:           Vec<OsString>,
 	/// The exported environment.
 	pub env:            HashMap<String, String>,
 	/// The shell's working directory, which relative paths resolve against.
@@ -2092,6 +2130,10 @@ pub struct Invocation {
 	/// Descriptors 0, 1, and 2; [`Fd::Closed`] reads as end of input and
 	/// discards writes.
 	pub stdio:          [Fd; 3],
+	/// Whether descriptors 1 and 2 are one open file (`2>&1`), which only the
+	/// caller can tell for a regular file: output and diagnostics then go
+	/// through one writer, in the order they are written.
+	pub stdout_is_stderr: bool,
 	/// Further open descriptors (`exec 3<…`, process substitution) by number,
 	/// reachable through `/dev/fd/N` paths.
 	pub fds:            Vec<(i32, Fd)>,
@@ -2113,13 +2155,14 @@ impl Invocation {
 	/// An invocation of `argv` (named by `argv[0]`) in `cwd` on `fs`, with no
 	/// environment, closed stdio, no cancellation, and no command runner.
 	#[must_use]
-	pub fn new(argv: Vec<String>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
+	pub fn new(argv: Vec<OsString>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
 		Self {
-			name: argv.first().cloned().unwrap_or_default(),
+			name: argv.first().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
 			argv,
 			env: HashMap::new(),
 			cwd,
 			stdio: [Fd::Closed, Fd::Closed, Fd::Closed],
+			stdout_is_stderr: false,
 			fds: Vec::new(),
 			fs,
 			cancel: None,
@@ -2131,13 +2174,26 @@ impl Invocation {
 	/// Opens the descriptors as shareable [`OpenFile`]s; `default_name` stands
 	/// in for an empty [`Invocation::name`].
 	pub(crate) fn open(self, default_name: &str) -> Opened {
-		let Self { name, argv, env, cwd, stdio, fds, fs, cancel, commands, reported_error } = self;
+		let Self {
+			name,
+			argv,
+			env,
+			cwd,
+			stdio,
+			stdout_is_stderr,
+			fds,
+			fs,
+			cancel,
+			commands,
+			reported_error,
+		} = self;
 		Opened {
 			name: if name.is_empty() { default_name.to_string() } else { name },
 			argv,
 			env,
 			cwd,
 			stdio: stdio.map(OpenFile::from_fd),
+			stdout_is_stderr,
 			fds: fds
 				.into_iter()
 				.filter_map(|(number, fd)| Some((number, OpenFile::from_fd(fd)?)))
@@ -2154,10 +2210,11 @@ impl Invocation {
 /// closed one.
 pub(crate) struct Opened {
 	pub name:           String,
-	pub argv:           Vec<String>,
+	pub argv:           Vec<OsString>,
 	pub env:            HashMap<String, String>,
 	pub cwd:            PathBuf,
 	pub stdio:          [Option<OpenFile>; 3],
+	pub stdout_is_stderr: bool,
 	pub fds:            Vec<(i32, OpenFile)>,
 	pub fs:             pi_vfs::Fs,
 	pub cancel:         Option<CancellationToken>,
@@ -2243,7 +2300,7 @@ struct Prepared<P> {
 /// failure).
 fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
 	let mut invocation = invocation.open(spec.name);
-	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
+	let argv = std::mem::take(&mut invocation.argv);
 	let [_, stdout, stderr] = &invocation.stdio;
 
 	let argv = match (spec.rewrite_argv)(argv) {
@@ -2256,6 +2313,12 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 
 	let parsed = match P::try_parse_from(&argv) {
 		Ok(parsed) => parsed,
+		// clap's text for an argument its parser reads as text but that is
+		// not UTF-8 names neither the utility nor the argument.
+		Err(err) if err.kind() == clap::error::ErrorKind::InvalidUtf8 => {
+			write_to(stderr.as_ref(), format_args!("{}", invalid_utf8(spec.name)));
+			return Err(spec.usage_error.into());
+		},
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
@@ -2465,7 +2528,13 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
-		name: invoked, env, stdio: [stdin, stdout, stderr_file], cancel: token, reported_error, ..
+		name: invoked,
+		env,
+		stdio: [stdin, stdout, stderr_file],
+		stdout_is_stderr,
+		cancel: token,
+		reported_error,
+		..
 	} = invocation;
 	let (stdin, stdout, stderr_file) = match (or_null(stdin), or_null(stdout), or_null(stderr_file)) {
 		(Ok(stdin), Ok(stdout), Ok(stderr_file)) => (stdin, stdout, stderr_file),
@@ -2501,12 +2570,15 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	// `2>&1` (and the default capture pipe): one shared writer keeps
 	// diagnostics and output in exact write order. It carries stdout output,
 	// so it takes the stdout guard: once the reader is gone every write fails
-	// and nothing is observable either way.
+	// and nothing is observable either way. A pipe is recognised by its
+	// identity; a regular file only by the caller, since `>f 2>f` opens two
+	// files on one inode whose offsets one writer would merge.
 	//
 	// An async utility's writers never touch a descriptor: they append to
 	// memory-backed `AsyncOut`s that the host drains asynchronously.
 	let mut async_out = None;
-	let (merged_out, stderr) = if stdout_destination.shares_with(&stderr_destination) {
+	let one_file = stdout_is_stderr || stdout_destination.shares_with(&stderr_destination);
+	let (merged_out, stderr) = if one_file {
 		if async_io {
 			let out = async_out_for(
 				stderr_file,
@@ -2521,7 +2593,7 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 			let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stdout, &sigpipe, &command_cancel);
 			let shared =
 				Arc::new(Mutex::new(StreamWriter::new(guarded, stderr_destination.regular_file)));
-			(Some(Arc::clone(&shared)), StreamWriter::Shared(shared))
+			(Some(Arc::clone(&shared)), StreamWriter::Diagnostics(shared))
 		}
 	} else if async_io {
 		let out = async_out_for(
@@ -2672,7 +2744,7 @@ impl ProcContext {
 		};
 		let (stdout, stderr) = match &invocation.stdio {
 			[_, Some(stdout), Some(stderr)]
-				if Destination::of(stdout).shares_with(&Destination::of(stderr)) =>
+				if invocation.stdout_is_stderr || Destination::of(stdout).shares_with(&Destination::of(stderr)) =>
 			{
 				let merged = out(stderr, GuardedStream::Stdout);
 				(Some(merged.clone()), Some(merged))
@@ -2804,9 +2876,21 @@ impl Write for ProcStream {
 /// status 141 for a closed reader and 1 otherwise.
 pub(crate) async fn run_process<P: Process>(invocation: Invocation) -> i32 {
 	let mut invocation = invocation.open("");
-	let argv = P::rewrite_argv(std::mem::take(&mut invocation.argv));
+	let argv = std::mem::take(&mut invocation.argv);
 	let context = ProcContext::from_invocation(invocation, P::USES_PATHS);
-	run_process_in::<P>(argv, &context).await
+	// A process builtin's parser reads text: an argument that is not UTF-8
+	// is refused, not read as some other one.
+	let Ok(argv) = argv.into_iter().map(OsString::into_string).collect::<Result<Vec<_>, _>>() else {
+		let _ = context.stderr().write_all(invalid_utf8(&context.command_name).as_bytes());
+		return drained_status(&context, INVALID_USAGE_EXIT_CODE).await;
+	};
+	run_process_in::<P>(P::rewrite_argv(argv), &context).await
+}
+
+/// The refusal of an argument that is not UTF-8 by the builtin `name`, whose
+/// parser reads that argument as text: `seq $'\xff'`.
+fn invalid_utf8(name: &str) -> String {
+	format!("{name}: invalid UTF-8 was detected in one or more arguments\n")
 }
 
 /// [`run_process`] against an existing context.
@@ -3269,7 +3353,7 @@ mod testing {
 			error.try_clone().expect("stderr"),
 		);
 		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(ToString::to_string).collect(),
+			argv.iter().map(OsString::from).collect(),
 			cwd.to_path_buf(),
 			pi_vfs::Fs::native(),
 		);
@@ -3303,7 +3387,7 @@ mod testing {
 		let output = tempfile::tempfile().expect("stdout file");
 		let error = tempfile::tempfile().expect("stderr file");
 		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(ToString::to_string).collect(),
+			argv.iter().map(OsString::from).collect(),
 			std::env::current_dir().expect("current dir"),
 			pi_vfs::Fs::native(),
 		);
@@ -3404,8 +3488,11 @@ mod testing {
 					if let (Some(argv0), Some(first)) = (argv0, argv.first_mut()) {
 						*first = argv0;
 					}
-					let mut invocation =
-						crate::extras::Invocation::new(argv, runner.cwd.clone(), pi_vfs::Fs::native());
+					let mut invocation = crate::extras::Invocation::new(
+						argv.iter().map(OsString::from).collect(),
+						runner.cwd.clone(),
+						pi_vfs::Fs::native(),
+					);
 					invocation.name = name;
 					invocation.env = runner.env.clone();
 					invocation.stdio = [

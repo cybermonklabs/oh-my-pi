@@ -230,6 +230,7 @@ pub async fn run(invocation: Invocation) -> i32 {
 #[cfg(test)]
 mod tests {
 	use std::{
+		ffi::OsString,
 		io::{PipeReader, PipeWriter, Read as _, Write as _},
 		time::Duration,
 	};
@@ -246,7 +247,7 @@ mod tests {
 		let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
 		let (stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe");
 		let mut invocation = Invocation::new(
-			argv.iter().map(ToString::to_string).collect(),
+			argv.iter().map(OsString::from).collect(),
 			std::env::current_dir().expect("current dir"),
 			pi_vfs::Fs::native(),
 		);
@@ -316,6 +317,41 @@ mod tests {
 		assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
 		let (code, _, err) = run_piped(&["sleep", "soon"], "").await;
 		assert_eq!((code, err.as_str()), (1, "sleep: invalid time interval 'soon'\n"));
+	}
+
+	/// `cat $'\xff'` opens the file of that name, as GNU's does: the argument
+	/// reaches the utility as its bytes.
+	#[cfg(all(unix, feature = "util.cat"))]
+	#[tokio::test]
+	async fn cat_opens_a_file_whose_name_is_not_utf8() {
+		use std::os::unix::ffi::OsStringExt as _;
+		let dir = tempfile::tempdir().expect("temp dir");
+		let name = OsString::from_vec(vec![0xff]);
+		std::fs::write(dir.path().join(&name), "x\n").expect("write file");
+		let (mut invocation, stdin, stdout, stderr) = piped(&["cat"]);
+		invocation.argv.push(name);
+		invocation.cwd = dir.path().to_path_buf();
+		drop(stdin);
+		let code = run(invocation).await;
+		assert_eq!((code, read_all(stdout), read_all(stderr)), (0, "x\n".to_owned(), String::new()));
+	}
+
+	/// A parser that reads an argument as text refuses one that is not UTF-8,
+	/// naming the builtin, where a lossy copy would be read as another
+	/// argument: a utility (`seq`, status 1) and a process builtin (`sleep`,
+	/// status 2) alike.
+	#[cfg(all(unix, feature = "util.seq", feature = "util.sleep"))]
+	#[tokio::test]
+	async fn a_text_parser_refuses_an_argument_that_is_not_utf8() {
+		use std::os::unix::ffi::OsStringExt as _;
+		for (name, status) in [("seq", 1), ("sleep", 2)] {
+			let (mut invocation, stdin, stdout, stderr) = piped(&[name]);
+			invocation.argv.push(OsString::from_vec(vec![0xff]));
+			drop(stdin);
+			let code = run(invocation).await;
+			let refusal = format!("{name}: invalid UTF-8 was detected in one or more arguments\n");
+			assert_eq!((code, read_all(stdout), read_all(stderr)), (status, String::new(), refusal), "{name}");
+		}
 	}
 
 	#[cfg(feature = "util.sleep")]
