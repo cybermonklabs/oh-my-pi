@@ -23,9 +23,32 @@ mod unix {
 	// lock, or call the shell: the CLI drains the bits at scheduler boundaries.
 	static PENDING: AtomicU64 = AtomicU64::new(0);
 
+	/// `PENDING`'s bit of signal `number`.
+	const fn bit(number: libc::c_int) -> u64 {
+		1 << (number - 1)
+	}
+
+	/// The fault signals. After one the kernel raised, the handler's return
+	/// runs the instruction that raised it again, so it comes again at once.
+	const FAULTS: u64 = bit(libc::SIGILL)
+		| bit(libc::SIGTRAP)
+		| bit(libc::SIGABRT)
+		| bit(libc::SIGBUS)
+		| bit(libc::SIGFPE)
+		| bit(libc::SIGSEGV)
+		| bit(libc::SIGSYS);
+
+	/// bash `termsig_sighandler`: the same fault signal again before the
+	/// shell handled it ends the process. Its default action comes back, so
+	/// a real fault, which repeats, ends the process the next time.
 	extern "C" fn on_signal(number: libc::c_int) {
 		if (1..=64).contains(&number) {
-			PENDING.fetch_or(1u64 << (number - 1), Ordering::Relaxed);
+			let mask = bit(number);
+			if PENDING.fetch_or(mask, Ordering::Relaxed) & mask & FAULTS != 0 {
+				// SAFETY: signal is async-signal-safe and takes a valid
+				// signal number and disposition.
+				unsafe { libc::signal(number, libc::SIG_DFL) };
+			}
 		}
 	}
 
@@ -103,6 +126,49 @@ mod unix {
 			] {
 				assert_eq!(ignored_from_status(status), None);
 			}
+		}
+
+		/// A real fault ends the process though the shell catches its signal
+		/// (bash's EXIT trap catches `SEGV`): the handler's return repeats the
+		/// fault, and the second delivery gets the default action back. The
+		/// fault runs in a child, this test binary again with `CHILD` set; the
+		/// bound starts at the fault, which comes as the child starts.
+		#[test]
+		fn a_real_fault_ends_the_process_though_its_signal_is_caught() {
+			const CHILD: &str = "PI_SHELL_SIGNALS_FAULT_CHILD";
+			const NAME: &str =
+				"process::signals::unix::tests::a_real_fault_ends_the_process_though_its_signal_is_caught";
+			if std::env::var_os(CHILD).is_some() {
+				let mut signals = Signals::default();
+				assert!(
+					signals
+						.set(Signal::Segv, Some(BStr::new(b"caught")))
+						.unwrap()
+				);
+				// SAFETY: none: a deliberate fault, a write to an unmapped address.
+				unsafe { ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
+				unreachable!("the write faults");
+			}
+			let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", NAME, "--nocapture"])
+				.env(CHILD, "1")
+				.stdout(std::process::Stdio::null())
+				.spawn()
+				.unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let status = loop {
+				if let Some(status) = child.try_wait().unwrap() {
+					break status;
+				}
+				if std::time::Instant::now() > deadline {
+					let _ = child.kill();
+					let _ = child.wait();
+					panic!("the fault repeats: the child still ran 30 s after it started");
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			};
+			use std::os::unix::process::ExitStatusExt as _;
+			assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}");
 		}
 	}
 
@@ -236,6 +302,12 @@ mod unix {
 		libc::SIGCONT,
 	];
 
+	/// Whether an embedding runtime hands `sig` over to the shell
+	/// ([`SHELL_SET`]): the shell may catch it by its own rules.
+	pub fn handed_over(sig: Signal) -> bool {
+		SHELL_SET.contains(&i32::from(sig.number(Platform::current())))
+	}
+
 	/// The dispositions an embedding runtime (Bun) installed for the
 	/// shell's signals, put back to `SIG_DFL` for the shell's run and
 	/// restored when dropped. Only [`SHELL_SET`] is touched: the runtime's
@@ -300,7 +372,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{RuntimeSignals, Signals};
+pub use unix::{RuntimeSignals, Signals, handed_over};
 
 /// The signal a standalone shell dies of (`run`).
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +425,13 @@ impl RuntimeSignals {
 	pub const fn reset() -> io::Result<Self> {
 		Ok(Self)
 	}
+}
+
+/// Off Unix an embedding runtime keeps no handlers of its own the shell
+/// could replace: every signal is handed over.
+#[cfg(not(unix))]
+pub const fn handed_over(_sig: crate::bash::Signal) -> bool {
+	true
 }
 
 /// Windows has no signals, only console control events: Ctrl-C

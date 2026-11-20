@@ -274,3 +274,63 @@ fn a_signal_the_host_keeps_ignored_has_its_trap_recorded_as_ignored() {
 		"TRAPUSR1: function\ndone\n"
 	);
 }
+
+/// A restore in a new process starts with default dispositions, so the root
+/// asks the host again for every signal's: a trap's, a zsh `TRAPNAL`
+/// function's, and those of the shell's own rules: zsh's `HUP` catch,
+/// bash's EXIT-trap catches, `QUIT` ignored.
+#[test]
+fn a_restore_asks_the_host_again_for_every_signals_disposition() {
+	use crate::{
+		bash::{
+			Budget, Cx, Engine, EngineConfig, MemStore, ModeId, RestoreOpts, Script, Shell, ShellInit,
+			Signal,
+		},
+		testkit::run::{Stop, advance},
+	};
+	let engine = Engine::new(EngineConfig::default());
+	let after_restore = |init: ShellInit, src: &str| {
+		let mut host = FakeHost::new();
+		let mut store = MemStore::new();
+		let mut shell =
+			Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, init).unwrap();
+		// Externalized while it runs: the traps are set, the EXIT trap not run.
+		let id = shell.submit(Script::command(format!("{src}; while :; do :; done").into_bytes()));
+		let budget = Budget { max_ops: 200, max_ns: u64::MAX };
+		assert_eq!(advance(&mut shell, &mut host, &mut store, id, budget), Stop::Yield);
+		shell
+			.externalize(&mut Cx { host: &mut host, store: &mut store })
+			.unwrap();
+		drop(shell);
+		let mut fresh = FakeHost::new();
+		let _restored = Shell::restore(
+			&engine,
+			&mut Cx { host: &mut fresh, store: &mut store },
+			RestoreOpts::default(),
+		)
+		.unwrap();
+		fresh
+			.asked
+			.into_iter()
+			.map(|(sig, action)| (sig, action.map(|a| a.to_string())))
+			.collect::<Vec<_>>()
+	};
+	let has = |asked: &[(Signal, Option<String>)], sig, action: &str| {
+		assert!(
+			asked.contains(&(sig, Some(action.to_owned()))),
+			"{sig:?} {action:?} not asked for: {asked:?}"
+		);
+	};
+	let zsh = ShellInit { mode: ModeId::Zsh, argv0: "zsh".into(), ..ShellInit::default() };
+	let asked = after_restore(zsh, "TRAPUSR1() print u; trap 'print t' TERM");
+	has(&asked, Signal::Hup, "caught");
+	has(&asked, Signal::Quit, "");
+	has(&asked, Signal::Usr1, "TRAPUSR1");
+	has(&asked, Signal::Term, "print t");
+	let asked = after_restore(ShellInit::default(), "trap 'echo x' EXIT; trap 'echo t' USR2");
+	has(&asked, Signal::Quit, "");
+	for sig in [Signal::Hup, Signal::Term, Signal::Usr1, Signal::Segv] {
+		has(&asked, sig, "caught");
+	}
+	has(&asked, Signal::Usr2, "echo t");
+}

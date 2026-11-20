@@ -311,6 +311,10 @@ pub struct FakeHost {
 	/// [`Host::set_signal_trap`](crate::bash::Host::set_signal_trap)
 	/// answers `false` for them, as for a signal ignored on entry.
 	pub fixed:   crate::bash::SigSet,
+	/// Every disposition the shell asked for
+	/// ([`Host::set_signal_trap`](crate::bash::Host::set_signal_trap)), in
+	/// order: the signal and the action (`None`: the default back).
+	pub asked:   Vec<(Signal, Option<BString>)>,
 }
 
 impl Default for FakeHost {
@@ -345,6 +349,7 @@ impl FakeHost {
 			child_opens: false,
 			logins:      None,
 			fixed:       crate::bash::SigSet::EMPTY,
+			asked:       Vec::new(),
 		}
 	}
 
@@ -737,7 +742,8 @@ impl crate::bash::Host for FakeHost {
 			.ok_or_else(|| io::ErrorKind::Unsupported.into())
 	}
 
-	fn set_signal_trap(&mut self, signal: Signal, _action: Option<&BStr>) -> io::Result<bool> {
+	fn set_signal_trap(&mut self, signal: Signal, action: Option<&BStr>) -> io::Result<bool> {
+		self.asked.push((signal, action.map(BString::from)));
 		Ok(!self.fixed.contains(signal))
 	}
 

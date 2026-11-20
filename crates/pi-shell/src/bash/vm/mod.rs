@@ -1703,61 +1703,6 @@ impl Shell {
 		k.root
 			.set_misc(cx.store, MiscKey::Umask, format!("{:04o}", cx.host.umask() & 0o7777));
 		k.root.set_positional(cx.store, init.args);
-		// The signals the root holds ignored while untrapped ([`untrapped`]):
-		// `QUIT` (bash "in all cases", zsh's `init_signals`), and in zsh the
-		// signals ignored on entry, until a trap for one is set or removed.
-		let held = if zsh {
-			cx.host.ignored_signals().with(crate::bash::Signal::Quit)
-		} else {
-			crate::bash::SigSet::EMPTY.with(crate::bash::Signal::Quit)
-		};
-		k.root.set_record(
-			cx.store,
-			KeyBuf::Misc(MiscKey::HeldIgnored),
-			Some(Record::Words(
-				held
-					.iter()
-					.map(|sig| BString::from(sig.to_string()))
-					.collect(),
-			)),
-		);
-		for sig in cx.host.ignored_signals().iter() {
-			// zsh `init_signals`: of the signals ignored on entry only `QUIT`
-			// is recorded as ignored (`ZSIG_IGNORED`), and any of them may be
-			// trapped.
-			if zsh {
-				cx.host.forget_ignored(sig);
-				if sig != crate::bash::Signal::Quit {
-					continue;
-				}
-				k.root.set_record(
-					cx.store,
-					KeyBuf::Misc(MiscKey::ZshEntryIgnored),
-					Some(Record::Words(vec![BString::from(sig.to_string())])),
-				);
-			}
-			k.root.set_record(
-				cx.store,
-				KeyBuf::Trap(crate::bash::store::TrapKey::Signal(sig)),
-				Some(Record::Trap { mode: init.mode, action: BString::default() }),
-			);
-		}
-		// The shell's own process ignores `QUIT` (an interactive shell's
-		// handlers come with `jobctl::init_io`); commands get it at its
-		// default. A zsh trap set or removed for it gives it its own
-		// disposition; bash keeps it ignored ([`builtins::trap`]). zsh
-		// catches `HUP` unless it was ignored on entry (`init_signals`:
-		// `zhandler`, which exits; [`untrapped`]).
-		if !init.interactive {
-			let _ = cx
-				.host
-				.set_signal_trap(crate::bash::Signal::Quit, Some(BStr::new(b"")));
-		}
-		if zsh && !held.contains(crate::bash::Signal::Hup) {
-			let _ = cx
-				.host
-				.set_signal_trap(crate::bash::Signal::Hup, Some(BStr::new(untrapped::CATCH)));
-		}
 		let vpid = k.vpid(cx.store);
 		if let Some(err) = k.root.take_fault() {
 			return Err(ShellError::Store(err));
@@ -1770,6 +1715,10 @@ impl Shell {
 		}
 		let mut root = Vproc::new(vpid, None, fds, cwd, None, false);
 		root.mode = init.mode;
+		untrapped::init(&mut k, cx, &root, init.mode).map_err(ShellError::Store)?;
+		if let Some(err) = k.root.take_fault() {
+			return Err(ShellError::Store(err));
+		}
 		if zsh {
 			let start = mode::ZshStart {
 				mode:        init.mode,

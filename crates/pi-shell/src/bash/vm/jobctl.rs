@@ -34,6 +34,7 @@ use super::{
 	exec::{self, Flow},
 	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Scratch, ScriptKind, Vproc},
 	state,
+	untrapped::CATCH,
 };
 use crate::bash::{
 	fd::{FdOrigin, FdRef},
@@ -45,11 +46,6 @@ use crate::bash::{
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
 };
-
-/// The action text handed to [`crate::bash::Host::set_signal_trap`] for a
-/// signal the interactive shell catches itself (any non-empty action
-/// catches; the text is not run).
-pub(super) const CATCH: &[u8] = b"interactive";
 
 /// The interactive shell's process groups (zsh `mypgrp`, `origpgrp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,50 +62,50 @@ struct Pgrp {
 #[derive(Default)]
 pub struct JobCtl {
 	/// The shell is interactive (set by [`init_io`]).
-	pub(super) interactive: bool,
+	interactive: bool,
 	/// The root vproc: the key of the shell's own foreground job.
-	root:                   Option<Vpid>,
+	root:        Option<Vpid>,
 	/// zsh `SHTTY`: the shell's terminal, where job notices go.
-	shtty:                  Option<FdRef>,
+	shtty:       Option<FdRef>,
 	/// Its handle for the [`crate::bash::Terminal`] seam.
-	handle:                 Option<OsHandle>,
+	handle:      Option<OsHandle>,
 	/// `MONITOR` acquired the terminal (zsh `jobbing` with a terminal).
-	pgrp:                   Option<Pgrp>,
+	pgrp:        Option<Pgrp>,
 	/// The shell's terminal modes (zsh `shttyinfo`).
-	modes:                  Option<Termios>,
+	modes:       Option<Termios>,
 	/// `(job key, pgid)`: the process group of each job that has one.
-	groups:                 Vec<(Vpid, u32)>,
+	groups:      Vec<(Vpid, u32)>,
 	/// `(vproc, job key)` for vprocs outside the shell's foreground job
 	/// ([`leader_of`]): a background job and what it runs, a command
 	/// substitution (`None`: no job, the shell's own group). Kept here
 	/// rather than in the vproc (idle vproc ≤ 2 KiB); only while the
 	/// shell does job control.
-	leaders:                Vec<(Vpid, Option<Vpid>)>,
+	leaders:     Vec<(Vpid, Option<Vpid>)>,
 	/// Terminal modes of stopped jobs, put back by `fg` (zsh `jn->ty`).
-	job_modes:              Vec<(Vpid, Termios)>,
+	job_modes:   Vec<(Vpid, Termios)>,
 	/// The job owning the terminal: the root (its own commands) or the
 	/// job `fg` resumed.
-	fg:                     Option<Vpid>,
+	fg:          Option<Vpid>,
 	/// Stops and continues externals of non-root vprocs reported during
 	/// the turn: `(vproc, event)`.
-	events:                 Vec<(Vpid, ProcEvent)>,
+	events:      Vec<(Vpid, ProcEvent)>,
 	/// A process of the shell's foreground job stopped: the root suspends
 	/// the job when it runs next.
-	fg_stop:                Option<Signal>,
+	fg_stop:     Option<Signal>,
 	/// `(child, job)`: children of the shell that moved into a suspended
 	/// job ([`suspend`]), re-parented after the turn.
-	reparent:               Vec<(Vpid, Vpid)>,
+	reparent:    Vec<(Vpid, Vpid)>,
 	/// Background jobs whose `[n] pid…` line is still to be printed.
-	announce:               Vec<Announce>,
+	announce:    Vec<Announce>,
 	/// `(job, text)`: a suspended construct's own text (zsh's super-job),
 	/// shown once it is done; until then the job shows the process that
 	/// stopped (the sub-job).
-	texts:                  Vec<(Vpid, BString)>,
+	texts:       Vec<(Vpid, BString)>,
 	/// zsh `stopmsg`: `exit` warned about jobs; counts down per command.
-	stopmsg:                u8,
+	stopmsg:     u8,
 	/// The terminal `read -k`/`-q` put in cbreak mode, with the modes it
 	/// had ([`set_cbreak`]).
-	cbreak:                 Option<(FdRef, Termios)>,
+	cbreak:      Option<(FdRef, Termios)>,
 }
 
 impl JobCtl {

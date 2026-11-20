@@ -58,6 +58,9 @@ pub struct NativeHost {
 	/// pi's builtin utilities standing in for tools `PATH` lacks
 	/// ([`crate::bash::Host::fallback`]); `None` offers none.
 	extras:    Option<Extras>,
+	/// The shell runs inside another runtime's process
+	/// ([`crate::process::ProcessOptions::embedded`]).
+	embedded:  bool,
 }
 
 /// The utilities a process shell offers where `PATH` has none (`ls`,
@@ -175,6 +178,7 @@ impl NativeHost {
 			#[cfg(unix)]
 			sockets: crate::sys::socket::NativeSockets,
 			extras: None,
+			embedded,
 		}
 	}
 
@@ -318,6 +322,13 @@ impl crate::bash::Host for NativeHost {
 
 	fn forget_ignored(&mut self, signal: crate::bash::Signal) {
 		self.signals.forget_ignored(signal);
+	}
+
+	/// Embedded, only the signals the runtime hands over
+	/// ([`crate::process::ProcessOptions::embedded`]): the runtime's own
+	/// handlers of the others (its fault handlers) stay.
+	fn may_catch(&self, signal: crate::bash::Signal) -> bool {
+		!self.embedded || crate::process::signals::handed_over(signal)
 	}
 
 	fn forward_signals(&mut self) {

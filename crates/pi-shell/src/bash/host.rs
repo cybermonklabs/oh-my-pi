@@ -123,6 +123,14 @@ pub trait Host {
 	/// `None` restores the default disposition. Its current disposition
 	/// stays as it is. Hosts without OS signals keep the default: nothing.
 	fn forget_ignored(&mut self, _signal: Signal) {}
+	/// Whether the shell may catch `signal` by its own rules, with no trap
+	/// set for it ([`Self::set_signal_trap`] with a catching action: bash's
+	/// EXIT trap catches its fatal signals, zsh `HUP`). A host embedded in a
+	/// runtime keeps the runtime's handlers of the signals it does not hand
+	/// over (its fault handlers). The default: every signal.
+	fn may_catch(&self, _signal: Signal) -> bool {
+		true
+	}
 	/// Forward the OS signals caught since the run loop last did, now, to
 	/// the shell's
 	/// [`ControlHandle::signal`](crate::bash::ControlHandle::signal). A run loop

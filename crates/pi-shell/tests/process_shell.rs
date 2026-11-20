@@ -11,7 +11,10 @@ mod zsh_oracle;
 use std::{
 	ffi::{OsStr, OsString},
 	fs, io,
-	os::unix::{ffi::OsStringExt, process::CommandExt},
+	os::unix::{
+		ffi::OsStringExt,
+		process::{CommandExt, ExitStatusExt},
+	},
 	path::Path,
 	process::Command,
 };
@@ -847,6 +850,72 @@ fn a_background_pipelines_bang_is_its_last_process() {
 	if have_zsh() {
 		assert_eq!(ours, Run::script(zsh_oracle::path(), "zsh", script).go());
 	}
+}
+
+/// An interactive shell's `HUP` from outside, with an EXIT trap that
+/// writes `$F`: bash runs the trap, then dies of the signal (its
+/// `terminating_signals` are caught interactive or not); zsh's handler
+/// exits with status 1 after the trap, also once a `HUP` trap was set and
+/// removed, by `trap -` or by `unfunction TRAPHUP` (`removetrap` puts the
+/// handler back).
+#[test]
+fn an_interactive_shell_runs_its_exit_trap_on_a_hup() -> io::Result<()> {
+	struct Case {
+		zsh:   bool,
+		setup: &'static str,
+		end:   End,
+	}
+	let cases = [
+		Case { zsh: false, setup: "true", end: Signal(libc::SIGHUP) },
+		Case { zsh: true, setup: "true", end: Exit(1) },
+		Case { zsh: true, setup: "trap 'print t' HUP; trap - HUP", end: Exit(1) },
+		Case { zsh: true, setup: "TRAPHUP() { print t }; unfunction TRAPHUP", end: Exit(1) },
+	];
+	for Case { zsh, setup, end } in cases {
+		let ours = if zsh {
+			Spawn::zsh()
+		} else {
+			Spawn::obash_as("bash")
+		};
+		let real = if zsh {
+			have_zsh().then(Spawn::real_zsh)
+		} else {
+			real_bash().map(|bash| Spawn::new(bash).argv0("bash"))
+		};
+		let shells =
+			std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+		for (who, spawn) in shells {
+			let dir = tempfile::tempdir()?;
+			let file = dir.path().join("F");
+			let args: &[&str] = if zsh {
+				&["-f", "-i"]
+			} else {
+				&["--norc", "--noprofile", "-i"]
+			};
+			let mut shell = spawn.args(args).env("F", &file).spawn()?;
+			shell.write(format!("{setup}; trap 'echo x > \"$F\"' EXIT; echo $((40 + 2))\r"))?;
+			// `42` then a newline: bash's bracketed paste puts `\e[?2004l\r`
+			// before it.
+			shell.read_until("42\r\n", TIMEOUT)?;
+			// Then the next prompt: the command is over and its output out.
+			// Sent before it, the real shells race (under load, zsh 5.9 once
+			// wrote `42` into the EXIT trap's file too, and bash 5.2.21 once
+			// did not exit).
+			shell.wait_screen(TIMEOUT, |screen| screen.contents().ends_with(['$', '#', '%']))?;
+			shell.signal(libc::SIGHUP)?;
+			let status = shell.wait(TIMEOUT)?;
+			let ended = status
+				.code()
+				.map_or_else(|| status.signal().map(Signal), |code| Some(Exit(code)));
+			assert_eq!(
+				(ended, fs::read_to_string(&file).ok()),
+				(Some(end), Some("x\n".to_owned())),
+				"{who}: {setup}: {:?}",
+				shell.output()
+			);
+		}
+	}
+	Ok(())
 }
 
 /// The bash cases need bash 5.2 or later

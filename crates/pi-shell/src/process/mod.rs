@@ -57,8 +57,11 @@ pub struct ProcessOptions {
 	/// - signals: of HUP, INT, QUIT, TERM, PIPE, ALRM, TSTP, TTIN, TTOU, CHLD,
 	///   WINCH and CONT, those the runtime caught with a handler (and `SIGPIPE`,
 	///   which it ignores) are reset to `SIG_DFL` for the run and restored after
-	///   it; no other disposition is touched. `SIGPIPE` is therefore not
-	///   reported as ignored on entry: externals start with the default action;
+	///   it. The shell catches no other signal by its own rules (a bash EXIT
+	///   trap's catches are of these signals alone), so the runtime's fault
+	///   handlers stay; only a trap the script sets changes another disposition.
+	///   `SIGPIPE` is therefore not reported as ignored on entry: externals
+	///   start with the default action;
 	/// - descriptors: the inherited ones above 2 (`3>file`) are duplicated,
 	///   never taken over, and the runtime's own are left alone;
 	/// - exits of externals are observed by a waiter thread each, beside the
