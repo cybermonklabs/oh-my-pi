@@ -7,10 +7,10 @@ import { executeShell } from "../native/index.js";
 // The bash tool's shell runs `grep` as a builtin. Each expectation below is
 // the bytes GNU grep 3.11 writes on stdout, and the status it exits with, for
 // the same command under LC_ALL=C, on input holding lines that are not valid
-// UTF-8: there each byte is one character. The builtin reads no locale for
-// this, so it answers so in every locale, where GNU in C.UTF-8 takes such a
-// line for binary data. stderr is dropped. The outputs are Latin-1 strings,
-// one character to a byte: `"caf\xe9"` is c, a, f and 0xE9.
+// UTF-8: there each byte is one character. Each command runs so: in a UTF-8
+// locale the builtin, as GNU, reads such a line a whole character at a time
+// where it can. stderr is dropped. The outputs are Latin-1 strings, one
+// character to a byte: `"caf\xe9"` is c, a, f and 0xE9.
 
 // Two lines that are not UTF-8 - a Latin-1 0xE9 and a 0xC3 no continuation
 // byte follows - beside plain ASCII ones.
@@ -33,7 +33,10 @@ afterAll(async () => {
  * the callback as text.
  */
 async function run(command: string): Promise<{ output: Buffer; exitCode: number | undefined }> {
-	const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
+	const result = await executeShell(
+		{ command: `{ export LC_ALL=C; ${command}\n} >out 2>/dev/null`, cwd: dir },
+		() => {},
+	);
 	return { output: await fs.readFile(path.join(dir, "out")), exitCode: result.exitCode };
 }
 

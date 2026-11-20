@@ -48,8 +48,12 @@ describe("builtin sed: a line cut inside a character and joined back is UTF-8 ag
 		// Regressed: `CAF\303\251AULAIT`, bytes having no case.
 		[String.raw`printf 'caf\303\251 au lait\n' | sed 's/ *//g;s/.*/\U&/'`, "CAF\xc3\x89AULAIT\n", 0],
 		// `c a f e a u l a i t \n`. In C GNU refuses `y/é/e/` (strings of different lengths).
-		// Regressed: `caf\303\251aulait`.
-		[String.raw`printf 'caf\303\251 au lait\n' | sed 's/ *//g;y/é/e/'`, "cafeaulait\n", 0],
+		// Regressed: `caf\303\251aulait`. The `é` is written with `printf`: bun writes a raw
+		// template's `é` as the text `\u00E9`.
+		[String.raw`printf 'caf\303\251 au lait\n' | sed "s/ *//g;y/$(printf '\303\251')/e/"`, "cafeaulait\n", 0],
+		// GNU reads `\u00E9` as `u00E9`: "strings for `y' command are different lengths", exit 1.
+		// Was `cafeaulait`, `\u00E9` read as `é`; in the base "internal error".
+		[String.raw`printf 'caf\303\251 au lait\n' | sed 's/ *//g;y/\u00E9/e/'`, "", 1],
 		// `X X X \n`: the fourth empty match is the one after the `a`, and the second, inside the `é`,
 		// is left as it was. In C: `X X X X \n`. Regressed: `XXXX`.
 		[String.raw`printf '\303\251a\n' | sed 's/x*/-/4;s/./X/g'`, "XXX\n", 0],

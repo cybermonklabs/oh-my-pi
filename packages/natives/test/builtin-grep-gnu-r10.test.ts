@@ -229,3 +229,11 @@ describe("builtin grep: -o with several patterns", () => {
 		[String.raw`printf 'q0xa q69xb\n' | grep -o -f many`, "q0xa\nq69xb\n", 0],
 	]);
 });
+
+describe("builtin grep: --help", () => {
+	cases([
+		// Regressed: a source comment on the `-e` option, "Read as its bytes, as every argument is: see
+		// [`bre::pattern_text`].", was printed as two lines of the help.
+		["grep --help | grep -c 'Read as its bytes'", "0\n", 1],
+	]);
+});

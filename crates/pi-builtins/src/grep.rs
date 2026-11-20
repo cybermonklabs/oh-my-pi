@@ -242,7 +242,8 @@ fn longest_match_at(
 )]
 struct GrepArgs {
 	/// Use PATTERN for matching (may be repeated; all patterns are OR-ed).
-	/// Read as its bytes, as every argument is: see [`bre::pattern_text`].
+	// Read as its bytes, as every argument is: see `bre::pattern_text`. (A
+	// `///` line would be clap's help text.)
 	#[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
 	patterns: Vec<OsString>,
 
@@ -915,16 +916,10 @@ fn translate_patterns(
 	target: bre::Target,
 	spec: MatcherSpec,
 ) -> Result<Vec<String>, String> {
-	let raw = if spec.c_locale {
-		bre::RawBytes::CLocale
-	} else if spec.raw_bytes {
-		bre::RawBytes::Utf8Locale
-	} else {
-		bre::RawBytes::Absent
-	};
+	let bytes = bre::PatternBytes { raw: spec.raw_bytes, utf8_locale: spec.utf8_locale };
 	patterns
 		.iter()
-		.map(|pattern| bre::translate_raw(pattern, dialect, target, spec.ignore_case, raw))
+		.map(|pattern| bre::translate_raw(pattern, dialect, target, spec.ignore_case, bytes))
 		.collect::<Result<_, _>>()
 		.map_err(|error: bre::BreError| error.message().to_owned())
 }
@@ -1134,12 +1129,14 @@ struct MatcherSpec {
 	/// Whether the patterns are [`bre::pattern_text`]'s, some holding a byte
 	/// that is no UTF-8.
 	raw_bytes:   bool,
-	/// Whether the patterns hold such a byte and the locale reads a byte to
-	/// a character (GNU's C locale), where such a pattern byte in a bracket
-	/// expression is a member of that byte; in a UTF-8 locale it is none,
-	/// for a line that is not UTF-8 too (see [`bre::translate_raw`]). False
-	/// where no pattern holds such a byte, whatever the locale.
-	c_locale:    bool,
+	/// Whether the locale is UTF-8, where a pattern byte in a bracket
+	/// expression is no member, and the engine for a line that is not UTF-8
+	/// matches a bracket member outside ASCII, and `.`, as a whole character
+	/// (see [`bre::translate_raw`]); else it is GNU's C locale, where every
+	/// byte is a character. Asked only where it decides something: where a
+	/// pattern holds such a byte, or such a line is read by an engine of its
+	/// own ([`reads_bytes_as_text`]).
+	utf8_locale: bool,
 }
 
 /// Compile all patterns using the last-selected matcher mode.
@@ -1199,6 +1196,10 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 	// pattern is compiled with PCRE2 - the engine `-P` already uses - rather
 	// than refused or searched as the text `\1`.
 	if patterns.iter().any(|pattern| bre::has_backreference(pattern)) {
+		// GNU's own error for a pattern it refuses comes first: `-e $'\303'
+		// -e '\(x\)\2'` is "Invalid back reference".
+		let target = if spec.bytes { bre::Target::PcreBytes } else { bre::Target::Pcre };
+		let translated = translate_patterns(patterns, dialect, target, spec)?;
 		// PCRE2 with PCRE2_UTF matches whole characters alone, so in a UTF-8
 		// locale it cannot match a pattern byte that is no UTF-8 in a line
 		// that is UTF-8, which GNU does: `printf 'café\n' | grep -c -e
@@ -1210,8 +1211,6 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 					.to_owned(),
 			);
 		}
-		let target = if spec.bytes { bre::Target::PcreBytes } else { bre::Target::Pcre };
-		let translated = translate_patterns(patterns, dialect, target, spec)?;
 		return build_pcre_matcher(&translated, spec);
 	}
 	let target = if spec.bytes { bre::Target::RustBytes } else { bre::Target::Rust };
@@ -2779,19 +2778,24 @@ impl AsyncUtility for Grep {
 	// locale alike. In the C locale every byte is a character, so where a
 	// pattern holds such a byte every line is read so, as GNU reads it: `.`
 	// and `[^\351]` match one byte of the line `é` there, not its character.
-	// Only such a pattern asks the locale.
-	let c_locale = raw_bytes && !crate::locale::ctype_is_utf8(host);
-	let spec = MatcherSpec {
+	// In a UTF-8 locale a line that is not UTF-8 is read a whole character
+	// at a time where it can be. Only where one of these decides something
+	// is the locale asked.
+	let mut spec = MatcherSpec {
 		mode:        resolve_match_mode(&matches),
 		ignore_case: resolve_ignore_case(&matches),
 		word:        cli.word,
 		line_regexp: cli.line_regexp,
 		null_data:   cli.null_data,
 		jit:         pcre2_jit_enabled(host.var("OMP_PCRE2_JIT")),
-		bytes:       c_locale,
+		bytes:       false,
 		raw_bytes,
-		c_locale,
+		utf8_locale: true,
 	};
+	if raw_bytes || !reads_bytes_as_text(&patterns, spec) {
+		spec.utf8_locale = crate::locale::ctype_is_utf8(host);
+		spec.bytes = raw_bytes && !spec.utf8_locale;
+	}
 	let matcher = match build_matcher(&patterns, spec) {
 		Ok(matcher) => matcher,
 		Err(error) => {
@@ -4030,7 +4034,7 @@ mod tests {
 			jit:         false,
 			bytes:       false,
 			raw_bytes:   false,
-			c_locale:    false,
+			utf8_locale: false,
 		};
 		let patterns = vec!["caf.".to_owned()];
 		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4069,7 +4073,7 @@ mod tests {
 		jit:         false,
 		bytes:       false,
 		raw_bytes:   false,
-		c_locale:    false,
+		utf8_locale: true,
 	};
 
 	#[test]
@@ -4160,7 +4164,7 @@ mod tests {
 		// no line `caf\351` for GNU there).
 		let find = |pattern: &[u8], c_locale: bool, bytes: bool, line: &[u8]| {
 			let (text, raw_bytes) = bre::pattern_text(pattern);
-			let spec = MatcherSpec { bytes, raw_bytes, c_locale, ..BRE_SPEC };
+			let spec = MatcherSpec { bytes, raw_bytes, utf8_locale: !c_locale, ..BRE_SPEC };
 			let Ok(Engine::Rust(matcher)) = build_matcher(&[text], spec) else {
 				panic!("{pattern:?} compiles");
 			};
@@ -4188,6 +4192,10 @@ mod tests {
 		// So is `.`, which matches no encoding error.
 		assert_eq!(find(b"x.y\xe9", false, true, b"x\xffy\xe9"), None);
 		assert_eq!(find(b"x.y\xe9", false, true, b"x\xc3\xa9y\xe9"), Some((0, 5)));
+		// So it is for a pattern that holds no such byte.
+		assert_eq!(find("[é]".as_bytes(), false, true, b"x\xa9"), None);
+		assert_eq!(find("[é]".as_bytes(), false, true, b"\xff\xc3\xa9"), Some((1, 3)));
+		assert_eq!(find(b"x.y", false, true, b"x\xffy"), None);
 		// In the C locale a range is the bytes the engine gets.
 		assert_eq!(find(b"[\xc3-\xc3\xa9]", true, true, line), Some((3, 4)));
 	}

@@ -431,15 +431,20 @@ fn byte_of(c: char) -> Option<u8> {
 }
 
 impl Transliteration {
-	/// Create through character mappings from `source` to `target`, as the
-	/// script spells them (see `CaseWriter::push_literal`). In byte text a
-	/// character outside ASCII that no escape names is several bytes: as a
-	/// source it maps no byte, and as a target it is written as those bytes,
-	/// as `s` writes it (`y/a/é/` writes the two bytes of `é`).
+	/// Create through character mappings from `source` to `target`, as
+	/// `parse_transliteration` reads them. A byte that is no UTF-8 is no
+	/// character of a line that is UTF-8: as a source it maps nothing there,
+	/// and as a target it is written as that byte, as GNU sed writes it in
+	/// C.UTF-8 (`printf 'cafe\n' | sed 'y/e/\xe9/'` writes `caf\351`). In
+	/// byte text a character outside ASCII that is UTF-8 is several bytes:
+	/// as a source it maps no byte, and as a target it is written as those
+	/// bytes, as `s` writes it (`y/a/é/` writes the two bytes of `é`).
 	pub fn from_strings(source: &str, target: &str) -> Self {
 		let mut result = Self::default();
 		for (from, to) in source.chars().zip(target.chars()) {
-			result.insert(script_text_char(from), script_text_char(to));
+			if char_byte(from).is_none() {
+				result.insert(from, to);
+			}
 			if let Some(byte) = byte_of(from) {
 				result.bytes[usize::from(byte)] = to;
 			}
@@ -4302,6 +4307,10 @@ pub const UNTERMINATED_ADDRESS: &str = "unterminated address regex";
 /// GNU sed's message for a `y` command whose strings never end: `sed 'y/a/'`.
 pub const UNTERMINATED_Y: &str = "unterminated `y' command";
 
+/// GNU sed's message for a `\c` before an escape that is not `\\`: `sed
+/// 'y/\c\x/x/'`.
+pub const RECURSIVE_ESCAPE_C: &str = "recursive escaping after \\c not allowed";
+
 /// Parse the regular expression delimited by the current line
 /// character and return it as a string, or fail with `unterminated` where
 /// the line ends first.
@@ -4379,45 +4388,125 @@ pub fn parse_regex(
 	compilation_error(lines, line, unterminated)
 }
 
-/// Parse the transliteration string delimited by the current line
-/// character and return it as a string.
+/// Parse a string of a `y` command, delimited by the current line
+/// character, as GNU sed 4.9 reads it, and return its characters: each
+/// UTF-8 sequence is one, and so is each byte that is no UTF-8, as the
+/// character that stands for it (`bre::byte_char`).
 /// On return the line is on the closing delimiter.
+///
+/// GNU reads the string in two steps. Up to the delimiter, an escaped
+/// delimiter is that character and an escaped newline a newline. Then each
+/// escape is read: `\a`, `\f`, `\n`, `\r`, `\t` and `\v`; `\cX`, the control
+/// character of `X` (`\c\\` that of `\`, `\c` before any other escape an
+/// error, `\c` at the end nothing); `\dNNN`, `\oNNN` and `\xHH`, the byte of
+/// that value mod 256; and any other `\X`, `\\` too, the `X` alone, so
+/// `y/\u00E9/e/` is "strings for `y' command are different lengths". The
+/// bytes so written are read as characters: `y/\xc3\xa9/e/` maps `é`.
 pub fn parse_transliteration(
-	lines: &ScriptLineProvider,
+	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 ) -> SedResult<String> {
 	let delimiter = scan_delimiter(lines, line, UNTERMINATED_Y)?;
-	let mut result = String::new();
-
-	while !line.eol() {
+	// The string up to the delimiter, each backslash in it before the
+	// character it escapes.
+	let mut text = Vec::new();
+	loop {
+		if line.eol() {
+			return compilation_error(lines, line, UNTERMINATED_Y);
+		}
 		match line.current() {
+			c if c == delimiter => break,
 			'\\' => {
 				line.advance();
 				if line.eol() {
-					return compilation_error(lines, line, UNTERMINATED_Y);
-				}
-				if line.current() == delimiter || line.current() == '\\' {
-					// Push only the escaped character
-					result.push(line.current());
-					line.advance();
+					let Some(next_line) = lines.next_line_in_source()? else {
+						return compilation_error(lines, line, UNTERMINATED_Y);
+					};
+					text.push('\n');
+					*line = ScriptCharProvider::new(&next_line);
 					continue;
 				}
-				if let Some(decoded) = parse_byte_escape(line) {
-					result.push(decoded);
-				} else {
-					// Pass through \<any> to tr for literal use
-					result.push('\\');
-					result.push(line.current());
-					line.advance();
+				// GNU keeps the backslash of `\&` where `&` is the delimiter.
+				let escaped = line.current();
+				if escaped != delimiter || escaped == '&' {
+					text.push('\\');
 				}
-				continue;
+				text.push(escaped);
 			},
-			c if c == delimiter => return Ok(result),
-			c => result.push(c),
+			c => text.push(c),
 		}
 		line.advance();
 	}
-	compilation_error(lines, line, UNTERMINATED_Y)
+
+	let mut bytes = Vec::with_capacity(text.len());
+	let mut rest = text.as_slice();
+	while let Some((&c, after)) = rest.split_first() {
+		rest = after;
+		if c != '\\' {
+			push_char_bytes(&mut bytes, c);
+			continue;
+		}
+		// `text` holds a backslash only before the character it escapes.
+		let [escaped, after @ ..] = rest else { break };
+		let escaped = *escaped;
+		rest = after;
+		match escaped {
+			'a' => bytes.push(0x07),
+			'f' => bytes.push(0x0C),
+			'n' => bytes.push(b'\n'),
+			'r' => bytes.push(b'\r'),
+			't' => bytes.push(b'\t'),
+			'v' => bytes.push(0x0B),
+			'c' => match rest {
+				[] => {},
+				['\\', '\\', after @ ..] => {
+					bytes.push(0x1C);
+					rest = after;
+				},
+				['\\', ..] => return compilation_error(lines, line, RECURSIVE_ESCAPE_C),
+				[target, after @ ..] => {
+					// GNU takes the first byte of the character after `\c`.
+					let start = bytes.len();
+					push_char_bytes(&mut bytes, *target);
+					bytes[start] = bytes[start].to_ascii_uppercase() ^ 0x40;
+					rest = after;
+				},
+			},
+			'd' | 'o' | 'x' => {
+				let (radix, most) = match escaped {
+					'd' => (10, 3),
+					'o' => (8, 3),
+					_ => (16, 2),
+				};
+				let digits = rest
+					.iter()
+					.take(most)
+					.take_while(|digit| digit.is_digit(radix))
+					.count();
+				if digits == 0 {
+					push_char_bytes(&mut bytes, escaped);
+				} else {
+					let value = rest[..digits]
+						.iter()
+						.filter_map(|digit| digit.to_digit(radix))
+						.fold(0, |value, digit| value * radix + digit);
+					bytes.push(value.to_le_bytes()[0]);
+					rest = &rest[digits..];
+				}
+			},
+			other => push_char_bytes(&mut bytes, other),
+		}
+	}
+	Ok(crate::bre::pattern_text(&bytes).0)
+}
+
+/// Appends the bytes of the script character `c`: the byte it stands for
+/// (`bre::char_byte`), else its UTF-8.
+fn push_char_bytes(bytes: &mut Vec<u8>, c: char) {
+	match crate::bre::char_byte(c) {
+		Some(byte) => bytes.push(byte),
+		None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+	}
 }
 
 #[cfg(test)]
@@ -4960,47 +5049,72 @@ mod tests {
 	// parse_transliteration
 	#[test]
 	fn test_simple_transliteration() {
-		let (lines, mut line) = make_providers("/abc/");
-		let parsed = parse_transliteration(&lines, &mut line).unwrap();
+		let (mut lines, mut line) = make_providers("/abc/");
+		let parsed = parse_transliteration(&mut lines, &mut line).unwrap();
 		assert_eq!(parsed, "abc");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_transliteration_with_escaped_delimiter() {
-		let (lines, mut line) = make_providers("/ab\\/c/");
-		let parsed = parse_transliteration(&lines, &mut line).unwrap();
+		let (mut lines, mut line) = make_providers("/ab\\/c/");
+		let parsed = parse_transliteration(&mut lines, &mut line).unwrap();
 		assert_eq!(parsed, "ab/c");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_transliteration_with_escaped_backslash() {
-		let (lines, mut line) = make_providers("/ab\\\\c/");
-		let parsed = parse_transliteration(&lines, &mut line).unwrap();
+		let (mut lines, mut line) = make_providers("/ab\\\\c/");
+		let parsed = parse_transliteration(&mut lines, &mut line).unwrap();
 		assert_eq!(parsed, "ab\\c");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_transliteration_with_escape_sequence() {
-		let (lines, mut line) = make_providers("/ab\\n/");
-		let parsed = parse_transliteration(&lines, &mut line).unwrap();
+		let (mut lines, mut line) = make_providers("/ab\\n/");
+		let parsed = parse_transliteration(&mut lines, &mut line).unwrap();
 		assert_eq!(parsed, "ab\n");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
+	fn reads_escapes_as_gnu_sed_does() {
+		// Each answer is what GNU sed 4.9 maps, measured in C.UTF-8 with
+		// `y/<string>/<as many characters>/`.
+		for (string, parsed) in [
+			("/\\u0061/", "u0061".to_owned()),
+			("/\\q\\b\\&\\./", "qb&.".to_owned()),
+			("/\\x61\\o142\\d099\\x\\d/", "abcxd".to_owned()),
+			("/\\x611\\d0971\\x6/", "a1a1\x06".to_owned()),
+			("/\\d300\\o777/", format!(",{}", byte_char(0xFF))),
+			("/\\xc3\\xa9\\xc3/", format!("é{}", byte_char(0xC3))),
+			("/\\ca\\c[\\c\\\\\\c\\/\\c/", "\x01\x1b\x1co".to_owned()),
+			("n\\nn", "n".to_owned()),
+		] {
+			let (mut lines, mut line) = make_providers(string);
+			assert_eq!(parse_transliteration(&mut lines, &mut line).unwrap(), parsed, "{string}");
+		}
+		let (mut lines, mut line) = make_providers("/\\c\\x/");
+		let err = parse_transliteration(&mut lines, &mut line).unwrap_err();
+		assert_eq!(
+			err.to_string(),
+			"-e expression #1, char 6: recursive escaping after \\c not allowed"
+		);
+	}
+
+	#[test]
 	fn errors_on_unterminated_transliteration() {
-		let (lines, mut line) = make_providers("/unterminated");
-		let err = parse_transliteration(&lines, &mut line).unwrap_err();
+		let (mut lines, mut line) = make_providers("/unterminated");
+		let err = parse_transliteration(&mut lines, &mut line).unwrap_err();
 		assert_eq!(err.to_string(), "-e expression #1, char 13: unterminated `y' command");
 	}
 
 	#[test]
 	fn errors_on_esc_at_tr_eol() {
-		let (lines, mut line) = make_providers("/foo\\");
-		let err = parse_transliteration(&lines, &mut line).unwrap_err();
+		let (mut lines, mut line) = make_providers("/foo\\");
+		let err = parse_transliteration(&mut lines, &mut line).unwrap_err();
 		assert_eq!(err.to_string(), "-e expression #1, char 5: unterminated `y' command");
 	}
 }
@@ -5328,6 +5442,15 @@ pub fn write_text_bytes(out: &mut impl Write, text: &str, bytes: bool) -> io::Re
 	out.write_all(&text.as_bytes()[written..])
 }
 
+/// A write of a `w` file that failed, with the number of bytes that write
+/// was to write, which GNU sed names: it writes a line's missing delimiter,
+/// its text and its delimiter apart, each with one `fwrite` of so many
+/// items, and reports the one that failed (`couldn't write 4 items`).
+pub struct WriteFailure {
+	pub error: io::Error,
+	pub items: usize,
+}
+
 /// Writes the pattern space `record` as sed writes it to a `w` file: after
 /// the `delimiter` the line written before it lacked where `missing`, and
 /// ended by its own where its last line has one. GNU sed leaves a last line
@@ -5338,13 +5461,13 @@ pub fn write_record(
 	record: &IOChunk,
 	missing: bool,
 	delimiter: u8,
-) -> io::Result<()> {
+) -> Result<(), WriteFailure> {
 	if missing {
-		out.write_all(&[delimiter])?;
+		out.write_all(&[delimiter]).map_err(|error| WriteFailure { error, items: 1 })?;
 	}
-	record.write_bytes(out)?;
+	record.write_bytes(out).map_err(|error| WriteFailure { error, items: record.byte_len() })?;
 	if record.is_newline_terminated() {
-		out.write_all(&[delimiter])?;
+		out.write_all(&[delimiter]).map_err(|error| WriteFailure { error, items: 1 })?;
 	}
 	Ok(())
 }
@@ -5637,6 +5760,18 @@ impl<'a> IOChunk<'a> {
 			#[cfg(unix)]
 			IOChunkContent::SliceInput { content, .. } => out.write_all(content),
 			IOChunkContent::Owned { content, bytes, .. } => write_text_bytes(out, content, *bytes),
+		}
+	}
+
+	/// The number of bytes [`Self::write_bytes`] writes.
+	pub fn byte_len(&self) -> usize {
+		match &self.content {
+			#[cfg(unix)]
+			IOChunkContent::SliceInput { content, .. } => content.len(),
+			IOChunkContent::Owned { content, bytes: true, .. } => {
+				content.chars().map(|c| if char_byte(c).is_some() { 1 } else { c.len_utf8() }).sum()
+			},
+			IOChunkContent::Owned { content, .. } => content.len(),
 		}
 	}
 
@@ -5993,15 +6128,17 @@ impl OutputBuffer {
 	/// [`write_record`] writes it. GNU sed keeps the delimiter that writer's
 	/// last line lacked apart from the one of the lines sed prints, so this
 	/// neither ends a line left pending here nor leaves one: `printf 'a' | sed
-	/// 'p;w /dev/stdout'` prints `aa\na`.
-	pub fn write_record_apart(&mut self, record: &IOChunk, missing: bool) -> io::Result<()> {
+	/// 'p;w /dev/stdout'` prints `aa\na`. A failure to write what was already
+	/// pending counts as one item.
+	pub fn write_record_apart(&mut self, record: &IOChunk, missing: bool) -> Result<(), WriteFailure> {
+		let pending = |error: io::Error| WriteFailure { error, items: 1 };
 		#[cfg(unix)]
 		{
-			self.flush_slice(WriteRange::Complete)?;
+			self.flush_slice(WriteRange::Complete).map_err(pending)?;
 		}
 		write_record(&mut self.out, record, missing, self.delimiter)?;
 		if record.is_newline_terminated() {
-			self.flush_completed_line()?;
+			self.flush_completed_line().map_err(pending)?;
 		}
 		Ok(())
 	}
@@ -8727,9 +8864,12 @@ use std::{cell::RefCell, io::BufWriter, path::PathBuf, rc::Rc};
 use crate::openfile::{DescriptorPath, STDERR_FD, STDOUT_FD};
 use pi_vfs::{File, OpenOptions};
 use crate::host::{Host, ShellPaths};
-use crate::sed::fast_io::{IOChunk, OutputBuffer, file_error, write_record};
+use crate::sed::fast_io::{IOChunk, OutputBuffer, WriteFailure, file_error, write_record};
 
 use crate::sed::error_handling::SedResult;
+
+/// glibc's `BUFSIZ`, the most bytes stdio buffers a file in.
+const STDIO_BUFSIZ: usize = 8192;
 
 thread_local! {
 	 /// Global list of all writers that should be flushed at shutdown
@@ -8780,7 +8920,19 @@ impl NamedWriter {
 						OpenOptions::new().create(true).write(true).truncate(true),
 					)
 					.map_err(|e| file_error("couldn't open file", &path, &e))?;
-				Target::File(BufWriter::new(file))
+				// GNU sed's stdio buffers the file in blocks of its
+				// `st_blksize`, at most `BUFSIZ` (8 KiB), and a write that
+				// does not fit flushes them; so buffered, a failed write is
+				// the same line's: `seq 100000 | sed -n 'w /dev/full'` fails
+				// writing the 4 bytes of `1041`.
+				let capacity = file
+					.metadata()
+					.ok()
+					.and_then(|meta| meta.blksize())
+					.and_then(|size| usize::try_from(size).ok())
+					.filter(|&size| size > 0 && size < STDIO_BUFSIZ)
+					.unwrap_or(STDIO_BUFSIZ);
+				Target::File(BufWriter::with_capacity(capacity, file))
 			},
 		};
 
@@ -8812,12 +8964,17 @@ impl NamedWriter {
 			Target::Stdout if in_place => write_record(&mut host.stdout, record, missing, delimiter),
 			Target::Stdout => output.write_record_apart(record, missing),
 			Target::Stderr => write_record(&mut host.stderr, record, missing, delimiter),
-			Target::Closed => Err(std::io::Error::other("file already closed")),
+			Target::Closed => {
+				Err(WriteFailure { error: std::io::Error::other("file already closed"), items: 1 })
+			},
 		};
-		// GNU sed writes each line apart, and names the item it failed to
-		// write: `sed 'w /dev/full'` on a long input is "couldn't write 1
-		// item to /dev/full: No space left on device".
-		result.map_err(|e| file_error("couldn't write 1 item to", &self.path, &e))
+		// GNU sed names the bytes of the write that failed, the line's text
+		// or its delimiter: `seq 100000 | sed -n 'w /dev/full'` is "couldn't
+		// write 4 items to /dev/full: No space left on device".
+		result.map_err(|WriteFailure { error, items }| {
+			let items = if items == 1 { "1 item".to_owned() } else { format!("{items} items") };
+			file_error(&format!("couldn't write {items} to"), &self.path, &error)
+		})
 	}
 
 	/// Flush the writer and close its file, returning a descriptive error.
@@ -9320,26 +9477,35 @@ fn substitute(
 
 /// Apply the specified transliteration in the provided pattern space.
 fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
-	let bytes = pattern.is_bytes();
 	let text = pattern.as_str();
-	let mut result = String::with_capacity(text.len());
 	let mut replaced = false;
 
 	// Perform the transliteration.
-	for ch in text.chars() {
-		if bytes {
+	let (result, bytes) = if pattern.is_bytes() {
+		let mut result = String::with_capacity(text.len());
+		for ch in text.chars() {
 			// A target outside ASCII that no escape names is the bytes of
 			// its UTF-8 encoding in byte text, as `s` writes it: in GNU's C
 			// locale `printf 'a\377\n' | sed 's/a/é/;s/./X/g'` prints `XXX`.
 			let mapped = trans.lookup_byte_text(ch);
 			replaced |= mapped != ch;
 			result.extend(script_byte_chars(mapped));
-		} else {
+		}
+		(result, true)
+	} else {
+		// A target that is a byte no UTF-8 is written as that byte, and the
+		// line is then byte text where it is no UTF-8 any more.
+		let mut result = Vec::with_capacity(text.len());
+		for ch in text.chars() {
 			let mapped = trans.lookup(ch);
 			replaced |= mapped != ch;
-			result.push(mapped);
+			match char_byte(mapped).filter(|_| mapped != ch) {
+				Some(byte) => result.push(byte),
+				None => result.extend_from_slice(mapped.encode_utf8(&mut [0; 4]).as_bytes()),
+			}
 		}
-	}
+		line_text(result)
+	};
 
 	// Lazy replace.
 	if replaced {
@@ -10153,39 +10319,47 @@ impl ScriptLineProvider {
 
 	/// Return the next script line to process across all scripts.
 	pub fn next_line(&mut self) -> SedResult<Option<String>> {
-		let mut line = String::new();
-
 		loop {
-			let advance = match &mut self.state {
-				State::NotStarted => Some(0),
-				State::Active { index, reader, .. } => {
-					line.clear();
-					let bytes = reader.read_line(&mut line)?;
-					if bytes == 0 {
-						Some(*index + 1) // finished reading this source
-					} else {
-						// Remove trailing newline
-						let newline = line.ends_with('\n');
-						if newline {
-							line.pop();
-						}
-						let place = &mut self.place;
-						place.bytes_before += place.line_bytes + usize::from(place.newline);
-						place.line_number += 1;
-						place.line_bytes = line.len();
-						place.newline = newline;
+			let next_index = match &self.state {
+				State::NotStarted => 0,
+				State::Active { index, .. } => {
+					let index = *index;
+					if let Some(line) = self.next_line_in_source()? {
 						return Ok(Some(line));
 					}
+					index + 1 // finished reading this source
 				},
 				State::Done => {
 					return Ok(None);
 				},
 			};
-
-			if let Some(next_index) = advance {
-				self.advance_source(next_index)?;
-			}
+			self.advance_source(next_index)?;
 		}
+	}
+
+	/// Return the next line of the script source being read, `None` where
+	/// it has no more: an escaped newline goes on to the next line there,
+	/// but GNU sed reads no escape across two expressions (`sed -e 'y/a\'
+	/// -e '/b/'` is "unterminated `y' command").
+	pub fn next_line_in_source(&mut self) -> SedResult<Option<String>> {
+		let State::Active { reader, .. } = &mut self.state else {
+			return Ok(None);
+		};
+		let mut line = String::new();
+		if reader.read_line(&mut line)? == 0 {
+			return Ok(None);
+		}
+		// Remove trailing newline
+		let newline = line.ends_with('\n');
+		if newline {
+			line.pop();
+		}
+		let place = &mut self.place;
+		place.bytes_before += place.line_bytes + usize::from(place.newline);
+		place.line_number += 1;
+		place.line_bytes = line.len();
+		place.newline = newline;
+		Ok(Some(line))
 	}
 
 	// Move to the next available script source.
