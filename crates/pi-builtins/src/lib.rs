@@ -226,6 +226,10 @@ mod whoami;
 mod xargs;
 #[cfg(feature = "util.yes")]
 mod yes;
+/// Runs a test that changes or reads what the whole process shares in a
+/// process of its own.
+#[cfg(test)]
+mod own_process;
 
 pub use duration::parse_duration;
 pub use host::{panic_scope_active, rayon_global_pool_available, set_rayon_global_pool_available};

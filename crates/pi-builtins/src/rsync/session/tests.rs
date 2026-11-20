@@ -344,9 +344,13 @@ fn local_delete_copies_terminate() {
 /// local copy run repeatedly reports identical `sent`/`received` counts (rsync
 /// 3.5.1 is deterministic here, even under CPU load). Frames meet reads only where
 /// upstream's processes would: reads happen at refills with the socketpair-sized
-/// in-process pipe, never ahead of them.
+/// in-process pipe, never ahead of them. The test runs in a process of its
+/// own, away from the other tests' threads.
 #[test]
 fn local_copy_byte_totals_are_deterministic() {
+	if !crate::own_process::own_process() {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	for i in 0..20 {
