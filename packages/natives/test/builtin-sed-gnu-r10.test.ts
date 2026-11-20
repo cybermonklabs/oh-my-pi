@@ -175,6 +175,103 @@ describe("builtin sed: errors written as GNU writes them", () => {
 	]);
 });
 
+describe("builtin sed: a step with no digits, and a `~` after other addresses", () => {
+	cases([
+		// Regressed: each of these was "sed: internal error", exit 1. GNU reads no digits after `~` as a step of 0: `first~0` is the line `first`, and `addr,~0` ends the range on its first line.
+		["seq 5 | sed -n '1~p' 2>&1", "1\n", 0],
+		["seq 5 | sed -n '1 ~p' 2>&1", "1\n", 0],
+		["seq 5 | sed -n '1~!p' 2>&1", "2\n3\n4\n5\n", 0],
+		["seq 5 | sed -n '1,~p' 2>&1", "1\n", 0],
+		["seq 5 | sed -n '/2/,~p' 2>&1", "2\n", 0],
+		["seq 5 | sed -n '\\%2%,~p' 2>&1", "2\n", 0],
+		["seq 5 | sed -n '$,~p' 2>&1", "5\n", 0],
+		["seq 5 | sed -n '/1/,~!p' 2>&1", "2\n3\n4\n5\n", 0],
+		["echo a | sed '/a/,~p' 2>&1", "a\na\n", 0],
+		// `0~` is line 0, which a regex may end.
+		["seq 5 | sed -n '0~,/2/p' 2>&1", "1\n2\n", 0],
+		["seq 5 | sed -n '0~p' 2>&1", error(char(3), "invalid usage of line address 0"), 1],
+		["seq 5 | sed -n '0~,p' 2>&1", error(char(4), "unexpected `,'"), 1],
+		// After an address other than a line number, the `~` is a command.
+		["seq 5 | sed -n '$~p' 2>&1", error(char(2), "unknown command: `~'"), 1],
+		["seq 5 | sed -n '/1/~p' 2>&1", error(char(4), "unknown command: `~'"), 1],
+		["seq 5 | sed -n '/1/I~p' 2>&1", error(char(5), "unknown command: `~'"), 1],
+		// What follows the step is the command.
+		["seq 5 | sed -n '1~xp' 2>&1", error(char(4), "extra characters after command"), 1],
+		["seq 5 | sed -n '1,~xp' 2>&1", error(char(5), "extra characters after command"), 1],
+		["seq 5 | sed -n '1~;p' 2>&1", error(char(3), "unknown command: `;'"), 1],
+		["seq 5 | sed -n '1,~}p' 2>&1", error(char(4), "unexpected `}'"), 1],
+		// Regressed by the same rule: a step of 0 ran the range to the last line.
+		["seq 5 | sed -n '2,~0p' 2>&1", "2\n", 0],
+		["seq 5 | sed -n '/3/,~0p' 2>&1", "3\n", 0],
+		// Regressed by the same rule: a `~` after `$` or a regex was read as a step.
+		["seq 5 | sed -n '$~2p' 2>&1", error(char(2), "unknown command: `~'"), 1],
+		["seq 5 | sed -n '/1/~2p' 2>&1", error(char(4), "unknown command: `~'"), 1],
+	]);
+});
+
+describe("builtin sed: how many addresses a command takes", () => {
+	cases([
+		// Regressed: accepted, so the script ran where GNU refuses it.
+		["seq 3 | sed -n '1,2q' 2>&1", error(char(4), "command only uses one address"), 1],
+		["echo a | sed '/a/~2p' 2>&1", error(char(4), "unknown command: `~'"), 1],
+		["seq 3 | sed --posix -n '1,2l' 2>&1", error(char(4), "command only uses one address"), 1],
+		// Regressed: `first~step` counted as two addresses, so `Q` refused it.
+		["seq 3 | sed -n '1~2Q 5'", "", 5],
+		// `q` takes it too.
+		["seq 3 | sed -n '1~2q 5'", "", 5],
+		// Regressed: `c` treated `first~step` as a range, replacing its last line alone.
+		["seq 3 | sed -n '1~2c foo'", "foo\nfoo\n", 0],
+		["seq 3 | sed '1~2!c foo'", "1\nfoo\n3\n", 0],
+		// Regressed: "} doesn't want any addresses" for both; GNU first refuses a `}` that closes no block.
+		["echo a | sed '1}' 2>&1", error(char(2), "unexpected `}'"), 1],
+		["echo a | sed -n '{p;1}' 2>&1", error(char(5), "`}' doesn't want any addresses"), 1],
+	]);
+});
+
+describe("builtin sed: a reused regex's group references", () => {
+	cases([
+		// Regressed: GNU checks the references of an address's regex when an `s` command first reuses it, before it searches the line; the builtin checked only on a match.
+		[
+			String.raw`printf 'b\n' | sed '/a/!s//[\1]/' 2>&1`,
+			error(char(0), "invalid reference \\1 on `s' command's RHS"),
+			1,
+		],
+		[
+			String.raw`printf 'b\na\n' | sed '/a/!s//[\1]/' 2>&1`,
+			error(char(0), "invalid reference \\1 on `s' command's RHS"),
+			1,
+		],
+		[
+			String.raw`printf 'b\n' | sed -n '/a/p;s//[\1]/' 2>&1`,
+			error(char(0), "invalid reference \\1 on `s' command's RHS"),
+			1,
+		],
+		// Regressed: anywhere else a reference to a group the regex lacks is empty, where the builtin refused it.
+		[String.raw`printf 'aab\n' | sed 's/\(a\)/x/;s//[\2]/' 2>&1`, "x[]b\n", 0],
+		[String.raw`printf 'ab\n' | sed '/\(a\)/s//[\1]/;s//<\2>/' 2>&1`, "[<>]b\n", 0],
+		[String.raw`printf 'ab\nab\n' | sed '/a/s//[&]/;s//[\1]/' 2>&1`, "[[]]b\n[[]]b\n", 0],
+		// Regressed: --posix checks no reference.
+		[String.raw`printf 'ab\n' | sed --posix '/a/s//[\1]/' 2>&1`, "[]b\n", 0],
+		[String.raw`printf 'ab\n' | sed --posix 's/a/[\1]/' 2>&1`, "[]b\n", 0],
+		// Each `/a/` is a regex of its own, checked by the `s` command that first reuses it.
+		[
+			String.raw`printf 'ab\n' | sed '/a/s//[&]/;/a/s//[\1]/' 2>&1`,
+			error(char(0), "invalid reference \\1 on `s' command's RHS"),
+			1,
+		],
+	]);
+});
+
+describe("builtin sed: what it refuses where GNU accepts", () => {
+	// The builtin lacks these; it refuses each with a nonzero exit and a
+	// message that names what it does not take. These are its own messages,
+	// not GNU's.
+	cases([
+		// Regressed: "number expected", which names no `+`. GNU reads `1,+` as `1,+0`.
+		["seq 3 | sed -n '1,+p' 2>&1", error(char(4), "expected a line count after `+'"), 1],
+	]);
+});
+
 describe("builtin sed: a brace with nothing to repeat, and a count above 32767", () => {
 	cases([
 		// Regressed: with `{` the delimiter, `\{` reaches the pattern as a brace that sed's own interval check never sees, and it is read as text; GNU prints "Invalid preceding regular expression" and exits 1.

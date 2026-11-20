@@ -26,6 +26,7 @@ mod stdio;
 	feature = "util.df",
 	feature = "util.du",
 	feature = "util.env",
+	feature = "util.find",
 	feature = "util.fold",
 	feature = "util.sort",
 	feature = "util.uniq"

@@ -413,15 +413,15 @@ fn has_separator(name: &OsStr) -> bool {
 	bytes.contains(&b'/') || (cfg!(windows) && bytes.contains(&b'\\'))
 }
 
-/// `Some(true)` for an executable file at `path`, `Some(false)` for a file
-/// that is not executable, `None` for nothing (or a directory).
+/// `Some(true)` for an executable file at `path`, `Some(false)` for anything
+/// else there, `None` for nothing. `execve` of a directory fails with
+/// `EACCES`, which GNU's xargs and find report as "Permission denied":
+/// `echo a | xargs ./dir` is `xargs: ./dir: Permission denied`, status 126.
 #[cfg(unix)]
 fn executable(path: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
-	let meta = std::fs::metadata(path)
-		.ok()
-		.filter(std::fs::Metadata::is_file)?;
-	Some(meta.permissions().mode() & 0o111 != 0)
+	let meta = std::fs::metadata(path).ok()?;
+	Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]

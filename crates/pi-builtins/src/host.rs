@@ -1959,6 +1959,18 @@ pub(crate) fn strip_errno(error: &io::Error) -> String {
 	message
 }
 
+/// The `strerror` text of a failure to run a command, as GNU's xargs and
+/// find print it: [`strip_errno`], with POSIX's words for the bare kinds a
+/// [`CommandRunner`] reports for its own lookup (`NotFound`: nothing has
+/// the name; `PermissionDenied`: nothing with it can be executed).
+pub(crate) fn run_strerror(error: &io::Error) -> String {
+	match (error.raw_os_error(), error.kind()) {
+		(None, io::ErrorKind::NotFound) => "No such file or directory".to_owned(),
+		(None, io::ErrorKind::PermissionDenied) => "Permission denied".to_owned(),
+		_ => strip_errno(error),
+	}
+}
+
 /// POSIX `strerror` text for an OS error kind. Kinds that cover several errnos
 /// on unix (`PermissionDenied` is both `EPERM` and `EACCES`) keep the native
 /// text there, which is already exact.

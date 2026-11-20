@@ -2,10 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { executeShell } from "../native/index.js";
 
 // The bash tool's shell runs `find` as a builtin. Each expectation below is
 // the bytes GNU find 4.10 writes on stdout, and the status it exits with, for
-// the same command under LC_ALL=C.UTF-8. stderr is dropped.
+// the same command under LC_ALL=C.UTF-8 unless a case names another locale.
+// stderr is dropped, unless a command sends it to stdout itself (`2>&1`).
 
 let dir: string;
 
@@ -56,4 +58,35 @@ describe("builtin find: parentheses nested 10,000 deep", () => {
 		const command = `find . ${"\\( ".repeat(depth)}-name f`;
 		expect(await runInChild(command)).toEqual({ child: 0, exitCode: 1, output: Buffer.alloc(0) });
 	}, 60_000);
+});
+
+/**
+ * Runs `command` in the builtin shell with stdout sent to a file, whose bytes
+ * are returned with the shell's exit status.
+ */
+async function run(command: string): Promise<{ output: string; exitCode: number | undefined }> {
+	const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
+	return { output: await fs.readFile(path.join(dir, "out"), "utf8"), exitCode: result.exitCode };
+}
+
+/** Makes `noexec` (not executable), `d`, and `xkill`, which kills itself, then runs `find . -maxdepth 0 ARGS`. */
+const exec = (args: string, locale = "C.UTF-8") =>
+	`printf '#!/bin/sh\\necho hi\\n' >noexec; mkdir -p d; printf '#!/bin/sh\\nkill -9 $$\\n' >xkill; chmod +x xkill; LC_ALL=${locale} find . -maxdepth 0 ${args} 2>&1`;
+
+describe("builtin find: a command -exec cannot run, or a signal kills", () => {
+	it.each([
+		// Regressed: each was `Failed to run NAME: entity not found` (or `permission denied`); GNU names the command in the locale's quotes, with strerror's text.
+		[exec("-exec nosuch {} \\;"), "find: ‘nosuch’: No such file or directory\n", 0],
+		[exec("-exec ./noexec {} \\;"), "find: ‘./noexec’: Permission denied\n", 0],
+		// Regressed: a directory was "entity not found"; it cannot be executed.
+		[exec("-exec ./d {} \\;"), "find: ‘./d’: Permission denied\n", 0],
+		[exec("-exec nosuch {} +"), "find: ‘nosuch’: No such file or directory\n", 1],
+		[exec("-exec ./noexec {} +"), "find: ‘./noexec’: Permission denied\n", 1],
+		[exec("-exec nosuch {} \\;", "C"), "find: 'nosuch': No such file or directory\n", 0],
+		// Regressed: a command killed by a signal was not reported.
+		[exec("-exec ./xkill {} \\;"), "find: ‘./xkill’ terminated by signal 9\n", 0],
+		[exec("-exec ./xkill {} +"), "find: ‘./xkill’ terminated by signal 9\n", 1],
+	])("%s", async (command, output, exitCode) => {
+		expect(await run(command)).toEqual({ output, exitCode });
+	});
 });

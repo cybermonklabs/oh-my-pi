@@ -550,13 +550,34 @@ pub mod matchers {
 		use std::{
 			error::Error,
 			ffi::OsString,
-			io::Write,
+			io::{self, Write},
 			path::{Path, PathBuf},
 			sync::{Mutex, PoisonError},
 		};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
-		use crate::host::ShellCommand;
+		use crate::host::{CommandStatus, Host, ShellCommand, run_strerror};
+
+		/// Whether the command named `name` that `-exec` ran succeeded, after
+		/// GNU findutils 4.10's diagnostic where it did not run (`find:
+		/// ‘nosuch’: No such file or directory`) or a signal killed it (`find:
+		/// ‘./cmd’ terminated by signal 9`), quoted as GNU quotes in the
+		/// locale: `'nosuch'` outside a UTF-8 one.
+		fn exec_succeeded(host: &mut Host, name: &str, outcome: io::Result<CommandStatus>) -> bool {
+			let (open, close) = if crate::locale::ctype_is_utf8(host) { ('‘', '’') } else { ('\'', '\'') };
+			match outcome {
+				Ok(status) => {
+					if let CommandStatus::Signaled(signal) = status {
+						let _ = writeln!(host.stderr, "find: {open}{name}{close} terminated by signal {signal}");
+					}
+					status.success()
+				},
+				Err(error) => {
+					let _ = writeln!(host.stderr, "find: {open}{name}{close}: {}", run_strerror(&error));
+					false
+				},
+			}
+		}
 
 		/// `{}` replacement for `-execdir`: the entry name relative to its parent.
 		fn execdir_arg(path: &Path) -> PathBuf {
@@ -647,13 +668,8 @@ pub mod matchers {
 					.lock()
 					.unwrap_or_else(PoisonError::into_inner)
 					.flush();
-				match matcher_io.host().run_command_async(command).await {
-					Ok(status) => status.success(),
-					Err(e) => {
-						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
-						false
-					},
-				}
+				let outcome = matcher_io.host().run_command_async(command).await;
+				exec_succeeded(matcher_io.host(), &self.executable, outcome)
 			}
 
 			fn has_side_effects(&self) -> bool {
@@ -712,16 +728,9 @@ pub mod matchers {
 					.lock()
 					.unwrap_or_else(PoisonError::into_inner)
 					.flush();
-				match matcher_io.host().run_command_async(shell_command).await {
-					Ok(status) => {
-						if !status.success() {
-							matcher_io.set_exit_code(1);
-						}
-					},
-					Err(e) => {
-						let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {}: {}", self.executable, e);
-						matcher_io.set_exit_code(1);
-					},
+				let outcome = matcher_io.host().run_command_async(shell_command).await;
+				if !exec_succeeded(matcher_io.host(), &self.executable, outcome) {
+					matcher_io.set_exit_code(1);
 				}
 			}
 		}
