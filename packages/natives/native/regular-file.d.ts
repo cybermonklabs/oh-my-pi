@@ -26,12 +26,12 @@ export type RegularFileRead =
 	| { kind: "missing" };
 
 /**
- * Read `file` if it is a regular file (all of it, or at most its first `length` bytes), never
- * blocking on one that is not: `lstat`, then a non-blocking `open` that follows no link, then
- * `fstat`. An `open` error is never thrown: it is reported as what stands there now, or as
- * `unreadable` when that is still a regular file.
+ * Read `file`, all of it, if it is a regular file, never blocking on one that is not: `lstat`,
+ * then a non-blocking `open` that follows no link, then `fstat`. An `open` error is never
+ * thrown: it is reported as what stands there now, or as `unreadable` when that is still a
+ * regular file.
  */
-export function readRegularFile(file: string, options?: { length?: number }): RegularFileRead;
+export function readRegularFile(file: string): RegularFileRead;
 
 /** The text of `file` if it is a regular file, else undefined. */
 export function readRegularFileText(file: string): string | undefined;
@@ -57,7 +57,7 @@ export function readLinkTarget(
 export function __setRegularFileIoForTests(
 	replacement:
 		| Partial<
-				Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync" | "readlinkSync">
+				Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readFileSync" | "closeSync" | "readlinkSync">
 		  >
 		| undefined,
 ): void;

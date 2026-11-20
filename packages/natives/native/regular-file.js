@@ -23,7 +23,7 @@ import * as fs from "node:fs";
  * describes.
  */
 
-/** @type {Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readSync" | "readFileSync" | "closeSync" | "readlinkSync">} */
+/** @type {Pick<typeof fs, "lstatSync" | "openSync" | "fstatSync" | "readFileSync" | "closeSync" | "readlinkSync">} */
 let io = fs;
 
 /**
@@ -82,13 +82,12 @@ function kindNow(file, error) {
 }
 
 /**
- * Read `file` if it is a regular file: all of it, or with `length` at most its first `length`
- * bytes. Never blocks, and throws only on a read error after a regular file was opened.
+ * Read `file`, all of it, if it is a regular file. Never blocks, and throws only on a read
+ * error after a regular file was opened.
  * @param {string} file
- * @param {{ length?: number }} [options]
  * @returns {import("./regular-file").RegularFileRead}
  */
-export function readRegularFile(file, options = {}) {
+export function readRegularFile(file) {
 	let stat;
 	try {
 		stat = io.lstatSync(file, { throwIfNoEntry: false });
@@ -109,15 +108,7 @@ export function readRegularFile(file, options = {}) {
 		const opened = io.fstatSync(fd);
 		const now = kindOf(opened);
 		if (now !== "file") return { kind: now, stat: opened };
-		if (options.length === undefined) return { kind: "file", content: io.readFileSync(fd), stat: opened };
-		const content = Buffer.alloc(options.length);
-		let read = 0;
-		while (read < content.length) {
-			const n = io.readSync(fd, content, read, content.length - read, read);
-			if (n === 0) break;
-			read += n;
-		}
-		return { kind: "file", content: content.subarray(0, read), stat: opened };
+		return { kind: "file", content: io.readFileSync(fd), stat: opened };
 	} finally {
 		io.closeSync(fd);
 	}
