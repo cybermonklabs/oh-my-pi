@@ -22,9 +22,6 @@ export function getNativesDir(): string;
  */
 export const NATIVES_DIR_HANDOFF_ENV_KEY: "__PI_NATIVES_DIR_HANDOFF";
 
-/** The environment variables the rule reads, the home directory's (`HOME`, or `USERPROFILE` on Windows) included. */
-export function nativesDirInputNames(): string[];
-
 /**
  * The handoff value for a child process whose environment is `env`: this process's answer, or
  * `dir`, for a process whose parent is `parent`.

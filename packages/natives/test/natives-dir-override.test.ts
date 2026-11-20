@@ -8,7 +8,6 @@ import {
 	getNativesDir,
 	nativesDirHandoff,
 	nativesDirHandoffDir,
-	nativesDirInputNames,
 } from "../native/natives-dir.js";
 import packageJson from "../package.json" with { type: "json" };
 
@@ -408,17 +407,22 @@ console.log(JSON.stringify({ main, worker }));`;
 			},
 		);
 
-		it("names every variable the rule reads, so a new one cannot be left out of it", async () => {
-			// A handoff is taken when the recorded inputs match, so a variable the rule reads and
-			// the list omits would let a child with its own value of it take the parent's answer.
-			const source = await Bun.file(path.join(import.meta.dir, "../native/natives-dir.js")).text();
-			const rule = /function resolveNativesDir\(\) \{\n(?<body>[\s\S]*?)\n\}/.exec(source)?.groups?.body;
-			if (!rule) throw new Error("resolveNativesDir not found in natives-dir.js");
-			const read = new Set(rule.match(/process\.env\.([A-Z0-9_]+)/g)?.map(hit => hit.slice("process.env.".length)));
-			// `os.homedir()` reads the home directory's variable, which the list names as well.
-			if (rule.includes("os.homedir()")) read.add(process.platform === "win32" ? "USERPROFILE" : "HOME");
+		it.each([
+			"PI_NATIVES_DIR",
+			"OMP_DOWNLOAD_ROOT",
+			"XDG_CACHE_HOME",
+			"OMP_CONFIG_ROOT",
+			"PI_CONFIG_DIR",
+			process.platform === "win32" ? "USERPROFILE" : "HOME",
+		])("is refused by a child whose %s differs from the recorded one", name => {
+			// Each variable the rule reads, the home directory's included (`os.homedir()` reads it).
+			const handedOver = path.join(tempRoot, "handed-over");
+			const env: Record<string, string | undefined> = { ...process.env, [name]: path.join(tempRoot, "recorded") };
+			const written = nativesDirHandoff(env, { parent: process.pid, dir: handedOver });
 
-			expect([...read].sort()).toEqual([...nativesDirInputNames()].sort());
+			expect(nativesDirHandoffDir(written, { env, ppid: process.pid })).toBe(handedOver);
+			const own = { ...env, [name]: path.join(tempRoot, "own") };
+			expect(nativesDirHandoffDir(written, { env: own, ppid: process.pid })).toBeUndefined();
 		});
 	});
 

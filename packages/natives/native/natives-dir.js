@@ -6,7 +6,7 @@ import { getEnvironmentData, setEnvironmentData } from "node:worker_threads";
 /**
  * An absolute directory from an override variable (`~` expanded), or undefined for a
  * relative or empty value.
- * @param {string | undefined} value
+ * @param {string | null | undefined} value
  * @returns {string | undefined}
  */
 function resolveAbsoluteDir(value) {
@@ -17,22 +17,45 @@ function resolveAbsoluteDir(value) {
 	return path.isAbsolute(dir) ? path.normalize(dir) : undefined;
 }
 
+/** The variable `os.homedir()` reads the home directory from. */
+const HOME_ENV_NAME = process.platform === "win32" ? "USERPROFILE" : "HOME";
+
 /**
- * The natives directory by the rule below, from the environment as it is now.
+ * What the rule reads from `env`: the five directory variables, and the home directory's
+ * variable, which `os.homedir()` reads (Bun, as the process starts). {@link resolveNativesDir}
+ * reads the environment through this object only, and a handoff records it and is taken only
+ * by a process whose own object is the recorded one, so the two cannot differ.
+ * @param {Record<string, string | undefined>} env
+ * @returns {Record<string, string | null>}
+ */
+function nativesDirInputs(env) {
+	return {
+		PI_NATIVES_DIR: env.PI_NATIVES_DIR ?? null,
+		OMP_DOWNLOAD_ROOT: env.OMP_DOWNLOAD_ROOT ?? null,
+		XDG_CACHE_HOME: env.XDG_CACHE_HOME ?? null,
+		OMP_CONFIG_ROOT: env.OMP_CONFIG_ROOT ?? null,
+		PI_CONFIG_DIR: env.PI_CONFIG_DIR ?? null,
+		[HOME_ENV_NAME]: env[HOME_ENV_NAME] ?? null,
+	};
+}
+
+/**
+ * The natives directory by the rule below, from the rule's inputs.
+ * @param {Record<string, string | null>} inputs from {@link nativesDirInputs}
  * @returns {string}
  */
-function resolveNativesDir() {
-	const override = resolveAbsoluteDir(process.env.PI_NATIVES_DIR);
+function resolveNativesDir(inputs) {
+	const override = resolveAbsoluteDir(inputs.PI_NATIVES_DIR);
 	if (override) return override;
-	const downloadRoot = resolveAbsoluteDir(process.env.OMP_DOWNLOAD_ROOT);
+	const downloadRoot = resolveAbsoluteDir(inputs.OMP_DOWNLOAD_ROOT);
 	if (downloadRoot) return path.join(downloadRoot, "natives");
-	const xdgCacheHome = process.env.XDG_CACHE_HOME;
+	const xdgCacheHome = inputs.XDG_CACHE_HOME;
 	if ((process.platform === "linux" || process.platform === "darwin") && xdgCacheHome) {
 		const appRoot = path.join(xdgCacheHome, "omp");
 		if (fs.existsSync(appRoot)) return path.join(appRoot, "natives");
 	}
 	const configRoot =
-		resolveAbsoluteDir(process.env.OMP_CONFIG_ROOT) ?? path.join(os.homedir(), process.env.PI_CONFIG_DIR || ".omp");
+		resolveAbsoluteDir(inputs.OMP_CONFIG_ROOT) ?? path.join(os.homedir(), inputs.PI_CONFIG_DIR || ".omp");
 	return path.join(configRoot, "natives");
 }
 
@@ -119,7 +142,7 @@ function adopt(dir, withHandoff) {
  * carry the directory.
  *
  * A process takes the answer only when it is the one it was written for:
- * - `inputs`, the values the rule reads ({@link nativesDirInputNames}), match its own
+ * - `inputs`, the values the rule reads ({@link nativesDirInputs}), match its own
  *   environment, so a program started with a home or directory variables of its own resolves
  *   its own directory;
  * - `parent` is the process that started it: its parent now, or, after that parent exited and
@@ -131,23 +154,6 @@ function adopt(dir, withHandoff) {
 export const NATIVES_DIR_HANDOFF_ENV_KEY = "__PI_NATIVES_DIR_HANDOFF";
 
 /**
- * The environment variables the rule reads, the home directory's included (`HOME`, or
- * `USERPROFILE` on Windows): a handoff is taken only by a process whose values of these are the
- * recorded ones.
- * @returns {string[]}
- */
-export function nativesDirInputNames() {
-	return [
-		"PI_NATIVES_DIR",
-		"OMP_DOWNLOAD_ROOT",
-		"XDG_CACHE_HOME",
-		"OMP_CONFIG_ROOT",
-		"PI_CONFIG_DIR",
-		process.platform === "win32" ? "USERPROFILE" : "HOME",
-	];
-}
-
-/**
  * The {@link NATIVES_DIR_HANDOFF_ENV_KEY} value for a child process whose environment is `env`
  * (its values of the rule's inputs are recorded from it): this process's answer, or `dir`, for
  * a process whose parent is `parent` (this process's pid).
@@ -156,10 +162,8 @@ export function nativesDirInputNames() {
  * @returns {string}
  */
 export function nativesDirHandoff(env, { parent, dir = getNativesDir() }) {
-	const inputs = {};
-	for (const name of nativesDirInputNames()) inputs[name] = env[name] ?? null;
 	const parentStart = processStartTime(parent === process.pid ? "self" : parent) ?? null;
-	return JSON.stringify({ dir, parent, parentStart, inputs });
+	return JSON.stringify({ dir, parent, parentStart, inputs: nativesDirInputs(env) });
 }
 
 /**
@@ -203,12 +207,13 @@ export function nativesDirHandoffDir(value, addressee) {
 	if (typeof handoff?.dir !== "string" || !path.isAbsolute(handoff.dir)) return undefined;
 	if (!addressee) return handoff.dir;
 	if (!isStartedByRecordedParent(handoff, addressee.ppid)) return undefined;
-	const inputs = handoff.inputs;
-	if (inputs === null || typeof inputs !== "object") return undefined;
-	const names = nativesDirInputNames();
-	if (Object.keys(inputs).length !== names.length) return undefined;
+	const recorded = handoff.inputs;
+	if (recorded === null || typeof recorded !== "object") return undefined;
+	const own = nativesDirInputs(addressee.env);
+	const names = Object.keys(own);
+	if (Object.keys(recorded).length !== names.length) return undefined;
 	for (const name of names) {
-		if (!(name in inputs) || (addressee.env[name] ?? null) !== inputs[name]) return undefined;
+		if (!(name in recorded) || own[name] !== recorded[name]) return undefined;
 	}
 	return handoff.dir;
 }
@@ -252,7 +257,7 @@ export function getNativesDir() {
 	// {@link startedWithNativesDirHandoff}); a program started with no `env` keeps it, which the
 	// parent check refuses while the recorded parent runs.
 	delete process.env[NATIVES_DIR_HANDOFF_ENV_KEY];
-	return adopt(handedOver ?? resolveNativesDir(), Boolean(value));
+	return adopt(handedOver ?? resolveNativesDir(nativesDirInputs(process.env)), Boolean(value));
 }
 
 /**
