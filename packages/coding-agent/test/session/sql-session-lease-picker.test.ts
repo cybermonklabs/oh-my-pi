@@ -185,9 +185,17 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 }
 
 /**
+ * The variables that place a process's profile, and so its sessions, beyond the home and XDG directories both
+ * processes of the file-storage case are given: the default profile and the default config directory, whatever the
+ * test's own shell sets (a Legion pod sets OMP_PROFILE). The holder, which starts with the test's environment, and
+ * the launch, which starts with only what it is given, then name one session directory.
+ */
+const DEFAULT_PLACEMENT = { OMP_PROFILE: "default", PI_PROFILE: "default", PI_CONFIG_DIR: ".omp" } as const;
+
+/**
  * The launch's startup on file storage under `OMP_SESSION_EXCLUSIVE=1`, in `dir` with `home`'s directories (those a
- * `LeaseProcess` started with `home` uses), the picker answering session `id`; once the agent session would start
- * it writes one turn and stops. The running process, whose stderr the caller reads.
+ * `LeaseProcess` started with `home` and {@link DEFAULT_PLACEMENT} uses), the picker answering session `id`; once
+ * the agent session would start it writes one turn and stops. The running process, whose stderr the caller reads.
  */
 function startFileLaunch(dir: TempDir, home: string, id: string): Bun.Subprocess<"ignore", "pipe", "pipe"> {
 	const script = `
@@ -241,6 +249,7 @@ function startFileLaunch(dir: TempDir, home: string, id: string): Bun.Subprocess
 			XDG_STATE_HOME: path.join(home, "state"),
 			XDG_CACHE_HOME: path.join(home, "cache"),
 			TMPDIR: process.env.TMPDIR,
+			...DEFAULT_PLACEMENT,
 			NO_COLOR: "1",
 			PI_NO_TITLE: "1",
 			OMP_SESSION_EXCLUSIVE: "1",
@@ -261,7 +270,7 @@ describe("omp --resume with autoResume on, picking the session it resumed, under
 		using dir = TempDir.createSync("@omp-lease-picker-file-");
 		const home = dir.join("home");
 		const config = { dsn: "", table: "", leaseTable: "", storage: "file" as const };
-		await using holder = await LeaseProcess.start(config, home);
+		await using holder = await LeaseProcess.start(config, home, DEFAULT_PLACEMENT);
 		const { sessionDir } = await holder.run({ op: "defaultSessionDir", cwd: dir.path() });
 		if (!sessionDir) throw new Error("the holder named no session directory");
 		// A new id each run: a file lease is keyed by the session id alone, machine-wide.
