@@ -30,7 +30,8 @@
  * the test reads those lines back with the store's.
  *
  * Each case prints one line, `left-setting case leg=… entry=… operations=…
- * data=… temp=… app=… pid=… pid_before=… pid_after=… left_value=… admin=…`,
+ * data=… temp=… app=… pid=… pid_before=… pid_after=… left_value=… admin=…
+ * app_value=…`,
  * then asserts each condition; each leg prints a line for each entry the
  * server lacks, and its case count last.
  */
@@ -519,19 +520,28 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 							settled = true;
 						},
 					);
+					let waiter: number | undefined;
 					await until(
 						async () => {
 							const [waiting] = (await db.unsafe(
-								"SELECT application_name FROM pg_catalog.pg_stat_activity " +
+								"SELECT pid FROM pg_catalog.pg_stat_activity " +
 									"WHERE $1::int = ANY(pg_catalog.pg_blocking_pids(pid))",
 								[Number(me?.pid)],
 							)) as Rows;
-							if (waiting) app = String(waiting.application_name);
+							if (waiting) waiter = Number(waiting.pid);
 							return waiting !== undefined || settled;
 						},
 						HELD_WAIT_MS,
 						{ what: "the store's append waiting for the held row", pollMs: POLL_MS },
 					).catch(() => undefined);
+					// A new statement: the poll's pg_stat_activity snapshot can predate the waiter's SET LOCAL application_name.
+					if (waiter !== undefined) {
+						const [named] = (await db.unsafe(
+							"SELECT application_name FROM pg_catalog.pg_stat_activity WHERE pid = $1::int",
+							[waiter],
+						)) as Rows;
+						if (named) app = String(named.application_name);
+					}
 					// The store's append must wait out the hold: its own short timeouts would end the wait inside it.
 					if (!settled) await Bun.sleep(HELD_HOLD_MS);
 				} finally {
@@ -910,6 +920,8 @@ interface Verdict {
 	pidAfter: number;
 	leftValue: string;
 	admin: string;
+	/** The `application_name` read for the store's waiting backend, if a waiter was found. */
+	appValue: string | undefined;
 }
 
 async function runCase(spec: CaseSpec): Promise<void> {
@@ -924,6 +936,7 @@ async function runCase(spec: CaseSpec): Promise<void> {
 		pidAfter: 0,
 		leftValue: "",
 		admin: "none",
+		appValue: undefined,
 	};
 	let failure: { operation: string; error: unknown } | undefined;
 	let harness: LeftClient | undefined;
@@ -952,6 +965,7 @@ async function runCase(spec: CaseSpec): Promise<void> {
 		failure = run.failure;
 		verdict.operations = failure ? `fail:${failure.operation}` : "pass";
 		verdict.app = run.app === PG_APPLICATION_NAME ? "pass" : "fail";
+		verdict.appValue = run.app;
 		// What the operations reported, read before the settling below gives back a claim a failed list left.
 		stage = "admin_read";
 		const data = await adminCompare(db, tables, run.model);
@@ -984,7 +998,8 @@ async function runCase(spec: CaseSpec): Promise<void> {
 		console.log(
 			`left-setting case leg=${LEG} entry=${spec.label} operations=${verdict.operations} data=${verdict.data} ` +
 				`temp=${verdict.temp} app=${verdict.app} pid=${verdict.pid} pid_before=${verdict.pidBefore} ` +
-				`pid_after=${verdict.pidAfter} left_value=${JSON.stringify(verdict.leftValue)} admin=${verdict.admin}`,
+				`pid_after=${verdict.pidAfter} left_value=${JSON.stringify(verdict.leftValue)} admin=${verdict.admin} ` +
+				`app_value=${verdict.appValue === undefined ? "none" : JSON.stringify(verdict.appValue)}`,
 		);
 		if (failure) {
 			console.log(
