@@ -19,6 +19,7 @@ mod frames;
 mod fsprobe;
 mod glob;
 mod jobctl;
+mod killed;
 mod locale;
 mod mode;
 mod nested;

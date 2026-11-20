@@ -38,7 +38,7 @@ use crate::bash::{
 	},
 	ids::{CallId, CmdTag, IntrinsicId, RunId},
 	ir::{self, AssignVal, Op, Part, Unit},
-	signal::{SigSet, Signal},
+	signal::SigSet,
 	snapshot::Lost,
 	store::{Attrs, Key, KeyBuf, MiscKey, Record, StateStore, StoreError, VarValue},
 	zshopt::ZshOpt,
@@ -73,6 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			notice: None,
 		}
 	}
 
@@ -104,6 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			notice,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*notice = None;
 	}
 }
 
@@ -4540,7 +4543,15 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				super::jobctl::fg_done(k, cx, vp, killed, &text);
 			}
 			if let (Some(sig), false) = (killed, replacing) {
-				report_killed(k, cx, vp, op, line, pid, sig);
+				let end = super::killed::killed(k, cx, vp, op, pid, sig);
+				// bash ran it with `exec`: its process is the command's.
+				if end.no_fork
+					&& vp.parent.is_none()
+					&& let Some(run) = run
+				{
+					k.exec_signals.insert(run, i32::from(sig.number(platform)));
+				}
+				st(vp).notice = end.notice.map(Box::new);
 			}
 			status
 		},
@@ -4568,55 +4579,6 @@ fn forget_job(vp: &mut Vproc, v: crate::bash::ids::Vpid) {
 	if let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number) {
 		vp.jobs.remove(number);
 	}
-}
-
-/// bash `notify_of_job_status` for a foreground command the shell itself
-/// ran (not a pipeline stage or a subshell) that the signal `sig` killed,
-/// in a non-interactive bash. With `DONT_REPORT_SIGTERM` and
-/// `DONT_REPORT_SIGPIPE`, bash's defaults: `INT` and `PIPE` say nothing;
-/// `TERM`, or a signal the shell traps, prints the signal's description
-/// (`Terminated`); any other prints `NAME: line N: ` and the job as `jobs
-/// -l` lists it, without its number (`pretty_print_job` with
-/// `JLIST_NONINTERACTIVE`: the pid, the description padded to
-/// `LONGEST_SIGNAL_DESC` (24), the command). zsh prints nothing here.
-fn report_killed(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &mut Vproc,
-	op: Op,
-	line: u32,
-	pid: u32,
-	sig: Signal,
-) {
-	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash
-		|| vp.parent.is_some()
-		|| super::jobctl::interactive(k)
-		|| vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
-		|| matches!(sig, Signal::Int | Signal::Pipe)
-	{
-		return;
-	}
-	let platform = k.engine.config().platform;
-	let desc = sig.description(platform);
-	let trapped = matches!(
-		state::record(cx.store, vp, Key::Trap(crate::bash::store::TrapKey::Signal(sig))),
-		Ok(Some(Record::Trap { action, .. })) if !action.is_empty()
-	);
-	if sig == Signal::Term || trapped {
-		let bytes = BString::from(format!("{desc}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
-		return;
-	}
-	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
-		return;
-	};
-	let text = exec::job_text(k, cx, vp, &unit, op.node);
-	// C's `%*s` with a negative width pads to its absolute value.
-	let pad = (24 - i64::try_from(desc.len()).unwrap_or(24)).unsigned_abs();
-	let mut msg =
-		format!("{pid:>5} {desc}{:w$}", "", w = usize::try_from(pad).unwrap_or(0)).into_bytes();
-	msg.extend_from_slice(&text);
-	k.diag(cx, vp, line, Diag::Warning { msg: msg.into() });
 }
 
 /// `wait -p var`: assign the waited child's pid (as `$!` showed it).
@@ -4751,6 +4713,7 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
+	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
 	vp.pipestatus.clear();
@@ -4769,6 +4732,12 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	// bash writes it from the shell, after the command's redirections,
+	// which only its child had.
+	if let Some(bytes) = notice {
+		vp.out
+			.push_back(PendingWrite { fd: 2, bytes: *bytes, off: 0 });
+	}
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}

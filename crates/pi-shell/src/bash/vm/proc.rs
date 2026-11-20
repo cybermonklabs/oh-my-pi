@@ -1535,6 +1535,11 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// bash's notice of the command a signal killed, written to the shell's
+	/// own standard error once the command's redirections are undone
+	/// ([`super::killed`]).
+	#[serde(default)]
+	pub notice:      Option<Box<BString>>,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1754,11 +1759,13 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
+// that to at most 1,840 B. bash's pending notice of a killed command
+// (`ExecState::notice`, 376 → 384 B): the bench measured 1,848 B per idle
+// vproc with it.
 const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

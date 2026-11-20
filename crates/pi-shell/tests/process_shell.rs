@@ -9,7 +9,10 @@ mod zsh_oracle;
 use std::{
 	ffi::OsStr,
 	fs, io,
-	os::unix::process::{CommandExt, ExitStatusExt},
+	os::unix::{
+		ffi::OsStringExt,
+		process::{CommandExt, ExitStatusExt},
+	},
 	path::Path,
 	process::Command,
 };
@@ -361,7 +364,7 @@ type Outcome = (Vec<u8>, Vec<u8>, Option<i32>, Option<i32>);
 fn run_entry(
 	program: impl AsRef<OsStr>,
 	name: &str,
-	args: &[&str],
+	args: &[impl AsRef<OsStr>],
 	ignored: &'static [libc::c_int],
 ) -> Outcome {
 	let mut cmd = Command::new(program);
@@ -393,76 +396,196 @@ type SignalCase<'a> = (&'a str, &'a [u8], Option<i32>, Option<i32>);
 
 /// `err` with the pid after each `NAME: line N: ` (bash's notice of a
 /// killed command) replaced by `PID`: each shell prints its own child's.
-fn mask_pids(err: &[u8]) -> String {
-	let text = String::from_utf8_lossy(err);
-	let mut out = String::new();
-	for l in text.split_inclusive('\n') {
-		let at = l
-			.find(": line ")
-			.and_then(|i| l[i + 7..].find(": ").map(|j| i + 7 + j + 2));
-		match at {
-			Some(at) => {
-				let rest = l[at..].trim_start_matches(' ');
-				let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-				out.push_str(&l[..at]);
-				out.push_str("PID");
-				out.push_str(&rest[digits..]);
+/// The pid's field is checked to be bash's `%5ld`: at least five columns,
+/// padded with spaces on the left only up to five.
+fn mask_pids(err: &[u8]) -> Vec<u8> {
+	let mut out = Vec::with_capacity(err.len());
+	for line in err.split_inclusive(|&b| b == b'\n') {
+		let at = line.windows(7).position(|w| w == b": line ").and_then(|i| {
+			line[i + 7..]
+				.windows(2)
+				.position(|w| w == b": ")
+				.map(|j| i + 7 + j + 2)
+		});
+		let Some(at) = at else {
+			out.extend_from_slice(line);
+			continue;
+		};
+		let spaces = line[at..].iter().take_while(|&&b| b == b' ').count();
+		let digits = line[at + spaces..]
+			.iter()
+			.take_while(|b| b.is_ascii_digit())
+			.count();
+		assert!(
+			digits > 0 && spaces + digits >= 5 && (spaces == 0 || spaces + digits == 5),
+			"the pid is printed as `%5ld`: {:?}",
+			String::from_utf8_lossy(line)
+		);
+		out.extend_from_slice(&line[..at]);
+		out.extend_from_slice(b"PID");
+		out.extend_from_slice(&line[at + spaces + digits..]);
+	}
+	out
+}
+
+/// `err` with each line's shell name before `: line ` replaced by `NAME`
+/// (bash names a function's line `environment`, a sourced file's by the
+/// file, which obash does not: a difference of every diagnostic).
+fn mask_names(err: &[u8]) -> Vec<u8> {
+	let mut out = Vec::with_capacity(err.len());
+	for line in err.split_inclusive(|&b| b == b'\n') {
+		match line.windows(7).position(|w| w == b": line ") {
+			Some(i) => {
+				out.extend_from_slice(b"NAME");
+				out.extend_from_slice(&line[i..]);
 			},
-			None => out.push_str(l),
+			None => out.extend_from_slice(line),
 		}
 	}
 	out
 }
 
+/// bash's long notice: `bash: line N: PID `, the description padded to 24
+/// columns, the command.
+fn long_notice(line: u32, desc: &str, text: &[u8]) -> Vec<u8> {
+	let mut out = format!("bash: line {line}: PID {desc:<24}").into_bytes();
+	out.extend_from_slice(text);
+	out.push(b'\n');
+	out
+}
+
 /// A non-interactive bash reports a foreground command a signal killed
-/// (`notify_of_job_status`): `TERM`, or a signal the shell traps, prints
-/// its description; `INT`, `PIPE` and a command substitution print
-/// nothing; any other signal prints `NAME: line N: `, the pid, the
-/// description padded to 24 columns and the command as bash prints it.
-/// zsh prints nothing in the same case.
+/// (`notify_of_job_status`), on its own standard error: `TERM`, or a signal
+/// the shell traps (`trap ''` too), prints its description; `INT`, `PIPE`,
+/// a command substitution and a posix shell print nothing; any other
+/// signal prints `NAME: line N: `, the pid, the description padded to 24
+/// columns and the command as bash prints it, here-documents and its bytes
+/// as they are. `N` is bash's line when it waits: the end of the complete
+/// command, a `for` header, a function body's first line. The last command
+/// of the `-c` string bash runs with `exec` and no fork, so it prints
+/// nothing and the shell's process dies of the signal; zsh does the same,
+/// and prints no notice anywhere.
 #[test]
 fn bash_reports_a_foreground_command_killed_by_a_signal() {
-	let cases: [(&str, &str, &str); 11] = [
-		("bash", "/bin/sh -c 'kill -TERM $$'; echo st=$?", "Terminated\n"),
+	const K: &[u8] = b"/bin/sh -c 'kill -KILL $$'";
+	let cat = |parts: &[&[u8]]| parts.concat();
+	let killed = |line| long_notice(line, "Killed", K);
+	let cases: Vec<(&str, Vec<u8>, Vec<u8>, Option<i32>, Option<i32>)> = vec![
 		(
 			"bash",
-			"/bin/sh -c 'kill -KILL $$'; echo st=$?",
-			"bash: line 1: PID Killed                  /bin/sh -c 'kill -KILL $$'\n",
+			b"/bin/sh -c 'kill -TERM $$'; echo st=$?".to_vec(),
+			b"Terminated\n".to_vec(),
+			Some(0),
+			None,
+		),
+		("bash", cat(&[K, b"; echo st=$?"]), killed(1), Some(0), None),
+		(
+			"bash",
+			b"/bin/sh -c 'kill -QUIT $$'; echo st=$?".to_vec(),
+			long_notice(1, "Quit", b"/bin/sh -c 'kill -QUIT $$'"),
+			Some(0),
+			None,
 		),
 		(
 			"bash",
-			"/bin/sh -c 'kill -QUIT $$'; echo st=$?",
-			"bash: line 1: PID Quit                    /bin/sh -c 'kill -QUIT $$'\n",
+			b"/bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
+			long_notice(1, "User defined signal 1", b"/bin/sh -c 'kill -USR1 $$'"),
+			Some(0),
+			None,
 		),
 		(
 			"bash",
-			"/bin/sh -c 'kill -USR1 $$'; echo st=$?",
-			"bash: line 1: PID User defined signal 1   /bin/sh -c 'kill -USR1 $$'\n",
+			b"/bin/sh -c 'kill -INT $$'; /bin/sh -c 'kill -PIPE $$'; echo st=$?".to_vec(),
+			b"".to_vec(),
+			Some(0),
+			None,
 		),
-		("bash", "/bin/sh -c 'kill -INT $$'; /bin/sh -c 'kill -PIPE $$'; echo st=$?", ""),
 		(
 			"bash",
-			"trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo st=$?",
-			"User defined signal 1\n",
+			b"trap 'echo t' USR1; /bin/sh -c 'kill -USR1 $$'; echo st=$?".to_vec(),
+			b"User defined signal 1\n".to_vec(),
+			Some(0),
+			None,
 		),
-		("bash", "x=$(/bin/sh -c 'kill -KILL $$'); echo st=$?", ""),
+		("bash", cat(&[b"trap '' KILL; ", K, b"; echo st=$?"]), b"Killed\n".to_vec(), Some(0), None),
+		("bash", cat(&[b"x=$(", K, b"); echo st=$?"]), b"".to_vec(), Some(0), None),
 		(
 			"bash",
-			"true\n/bin/sh   -c 'kill -HUP $$'   ; echo st=$?",
-			"bash: line 2: PID Hangup                  /bin/sh -c 'kill -HUP $$'\n",
+			b"true\n/bin/sh   -c 'kill -HUP $$'   ; echo st=$?".to_vec(),
+			long_notice(2, "Hangup", b"/bin/sh -c 'kill -HUP $$'"),
+			Some(0),
+			None,
 		),
-		("bash", "exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?", ""),
-		("zsh", "/bin/sh -c 'kill -KILL $$'; print st=$?", ""),
-		("zsh", "/bin/sh -c 'kill -TERM $$'; print st=$?", ""),
+		(
+			"bash",
+			b"exec 2>&1; /bin/sh -c 'kill -ALRM $$'; echo st=$?".to_vec(),
+			b"".to_vec(),
+			Some(0),
+			None,
+		),
+		// The last command: no fork, no notice, the shell dies of it.
+		("bash", K.to_vec(), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("bash", cat(&[b"true && ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("bash", cat(&[b"true; ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("bash", cat(&[b"true &&\n", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("bash", cat(&[b"trap '' USR1; ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("bash", cat(&[b"trap 'echo t' USR1; ", K]), killed(1), Some(137), None),
+		("bash", cat(&[b"! ", K]), killed(1), Some(0), None),
+		// Through the shell's own standard error, not the command's.
+		(
+			"bash",
+			cat(&[K, b" 2>/dev/null; echo st=$?"]),
+			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
+			Some(0),
+			None,
+		),
+		(
+			"bash",
+			cat(&[K, b" 2>/dev/null"]),
+			long_notice(1, "Killed", &cat(&[K, b" 2> /dev/null"])),
+			Some(137),
+			None,
+		),
+		("bash", cat(&[b"set -o posix; ", K, b"; echo st=$?"]), b"".to_vec(), Some(0), None),
+		// bash's line when it waits.
+		("bash", cat(&[b"{\n", K, b"\n}; echo st=$?"]), killed(3), Some(0), None),
+		("bash", cat(&[b"if true; then\n", K, b"\nfi; echo st=$?"]), killed(3), Some(0), None),
+		("bash", cat(&[b"for x in 1\ndo\n", K, b"\ndone; echo st=$?"]), killed(1), Some(0), None),
+		("bash", cat(&[b"f()\n{\n", K, b"\n}\nf; echo st=$?"]), killed(2), Some(0), None),
+		("bash", b"/bin/sh -c \\\n'kill -KILL $$'; echo st=$?".to_vec(), killed(2), Some(0), None),
+		(
+			"bash",
+			cat(&[K, b" <<EOF\nx\nEOF\necho st=$?"]),
+			long_notice(3, "Killed", &cat(&[K, b" <<EOF\nx\nEOF\n"])),
+			Some(0),
+			None,
+		),
+		(
+			"bash",
+			cat(&[K, b" \xe9x; echo st=$?"]),
+			long_notice(1, "Killed", &cat(&[K, b" \xe9x"])),
+			Some(0),
+			None,
+		),
+		("zsh", cat(&[K, b"; print st=$?"]), b"".to_vec(), Some(0), None),
+		("zsh", b"/bin/sh -c 'kill -TERM $$'; print st=$?".to_vec(), b"".to_vec(), Some(0), None),
+		("zsh", cat(&[b"true && ", K]), b"".to_vec(), None, Some(libc::SIGKILL)),
+		("zsh", cat(&[b"trap 'print x' EXIT; ", K]), b"".to_vec(), Some(137), None),
 	];
-	for (name, script, want) in cases {
-		let args = if name == "zsh" {
-			vec!["-f", "-c", script]
+	for (name, script, want, code, signal) in cases {
+		let script = std::ffi::OsString::from_vec(script);
+		let args: Vec<&OsStr> = if name == "zsh" {
+			vec![OsStr::new("-f"), OsStr::new("-c"), &script]
 		} else {
-			vec!["-c", script]
+			vec![OsStr::new("-c"), &script]
 		};
 		let ours = run_entry(env!("CARGO_BIN_EXE_obash"), name, &args, &[]);
-		assert_eq!(mask_pids(&ours.1), want, "{name}: {script}");
+		let shown = format!("{name}: {script:?}");
+		assert_eq!(
+			(String::from_utf8_lossy(&mask_pids(&ours.1)), ours.2, ours.3),
+			(String::from_utf8_lossy(&want), code, signal),
+			"{shown}"
+		);
 		let real = if name == "zsh" {
 			have_zsh().then(zsh_oracle::path)
 		} else {
@@ -471,11 +594,12 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		match real {
 			Some(real) => {
 				let theirs = run_entry(&real, name, &args, &[]);
-				assert_eq!(
-					(mask_pids(&ours.0), mask_pids(&ours.1), ours.2),
-					(mask_pids(&theirs.0), mask_pids(&theirs.1), theirs.2),
-					"{name}: {script}"
-				);
+				let seen = |o: &Outcome| {
+					let mask =
+						|b: &[u8]| String::from_utf8_lossy(&mask_names(&mask_pids(b))).into_owned();
+					(mask(&o.0), mask(&o.1), o.2, o.3)
+				};
+				assert_eq!(seen(&ours), seen(&theirs), "{shown}");
 			},
 			None => {
 				zsh_oracle::uncompared(&format!("no {name} to compare the killed-command notice with"));
