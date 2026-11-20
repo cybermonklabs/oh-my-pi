@@ -1149,13 +1149,19 @@ describe("SQL session store under a session setting another client left on Postg
 				return NORIGHTS_ROLE;
 			});
 			if (LEG !== "direct") return;
+			// The two read-only cases log in with every right the store's login has, so only the read-only default
+			// can stop the store's write: without the store's refusal its tables would land.
 			await make("read-only login", async () => {
 				await db.unsafe(`CREATE ROLE ${identifier(READ_ONLY_LOGIN)} LOGIN`);
+				// It inherits every right of the store's login, so it may create the store's tables where that login
+				// may: in a database that login owns, through pg_database_owner, which owns `public`.
+				await db.unsafe(`GRANT ${identifier(server.login)} TO ${identifier(READ_ONLY_LOGIN)} WITH INHERIT TRUE`);
 				await db.unsafe(`ALTER ROLE ${identifier(READ_ONLY_LOGIN)} SET default_transaction_read_only = on`);
 				return READ_ONLY_LOGIN;
 			});
 			await make("read-only database", async () => {
-				await db.unsafe(`CREATE DATABASE ${identifier(READ_ONLY_DATABASE)}`);
+				// Owned by the store's login, which may then create its tables in its `public`.
+				await db.unsafe(`CREATE DATABASE ${identifier(READ_ONLY_DATABASE)} OWNER ${identifier(server.login)}`);
 				await db.unsafe(`ALTER DATABASE ${identifier(READ_ONLY_DATABASE)} SET default_transaction_read_only = on`);
 				return READ_ONLY_DATABASE;
 			});
@@ -1174,6 +1180,8 @@ describe("SQL session store under a session setting another client left on Postg
 						.unsafe(`DROP DATABASE IF EXISTS ${identifier(READ_ONLY_DATABASE)} WITH (FORCE)`)
 						.catch(() => undefined);
 				}
+				// The case tables dropped above include any the read-only login made, so it owns nothing; DROP ROLE
+				// also revokes its membership in the store's login.
 				for (const role of [READ_ONLY_LOGIN, NORIGHTS_ROLE]) {
 					await db.unsafe(`DROP ROLE IF EXISTS ${identifier(role)}`).catch(() => undefined);
 				}
