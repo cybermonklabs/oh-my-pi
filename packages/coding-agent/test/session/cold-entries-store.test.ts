@@ -367,6 +367,38 @@ describe("cold entry store", () => {
 		expect(textOf(entry(reopened, "u1"))).toBe(`u1 ${BODY}`);
 	});
 
+	// Late usage lands on every turn's branch; a build after it must not walk every entry again for a cut that did not move.
+	it("does not compute the cut again at the next build after a usage record appended off the current leaf", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const manager = await open(await writeSession(dir.path()));
+		manager.buildSessionContext();
+		// A write makes a1 whole; it goes back to the store when the cut is applied again, or at a recool.
+		const message = messageOf(entry(manager, "a1"));
+		if (message.role !== "assistant") throw new Error("expected an assistant message");
+		message.content = [{ type: "text", text: `rewritten ${BODY}` }];
+		expect(manager.coldStoreStats().coldEntries).toBe(1);
+
+		const recorded = manager.appendModelUsage(
+			{
+				purpose: "title",
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-20250514",
+				usage: usage(),
+				stopReason: "stop",
+			},
+			{ sessionId: manager.getSessionId(), parentId: "u2" },
+		);
+		expect(recorded).toBeDefined();
+		expect(manager.getLeafId()).toBe("a2");
+		manager.buildSessionContext();
+		expect(manager.coldStoreStats().coldEntries).toBe(1);
+
+		// Control: the entry belongs in the store, so applying the cut would have cooled it.
+		manager.recoolEntries();
+		expect(manager.coldStoreStats().coldEntries).toBe(2);
+	});
+
 	it("applies updateEntryBody to a cold entry's nested values and keeps the entry cold", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
 		const manager = await open(await writeSession(dir.path()));

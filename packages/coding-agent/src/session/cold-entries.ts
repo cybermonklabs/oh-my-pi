@@ -643,10 +643,12 @@ const STORE_FILE_NAME = /^(\d+)-[0-9a-f-]+\.jsonl$/;
 let staleStoresSwept = false;
 
 /**
- * Delete from `dir` the store files of processes that are gone, once per
- * process; for Windows, where a store's file is deleted only when the store
- * closes, is collected or at exit, so a killed process leaves its file, which
- * holds its entries unmasked. A file of a live process stays.
+ * Delete from `dir` the store files of processes that are gone, at the first
+ * store a process opens; for Windows, where a store's file is deleted only
+ * when the store closes, is collected or at exit, so a killed process leaves
+ * its file, which holds its entries unmasked. A file whose pid a live process
+ * has (its own, or a dead one's pid reused) stays until a later sweep finds
+ * that pid gone.
  */
 function sweepStaleStores(dir: string): void {
 	if (staleStoresSwept) return;
@@ -714,12 +716,13 @@ interface CachedRecord {
  * `os.tmpdir()/omp-cold-<uid>/`, a directory the account owns alone,
  * unlinked as soon as it is open on POSIX (its disk is freed when the
  * descriptor closes, and a killed process leaves nothing; on Windows it is
- * deleted when the store is closed or collected and at exit, and the next
- * process that opens a store deletes those of killed processes). A record is
- * the entry exactly as the manager held it, with image data replaced by blob
- * references. Every cold entry refers to its store, so a clone sharing the
- * entries keeps it open as long as it needs it; the last manager holding it
- * closes it when that manager closes ({@link release}).
+ * deleted when the store is closed or collected and at exit, and a later
+ * process deletes a killed process's file at its first store open, unless
+ * that pid is in use again). A record is the entry exactly as the manager
+ * held it, with image data replaced by blob references. Every cold entry
+ * refers to its store, so a clone sharing the entries keeps it open as long
+ * as it needs it; the last manager holding it closes it when that manager
+ * closes ({@link release}).
  */
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;

@@ -35,7 +35,7 @@
 - Rebuilding the context after a compaction, a branch move or a model change no longer fails when an older message's image cannot be written to a full disk as the message leaves memory; that message stays in memory instead
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them in memory instead
-- On Windows, the temporary file of older entry bodies that a killed omp process left behind is deleted by the next omp process that opens one
+- On Windows, the temporary file of older entry bodies that a killed omp process left behind is deleted when a later omp process opens its first such file, unless another live process has taken the killed process's pid
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
 - After `/delete` while a backgrounded command still runs, closing the session frees the temporary file of older entry bodies at once instead of at the next garbage collection
 - A subagent that answers an IRC message in the turn that message woke it for no longer sends the sender that answer a second time, reviving it, when the sender was parked before the turn ended
