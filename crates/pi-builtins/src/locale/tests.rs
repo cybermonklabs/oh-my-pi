@@ -751,11 +751,16 @@ fn a_child_forked_while_the_utility_is_written_leaves_it_runnable() {
 	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
 	LINGER.set(false);
 	let lingering = LINGERING.get().expect("a child was forked during the write");
-	// SAFETY: signal 0 sends nothing.
-	let alive = unsafe { libc::kill(lingering, 0) } == 0;
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_| None);
+	// Read before `end_lingering` reaps it: a child that exited early is a
+	// zombie until then, which `kill(pid, 0)` would still count as alive.
+	let (state, _) = state_and_threads(lingering);
 	end_lingering();
-	assert!(alive, "the child forked during the write ran on while the query ran");
+	assert!(
+		!matches!(state, b'Z' | b'X' | b'?'),
+		"the child forked during the write did not run on while the query ran: state {}",
+		char::from(state)
+	);
 	assert!(matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"), "{answer:?}");
 }
 
