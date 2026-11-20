@@ -88,31 +88,15 @@ fn masked(mut b: Vec<u8>) -> Vec<u8> {
 
 /// The real zsh's own function files, sorted: every file (but a `.zwc`
 /// digest) of the `$fpath` directories of `zsh -f` that lie in the
-/// directory zsh installed its functions in. That is the directory holding
-/// `compinit`, or the one above it when zsh installed its functions in
-/// subdirectories of their source tree (`--enable-function-subdirs`:
-/// `…/Completion/compinit`). The site and vendor directories, which hold
-/// other packages' functions, are not part of it. Empty (the calling test
-/// reported uncompared) when there is no such file.
+/// directory zsh installed its functions in
+/// ([`zsh_oracle::own_function_dirs`]). Empty (the calling test reported
+/// uncompared) when there is no such file.
 fn corpus() -> Vec<String> {
-	let (out, err, st) = run(true, "print -rl -- $fpath", &[]);
-	assert_eq!((err.as_str(), st), ("", 0), "zsh's $fpath");
-	let fpath: Vec<PathBuf> = out.lines().map(PathBuf::from).collect();
-	let fndir = fpath
-		.iter()
-		.find(|d| d.join("compinit").is_file())
-		.map(|d| {
-			if d.file_name().is_some_and(|n| n == "Completion") {
-				d.parent().unwrap_or(d).to_owned()
-			} else {
-				d.clone()
-			}
-		});
+	let Some((root, dirs)) = zsh_oracle::own_function_dirs() else {
+		return Vec::new();
+	};
 	let mut files = Vec::new();
-	for dir in fpath
-		.iter()
-		.filter(|d| fndir.as_ref().is_some_and(|f| d.starts_with(f)))
-	{
+	for dir in &dirs {
 		let Ok(entries) = fs::read_dir(dir) else {
 			continue;
 		};
@@ -129,7 +113,7 @@ fn corpus() -> Vec<String> {
 		zsh_oracle::uncompared(&format!(
 			"no corpus files found under the function directory of {}'s $fpath ({})",
 			zsh_oracle::path().display(),
-			fndir.map_or_else(|| "no compinit in it".to_owned(), |d| d.display().to_string())
+			root.display()
 		));
 	}
 	files

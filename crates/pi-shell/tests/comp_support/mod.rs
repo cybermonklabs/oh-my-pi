@@ -13,10 +13,7 @@
 
 pub mod comptest;
 
-use std::{
-	env,
-	path::{Path, PathBuf},
-};
+use std::{env, path::PathBuf};
 
 use crate::pty_support::{Spawn, have_real_zsh};
 
@@ -52,45 +49,23 @@ pub fn shell() -> Spawn {
 }
 
 /// The directories of zsh 5.9's shell-code completion functions
-/// (`_main_complete`, `compinit`, ...) as installed: one flat directory
-/// (macOS, `/usr/share/zsh/5.9/functions`) or the source-tree layout
-/// (Debian, `/usr/share/zsh/functions/Completion/Base`, ...). `None` when
-/// neither exists: the tests then compare nothing, and the calling test
-/// is reported [`crate::zsh_oracle::uncompared`].
+/// (`_main_complete`, `compinit`, ...) as the real zsh installed them
+/// ([`crate::zsh_oracle::own_function_dirs`]): one flat directory (macOS,
+/// `/usr/share/zsh/5.9/functions`) or the source-tree layout (Debian,
+/// `/usr/share/zsh/functions/Completion/Base`, ...). `None` without them:
+/// the tests then compare nothing, and the calling test is reported
+/// [`crate::zsh_oracle::uncompared`].
 #[must_use]
 pub fn compsys_fpath() -> Option<Vec<PathBuf>> {
-	const ROOTS: [&str; 2] = ["/usr/share/zsh/5.9/functions", "/usr/share/zsh/functions"];
-	for root in ROOTS {
-		let root = Path::new(root);
-		if root.join("_main_complete").is_file() && root.join("compinit").is_file() {
-			return Some(vec![root.to_owned()]);
-		}
-		if root.join("Completion/Base/_main_complete").is_file() {
-			let mut dirs = Vec::new();
-			for top in sorted_dirs(root) {
-				dirs.extend(sorted_dirs(&top));
-				dirs.push(top);
-			}
-			return Some(dirs);
-		}
+	let (root, dirs) = crate::zsh_oracle::own_function_dirs()?;
+	if dirs.iter().any(|d| d.join("_main_complete").is_file()) {
+		return Some(dirs);
 	}
 	crate::zsh_oracle::uncompared(&format!(
 		"zsh 5.9's completion functions are not installed (no _main_complete under {})",
-		ROOTS.join(" or ")
+		root.display()
 	));
 	None
-}
-
-fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
-	let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-		.into_iter()
-		.flatten()
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.is_dir())
-		.collect();
-	dirs.sort();
-	dirs
 }
 
 /// `fpath=( ... )` words for [`compsys_fpath`] (the paths need no quoting).

@@ -56,32 +56,81 @@ pub fn is_zsh_5_9() -> bool {
 	found
 }
 
+/// The real zsh's own `$fpath` (`zsh -f`): where this machine installed
+/// zsh's functions. `None`, the calling test reported [`uncompared`], when
+/// the real zsh is missing or cannot list it.
+#[must_use]
+pub fn fpath() -> Option<Vec<PathBuf>> {
+	if !exists() {
+		return None;
+	}
+	let zsh = path();
+	match Command::new(&zsh)
+		.args(["-f", "-c", "print -rl -- $fpath"])
+		.output()
+	{
+		Ok(out) if out.status.success() => Some(
+			String::from_utf8_lossy(&out.stdout)
+				.lines()
+				.map(PathBuf::from)
+				.collect(),
+		),
+		Ok(out) => {
+			uncompared(&format!(
+				"{} could not list its $fpath: {}",
+				zsh.display(),
+				String::from_utf8_lossy(&out.stderr).trim()
+			));
+			None
+		},
+		Err(e) => {
+			uncompared(&format!("{} could not list its $fpath: {e}", zsh.display()));
+			None
+		},
+	}
+}
+
+/// The directory the real zsh installed its own functions in, and the
+/// `$fpath` directories under it ([`fpath`]), in `$fpath`'s order. That
+/// directory holds `compinit`, or is the one above it when zsh installed
+/// its functions in subdirectories of their source tree
+/// (`--enable-function-subdirs`: `…/Completion/compinit`). The site and
+/// vendor directories, which hold other packages' functions, are left out.
+/// `None`, the calling test reported [`uncompared`], without them.
+#[must_use]
+pub fn own_function_dirs() -> Option<(PathBuf, Vec<PathBuf>)> {
+	let fpath = fpath()?;
+	let Some(root) = fpath
+		.iter()
+		.find(|d| d.join("compinit").is_file())
+		.map(|d| {
+			if d.file_name().is_some_and(|n| n == "Completion") {
+				d.parent().unwrap_or(d)
+			} else {
+				d
+			}
+		})
+		.map(Path::to_owned)
+	else {
+		uncompared(&format!("the $fpath of {} has no compinit", path().display()));
+		return None;
+	};
+	let dirs = fpath.into_iter().filter(|d| d.starts_with(&root)).collect();
+	Some((root, dirs))
+}
+
 /// The file of the function `name` in the real zsh's own `$fpath` (`zsh
 /// -f`), the first directory that has one, wherever this machine installed
 /// zsh's functions. `None`, the calling test reported [`uncompared`], when
 /// the real zsh is missing, cannot list its `$fpath`, or has no such file.
 #[must_use]
 pub fn function_file(name: &str) -> Option<PathBuf> {
-	if !exists() {
-		return None;
-	}
-	let zsh = path();
-	let listed = match Command::new(&zsh)
-		.args(["-f", "-c", "print -rl -- $fpath"])
-		.output()
-	{
-		Ok(out) => out.stdout,
-		Err(e) => {
-			uncompared(&format!("{} could not list its $fpath: {e}", zsh.display()));
-			return None;
-		},
-	};
-	let found = String::from_utf8_lossy(&listed)
-		.lines()
-		.map(|dir| Path::new(dir).join(name))
+	let found = fpath()?
+		.into_iter()
+		.map(|dir| dir.join(name))
 		.find(|file| file.is_file());
 	if found.is_none() {
-		uncompared(&format!("the $fpath of {} has no file {name}", zsh.display()));
+		uncompared(&format!("the $fpath of {} has no file {name}", path().display()));
 	}
 	found
 }
