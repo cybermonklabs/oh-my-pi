@@ -45,12 +45,13 @@ const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
 // spending Bun's default ten database backends for every omp process. Return
 // them between turns; a lifetime cap would only churn actively used connections.
 //
-// No connection-level setting is sent: PgBouncer before 1.26 (agents-postgres
-// runs 1.25.2 in transaction mode) refuses a `search_path` startup parameter,
-// and a transaction-mode pool would not keep a session-level `SET` for this
-// client anyway. The store locks `search_path` in each transaction instead
-// (`SET LOCAL`), which the pool keeps within that transaction, and names only
-// `pg_catalog` objects in the one statement it sends alone (the heartbeat).
+// No connection-level setting is sent: PgBouncer before 1.26 in transaction
+// mode refuses a `search_path` startup parameter, and a transaction-mode pool
+// would not keep a session-level `SET` for this client anyway. The store runs
+// each transaction on one connection it reserves, and its opening sets with
+// `SET LOCAL` every session setting the store depends on, `search_path`
+// included (see sql-session-postgres-settings.ts), which the pool keeps within
+// that transaction.
 const SESSION_SQL_POOL_MAX = 2;
 const SESSION_SQL_POOL_IDLE_TIMEOUT_SECONDS = 5;
 

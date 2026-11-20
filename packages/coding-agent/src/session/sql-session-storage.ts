@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type FileLockHandle, getBlobsDir, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
+import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
 import type { SessionBlobSweep, SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
@@ -20,6 +20,7 @@ import {
 } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
 import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-title-slot";
+import { PG_CONDITIONAL_PARAMETERS, PG_REPAIR_RETRIES, pgOpening } from "./sql-session-postgres-settings";
 
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
@@ -29,8 +30,8 @@ import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-ti
 export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
 
 /**
- * SQL executor shared by the pooled client and its transaction-scoped handle.
- * Bun's SQL client exposes a tagged-template API too,
+ * SQL executor shared by the pooled client, its transaction-scoped handle and
+ * a reserved connection. Bun's SQL client exposes a tagged-template API too,
  * but this implementation intentionally uses `unsafe(query, values)` because
  * the table identifier is validated and then inlined while values remain bound
  * parameters.
@@ -40,21 +41,49 @@ export interface SqlSessionStorageTransaction {
 }
 
 /**
- * Bun.SQL-compatible client. PostgreSQL and MySQL writes run in `transaction()`
- * so a session row and its parts change together; on SQLite the store issues
+ * One server connection that {@link SqlSessionStorageClient.reserve} gives the
+ * store alone, until the store calls `release()` (its transaction ended, and
+ * the pool may hand the connection to another caller) or `close()` (the
+ * store cannot repair the connection, so nobody may use it again). On it the
+ * store runs one PostgreSQL transaction that it opens and ends itself, and
+ * sends, in order:
+ * - the opening: one `unsafe()` call with no values (one simple query), which
+ *   begins the transaction (`BEGIN ISOLATION LEVEL READ COMMITTED`, then
+ *   `READ WRITE`, or `READ ONLY` for a read) and sets with `SET LOCAL` every
+ *   session setting the store's statements depend on (see
+ *   `sql-session-postgres-settings.ts`);
+ * - for a write, the read of `default_transaction_read_only`, and at start-up
+ *   the start-up lock;
+ * - the operation's statements, their values bound;
+ * - `COMMIT`, or `ROLLBACK` after an error. The store reads the `command` tag
+ *   of the `COMMIT` answer, as `Bun.SQL` gives it: `ROLLBACK` there fails the
+ *   operation.
+ * So a wrapper's `reserve()` must hand back one real server connection that
+ * sends each message of the store to that connection, and nothing else:
+ * `SET LOCAL`, the transaction and its locks hold only on that connection,
+ * and a wrapper that sends each message on any free connection runs the
+ * store's statements outside the transaction the store opened.
+ */
+export interface SqlSessionStorageReservedConnection {
+	unsafe(query: string, values?: unknown[]): Promise<SqlSessionStorageResult>;
+	release(): void | Promise<void>;
+	close(): Promise<void>;
+}
+
+/**
+ * Bun.SQL-compatible client. MySQL writes run in `transaction()` so a session
+ * row and its parts change together; on SQLite the store issues
  * `BEGIN IMMEDIATE` / `COMMIT` through `unsafe()` itself and runs one call at a
  * time per client, because Bun's SQLite adapter has a single connection.
- * On PostgreSQL every write, a single statement included, runs in
- * `transaction()` and starts with `SET TRANSACTION READ WRITE`, which takes
- * effect only as the first statement of a real transaction block, so a
- * wrapper's `transaction()` must open a real transaction before it calls the
- * callback (one that only calls the callback silently loses `READ WRITE`).
- * Such a wrapper also loses the start-up lock: in autocommit,
- * `pg_advisory_xact_lock` is released when its own statement ends, so stores
- * that start together race on `CREATE TABLE` again, and no error shows it.
+ * On PostgreSQL the store sends nothing through the client's own `unsafe()`
+ * or `transaction()`: it runs every statement on a connection that
+ * `reserve()` gives it (see {@link SqlSessionStorageReservedConnection}), so
+ * a PostgreSQL client must provide `reserve()`. MySQL and SQLite never call it.
  */
 export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 	transaction(callback: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void>;
+	/** One server connection for the store alone (PostgreSQL); `Bun.SQL` provides it. */
+	reserve?(): Promise<SqlSessionStorageReservedConnection>;
 	/**
 	 * `Bun.SQL` exposes the parsed connection options here. We only consult
 	 * `adapter` to pick the dialect; the field is typed as
@@ -628,8 +657,8 @@ const WRITE_ATTEMPTS = 5;
 const SETUP_LOCK_KEY = 0x6f6d705f73657373n;
 /**
  * `default_transaction_read_only` of this PostgreSQL connection, read inside
- * each store transaction (see `#readWrite`). `setting` is the session's own
- * value; `SET TRANSACTION READ WRITE` does not change it. `reset_val` is the
+ * each store write (see `#postgres`). `setting` is the session's own value;
+ * the opening's `READ WRITE` does not change it. `reset_val` is the
  * default the backend session started from: what the database, the role, the
  * server or the backend connection's start parameters set. Three cases:
  * - `setting` on, `reset_val` off: a session set read-only over a default
@@ -647,6 +676,47 @@ const READ_ONLY_REFUSAL =
 	"SqlSessionStorage: this session keeps a read-only default (default_transaction_read_only = on) " +
 	"that a database, role, server or connection-start setting gives it; the store overrides only " +
 	"a read-only value that a session set over a default that is off, so nothing was written.";
+/** Why `init()` refuses a PostgreSQL client that has no `reserve()` (see {@link SqlSessionStorageReservedConnection}). */
+const PG_NO_RESERVE =
+	"SqlSessionStorage: a PostgreSQL client must provide reserve(), which Bun.SQL does: " +
+	"the store runs each transaction on one reserved connection";
+/** The warning of each PostgreSQL connection the store closes because no transaction can repair it (see `#postgres`). */
+const PG_REPAIR_WARNING = "SqlSessionStorage closed a PostgreSQL connection it cannot repair";
+/** The operation a PostgreSQL transaction of the store runs for, as {@link PG_REPAIR_WARNING} names it. */
+type PgOperation =
+	| "open"
+	| "loadIndex"
+	| "readFull"
+	| "readSlices"
+	| "readFrom"
+	| "writeFull"
+	| "append"
+	| "updateSessionTitle"
+	| "remove"
+	| "move"
+	| "claim"
+	| "heartbeat"
+	| "release"
+	| "claimHolder"
+	| "blob.insert"
+	| "blob.sizes"
+	| "blob.read"
+	| "blob.wrong"
+	| "blob.repair"
+	| "blob.reference"
+	| "blob.sweep";
+/** The SQLSTATE of a PostgreSQL server error (Bun's `errno`), or `undefined` for any other error. */
+function pgSqlstate(error: unknown): string | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const errno = "errno" in error ? error.errno : undefined;
+	return typeof errno === "string" ? errno : undefined;
+}
+/** Bun's own code of an error (`ERR_POSTGRES_…`), or `undefined`. */
+function pgErrorCode(error: unknown): string | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const code = "code" in error ? error.code : undefined;
+	return typeof code === "string" ? code : undefined;
+}
 const utf8Decoder = new TextDecoder("utf-8");
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
@@ -766,22 +836,25 @@ function run(
 }
 
 /**
- * The first statement of every PostgreSQL transaction the store runs, and of
- * every read it sends on its own: every function, operator and type its
+ * Which of the opening's conditional parameters ({@link PG_CONDITIONAL_PARAMETERS})
+ * this server has: the probe, the store's first PostgreSQL statement, read in
+ * a transaction whose opening holds none of the statements that need them.
+ */
+const PG_PRESENT_PARAMETERS = statement(
+	"postgres",
+	"SELECT name FROM pg_catalog.pg_settings WHERE name IN " +
+		`(${PG_CONDITIONAL_PARAMETERS.map((_name, index) => `@p${index}`).join(", ")})`,
+);
+/**
+ * The schema of the store's PostgreSQL tables, which every statement names
+ * them with. The opening sets `search_path` to `pg_catalog, pg_temp` (see
+ * `sql-session-postgres-settings.ts`): every function, operator and type the
  * statements name is then found in `pg_catalog` alone (`pg_temp` is never
  * searched for functions or operators, and comes after `pg_catalog` for
- * relations), so one that a login with `CREATE` on the store's schema planted
- * there, an exact match where `pg_catalog` has only one through an implicit
- * cast (the CVE-2018-1058 class), is never picked. The store's own tables are
- * named `public.<table>` ({@link PG_SCHEMA}). `SET LOCAL` ends with the
- * transaction, so a transaction-mode pooler hands nothing on. The CLI's
- * client sets no connection-level `search_path` (PgBouncer before 1.26
- * refuses one), so this lock is what every statement runs under.
+ * relations), so one that a login with `CREATE` on the store's schema
+ * planted there, an exact match where `pg_catalog` has only one through an
+ * implicit cast, is never picked.
  */
-const PG_SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
-/** The heartbeat's opening: search_path lock and both bounds in one simple query, so they cost one round trip. */
-const PG_HEARTBEAT_OPENING = `${PG_SEARCH_PATH}; SET LOCAL lock_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}; SET LOCAL idle_in_transaction_session_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`;
-/** The schema of the store's PostgreSQL tables, which every statement names them with. */
 const PG_SCHEMA = "public";
 /**
  * The lease table's indexes keyed by `holder` alone, whatever their names: the
@@ -871,46 +944,19 @@ interface HolderIndexNameRow {
 }
 
 /**
- * `query` with each bound value written into it as an untyped literal, so it
- * can go in one simple query with {@link PG_SEARCH_PATH}: Bun neither
- * pipelines nor binds values in a multi-statement query, and one round trip
- * per read is what a read cost before the lock. A value is dollar-quoted with
- * a tag that occurs nowhere in it and that its end cannot make with the
- * closing `$` (a value ending in `$omp` would close `$omp$…$omp$` early), so
- * nothing in it is read as SQL whatever `standard_conforming_strings` is; a
- * space on each side keeps the quote apart from the text around it. As an
- * untyped literal it takes its type from where it is used, as an unbound
- * parameter does from its first use. Numbers go in as their decimal digits;
- * only integers are bound. A string holding NUL, which a simple query cannot
- * carry, is refused, as PostgreSQL refuses it as a bound text value.
+ * The columns of one of the store's PostgreSQL tables, as {@link SqlSessionStorageBackend}'s table check reads
+ * them: each column's type by its OID and modifier, beside the OID this server gives each declared type (see
+ * {@link PG_DECLARED_COLUMNS}), so the check compares numbers and answers the same whatever
+ * `quote_all_identifiers` is. `type`, the type's name, is for a refusal's text only.
  */
-function inlinePostgres(query: Statement, values: StatementValues): string {
-	const literals = query.params.map(name => {
-		const value = values[name];
-		if (value === undefined) throw new Error(`SqlSessionStorage: no value bound for @${name}`);
-		if (value === null) return "NULL";
-		let text: string;
-		if (typeof value === "string") text = value;
-		else if (typeof value === "number" && Number.isSafeInteger(value)) text = String(value);
-		else throw new Error(`SqlSessionStorage: cannot write @${name} into a read (${typeof value})`);
-		if (text.includes("\0")) throw new Error(`SqlSessionStorage: @${name} holds a NUL character`);
-		let tag = "omp";
-		for (let n = 0; `${text}$`.includes(`$${tag}$`); n++) tag = `omp${n}`;
-		return ` $${tag}$${text}$${tag}$ `;
-	});
-	// One pass over the statement's own text: a written value is never read again.
-	return query.sql.replace(/\$(\d+)/g, (_marker, index: string) => {
-		const literal = literals[Number(index) - 1];
-		if (literal === undefined) throw new Error(`SqlSessionStorage: no value bound for $${index}`);
-		return literal;
-	});
-}
-
-/** The columns of one of the store's PostgreSQL tables, as {@link SqlSessionStorageBackend}'s table check reads them. */
 const PG_TABLE_COLUMNS = statement(
 	"postgres",
-	"SELECT a.attname AS name, pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, " +
-		"a.atthasdef AS has_default, a.attgenerated::text AS generated, a.attidentity::text AS identity " +
+	"SELECT a.attname AS name, a.atttypid::text AS type_oid, a.atttypmod AS type_mod, " +
+		"pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, " +
+		"a.atthasdef AS has_default, a.attgenerated::text AS generated, a.attidentity::text AS identity, " +
+		"'pg_catalog.text'::pg_catalog.regtype::pg_catalog.oid::text AS text_oid, " +
+		"'pg_catalog.int8'::pg_catalog.regtype::pg_catalog.oid::text AS bigint_oid, " +
+		"'pg_catalog.bytea'::pg_catalog.regtype::pg_catalog.oid::text AS bytea_oid " +
 		"FROM pg_catalog.pg_attribute a WHERE a.attrelid = pg_catalog.to_regclass(@table) AND a.attnum > 0 " +
 		"AND NOT a.attisdropped",
 );
@@ -988,7 +1034,12 @@ function primaryKeyProblem(found: readonly string[], wanted: readonly string[]):
 	if ([...found].sort().join(", ") === [...wanted].sort().join(", ")) return undefined;
 	return found.length === 0 ? "no primary key" : `primary key (${found.join(", ")}), not (${wanted.join(", ")})`;
 }
-/** The columns of the store's PostgreSQL tables and their declared types, as `format_type` prints them. */
+/** A type the store declares a PostgreSQL column with. */
+type PgDeclaredType = "text" | "bigint" | "bytea";
+/**
+ * The columns of the store's PostgreSQL tables and their declared types: a column must have the OID of its
+ * type, as {@link PG_TABLE_COLUMNS} reads it, and no type modifier.
+ */
 const PG_DECLARED_COLUMNS = {
 	session: {
 		path: "text",
@@ -1010,15 +1061,20 @@ const PG_DECLARED_COLUMNS = {
 		acquired_at: "bigint",
 		heartbeat_at: "bigint",
 	},
-} satisfies Record<string, Record<string, string>>;
+} satisfies Record<string, Record<string, PgDeclaredType>>;
 
 /** {@link PG_TABLE_COLUMNS} row. */
 interface TableColumnRow {
 	name: string;
+	type_oid: string;
+	type_mod: number | string;
 	type: string;
 	has_default: boolean;
 	generated: string;
 	identity: string;
+	text_oid: string;
+	bigint_oid: string;
+	bytea_oid: string;
 }
 
 /** {@link PG_TABLE_OBJECTS} row. */
@@ -1039,7 +1095,7 @@ function buildQueries(
 	leaseExpiryMs: number,
 	schema?: string,
 ): DialectQueries {
-	// PostgreSQL statements name every table with its schema, since they run under PG_SEARCH_PATH.
+	// PostgreSQL statements name every table with its schema: the opening sets search_path to pg_catalog, pg_temp.
 	const relation = (relationName: string): string =>
 		schema === undefined ? relationName : `${quoteIdentifier(schema)}.${relationName}`;
 	const table = relation(name);
@@ -2020,6 +2076,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#maxBlobBytes: Promise<number> | undefined;
 	/** The `maxBlobBytes` option, or {@link MAX_BLOB_BYTES}. */
 	readonly #maxRowBlobBytes: number;
+	/**
+	 * The conditional parameters of the opening this PostgreSQL server has, as
+	 * the probe read them at start-up: every later opening is `pgOpening` of them.
+	 */
+	#present: ReadonlySet<string> = new Set();
 	/** The blob table's writes and reads; every content write below waits for the blobs queued before it. */
 	readonly blobs: SqlBlobTier = new SqlBlobTier(this);
 
@@ -2102,12 +2163,23 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 					);
 				}
 			}
+			if (this.#adapter === "postgres") {
+				// Before any statement: the store sends every PostgreSQL statement on a reserved connection.
+				if (typeof this.#client.reserve !== "function") throw new Error(PG_NO_RESERVE);
+				// The probe, with no conditional statement in its opening: which of them this server takes.
+				const present = (await this.#readOne(
+					"open",
+					PG_PRESENT_PARAMETERS,
+					listValues("p", PG_CONDITIONAL_PARAMETERS),
+				)) as Array<{ name: string }>;
+				this.#present = new Set(present.map(row => row.name));
+			}
 			// One look at the PostgreSQL tables and the server, for a store that
 			// would write there (claims, or makes tables): a server in recovery
 			// accepts no write, so the store refuses to start on it.
 			const look =
 				this.#adapter === "postgres" && (this.#gate === "row" || this.#createTable)
-					? (((await this.#readOne(PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[])[0] ??
+					? (((await this.#readOne("open", PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[])[0] ??
 						undefined)
 					: undefined;
 			if (look && pgTrue(look.in_recovery)) {
@@ -2136,7 +2208,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// table, under it would leave the lease table without one. #checkTables
 			// then refuses whatever holds the name.
 			const createIndex = indexMade ? undefined : lease?.createIndex;
-			const { columns, holder } = await this.#read(async executor => ({
+			const { columns, holder } = await this.#read("open", async executor => ({
 				columns: new Set(
 					((await run(executor, this.#q.columns, { table: this.#relation(this.#table) })) as ColumnRow[]).map(
 						row => row.column_name.toLowerCase(),
@@ -2155,7 +2227,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			// MySQL's UPDATE locks every row it scans, so a no-op backfill would
 			// still wait for, and block, every write in flight.
-			if ((await this.#readOne(this.#q.findUnmeasured)).length > 0) {
+			if ((await this.#readOne("open", this.#q.findUnmeasured)).length > 0) {
 				await this.#setup(this.#q.backfillByteLen);
 			}
 			if (createIndex && holder && !holder.indexed && !holder.nameTakenBy) await this.#setup(createIndex);
@@ -2422,7 +2494,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async #deleteLease(lease: LeaseQueries, sessionId: string): Promise<void> {
 		const values = { sid: sessionId, holder: this.#holder };
 		if (this.#adapter === "postgres") {
-			await this.#readWrite(async transaction => {
+			await this.#postgres("release", "write", async transaction => {
 				await transaction.unsafe(`SET LOCAL statement_timeout = ${LEASE_RELEASE_BOUND_MS}`);
 				await run(transaction, lease.release, values);
 			});
@@ -2521,7 +2593,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async #runClaim(claim: LeaseClaim): Promise<boolean> {
 		await claim.after;
 		for (const file of claim.paths.keys()) {
-			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch(() => [""]);
+			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch((err: unknown) => {
+				// On PostgreSQL only a path with no session row yet has no header; any other failed read fails the claim.
+				if (this.#adapter === "postgres" && !isEnoent(err)) throw err;
+				return [""];
+			});
 			const id = headerSessionId(head ?? "");
 			if (id !== undefined && id !== (claim.headers.get(file) ?? claim.sessionId)) {
 				claim.foreign = true;
@@ -2535,7 +2611,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		let held = false;
 		try {
 			if (this.#adapter === "postgres") {
-				await this.#readWrite(async transaction => {
+				await this.#postgres("claim", "write", async transaction => {
 					await transaction.unsafe(`SET LOCAL lock_timeout = ${claim.lockBoundMs}`);
 					if (lease.claimLock) await run(transaction, lease.claimLock, values);
 					held = (await run(transaction, lease.claim, values)).length > 0;
@@ -2604,14 +2680,18 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Refresh the lease rows of every claim this store still holds, in one
 	 * statement, and no other row of its: a row whose release gave up (see
 	 * {@link release}) is left to expire instead of staying held while the
-	 * store lives. PostgreSQL sends every heartbeat through {@link #readWrite}
-	 * on its first try: its lock and idle-in-transaction timeouts are `SET
-	 * LOCAL`, so no session setting crosses a transaction-mode pool. Its row
-	 * locks can last through one COMMIT round trip, but the server ends a
-	 * stalled transaction 1.5 s before a fence would mark its claim lost. A
-	 * heartbeat whose transaction or COMMIT answer is lost is a failed beat:
-	 * it leaves every claim as it is until another database answer proves it
-	 * held or lost.
+	 * store lives. On PostgreSQL a heartbeat is a write of {@link #postgres}
+	 * from its first try, so the read-only check refuses it as it refuses every
+	 * write; then one message sets its lock and idle-in-transaction bounds with
+	 * `SET LOCAL` (see {@link LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}), so no
+	 * session setting crosses a transaction-mode pool, and the update binds
+	 * the holder token and the session ids. Its row locks can last through the
+	 * runner's COMMIT round trip, but the server ends a stalled transaction
+	 * 1.5 s before a fence would mark its claim lost. A heartbeat whose
+	 * transaction or COMMIT answer is lost (the server ended a stalled one, and
+	 * the runner closed its connection) is a failed beat: it leaves every claim
+	 * as it is until another database answer proves it held or lost, and the
+	 * next beat runs on a new connection.
 	 */
 	async #beat(): Promise<void> {
 		const lease = this.#q.lease;
@@ -2626,11 +2706,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const [index, claim] of live.entries()) values[`sid${index}`] = claim.sessionId;
 			let refreshed: Array<{ session_id: string }> = [];
 			if (this.#adapter === "postgres") {
-				await this.#readWrite(async transaction => {
-					refreshed = (await run(transaction, lease.heartbeat(live.length), values)) as Array<{
-						session_id: string;
-					}>;
-				}, "heartbeat");
+				refreshed = await this.#postgres("heartbeat", "write", async transaction => {
+					await transaction.unsafe(
+						`SET LOCAL lock_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}; ` +
+							`SET LOCAL idle_in_transaction_session_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`,
+					);
+					return (await run(transaction, lease.heartbeat(live.length), values)) as Array<{ session_id: string }>;
+				});
 			} else {
 				// Two statements on their own, in no transaction: a lock wait timeout of the update (with
 				// `innodb_rollback_on_timeout` ON or OFF) fails this heartbeat alone, and leaves no transaction
@@ -2683,7 +2765,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#probeLease(sessionId: string): Promise<LeaseProbeRow[]> {
 		const lease = this.#q.lease;
 		if (!lease) return Promise.resolve([]);
-		return this.#readOne(lease.probe, { sid: sessionId }) as Promise<LeaseProbeRow[]>;
+		return this.#readOne("claimHolder", lease.probe, { sid: sessionId }) as Promise<LeaseProbeRow[]>;
 	}
 
 	/**
@@ -2746,15 +2828,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * and its OS lock keeps every other claimant.
 	 */
 	async #fencedTransaction(
+		operation: PgOperation,
 		fences: readonly LeaseFence[],
 		work: (transaction: SqlSessionStorageTransaction) => Promise<void>,
 	): Promise<void> {
 		const lease = this.#q.lease;
-		if (!lease || this.#gate !== "row" || fences.length === 0) return this.#transaction(work);
+		if (!lease || this.#gate !== "row" || fences.length === 0) return this.#transaction(operation, work);
 		const deadline = performance.now() + LEASE_FENCE_LOCK_BOUND_MS;
 		for (;;) {
 			try {
-				await this.#transaction(async transaction => {
+				await this.#transaction(operation, async transaction => {
 					await this.#runFences(transaction, lease, fences, deadline);
 					await work(transaction);
 				});
@@ -2768,12 +2851,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * The fence statements of {@link #fencedTransaction}. On PostgreSQL they alone
-	 * run under the fence's lock bound: the transaction's own `lock_timeout`
-	 * (a client's session setting, or the server's) is read as the bound is
-	 * set, in one statement, and set back after them, so the write that
-	 * follows waits as the client asked. On MySQL and MariaDB a refused read
-	 * before `deadline` throws {@link FenceLockRefused}, so the caller runs the
-	 * whole transaction again; one at or past it refuses the write.
+	 * run under the fence's lock bound: `SET LOCAL lock_timeout` sets it before
+	 * them and sets it back `TO DEFAULT` after them, the value the opening gave
+	 * the transaction (the login's, the database's or the server's), so the
+	 * write that follows waits as that default says. On MySQL and MariaDB a
+	 * refused read before `deadline` throws {@link FenceLockRefused}, so the
+	 * caller runs the whole transaction again; one at or past it refuses the write.
 	 */
 	async #runFences(
 		transaction: SqlSessionStorageTransaction,
@@ -2782,15 +2865,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		deadline: number,
 	): Promise<void> {
 		const postgres = this.#adapter === "postgres";
-		let prior: string | undefined;
-		if (postgres) {
-			const [row] = (await transaction.unsafe(
-				"SELECT p.prior, pg_catalog.set_config('lock_timeout', $1, true) AS bound " +
-					"FROM (SELECT pg_catalog.current_setting('lock_timeout') AS prior OFFSET 0) AS p",
-				[String(LEASE_FENCE_LOCK_BOUND_MS)],
-			)) as Array<{ prior?: unknown }>;
-			prior = typeof row?.prior === "string" ? row.prior : "0";
-		}
+		if (postgres) await transaction.unsafe(`SET LOCAL lock_timeout = ${LEASE_FENCE_LOCK_BOUND_MS}`);
 		for (const { claim, sessionId, file } of fences) {
 			const values = { sid: sessionId, holder: this.#holder };
 			try {
@@ -2809,9 +2884,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (claim) this.#markLost(claim);
 			throw new SessionLeaseLostError(file, sessionId);
 		}
-		if (prior !== undefined) {
-			await transaction.unsafe("SELECT pg_catalog.set_config('lock_timeout', $1, true)", [prior]);
-		}
+		if (postgres) await transaction.unsafe("SET LOCAL lock_timeout TO DEFAULT");
 	}
 
 	/** After a move: the claim `src` was written under now covers `dst`. */
@@ -2844,7 +2917,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * table that was there, init looks for the index first. The look (init's,
 	 * `look`) also reads the connection's read-only default, and refuses to
 	 * start on one the session keeps, as a write would (see
-	 * {@link #readWrite}), though it makes nothing. On MySQL and SQLite each
+	 * {@link #postgres}), though it makes nothing. On MySQL and SQLite each
 	 * table is made on its own, as before.
 	 */
 	async #createTables(look: TablesPresentRow | undefined): Promise<boolean> {
@@ -2869,7 +2942,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			return false;
 		}
 		let indexMade = false;
-		await this.#readWrite(async transaction => {
+		await this.#postgres("open", "start-up", async transaction => {
 			const [now] = (await run(transaction, PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[];
 			const missing: string[] = [];
 			if (!pgTrue(now?.session)) missing.push(this.#q.createTable);
@@ -2888,7 +2961,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				}
 			}
 			if (missing.length > 0) await transaction.unsafe(missing.join("; "));
-		}, "start-up");
+		});
 		return indexMade;
 	}
 
@@ -2948,8 +3021,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * moment on a PostgreSQL database without the tables would race: two
 	 * `CREATE TABLE IF NOT EXISTS` of one name both find no table, and one
 	 * fails (SQLSTATE 23505, 42P07 or 42710). So there every start-up
-	 * statement runs in its own transaction behind the start-up opening of
-	 * `#readWrite`, which takes one transaction-scoped advisory lock; they run
+	 * statement runs in its own start-up transaction of {@link #postgres},
+	 * which takes one transaction-scoped advisory lock; they run
 	 * one after another, and the lock ends with the transaction. Each
 	 * statement keeps its own transaction, so a duplicate-column error still
 	 * fails only its own ALTER. The tables themselves are made together, by
@@ -2961,79 +3034,144 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			await this.#writeAlone(executor => executor.unsafe(query));
 			return;
 		}
-		await this.#readWrite(transaction => transaction.unsafe(query), "start-up");
+		await this.#postgres("open", "start-up", transaction => transaction.unsafe(query));
 	}
 
 	/**
-	 * Run one write outside any store transaction: on PostgreSQL in a
-	 * read-write transaction of its own (see `#readWrite`), elsewhere straight
-	 * on the client. On SQLite it does not use the call queue, so the caller
+	 * Run one write outside any store transaction, straight on the client
+	 * (MySQL and SQLite: PostgreSQL runs every statement in {@link #postgres}).
+	 * On SQLite it does not use the call queue, so the caller
 	 * must already hold `#exclusive` (`init` does), or
 	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
 	 * connection.
 	 */
 	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
-		if (this.#adapter === "postgres") await this.#readWrite(write);
-		else await write(this.#client);
+		await write(this.#client);
 	}
 
 	/**
-	 * Run `work` in one PostgreSQL transaction that starts with `opening`.
-	 * Used on PostgreSQL only.
+	 * Run `work` in one PostgreSQL transaction on a connection of its own: the
+	 * only way the store sends a statement on PostgreSQL, so no session
+	 * setting that another client of a transaction-mode pool left on a server
+	 * connection reaches one. Each attempt:
+	 * 1. `reserve()` a connection.
+	 * 2. The opening, `pgOpening(mode, present)` as one simple query: `BEGIN
+	 *    ISOLATION LEVEL READ COMMITTED`, `READ ONLY` for a read and `READ
+	 *    WRITE` otherwise, then `SET LOCAL` of every session setting the
+	 *    store's statements depend on (see `sql-session-postgres-settings.ts`).
+	 *    `SET LOCAL` ends with the transaction, so the store leaves nothing on
+	 *    the connection either.
+	 * 3. For a write, the read of `setting` and `reset_val` of
+	 *    `default_transaction_read_only` ({@link READ_ONLY_SETTINGS}). A pooled
+	 *    connection can carry another client's session-level
+	 *    `default_transaction_read_only = on`; PostgreSQL then refuses every
+	 *    write, even `CREATE TABLE IF NOT EXISTS` on a table that exists
+	 *    (SQLSTATE 25006), but honours the opening's `READ WRITE` whatever that
+	 *    default is. The read gives three cases:
+	 *    - A session value over a default that is off (`setting` on,
+	 *      `reset_val` off): the store overrides it, and `work` runs.
+	 *    - A read-only default that the backend session keeps (both on): the
+	 *      store honours it. The database, the role, the server or the backend
+	 *      connection's start parameters set it, so it is an operator's or a
+	 *      provider's decision (a provider can make a database read-only when
+	 *      its disk is nearly full). The transaction fails with
+	 *      {@link READ_ONLY_REFUSAL} before `work` runs, with nothing written.
+	 *    - A session that turned such a default off (`setting` off,
+	 *      `reset_val` on): `work` runs, as it did before the store read this
+	 *      setting.
+	 *    A transaction-mode pooler applies a client's start parameters and its
+	 *    `connect_query` to the backend with `SET`, so the store overrides them
+	 *    like any session value. Any other answer, no row included, lets
+	 *    `work` run. At start-up (see `#setup`) the start-up advisory lock
+	 *    comes next, so an honoured default refuses before any wait. The
+	 *    opening's `READ COMMITTED` holds whatever `default_transaction_isolation`
+	 *    is: under `repeatable read` a start-up transaction's snapshot would be
+	 *    taken before its lock wait, and a backfill would then fail with
+	 *    SQLSTATE 40001.
+	 * 4. `work`, on the reserved connection alone.
+	 * 5. `COMMIT`, then `release()`. A `COMMIT` that answers `ROLLBACK` fails
+	 *    with an error naming `operation`.
 	 *
-	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of
-	 * `setting` and `reset_val` of `default_transaction_read_only` (see
-	 * {@link READ_ONLY_SETTINGS}). A pooled connection can carry another
-	 * client's session-level `default_transaction_read_only = on` (a
-	 * transaction-mode pooler hands one backend to many clients, and a session
-	 * `SET` stays on it); PostgreSQL then refuses every write, even
-	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
-	 * but honours `READ WRITE` set as a transaction's first statement whatever
-	 * that default is. The read gives three cases:
-	 * - A session value over a default that is off (`setting` on, `reset_val`
-	 *   off): the store overrides it, and `work` runs.
-	 * - A read-only default that the backend session keeps (both on): the
-	 *   store honours it. The database, the role, the server or the backend
-	 *   connection's start parameters set it, so it is an operator's or a
-	 *   provider's decision (a provider can make a database read-only when its
-	 *   disk is nearly full). The transaction fails before `work` runs, with
-	 *   nothing written.
-	 * - A session that turned such a default off (`setting` off, `reset_val`
-	 *   on): `work` runs, as it did before the store read this setting.
-	 * A transaction-mode pooler applies a client's start parameters and its
-	 * `connect_query` to the backend with `SET`, so the store overrides them
-	 * like any session value. Any other answer, no row included, lets `work`
-	 * run.
-	 *
-	 * The start-up opening (see `#setup`) adds `READ COMMITTED` before the
-	 * read and the start-up advisory lock after it. Under a `repeatable read`
-	 * default the snapshot would be taken before the lock wait, and a
-	 * backfill would then fail with SQLSTATE 40001. The lock comes after the
-	 * read, so an honoured default refuses before any wait.
-	 *
-	 * The three openings differ in what else they send:
-	 *
-	 * - `"write"` (default): `SET LOCAL search_path` alone.
-	 * - `"start-up"`: `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
-	 *   before the read, and the start-up advisory lock after it.
-	 * - `"heartbeat"`: `SET LOCAL search_path`, `SET LOCAL lock_timeout`
-	 *   and `SET LOCAL idle_in_transaction_session_timeout` in one simple
-	 *   query ({@link PG_HEARTBEAT_OPENING}), so the beat shares the
-	 *   store's read-only refusal and cannot drift from it.
+	 * A failure:
+	 * - Repairless: an error in answer to the opening (a pooler's own refusal
+	 *   included), a connection that ended before that answer, or SQLSTATE
+	 *   25006 (`read_only_sql_transaction`) or 42501 (`insufficient_privilege`)
+	 *   from a later statement: the connection carries something no
+	 *   transaction sets back (`cloudsql_session_read_only = locked`, a `SET
+	 *   SESSION AUTHORIZATION`). The store sends no `ROLLBACK`, closes the
+	 *   connection, so no caller gets it again, writes
+	 *   {@link PG_REPAIR_WARNING}, and runs the attempt again on a new one, at
+	 *   most {@link PG_REPAIR_RETRIES} times; the last attempt's error is
+	 *   thrown.
+	 * - The connection ended after the opening's answer, `COMMIT` included:
+	 *   the store closes it and throws, and runs nothing again, since whether
+	 *   `work` committed is unknown and an append is not idempotent.
+	 * - Any other error, `work`'s own included: `ROLLBACK`, `release()`, and
+	 *   the error thrown. When the `ROLLBACK` fails, the store closes the
+	 *   connection and throws the first error.
+	 * - A refused `reserve()` is thrown as it is.
+	 * The store's other retries (a deadlock victim, a move's key collision, a
+	 * blob write) each run a whole call again. `work` must never wait for
+	 * another transaction of this store: in a pool of one server connection it
+	 * would wait for its own.
 	 */
-	#readWrite(
-		work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>,
-		opening: "write" | "start-up" | "heartbeat" = "write",
-	): Promise<void> {
-		return this.#client.transaction(async transaction => {
-			await transaction.unsafe("SET TRANSACTION READ WRITE");
-			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-			await transaction.unsafe(opening === "heartbeat" ? PG_HEARTBEAT_OPENING : PG_SEARCH_PATH);
-			const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
-			if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
-			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
-			await work(transaction);
-		});
+	async #postgres<T>(
+		operation: PgOperation,
+		mode: "read" | "write" | "start-up",
+		work: (transaction: SqlSessionStorageReservedConnection) => Promise<T>,
+	): Promise<T> {
+		const opening = pgOpening(mode === "read" ? "read" : "write", this.#present);
+		for (let attempt = 1; ; attempt++) {
+			const reserving = this.#client.reserve?.();
+			if (!reserving) throw new Error(PG_NO_RESERVE);
+			const reserved = await reserving;
+			let opened = false;
+			let result: T;
+			let committed: SqlSessionStorageResult;
+			try {
+				await reserved.unsafe(opening);
+				opened = true;
+				if (mode !== "read") {
+					const [readOnly] = (await reserved.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
+					if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+					if (mode === "start-up") await reserved.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
+				}
+				result = await work(reserved);
+				committed = await reserved.unsafe("COMMIT");
+			} catch (err) {
+				const sqlstate = pgSqlstate(err);
+				if (!opened || sqlstate === "25006" || sqlstate === "42501") {
+					await reserved.close();
+					logger.warn(PG_REPAIR_WARNING, {
+						operation,
+						sqlstate: sqlstate ?? pgErrorCode(err),
+						message: toError(err).message,
+						attempt,
+					});
+					if (attempt <= PG_REPAIR_RETRIES) continue;
+					throw err;
+				}
+				if (pgErrorCode(err) === "ERR_POSTGRES_CONNECTION_CLOSED") {
+					await reserved.close();
+					throw err;
+				}
+				try {
+					await reserved.unsafe("ROLLBACK");
+				} catch {
+					await reserved.close();
+					throw err;
+				}
+				await reserved.release();
+				throw err;
+			}
+			await reserved.release();
+			if ("command" in committed && committed.command === "ROLLBACK") {
+				throw new Error(
+					`SqlSessionStorage: PostgreSQL rolled back the ${operation} transaction; its COMMIT answered ROLLBACK`,
+				);
+			}
+			return result;
+		}
 	}
 
 	/**
@@ -3057,14 +3195,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Run `work` in one transaction. On SQLite it opens with `BEGIN IMMEDIATE`,
 	 * taking the write lock up front, so a writer in another process makes it
-	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it starts
-	 * with the write opening of `#readWrite`. On PostgreSQL and MySQL a
+	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it is a
+	 * write of {@link #postgres}. On PostgreSQL and MySQL a
 	 * transaction the database aborts as a deadlock victim runs again; each
 	 * one recomputes everything under its own locks. A refused read-only
 	 * default is no deadlock and does not run again.
 	 */
-	#transaction(work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> {
-		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#readWrite(work));
+	#transaction(
+		operation: PgOperation,
+		work: (transaction: SqlSessionStorageTransaction) => Promise<void>,
+	): Promise<void> {
+		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#postgres(operation, "write", work));
 		if (this.#adapter === "mysql") return this.#retryDeadlocks(() => this.#client.transaction(work));
 		return this.#exclusive(async () => {
 			await this.#client.unsafe("BEGIN IMMEDIATE");
@@ -3144,7 +3285,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async #columns(table: string): Promise<Set<string>> {
-		const rows = (await this.#read(executor =>
+		const rows = (await this.#read("open", executor =>
 			run(executor, this.#q.columns, { table: this.#relation(table) }),
 		)) as ColumnRow[];
 		return new Set(rows.map(row => row.column_name.toLowerCase()));
@@ -3156,33 +3297,28 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * Run a read: on PostgreSQL in a transaction of its own that starts with
-	 * {@link PG_SEARCH_PATH}, as every other statement does; elsewhere
-	 * straight on the client.
+	 * Run a read: on PostgreSQL in a `READ ONLY` transaction of its own (see
+	 * {@link #postgres}), as every other statement there; elsewhere straight
+	 * on the client.
 	 */
-	async #read<T>(work: (executor: SqlSessionStorageTransaction) => Promise<T>): Promise<T> {
+	async #read<T>(operation: PgOperation, work: (executor: SqlSessionStorageTransaction) => Promise<T>): Promise<T> {
 		if (this.#adapter !== "postgres") return work(this.#client);
-		let result!: T;
-		await this.#client.transaction(async transaction => {
-			await transaction.unsafe(PG_SEARCH_PATH);
-			result = await work(transaction);
-		});
-		return result;
+		return this.#postgres(operation, "read", work);
 	}
 
 	/**
-	 * Run one read statement: on PostgreSQL in one simple query behind
-	 * {@link PG_SEARCH_PATH}, which holds for the query's implicit
-	 * transaction, so the read costs the one round trip it did before the lock
-	 * (see {@link inlinePostgres}); elsewhere straight on the client.
+	 * Run one read statement: on PostgreSQL in a `READ ONLY` transaction of its
+	 * own, its values bound (see {@link #postgres}); elsewhere straight on the
+	 * client.
 	 */
-	async #readOne(query: Statement | string, values: StatementValues = {}): Promise<SqlSessionStorageResult> {
+	async #readOne(
+		operation: PgOperation,
+		query: Statement | string,
+		values: StatementValues = {},
+	): Promise<SqlSessionStorageResult> {
 		const statement = typeof query === "string" ? { sql: query, params: [] } : query;
 		if (this.#adapter !== "postgres") return run(this.#client, statement, values);
-		const results = await this.#client.unsafe(`${PG_SEARCH_PATH}; ${inlinePostgres(statement, values)}`);
-		const rows = results[1];
-		if (!Array.isArray(rows)) throw new Error("SqlSessionStorage: a PostgreSQL read answered no rows for its query");
-		return rows as SqlSessionStorageResult;
+		return this.#postgres(operation, "read", reserved => run(reserved, statement, values));
 	}
 
 	/**
@@ -3217,7 +3353,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * make the table a partition of a table of its own whose partition key
 	 * calls its function;
 	 * PostgreSQL finds those through its catalogs, not through search_path, so
-	 * {@link PG_SEARCH_PATH} does not stop them. So every column must be the
+	 * the opening's `search_path` does not stop them. So every column must be the
 	 * store's, of its declared built-in type, with no default, generation or
 	 * identity, and no other column may exist: the store's inserts leave every
 	 * other column to its default, which the store cannot vet cheaply, and the
@@ -3231,7 +3367,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			await this.#checkKeysAndGrants();
 			return;
 		}
-		const tables: Array<[string, Record<string, string>]> = [
+		const tables: Array<[string, Record<string, PgDeclaredType>]> = [
 			[this.#table, PG_DECLARED_COLUMNS.session],
 			[`${this.#table}_parts`, PG_DECLARED_COLUMNS.parts],
 			[`${this.#table}_blobs`, PG_DECLARED_COLUMNS.blobs],
@@ -3239,7 +3375,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		];
 		if (this.#q.lease) tables.push([this.#leaseTable, PG_DECLARED_COLUMNS.lease]);
 		const problems: string[] = [];
-		await this.#read(async executor => {
+		await this.#read("open", async executor => {
 			for (const [name, declared] of tables) {
 				const relation = this.#relation(name);
 				const columns = (await run(executor, PG_TABLE_COLUMNS, { table: relation })) as TableColumnRow[];
@@ -3248,7 +3384,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				for (const [column, type] of Object.entries(declared)) {
 					const row = columns.find(candidate => candidate.name === column);
 					if (!row) found.push(`no column ${column}`);
-					else if (row.type !== type) found.push(`column ${column} of type ${row.type}, not ${type}`);
+					else if (row.type_oid !== row[`${type}_oid` as const] || Number(row.type_mod) !== -1) {
+						found.push(`column ${column} of type ${row.type}, not ${type}`);
+					}
 				}
 				for (const row of columns) {
 					if (!(row.name in declared)) found.push(`column ${row.name}, which the store does not declare`);
@@ -3337,7 +3475,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const [suffix, needs] of Object.entries(BLOB_TABLE_NEEDS)) {
 				const table = `${this.#table}_${suffix}`;
 				// Start-up already holds the SQLite queue (see init), so this reads straight through.
-				const rows = (await this.#read(executor => run(executor, keyQuery, { table }))) as Array<{ name: unknown }>;
+				const rows = (await this.#read("open", executor => run(executor, keyQuery, { table }))) as Array<{
+					name: unknown;
+				}>;
 				const keyProblem = primaryKeyProblem(
 					rows.map(row => String(row.name).toLowerCase()),
 					needs.key,
@@ -3347,7 +3487,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		for (const { table, privilege, probe } of this.#q.privilegeProbes) {
 			try {
-				await this.#fencedTransaction([], transaction => run(transaction, probe, {}).then(() => undefined));
+				await this.#fencedTransaction("open", [], transaction => run(transaction, probe, {}).then(() => undefined));
 			} catch (err) {
 				problems.push(`the store's login cannot ${privilege} on table ${table} (${toError(err).message})`);
 			}
@@ -3360,7 +3500,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
-		const rows = (await this.#exclusive(() => this.#readOne(this.#q.loadIndex))) as IndexRow[];
+		const rows = (await this.#exclusive(() => this.#readOne("loadIndex", this.#q.loadIndex))) as IndexRow[];
 		return rows.map(row => {
 			if (row.byte_len === null) {
 				throw new Error(
@@ -3380,7 +3520,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async readFull(path: string): Promise<string | null> {
-		const rows = (await this.#exclusive(() => this.#readOne(this.#q.readFull, { path }))) as ContentRow[];
+		const rows = (await this.#exclusive(() => this.#readOne("readFull", this.#q.readFull, { path }))) as ContentRow[];
 		let head: string | undefined;
 		const parts: Array<{ offset: number; content: string }> = [];
 		for (const row of rows) {
@@ -3394,7 +3534,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const rows = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readSlices, { path, prefix: prefixBytes, suffix: suffixBytes }),
+			this.#readOne("readSlices", this.#q.readSlices, { path, prefix: prefixBytes, suffix: suffixBytes }),
 		)) as SliceRow[];
 		let session: SliceRow | undefined;
 		const headParts: Array<{ offset: number; bytes: Uint8Array | null }> = [];
@@ -3418,7 +3558,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			MAX_PIECE_BYTES,
 		);
 		const rows = (await this.#exclusive(() =>
-			this.#readOne(this.#q.readFrom, {
+			this.#readOne("readFrom", this.#q.readFrom, {
 				path,
 				offset,
 				end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(offset + take, Number.MAX_SAFE_INTEGER),
@@ -3471,7 +3611,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#withBlobRefs(named, allowGone =>
-			this.#fencedTransaction(fences, async transaction => {
+			this.#fencedTransaction("writeFull", fences, async transaction => {
 				if (expectedSize === null) {
 					const result = await run(transaction, this.#q.insertRowIfMissing, row);
 					const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
@@ -3519,7 +3659,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
-		await this.#fencedTransaction(fences, async transaction => {
+		await this.#fencedTransaction("updateSessionTitle", fences, async transaction => {
 			await run(transaction, this.#q.updateTitle, {
 				path,
 				title: title.title ?? null,
@@ -3538,7 +3678,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#withBlobRefs(named, allowGone =>
-			this.#fencedTransaction(fences, async transaction => {
+			this.#fencedTransaction("append", fences, async transaction => {
 				// A store that claims sessions refuses to append onto bytes it did not
 				// write (another writer that claims nothing, such as an older omp,
 				// changed or replaced the file), so `SessionManager` can read the file
@@ -3566,7 +3706,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#withBlobRefs(named, allowGone =>
-			this.#fencedTransaction(fences, transaction => this.#addRefs(transaction, path, named, allowGone)),
+			this.#fencedTransaction("blob.reference", fences, transaction =>
+				this.#addRefs(transaction, path, named, allowGone),
+			),
 		);
 	}
 
@@ -3639,7 +3781,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async insertBlob(hash: string, data: Uint8Array, mimeType: string | undefined, limit: number): Promise<boolean> {
 		const created = Date.now();
 		let added = false;
-		await this.#fencedTransaction([], async transaction => {
+		await this.#fencedTransaction("blob.insert", [], async transaction => {
 			const parts = new Map<string, Uint8Array>();
 			const keys: string[] = [];
 			if (data.byteLength > limit) {
@@ -3694,7 +3836,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const bound = Math.min(this.#maxRowBlobBytes, MAX_BLOB_BYTES);
 		const query = this.#q.maxPacket;
 		if (!query) return Promise.resolve(bound);
-		this.#maxBlobBytes ??= this.#exclusive(() => this.#readOne(query, {})).then(
+		this.#maxBlobBytes ??= this.#exclusive(() => this.#readOne("blob.insert", query, {})).then(
 			rows => {
 				const packet = Number((rows as Array<{ max_packet?: unknown }>)[0]?.max_packet);
 				if (!Number.isFinite(packet) || packet <= 0) {
@@ -3715,7 +3857,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const sizes = new Map<string, number>();
 		for (const batch of batches(hashes, BLOB_READ_BATCH)) {
 			const query = this.#q.selectBlobSizes(batch.length);
-			const rows = (await this.#exclusive(() => this.#readOne(query, listValues("h", batch)))) as BlobSizeRow[];
+			const rows = (await this.#exclusive(() =>
+				this.#readOne("blob.sizes", query, listValues("h", batch)),
+			)) as BlobSizeRow[];
 			for (const row of rows) sizes.set(row.sha256, rowNumber(row.byte_len));
 		}
 		return sizes;
@@ -3735,7 +3879,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			const values = listValues("h", batch);
 			batch = [];
 			bytes = 0;
-			const rows = (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[];
+			const rows = (await this.#exclusive(() => this.#readOne("blob.read", query, values))) as BlobRow[];
 			for (const row of rows) await visit(row.sha256, await this.#wholeBlob(row));
 		};
 		for (const [hash, size] of await this.blobSizes(hashes)) {
@@ -3754,7 +3898,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const parts = new Map<string, Buffer>();
 		for (const batch of batches(keys, BLOB_READ_BATCH)) {
 			const query = this.#q.selectBlobs(batch.length);
-			const rows = (await this.#exclusive(() => this.#readOne(query, listValues("h", batch)))) as BlobRow[];
+			const rows = (await this.#exclusive(() =>
+				this.#readOne("blob.read", query, listValues("h", batch)),
+			)) as BlobRow[];
 			for (const part of rows) {
 				parts.set(part.sha256, Buffer.from(part.content.buffer, part.content.byteOffset, part.content.byteLength));
 			}
@@ -3770,14 +3916,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			const values = listValues("h", batch);
 			if (digests) {
 				const query = digests(batch.length);
-				for (const row of (await this.#exclusive(() => this.#readOne(query, values))) as BlobDigestRow[]) {
+				for (const row of (await this.#exclusive(() =>
+					this.#readOne("blob.wrong", query, values),
+				)) as BlobDigestRow[]) {
 					const digest = typeof row.digest === "string" ? row.digest : Buffer.from(row.digest).toString("latin1");
 					if (digest.toLowerCase() !== row.sha256) wrong.push(row.sha256);
 				}
 				continue;
 			}
 			const query = this.#q.selectBlobs(batch.length);
-			for (const row of (await this.#exclusive(() => this.#readOne(query, values))) as BlobRow[]) {
+			for (const row of (await this.#exclusive(() => this.#readOne("blob.wrong", query, values))) as BlobRow[]) {
 				if (rowNumber(row.byte_len) === row.content.byteLength && blobSha256(row.content) !== row.sha256) {
 					wrong.push(row.sha256);
 				}
@@ -3789,7 +3937,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** Rewrite the row of `hash` with `data`, bytes that hash to it; answers false for one over `limit`, left as it is. */
 	async repairBlob(hash: string, data: Uint8Array, limit: number): Promise<boolean> {
 		if (data.byteLength > limit) return false;
-		await this.#fencedTransaction([], transaction =>
+		await this.#fencedTransaction("blob.repair", [], transaction =>
 			run(transaction, this.#q.repairBlob, { sha256: hash, content: data, len: data.byteLength }).then(
 				() => undefined,
 			),
@@ -3807,11 +3955,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
 		if (apply) {
 			// The references of paths that have no session row, each dropped with its blob's row locked exclusive.
-			const dangling = (await this.#exclusive(() => this.#readOne(this.#q.danglingRefs, {}))) as RefRow[];
+			const dangling = (await this.#exclusive(() =>
+				this.#readOne("blob.sweep", this.#q.danglingRefs, {}),
+			)) as RefRow[];
 			const byHash = new Map<string, string[]>();
 			for (const row of dangling) byHash.set(row.sha256, [...(byHash.get(row.sha256) ?? []), row.path]);
 			for (const batch of batches([...byHash.keys()].sort(), BLOB_READ_BATCH)) {
-				await this.#fencedTransaction([], async transaction => {
+				await this.#fencedTransaction("blob.sweep", [], async transaction => {
 					const look = this.#q.sessionRowsOf;
 					if (look) {
 						await this.#dropDanglingRefs(transaction, look, batch, byHash);
@@ -3829,7 +3979,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 		}
 		const rows = (await this.#exclusive(() =>
-			this.#readOne(this.#q.sweepCandidates, { before: beforeMs }),
+			this.#readOne("blob.sweep", this.#q.sweepCandidates, { before: beforeMs }),
 		)) as BlobSizeRow[];
 		const sizes = new Map(
 			rows.filter(row => !referenced.has(row.sha256)).map(row => [row.sha256, rowNumber(row.byte_len)]),
@@ -3841,7 +3991,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		for (const batch of batches([...sizes.keys()], BLOB_READ_BATCH)) {
 			let deleted: string[] = [];
-			await this.#fencedTransaction([], async transaction => {
+			await this.#fencedTransaction("blob.sweep", [], async transaction => {
 				// The candidates' rows and their parts' rows, in one pass, before any reference goes.
 				const locked = await this.#lockBlobRows(
 					transaction,
@@ -3871,8 +4021,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
-		const there = under ? undefined : await this.#sessionRowsThere(paths);
-		await this.#fencedTransaction(fences, async transaction => {
+		const there = under ? undefined : await this.#sessionRowsThere("remove", paths);
+		await this.#fencedTransaction("remove", fences, async transaction => {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
 			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
@@ -3890,7 +4040,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {
 		if (src === dst) {
-			const rows = await this.#exclusive(() => this.#readOne(this.#q.exists, { path: src }));
+			const rows = await this.#exclusive(() => this.#readOne("move", this.#q.exists, { path: src }));
 			if (rows.length === 0) throw enoent(src);
 			return;
 		}
@@ -3921,8 +4071,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		noReplace: boolean,
 		fences: readonly LeaseFence[],
 	): Promise<void> {
-		const there = await this.#sessionRowsThere([src, dst]);
-		await this.#fencedTransaction(fences, async transaction => {
+		const there = await this.#sessionRowsThere("move", [src, dst]);
+		await this.#fencedTransaction("move", fences, async transaction => {
 			// Both session rows first, in path order, before either changes; only rows there are change. A `dst`
 			// with no row is taken by the UPDATE below, after `src`'s (see docs/session.md, "Races").
 			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
@@ -4012,11 +4162,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * snapshot, comes after its locks: the parts and references it then reads
 	 * hold every write of those paths that committed. Elsewhere `undefined`.
 	 */
-	async #sessionRowsThere(paths: readonly string[]): Promise<ReadonlySet<string> | undefined> {
+	async #sessionRowsThere(operation: PgOperation, paths: readonly string[]): Promise<ReadonlySet<string> | undefined> {
 		const look = this.#q.sessionRowsOf;
 		if (!look) return undefined;
 		const ordered = [...new Set(paths)].sort();
-		const rows = (await this.#readOne(look(ordered.length), listValues("p", ordered))) as PathRow[];
+		const rows = (await this.#readOne(operation, look(ordered.length), listValues("p", ordered))) as PathRow[];
 		return new Set(rows.map(row => row.path));
 	}
 
