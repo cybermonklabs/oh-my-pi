@@ -1022,17 +1022,17 @@ mod tests {
 	}
 
 	/// The reference binary as a real daemon: module listing and a password
-	/// login, over TCP.
+	/// login, over TCP. The reference is the conformance suite's rsync 3.5.1,
+	/// so the test runs wherever that suite does (and fails like it when the
+	/// Jobs require one): openrsync (`/usr/bin/rsync` on macOS) has no daemon
+	/// mode, and older distro rsyncs (3.2.x, protocol 31) negotiate down.
 	#[cfg(unix)]
 	#[test]
 	fn live_reference_daemon_listing_and_auth() {
-		let Some(rsync) = ["/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", "/usr/bin/rsync"]
-			.into_iter()
-			.map(Path::new)
-			.find(|p| p.exists() && is_protocol_33_samba_rsync(p))
-		else {
+		let Some(rsync) = crate::rsync::conformance::reference() else {
 			return;
 		};
+		let rsync = rsync.as_path();
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
 		std::fs::create_dir(root.join("data")).unwrap();
@@ -1100,17 +1100,6 @@ mod tests {
 		let err = daemon_handshake(&mut conn, &cfg, &logger).unwrap_err();
 		assert_eq!(err.message.as_deref(), Some("@ERROR: auth failed on module priv"));
 		assert_eq!(err.code, 5);
-	}
-
-	/// A samba rsync whose daemon negotiates protocol 33, which the test pins.
-	/// openrsync (`/usr/bin/rsync` on macOS) has no daemon mode, and older
-	/// distro rsyncs (3.2.x, protocol 31) negotiate down.
-	#[cfg(unix)]
-	fn is_protocol_33_samba_rsync(path: &Path) -> bool {
-		std::process::Command::new(path).arg("--version").output().is_ok_and(|out| {
-			let version = String::from_utf8_lossy(&out.stdout);
-			version.starts_with("rsync  version 3.") && version.contains("protocol version 33")
-		})
 	}
 
 	#[test]

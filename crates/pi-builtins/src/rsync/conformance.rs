@@ -30,8 +30,10 @@
 //! local-time output uses one zone on both sides), matching the test host's
 //! empty shell environment; the fake remote shell, the reference server, and
 //! the password files are named by the same absolute paths on both sides.
-//! The suite skips itself when no rsync 3.5.1 is installed. Set
-//! `RSYNC_CONFORMANCE_FILTER=<substring>` to run only matching scenarios.
+//! The suite skips itself when no rsync 3.5.1 is installed, unless
+//! `RSYNC_REFERENCE_REQUIRED` is set; a 3.5.1 without xxhash, lz4 or zstd
+//! fails it (see [`reference`]). Set `RSYNC_CONFORMANCE_FILTER=<substring>`
+//! to run only matching scenarios.
 #![cfg(unix)]
 
 mod cases;
@@ -105,18 +107,34 @@ struct Outcome {
 	tree: Snapshot,
 }
 
-/// The reference rsync 3.5.1 binary, when one is installed. Other versions
-/// are skipped: the builtin's output is byte-for-byte 3.5.1's.
-fn reference() -> Option<PathBuf> {
+/// The reference rsync 3.5.1 binary, when one is installed (Homebrew's, or
+/// the first on `PATH`). Other versions are skipped: the builtin's output is
+/// byte-for-byte 3.5.1's. The rsync daemon tests use it too.
+///
+/// A run that cannot compare says so instead of passing:
+/// - with `RSYNC_REFERENCE_REQUIRED` set (the test Jobs set it), no 3.5.1
+///   fails the caller;
+/// - a 3.5.1 built without the checksums and compressors the builtin
+///   offers (xxhash, lz4, zstd) fails it too, since its transfers differ
+///   from the builtin's for that reason alone.
+pub(super) fn reference() -> Option<PathBuf> {
 	let mut candidates = vec![PathBuf::from("/opt/homebrew/bin/rsync")];
 	if let Some(path) = std::env::var_os("PATH") {
 		candidates.extend(std::env::split_paths(&path).map(|d| d.join("rsync")));
 	}
-	candidates.into_iter().find(|p| {
-		Command::new(p).arg("--version").env_clear().output().is_ok_and(|o| {
-			String::from_utf8_lossy(&o.stdout).starts_with("rsync  version 3.5.1  protocol version 33\n")
-		})
-	})
+	let found = candidates.into_iter().find_map(|p| {
+		let o = Command::new(&p).arg("--version").env_clear().output().ok()?;
+		let version = String::from_utf8_lossy(&o.stdout).into_owned();
+		version.starts_with("rsync  version 3.5.1  protocol version 33\n").then_some((p, version))
+	});
+	let Some((path, version)) = found else {
+		let required = std::env::var_os("RSYNC_REFERENCE_REQUIRED").is_some_and(|v| !v.is_empty());
+		assert!(!required, "no rsync 3.5.1 on PATH, and RSYNC_REFERENCE_REQUIRED is set");
+		return None;
+	};
+	let missing: Vec<&str> = ["xxh128", "lz4", "zstd"].into_iter().filter(|name| !version.contains(name)).collect();
+	assert!(missing.is_empty(), "the reference {} was built without {missing:?}:\n{version}", path.display());
+	Some(path)
 }
 
 fn now_ns() -> i128 {
