@@ -39,6 +39,23 @@ pub(crate) fn effective_uid() -> Option<u32> {
 	}
 }
 
+/// The error `lchown` gives a new symlink of this process's when asked to
+/// hand it to `uid`, a foreign owner; `None` where the owner changed. The
+/// tests of the ownership rule need such a symlink, which root alone can make
+/// and only where `uid` is mapped: a user namespace that maps root alone
+/// answers `EINVAL`.
+#[cfg(all(test, unix))]
+pub(crate) fn foreign_owner_refused(uid: u32) -> Option<std::io::Error> {
+	let dir = match tempfile::tempdir() {
+		Ok(dir) => dir,
+		Err(error) => return Some(error),
+	};
+	let probe = dir.path().join("probe");
+	std::os::unix::fs::symlink("target", &probe)
+		.and_then(|()| std::os::unix::fs::lchown(&probe, Some(uid), Some(uid)))
+		.err()
+}
+
 /// Which id space a list or map is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {

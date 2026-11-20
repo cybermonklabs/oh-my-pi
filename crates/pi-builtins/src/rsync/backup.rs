@@ -1119,6 +1119,10 @@ mod tests {
 		if crate::rsync::ids::effective_uid() != Some(0) {
 			return;
 		}
+		if let Some(error) = crate::rsync::ids::foreign_owner_refused(1) {
+			eprintln!("skipped: the foreign-owner part: a symlink cannot be given to uid 1: {error}");
+			return;
+		}
 		link(&base, "via", dest.to_str().unwrap());
 		std::os::unix::fs::lchown(base.join("via"), Some(1), Some(1)).unwrap();
 		let (ctx, trees, _) = setup(&base.join("via"), backup_opts(Some("bk"), ""), &OUT);
