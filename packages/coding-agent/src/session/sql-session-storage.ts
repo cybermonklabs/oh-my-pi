@@ -1724,7 +1724,9 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	override async drain(): Promise<void> {
 		try {
 			await super.drain();
-			// A blob that still does not land was warned about, and failed the transcript write that named it.
+			// A blob this land tries and still cannot land is warned about; one its pass did not try (see SqlBlobTier)
+			// gets no warning line of its own, since its failure names the blob whose write ended the pass. Either
+			// stays queued, and the drain does not reject for it.
 			await this.#backend.blobs.land().catch(() => undefined);
 		} finally {
 			await this.#backend.releasesSettled();
@@ -1755,9 +1757,19 @@ export class SqlSessionStorage extends IndexedSessionStorage {
  * most n + 1 lands (each image's own, which {@link store} starts, and the
  * write's), so it closes at most 4(n + 1); one whose transaction then finds
  * k of the blobs it names gone meets at most k + 1 more, which land them
- * again ({@link reland}). A drain ({@link SqlSessionStorage.drain}, which
- * lands every queued blob) is a call of its own and one land, so it closes
- * at most 4 more, however many blobs stay queued.
+ * again ({@link reland}). A session open that writes m images back to the
+ * table (`restoreTierBlobs` in session-loader.ts) meets at most m + 1 lands
+ * (one per image it queues, and its reference's), so it closes at most
+ * 4(m + 1) from lands; its reference transaction, like a transcript
+ * write's, meets k + 1 more when it finds k of the blobs gone. Its other
+ * calls are operations of their own, at most 4 closes each: each batch it
+ * reads (blob sizes, rows whose bytes do not hash to their key, blob bytes),
+ * each row it rewrites, and the reference transaction. On connections that
+ * are all repairless its first read, of blob sizes, fails, so it queues no
+ * image and writes no reference: it closes 4. A drain
+ * ({@link SqlSessionStorage.drain}, which lands every queued blob) is a call
+ * of its own and one land, so it closes at most 4 more, however many blobs
+ * stay queued.
  *
  * Bytes that do not hash to their reference are never stored. A blob larger
  * than one row takes is stored as parts (see {@link BLOB_PARTS_PATH}).
@@ -1795,8 +1807,11 @@ class SqlBlobTier implements SessionBlobTier {
 	/**
 	 * Land the queued blobs among `hashes` (every queued blob, without
 	 * `hashes`), behind the ones queued before them. Rejects when one of
-	 * `hashes` did not land in its tries (see {@link SqlBlobTier}); it stays
-	 * queued. Another blob that fails does not reject it.
+	 * `hashes` did not land in its tries, and also for one the pass did not
+	 * try: a blob queued before it whose write's repairs are spent ends the
+	 * pass, and the rejection has that write's error as its cause (see
+	 * {@link SqlBlobTier}, which states the rule). Either way it stays
+	 * queued. Another blob's failure rejects it in no other way.
 	 */
 	async land(hashes?: Iterable<string>): Promise<void> {
 		const wanted =
@@ -3654,7 +3669,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			title_updated_at: title?.updatedAt ?? null,
 			len: bytes.byteLength,
 		};
-		// The blobs this content names land first (see SqlBlobTier); no other blob holds it up.
+		// The blobs this content names land first (see SqlBlobTier). A blob queued before them whose write's
+		// repairs are spent ends that land's pass, so this write is rejected for a named blob the pass did not try.
 		const named = namedBlobHashes(content);
 		await this.blobs.land(named);
 		const fences = this.#fencesOf([path]);
@@ -3721,7 +3737,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void> {
 		const values = { path, content: line, mtime: mtimeMs, len: Buffer.byteLength(line, "utf8") };
-		// The blobs this line names land first (see SqlBlobTier); no other blob holds it up.
+		// The blobs this line names land first (see SqlBlobTier). A blob queued before them whose write's
+		// repairs are spent ends that land's pass, so this write is rejected for a named blob the pass did not try.
 		const named = namedBlobHashes(line);
 		await this.blobs.land(named);
 		const fences = this.#fencesOf([path]);
