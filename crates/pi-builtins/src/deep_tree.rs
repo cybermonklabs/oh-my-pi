@@ -28,6 +28,41 @@ impl Drop for RemoveTree {
 	}
 }
 
+/// Makes the directory `top` and a chain of `depth` directories `d` below
+/// it, with a file `f` at each level that holds the level's number.
+pub(crate) fn file_chain(top: &std::path::Path, depth: usize) {
+	let mut path = top.to_path_buf();
+	std::fs::create_dir(&path).unwrap();
+	for level in 0..depth {
+		std::fs::write(path.join("f"), level.to_string()).unwrap();
+		path.push("d");
+		std::fs::create_dir(&path).unwrap();
+	}
+}
+
+/// Asserts that `copy` holds what [`file_chain`] made: each level's file,
+/// and nothing below the last level.
+pub(crate) fn assert_file_chain(copy: &std::path::Path, depth: usize) {
+	let mut path = copy.to_path_buf();
+	for level in 0..depth {
+		assert_eq!(std::fs::read_to_string(path.join("f")).unwrap(), level.to_string(), "level {level}");
+		path.push("d");
+	}
+	assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0, "the last level is empty");
+}
+
+/// Lowers the open-file limit of this process to `limit`. The limit belongs
+/// to the whole process, so the caller runs in a process of its own.
+#[cfg(unix)]
+pub(crate) fn limit_descriptors(limit: libc::rlim_t) {
+	let mut old = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+	// SAFETY: a plain getrlimit and setrlimit of this process, which no other
+	// test shares.
+	assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut old) }, 0);
+	let new = libc::rlimit { rlim_cur: limit, rlim_max: old.rlim_max };
+	assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const new) }, 0);
+}
+
 #[cfg(unix)]
 mod tests {
 	use std::{fs, path::Path};
