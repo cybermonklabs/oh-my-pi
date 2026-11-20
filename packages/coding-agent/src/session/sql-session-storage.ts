@@ -3064,10 +3064,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * 3. For a write, the read of `setting` and `reset_val` of
 	 *    `default_transaction_read_only` ({@link READ_ONLY_SETTINGS}). A pooled
 	 *    connection can carry another client's session-level
-	 *    `default_transaction_read_only = on`; PostgreSQL then refuses every
-	 *    write, even `CREATE TABLE IF NOT EXISTS` on a table that exists
-	 *    (SQLSTATE 25006), but honours the opening's `READ WRITE` whatever that
-	 *    default is. The read gives three cases:
+	 *    `default_transaction_read_only = on` (a transaction-mode pooler hands
+	 *    one backend to many clients, and a session `SET` stays on it);
+	 *    PostgreSQL then refuses every write, even `CREATE TABLE IF NOT EXISTS`
+	 *    on a table that exists (SQLSTATE 25006), but honours a transaction's
+	 *    own `READ WRITE`, which the opening's `BEGIN ... READ WRITE` sets,
+	 *    whatever that default is. The read gives three cases:
 	 *    - A session value over a default that is off (`setting` on,
 	 *      `reset_val` off): the store overrides it, and `work` runs.
 	 *    - A read-only default that the backend session keeps (both on): the
@@ -3083,11 +3085,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *    `connect_query` to the backend with `SET`, so the store overrides them
 	 *    like any session value. Any other answer, no row included, lets
 	 *    `work` run. At start-up (see `#setup`) the start-up advisory lock
-	 *    comes next, so an honoured default refuses before any wait. The
-	 *    opening's `READ COMMITTED` holds whatever `default_transaction_isolation`
-	 *    is: under `repeatable read` a start-up transaction's snapshot would be
-	 *    taken before its lock wait, and a backfill would then fail with
-	 *    SQLSTATE 40001.
+	 *    comes after the read, so an honoured default refuses before any
+	 *    wait. The opening's `READ COMMITTED`, set in `BEGIN` before the read,
+	 *    holds whatever `default_transaction_isolation` is: under
+	 *    `repeatable read` a start-up transaction's snapshot would be taken
+	 *    before its lock wait, and a backfill would then fail with SQLSTATE
+	 *    40001.
 	 * 4. `work`, on the reserved connection alone.
 	 * 5. `COMMIT`, then `release()`. A `COMMIT` that answers `ROLLBACK` fails
 	 *    with an error naming `operation`.
