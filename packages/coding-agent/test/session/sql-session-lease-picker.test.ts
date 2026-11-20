@@ -9,12 +9,13 @@
  * directory (a `--session-dir` would start a new session instead of resuming one), with the picker answered by the
  * fixture and the agent session never started: its `createAgentSession` reads the lease rows and tries the other
  * holder's claim, then stops the launch. PostgreSQL and MySQL run when `OMP_TEST_SQL_POSTGRES_URL` /
- * `OMP_TEST_SQL_MYSQL_URL` name a server.
+ * `OMP_TEST_SQL_MYSQL_URL` name a server. On file storage under `OMP_SESSION_EXCLUSIVE=1`, a pick of that same
+ * session is an explicit resume: it waits for another process's lease on it, as `--resume <id>` does.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { cliDatabase, ROW_LEASE_BACKENDS } from "./sql-session-lease-fixture";
+import { cliDatabase, LeaseProcess, ROW_LEASE_BACKENDS, transcript } from "./sql-session-lease-fixture";
 
 const sourceDir = path.resolve(import.meta.dir, "../../src");
 const RECENT = "01a1fa00-0000-7000-8000-000000000001";
@@ -25,6 +26,8 @@ interface Observation {
 	offered?: string[];
 	rowsRecentAtPicker?: number;
 	sessionId?: string;
+	/** The file the launch wrote its turn to (file storage). */
+	sessionFile?: string;
 	rowsRecent?: number;
 	rowsPicked?: number;
 	otherClaimsRecent?: boolean;
@@ -180,3 +183,115 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 		}, 90_000);
 	});
 }
+
+/**
+ * The launch's startup on file storage under `OMP_SESSION_EXCLUSIVE=1`, in `dir` with `home`'s directories (those a
+ * `LeaseProcess` started with `home` uses), the picker answering {@link RECENT}; once the agent session would start
+ * it writes one turn and stops. The running process, whose stderr the caller reads.
+ */
+function startFileLaunch(dir: TempDir, home: string): Bun.Subprocess<"ignore", "pipe", "pipe"> {
+	const script = `
+		import { parseArgs } from ${JSON.stringify(path.join(sourceDir, "cli/args.ts"))};
+		import { runRootCommand } from ${JSON.stringify(path.join(sourceDir, "main.ts"))};
+		import { Settings } from ${JSON.stringify(path.join(sourceDir, "config/settings.ts"))};
+		import { AuthStorage } from ${JSON.stringify(path.join(sourceDir, "session/auth-storage.ts"))};
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		const settings = Settings.isolated({
+			autoResume: true, retry: { enabled: false }, marketplace: { autoUpdate: "off" },
+			telemetry: { otlpExportEnabled: false },
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		const args = ["--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-lsp", "--no-extensions",
+			"--resume", "--print", "hello"];
+		const stop = new Error("fixture stops the launch before the agent session");
+		const observation = {};
+		let manager;
+		try {
+			await runRootCommand(parseArgs(args), args, {
+				settings,
+				discoverAuthStorage: async () => authStorage,
+				selectSession: async sessions => sessions.find(session => session.id === ${JSON.stringify(RECENT)}) ?? null,
+				createAgentSession: async options => {
+					manager = options.sessionManager;
+					observation.sessionId = manager?.getSessionId();
+					manager.appendMessage({ role: "user", content: "written by the launch", timestamp: Date.now() });
+					await manager.flush();
+					observation.sessionFile = manager.getSessionFile();
+					throw stop;
+				},
+			});
+		} catch (error) {
+			if (error !== stop) observation.error = String((error && error.stack) || error);
+		} finally {
+			await manager?.close();
+			authStorage.close();
+		}
+		console.log("OBSERVATION:" + JSON.stringify(observation));
+		process.exit(0);
+	`;
+	return Bun.spawn([process.execPath, "--eval", script], {
+		cwd: dir.path(),
+		env: {
+			PATH: process.env.PATH,
+			HOME: home,
+			USERPROFILE: home,
+			PI_CODING_AGENT_DIR: path.join(home, "agent"),
+			XDG_CONFIG_HOME: path.join(home, "config"),
+			XDG_DATA_HOME: path.join(home, "data"),
+			XDG_STATE_HOME: path.join(home, "state"),
+			XDG_CACHE_HOME: path.join(home, "cache"),
+			TMPDIR: process.env.TMPDIR,
+			NO_COLOR: "1",
+			PI_NO_TITLE: "1",
+			OMP_SESSION_EXCLUSIVE: "1",
+			// The session-owner lease directory the holder (started with this test's environment) uses.
+			...(process.env.PI_TEST_SESSION_OWNERS_DIR
+				? { PI_TEST_SESSION_OWNERS_DIR: process.env.PI_TEST_SESSION_OWNERS_DIR }
+				: {}),
+		},
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		signal: AbortSignal.timeout(60_000),
+	});
+}
+
+describe("omp --resume with autoResume on, picking the session it resumed, under OMP_SESSION_EXCLUSIVE=1 (file storage)", () => {
+	it("waits for another process's lease on that session, then writes it under its own id", async () => {
+		using dir = TempDir.createSync("@omp-lease-picker-file-");
+		const home = dir.join("home");
+		const config = { dsn: "", table: "", leaseTable: "", storage: "file" as const };
+		await using holder = await LeaseProcess.start(config, home);
+		const { sessionDir } = await holder.run({ op: "defaultSessionDir", cwd: dir.path() });
+		if (!sessionDir) throw new Error("the holder named no session directory");
+		const file = path.join(sessionDir, `2026-11-19T00-00-00-000Z_${RECENT}.jsonl`);
+		await Bun.write(file, transcript(RECENT, "the most recent", dir.path()));
+		expect((await holder.run({ op: "hold", file, sessionDir })).sessionId).toBe(RECENT);
+
+		const launch = startFileLaunch(dir, home);
+		const waitLine = `Session ${RECENT} is held by another omp process; waiting up to 35 s for its lease to go`;
+		const decoder = new TextDecoder();
+		const reader = launch.stderr.getReader();
+		let stderr = "";
+		// The holder ends only once the launch says it waits on the holder's lease, or once the launch is over.
+		for (let read = await reader.read(); !read.done; read = await reader.read()) {
+			stderr += decoder.decode(read.value, { stream: true });
+			if (stderr.includes(waitLine)) break;
+		}
+		const waited = stderr.includes(waitLine);
+		await holder[Symbol.asyncDispose]();
+		for (let read = await reader.read(); !read.done; read = await reader.read()) {
+			stderr += decoder.decode(read.value, { stream: true });
+		}
+		const [exitCode, stdout] = await Promise.all([launch.exited, new Response(launch.stdout).text()]);
+		const line = stdout.split("\n").find(row => row.startsWith("OBSERVATION:"));
+		const observation = line ? (JSON.parse(line.slice("OBSERVATION:".length)) as Observation) : undefined;
+
+		expect({ waited, exitCode, observation }, stderr).toEqual({
+			waited: true,
+			exitCode: 0,
+			observation: { sessionId: RECENT, sessionFile: file },
+		});
+		expect(await Bun.file(file).text()).toContain("written by the launch");
+	}, 90_000);
+});

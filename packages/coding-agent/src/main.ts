@@ -2425,11 +2425,12 @@ export async function runRootCommand(
 			// The pick replaces the session `createSessionManager` resumed on its own (`autoResume`): that one is closed
 			// once the pick holds its claim, so its lease goes back and another process can open it. A pick of that
 			// same session keeps its manager and opens no second one: a second manager of one session would be refused
-			// wherever a session has one writer, and move the pick to a new id.
+			// wherever a session has one writer, and move the pick to a new id. It is an explicit resume all the same,
+			// so it claims as one, with the wait the automatic resume skipped (a no-op where that one already holds it).
 			const replaced = sessionManager;
 			let pickedManager: SessionManager;
 			if (replaced !== undefined && replaced.getSessionFile() === chosen.path) {
-				pickedManager = replaced;
+				pickedManager = await claimOpenedSession(replaced);
 			} else {
 				try {
 					pickedManager = await claimOpenedSession(

@@ -1164,6 +1164,8 @@ export class SessionManager {
 	#sessionClaim: { sessionId: string; release: (() => void) | undefined } | undefined;
 	/** Set once an `OMP_SESSION_EXCLUSIVE=1` session began to stop (see {@link #stopExclusive}). */
 	#exclusiveStopping = false;
+	/** How many times {@link close} has begun: a file-lease wait that began before a close ends without the claim. */
+	#closes = 0;
 	/** A subagent transcript's follow of its parent session to the sibling it moved to (see {@link #followParentMove}). */
 	#parentMoveFollow: Promise<void> | undefined;
 	/** A recovery of a write conflict a deferred-publish store reported for a queued write (see {@link #recoverQueuedConflict}). */
@@ -1403,10 +1405,13 @@ export class SessionManager {
 	 * the next process's first write stops it. A session still held after the
 	 * wait stops there, before anything writes it. A refusal for a file that no
 	 * longer holds this session is left to the first write, which stops it as
-	 * `replaced`. Without `OMP_SESSION_EXCLUSIVE=1` nothing changes: the kernel
-	 * drops a dead holder's lease at once, so the wait would serve only a
-	 * holder that is still ending, and a resume of a session another process
-	 * holds moves to a sibling at its first write, as before.
+	 * `replaced`. A {@link close}, {@link seal} or session switch during the
+	 * wait ends it without the claim: a closed manager must not take the
+	 * session back from the next process. Without `OMP_SESSION_EXCLUSIVE=1`
+	 * nothing changes: the kernel drops a dead holder's lease at once, so the
+	 * wait would serve only a holder that is still ending, and a resume of a
+	 * session another process holds moves to a sibling at its first write, as
+	 * before.
 	 */
 	async #waitForOpenFileClaim(options: {
 		waitMs?: number;
@@ -1417,6 +1422,7 @@ export class SessionManager {
 		const waitMs = options.waitMs ?? 0;
 		if (!isSessionExclusive() || waitMs <= 0 || !this.#persist || !sessionFile || !this.#storage.claimSession) return;
 		const deadline = Date.now() + waitMs;
+		const closes = this.#closes;
 		let waiting = false;
 		for (;;) {
 			this.#claimSession();
@@ -1433,7 +1439,14 @@ export class SessionManager {
 				return;
 			}
 			await Bun.sleep(Math.min(OPEN_FILE_CLAIM_RETRY_MS, left));
-			if (this.#released || this.#sessionId !== sessionId || this.#sessionFile !== sessionFile) return;
+			if (
+				this.#released ||
+				this.#closes !== closes ||
+				this.#sessionId !== sessionId ||
+				this.#sessionFile !== sessionFile
+			) {
+				return;
+			}
 		}
 		await this.#reloadIfWrittenElsewhere();
 	}
@@ -3827,6 +3840,7 @@ export class SessionManager {
 
 	/** Flush, then close the append writer. */
 	async close(): Promise<void> {
+		this.#closes++;
 		if (!this.#persist) return;
 		try {
 			// Close and drain despite a latched failure, so a queued publish can

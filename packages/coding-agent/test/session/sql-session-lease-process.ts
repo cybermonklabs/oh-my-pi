@@ -33,6 +33,12 @@
  *   `dir` as RPC `open_session` does (`via: "rpc"`), recording every `session_start` and
  *   `session_switch` with the id it saw and when, and the manager's id once a second while it
  *   switches (as an extension's heartbeat reads it), then write one turn.
+ * - `{ op: "openWaiting", file, sessionDir, waitMs }`: open the session file and start the claim an explicit
+ *   resume takes (`claimOpenedSession` with `waitMs`); answer once the claim says it waits for another holder
+ *   (`waiting: true`), or once it settled without waiting (`waiting: false`).
+ * - `{ op: "closeWaiting" }`: close that manager while its claim may still wait.
+ * - `{ op: "settleWaiting" }`: wait for that claim to settle; `held` is whether any process, this one
+ *   included, holds the session's lease then.
  *
  * It closes its sessions and exits when stdin ends.
  */
@@ -44,7 +50,12 @@ import { openRpcSession } from "../../src/modes/rpc/rpc-mode";
 import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { SessionManager, type SessionPersistenceNotice } from "../../src/session/session-manager";
-import { FileSessionStorage, type SessionStorage, setDefaultSessionStorage } from "../../src/session/session-storage";
+import {
+	FileSessionStorage,
+	isSessionLeaseHeld,
+	type SessionStorage,
+	setDefaultSessionStorage,
+} from "../../src/session/session-storage";
 import { SqlSessionStorage } from "../../src/session/sql-session-storage";
 import { SQL } from "bun";
 
@@ -85,6 +96,8 @@ const managers: SessionManager[] = [];
 let held: SessionManager | undefined;
 let subagent: SessionManager | undefined;
 let notices: SessionPersistenceNotice[] = [];
+/** The claim `openWaiting` started, and the session id it claims. */
+let waitingClaim: { sessionId: string; settled: Promise<void> } | undefined;
 
 function report(fields: Record<string, unknown>): void {
 	process.stdout.write(`${JSON.stringify(fields)}\n`);
@@ -331,6 +344,28 @@ async function handle(command: Record<string, unknown>): Promise<Record<string, 
 		}
 		case "switch":
 			return switchTo(command);
+		case "openWaiting": {
+			const manager = adopt(
+				await SessionManager.open(String(command.file), String(command.sessionDir), storage, {
+					suppressBreadcrumb: true,
+				}),
+			);
+			const waits = Promise.withResolvers<boolean>();
+			const settled = manager.claimOpenedSession({
+				waitMs: Number(command.waitMs),
+				onWait: () => waits.resolve(true),
+			});
+			waitingClaim = { sessionId: manager.getSessionId(), settled };
+			return { waiting: await Promise.race([waits.promise, settled.then(() => false)]) };
+		}
+		case "closeWaiting":
+			await held?.close();
+			return {};
+		case "settleWaiting": {
+			if (!waitingClaim) throw new Error("no claim is waiting");
+			await waitingClaim.settled;
+			return { held: isSessionLeaseHeld(waitingClaim.sessionId) };
+		}
 		default:
 			throw new Error(`unknown command ${JSON.stringify(command.op)}`);
 	}
