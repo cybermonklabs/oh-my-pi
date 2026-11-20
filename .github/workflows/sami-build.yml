@@ -154,8 +154,12 @@ jobs:
         run: |
           sudo apt-get -q update
           sudo apt-get -q install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
+      # Restore and save are separate steps: actions/cache saves only when
+      # the whole job succeeds, so every red run rebuilt rsync (run
+      # 44757840012). The save follows the check, so a broken build is never
+      # cached, and a later test failure no longer loses the build.
       - id: rsync-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/rsync-ref
           # The tarball's sha256: the build is a function of it and of the
@@ -213,6 +217,12 @@ jobs:
           for need in zstd lz4; do
             case " $compressors " in *" $need "*) ;; *) echo "::error title=Reference rsync::built without the $need compressor"; exit 1 ;; esac
           done
+      - name: Save the reference rsync
+        if: steps.rsync-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/rsync-ref
+          key: ${{ steps.rsync-cache.outputs.cache-primary-key }}
       - name: Rust tests against the known-failure list
         # bash with pipefail: a failed jq or awk must fail the step, never read
         # as "no test failed".
