@@ -1042,44 +1042,17 @@ mod tests {
 			use std::os::unix::fs::PermissionsExt;
 			std::fs::set_permissions(root.join("secrets"), std::fs::Permissions::from_mode(0o600)).unwrap();
 		}
-		let port = {
-			let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-			probe.local_addr().unwrap().port()
-		};
 		let conf = format!(
-			"use chroot = no\naddress = 127.0.0.1\nmotd file = {r}/motd\npid file = {r}/pid\n\
+			"use chroot = no\naddress = 127.0.0.1\nmotd file = {r}/motd\npid file = {r}/pid\nlog file = {r}/log\n\
 			 [pub]\n\tpath = {r}/data\n\tcomment = Public stuff\n\
 			 [priv]\n\tpath = {r}/data\n\tauth users = alice\n\tsecrets file = {r}/secrets\n",
 			r = root.display()
 		);
 		std::fs::write(root.join("rsyncd.conf"), conf).unwrap();
-		let mut daemon = std::process::Command::new(rsync)
-			.arg("--daemon")
-			.arg("--no-detach")
-			.arg(format!("--port={port}"))
-			.arg(format!("--config={}", root.join("rsyncd.conf").display()))
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::null())
-			.spawn()
-			.unwrap();
-		struct Kill(std::process::Child);
-		impl Drop for Kill {
-			fn drop(&mut self) {
-				let _ = self.0.kill();
-				let _ = self.0.wait();
-			}
-		}
-		let _guard = {
-			let deadline = Instant::now() + Duration::from_secs(10);
-			while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-				assert!(Instant::now() < deadline, "daemon did not start");
-				if let Ok(Some(_)) = daemon.try_wait() {
-					return;
-				}
-				std::thread::sleep(Duration::from_millis(50));
-			}
-			Kill(daemon)
-		};
+		// Retried on a fresh port when another process takes the probed one
+		// first, and ready only once the daemon itself greets on it.
+		let daemon = crate::rsync::conformance::daemon::Daemon::serve(rsync, root, &root.join("rsyncd.conf"));
+		let port = daemon.port;
 
 		let (host, _) = crate::host::Host::for_test("rsync", "", root);
 		let env = host.child_env();

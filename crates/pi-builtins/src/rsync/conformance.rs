@@ -35,7 +35,7 @@
 #![cfg(unix)]
 
 mod cases;
-mod daemon;
+pub(super) mod daemon;
 mod fixture;
 mod normalize;
 mod snapshot;

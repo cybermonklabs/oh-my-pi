@@ -31,10 +31,30 @@ fn zsh(script: &str, port: u16) -> (String, String, i32) {
 	)
 }
 
-/// A TCP port nothing listens on right now.
+/// A TCP port nothing listens on right now. The probe's listener is dropped,
+/// so another process can take the port before the script listens on it:
+/// see [`zsh_tcp_on_a_free_port`].
 fn free_port() -> u16 {
 	let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
 	l.local_addr().unwrap().port()
+}
+
+/// Runs `script`, whose second line listens on `$PORT` (`ztcp -l $PORT`), on
+/// a free port. `ztcp` takes no port 0, so the port is probed first, and
+/// another process can take it before the script's listen: only a failure of
+/// that line is retried, on a fresh port. Any other output is the test's.
+fn zsh_tcp_on_a_free_port(script: &str) -> (u16, (String, String, i32)) {
+	let mut lost = Vec::new();
+	for _ in 0..5 {
+		let port = free_port();
+		let run = zsh(script, port);
+		if run.1.starts_with("zsh:ztcp:2:") {
+			lost.push(format!("port {port}: {}", run.1.lines().next().unwrap_or_default()));
+			continue;
+		}
+		return (port, run);
+	}
+	panic!("the script's listen failed on 5 fresh ports: {lost:?}");
 }
 
 #[test]
@@ -63,8 +83,7 @@ zsh:zsocket:8: could not bind to sock: address already in use
 
 #[test]
 fn zsh_mod_net_tcp_loopback_round_trip() {
-	let port = free_port();
-	let (out, err, st) = zsh(
+	let (port, (out, err, st)) = zsh_tcp_on_a_free_port(
 		"zmodload zsh/net/tcp
 ztcp -l $PORT; l=$REPLY
 ztcp -L | while read fd rest; do print -r -- $rest; done
@@ -79,7 +98,6 @@ ztcp -c $o; n=(${(f)\"$(ztcp -L)\"}); echo $#n
 ztcp -c; n=(${(f)\"$(ztcp -L)\"}); echo $#n
 ztcp 127.0.0.1 $PORT; echo $?
 ztcp localhost $PORT; echo $?",
-		port,
 	);
 	// zsh prints the port of `ztcp -v HOST PORT` in network byte order.
 	let shown = i32::from(port.to_be());
