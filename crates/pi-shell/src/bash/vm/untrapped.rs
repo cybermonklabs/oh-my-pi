@@ -17,8 +17,11 @@
 //! - bash with an EXIT trap, interactive or not: once one is set its
 //!   `terminating_signals` are caught (`set_signal` →
 //!   `initialize_terminating_signals`), and one of them runs the trap, then
-//!   kills the shell (`termsig_handler`). A host embedded in a runtime lets the
-//!   shell catch only the signals it hands over
+//!   kills the shell (`termsig_handler`). While the root waits for a foreground
+//!   job (an external, a subshell, a pipeline), an `INT` waits for it too: the
+//!   shell acts on it only if a process of the job died of `SIGINT`
+//!   (`wait_sigint_handler`, [`Untrapped::BashExitTrapAfterChild`]). A host
+//!   embedded in a runtime lets the shell catch only the signals it hands over
 //!   ([`crate::bash::Host::may_catch`]): the runtime's fault handlers stay.
 //! - Else the signal's default action.
 
@@ -73,6 +76,11 @@ pub(super) enum Untrapped {
 	ZshHupExit,
 	/// bash: run the EXIT trap, then die of the signal.
 	BashExitTrapThenDie,
+	/// bash, `INT` while the root waits for a foreground job (an external,
+	/// a subshell, a pipeline): wait for it, then act only if a process of
+	/// it died of `SIGINT` (bash `wait_sigint_handler`, `child_caught_sigint`;
+	/// [`super::end_held_sigint`]).
+	BashExitTrapAfterChild,
 	/// The signal's default action.
 	Default,
 }
@@ -99,7 +107,11 @@ pub(super) fn decide(
 	Ok(match vp.mode.dialect() {
 		Dialect::Zsh if sig == Signal::Hup => Untrapped::ZshHupExit,
 		Dialect::Bash if BASH_FATAL.contains(&sig) && bash_exit_trap(cx.store, vp)? => {
-			Untrapped::BashExitTrapThenDie
+			if sig == Signal::Int && vp.parent.is_none() && super::waits_for_job(vp) {
+				Untrapped::BashExitTrapAfterChild
+			} else {
+				Untrapped::BashExitTrapThenDie
+			}
 		},
 		_ => Untrapped::Default,
 	})

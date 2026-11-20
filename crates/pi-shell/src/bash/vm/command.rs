@@ -74,6 +74,7 @@ impl ExecState {
 			resume: false,
 			resumed: 0,
 			notice: None,
+			in_place: false,
 		}
 	}
 
@@ -106,6 +107,7 @@ impl ExecState {
 			resume,
 			resumed,
 			notice,
+			in_place,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -133,6 +135,7 @@ impl ExecState {
 		*resume = false;
 		*resumed = 0;
 		*notice = None;
+		*in_place = false;
 	}
 }
 
@@ -2416,6 +2419,8 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				ChildRedirs { list, exec_diag: super::redir::diag_prefix(k, cx, vp, line, &name) }
 			});
 			let child_redirs = redirs.is_some();
+			// Known before the spawn: a signal can come while it is in flight.
+			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2545,7 +2550,7 @@ fn spawned_external(
 			}
 			st(vp).stage = Stage::Redirect;
 		},
-		Ok(child) => {
+		Ok(mut child) => {
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
@@ -2554,6 +2559,13 @@ fn spawned_external(
 			// through).
 			if !k.bangs.is_empty() {
 				k.settle_bang(vp.vpid, Some(pid));
+			}
+			// Sent to the shell while the program it runs in place of itself
+			// was being spawned: the program's.
+			if vp.parent.is_none() {
+				for sig in std::mem::take(&mut k.forward).iter() {
+					let _ = child.signal(sig);
+				}
 			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);
@@ -4528,6 +4540,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// The shell's process was the program it `exec`ed: bash and zsh
+			// run no EXIT trap after it.
+			if replacing && reaped {
+				super::exec::spend_exit_trap(vp);
+			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
 				let text = vp
 					.frames
@@ -4542,8 +4559,9 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					.unwrap_or_default();
 				super::jobctl::fg_done(k, cx, vp, killed, &text);
 			}
+			let in_place = st(vp).in_place;
 			if let (Some(sig), false) = (killed, replacing) {
-				let end = super::killed::killed(k, cx, vp, op, pid, sig);
+				let end = super::killed::killed(k, cx, vp, op, pid, sig, in_place);
 				// bash ran it with `exec`: its process is the command's.
 				if end.no_fork
 					&& vp.parent.is_none()
@@ -4553,6 +4571,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				}
 				st(vp).notice = end.notice.map(Box::new);
 			}
+			super::end_held_sigint(k, vp, killed == Some(crate::bash::Signal::Int));
 			status
 		},
 		None => st(vp).status,

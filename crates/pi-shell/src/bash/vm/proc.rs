@@ -1540,6 +1540,11 @@ pub struct ExecState {
 	/// ([`super::killed`]).
 	#[serde(default)]
 	pub notice:      Option<Box<BString>>,
+	/// The external runs in place of the shell: the last command of a `-c`
+	/// string the real shell runs without a fork ([`super::killed::in_place`]).
+	/// A signal sent to the shell is the program's then, as for `exec`.
+	#[serde(default)]
+	pub in_place:    bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.

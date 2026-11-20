@@ -468,6 +468,17 @@ pub struct Kernel {
 	/// Which DEBUG/ERR/RETURN traps may be set: lets `exec::start_trap`
 	/// skip its checks before every command; not imaged.
 	pub pseudo_traps:       exec::PseudoTraps,
+	/// bash `wait_sigint_received`: an `INT` the root catches for its EXIT
+	/// trap came while it waited for a foreground job; it acts on it once
+	/// the job has ended, and only if a process of it died of `SIGINT`
+	/// ([`untrapped::Untrapped::BashExitTrapAfterChild`]). Not imaged: a
+	/// snapshot drops it.
+	pub held_sigint:        bool,
+	/// Signals sent to the shell while the program the root runs in place
+	/// of itself (`exec`, [`proc::ExecState::in_place`]) was still being
+	/// spawned: the program gets them once it exists (a spawn that fails
+	/// drops them). Not imaged: a snapshot drops a spawn in flight.
+	pub forward:            crate::bash::SigSet,
 	/// Re-parsed `${ ;}` bodies ([`exec::NoforkUnits`]); not imaged.
 	pub nofork_units:       exec::NoforkUnits,
 	/// The functions each zsh word code digest (`.zwc`) holds, by path,
@@ -627,6 +638,8 @@ impl Kernel {
 			start_ns: 0,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
+			held_sigint: false,
+			forward: crate::bash::SigSet::EMPTY,
 			nofork_units: HashMap::new(),
 			zsh_dumps: parking_lot::Mutex::new(HashMap::new()),
 			spare_tree: crate::bash::syntax::Tree::default(),
@@ -2444,6 +2457,18 @@ impl Shell {
 					},
 				}
 			};
+			// The program the root runs in place of the shell (`exec`, or a
+			// command the real shell runs without a fork) is the real shell's
+			// process: a signal sent to the shell is the program's (one the
+			// shell ignores the program inherits ignored), and the shell ends
+			// as the program does. `CHLD` comes from the engine's children.
+			if target == SigTarget::Vpid(root.0)
+				&& sig != Signal::Chld
+				&& trap != Some(true)
+				&& forward_to_program(&mut self.k, &mut self.procs[i], sig)
+			{
+				continue;
+			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
@@ -2516,6 +2541,14 @@ impl Shell {
 						signal_lives(&mut self.procs[i], sig, false);
 					}
 					exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
+					continue;
+				},
+				untrapped::Untrapped::BashExitTrapAfterChild => {
+					if !to_shell_only {
+						signal_lives(&mut self.procs[i], sig, false);
+					}
+					// The job's end decides ([`end_held_sigint`]).
+					self.k.held_sigint = true;
 					continue;
 				},
 				untrapped::Untrapped::BashExitTrapThenDie => {
@@ -2786,6 +2819,63 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			e.wait_into = None;
 			e.status = status;
 		}
+	}
+}
+
+/// Whether `p`'s innermost frame waits for a foreground job of processes
+/// (bash `wait_for`): an external it started, or the subshell or pipeline
+/// stages its `Spawn` started (all of them in children: no last stage
+/// running in `p` itself).
+fn waits_for_job(p: &Vproc) -> bool {
+	p.frames
+		.last()
+		.and_then(|f| f.scratch.as_ref())
+		.is_some_and(|sc| {
+			let external = matches!(sc.live, Live::Ext(_))
+				&& sc
+					.exec
+					.as_ref()
+					.is_some_and(|e| matches!(e.waiting, Some(proc::Awaited::Ext { .. })));
+			external || (!sc.children.is_empty() && sc.inline.is_none())
+		})
+}
+
+/// Act now on an `INT` the root held while it waited for a foreground job
+/// ([`Kernel::held_sigint`]) if a process of the job died of `SIGINT`; else
+/// the job caught it (`child_caught_sigint`) and the script goes on. `vp`
+/// is the vproc whose wait ended.
+fn end_held_sigint(k: &mut Kernel, vp: &Vproc, died_of_int: bool) {
+	if vp.parent.is_none() && std::mem::take(&mut k.held_sigint) && died_of_int {
+		ControlHandle(Arc::clone(&k.ctl)).signal(SigTarget::Vpid(vp.vpid), Signal::Int);
+	}
+}
+
+/// Give `sig` to the external `p`'s innermost frame runs in place of the
+/// shell: one it `exec`s, or one the real shell runs without a fork
+/// ([`proc::ExecState::in_place`]). The real shell's process is then the
+/// program, so a signal sent to the shell is the program's: given at once,
+/// or once the program's spawn has finished ([`Kernel::forward`]). `false`
+/// when `p`, the root, runs no such program.
+fn forward_to_program(k: &mut Kernel, p: &mut Vproc, sig: Signal) -> bool {
+	let Some(sc) = p.frames.last_mut().and_then(|f| f.scratch.as_mut()) else {
+		return false;
+	};
+	let Some(e) = sc.exec.as_deref() else {
+		return false;
+	};
+	if !(e.in_place || matches!(e.control, Some(proc::Transfer::Exec))) {
+		return false;
+	}
+	match &mut sc.live {
+		Live::Ext(ext) if matches!(e.waiting, Some(proc::Awaited::Ext { .. })) => {
+			let _ = ext.signal(sig);
+			true
+		},
+		Live::Spawn(_) => {
+			k.forward = k.forward.with(sig);
+			true
+		},
+		_ => false,
 	}
 }
 

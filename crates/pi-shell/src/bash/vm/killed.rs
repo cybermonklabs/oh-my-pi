@@ -1,8 +1,10 @@
 //! bash's notice of a foreground command that a signal killed (`jobs.c`
 //! `notify_of_job_status`), for a non-interactive bash-mode shell, and the
-//! `exec` without a fork of the last command of a `-c` string (bash
-//! `CMD_NO_FORK`, zsh `execcmd_exec`'s `last1`), which prints no notice:
-//! the shell's own process is the command, and dies of the signal with it.
+//! commands the real shell runs in place of itself ([`in_place`]): the last
+//! command of a `-c` string, run with `exec` and no fork (bash
+//! `CMD_NO_FORK`, zsh `execcmd_exec`'s `last1`). Such a command prints no
+//! notice: the shell's own process is the command, and dies of the signal
+//! with it.
 //!
 //! bash 5.2.21 is built with `DONT_REPORT_SIGTERM` and `DONT_REPORT_SIGPIPE`
 //! (`config-top.h`): `INT` and `PIPE` say nothing; `TERM`, or a signal the
@@ -40,7 +42,7 @@ pub(super) struct Killed {
 }
 
 /// [`Killed`] for the command of `op`, external process `pid`, that `sig`
-/// killed in `vp`.
+/// killed in `vp`; `in_place` is what [`in_place`] said when it started.
 pub(super) fn killed(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -48,8 +50,12 @@ pub(super) fn killed(
 	op: Op,
 	pid: u32,
 	sig: Signal,
+	in_place: bool,
 ) -> Killed {
 	let quiet = Killed { notice: None, no_fork: false };
+	if in_place {
+		return Killed { notice: None, no_fork: true };
+	}
 	if nested::in_subshell(cx.store, vp)
 		|| misc_is(cx, vp, MiscKey::Interactive, b"1")
 		|| vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
@@ -57,9 +63,6 @@ pub(super) fn killed(
 		return quiet;
 	}
 	let c_string = misc_is(cx, vp, MiscKey::RunOrigin, b"c");
-	if c_string && no_fork(k, cx, vp, op) {
-		return Killed { notice: None, no_fork: true };
-	}
 	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
 	if vp.mode.dialect() != Dialect::Bash
 		|| (c_string && posix)
@@ -87,6 +90,20 @@ pub(super) fn killed(
 	bytes.extend_from_slice(&text);
 	bytes.push(b'\n');
 	Killed { notice: Some(BString::from(bytes)), no_fork: false }
+}
+
+/// Whether the real shell runs the command of `op`, an external `vp`
+/// starts, in place of itself: the last command of a `-c` string, which it
+/// runs with `exec` and no fork ([`no_fork`]), outside a subshell, a
+/// pipeline stage and an interactive shell. The real shell's process is
+/// then the command: a signal sent to the shell is the command's, and the
+/// shell ends as the command does.
+pub(super) fn in_place(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
+	!vp.frames.iter().any(|f| f.kind == FrameKind::Stage)
+		&& no_fork(k, cx, vp, op)
+		&& misc_is(cx, vp, MiscKey::RunOrigin, b"c")
+		&& !misc_is(cx, vp, MiscKey::Interactive, b"1")
+		&& !nested::in_subshell(cx.store, vp)
 }
 
 /// Whether the misc record `key` of `vp` is `value`.

@@ -701,8 +701,9 @@ pub fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 }
 
 /// Mark `vp`'s EXIT trap as run: its run's flag, or a forked subshell's
-/// own (it has no run).
-fn spend_exit_trap(vp: &mut Vproc) {
+/// own (it has no run). Also the end of a program the shell `exec`ed: the
+/// shell's process was the program, so no trap of the shell's is left.
+pub(super) fn spend_exit_trap(vp: &mut Vproc) {
 	if let Some(run) = vp.runs.front_mut() {
 		run.exit_trap_started = true;
 	}
@@ -4277,6 +4278,10 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		statuses.push(last);
 	}
 	clear_scratch(&mut k.root, cx.store, vp);
+	// A stage or subshell that died of `SIGINT` ends with 130 (a vproc has no
+	// signal death of its own).
+	let int = crate::bash::Signal::Int.exit_status(k.engine.config().platform);
+	super::end_held_sigint(k, vp, statuses.contains(&int));
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
 		super::jobctl::fg_done(k, cx, vp, None, b"");
 	}

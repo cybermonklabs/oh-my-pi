@@ -1,13 +1,15 @@
 //! Run obash, bash and zsh as processes and compare how they end: the
-//! signals they start with, their core size limit, and the real bash the
-//! comparisons need ([`real_bash`]).
+//! signals they start with, their core size limit, the real bash the
+//! comparisons need ([`real_bash`]), and a signal sent from outside once the
+//! command a shell waits for has started ([`Run::go_signalled`]).
 
 use std::{
 	ffi::{OsStr, OsString},
 	fmt,
 	os::unix::process::{CommandExt, ExitStatusExt},
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Command, Stdio},
+	time::Duration,
 };
 
 use crate::zsh_oracle;
@@ -88,6 +90,8 @@ pub struct Run {
 	dir:     Option<PathBuf>,
 	wrap:    Vec<&'static str>,
 	env:     Vec<(&'static str, Option<OsString>)>,
+	/// In a process group of its own (so a signal can go to the group).
+	group:   bool,
 }
 
 impl Run {
@@ -101,6 +105,7 @@ impl Run {
 			dir: None,
 			wrap: Vec::new(),
 			env: Vec::new(),
+			group: false,
 		}
 	}
 
@@ -161,6 +166,13 @@ impl Run {
 		self
 	}
 
+	/// Run in a process group of its own.
+	#[must_use]
+	pub const fn own_group(mut self) -> Self {
+		self.group = true;
+		self
+	}
+
 	/// The command, and the directory of the shell's link it needs alive.
 	fn command(&self) -> (Command, tempfile::TempDir) {
 		let link_dir = tempfile::tempdir().expect("a directory for the shell's link");
@@ -185,9 +197,9 @@ impl Run {
 		if let Some(dir) = &self.dir {
 			cmd.current_dir(dir);
 		}
-		let (ignored, cores) = (self.ignored.clone(), self.cores);
-		// SAFETY: signal, getrlimit and setrlimit are async-signal-safe and
-		// change only the child; nothing here allocates.
+		let (ignored, cores, group) = (self.ignored.clone(), self.cores, self.group);
+		// SAFETY: signal, setpgid, getrlimit and setrlimit are
+		// async-signal-safe and change only the child; nothing here allocates.
 		unsafe {
 			cmd.pre_exec(move || {
 				for sig in SENT {
@@ -195,6 +207,9 @@ impl Run {
 				}
 				for &sig in &ignored {
 					libc::signal(sig, libc::SIG_IGN);
+				}
+				if group {
+					libc::setpgid(0, 0);
 				}
 				let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 				if libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) == 0 {
@@ -214,6 +229,32 @@ impl Run {
 	pub fn go(&self) -> Outcome {
 		let (mut cmd, _link_dir) = self.command();
 		outcome(cmd.output().expect("start the shell"))
+	}
+
+	/// Run it and send it `sig` once `started` exists (the file the command
+	/// it waits for makes when it has started): to its process group when
+	/// `group` ([`Self::own_group`]), else to the shell alone. Then wait for
+	/// it to end. A shell that ends before the file exists fails the test;
+	/// nextest's own timeout bounds one that never makes it.
+	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
+		let (mut cmd, _link_dir) = self.command();
+		let mut child = cmd
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("start the shell");
+		while !started.exists() {
+			if let Some(status) = child.try_wait().expect("look at the shell") {
+				let out = child.wait_with_output().expect("read the shell's output");
+				panic!("the shell ended ({status}) before {} existed: {out:?}", started.display());
+			}
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+		// SAFETY: kill takes integer ids; the child is not reaped yet.
+		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
+		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
+		outcome(child.wait_with_output().expect("wait for the shell"))
 	}
 }
 

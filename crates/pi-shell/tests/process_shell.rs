@@ -852,6 +852,153 @@ fn a_background_pipelines_bang_is_its_last_process() {
 	}
 }
 
+/// A signal case: `shell` runs `script` with `-c` and gets `sig` from
+/// outside (`group`: sent to its process group, else to the shell alone)
+/// once the command it waits for has made `$F`; it prints `stdout` and ends
+/// by `end`.
+struct SentCase {
+	shell:  &'static str,
+	script: String,
+	sig:    libc::c_int,
+	group:  bool,
+	stdout: &'static [u8],
+	end:    End,
+}
+
+/// Run each case under obash and, where it exists, the real shell: both
+/// print the same and end the same.
+fn run_sent(cases: Vec<SentCase>) {
+	let dir = tempfile::tempdir().expect("a directory for the start file");
+	let started = dir.path().join("started");
+	for SentCase { shell, script, sig, group, stdout, end } in cases {
+		let run = |program: &OsStr| {
+			let _ = fs::remove_file(&started);
+			let run = Run::script(program, shell, &script).env("F", &started);
+			let run = if group { run.own_group() } else { run };
+			run.go_signalled(&started, sig, group)
+		};
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let shown = format!(
+			"{shell}: {script}, signal {sig} to the {}",
+			if group { "group" } else { "shell" }
+		);
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.stdout), ours.end()),
+			(String::from_utf8_lossy(stdout), Some(end)),
+			"{shown}: {ours:?}"
+		);
+		if let Some(real) = real(shell) {
+			let theirs = run(real.as_os_str());
+			assert_eq!(
+				(&ours.stdout, ours.end()),
+				(&theirs.stdout, theirs.end()),
+				"{shown}: {theirs:?}"
+			);
+		}
+	}
+}
+
+/// A program the shell runs in place of itself (`exec`, or the last command
+/// of a `-c` string run without a fork:
+/// [`bash_reports_a_foreground_command_killed_by_a_signal`]) is the shell's
+/// process: a signal sent to the shell is the program's, even one the
+/// shell traps (the program has no trap), and the shell ends as the program
+/// does. zsh's `HUP` handler and bash's EXIT trap went with the shell: a
+/// server the program runs goes on after a `HUP` it handles. The program
+/// makes `$F` once it has started.
+#[test]
+fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
+	let program = "/bin/sh -c ': > \"$F\"; exec /bin/sleep 5 >/dev/null 2>&1'";
+	let server = "/bin/sh -c 'trap \"echo reload\" HUP; : > \"$F\"; /bin/sleep 1; echo done'";
+	let case = |shell, script: String, sig, stdout, end| SentCase {
+		shell,
+		script,
+		sig,
+		group: false,
+		stdout,
+		end,
+	};
+	run_sent(vec![
+		case("zsh", program.into(), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
+		case("zsh", format!("exec {program}"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
+		case("zsh", format!("true; {program}"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
+		case("zsh", server.into(), libc::SIGHUP, b"reload\ndone\n", Exit(0)),
+		case(
+			"bash",
+			format!("trap 'echo x' EXIT; exec {program}"),
+			libc::SIGTERM,
+			b"",
+			Signal(libc::SIGTERM),
+		),
+		case(
+			"bash",
+			format!("trap 'echo t' TERM; exec {program}"),
+			libc::SIGTERM,
+			b"",
+			Signal(libc::SIGTERM),
+		),
+		case(
+			"bash",
+			format!("trap 'echo x' EXIT; {program}"),
+			libc::SIGTERM,
+			b"x\n",
+			Signal(libc::SIGTERM),
+		),
+	]);
+}
+
+/// A program the shell `exec`s replaces it, so no EXIT trap of the shell's
+/// runs after the program (bash 5.2.21, zsh 5.9), in a subshell either.
+#[test]
+fn an_execd_program_leaves_no_exit_trap_to_run() {
+	for (shell, script, stdout) in [
+		("bash", "trap 'echo x' EXIT; exec /bin/true", ""),
+		("bash", "( trap 'echo sub' EXIT; exec /bin/true ); echo st=$?", "st=0\n"),
+		("zsh", "trap 'print x' EXIT; exec /bin/true", ""),
+	] {
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), shell, script).go();
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.stdout), ours.end()),
+			(stdout.into(), Some(Exit(0))),
+			"{shell}: {script}: {ours:?}"
+		);
+		if let Some(real) = real(shell) {
+			assert_eq!(ours, Run::script(real, shell, script).go(), "{shell}: {script}");
+		}
+	}
+}
+
+/// bash with an EXIT trap catches `INT` (`terminating_signals`), but while
+/// it waits for a foreground command it only notes one
+/// (`wait_sigint_handler`): once the command has ended it acts on it (runs
+/// the trap, then dies of `SIGINT`) only if the command died of `SIGINT`
+/// too; else the command caught it and the script goes on. The command
+/// makes `$F` once it has started, notes an `INT` and goes on.
+#[test]
+fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
+	let child =
+		"/bin/sh -c 'trap \"echo child-int\" INT; : > \"$F\"; /bin/sleep 1; echo child-done'";
+	let script = format!("trap 'echo x' EXIT; {child}; echo after");
+	let case = |script, group, stdout, end| SentCase {
+		shell: "bash",
+		script,
+		sig: libc::SIGINT,
+		group,
+		stdout,
+		end,
+	};
+	run_sent(vec![
+		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
+		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
+		case(
+			"trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; exec /bin/sleep 3'; echo after".into(),
+			true,
+			b"x\n",
+			Signal(libc::SIGINT),
+		),
+	]);
+}
+
 /// An interactive shell's `HUP` from outside, with an EXIT trap that
 /// writes `$F`: bash runs the trap, then dies of the signal (its
 /// `terminating_signals` are caught interactive or not); zsh's handler
