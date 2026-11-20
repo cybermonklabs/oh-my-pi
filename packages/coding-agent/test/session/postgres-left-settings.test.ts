@@ -58,6 +58,7 @@ import {
 	leftClient,
 	leftError,
 	logPids,
+	reachesPostgresDirectly,
 } from "./postgres-left-settings-harness";
 import { rejection, until } from "./sql-session-lease-fixture";
 
@@ -160,13 +161,11 @@ function errorText(err: unknown): string {
 async function readServer(url: string): Promise<Server> {
 	const sql = new SQL(url, { max: 1 });
 	try {
-		const [where] = (await sql.unsafe(
-			"SELECT pg_catalog.inet_server_port() AS port, session_user::text AS login",
-		)) as Rows;
+		const direct = await reachesPostgresDirectly(sql, url);
+		const [where] = (await sql.unsafe("SELECT session_user::text AS login")) as Rows;
 		const settings = (await sql.unsafe("SELECT name, context FROM pg_catalog.pg_settings")) as Rows;
-		const urlPort = Number(new URL(url).port || "5432");
 		return {
-			leg: Number(where?.port) === urlPort ? "direct" : "pooled",
+			leg: direct ? "direct" : "pooled",
 			login: String(where?.login),
 			names: new Set(settings.map(row => String(row.name))),
 			userNames: settings.filter(row => row.context === "user").map(row => String(row.name)),

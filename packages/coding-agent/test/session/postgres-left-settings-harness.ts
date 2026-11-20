@@ -136,6 +136,16 @@ export interface LeftClient {
 	end(): Promise<void>;
 }
 
+/**
+ * Whether `url` reaches PostgreSQL directly, read on `sql`, a client of `url`:
+ * behind a pooler such as PgBouncer, `inet_server_port()` read through the
+ * URL is the server's own port, another than the URL's.
+ */
+export async function reachesPostgresDirectly(sql: SQL, url: string): Promise<boolean> {
+	const [where] = (await sql.unsafe("SELECT pg_catalog.inet_server_port() AS port")) as Array<{ port: unknown }>;
+	return Number(where?.port) === Number(new URL(url).port || "5432");
+}
+
 /** Times a reservation is taken again when its connection turns out closed (the server ended an idle one). */
 const TAKE_ATTEMPTS = 3;
 
