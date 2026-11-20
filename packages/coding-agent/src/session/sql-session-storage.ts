@@ -1847,34 +1847,49 @@ class SqlBlobTier implements SessionBlobTier {
 	/** One land's pass over the queued blobs, in the order they were queued (see {@link SqlBlobTier}). */
 	async #landQueued(): Promise<void> {
 		const queued = [...this.#queued];
-		for (const [index, [hash, blob]] of queued.entries()) {
+		// The error of the write whose repairs are spent, and that write's blob: the pass tries no blob after it.
+		let spent: Error | undefined;
+		let spentHash = "";
+		for (const [hash, blob] of queued) {
 			if (this.#queued.get(hash) !== blob) continue;
+			if (spent !== undefined) {
+				this.#failed.set(
+					hash,
+					new Error(
+						`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
+							`so no transcript naming it is written yet: it was not tried after session image ${spentHash} ` +
+							`met only PostgreSQL connections no transaction can repair: ${spent.message}`,
+						{ cause: spent },
+					),
+				);
+				continue;
+			}
 			try {
 				await this.#landOne(hash, blob.data, blob.mimeType);
 				this.#failed.delete(hash);
 			} catch (err) {
 				const error = toError(err);
-				this.#failed.set(hash, error);
-				// `#landOne` keeps the runner's error as the cause of its failure.
-				const spent = error.cause;
-				if (!this.#backend.repairsSpent(spent)) continue;
-				for (const [untried, rest] of queued.slice(index + 1)) {
-					if (this.#queued.get(untried) !== rest) continue;
-					this.#failed.set(
-						untried,
-						new Error(
-							`SqlSessionStorage: session image ${untried} did not reach ${this.#backend.table}_blobs, ` +
-								`so no transcript naming it is written yet: it was not tried after session image ${hash} ` +
-								`met only PostgreSQL connections no transaction can repair: ${toError(spent).message}`,
-							{ cause: spent },
-						),
-					);
+				this.#failed.set(
+					hash,
+					new Error(
+						`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
+							`so no transcript naming it is written yet: ${error.message}`,
+						{ cause: error },
+					),
+				);
+				if (this.#backend.repairsSpent(err)) {
+					spent = error;
+					spentHash = hash;
 				}
-				return;
 			}
 		}
 	}
 
+	/**
+	 * Write one blob, in at most {@link BLOB_WRITE_ATTEMPTS} tries. Throws the
+	 * last try's error as the runner threw it, so {@link #landQueued} can ask
+	 * {@link SqlSessionStorageBackend.repairsSpent} about it.
+	 */
 	async #landOne(hash: string, data: Buffer, mimeType: string | undefined): Promise<void> {
 		// A row is never replaced by a later write, so bytes that do not hash to their key are kept out.
 		if (blobSha256(data) !== hash) {
@@ -1910,18 +1925,13 @@ class SqlBlobTier implements SessionBlobTier {
 					await Bun.sleep(BLOB_RETRY_MS * 2 ** (attempt - 1));
 					continue;
 				}
-				const error = toError(err);
 				logger.warn("Storing a session blob in the session database failed; the next write naming it tries again", {
 					hash,
 					bytes: data.byteLength,
 					attempts: attempt,
-					error: error.message,
+					error: toError(err).message,
 				});
-				throw new Error(
-					`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
-						`so no transcript naming it is written yet: ${error.message}`,
-					{ cause: error },
-				);
+				throw err;
 			}
 		}
 	}
@@ -3237,7 +3247,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * between it and the tier rethrows that same object: {@link #retryDeadlocks}
 	 * (a marked error is no deadlock), {@link #transaction},
 	 * {@link #fencedTransaction} (nor a fence refusal) and {@link insertBlob}.
-	 * The tier's failure of that blob keeps it as its cause.
+	 * The tier reads the mark on the runner's own error, which its blob write
+	 * rethrows as it is, and only then wraps that error, as the cause, in the
+	 * blob's failure.
 	 */
 	repairsSpent(err: unknown): boolean {
 		return typeof err === "object" && err !== null && this.#spentRepairs.has(err);
