@@ -224,6 +224,8 @@ let root: TempDir | undefined;
 const records: LeftRecord[] = [];
 /** Every case's tables, dropped after the case and again at the end. */
 const madeTables: CaseTables[] = [];
+/** Tables of this run that the case drops missed, found and dropped at the end (see the leg's afterAll). */
+const leftTables: string[] = [];
 let sequence = 0;
 
 function needAdmin(): SQL {
@@ -1169,6 +1171,19 @@ describe("SQL session store under a session setting another client left on Postg
 			const db = admin;
 			if (db) {
 				for (const tables of madeTables) await dropTables(tables);
+				// A table of this run that the drops above do not name (the store gained a table) is dropped here by
+				// its exact name and fails the run, so the shared server keeps none and the list above is mended.
+				const rows = (await db
+					.unsafe(
+						"SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace " +
+							"WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND pg_catalog.starts_with(c.relname, $1)",
+						[`omp_left_${SUFFIX}_`],
+					)
+					.catch(() => [])) as Array<{ relname: string }>;
+				for (const { relname } of rows) {
+					leftTables.push(relname);
+					await db.unsafe(`DROP TABLE IF EXISTS public.${identifier(relname)}`).catch(() => undefined);
+				}
 				if (made.has("read-only database")) {
 					await db
 						.unsafe(`DROP DATABASE IF EXISTS ${identifier(READ_ONLY_DATABASE)} WITH (FORCE)`)
@@ -1185,6 +1200,9 @@ describe("SQL session store under a session setting another client left on Postg
 			agentDir?.removeSync();
 			root?.removeSync();
 			console.log(`left-setting leg=${LEG} cases=${CASES.length}`);
+			if (leftTables.length > 0) {
+				throw new Error(`left-setting: the case drops missed ${leftTables.join(", ")}; dropped them now`);
+			}
 		});
 
 		test("the admin URL is set, and every user setting of the server is listed", () => {
