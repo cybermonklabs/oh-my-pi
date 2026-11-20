@@ -189,7 +189,7 @@ jobs:
           echo "rsync-3.5.1.tar.gz from $got"
           mkdir -p "$RUNNER_TEMP/rsync-build" "$HOME/rsync-ref/bin"
           tar -xzf "$tarball" -C "$RUNNER_TEMP/rsync-build"
-          cd "$RUNNER_TEMP/rsync-build/rsync-3.5.1"
+          cd "$RUNNER_TEMP/rsync-build/rsync-3.5.1" || exit 1
           ./configure --disable-md2man
           make -j "$(nproc)"
           cp rsync "$HOME/rsync-ref/bin/rsync"
@@ -415,7 +415,11 @@ jobs:
               continue
             fi
             case "$rule" in
-              "rust_test rule" | "cargo test")
+              "rust_test rule" | "native_test rule" | "cargo test")
+                # A native_test (bazel-skylib) runs a prebuilt binary; here
+                # pi-builtins_foreign_owner_test runs pi-builtins_test's, so its
+                # log is libtest's record too, and one that holds none fails
+                # below by name.
                 # A log can hold several suites (`cargo test --doc` runs one
                 # binary per doctest that cannot be merged): the planned count
                 # is the sum of every suite's test_count, and every started
