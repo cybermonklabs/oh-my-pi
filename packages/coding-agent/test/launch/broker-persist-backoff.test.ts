@@ -26,9 +26,14 @@ interface EmbeddedBroker {
  * Starts the in-process broker and waits until it accepts connections. A client that connects
  * earlier finds no endpoint and starts a broker process of its own (`client.ts`, `#spawnBroker`),
  * which can take the scope: the test then talks to a broker whose warnings never reach the spy
- * here, and which outlives the test.
+ * here, and which outlives the test. When another process holds the scope this fails, and
+ * `refused` leaves neither that broker nor `client` behind.
  */
-async function startBroker(projectDir: string, runtimeDir: string): Promise<EmbeddedBroker> {
+async function startBroker(
+	client: DaemonBrokerClient,
+	projectDir: string,
+	runtimeDir: string,
+): Promise<EmbeddedBroker> {
 	const saved = [DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV, DAEMON_IDLE_GRACE_ENV].map(
 		name => [name, process.env[name]] as const,
 	);
@@ -41,9 +46,36 @@ async function startBroker(projectDir: string, runtimeDir: string): Promise<Embe
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
 	}
-	if (!(await Promise.race([listening.promise, finished.then(() => false)])))
-		throw new Error("In-process daemon broker did not claim its scope");
-	return { finished };
+	if (await Promise.race([listening.promise, finished.then(() => false)])) return { finished };
+	throw await refused(client, runtimeDir);
+}
+
+/**
+ * The failure of an in-process broker that did not claim its scope. It first asks the broker
+ * holding the scope to shut down through `client` (with no broker in the lease, a request would
+ * start one), closes `client`, and waits up to 5 s for the lease to be free and that broker's
+ * process to end (it frees the lease before it exits), so the failing test leaves neither behind.
+ */
+async function refused(client: DaemonBrokerClient, runtimeDir: string): Promise<Error> {
+	const holder = await leaseHolder(runtimeDir);
+	const another = holder !== undefined && holder !== process.pid ? holder : undefined;
+	// Pinned before the request, so its status is that process's and never a later one's.
+	const other = another === undefined ? null : Process.fromPid(another);
+	if (another !== undefined) await client.request({ op: "shutdown" }).catch(() => undefined);
+	client.close();
+	const deadline = performance.now() + 5_000;
+	let left = await leaseHolder(runtimeDir);
+	while ((left !== undefined || other?.status() === "running") && performance.now() < deadline) {
+		await Bun.sleep(20);
+		left = await leaseHolder(runtimeDir);
+	}
+	const state =
+		left !== undefined
+			? `and process ${left} still holds it`
+			: other?.status() === "running"
+				? "and still runs"
+				: "and has shut down";
+	return new Error(`In-process daemon broker did not claim its scope: process ${holder ?? "none"} held it, ${state}`);
 }
 
 /** The pid in the scope's broker lease (`broker.pid`), or `undefined` when no broker holds it. */
@@ -114,7 +146,7 @@ async function startSleep(client: DaemonBrokerClient, projectDir: string, detach
 /** A detached daemon, recorded by a broker that then exits, as an older broker recorded it: no mark. */
 async function recordUnpinnable(projectDir: string, runtimeDir: string, metaPath: string): Promise<Daemon> {
 	const first = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-	const firstBroker = await startBroker(projectDir, runtimeDir);
+	const firstBroker = await startBroker(first, projectDir, runtimeDir);
 	let daemon: Daemon;
 	try {
 		daemon = await startSleep(first, projectDir, true);
@@ -187,7 +219,7 @@ it("backs off a write that keeps failing, warns once, and writes once the disk t
 	try {
 		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = await startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(client, projectDir, runtimeDir);
 		const writes = { n: 0 };
 		const realWrite = Bun.write;
 		const writeSpy = spyOn(Bun, "write").mockImplementation(((destination: unknown, ...rest: unknown[]) => {
@@ -253,7 +285,7 @@ it("times the backoff on the monotonic clock: a backward step of the wall clock 
 	try {
 		daemon = await recordUnpinnable(projectDir, runtimeDir, metaPath);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = await startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(client, projectDir, runtimeDir);
 		const realNow = Date.now.bind(Date);
 		let clockSpy: { mockRestore(): void } | undefined;
 		const { warned, restore: restoreWarnings } = countWarnings();
@@ -301,7 +333,7 @@ for (const detached of [false, true]) {
 		await fs.mkdir(projectDir);
 		const previousTitle = process.title;
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = await startBroker(projectDir, runtimeDir);
+		const broker = await startBroker(client, projectDir, runtimeDir);
 		const { warned, restore: restoreWarnings } = countWarnings();
 		let daemon: Daemon | undefined;
 		try {

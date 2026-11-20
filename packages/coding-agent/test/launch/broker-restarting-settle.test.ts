@@ -31,9 +31,11 @@ interface EmbeddedBroker {
  * Starts the in-process broker and waits until it accepts connections. A client that connects
  * earlier finds no endpoint and starts a broker process of its own (`client.ts`, `#spawnBroker`),
  * which can take the scope: the test then talks to a broker without this test's options and spies,
- * and which outlives the test.
+ * and which outlives the test. When another process holds the scope this fails, and `refused`
+ * leaves neither that broker nor `client` behind.
  */
 async function startBroker(
+	client: DaemonBrokerClient,
 	projectDir: string,
 	runtimeDir: string,
 	options: DaemonBrokerStartOptions = {},
@@ -49,9 +51,36 @@ async function startBroker(
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
-	if (!(await Promise.race([listening.promise, finished.then(() => false)])))
-		throw new Error("In-process daemon broker did not claim its scope");
-	return { finished };
+	if (await Promise.race([listening.promise, finished.then(() => false)])) return { finished };
+	throw await refused(client, runtimeDir);
+}
+
+/**
+ * The failure of an in-process broker that did not claim its scope. It first asks the broker
+ * holding the scope to shut down through `client` (with no broker in the lease, a request would
+ * start one), closes `client`, and waits up to 5 s for the lease to be free and that broker's
+ * process to end (it frees the lease before it exits), so the failing test leaves neither behind.
+ */
+async function refused(client: DaemonBrokerClient, runtimeDir: string): Promise<Error> {
+	const holder = await leaseHolder(runtimeDir);
+	const another = holder !== undefined && holder !== process.pid ? holder : undefined;
+	// Pinned before the request, so its status is that process's and never a later one's.
+	const other = another === undefined ? null : Process.fromPid(another);
+	if (another !== undefined) await client.request({ op: "shutdown" }).catch(() => undefined);
+	client.close();
+	const deadline = performance.now() + 5_000;
+	let left = await leaseHolder(runtimeDir);
+	while ((left !== undefined || other?.status() === "running") && performance.now() < deadline) {
+		await Bun.sleep(20);
+		left = await leaseHolder(runtimeDir);
+	}
+	const state =
+		left !== undefined
+			? `and process ${left} still holds it`
+			: other?.status() === "running"
+				? "and still runs"
+				: "and has shut down";
+	return new Error(`In-process daemon broker did not claim its scope: process ${holder ?? "none"} held it, ${state}`);
 }
 
 /** The pid in the scope's broker lease (`broker.pid`), or `undefined` when no broker holds it. */
@@ -116,7 +145,7 @@ describe("daemon broker restart settling", () => {
 		const previousTitle = process.title;
 		// Create the client (writes broker.token) before starting the broker, which reads that token.
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = await startBroker(projectDir, runtimeDir, {
+		const broker = await startBroker(client, projectDir, runtimeDir, {
 			restartBackoffBaseMs: RESTART_BACKOFF_BASE_MS,
 		});
 		const name = "crash-loop";
@@ -178,7 +207,7 @@ describe("daemon broker restart settling", () => {
 		await fs.mkdir(projectDir);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		const previousTitle = process.title;
-		const broker = await startBroker(projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
+		const broker = await startBroker(client, projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
 		const name = "stopped-during-backoff";
 		const metadataPath = path.join(runtimeDir, "daemons", name, "meta.json");
 		const releaseWrite = Promise.withResolvers<void>();
@@ -250,7 +279,7 @@ describe("daemon broker restart settling", () => {
 		let pid: number | undefined;
 
 		const firstClient = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const firstBroker = await startBroker(projectDir, runtimeDir);
+		const firstBroker = await startBroker(firstClient, projectDir, runtimeDir);
 		try {
 			const started = await firstClient.request({
 				op: "start",
@@ -277,7 +306,7 @@ describe("daemon broker restart settling", () => {
 		await expectNoBrokerLeft(runtimeDir);
 
 		const secondClient = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const secondBroker = await startBroker(projectDir, runtimeDir);
+		const secondBroker = await startBroker(secondClient, projectDir, runtimeDir);
 		try {
 			const recovered = await snapshotOf(secondClient, name);
 			expect(recovered.state).toBe("running");
