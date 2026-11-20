@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Under `OMP_SESSION_EXCLUSIVE=1` on file session storage, an explicit resume (`--resume`, `--continue`, a picker pick) of a session another omp process still holds now waits up to 35 s for that process to end, then resumes the session under its own id; before, it ended non-zero at its first write, so a launcher that starts the next process while the previous one is still ending lost the start. One still held after the wait ends non-zero before anything writes it. Without the variable nothing changes.
 - A session resumed on another machine shows its snapcompact archive's frames again instead of `N archived image frames unavailable here`: each frame whose image blob is missing is drawn again from the archive text the session keeps and stored under the same reference, so the prompt cache prefix is unchanged. A frame that does not draw to the same bytes keeps the notice, and a warning names it.
 - Fixed the debug menu's "Clear artifact cache" deleting whole project directories, session transcripts included; it now removes only tool output files older than 30 days and keeps transcripts, subagent outputs, `/btw` conversations and drafts. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))
 - A failed `/tan` dispatch no longer leaves its clone's transcript behind or keeps the clone's ownership lease, under file and SQL session storage. ([#13416](https://github.com/can1357/oh-my-pi/pull/13416) by [@sjawhar](https://github.com/sjawhar))

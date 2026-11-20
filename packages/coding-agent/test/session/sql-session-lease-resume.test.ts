@@ -575,4 +575,83 @@ describe("omp --resume <id> under OMP_SESSION_EXCLUSIVE=1 on file storage", () =
 		]);
 		expect(await Bun.file(session.file).text()).toBe(replacement);
 	}, 60_000);
+
+	// A launcher starts the next process on a session while the one before it is still ending (`--resume=<file>
+	// --mode rpc`, with OMP_SESSION_EXCLUSIVE=1).
+	it("waits for a holder that ends within the wait, then resumes the session under its own id", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const holderPid = holder.pid;
+
+		await using resumed = await LeaseProcess.start(session.config, dir.join("resumed"), EXCLUSIVE);
+		const resuming = resumed.run(resumeById(session));
+		// The holder ends while the resume waits: a real process's lease, which no fake timer releases.
+		await Bun.sleep(2000);
+		await holder[Symbol.asyncDispose]();
+		const report = await resuming;
+		const after = await resumed.run({ op: "append", text: "after the wait" });
+
+		expect({
+			error: report.error,
+			sessionId: report.sessionId,
+			sessionFile: report.sessionFile,
+			sessionStartId: report.sessionStartId,
+			waited: report.stderr?.includes(
+				`Session ${ID} is held by another omp process; waiting up to 35 s for its lease to go`,
+			),
+			waitedForHolder: (report.elapsedMs ?? 0) >= 1500,
+			afterSessionId: after.sessionId,
+			afterSessionFile: after.sessionFile,
+		}).toEqual({
+			error: undefined,
+			sessionId: ID,
+			sessionFile: session.file,
+			sessionStartId: ID,
+			waited: true,
+			waitedForHolder: true,
+			afterSessionId: ID,
+			afterSessionFile: session.file,
+		});
+		expect(fs.readdirSync(session.dir).filter(name => name.endsWith(".jsonl"))).toEqual([
+			path.basename(session.file),
+		]);
+		const content = await Bun.file(session.file).text();
+		expect([
+			content.includes(`held by ${holderPid}`),
+			content.includes(`resumed by ${resumed.pid}`),
+			content.includes("after the wait"),
+		]).toEqual([true, true, true]);
+	}, 60_000);
+
+	it("exits non-zero naming open-elsewhere when the holder still holds the session after the wait, and writes nothing", async () => {
+		using dir = TempDir.createSync("@omp-exclusive-wait-bound-");
+		const session = await fileSession(dir);
+		await using holder = await LeaseProcess.start(session.config, dir.join("holder"));
+		expect((await holder.run({ op: "hold", file: session.file, sessionDir: session.dir })).sessionId).toBe(ID);
+		const before = await Bun.file(session.file).text();
+
+		await using resumed = await LeaseProcess.start(session.config, dir.join("resumed"), EXCLUSIVE);
+		const started = performance.now();
+		const failure = await resumed.run(resumeById(session)).then(
+			done => `resumed ${done.sessionId} ${done.error ?? ""}`,
+			(err: unknown) => String(err),
+		);
+		const exitCode = await exitOf(resumed, 20_000);
+		const elapsedMs = performance.now() - started;
+
+		expect({
+			exitCode,
+			waited: failure.includes(
+				`Session ${ID} is held by another omp process; waiting up to 35 s for its lease to go`,
+			),
+			stopped: failure.includes(`Session ${ID} stops (open-elsewhere): another omp process holds it.`),
+			waitedOut: elapsedMs >= RESUME_WAIT_MS,
+		}).toEqual({ exitCode: 1, waited: true, stopped: true, waitedOut: true });
+		expect(fs.readdirSync(session.dir).filter(name => name.endsWith(".jsonl"))).toEqual([
+			path.basename(session.file),
+		]);
+		expect(await Bun.file(session.file).text()).toBe(before);
+	}, 90_000);
 });
