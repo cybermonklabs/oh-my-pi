@@ -1,46 +1,12 @@
 //! The shell's locale as a command it starts would see it: its search
 //! path, its working directory, and the locale utility that answers for
 //! it. A test that changes or reads what belongs to the whole process runs
-//! in a process of its own, whatever runs it ([`own_process`]).
+//! in a process of its own, whatever runs it
+//! ([`crate::own_process::own_process`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// The variable that names the one test a process [`own_process`] started
-/// is to run.
-#[cfg(target_os = "linux")]
-const OWN_PROCESS: &str = "PI_BUILTINS_LOCALE_TEST_OWN_PROCESS";
-
-/// Whether the test `name` of this module is to run its body here: `true`
-/// in the process this started for it. Otherwise this starts that process,
-/// this test binary again for `name` alone, waits for it, fails unless it
-/// ran that test and the test passed, and returns `false`.
-///
-/// Such a test changes, or asserts, what belongs to the whole process:
-/// signal dispositions, the process group, `RLIMIT_NOFILE`, `LOCPATH`, the
-/// children and the open descriptors of every task. nextest gives every
-/// test a process of its own, but libtest (`cargo test`, Bazel's
-/// `rust_test`) runs all of a binary's tests in one process, in parallel.
-/// There one test's signal storm killed another's utility, and one test's
-/// children and descriptors failed another's count.
-#[cfg(target_os = "linux")]
-fn own_process(name: &str) -> bool {
-	if std::env::var_os(OWN_PROCESS).is_some_and(|test| test == name) {
-		return true;
-	}
-	let test = format!("locale::tests::{name}");
-	let ran = Command::new(std::env::current_exe().unwrap())
-		.args(["--exact", &test, "--test-threads=1", "--nocapture"])
-		.env(OWN_PROCESS, name)
-		.output()
-		.unwrap();
-	let out = String::from_utf8_lossy(&ran.stdout);
-	let err = String::from_utf8_lossy(&ran.stderr);
-	assert!(ran.status.success(), "{test} failed in its own process:\n{out}{err}");
-	assert!(out.contains("1 passed"), "{test} did not run in its own process:\n{out}{err}");
-	false
-}
 
 /// A locale name no installed locale archive can answer for, so only the
 /// directory the test generates can supply it.
@@ -200,7 +166,7 @@ fn an_answer_that_needs_no_working_directory_is_still_given() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
-	if !own_process("a_process_whose_children_are_reaped_for_it_asks_nothing") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -263,7 +229,7 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_refused_query_falls_back_to_the_name_and_says_so() {
-	if !own_process("a_refused_query_falls_back_to_the_name_and_says_so") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -358,7 +324,7 @@ fn a_locale_missing_a_category_leaves_the_utilities_in_c() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_competing_reaper_does_not_turn_the_query_into_a_stray_signal() {
-	if !own_process("a_competing_reaper_does_not_turn_the_query_into_a_stray_signal") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -451,7 +417,7 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_handed_to_a_task_already_read_is_still_caught() {
-	if !own_process("a_child_handed_to_a_task_already_read_is_still_caught") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
@@ -542,7 +508,7 @@ fn a_child_handed_to_a_task_already_read_is_still_caught() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_composite_looking_name_is_loadable_only_as_the_reference_loads_it() {
-	if !own_process("a_composite_looking_name_is_loadable_only_as_the_reference_loads_it") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -590,7 +556,7 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 	use std::sync::mpsc;
 	use std::time::Duration;
 
-	if !own_process("a_locale_lock_another_thread_holds_does_not_reach_the_lookup") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -645,7 +611,7 @@ fn a_descriptor_limit_with_two_to_spare_still_answers() {
 
 	use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
-	if !own_process("a_descriptor_limit_with_two_to_spare_still_answers") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -826,7 +792,7 @@ fn a_descendant_of_the_utility_does_not_outlive_the_query() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_closed_standard_descriptor_never_becomes_the_answer() {
-	if !own_process("a_closed_standard_descriptor_never_becomes_the_answer") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -885,7 +851,7 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 fn a_query_leaves_the_callers_signal_settings_alone() {
 	use std::os::unix::fs::PermissionsExt as _;
 
-	if !own_process("a_query_leaves_the_callers_signal_settings_alone") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -966,7 +932,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	use std::os::unix::fs::PermissionsExt as _;
 	use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-	if !own_process("an_inherited_handler_does_not_run_in_the_child_before_exec") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	/// This test's own number, and the descriptor the handler writes to.
@@ -1162,7 +1128,7 @@ fn the_ignored_signal_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_name_is_the_name_of_the_data_whatever_punctuation_it_carries() {
-	if !own_process("a_name_is_the_name_of_the_data_whatever_punctuation_it_carries") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1314,7 +1280,7 @@ fn df_grouping(line: &str) -> Option<char> {
 ))]
 #[tokio::test]
 async fn the_utilities_honour_a_locale_only_the_shell_exports() {
-	if !own_process("the_utilities_honour_a_locale_only_the_shell_exports") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1358,7 +1324,7 @@ async fn the_utilities_honour_a_locale_only_the_shell_exports() {
 ))]
 #[tokio::test]
 async fn a_missing_category_leaves_the_utilities_in_c() {
-	if !own_process("a_missing_category_leaves_the_utilities_in_c") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1531,7 +1497,7 @@ fn probe_found_clone3() -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
-	if !own_process("a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1569,7 +1535,7 @@ fn a_clone3_that_answers_enosys_leaves_clone_to_start_the_utility() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() {
-	if !own_process("a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1595,7 +1561,7 @@ fn a_clone3_that_answers_enosys_at_the_call_leaves_clone_to_start_the_utility() 
 #[cfg(target_os = "linux")]
 #[test]
 fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
-	if !own_process("another_threads_refused_clone3_does_not_choose_this_threads_call") {
+	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
