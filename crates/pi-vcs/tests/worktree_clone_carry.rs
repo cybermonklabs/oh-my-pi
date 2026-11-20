@@ -419,11 +419,11 @@ fn clean_clone_leaves_out_untracked_paths_and_nested_checkouts() {
 	git(&source, &["commit", "-qm", "the source does not"]);
 	write(&source, "notes/todo.txt", "untracked work\n");
 	write(&source, "scratch.txt", "untracked scratch\n");
-	git(&source, &["worktree", "add", "-q", "--detach", ".worktrees/linked", "HEAD"]);
+	git(&source, &["worktree", "add", "-q", "--detach", ".checkouts/linked", "HEAD"]);
 	nested_repository(&source.join("node_modules/gitdep"));
 	assert_eq!(
 		git(&source, &["status", "--porcelain"]),
-		"?? .worktrees/\n?? notes/\n?? scratch.txt",
+		"?? .checkouts/\n?? notes/\n?? scratch.txt",
 		"the fixture's paths are untracked and not ignored"
 	);
 	let source_before = snapshot(&source);
@@ -438,7 +438,7 @@ fn clean_clone_leaves_out_untracked_paths_and_nested_checkouts() {
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
 	let carried: Vec<&str> =
-		["notes/todo.txt", "scratch.txt", ".worktrees/linked", "node_modules/gitdep"]
+		["notes/todo.txt", "scratch.txt", ".checkouts/linked", "node_modules/gitdep"]
 			.into_iter()
 			.filter(|relative| fs::symlink_metadata(target.join(relative)).is_ok())
 			.collect();
@@ -449,7 +449,7 @@ fn clean_clone_leaves_out_untracked_paths_and_nested_checkouts() {
 	);
 	assert_eq!(git(&target, &["status", "--porcelain", "--untracked-files=all"]), "");
 	assert_eq!(snapshot(&source), source_before, "the clone changed source files");
-	assert_eq!(git(&source.join(".worktrees/linked"), &["status", "--porcelain"]), "");
+	assert_eq!(git(&source.join(".checkouts/linked"), &["status", "--porcelain"]), "");
 }
 
 /// Keeping changes carries the source's untracked files, and still no other
@@ -463,7 +463,7 @@ fn clone_keeping_changes_carries_untracked_files_but_no_nested_checkout() {
 	}
 	write(&source, "notes/todo.txt", "untracked work\n");
 	write(&source, "scratch.txt", "untracked scratch\n");
-	git(&source, &["worktree", "add", "-q", "--detach", ".worktrees/linked", "HEAD"]);
+	git(&source, &["worktree", "add", "-q", "--detach", ".checkouts/linked", "HEAD"]);
 	nested_repository(&source.join("node_modules/gitdep"));
 	let source_before = snapshot(&source);
 	let target = temp.path().join("target");
@@ -483,7 +483,7 @@ fn clone_keeping_changes_carries_untracked_files_but_no_nested_checkout() {
 	] {
 		assert_eq!(fs::read_to_string(target.join(relative)).unwrap(), contents, "{relative}");
 	}
-	let carried: Vec<&str> = [".worktrees/linked", "node_modules/gitdep"]
+	let carried: Vec<&str> = [".checkouts/linked", "node_modules/gitdep"]
 		.into_iter()
 		.filter(|relative| fs::symlink_metadata(target.join(relative)).is_ok())
 		.collect();
@@ -550,7 +550,7 @@ fn clone_leaves_a_checked_out_submodule_empty_as_git_does() {
 	}
 }
 
-/// A destination inside the source (`git worktree add .worktrees/x`) is not
+/// A destination inside the source (`git worktree add .checkouts/x`) is not
 /// copied into itself.
 #[test]
 fn clone_inside_the_source_leaves_out_its_own_destination() {
@@ -559,7 +559,7 @@ fn clone_inside_the_source_leaves_out_its_own_destination() {
 		eprintln!("SKIP: no working clone backend on this filesystem");
 		return;
 	}
-	let target = source.join(".worktrees/inner");
+	let target = source.join(".checkouts/inner");
 	let result = repo
 		.worktree_add(&target, "HEAD", WorktreeAddOptions {
 			detach:       true,
@@ -570,7 +570,7 @@ fn clone_inside_the_source_leaves_out_its_own_destination() {
 		.unwrap();
 	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
 	assert!(
-		fs::symlink_metadata(target.join(".worktrees")).is_err(),
+		fs::symlink_metadata(target.join(".checkouts")).is_err(),
 		"the clone copied its own destination"
 	);
 	assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "tracked\n");

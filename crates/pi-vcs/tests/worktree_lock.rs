@@ -65,7 +65,7 @@ fn options(clone: WorktreeClone, lock: Option<&str>) -> WorktreeAddOptions {
 #[test]
 fn worktree_add_writes_the_lock_git_writes() {
 	for clone in [WorktreeClone::Off, WorktreeClone::Auto] {
-		for reason in ["agent session: locked on add (AGENTC-431)", "", "in use\n"] {
+		for reason in ["agent session: locked on add (prune guard)", "", "in use\n"] {
 			let (temp, source, repo) = fixture();
 			let by_git = temp.path().join("by-git");
 			git(&source, &[

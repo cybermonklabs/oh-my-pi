@@ -50,9 +50,9 @@ describe("rewriteGitWorktreeAdd", () => {
 	});
 
 	it("locks a rewritten add with the configured reason, as a git wrapper that locks every add would", () => {
-		const lockReason = "agent session: locked on add (AGENTC-431)";
+		const lockReason = "agent session: locked on add (prune guard)";
 		expect(rewriteGitWorktreeAdd("git worktree add --detach ../wt HEAD", OMP, { lockReason })).toBe(
-			"bun '/opt/omp cli.ts' worktree add --detach --lock '--reason=agent session: locked on add (AGENTC-431)' -- ../wt HEAD",
+			"bun '/opt/omp cli.ts' worktree add --detach --lock '--reason=agent session: locked on add (prune guard)' -- ../wt HEAD",
 		);
 		// An explicit lock is the caller's own and keeps git's default reason.
 		expect(rewriteGitWorktreeAdd("git worktree add --lock ../wt", OMP, { lockReason })).toBe(
