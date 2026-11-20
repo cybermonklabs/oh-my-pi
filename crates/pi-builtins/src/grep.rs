@@ -242,8 +242,9 @@ fn longest_match_at(
 )]
 struct GrepArgs {
 	/// Use PATTERN for matching (may be repeated; all patterns are OR-ed).
+	/// Read as its bytes, as every argument is: see [`bre::pattern_text`].
 	#[arg(short = 'e', long = "regexp", value_name = "PATTERN", allow_hyphen_values = true)]
-	patterns: Vec<String>,
+	patterns: Vec<OsString>,
 
 	/// Read patterns from FILE, one per line.
 	#[arg(short = 'f', long = "file", value_name = "FILE", allow_hyphen_values = true)]
@@ -355,7 +356,7 @@ struct GrepArgs {
 
 	/// Print STRING between non-adjacent groups of context lines.
 	#[arg(long = "group-separator", value_name = "STRING")]
-	group_separator: Option<String>,
+	group_separator: Option<OsString>,
 
 	/// Do not print a separator between context groups.
 	#[arg(long = "no-group-separator")]
@@ -383,11 +384,11 @@ struct GrepArgs {
 
 	/// Search files matching GLOB.
 	#[arg(long = "include", value_name = "GLOB")]
-	include: Vec<String>,
+	include: Vec<OsString>,
 
 	/// Skip files matching GLOB.
 	#[arg(long = "exclude", value_name = "GLOB")]
-	exclude: Vec<String>,
+	exclude: Vec<OsString>,
 
 	/// Read file exclusion globs from FILE.
 	#[arg(long = "exclude-from", value_name = "FILE")]
@@ -395,11 +396,11 @@ struct GrepArgs {
 
 	/// Skip directories matching GLOB during recursive searches.
 	#[arg(long = "exclude-dir", value_name = "GLOB")]
-	exclude_dir: Vec<String>,
+	exclude_dir: Vec<OsString>,
 
 	/// Search directories matching GLOB during recursive searches.
 	#[arg(long = "include-dir", value_name = "GLOB")]
-	include_dir: Vec<String>,
+	include_dir: Vec<OsString>,
 
 	/// Recursively search each directory operand.
 	#[arg(short = 'r', long = "recursive")]
@@ -734,7 +735,7 @@ fn resolve_group_separator(cli: &GrepArgs, matches: &ArgMatches) -> Option<Vec<u
 		choose_latest(
 			&mut selected,
 			last_index(matches, "group_separator"),
-			Some(separator.as_bytes().to_vec()),
+			Some(separator.as_encoded_bytes().to_vec()),
 		);
 	}
 	choose_latest(&mut selected, last_index(matches, "no_group_separator"), None);
@@ -905,16 +906,24 @@ const fn dialect_of(mode: MatchMode) -> Option<bre::Dialect> {
 }
 
 /// Translates every pattern for `target`, reporting the first one GNU
-/// refuses with the message GNU prints for it.
+/// refuses with the message GNU prints for it. With `raw_bytes` the patterns
+/// are [`bre::pattern_text`]'s, some holding bytes that are no UTF-8.
 fn translate_patterns(
 	patterns: &[String],
 	dialect: bre::Dialect,
 	target: bre::Target,
 	icase: bool,
+	raw_bytes: bool,
 ) -> Result<Vec<String>, String> {
 	patterns
 		.iter()
-		.map(|pattern| bre::translate(pattern, dialect, target, icase, bre::Strictness::Lenient))
+		.map(|pattern| {
+			if raw_bytes {
+				bre::translate_raw(pattern, dialect, target, icase)
+			} else {
+				bre::translate(pattern, dialect, target, icase, bre::Strictness::Lenient)
+			}
+		})
 		.collect::<Result<_, _>>()
 		.map_err(|error: bre::BreError| error.message().to_owned())
 }
@@ -923,15 +932,25 @@ fn translate_patterns(
 /// that is not UTF-8 each character outside ASCII is written as the escapes
 /// of its UTF-8 bytes, which that crate reads with Unicode off as those
 /// bytes, in a bracket expression too, as GNU grep reads them in the C
-/// locale.
+/// locale. A pattern byte that is no UTF-8 (`spec.raw_bytes`; one that is
+/// still a character here, of a fixed string) is written as that byte.
 fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 	use std::fmt::Write as _;
-	if !spec.bytes || pattern.is_ascii() {
+	if !(spec.bytes || spec.raw_bytes) || pattern.is_ascii() {
 		return pattern;
 	}
+	let target = if spec.bytes { bre::Target::RustBytes } else { bre::Target::Rust };
 	let mut escaped = String::with_capacity(pattern.len() * 2);
 	for c in pattern.chars() {
 		if c.is_ascii() {
+			escaped.push(c);
+			continue;
+		}
+		if let Some(byte) = bre::raw_byte(c).filter(|_| spec.raw_bytes) {
+			bre::push_raw_byte(&mut escaped, byte, target);
+			continue;
+		}
+		if !spec.bytes {
 			escaped.push(c);
 			continue;
 		}
@@ -940,6 +959,124 @@ fn regex_syntax(pattern: String, spec: MatcherSpec) -> String {
 		}
 	}
 	escaped
+}
+
+/// The `-P` pattern `pattern` - in PCRE2's own syntax - as PCRE2 reads the
+/// bytes GNU's `grep -P` passes it, where it holds a byte that is no UTF-8
+/// (`spec.raw_bytes`). In a UTF-8 locale GNU compiles it with PCRE2_UTF,
+/// which refuses it with PCRE2's message: `grep -P $'\351'` is "UTF-8
+/// error: 2 bytes missing at end", exit 2. In the C locale (`spec.bytes`)
+/// such a byte is written as PCRE2's escape of it, which it reads without
+/// PCRE2_UTF as that byte: after a backslash the escape is completed, as
+/// `\` before the byte is the byte, and in `\Q…\E` the quoting is closed
+/// around it.
+fn perl_syntax(pattern: &str, spec: MatcherSpec) -> Result<String, String> {
+	use std::fmt::Write as _;
+	if !spec.raw_bytes || !pattern.chars().any(|c| bre::raw_byte(c).is_some()) {
+		return Ok(pattern.to_owned());
+	}
+	if !spec.bytes {
+		let bytes = bre::pattern_bytes(pattern);
+		return Err(pcre2_utf8_error(&bytes).unwrap_or("UTF-8 error").to_owned());
+	}
+	let mut out = String::with_capacity(pattern.len() * 2);
+	let mut escaped = false;
+	let mut quoted = false;
+	let mut chars = pattern.chars().peekable();
+	while let Some(c) = chars.next() {
+		if let Some(byte) = bre::raw_byte(c) {
+			let _ = match (escaped, quoted) {
+				(true, _) => write!(out, "x{{{byte:02X}}}"),
+				(false, true) => write!(out, r"\E\x{{{byte:02X}}}\Q"),
+				(false, false) => write!(out, r"\x{{{byte:02X}}}"),
+			};
+			escaped = false;
+			continue;
+		}
+		out.push(c);
+		if quoted {
+			if c == '\\' && chars.peek() == Some(&'E') {
+				out.push('E');
+				chars.next();
+				quoted = false;
+			}
+		} else if escaped {
+			escaped = false;
+			quoted = c == 'Q';
+		} else {
+			escaped = c == '\\';
+		}
+	}
+	Ok(out)
+}
+
+/// PCRE2's message for the first UTF-8 error in `bytes`, as its UTF check
+/// (`valid_utf`) finds it, or `None` for UTF-8: GNU's `grep -P` prints it
+/// for a pattern that is not UTF-8 in a UTF-8 locale.
+fn pcre2_utf8_error(bytes: &[u8]) -> Option<&'static str> {
+	let mut at = 0;
+	while let Some(&lead) = bytes.get(at) {
+		at += 1;
+		if lead < 0x80 {
+			continue;
+		}
+		if lead < 0xc0 {
+			return Some("UTF-8 error: isolated byte with 0x80 bit set");
+		}
+		if lead >= 0xfe {
+			return Some("UTF-8 error: illegal byte (0xfe or 0xff)");
+		}
+		// The bytes that follow the lead byte, 1 to 5.
+		let follow = match lead {
+			0xc0..=0xdf => 1,
+			0xe0..=0xef => 2,
+			0xf0..=0xf7 => 3,
+			0xf8..=0xfb => 4,
+			_ => 5,
+		};
+		let left = bytes.len() - at;
+		if left < follow {
+			return Some(
+				[
+					"UTF-8 error: 1 byte missing at end",
+					"UTF-8 error: 2 bytes missing at end",
+					"UTF-8 error: 3 bytes missing at end",
+					"UTF-8 error: 4 bytes missing at end",
+					"UTF-8 error: 5 bytes missing at end",
+				][follow - left - 1],
+			);
+		}
+		let rest = &bytes[at..at + follow];
+		at += follow;
+		if let Some(bad) = rest.iter().position(|byte| byte & 0xc0 != 0x80) {
+			return Some(
+				[
+					"UTF-8 error: byte 2 top bits not 0x80",
+					"UTF-8 error: byte 3 top bits not 0x80",
+					"UTF-8 error: byte 4 top bits not 0x80",
+					"UTF-8 error: byte 5 top bits not 0x80",
+					"UTF-8 error: byte 6 top bits not 0x80",
+				][bad],
+			);
+		}
+		let second = rest[0];
+		let error = match follow {
+			1 if lead & 0x3e == 0 => "UTF-8 error: overlong 2-byte sequence",
+			2 if lead == 0xe0 && second & 0x20 == 0 => "UTF-8 error: overlong 3-byte sequence",
+			2 if lead == 0xed && second >= 0xa0 => "UTF-8 error: code points 0xd800-0xdfff are not defined",
+			3 if lead == 0xf0 && second & 0x30 == 0 => "UTF-8 error: overlong 4-byte sequence",
+			3 if lead > 0xf4 || (lead == 0xf4 && second > 0x8f) => {
+				"UTF-8 error: code points greater than 0x10ffff are not defined"
+			},
+			4 if lead == 0xf8 && second & 0x38 == 0 => "UTF-8 error: overlong 5-byte sequence",
+			4 => "UTF-8 error: 5-byte character is not allowed (RFC 3629)",
+			5 if lead == 0xfc && second & 0x3c == 0 => "UTF-8 error: overlong 6-byte sequence",
+			5 => "UTF-8 error: 6-byte character is not allowed (RFC 3629)",
+			_ => continue,
+		};
+		return Some(error);
+	}
+	None
 }
 
 /// Compiles `patterns` - already in PCRE2's syntax - with PCRE2.
@@ -970,8 +1107,12 @@ struct MatcherSpec {
 	/// PCRE2's JIT, as the shell's `OMP_PCRE2_JIT` sets it.
 	jit:         bool,
 	/// For a line that is not UTF-8, which GNU grep reads a byte to a
-	/// character in the C locale; see [`LineMatcher`].
+	/// character in the C locale; see [`LineMatcher`]. For every line where
+	/// a pattern holds a byte that is no UTF-8 in the C locale.
 	bytes:       bool,
+	/// Whether the patterns are [`bre::pattern_text`]'s, some holding a byte
+	/// that is no UTF-8.
+	raw_bytes:   bool,
 }
 
 /// Compile all patterns using the last-selected matcher mode.
@@ -981,7 +1122,14 @@ struct MatcherSpec {
 /// user typed answers a different question with a success status.
 fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, String> {
 	if spec.mode == MatchMode::Perl {
-		return build_pcre_matcher(patterns, spec);
+		if !spec.raw_bytes {
+			return build_pcre_matcher(patterns, spec);
+		}
+		let written = patterns
+			.iter()
+			.map(|pattern| perl_syntax(pattern, spec))
+			.collect::<Result<Vec<_>, _>>()?;
+		return build_pcre_matcher(&written, spec);
 	}
 
 	// With no pattern (`-f` of an empty file) no line matches. To fold case,
@@ -1025,11 +1173,11 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 	// than refused or searched as the text `\1`.
 	if patterns.iter().any(|pattern| bre::has_backreference(pattern)) {
 		let target = if spec.bytes { bre::Target::PcreBytes } else { bre::Target::Pcre };
-		let translated = translate_patterns(patterns, dialect, target, spec.ignore_case)?;
+		let translated = translate_patterns(patterns, dialect, target, spec.ignore_case, spec.raw_bytes)?;
 		return build_pcre_matcher(&translated, spec);
 	}
 	let target = if spec.bytes { bre::Target::RustBytes } else { bre::Target::Rust };
-	let translated: Vec<String> = translate_patterns(patterns, dialect, target, spec.ignore_case)?
+	let translated: Vec<String> = translate_patterns(patterns, dialect, target, spec.ignore_case, spec.raw_bytes)?
 		.into_iter()
 		.map(|pattern| regex_syntax(pattern, spec))
 		.collect();
@@ -1147,6 +1295,8 @@ const FIRST_WINDOW: usize = 256;
 
 /// The matcher of a search for `text`, which `build_matcher` compiled from
 /// `patterns` with `spec` and which `engine` takes out of what it returns.
+/// Where `text` already reads a byte to a character (`spec.bytes`), it reads
+/// every line.
 fn line_matcher<M: Send + Sync + 'static>(
 	text: M,
 	patterns: Vec<String>,
@@ -1157,7 +1307,7 @@ fn line_matcher<M: Send + Sync + 'static>(
 where
 	M: Matcher,
 {
-	let bytes = (!reads_bytes_as_text(&patterns, spec)).then(|| {
+	let bytes = (!spec.bytes && !reads_bytes_as_text(&patterns, spec)).then(|| {
 		let spec = MatcherSpec { bytes: true, ..spec };
 		let build: Box<dyn FnOnce() -> Option<M> + Send> =
 			Box::new(move || build_matcher(&patterns, spec).ok().and_then(engine));
@@ -2088,27 +2238,52 @@ async fn read_auxiliary_file(host: &mut Host, path: &OsStr) -> Result<Vec<u8>, S
 	result.map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn pattern_file_lines(bytes: &[u8]) -> Vec<String> {
-	if bytes.is_empty() {
-		return Vec::new();
-	}
-	String::from_utf8_lossy(bytes)
-		.split_terminator('\n')
-		.map(str::to_owned)
-		.collect()
+/// The lines of a pattern or glob file: none for an empty file, and none
+/// after a last newline.
+fn file_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+	let lines = if bytes.is_empty() { None } else { Some(bytes.strip_suffix(b"\n").unwrap_or(bytes)) };
+	lines.into_iter().flat_map(|lines| lines.split(|&byte| byte == b'\n'))
 }
 
-async fn resolve_patterns(host: &mut Host, cli: &GrepArgs) -> Result<(Vec<String>, Vec<OsString>), String> {
+/// The patterns of a search, each as [`bre::pattern_text`] writes it: GNU
+/// reads a pattern as its bytes, so `grep $'\351'` selects the lines holding
+/// that byte.
+#[derive(Default)]
+struct Patterns {
+	texts:     Vec<String>,
+	/// Whether one holds a byte that is no UTF-8.
+	raw_bytes: bool,
+}
+
+impl Patterns {
+	/// Adds the pattern `line`.
+	fn push(&mut self, line: &[u8]) {
+		let (text, raw) = bre::pattern_text(line);
+		self.raw_bytes |= raw;
+		self.texts.push(text);
+	}
+
+	/// Adds the patterns of the argument `pattern`, one per line of it.
+	fn push_argument(&mut self, pattern: &OsStr) {
+		for line in pattern.as_encoded_bytes().split(|&byte| byte == b'\n') {
+			self.push(line);
+		}
+	}
+}
+
+async fn resolve_patterns(host: &mut Host, cli: &GrepArgs) -> Result<(Patterns, Vec<OsString>), String> {
 	let has_explicit_patterns = !cli.patterns.is_empty() || !cli.pattern_files.is_empty();
-	let mut patterns = Vec::new();
+	let mut patterns = Patterns::default();
 	let mut files = Vec::new();
 
 	if has_explicit_patterns {
 		for pattern in &cli.patterns {
-			patterns.extend(pattern.split('\n').map(str::to_owned));
+			patterns.push_argument(pattern);
 		}
 		for path in &cli.pattern_files {
-			patterns.extend(pattern_file_lines(&read_auxiliary_file(host, path).await?));
+			for line in file_lines(&read_auxiliary_file(host, path).await?) {
+				patterns.push(line);
+			}
 		}
 		files.clone_from(&cli.args);
 		return Ok((patterns, files));
@@ -2118,7 +2293,7 @@ async fn resolve_patterns(host: &mut Host, cli: &GrepArgs) -> Result<(Vec<String
 	let Some(pattern) = args.next() else {
 		return Err("no pattern given\nUsage: grep [OPTION]... PATTERN [FILE]...".to_owned());
 	};
-	patterns.extend(pattern.to_string_lossy().split('\n').map(str::to_owned));
+	patterns.push_argument(pattern);
 	files.extend(args.cloned());
 	Ok((patterns, files))
 }
@@ -2129,20 +2304,22 @@ async fn collect_rule_specs(
 	matches: &ArgMatches,
 ) -> Result<(Vec<RuleSpec>, Vec<RuleSpec>), String> {
 	let mut files = Vec::new();
+	// A glob is read as text: one byte that is no UTF-8 is U+FFFD there.
+	let glob = |pattern: &[u8]| String::from_utf8_lossy(pattern).into_owned();
 	if let Some(indices) = matches.indices_of("include") {
 		for (index, pattern) in indices.zip(&cli.include) {
-			files.push(RuleSpec { index, include: true, pattern: pattern.clone() });
+			files.push(RuleSpec { index, include: true, pattern: glob(pattern.as_encoded_bytes()) });
 		}
 	}
 	if let Some(indices) = matches.indices_of("exclude") {
 		for (index, pattern) in indices.zip(&cli.exclude) {
-			files.push(RuleSpec { index, include: false, pattern: pattern.clone() });
+			files.push(RuleSpec { index, include: false, pattern: glob(pattern.as_encoded_bytes()) });
 		}
 	}
 	if let Some(indices) = matches.indices_of("exclude_from") {
 		for (index, path) in indices.zip(&cli.exclude_from) {
-			for pattern in pattern_file_lines(&read_auxiliary_file(host, path).await?) {
-				files.push(RuleSpec { index, include: false, pattern });
+			for pattern in file_lines(&read_auxiliary_file(host, path).await?) {
+				files.push(RuleSpec { index, include: false, pattern: glob(pattern) });
 			}
 		}
 	}
@@ -2150,12 +2327,12 @@ async fn collect_rule_specs(
 	let mut dirs = Vec::new();
 	if let Some(indices) = matches.indices_of("include_dir") {
 		for (index, pattern) in indices.zip(&cli.include_dir) {
-			dirs.push(RuleSpec { index, include: true, pattern: pattern.clone() });
+			dirs.push(RuleSpec { index, include: true, pattern: glob(pattern.as_encoded_bytes()) });
 		}
 	}
 	if let Some(indices) = matches.indices_of("exclude_dir") {
 		for (index, pattern) in indices.zip(&cli.exclude_dir) {
-			dirs.push(RuleSpec { index, include: false, pattern: pattern.clone() });
+			dirs.push(RuleSpec { index, include: false, pattern: glob(pattern.as_encoded_bytes()) });
 		}
 	}
 	Ok((files, dirs))
@@ -2518,7 +2695,7 @@ impl AsyncUtility for Grep {
 		let cli = self.cli;
 		let matches = self.matches;
 
-	let (patterns, mut files) = match resolve_patterns(host, &cli).await {
+	let (Patterns { texts: patterns, raw_bytes }, mut files) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
 		Err(error) => {
 			let _ = writeln!(host.stderr, "grep: {error}");
@@ -2561,6 +2738,10 @@ impl AsyncUtility for Grep {
 	if selects_no_record && (cli.quiet || !files_without_match) {
 		return 1;
 	}
+	// A pattern byte that is no UTF-8 is that byte in the C and the C.UTF-8
+	// locale alike. In the C locale every byte is a character, so where a
+	// pattern holds such a byte every line is read so, as GNU reads it: `.`
+	// and `[^\351]` match one byte of the line `é` there, not its character.
 	let spec = MatcherSpec {
 		mode:        resolve_match_mode(&matches),
 		ignore_case: resolve_ignore_case(&matches),
@@ -2568,7 +2749,8 @@ impl AsyncUtility for Grep {
 		line_regexp: cli.line_regexp,
 		null_data:   cli.null_data,
 		jit:         pcre2_jit_enabled(host.var("OMP_PCRE2_JIT")),
-		bytes:       false,
+		bytes:       raw_bytes && !crate::locale::ctype_is_utf8(host),
+		raw_bytes,
 	};
 	let matcher = match build_matcher(&patterns, spec) {
 		Ok(matcher) => matcher,
@@ -3807,6 +3989,7 @@ mod tests {
 			null_data:   false,
 			jit:         false,
 			bytes:       false,
+			raw_bytes:   false,
 		};
 		let patterns = vec!["caf.".to_owned()];
 		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3844,6 +4027,7 @@ mod tests {
 		null_data:   false,
 		jit:         false,
 		bytes:       false,
+		raw_bytes:   false,
 	};
 
 	#[test]
@@ -3922,6 +4106,61 @@ mod tests {
 		let mut short = OPTIONS.short_valued.clone();
 		short.sort_unstable();
 		assert_eq!(short, ['A', 'B', 'C', 'D', 'd', 'e', 'f', 'm']);
+	}
+
+	#[test]
+	fn a_pattern_byte_matches_that_byte_in_both_locales() {
+		// If this regresses, `grep $'\303'` misses the line `café` (whose `é`
+		// starts with that byte), or `grep $'[\303]'` selects it in a UTF-8
+		// locale, where GNU grep 3.11 selects it in the C locale alone, as
+		// it does `grep $'f.\251'`.
+		let find = |pattern: &[u8], bytes: bool, line: &[u8]| {
+			let (text, raw_bytes) = bre::pattern_text(pattern);
+			let spec = MatcherSpec { bytes, raw_bytes, ..BRE_SPEC };
+			let Ok(Engine::Rust(matcher)) = build_matcher(&[text], spec) else {
+				panic!("{pattern:?} compiles");
+			};
+			matcher.find(line).unwrap().map(|found| (found.start(), found.end()))
+		};
+		let line = "café".as_bytes();
+		for bytes in [false, true] {
+			assert_eq!(find(b"\xc3", bytes, line), Some((3, 4)), "bytes {bytes}");
+			assert_eq!(find(b"\xe9", bytes, b"caf\xe9"), Some((3, 4)), "bytes {bytes}");
+		}
+		assert_eq!(find(b"[\xc3]", false, line), None);
+		assert_eq!(find(b"[\xc3]", true, line), Some((3, 4)));
+		assert_eq!(find(b"[^\xc3]\xa9", false, line), None);
+		assert_eq!(find(b"f.\xa9", true, line), Some((2, 5)));
+		assert_eq!(find(b"f.\xa9", false, line), None);
+	}
+
+	#[test]
+	fn a_perl_pattern_byte_is_its_escape_in_the_c_locale_and_refused_in_utf8() {
+		// If this regresses, `LC_ALL=C grep -P $'.\377'` selects no line
+		// holding that byte, or `grep -P $'\351'` searches in a UTF-8 locale,
+		// where GNU grep 3.11 says "UTF-8 error: 2 bytes missing at end" and
+		// exits 2.
+		let spec = MatcherSpec { mode: MatchMode::Perl, bytes: true, raw_bytes: true, ..BRE_SPEC };
+		let written = |bytes: &[u8], spec| perl_syntax(&bre::pattern_text(bytes).0, spec);
+		assert_eq!(written(b".\xff", spec), Ok(r".\x{FF}".to_owned()));
+		assert_eq!(written(b"\\\xe9", spec), Ok(r"\x{E9}".to_owned()));
+		assert_eq!(written(b"\\\\\xe9", spec), Ok(r"\\\x{E9}".to_owned()));
+		assert_eq!(written(b"\\Qa\xe9b\\E", spec), Ok(r"\Qa\E\x{E9}\Qb\E".to_owned()));
+		let utf8 = MatcherSpec { bytes: false, ..spec };
+		assert_eq!(written(b"\xe9", utf8), Err("UTF-8 error: 2 bytes missing at end".to_owned()));
+		// PCRE2's own check, as GNU grep 3.11 reports it.
+		let refused: [(&[u8], &str); 6] = [
+			(b"[\xe9]", "UTF-8 error: 1 byte missing at end"),
+			(b".\xff", "UTF-8 error: illegal byte (0xfe or 0xff)"),
+			(b"\\Q\xe9\\E", "UTF-8 error: byte 2 top bits not 0x80"),
+			(b"a\x80", "UTF-8 error: isolated byte with 0x80 bit set"),
+			(b"\xc0\x80", "UTF-8 error: overlong 2-byte sequence"),
+			(b"\xed\xa0\x80", "UTF-8 error: code points 0xd800-0xdfff are not defined"),
+		];
+		for (bytes, message) in refused {
+			assert_eq!(pcre2_utf8_error(bytes), Some(message), "{bytes:?}");
+		}
+		assert_eq!(pcre2_utf8_error("café".as_bytes()), None);
 	}
 }
 

@@ -71,8 +71,76 @@ impl Target {
 	/// leaves out `Ⅻ`, a letter to GNU; in the C locale a byte from 0x80 up
 	/// is no letter.
 	const fn unicode_letters(self) -> bool {
-		!matches!(self, Self::RustBytes | Self::PcreBytes)
+		!self.reads_bytes()
 	}
+
+	/// Whether the engine reads a byte to a character: GNU grep's C locale.
+	const fn reads_bytes(self) -> bool {
+		matches!(self, Self::RustBytes | Self::PcreBytes)
+	}
+}
+
+/// The first of the characters that stand, in a pattern of [`pattern_text`],
+/// for its bytes that are no UTF-8: U+10FF80 for the byte 0x80 to U+10FFFF
+/// for 0xFF, characters of the private use plane 16. A pattern that also
+/// holds one of those characters as itself reads it as that byte.
+const RAW_BYTE_BASE: u32 = 0x10_FF00;
+
+/// The text [`translate_raw`] reads for the pattern `bytes`: its UTF-8 as it
+/// is, and each byte that is no UTF-8 as the character that stands for it
+/// ([`raw_byte`]), with whether it holds such a byte. GNU grep reads a
+/// pattern as its bytes: `grep $'\351'` selects a line holding the byte
+/// 0xE9.
+#[cfg(any(feature = "util.grep", test))]
+pub(crate) fn pattern_text(bytes: &[u8]) -> (String, bool) {
+	let mut text = String::with_capacity(bytes.len());
+	let mut raw = false;
+	for chunk in bytes.utf8_chunks() {
+		text.push_str(chunk.valid());
+		for &byte in chunk.invalid() {
+			raw = true;
+			text.extend(char::from_u32(RAW_BYTE_BASE + u32::from(byte)));
+		}
+	}
+	(text, raw)
+}
+
+/// The bytes of a pattern of [`pattern_text`]: `text` with each character
+/// that stands for a byte written as that byte.
+#[cfg(any(feature = "util.grep", test))]
+pub(crate) fn pattern_bytes(text: &str) -> Vec<u8> {
+	let mut bytes = Vec::with_capacity(text.len());
+	for c in text.chars() {
+		match raw_byte(c) {
+			Some(byte) => bytes.push(byte),
+			None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+		}
+	}
+	bytes
+}
+
+/// The byte that is no UTF-8 the character `c` stands for in a pattern of
+/// [`pattern_text`], if it stands for one.
+pub(crate) fn raw_byte(c: char) -> Option<u8> {
+	let byte = u8::try_from(u32::from(c).checked_sub(RAW_BYTE_BASE)?).ok()?;
+	(byte >= 0x80).then_some(byte)
+}
+
+/// Writes the pattern byte `byte`, which is no UTF-8, as an atom of `target`
+/// that matches that byte. GNU grep matches such a byte as itself in the C
+/// and the C.UTF-8 locale alike, in a character too: `grep $'\303'` selects
+/// the line `é` in both. PCRE2 with PCRE2_UTF matches whole characters
+/// alone, so for [`Target::Pcre`] (a back-reference among the patterns, for
+/// a line that is UTF-8) the byte matches nothing. `sed` and `nl` read no
+/// pattern of [`pattern_text`].
+pub(crate) fn push_raw_byte(out: &mut String, byte: u8, target: Target) {
+	use std::fmt::Write as _;
+	let _ = match target {
+		Target::Rust | Target::Fancy => write!(out, r"(?-u:\x{byte:02X})"),
+		Target::RustBytes => write!(out, r"\x{byte:02X}"),
+		Target::PcreBytes => write!(out, r"\x{{{byte:02X}}}"),
+		Target::Pcre => write!(out, "(?!)"),
+	};
 }
 
 /// How strictly a pattern is read.
@@ -164,6 +232,25 @@ pub(crate) fn translate(
 	translate_multiline(pattern, dialect, target, icase, strictness, false)
 }
 
+/// [`translate`] for GNU grep's pattern of [`pattern_text`], whose characters
+/// from U+10FF80 up stand for the bytes that are no UTF-8 in it. Such a byte
+/// is written as [`push_raw_byte`] writes it; in a bracket expression, for a
+/// target that reads a byte to a character, as a member of that byte, as GNU
+/// reads it in the C locale (`LC_ALL=C grep $'[\351]'` selects the byte
+/// 0xE9). For one that reads characters it is no member, as in GNU's UTF-8
+/// locale, where no character is that byte (`grep $'[\351]'` selects
+/// nothing), except as a range's end, which is the character of its value
+/// there (`grep $'[\351-\377]'` selects `é`, U+00E9).
+#[cfg(any(feature = "util.grep", test))]
+pub(crate) fn translate_raw(
+	pattern: &str,
+	dialect: Dialect,
+	target: Target,
+	icase: bool,
+) -> Result<String, BreError> {
+	translator(pattern, dialect, target, icase, Strictness::Lenient, false, true).run()
+}
+
 /// Rewrites `pattern`, written in `dialect`, into the syntax `target` reads
 /// with the meaning GNU gives it, read as strictly as `strictness` says.
 ///
@@ -182,6 +269,20 @@ pub(crate) fn translate_multiline(
 	strictness: Strictness,
 	multiline: bool,
 ) -> Result<String, BreError> {
+	translator(pattern, dialect, target, icase, strictness, multiline, false).run()
+}
+
+/// The translation of `pattern`; `raw_bytes` for a pattern of
+/// [`pattern_text`] (see [`translate_raw`]).
+fn translator(
+	pattern: &str,
+	dialect: Dialect,
+	target: Target,
+	icase: bool,
+	strictness: Strictness,
+	multiline: bool,
+	raw_bytes: bool,
+) -> Translator<'_> {
 	Translator {
 		chars: pattern.chars().peekable(),
 		out: String::with_capacity(pattern.len() + 8),
@@ -190,6 +291,7 @@ pub(crate) fn translate_multiline(
 		strictness,
 		icase,
 		multiline,
+		raw_bytes,
 		atom: None,
 		quantified: false,
 		atom_is_anchor: false,
@@ -199,7 +301,6 @@ pub(crate) fn translate_multiline(
 		opened: 0,
 		completed: 0,
 	}
-	.run()
 }
 
 /// Whether a character of `pattern` outside every bracket expression
@@ -649,6 +750,9 @@ struct Translator<'a> {
 	/// Whether a bracket expression that negates holds no newline; see
 	/// [`translate_multiline`].
 	multiline:  bool,
+	/// Whether the characters from U+10FF80 up stand for pattern bytes that
+	/// are no UTF-8; see [`translate_raw`].
+	raw_bytes:  bool,
 	/// Where in `out` the atom a repetition operator repeats begins, or
 	/// `None` at a branch start, where there is nothing to repeat.
 	atom:       Option<usize>,
@@ -702,6 +806,7 @@ impl Translator<'_> {
 						self.icase,
 						self.target,
 						self.multiline,
+						self.raw_bytes,
 					)?;
 					self.set_atom(start);
 				},
@@ -995,7 +1100,10 @@ impl Translator<'_> {
 
 	fn literal(&mut self, c: char) {
 		let start = self.out.len();
-		push_literal(&mut self.out, c);
+		match raw_byte(c).filter(|_| self.raw_bytes) {
+			Some(byte) => push_raw_byte(&mut self.out, byte, self.target),
+			None => push_literal(&mut self.out, c),
+		}
 		self.set_atom(start);
 	}
 
@@ -1188,20 +1296,35 @@ enum BracketMember {
 ///
 /// A list that negates holds no newline where `multiline` (GNU sed's `M`
 /// flag): `[^x]*$` stops at the end of a line there.
+///
+/// With `raw_bytes` a member that stands for a pattern byte that is no
+/// UTF-8 is read as [`translate_raw`] says.
 fn take_bracket_expression(
 	chars: &mut Peekable<Chars<'_>>,
 	out: &mut String,
 	icase: bool,
 	target: Target,
 	multiline: bool,
+	raw_bytes: bool,
 ) -> Result<bool, BreError> {
+	let class_start = out.len();
 	out.push('[');
-	if chars.next_if_eq(&'^').is_some() {
+	let negated = chars.next_if_eq(&'^').is_some();
+	if negated {
 		out.push('^');
 		if multiline {
 			out.push_str("\\n");
 		}
 	}
+	let raw = |c: char| raw_byte(c).filter(|_| raw_bytes);
+	// A pattern byte for an engine that reads characters: no member alone,
+	// the character of its value as a range's end.
+	let as_char = |c: char| match raw(c) {
+		Some(byte) if !target.reads_bytes() => char::from(byte),
+		_ => c,
+	};
+	// Whether a member was written; see `raw_bytes`.
+	let mut written = false;
 	// A `-` first in the list is a member.
 	let mut first = true;
 	// GNU warns where the list opens with a colon, the member last read is a
@@ -1236,6 +1359,7 @@ fn take_bracket_expression(
 				let BracketMember::Char(end) = take_bracket_member(chars, true)? else {
 					return Err(BreError::RangeEndInvalid);
 				};
+				let (start, end) = (as_char(start), as_char(end));
 				// GNU checks the range against the ends it folds: `[Z-a]` is
 				// a range of its own and "Invalid range end" under `-i`,
 				// while `[a-Z]` is the other way round. One the engine cannot
@@ -1251,18 +1375,36 @@ fn take_bracket_expression(
 				if high < low {
 					return Err(BreError::RangeEndInvalid);
 				}
-				push_bracket_char(out, low);
+				push_bracket_member(out, low, raw(low), target);
 				out.push('-');
-				push_bracket_char(out, high);
+				push_bracket_member(out, high, raw(high), target);
+				written = true;
 			},
-			BracketMember::Char(c) | BracketMember::Equivalence(c) => push_bracket_char(out, c),
-			BracketMember::Class(name) => push_bracket_class(out, name, target, icase),
+			BracketMember::Char(c) if raw(c).is_some() && !target.reads_bytes() => {},
+			BracketMember::Char(c) | BracketMember::Equivalence(c) => {
+				push_bracket_member(out, c, raw(c), target);
+				written = true;
+			},
+			BracketMember::Class(name) => {
+				push_bracket_class(out, name, target, icase);
+				written = true;
+			},
 		}
 		match chars.peek() {
 			None => return Err(BreError::BracketUnmatched),
 			Some(']') => {
 				chars.next();
 				out.push(']');
+				// Every member was a pattern byte no character is: the list
+				// matches no character, or every one where it negates.
+				if !written {
+					out.truncate(class_start);
+					out.push_str(match (negated, multiline) {
+						(false, _) => r"[^\x00-\x{10FFFF}]",
+						(true, false) => r"[\x00-\x{10FFFF}]",
+						(true, true) => r"[^\n]",
+					});
+				}
 				return Ok(opens_colon && ends_colon && other_member && !special);
 			},
 			Some(_) => {},
@@ -1340,6 +1482,16 @@ fn push_bracket_char(out: &mut String, c: char) {
 		out.push('\\');
 	}
 	out.push(c);
+}
+
+/// Append `c` as a member of a class: the pattern byte `raw` it stands for,
+/// for an engine that reads a byte to a character ([`push_raw_byte`]), or
+/// else the character itself ([`push_bracket_char`]).
+fn push_bracket_member(out: &mut String, c: char, raw: Option<u8>, target: Target) {
+	match raw {
+		Some(byte) if target.reads_bytes() => push_raw_byte(out, byte, target),
+		_ => push_bracket_char(out, c),
+	}
 }
 
 /// Append the POSIX class `name` as a member of a class, with the meaning it
@@ -2284,5 +2436,40 @@ mod tests {
 		for pattern in ["a+", "a?", "a{2}", "(a)", "a|b"] {
 			assert!(!is_literal(pattern, Dialect::Extended), "{pattern}");
 		}
+	}
+
+	/// A pattern byte that is no UTF-8 is that byte for an engine that reads
+	/// a byte to a character, in a bracket expression too, as GNU grep 3.11
+	/// reads it in the C locale. For one that reads characters it is that
+	/// byte outside a bracket expression, no member inside one, and the
+	/// character of its value as a range's end, as GNU grep 3.11 reads it in
+	/// the C.UTF-8 locale.
+	#[test]
+	fn a_pattern_byte_that_is_no_utf8_is_that_byte() {
+		// If this regresses, `grep $'\351'` selects no line holding the byte
+		// 0xE9, or `grep $'[\351]'` selects one in a UTF-8 locale, where
+		// GNU's selects none.
+		let raw = |pattern: &[u8], target| {
+			let (text, raw) = pattern_text(pattern);
+			assert!(raw, "{pattern:?}");
+			translate_raw(&text, Dialect::Basic, target, false)
+		};
+		assert_eq!(raw(b"caf\xe9", Target::RustBytes), Ok(r"caf\xE9".to_owned()));
+		assert_eq!(raw(b"caf\xe9", Target::Rust), Ok(r"caf(?-u:\xE9)".to_owned()));
+		assert_eq!(raw(b"\xe9*", Target::Rust), Ok(r"(?-u:\xE9)*".to_owned()));
+		assert_eq!(raw(b"\\\xe9", Target::RustBytes), Ok(r"\xE9".to_owned()));
+		assert_eq!(raw(b"\xc3", Target::PcreBytes), Ok(r"\x{C3}".to_owned()));
+		assert_eq!(raw(b"\xc3", Target::Pcre), Ok("(?!)".to_owned()));
+		assert_eq!(raw(b"[a\xe9]", Target::RustBytes), Ok(r"[a\xE9]".to_owned()));
+		assert_eq!(raw(b"[^\xe9]", Target::RustBytes), Ok(r"[^\xE9]".to_owned()));
+		assert_eq!(raw(b"[a\xe9]", Target::Rust), Ok("[a]".to_owned()));
+		assert_eq!(raw(b"[\xe9]", Target::Rust), Ok(r"[^\x00-\x{10FFFF}]".to_owned()));
+		assert_eq!(raw(b"[^\xe9]", Target::Rust), Ok(r"[\x00-\x{10FFFF}]".to_owned()));
+		assert_eq!(raw(b"[\xe9-\xff]", Target::Rust), Ok("[\u{e9}-\u{ff}]".to_owned()));
+		assert_eq!(raw(b"[\xe9-\xff]", Target::RustBytes), Ok(r"[\xE9-\xFF]".to_owned()));
+		assert_eq!(raw(b"[\xff-\xe9]", Target::RustBytes), Err(BreError::RangeEndInvalid));
+		// UTF-8 stays text, and the bytes come back as they were.
+		assert_eq!(pattern_text("café".as_bytes()), ("café".to_owned(), false));
+		assert_eq!(pattern_bytes(&pattern_text(b"a\xe9\xc3\xa9\xff").0), b"a\xe9\xc3\xa9\xff");
 	}
 }
