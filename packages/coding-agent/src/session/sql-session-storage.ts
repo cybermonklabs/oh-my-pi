@@ -442,13 +442,6 @@ interface LeaseQueries {
 	 * reads them back with `heldBy`).
 	 */
 	heartbeat(count: number): Statement;
-	/**
-	 * PostgreSQL's `heartbeat` to run outside a transaction, where the
-	 * connection's `search_path` is not locked: every function and operator
-	 * it names is `pg_catalog`'s, written so, and its table is qualified.
-	 * Unset on MySQL, whose heartbeat runs alone already.
-	 */
-	heartbeatAlone: ((count: number) => Statement) | undefined;
 	heldBy(count: number): Statement;
 	release: Statement;
 	/**
@@ -698,15 +691,16 @@ const LEASE_CLAIM_LOCK_BOUND_MS = 5000;
  * refuses the write, the session held by the other process.
  */
 const LEASE_FENCE_LOCK_BOUND_MS = 2000;
+/**
+ * The PostgreSQL heartbeat's local lock wait and idle-in-transaction bounds.
+ * Both leave 1.5 s before a fenced write marks its claim lost, so the server
+ * ends a heartbeat that cannot commit before its locks can consume that fence.
+ */
+const LEASE_HEARTBEAT_TRANSACTION_BOUND_MS = 500;
 /** How often a whole transaction whose MySQL or MariaDB `NOWAIT` lock read was refused runs again within its bound. */
 const NOWAIT_RETRY_MS = 50;
 /** The first key of PostgreSQL's two-key advisory locks the claim and the fence of a session take (`'omp'`). */
 const PG_SESSION_LOCK_CLASS = 0x6f6d70;
-
-/** PostgreSQL `read_only_sql_transaction` (SQLSTATE 25006): a write sent on a connection left read-only. */
-function isReadOnlyTransactionError(error: unknown): boolean {
-	return error instanceof Error && "errno" in error && error.errno === "25006";
-}
 
 /**
  * Another transaction held the lock a statement waited for past its bound:
@@ -1055,6 +1049,8 @@ function run(
  * refuses one), so this lock is what every statement runs under.
  */
 const PG_SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
+/** The heartbeat's opening: search_path lock and both bounds in one simple query, so they cost one round trip. */
+const PG_HEARTBEAT_OPENING = `${PG_SEARCH_PATH}; SET LOCAL lock_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}; SET LOCAL idle_in_transaction_session_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`;
 /** The schema of the store's PostgreSQL tables, which every statement names them with. */
 const PG_SCHEMA = "public";
 /**
@@ -1898,20 +1894,6 @@ function buildLeaseQueries(
 				`UPDATE ${leases} SET heartbeat_at = ${now} WHERE holder = @holder AND session_id IN (${sessions(count)})` +
 					(mysql ? "" : " RETURNING session_id"),
 			),
-		heartbeatAlone: mysql
-			? undefined
-			: count => {
-					const qualifiedNow =
-						"(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) OPERATOR(pg_catalog.*) 1000)::pg_catalog.int8";
-					const mine = Array.from(
-						{ length: count },
-						(_, index) => `session_id OPERATOR(pg_catalog.=) @sid${index}`,
-					).join(" OR ");
-					return sql(
-						`UPDATE ${leases} SET heartbeat_at = ${qualifiedNow} ` +
-							`WHERE holder OPERATOR(pg_catalog.=) @holder AND (${mine}) RETURNING session_id`,
-					);
-				},
 		heldBy: count =>
 			sql(`SELECT session_id FROM ${leases} WHERE holder = @holder AND session_id IN (${sessions(count)})`),
 		release: sql(`DELETE FROM ${leases} WHERE session_id = @sid AND holder = @holder`),
@@ -3237,12 +3219,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Refresh the lease rows of every claim this store still holds, in one
 	 * statement, and no other row of its: a row whose release gave up (see
 	 * {@link release}) is left to expire instead of staying held while the
-	 * store lives. A claim the statement found gone (its row deleted, or
-	 * another holder's now) is lost; one it refreshed is proven until the
-	 * statement's send time plus the expiry less one interval, however late
-	 * the answer came. A failed heartbeat (database unreachable) leaves every
-	 * claim as it is, so a claim the database cannot confirm for long enough
-	 * lapses: its writes wait, and nothing moves.
+	 * store lives. PostgreSQL sends every heartbeat through {@link #readWrite}
+	 * on its first try: its lock and idle-in-transaction timeouts are `SET
+	 * LOCAL`, so no session setting crosses a transaction-mode pool. Its row
+	 * locks can last through one COMMIT round trip, but the server ends a
+	 * stalled transaction 1.5 s before a fence would mark its claim lost. A
+	 * heartbeat whose transaction or COMMIT answer is lost is a failed beat:
+	 * it leaves every claim as it is until another database answer proves it
+	 * held or lost.
 	 */
 	async #beat(): Promise<void> {
 		const lease = this.#q.lease;
@@ -3257,7 +3241,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const [index, claim] of live.entries()) values[`sid${index}`] = claim.sessionId;
 			let refreshed: Array<{ session_id: string }> = [];
 			if (this.#adapter === "postgres") {
-				refreshed = (await this.#heartbeatAlone(lease, live.length, values)) as Array<{ session_id: string }>;
+				await this.#readWrite(async transaction => {
+					refreshed = (await run(transaction, lease.heartbeat(live.length), values)) as Array<{
+						session_id: string;
+					}>;
+				}, "heartbeat");
 			} else {
 				// Two statements on their own, in no transaction: a lock wait timeout of the update (with
 				// `innodb_rollback_on_timeout` ON or OFF) fails this heartbeat alone, and leaves no transaction
@@ -3277,38 +3265,6 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		} finally {
 			this.#beating = false;
 		}
-	}
-
-	/**
-	 * PostgreSQL's heartbeat: one statement outside any transaction (see
-	 * `heartbeatAlone`), committed on the server as it ends, so the lease rows
-	 * it locks are free again before its answer leaves, however slow that
-	 * answer: a fence of this store's own write never waits on it. It names
-	 * only `pg_catalog` functions and operators, since the connection's
-	 * `search_path` is not locked outside a transaction, and binds the holder
-	 * token as a parameter, as every statement does. On a connection another
-	 * session left read-only (SQLSTATE 25006) it runs as a transaction instead
-	 * (`#readWrite`), which overrides such a value or refuses a read-only
-	 * default, as every write does.
-	 */
-	async #heartbeatAlone(
-		lease: LeaseQueries,
-		count: number,
-		values: StatementValues,
-	): Promise<SqlSessionStorageResult> {
-		const alone = lease.heartbeatAlone?.(count);
-		if (alone) {
-			try {
-				return await run(this.#client, alone, values);
-			} catch (err) {
-				if (!isReadOnlyTransactionError(err)) throw err;
-			}
-		}
-		let refreshed: SqlSessionStorageResult = [];
-		await this.#readWrite(async transaction => {
-			refreshed = await run(transaction, lease.heartbeat(count), values);
-		});
-		return refreshed;
 	}
 
 	/**
@@ -3669,15 +3625,25 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * default the snapshot would be taken before the lock wait, and a
 	 * backfill would then fail with SQLSTATE 40001. The lock comes after the
 	 * read, so an honoured default refuses before any wait.
+	 *
+	 * The three openings differ in what else they send:
+	 *
+	 * - `"write"` (default): `SET LOCAL search_path` alone.
+	 * - `"start-up"`: `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
+	 *   before the read, and the start-up advisory lock after it.
+	 * - `"heartbeat"`: `SET LOCAL search_path`, `SET LOCAL lock_timeout`
+	 *   and `SET LOCAL idle_in_transaction_session_timeout` in one simple
+	 *   query ({@link PG_HEARTBEAT_OPENING}), so the beat shares the
+	 *   store's read-only refusal and cannot drift from it.
 	 */
 	#readWrite(
 		work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>,
-		opening: "write" | "start-up" = "write",
+		opening: "write" | "start-up" | "heartbeat" = "write",
 	): Promise<void> {
 		return this.#client.transaction(async transaction => {
 			await transaction.unsafe("SET TRANSACTION READ WRITE");
 			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-			await transaction.unsafe(PG_SEARCH_PATH);
+			await transaction.unsafe(opening === "heartbeat" ? PG_HEARTBEAT_OPENING : PG_SEARCH_PATH);
 			const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
 			if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
 			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
