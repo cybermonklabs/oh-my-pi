@@ -530,6 +530,32 @@ mod tests {
 		NO_OPENAT2.store(false, Ordering::SeqCst);
 	}
 
+	/// Runs the test `name` (its path in this crate) again in a process of its
+	/// own and fails when that run fails or runs no test: `true` here, `false`
+	/// in that process, which runs the test's body. The fallbacks are the
+	/// process's: a walk of any other test of this process sets them when its
+	/// kernel refuses `openat2` (gVisor) or `O_NOATIME` (a file of another
+	/// owner), and a test that reads them would read that walk's decision.
+	fn alone(name: &str) -> bool {
+		const ALONE: &str = "PI_WALKER_TEST_ALONE";
+		if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+			return false;
+		}
+		let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+			.args(["--exact", name, "--nocapture", "--test-threads=1"])
+			.env(ALONE, name)
+			.output()
+			.expect("run the test in a process of its own");
+		let (out, err) =
+			(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+		assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
+		assert!(
+			out.contains("1 passed"),
+			"{name} ran no test in a process of its own:\n{out}\n{err}"
+		);
+		true
+	}
+
 	/// Whether the kernel opens `a/f` below `root` with `openat2`.
 	fn openat2_works(root: c_int) -> bool {
 		let how = OpenHow { flags: u64::from(FLAGS.cast_unsigned()), mode: 0, resolve: RESOLVE };
@@ -556,6 +582,11 @@ mod tests {
 	/// walk then replaces) and for `openat`.
 	#[test]
 	fn an_eperm_turns_o_noatime_off_only_when_the_open_without_it_opens() {
+		if alone(
+			"fs::native::sys::tests::an_eperm_turns_o_noatime_off_only_when_the_open_without_it_opens",
+		) {
+			return;
+		}
 		let _serial = SWITCHES.lock();
 		let tree = Tree::new("noatime");
 		let root = fs::File::open(&tree.0).expect("open the root");
@@ -622,6 +653,9 @@ mod tests {
 	/// path: one from the file's own open fails the walk too.
 	#[test]
 	fn an_einval_sets_openat2_aside_only_when_the_walk_opens() {
+		if alone("fs::native::sys::tests::an_einval_sets_openat2_aside_only_when_the_walk_opens") {
+			return;
+		}
 		let _serial = SWITCHES.lock();
 		let tree = Tree::new("einval");
 		let root = fs::File::open(&tree.0).expect("open the root");
