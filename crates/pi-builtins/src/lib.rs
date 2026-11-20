@@ -233,6 +233,9 @@ mod own_process;
 /// Removes a test's deep directory tree without one descriptor per level.
 #[cfg(test)]
 mod deep_tree;
+/// Writes the programs a test runs from a child, so no fork holds them busy.
+#[cfg(all(test, unix))]
+mod testprog;
 
 pub use duration::parse_duration;
 pub use host::{panic_scope_active, rayon_global_pool_available, set_rayon_global_pool_available};

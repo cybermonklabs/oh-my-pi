@@ -65,8 +65,6 @@ mod receiver;
 mod scan;
 mod sender;
 mod session;
-#[cfg(all(test, unix))]
-mod testprog;
 mod time;
 mod token;
 mod transport;

@@ -1431,10 +1431,10 @@ mod tests {
 		}
 
 		/// Writes `#!/bin/sh` and `body` as the program `dir/name`, through
-		/// [`crate::rsync::testprog`], and returns its path.
+		/// [`crate::testprog`], and returns its path.
 		fn script(dir: &Path, name: &str, body: &str) -> String {
 			let path = dir.join(name);
-			crate::rsync::testprog::write(&path, &format!("#!/bin/sh\n{body}"));
+			crate::testprog::write(&path, &format!("#!/bin/sh\n{body}"));
 			path.to_string_lossy().into_owned()
 		}
 
@@ -1607,7 +1607,7 @@ mod tests {
 		/// and the run failed: `Failed to exec ...: Text file busy (26)`.
 		#[test]
 		fn a_child_forked_while_the_script_is_written_leaves_it_runnable() {
-			use crate::rsync::testprog::{LINGER, LINGERING, end_lingering};
+			use crate::testprog::{LINGER, LINGERING, end_lingering};
 
 			let dir = tempfile::tempdir().unwrap();
 			let logger = logger();

@@ -187,7 +187,7 @@ impl Bench {
 		// sets the locale itself so that both remote servers have it whatever
 		// each client hands down.
 		let rsh = bin.join("fakersh");
-		crate::rsync::testprog::write(&rsh, &format!("#!/bin/sh\nshift\nLC_ALL={locale}\nexport LC_ALL\nexec /bin/sh -c \"$*\"\n"));
+		crate::testprog::write(&rsh, &format!("#!/bin/sh\nshift\nLC_ALL={locale}\nexport LC_ALL\nexec /bin/sh -c \"$*\"\n"));
 		for (name, password) in [("pw", "sekrit\n"), ("badpw", "wrong\n")] {
 			let file = bin.join(name);
 			fs::write(&file, password).unwrap();

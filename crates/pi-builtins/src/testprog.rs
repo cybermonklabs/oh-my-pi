@@ -1,4 +1,6 @@
-//! Programs a test writes and then runs, such as a fake remote shell.
+//! Programs a test writes and then runs: rsync's fake remote shells, the
+//! locale utilities the locale tests put in place of the system's, and any
+//! other program a test makes in order to run it.
 //!
 //! The test binary runs its tests as threads of one process. While this
 //! process holds a file open for writing, every child another thread forks

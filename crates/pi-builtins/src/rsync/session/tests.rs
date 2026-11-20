@@ -339,7 +339,7 @@ fn log_file_exit_line_uses_live_counters() {
 		let Some(rsync) = reference() else { return };
 		// Runs the remote command through sh so --rsync-path can carry options.
 		let rsh = dir.path().join("shrsh");
-		crate::rsync::testprog::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n");
+		crate::testprog::write(&rsh, "#!/bin/sh\nshift\nexec /bin/sh -c \"$*\"\n");
 		let server_log = dir.path().join("s.log");
 		let rpath = format!("--rsync-path={} --log-file={}", rsync.display(), server_log.display());
 		let source = format!("h:{}/src/", dir.path().display());
@@ -493,7 +493,7 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 	let dir = tempfile::tempdir().unwrap();
 	make_tree(&dir.path().join("src"));
 	let rsh = dir.path().join("stuckrsh");
-	crate::rsync::testprog::write(&rsh, "#!/bin/sh\nexec sleep 600\n");
+	crate::testprog::write(&rsh, "#!/bin/sh\nexec sleep 600\n");
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
 	let canceller = std::thread::spawn(move || {
@@ -663,7 +663,7 @@ fn list_only_matches_reference() {
 #[cfg(unix)]
 fn fake_rsh(dir: &Path) -> PathBuf {
 	let path = dir.join("fakersh");
-	crate::rsync::testprog::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n");
+	crate::testprog::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n");
 	path
 }
 
