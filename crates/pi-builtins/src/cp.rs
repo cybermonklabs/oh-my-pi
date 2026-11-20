@@ -18,6 +18,7 @@ use std::{
 	fmt,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
+	sync::LazyLock,
 };
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, value_parser};
@@ -40,6 +41,7 @@ use uucore::{
 use crate::{
 	file_backup::{backup_display, backup_path, determine_backup_mode, determine_backup_suffix},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
+	long_options::OptionTable,
 	progress::stderr_draw_target,
 };
 
@@ -384,8 +386,20 @@ pub(crate) struct Cp {
 
 matches_parser!(Cp, uu_app);
 
+/// The options `cp` accepts, of which `--progress` and
+/// `--preserve-default-attributes` are the builtin's alone: GNU cp 9.7 reads
+/// `--pr` and `--pres=mode` as `--preserve`, where both also begin one of
+/// those.
+static OPTIONS: LazyLock<OptionTable> = LazyLock::new(|| {
+	OptionTable::new(uu_app(), &[options::PROGRESS_BAR, options::PRESERVE_DEFAULT_ATTRIBUTES])
+});
+
 impl Utility for Cp {
 	const NAME: &'static str = "cp";
+
+	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
+		Ok(OPTIONS.spell_out_all(argv))
+	}
 
 	fn run(self, host: &mut Host) -> i32 {
 		match cp_main(&self.matches, host) {

@@ -4,16 +4,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { executeShell } from "../native/index.js";
 
-// The bash tool's shell runs `find` as a builtin. Each expectation below is
-// the bytes GNU findutils 4.10 writes, with stderr sent to stdout (`2>&1`) and
-// both into a regular file, and the status it exits with, for the same command
-// under the locale the case names. GNU prints a diagnostic where it was written
-// among the output: glibc's `error` flushes stdout first.
+// The bash tool's shell runs `cat`, `grep`, `find` and `du` as builtins. Each
+// expectation below is the bytes GNU coreutils 9.7, grep 3.11 and findutils
+// 4.10 write, with stderr sent to stdout (`2>&1`) and both into a regular
+// file, and the status they exit with, for the same command under
+// LC_ALL=C.UTF-8 unless a case names another locale. GNU prints a diagnostic
+// where it was written among the output: glibc's `error` flushes stdout first.
 
 let dir: string;
 
 beforeAll(async () => {
 	dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-order-r10-"));
+	await fs.writeFile(path.join(dir, "abc"), "a\nb\nc\n");
+	await fs.mkdir(path.join(dir, "d"));
 });
 
 afterAll(async () => {
@@ -34,13 +37,21 @@ async function run(command: string): Promise<{ output: string; exitCode: number 
 
 describe("builtin output and diagnostics sent to one file with 2>&1", () => {
 	it.each([
-		// Regressed: every path find printed came first and each refusal of its `-delete` (in a directory it cannot
-		// write) last.
+		// Regressed: every line of output came first and the diagnostic last.
+		["cat abc nosuch abc 2>&1", "a\nb\nc\ncat: nosuch: No such file or directory\na\nb\nc\n", 1],
+		["cat nosuch abc 2>&1", "cat: nosuch: No such file or directory\na\nb\nc\n", 1],
+		// Regressed: the same for grep.
+		["grep -H a abc d abc 2>&1", "abc:a\ngrep: d: Is a directory\nabc:a\n", 2],
+		// Regressed: the same for find, whose `-delete` refused in a directory it cannot write.
 		[
 			"mkdir -p ro; touch ro/a ro/b; chmod 555 ro; LC_ALL=C find ro -type f -print -delete 2>&1; echo $?; chmod 755 ro",
 			"ro/a\nfind: cannot delete 'ro/a': Permission denied\nro/b\nfind: cannot delete 'ro/b': Permission denied\n1\n",
 			0,
 		],
+		// Regressed: the same for du, which writes its output to the descriptor unbuffered.
+		["du -sb nosuch abc 2>&1", "du: cannot access 'nosuch': No such file or directory\n6\tabc\n", 1],
+		// A pipe already kept the order.
+		["cat abc nosuch abc 2>&1 | cat", "a\nb\nc\ncat: nosuch: No such file or directory\na\nb\nc\n", 0],
 	])("%s", async (command, output, exitCode) => {
 		expect(await run(command)).toEqual({ output, exitCode });
 	});

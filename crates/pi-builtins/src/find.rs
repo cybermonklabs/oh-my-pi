@@ -611,26 +611,81 @@ pub mod matchers {
 		use std::{
 			error::Error,
 			ffi::OsString,
-			io::Write,
+			io::{self, Write},
 			path::{Path, PathBuf},
 			sync::{Mutex, PoisonError},
 		};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
-		use crate::host::{ShellCommand, command_line_too_long, line_bytes};
+		use crate::host::{
+			CommandStatus, Host, ShellCommand, command_line_too_long, line_bytes, run_strerror,
+		};
 
-		/// `{}` replacement for `-execdir`: the entry name relative to its parent.
-		fn execdir_arg(path: &Path) -> PathBuf {
+		/// Whether the command named `name` that `-exec` ran succeeded, after
+		/// GNU findutils 4.10's diagnostic where it did not run (`find:
+		/// ‘nosuch’: No such file or directory`) or a signal killed it (`find:
+		/// ‘./cmd’ terminated by signal 9`), quoted as GNU quotes in the
+		/// locale: `'nosuch'` outside a UTF-8 one.
+		fn exec_succeeded(host: &mut Host, name: &str, outcome: io::Result<CommandStatus>) -> bool {
+			match outcome {
+				Ok(CommandStatus::Signaled(signal)) => {
+					let name = super::super::quoted(host, name.as_bytes());
+					let _ = writeln!(host.stderr, "find: {name} terminated by signal {signal}");
+					false
+				},
+				Ok(status) => status.success(),
+				Err(error) => {
+					let name = super::super::quoted(host, name.as_bytes());
+					let _ = writeln!(host.stderr, "find: {name}: {}", run_strerror(&error));
+					false
+				},
+			}
+		}
+
+		/// A start point split as GNU find splits its operand for `-execdir`,
+		/// as written: the directory before its last name (`.` where it has
+		/// none) and that name with any trailing `/`. `None` below the start
+		/// points, for `/`, and for an operand that is not UTF-8.
+		fn split_start(entry: &WalkEntry) -> Option<(&str, &str)> {
+			if entry.depth() != 0 {
+				return None;
+			}
+			let operand = entry.display_path().to_str()?;
+			let trimmed = operand.trim_end_matches('/');
+			if trimmed.is_empty() {
+				return None;
+			}
+			Some(match trimmed.rfind('/') {
+				Some(slash) => (&operand[..slash.max(1)], &operand[slash + 1..]),
+				None => (".", operand),
+			})
+		}
+
+		/// `{}` replacement for `-execdir`: the entry name relative to its
+		/// parent, and for a start point its last name as written: `find .
+		/// -execdir` passes `./.`, `find sub/ -execdir` `./sub/`.
+		fn execdir_arg(entry: &WalkEntry) -> PathBuf {
+			if let Some((_, name)) = split_start(entry) {
+				return PathBuf::from(format!("./{name}"));
+			}
+			let path = entry.path();
 			match pi_vfs::file_name(path) {
 				Some(name) => Path::new(".").join(name),
 				None => Path::new(".").join(path),
 			}
 		}
 
-		/// Working directory for running `-execdir` on `path`; `None` keeps the
-		/// current directory. Provider directories are fine: builtins run there,
-		/// and the shell refuses external programs with its own diagnostic.
-		fn execdir_dir(path: &Path) -> Option<&Path> {
+		/// Working directory for running `-execdir` on `entry`; `None` keeps the
+		/// current directory. A start point runs in the directory its operand
+		/// names, as in GNU find: `find . -execdir` in `.`, `find sub/inner
+		/// -execdir` in `sub`. Provider directories are fine: builtins run
+		/// there, and the shell refuses external programs with its own
+		/// diagnostic.
+		pub(crate) fn execdir_dir(entry: &WalkEntry) -> Option<&Path> {
+			if let Some((dir, _)) = split_start(entry) {
+				return Some(Path::new(dir));
+			}
+			let path = entry.path();
 			match pi_vfs::parent_path(path) {
 				// Root paths like "/" have no parent.  Run them from the root to match GNU
 				// find.
@@ -679,7 +734,7 @@ pub mod matchers {
 		impl Matcher for SingleExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info.path())
+					execdir_arg(file_info)
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -698,7 +753,7 @@ pub mod matchers {
 				// and status 126: one command cannot be split.
 				let mut command = ShellCommand::new(argv);
 				if self.exec_in_parent_dir
-					&& let Some(dir) = execdir_dir(file_info.path())
+					&& let Some(dir) = execdir_dir(file_info)
 				{
 					command = command.current_dir(dir);
 				}
@@ -710,13 +765,8 @@ pub mod matchers {
 					.lock()
 					.unwrap_or_else(PoisonError::into_inner)
 					.flush();
-				match matcher_io.host().run_command_async(command).await {
-					Ok(status) => status.success(),
-					Err(e) => {
-						failed_to_run(matcher_io, &self.executable, &e);
-						false
-					},
-				}
+				let outcome = matcher_io.host().run_command_async(command).await;
+				exec_succeeded(matcher_io.host(), &self.executable, outcome)
 			}
 
 			fn has_side_effects(&self) -> bool {
@@ -790,44 +840,22 @@ pub mod matchers {
 						.unwrap_or_else(PoisonError::into_inner)
 						.flush();
 					match matcher_io.host().run_command_async(shell_command).await {
-						Ok(status) => {
-							if !status.success() {
-								matcher_io.set_exit_code(1);
-							}
-						},
 						Err(e) if files.len() > 1 && too_long(&e, command, line, matcher_io.host().cwd()) => {
 							let middle = files.start + files.len() / 2;
 							pending.push(middle..files.end);
 							pending.push(files.start..middle);
 						},
-						Err(e) if too_long(&e, command, line, matcher_io.host().cwd()) => {
-							too_long_alone(matcher_io, &self.executable, &e);
-							matcher_io.set_exit_code(1);
-						},
-						Err(e) => {
-							failed_to_run(matcher_io, &self.executable, &e);
-							matcher_io.set_exit_code(1);
+						// Any other outcome is reported as for `-exec … ;`, a line
+						// refused as too long with one file (which no split can
+						// help) included: `find: ‘NAME’: Argument list too long`.
+						outcome => {
+							if !exec_succeeded(matcher_io.host(), &self.executable, outcome) {
+								matcher_io.set_exit_code(1);
+							}
 						},
 					}
 				}
 			}
-		}
-
-		/// Reports that the command `executable` could not be started (nothing
-		/// executable has its name): `Failed to run NAME: ERROR`.
-		fn failed_to_run(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
-			let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {executable}: {error}");
-		}
-
-		/// Reports that the system refused `executable`'s line with one file as
-		/// too long, which no split can help: `find: ‘NAME’: strerror`, with the
-		/// quotes of the locale find runs in (`'NAME'` in the C locale), as GNU's
-		/// find quotes it.
-		fn too_long_alone(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
-			let host = matcher_io.host();
-			let name = crate::locale::gnu_quote(crate::locale::ctype_is_utf8(host), executable.as_bytes());
-			let text = crate::host::run_strerror(error);
-			let _ = writeln!(&mut host.stderr, "find: {name}: {text}");
 		}
 
 		/// Whether `error` is the system refusing `command`'s line of `line`
@@ -842,7 +870,7 @@ pub mod matchers {
 		impl Matcher for MultiExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info.path())
+					execdir_arg(file_info)
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -858,7 +886,7 @@ pub mod matchers {
 				};
 				if let Some(mut full) = full {
 					if self.exec_in_parent_dir
-						&& let Some(dir) = execdir_dir(file_info.path())
+						&& let Some(dir) = execdir_dir(file_info)
 					{
 						full.current_dir(dir);
 					}
@@ -4310,7 +4338,7 @@ pub mod matchers {
 		config: &mut Config,
 		host: &mut Host,
 	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
-		let (_, top_level_matcher) = build_matcher_tree(args, config, 0, false, host).await?;
+		let top_level_matcher = build_matcher_tree(args, config, host).await?;
 
 		// if the matcher doesn't have any side-effects, then we default to printing
 		if !top_level_matcher.has_side_effects() {
@@ -4494,17 +4522,26 @@ pub mod matchers {
 		Ok(file)
 	}
 
-	/// The main "translate command-line args into a matcher" function. Will call
-	/// itself recursively if it encounters an opening bracket. A successful return
-	/// consists of a tuple containing the new index into the args array to use (if
-	/// called recursively) and the resulting matcher.
+	/// The main "translate command-line args into a matcher" function.
+	///
+	/// A parenthesized expression is read as an expression of its own, with
+	/// the default regex type, and becomes one condition of the expression
+	/// it is in. The expressions a `(` interrupted are kept on a stack, not
+	/// by recursion, so a nest of parentheses 10,000 deep, which GNU find
+	/// reads, does not overflow the stack, nor does one deeper.
 	async fn build_matcher_tree(
 		args: &[&str],
 		config: &mut Config,
-		arg_index: usize,
-		mut expecting_bracket: bool,
 		host: &mut Host,
-	) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
+	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+		/// An expression a `(` interrupted, to go on with once `)` closes
+		/// the expression inside.
+		struct Outer {
+			matcher:             ListMatcherBuilder,
+			regex_type:          regex::RegexType,
+			invert_next_matcher: bool,
+		}
+		let mut outer: Vec<Outer> = Vec::new();
 		let mut top_level_matcher = ListMatcherBuilder::new();
 
 		let mut regex_type = regex::RegexType::default();
@@ -4513,7 +4550,7 @@ pub mod matchers {
 		// order of arguments is important
 		// arguments can start with + as well as -
 		// multiple-character flags don't start with a double dash
-		let mut i = arg_index;
+		let mut i = 0;
 		let mut invert_next_matcher = false;
 		while i < args.len() {
 			let possible_submatcher = match args[i] {
@@ -4862,24 +4899,34 @@ pub mod matchers {
 					None
 				},
 				"(" => {
-					let (new_arg_index, sub_matcher) =
-						Box::pin(build_matcher_tree(args, config, i + 1, true, host)).await?;
-					i = new_arg_index;
-					Some(sub_matcher)
+					outer.push(Outer {
+						matcher:             std::mem::replace(
+							&mut top_level_matcher,
+							ListMatcherBuilder::new(),
+						),
+						regex_type:          std::mem::take(&mut regex_type),
+						invert_next_matcher: std::mem::take(&mut invert_next_matcher),
+					});
+					None
 				},
 				")" => {
-					if !expecting_bracket {
+					let Some(enclosing) = outer.pop() else {
 						return Err(From::from(
 							"invalid expression: expected expression before closing parentheses ')'.",
 						));
-					}
+					};
 
 					let bracket = args[i - 1];
 					if bracket == "(" {
 						return Err(From::from("invalid expression; empty parentheses are not allowed."));
 					}
 
-					return Ok((i, top_level_matcher.build()));
+					// The expression inside becomes one condition of the one
+					// the `(` interrupted, which goes on as it was.
+					let inner = std::mem::replace(&mut top_level_matcher, enclosing.matcher);
+					regex_type = enclosing.regex_type;
+					invert_next_matcher = enclosing.invert_next_matcher;
+					Some(inner.build())
 				},
 				"-follow" => {
 					// This option affects multiple matchers.
@@ -4996,7 +5043,7 @@ pub mod matchers {
 			i += 1;
 			if config.help_requested || config.version_requested {
 				// Ignore anything, even invalid expressions, after -help/-version
-				expecting_bracket = false;
+				outer.clear();
 				break;
 			}
 			if let Some(submatcher) = possible_submatcher {
@@ -5008,7 +5055,7 @@ pub mod matchers {
 				}
 			}
 		}
-		if expecting_bracket {
+		if !outer.is_empty() {
 			return Err(From::from(
 				"invalid expression; I was expecting to find a ')' somewhere but did not see one.",
 			));
@@ -5016,7 +5063,7 @@ pub mod matchers {
 		if config.files0_argument.is_some() {
 			parse_files0_args(config, host).await?;
 		}
-		Ok((i, top_level_matcher.build()))
+		Ok(top_level_matcher.build())
 	}
 
 	// https://www.gnu.org/software/findutils/manual/html_node/find_html/Starting-points.html
@@ -5071,8 +5118,17 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};
 
-use crate::host::{AsyncUtility, Host, matches_parser};
+use crate::host::{AsyncUtility, Host, matches_parser, strip_errno};
 use matchers::{Follow, WalkEntry};
+
+/// `name` (its bytes) in the quotes GNU findutils 4.10 puts around a name
+/// in a diagnostic, quotearg's ([`gnu_quote`](crate::locale::gnu_quote)):
+/// `‘name’` in a UTF-8 locale, `'name'` elsewhere, with what the locale
+/// does not print escaped: `find 'a’b'` is `find: ‘a\’b’: No such file or
+/// directory`, and `'a\342\200\231b'` in the C locale.
+fn quoted(host: &Host, name: &[u8]) -> String {
+	crate::locale::gnu_quote(crate::locale::ctype_is_utf8(host), name)
+}
 
 pub struct Config {
 	same_file_system:  bool,
@@ -5240,7 +5296,9 @@ async fn apply_find_entry(
 
 	// Allocated only when the directory changes, not for every entry. Every
 	// path comes from one walk, so the same directory is spelled the same.
-	let new_dir = pi_vfs::parent_path(entry.path());
+	// `-execdir ... +` runs a batch in the directory of its entries, where
+	// a start point names its own (see `execdir_dir`).
+	let new_dir = matchers::exec::execdir_dir(&entry);
 	if new_dir.map(Path::as_os_str) != current_dir.as_deref().map(Path::as_os_str) {
 		if let Some(dir) = current_dir.take() {
 			matcher.finished_dir(dir.as_path(), &mut matcher_io).await;
@@ -5312,9 +5370,12 @@ async fn process_dir_walk_request(
 	let mut ret = 0;
 	let tree_options = find_tree_options(config);
 	match pi_walker::walk::Tree::new(&layer, resolved_root, &tree_options).await {
-		Err(pi_walker::walk::WalkError::Root { path, error }) => {
+		// GNU names the start point as given: `find nosuch` is `find:
+		// ‘nosuch’: No such file or directory`, exit 1.
+		Err(pi_walker::walk::WalkError::Root { error, .. }) => {
 			ret = 1;
-			let _ = writeln!(host.stderr, "Error: {}: {error}", path.display());
+			let name = quoted(host, &crate::host::os_bytes_lossy(operand.as_os_str()));
+			let _ = writeln!(host.stderr, "find: {name}: {}", strip_errno(&error));
 		},
 		Ok(mut tree) => {
 			let mut pace = host.output_pace();
@@ -6362,5 +6423,27 @@ mod tests {
 			assert!(root.is_dir(), "{operand:?}: the directory was removed");
 			assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{operand:?}: the contents stay");
 		}
+	}
+
+	/// A nest of parentheses as deep as GNU find reads, and deeper, must be
+	/// read without overflowing the stack of the thread the shell runs on.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn reads_a_nest_of_parentheses_deeper_than_the_stack() {
+		// If this regresses, `find . \( … -name a.txt … \)` nested 100,000
+		// deep overflows the stack and aborts the process, where GNU find
+		// 4.10 prints `./a.txt` (measured 10,000 deep), and refuses the nest
+		// left unclosed with exit 1.
+		let (_dir, root) = fixture();
+		let depth = 100_000;
+		let mut args = vec![".".to_owned()];
+		args.extend(std::iter::repeat_n("(".to_owned(), depth));
+		args.extend(["-name".to_owned(), "a.txt".to_owned()]);
+		let unclosed = args.clone();
+		args.extend(std::iter::repeat_n(")".to_owned(), depth));
+		let (code, capture) = run(&root, &args).await;
+		assert_eq!((code, capture.out().as_str()), (0, "./a.txt\n"), "{}", capture.err());
+		let (code, capture) = run(&root, &unclosed).await;
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("expecting to find a ')'"), "{}", capture.err());
 	}
 }

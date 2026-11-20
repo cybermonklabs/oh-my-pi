@@ -34,6 +34,7 @@ use pi_walker::{
 	walk,
 };
 use crate::bre;
+use crate::long_options::OptionTable;
 use crate::host::{AsyncUtility, Host, StdoutFile};
 use crate::stdio;
 
@@ -57,10 +58,12 @@ pub(crate) struct RecordFormat {
 	/// Byte printed in place of each `/` in a path (`rg --path-separator`).
 	/// On Windows `\` is rewritten too, so displayed paths stay uniform.
 	pub path_separator: Option<u8>,
-	/// End a printed path with NUL instead of its separator or terminator
+	/// End a printed path with NUL instead of its separator or newline
 	/// (`grep -Z`, `rg -0`).
 	pub null_paths:     bool,
-	/// Ends each record: `\n`, or NUL under `grep -z`.
+	/// Ends each line record: `\n`, or NUL under `grep -z`. A file-name or a
+	/// count record ends with a newline either way, as GNU grep 3.11's do:
+	/// `grep -zc a in1` prints `2` and a newline.
 	pub terminator:     u8,
 }
 
@@ -113,8 +116,8 @@ impl RecordFormat {
 	}
 
 	/// Writes a file-name record (`-l`, `-L`, `rg --files`): the path ended
-	/// by NUL under `null_paths`, else by the terminator. An unnamed input
-	/// prints only the terminator, and nothing under `null_paths`.
+	/// by NUL under `null_paths`, else by a newline. An unnamed input prints
+	/// only the newline, and nothing under `null_paths`.
 	pub fn write_path_record<W: Write + ?Sized>(
 		&self,
 		out: &mut W,
@@ -123,14 +126,15 @@ impl RecordFormat {
 		match path {
 			Some(path) => {
 				self.write_path(out, path)?;
-				out.write_all(&[if self.null_paths { b'\0' } else { self.terminator }])
+				out.write_all(if self.null_paths { b"\0" } else { b"\n" })
 			},
 			None if self.null_paths => Ok(()),
-			None => out.write_all(&[self.terminator]),
+			None => out.write_all(b"\n"),
 		}
 	}
 
-	/// Writes a `-c` record: the optional `PATH:` prefix, then `count`.
+	/// Writes a `-c` record: the optional `PATH:` prefix, then `count` and a
+	/// newline.
 	pub fn write_count_record<W: Write + ?Sized>(
 		&self,
 		out: &mut W,
@@ -139,7 +143,7 @@ impl RecordFormat {
 	) -> io::Result<()> {
 		self.write_prefix(out, path, None, None, None, b':')?;
 		out.write_all(count.format_into(&mut fmt::NumBuffer::new()).as_bytes())?;
-		out.write_all(&[self.terminator])
+		out.write_all(b"\n")
 	}
 }
 
@@ -800,49 +804,9 @@ fn resolve_max_count(cli: &GrepArgs) -> Option<u64> {
 	}
 }
 
-/// A long option `grep` accepts: its names - the long name first, then its
-/// aliases, which getopt counts as the same option - and whether it takes
-/// the next argument as its value.
-struct LongOption {
-	names:       Vec<String>,
-	takes_value: bool,
-}
-
 /// The options `grep` accepts, read once from the parser's own definition.
-struct OptionTables {
-	/// Every long option, so whether a long option takes the next argument
-	/// is known for every name and abbreviation clap accepts (`--bef 1` is
-	/// `--before-context 1`).
-	long:         Vec<LongOption>,
-	/// The short options that take a value (`-e`, `-m`, `-A`, ...).
-	short_valued: Vec<char>,
-}
-
-static OPTIONS: LazyLock<OptionTables> = LazyLock::new(|| {
-	let mut command = GrepArgs::command();
-	command.build();
-	// An option whose value is optional (`--color`) does not take the next
-	// argument.
-	let takes_value =
-		|arg: &clap::Arg| arg.get_num_args().is_some_and(|range| range.min_values() > 0);
-	OptionTables {
-		long:         command
-			.get_arguments()
-			.filter_map(|arg| {
-				let mut names = vec![arg.get_long()?.to_owned()];
-				if let Some(aliases) = arg.get_all_aliases() {
-					names.extend(aliases.into_iter().map(str::to_owned));
-				}
-				Some(LongOption { names, takes_value: takes_value(arg) })
-			})
-			.collect(),
-		short_valued: command
-			.get_arguments()
-			.filter(|&arg| takes_value(arg))
-			.filter_map(clap::Arg::get_short)
-			.collect(),
-	}
-});
+static OPTIONS: LazyLock<OptionTable> =
+	LazyLock::new(|| OptionTable::new(GrepArgs::command(), &BUILTIN_ONLY_LONG_OPTIONS));
 
 /// The long options `grep` has and GNU grep 3.11 does not. getopt reads a
 /// prefix as the one option it begins, so where a prefix also begins one of
@@ -851,43 +815,14 @@ static OPTIONS: LazyLock<OptionTables> = LazyLock::new(|| {
 /// `--mmap`.
 const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = ["include-dir", "mmap"];
 
-/// The long option `name` names, exactly or as the abbreviation getopt
-/// accepts: a prefix of the names of one option alone, so `--regex` is
-/// `--regexp` and `--col` is `--color`, whose alias `--colour` is the same
-/// option, or, where it also begins one of [`BUILTIN_ONLY_LONG_OPTIONS`], of
-/// one of GNU's options alone.
-fn long_option(name: &str) -> Option<&'static LongOption> {
-	if name.is_empty() {
-		return None;
-	}
-	let long = &OPTIONS.long;
-	if let Some(option) = long.iter().find(|option| option.names.iter().any(|n| n == name)) {
-		return Some(option);
-	}
-	let begins = |option: &&LongOption| option.names.iter().any(|n| n.starts_with(name));
-	only(long.iter().filter(begins)).or_else(|| {
-		only(
-			long.iter()
-				.filter(begins)
-				.filter(|option| !BUILTIN_ONLY_LONG_OPTIONS.contains(&option.names[0].as_str())),
-		)
-	})
-}
-
-/// The one item `items` yields, `None` where it yields none or several.
-fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
-	let item = items.next()?;
-	items.next().is_none().then_some(item)
-}
-
 /// Rewrites what clap reads otherwise than GNU grep: a context count becomes
 /// `--context=N`, as an argument of digits (`-5`) and as each run of digits
 /// in a group of short options (`-5e mid`, `-n2e mid`), an option's value
 /// attached with a leading `=` (`-e=x`, `-ve=x`) is passed apart, as clap
 /// would drop the `=`, and a long option is written out by its full name as
 /// getopt resolves it (`--regex=zz` is `--regexp=zz`, and `--inc` is
-/// `--include`; see [`long_option`]). clap refuses an ambiguous one, as GNU
-/// does.
+/// `--include`; see [`OptionTable::long_option`]). clap refuses an ambiguous
+/// one, as GNU does.
 ///
 /// A group is read as getopt reads it with GNU grep's digit options: a run of
 /// digits is one count (`-15`), and a later count replaces it (`-5n3` is
@@ -909,15 +844,11 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 		let Some(text) = arg.to_str() else { normalized.push(arg); continue };
 		if text == "--" { literal = true; normalized.push(arg); continue }
 		if let Some(long) = text.strip_prefix("--") {
-			let (name, value) =
-				long.split_once('=').map_or((long, None), |(name, value)| (name, Some(value)));
-			let option = long_option(name);
-			value_pending = value.is_none() && option.is_some_and(|option| option.takes_value);
-			match option {
-				Some(option) => normalized.push(OsString::from(match value {
-					Some(value) => format!("--{}={value}", option.names[0]),
-					None => format!("--{}", option.names[0]),
-				})),
+			match OPTIONS.spell_out(long) {
+				Some((spelled, value_follows)) => {
+					value_pending = value_follows;
+					normalized.push(spelled);
+				},
 				None => normalized.push(arg),
 			}
 			continue;

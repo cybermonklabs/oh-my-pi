@@ -47,7 +47,12 @@
 //! `exec` the same way (`EACCES`, `ENOENT` of a `#!` interpreter,
 //! `ENAMETOOLONG` of a path); `ENOEXEC` runs the file as a script, as
 //! `execvp` does. xargs and find ask only for a line too long: any other
-//! refusal is the shell's diagnostic and status 126.
+//! refusal is the shell's diagnostic and status 126. Most refusals never
+//! reach the `exec`: the lookup finds a file nobody may execute (a
+//! directory, no execute bit, a `#!` interpreter without one) and a `#!`
+//! interpreter that does not exist first, and the utility reports them in
+//! its own words, as GNU's do (`xargs: ./script: No such file or
+//! directory`, status 127).
 
 use std::{
 	ffi::OsStr,
@@ -511,7 +516,7 @@ impl Lookup {
 	/// applied to the utility's `PATH`.
 	fn find(&self, changes: &[EnvChange], name: &OsStr, cwd: &Path) -> io::Result<PathBuf> {
 		if has_separator(name) {
-			return match executable(&cwd.join(name)) {
+			return match executable(&cwd.join(name), cwd) {
 				Some(true) => Ok(cwd.join(name)),
 				Some(false) => Err(io::ErrorKind::PermissionDenied.into()),
 				None => Err(io::ErrorKind::NotFound.into()),
@@ -529,7 +534,7 @@ impl Lookup {
 		let mut denied = false;
 		for dir in std::env::split_paths(OsStr::new(path)) {
 			let candidate = cwd.join(dir).join(name);
-			match executable(&candidate) {
+			match executable(&candidate, cwd) {
 				Some(true) => return Ok(candidate),
 				Some(false) => denied = true,
 				None => {},
@@ -589,19 +594,58 @@ fn has_separator(name: &OsStr) -> bool {
 	bytes.contains(&b'/') || (cfg!(windows) && bytes.contains(&b'\\'))
 }
 
-/// `Some(true)` for an executable file at `path`, `Some(false)` for a file
-/// that is not executable, `None` for nothing (or a directory).
+/// How `execve` of `path` fares, as GNU's xargs, find and env report it:
+/// `Some(true)` where it runs, `Some(false)` where it fails with `EACCES`
+/// ("Permission denied"), `None` where it fails with `ENOENT` ("No such
+/// file or directory"). A directory, or a file without execute permission,
+/// is `EACCES`: `echo a | xargs ./dir` is `xargs: ./dir: Permission
+/// denied`, status 126. A script fails as its `#!` interpreter, resolved
+/// from `cwd`, does: one that is missing is `ENOENT`, `echo a | xargs
+/// ./script` is `xargs: ./script: No such file or directory`, status 127.
+/// An interpreter the lookup cannot reach otherwise (a name past
+/// `NAME_MAX` on its way, `ENAMETOOLONG`) is `Some(true)`: `execve` refuses
+/// it, and the shell reports that refusal, or hands it to a utility that
+/// asked for it (`env ./script` is `env: ‘./script’: File name too long`,
+/// status 126, as in coreutils).
 #[cfg(unix)]
-fn executable(path: &Path) -> Option<bool> {
+fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
-	let meta = std::fs::metadata(path)
-		.ok()
-		.filter(std::fs::Metadata::is_file)?;
-	Some(meta.permissions().mode() & 0o111 != 0)
+	let runs = |path: &Path| -> io::Result<bool> {
+		let meta = std::fs::metadata(path)?;
+		Ok(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+	};
+	if !runs(path).ok()? {
+		return Some(false);
+	}
+	let Some(interpreter) = interpreter(path) else {
+		return Some(true);
+	};
+	match runs(&cwd.join(interpreter)) {
+		Ok(runs) => Some(runs),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+		Err(_) => Some(true),
+	}
+}
+
+/// The interpreter a `#!` line at the start of the file at `path` names, as
+/// the kernel reads it: the first word after `#!`, in the first 256 bytes.
+/// `None` for a file that has no such line or cannot be read.
+#[cfg(unix)]
+fn interpreter(path: &Path) -> Option<PathBuf> {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let mut head = [0; 256];
+	let len = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+	let line = head[..len].strip_prefix(b"#!")?;
+	let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+	let blank = |b: &u8| matches!(b, b' ' | b'\t');
+	let start = line.iter().position(|b| !blank(b))?;
+	let word = &line[start..];
+	let end = word.iter().position(|b| blank(b) || *b == 0).unwrap_or(word.len());
+	Some(PathBuf::from(OsStr::from_bytes(&word[..end])))
 }
 
 #[cfg(not(unix))]
-fn executable(path: &Path) -> Option<bool> {
+fn executable(path: &Path, _cwd: &Path) -> Option<bool> {
 	(path.is_file() || path.with_extension("exe").is_file()).then_some(true)
 }
 
@@ -623,5 +667,37 @@ mod tests {
 		assert!(!is_name("1x"));
 		assert!(!is_name("a-b"));
 		assert!(!is_name(""));
+	}
+
+	/// Each answer is how `execve` fails, which GNU findutils 4.10's xargs
+	/// and find report: `None` "No such file or directory" (127),
+	/// `Some(false)` "Permission denied" (126).
+	#[cfg(unix)]
+	#[test]
+	fn executable_answers_as_execve_fails() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let cwd = dir.path();
+		let write = |name: &str, text: &str, mode: u32| {
+			let file = cwd.join(name);
+			std::fs::write(&file, text).expect("write");
+			std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+			file
+		};
+		assert_eq!(executable(&cwd.join("missing"), cwd), None);
+		// A directory cannot be executed.
+		assert_eq!(executable(cwd, cwd), Some(false));
+		assert_eq!(executable(&write("plain", "x\n", 0o644), cwd), Some(false));
+		assert_eq!(executable(&write("binary", "\x7fELF", 0o755), cwd), Some(true));
+		assert_eq!(executable(&write("script", "#!/bin/sh\necho hi\n", 0o755), cwd), Some(true));
+		// A script fails as its interpreter does: missing, or not executable
+		// (`#!/etc/passwd`), here named from `cwd`.
+		assert_eq!(executable(&write("lost", "#! /nonexistent/sh -e\n", 0o755), cwd), None);
+		assert_eq!(executable(&write("denied", "#!plain\n", 0o755), cwd), Some(false));
+		// An interpreter past `NAME_MAX` (a symlink to such a name) is left
+		// to `execve`, whose `ENAMETOOLONG` the shell reports or hands on.
+		std::os::unix::fs::symlink(cwd.join("0".repeat(256)), cwd.join("ll")).expect("symlink");
+		let long = write("long", &format!("#!{}\n", cwd.join("ll").display()), 0o755);
+		assert_eq!(executable(&long, cwd), Some(true));
 	}
 }

@@ -1617,10 +1617,19 @@ mod tests {
 			let tree = Tree::open(&BlockingFs::native(), &base.join("backup"), &opts).unwrap();
 			tree.mkdir(Path::new("x"), 0o755).unwrap();
 			assert!(base.join("disk/x").is_dir());
-			// A root that refuses our uid (the trust seam) is refused.
-			let only_root = |uid: u32| uid == 0;
-			let err = paths::open_operator_dir(&base.join("backup"), false, None, &only_root).unwrap_err();
-			assert!(paths::is_untrusted_symlink(&err));
+			// A root that refuses our uid (the trust seam) is refused; where the
+			// test runs as root, our symlink is root's, whom that rule trusts.
+			let owner = std::fs::symlink_metadata(base.join("backup")).unwrap().uid();
+			if owner == 0 {
+				eprintln!(
+					"skipped: the untrusted-root part: the symlink this test made is owned by uid {owner}, whom the \
+					 root-only rule trusts"
+				);
+			} else {
+				let only_root = |uid: u32| uid == 0;
+				let err = paths::open_operator_dir(&base.join("backup"), false, None, &only_root).unwrap_err();
+				assert!(paths::is_untrusted_symlink(&err));
+			}
 			// --confine-root refuses a root outside it.
 			let confined = TreeOpts { confine: Some(base.join("elsewhere")), ..opts };
 			std::fs::create_dir(base.join("elsewhere")).unwrap();

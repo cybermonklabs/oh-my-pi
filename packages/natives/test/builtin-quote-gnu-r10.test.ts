@@ -4,10 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { executeShell } from "../native/index.js";
 
-// The bash tool's shell runs `env`, `timeout` and `nohup` as builtins. Each
-// expectation below is the bytes GNU coreutils 9.7 writes, with stderr sent to
-// stdout (`2>&1`), and the status it exits with, for the same command under
-// LC_ALL=C.UTF-8 unless a case names another locale.
+// The bash tool's shell runs `env`, `timeout`, `nohup`, `cat`, `rm`, `seq`
+// and `sleep` as builtins. Each expectation below is the bytes GNU coreutils
+// 9.7 writes, with stderr sent to stdout (`2>&1`), and the status it exits
+// with, for the same command under LC_ALL=C.UTF-8 unless a case names another
+// locale, or else the builtin's own refusal where a case says so.
 
 let dir: string;
 
@@ -46,6 +47,22 @@ describe("builtin env, timeout and nohup: a command name they cannot run, quoted
 		[String.raw`env $'x\u2028y' 2>&1`, "env: ‘x\\342\\200\\250y’: No such file or directory\n", 127],
 		// Regressed: a `’` in the name was not escaped, so it read as the closing quote.
 		["env 'a’b' 2>&1", "env: ‘a\\’b’: No such file or directory\n", 127],
+	])("%s", async (command, output, exitCode) => {
+		expect(await run(command)).toEqual({ output, exitCode });
+	});
+});
+
+describe("builtin arguments that are not UTF-8", () => {
+	it.each([
+		// Regressed: the shell handed cat U+FFFD for the byte, so it opened no such file.
+		[String.raw`printf 'x\n' >$'\xff'; cat $'\xff' 2>&1`, "x\n", 0],
+		// Regressed: the same for rm, which aimed at a file named U+FFFD.
+		[String.raw`printf 'x\n' >$'\xff'; rm $'\xff' 2>&1 && test ! -e $'\xff' && echo removed`, "removed\n", 0],
+		// The builtin's own refusal: its parser reads these as text. GNU reads the byte (`seq: invalid floating
+		// point argument: ‘\377’`, `sleep: invalid time interval ‘\377’`, exit 1). Regressed: the builtin read
+		// U+FFFD in its place.
+		[String.raw`seq $'\xff' 2>&1`, "seq: invalid UTF-8 was detected in one or more arguments\n", 1],
+		[String.raw`sleep $'\xff' 2>&1`, "sleep: invalid UTF-8 was detected in one or more arguments\n", 2],
 	])("%s", async (command, output, exitCode) => {
 		expect(await run(command)).toEqual({ output, exitCode });
 	});

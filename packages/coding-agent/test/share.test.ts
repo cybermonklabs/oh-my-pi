@@ -872,7 +872,7 @@ describe("buildShareSnapshot over cold entries", () => {
 		const ids = ["x1", "x2", "x3", "u1", "c1"];
 		const entries = ids.map((id, index) => {
 			const parentId = index === 0 ? null : ids[index - 1]!;
-			if (id === "u1") return { ...messageEntry(id, parentId, "the token is in the markers"), timestamp };
+			if (id === "u1") return messageEntry(id, parentId, "the token is in the markers");
 			if (id === "c1") {
 				return {
 					type: "compaction",

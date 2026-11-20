@@ -3506,6 +3506,7 @@ use uucore::{
 use crate::{
 	host::{Host, Utility, format_usage, rayon_global_pool_available},
 	locale::{collation_locale_failed, numeric_symbols, shell_collator, shell_locale},
+	long_options::OptionTable,
 	sort::{
 		buffer_hint::automatic_buffer_size,
 		tmp_dir::{TmpDirWrapper, TmpFile},
@@ -5597,18 +5598,9 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 			.find(|arg| arg.get_short() == Some(char::from(short)))
 			.map(takes_value)
 	};
-	// Mirrors clap's `infer_long_args`: an exact name wins, else a unique prefix.
-	let long_takes_value = |name: &str| {
-		let exact = app.get_arguments().find(|arg| arg.get_long() == Some(name));
-		let arg = exact.or_else(|| {
-			let mut prefixed = app
-				.get_arguments()
-				.filter(|arg| arg.get_long().is_some_and(|long| long.starts_with(name)));
-			let first = prefixed.next();
-			if prefixed.next().is_none() { first } else { None }
-		});
-		arg.is_some_and(takes_value)
-	};
+	// The arguments are written out by their full names already
+	// ([`OptionTable::spell_out_all`]), so the table names each one.
+	let long_takes_value = |name: &str| OPTIONS.long_option(name).is_some_and(|option| option.takes_value);
 
 	let mut out = Vec::with_capacity(argv.len() + 1);
 	let mut args = argv.into_iter();
@@ -5670,12 +5662,18 @@ fn split_attached_separator(argv: Vec<OsString>) -> Vec<OsString> {
 	out
 }
 
+/// The options `sort` accepts, of which `--check-silent` is the builtin's
+/// alone: GNU sort 9.7 reads `--ch` and `--che` as `--check`, where both
+/// also begin it.
+static OPTIONS: LazyLock<OptionTable> =
+	LazyLock::new(|| OptionTable::new(uu_app(), &[options::check::CHECK_SILENT]));
+
 impl Utility for Sort {
 	const NAME: &'static str = "sort";
 	const USAGE_ERROR: u8 = 2;
 
 	fn rewrite_argv(argv: Vec<OsString>) -> Result<Vec<OsString>, String> {
-		Ok(split_attached_separator(argv))
+		Ok(split_attached_separator(OPTIONS.spell_out_all(argv)))
 	}
 
 	fn run(self, host: &mut Host) -> i32 {
