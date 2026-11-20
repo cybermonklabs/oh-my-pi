@@ -201,8 +201,6 @@ fn a_process_whose_children_are_reaped_for_it_asks_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_silent_or_flooding_utility_affirms_nothing() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let cases: [(&str, &str, bool); 3] = [
 		("quiet", "printf 'ISO-8859-1\\n'\n", true),
@@ -211,8 +209,7 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 	];
 	for (name, body, accepts) in cases {
 		let program = dir.path().join(name);
-		fs::write(&program, format!("#!/bin/sh\n{body}")).unwrap();
-		fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::testprog::write(&program, &format!("#!/bin/sh\n{body}"));
 		let answer = crate::locale::utility_accepts_for_test(&program, "de_DE@absent;bogus");
 		match (&answer, accepts) {
 			(crate::locale::Loadable::Yes, true) | (crate::locale::Loadable::Unasked(_), false) => {},
@@ -711,8 +708,6 @@ fn a_vanished_working_directory_is_reported_rather_than_guessed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_locale_utility_that_misbehaves_is_reported() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let dir = tempfile::tempdir().unwrap();
 	let env = |_: &str| None;
 	let cases: [(&str, &str, &str); 7] = [
@@ -726,8 +721,7 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 	];
 	for (name, body, expected) in cases {
 		let program = dir.path().join(name);
-		fs::write(&program, format!("#!/bin/sh\n{body}")).unwrap();
-		fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+		crate::testprog::write(&program, &format!("#!/bin/sh\n{body}"));
 		let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
 		match (&answer, expected) {
 			(crate::locale::Codeset::Loaded(codeset), "") => assert_eq!(codeset, "ISO-8859-1", "{name}"),
@@ -737,6 +731,32 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 			_ => panic!("{name}: {answer:?}"),
 		}
 	}
+}
+
+/// A child forked while the utility is written, as another test's thread
+/// can fork at any time, keeps no hold on it: here one is forked in the
+/// middle of the write and lives until the query has run. When these tests
+/// wrote their utilities themselves (`fs::write`), such a child kept the
+/// write descriptor, the kernel refused to run the utility ("Text file
+/// busy"), and the query refused with exit status 126: one whole-crate run
+/// in a runc Job (`fix16-loc60b-rc`) failed so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_forked_while_the_utility_is_written_leaves_it_runnable() {
+	use crate::testprog::{LINGER, LINGERING, end_lingering};
+
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("locale");
+	LINGER.set(true);
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
+	LINGER.set(false);
+	let lingering = LINGERING.get().expect("a child was forked during the write");
+	// SAFETY: signal 0 sends nothing.
+	let alive = unsafe { libc::kill(lingering, 0) } == 0;
+	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_| None);
+	end_lingering();
+	assert!(alive, "the child forked during the write ran on while the query ran");
+	assert!(matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"), "{answer:?}");
 }
 
 /// Nothing the utility leaves in its process group outlives the query,
@@ -984,16 +1004,13 @@ fn state_and_threads(number: libc::pid_t) -> (u8, u32) {
 /// answer, and returns the descendant's process id.
 #[cfg(target_os = "linux")]
 fn query_leaving_a_descendant(dir: &Path) -> i32 {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let program = dir.join("locale");
 	let marker = dir.join("descendant");
 	let body = format!(
 		"#!/bin/sh\n(exec 1>&-; exec sleep 30) &\necho $! > '{}'\nprintf 'ISO-8859-1\\n'\nexit 0\n",
 		marker.display()
 	);
-	fs::write(&program, body).unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, &body);
 	let env = |_: &str| None;
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
 	let descendant: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
@@ -1146,8 +1163,6 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_query_leaves_the_callers_signal_settings_alone() {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	if !crate::own_process::own_process() {
 		return;
 	}
@@ -1170,8 +1185,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let after = blocked(nix::sys::signal::SIGUSR1);
 	// A utility that raises the signal the caller ignores, then answers.
 	let program = dir.path().join("locale");
-	fs::write(&program, "#!/bin/sh\nkill -PIPE $$\nprintf 'UTF-8\\n'\n").unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, "#!/bin/sh\nkill -PIPE $$\nprintf 'UTF-8\\n'\n");
 	let ignored = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_| None);
 	// SAFETY: as above.
 	unsafe { libc::signal(libc::SIGPIPE, kept) };
@@ -1226,7 +1240,6 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 #[test]
 fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	use std::os::fd::AsRawFd as _;
-	use std::os::unix::fs::PermissionsExt as _;
 	use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 	if !crate::own_process::own_process() {
@@ -1339,8 +1352,7 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 		 printf 'UTF-8\\n'\n",
 		signal = libc::SIGUSR2
 	);
-	fs::write(&raises, script).unwrap();
-	fs::set_permissions(&raises, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&raises, &script);
 	let ignoring = crate::locale::codeset_from_utility_for_test(&raises, "C.UTF-8", &|_| None);
 	// SAFETY: putting back what this test changed, before it can fail.
 	unsafe {
@@ -1727,11 +1739,8 @@ fn answer_enosys_on_this_thread(calls: &[libc::c_long], probe_finds_clone3: bool
 /// pass by finding none.
 #[cfg(target_os = "linux")]
 fn latin_utility(dir: &Path) -> PathBuf {
-	use std::os::unix::fs::PermissionsExt as _;
-
 	let program = dir.join("latin-locale");
-	fs::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n").unwrap();
-	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
 	program
 }
 
