@@ -125,8 +125,8 @@ const NO_DATE_VALUES =
 const NO_LOCALE_FORMATTING =
 	"It acts only on the to_char family of functions and on money values, and the store uses neither.";
 const NO_BACKSLASH_LITERAL =
-	"No string literal the store sends holds a backslash: it binds its values or writes them dollar-quoted, " +
-	"so each literal reads the same under every value.";
+	"The store binds its values, so no string literal it sends holds a backslash, " +
+	"and each literal reads the same under every value.";
 const PASSWORD_ONLY = "It acts only when CREATE ROLE or ALTER ROLE sets a password, and the store sends neither.";
 const LOGICAL_DECODING_ONLY = "It acts only in logical decoding and logical replication, which the store never runs.";
 const NO_XML = "It acts only on XML values, and the store sends and reads none.";
@@ -215,7 +215,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 	),
 	// It picks the access method of each table the store creates.
 	toDefault("default_table_access_method", "'heap'", { none: "PostgreSQL 16 has one table access method, heap" }),
-	entry("default_tablespace", TO_DEFAULT, "'pg_global'"),
+	toDefault("default_tablespace", "'pg_global'"),
 	exempt(
 		"default_text_search_config",
 		"It acts only on text search functions, and the store calls none.",
@@ -264,7 +264,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 		"off",
 		{ none: "it only adds or drops a warning" },
 	),
-	entry("exit_on_error", TO_DEFAULT, "on"),
+	toDefault("exit_on_error", "on"),
 	exempt(
 		"extra_float_digits",
 		"It formats only floating-point output, and the store reads no floating-point value.",
@@ -288,7 +288,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 		"It acts only when CREATE COLLATION or CREATE DATABASE checks an ICU locale, and the store sends neither.",
 		"error",
 	),
-	entry("idle_in_transaction_session_timeout", TO_DEFAULT, "'1ms'"),
+	toDefault("idle_in_transaction_session_timeout", "'1ms'"),
 	exempt(
 		"idle_session_timeout",
 		'It acts only while no transaction of the store runs: it ends a session that is idle "but not within an open ' +
@@ -313,7 +313,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 		"''",
 		{ none: "a value set in a session loads nothing" },
 	),
-	entry("lock_timeout", TO_DEFAULT, "'1ms'"),
+	toDefault("lock_timeout", "'1ms'"),
 	exempt("logical_decoding_work_mem", LOGICAL_DECODING_ONLY, "'64kB'"),
 	// At -1 the server keeps a text copy of each bound value: a 512 MiB blob's copy passes 1 GB, and its INSERT fails.
 	toDefault("log_parameter_max_length_on_error", "-1"),
@@ -361,7 +361,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 	entry("search_path", { kind: "set-local", value: "= pg_catalog, pg_temp" }, "''"),
 	plan("seq_page_cost", "1000"),
 	exempt("standard_conforming_strings", NO_BACKSLASH_LITERAL, "off"),
-	entry("statement_timeout", TO_DEFAULT, "'50ms'"),
+	toDefault("statement_timeout", "'50ms'"),
 	exempt(
 		"stats_fetch_consistency",
 		"It acts only on reads of the cumulative statistics views, and the store reads none.",
@@ -422,7 +422,7 @@ const POSTGRESQL_16_SETTINGS: readonly PgSessionSetting[] = [
 		left: "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
 		hostile: true,
 	},
-	// On, `x = NULL` means `x IS NULL`, the form a null the store writes into a statement's text takes.
+	// On, the parser reads `x = NULL` in a statement's text as `x IS NULL`.
 	toDefault("transform_null_equals", "on"),
 	exempt("vacuum_buffer_usage_limit", VACUUM_ONLY, "'128kB'"),
 	exempt("vacuum_cost_delay", VACUUM_ONLY, "100"),
@@ -459,7 +459,7 @@ const CLOUD_SQL_SETTINGS: readonly PgSessionSetting[] = [
 		"It lets the functions of the google_ml_integration extension call Vertex AI, and the store calls none of them.",
 		"off",
 	),
-	entry("cloudsql_session_read_only", TO_DEFAULT, "on"),
+	toDefault("cloudsql_session_read_only", "on"),
 	cloudSqlUndocumented("google_db_advisor.ai_rewritten_query_return_count", "10"),
 	cloudSqlUndocumented("google_db_advisor.debug_option", "1"),
 	cloudSqlUndocumented("google_db_advisor.enable_ai_perfagent_advice", "on"),
@@ -537,7 +537,7 @@ const LATER_SETTINGS: readonly PgSessionSetting[] = [
 		),
 		conditional: POSTGRESQL_18,
 	},
-	{ ...entry("transaction_timeout", TO_DEFAULT, "'100ms'"), conditional: POSTGRESQL_17 },
+	{ ...toDefault("transaction_timeout", "'100ms'"), conditional: POSTGRESQL_17 },
 	{ ...exempt("vacuum_max_eager_freeze_failure_rate", VACUUM_ONLY, "0"), conditional: POSTGRESQL_18 },
 	{ ...exempt("vacuum_truncate", VACUUM_ONLY, "off"), conditional: POSTGRESQL_18 },
 ];
@@ -565,6 +565,9 @@ export const PG_SESSION_SETTINGS: readonly PgSessionSetting[] = [
 	...LATER_SETTINGS,
 	...STATE_SETTINGS,
 ];
+
+/** The `BEGIN` of every opening, before its `READ WRITE` or `READ ONLY`. */
+const READ_COMMITTED_BEGIN = "BEGIN ISOLATION LEVEL READ COMMITTED";
 
 /**
  * The statements after `BEGIN` that come first, in this order: `exit_on_error`
@@ -599,7 +602,7 @@ function buildOpening(): PgOpeningStatement[] {
 	const conditionalHead = CONDITIONAL_HEAD.map(take);
 	const rest = [...statements.values()];
 	return [
-		{ sql: "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE" },
+		{ sql: `${READ_COMMITTED_BEGIN} READ WRITE` },
 		...head,
 		...rest.filter(statement => statement.needs === undefined),
 		...conditionalHead,
@@ -620,7 +623,7 @@ export const PG_CONDITIONAL_PARAMETERS: readonly string[] = PG_OPENING.flatMap(s
 	statement.needs === undefined ? [] : [statement.needs],
 );
 
-const READ_BEGIN = "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY";
+const READ_BEGIN = `${READ_COMMITTED_BEGIN} READ ONLY`;
 
 /**
  * The opening the store sends as one simple query: the statements of

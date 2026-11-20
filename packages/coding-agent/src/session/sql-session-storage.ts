@@ -842,9 +842,14 @@ function run(
  */
 const PG_PRESENT_PARAMETERS = statement(
 	"postgres",
-	"SELECT name FROM pg_catalog.pg_settings WHERE name IN " +
-		`(${PG_CONDITIONAL_PARAMETERS.map((_name, index) => `@p${index}`).join(", ")})`,
+	`SELECT name FROM pg_catalog.pg_settings WHERE name IN (${inList("p", PG_CONDITIONAL_PARAMETERS.length)})`,
 );
+/** The read and the write opening on a server that has the conditional parameters `present` (see {@link pgOpening}). */
+function pgOpenings(present: ReadonlySet<string>): { readonly read: string; readonly write: string } {
+	return { read: pgOpening("read", present), write: pgOpening("write", present) };
+}
+/** The openings until the probe has read which conditional parameters the server has: with none of their statements. */
+const PG_PROBE_OPENINGS = pgOpenings(new Set());
 /**
  * The schema of the store's PostgreSQL tables, which every statement names
  * them with. The opening sets `search_path` to `pg_catalog, pg_temp` (see
@@ -1103,9 +1108,6 @@ function buildQueries(
 	const blobs = relation(`${name}_blobs`);
 	const refs = relation(`${name}_refs`);
 	const sql = (template: string): Statement => statement(adapter, template);
-	/** `@<prefix>0, …, @<prefix><count - 1>`, an IN list's bound values. */
-	const inList = (prefix: string, count: number): string =>
-		Array.from({ length: count }, (_unused, index) => `@${prefix}${index}`).join(", ");
 	const blobByteLength = adapter === "postgres" ? "octet_length(content)" : "length(content)";
 	const mysql = adapter === "mysql";
 	const integer = adapter === "sqlite" ? "INTEGER" : "BIGINT";
@@ -1928,6 +1930,11 @@ function batches<T>(items: readonly T[], size: number): T[][] {
 	return runs;
 }
 
+/** `@<prefix>0, …, @<prefix><count - 1>`, an IN list's bound values. */
+function inList(prefix: string, count: number): string {
+	return Array.from({ length: count }, (_unused, index) => `@${prefix}${index}`).join(", ");
+}
+
 /** `items` bound as `@<prefix>0` … for an IN list built with the same prefix. */
 function listValues(prefix: string, items: readonly string[]): StatementValues {
 	return Object.fromEntries(items.map((item, index) => [`${prefix}${index}`, item]));
@@ -2077,10 +2084,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** The `maxBlobBytes` option, or {@link MAX_BLOB_BYTES}. */
 	readonly #maxRowBlobBytes: number;
 	/**
-	 * The conditional parameters of the opening this PostgreSQL server has, as
-	 * the probe read them at start-up: every later opening is `pgOpening` of them.
+	 * The read and the write opening of every PostgreSQL transaction (see
+	 * {@link #postgres}): without the conditional statements until the probe
+	 * has read at start-up which of them this server takes, then with those.
 	 */
-	#present: ReadonlySet<string> = new Set();
+	#openings = PG_PROBE_OPENINGS;
 	/** The blob table's writes and reads; every content write below waits for the blobs queued before it. */
 	readonly blobs: SqlBlobTier = new SqlBlobTier(this);
 
@@ -2164,15 +2172,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				}
 			}
 			if (this.#adapter === "postgres") {
-				// Before any statement: the store sends every PostgreSQL statement on a reserved connection.
-				if (typeof this.#client.reserve !== "function") throw new Error(PG_NO_RESERVE);
-				// The probe, with no conditional statement in its opening: which of them this server takes.
+				// The probe, with no conditional statement in its opening: which of them this server takes. It is
+				// the first statement, so a client without reserve() is refused (see #postgres) before any is sent.
 				const present = (await this.#readOne(
 					"open",
 					PG_PRESENT_PARAMETERS,
 					listValues("p", PG_CONDITIONAL_PARAMETERS),
 				)) as Array<{ name: string }>;
-				this.#present = new Set(present.map(row => row.name));
+				this.#openings = pgOpenings(new Set(present.map(row => row.name)));
 			}
 			// One look at the PostgreSQL tables and the server, for a store that
 			// would write there (claims, or makes tables): a server in recovery
@@ -3027,26 +3034,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * statement keeps its own transaction, so a duplicate-column error still
 	 * fails only its own ALTER. The tables themselves are made together, by
 	 * {@link #createTables}. On MySQL and SQLite the statement runs straight
-	 * on the client.
+	 * on the client. On SQLite it does not use the call queue, so the caller
+	 * must already hold `#exclusive` (`init` does), or the statement can join
+	 * another call's `BEGIN IMMEDIATE` on SQLite's one connection.
 	 */
 	async #setup(query: string): Promise<void> {
 		if (this.#adapter !== "postgres") {
-			await this.#writeAlone(executor => executor.unsafe(query));
+			await this.#client.unsafe(query);
 			return;
 		}
 		await this.#postgres("open", "start-up", transaction => transaction.unsafe(query));
-	}
-
-	/**
-	 * Run one write outside any store transaction, straight on the client
-	 * (MySQL and SQLite: PostgreSQL runs every statement in {@link #postgres}).
-	 * On SQLite it does not use the call queue, so the caller
-	 * must already hold `#exclusive` (`init` does), or
-	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
-	 * connection.
-	 */
-	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
-		await write(this.#client);
 	}
 
 	/**
@@ -3055,7 +3052,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * setting that another client of a transaction-mode pool left on a server
 	 * connection reaches one. Each attempt:
 	 * 1. `reserve()` a connection.
-	 * 2. The opening, `pgOpening(mode, present)` as one simple query: `BEGIN
+	 * 2. The opening of `mode` ({@link #openings}) as one simple query: `BEGIN
 	 *    ISOLATION LEVEL READ COMMITTED`, `READ ONLY` for a read and `READ
 	 *    WRITE` otherwise, then `SET LOCAL` of every session setting the
 	 *    store's statements depend on (see `sql-session-postgres-settings.ts`).
@@ -3123,7 +3120,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		mode: "read" | "write" | "start-up",
 		work: (transaction: SqlSessionStorageReservedConnection) => Promise<T>,
 	): Promise<T> {
-		const opening = pgOpening(mode === "read" ? "read" : "write", this.#present);
+		const opening = mode === "read" ? this.#openings.read : this.#openings.write;
 		for (let attempt = 1; ; attempt++) {
 			const reserving = this.#client.reserve?.();
 			if (!reserving) throw new Error(PG_NO_RESERVE);
@@ -3309,19 +3306,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return this.#postgres(operation, "read", work);
 	}
 
-	/**
-	 * Run one read statement: on PostgreSQL in a `READ ONLY` transaction of its
-	 * own, its values bound (see {@link #postgres}); elsewhere straight on the
-	 * client.
-	 */
+	/** Run one read statement through {@link #read}, its values bound. */
 	async #readOne(
 		operation: PgOperation,
 		query: Statement | string,
 		values: StatementValues = {},
 	): Promise<SqlSessionStorageResult> {
 		const statement = typeof query === "string" ? { sql: query, params: [] } : query;
-		if (this.#adapter !== "postgres") return run(this.#client, statement, values);
-		return this.#postgres(operation, "read", reserved => run(reserved, statement, values));
+		return this.#read(operation, executor => run(executor, statement, values));
 	}
 
 	/**

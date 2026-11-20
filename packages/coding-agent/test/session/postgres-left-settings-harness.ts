@@ -1,5 +1,5 @@
 /**
- * The client R6's test (`postgres-left-settings.test.ts`) hands the SQL
+ * The client that `postgres-left-settings.test.ts` hands the SQL
  * session store, and the rule it reads the server log by.
  *
  * {@link leftClient} wraps a Bun `SQL` and routes every call the store makes,

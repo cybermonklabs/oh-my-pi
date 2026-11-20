@@ -97,7 +97,7 @@ const RELEASE = /^DELETE FROM "public"\.omp_session_leases WHERE session_id = \$
 const HEARTBEAT_BOUNDS = "SET LOCAL lock_timeout = 500; SET LOCAL idle_in_transaction_session_timeout = 500";
 const HEARTBEAT = /^UPDATE "public"\.omp_session_leases SET heartbeat_at = .* RETURNING session_id$/;
 
-/** The statements that make the store's tables, as the store sent them before it ran on reserved connections. */
+/** The statements that make the store's tables, exactly as buildQueries gives them. */
 const SCHEMA = [
 	'CREATE TABLE IF NOT EXISTS "public".omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT, byte_len BIGINT)',
 	'CREATE TABLE IF NOT EXISTS "public".omp_session_files_parts (path TEXT NOT NULL, start_offset BIGINT NOT NULL, content TEXT NOT NULL, PRIMARY KEY (path, start_offset))',
@@ -315,9 +315,9 @@ function answer(
 				has_default: false,
 				generated: "",
 				identity: "",
-				text_oid: "25",
-				bigint_oid: "20",
-				bytea_oid: "17",
+				text_oid: TYPE_OIDS.text,
+				bigint_oid: TYPE_OIDS.bigint,
+				bytea_oid: TYPE_OIDS.bytea,
 			})),
 		);
 	}

@@ -22,8 +22,12 @@
  * Every local connection must be trusted: the test logs in as its own roles
  * and to its own database with the store's URL, user or database replaced.
  * The direct leg's last test reads the server log (`log/server.log` in the
- * data directory, written with `log_statement = 'all'` and
- * `log_line_prefix = '%m pid=%p app=%a code=%e '`) through the admin URL.
+ * data directory, written with `log_statement = 'all'`,
+ * `log_parameter_max_length = 0` and
+ * `log_line_prefix = '%m pid=%p app=%a code=%e '`) through the admin URL. It
+ * needs `log_parameter_max_length = 0`: at the default, -1, the server logs
+ * each bound value whole after its statement, 8 MiB for the 8 MiB write, and
+ * the test reads those lines back with the store's.
  *
  * Each case prints one line, `left-setting case leg=… entry=… operations=…
  * data=… temp=… app=… pid=… pid_before=… pid_after=… left_value=… admin=…`,
@@ -55,6 +59,7 @@ import {
 	leftError,
 	logPids,
 } from "./postgres-left-settings-harness";
+import { rejection } from "./sql-session-lease-fixture";
 
 const STORE_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 const ADMIN_URL = process.env.OMP_TEST_SQL_POSTGRES_ADMIN_URL;
@@ -263,15 +268,6 @@ async function until(check: () => Promise<boolean>, ms: number, what: string): P
 		if (Date.now() > deadline) throw new Error(`${what} did not happen within ${ms} ms`);
 		await Bun.sleep(50);
 	}
-}
-
-async function rejection(promise: Promise<unknown>): Promise<unknown> {
-	return promise.then(
-		() => {
-			throw new Error("expected a rejection");
-		},
-		(err: unknown) => err,
-	);
 }
 
 interface CaseTables {
@@ -570,8 +566,9 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 		[
 			"truncate",
 			async () => {
-				await store().writeText(files.truncated, transcript(id(), "before the truncate"));
-				setFile(files.truncated, transcript(id(), "before the truncate"));
+				const content = transcript(id(), "before the truncate");
+				await store().writeText(files.truncated, content);
+				setFile(files.truncated, content);
 				const truncating = store().openWriter(files.truncated, { flags: "w" });
 				await truncating.append(turn("after the truncate", "m1"));
 				await truncating.close();
@@ -619,8 +616,9 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 		[
 			"remove",
 			async () => {
-				await store().writeText(files.removed, transcript(id(), "removed next"));
-				setFile(files.removed, transcript(id(), "removed next"));
+				const content = transcript(id(), "removed next");
+				await store().writeText(files.removed, content);
+				setFile(files.removed, content);
 				await store().unlink(files.removed);
 				model.files.delete(files.removed);
 			},
@@ -628,10 +626,12 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 		[
 			"delete_session",
 			async () => {
-				await store().writeText(files.deleted, transcript(ids.deleted, "deleted with its artifact"));
-				setFile(files.deleted, transcript(ids.deleted, "deleted with its artifact"));
-				await store().writeText(files.artifact, transcript(id(), "an artifact of the deleted session"));
-				setFile(files.artifact, transcript(id(), "an artifact of the deleted session"));
+				const session = transcript(ids.deleted, "deleted with its artifact");
+				await store().writeText(files.deleted, session);
+				setFile(files.deleted, session);
+				const artifact = transcript(id(), "an artifact of the deleted session");
+				await store().writeText(files.artifact, artifact);
+				setFile(files.artifact, artifact);
 				await store().deleteSessionWithArtifacts(files.deleted);
 				model.files.delete(files.deleted);
 				model.files.delete(files.artifact);
@@ -1091,16 +1091,18 @@ async function openOnPool(url: string, label: string, tables: CaseTables) {
 	return { harness, storage, file };
 }
 
+/** The size of the server log, in bytes. */
+async function logSize(db: SQL): Promise<number> {
+	return Number(((await db.unsafe(`SELECT size FROM pg_catalog.pg_stat_file('${LOG_FILE}')`)) as Rows)[0]?.size);
+}
+
 /** Read the server log from `start`, keeping only the lines of `keep`'s backends and the lines that continue them. */
 async function readServerLog(db: SQL, start: number, keep: ReadonlySet<number>): Promise<string> {
-	const size = async () =>
-		Number(((await db.unsafe(`SELECT size FROM pg_catalog.pg_stat_file('${LOG_FILE}')`)) as Rows)[0]?.size);
-	// The logging collector writes a moment after the backend: wait until the file stops growing.
-	let end = await size();
+	// The logging collector writes a moment after the backend, and announces nothing: watch the size settle.
+	let end = await logSize(db);
 	for (let look = 0; look < 10; look++) {
-		// The logging collector writes a moment after the backend, and announces nothing: watch the size settle.
 		await Bun.sleep(500);
-		const next = await size();
+		const next = await logSize(db);
 		if (next === end) break;
 		end = next;
 	}
@@ -1165,10 +1167,7 @@ describe("SQL session store under a session setting another client left on Postg
 				await db.unsafe(`ALTER DATABASE ${identifier(READ_ONLY_DATABASE)} SET default_transaction_read_only = on`);
 				return READ_ONLY_DATABASE;
 			});
-			await make("server log offset", async () => {
-				const [row] = (await db.unsafe(`SELECT size FROM pg_catalog.pg_stat_file('${LOG_FILE}')`)) as Rows;
-				return String(row?.size);
-			});
+			await make("server log offset", async () => String(await logSize(db)));
 		});
 
 		afterAll(async () => {

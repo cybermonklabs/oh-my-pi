@@ -95,7 +95,7 @@ const BEGIN_CLAUSE: PgSettingKind = { kind: "begin-clause" };
 const NO_LONGER_USED: PgSettingKind = { kind: "no-longer-used", reason: expect.any(String) };
 const EXEMPT: PgSettingKind = { kind: "exempt", reason: expect.any(String) };
 
-/** The entries whose kind R1 fixes, with that kind and its value. */
+/** The entries whose kind the store's statements depend on, with that kind and its value. */
 const FIXED_KINDS: Array<[string, PgSettingKind]> = [
 	["application_name", { kind: "set-local", value: "= 'omp-session-store'" }],
 	["statement_timeout", TO_DEFAULT],
@@ -131,6 +131,28 @@ const OPENING_HEAD = [
 	"SET LOCAL statement_timeout TO DEFAULT",
 	"SET LOCAL lock_timeout TO DEFAULT",
 	"SET LOCAL idle_in_transaction_session_timeout TO DEFAULT",
+];
+
+/** The statements of the set-local entries that no supported server lacks, less the head's, in list order. */
+const UNCONDITIONAL_REST = PG_SESSION_SETTINGS.filter(isSetLocal)
+	.filter(entry => entry.conditional === undefined)
+	.map(statementOf)
+	.filter(sql => !OPENING_HEAD.includes(sql));
+
+/**
+ * The parameters of the opening's conditional statements, in its order: `transaction_timeout` and
+ * `cloudsql_session_read_only`, then every other set-local entry that a supported server may lack, in list order.
+ */
+const CONDITIONAL_ORDER = [
+	"transaction_timeout",
+	"cloudsql_session_read_only",
+	...PG_SESSION_SETTINGS.filter(
+		entry =>
+			isSetLocal(entry) &&
+			entry.conditional !== undefined &&
+			entry.name !== "transaction_timeout" &&
+			entry.name !== "cloudsql_session_read_only",
+	).map(entry => entry.name),
 ];
 
 describe("PG_SESSION_SETTINGS", () => {
@@ -213,7 +235,7 @@ describe("PG_SESSION_SETTINGS", () => {
 		expect(wrong).toEqual([]);
 	});
 
-	describe("the kinds R1 fixes", () => {
+	describe("the kinds the store's statements depend on", () => {
 		for (const [name, kind] of FIXED_KINDS) {
 			it(name, () => {
 				expect(PG_SESSION_SETTINGS.find(entry => entry.name === name)?.kind).toEqual(kind);
@@ -264,29 +286,50 @@ describe("PG_OPENING", () => {
 		);
 	});
 
-	it("PG_CONDITIONAL_PARAMETERS names the parameter each conditional statement needs, in order", () => {
-		expect(PG_CONDITIONAL_PARAMETERS).toEqual(
-			PG_OPENING.flatMap(statement => (statement.needs === undefined ? [] : [statement.needs])),
-		);
+	it("PG_CONDITIONAL_PARAMETERS: transaction_timeout, cloudsql_session_read_only, then each other conditional set-local entry in list order", () => {
+		expect(PG_CONDITIONAL_PARAMETERS).toEqual(CONDITIONAL_ORDER);
 	});
 });
 
 describe("pgOpening", () => {
-	const presents: Array<[string, ReadonlySet<string>]> = [
-		["no conditional parameter", new Set()],
-		...PG_CONDITIONAL_PARAMETERS.map((name): [string, ReadonlySet<string>] => [`only ${name}`, new Set([name])]),
-		["every conditional parameter", new Set(PG_CONDITIONAL_PARAMETERS)],
+	const BEGIN_WRITE = "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE";
+	const BEGIN_READ = "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY";
+	const MARK = "SET LOCAL application_name = 'omp-session-store'";
+	/** The write opening on a server that has no conditional parameter. */
+	const NONE = [BEGIN_WRITE, ...OPENING_HEAD, ...UNCONDITIONAL_REST].join("; ");
+	/** A label, the parameters a server has, and the write opening the store must send there. */
+	const cases: Array<[string, ReadonlySet<string>, string]> = [
+		["no conditional parameter", new Set(), NONE],
+		["only names that no conditional statement needs", new Set(["work_mem", "no_such_setting"]), NONE],
+		["transaction_timeout", new Set(["transaction_timeout"]), `${NONE}; SET LOCAL transaction_timeout TO DEFAULT`],
+		[
+			"restrict_nonsystem_relation_kind and cloudsql_session_read_only",
+			new Set(["restrict_nonsystem_relation_kind", "cloudsql_session_read_only"]),
+			`${NONE}; SET LOCAL cloudsql_session_read_only TO DEFAULT; SET LOCAL restrict_nonsystem_relation_kind TO DEFAULT`,
+		],
+		[
+			"every conditional parameter",
+			new Set(CONDITIONAL_ORDER),
+			[NONE, ...CONDITIONAL_ORDER.map(name => `SET LOCAL ${name} TO DEFAULT`)].join("; "),
+		],
 	];
-	for (const mode of ["write", "read"] as const) {
-		for (const [label, present] of presents) {
-			it(`${mode}, the server having ${label}`, () => {
-				const sent = PG_OPENING.filter(({ needs }) => needs === undefined || present.has(needs)).map(
-					({ sql }) => sql,
-				);
-				if (mode === "read") sent[0] = "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY";
-				expect(pgOpening(mode, present)).toBe(sent.join("; "));
-			});
-		}
+
+	it("begins READ ONLY for a read and READ WRITE for a write, then marks the application", () => {
+		expect(pgOpening("read", new Set())).toStartWith(`${BEGIN_READ}; ${MARK}; `);
+		expect(pgOpening("write", new Set())).toStartWith(`${BEGIN_WRITE}; ${MARK}; `);
+	});
+
+	it("with no conditional parameter, holds no conditional statement and ends with work_mem and role", () => {
+		const opening = pgOpening("write", new Set());
+		expect(CONDITIONAL_ORDER.filter(name => opening.includes(`SET LOCAL ${name} `))).toEqual([]);
+		expect(opening).toEndWith("; SET LOCAL work_mem TO DEFAULT; SET LOCAL role TO DEFAULT");
+	});
+
+	for (const [label, present, write] of cases) {
+		it(`the server having ${label}: the write opening, and the read opening with READ ONLY`, () => {
+			expect(pgOpening("write", present)).toBe(write);
+			expect(pgOpening("read", present)).toBe(`${BEGIN_READ}${write.slice(BEGIN_WRITE.length)}`);
+		});
 	}
 });
 
