@@ -2626,15 +2626,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const [index, claim] of live.entries()) values[`sid${index}`] = claim.sessionId;
 			let refreshed: Array<{ session_id: string }> = [];
 			if (this.#adapter === "postgres") {
-				await this.#client.transaction(async transaction => {
-					await transaction.unsafe("SET TRANSACTION READ WRITE");
-					await transaction.unsafe(PG_HEARTBEAT_OPENING);
-					const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
-					if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
+				await this.#readWrite(async transaction => {
 					refreshed = (await run(transaction, lease.heartbeat(live.length), values)) as Array<{
 						session_id: string;
 					}>;
-				});
+				}, "heartbeat");
 			} else {
 				// Two statements on their own, in no transaction: a lock wait timeout of the update (with
 				// `innodb_rollback_on_timeout` ON or OFF) fails this heartbeat alone, and leaves no transaction
@@ -2985,44 +2981,27 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Run `work` in one PostgreSQL transaction that starts with `opening`.
 	 * Used on PostgreSQL only.
 	 *
-	 * The write opening is `SET TRANSACTION READ WRITE`, then a read of
-	 * `setting` and `reset_val` of `default_transaction_read_only` (see
-	 * {@link READ_ONLY_SETTINGS}). A pooled connection can carry another
-	 * client's session-level `default_transaction_read_only = on` (a
-	 * transaction-mode pooler hands one backend to many clients, and a session
-	 * `SET` stays on it); PostgreSQL then refuses every write, even
-	 * `CREATE TABLE IF NOT EXISTS` on a table that exists (SQLSTATE 25006),
-	 * but honours `READ WRITE` set as a transaction's first statement whatever
-	 * that default is. The read gives three cases:
-	 * - A session value over a default that is off (`setting` on, `reset_val`
-	 *   off): the store overrides it, and `work` runs.
-	 * - A read-only default that the backend session keeps (both on): the
-	 *   store honours it. The database, the role, the server or the backend
-	 *   connection's start parameters set it, so it is an operator's or a
-	 *   provider's decision (a provider can make a database read-only when its
-	 *   disk is nearly full). The transaction fails before `work` runs, with
-	 *   nothing written.
-	 * - A session that turned such a default off (`setting` off, `reset_val`
-	 *   on): `work` runs, as it did before the store read this setting.
-	 * A transaction-mode pooler applies a client's start parameters and its
-	 * `connect_query` to the backend with `SET`, so the store overrides them
-	 * like any session value. Any other answer, no row included, lets `work`
-	 * run.
+	 * Every opening sends `SET TRANSACTION READ WRITE`, then locks
+	 * `search_path` and reads `default_transaction_read_only`, refusing a
+	 * read-only default the session keeps. The three openings differ in what
+	 * else they send:
 	 *
-	 * The start-up opening (see `#setup`) adds `READ COMMITTED` before the
-	 * read and the start-up advisory lock after it. Under a `repeatable read`
-	 * default the snapshot would be taken before the lock wait, and a
-	 * backfill would then fail with SQLSTATE 40001. The lock comes after the
-	 * read, so an honoured default refuses before any wait.
+	 * - `"write"` (default): `SET LOCAL search_path` alone.
+	 * - `"start-up"`: `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
+	 *   before the read, and the start-up advisory lock after it.
+	 * - `"heartbeat"`: `SET LOCAL search_path`, `SET LOCAL lock_timeout`
+	 *   and `SET LOCAL idle_in_transaction_session_timeout` in one simple
+	 *   query ({@link PG_HEARTBEAT_OPENING}), so the beat shares the
+	 *   store's read-only refusal and cannot drift from it.
 	 */
 	#readWrite(
 		work: (transaction: SqlSessionStorageTransaction) => Promise<unknown>,
-		opening: "write" | "start-up" = "write",
+		opening: "write" | "start-up" | "heartbeat" = "write",
 	): Promise<void> {
 		return this.#client.transaction(async transaction => {
 			await transaction.unsafe("SET TRANSACTION READ WRITE");
 			if (opening === "start-up") await transaction.unsafe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-			await transaction.unsafe(PG_SEARCH_PATH);
+			await transaction.unsafe(opening === "heartbeat" ? PG_HEARTBEAT_OPENING : PG_SEARCH_PATH);
 			const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
 			if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
 			if (opening === "start-up") await transaction.unsafe(`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`);
