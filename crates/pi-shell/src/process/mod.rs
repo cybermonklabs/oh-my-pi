@@ -33,7 +33,9 @@ use std::{
 use bstr::BString;
 
 pub use self::host::{NativeHost, ignored_on_entry, inherited_fds};
-use self::signals::RuntimeSignals;
+#[cfg(unix)]
+use self::signals::die_of;
+use self::signals::{Death, RuntimeSignals};
 use crate::{
 	bash::{
 		Budget, CallOutcome, Cx, Dialect, Engine, EngineConfig, EventMask, MemStore, ModeId, Origin,
@@ -502,45 +504,6 @@ pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOp
 	#[cfg(not(unix))]
 	let _ = death;
 	status
-}
-
-/// The signal a standalone shell dies of ([`run`]).
-#[derive(Clone, Copy, Debug)]
-struct Death {
-	/// The signal's number.
-	signal:    i32,
-	/// An `exec`ed program died of it ([`Shell::exec_signal`]): the shell
-	/// passes that death on, and dumps no core of its own beside the
-	/// program's (zsh and bash `exec` the program, so one core exists).
-	passed_on: bool,
-}
-
-/// End the process by `death`'s signal's default action: the disposition
-/// back to the default, the signal unblocked, then raised. A death passed
-/// on from an `exec`ed program first makes the process dump no core
-/// (`PR_SET_DUMPABLE` 0 on Linux, whatever `core_pattern` says; a core
-/// size limit of 0 elsewhere). Returns only when the signal does not end
-/// the process.
-#[cfg(unix)]
-fn die_of(death: Death) {
-	let Death { signal, passed_on } = death;
-	// SAFETY: plain prctl, rlimit, disposition, mask and raise calls on a
-	// valid signal number, an initialized limit and a set initialized by
-	// sigemptyset.
-	unsafe {
-		if passed_on {
-			#[cfg(target_os = "linux")]
-			libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
-			#[cfg(not(target_os = "linux"))]
-			libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
-		}
-		libc::signal(signal, libc::SIG_DFL);
-		let mut set: libc::sigset_t = mem::zeroed();
-		libc::sigemptyset(&raw mut set);
-		libc::sigaddset(&raw mut set, signal);
-		libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
-		libc::raise(signal);
-	}
 }
 
 /// bash's `--pretty-print` instead of running: the status when `launch`
