@@ -3302,7 +3302,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * connection commits to the database file and never for this
 	 * connection's own commits (a private database has no other connection,
 	 * so there the read takes no pragma), and this client's counts of its
-	 * writes of the path (see {@link SqliteWrites}); at its end it takes
+	 * writes, of every path and of the path's hashed slot (see
+	 * {@link SqliteWrites}); at its end it takes
 	 * them again. When any of them moved, it reads exactly the bytes it yielded
 	 * again, from `fromByte` for as many bytes, with the same page checks,
 	 * and compares their SHA-256 with that of the bytes it yielded: a
