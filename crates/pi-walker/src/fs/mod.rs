@@ -665,7 +665,7 @@ impl Session {
 	/// Opens the directory at an absolute path, following symlinks.
 	pub async fn open_dir(&mut self, path: &Path) -> io::Result<Dir> {
 		#[cfg(test)]
-		seam::fire(seam::last(path), seam::Open::Path);
+		seam::dir_open(seam::last(path), seam::Open::Path)?;
 		let repr = match &mut self.imp {
 			Imp::Native(s) => DirRepr::Native(native::open_dir(s, path)?),
 			Imp::Provider(fs) => DirRepr::Provider(provider::open_dir(fs, path).await?),
@@ -679,7 +679,7 @@ impl Session {
 	/// that follows it despite `O_NOFOLLOW`. Earlier components are followed.
 	pub async fn open_dir_unlinked(&mut self, path: &Path) -> io::Result<Dir> {
 		#[cfg(test)]
-		seam::fire(seam::last(path), seam::Open::Path);
+		seam::dir_open(seam::last(path), seam::Open::Path)?;
 		let repr = match &mut self.imp {
 			Imp::Native(s) => DirRepr::Native(native::open_dir_unlinked(s, path)?),
 			Imp::Provider(fs) => {
@@ -693,7 +693,7 @@ impl Session {
 	/// that replaced it since `parent` was listed.
 	pub async fn open_child(&mut self, parent: &Dir, name: &[u8]) -> io::Result<Dir> {
 		#[cfg(test)]
-		seam::fire(name, seam::Open::At);
+		seam::dir_open(name, seam::Open::At)?;
 		let repr = match (&mut self.imp, &parent.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => DirRepr::Native(native::open_child(s, h, name)?),
 			(Imp::Provider(fs), DirRepr::Provider(path)) => {
@@ -709,6 +709,8 @@ impl Session {
 	/// Fails with [`io::ErrorKind::Unsupported`] where `..` cannot be opened
 	/// relative to a handle (Windows, providers).
 	pub(crate) fn open_parent(&mut self, child: &Dir) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::dir_open(b"..", seam::Open::Parent)?;
 		match (&mut self.imp, &child.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => {
 				Ok(Dir { repr: DirRepr::Native(native::open_parent(s, h)?) })
@@ -842,7 +844,7 @@ impl Session {
 	pub async fn open_dir_beneath(&mut self, root: &Dir, rel: &[u8]) -> io::Result<Dir> {
 		check_relative(rel)?;
 		#[cfg(test)]
-		seam::fire(seam::last_of(rel), seam::Open::Beneath);
+		seam::dir_open(seam::last_of(rel), seam::Open::Beneath)?;
 		let repr = match (&mut self.imp, &root.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => {
 				DirRepr::Native(native::open_dir_beneath(s, h, rel)?)
@@ -1092,9 +1094,11 @@ async fn list_with(
 /// a closure for an entry name, and the first open (or, registered for it,
 /// stat) of an entry by that name runs it just before the call, so the test
 /// can swap the entry for a symlink exactly there, without a racing writer.
+/// A test can also make every directory open on its own thread fail
+/// ([`fail_opens`]), as a short burst of `EMFILE` would.
 #[cfg(test)]
 pub(crate) mod seam {
-	use std::path::Path;
+	use std::{cell::RefCell, io, path::Path};
 
 	use parking_lot::Mutex;
 
@@ -1107,8 +1111,44 @@ pub(crate) mod seam {
 		At,
 		/// An open below the walk root, with no symlink followed on the way.
 		Beneath,
+		/// An open of a directory's `..`.
+		Parent,
 		/// A stat by path; only [`before_stat`] hooks run here.
 		Stat,
+	}
+
+	type Fail = Box<dyn FnMut(Open) -> Option<io::Error>>;
+
+	thread_local! {
+		static FAIL: RefCell<Option<Fail>> = const { RefCell::new(None) };
+	}
+
+	/// Fails each directory open on this thread with the error `fail` returns
+	/// for its kind, if any, instead of making it, until the returned guard
+	/// drops. Thread-local, so tests running beside this one keep their
+	/// opens.
+	#[cfg_attr(not(unix), expect(dead_code, reason = "only the Unix reopen tests fail opens"))]
+	pub(crate) fn fail_opens(fail: impl FnMut(Open) -> Option<io::Error> + 'static) -> Failing {
+		FAIL.with_borrow_mut(|slot| *slot = Some(Box::new(fail)));
+		Failing
+	}
+
+	/// Makes this thread's directory opens again when dropped.
+	pub(crate) struct Failing;
+
+	impl Drop for Failing {
+		fn drop(&mut self) {
+			FAIL.with_borrow_mut(|slot| *slot = None);
+		}
+	}
+
+	/// Runs the hook registered for `name` and this kind of directory open, if
+	/// any, then fails the open when this thread fails such opens.
+	pub(crate) fn dir_open(name: &[u8], open: Open) -> io::Result<()> {
+		fire(name, open);
+		FAIL
+			.with_borrow_mut(|slot| slot.as_mut().and_then(|fail| fail(open)))
+			.map_or(Ok(()), Err)
 	}
 
 	type Hook = Box<dyn FnOnce(Open) + Send>;

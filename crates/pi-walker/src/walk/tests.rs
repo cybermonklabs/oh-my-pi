@@ -1158,6 +1158,107 @@ async fn a_parent_the_walk_returns_to_is_taken_back_only_as_itself() {
 	}
 }
 
+/// A parent the walk gave its handle up for, and cannot open again when it
+/// returns to it, keeps its place: its subdirectories that the walk cannot
+/// open are reported with the open's own error, and those it can open once
+/// the failure ends are walked. Here every directory open on this thread
+/// fails with `EMFILE` from the report of `p/a/d`, the last before the walk
+/// leaves `p/a` for `p`, until the walk reports an error. Losing `p` instead
+/// reported `p/y` and `p/z` as moved or replaced, and walked neither.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
+	let tmp = make_tree("tree-reopen-fails", &["p/y/missed", "p/z/kept"]);
+	std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+	// Far enough below `p` for `p` to give its handle up.
+	chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+	let opts = TreeOptions { contents_first: true, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+		.await
+		.expect("tree");
+	let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+	let mut failing = None;
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => {
+				let path = String::from_utf8_lossy(entry.path).into_owned();
+				if path == "p/a/d" {
+					failing = Some(crate::fs::seam::fail_opens(move |_| Some(emfile())));
+				}
+				if !path.starts_with("p/a/") {
+					seen.push(path);
+				}
+			},
+			Event::Error(error) => {
+				failing = None;
+				let path = error
+					.path
+					.strip_prefix(tmp.path())
+					.unwrap()
+					.to_string_lossy()
+					.into_owned();
+				errors.push((path, error.error.to_string()));
+			},
+		}
+	}
+	drop(cursor);
+	assert!(failing.is_none(), "the walk reported no error while its opens failed");
+	assert_eq!(errors, [("p/y".to_owned(), emfile().to_string())]);
+	assert_eq!(seen, ["p/a", "p/y", "p/z/kept", "p/z", "p"]);
+}
+
+/// Under [`Follow::Always`] too, a lost parent enters none of its
+/// subdirectories, a followed link included: the link opens by path, so it
+/// resolves through whatever now stands at the parent's path. Here `p`'s
+/// child is moved out and `p` replaced while the walk is below it, and the
+/// new `p` holds a link `l` to `u`, where the old one linked to `t`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_parent_follows_no_link() {
+	let tmp = make_tree("tree-lost-link", &["o/z/secret", "t/listed", "u/other"]);
+	std::fs::create_dir_all(tmp.path().join("p/z")).unwrap();
+	symlink("../t", &tmp.path().join("p/l"));
+	std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+	// Far enough below `p` for `p` to give its handle up.
+	chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+	let opts = TreeOptions { follow: Follow::Always, ..Default::default() };
+	let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+		.await
+		.expect("tree");
+	let (mut seen, mut errors) = (Vec::new(), Vec::new());
+	while let Some(event) = cursor.next().await {
+		match event {
+			Event::Entry(entry) => {
+				let path = String::from_utf8_lossy(entry.path).into_owned();
+				if path.ends_with("/leaf") {
+					// While the walk is at the bottom of `p/a`.
+					std::fs::rename(tmp.path().join("p/a"), tmp.path().join("o/a")).unwrap();
+					std::fs::rename(tmp.path().join("p"), tmp.path().join("p-old")).unwrap();
+					std::fs::create_dir_all(tmp.path().join("p/z/impostor")).unwrap();
+					symlink("../u", &tmp.path().join("p/l"));
+				}
+				if path.starts_with("p/") && !path.starts_with("p/a/") {
+					seen.push(path);
+				}
+			},
+			Event::Error(error) => {
+				let path = error
+					.path
+					.strip_prefix(tmp.path())
+					.unwrap()
+					.to_string_lossy()
+					.into_owned();
+				errors.push((path, error.error.to_string()));
+			},
+		}
+	}
+	drop(cursor);
+	let moved = "the directory was moved or replaced during the walk".to_owned();
+	assert_eq!(seen, ["p/a", "p/l", "p/z"]);
+	assert_eq!(errors, [("p/l".to_owned(), moved.clone()), ("p/z".to_owned(), moved)]);
+}
+
 /// A walk stopped at the leaf of a deep ignore chain releases its frames one
 /// level at a time: the stopped cursor is dropped on a thread with a small
 /// stack. Releasing the root's frame first left the deepest frame holding
