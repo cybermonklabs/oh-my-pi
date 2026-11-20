@@ -756,6 +756,67 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 	}
 }
 
+/// `Fs::write` to a host FIFO waits for room while the reader drains it.
+/// On a current-thread runtime that reader is a task on the same thread, so
+/// a write inline in the async fn holds the only thread and the reader never
+/// runs: the write must run off the runtime worker.
+#[cfg(unix)]
+#[test]
+fn async_write_to_a_fifo_lets_a_reader_on_the_same_runtime_drain_it() {
+	use std::{io::Read as _, os::unix::fs::OpenOptionsExt as _, sync::mpsc};
+
+	const TOTAL: usize = 1 << 20;
+	let dir = TempDir::new("fifo-async-write");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let reader = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&fifo)
+		.unwrap();
+	let (done_tx, done_rx) = mpsc::channel();
+	let path = fifo;
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let result = runtime.block_on(async move {
+			let drain = async {
+				let mut reader = reader;
+				let mut got = 0;
+				let mut buf = vec![0; 64 << 10];
+				// A non-blocking FIFO read gives 0 until a writer opens, and
+				// would-block once one has: both mean "not yet" until all of
+				// it arrived. The reader stays open throughout, so the write's
+				// open finds it.
+				while got < TOTAL {
+					match reader.read(&mut buf) {
+						Ok(n) if n > 0 => got += n,
+						Ok(_) => tokio::time::sleep(Duration::from_millis(1)).await,
+						Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+							tokio::time::sleep(Duration::from_millis(1)).await;
+						},
+						Err(e) => panic!("{e}"),
+					}
+				}
+				got
+			};
+			let fs = Fs::native();
+			let (written, got) = tokio::join!(fs.write(&path, vec![b'x'; TOTAL]), drain);
+			written.map(|()| got)
+		});
+		let _ = done_tx.send(result);
+	});
+	let got = done_rx
+		.recv_timeout(Duration::from_secs(10))
+		.expect("DEADLINE fired: the FIFO write held the runtime's only thread")
+		.unwrap();
+	assert_eq!(got, TOTAL);
+}
+
 /// A FIFO opened non-blocking (`dd iflag=nonblock`) must read without
 /// waiting. On Linux such a FIFO with no writer reports no readiness, so a
 /// read that first waited for readiness blocked until the token fired

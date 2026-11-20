@@ -1059,7 +1059,10 @@ async fn report_close_failure(
 		outcome.status = 1;
 	}
 	let mut line = format!("pi-shell: closing a file failed: {err}\n");
+	#[cfg(unix)]
 	let limit = crate::sys::WRITE_CHUNK;
+	#[cfg(not(unix))]
+	let limit = usize::MAX;
 	if line.len() > limit {
 		let mut end = limit.saturating_sub(1);
 		while !line.is_char_boundary(end) {

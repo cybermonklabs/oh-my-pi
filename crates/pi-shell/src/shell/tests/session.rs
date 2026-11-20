@@ -405,26 +405,62 @@ fn a_builtin_writing_to_a_full_output_pipe_still_times_out() {
 	assert!(result.timed_out, "{result:?}");
 }
 
-/// The Darwin blocking-pool route is selectable on Linux too. The same
-/// one-worker output-pipe run must reach its native timeout.
+/// The writer-thread route, Darwin's only one, forced on Linux in this
+/// test's child process: the same one-worker output-pipe run must reach
+/// its timeout.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_builtin_writing_to_a_full_output_pipe_through_blocking_pool_still_times_out() {
-	crate::sys::force_blocking_pool_writes_for_test(true);
-	a_builtin_writing_to_a_full_output_pipe_still_times_out();
-	crate::sys::force_blocking_pool_writes_for_test(false);
+fn a_builtin_writing_to_a_full_output_pipe_through_the_writer_thread_still_times_out() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::a_builtin_writing_to_a_full_output_pipe_through_the_writer_thread_still_times_out"
+		),
+		a_builtin_writing_to_a_full_output_pipe_still_times_out,
+	);
 }
 
-/// An external command that floods stdout while nothing drains the output
-/// pipe must not leave a zombie. The fix prevents the write from blocking
-/// the runtime; without it, `UnixProc::drop` → `reap` → `waitpid`
-/// (`crates/pi-shell/src/sys/spawn/unix.rs:1315-1370`) is never reached
-/// because the future holding `UnixProc` cannot be polled.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// Whether `pid` is a zombie: it exited and its parent has not reaped it.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+	std::fs::read_to_string(format!("/proc/{pid}/stat"))
+		.ok()
+		.and_then(|stat| Some(stat.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+		.unwrap_or(false)
+}
+
+/// A real external child that exits while a builtin writes to a full
+/// output pipe nothing drains must be reaped: its `waitpid` runs on the
+/// runtime (`UnixProc`'s `Drop` and `reap`,
+/// `crates/pi-shell/src/sys/spawn/unix.rs`), which a write that waited in the
+/// kernel would hold for good. The child is `/bin/sh` by absolute path, so it
+/// is an external process, and it writes its own pid. A control first shows
+/// that the check sees a child nobody reaped.
+#[cfg(target_os = "linux")]
 #[test]
-fn an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie() {
+fn an_external_child_of_a_run_with_a_full_output_pipe_is_reaped() {
 	const BOUND: Duration = Duration::from_secs(15);
+	let mut control = std::process::Command::new("/bin/true")
+		.spawn()
+		.expect("spawn the control");
+	let seen = std::time::Instant::now();
+	while !is_zombie(control.id()) {
+		assert!(seen.elapsed() < Duration::from_secs(5), "the control never showed as a zombie");
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	control.wait().expect("reap the control");
+	assert!(!is_zombie(control.id()), "the control was reaped");
+
 	let _guard = shell_test_lock().blocking_lock();
+	let stamp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let pidfile = std::env::temp_dir().join(format!("pi-shell-reap-{}-{stamp}", std::process::id()));
+	let command = format!(
+		"/bin/sh -c 'echo $$ > {}; sleep 0.3' & while :; do echo 0123456789abcdefghi; done",
+		pidfile.display()
+	);
 	let (chunks, undrained) = flume::bounded::<String>(1);
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
@@ -433,14 +469,9 @@ fn an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie() {
 			.enable_all()
 			.build()
 			.expect("single-worker runtime");
-		let options = ShellExecuteOptions {
-			command: "yes 0123456789abcdefghijklmnopqrstuvwxyz".to_string(),
-			timeout_ms: Some(2000),
-			..Default::default()
-		};
+		let options = ShellExecuteOptions { command, timeout_ms: Some(2000), ..Default::default() };
 		let result =
 			runtime.block_on(execute_shell(options, Some(chunks), CancelToken::new(Some(2000))));
-		// Let the runtime clean up externals before we check for zombies.
 		runtime.shutdown_timeout(Duration::from_secs(3));
 		let _ = tx.send(result);
 	});
@@ -450,36 +481,31 @@ fn an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie() {
 		.expect("execute_shell");
 	drop(undrained);
 	assert!(result.timed_out, "{result:?}");
-	// After cleanup, no child of this process should be a zombie.
-	// /proc/PID/task/TID/children lists direct children; a zombie has
-	// state Z in /proc/PID/stat.
-	std::thread::sleep(Duration::from_millis(500));
-	let pid = std::process::id();
-	let children_path = format!("/proc/{pid}/task/{pid}/children");
-	let zombies: Vec<u32> = std::fs::read_to_string(&children_path)
-		.unwrap_or_default()
-		.split_whitespace()
-		.filter_map(|s| s.parse::<u32>().ok())
-		.filter(|&child| {
-			std::fs::read_to_string(format!("/proc/{child}/stat"))
-				.ok()
-				.and_then(|stat| {
-					let rest = stat.rsplit_once(')')?.1;
-					rest.trim_start().starts_with('Z').then_some(())
-				})
-				.is_some()
-		})
-		.collect();
-	assert!(zombies.is_empty(), "children left as zombies: {zombies:?}");
+	let pid: u32 = std::fs::read_to_string(&pidfile)
+		.expect("the external wrote its pid")
+		.trim()
+		.parse()
+		.expect("a pid");
+	let _ = std::fs::remove_file(&pidfile);
+	let reaped = std::time::Instant::now();
+	while is_zombie(pid) {
+		assert!(reaped.elapsed() < Duration::from_secs(2), "the external {pid} is left a zombie");
+		std::thread::sleep(Duration::from_millis(10));
+	}
 }
 
-/// Runs the zombie control through the portable Darwin blocking-pool route.
+/// The same through the writer-thread route, forced on Linux in this
+/// test's child process.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_external_flooding_a_full_output_pipe_through_blocking_pool_is_reaped() {
-	crate::sys::force_blocking_pool_writes_for_test(true);
-	an_external_flooding_a_full_output_pipe_is_reaped_not_left_a_zombie();
-	crate::sys::force_blocking_pool_writes_for_test(false);
+fn an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_is_reaped() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_is_reaped"
+		),
+		an_external_child_of_a_run_with_a_full_output_pipe_is_reaped,
+	);
 }
 
 /// A run that succeeded, as a failed close finds it.

@@ -541,20 +541,16 @@ mod descriptor {
 	use std::{
 		io,
 		os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+		sync::Arc,
 		time::Duration,
 	};
 	#[cfg(target_os = "linux")]
-	use std::{
-		ffi::CString,
-		os::fd::FromRawFd,
-	};
+	use std::{ffi::CString, os::fd::FromRawFd};
 
 	use tokio::io::unix::AsyncFd;
 
-	/// The most a gated write carries at once: what a pipe that polls
-	/// writable is sure to take (`PIPE_BUF`), also when its free space is
-	/// unknown.
-	const ATOMIC_WRITE: usize = if cfg!(any(target_os = "linux", target_os = "android")) { 4096 } else { 512 };
+	/// The most one write on the blocking pool carries.
+	const BLOCKING_WRITE_CHUNK: usize = 64 << 10;
 
 	/// How often a read waiting on a named FIFO rechecks it on Apple
 	/// platforms, whose kqueue never reports that a FIFO's last writer closed
@@ -564,13 +560,14 @@ mod descriptor {
 
 	/// A descriptor registered with the reactor.
 	pub(super) struct Descriptor {
-		afd:   AsyncFd<OwnedFd>,
+		afd:            AsyncFd<OwnedFd>,
 		/// The open file description is shared (or left blocking): every
 		/// read syscall is preceded by a zero-timeout readiness check.
-		gated: bool,
-		/// Writes on a description that cannot be privately reopened run on
-		/// Tokio's blocking pool, never the shared runtime worker.
-		blocking_writes: bool,
+		gated:          bool,
+		/// A dup that writes on Tokio's blocking pool, where a write may wait
+		/// in the kernel without holding a runtime worker: the description
+		/// could not be reopened privately (Darwin, or a reopen that failed).
+		blocking:       Option<Arc<std::fs::File>>,
 		/// The reactor never reports this descriptor's end of input (a named
 		/// FIFO on an Apple platform); waits recheck it periodically.
 		eof_unreported: bool,
@@ -578,15 +575,31 @@ mod descriptor {
 
 	impl Descriptor {
 		/// Registers `fd`, whose description may be shared with other
-		/// processes. Linux reopens a pipe through procfs into a private
-		/// non-blocking description; on Darwin and when that fails, writes use
-		/// the blocking pool.
+		/// processes. On Linux a pipe or FIFO is reopened through procfs into
+		/// a private non-blocking description; anything else (a terminal or
+		/// another device, whose open has side effects), Darwin, and a reopen
+		/// that fails write on the blocking pool.
 		pub fn gated(fd: OwnedFd) -> Result<Self, OwnedFd> {
 			#[cfg(target_os = "linux")]
-			if let Ok(private) = reopen_nonblocking(fd.as_fd()) {
+			if is_fifo(fd.as_fd())
+				&& let Ok(private) = reopen_nonblocking(fd.as_fd())
+			{
 				return Self::register(private, false, false);
 			}
 			Self::register(fd, true, true)
+		}
+
+		/// [`Self::gated`] as when the reopen fails: writes on the blocking
+		/// pool, also for a pipe on Linux.
+		#[cfg(test)]
+		pub fn gated_without_reopen(fd: OwnedFd) -> Result<Self, OwnedFd> {
+			Self::register(fd, true, true)
+		}
+
+		/// The descriptor this holds, for tests to ask what it refers to.
+		#[cfg(all(test, target_os = "linux"))]
+		pub fn as_fd(&self) -> BorrowedFd<'_> {
+			self.afd.get_ref().as_fd()
 		}
 
 		/// Registers `fd`, whose description this process opened `O_NONBLOCK`.
@@ -596,8 +609,16 @@ mod descriptor {
 
 		fn register(fd: OwnedFd, gated: bool, blocking_writes: bool) -> Result<Self, OwnedFd> {
 			let eof_unreported = is_named_fifo(fd.as_fd());
+			let blocking = if blocking_writes {
+				match fd.try_clone() {
+					Ok(dup) => Some(Arc::new(std::fs::File::from(dup))),
+					Err(_) => return Err(fd),
+				}
+			} else {
+				None
+			};
 			match AsyncFd::try_new(fd) {
-				Ok(afd) => Ok(Self { afd, gated, blocking_writes, eof_unreported }),
+				Ok(afd) => Ok(Self { afd, gated, blocking, eof_unreported }),
 				Err(error) => Err(error.into_parts().0),
 			}
 		}
@@ -653,40 +674,29 @@ mod descriptor {
 			self.afd.readable().await.map(Some)
 		}
 
-		/// Writes all of `buf`, waiting for room. Linux pipes use a private
-		/// non-blocking description, so a competing writer returns EAGAIN
-		/// rather than blocking. Darwin and unreopenable descriptors write on
-		/// Tokio's blocking pool, never a shared scheduler worker.
+		/// Writes all of `buf`, waiting for room. A private non-blocking
+		/// description waits for readiness and takes what fits; a blocking
+		/// one writes on the blocking pool, never on a runtime worker, and
+		/// without any readiness: after a write that took the room, an
+		/// edge-triggered wait may get no new edge while the reader keeps up.
 		pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
-			while !buf.is_empty() {
-				let mut guard = self.afd.writable().await?;
-				let fd = self.afd.get_ref().as_fd();
-				if self.gated && !writable_now(fd)? {
-					guard.clear_ready();
-					continue;
-				}
-				let room = if self.gated {
-					free_space(fd).unwrap_or(ATOMIC_WRITE).min(ATOMIC_WRITE).clamp(1, buf.len())
-				} else {
-					buf.len()
-				};
-				if self.blocking_writes {
-					guard.clear_ready();
-					drop(guard);
-					let file = self.afd.get_ref().try_clone()?;
-					let bytes = buf[..room].to_vec();
-					let written = tokio::task::spawn_blocking(move || {
-						sys_write(file.as_raw_fd(), &bytes)
+			if let Some(file) = &self.blocking {
+				while !buf.is_empty() {
+					let chunk = buf.len().min(BLOCKING_WRITE_CHUNK);
+					let (file, bytes) = (Arc::clone(file), buf[..chunk].to_vec());
+					tokio::task::spawn_blocking(move || {
+						use std::io::Write as _;
+						(&*file).write_all(&bytes)
 					})
 					.await
 					.map_err(io::Error::other)??;
-					if written == 0 {
-						return Err(io::ErrorKind::WriteZero.into());
-					}
-					buf = &buf[written..];
-					continue;
+					buf = &buf[chunk..];
 				}
-				match guard.try_io(|afd| sys_write(afd.get_ref().as_raw_fd(), &buf[..room])) {
+				return Ok(());
+			}
+			while !buf.is_empty() {
+				let mut guard = self.afd.writable().await?;
+				match guard.try_io(|afd| sys_write(afd.get_ref().as_raw_fd(), buf)) {
 					Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
 					Ok(Ok(written)) => buf = &buf[written..],
 					Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {},
@@ -727,7 +737,7 @@ mod descriptor {
 		let reopened = unsafe {
 			libc::open(
 				path.as_ptr(),
-				(flags & libc::O_ACCMODE) | libc::O_NONBLOCK | libc::O_CLOEXEC,
+				(flags & libc::O_ACCMODE) | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
 			)
 		};
 		if reopened < 0 {
@@ -736,6 +746,21 @@ mod descriptor {
 			// SAFETY: `open` returned one fresh descriptor.
 			Ok(unsafe { OwnedFd::from_raw_fd(reopened) })
 		}
+	}
+
+	/// Whether `fd` is a pipe or FIFO: the only kind whose reopen has no side
+	/// effects (a device's open runs again: `/dev/ptmx` makes a new pty).
+	#[cfg(target_os = "linux")]
+	fn is_fifo(fd: BorrowedFd<'_>) -> bool {
+		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `stat` is valid for writes of one `struct stat`; `fd` is
+		// borrowed from a live descriptor for the call.
+		if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+			return false;
+		}
+		// SAFETY: a successful `fstat` filled the whole struct.
+		let stat = unsafe { stat.assume_init() };
+		stat.st_mode & libc::S_IFMT == libc::S_IFIFO
 	}
 
 	/// Whether `fd` is a FIFO with a name on an Apple platform (an anonymous
@@ -768,65 +793,6 @@ mod descriptor {
 				result => return result,
 			}
 		}
-	}
-
-	/// Whether a write to `fd` would not block, checked without waiting.
-	fn writable_now(fd: BorrowedFd<'_>) -> io::Result<bool> {
-		let mut pollfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
-		loop {
-			// SAFETY: one `pollfd` valid for the call; `fd` is borrowed from a
-			// live descriptor for the whole call.
-			match unsafe { libc::poll(&raw mut pollfd, 1, 0) } {
-				..0 => {
-					let error = io::Error::last_os_error();
-					if error.kind() != io::ErrorKind::Interrupted {
-						return Err(error);
-					}
-				},
-				ready => return Ok(ready > 0),
-			}
-		}
-	}
-
-	/// Bytes a pipe accepts without blocking (its capacity less what is
-	/// queued); `None` for other descriptors and when the platform does not
-	/// say.
-	#[cfg(any(target_os = "linux", target_os = "android"))]
-	fn free_space(fd: BorrowedFd<'_>) -> Option<usize> {
-		// SAFETY: `F_GETPIPE_SZ` takes no argument; `fd` is borrowed from a live
-		// descriptor for the call.
-		let capacity = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPIPE_SZ) };
-		let mut queued: libc::c_int = 0;
-		// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which is
-		// valid for the call; `fd` is borrowed from a live descriptor.
-		let status = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
-		if capacity < 0 || status < 0 {
-			return None;
-		}
-		usize::try_from(capacity.saturating_sub(queued).max(0)).ok()
-	}
-
-	/// Bytes a pipe accepts without blocking (its block size less what is
-	/// queued); `None` for other descriptors and when the platform does not
-	/// say.
-	#[cfg(not(any(target_os = "linux", target_os = "android")))]
-	fn free_space(fd: BorrowedFd<'_>) -> Option<usize> {
-		use std::mem::MaybeUninit;
-
-		let mut stat = MaybeUninit::<libc::stat>::uninit();
-		// SAFETY: `stat` is valid for writes of one `struct stat`; `fd` is
-		// borrowed from a live descriptor for the call.
-		if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-			return None;
-		}
-		// SAFETY: a successful `fstat` filled the whole struct.
-		let stat = unsafe { stat.assume_init() };
-		if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
-			return None;
-		}
-		let block = usize::try_from(stat.st_blksize).ok().filter(|&block| block > 0)?;
-		let queued = usize::try_from(stat.st_size).ok()?;
-		Some(block.saturating_sub(queued))
 	}
 }
 
@@ -936,6 +902,86 @@ mod tests {
 			written.unwrap();
 		});
 		drop(done);
+	}
+
+	/// A descriptor whose private reopen failed (a pipe of another user, no
+	/// `/proc`, a socket) writes on the blocking pool. A drain of many
+	/// chunks must finish while the reader keeps up: a wait for an
+	/// edge-triggered writability edge after each write would depend on an
+	/// edge the kernel need not send. The bound runs on a thread of its own.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_drain_without_a_private_reopen_finishes_while_the_reader_keeps_up() {
+		use std::{
+			sync::mpsc::{RecvTimeoutError, channel},
+			time::Duration,
+		};
+
+		const TOTAL: usize = 64 * 4096;
+		let (mut reader, writer) = std::io::pipe().unwrap();
+		let reading = std::thread::spawn(move || {
+			let mut all = Vec::new();
+			reader.read_to_end(&mut all).unwrap();
+			all.len()
+		});
+		let (done, finished) = channel::<()>();
+		std::thread::spawn(move || {
+			if finished.recv_timeout(Duration::from_secs(10)) == Err(RecvTimeoutError::Timeout) {
+				eprintln!("DEADLINE fired: a drain without a private reopen did not finish within 10s");
+				std::process::exit(1);
+			}
+		});
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let descriptor = descriptor::Descriptor::gated_without_reopen(OwnedFd::from(writer)).unwrap();
+			for chunk in vec![b'x'; TOTAL].chunks(4096) {
+				descriptor.write_all(chunk).await.unwrap();
+			}
+		});
+		drop(runtime);
+		assert_eq!(reading.join().unwrap(), TOTAL);
+		drop(done);
+	}
+
+	/// Only a pipe or FIFO is reopened through `/proc/self/fd`: a device's
+	/// open runs again on a reopen, and `/dev/ptmx` then makes a new pty
+	/// pair. So the descriptor `Descriptor::gated` registers for a pty
+	/// master must be that master's own pty (`TIOCGPTN` gives the same
+	/// number); a reopen holds a new one.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_terminal_descriptor_is_not_reopened() {
+		use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd};
+
+		let number = |fd: BorrowedFd<'_>| {
+			let mut number: libc::c_uint = 0;
+			// SAFETY: `TIOCGPTN` writes one `c_uint` through the pointer, which
+			// is valid for the call; `fd` is borrowed from a live descriptor.
+			let status = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGPTN, &raw mut number) };
+			assert_eq!(status, 0, "TIOCGPTN: {}", io::Error::last_os_error());
+			number
+		};
+		// SAFETY: plain call; returns a new fd or -1, checked below.
+		let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+		assert!(master >= 0, "posix_openpt: {}", io::Error::last_os_error());
+		// SAFETY: `master` is a fresh fd this test owns from here on.
+		let master = unsafe { OwnedFd::from_raw_fd(master) };
+		let pty = number(master.as_fd());
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let descriptor = runtime
+			.block_on(async { descriptor::Descriptor::gated(master) })
+			.unwrap_or_else(|_| panic!("a pty master registers with the reactor"));
+		assert_eq!(
+			number(descriptor.as_fd()),
+			pty,
+			"Descriptor::gated reopened the pty master: it holds a new pty"
+		);
 	}
 }
 

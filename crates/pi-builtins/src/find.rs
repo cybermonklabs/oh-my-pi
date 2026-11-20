@@ -5200,9 +5200,13 @@ async fn run_find(
 	ret
 }
 
+/// Writes through [`Host::stdout_writer`]: find is an async utility, whose
+/// raw `host.stdout` would write on the runtime worker, where a full output
+/// pipe holds it.
 fn print_help(host: &mut Host) {
+	let mut out = host.stdout_writer();
 	let _ = writeln!(
-		&mut host.stdout,
+		out,
 		r"Usage: find [path...] [expression]
 
 If no path is supplied then the current working directory is used by default.
@@ -5249,7 +5253,8 @@ Early alpha implementation. Currently the only expressions supported are
 }
 
 fn print_version(host: &mut Host) {
-	let _ = writeln!(host.stdout, "find (Rust) 0.8.0");
+	let mut out = host.stdout_writer();
+	let _ = writeln!(out, "find (Rust) 0.8.0");
 }
 
 /// pi-uutils: BSD `find -E` compatibility (macOS muscle memory).

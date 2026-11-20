@@ -214,10 +214,11 @@ pub async fn run(invocation: Invocation) -> i32 {
 	if let Some(extra) = find(&invocation.name) {
 		return (extra.run)(invocation).await;
 	}
-	let Invocation { name, stdio: [_, _, stderr], .. } = invocation;
+	let Invocation { name, stdio: [_, _, stderr], cancel, .. } = invocation;
 	crate::host::report_async(
 		crate::openfile::OpenFile::from_fd(stderr),
 		format!("{name}: not a pi extra\n"),
+		cancel,
 	)
 	.await;
 	127

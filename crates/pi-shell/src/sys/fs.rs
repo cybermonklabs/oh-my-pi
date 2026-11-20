@@ -6,13 +6,16 @@
 //! pending open releases the helper).
 //!
 //! Reads and writes on pipes, FIFOs, sockets and terminals never wait in the
-//! kernel on Unix: the other end may be a vproc of the same engine (a FIFO, a
-//! `/dev/fd/N` of a process substitution), and a terminal read must not stop
-//! the scheduler (`read -t` timers, other vprocs). [`StdFile`] checks
-//! readiness first and returns `Pending` with the waker registered on the
-//! shared readiness thread (`ready`); the descriptor's flags stay untouched,
-//! since externals inherit them. Windows pipes and consoles keep blocking
-//! I/O (anonymous pipes cannot be polled).
+//! kernel on a scheduler thread on Unix: the other end may be a vproc of the
+//! same engine (a FIFO, a `/dev/fd/N` of a process substitution), and a
+//! terminal read must not stop the scheduler (`read -t` timers, other
+//! vprocs). [`StdFile`] checks readiness first and returns `Pending` with
+//! the waker registered on the shared readiness thread (`ready`); the
+//! descriptor's flags stay untouched, since externals inherit them. A write
+//! goes through a private non-blocking description of the pipe (Linux,
+//! reopened through `/proc/self/fd`), or else to a writer thread of the
+//! descriptor's own ([`BlockingWriter`]). Windows pipes and consoles keep
+//! blocking I/O (anonymous pipes cannot be polled).
 //!
 //! Windows specifics: `test -x` holds for directories, files with a
 //! `PATHEXT` extension and files starting with `#!`; process substitution
@@ -20,9 +23,12 @@
 //! the engine asks for [`TempPurpose::HereDoc`], e.g. for a consumer that
 //! must seek).
 
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(unix)]
+use std::{collections::VecDeque, sync::Arc, task::Waker};
 use std::{
 	fs::{self, OpenOptions},
-	future::Future,
 	io::{self, IsTerminal, Read, Seek, Write},
 	path::Path,
 	sync::atomic::{AtomicU32, Ordering},
@@ -55,49 +61,170 @@ pub struct StdFile {
 	/// dropped, and forgotten by the waiting thread, before `file` closes.
 	#[cfg(unix)]
 	watch:          Option<crate::sys::ready::Watch>,
-	/// A write running outside the scheduler worker where Linux cannot make
-	/// a private non-blocking pipe description. Declared before `file`, so a
-	/// detached blocking task keeps its clone rather than this descriptor.
+	/// Writes for a descriptor with no private non-blocking description,
+	/// started on the first such write.
 	#[cfg(unix)]
-	pending_write:  Option<PendingWrite>,
+	writer:         Option<BlockingWriter>,
 	/// Linux only: a fresh non-blocking open file description of a pipe's
-	/// write end. Externals retain the blocking description they inherited.
+	/// write end. Externals keep the blocking description they inherited.
 	#[cfg(target_os = "linux")]
 	private_writer: Option<fs::File>,
+	/// Test only: runs after the readiness check and before the write.
+	#[cfg(all(test, unix))]
+	before_write:   Option<TestHook>,
 	file:           fs::File,
 	kind:           FileKind,
 	/// Access mode of the open file description (`O_ACCMODE` bits of
 	/// `F_GETFL`; `None` when unknown).
 	#[cfg(unix)]
 	access:         Option<libc::c_int>,
-	/// Advisory pipe capacity cached at construction; saves one
-	/// `fcntl(F_GETPIPE_SZ)` per write. `F_SETPIPE_SZ` can change it, but a
-	/// stale value reaches a private `O_NONBLOCK` write (EAGAIN) or the
-	/// blocking-pool fallback, never a shared runtime worker.
-	#[cfg(any(target_os = "linux", target_os = "android"))]
-	pipe_capacity:  Option<i32>,
 }
 
-/// A write moved off the shared scheduler worker. Tokio's blocking pool
-/// serves real shell runs; the thread fallback lets direct engine tests run
-/// without a Tokio runtime.
+/// How long a write waits before it tries again when the pipe polls
+/// writable but took nothing: a readiness watch would fire at once.
+#[cfg(target_os = "linux")]
+const WRITE_RETRY: Duration = Duration::from_millis(5);
+
+/// The most one hand-off to a [`BlockingWriter`] copies.
+#[cfg(unix)]
+const BLOCKING_WRITE_CHUNK: usize = 64 << 10;
+
+/// Finished writes a [`BlockingWriter`] keeps for writers that have not
+/// collected them: a write whose future was dropped is never collected.
+#[cfg(unix)]
+const UNCOLLECTED_LIMIT: usize = 64;
+
+/// The write for a descriptor whose writes may wait in the kernel and that
+/// has no private non-blocking description: every Darwin pipe, FIFO and
+/// terminal; on Linux a terminal, a socket, or a pipe whose reopen failed.
+/// One thread of its own writes one chunk at a time, in order, with a
+/// blocking `write(2)`, so the wait is never on a scheduler thread.
+///
+/// A write is `Pending` until its chunk is in the kernel, and `Ready` with
+/// that write's own count. Writers that share the file (dups of one fd)
+/// each collect their own result: a finished chunk belongs to the poll
+/// whose buffer starts with exactly that chunk, as the poll that handed it
+/// off passes again. Another writer waits until the thread is free.
 #[cfg(unix)]
 #[derive(Debug)]
-enum PendingWrite {
-	Blocking(tokio::task::JoinHandle<io::Result<usize>>),
-	Thread(tokio::sync::oneshot::Receiver<io::Result<usize>>),
+struct BlockingWriter {
+	jobs:  std::sync::mpsc::Sender<Arc<[u8]>>,
+	state: Arc<parking_lot::Mutex<WriterState>>,
 }
 
-/// Exercises the portable blocking-pool path on Linux too. Each nextest case
-/// runs in a separate process, so the test-only switch cannot affect another
-/// case.
-#[cfg(test)]
-static FORCE_BLOCKING_POOL_WRITES: std::sync::atomic::AtomicBool =
-	std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct WriterState {
+	/// The bytes the thread writes now.
+	in_flight: Option<Arc<[u8]>>,
+	/// Finished writes not yet collected, oldest first.
+	finished:  VecDeque<(Arc<[u8]>, io::Result<usize>)>,
+	/// Writers to wake when the thread finishes a write.
+	wakers:    Vec<Waker>,
+}
 
-#[cfg(test)]
-pub(crate) fn force_blocking_pool_writes_for_test(on: bool) {
-	FORCE_BLOCKING_POOL_WRITES.store(on, std::sync::atomic::Ordering::Relaxed);
+#[cfg(unix)]
+impl BlockingWriter {
+	fn start(file: &fs::File) -> io::Result<Self> {
+		let mut file = file.try_clone()?;
+		let (jobs, queue) = std::sync::mpsc::channel::<Arc<[u8]>>();
+		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
+		let shared = Arc::clone(&state);
+		std::thread::Builder::new()
+			.name("obash-write".into())
+			.stack_size(64 << 10)
+			.spawn(move || {
+				// Ends once the `StdFile` is dropped and the last write is done.
+				while let Ok(bytes) = queue.recv() {
+					let result = loop {
+						match file.write(&bytes) {
+							Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+							result => break result,
+						}
+					};
+					let wakers = {
+						let mut s = shared.lock();
+						s.in_flight = None;
+						if s.finished.len() == UNCOLLECTED_LIMIT {
+							s.finished.pop_front();
+						}
+						s.finished.push_back((bytes, result));
+						std::mem::take(&mut s.wakers)
+					};
+					for waker in wakers {
+						waker.wake();
+					}
+				}
+			})?;
+		Ok(Self { jobs, state })
+	}
+
+	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		let chunk = &buf[..buf.len().min(BLOCKING_WRITE_CHUNK)];
+		let mut s = self.state.lock();
+		if let Some(i) = s.finished.iter().position(|(bytes, _)| **bytes == *chunk)
+			&& let Some((_, result)) = s.finished.remove(i)
+		{
+			return Poll::Ready(result);
+		}
+		if s.in_flight.is_none() {
+			let bytes: Arc<[u8]> = Arc::from(chunk);
+			if self.jobs.send(Arc::clone(&bytes)).is_err() {
+				return Poll::Ready(Err(io::Error::other("the writer thread stopped")));
+			}
+			s.in_flight = Some(bytes);
+		}
+		if !s.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+			s.wakers.push(cx.waker().clone());
+		}
+		Poll::Pending
+	}
+}
+
+/// A test's callback in the write path.
+#[cfg(all(test, unix))]
+pub(crate) struct TestHook(pub(crate) Box<dyn FnMut() + Send>);
+
+#[cfg(all(test, unix))]
+impl std::fmt::Debug for TestHook {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("TestHook")
+	}
+}
+
+/// Set in a test's child process: every `StdFile` there takes the
+/// [`BlockingWriter`] route, the only one Darwin has, on Linux too.
+#[cfg(all(test, target_os = "linux"))]
+const FORCE_BLOCKING_WRITER_ENV: &str = "PI_SHELL_TEST_FORCE_BLOCKING_WRITER";
+
+#[cfg(all(test, target_os = "linux"))]
+static FORCE_BLOCKING_WRITER: std::sync::LazyLock<bool> =
+	std::sync::LazyLock::new(|| std::env::var_os(FORCE_BLOCKING_WRITER_ENV).is_some());
+
+/// Runs `body` in a child process of this test binary where every
+/// `StdFile` takes the [`BlockingWriter`] route. `test` is the test's full
+/// path (`module_path!()` and its name): the child runs exactly that test,
+/// which then runs `body`. A process of its own keeps the route from
+/// reaching the tests that run beside it in one process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn in_blocking_writer_process(test: &str, body: impl FnOnce()) {
+	if *FORCE_BLOCKING_WRITER {
+		body();
+		return;
+	}
+	let name = test.split_once("::").map_or(test, |(_, rest)| rest);
+	let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+		.args([name, "--exact", "--nocapture", "--test-threads=1"])
+		.env(FORCE_BLOCKING_WRITER_ENV, "1")
+		.output()
+		.expect("run the test in a child process");
+	let stdout = String::from_utf8_lossy(&out.stdout);
+	assert!(
+		out.status.success() && stdout.contains("1 passed"),
+		"the child run of {name} failed ({}):\n{stdout}\n{}",
+		out.status,
+		String::from_utf8_lossy(&out.stderr)
+	);
 }
 
 /// Reopen a Linux pipe through procfs, producing a distinct non-blocking open
@@ -108,8 +235,19 @@ fn private_nonblocking_writer(file: &fs::File) -> io::Result<fs::File> {
 
 	OpenOptions::new()
 		.write(true)
-		.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+		.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
 		.open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// One write, again on `EINTR`.
+#[cfg(target_os = "linux")]
+fn write_once(mut file: &fs::File, buf: &[u8]) -> io::Result<usize> {
+	loop {
+		match file.write(buf) {
+			Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+			result => return result,
+		}
+	}
 }
 
 impl StdFile {
@@ -135,27 +273,15 @@ impl StdFile {
 				(flags >= 0).then_some(flags & libc::O_ACCMODE)
 			})
 			.flatten();
-		#[cfg(any(target_os = "linux", target_os = "android"))]
-		let pipe_capacity = (kind == FileKind::Pipe)
-			.then(|| {
-				use std::os::fd::AsRawFd;
-				// SAFETY: F_GETPIPE_SZ only inspects this live descriptor.
-				let cap = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPIPE_SZ) };
-				(cap > 0).then_some(cap)
-			})
-			.flatten();
 		#[cfg(all(target_os = "linux", test))]
-		let force_blocking_pool =
-			FORCE_BLOCKING_POOL_WRITES.load(std::sync::atomic::Ordering::Relaxed);
+		let force_blocking_writer = *FORCE_BLOCKING_WRITER;
 		#[cfg(all(target_os = "linux", not(test)))]
-		let force_blocking_pool = false;
+		let force_blocking_writer = false;
 		#[cfg(target_os = "linux")]
-		let private_writer = (!force_blocking_pool
+		let private_writer = (!force_blocking_writer
 			&& kind == FileKind::Pipe
 			&& access.is_none_or(|access| access == libc::O_WRONLY || access == libc::O_RDWR))
-		.then(|| private_nonblocking_writer(&file))
-		.transpose()
-		.ok()
+		.then(|| private_nonblocking_writer(&file).ok())
 		.flatten();
 		Self {
 			file,
@@ -163,14 +289,27 @@ impl StdFile {
 			#[cfg(unix)]
 			watch: None,
 			#[cfg(unix)]
-			pending_write: None,
+			writer: None,
 			#[cfg(target_os = "linux")]
 			private_writer,
+			#[cfg(all(test, unix))]
+			before_write: None,
 			#[cfg(unix)]
 			access,
-			#[cfg(any(target_os = "linux", target_os = "android"))]
-			pipe_capacity,
 		}
+	}
+
+	/// Test only: run `hook` in every write, after the readiness check and
+	/// before the `write(2)`.
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) fn set_before_write(&mut self, hook: impl FnMut() + Send + 'static) {
+		self.before_write = Some(TestHook(Box::new(hook)));
+	}
+
+	/// Whether writes go through a private non-blocking description.
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) const fn has_private_writer(&self) -> bool {
+		self.private_writer.is_some()
 	}
 
 	/// Whether I/O in this direction must wait for readiness instead of
@@ -223,133 +362,143 @@ impl StdFile {
 		}
 	}
 
-	/// Write what fits without waiting, as long as the descriptor stays
-	/// writable: per readiness check, at most the room
-	/// [`ready::write_room`](crate::sys::ready::write_room) measures. On
-	/// Linux a private non-blocking open file description closes the measure →
-	/// write race; elsewhere a blocking write runs on the blocking pool.
-	#[cfg(unix)]
-	fn write_ready(&self, buf: &[u8]) -> io::Result<usize> {
+	/// Waits after a write that took nothing. A competing writer that took
+	/// the room leaves the pipe unwritable: wait for readiness. A pipe that
+	/// still polls writable (gVisor, with less free than the write needs)
+	/// would wake a watch at once, so try again after [`WRITE_RETRY`].
+	/// `Ok` means `Pending`, with a wake registered.
+	#[cfg(target_os = "linux")]
+	fn wait_for_room(&mut self, cx: &Context<'_>) -> io::Result<()> {
 		use std::os::fd::AsRawFd;
 
 		use crate::sys::ready;
-		let fd = self.file.as_raw_fd();
-		#[cfg(target_os = "linux")]
-		let mut writer = self.private_writer.as_ref().unwrap_or(&self.file);
-		#[cfg(not(target_os = "linux"))]
-		let mut writer = &self.file;
-		let mut done = 0;
-		while done < buf.len() {
-			if done > 0 && !ready::now(fd, ready::WRITE)? {
-				break;
-			}
-			#[cfg(any(target_os = "linux", target_os = "android"))]
-			let room = ready::write_room_with_capacity(fd, self.pipe_capacity);
-			#[cfg(not(any(target_os = "linux", target_os = "android")))]
-			let room = ready::write_room(fd);
-			if room == 0 {
-				break;
-			}
-			let end = buf.len().min(done + room);
-			match writer.write(&buf[done..end]) {
-				Ok(n) => done += n,
-				Err(e) if done > 0 && e.kind() != io::ErrorKind::Interrupted => break,
-				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
-				Err(e) => return Err(e),
-			}
+		if ready::now(self.file.as_raw_fd(), ready::WRITE)? {
+			return ready::wake_after(cx.waker(), WRITE_RETRY);
 		}
-		Ok(done)
+		match self.ready(cx, ready::WRITE) {
+			// It drained since the check: try again at once.
+			Poll::Ready(Ok(())) => {
+				cx.waker().wake_by_ref();
+				Ok(())
+			},
+			Poll::Ready(Err(e)) => Err(e),
+			Poll::Pending => Ok(()),
+		}
 	}
 
-	/// Poll a blocking write outside the shared scheduler worker. This is the
-	/// Darwin and procfs-unavailable fallback: it can occupy a blocking-pool
-	/// thread, never the worker that drains the pipe or fires its timeout.
-	#[cfg(unix)]
-	fn poll_blocking_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		if let Some(pending) = &mut self.pending_write {
-			let result = match pending {
-				PendingWrite::Blocking(task) => std::pin::Pin::new(task)
-					.poll(cx)
-					.map(|result| result.unwrap_or_else(|error| Err(io::Error::other(error)))),
-				PendingWrite::Thread(receiver) => std::pin::Pin::new(receiver)
-					.poll(cx)
-					.map(|result| result.unwrap_or_else(|_| Err(io::ErrorKind::Interrupted.into()))),
-			};
-			if let Poll::Ready(result) = result {
-				self.pending_write = None;
-				return Poll::Ready(result);
-			}
-			return Poll::Pending;
-		}
+	/// A write on the private non-blocking description: as much of `buf` as
+	/// the pipe takes, or `Pending` with nothing written. gVisor fails a
+	/// write larger than the free space with `EAGAIN` while the pipe polls
+	/// writable, so a write that took nothing is tried once more with what
+	/// [`write_room`](crate::sys::ready::write_room) measures.
+	#[cfg(target_os = "linux")]
+	fn poll_private_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		use std::os::fd::AsRawFd;
 
-		let mut file = match self.file.try_clone() {
-			Ok(file) => file,
-			Err(error) => return Poll::Ready(Err(error)),
+		use crate::sys::ready;
+		if let Err(e) = std::task::ready!(self.ready(cx, ready::WRITE)) {
+			return Poll::Ready(Err(e));
+		}
+		#[cfg(test)]
+		if let Some(hook) = self.before_write.as_mut() {
+			(hook.0)();
+		}
+		let Some(writer) = self.private_writer.as_ref() else {
+			return Poll::Ready(Err(io::Error::other("no private writer")));
 		};
-		let bytes = buf.to_vec();
-		let pending = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-			PendingWrite::Blocking(handle.spawn_blocking(move || file.write(&bytes)))
-		} else {
-			let (sender, receiver) = tokio::sync::oneshot::channel();
-			match std::thread::Builder::new()
-				.name("obash-write".into())
-				.spawn(move || {
-					let _ = sender.send(file.write(&bytes));
-				}) {
-				Ok(_) => PendingWrite::Thread(receiver),
-				Err(error) => return Poll::Ready(Err(error)),
+		match write_once(writer, buf) {
+			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+			done => return Poll::Ready(done),
+		}
+		let room = ready::write_room(self.file.as_raw_fd());
+		if room > 0 && room < buf.len() {
+			match write_once(writer, &buf[..room]) {
+				Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+				done => return Poll::Ready(done),
 			}
-		};
-		self.pending_write = Some(pending);
-		cx.waker().wake_by_ref();
-		Poll::Pending
+		}
+		match self.wait_for_room(cx) {
+			Ok(()) => Poll::Pending,
+			Err(e) => Poll::Ready(Err(e)),
+		}
+	}
+
+	/// A write handed to this descriptor's [`BlockingWriter`], started on
+	/// the first one.
+	#[cfg(unix)]
+	fn poll_blocking_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		if self.writer.is_none() {
+			match BlockingWriter::start(&self.file) {
+				Ok(writer) => self.writer = Some(writer),
+				Err(e) => return Poll::Ready(Err(e)),
+			}
+		}
+		#[cfg(test)]
+		if let Some(hook) = self.before_write.as_mut() {
+			(hook.0)();
+		}
+		match &self.writer {
+			Some(writer) => writer.poll_write(cx, buf),
+			None => Poll::Ready(Err(io::Error::other("no writer thread"))),
+		}
 	}
 
 	/// Writes `buf` as one atomic pipe record, or waits without writing
-	/// anything. The caller must keep `buf` at most [`WRITE_CHUNK`]; this is
-	/// used for status lines, which must not be left as fragments.
+	/// anything. The caller keeps `buf` at most `PIPE_BUF`
+	/// ([`WRITE_CHUNK`](crate::sys::ready::WRITE_CHUNK)), which a pipe takes
+	/// whole or not at all; this is for status lines, which must not be left
+	/// as fragments.
 	#[cfg(unix)]
 	pub(crate) fn poll_write_atomic(
 		&mut self,
-		cx: &mut Context<'_>,
+		cx: &Context<'_>,
 		buf: &[u8],
 	) -> Poll<io::Result<()>> {
 		if buf.len() > crate::sys::ready::WRITE_CHUNK {
 			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
 		}
-		if self.gated(true) && !buf.is_empty() {
-			if let Err(error) = std::task::ready!(self.ready(cx, crate::sys::ready::WRITE)) {
-				return Poll::Ready(Err(error));
-			}
-			#[cfg(target_os = "linux")]
-			if let Some(writer) = self.private_writer.as_mut() {
-				use std::os::fd::AsRawFd;
+		if !self.gated(true) || buf.is_empty() {
+			return Poll::Ready(self.file.write_all(buf));
+		}
+		#[cfg(target_os = "linux")]
+		if self.private_writer.is_some() {
+			use std::os::fd::AsRawFd;
 
-				if crate::sys::ready::write_room_with_capacity(
-					self.file.as_raw_fd(),
-					self.pipe_capacity,
-				) < buf.len()
-				{
-					cx.waker().wake_by_ref();
-					return Poll::Pending;
-				}
-				return match writer.write(buf) {
-					Ok(n) if n == buf.len() => Poll::Ready(Ok(())),
-					Ok(_) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
-					Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-						cx.waker().wake_by_ref();
-						Poll::Pending
-					},
-					Err(error) => Poll::Ready(Err(error)),
-				};
+			use crate::sys::ready;
+			if let Err(e) = std::task::ready!(self.ready(cx, ready::WRITE)) {
+				return Poll::Ready(Err(e));
 			}
-			return match self.poll_blocking_write(cx, buf) {
-				Poll::Ready(Ok(n)) if n == buf.len() => Poll::Ready(Ok(())),
-				Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
-				Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-				Poll::Pending => Poll::Pending,
+			if ready::write_room(self.file.as_raw_fd()) >= buf.len()
+				&& let Some(writer) = self.private_writer.as_ref()
+			{
+				match write_once(writer, buf) {
+					Ok(n) if n == buf.len() => return Poll::Ready(Ok(())),
+					Ok(_) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+					Err(e) => return Poll::Ready(Err(e)),
+				}
+			}
+			return match self.wait_for_room(cx) {
+				Ok(()) => Poll::Pending,
+				Err(e) => Poll::Ready(Err(e)),
 			};
 		}
+		match self.poll_blocking_write(cx, buf) {
+			Poll::Ready(Ok(n)) if n == buf.len() => Poll::Ready(Ok(())),
+			Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	/// Windows has no pollable anonymous-pipe writes; its synchronous write
+	/// remains the platform implementation of this status path.
+	#[cfg(not(unix))]
+	pub(crate) fn poll_write_atomic(
+		&mut self,
+		_cx: &Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<()>> {
 		Poll::Ready(self.file.write_all(buf))
 	}
 }
@@ -436,35 +585,13 @@ impl File for StdFile {
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		#[cfg(unix)]
 		if self.gated(true) && !buf.is_empty() {
-			if let Err(e) = std::task::ready!(self.ready(cx, crate::sys::ready::WRITE)) {
-				return Poll::Ready(Err(e));
-			}
 			#[cfg(target_os = "linux")]
 			if self.private_writer.is_some() {
-				return match self.write_ready(buf) {
-					Ok(0) => {
-						// A competing writer consumed the room.
-						cx.waker().wake_by_ref();
-						Poll::Pending
-					},
-					Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-						// The private description returned EAGAIN instead of
-						// sleeping in the kernel.
-						cx.waker().wake_by_ref();
-						Poll::Pending
-					},
-					done => Poll::Ready(done),
-				};
+				return self.poll_private_write(cx, buf);
 			}
-			#[cfg(unix)]
-			{
-				use std::os::fd::AsRawFd;
-
-				// Darwin has no procfs re-open route; a failed Linux reopen
-				// also reaches this safe fallback.
-				let room = crate::sys::ready::write_room(self.file.as_raw_fd()).max(1);
-				return self.poll_blocking_write(cx, &buf[..buf.len().min(room)]);
-			}
+			// No readiness check first: the writer thread waits instead, and
+			// a finished write is collected even when the pipe is full again.
+			return self.poll_blocking_write(cx, buf);
 		}
 		#[cfg(not(unix))]
 		let _ = cx;
@@ -1350,27 +1477,60 @@ mod tests {
 			assert_ne!(private & libc::O_NONBLOCK, 0, "shell's private writer is nonblocking");
 		}
 
-		/// A writer can consume the room after `POLLOUT` but before this
-		/// writer reaches `write(2)`. The private description returns EAGAIN
-		/// in that window instead of sleeping in the kernel.
+		/// A rival writer can take the room after `POLLOUT` and before this
+		/// writer's `write(2)`. The write goes through the private
+		/// non-blocking description, so it is `Pending` with nothing written,
+		/// not a wait in the kernel. Drives `poll_write`; a write through the
+		/// inherited blocking description waits here until the deadline.
 		#[cfg(target_os = "linux")]
 		#[test]
-		fn competing_writer_after_poll_gets_eagain_not_a_wait() {
+		fn a_rival_that_takes_the_room_after_the_poll_leaves_the_write_pending() {
 			use std::os::fd::AsRawFd;
 
 			let (mut writer, reader) = pipe_with_free(libc::PIPE_BUF);
-			assert!(
-				crate::sys::ready::now(writer.file.as_raw_fd(), crate::sys::ready::WRITE).unwrap()
-			);
-			writer
-				.file
-				.try_clone()
-				.unwrap()
-				.write_all(&vec![b'c'; libc::PIPE_BUF])
-				.unwrap();
-			let private = writer.private_writer.as_mut().unwrap();
-			let error = private.write(b"x").unwrap_err();
-			assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+			assert!(writer.has_private_writer(), "the pipe was reopened");
+			let mut rival = writer.file.try_clone().unwrap();
+			writer.set_before_write(move || rival.write_all(&[b'c'; libc::PIPE_BUF]).unwrap());
+			let finished =
+				deadline("poll_write after a rival filled the pipe", Duration::from_secs(2));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(wrote.is_pending(), "{wrote:?}");
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer; `reader`
+			// owns the fd.
+			let status =
+				unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD as _, &raw mut queued) };
+			assert_eq!(status, 0);
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let capacity = unsafe { libc::fcntl(writer.file.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			assert_eq!(queued, capacity, "only the rival's bytes are in the pipe");
+			drop(reader);
+		}
+
+		/// `F_SETPIPE_SZ` can grow a pipe after its writer was wrapped. A write
+		/// then has the new room: a capacity measured before would see the
+		/// old capacity queued, find no room, and wake itself while the pipe
+		/// polls writable.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_pipe_grown_after_wrapping_takes_a_write_into_its_new_room() {
+			use std::os::fd::AsRawFd;
+
+			let (reader, w) = io::pipe().unwrap();
+			let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+			let fd = writer.file.as_raw_fd();
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let old = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+			// SAFETY: `F_SETPIPE_SZ` takes an int; `writer` owns the fd.
+			let grown = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 2 * old) };
+			assert!(grown >= 2 * old, "F_SETPIPE_SZ: {grown}: {}", io::Error::last_os_error());
+			let queued = vec![b'q'; usize::try_from(old).unwrap()];
+			writer.file.try_clone().unwrap().write_all(&queued).unwrap();
+			let finished = deadline("poll_write into a grown pipe", Duration::from_secs(2));
+			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
+			drop(finished);
+			assert!(matches!(wrote, Poll::Ready(Ok(1))), "{wrote:?}");
 			drop(reader);
 		}
 
@@ -1379,11 +1539,31 @@ mod tests {
 		/// blocking write of at most `PIPE_BUF` bytes then waits until all of
 		/// it fits. Nothing reads this pipe, so such a wait never ends:
 		/// `poll_write` must write at most the free space, or be `Pending`.
-		#[cfg(any(target_os = "linux", target_os = "android"))]
+		#[cfg(target_os = "linux")]
 		#[test]
 		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_never_waits() {
+			write_into_less_than_pipe_buf_free(true);
+		}
+
+		/// The same through the writer thread, Darwin's only route, which this
+		/// test's child process forces on Linux.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_through_the_writer_thread_never_waits() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_write_to_a_pipe_with_less_than_pipe_buf_free_through_the_writer_thread_never_waits"
+				),
+				|| write_into_less_than_pipe_buf_free(false),
+			);
+		}
+
+		#[cfg(target_os = "linux")]
+		fn write_into_less_than_pipe_buf_free(private: bool) {
 			let free = libc::PIPE_BUF - 1;
 			let (mut writer, reader) = pipe_with_free(free);
+			assert_eq!(writer.has_private_writer(), private);
 			let buf = vec![b'x'; 2 * libc::PIPE_BUF];
 			let finished = deadline("poll_write with PIPE_BUF - 1 bytes free", Duration::from_secs(1));
 			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), &buf);
@@ -1398,15 +1578,105 @@ mod tests {
 			drop(reader);
 		}
 
-		/// The Darwin route is selectable on Linux: it moves the write to
-		/// Tokio's blocking pool, where the same full-pipe reproducer must
-		/// return Pending rather than hold a scheduler worker.
+		/// Two writers that share one descriptor (`echo AAAA & echo BBBB`)
+		/// each get their own write through the writer thread, once: B must
+		/// not take A's finished write as its own, and A must not write again.
 		#[cfg(target_os = "linux")]
 		#[test]
-		fn a_write_to_a_pipe_with_less_than_pipe_buf_free_through_blocking_pool_never_waits() {
-			force_blocking_pool_writes_for_test(true);
-			a_write_to_a_pipe_with_less_than_pipe_buf_free_never_waits();
-			force_blocking_pool_writes_for_test(false);
+		fn writers_sharing_the_writer_thread_each_get_their_own_write() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::writers_sharing_the_writer_thread_each_get_their_own_write"),
+				|| {
+					let (mut reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("two writers through the writer thread", Duration::from_secs(5));
+					let mut a = writer.poll_write(&mut cx, b"AAAA\n");
+					assert!(a.is_pending(), "{a:?}");
+					let mut first = [0u8; 5];
+					reader.read_exact(&mut first).unwrap();
+					assert_eq!(&first, b"AAAA\n");
+					// A's write is done and not yet collected when B polls.
+					let mut b = writer.poll_write(&mut cx, b"BBBB\n");
+					while a.is_pending() || b.is_pending() {
+						if a.is_pending() {
+							a = writer.poll_write(&mut cx, b"AAAA\n");
+						}
+						if b.is_pending() {
+							b = writer.poll_write(&mut cx, b"BBBB\n");
+						}
+						if a.is_pending() || b.is_pending() {
+							flag.wait("a write through the writer thread finished");
+						}
+					}
+					assert!(matches!(a, Poll::Ready(Ok(5))), "{a:?}");
+					assert!(matches!(b, Poll::Ready(Ok(5))), "{b:?}");
+					drop(writer);
+					let mut rest = Vec::new();
+					reader.read_to_end(&mut rest).unwrap();
+					drop(finished);
+					assert_eq!(rest, b"BBBB\n", "after A's line, only B's line, once");
+				},
+			);
+		}
+
+		/// A write through the writer thread that fills the pipe is collected
+		/// although the pipe is full again: the finished write is taken before
+		/// anything waits for room.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_write_that_fills_the_pipe_is_collected_while_the_pipe_is_full() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_write_that_fills_the_pipe_is_collected_while_the_pipe_is_full"
+				),
+				|| {
+					let (mut writer, reader) = pipe_with_free(libc::PIPE_BUF);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished =
+						deadline("collecting a write that filled the pipe", Duration::from_secs(5));
+					let buf = vec![b'x'; libc::PIPE_BUF];
+					let mut wrote = writer.poll_write(&mut cx, &buf);
+					while wrote.is_pending() {
+						flag.wait("the writer thread finished");
+						wrote = writer.poll_write(&mut cx, &buf);
+					}
+					drop(finished);
+					assert!(matches!(wrote, Poll::Ready(Ok(n)) if n == libc::PIPE_BUF), "{wrote:?}");
+					drop(reader);
+				},
+			);
+		}
+
+		/// A pipe that polls writable with less room than an atomic record
+		/// needs (gVisor reports `POLLOUT` with one byte free) is tried again
+		/// after a pause, not in a loop that wakes itself at once.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn an_atomic_record_that_does_not_fit_waits_without_spinning() {
+			let (mut writer, reader) = pipe_with_free(10);
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let cx = Context::from_waker(&waker);
+			let record = [b'r'; 20];
+			let start = Instant::now();
+			let mut polls = 0;
+			while start.elapsed() < Duration::from_millis(200) {
+				polls += 1;
+				let wrote = writer.poll_write_atomic(&cx, &record);
+				assert!(wrote.is_pending(), "{wrote:?}");
+				flag.wait_for(Duration::from_millis(200).saturating_sub(start.elapsed()));
+			}
+			assert!(polls < 100, "{polls} polls in 200 ms: the write wakes itself in a loop");
+			drop(reader);
 		}
 
 		/// A full pipe whose reader left has no room, yet a write to it does
@@ -1526,6 +1796,21 @@ mod tests {
 				while !self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
 					assert!(Instant::now() < deadline, "not woken: {what}");
 					thread::sleep(Duration::from_millis(5));
+				}
+			}
+
+			/// Waits up to `limit` for a wake; whether one came.
+			#[cfg(target_os = "linux")]
+			fn wait_for(&self, limit: Duration) -> bool {
+				let deadline = Instant::now() + limit;
+				loop {
+					if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+						return true;
+					}
+					if Instant::now() >= deadline {
+						return false;
+					}
+					thread::sleep(Duration::from_millis(1));
 				}
 			}
 		}
