@@ -80,15 +80,37 @@ impl Target {
 	}
 }
 
-/// The first of the characters that stand, in a pattern of [`pattern_text`],
-/// for its bytes that are no UTF-8: U+10FF80 for the byte 0x80 to U+10FFFF
-/// for 0xFF, characters of the private use plane 16. A pattern that also
-/// holds one of those characters as itself reads it as that byte.
-const RAW_BYTE_BASE: u32 = 0x10_FF00;
+/// The offset of the characters that stand for the bytes from 0x80 up where
+/// a text holds bytes that are no UTF-8, as `sed`'s byte text and a pattern
+/// of [`pattern_text`] hold them: the byte `b` (0x80 to 0xFF) is U+10FF00 +
+/// `b`, so U+10FF80 to U+10FFFF, characters of the private use plane 16. A
+/// text that also holds one of those characters as itself reads it as that
+/// byte.
+const BYTE_CHARS: u32 = 0x10_FF00;
+
+/// The character that stands for `byte` (see [`BYTE_CHARS`]); an ASCII byte
+/// is itself.
+#[cfg(any(feature = "util.grep", feature = "util.sed", test))]
+pub(crate) fn byte_char(byte: u8) -> char {
+	if byte.is_ascii() {
+		char::from(byte)
+	} else {
+		char::from_u32(BYTE_CHARS | u32::from(byte)).expect("U+10FF80 to U+10FFFF are scalar values")
+	}
+}
+
+/// The byte from 0x80 up that the character `c` stands for (see
+/// [`BYTE_CHARS`]), if it stands for one.
+pub(crate) fn char_byte(c: char) -> Option<u8> {
+	u32::from(c)
+		.checked_sub(BYTE_CHARS)
+		.and_then(|byte| u8::try_from(byte).ok())
+		.filter(|byte| !byte.is_ascii())
+}
 
 /// The text [`translate_raw`] reads for the pattern `bytes`: its UTF-8 as it
 /// is, and each byte that is no UTF-8 as the character that stands for it
-/// ([`raw_byte`]), with whether it holds such a byte. GNU grep reads a
+/// ([`byte_char`]), with whether it holds such a byte. GNU grep reads a
 /// pattern as its bytes: `grep $'\351'` selects a line holding the byte
 /// 0xE9.
 #[cfg(any(feature = "util.grep", test))]
@@ -99,7 +121,7 @@ pub(crate) fn pattern_text(bytes: &[u8]) -> (String, bool) {
 		text.push_str(chunk.valid());
 		for &byte in chunk.invalid() {
 			raw = true;
-			text.extend(char::from_u32(RAW_BYTE_BASE + u32::from(byte)));
+			text.push(byte_char(byte));
 		}
 	}
 	(text, raw)
@@ -111,19 +133,12 @@ pub(crate) fn pattern_text(bytes: &[u8]) -> (String, bool) {
 pub(crate) fn pattern_bytes(text: &str) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(text.len());
 	for c in text.chars() {
-		match raw_byte(c) {
+		match char_byte(c) {
 			Some(byte) => bytes.push(byte),
 			None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
 		}
 	}
 	bytes
-}
-
-/// The byte that is no UTF-8 the character `c` stands for in a pattern of
-/// [`pattern_text`], if it stands for one.
-pub(crate) fn raw_byte(c: char) -> Option<u8> {
-	let byte = u8::try_from(u32::from(c).checked_sub(RAW_BYTE_BASE)?).ok()?;
-	(byte >= 0x80).then_some(byte)
 }
 
 /// Writes the pattern byte `byte`, which is no UTF-8, as an atom of `target`
@@ -248,7 +263,11 @@ pub(crate) fn translate_raw(
 	target: Target,
 	icase: bool,
 ) -> Result<String, BreError> {
-	translator(pattern, dialect, target, icase, Strictness::Lenient, false, true).run()
+	Translator {
+		raw_bytes: true,
+		..translator(pattern, dialect, target, icase, Strictness::Lenient, false)
+	}
+	.run()
 }
 
 /// Rewrites `pattern`, written in `dialect`, into the syntax `target` reads
@@ -269,11 +288,11 @@ pub(crate) fn translate_multiline(
 	strictness: Strictness,
 	multiline: bool,
 ) -> Result<String, BreError> {
-	translator(pattern, dialect, target, icase, strictness, multiline, false).run()
+	translator(pattern, dialect, target, icase, strictness, multiline).run()
 }
 
-/// The translation of `pattern`; `raw_bytes` for a pattern of
-/// [`pattern_text`] (see [`translate_raw`]).
+/// The translation of `pattern`, each of whose characters is itself; see
+/// [`translate_raw`] for a pattern of [`pattern_text`].
 fn translator(
 	pattern: &str,
 	dialect: Dialect,
@@ -281,7 +300,6 @@ fn translator(
 	icase: bool,
 	strictness: Strictness,
 	multiline: bool,
-	raw_bytes: bool,
 ) -> Translator<'_> {
 	Translator {
 		chars: pattern.chars().peekable(),
@@ -291,7 +309,7 @@ fn translator(
 		strictness,
 		icase,
 		multiline,
-		raw_bytes,
+		raw_bytes: false,
 		atom: None,
 		quantified: false,
 		atom_is_anchor: false,
@@ -1100,7 +1118,7 @@ impl Translator<'_> {
 
 	fn literal(&mut self, c: char) {
 		let start = self.out.len();
-		match raw_byte(c).filter(|_| self.raw_bytes) {
+		match char_byte(c).filter(|_| self.raw_bytes) {
 			Some(byte) => push_raw_byte(&mut self.out, byte, self.target),
 			None => push_literal(&mut self.out, c),
 		}
@@ -1316,7 +1334,7 @@ fn take_bracket_expression(
 			out.push_str("\\n");
 		}
 	}
-	let raw = |c: char| raw_byte(c).filter(|_| raw_bytes);
+	let raw = |c: char| char_byte(c).filter(|_| raw_bytes);
 	// A pattern byte for an engine that reads characters: no member alone,
 	// the character of its value as a range's end.
 	let as_char = |c: char| match raw(c) {
@@ -1399,11 +1417,7 @@ fn take_bracket_expression(
 				// matches no character, or every one where it negates.
 				if !written {
 					out.truncate(class_start);
-					out.push_str(match (negated, multiline) {
-						(false, _) => r"[^\x00-\x{10FFFF}]",
-						(true, false) => r"[\x00-\x{10FFFF}]",
-						(true, true) => r"[^\n]",
-					});
+					out.push_str(if negated { r"[\x00-\x{10FFFF}]" } else { r"[^\x00-\x{10FFFF}]" });
 				}
 				return Ok(opens_colon && ends_colon && other_member && !special);
 			},

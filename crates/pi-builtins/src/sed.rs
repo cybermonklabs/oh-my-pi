@@ -26,11 +26,15 @@ pub mod command {
 use std::path::PathBuf; // For file descriptors and equivalent
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use crate::{host::ShellPaths, sed::error_handling::SedResult};
+use crate::{
+	bre::{byte_char, char_byte},
+	host::ShellPaths,
+	sed::error_handling::SedResult,
+};
 
 use crate::sed::{
 	error_handling::ScriptLocation,
-	fast_io::{byte_char, char_byte, script_byte_chars, script_text_char},
+	fast_io::{script_byte_chars, script_text_char},
 	fast_regex::{Captures, Match, ScriptRegex},
 	named_writer::NamedWriter,
 	script_char_provider::ScriptCharProvider,
@@ -3959,11 +3963,10 @@ pub mod delimited_parser {
 
 use std::char;
 
-use crate::sed::error_handling::SedResult;
+use crate::{bre::byte_char, sed::error_handling::SedResult};
 
 use crate::sed::{
 	error_handling::compilation_error,
-	fast_io::byte_char,
 	script_char_provider::ScriptCharProvider,
 	script_line_provider::ScriptLineProvider,
 };
@@ -4131,7 +4134,7 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
 
 /// Parse a character escape as [`parse_char_escape`] does, except that a
 /// numeric escape (`\dNNN`, `\oNNN`, `\xHH`) of a value from 0x80 to 0xFF
-/// names that byte, held as its byte text character (`fast_io::byte_char`):
+/// names that byte, held as its byte text character (`bre::byte_char`):
 /// GNU sed matches and writes the byte itself, which a line that is not
 /// UTF-8 holds, while in a line that is UTF-8 it stays the character of the
 /// same code (`fast_io::script_text_char`).
@@ -5226,10 +5229,13 @@ use std::{
 #[cfg(unix)]
 use memchr::memchr;
 use pi_vfs::BlockingFs;
-use crate::host::Host;
+use crate::{
+	bre::{byte_char, char_byte},
+	host::Host,
+};
 
 // A line that is not UTF-8 is held as byte text: a String in which each byte
-// from 0x80 up is the character `byte_char` gives it, one of the last 128
+// from 0x80 up is the character `bre::byte_char` gives it, one of the last 128
 // code points, and each ASCII byte is itself. Every byte is then one
 // character, as each is for GNU sed in the C locale (`s/./X/g` replaces each
 // one), which no class but a negated one holds and which has no case; the
@@ -5241,27 +5247,6 @@ use crate::host::Host;
 // as that escape: `s/<U+10FFFF>/X/` searches the character `ÿ` in a line that
 // is UTF-8 and the byte 0xFF in byte text, where GNU sed searches the
 // character U+10FFFF.
-
-/// The code point before the 128 that stand for the bytes 0x80 to 0xFF in
-/// byte text, U+10FF80 to U+10FFFF.
-const BYTE_CHARS: u32 = 0x10_FF00;
-
-/// The character byte text holds for `byte`.
-pub fn byte_char(byte: u8) -> char {
-	if byte.is_ascii() {
-		char::from(byte)
-	} else {
-		char::from_u32(BYTE_CHARS | u32::from(byte)).expect("U+10FF80 to U+10FFFF are scalar values")
-	}
-}
-
-/// The byte from 0x80 up that the byte text character `c` stands for.
-pub fn char_byte(c: char) -> Option<u8> {
-	u32::from(c)
-		.checked_sub(BYTE_CHARS)
-		.and_then(|byte| u8::try_from(byte).ok())
-		.filter(|byte| !byte.is_ascii())
-}
 
 /// `bytes` as byte text.
 pub fn byte_text(bytes: &[u8]) -> String {
@@ -8875,7 +8860,7 @@ use std::{cell::RefCell, io, path::PathBuf, process::Command as ProcessCommand, 
 use pi_vfs::BlockingFs;
 use uucore::display::Quotable;
 
-use crate::host::Host;
+use crate::{bre::char_byte, host::Host};
 use crate::sed::error_handling::{IoContext, SedResult};
 
 use crate::sed::{
@@ -8884,7 +8869,7 @@ use crate::sed::{
 		Transliteration,
 	},
 	error_handling::{ScriptLocation, input_runtime_error, script_end_error},
-	fast_io::{IOChunk, LineReader, OutputBuffer, append_text, char_byte, line_text, script_byte_chars},
+	fast_io::{IOChunk, LineReader, OutputBuffer, append_text, line_text, script_byte_chars},
 	fast_regex::{ScriptRegex, on_char_boundaries},
 	in_place::InPlace,
 	named_writer,
