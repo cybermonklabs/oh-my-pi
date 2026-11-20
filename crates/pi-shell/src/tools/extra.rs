@@ -607,6 +607,9 @@ fn has_separator(name: &OsStr) -> bool {
 /// it, and the shell reports that refusal, or hands it to a utility that
 /// asked for it (`env ./script` is `env: ‘./script’: File name too long`,
 /// status 126, as in coreutils).
+/// A `#!` line that names no interpreter (`#! \0x`) is `Some(true)`: Linux
+/// fails with `ENOEXEC`, so the file runs as a shell script, and whatever
+/// else the system says (gVisor: `EINVAL`) is the shell's to report.
 #[cfg(unix)]
 fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 	use std::os::unix::fs::PermissionsExt as _;
@@ -628,20 +631,14 @@ fn executable(path: &Path, cwd: &Path) -> Option<bool> {
 }
 
 /// The interpreter a `#!` line at the start of the file at `path` names, as
-/// the kernel reads it: the first word after `#!`, in the first 256 bytes.
-/// `None` for a file that has no such line or cannot be read.
+/// the kernel reads it (`pi_builtins::extras::shebang_interpreter`). `None`
+/// for a file that names none or cannot be read.
 #[cfg(unix)]
 fn interpreter(path: &Path) -> Option<PathBuf> {
 	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
-	let mut head = [0; 256];
-	let len = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
-	let line = head[..len].strip_prefix(b"#!")?;
-	let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
-	let blank = |b: &u8| matches!(b, b' ' | b'\t');
-	let start = line.iter().position(|b| !blank(b))?;
-	let word = &line[start..];
-	let end = word.iter().position(|b| blank(b) || *b == 0).unwrap_or(word.len());
-	Some(PathBuf::from(OsStr::from_bytes(&word[..end])))
+	let mut head = Vec::with_capacity(256);
+	std::fs::File::open(path).ok()?.take(256).read_to_end(&mut head).ok()?;
+	Some(PathBuf::from(OsStr::from_bytes(pi_builtins::extras::shebang_interpreter(&head)?)))
 }
 
 #[cfg(not(unix))]
@@ -699,5 +696,8 @@ mod tests {
 		std::os::unix::fs::symlink(cwd.join("0".repeat(256)), cwd.join("ll")).expect("symlink");
 		let long = write("long", &format!("#!{}\n", cwd.join("ll").display()), 0o755);
 		assert_eq!(executable(&long, cwd), Some(true));
+		// A line that names no interpreter is no `cwd` to stat: it runs.
+		assert_eq!(executable(&write("unnamed", "#! \0x", 0o755), cwd), Some(true));
+		assert_eq!(executable(&write("blank", "#!  \necho hi\n", 0o755), cwd), Some(true));
 	}
 }

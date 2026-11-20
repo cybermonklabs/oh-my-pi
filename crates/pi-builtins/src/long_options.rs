@@ -100,6 +100,22 @@ impl OptionTable {
 		Some((OsString::from(spelled), value.is_none() && option.takes_value))
 	}
 
+	/// Whether the argument `arg` takes the next argument as its value: a
+	/// long option that takes a value, written without its `=value`
+	/// (`--lines`), or a group of short options in which the first that
+	/// takes a value ends the group (`-n`, `-qn`; `-n5` holds its value).
+	pub fn value_follows(&self, arg: &str) -> bool {
+		if let Some(long) = arg.strip_prefix("--") {
+			return self.spell_out(long).is_some_and(|(_, value_follows)| value_follows);
+		}
+		arg.strip_prefix('-').is_some_and(|group| {
+			group
+				.char_indices()
+				.find(|&(_, option)| self.short_valued.contains(&option))
+				.is_some_and(|(at, option)| at + option.len_utf8() == group.len())
+		})
+	}
+
 	/// Writes each long option of `argv` out by its full name; see
 	/// [`Self::spell_out`]. The value of an option, and every argument after
 	/// `--`, is left as it is.
@@ -129,14 +145,7 @@ impl OptionTable {
 					},
 				}
 			} else {
-				// The first option of a group that takes a value takes the
-				// rest of it, or the next argument where the group ends there.
-				let value_follows = text.strip_prefix('-').is_some_and(|group| {
-					group
-						.char_indices()
-						.find(|&(_, option)| self.short_valued.contains(&option))
-						.is_some_and(|(at, option)| at + option.len_utf8() == group.len())
-				});
+				let value_follows = self.value_follows(text);
 				spelled.push(arg);
 				value_follows
 			};

@@ -2437,6 +2437,41 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 	}
 }
 
+/// The interpreter a `#!` line names, read from `head`, the file's first
+/// bytes, as Linux's `binfmt_script` reads its first 256: the first word
+/// after `#!` and any blanks (spaces and tabs), up to a blank, a NUL or the
+/// end of the line. `None` where the file does not start with `#!`, where
+/// the line names nothing (blanks alone, or a NUL first, as in `#! \0x`),
+/// and where no newline comes in the 256 bytes and nothing ends the name
+/// there, which the kernel takes for a name cut short. For each of these
+/// `execve` fails with `ENOEXEC`, and `execvp` runs the file with
+/// `/bin/sh`. (GKE Sandbox, gVisor, reads a NUL as part of the name and
+/// fails with `EINVAL` or `ENOENT` where Linux reads no name.)
+pub fn shebang_interpreter(head: &[u8]) -> Option<&[u8]> {
+	/// The bytes the kernel reads (`BINPRM_BUF_SIZE`).
+	const BUFFER: usize = 256;
+	let head = &head[..head.len().min(BUFFER)];
+	let rest = head.strip_prefix(b"#!")?;
+	let blank = |byte: u8| matches!(byte, b' ' | b'\t');
+	let line = match rest.iter().position(|&byte| byte == b'\n') {
+		Some(end) => &rest[..end],
+		// A shorter file is followed by the NULs the kernel pads it with.
+		None if head.len() < BUFFER => rest,
+		// A blank or a NUL must end the name within the buffer, whose last
+		// byte the kernel then drops.
+		None => {
+			let start = rest.iter().position(|&byte| !blank(byte))?;
+			if !rest[start..].iter().any(|&byte| blank(byte) || byte == 0) {
+				return None;
+			}
+			&rest[..rest.len() - 1]
+		},
+	};
+	let name = &line[line.iter().position(|&byte| !blank(byte))?..];
+	let end = name.iter().position(|&byte| blank(byte) || byte == 0).unwrap_or(name.len());
+	(end > 0).then_some(&name[..end])
+}
+
 /// What the shared adapter needs to know about a utility, whichever trait it
 /// implements.
 #[derive(Clone, Copy)]
@@ -3606,6 +3641,37 @@ mod testing {
 		assert_eq!(super::pollable_fd(&null), None);
 		let (reader, _writer) = std::io::pipe().unwrap();
 		assert!(super::pollable_fd(&OpenFile::from(reader)).is_some());
+	}
+
+	/// The interpreter of a `#!` line, as Linux's `fs/binfmt_script.c`
+	/// reads it (`None` where `execve` fails with `ENOEXEC`).
+	#[test]
+	fn shebang_interpreter_reads_as_linux_does() {
+		use super::shebang_interpreter;
+		let named = |head: &[u8]| shebang_interpreter(head).map(<[u8]>::to_vec);
+		assert_eq!(named(b"#!/bin/sh\necho\n"), Some(b"/bin/sh".to_vec()));
+		assert_eq!(named(b"#! \t/bin/sh -e  \n"), Some(b"/bin/sh".to_vec()));
+		assert_eq!(named(b"#!/bin/sh"), Some(b"/bin/sh".to_vec()));
+		assert_eq!(named(b"#!/bin/echo\0junk\n"), Some(b"/bin/echo".to_vec()));
+		assert_eq!(named(b"#!/bin/echo\r\n"), Some(b"/bin/echo\r".to_vec()));
+		assert_eq!(named(b"echo\n"), None);
+		assert_eq!(named(b"#!"), None);
+		assert_eq!(named(b"#!   \n"), None);
+		// Blanks, then a NUL: no name.
+		assert_eq!(named(b"#! \0x"), None);
+		assert_eq!(named(b"#!\0/bin/echo\n"), None);
+		// No newline in the first 256 bytes: the name must end there.
+		let long = |name_len: usize, then: &[u8]| {
+			let mut head = b"#!".to_vec();
+			head.resize(2 + name_len, b'a');
+			head.extend_from_slice(then);
+			head.resize(300, b'b');
+			head
+		};
+		assert_eq!(named(&long(300, b"")), None);
+		assert_eq!(named(&long(253, b" ")), Some(vec![b'a'; 253]));
+		assert_eq!(named(&long(254, b" ")), None);
+		assert_eq!(named(&long(10, b" ")), Some(vec![b'a'; 10]));
 	}
 
 	#[cfg(windows)]

@@ -15,7 +15,7 @@ use clap::{Arg, ArgAction, ArgMatches};
 
 use crate::host::{
 	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, line_bytes,
-	matches_parser, run_strerror,
+	matches_parser, os_bytes_lossy, run_strerror,
 };
 
 mod options {
@@ -322,20 +322,37 @@ enum CommandExecutionError {
 	ArgumentSize,
 }
 
+impl CommandExecutionError {
+	/// The command name, which the message starts with; an argument-size
+	/// refusal names none.
+	fn name(&self) -> Option<&OsStr> {
+		match self {
+			Self::UrgentlyFailed(name)
+			| Self::NotFound(name)
+			| Self::Killed { name, .. }
+			| Self::CannotRun { name, .. } => Some(name),
+			Self::ArgumentSize => None,
+		}
+	}
+
+	/// What the message says after the command name and `: `, or all of it
+	/// where it names no command.
+	fn reason(&self) -> String {
+		match self {
+			Self::UrgentlyFailed(_) => "exited with status 255; aborting".to_owned(),
+			Self::Killed { signal, .. } => format!("terminated by signal {signal}"),
+			Self::CannotRun { error, .. } => run_strerror(error),
+			Self::NotFound(_) => "No such file or directory".to_owned(),
+			Self::ArgumentSize => "can't call exec() due to argument size restrictions".to_owned(),
+		}
+	}
+}
+
 impl Display for CommandExecutionError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::UrgentlyFailed(name) => {
-				write!(f, "{}: exited with status 255; aborting", name.to_string_lossy())
-			},
-			Self::Killed { name, signal } => {
-				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
-			},
-			Self::CannotRun { name, error } => {
-				write!(f, "{}: {}", name.to_string_lossy(), run_strerror(error))
-			},
-			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
-			Self::ArgumentSize => write!(f, "can't call exec() due to argument size restrictions"),
+		match self.name() {
+			Some(name) => write!(f, "{}: {}", name.to_string_lossy(), self.reason()),
+			None => f.write_str(&self.reason()),
 		}
 	}
 }
@@ -1279,7 +1296,20 @@ impl Utility for Xargs {
 			Ok(CommandResult::Success) => 0,
 			Ok(CommandResult::Failure) => 123,
 			Err(error) => {
-				let _ = writeln!(host.stderr, "xargs: {error}");
+				// GNU xargs writes the command name's own bytes: `echo a |
+				// xargs $'n\xff'` is "xargs: n\377: No such file or directory".
+				let mut line = b"xargs: ".to_vec();
+				if let XargsError::CommandExecution(command_error) = &error {
+					if let Some(name) = command_error.name() {
+						line.extend_from_slice(&os_bytes_lossy(name));
+						line.extend_from_slice(b": ");
+					}
+					line.extend_from_slice(command_error.reason().as_bytes());
+				} else {
+					let _ = write!(line, "{error}");
+				}
+				line.push(b'\n');
+				let _ = host.stderr.write_all(&line);
 				if let XargsError::CommandExecution(command_error) = error {
 					match command_error {
 						CommandExecutionError::UrgentlyFailed(_) => 124,

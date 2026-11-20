@@ -59,3 +59,15 @@ describe("builtin xargs: a command it cannot run, or that exits 255", () => {
 		expect(await run(command)).toEqual({ output, exitCode });
 	});
 });
+
+describe("builtin xargs: a command name that is not UTF-8", () => {
+	it("is written as its bytes", async () => {
+		// Regressed: written with U+FFFD for the byte 0xFF.
+		const command = String.raw`echo a | xargs $'n\377' 2>&1; echo $?`;
+		const result = await executeShell({ command: `{ ${command}\n} >out 2>/dev/null`, cwd: dir }, () => {});
+		expect({ output: await fs.readFile(path.join(dir, "out")), exitCode: result.exitCode }).toEqual({
+			output: Buffer.from("xargs: n\xff: No such file or directory\n127\n", "latin1"),
+			exitCode: 0,
+		});
+	});
+});

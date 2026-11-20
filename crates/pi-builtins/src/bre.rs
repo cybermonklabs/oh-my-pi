@@ -249,22 +249,25 @@ pub(crate) fn translate(
 
 /// [`translate`] for GNU grep's pattern of [`pattern_text`], whose characters
 /// from U+10FF80 up stand for the bytes that are no UTF-8 in it. Such a byte
-/// is written as [`push_raw_byte`] writes it; in a bracket expression, for a
-/// target that reads a byte to a character, as a member of that byte, as GNU
-/// reads it in the C locale (`LC_ALL=C grep $'[\351]'` selects the byte
-/// 0xE9). For one that reads characters it is no member, as in GNU's UTF-8
+/// is written as [`push_raw_byte`] writes it. In a bracket expression it is a
+/// member of that byte where `byte_members`, as GNU reads it in the C locale
+/// (`LC_ALL=C grep $'[\351]'` selects the byte 0xE9), for a target that
+/// reads a byte to a character. Elsewhere it is no member, as in GNU's UTF-8
 /// locale, where no character is that byte (`grep $'[\351]'` selects
-/// nothing), except as a range's end, which is the character of its value
-/// there (`grep $'[\351-\377]'` selects `é`, U+00E9).
+/// nothing, in a line that is not UTF-8 too), except as a range's end, which
+/// is the character of its value there (`grep $'[\351-\377]'` selects `é`,
+/// U+00E9).
 #[cfg(any(feature = "util.grep", test))]
 pub(crate) fn translate_raw(
 	pattern: &str,
 	dialect: Dialect,
 	target: Target,
 	icase: bool,
+	byte_members: bool,
 ) -> Result<String, BreError> {
 	Translator {
 		raw_bytes: true,
+		byte_members,
 		..translator(pattern, dialect, target, icase, Strictness::Lenient, false)
 	}
 	.run()
@@ -310,6 +313,7 @@ fn translator(
 		icase,
 		multiline,
 		raw_bytes: false,
+		byte_members: false,
 		atom: None,
 		quantified: false,
 		atom_is_anchor: false,
@@ -362,6 +366,14 @@ fn holds(pattern: &str, found: impl Fn(char, bool) -> bool) -> bool {
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn has_backreference(pattern: &str) -> bool {
 	holds(pattern, |c, escaped| escaped && matches!(c, '1'..='9'))
+}
+
+/// Whether `pattern`, of [`pattern_text`], holds a pattern byte that is no
+/// UTF-8 outside every bracket expression, which [`Target::Pcre`] cannot
+/// match (see [`push_raw_byte`]).
+#[cfg(feature = "util.grep")]
+pub(crate) fn has_raw_byte(pattern: &str) -> bool {
+	holds(pattern, |c, _| char_byte(c).is_some())
 }
 
 /// Whether `pattern`, written in `dialect`, opens a group.
@@ -771,6 +783,9 @@ struct Translator<'a> {
 	/// Whether the characters from U+10FF80 up stand for pattern bytes that
 	/// are no UTF-8; see [`translate_raw`].
 	raw_bytes:  bool,
+	/// Whether such a byte in a bracket expression is a member of that byte;
+	/// see [`translate_raw`].
+	byte_members: bool,
 	/// Where in `out` the atom a repetition operator repeats begins, or
 	/// `None` at a branch start, where there is nothing to repeat.
 	atom:       Option<usize>,
@@ -825,6 +840,7 @@ impl Translator<'_> {
 						self.target,
 						self.multiline,
 						self.raw_bytes,
+						self.byte_members,
 					)?;
 					self.set_atom(start);
 				},
@@ -1316,7 +1332,8 @@ enum BracketMember {
 /// flag): `[^x]*$` stops at the end of a line there.
 ///
 /// With `raw_bytes` a member that stands for a pattern byte that is no
-/// UTF-8 is read as [`translate_raw`] says.
+/// UTF-8 is read as [`translate_raw`] says, a member of that byte where
+/// `byte_members`.
 fn take_bracket_expression(
 	chars: &mut Peekable<Chars<'_>>,
 	out: &mut String,
@@ -1324,6 +1341,7 @@ fn take_bracket_expression(
 	target: Target,
 	multiline: bool,
 	raw_bytes: bool,
+	byte_members: bool,
 ) -> Result<bool, BreError> {
 	let class_start = out.len();
 	out.push('[');
@@ -1335,11 +1353,22 @@ fn take_bracket_expression(
 		}
 	}
 	let raw = |c: char| char_byte(c).filter(|_| raw_bytes);
-	// A pattern byte for an engine that reads characters: no member alone,
+	// A pattern byte that is no member, as in a UTF-8 locale: nothing alone,
 	// the character of its value as a range's end.
 	let as_char = |c: char| match raw(c) {
-		Some(byte) if !target.reads_bytes() => char::from(byte),
+		Some(byte) if !byte_members => char::from(byte),
 		_ => c,
+	};
+	// The byte of a range's end that an engine reading a byte to a
+	// character puts next to the `-`: the pattern byte it stands for, or
+	// else the last of its UTF-8 bytes where it starts the range and the
+	// first where it ends it, its other bytes being members of their own.
+	let edge_byte = |c: char, start: bool| {
+		raw(c).unwrap_or_else(|| {
+			let mut utf8 = [0; 4];
+			let bytes = c.encode_utf8(&mut utf8).as_bytes();
+			if start { bytes[bytes.len() - 1] } else { bytes[0] }
+		})
 	};
 	// Whether a member was written; see `raw_bytes`.
 	let mut written = false;
@@ -1390,7 +1419,15 @@ fn take_bracket_expression(
 				} else {
 					(start, end)
 				};
-				if high < low {
+				// An engine that reads a byte to a character is checked on the
+				// bytes it gets, as GNU checks them in the C locale: `LC_ALL=C
+				// grep $'[\xc3-\xc3\xa9]'` is the range C3-C3 and the byte A9.
+				let backwards = if target.reads_bytes() {
+					edge_byte(high, false) < edge_byte(low, true)
+				} else {
+					high < low
+				};
+				if backwards {
 					return Err(BreError::RangeEndInvalid);
 				}
 				push_bracket_member(out, low, raw(low), target);
@@ -1398,7 +1435,12 @@ fn take_bracket_expression(
 				push_bracket_member(out, high, raw(high), target);
 				written = true;
 			},
-			BracketMember::Char(c) if raw(c).is_some() && !target.reads_bytes() => {},
+			// For an engine that reads a byte to a character a list that
+			// negates still leaves the byte out: in a UTF-8 locale it is no
+			// character, which `[^\351]` does not match (`printf '\351\n' |
+			// grep -c $'[^\351]'` is 0).
+			BracketMember::Char(c)
+				if raw(c).is_some() && !byte_members && !(negated && target.reads_bytes()) => {},
 			BracketMember::Char(c) | BracketMember::Equivalence(c) => {
 				push_bracket_member(out, c, raw(c), target);
 				written = true;
@@ -1414,10 +1456,16 @@ fn take_bracket_expression(
 				chars.next();
 				out.push(']');
 				// Every member was a pattern byte no character is: the list
-				// matches no character, or every one where it negates.
+				// matches no character, or every one where it negates, written
+				// in bytes for an engine that reads them.
 				if !written {
 					out.truncate(class_start);
-					out.push_str(if negated { r"[\x00-\x{10FFFF}]" } else { r"[^\x00-\x{10FFFF}]" });
+					out.push_str(match (negated, target.reads_bytes()) {
+						(false, false) => r"[^\x00-\x{10FFFF}]",
+						(true, false) => r"[\x00-\x{10FFFF}]",
+						(false, true) => r"[^\x00-\xFF]",
+						(true, true) => r"[\x00-\xFF]",
+					});
 				}
 				return Ok(opens_colon && ends_colon && other_member && !special);
 			},
@@ -2457,17 +2505,21 @@ mod tests {
 	/// reads it in the C locale. For one that reads characters it is that
 	/// byte outside a bracket expression, no member inside one, and the
 	/// character of its value as a range's end, as GNU grep 3.11 reads it in
-	/// the C.UTF-8 locale.
+	/// the C.UTF-8 locale; so it is in that locale for the engine that reads
+	/// a line that is not UTF-8 a byte to a character.
 	#[test]
 	fn a_pattern_byte_that_is_no_utf8_is_that_byte() {
 		// If this regresses, `grep $'\351'` selects no line holding the byte
 		// 0xE9, or `grep $'[\351]'` selects one in a UTF-8 locale, where
-		// GNU's selects none.
-		let raw = |pattern: &[u8], target| {
+		// GNU's selects none, or `LC_ALL=C grep $'[\xc3-\xc3\xa9]'` is
+		// "Invalid range end", where GNU reads the range C3-C3.
+		let translated = |pattern: &[u8], target: Target, byte_members: bool| {
 			let (text, raw) = pattern_text(pattern);
 			assert!(raw, "{pattern:?}");
-			translate_raw(&text, Dialect::Basic, target, false)
+			translate_raw(&text, Dialect::Basic, target, false, byte_members)
 		};
+		// The C locale reads a byte to a character, the C.UTF-8 one does not.
+		let raw = |pattern: &[u8], target: Target| translated(pattern, target, target.reads_bytes());
 		assert_eq!(raw(b"caf\xe9", Target::RustBytes), Ok(r"caf\xE9".to_owned()));
 		assert_eq!(raw(b"caf\xe9", Target::Rust), Ok(r"caf(?-u:\xE9)".to_owned()));
 		assert_eq!(raw(b"\xe9*", Target::Rust), Ok(r"(?-u:\xE9)*".to_owned()));
@@ -2482,6 +2534,17 @@ mod tests {
 		assert_eq!(raw(b"[\xe9-\xff]", Target::Rust), Ok("[\u{e9}-\u{ff}]".to_owned()));
 		assert_eq!(raw(b"[\xe9-\xff]", Target::RustBytes), Ok(r"[\xE9-\xFF]".to_owned()));
 		assert_eq!(raw(b"[\xff-\xe9]", Target::RustBytes), Err(BreError::RangeEndInvalid));
+		// In the C locale a range is checked on the bytes the engine gets:
+		// the last of its start's and the first of its end's.
+		assert_eq!(raw(b"[\xc3-\xc3\xa9]", Target::RustBytes), Ok("[\\xC3-\u{e9}]".to_owned()));
+		assert_eq!(raw(b"[\xc3-\xa9]", Target::RustBytes), Err(BreError::RangeEndInvalid));
+		assert_eq!(raw(b"[\xc3\xa9-\xc3\x9f\xff]", Target::RustBytes), Ok("[\u{e9}-\u{df}\\xFF]".to_owned()));
+		// In a UTF-8 locale a line that is not UTF-8 reads the bracket as the
+		// text engine does; a list that negates leaves the byte out.
+		assert_eq!(translated(b"[\xe9]", Target::RustBytes, false), Ok(r"[^\x00-\xFF]".to_owned()));
+		assert_eq!(translated(b"f[a\xe9]", Target::RustBytes, false), Ok("f[a]".to_owned()));
+		assert_eq!(translated(b"[^\xe9]", Target::RustBytes, false), Ok(r"[^\xE9]".to_owned()));
+		assert_eq!(translated(b"[\xc0-\xff]", Target::RustBytes, false), Ok("[\u{c0}-\u{ff}]".to_owned()));
 		// UTF-8 stays text, and the bytes come back as they were.
 		assert_eq!(pattern_text("café".as_bytes()), ("café".to_owned(), false));
 		assert_eq!(pattern_bytes(&pattern_text(b"a\xe9\xc3\xa9\xff").0), b"a\xe9\xc3\xa9\xff");

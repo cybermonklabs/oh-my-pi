@@ -348,3 +348,78 @@ describe("builtin sed: blocks nested 100,000 deep", () => {
 		});
 	}, 60_000);
 });
+
+describe("builtin sed: where a range ends, and `c` on a range", () => {
+	cases([
+		// Regressed: a line-number end reached while the range was active wrote no text.
+		[String.raw`seq 5 | sed '3,4c\X'`, "1\n2\nX\n5\n", 0],
+		// Regressed: once one range had ended at its first line, every later line of a `c` range wrote the text.
+		[String.raw`seq 5 | sed '1,+0d;3,4c\X'`, "2\nX\n5\n", 0],
+		// Regressed: the text was written where the input ended inside the range.
+		[String.raw`seq 5 | sed '3,10c\X'`, "1\n2\n", 0],
+		// Regressed: `addr,+N` ended a line late, so `c` wrote no text.
+		[String.raw`seq 5 | sed '2,+1c\X'`, "1\nX\n4\n5\n", 0],
+		// Regressed: `!` on a range wrote the text on the last line alone.
+		[String.raw`seq 5 | sed '2,3!c\X'`, "X\n2\n3\nX\nX\n", 0],
+		// Regressed: a range whose end line the command did not see ended a line late, writing no text.
+		[String.raw`seq 5 | sed '3d;2,4c\X'`, "1\nX\n5\n", 0],
+		// Regressed: `addr,+N` past a line the command did not see left out the line that ends it.
+		["seq 10 | sed -n '3d;2,+1p'", "2\n4\n", 0],
+		// Regressed: `addr,~N` past a multiple the command did not see ran on to the next one.
+		["seq 10 | sed -n '4d;2,~4p'", "2\n3\n5\n", 0],
+	]);
+});
+
+describe("builtin sed: `first~step` is an address GNU tests on each line", () => {
+	cases([
+		// Regressed: held as a range that started at `first`, so with line 1 deleted nothing was printed.
+		["seq 5 | sed -n '1d;1~2p'", "3\n5\n", 0],
+		[String.raw`seq 10 | sed '1d;1~2c\X'`, "2\nX\n4\nX\n6\nX\n8\nX\n10\n", 0],
+		// Regressed: "unknown command: `,'": the step left no room for a second address.
+		["seq 10 | sed -n '2~3,+1p'", "2\n3\n5\n6\n8\n9\n", 0],
+		["seq 10 | sed -n '0~4,5p'", "4\n5\n8\n", 0],
+	]);
+});
+
+describe("builtin sed: a range whose first address is a line number", () => {
+	cases([
+		// Regressed: it started on that line alone, which `N` read, so it never started; GNU starts it on the first
+		// line at or past it.
+		["seq 10 | sed -n '$!N;3,5p'", "3\n4\n", 0],
+		["seq 10 | sed -n '$!N;3,4p'", "3\n4\n", 0],
+		["seq 10 | sed -n '$!N;3,+1p'", "3\n4\n5\n6\n", 0],
+		["seq 10 | sed -n '$!N;3,~4p'", "3\n4\n5\n6\n7\n8\n", 0],
+		[String.raw`seq 10 | sed '$!N;3,5c\X'`, "1\n2\n5\n6\n7\n8\n9\n10\n", 0],
+		["seq 10 | sed -n '2d;2,3p'", "3\n", 0],
+	]);
+});
+
+describe("builtin sed: errors about files and comments as GNU writes them", () => {
+	cases([
+		// Regressed: `<script argument 1>:1:1: error: creating file '/nonexistent/x': … (os error 2)`, exit 2.
+		[
+			"echo a | sed 'w /nonexistent/x' 2>&1",
+			"sed: couldn't open file /nonexistent/x: No such file or directory\n",
+			4,
+		],
+		[
+			"echo a | sed 's/a/b/w /nonexistent/y' 2>&1",
+			"sed: couldn't open file /nonexistent/y: No such file or directory\n",
+			4,
+		],
+		// Regressed: "error opening script file '/nonexistent/s': … (os error 2)", exit 2.
+		["echo a | sed -f /nonexistent/s 2>&1", "sed: couldn't open file /nonexistent/s: No such file or directory\n", 4],
+		// Regressed: "unknown command: `#'".
+		["echo a | sed '1#foo' 2>&1", error(char(2), "comments don't accept any addresses"), 1],
+		["echo a | sed '1,2#foo' 2>&1", error(char(4), "comments don't accept any addresses"), 1],
+		["echo a | sed '1!#foo' 2>&1", error(char(3), "comments don't accept any addresses"), 1],
+		// Regressed: the same; after `!` alone it is a comment.
+		["echo a | sed '!#foo' 2>&1", "a\n", 0],
+		// Regressed: the script file's name was written with U+FFFD for the byte 0xFF.
+		[
+			String.raw`printf 'k\n' >$'n\377'; echo a | sed -f $'n\377' 2>&1`,
+			"sed: file n\xff line 1: unknown command: `k'\n",
+			1,
+		],
+	]);
+});

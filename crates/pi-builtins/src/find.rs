@@ -1461,17 +1461,24 @@ pub mod matchers {
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
+		/// The depth of a matcher that holds `submatchers`: one level more
+		/// than the deepest of them (see [`Matcher::depth`]).
+		fn depth_over(submatchers: &[Box<dyn Matcher>]) -> usize {
+			1 + submatchers.iter().map(Matcher::depth).max().unwrap_or(0)
+		}
+
 		/// This matcher contains a collection of other matchers. A file only matches
 		/// if it matches ALL the contained sub-matchers. For sub-matchers that have
 		/// side effects, the side effects occur in the same order as the sub-matchers
 		/// were pushed into the collection.
 		pub struct AndMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
+			depth:       usize,
 		}
 
 		impl AndMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { submatchers }
+				Self { depth: depth_over(&submatchers), submatchers }
 			}
 		}
 
@@ -1511,6 +1518,10 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
+			}
+
+			fn depth(&self) -> usize {
+				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1556,11 +1567,12 @@ pub mod matchers {
 		/// were pushed into the collection.
 		pub struct OrMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
+			depth:       usize,
 		}
 
 		impl OrMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { submatchers }
+				Self { depth: depth_over(&submatchers), submatchers }
 			}
 		}
 
@@ -1600,6 +1612,10 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
+			}
+
+			fn depth(&self) -> usize {
+				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1667,11 +1683,12 @@ pub mod matchers {
 		/// occur in the same order as the sub-matchers were pushed into the collection.
 		pub struct ListMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
+			depth:       usize,
 		}
 
 		impl ListMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { submatchers }
+				Self { depth: depth_over(&submatchers), submatchers }
 			}
 		}
 
@@ -1695,6 +1712,10 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
+			}
+
+			fn depth(&self) -> usize {
+				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1809,11 +1830,13 @@ pub mod matchers {
 		/// Matcher that wraps another matcher and inverts matching criteria.
 		pub struct NotMatcher {
 			submatcher: Box<dyn Matcher>,
+			depth:      usize,
 		}
 
 		impl NotMatcher {
 			pub fn new(submatcher: impl Matcher) -> Self {
-				Self { submatcher: submatcher.into_box() }
+				let submatcher = submatcher.into_box();
+				Self { depth: 1 + submatcher.depth(), submatcher }
 			}
 		}
 
@@ -1829,6 +1852,10 @@ pub mod matchers {
 
 			fn has_side_effects(&self) -> bool {
 				self.submatcher.has_side_effects()
+			}
+
+			fn depth(&self) -> usize {
+				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -4232,6 +4259,13 @@ pub mod matchers {
 			false
 		}
 
+		/// How many matchers deep the tree under this one is, this one
+		/// included: evaluating the tree and dropping it recurse once for
+		/// each level (see [`MAX_EXPRESSION_DEPTH`]).
+		fn depth(&self) -> usize {
+			1
+		}
+
 		/// Notification that find is leaving a given directory.
 		async fn finished_dir(&self, _finished_directory: &Path, _matcher_io: &mut MatcherIO) {}
 
@@ -4267,6 +4301,10 @@ pub mod matchers {
 
 		fn has_side_effects(&self) -> bool {
 			(**self).has_side_effects()
+		}
+
+		fn depth(&self) -> usize {
+			(**self).depth()
 		}
 
 		async fn finished_dir(&self, finished_directory: &Path, matcher_io: &mut MatcherIO) {
@@ -4522,13 +4560,23 @@ pub mod matchers {
 		Ok(file)
 	}
 
+	/// The deepest a tree of matchers may be, once read (see
+	/// [`Matcher::depth`]). Evaluating the tree and dropping it recurse once
+	/// for each level, so a deeper one, such as `! \( ! \( … \) \)` nested
+	/// 100,000 deep, would overflow the stack and abort the process (the
+	/// release build did from about 13,000 levels); it is refused instead.
+	/// A nest of parentheses alone is one level, however deep: a group of
+	/// one expression is that expression.
+	const MAX_EXPRESSION_DEPTH: usize = 1000;
+
 	/// The main "translate command-line args into a matcher" function.
 	///
 	/// A parenthesized expression is read as an expression of its own, with
 	/// the default regex type, and becomes one condition of the expression
 	/// it is in. The expressions a `(` interrupted are kept on a stack, not
 	/// by recursion, so a nest of parentheses 10,000 deep, which GNU find
-	/// reads, does not overflow the stack, nor does one deeper.
+	/// reads, does not overflow the stack, nor does one deeper. A tree of
+	/// matchers deeper than [`MAX_EXPRESSION_DEPTH`] is refused.
 	async fn build_matcher_tree(
 		args: &[&str],
 		config: &mut Config,
@@ -5046,13 +5094,17 @@ pub mod matchers {
 				outer.clear();
 				break;
 			}
-			if let Some(submatcher) = possible_submatcher {
+			if let Some(mut submatcher) = possible_submatcher {
 				if invert_next_matcher {
-					top_level_matcher.new_and_condition(NotMatcher::new(submatcher));
+					submatcher = NotMatcher::new(submatcher).into_box();
 					invert_next_matcher = false;
-				} else {
-					top_level_matcher.new_and_condition(submatcher);
 				}
+				if submatcher.depth() > MAX_EXPRESSION_DEPTH {
+					return Err(From::from(format!(
+						"an expression nested more than {MAX_EXPRESSION_DEPTH} levels deep is not supported"
+					)));
+				}
+				top_level_matcher.new_and_condition(submatcher);
 			}
 		}
 		if !outer.is_empty() {
@@ -6445,5 +6497,32 @@ mod tests {
 		let (code, capture) = run(&root, &unclosed).await;
 		assert_eq!(code, 1);
 		assert!(capture.err().contains("expecting to find a ')'"), "{}", capture.err());
+	}
+
+	/// A tree of matchers deeper than evaluating it can recurse must be
+	/// refused, with the process alive.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn refuses_an_expression_too_deep_to_evaluate() {
+		// If this regresses, `find . ! \( ! \( … -name a.txt … \) \)` nested
+		// 100,000 deep, a `!` matcher for each level, overflows the stack as
+		// it is evaluated or dropped and aborts the process.
+		let (_dir, root) = fixture();
+		let nest = |depth: usize, open: &[&str]| {
+			let mut args = vec![".".to_owned()];
+			for _ in 0..depth {
+				args.extend(open.iter().map(|&arg| arg.to_owned()));
+			}
+			args.extend(["-name".to_owned(), "a.txt".to_owned()]);
+			args.extend(std::iter::repeat_n(")".to_owned(), depth));
+			args
+		};
+		for open in [&["!", "("][..], &["-true", "("][..]] {
+			let (code, capture) = run(&root, &nest(100_000, open)).await;
+			assert_eq!(code, 1, "{open:?}: {}", capture.out());
+			assert!(capture.err().contains("nested more than 1000 levels deep is not supported"), "{}", capture.err());
+			// An even number of `!` leaves the name test as it is.
+			let (code, capture) = run(&root, &nest(100, open)).await;
+			assert_eq!((code, capture.out().as_str()), (0, "./a.txt\n"), "{open:?}: {}", capture.err());
+		}
 	}
 }
