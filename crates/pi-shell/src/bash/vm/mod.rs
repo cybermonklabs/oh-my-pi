@@ -2067,6 +2067,19 @@ impl Shell {
 				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
+				// A subshell the parent ran in place of itself died with the
+				// command it ran in place: so does the parent's process.
+				if let (true, Some(signal)) = (p.in_place(), p.died_of())
+					&& let Some(parent) = self.procs.iter_mut().find(|q| Some(q.vpid) == p.parent)
+				{
+					match parent.runs.front().map(|run| run.id) {
+						Some(run) if parent.parent.is_none() => {
+							self.k.exec_signals.insert(run, signal);
+						},
+						_ if parent.in_place() => parent.zsh_state().died_of = Some(signal),
+						_ => {},
+					}
+				}
 				self.reaped(cx, p.parent, p.vpid, p.status);
 			} else {
 				i += 1;

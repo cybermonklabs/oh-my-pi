@@ -4130,7 +4130,16 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.get_or_insert_with(|| FdRef::mem(mem::MemBuf::new(Vec::new())));
 					fds.set(0, Some(null.clone()));
 				}
+				// zsh's last `( … )` runs without a fork: the shell's process
+				// is the subshell's, and its last command in turn the
+				// subshell's ([`super::proc::VprocZsh::in_place`]).
+				let in_place = info.kind == SpawnKind::Subshell
+					&& vp.mode.dialect() == Dialect::Zsh
+					&& super::killed::in_place(k, cx, vp, op);
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				if in_place {
+					child.zsh_state().in_place = true;
+				}
 				if child.mode.dialect() != Dialect::Zsh
 					|| !async_subshell_body(unit, top_frame(vp).pc, info)
 				{

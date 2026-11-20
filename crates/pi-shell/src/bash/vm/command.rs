@@ -4562,12 +4562,18 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let in_place = st(vp).in_place;
 			if let (Some(sig), false) = (killed, replacing) {
 				let end = super::killed::killed(k, cx, vp, op, pid, sig, in_place);
-				// bash ran it with `exec`: its process is the command's.
-				if end.no_fork
-					&& vp.parent.is_none()
-					&& let Some(run) = run
-				{
-					k.exec_signals.insert(run, i32::from(sig.number(platform)));
+				// bash ran it with `exec`: its process is the command's. In a
+				// subshell zsh ran in place of itself, that process is the
+				// root's too ([`super::proc::VprocZsh::died_of`]).
+				if end.no_fork {
+					let signal = i32::from(sig.number(platform));
+					match run {
+						Some(run) if vp.parent.is_none() => {
+							k.exec_signals.insert(run, signal);
+						},
+						_ if vp.in_place() => vp.zsh_state().died_of = Some(signal),
+						_ => {},
+					}
 				}
 				st(vp).notice = end.notice.map(Box::new);
 			}

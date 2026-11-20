@@ -497,6 +497,23 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 		zsh(cat(&[b"case a in (a) true; ", K, b"; esac"]), KILLED),
 		zsh(cat(&[b"case a in a) ", K, b";& b) true;; esac"]), Exit(0)),
 		zsh(cat(&[b"case a in a) ", K, b";| b) true;; esac"]), Exit(137)),
+		// A here-document in the body, from the parse tree (its body follows
+		// the line).
+		zsh(cat(&[K, b" <<EOF\nx\nEOF"]), KILLED),
+		zsh(cat(&[b"if true; then ", K, b" <<EOF\nx\nEOF\nfi"]), KILLED),
+		zsh(cat(&[b"{ ", K, b" <<EOF\nx\nEOF\n}"]), KILLED),
+		zsh(cat(&[b"case a in a) ", K, b" <<EOF\nx\nEOF\n;; esac"]), KILLED),
+		// zsh runs a last `( … )` in place, and its last command too.
+		zsh(cat(&[b"( ", K, b" )"]), KILLED),
+		zsh(cat(&[b"true; ( ", K, b" )"]), KILLED),
+		zsh(cat(&[b"( true; ", K, b" )"]), KILLED),
+		zsh(cat(&[b"( ", K, b"; true )"]), Exit(0)),
+		zsh(cat(&[b"( ( ", K, b" ) )"]), KILLED),
+		zsh(cat(&[b"if true; then ( ", K, b" ); fi"]), KILLED),
+		zsh(cat(&[b"( ", K, b" ) > /dev/null"]), KILLED),
+		zsh(cat(&[b"{ ( ", K, b" ) }"]), KILLED),
+		zsh(cat(&[b"x=1; ( ", K, b" ); print after"]), Exit(0)),
+		zsh(cat(&[b"( trap 'print x' EXIT; ", K, b" )"]), Exit(137)),
 	];
 	for NoticeCase { shell, script, stderr, end } in cases {
 		let script = OsString::from_vec(script);

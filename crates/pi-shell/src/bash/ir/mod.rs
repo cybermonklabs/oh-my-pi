@@ -293,6 +293,12 @@ pub struct Unit {
 	pub conds:               Vec<CondIr>,
 	/// Function definitions.
 	pub funcs:               Vec<FuncIr>,
+	/// zsh: the syntax node ids, sorted, of the commands zsh runs with
+	/// `last1` when this complete command is the last of its `-c` string:
+	/// simple commands it runs with `exec` and no fork, and `( … )`
+	/// subshells it runs in place (`lower::zsh_tails`). Empty for bash.
+	#[serde(default)]
+	pub tails:               Vec<u32>,
 }
 
 impl Unit {
@@ -332,6 +338,7 @@ impl Unit {
 			ariths: Vec::new(),
 			conds: Vec::new(),
 			funcs: Vec::new(),
+			tails: Vec::new(),
 		}
 	}
 

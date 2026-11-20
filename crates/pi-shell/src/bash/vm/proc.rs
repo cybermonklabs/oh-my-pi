@@ -208,6 +208,17 @@ pub struct VprocZsh {
 	/// op returned anything else. Never imaged: it lives within one op step.
 	#[serde(skip)]
 	pub glob_hook:          Option<(BString, u32)>,
+	/// A `( … )` the root runs in place of itself, as the last command of
+	/// its `-c` string (zsh's `last1`: no fork). Its own last command runs
+	/// in place of it in turn ([`super::killed::in_place`]). A subshell of
+	/// it starts without.
+	#[serde(default)]
+	pub in_place:           bool,
+	/// The signal (its number) the command this vproc ran in place of
+	/// itself died of: an [`Self::in_place`] subshell's process would have
+	/// been that command, so its parent dies of it too.
+	#[serde(default)]
+	pub died_of:            Option<i32>,
 }
 
 /// A number as zsh's `lastmathval` keeps it ([`VprocZsh::last_math`]); a
@@ -237,10 +248,29 @@ impl VprocZsh {
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
 			&& self.glob_hook.is_none()
+			&& !self.in_place
+			&& self.died_of.is_none()
 	}
 }
 
 impl Vproc {
+	/// zsh: a `( … )` the root runs in place of itself
+	/// ([`VprocZsh::in_place`]).
+	pub fn in_place(&self) -> bool {
+		self.zsh.as_ref().is_some_and(|z| z.in_place)
+	}
+
+	/// The signal the command this vproc ran in place of itself died of
+	/// ([`VprocZsh::died_of`]).
+	pub fn died_of(&self) -> Option<i32> {
+		self.zsh.as_ref().and_then(|z| z.died_of)
+	}
+
+	/// The vproc's zsh state, created on first use.
+	pub fn zsh_state(&mut self) -> &mut VprocZsh {
+		self.zsh.get_or_insert_with(Box::default)
+	}
+
 	/// zsh's current sticky emulation.
 	pub fn sticky(&self) -> Option<&crate::bash::store::Sticky> {
 		self.zsh.as_ref().and_then(|z| z.sticky.as_ref())

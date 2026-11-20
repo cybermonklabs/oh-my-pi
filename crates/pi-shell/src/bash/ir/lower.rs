@@ -125,6 +125,10 @@ fn lower_command(
 		let idx = l.str(&w.bash_msg);
 		l.emit(Opcode::Warn, idx, w.line, w.line);
 	}
+	if mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		zsh_tails(cc.list(), &mut l.unit.tails);
+		l.unit.tails.sort_unstable();
+	}
 	l.list(cc.list())?;
 	l.emit(Opcode::End, 0, 0, 0);
 	match replay_id {
@@ -133,6 +137,55 @@ fn lower_command(
 		_ => l.unit.seal_from(l.source_hash),
 	}
 	Ok(l.unit)
+}
+
+/// zsh's `last1` (`execlist`, `execpline`, `execcmd`): what of `list` zsh
+/// runs in place of itself when `list` is the last it runs. The last list
+/// item, unless it runs in the background; of its and-or list, the last
+/// pipeline, when that has one stage and no `!` or `time`; that command if
+/// it is simple, else on into the body of a `{ }` (not a `try` with
+/// `always`), of a `( … )` (whose node goes in too: zsh runs it without a
+/// fork), of every branch of an `if` (not a condition) and of each `case`
+/// arm that ends with `;;` (`;&` and `;|` run on). Node ids into `out`.
+fn zsh_tails(list: st::List<'_>, out: &mut Vec<u32>) {
+	let Some(item) = list.items().into_iter().next_back() else {
+		return;
+	};
+	if matches!(item.sep(), syn::Sep::Amp | syn::Sep::Disown) {
+		return;
+	}
+	let ao = item.and_or();
+	let p = ao.rest().last().map_or_else(|| ao.first(), |(_, p)| p);
+	if p.bang() || p.time().is_some() {
+		return;
+	}
+	let Some(cmd) = p.stages().one() else {
+		return;
+	};
+	match cmd.kind() {
+		st::CommandKind::Simple(_) => out.push(cmd.id().0),
+		st::CommandKind::Brace(body) => zsh_tails(body, out),
+		st::CommandKind::Subshell(body) => {
+			out.push(cmd.id().0);
+			zsh_tails(body, out);
+		},
+		st::CommandKind::If(i) => {
+			for arm in i.arms() {
+				zsh_tails(arm.body, out);
+			}
+			if let Some(body) = i.else_body() {
+				zsh_tails(body, out);
+			}
+		},
+		st::CommandKind::Case(c) => {
+			for arm in c.arms() {
+				if arm.term() == syn::CaseTerm::Break {
+					zsh_tails(arm.body(), out);
+				}
+			}
+		},
+		_ => {},
+	}
 }
 
 /// Lower a word parsed at run time (`parse_text`: here-document bodies,
