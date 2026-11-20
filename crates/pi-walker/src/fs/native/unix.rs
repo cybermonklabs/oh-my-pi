@@ -140,6 +140,13 @@ pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::R
 	sys::openat_dir(parent.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
 }
 
+/// Opens the directory `..` of `child`: its parent while `child` is where
+/// it was listed. The caller checks the result's identity.
+pub(crate) fn open_parent(s: &mut Scratch, child: &Handle) -> io::Result<Handle> {
+	let dotdot = s.cstr(b"..")?;
+	sys::openat_dir(child.as_raw_fd(), dotdot, DIR_FLAGS | libc::O_NOFOLLOW)
+}
+
 pub(crate) fn list(
 	s: &mut Scratch,
 	dir: &Handle,

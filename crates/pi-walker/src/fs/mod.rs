@@ -342,6 +342,14 @@ enum DirRepr {
 	Provider(PathBuf),
 }
 
+impl Dir {
+	/// Whether this directory holds an open descriptor or handle (native),
+	/// as opposed to a provider path.
+	pub(crate) const fn holds_descriptor(&self) -> bool {
+		matches!(self.repr, DirRepr::Native(_))
+	}
+}
+
 /// An open regular file, read with [`File::read_into`] or streamed through
 /// [`File::read`]. Closed on drop.
 #[derive(Debug)]
@@ -694,6 +702,20 @@ impl Session {
 			_ => return Err(foreign_dir()),
 		};
 		Ok(Dir { repr })
+	}
+
+	/// Opens the directory `..` of `child`, which is its parent only while
+	/// `child` has not moved: callers check the identity of what they get.
+	/// Fails with [`io::ErrorKind::Unsupported`] where `..` cannot be opened
+	/// relative to a handle (Windows, providers).
+	pub(crate) fn open_parent(&mut self, child: &Dir) -> io::Result<Dir> {
+		match (&mut self.imp, &child.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => {
+				Ok(Dir { repr: DirRepr::Native(native::open_parent(s, h)?) })
+			},
+			(Imp::Provider(_), DirRepr::Provider(_)) => Err(io::ErrorKind::Unsupported.into()),
+			_ => Err(foreign_dir()),
+		}
 	}
 
 	/// Lists every entry of `dir` except `.` and `..`, skipping special files

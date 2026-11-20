@@ -31,8 +31,8 @@ impl TempDir {
 			.duration_since(UNIX_EPOCH)
 			.map_or(0, |d| d.as_nanos());
 		let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-		let path =
-			std::env::temp_dir().join(format!("pi-walker-grep-{}-{nanos}-{seq}", std::process::id()));
+		let path = crate::testing::temp_root()
+			.join(format!("pi-walker-grep-{}-{nanos}-{seq}", std::process::id()));
 		fs::create_dir_all(&path).expect("create temp dir");
 		Self(path.canonicalize().expect("canonical temp dir"))
 	}
@@ -1156,21 +1156,25 @@ async fn budgeted_search_refuses_a_file_below_a_directory_swapped_for_a_symlink(
 	assert!(!escaped(texts(&result)), "read through the swapped link: {:?}", texts(&result));
 }
 
-/// Case A in the budgeted pass, below the depth past which the ordered
-/// traversal stops keeping directory handles: `sub` is swapped for a symlink
-/// to a directory outside the root between its parent's listing and its own
-/// open. The traversal opens `sub` below the root's handle (not by path), so
-/// it does not descend into the link. That open is what the swap records:
-/// the candidate opens below the root too, so the read alone could not show
-/// a traversal that descended into the link.
+/// Case A in the budgeted pass, deeper than the window of directory handles
+/// the ordered traversal keeps: `sub` is swapped for a symlink to a directory
+/// outside the root between its parent's listing and its own open. Nothing
+/// beneath `sub` is read, or even opened: the candidate opens below the root,
+/// which refuses the link on its own, so only the attempt to open the
+/// outside file can show a traversal that descended into the link. The
+/// control: the swap ran, before `sub`'s open.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn budgeted_search_past_the_open_directory_limit_refuses_a_swapped_directory() {
 	let tree = SwapTree::new("grep-budgeted-a-deep", walk::tree::MAX_OPEN_DIRS, Outside::OtherName);
 	tree.swap_dir_before_open(&tree.sub_name);
+	let reached = Arc::new(parking_lot::Mutex::new(None));
+	let seen = Arc::clone(&reached);
+	crate::fs::seam::before_open(&tree.outside_name, move |open| *seen.lock() = Some(open));
 	let result = run(&tree.root, &GrepOptions { max_count: Some(100), ..options(&needle()) }).await;
-	assert_eq!(tree.swapped(), Some(Open::Beneath), "sub did not open below the root");
-	assert!(!escaped(texts(&result)), "descended into the swapped link: {:?}", texts(&result));
+	assert!(tree.swapped().is_some(), "the swap did not run");
+	assert_eq!(*reached.lock(), None, "opened a file the swapped link holds");
+	assert!(!escaped(texts(&result)), "read through the swapped link: {:?}", texts(&result));
 }
 
 /// The unbounded pass opens a listed file relative to its directory without

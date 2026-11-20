@@ -20,6 +20,7 @@
 - `find` without `-L` or `-H` no longer walks, or deletes below, a symlink put in place of its starting point after find checked it, on any kernel: the starting point opens without following a symlink there
 - The bash tool's `rm -r` no longer empties the target of a symlink put in place of its operand after rm checked it, on any kernel: the operand opens without following a symlink, as the directory `lstat` found, and any other is reported as `Not a directory`
 - Under gVisor releases before 20261109.0, `mv` of a directory across filesystems no longer deletes files outside the moved tree through a directory swapped for a symlink: it removes the copied source, and a directory it replaces, with `rm -r`'s walk
+- The bash tool's `find` and `fd`, `listWorkspace()`, and `grep()` with a match limit, over a tree more than 64 directories deep, no longer look every component of a directory's path up again for each directory below the 64th, which made such a walk take time quadratic in its depth where each lookup is slow, as under gVisor (`find` over 2,000 levels took 97 seconds there): each directory now opens relative to its parent, and a parent the walk returns to opens through its child's `..`, taken only when it is still the directory the walk left
 
 ## [18.18.6] - 2026-11-09
 

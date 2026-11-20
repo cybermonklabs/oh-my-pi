@@ -190,9 +190,19 @@ struct Frame {
 	/// Depth of this directory; its entries sit one level deeper.
 	depth:    usize,
 	ignore:   Option<Arc<IgnoreFrame>>,
-	/// The open directory, for relative child opens (`None` for the root,
-	/// whose handle is [`Cx::root_dir`], and past [`MAX_OPEN_DIRS`]).
+	/// The open directory, for relative child opens. `None` for the root,
+	/// whose handle is [`Cx::root_dir`]; while the frame is too shallow to
+	/// keep it (see [`MAX_OPEN_DIRS`]); and once the directory could not be
+	/// found again (`lost`).
 	dir:      Option<Dir>,
+	/// Identity of `dir`, recorded when it was closed to keep the window of
+	/// open directories, so that reopening it can be checked.
+	id:       Option<FileId>,
+	/// Reached by following a symlink: its `..` is not its walk parent.
+	followed: bool,
+	/// Its handle could not be opened again as the same directory: it was
+	/// moved or replaced. Its remaining subdirectories are not entered.
+	lost:     bool,
 	/// Path lengths to restore once the directory is done.
 	rel_len:  usize,
 	abs_len:  usize,
@@ -212,9 +222,13 @@ impl Drop for Stack {
 }
 
 /// Directory handles kept open down the stack for relative child opens, the
-/// root's included; deeper directories open below the root's handle, with no
-/// symlink followed on the way ([`Session::open_dir_beneath`]; by path under
-/// [`Follow::Always`]), so deep trees cannot exhaust descriptors.
+/// root's included: the deepest frames keep theirs, so every child opens
+/// relative to its parent whatever the depth, and deep trees cannot exhaust
+/// descriptors. A frame that gave its handle up gets it back when the walk
+/// returns to it, through its child's `..`, else below the root's handle
+/// with no symlink followed on the way ([`Session::open_dir_beneath`]; by
+/// path under [`Follow::Always`]), and only as the directory whose identity
+/// it recorded.
 pub(crate) const MAX_OPEN_DIRS: usize = 64;
 
 /// Where a [`Tree`] is in its traversal.
@@ -337,21 +351,23 @@ impl Tree {
 				mtime: full.then_some(info.stamp.mtime),
 			},
 			cx: Cx {
-				abs:       abs_root.as_os_str().as_encoded_bytes().to_vec(),
-				fs:        fs.clone(),
-				opts:      opts.clone(),
-				session:   ManuallyDrop::new(session),
-				root:      abs_root,
-				ignorer:   None,
-				root_dev:  None,
-				root_dir:  None,
-				ancestors: Vec::new(),
-				pool:      Vec::new(),
-				ign:       Vec::new(),
-				rel:       Vec::new(),
-				open_dirs: 0,
-				error:     None,
-				after:     After::Nothing,
+				abs:                abs_root.as_os_str().as_encoded_bytes().to_vec(),
+				fs:                 fs.clone(),
+				opts:               opts.clone(),
+				session:            ManuallyDrop::new(session),
+				root:               abs_root,
+				ignorer:            None,
+				root_dev:           None,
+				root_dir:           None,
+				ancestors:          Vec::new(),
+				pool:               Vec::new(),
+				ign:                Vec::new(),
+				rel:                Vec::new(),
+				open_dirs:          0,
+				#[cfg(test)]
+				opens:              Opens::default(),
+				error:              None,
+				after:              After::Nothing,
 			},
 		})
 	}
@@ -382,6 +398,12 @@ impl Tree {
 	/// entries with [`Session::open_file_beneath`].
 	pub(crate) const fn root_dir(&self) -> Option<&Arc<Dir>> {
 		self.cx.root_dir.as_ref()
+	}
+
+	/// The directory opens this traversal made so far.
+	#[cfg(test)]
+	pub(crate) const fn opens(&self) -> Opens {
+		self.cx.opens
 	}
 
 	/// Runs the traversal to the next report.
@@ -416,7 +438,7 @@ impl Tree {
 						)
 						.await;
 					match listed {
-						Ok(Some(frame)) => self.stack.0.push(frame),
+						Ok(Some(frame)) => self.push(frame).await,
 						Ok(None) => self.cx.restore(descent.saved.0, descent.saved.1),
 						Err(error) => return Some(self.cx.error(error, None, descent.saved)),
 					}
@@ -439,7 +461,7 @@ impl Tree {
 					if self.root.file_type == FileType::Dir && self.cx.opts.max_depth != Some(0) {
 						match self.cx.open_root().await {
 							Ok(frame) => {
-								self.stack.0.push(frame);
+								self.push(frame).await;
 								self.phase = Phase::Walk;
 							},
 							Err(error) => {
@@ -456,6 +478,9 @@ impl Tree {
 					};
 					if frame.next == frame.listing.len() {
 						let frame = self.stack.0.pop().expect("the loop holds a frame");
+						if let Some(parent) = self.stack.0.last_mut() {
+							self.cx.reopen(parent, &frame).await;
+						}
 						if let Some(emit) = self.cx.close(frame) {
 							return Some(emit);
 						}
@@ -471,7 +496,7 @@ impl Tree {
 					match self.cx.enter(parent, index).await {
 						Entered::Next => {},
 						Entered::Emit(emit) => return Some(emit),
-						Entered::Push(frame) => self.stack.0.push(frame),
+						Entered::Push(frame) => self.push(frame).await,
 					}
 				},
 				Phase::Tail => {
@@ -484,6 +509,27 @@ impl Tree {
 					}
 				},
 			}
+		}
+	}
+
+	/// Pushes `frame`, the new deepest directory. Past [`MAX_OPEN_DIRS`]
+	/// open directories the shallowest frame that keeps a handle closes it,
+	/// recording its identity so that [`Cx::reopen`] can check the handle it
+	/// gets back.
+	async fn push(&mut self, frame: Frame) {
+		self.stack.0.push(frame);
+		while self.cx.open_dirs > MAX_OPEN_DIRS {
+			let Some(shallowest) = self
+				.stack
+				.0
+				.iter_mut()
+				.find(|frame| frame.dir.as_ref().is_some_and(Dir::holds_descriptor))
+			else {
+				break;
+			};
+			let dir = shallowest.dir.take().expect("the frame keeps a handle");
+			shallowest.id = self.cx.session.identify_dir(&dir).await.ok();
+			self.cx.open_dirs -= 1;
 		}
 	}
 }
@@ -516,10 +562,25 @@ struct Cx {
 	rel:       Vec<u8>,
 	/// Absolute path of the current entry (encoded `OsStr` bytes).
 	abs:       Vec<u8>,
+	/// Open directory handles the stack keeps, the root's included
+	/// (providers hold none).
 	open_dirs: usize,
+	#[cfg(test)]
+	opens:     Opens,
 	/// The failure [`Emit::Error`] reports.
 	error:     Option<DirError>,
 	after:     After,
+}
+
+/// Directory opens of a traversal, for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Opens {
+	/// Opens that look every component up: by absolute path, or below the
+	/// root's handle.
+	pub(crate) walked: usize,
+	/// A frame's handle reopened through its child's `..`.
+	pub(crate) parent: usize,
 }
 
 /// `bytes` (built from encoded `OsStr` pieces) as a path.
@@ -589,6 +650,10 @@ impl Cx {
 			None
 		};
 		let saved = (0, self.abs.len());
+		#[cfg(test)]
+		{
+			self.opens.walked += 1;
+		}
 		let dir = if self.opts.follow == Follow::Never {
 			self.session.open_dir_unlinked(&self.root).await?
 		} else {
@@ -605,7 +670,7 @@ impl Cx {
 	fn close(&mut self, frame: Frame) -> Option<Emit> {
 		let Frame { listing, dir, post, ancestor, rel_len, abs_len, .. } = frame;
 		self.pool.push(listing);
-		if dir.is_some() {
+		if dir.as_ref().is_some_and(Dir::holds_descriptor) {
 			self.open_dirs -= 1;
 		}
 		drop(dir);
@@ -712,10 +777,10 @@ impl Cx {
 	}
 
 	/// Opens and lists the directory `name` of `parent`: relative to
-	/// `parent`'s handle, or past [`MAX_OPEN_DIRS`] below the root's without
-	/// following a symlink on the way, and by path when `followed` (or deep
-	/// under [`Follow::Always`]); `None` when it lies on another filesystem
-	/// than the root.
+	/// `parent`'s handle, and by path when `followed`; `None` when it lies
+	/// on another filesystem than the root. A `parent` that lost its handle
+	/// enters no subdirectory: it was moved or replaced while the walk was
+	/// below it.
 	#[expect(clippy::too_many_arguments, reason = "everything one entry decided")]
 	async fn list_child(
 		&mut self,
@@ -733,12 +798,18 @@ impl Cx {
 			None if parent.depth == 0 => self.root_dir.as_deref(),
 			None => None,
 		};
-		let dir = match (parent_dir, &self.root_dir, followed) {
-			(Some(dir), _, false) => self.session.open_child(dir, name).await?,
-			(None, Some(root), false) if self.opts.follow != Follow::Always => {
-				self.session.open_dir_beneath(root, &self.rel).await?
+		let dir = match (parent_dir, followed) {
+			(Some(dir), false) => self.session.open_child(dir, name).await?,
+			(None, false) => {
+				return Err(io::Error::other("the directory was moved or replaced during the walk"));
 			},
-			_ => self.session.open_dir(as_path(&self.abs)).await?,
+			(_, true) => {
+				#[cfg(test)]
+				{
+					self.opens.walked += 1;
+				}
+				self.session.open_dir(as_path(&self.abs)).await?
+			},
 		};
 		if let Some(root) = self.root_dev {
 			let id = match target {
@@ -749,10 +820,84 @@ impl Cx {
 				return Ok(None);
 			}
 		}
-		self
+		let mut frame = self
 			.open_frame(dir, depth, parent.ignore.as_ref(), children, post, saved)
+			.await?;
+		frame.followed = followed;
+		Ok(Some(frame))
+	}
+
+	/// Gives `parent`, which the walk returns to from `child`, the handle it
+	/// closed to keep the window of open directories: through `child`'s
+	/// `..`, else as it was first reached, and only as the directory whose
+	/// identity it recorded. Otherwise `parent` is lost: it was moved or
+	/// replaced while the walk was below it, and whatever now answers to
+	/// `..` or to its path is not walked as it. The root keeps its handle in
+	/// [`Cx::root_dir`].
+	async fn reopen(&mut self, parent: &mut Frame, child: &Frame) {
+		if parent.dir.is_some() || parent.lost || parent.depth == 0 {
+			return;
+		}
+		let Some(id) = parent.id else {
+			parent.lost = true;
+			return;
+		};
+		let through_child = if !child.followed
+			&& let Some(dir) = &child.dir
+			&& let Ok(up) = self.session.open_parent(dir)
+			&& self
+				.session
+				.identify_dir(&up)
+				.await
+				.is_ok_and(|got| got == id)
+		{
+			#[cfg(test)]
+			{
+				self.opens.parent += 1;
+			}
+			Some(up)
+		} else {
+			None
+		};
+		let found = match through_child {
+			Some(dir) => Some(dir),
+			// `child`'s saved lengths are its parent's paths.
+			None => self.open_as(child.rel_len, child.abs_len, id).await,
+		};
+		match found {
+			Some(dir) => {
+				self.open_dirs += usize::from(dir.holds_descriptor());
+				parent.dir = Some(dir);
+			},
+			None => parent.lost = true,
+		}
+	}
+
+	/// Opens the directory at the first `rel_len` bytes of the walk-relative
+	/// path: below the root's handle with no symlink followed on the way, or
+	/// by the first `abs_len` bytes of the absolute path under
+	/// [`Follow::Always`]; only when it is still the one with identity `id`.
+	async fn open_as(&mut self, rel_len: usize, abs_len: usize, id: FileId) -> Option<Dir> {
+		#[cfg(test)]
+		{
+			self.opens.walked += 1;
+		}
+		let dir = match &self.root_dir {
+			Some(root) if self.opts.follow != Follow::Always => {
+				self
+					.session
+					.open_dir_beneath(root, &self.rel[..rel_len])
+					.await
+			},
+			_ => self.session.open_dir(as_path(&self.abs[..abs_len])).await,
+		}
+		.ok()?;
+		self
+			.session
+			.identify_dir(&dir)
 			.await
-			.map(Some)
+			.is_ok_and(|got| got == id)
+			.then_some(dir)
 	}
 
 	/// Lists the open `dir` at `depth` into a new frame.
@@ -814,14 +959,16 @@ impl Cx {
 		} else {
 			false
 		};
-		let dir = (self.open_dirs < MAX_OPEN_DIRS).then_some(dir);
-		self.open_dirs += usize::from(dir.is_some());
+		self.open_dirs += usize::from(dir.holds_descriptor());
 		Ok(Frame {
 			listing,
 			next: 0,
 			depth,
 			ignore,
-			dir,
+			dir: Some(dir),
+			id: None,
+			followed: false,
+			lost: false,
 			rel_len: saved.0,
 			abs_len: saved.1,
 			post,

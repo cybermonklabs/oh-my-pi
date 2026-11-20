@@ -671,8 +671,8 @@ mod tests {
 
 	impl Tree {
 		fn new(tag: &str) -> Self {
-			let base =
-				std::env::temp_dir().join(format!("pi-walker-linux-{tag}-{}", std::process::id()));
+			let base = crate::testing::temp_root()
+				.join(format!("pi-walker-linux-{tag}-{}", std::process::id()));
 			let _ = fs::remove_dir_all(&base);
 			fs::create_dir_all(base.join("a")).expect("create a");
 			fs::write(base.join("a/f"), "f").expect("write a/f");

@@ -336,6 +336,12 @@ pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::R
 	nt_open(s, parent, name, DIR_ACCESS, FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT)
 }
 
+/// A relative `NtCreateFile` name cannot climb with `..`, so a parent is
+/// opened again below the root instead (the caller's fallback).
+pub(crate) fn open_parent(_s: &mut Scratch, _child: &Handle) -> io::Result<Handle> {
+	Err(io::ErrorKind::Unsupported.into())
+}
+
 const fn is_dot_or_dot_dot_utf16(name: &[u8]) -> bool {
 	matches!(name, [b'.', 0] | [b'.', 0, b'.', 0])
 }
@@ -855,7 +861,8 @@ mod tests {
 	/// query is not checked, and when none refused it the test prints UNKNOWN.
 	#[test]
 	fn a_file_that_refuses_the_attribute_query_is_stated_through_std() {
-		let held = std::env::temp_dir().join(format!("pi-walker-locked-{}", std::process::id()));
+		let held =
+			crate::testing::temp_root().join(format!("pi-walker-locked-{}", std::process::id()));
 		std::fs::write(&held, b"held").unwrap();
 		let lock = std::fs::OpenOptions::new()
 			.read(true)
