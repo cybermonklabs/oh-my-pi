@@ -607,7 +607,14 @@ mod tests {
 		);
 		drop(child_out);
 		let mut cx = Context::from_waker(Waker::noop());
-		pumps.poll(&mut cx, &tracker);
+		// End of file comes once every holder of the write end has closed it. A
+		// process another test of this process forks holds a copy until its
+		// exec, which delays end of file and never holds it off
+		// ([`crate::testkit::child::Gate`]): poll until the drain is reported.
+		while tracker.lock().draining() > 3 {
+			pumps.poll(&mut cx, &tracker);
+			std::thread::yield_now();
+		}
 		pumps.poll(&mut cx, &tracker);
 		assert_eq!(tracker.lock().draining(), 3, "end of file drained one half, once");
 		drop(pumps);
