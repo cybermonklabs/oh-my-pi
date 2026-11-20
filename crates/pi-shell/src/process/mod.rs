@@ -691,6 +691,7 @@ pub fn shell_init(
 	let zsh_fpath = (args.mode.dialect() == Dialect::Zsh)
 		.then(|| system_fpath(&env))
 		.flatten();
+	let login_home = args.login_home(&env);
 	ShellInit {
 		mode: args.mode,
 		argv0,
@@ -704,6 +705,7 @@ pub fn shell_init(
 		zsh_params: zsh_params(args),
 		zsh_fpath,
 		profile: Profile::User,
+		login_home,
 	}
 }
 

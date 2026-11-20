@@ -918,6 +918,70 @@ fn an_interactive_shell_runs_its_exit_trap_on_a_hup() -> io::Result<()> {
 	Ok(())
 }
 
+/// A login-HOME case: obash runs as `argv0` with `args` (and `env` set),
+/// without `HOME`, and prints `stdout`.
+struct LoginCase {
+	argv0:  &'static str,
+	args:   Vec<OsString>,
+	env:    Option<&'static str>,
+	stdout: String,
+}
+
+/// bash sets `HOME` from the password database when the environment has
+/// none only as a login shell by `argv[0]` (`-bash`, `-sh`), not with `-l`
+/// (`-bash -l` sets none) and not in posix mode at startup (`-o posix`,
+/// `--posix`, `POSIXLY_CORRECT`, `POSIX_PEDANTIC`; an `sh`'s posix mode
+/// starts after). `$0` does not decide: it is the name after `-c string`,
+/// or the script.
+#[test]
+fn bash_sets_home_only_as_a_login_shell_by_argv0() {
+	const SHOW: &str = "echo \"[${HOME-unset}] [$0]\"";
+	let Some((_, home)) = passwd_entry() else {
+		zsh_oracle::uncompared("the uid running the tests has no password database entry");
+		return;
+	};
+	let dir = tempfile::tempdir().expect("a directory for the script");
+	let script = dir.path().join("s.sh");
+	fs::write(&script, format!("{SHOW}\n")).expect("write the script");
+	let show = OsString::from(SHOW);
+	let case = |argv0, args: &[&OsStr], env, stdout: String| LoginCase {
+		argv0,
+		args: args.iter().map(|&a| a.to_owned()).collect(),
+		env,
+		stdout,
+	};
+	let os = |s: &'static str| OsStr::new(s);
+	let cases = [
+		case("bash", &[os("-c"), &show, os("-x")], None, "[unset] [-x]\n".into()),
+		case("-bash", &[script.as_os_str()], None, format!("[{home}] [{}]\n", script.display())),
+		case("-sh", &[os("-c"), &show], None, format!("[{home}] [-sh]\n")),
+		case("-bash", &[os("-l"), os("-c"), &show], None, "[unset] [-bash]\n".into()),
+		case("-bash", &[os("-c"), &show], None, format!("[{home}] [-bash]\n")),
+		case("bash", &[os("-l"), os("-c"), &show], None, "[unset] [bash]\n".into()),
+		case("-bash", &[os("-o"), os("posix"), os("-c"), &show], None, "[unset] [-bash]\n".into()),
+		case("-bash", &[os("+o"), os("posix"), os("-c"), &show], None, format!("[{home}] [-bash]\n")),
+		case("-bash", &[os("--posix"), os("-c"), &show], None, "[unset] [-bash]\n".into()),
+		case("-bash", &[os("-c"), &show], Some("POSIXLY_CORRECT"), "[unset] [-bash]\n".into()),
+		case("-bash", &[os("-c"), &show], Some("POSIX_PEDANTIC"), "[unset] [-bash]\n".into()),
+	];
+	for LoginCase { argv0, args, env, stdout } in cases {
+		let run = |program: &OsStr| {
+			let run = Run::new(program, argv0, &args).env_remove("HOME");
+			match env {
+				Some(name) => run.env(name, "1"),
+				None => run,
+			}
+			.go()
+		};
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let shown = format!("{argv0} {args:?} with {env:?}");
+		assert_eq!(String::from_utf8_lossy(&ours.stdout), stdout, "{shown}: {ours:?}");
+		if let Some(bash) = real_bash() {
+			assert_eq!(ours, run(bash.as_os_str()), "{shown}");
+		}
+	}
+}
+
 /// The bash cases need bash 5.2 or later
 /// ([`process_support::BASH_OLDEST`]): an older bash is refused, and the
 /// test says so on an `UNCOMPARED:` line. Here a stand-in reports the bash

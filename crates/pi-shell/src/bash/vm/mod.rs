@@ -160,6 +160,10 @@ pub struct ShellInit {
 	pub zsh_fpath:   Option<Vec<BString>>,
 	/// Whose shell it is: a user's, or a program's ([`Profile::Tool`]).
 	pub profile:     Profile,
+	/// bash sets `HOME` from the password database when the environment has
+	/// none: a login shell by `argv[0]` outside posix mode
+	/// ([`crate::bash::invocation::ShellArgs::login_home`]).
+	pub login_home:  bool,
 }
 
 /// Whose shell a [`Shell`] is, which decides whether it may touch its
@@ -211,6 +215,7 @@ impl Default for ShellInit {
 			zsh_params:  Vec::new(),
 			zsh_fpath:   None,
 			profile:     Profile::User,
+			login_home:  false,
 		}
 	}
 }
@@ -1256,15 +1261,7 @@ fn startup_vars(k: &mut Kernel, cx: &mut Cx<'_>, init: &ShellInit) -> Result<(),
 		startup_values(cx, &init.argv0, ppid, k.engine.config().platform, StartupVars {
 			lookup_shell: need_shell && !deferred_shell,
 			interactive:  init.interactive,
-			login_home:   init.argv0.first() == Some(&b'-')
-				&& !init
-					.options
-					.iter()
-					.any(|(n, on)| *on && n.as_slice() == b"posix")
-				&& !init
-					.env
-					.iter()
-					.any(|(n, _)| n.as_slice() == b"POSIXLY_CORRECT"),
+			login_home:   init.login_home,
 		})
 	};
 	// zsh started as sh or ksh has no `MANPATH` and no prompt aliases
@@ -1473,9 +1470,8 @@ pub fn zsh_startup_values(
 pub struct StartupVars {
 	lookup_shell: bool,
 	interactive:  bool,
-	/// A login shell by name (`argv[0]` `-bash`; bash's `login_shell == 1`,
-	/// which `-l` does not make) not in posix mode: bash sets `HOME` when
-	/// the environment has none (`variables.c`: `set_home_var`).
+	/// bash sets `HOME` when the environment has none
+	/// ([`crate::bash::invocation::ShellArgs::login_home`]).
 	login_home:   bool,
 }
 
