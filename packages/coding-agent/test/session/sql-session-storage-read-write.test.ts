@@ -9,11 +9,14 @@
  * default is still read-only. A read-only default the connection's start
  * parameters set, as a database or role default would, is honoured instead:
  * the store refuses every write there and writes nothing. A session that turns
- * that default off again writes there, as older releases did. A last test
+ * that default off again writes there, as older releases did. A last group
  * starts several stores at once on new tables, with the server's default left
  * as it is. Runs only when `OMP_TEST_SQL_POSTGRES_URL` names a throwaway database.
- * That URL must be a direct connection, not one through a transaction-mode
- * pooler, because the read-only tests set that default at session level.
+ * The first three groups run on a direct connection only: they set that
+ * default at session level or as a start parameter, which a transaction-mode
+ * pooler neither keeps nor passes on, so they skip under
+ * `OMP_TEST_SQL_POSTGRES_POOLER=transaction` (see
+ * `POSTGRES_TRANSACTION_POOLER`). The last group runs through a pooler too.
  * Every test uses its own tables and drops them when done.
  */
 import { SQL } from "bun";
@@ -22,6 +25,7 @@ import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-ti
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import { POSTGRES_TRANSACTION_POOLER } from "./sql-session-lease-fixture";
 
 const url = process.env.OMP_TEST_SQL_POSTGRES_URL;
 
@@ -138,197 +142,201 @@ async function columns(db: Pick<Db, "other">, table: string): Promise<string[]> 
 	return rows.map(row => row.column_name);
 }
 
-describe.skipIf(!url)("SqlSessionStorage on a PostgreSQL connection whose transactions default to read-only", () => {
-	it("starts again on tables that exist", async () => {
-		const path = "/sessions/p/kept.jsonl";
-		const { db } = await readOnlyStore({ [path]: "kept\n" });
+// Direct connection only: every test sets the read-only default at session level on the store's one connection.
+describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
+	"SqlSessionStorage on a PostgreSQL connection whose transactions default to read-only",
+	() => {
+		it("starts again on tables that exist", async () => {
+			const path = "/sessions/p/kept.jsonl";
+			const { db } = await readOnlyStore({ [path]: "kept\n" });
 
-		const storage = await open(db);
+			const storage = await open(db);
 
-		expect(await storage.readText(path)).toBe("kept\n");
-		expect(await stored(db, path)).toBe("kept\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("creates its tables", async () => {
-		const db = await connect();
-		await setReadOnly(db);
-
-		const storage = await open(db);
-
-		expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
-		expect(await columns(db, `${db.table}_parts`)).toEqual(["content", "path", "start_offset"]);
-		const path = "/sessions/p/new.jsonl";
-		await storage.writeText(path, "new\n");
-		expect(await storage.readText(path)).toBe("new\n");
-		expect(await stored(db, path)).toBe("new\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("migrates a session table from before titles and parts", async () => {
-		const db = await connect();
-		const path = "/sessions/p/old.jsonl";
-		const content = "old ✓\n";
-		await db.other.unsafe(
-			`CREATE TABLE ${db.table} (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL)`,
-		);
-		await db.other.unsafe(`INSERT INTO ${db.table} (path, content, mtime_ms) VALUES ($1, $2, 1)`, [path, content]);
-		await setReadOnly(db);
-
-		const storage = await open(db);
-
-		expect(await storage.readText(path)).toBe(content);
-		expect(storage.statSync(path).size).toBe(Buffer.byteLength(content));
-		expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
-		const rows = (await db.other.unsafe(`SELECT byte_len FROM ${db.table} WHERE path = $1`, [path])) as Array<{
-			byte_len: number | bigint | string;
-		}>;
-		expect(Number(rows[0]?.byte_len)).toBe(Buffer.byteLength(content));
-		expect(await stored(db, path)).toBe(content);
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("appends through a writer", async () => {
-		const { db, storage } = await readOnlyStore();
-		const path = "/sessions/p/appended.jsonl";
-
-		const writer = storage.openWriter(path);
-		await writer.append("one\n");
-		await writer.append("two ✓\n");
-		await writer.close();
-
-		expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
-		expect(await stored(db, path)).toBe("one\ntwo ✓\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("appends through a writer when SET SESSION CHARACTERISTICS made the session read-only", async () => {
-		const db = await connect();
-		const storage = await open(db);
-		await setReadOnly(db, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
-		const path = "/sessions/p/characteristics.jsonl";
-
-		const writer = storage.openWriter(path);
-		await writer.append("one\n");
-		await writer.append("two ✓\n");
-		await writer.close();
-
-		expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
-		expect(await stored(db, path)).toBe("one\ntwo ✓\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("writes a session whole", async () => {
-		const { db, storage } = await readOnlyStore();
-		const path = "/sessions/p/written.jsonl";
-
-		await storage.writeText(path, "whole ✓\n");
-
-		expect(await storage.readText(path)).toBe("whole ✓\n");
-		expect(await stored(db, path)).toBe("whole ✓\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("creates a session and replaces it at its size", async () => {
-		const { db, storage } = await readOnlyStore();
-		const path = "/sessions/p/atomic.jsonl";
-
-		await storage.writeTextAtomic(path, "first\n", { expectedSize: null });
-		expect(await stored(db, path)).toBe("first\n");
-		await storage.writeTextAtomic(path, "second ✓\n", { expectedSize: storage.statSync(path).size });
-
-		expect(await storage.readText(path)).toBe("second ✓\n");
-		expect(await stored(db, path)).toBe("second ✓\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("truncates a session through a writer opened with flags w", async () => {
-		const path = "/sessions/p/truncated.jsonl";
-		const { db, storage } = await readOnlyStore({ [path]: "old\nlines\n" });
-
-		const writer = storage.openWriter(path, { flags: "w" });
-		await writer.append("fresh\n");
-		await writer.close();
-
-		expect(await storage.readText(path)).toBe("fresh\n");
-		expect(await stored(db, path)).toBe("fresh\n");
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	it("updates a session's title", async () => {
-		const path = "/sessions/p/titled.jsonl";
-		const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
-		const { db, storage } = await readOnlyStore({
-			[path]: `${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${header}`,
-		});
-
-		await storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" });
-
-		await storage.refresh();
-		expect(JSON.parse((await storage.readText(path)).split("\n")[0])).toMatchObject({
-			type: "title",
-			title: "New",
-			source: "user",
-			updatedAt: "t2",
-		});
-		const rows = (await db.other.unsafe(
-			`SELECT title, title_source, title_updated_at FROM ${db.table} WHERE path = $1`,
-			[path],
-		)) as Array<{ title: string; title_source: string; title_updated_at: string }>;
-		expect(rows[0]).toEqual({ title: "New", title_source: "user", title_updated_at: "t2" });
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-
-	// Two kinds of write: `rename` first deletes any row at `to`, `renameNoReplace` never does.
-	for (const method of ["rename", "renameNoReplace"] as const) {
-		it(`moves a session through ${method}`, async () => {
-			const from = "/sessions/p/from.jsonl";
-			const to = "/sessions/q/to.jsonl";
-			const { db, storage } = await readOnlyStore({ [from]: "moved\n" });
-
-			await storage[method](from, to);
-
-			await storage.refresh();
-			expect(storage.existsSync(from)).toBe(false);
-			expect(await storage.readText(to)).toBe("moved\n");
-			expect(await stored(db, from)).toBeNull();
-			expect(await storedParts(db, from)).toEqual([]);
-			expect(await stored(db, to)).toBe("moved\n");
+			expect(await storage.readText(path)).toBe("kept\n");
+			expect(await stored(db, path)).toBe("kept\n");
 			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
 		});
-	}
 
-	it("unlinks a session", async () => {
-		const path = "/sessions/p/unlinked.jsonl";
-		const { db, storage } = await readOnlyStore({ [path]: "gone\n" });
+		it("creates its tables", async () => {
+			const db = await connect();
+			await setReadOnly(db);
 
-		await storage.unlink(path);
+			const storage = await open(db);
 
-		await storage.refresh();
-		expect(storage.existsSync(path)).toBe(false);
-		expect(await stored(db, path)).toBeNull();
-		expect(await storedParts(db, path)).toEqual([]);
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
+			expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
+			expect(await columns(db, `${db.table}_parts`)).toEqual(["content", "path", "start_offset"]);
+			const path = "/sessions/p/new.jsonl";
+			await storage.writeText(path, "new\n");
+			expect(await storage.readText(path)).toBe("new\n");
+			expect(await stored(db, path)).toBe("new\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
 
-	it("deletes a session with its artifacts", async () => {
-		// The delete also removes the artifacts directory from local disk.
-		using dir = TempDir.createSync("@omp-sql-read-write-");
-		const session = dir.join("s.jsonl");
-		const artifact = dir.join("s", "x.jsonl");
-		const { db, storage } = await readOnlyStore({ [session]: "session\n", [artifact]: "artifact\n" });
+		it("migrates a session table from before titles and parts", async () => {
+			const db = await connect();
+			const path = "/sessions/p/old.jsonl";
+			const content = "old ✓\n";
+			await db.other.unsafe(
+				`CREATE TABLE ${db.table} (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms BIGINT NOT NULL)`,
+			);
+			await db.other.unsafe(`INSERT INTO ${db.table} (path, content, mtime_ms) VALUES ($1, $2, 1)`, [path, content]);
+			await setReadOnly(db);
 
-		await storage.deleteSessionWithArtifacts(session);
+			const storage = await open(db);
 
-		await storage.refresh();
-		for (const path of [session, artifact]) {
+			expect(await storage.readText(path)).toBe(content);
+			expect(storage.statSync(path).size).toBe(Buffer.byteLength(content));
+			expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
+			const rows = (await db.other.unsafe(`SELECT byte_len FROM ${db.table} WHERE path = $1`, [path])) as Array<{
+				byte_len: number | bigint | string;
+			}>;
+			expect(Number(rows[0]?.byte_len)).toBe(Buffer.byteLength(content));
+			expect(await stored(db, path)).toBe(content);
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("appends through a writer", async () => {
+			const { db, storage } = await readOnlyStore();
+			const path = "/sessions/p/appended.jsonl";
+
+			const writer = storage.openWriter(path);
+			await writer.append("one\n");
+			await writer.append("two ✓\n");
+			await writer.close();
+
+			expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
+			expect(await stored(db, path)).toBe("one\ntwo ✓\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("appends through a writer when SET SESSION CHARACTERISTICS made the session read-only", async () => {
+			const db = await connect();
+			const storage = await open(db);
+			await setReadOnly(db, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY");
+			const path = "/sessions/p/characteristics.jsonl";
+
+			const writer = storage.openWriter(path);
+			await writer.append("one\n");
+			await writer.append("two ✓\n");
+			await writer.close();
+
+			expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
+			expect(await stored(db, path)).toBe("one\ntwo ✓\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("writes a session whole", async () => {
+			const { db, storage } = await readOnlyStore();
+			const path = "/sessions/p/written.jsonl";
+
+			await storage.writeText(path, "whole ✓\n");
+
+			expect(await storage.readText(path)).toBe("whole ✓\n");
+			expect(await stored(db, path)).toBe("whole ✓\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("creates a session and replaces it at its size", async () => {
+			const { db, storage } = await readOnlyStore();
+			const path = "/sessions/p/atomic.jsonl";
+
+			await storage.writeTextAtomic(path, "first\n", { expectedSize: null });
+			expect(await stored(db, path)).toBe("first\n");
+			await storage.writeTextAtomic(path, "second ✓\n", { expectedSize: storage.statSync(path).size });
+
+			expect(await storage.readText(path)).toBe("second ✓\n");
+			expect(await stored(db, path)).toBe("second ✓\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("truncates a session through a writer opened with flags w", async () => {
+			const path = "/sessions/p/truncated.jsonl";
+			const { db, storage } = await readOnlyStore({ [path]: "old\nlines\n" });
+
+			const writer = storage.openWriter(path, { flags: "w" });
+			await writer.append("fresh\n");
+			await writer.close();
+
+			expect(await storage.readText(path)).toBe("fresh\n");
+			expect(await stored(db, path)).toBe("fresh\n");
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("updates a session's title", async () => {
+			const path = "/sessions/p/titled.jsonl";
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			const { db, storage } = await readOnlyStore({
+				[path]: `${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${header}`,
+			});
+
+			await storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" });
+
+			await storage.refresh();
+			expect(JSON.parse((await storage.readText(path)).split("\n")[0])).toMatchObject({
+				type: "title",
+				title: "New",
+				source: "user",
+				updatedAt: "t2",
+			});
+			const rows = (await db.other.unsafe(
+				`SELECT title, title_source, title_updated_at FROM ${db.table} WHERE path = $1`,
+				[path],
+			)) as Array<{ title: string; title_source: string; title_updated_at: string }>;
+			expect(rows[0]).toEqual({ title: "New", title_source: "user", title_updated_at: "t2" });
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		// Two kinds of write: `rename` first deletes any row at `to`, `renameNoReplace` never does.
+		for (const method of ["rename", "renameNoReplace"] as const) {
+			it(`moves a session through ${method}`, async () => {
+				const from = "/sessions/p/from.jsonl";
+				const to = "/sessions/q/to.jsonl";
+				const { db, storage } = await readOnlyStore({ [from]: "moved\n" });
+
+				await storage[method](from, to);
+
+				await storage.refresh();
+				expect(storage.existsSync(from)).toBe(false);
+				expect(await storage.readText(to)).toBe("moved\n");
+				expect(await stored(db, from)).toBeNull();
+				expect(await storedParts(db, from)).toEqual([]);
+				expect(await stored(db, to)).toBe("moved\n");
+				expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			});
+		}
+
+		it("unlinks a session", async () => {
+			const path = "/sessions/p/unlinked.jsonl";
+			const { db, storage } = await readOnlyStore({ [path]: "gone\n" });
+
+			await storage.unlink(path);
+
+			await storage.refresh();
 			expect(storage.existsSync(path)).toBe(false);
 			expect(await stored(db, path)).toBeNull();
 			expect(await storedParts(db, path)).toEqual([]);
-		}
-		expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
-	});
-});
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+
+		it("deletes a session with its artifacts", async () => {
+			// The delete also removes the artifacts directory from local disk.
+			using dir = TempDir.createSync("@omp-sql-read-write-");
+			const session = dir.join("s.jsonl");
+			const artifact = dir.join("s", "x.jsonl");
+			const { db, storage } = await readOnlyStore({ [session]: "session\n", [artifact]: "artifact\n" });
+
+			await storage.deleteSessionWithArtifacts(session);
+
+			await storage.refresh();
+			for (const path of [session, artifact]) {
+				expect(storage.existsSync(path)).toBe(false);
+				expect(await stored(db, path)).toBeNull();
+				expect(await storedParts(db, path)).toEqual([]);
+			}
+			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+		});
+	},
+);
 
 /**
  * A store's connection whose transactions default to read-only from its start
@@ -360,49 +368,53 @@ async function storedCounts(db: Db): Promise<{ sessions: number; parts: number }
  * decision, so the store honours it: it refuses to start or write, and
  * nothing reaches the database.
  */
-describe.skipIf(!url)("a read-only default the connection's start sets is honoured", () => {
-	it("refuses to create its tables", async () => {
-		const db = await connectReadOnlyAtStart();
+// Direct connection only: the read-only default is the connection's start parameter.
+describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
+	"a read-only default the connection's start sets is honoured",
+	() => {
+		it("refuses to create its tables", async () => {
+			const db = await connectReadOnlyAtStart();
 
-		await expect(open(db)).rejects.toThrow("default_transaction_read_only");
+			await expect(open(db)).rejects.toThrow("default_transaction_read_only");
 
-		expect(await columns(db, db.table)).toEqual([]);
-		expect(await columns(db, `${db.table}_parts`)).toEqual([]);
-	});
+			expect(await columns(db, db.table)).toEqual([]);
+			expect(await columns(db, `${db.table}_parts`)).toEqual([]);
+		});
 
-	it("refuses to start on tables another client made", async () => {
-		const db = await connectReadOnlyAtStart();
-		await SqlSessionStorage.create({ client: db.other, table: db.table });
+		it("refuses to start on tables another client made", async () => {
+			const db = await connectReadOnlyAtStart();
+			await SqlSessionStorage.create({ client: db.other, table: db.table });
 
-		await expect(open(db)).rejects.toThrow("default_transaction_read_only");
+			await expect(open(db)).rejects.toThrow("default_transaction_read_only");
 
-		expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
-	});
+			expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
+		});
 
-	it("refuses an append through a writer on tables it does not create", async () => {
-		const db = await connectReadOnlyAtStart();
-		await SqlSessionStorage.create({ client: db.other, table: db.table });
-		const storage = await SqlSessionStorage.create({ client: db.client, table: db.table, createTable: false });
+		it("refuses an append through a writer on tables it does not create", async () => {
+			const db = await connectReadOnlyAtStart();
+			await SqlSessionStorage.create({ client: db.other, table: db.table });
+			const storage = await SqlSessionStorage.create({ client: db.client, table: db.table, createTable: false });
 
-		const writer = storage.openWriter("/sessions/p/appended.jsonl");
-		await expect(writer.append("refused\n")).rejects.toThrow("default_transaction_read_only");
-		await expect(writer.close()).rejects.toThrow("default_transaction_read_only");
+			const writer = storage.openWriter("/sessions/p/appended.jsonl");
+			await expect(writer.append("refused\n")).rejects.toThrow("default_transaction_read_only");
+			await expect(writer.close()).rejects.toThrow("default_transaction_read_only");
 
-		expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
-	});
+			expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
+		});
 
-	it("refuses to write a session whole on tables it does not create", async () => {
-		const db = await connectReadOnlyAtStart();
-		await SqlSessionStorage.create({ client: db.other, table: db.table });
-		const storage = await SqlSessionStorage.create({ client: db.client, table: db.table, createTable: false });
+		it("refuses to write a session whole on tables it does not create", async () => {
+			const db = await connectReadOnlyAtStart();
+			await SqlSessionStorage.create({ client: db.other, table: db.table });
+			const storage = await SqlSessionStorage.create({ client: db.client, table: db.table, createTable: false });
 
-		await expect(storage.writeText("/sessions/p/written.jsonl", "refused\n")).rejects.toThrow(
-			"default_transaction_read_only",
-		);
+			await expect(storage.writeText("/sessions/p/written.jsonl", "refused\n")).rejects.toThrow(
+				"default_transaction_read_only",
+			);
 
-		expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
-	});
-});
+			expect(await storedCounts(db)).toEqual({ sessions: 0, parts: 0 });
+		});
+	},
+);
 
 /** What a session that turned off a read-only default it started with reads. */
 const TURNED_OFF = { setting: "off", reset_val: "on" };
@@ -424,7 +436,8 @@ async function connectTurnedOff(): Promise<Db> {
  * `setting` is off. That session made the decision, and older releases wrote
  * there, so the store writes.
  */
-describe.skipIf(!url)("a session that turns such a default off writes", () => {
+// Direct connection only: a start parameter sets the read-only default and a session-level SET turns it off.
+describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)("a session that turns such a default off writes", () => {
 	it("creates its tables", async () => {
 		const db = await connectTurnedOff();
 
