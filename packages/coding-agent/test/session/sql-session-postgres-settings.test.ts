@@ -155,6 +155,9 @@ const CONDITIONAL_ORDER = [
 	).map(entry => entry.name),
 ];
 
+/** The statement the opening sends right before `SET LOCAL transaction_timeout TO DEFAULT`. */
+const STOP_TRANSACTION_TIMER = "SET LOCAL transaction_timeout = 0";
+
 describe("PG_SESSION_SETTINGS", () => {
 	describe("the list holds every name of each captured server", () => {
 		for (const file of CAPTURES) {
@@ -253,10 +256,17 @@ describe("PG_OPENING", () => {
 		expect(PG_OPENING[1]?.sql).toBe(`SET LOCAL application_name = '${PG_APPLICATION_NAME}'`);
 	});
 
-	it("holds one statement per set-local entry and no other, each conditional one last with the parameter it needs", () => {
+	it("holds one statement per set-local entry and no other, two for transaction_timeout (= 0, then TO DEFAULT), each conditional one last with the parameter it needs", () => {
 		const setLocal = PG_SESSION_SETTINGS.filter(isSetLocal);
 		const statements = PG_OPENING.slice(1);
-		expect(statements.filter(({ sql }) => !setLocal.some(entry => statementOf(entry) === sql))).toEqual([]);
+		// The one statement of no entry: transaction_timeout's `= 0`, which stops a timer the BEGIN started.
+		expect(
+			statements.filter(({ sql }) => sql !== STOP_TRANSACTION_TIMER && !setLocal.some(e => statementOf(e) === sql)),
+		).toEqual([]);
+		expect(statements.filter(({ sql }) => sql.startsWith("SET LOCAL transaction_timeout "))).toEqual([
+			{ sql: STOP_TRANSACTION_TIMER, needs: "transaction_timeout" },
+			{ sql: "SET LOCAL transaction_timeout TO DEFAULT", needs: "transaction_timeout" },
+		]);
 		expect(
 			setLocal
 				.filter(entry => statements.filter(({ sql }) => sql === statementOf(entry)).length !== 1)
@@ -301,7 +311,11 @@ describe("pgOpening", () => {
 	const cases: Array<[string, ReadonlySet<string>, string]> = [
 		["no conditional parameter", new Set(), NONE],
 		["only names that no conditional statement needs", new Set(["work_mem", "no_such_setting"]), NONE],
-		["transaction_timeout", new Set(["transaction_timeout"]), `${NONE}; SET LOCAL transaction_timeout TO DEFAULT`],
+		[
+			"transaction_timeout",
+			new Set(["transaction_timeout"]),
+			`${NONE}; ${STOP_TRANSACTION_TIMER}; SET LOCAL transaction_timeout TO DEFAULT`,
+		],
 		[
 			"restrict_nonsystem_relation_kind and cloudsql_session_read_only",
 			new Set(["restrict_nonsystem_relation_kind", "cloudsql_session_read_only"]),
@@ -310,7 +324,7 @@ describe("pgOpening", () => {
 		[
 			"every conditional parameter",
 			new Set(CONDITIONAL_ORDER),
-			[NONE, ...CONDITIONAL_ORDER.map(name => `SET LOCAL ${name} TO DEFAULT`)].join("; "),
+			[NONE, STOP_TRANSACTION_TIMER, ...CONDITIONAL_ORDER.map(name => `SET LOCAL ${name} TO DEFAULT`)].join("; "),
 		],
 	];
 

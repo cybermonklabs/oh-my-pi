@@ -585,6 +585,26 @@ const OPENING_HEAD = [
 /** The conditional statements that come first among the conditional ones. */
 const CONDITIONAL_HEAD = ["transaction_timeout", "cloudsql_session_read_only"];
 
+/**
+ * The statement the opening sends right before `SET LOCAL transaction_timeout
+ * TO DEFAULT`, where the server has the parameter; the transaction still runs
+ * with the default. On PostgreSQL 17 and 18, `BEGIN` arms the transaction
+ * timer with the session's value (`StartTransaction`,
+ * `src/backend/access/transam/xact.c`), which can be one another client left.
+ * A `SET LOCAL` in the transaction changes that timer only through the
+ * parameter's assign hook (`assign_transaction_timeout`,
+ * `src/backend/tcop/postgres.c`): it starts a timer only when none runs, and
+ * stops a running one only for a new value of 0 or less. So with a positive
+ * default, `TO DEFAULT` alone would leave a shorter timer that another client
+ * left running, and at its end the server terminates the connection with
+ * `25P04`. The value 0 stops that timer; `TO DEFAULT` then starts one with the
+ * default.
+ */
+const STOP_TRANSACTION_TIMER: PgOpeningStatement = {
+	sql: "SET LOCAL transaction_timeout = 0",
+	needs: "transaction_timeout",
+};
+
 function buildOpening(): PgOpeningStatement[] {
 	const statements = new Map<string, PgOpeningStatement>();
 	for (const setting of PG_SESSION_SETTINGS) {
@@ -599,7 +619,7 @@ function buildOpening(): PgOpeningStatement[] {
 		return statement;
 	};
 	const head = OPENING_HEAD.map(take);
-	const conditionalHead = CONDITIONAL_HEAD.map(take);
+	const conditionalHead = [STOP_TRANSACTION_TIMER, ...CONDITIONAL_HEAD.map(take)];
 	const rest = [...statements.values()];
 	return [
 		{ sql: `${READ_COMMITTED_BEGIN} READ WRITE` },
@@ -614,14 +634,16 @@ function buildOpening(): PgOpeningStatement[] {
  * The write opening's statements in the order the store sends them: `BEGIN`,
  * the `application_name` mark, `exit_on_error`, the three timeouts, every
  * other set-local entry in list order, and last the statements that need a
- * parameter some supported server lacks, each with that parameter.
+ * parameter some supported server lacks, each with that parameter:
+ * `transaction_timeout`'s two ({@link STOP_TRANSACTION_TIMER}, then `TO
+ * DEFAULT`) first.
  */
 export const PG_OPENING: readonly PgOpeningStatement[] = buildOpening();
 
-/** The parameters the conditional statements of {@link PG_OPENING} need, in its order; the store's probe reads them. */
-export const PG_CONDITIONAL_PARAMETERS: readonly string[] = PG_OPENING.flatMap(statement =>
-	statement.needs === undefined ? [] : [statement.needs],
-);
+/** The parameters the conditional statements of {@link PG_OPENING} need, each once, in its order; the store's probe reads them. */
+export const PG_CONDITIONAL_PARAMETERS: readonly string[] = [
+	...new Set(PG_OPENING.flatMap(statement => (statement.needs === undefined ? [] : [statement.needs]))),
+];
 
 const READ_BEGIN = `${READ_COMMITTED_BEGIN} READ ONLY`;
 

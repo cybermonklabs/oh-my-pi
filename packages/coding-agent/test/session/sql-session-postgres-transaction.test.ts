@@ -1,18 +1,25 @@
 /**
- * How `SqlSessionStorage` runs its statements on PostgreSQL, without a
- * server. A fake client hands out reserved connections that record every
- * message, `release()` and `close()`, and answer by a script in the shapes
- * Bun 1.4.4 gives: a simple query answers one result per statement, each with
- * its `command`; a server error has `name` `PostgresError` and the SQLSTATE
- * in `errno`; a lost connection has the code `ERR_POSTGRES_CONNECTION_CLOSED`
- * and no `errno`. The client's own `unsafe()` and `transaction()` refuse and
- * record the call: on PostgreSQL the store sends nothing there. It holds:
+ * How `SqlSessionStorage` runs its statements on PostgreSQL. Every case but
+ * the last runs without a server: a fake client hands out reserved
+ * connections that record every message, `release()` and `close()`, and
+ * answer by a script in the shapes Bun 1.4.4 gives: a simple query answers
+ * one result per statement, each with its `command`; a server error has
+ * `name` `PostgresError` and the SQLSTATE in `errno`; a lost connection has
+ * the code `ERR_POSTGRES_CONNECTION_CLOSED` and no `errno`. The client's own
+ * `unsafe()` and `transaction()` refuse and record the call: on PostgreSQL the
+ * store sends nothing there. It holds:
  * - the transaction runner's state table, one test per row;
  * - the open (the probe, the openings its answer builds, the schema
  *   statements), the lease's claim, heartbeat, release and fence, and the
  *   client's `reserve()`;
  * - for every operation of the store, that each connection it reserved began
- *   with the opening and ended with COMMIT or ROLLBACK.
+ *   with the opening and ended with COMMIT or ROLLBACK;
+ * - on a real server, that a `transaction_timeout` another client left,
+ *   shorter than a positive default, ends no store transaction. It runs only
+ *   when `OMP_TEST_SQL_POSTGRES_URL` (the store's database) and
+ *   `OMP_TEST_SQL_POSTGRES_ADMIN_URL` (the same database, as a login that may
+ *   alter the defaults of the store's login there: that login itself or a
+ *   superuser) are set and the server is PostgreSQL 17 or later.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
@@ -31,6 +38,30 @@ import {
 	type SqlSessionStorageResult,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
+
+const STORE_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
+const ADMIN_URL = process.env.OMP_TEST_SQL_POSTGRES_ADMIN_URL;
+
+/** The first row of `query`, read on a client of its own on `url`, which it closes. */
+async function readOnce(url: string, query: string): Promise<Record<string, unknown>> {
+	const sql = new SQL(url, { max: 1 });
+	try {
+		const [row] = (await sql.unsafe(query)) as Array<Record<string, unknown>>;
+		return row ?? {};
+	} finally {
+		await sql.close();
+	}
+}
+
+/** The server's `server_version_num` when both URLs are set, else 0. */
+const SERVER_VERSION =
+	STORE_URL && ADMIN_URL ? Number((await readOnce(ADMIN_URL, "SHOW server_version_num")).server_version_num) : 0;
+
+/** `name` as a quoted identifier. */
+function quoted(name: string): string {
+	return `"${name.replaceAll('"', '""')}"`;
+}
 
 const ID = "01a1f400-0000-7000-8000-000000000001";
 const OTHER_ID = "01a1f400-0000-7000-8000-000000000002";
@@ -1593,4 +1624,85 @@ describe("every operation runs on reserved connections that begin with the openi
 			expect(missingSites(fake, driver.sites)).toEqual([]);
 		});
 	}
+});
+
+describe("on a PostgreSQL server", () => {
+	it.skipIf(SERVER_VERSION < 170000)(
+		"transaction_timeout: a left value shorter than a positive default ends no store transaction",
+		async () => {
+			const storeUrl = STORE_URL ?? "";
+			const admin = new SQL(ADMIN_URL ?? "", { max: 2 });
+			const table = `omp_ttl_${process.pid.toString(36)}_${Date.now().toString(36)}`;
+			const leaseTable = `${table}_leases`;
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			let target: string | undefined;
+			let client: SQL | undefined;
+			let storage: SqlSessionStorage | undefined;
+			let held: Promise<unknown> | undefined;
+			try {
+				const where = await readOnce(
+					storeUrl,
+					"SELECT session_user::text AS login, pg_catalog.current_database()::text AS database",
+				);
+				// The default of the store's login in its database alone: the server may serve other databases.
+				target = `${quoted(String(where.login))} IN DATABASE ${quoted(String(where.database))}`;
+				await admin.unsafe(`ALTER ROLE ${target} SET transaction_timeout = '10min'`);
+				// One connection, so the store reserves the one this client leaves its setting on.
+				client = new SQL(storeUrl, { max: 1 });
+				const [fresh] = (await client.unsafe("SHOW transaction_timeout")) as Array<Record<string, unknown>>;
+				expect(fresh?.transaction_timeout).toBe("10min");
+				await client.unsafe("SET transaction_timeout = '1s'");
+				const [before] = (await client.unsafe("SELECT pg_catalog.pg_backend_pid() AS pid")) as Array<{
+					pid: number;
+				}>;
+				storage = await SqlSessionStorage.create({ client, table, leaseTable });
+				await storage.writeText(FILE, HEADER);
+
+				// The session's row, locked by another transaction for 2 s: longer than the 1 s left on the connection.
+				// A real wait: the server's transaction timer runs on the server's clock.
+				const locked = Promise.withResolvers<void>();
+				held = admin.transaction(async transaction => {
+					await transaction.unsafe(`SELECT path FROM "public".${table} WHERE path = $1 FOR UPDATE`, [FILE]);
+					locked.resolve();
+					await Bun.sleep(2000);
+				});
+				held.catch((err: unknown) => locked.reject(err));
+				await locked.promise;
+				const content = `${HEADER}{"type":"message","id":"m1"}\n`;
+				const started = Date.now();
+				// A full write, which waits on the row's lock in its transaction; its error is read below.
+				const written = storage.writeText(FILE, content).then(
+					() => undefined,
+					(err: unknown) => err,
+				);
+				await held;
+				expect(await written).toBeUndefined();
+				expect(Date.now() - started).toBeGreaterThan(1000);
+
+				const [row] = (await admin.unsafe(`SELECT content FROM "public".${table} WHERE path = $1`, [
+					FILE,
+				])) as Array<{ content: string }>;
+				const parts = (await admin.unsafe(
+					`SELECT content FROM "public".${table}_parts WHERE path = $1 ORDER BY start_offset`,
+					[FILE],
+				)) as Array<{ content: string }>;
+				expect(`${row?.content ?? ""}${parts.map(part => part.content).join("")}`).toBe(content);
+				const [after] = (await client.unsafe("SELECT pg_catalog.pg_backend_pid() AS pid")) as Array<{
+					pid: number;
+				}>;
+				expect(after?.pid).toBe(before?.pid);
+				expect(mentions(warn.mock.calls, "25P04")).toBe(false);
+			} finally {
+				if (target) await admin.unsafe(`ALTER ROLE ${target} RESET transaction_timeout`);
+				await held?.catch(() => undefined);
+				await storage?.drain().catch(() => undefined);
+				await client?.close();
+				for (const name of [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table, leaseTable]) {
+					await admin.unsafe(`DROP TABLE IF EXISTS "public".${name}`);
+				}
+				await admin.close();
+			}
+		},
+		30_000,
+	);
 });
