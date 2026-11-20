@@ -31,8 +31,10 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	rejection,
+	TcpProxy,
 	transcript,
 	until,
+	type WireStatement,
 } from "./sql-session-lease-fixture";
 
 // These tests wait in real time on purpose: a lease expires and a heartbeat
@@ -586,13 +588,16 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			for (const release of releases) release?.();
 		}, 30_000);
 
-		it("keeps its claim when its own heartbeat's answer is slow: the heartbeat holds no row lock a write's fence waits for", async () => {
+		it("keeps its claim when its own heartbeat's answer is slow: on PostgreSQL the server ends the stalled heartbeat before the fence gives up; on MySQL the heartbeat runs outside a transaction and holds no lock", async () => {
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const lease = { expiryMs: 20_000, heartbeatMs: 500 };
 			const answerDelayMs = 4000;
 			let delaying = false;
 			const heartbeat = new RegExp(`UPDATE (?:"[^"]+"\\.)?${db.leaseTable} SET heartbeat_at`);
 			// Each heartbeat reaches the database at once; its answer comes back 4 s later, as on a slow network.
+			// On PostgreSQL the server's idle_in_transaction_session_timeout (500 ms) ends the backend before the
+			// 4 s delay, freeing the row lock. On MySQL the heartbeat is two autocommit statements, so the row
+			// lock is freed at once and the delay is network-only.
 			const slowAnswers = (client: SqlSessionStorageClient): SqlSessionStorageClient => {
 				const slow = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
 					async unsafe(query, values) {
@@ -746,6 +751,62 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				});
 				release?.();
 				await storage.drain();
+			},
+			30_000,
+		);
+		it.skipIf(adapter !== "postgres")(
+			"sends exactly six statements per heartbeat on the wire",
+			async () => {
+				const proxy = TcpProxy.for(url ?? "");
+				const wire = proxy.recordPostgres();
+				try {
+					await using db = await openLeaseDb(adapter, proxy.urlFor(url ?? ""));
+					const lease = { expiryMs: 20_000, heartbeatMs: 500 };
+					const storage = await db.open({ dsn: proxy.urlFor(url ?? ""), lease });
+					const file = sessionFile(db);
+					const release = await storage.acquireSessionClaim?.(ID, file);
+					await storage.writeText(file, transcript(ID, "before"));
+					await storage.drain();
+					const beforeCount = wire.statements.length;
+					// Real timer: the heartbeat fires on the store's interval and the wire records the actual protocol.
+					await Bun.sleep(lease.heartbeatMs * 2);
+					release?.();
+					await storage.drain();
+					// Find the heartbeat's UPDATE and isolate its connection's transaction (BEGIN..COMMIT).
+					const afterSetup = wire.statements.slice(beforeCount);
+					const beat = afterSetup.find(s => /^UPDATE .*SET heartbeat_at/.test(s.sql));
+					if (!beat) throw new Error("no heartbeat UPDATE found on the wire");
+					const conn = beat.connection;
+					const connStmts = afterSetup.filter(s => s.connection === conn);
+					const beatIdx = connStmts.indexOf(beat);
+					let beginIdx = beatIdx;
+					for (let i = beatIdx - 1; i >= 0; i--) {
+						if (connStmts[i]!.sql === "BEGIN") {
+							beginIdx = i;
+							break;
+						}
+					}
+					let commitIdx = connStmts.length - 1;
+					for (let i = beatIdx + 1; i < connStmts.length; i++) {
+						if (connStmts[i]!.sql === "COMMIT") {
+							commitIdx = i;
+							break;
+						}
+					}
+					const tx = connStmts.slice(beginIdx, commitIdx + 1);
+					expect({
+						count: tx.length,
+						combined: tx.some(
+							s =>
+								s.protocol === "query" &&
+								/SET LOCAL search_path/.test(s.sql) &&
+								/lock_timeout/.test(s.sql) &&
+								/idle_in_transaction_session_timeout/.test(s.sql),
+						),
+					}).toEqual({ count: 6, combined: true });
+				} finally {
+					proxy.stop();
+				}
 			},
 			30_000,
 		);

@@ -779,6 +779,8 @@ function run(
  * refuses one), so this lock is what every statement runs under.
  */
 const PG_SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
+/** The heartbeat's opening: search_path lock and both bounds in one simple query, so they cost one round trip. */
+const PG_HEARTBEAT_OPENING = `${PG_SEARCH_PATH}; SET LOCAL lock_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}; SET LOCAL idle_in_transaction_session_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`;
 /** The schema of the store's PostgreSQL tables, which every statement names them with. */
 const PG_SCHEMA = "public";
 /**
@@ -2624,11 +2626,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			for (const [index, claim] of live.entries()) values[`sid${index}`] = claim.sessionId;
 			let refreshed: Array<{ session_id: string }> = [];
 			if (this.#adapter === "postgres") {
-				await this.#readWrite(async transaction => {
-					await transaction.unsafe(`SET LOCAL lock_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`);
-					await transaction.unsafe(
-						`SET LOCAL idle_in_transaction_session_timeout = ${LEASE_HEARTBEAT_TRANSACTION_BOUND_MS}`,
-					);
+				await this.#client.transaction(async transaction => {
+					await transaction.unsafe("SET TRANSACTION READ WRITE");
+					await transaction.unsafe(PG_HEARTBEAT_OPENING);
+					const [readOnly] = (await transaction.unsafe(READ_ONLY_SETTINGS)) as ReadOnlySettingsRow[];
+					if (readOnly?.setting === "on" && readOnly.reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
 					refreshed = (await run(transaction, lease.heartbeat(live.length), values)) as Array<{
 						session_id: string;
 					}>;
