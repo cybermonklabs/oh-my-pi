@@ -122,5 +122,8 @@ rust_test(
     crate = ":pi-builtins",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal_dev = True) + ["//crates/vendor/grep-searcher"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//crates/pi-shell",
+        "//crates/vendor/grep-searcher",
+    ],
 )
