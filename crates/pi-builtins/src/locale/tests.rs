@@ -816,6 +816,168 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 	}
 }
 
+/// Before Linux 6.9, a member whose main thread has exited while another of
+/// its threads runs is ended too: its `stat` reads `Z`, as a true zombie's
+/// does, and the walk used to skip it, so it outlived the query
+/// (INFRA-4425's review of `77e857a4`). A true zombie in the group is still
+/// skipped: it has ended, and only its parent's wait removes it.
+///
+/// The utility, the member and the zombie are this test's children, so the
+/// test reaps each and sees how it ended, and ends and reaps whatever is left
+/// if it fails. It runs in a process of its own, where the member and the
+/// zombie are forked from a process of two threads.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
+	use std::os::fd::FromRawFd as _;
+	use std::os::unix::process::CommandExt as _;
+
+	if !crate::own_process::own_process() {
+		return;
+	}
+	as_linux_6_8();
+	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
+	let group = libc::pid_t::try_from(utility.id()).unwrap();
+	let mut children = Children { utility, forked: Vec::new() };
+	let member = children.fork_into(group, true);
+	let zombie = children.fork_into(group, false);
+	// The premise, as `/proc` shows it: both read `Z`, and only the member
+	// has a thread left.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	while (state_and_threads(member), state_and_threads(zombie)) != ((b'Z', 2), (b'Z', 1)) {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"premise: member {:?}, zombie {:?}",
+			state_and_threads(member),
+			state_and_threads(zombie)
+		);
+		std::thread::sleep(std::time::Duration::from_millis(10));
+	}
+	assert!(!super::live_member(zombie, group), "a true zombie counts as a live member");
+	// SAFETY: a handle on this test's own unreaped child, owned from here.
+	let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
+	let handle =
+		super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) }, group);
+	handle.end_group();
+	let ended = children.reap_within(member, std::time::Duration::from_secs(2));
+	assert_eq!(children.reap_within(zombie, std::time::Duration::from_secs(2)), Some(0), "the zombie's exit status");
+	// A raw wait status equal to the signal number: ended by `SIGKILL`.
+	assert_eq!(ended, Some(libc::SIGKILL), "the member whose main thread exited outlived end_group");
+}
+
+/// What [`a_member_whose_main_thread_exited_is_ended_before_linux_6_9`]
+/// started: on drop, whatever is not reaped yet is killed and reaped, so a
+/// failure leaves nothing holding the output its own process is read by.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+struct Children {
+	utility: std::process::Child,
+	/// Forked children not reaped yet.
+	forked:  Vec<libc::pid_t>,
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl Children {
+	/// Forks a child of this test into the process group `group`. With
+	/// `main_thread_exits`, the child starts a thread that sleeps and then
+	/// ends its main thread alone with the raw `exit` system call (not
+	/// `exit_group`), which leaves the process as `pthread_exit` would;
+	/// `pthread_exit` itself unwinds, and its unwind would run this test's
+	/// frames in the child. Without it, the child exits 0 at once and stays
+	/// a zombie until this test reaps it. The child makes only
+	/// async-signal-safe calls and `pthread_create`, which glibc's `fork`
+	/// leaves usable, and never returns into this test.
+	fn fork_into(&mut self, group: libc::pid_t, main_thread_exits: bool) -> libc::pid_t {
+		extern "C" fn sleeper(_: *mut libc::c_void) -> *mut libc::c_void {
+			loop {
+				// SAFETY: `pause` only waits for a signal.
+				unsafe { libc::pause() };
+			}
+		}
+		// SAFETY: see above.
+		let child = unsafe { libc::fork() };
+		assert!(child >= 0, "{}", std::io::Error::last_os_error());
+		if child == 0 {
+			// SAFETY: see above.
+			unsafe {
+				if libc::setpgid(0, group) != 0 {
+					libc::_exit(3);
+				}
+				if !main_thread_exits {
+					libc::_exit(0);
+				}
+				let mut thread: libc::pthread_t = 0;
+				if libc::pthread_create(&raw mut thread, std::ptr::null(), sleeper, std::ptr::null_mut()) != 0 {
+					libc::_exit(4);
+				}
+				libc::syscall(libc::SYS_exit, 0);
+				libc::_exit(5);
+			}
+		}
+		self.forked.push(child);
+		child
+	}
+
+	/// Reaps the forked child `number` once it has ended, within `limit`,
+	/// and returns its raw wait status; `None` when it is still running at
+	/// the limit, after which it is killed and reaped.
+	fn reap_within(&mut self, number: libc::pid_t, limit: std::time::Duration) -> Option<libc::c_int> {
+		let deadline = std::time::Instant::now() + limit;
+		let mut status: libc::c_int = 0;
+		let ended = loop {
+			// SAFETY: a non-blocking wait for this test's own child.
+			if unsafe { libc::waitpid(number, &raw mut status, libc::WNOHANG) } == number {
+				break Some(status);
+			}
+			if std::time::Instant::now() >= deadline {
+				// SAFETY: this test's own child, unreaped, so the number is
+				// its.
+				unsafe {
+					libc::kill(number, libc::SIGKILL);
+					libc::waitpid(number, &raw mut status, 0);
+				}
+				break None;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		};
+		self.forked.retain(|forked| *forked != number);
+		ended
+	}
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl Drop for Children {
+	fn drop(&mut self) {
+		let _ = self.utility.kill();
+		let _ = self.utility.wait();
+		for number in self.forked.drain(..) {
+			// SAFETY: this test's own children, unreaped, so each number is
+			// its own.
+			unsafe {
+				libc::kill(number, libc::SIGKILL);
+				libc::waitpid(number, std::ptr::null_mut(), 0);
+			}
+		}
+	}
+}
+
+/// The state letter in `/proc/<number>/stat` and the count in
+/// `/proc/<number>/status`'s `Threads:`, `(b'?', 0)` where either cannot be
+/// read.
+#[cfg(target_os = "linux")]
+fn state_and_threads(number: libc::pid_t) -> (u8, u32) {
+	let state = fs::read(format!("/proc/{number}/stat"))
+		.ok()
+		.and_then(|stat| stat.iter().rposition(|byte| *byte == b')').and_then(|end| stat.get(end + 2).copied()))
+		.unwrap_or(b'?');
+	let threads = fs::read_to_string(format!("/proc/{number}/status"))
+		.ok()
+		.and_then(|status| {
+			status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
+		})
+		.unwrap_or(0);
+	(state, threads)
+}
+
 /// Runs a query whose utility leaves a descendant that closes the pipe it
 /// inherited and sleeps, records that descendant's process id (`$!`; `$$`
 /// in a subshell is still the shell's), answers, and exits 0. Asserts the

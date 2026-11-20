@@ -1806,10 +1806,18 @@ fn end_members(utility: &ChildHandle) {
 	}
 }
 
-/// Whether `/proc` shows the process `number` alive (not a zombie) in the
-/// process group `group`. `stat`'s second field is the command in
-/// parentheses, which can hold anything, so the fields are read after the
-/// last `)`: the state, the parent, then the process group.
+/// Whether `/proc` shows the process `number` alive in the process group
+/// `group`. `stat`'s second field is the command in parentheses, which can
+/// hold anything, so the fields are read after the last `)`: the state, the
+/// parent, then the process group.
+///
+/// `stat` describes the thread group's leader, so a process whose main
+/// thread has called `pthread_exit` while another of its threads runs reads
+/// `Z`, as one that has ended does. `status`'s `Threads:` tells them apart:
+/// 2 or more for the first, 1 for a true zombie (measured on Linux 6.12 and
+/// 7.0, and on gVisor, which lists no `/proc/<n>/task` entries to count
+/// instead). Such a process is alive, and a signal through its handle
+/// reaches its threads, as the group signal from Linux 6.9 on does.
 #[cfg(target_os = "linux")]
 fn live_member(number: libc::pid_t, group: libc::pid_t) -> bool {
 	let Ok(stat) = std::fs::read(format!("/proc/{number}/stat")) else { return false };
@@ -1818,7 +1826,22 @@ fn live_member(number: libc::pid_t, group: libc::pid_t) -> bool {
 	let (Some(state), Some(_parent), Some(pgrp)) = (fields.next(), fields.next(), fields.next()) else {
 		return false;
 	};
-	state != b"Z" && state != b"X" && std::str::from_utf8(pgrp).ok().and_then(|pgrp| pgrp.parse().ok()) == Some(group)
+	if std::str::from_utf8(pgrp).ok().and_then(|pgrp| pgrp.parse().ok()) != Some(group) {
+		return false;
+	}
+	match state {
+		b"X" => false,
+		b"Z" => process_threads(number).is_some_and(|threads| threads > 1),
+		_ => true,
+	}
+}
+
+/// The number of threads `/proc/<number>/status` gives the process, or
+/// `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+fn process_threads(number: libc::pid_t) -> Option<u32> {
+	let status = std::fs::read_to_string(format!("/proc/{number}/status")).ok()?;
+	status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
 }
 
 /// Ends the locale utility and everything left in its process group, within
