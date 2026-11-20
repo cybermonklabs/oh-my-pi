@@ -64,8 +64,7 @@ export interface SqlSessionStorageTransaction {
  * and a wrapper that sends each message on any free connection runs the
  * store's statements outside the transaction the store opened.
  */
-export interface SqlSessionStorageReservedConnection {
-	unsafe(query: string, values?: unknown[]): Promise<SqlSessionStorageResult>;
+export interface SqlSessionStorageReservedConnection extends SqlSessionStorageTransaction {
 	release(): void | Promise<void>;
 	close(): Promise<void>;
 }
@@ -97,6 +96,11 @@ export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 /** Array result returned by `Bun.SQL`, including MySQL mutation metadata. */
 export interface SqlSessionStorageResult extends Array<unknown> {
 	affectedRows?: number;
+	/**
+	 * The answer's command tag, as `Bun.SQL` gives it. The store reads it on
+	 * `COMMIT`, which answers `ROLLBACK` when the transaction rolled back.
+	 */
+	command?: string;
 }
 
 export interface SqlSessionStorageOptions {
@@ -910,22 +914,18 @@ const PG_TABLES_PRESENT = statement(
 		"FROM pg_catalog.pg_settings s WHERE s.name = 'default_transaction_read_only'",
 );
 
-/** {@link PG_TABLES_PRESENT} row. A boolean arrives as `true` bound and as `t` in a simple query's text. */
+/** {@link PG_TABLES_PRESENT} row. */
 interface TablesPresentRow {
-	session: boolean | string;
-	parts: boolean | string;
-	lease: boolean | string;
-	blobs: boolean | string;
-	refs: boolean | string;
+	session: boolean;
+	parts: boolean;
+	lease: boolean;
+	blobs: boolean;
+	refs: boolean;
 	read_only_setting: string;
 	read_only_reset_val: string;
-	in_recovery: boolean | string;
+	in_recovery: boolean;
 }
 
-/** A PostgreSQL boolean as {@link PG_TABLES_PRESENT} returns it: `true` bound, `t` in a simple query's text. */
-function pgTrue(value: boolean | string | undefined): boolean {
-	return value === true || value === "t";
-}
 /** A relation's kind (`pg_class.relkind`), with its article, as a refusal names it. */
 const PG_RELATION_KINDS: Record<string, string> = {
 	r: "a table",
@@ -2189,7 +2189,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 					? (((await this.#readOne("open", PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[])[0] ??
 						undefined)
 					: undefined;
-			if (look && pgTrue(look.in_recovery)) {
+			if (look?.in_recovery) {
 				throw new Error(
 					`SqlSessionStorage: the PostgreSQL server is in recovery (a hot standby or a read replica), which accepts no write, so a store that ${this.#gate === "row" ? "claims sessions" : "makes its tables"} cannot start on it. Point the DSN at the primary.`,
 				);
@@ -2939,28 +2939,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			return false;
 		}
 		if (look?.read_only_setting === "on" && look.read_only_reset_val === "on") throw new Error(READ_ONLY_REFUSAL);
-		if (
-			pgTrue(look?.session) &&
-			pgTrue(look?.parts) &&
-			pgTrue(look?.lease) &&
-			pgTrue(look?.blobs) &&
-			pgTrue(look?.refs)
-		) {
+		if (look?.session && look.parts && look.lease && look.blobs && look.refs) {
 			return false;
 		}
 		let indexMade = false;
 		await this.#postgres("open", "start-up", async transaction => {
 			const [now] = (await run(transaction, PG_TABLES_PRESENT, this.#pgTableNames())) as TablesPresentRow[];
 			const missing: string[] = [];
-			if (!pgTrue(now?.session)) missing.push(this.#q.createTable);
-			if (!pgTrue(now?.parts)) missing.push(this.#q.createPartsTable);
-			if (!pgTrue(now?.blobs)) missing.push(this.#q.createBlobsTable);
+			if (!now?.session) missing.push(this.#q.createTable);
+			if (!now?.parts) missing.push(this.#q.createPartsTable);
+			if (!now?.blobs) missing.push(this.#q.createBlobsTable);
 			// The index goes with the table, so the login that makes the table owns both.
-			if (!pgTrue(now?.refs)) {
+			if (!now?.refs) {
 				missing.push(this.#q.createRefsTable);
 				if (this.#q.createRefsIndex) missing.push(this.#q.createRefsIndex);
 			}
-			if (lease && !pgTrue(now?.lease)) {
+			if (lease && !now?.lease) {
 				missing.push(lease.createTable);
 				if (lease.createIndex) {
 					missing.push(lease.createIndex);
@@ -3034,26 +3028,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * statement keeps its own transaction, so a duplicate-column error still
 	 * fails only its own ALTER. The tables themselves are made together, by
 	 * {@link #createTables}. On MySQL and SQLite the statement runs straight
-	 * on the client.
+	 * on the client, outside any store transaction. On SQLite that skips the
+	 * call queue, so the caller must already hold `#exclusive` (`init` does),
+	 * or the statement can join another call's `BEGIN IMMEDIATE` on SQLite's
+	 * one connection.
 	 */
 	async #setup(query: string): Promise<void> {
 		if (this.#adapter !== "postgres") {
-			await this.#writeAlone(executor => executor.unsafe(query));
+			await this.#client.unsafe(query);
 			return;
 		}
 		await this.#postgres("open", "start-up", transaction => transaction.unsafe(query));
-	}
-
-	/**
-	 * Run one write outside any store transaction, straight on the client
-	 * (MySQL and SQLite: PostgreSQL runs every statement in {@link #postgres}).
-	 * On SQLite it does not use the call queue, so the caller
-	 * must already hold `#exclusive` (`init` does), or
-	 * the statement can join another call's `BEGIN IMMEDIATE` on SQLite's one
-	 * connection.
-	 */
-	async #writeAlone(write: (executor: SqlSessionStorageTransaction) => Promise<unknown>): Promise<void> {
-		await write(this.#client);
 	}
 
 	/**
@@ -3128,7 +3113,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async #postgres<T>(
 		operation: PgOperation,
 		mode: "read" | "write" | "start-up",
-		work: (transaction: SqlSessionStorageReservedConnection) => Promise<T>,
+		work: (transaction: SqlSessionStorageTransaction) => Promise<T>,
 	): Promise<T> {
 		const opening = mode === "read" ? this.#openings.read : this.#openings.write;
 		for (let attempt = 1; ; attempt++) {
@@ -3175,7 +3160,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				throw err;
 			}
 			await reserved.release();
-			if ("command" in committed && committed.command === "ROLLBACK") {
+			if (committed.command === "ROLLBACK") {
 				throw new Error(
 					`SqlSessionStorage: PostgreSQL rolled back the ${operation} transaction; its COMMIT answered ROLLBACK`,
 				);

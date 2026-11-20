@@ -59,7 +59,7 @@ import {
 	leftError,
 	logPids,
 } from "./postgres-left-settings-harness";
-import { rejection } from "./sql-session-lease-fixture";
+import { rejection, until } from "./sql-session-lease-fixture";
 
 const STORE_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 const ADMIN_URL = process.env.OMP_TEST_SQL_POSTGRES_ADMIN_URL;
@@ -90,6 +90,8 @@ const HELD_WAIT_MS = 10_000;
 const HELD_HOLD_MS = 1000;
 /** A lease heartbeat runs every 500 ms; its row must advance within this. */
 const HEARTBEAT_WAIT_MS = 5000;
+/** How often a wait polls the live server: a database condition gives no event to wait on. */
+const POLL_MS = 50;
 const LEASE = { expiryMs: 3000, heartbeatMs: 500 };
 const LOG_FILE = "log/server.log";
 const LOG_CHUNK_BYTES = 16 * 1024 * 1024;
@@ -261,15 +263,6 @@ async function within<T>(promise: Promise<T>, ms: number, label: string): Promis
 	}
 }
 
-/** Poll `check` against the live server; a database condition gives no event to wait on. */
-async function until(check: () => Promise<boolean>, ms: number, what: string): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (!(await check())) {
-		if (Date.now() > deadline) throw new Error(`${what} did not happen within ${ms} ms`);
-		await Bun.sleep(50);
-	}
-}
-
 interface CaseTables {
 	readonly table: string;
 	readonly leaseTable: string;
@@ -321,7 +314,10 @@ async function terminate(pids: Iterable<number>): Promise<void> {
 	if (!db) return;
 	for (const pid of new Set(pids)) {
 		await db.unsafe("SELECT pg_catalog.pg_terminate_backend($1::int)", [pid]).catch(() => undefined);
-		await until(() => backendGone(db, pid), READ_BOUND_MS, `the end of backend ${pid}`).catch(() => undefined);
+		await until(() => backendGone(db, pid), READ_BOUND_MS, {
+			what: `the end of backend ${pid}`,
+			pollMs: POLL_MS,
+		}).catch(() => undefined);
 	}
 	// PgBouncer drops a server connection when the ended backend's FATAL reaches it; nothing tells the test when it did.
 	await Bun.sleep(200);
@@ -487,7 +483,7 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 				await until(
 					async () => Number((await leaseRows(ids.claimed))[0]?.heartbeat_at) > start,
 					HEARTBEAT_WAIT_MS,
-					"a heartbeat",
+					{ what: "a heartbeat", pollMs: POLL_MS },
 				);
 			},
 		],
@@ -533,7 +529,7 @@ async function runOperations(harness: LeftClient, tables: CaseTables): Promise<O
 							return waiting !== undefined || settled;
 						},
 						HELD_WAIT_MS,
-						"the store's append waiting for the held row",
+						{ what: "the store's append waiting for the held row", pollMs: POLL_MS },
 					).catch(() => undefined);
 					// The store's append must wait out the hold: its own short timeouts would end the wait inside it.
 					if (!settled) await Bun.sleep(HELD_HOLD_MS);
@@ -1402,7 +1398,10 @@ describe("SQL session store under a session setting another client left on Postg
 						expect(harness.record.closes.map(close => ({ pid: close.pid, errno: close.error?.errno }))).toEqual([
 							{ pid: left.pid, errno: "42501" },
 						]);
-						await until(() => backendGone(db, left.pid), READ_BOUND_MS, `the end of backend ${left.pid}`);
+						await until(() => backendGone(db, left.pid), READ_BOUND_MS, {
+							what: `the end of backend ${left.pid}`,
+							pollMs: POLL_MS,
+						});
 						expect(harness.record.releases.length).toBeGreaterThan(0);
 						expect(await adminTitle(db, tables, opened.file)).toBe(TITLE.title);
 						await settle([opened.storage]);
@@ -1452,7 +1451,10 @@ describe("SQL session store under a session setting another client left on Postg
 						expect(closes.length).toBeLessThanOrEqual(PG_REPAIR_RETRIES);
 						expect(closes.map(close => close.error?.errno)).toEqual(Array(closes.length).fill("42501"));
 						for (const close of closes) {
-							await until(() => backendGone(db, close.pid), READ_BOUND_MS, `the end of backend ${close.pid}`);
+							await until(() => backendGone(db, close.pid), READ_BOUND_MS, {
+								what: `the end of backend ${close.pid}`,
+								pollMs: POLL_MS,
+							});
 						}
 						expect(await adminTitle(db, tables, opened.file)).toBe(TITLE.title);
 						await settle([opened.storage]);

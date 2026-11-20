@@ -39,6 +39,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { rejection, until } from "./sql-session-lease-fixture";
 
 const STORE_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 const ADMIN_URL = process.env.OMP_TEST_SQL_POSTGRES_ADMIN_URL;
@@ -532,17 +533,13 @@ function answerMessage(
 }
 
 /**
- * Wait for a state the store reaches on its own: the lease heartbeat runs on
- * the store's interval timer (20 ms here), and each beat is a chain of
- * promises through the fake connection, which a fake clock would not run.
+ * How long, and how often, a test polls for a state the store reaches on its
+ * own: the lease heartbeat runs on the store's interval timer (20 ms here),
+ * and each beat is a chain of promises through the fake connection, which a
+ * fake clock would not run.
  */
-async function until(done: () => boolean, what: string): Promise<void> {
-	const deadline = Date.now() + 3000;
-	while (!done()) {
-		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-		await Bun.sleep(5);
-	}
-}
+const STATE_WAIT_MS = 3000;
+const STATE_POLL_MS = 5;
 
 /** A fake PostgreSQL client; `reserve: false` makes one without `reserve()`. */
 function fakePostgres(server: Partial<FakeServer> = {}, { reserve = true } = {}): FakePostgres {
@@ -649,7 +646,11 @@ function fakePostgres(server: Partial<FakeServer> = {}, { reserve = true } = {})
 		script: (...next) => {
 			scripts.push(...next);
 		},
-		settled: () => until(() => connections.every(finished), "every reserved connection to be released or closed"),
+		settled: () =>
+			until(() => connections.every(finished), STATE_WAIT_MS, {
+				what: "every reserved connection to be released or closed",
+				pollMs: STATE_POLL_MS,
+			}),
 	};
 }
 
@@ -671,17 +672,6 @@ function ends(connection: Connection | undefined): { releases: number | undefine
 /** The first connection that received a message `sql` matches. */
 function connectionWith(fake: FakePostgres, sql: RegExp): Connection | undefined {
 	return fake.connections.find(connection => connection.messages.some(message => sql.test(message.sql)));
-}
-
-/** The error `work` rejects with. */
-async function failure(work: Promise<unknown>): Promise<Error> {
-	try {
-		await work;
-	} catch (err) {
-		if (err instanceof Error) return err;
-		throw err;
-	}
-	throw new Error("the operation resolved");
 }
 
 /** Spy on the store's warnings; the function returned reads the context of each repair warning so far. */
@@ -870,9 +860,11 @@ describe("the transaction runner's state table", () => {
 	it("8. committing, COMMIT answers ROLLBACK: release(), an error naming the operation thrown", async () => {
 		const { fake, storage, from } = await openOnFake();
 		fake.script({ commit: "answers ROLLBACK" });
-		const error = await failure(storage.updateSessionTitle(FILE, TITLE));
-		expect(error.message).toContain("updateSessionTitle");
-		expect(error.message).toMatch(/rolled back/i);
+		const error = await rejection(storage.updateSessionTitle(FILE, TITLE));
+		expect(error).toBeInstanceOf(Error);
+		const { message } = error as Error;
+		expect(message).toContain("updateSessionTitle");
+		expect(message).toMatch(/rolled back/i);
 		const [committed, ...more] = fake.connections.slice(from);
 		expect(more).toEqual([]);
 		expect(sqls(committed)).toEqual(TITLE_TRANSACTION);
@@ -906,9 +898,10 @@ describe("the transaction runner's state table", () => {
 	it("11. rolling back, ROLLBACK fails: close(), the first error thrown", async () => {
 		const { fake, storage, from } = await openOnFake();
 		fake.script({ statement: { match: TITLE_UPDATE, sqlstate: "23505" }, rollbackFails: true });
-		const error = await failure(storage.updateSessionTitle(FILE, TITLE));
+		const error = await rejection(storage.updateSessionTitle(FILE, TITLE));
 		const [failed, ...more] = fake.connections.slice(from);
 		expect(more).toEqual([]);
+		expect(error).toBeInstanceOf(Error);
 		expect(error).toMatchObject({ errno: "23505", message: serverMessage("23505", failed?.number ?? 0) });
 		expect(sqls(failed)).toEqual([
 			WRITE_OPENING,
@@ -926,7 +919,7 @@ describe("the transaction runner's state table", () => {
 		fake.script(
 			...Array.from({ length: attempts }, () => ({ statement: { match: TITLE_UPDATE, sqlstate: "42501" } })),
 		);
-		const error = await failure(storage.updateSessionTitle(FILE, TITLE));
+		const error = await rejection(storage.updateSessionTitle(FILE, TITLE));
 		const tried = fake.connections.slice(from);
 		expect(tried).toHaveLength(attempts);
 		expect(tried.map(ends)).toEqual(tried.map(() => ({ releases: 0, closes: 1 })));
@@ -938,6 +931,7 @@ describe("the transaction runner's state table", () => {
 				attempt: index + 1,
 			})),
 		);
+		expect(error).toBeInstanceOf(Error);
 		expect(error).toMatchObject({ errno: "42501", message: serverMessage("42501", tried.at(-1)?.number ?? 0) });
 	});
 
@@ -1004,7 +998,10 @@ describe("the transaction runner's state table", () => {
 
 	it("16. heartbeat: the write opening, the read-only check, the heartbeat's bounds, the UPDATE with bound values, then COMMIT and release(); the refreshed sessions are the UPDATE's rows", async () => {
 		const { fake, storage, release } = await beating();
-		await until(() => finished(afterClaim(fake)[0]), "the first heartbeat");
+		await until(() => finished(afterClaim(fake)[0]), STATE_WAIT_MS, {
+			what: "the first heartbeat",
+			pollMs: STATE_POLL_MS,
+		});
 		const [beat] = afterClaim(fake);
 		expect(sqls(beat)).toEqual([
 			WRITE_OPENING,
@@ -1022,7 +1019,10 @@ describe("the transaction runner's state table", () => {
 		release?.();
 		// An UPDATE that refreshed no lease row: the claim is lost.
 		const lost = await beating({ heartbeatFinds: false });
-		await until(() => lost.storage.sessionClaimLost?.(ID) === true, "the claim to be lost");
+		await until(() => lost.storage.sessionClaimLost?.(ID) === true, STATE_WAIT_MS, {
+			what: "the claim to be lost",
+			pollMs: STATE_POLL_MS,
+		});
 		lost.release?.();
 	});
 
@@ -1031,7 +1031,10 @@ describe("the transaction runner's state table", () => {
 		const { fake, release } = await beating();
 		fake.server.readOnly = { setting: "on", reset_val: "on" };
 		const from = fake.connections.length;
-		await until(() => finished(fake.connections[from]), "a heartbeat on the read-only default");
+		await until(() => finished(fake.connections[from]), STATE_WAIT_MS, {
+			what: "a heartbeat on the read-only default",
+			pollMs: STATE_POLL_MS,
+		});
 		const beat = fake.connections[from];
 		expect(sqls(beat)).toEqual([WRITE_OPENING, READ_ONLY_SETTINGS, "ROLLBACK"]);
 		expect(ends(beat)).toEqual({ releases: 1, closes: 0 });
@@ -1178,7 +1181,10 @@ describe("the lease", () => {
 		const { fake, storage, release } = await beating();
 		// As the server's idle-in-transaction clock ends a stalled beat: its next message finds the connection gone.
 		fake.server.ends.push(HEARTBEAT);
-		await until(() => fake.server.ends.length === 0, "the server to end a heartbeat");
+		await until(() => fake.server.ends.length === 0, STATE_WAIT_MS, {
+			what: "the server to end a heartbeat",
+			pollMs: STATE_POLL_MS,
+		});
 		const ended = fake.connections.find(connection => connection.closes > 0);
 		expect(sqls(ended)).toEqual([
 			WRITE_OPENING,
@@ -1188,7 +1194,10 @@ describe("the lease", () => {
 		]);
 		expect(ends(ended)).toEqual({ releases: 0, closes: 1 });
 		const after = ended ? fake.connections.indexOf(ended) + 1 : fake.connections.length;
-		await until(() => finished(fake.connections[after]), "the next heartbeat");
+		await until(() => finished(fake.connections[after]), STATE_WAIT_MS, {
+			what: "the next heartbeat",
+			pollMs: STATE_POLL_MS,
+		});
 		expect(sqls(fake.connections[after])).toEqual([
 			WRITE_OPENING,
 			READ_ONLY_SETTINGS,
@@ -1548,7 +1557,8 @@ const OPERATIONS = {
 					fake.connections.some(
 						connection => finished(connection) && connection.messages.some(({ sql }) => HEARTBEAT.test(sql)),
 					),
-				"a heartbeat",
+				STATE_WAIT_MS,
+				{ what: "a heartbeat", pollMs: STATE_POLL_MS },
 			);
 			release?.();
 			await storage.drain();

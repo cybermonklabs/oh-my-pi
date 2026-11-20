@@ -307,12 +307,25 @@ export async function rejection(promise: Promise<unknown>): Promise<unknown> {
 	);
 }
 
-/** Wait until `check` holds, polling; fails after `ms`. */
-export async function until(check: () => Promise<boolean> | boolean, ms = 10_000): Promise<void> {
+/**
+ * Wait until `check` holds, polling every `pollMs`; fails after `ms`, naming
+ * `what` when given.
+ */
+export async function until(
+	check: () => Promise<boolean> | boolean,
+	ms = 10_000,
+	{ what, pollMs = 25 }: { what?: string; pollMs?: number } = {},
+): Promise<void> {
 	const deadline = Date.now() + ms;
 	while (!(await check())) {
-		if (Date.now() > deadline) throw new Error(`the condition did not hold within ${ms} ms`);
-		await Bun.sleep(25);
+		if (Date.now() > deadline) {
+			throw new Error(
+				what === undefined
+					? `the condition did not hold within ${ms} ms`
+					: `timed out after ${ms} ms waiting for ${what}`,
+			);
+		}
+		await Bun.sleep(pollMs);
 	}
 }
 
