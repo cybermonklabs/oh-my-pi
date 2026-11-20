@@ -207,6 +207,98 @@ describe("builtin grep: without case, a range whose ends are pattern bytes, in t
 		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -ic $'[\341-\351]'`, "0\n", 1],
 		[String.raw`printf '\303\241\n' | LC_ALL=C.UTF-8 grep -ic $'[^\340-\341]'`, "1\n", 0],
 		[String.raw`printf '\303\241\n' | LC_ALL=C.UTF-8 grep -ic $'[a\340-\341]'`, "0\n", 1],
+		// So with one end a pattern byte, the other end's upper case the range's start: `[z-\351]` is
+		// `Z` to `é`. Regressed: `a` and `z`, whose upper cases are before the start, were in the range.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -ic $'[z-\351]'`, "0\n", 1],
+		[String.raw`printf 'a\n' | LC_ALL=C.UTF-8 grep -ic $'[z-\351]'`, "0\n", 1],
+		[String.raw`printf 'z\n' | LC_ALL=C.UTF-8 grep -ic $'[_-\351]'`, "0\n", 1],
+		// Already GNU's answer, kept: `Z`, and `ý`, whose upper case `Ý` is in the range.
+		[String.raw`printf 'Z\377\n' | LC_ALL=C.UTF-8 grep -ic $'[z-\351]'`, "1\n", 0],
+		[String.raw`printf '\303\275\n' | LC_ALL=C.UTF-8 grep -ic $'[_-\351]'`, "1\n", 0],
+		// Regressed: `µ` and the Kelvin sign, whose upper cases are past `é`, were in the range.
+		[String.raw`printf '\302\265\377\n' | LC_ALL=C.UTF-8 grep -ic $'[a-\351]'`, "0\n", 1],
+		[String.raw`printf '\302\265\n' | LC_ALL=C.UTF-8 grep -ic $'[a-\351]'`, "0\n", 1],
+		[String.raw`printf '\342\204\252\n' | LC_ALL=C.UTF-8 grep -ic $'[a-\351]'`, "0\n", 1],
+	]);
+});
+
+describe("builtin grep: a pattern byte among the patterns, on a line that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 reads the line's characters as it reads them where no
+	// pattern holds a pattern byte: their other case, whether they are word
+	// characters, and the letters of `[[:alpha:]]`.
+	cases([
+		// Regressed: each read as ASCII alone, `é` no letter and no case of `É`.
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic -e $'\303\251' -e $'\351x'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c -e '^\w' -e $'\351x'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c -e '^\W' -e $'\351x'`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -cw -e a -e $'\351x'`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -c -e 'a\b' -e $'\351x'`, "0\n", 1],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c -e '^[[:alpha:]]' -e $'\351x'`, "1\n", 0],
+		[String.raw`printf '\317\203\377\n' | LC_ALL=C.UTF-8 grep -ic -e $'\316\243' -e $'\351x'`, "1\n", 0],
+		[String.raw`printf 'I\377\n' | LC_ALL=C.UTF-8 grep -ic -e $'\304\261' -e $'\351x'`, "1\n", 0],
+	]);
+});
+
+describe("builtin grep: -w beside a byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 takes a byte that is not UTF-8 for no word character
+	// under `-w`.
+	cases([
+		// Regressed: nothing matched next to such a byte.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cw a`, "1\n", 0],
+		[String.raw`printf '\377a\n' | LC_ALL=C.UTF-8 grep -cw a`, "1\n", 0],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -Fcw a`, "1\n", 0],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -Ecw a`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -cw $'\303\251'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -ic -w $'\303\211'`, "1\n", 0],
+		[String.raw`printf 'a\377b\n' | LC_ALL=C.UTF-8 grep -ow b`, "b\n", 0],
+		[String.raw`printf 'x\377ab\n' | LC_ALL=C.UTF-8 grep -bow ab`, "2:ab\n", 0],
+		[String.raw`printf 'ab\377c\n' | LC_ALL=C.UTF-8 grep -ow 'ab\|c'`, "ab\nc\n", 0],
+		// Regressed: the second `a` alone was printed.
+		[String.raw`printf 'a\377 a\n' | LC_ALL=C.UTF-8 grep -ow a`, "a\na\n", 0],
+	]);
+});
+
+describe("builtin grep: -P on a line that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 reads such a line under `-P` with PCRE2's UTF mode, and
+	// without its Unicode properties: `\w` and `[[:alpha:]]` hold no `é`,
+	// while `é` is a character, of either case, and no encoding error
+	// matches.
+	cases([
+		// Regressed: `é` matched each, counted 1.
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '^\w'`, "0\n", 1],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '\w'`, "0\n", 1],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '[[:alpha:]]'`, "0\n", 1],
+		// Already GNU's answer, kept.
+		[String.raw`printf 'a\377b\n' | LC_ALL=C.UTF-8 grep -P -c 'a.b'`, "0\n", 1],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -P -ic $'\303\251'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '\x{e9}'`, "1\n", 0],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -o '.'`, "\xc3\xa9\n", 0],
+		[String.raw`printf 'a\377b\n' | LC_ALL=C grep -P -c 'a.b'`, "1\n", 0],
+	]);
+});
+
+describe("builtin grep: without case, the counterparts GNU gives a letter", () => {
+	// GNU grep 3.11 matches a letter's upper case, that one's lower case,
+	// and the lower-case letters with no upper case of their own for them
+	// (`ı` for `I` and `i`): not the Kelvin sign for `k`, the Ångström sign
+	// for `å`, the Ohm sign for `ω` or `ẞ` for `ß`, which Unicode's folding
+	// adds.
+	cases([
+		// Regressed: each counted 1.
+		[String.raw`printf '\342\204\252\n' | LC_ALL=C.UTF-8 grep -ic k`, "0\n", 1],
+		[String.raw`printf '\342\204\252\377\n' | LC_ALL=C.UTF-8 grep -ic k`, "0\n", 1],
+		[String.raw`printf 'k\377\n' | LC_ALL=C.UTF-8 grep -ic $'\342\204\252'`, "0\n", 1],
+		[String.raw`printf '\342\204\252\n' | LC_ALL=C.UTF-8 grep -iFc k`, "0\n", 1],
+		[String.raw`printf '\342\204\253\377\n' | LC_ALL=C.UTF-8 grep -ic $'\303\245'`, "0\n", 1],
+		[String.raw`printf '\342\204\253\377\n' | LC_ALL=C.UTF-8 grep -ic $'\303\205'`, "0\n", 1],
+		[String.raw`printf '\342\204\246\n' | LC_ALL=C.UTF-8 grep -ic $'\317\211'`, "0\n", 1],
+		[String.raw`printf '\341\272\236\n' | LC_ALL=C.UTF-8 grep -ic $'\303\237'`, "0\n", 1],
+		// Regressed: each counted 0.
+		[String.raw`printf 'I\n' | LC_ALL=C.UTF-8 grep -ic $'\304\261'`, "1\n", 0],
+		[String.raw`printf 'I\377\n' | LC_ALL=C.UTF-8 grep -ic $'\304\261'`, "1\n", 0],
+		// Already GNU's answer, kept: `É` for `é`, and `K` for `k` beside a back-reference.
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic $'\303\251'`, "1\n", 0],
+		[String.raw`printf 'ka\n' | LC_ALL=C.UTF-8 grep -ic 'K\(a\)\1*'`, "1\n", 0],
 	]);
 });
 

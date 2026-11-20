@@ -444,6 +444,31 @@ describe("builtin sed: a `w` file that cannot be written", () => {
 			"sed: couldn't write 4 items to stdout: No space left on device\n",
 			4,
 		],
+		// Only the names `/dev/stdout` and `/dev/stderr` are GNU's own streams, named so; any
+		// other is named as written. Regressed: each named `stdout`.
+		[
+			"seq 100000 | sed -n 'w /dev/fd/1' 2>&1 >/dev/full",
+			"sed: couldn't write 4 items to /dev/fd/1: No space left on device\n",
+			4,
+		],
+		[
+			"seq 100000 | sed -n 'w //dev/stdout' 2>&1 >/dev/full",
+			"sed: couldn't write 4 items to //dev/stdout: No space left on device\n",
+			4,
+		],
+		[
+			"seq 100000 | sed -n 'w /proc/self/fd/1' 2>&1 >/dev/full",
+			"sed: couldn't write 4 items to /proc/self/fd/1: No space left on device\n",
+			4,
+		],
+		// A write that fails only where sed flushes its output at the end. Regressed: "No space
+		// left on device (os error 28)", exit 2.
+		[
+			"printf 'a\\n' | sed -n 'w /dev/stdout' 2>&1 >/dev/full",
+			"sed: couldn't flush stdout: No space left on device\n",
+			4,
+		],
+		["printf 'a\\n' | sed p 2>&1 >/dev/full", "sed: couldn't flush stdout: No space left on device\n", 4],
 	]);
 });
 
@@ -451,6 +476,10 @@ describe("builtin sed: one `w` file for each name", () => {
 	cases([
 		// Regressed: the second `w` opened the file again, and each line was written once.
 		["seq 3 | sed -n -e 'w o' -e 'w o'; cat o", "1\n1\n2\n2\n3\n3\n", 0],
+		// A name is as written: two names of one file are two streams, each writing it from its
+		// start. Regressed: one stream, which wrote each line twice.
+		["mkdir d; seq 3 | sed -n -e 'w d/o' -e 'w d//o'; cat d/o", "1\n2\n3\n", 0],
+		["mkdir d; seq 3 | sed -n -e 'w d/o' -e 'w d/./o'; cat d/o", "1\n2\n3\n", 0],
 	]);
 });
 
@@ -470,6 +499,15 @@ describe("builtin sed: `y` reads its strings by the locale", () => {
 		// Regressed: the line was read a byte at a time, which `é` is no member of.
 		[String.raw`printf 'caf\303\251\377\n' | LC_ALL=C.UTF-8 sed $'y/\303\251/e/' 2>&1`, "cafe\xff\n", 0],
 		[String.raw`printf 'caf\303\251\377\n' | LC_ALL=C.UTF-8 sed 'y/\xc3\xa9/e/' 2>&1`, "cafe\xff\n", 0],
+		// A character of a line that is not UTF-8 is mapped whole, U+10FF80 too. Regressed:
+		// `b\200\377`, its first three bytes dropped.
+		[String.raw`printf 'a\364\217\276\200\377\n' | LC_ALL=C.UTF-8 sed 'y/a/b/'`, "b\xf4\x8f\xbe\x80\xff\n", 0],
+		// A source given twice keeps its first target in C.UTF-8, and its last in the C locale.
+		// Regressed: the last in both.
+		["echo a | LC_ALL=C.UTF-8 sed 'y/aa/12/'", "1\n", 0],
+		["echo ab | LC_ALL=C.UTF-8 sed 'y/aba/123/'", "12\n", 0],
+		[String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 sed $'y/\303\251\303\251/12/'`, "caf1\n", 0],
+		["echo a | LC_ALL=C sed 'y/aa/12/'", "2\n", 0],
 	]);
 });
 
