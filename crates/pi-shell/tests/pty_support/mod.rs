@@ -4,7 +4,8 @@
 //!
 //! [`Spawn`] describes the process: program, `argv[0]`, arguments, a
 //! hermetic environment (`PATH` of the runner, `HOME` and `ZDOTDIR` a fresh
-//! temporary directory, `TERM=xterm-256color`, `LANG=en_US.UTF-8`), startup
+//! temporary directory, `TERM=xterm-256color`, `LANG` a UTF-8 locale the
+//! machine has ([`utf8_locale`])), startup
 //! files written into that home ([`Spawn::rc_file`]) and the window size.
 //! [`Spawn::spawn`] starts it as the leader of a new session whose
 //! controlling terminal is the pty (fds 0–2 on its terminal side).
@@ -104,6 +105,38 @@ pub struct Spawn {
 	sync:    bool,
 }
 
+/// The UTF-8 locale the shells run in (`LANG`): `C.UTF-8`, which glibc
+/// 2.35 and later and musl have, else `en_US.UTF-8` (macOS has no
+/// `C.UTF-8`). Both give these tests the same answers: with `C.UTF-8` the
+/// whole pi-shell set passes alike with and without `en_US.UTF-8` installed.
+///
+/// # Panics
+///
+/// When the machine has neither: zsh 5.9 would then show multibyte text as
+/// bytes, and the comparisons would fail without saying why.
+#[must_use]
+pub fn utf8_locale() -> &'static str {
+	static LOCALE: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+		[c"C.UTF-8", c"en_US.UTF-8"]
+			.into_iter()
+			.find(|name| {
+				// SAFETY: newlocale takes a valid C string and no base locale;
+				// a locale it returns is freed at once.
+				let locale =
+					unsafe { libc::newlocale(libc::LC_ALL_MASK, name.as_ptr(), std::ptr::null_mut()) };
+				let found = !locale.is_null();
+				if found {
+					// SAFETY: a locale newlocale returned, freed once.
+					unsafe { libc::freelocale(locale) };
+				}
+				found
+			})
+			.map(|name| name.to_str().expect("an ASCII locale name"))
+			.expect("this machine has no UTF-8 locale (C.UTF-8 or en_US.UTF-8) to run zsh 5.9 in")
+	});
+	*LOCALE
+}
+
 impl Spawn {
 	/// `program` with the hermetic environment (see the module docs), 24 ×
 	/// 80.
@@ -118,7 +151,7 @@ impl Spawn {
 			(OsString::from("HOME"), home.path().as_os_str().to_owned()),
 			(OsString::from("ZDOTDIR"), home.path().as_os_str().to_owned()),
 			(OsString::from("TERM"), OsString::from("xterm-256color")),
-			(OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+			(OsString::from("LANG"), OsString::from(utf8_locale())),
 		];
 		if let Some(path) = std::env::var_os("PATH") {
 			env.push((OsString::from("PATH"), path));

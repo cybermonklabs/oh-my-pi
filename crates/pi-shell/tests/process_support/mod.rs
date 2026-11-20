@@ -292,9 +292,13 @@ pub fn bash_version(line: &str) -> Option<(u32, u32)> {
 	Some((major, minor))
 }
 
-/// `path` if it is bash [`BASH_OLDEST`] or later; else `None`, and the test
-/// reported [`zsh_oracle::uncompared`] with the version it found.
-pub fn bash_at(path: PathBuf) -> Option<PathBuf> {
+/// `path` if it is bash [`BASH_OLDEST`] or later; else why not, naming the
+/// version it found.
+///
+/// # Errors
+///
+/// The refusal: `path` is an older bash, or no bash.
+pub fn bash_at(path: PathBuf) -> Result<PathBuf, String> {
 	let version = Command::new(&path).arg("--version").output();
 	let first = version.as_ref().ok().and_then(|out| {
 		String::from_utf8_lossy(&out.stdout)
@@ -307,25 +311,27 @@ pub fn bash_at(path: PathBuf) -> Option<PathBuf> {
 		.and_then(bash_version)
 		.is_some_and(|v| v >= BASH_OLDEST)
 	{
-		return Some(path);
+		return Ok(path);
 	}
-	zsh_oracle::uncompared(&format!(
+	Err(format!(
 		"{} is not bash {}.{} or later ({}), so nothing is compared with bash",
 		path.display(),
 		BASH_OLDEST.0,
 		BASH_OLDEST.1,
 		first.unwrap_or_else(|| format!("{version:?}"))
-	));
-	None
+	))
 }
 
 /// The real bash: `$PI_TEST_REAL_BASH`, or `/bin/bash`, if it is bash 5.2
-/// or later ([`bash_at`]).
+/// or later ([`bash_at`]); else `None`, and the test reported
+/// [`zsh_oracle::uncompared`] with the refusal.
 pub fn real_bash() -> Option<PathBuf> {
 	let path = std::env::var_os("PI_TEST_REAL_BASH")
 		.filter(|p| !p.is_empty())
 		.map_or_else(|| PathBuf::from("/bin/bash"), PathBuf::from);
 	bash_at(path)
+		.map_err(|refusal| zsh_oracle::uncompared(&refusal))
+		.ok()
 }
 
 /// The real shell `name` (`zsh` or `bash`) the case compares with, or

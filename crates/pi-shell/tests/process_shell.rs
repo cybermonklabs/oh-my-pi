@@ -1158,9 +1158,10 @@ fn bash_sets_home_only_as_a_login_shell_by_argv0() {
 }
 
 /// The bash cases need bash 5.2 or later
-/// ([`process_support::BASH_OLDEST`]): an older bash is refused, and the
-/// test says so on an `UNCOMPARED:` line. Here a stand-in reports the bash
-/// of Ubuntu 22.04, 5.1.16.
+/// ([`process_support::BASH_OLDEST`]): an older bash is refused, with a
+/// reason naming the version it found, which [`real_bash`] prints on an
+/// `UNCOMPARED:` line. Here a stand-in reports the bash of Ubuntu 22.04,
+/// 5.1.16; this test prints nothing.
 #[test]
 fn the_real_bash_must_be_5_2_or_later() {
 	use std::os::unix::fs::PermissionsExt;
@@ -1191,7 +1192,13 @@ fn the_real_bash_must_be_5_2_or_later() {
 		)
 		.expect("write the stand-in");
 		fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("make it runnable");
-		assert_eq!(process_support::bash_at(fake.clone()).is_some(), accepted, "bash {version}");
+		match process_support::bash_at(fake.clone()) {
+			Ok(_) => assert!(accepted, "bash {version} was taken"),
+			Err(refusal) => {
+				assert!(!accepted, "bash {version} was refused: {refusal}");
+				assert!(refusal.contains(&format!("version {version}(1)")), "{refusal}");
+			},
+		}
 	}
 }
 
