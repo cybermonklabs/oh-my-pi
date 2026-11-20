@@ -38,5 +38,6 @@ rust_test(
 rust_doc_test(
     name = "pi-ast_doc_test",
     crate = ":pi-ast",
+    crate_features = ["wasm"],
     deps = all_crate_deps(normal_dev = True),
 )
