@@ -119,6 +119,43 @@ fn too_old_protocol_is_a_mismatch() {
 	);
 }
 
+/// The client of a local copy stops its server half while the half is in the
+/// protocol exchange: the half has sent its version and not yet read the
+/// client's. Upstream's child exits on that SIGUSR1 wherever it is, so the
+/// half's one line is `received SIGUSR1`, never the read the stop cancelled.
+/// `too_old_protocol_is_a_mismatch` takes this path when its half is slow.
+#[test]
+fn a_local_half_stopped_in_its_handshake_exits_as_signalled() {
+	let dir = tempfile::tempdir().unwrap();
+	let (mut host, cap) = crate::host::Host::for_test("rsync", Vec::new(), dir.path());
+	let io = HostIo::new(&mut host, Arc::new(HashMap::new()), OsString::from("rsync"));
+	let getenv = |_: &str| None;
+	let argv = ["--protocol=19", "-a", "src/", "d/"].map(OsString::from);
+	let Ok(Parsed::Run(opts)) = options::parse(&argv, &getenv) else { panic!("the operands parse") };
+	let mut sopts = options::local_server_options(&opts, &getenv).unwrap();
+	sopts.args = vec![OsString::from("."), OsString::from("d/")];
+	sopts.old_style_args = 2;
+	let kill = Arc::new(AtomicBool::new(false));
+	let (mut client, server) = transport::local_pair(Arc::clone(&kill));
+	let mut sio = io.clone();
+	sio.cancel = Arc::clone(&kill);
+	let local = LocalServer {
+		conn: server,
+		client_info: handshake::local_client_info(&opts, false),
+		filters: Filters::new(FilterConfig::default()),
+	};
+	let half = thread::spawn(move || server_main(&sio, sopts, Some(local)));
+	// The half's version arrives; the client's never does.
+	let mut version = [0u8; 4];
+	client.reader.read_exact(&mut version).unwrap();
+	kill.store(true, Ordering::Relaxed);
+	let code = half.join().unwrap();
+	assert_eq!(
+		(code, cap.err().as_str()),
+		(RERR_SIGNAL1, "rsync error: received SIGUSR1 (code 19) at main.c(1687) [Receiver=3.5.1]\n")
+	);
+}
+
 /// Captured from rsync 3.5.1: when the server half of a local copy fails while
 /// setting up, the client exits with its code and prints nothing of its own.
 #[test]
