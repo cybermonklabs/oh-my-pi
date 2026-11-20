@@ -60,9 +60,8 @@ import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from 
  *   files the read itself opened, and only when they still match it once all are
  *   read; a file that changed during the read, even one put back as it was, keeps
  *   nothing. The kept state names the rule it was kept under
- *   ({@link SEEN_STATE_VERSION}); one kept under another rule, or under none (a
- *   record an earlier build of this loader wrote), is not trusted: the bytes are
- *   read again.
+ *   ({@link SEEN_STATE_VERSION}); a record of any other shape reads `unknown` until the
+ *   next build.
  * A regular file that cannot be opened (no permission, no descriptor left) has no
  * bytes to judge: a start reads `unknown` and keeps nothing, and a build stops.
  * The change time and the inode see an edit whose size and modification time were
@@ -81,8 +80,7 @@ import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from 
  * The rule a record's kept state (`seen`) was kept under: what a fingerprint covers (size,
  * modification time, change time, inode; `changed` for a file whose read met another kind)
  * and when one is kept (only when no time in it is too new to trust, {@link RACY_MARGIN_MS}).
- * A state kept under another rule is read again, and every scanned directory of its record
- * listed again.
+ * A record whose state names another rule is not well formed.
  */
 const SEEN_STATE_VERSION = 2;
 
@@ -889,27 +887,29 @@ function isCheckoutPath(rel) {
 }
 
 /**
- * The record's shape, checked before a start trusts any of it.
+ * The record's shape, its kept state's (`seen`) included, checked before a start trusts any of
+ * it. A record of another shape reads `unknown`, as one of another addon does.
  * @param {any} stamp
  */
 function isWellFormedStamp(stamp) {
 	const isTimes = dirs =>
 		dirs !== null &&
 		typeof dirs === "object" &&
-		Object.entries(dirs).every(
-			// A number is a time an earlier build of this loader kept, which no stamp equals: that
-			// directory is listed again.
-			([rel, time]) => isCheckoutPath(rel) && (typeof time === "string" || typeof time === "number"),
-		);
+		Object.entries(dirs).every(([rel, time]) => isCheckoutPath(rel) && typeof time === "string");
 	const isPatterns = patterns => Array.isArray(patterns) && patterns.every(isCheckoutPath);
 	const isGlobs = globs =>
 		Array.isArray(globs) &&
 		globs.length > 0 &&
 		globs.every(glob => isPatterns(glob?.include) && glob.include.length > 0 && isPatterns(glob.exclude));
+	const { seen } = stamp ?? {};
 	return (
 		typeof stamp?.sources === "string" &&
-		stamp.seen !== null &&
-		typeof stamp.seen === "object" &&
+		seen !== null &&
+		typeof seen === "object" &&
+		seen.version === SEEN_STATE_VERSION &&
+		(typeof seen.fingerprint === "string" || seen.fingerprint === null) &&
+		(seen.verdict === "current" || seen.verdict === "other") &&
+		(seen.sameCheckout === null || typeof seen.sameCheckout === "boolean") &&
 		(stamp.checkout === null || (typeof stamp.checkout === "string" && /^[0-9a-f-]{36}$/.test(stamp.checkout))) &&
 		Array.isArray(stamp.files) &&
 		stamp.files.length > 0 &&
@@ -923,23 +923,6 @@ function isWellFormedStamp(stamp) {
 		stamp.packages.every(entry => typeof entry?.dir === "string" && typeof entry.buildScript === "boolean") &&
 		stamp.packages.every(entry => entry.dir === "." || isCheckoutPath(entry.dir))
 	);
-}
-
-/**
- * The record's kept state (`seen`) when it was kept under this rule ({@link SEEN_STATE_VERSION})
- * and has its shape, else undefined. A state kept under another rule, or under none (a record an
- * earlier build of this loader wrote, whose fingerprint covered less), is read again, not
- * trusted.
- * @param {any} seen
- * @returns {{ fingerprint: string | null; sameCheckout: boolean | null; verdict: "current" | "other" } | undefined}
- */
-function keptState(seen) {
-	return seen.version === SEEN_STATE_VERSION &&
-		(typeof seen.fingerprint === "string" || seen.fingerprint === null) &&
-		(seen.verdict === "current" || seen.verdict === "other") &&
-		(seen.sameCheckout === null || typeof seen.sameCheckout === "boolean")
-		? seen
-		: undefined;
 }
 
 /**
@@ -1008,15 +991,11 @@ export function addonSourcesState(addonPath, repoRoot) {
 		}
 		let learned = false;
 		const scanned = [];
-		// Directory states kept under an earlier rule may be too new to trust: list them again once.
-		const sameRule = stamp.seen.version === SEEN_STATE_VERSION;
 		for (const entry of stamp.scanned) {
-			const unchanged =
-				sameRule &&
-				Object.entries(entry.dirs).every(([rel, time]) => {
-					const stat = lstatSource(repoRoot, rel);
-					return stat?.isDirectory() && directoryStamp(stat) === time;
-				});
+			const unchanged = Object.entries(entry.dirs).every(([rel, time]) => {
+				const stat = lstatSource(repoRoot, rel);
+				return stat?.isDirectory() && directoryStamp(stat) === time;
+			});
 			if (unchanged) {
 				scanned.push(entry);
 				continue;
@@ -1037,10 +1016,9 @@ export function addonSourcesState(addonPath, repoRoot) {
 			stamp.checkout,
 			untracked.length > 0 ? checkoutId(repoRoot, false) : null,
 		);
-		const kept = keptState(stamp.seen);
-		let verdict = kept?.verdict;
+		let { verdict } = stamp.seen;
 		let seen = stamp.seen;
-		if (kept === undefined || fingerprint !== kept.fingerprint || sameCheckout !== kept.sameCheckout) {
+		if (fingerprint !== seen.fingerprint || sameCheckout !== seen.sameCheckout) {
 			const read = hashSources(repoRoot, stamp.files, startedAt);
 			const now = identities(stamp.files, untracked, read.hashes);
 			// A file untracked at build time may be missing only in another checkout of the

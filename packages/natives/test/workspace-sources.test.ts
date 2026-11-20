@@ -601,22 +601,30 @@ console.log(JSON.stringify({ state, built, writtenBack: after !== before && JSON
 		},
 	);
 
-	it.each([
-		["no rule", undefined],
-		["another rule", 0],
-		["the rule before times within two seconds of the read were distrusted", 1],
-	])("read the bytes again for a verdict a record kept under %s", async (_label, version) => {
+	it("read a record of another shape as unknown until the next build", async () => {
 		await readLater(() => build());
 		const stampPath = `${addon}.sources.json`;
 		const stamp = await Bun.file(stampPath).json();
-		// A verdict this tree does not have, kept as an earlier build of this loader kept one:
-		// under its own fingerprint rule, which this one cannot vouch for.
-		await Bun.write(stampPath, JSON.stringify({ ...stamp, seen: { ...stamp.seen, version, verdict: "other" } }));
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		// A kept state under no rule, or under another one, as only earlier commits of this
+		// change wrote.
+		for (const version of [undefined, 0, 1]) {
+			await Bun.write(stampPath, JSON.stringify({ ...stamp, seen: { ...stamp.seen, version } }));
+			expect(addonSourcesState(addon, repo)).toBe("unknown");
+		}
+		// A scanned directory's time kept as a number.
+		const scanned = [
+			{
+				dir: "crates/pi-natives",
+				globs: [{ include: ["src/*.rs"], exclude: [] }],
+				dirs: { "crates/pi-natives/src": 1 },
+			},
+		];
+		await Bun.write(stampPath, JSON.stringify({ ...stamp, scanned }));
+		expect(addonSourcesState(addon, repo)).toBe("unknown");
 
-		// Control: the same verdict under this rule is taken as it stands.
-		await Bun.write(stampPath, JSON.stringify({ ...stamp, seen: { ...stamp.seen, verdict: "other" } }));
-		expect(addonSourcesState(addon, repo)).toBe("other");
+		// Control: the record as the build wrote it.
+		await Bun.write(stampPath, JSON.stringify(stamp));
+		expect(addonSourcesState(addon, repo)).toBe("current");
 	});
 
 	it("ignore build output and dot files in the source tree", async () => {
@@ -1032,24 +1040,6 @@ console.log(JSON.stringify({ state: addonSourcesState(addon, repo), now: nodeFs.
 		expect(addonSourcesState(addon, repo)).toBe("other");
 	});
 
-	it("judge a record whose directory times an earlier build kept as numbers, listing those directories again", async () => {
-		await checkout();
-		const stampPath = `${addon}.sources.json`;
-		const stamp = await Bun.file(stampPath).json();
-		const mtime = (await fs.lstat(path.join(repo, defs))).mtimeMs;
-		const scanned = stamp.scanned.map((entry: { dirs: Record<string, string> }) => ({
-			...entry,
-			dirs: Object.fromEntries(Object.keys(entry.dirs).map(rel => [rel, mtime])),
-		}));
-		await Bun.write(stampPath, JSON.stringify({ ...stamp, scanned }));
-
-		expect(await readLater(() => addonSourcesState(addon, repo))).toBe("current");
-		const now = await fs.lstat(path.join(repo, defs));
-		expect((await Bun.file(stampPath).json()).scanned[0].dirs[defs]).toBe(
-			`${now.mtimeMs}\0${now.ctimeMs}\0${now.ino}`,
-		);
-	});
-
 	it("are other sources until the next build for a file added to a scanned directory during the build and removed before its end", async () => {
 		await checkout();
 		const before = readRustSources(repo, CARGO_SOURCE_ROOTS);
@@ -1213,25 +1203,6 @@ const kept = keptFor();
 nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
 console.log(JSON.stringify({ kept, state: addonSourcesState(addon, repo) }));`),
 		).toEqual({ kept: "unsettled", state: "other" });
-	});
-
-	it("list a scanned directory again when its state was kept under an earlier rule", async () => {
-		await checkout();
-		expect(
-			bounded(`${freezeDirectory()}
-// A build more than two seconds after the writes keeps the directory's state.
-const realNow = Date.now;
-Date.now = () => realNow.call(Date) + 10_000;
-writeAddonSourcesStamp(addon, readRustSources(repo, CARGO_SOURCE_ROOTS), {});
-Date.now = realNow;
-const record = JSON.parse(nodeFs.readFileSync(stampPath, "utf8"));
-nodeFs.writeFileSync(dir + "/zz.toml", "[filters.zz]\\n");
-// Control: under this rule the kept state stands, and the frozen state hides the file.
-const sameRule = addonSourcesState(addon, repo);
-nodeFs.writeFileSync(stampPath, JSON.stringify({ ...record, seen: { ...record.seen, version: 1 } }));
-const earlierRule = addonSourcesState(addon, repo);
-console.log(JSON.stringify({ kept: keptFor() !== "unsettled", sameRule, earlierRule }));`),
-		).toEqual({ kept: true, sameRule: "current", earlierRule: "other" });
 	});
 
 	it("record only the files a scanned directory's glob matches, honouring exclude", async () => {
