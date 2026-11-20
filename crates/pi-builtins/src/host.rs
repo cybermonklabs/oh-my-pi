@@ -1630,11 +1630,11 @@ impl ShellCommand {
 /// lexically normalized (`-execdir`'s `<dir>/./sub` is `<dir>/sub`), as the
 /// shell enters it.
 ///
-/// The shell's twin, `refused_as_too_long` in pi-shell's VM
-/// (`bash/vm/command.rs`), decides which refusals reach the utility; the
-/// two apply the same rule.
+/// pi-shell's VM asks this too (`refused_as_too_long` in
+/// `bash/vm/command.rs`), to decide which refusals reach the utility: one
+/// rule for both.
 #[cfg(unix)]
-pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
+pub fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
 	use std::os::unix::ffi::OsStrExt as _;
 	match error.raw_os_error() {
 		Some(libc::E2BIG) => true,
@@ -1654,8 +1654,7 @@ pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usi
 /// to `cwd` when relative) is past `PATH_MAX` or holds a name past
 /// `NAME_MAX`, or looking it up fails with `ENAMETOOLONG` (a symlink on its
 /// way names one). Only read for an `ENAMETOOLONG` of a long line, the one
-/// refusal it decides. The shell's twin is `interpreter_path_too_long` in
-/// pi-shell's VM.
+/// refusal it decides.
 #[cfg(unix)]
 fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
 	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
@@ -1689,7 +1688,7 @@ const POSIX_ARG_MAX: usize = 4096;
 
 /// The bytes the arguments `argv` take in a command line: each string and
 /// its terminating NUL, as the system counts them.
-pub(crate) fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
+pub fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
 	argv.into_iter().map(|arg| arg.as_ref().len() + 1).sum()
 }
 
@@ -1707,7 +1706,7 @@ fn path_fits(path: &Path) -> bool {
 /// Windows commands are not split (the shell keeps its diagnostic for every
 /// refused start): see the Unix twin.
 #[cfg(not(unix))]
-pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
+pub fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
 	false
 }
 

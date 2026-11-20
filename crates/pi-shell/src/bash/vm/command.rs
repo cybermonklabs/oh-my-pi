@@ -2690,85 +2690,18 @@ fn refusals_to_host(vp: &mut Vproc) -> bool {
 
 /// Whether `err`, the failure to start the program at `path` with the
 /// arguments `argv` in the working directory `cwd`, is the system refusing
-/// the command line as too long: `E2BIG`, or `ENAMETOOLONG` as GKE Sandbox
-/// (gVisor) says it, but that only when nothing else can have caused it:
-/// - The arguments take more than POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`,
-///   4,096 bytes), which no system refuses: a short line's `ENAMETOOLONG` is a
-///   path's.
-/// - The program's path and the directory are each shorter than `PATH_MAX`,
-///   with no name in them longer than `NAME_MAX` (a working directory past
-///   `PATH_MAX` refuses every command alike).
-/// - The program is no `#!` script whose interpreter the system cannot reach by
-///   its path ([`interpreter_path_too_long`]), whatever the line's size, as
-///   GNU's xargs never splits it.
-///
-/// The same rule as `pi_builtins`' `command_line_too_long`, which decides
-/// whether `xargs` and `find` retry, so a refusal reaches them only when
-/// they act on it; any other keeps the shell's diagnostic.
+/// the command line as too long: `pi_builtins`' `command_line_too_long`,
+/// which also decides whether `xargs` and `find` retry, so a refusal reaches
+/// them only when they act on it; any other keeps the shell's diagnostic.
 #[cfg(unix)]
 fn refused_as_too_long(err: &std::io::Error, path: &[u8], argv: &[BString], cwd: &[u8]) -> bool {
-	/// POSIX's least `ARG_MAX` (`_POSIX_ARG_MAX`).
-	const POSIX_ARG_MAX: usize = 4096;
-	match err.raw_os_error() {
-		Some(libc::E2BIG) => true,
-		Some(libc::ENAMETOOLONG) => {
-			let line: usize = argv.iter().map(|arg| arg.len() + 1).sum();
-			line > POSIX_ARG_MAX
-				&& fits_as_path(path)
-				&& fits_as_path(cwd)
-				&& !interpreter_path_too_long(&super::probe::absolute(cwd, path), cwd)
-		},
-		_ => false,
-	}
-}
-
-/// Whether the program at `path` (a host path: the one the system refused)
-/// is a `#!` script whose interpreter the system cannot reach by its path:
-/// the interpreter its first line names (read as the kernel reads it, from
-/// the file's first 256 bytes; relative to `cwd` when relative) is past
-/// `PATH_MAX` or holds a name past `NAME_MAX`, or looking it up fails with
-/// `ENAMETOOLONG` (a symlink on its way names one). The read is bounded and
-/// only made for an `ENAMETOOLONG` of a long line, the one refusal it
-/// decides. The same check as `pi_builtins`' `interpreter_path_too_long`.
-#[cfg(unix)]
-fn interpreter_path_too_long(path: &[u8], cwd: &[u8]) -> bool {
-	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
-	let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(path)) else {
-		return false;
-	};
-	let mut head = Vec::with_capacity(256);
-	if file.take(256).read_to_end(&mut head).is_err() {
-		return false;
-	}
-	let Some(line) = head.strip_prefix(b"#!") else {
-		return false;
-	};
-	let line = &line[line
-		.iter()
-		.take_while(|&&c| c == b' ' || c == b'\t')
-		.count()..];
-	let end = line
-		.iter()
-		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
-		.unwrap_or(line.len());
-	let interpreter = super::probe::absolute(cwd, &line[..end]);
-	if line[..end].is_empty() {
-		return false;
-	}
-	!fits_as_path(&interpreter)
-		|| std::fs::metadata(std::ffi::OsStr::from_bytes(&interpreter))
-			.is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
-}
-
-/// Whether the system takes `path` as a name: shorter than `PATH_MAX`, with
-/// no name in it longer than `NAME_MAX` (255 on Linux and macOS).
-#[cfg(unix)]
-fn fits_as_path(path: &[u8]) -> bool {
-	const NAME_MAX: usize = 255;
-	path.len() < crate::sys::PATH_MAX
-		&& path
-			.split(|&b| b == b'/')
-			.all(|name| name.len() <= NAME_MAX)
+	use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _, path::Path};
+	pi_builtins::extras::command_line_too_long(
+		err,
+		Path::new(OsStr::from_bytes(path)),
+		pi_builtins::extras::line_bytes(argv.iter().map(|arg| OsStr::from_bytes(arg))),
+		Path::new(OsStr::from_bytes(cwd)),
+	)
 }
 
 /// Elsewhere no utility splits a command line, so every refused start keeps
@@ -5465,8 +5398,8 @@ mod tests {
 	/// `E2BIG` is always a command line too long; `ENAMETOOLONG` only for
 	/// arguments past `_POSIX_ARG_MAX` (4,096 bytes) when neither the
 	/// program's path nor the working directory is past `PATH_MAX` or holds
-	/// a name past `NAME_MAX`; any other error never is. The cases of
-	/// `pi_builtins`' twin (`command_line_too_long`), for resolved paths.
+	/// a name past `NAME_MAX`; any other error never is: `pi_builtins`'
+	/// rule (`command_line_too_long`), as the shell asks it, for host paths.
 	#[cfg(unix)]
 	#[test]
 	fn enametoolong_is_a_line_too_long_only_when_no_path_is() {
@@ -5502,7 +5435,8 @@ mod tests {
 		assert!(!refused_as_too_long(&other, b"/usr/bin/printf", &long, b"/tmp"));
 	}
 
-	/// The `#!` rule of `pi_builtins`' twin: an `ENAMETOOLONG` of a long line
+	/// The `#!` rule of `pi_builtins`' `command_line_too_long`, as the shell
+	/// asks it: an `ENAMETOOLONG` of a long line
 	/// whose program is a script with an interpreter the system cannot reach
 	/// by its path (a symlink to a name past `NAME_MAX`) is the
 	/// interpreter's; a reachable interpreter, or no `#!`, keeps the line's.
