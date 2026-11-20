@@ -109,13 +109,6 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				if start_trap(k, vp, cx, TrapKey::Signal(sig)) {
 					continue;
 				}
-				if sig == crate::bash::signal::Signal::Hup
-					&& vp.mode.dialect() == Dialect::Zsh
-					&& matches!(state::record(cx.store, vp, Key::Trap(TrapKey::Signal(sig))), Ok(None))
-				{
-					zsh_hup_exit(k, vp, cx);
-					continue;
-				}
 			}
 		}
 		if !vp.restore_opts.is_empty() {
@@ -687,24 +680,34 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	}
 }
 
-/// zsh `zhandler` for a `HUP` without a trap, `zexit(SIGHUP)`: the shell
-/// exits with status 1 now, after the EXIT trap in effect, and runs no
-/// other. Inside a function that is the function's own EXIT trap, if any:
-/// zsh's `starttrapscope` keeps the shell's away while a function runs,
-/// and unlike `exit` the signal does not wait for the function to return.
-fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+/// zsh `zhandler` for a `HUP` without a trap, `zexit(SIGHUP)`, from the
+/// signal itself: the shell exits with status 1 now, after the EXIT trap
+/// in effect, and runs no other. It does not wait for the command it runs,
+/// which it leaves to the signal. Inside a function that is the
+/// function's own EXIT trap, if any: zsh's `starttrapscope` keeps the
+/// shell's away while a function runs, and unlike `exit` the signal does
+/// not wait for the function to return.
+pub fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 	let in_function = vp
 		.frames
 		.iter()
 		.any(|f| matches!(f.kind, FrameKind::Function { .. }));
 	exit_shell(k, vp, cx, 1);
+	vp.blocked = None;
+	vp.stopped = false;
 	if in_function {
-		if let Some(run) = vp.runs.front_mut() {
-			run.exit_trap_started = true;
-		}
-		if vp.transient {
-			vp.exit_trap_run = true;
-		}
+		spend_exit_trap(vp);
+	}
+}
+
+/// Mark `vp`'s EXIT trap as run: its run's flag, or a forked subshell's
+/// own (it has no run).
+fn spend_exit_trap(vp: &mut Vproc) {
+	if let Some(run) = vp.runs.front_mut() {
+		run.exit_trap_started = true;
+	}
+	if vp.transient {
+		vp.exit_trap_run = true;
 	}
 }
 
@@ -4005,6 +4008,29 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	(group && exec).then_some(BangStage::Exec)
 }
 
+/// Whether the `( … )` that `info` spawns at `pc` is the whole body of a
+/// background job (`( … ) &`): zsh runs that as one process, whose
+/// `entersubsh` ran with the job's, so its traps are not unset again (they
+/// hold the job's ignored `INT` and `QUIT` where it has no job control).
+fn async_subshell_body(unit: &Unit, pc: u32, info: &crate::bash::ir::SpawnIr) -> bool {
+	if info.kind != SpawnKind::Subshell {
+		return false;
+	}
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let end = info.end + u32::from(code(info.end) == Some(Opcode::Leave));
+	code(end) == Some(Opcode::SubExit)
+		&& unit.spawns.iter().any(|s| {
+			s.kind == SpawnKind::Background
+				&& end + 1 == s.end
+				&& s.stages.first().is_some_and(|st| {
+					st.entry <= pc
+						&& unit.ops[st.entry as usize..pc as usize]
+							.iter()
+							.all(|op| matches!(op.code, Opcode::Nop | Opcode::Enter))
+				})
+		})
+}
+
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
 /// started `stages` (`(vproc, entry)`; the last one a child, or the job's
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
@@ -4104,27 +4130,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
-				// zsh's `( … ) &` is one process, whose `entersubsh` ran with
-				// the async job's: the `( … )` that is a background job's body
-				// does not unset its traps again (they hold the async ignores).
-				let pc = vp.frames.last().map_or(u32::MAX, |f| f.pc);
-				let async_body = info.kind == SpawnKind::Subshell
-					&& unit.spawns.iter().any(|s| {
-						s.kind == SpawnKind::Background
-							&& s.stages.first().is_some_and(|st| {
-								st.entry <= pc
-									&& unit.ops[st.entry as usize..pc as usize]
-										.iter()
-										.all(|op| matches!(op.code, Opcode::Nop | Opcode::Enter))
-									&& {
-										let code_at = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-										let end =
-											info.end + u32::from(code_at(info.end) == Some(Opcode::Leave));
-										code_at(end) == Some(Opcode::SubExit) && end + 1 == s.end
-									}
-							})
-					});
-				if !async_body {
+				if child.mode.dialect() != Dialect::Zsh
+					|| !async_subshell_body(unit, top_frame(vp).pc, info)
+				{
 					zsh_subshell_traps(k, cx, &mut child, false);
 				}
 				if info.kind == SpawnKind::Background && !control {
@@ -4988,54 +4996,18 @@ pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc
 	}
 }
 
-/// bash `termsig_handler` for vproc `vp` and the fatal signal `sig`, when
-/// an EXIT trap of its own is set (bash catches its `terminating_signals`
-/// once one is): what it runs gets the signal, its frames go, the EXIT
-/// trap runs with `$?` as it was, and when the trap ends the vproc exits
-/// with `status` (128 + the signal's number). `false`, and nothing done,
-/// without such a trap.
-pub fn bash_termsig(
-	k: &mut Kernel,
-	vp: &mut Vproc,
-	cx: &mut Cx<'_>,
-	sig: crate::bash::signal::Signal,
-	status: i32,
-) -> bool {
-	if vp.parent.is_some() && !vp.own_traps.has(TrapKey::Exit) {
-		return false;
-	}
-	match state::record(cx.store, vp, Key::Trap(TrapKey::Exit)) {
-		Ok(Some(Record::Trap { action, .. })) if !action.is_empty() => {},
-		Ok(_) => return false,
-		Err(err) => {
-			k.fail(err);
-			return false;
-		},
-	}
-	for frame in &mut vp.frames {
-		if let Some(sc) = frame.scratch.as_mut() {
-			match &mut sc.live {
-				super::proc::Live::Task(task) => task.signal(sig),
-				super::proc::Live::Ext(ext) => {
-					let _ = ext.signal(sig);
-					let _ = ext.cont();
-				},
-				_ => {},
-			}
-		}
-	}
+/// bash `termsig_handler` for vproc `vp`, which has an EXIT trap of its own
+/// ([`super::untrapped`]: bash catches its `terminating_signals` once one
+/// is set): its frames go, the EXIT trap runs with `$?` as it was, and when
+/// the trap ends the vproc exits with `status` (128 + the signal's number).
+pub fn bash_termsig(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	unwind(&mut k.root, cx.store, vp, 0);
 	vp.blocked = None;
 	vp.stopped = false;
-	if let Some(run) = vp.runs.front_mut() {
-		run.exit_trap_started = true;
-	}
-	if vp.transient {
-		vp.exit_trap_run = true;
-	}
+	spend_exit_trap(vp);
 	if !start_trap(k, vp, cx, TrapKey::Exit) {
 		vp.status = status;
-		return true;
+		return;
 	}
 	// The trap's end exits with `status`; the trap itself sees `$?`.
 	if let Some(Frame {
@@ -5046,7 +5018,6 @@ pub fn bash_termsig(
 		*end = status;
 		*exit = true;
 	}
-	true
 }
 
 /// Push a script frame running `src` (`eval`, `source`).

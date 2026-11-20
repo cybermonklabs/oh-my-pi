@@ -422,6 +422,9 @@ fn fresh_shell(
 		startup_values(cx, &args.shell_name, ppid, k.engine.config().platform, super::StartupVars {
 			lookup_shell: need_shell,
 			interactive:  args.interactive,
+			login_home:   args.login_name
+				&& !args.posix
+				&& !matches!(ov.vars.get(&b"POSIXLY_CORRECT"[..]), Some(Some(_))),
 		})
 	};
 	for (name, var, forced) in values {

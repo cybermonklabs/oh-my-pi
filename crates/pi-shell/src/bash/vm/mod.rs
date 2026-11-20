@@ -30,6 +30,7 @@ mod proc;
 pub mod quote;
 mod redir;
 mod state;
+mod untrapped;
 mod xtrace;
 mod zle;
 mod zsh;
@@ -1255,6 +1256,15 @@ fn startup_vars(k: &mut Kernel, cx: &mut Cx<'_>, init: &ShellInit) -> Result<(),
 		startup_values(cx, &init.argv0, ppid, k.engine.config().platform, StartupVars {
 			lookup_shell: need_shell && !deferred_shell,
 			interactive:  init.interactive,
+			login_home:   init.argv0.first() == Some(&b'-')
+				&& !init
+					.options
+					.iter()
+					.any(|(n, on)| *on && n.as_slice() == b"posix")
+				&& !init
+					.env
+					.iter()
+					.any(|(n, _)| n.as_slice() == b"POSIXLY_CORRECT"),
 		})
 	};
 	// zsh started as sh or ksh has no `MANPATH` and no prompt aliases
@@ -1463,6 +1473,10 @@ pub fn zsh_startup_values(
 pub struct StartupVars {
 	lookup_shell: bool,
 	interactive:  bool,
+	/// A login shell by name (`argv[0]` `-bash`; bash's `login_shell == 1`,
+	/// which `-l` does not make) not in posix mode: bash sets `HOME` when
+	/// the environment has none (`variables.c`: `set_home_var`).
+	login_home:   bool,
 }
 
 /// bash's startup variables of a new shell named `argv0` whose `$PPID` is
@@ -1482,6 +1496,16 @@ pub fn startup_values(
 		cx.host.login_shell().unwrap_or_default()
 	} else {
 		BString::default()
+	};
+	let home = if options.login_home {
+		// bash `sh_get_home_dir`: the entry's home, `/` without one.
+		Some(if user.home.is_empty() {
+			BString::from("/")
+		} else {
+			user.home.clone()
+		})
+	} else {
+		None
 	};
 	let defaults: [(&'static [u8], BString); 16] = [
 		(b"IFS", BString::from(" \t\n")),
@@ -1506,9 +1530,13 @@ pub fn startup_values(
 	if options.interactive {
 		out.push((&b"PS1"[..], Var::scalar(BString::from(r"\s-\v\$ "), Attrs::NONE), false));
 	}
+	if let Some(home) = home {
+		out.push((&b"HOME"[..], Var::scalar(home, Attrs::NONE), false));
+	}
 	for (name, value) in defaults {
-		// bash sets SHELL from the passwd entry only when known, and never
-		// sets HOME: `~` reads the entry without it.
+		// bash sets `SHELL` from the password database entry
+		// (`set_shell_var`: the entry's shell, `/bin/sh` without one); `HOME`
+		// only for a login shell, above: else `~` reads the entry.
 		if name == b"SHELL" && value.is_empty() {
 			continue;
 		}
@@ -1675,22 +1703,24 @@ impl Shell {
 		k.root
 			.set_misc(cx.store, MiscKey::Umask, format!("{:04o}", cx.host.umask() & 0o7777));
 		k.root.set_positional(cx.store, init.args);
-		if zsh {
-			// zsh `init_signals`: the shell ignores `QUIT`, and the signals
-			// ignored on entry stay ignored, until a trap for one is set or
-			// removed; while untrapped, a signal to the shell does nothing.
-			let held = cx.host.ignored_signals().with(crate::bash::Signal::Quit);
-			k.root.set_record(
-				cx.store,
-				KeyBuf::Misc(MiscKey::ZshHeldIgnored),
-				Some(Record::Words(
-					held
-						.iter()
-						.map(|sig| BString::from(sig.to_string()))
-						.collect(),
-				)),
-			);
-		}
+		// The signals the root holds ignored while untrapped ([`untrapped`]):
+		// `QUIT` (bash "in all cases", zsh's `init_signals`), and in zsh the
+		// signals ignored on entry, until a trap for one is set or removed.
+		let held = if zsh {
+			cx.host.ignored_signals().with(crate::bash::Signal::Quit)
+		} else {
+			crate::bash::SigSet::EMPTY.with(crate::bash::Signal::Quit)
+		};
+		k.root.set_record(
+			cx.store,
+			KeyBuf::Misc(MiscKey::HeldIgnored),
+			Some(Record::Words(
+				held
+					.iter()
+					.map(|sig| BString::from(sig.to_string()))
+					.collect(),
+			)),
+		);
 		for sig in cx.host.ignored_signals().iter() {
 			// zsh `init_signals`: of the signals ignored on entry only `QUIT`
 			// is recorded as ignored (`ZSIG_IGNORED`), and any of them may be
@@ -1712,15 +1742,21 @@ impl Shell {
 				Some(Record::Trap { mode: init.mode, action: BString::default() }),
 			);
 		}
-		// zsh `init_signals` and bash (which ignores `QUIT` "in all cases")
-		// ignore `QUIT` in the shell's own process; an interactive shell's
-		// handlers come with `jobctl::init_io`. Commands get it at its
+		// The shell's own process ignores `QUIT` (an interactive shell's
+		// handlers come with `jobctl::init_io`); commands get it at its
 		// default. A zsh trap set or removed for it gives it its own
-		// disposition; bash keeps it ignored ([`builtins::trap`]).
+		// disposition; bash keeps it ignored ([`builtins::trap`]). zsh
+		// catches `HUP` unless it was ignored on entry (`init_signals`:
+		// `zhandler`, which exits; [`untrapped`]).
 		if !init.interactive {
 			let _ = cx
 				.host
 				.set_signal_trap(crate::bash::Signal::Quit, Some(BStr::new(b"")));
+		}
+		if zsh && !held.contains(crate::bash::Signal::Hup) {
+			let _ = cx
+				.host
+				.set_signal_trap(crate::bash::Signal::Hup, Some(BStr::new(untrapped::CATCH)));
 		}
 		let vpid = k.vpid(cx.store);
 		if let Some(err) = k.root.take_fault() {
@@ -2236,23 +2272,16 @@ impl Shell {
 				let unwinds = trapped
 					|| (sig != Signal::Kill && self.procs[i].has_work() && !self.procs[i].transient);
 				if unwinds {
+					// A spawn still pending never starts: the cancelled command
+					// is not resumed (the trap is the last action).
 					for frame in &mut self.procs[i].frames {
-						if let Some(sc) = frame.scratch.as_mut() {
-							// A spawn still pending never starts: the cancelled
-							// command is not resumed (the trap is the last action).
-							if matches!(sc.live, Live::Spawn(_)) {
-								sc.live = Live::None;
-							}
-							match &mut sc.live {
-								Live::Task(task) => task.signal(sig),
-								Live::Ext(ext) => {
-									let _ = ext.signal(sig);
-									let _ = ext.cont();
-								},
-								_ => {},
-							}
+						if let Some(sc) = frame.scratch.as_mut()
+							&& matches!(sc.live, Live::Spawn(_))
+						{
+							sc.live = Live::None;
 						}
 					}
+					signal_lives(&mut self.procs[i], sig, true);
 					self.procs[i].stopped = false;
 					if trapped {
 						exec::mark_cancel(&mut self.procs[i], status);
@@ -2474,7 +2503,7 @@ impl Shell {
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
 			if target != SigTarget::Vpid(root.0) && !terminating {
-				signal_lives(&mut self.procs[i], sig);
+				signal_lives(&mut self.procs[i], sig, false);
 			}
 			// A vproc that is just its program (bash would have `exec`'d it:
 			// `cmd &`, a pipeline stage, `( cmd )`, `exec cmd`) or just waits
@@ -2523,70 +2552,47 @@ impl Shell {
 				}
 				continue;
 			}
-			// The interactive shell itself: zsh's handlers (`INT` abandons
-			// the command line; `QUIT`, `TERM`, `ALRM` and, with job
-			// control, the terminal stop signals do nothing).
-			if self.procs[i].parent.is_none()
-				&& jobctl::untrapped(&mut self.k, cx, &mut self.procs[i], sig)
-			{
-				continue;
-			}
-			// zsh's own dispositions of a signal it has no trap for (zsh
-			// `init_signals`, `zhandler`): the root ignores `QUIT` and what was
-			// ignored on entry, and `HUP` makes the shell exit with status 1
-			// (`zexit(SIGHUP)`, its EXIT trap first) once the command it runs
-			// is done, a command the signal reaches too when it was sent to
-			// more than the shell.
-			if self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Zsh {
-				let held = self.procs[i].parent.is_none()
-					&& match builtins::trap::held_ignored(cx.store, &self.procs[i], sig) {
-						Ok(held) => held,
-						Err(err) => {
-							self.k.fail(err);
-							return;
-						},
-					};
-				if held {
-					continue;
-				}
-				if sig == Signal::Hup {
-					let process = &mut self.procs[i];
-					if target != SigTarget::Vpid(root.0) {
-						signal_lives(process, sig);
+			// No trap: what the shell does itself ([`untrapped::decide`]). A
+			// signal sent to more than the shell reaches what it runs too;
+			// the shell does not wait for that to end.
+			let decision = match untrapped::decide(&mut self.k, cx, &mut self.procs[i], sig) {
+				Ok(decision) => decision,
+				Err(err) => {
+					self.k.fail(err);
+					return;
+				},
+			};
+			let status = sig.exit_status(platform);
+			let to_shell_only = target == SigTarget::Vpid(root.0);
+			match decision {
+				untrapped::Untrapped::Handled | untrapped::Untrapped::Ignored => continue,
+				untrapped::Untrapped::ZshHupExit => {
+					if !to_shell_only {
+						signal_lives(&mut self.procs[i], sig, false);
 					}
-					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
-						process.blocked = None;
-					}
-					interrupt_wait(process, sig.exit_status(platform));
+					exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
 					continue;
-				}
-			}
-			// bash ignores `QUIT` in the shell itself "in all cases"; its
-			// subshells get it at its default.
-			if sig == Signal::Quit
-				&& self.procs[i].parent.is_none()
-				&& self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Bash
-			{
-				continue;
+				},
+				untrapped::Untrapped::BashExitTrapThenDie => {
+					if !to_shell_only {
+						signal_lives(&mut self.procs[i], sig, true);
+					}
+					if self.procs[i].parent.is_none() {
+						self.k.killed_by = Some(i32::from(sig.number(platform)));
+					}
+					exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, status);
+					continue;
+				},
+				untrapped::Untrapped::Default => {},
 			}
 			match sig.default_action() {
 				DefaultAction::Terminate => {
-					// bash catches its fatal signals once an EXIT trap is set
-					// (`initialize_terminating_signals`): the trap runs, then
-					// the shell dies of the signal (`termsig_handler`).
-					let status = sig.exit_status(platform);
-					let caught = self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Bash
-						&& bash_fatal(sig)
-						&& exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, sig, status);
 					if self.procs[i].parent.is_none() {
 						// The root shell dies of the signal: a process host
 						// dies of it too ([`Shell::killed_by`]).
 						self.k.killed_by = Some(i32::from(sig.number(platform)));
 					}
-					if !caught {
-						self.kill(cx, i, sig, status);
-					}
+					self.kill(cx, i, sig, status);
 				},
 				DefaultAction::Stop | DefaultAction::Continue => {
 					let stop = sig.default_action() == DefaultAction::Stop;
@@ -2838,41 +2844,19 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 	}
 }
 
-/// bash's `terminating_signals` (`sig.c`): the fatal signals it catches,
-/// to run its EXIT trap first, once one is set. `PROF`, `STKFLT` and `PWR`
-/// are not among them (measured with bash 5.2.21).
-const fn bash_fatal(sig: Signal) -> bool {
-	matches!(
-		sig,
-		Signal::Hup
-			| Signal::Int
-			| Signal::Ill
-			| Signal::Trap
-			| Signal::Abrt
-			| Signal::Emt
-			| Signal::Fpe
-			| Signal::Bus
-			| Signal::Segv
-			| Signal::Sys
-			| Signal::Pipe
-			| Signal::Alrm
-			| Signal::Term
-			| Signal::Xcpu
-			| Signal::Xfsz
-			| Signal::Vtalrm
-			| Signal::Usr1
-			| Signal::Usr2
-	)
-}
-
-/// Pass `sig` on to the builtin tasks and externals `p` runs now.
-fn signal_lives(p: &mut Vproc, sig: Signal) {
+/// Pass `sig` on to the builtin tasks and externals `p` runs now, and
+/// continue the externals after it when `cont` (bash's `kill_pid` continues
+/// a stopped job it ends).
+fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 	for frame in &mut p.frames {
 		if let Some(sc) = frame.scratch.as_mut() {
 			match &mut sc.live {
 				Live::Task(task) => task.signal(sig),
 				Live::Ext(ext) => {
 					let _ = ext.signal(sig);
+					if cont {
+						let _ = ext.cont();
+					}
 				},
 				_ => {},
 			}

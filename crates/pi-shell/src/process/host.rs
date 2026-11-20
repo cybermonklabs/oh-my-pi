@@ -720,39 +720,20 @@ pub fn inherited_fds(_embedded: bool) -> Vec<(i32, Box<dyn File>)> {
 	Vec::new()
 }
 
+/// bash `get_current_user_info` for `SHELL`: the login shell of the user's
+/// password database entry; `/bin/sh` for a uid without one; else
+/// `$SHELL` (off Unix, or an entry with no shell).
 fn read_login_shell() -> Option<BString> {
+	let from_env = || std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes()));
 	#[cfg(unix)]
 	{
 		// SAFETY: getuid has no preconditions.
-		login_shell(unsafe { libc::getuid() })
-			.or_else(|| std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes())))
+		match crate::sys::user::passwd_entry(unsafe { libc::getuid() }) {
+			Some(pw) if !pw.shell.is_empty() => Some(pw.shell),
+			Some(_) => from_env(),
+			None => Some(BString::from("/bin/sh")),
+		}
 	}
 	#[cfg(not(unix))]
-	std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes()))
-}
-
-/// The login shell of `uid` from the password database (bash sets `SHELL`
-/// from it when the environment has none).
-#[cfg(unix)]
-fn login_shell(uid: libc::uid_t) -> Option<BString> {
-	let mut buf = vec![0u8; 4096];
-	let mut pw = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-	let mut found: *mut libc::passwd = std::ptr::null_mut();
-	// SAFETY: every pointer is valid for the call; `buf` holds the strings
-	// `pw` points into and outlives their use below.
-	let rc = unsafe {
-		libc::getpwuid_r(uid, pw.as_mut_ptr(), buf.as_mut_ptr().cast(), buf.len(), &raw mut found)
-	};
-	if rc != 0 || found.is_null() {
-		return None;
-	}
-	// SAFETY: getpwuid_r succeeded, so `pw` is initialized and `pw_shell`
-	// is null or a NUL-terminated string inside `buf`.
-	let shell = unsafe { pw.assume_init().pw_shell };
-	if shell.is_null() {
-		return None;
-	}
-	// SAFETY: see above.
-	let bytes = unsafe { std::ffi::CStr::from_ptr(shell) }.to_bytes();
-	(!bytes.is_empty()).then(|| BString::from(bytes))
+	from_env()
 }

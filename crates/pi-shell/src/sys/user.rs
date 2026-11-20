@@ -25,7 +25,7 @@ pub fn read_user() -> UserInfo {
 	#[cfg(windows)]
 	let (uid, euid, gid) = windows::ids();
 	#[cfg(unix)]
-	let (name, home) = passwd_entry(uid).unwrap_or_else(no_entry);
+	let (name, home) = passwd_entry(uid).map_or_else(no_entry, |pw| (pw.name, pw.dir));
 	#[cfg(windows)]
 	let (name, home) = {
 		let var = |k: &str| {
@@ -46,40 +46,16 @@ fn no_entry() -> (BString, BString) {
 	(BString::default(), BString::default())
 }
 
-/// The name and home directory of `uid`'s password database entry
-/// (`getpwuid_r`); `None` without one.
+/// `uid`'s password database entry (`getpwuid_r`, [`user_db`]); `None`
+/// without one, or when the database cannot be read.
+///
+/// [`user_db`]: crate::sys::fs_ops::user_db
 #[cfg(unix)]
-fn passwd_entry(uid: libc::uid_t) -> Option<(BString, BString)> {
-	use std::ffi::CStr;
-	let mut buf = vec![0u8; 4096];
-	loop {
-		let mut pw = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-		let mut found: *mut libc::passwd = std::ptr::null_mut();
-		// SAFETY: `pw` and `buf` are valid for writes of their sizes;
-		// getpwuid_r fills them and sets `found`.
-		let rc = unsafe {
-			libc::getpwuid_r(uid, pw.as_mut_ptr(), buf.as_mut_ptr().cast(), buf.len(), &raw mut found)
-		};
-		if rc == libc::ERANGE && buf.len() < 1 << 20 {
-			buf.resize(buf.len() * 2, 0);
-			continue;
-		}
-		if rc != 0 || found.is_null() {
-			return None;
-		}
-		// SAFETY: getpwuid_r succeeded, so `pw` is initialized and its
-		// strings are null or NUL-terminated inside `buf`.
-		let pw = unsafe { pw.assume_init() };
-		let text = |p: *const libc::c_char| {
-			if p.is_null() {
-				BString::default()
-			} else {
-				// SAFETY: as above.
-				BString::from(unsafe { CStr::from_ptr(p) }.to_bytes())
-			}
-		};
-		return Some((text(pw.pw_name), text(pw.pw_dir)));
-	}
+pub fn passwd_entry(uid: libc::uid_t) -> Option<crate::bash::fs::PwEntry> {
+	crate::sys::fs_ops::user_db(&crate::bash::fs::PwQuery::Uid(uid))
+		.ok()?
+		.into_iter()
+		.next()
 }
 
 /// The effective uid and gid files read as owned by. Windows reports no

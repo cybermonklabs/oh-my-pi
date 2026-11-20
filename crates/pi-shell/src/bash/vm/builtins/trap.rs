@@ -20,7 +20,7 @@ use crate::bash::{
 		Kernel,
 		exec::mode_of,
 		proc::{FrameKind, ScriptKind, Vproc},
-		quote, state,
+		quote, state, untrapped,
 	},
 };
 
@@ -55,11 +55,11 @@ fn print(ctx: &mut Ctx<'_, '_>, key: TrapKey, action: &[u8]) {
 
 /// The zsh functions that are the trap for `key`, in the order zsh's
 /// `gettrapnode` looks for them: `TRAP` and zsh's name of the signal
-/// ([`Signal::zsh_name`]: `TRAPINT`, `TRAPIOT` on Linux), then its
-/// alternate names ([`Signal::zsh_alternates`]: `TRAPIO` for `POLL`), or
-/// `TRAPEXIT`, `TRAPZERR` then `TRAPERR` (zsh's `ERR` names `ZERR`),
-/// `TRAPDEBUG`. None for bash's `RETURN`. A signal has one trap function
-/// at a time, under one of these names ([`func_changing`]).
+/// ([`Signal::zsh_name`]: `TRAPINT`, `TRAPABRT`), then its alternate names
+/// ([`Signal::zsh_alternates`]: `TRAPIOT` for `ABRT`, `TRAPIO` for `POLL`
+/// on Linux), or `TRAPEXIT`, `TRAPZERR` then `TRAPERR` (zsh's `ERR` names
+/// `ZERR`), `TRAPDEBUG`. None for bash's `RETURN`. A signal has one trap
+/// function at a time, under one of these names ([`zsh_settrap`]).
 pub fn func_names(key: TrapKey, platform: crate::bash::ids::Platform) -> Vec<BString> {
 	match key {
 		TrapKey::Signal(sig) => std::iter::once(sig.zsh_name(platform))
@@ -77,6 +77,24 @@ pub fn func_names(key: TrapKey, platform: crate::bash::ids::Platform) -> Vec<BSt
 /// back as.
 fn func_name(key: TrapKey, platform: crate::bash::ids::Platform) -> Option<BString> {
 	func_names(key, platform).into_iter().next()
+}
+
+/// Remove the trap functions of `key` under each of its names but `keep`:
+/// a definition replaces the signal's trap function under another name
+/// (zsh's `settrap` calls `removetrap`, which removes the function
+/// `gettrapnode` finds), and a removal removes it under any name.
+pub fn remove_trap_funcs(
+	root: &mut state::Root,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	key: TrapKey,
+	keep: Option<&[u8]>,
+) {
+	for name in func_names(key, root.platform()) {
+		if keep != Some(name.as_slice()) {
+			state::store_record(root, store, vp, KeyBuf::Func(name), None);
+		}
+	}
 }
 
 /// zsh `gettrapnode`: the function that is the trap for `key` in `vp`,
@@ -177,9 +195,7 @@ fn current(
 /// Remove the trap for `key`: its record and its `TRAPNAL` function.
 fn clear(root: &mut state::Root, store: &mut dyn StateStore, vp: &mut Vproc, key: TrapKey) {
 	state::store_record(root, store, vp, KeyBuf::Trap(key), None);
-	for name in func_names(key, root.platform()) {
-		state::store_record(root, store, vp, KeyBuf::Func(name), None);
-	}
+	remove_trap_funcs(root, store, vp, key, None);
 }
 
 /// Put `saved` (a trap record or a `TRAPNAL` function) back as the trap for
@@ -284,59 +300,6 @@ pub fn end_scope(
 	Ok(())
 }
 
-/// Whether the trap of `sig` is still the `''` zsh recorded for a signal
-/// ignored when it started ([`MiscKey::ZshEntryIgnored`]).
-fn entry_ignored(store: &mut dyn StateStore, vp: &Vproc, sig: Signal) -> Result<bool, StoreError> {
-	Ok(matches!(
-		state::record(store, vp, Key::Misc(MiscKey::ZshEntryIgnored))?,
-		Some(Record::Words(names)) if names.iter().any(|n| n.as_slice() == sig.to_string().as_bytes())
-	))
-}
-
-/// Whether the root zsh shell ignores `sig` while it has no trap for it
-/// ([`MiscKey::ZshHeldIgnored`]: `QUIT`, and what was ignored on entry).
-///
-/// # Errors
-///
-/// A store failure reading the record.
-pub fn held_ignored(
-	store: &mut dyn StateStore,
-	vp: &Vproc,
-	sig: Signal,
-) -> Result<bool, StoreError> {
-	Ok(matches!(
-		state::record(store, vp, Key::Misc(MiscKey::ZshHeldIgnored))?,
-		Some(Record::Words(names)) if names.iter().any(|n| n.as_slice() == sig.to_string().as_bytes())
-	))
-}
-
-/// A trap for `sig` is set or removed: zsh holds it ignored no more
-/// ([`MiscKey::ZshHeldIgnored`]; `settrap` gives it a handler,
-/// `removetrap` its default).
-fn release_held(
-	root: &mut state::Root,
-	store: &mut dyn StateStore,
-	vp: &mut Vproc,
-	sig: Signal,
-) -> Result<(), StoreError> {
-	let name = sig.to_string();
-	let Some(Record::Words(names)) = state::record(store, vp, Key::Misc(MiscKey::ZshHeldIgnored))?
-	else {
-		return Ok(());
-	};
-	if !names.iter().any(|n| n.as_slice() == name.as_bytes()) {
-		return Ok(());
-	}
-	let rest: Vec<BString> = names
-		.iter()
-		.filter(|n| n.as_slice() != name.as_bytes())
-		.cloned()
-		.collect();
-	let record = (!rest.is_empty()).then_some(Record::Words(rest));
-	state::store_record(root, store, vp, KeyBuf::Misc(MiscKey::ZshHeldIgnored), record);
-	Ok(())
-}
-
 /// zsh `entersubsh` for `child`, a new zsh subshell. Without
 /// `ESUB_KEEPTRAP` (`keep` false: `( … )`, `&`, `$( )`, `<( )`, a
 /// coproc) it unsets every signal trap but the `TRAPNAL` functions,
@@ -402,7 +365,7 @@ pub fn save_local(
 			// ignored-on-entry `QUIT`.
 			if let TrapKey::Signal(sig) = key
 				&& matches!(&now, Some(Record::Trap { action, .. }) if action.is_empty())
-				&& entry_ignored(store, vp, sig)?
+				&& untrapped::names_hold(store, vp, MiscKey::ZshEntryIgnored, sig)?
 			{
 				now = None;
 			}
@@ -425,16 +388,9 @@ pub enum FuncChange {
 	Removed,
 }
 
-/// A zsh `TRAPNAL` function named `name` is about to change (`how`): under
-/// `localtraps` the enclosing function saves the trap ([`save_local`]); a
-/// definition replaces a `trap` action for the same signal and the
-/// signal's trap function under any other of its names ([`func_names`]:
-/// zsh's `settrap` calls `removetrap`, which removes the function
-/// `gettrapnode` finds, so one trap function per signal stays), and makes
-/// the trap known to the DEBUG/ZERR fast path. The root shell asks the
-/// host to catch the signal while the function exists and gives it back
-/// its default once it is removed, as zsh's `settrap`/`unsettrap` do:
-/// without that a real signal ended the shell instead of calling the
+/// A zsh `TRAPNAL` function named `name` is about to change (`how`): zsh's
+/// `settrap` (`unsettrap` for a removal) for its signal ([`zsh_settrap`]).
+/// Without that a real signal ended the shell instead of calling the
 /// function. `None` when `name` names no trap.
 ///
 /// # Errors
@@ -451,67 +407,74 @@ pub fn func_changing(
 	let Some(key) = func_key(name, platform) else {
 		return Ok(None);
 	};
-	save_local(&mut k.root, cx.store, vp, key)?;
-	if let TrapKey::Signal(sig) = key {
-		release_held(&mut k.root, cx.store, vp, sig)?;
-	}
-	if how != FuncChange::Removed {
-		for other in func_names(key, platform) {
-			if other.as_slice() != name {
-				state::store_record(&mut k.root, cx.store, vp, KeyBuf::Func(other), None);
-			}
-		}
-	}
-	if how == FuncChange::Defined {
-		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
-		k.pseudo_traps.note(key);
-	}
-	if let TrapKey::Signal(sig) = key {
-		let action = (how != FuncChange::Removed).then(|| BStr::new(name));
-		match os_disposition(k, cx, vp, sig, action) {
-			// The host keeps the signal ignored: the trap is recorded as
-			// ignored, beside the function.
-			Some(Ok(false)) if how != FuncChange::Removed => {
-				let ignored = Record::Trap { mode: mode_of(vp), action: BString::default() };
-				state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), Some(ignored));
-			},
-			Some(Err(err)) => {
-				let line = crate::bash::vm::exec::current_line(vp);
-				k.diag(cx, vp, line, Diag::SignalSetup { sig, err });
-			},
-			Some(Ok(_)) | None => {},
-		}
+	if let Err((sig, err)) = zsh_settrap(k, cx, vp, key, ZshTrap::Func(name, how))? {
+		let line = crate::bash::vm::exec::current_line(vp);
+		k.diag(cx, vp, line, Diag::SignalSetup { sig, err });
 	}
 	Ok(Some(key))
 }
 
-/// Ask the host to give the root shell's `sig` the OS disposition its trap
-/// `action` makes (`None`: the trap removed;
-/// [`trap_disposition`](crate::bash::vm::jobctl::trap_disposition); bash
-/// ignores `QUIT` "in all cases", so a removed trap leaves it ignored).
-/// `None` when the shell asks nothing: in a subshell, whose traps change no
-/// disposition of the process, and for `KILL`, `STOP` and `CHLD` (which
-/// comes from the engine, one per reaped child, not from the OS). Else the
-/// host's answer: `Ok(false)` when the signal stays ignored as it was on
-/// entry, and the caller then records the trap as ignored.
-fn os_disposition(
-	k: &Kernel,
+/// What a zsh trap change sets ([`zsh_settrap`]).
+enum ZshTrap<'a> {
+	/// `trap` sets this action (`Some`) or removes the trap (`None`).
+	Trap(Option<BString>),
+	/// The `TRAPNAL` function of this name changes.
+	Func(&'a [u8], FuncChange),
+}
+
+/// zsh `settrap`/`unsettrap` for `key`, for `trap` and for a `TRAPNAL`
+/// function alike: under `localtraps` the enclosing function saves the
+/// trap ([`save_local`]); the signal's other trap functions go
+/// ([`remove_trap_funcs`]); a signal the root held ignored, or recorded
+/// as ignored on entry, is so no more ([`untrapped::release`]); the vproc
+/// runs the trap as its own; a defined function replaces a `trap` action;
+/// and the root asks the host for the signal's disposition
+/// ([`untrapped::ask_host`]), recording the trap as ignored where the host
+/// keeps the signal ignored. `Err` of the host's failure.
+fn zsh_settrap(
+	k: &mut Kernel,
 	cx: &mut crate::bash::vm::Cx<'_>,
-	vp: &Vproc,
-	sig: Signal,
-	action: Option<&BStr>,
-) -> Option<std::io::Result<bool>> {
-	if vp.overlay.is_some() || matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld) {
-		return None;
-	}
-	let action = match action {
-		None if sig == Signal::Quit && vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
-			Some(BStr::new(b""))
+	vp: &mut Vproc,
+	key: TrapKey,
+	change: ZshTrap<'_>,
+) -> Result<Result<(), (Signal, std::io::Error)>, StoreError> {
+	save_local(&mut k.root, cx.store, vp, key)?;
+	let (keep, os_action, defined) = match &change {
+		ZshTrap::Trap(action) => (None, action.as_ref().map(|a| a.as_bstr()), false),
+		ZshTrap::Func(name, how) => {
+			let live = *how != FuncChange::Removed;
+			(live.then_some(*name), live.then(|| BStr::new(*name)), *how == FuncChange::Defined)
 		},
-		action => action,
 	};
-	let disposition = crate::bash::vm::jobctl::trap_disposition(k, sig, action);
-	Some(cx.host.set_signal_trap(sig, disposition))
+	remove_trap_funcs(&mut k.root, cx.store, vp, key, keep);
+	if let TrapKey::Signal(sig) = key {
+		untrapped::release(&mut k.root, cx.store, vp, sig)?;
+	}
+	vp.own_traps = vp.own_traps.with(key);
+	if defined {
+		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
+		k.pseudo_traps.note(key);
+	}
+	let mut host_keeps_ignored = false;
+	if let TrapKey::Signal(sig) = key {
+		match untrapped::ask_host(k, cx, vp, sig, os_action)? {
+			Some(Ok(false)) => host_keeps_ignored = os_action.is_some(),
+			Some(Err(err)) => return Ok(Err((sig, err))),
+			Some(Ok(true)) | None => {},
+		}
+	}
+	let action = match change {
+		// Beside a function too: the signal stays ignored.
+		_ if host_keeps_ignored => Some(BString::default()),
+		ZshTrap::Trap(action) => action,
+		ZshTrap::Func(..) => return Ok(Ok(())),
+	};
+	if action.as_ref().is_some_and(|a| !a.is_empty()) {
+		k.pseudo_traps.note(key);
+	}
+	let record = action.map(|action| Record::Trap { mode: mode_of(vp), action });
+	state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), record);
+	Ok(Ok(()))
 }
 
 /// zsh's trap key for `spec` (zsh `getsignum`): a number (0 is `EXIT`), a
@@ -591,42 +554,19 @@ fn zsh_traps(ctx: &mut Ctx<'_, '_>) -> Result<Vec<(TrapKey, Record)>, super::Nee
 }
 
 /// Set (`Some`) or remove (`None`) the trap for `key` in zsh (`settrap`,
-/// `unsettrap`): under `localtraps` the enclosing function saves the old
-/// one; a `TRAPNAL` function for it goes; the root shell's signal
-/// disposition follows, as for bash's `trap`.
+/// `unsettrap`: [`zsh_settrap`]).
 fn zsh_change(
 	ctx: &mut Ctx<'_, '_>,
 	key: TrapKey,
 	action: Option<BString>,
 ) -> Result<bool, super::Need> {
-	save_local(&mut ctx.k.root, ctx.cx.store, ctx.vp, key)?;
-	for name in func_names(key, ctx.k.engine.config().platform) {
-		ctx.store_record(KeyBuf::Func(name), None);
+	match zsh_settrap(ctx.k, ctx.cx, ctx.vp, key, ZshTrap::Trap(action))? {
+		Ok(()) => Ok(true),
+		Err((sig, err)) => {
+			ctx.err(Diag::SignalSetup { sig, err });
+			Ok(false)
+		},
 	}
-	if let TrapKey::Signal(sig) = key {
-		if entry_ignored(ctx.cx.store, ctx.vp, sig)? {
-			ctx.store_record(KeyBuf::Misc(MiscKey::ZshEntryIgnored), None);
-		}
-		release_held(&mut ctx.k.root, ctx.cx.store, ctx.vp, sig)?;
-	}
-	let mut effective = action;
-	if let TrapKey::Signal(sig) = key {
-		match os_disposition(ctx.k, ctx.cx, ctx.vp, sig, effective.as_ref().map(BStr::new)) {
-			Some(Ok(false)) => effective = effective.map(|_| BString::default()),
-			Some(Err(err)) => {
-				ctx.err(Diag::SignalSetup { sig, err });
-				return Ok(false);
-			},
-			Some(Ok(true)) | None => {},
-		}
-	}
-	let record = effective.map(|action| Record::Trap { mode: mode_of(ctx.vp), action });
-	ctx.vp.own_traps = ctx.vp.own_traps.with(key);
-	if matches!(&record, Some(Record::Trap { action, .. }) if !action.is_empty()) {
-		ctx.k.pseudo_traps.note(key);
-	}
-	ctx.store_record(KeyBuf::Trap(key), record);
-	Ok(true)
 }
 
 /// zsh `trap` (`bin_trap`): without arguments list every trap (`trap --
@@ -822,7 +762,7 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		if let TrapKey::Signal(sig) = key {
 			// The root shell's OS disposition follows its traps (signals
 			// ignored on entry stay ignored, as in a non-interactive bash).
-			match os_disposition(ctx.k, ctx.cx, ctx.vp, sig, effective.as_ref().map(BStr::new)) {
+			match untrapped::ask_host(ctx.k, ctx.cx, ctx.vp, sig, effective.as_ref().map(BStr::new))? {
 				Some(Ok(false)) => effective = Some(BString::default()),
 				Some(Err(err)) => {
 					ctx.err(Diag::SignalSetup { sig, err });
@@ -848,10 +788,14 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				TrapKey::Exit | TrapKey::Signal(_) => {},
 			}
 		}
-		if matches!(&record, Some(Record::Trap { action, .. }) if !action.is_empty()) {
+		let has_action = matches!(&record, Some(Record::Trap { action, .. }) if !action.is_empty());
+		if has_action {
 			ctx.k.pseudo_traps.note(key);
 		}
 		ctx.store_record(KeyBuf::Trap(key), record);
+		if has_action && key == TrapKey::Exit {
+			untrapped::bash_exit_trap_set(ctx.k, ctx.cx, ctx.vp)?;
+		}
 	}
 	done(status)
 }

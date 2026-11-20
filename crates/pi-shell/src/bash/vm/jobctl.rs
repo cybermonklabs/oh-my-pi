@@ -49,7 +49,7 @@ use crate::bash::{
 /// The action text handed to [`crate::bash::Host::set_signal_trap`] for a
 /// signal the interactive shell catches itself (any non-empty action
 /// catches; the text is not run).
-const CATCH: &[u8] = b"interactive";
+pub(super) const CATCH: &[u8] = b"interactive";
 
 /// The interactive shell's process groups (zsh `mypgrp`, `origpgrp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,50 +66,50 @@ struct Pgrp {
 #[derive(Default)]
 pub struct JobCtl {
 	/// The shell is interactive (set by [`init_io`]).
-	interactive: bool,
+	pub(super) interactive: bool,
 	/// The root vproc: the key of the shell's own foreground job.
-	root:        Option<Vpid>,
+	root:                   Option<Vpid>,
 	/// zsh `SHTTY`: the shell's terminal, where job notices go.
-	shtty:       Option<FdRef>,
+	shtty:                  Option<FdRef>,
 	/// Its handle for the [`crate::bash::Terminal`] seam.
-	handle:      Option<OsHandle>,
+	handle:                 Option<OsHandle>,
 	/// `MONITOR` acquired the terminal (zsh `jobbing` with a terminal).
-	pgrp:        Option<Pgrp>,
+	pgrp:                   Option<Pgrp>,
 	/// The shell's terminal modes (zsh `shttyinfo`).
-	modes:       Option<Termios>,
+	modes:                  Option<Termios>,
 	/// `(job key, pgid)`: the process group of each job that has one.
-	groups:      Vec<(Vpid, u32)>,
+	groups:                 Vec<(Vpid, u32)>,
 	/// `(vproc, job key)` for vprocs outside the shell's foreground job
 	/// ([`leader_of`]): a background job and what it runs, a command
 	/// substitution (`None`: no job, the shell's own group). Kept here
 	/// rather than in the vproc (idle vproc ≤ 2 KiB); only while the
 	/// shell does job control.
-	leaders:     Vec<(Vpid, Option<Vpid>)>,
+	leaders:                Vec<(Vpid, Option<Vpid>)>,
 	/// Terminal modes of stopped jobs, put back by `fg` (zsh `jn->ty`).
-	job_modes:   Vec<(Vpid, Termios)>,
+	job_modes:              Vec<(Vpid, Termios)>,
 	/// The job owning the terminal: the root (its own commands) or the
 	/// job `fg` resumed.
-	fg:          Option<Vpid>,
+	fg:                     Option<Vpid>,
 	/// Stops and continues externals of non-root vprocs reported during
 	/// the turn: `(vproc, event)`.
-	events:      Vec<(Vpid, ProcEvent)>,
+	events:                 Vec<(Vpid, ProcEvent)>,
 	/// A process of the shell's foreground job stopped: the root suspends
 	/// the job when it runs next.
-	fg_stop:     Option<Signal>,
+	fg_stop:                Option<Signal>,
 	/// `(child, job)`: children of the shell that moved into a suspended
 	/// job ([`suspend`]), re-parented after the turn.
-	reparent:    Vec<(Vpid, Vpid)>,
+	reparent:               Vec<(Vpid, Vpid)>,
 	/// Background jobs whose `[n] pid…` line is still to be printed.
-	announce:    Vec<Announce>,
+	announce:               Vec<Announce>,
 	/// `(job, text)`: a suspended construct's own text (zsh's super-job),
 	/// shown once it is done; until then the job shows the process that
 	/// stopped (the sub-job).
-	texts:       Vec<(Vpid, BString)>,
+	texts:                  Vec<(Vpid, BString)>,
 	/// zsh `stopmsg`: `exit` warned about jobs; counts down per command.
-	stopmsg:     u8,
+	stopmsg:                u8,
 	/// The terminal `read -k`/`-q` put in cbreak mode, with the modes it
 	/// had ([`set_cbreak`]).
-	cbreak:      Option<(FdRef, Termios)>,
+	cbreak:                 Option<(FdRef, Termios)>,
 }
 
 impl JobCtl {
@@ -278,7 +278,7 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 			}
 		}
 		k.root
-			.set_record(cx.store, KeyBuf::Misc(MiscKey::ZshHeldIgnored), None);
+			.set_record(cx.store, KeyBuf::Misc(MiscKey::HeldIgnored), None);
 	}
 	open_shtty(k, cx);
 	let monitor = state::option(&mut k.root, cx.store, vp, OptId::Monitor).unwrap_or(false);
@@ -291,7 +291,7 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	for sig in [Signal::Int, Signal::Winch, Signal::Alrm] {
 		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(CATCH)));
 	}
-	for sig in held_ignored(k).iter() {
+	for sig in interactive_ignored(k).iter() {
 		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
 	}
 }
@@ -315,7 +315,7 @@ fn open_shtty(k: &mut Kernel, cx: &mut Cx<'_>) {
 /// The signals the interactive shell ignores itself (zsh `init_signals`):
 /// `QUIT` and `TERM`, and the terminal stop signals while it does job
 /// control.
-const fn held_ignored(k: &Kernel) -> SigSet {
+const fn interactive_ignored(k: &Kernel) -> SigSet {
 	let mut set = SigSet::EMPTY.with(Signal::Quit).with(Signal::Term);
 	if k.jobctl.pgrp.is_some() {
 		set = set.with(Signal::Tstp).with(Signal::Ttin).with(Signal::Ttou);
@@ -408,18 +408,14 @@ pub fn enable_monitor(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	true
 }
 
-/// The OS disposition the root shell asks for when its trap for `sig`
-/// changes to `action` (`None`: removed): an interactive shell keeps its
-/// own (`INT`, `WINCH`, `ALRM` caught; `QUIT`, `TERM` and, with job
-/// control, `TSTP`/`TTIN`/`TTOU` ignored) instead of the entry disposition.
-pub fn trap_disposition<'a>(k: &Kernel, sig: Signal, action: Option<&'a BStr>) -> Option<&'a BStr> {
-	if action.is_some() || !k.jobctl.interactive {
-		return action;
-	}
+/// The OS disposition the interactive root shell asks for when it has no
+/// trap for `sig`: its own (`INT`, `WINCH`, `ALRM` caught; `QUIT`, `TERM`
+/// and, with job control, `TSTP`/`TTIN`/`TTOU` ignored), else the default.
+pub fn interactive_disposition(k: &Kernel, sig: Signal) -> Option<&'static BStr> {
 	if matches!(sig, Signal::Int | Signal::Winch | Signal::Alrm) {
 		return Some(BStr::new(CATCH));
 	}
-	held_ignored(k).contains(sig).then(|| BStr::new(b""))
+	interactive_ignored(k).contains(sig).then(|| BStr::new(b""))
 }
 
 /// The interactive root got `sig` with no trap set: what zsh's handler

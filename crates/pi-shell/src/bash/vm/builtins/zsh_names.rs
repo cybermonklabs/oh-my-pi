@@ -360,7 +360,8 @@ fn remove(ctx: &mut Ctx<'_, '_>, ht: Ht, name: &[u8]) -> Result<bool, Need> {
 			let platform = ctx.k.engine.config().platform;
 			// A `TRAPxxx` function is its signal's trap, under any of the
 			// signal's names: removing one name removes the trap function
-			// there is (zsh's `removeshfuncnode` calls `removetrap`).
+			// there is (zsh's `removeshfuncnode` calls `removetrap`), which
+			// `func_changing` does for a trap name.
 			let names = super::trap::func_key(name, platform).map_or_else(
 				|| vec![BString::from(name)],
 				|key| super::trap::func_names(key, platform),
@@ -371,9 +372,8 @@ fn remove(ctx: &mut Ctx<'_, '_>, ht: Ht, name: &[u8]) -> Result<bool, Need> {
 			}
 			if found {
 				let removed = super::trap::FuncChange::Removed;
-				super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, removed)?;
-				for n in names {
-					ctx.store_record(KeyBuf::Func(n), None);
+				if super::trap::func_changing(ctx.k, ctx.cx, ctx.vp, name, removed)?.is_none() {
+					ctx.store_record(KeyBuf::Func(BString::from(name)), None);
 				}
 			}
 			found
