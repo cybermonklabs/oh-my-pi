@@ -108,7 +108,7 @@ echo "Cargo manifests: $(wc -l <"$tmp/manifests") tracked, $unlisted outside the
 # attributes as written and globs expanded.
 # `$t` is a Bazel query variable (`let t = ... in`), not a shell one.
 # shellcheck disable=SC2016
-expr='let t = kind("^rust_(doc_)?test rule$", //crates/...) - attr(tags, "manual", //crates/...) in $t + labels(crate, $t)'
+expr='let t = kind("^(rust_(doc_)?test|native_test) rule$", //crates/...) - attr(tags, "manual", //crates/...) in $t + labels(crate, $t)'
 bazelisk query --output=streamed_jsonproto "$expr" >"$tmp/rules.json" || fail "bazel query failed: $expr"
 jq -r -s '
 	def attrs($r): ($r.attribute // []);
@@ -169,4 +169,44 @@ while IFS=$'\t' read -r kind package name src; do
 	fi
 done <"$tmp/required"
 echo "Rust test parity: $total test targets in the suite, $missing without a Bazel test target"
-[ "$missing" = 0 ] && [ "$unlisted" = 0 ]
+
+# A test target's `args` can drop tests from its binary (`--skip X`), as
+# pi-builtins_test drops ::foreign_owner::, which a native_test runs as root.
+# Each such skip must be run by another test target of the same binary (a
+# native_test whose src is that target, with X as its filter), or be named in
+# .github/sami/rust-test-sanctioned-skips.txt; otherwise those tests run
+# nowhere.
+[ -f .github/sami/rust-test-sanctioned-skips.txt ] || fail ".github/sami/rust-test-sanctioned-skips.txt is missing"
+awk '!/^[[:space:]]*(#|$)/ { print $1 "\t" $2 }' .github/sami/rust-test-sanctioned-skips.txt | LC_ALL=C sort -u >"$tmp/sanctioned"
+jq -r -s '
+	def attrs($r): ($r.attribute // []);
+	def str($r; $n): [attrs($r)[] | select(.name == $n) | .stringValue // empty] | .[0] // "";
+	def list($r; $n): [attrs($r)[] | select(.name == $n) | (.stringListValue // [])[]];
+	.[] | select(.type == "RULE") | .rule
+	| select(.ruleClass == "rust_test" or .ruleClass == "native_test")
+	| . as $r
+	| (if .ruleClass == "native_test" then str($r; "src") else .name end) as $binary
+	| list($r; "args") as $a
+	| (reduce range(0; $a | length) as $i ({skip: [], filter: [], take: false};
+		if .take then .skip += [$a[$i]] | .take = false
+		elif $a[$i] == "--skip" then .take = true
+		elif ($a[$i] | startswith("--skip=")) then .skip += [$a[$i][7:]]
+		elif ($a[$i] | startswith("-")) then .
+		else .filter += [$a[$i]] end)) as $parsed
+	| ($parsed.skip[] | ["skip", $binary, $r.name, .]), ($parsed.filter[] | ["filter", $binary, $r.name, .])
+	| @tsv' "$tmp/rules.json" >"$tmp/args" || fail "could not read the test targets' args from bazel query"
+awk -F'\t' '$1 == "filter" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/filters"
+dropped=0
+while IFS=$'\t' read -r _ binary rule value; do
+	if grep -qxF -- "$binary"$'\t'"$value" "$tmp/filters"; then
+		continue
+	fi
+	if grep -qxF -- "$rule"$'\t'"$value" "$tmp/sanctioned"; then
+		echo "Sanctioned skip in $rule's args: $value"
+		continue
+	fi
+	echo "::error title=Rust test parity::$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
+	dropped=$((dropped + 1))
+done < <(awk -F'\t' '$1 == "skip"' "$tmp/args")
+echo "Skips in test targets' args: $(awk -F'\t' '$1 == "skip"' "$tmp/args" | wc -l), $dropped run nowhere"
+[ "$missing" = 0 ] && [ "$unlisted" = 0 ] && [ "$dropped" = 0 ]

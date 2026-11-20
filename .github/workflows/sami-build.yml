@@ -150,10 +150,6 @@ jobs:
       # rsync is 3.2.7, so they ran nowhere. The test step puts this build
       # first on the tests' PATH and sets RSYNC_REFERENCE_REQUIRED, with which
       # a missing or incomplete reference fails them instead.
-      - name: Libraries of the reference rsync
-        run: |
-          sudo apt-get -q update
-          sudo apt-get -q install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
       # Restore and save are separate steps: actions/cache saves only when
       # the whole job succeeds, so every red run rebuilt rsync (run
       # 44757840012). The save follows the check, so a broken build is never
@@ -163,8 +159,17 @@ jobs:
         with:
           path: ~/rsync-ref
           # The tarball's sha256: the build is a function of it and of the
-          # runner image's libraries.
+          # runner image's libraries. The key names the image's OS but not
+          # its version; a cached binary that no longer loads on a newer
+          # image fails the check step below, which fails the job.
           key: rsync-3.5.1-c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef-ubuntu-22.04
+      # The -dev packages are needed only to build; the cached binary's
+      # shared libraries are on the image (the check step proves it loads).
+      - name: Libraries of the reference rsync
+        if: steps.rsync-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -q -o Acquire::Retries=5 update
+          sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends libxxhash-dev liblz4-dev libzstd-dev libacl1-dev libidn2-dev
       - name: Build the reference rsync 3.5.1
         if: steps.rsync-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -223,6 +228,159 @@ jobs:
         with:
           path: ~/rsync-ref
           key: ${{ steps.rsync-cache.outputs.cache-primary-key }}
+      # pi-shell's zsh completion and zsh-oracle tests compare obash with zsh
+      # 5.9: its own completion functions (/usr/share/zsh/5.9/functions, or
+      # the real zsh's $fpath) and /bin/zsh itself, which must print
+      # `zsh 5.9 `. The runner has no zsh, so they skipped. zsh 5.9 is built
+      # from the tarball whose sha256 SourceForge and Debian's orig tarball
+      # agree on, into ~/zsh-ref, and linked in as /usr/bin/zsh (/bin is
+      # /usr/bin) and /usr/share/zsh/5.9. A test that still skips fails the
+      # job (the skip scan in the test step).
+      - id: zsh-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/zsh-ref
+          key: zsh-5.9-9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5-ubuntu-22.04
+      - name: Build zsh 5.9
+        if: steps.zsh-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sudo apt-get -q -o Acquire::Retries=5 update
+          sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends libncurses-dev
+          sha=9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5
+          tarball="$RUNNER_TEMP/zsh-5.9.tar.xz"
+          got=""
+          for url in \
+            https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz \
+            https://deb.debian.org/debian/pool/main/z/zsh/zsh_5.9.orig.tar.xz; do
+            if curl -fsSL --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 20 --max-time 120 -o "$tarball" "$url" &&
+              echo "$sha  $tarball" | sha256sum -c -; then
+              got="$url"
+              break
+            fi
+            echo "::warning title=zsh 5.9::$url gave no tarball with sha256 $sha"
+          done
+          if [ -z "$got" ]; then
+            echo "::error title=zsh 5.9::no source gave zsh-5.9.tar.xz with sha256 $sha"
+            exit 1
+          fi
+          echo "zsh-5.9.tar.xz from $got"
+          mkdir -p "$RUNNER_TEMP/zsh-build"
+          tar -xJf "$tarball" -C "$RUNNER_TEMP/zsh-build"
+          cd "$RUNNER_TEMP/zsh-build/zsh-5.9" || exit 1
+          # The runner has no controlling tty, so configure cannot probe
+          # tcsetpgrp (run 44806741441); Linux has it, as Debian's build says.
+          ./configure --prefix="$HOME/zsh-ref" --enable-multibyte --with-tcsetpgrp
+          make -j "$(nproc)"
+          make install.bin install.modules install.fns
+      - name: Install and check zsh 5.9
+        shell: bash
+        run: |
+          sudo ln -sfn "$HOME/zsh-ref/bin/zsh" /usr/bin/zsh
+          sudo mkdir -p /usr/share/zsh
+          sudo ln -sfn "$HOME/zsh-ref/share/zsh/5.9" /usr/share/zsh/5.9
+          version="$(/bin/zsh --version)"
+          echo "$version"
+          case "$version" in "zsh 5.9 "*) ;; *)
+            echo "::error title=zsh 5.9::/bin/zsh is not zsh 5.9"
+            exit 1
+            ;;
+          esac
+          for f in _main_complete compinit; do
+            [ -f "/usr/share/zsh/5.9/functions/$f" ] || { echo "::error title=zsh 5.9::no $f in /usr/share/zsh/5.9/functions"; exit 1; }
+          done
+          /bin/zsh -f -c 'print -rl -- $fpath'
+      - name: Save zsh 5.9
+        if: steps.zsh-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/zsh-ref
+          key: ${{ steps.zsh-cache.outputs.cache-primary-key }}
+      # pi-shell's bash-oracle tests compare obash with bash 5.2 or later
+      # (they were measured with 5.2.21), and report a bash older than that
+      # as uncompared, which the skip scan fails; the runner's /bin/bash is
+      # 5.1.16. bash 5.2.21 is built from the GNU tarball whose sha256 is
+      # pinned here (ftp.gnu.org and its mirror network gave the same bytes,
+      # signed by its maintainer's key 7C0135FB088AAF6C66C650B9BB5869F064EA74AB),
+      # into ~/bash-ref, and the tests get it as PI_TEST_REAL_BASH; the
+      # runner's own bash, which runs every step, stays as it is.
+      - id: bash-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/bash-ref
+          key: bash-5.2.21-c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8-ubuntu-22.04
+      - name: Build bash 5.2.21
+        if: steps.bash-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sha=c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8
+          tarball="$RUNNER_TEMP/bash-5.2.21.tar.gz"
+          got=""
+          for url in \
+            https://ftpmirror.gnu.org/gnu/bash/bash-5.2.21.tar.gz \
+            https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz; do
+            if curl -fsSL --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 20 --max-time 120 -o "$tarball" "$url" &&
+              echo "$sha  $tarball" | sha256sum -c -; then
+              got="$url"
+              break
+            fi
+            echo "::warning title=bash 5.2.21::$url gave no tarball with sha256 $sha"
+          done
+          if [ -z "$got" ]; then
+            echo "::error title=bash 5.2.21::no source gave bash-5.2.21.tar.gz with sha256 $sha"
+            exit 1
+          fi
+          echo "bash-5.2.21.tar.gz from $got"
+          mkdir -p "$RUNNER_TEMP/bash-build"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/bash-build"
+          cd "$RUNNER_TEMP/bash-build/bash-5.2.21" || exit 1
+          ./configure --prefix="$HOME/bash-ref"
+          make -j "$(nproc)"
+          make install
+      - name: Check bash 5.2.21
+        shell: bash
+        run: |
+          version="$("$HOME/bash-ref/bin/bash" --version | sed -n 1p)"
+          echo "$version"
+          case "$version" in "GNU bash, version 5.2.21("*) ;; *)
+            echo "::error title=bash 5.2.21::$HOME/bash-ref/bin/bash is not bash 5.2.21"
+            exit 1
+            ;;
+          esac
+          echo "the runner's bash: $(/bin/bash --version | sed -n 1p)"
+      - name: Save bash 5.2.21
+        if: steps.bash-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/bash-ref
+          key: ${{ steps.bash-cache.outputs.cache-primary-key }}
+      # pi-builtins' sort tests compare collation and numbers under
+      # sv_SE.UTF-8, en_US.UTF-8 and de_DE.UTF-8, and skipped the locales the
+      # runner had not generated (run 44803069963).
+      - name: Locales the tests compare under
+        run: |
+          sudo locale-gen sv_SE.UTF-8 en_US.UTF-8 de_DE.UTF-8
+          locale -a
+      # pi-iso clones a tree with reflinks (FICLONE), and pi-vcs's
+      # worktree_clone_carry tests skip without them; the runner's ext4 has
+      # none. The tests' temporary files go on a loop-mounted XFS with
+      # reflink=1, checked here; the test step points TMPDIR at it.
+      - name: A reflink filesystem for the tests' temporary files
+        shell: bash
+        run: |
+          if ! command -v mkfs.xfs >/dev/null; then
+            sudo apt-get -q -o Acquire::Retries=5 update
+            sudo apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends xfsprogs
+          fi
+          truncate -s 12G "$RUNNER_TEMP/reflink.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/reflink.img"
+          sudo mkdir -p /mnt/reflink
+          sudo mount -o loop "$RUNNER_TEMP/reflink.img" /mnt/reflink
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /mnt/reflink/tmp
+          echo probe >/mnt/reflink/tmp/reflink-probe
+          cp --reflink=always /mnt/reflink/tmp/reflink-probe /mnt/reflink/tmp/reflink-probe.clone
+          rm /mnt/reflink/tmp/reflink-probe /mnt/reflink/tmp/reflink-probe.clone
+          findmnt /mnt/reflink
       - name: Rust tests against the known-failure list
         # bash with pipefail: a failed jq or awk must fail the step, never read
         # as "no test failed".
@@ -232,6 +390,7 @@ jobs:
         run: |
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
           list=.github/sami/rust-test-known-failures.txt
+          skip_list=.github/sami/rust-test-known-skips.txt
           bep="$RUNNER_TEMP/rust-test-bep.json"
           bep_root="$RUNNER_TEMP/rust-test-bep-root.json"
           # Tests that need root (to chown a file to another uid) are named in
@@ -249,13 +408,51 @@ jobs:
           done <.github/sami/rust-test-root-targets.txt
           not_roots=()
           for target in "${roots[@]}"; do not_roots+=("-$target"); done
+          # Sanctioned skips: tests the fork's owner ruled out of this gate,
+          # each named in .github/sami/rust-test-sanctioned-skips.txt with the
+          # ruling. Today one: rsync::session::tests::
+          # local_copy_byte_totals_are_deterministic, by the fork owner's
+          # ruling of 2026-11-20 ("leave it, and skip that one test so it
+          # cannot stop a release").
+          # Tests that run in a process of their own, after the others, are
+          # named in .github/sami/rust-test-own-process.txt; the main
+          # invocation skips them too.
+          # Bazel passes a --test_arg to every test binary, and libtest's
+          # --exact would also turn pi-builtins_test's own `--skip
+          # ::foreign_owner::` (BUILD.bazel) into an exact match, so each skip
+          # is the test's whole path, and the step checks below that it names
+          # exactly one test, which did not run there.
+          sanctioned=()
+          own=()
+          skip_flags=()
+          while read -r target name _; do
+            case "$target" in "" | "#"*) continue ;; esac
+            sanctioned+=("$target $name")
+            skip_flags+=(--test_arg=--skip --test_arg="$name")
+          done <.github/sami/rust-test-sanctioned-skips.txt
+          while read -r target name _; do
+            case "$target" in "" | "#"*) continue ;; esac
+            own+=("$target $name")
+            skip_flags+=(--test_arg=--skip --test_arg="$name")
+          done <.github/sami/rust-test-own-process.txt
           rc=0
           # The reference rsync goes first on the tests' PATH (the rest is the
           # PATH Bazel's strict action env gives a test), and
           # RSYNC_REFERENCE_REQUIRED makes an rsync test without it fail
           # rather than skip.
           test_path="$HOME/rsync-ref/bin:/usr/local/bin:/usr/bin:/bin"
-          env_flags=(--test_env=PATH="$test_path" --test_env=RSYNC_REFERENCE_REQUIRED=1)
+          # PI_TEST_REAL_BASH: the bash 5.2.21 the bash-oracle tests compare
+          # with (the steps before).
+          # PI_AST_REPO_CORPUS: the checkout pi-ast's corpus tests walk (their
+          # sources are not a declared input; see crates/pi-ast/src/block.rs).
+          # The tests' TMPDIR is the reflink filesystem (the step before),
+          # writable in the sandbox. Bazel gives every local action, a test
+          # too, the TMPDIR of the bazel command's own environment, and drops
+          # one a --test_env sets (PosixLocalEnvProvider), so a --test_env
+          # TMPDIR never reached the tests (run 44807499064): each bazel test
+          # below runs with TMPDIR="$tmpdir" in its environment.
+          tmpdir=/mnt/reflink/tmp
+          env_flags=(--test_env=PATH="$test_path" --test_env=RSYNC_REFERENCE_REQUIRED=1 --sandbox_writable_path="$tmpdir" --test_env=PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" --test_env=PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE")
           # --keep_going: the ci config stops at the first target that fails to
           # build, and so skipped 7 of the 17 test targets in run 44694233578;
           # a release gate names every failure in one run.
@@ -265,60 +462,123 @@ jobs:
           # binary that exits 0 before its tests end shows, whatever a child
           # process printed. rules_rust's doctest runner passes the arguments
           # on to the doctest binaries and writes libtest's text summary itself.
-          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" -- //crates/... "${not_roots[@]}" || rc=$?
           # --show-output puts each passed test's output in its record, so a
-          # root test that printed `not run:` (its precondition, root, broke)
-          # can be failed below. sudo resets PATH to its secure_path, so the
-          # test's PATH is given again after it.
+          # test that skipped itself (printed a skip line and returned) is
+          # seen below, and a root test that printed `not run:` (its
+          # precondition, root, broke) fails.
+          json_flags=(--test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output)
+          TMPDIR="$tmpdir" bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" "${skip_flags[@]}" "${json_flags[@]}" --build_event_json_file="$bep" -- //crates/... "${not_roots[@]}" || rc=$?
+          # Bazel's build event logs (the root and own-process invocations'
+          # too) name every test target with its rule, its status and its
+          # test.log files: one row per log, target, rule, status, which list
+          # Bazel put the log in (passed or failed) and its path. The runner's
+          # jq is 1.6, which refuses a keyword such as `label` as a variable
+          # name (run 44696018007).
+          bep_rows() {
+            jq -rs '
+              (map(select(.id.targetConfigured))
+               | map({key: .id.targetConfigured.label, value: (.configured.targetKind // "unknown")})
+               | from_entries) as $kinds
+              | .[]
+              | select(.id.testSummary)
+              | .id.testSummary.label as $target
+              | ($kinds[$target] // "unknown") as $rule
+              | .testSummary.overallStatus as $status
+              | ([(.testSummary.passed // [])[] | ["passed", .uri]]
+                 + [(.testSummary.failed // [])[] | ["failed", .uri]]) as $logs
+              | if ($logs | length) == 0 then [$target, $rule, $status, "none", ""]
+                else ($logs[] | [$target, $rule, $status, .[0], (.[1] | sub("^file://"; ""))]) end
+              | @tsv' "$@"
+          }
+          # A later bazel test of the same target (an own-process test)
+          # writes its test.log to the same path, so the main invocation's
+          # logs are copied now, each to a path of its own (run 44831606057
+          # read the own-process log as the main one). A sixth column keeps
+          # the test binary each log came from: it sits beside the original
+          # log, bin/ for testlogs/.
+          rows_main="$RUNNER_TEMP/rust-test-logs-main.tsv"
+          main_logs="$RUNNER_TEMP/rust-test-main-logs"
+          mkdir -p "$main_logs"
+          : >"$rows_main"
+          n=0
+          while IFS=$'\t' read -r label rule status kind log; do
+            copy="$log"
+            bin=""
+            if [ -n "$log" ] && [ -f "$log" ]; then
+              n=$((n + 1))
+              copy="$main_logs/$n.log"
+              cp "$log" "$copy"
+              bin="$(dirname "$log")"
+              bin="${bin/\/testlogs\//\/bin\/}"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$rule" "$status" "$kind" "$copy" "$bin" >>"$rows_main"
+          done < <(bep_rows "$bep")
+          # sudo resets PATH to its secure_path, so the test's PATH is given
+          # again after it.
           rc_root=0
           if [ "${#roots[@]}" -gt 0 ]; then
-            bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" --run_under="sudo -E env PATH=$test_path" --test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output --build_event_json_file="$bep_root" -- "${roots[@]}" || rc_root=$?
+            TMPDIR="$tmpdir" bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" --run_under="sudo -E env PATH=$test_path" "${json_flags[@]}" --build_event_json_file="$bep_root" -- "${roots[@]}" || rc_root=$?
           fi
+          # Each own-process test alone: its target with libtest's --exact
+          # filter, one invocation per test, each with its own event log.
+          codes=("$rc" "$rc_root")
+          own_beps=()
+          for i in "${!own[@]}"; do
+            read -r target name <<<"${own[$i]}"
+            own_beps+=("$RUNNER_TEMP/rust-test-bep-own-$i.json")
+            code=0
+            TMPDIR="$tmpdir" bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going "${env_flags[@]}" "${json_flags[@]}" --test_arg=--exact --test_arg="$name" --build_event_json_file="${own_beps[$i]}" -- "$target" || code=$?
+            codes+=("$code")
+          done
           # Bazel exits 0 when every test passed, 3 when every target built and
           # a test failed, and 1 when a target failed to build (the others
           # still built and ran). Any other code is Bazel itself failing, and
           # its event log cannot be trusted.
-          for code in "$rc" "$rc_root"; do
+          rc=0
+          for code in "${codes[@]}"; do
             case "$code" in
-              0 | 1 | 3) ;;
+              0) ;;
+              1) rc=1 ;;
+              3) [ "$rc" = 1 ] || rc=3 ;;
               *)
                 echo "::error title=Rust tests::bazel test exited $code, which is neither a test nor a build failure"
                 exit "$code"
                 ;;
             esac
           done
-          if [ "$rc" = 1 ] || [ "$rc_root" = 1 ]; then
-            rc=1
-          elif [ "$rc_root" = 3 ]; then
-            rc=3
-          fi
           # A list line is `<test target> <test name>  <reason>`.
           known="$RUNNER_TEMP/rust-test-known.txt"
+          known_skips="$RUNNER_TEMP/rust-test-known-skips.txt"
           failed="$RUNNER_TEMP/rust-test-failed.txt"
+          skips="$RUNNER_TEMP/rust-test-skips.txt"
           rows="$RUNNER_TEMP/rust-test-logs.tsv"
           awk '!/^[[:space:]]*(#|$)/ { print $1, $2 }' "$list" | LC_ALL=C sort -u >"$known"
-          # Bazel's build event logs (the root invocation's too) name every
-          # test target with its rule, its status and its test.log files: one
-          # row per log, target, rule, status, which list Bazel put the log in
-          # (passed or failed) and its path. The runner's jq is 1.6, which
-          # refuses a keyword such as `label` as a variable name (run
-          # 44696018007).
-          beps=("$bep")
-          if [ "${#roots[@]}" -gt 0 ]; then beps+=("$bep_root"); fi
-          jq -rs '
-            (map(select(.id.targetConfigured))
-             | map({key: .id.targetConfigured.label, value: (.configured.targetKind // "unknown")})
-             | from_entries) as $kinds
-            | .[]
-            | select(.id.testSummary)
-            | .id.testSummary.label as $target
-            | ($kinds[$target] // "unknown") as $rule
-            | .testSummary.overallStatus as $status
-            | ([(.testSummary.passed // [])[] | ["passed", .uri]]
-               + [(.testSummary.failed // [])[] | ["failed", .uri]]) as $logs
-            | if ($logs | length) == 0 then [$target, $rule, $status, "none", ""]
-              else ($logs[] | [$target, $rule, $status, .[0], (.[1] | sub("^file://"; ""))]) end
-            | @tsv' "${beps[@]}" >"$rows"
+          awk '!/^[[:space:]]*(#|$)/ { print $1, $2 }' "$skip_list" | LC_ALL=C sort -u >"$known_skips"
+          : >"$skips"
+          cut -f1-5 "$rows_main" >"$rows"
+          if [ "${#roots[@]}" -gt 0 ]; then bep_rows "$bep_root" >>"$rows"; fi
+          # Each own-process invocation must report exactly its one test, so a
+          # filter that matches nothing (a renamed test) cannot pass as zero
+          # tests.
+          bad_own=0
+          for i in "${!own[@]}"; do
+            read -r target name <<<"${own[$i]}"
+            bep_rows "${own_beps[$i]}" >"$RUNNER_TEMP/rust-test-logs-own-$i.tsv"
+            cat "$RUNNER_TEMP/rust-test-logs-own-$i.tsv" >>"$rows"
+            log="$(awk -F'\t' -v t="$target" '$1 == t && $5 != "" { print $5 }' "$RUNNER_TEMP/rust-test-logs-own-$i.tsv")"
+            if [ -z "$log" ] || [ "$(printf '%s\n' "$log" | wc -l)" != 1 ] || [ ! -f "$log" ]; then
+              echo "::error title=Own-process test::$target has no one test log for $name in its own invocation"
+              bad_own=1
+              continue
+            fi
+            ran="$(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored")) | .name' "$log")"
+            if [ "$ran" != "$name" ]; then
+              echo "::error title=Own-process test::$target's own invocation for $name reported [$(printf '%s' "$ran" | tr '\n' ' ')], not exactly that one test"
+              bad_own=1
+              continue
+            fi
+            echo "Own-process test ran alone: $target $name ($(jq -R -r --arg t "$name" 'fromjson? | select(type == "object" and .type == "test" and .name == $t and (.event == "ok" or .event == "failed" or .event == "ignored")) | .event' "$log"))"
+          done
           if [ ! -s "$rows" ]; then
             echo "::error title=Rust tests::the build event log names no test target, so nothing shows that any test ran"
             exit 1
@@ -360,7 +620,7 @@ jobs:
               log="$RUNNER_TEMP/cargo-test-$n.log"
               code=0
               # shellcheck disable=SC2086 # $name is empty for --lib and --doc
-              rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$selector" $name -- -Zunstable-options --format=json >"$log" 2>"$log.err" || code=$?
+              rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$selector" $name -- -Zunstable-options --format=json --show-output >"$log" 2>"$log.err" || code=$?
               if [ "$code" = 0 ]; then
                 printf '%s\tcargo test\tPASSED\tpassed\t%s\n' "$label" "$log" >>"$rows"
               else
@@ -376,7 +636,7 @@ jobs:
             exit 1
           fi
           : >"$failed"
-          bad=0
+          bad="$bad_own"
           if [ "$rc" = 1 ]; then
             echo "::error title=Rust tests::a target failed to build (Bazel's FAILED TO BUILD lines above name it); no list line can account for that"
             bad=1
@@ -455,6 +715,32 @@ jobs:
                   bad=1
                   continue
                 fi
+                # A test that skips itself on a missing precondition returns,
+                # and so passes, after printing a skip line: today `skipping`,
+                # `skipped`, `SKIP`, `not run` or `UNCOMPARED`, alone or after
+                # `<test name>: `. A new test that skips prints
+                # `skipped: <reason>`. Every invocation passes --show-output,
+                # so a passing test's output is in its record; a line written
+                # to the process's stderr directly is outside it, and must name
+                # its test. Each skip is compared with
+                # .github/sami/rust-test-known-skips.txt below, so a runner
+                # that lacks a precondition fails the job rather than skipping.
+                # Only a passing test's record is read: a failed test fails the
+                # job anyway, and its report can quote a tool's own `skipping`
+                # line (rsync's `skipping non-regular file`, run 44807499064),
+                # which is no skip.
+                jq -R -r --arg target "$label" '
+                  fromjson? | select(type == "object" and .type == "test" and .event == "ok")
+                  | select((.stdout // "") | split("\n") | any(test("^([A-Za-z0-9_:]+: )?(skipping|skipped|SKIP|not run|UNCOMPARED)[ :]")))
+                  | "\($target) \(.name)"' "$log" >>"$skips"
+                while IFS= read -r line; do
+                  if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipping|skipped|SKIP|not\ run|UNCOMPARED)[\ :] ]]; then
+                    echo "$label ${BASH_REMATCH[1]}" >>"$skips"
+                  else
+                    echo "::error title=Rust tests::$label printed a skip line outside libtest's record that names no test: $line"
+                    bad=1
+                  fi
+                done < <(grep -v '^{' "$log" | grep -E '(^|: )(skipping|skipped|SKIP|not run|UNCOMPARED)[ :]' || true)
                 # A root target runs as root, so a test in it that printed
                 # `not run:` skipped itself on a broken precondition, and it
                 # must pass the number of tests its list line names. libtest
@@ -466,8 +752,10 @@ jobs:
                     echo "::error title=Rust tests::$label $skipped printed 'not run:', though it runs as root"
                     bad=1
                   done < <(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and ((.stdout // "") | test("not run:"))) | .name' "$log")
-                  if grep -v '^{' "$log" | grep -q 'not run:'; then
-                    echo "::error title=Rust tests::$label printed 'not run:' outside libtest's record, though it runs as root: $(grep -v '^{' "$log" | grep -m1 'not run:')"
+                  # grep -c, not -q: under pipefail a grep -q that stops early
+                  # can kill the grep before it with SIGPIPE and read as clean.
+                  if [ "$(grep -v '^{' "$log" | grep -c 'not run:' || true)" != 0 ]; then
+                    echo "::error title=Rust tests::$label printed 'not run:' outside libtest's record, though it runs as root: $(grep -v '^{' "$log" | grep 'not run:' | sed -n 1p)"
                     bad=1
                   fi
                   passed="$(jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object" and .type == "test" and .event == "ok")] | length' "$log")"
@@ -548,6 +836,82 @@ jobs:
             echo "::error title=Known failure passed::$label $name is in $list but did not fail: remove its line from the list"
             bad=1
           done <"$RUNNER_TEMP/rust-test-stale.txt"
+          # The skips, against the known-skip list, both ways.
+          LC_ALL=C sort -u -o "$skips" "$skips"
+          LC_ALL=C comm -12 "$skips" "$known_skips" >"$RUNNER_TEMP/rust-test-skips-expected.txt"
+          LC_ALL=C comm -23 "$skips" "$known_skips" >"$RUNNER_TEMP/rust-test-skips-unlisted.txt"
+          LC_ALL=C comm -13 "$skips" "$known_skips" >"$RUNNER_TEMP/rust-test-skips-stale.txt"
+          while read -r label name; do
+            echo "Known skip, skipped as expected: $label $name"
+          done <"$RUNNER_TEMP/rust-test-skips-expected.txt"
+          while read -r label name; do
+            echo "::error title=Rust test skipped::$label $name skipped itself and is not in $skip_list"
+            bad=1
+          done <"$RUNNER_TEMP/rust-test-skips-unlisted.txt"
+          while read -r label name; do
+            echo "::error title=Known skip ran::$label $name is in $skip_list but did not skip: remove its line from the list"
+            bad=1
+          done <"$RUNNER_TEMP/rust-test-skips-stale.txt"
+          echo "Skipped tests: $(wc -l <"$skips") ($(wc -l <"$RUNNER_TEMP/rust-test-skips-expected.txt") listed)"
+          # Each skip the main invocation passed (the sanctioned ones and the
+          # own-process tests) must take out exactly one test, of its named
+          # target, which then did not run there. libtest's --skip takes out
+          # every test whose name contains it, in every binary, and counts them
+          # as filtered_out at its suite's end. So each binary of the main
+          # invocation whose record took a test out lists its tests (`--list`;
+          # the binary kept beside the copy of its log), and each
+          # skip must be in exactly one listed name: the named test of the
+          # named target. A doctest the main invocation took out fails the job,
+          # since no list names one. A ruling whose test was renamed or removed
+          # fails here: update the list with a new ruling.
+          listed="$RUNNER_TEMP/rust-test-listed.tsv"
+          matches="$RUNNER_TEMP/rust-test-skip-matches.tsv"
+          : >"$listed"
+          while IFS=$'\t' read -r label rule _ _ log bin; do
+            [ -f "$log" ] || continue
+            case "$rule" in
+              "rust_test rule" | "native_test rule")
+                filtered="$(jq -R -s '[split("\n")[] | fromjson? | select(type == "object" and .type == "suite" and (.event == "ok" or .event == "failed")) | .filtered_out // 0] | add // 0' "$log")"
+                [ "$filtered" -gt 0 ] || continue
+                if [ ! -x "$bin" ] || ! "$bin" --list >"$RUNNER_TEMP/rust-test-list.txt"; then
+                  echo "::error title=Rust test skips::$label took $filtered tests out, and its binary $bin cannot list its tests"
+                  bad=1
+                  continue
+                fi
+                sed -n 's/: test$//p' "$RUNNER_TEMP/rust-test-list.txt" | awk -v l="$label" '{ print l "\t" $0 }' >>"$listed"
+                ;;
+              "rust_doc_test rule")
+                if awk '/^test result: / { last = $0 } END { exit !(last ~ / [1-9][0-9]* filtered out/) }' "$log"; then
+                  echo "::error title=Rust test skips::$label took a doctest out in the main invocation, which no list names"
+                  bad=1
+                fi
+                ;;
+            esac
+          done <"$rows_main"
+          check_skip() {
+            local title="$1" from="$2" target="$3" name="$4" log
+            awk -F'\t' -v n="$name" 'index($2, n) { print $1 "\t" $2 }' "$listed" >"$matches"
+            if [ "$(cat "$matches")" != "$target"$'\t'"$name" ]; then
+              echo "::error title=$title::the skip $name in $from takes out $(wc -l <"$matches") tests of the main invocation, not exactly that one of $target: $(tr '\t\n' ': ' <"$matches")"
+              return 1
+            fi
+            log="$(awk -F'\t' -v t="$target" '$1 == t && $5 != "" { print $5; exit }' "$rows_main")"
+            # grep -c reads all its input: with pipefail, a grep -q that stops
+            # at its first match can kill jq with SIGPIPE and read as no match.
+            if [ "$(jq -R -r 'fromjson? | select(type == "object" and .type == "test") | .name' "$log" | grep -cxF -- "$name" || true)" != 0 ]; then
+              echo "::error title=$title::$target $name ran in the main invocation, though $from skips it there"
+              return 1
+            fi
+            echo "$title, taken out of the main invocation: $target $name"
+          }
+          for entry in "${sanctioned[@]}"; do
+            read -r target name <<<"$entry"
+            check_skip "Sanctioned skip" .github/sami/rust-test-sanctioned-skips.txt "$target" "$name" || bad=1
+          done
+          for entry in "${own[@]}"; do
+            read -r target name <<<"$entry"
+            check_skip "Own-process test" .github/sami/rust-test-own-process.txt "$target" "$name" || bad=1
+          done
           exit "$bad"
       - name: Every Rust test has a Bazel test target
         # `bazel test //crates/...` runs only Bazel test targets, and most of

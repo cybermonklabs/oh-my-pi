@@ -1,0 +1,9 @@
+# Tests the rust_test job in .github/workflows/sami-build.yml runs in a process
+# of their own, after the other tests: the main invocation passes each to every
+# test binary as `--skip <name>`, and a later invocation runs the named target
+# with `--exact <name>`. The job fails unless each name matches exactly one
+# test, in the named target, which did not run in the main invocation, and its
+# own invocation reports exactly that test. It still fails, like any other
+# test, when that test fails.
+# One per line: <bazel test target> <libtest test path>  <why>.
+//crates/pi-builtins:pi-builtins_test rsync::conformance::local_transfers_match_reference  compares 150 local transfers with rsync 3.5.1's; beside the crate's other tests in one process, 3 scenarios differed (runs 44803069963 and 44807499064)
