@@ -1,0 +1,7 @@
+# Known failures for the rust_test job in .github/workflows/sami-build.yml:
+# Rust tests that fail at a sami release for a reason another change fixes.
+# The job passes only when exactly the tests named here fail. It fails when a
+# test that is not named fails, and when a named test passes or no longer
+# exists: remove its line then, so the list empties as the fixes land.
+# One per line: <bazel test target> <libtest test name>  <reason: the change
+# that fixes it and its issue>.
