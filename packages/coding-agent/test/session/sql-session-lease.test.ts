@@ -11,7 +11,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionLeaseLostError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
+import { PG_CONDITIONAL_PARAMETERS, pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
 import {
 	SESSION_OPEN_CLAIM_WAIT_MS,
 	SqlSessionStorage,
@@ -36,7 +36,6 @@ import {
 	TcpProxy,
 	transcript,
 	until,
-	type WireStatement,
 } from "./sql-session-lease-fixture";
 
 // These tests wait in real time on purpose: a lease expires and a heartbeat
@@ -764,12 +763,21 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			30_000,
 		);
 		it.skipIf(adapter !== "postgres")(
-			"sends exactly six statements per heartbeat on the wire",
+			"sends a heartbeat as five messages on one connection: opening, read-only check, both bounds in one, update, COMMIT",
 			async () => {
 				const proxy = TcpProxy.for(url ?? "");
 				const wire = proxy.recordPostgres();
 				try {
 					await using db = await openLeaseDb(adapter, proxy.urlFor(url ?? ""));
+					// The conditional parameters this server has, read as the store's probe reads them.
+					const placeholders = PG_CONDITIONAL_PARAMETERS.map((_name, index) => `@${index + 1}`).join(", ");
+					const rows = await db.sql(`SELECT name FROM pg_catalog.pg_settings WHERE name IN (${placeholders})`, [
+						...PG_CONDITIONAL_PARAMETERS,
+					]);
+					const present = new Set(rows.map(row => String(row.name)));
+					const heartbeat = new RegExp(
+						`^UPDATE (?:"[^"]+"\\.)?${db.leaseTable} SET heartbeat_at = .* RETURNING session_id$`,
+					);
 					const lease = { expiryMs: 20_000, heartbeatMs: 500 };
 					const storage = await db.open({ dsn: proxy.urlFor(url ?? ""), lease });
 					const file = sessionFile(db);
@@ -781,38 +789,32 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					await Bun.sleep(lease.heartbeatMs * 2);
 					release?.();
 					await storage.drain();
-					// Find the heartbeat's UPDATE and isolate its connection's transaction (BEGIN..COMMIT).
+					// The heartbeat's transaction: on its UPDATE's connection, from the nearest opening before it to
+					// the nearest COMMIT after it.
 					const afterSetup = wire.statements.slice(beforeCount);
-					const beat = afterSetup.find(s => /^UPDATE .*SET heartbeat_at/.test(s.sql));
+					const beat = afterSetup.find(s => heartbeat.test(s.sql));
 					if (!beat) throw new Error("no heartbeat UPDATE found on the wire");
-					const conn = beat.connection;
-					const connStmts = afterSetup.filter(s => s.connection === conn);
+					const connStmts = afterSetup.filter(s => s.connection === beat.connection);
 					const beatIdx = connStmts.indexOf(beat);
-					let beginIdx = beatIdx;
-					for (let i = beatIdx - 1; i >= 0; i--) {
-						if (connStmts[i]!.sql === "BEGIN") {
-							beginIdx = i;
-							break;
-						}
-					}
-					let commitIdx = connStmts.length - 1;
-					for (let i = beatIdx + 1; i < connStmts.length; i++) {
-						if (connStmts[i]!.sql === "COMMIT") {
-							commitIdx = i;
-							break;
-						}
-					}
-					const tx = connStmts.slice(beginIdx, commitIdx + 1);
-					expect({
-						count: tx.length,
-						combined: tx.some(
-							s =>
-								s.protocol === "query" &&
-								/SET LOCAL search_path/.test(s.sql) &&
-								/lock_timeout/.test(s.sql) &&
-								/idle_in_transaction_session_timeout/.test(s.sql),
-						),
-					}).toEqual({ count: 6, combined: true });
+					const openingIdx = connStmts.findLastIndex((s, i) => i < beatIdx && /^BEGIN\b/.test(s.sql));
+					const commitIdx = connStmts.findIndex((s, i) => i > beatIdx && s.sql === "COMMIT");
+					const tx = connStmts.slice(
+						openingIdx === -1 ? beatIdx : openingIdx,
+						commitIdx === -1 ? undefined : commitIdx + 1,
+					);
+					expect(tx.map(({ protocol, sql }) => ({ protocol, sql }))).toEqual([
+						{ protocol: "query", sql: pgOpening("write", present) },
+						{
+							protocol: "query",
+							sql: "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'",
+						},
+						{
+							protocol: "query",
+							sql: "SET LOCAL lock_timeout = 500; SET LOCAL idle_in_transaction_session_timeout = 500",
+						},
+						{ protocol: "execute", sql: expect.stringMatching(heartbeat) },
+						{ protocol: "query", sql: "COMMIT" },
+					]);
 				} finally {
 					proxy.stop();
 				}
