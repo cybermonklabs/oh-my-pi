@@ -16,7 +16,7 @@ import type {
 	SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
-import { LEASE_BACKENDS, openLeaseDb, transcript } from "./sql-session-lease-fixture";
+import { LEASE_BACKENDS, openLeaseDb, reserveWrapped, transcript } from "./sql-session-lease-fixture";
 
 const ID = "01a1f500-0000-7000-8000-000000000001";
 
@@ -26,24 +26,27 @@ interface Recorded {
 	values: unknown[];
 }
 
-/** `client`, recording each statement a transaction sends, with the transaction's number. */
+/**
+ * `client`, recording each statement a transaction sends, with the transaction's number; on PostgreSQL each
+ * connection the store reserves is one transaction.
+ */
 function recorder(client: SqlSessionStorageClient, into: Recorded[]): SqlSessionStorageClient {
 	let next = 0;
+	const numbered = (transaction: SqlSessionStorageTransaction): SqlSessionStorageTransaction => {
+		const tx = ++next;
+		return {
+			unsafe(query, values) {
+				into.push({ tx, sql: query, values: [...(values ?? [])] });
+				return transaction.unsafe(query, values);
+			},
+		};
+	};
 	return {
 		options: client.options,
 		unsafe: (query, values) => client.unsafe(query, values),
-		transaction: callback => {
-			const tx = ++next;
-			return client.transaction(transaction =>
-				callback({
-					unsafe(query, values) {
-						into.push({ tx, sql: query, values: [...(values ?? [])] });
-						return transaction.unsafe(query, values);
-					},
-				} satisfies SqlSessionStorageTransaction),
-			);
-		},
+		transaction: callback => client.transaction(transaction => callback(numbered(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, numbered),
 	};
 }
 

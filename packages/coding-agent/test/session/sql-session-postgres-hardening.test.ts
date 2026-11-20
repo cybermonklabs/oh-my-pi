@@ -14,6 +14,7 @@ import { describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { resolveSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
+import { pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	SqlSessionStorage,
@@ -25,9 +26,9 @@ import { SQL } from "bun";
 import {
 	type LeaseDb,
 	openLeaseDb,
+	reserveWrapped,
 	TcpProxy,
 	transcript,
-	unqualifiedNames,
 	until,
 	type WireRecord,
 } from "./sql-session-lease-fixture";
@@ -37,7 +38,6 @@ import {
 
 const ID = "01a1f300-0000-7000-8000-000000000001";
 const OTHER_ID = "01a1f300-0000-7000-8000-000000000002";
-const SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
 const SESSION_TABLE = "omp_session_files";
 const PARTS_TABLE = "omp_session_files_parts";
 const LEASE_TABLE = "omp_session_leases";
@@ -66,11 +66,18 @@ const DECLARED: Record<string, Record<string, string>> = {
 		heartbeat_at: "bigint",
 	},
 };
+/** The OID PostgreSQL gives each declared type, as the integrity check reads it from the server. */
+const TYPE_OIDS: Record<string, string> = { text: "25", bigint: "20", bytea: "17" };
+/** The OID of a type another login made, which no declared type has. */
+const PLANTED_TYPE_OID = "16390";
 
 interface Sent {
 	sql: string;
 	values: unknown[] | undefined;
-	/** The transaction that sent it, numbered from 1; `null` for the bare client. */
+	/**
+	 * The transaction that sent it (on PostgreSQL, the reserved connection), numbered from 1 across every
+	 * fake of this file, so two fakes that record into one list never share a number; `null` for the bare client.
+	 */
 	transaction: number | null;
 }
 
@@ -89,13 +96,12 @@ interface FakeServer {
 	sizes?: Record<string, number>;
 }
 
-/** A one-statement read's opening: the lock, then the read, in one simple query. */
-const LOCKED = `${SEARCH_PATH}; `;
-
-/** `sql` without a one-statement read's lock. */
-function body(sql: string): string {
-	return sql.startsWith(LOCKED) ? sql.slice(LOCKED.length) : sql;
-}
+/** The fake's probe finds none of the opening's conditional parameters, so every opening holds none of them. */
+const NONE: ReadonlySet<string> = new Set();
+/** The opening of a read transaction. */
+const READ_OPENING = pgOpening("read", NONE);
+/** The openings the store may begin a transaction with; each locks `search_path` to `pg_catalog, pg_temp`. */
+const OPENINGS: readonly string[] = [pgOpening("write", NONE), READ_OPENING];
 
 /** The table a relation argument names, from its qualified spelling `"public".<name>`. */
 function tableOf(values: unknown[] | undefined): string {
@@ -103,12 +109,15 @@ function tableOf(values: unknown[] | undefined): string {
 	return value.slice(value.lastIndexOf(".") + 1);
 }
 
+/** How many transactions the fakes of this file have begun. */
+let transactions = 0;
+
 /**
  * A PostgreSQL client that answers enough for the store to run every kind of
- * statement it has, and records each one with the transaction that sent it.
+ * statement it has, and records each one with the transaction that sent it:
+ * each connection the store reserves is one transaction.
  */
 function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionStorageClient {
-	let transactions = 0;
 	/** Set once the store made the lease table's holder index, so the next probe finds it. */
 	let indexMade = false;
 	const holderIndex = () => !server.empty || indexMade;
@@ -119,18 +128,23 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 			if (server.empty) return [];
 			return Object.keys(DECLARED[tableOf(values)] ?? {}).map(column_name => ({ column_name }));
 		}
-		if (sql.startsWith("SELECT a.attname AS name, pg_catalog.format_type(")) {
+		if (sql.startsWith("SELECT a.attname AS name, ")) {
 			const table = tableOf(values);
-			return Object.entries(DECLARED[table] ?? {}).map(([name, type]) => ({
-				name,
-				type:
-					server.plantedType?.table === table && server.plantedType.column === name
-						? server.plantedType.type
-						: type,
-				has_default: false,
-				generated: "",
-				identity: "",
-			}));
+			return Object.entries(DECLARED[table] ?? {}).map(([name, type]) => {
+				const planted = server.plantedType?.table === table && server.plantedType.column === name;
+				return {
+					name,
+					type_oid: planted ? PLANTED_TYPE_OID : TYPE_OIDS[type],
+					type_mod: -1,
+					type: planted ? server.plantedType?.type : type,
+					has_default: false,
+					generated: "",
+					identity: "",
+					text_oid: TYPE_OIDS.text,
+					bigint_oid: TYPE_OIDS.bigint,
+					bytea_oid: TYPE_OIDS.bytea,
+				};
+			});
 		}
 		if (sql.startsWith("SELECT 'trigger' AS kind")) return server.plantedObjects ?? [];
 		// The blob table's primary key, and the INSERT grant the store's login holds on it.
@@ -179,8 +193,6 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 	const handle = (transaction: number | null): SqlSessionStorageTransaction => ({
 		async unsafe(sql, values): Promise<SqlSessionStorageResult> {
 			sent.push({ sql, values, transaction });
-			// A read and its search_path lock in one simple query: one result per statement.
-			if (sql.startsWith(LOCKED)) return [[], answer(sql.slice(LOCKED.length), values)];
 			return answer(sql, values);
 		},
 	});
@@ -192,6 +204,10 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 			transactions += 1;
 			return callback(handle(transactions));
 		},
+		async reserve() {
+			transactions += 1;
+			return { ...handle(transactions), release() {}, async close() {} };
+		},
 	};
 }
 
@@ -199,22 +215,17 @@ const UNQUALIFIED_TABLE = new RegExp(`(?<![".\\w])(${SESSION_TABLE}(?:_parts)?|$
 const BARE_RELATION_VALUE = new RegExp(`^(${SESSION_TABLE}(_parts)?|${LEASE_TABLE}(_holder)?)$`);
 
 /**
- * Every way `sent` departs from the rule: a statement outside a transaction
- * that neither opens with the search_path lock (a one-statement read) nor
- * names only `pg_catalog` functions and operators (the heartbeat), a
- * statement of a transaction before its `search_path` lock (its
- * `SET TRANSACTION`s aside), and a table, or a relation argument, without its
- * schema.
+ * Every way `sent` departs from the rule: a statement sent outside a
+ * transaction (on PostgreSQL the store sends every statement on a reserved
+ * connection), a statement of a transaction before its opening (which locks
+ * `search_path`), and a table, or a relation argument, without its schema.
  */
 function unlockedStatements(sent: readonly Sent[]): string[] {
 	const problems: string[] = [];
 	const byTransaction = new Map<number, Sent[]>();
 	for (const statement of sent) {
 		if (statement.transaction === null) {
-			const unqualified = statement.sql.startsWith(LOCKED) ? [] : unqualifiedNames(statement.sql);
-			if (unqualified.length > 0) {
-				problems.push(`outside a transaction, naming ${unqualified.join(" ")} unqualified: ${statement.sql}`);
-			}
+			problems.push(`outside a transaction: ${statement.sql}`);
 			continue;
 		}
 		const statements = byTransaction.get(statement.transaction) ?? [];
@@ -222,10 +233,9 @@ function unlockedStatements(sent: readonly Sent[]): string[] {
 		byTransaction.set(statement.transaction, statements);
 	}
 	for (const statements of byTransaction.values()) {
-		const locked = statements.findIndex(statement => statement.sql === SEARCH_PATH);
+		const opened = statements.findIndex(statement => OPENINGS.includes(statement.sql));
 		for (const [index, statement] of statements.entries()) {
-			if (statement.sql === SEARCH_PATH || statement.sql.startsWith("SET TRANSACTION ")) continue;
-			if (locked < 0 || index < locked) problems.push(`before the search_path lock: ${statement.sql}`);
+			if (opened < 0 || index < opened) problems.push(`before the opening: ${statement.sql}`);
 		}
 	}
 	for (const statement of sent) {
@@ -311,7 +321,7 @@ describe("SqlSessionStorage on PostgreSQL, without a server", () => {
 			/ON CONFLICT \(path\) DO NOTHING RETURNING path$/,
 			/^WITH gone AS \(DELETE FROM/,
 		];
-		expect(kinds.filter(kind => !sent.some(statement => kind.test(body(statement.sql)))).map(String)).toEqual([]);
+		expect(kinds.filter(kind => !sent.some(statement => kind.test(statement.sql))).map(String)).toEqual([]);
 		expect(unlockedStatements(sent)).toEqual([]);
 		// The holder token is always a bound parameter: every comparison with it names a placeholder.
 		expect(
@@ -322,7 +332,7 @@ describe("SqlSessionStorage on PostgreSQL, without a server", () => {
 		expect(sent.some(statement => statement.sql.includes(" AND holder = $"))).toBe(true);
 	});
 
-	it("sends each data read as one statement outside a transaction: the search_path lock, then the read", async () => {
+	it("sends each data read in a read transaction of its own: the read opening, the read, then COMMIT", async () => {
 		const file = `/sessions/p/2026-11-17T00-00-00-000Z_${ID}.jsonl`;
 		const sent: Sent[] = [];
 		const storage = await SqlSessionStorage.create({ client: recordingPostgres(sent, { indexed: [file] }) });
@@ -332,15 +342,20 @@ describe("SqlSessionStorage on PostgreSQL, without a server", () => {
 			["readTextFrom", () => storage.readTextFrom(file, 0, 64)],
 			["refresh", () => storage.refresh()],
 		];
-		const rounds: Record<string, Array<{ transaction: number | null; locked: boolean }>> = {};
+		const rounds: Record<string, { connections: number; sent: string[] }> = {};
 		for (const [name, read] of reads) {
 			const start = sent.length;
 			await read();
-			rounds[name] = sent
-				.slice(start)
-				.map(statement => ({ transaction: statement.transaction, locked: statement.sql.startsWith(LOCKED) }));
+			const statements = sent.slice(start);
+			rounds[name] = {
+				// The reserved connections the read used; a statement on the bare client is on none.
+				connections: new Set(statements.flatMap(statement => statement.transaction ?? [])).size,
+				sent: statements.map(statement =>
+					statement.sql === READ_OPENING ? "the read opening" : statement.sql === "COMMIT" ? "COMMIT" : "the read",
+				),
+			};
 		}
-		const one = [{ transaction: null, locked: true }];
+		const one = { connections: 1, sent: ["the read opening", "the read", "COMMIT"] };
 		expect(rounds).toEqual({ readText: one, readTextSlices: one, readTextFrom: one, refresh: one });
 		expect(unlockedStatements(sent)).toEqual([]);
 	});
@@ -565,39 +580,25 @@ describe.skipIf(!pgUrl)("OMP_SESSION_SQL_CREATE_TABLE on PostgreSQL", () => {
 	}, 60_000);
 });
 
-/** The transaction-control statements a client sends around its own, which name no relation and no function. */
-const TRANSACTION_CONTROL = /^(BEGIN|START TRANSACTION|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
-
 /**
- * Every statement `record` saw that ran without the search_path lock: outside
- * a transaction, or in one before its `SET LOCAL search_path`, unless it is
- * one simple query that opens with the lock (a one-statement read), a
- * transaction-control statement, or a statement alone outside a transaction
- * that names only `pg_catalog` functions and operators (the heartbeat).
- * Tracked per connection, in the order sent.
+ * Every message `record` saw that ran outside a transaction one of
+ * `openings` began: on a connection before its first opening, or after the
+ * `COMMIT` or `ROLLBACK` that ended one and before the next; and an opening
+ * sent inside a transaction. Each opening locks `search_path` to
+ * `pg_catalog, pg_temp`. Tracked per connection, in the order sent.
  */
-function unlockedOnTheWire(record: WireRecord): string[] {
+function unlockedOnTheWire(record: WireRecord, openings: ReadonlySet<string>): string[] {
 	const problems: string[] = [];
-	const state = new Map<number, { inTransaction: boolean; locked: boolean }>();
+	const open = new Map<number, boolean>();
 	for (const { connection, protocol, sql } of record.statements) {
 		const text = sql.trim();
-		const current = state.get(connection) ?? { inTransaction: false, locked: false };
-		state.set(connection, current);
-		if (/^(BEGIN|START TRANSACTION)\b/i.test(text)) {
-			current.inTransaction = true;
-			current.locked = false;
-		} else if (/^(COMMIT|END|ROLLBACK)\b(?! TO)/i.test(text)) {
-			current.inTransaction = false;
-			current.locked = false;
-		} else if (text === SEARCH_PATH && current.inTransaction) {
-			current.locked = true;
-		} else if (protocol === "query" && text.startsWith(`${SEARCH_PATH}; `)) {
-			// One simple query runs as one implicit transaction, its lock first.
-		} else if (!current.inTransaction && unqualifiedNames(text).length === 0) {
-			// Alone, and nothing in it is found through the connection's search_path.
-		} else if (!TRANSACTION_CONTROL.test(text) && !/^SET TRANSACTION\b/i.test(text) && !current.locked) {
-			const unqualified = current.inTransaction ? "" : ` (naming ${unqualifiedNames(text).join(" ")} unqualified)`;
-			problems.push(`connection ${connection} (${protocol})${unqualified}: ${text}`);
+		if (openings.has(text)) {
+			if (open.get(connection)) problems.push(`connection ${connection} (${protocol}), an opening in a transaction`);
+			open.set(connection, true);
+		} else if (!open.get(connection)) {
+			problems.push(`connection ${connection} (${protocol}), outside a transaction: ${text}`);
+		} else if (/^(COMMIT|ROLLBACK)$/i.test(text)) {
+			open.set(connection, false);
 		}
 	}
 	return problems;
@@ -612,6 +613,13 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL, on the wire", () => {
 		const record = proxy.recordPostgres();
 		const url = new URL(proxy.urlFor(pgUrl ?? ""));
 		url.pathname = `/${database}`;
+		// The openings the store may send on this server; the probe's holds no conditional statement.
+		const names = new Set(
+			((await admin.unsafe("SELECT name FROM pg_catalog.pg_settings")) as Array<{ name: string }>).map(
+				row => row.name,
+			),
+		);
+		const openings = new Set([pgOpening("write", names), pgOpening("read", names), pgOpening("read", new Set())]);
 		await admin.unsafe(`CREATE DATABASE ${database}`);
 		try {
 			const dsnFile = dir.join("dsn");
@@ -647,7 +655,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL, on the wire", () => {
 				statements: record.statements.length > 20,
 				startupSearchPath: record.startups.filter(startup => "search_path" in startup || "options" in startup),
 			}).toEqual({ refused: null, statements: true, startupSearchPath: [] });
-			expect(unlockedOnTheWire(record)).toEqual([]);
+			expect(unlockedOnTheWire(record, openings)).toEqual([]);
 		} finally {
 			proxy.stop();
 			await admin.unsafe(
@@ -660,7 +668,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL, on the wire", () => {
 	}, 60_000);
 });
 
-/** `client` with every statement it and its transactions send pushed onto `sent`, in order. */
+/** `client` with every statement it, its transactions and its reserved connections send pushed onto `sent`, in order. */
 function recording(client: SqlSessionStorageClient, sent: string[]): SqlSessionStorageClient {
 	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
 		unsafe(sql, values) {
@@ -673,6 +681,7 @@ function recording(client: SqlSessionStorageClient, sent: string[]): SqlSessionS
 		unsafe: wrap(client).unsafe,
 		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, wrap),
 	};
 }
 

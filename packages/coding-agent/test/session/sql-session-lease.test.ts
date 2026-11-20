@@ -11,6 +11,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionLeaseLostError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
 import {
 	SESSION_OPEN_CLAIM_WAIT_MS,
 	SqlSessionStorage,
@@ -31,6 +32,7 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	rejection,
+	reserveWrapped,
 	TcpProxy,
 	transcript,
 	until,
@@ -120,6 +122,7 @@ function forgingFence(
 		unsafe: forged(client).unsafe,
 		transaction: callback => client.transaction(transaction => callback(forged(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, forged),
 	};
 }
 
@@ -557,6 +560,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					unsafe: late(client).unsafe,
 					transaction: callback => client.transaction(transaction => callback(late(transaction))),
 					end: () => client.end?.() ?? Promise.resolve(),
+					...reserveWrapped(client, late),
 				};
 			};
 			const storage = await db.open({ lease, wrap: lateAnswers });
@@ -612,6 +616,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					unsafe: slow(client).unsafe,
 					transaction: callback => client.transaction(transaction => callback(slow(transaction))),
 					end: () => client.end?.() ?? Promise.resolve(),
+					...reserveWrapped(client, slow),
 				};
 			};
 			const storage = await db.open({ lease, wrap: slowAnswers });
@@ -683,6 +688,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const lease = { expiryMs: 20_000, heartbeatMs: 1000 };
 				const heartbeat = new RegExp(`^UPDATE (?:"[^"]+"\\.)?${db.leaseTable} SET heartbeat_at`);
+				// The heartbeat's own bounds, which only a heartbeat sends, after its opening and read-only check.
+				const heartbeatBounds =
+					/^SET LOCAL lock_timeout = \d+; SET LOCAL idle_in_transaction_session_timeout = \d+$/;
 				const heartbeatPids: number[] = [];
 				let recordBeats = false;
 				let pauseNextHeartbeat = false;
@@ -691,7 +699,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				const trace = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
 					async unsafe(query, values) {
 						const result = await executor.unsafe(query, values);
-						if (recordBeats && query === "SET TRANSACTION READ WRITE") {
+						if (recordBeats && heartbeatBounds.test(query)) {
 							const [row] = (await executor.unsafe("SELECT pg_backend_pid() AS pid")) as Array<{
 								pid: number | string;
 							}>;
@@ -712,6 +720,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 						unsafe: trace(client).unsafe,
 						transaction: callback => client.transaction(transaction => callback(trace(transaction))),
 						end: () => client.end?.() ?? Promise.resolve(),
+						...reserveWrapped(client, trace),
 					}),
 				});
 				const file = sessionFile(db);
@@ -834,6 +843,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					unsafe: observe(single as unknown as SqlSessionStorageTransaction).unsafe,
 					transaction: callback => single.transaction(transaction => callback(observe(transaction))),
 					end: () => single.end(),
+					...reserveWrapped(single, observe),
 				};
 				const storage = await db.open({
 					lease,
@@ -866,9 +876,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			"keeps the connection's own lock_timeout for the rest of a write after its fence",
 			async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
-				// One connection with a session-level lock_timeout of 1 s, as an SDK caller may set.
-				const single = new SQL(db.dsn, { max: 1 });
-				await single.unsafe("SET lock_timeout = '1s'");
+				// One connection whose own lock_timeout is 1 s, as an SDK caller may set it: a start parameter, the value
+				// each store transaction's opening keeps (`SET LOCAL lock_timeout TO DEFAULT`).
+				const single = new SQL(db.dsn, { max: 1, connection: { lock_timeout: "1s" } });
 				const storage = await db.open({
 					lease: STILL,
 					wrap: client => {
@@ -1438,13 +1448,13 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 /**
  * A client of a database where another login made every table, column and
  * index the store needs: the catalog probes say so, and every statement the
- * store sends is recorded in `sent`.
+ * store sends, on the client, in a transaction or on a reserved connection,
+ * is recorded in `sent`.
  */
 function ownerMadeSchemaClient(adapter: "postgres" | "mysql", sent: string[]): SqlSessionStorageClient {
 	const columns = ["path", "content", "mtime_ms", "title", "title_source", "title_updated_at", "byte_len"].map(
 		column_name => ({ column_name }),
 	);
-	const lock = "SET LOCAL search_path = pg_catalog, pg_temp";
 	const answer = (sql: string, values?: unknown[]): SqlSessionStorageResult => {
 		if (sql.includes(" AS column_name FROM ")) return columns;
 		// Every table is there, so PostgreSQL's start-up makes none.
@@ -1466,24 +1476,32 @@ function ownerMadeSchemaClient(adapter: "postgres" | "mysql", sent: string[]): S
 	};
 	const executor: SqlSessionStorageTransaction = {
 		async unsafe(sql, values): Promise<SqlSessionStorageResult> {
-			// A read sent alone carries its search_path lock: record the two statements apart.
-			if (sql.startsWith(`${lock}; `)) {
-				const read = sql.slice(lock.length + 2);
-				sent.push(lock, read);
-				return [[], answer(read, values)];
-			}
 			sent.push(sql);
 			return answer(sql, values);
 		},
 	};
-	return { options: { adapter }, unsafe: executor.unsafe, transaction: callback => callback(executor) };
+	return {
+		options: { adapter },
+		unsafe: executor.unsafe,
+		transaction: callback => callback(executor),
+		async reserve() {
+			return { ...executor, release() {}, async close() {} };
+		},
+	};
 }
+
+/**
+ * The openings of the store's PostgreSQL transactions where the probe finds none of the conditional parameters, as
+ * the fake's does: `BEGIN` and `SET LOCAL` of session settings, which any login may run.
+ */
+const NON_OWNER_OPENINGS: ReadonlySet<string> = new Set([pgOpening("write", new Set()), pgOpening("read", new Set())]);
 
 /** What a login that owns none of the tables may run at start-up: no-op creates, reads, and transaction settings. */
 const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^CREATE TABLE IF NOT EXISTS /,
-	/^SET TRANSACTION (READ WRITE|ISOLATION LEVEL READ COMMITTED)$/,
-	/^SET LOCAL search_path = pg_catalog, pg_temp$/,
+	/^COMMIT$/,
+	// PostgreSQL: the probe of the opening's conditional parameters.
+	/^SELECT name FROM pg_catalog\.pg_settings WHERE name IN \(/,
 	/^SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'$/,
 	/^SELECT pg_advisory_xact_lock\(\d+\)$/,
 	/^SELECT (attname|column_name) AS column_name FROM /,
@@ -1492,7 +1510,7 @@ const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^SELECT i\.indexrelid::text AS oid FROM pg_catalog\.pg_index i /,
 	/^SELECT c\.oid::text AS oid, c\.relkind::text AS kind, /,
 	/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /,
-	/^SELECT a\.attname AS name, pg_catalog\.format_type\(/,
+	/^SELECT a\.attname AS name, a\.atttypid::text AS type_oid, /,
 	/^SELECT 'trigger' AS kind, /,
 	/^SELECT a\.attname::text AS name FROM pg_catalog\.pg_index i /,
 	/^SELECT pg_catalog\.has_table_privilege\(/,
@@ -1514,7 +1532,9 @@ describe("SqlSessionStorage start-up on tables another login made", () => {
 			const sent: string[] = [];
 			await SqlSessionStorage.create({ client: ownerMadeSchemaClient(adapter, sent), claims: true });
 
-			expect(sent.filter(sql => !NON_OWNER_STARTUP.some(allowed => allowed.test(sql)))).toEqual([]);
+			expect(
+				sent.filter(sql => !NON_OWNER_OPENINGS.has(sql) && !NON_OWNER_STARTUP.some(allowed => allowed.test(sql))),
+			).toEqual([]);
 			// PostgreSQL looks first and makes nothing that is there; MySQL runs its five no-op creates, as before.
 			expect(sent.filter(sql => sql.startsWith("CREATE TABLE IF NOT EXISTS "))).toHaveLength(
 				adapter === "postgres" ? 0 : 5,
