@@ -689,10 +689,6 @@ fn inplace_partial_retry_refuses_a_foreign_symlink_swapped_in() {
 	if unsafe { libc::geteuid() } != 0 {
 		return;
 	}
-	if let Some(error) = crate::rsync::ids::foreign_owner_refused(65534) {
-		eprintln!("skipped: a symlink cannot be given to uid 65534: {error}");
-		return;
-	}
 	let mut o = opts();
 	o.keep_partial = true;
 	o.partial_dir = Some("pdir".into());
@@ -777,10 +773,6 @@ fn inplace_partial_dir_output_is_not_followed_through_a_refused_symlink() {
 fn inplace_partial_dir_refuses_a_foreign_owned_symlink() {
 	// SAFETY: geteuid has no preconditions.
 	if unsafe { libc::geteuid() } != 0 {
-		return;
-	}
-	if let Some(error) = crate::rsync::ids::foreign_owner_refused(65534) {
-		eprintln!("skipped: a symlink cannot be given to uid 65534: {error}");
 		return;
 	}
 	let mut o = opts();

@@ -1282,10 +1282,6 @@ mod tests {
 		assert_eq!(text, "- *.o\n");
 
 		// A walk that trusts only root rejects our symlinks: parent component…
-		if let Some(uid) = owned_by_root(&base.join("link")) {
-			eprintln!("skipped: the symlinks this test made are owned by uid {uid}, whom the root-only rule trusts");
-			return;
-		}
 		let only_root = |uid: u32| uid == 0;
 		let err = walk_bytes(&base.join("link/rules"), &only_root, libc::O_RDONLY).unwrap_err();
 		assert!(is_untrusted_symlink(&err));
@@ -1297,25 +1293,12 @@ mod tests {
 		assert!(walk_bytes(&base.join("real/rules"), &only_root, libc::O_RDONLY).is_ok());
 	}
 
-	/// The owner of the symlink at `link` where it is root, whom the root-only
-	/// rule trusts: the tests of that rule need a symlink of theirs it refuses,
-	/// which a test run as root does not make.
-	fn owned_by_root(link: &Path) -> Option<u32> {
-		use std::os::unix::fs::MetadataExt as _;
-		let uid = fs::symlink_metadata(link).unwrap().uid();
-		(uid == 0).then_some(uid)
-	}
-
 	#[test]
 	fn operator_walk_creates_and_refuses_untrusted_parent_for_writes() {
 		let (_guard, base) = canonical_tempdir();
 		fs::create_dir(base.join("logs")).unwrap();
 		fs::create_dir(base.join("victim")).unwrap();
 		symlink("victim", base.join("planted")).unwrap();
-		if let Some(uid) = owned_by_root(&base.join("planted")) {
-			eprintln!("skipped: the symlink this test made is owned by uid {uid}, whom the root-only rule trusts");
-			return;
-		}
 		let only_root = |uid: u32| uid == 0;
 		let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND;
 		walk_bytes(&base.join("logs/new.log"), &only_root, flags).unwrap();
