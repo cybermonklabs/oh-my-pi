@@ -546,10 +546,20 @@ fn masked(o: &Outcome) -> Outcome {
 /// standalone shell leaves running when it exits
 /// ([`a_standalone_exit_ends_running_background_externals`]), where bash
 /// and zsh leave them. It has no single quote, so a script can quote it so.
-const SHELL_ONLY: &str = "trap \"\" TERM HUP; [ -n \"$3\" ] && : > \"$3\"; kill -$1 $2; i=0; \
-                          while [ $i -lt 500 ]; do case $(ps -o stat= -p $2 2>/dev/null | tr -d \
-                          \" \") in \"\"|Z*) echo shell-gone; exit;; esac; sleep 0.01; \
-                          i=$((i+1)); done; echo shell-waited";
+///
+/// With `WAIT_FOR` set, it sends the signal only once the shell's state
+/// (`ps -o stat`) starts with `WAIT_FOR`, or the shell is gone: the real
+/// bash runs with `WAIT_FOR=S`, which after its fork it reaches when it
+/// blocks in `waitpid` for this command. bash 5.2.21 acts on a terminating
+/// signal that comes before it blocks there only once the command has
+/// ended: on a loaded machine the signal came that early, and bash waited
+/// 500 looks.
+const SHELL_ONLY: &str = "trap \"\" TERM HUP; [ -n \"$3\" ] && : > \"$3\"; [ -n \"$WAIT_FOR\" ] \
+                          && until case $(ps -o stat= -p $2 2>/dev/null | tr -d \" \") in \
+                          \"$WAIT_FOR\"*|\"\") true;; *) false;; esac; do sleep 0.01; done; kill \
+                          -$1 $2; i=0; while [ $i -lt 500 ]; do case $(ps -o stat= -p $2 \
+                          2>/dev/null | tr -d \" \") in \"\"|Z*) echo shell-gone; exit;; esac; \
+                          sleep 0.01; i=$((i+1)); done; echo shell-waited";
 
 /// bash catches its fatal signals once an EXIT trap is set (`set_signal` →
 /// `initialize_terminating_signals`): the trap runs (with `$?` as it was),
@@ -615,7 +625,8 @@ fn bash_runs_its_exit_trap_before_dying_of_a_fatal_signal() {
 		// which obash does not: stdout and the end are compared.
 		assert_eq!((ours.stdout.as_slice(), ours.end()), (stdout, Some(end)), "{script}");
 		if let Some(bash) = real_bash() {
-			let theirs = Run::script(bash, "bash", script).go();
+			// bash waits for the command in `waitpid` ([`SHELL_ONLY`]).
+			let theirs = Run::script(bash, "bash", script).env("WAIT_FOR", "S").go();
 			assert_eq!((&ours.stdout, ours.end()), (&theirs.stdout, theirs.end()), "{script}");
 		}
 	}
