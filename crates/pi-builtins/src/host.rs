@@ -1625,7 +1625,7 @@ impl ShellCommand {
 ///
 /// `program` is the name the utility gave: a relative path runs from `cwd`,
 /// and a bare name is looked up on `PATH`, where only a path that fits is
-/// found (the shell's twin reads that program: a refusal it finds to be the
+/// found (pi-shell's lookup reads that program: a refusal it finds to be the
 /// interpreter's reaches the utility without its `errno`). `cwd` is taken
 /// lexically normalized (`-execdir`'s `<dir>/./sub` is `<dir>/sub`), as the
 /// shell enters it.
@@ -1650,11 +1650,10 @@ pub fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd
 
 /// Whether the program at `path` is a `#!` script whose interpreter the
 /// system cannot reach by its path: the interpreter its first line names
-/// (read as the kernel reads it, from the file's first 256 bytes; relative
-/// to `cwd` when relative) is past `PATH_MAX` or holds a name past
-/// `NAME_MAX`, or looking it up fails with `ENAMETOOLONG` (a symlink on its
-/// way names one). Only read for an `ENAMETOOLONG` of a long line, the one
-/// refusal it decides.
+/// ([`shebang_interpreter`]; relative to `cwd` when relative) is past
+/// `PATH_MAX` or holds a name past `NAME_MAX`, or looking it up fails with
+/// `ENAMETOOLONG` (a symlink on its way names one). Only read for an
+/// `ENAMETOOLONG` of a long line, the one refusal it decides.
 #[cfg(unix)]
 fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
 	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
@@ -1665,18 +1664,10 @@ fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
 	if file.take(256).read_to_end(&mut head).is_err() {
 		return false;
 	}
-	let Some(line) = head.strip_prefix(b"#!") else {
+	let Some(name) = shebang_interpreter(&head) else {
 		return false;
 	};
-	let line = &line[line.iter().take_while(|&&c| c == b' ' || c == b'\t').count()..];
-	let end = line
-		.iter()
-		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
-		.unwrap_or(line.len());
-	if end == 0 {
-		return false;
-	}
-	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(&line[..end]));
+	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(name));
 	!path_fits(&interpreter)
 		|| std::fs::metadata(&interpreter).is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
 }
