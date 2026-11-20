@@ -9,7 +9,7 @@
 //! Every rule here was measured against GNU grep 3.11 and GNU sed 4.9 in the
 //! C and the C.UTF-8 locale; the comments name the command that shows it.
 
-use std::{iter::Peekable, str::Chars};
+use std::{iter::Peekable, str::Chars, sync::LazyLock};
 
 /// The dialect a pattern is written in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,8 +119,8 @@ pub(crate) fn char_byte(c: char) -> Option<u8> {
 /// is, and each byte that is no UTF-8 as the character that stands for it
 /// ([`byte_char`]), with whether it holds such a byte. GNU grep reads a
 /// pattern as its bytes: `grep $'\351'` selects a line holding the byte
-/// 0xE9. sed reads the bytes a string of `y` names so.
-#[cfg(any(feature = "util.grep", feature = "util.sed", test))]
+/// 0xE9.
+#[cfg(any(feature = "util.grep", test))]
 pub(crate) fn pattern_text(bytes: &[u8]) -> (String, bool) {
 	let mut text = String::with_capacity(bytes.len());
 	let mut raw = false;
@@ -1590,12 +1590,11 @@ fn close_class(
 	let kept_apart = !(ascii.is_empty() && wide.is_empty() && exact.is_empty());
 	let fold = icase && (whole || kept_apart);
 	if fold {
-		let lonesome = LONESOME_LOWER.map(|lone| (lone, simple_upper(lone)));
 		let mut folded = Vec::new();
 		let members = ascii.iter().map(|&(low, high)| (u32::from(low), u32::from(high)));
 		for (low, high) in members.chain(wide.iter().copied()) {
 			for c in (low..=high).filter_map(char::from_u32) {
-				for other_case in case_counterparts(c, &lonesome) {
+				for other_case in case_counterparts(c) {
 					if other_case.is_ascii() {
 						push_bracket_char(out, other_case);
 						written = true;
@@ -1688,18 +1687,21 @@ const LONESOME_LOWER: [char; 19] = [
 	'\u{1E9B}', '\u{1FBE}',
 ];
 
+/// [`LONESOME_LOWER`], each with its upper case ([`simple_upper`]).
+static LONESOME: LazyLock<[(char, char); 19]> =
+	LazyLock::new(|| LONESOME_LOWER.map(|lone| (lone, simple_upper(lone))));
+
 /// The characters GNU grep also matches for `c` without case, as gnulib's
 /// `case_folded_counterparts` gives them with glibc's `towupper` and
 /// `towlower`: the upper case of `c`, the lower case of that where its upper
-/// case is the same, and each of `lonesome` (the [`LONESOME_LOWER`] with
-/// their upper case) whose upper case is the same. So `[Σ]` matches `ς`,
-/// `[s]` matches `ſ` and `[ı]` matches `I`, and the Kelvin sign and `k`
-/// match each other neither way, as `printf 'k\377\n' | grep -ic
-/// $'[\u212A\351]'` counts 0.
-fn case_counterparts(c: char, lonesome: &[(char, char)]) -> impl Iterator<Item = char> + '_ {
+/// case is the same, and each of [`LONESOME_LOWER`] whose upper case is the
+/// same. So `[Σ]` matches `ς`, `[s]` matches `ſ` and `[ı]` matches `I`, and
+/// the Kelvin sign and `k` match each other neither way, as `printf
+/// 'k\377\n' | grep -ic $'[\u212A\351]'` counts 0.
+fn case_counterparts(c: char) -> impl Iterator<Item = char> {
 	let upper = simple_upper(c);
 	let lower = simple_lower(upper);
-	let lonesome = lonesome
+	let lonesome = LONESOME
 		.iter()
 		.filter(move |&&(lone, lone_upper)| lone != lower && lone != upper && lone != c && lone_upper == upper)
 		.map(|&(lone, _)| lone);
@@ -1725,25 +1727,34 @@ pub(crate) fn case_differs(c: char) -> bool {
 /// '\341\272\236\n' | grep -ic $'\303\237'` (`ẞ` against `ß`) is 0, in a
 /// line that is not UTF-8 too.
 pub(crate) fn push_case_literal(out: &mut String, c: char) {
-	let lonesome = LONESOME_LOWER.map(|lone| (lone, simple_upper(lone)));
 	out.push_str("(?-i:[");
 	push_bracket_char(out, c);
-	for other_case in case_counterparts(c, &lonesome) {
+	for other_case in case_counterparts(c) {
 		push_bracket_char(out, other_case);
 	}
 	out.push_str("])");
 }
 
 /// The characters whose upper case ([`simple_upper`]) is from `low` to
-/// `high`, as ranges of scalar values: the members GNU grep gives under
-/// `-i` a range whose ends are pattern bytes, each the character of its
-/// value.
-fn upper_case_in(low: char, high: char) -> impl Iterator<Item = (u32, u32)> {
-	(low..=high)
-		.flat_map(|c| [c, simple_lower(c)])
-		.chain(LONESOME_LOWER)
-		.filter(move |&c| (low..=high).contains(&simple_upper(c)))
-		.map(|c| (u32::from(c), u32::from(c)))
+/// `high`, as ranges of scalar values, adjacent characters joined: the
+/// members GNU grep gives under `-i` a range whose ends are pattern bytes,
+/// each the character of its value. `[\200-\U0010FFFF]` is so a few dozen
+/// ranges, not a million characters.
+fn upper_case_in(low: char, high: char) -> Vec<(u32, u32)> {
+	let range = low..=high;
+	let lower_outside = range.clone().map(simple_lower).filter(|c| !range.contains(c));
+	let mut ranges: Vec<(u32, u32)> = Vec::new();
+	for c in range.clone().chain(lower_outside).chain(LONESOME_LOWER) {
+		if !range.contains(&simple_upper(c)) {
+			continue;
+		}
+		let code = u32::from(c);
+		match ranges.last_mut() {
+			Some(last) if code == last.1 + 1 => last.1 = code,
+			_ => ranges.push((code, code)),
+		}
+	}
+	ranges
 }
 
 /// The simple upper case of `c`, as `towupper` gives it and GNU sed's `\U`
@@ -2965,6 +2976,19 @@ mod tests {
 		assert_eq!(icase("ab", Target::Rust), "ab");
 		assert_eq!(icase("k\u{e9}", Target::Fancy), "k\u{e9}");
 		assert_eq!(translate("k", Dialect::Basic, Target::Rust, false, Strictness::Lenient), Ok("k".to_owned()));
+	}
+
+	/// Under `-i` a range whose ends are pattern bytes holds each character
+	/// whose upper case is in it, adjacent ones joined into one range.
+	#[test]
+	fn a_range_without_case_is_held_as_ranges() {
+		// If this regresses, `grep -i $'[\200-\U0010FFFF]'` builds about 2.2
+		// million entries, one a character.
+		let ranges = upper_case_in('\u{80}', '\u{10FFFF}');
+		assert!(ranges.len() < 100, "{} ranges", ranges.len());
+		// `ı`, whose upper case is `I`, is left out.
+		assert_eq!(ranges[0], (0x80, 0x130));
+		assert_eq!(upper_case_in('A', 'Z'), [(0x41, 0x5A), (0x61, 0x7A), (0x131, 0x131), (0x17F, 0x17F)]);
 	}
 
 	/// In a UTF-8 locale the engine for a line that is not UTF-8, which a

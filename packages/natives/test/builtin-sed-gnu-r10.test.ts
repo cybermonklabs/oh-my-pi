@@ -508,6 +508,67 @@ describe("builtin sed: `y` reads its strings by the locale", () => {
 		["echo ab | LC_ALL=C.UTF-8 sed 'y/aba/123/'", "12\n", 0],
 		[String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 sed $'y/\303\251\303\251/12/'`, "caf1\n", 0],
 		["echo a | LC_ALL=C sed 'y/aa/12/'", "2\n", 0],
+		// A character from U+10FF80 written in the script is that character. Regressed: it was
+		// the byte 0x80, and in the C locale its four bytes were one, with no error.
+		[String.raw`printf 'ab\n' | LC_ALL=C.UTF-8 sed $'y/ab/\364\217\276\200c/'`, "\xf4\x8f\xbe\x80c\n", 0],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 sed $'y/a/\364\217\276\200/'`, "\xf4\x8f\xbe\x80\xff\n", 0],
+		[
+			String.raw`printf 'ab\n' | LC_ALL=C sed $'y/ab/\364\217\276\200c/' 2>&1`,
+			error(char(11), "strings for `y' command are different lengths"),
+			1,
+		],
+	]);
+});
+
+describe("builtin sed: a `y` error comes before a later `w` file is opened", () => {
+	// GNU sed 4.9 reports a `y` command whose strings differ in length in the
+	// locale before it compiles the commands after it, so the file of a later
+	// `w` (or `s///w`) is neither created nor emptied.
+	const different = (n: number) => error(char(n), "strings for `y' command are different lengths");
+	cases([
+		// Regressed: `o` was emptied, or created.
+		[
+			String.raw`echo keep >o; printf 'x\n' | LC_ALL=C sed -e $'y/\303\251/e/' -e 'w o' 2>&1; echo $?; cat o`,
+			`${different(7)}1\nkeep\n`,
+			0,
+		],
+		[
+			String.raw`rm -f o; printf 'x\n' | LC_ALL=C sed -e $'y/\303\251/e/' -e 'w o' 2>&1; test -e o; echo $?`,
+			`${different(7)}1\n`,
+			0,
+		],
+		[
+			String.raw`echo keep >o; printf 'x\n' | LC_ALL=C.UTF-8 sed -e 'y/\xc3\xa9/ab/' -e 'w o' 2>&1; echo $?; cat o`,
+			`${different(14)}1\nkeep\n`,
+			0,
+		],
+		[
+			String.raw`echo keep >o; printf 'x\n' | LC_ALL=C.UTF-8 sed -e $'y/ab/\303\251/' -e 'w o' 2>&1; cat o`,
+			`${different(8)}keep\n`,
+			0,
+		],
+		[
+			String.raw`echo keep >o; printf 'x\n' | LC_ALL=C sed -e $'y/a/\303\251/' -e 'w o' 2>&1; cat o`,
+			`${different(7)}keep\n`,
+			0,
+		],
+		[String.raw`echo keep >o; echo a | LC_ALL=C sed $'y/\303\251/e/;w o' 2>&1; cat o`, `${different(7)}keep\n`, 0],
+		[
+			String.raw`echo keep >o; echo a | LC_ALL=C sed -e $'y/\303\251/e/' -e 's/a/b/w o' 2>&1; cat o`,
+			`${different(7)}keep\n`,
+			0,
+		],
+		[
+			String.raw`echo keep >o; echo a >in; LC_ALL=C sed -i -e $'y/\303\251/e/' -e 'w o' in 2>&1; cat o in`,
+			`${different(7)}keep\na\n`,
+			0,
+		],
+		// Already GNU's answer, kept: the strings are of one length in C.UTF-8.
+		[
+			String.raw`echo keep >o; printf 'x\n' | LC_ALL=C.UTF-8 sed -e $'y/\303\251/e/' -e 'w o' 2>&1; echo $?; cat o`,
+			"x\n0\nx\n",
+			0,
+		],
 	]);
 });
 
