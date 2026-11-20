@@ -215,16 +215,41 @@ jobs:
             echo "::error title=Rust tests::a target failed to build (Bazel's FAILED TO BUILD lines above name it); no list line can account for that"
             bad=1
           fi
+          # Bazel skips, without an error and without a result in the event
+          # log, a test it finds incompatible with the runner (its own
+          # target_compatible_with or a dependency's) or one a --test_*_filters
+          # option leaves out. Every test target the pattern names, less those
+          # tagged manual, must have a result. The query takes no --bazelrc:
+          # the bazel-cache fragment's `common --config=ci` is defined for
+          # build only, and query refuses it.
+          tests="$RUNNER_TEMP/rust-test-targets.txt"
+          if ! bazelisk query --output=label 'kind("_test rule$", //crates/...) - attr(tags, "manual", //crates/...)' >"$tests.raw"; then
+            echo "::error title=Rust tests::bazel query for the test targets failed"
+            exit 1
+          fi
+          LC_ALL=C sort -u "$tests.raw" >"$tests"
+          if [ ! -s "$tests" ]; then
+            echo "::error title=Rust tests::bazel query names no test target under //crates"
+            exit 1
+          fi
+          cut -f1 "$rows" | LC_ALL=C sort -u >"$RUNNER_TEMP/rust-test-with-result.txt"
+          while read -r label; do
+            echo "::error title=Rust tests::$label is a test target, but bazel test has no result for it: skipped as incompatible with the runner, left out by a test filter, or not built"
+            bad=1
+          done < <(LC_ALL=C comm -23 "$tests" "$RUNNER_TEMP/rust-test-with-result.txt")
           # Bazel calls a target PASSED from its exit code alone, so a test
           # binary that exits 0 before libtest finishes (a test that calls
           # std::process::exit) passes there.
           # A rust_test log must hold libtest's JSON record whole: the planned
           # test_count, a result for every planned test, and the suite's end,
           # `ok` in a passed log. The failed tests are its `failed` events.
-          # A rust_doc_test log is the doctest runner's text: a passed log's
-          # last summary line must be `test result: ok.`; a failed one ends
-          # with `failures:`, each failed doctest indented four spaces, a blank
-          # line and `test result: FAILED.`, which the awk program reads.
+          # A rust_doc_test log is the doctest runner's text. Its first
+          # `running N tests` header must equal its last summary's passed +
+          # failed + ignored + measured, so a summary a child process printed
+          # does not stand for the runner's; a passed log's last summary must
+          # be `test result: ok.`. A failed one ends with `failures:`, each
+          # failed doctest indented four spaces, a blank line and `test result:
+          # FAILED.`, which the awk program reads.
           # A failed log that names no failed test (a crash, a timeout) fails
           # the job, since the list cannot account for it.
           while IFS=$'\t' read -r label rule status kind log; do
@@ -265,8 +290,23 @@ jobs:
                 echo "::endgroup::"
                 ;;
               "rust_doc_test rule")
+                counts="$(awk '
+                  !head && /^running [0-9]+ tests?$/ { head = $2 }
+                  /^test result: / {
+                    last = $0; sum = 0
+                    n = split($0, word, /[ ;]+/)
+                    for (i = 2; i <= n; i++) if (word[i] ~ /^(passed|failed|ignored|measured)$/) sum += word[i - 1]
+                  }
+                  END { printf "%s\t%s\t%s\n", (head == "" ? -1 : head), (last == "" ? -1 : sum), (last ~ /^test result: ok\./ ? "ok" : "not-ok") }
+                ' "$log")"
+                IFS=$'\t' read -r header summed verdict <<<"$counts"
+                if [ "$header" -lt 0 ] || [ "$summed" != "$header" ]; then
+                  echo "::error title=Rust tests::$label is $status, but its log's header plans $header doctests and its last summary counts $summed"
+                  bad=1
+                  continue
+                fi
                 if [ "$kind" = passed ]; then
-                  if ! awk '/^test result: / { last = $0 } END { exit !(last ~ /^test result: ok\./) }' "$log"; then
+                  if [ "$verdict" != ok ]; then
                     echo "::error title=Rust tests::$label is $status, but its log's last summary is not 'test result: ok.'"
                     bad=1
                   fi
