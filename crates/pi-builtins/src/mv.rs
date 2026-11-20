@@ -501,7 +501,7 @@ fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Option
 			host.fail(1);
 			Ok(())
 		},
-		Err(e) if target_is_dir => Err(MvFailure::Message(format!(
+		Err(e) if target_is_dir && !is_refusal(&e) => Err(MvFailure::Message(format!(
 			"cannot move {} to {}: {e}",
 			source.quote(),
 			target.quote()
@@ -725,7 +725,11 @@ fn move_files_into_dir(host: &mut Host, files: &[PathBuf], target_dir: &Path, op
 		match rename(host, sourcepath, &targetpath, options, display_manager.as_ref(), &mut copier) {
 			Err(e) if e.to_string().is_empty() => host.fail(1),
 			Err(e) => {
-				let e = format!("cannot move {} to {}: {e}", sourcepath.quote(), targetpath.quote());
+				let e = if is_refusal(&e) {
+					e.to_string()
+				} else {
+					format!("cannot move {} to {}: {e}", sourcepath.quote(), targetpath.quote())
+				};
 				if let Some(pb) = &display_manager {
 					pb.suspend(|| show(host, e));
 				} else {
@@ -802,6 +806,24 @@ fn rename(
 		}
 	}
 
+	// A directory replaces only a directory, as GNU mv decides before it moves
+	// anything. On one file system `rename(2)` refuses any other destination
+	// too (`ENOTDIR`), but across file systems it fails with `EXDEV` before it
+	// looks at the types, and the copy would remove the file or the link in
+	// the directory's place. A backup has moved the destination aside above.
+	if filesystem
+		.symlink_metadata(&from_fs)
+		.is_ok_and(|from| from.file_type().is_dir())
+		&& filesystem
+			.symlink_metadata(&to_fs)
+			.is_ok_and(|to| !to.file_type().is_dir())
+	{
+		return Err(io::Error::other(MvError::NonDirectoryToDirectory(
+			from.quote().to_string(),
+			to.quote().to_string(),
+		)));
+	}
+
 	// "to" may no longer exist if it was backed up
 	if filesystem.exists(&to_fs) && filesystem.is_dir(&to_fs) && !filesystem.is_symlink(&to_fs) {
 		// normalize behavior between *nix and windows
@@ -841,6 +863,12 @@ fn rename(
 /// move may be completed by copying and removing.
 fn crosses_devices(error: &io::Error) -> bool {
 	error.kind() == io::ErrorKind::CrossesDevices
+}
+
+/// Whether a failed move is one of mv's own refusals ([`MvError`]), whose
+/// message names both paths, as GNU's does.
+fn is_refusal(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<MvError>())
 }
 
 /// A wrapper around `rename`, so that if it fails, we try falling back on
@@ -883,10 +911,19 @@ fn rename_with_fallback(
 	};
 
 	// The copy replaces the destination as the rename would have: a
-	// directory is not merged into, a file is not written through.
+	// directory is not merged into, a file is not written through. A
+	// directory replaces only a directory: `rename` refused any other
+	// destination, and one put there since is refused the same way.
 	if file_type.is_dir() {
-		if filesystem.exists(&to_fs) {
-			remove_moved_tree(host, to, &to_fs)?;
+		match filesystem.symlink_metadata(&to_fs) {
+			Ok(to_meta) if to_meta.file_type().is_dir() => remove_moved_tree(host, to, &to_fs)?,
+			Ok(_) => {
+				return Err(io::Error::other(MvError::NonDirectoryToDirectory(
+					from.quote().to_string(),
+					to.quote().to_string(),
+				)));
+			},
+			Err(_) => {},
 		}
 	} else if filesystem.is_symlink(&to_fs) {
 		filesystem.remove_file(&to_fs).map_err(|err| {
