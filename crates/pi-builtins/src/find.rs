@@ -6139,13 +6139,9 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn printf_into_closed_pipe_stops_without_panicking() {
-		use crate::openfile::OpenFile;
-
 		let (_dir, root) = fixture();
 		let (mut host, capture) = crate::host::Host::for_test("find", "", &root);
-		let (reader, writer) = std::io::pipe().unwrap();
-		drop(reader);
-		host.set_test_stdout(OpenFile::from(writer));
+		host.set_test_stdout(crate::host::widowed_pipe());
 
 		let outcome = run_unguarded(&mut host, &[".", "-printf", "%p\n"]).await;
 		assert!(outcome.is_ok(), "find panicked writing to a closed pipe");
@@ -6159,15 +6155,11 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn diagnostic_into_closed_pipe_does_not_panic() {
-		use crate::openfile::OpenFile;
-
 		use crate::host::StreamWriter;
 
 		let (_dir, root) = fixture();
 		let (mut host, _capture) = crate::host::Host::for_test("find", "", &root);
-		let (reader, writer) = std::io::pipe().unwrap();
-		drop(reader);
-		host.stderr = StreamWriter::line(OpenFile::from(writer));
+		host.stderr = StreamWriter::line(crate::host::widowed_pipe());
 
 		// The test host cannot run commands, so `-exec` reports a diagnostic.
 		let outcome =

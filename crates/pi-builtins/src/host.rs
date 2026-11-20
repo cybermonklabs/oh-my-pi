@@ -3476,6 +3476,56 @@ mod testing {
 		assert!(super::pollable_fd(&OpenFile::from(reader)).is_some());
 	}
 
+	/// The write end of a pipe that no process reads, as `… | head -1` leaves
+	/// the writer once `head` has exited: every write to it fails with `EPIPE`.
+	///
+	/// Dropping the read end is not enough here. The tests run as threads of
+	/// one process, and a child that another test forks while the read end is
+	/// open (a `Command`'s child before it execs, or a `fork` that never
+	/// execs) holds a copy of it, so writes still land in the pipe until that
+	/// child execs or exits. This returns once no process holds a read end.
+	#[cfg(unix)]
+	pub(crate) fn widowed_pipe() -> OpenFile {
+		let (reader, writer) = std::io::pipe().expect("pipe");
+		drop(reader);
+		widow(OpenFile::from(writer), || std::thread::sleep(std::time::Duration::from_millis(1)))
+	}
+
+	/// Returns `writer` once no process holds a read end of its pipe, calling
+	/// `while_read` each time one still does. Panics after a minute, so a
+	/// read end that never closes fails the test instead of hanging it.
+	#[cfg(unix)]
+	fn widow(writer: OpenFile, mut while_read: impl FnMut()) -> OpenFile {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+		while !writer.reader_gone() {
+			assert!(std::time::Instant::now() < deadline, "a read end of the pipe is still open after 60 s");
+			while_read();
+		}
+		writer
+	}
+
+	/// A child holding a copy of the read end, as a child another test forks
+	/// while the read end is open does, keeps the pipe read after this process
+	/// drops its own: a write still succeeds. [`widow`] waits for that child.
+	#[cfg(unix)]
+	#[test]
+	fn a_widowed_pipe_waits_for_a_child_that_holds_its_read_end() {
+		let (reader, writer) = std::io::pipe().unwrap();
+		let mut holder = std::process::Command::new("sleep").arg("600").stdin(reader).spawn().unwrap();
+		let mut writer = OpenFile::from(writer);
+		writer.write_all(b"x").expect("the child's copy of the read end keeps the pipe read");
+		let mut waits = 0;
+		let mut writer = widow(writer, || {
+			waits += 1;
+			if waits == 1 {
+				holder.kill().unwrap();
+				holder.wait().unwrap();
+			}
+		});
+		assert!(waits >= 1, "widow returned while the child held the read end");
+		assert_eq!(writer.write(b"x").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn resolves_msys_and_tmp_aliases_to_native_locations() {
@@ -4363,9 +4413,7 @@ mod testing {
 		#[tokio::test]
 		async fn closed_reader_in_the_final_drain_yields_141_and_silences_stderr() {
 			let (mut host, capture) = Host::for_test_async("chatty", "", "/");
-			let (reader, writer) = std::io::pipe().unwrap();
-			drop(reader);
-			host.set_test_stdout(OpenFile::from(writer));
+			host.set_test_stdout(crate::host::widowed_pipe());
 
 			let code = run_caught_async::<Chatty>(Chatty, &mut host).await;
 
@@ -4530,7 +4578,7 @@ mod testing {
 	mod sigpipe {
 		use std::ffi::OsString;
 
-		use crate::host::{Host, OpenFile, SIGPIPE_EXIT_CODE, Utility, Write, run_caught};
+		use crate::host::{Host, SIGPIPE_EXIT_CODE, Utility, Write, run_caught};
 
 		/// A port written the naive way: any write failure is a diagnostic on
 		/// stderr plus exit 1. Nothing in it knows about broken pipes.
@@ -4559,9 +4607,7 @@ mod testing {
 
 		fn closed_pipe_host(args: &[&str]) -> (i32, super::Capture) {
 			let (mut host, capture) = Host::for_test("naive", "", "/");
-			let (reader, writer) = std::io::pipe().unwrap();
-			drop(reader);
-			host.set_test_stdout(OpenFile::from(writer));
+			host.set_test_stdout(super::widowed_pipe());
 			let argv: Vec<OsString> =
 				std::iter::once("naive").chain(args.iter().copied()).map(OsString::from).collect();
 			let parsed = <NaiveWriter as clap::Parser>::try_parse_from(argv).unwrap();
@@ -4599,7 +4645,7 @@ pub(crate) use testing::tree_with_sparse_file;
 pub(crate) use testing::run_extra_with;
 #[cfg(all(test, unix))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Refused, Refusing, on_path};
+pub(crate) use testing::{Refused, Refusing, on_path, widowed_pipe};
 #[cfg(all(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{SHOW_ARGS, lines_run};
