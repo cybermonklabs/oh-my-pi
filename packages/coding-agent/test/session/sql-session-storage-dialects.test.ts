@@ -19,7 +19,7 @@ import {
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
-import { reserveWrapped } from "./sql-session-lease-fixture";
+import { POSTGRES_TRANSACTION_POOLER, reserveWrapped } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -565,86 +565,97 @@ for (const { adapter, url } of BACKENDS) {
 			}
 		}, 60_000);
 
-		it("starts while another client holds a session row lock", async () => {
-			await using db = new Db(adapter, url ?? "");
-			const storage = await db.open();
-			await storage.writeText("/locked.jsonl", "locked\n");
-			const starter = await db.lockBoundClient();
+		// On PostgreSQL, direct connection only: the starter's 1 s lock bound is its connection's start parameter
+		// (`lockBoundClient`), which a transaction pooler does not pass on.
+		it.skipIf(adapter === "postgres" && POSTGRES_TRANSACTION_POOLER)(
+			"starts while another client holds a session row lock",
+			async () => {
+				await using db = new Db(adapter, url ?? "");
+				const storage = await db.open();
+				await storage.writeText("/locked.jsonl", "locked\n");
+				const starter = await db.lockBoundClient();
 
-			const release = Promise.withResolvers<void>();
-			const locked = Promise.withResolvers<void>();
-			const holder = db.client.transaction(async transaction => {
-				await transaction.unsafe(
-					`SELECT byte_len FROM ${db.table} WHERE path = ${adapter === "postgres" ? "$1" : "?"} FOR UPDATE`,
-					["/locked.jsonl"],
-				);
-				locked.resolve();
-				await release.promise;
-			});
-			await locked.promise;
-			try {
-				const started = await db.open({ client: starter });
-				expect(started.statSync("/locked.jsonl").size).toBe(7);
-			} finally {
-				release.resolve();
-				await holder;
-			}
-		});
-
-		it("leaves no orphan part when a peer appends to an artifact while its session is deleted", async () => {
-			await using db = new Db(adapter, url ?? "");
-			const session = "/race/s1.jsonl";
-			const artifact = "/race/s1/sub.jsonl";
-			const seed = await db.open();
-			await seed.writeText(session, "session head\n");
-			await seed.writeText(artifact, "");
-			// The peer gives up on a lock after 1 s, so a peer the delete blocks
-			// fails on its own instead of waiting for a commit that waits on it.
-			const peerClient = await db.lockBoundClient();
-			const peer = await db.open({ client: peerClient });
-
-			// Pause the delete right after its first statement on the session's
-			// parts, and let the peer append to the artifact meanwhile: the peer
-			// either commits or times out on a lock the delete holds.
-			let peerOutcome: unknown;
-			const run = async (sql: string, values: unknown[] | undefined, executor: SqlSessionStorageTransaction) => {
-				const result = await executor.unsafe(sql, values);
-				if (peerOutcome === undefined && sql.includes(`${db.table}_parts`) && values?.includes(session)) {
-					const writer = peer.openWriter(artifact);
-					peerOutcome = await writer.append("peer line\n").then(
-						() => writer.close().then(() => "appended"),
-						(error: unknown) => error,
+				const release = Promise.withResolvers<void>();
+				const locked = Promise.withResolvers<void>();
+				const holder = db.client.transaction(async transaction => {
+					await transaction.unsafe(
+						`SELECT byte_len FROM ${db.table} WHERE path = ${adapter === "postgres" ? "$1" : "?"} FOR UPDATE`,
+						["/locked.jsonl"],
 					);
+					locked.resolve();
+					await release.promise;
+				});
+				await locked.promise;
+				try {
+					const started = await db.open({ client: starter });
+					expect(started.statSync("/locked.jsonl").size).toBe(7);
+				} finally {
+					release.resolve();
+					await holder;
 				}
-				return result;
-			};
-			const pausing: SqlSessionStorageClient = {
-				options: db.client.options,
-				unsafe: (sql, values) => run(sql, values, db.client),
-				transaction: work =>
-					db.client.transaction(async transaction =>
-						work({ unsafe: (sql, values) => run(sql, values, transaction) }),
-					),
-				...reserveWrapped(db.client, connection => ({ unsafe: (sql, values) => run(sql, values, connection) })),
-			};
-			const deleter = await SqlSessionStorage.create({ client: pausing, table: db.table });
-			await deleter.deleteSessionWithArtifacts(session);
-			if (peerOutcome !== "appended") {
-				expect(peerOutcome).toMatchObject({ errno: adapter === "postgres" ? "55P03" : 1205 });
-			}
+			},
+		);
 
-			const orphans = (await db.client.unsafe(
-				`SELECT path, start_offset FROM ${db.table}_parts WHERE path NOT IN (SELECT path FROM ${db.table})`,
-			)) as unknown[];
-			expect([...orphans]).toEqual([]);
-			const later = await db.open();
-			const writer = later.openWriter(artifact);
-			await writer.append("later line\n");
-			await writer.close();
-			const stored = await db.stored(artifact);
-			expect(stored?.endsWith("later line\n")).toBe(true);
-			expect((await db.open()).statSync(artifact).size).toBe(Buffer.byteLength(stored ?? ""));
-			expect(await db.stored(session)).toBeNull();
-		});
+		// On PostgreSQL, direct connection only: the peer's 1 s lock bound is its connection's start parameter
+		// (`lockBoundClient`), which a transaction pooler does not pass on; without it the peer waits on the delete,
+		// which waits on the peer.
+		it.skipIf(adapter === "postgres" && POSTGRES_TRANSACTION_POOLER)(
+			"leaves no orphan part when a peer appends to an artifact while its session is deleted",
+			async () => {
+				await using db = new Db(adapter, url ?? "");
+				const session = "/race/s1.jsonl";
+				const artifact = "/race/s1/sub.jsonl";
+				const seed = await db.open();
+				await seed.writeText(session, "session head\n");
+				await seed.writeText(artifact, "");
+				// The peer gives up on a lock after 1 s, so a peer the delete blocks
+				// fails on its own instead of waiting for a commit that waits on it.
+				const peerClient = await db.lockBoundClient();
+				const peer = await db.open({ client: peerClient });
+
+				// Pause the delete right after its first statement on the session's
+				// parts, and let the peer append to the artifact meanwhile: the peer
+				// either commits or times out on a lock the delete holds.
+				let peerOutcome: unknown;
+				const run = async (sql: string, values: unknown[] | undefined, executor: SqlSessionStorageTransaction) => {
+					const result = await executor.unsafe(sql, values);
+					if (peerOutcome === undefined && sql.includes(`${db.table}_parts`) && values?.includes(session)) {
+						const writer = peer.openWriter(artifact);
+						peerOutcome = await writer.append("peer line\n").then(
+							() => writer.close().then(() => "appended"),
+							(error: unknown) => error,
+						);
+					}
+					return result;
+				};
+				const pausing: SqlSessionStorageClient = {
+					options: db.client.options,
+					unsafe: (sql, values) => run(sql, values, db.client),
+					transaction: work =>
+						db.client.transaction(async transaction =>
+							work({ unsafe: (sql, values) => run(sql, values, transaction) }),
+						),
+					...reserveWrapped(db.client, connection => ({ unsafe: (sql, values) => run(sql, values, connection) })),
+				};
+				const deleter = await SqlSessionStorage.create({ client: pausing, table: db.table });
+				await deleter.deleteSessionWithArtifacts(session);
+				if (peerOutcome !== "appended") {
+					expect(peerOutcome).toMatchObject({ errno: adapter === "postgres" ? "55P03" : 1205 });
+				}
+
+				const orphans = (await db.client.unsafe(
+					`SELECT path, start_offset FROM ${db.table}_parts WHERE path NOT IN (SELECT path FROM ${db.table})`,
+				)) as unknown[];
+				expect([...orphans]).toEqual([]);
+				const later = await db.open();
+				const writer = later.openWriter(artifact);
+				await writer.append("later line\n");
+				await writer.close();
+				const stored = await db.stored(artifact);
+				expect(stored?.endsWith("later line\n")).toBe(true);
+				expect((await db.open()).statSync(artifact).size).toBe(Buffer.byteLength(stored ?? ""));
+				expect(await db.stored(session)).toBeNull();
+			},
+		);
 	});
 }
