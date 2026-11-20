@@ -27,7 +27,8 @@ const CASES = [
 
 /** Why the cases cannot use `url`, or undefined when they can (PostgreSQL 17 or later, reached directly). */
 async function unfitFor(url: string): Promise<string | undefined> {
-	const sql = new SQL(url, { max: 1 });
+	// A server that never answers holds the file's load 5 s at most, as the transaction test's own read.
+	const sql = new SQL(url, { max: 1, connectionTimeout: 5 });
 	try {
 		const direct = await reachesPostgresDirectly(sql, url);
 		const [row] = (await sql.unsafe(
