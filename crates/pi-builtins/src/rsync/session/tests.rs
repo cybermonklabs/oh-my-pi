@@ -512,6 +512,15 @@ fn cancel_mid_connection_exits_20_with_trailer() {
 /// stops its server half, whose generator reports SIGUSR1. Captured from
 /// rsync 3.5.1 (`rsync -a bigsrc/ dst/`, SIGTERM to the client), three runs:
 /// exactly these two lines, exit 20.
+///
+/// The test cancels once the copy is under way (the receiver's file in `dst`
+/// holds bytes), not at a fixed time, and asserts what the cancellation did,
+/// not the wall clock: exit 20, both lines, and a copy that stopped short.
+/// `--bwlimit=100` makes the whole copy take about 80 s, so a slow machine
+/// lengthens the run but cannot finish the copy before the cancel. The bound
+/// the product itself keeps is in the second line: the client waits at most
+/// 10 s for its server half to stop, and reports the first line alone when
+/// it does not.
 #[test]
 fn cancel_local_copy_reports_like_upstream() {
 	use clap::Parser as _;
@@ -520,22 +529,34 @@ fn cancel_local_copy_reports_like_upstream() {
 	fs::write(dir.path().join("bigsrc/f"), vec![0u8; 8 << 20]).unwrap();
 	let (mut host, cap) = crate::host::Host::for_test_owning("rsync", Vec::new(), dir.path());
 	let cancel = host.cancel_flag_for_test();
+	let ended = Arc::new(AtomicBool::new(false));
+	let (dst, run_ended) = (dir.path().join("dst"), Arc::clone(&ended));
 	let canceller = std::thread::spawn(move || {
-		std::thread::sleep(Duration::from_millis(500));
+		let deadline = Instant::now() + Duration::from_secs(120);
+		let under_way = || {
+			fs::read_dir(&dst)
+				.into_iter()
+				.flatten()
+				.flatten()
+				.any(|entry| entry.metadata().is_ok_and(|meta| meta.len() > 0))
+		};
+		while !under_way() && !run_ended.load(Ordering::Relaxed) && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(10));
+		}
 		cancel.store(true, Ordering::Relaxed);
 	});
-	// --bwlimit keeps the copy running well past the cancellation.
-	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "--bwlimit=500", "bigsrc/", "dst/"]).unwrap();
-	let started = Instant::now();
+	let parsed = Rsync::try_parse_from(["rsync", "--", "-a", "--bwlimit=100", "bigsrc/", "dst/"]).unwrap();
 	let code = crate::host::run_caught::<Rsync>(parsed, &mut host);
+	ended.store(true, Ordering::Relaxed);
 	canceller.join().unwrap();
 	assert_eq!(code, RERR_SIGNAL);
-	assert!(started.elapsed() < Duration::from_secs(10), "cancellation was not prompt");
 	assert_eq!(
 		cap.err(),
 		"rsync error: received SIGINT, SIGTERM, or SIGHUP (code 20) at rsync.c(874) [sender=3.5.1]\n\
 		 rsync error: received SIGUSR1 (code 19) at main.c(1687) [generator=3.5.1]\n"
 	);
+	let copied = fs::metadata(dir.path().join("dst/f")).map_or(0, |meta| meta.len());
+	assert!(copied < 8 << 20, "the copy ran to its end: the cancellation did not stop it");
 }
 
 /// A cancelled run ends with upstream's signal exit (code 20).
