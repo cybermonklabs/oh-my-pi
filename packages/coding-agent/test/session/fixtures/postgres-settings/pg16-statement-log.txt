@@ -1,0 +1,24 @@
+2026-11-20 03:36:19.151 UTC pid=28 app= code=00000 LOG:  starting PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-11-20 03:36:19.151 UTC pid=28 app= code=00000 LOG:  listening on Unix socket "/tmp/pg/.s.PGSQL.5432"
+2026-11-20 03:36:19.155 UTC pid=31 app= code=00000 LOG:  database system was shut down at 2026-11-20 03:36:19 UTC
+2026-11-20 03:36:19.162 UTC pid=28 app= code=00000 LOG:  database system is ready to accept connections
+2026-11-20 03:36:19.250 UTC pid=40 app=psql code=00000 LOG:  statement: CREATE ROLE norights NOLOGIN; CREATE TABLE public.t (k text PRIMARY KEY, v bigint); INSERT INTO public.t VALUES ('a', 1); GRANT norights TO postgres;
+2026-11-20 03:36:19.267 UTC pid=46 app=psql code=00000 LOG:  statement: BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SET LOCAL application_name = 'omp-session-store'; SET LOCAL statement_timeout TO DEFAULT; SET LOCAL search_path = pg_catalog, pg_temp
+2026-11-20 03:36:19.268 UTC pid=46 app=omp-session-store code=00000 LOG:  execute <unnamed>: SELECT v FROM public.t WHERE k = $1 
+2026-11-20 03:36:19.268 UTC pid=46 app=omp-session-store code=00000 LOG:  statement: COMMIT
+2026-11-20 03:36:19.280 UTC pid=52 app=psql code=00000 LOG:  statement: BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SET LOCAL application_name = 'omp-session-store'
+2026-11-20 03:36:19.280 UTC pid=52 app=omp-session-store code=00000 LOG:  statement: UPDATE public.t SET v = v + 1 WHERE k = $omp$a$omp$ RETURNING k; COMMIT
+2026-11-20 03:36:19.293 UTC pid=58 app=psql code=00000 LOG:  statement: SET SESSION AUTHORIZATION norights
+2026-11-20 03:36:19.293 UTC pid=58 app=psql code=00000 LOG:  statement: BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SET LOCAL application_name = 'omp-session-store'; SET LOCAL role TO DEFAULT
+2026-11-20 03:36:19.293 UTC pid=58 app=omp-session-store code=00000 LOG:  statement: UPDATE public.t SET v = 0 WHERE k = 'a'
+2026-11-20 03:36:19.294 UTC pid=58 app=omp-session-store code=42501 ERROR:  permission denied for table t
+2026-11-20 03:36:19.294 UTC pid=58 app=omp-session-store code=42501 STATEMENT:  UPDATE public.t SET v = 0 WHERE k = 'a'
+2026-11-20 03:36:19.294 UTC pid=58 app=psql code=00000 LOG:  statement: ROLLBACK
+2026-11-20 03:36:19.304 UTC pid=64 app=psql code=00000 LOG:  statement: BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SET LOCAL application_name = 'omp-session-store'; SET LOCAL cloudsql_session_read_only TO DEFAULT
+2026-11-20 03:36:19.304 UTC pid=64 app=omp-session-store code=42704 ERROR:  unrecognized configuration parameter "cloudsql_session_read_only"
+2026-11-20 03:36:19.304 UTC pid=64 app=omp-session-store code=42704 STATEMENT:  BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SET LOCAL application_name = 'omp-session-store'; SET LOCAL cloudsql_session_read_only TO DEFAULT
+2026-11-20 03:36:19.304 UTC pid=64 app=psql code=00000 LOG:  statement: ROLLBACK
+2026-11-20 03:36:19.313 UTC pid=70 app=psql code=00000 LOG:  statement: /* left-setting-test */ SET transaction_read_only = on
+2026-11-20 03:36:19.313 UTC pid=70 app=psql code=00000 LOG:  statement: /* left-setting-test */ SET bytea_output = 'escape'
+2026-11-20 03:36:19.324 UTC pid=78 app=psql code=00000 LOG:  statement: SET idle_session_timeout = '200ms';
+2026-11-20 03:36:19.524 UTC pid=78 app=psql code=57P05 FATAL:  terminating connection due to idle-session timeout
