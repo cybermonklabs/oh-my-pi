@@ -635,7 +635,7 @@ const BLOB_READ_BATCH = 100;
 const BLOB_READ_BYTES = 16 * 1024 * 1024;
 /**
  * Tries of one blob write before the transcript write waiting for it fails; the blob stays queued for the next.
- * A PostgreSQL error whose repairless retries are spent ends them at once (see {@link spentRepairs}).
+ * An error whose repairs are spent ends them at once (see {@link SqlSessionStorageBackend.repairsSpent}).
  */
 const BLOB_WRITE_ATTEMPTS = 3;
 /** Wait before the second try of a blob write, doubled before each later one. */
@@ -724,13 +724,6 @@ function pgErrorCode(error: unknown): string | undefined {
 	const code = "code" in error ? error.code : undefined;
 	return typeof code === "string" ? code : undefined;
 }
-/**
- * The errors `#postgres` threw after its last repairless attempt: their
- * operation already ran on {@link PG_REPAIR_RETRIES} + 1 connections, and
- * each was closed, so no other retry of the store runs it again. Each error
- * stays as it was thrown; only this set marks it.
- */
-const spentRepairs = new WeakSet<object>();
 const utf8Decoder = new TextDecoder("utf-8");
 /**
  * Most bytes one `readFrom` piece asks for: PostgreSQL's substr takes integer
@@ -1746,15 +1739,26 @@ export class SqlSessionStorage extends IndexedSessionStorage {
  * image a takeover raced. A transcript write first waits for the queued
  * blobs its content names ({@link land}), so no committed transcript names a
  * blob the table lacks, whatever stops the writer; a write that names none
- * waits for none. A blob write is tried {@link BLOB_WRITE_ATTEMPTS} times,
- * except after a PostgreSQL error whose repairless retries are spent (see
- * {@link spentRepairs}), which fails it at once: a land that meets only
- * connections no transaction can repair closes {@link PG_REPAIR_RETRIES} + 1
- * of them. A blob write that still fails stays queued and fails the
- * transcript writes naming it, which the session reports as a persistence
- * error, and the next such write tries it again. Writes run one after
- * another, so a burst of images holds one connection at a time; one that
- * fails does not stop the others.
+ * waits for none. A blob write is tried {@link BLOB_WRITE_ATTEMPTS} times. A
+ * blob write that still fails stays queued and fails the transcript writes
+ * naming it, which the session reports as a persistence error, and the next
+ * such write tries it again. Each land is one pass over the queued blobs,
+ * one write after another, so a burst of images holds one connection at a
+ * time; a blob that fails does not stop the others, but an error whose
+ * repairs are spent ({@link SqlSessionStorageBackend.repairsSpent}) fails
+ * its blob at once and ends the pass: each queued blob the pass did not try
+ * fails with that error as its cause and stays queued.
+ *
+ * So on PostgreSQL connections no transaction can repair, each land makes at
+ * most {@link PG_REPAIR_RETRIES} + 1 attempts (4) and closes as many
+ * connections. A transcript write that names n newly stored images meets at
+ * most n + 1 lands (each image's own, which {@link store} starts, and the
+ * write's), so it closes at most 4(n + 1); one whose transaction then finds
+ * k of the blobs it names gone meets at most k + 1 more, which land them
+ * again ({@link reland}). A drain ({@link SqlSessionStorage.drain}, which
+ * lands every queued blob) is a call of its own and one land, so it closes
+ * at most 4 more, however many blobs stay queued.
+ *
  * Bytes that do not hash to their reference are never stored. A blob larger
  * than one row takes is stored as parts (see {@link BLOB_PARTS_PATH}).
  */
@@ -1825,14 +1829,33 @@ class SqlBlobTier implements SessionBlobTier {
 		return queued;
 	}
 
+	/** One land's pass over the queued blobs, in the order they were queued (see {@link SqlBlobTier}). */
 	async #landQueued(): Promise<void> {
-		for (const [hash, blob] of [...this.#queued]) {
+		const queued = [...this.#queued];
+		for (const [index, [hash, blob]] of queued.entries()) {
 			if (this.#queued.get(hash) !== blob) continue;
 			try {
 				await this.#landOne(hash, blob.data, blob.mimeType);
 				this.#failed.delete(hash);
 			} catch (err) {
-				this.#failed.set(hash, toError(err));
+				const error = toError(err);
+				this.#failed.set(hash, error);
+				// `#landOne` keeps the runner's error as the cause of its failure.
+				const spent = error.cause;
+				if (!this.#backend.repairsSpent(spent)) continue;
+				for (const [untried, rest] of queued.slice(index + 1)) {
+					if (this.#queued.get(untried) !== rest) continue;
+					this.#failed.set(
+						untried,
+						new Error(
+							`SqlSessionStorage: session image ${untried} did not reach ${this.#backend.table}_blobs, ` +
+								`so no transcript naming it is written yet: it was not tried after session image ${hash} ` +
+								`met only PostgreSQL connections no transaction can repair: ${toError(spent).message}`,
+							{ cause: spent },
+						),
+					);
+				}
+				return;
 			}
 		}
 	}
@@ -1867,8 +1890,8 @@ class SqlBlobTier implements SessionBlobTier {
 				}
 				return;
 			} catch (err) {
-				// A spent repairless error already ran the insert on PG_REPAIR_RETRIES + 1 connections.
-				if (attempt < BLOB_WRITE_ATTEMPTS && !spentRepairs.has(err as object)) {
+				// An error whose repairs are spent is not tried again (see SqlSessionStorageBackend.repairsSpent).
+				if (attempt < BLOB_WRITE_ATTEMPTS && !this.#backend.repairsSpent(err)) {
 					await Bun.sleep(BLOB_RETRY_MS * 2 ** (attempt - 1));
 					continue;
 				}
@@ -2104,6 +2127,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * has read at start-up which of them this server takes, then with those.
 	 */
 	#openings = PG_PROBE_OPENINGS;
+	/** The errors {@link #postgres} threw after its last repairless attempt (see {@link repairsSpent}). */
+	readonly #spentRepairs = new WeakSet<object>();
 	/** The blob table's writes and reads; every content write below waits for the blobs queued before it. */
 	readonly blobs: SqlBlobTier = new SqlBlobTier(this);
 
@@ -3112,8 +3137,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *   connection, so no caller gets it again, writes
 	 *   {@link PG_REPAIR_WARNING}, and runs the attempt again on a new one, at
 	 *   most {@link PG_REPAIR_RETRIES} times. The last attempt's error is
-	 *   thrown, marked (see {@link spentRepairs}), so no other retry of
-	 *   the store runs the operation again.
+	 *   thrown, marked for {@link repairsSpent}.
 	 * - The connection ended after the opening's answer, `COMMIT` included:
 	 *   the store closes it and throws, and runs nothing again, since whether
 	 *   `work` committed is unknown and an append is not idempotent.
@@ -3121,12 +3145,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 *   the error thrown. When the `ROLLBACK` fails, the store closes the
 	 *   connection and throws the first error.
 	 * - A refused `reserve()` is thrown as it is.
-	 * The store's other retries (a deadlock victim, a move's key collision, a
-	 * blob write) each run a whole call again. None follows a marked error:
-	 * PostgreSQL answers no opening with a deadlock or a key collision, and a
-	 * blob write fails at once on one. `work` must never wait for
-	 * another transaction of this store: in a pool of one server connection it
-	 * would wait for its own.
+	 * `work` must never wait for another transaction of this store: in a pool
+	 * of one server connection it would wait for its own.
 	 */
 	async #postgres<T>(
 		operation: PgOperation,
@@ -3162,7 +3182,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 						attempt,
 					});
 					if (attempt <= PG_REPAIR_RETRIES) continue;
-					if (typeof err === "object" && err !== null) spentRepairs.add(err);
+					if (typeof err === "object" && err !== null) this.#spentRepairs.add(err);
 					throw err;
 				}
 				if (pgErrorCode(err) === "ERR_POSTGRES_CONNECTION_CLOSED") {
@@ -3186,6 +3206,26 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			return result;
 		}
+	}
+
+	/**
+	 * Whether `err` is the error {@link #postgres} threw after its last
+	 * repairless attempt. Its operation then ran on {@link PG_REPAIR_RETRIES}
+	 * + 1 connections and closed each, so no retry of the store runs it
+	 * again: its blob write is not tried again, and the land of that write
+	 * tries no other queued blob (see {@link SqlBlobTier}). The store's other
+	 * retries, a deadlock victim's and a move's key collision's, never meet
+	 * such an error: PostgreSQL answers no opening with a deadlock or a key
+	 * collision, and 25006, 42501 and a closed connection are neither. Only
+	 * `#postgres` marks an error, so on MySQL and SQLite no error is one. The
+	 * mark is on the error object as `#postgres` threw it, and each layer
+	 * between it and the tier rethrows that same object: {@link #retryDeadlocks}
+	 * (a marked error is no deadlock), {@link #transaction},
+	 * {@link #fencedTransaction} (nor a fence refusal) and {@link insertBlob}.
+	 * The tier's failure of that blob keeps it as its cause.
+	 */
+	repairsSpent(err: unknown): boolean {
+		return typeof err === "object" && err !== null && this.#spentRepairs.has(err);
 	}
 
 	/**

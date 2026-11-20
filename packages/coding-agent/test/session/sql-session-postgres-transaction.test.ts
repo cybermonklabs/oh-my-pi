@@ -930,21 +930,18 @@ describe("the transaction runner's state table", () => {
 		expect(error).toMatchObject({ errno: "42501", message: serverMessage("42501", tried.at(-1)?.number ?? 0) });
 	});
 
-	it("12, for a blob land: on repairless connections alone, one land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more, and rejects with the fourth attempt's error as its cause", async () => {
+	it("12, for a blob land: on repairless connections alone, each land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more; a store() and the reference after it are two lands, and the reference rejects naming the image, with the last attempt's error as its cause", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
 		const attempts = PG_REPAIR_RETRIES + 1;
 		// From now on every opening is refused, as on connections left with `cloudsql_session_read_only = locked`.
 		fake.server.refuse.push({ match: /^BEGIN /, sqlstate: "25006" });
-		// `store()` starts the blob's land at once; the case reads that land's outcome.
-		const land = vi.spyOn(storage.blobTier as unknown as { land(hashes?: Iterable<string>): Promise<void> }, "land");
+		// The land `store()` starts, then the land the reference waits for.
 		storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
-		expect(land).toHaveBeenCalledTimes(1);
-		const [landing] = land.mock.results;
-		const error = await rejection(landing?.value as Promise<void>);
+		const error = await rejection(storage.blobTier.reference(FILE, [IMAGE_HASH]));
 		const tried = fake.connections.slice(from);
 		const closes = tried.reduce((sum, connection) => sum + connection.closes, 0);
-		expect({ reserved: tried.length, closes }).toEqual({ reserved: attempts, closes: attempts });
+		expect({ reserved: tried.length, closes }).toEqual({ reserved: 2 * attempts, closes: 2 * attempts });
 		expect(tried.map(ends)).toEqual(tried.map(() => ({ releases: 0, closes: 1 })));
 		expect(tried.map(sqls)).toEqual(tried.map(() => [WRITE_OPENING]));
 		expect(repairs()).toEqual(
@@ -952,7 +949,7 @@ describe("the transaction runner's state table", () => {
 				operation: "blob.insert",
 				sqlstate: "25006",
 				message: serverMessage("25006", connection.number),
-				attempt: index + 1,
+				attempt: (index % attempts) + 1,
 			})),
 		);
 		expect(error).toBeInstanceOf(Error);
@@ -963,6 +960,61 @@ describe("the transaction runner's state table", () => {
 			errno: "25006",
 			message: serverMessage("25006", tried.at(-1)?.number ?? 0),
 		});
+	});
+
+	it("12, for a write naming two new images: each land stops at its first blob write whose repairs are spent, so the append meets three lands and closes at most 3 × (PG_REPAIR_RETRIES + 1) connections, a drain one land more; both images stay queued, and land once the connections are clean", async () => {
+		const repairs = watchRepairs();
+		const { fake, storage, from } = await openOnFake();
+		const attempts = PG_REPAIR_RETRIES + 1;
+		const tried = () => fake.connections.slice(from);
+		const closes = () => tried().reduce((sum, connection) => sum + connection.closes, 0);
+		fake.server.refuse.push({ match: /^BEGIN /, sqlstate: "25006" });
+		// Each store() starts a land, and the append a third; every pass tries the image first, since it was queued first.
+		storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
+		storage.blobTier.store(ICON_HASH, ICON, "image/png");
+		const writer = storage.openWriter(FILE);
+		// The line names the icon first, which no pass tries: the append's rejection says why.
+		const line = `{"type":"message","images":["blob:sha256:${ICON_HASH}","blob:sha256:${IMAGE_HASH}"]}\n`;
+		const error = await rejection(writer.append(line));
+		expect({ reserved: tried().length, closes: closes() }).toEqual({ reserved: 3 * attempts, closes: 3 * attempts });
+		expect(tried().map(ends)).toEqual(tried().map(() => ({ releases: 0, closes: 1 })));
+		expect(repairs()).toEqual(
+			tried().map((connection, index) => ({
+				operation: "blob.insert",
+				sqlstate: "25006",
+				message: serverMessage("25006", connection.number),
+				attempt: (index % attempts) + 1,
+			})),
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toStartWith(
+			`SqlSessionStorage: session image ${ICON_HASH} did not reach omp_session_files_blobs, `,
+		);
+		expect((error as Error).message).toContain(
+			`it was not tried after session image ${IMAGE_HASH} met only PostgreSQL connections no transaction can repair`,
+		);
+		expect((error as Error).cause).toMatchObject({
+			errno: "25006",
+			message: serverMessage("25006", tried().at(-1)?.number ?? 0),
+		});
+		// A drain first reports a failed write it waited for: this one rejects with the append's failure and lands nothing.
+		expect(await rejection(storage.drain())).toBe(error);
+		expect(closes()).toBe(3 * attempts);
+		// The next is one land, whose pass stops at the image: the icon stays queued with it.
+		await storage.drain();
+		expect({ reserved: tried().length, closes: closes() }).toEqual({ reserved: 4 * attempts, closes: 4 * attempts });
+		expect(repairs()).toHaveLength(4 * attempts);
+		expect(fake.server.blobs.size).toBe(0);
+		// Clean connections again: the next drain lands both, so both were still queued.
+		fake.server.refuse.length = 0;
+		await storage.drain();
+		const landed = tried().slice(4 * attempts);
+		expect(landed.map(ends)).toEqual([
+			{ releases: 1, closes: 0 },
+			{ releases: 1, closes: 0 },
+		]);
+		expect(new Set(fake.server.blobs.keys())).toEqual(new Set([IMAGE_HASH, ICON_HASH]));
+		expect(repairs()).toHaveLength(4 * attempts);
 	});
 
 	it("13. any repairless, three repairless attempts then a clean one: three close() calls, the operation resolves on the fourth reservation", async () => {
