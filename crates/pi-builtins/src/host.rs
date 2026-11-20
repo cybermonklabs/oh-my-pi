@@ -1650,24 +1650,16 @@ pub fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd
 
 /// Whether the program at `path` is a `#!` script whose interpreter the
 /// system cannot reach by its path: the interpreter its first line names
-/// ([`shebang_interpreter`]; relative to `cwd` when relative) is past
+/// ([`script_interpreter`]; relative to `cwd` when relative) is past
 /// `PATH_MAX` or holds a name past `NAME_MAX`, or looking it up fails with
 /// `ENAMETOOLONG` (a symlink on its way names one). Only read for an
 /// `ENAMETOOLONG` of a long line, the one refusal it decides.
 #[cfg(unix)]
 fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
-	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
-	let Ok(file) = std::fs::File::open(path) else {
+	let Some(name) = script_interpreter(path) else {
 		return false;
 	};
-	let mut head = Vec::with_capacity(256);
-	if file.take(256).read_to_end(&mut head).is_err() {
-		return false;
-	}
-	let Some(name) = shebang_interpreter(&head) else {
-		return false;
-	};
-	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(name));
+	let interpreter = cwd.join(name);
 	!path_fits(&interpreter)
 		|| std::fs::metadata(&interpreter).is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
 }
