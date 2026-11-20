@@ -159,7 +159,13 @@ jobs:
           # --keep_going: the ci config stops at the first target that fails to
           # build, and so skipped 7 of the 17 test targets in run 44694233578;
           # a release gate names every failure in one run.
-          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --build_event_json_file="$bep" //crates/... || rc=$?
+          # -Zunstable-options --format=json (the toolchain is nightly,
+          # .bazelrc): each libtest binary writes its own record to its log,
+          # the number of tests it plans and then each one's result, so a
+          # binary that exits 0 before its tests end shows, whatever a child
+          # process printed. rules_rust's doctest runner passes the arguments
+          # on to the doctest binaries and writes libtest's text summary itself.
+          bazelisk --bazelrc="$OMP_BAZEL_RC" test --keep_going --test_arg=-Zunstable-options --test_arg=--format=json --build_event_json_file="$bep" //crates/... || rc=$?
           # Bazel exits 0 when every test passed, 3 when every target built and
           # a test failed, and 1 when a target failed to build (the others
           # still built and ran). Any other code is Bazel itself failing, and
@@ -176,25 +182,30 @@ jobs:
           failed="$RUNNER_TEMP/rust-test-failed.txt"
           rows="$RUNNER_TEMP/rust-test-logs.tsv"
           awk '!/^[[:space:]]*(#|$)/ { print $1, $2 }' "$list" | LC_ALL=C sort -u >"$known"
-          # Bazel's build event log names every test target with its status and
-          # its test.log files: one row per log, target, status, which list
-          # Bazel put the log in (passed or failed) and its path. The runner's
-          # jq is 1.6, which refuses a keyword such as `label` as a variable
-          # name (run 44696018007).
-          jq -r '
-            select(.id.testSummary)
+          # Bazel's build event log names every test target with its rule, its
+          # status and its test.log files: one row per log, target, rule,
+          # status, which list Bazel put the log in (passed or failed) and its
+          # path. The runner's jq is 1.6, which refuses a keyword such as
+          # `label` as a variable name (run 44696018007).
+          jq -rs '
+            (map(select(.id.targetConfigured))
+             | map({key: .id.targetConfigured.label, value: (.configured.targetKind // "unknown")})
+             | from_entries) as $kinds
+            | .[]
+            | select(.id.testSummary)
             | .id.testSummary.label as $target
+            | ($kinds[$target] // "unknown") as $rule
             | .testSummary.overallStatus as $status
             | ([(.testSummary.passed // [])[] | ["passed", .uri]]
                + [(.testSummary.failed // [])[] | ["failed", .uri]]) as $logs
-            | if ($logs | length) == 0 then [$target, $status, "none", ""]
-              else ($logs[] | [$target, $status, .[0], (.[1] | sub("^file://"; ""))]) end
+            | if ($logs | length) == 0 then [$target, $rule, $status, "none", ""]
+              else ($logs[] | [$target, $rule, $status, .[0], (.[1] | sub("^file://"; ""))]) end
             | @tsv' "$bep" >"$rows"
           if [ ! -s "$rows" ]; then
             echo "::error title=Rust tests::the build event log names no test target, so nothing shows that any test ran"
             exit 1
           fi
-          if [ "$rc" = 3 ] && ! awk -F'\t' '$2 != "PASSED" { n++ } END { exit !n }' "$rows"; then
+          if [ "$rc" = 3 ] && ! awk -F'\t' '$3 != "PASSED" { n++ } END { exit !n }' "$rows"; then
             echo "::error title=Rust tests::bazel test reported a failed test, but its build event log names no target that did not pass"
             exit 1
           fi
@@ -206,33 +217,75 @@ jobs:
           fi
           # Bazel calls a target PASSED from its exit code alone, so a test
           # binary that exits 0 before libtest finishes (a test that calls
-          # std::process::exit) passes there. A passed log's last libtest
-          # summary line must be `test result: ok.`.
-          # libtest ends a failed run with `failures:`, then each failed test's
-          # name indented four spaces, a blank line and `test result: FAILED.`;
-          # the awk program prints that last list. A failed log with no such
-          # list (a crash, a timeout) fails the job, since the list cannot
-          # account for it.
-          while IFS=$'\t' read -r label status kind log; do
+          # std::process::exit) passes there.
+          # A rust_test log must hold libtest's JSON record whole: the planned
+          # test_count, a result for every planned test, and the suite's end,
+          # `ok` in a passed log. The failed tests are its `failed` events.
+          # A rust_doc_test log is the doctest runner's text: a passed log's
+          # last summary line must be `test result: ok.`; a failed one ends
+          # with `failures:`, each failed doctest indented four spaces, a blank
+          # line and `test result: FAILED.`, which the awk program reads.
+          # A failed log that names no failed test (a crash, a timeout) fails
+          # the job, since the list cannot account for it.
+          while IFS=$'\t' read -r label rule status kind log; do
             if [ "$kind" = none ] || [ ! -f "$log" ]; then
               echo "::error title=Rust tests::$label is $status and Bazel names no test log for it"
               bad=1
               continue
             fi
-            if [ "$kind" = passed ]; then
-              if ! awk '/^test result: / { last = $0 } END { exit !(last ~ /^test result: ok\./) }' "$log"; then
-                echo "::error title=Rust tests::$label is $status, but its log's last libtest summary is not 'test result: ok.': the test binary ended before its tests did"
+            case "$rule" in
+              "rust_test rule")
+                record="$(jq -R -s -r '
+                  [split("\n")[] | fromjson? | select(type == "object")] as $events
+                  | [($events | map(select(.type == "suite" and .event == "started")) | .[0].test_count // -1),
+                     ($events | map(select(.type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored"))) | length),
+                     ($events | map(select(.type == "suite" and (.event == "ok" or .event == "failed"))) | .[-1].event // "none")]
+                  | @tsv' "$log")"
+                IFS=$'\t' read -r planned reported ended <<<"$record"
+                if [ "$planned" -lt 0 ]; then
+                  echo "::error title=Rust tests::$label is $status and its log holds no libtest record"
+                  bad=1
+                  continue
+                fi
+                if [ "$reported" != "$planned" ] || [ "$ended" = none ]; then
+                  echo "::error title=Rust tests::$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did"
+                  bad=1
+                  continue
+                fi
+                if [ "$kind" = passed ]; then
+                  if [ "$ended" != ok ]; then
+                    echo "::error title=Rust tests::$label is $status, but libtest's suite ended $ended"
+                    bad=1
+                  fi
+                  continue
+                fi
+                names="$(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed") | .name' "$log")"
+                echo "::group::$label failures"
+                jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed") | "---- \(.name) ----\n\(.stdout // "")"' "$log"
+                echo "::endgroup::"
+                ;;
+              "rust_doc_test rule")
+                if [ "$kind" = passed ]; then
+                  if ! awk '/^test result: / { last = $0 } END { exit !(last ~ /^test result: ok\./) }' "$log"; then
+                    echo "::error title=Rust tests::$label is $status, but its log's last summary is not 'test result: ok.'"
+                    bad=1
+                  fi
+                  continue
+                fi
+                names="$(awk '
+                  /^failures:$/ { inlist = 1; names = ""; next }
+                  inlist && /^    [^ ]/ { names = names substr($0, 5) "\n"; next }
+                  inlist && /^$/ { next }
+                  /^test result: FAILED\./ { printf "%s", names }
+                  { inlist = 0; names = "" }
+                ' "$log")"
+                ;;
+              *)
+                echo "::error title=Rust tests::$label is a $rule, whose log this step cannot read"
                 bad=1
-              fi
-              continue
-            fi
-            names="$(awk '
-              /^failures:$/ { inlist = 1; names = ""; next }
-              inlist && /^    [^ ]/ { names = names substr($0, 5) "\n"; next }
-              inlist && /^$/ { next }
-              /^test result: FAILED\./ { printf "%s", names }
-              { inlist = 0; names = "" }
-            ' "$log")"
+                continue
+                ;;
+            esac
             if [ -z "$names" ]; then
               echo "::error title=Rust tests::$label is $status and its log names no failed test"
               bad=1
