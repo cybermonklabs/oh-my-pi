@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
@@ -122,11 +123,32 @@ rust_library(
     ],
 )
 
+# Tests of the real ownership rule plant a symlink owned by another user, which
+# only root outside a one-uid user namespace can do. Bazel's linux-sandbox runs
+# a test in a user namespace that maps one uid, so those tests (named by their
+# `foreign_owner` modules) run from a target of their own with no sandbox, and
+# the main target skips them. Run that target as root: otherwise each of its
+# tests prints "not run: ..." on stderr and passes. It runs the main target's
+# test binary, so the two cannot differ in what they build.
+FOREIGN_OWNER_TESTS = "::foreign_owner::"
+
 rust_test(
     name = "pi-builtins_test",
+    args = [
+        "--skip",
+        FOREIGN_OWNER_TESTS,
+    ],
     crate = ":pi-builtins",
     crate_features = PI_BUILTINS_FEATURES,
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True) + ["//crates/vendor/grep-searcher"],
+)
+
+native_test(
+    name = "pi-builtins_foreign_owner_test",
+    src = ":pi-builtins_test",
+    out = "pi-builtins_foreign_owner_test.bin",
+    args = [FOREIGN_OWNER_TESTS],
+    tags = ["no-sandbox"],
 )
