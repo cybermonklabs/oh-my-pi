@@ -305,6 +305,7 @@ export interface TurnRecoveryHost {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
+		onSkip?: () => void;
 		onError?: (error: unknown) => void;
 	}): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
@@ -3242,9 +3243,6 @@ export class TurnRecovery {
 			// Aborted during sleep - emit end event so UI can clean up
 			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 		}
-		if (this.#retryAbortController === retryAbortController) {
-			this.#retryAbortController = undefined;
-		}
 
 		// The identity-keyed removal above can miss when a context rebuild
 		// recreated the failed turn's message object between settle and retry
@@ -3267,7 +3265,15 @@ export class TurnRecovery {
 			source: "automatic-retry",
 			delayMs: 1,
 			generation,
-			shouldContinue: () => this.#retryAttempt > 0,
+			shouldContinue: () => this.#retryAttempt > 0 && !retryAbortController.signal.aborted,
+			onSkip: () => {
+				if (!retryAbortController.signal.aborted || this.#retryAbortController !== retryAbortController) return;
+				void this.#endCancelledRetry(message, this.#retryCancelStopsTurn).catch(error =>
+					logger.error("Closing a retry saga after its continuation was skipped threw", {
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			},
 			onError: error =>
 				void this.#failRetryAfterLocalContinueError(message, error).catch(failure =>
 					logger.error("Closing a retry saga after a failed local continuation threw", {

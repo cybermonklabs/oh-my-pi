@@ -5521,6 +5521,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			for (;;) {
 				try {
 					if (!this.agent.state.isStreaming) onStart?.();
+					// An Esc can abort an automatic retry after it passed scheduling checks but before
+					// `continue()` claims the agent. Recheck that retry's controller at this final boundary.
+					// Only the retry: other sources' predicates read state this run's own in-flight count
+					// changes (a queued-message drain reads `isStreaming`), so rechecking them here skips
+					// them every time, and the drain reschedules itself without end.
+					if (isAutomaticRetry && request.options.shouldContinue && !request.options.shouldContinue()) {
+						return { status: "skipped", reason: "should-continue-false" };
+					}
 					await this.agent.continue(signal);
 					return { status: "completed" };
 				} catch (error) {
