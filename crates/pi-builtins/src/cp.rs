@@ -3983,7 +3983,7 @@ mod tests {
 		if !crate::own_process::own_process() {
 			return;
 		}
-		let fixture = tempdir().unwrap();
+		let fixture = crate::deep_tree::tempdir();
 		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
 		file_chain(&fixture.path().join("src"), 100);
 		limit_descriptors(32);
@@ -4006,7 +4006,7 @@ mod tests {
 		if !crate::own_process::own_process() {
 			return;
 		}
-		let fixture = tempdir().unwrap();
+		let fixture = crate::deep_tree::tempdir();
 		let _trees = [RemoveTree(fixture.path().join("src")), RemoveTree(fixture.path().join("dst"))];
 		file_chain(&fixture.path().join("src"), 200);
 		let cwd = fixture.path().to_path_buf();

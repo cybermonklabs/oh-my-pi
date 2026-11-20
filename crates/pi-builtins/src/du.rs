@@ -1492,7 +1492,7 @@ mod tests {
 	/// deeper chains prove nothing more while every lookup by path grows.
 	#[test]
 	fn sums_a_directory_chain_deeper_than_the_stack() {
-		let dir = tempfile::tempdir().expect("tempdir");
+		let dir = crate::deep_tree::tempdir();
 		let root = dir.path().canonicalize().expect("canonical");
 		// Removed before `dir` drops, whose `remove_dir_all` would hold one
 		// descriptor per level of the chain.

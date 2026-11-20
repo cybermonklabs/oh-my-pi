@@ -2128,14 +2128,18 @@ mod tests {
 
 	/// A directory chain deeper than the removal could recurse through on a
 	/// small stack, whose paths pass `PATH_MAX`, and which one descriptor per
-	/// level would take past Linux's default limit of 1024. Every level also
-	/// holds a file, so the walk keeps listing a directory after coming back up
-	/// out of its subdirectory. Redox removes through the provider walk rather
-	/// than the descriptor walk, so it is not covered.
+	/// level would take past the open-file limit of 32 the test sets in a
+	/// process of its own. Every level also holds a file, so the walk keeps
+	/// listing a directory after coming back up out of its subdirectory.
+	/// Redox removes through the provider walk rather than the descriptor
+	/// walk, so it is not covered.
 	///
-	/// Keep the chain shallow beyond that: on macOS every file operation slows
-	/// with its directory's depth, so building and removing the chain grows
-	/// quadratically, and 5,000 levels took over five minutes.
+	/// 400 levels: rm's walk before 6d543cb1, which recursed once per level,
+	/// overflowed a 256 KiB stack from 201 levels. Keep the chain shallow
+	/// beyond that: on macOS every file operation slows with its directory's
+	/// depth, so building and removing the chain grows quadratically, and
+	/// 5,000 levels took over five minutes; and a Bazel server that removed a
+	/// chain of 1,215 levels a killed test had left in its sandbox died.
 	#[cfg(all(unix, not(target_os = "redox")))]
 	#[test]
 	fn removes_a_directory_chain_deeper_than_the_stack() {
@@ -2143,10 +2147,13 @@ mod tests {
 
 		use uucore::safe_traversal::{DirFd, SymlinkBehavior};
 
-		const DEPTH: usize = 1_100;
-		const NAME: &str = "level";
+		if !crate::own_process::own_process() {
+			return;
+		}
+		const DEPTH: usize = 400;
+		const NAME: &str = "level-of-the-chain";
 		const { assert!(DEPTH * (NAME.len() + 1) > libc::PATH_MAX as usize) };
-		let cwd = tempdir().unwrap();
+		let cwd = crate::deep_tree::tempdir();
 		let root = cwd.path().join("deep");
 		// Whatever rm leaves is removed before `cwd` drops, whose
 		// `remove_dir_all` would hold one descriptor per level of the chain.
@@ -2159,6 +2166,7 @@ mod tests {
 			dir = dir.open_subdir(OsStr::new(NAME), SymlinkBehavior::NoFollow).unwrap();
 		}
 		drop(dir);
+		crate::deep_tree::limit_descriptors(32);
 
 		let cwd_path = cwd.path().to_path_buf();
 		let (code, err) = std::thread::Builder::new()

@@ -17,6 +17,25 @@
 
 use std::path::PathBuf;
 
+/// Where a deep test makes its trees: Bazel's per-test `TEST_TMPDIR` when it
+/// is set, else the system's temporary directory. `TEST_TMPDIR` lies below
+/// the test's sandbox directory, which Bazel removes, also after it kills the
+/// test; under the process-wrapper sandbox `/tmp` is the host's, where a
+/// killed test's tree would stay. A Bazel 9.2.0 server that removed a chain
+/// of 1,215 levels left in its sandbox died (exit 37; it survived 1,205), so
+/// every chain a test builds stays far shorter.
+pub(crate) fn temp_root() -> PathBuf {
+	std::env::var_os("TEST_TMPDIR")
+		.map(PathBuf::from)
+		.filter(|dir| dir.is_dir())
+		.unwrap_or_else(std::env::temp_dir)
+}
+
+/// A temporary directory under [`temp_root`], removed on drop.
+pub(crate) fn tempdir() -> tempfile::TempDir {
+	tempfile::tempdir_in(temp_root()).unwrap()
+}
+
 /// Removes the directory `0` and everything below it when dropped, through the
 /// native filesystem's `remove_dir_all`. Declare it after the `TempDir` that
 /// holds the directory, so it drops first, also when the test fails.
@@ -159,7 +178,7 @@ mod tests {
 	}
 
 	/// Under an open-file limit of 32 the host filesystem removes a chain of
-	/// 1,000 levels, where `std::fs::remove_dir_all` runs out of descriptors
+	/// 100 levels, where `std::fs::remove_dir_all` runs out of descriptors
 	/// and leaves the chain behind. It runs in a process of its own, since the
 	/// limit belongs to the whole process.
 	#[test]
@@ -167,10 +186,10 @@ mod tests {
 		if !crate::own_process::own_process() {
 			return;
 		}
-		let ours = tempfile::tempdir().unwrap();
-		chain(ours.path(), 1_000);
-		let stds = tempfile::tempdir().unwrap();
-		chain(stds.path(), 1_000);
+		let ours = super::tempdir();
+		chain(ours.path(), 100);
+		let stds = super::tempdir();
+		chain(stds.path(), 100);
 		let limit = libc::rlimit { rlim_cur: 32, rlim_max: 32 };
 		// SAFETY: a plain setrlimit of this process, which no other test shares.
 		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) }, 0);

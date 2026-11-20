@@ -5565,8 +5565,9 @@ mod tests {
 	/// path below the walk's open directories grows.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn walks_a_directory_chain_deeper_than_the_stack() {
-		let (_dir, root) = fixture();
-		// Removed before `_dir` drops, whose `remove_dir_all` would hold one
+		let dir = crate::deep_tree::tempdir();
+		let root = fs::canonicalize(dir.path()).unwrap();
+		// Removed before `dir` drops, whose `remove_dir_all` would hold one
 		// descriptor per level of the chain.
 		let _chain = crate::deep_tree::RemoveTree(root.join("deep"));
 		let depth = 200;

@@ -1165,7 +1165,7 @@ mod tests {
 		use crate::deep_tree::{RemoveTree, assert_file_chain, file_chain, limit_descriptors};
 
 		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
-		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+		match (device("/dev/shm".as_ref()), device(&crate::deep_tree::temp_root())) {
 			(Ok(shm), Ok(temp)) if shm != temp => {},
 			(shm, temp) => {
 				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
@@ -1176,7 +1176,7 @@ mod tests {
 			return;
 		}
 		let from = tempfile::tempdir_in("/dev/shm").unwrap();
-		let to = tempdir().unwrap();
+		let to = crate::deep_tree::tempdir();
 		let src = from.path().join("src");
 		let dst = to.path().join("dst");
 		let _trees = [RemoveTree(src.clone()), RemoveTree(dst.clone())];
