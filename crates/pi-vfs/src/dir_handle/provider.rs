@@ -1,6 +1,7 @@
-//! [`pi_vfs::Fs`] providers: directories are paths, listings come from
-//! `read_dir`, and files are provider [`pi_vfs::File`]s. URL children are
-//! joined with [`pi_vfs::child_path`], which percent-encodes raw names.
+//! The provider side of [`super::DirHandle`]: a directory is its path on a
+//! facade, listings come from `read_dir`, files are facade [`File`]s, and
+//! each call joins the entry's name to the directory's path with
+//! [`child_path`], which percent-encodes raw names in URLs.
 //!
 //! A provider resolves each path itself, so opens and writes that do not
 //! follow symlinks check the final component with `symlink_metadata` and
@@ -16,15 +17,22 @@ use std::{
 	time::UNIX_EPOCH,
 };
 
-use pi_vfs::{Fs, Metadata};
-
 use super::{
-	Detail, FileId, FileInfo, FileType, Listing, Stamp, is_rel_separator, not_regular, os_name,
+	Detail, FileInfo, FileType, Listing, Stamp, is_rel_separator, not_regular, os_name,
 	symlink_refused,
 };
+use crate::{
+	error::{not_a_directory, unsupported},
+	file::File,
+	fs::Fs,
+	metadata::Metadata,
+	options::OpenOptions,
+	path::child_path,
+	types::{self, Permissions},
+};
 
-/// Entry type of a provider file type; `None` for special files.
-fn type_of(file_type: pi_vfs::FileType) -> Option<FileType> {
+/// Entry type of a facade file type; `None` for special files.
+fn type_of(file_type: types::FileType) -> Option<FileType> {
 	if file_type.is_symlink() {
 		Some(FileType::Symlink)
 	} else if file_type.is_dir() {
@@ -45,7 +53,7 @@ fn mtime_of(meta: &Metadata) -> Option<i64> {
 	})
 }
 
-fn info_of(meta: &Metadata) -> FileInfo {
+pub(super) fn info_of(meta: &Metadata) -> FileInfo {
 	let mtime = mtime_of(meta).unwrap_or(0);
 	let ctime = meta
 		.ctime()
@@ -83,16 +91,13 @@ fn is_invalid_name(name: &OsStr) -> bool {
 		)
 }
 
-fn not_a_directory() -> io::Error {
-	pi_vfs::not_a_directory()
-}
-
+/// The entry `name` (raw bytes) of the directory at `dir`.
 pub(super) fn child(dir: &Path, name: &[u8]) -> PathBuf {
-	pi_vfs::child_path(dir, &os_name(name))
+	child_path(dir, &os_name(name))
 }
 
 /// The walk-relative `rel` (raw names, see
-/// [`super::Session::open_file_beneath`]) below `root`.
+/// [`super::DirHandle::open_regular_beneath_async`]) below `root`.
 pub(super) fn beneath(root: &Path, rel: &[u8]) -> PathBuf {
 	let mut path = root.to_path_buf();
 	for segment in rel.split(|&b| is_rel_separator(b)) {
@@ -113,23 +118,18 @@ fn unlinked_file_info(meta: &Metadata) -> io::Result<FileInfo> {
 	}
 }
 
-pub(super) async fn open_dir(fs: &Fs, path: &Path) -> io::Result<PathBuf> {
-	if !fs.metadata(path).await?.is_dir() {
+/// Checks that `path` is a directory, following a final symlink only with
+/// `follow`.
+pub(super) async fn open_dir(fs: &Fs, path: &Path, follow: bool) -> io::Result<()> {
+	let meta = if follow {
+		fs.metadata(path).await?
+	} else {
+		fs.symlink_metadata(path).await?
+	};
+	if !meta.is_dir() {
 		return Err(not_a_directory());
 	}
-	Ok(path.to_path_buf())
-}
-
-/// Checks, without following a symlink, that `path` is a directory.
-pub(super) async fn open_dir_unlinked(fs: &Fs, path: PathBuf) -> io::Result<PathBuf> {
-	if !fs.symlink_metadata(&path).await?.is_dir() {
-		return Err(not_a_directory());
-	}
-	Ok(path)
-}
-
-pub(super) async fn open_child(fs: &Fs, parent: &Path, name: &[u8]) -> io::Result<PathBuf> {
-	open_dir_unlinked(fs, child(parent, name)).await
+	Ok(())
 }
 
 pub(super) async fn list(fs: &Fs, dir: &Path, detail: Detail, out: &mut Listing) -> io::Result<()> {
@@ -168,7 +168,7 @@ pub(super) async fn list(fs: &Fs, dir: &Path, detail: Detail, out: &mut Listing)
 
 /// Opens the regular file at `path`, following symlinks. The type is checked
 /// before opening so directories and special files are never opened.
-pub(super) async fn open_file(fs: &Fs, path: &Path) -> io::Result<(pi_vfs::File, FileInfo)> {
+pub(super) async fn open_file(fs: &Fs, path: &Path) -> io::Result<(File, FileInfo)> {
 	let info = info_of(&fs.metadata(path).await?);
 	if info.file_type != Some(FileType::File) {
 		return Err(not_regular());
@@ -178,10 +178,7 @@ pub(super) async fn open_file(fs: &Fs, path: &Path) -> io::Result<(pi_vfs::File,
 
 /// Opens the regular file at `path`, refusing a final symlink: the type is
 /// checked without following it before the open.
-pub(super) async fn open_file_unlinked(
-	fs: &Fs,
-	path: &Path,
-) -> io::Result<(pi_vfs::File, FileInfo)> {
+pub(super) async fn open_file_unlinked(fs: &Fs, path: &Path) -> io::Result<(File, FileInfo)> {
 	let info = unlinked_file_info(&fs.symlink_metadata(path).await?)?;
 	Ok((fs.open(path).await?, info))
 }
@@ -218,7 +215,35 @@ pub(super) async fn stat(fs: &Fs, path: &Path, follow: bool) -> io::Result<FileI
 	Ok(info_of(&meta))
 }
 
-pub(super) async fn identify(fs: &Fs, path: &Path) -> io::Result<FileId> {
-	let id = fs.file_id(path, true).await?;
-	Ok(FileId { dev: id.dev(), ino: id.ino(), native: id.is_native() })
+/// Whether the entry at `path` is a symlink; a missing entry is not.
+async fn is_link(fs: &Fs, path: &Path) -> io::Result<bool> {
+	match fs.symlink_metadata(path).await {
+		Ok(meta) => Ok(meta.is_symlink()),
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(err) => Err(err),
+	}
+}
+
+/// Opens `path` as `options` say, refusing a symlink there
+/// ([`symlink_refused`]): the check and the open are two calls.
+pub(super) async fn open_at(fs: &Fs, path: &Path, options: &OpenOptions) -> io::Result<File> {
+	if is_link(fs, path).await? {
+		return Err(symlink_refused());
+	}
+	fs.open_with(path, options).await
+}
+
+/// Sets the permissions of `path`; without `follow` a symlink there is
+/// refused ([`unsupported`]), as Linux refuses to change a symlink's mode,
+/// since a provider's change follows one.
+pub(super) async fn set_permissions(
+	fs: &Fs,
+	path: &Path,
+	permissions: Permissions,
+	follow: bool,
+) -> io::Result<()> {
+	if !follow && is_link(fs, path).await? {
+		return Err(unsupported("changing the mode of a symbolic link"));
+	}
+	fs.set_permissions(path, permissions).await
 }

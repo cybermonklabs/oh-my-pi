@@ -22,6 +22,13 @@
 //! `FILE_OPEN_REPARSE_POINT`, which opens a reparse point itself instead of
 //! its target; file opens and opens below a walk root then refuse a reparse
 //! point they reached.
+//!
+//! The general calls of [`crate::DirHandle`] that Windows has no relative
+//! form of here (stats, opens with options, creation, rename, links,
+//! attribute and time changes) name the entry through the directory's final
+//! path (`GetFinalPathNameByHandleW`) and the facades' host calls; removal
+//! opens the entry relative to the handle, as a removal below a walk root
+//! does.
 
 use std::{
 	io,
@@ -29,7 +36,7 @@ use std::{
 		fs::{MetadataExt, OpenOptionsExt},
 		io::{AsRawHandle, FromRawHandle, OwnedHandle},
 	},
-	path::Path,
+	path::{Path, PathBuf},
 	ptr::{null, null_mut},
 };
 
@@ -56,25 +63,30 @@ use windows_sys::{
 			FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
 			FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
-			FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-			FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo, FileDispositionInfoEx,
-			GetFileInformationByHandle, GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
-			SetFileInformationByHandle,
+			FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo,
+			FileDispositionInfoEx, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE, SetFileInformationByHandle,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
 };
 
 use super::{aligned_buf, le32, le64, rewrite};
-use crate::fs::{
-	Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular,
-	wtf8::{push_wide, push_wtf8},
+use crate::{
+	dir_handle::{
+		Detail, FileInfo, FileType, Listing, Stamp, not_regular, os_name,
+		wtf8::{push_wide, push_wtf8},
+	},
+	metadata::Metadata,
+	options::OpenOptions,
+	types::{FileId, FileTime, Permissions, SymlinkKind},
 };
 
 /// An open directory or file handle, closed on drop.
 pub(crate) type Handle = OwnedHandle;
 
-/// See [`crate::fs::Fs::workers`] (unmeasured on Windows).
+/// See [`crate::dir_handle::WORKERS`] (unmeasured on Windows).
 pub(crate) const WORKERS: usize = 4;
 
 const LIST_BUF: usize = 64 << 10;
@@ -526,7 +538,12 @@ pub(crate) fn remove_beneath(
 	dir: bool,
 ) -> io::Result<()> {
 	let (reached, name) = parent_beneath(s, root, rel)?;
-	let at = reached.as_ref().unwrap_or(root);
+	remove_entry(s, reached.as_ref().unwrap_or(root), name, dir)
+}
+
+/// Marks `name` (one component) of `at` for deletion, as [`remove_beneath`]
+/// marks the entry it reached.
+fn remove_entry(s: &mut Scratch, at: &Handle, name: &[u8], dir: bool) -> io::Result<()> {
 	let kind = if dir {
 		FILE_DIRECTORY_FILE
 	} else {
@@ -636,10 +653,10 @@ pub(crate) fn read_at(h: &Handle, buf: &mut [u8], off: u64) -> io::Result<usize>
 
 /// Identity of an open file, read from its handle rather than from the path it
 /// was opened by.
-pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
+pub(crate) fn handle_metadata(h: &Handle) -> io::Result<Metadata> {
 	use std::os::windows::io::AsHandle;
 	let owned = h.as_handle().try_clone_to_owned()?;
-	pi_vfs::Metadata::from_file(&std::fs::File::from(owned))
+	Metadata::from_file(&std::fs::File::from(owned))
 }
 
 /// Describes the file at `path`. An absolute path is answered by
@@ -811,11 +828,10 @@ pub(crate) fn identify_dir(h: &Handle) -> io::Result<FileId> {
 	if unsafe { GetFileInformationByHandle(h.as_raw_handle(), &raw mut fi) } == 0 {
 		return Err(io::Error::last_os_error());
 	}
-	Ok(FileId {
-		dev:    u64::from(fi.dwVolumeSerialNumber),
-		ino:    (u64::from(fi.nFileIndexHigh) << 32) | u64::from(fi.nFileIndexLow),
-		native: true,
-	})
+	Ok(FileId::native(
+		u64::from(fi.dwVolumeSerialNumber),
+		(u64::from(fi.nFileIndexHigh) << 32) | u64::from(fi.nFileIndexLow),
+	))
 }
 
 /// Admits NTFS and `ReFS`, which keep 100ns timestamps and update a
@@ -846,12 +862,171 @@ pub(crate) fn stable_stamps(h: &Handle, _stamp: &Stamp) -> bool {
 		.any(|fs| fs.encode_utf16().eq(name.iter().copied()))
 }
 
+// The general calls of `DirHandle`: each names one entry of `dir`.
+
+/// The final path of the directory `h` (`\\?\` form), which the general
+/// calls join an entry name to.
+fn final_path(h: &Handle) -> io::Result<PathBuf> {
+	use std::os::windows::ffi::OsStringExt;
+	let mut buf = vec![0u16; 512];
+	loop {
+		// SAFETY: `buf` is writable for the length passed.
+		let n = unsafe {
+			GetFinalPathNameByHandleW(
+				h.as_raw_handle(),
+				buf.as_mut_ptr(),
+				buf.len() as u32,
+				FILE_NAME_NORMALIZED,
+			)
+		} as usize;
+		if n == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		if n < buf.len() {
+			buf.truncate(n);
+			return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+		}
+		// Too small: `n` is the length needed, its NUL included.
+		buf.resize(n, 0);
+	}
+}
+
+/// The entry `name` (one WTF-8 component) of the directory `h`, by path.
+fn entry_path(h: &Handle, name: &[u8]) -> io::Result<PathBuf> {
+	Ok(final_path(h)?.join(os_name(name)))
+}
+
+/// Whether the entry at `path` is a reparse point the facades report as a
+/// symlink; a missing entry is not.
+fn is_link(path: &Path) -> io::Result<bool> {
+	match crate::native::symlink_metadata(path) {
+		Ok(meta) => Ok(meta.is_symlink()),
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(err) => Err(err),
+	}
+}
+
+pub(crate) fn stat_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	follow: bool,
+) -> io::Result<Metadata> {
+	let path = entry_path(dir, name)?;
+	if follow {
+		crate::native::metadata(&path)
+	} else {
+		crate::native::symlink_metadata(&path)
+	}
+}
+
+/// Opens `name` in `dir` as `options` say, refusing a reparse point there
+/// (`ERROR_STOPPED_ON_SYMLINK`); the check and the open are two calls by
+/// path. Windows creation modes only toggle the read-only attribute, which
+/// no creation mask reaches.
+pub(crate) fn open_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	options: &OpenOptions,
+	_mask: Option<u32>,
+) -> io::Result<std::fs::File> {
+	let path = entry_path(dir, name)?;
+	if is_link(&path)? {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
+	options.to_std().open(&path)
+}
+
+pub(crate) fn create_dir_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	mode: Option<u32>,
+	_mask: Option<u32>,
+) -> io::Result<()> {
+	crate::native::create_dir(&entry_path(dir, name)?, mode, false)
+}
+
+/// Marks `name` in `dir` for deletion, opened relative to `dir` as
+/// [`remove_beneath`] opens the entry it reached.
+pub(crate) fn remove_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	dir_entry: bool,
+) -> io::Result<()> {
+	remove_entry(s, dir, name, dir_entry)
+}
+
+pub(crate) fn rename_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	from: &[u8],
+	to_dir: &Handle,
+	to: &[u8],
+) -> io::Result<()> {
+	std::fs::rename(entry_path(dir, from)?, entry_path(to_dir, to)?)
+}
+
+pub(crate) fn symlink_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	target: &Path,
+	name: &[u8],
+) -> io::Result<()> {
+	crate::native::symlink(target, &entry_path(dir, name)?, SymlinkKind::Auto)
+}
+
+pub(crate) fn read_link_at(_s: &mut Scratch, dir: &Handle, name: &[u8]) -> io::Result<PathBuf> {
+	std::fs::read_link(entry_path(dir, name)?)
+}
+
+/// Toggles the read-only attribute of `name` in `dir`; without `follow` a
+/// reparse point there is refused (`ERROR_NOT_SUPPORTED`), as Linux refuses
+/// to change a symlink's mode.
+pub(crate) fn set_permissions_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	permissions: Permissions,
+	follow: bool,
+) -> io::Result<()> {
+	let path = entry_path(dir, name)?;
+	if !follow && is_link(&path)? {
+		return Err(win_error(ERROR_NOT_SUPPORTED));
+	}
+	crate::native::set_permissions(&path, permissions)
+}
+
+pub(crate) fn set_times_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	accessed: FileTime,
+	modified: FileTime,
+	follow: bool,
+) -> io::Result<()> {
+	crate::native::set_times(&entry_path(dir, name)?, accessed, modified, follow)
+}
+
+pub(crate) fn chown_at(
+	_s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	uid: Option<u32>,
+	gid: Option<u32>,
+	follow: bool,
+) -> io::Result<()> {
+	crate::native::chown(&entry_path(dir, name)?, uid, gid, follow)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{os::windows::fs::OpenOptionsExt, path::PathBuf};
 
 	use super::{Scratch, full_attributes, refuses_queries, stat};
-	use crate::fs::FileType;
+	use crate::dir_handle::FileType;
 
 	/// A stat of a file that refuses the attribute query falls back to
 	/// `std::fs`, which answers it from the directory's entry, with and
@@ -862,7 +1037,7 @@ mod tests {
 	#[test]
 	fn a_file_that_refuses_the_attribute_query_is_stated_through_std() {
 		let held =
-			crate::testing::temp_root().join(format!("pi-walker-locked-{}", std::process::id()));
+			crate::dir_handle::temp_root().join(format!("pi-vfs-locked-{}", std::process::id()));
 		std::fs::write(&held, b"held").unwrap();
 		let lock = std::fs::OpenOptions::new()
 			.read(true)

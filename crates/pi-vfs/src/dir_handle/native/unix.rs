@@ -1,27 +1,35 @@
 //! Unix descriptors: relative `openat` opens, confined opens below a walk
-//! root, positional file reads, and the per-device stable-stamp verdicts.
-//! Listing and stat syscalls, and the kernel's own confined open where it has
-//! one, come from the platform's `sys` module.
+//! root, positional file reads, the per-device stable-stamp verdicts, and
+//! the `*at` calls behind [`crate::DirHandle`]'s general methods. Listing and
+//! stat syscalls, and the kernel's own confined open where it has one, come
+//! from the platform's `sys` module.
 
 use std::{
-	ffi::{c_char, c_int},
+	ffi::{CString, c_char, c_int},
 	io,
+	mem::MaybeUninit,
 	os::{
 		fd::{AsRawFd, OwnedFd, RawFd},
-		unix::ffi::OsStrExt,
+		unix::ffi::{OsStrExt, OsStringExt},
 	},
-	path::Path,
+	path::{Path, PathBuf},
 };
 
 use parking_lot::RwLock;
 
 use super::{rewrite, sys};
-use crate::fs::{Detail, FileId, FileInfo, FileType, Listing, Stamp, not_regular};
+use crate::{
+	dir_handle::{Detail, FileInfo, FileType, Listing, Stamp, not_regular},
+	error::nul_in_path,
+	metadata::Metadata,
+	options::OpenOptions,
+	types::{FileId, FileTime, Permissions},
+};
 
 /// An open directory or file descriptor, closed on drop.
 pub(crate) type Handle = OwnedFd;
 
-/// See [`crate::fs::Fs::workers`].
+/// See [`crate::dir_handle::WORKERS`].
 pub(crate) const WORKERS: usize = sys::WORKERS;
 
 const DIR_FLAGS: c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
@@ -327,10 +335,10 @@ pub(crate) fn read_at(h: &Handle, buf: &mut [u8], off: u64) -> io::Result<usize>
 
 /// Identity of an open file, read from its descriptor rather than from the
 /// path it was opened by.
-pub(crate) fn handle_metadata(h: &Handle) -> io::Result<pi_vfs::Metadata> {
+pub(crate) fn handle_metadata(h: &Handle) -> io::Result<Metadata> {
 	use std::os::fd::AsFd;
 	let owned = h.as_fd().try_clone_to_owned()?;
-	pi_vfs::Metadata::from_file(&std::fs::File::from(owned))
+	Metadata::from_file(&std::fs::File::from(owned))
 }
 
 pub(crate) fn stat(s: &mut Scratch, path: &Path, follow: bool) -> io::Result<FileInfo> {
@@ -351,7 +359,7 @@ pub(crate) fn identify_dir(h: &Handle) -> io::Result<FileId> {
 }
 
 const fn id_of(stamp: &Stamp) -> FileId {
-	FileId { dev: stamp.dev, ino: stamp.ino, native: true }
+	FileId::native(stamp.dev, stamp.ino)
 }
 
 /// Stable-stamp verdicts per device: stamps carry real device numbers, so a
@@ -368,4 +376,258 @@ pub(crate) fn stable_stamps(h: &Handle, stamp: &Stamp) -> bool {
 		memo.push((stamp.dev, ok));
 	}
 	ok
+}
+
+// The general calls of `DirHandle`: each names one entry of `dir`.
+
+fn cvt(ret: c_int) -> io::Result<()> {
+	if ret == -1 {
+		Err(io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+/// `ret` (0 or -1) of a call retried while it fails with `EINTR`.
+fn retry(mut call: impl FnMut() -> c_int) -> io::Result<()> {
+	loop {
+		match cvt(call()) {
+			Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
+			result => return result,
+		}
+	}
+}
+
+const fn follow_flag(follow: bool) -> c_int {
+	if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW }
+}
+
+/// `fstatat` of `name` in `dir`, following a symlink there only with
+/// `follow`.
+pub(crate) fn stat_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	follow: bool,
+) -> io::Result<Metadata> {
+	let name = s.cstr(name)?;
+	let mut st = MaybeUninit::<libc::stat>::uninit();
+	// SAFETY: `name` is NUL-terminated and `st` is a valid out-pointer.
+	retry(|| unsafe { libc::fstatat(dir.as_raw_fd(), name, st.as_mut_ptr(), follow_flag(follow)) })?;
+	// SAFETY: `fstatat` succeeded and filled `st`.
+	Ok(Metadata::from_stat(unsafe { st.assume_init_ref() }))
+}
+
+/// The `open` flags of `options`, as [`std::fs::OpenOptions`] derives them:
+/// an access mode, then the creation flags it allows (`EINVAL` for a
+/// combination it refuses), then the custom flags past the access mode.
+fn open_flags(options: &OpenOptions) -> io::Result<c_int> {
+	let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
+	let (read, write, append) = (options.is_read(), options.is_write(), options.is_append());
+	let access = match (read, write, append) {
+		(true, false, false) => libc::O_RDONLY,
+		(false, true, false) => libc::O_WRONLY,
+		(true, true, false) => libc::O_RDWR,
+		(false, _, true) => libc::O_WRONLY | libc::O_APPEND,
+		(true, _, true) => libc::O_RDWR | libc::O_APPEND,
+		(false, false, false) => return Err(invalid()),
+	};
+	let (truncate, create, create_new) =
+		(options.is_truncate(), options.is_create(), options.is_create_new());
+	if !write && !append && (truncate || create || create_new) {
+		return Err(invalid());
+	}
+	if append && truncate && !create_new {
+		return Err(invalid());
+	}
+	let creation = match (truncate, create, create_new) {
+		(_, _, true) => libc::O_CREAT | libc::O_EXCL,
+		(false, false, false) => 0,
+		(true, false, false) => libc::O_TRUNC,
+		(false, true, false) => libc::O_CREAT,
+		(true, true, false) => libc::O_CREAT | libc::O_TRUNC,
+	};
+	Ok(access | creation | (options.get_custom_flags() & !libc::O_ACCMODE))
+}
+
+/// Opens `name` in `dir` as `options` say, never through a symlink there
+/// (`O_NOFOLLOW`: `ELOOP`). A file it creates gets `options`' mode (`0o666`
+/// by default) less the process umask; with a creation `mask` it gets
+/// exactly that mode less `mask`, as the facades' host opens give it (the
+/// mode is set again after an exclusive create; an existing file keeps its
+/// mode).
+pub(crate) fn open_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	options: &OpenOptions,
+	mask: Option<u32>,
+) -> io::Result<std::fs::File> {
+	let flags = open_flags(options)? | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+	let requested = options.get_mode().unwrap_or(0o666);
+	let creates = flags & libc::O_CREAT != 0;
+	let name = s.cstr(name)?;
+	let Some(mask) = mask.filter(|_| creates) else {
+		return openat_mode(dir.as_raw_fd(), name, flags, requested).map(std::fs::File::from);
+	};
+	let mode = requested & !mask;
+	match openat_mode(dir.as_raw_fd(), name, flags | libc::O_EXCL, mode) {
+		Ok(fd) => {
+			let file = std::fs::File::from(fd);
+			// Best effort: without it the file keeps the stricter mode the
+			// process umask left.
+			let _ = crate::native::file_set_permissions(&file, Permissions::from_mode(mode));
+			Ok(file)
+		},
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && flags & libc::O_EXCL == 0 => {
+			openat_mode(dir.as_raw_fd(), name, flags, mode).map(std::fs::File::from)
+		},
+		Err(err) => Err(err),
+	}
+}
+
+/// `mkdirat` of `name` in `dir` with `mode` (`0o777` by default) less the
+/// process umask; with a creation `mask`, exactly `mode` less `mask` (set
+/// again after the create, best effort).
+pub(crate) fn create_dir_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	mode: Option<u32>,
+	mask: Option<u32>,
+) -> io::Result<()> {
+	let name = s.cstr(name)?;
+	let requested = mode.unwrap_or(0o777);
+	let mode = mask.map_or(requested, |mask| requested & !mask);
+	// SAFETY: `name` is NUL-terminated.
+	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, mode as libc::mode_t) })?;
+	if mask.is_some() {
+		// SAFETY: as above; the directory was just made, so `name` is one.
+		let _ = retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode as libc::mode_t, 0) });
+	}
+	Ok(())
+}
+
+/// `unlinkat` of `name` in `dir`: an empty directory with `dir_entry`, else
+/// a file, symlink (itself) or special file.
+pub(crate) fn remove_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	dir_entry: bool,
+) -> io::Result<()> {
+	let name = s.cstr(name)?;
+	let flags = if dir_entry { libc::AT_REMOVEDIR } else { 0 };
+	// SAFETY: `name` is NUL-terminated.
+	retry(|| unsafe { libc::unlinkat(dir.as_raw_fd(), name, flags) })
+}
+
+fn c_name(name: &[u8]) -> io::Result<CString> {
+	CString::new(name).map_err(|_| nul_in_path())
+}
+
+/// `renameat` of `from` in `dir` to `to` in `to_dir`.
+pub(crate) fn rename_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	from: &[u8],
+	to_dir: &Handle,
+	to: &[u8],
+) -> io::Result<()> {
+	let to = c_name(to)?;
+	let from = s.cstr(from)?;
+	// SAFETY: both names are NUL-terminated.
+	retry(|| unsafe { libc::renameat(dir.as_raw_fd(), from, to_dir.as_raw_fd(), to.as_ptr()) })
+}
+
+/// `symlinkat`: makes `name` in `dir` a symlink holding `target` verbatim.
+pub(crate) fn symlink_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	target: &Path,
+	name: &[u8],
+) -> io::Result<()> {
+	let target = c_name(target.as_os_str().as_bytes())?;
+	let name = s.cstr(name)?;
+	// SAFETY: both strings are NUL-terminated.
+	retry(|| unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name) })
+}
+
+/// `readlinkat` of `name` in `dir`, growing the buffer until the target
+/// fits.
+pub(crate) fn read_link_at(s: &mut Scratch, dir: &Handle, name: &[u8]) -> io::Result<PathBuf> {
+	let name = s.cstr(name)?;
+	let mut buf = Vec::<u8>::with_capacity(256);
+	loop {
+		// SAFETY: `name` is NUL-terminated and `buf` is writable for its
+		// capacity.
+		let n = unsafe {
+			libc::readlinkat(dir.as_raw_fd(), name, buf.as_mut_ptr().cast(), buf.capacity())
+		};
+		let Ok(n) = usize::try_from(n) else {
+			let err = io::Error::last_os_error();
+			if err.kind() == io::ErrorKind::Interrupted {
+				continue;
+			}
+			return Err(err);
+		};
+		if n < buf.capacity() {
+			// SAFETY: `readlinkat` initialized the first `n` bytes.
+			unsafe { buf.set_len(n) };
+			return Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)));
+		}
+		// The target may have been cut at the capacity: read again into
+		// twice the room (`buf` is empty, so this is the capacity asked).
+		buf.reserve(buf.capacity() * 2);
+	}
+}
+
+/// `fchmodat` of `name` in `dir`; without `follow` a symlink there is not
+/// followed (Linux refuses to change one: `EOPNOTSUPP`).
+pub(crate) fn set_permissions_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	permissions: Permissions,
+	follow: bool,
+) -> io::Result<()> {
+	let name = s.cstr(name)?;
+	let mode = permissions.mode() as libc::mode_t;
+	// SAFETY: `name` is NUL-terminated.
+	retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode, follow_flag(follow)) })
+}
+
+/// `utimensat` of `name` in `dir`: [`FileTime::Omit`] keeps a time,
+/// [`FileTime::Now`] takes the filesystem clock; without `follow` a symlink
+/// there gets the times itself.
+pub(crate) fn set_times_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	accessed: FileTime,
+	modified: FileTime,
+	follow: bool,
+) -> io::Result<()> {
+	let name = s.cstr(name)?;
+	let times = [crate::native::timespec(accessed), crate::native::timespec(modified)];
+	// SAFETY: `name` is NUL-terminated and `times` holds the two entries
+	// `utimensat` reads.
+	retry(|| unsafe { libc::utimensat(dir.as_raw_fd(), name, times.as_ptr(), follow_flag(follow)) })
+}
+
+/// `fchownat` of `name` in `dir`; `None` keeps that id. Without `follow` a
+/// symlink there changes owner itself.
+pub(crate) fn chown_at(
+	s: &mut Scratch,
+	dir: &Handle,
+	name: &[u8],
+	uid: Option<u32>,
+	gid: Option<u32>,
+	follow: bool,
+) -> io::Result<()> {
+	let name = s.cstr(name)?;
+	let uid = uid.map_or(libc::uid_t::MAX, |uid| uid as libc::uid_t);
+	let gid = gid.map_or(libc::gid_t::MAX, |gid| gid as libc::gid_t);
+	// SAFETY: `name` is NUL-terminated.
+	retry(|| unsafe { libc::fchownat(dir.as_raw_fd(), name, uid, gid, follow_flag(follow)) })
 }

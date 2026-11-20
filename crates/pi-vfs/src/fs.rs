@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::file::POLL_SLICE;
 use crate::{
 	dir::{EntryBinding, ReadDir},
+	dir_handle::DirHandle,
 	error::{
 		already_exists, invalid_argument, no_provider, not_a_directory, not_permitted,
 		permission_denied, unsupported,
@@ -1006,6 +1007,51 @@ impl Fs {
 		}
 	}
 
+	/// Opens the directory at `path` as a [`DirHandle`], below which every
+	/// call names one entry: a descriptor on the host, the path on a provider.
+	/// Earlier components are followed; with `follow` the last is too.
+	/// Without, a symlink that is the last component is refused (`ENOTDIR` on
+	/// Unix, also on a kernel that follows one despite `O_NOFOLLOW`;
+	/// `ERROR_STOPPED_ON_SYMLINK` on Windows; [`not_a_directory`] on a
+	/// provider). A host handle keeps this facade's creation mask and
+	/// cancellation for the files and directories it creates and opens.
+	///
+	/// # Errors
+	///
+	/// The open's errors; [`not_a_directory`] for anything else, a descriptor
+	/// overlay included.
+	pub async fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.route(path)? {
+			Route::Native => DirHandle::open_host(path, follow, &self.scope),
+			Route::Provider(_) => {
+				DirHandle::open_provider(self, Handle::try_current().ok(), path, follow).await
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// Opens the directory at `path` as a handle that names its entries by
+	/// path on this facade, whatever serves them: each call joins the entry's
+	/// name to `path` and makes this facade's path call, which routes it as
+	/// the facade routes any path. Where this facade serves `path` from the
+	/// host, [`Self::open_dir`] opens a host handle instead; a walk that
+	/// started below a provider's root keeps to paths with this call. The
+	/// directory is checked to be one, a final symlink followed only with
+	/// `follow`.
+	///
+	/// # Errors
+	///
+	/// The facade's metadata errors; [`not_a_directory`] for anything else, a
+	/// descriptor overlay included.
+	pub async fn open_dir_by_path(
+		&self,
+		path: impl AsRef<Path>,
+		follow: bool,
+	) -> io::Result<DirHandle> {
+		DirHandle::open_provider(self, Handle::try_current().ok(), path.as_ref(), follow).await
+	}
+
 	pub async fn read_dir(&self, path: impl AsRef<Path>) -> io::Result<ReadDir> {
 		let path = path.as_ref();
 		match self.route(path)? {
@@ -1634,6 +1680,27 @@ impl BlockingFs {
 				let read_dir = self.run(provider.read_dir(path))?;
 				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
 				Ok(read_dir.bind(self.fs.entry_binding(provider, runtime)))
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// See [`Fs::open_dir`]. The handle's synchronous provider calls are
+	/// driven as this facade drives its own.
+	///
+	/// # Errors
+	///
+	/// As for [`Fs::open_dir`].
+	pub fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.fs.route(path)? {
+			Route::Native => DirHandle::open_host(path, follow, &self.fs.scope),
+			Route::Provider(_) => {
+				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
+				block_on(
+					self.runtime.as_ref(),
+					DirHandle::open_provider(&self.fs, runtime, path, follow),
+				)
 			},
 			Route::Mounted(_) => Err(not_a_directory()),
 		}

@@ -40,7 +40,7 @@ use super::{
 	aligned_buf, is_dot_or_dot_dot, le16, le64,
 	unix::{Scratch, nanos, type_of_dt, type_of_mode, walk_beneath},
 };
-use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
+use crate::dir_handle::{Detail, FileInfo, FileType, Listing, Stamp};
 
 /// On a 16-vCPU arm64 VM, 8 workers walked faster and steadier than 16
 /// (kernel contention on fd-table and dcache locks grows with thread count).
@@ -671,8 +671,8 @@ mod tests {
 
 	impl Tree {
 		fn new(tag: &str) -> Self {
-			let base = crate::testing::temp_root()
-				.join(format!("pi-walker-linux-{tag}-{}", std::process::id()));
+			let base = crate::dir_handle::temp_root()
+				.join(format!("pi-vfs-linux-{tag}-{}", std::process::id()));
 			let _ = fs::remove_dir_all(&base);
 			fs::create_dir_all(base.join("a")).expect("create a");
 			fs::write(base.join("a/f"), "f").expect("write a/f");
