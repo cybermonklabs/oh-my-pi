@@ -478,7 +478,7 @@ fn bash_reports_a_foreground_command_killed_by_a_signal() {
 				);
 			},
 			None => {
-				zsh_oracle::uncompared(&format!("no {name} to compare the killed-command notice with"))
+				zsh_oracle::uncompared(&format!("no {name} to compare the killed-command notice with"));
 			},
 		}
 	}
