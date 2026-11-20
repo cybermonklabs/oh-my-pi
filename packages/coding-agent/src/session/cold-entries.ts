@@ -64,7 +64,9 @@ const CACHE_ENTRIES = 8;
 /**
  * Bytes the materialized records kept may hold together, each counted with
  * its images resolved ({@link freezeAndMeasure}): a record holds an image as
- * a blob reference, its materialized form as the whole base64 data.
+ * a blob reference, its materialized form as the whole base64 data. A
+ * snapcompact frame stays a blob reference in both, read through
+ * `lazyImageDataSync` when a context build selects it.
  */
 const CACHE_BYTES = 16 * 1024 * 1024;
 /** Records are written in batches of about this size. */
@@ -598,7 +600,8 @@ function jsonFits(value: object, limit: number): boolean {
  * Deep-freeze `value` and return a lower bound of its JSON text's length,
  * counting each UTF-16 unit as one byte as {@link jsonFits} does. For a
  * materialized record that is its size with each image resolved to the
- * base64 data its blob reference stands for.
+ * base64 data its blob reference stands for; a snapcompact frame counts as
+ * the blob reference it stays.
  */
 function freezeAndMeasure(value: unknown): number {
 	let units = 0;
@@ -955,9 +958,10 @@ export class ColdEntryStore {
  * Make a cold `entry` whole again, in place: parse its record unfrozen and turn
  * every accessor back into a data property, `entry.message` staying the same
  * object. Without `resolveBlobs: false` image data are read back from the blob
- * store. The entry remembers its record, which it takes back when it goes cold
- * again unchanged ({@link convertToColdEntry}). Returns false when `entry` is
- * not cold.
+ * store, but for snapcompact frames, which stay blob references that
+ * `lazyImageDataSync` reads when a context build selects them. The entry
+ * remembers its record, which it takes back when it goes cold again unchanged
+ * ({@link convertToColdEntry}). Returns false when `entry` is not cold.
  */
 export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boolean }): boolean {
 	const record = recordOf(entry);

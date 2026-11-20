@@ -93,6 +93,28 @@ describe("builtin grep: a brace that makes no interval after an anchor", () => {
 	]);
 });
 
+describe("builtin grep: an interval count above 32767", () => {
+	cases([
+		// Regressed: the count is given to the engine, which searches; GNU prints "Regular expression too big" and exits 2.
+		[String.raw`printf 'a\n' | grep -c 'a\{32768\}'`, "", 2],
+		// Regressed: the same for a maximum, so the line `a` is counted.
+		[String.raw`printf 'a\n' | grep -c 'a\{1,32768\}'`, "", 2],
+		// Regressed: the same for a minimum with no maximum.
+		[String.raw`printf 'a\n' | grep -cE 'a{32768,}'`, "", 2],
+		// Regressed: GNU's ERE reads the count after an anchor too.
+		[String.raw`printf 'a\n' | grep -cE '^{32768}'`, "", 2],
+		// Regressed: GNU nl reads its pattern as grep does, and exits 1.
+		[String.raw`printf 'a\n' | nl -bp'a\{1,32768\}'`, "", 1],
+		// 32767 is the most GNU allows.
+		[String.raw`printf 'a\n' | grep -c 'a\{32767\}'`, "0\n", 1],
+		// A BRE's `\{` with nothing to repeat is text, whatever its count.
+		[String.raw`printf '{32768}\n' | grep -c '\{32768\}'`, "1\n", 0],
+		// So is a brace that makes no interval in an ERE.
+		[String.raw`printf '{x\n' | grep -cE '{x'`, "1\n", 0],
+		[String.raw`printf '{1\n' | grep -c '\{1'`, "1\n", 0],
+	]);
+});
+
 describe("builtin grep: `^` after an assertion in a BRE", () => {
 	cases([
 		// Regressed: `^` after `\<` anchors, so the line `a` is selected; GNU reads it as a caret and selects nothing.

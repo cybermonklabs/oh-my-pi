@@ -232,22 +232,22 @@ export class IrcBus implements IrcBusApi {
 		// again before the delivery returned reads parked at both ends. An agent
 		// the bus did not forget records as usual, a parked one or one the
 		// registry never held included; one forgotten and revived since is live.
-		if (
-			(flight.fromForgotten && !isLive(this.#registry.get(message.from))) ||
-			(flight.toForgotten && !isLive(this.#registry.get(flight.to)))
-		) {
+		if (receipt.outcome === "failed" || (flight.fromForgotten && !isLive(this.#registry.get(message.from)))) {
 			return receipt;
 		}
-		if (receipt.outcome !== "failed") {
-			// The receipt names who received it: the lifecycle can readdress the
-			// message after this call resolved the name.
-			if (message.progress) {
-				this.#record(this.#lastProgress, message.from, receipt.to, mark);
-			} else {
-				this.#record(this.#lastSent, message.from, receipt.to, mark);
-				if (!message.broadcast && !message.wakeRelay)
-					this.#record(this.#lastDirect, message.from, receipt.to, mark);
-			}
+		// A recipient forgotten during the delivery keeps only what forgetAgent
+		// keeps of it: a live sender's sent and progress marks, which the wake-turn
+		// relay of the sender's turn still asks, and no direct mark.
+		const recipientForgotten = flight.toForgotten && !isLive(this.#registry.get(flight.to));
+		if (recipientForgotten && !isLive(this.#registry.get(message.from))) return receipt;
+		// The receipt names who received it: the lifecycle can readdress the
+		// message after this call resolved the name.
+		if (message.progress) {
+			this.#record(this.#lastProgress, message.from, receipt.to, mark);
+		} else {
+			this.#record(this.#lastSent, message.from, receipt.to, mark);
+			if (!recipientForgotten && !message.broadcast && !message.wakeRelay)
+				this.#record(this.#lastDirect, message.from, receipt.to, mark);
 		}
 		return receipt;
 	}

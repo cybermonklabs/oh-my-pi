@@ -11,8 +11,11 @@ import {
 	shareSession,
 } from "../src/export/share";
 import { SecretObfuscator } from "../src/secrets/obfuscator";
-import type { SessionEntry, SessionHeader } from "../src/session/session-entries";
+import { isColdEntry } from "../src/session/cold-entries";
+import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "../src/session/exit-diagnostics";
+import { CURRENT_SESSION_VERSION, type SessionEntry, type SessionHeader } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import { FileSessionStorage } from "../src/session/session-storage";
 import { SqlSessionStorage } from "../src/session/sql-session-storage";
 
 const IV_LENGTH = 12;
@@ -852,4 +855,78 @@ describe("share command", () => {
 			server.stop(true);
 		}
 	}, 30_000);
+});
+
+describe("buildShareSnapshot over cold entries", () => {
+	/** Tool start markers before the cut of a compaction, so a session opened with its cold store holds them cold. */
+	async function writeSessionWithColdMarkers(dir: string, secret: string): Promise<string> {
+		const timestamp = "2026-06-12T00:00:00.000Z";
+		const file = path.join(dir, "session.jsonl");
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "cold",
+			timestamp,
+			cwd: dir,
+		};
+		const ids = ["x1", "x2", "x3", "u1", "c1"];
+		const entries = ids.map((id, index) => {
+			const parentId = index === 0 ? null : ids[index - 1]!;
+			if (id === "u1") return { ...messageEntry(id, parentId, "the token is in the markers"), timestamp };
+			if (id === "c1") {
+				return {
+					type: "compaction",
+					id,
+					parentId,
+					timestamp,
+					summary: "done",
+					firstKeptEntryId: "u1",
+					tokensBefore: 10,
+				};
+			}
+			return {
+				type: "custom",
+				id,
+				parentId,
+				timestamp,
+				customType: TOOL_EXECUTION_START_CUSTOM_TYPE,
+				data: {
+					toolCallId: `call_${id}`,
+					toolName: "bash",
+					args: { command: `echo ${secret} ${"x".repeat(512)}` },
+				},
+			};
+		});
+		await Bun.write(file, [header, ...entries].map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		return file;
+	}
+
+	function openSession(file: string, coldStore: boolean): Promise<SessionManager> {
+		return SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
+	}
+
+	// Regression: a share with secrets masked reads back from the cold store, and resolves, the record of
+	// every cold extension entry only to drop its `data`, which costs a read and parse per entry on each share.
+	test("drops a cold custom entry's data without reading its record, and shares what a whole entry gives", async () => {
+		using dir = TempDir.createSync("@omp-share-cold-");
+		const secret = "hunter2-XYZZY";
+		const file = await writeSessionWithColdMarkers(dir.path(), secret);
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const cold = await openSession(file, true);
+		const whole = await openSession(file, false);
+		try {
+			const markers = cold.getEntries().filter(entry => entry.type === "custom");
+			expect(markers.map(entry => isColdEntry(entry))).toEqual([true, true, true]);
+			const readsBefore = cold.coldStoreStats().materializations;
+
+			const snapshot = buildShareSnapshot(cold, { obfuscator });
+
+			expect(cold.coldStoreStats().materializations).toBe(readsBefore);
+			expect(JSON.stringify(snapshot)).toBe(JSON.stringify(buildShareSnapshot(whole, { obfuscator })));
+			expect(JSON.stringify(snapshot)).not.toContain(secret);
+		} finally {
+			await cold.close();
+			await whole.close();
+		}
+	});
 });

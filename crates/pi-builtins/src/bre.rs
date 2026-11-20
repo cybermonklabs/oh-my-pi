@@ -40,10 +40,14 @@ pub(crate) enum Target {
 	RustBytes,
 	/// PCRE2, which `grep` compiles a back-reference with. It runs with
 	/// PCRE2_UCP, where its own POSIX classes are Unicode categories, so each
-	/// class is written to match what it matches for [`Self::Rust`] (see
-	/// [`push_bracket_class`]): one back-reference among the patterns does
-	/// not change what the others match. It has the look-around the word
-	/// edges need.
+	/// bracket-expression class is written to match what it matches for
+	/// [`Self::Rust`] (see [`push_bracket_class`]). The word class is each
+	/// engine's own: `\w`, `\W`, `\b`, `\B`, `\<`, `\>` and `-w` count `²`
+	/// and `½` as word characters under PCRE2_UCP and not in the `regex`
+	/// crate, so a back-reference among the patterns changes what those
+	/// match: `printf 'x²\n' | grep -c -e 'x\w' -e '\(y\)\1'` is 1, where it
+	/// is 0 without the back-reference and for GNU. It has the look-around the
+	/// word edges need.
 	Pcre,
 	/// PCRE2 without PCRE2_UTF and PCRE2_UCP, for a line that is not UTF-8,
 	/// which GNU grep reads a byte to a character in the C locale: its POSIX
@@ -106,9 +110,14 @@ pub(crate) enum BreError {
 	/// ordinary character instead, a count that holds other than digits
 	/// (`a\{1x\}`); see [`NoInterval`].
 	IntervalInvalid,
+	/// An interval whose count is above 32767, glibc's RE_DUP_MAX, wherever
+	/// the dialect reads it as an interval: `grep 'a\{32768\}'`, and `grep
+	/// -E '{32768}'` with nothing to repeat.
+	TooBig,
 	/// A repetition operator with nothing to repeat, or one more repetition
 	/// than the dialect allows, which `sed` refuses where `grep` reads the
-	/// text itself or drops the operator.
+	/// text itself or drops the operator; in `sed` also a brace with nothing
+	/// to repeat, whatever follows it.
 	RepetitionOperandMissing,
 	/// A `)` or `\)` that closes no group, where the dialect refuses one.
 	ParenUnmatched,
@@ -130,6 +139,7 @@ impl BreError {
 			Self::RangeEndInvalid => "Invalid range end",
 			Self::BraceUnmatched => "Unmatched \\{",
 			Self::IntervalInvalid => "Invalid content of \\{\\}",
+			Self::TooBig => "Regular expression too big",
 			Self::RepetitionOperandMissing => "Invalid preceding regular expression",
 			Self::ParenUnmatched => "Unmatched ) or \\)",
 			Self::BackReferenceInvalid => "Invalid back reference",
@@ -769,19 +779,29 @@ impl Translator<'_> {
 	/// An interval: `{n}`, `{n,}`, `{n,m}`, or GNU's `{,m}` and `{,}`, which
 	/// are `{0,m}` and `{0,}`.
 	fn brace(&mut self) -> Result<(), BreError> {
+		// Whether GNU grep reads a brace that makes no interval here as an
+		// ordinary character: where there is nothing to repeat, or after an
+		// anchor, which glibc gives no repetition.
+		let text = !self.strict() && (self.atom.is_none() || self.atom_is_anchor);
 		match read_interval(&mut self.chars, self.dialect) {
 			Ok((operator, literal)) => self.repeat(&operator, &literal),
-			// With nothing to repeat glibc reads no interval, and the brace is
-			// an ordinary character: `grep -c '\{'` counts the lines holding
-			// one, and so does `grep -cE '{1,2,3}'`.
-			Err(_) if self.atom.is_none() => {
-				self.literal('{');
-				Ok(())
+			// GNU sed refuses a brace with nothing to repeat before it reads
+			// what follows: `sed -E 's{\{x{Y{'` is "Invalid preceding regular
+			// expression".
+			Err(_) if self.strict() && self.atom.is_none() => {
+				Err(BreError::RepetitionOperandMissing)
 			},
-			// So it is after an anchor, which glibc gives no repetition:
-			// `grep -cE '^{}'` counts the lines starting with `{}`, and `grep
-			// -c '\B\{\}'` those holding it.
-			Err(_) if self.atom_is_anchor && !self.strict() => {
+			// GNU grep's dfa reads a count in an ERE wherever it stands, so
+			// `grep -E '^{32768}'` is "regular expression too big", while a
+			// BRE's `\{` with nothing to repeat is text (`grep -c '\{32768\}'`
+			// counts the lines holding `{32768}`).
+			Err(NoInterval::TooBig) if !(text && self.dialect == Dialect::Basic) => {
+				Err(BreError::TooBig)
+			},
+			// Otherwise there the brace is an ordinary character: `grep -c
+			// '\{'` counts the lines holding one, and so do `grep -cE
+			// '{1,2,3}'`, `grep -cE '^{}'` and `grep -c '\B\{\}'`.
+			Err(_) if text => {
 				self.literal('{');
 				Ok(())
 			},
@@ -994,7 +1014,13 @@ enum NoInterval {
 	/// second comma (`a{1,2,3}`), or a maximum below the minimum (`a{2,1}`).
 	/// "Invalid content of \{\}" in every dialect.
 	Invalid,
+	/// The counts make an interval whose most is above [`RE_DUP_MAX`]:
+	/// `a{32768}`, `a{1,32768}`, `a{32768,}`. "Regular expression too big".
+	TooBig,
 }
+
+/// The largest count of an interval glibc and GNU's dfa accept.
+const RE_DUP_MAX: u32 = 32767;
 
 /// What ends one count of an interval.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1034,10 +1060,12 @@ fn read_count(
 	Ok((digits, end))
 }
 
-/// The number a count's digits spell, capped one past glibc's RE_DUP_MAX
-/// (32767), as glibc caps it.
+/// The number a count's digits spell, capped one past [`RE_DUP_MAX`], as
+/// glibc caps it: `a{40000,32768}` is too big, not backwards.
 fn count_value(digits: &str) -> u32 {
-	digits.bytes().fold(0, |value, digit| (value * 10 + u32::from(digit - b'0')).min(0x8000))
+	digits
+		.bytes()
+		.fold(0, |value, digit| (value * 10 + u32::from(digit - b'0')).min(RE_DUP_MAX + 1))
 }
 
 /// Reads the interval after an opening brace, as glibc's `parse_dup_op`
@@ -1063,6 +1091,12 @@ fn read_interval(
 	// A maximum below the minimum: `a{2,1}`.
 	if high.as_deref().is_some_and(|high| !high.is_empty() && count_value(high) < count_value(&low)) {
 		return Err(NoInterval::Invalid);
+	}
+	// The most, or the least where there is no most (`a{32768,}`), checked
+	// once the interval is read, as glibc checks it.
+	let most = high.as_deref().filter(|high| !high.is_empty()).unwrap_or(low.as_str());
+	if count_value(most) > RE_DUP_MAX {
+		return Err(NoInterval::TooBig);
 	}
 	let literal = match &high {
 		Some(high) => format!("{{{low},{high}}}"),
@@ -1506,10 +1540,63 @@ mod tests {
 		assert_eq!(bre_err(r"a\{1"), Some(BreError::BraceUnmatched));
 		assert_eq!(bre_err(r"a\{x"), Some(BreError::BraceUnmatched));
 		assert_eq!(bre_err(r"a\{"), Some(BreError::BraceUnmatched));
-		// With nothing to repeat it is an ordinary brace: `grep -c '\{'`
-		// counts the lines holding one.
-		assert_eq!(bre(r"\{"), r"\{");
+		// With nothing to repeat it is an ordinary brace to grep: `grep -c
+		// '\{'` counts the lines holding one.
+		let grep_bre =
+			|pattern: &str| translate(pattern, Dialect::Basic, Target::Rust, false, Strictness::Lenient);
+		assert_eq!(grep_bre(r"\{"), Ok(r"\{".to_owned()));
 		assert_eq!(bre(r"\}"), r"\}");
+	}
+
+	#[test]
+	fn sed_refuses_a_brace_with_nothing_to_repeat() {
+		// If this regresses, `echo a | sed -E 's{\{x{Y{'` (where `\{` is the
+		// delimiter, so sed's own interval check does not see it) prints `a`
+		// and exits 0, where GNU sed prints "Invalid preceding regular
+		// expression" and exits 1, whatever follows the brace.
+		for pattern in [r"\{", r"\{x", r"\{1,2,3\}", r"\{\}", r"^\{x", r"x\|\{x", r"\(\{x\)"] {
+			assert_eq!(bre_err(pattern), Some(BreError::RepetitionOperandMissing), "{pattern}");
+		}
+		let sed_ere = |pattern: &str| translate(pattern, Dialect::Extended, Target::Fancy, false, Strictness::Sed).err();
+		for pattern in ["{x", "{1,2,3}", "{}", "{2\\}", "^{x", "x|{x", "({x)"] {
+			assert_eq!(sed_ere(pattern), Some(BreError::RepetitionOperandMissing), "{pattern}");
+		}
+		// GNU grep reads each as text.
+		for pattern in ["{x", "{1,2,3}", "{}", "^{x", "x|{x", "({x)"] {
+			assert!(ere_err(pattern).is_none(), "{pattern}");
+		}
+	}
+
+	#[test]
+	fn a_count_above_re_dup_max_is_too_big() {
+		// If this regresses, `grep -c 'a\{32768\}'` searches, and `grep -c
+		// 'a\{1,32768\}'` counts the line `a`, where GNU grep prints "Regular
+		// expression too big" and exits 2, as GNU sed does with exit 1.
+		for pattern in [r"a\{32768\}", r"a\{1,32768\}", r"a\{32768,\}", r"a\{,32768\}", r"a\{0032768\}"] {
+			assert_eq!(bre_err(pattern), Some(BreError::TooBig), "{pattern}");
+			assert_eq!(
+				translate(pattern, Dialect::Basic, Target::Rust, false, Strictness::Lenient).err(),
+				Some(BreError::TooBig),
+				"{pattern}"
+			);
+		}
+		// Capped as glibc caps them, both counts are 32768: too big, not
+		// backwards, while a maximum below the minimum is checked first.
+		assert_eq!(ere_err("a{40000,32768}"), Some(BreError::TooBig));
+		assert_eq!(ere_err("a{40000,1}"), Some(BreError::IntervalInvalid));
+		assert_eq!(ere("a{32767}"), "a{32767}");
+		assert_eq!(ere("a{0032767}"), "a{0032767}");
+		// GNU grep's ERE reads a count wherever it stands; its BRE reads a
+		// `\{` with nothing to repeat, or after an anchor, as text.
+		for pattern in ["{32768}", "^{32768}", "a${32768}", r"\b{32768}", "x|{32768}"] {
+			assert_eq!(ere_err(pattern), Some(BreError::TooBig), "{pattern}");
+		}
+		let grep_bre =
+			|pattern: &str| translate(pattern, Dialect::Basic, Target::Rust, false, Strictness::Lenient);
+		assert_eq!(grep_bre(r"\{32768\}"), Ok(r"\{32768\}".to_owned()));
+		assert_eq!(grep_bre(r"\b\{32768\}"), Ok(r"\b\{32768\}".to_owned()));
+		// A count a character interrupts is not read as a count at all.
+		assert_eq!(ere("a{32768x}"), r"a\{32768x\}");
 	}
 
 	#[test]

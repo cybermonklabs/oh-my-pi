@@ -726,8 +726,8 @@ describe("IRC", () => {
 			});
 
 			// Regressed: a subagent parked while a message to it is delivered keeps that message's
-			// mark, and its owner's wait counts the parked agent as owing a reply.
-			it("records no mark for a recipient parked during the delivery", async () => {
+			// direct mark, and its owner's wait counts the parked agent as owing a reply.
+			it("records no direct mark for a recipient parked during the delivery, and keeps the live sender's sent mark", async () => {
 				registerAgents("0-Main", "0-Sub");
 				raceDelivery("0-Sub", () => {
 					registry.detachSession("0-Sub");
@@ -737,20 +737,22 @@ describe("IRC", () => {
 				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
 				expect(receipt.outcome).toBe("injected");
 
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 			});
 
 			// Regressed: a subagent released while a message to it is delivered keeps that message's
-			// mark for the rest of the session.
-			it("records no mark for a recipient removed during the delivery", async () => {
+			// direct mark for the rest of the session.
+			it("records no direct mark for a recipient removed during the delivery, and keeps the live sender's sent mark", async () => {
 				registerAgents("0-Main", "0-Sub");
 				raceDelivery("0-Sub", () => registry.unregister("0-Sub"));
 
 				const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "which codeword?" });
 				expect(receipt.outcome).toBe("injected");
 
-				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(false);
+				// The live owner keeps its mark of what it sent, as forgetAgent keeps it for a live sender.
+				expect(bus.sentSince("0-Main", "0-Sub", 0)).toBe(true);
 				expect(bus.unansweredSends("0-Main", 0)).toEqual([]);
 			});
 
@@ -858,11 +860,12 @@ describe("IRC", () => {
 			});
 
 			// Regressed: a message to a transcript's name, which the lifecycle hands to the agent now
-			// running that transcript, keeps its mark when that agent parks during the delivery, and its
-			// owner's wait counts the parked agent as owing a reply. Only a lifecycle that resolves a name
+			// running that transcript, kept its direct mark when that agent parked during the delivery,
+			// and its owner's wait counted the parked agent as owing a reply. The live sender keeps only
+			// what forgetAgent keeps: its sent mark, which its wake-turn relay asks. Only a lifecycle that resolves a name
 			// to another agent (`ensureLiveTarget`) readdresses a message.
 			it.skipIf(!("ensureLiveTarget" in AgentLifecycleManager.prototype))(
-				"records no mark for the agent a readdressed message reached and that parked during the delivery",
+				"records no direct mark for the agent a readdressed message reached and that parked during the delivery",
 				async () => {
 					registerAgents("0-Main", "0-Running");
 					registry.register({
@@ -892,7 +895,7 @@ describe("IRC", () => {
 					const receipt = await readdressing.send({ from: "0-Main", to: "0-Transcript", body: "which codeword?" });
 					expect(receipt).toMatchObject({ to: "0-Running", outcome: "injected" });
 
-					expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(false);
+					expect(readdressing.sentSince("0-Main", "0-Running", 0)).toBe(true);
 					expect(readdressing.unansweredSends("0-Main", 0)).toEqual([]);
 				},
 			);
