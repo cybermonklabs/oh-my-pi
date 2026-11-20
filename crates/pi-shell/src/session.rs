@@ -1117,4 +1117,54 @@ mod tests {
 		child.kill().unwrap();
 		child.wait().unwrap();
 	}
+
+	/// A builtin's write that a descriptor's writer thread took and that
+	/// then failed (nothing reads the pipe any more) fails that builtin: a
+	/// write ends only at its flush, so `echo` reports the write error and
+	/// exits 1, and the failure is never lost. The writer thread is forced
+	/// in this test's child process, as Darwin always uses it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_write_that_fails_after_its_hand_off_fails_its_builtin() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_write_that_fails_after_its_hand_off_fails_its_builtin"),
+			|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(1)
+					.enable_all()
+					.build()
+					.unwrap();
+				let errors = runtime.block_on(async {
+					let mut s = session();
+					let (reader, writer) = io::pipe().unwrap();
+					drop(reader);
+					let (mut err_r, err_w) = io::pipe().unwrap();
+					let errors = std::thread::spawn(move || {
+						let mut e = String::new();
+						err_r.read_to_string(&mut e).unwrap();
+						e
+					});
+					let stdio = RunStdio {
+						stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+						stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+						stderr: Some(std::fs::File::from(std::os::fd::OwnedFd::from(err_w))),
+					};
+					tokio::time::timeout(
+						std::time::Duration::from_secs(10),
+						s.run(
+							"trap '' PIPE; echo y; echo \"status=$?\" >&2",
+							stdio,
+							CancellationToken::new(),
+						),
+					)
+					.await
+					.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+					.unwrap();
+					errors.join().unwrap()
+				});
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert!(errors.contains("Broken pipe"), "echo reports its write error: {errors:?}");
+			},
+		);
+	}
 }

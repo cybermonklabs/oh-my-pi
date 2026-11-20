@@ -391,3 +391,23 @@ fn snapshot_of_a_pending_spawn_reissues_it_without_duplicating_the_process() {
 	assert_eq!(r.parts().1.stdout.bytes(), b"status 7\n");
 	assert_eq!(tally(&gate), (2, 2, 1), "one process for one command");
 }
+
+// Failure mode: output a builtin wrote is still held by its descriptor
+// (a host file's writer thread took the chunk) when the next command, an
+// external that inherits the descriptor, starts and writes past it:
+// `echo a; /bin/echo b` prints `b` first. A builtin's write ends only once
+// flushed, so an external starts after everything before it is out.
+#[test]
+fn an_external_starts_only_after_the_output_before_it_is_flushed() {
+	let host = FakeHost::new().with_buffered_stdout();
+	let flushed = host.stdout.clone();
+	let at_spawn = Arc::new(Mutex::new(Vec::new()));
+	let seen = Arc::clone(&at_spawn);
+	let host = host.with_spawner(Box::new(move |_: SpawnSpec<'_>| {
+		*seen.lock() = flushed.bytes();
+		Ok(Box::new(Exited(0)) as Box<dyn ExtProc>)
+	}));
+	let mut r = Rig::new(host, skeleton_init(&[]));
+	assert_eq!(run(&mut r, "echo a; printf b; /x/ext"), (0, false));
+	assert_eq!(*at_spawn.lock(), b"a\nb", "the external started before the shell's output was out");
+}

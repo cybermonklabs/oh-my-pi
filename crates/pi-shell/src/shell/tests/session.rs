@@ -429,6 +429,46 @@ fn is_zombie(pid: u32) -> bool {
 		.unwrap_or(false)
 }
 
+/// The shape that froze agents' shells, made deterministic: one builtin
+/// write leaves the capture pipe's room off a `PIPE_BUF` multiple, and a
+/// write larger than the pipe follows (`printf x; printf '%0300000d\n' 0`).
+/// Under gVisor a pipe polls writable with one byte free, and a blocking
+/// write of up to `PIPE_BUF` then waited in the kernel on the runtime's only
+/// worker, where the capture's reader and every timer run. On a one-worker
+/// runtime the run must deliver all its bytes, and a timer started beside
+/// it must fire.
+#[cfg(unix)]
+#[test]
+fn a_run_that_overfills_its_capture_lets_a_timer_beside_it_fire() {
+	const BOUND: Duration = Duration::from_secs(15);
+	let _guard = shell_test_lock().blocking_lock();
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let _ = tx.send(runtime.block_on(async {
+			let timer = tokio::spawn(tokio::time::sleep(Duration::from_secs(2)));
+			let run = capture_unlocked(
+				"printf x; printf '%0300000d\\n' 0",
+				None,
+				None,
+				CancelToken::default(),
+			)
+			.await;
+			timer.await.expect("the timer task");
+			run
+		}));
+	});
+	let (result, output) = rx.recv_timeout(BOUND).unwrap_or_else(|_| {
+		panic!("DEADLINE fired: the run or the timer beside it did not settle within {BOUND:?}")
+	});
+	assert_eq!(result.exit_code, Some(0), "{result:?}");
+	assert_eq!(output.len(), 300_002, "every byte of the run reached the capture");
+}
+
 /// A real external child that exits while a builtin writes to a full
 /// output pipe nothing drains must be reaped: its `waitpid` runs on the
 /// runtime (`UnixProc`'s `Drop` and `reap`,

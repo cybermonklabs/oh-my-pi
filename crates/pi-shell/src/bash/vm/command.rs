@@ -3211,58 +3211,83 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 	}
 }
 
-/// Write the command's own output in order (pollable).
+/// Write the command's own output in order (pollable). A write is done once
+/// its bytes are handed off and flushed: a host file's writer thread takes a
+/// chunk at once and writes it later, so the flush is where that write
+/// fails, and its error is this command's, as a write error is.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
 	loop {
-		let state = st(vp);
-		let pending = state.writes.front()?;
-		if pending.off >= pending.bytes.len() {
-			state.writes.pop_front();
+		let pending = st(vp).writes.front()?;
+		let (fd, handed_off) = (pending.fd, pending.off >= pending.bytes.len());
+		let handle = vp.fds.handle(fd);
+		if handed_off {
+			match handle.poll_flush(&mut tcx) {
+				Poll::Ready(Ok(())) => {
+					st(vp).writes.pop_front();
+				},
+				Poll::Ready(Err(err)) => {
+					if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+						return Some(flow);
+					}
+				},
+				Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
+			}
 			continue;
 		}
-		let fd = pending.fd;
-		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
 		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
-			Poll::Ready(Ok(written)) if written > 0 => {
-				pending.off += written;
-				if pending.off >= pending.bytes.len() {
-					state.writes.pop_front();
-				}
-			},
+			Poll::Ready(Ok(written)) if written > 0 => pending.off += written,
 			Poll::Ready(res) => {
-				state.writes.retain(|queued| queued.fd != fd);
-				if fd != 2 {
-					let err = res
-						.err()
-						.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
-					if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
-						// The virtual SIGPIPE ends this shell silently, as it ends
-						// a bash pipeline child.
-						let platform = k.engine.config().platform;
-						return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
-					}
-					let state = st(vp);
-					// bash's `help` does not check its writes.
-					if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
-						continue;
-					}
-					let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
-					state.status = 1;
-					// Through the command's own fd 2 (`2>&1 >&4`), while its
-					// redirections are in place.
-					let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-					st(vp)
-						.writes
-						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				let err = res
+					.err()
+					.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
 				}
 			},
 			Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
 		}
 	}
+}
+
+/// A write to `fd` failed: drop what is queued for it, and report the error
+/// as the command's (bash's `write error`), or end the shell on `SIGPIPE`.
+/// A failed write to fd 2 is dropped without a report.
+fn write_failed(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	fd: i32,
+	err: std::io::Error,
+) -> Option<Flow> {
+	st(vp).writes.retain(|queued| queued.fd != fd);
+	if fd == 2 {
+		return None;
+	}
+	if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
+		// The virtual SIGPIPE ends this shell silently, as it ends
+		// a bash pipeline child.
+		let platform = k.engine.config().platform;
+		return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+	}
+	let state = st(vp);
+	// bash's `help` does not check its writes.
+	if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
+		return None;
+	}
+	let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
+	state.status = 1;
+	// Through the command's own fd 2 (`2>&1 >&4`), while its
+	// redirections are in place.
+	let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
+	st(vp)
+		.writes
+		.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	None
 }
 
 /// Whether `SIGPIPE` is ignored (`trap '' PIPE`), so a write to a pipe

@@ -88,25 +88,30 @@ enum Native {
 	/// A descriptor written once the reactor reports it writable.
 	#[cfg(unix)]
 	Descriptor(descriptor::Descriptor),
-	/// A pipe written on the blocking pool.
-	#[cfg(windows)]
+	/// A pipe written on the blocking pool: every Windows pipe, and a Unix
+	/// descriptor that can block but could not be registered.
+	#[cfg(any(unix, windows))]
 	Blocking(OpenFile),
 }
 
 impl Native {
 	/// Classifies `handle`: inline for a regular file, a device that never
-	/// blocks or an in-process stream; otherwise a reactor-driven descriptor
-	/// (a blocking-pool pipe on Windows). Needs a runtime to register with.
+	/// blocks or an in-process stream; otherwise a reactor-driven descriptor,
+	/// or the blocking pool where none can be registered (every Windows pipe;
+	/// a failed dup or registration on Unix). Needs a runtime to register
+	/// with.
 	fn open(handle: &OpenFile, regular_file: bool) -> Self {
 		#[cfg(unix)]
 		{
 			if !regular_file
 				&& let Ok(fd) = handle.try_borrow_as_fd()
 				&& pi_vfs::fd_reads_can_block(fd)
-				&& let Ok(owned) = fd.try_clone_to_owned()
-				&& let Ok(descriptor) = descriptor::Descriptor::gated(owned)
 			{
-				return Self::Descriptor(descriptor);
+				// A write that can wait never runs inline on the worker.
+				return match fd.try_clone_to_owned().map(descriptor::Descriptor::gated) {
+					Ok(Ok(descriptor)) => Self::Descriptor(descriptor),
+					Ok(Err(_)) | Err(_) => Self::Blocking(handle.clone()),
+				};
 			}
 			Self::Inline(handle.clone())
 		}
@@ -134,7 +139,7 @@ impl Native {
 				let result = descriptor.write_all(&bytes).await;
 				(bytes, result)
 			},
-			#[cfg(windows)]
+			#[cfg(any(unix, windows))]
 			Self::Blocking(file) => {
 				let mut file = file.clone();
 				match tokio::task::spawn_blocking(move || {
@@ -564,13 +569,26 @@ mod descriptor {
 		/// The open file description is shared (or left blocking): every
 		/// read syscall is preceded by a zero-timeout readiness check.
 		gated:          bool,
-		/// A dup that writes on Tokio's blocking pool, where a write may wait
-		/// in the kernel without holding a runtime worker: the description
-		/// could not be reopened privately (Darwin, or a reopen that failed).
-		blocking:       Option<Arc<std::fs::File>>,
+		/// Writes go on Tokio's blocking pool, where a write may wait in the
+		/// kernel without holding a runtime worker: the description could not
+		/// be reopened privately (Darwin, a terminal, or a reopen that failed).
+		blocking_writes: bool,
+		/// The dup those writes use, made by the first one; a failed dup is
+		/// that write's error.
+		blocking:       std::sync::OnceLock<Arc<std::fs::File>>,
 		/// The reactor never reports this descriptor's end of input (a named
 		/// FIFO on an Apple platform); waits recheck it periodically.
 		eof_unreported: bool,
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		/// Test only: in this thread, [`Descriptor::gated`] skips the private
+		/// reopen.
+		pub(super) static NO_REOPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+		/// Test only: in this thread, the dup for blocking writes fails with
+		/// `EMFILE`.
+		pub(super) static DUP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 	}
 
 	impl Descriptor {
@@ -580,8 +598,13 @@ mod descriptor {
 		/// another device, whose open has side effects), Darwin, and a reopen
 		/// that fails write on the blocking pool.
 		pub fn gated(fd: OwnedFd) -> Result<Self, OwnedFd> {
+			#[cfg(all(target_os = "linux", test))]
+			let reopen = !NO_REOPEN.get();
+			#[cfg(all(target_os = "linux", not(test)))]
+			let reopen = true;
 			#[cfg(target_os = "linux")]
-			if is_fifo(fd.as_fd())
+			if reopen
+				&& is_fifo(fd.as_fd())
 				&& let Ok(private) = reopen_nonblocking(fd.as_fd())
 			{
 				return Self::register(private, false, false);
@@ -609,18 +632,29 @@ mod descriptor {
 
 		fn register(fd: OwnedFd, gated: bool, blocking_writes: bool) -> Result<Self, OwnedFd> {
 			let eof_unreported = is_named_fifo(fd.as_fd());
-			let blocking = if blocking_writes {
-				match fd.try_clone() {
-					Ok(dup) => Some(Arc::new(std::fs::File::from(dup))),
-					Err(_) => return Err(fd),
-				}
-			} else {
-				None
-			};
 			match AsyncFd::try_new(fd) {
-				Ok(afd) => Ok(Self { afd, gated, blocking, eof_unreported }),
+				Ok(afd) => Ok(Self {
+					afd,
+					gated,
+					blocking_writes,
+					blocking: std::sync::OnceLock::new(),
+					eof_unreported,
+				}),
 				Err(error) => Err(error.into_parts().0),
 			}
+		}
+
+		/// The dup blocking writes use, made on the first one.
+		fn blocking_file(&self) -> io::Result<Arc<std::fs::File>> {
+			if let Some(file) = self.blocking.get() {
+				return Ok(Arc::clone(file));
+			}
+			#[cfg(test)]
+			if DUP_FAILS.get() {
+				return Err(io::Error::from_raw_os_error(libc::EMFILE));
+			}
+			let dup = Arc::new(std::fs::File::from(self.afd.get_ref().try_clone()?));
+			Ok(Arc::clone(self.blocking.get_or_init(|| dup)))
 		}
 
 		/// Reads up to `buf.len()` bytes, waiting for readiness.
@@ -680,10 +714,11 @@ mod descriptor {
 		/// without any readiness: after a write that took the room, an
 		/// edge-triggered wait may get no new edge while the reader keeps up.
 		pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
-			if let Some(file) = &self.blocking {
+			if self.blocking_writes {
+				let file = self.blocking_file()?;
 				while !buf.is_empty() {
 					let chunk = buf.len().min(BLOCKING_WRITE_CHUNK);
-					let (file, bytes) = (Arc::clone(file), buf[..chunk].to_vec());
+					let (file, bytes) = (Arc::clone(&file), buf[..chunk].to_vec());
 					tokio::task::spawn_blocking(move || {
 						use std::io::Write as _;
 						(&*file).write_all(&bytes)
@@ -982,6 +1017,56 @@ mod tests {
 			pty,
 			"Descriptor::gated reopened the pty master: it holds a new pty"
 		);
+	}
+
+	/// A dup that fails (`EMFILE` near the descriptor limit) for a
+	/// descriptor whose writes go on the blocking pool is that write's
+	/// error: the write never falls back to a blocking write on the
+	/// runtime's thread. The pipe is full and nothing reads it, so such a
+	/// write would never return. The bound runs on the calling thread.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_failed_dup_for_blocking_writes_is_the_writes_error() {
+		use std::{
+			os::fd::AsRawFd as _,
+			sync::mpsc::{RecvTimeoutError, channel},
+			time::Duration,
+		};
+
+		let (reader, writer) = std::io::pipe().unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()))
+			.write_all(&vec![b'q'; capacity])
+			.unwrap();
+		let (tx, rx) = channel();
+		std::thread::spawn(move || {
+			descriptor::NO_REOPEN.set(true);
+			descriptor::DUP_FAILS.set(true);
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap();
+			let result = runtime.block_on(async {
+				let file = OpenFile::from(std::fs::File::from(OwnedFd::from(writer)));
+				let mut native = Native::open(&file, false);
+				native.write_all(b"x".to_vec()).await.1
+			});
+			let _ = tx.send(result);
+		});
+		match rx.recv_timeout(Duration::from_secs(5)) {
+			Ok(result) => assert_eq!(
+				result.as_ref().err().and_then(io::Error::raw_os_error),
+				Some(libc::EMFILE),
+				"{result:?}"
+			),
+			Err(RecvTimeoutError::Timeout) => {
+				panic!("DEADLINE fired: the write waited in the kernel on the runtime's thread")
+			},
+			Err(e) => panic!("{e}"),
+		}
+		drop(reader);
 	}
 }
 
