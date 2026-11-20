@@ -5,11 +5,13 @@ import * as path from "node:path";
 import { executeShell } from "../native/index.js";
 
 // The bash tool's shell runs `sed` as a builtin, which reads a line that is
-// UTF-8 as characters in every locale. Each expectation below is the bytes
-// GNU sed 4.9 writes on stdout, and the status it exits with, for the same
-// command in C.UTF-8; each comment gives GNU's output as `od -c` prints it,
-// and its answer in the C locale, which reads the line a byte to a character.
-// stderr is dropped. The outputs are Latin-1 strings, one character to a byte.
+// UTF-8 as characters in every locale, but for `y`, whose strings it reads
+// by the shell's locale, as GNU does; a `y` case sets `LC_ALL=C.UTF-8`. Each
+// expectation below is the bytes GNU sed 4.9 writes on stdout, and the
+// status it exits with, for the same command in C.UTF-8; each comment gives
+// GNU's output as `od -c` prints it, and its answer in the C locale, which
+// reads the line a byte to a character. stderr is dropped. The outputs are
+// Latin-1 strings, one character to a byte.
 
 let dir: string;
 
@@ -50,9 +52,13 @@ describe("builtin sed: a line cut inside a character and joined back is UTF-8 ag
 		// `c a f e a u l a i t \n`. In C GNU refuses `y/é/e/` (strings of different lengths).
 		// Regressed: `caf\303\251aulait`. The `é` is written with `printf`: bun writes a raw
 		// template's `é` as the text `\u00E9`.
-		[String.raw`printf 'caf\303\251 au lait\n' | sed "s/ *//g;y/$(printf '\303\251')/e/"`, "cafeaulait\n", 0],
+		[
+			String.raw`printf 'caf\303\251 au lait\n' | LC_ALL=C.UTF-8 sed "s/ *//g;y/$(printf '\303\251')/e/"`,
+			"cafeaulait\n",
+			0,
+		],
 		// GNU reads `\u00E9` as `u00E9`: "strings for `y' command are different lengths", exit 1.
-		// Was `cafeaulait`, `\u00E9` read as `é`; in the base "internal error".
+		// Regressed: `\u00E9` was read as `é`, and the line printed as `cafeaulait`.
 		[String.raw`printf 'caf\303\251 au lait\n' | sed 's/ *//g;y/\u00E9/e/'`, "", 1],
 		// `X X X \n`: the fourth empty match is the one after the `a`, and the second, inside the `é`,
 		// is left as it was. In C: `X X X X \n`. Regressed: `XXXX`.

@@ -78,6 +78,13 @@ impl Target {
 	const fn reads_bytes(self) -> bool {
 		matches!(self, Self::RustBytes | Self::PcreBytes)
 	}
+
+	/// Whether the engine is one of grep's that fold case by Unicode's own
+	/// rules, where GNU grep's differ (see [`push_case_literal`]); `sed`
+	/// and `nl` keep their engine's.
+	const fn folds_unicode(self) -> bool {
+		matches!(self, Self::Rust | Self::Pcre)
+	}
 }
 
 /// The offset of the characters that stand for the bytes from 0x80 up where
@@ -129,16 +136,29 @@ pub(crate) fn pattern_text(bytes: &[u8]) -> (String, bool) {
 
 /// The bytes of a pattern of [`pattern_text`]: `text` with each character
 /// that stands for a byte written as that byte.
-#[cfg(any(feature = "util.grep", test))]
+#[cfg(any(feature = "util.grep", feature = "util.sed", test))]
 pub(crate) fn pattern_bytes(text: &str) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(text.len());
 	for c in text.chars() {
-		match char_byte(c) {
-			Some(byte) => bytes.push(byte),
-			None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-		}
+		push_char_bytes(&mut bytes, c);
 	}
 	bytes
+}
+
+/// Appends the bytes `c` is: the byte it stands for (see [`BYTE_CHARS`]),
+/// else its UTF-8.
+#[cfg(any(feature = "util.grep", feature = "util.sed", test))]
+pub(crate) fn push_char_bytes(bytes: &mut Vec<u8>, c: char) {
+	match char_byte(c) {
+		Some(byte) => bytes.push(byte),
+		None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+	}
+}
+
+/// The number of bytes [`push_char_bytes`] appends for `c`.
+#[cfg(any(feature = "util.sed", test))]
+pub(crate) fn char_bytes_len(c: char) -> usize {
+	if char_byte(c).is_some() { 1 } else { c.len_utf8() }
 }
 
 /// Writes the pattern byte `byte`, which is no UTF-8, as an atom of `target`
@@ -271,10 +291,11 @@ pub(crate) fn translate(
 /// selects nothing, in a line that is not UTF-8 too), except as a range's
 /// end, which is the character of its value there (`grep $'[\351-\377]'`
 /// selects `é`, U+00E9). There a target that reads a byte to a character,
-/// for a line that is not UTF-8, matches each bracket member outside ASCII,
-/// and `.`, only as the whole UTF-8 sequence of a character, and nothing of
-/// an encoding error, as GNU does, whatever the pattern holds: `printf
-/// 'x\251\n' | grep -c '[é]'` is 0.
+/// which grep reads a line that is not UTF-8 with where a back-reference
+/// is among the patterns, matches each bracket member outside ASCII, and
+/// `.`, only as the whole UTF-8 sequence of a character, and nothing of an
+/// encoding error, as GNU does: `printf 'x\251\n' | grep -c -e '[é]' -e
+/// '\(k\)\1'` is 0.
 #[cfg(any(feature = "util.grep", test))]
 pub(crate) fn translate_raw(
 	pattern: &str,
@@ -1147,11 +1168,15 @@ impl Translator<'_> {
 			Some(byte) => push_raw_byte(&mut self.out, byte, self.target),
 			// In a UTF-8 locale `.` is a whole character, and no encoding
 			// error, in a line that is not UTF-8 as in one that is (see
-			// `close_whole_class`): `printf 'x\377y\n' | grep -c 'x.y'` is
-			// 0.
+			// `close_class`): `printf 'x\377y\n' | grep -c -e 'x.y' -e
+			// $'\351'` is 0.
 			None if c == '.' && self.bytes.utf8_locale && self.target.reads_bytes() => {
 				self.out.push_str(r"[^\n");
-				close_whole_class(&mut self.out, start, true, true, &[], Vec::new(), false, self.target);
+				let members = ClassMembers { written: true, ..ClassMembers::default() };
+				close_class(&mut self.out, start, true, members, false, self.target, true);
+			},
+			None if self.icase && self.target.folds_unicode() && case_differs(c) => {
+				push_case_literal(&mut self.out, c);
 			},
 			None => push_literal(&mut self.out, c),
 		}
@@ -1375,14 +1400,14 @@ fn take_bracket_expression(
 		Some(byte) if bytes.utf8_locale => char::from(byte),
 		_ => c,
 	};
-	// In a UTF-8 locale, an engine that reads a byte to a character (for a
+	// The members kept apart to be written at the close (see `close_class`):
+	// in a UTF-8 locale an engine that reads a byte to a character (for a
 	// line that is not UTF-8) matches a member outside ASCII only as its
-	// whole UTF-8 sequence; `wide` holds those members, as ranges of scalar
-	// values, `out` the class of the ASCII ones, and `ascii` those, for
-	// their other case (see `close_whole_class`).
+	// whole UTF-8 sequence, and under `-i` a range whose ends are pattern
+	// bytes holds no other case of its characters.
 	let whole = bytes.utf8_locale && target.reads_bytes();
-	let mut wide: Vec<(u32, u32)> = Vec::new();
-	let mut ascii: Vec<(char, char)> = Vec::new();
+	let apart = whole || (icase && bytes.raw && bytes.utf8_locale);
+	let mut members = ClassMembers::default();
 	// The byte of a range's end that an engine reading a byte to a
 	// character puts next to the `-`: the pattern byte it stands for, or
 	// else the last of its UTF-8 bytes where it starts the range and the
@@ -1394,8 +1419,6 @@ fn take_bracket_expression(
 			if start { encoded[encoded.len() - 1] } else { encoded[0] }
 		})
 	};
-	// Whether a member was written to `out`; see `bytes`.
-	let mut written = false;
 	// A `-` first in the list is a member.
 	let mut first = true;
 	// GNU warns where the list opens with a colon, the member last read is a
@@ -1430,6 +1453,13 @@ fn take_bracket_expression(
 				let BracketMember::Char(end) = take_bracket_member(chars, true)? else {
 					return Err(BreError::RangeEndInvalid);
 				};
+				let raw_end = raw_byte(start).is_some() || raw_byte(end).is_some();
+				// The ends GNU checks the upper case of a character against
+				// under `-i` where an end is a pattern byte: that byte's
+				// character as it is, and any other end's upper case.
+				let upper_end =
+					|c: char| if raw_byte(c).is_some() { as_char(c) } else { simple_upper(c) };
+				let upper_ends = (upper_end(start), upper_end(end));
 				let (start, end) = (as_char(start), as_char(end));
 				// GNU checks the range against the ends it folds: `[Z-a]` is
 				// a range of its own and "Invalid range end" under `-i`,
@@ -1454,63 +1484,57 @@ fn take_bracket_expression(
 				if backwards {
 					return Err(BreError::RangeEndInvalid);
 				}
-				if whole {
+				if icase && raw_end && bytes.utf8_locale {
+					// GNU holds each character whose upper case is in the
+					// range: under `-i` `[\300-\301]` matches `á`, and
+					// `[\340-\341]` neither `á` nor `Á`; `[z-\351]` matches `Z`
+					// and `É`, and not `a`, whose upper case is before `Z`.
+					members.exact.extend(upper_case_in(upper_ends.0, upper_ends.1));
+				} else if apart {
 					if low.is_ascii() {
 						push_bracket_char(out, low);
 						out.push('-');
 						if high.is_ascii() {
 							push_bracket_char(out, high);
 						} else {
-							push_raw_byte(out, 0x7F, target);
+							out.push_str(r"\x7F");
 						}
-						ascii.push((low, high.min('\x7F')));
-						written = true;
+						if icase {
+							members.ascii.push((low, high.min('\x7F')));
+						}
+						members.written = true;
 					}
 					if !high.is_ascii() {
-						wide.push((u32::from(low).max(0x80), u32::from(high)));
+						members.wide.push((u32::from(low).max(0x80), u32::from(high)));
 					}
 				} else {
 					push_bracket_member(out, low, raw_byte(low), target);
 					out.push('-');
 					push_bracket_member(out, high, raw_byte(high), target);
-					written = true;
+					members.written = true;
 				}
 			},
 			BracketMember::Char(c) if raw_byte(c).is_some() && bytes.utf8_locale => {},
-			BracketMember::Char(c) if whole && !c.is_ascii() => wide.push((u32::from(c), u32::from(c))),
+			BracketMember::Char(c) if apart && !c.is_ascii() => {
+				members.wide.push((u32::from(c), u32::from(c)));
+			},
 			BracketMember::Char(c) | BracketMember::Equivalence(c) => {
 				push_bracket_member(out, c, raw_byte(c), target);
-				if whole {
-					ascii.push((c, c));
+				if apart && icase {
+					members.ascii.push((c, c));
 				}
-				written = true;
+				members.written = true;
 			},
 			BracketMember::Class(name) => {
 				push_bracket_class(out, name, target, icase);
-				written = true;
+				members.written = true;
 			},
 		}
 		match chars.peek() {
 			None => return Err(BreError::BracketUnmatched),
 			Some(']') => {
 				chars.next();
-				if whole {
-					close_whole_class(out, class_start, negated, written, &ascii, wide, icase, target);
-					return Ok(opens_colon && ends_colon && other_member && !special);
-				}
-				out.push(']');
-				// Every member was a pattern byte no character is: the list
-				// matches no character, or every one where it negates, written
-				// in bytes for an engine that reads them.
-				if !written {
-					out.truncate(class_start);
-					out.push_str(match (negated, target.reads_bytes()) {
-						(false, false) => r"[^\x00-\x{10FFFF}]",
-						(true, false) => r"[\x00-\x{10FFFF}]",
-						(false, true) => r"[^\x00-\xFF]",
-						(true, true) => r"[\x00-\xFF]",
-					});
-				}
+				close_class(out, class_start, negated, members, icase, target, whole);
 				return Ok(opens_colon && ends_colon && other_member && !special);
 			},
 			Some(_) => {},
@@ -1518,28 +1542,54 @@ fn take_bracket_expression(
 	}
 }
 
-/// Closes a bracket expression for an engine that reads a byte to a
-/// character, in a UTF-8 locale, as GNU reads it there in a line that is not
-/// UTF-8: `out` holds it from `class_start` with its ASCII members
-/// (`written` where it holds one), `ascii` the ranges of those, and `wide`
-/// the ranges of its members outside ASCII, which match only as the whole
-/// UTF-8 sequence of a character. A list that negates matches any character
-/// it does not hold, and no encoding error: `printf 'x\251\n' | grep -o
-/// $'[^\300-\377]'` prints the `x` alone. Where `icase` the other case of
-/// each member is one too, as GNU gives it ([`case_counterparts`]); the
-/// engine folds ASCII alone. It is written as an alternation,
-/// `(?:[a]|\xC3[\x80-\xBF])` for `[a\300-\377]`.
-fn close_whole_class(
+/// The members of a bracket expression that are written at its close; see
+/// [`close_class`].
+#[derive(Default)]
+struct ClassMembers {
+	/// Whether a member was written to the list as it was read.
+	written: bool,
+	/// Under `-i`, the ranges of the ASCII members written, whose other case
+	/// is a member too.
+	ascii:   Vec<(char, char)>,
+	/// The ranges of the members outside ASCII, as scalar values.
+	wide:    Vec<(u32, u32)>,
+	/// Members whose other case is none: under `-i`, the characters a range
+	/// whose ends are pattern bytes holds ([`upper_case_in`]).
+	exact:   Vec<(u32, u32)>,
+}
+
+/// Closes a bracket expression whose list `out` holds from `class_start`,
+/// with the members it kept apart. A list that holds no member matches no
+/// character, or every one where it negates.
+///
+/// For an engine that reads a byte to a character, in a UTF-8 locale
+/// (`whole`), as GNU reads it there in a line that is not UTF-8: the members
+/// outside ASCII match only as the whole UTF-8 sequence of a character, and
+/// a list that negates matches any character it does not hold, and no
+/// encoding error: `printf 'x\251\n' | grep -o $'[^\300-\377]'` prints the
+/// `x` alone. Where `icase` the other case of each member is one too, as GNU
+/// gives it ([`case_counterparts`]); the engine folds ASCII alone. It is
+/// written as an alternation, `(?:[a]|\xC3[\x80-\xBF])` for `[a\300-\377]`.
+///
+/// For an engine that reads text the members are written in the class,
+/// which the engine folds; where they were kept apart (a pattern of
+/// [`pattern_text`] in a UTF-8 locale, under `-i`), each member's other
+/// case is written as for `whole` and the class is read with case, as the
+/// engine's folding is not GNU's: `printf 'I\377\n' | grep -ic
+/// $'[\304\261\351]'` is 1.
+fn close_class(
 	out: &mut String,
 	class_start: usize,
 	negated: bool,
-	mut written: bool,
-	ascii: &[(char, char)],
-	mut wide: Vec<(u32, u32)>,
+	members: ClassMembers,
 	icase: bool,
 	target: Target,
+	whole: bool,
 ) {
-	if icase {
+	let ClassMembers { mut written, ascii, mut wide, exact } = members;
+	let kept_apart = !(ascii.is_empty() && wide.is_empty() && exact.is_empty());
+	let fold = icase && (whole || kept_apart);
+	if fold {
 		let lonesome = LONESOME_LOWER.map(|lone| (lone, simple_upper(lone)));
 		let mut folded = Vec::new();
 		let members = ascii.iter().map(|&(low, high)| (u32::from(low), u32::from(high)));
@@ -1557,15 +1607,7 @@ fn close_whole_class(
 		}
 		wide.extend(folded);
 	}
-	if !negated && wide.is_empty() {
-		out.push(']');
-		// Every member was a pattern byte no character is.
-		if !written {
-			out.truncate(class_start);
-			out.push_str(r"[^\x00-\xFF]");
-		}
-		return;
-	}
+	wide.extend(exact);
 	wide.sort_unstable();
 	let mut merged: Vec<(u32, u32)> = Vec::with_capacity(wide.len());
 	for (low, high) in wide {
@@ -1573,6 +1615,36 @@ fn close_whole_class(
 			Some(last) if low <= last.1 + 1 => last.1 = last.1.max(high),
 			_ => merged.push((low, high)),
 		}
+	}
+	if !whole {
+		for &(low, high) in &merged {
+			let low = char::from_u32(low).expect("a member's end is a scalar value");
+			let high = char::from_u32(high).expect("a member's end is a scalar value");
+			push_bracket_char(out, low);
+			if high != low {
+				out.push('-');
+				push_bracket_char(out, high);
+			}
+		}
+		if !written && merged.is_empty() {
+			out.truncate(class_start);
+			out.push_str(if negated { r"[\x00-\x{10FFFF}]" } else { r"[^\x00-\x{10FFFF}]" });
+			return;
+		}
+		out.push(']');
+		if fold {
+			out.insert_str(class_start, "(?-i:");
+			out.push(')');
+		}
+		return;
+	}
+	if !negated && merged.is_empty() {
+		out.push(']');
+		if !written {
+			out.truncate(class_start);
+			out.push_str(r"[^\x00-\xFF]");
+		}
+		return;
 	}
 	if negated {
 		let mut gaps = Vec::new();
@@ -1624,29 +1696,63 @@ const LONESOME_LOWER: [char; 19] = [
 /// `[s]` matches `ſ` and `[ı]` matches `I`, and the Kelvin sign and `k`
 /// match each other neither way, as `printf 'k\377\n' | grep -ic
 /// $'[\u212A\351]'` counts 0.
-fn case_counterparts(c: char, lonesome: &[(char, char)]) -> Vec<char> {
+fn case_counterparts(c: char, lonesome: &[(char, char)]) -> impl Iterator<Item = char> + '_ {
 	let upper = simple_upper(c);
 	let lower = simple_lower(upper);
-	let mut found = Vec::new();
-	if upper != c {
-		found.push(upper);
-	}
-	if lower != upper && lower != c && simple_upper(lower) == upper {
-		found.push(lower);
-	}
-	found.extend(
-		lonesome
-			.iter()
-			.filter(|&&(lone, lone_upper)| lone != lower && lone != upper && lone != c && lone_upper == upper)
-			.map(|&(lone, _)| lone),
-	);
-	found
+	let lonesome = lonesome
+		.iter()
+		.filter(move |&&(lone, lone_upper)| lone != lower && lone != upper && lone != c && lone_upper == upper)
+		.map(|&(lone, _)| lone);
+	(upper != c)
+		.then_some(upper)
+		.into_iter()
+		.chain((lower != upper && lower != c && simple_upper(lower) == upper).then_some(lower))
+		.chain(lonesome)
 }
 
-/// The simple upper case of `c`, as `towupper` gives it: Rust's where it is
-/// one character, and for a lower-case Greek letter with ypogegrammeni,
-/// whose full upper case is two, the one with prosgegrammeni (`ᾀ` is `ᾈ`).
-fn simple_upper(c: char) -> char {
+/// Whether the `regex` crate's and PCRE2's own folding of `c` may match
+/// other characters than GNU grep matches without case ([`case_counterparts`]):
+/// that of a letter outside ASCII, and of `i`, `I`, `k` and `K`, which they
+/// fold with `İ`/`ı` left out and with the Kelvin sign.
+pub(crate) fn case_differs(c: char) -> bool {
+	if c.is_ascii() { matches!(c, 'i' | 'I' | 'k' | 'K') } else { c.is_alphabetic() }
+}
+
+/// Writes `c` as GNU grep matches it without case, for an engine that folds
+/// case itself: `c` and its counterparts ([`case_counterparts`]) in a class
+/// read with case. `printf '\342\204\252\n' | grep -ic k` (the Kelvin sign)
+/// is 0, `printf 'I\n' | grep -ic $'\304\261'` (`ı`) is 1, and `printf
+/// '\341\272\236\n' | grep -ic $'\303\237'` (`ẞ` against `ß`) is 0, in a
+/// line that is not UTF-8 too.
+pub(crate) fn push_case_literal(out: &mut String, c: char) {
+	let lonesome = LONESOME_LOWER.map(|lone| (lone, simple_upper(lone)));
+	out.push_str("(?-i:[");
+	push_bracket_char(out, c);
+	for other_case in case_counterparts(c, &lonesome) {
+		push_bracket_char(out, other_case);
+	}
+	out.push_str("])");
+}
+
+/// The characters whose upper case ([`simple_upper`]) is from `low` to
+/// `high`, as ranges of scalar values: the members GNU grep gives under
+/// `-i` a range whose ends are pattern bytes, each the character of its
+/// value.
+fn upper_case_in(low: char, high: char) -> impl Iterator<Item = (u32, u32)> {
+	(low..=high)
+		.flat_map(|c| [c, simple_lower(c)])
+		.chain(LONESOME_LOWER)
+		.filter(move |&c| (low..=high).contains(&simple_upper(c)))
+		.map(|c| (u32::from(c), u32::from(c)))
+}
+
+/// The simple upper case of `c`, as `towupper` gives it and GNU sed's `\U`
+/// writes it: Rust's where it is one character, and for a lower-case Greek
+/// letter with ypogegrammeni, whose full upper case is two, the one with
+/// prosgegrammeni (`ᾀ` is `ᾈ`); any other whose full upper case is several
+/// characters is itself (`ß`, `ﬁ`). Measured with GNU sed 4.9 in C.UTF-8 on
+/// every code point whose full case mapping is several characters.
+pub(crate) fn simple_upper(c: char) -> char {
 	let mut upper = c.to_uppercase();
 	if let (Some(one), None) = (upper.next(), upper.next()) {
 		return one;
@@ -1660,9 +1766,10 @@ fn simple_upper(c: char) -> char {
 	char::from_u32(simple).unwrap_or(c)
 }
 
-/// The simple lower case of `c`, as `towlower` gives it: Rust's where it is
-/// one character, and `i` for `İ`, whose full lower case is two.
-fn simple_lower(c: char) -> char {
+/// The simple lower case of `c`, as `towlower` gives it and GNU sed's `\L`
+/// writes it: Rust's where it is one character, and `i` for `İ`, the only
+/// character whose full lower case is two.
+pub(crate) fn simple_lower(c: char) -> char {
 	let mut lower = c.to_lowercase();
 	match (lower.next(), lower.next()) {
 		(Some(one), None) => one,
@@ -2819,26 +2926,57 @@ mod tests {
 			)
 			.to_owned())
 		);
-		// Without case each other character's other case is a member too.
-		let text = pattern_text(b"[\xe0-\xe1]").0;
-		assert_eq!(
-			translate_raw(&text, Dialect::Basic, Target::RustBytes, true, PatternBytes { raw: true, utf8_locale: true }),
-			Ok(r"(?:\xC3[\x80-\x81]|\xC3[\xA0-\xA1])".to_owned())
-		);
+		// Without case a range whose ends are pattern bytes holds each
+		// character whose upper case it holds, as GNU gives it: `[\300-\301]`
+		// holds `á`, `[\340-\341]` nothing. The text engine reads it with
+		// case.
+		let folded = |pattern: &[u8], target: Target| {
+			let text = pattern_text(pattern).0;
+			translate_raw(&text, Dialect::Basic, target, true, PatternBytes { raw: true, utf8_locale: true })
+		};
+		assert_eq!(folded(b"[\xc0-\xc1]", Target::RustBytes), Ok(r"(?:\xC3[\x80-\x81]|\xC3[\xA0-\xA1])".to_owned()));
+		assert_eq!(folded(b"[\xe0-\xe1]", Target::RustBytes), Ok(r"[^\x00-\xFF]".to_owned()));
+		assert_eq!(folded(b"[\xc0-\xc1]", Target::Rust), Ok("(?-i:[\u{c0}-\u{c1}\u{e0}-\u{e1}])".to_owned()));
+		assert_eq!(folded(b"[a\xc0-\xc1]", Target::Rust), Ok("(?-i:[aA\u{c0}-\u{c1}\u{e0}-\u{e1}])".to_owned()));
+		assert_eq!(folded(b"[\xe0-\xe1]", Target::Rust), Ok(r"[^\x00-\x{10FFFF}]".to_owned()));
+		assert_eq!(folded(b"[^\xe0-\xe1]", Target::Rust), Ok(r"[\x00-\x{10FFFF}]".to_owned()));
 		// UTF-8 stays text, and the bytes come back as they were.
 		assert_eq!(pattern_text("café".as_bytes()), ("café".to_owned(), false));
 		assert_eq!(pattern_bytes(&pattern_text(b"a\xe9\xc3\xa9\xff").0), b"a\xe9\xc3\xa9\xff");
 	}
 
-	/// In a UTF-8 locale the engine for a line that is not UTF-8 reads a
-	/// bracket member outside ASCII as a whole character whatever the
-	/// pattern holds, of either case as GNU grep 3.11 gives it under `-i`.
+	/// Without case grep's Unicode engines match a character's GNU
+	/// counterparts, which their own folding gives otherwise for some.
+	#[test]
+	fn a_letter_without_case_is_its_gnu_counterparts() {
+		// If this regresses, `printf '\342\204\252\n' | grep -ic k` (the
+		// Kelvin sign) counts 1 where GNU grep 3.11 counts 0, or `printf
+		// 'I\n' | grep -ic $'\304\261'` (`ı`) counts 0 where GNU counts 1.
+		let icase = |pattern: &str, target: Target| {
+			translate(pattern, Dialect::Basic, target, true, Strictness::Lenient).unwrap()
+		};
+		assert_eq!(icase("k", Target::Rust), "(?-i:[kK])");
+		assert_eq!(icase("\u{212A}", Target::Rust), "(?-i:[\u{212A}])");
+		assert_eq!(icase("\u{131}", Target::Pcre), "(?-i:[\u{131}Ii])");
+		assert_eq!(icase("\u{e9}", Target::Rust), "(?-i:[\u{e9}\u{c9}])");
+		assert_eq!(icase("\u{df}", Target::Rust), "(?-i:[\u{df}])");
+		// Any other letter keeps the engine's folding, and sed's engine its
+		// own.
+		assert_eq!(icase("ab", Target::Rust), "ab");
+		assert_eq!(icase("k\u{e9}", Target::Fancy), "k\u{e9}");
+		assert_eq!(translate("k", Dialect::Basic, Target::Rust, false, Strictness::Lenient), Ok("k".to_owned()));
+	}
+
+	/// In a UTF-8 locale the engine for a line that is not UTF-8, which a
+	/// pattern set with a back-reference reads it with, reads a bracket
+	/// member outside ASCII as a whole character, of either case as GNU grep
+	/// 3.11 gives it under `-i`.
 	#[test]
 	fn a_bracket_member_outside_ascii_is_a_whole_character_in_a_utf8_locale() {
-		// If this regresses, `printf 'x\251\n' | grep -c '[é]'` counts 1
-		// where GNU counts 0, or `-ic` with `[Σ\351]` misses `ς`.
+		// If this regresses, `printf 'x\251\n' | grep -c -e '[é]' -e $'\377'`
+		// counts 1 where GNU counts 0, or `-ic` with `[Σ\351]` misses `ς`.
 		let utf8 = |pattern: &str, icase: bool| {
-			let bytes = PatternBytes { raw: false, utf8_locale: true };
+			let bytes = PatternBytes { raw: true, utf8_locale: true };
 			translate_raw(pattern, Dialect::Basic, Target::RustBytes, icase, bytes)
 		};
 		assert_eq!(utf8("[é]", false), Ok(r"(?:\xC3\xA9)".to_owned()));
@@ -2851,7 +2989,7 @@ mod tests {
 		assert_eq!(utf8("[k]", true), Ok("[kK]".to_owned()));
 		// `ᾀ`'s simple upper case is the one character `ᾈ`.
 		assert_eq!(utf8("[\u{1F80}]", true), Ok(r"(?:\xE1\xBE\x80|\xE1\xBE\x88)".to_owned()));
-		// The C locale reads it a byte at a time, as before.
+		// The C locale reads it a byte at a time.
 		let c = PatternBytes { raw: false, utf8_locale: false };
 		assert_eq!(translate_raw("[é]", Dialect::Basic, Target::RustBytes, false, c), Ok("[é]".to_owned()));
 	}
