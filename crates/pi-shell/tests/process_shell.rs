@@ -927,13 +927,16 @@ fn run_sent(cases: Vec<SentCase>) {
 	let dir = tempfile::tempdir().expect("a directory for the start file");
 	let started = dir.path().join("started");
 	for SentCase { shell, script, sig, group, stdout, end } in cases {
-		let run = |program: &OsStr| {
+		// The real shell signalled only once it has blocked
+		// ([`Run::when_blocked`]).
+		let run = |program: &OsStr, real: bool| {
 			let _ = fs::remove_file(&started);
 			let run = Run::script(program, shell, &script).env("F", &started);
 			let run = if group { run.own_group() } else { run };
+			let run = if real { run.when_blocked() } else { run };
 			run.go_signalled(&started, sig, group)
 		};
-		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")), false);
 		let shown = format!(
 			"{shell}: {script}, signal {sig} to the {}",
 			if group { "group" } else { "shell" }
@@ -944,7 +947,7 @@ fn run_sent(cases: Vec<SentCase>) {
 			"{shown}: {ours:?}"
 		);
 		if let Some(real) = real(shell) {
-			let theirs = run(real.as_os_str());
+			let theirs = run(real.as_os_str(), true);
 			assert_eq!(
 				(&ours.stdout, ours.end()),
 				(&theirs.stdout, theirs.end()),
@@ -1280,6 +1283,12 @@ fn an_interactive_shell_runs_its_exit_trap_on_a_hup() -> io::Result<()> {
 			// wrote `42` into the EXIT trap's file too, and bash 5.2.21 once
 			// did not exit).
 			shell.wait_screen(TIMEOUT, |screen| screen.contents().ends_with(['$', '#', '%']))?;
+			// And the real shell blocked reading its terminal: bash 5.2.21 shows
+			// the prompt before readline blocks, and acts on a `HUP` that comes
+			// in between only at its next input (seen under load).
+			if who != "obash" {
+				pty_support::wait_blocked(shell.pid());
+			}
 			shell.signal(libc::SIGHUP)?;
 			let status = shell.wait(TIMEOUT)?;
 			let ended = status

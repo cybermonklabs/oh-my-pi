@@ -922,6 +922,76 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 	Ok(out)
 }
 
+/// Wait until process `pid` is blocked (its state in `/proc/PID/stat` is
+/// `S`), stopped or gone, and so is every process below it that has a
+/// child of its own. A shell then waits (in `waitpid`, or reading its
+/// terminal), and so does each subshell of it that runs a command, so a
+/// signal sent now comes after each set its wait up. bash 5.2.21 acts on a
+/// terminating signal that comes before it blocks only once the wait ends,
+/// or at once; on a loaded machine a signal sent at the caller's other fact
+/// (a file the command made, a prompt on the screen) came that early, to
+/// bash or to a subshell it forked. A process with no child may run on (a
+/// busy subshell, a command): the signal reaches it from the kernel, and it
+/// does what its disposition says. Off Linux there is no `/proc`: it returns
+/// at once.
+pub fn wait_blocked(pid: i32) {
+	#[cfg(target_os = "linux")]
+	while !tree_blocked(pid, true) {
+		std::thread::sleep(Duration::from_millis(5));
+	}
+	#[cfg(not(target_os = "linux"))]
+	let _ = pid;
+}
+
+/// Whether `pid` (when `itself`, or when it has a child) and the processes
+/// below it that have a child are each blocked, stopped or gone
+/// ([`wait_blocked`]).
+#[cfg(target_os = "linux")]
+fn tree_blocked(pid: i32, itself: bool) -> bool {
+	let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+		return true;
+	};
+	let state = stat
+		.rfind(')')
+		.and_then(|close| stat[close + 1..].split_whitespace().next());
+	let kids = children(pid);
+	if (itself || !kids.is_empty()) && matches!(state, Some("R" | "D")) {
+		return false;
+	}
+	kids.into_iter().all(|kid| tree_blocked(kid, false))
+}
+
+/// The children of `pid`: each of its threads' `children` file, or, where
+/// `/proc` has none, a scan of every process's parent.
+#[cfg(target_os = "linux")]
+fn children(pid: i32) -> Vec<i32> {
+	let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+		return Vec::new();
+	};
+	let mut out = Vec::new();
+	for task in tasks.flatten() {
+		match fs::read_to_string(task.path().join("children")) {
+			Ok(list) => out.extend(
+				list
+					.split_whitespace()
+					.filter_map(|c| c.parse::<i32>().ok()),
+			),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+				let Ok(all) = fs::read_dir("/proc") else {
+					return out;
+				};
+				return all
+					.flatten()
+					.filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+					.filter(|&child| proc_stat(child).is_some_and(|(_, parent)| parent == pid))
+					.collect();
+			},
+			Err(_) => {},
+		}
+	}
+	out
+}
+
 /// Process `pid` as `/proc/PID/stat` gives it, and its parent; `None` when
 /// it is gone.
 #[cfg(target_os = "linux")]

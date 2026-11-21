@@ -12,7 +12,7 @@ use std::{
 	time::Duration,
 };
 
-use crate::zsh_oracle;
+use crate::{pty_support::wait_blocked, zsh_oracle};
 
 /// What a shell run gave.
 #[derive(Clone, PartialEq, Eq)]
@@ -92,6 +92,9 @@ pub struct Run {
 	env:     Vec<(&'static str, Option<OsString>)>,
 	/// In a process group of its own (so a signal can go to the group).
 	group:   bool,
+	/// [`Self::go_signalled`] signals only once the shell has blocked
+	/// ([`Self::when_blocked`]).
+	blocked: bool,
 }
 
 impl Run {
@@ -106,6 +109,7 @@ impl Run {
 			wrap: Vec::new(),
 			env: Vec::new(),
 			group: false,
+			blocked: false,
 		}
 	}
 
@@ -170,6 +174,17 @@ impl Run {
 	#[must_use]
 	pub const fn own_group(mut self) -> Self {
 		self.group = true;
+		self
+	}
+
+	/// [`Self::go_signalled`] sends its signal only once the shell has also
+	/// blocked ([`wait_blocked`]): for the real bash, which acts on a signal
+	/// that comes before it blocks in `waitpid` only once the command has
+	/// ended, or at once. Not for obash, which runs a subshell's code in its
+	/// own process, so it can stay running while it waits.
+	#[must_use]
+	pub const fn when_blocked(mut self) -> Self {
+		self.blocked = true;
 		self
 	}
 
@@ -251,6 +266,10 @@ impl Run {
 			std::thread::sleep(Duration::from_millis(5));
 		}
 		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+		// The real bash blocked waiting for the command ([`Self::when_blocked`]).
+		if self.blocked {
+			wait_blocked(pid);
+		}
 		// SAFETY: kill takes integer ids; the child is not reaped yet.
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
