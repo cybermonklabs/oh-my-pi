@@ -23,7 +23,7 @@ fn bounded(program: &str, args: &[&str], env: &[(&str, &str)]) -> (Output, u32) 
 }
 
 fn obash(args: &[&str], env: &[(&str, &str)]) -> (Output, u32) {
-	bounded(env!("CARGO_BIN_EXE_obash"), args, env)
+	bounded(obash_support::obash_path(), args, env)
 }
 
 /// The `key=value` fields of every stats line.
@@ -172,7 +172,7 @@ fn an_inherited_fd_skips_every_snapshot() {
 	let dir = tempfile::tempdir().unwrap();
 	let stats_path = dir.path().join("stats");
 	let wrap = "exec \"$0\" -c \"$1\" 7</dev/null";
-	let (out, _) = bounded("/bin/sh", &["-c", wrap, env!("CARGO_BIN_EXE_obash"), LOOPS], &[
+	let (out, _) = bounded("/bin/sh", &["-c", wrap, obash_support::obash_path(), LOOPS], &[
 		("PI_SHELL_FAULT", "3:1"),
 		("PI_SHELL_FAULT_STATS", stats_path.to_str().unwrap()),
 	]);
@@ -267,7 +267,7 @@ fn a_signal_ignored_on_entry_stays_ignored_after_exec() {
 	let script = "i=0; while [ $i -lt 20 ]; do i=$((i + 1)); done; trap - INT; trap 'echo no' INT; \
 	              trap -p INT";
 	let wrap = "trap '' INT; exec \"$@\"";
-	let obash = env!("CARGO_BIN_EXE_obash");
+	let obash = obash_support::obash_path();
 	let (plain, _) = bounded("/bin/sh", &["-c", wrap, "_", obash, "-c", script], &[]);
 	assert_eq!(plain.stdout, b"trap -- '' SIGINT\n");
 	let (hit, _) = bounded(
@@ -292,7 +292,7 @@ fn a_script_on_stdin_continues_after_exec() {
 	.unwrap();
 	let run = |args: &str| {
 		let cmd = format!("exec \"$0\" {args} < \"$1\"");
-		bounded("/bin/sh", &["-c", &cmd, env!("CARGO_BIN_EXE_obash"), script.to_str().unwrap()], &[])
+		bounded("/bin/sh", &["-c", &cmd, obash_support::obash_path(), script.to_str().unwrap()], &[])
 	};
 	let (plain, _) = run("");
 	assert_eq!(plain.stdout, b"one 10\ngot: this line is data\n");

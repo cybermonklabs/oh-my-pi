@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test", "rust_test_suite")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -23,5 +23,24 @@ rust_test(
     crate = ":pi-vcs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# Integration tests: one rust_test per tests/*.rs, as cargo builds them.
+rust_test_suite(
+    name = "pi-vcs_integration_tests",
+    srcs = glob(["tests/*.rs"]),
+    aliases = aliases(),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
+        ":pi-vcs",
+        "//crates/pi-iso",
+    ],
+)
+
+rust_doc_test(
+    name = "pi-vcs_doc_test",
+    crate = ":pi-vcs",
     deps = all_crate_deps(normal_dev = True),
 )
