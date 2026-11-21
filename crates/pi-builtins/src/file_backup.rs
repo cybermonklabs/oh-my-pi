@@ -7,23 +7,24 @@
 
 use std::{
 	ffi::OsStr,
-	io,
 	path::{Path, PathBuf},
 };
 
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use clap::ArgMatches;
+#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+use pi_vfs::normalize_lexically;
 use pi_vfs::{BlockingFs, child_path, file_name, parent_path, with_file_name};
 use uucore::backup_control::BackupMode;
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use uucore::{backup_control, display::Quotable};
 
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use crate::host::Host;
 
 /// Resolves a `--backup` CONTROL word (unique prefixes allowed); the error is
 /// the GNU diagnostic naming `origin`.
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 fn match_backup_method(method: &str, origin: &str) -> Result<BackupMode, String> {
 	let matches = backup_control::BACKUP_CONTROL_VALUES
 		.iter()
@@ -49,7 +50,7 @@ fn match_backup_method(method: &str, origin: &str) -> Result<BackupMode, String>
 
 /// The backup mode selected by the `uucore::backup_control::arguments` flags,
 /// falling back to the shell's `VERSION_CONTROL`.
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 pub(crate) fn determine_backup_mode(matches: &ArgMatches, host: &Host) -> Result<BackupMode, String> {
 	let cli_method = matches
 		.get_one::<String>(backup_control::arguments::OPT_BACKUP)
@@ -74,31 +75,42 @@ pub(crate) fn determine_backup_mode(matches: &ArgMatches, host: &Host) -> Result
 }
 
 /// The backup suffix from `-S`, else the shell's `SIMPLE_BACKUP_SUFFIX`, else
-/// `~`; a suffix containing `/` falls back to `~`.
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+/// `~`. An empty suffix, or one holding `/`, is `~`, as GNU's
+/// `set_simple_backup_suffix` decides: an empty one would name the backup
+/// after the file itself, and the move would then replace it.
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 pub(crate) fn determine_backup_suffix(matches: &ArgMatches, host: &Host) -> String {
 	let suffix = matches
 		.get_one::<String>(backup_control::arguments::OPT_SUFFIX)
 		.map(String::as_str)
 		.or_else(|| host.var("SIMPLE_BACKUP_SUFFIX"))
 		.unwrap_or(backup_control::DEFAULT_BACKUP_SUFFIX);
-	if suffix.contains('/') {
+	if suffix.is_empty() || suffix.contains('/') {
 		backup_control::DEFAULT_BACKUP_SUFFIX.to_string()
 	} else {
 		suffix.to_string()
 	}
 }
 
-/// The backup name for `path` under `mode`. A numbered backup is
-/// `name.~N~` with N one past the highest version among the entries of
-/// `path`'s directory, as GNU's `numbered_backup` (gnulib backupfile.c)
-/// reads them: every entry `name.~N~` counts, whatever it is, a symlink
-/// that points nowhere included, and N is digits without a leading zero,
-/// compared as a string so that no version overflows. `existing` numbers
-/// when any numbered backup is there, and uses `suffix` otherwise. A
-/// directory that cannot be listed is probed instead, `name.~1~` upward,
-/// for the first name no entry holds (`lstat`), so that the backup never
-/// lands on an entry.
+/// The backup name for `path` under `mode`, as gnulib's `backupfile.c`
+/// chooses it. A numbered backup is `name.~N~` with N one past the highest
+/// version among the entries of `path`'s directory: every entry `name.~N~`
+/// counts, whatever it is, a symlink that points nowhere included, and N is
+/// digits without a leading zero, compared and counted as a string so that
+/// no version overflows. `existing` numbers when the listing shows a
+/// numbered backup, and uses `suffix` otherwise, also when the directory
+/// cannot be listed. A numbered name that is new, or longer than every one
+/// listed, and too long for the directory gives way to a name ending in `~`
+/// ([`fit_name`]).
+///
+/// A listing that fails, or ends early with an error, may miss an entry at
+/// the numbered name it gives, so that name is then confirmed free by
+/// `lstat`, from its version upward, and the backup never lands on an entry.
+/// GNU instead renames without replacing and lists again: where the
+/// directory cannot be listed, mv and cp then retry `name.~1~` without end,
+/// and ln replaces it. In a numbered mode GNU also renames the `~` name
+/// without replacing, and fails when an entry holds it; here the backup
+/// replaces that entry, as a simple backup does.
 pub(crate) fn backup_path(
 	filesystem: &BlockingFs,
 	mode: BackupMode,
@@ -110,40 +122,67 @@ pub(crate) fn backup_path(
 		name.push(suffix);
 		with_file_name(path, name)
 	};
-	let numbered = |version: &str| simple(OsStr::new(&format!(".~{version}~")));
-	if matches!(mode, BackupMode::None | BackupMode::Simple) {
-		return (mode == BackupMode::Simple).then(|| simple(suffix.as_ref()));
+	let numbered = |version: &[u8]| {
+		let version = std::str::from_utf8(version).expect("versions are ASCII digits");
+		simple(OsStr::new(&format!(".~{version}~")))
+	};
+	match mode {
+		BackupMode::None => return None,
+		BackupMode::Simple => return Some(simple(suffix.as_ref())),
+		BackupMode::Existing | BackupMode::Numbered => {},
 	}
-	match highest_backup(filesystem, path) {
-		Ok(Some(highest)) => Some(numbered(&next_version(&highest))),
-		Ok(None) if mode == BackupMode::Numbered => Some(numbered("1")),
-		Ok(None) => Some(simple(suffix.as_ref())),
-		Err(_) => {
-			let taken = |version: u64| filesystem.symlink_metadata(numbered(&version.to_string())).is_ok();
-			if mode == BackupMode::Existing && !taken(1) {
-				return Some(simple(suffix.as_ref()));
-			}
-			let free = (1u64..).find(|&version| !taken(version)).expect("backup versions are unbounded");
-			Some(numbered(&free.to_string()))
+	let listing = list_backups(filesystem, path);
+	let mut version = match &listing.highest {
+		Some(highest) => next_version(highest),
+		None if mode == BackupMode::Existing => {
+			return Some(fit_name(filesystem, path, simple(suffix.as_ref())));
 		},
+		None => b"1".to_vec(),
+	};
+	if !listing.complete {
+		while filesystem.symlink_metadata(numbered(&version)).is_ok() {
+			version = next_version(&version);
+		}
 	}
+	let backup = numbered(&version);
+	// A name as long as one the directory holds fits it (gnulib's
+	// `BACKUP_IS_SAME_LENGTH`), whatever the limit reads.
+	if listing
+		.highest
+		.is_some_and(|highest| highest.len() == version.len())
+	{
+		return Some(backup);
+	}
+	Some(fit_name(filesystem, path, backup))
 }
 
-/// The highest version N, as its digits, among the entries `name.~N~` of
-/// `path`'s directory; `None` when there is none. An entry the listing
-/// cannot read is skipped, as GNU uses the highest version it read.
-fn highest_backup(filesystem: &BlockingFs, path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// What a listing of a file's directory says about its numbered backups.
+struct Listing {
+	/// The highest version N, as its digits, among the entries `name.~N~`
+	/// read; `None` when there was none.
+	highest:  Option<Vec<u8>>,
+	/// The listing read every entry: it neither failed nor ended early with
+	/// an error.
+	complete: bool,
+}
+
+/// The numbered backups among the entries of `path`'s directory.
+fn list_backups(filesystem: &BlockingFs, path: &Path) -> Listing {
+	let mut listing = Listing { highest: None, complete: false };
 	let Some(name) = file_name(path) else {
-		return Ok(None);
+		listing.complete = true;
+		return listing;
 	};
-	let dir = parent_path(path)
-		.filter(|dir| !dir.as_os_str().is_empty())
-		.unwrap_or(Path::new("."));
+	let Ok(entries) = filesystem.read_dir(backup_dir(path)) else {
+		return listing;
+	};
 	let mut prefix = name.into_owned();
 	prefix.push(".~");
 	let prefix = prefix.as_encoded_bytes();
-	let mut highest: Option<Vec<u8>> = None;
-	for entry in filesystem.read_dir(dir)?.flatten() {
+	for entry in entries {
+		let Ok(entry) = entry else {
+			return listing;
+		};
 		let entry = entry.file_name();
 		let Some(version) = entry
 			.as_encoded_bytes()
@@ -153,15 +192,28 @@ fn highest_backup(filesystem: &BlockingFs, path: &Path) -> io::Result<Option<Vec
 			continue;
 		};
 		let counts = matches!(version.first(), Some(b'1'..=b'9')) && version.iter().all(u8::is_ascii_digit);
-		if counts && highest.as_ref().is_none_or(|top| (version.len(), version) > (top.len(), top.as_slice())) {
-			highest = Some(version.to_vec());
+		if counts
+			&& listing
+				.highest
+				.as_ref()
+				.is_none_or(|top| (version.len(), version) > (top.len(), top.as_slice()))
+		{
+			listing.highest = Some(version.to_vec());
 		}
 	}
-	Ok(highest)
+	listing.complete = true;
+	listing
+}
+
+/// The directory `path` is in, `.` for a bare name.
+fn backup_dir(path: &Path) -> &Path {
+	parent_path(path)
+		.filter(|dir| !dir.as_os_str().is_empty())
+		.unwrap_or(Path::new("."))
 }
 
 /// `version` (ASCII digits) plus one, as digits.
-fn next_version(version: &[u8]) -> String {
+fn next_version(version: &[u8]) -> Vec<u8> {
 	let mut digits = version.to_vec();
 	let carried = digits.iter_mut().rev().all(|digit| {
 		if *digit == b'9' {
@@ -175,7 +227,120 @@ fn next_version(version: &[u8]) -> String {
 	if carried {
 		digits.insert(0, b'1');
 	}
-	String::from_utf8(digits).expect("ASCII digits")
+	digits
+}
+
+/// `backup`, or, when its name is too long for the directory, `path`'s name
+/// cut to fit with `~` after it, as gnulib's `check_extension` decides: the
+/// name keeps every byte it can, at most one under the limit
+/// ([`name_limit`]). A name of 14 bytes or fewer (`NAME_MAX_MINIMUM`) always
+/// fits.
+fn fit_name(filesystem: &BlockingFs, path: &Path, backup: PathBuf) -> PathBuf {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+		let length = file_name(&backup).map_or(0, |name| name.len());
+		if length <= NAME_MAX_MINIMUM {
+			return backup;
+		}
+		let Some(limit) = name_limit(filesystem, backup_dir(path)) else {
+			return backup;
+		};
+		if length <= limit {
+			return backup;
+		}
+		let name = file_name(path).unwrap_or_default();
+		let keep = if limit <= name.len() { limit.saturating_sub(1) } else { name.len() };
+		let mut cut = name.as_bytes()[..keep].to_vec();
+		cut.push(b'~');
+		with_file_name(path, std::ffi::OsString::from_vec(cut))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (filesystem, path);
+		backup
+	}
+}
+
+/// POSIX's least `NAME_MAX`: a name this long fits any directory.
+#[cfg(unix)]
+const NAME_MAX_MINIMUM: usize = 14;
+
+/// The longest backup name the directory `dir` takes, as gnulib reads it:
+/// one under pathconf's `NAME_MAX`, or `NAME_MAX_MINIMUM` where pathconf
+/// reports no limit. `None` (no limit) where pathconf fails, and where `dir`
+/// is not a host directory, whose provider then refuses a name too long.
+#[cfg(unix)]
+fn name_limit(filesystem: &BlockingFs, dir: &Path) -> Option<usize> {
+	use std::os::unix::ffi::OsStrExt as _;
+	if !filesystem.is_native_local(dir) {
+		return None;
+	}
+	let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+	nix::errno::Errno::clear();
+	// SAFETY: `dir` is a NUL-terminated path that outlives the call.
+	let max = unsafe { libc::pathconf(dir.as_ptr(), libc::_PC_NAME_MAX) };
+	if max == -1 {
+		return (nix::errno::Errno::last_raw() == 0).then_some(NAME_MAX_MINIMUM);
+	}
+	usize::try_from(max - 1).ok()
+}
+
+/// Whether `from` is `to`'s simple backup, so that backing `to` up would
+/// destroy it, as GNU's `source_is_dst_backup` (copy.c) decides for cp and
+/// mv alike: `from`'s name is `to`'s with `suffix` after it, and the entry of
+/// that name beside `to`, followed, is the same file as `from` (followed when
+/// `follow_from`). Without both identities (a provider may give none) the
+/// same location decides: `./dest~` is the same file, a `dest~` in another
+/// directory is not.
+#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+pub(crate) fn source_is_destination_backup(
+	filesystem: &BlockingFs,
+	from: &Path,
+	follow_from: bool,
+	to: &Path,
+	suffix: &str,
+) -> bool {
+	let (Some(from_name), Some(to_name)) = (file_name(from), file_name(to)) else {
+		return false;
+	};
+	let mut backup_name = to_name.into_owned();
+	backup_name.push(suffix);
+	if *from_name != *backup_name {
+		return false;
+	}
+	let backup = with_file_name(to, &backup_name);
+	let from_metadata = if follow_from {
+		filesystem.metadata(from)
+	} else {
+		filesystem.symlink_metadata(from)
+	};
+	let (Ok(from_metadata), Ok(backup_metadata)) = (from_metadata, filesystem.metadata(&backup)) else {
+		return false;
+	};
+	match (from_metadata.file_id(), backup_metadata.file_id()) {
+		(Some(from_id), Some(backup_id)) if from_id.is_native() == backup_id.is_native() => {
+			from_id == backup_id
+		},
+		_ => location(filesystem, from, follow_from) == location(filesystem, &backup, true),
+	}
+}
+
+/// Where `path` is: with `follow`, the canonical file (the host file a
+/// provider path aliases, if any); without, its entry in its canonical
+/// directory. Lexical where neither can be read.
+#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+fn location(filesystem: &BlockingFs, path: &Path, follow: bool) -> PathBuf {
+	let canonical = |path: &Path| match filesystem.backing_path(path).ok().flatten() {
+		Some(backing) => filesystem.canonicalize(&backing).ok(),
+		None => filesystem.canonicalize(path).ok(),
+	};
+	let found = if follow {
+		canonical(path)
+	} else {
+		file_name(path).and_then(|name| canonical(backup_dir(path)).map(|dir| child_path(&dir, &name)))
+	};
+	found.unwrap_or_else(|| normalize_lexically(path))
 }
 
 /// Rebuilds the operand-relative display form of `backup`, created beside

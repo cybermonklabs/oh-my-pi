@@ -38,7 +38,10 @@ use uucore::{
 };
 
 use crate::{
-	file_backup::{backup_display, backup_path, determine_backup_mode, determine_backup_suffix},
+	file_backup::{
+		backup_display, backup_path, determine_backup_mode, determine_backup_suffix,
+		source_is_destination_backup,
+	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
 	progress::stderr_draw_target,
 };
@@ -2016,9 +2019,29 @@ fn handle_existing_dest(
 		options.overwrite.verify(host, dest, options.debug)?;
 	}
 
+	// The backup would be renamed over a source that is the destination's
+	// simple backup, so GNU refuses one in every mode but numbered, whatever
+	// the backup's own name, by the same rule as mv (`copy.c`,
+	// `source_is_dst_backup`), reading the source as the copy reads it.
+	if !matches!(options.backup, BackupMode::None | BackupMode::Numbered)
+		&& source_is_destination_backup(
+			&filesystem,
+			&source_fs,
+			options.dereference(source_in_command_line),
+			&dest_fs,
+			&options.backup_suffix,
+		) {
+		return Err(CpError::Error(format!(
+			"backing up {} might destroy source;  {} not copied",
+			dest.quote(),
+			source.quote()
+		)));
+	}
 	let mut is_dest_removed = false;
 	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix);
 	if let Some(backup) = &backup {
+		// Any backup name that is the source itself, as the `~` name a long
+		// name gives way to can be, would destroy it too.
 		if paths_refer_to_same_file(&filesystem, &source_fs, backup, true) {
 			return Err(CpError::Error(format!(
 				"backing up {} might destroy source;  {} not copied",

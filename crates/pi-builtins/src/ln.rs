@@ -22,7 +22,7 @@ use uucore::{
 };
 
 use crate::{
-	file_backup::{backup_display, backup_path},
+	file_backup::{backup_display, backup_path, determine_backup_mode, determine_backup_suffix},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
 };
 
@@ -165,9 +165,10 @@ fn ln_main(matches: &ArgMatches, host: &mut Host) -> LnResult<()> {
 		OverwriteMode::NoClobber
 	};
 
-	let backup_mode = backup_control::determine_backup_mode(matches)
-		.map_err(|error| LnError::Message(error.to_string()))?;
-	let backup_suffix = backup_control::determine_backup_suffix(matches);
+	// The shell's `VERSION_CONTROL` and `SIMPLE_BACKUP_SUFFIX`, as cp and mv
+	// read them; an empty suffix is `~`.
+	let backup_mode = determine_backup_mode(matches, &*host).map_err(LnError::Message)?;
+	let backup_suffix = determine_backup_suffix(matches, &*host);
 
 	// When we have "-L" or "-L -P", false otherwise
 	let logical = matches.get_flag(options::LOGICAL);
