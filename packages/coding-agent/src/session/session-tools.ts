@@ -833,15 +833,17 @@ interface HeldSettingsRebuild extends WithheldChange {
 	/** A skill rediscovery is held: the rebuild lists the registry's skills in the prompt. */
 	skills: boolean;
 	/**
-	 * What the last request before the hold declared for each tool, by name: the tools keep declaring it until the
-	 * rebuild, as the prompt keeps its bytes. Undefined when that request did not carry the held prompt, or when
-	 * neither this process's requests nor the branch's record shows what it declared (a resumed or switched-in
-	 * transcript whose tools render otherwise under the earlier settings): the tools then declare what they render.
-	 * A later change that shows it fills it in ({@link SessionTools.#keptDeclarations}).
+	 * What the last request before the hold declared for each tool, by name, with the digests it was sent with: the
+	 * tools keep declaring it until the rebuild, as the prompt keeps its bytes. Undefined when that request did not
+	 * carry the held prompt, or when neither this process's requests nor the branch's record shows what it declared (a
+	 * resumed or switched-in transcript whose tools render otherwise under the earlier settings): the tools then
+	 * declare what they render. A later change that shows it fills it in ({@link SessionTools.#keptDeclarations}), and
+	 * a move to a branch whose newest request declared other tool definitions takes that branch's own
+	 * ({@link SessionTools.followBranchDeclarations}).
 	 */
-	declarations: ReadonlyMap<string, ToolDeclarationFields> | undefined;
-	/** Each tool the hold declares with {@link declarations}, wrapped once ({@link forwardingProxy}). */
-	readonly declared: WeakMap<AgentTool, AgentTool>;
+	declarations: SentDeclarations | undefined;
+	/** Each tool the hold declares with {@link declarations}, wrapped once for each it keeps ({@link forwardingProxy}). */
+	declared: WeakMap<AgentTool, AgentTool>;
 	/**
 	 * The settings a tool the hold keeps declared as sent was declared under: each changed setting reads its value
 	 * from before the change while the hold lasts ({@link SessionTools.toolCallSettings}).
@@ -2329,7 +2331,7 @@ export class SessionTools {
 	#declaredAs(tool: AgentTool): AgentTool {
 		const own = this.#declaredOwners.get(tool) ?? tool;
 		const held = this.#heldSettingsRebuild;
-		const fields = held?.declarations?.get(own.name);
+		const fields = held?.declarations?.tools.get(own.name);
 		if (!held || !fields) return own;
 		let declared = held.declared.get(own);
 		if (!declared) {
@@ -2368,7 +2370,7 @@ export class SessionTools {
 	 */
 	toolCallSettingsFor(name: string): Settings | undefined {
 		const held = this.#heldSettingsRebuild;
-		const fields = held?.declarations?.get(name);
+		const fields = held?.declarations?.tools.get(name);
 		const tool = fields && this.#host.agent.state.tools.find(candidate => candidate.name === name);
 		if (!held || !fields || !tool) return undefined;
 		return this.#declaresOtherwise(this.#declaredOwners.get(tool) ?? tool, fields) ? held.toolSettings : undefined;
@@ -2727,9 +2729,12 @@ export class SessionTools {
 		return this.#host.agent.state.messages.findLast(message => message.role === "assistant");
 	}
 
-	/** Whether the prompt is bound: a prefix-bound model has answered under it ({@link #holdSettingsRebuild}). */
+	/**
+	 * Whether the prompt is bound: a prefix-bound model has answered under it, or a primary call in flight on one was
+	 * sent with it, whose reply binds it ({@link #holdSettingsRebuild}).
+	 */
 	get #promptBound(): boolean {
-		return this.#host.model()?.thinking?.prefixBinding === true && this.#latestReply() !== undefined;
+		return this.#host.model()?.thinking?.prefixBinding === true && !this.#promptUnanswered;
 	}
 
 	/**
@@ -3191,26 +3196,27 @@ export class SessionTools {
 	/**
 	 * What an implicit prompt rebuild must keep when the model binds signed
 	 * thinking to its prompt prefix. `"free"`: the model does not bind, the
-	 * transcript holds no reply, or its newest reply is one this session was
-	 * created with whose prompt the transcript does not record, while no prompt is
-	 * committed yet: that reply was not produced under the startup prompt, so the
-	 * startup build may still take its place. `"frozen"`: the transcript may be
-	 * bound to the current prompt, the one the session was created with included:
-	 * as for a held settings rebuild ({@link #promptBound}), a reply produced under
-	 * it binds it whether or not a rebuild ever committed one. Otherwise the
-	 * newest reply is the restored one and no primary model call has run: a
-	 * resumed process builds its base prompt before tools that register late
-	 * (extension tools, MCP servers), so a rebuild may commit only when it
-	 * reproduces the prompt the transcript was sent with. A transcript restored
-	 * without a recorded digest, once a prompt is committed, or switched in later,
-	 * stays frozen.
+	 * transcript holds no reply and no primary model call is in flight, or its
+	 * newest reply is one this session was created with whose prompt the
+	 * transcript does not record, while no prompt is committed yet: that reply was
+	 * not produced under the startup prompt, so the startup build may still take
+	 * its place. `"frozen"`: the transcript may be bound to the current prompt, the
+	 * one the session was created with included: as for a held settings rebuild
+	 * ({@link #promptBound}), a reply produced under it, or a call in flight that
+	 * was sent with it (the session's first included), binds it whether or not a
+	 * rebuild ever committed one. Otherwise the newest reply is the restored one
+	 * and no primary model call has run: a resumed process builds its base prompt
+	 * before tools that register late (extension tools, MCP servers), so a rebuild
+	 * may commit only when it reproduces the prompt the transcript was sent with.
+	 * A transcript restored without a recorded digest, once a prompt is committed,
+	 * or switched in later, stays frozen.
 	 */
 	#implicitRebuildBinding(): "free" | "frozen" | { promptDigest: string } {
-		if (this.#host.model()?.thinking?.prefixBinding !== true) return "free";
+		if (this.#host.model()?.thinking?.prefixBinding !== true || this.#promptUnanswered) return "free";
 		const latest = this.#latestReply();
-		if (latest === undefined) return "free";
 		const restored = this.#restoredTranscript;
-		if (latest !== restored?.reply) return "frozen";
+		// No reply yet: the call in flight binds the prompt it was sent with.
+		if (latest === undefined || latest !== restored?.reply) return "frozen";
 		if (restored.promptDigest) return { promptDigest: restored.promptDigest };
 		return this.#lastAppliedToolSignature !== undefined || this.#basePromptRestored ? "frozen" : "free";
 	}
@@ -3964,15 +3970,16 @@ export class SessionTools {
 
 	/**
 	 * Holds the rebuild that `settingsChange` started when the prompt is bound (a prefix-bound model has answered
-	 * under it): the system prompt keeps its bytes and each tool keeps the declaration the last request before the
-	 * change sent ({@link #declaredAs}), {@link takeSettingsNotice} tells the model what changed and when it goes out,
-	 * and {@link absorbHeldSettingsRebuild} runs the rebuild once it is due: at a cut the cut rule admits, once the
-	 * prompt cache entry lapses, or five minutes after the change, whichever comes first. A new hold is recorded on
-	 * the branch with its start, as on each branch a reply under it goes to ({@link recordReplyPrompt}), so a resumed
-	 * process that restores the bound prompt keeps the change waiting no longer ({@link #restoreTranscriptPrompt}).
-	 * Returns the hold to extend, or undefined when the rebuild runs now: no settings change started it, or nothing
-	 * is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session was created with binds as soon as a
-	 * reply was produced under it, before any rebuild committed.
+	 * under it, or a call in flight was sent with it): the system prompt keeps its bytes and each tool keeps the
+	 * declaration the last request before the change sent ({@link #declaredAs}), {@link takeSettingsNotice} tells the
+	 * model what changed and when it goes out, and {@link absorbHeldSettingsRebuild} runs the rebuild once it is due:
+	 * at a cut the cut rule admits, once the prompt cache entry lapses, or five minutes after the change, whichever
+	 * comes first. A new hold is recorded on the branch with its start, as on each branch a reply under it goes to
+	 * ({@link recordReplyPrompt}), so a resumed process that restores the bound prompt keeps the change waiting no
+	 * longer ({@link #restoreTranscriptPrompt}). Returns the hold to extend, or undefined when the rebuild runs now: no
+	 * settings change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session
+	 * was created with binds as soon as a reply was produced under it or a call sent with it, before any rebuild
+	 * committed.
 	 */
 	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
 		if (!settingsChange || !this.#promptBound) return undefined;
@@ -4026,10 +4033,7 @@ export class SessionTools {
 				// A hold that had no declarations to keep takes the ones the change shows, and its tools declare them
 				// from then on.
 				const held = this.#heldSettingsRebuild;
-				if (held && !held.declarations && declarations.kept) {
-					held.declarations = declarations.kept;
-					this.#setAgentTools(this.#host.agent.state.tools);
-				}
+				if (held && !held.declarations && declarations.kept) this.#keepDeclarations(held, declarations.kept);
 				const prompt = await this.#promptMovers(
 					settingsChange.filter(change => !declarations.movers.includes(change)),
 				);
@@ -4066,20 +4070,39 @@ export class SessionTools {
 	}
 
 	/**
-	 * What the bound prompt's tools keep declaring under a hold: the hold's declarations, else what the last request
-	 * declared ({@link #sentDeclarations}) when the conversation continues from it (the current prompt, and the tool
+	 * What a hold keeps the bound prompt's tools declaring on the current branch: what the last request declared
+	 * ({@link #sentDeclarations}) when the conversation continues from it (the current prompt, and the tool
 	 * definitions the branch's newest request declared: {@link #boundToolsDigest}), else what the branch records its
 	 * last request declared, when the active tools declare that under `before` (each held or changed setting at its
 	 * earlier value; {@link #transcriptDeclarations}): a resumed or switched-in transcript, or a `/tree` move to a
 	 * reply whose request declared other definitions. Undefined when nothing shows them.
 	 */
-	#keptDeclarations(before: ReadonlyMap<AnySetting, unknown>): ReadonlyMap<string, ToolDeclarationFields> | undefined {
-		const held = this.#heldSettingsRebuild;
-		if (held?.declarations) return held.declarations;
+	#keptDeclarations(before: ReadonlyMap<AnySetting, unknown>): SentDeclarations | undefined {
 		const sent = this.#sentDeclarations;
 		return sent?.promptDigest === this.currentPromptDigest() && sent.toolsDigest === this.#boundToolsDigest()
-			? sent.tools
+			? sent
 			: this.#transcriptDeclarations(before);
+	}
+
+	/** Gives `held` the declarations its tools keep from now on, or none, and the agent its tools declared so. */
+	#keepDeclarations(held: HeldSettingsRebuild, declarations: SentDeclarations | undefined): void {
+		held.declarations = declarations;
+		held.declared = new WeakMap();
+		this.#setAgentTools(this.#host.agent.state.tools);
+	}
+
+	/**
+	 * Follows a move to another branch (`/tree`, a rewind, a branch or fork into a new session file, a session
+	 * switch): a held settings rebuild whose tools keep what a request declared with other tool definitions than the
+	 * ones the branch's newest request declared ({@link #boundToolsDigest}) keeps what that request declared instead
+	 * ({@link #keptDeclarations}), or nothing when nothing shows it, and its tools then declare what they render. The
+	 * next request declares what the request it continues from declared, so it reads the cache entry that request's
+	 * reply left.
+	 */
+	followBranchDeclarations(): void {
+		const held = this.#heldSettingsRebuild;
+		if (!held || held.declarations?.toolsDigest === this.#boundToolsDigest()) return;
+		this.#keepDeclarations(held, this.#keptDeclarations(held.before));
 	}
 
 	/**
@@ -4090,9 +4113,7 @@ export class SessionTools {
 	 * ({@link #sentDeclarations}). Undefined when the branch records neither, or the tools declare otherwise (a tool
 	 * registered since, a withdrawn one only an earlier process could declare).
 	 */
-	#transcriptDeclarations(
-		before: ReadonlyMap<AnySetting, unknown>,
-	): ReadonlyMap<string, ToolDeclarationFields> | undefined {
+	#transcriptDeclarations(before: ReadonlyMap<AnySetting, unknown>): SentDeclarations | undefined {
 		const promptDigest = this.currentPromptDigest();
 		const toolsDigest = this.recordedToolsDigest();
 		if (toolsDigest === undefined || this.recordedPromptDigest() !== promptDigest) return undefined;
@@ -4103,25 +4124,29 @@ export class SessionTools {
 		);
 		const declared = tools.map((tool, index) => forwardingProxy(tool, fields[index]));
 		if (this.#host.toolDefinitionsDigest(declared) !== toolsDigest) return undefined;
-		const declarations = new Map(tools.map((tool, index) => [tool.name, fields[index]] as const));
-		this.#sentDeclarations = { promptDigest, toolsDigest, tools: declarations };
+		const declarations: SentDeclarations = {
+			promptDigest,
+			toolsDigest,
+			tools: new Map(tools.map((tool, index) => [tool.name, fields[index]] as const)),
+		};
+		this.#sentDeclarations = declarations;
 		return declarations;
 	}
 
 	/**
 	 * The changes of `settingsChange` an active tool's declaration moves with, among the tools that now declare
-	 * otherwise than the bound prompt's kept declarations ({@link #keptDeclarations}): each change that gives one of
-	 * those tools another declaration when set back to its earlier value alone, or when it alone keeps its new value
-	 * while every held or changed setting is set back. The second catches a setting a declaration renders only beside
-	 * another changed one (`tools.maxTimeout`, which `bash` states only while `async.enabled` is on), so a kept
-	 * declaration runs under every setting it was rendered under. Empty when nothing shows what the bound prompt's
-	 * request declared, no tool declares otherwise, or the hold keeps each changed setting. Gives the kept
-	 * declarations too, which a hold that had none takes ({@link holdToolDeclarationChange}); undefined when the hold
-	 * keeps each changed setting or nothing shows them.
+	 * otherwise than the bound prompt's kept declarations (the hold's, else {@link #keptDeclarations}): each change
+	 * that gives one of those tools another declaration when set back to its earlier value alone, or when it alone
+	 * keeps its new value while every held or changed setting is set back. The second catches a setting a declaration
+	 * renders only beside another changed one (`tools.maxTimeout`, which `bash` states only while `async.enabled` is
+	 * on), so a kept declaration runs under every setting it was rendered under. Empty when nothing shows what the
+	 * bound prompt's request declared, no tool declares otherwise, or the hold keeps each changed setting. Gives the
+	 * kept declarations too, which a hold that had none takes ({@link holdToolDeclarationChange}); undefined when the
+	 * hold keeps each changed setting or nothing shows them.
 	 */
 	#declarationMovers(settingsChange: readonly SettingChange[]): {
 		movers: SettingChange[];
-		kept: ReadonlyMap<string, ToolDeclarationFields> | undefined;
+		kept: SentDeclarations | undefined;
 	} {
 		const held = this.#heldSettingsRebuild;
 		const changes = settingsChange.filter(({ setting }) => !held?.before.has(setting));
@@ -4129,12 +4154,12 @@ export class SessionTools {
 		// The settings the kept declarations were rendered under.
 		const before = new Map(held?.before);
 		for (const { setting, previous } of changes) before.set(setting, previous);
-		const kept = this.#keptDeclarations(before);
+		const kept = held?.declarations ?? this.#keptDeclarations(before);
 		if (!kept) return { movers: [], kept };
 		// Each tool that declares otherwise now, with what it declares under the session's settings.
 		const altered = this.#host.agent.state.tools.flatMap(tool => {
 			const own = this.#declaredOwners.get(tool) ?? tool;
-			const fields = kept.get(own.name);
+			const fields = kept.tools.get(own.name);
 			if (!fields) return [];
 			const declaration = this.#toolCallSettingsScope.exit(() => toolDeclaration(own));
 			return declaration === keptDeclaration(own, fields) ? [] : [{ own, declaration }];
@@ -4505,10 +4530,10 @@ export class SessionTools {
 			}
 			// A recall a system block would carry only by rewriting the cached prompt rides the conversation as a hidden
 			// message (`adoptMemoryRecall`): a reused one the branch delivered that way, even on resume, and a fresh
-			// one after a prefix-bound model answered a prompt sent without it, where a new block would have the
-			// provider write the whole conversation to its cache again and drop its replayed thinking. Each request
-			// sends it where its context lacks it, and a prompt rebuild leaves it out of the memory instructions
-			// (`recallDelivered`).
+			// one after a prefix-bound model answered a prompt sent without it (or while a call sent with that prompt is
+			// in flight), where a new block would have the provider write the whole conversation to its cache again
+			// and drop its replayed thinking. Each request sends it where its context lacks it, and a prompt rebuild
+			// leaves it out of the memory instructions (`recallDelivered`).
 			const hidden = memory.reused
 				? findDeliveredRecall(this.#host.sessionManager.getBranchView()) !== undefined
 				: this.#promptBound;

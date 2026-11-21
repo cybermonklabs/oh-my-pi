@@ -13439,6 +13439,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the rewind branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
@@ -14643,6 +14645,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// A prompt restored for the session left behind stays with it.
 			if (switchingToDifferentSession) this.#tools.leaveRestoredTranscript();
+			// A held settings change keeps declaring what the request the loaded branch continues from declared.
+			this.#tools.followBranchDeclarations();
 			// Refresh the workspace-roots block to match the resumed session's directory set.
 			// Wrapped so a rebuild failure (e.g. a gate that intentionally fails in tests)
 			// doesn't roll back an otherwise-successful session switch.
@@ -14929,6 +14933,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			if (!skipConversationRestore) {
 				this.replaceMessagesFromSessionContext(sessionContext.messages);
+				// A held settings change keeps declaring what the request the new file continues from declared.
+				this.#tools.followBranchDeclarations();
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
@@ -15380,6 +15386,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;

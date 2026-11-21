@@ -115,6 +115,19 @@ export function toolCallAnswer(
 	);
 }
 
+/** `reply`, whose stream sends nothing until `released` settles: the request stays in flight until then. */
+export function heldOpen(reply: Response, released: Promise<void>): Response {
+	const body = reply.arrayBuffer();
+	const stream = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			await released;
+			controller.enqueue(new Uint8Array(await body));
+			controller.close();
+		},
+	});
+	return new Response(stream, { status: reply.status, headers: reply.headers });
+}
+
 /** Every text a wire value carries: text blocks, string contents and nested tool results. */
 export function textOf(value: unknown): string {
 	if (typeof value === "string") return value;
