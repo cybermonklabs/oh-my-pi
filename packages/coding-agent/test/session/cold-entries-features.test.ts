@@ -25,6 +25,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import {
 	CURRENT_SESSION_VERSION,
 	type SessionEntry,
@@ -38,6 +39,23 @@ import { persistedAgentDefinition } from "@oh-my-pi/pi-coding-agent/task/persist
 import { getLatestTodoPhasesFromEntries } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	answer,
+	branchConversation,
+	CONTINUED_ANSWER,
+	CONTINUED_TEXT,
+	failedTurn,
+	FIRST_TEXT,
+	FRESH_TEXT,
+	type KeptTurnSessionOptions,
+	MESSAGE_START_FRAME,
+	modelConversation,
+	OVERLOADED_FRAME,
+	type PrimaryAnswer,
+	renderTurn,
+	TEXT_FRAMES,
+	useKeptTurnSessions,
+} from "../helpers/kept-turn-session";
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const TITLE = "Refactor the module tree";
@@ -895,6 +913,163 @@ describe("features that read older entries, on a session whose older bodies are 
 			expect(prunePasses.mock.calls.length).toBeGreaterThanOrEqual(turns);
 			expect(extensionReads.length).toBeGreaterThanOrEqual(2 * turns);
 			expect(manager.coldStoreStats().materializations).toBe(afterFirstTurn.materializations);
+		},
+		CASE_TIMEOUT_MS,
+	);
+});
+
+/**
+ * A turn the session keeps and continues from after visible text (a stream
+ * cut after it), on the session above whose older bodies are cold: the kept
+ * turn and the continue reminder after it stay in the context a reload, a
+ * resume and a compaction rebuild, exactly as a manager that holds every entry
+ * (`coldStore: false`) rebuilds it, and the turn is drawn as it was live. The
+ * primary runs the real Anthropic provider; only its HTTP client is replaced.
+ * This member has no session-store masking; the same cases with masking on run
+ * at the head, where `secrets.maskSessionStore` lives.
+ */
+describe("a turn kept and continued from after visible text", () => {
+	const sessions = useKeptTurnSessions();
+	const cleanups: Array<() => Promise<void>> = [];
+	const keptTurn = `assistant[text:${FIRST_TEXT}]`;
+	const reminder = expect.stringMatching(/^developer:/);
+	const continuation = `assistant[text:${CONTINUED_TEXT}]`;
+	const cutTurn: PrimaryAnswer = { stream: MESSAGE_START_FRAME + TEXT_FRAMES + OVERLOADED_FRAME };
+
+	// After the harness's own hooks, which dispose of the sessions on these managers.
+	afterEach(async () => {
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	});
+
+	async function open(file: string, coldStore: boolean): Promise<SessionManager> {
+		const manager = await SessionManager.open(file, path.dirname(file), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+			coldStore,
+		});
+		cleanups.push(() => manager.close());
+		return manager;
+	}
+
+	/**
+	 * Resumes the cold session, sends `prompts` with the primary answering
+	 * `answers` in order, and checks the live context ends on the kept turn,
+	 * its reminder and its continuation.
+	 */
+	async function runOnColdSession(
+		answers: PrimaryAnswer[],
+		options: KeptTurnSessionOptions & { prompts?: string[] } = {},
+	) {
+		const written = await writeSession(sessions.tempDir.path(), crypto.randomUUID());
+		const cold = await open(written.file, true);
+		expect(cold.coldStoreStats().coldEntries).toBeGreaterThan(10);
+		sessions.answers = answers;
+		const session = await sessions.startSession(cold, {
+			...options,
+			messages: cold.buildSessionContext().messages,
+		});
+		for (const prompt of options.prompts ?? ["Answer in two parts"]) {
+			await session.prompt(prompt);
+			await session.waitForIdle();
+		}
+		const live = modelConversation(session.agent.state.messages);
+		expect(live.slice(-4)).toEqual(["user", keptTurn, reminder, continuation]);
+		return { written, cold, session, live };
+	}
+
+	/** The session file reopened as a resume opens it, its older bodies cold, and with every entry held. */
+	async function reopenBoth(cold: SessionManager, file: string) {
+		const reopened = await sessions.reopen(cold);
+		expect(reopened.coldStoreStats().coldEntries).toBeGreaterThan(10);
+		const whole = await open(file, false);
+		expect(whole.coldStoreStats().coldEntries).toBe(0);
+		return { reopened, whole };
+	}
+
+	// Regression: on a long session whose older bodies are out of memory, a reload
+	// rebuilds the context without the turn a cut stream ended after its text, or
+	// without the reminder between it and its continuation, so the model no longer
+	// sees the first half of its answer; or the reloaded transcript draws the turn
+	// differently from the live one.
+	it(
+		"is in the context a reload rebuilds, and drawn as live",
+		async () => {
+			const { written, cold, session, live } = await runOnColdSession([cutTurn, { stream: CONTINUED_ANSWER }]);
+			const { reopened, whole } = await reopenBoth(cold, written.file);
+
+			const rebuilt = reopened.buildSessionContext().messages;
+			expect(modelConversation(rebuilt)).toEqual(live);
+			expect(wire(rebuilt)).toEqual(wire(whole.buildSessionContext().messages));
+			expect(branchConversation(reopened).slice(-4)).toEqual([
+				"user",
+				keptTurn,
+				`custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`,
+				continuation,
+			]);
+			expect(failedTurn(rebuilt)?.continued).toBe(true);
+
+			const drawnLive = failedTurn(sessions.drawnTurns(session));
+			const drawnReloaded = failedTurn(reopened.buildSessionContext({ transcript: true }).messages);
+			if (!drawnLive || !drawnReloaded)
+				throw new Error("Expected the kept turn live and in the reloaded transcript");
+			expect(renderTurn(drawnReloaded)).toEqual(renderTurn(drawnLive));
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	// Regression: after a resume of a long session whose older bodies are out of
+	// memory, the next request no longer carries the kept turn, or the reminder the
+	// model read between it and its continuation.
+	it(
+		"is sent to the model again after a resume",
+		async () => {
+			const { written, cold, live } = await runOnColdSession([
+				cutTurn,
+				{ stream: CONTINUED_ANSWER },
+				{ stream: answer(FRESH_TEXT) },
+			]);
+			const { reopened, whole } = await reopenBoth(cold, written.file);
+			const resumed = await sessions.startSession(reopened, { messages: reopened.buildSessionContext().messages });
+
+			await resumed.prompt("And then?");
+			await resumed.waitForIdle();
+
+			const sent = modelConversation(sessions.requestMessages.at(-1) ?? []);
+			expect(sent).toEqual([...live, "user"]);
+			expect(sent).toEqual([...modelConversation(whole.buildSessionContext().messages), "user"]);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	// Regression: a compaction after the continuation keeps the kept turn's prompt
+	// and what follows, yet on a session whose older bodies are out of memory the
+	// context it rebuilds drops the kept turn or its reminder. The earlier answer
+	// is long and the kept-recent budget small, so the cut falls on the prompt of
+	// the kept turn.
+	it(
+		"stays in the kept region of a compaction",
+		async () => {
+			const { written, cold, session } = await runOnColdSession(
+				[{ stream: answer("An earlier answer. ".repeat(1_500)) }, cutTurn, { stream: CONTINUED_ANSWER }],
+				{
+					prompts: ["An earlier question", "Answer in two parts"],
+					settings: { "compaction.keepRecentTokens": 2_000 },
+					compactionSummary: "The earlier question was answered.",
+				},
+			);
+
+			await session.compact();
+
+			// The summary reaches the model as a user message, then the kept region.
+			const live = modelConversation(session.agent.state.messages);
+			expect(live).toEqual(["user", "user", keptTurn, reminder, continuation]);
+			const { reopened, whole } = await reopenBoth(cold, written.file);
+			const rebuilt = reopened.buildSessionContext().messages;
+			expect(modelConversation(rebuilt)).toEqual(live);
+			expect(wire(rebuilt)).toEqual(wire(whole.buildSessionContext().messages));
+			const entries = reopened.getEntries();
+			const compaction = entries.findLast(entry => entry.type === "compaction");
+			const prompt = entries.findLast(entry => entry.type === "message" && entry.message.role === "user");
+			expect(compaction).toMatchObject({ firstKeptEntryId: prompt?.id });
 		},
 		CASE_TIMEOUT_MS,
 	);
