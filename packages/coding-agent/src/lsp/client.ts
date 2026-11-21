@@ -881,36 +881,48 @@ function uriIsWithin(uri: string, root: string): boolean {
 	return uri === root || uri.startsWith(root.endsWith("/") ? root : `${root}/`);
 }
 
-/** Reconcile open overlays and file watchers with the ops a workspace edit actually performed. */
-async function reconcileExecutedChanges(
-	executed: ExecutedWorkspaceChange[],
-	cwd: string,
-	signal?: AbortSignal,
-): Promise<void> {
+/**
+ * Reconcile open overlays and file watchers with the ops a workspace edit actually performed.
+ * The ops have already changed the files, so the caller's abort does not stop this: each
+ * step is bounded by its own {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}, as the notice is. A
+ * client whose step fails is logged and left; the notice still goes out, and nothing here
+ * rejects.
+ */
+async function reconcileExecutedChanges(executed: ExecutedWorkspaceChange[], cwd: string): Promise<void> {
 	if (executed.length === 0) return;
 	const { finalUris, deletedRoots, watchedFiles } = workspaceEditChanges(executed);
 	const workspace = path.resolve(cwd);
 	const activeClients = Array.from(clients.values()).filter(
 		client => client.status === "ready" && path.resolve(client.cwd) === workspace,
 	);
+	const stepBound = () => AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
 
-	for (const activeClient of activeClients) {
-		for (const uri of Array.from(activeClient.openFiles.keys())) {
-			let deleted = false;
-			for (const root of deletedRoots) {
-				if (uriIsWithin(uri, root)) {
-					deleted = true;
-					break;
+	await Promise.all(
+		activeClients.map(async activeClient => {
+			try {
+				for (const uri of Array.from(activeClient.openFiles.keys())) {
+					let deleted = false;
+					for (const root of deletedRoots) {
+						if (uriIsWithin(uri, root)) {
+							deleted = true;
+							break;
+						}
+					}
+					if (!deleted) continue;
+					await closeDocument(activeClient, uri, stepBound());
 				}
+				for (const uri of finalUris) {
+					if (!activeClient.openFiles.has(uri)) continue;
+					await refreshFile(activeClient, uriToFile(uri), stepBound());
+				}
+			} catch (err) {
+				logger.warn("LSP overlay reconciliation after a workspace edit failed", {
+					client: activeClient.name,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
-			if (!deleted) continue;
-			await closeDocument(activeClient, uri, signal);
-		}
-		for (const uri of finalUris) {
-			if (!activeClient.openFiles.has(uri)) continue;
-			await refreshFile(activeClient, uriToFile(uri), signal);
-		}
-	}
+		}),
+	);
 	await notifyWorkspaceWatchedFiles(cwd, watchedFiles);
 }
 
@@ -921,30 +933,23 @@ async function reconcileExecutedChanges(
  * `ignoreIfExists`/`ignoreIfNotExists` neither closes overlays nor notifies watchers, and
  * when the edit fails partway the already-executed prefix is still reconciled before the
  * error propagates so mutated files never keep stale overlays.
+ *
+ * A `signal` already aborted when the call starts stops it before it changes anything;
+ * the edit itself does not watch the signal. Once the edit has run, the abort stops
+ * nothing: the call reports what it changed, and the servers are told of it.
  */
 export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<string[]> {
+	throwIfAborted(signal);
 	const executed: ExecutedWorkspaceChange[] = [];
-	let applied: string[];
 	try {
-		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change)));
-	} catch (err) {
-		// Best-effort: overlays for the mutated prefix must not stay stale, but
-		// reconciliation problems must not mask the original apply failure.
-		try {
-			await reconcileExecutedChanges(executed, cwd, signal);
-		} catch (reconcileErr) {
-			logger.warn("LSP overlay reconciliation after failed workspace edit failed", {
-				error: reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr),
-			});
-		}
-		throw err;
+		return (await applyWorkspaceEdit(edit, cwd, change => executed.push(change))).applied;
+	} finally {
+		await reconcileExecutedChanges(executed, cwd);
 	}
-	await reconcileExecutedChanges(executed, cwd, signal);
-	return applied;
 }
 
 interface DynamicCapabilityRegistration {
@@ -2034,9 +2039,10 @@ function isPathInsideWorkspace(filePath: string, workspace: string): boolean {
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-/** Budget for the one-way watched-files notification: a wedged server that
- *  stops draining stdin must never hang the filesystem mutation that
- *  triggered it. Failures degrade to a debug log below. */
+/** Budget for the one-way watched-files notification, and for each step that
+ *  reconciles open documents with a workspace edit that has run: a wedged server
+ *  that stops draining stdin must never hang the filesystem mutation that
+ *  triggered it. Failures degrade to a log. */
 const WATCHED_FILES_NOTIFY_TIMEOUT_MS = 2_000;
 
 /**

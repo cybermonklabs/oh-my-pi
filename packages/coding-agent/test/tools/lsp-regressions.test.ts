@@ -5800,9 +5800,11 @@ describe("lsp regressions", () => {
 	});
 
 	describe("an edit whose change is made before the call's abort", () => {
-		// Each case places the abort right after the change lands. The change is then reported as
-		// made, and the server is still told of it: its notice is bounded by its own timeout, not
-		// by the call's abort.
+		// Each case places the abort right after the change lands, through the edit tool or a
+		// workspace edit (the `lsp` tool's rename and code actions). The change is then reported as
+		// made, and the server is still told of it: the steps after the change are bounded by their
+		// own timeouts, not by the call's abort. The controls: a write the client refuses still
+		// fails, and a workspace edit aborted before it starts changes nothing.
 		const config: ServerConfig = { command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] };
 
 		function editSession(cwd: string, getClientBridge?: () => ClientBridge | undefined): ToolSession {
@@ -5998,6 +6000,120 @@ describe("lsp regressions", () => {
 
 				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
 				expect(result.isError).not.toBe(true);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
+
+		/** A workspace edit (the `lsp` tool's rename and code actions apply one) of `old` to `new` in `target`. */
+		function renameEdit(target: string): WorkspaceEdit {
+			return {
+				documentChanges: [
+					{
+						textDocument: { uri: fileToUri(target), version: null },
+						edits: [
+							{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+						],
+					} satisfies TextDocumentEdit,
+				],
+			};
+		}
+
+		/** Aborts `controller` as soon as `target`'s new bytes are on disk (the edit writes with `Bun.write`). */
+		function abortOnceWritten(target: string, controller: AbortController): void {
+			const write = Bun.write;
+			vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				const written: number = await Reflect.apply(write, Bun, args);
+				if (args[0] === target) controller.abort();
+				return written;
+			}) as never);
+		}
+
+		/** The call's result, or what it rejected with. */
+		function settle(call: Promise<unknown>): Promise<unknown> {
+			return call.then(
+				result => result,
+				(rejection: unknown) => rejection,
+			);
+		}
+
+		it("a workspace edit is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-workspace-edit-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const controller = new AbortController();
+				abortOnceWritten(target, controller);
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect({ settled, serverTold: await told(server, target) }).toEqual({
+					settled: [expect.stringContaining("n.ts")],
+					serverTold: true,
+				});
+				// The open document was brought up to the new text too.
+				const didChange = await server.waitFor(message => message.method === "textDocument/didChange");
+				expect(didChange.params).toMatchObject({ contentChanges: [{ text: 'export const a = "new";\n' }] });
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit whose call is aborted before it starts changes nothing", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-aborted-workspace-edit-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const controller = new AbortController();
+				controller.abort();
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(ToolAbortError);
+				expect(await told(server, target)).toBe(false);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a server that stops reading delays an aborted workspace edit only by the step's own timeout", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-workspace-edit-wedged-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// From here the server never drains its input: only the step's timeout ends the refresh.
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => new Promise<number>(() => {}));
+				const controller = new AbortController();
+				abortOnceWritten(target, controller);
+
+				const settled = await settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).toEqual([expect.stringContaining("n.ts")]);
 			} finally {
 				await lspClient.shutdownAll();
 				tempDir.removeSync();
