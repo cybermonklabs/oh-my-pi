@@ -25,6 +25,7 @@ import {
 import { renderCall, renderResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import {
 	type CodeAction,
+	type Command,
 	type CreateFile,
 	type DeleteFile,
 	type Diagnostic,
@@ -6119,6 +6120,127 @@ describe("lsp regressions", () => {
 				tempDir.removeSync();
 			}
 		}, 15_000);
+
+		/**
+		 * Runs the `lsp` tool's `code_actions` apply of "Fix it" on `n.ts` (`old` to `new`)
+		 * against a fake server whose action is `action` and whose `workspace/executeCommand`
+		 * is handled by `onCommand`. Returns the target, the call's result or rejection, and
+		 * the signal's controller.
+		 */
+		async function applyFixIt(
+			tempDir: string,
+			action: (uri: string) => CodeAction | Command,
+			onCommand: (message: RpcMessage, srv: FakeLspServer, controller: AbortController) => void,
+		): Promise<{ target: string; settled: unknown; controller: AbortController }> {
+			const target = path.join(tempDir, "n.ts");
+			await Bun.write(target, 'export const a = "old";\n');
+			const controller = new AbortController();
+			const serverConfig: ServerConfig = {
+				command: "fake-lsp",
+				fileTypes: [".ts"],
+				rootMarkers: [],
+				isLinter: true,
+			};
+			installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: { codeActionProvider: true } } });
+				} else if (message.method === "textDocument/codeAction") {
+					const params = message.params as { textDocument: { uri: string } };
+					srv.send({ jsonrpc: "2.0", id: message.id, result: [action(params.textDocument.uri)] });
+				} else if (message.method === "codeAction/resolve") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: message.params });
+				} else if (message.method === "workspace/executeCommand") {
+					onCommand(message, srv, controller);
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: { "fake-lsp": serverConfig } });
+			const client = await lspClient.getOrCreateClient(serverConfig, tempDir, 1_000);
+			await lspClient.ensureFileOpen(client, target);
+			const settled = await settle(
+				new LspTool(makeLspSession(tempDir)).execute(
+					"apply-fix-it",
+					{ action: "code_actions", file: target, line: 1, query: "Fix it", apply: true },
+					controller.signal,
+				),
+			);
+			return { target, settled, controller };
+		}
+
+		const fixItWithCommand = (uri: string): CodeAction => ({
+			title: "Fix it",
+			kind: "quickfix",
+			edit: {
+				changes: {
+					[uri]: [
+						{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+					],
+				},
+			},
+			command: { title: "Fix it", command: "fix.it", arguments: [] },
+		});
+
+		it("a code action whose command the abort stops after its edit is reported as applied, naming the command", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-code-action-");
+			try {
+				// The abort lands while the server runs the command, after the edit has changed the file.
+				const { target, settled, controller } = await applyFixIt(tempDir.path(), fixItWithCommand, (_m, _s, c) =>
+					c.abort(),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:');
+				expect(text).toContain(
+					"  Command(s) not waited for, because the call was cancelled or timed out (the server may not have run them):\n    fix.it",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action with a command and no edit that the abort stops still ends as aborted", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-aborted-command-action-");
+			try {
+				const { target, settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					(_m, _s, c) => c.abort(),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(ToolAbortError);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action whose command fails after its edit, with no abort, still reports the failure", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-failed-code-action-command-");
+			try {
+				const { settled } = await applyFixIt(tempDir.path(), fixItWithCommand, (message, srv) =>
+					srv.send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "fix.it failed" } }),
+				);
+
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith("LSP error:");
+				expect(text).toContain("fix.it failed");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
 	});
 
 	it("reconciles the executed prefix when a workspace edit fails partway", async () => {

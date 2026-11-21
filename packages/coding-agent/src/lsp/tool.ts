@@ -1526,6 +1526,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									signal,
 								);
 							},
+							signal,
 						});
 
 						if (!appliedAction) {
@@ -1541,6 +1542,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						if (appliedAction.executedCommands.length > 0) {
 							summaryLines.push("  Executed command(s):");
 							summaryLines.push(...appliedAction.executedCommands.map(commandName => `    ${commandName}`));
+						}
+						if (appliedAction.abortedCommands?.length) {
+							summaryLines.push(
+								"  Command(s) not waited for, because the call was cancelled or timed out (the server may not have run them):",
+							);
+							summaryLines.push(...appliedAction.abortedCommands.map(commandName => `    ${commandName}`));
 						}
 
 						output = `Applied "${appliedAction.title}":\n${summaryLines.join("\n")}`;

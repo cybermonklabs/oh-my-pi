@@ -525,12 +525,16 @@ export interface CodeActionApplyDependencies {
 	resolveCodeAction?: (action: CodeAction) => Promise<CodeAction>;
 	applyWorkspaceEdit: (edit: WorkspaceEdit) => Promise<string[]>;
 	executeCommand: (command: Command) => Promise<void>;
+	/** The call's signal (its cancel and its deadline): once the edit has changed files, a command it stops is reported, not thrown. */
+	signal?: AbortSignal;
 }
 
 export interface AppliedCodeActionResult {
 	title: string;
 	edits: string[];
 	executedCommands: string[];
+	/** Commands the call's signal stopped waiting for after the edit had changed files. */
+	abortedCommands?: string[];
 }
 
 function isCommandItem(action: CodeAction | Command): action is Command {
@@ -557,16 +561,24 @@ export async function applyCodeAction(
 
 	const edits = resolvedAction.edit ? await dependencies.applyWorkspaceEdit(resolvedAction.edit) : [];
 	const executedCommands: string[] = [];
+	let abortedCommands: string[] | undefined;
 	if (resolvedAction.command) {
-		await dependencies.executeCommand(resolvedAction.command);
-		executedCommands.push(resolvedAction.command.command);
+		try {
+			await dependencies.executeCommand(resolvedAction.command);
+			executedCommands.push(resolvedAction.command.command);
+		} catch (error) {
+			// The edit has already changed files, and the abort does not undo them: the
+			// call reports the edit as applied and the command as aborted.
+			if (edits.length === 0 || !dependencies.signal?.aborted) throw error;
+			abortedCommands = [resolvedAction.command.command];
+		}
 	}
 
 	if (edits.length === 0 && executedCommands.length === 0) {
 		return null;
 	}
 
-	return { title: resolvedAction.title, edits, executedCommands };
+	return { title: resolvedAction.title, edits, executedCommands, ...(abortedCommands ? { abortedCommands } : {}) };
 }
 
 const GLOB_PATTERN_CHARS = /[*?[{]/;
