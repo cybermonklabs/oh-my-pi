@@ -19,6 +19,7 @@ import * as oauthFlowModule from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
+	type AcpAgentOptions,
 	createAcpExtensionUiContext,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
@@ -196,8 +197,9 @@ class FakeAgentSession {
 	constructor(
 		cwd: string,
 		private readonly models: Model[] = TEST_MODELS,
+		sessionManager: SessionManager = SessionManager.create(cwd),
 	) {
-		this.sessionManager = SessionManager.create(cwd);
+		this.sessionManager = sessionManager;
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
 			sessionId: this.sessionId,
@@ -558,6 +560,10 @@ async function createHarness(
 		extensionRunners?: boolean;
 		/** Exposed to each created session's `modelRegistry` for MCP credential round-trips. */
 		authStorage?: AuthStorage;
+		/** Passed to the `AcpAgent` (its `persistSessions` is false under `--no-session`). */
+		agentOptions?: AcpAgentOptions;
+		/** The factory's sessions keep no file, as main.ts's ACP factory makes them under `--no-session`. */
+		inMemorySessions?: boolean;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -601,7 +607,11 @@ async function createHarness(
 	const initialSession = new FakeAgentSession(cwdA);
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
-		const session = new FakeAgentSession(cwd);
+		const session = new FakeAgentSession(
+			cwd,
+			TEST_MODELS,
+			options.inMemorySessions ? SessionManager.inMemory(cwd) : undefined,
+		);
 		if (options.authStorage) session.authStorage = options.authStorage;
 		if (options.extensionRunners) {
 			session.extensionRunner = new ExtensionRunner(
@@ -619,7 +629,7 @@ async function createHarness(
 		return { session: session as unknown as AgentSession, setToolUIContext };
 	};
 
-	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
+	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession, options.agentOptions);
 	const clientCapabilities =
 		options.clientCapabilities ?? (options.elicitationHandler ? { elicitation: { form: {} } } : undefined);
 	if (clientCapabilities) {
@@ -648,6 +658,80 @@ async function advanceBootstrapGuard(): Promise<void> {
 	vi.advanceTimersByTime(ACP_BOOTSTRAP_RACE_GUARD_MS);
 	await Promise.resolve();
 }
+
+describe("ACP agent without session persistence (--no-session)", () => {
+	/** A session stored the way a run with persistence stores it: two messages, on disk. */
+	async function storedSession(cwd: string): Promise<FakeAgentSession> {
+		const stored = new FakeAgentSession(cwd);
+		stored.sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		stored.sessionManager.appendMessage(makeAssistantMessage("reply", "reasoning"));
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+		return stored;
+	}
+
+	async function refusal(promise: Promise<unknown>): Promise<string> {
+		try {
+			await promise;
+			return "(it succeeded)";
+		} catch (err) {
+			return err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	it("refuses session/load, session/resume and session/fork of a stored session, naming --no-session, and still serves session/new", async () => {
+		const harness = await createHarness({ agentOptions: { persistSessions: false }, inMemorySessions: true });
+		const stored = await storedSession(harness.cwdA);
+		const before = harness.sessions.length;
+		const request = { sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] };
+
+		const messages = {
+			"session/load": await refusal(harness.agent.loadSession(request)),
+			"session/resume": await refusal(harness.agent.resumeSession(request)),
+			"session/fork": await refusal(harness.agent.unstable_forkSession(request)),
+		};
+
+		const refused = (method: string) =>
+			`Invalid request: ${method} requires session persistence; omp was started with --no-session`;
+		expect(messages).toEqual({
+			"session/load": refused("session/load"),
+			"session/resume": refused("session/resume"),
+			"session/fork": refused("session/fork"),
+		});
+		// The refusals made no session.
+		expect(harness.sessions.length).toBe(before);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expect(harness.findSession(created.sessionId)?.sessionManager.getSessionFile()).toBeUndefined();
+		await harness.agent.dispose();
+	});
+
+	it("advertises session/load, resume and fork only when sessions persist", async () => {
+		const without = await createHarness({ agentOptions: { persistSessions: false }, inMemorySessions: true });
+		const off = await without.agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		expect(off.agentCapabilities?.loadSession).toBe(false);
+		expect(off.agentCapabilities?.sessionCapabilities).toEqual({ list: {}, close: {} });
+		await without.agent.dispose();
+
+		// Control: a run that keeps its sessions advertises all three.
+		const withPersistence = await createHarness();
+		const on = await withPersistence.agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		expect(on.agentCapabilities?.loadSession).toBe(true);
+		expect(on.agentCapabilities?.sessionCapabilities).toEqual({ list: {}, fork: {}, resume: {}, close: {} });
+		await withPersistence.agent.dispose();
+	});
+
+	it("control: without --no-session, session/load of a stored session gives back its entries and its id", async () => {
+		const harness = await createHarness();
+		const stored = await storedSession(harness.cwdA);
+
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+
+		const loaded = harness.sessions.at(-1);
+		expect(loaded?.sessionId).toBe(stored.sessionId);
+		expect(loaded?.sessionManager.getEntries().filter(entry => entry.type === "message")).toHaveLength(2);
+		await harness.agent.dispose();
+	});
+});
 
 describe("ACP agent", () => {
 	it("keeps the ACP handle after the durable session changes", async () => {

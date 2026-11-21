@@ -448,6 +448,17 @@ type CreateAcpSession = (
 	options?: { interactivePrompts?: boolean },
 ) => Promise<AgentSession | AcpSessionHandle>;
 
+/** How an {@link AcpAgent} serves its client. */
+export interface AcpAgentOptions {
+	/**
+	 * Whether this run keeps its sessions in the session store; false under
+	 * `--no-session`. Without it the agent neither advertises nor serves
+	 * `session/load`, `session/resume` and `session/fork`, which read a stored
+	 * session, and refuses them naming `--no-session`. Defaults to true.
+	 */
+	persistSessions?: boolean;
+}
+
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
@@ -1011,15 +1022,22 @@ export class AcpAgent implements Agent {
 	/** Serializes writes of the handle map ({@link readAcpSessionHandles}). */
 	#handleWrites: Promise<void> = Promise.resolve();
 	#disposePromise: Promise<void> | undefined;
+	readonly #persistSessions: boolean;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
 
-	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
+	constructor(
+		connection: AgentSideConnection,
+		createSession: CreateAcpSession,
+		initialSession?: AgentSession,
+		options: AcpAgentOptions = {},
+	) {
 		this.#connection = connection;
 		this.#initialSession = initialSession;
 		this.#createSession = createSession;
+		this.#persistSessions = options.persistSessions ?? true;
 	}
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
@@ -1054,7 +1072,7 @@ export class AcpAgent implements Agent {
 			},
 			authMethods,
 			agentCapabilities: {
-				loadSession: true,
+				loadSession: this.#persistSessions,
 				mcpCapabilities: {
 					http: true,
 					sse: true,
@@ -1063,12 +1081,11 @@ export class AcpAgent implements Agent {
 					embeddedContext: true,
 					image: true,
 				},
-				sessionCapabilities: {
-					list: {},
-					fork: {},
-					resume: {},
-					close: {},
-				},
+				// Without persistence a session lives only in this process: there is no
+				// stored session to load, resume or fork (see AcpAgentOptions).
+				sessionCapabilities: this.#persistSessions
+					? { list: {}, fork: {}, resume: {}, close: {} }
+					: { list: {}, close: {} },
 			},
 			// Top-level `_meta` (sibling of `agentCapabilities`) is where
 			// claude-agent-acp and codex-acp advertise steering; clients such as
@@ -1104,6 +1121,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+		this.#assertPersistedSessions("session/load");
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers);
 		await this.#replaySessionHistory(record);
@@ -1133,6 +1151,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		this.#assertPersistedSessions("session/resume");
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []);
 		const response: ResumeSessionResponse = {
@@ -1144,6 +1163,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+		this.#assertPersistedSessions("session/fork");
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#forkManagedSession(params);
 		const response: ForkSessionResponse = {
@@ -2367,6 +2387,15 @@ export class AcpAgent implements Agent {
 		if (!path.isAbsolute(cwd)) {
 			throw new Error(`ACP cwd must be absolute: ${cwd}`);
 		}
+	}
+
+	/** Refuses `method`, which reads a stored session, when this run keeps none (`--no-session`). */
+	#assertPersistedSessions(method: string): void {
+		if (this.#persistSessions) return;
+		throw RequestError.invalidRequest(
+			{ method },
+			`${method} requires session persistence; omp was started with --no-session`,
+		);
 	}
 
 	#convertPromptBlocks(blocks: PromptRequest["prompt"]): { text: string; images: AgentImageContent[] } {

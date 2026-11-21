@@ -210,7 +210,12 @@ import { cfgTaskAgentIdleTtlMs } from "./task/settings";
 import { cfgSkillsIncludeSkills } from "./extensibility/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
-type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
+type RunAcpMode = (
+	createSession: AcpSessionFactory,
+	initialSession?: AgentSession,
+	/** `persistSessions: false` under --no-session (AcpAgentOptions in modes/acp/acp-agent.ts). */
+	options?: { persistSessions?: boolean },
+) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<number>;
 type RunRpcMode = (session: AgentSession, options?: RpcModeOptions) => Promise<never>;
 
@@ -589,7 +594,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		// --no-session keeps every session in memory, as the launch's own session does
-		// (createSessionManager): nothing a `session/new` makes is written to the store.
+		// (createSessionManager): a session/new writes nothing to the store. session/load,
+		// session/resume and session/fork read a stored session, so the agent neither
+		// advertises nor serves them then (runAcpMode's persistSessions: false, below).
 		const nextSessionManager = args.parsedArgs.noSession
 			? SessionManager.inMemory(cwd)
 			: SessionManager.create(cwd, args.sessionDir);
@@ -2625,7 +2632,7 @@ export async function runRootCommand(
 			// Startup is over: stop recording spans, or every later session and subagent
 			// appends to the timing tree for the life of the server.
 			logger.endTiming();
-			await runAcpMode(createAcpSession);
+			await runAcpMode(createAcpSession, undefined, { persistSessions: !parsedArgs.noSession });
 		} else {
 			// Resolve extension-registered CLI flags before creating the session so a
 			// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb
