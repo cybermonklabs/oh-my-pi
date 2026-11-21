@@ -698,6 +698,32 @@ mod tests {
 		DIRECTORY_LINKS.store(UNPROBED, Ordering::SeqCst);
 	}
 
+	/// Runs the test `name` (its path in this crate) again in a process of its
+	/// own and fails when that run fails or runs no test: `true` here, `false`
+	/// in that process, which runs the test's body. The fallbacks are the
+	/// process's: a walk of any other test of this process sets them when its
+	/// kernel refuses `openat2` (gVisor) or `O_NOATIME` (a file of another
+	/// owner), and a test that reads them would read that walk's decision.
+	fn alone(name: &str) -> bool {
+		const ALONE: &str = "PI_WALKER_TEST_ALONE";
+		if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+			return false;
+		}
+		let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+			.args(["--exact", name, "--nocapture", "--test-threads=1"])
+			.env(ALONE, name)
+			.output()
+			.expect("run the test in a process of its own");
+		let (out, err) =
+			(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+		assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
+		assert!(
+			out.contains("1 passed"),
+			"{name} ran no test in a process of its own:\n{out}\n{err}"
+		);
+		true
+	}
+
 	/// Whether the kernel opens `a/f` below `root` with `openat2`.
 	fn openat2_works(root: c_int) -> bool {
 		let how = OpenHow { flags: u64::from(FLAGS.cast_unsigned()), mode: 0, resolve: RESOLVE };
@@ -861,9 +887,18 @@ mod tests {
 	/// a symlink at a directory's name, one swapped in just before the open
 	/// (below a root and as a listed subdirectory), a regular file and a FIFO
 	/// are each refused with `ENOTDIR`, the FIFO without blocking, and a
-	/// directory renamed into the name opens, as Linux opens it.
+	/// directory renamed into the name opens, as Linux opens it. It runs in a
+	/// process of its own ([`alone`]): the probe's verdict is the process's,
+	/// and another test's walk probing the real kernel could store `REFUSED`
+	/// over the emulated kernel's verdict, after which the opens trust the
+	/// emulated kernel and follow the link.
 	#[test]
 	fn a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one() {
+		if alone(
+			"fs::native::sys::tests::a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one",
+		) {
+			return;
+		}
 		let _serial = SWITCHES.lock();
 		let tree = Tree::new("follows");
 		let outside = Tree::new("follows-outside");
@@ -877,8 +912,8 @@ mod tests {
 		let _no_openat2 = fail_opens(|call, _| (call == Call::Openat2).then_some(libc::ENOSYS));
 		let _follows = follow_directory_links();
 		// The control: this kernel follows the link that `O_NOFOLLOW` names,
-		// and the probe sees it. Its verdict is stored here, so no other
-		// test's probe of the real kernel can store its own first.
+		// and the probe sees it. Its verdict is stored here; no other test
+		// runs in this process to store its own.
 		let followed = openat(root.as_raw_fd(), c"link".as_ptr(), DIR).expect("the kernel follows");
 		assert_eq!(id_of(followed), id_at(&outside.0), "the emulated kernel did not follow");
 		let verdict = probe_directory_links();
@@ -1000,9 +1035,16 @@ mod tests {
 	/// becoming the controlling terminal of a process that has none, which
 	/// `O_NOCTTY` keeps on a kernel [`openat_dir`] does not trust. The
 	/// control: a plain open of a pty slave in a new session makes it the
-	/// controlling terminal, so the check can see one.
+	/// controlling terminal, so the check can see one. It runs in a process of
+	/// its own ([`alone`]): another test's walk probing the real kernel could
+	/// store `REFUSED` over the verdict stored here, and the open would then
+	/// be the trusted one, which Linux refuses before any terminal opens, so
+	/// the test would pass without checking `O_NOCTTY`.
 	#[test]
 	fn a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal() {
+		if alone("fs::native::sys::tests::a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal") {
+			return;
+		}
 		let _serial = SWITCHES.lock();
 		reset();
 		DIRECTORY_LINKS.store(FOLLOWED, Ordering::SeqCst);
