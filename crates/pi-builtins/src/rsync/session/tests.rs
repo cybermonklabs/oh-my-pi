@@ -15,18 +15,24 @@ fn run(argv: &[&str], cwd: &Path) -> (i32, String, String) {
 	(code, cap.out(), cap.err())
 }
 
-/// The reference rsync 3.x binary, when one is installed.
+/// The reference rsync 3.x binary, when one is installed. Without one, the
+/// calling test skips: it prints `skipped: <reason>`, as every test that
+/// cannot run here does, and returns.
 fn reference() -> Option<PathBuf> {
 	let mut candidates = vec![PathBuf::from("/opt/homebrew/bin/rsync")];
 	if let Some(path) = std::env::var_os("PATH") {
 		candidates.extend(std::env::split_paths(&path).map(|d| d.join("rsync")));
 	}
-	candidates.into_iter().find(|p| {
+	let found = candidates.into_iter().find(|p| {
 		Command::new(p)
 			.arg("--version")
 			.output()
 			.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).starts_with("rsync  version 3."))
-	})
+	});
+	if found.is_none() {
+		eprintln!("skipped: no rsync 3.x on PATH");
+	}
+	found
 }
 
 /// A small tree: a file, a nested file, and (unix) a symlink.

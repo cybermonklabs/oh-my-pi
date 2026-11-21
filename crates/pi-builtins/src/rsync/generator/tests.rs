@@ -969,8 +969,9 @@ fn fake_super_link_dest_links_special_placeholders() {
 		b"10644 0,0 0:0",
 		false,
 	);
-	if record.is_err() {
+	if let Err(err) = record {
 		// No xattr support on this temp filesystem: fake-super cannot work here.
+		eprintln!("skipped: no user xattrs on the temporary filesystem: {err}");
 		return;
 	}
 
