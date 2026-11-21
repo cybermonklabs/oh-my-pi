@@ -564,8 +564,40 @@ fn child_of(parent: i32) -> proc::ProcInfo {
 /// Non-interactive bash layout: the child shares the host's group and
 /// session (so it keeps the controlling terminal), `PgroupSpec` is ignored,
 /// and signals, stop and cont reach the child alone, never the shared group.
+///
+/// The host is a process of its own, in a process group of its own: this
+/// test stops a child in the host's group, and a group with a stopped member
+/// is one the kernel may hang up. gVisor before 553528ee ("Only signal a
+/// process group's stopped members when it becomes orphaned") sends SIGHUP
+/// and SIGCONT to every member of an orphaned group with a stopped member
+/// each time any member leaves it; the test binary's own group is orphaned
+/// when it runs under `setsid`, and other tests' children leave it all the
+/// time, so the binary died of SIGHUP. In a group of its own, whose parent is
+/// in another group of the same session, the group is not orphaned and holds
+/// no other test's children.
 #[test]
 fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
+	const NAME: &str =
+		"sys::spawn::unix::tests::inherit_keeps_the_hosts_group_and_signals_only_the_child";
+	const ALONE: &str = "PI_SHELL_TEST_ALONE";
+	if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+		let output = std::process::Command::new(std::env::current_exe().unwrap())
+			.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+			.env(ALONE, NAME)
+			.process_group(0)
+			.output()
+			.unwrap();
+		let (out, err) =
+			(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+		assert!(
+			output.status.success(),
+			"the run of its own failed ({}):\n{out}\n{err}",
+			output.status
+		);
+		assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+		return;
+	}
+	assert_eq!(pgid(0), std::process::id() as i32, "the host leads a group of its own");
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, Duration::from_secs(2));
 	let sleep = crate::testkit::child::on_path("sleep");
