@@ -194,13 +194,14 @@ function waitedIn(query: string): string {
  * Waits until the server reports a transaction of `tracked` in `LOCK WAIT` on its own connection, and answers the
  * statement it waits in (see {@link waitedIn}). Once `settled` has settled first, answers "none"; once `ms` have passed
  * first, answers "none" with what it saw: the statements in flight by connection, and every transaction on the
- * server with its connection, state and statement.
+ * server with its connection, state and statement. The 2.5 s default answers at its first read (about 150 ms) when
+ * the wait is there, and leaves the named answer inside bun's 5 s bound for a case on a slow node.
  */
 async function lockWaitOf(
 	db: LeaseDb,
 	tracked: ReturnType<typeof inFlightClient> | undefined,
 	settled: Promise<unknown>,
-	ms = 4000,
+	ms = 2500,
 ): Promise<string> {
 	let done = false;
 	settled.then(
@@ -215,7 +216,8 @@ async function lockWaitOf(
 	let seen: Array<{ id?: unknown; state?: unknown; query?: unknown }> = [];
 	while (Date.now() < until && !done) {
 		// InnoDB answers INFORMATION_SCHEMA.INNODB_TRX from a cache it refills only when nothing read it in the last
-		// 100 ms (trx0i_s.cc, can_cache_be_updated), so reads closer than that see the same old rows: 150 ms apart.
+		// 100 ms (can_cache_be_updated: MySQL 8.4.13 trx0i_s.cc:681-699, MariaDB 11.4 and 11.8 trx0i_s.cc:958-970),
+		// so reads closer than that see the same old rows: 150 ms apart.
 		await Bun.sleep(150);
 		if (done) break;
 		seen = (await db.sql(
@@ -1893,6 +1895,80 @@ describe("session blobs in the SQL session storage", () => {
 					}).toEqual({ deleteWaits: "lock", paths: [c, away], away: sub, deadlocks: 0 });
 				},
 			);
+
+			// A source inside the directory that moves into the gap just before it deadlocks on a range too: the
+			// delete's range lock reaches a/s (the rows inside the directory), and waits for its row and the gap before
+			// it; the rename's UPDATE into that gap, inside the directory (a/d) or outside it (a.k/s, which sorts after
+			// a.jsonl and before a/), then waits for the delete. InnoDB rolls one back (1213) on a range as on a scan,
+			// and the retry runs it again, so the end state is one of the two serial orders: the rename first (the
+			// delete then takes the row if it is inside the directory) or the delete first (the rename then finds no
+			// source, ENOENT).
+			for (const [where, destination] of [
+				["inside the directory", ["a", "d.jsonl"]],
+				["outside it", ["a.k", "s.jsonl"]],
+			] as const) {
+				it.skipIf(adapter !== "mysql")(
+					`runs the rolled-back side again when a rename of a row inside a deleted artifacts directory moves it into the gap just before it, ${where}`,
+					async () => {
+						await using db = await openLeaseDb(adapter, url ?? "");
+						const deadlocks: string[] = [];
+						let gate: GatedClient | undefined;
+						const renamer = await db.open({
+							claims: false,
+							wrap: client => {
+								gate = gatedClient(
+									deadlockLog(client, deadlocks),
+									new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`),
+									"before",
+								);
+								return gate.client;
+							},
+						});
+						let trackedDeleter: ReturnType<typeof inFlightClient> | undefined;
+						const deleter = await db.open({
+							claims: false,
+							wrap: client => {
+								trackedDeleter = inFlightClient(deadlockLog(client, deadlocks));
+								return trackedDeleter.client;
+							},
+						});
+						const a = db.dir.join("sessions", "a.jsonl");
+						const source = db.dir.join("sessions", "a", "s.jsonl");
+						const c = db.dir.join("sessions", "c.jsonl");
+						const target = db.dir.join("sessions", ...destination);
+						for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
+						await renamer.writeText(source, transcript(ID, "a subagent"));
+						await renamer.drain();
+						await deleter.refresh();
+
+						gate?.close();
+						const renaming = renamer.renameNoReplace(source, target);
+						const renamed = renaming.then(
+							() => "ok",
+							(error: unknown) => String((error as { code?: unknown }).code ?? error),
+						);
+						let deleting: Promise<void> | undefined;
+						let deleteWaits = "none";
+						try {
+							await Promise.race([gate?.paused(), renaming]);
+							deleting = deleter.deleteSessionWithArtifacts(a);
+							deleteWaits = await lockWaitOf(db, trackedDeleter, deleting);
+						} finally {
+							gate?.open();
+						}
+						await deleting;
+						const order = { rename: await renamed, paths: await db.paths() };
+						// The rename first: it ends at the target, then the delete takes it if it is inside the directory.
+						const renameFirst = {
+							rename: "ok",
+							paths: target.startsWith(`${a.slice(0, -".jsonl".length)}/`) ? [c] : [target, c],
+						};
+						const deleteFirst = { rename: "ENOENT", paths: [c] };
+						expect({ deleteWaits, deadlocks: deadlocks.length }).toEqual({ deleteWaits: "lock", deadlocks: 1 });
+						expect([renameFirst, deleteFirst]).toContainEqual(order);
+					},
+				);
+			}
 
 			// A rename moves its source's references one key at a time, from a read after it locks the source's row:
 			// another client's append that adds a reference to the source and commits while the rename waits to lock
