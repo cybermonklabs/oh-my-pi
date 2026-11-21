@@ -112,6 +112,21 @@ export interface EvalCellResult {
 	/** Evictable events dropped from the front of `statusEvents` (see {@link recordStatusEvent}). */
 	statusEventsElided?: number;
 }
+/**
+ * A subagent whose result a bridged call handed the cell (`tool.task`, `tool.wait`, `wait()`),
+ * with the run-end flags its `task` result records.
+ */
+export interface EvalHeldAgentResult {
+	id: string;
+	aborted?: boolean;
+	workerLost?: boolean;
+	/**
+	 * When the call handed the result to the cell, in epoch ms. The eval result is written when the
+	 * cell ends, later; `omp --restore` judges which turn of the subagent the handover settled by
+	 * this time, so a turn the cell started after the handover stays unsettled.
+	 */
+	handedAt?: number;
+}
 
 /** Tool result detail object surfaced to the UI/transcript. */
 export interface EvalToolDetails {
@@ -134,6 +149,13 @@ export interface EvalToolDetails {
 	languages?: EvalLanguage[];
 	/** Optional human-readable notice (e.g. fallback explanation). */
 	notice?: string;
+	/**
+	 * Subagents whose results the cell's bridged calls handed it; `omp --restore` reads them as the
+	 * parent's. Only a cell that finishes in the foreground records them: a backgrounded cell's result
+	 * reaches the parent as a job delivery, which does not carry them. A `wait()` or `tool.wait`
+	 * handover is also recorded where it happens, as an eval job record.
+	 */
+	agentResults?: EvalHeldAgentResult[];
 	/** Present when the cell was auto-backgrounded as an async job; `cancelled`: killed before it finished. */
 	async?: {
 		state: "running" | "completed" | "failed" | "cancelled";

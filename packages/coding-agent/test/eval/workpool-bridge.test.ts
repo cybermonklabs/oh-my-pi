@@ -158,4 +158,89 @@ describe("workpool model validation", () => {
 		await runEvalWorkpool({ op: "push", name: "picked", items: ["one"] }, { session });
 		expect(await requested.promise).toEqual(model);
 	});
+
+	it("records each worker it spawns as owed, on disk, before the worker starts", async () => {
+		// If this regresses, a pool worker leaves no record: once the call that pushed the work has finished, a worker
+		// whose key failed while its batch still ran is in no window, and `omp --restore` leaves it, though the pool's
+		// owner still waits on its result.
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+		const log: string[] = [];
+		const started = Promise.withResolvers<void>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
+			log.push("worker started");
+			started.resolve();
+			throw new Error("stop after dispatch");
+		});
+		const session: ToolSession = {
+			...makeSession(),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					const state = data && typeof data === "object" && "state" in data ? String(data.state) : "?";
+					log.push(`append ${customType} ${state}`);
+					return "entry";
+				},
+				flush: async () => {
+					await Promise.resolve();
+					log.push("flushed");
+				},
+			},
+		} as unknown as ToolSession;
+		await runEvalWorkpool({ op: "create", name: "owed", agent: "scout" }, { session });
+		await runEvalWorkpool({ op: "push", name: "owed", items: ["one"] }, { session });
+		await started.promise;
+
+		expect(log).toEqual(["append eval-agent-job owed", "flushed", "worker started"]);
+	});
+
+	it("records a worker's handover when a peek returns its settled batch, and the rest when the drained pool hands its result over", async () => {
+		// If this regresses, a pool worker's `owed` record is never settled: `omp --restore` relaunches a worker whose
+		// failure the owner already got from the pool, and the owner gets that result twice.
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+		const log: string[] = [];
+		const calls: Array<string | undefined> = [];
+		const second = Promise.withResolvers<void>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+			calls.push(request.spawnCallId);
+			// The second worker's batch runs on until the test lets it fail too.
+			if (calls.length === 2) await second.promise;
+			throw new Error("No API key for provider: anthropic");
+		});
+		const session: ToolSession = {
+			...makeSession(),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					const record = data as { agentId?: string; state?: string } | undefined;
+					log.push(`${customType} ${record?.state} ${record?.agentId}`);
+					return "entry";
+				},
+				flush: async () => {},
+			},
+		} as unknown as ToolSession;
+		const options = { session, spawnCallId: "call_pool_eval" };
+		await runEvalWorkpool({ op: "create", name: "handed", agent: "scout" }, options);
+		await runEvalWorkpool({ op: "push", name: "handed", items: ["one", "two"] }, options);
+		let peeked: { batches: Array<{ agent: string; status: string }> };
+		const withStatus = (status: string) => peeked.batches.find(batch => batch.status === status)?.agent;
+		for (;;) {
+			peeked = (await runEvalWorkpool({ op: "peek", name: "handed" }, options)) as typeof peeked;
+			if (withStatus("failed") && withStatus("running")) break;
+			await Bun.sleep(5);
+		}
+		const [failed, running] = [withStatus("failed")!, withStatus("running")!];
+
+		expect(log.filter(line => line.includes("delivered"))).toEqual([`eval-agent-job delivered ${failed}`]);
+
+		const poolJob = session.asyncJobManager!.getJob("handed")!;
+		second.resolve();
+		await poolJob.promise;
+
+		expect(log).toEqual([
+			expect.stringMatching(/^eval-agent-job owed /),
+			expect.stringMatching(/^eval-agent-job owed /),
+			`eval-agent-job delivered ${failed}`,
+			`eval-agent-job delivered ${running}`,
+		]);
+		// Each worker records the `eval` call that pushed its item as the call it was spawned under.
+		expect(calls).toEqual(["call_pool_eval", "call_pool_eval"]);
+	});
 });

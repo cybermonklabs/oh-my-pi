@@ -161,6 +161,63 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
 	});
 
+	for (const [label, relaunched, ran] of [
+		[
+			"does not run again a cut-off call whose subagent restore relaunched, gives it a result naming the subagent, and runs the batch's other call again",
+			{ call_1: ["Worker"] },
+			["second"],
+		],
+		[
+			"control: runs every call of the cut-off batch again when restore relaunched no subagent",
+			{},
+			["first", "second"],
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, a call that started a subagent `--restore` relaunched runs again: its subagent's work
+			// starts a second time beside the relaunched one, and the parent gets two results for it.
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const executed: string[] = [];
+			// The process died while both calls ran: no tool results, no session_exit record.
+			const { session, mock } = reopen(
+				model,
+				[
+					{ role: "user", content: "run both probes", timestamp: Date.now() },
+					assistant(model, {
+						content: [
+							{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "first" } },
+							{ type: "toolCall", id: "call_2", name: "probe", arguments: { value: "second" } },
+						],
+						stopReason: "toolUse",
+					}),
+				],
+				[probeTool(executed)],
+				[{ content: ["done after restore"], stopReason: "stop" }],
+			);
+
+			await expect(session.restoreInterruptedTurn({ relaunched })).resolves.toBe(true);
+			await session.waitForIdle();
+
+			expect(executed).toEqual([...ran]);
+			expect(mock.calls.length).toBe(1);
+			const first = session.agent.state.messages.findLast(
+				message => message.role === "toolResult" && message.toolCallId === "call_1",
+			);
+			const text =
+				first?.role === "toolResult"
+					? first.content.map(part => (part.type === "text" ? part.text : "")).join("")
+					: "";
+			if ("call_1" in relaunched) {
+				expect(text).toContain("is not run again");
+				expect(text).toContain("Subagent Worker it started was relaunched by --restore and goes on with its work.");
+				expect(text).toContain("as its own follow-up turn unless a `wait` takes it");
+			} else {
+				expect(text).not.toContain("is not run again");
+			}
+		});
+	}
+
 	it("goes on with a turn exit recovery closed when the eval state snapshot follows it (#16195)", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");

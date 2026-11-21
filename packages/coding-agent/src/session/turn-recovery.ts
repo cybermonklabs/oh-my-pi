@@ -305,6 +305,7 @@ export interface TurnRecoveryHost {
 		delayMs?: number;
 		generation?: number;
 		shouldContinue?: () => boolean;
+		onSkip?: () => void;
 		onError?: (error: unknown) => void;
 	}): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
@@ -3199,6 +3200,11 @@ export class TurnRecovery {
 		// Quota resets elapse while the machine sleeps; capture the deadline before event delivery.
 		const usageResetDeadline = AIError.is(id, AIError.Flag.UsageLimit) ? Date.now() + delayMs : undefined;
 
+		// Registered before the retry is announced: an `abortRetry()` from an `auto_retry_start` listener
+		// (the user's Esc as the retry notice appears) cancels this retry instead of finding none.
+		const retryAbortController = new AbortController();
+		this.#retryAbortController?.abort();
+		this.#retryAbortController = retryAbortController;
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
@@ -3210,6 +3216,10 @@ export class TurnRecovery {
 		if (this.#host.abortInProgress() || this.#host.promptGeneration() !== generation) {
 			// A newer prompt alone supersedes the retry: the turn goes on in that prompt.
 			return this.#endCancelledRetry(message, this.#host.abortInProgress() && this.#retryCancelStopsTurn);
+		}
+		if (retryAbortController.signal.aborted) {
+			if (this.#retryAbortController !== retryAbortController) return false;
+			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
 		}
 
 		// Resolved stream-stall tools and proven-unexecuted malformed/refused
@@ -3226,9 +3236,6 @@ export class TurnRecovery {
 		this.#maybeInjectMalformedFunctionCallRedirect(id, maxRetries, preserveFailedTurn, switchedModel);
 
 		// Quota waits follow the wall clock; ordinary backoff stays monotonic.
-		const retryAbortController = new AbortController();
-		this.#retryAbortController?.abort();
-		this.#retryAbortController = retryAbortController;
 		try {
 			if (usageResetDeadline !== undefined) {
 				await sleepUntil(usageResetDeadline, retryAbortController.signal);
@@ -3241,9 +3248,6 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			return this.#endCancelledRetry(message, this.#retryCancelStopsTurn);
-		}
-		if (this.#retryAbortController === retryAbortController) {
-			this.#retryAbortController = undefined;
 		}
 
 		// The identity-keyed removal above can miss when a context rebuild
@@ -3267,7 +3271,15 @@ export class TurnRecovery {
 			source: "automatic-retry",
 			delayMs: 1,
 			generation,
-			shouldContinue: () => this.#retryAttempt > 0,
+			shouldContinue: () => this.#retryAttempt > 0 && !retryAbortController.signal.aborted,
+			onSkip: () => {
+				if (!retryAbortController.signal.aborted || this.#retryAbortController !== retryAbortController) return;
+				void this.#endCancelledRetry(message, this.#retryCancelStopsTurn).catch(error =>
+					logger.error("Closing a retry saga after its continuation was skipped threw", {
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			},
 			onError: error =>
 				void this.#failRetryAfterLocalContinueError(message, error).catch(failure =>
 					logger.error("Closing a retry saga after a failed local continuation threw", {

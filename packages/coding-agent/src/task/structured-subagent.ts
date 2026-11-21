@@ -169,6 +169,8 @@ export interface StructuredSubagentRequest {
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
+	/** The parent's top-level call the spawn was requested under ({@link ExecutorOptions.spawnCallId}). */
+	spawnCallId?: string;
 	detached?: boolean;
 	invokedAt?: number;
 	acquiredAt?: number;
@@ -803,6 +805,7 @@ function buildExecutorOptions(
 		description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,
 		index: request.index ?? 0,
 		parentToolCallId: request.parentToolCallId,
+		spawnCallId: request.spawnCallId,
 		detached: request.detached,
 		id,
 		taskDepth: session.taskDepth ?? 0,
