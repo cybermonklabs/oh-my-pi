@@ -18,7 +18,11 @@ use crate::{
 		ModeId, NativeRef, ProcEvent, ResolveCtx, Resolved, Rlimit, SpawnFuture, SpawnSpec, StdFd,
 		SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict, Vpid,
 	},
-	process::{pending_fs::PendingFs, signals::Signals, timer::Timers},
+	process::{
+		pending_fs::PendingFs,
+		signals::{Signals, WakeOnSignal},
+		timer::Timers,
+	},
 	sys::{Exits, NativeSpawner, Sessions, SpawnConfig, StdFs, std_stream},
 };
 
@@ -47,8 +51,10 @@ pub struct NativeHost {
 	/// five times: 20 id and `getgroups` syscalls).
 	user:      std::cell::OnceCell<UserInfo>,
 	/// The shell caught OS signals go to ([`Self::bind_signals`]): every
-	/// external this host spawns hands them over when its exit is observed.
-	bridge:    Option<(ControlHandle, Vpid)>,
+	/// external this host spawns hands them over when its exit is observed,
+	/// and each one caught stops the running vproc at its next op
+	/// ([`WakeOnSignal`]).
+	bridge:    Option<(ControlHandle, Vpid, WakeOnSignal)>,
 	/// The process's terminals ([`crate::bash::Host::terminal`]).
 	#[cfg(any(unix, windows))]
 	terminal:  crate::sys::tty::NativeTerminal,
@@ -200,18 +206,24 @@ impl NativeHost {
 		self.extras = Some(Extras { tools, runtime: None });
 	}
 
-	/// Deliver the OS signals caught before an external's exit to the root
-	/// vproc `root` of the shell `ctl` controls as soon as the engine
-	/// observes that exit, before the command after it runs. bash handles a
-	/// signal that arrived while it waited for a foreground child before
-	/// its next command; obash's run loop forwards caught signals only
-	/// between steps, and a step that reaps the child would otherwise run
-	/// on into the next command first (`/bin/kill -USR1 $$; echo after`
-	/// printed `after` without the trap's output). Called by `main` and
-	/// the fault injector right after `Shell::create` / `Shell::restore`;
-	/// externals spawned for an earlier shell keep its handle.
+	/// Deliver the OS signals caught to the root vproc `root` of the shell
+	/// `ctl` controls: each one caught stops the running vproc at its next
+	/// op, which has the engine ask for it ([`WakeOnSignal`],
+	/// [`crate::bash::Host::forward_signals`]); one caught before an
+	/// external's exit is handed over as soon as the engine observes that
+	/// exit, before the command after it runs. bash handles a signal as it
+	/// comes while it runs shell code, and one that came while it waited for
+	/// a foreground child before its next command (`/bin/kill -USR1 $$; echo
+	/// after` printed `after` without the trap's output, as did a trap whose
+	/// signal came while a loop of builtins ran the script to its end).
+	/// Called by `main` and the fault injector right after `Shell::create` /
+	/// `Shell::restore`; externals spawned for an earlier shell keep its
+	/// handle.
 	pub fn bind_signals(&mut self, ctl: ControlHandle, root: Vpid) {
-		self.bridge = Some((ctl, root));
+		// The signals wake one shell at a time: the earlier one first stops.
+		self.bridge = None;
+		let wake = WakeOnSignal::new(&ctl);
+		self.bridge = Some((ctl, root, wake));
 	}
 
 	/// The signals ignored on entry this host reports
@@ -277,7 +289,9 @@ impl crate::bash::Host for NativeHost {
 	fn spawn(&mut self, spec: SpawnSpec<'_>) -> SpawnFuture {
 		let spawned = self.spawner.spawn(spec).map(|child| -> Box<dyn ExtProc> {
 			match &self.bridge {
-				Some((ctl, root)) => Box::new(SignalsOnExit { child, ctl: ctl.clone(), root: *root }),
+				Some((ctl, root, _)) => {
+					Box::new(SignalsOnExit { child, ctl: ctl.clone(), root: *root })
+				},
 				None => child,
 			}
 		});
@@ -332,7 +346,7 @@ impl crate::bash::Host for NativeHost {
 	}
 
 	fn forward_signals(&mut self) {
-		if let Some((ctl, root)) = &self.bridge {
+		if let Some((ctl, root, _)) = &self.bridge {
 			Signals::dispatch(ctl, *root);
 		}
 	}

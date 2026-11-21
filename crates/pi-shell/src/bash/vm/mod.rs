@@ -57,7 +57,7 @@ pub use self::{
 	zsh::zpattern::Cache as ZshPatternCache,
 };
 use self::{
-	control::{CANCEL, Ctl, PAUSE, RESUME, SIGNAL, SUSPEND},
+	control::{CANCEL, Ctl, OS_SIGNAL, PAUSE, RESUME, SIGNAL, SUSPEND},
 	proc::{Frame, FrameKind, Live, PendingWrite, ScriptKind},
 	state::{Overlay, Root, Var},
 };
@@ -469,11 +469,19 @@ pub struct Kernel {
 	/// skip its checks before every command; not imaged.
 	pub pseudo_traps:       exec::PseudoTraps,
 	/// bash's `INT` as each vproc that has one has it ([`IntNote`]): where its
-	/// last wait began, noted while it waits for its foreground job, or died
-	/// of. Kept here, not on the vproc, which stays in its size budget; an
-	/// entry goes when its vproc ends. Not imaged: a snapshot drops a wait in
-	/// flight.
+	/// last wait began, or noted while it waits for its foreground job or reads
+	/// a command substitution. Kept here, not on the vproc, which stays in its
+	/// size budget; an entry goes when its vproc ends. Not imaged: a snapshot
+	/// drops a wait in flight.
 	pub int_notes:          Vec<(Vpid, IntNote)>,
+	/// The subshell vprocs that die of `SIGINT`, not reaped yet: by their own
+	/// end at its default action (`Shell`'s `kill`), as the program they are
+	/// ([`external_ended`]), or through their own EXIT trap (bash
+	/// `termsig_handler` kills the subshell with the signal once the trap has
+	/// run). Their parent's hold reads it at the reap ([`Shell::reaped`]).
+	/// Apart from [`Self::int_notes`]: a wait the EXIT trap begins rewrites
+	/// those. Not imaged.
+	pub int_deaths:         Vec<Vpid>,
 	/// Signals sent to the shell while the program the root runs in place
 	/// of itself (`exec`, [`proc::ExecState::in_place`]) was still being
 	/// spawned: the program gets them once it exists (a spawn that fails
@@ -604,6 +612,20 @@ impl Kernel {
 		}
 	}
 
+	/// Subshell vproc `vpid` dies of `SIGINT` ([`Self::int_deaths`]).
+	pub(super) fn dies_of_int(&mut self, vpid: Vpid) {
+		if !self.int_deaths.contains(&vpid) {
+			self.int_deaths.push(vpid);
+		}
+	}
+
+	/// Whether vproc `vpid` died of `SIGINT` ([`Self::int_deaths`]); its
+	/// entry goes.
+	pub(super) fn died_of_int(&mut self, vpid: Vpid) -> bool {
+		let at = self.int_deaths.iter().position(|&v| v == vpid);
+		at.map(|i| self.int_deaths.swap_remove(i)).is_some()
+	}
+
 	/// The functions (metafied names) of the digest `path` as this shell
 	/// last read it, while its modification time and size are `stamp`.
 	pub(crate) fn dump_funcs(
@@ -666,6 +688,7 @@ impl Kernel {
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
 			int_notes: Vec::new(),
+			int_deaths: Vec::new(),
 			forward: crate::bash::SigSet::EMPTY,
 			program_in_place: false,
 			nofork_units: HashMap::new(),
@@ -2024,6 +2047,11 @@ impl Shell {
 			if let Some(step) = self.report() {
 				return step;
 			}
+			// A substitution's output read to its end while its reader held an
+			// `INT` ([`HeldInt::Comsub`]).
+			if !self.k.int_notes.is_empty() {
+				self.comsub_reads_ended();
+			}
 			if self.k.ctl.word() != 0 {
 				if let Some(step) = self.apply_requests(cx) {
 					return step;
@@ -2115,7 +2143,7 @@ impl Shell {
 				{
 					untrapped::in_place_ended(&mut self.k, cx, parent);
 				}
-				let died = self.k.int_note(p.vpid) == Some(IntNote::Died);
+				let died = self.k.died_of_int(p.vpid);
 				self.k.set_int_note(p.vpid, None);
 				self.reaped(cx, p.parent, p.vpid, p.status, died);
 			} else {
@@ -2167,7 +2195,7 @@ impl Shell {
 	}
 
 	/// Child vproc `vpid` of `parent` ended with `status` (`died_of_int`:
-	/// by `SIGINT`, [`IntNote::Died`]): the parent's job for it is
+	/// by `SIGINT`, [`Kernel::int_deaths`]): the parent's job for it is
 	/// done (`jobs`, `wait` see it), a parent trapping `SIGCHLD` owes one
 	/// more run of the trap, and one holding an `INT` for its foreground job
 	/// learns how this process of it ended (bash `waitchld`'s
@@ -2276,7 +2304,13 @@ impl Shell {
 
 	/// Apply pending control requests.
 	fn apply_requests(&mut self, cx: &mut Cx<'_>) -> Option<Step> {
-		let req = self.k.ctl.take();
+		let mut req = self.k.ctl.take();
+		// The OS signals a handler caught while shell code ran: the host
+		// queues them now ([`ControlHandle::signal_word`]).
+		if req & OS_SIGNAL != 0 {
+			cx.host.forward_signals();
+			req |= self.k.ctl.take();
+		}
 		if req & (CANCEL | SIGNAL) != 0 {
 			// A cancel or signal concerns blocked vprocs too: let them run
 			// (pause/resume deliberately do not).
@@ -2319,6 +2353,9 @@ impl Shell {
 					self.kill(cx, i, sig, status);
 				}
 			}
+			// The root's process runs no program in place of the shell now: a
+			// pending spawn went, and the program got the signal.
+			untrapped::program_ended(&mut self.k, cx, &self.procs[0]);
 			// Calls of the cancelled vprocs are void; a detached tree's go on.
 			let detached: Vec<Vpid> = self
 				.procs
@@ -2378,18 +2415,29 @@ impl Shell {
 
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
 	/// scripts. Transient vprocs are removed. One `sig` is `INT` died of it
-	/// ([`IntNote::Died`]).
+	/// ([`Kernel::int_deaths`]); one another signal ends died of that one,
+	/// though an `INT` began its end (its EXIT trap, which the signal ends).
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
-		let died = sig == Signal::Int;
-		self
-			.k
-			.set_int_note(self.procs[i].vpid, died.then_some(IntNote::Died));
+		self.end(cx, i, sig, status, true);
+	}
+
+	/// [`Self::kill`], `externals`: signalling its externals too; else they
+	/// run on (released: the root's process died of `sig`,
+	/// [`Self::release_foreground`]).
+	fn end(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32, externals: bool) {
+		let vpid = self.procs[i].vpid;
+		self.k.set_int_note(vpid, None);
+		if sig == Signal::Int && self.procs[i].parent.is_some() {
+			self.k.dies_of_int(vpid);
+		} else {
+			self.k.died_of_int(vpid);
+		}
 		let p = &mut self.procs[i];
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
 				match &mut sc.live {
 					Live::Task(t) => t.signal(sig),
-					Live::Ext(e) => {
+					Live::Ext(e) if externals => {
 						let _ = e.signal(sig);
 						let _ = e.cont();
 					},
@@ -2414,6 +2462,10 @@ impl Shell {
 			}
 			self.k.done.push_back((run.id, status));
 		}
+		// The root's process runs no program in place of the shell now.
+		if self.procs[i].parent.is_none() {
+			untrapped::program_ended(&mut self.k, cx, &self.procs[i]);
+		}
 		if self.procs[i].transient {
 			let p = self.procs.remove(i);
 			self.k.trace_sources.remove(&p.vpid);
@@ -2423,6 +2475,7 @@ impl Shell {
 			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
 			self.k.set_int_note(p.vpid, None);
+			let died = self.k.died_of_int(p.vpid);
 			self.reaped(cx, p.parent, p.vpid, status, died);
 		}
 	}
@@ -2483,10 +2536,12 @@ impl Shell {
 	/// signal number `n` ([`control::Ctl::take_signals`]) reaches it: its
 	/// foreground job (bash `wait_for` with `wait_sigint_handler`), when its
 	/// innermost frame awaits an external or the stages or subshell of a
-	/// `Spawn` still running (not one it runs itself, `lastpipe`); for the
-	/// root, the output of a command substitution it reads. `None`: it runs
-	/// shell code, or did when the signal came, before its wait began
-	/// ([`IntNote::WaitFrom`]).
+	/// `Spawn` still running (not one it runs itself, `lastpipe`); the output
+	/// of a command substitution it reads while something still writes it
+	/// (`command_substitute` blocks `SIGINT` around `read_comsub`, in every
+	/// bash process), then the substitution's process, as a job
+	/// (`wait_for`). `None`: it runs shell code, or did when the signal came,
+	/// before its wait began ([`IntNote::WaitFrom`]).
 	fn waits(&self, i: usize, n: u64) -> Option<HeldInt> {
 		let p = &self.procs[i];
 		if let Some(IntNote::WaitFrom(from)) = self.k.int_note(p.vpid)
@@ -2504,16 +2559,68 @@ impl Shell {
 		if external || stages {
 			return Some(HeldInt::Job { caught: false });
 		}
-		(p.parent.is_none() && matches!(sc.sub, Some(proc::PendingSub::Fork { .. })))
-			.then_some(HeldInt::Comsub)
+		match &sc.sub {
+			Some(proc::PendingSub::Fork { capture, .. }) if capture.has_writers() => {
+				Some(HeldInt::Comsub)
+			},
+			Some(proc::PendingSub::Fork { .. }) => Some(HeldInt::Job { caught: false }),
+			_ => None,
+		}
+	}
+
+	/// A vproc that holds an `INT` while it reads a substitution's output
+	/// ([`HeldInt::Comsub`]), whose output nothing writes any more (its
+	/// process closed or moved its standard output, and no program of it
+	/// holds a copy): the read is over, and it acts on the `INT` now, as
+	/// bash does once `read_comsub` reads end of file and `SIGINT` is
+	/// unblocked, before it waits for the substitution's process; that wait
+	/// begins after the signal ([`IntNote::WaitFrom`]), and holds a later
+	/// one as for a job ([`Self::waits`]).
+	fn comsub_reads_ended(&mut self) {
+		let ended: Vec<Vpid> = self
+			.k
+			.int_notes
+			.iter()
+			.filter(|&&(_, note)| note == IntNote::Held(HeldInt::Comsub))
+			.map(|&(vpid, _)| vpid)
+			.filter(|&vpid| {
+				self
+					.procs
+					.iter()
+					.find(|p| p.vpid == vpid)
+					.and_then(|p| p.frames.last()?.scratch.as_ref())
+					.is_some_and(|sc| {
+						matches!(&sc.sub, Some(proc::PendingSub::Fork { capture, .. }) if !capture.has_writers())
+					})
+			})
+			.collect();
+		for vpid in ended {
+			ControlHandle(Arc::clone(&self.k.ctl)).signal(SigTarget::Vpid(vpid), Signal::Int);
+			let from = self.k.ctl.signals_queued();
+			self.k.set_int_note(vpid, Some(IntNote::WaitFrom(from)));
+		}
 	}
 
 	/// The vprocs of the root's foreground command, parents first: each
 	/// child of the root (a stage, a subshell, a command or process
 	/// substitution), then each of theirs, and so on, but a job of its own
-	/// (in its parent's job table).
-	fn foreground_tree(&self) -> Vec<Vpid> {
-		let mut tree = vec![self.procs[0].vpid];
+	/// (in its parent's job table). `shell_group`: only those bash runs in
+	/// the shell's own process group under job control (`set -m`): not the
+	/// stages or subshell of the foreground job the root waits for, which
+	/// bash runs in a group of their own, nor theirs.
+	fn foreground_tree(&self, shell_group: bool) -> Vec<Vpid> {
+		let root = &self.procs[0];
+		let job: Vec<Vpid> = if shell_group {
+			root
+				.frames
+				.iter()
+				.filter_map(|f| f.scratch.as_ref())
+				.flat_map(|sc| sc.children.iter().map(|&(vpid, _)| vpid))
+				.collect()
+		} else {
+			Vec::new()
+		};
+		let mut tree = vec![root.vpid];
 		let mut next = 0;
 		while let Some(&parent) = tree.get(next) {
 			next += 1;
@@ -2524,6 +2631,7 @@ impl Shell {
 				if p.parent == Some(parent)
 					&& owner.jobs.by_vpid(p.vpid).is_none()
 					&& !tree.contains(&p.vpid)
+					&& !job.contains(&p.vpid)
 				{
 					tree.push(p.vpid);
 				}
@@ -2534,94 +2642,217 @@ impl Shell {
 	}
 
 	/// Let the externals of the root's foreground command outlive the shell
-	/// ([`exec::release_externals`], [`Self::foreground_tree`]). bash's
-	/// `termsig_handler` and zsh's `zexit` end the shell's process alone;
-	/// the processes of its foreground command go on. Shell code of a stage
-	/// or a subshell runs in obash's process, and ends with it.
+	/// ([`exec::release_externals`]): the root's own and those of each vproc
+	/// of [`Self::foreground_tree`]. bash's `termsig_handler` and zsh's
+	/// `zexit` end the shell's process alone, and so does a signal's default
+	/// action: the processes of its foreground command go on. Shell code of
+	/// a stage or a subshell runs in obash's process, and ends with it.
 	fn release_foreground(&mut self) {
-		let tree = self.foreground_tree();
-		for p in self.procs.iter_mut().filter(|p| tree.contains(&p.vpid)) {
+		let tree = self.foreground_tree(false);
+		for p in self
+			.procs
+			.iter_mut()
+			.filter(|p| p.parent.is_none() || tree.contains(&p.vpid))
+		{
 			exec::release_externals(p);
 		}
 	}
 
-	/// The `INT` of the shell's process group, as each bash process of the
-	/// root's foreground command gets it: bash runs each stage, subshell and
-	/// substitution in a process of its own, in the shell's group without job
-	/// control, where obash runs their code in its own process, which gets
-	/// the signal once. Parents first ([`Self::foreground_tree`]), so that
-	/// each one's end reaches its parent's hold ([`Self::reaped`]). One that
-	/// is just its program ([`transparent`]) leaves the signal to the
-	/// program, which has it from the kernel; one with an `INT` trap of its
-	/// own runs it, or ignores it (`trap ''`, a background job's); else it
-	/// holds it while it waits for a job of its own ([`HeldInt`]), and dies
-	/// of it (after an EXIT trap of its own) while it runs shell code, as a
-	/// bash subshell does.
-	///
-	/// An `INT` from another process ([`SigTarget::Outside`]) is taken as the
-	/// group's, though a `kill` of the shell's pid alone sends one too: taken
-	/// as the shell's alone, a `kill` of the group (`timeout`, a runner's
-	/// cancel) would leave a stage of shell code running on, a loop forever
-	/// (`while :; do sleep 1; done | cmd`), where bash's stage dies. So a
-	/// `kill -INT` of obash's pid alone also ends the shell code of its
-	/// foreground command, which bash's subshells would run on: a known
-	/// difference.
-	fn int_to_foreground(&mut self, cx: &mut Cx<'_>, n: u64) {
-		let key = crate::bash::store::TrapKey::Signal(Signal::Int);
-		let status = Signal::Int.exit_status(self.k.engine.config().platform);
-		// The vprocs made when a wait began after the signal came: the
-		// kernel's signal did not reach the processes bash forks after it.
+	/// The vprocs of the root's foreground command that get the `INT` of
+	/// the shell's process group ([`Self::int_to_foreground`]), parents
+	/// first: each bash process of the command bash runs in the shell's
+	/// group. Without job control that is each stage, subshell and
+	/// substitution, where obash runs their code in its own process, which
+	/// gets the signal once; under `set -m` the stages and subshell of a
+	/// foreground job are in a group of their own, and get none, while its
+	/// substitutions are in the shell's ([`Self::foreground_tree`]). Not
+	/// those made when a wait began after the signal came: the kernel's
+	/// signal did not reach the processes bash forks after it. Taken before
+	/// the root takes the signal, whose end (its EXIT trap, or its death)
+	/// unwinds the frames that name its foreground job. `None` after a store
+	/// failure.
+	fn int_targets(&mut self, cx: &mut Cx<'_>, n: u64) -> Option<Vec<Vpid>> {
+		let monitor = match state::option(&mut self.k.root, cx.store, &self.procs[0], OptId::Monitor)
+		{
+			Ok(monitor) => monitor,
+			Err(err) => {
+				self.k.fail(err);
+				return None;
+			},
+		};
 		let mut later: Vec<Vpid> = Vec::new();
-		for vpid in self.foreground_tree() {
-			let Some(i) = self.procs.iter().position(|p| p.vpid == vpid) else {
+		let mut targets = Vec::new();
+		for vpid in self.foreground_tree(monitor) {
+			let Some(p) = self.procs.iter().find(|p| p.vpid == vpid) else {
 				continue;
 			};
-			if let Some(parent) = self.procs[i].parent
+			if let Some(parent) = p.parent
 				&& (later.contains(&parent)
 					|| matches!(self.k.int_note(parent), Some(IntNote::WaitFrom(from)) if n <= from))
 			{
 				later.push(vpid);
 				continue;
 			}
+			targets.push(vpid);
+		}
+		Some(targets)
+	}
+
+	/// The `INT` of the shell's process group, as each bash process of the
+	/// root's foreground command gets it: `targets`, from
+	/// [`Self::int_targets`]. Parents first, so that each one's end reaches
+	/// its parent's hold ([`Self::reaped`]). One that is just its program
+	/// ([`transparent`]) leaves the signal to the program, which has it from
+	/// the kernel; one with an `INT` trap of its own runs it, or ignores it
+	/// (`trap ''`, a background job's); else it holds it while it waits for a
+	/// job of its own or reads a substitution ([`HeldInt`]), and dies of it
+	/// (after an EXIT trap of its own) while it runs shell code, as a bash
+	/// subshell does ([`Self::take`], as [`Self::deliver`] gives a signal).
+	///
+	/// An `INT` from another process ([`SigTarget::Outside`]) is taken as the
+	/// group's, though a `kill` of the shell's pid alone sends one too: taken
+	/// as the shell's alone, a `kill` of the group (`timeout`, a runner's
+	/// cancel) would leave a stage of shell code running on, a loop forever
+	/// (`while :; do sleep 1; done | cmd`), where bash's stage dies. So
+	/// without job control a `kill -INT` of obash's pid alone also ends the
+	/// shell code of its foreground command, which bash's subshells would
+	/// run on: a known difference.
+	fn int_to_foreground(&mut self, cx: &mut Cx<'_>, n: u64, targets: Vec<Vpid>) {
+		let key = crate::bash::store::TrapKey::Signal(Signal::Int);
+		for vpid in targets {
+			let Some(i) = self.procs.iter().position(|p| p.vpid == vpid) else {
+				continue;
+			};
 			let p = &self.procs[i];
 			if p.mode.dialect() != crate::bash::ids::Dialect::Bash
 				|| transparent(p, false) == Some(true)
 			{
 				continue;
 			}
-			match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
-				Ok(Some(Record::Trap { action, .. })) if action.is_empty() => continue,
-				Ok(Some(Record::Trap { .. })) if p.own_traps.has(key) => {
-					let p = &mut self.procs[i];
-					p.pending_traps = p.pending_traps.with(Signal::Int);
-					if !p.waiting_foreground() {
-						p.blocked = None;
-					}
-					continue;
-				},
-				Ok(_) => {},
+			// An ignoring trap stays in a subshell; one with an action only
+			// where the subshell set it.
+			let trap = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
+				Ok(Some(Record::Trap { action, .. })) if action.is_empty() => Some(true),
+				Ok(Some(Record::Trap { .. })) if p.own_traps.has(key) => Some(false),
+				Ok(_) => None,
 				Err(err) => {
 					self.k.fail(err);
 					return;
 				},
-			}
-			let waits = self.waits(i, n);
-			match untrapped::decide(&mut self.k, cx, &mut self.procs[i], Signal::Int, waits) {
-				Ok(untrapped::Untrapped::Held(held)) => {
-					self.k.set_int_note(vpid, Some(IntNote::Held(held)));
-				},
-				Ok(untrapped::Untrapped::BashExitTrapThenDie) => {
-					self.k.set_int_note(vpid, Some(IntNote::Died));
-					exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, status);
-				},
-				Ok(untrapped::Untrapped::Default) => self.kill(cx, i, Signal::Int, status),
-				Ok(_) => {},
-				Err(err) => {
-					self.k.fail(err);
-					return;
-				},
+			};
+			if let Err(err) = self.take(cx, i, i, Signal::Int, n, trap, false) {
+				self.k.fail(err);
+				return;
 			}
 		}
+	}
+
+	/// Vproc `i` takes signal number `n`, `sig`. With a trap (`trap`:
+	/// `Some(true)` an ignoring one), the trap of vproc `own` (`i`, or the
+	/// zsh `( … )` the root runs in place of itself, [`Self::in_place_end`])
+	/// is due ([`trapped`]); without one, what the shell does itself
+	/// ([`untrapped::decide`]). `pass_on`: the signal was sent to more than
+	/// the shell's own process, so what `i` runs gets it too. One step for
+	/// [`Self::deliver`] and [`Self::int_to_foreground`]: the job change of
+	/// a stop or continue, if any.
+	///
+	/// # Errors
+	///
+	/// A store failure reading the held set, an option or the EXIT trap.
+	#[expect(clippy::too_many_arguments, reason = "the signal, its trap and its reach, one step")]
+	fn take(
+		&mut self,
+		cx: &mut Cx<'_>,
+		i: usize,
+		own: usize,
+		sig: Signal,
+		n: u64,
+		trap: Option<bool>,
+		pass_on: bool,
+	) -> Result<Option<(Vpid, Option<Signal>)>, StoreError> {
+		let platform = self.k.engine.config().platform;
+		if let Some(ignored) = trap {
+			if !ignored {
+				trapped(&mut self.procs[own], sig, platform);
+			}
+			return Ok(None);
+		}
+		// Without job control bash holds an `INT` while it waits for a job,
+		// and while it reads a command substitution ([`Self::waits`]).
+		let waits = self.waits(i, n);
+		let decision = untrapped::decide(&mut self.k, cx, &mut self.procs[i], sig, waits)?;
+		let status = sig.exit_status(platform);
+		let root = self.procs[i].parent.is_none();
+		let vpid = self.procs[i].vpid;
+		match decision {
+			untrapped::Untrapped::Handled | untrapped::Untrapped::Ignored => {},
+			untrapped::Untrapped::ZshHupExit => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, false);
+				}
+				if root {
+					self.release_foreground();
+				}
+				exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
+			},
+			untrapped::Untrapped::Held(held) => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, false);
+				}
+				// The wait's end decides ([`end_held_sigint`]).
+				self.k.set_int_note(vpid, Some(IntNote::Held(held)));
+			},
+			// bash `termsig_sighandler`: a terminating signal that comes while
+			// the EXIT trap a first one began runs ends the shell at once, by
+			// itself; obash had begun the trap again, and again.
+			untrapped::Untrapped::BashExitTrapThenDie if exec::terminating(&self.procs[i]) => {
+				if root {
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+					self.end(cx, i, sig, status, false);
+				} else {
+					self.kill(cx, i, sig, status);
+				}
+			},
+			untrapped::Untrapped::BashExitTrapThenDie => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, true);
+				}
+				if root {
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+				} else if sig == Signal::Int {
+					// bash's subshell kills itself with the signal once the trap
+					// has run: its parent's hold reads a death by it.
+					self.k.dies_of_int(vpid);
+				} else {
+					// It dies of this signal, not of an `INT` that began its end.
+					self.k.died_of_int(vpid);
+				}
+				exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, status);
+			},
+			untrapped::Untrapped::Default => match sig.default_action() {
+				DefaultAction::Terminate if root => {
+					// The root shell dies of the signal: a process host dies of it
+					// too ([`Shell::killed_by`]), and leaves its foreground command
+					// running, its own program too, as the kernel's signal to a
+					// real shell does.
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+					self.end(cx, i, sig, status, false);
+				},
+				DefaultAction::Terminate => self.kill(cx, i, sig, status),
+				DefaultAction::Stop | DefaultAction::Continue => {
+					let stop = sig.default_action() == DefaultAction::Stop;
+					let p = &mut self.procs[i];
+					let change = (p.stopped != stop).then_some((p.vpid, stop.then_some(sig)));
+					set_stopped(p, stop);
+					return Ok(change);
+				},
+				DefaultAction::Ignore => {},
+			},
+		}
+		Ok(None)
 	}
 
 	/// The vproc at the end of the chain that the process of vproc `i` is:
@@ -2646,13 +2877,10 @@ impl Shell {
 			.k
 			.emit(cx, root, None, EventData::Signal { sig, target });
 		let platform = self.k.engine.config().platform;
-		// The kernel signalled the root's process group: the vproc's own
-		// signal, which a program it runs in place has from the kernel too.
-		// Another process signalled it (`outside`): its own, or its group's.
-		let (target, from_kernel, outside) = match target {
-			SigTarget::Group(v) => (SigTarget::Vpid(v), true, true),
-			SigTarget::Outside(v) => (SigTarget::Vpid(v), false, true),
-			target => (target, false, false),
+		let (target, sender) = match target {
+			SigTarget::Group(v) => (SigTarget::Vpid(v), Sender::Kernel),
+			SigTarget::Outside(v) => (SigTarget::Vpid(v), Sender::Process),
+			target => (target, Sender::Shell),
 		};
 		let job_root = match target {
 			SigTarget::Job(id) => self
@@ -2674,6 +2902,24 @@ impl Shell {
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})
 			.collect();
+		// The kernel's `INT` reaches every process of the group: each bash
+		// process of the foreground command has it too. One from another
+		// process may be the group's or the shell's alone, which a signal does
+		// not tell apart: it is taken as the group's
+		// ([`Self::int_to_foreground`]). Who gets it is fixed before the root
+		// takes it ([`Self::int_targets`]).
+		let foreground = if sender != Sender::Shell
+			&& sig == Signal::Int
+			&& target == SigTarget::Vpid(root.0)
+			&& root.1.dialect() == crate::bash::ids::Dialect::Bash
+		{
+			match self.int_targets(cx, n) {
+				Some(targets) => Some(targets),
+				None => return,
+			}
+		} else {
+			None
+		};
 		self.callout_trees(&mut hits);
 		// Vprocs this signal stopped or continued (job states follow).
 		let mut changed: Vec<(Vpid, Option<Signal>)> = Vec::new();
@@ -2720,7 +2966,7 @@ impl Shell {
 			if target == SigTarget::Vpid(root.0)
 				&& sig != Signal::Chld
 				&& trap != Some(true)
-				&& forward_to_program(&mut self.k, &mut self.procs[own], sig, !from_kernel)
+				&& forward_to_program(&mut self.k, &mut self.procs[own], sig, sender != Sender::Kernel)
 			{
 				continue;
 			}
@@ -2762,104 +3008,19 @@ impl Shell {
 			if self.procs[i].parent.is_none() && zle::signal(&mut self.procs[i], sig, trap.is_some()) {
 				continue;
 			}
-			if let Some(ignored) = trap {
-				if !ignored {
-					let process = &mut self.procs[own];
-					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
-						process.blocked = None;
-					}
-					// bash: a trapped signal ends the `wait` builtin with 128 + n
-					// (then the trap runs); `SIGCHLD` does not.
-					if sig != Signal::Chld {
-						interrupt_wait(process, sig.exit_status(platform));
-					}
-				}
-				continue;
-			}
-			// No trap: what the shell does itself ([`untrapped::decide`]). A
-			// signal sent to more than the shell reaches what it runs too;
+			// A signal sent to more than the shell reaches what it runs too;
 			// the shell does not wait for that to end.
-			// Without job control bash holds an `INT` while it waits for a job
-			// ([`Self::waits`]).
-			let waits = self.waits(i, n);
-			let decision = match untrapped::decide(&mut self.k, cx, &mut self.procs[i], sig, waits) {
-				Ok(decision) => decision,
+			match self.take(cx, i, own, sig, n, trap, target != SigTarget::Vpid(root.0)) {
+				Ok(Some(change)) => changed.push(change),
+				Ok(None) => {},
 				Err(err) => {
 					self.k.fail(err);
 					return;
 				},
-			};
-			let status = sig.exit_status(platform);
-			let to_shell_only = target == SigTarget::Vpid(root.0);
-			match decision {
-				untrapped::Untrapped::Handled | untrapped::Untrapped::Ignored => continue,
-				untrapped::Untrapped::ZshHupExit => {
-					if !to_shell_only {
-						signal_lives(&mut self.procs[i], sig, false);
-					}
-					if self.procs[i].parent.is_none() {
-						self.release_foreground();
-					}
-					exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
-					continue;
-				},
-				untrapped::Untrapped::Held(held) => {
-					if !to_shell_only {
-						signal_lives(&mut self.procs[i], sig, false);
-					}
-					// The wait's end decides ([`end_held_sigint`]).
-					let vpid = self.procs[i].vpid;
-					self.k.set_int_note(vpid, Some(IntNote::Held(held)));
-					continue;
-				},
-				untrapped::Untrapped::BashExitTrapThenDie => {
-					if !to_shell_only {
-						signal_lives(&mut self.procs[i], sig, true);
-					}
-					if self.procs[i].parent.is_none() {
-						self.k.killed_by = Some(i32::from(sig.number(platform)));
-						self.release_foreground();
-					}
-					exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, status);
-					continue;
-				},
-				untrapped::Untrapped::Default => {},
-			}
-			match sig.default_action() {
-				DefaultAction::Terminate => {
-					if self.procs[i].parent.is_none() {
-						// The root shell dies of the signal: a process host
-						// dies of it too ([`Shell::killed_by`]), and leaves
-						// its foreground command running, as the kernel's
-						// signal to a real shell does.
-						self.k.killed_by = Some(i32::from(sig.number(platform)));
-						self.release_foreground();
-					}
-					self.kill(cx, i, sig, status);
-				},
-				DefaultAction::Stop | DefaultAction::Continue => {
-					let stop = sig.default_action() == DefaultAction::Stop;
-					let p = &mut self.procs[i];
-					if p.stopped != stop {
-						changed.push((p.vpid, stop.then_some(sig)));
-					}
-					set_stopped(p, stop);
-				},
-				DefaultAction::Ignore => {},
 			}
 		}
-		// The kernel's `INT` reaches every process of the group: each bash
-		// process of the foreground command has it too. One from another
-		// process may be the group's or the shell's alone, which a signal does
-		// not tell apart: it is taken as the group's
-		// ([`Self::int_to_foreground`]).
-		if outside
-			&& sig == Signal::Int
-			&& target == SigTarget::Vpid(root.0)
-			&& root.1.dialect() == crate::bash::ids::Dialect::Bash
-		{
-			self.int_to_foreground(cx, n);
+		if let Some(targets) = foreground {
+			self.int_to_foreground(cx, n, targets);
 		}
 		for (vpid, stop) in changed {
 			self.job_changed(cx, vpid, stop);
@@ -3100,16 +3261,42 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 	}
 }
 
+/// A signal reaches vproc `p`, whose trap for it has an action (bash
+/// `trap_handler`): the trap is due, at once unless `p` waits for its
+/// foreground command (bash runs it once the command has ended), and a
+/// `wait` builtin `p` is in ends with 128 + the signal's number (then the
+/// trap runs); `SIGCHLD` ends none.
+fn trapped(p: &mut Vproc, sig: Signal, platform: crate::bash::ids::Platform) {
+	p.pending_traps = p.pending_traps.with(sig);
+	if !p.waiting_foreground() {
+		p.blocked = None;
+	}
+	if sig != Signal::Chld {
+		interrupt_wait(p, sig.exit_status(platform));
+	}
+}
+
+/// Who sent a signal `Shell::deliver` gives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sender {
+	/// The shell: `kill`, a job's or the engine's own signal.
+	Shell,
+	/// The kernel, to the root's OS process group ([`SigTarget::Group`]): a
+	/// terminal's `INT`, `QUIT` or hangup `HUP`. A program the root runs in
+	/// place of itself, in that group too, has it already.
+	Kernel,
+	/// Another process ([`SigTarget::Outside`], `SI_USER`): to the shell's
+	/// pid alone or to its process group, which the signal does not tell
+	/// apart.
+	Process,
+}
+
 /// bash's `INT` as a vproc has it ([`Kernel::int_notes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntNote {
 	/// Noted while it waits ([`HeldInt`]), to act on once the wait ends
 	/// ([`end_held_sigint`]).
 	Held(HeldInt),
-	/// It died of `SIGINT`: by its own end ([`Shell`]'s `kill`), or as the
-	/// program it is (a subshell vproc that is just its external); its
-	/// parent's hold reads it ([`Shell::reaped`]).
-	Died,
 	/// Its wait began ([`wait_starts`]) once the signals up to this number
 	/// were queued ([`control::Ctl::signals_queued`]): one of them came while
 	/// it ran shell code ([`Shell::waits`]), and did not reach the vprocs
@@ -3127,30 +3314,38 @@ pub enum HeldInt {
 	/// otherwise (bash `child_caught_sigint`, which `waitchld` sets again for
 	/// each child it reaps: [`external_ended`], [`Shell::reaped`]).
 	Job { caught: bool },
-	/// The root, with an EXIT trap, while it read a command substitution's
-	/// output (its `termsig_sighandler` notes it; the shell acts once the
-	/// read ends): it acts whatever the substitution's processes did.
+	/// While it read a command substitution's output, with or without an
+	/// EXIT trap and job control (bash blocks `SIGINT` around
+	/// `read_comsub`): once the read ends (nothing writes the output any
+	/// more, [`Shell::comsub_reads_ended`], or the substitution's process
+	/// ended) it acts whatever the substitution's processes did.
 	Comsub,
 }
 
 /// The external `vp` ran ended (`killed`: by that signal): the last
-/// process of the job `vp` holds an `INT` for ended so ([`HeldInt::Job`]);
-/// `vp`, when it is just that program ([`transparent`]), died of `SIGINT`
-/// with it ([`IntNote::Died`]). Then `vp`'s wait for it is over
-/// ([`end_held_sigint`]).
-fn external_ended(k: &mut Kernel, vp: &Vproc, killed: Option<Signal>) {
+/// process of the job `vp` holds an `INT` for ended so ([`HeldInt::Job`]).
+/// Where `vp` is that program (`replacing`: it `exec`ed it; or it is just
+/// that program, [`transparent`]), the program's end is `vp`'s: a death by
+/// `SIGINT` is `vp`'s ([`Kernel::int_deaths`]), and another end clears one
+/// an `INT` began (an EXIT trap that `exec`s a program). Then `vp`'s wait
+/// for it is over ([`end_held_sigint`]).
+fn external_ended(k: &mut Kernel, vp: &Vproc, killed: Option<Signal>, replacing: bool) {
 	if let Some(IntNote::Held(HeldInt::Job { .. })) = k.int_note(vp.vpid) {
 		let caught = killed != Some(Signal::Int);
 		k.set_int_note(vp.vpid, Some(IntNote::Held(HeldInt::Job { caught })));
 	}
-	if killed == Some(Signal::Int) && vp.parent.is_some() && transparent(vp, false) == Some(true) {
-		k.set_int_note(vp.vpid, Some(IntNote::Died));
+	if vp.parent.is_some() && (replacing || transparent(vp, false) == Some(true)) {
+		if killed == Some(Signal::Int) {
+			k.dies_of_int(vp.vpid);
+		} else {
+			k.died_of_int(vp.vpid);
+		}
 	}
 	end_held_sigint(k, vp, false);
 }
 
 /// `vp`'s wait for what it held an `INT` for is over: its foreground job,
-/// or (`comsub`) the command substitution the root read. It acts on the
+/// or (`comsub`) the command substitution it read. It acts on the
 /// `INT` now, as on one that comes while it waits for nothing
 /// ([`untrapped::decide`]), unless the last process of the job caught it;
 /// then it goes on.

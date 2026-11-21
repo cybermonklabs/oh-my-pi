@@ -2555,13 +2555,11 @@ fn spawned_external(
 	if spawned.is_err() && !k.bangs.is_empty() {
 		k.settle_bang(vp.vpid, None);
 	}
-	// No program to give them to: the signals sent while it was spawned go
-	// ([`super::Kernel::forward`]).
+	// No program to give them to: the signals sent while it was spawned go,
+	// and the process is the shell's again
+	// ([`super::untrapped::program_ended`]).
 	if spawned.is_err() && (vp.parent.is_none() || vp.in_place()) {
-		k.forward = crate::bash::SigSet::EMPTY;
-		if k.program_in_place {
-			super::untrapped::program_in_place(k, cx, vp, false);
-		}
+		super::untrapped::program_ended(k, cx, vp);
 	}
 	match spawned {
 		Err(_) if child_redirs => {
@@ -4603,12 +4601,12 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				}
 				st(vp).notice = end.notice.map(Box::new);
 			}
-			super::external_ended(k, vp, killed);
+			super::external_ended(k, vp, killed, replacing);
 			// The program run in place has ended (or is lost): the process is
 			// the shell's own again, with the shell's signal rules; a session
-			// runs its next command ([`super::untrapped::program_in_place`]).
-			if k.program_in_place && (vp.parent.is_none() || vp.in_place()) {
-				super::untrapped::program_in_place(k, cx, vp, false);
+			// runs its next command ([`super::untrapped::program_ended`]).
+			if vp.parent.is_none() || vp.in_place() {
+				super::untrapped::program_ended(k, cx, vp);
 			}
 			status
 		},

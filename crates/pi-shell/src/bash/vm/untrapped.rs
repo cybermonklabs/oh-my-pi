@@ -33,13 +33,16 @@
 //!   subshell, that waits for its foreground job notes it, and acts on it once
 //!   the job has ended, only if the last process of the job to end died of
 //!   `SIGINT` (`child_caught_sigint`, which `waitchld` sets again for each
-//!   child it reaps; [`Untrapped::Held`]); else it goes on. One that runs shell
-//!   code meanwhile acts at once. A root with an EXIT trap that reads a command
-//!   substitution acts once the read ends. obash catches it for that
-//!   ([`Own::BashInt`]), and gives the kernel's `INT` to each process of the
-//!   foreground command bash would run (`Shell::int_to_foreground`). A host
-//!   embedded in a runtime lets the shell catch only the signals it hands over
-//!   ([`crate::bash::Host::may_catch`]): the runtime's fault handlers stay.
+//!   child it reaps; [`Untrapped::Held`]); else it goes on. Each bash process,
+//!   the root or a subshell, with job control or without, holds it while it
+//!   reads a command substitution (`command_substitute` blocks `SIGINT` around
+//!   `read_comsub`) and acts once the read ends. One that runs shell code
+//!   meanwhile acts at once. obash catches it for that ([`Own::BashInt`]), and
+//!   gives the kernel's `INT` to each process of the foreground command bash
+//!   would run in the shell's process group (`Shell::int_to_foreground`). A
+//!   host embedded in a runtime lets the shell catch only the signals it hands
+//!   over ([`crate::bash::Host::may_catch`]): the runtime's fault handlers
+//!   stay.
 //! - Else the signal's default action.
 
 use std::io;
@@ -171,8 +174,8 @@ fn own(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> Result<Own, Stor
 
 /// [`Untrapped`] for `sig`, which `vp` has no trap for ([`own`]); `waits`:
 /// what `vp` waits for (the engine's `Shell::waits`), for bash's `INT`
-/// hold, which a subshell always has and the root only without job control
-/// (`set -m`).
+/// hold: a subshell always has it; the root has it for a substitution it
+/// reads, and for its foreground job only without job control (`set -m`).
 ///
 /// # Errors
 ///
@@ -188,7 +191,7 @@ pub(super) fn decide(
 	let held = if sig == Signal::Int && matches!(own, Own::BashExitTrap | Own::BashInt) {
 		let monitor =
 			vp.parent.is_none() && state::option(&mut k.root, cx.store, vp, OptId::Monitor)?;
-		waits.filter(|_| !monitor)
+		waits.filter(|&held| !monitor || held == super::HeldInt::Comsub)
 	} else {
 		None
 	};
@@ -198,11 +201,7 @@ pub(super) fn decide(
 		Own::Caught | Own::Program | Own::Default => Untrapped::Default,
 		Own::Ignored => Untrapped::Ignored,
 		Own::ZshHup => Untrapped::ZshHupExit,
-		// Without an EXIT trap the read of a substitution is no wait.
-		Own::BashInt => match held {
-			Some(held @ super::HeldInt::Job { .. }) => Untrapped::Held(held),
-			_ => Untrapped::Default,
-		},
+		Own::BashInt => held.map_or(Untrapped::Default, Untrapped::Held),
 		Own::BashExitTrap => held.map_or(Untrapped::BashExitTrapThenDie, Untrapped::Held),
 	})
 }
@@ -221,8 +220,9 @@ fn bash_exit_trap(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreE
 
 /// The root's OS disposition of `sig` once its trap is `action` (`None`: no
 /// trap): the trap's own, else [`own`]'s: caught, ignored, or caught for
-/// zsh's `HUP` handler, bash's EXIT trap or a program run in place, where the
-/// host lets the shell catch it; else the default.
+/// zsh's `HUP` handler, bash's EXIT trap, bash's `INT` for its waits or a
+/// program run in place, where the host lets the shell catch it; else the
+/// default.
 fn disposition<'a>(
 	k: &Kernel,
 	cx: &mut Cx<'_>,
@@ -244,15 +244,16 @@ fn disposition<'a>(
 }
 
 /// The root's process becomes the program `vp`'s innermost frame `exec`s or
-/// runs without a fork (`running`), or stays the shell's (its spawn failed):
-/// the root asks the host again for each signal whose default action ends
-/// the process and that has no trap. While the program runs each is caught
-/// ([`Own::Program`]) and forwarded to it, as the real shell's process, the
-/// program, would get it; one the shell ignores stays ignored, as the
-/// program inherits it, and a trapped one keeps its trap's disposition (it
-/// is forwarded too). `vp` is the root, or the zsh `( … )` it runs in place,
-/// whose traps are the process's. Asked before the spawn, so the program
-/// starts with the default of each (a handler does not survive `exec`).
+/// runs without a fork (`running`), or is the shell's own again
+/// ([`program_ended`]): the root asks the host again for each signal whose
+/// default action ends the process and that has no trap. While the program
+/// runs each is caught ([`Own::Program`]) and forwarded to it, as the real
+/// shell's process, the program, would get it; one the shell ignores stays
+/// ignored, as the program inherits it, and a trapped one keeps its trap's
+/// disposition (it is forwarded too). `vp` is the root, or the zsh `( … )`
+/// it runs in place, whose traps are the process's. Asked before the spawn,
+/// so the program starts with the default of each (a handler does not
+/// survive `exec`).
 pub(super) fn program_in_place(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, running: bool) {
 	k.program_in_place = running;
 	let platform = k.engine.config().platform;
@@ -283,6 +284,21 @@ pub(super) fn program_in_place(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, runn
 				return;
 			},
 		}
+	}
+}
+
+/// The program the root's process ran in place of the shell has ended, or
+/// never runs: reaped (`command`'s `await_`), its spawn failed, or a cancel
+/// or the root's own end took the frames that ran it (`Shell`'s
+/// `apply_requests` and `end`). The process is the shell's own again, with
+/// the shell's signal rules ([`program_in_place`] with `running` false; a
+/// session runs its next command), and the signals kept for a program
+/// still being spawned go ([`Kernel::forward`]). `vp`: the root, or the zsh
+/// `( … )` that ran the program.
+pub(super) fn program_ended(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) {
+	k.forward = crate::bash::SigSet::EMPTY;
+	if k.program_in_place {
+		program_in_place(k, cx, vp, false);
 	}
 }
 

@@ -131,13 +131,17 @@ pub trait Host {
 	fn may_catch(&self, _signal: Signal) -> bool {
 		true
 	}
-	/// Forward the OS signals caught since the run loop last did, now, to
-	/// the shell's
-	/// [`ControlHandle::signal`](crate::bash::ControlHandle::signal). A run loop
-	/// forwards them between steps; the line editor asks before it answers a
-	/// `zle -F` handler's file, as zsh, whose signal handler has run (a resize
-	/// redrawn) by the time `select` reports the file. Hosts without OS signals
-	/// keep the default: nothing.
+	/// Forward the OS signals caught since the last call, now, to the
+	/// shell's [`ControlHandle::signal`](crate::bash::ControlHandle::signal).
+	/// A run loop forwards them between steps; the line editor asks before it
+	/// answers a `zle -F` handler's file, as zsh, whose signal handler has run
+	/// (a resize redrawn) by the time `select` reports the file; the engine
+	/// asks at the safepoint a host's signal handler stops the running vproc
+	/// at (it marks the control word, the process host's `WakeOnSignal`),
+	/// before it spawns an external and as a wait for what the shell runs
+	/// begins, so that a signal that came before is taken as come while the
+	/// shell ran shell code. Hosts without OS signals keep the default:
+	/// nothing.
 	fn forward_signals(&mut self) {}
 	/// The filesystem (hookable: VFS, devices, `/dev/fd`, `/dev/tcp`).
 	fn fs(&mut self) -> &mut dyn Fs;

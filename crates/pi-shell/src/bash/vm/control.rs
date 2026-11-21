@@ -28,6 +28,10 @@ pub const RESUME: u32 = 1 << 1;
 pub const CANCEL: u32 = 1 << 2;
 pub const SUSPEND: u32 = 1 << 3;
 pub const SIGNAL: u32 = 1 << 4;
+/// An OS signal handler caught a signal the host has not forwarded yet
+/// ([`ControlHandle::signal_word`]): the next safepoint has the host
+/// forward it ([`crate::bash::Host::forward_signals`]).
+pub const OS_SIGNAL: u32 = 1 << 5;
 
 /// Shared control state of one shell.
 pub struct Ctl {
@@ -175,6 +179,9 @@ impl Wake for Ctl {
 pub struct ControlHandle(pub(crate) Arc<Ctl>);
 
 impl ControlHandle {
+	/// [`OS_SIGNAL`], for [`Self::signal_word`].
+	pub(crate) const OS_SIGNAL: u32 = OS_SIGNAL;
+
 	/// Pause the whole shell: virtual processes park at their next safepoint,
 	/// externals are stopped and tasks paused; `step` returns `Paused` until
 	/// [`ControlHandle::resume`].
@@ -230,6 +237,15 @@ impl ControlHandle {
 	/// spinning on `step`.
 	pub fn poll_runnable(&self, cx: &mut Context<'_>) -> Poll<()> {
 		self.0.poll_since(self.0.parked.load(Ordering::Acquire), cx)
+	}
+
+	/// The control word, for a host's OS signal handler to set
+	/// [`OS_SIGNAL`] in, with one atomic `fetch_or` (async-signal-safe): the
+	/// running vproc stops at its next op, as for any request, so a signal
+	/// that comes while the shell runs shell code is taken before the next
+	/// command, as bash takes one.
+	pub(crate) fn signal_word(&self) -> &AtomicU32 {
+		&self.0.word
 	}
 }
 

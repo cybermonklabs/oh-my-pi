@@ -6,6 +6,60 @@
 
 #[cfg(not(unix))]
 use std::io;
+use std::{
+	ptr,
+	sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+};
+
+use crate::bash::ControlHandle;
+
+/// The control word of the shell the OS signals go to ([`WakeOnSignal`]).
+static WAKE: AtomicPtr<AtomicU32> = AtomicPtr::new(ptr::null_mut());
+
+/// The handlers between their load of [`WAKE`] and their mark of it.
+static MARKING: AtomicU32 = AtomicU32::new(0);
+
+/// A handler caught a signal for the shell: the running vproc stops at its
+/// next op, and the host forwards the signal then, so that it is taken
+/// before the next command, as bash takes one, and not only once the
+/// engine's step returns (a script that ended meanwhile never ran its
+/// trap). Atomics only: async-signal-safe.
+fn mark_wake() {
+	MARKING.fetch_add(1, Ordering::SeqCst);
+	let word = WAKE.load(Ordering::SeqCst);
+	if !word.is_null() {
+		// SAFETY: a word stays registered only while its `WakeOnSignal`
+		// lives, whose drop takes it out, then waits for every handler that
+		// may have loaded it to leave.
+		unsafe { (*word).fetch_or(ControlHandle::OS_SIGNAL, Ordering::SeqCst) };
+	}
+	MARKING.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The shell the caught OS signals wake ([`mark_wake`]), while this lives:
+/// one at a time, as the signals are the process's.
+pub struct WakeOnSignal(ControlHandle);
+
+impl WakeOnSignal {
+	/// Wake the shell `ctl` controls on each OS signal caught from now on.
+	pub fn new(ctl: &ControlHandle) -> Self {
+		let ctl = ctl.clone();
+		WAKE.store(ptr::from_ref(ctl.signal_word()).cast_mut(), Ordering::SeqCst);
+		Self(ctl)
+	}
+}
+
+impl Drop for WakeOnSignal {
+	fn drop(&mut self) {
+		let word = ptr::from_ref(self.0.signal_word()).cast_mut();
+		let _ = WAKE.compare_exchange(word, ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+		// A handler that loaded the word before it went out is done with it
+		// in a few instructions.
+		while MARKING.load(Ordering::SeqCst) != 0 {
+			std::hint::spin_loop();
+		}
+	}
+}
 
 #[cfg(unix)]
 mod unix {
@@ -57,9 +111,11 @@ mod unix {
 		false
 	}
 
-	/// bash `termsig_sighandler`: the same fault signal again before the
-	/// shell handled it ends the process. Its default action comes back, so
-	/// a real fault, which repeats, ends the process the next time.
+	/// bash `termsig_sighandler`: a signal is handed to the shell (pending,
+	/// and the engine woken, [`super::mark_wake`]); the same fault signal
+	/// again before the shell handled it ends the process. Its default action
+	/// comes back, so a real fault, which repeats, ends the process the next
+	/// time.
 	extern "C" fn on_signal(number: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
 		if (1..=64).contains(&number) {
 			let mask = bit(number);
@@ -72,6 +128,7 @@ mod unix {
 				// signal number and disposition.
 				unsafe { libc::signal(number, libc::SIG_DFL) };
 			}
+			super::mark_wake();
 		}
 	}
 
@@ -607,6 +664,7 @@ mod windows {
 		}
 		if TRAPPED.load(Ordering::Relaxed) & b != 0 {
 			PENDING.fetch_or(b, Ordering::Relaxed);
+			super::mark_wake();
 			if sig == Signal::Int {
 				crate::sys::console::ctrl_c_claimed();
 			}

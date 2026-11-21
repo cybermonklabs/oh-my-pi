@@ -944,12 +944,17 @@ fn an_execd_program_leaves_no_exit_trap_to_run() {
 /// process of it to end died of `SIGINT`; else the command caught it and
 /// the script goes on. Each stage, subshell and command substitution is a
 /// bash process of its own in the group: one that runs shell code dies of
-/// the `INT` the group gets at once, one that waits for a command holds it
-/// by the same rule. Reading a command substitution's output bash with an
-/// EXIT trap acts once the substitution has ended, whatever its command
-/// did, and without one at once. Under `set -m` bash acts at once. The
-/// command makes `$F` once it has started, and goes on only once the run
-/// has sent the signal ([`SENT`]).
+/// the `INT` the group gets at once (after an EXIT trap of its own, which
+/// its parent takes as a death by it), one that waits for a command holds
+/// it by the same rule, and a trap of its own ends a `wait` it is in with
+/// 130. Each bash process that reads a command substitution's output holds
+/// it until the read ends, with job control too (`command_substitute`
+/// blocks `SIGINT` around `read_comsub`), then acts, whatever its command
+/// did. Under `set -m` bash holds nothing for a job, which runs in a
+/// process group of its own: neither a `kill` of the shell's pid nor of its
+/// group reaches the job's processes, while its substitutions are in the
+/// shell's group. The command makes `$F` once it has started, and goes on
+/// only once the run has sent the signal ([`SENT`]).
 #[test]
 fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// A command that catches `INT` and outlives it by a second: it prints
@@ -978,6 +983,9 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// which it removes for the next run.
 	let last = "/bin/sh -c 'until [ -e \"$F.a\" ]; do /bin/sleep 0.01; done; rm -f \"$F.a\"; : > \
 	            \"$F\"; exec /bin/cat'";
+	// Shell code that makes `$F`, then runs on, never blocking, until the run
+	// has sent the signal.
+	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do :; done";
 	run_sent(vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
@@ -1123,6 +1131,270 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"x\n",
 			died,
 		),
+		// A trap of a subshell's own ends its `wait` with 130, as the root's
+		// does.
+		case(
+			format!(
+				"( trap 'echo t' INT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3' >/dev/null \
+				 2>&1 & wait; echo w=$? ); echo after"
+			),
+			true,
+			b"t\nw=130\nafter\n",
+			Exit(0),
+		),
+		case(
+			format!(
+				"trap 'echo t' INT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3' >/dev/null \
+				 2>&1 & wait; echo w=$?"
+			),
+			true,
+			b"t\nw=130\n",
+			Exit(0),
+		),
+		// A subshell that dies of it through its own EXIT trap: its parent
+		// reads a death by `SIGINT`, also where the trap runs a program.
+		case(
+			format!(
+				"( trap 'echo sub' EXIT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo \
+				 more ); echo after"
+			),
+			true,
+			b"sub\n",
+			died,
+		),
+		SentCase {
+			waits: false,
+			..case(
+				"( trap '/bin/rm -f \"$F.nx\"' EXIT; : > \"$F\"; while :; do :; done ); echo after"
+					.into(),
+				true,
+				b"",
+				died,
+			)
+		},
+		SentCase {
+			waits: false,
+			..case(
+				"( trap 'echo sub' EXIT; : > \"$F\"; while :; do :; done ); echo after".into(),
+				true,
+				b"sub\n",
+				died,
+			)
+		},
+		// The read of a substitution holds it without an EXIT trap, with job
+		// control, and in a subshell; the substitution's code goes on.
+		case(
+			format!(
+				"exec 3>&1; v=$(/bin/sh -c 'trap \"\" INT; : > \"$F\"; {SENT}'; echo more >&3); echo \
+				 after"
+			),
+			true,
+			b"more\n",
+			died,
+		),
+		case(
+			format!(
+				"set -m; exec 3>&1; v=$(/bin/sh -c 'trap \"\" INT; : > \"$F\"; {SENT}'; echo more \
+				 >&3); echo after"
+			),
+			true,
+			b"more\n",
+			died,
+		),
+		case(
+			format!(
+				"( exec 3>&1; v=$(/bin/sh -c 'trap \"\" INT; : > \"$F\"; {SENT}'; echo more >&3); \
+				 echo sub-after ); echo after"
+			),
+			true,
+			b"more\n",
+			died,
+		),
+		// Under `set -m` a substitution's shell code is in the shell's group:
+		// it dies of the group's `INT`.
+		SentCase {
+			waits: false,
+			..case("set -m; v=$(: > \"$F\"; while :; do :; done); echo after".into(), true, b"", died)
+		},
+		// Under `set -m` the job's shell code is in a group of its own: a
+		// `kill` of the shell's pid or group reaches only the shell, whose
+		// trap runs once the job has ended. The job's code never blocks. (A
+		// pipeline's external stage stays in obash's group, which a `kill` of
+		// it reaches: obash makes a job's process group only with a terminal,
+		// a known difference.)
+		SentCase {
+			waits: false,
+			..case(
+				format!("set -m; trap 'echo i' INT; ( {busy}; echo more ); echo after"),
+				false,
+				b"more\ni\nafter\n",
+				Exit(0),
+			)
+		},
+		SentCase {
+			waits: false,
+			..case(
+				format!("set -m; trap 'echo i' INT; ( {busy}; echo more ); echo after"),
+				true,
+				b"more\ni\nafter\n",
+				Exit(0),
+			)
+		},
+		SentCase {
+			waits: false,
+			..case(
+				format!("set -m; trap 'echo i' INT; {{ {busy}; echo more; }} | cat; echo after"),
+				false,
+				b"more\ni\nafter\n",
+				Exit(0),
+			)
+		},
+		// The root that dies of it under `set -m` runs its EXIT trap first,
+		// while the job, in its own group, goes on: the trap waits for what
+		// the job makes once the signal was sent.
+		SentCase {
+			waits: false,
+			..case(
+				format!(
+					"set -m; trap 'until [ -e \"$F.done\" ]; do :; done; echo root-exit' EXIT; ( \
+					 {busy}; : > \"$F.done\" ); echo after"
+				),
+				true,
+				b"root-exit\n",
+				died,
+			)
+		},
+		// A subshell whose EXIT trap the `INT` began, and whose process another
+		// signal then ends (the trap `exec`s a program that dies of `TERM`, or
+		// kills it with `KILL`), dies of that signal: its parent goes on. (A
+		// `kill -TERM $BASHPID` in the trap gives bash 5.2.21 either end under
+		// load.)
+		SentCase {
+			waits: false,
+			..case(
+				"( trap 'trap - EXIT; exec /bin/sh -c \"kill -TERM \\$\\$\"' EXIT; : > \"$F\"; while \
+				 :; do :; done ); echo after"
+					.into(),
+				true,
+				b"after\n",
+				Exit(0),
+			)
+		},
+		SentCase {
+			waits: false,
+			..case(
+				"( trap 'kill -KILL $BASHPID' EXIT; : > \"$F\"; while :; do :; done ); echo after"
+					.into(),
+				true,
+				b"after\n",
+				Exit(0),
+			)
+		},
+	]);
+}
+
+/// bash `termsig_sighandler`: a terminating signal that comes while the EXIT
+/// trap a first one began runs ends the shell at once, by the new signal, in
+/// a subshell and in the root (the trap's own `kill`, so no timing).
+#[test]
+fn a_second_terminating_signal_ends_the_exit_trap_at_once() {
+	for (script, stdout, end) in [
+		(
+			"( trap \"echo trap; kill -TERM \\$BASHPID; echo still\" EXIT; kill -INT $BASHPID; echo \
+			 no ); echo after s=$?",
+			"trap\nafter s=143\n",
+			Exit(0),
+		),
+		(
+			"( trap \"echo trap; kill -KILL \\$BASHPID; echo still\" EXIT; kill -TERM $BASHPID; echo \
+			 no ); echo after s=$?",
+			"trap\nafter s=137\n",
+			Exit(0),
+		),
+		(
+			"trap \"echo trap; kill -TERM \\$\\$; echo still\" EXIT; kill -INT $$; echo no",
+			"trap\n",
+			Signal(libc::SIGTERM),
+		),
+	] {
+		let ours = Run::script(OsStr::new(env!("CARGO_BIN_EXE_obash")), "bash", script).go();
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.stdout).into_owned(), ours.end()),
+			(stdout.to_owned(), Some(end)),
+			"{script}: {ours:?}"
+		);
+		if let Some(real) = real("bash") {
+			let theirs = Run::script(real.as_os_str(), "bash", script).go();
+			assert_eq!((&ours.stdout, ours.end()), (&theirs.stdout, theirs.end()), "bash: {script}");
+		}
+	}
+}
+
+/// bash reads a command substitution's output with `SIGINT` blocked until
+/// the read ends: once nothing writes the output any more, it acts on an
+/// `INT` that came meanwhile, before it waits for the substitution's
+/// process, which may run on; an `INT` that comes during that wait it holds
+/// as for a job (`wait_for`), and goes on where the process caught it. The
+/// substitution ignores `INT` and makes `$F`. In the first row it closes its
+/// output once the run has sent the signal ([`SENT`]), then waits for
+/// `$F.checked`, which the test makes once the shell has ended: a shell that
+/// waited for the substitution's process would never end. In the second it
+/// closes its output first, then waits for the signal, and ends.
+#[test]
+fn bash_acts_on_a_held_int_once_the_substitutions_output_ends() {
+	let rows = [
+		(
+			format!(
+				"v=$(trap '' INT; : > \"$F\"; {SENT}; exec >/dev/null 2>&1; until [ -e \"$F.checked\" \
+				 ]; do /bin/sleep 0.01; done); echo after"
+			),
+			(String::new(), Some(Signal(libc::SIGINT))),
+		),
+		(
+			format!("v=$(trap '' INT; exec >/dev/null; : > \"$F\"; {SENT}); echo after"),
+			("after\n".to_owned(), Some(Exit(0))),
+		),
+	];
+	for (script, ended) in rows {
+		let run = |program: &OsStr| {
+			let dir = tempfile::tempdir().expect("a directory for the start file");
+			let started = dir.path().join("started");
+			let out = Run::script(program, "bash", &script)
+				.env("F", &started)
+				.when_blocked()
+				.go_signalled(&started, libc::SIGINT, false);
+			fs::File::create(started.with_extension("checked")).expect("let the substitution end");
+			(String::from_utf8_lossy(&out.stdout).into_owned(), out.end())
+		};
+		assert_eq!(run(OsStr::new(env!("CARGO_BIN_EXE_obash"))), ended, "{script}");
+		if let Some(real) = real("bash") {
+			assert_eq!(run(real.as_os_str()), ended, "bash: {script}");
+		}
+	}
+}
+
+/// A trapped signal that comes while the shell runs shell code that never
+/// blocks (a loop of builtins) runs its trap before the next command, as
+/// bash's does, and before the shell ends where the script ends there. The
+/// loop makes `$F`, then runs until the run has sent the signal.
+#[test]
+fn a_trapped_signal_runs_its_trap_while_the_shell_runs_builtins() {
+	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do :; done";
+	let case = |name: &str, sig, then: &str, stdout: &'static [u8]| SentCase {
+		shell: "bash",
+		script: format!("trap 'echo {name}' {name}; {busy}{then}"),
+		sig,
+		group: false,
+		stdout,
+		end: Exit(0),
+		waits: false,
+	};
+	run_sent(vec![
+		case("USR1", libc::SIGUSR1, "; echo after", b"USR1\nafter\n"),
+		case("INT", libc::SIGINT, "; echo after", b"INT\nafter\n"),
+		case("TERM", libc::SIGTERM, "; echo after", b"TERM\nafter\n"),
+		case("HUP", libc::SIGHUP, "; echo after", b"HUP\nafter\n"),
+		case("USR1", libc::SIGUSR1, "", b"USR1\n"),
 	]);
 }
 
@@ -1195,7 +1467,8 @@ fn an_embedded_bash_dies_of_the_int_it_acts_on() {
 /// process in each row, makes `$F`, and prints `child-done` once the shell
 /// has ended (it has a new parent then), which the run reads to the end of
 /// its output: no time the shell is given to act. One the shell does not
-/// catch ends it at its default action, and the command goes on too.
+/// catch ends it at its default action, and the command goes on too: an
+/// `INT` the root acts on at once (under `set -m`, which holds none) too.
 ///
 /// A known difference, until `fix/shell-external-stages-share-a-kernel-pipe`
 /// (INFRA-1484's architect ruled so on 2026-11-21 at 03:22Z): obash joins
@@ -1247,6 +1520,13 @@ fn a_caught_signal_that_ends_the_shell_leaves_its_foreground_command_running() {
 			libc::SIGTERM,
 			b"child-done\n",
 			Signal(libc::SIGTERM),
+		),
+		case(
+			"bash",
+			format!("set -m; {child}; echo after"),
+			libc::SIGINT,
+			b"child-done\n",
+			Signal(libc::SIGINT),
 		),
 		case(
 			"zsh",

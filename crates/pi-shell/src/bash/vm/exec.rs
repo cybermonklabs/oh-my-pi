@@ -2741,8 +2741,10 @@ pub fn settle_sub(
 				sc.sub = Some(PendingSub::Fork { vpid, capture });
 				return Some(Flow::Block(WaitKey::Proc(vpid)));
 			};
-			// The root that read it acts now on an `INT` it noted meanwhile.
+			// The vproc that read it acts now on an `INT` it held meanwhile:
+			// while it read, or once the read was over, as for a job.
 			super::end_held_sigint(k, vp, true);
+			super::end_held_sigint(k, vp, false);
 			// zsh's `readoutput` trims the output itself; `=(…)` keeps it.
 			(capture.take(), status, vp.mode.dialect() == Dialect::Zsh)
 		},
@@ -5051,6 +5053,17 @@ pub fn bash_termsig(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		*end = status;
 		*exit = true;
 	}
+}
+
+/// Whether `vp` runs the EXIT trap a terminating signal began
+/// ([`bash_termsig`]: bash's `termsig_handler` is under way).
+pub fn terminating(vp: &Vproc) -> bool {
+	vp.frames.iter().any(|f| {
+		matches!(f.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: TrapKey::Exit, exit: true, .. },
+			..
+		})
+	})
 }
 
 /// Push a script frame running `src` (`eval`, `source`).
