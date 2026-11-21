@@ -728,14 +728,16 @@ impl GitRepo {
 	/// `path` is missing, or is still the directory the add made (same device
 	/// and inode, and the token the add set on it) with no repository in it
 	/// (no `.git` but the add's own gitfile at its root, and no bare
-	/// repository). Files written into that tree after the add stopped, and
+	/// repository) and no filesystem mounted in it (every entry on the root's
+	/// device). Files written into that tree after the add stopped, and
 	/// changes staged there, are removed with it. A live add, a lock someone
 	/// changed or removed, a commit or checkout made there, a directory made
-	/// again in its place, a repository anywhere in the tree, or a platform
-	/// that cannot check these is refused with a message naming the
-	/// registration, and nothing is removed. Registrations earlier reclaims
-	/// moved out of git's view and did not delete go first. Returns one note
-	/// per removal, for the caller to show.
+	/// again in its place, a repository or a mount point anywhere in the
+	/// tree, or a platform that cannot check these is refused with a message
+	/// naming the registration, and nothing is removed. A mount made during
+	/// the emptying stops it there, with nothing on that filesystem removed.
+	/// Registrations earlier reclaims moved out of git's view and did not delete
+	/// go first. Returns one note per removal, for the caller to show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
 		let common = &self.info().common_dir;
 		sweep_moved_registrations(common);
@@ -2439,6 +2441,63 @@ mod tree_dir {
 		}
 	}
 
+	/// The device the entry `name` in the directory `dir` is on, without
+	/// following a symlink or triggering an automount: a mount point reports
+	/// the mounted filesystem's. `None` when the entry is gone.
+	fn device_at(dir: RawFd, name: &CStr) -> io::Result<Option<libc::dev_t>> {
+		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `name` is a live NUL-terminated string, and `stat` is
+		// writable memory of the size `fstatat` fills.
+		let rc = unsafe {
+			libc::fstatat(
+				dir,
+				name.as_ptr(),
+				stat.as_mut_ptr(),
+				libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+			)
+		};
+		if rc != 0 {
+			let err = io::Error::last_os_error();
+			return if err.kind() == io::ErrorKind::NotFound {
+				Ok(None)
+			} else {
+				Err(err)
+			};
+		}
+		// SAFETY: `fstatat` succeeded, so it filled `stat`.
+		Ok(Some(unsafe { stat.assume_init() }.st_dev))
+	}
+
+	/// The device the open file `fd` is on.
+	fn device_of(fd: RawFd) -> io::Result<libc::dev_t> {
+		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `fd` is an open descriptor, and `stat` is writable memory of
+		// the size `fstat` fills.
+		if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `fstat` succeeded, so it filled `stat`.
+		Ok(unsafe { stat.assume_init() }.st_dev)
+	}
+
+	/// Whether `found`, the device of an entry below a tree's root, is not the
+	/// root's `root`: the entry is a mount point (or on a filesystem that gives
+	/// its subvolumes devices of their own), which the reclaim never descends
+	/// into or removes.
+	const fn other_device(found: libc::dev_t, root: libc::dev_t) -> bool {
+		found != root
+	}
+
+	/// The error the emptying stops with at `path`, a mount point that
+	/// appeared after the checks.
+	fn mounted(path: &Path) -> io::Error {
+		io::Error::other(format!(
+			"a filesystem is mounted at {} in the tree of an interrupted worktree add; the reclaim \
+			 stopped there and removed nothing on it",
+			path.display()
+		))
+	}
+
 	/// The names in the directory `dir`, without `.` and `..`.
 	fn names(dir: RawFd) -> io::Result<Vec<CString>> {
 		// `fdopendir` takes the descriptor over, so it gets a duplicate.
@@ -2486,14 +2545,27 @@ mod tree_dir {
 		}
 	}
 
-	/// Removes everything in the directory `dir`, never following a symlink:
-	/// each subdirectory is opened `O_NOFOLLOW` from its parent, and a name
-	/// that turned into a symlink or a file meanwhile is unlinked itself.
-	fn remove_all_in(dir: RawFd) -> io::Result<()> {
+	/// Removes everything in the directory `dir` (at `at`), never following a
+	/// symlink: each subdirectory is opened `O_NOFOLLOW` from its parent, and
+	/// a name that turned into a symlink or a file meanwhile is unlinked
+	/// itself. An entry on another device than `dev`, the tree root's, stops
+	/// it before anything on that device is touched.
+	fn remove_all_in(dir: RawFd, dev: libc::dev_t, at: &Path) -> io::Result<()> {
 		for name in names(dir)? {
+			let path = at.join(OsStr::from_bytes(name.as_bytes()));
+			match device_at(dir, &name)? {
+				None => continue,
+				Some(found) if other_device(found, dev) => return Err(mounted(&path)),
+				Some(_) => {},
+			}
 			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
 				Ok(child) => {
-					remove_all_in(child.as_raw_fd())?;
+					// A mount made on the name after `device_at`: the open
+					// went onto it.
+					if other_device(device_of(child.as_raw_fd())?, dev) {
+						return Err(mounted(&path));
+					}
+					remove_all_in(child.as_raw_fd(), dev, &path)?;
 					drop(child);
 					unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
 				},
@@ -2507,35 +2579,58 @@ mod tree_dir {
 		Ok(())
 	}
 
-	/// Looks in the directory `dir` (at `at` below the tree's root) for a
-	/// repository: an entry named `.git` (the root's own is skipped), or, below
-	/// the root, `dir` itself holding `HEAD`, `objects` and `refs` (a bare
-	/// repository). Queues every subdirectory it opens without following a
-	/// symlink.
-	fn git_entry_in(
+	/// What below a tree's root is not the interrupted add's to remove, by
+	/// its path relative to the root.
+	pub enum Foreign {
+		/// A repository: an entry named `.git`, or a directory holding `HEAD`,
+		/// `objects` and `refs` (a bare repository).
+		Repository(PathBuf),
+		/// An entry on another device than the root: a mount point.
+		MountPoint(PathBuf),
+	}
+
+	/// Looks in the directory `dir` (at `at` below the tree's root, on the
+	/// device `dev`) for what is not the add's: an entry on another device,
+	/// an entry named `.git` (the root's own is skipped), or, below the root,
+	/// `dir` itself holding `HEAD`, `objects` and `refs`. Queues every
+	/// subdirectory it opens without following a symlink.
+	fn foreign_entry_in(
 		dir: RawFd,
 		at: &Path,
 		root: bool,
+		dev: libc::dev_t,
 		pending: &mut Vec<(OwnedFd, PathBuf)>,
-	) -> io::Result<Option<PathBuf>> {
+	) -> io::Result<Option<Foreign>> {
 		let names = names(dir)?;
 		if !root
 			&& [&b"HEAD"[..], b"objects", b"refs"]
 				.iter()
 				.all(|wanted| names.iter().any(|name| name.as_bytes() == *wanted))
 		{
-			return Ok(Some(at.to_path_buf()));
+			return Ok(Some(Foreign::Repository(at.to_path_buf())));
 		}
 		for name in names {
 			let relative = at.join(OsStr::from_bytes(name.as_bytes()));
+			match device_at(dir, &name)? {
+				None => continue,
+				Some(found) if other_device(found, dev) => {
+					return Ok(Some(Foreign::MountPoint(relative)));
+				},
+				Some(_) => {},
+			}
 			if name.as_bytes() == b".git" {
 				if root {
 					continue;
 				}
-				return Ok(Some(relative));
+				return Ok(Some(Foreign::Repository(relative)));
 			}
 			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
-				Ok(child) => pending.push((child, relative)),
+				Ok(child) => {
+					if other_device(device_of(child.as_raw_fd())?, dev) {
+						return Ok(Some(Foreign::MountPoint(relative)));
+					}
+					pending.push((child, relative));
+				},
 				Err(err)
 					if err.kind() == io::ErrorKind::NotFound
 						|| matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {},
@@ -2589,17 +2684,21 @@ mod tree_dir {
 				.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin))
 		}
 
-		/// The first repository below this directory's root, relative to the
-		/// root: an entry named `.git` (the root's own is not looked at), or a
-		/// directory holding `HEAD`, `objects` and `refs`. Walks every
-		/// subdirectory without following a symlink.
-		pub fn nested_git_entry(&self) -> io::Result<Option<PathBuf>> {
+		/// The first entry below this directory's root that is not the
+		/// add's: an entry on another device (a mount point), an entry named
+		/// `.git` (the root's own is not looked at), or a directory holding
+		/// `HEAD`, `objects` and `refs`. Walks every subdirectory without
+		/// following a symlink or descending onto another device.
+		pub fn foreign_entry(&self) -> io::Result<Option<Foreign>> {
+			let dev = device_of(self.0.as_raw_fd())?;
 			let mut pending = Vec::new();
-			if let Some(found) = git_entry_in(self.0.as_raw_fd(), Path::new(""), true, &mut pending)? {
+			if let Some(found) =
+				foreign_entry_in(self.0.as_raw_fd(), Path::new(""), true, dev, &mut pending)?
+			{
 				return Ok(Some(found));
 			}
 			while let Some((dir, at)) = pending.pop() {
-				if let Some(found) = git_entry_in(dir.as_raw_fd(), &at, false, &mut pending)? {
+				if let Some(found) = foreign_entry_in(dir.as_raw_fd(), &at, false, dev, &mut pending)? {
 					return Ok(Some(found));
 				}
 			}
@@ -2618,9 +2717,11 @@ mod tree_dir {
 			Ok(())
 		}
 
-		/// Removes everything in this directory, keeping the directory.
-		pub fn empty(&self) -> io::Result<()> {
-			remove_all_in(self.0.as_raw_fd())
+		/// Removes everything in this directory (opened at `path`), keeping
+		/// the directory. It stops at an entry on another device than this
+		/// directory, before touching anything there.
+		pub fn empty(&self, path: &Path) -> io::Result<()> {
+			remove_all_in(self.0.as_raw_fd(), device_of(self.0.as_raw_fd())?, path)
 		}
 
 		/// Removes the token from this directory if it is still `token`; a
@@ -2997,12 +3098,12 @@ fn take_abandoned_add(
 }
 
 /// Empties the tree an interrupted add left at `tree` while it is still the
-/// directory that add made (`made`) and holds no repository, and returns the
-/// note to show with the directory, held open so its token can go after the
-/// registration; a tree that is gone leaves only the registration to remove.
-/// Anything else is refused with `refuse`, and nothing is removed. The tree
-/// is opened once, without following a symlink, and every check and the
-/// removal go through that descriptor.
+/// directory that add made (`made`) and holds no repository and no mount
+/// point, and returns the note to show with the directory, held open so its
+/// token can go after the registration; a tree that is gone leaves only the
+/// registration to remove. Anything else is refused with `refuse`, and
+/// nothing is removed. The tree is opened once, without following a symlink,
+/// and every check and the removal go through that descriptor.
 #[cfg(target_os = "linux")]
 fn reclaim_tree(
 	common: &Path,
@@ -3038,21 +3139,31 @@ fn reclaim_tree(
 	if !dir.git_entry_is_ours(tree, admin) {
 		return Err(refuse("and holds a `.git` that is not this registration's"));
 	}
-	// The add's own tree never holds a `.git` below its root: the clone leaves
+	// The add's own tree never holds a `.git` below its root (the clone leaves
 	// out directories a `.git` marks, and a checkout writes a submodule as an
-	// empty directory.
-	if let Some(nested) = dir.nested_git_entry()? {
-		return Err(refuse(&format!(
-			"and holds a repository below its root ({})",
-			tree.join(nested).display()
-		)));
+	// empty directory), and it is one filesystem: a mount below it is someone
+	// else's.
+	match dir.foreign_entry()? {
+		Some(tree_dir::Foreign::Repository(nested)) => {
+			return Err(refuse(&format!(
+				"and holds a repository below its root ({})",
+				tree.join(nested).display()
+			)));
+		},
+		Some(tree_dir::Foreign::MountPoint(mount)) => {
+			return Err(refuse(&format!(
+				"and holds a filesystem mounted below its root ({})",
+				tree.join(mount).display()
+			)));
+		},
+		None => {},
 	}
 	#[cfg(test)]
 	test_hooks::before_tree_removal(tree);
 	// The directory stays, writable by its owner: it can be a mount point, and
 	// the add keeps an empty directory anyway.
 	dir.make_owner_writable()?;
-	dir.empty()?;
+	dir.empty(tree)?;
 	Ok((
 		format!(
 			"emptied the partial tree an interrupted worktree add left at {}, with any file written \
@@ -3749,6 +3860,58 @@ mod tests {
 			.to_string();
 		assert!(err.contains("holds a repository below its root"), "{err}");
 		assert!(tree.join("nested/m.git/HEAD").is_file() && admin.is_dir());
+	}
+
+	/// A filesystem mounted below the tree's root (a bind mount, a tmpfs) is
+	/// someone else's: the reclaim refuses and removes nothing, and the
+	/// emptying alone, as when the mount appears after the checks, stops at
+	/// the mount point too. Making a mount point needs privileges the tests
+	/// lack: the builds Job mounts one inside a directory the test user owns
+	/// and names it in `PI_VCS_TEST_MOUNT_POINT`; that directory is the tree.
+	/// Run with `--ignored`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "needs a mount point inside a directory the test user owns: PI_VCS_TEST_MOUNT_POINT"]
+	fn reclaim_refuses_a_tree_holding_a_mount_point() {
+		use std::os::unix::fs::MetadataExt;
+		let mount = PathBuf::from(std::env::var("PI_VCS_TEST_MOUNT_POINT").expect(
+			"PI_VCS_TEST_MOUNT_POINT names a mount point inside a directory the test user owns",
+		));
+		let tree = mount.parent().unwrap().to_path_buf();
+		assert_ne!(
+			fs::metadata(&mount).unwrap().dev(),
+			fs::metadata(&tree).unwrap().dev(),
+			"{} is not a mount point",
+			mount.display()
+		);
+		// What an earlier run left in the tree, beside the mount point.
+		for entry in fs::read_dir(&tree).unwrap() {
+			let path = entry.unwrap().path();
+			if path != mount {
+				let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+			}
+		}
+		let data = mount.join("data");
+		fs::write(&data, "someone's\n").unwrap();
+		let (_temp, repo) = fixture();
+		let admin = abandoned_add(&repo, &tree, None);
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		assert!(
+			data.is_file(),
+			"the reclaim emptied the filesystem mounted at {}: {result:?}",
+			mount.display()
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(err.contains("holds a filesystem mounted below its root"), "{err}");
+		assert!(
+			tree.join("partial").is_file() && tree.join(".git").is_file() && admin.is_dir(),
+			"the reclaim removed something: {err}"
+		);
+		// The emptying alone.
+		let dir = tree_dir::TreeDir::open(&tree).unwrap().unwrap();
+		let err = dir.empty(&tree).unwrap_err().to_string();
+		assert!(data.is_file(), "the emptying removed {}: {err}", data.display());
+		assert!(err.contains("a filesystem is mounted at"), "{err}");
 	}
 
 	/// A registration an earlier reclaim moved out of `worktrees/` and did not
