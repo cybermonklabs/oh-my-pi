@@ -1,15 +1,23 @@
-//! A real fault in the process of a shell with an EXIT trap ends the
-//! process. bash's EXIT trap catches the fault signals (`SEGV`, `BUS`, …),
-//! and a real fault runs again when its handler returns: standalone, the
-//! handler gives the signal its default action back on its second delivery
-//! (bash's `termsig_sighandler`); embedded in a runtime, the shell catches
-//! none of them, and the runtime's own handler takes the fault.
+//! A real fault in the process of a shell with an EXIT trap. bash's EXIT
+//! trap catches the fault signals (`SEGV`, `BUS`, `SYS`, …). One an
+//! instruction raises before it completes runs again when its handler
+//! returns: standalone, the handler gives the signal its default action back
+//! at once and raises it again, not handing it to the shell, so the process
+//! ends by it whichever thread runs first, and the trap does not run;
+//! embedded in a runtime, the shell catches none of them, and the runtime's
+//! own handler takes the fault. (bash 5.2.21, with the same fault in a
+//! thread of its process, runs the trap first in most runs but not all: its
+//! fault thread races the repeat itself; a known difference.) One raised
+//! once its instruction has run does not repeat (a system call a seccomp
+//! filter traps, `SIGSYS`): the shell takes it as bash does, runs its EXIT
+//! trap, then dies of it.
 //!
 //! Each case runs in a child process: this test binary again, running the
 //! one test with [`CASE`] set. The child starts the shell
 //! ([`pi_shell::process::main`]) on a `-c` string that sets an EXIT trap,
-//! makes the file [`MARK`] names, then waits; a thread of the child writes
-//! to an unmapped address once the file exists.
+//! makes the file [`MARK`] names, then waits; a thread of the child faults
+//! once the file exists: a write to an unmapped address, or (`syscall`) a
+//! system call its seccomp filter traps.
 
 #![cfg(unix)]
 
@@ -22,7 +30,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-/// The child's case: `standalone` or `embedded`.
+/// The child's case: `standalone`, `embedded` or `syscall`.
 const CASE: &str = "PI_SHELL_FAULT_CASE";
 /// The file the script makes once its EXIT trap is set.
 const MARK: &str = "PI_SHELL_FAULT_MARK";
@@ -39,8 +47,10 @@ extern "C" fn runtime_handler(_: libc::c_int) {
 	unsafe { libc::_exit(RUNTIME_HANDLED) }
 }
 
-/// The child: the fault thread, then the shell; `embedded` says how it runs.
-fn child(embedded: bool) -> ! {
+/// The child: the fault thread, then the shell; `case` says how it runs
+/// and faults.
+fn child(case: &str) -> ! {
+	let embedded = case == "embedded";
 	if embedded {
 		// SAFETY: a zeroed sigaction with a handler and an emptied mask is a
 		// valid disposition.
@@ -51,10 +61,15 @@ fn child(embedded: bool) -> ! {
 			libc::sigaction(libc::SIGSEGV, &raw const action, std::ptr::null_mut());
 		}
 	}
+	let syscall = case == "syscall";
 	let mark = PathBuf::from(std::env::var_os(MARK).expect("the mark's path"));
 	thread::spawn(move || {
 		while !mark.exists() {
 			thread::sleep(Duration::from_millis(5));
+		}
+		if syscall {
+			trapped_syscall();
+			return;
 		}
 		// SAFETY: none: a deliberate fault, a write to an unmapped address.
 		unsafe { std::ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
@@ -63,6 +78,59 @@ fn child(embedded: bool) -> ! {
 		embedded,
 	});
 	std::process::exit(exit.end())
+}
+
+/// A fault raised once its instruction has run: a seccomp filter on this
+/// thread alone traps its `getppid` (`SECCOMP_RET_TRAP`), which raises
+/// `SIGSYS` (`SYS_SECCOMP`) in place of the call; the thread then goes on.
+#[cfg(target_os = "linux")]
+fn trapped_syscall() {
+	#[expect(clippy::cast_possible_truncation, reason = "BPF codes and a syscall number")]
+	let filter = [
+		libc::sock_filter {
+			code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+			jt:   0,
+			jf:   0,
+			k:    0,
+		},
+		libc::sock_filter {
+			code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+			jt:   0,
+			jf:   1,
+			k:    libc::SYS_getppid as u32,
+		},
+		libc::sock_filter {
+			code: (libc::BPF_RET | libc::BPF_K) as u16,
+			jt:   0,
+			jf:   0,
+			k:    libc::SECCOMP_RET_TRAP,
+		},
+		libc::sock_filter {
+			code: (libc::BPF_RET | libc::BPF_K) as u16,
+			jt:   0,
+			jf:   0,
+			k:    libc::SECCOMP_RET_ALLOW,
+		},
+	];
+	let program = libc::sock_fprog { len: 4, filter: filter.as_ptr().cast_mut() };
+	// SAFETY: prctl takes the documented arguments; the filter outlives the
+	// call that installs it; getppid takes none.
+	unsafe {
+		assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no new privileges");
+		assert_eq!(
+			libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const program),
+			0,
+			"the seccomp filter: {}",
+			std::io::Error::last_os_error()
+		);
+		libc::syscall(libc::SYS_getppid);
+	}
+}
+
+/// Other systems have no seccomp: the `syscall` case runs on Linux only.
+#[cfg(not(target_os = "linux"))]
+fn trapped_syscall() {
+	unreachable!("the syscall case runs on Linux only");
 }
 
 /// Run test `test` again as the child of `case`: how it ended and what it
@@ -110,7 +178,7 @@ fn run_child(test: &str, case: &str) -> (ExitStatus, String) {
 /// The case this process runs as a child, if it is one.
 fn as_child() {
 	if let Some(case) = std::env::var_os(CASE) {
-		child(case == "embedded");
+		child(case.to_str().expect("a case name"));
 	}
 }
 
@@ -135,4 +203,17 @@ fn a_real_fault_in_an_embedded_shell_reaches_the_runtimes_handler() {
 		run_child("a_real_fault_in_an_embedded_shell_reaches_the_runtimes_handler", "embedded");
 	assert_eq!(status.code(), Some(RUNTIME_HANDLED), "{status}: {out}");
 	assert!(!trap_ran(&out), "the shell's handler took the fault first: {out}");
+}
+
+/// A fault that does not repeat (`SIGSYS` from a trapped system call) is
+/// the shell's, as bash takes it: the EXIT trap runs, then the shell dies
+/// of the signal (bash `termsig_handler`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_trapped_system_call_runs_the_exit_trap_then_ends_the_shell() {
+	as_child();
+	let (status, out) =
+		run_child("a_trapped_system_call_runs_the_exit_trap_then_ends_the_shell", "syscall");
+	assert_eq!(status.signal(), Some(libc::SIGSYS), "{status}: {out}");
+	assert!(trap_ran(&out), "the EXIT trap did not run: {out}");
 }

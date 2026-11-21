@@ -89,8 +89,8 @@ mod unix {
 		1 << (number - 1)
 	}
 
-	/// The fault signals. After one the kernel raised, the handler's return
-	/// runs the instruction that raised it again, so it comes again at once.
+	/// The fault signals: the same one again before the shell has handled
+	/// the first ends the process ([`on_signal`]).
 	const FAULTS: u64 = bit(libc::SIGILL)
 		| bit(libc::SIGTRAP)
 		| bit(libc::SIGABRT)
@@ -98,6 +98,15 @@ mod unix {
 		| bit(libc::SIGFPE)
 		| bit(libc::SIGSEGV)
 		| bit(libc::SIGSYS);
+
+	/// The fault signals an instruction raises before it completes (an
+	/// address it cannot reach, an illegal or a dividing instruction): run
+	/// again on the handler's return, it faults again. Not `TRAP` or `SYS`,
+	/// which an instruction raises once it has run (a breakpoint; a system
+	/// call a seccomp filter traps, `SYS_SECCOMP`), nor `ABRT`, which
+	/// `abort` raises.
+	const REPEATING: u64 =
+		bit(libc::SIGILL) | bit(libc::SIGBUS) | bit(libc::SIGFPE) | bit(libc::SIGSEGV);
 
 	/// Whether a delivery's `si_code` says the kernel sent it ([`FROM_KERNEL`]).
 	#[cfg(target_os = "linux")]
@@ -111,21 +120,52 @@ mod unix {
 		false
 	}
 
+	/// Whether signal `number`, whose `si_code` is `code`, ends the process
+	/// at once ([`on_signal`]): a fault an instruction of this process raised
+	/// (`SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC`, …: the small positive
+	/// codes, on Linux and the BSDs alike, not a `kill`, `sigqueue` or
+	/// `raise`: `SI_USER`, `SI_QUEUE`, `SI_TKILL`) and would raise again
+	/// ([`REPEATING`]).
+	const fn ends_the_process(number: libc::c_int, code: libc::c_int) -> bool {
+		bit(number) & REPEATING != 0 && code > 0 && code < 0x80
+	}
+
 	/// bash `termsig_sighandler`: a signal is handed to the shell (pending,
 	/// and the engine woken, [`super::mark_wake`]); the same fault signal
-	/// again before the shell handled it ends the process. Its default action
-	/// comes back, so a real fault, which repeats, ends the process the next
-	/// time.
+	/// again before the shell handled it ends the process. A fault an
+	/// instruction of this process raised and would raise again
+	/// ([`ends_the_process`]) is not handed over: it ends the process now, by
+	/// the same signal, whichever thread runs first (its default action
+	/// back, and the signal raised again, which comes as the handler
+	/// returns). Handed over, the shell could run its EXIT trap first or not,
+	/// on its own thread, while the faulting one ran the instruction again.
+	/// A `SYS` or `TRAP` an instruction raised is handed over, as bash takes
+	/// it: the EXIT trap runs, then the shell dies of it.
 	extern "C" fn on_signal(number: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
 		if (1..=64).contains(&number) {
 			let mask = bit(number);
-			// SAFETY: with `SA_SIGINFO` the kernel passes a valid siginfo.
-			if !info.is_null() && sent_by_kernel(unsafe { (*info).si_code }) {
+			let code = if info.is_null() {
+				0
+			} else {
+				// SAFETY: with `SA_SIGINFO` the kernel passes a valid siginfo.
+				unsafe { (*info).si_code }
+			};
+			if ends_the_process(number, code) {
+				// SAFETY: signal and raise are async-signal-safe and take a
+				// valid signal number and disposition; the raised signal waits,
+				// blocked while its handler runs, for the handler's return.
+				unsafe {
+					libc::signal(number, libc::SIG_DFL);
+					libc::raise(number);
+				}
+				return;
+			}
+			if sent_by_kernel(code) {
 				FROM_KERNEL.fetch_or(mask, Ordering::Relaxed);
 			}
 			if PENDING.fetch_or(mask, Ordering::Relaxed) & mask & FAULTS != 0 {
-				// SAFETY: signal is async-signal-safe and takes a valid
-				// signal number and disposition.
+				// SAFETY: signal is async-signal-safe and takes a valid signal
+				// number and disposition.
 				unsafe { libc::signal(number, libc::SIG_DFL) };
 			}
 			super::mark_wake();
@@ -227,6 +267,27 @@ mod unix {
 			assert_eq!(deliver(libc::SI_USER), (true, false));
 		}
 
+		/// Which deliveries end the process at once ([`ends_the_process`]):
+		/// a fault an instruction raised before it completed (a fault's small
+		/// positive code on `SEGV`, `BUS`, `ILL`, `FPE`); not the same signal
+		/// a `kill` or `raise` sent (`SI_USER`, `SI_TKILL`), nor a `SYS` or
+		/// `TRAP` an instruction raised once it had run (`SYS_SECCOMP`,
+		/// `TRAP_BRKPT`), which the shell takes. How the process then ends is
+		/// [`a_real_fault_ends_the_process_though_its_signal_is_caught`]'s,
+		/// and `process_faults`'.
+		#[test]
+		fn only_a_fault_that_repeats_ends_the_process_at_once() {
+			let raised = 1;
+			for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+				assert!(ends_the_process(sig, raised), "{sig} raised by a fault");
+				assert!(!ends_the_process(sig, libc::SI_USER), "{sig} sent by a kill");
+				assert!(!ends_the_process(sig, libc::SI_TKILL), "{sig} raised by raise");
+			}
+			for sig in [libc::SIGSYS, libc::SIGTRAP, libc::SIGABRT, libc::SIGTERM] {
+				assert!(!ends_the_process(sig, raised), "{sig}, code 1");
+			}
+		}
+
 		/// A kernel-sent signal reaches the whole process group, but for a
 		/// session leader's `HUP`: a terminal's hangup sends it to the leader
 		/// alone.
@@ -248,8 +309,8 @@ mod unix {
 		}
 
 		/// A real fault ends the process though the shell catches its signal
-		/// (bash's EXIT trap catches `SEGV`): the handler's return repeats the
-		/// fault, and the second delivery gets the default action back. The
+		/// (bash's EXIT trap catches `SEGV`): the handler gives the signal its
+		/// default action back at once and raises it again. The
 		/// fault runs in a child, this test binary again with `CHILD` set; the
 		/// bound starts at the fault, which comes as the child starts.
 		#[test]
