@@ -24,6 +24,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import { withoutDisabledExperimentalBetas } from "@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch";
 import {
 	anthropicDeclaredTools,
 	anthropicKeepsToolDeclaration,
@@ -459,6 +460,7 @@ export class Agent {
 				pruneDescriptions: boolean;
 				declaration: RecordedToolDeclaration | undefined;
 				sentRevision: number;
+				strictWithheld: boolean;
 				fingerprint: string;
 		  }
 		| undefined;
@@ -717,10 +719,12 @@ export class Agent {
 	 * Fingerprint of the tool definitions the next main request on `model` declares, as the wire carries them: the
 	 * active tools, normalized as that request sends them, and on a provider that keeps its tool declaration
 	 * across a conversation, in the order and with the deferral that declaration gives them, each withdrawn tool it
-	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}). Withdrawing such a
-	 * tool leaves the fingerprint as it was; a withdrawn tool this agent never sent (a resumed process's) leaves the
-	 * declaration, which changes it. With `tools`, the fingerprint the request would declare with them in place of
-	 * the active tools.
+	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}) while a tool is
+	 * active. Withdrawing such a tool beside an active one leaves the fingerprint as it was; it changes when the last
+	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
+	 * process's) leaves the declaration. Where the request sends no tool as strict ({@link #withholdsStrictTools}),
+	 * each tool counts as marked `strict: false`, so turning Claude Code's experimental-beta kill switch on or off
+	 * changes it. With `tools`, the fingerprint the request would declare with them in place of the active tools.
 	 */
 	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
@@ -729,6 +733,7 @@ export class Agent {
 		const declaration = this.#toolDeclaration(model);
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
+		const strictWithheld = this.#withholdsStrictTools(model);
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
 		const memoized = tools === this.#state.tools;
 		const memo = this.#declaredToolsMemo;
@@ -741,13 +746,17 @@ export class Agent {
 			memo.intentDescription === intentDescription &&
 			memo.pruneDescriptions === pruneDescriptions &&
 			memo.declaration === declaration &&
-			memo.sentRevision === sentRevision
+			memo.sentRevision === sentRevision &&
+			memo.strictWithheld === strictWithheld
 		) {
 			return memo.fingerprint;
 		}
 		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
 		const declared = this.#declaredFrom(active, declaration);
-		const fingerprint = toolSpecsFingerprint(declared);
+		// The provider decodes no tool as strict there, as it decodes one marked `strict: false`.
+		const fingerprint = toolSpecsFingerprint(
+			strictWithheld ? declared.map(tool => ({ ...tool, strict: false })) : declared,
+		);
 		if (memoized) {
 			this.#declaredToolsMemo = {
 				model,
@@ -757,6 +766,7 @@ export class Agent {
 				pruneDescriptions,
 				declaration,
 				sentRevision,
+				strictWithheld,
 				fingerprint,
 			};
 		}
@@ -765,10 +775,11 @@ export class Agent {
 
 	/**
 	 * The tools the next main request on `model` declares, in wire order, as {@link declaredToolsFingerprint} hashes
-	 * them: the active tools as they are (not normalized for the wire), and on a provider that keeps its tool
-	 * declaration across a conversation, each withdrawn tool it still holds as this agent last sent it, a newly
-	 * active tool as a copy with `deferLoading`. The same list, copies included, until the active tools, the
-	 * declaration or the sent definitions change; the active tools' array itself where no declaration is kept.
+	 * them (each tool's own `strict` aside): the active tools as they are (not normalized for the wire), and on a
+	 * provider that keeps its tool declaration across a conversation, while a tool is active, each withdrawn tool it
+	 * still holds as this agent last sent it, a newly active tool as a copy with `deferLoading`. The same list, copies
+	 * included, until the active tools, the declaration or the sent definitions change; the active tools' array
+	 * itself where no declaration is kept.
 	 */
 	declaredTools(model: Model | undefined): readonly Tool[] {
 		const tools = this.#state.tools;
@@ -786,7 +797,8 @@ export class Agent {
 
 	/**
 	 * The tools a main request with the `active` tools declares: under a kept `declaration`, in its wire order, each
-	 * withdrawn tool it holds as this agent last sent it ({@link anthropicDeclaredTools}); `active` itself without one.
+	 * withdrawn tool it holds as this agent last sent it, none when `active` is empty
+	 * ({@link SentToolDefinitions.inactiveFor}, {@link anthropicDeclaredTools}); `active` itself without one.
 	 */
 	#declaredFrom(active: readonly Tool[], declaration: RecordedToolDeclaration | undefined): readonly Tool[] {
 		return declaration
@@ -796,7 +808,8 @@ export class Agent {
 
 	/**
 	 * The declaration the next main request on `model` keeps ({@link latestToolDeclaration}): undefined on a provider
-	 * that keeps none, and under an owned dialect, which carries the tools in the prompt.
+	 * that keeps none ({@link anthropicKeepsToolDeclaration}, which Claude Code's experimental-beta kill switch turns
+	 * off), and under an owned dialect, which carries the tools in the prompt.
 	 */
 	#toolDeclaration(model: Model | undefined): RecordedToolDeclaration | undefined {
 		return model !== undefined &&
@@ -805,6 +818,21 @@ export class Agent {
 			!this.#ownedDialect(model)
 			? latestToolDeclaration(this.#state.messages)
 			: undefined;
+	}
+
+	/**
+	 * Whether the next main request on `model` sends no tool as strict: on Anthropic, where the compat the request
+	 * goes out with disables strict tools ({@link withoutDisabledExperimentalBetas}: Claude Code's experimental-beta
+	 * kill switch, or a host whose compat rejects them); not under an owned dialect, which carries the tools in the
+	 * prompt.
+	 */
+	#withholdsStrictTools(model: Model | undefined): boolean {
+		return (
+			model !== undefined &&
+			isAnthropicMessagesModel(model) &&
+			withoutDisabledExperimentalBetas(model).compat.disableStrictTools === true &&
+			!this.#ownedDialect(model)
+		);
 	}
 
 	/**

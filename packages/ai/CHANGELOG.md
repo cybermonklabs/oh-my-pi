@@ -4,7 +4,8 @@
 
 ### Added
 
-- Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation, and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
+- Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation (never while Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to its provider), and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
+- Added `@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch` with `experimentalBetasDisabled()`, whether `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to a model's provider, and `withoutDisabledExperimentalBetas()`, the model with the compat an `anthropic` request then goes out with (no strict tools, no mid-conversation tool changes, …)
 
 ## [18.18.4] - 2026-11-09
 

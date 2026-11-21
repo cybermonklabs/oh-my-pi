@@ -1,4 +1,5 @@
 import type { AnthropicRequestControls, Model, Tool } from "../types";
+import { withoutDisabledExperimentalBetas } from "./anthropic-beta-kill-switch";
 
 /** The tool controls a response recorded (`requestControls.tools`): what its request declared, deferred and made active. */
 export type AnthropicToolControls = NonNullable<AnthropicRequestControls["tools"]>;
@@ -62,10 +63,13 @@ export function declareAnthropicTools(
 /**
  * Whether requests on `model` keep their top-level tool declaration across a
  * conversation, announcing availability changes as controls instead: a tool
- * taken off the roster stays declared ({@link anthropicDeclaredTools}).
+ * taken off the roster stays declared ({@link anthropicDeclaredTools}). Read
+ * off the compat the request goes out with ({@link withoutDisabledExperimentalBetas}):
+ * Claude Code's kill switch turns mid-conversation tool changes off, and a
+ * request then declares the active tools alone.
  */
 export function anthropicKeepsToolDeclaration(model: Model<"anthropic-messages">): boolean {
-	return model.compat.supportsMidConversationToolChanges === true;
+	return withoutDisabledExperimentalBetas(model).compat.supportsMidConversationToolChanges === true;
 }
 
 /**

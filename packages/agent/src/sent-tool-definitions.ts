@@ -53,19 +53,19 @@ export class SentToolDefinitions {
 	 * there are none or the request declares no tools ({@link inactiveFor}).
 	 */
 	withInactiveTools(context: Context): Context {
-		const inactiveTools = context.tools?.length
-			? this.inactiveFor(latestToolDeclaration(context.messages), context.tools)
-			: undefined;
+		const inactiveTools = this.inactiveFor(latestToolDeclaration(context.messages), context.tools ?? []);
 		if (!inactiveTools && !context.inactiveTools) return context;
 		return { ...context, inactiveTools };
 	}
 
 	/**
-	 * The definitions this Agent sent for the names `declaration` declares that are not in `active`; undefined when
-	 * there are none. Names never sent by this Agent are skipped: the provider drops them from the declaration.
+	 * The definitions this Agent sent for the names `declaration` declares that are not in `active`, which a request
+	 * with the `active` tools re-declares; undefined when there are none, and when `active` is empty: a request that
+	 * declares no active tool declares no withdrawn one either. Names never sent by this Agent are skipped: the
+	 * provider drops them from the declaration.
 	 */
 	inactiveFor(declaration: RecordedToolDeclaration | undefined, active: readonly Tool[]): Tool[] | undefined {
-		if (!declaration) return undefined;
+		if (!declaration || active.length === 0) return undefined;
 		const activeNames = new Set(active.map(tool => tool.name));
 		const inactive: Tool[] = [];
 		for (const name of declaration.declared) {

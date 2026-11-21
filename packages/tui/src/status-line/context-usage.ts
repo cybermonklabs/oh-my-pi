@@ -345,8 +345,9 @@ const WITHDRAWN_TOOL_DEFINITIONS = new WeakMap<readonly ContextTool[], Withdrawn
 /**
  * The definitions the next request to `model` declares for tools not on
  * `tools`, `agent`'s roster: on a provider that keeps its tool declaration
- * across a conversation, a tool taken off the roster goes out with every
- * request, as it was last sent. Converts no schema, so a cyclic one cannot throw here.
+ * across a conversation, a tool taken off the roster goes out, as it was last
+ * sent, with every request that declares a tool on the roster. Converts no
+ * schema, so a cyclic one cannot throw here.
  */
 function withdrawnToolDefinitions(
 	agent: ToolDeclarationSource | undefined,

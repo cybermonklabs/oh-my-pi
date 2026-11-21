@@ -128,8 +128,8 @@ function appendToolDefinitionEntries(session: AgentSession, state: SnapshotBuild
 	const toolSourcesByName = new Map(session.getAllToolInfos().map(info => [info.name, info.sourceInfo]));
 	const activeByName = new Map(session.agent.state.tools.map(tool => [tool.name, tool]));
 	// The definitions the next request declares: on a model that keeps its tool declaration, a tool taken off the
-	// roster stays declared, and every request counts it. Each shows as the session holds it, a definition the
-	// session no longer holds as it was sent.
+	// roster stays declared while a tool is on it, and every such request counts it. Each shows as the session holds
+	// it, a definition the session no longer holds as it was sent.
 	for (const [index, declared] of session.agent.declaredTools(session.model).entries()) {
 		const { name, description, parameters } = declared;
 		const tool = activeByName.get(name) ?? session.getToolByName(name) ?? { name, description, parameters };

@@ -12,14 +12,7 @@ import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
-import {
-	$env,
-	$flag,
-	logger,
-	parseJsonWithRepair,
-	parseStreamingJsonThrottled,
-	readSseEvents,
-} from "@oh-my-pi/pi-utils";
+import { $env, logger, parseJsonWithRepair, parseStreamingJsonThrottled, readSseEvents } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
@@ -211,6 +204,7 @@ import {
 	isAnthropicFastModeFallbackDisabled,
 	normalizeAnthropicBaseUrl,
 } from "./anthropic-state";
+import { experimentalBetasDisabled, withoutDisabledExperimentalBetas } from "./anthropic-beta-kill-switch";
 import {
 	type AnthropicToolControls,
 	anthropicKeepsToolDeclaration,
@@ -3842,11 +3836,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, con
 		retryEmptyCompletion: true,
 	});
 
-/** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
-function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean {
-	return model.compat.honorsClaudeCodeBetaKillSwitch === true && $flag("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
-}
-
 /**
  * Whether a request body carries a field the kill switch withholds. A frozen
  * fallback-credit body that does cannot be redeemed under the switch. Defined
@@ -3897,37 +3886,6 @@ function withholdKillSwitchControls(holder: { thinking?: ThinkingConfigParam; ou
 	delete holder.output_config.task_budget;
 	delete holder.output_config.format;
 	if (Object.keys(holder.output_config).length === 0) delete holder.output_config;
-}
-
-/**
- * Honor Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` kill switch on
- * providers whose compat opts in (`honors-claude-code-beta-kill-switch`).
- * Gateways behind `ANTHROPIC_BASE_URL` often reject pre-release body fields,
- * so the switch withholds what Claude Code's gateway contract lists — context
- * management, beta tool fields (`strict`, `defer_loading`,
- * `eager_input_streaming`), tool search (mid-conversation tool changes),
- * structured-output format, task budgets — plus `thinking.block_binding` and
- * server compaction (whose legacy replay needs a `context_management` edit),
- * together with their betas. Effort, adaptive thinking, interleaved thinking
- * and extended context stay, as in Claude Code. Applied through compat so every
- * request builder and retry rung sees one decision; {@link withholdKillSwitchFields}
- * and {@link killSwitchBetas} cover the rest where bodies and betas are finalized.
- */
-function withoutDisabledExperimentalBetas(model: Model<"anthropic-messages">): Model<"anthropic-messages"> {
-	if (!experimentalBetasDisabled(model)) return model;
-	return {
-		...model,
-		compat: {
-			...model.compat,
-			supportsContextManagement: false,
-			supportsThinkingBindingControls: false,
-			supportsServerCompaction: false,
-			supportsMessageThreads: false,
-			disableStrictTools: true,
-			supportsEagerToolInputStreaming: false,
-			supportsMidConversationToolChanges: false,
-		},
-	};
 }
 
 export type AnthropicSystemBlock = {
