@@ -47,6 +47,8 @@ mod ready;
 pub mod regex;
 mod relay;
 pub mod rlimit;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod room;
 pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
