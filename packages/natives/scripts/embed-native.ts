@@ -30,6 +30,25 @@ export interface EmbedOptions extends NativeEmbedTarget {
 	readonly version?: string;
 }
 
+/** One addon of a set {@link addonSetDigest} names. */
+export interface AddonDigestEntry {
+	readonly filename: string;
+	/** SHA-256 of the addon's bytes, hex. */
+	readonly sha256: string;
+}
+
+/**
+ * The identity of a set of addons, computed when a binary or a native npm package
+ * is built: SHA-256 over each `<filename>\0<sha256>\n`, in the order given, hex.
+ * The loader names the directory it extracts or stages that set into
+ * `<natives dir>/<version>-<first 12 hex digits>` and never computes it itself.
+ */
+export function addonSetDigest(files: readonly AddonDigestEntry[]): string {
+	return new Bun.CryptoHasher("sha256")
+		.update(files.map(({ filename, sha256 }) => `${filename}\0${sha256}\n`).join(""))
+		.digest("hex");
+}
+
 /**
  * Build the in-memory `Bun.build({ files })` overrides that embed one target's
  * addons into a standalone binary: one `<addon>.node.zst` zstd frame per addon
@@ -37,6 +56,11 @@ export interface EmbedOptions extends NativeEmbedTarget {
  * manifest that points at them. Output is a pure function of the addon bytes
  * (no timestamps, no container), which keeps release-to-release binary patches
  * small.
+ *
+ * The manifest carries each addon's SHA-256 and a `digest` of the whole set,
+ * computed here so a start never hashes an addon it does not extract. The
+ * loader extracts into `<natives dir>/<version>-<first 12 hex of digest>`, so
+ * two builds of one release never share an extracted file.
  *
  * Nothing is written to disk. Bun.build shares the runtime's directory cache
  * and never re-reads it on a miss, so a process that imported pi-natives before
@@ -89,19 +113,22 @@ export async function embeddedAddonFiles({
 	const frames = await Promise.all(
 		available.map(({ bytes }) => Bun.zstdCompress(bytes, { level: EMBEDDED_ADDON_ZSTD_LEVEL })),
 	);
+	const sha256s = available.map(({ bytes }) => new Bun.CryptoHasher("sha256").update(bytes).digest("hex"));
 	const imports = available.map(
 		({ filename }, index) =>
 			`import zstdPath${index} from ${JSON.stringify(`./${filename}.zst`)} with { type: "file" };`,
 	);
 	const files = available.map(
 		({ variant, filename, bytes }, index) =>
-			`{ variant: ${JSON.stringify(variant)}, filename: ${JSON.stringify(filename)}, size: ${bytes.length}, zstdPath: zstdPath${index} }`,
+			`{ variant: ${JSON.stringify(variant)}, filename: ${JSON.stringify(filename)}, size: ${bytes.length}, sha256: ${JSON.stringify(sha256s[index])}, zstdPath: zstdPath${index} }`,
 	);
+	const digest = addonSetDigest(available.map(({ filename }, index) => ({ filename, sha256: sha256s[index] })));
 	const manifest = `${imports.join("\n")}
 
 export const embeddedAddon = {
 	platformTag: ${JSON.stringify(platformTag)},
 	version: ${JSON.stringify(version)},
+	digest: ${JSON.stringify(digest)},
 	files: [
 		${files.join(",\n\t\t")},
 	],

@@ -82,22 +82,25 @@ RUN bun install --frozen-lockfile --ignore-scripts
 COPY . /pi/
 
 # Hash the exact input trees in the build context before generated files change.
-# Extra untracked inputs change the key and safely result in a cache miss.
+# Extra untracked inputs change the key and safely result in a cache miss. The
+# paths and their order are robomp's `CACHE_KEY_PATHS` (python/robomp/src/natives_cache.py).
 RUN set -eux; \
     git init --bare /tmp/native-key.git; \
     export GIT_DIR=/tmp/native-key.git GIT_WORK_TREE=/pi; \
-    git add -f -- crates Cargo.lock Cargo.toml rust-toolchain.toml packages/natives \
+    git add -f -- crates Cargo.lock Cargo.toml rust-toolchain.toml .cargo packages/natives \
       ':(exclude)**/node_modules/**' ':(exclude)packages/natives/native/.build/**'; \
     tree="$(git write-tree)"; \
     mkdir -p /out/natives-seed; \
     printf '%s\n' "$tree:crates" "$tree:Cargo.lock" "$tree:Cargo.toml" \
-      "$tree:rust-toolchain.toml" "$tree:packages/natives" \
+      "$tree:rust-toolchain.toml" "$tree:.cargo" "$tree:packages/natives" \
       | git cat-file --batch-check > /out/natives-seed/trees.txt; \
     rm -rf /tmp/native-key.git
 
 # Layer 4 — compile pi-natives to a Linux N-API addon. Persistent caches keep
 # repeat builds incremental: cargo's package index + git-deps (CARGO_HOME is
 # /usr/local/cargo in the rust image, not ~/.cargo) + the workspace target dir.
+# The seed keeps the build's sources record (`<addon>.sources.json`) and, with
+# `cp -p`, the addon's modification time, by which that record names it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/pi/target \
@@ -105,7 +108,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     bun --cwd=packages/natives run build; \
     mkdir -p /out; \
     cp packages/natives/native/pi_natives.linux-*.node /out/; \
-    cp packages/natives/native/pi_natives.linux-*.node \
+    cp -p packages/natives/native/pi_natives.linux-*.node \
+       packages/natives/native/pi_natives.linux-*.node.sources.json \
        packages/natives/native/index.d.ts packages/natives/native/index.js \
        packages/natives/native/embedded-addon.js /out/natives-seed/
 

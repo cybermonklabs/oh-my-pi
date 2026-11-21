@@ -17,7 +17,12 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { type DaemonBrokerClient, daemonClientForProject } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { daemonRuntimeDir } from "../launch/paths";
-import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
+import {
+	ompDaemonSpecEnv,
+	resolveWorkerSpawnCmd,
+	SMOKE_TEST_TIMEOUT_MS,
+	workerEnvFromParent,
+} from "../subprocess/worker-client";
 import type { ToolSession } from "../tools";
 import {
 	errorMessage,
@@ -343,7 +348,7 @@ async function startHost(
 				application: spawn.cmd[0]!,
 				// The trailing ref is ignored by the host; it labels the `omp ps` COMMAND column.
 				args: [...spawn.cmd.slice(1), idbRef(loc)],
-				env: { [IDA_HOST_CONFIG_ENV]: JSON.stringify(config) },
+				env: ompDaemonSpecEnv({ [IDA_HOST_CONFIG_ENV]: JSON.stringify(config) }),
 				cwd: spawn.cwd ?? broker.projectDir,
 				pty: false,
 				ready: { log: IDA_HOST_READY_PATTERN, timeoutMs: READY_TIMEOUT_MS },

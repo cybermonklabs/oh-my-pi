@@ -14,7 +14,12 @@ import { logger, ptree } from "@oh-my-pi/pi-utils";
 import { daemonClientForProject } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { daemonRuntimeDir } from "../launch/paths";
-import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
+import {
+	ompDaemonSpecEnv,
+	resolveWorkerSpawnCmd,
+	SMOKE_TEST_TIMEOUT_MS,
+	workerEnvFromParent,
+} from "../subprocess/worker-client";
 import type { BlobBackend } from "./broker";
 import {
 	BLOB_BROKER_CONFIG_ENV,
@@ -172,10 +177,10 @@ async function ensureBlobDaemon(projectDir: string, config: BlobBrokerWorkerConf
 					name: BLOB_BROKER_DAEMON_NAME,
 					application: spawn.cmd[0]!,
 					args: spawn.cmd.slice(1),
-					env: {
+					env: ompDaemonSpecEnv({
 						[BLOB_BROKER_SOCKET_ENV]: socket,
 						[BLOB_BROKER_CONFIG_ENV]: JSON.stringify(config),
-					},
+					}),
 					cwd: spawn.cwd ?? client.projectDir,
 					pty: false,
 					ready: { log: BLOB_BROKER_READY_PATTERN, timeoutMs: READY_TIMEOUT_MS },

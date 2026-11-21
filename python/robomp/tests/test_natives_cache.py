@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import threading
 import time
@@ -78,14 +80,26 @@ def _seed_repo(root: Path, *, with_all_inputs: bool = True) -> Path:
     return root
 
 
-def _populate_built_artifacts(repo_dir: Path, *, body: bytes = b"\x7fELF...native") -> Path:
-    """Fill `packages/natives/native/` with a complete built-artifact set."""
+NODE = "pi_natives.linux-arm64.node"
+SOURCES_RECORD = f"{NODE}.sources.json"
+
+
+def _populate_built_artifacts(
+    repo_dir: Path, *, body: bytes = b"\x7fELF...native", sources_record: str | None = None
+) -> Path:
+    """Fill `packages/natives/native/` with a complete built-artifact set.
+
+    ``sources_record`` is written next to the addon as the native build writes
+    `<addon>.sources.json`, its record of the Rust sources it compiled.
+    """
     native_dir = repo_dir / "packages" / "natives" / "native"
     native_dir.mkdir(parents=True, exist_ok=True)
-    (native_dir / "pi_natives.linux-arm64.node").write_bytes(body)
+    (native_dir / NODE).write_bytes(body)
     (native_dir / "index.d.ts").write_text("export const X: number;\n")
     (native_dir / "index.js").write_text("export const X = 1;\n")
     (native_dir / "embedded-addon.js").write_text("export const embeddedAddon = null;\n")
+    if sources_record is not None:
+        (native_dir / SOURCES_RECORD).write_text(sources_record)
     return native_dir
 
 
@@ -152,6 +166,21 @@ def test_compute_key_handles_missing_inputs(tmp_path: Path) -> None:
     assert key_before != key_after
 
 
+def test_compute_key_changes_with_cargo_config(tmp_path: Path) -> None:
+    # `.cargo/config.toml` sets rustflags and linker settings the napi build compiles with,
+    # and the addon's sources record covers it; a key that left it out would serve an
+    # addon built under the old configuration.
+    keys = []
+    for name, rustflags in (("a", "-C target-cpu=x86-64-v2"), ("b", "-C target-cpu=x86-64-v3")):
+        repo = _seed_repo(tmp_path / name / "repo")
+        (repo / ".cargo").mkdir()
+        (repo / ".cargo" / "config.toml").write_text(f'[build]\nrustflags = ["{rustflags}"]\n')
+        _git(["-C", str(repo), "add", "."], cwd=repo.parent)
+        _git(["-C", str(repo), "commit", "-m", "cargo config"], cwd=repo.parent)
+        keys.append(compute_key(repo, target="linux-arm64"))
+    assert keys[0] != keys[1]
+
+
 def test_compute_key_uses_all_documented_paths() -> None:
     # Sanity contract: the exported path list IS the input set.
     assert CACHE_KEY_PATHS == (
@@ -159,7 +188,122 @@ def test_compute_key_uses_all_documented_paths() -> None:
         "Cargo.lock",
         "Cargo.toml",
         "rust-toolchain.toml",
+        ".cargo",
         "packages/natives",
+    )
+
+
+def test_image_seed_key_lists_the_cache_key_paths_in_order() -> None:
+    # The Dockerfile writes the image seed's `trees.txt` from its own path list; a seed is
+    # served under the key a workspace computes only when both lists are the same.
+    dockerfile = (Path(__file__).resolve().parents[3] / "Dockerfile").read_text(encoding="utf-8")
+    joined = dockerfile.replace("\\\n", " ")
+    added = re.search(r"git add -f -- ([^\n]*?) ':\(exclude\)", joined)
+    assert added is not None, "the Dockerfile's `git add -f -- <paths>` line is missing"
+    assert tuple(added.group(1).split()) == CACHE_KEY_PATHS
+    trees = re.search(r"printf '%s\\n' ((?:\"\$tree:[^\"]+\"\s*)+)\|", joined)
+    assert trees is not None, "the Dockerfile's `printf ... $tree:<path>` list is missing"
+    assert tuple(re.findall(r"\"\$tree:([^\"]+)\"", trees.group(1))) == CACHE_KEY_PATHS
+
+
+def _dockerignore_excludes(patterns: list[str], rel: str) -> bool:
+    """Whether Docker's build context leaves out `rel` under these dockerignore patterns.
+
+    Docker's rules: `**` matches any number of directories, `*` and `?` stay within one;
+    a pattern that matches a parent directory leaves out everything below it; `!` keeps;
+    the last matching pattern wins.
+    """
+
+    def regex(pattern: str) -> re.Pattern[str]:
+        out = ""
+        i = 0
+        while i < len(pattern):
+            if pattern.startswith("**/", i):
+                out += "(?:.*/)?"
+                i += 3
+            elif pattern.startswith("**", i):
+                out += ".*"
+                i += 2
+            elif pattern[i] == "*":
+                out += "[^/]*"
+                i += 1
+            elif pattern[i] == "?":
+                out += "[^/]"
+                i += 1
+            else:
+                out += re.escape(pattern[i])
+                i += 1
+        return re.compile(out)
+
+    parts = rel.split("/")
+    prefixes = ["/".join(parts[: n + 1]) for n in range(len(parts))]
+    excluded = False
+    for line in patterns:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        keep = line.startswith("!")
+        pattern = line[1:] if keep else line
+        pattern = pattern.strip().strip("/")
+        if pattern and any(regex(pattern).fullmatch(prefix) for prefix in prefixes):
+            excluded = not keep
+    return excluded
+
+
+def _image_seed_trees(context: Path, trees: Path) -> None:
+    """The Dockerfile's key step over a build context (`git add -f` into a throwaway index)."""
+    git_dir = context.parent / f"{context.name}.key.git"
+    config = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", "--bare", str(git_dir)], check=True, env=os.environ | config)
+    env = os.environ | config | {"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(context)}
+    present = [path for path in CACHE_KEY_PATHS if (context / path).exists()]
+    subprocess.run(
+        ["git", "add", "-f", "--", *present, ":(exclude)**/node_modules/**"], check=True, cwd=context, env=env
+    )
+    tree = subprocess.run(["git", "write-tree"], check=True, capture_output=True, text=True, env=env).stdout.strip()
+    lines = subprocess.run(
+        ["git", "cat-file", "--batch-check"],
+        input="".join(f"{tree}:{path}\n" for path in CACHE_KEY_PATHS),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout
+    trees.write_text(lines)
+
+
+@pytest.mark.parametrize("dockerignore", [".dockerignore", "Dockerfile.dockerignore"])
+def test_build_context_leaves_out_a_host_sources_record(dockerignore: str) -> None:
+    patterns = (Path(__file__).resolve().parents[3] / dockerignore).read_text(encoding="utf-8").splitlines()
+    assert _dockerignore_excludes(patterns, f"packages/natives/native/{SOURCES_RECORD}")
+    assert _dockerignore_excludes(patterns, f"crates/x/{SOURCES_RECORD}")
+    # Not everything: the context still holds the sources the image builds from.
+    assert not _dockerignore_excludes(patterns, "crates/pi-natives/src/lib.rs")
+
+
+def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: Path) -> None:
+    # A working checkout where someone ran `bun run build:native` holds the addon's sources
+    # record. Docker sends the context through Dockerfile.dockerignore; the seed key computed
+    # from it must be the one a robomp workspace of the same commit computes.
+    repo = _seed_repo(tmp_path / "repo")
+    (repo / "packages" / "natives" / "native" / SOURCES_RECORD).write_text('{"addon":{}}\n')
+    patterns = (
+        (Path(__file__).resolve().parents[3] / "Dockerfile.dockerignore").read_text(encoding="utf-8").splitlines()
+    )
+    context = tmp_path / "context"
+    for source in repo.rglob("*"):
+        rel = source.relative_to(repo).as_posix()
+        if rel == ".git" or rel.startswith(".git/") or not source.is_file():
+            continue
+        if _dockerignore_excludes(patterns, rel):
+            continue
+        (context / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, context / rel)
+    trees = tmp_path / "trees.txt"
+    _image_seed_trees(context, trees)
+
+    assert natives_cache._key_from_lines(trees.read_text().splitlines(), "linux-arm64") == compute_key(
+        repo, target="linux-arm64"
     )
 
 
@@ -227,10 +371,57 @@ def test_capture_then_populate_copies_artifacts(tmp_path: Path) -> None:
         assert cached_companion.read_text() == original, name
 
 
-@pytest.mark.parametrize("name", ["index.js", "pi_natives.linux-arm64.node"])
+def _clone_workspace(src_repo: Path, name: str) -> Path:
+    dst_repo = src_repo.parent.parent / name / "repo"
+    dst_repo.mkdir(parents=True)
+    _git(["clone", str(src_repo), str(dst_repo)], cwd=dst_repo.parent)
+    dst_native = dst_repo / "packages" / "natives" / "native"
+    dst_native.mkdir(parents=True, exist_ok=True)
+    return dst_native
+
+
+def test_capture_then_populate_restores_the_sources_record_with_the_addon_it_names(tmp_path: Path) -> None:
+    cache = _cache(tmp_path)
+    src_repo = _seed_repo(tmp_path / "src" / "repo")
+    record = '{"addon":{"size":15,"mtimeMs":1},"sources":"d1","seen":{"fingerprint":"f1","sources":"d1"}}\n'
+    native_dir = _populate_built_artifacts(src_repo, sources_record=record)
+    key = compute_key(src_repo, target="linux-arm64")
+    stored = cache.capture(REPO, key, native_dir)
+    assert stored is not None
+
+    dst_native = _clone_workspace(src_repo, "dst")
+    hit = cache.populate_workspace(REPO, key, dst_native)
+
+    assert hit is not None
+    assert dst_native / SOURCES_RECORD in hit.files
+    assert (dst_native / SOURCES_RECORD).read_text() == record
+    # The record names its addon by size and modification time; the restored addon keeps both,
+    # so the workspace loader still takes the record for this addon.
+    src_stat, dst_stat = (native_dir / NODE).stat(), (dst_native / NODE).stat()
+    assert (dst_stat.st_size, dst_stat.st_mtime_ns) == (src_stat.st_size, src_stat.st_mtime_ns)
+
+
+def test_an_entry_without_a_sources_record_is_served_and_leaves_none(tmp_path: Path) -> None:
+    cache = _cache(tmp_path)
+    src_repo = _seed_repo(tmp_path / "src" / "repo")
+    native_dir = _populate_built_artifacts(src_repo)
+    key = compute_key(src_repo, target="linux-arm64")
+    assert cache.capture(REPO, key, native_dir) is not None
+    dst_native = _clone_workspace(src_repo, "dst")
+    # A record an earlier build left in the workspace describes another addon.
+    (dst_native / SOURCES_RECORD).write_text('{"sources":"from an earlier build"}\n')
+
+    hit = cache.populate_workspace(REPO, key, dst_native)
+
+    assert hit is not None
+    assert (dst_native / NODE).read_bytes() == b"\x7fELF...native"
+    assert not (dst_native / SOURCES_RECORD).exists()
+
+
+@pytest.mark.parametrize("name", ["index.js", "pi_natives.linux-arm64.node", SOURCES_RECORD])
 def test_capture_rejects_symlink_sources(tmp_path: Path, name: str) -> None:
     cache = _cache(tmp_path)
-    native = _populate_built_artifacts(_seed_repo(tmp_path / "repo"))
+    native = _populate_built_artifacts(_seed_repo(tmp_path / "repo"), sources_record="{}\n")
     secret = tmp_path / "secret"
     secret.write_text("private marker")
     (native / name).unlink()

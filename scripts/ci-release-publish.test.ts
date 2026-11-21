@@ -190,6 +190,12 @@ describe("published legal payloads", () => {
 				"native/loader-state.d.ts",
 				"native/path.js",
 				"native/path.d.ts",
+				"native/natives-dir.js",
+				"native/natives-dir.d.ts",
+				"native/regular-file.js",
+				"native/regular-file.d.ts",
+				"native/workspace-sources.js",
+				"native/workspace-sources.d.ts",
 				"native/sqlite-locks.js",
 				"native/sqlite-locks.d.ts",
 				"native/vcs.js",
@@ -199,6 +205,45 @@ describe("published legal payloads", () => {
 				"THIRD-PARTY-NOTICES.txt",
 				"LICENSE",
 			]);
+		} finally {
+			await fs.rm(pkgDir, { recursive: true, force: true });
+		}
+	});
+
+	it("ships every module the native core package exports or its shipped modules import", async () => {
+		const nativesDir = path.join(import.meta.dir, "../packages/natives");
+		const pkgDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-core-"));
+		try {
+			await Bun.write(
+				path.join(pkgDir, "package.json"),
+				JSON.stringify({ name: "@oh-my-pi/pi-natives", version: "15.5.15", license: "MIT" }),
+			);
+			const shipped = new Set((await prepareNativeCorePackage(pkgDir, false)).files);
+			const { exports } = (await Bun.file(path.join(nativesDir, "package.json")).json()) as {
+				exports: Record<string, string | Record<string, string>>;
+			};
+			const needed = new Set<string>();
+			for (const target of Object.values(exports)) {
+				for (const file of typeof target === "string" ? [target] : Object.values(target)) {
+					needed.add(path.posix.normalize(file));
+				}
+			}
+			// The modules a shipped module imports, followed to every module they import in turn.
+			const queue = [...needed].filter(file => file.endsWith(".js"));
+			const transpiler = new Bun.Transpiler({ loader: "js" });
+			for (let file = queue.pop(); file !== undefined; file = queue.pop()) {
+				const source = await Bun.file(path.join(nativesDir, file)).text();
+				// Bun's own parse: static, side-effect, re-export and dynamic imports and require calls.
+				for (const { path: specifier } of transpiler.scanImports(source)) {
+					if (!specifier.startsWith("./") && !specifier.startsWith("../")) continue;
+					const imported = path.posix.join(path.posix.dirname(file), specifier);
+					if (imported === "package.json" || needed.has(imported)) continue;
+					needed.add(imported);
+					if (imported.endsWith(".js")) queue.push(imported);
+				}
+			}
+
+			expect([...needed].filter(file => !shipped.has(file)).sort()).toEqual([]);
 		} finally {
 			await fs.rm(pkgDir, { recursive: true, force: true });
 		}

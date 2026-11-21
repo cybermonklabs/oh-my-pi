@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- omp's subprocess workers, its launch broker and the omp daemons the broker runs (blob broker, LSP mux, text prediction, IDA host, browser relay) take this session's natives directory from a private handoff, so they load the native addon and grammars from the directory it does, also after a `.env` file set a directory variable, and also a worker whose session exited before it started. The commands the agent runs, directly or through the launch broker, get `PI_NATIVES_DIR` as omp was started with it, or none, and nothing of omp's answer, so an omp a command starts with a home of its own resolves its own natives directory. omp's own `.env` loading no longer applies a `.env` file's `PI_NATIVES_DIR` or the handoff. [The natives directory](../../docs/natives-addon-loader-runtime.md#the-natives-directory) has the full rule
+- A non-compiled omp (the npm package's `omp` script, `bun src/cli.ts`) starts its subprocess workers and its launch broker with Bun's own `.env` loading off (`bun --no-env-file`): they get their environment from the session, and omp applies its `.env` files itself. A worker started after the session moved into a directory whose `.env` sets a natives-directory variable no longer names another natives directory and extracts a second addon copy there
+- A service the launch broker runs no longer gets the project `.env` values the bash tool keeps from commands (`OMP_DOWNLOAD_ROOT` among them): the broker builds its environment as a command's, with the service's spec over it, so a service and the same command run directly see one environment. The language servers the LSP mux daemon starts get that environment too
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

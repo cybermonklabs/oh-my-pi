@@ -1,9 +1,13 @@
+import type * as nodeFs from "node:fs";
+
 export interface EmbeddedAddonFile {
 	variant: "modern" | "baseline" | "default";
 	/** Basename of the extracted `.node` file. */
 	filename: string;
 	/** Decompressed addon size in bytes. */
 	size: number;
+	/** SHA-256 of the decompressed addon, hex; extraction writes no other bytes. */
+	sha256: string;
 	/** Embedded zstd frame holding the addon bytes. */
 	zstdPath: string;
 }
@@ -11,6 +15,11 @@ export interface EmbeddedAddonFile {
 export interface EmbeddedAddon {
 	platformTag: string;
 	version: string;
+	/**
+	 * SHA-256 over every file's name and `sha256`, hex: the build's identity. Its first
+	 * 12 digits name the extraction directory, `<natives dir>/<version>-<digest prefix>`.
+	 */
+	digest: string;
 	files: EmbeddedAddonFile[];
 }
 
@@ -59,14 +68,33 @@ export interface InitLoaderContextOverrides {
 	leafPackageDir?: string | null;
 }
 
+/**
+ * The addons a native leaf package records in its package.json (`nativeAddons`), written
+ * when the package is built by `scripts/gen-npm-packages.ts`.
+ */
+export interface PackageAddons {
+	/** SHA-256 over every file's name and `sha256`, hex; names the staging directory. */
+	digest: string;
+	files: { filename: string; size: number; sha256: string }[];
+}
+
 export interface NativeLoaderContext {
 	platformTag: string;
 	packageVersion: string;
 	nativeDir: string;
 	leafPackageDir: string | null;
+	/**
+	 * This process's addon cache directory: `<nativesDir>/<version>-<digest prefix>` for a
+	 * compiled binary with an embedded addon (the embedded manifest's digest) and for a
+	 * Windows install that stages (its leaf package's digest), `<nativesDir>/<version>`
+	 * otherwise.
+	 */
 	versionedDir: string;
 	isCompiledBinary: boolean;
+	/** A Windows `node_modules` install whose leaf package records its addons. */
 	stageFromNodeModules: boolean;
+	/** The addons staging copies; null when nothing is staged. */
+	stagedAddons: PackageAddons | null;
 	selectedVariant: "modern" | "baseline" | null;
 	addonFilenames: string[];
 	addonLabel: string;
@@ -79,20 +107,47 @@ export function initLoaderContext(overrides?: InitLoaderContextOverrides): Nativ
 
 export interface CleanupStaleNativeVersionsInput {
 	nativesDir: string;
-	currentVersion: string;
+	/** The cache directory this process loads from; never removed. */
+	currentDir: string;
 }
 
+/**
+ * Remove the addon cache directories (`<version>` and `<version>-<digest prefix>`) in
+ * `nativesDir` that no omp process has used for a day, other than `currentDir`; returns
+ * the paths removed.
+ */
 export function cleanupStaleNativeVersions(input: CleanupStaleNativeVersionsInput): string[];
 
+/** Create an addon cache directory and mark it used now. */
 export function prepareNativeVersionDir(versionedDir: string): void;
+
+/**
+ * Replace the addon cache's file calls (`undefined` restores `node:fs`), for tests: a cleanup
+ * that renames a directory away between a check and the load, or calls to record. It reaches
+ * this module instance only.
+ */
+export function __setAddonFileIoForTests(replacement: Partial<typeof nodeFs> | undefined): void;
 
 export interface ExtractEmbeddedAddonsInput {
 	files: EmbeddedAddonFile[];
 	targetDir: string;
 }
 
-/** Decompress every manifest addon missing or wrong-sized in `targetDir`; returns the paths written. */
+/**
+ * Decompress every manifest addon missing from `targetDir` or of the wrong size, check it
+ * against its `size` and `sha256`, and write it durably (a synced temporary file renamed
+ * into place, then the directory synced where the platform allows); returns the paths
+ * written.
+ */
 export function extractEmbeddedAddons(input: ExtractEmbeddedAddonsInput): string[];
+
+/**
+ * On a Windows `node_modules` install, copy the leaf package's addons into `versionedDir`
+ * (checked against `stagedAddons` and written as {@link extractEmbeddedAddons} writes),
+ * reuse a copy of the recorded size, and mark the directory used. Returns the first staged
+ * path in candidate order, or null; failures are appended to `errors`.
+ */
+export function maybeStageNodeModulesAddon(ctx: NativeLoaderContext, errors: string[]): string | null;
 
 export interface SelectCpuVariantInput {
 	arch: string;
@@ -129,9 +184,32 @@ export interface NativeAddonStatus {
 	version: string | null;
 	/** `package.json#version` of the loader that loaded it. */
 	packageVersion: string;
-	/** True when the addon carries a different release than this package. */
+	/**
+	 * True when the addon carries a different release than this package, or (on a workspace
+	 * load) {@link NativeAddonStatus.builtFromOtherSources}.
+	 */
 	stale: boolean;
+	/**
+	 * True on a workspace load whose addon, of this release, was built from Rust sources other
+	 * than the checkout's, as the build's `<addon>.sources.json` record shows. False without a
+	 * record, and on every other load.
+	 */
+	builtFromOtherSources: boolean;
 }
+
+export interface DescribeLoadedAddonContext {
+	packageVersion: string;
+	isWorkspaceLoad: boolean;
+	/** `<checkout>/packages/natives/native` on a workspace load. */
+	nativeDir: string;
+}
+
+/** The identity `loadNative()` records for the addon it loaded from `candidate`. */
+export function describeLoadedAddon(
+	bindings: Record<string, unknown>,
+	candidate: string,
+	ctx: DescribeLoadedAddonContext,
+): NativeAddonStatus;
 
 /** The addon behind this process's exports; `null` before a successful load. */
 export function nativeAddonStatus(): NativeAddonStatus | null;
@@ -171,4 +249,10 @@ export function reportStaleWorkspaceAddon(
 /** Actionable text for {@link missingNativeExport}. */
 export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
 
+/**
+ * Load the native addon. The cache checks and writes (extraction, staging, and the one retry of
+ * a cache file that vanished between the check that found it and its load, as it does while
+ * cleanup in another process holds its directory renamed away) go through the addon cache's
+ * file calls ({@link __setAddonFileIoForTests}).
+ */
 export function loadNative(): Record<string, unknown>;
