@@ -1835,6 +1835,25 @@ mod tests {
 		assert_eq!(taps.0.lock().len(), 1);
 	}
 
+	/// `tail -f` into an external stops once that reader is gone: it asks
+	/// with an empty write, which the shared OS pipe must answer as the
+	/// memory pipe does (`BrokenPipe`), or `tail` follows the idle file for
+	/// good. `tail` (a builtin) opens its stdout while the pipe is still in
+	/// memory; `head` (an external) turns it into an OS pipe. The bound only
+	/// turns a hang into a failure.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn tail_f_into_an_external_stops_once_its_reader_is_gone() {
+		let dir = tempfile::tempdir().unwrap();
+		let log = dir.path().join("app.log");
+		std::fs::write(&log, "first\nsecond\n").unwrap();
+		let mut s = session();
+		let cmd = format!("tail -f '{}' | /usr/bin/head -n 1; echo done", log.display());
+		let c = tokio::time::timeout(Duration::from_secs(60), sh(&mut s, &cmd))
+			.await
+			.expect("tail -f did not stop within 60 s after its reader left");
+		assert_eq!(c.stdout, "first\ndone\n");
+	}
+
 	/// Between two external stages a tapped pipe stays in memory, pumped, so
 	/// the tap and the run's trace see every byte in order. On Linux (the
 	/// probe reads `/proc`, and only Linux shares the pipe), the stages of a

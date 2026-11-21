@@ -3,15 +3,19 @@
 //! stages share one kernel pipe, as bash's and zsh's do.
 //!
 //! Linux only. The pipe's two descriptors are ordinary blocking ones, and the
-//! externals inherit them. The shell never reads or writes through them: each
-//! engine handle of an end reopens it through `/proc/self/fd/N`, which makes a
-//! new open file description of the same pipe, and sets that one non-blocking.
-//! A stage of shell code then takes what the pipe holds or has room for and is
+//! externals inherit them. The shell never reads or writes through them: when
+//! the pipe is made it reopens each end once through `/proc/self/fd/N`, which
+//! makes a new open file description of the same pipe, and sets that one
+//! non-blocking. Every engine handle of an end shares that description. A
+//! stage of shell code then takes what the pipe holds or has room for and is
 //! woken by the readiness thread for the rest, never waiting in the kernel,
 //! while the descriptions the externals share stay blocking (`O_NONBLOCK`
-//! belongs to the description). Each handle has its own description and its
-//! own readiness wait, so handles polled by different tasks do not take each
-//! other's wakeups.
+//! belongs to the description). Each task waiting on an end keeps a readiness
+//! wait of its own, so tasks polling one end with their own wakers (the
+//! engine, an extra's fd, a host feed) do not take each other's wakeups.
+//!
+//! Where the private ends cannot be opened (no `/proc` mounted) no OS pipe is
+//! made, and the memory pipe stays, pumped.
 //!
 //! Elsewhere there is no such private description: macOS's `/dev/fd/N` and the
 //! BSDs' duplicate the descriptor and share its description, and Windows'
@@ -47,7 +51,7 @@ mod imp {
 			unix::fs::OpenOptionsExt,
 		},
 		ptr,
-		task::{Context, Poll},
+		task::{Context, Poll, Waker},
 	};
 
 	use crate::{
@@ -66,25 +70,42 @@ mod imp {
 		open: impl Fn(RawFd, bool) -> io::Result<fs::File>,
 	) -> Option<(Box<dyn File>, Box<dyn File>)> {
 		let (r, w) = io::pipe().ok()?;
-		let (read, write) =
-			(Shared::new(OwnedFd::from(r), false), Shared::new(OwnedFd::from(w), true));
-		// Every engine handle reads and writes through a private end of its
-		// own. Where none can be opened (no `/proc` mounted), the pipe stays in
+		let (r, w) = (fs::File::from(OwnedFd::from(r)), fs::File::from(OwnedFd::from(w)));
+		// The shell's private end of each, opened now, once: nothing is
+		// opened later, so a stage of shell code cannot meet `EMFILE` midway.
+		// Where they cannot be opened (no `/proc` mounted), the pipe stays in
 		// memory, pumped: shared, it would fail the shell's own stages.
-		open(read.file.as_raw_fd(), false).ok()?;
-		let mut ours = open(write.file.as_raw_fd(), true).ok()?;
+		let reads = Private::new(open(r.as_raw_fd(), false).ok()?, false);
+		let writes = Private::new(open(w.as_raw_fd(), true).ok()?, true);
 		// The only reader is ours, so a write that does not fit would wait
 		// forever: the private end takes what fits, and anything left over
 		// means this pipe cannot hold what the memory pipe had.
 		let mut done = 0;
 		while done < prefill.len() {
-			match ours.write(&prefill[done..]) {
+			match (&writes.file).write(&prefill[done..]) {
 				Ok(n) if n > 0 => done += n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
 				_ => return None,
 			}
 		}
-		Some((Box::new(read), Box::new(write)))
+		Some((Box::new(Shared { file: r, own: reads }), Box::new(Shared { file: w, own: writes })))
+	}
+
+	/// The `revents` of `fd` for `events` right now (`poll(2)`, zero
+	/// timeout); `POLLERR` and `POLLHUP` come whatever `events` asks.
+	fn revents(fd: RawFd, events: i16) -> io::Result<i16> {
+		let mut p = libc::pollfd { fd, events, revents: 0 };
+		loop {
+			// SAFETY: one valid pollfd; a zero timeout never waits.
+			let n = unsafe { libc::poll(&raw mut p, 1, 0) };
+			if n >= 0 {
+				return Ok(if n > 0 { p.revents } else { 0 });
+			}
+			let e = io::Error::last_os_error();
+			if e.kind() != io::ErrorKind::Interrupted {
+				return Err(e);
+			}
+		}
 	}
 
 	/// `write(2)` of `buf` to `file`, reporting a pipe whose readers are all
@@ -143,48 +164,21 @@ mod imp {
 			})
 	}
 
-	/// One end of the pipe as the shell holds it for the externals: its
-	/// blocking descriptor ([`File::os_handle`]). Each [`File::dup`] is a
-	/// [`Private`] end; I/O on this end itself goes through one too.
+	/// One end of the pipe as the shell holds it: its blocking descriptor,
+	/// which externals inherit ([`File::os_handle`]), and the private end
+	/// opened with it, through which the shell reads or writes.
 	struct Shared {
-		file:  fs::File,
-		write: bool,
-		/// The private end this one's own I/O uses, opened on first use.
-		own:   Option<Private>,
-	}
-
-	impl Shared {
-		fn new(fd: OwnedFd, write: bool) -> Self {
-			Self { file: fs::File::from(fd), write, own: None }
-		}
-
-		fn own(&mut self) -> io::Result<&mut Private> {
-			if self.own.is_none() {
-				self.own = Some(Private::open(self.file.as_raw_fd(), self.write)?);
-			}
-			Ok(self.own.as_mut().expect("opened above"))
-		}
+		file: fs::File,
+		own:  Private,
 	}
 
 	impl File for Shared {
 		fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
-			if self.write {
-				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
-			}
-			match self.own() {
-				Ok(own) => own.poll_read(cx, buf),
-				Err(e) => Poll::Ready(Err(e)),
-			}
+			self.own.poll_read(cx, buf)
 		}
 
 		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-			if !self.write {
-				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
-			}
-			match self.own() {
-				Ok(own) => own.poll_write(cx, buf),
-				Err(e) => Poll::Ready(Err(e)),
-			}
+			self.own.poll_write(cx, buf)
 		}
 
 		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -207,30 +201,55 @@ mod imp {
 			self.file.metadata().map(|m| crate::sys::fs::stat_of(&m))
 		}
 
+		/// Another private end, opened now (it can fail, `EMFILE`). The engine
+		/// never asks: its handles of an end share this one's.
 		fn dup(&self) -> io::Result<Box<dyn File>> {
-			Ok(Box::new(Private::open(self.file.as_raw_fd(), self.write)?))
+			let write = self.own.write;
+			Ok(Box::new(Private::new(private(self.file.as_raw_fd(), write)?, write)))
 		}
 	}
 
-	/// An engine handle's own end: a private non-blocking description of the
-	/// pipe. Its I/O takes what is there and returns `Pending` for the rest,
-	/// with this handle's waker registered on the readiness thread.
+	/// A private non-blocking description of one end. Its I/O takes what is
+	/// there and returns `Pending` for the rest, with the polling task's waker
+	/// registered on the readiness thread.
 	struct Private {
-		/// Declared first: forgotten by the readiness thread before the
+		/// One readiness wait per task waiting on this end, with its waker;
+		/// declared first: forgotten by the readiness thread before the
 		/// descriptor closes.
-		watch: Option<ready::Watch>,
+		waits: Vec<(Waker, ready::Watch)>,
 		file:  fs::File,
 		write: bool,
 	}
 
 	impl Private {
-		fn open(fd: RawFd, write: bool) -> io::Result<Self> {
-			Ok(Self { watch: None, file: private(fd, write)?, write })
+		const fn new(file: fs::File, write: bool) -> Self {
+			Self { waits: Vec::new(), file, write }
 		}
 
-		/// `op` on the non-blocking descriptor; on `WouldBlock` the waker is
-		/// registered for `events` (replacing the earlier wait) and `op` tried
-		/// once more, as readiness may have come before the registration.
+		/// Register `waker` for `events`, replacing only that task's earlier
+		/// wait: every task waiting on this end keeps a wait of its own, as
+		/// the memory pipe keeps every waiter.
+		fn wait(&mut self, waker: &Waker, events: i16) -> io::Result<()> {
+			self.waits.retain(|(w, _)| !w.will_wake(waker));
+			let watch = ready::watch(self.file.as_raw_fd(), events, waker)?;
+			self.waits.push((waker.clone(), watch));
+			Ok(())
+		}
+
+		/// Bytes moved or the end failed: every other waiting task is woken to
+		/// poll again (a needless wake costs one poll), and the waits are
+		/// forgotten, as the memory pipe wakes all its waiters.
+		fn wake_others(&mut self, waker: &Waker) {
+			for (w, _watch) in self.waits.drain(..) {
+				if !w.will_wake(waker) {
+					w.wake();
+				}
+			}
+		}
+
+		/// `op` on the non-blocking descriptor; on `WouldBlock` the task's
+		/// waker is registered for `events` and `op` tried once more, as
+		/// readiness may have come before the registration.
 		fn poll_io(
 			&mut self,
 			cx: &Context<'_>,
@@ -243,17 +262,46 @@ mod imp {
 					Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
 					r => {
-						self.watch = None;
+						self.wake_others(cx.waker());
 						return Poll::Ready(r);
 					},
 				}
 				if registered {
 					return Poll::Pending;
 				}
-				self.watch = None;
-				match ready::watch(self.file.as_raw_fd(), events, cx.waker()) {
-					Ok(w) => self.watch = Some(w),
+				if let Err(e) = self.wait(cx.waker(), events) {
+					return Poll::Ready(Err(e));
+				}
+				registered = true;
+			}
+		}
+
+		/// A zero-length read or write asks whether the end is ready (`read -t
+		/// 0`, `zselect`, an extra's empty write: `tail -f` and `reader_gone`
+		/// ask whether the reader is gone): a non-blocking `read(2)` or
+		/// `write(2)` of nothing returns at once, so `poll(2)` answers instead,
+		/// as the memory pipe does: `Ok(0)` when ready, `Pending` (the task's
+		/// waker registered) when not, and on the write end `BrokenPipe` once
+		/// no reader is left (`POLLERR`).
+		fn poll_ready(&mut self, cx: &Context<'_>, events: i16) -> Poll<io::Result<usize>> {
+			let mut registered = false;
+			loop {
+				let revents = match revents(self.file.as_raw_fd(), events) {
+					Ok(r) => r,
 					Err(e) => return Poll::Ready(Err(e)),
+				};
+				if revents != 0 {
+					self.waits.retain(|(w, _)| !w.will_wake(cx.waker()));
+					if self.write && revents & libc::POLLERR != 0 {
+						return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+					}
+					return Poll::Ready(Ok(0));
+				}
+				if registered {
+					return Poll::Pending;
+				}
+				if let Err(e) = self.wait(cx.waker(), events) {
+					return Poll::Ready(Err(e));
 				}
 				registered = true;
 			}
@@ -266,29 +314,7 @@ mod imp {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				// A zero-length read asks whether the pipe is readable (`read
-				// -t 0`, `zselect`): a non-blocking `read(2)` of nothing returns
-				// at once, so readiness answers instead, as for a memory pipe.
-				let fd = self.file.as_raw_fd();
-				return match ready::now(fd, ready::READ) {
-					Ok(true) => {
-						self.watch = None;
-						Poll::Ready(Ok(0))
-					},
-					Ok(false) => {
-						self.watch = None;
-						match ready::watch(fd, ready::READ, cx.waker()) {
-							Ok(w) => self.watch = Some(w),
-							Err(e) => return Poll::Ready(Err(e)),
-						}
-						match ready::now(fd, ready::READ) {
-							Ok(true) => Poll::Ready(Ok(0)),
-							Ok(false) => Poll::Pending,
-							Err(e) => Poll::Ready(Err(e)),
-						}
-					},
-					Err(e) => Poll::Ready(Err(e)),
-				};
+				return self.poll_ready(cx, ready::READ);
 			}
 			self.poll_io(cx, ready::READ, |mut f| f.read(buf))
 		}
@@ -298,7 +324,7 @@ mod imp {
 				return Poll::Ready(Err(io::ErrorKind::Unsupported.into()));
 			}
 			if buf.is_empty() {
-				return Poll::Ready(Ok(0));
+				return self.poll_ready(cx, ready::WRITE);
 			}
 			self.poll_io(cx, ready::WRITE, |f| write_quietly(f, buf))
 		}
@@ -326,7 +352,7 @@ mod imp {
 		}
 
 		fn dup(&self) -> io::Result<Box<dyn File>> {
-			Ok(Box::new(Self::open(self.file.as_raw_fd(), self.write)?))
+			Ok(Box::new(Self::new(private(self.file.as_raw_fd(), self.write)?, self.write)))
 		}
 	}
 
@@ -416,8 +442,10 @@ mod imp {
 			assert!(rd.poll_read(&mut cx, &mut buf).is_pending());
 			assert!(rd.poll_read(&mut cx, &mut []).is_pending(), "zero-length: not readable yet");
 			external(w.as_ref()).write_all(b"x").unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 			while !flag.0.load(Ordering::SeqCst) {
-				std::thread::yield_now();
+				assert!(std::time::Instant::now() < deadline, "the reader was not woken within 30 s");
+				std::thread::sleep(std::time::Duration::from_millis(1));
 			}
 			assert!(matches!(rd.poll_read(&mut cx, &mut []), Poll::Ready(Ok(0))));
 			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(1))));

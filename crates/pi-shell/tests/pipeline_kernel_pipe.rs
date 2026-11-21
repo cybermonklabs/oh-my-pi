@@ -284,9 +284,13 @@ fn shell_code_stages_without_proc() {
 		.output()
 		.expect("run obash with /proc hidden");
 	assert_eq!(
-		String::from_utf8_lossy(&out.stdout),
-		"got a\ngot b\n",
-		"obash with /proc hidden: {out:?}"
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout),
+			String::from_utf8_lossy(&out.stderr)
+		),
+		(Some(0), "got a\ngot b\n".into(), "".into()),
+		"obash with /proc hidden: status, stdout, stderr"
 	);
 }
 
@@ -360,7 +364,12 @@ fn end_of_file_waits_for_every_writer() {
 	check("end_of_file_waits_for_every_writer", &[
 		Case::new(
 			Bash,
-			"{ /bin/sh -c 'sleep 0.3; echo late' & /bin/echo early; } | /bin/cat; echo after",
+			// The background writer waits for the file the other stage makes
+			// after it wrote `early` (`$F`, a path in a fresh directory), so
+			// the order does not depend on how fast either one starts. The
+			// wait gives up after 3000 rounds, and the order is then wrong.
+			"{ /bin/sh -c 'i=0; while [ ! -e \"$F\" ] && [ $i -lt 3000 ]; do sleep 0.01; i=$((i + \
+			 1)); done; echo late' & /bin/sh -c 'echo early; : > \"$F\"'; } | /bin/cat; echo after",
 			"early\nlate\nafter\n",
 		),
 		Case::new(

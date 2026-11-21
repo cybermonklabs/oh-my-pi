@@ -249,14 +249,17 @@ pub trait Host {
 	/// pipeline stages that an external is about to take an end of: `(read,
 	/// write)`. Each end's [`File::os_handle`] is the descriptor externals
 	/// inherit, so two external stages share one kernel pipe, as bash's do,
-	/// and go on if the shell dies. Each end's [`File::dup`] is an end of the
-	/// shell's own whose reads and writes never wait: they move what they can
-	/// and return `Pending`, waking the task once there is more, so a stage
-	/// of shell code never blocks the engine. `None` (the default) keeps the
-	/// engine's memory pipe, which the host pumps: a host without OS pipes,
-	/// one that cannot give the shell such ends (Unix other than Linux,
-	/// Windows: see [`crate::sys::stage_pipe`]), or a `prefill` the new pipe
-	/// cannot hold.
+	/// and go on if the shell dies. The shell reads and writes each end through
+	/// the end itself, and that I/O never waits: it moves what it can and
+	/// returns `Pending`, waking every task waiting on the end once there is
+	/// more, so a stage of shell code never blocks the engine; a zero-length
+	/// read or write answers readiness, a write with no reader left fails with
+	/// `BrokenPipe`, as for the memory pipe. Whatever that needs (a private
+	/// descriptor) is opened here, never later. `None` (the default) keeps the
+	/// engine's memory pipe, which the host pumps: a host without OS pipes, one
+	/// that cannot give the shell such ends (Unix other than Linux, Windows,
+	/// Linux without `/proc`: see [`crate::sys::stage_pipe`]), or a `prefill`
+	/// the new pipe cannot hold.
 	fn os_pipe(&mut self, _prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 		None
 	}

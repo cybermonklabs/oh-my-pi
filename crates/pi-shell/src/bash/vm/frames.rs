@@ -127,7 +127,8 @@ impl FdImager {
 			return i;
 		}
 		// A pipe that became an OS pipe has no image (its bytes are in the
-		// kernel, externals hold its ends): it is lost, as a host file is.
+		// kernel, externals hold its ends): it is a host pipe now, imaged as
+		// one, so externalize and restore both report it lost.
 		let mem = h
 			.with_mem(|m| {
 				let (key, end) = m.key();
@@ -138,6 +139,7 @@ impl FdImager {
 			(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
 			(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
 			(None, FdOrigin::Host, Some(kind)) => FdObjImage::Host(kind),
+			(None, FdOrigin::Mem, Some(kind)) if h.is_os_pipe() => FdObjImage::Host(kind),
 			(None, origin @ (FdOrigin::Host | FdOrigin::Mem), _) => FdObjImage::Lost(origin),
 			(None, FdOrigin::Closed, _) => FdObjImage::Closed,
 		};
@@ -1391,12 +1393,13 @@ mod tests {
 
 	// Failure mode: a pipe that became an OS pipe is imaged as a memory pipe
 	// (its kernel bytes and the externals' ends silently dropped) instead of
-	// lost, so a restore would pretend to resume it.
+	// lost, so a restore would pretend to resume it; or (review finding 4) it
+	// is imaged as lost but restore does not report it, since restore reports
+	// a lost fd only where the image names a host object's kind.
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	#[test]
-	fn a_pipe_shared_with_externals_is_imaged_as_lost() {
-		use super::FdObjImage;
-		use crate::bash::fd::FdOrigin;
+	fn a_pipe_shared_with_externals_is_lost_on_externalize_and_restore() {
+		use super::{FdObjImage, FdRebuild, FileKind};
 		let (r, w) = crate::bash::mem::stage_pipe();
 		let (r, w) = (FdRef::mem(r), FdRef::mem(w));
 		let (pr, pw) = crate::bash::mem::stage_pipe();
@@ -1405,9 +1408,15 @@ mod tests {
 		assert!(r.is_os_pipe() && w.is_os_pipe() && !pr.is_os_pipe());
 		let mut img = FdImager::default();
 		let ids = [img.fd(&r), img.fd(&w), img.fd(&pr), img.fd(&pw)];
-		assert!(matches!(img.objs[ids[0] as usize], FdObjImage::Lost(FdOrigin::Mem)));
-		assert!(matches!(img.objs[ids[1] as usize], FdObjImage::Lost(FdOrigin::Mem)));
 		assert!(matches!(img.objs[ids[2] as usize], FdObjImage::Mem { .. }), "a memory pipe images");
 		assert_eq!(img.mems.len(), 1, "only the memory pipe has an image");
+		// Restore reports a lost fd (`Lost::Fd`) exactly where `host_kind`
+		// names the kind of the object the image held.
+		let mut stdio = [None, None, None];
+		let built = vec![None; img.objs.len()];
+		let rebuild = FdRebuild { objs: img.objs, mems: Vec::new(), built, stdio: &mut stdio };
+		assert_eq!(rebuild.host_kind(ids[0]), Some(FileKind::Pipe), "the read end is reported lost");
+		assert_eq!(rebuild.host_kind(ids[1]), Some(FileKind::Pipe), "the write end is reported lost");
+		assert_eq!(rebuild.host_kind(ids[2]), None, "a memory pipe is rebuilt, not lost");
 	}
 }

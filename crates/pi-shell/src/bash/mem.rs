@@ -10,16 +10,17 @@
 //! moment an external takes one of its ends ([`MemFile::share_with_external`]):
 //! two external stages then inherit the two ends of one kernel pipe, as bash's
 //! and zsh's stages do, and keep exchanging bytes if the shell dies; a stage of
-//! shell code reads and writes the same OS pipe through an end of its own that
-//! never waits. A tapped pipe ([`tapped_pipe`]) stays in memory, so its mirror
-//! sees every byte, and so does a pipe on a host without OS pipes.
+//! shell code reads and writes the same OS pipe through the shell's own end of
+//! it, which never waits. A tapped pipe ([`tapped_pipe`]) stays in memory, so
+//! its mirror sees every byte, and so does a pipe on a host without OS pipes
+//! (or that declined to make one).
 //!
 //! An fd holds one as a [`MemFile`], which keeps its type: externalize
 //! images the shared state once per object ([`MemImage`], contents inline:
 //! a pipe holds at most [`PIPE_CAPACITY`] bytes) and restore rebuilds it
 //! ([`MemObj`]) and hands out the ends the restored fds held. A pipe that
 //! became an OS pipe has no image: its bytes are in the kernel and externals
-//! hold its ends, so a snapshot reports it lost.
+//! hold its ends, so a snapshot reports it lost, as a host pipe.
 
 use std::{
 	collections::VecDeque,
@@ -55,16 +56,25 @@ pub struct PipeState {
 	/// taking one of its ends turns into an OS pipe.
 	shareable: bool,
 	/// The OS pipe this one became ([`MemFile::share_with_external`]): from
-	/// then on `buf` holds only bytes an engine reader gave back
-	/// ([`PipeReader::unread`]), which come before what the OS pipe holds.
+	/// then on `buf` holds only bytes given back to the pipe
+	/// ([`PipeReader::unread`]: what a host feed held when its external
+	/// ended, zcurses' input), which come before what the OS pipe holds.
 	os:        Option<OsEnds>,
+	/// An external took the read end of the OS pipe while bytes waited in
+	/// `buf`, so the host feeds it through a pump, which may hold bytes no
+	/// later reader may overtake: from then on every external reader is fed
+	/// too ([`File::os_handle`] stays `None`).
+	fed:       bool,
 }
 
-/// The shell's descriptors of the two ends of the OS pipe a [`stage_pipe`]
-/// became: the ones externals inherit ([`File::os_handle`]), and from which
-/// each engine handle opens its own end ([`File::dup`]). An end is closed with
-/// its last engine handle, so end of file and `EPIPE` come from the kernel,
-/// once no process holds the other end, as for any pipe.
+/// The shell's two ends of the OS pipe a [`stage_pipe`] became
+/// ([`Host::os_pipe`](crate::bash::Host::os_pipe)): each one's
+/// [`File::os_handle`] is the descriptor externals inherit, and its reads and
+/// writes go through a non-blocking end opened with the pipe, which every
+/// engine handle of that end shares and which keeps a wakeup for each task
+/// waiting on it. An end is closed with its last engine handle, so end of
+/// file and `EPIPE` come from the kernel once no process holds the other end,
+/// as for any pipe.
 struct OsEnds {
 	read:  Option<Box<dyn File>>,
 	write: Option<Box<dyn File>>,
@@ -93,37 +103,14 @@ impl PipeState {
 }
 
 /// Read end of a [`pipe`].
-pub struct PipeReader {
-	state: Arc<Mutex<PipeState>>,
-	/// This handle's own end of the OS pipe the pipe became, opened on first
-	/// use (see [`PipeState::os`]): its reads never wait, and its readiness
-	/// wait is its own, so handles polled by different tasks keep their
-	/// wakeups.
-	os:    Option<Box<dyn File>>,
-}
+pub struct PipeReader(Arc<Mutex<PipeState>>);
 
 /// Write end of a [`pipe`].
-pub struct PipeWriter {
-	state: Arc<Mutex<PipeState>>,
-	/// As [`PipeReader::os`], for writing.
-	os:    Option<Box<dyn File>>,
-}
-
-impl PipeReader {
-	fn new(state: Arc<Mutex<PipeState>>) -> Self {
-		Self { state, os: None }
-	}
-}
-
-impl PipeWriter {
-	fn new(state: Arc<Mutex<PipeState>>) -> Self {
-		Self { state, os: None }
-	}
-}
+pub struct PipeWriter(Arc<Mutex<PipeState>>);
 
 fn ends(state: PipeState) -> (PipeReader, PipeWriter) {
 	let state = Arc::new(Mutex::new(PipeState { readers: 1, writers: 1, ..state }));
-	(PipeReader::new(Arc::clone(&state)), PipeWriter::new(state))
+	(PipeReader(Arc::clone(&state)), PipeWriter(state))
 }
 
 /// A new in-memory pipe of [`PIPE_CAPACITY`] bytes.
@@ -151,12 +138,13 @@ pub fn tapped_pipe(mirror: Arc<dyn PipeMirror>) -> (PipeReader, PipeWriter) {
 impl PipeReader {
 	/// Push `bytes` back ahead of the buffered data (beyond the capacity if
 	/// need be) and wake the waiters
-	/// ([`FdRef::unread`](crate::bash::FdRef::unread)). On a pipe that became
+	/// ([`FdRef::unread`](crate::bash::FdRef::unread): a host feed's held
+	/// bytes when its external ends, zcurses' input). On a pipe that became
 	/// an OS pipe they come before what the OS pipe holds, so an external
-	/// that takes the read end while they wait gets them through the host's
-	/// pump ([`File::os_handle`] is `None` until they are read).
+	/// that takes the read end while they wait is fed through the host's
+	/// pump ([`File::os_handle`] is `None`).
 	pub fn unread(&self, bytes: &[u8]) {
-		let mut s = self.state.lock();
+		let mut s = self.0.lock();
 		for &b in bytes.iter().rev() {
 			s.buf.push_front(b);
 		}
@@ -166,7 +154,7 @@ impl PipeReader {
 
 impl Drop for PipeReader {
 	fn drop(&mut self) {
-		let mut s = self.state.lock();
+		let mut s = self.0.lock();
 		s.readers -= 1;
 		if s.readers == 0 {
 			s.close_mirror();
@@ -180,7 +168,7 @@ impl Drop for PipeReader {
 
 impl Drop for PipeWriter {
 	fn drop(&mut self) {
-		let mut s = self.state.lock();
+		let mut s = self.0.lock();
 		s.writers -= 1;
 		if s.writers == 0 {
 			s.close_mirror();
@@ -192,37 +180,21 @@ impl Drop for PipeWriter {
 	}
 }
 
-/// `handle`, this engine handle's own end of the OS pipe, opened from the
-/// shell's descriptor `shared` of that end on first use.
-fn own_end<'h>(
-	handle: &'h mut Option<Box<dyn File>>,
-	shared: Option<&dyn File>,
-) -> io::Result<&'h mut Box<dyn File>> {
-	if handle.is_none() {
-		// The shell's descriptor of an end lives as long as any engine handle
-		// of that end, and the caller is one.
-		let shared = shared.ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
-		*handle = Some(shared.dup()?);
-	}
-	Ok(handle.as_mut().expect("opened above"))
-}
-
 fn unsupported<T>() -> Poll<io::Result<T>> {
 	Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
 }
 
 impl File for PipeReader {
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
-		let mut s = self.state.lock();
+		let mut s = self.0.lock();
 		if s.buf.is_empty() {
-			if let Some(os) = &s.os {
-				// An OS pipe: what it holds, through this handle's own end.
-				let end = match own_end(&mut self.os, os.read.as_deref()) {
-					Ok(end) => end,
-					Err(e) => return Poll::Ready(Err(e)),
+			if let Some(os) = &mut s.os {
+				// An OS pipe: what it holds, through the shell's end of it,
+				// which stays while this handle holds the read end.
+				return match &mut os.read {
+					Some(end) => end.poll_read(cx, buf),
+					None => Poll::Ready(Ok(0)),
 				};
-				drop(s);
-				return end.poll_read(cx, buf);
 			}
 			if s.writers == 0 {
 				return Poll::Ready(Ok(0));
@@ -259,19 +231,20 @@ impl File for PipeReader {
 		FileKind::Pipe
 	}
 
-	/// The OS pipe's read end, once the pipe became one and no byte an
-	/// engine reader gave back is waiting ahead of it.
+	/// The OS pipe's read end, once the pipe became one, unless bytes given
+	/// back wait ahead of it or an earlier external reader is fed
+	/// ([`PipeState::fed`]).
 	fn os_handle(&self) -> Option<OsHandle> {
-		let s = self.state.lock();
-		if !s.buf.is_empty() {
+		let s = self.0.lock();
+		if s.fed || !s.buf.is_empty() {
 			return None;
 		}
 		s.os.as_ref()?.read.as_ref()?.os_handle()
 	}
 
 	fn dup(&self) -> io::Result<Box<dyn File>> {
-		self.state.lock().readers += 1;
-		Ok(Box::new(Self::new(Arc::clone(&self.state))))
+		self.0.lock().readers += 1;
+		Ok(Box::new(Self(Arc::clone(&self.0))))
 	}
 }
 
@@ -281,16 +254,14 @@ impl File for PipeWriter {
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		let mut s = self.state.lock();
-		if let Some(os) = &s.os {
+		let mut s = self.0.lock();
+		if let Some(os) = &mut s.os {
 			// An OS pipe: the kernel decides room and `EPIPE`, as other
 			// processes may hold its read end.
-			let end = match own_end(&mut self.os, os.write.as_deref()) {
-				Ok(end) => end,
-				Err(e) => return Poll::Ready(Err(e)),
+			return match &mut os.write {
+				Some(end) => end.poll_write(cx, buf),
+				None => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
 			};
-			drop(s);
-			return end.poll_write(cx, buf);
 		}
 		if s.readers == 0 {
 			return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
@@ -309,11 +280,8 @@ impl File for PipeWriter {
 		Poll::Ready(Ok(n))
 	}
 
-	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		match &mut self.os {
-			Some(end) => end.poll_flush(cx),
-			None => Poll::Ready(Ok(())),
-		}
+	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
 	}
 
 	fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
@@ -326,12 +294,12 @@ impl File for PipeWriter {
 
 	/// The OS pipe's write end, once the pipe became one.
 	fn os_handle(&self) -> Option<OsHandle> {
-		self.state.lock().os.as_ref()?.write.as_ref()?.os_handle()
+		self.0.lock().os.as_ref()?.write.as_ref()?.os_handle()
 	}
 
 	fn dup(&self) -> io::Result<Box<dyn File>> {
-		self.state.lock().writers += 1;
-		Ok(Box::new(Self::new(Arc::clone(&self.state))))
+		self.0.lock().writers += 1;
+		Ok(Box::new(Self(Arc::clone(&self.0))))
 	}
 }
 
@@ -466,8 +434,8 @@ impl MemFile {
 	/// one object) and the end this is.
 	pub fn key(&self) -> (usize, MemEnd) {
 		match self {
-			Self::PipeRead(r) => (Arc::as_ptr(&r.state).addr(), MemEnd::Read),
-			Self::PipeWrite(w) => (Arc::as_ptr(&w.state).addr(), MemEnd::Write),
+			Self::PipeRead(r) => (Arc::as_ptr(&r.0).addr(), MemEnd::Read),
+			Self::PipeWrite(w) => (Arc::as_ptr(&w.0).addr(), MemEnd::Write),
 			Self::Buf(b) => (Arc::as_ptr(&b.pos).addr(), MemEnd::Whole),
 			Self::Capture(c) => (c.key(), MemEnd::Whole),
 		}
@@ -477,7 +445,7 @@ impl MemFile {
 	/// whose bytes are in the kernel and whose ends externals hold.
 	pub fn image(&self) -> Option<MemImage> {
 		Some(match self {
-			Self::PipeRead(PipeReader { state, .. }) | Self::PipeWrite(PipeWriter { state, .. }) => {
+			Self::PipeRead(PipeReader(state)) | Self::PipeWrite(PipeWriter(state)) => {
 				let s = state.lock();
 				if s.os.is_some() {
 					return None;
@@ -499,36 +467,48 @@ impl MemFile {
 	/// ([`Host::os_pipe`](crate::bash::Host::os_pipe)), so the external
 	/// inherits its end ([`File::os_handle`]) and every other end, external or
 	/// engine, uses the same pipe from then on. Engine waiters are woken to
-	/// poll it. Any other object, a pipe already shared, and a pipe `os_pipe`
-	/// declines stay as they are: the host pumps them.
+	/// poll it. Any other object, and a pipe already shared, stay as they are.
+	///
+	/// A pipe `os_pipe` declines stays in memory for good: the host pumps it to
+	/// this external, whose feed may hold bytes, and a later OS pipe would let
+	/// another external read past them. For the same reason an external that
+	/// takes the read end of an OS pipe while bytes given back wait ahead of
+	/// it makes every later external reader fed too ([`PipeState::fed`]).
 	pub fn share_with_external(
 		&self,
 		os_pipe: impl FnOnce(&[u8]) -> Option<(Box<dyn File>, Box<dyn File>)>,
 	) {
-		let state = match self {
-			Self::PipeRead(PipeReader { state, .. }) | Self::PipeWrite(PipeWriter { state, .. }) => {
-				state
-			},
+		let (state, reader) = match self {
+			Self::PipeRead(PipeReader(state)) => (state, true),
+			Self::PipeWrite(PipeWriter(state)) => (state, false),
 			Self::Buf(_) | Self::Capture(_) => return,
 		};
 		let mut s = state.lock();
-		if !s.shareable || s.os.is_some() {
+		if !s.shareable {
 			return;
 		}
-		let Some((read, write)) = os_pipe(s.buf.make_contiguous()) else {
-			return;
-		};
-		s.buf.clear();
-		let os =
-			OsEnds { read: (s.readers > 0).then_some(read), write: (s.writers > 0).then_some(write) };
-		s.os = Some(os);
-		s.wake_all();
+		if s.os.is_none() {
+			let Some((read, write)) = os_pipe(s.buf.make_contiguous()) else {
+				s.shareable = false;
+				return;
+			};
+			s.buf.clear();
+			let os = OsEnds {
+				read:  (s.readers > 0).then_some(read),
+				write: (s.writers > 0).then_some(write),
+			};
+			s.os = Some(os);
+			s.wake_all();
+		}
+		if reader && !s.buf.is_empty() {
+			s.fed = true;
+		}
 	}
 
 	/// Whether this is an end of a pipe that became an OS pipe.
 	pub fn is_os_pipe(&self) -> bool {
 		match self {
-			Self::PipeRead(PipeReader { state, .. }) | Self::PipeWrite(PipeWriter { state, .. }) => {
+			Self::PipeRead(PipeReader(state)) | Self::PipeWrite(PipeWriter(state)) => {
 				state.lock().os.is_some()
 			},
 			Self::Buf(_) | Self::Capture(_) => false,
@@ -539,12 +519,12 @@ impl MemFile {
 	pub fn dup_end(&self) -> Self {
 		match self {
 			Self::PipeRead(r) => {
-				r.state.lock().readers += 1;
-				Self::PipeRead(PipeReader::new(Arc::clone(&r.state)))
+				r.0.lock().readers += 1;
+				Self::PipeRead(PipeReader(Arc::clone(&r.0)))
 			},
 			Self::PipeWrite(w) => {
-				w.state.lock().writers += 1;
-				Self::PipeWrite(PipeWriter::new(Arc::clone(&w.state)))
+				w.0.lock().writers += 1;
+				Self::PipeWrite(PipeWriter(Arc::clone(&w.0)))
 			},
 			Self::Buf(b) => Self::Buf(MemBuf { data: Arc::clone(&b.data), pos: Arc::clone(&b.pos) }),
 			Self::Capture(c) => Self::Capture(c.clone()),
@@ -662,11 +642,11 @@ impl MemObj {
 		match (self, end) {
 			(Self::Pipe(s), MemEnd::Read) => {
 				s.lock().readers += 1;
-				Some(MemFile::PipeRead(PipeReader::new(Arc::clone(s))))
+				Some(MemFile::PipeRead(PipeReader(Arc::clone(s))))
 			},
 			(Self::Pipe(s), MemEnd::Write) => {
 				s.lock().writers += 1;
-				Some(MemFile::PipeWrite(PipeWriter::new(Arc::clone(s))))
+				Some(MemFile::PipeWrite(PipeWriter(Arc::clone(s))))
 			},
 			(Self::Buf(b), MemEnd::Whole) => {
 				Some(MemFile::Buf(MemBuf { data: Arc::clone(&b.data), pos: Arc::clone(&b.pos) }))
@@ -893,6 +873,118 @@ mod tests {
 				panic!("a write with no reader fails");
 			};
 			assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+		}
+
+		/// A waker that counts its wakes.
+		#[derive(Default)]
+		struct Count(std::sync::atomic::AtomicUsize);
+
+		impl std::task::Wake for Count {
+			fn wake(self: Arc<Self>) {
+				self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			}
+		}
+
+		impl Count {
+			fn woken(&self) -> bool {
+				self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+			}
+		}
+
+		/// Wait until `done`, failing the test after 30 s instead of hanging.
+		fn until(what: &str, done: impl Fn() -> bool) {
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			while !done() {
+				assert!(std::time::Instant::now() < deadline, "{what}: not within 30 s");
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+		}
+
+		/// Write to `w` until the OS pipe is full (the write is `Pending`).
+		fn fill(w: &mut MemFile, cx: &mut Context<'_>) {
+			let chunk = [1u8; 4096];
+			let mut put = 0usize;
+			loop {
+				match w.poll_write(cx, &chunk) {
+					Poll::Ready(Ok(n)) => put += n,
+					Poll::Ready(Err(e)) => panic!("write: {e}"),
+					Poll::Pending => return,
+				}
+				assert!(put < 16 << 20, "the pipe never filled");
+			}
+		}
+
+		// Failure mode (review finding 1): an empty write is how an extra asks
+		// whether its reader is gone (`tail -f`, `reader_gone`) or the pipe has
+		// room (`zselect -w`); on an OS pipe it answered `Ok(0)` always, where
+		// the memory pipe says `Pending` when full and `BrokenPipe` when no
+		// reader is left.
+		#[test]
+		fn an_empty_write_sees_a_full_pipe_and_a_gone_reader() {
+			let (r, w) = stage_pipe();
+			let (r, mut w) = (MemFile::from(r), MemFile::from(w));
+			w.share_with_external(os_pipe);
+			assert!(matches!(w.poll_write(&mut cx(), b""), Poll::Ready(Ok(0))), "room and a reader");
+			fill(&mut w, &mut cx());
+			assert!(w.poll_write(&mut cx(), b"").is_pending(), "a full pipe has no room");
+			drop(r);
+			let Poll::Ready(Err(e)) = w.poll_write(&mut cx(), b"") else {
+				panic!("an empty write with no reader left is a broken pipe");
+			};
+			assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+		}
+
+		// Failure mode (review finding 2): two tasks poll one handle (two
+		// extras holding clones of one fd, a host feed), each with its own
+		// waker; the second wait replaced the first, so the first task was
+		// never woken and kept the end open.
+		#[test]
+		fn every_task_waiting_on_one_handle_is_woken() {
+			let (r, w) = stage_pipe();
+			let (mut r, mut w) = (MemFile::from(r), MemFile::from(w));
+			w.share_with_external(os_pipe);
+			let (a, b) = (Arc::new(Count::default()), Arc::new(Count::default()));
+			let (wa, wb) = (Waker::from(Arc::clone(&a)), Waker::from(Arc::clone(&b)));
+			fill(&mut w, &mut Context::from_waker(&wa));
+			assert!(
+				w.poll_write(&mut Context::from_waker(&wb), b"x")
+					.is_pending()
+			);
+			drain(&mut r);
+			until("both writers woken", || a.woken() && b.woken());
+		}
+
+		// Failure mode (review finding 3): an external took the read end while
+		// bytes waited in the memory buffer, so the host feeds it through a
+		// pump that may hold some of them; a later external got the OS end
+		// and read past them.
+		#[test]
+		fn once_a_reader_is_fed_every_later_reader_is_fed() {
+			let (r, w) = stage_pipe();
+			let (mut r, w) = (MemFile::from(r), MemFile::from(w));
+			w.share_with_external(os_pipe);
+			let MemFile::PipeRead(reader) = &r else {
+				unreachable!()
+			};
+			reader.unread(b"held");
+			r.share_with_external(os_pipe);
+			assert!(r.os_handle().is_none(), "the first external is fed");
+			assert_eq!(drain(&mut r).0, b"held", "its feed took the bytes");
+			r.share_with_external(os_pipe);
+			assert!(r.os_handle().is_none(), "a later external is fed too");
+		}
+
+		// Failure mode (review finding 3): a pipe the host declined to make an
+		// OS pipe is pumped to its externals, whose feeds may hold bytes;
+		// turning it into an OS pipe later let a new external read past them.
+		#[test]
+		fn a_declined_pipe_stays_in_memory() {
+			let (r, w) = stage_pipe();
+			let (r, w) = (MemFile::from(r), MemFile::from(w));
+			r.share_with_external(|_| None);
+			assert!(!r.is_os_pipe());
+			w.share_with_external(os_pipe);
+			assert!(!w.is_os_pipe() && w.os_handle().is_none() && w.image().is_some());
 		}
 	}
 }
