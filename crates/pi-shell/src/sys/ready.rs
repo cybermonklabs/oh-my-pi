@@ -194,8 +194,22 @@ impl Poller {
 		Ok(())
 	}
 
+	/// Forgets watch `id`. One dropped before it fired is mostly its file
+	/// closing, and the thread's wait (`poll(2)`, `select(2)`) holds a
+	/// reference to every file it waits on until it returns: the thread is
+	/// woken, so it lets that file go now rather than at its next wake. A
+	/// pipe whose last reader closed then fails its writer's next write.
 	fn forget(&self, id: u64) {
-		self.entries.lock().retain(|e| e.id != id);
+		let removed = {
+			let mut entries = self.entries.lock();
+			let before = entries.len();
+			entries.retain(|e| e.id != id);
+			entries.len() != before
+		};
+		if removed && let Some(wake) = &self.wake {
+			// A full wake pipe already guarantees a rescan.
+			let _ = (&*wake).write(&[1]);
+		}
 	}
 }
 
@@ -221,6 +235,18 @@ struct Watched {
 	fd:     RawFd,
 	events: i16,
 }
+
+/// Test only: the descriptors of the readiness thread's last wait, written
+/// before it starts, and a count that is odd while the thread is in that
+/// wait's `poll(2)` call and nothing else (made odd just before the call,
+/// even as it returns). A test that reads the count odd, the descriptors,
+/// the thread asleep, and the same count again knows the thread sleeps in
+/// that `poll(2)` with those files: the call is its only way to sleep while
+/// the count is odd.
+#[cfg(all(test, not(target_os = "macos")))]
+static IN_WAIT: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+#[cfg(all(test, not(target_os = "macos")))]
+static IN_POLL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn run(mut wake: PipeReader) {
 	let mut watched: Vec<Watched> = Vec::new();
@@ -289,9 +315,16 @@ fn wait(wake: RawFd, watched: &[Watched], timeout: Option<Duration>) -> (bool, V
 		events:  w.events,
 		revents: 0,
 	}));
+	#[cfg(test)]
+	{
+		*IN_WAIT.lock() = watched.iter().map(|w| w.fd).collect();
+		IN_POLL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+	}
 	// SAFETY: `fds` holds `fds.len()` valid pollfds.
 	let n =
 		unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout(timeout)) };
+	#[cfg(test)]
+	IN_POLL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 	if n < 0 {
 		return (false, Vec::new());
 	}
@@ -479,6 +512,66 @@ mod tests {
 		let id = watch.0;
 		drop(watch);
 		assert!(!POLLER.entries.lock().iter().any(|e| e.id == id));
+	}
+
+	/// A watched read end that closes lets its pipe go at once: the waiting
+	/// thread holds a reference to every file it waits on, so a watch
+	/// dropped without waking it kept the pipe's reader alive until
+	/// something else woke the thread, and the writer went on writing into
+	/// a pipe nobody can read. In a process of its own, where nothing else
+	/// wakes the thread. Before `r` closes, the thread is known to sleep in
+	/// a `poll(2)` that holds `r`: the test reads `IN_POLL` odd, `IN_WAIT`
+	/// with `r`, the thread asleep (`S`) in procfs, then `IN_POLL` unchanged
+	/// (see `IN_POLL`). The writer side is read with a `poll(2)` for no
+	/// event, which reports `POLLERR` once the pipe has no reader; no byte is
+	/// written, since a byte would make `r` readable and wake the thread.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn closing_a_watched_read_end_gives_its_writer_a_broken_pipe() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::closing_a_watched_read_end_gives_its_writer_a_broken_pipe"),
+			|| {
+				let (r, w) = io::pipe().unwrap();
+				let watch = watch(r.as_raw_fd(), READ, Waker::noop()).unwrap();
+				let rfd = r.as_raw_fd();
+				// The readiness thread's scheduler state, from procfs.
+				let state = || -> Option<String> {
+					for task in std::fs::read_dir("/proc/self/task").ok()? {
+						let dir = task.ok()?.path();
+						let comm = std::fs::read_to_string(dir.join("comm")).ok()?;
+						if comm.trim() == "obash-ready" {
+							let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+							let (_, rest) = stat.rsplit_once(") ")?;
+							return rest.split(' ').next().map(str::to_owned);
+						}
+					}
+					None
+				};
+				let deadline = Instant::now() + Duration::from_secs(10);
+				loop {
+					let before = IN_POLL.load(std::sync::atomic::Ordering::SeqCst);
+					if before % 2 == 1 && IN_WAIT.lock().contains(&rfd) {
+						let now = state().expect("the readiness thread's state in /proc/self/task");
+						if now == "S" && IN_POLL.load(std::sync::atomic::Ordering::SeqCst) == before {
+							break;
+						}
+					}
+					assert!(Instant::now() < deadline, "the thread never slept in a poll on `r`");
+					thread::sleep(Duration::from_millis(1));
+				}
+				drop(watch);
+				drop(r);
+				let mut pfd = libc::pollfd { fd: w.as_raw_fd(), events: 0, revents: 0 };
+				// SAFETY: one valid pollfd for our open descriptor.
+				let n = unsafe { libc::poll(&raw mut pfd, 1, 2000) };
+				assert!(
+					n == 1 && pfd.revents & libc::POLLERR != 0,
+					"the pipe still had a reader 2 s after its only read end closed (poll {n}, revents \
+					 {:#x})",
+					pfd.revents
+				);
+			},
+		);
 	}
 
 	#[cfg(target_os = "linux")]

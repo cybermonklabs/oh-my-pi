@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::bash::{
-	fs::{File, FileKind, SeekFrom},
+	fs::{File, FileKind, Mark, SeekFrom},
 	host::{OsHandle, PipeMirror},
 };
 
@@ -432,11 +432,11 @@ impl File for MemFile {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<(usize, Option<u64>)>> {
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		self.file().poll_write_marked(cx, buf)
 	}
 
-	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
 		self.file().poll_settle_marked(cx, marks)
 	}
 

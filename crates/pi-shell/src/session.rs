@@ -1316,4 +1316,106 @@ mod tests {
 			"nonexistent",
 		);
 	}
+
+	/// Runs `script` with fd `gone` (1 or 2) a pipe nothing reads, on the
+	/// writer-thread route (the test's child process): what the other stream
+	/// got, and how many chunks the writer threads failed.
+	#[cfg(target_os = "linux")]
+	fn run_into_a_readerless_pipe(script: &str, gone: i32) -> (String, usize) {
+		use std::os::fd::OwnedFd;
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut s = session();
+			let (reader, readerless) = io::pipe().unwrap();
+			drop(reader);
+			let (mut other_r, other_w) = io::pipe().unwrap();
+			let other = std::thread::spawn(move || {
+				let mut text = String::new();
+				other_r.read_to_string(&mut text).unwrap();
+				text
+			});
+			let (stdout, stderr) = if gone == 1 {
+				(readerless, other_w)
+			} else {
+				(other_w, readerless)
+			};
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(OwnedFd::from(stdout))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(stderr))),
+			};
+			tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				s.run(script, stdio, CancellationToken::new()),
+			)
+			.await
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+			.unwrap();
+			let text = other.join().unwrap();
+			(text, crate::sys::CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst))
+		})
+	}
+
+	/// A builtin's output of four chunks stops at the first one that fails:
+	/// bash stops at its first failed `write(2)`. Handing off the rest sends
+	/// a FIFO's next reader the tail without the head, or blocks the builtin
+	/// on the tail before it reports the failure.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_builtin_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_builtin_stops_at_its_first_failed_chunk"),
+			|| {
+				let (errors, failed) = run_into_a_readerless_pipe(
+					"trap '' PIPE; big=$(printf '%0200000d' 0); echo \"$big\"; echo \"status=$?\" >&2",
+					1,
+				);
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert_eq!(errors.matches("Broken pipe").count(), 1, "one write error: {errors:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A diagnostic of two chunks (`Kernel::diag`, written by `flush_out`)
+	/// stops at the first one that fails, and the next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_diagnostic_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_diagnostic_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"big=$(printf '%070000d' 0); \"$big\"; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=127"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A tool's message of two chunks (`tools::Out`, `timeout`'s usage
+	/// error naming its operand) stops at the first one that fails, and the
+	/// next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_message_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tool_message_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"timeout \"$(printf '%070000d' 0)x\" true; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=125"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
 }

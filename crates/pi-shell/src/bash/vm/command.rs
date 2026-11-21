@@ -3213,7 +3213,9 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 /// [`HandedOff`](super::proc::HandedOff)): a host file's writer thread takes
 /// a chunk at once and writes it later, so the settle is where that write
 /// fails, and its error, and only its, is this command's, as a write error
-/// is.
+/// is. The chunk handed off last settles before the next one goes (the
+/// thread is idle for that hand-off anyway), so a command stops at its first
+/// failed chunk, as bash stops at its first failed `write(2)`.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
@@ -3222,11 +3224,12 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 		let handle = vp.fds.handle(fd);
 		let pending = st(vp).writes.front_mut().expect("checked");
 		let done = pending.off >= pending.bytes.len();
-		// What another object took (the fd was restored in between) is out
-		// there before the rest goes to this one.
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
 		let settled = match &pending.handed.file {
-			Some(held) if done || !held.same(&handle) => {
-				match held.poll_settle_marked(&mut tcx, &pending.handed.marks) {
+			Some(held) if done || !held.same(&handle) || pending.handed.mark.is_some() => {
+				match held.poll_settle_marked(&mut tcx, pending.handed.mark.as_slice()) {
 					Poll::Ready(result) => Some(result),
 					Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
 				}
@@ -3250,7 +3253,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
 			Poll::Ready(Ok((written, mark))) if written > 0 => {
 				pending.off += written;
-				pending.handed.marks.extend(mark);
+				pending.handed.mark = mark;
 				pending.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(res) => {

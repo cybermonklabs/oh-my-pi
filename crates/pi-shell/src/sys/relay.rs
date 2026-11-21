@@ -42,7 +42,7 @@ use std::{
 };
 
 use crate::{
-	bash::{ExitStatus, ExtProc, OsHandle, Signal},
+	bash::{ExitStatus, ExtProc, Mark, OsHandle, Signal},
 	sys::pump::{
 		BUF, BURST, End, PollIo, orphan,
 		os::{self, OsPipe, Timer},
@@ -108,6 +108,10 @@ struct Relay {
 	/// Decoded text, written into the sink up to `sent`.
 	text:     Vec<u8>,
 	sent:     usize,
+	/// The chunk of text a sink's writer thread took last
+	/// ([`End::poll_write_marked`]): settled before the next one goes, and
+	/// its failure is the sink's refusal.
+	mark:     Option<Mark>,
 	/// Bytes read from the program so far.
 	consumed: u64,
 	phase:    Phase,
@@ -126,6 +130,7 @@ impl Relay {
 			buf: vec![0; BUF].into_boxed_slice(),
 			text: Vec::new(),
 			sent: 0,
+			mark: None,
 			consumed: 0,
 			phase: Phase::Reading,
 			target: None,
@@ -136,22 +141,27 @@ impl Relay {
 	/// Forward what can move now; ready once done. Yields after a burst.
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
 		for _ in 0..BURST {
-			while self.sent < self.text.len() {
-				match std::task::ready!(self.sink.poll_write(cx, &self.text[self.sent..])) {
-					Ok(n) if n > 0 => self.sent += n,
-					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
-					_ => {
-						// Refused (the sink's reader is gone) or failed: closing
-						// our end makes that visible to the program, whose next
-						// write fails as on a pipe whose reader is gone. Nothing
-						// more reaches the sink.
-						self.pipe = None;
-						self.text.clear();
-						self.sent = 0;
-						self.phase = Phase::Done;
-						return Poll::Ready(());
+			// The chunk the sink's writer thread took last is out before the
+			// next text goes, or the flush: its failure is a refusal. While
+			// it is written the relay goes on reading.
+			match self.settle(cx) {
+				Poll::Ready(Ok(())) => {},
+				Poll::Ready(Err(_)) => return self.refused(),
+				Poll::Pending if self.sent < self.text.len() || self.phase == Phase::Flush => {
+					return Poll::Pending;
+				},
+				Poll::Pending => {},
+			}
+			if self.sent < self.text.len() {
+				match std::task::ready!(self.sink.poll_write_marked(cx, &self.text[self.sent..])) {
+					Ok((n, mark)) if n > 0 => {
+						self.sent += n;
+						self.mark = mark;
 					},
+					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+					_ => return self.refused(),
 				}
+				continue;
 			}
 			self.text.clear();
 			self.sent = 0;
@@ -184,6 +194,28 @@ impl Relay {
 		// A burst moved: let the engine run, then go on.
 		cx.waker().wake_by_ref();
 		Poll::Pending
+	}
+
+	/// Settles the chunk the sink's writer thread took last, if any.
+	fn settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		let Some(mark) = &self.mark else {
+			return Poll::Ready(Ok(()));
+		};
+		let result = std::task::ready!(self.sink.poll_settle_marked(cx, std::slice::from_ref(mark)));
+		self.mark = None;
+		Poll::Ready(result)
+	}
+
+	/// The sink refused text (its reader is gone) or failed: closing our end
+	/// makes that visible to the program, whose next write fails as on a
+	/// pipe whose reader is gone. Nothing more reaches the sink.
+	fn refused(&mut self) -> Poll<()> {
+		self.pipe = None;
+		self.text.clear();
+		self.sent = 0;
+		self.mark = None;
+		self.phase = Phase::Done;
+		Poll::Ready(())
 	}
 
 	/// The stream ended: our end of the pipe closes first, then the decoder
@@ -220,12 +252,17 @@ impl Relay {
 		}
 		// What was handed to the sink is out of the shell: a host file's
 		// writer thread takes text at once and writes it later, and the next
-		// command must come after it.
-		if self
-			.sink
-			.poll_settle(&mut Context::from_waker(cx.waker()))
-			.is_pending()
-		{
+		// command must come after it. A failed chunk is the sink's refusal.
+		let mut tcx = Context::from_waker(cx.waker());
+		match self.settle(&mut tcx) {
+			Poll::Ready(Ok(())) => {},
+			Poll::Ready(Err(_)) => {
+				let _ = self.refused();
+				return true;
+			},
+			Poll::Pending => return false,
+		}
+		if self.sink.poll_settle(&mut tcx).is_pending() {
 			return false;
 		}
 		!self.decoder.holds_bytes()
@@ -703,5 +740,215 @@ mod tests {
 		released.store(true, std::sync::atomic::Ordering::SeqCst);
 		assert!(relay.drained(&cx), "not drained once the sink had the text out");
 		drop(program);
+	}
+}
+
+/// A relay into a sink whose writer thread fails the text it took: Windows
+/// takes that route for every pipe; Linux does in the test's own process.
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod refusal_tests {
+	use std::{
+		io::Write as _,
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
+		task::Wake,
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+	use crate::sys::StdFile;
+
+	/// Passes bytes through as text.
+	struct Bytes;
+
+	impl ByteDecoder for Bytes {
+		fn push(&mut self, bytes: &[u8]) -> String {
+			String::from_utf8_lossy(bytes).into_owned()
+		}
+
+		fn holds_bytes(&self) -> bool {
+			false
+		}
+
+		fn finish(&mut self) -> String {
+			String::new()
+		}
+	}
+
+	/// Records a wake and unparks the test thread.
+	struct Woken(AtomicBool, std::thread::Thread);
+
+	impl Wake for Woken {
+		fn wake(self: Arc<Self>) {
+			self.0.store(true, Ordering::SeqCst);
+			self.1.unpark();
+		}
+	}
+
+	/// The write end of a pipe whose reader is gone, as a host file.
+	fn readerless_sink() -> End {
+		let (reader, writer) = io::pipe().unwrap();
+		drop(reader);
+		#[cfg(unix)]
+		let file = fs::File::from(std::os::fd::OwnedFd::from(writer));
+		#[cfg(windows)]
+		let file = fs::File::from(std::os::windows::io::OwnedHandle::from(writer));
+		End::File(Box::new(StdFile::new(file)))
+	}
+
+	/// Runs `body` where every `StdFile` writes through its writer thread.
+	fn on_the_writer_thread(test: &str, body: impl FnOnce()) {
+		#[cfg(target_os = "linux")]
+		crate::sys::in_blocking_writer_process(test, body);
+		#[cfg(windows)]
+		{
+			let _ = test;
+			body();
+		}
+	}
+
+	// Failure mode: the sink's writer thread took the relay's text and then
+	// failed to write it (the capture's reader is gone, as when the host
+	// stops draining a background program's output), and the relay went on:
+	// the program never got its broken pipe, and it and its relay ran on. The
+	// relay settles the chunk it handed off, takes the failure as the sink's
+	// refusal and closes our end of the program's pipe, so the program's next
+	// write fails as one straight into the capture would.
+	#[test]
+	fn a_relay_whose_sink_fails_a_chunk_closes_the_programs_pipe() {
+		on_the_writer_thread(
+			concat!(module_path!(), "::a_relay_whose_sink_fails_a_chunk_closes_the_programs_pipe"),
+			|| {
+				let (pipe, mut program) = os::pipe(false).unwrap();
+				program.write_all(b"abc").unwrap();
+				let mut relay = Relay::new(pipe, Box::new(Bytes), readerless_sink());
+				// Polled again only once its waker was woken, so a relay that
+				// waits on its sink's settle without a wake registered fails.
+				let woken = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+				let waker = Waker::from(Arc::clone(&woken));
+				let mut cx = Context::from_waker(&waker);
+				let start = Instant::now();
+				while relay.poll(&mut cx).is_pending() {
+					while !woken.0.swap(false, Ordering::SeqCst) {
+						assert!(
+							start.elapsed() < Duration::from_secs(5),
+							"the relay was not woken to take the sink's refusal: {} bytes read, its pipe \
+							 {}",
+							relay.consumed,
+							if relay.pipe.is_some() {
+								"open"
+							} else {
+								"closed"
+							}
+						);
+						std::thread::park_timeout(Duration::from_millis(50));
+					}
+				}
+				assert_eq!(relay.consumed, 3);
+				assert!(relay.pipe.is_none(), "the relay ended with the program's pipe open");
+				// The readiness thread lets our end go once it wakes from its
+				// wait, which the end's drop asks for.
+				let start = Instant::now();
+				loop {
+					match program.write(b"d") {
+						Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
+						Ok(_) => assert!(
+							start.elapsed() < Duration::from_secs(2),
+							"the program still wrote 2 s after the refusal"
+						),
+						Err(e) => panic!("the program's write after the refusal: {e}"),
+					}
+					std::thread::sleep(Duration::from_millis(5));
+				}
+			},
+		);
+	}
+
+	// Failure mode: the relay handed text to its sink's writer thread, which
+	// waited on a full pipe, and then the pipe's reader left: the thread's
+	// write failed, and nothing woke the relay to settle it, so it slept with
+	// the program's pipe open. Here the relay is known to have handed that
+	// chunk off (`Pending` with the program's three bytes read: it hands off
+	// what it reads in the same poll, to a writer thread that is idle) while
+	// the pipe has no room for it, before the reader leaves, and it is polled
+	// again only once its waker was woken.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_relay_waiting_on_its_sinks_chunk_is_woken_when_the_chunk_fails() {
+		use std::os::unix::fs::OpenOptionsExt;
+
+		on_the_writer_thread(
+			concat!(
+				module_path!(),
+				"::a_relay_waiting_on_its_sinks_chunk_is_woken_when_the_chunk_fails"
+			),
+			|| {
+				let dir = tempfile::tempdir().unwrap();
+				let path = dir.path().join("sink");
+				let made = std::process::Command::new("mkfifo")
+					.arg(&path)
+					.status()
+					.unwrap();
+				assert!(made.success(), "mkfifo: {made}");
+				let held = fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				let mut filler = fs::OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				// Full to the byte: 4096-byte writes, then single bytes, until
+				// the pipe takes none.
+				for size in [4096, 1] {
+					loop {
+						match filler.write(&vec![b'F'; size]) {
+							Ok(_) => {},
+							Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+							Err(e) => panic!("filling the sink: {e}"),
+						}
+					}
+				}
+				let sink = fs::OpenOptions::new().write(true).open(&path).unwrap();
+				let (pipe, mut program) = os::pipe(false).unwrap();
+				program.write_all(b"abc").unwrap();
+				let mut relay =
+					Relay::new(pipe, Box::new(Bytes), End::File(Box::new(StdFile::new(sink))));
+				let woken = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+				let waker = Waker::from(Arc::clone(&woken));
+				let mut cx = Context::from_waker(&waker);
+				let wait_for_wake = |what: &str| {
+					let start = Instant::now();
+					while !woken.0.swap(false, Ordering::SeqCst) {
+						assert!(
+							start.elapsed() < Duration::from_secs(5),
+							"the relay was not woken: {what}"
+						);
+						std::thread::park_timeout(Duration::from_millis(50));
+					}
+				};
+				// Until the program's text is with the writer thread, which
+				// waits on the full pipe.
+				loop {
+					assert!(relay.poll(&mut cx).is_pending(), "the relay ended with its sink full");
+					if relay.consumed == 3 {
+						break;
+					}
+					wait_for_wake("for the program's text");
+				}
+				woken.0.store(false, Ordering::SeqCst);
+				drop(held);
+				wait_for_wake("when its sink's chunk failed");
+				while relay.poll(&mut cx).is_pending() {
+					wait_for_wake("to take the sink's refusal");
+				}
+				assert!(relay.pipe.is_none(), "the relay ended with the program's pipe open");
+				drop(filler);
+			},
+		);
 	}
 }

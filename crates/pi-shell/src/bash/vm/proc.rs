@@ -996,16 +996,18 @@ impl PendingWrite {
 }
 
 /// Where a [`PendingWrite`]'s bytes went once handed off: the object that
-/// took them, and the marks of the chunks its writer thread took
-/// ([`crate::bash::File::poll_write_marked`]). The entry is done once that
-/// object has settled those chunks: the fd may name another object by then (a
-/// redirection restored in between), and another writer on the same object
-/// may have chunks of its own in flight. Live state of one host file: not
-/// saved, and not part of the entry's value.
+/// took them, and the [`Mark`](crate::bash::Mark) of the chunk its writer
+/// thread took last ([`crate::bash::File::poll_write_marked`]). The writer
+/// settles that chunk before it hands the next one to the same object, so
+/// it stops at its first failed chunk and holds one mark at most; the entry
+/// is done once its last chunk has settled. The fd may name another object
+/// by then (a redirection restored in between), and another writer on the
+/// same object may have chunks of its own in flight. Live state of one host
+/// file: not saved, and not part of the entry's value.
 #[derive(Clone, Debug, Default)]
 pub struct HandedOff {
-	pub file:  Option<crate::bash::FdRef>,
-	pub marks: Vec<u64>,
+	pub file: Option<crate::bash::FdRef>,
+	pub mark: Option<crate::bash::Mark>,
 }
 
 impl PartialEq for HandedOff {

@@ -442,6 +442,9 @@ pub struct Refusal {
 	stderr:    FdRef,
 	message:   Vec<u8>,
 	written:   usize,
+	/// The chunk of the message a writer thread took last: settled before
+	/// the next one goes ([`crate::bash::File::poll_settle_marked`]).
+	mark:      Option<crate::bash::Mark>,
 	/// A cancelling signal arrived: end now, settled or not.
 	cancelled: bool,
 }
@@ -451,16 +454,36 @@ impl Refusal {
 	pub(crate) fn new(name: &[u8], stderr: FdRef) -> Self {
 		let mut message = name.to_vec();
 		message.extend_from_slice(b": not available in this shell\n");
-		Self { stderr, message, written: 0, cancelled: false }
+		Self { stderr, message, written: 0, mark: None, cancelled: false }
 	}
 }
 
 impl Task for Refusal {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<i32> {
-		while !self.cancelled && self.written < self.message.len() {
-			match self.stderr.poll_write(cx, &self.message[self.written..]) {
-				Poll::Ready(Ok(n)) if n > 0 => self.written += n,
+		while !self.cancelled {
+			if let Some(mark) = &self.mark {
+				let settled = std::task::ready!(
+					self
+						.stderr
+						.poll_settle_marked(cx, std::slice::from_ref(mark))
+				);
+				self.mark = None;
 				// A closed or failing stderr loses the message.
+				if settled.is_err() {
+					return Poll::Ready(1);
+				}
+			}
+			if self.written >= self.message.len() {
+				break;
+			}
+			match self
+				.stderr
+				.poll_write_marked(cx, &self.message[self.written..])
+			{
+				Poll::Ready(Ok((n, mark))) if n > 0 => {
+					self.written += n;
+					self.mark = mark;
+				},
 				Poll::Ready(_) => return Poll::Ready(1),
 				Poll::Pending => return Poll::Pending,
 			}

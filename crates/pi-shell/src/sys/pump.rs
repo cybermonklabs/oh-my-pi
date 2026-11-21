@@ -50,7 +50,7 @@ use parking_lot::Mutex;
 
 use self::os::OsPipe;
 use crate::{
-	bash::{FdRef, File},
+	bash::{FdRef, File, Mark},
 	sys::lifecycle::Tracker,
 };
 
@@ -76,7 +76,7 @@ impl End {
 	pub fn direction(&mut self) -> (bool, bool) {
 		let mut cx = Context::from_waker(Waker::noop());
 		let readable = !matches!(self.poll_read(&mut cx, &mut []), Poll::Ready(Err(_)));
-		let writable = !matches!(self.poll_write(&mut cx, &[]), Poll::Ready(Err(_)));
+		let writable = !matches!(self.poll_write_marked(&mut cx, &[]), Poll::Ready(Err(_)));
 		(readable, writable)
 	}
 }
@@ -84,8 +84,20 @@ impl End {
 /// Pollable I/O on either side of a pump.
 pub(super) trait PollIo {
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+	/// A write, with the mark of the chunk a writer thread took
+	/// ([`File::poll_write_marked`]; `None` when it wrote as it took).
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>>;
+	/// Ready once the chunks of `marks` are out, with their first error
+	/// ([`File::poll_settle_marked`]).
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>>;
+	/// Moves on what this side took and has not written out yet (a zsh
+	/// multios tee moves its queue only when polled): `Ready` once it is out.
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
 impl PollIo for End {
@@ -96,24 +108,33 @@ impl PollIo for End {
 		}
 	}
 
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		match self {
-			Self::Fd(f) => f.poll_write(cx, buf),
-			Self::File(f) => f.poll_write(cx, buf),
-		}
-	}
-
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		match self {
 			Self::Fd(f) => f.poll_flush(cx),
 			Self::File(f) => f.poll_flush(cx),
 		}
 	}
-}
 
-impl End {
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self {
+			Self::Fd(f) => f.poll_write_marked(cx, buf),
+			Self::File(f) => f.poll_write_marked(cx, buf),
+		}
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		match self {
+			Self::Fd(f) => f.poll_settle_marked(cx, marks),
+			Self::File(f) => f.poll_settle_marked(cx, marks),
+		}
+	}
+
 	/// Ready once the writes this end took are out ([`File::poll_settle`]).
-	pub(super) fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		match self {
 			Self::Fd(f) => f.poll_settle(cx),
 			Self::File(f) => f.poll_settle(cx),
@@ -126,12 +147,31 @@ impl PollIo for OsPipe {
 		Self::poll_read(self, cx, buf)
 	}
 
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		Self::poll_write(self, cx, buf)
+	/// Our end of an OS pipe writes as it takes: no mark.
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		Self::poll_write(self, cx, buf).map_ok(|n| (n, None))
+	}
+
+	fn poll_settle_marked(
+		&mut self,
+		_cx: &mut Context<'_>,
+		_marks: &[Mark],
+	) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		Self::poll_flush(self, cx)
+	}
+
+	/// Our end of an OS pipe writes as it takes, or its own in-flight
+	/// write goes on by itself.
+	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
 	}
 }
 
@@ -147,11 +187,14 @@ struct Chunk {
 	end:   usize,
 	/// The source ended (end of file or an error): flush, then done.
 	eof:   bool,
+	/// The chunk a writer thread of `dst` took last: settled before the next
+	/// one goes, and its failure is `dst`'s refusal.
+	mark:  Option<Mark>,
 }
 
 impl Chunk {
 	fn new() -> Self {
-		Self { buf: vec![0; BUF].into_boxed_slice(), start: 0, end: 0, eof: false }
+		Self { buf: vec![0; BUF].into_boxed_slice(), start: 0, end: 0, eof: false, mark: None }
 	}
 
 	/// Read but not written yet.
@@ -159,9 +202,21 @@ impl Chunk {
 		&self.buf[self.start..self.end]
 	}
 
+	/// Settles the chunk `dst` took last, if any: `Ready(false)` when it
+	/// failed.
+	fn settle(&mut self, cx: &mut Context<'_>, dst: &mut impl PollIo) -> Poll<bool> {
+		let Some(mark) = &self.mark else {
+			return Poll::Ready(true);
+		};
+		let settled = std::task::ready!(dst.poll_settle_marked(cx, std::slice::from_ref(mark)));
+		self.mark = None;
+		Poll::Ready(settled.is_ok())
+	}
+
 	/// Copy `src` into `dst`. Ready once done: `src` ended and `dst` was
-	/// flushed, or `dst` refused bytes (`EPIPE`, a failed object). Yields
-	/// after [`BURST`] steps.
+	/// flushed, or `dst` refused bytes (`EPIPE`, a failed object, a chunk a
+	/// writer thread of `dst` failed). The chunk `dst` took last settles
+	/// before the next one goes. Yields after [`BURST`] steps.
 	fn poll_copy(
 		&mut self,
 		cx: &mut Context<'_>,
@@ -171,10 +226,23 @@ impl Chunk {
 		for _ in 0..BURST {
 			if self.start == self.end {
 				if self.eof {
+					let _ = std::task::ready!(self.settle(cx, dst));
 					let _ = std::task::ready!(dst.poll_flush(cx));
 					return Poll::Ready(());
 				}
-				match std::task::ready!(src.poll_read(cx, &mut self.buf)) {
+				let read = match src.poll_read(cx, &mut self.buf) {
+					Poll::Ready(read) => read,
+					Poll::Pending => {
+						// Nothing to copy now: what `dst` took moves on out
+						// meanwhile (a tee moves its queue only when polled).
+						if self.settle(cx, dst) == Poll::Ready(false) {
+							return Poll::Ready(());
+						}
+						let _ = dst.poll_settle(cx);
+						return Poll::Pending;
+					},
+				};
+				match read {
 					Ok(0) => self.eof = true,
 					Ok(n) => {
 						self.start = 0;
@@ -185,8 +253,14 @@ impl Chunk {
 				}
 				continue;
 			}
-			match std::task::ready!(dst.poll_write(cx, &self.buf[self.start..self.end])) {
-				Ok(n) if n > 0 => self.start += n,
+			if !std::task::ready!(self.settle(cx, dst)) {
+				return Poll::Ready(());
+			}
+			match std::task::ready!(dst.poll_write_marked(cx, &self.buf[self.start..self.end])) {
+				Ok((n, mark)) if n > 0 => {
+					self.start += n;
+					self.mark = mark;
+				},
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
 				// The reader is gone (EPIPE) or the object failed.
 				_ => return Poll::Ready(()),
@@ -642,6 +716,44 @@ mod tests {
 		let mut rest = Vec::new();
 		(&child).read_to_end(&mut rest).unwrap();
 		assert!(rest.is_empty(), "the child reads end of file");
+	}
+
+	// Failure mode: a pump into a host file whose writer thread failed a
+	// chunk (its reader gone) wrote on with plain writes, which see no
+	// hand-off error: it handed off chunk after chunk of the program's output
+	// until the program ended. The pump writes with marks, settles the chunk
+	// it handed off last before the next, and stops at the first failed one.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_pump_stops_at_the_first_chunk_its_destination_failed() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_pump_stops_at_the_first_chunk_its_destination_failed"),
+			|| {
+				let (reader, writer) = io::pipe().unwrap();
+				drop(reader);
+				let file = fs::File::from(std::os::fd::OwnedFd::from(writer));
+				let mut dst = End::File(Box::new(crate::sys::StdFile::new(file)));
+				let (mut src, program) = os::pipe(false).unwrap();
+				let writes = std::thread::spawn(move || {
+					// Four chunks' worth; the write ends once the pump stops
+					// and our end of its pipe closes.
+					let _ = std::io::Write::write_all(&mut &program, &vec![b'x'; 4 * BUF]);
+				});
+				let mut chunk = Chunk::new();
+				let woken = Arc::new(Woken::default());
+				let waker = Waker::from(Arc::clone(&woken));
+				let mut cx = Context::from_waker(&waker);
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				while chunk.poll_copy(&mut cx, &mut src, &mut dst).is_pending() {
+					assert!(std::time::Instant::now() < deadline, "the pump never stopped");
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				}
+				drop(src);
+				writes.join().unwrap();
+				let failed = crate::sys::CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst);
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
 	}
 
 	#[derive(Default)]

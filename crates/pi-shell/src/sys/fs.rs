@@ -41,7 +41,7 @@ use std::{
 use bstr::{BStr, BString, ByteSlice};
 
 use crate::bash::{
-	DirEntry, DirIter, File, FileKind, Fs, FsPoll, OpenFlags, OsHandle, Stat, StdFd,
+	DirEntry, DirIter, File, FileKind, Fs, FsPoll, Mark, OpenFlags, OsHandle, Stat, StdFd,
 	fs::{Access, StatKind, TempNode, TempPurpose},
 };
 
@@ -107,31 +107,27 @@ pub(crate) const BLOCKING_WRITE_CHUNK: usize = 64 << 10;
 /// runs next (an external that inherits the descriptor, another writer on
 /// the same pipe) comes after them.
 ///
-/// Each chunk handed off gets the next mark. A chunk that fails keeps its
-/// error under its mark until the writer that handed it off takes it, by
-/// settling with the marks of its own chunks ([`File::poll_settle_marked`]);
-/// a flush, which the engine makes before it closes the descriptor, takes
-/// what no writer took. No other write sees it: every later write is made,
-/// as every later `write(2)` is (a FIFO whose reader came back takes it), and
-/// a writer gets the errors of its own chunks only.
+/// Each chunk handed off gets a [`Mark`], which keeps the chunk's result.
+/// A writer that hands chunks off ([`File::poll_write_marked`]) holds their
+/// marks and takes its chunks' errors by settling with them
+/// ([`File::poll_settle_marked`]); an engine writer settles a chunk before
+/// it hands off the next one to the same object, so it stops at its first
+/// failed chunk, as a writer stops at its first failed `write(2)`, and never
+/// has more than one mark in flight. A chunk's error reaches no other writer,
+/// settle or flush: a plain write ([`File::poll_write`]) drops its mark and
+/// with it the chunk's error, and every engine writer whose bytes can reach
+/// this thread writes with marks. Every later write is made, as every later
+/// `write(2)` is (a FIFO whose reader came back takes it).
 #[derive(Debug)]
 struct BlockingWriter {
-	jobs:  std::sync::mpsc::Sender<(u64, Vec<u8>)>,
+	jobs:  std::sync::mpsc::Sender<(Mark, Vec<u8>)>,
 	state: Arc<parking_lot::Mutex<WriterState>>,
 }
-
-/// The most failed chunks whose errors are kept for their writers; past it
-/// the oldest is dropped (its writer never settled).
-const KEPT_ERRORS: usize = 64;
 
 #[derive(Debug, Default)]
 struct WriterState {
 	/// The thread is writing a chunk.
 	busy:   bool,
-	/// Chunks handed off so far: the mark of the latest.
-	handed: u64,
-	/// Errors of failed chunks that no writer took yet, by mark.
-	failed: std::collections::BTreeMap<u64, io::Error>,
 	/// Writers and settles to wake when the thread is idle again.
 	wakers: Vec<Waker>,
 }
@@ -139,7 +135,7 @@ struct WriterState {
 impl BlockingWriter {
 	fn start(file: &fs::File) -> io::Result<Self> {
 		let mut file = file.try_clone()?;
-		let (jobs, queue) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+		let (jobs, queue) = std::sync::mpsc::channel::<(Mark, Vec<u8>)>();
 		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
 		let shared = Arc::clone(&state);
 		std::thread::Builder::new()
@@ -149,15 +145,16 @@ impl BlockingWriter {
 				// Ends once the `StdFile` is dropped and the last chunk is done.
 				while let Ok((mark, bytes)) = queue.recv() {
 					let result = write_all_waiting(&mut file, &bytes);
+					#[cfg(all(test, target_os = "linux"))]
+					if result.is_err() {
+						CHUNKS_FAILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					}
 					let wakers = {
 						let mut s = shared.lock();
+						// Under the lock a settle checks the mark under, so no
+						// settle misses the wake.
+						mark.finish(result);
 						s.busy = false;
-						if let Err(e) = result {
-							s.failed.insert(mark, e);
-							while s.failed.len() > KEPT_ERRORS {
-								s.failed.pop_first();
-							}
-						}
 						std::mem::take(&mut s.wakers)
 					};
 					for waker in wakers {
@@ -169,18 +166,17 @@ impl BlockingWriter {
 	}
 
 	/// Hands off a chunk of `buf`: `Ready` with its length and its mark.
-	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<(usize, u64)>> {
+	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<(usize, Mark)>> {
 		let mut s = self.state.lock();
 		if s.busy {
 			register(&mut s.wakers, cx);
 			return Poll::Pending;
 		}
 		let chunk = &buf[..buf.len().min(BLOCKING_WRITE_CHUNK)];
-		let mark = s.handed + 1;
-		if self.jobs.send((mark, chunk.to_vec())).is_err() {
+		let mark = Mark::new();
+		if self.jobs.send((mark.clone(), chunk.to_vec())).is_err() {
 			return Poll::Ready(Err(io::Error::other("the writer thread stopped")));
 		}
-		s.handed = mark;
 		s.busy = true;
 		Poll::Ready(Ok((chunk.len(), mark)))
 	}
@@ -196,37 +192,24 @@ impl BlockingWriter {
 		Poll::Ready(())
 	}
 
-	/// `Ready` once every chunk up to the last of `marks` is done, with the
-	/// error of the first of these chunks that failed, which it takes.
-	fn poll_settle_marked(&self, cx: &Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
-		let mut s = self.state.lock();
-		let done = s.handed - u64::from(s.busy);
-		if marks.iter().any(|&mark| mark > done) {
-			register(&mut s.wakers, cx);
-			return Poll::Pending;
-		}
-		let mut first = None;
-		for mark in marks {
-			if let Some(e) = s.failed.remove(mark)
-				&& first.is_none()
-			{
-				first = Some(e);
+	/// `Ready` once the chunks of `marks` are done, with the first of their
+	/// errors; it takes all of them.
+	fn poll_settle_marked(&self, cx: &Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		{
+			let mut s = self.state.lock();
+			if marks.iter().any(|mark| !mark.is_done()) {
+				register(&mut s.wakers, cx);
+				return Poll::Pending;
 			}
 		}
-		Poll::Ready(first.map_or(Ok(()), Err))
-	}
-
-	/// `Ready` once the thread is idle, with the first error no writer took
-	/// (all of them are taken).
-	fn poll_drain(&self, cx: &Context<'_>) -> Poll<io::Result<()>> {
-		let mut s = self.state.lock();
-		if s.busy {
-			register(&mut s.wakers, cx);
-			return Poll::Pending;
+		let mut first = Ok(());
+		for mark in marks {
+			let result = mark.take_error();
+			if first.is_ok() {
+				first = result;
+			}
 		}
-		let first = s.failed.pop_first().map(|(_, e)| e);
-		s.failed.clear();
-		Poll::Ready(first.map_or(Ok(()), Err))
+		Poll::Ready(first)
 	}
 
 	/// Test only: whether no chunk is being written.
@@ -267,6 +250,12 @@ fn write_all_waiting(file: &mut fs::File, mut bytes: &[u8]) -> io::Result<()> {
 /// can drain only after the retry branch has run.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) static WOULD_BLOCK_SEEN: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+/// Test only: how many chunks writer threads failed to write, so a test
+/// can tell how many chunks a writer handed off after its first failed one.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static CHUNKS_FAILED: std::sync::atomic::AtomicUsize =
 	std::sync::atomic::AtomicUsize::new(0);
 
 /// Waits, on the writer thread, until a non-blocking descriptor may take a
@@ -542,7 +531,7 @@ impl StdFile {
 		&mut self,
 		cx: &Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<(usize, u64)>> {
+	) -> Poll<io::Result<(usize, Mark)>> {
 		if self.writer.is_none() {
 			match BlockingWriter::start(&self.file) {
 				Ok(writer) => self.writer = Some(writer),
@@ -576,7 +565,7 @@ impl StdFile {
 		&mut self,
 		cx: &Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<Option<u64>>> {
+	) -> Poll<io::Result<Option<Mark>>> {
 		if buf.len() > crate::sys::ready::WRITE_CHUNK {
 			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
 		}
@@ -623,7 +612,7 @@ impl StdFile {
 		&mut self,
 		cx: &Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<Option<u64>>> {
+	) -> Poll<io::Result<Option<Mark>>> {
 		if buf.len() > BLOCKING_WRITE_CHUNK {
 			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
 		}
@@ -718,6 +707,9 @@ impl File for StdFile {
 		Poll::Ready(self.file.read(buf))
 	}
 
+	/// A plain write: a chunk handed to the writer thread is the write's
+	/// mark's alone, and this drops it, so the chunk's error is lost. Every
+	/// engine writer whose bytes can reach the thread writes with marks.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		self.poll_write_marked(cx, buf).map_ok(|(n, _)| n)
 	}
@@ -726,7 +718,7 @@ impl File for StdFile {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<(usize, Option<u64>)>> {
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		#[cfg(unix)]
 		if self.gated(true) && !buf.is_empty() {
 			#[cfg(target_os = "linux")]
@@ -749,14 +741,11 @@ impl File for StdFile {
 		Poll::Ready(self.file.write(buf).map(|n| (n, None)))
 	}
 
-	/// Waits for the writer thread, and gives the first error of a chunk no
-	/// writer took: the engine flushes before it closes the descriptor, so a
-	/// failure of the last write before the close is reported there.
+	/// Waits for the writer thread. It takes no chunk's error: each is the
+	/// error of the writer that holds the chunk's mark.
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		if let Some(writer) = &self.writer
-			&& let Err(e) = std::task::ready!(writer.poll_drain(cx))
-		{
-			return Poll::Ready(Err(e));
+		if let Some(writer) = &self.writer {
+			std::task::ready!(writer.poll_settle(cx));
 		}
 		Poll::Ready(self.file.flush())
 	}
@@ -768,7 +757,7 @@ impl File for StdFile {
 		}
 	}
 
-	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
 		match &self.writer {
 			Some(writer) => writer.poll_settle_marked(cx, marks),
 			None => Poll::Ready(Ok(())),
@@ -1956,7 +1945,8 @@ mod tests {
 					let Poll::Ready(Ok((2, Some(a_mark)))) = a else {
 						panic!("A: {a:?}")
 					};
-					settled(&mut writer, &flag, &mut cx, &[a_mark]).expect("A's chunk is out");
+					settled(&mut writer, &flag, &mut cx, std::slice::from_ref(&a_mark))
+						.expect("A's chunk is out");
 					// Writer B hands off its line; the pipe is full, so it waits.
 					let b = write_marked(&mut writer, &mut cx, b"b\n");
 					let Poll::Ready(Ok((2, Some(b_mark)))) = b else {
@@ -2036,13 +2026,143 @@ mod tests {
 			);
 		}
 
+		/// A plain write never takes a marked writer's error: A (marked) fails
+		/// and has not settled; the plain write after it hands off its own
+		/// chunk, and A's settle still finds A's error.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_plain_write_never_takes_a_marked_writers_error() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_plain_write_never_takes_a_marked_writers_error"),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a plain write beside a marked one", Duration::from_secs(5));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let plain = loop {
+						match writer.poll_write(&mut cx, b"p\n") {
+							Poll::Pending => flag.wait("the writer thread finished A's chunk"),
+							done => break done,
+						}
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert!(
+						matches!(plain, Poll::Ready(Ok(2))),
+						"the plain write took A's error: {plain:?}"
+					);
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's settle lost A's error: {a_done:?}"
+					);
+				},
+			);
+		}
+
+		/// A failed chunk's error waits for its writer however many chunks of
+		/// other writers fail before it settles: nothing evicts it. A's chunk
+		/// fails; a hundred other writers' chunks fail and none of them has
+		/// settled yet; A's settle finds A's error.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_failed_chunks_error_waits_for_its_writer_however_many_chunks_fail_after_it() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_failed_chunks_error_waits_for_its_writer_however_many_chunks_fail_after_it"
+				),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a hundred failed chunks", Duration::from_secs(20));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let mut others = Vec::new();
+					while others.len() < 100 {
+						match write_marked(&mut writer, &mut cx, b"o\n") {
+							Poll::Ready(Ok((2, Some(mark)))) => others.push(mark),
+							Poll::Pending => flag.wait("the writer thread finished a chunk"),
+							other => panic!("another writer's chunk: {other:?}"),
+						}
+					}
+					// Every chunk is done before A settles.
+					while writer.poll_settle(&mut cx).is_pending() {
+						flag.wait("the writer thread finished the last chunk");
+					}
+					let failed = CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst);
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert_eq!(failed, 101, "every chunk had no reader");
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's error was dropped before A settled: {a_done:?}"
+					);
+					for mark in &others {
+						assert!(
+							settled(&mut writer, &flag, &mut cx, std::slice::from_ref(mark)).is_err()
+						);
+					}
+				},
+			);
+		}
+
+		/// A flush takes no marked writer's error: when a tee flushes fd 3
+		/// before a background `printf a >&3` settles, `printf` keeps its own
+		/// failure.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_flush_takes_no_marked_writers_error() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_flush_takes_no_marked_writers_error"),
+				|| {
+					let (reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					drop(reader);
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a flush beside a marked writer", Duration::from_secs(5));
+					let Poll::Ready(Ok((2, Some(a)))) = write_marked(&mut writer, &mut cx, b"a\n")
+					else {
+						panic!("A was not handed off")
+					};
+					let flushed = loop {
+						match writer.poll_flush(&mut cx) {
+							Poll::Ready(result) => break result,
+							Poll::Pending => flag.wait("the writer thread went idle"),
+						}
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a]);
+					drop(finished);
+					assert!(flushed.is_ok(), "the flush took A's error: {flushed:?}");
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"A's settle lost A's error to the flush: {a_done:?}"
+					);
+				},
+			);
+		}
+
 		/// Hands `buf` to `writer`: what it took and its chunk's mark.
 		#[cfg(target_os = "linux")]
 		fn write_marked(
 			writer: &mut StdFile,
 			cx: &mut Context<'_>,
 			buf: &[u8],
-		) -> Poll<io::Result<(usize, Option<u64>)>> {
+		) -> Poll<io::Result<(usize, Option<Mark>)>> {
 			writer.poll_write_marked(cx, buf)
 		}
 
@@ -2052,7 +2172,7 @@ mod tests {
 			writer: &mut StdFile,
 			flag: &Flag,
 			cx: &mut Context<'_>,
-			marks: &[u64],
+			marks: &[Mark],
 		) -> io::Result<()> {
 			loop {
 				match writer.poll_settle_marked(cx, marks) {

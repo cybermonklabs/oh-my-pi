@@ -677,25 +677,29 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// external that inherits the fd, a builtin writing to another fd of the
 /// same pipe) comes after it. That object, not whatever the fd names by
 /// then: a failed compound redirection restores the fds between the write
-/// and the settle. Write errors on a diagnostic stream are dropped, as bash
-/// does.
+/// and the settle. The chunk handed off last settles before the next one
+/// goes, and an entry stops at its first failed chunk; write errors on a
+/// diagnostic stream are dropped, as bash does.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	let mut cx = Context::from_waker(&k.waker);
 	while let Some(w) = vp.out.front_mut() {
 		let handle = vp.fds.handle(w.fd);
 		let done = w.off >= w.bytes.len();
-		// What another object took (the fd was restored in between) is out
-		// there before the rest goes to this one.
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
 		if let Some(held) = &w.handed.file
-			&& (done || !held.same(&handle))
+			&& (done || !held.same(&handle) || w.handed.mark.is_some())
 		{
-			if held
-				.poll_settle_marked(&mut cx, &w.handed.marks)
-				.is_pending()
-			{
+			let Poll::Ready(settled) = held.poll_settle_marked(&mut cx, w.handed.mark.as_slice())
+			else {
 				return Some(w.fd);
-			}
+			};
 			w.handed = super::proc::HandedOff::default();
+			if settled.is_err() {
+				vp.out.pop_front();
+				continue;
+			}
 		}
 		if done {
 			vp.out.pop_front();
@@ -704,7 +708,7 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
 			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
-				w.handed.marks.extend(mark);
+				w.handed.mark = mark;
 				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
