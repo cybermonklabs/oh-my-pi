@@ -1234,4 +1234,28 @@ mod windows {
 		assert!(!outside.join("f").exists(), "open_at made f in the link's target ({opened:?})");
 		assert!(made.is_err() && opened.is_err(), "{made:?} {opened:?}");
 	}
+
+	/// A handle on a volume with no drive letter makes its path-based calls
+	/// through the volume's GUID path (`\\?\Volume{...}\`), where the final
+	/// path in drive-letter form does not exist: a directory made there is
+	/// found where it was asked, and the handle stats it. A run that has such
+	/// a volume names its root in `PI_VFS_TEST_DRIVELESS_DIR`.
+	#[test]
+	fn a_handle_on_a_volume_with_no_drive_letter_makes_its_calls_there() {
+		let Some(root_path) = std::env::var_os("PI_VFS_TEST_DRIVELESS_DIR").map(PathBuf::from) else {
+			eprintln!(
+				"UNKNOWN: PI_VFS_TEST_DRIVELESS_DIR names no volume without a drive letter; nothing \
+				 was checked"
+			);
+			return;
+		};
+		let name = format!("pi-vfs-guid-{}", std::process::id());
+		let made = root_path.join(&name);
+		let _ = std::fs::remove_dir_all(&made);
+		let root = BlockingFs::native().open_dir(&root_path, true).unwrap();
+		root.create_dir_at(OsStr::new(&name), None).unwrap();
+		assert!(made.is_dir(), "{} was not made", made.display());
+		assert!(root.stat_at(OsStr::new(&name), false).unwrap().is_dir());
+		std::fs::remove_dir(&made).unwrap();
+	}
 }
