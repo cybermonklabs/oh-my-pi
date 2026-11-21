@@ -1824,6 +1824,33 @@ mod tests {
 			);
 		}
 
+		/// A file that was ready and fills up again is waited on again: the
+		/// watch that woke the first wait has fired, and the next task to wait
+		/// registers a new one.
+		#[test]
+		fn a_wait_after_the_file_was_ready_is_woken() {
+			let mut fifo = FullFifo::new();
+			let first = Arc::new(Flag::default());
+			assert!(write_with(&mut fifo.writer, &first, b"x").is_pending(), "no room");
+			fifo.drain();
+			first.wait("the first writer woken by the drain");
+			// Fill it again through the same file, a byte at a time (a byte
+			// always fits when the file is ready), until a write waits.
+			let second = Arc::new(Flag::default());
+			let mut written = 0usize;
+			loop {
+				match write_with(&mut fifo.writer, &second, b"y") {
+					Poll::Ready(Ok(1)) => written += 1,
+					Poll::Pending => break,
+					other => panic!("refilling the FIFO: {other:?} after {written} bytes"),
+				}
+			}
+			assert!(written > 0, "the drain made room");
+			fifo.drain();
+			second
+				.wait("the second writer, waiting after the first wait was woken, woken by the drain");
+		}
+
 		/// The same for two tasks waiting for input on one pipe.
 		#[test]
 		fn every_task_waiting_for_input_is_woken() {
@@ -1880,9 +1907,8 @@ mod tests {
 
 		/// However many tasks wait on one file, the first 64 wakers are kept;
 		/// the task that finds them all taken wakes every stored one (each
-		/// polls again and waits anew) and is kept itself (the set's cap then
-		/// doubles). One waker that polls again (the engine's vprocs share
-		/// one) is kept once.
+		/// polls again and waits anew) and is kept itself. One waker that
+		/// polls again (the engine's vprocs share one) is kept once.
 		#[test]
 		fn tasks_past_the_cap_wake_the_stored_ones() {
 			let mut fifo = FullFifo::new();
