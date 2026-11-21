@@ -285,8 +285,7 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 	// Its own catches and ignores ([`catches`], [`ignores`]), asked for
 	// through the one rule ([`rule::reinstall_these`]).
-	let own = [Signal::Int, Signal::Winch, Signal::Alrm, Signal::Quit, Signal::Term];
-	let own = own.into_iter().chain(STOPS);
+	let own = CAUGHT.into_iter().chain(IGNORED).chain(STOPS);
 	if let Err(err) = rule::reinstall_these(k, cx, vp, own) {
 		k.fail(err);
 	}
@@ -308,21 +307,27 @@ fn open_shtty(k: &mut Kernel, cx: &mut Cx<'_>) {
 	}
 }
 
+/// The signals the interactive root catches for its own handlers.
+const CAUGHT: [Signal; 3] = [Signal::Int, Signal::Winch, Signal::Alrm];
+
+/// The signals the interactive root ignores.
+const IGNORED: [Signal; 2] = [Signal::Quit, Signal::Term];
+
 /// The terminal stop signals a shell doing job control ignores.
 const STOPS: [Signal; 3] = [Signal::Tstp, Signal::Ttin, Signal::Ttou];
 
 /// Whether the root catches `sig` for its interactive handler
-/// ([`untrapped`]): `INT`, `WINCH` and `ALRM`, interactive only.
-pub const fn catches(k: &Kernel, sig: Signal) -> bool {
-	k.jobctl.interactive && matches!(sig, Signal::Int | Signal::Winch | Signal::Alrm)
+/// ([`untrapped`]): [`CAUGHT`], interactive only.
+pub fn catches(k: &Kernel, sig: Signal) -> bool {
+	k.jobctl.interactive && CAUGHT.contains(&sig)
 }
 
 /// Whether the root ignores `sig` itself (zsh `init_signals`,
-/// `acquire_pgrp`): `QUIT` and `TERM` when interactive, and the terminal
-/// stop signals while it does job control.
-pub const fn ignores(k: &Kernel, sig: Signal) -> bool {
-	(k.jobctl.interactive && matches!(sig, Signal::Quit | Signal::Term))
-		|| (k.jobctl.pgrp.is_some() && matches!(sig, Signal::Tstp | Signal::Ttin | Signal::Ttou))
+/// `acquire_pgrp`): [`IGNORED`] when interactive, and [`STOPS`] while it
+/// does job control.
+pub fn ignores(k: &Kernel, sig: Signal) -> bool {
+	(k.jobctl.interactive && IGNORED.contains(&sig))
+		|| (k.jobctl.pgrp.is_some() && STOPS.contains(&sig))
 }
 
 /// zsh `acquire_pgrp`: wait until the shell's group owns the terminal (a
