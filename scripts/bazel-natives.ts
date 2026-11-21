@@ -49,13 +49,13 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { installBuiltAddon } from "../packages/natives/scripts/install-addon";
 import {
 	BAZEL_SOURCE_ROOTS,
 	copyAddonSourcesStamp,
 	type RustSources,
 	readRustSources,
-} from "../packages/natives/native/workspace-sources.js";
-import { installBuiltAddon } from "../packages/natives/scripts/install-addon";
+} from "../packages/natives/scripts/rust-sources";
 import { detectHostAvx2Support, detectHostMusl, resolveLocalHostAddon } from "./host-detect";
 import { hasVersionStampSlot, nativesPackageVersion, stampNativeVersion } from "./stamp-native-version";
 

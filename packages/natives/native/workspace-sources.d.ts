@@ -1,70 +1,78 @@
-/** What a Cargo build of the addon compiles, relative to the repository root. */
-export const CARGO_SOURCE_ROOTS: readonly string[];
+import type * as fs from "node:fs";
 
-/** What a Bazel build of the addon compiles: the Cargo inputs plus the Bazel module, targets, settings and toolchains. */
-export const BAZEL_SOURCE_ROOTS: readonly string[];
+/**
+ * The workspace loader's half of the record of a workspace addon's Rust sources, and what the
+ * build's half (`scripts/rust-sources.ts`) shares with it.
+ */
 
-/** A checkout's sources under a build's roots, as a native build records them. */
-export interface RustSources {
-	/** The roots, relative to the repository root. */
-	roots: string[];
-	/**
-	 * The checkout that built the addon: the id kept in its git directory (`omp-checkout-id`,
-	 * made by its first build), or null for a tree with no `.git` of its own.
-	 */
-	checkout: string | null;
-	/**
-	 * The source files, `/`-separated and sorted: under the roots, git's tracked and unignored
-	 * files (or a throwaway listing's, or a walk's), and in each scanned directory the files its
-	 * globs match, gitignored or not.
-	 */
-	files: string[];
-	/**
-	 * The listed files git did not track at build time. Their bytes must match; one may be
-	 * missing only when the record is judged in another checkout.
-	 */
-	untracked: string[];
-	/** Each listed file's content hash; never written to the record. */
-	hashes: Record<string, string>;
-	/**
-	 * Each listed file's fingerprint line (size, modification time, change time and inode) as
-	 * the read of its bytes found it; never written to the record. The settle compares them.
-	 */
-	stats: Record<string, string>;
-	/**
-	 * SHA-256 over each listed file's path, size, modification time, change time and inode as
-	 * the read of its bytes found them, hex; null when a file no longer matched that once all
-	 * were read, changed kind during its own read, or had a modification or change time less
-	 * than two seconds before the read began (git's racy case: an edit in that tick, after
-	 * the read, could leave every time as it was).
-	 */
-	fingerprint: string | null;
-	/**
-	 * SHA-256 over each tracked file's path and content (a link's target, for a link), hex; or
-	 * `"changed during the build"` after a settle that saw a listed file move during the build,
-	 * which no tree matches.
-	 */
-	digest: string;
-	/** Each untracked file's content hash. */
-	untrackedHashes: Record<string, string>;
-	/**
-	 * The directories build scripts scan: each with its `cargo_build_script` globs (patterns
-	 * relative to the repository root) and the state of it and its subdirectories (modification
-	 * time, change time and inode, `\0`-separated).
-	 */
-	scanned: { dir: string; globs: { include: string[]; exclude: string[] }[]; dirs: Record<string, string> }[];
-	/**
-	 * The scanned directories whose state was too new to trust when it was read (as
-	 * `fingerprint`). The settle lists them again, and the record keeps for them a state no
-	 * directory has, so the first start lists them again.
-	 */
-	unsettled: string[];
-	/** Each package directory and whether it has a `build.rs`. */
-	packages: { dir: string; buildScript: boolean }[];
+/** A `glob()` of a build script: its include and exclude patterns, relative to the repository root. */
+export interface Glob {
+	include: string[];
+	exclude: string[];
 }
+
+/** The rule a record's kept state (`seen`) was kept under; a record that names another is not well formed. */
+export const SEEN_STATE_VERSION: number;
+
+/** The digest a record holds when a listed file moved while the build ran, which no tree matches. */
+export const CHANGED_DURING_BUILD: string;
 
 /** A path for a temporary file next to `target`, unique to this process and thread. */
 export function uniqueTempPath(target: string): string;
+
+/** The `lstat` of a path in the checkout, through the shared reader's calls. */
+export function lstatSource(repoRoot: string, rel: string): fs.Stats | undefined;
+
+/** Whether a build script's globs take in `rel`: one glob includes it and does not exclude it. */
+export function globsMatch(globs: readonly Glob[], rel: string): boolean;
+
+/** A directory's state as a scan keeps it: its modification time, change time and inode. */
+export function directoryStamp(stat: fs.Stats): string;
+
+/** A walk of a directory a build script scans, with no filter. */
+export interface DirectoryScan {
+	/** The state of the directory and of every directory below it ({@link directoryStamp}). */
+	times: Record<string, string>;
+	/** The directories whose times are too new to trust for the read. */
+	racy: string[];
+	/** Every file and link there. */
+	files: string[];
+}
+
+/** Walk a directory a build script scans, for a read that began at `startedAt`. */
+export function scanDirectory(repoRoot: string, dir: string, startedAt: number): DirectoryScan;
+
+/** `times` as a record keeps them: a directory in `racy` gets a state no directory has. */
+export function settledTimes(times: Record<string, string>, racy: readonly string[]): Record<string, string>;
+
+/**
+ * List a scanned directory again and compare the files its globs match now with those of
+ * `files` (a record's, or a build's listing).
+ */
+export function listScannedAgain(
+	repoRoot: string,
+	entry: { dir: string; globs: Glob[] },
+	files: readonly string[],
+	startedAt: number,
+): { same: boolean; now: DirectoryScan };
+
+/**
+ * Hash every listed file, and take the fingerprint of the state those bytes came from, or null
+ * when a file changed during the read or has a time too new to trust. Throws when a regular file
+ * cannot be opened.
+ */
+export function hashSources(
+	repoRoot: string,
+	files: readonly string[],
+	startedAt: number,
+): { hashes: Record<string, string>; stats: Record<string, string>; fingerprint: string | null };
+
+/** The record's identities of a tree whose files hash to `hashes`: the tracked files' digest, and each untracked file's hash. */
+export function identities(
+	files: readonly string[],
+	untracked: readonly string[],
+	hashes: Record<string, string>,
+): { digest: string; untrackedHashes: Record<string, string> };
 
 /**
  * The id of the checkout at `repoRoot`, kept in its git directory (`omp-checkout-id`) and, with
@@ -74,32 +82,17 @@ export function uniqueTempPath(target: string): string;
  */
 export function checkoutId(repoRoot: string, create: boolean): string | null;
 
-/**
- * The checkout's sources under `roots` now, read before a build begins; lists and reads every
- * source file. Throws when a listed regular file cannot be opened.
- */
-export function readRustSources(repoRoot: string, roots: readonly string[]): RustSources;
-
-/**
- * The sources to record after the build: `before`, with `Cargo.lock` as the build left it
- * when it is the only listed file that changed; sources no tree matches when any other listed
- * file moved during the build (its bytes, size, times or inode), also one put back as it was,
- * or a directory a build script scans did.
- */
-export function settleRustSources(repoRoot: string, before: RustSources): RustSources;
-
 /** Where a native build records the sources of the addon at `addonPath` (`<addon>.sources.json`). */
 export function addonSourcesStampPath(addonPath: string): string;
 
-/**
- * Record that the addon at `addonPath`, as it is now on disk (its size and modification
- * time, set to the whole second), was built from `sources` with the settings `build`
- * (profile, features, flags), kept for diagnosis and never compared.
- */
-export function writeAddonSourcesStamp(addonPath: string, sources: RustSources, build: Record<string, unknown>): void;
+/** Write `stamp` as the record of the addon at `addonPath`, through a temporary file renamed into place. */
+export function writeStamp(addonPath: string, stamp: unknown): void;
 
-/** Give `toAddonPath`, a copy of `fromAddonPath`, the record of the addon it was copied from. */
-export function copyAddonSourcesStamp(fromAddonPath: string, toAddonPath: string): void;
+/**
+ * Whether the checkout judging a record is the one that wrote it, as the cached verdict is keyed
+ * by it: null when the record has no untracked file, for which it cannot matter.
+ */
+export function sameCheckoutKey(hasUntracked: boolean, recorded: string | null, current: string | null): boolean | null;
 
 /**
  * Whether the addon at `addonPath` was built from the sources now in `repoRoot`;

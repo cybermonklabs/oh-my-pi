@@ -8,14 +8,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	addonSourcesState,
-	addonSourcesStampPath,
-	CARGO_SOURCE_ROOTS,
-	readRustSources,
-	writeAddonSourcesStamp,
-} from "../native/workspace-sources.js";
+import { addonSourcesState, addonSourcesStampPath } from "../native/workspace-sources.js";
 import { installBuiltAddon } from "../scripts/install-addon";
+import { CARGO_SOURCE_ROOTS, readRustSources, writeAddonSourcesStamp } from "../scripts/rust-sources";
 
 let repo = "";
 let addon = "";
@@ -48,11 +43,11 @@ afterEach(async () => {
  */
 function installInChild(deny: boolean): unknown {
 	const installTs = path.join(import.meta.dir, "../scripts/install-addon.ts");
-	const sourcesJs = path.join(import.meta.dir, "../native/workspace-sources.js");
+	const rustSourcesTs = path.join(import.meta.dir, "../scripts/rust-sources.ts");
 	const regularFileJs = path.join(import.meta.dir, "../native/regular-file.js");
 	const lib = path.join(repo, "crates/pi-natives/src/lib.rs");
 	const script = `const { installBuiltAddon } = await import(${JSON.stringify(installTs)});
-const { readRustSources, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(sourcesJs)});
+const { readRustSources, CARGO_SOURCE_ROOTS } = await import(${JSON.stringify(rustSourcesTs)});
 const { __setRegularFileIoForTests } = await import(${JSON.stringify(regularFileJs)});
 const nodeFs = await import("node:fs");
 const sourcesBeforeBuild = readRustSources(${JSON.stringify(repo)}, CARGO_SOURCE_ROOTS);

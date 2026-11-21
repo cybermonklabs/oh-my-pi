@@ -4,12 +4,8 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import {
-	addonSourcesStampPath,
-	type RustSources,
-	settleRustSources,
-	writeAddonSourcesStamp,
-} from "../native/workspace-sources.js";
+import { addonSourcesStampPath } from "../native/workspace-sources.js";
+import { type RustSources, settleRustSources, writeAddonSourcesStamp } from "./rust-sources";
 
 /** Copy `src` to `dest` under a temporary name and rename it into place. */
 export async function installBinary(src: string, dest: string): Promise<void> {

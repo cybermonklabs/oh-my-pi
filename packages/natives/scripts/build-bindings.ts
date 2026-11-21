@@ -19,9 +19,9 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { stampNativeVersion } from "../../../scripts/stamp-native-version";
-import { CARGO_SOURCE_ROOTS, readRustSources } from "../native/workspace-sources.js";
 import { generateEnumExports } from "./gen-enums";
 import { installBuiltAddon } from "./install-addon";
+import { CARGO_SOURCE_ROOTS, readRustSources } from "./rust-sources";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
 // static build so the local addon never retains host Homebrew paths.

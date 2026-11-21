@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from "./regular-file.js";
 
@@ -10,12 +9,14 @@ import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from 
  * `packages/natives/native/`, and skips release validation there, so an addon
  * built before the checkout's Rust sources changed would load as current: same
  * release, other code. The native build (`scripts/bazel-natives.ts`,
- * `scripts/build-bindings.ts`) records the sources it compiled next to the addon
- * (`<addon>.sources.json`), and the loader compares that record with the checkout
- * on a workspace load. Compiled binaries and package installs never read it.
+ * `scripts/build-bindings.ts`, through `packages/natives/scripts/rust-sources.ts`, which holds
+ * the build's half) records the sources it compiled next to the addon (`<addon>.sources.json`),
+ * and the loader compares that record with the checkout on a workspace load, with this
+ * module, which also holds what both halves share. Compiled binaries and package installs
+ * never read it.
  *
  * The record lists the source files the build had: under the build's roots
- * ({@link CARGO_SOURCE_ROOTS} or {@link BAZEL_SOURCE_ROOTS}), the files git tracks
+ * (`CARGO_SOURCE_ROOTS` or `BAZEL_SOURCE_ROOTS`, in `scripts/rust-sources.ts`), the files git tracks
  * or would track, so a gitignored file is never a source. That listing is used
  * only in a repository whose top level is the tree; elsewhere (a Docker build
  * context, a tree with no `.git` inside another repository) the build lists
@@ -82,7 +83,7 @@ import { lstatPath, readLinkTarget, readRegularFile, readRegularFileText } from 
  * and when one is kept (only when no time in it is too new to trust, {@link RACY_MARGIN_MS}).
  * A record whose state names another rule is not well formed.
  */
-const SEEN_STATE_VERSION = 2;
+export const SEEN_STATE_VERSION = 2;
 
 /**
  * How much older than a read a time must be for the read to trust it: git's racy-clean rule.
@@ -111,40 +112,13 @@ function isRacy(stat, startedAt) {
 	return Math.max(stat.mtimeMs, stat.ctimeMs) >= startedAt - RACY_MARGIN_MS;
 }
 
-/** What a Cargo build of the addon compiles, relative to the repository root. */
-export const CARGO_SOURCE_ROOTS = Object.freeze(["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", "crates"]);
-
-/**
- * What a Bazel build of the addon compiles: the Cargo inputs (crate_universe
- * resolves third-party crates from them, and each crate's `BUILD.bazel` is under
- * `crates/`), the root targets, the module, the settings, the Bazel version, and
- * the toolchain and transition definitions under `bazel/`. `MODULE.bazel.lock`
- * is left out: a build rewrites it after `MODULE.bazel` changes, which would make
- * every such build read as other sources, and it follows from `MODULE.bazel`.
- */
-export const BAZEL_SOURCE_ROOTS = Object.freeze([
-	...CARGO_SOURCE_ROOTS,
-	"BUILD.bazel",
-	"MODULE.bazel",
-	".bazelrc",
-	".bazelversion",
-	".bazelignore",
-	"bazel",
-]);
-
-/**
- * Sources the build itself rewrites: Cargo updates `Cargo.lock` when a manifest's
- * dependencies changed, so the lock the build compiled against is the one it left.
- */
-const REWRITTEN_BY_BUILD = new Set(["Cargo.lock"]);
-
 /**
  * The digest a record holds when a listed file moved while the build ran (its bytes, size,
  * times or inode), even one put back as it was: the compiler may have read anything in
  * between, so the record names no sources, and the addon reads as built from other sources
  * until the next build. No content digest (hex) equals it.
  */
-const CHANGED_DURING_BUILD = "changed during the build";
+export const CHANGED_DURING_BUILD = "changed during the build";
 
 /**
  * A path a temporary file next to `target` can take: unique to this process and
@@ -162,193 +136,8 @@ export function uniqueTempPath(target) {
  * @param {string} repoRoot
  * @param {string} rel
  */
-function lstatSource(repoRoot, rel) {
+export function lstatSource(repoRoot, rel) {
 	return lstatPath(path.join(repoRoot, rel));
-}
-
-/**
- * Run git with the caller's environment, less the variables that would point it
- * at another repository; its stdout, or null when it fails or cannot start.
- * @param {string[]} args
- * @returns {string | null}
- */
-function runGit(args) {
-	const env = { ...process.env };
-	for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete env[name];
-	try {
-		const git = Bun.spawnSync(["git", ...args], { env, stdout: "pipe", stderr: "pipe" });
-		return git.exitCode === 0 ? git.stdout.toString() : null;
-	} catch {
-		return null;
-	}
-}
-
-/**
- * `git ls-files -t -z` output as paths and whether git tracks each.
- * @param {string} output
- */
-function parseListing(output) {
-	return output
-		.split("\0")
-		.filter(Boolean)
-		.map(entry => ({ rel: entry.slice(2), tracked: !entry.startsWith("? ") }));
-}
-
-/**
- * Every file and link a walk finds under `roots`, for a machine without git:
- * below a root, names starting with a dot and `target` directories are skipped,
- * and a link, to a directory or not, is an entry, never followed.
- * @param {string} repoRoot
- * @param {readonly string[]} roots
- * @returns {string[]}
- */
-function walkSources(repoRoot, roots) {
-	const files = [];
-	const visit = rel => {
-		const stat = lstatSource(repoRoot, rel);
-		if (!stat) return;
-		if (!stat.isDirectory()) {
-			files.push(rel);
-			return;
-		}
-		for (const name of fs.readdirSync(path.join(repoRoot, rel))) {
-			if (name.startsWith(".") || name === "target") continue;
-			visit(`${rel}/${name}`);
-		}
-	};
-	for (const root of roots) visit(root);
-	return files;
-}
-
-/**
- * Whether `repoRoot` is the top level of a git repository or worktree, not a
- * directory inside another one (`git rev-parse --show-toplevel`).
- * @param {string} repoRoot
- */
-function isRepositoryRoot(repoRoot) {
-	const top = runGit(["-C", repoRoot, "rev-parse", "--show-toplevel"])?.trim();
-	if (!top) return false;
-	try {
-		return fs.realpathSync(top) === fs.realpathSync(repoRoot);
-	} catch {
-		return false;
-	}
-}
-
-/**
- * The source files under `roots`, `/`-separated and sorted, and the ones among
- * them git does not track. In a repository whose top level is `repoRoot`: git's
- * tracked files and its untracked, unignored ones. Otherwise (a Docker build
- * context, a tree with no `.git` inside another repository), or when git fails in
- * the repository: git against a throwaway repository, as the Dockerfile's key step
- * does, so `.gitignore` still applies; every file then counts as tracked, since
- * nothing tells a source from a scratch file there. When git fails that way too,
- * or cannot run: {@link walkSources}. Directories (a submodule's entry) and listed
- * files that no longer exist are left out.
- * @param {string} repoRoot
- * @param {readonly string[]} roots
- * @returns {{ files: string[]; untracked: string[] }}
- */
-function listBuildSources(repoRoot, roots) {
-	const args = ["ls-files", "-z", "-t", "--cached", "--others", "--exclude-standard", "--", ...roots];
-	let entries;
-	// Only the repository whose top level is this tree: a tree with no `.git` of its own
-	// inside another repository is no checkout of that repository.
-	const inRepository = isRepositoryRoot(repoRoot) ? runGit(["-C", repoRoot, ...args]) : null;
-	if (inRepository !== null) entries = parseListing(inRepository);
-	else {
-		const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-sources-git-"));
-		try {
-			if (runGit(["init", "-q", "--bare", gitDir]) !== null) {
-				// Without a repository's index, a tree with no `.gitignore` for build output
-				// would list it: leave out `target` directories, as a walk does.
-				const throwaway = runGit([
-					"--git-dir",
-					gitDir,
-					"--work-tree",
-					repoRoot,
-					"-C",
-					repoRoot,
-					...args,
-					":(exclude,glob)**/target/**",
-				]);
-				if (throwaway !== null) entries = parseListing(throwaway).map(({ rel }) => ({ rel, tracked: true }));
-			}
-		} finally {
-			fs.rmSync(gitDir, { recursive: true, force: true });
-		}
-	}
-	entries ??= walkSources(repoRoot, roots).map(rel => ({ rel, tracked: true }));
-	const kept = new Map();
-	for (const { rel, tracked } of entries) {
-		const stat = lstatSource(repoRoot, rel);
-		if (stat && !stat.isDirectory()) kept.set(rel, (kept.get(rel) ?? false) || tracked);
-	}
-	const files = [...kept.keys()].sort();
-	return { files, untracked: files.filter(rel => !kept.get(rel)) };
-}
-
-/**
- * The argument text of the call whose `(` ends just before `start`, comments
- * removed.
- * @param {string} text
- * @param {number} start
- */
-function callArguments(text, start) {
-	let depth = 1;
-	let quote = "";
-	let body = "";
-	for (let i = start; i < text.length && depth > 0; i++) {
-		const char = text[i];
-		if (quote) {
-			body += char;
-			if (char === "\\") body += text[++i] ?? "";
-			else if (char === quote) quote = "";
-			continue;
-		}
-		if (char === "#") {
-			const end = text.indexOf("\n", i);
-			i = end < 0 ? text.length : end - 1;
-			continue;
-		}
-		if (char === '"' || char === "'") quote = char;
-		else if (char === "(") depth++;
-		else if (char === ")" && --depth === 0) break;
-		body += char;
-	}
-	return body;
-}
-
-/**
- * The argument text of each top-level call to `name` in a Starlark file.
- * @param {string} text
- * @param {string} name
- */
-function* starlarkCalls(text, name) {
-	for (const match of text.matchAll(new RegExp(`(?:^|\\n)[ \\t]*${name}\\s*\\(`, "g"))) {
-		yield callArguments(text, match.index + match[0].length);
-	}
-}
-
-/** @param {string} list the text inside a Starlark list's brackets */
-function stringsOf(list) {
-	return [...list.matchAll(/["']([^"']+)["']/g)].map(([, value]) => value);
-}
-
-/**
- * Each `glob()` in `text`: its `include` patterns (the first list, positional or
- * `include = […]`) and its `exclude` patterns.
- * @param {string} text
- * @returns {Generator<{ include: string[]; exclude: string[] }>}
- */
-function* globCalls(text) {
-	for (const match of text.matchAll(/\bglob\s*\(/g)) {
-		const args = callArguments(text, match.index + match[0].length);
-		const excludeList = /\bexclude\s*=\s*\[([^\]]*)\]/.exec(args);
-		const rest = excludeList ? args.replace(excludeList[0], "") : args;
-		const includeList = /\[([^\]]*)\]/.exec(rest);
-		yield { include: includeList ? stringsOf(includeList[1]) : [], exclude: excludeList ? stringsOf(excludeList[1]) : [] };
-	}
 }
 
 /**
@@ -382,7 +171,7 @@ function globRegExp(pattern) {
  * @param {readonly { include: string[]; exclude: string[] }[]} globs
  * @param {string} rel
  */
-function globsMatch(globs, rel) {
+export function globsMatch(globs, rel) {
 	return globs.some(
 		glob =>
 			glob.include.some(pattern => globRegExp(pattern).test(rel)) &&
@@ -391,49 +180,11 @@ function globsMatch(globs, rel) {
 }
 
 /**
- * The directories build scripts scan, with the globs that say which of their files
- * a build script takes in: for each listed `BUILD.bazel`, every `glob()` in its
- * `cargo_build_script` calls (patterns made relative to the repository root), each
- * pattern's directory being its part before the first segment with a wildcard.
- * Bazel gives a build script only the files its globs match, so those files, and
- * no others there, are what a build script can read; Cargo's `rerun-if-changed`
- * names the same directories.
- * @param {string} repoRoot
- * @param {readonly string[]} files
- * @returns {{ dir: string; globs: { include: string[]; exclude: string[] }[] }[]}
- */
-function buildScriptScannedDirs(repoRoot, files) {
-	const byDir = new Map();
-	for (const rel of files) {
-		if (path.posix.basename(rel) !== "BUILD.bazel") continue;
-		// A `BUILD.bazel` that is not a regular file (a FIFO, say) has no globs to give.
-		const text = readRegularFileText(path.join(repoRoot, rel));
-		if (text === undefined) continue;
-		const pkg = path.posix.dirname(rel);
-		for (const call of starlarkCalls(text, "cargo_build_script")) {
-			for (const glob of globCalls(call)) {
-				const exclude = glob.exclude.map(pattern => path.posix.join(pkg, pattern));
-				for (const pattern of glob.include) {
-					const segments = pattern.split("/");
-					const wildcard = segments.findIndex(segment => /[*?]/.test(segment));
-					if (wildcard < 0) continue;
-					const dir = path.posix.join(pkg, ...segments.slice(0, wildcard));
-					if (!lstatSource(repoRoot, dir)?.isDirectory()) continue;
-					if (!byDir.has(dir)) byDir.set(dir, []);
-					byDir.get(dir).push({ include: [path.posix.join(pkg, pattern)], exclude });
-				}
-			}
-		}
-	}
-	return [...byDir.keys()].sort().map(dir => ({ dir, globs: byDir.get(dir) }));
-}
-
-/**
  * A directory's state as a scan keeps it: its modification time, change time and inode, so a
  * file added or removed there gives a new one, also when the modification time is put back.
  * @param {fs.Stats} stat
  */
-function directoryStamp(stat) {
+export function directoryStamp(stat) {
 	return `${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}`;
 }
 
@@ -449,7 +200,7 @@ function directoryStamp(stat) {
  *   of them whose times are too new to trust ({@link isRacy}), and every file and
  *   link there
  */
-function scanDirectory(repoRoot, dir, startedAt) {
+export function scanDirectory(repoRoot, dir, startedAt) {
 	const times = {};
 	const racy = [];
 	const files = [];
@@ -475,7 +226,7 @@ function scanDirectory(repoRoot, dir, startedAt) {
  * @param {readonly string[]} racy
  * @returns {Record<string, string>}
  */
-function settledTimes(times, racy) {
+export function settledTimes(times, racy) {
 	return Object.fromEntries(Object.entries(times).map(([rel, time]) => [rel, racy.includes(rel) ? UNSETTLED_DIRECTORY : time]));
 }
 
@@ -488,26 +239,11 @@ function settledTimes(times, racy) {
  * @param {number} startedAt
  * @returns {{ same: boolean; now: ReturnType<typeof scanDirectory> }}
  */
-function listScannedAgain(repoRoot, entry, files, startedAt) {
+export function listScannedAgain(repoRoot, entry, files, startedAt) {
 	const recorded = files.filter(rel => rel.startsWith(`${entry.dir}/`) && globsMatch(entry.globs, rel));
 	const now = scanDirectory(repoRoot, entry.dir, startedAt);
 	const matched = now.files.filter(rel => globsMatch(entry.globs, rel));
 	return { same: matched.length === recorded.length && matched.every((rel, i) => rel === recorded[i]), now };
-}
-
-/**
- * Each package directory (one holding a listed `Cargo.toml`) and whether it has a
- * `build.rs`, which Cargo runs without any manifest naming it.
- * @param {string} repoRoot
- * @param {readonly string[]} files
- */
-function packageBuildScripts(repoRoot, files) {
-	return files
-		.filter(rel => path.posix.basename(rel) === "Cargo.toml")
-		.map(rel => {
-			const dir = path.posix.dirname(rel);
-			return { dir, buildScript: lstatSource(repoRoot, path.posix.join(dir, "build.rs")) !== undefined };
-		});
 }
 
 /**
@@ -594,7 +330,7 @@ function digestOf(files, hashes) {
  * @param {number} startedAt when the read began (`Date.now()`, taken before any `stat`)
  * @returns {{ hashes: Record<string, string>; stats: Record<string, string>; fingerprint: string | null }}
  */
-function hashSources(repoRoot, files, startedAt) {
+export function hashSources(repoRoot, files, startedAt) {
 	/** @type {Record<string, string>} */
 	const hashes = {};
 	/** @type {Record<string, string>} */
@@ -617,7 +353,7 @@ function hashSources(repoRoot, files, startedAt) {
  * @param {readonly string[]} untracked
  * @param {Record<string, string>} hashes
  */
-function identities(files, untracked, hashes) {
+export function identities(files, untracked, hashes) {
 	const optional = new Set(untracked);
 	return {
 		digest: digestOf(
@@ -698,86 +434,6 @@ export function checkoutId(repoRoot, create) {
 }
 
 /**
- * The checkout's sources under `roots` now, as a native build records them, read
- * before the build begins. Lists the files once (one `git ls-files`), adds the
- * files of the directories build scripts scan that their globs match, gitignored
- * or not, as sources the build had, and reads every one. Its fingerprint is that
- * of the files it read, or null when one changed while it read them or has a time
- * too new to trust ({@link isRacy}); `unsettled` names each scanned directory whose
- * times were too new. Throws when a listed regular file cannot be opened.
- * @param {string} repoRoot
- * @param {readonly string[]} roots
- */
-export function readRustSources(repoRoot, roots) {
-	const startedAt = Date.now();
-	const listed = listBuildSources(repoRoot, roots);
-	const scans = buildScriptScannedDirs(repoRoot, listed.files).map(({ dir, globs }) => {
-		const scan = scanDirectory(repoRoot, dir, startedAt);
-		return { dir, globs, times: scan.times, racy: scan.racy, files: scan.files.filter(rel => globsMatch(globs, rel)) };
-	});
-	const scannedFiles = new Set(scans.flatMap(scan => scan.files));
-	const files = [...new Set([...listed.files, ...scannedFiles])].sort();
-	// A scanned directory's matched files are compiled whether git tracks them or not.
-	const untracked = listed.untracked.filter(rel => !scannedFiles.has(rel));
-	const { hashes, stats, fingerprint } = hashSources(repoRoot, files, startedAt);
-	return {
-		roots: [...roots],
-		checkout: checkoutId(repoRoot, true),
-		files,
-		untracked,
-		hashes,
-		stats,
-		fingerprint,
-		...identities(files, untracked, hashes),
-		scanned: scans.map(({ dir, globs, times }) => ({ dir, globs, dirs: times })),
-		unsettled: scans.flatMap(({ racy }) => racy),
-		packages: packageBuildScripts(repoRoot, files),
-	};
-}
-
-/**
- * The sources to record once the build is done: `before` ({@link readRustSources}
- * before the build), except that a file the build itself rewrites
- * ({@link REWRITTEN_BY_BUILD}: `Cargo.lock`) takes the content the build left. If
- * any other listed file moved while the build ran (its bytes, or its size, times or
- * inode, as a file edited and put back as it was has), or a directory a build script
- * scans did (a file added there and removed again), the record names no sources
- * ({@link CHANGED_DURING_BUILD}), so the addon reads as built from other sources
- * until the next build. A scanned directory whose state was too new to trust before
- * the build (`unsettled`: a file added after that read, in its tick, leaves the state
- * as it was) is also listed again, and a matched file added or removed there counts as
- * moved.
- * @param {string} repoRoot
- * @param {ReturnType<typeof readRustSources>} before
- * @returns {ReturnType<typeof readRustSources>}
- */
-export function settleRustSources(repoRoot, before) {
-	const startedAt = Date.now();
-	const read = hashSources(repoRoot, before.files, startedAt);
-	const fileMoved = before.files.some(
-		rel => !REWRITTEN_BY_BUILD.has(rel) && (read.stats[rel] !== before.stats[rel] || read.hashes[rel] !== before.hashes[rel]),
-	);
-	const directoryMoved = before.scanned.some(
-		entry =>
-			Object.entries(entry.dirs).some(([rel, stamp]) => {
-				const stat = lstatSource(repoRoot, rel);
-				return !stat?.isDirectory() || directoryStamp(stat) !== stamp;
-			}) ||
-			(Object.keys(entry.dirs).some(rel => before.unsettled.includes(rel)) &&
-				!listScannedAgain(repoRoot, entry, before.files, startedAt).same),
-	);
-	if (fileMoved || directoryMoved) return { ...before, digest: CHANGED_DURING_BUILD, fingerprint: null };
-	if (before.files.every(rel => read.hashes[rel] === before.hashes[rel])) return before;
-	return {
-		...before,
-		hashes: read.hashes,
-		stats: read.stats,
-		fingerprint: read.fingerprint,
-		...identities(before.files, before.untracked, read.hashes),
-	};
-}
-
-/**
  * Where a native build records the sources of the addon at `addonPath`.
  * @param {string} addonPath
  */
@@ -789,7 +445,7 @@ export function addonSourcesStampPath(addonPath) {
  * @param {string} addonPath
  * @param {unknown} stamp
  */
-function writeStamp(addonPath, stamp) {
+export function writeStamp(addonPath, stamp) {
 	const stampPath = addonSourcesStampPath(addonPath);
 	const tempPath = uniqueTempPath(stampPath);
 	try {
@@ -802,56 +458,6 @@ function writeStamp(addonPath, stamp) {
 }
 
 /**
- * The addon's identity in a record: its size and a whole-second modification time.
- * The time is set to the whole second first, because copies that keep times often
- * keep only seconds (a Docker layer `COPY`, tar), and the record must still name
- * the addon after one.
- * @param {string} addonPath
- * @returns {{ size: number; mtimeMs: number }}
- */
-function addonIdentity(addonPath) {
-	const before = fs.statSync(addonPath);
-	if (before.mtimeMs % 1000 !== 0) fs.utimesSync(addonPath, before.atime, Math.floor(before.mtimeMs / 1000));
-	const addon = fs.statSync(addonPath);
-	return { size: addon.size, mtimeMs: addon.mtimeMs };
-}
-
-/**
- * Record that the addon at `addonPath`, as it is now on disk, was built from
- * `sources` ({@link readRustSources} before the build began, then
- * {@link settleRustSources}, so an edit made during the build reads as other
- * sources, never as current) with the settings `build`, kept for diagnosis only.
- * The record names the addon file by its size and modification time, so an addon
- * put there later by anything else is not taken for this one.
- * @param {string} addonPath
- * @param {ReturnType<typeof readRustSources>} sources
- * @param {Record<string, unknown>} build
- */
-export function writeAddonSourcesStamp(addonPath, sources, build) {
-	writeStamp(addonPath, {
-		addon: addonIdentity(addonPath),
-		roots: sources.roots,
-		checkout: sources.checkout,
-		files: sources.files,
-		untracked: sources.untrackedHashes,
-		sources: sources.digest,
-		// A scanned directory whose state was too new to trust is listed again at the first start.
-		scanned: sources.scanned.map(entry => ({ ...entry, dirs: settledTimes(entry.dirs, sources.unsettled) })),
-		packages: sources.packages,
-		// The checkout that built the addon is the one judging it now. A fingerprint of null (a file
-		// changed while the build read it, or one too new to trust) matches no state: the first start
-		// reads the bytes.
-		seen: {
-			version: SEEN_STATE_VERSION,
-			fingerprint: sources.fingerprint,
-			sameCheckout: sameCheckoutKey(sources.untracked.length > 0, sources.checkout, sources.checkout),
-			verdict: sources.digest === CHANGED_DURING_BUILD ? "other" : "current",
-		},
-		build,
-	});
-}
-
-/**
  * Whether the checkout judging a record is the one that wrote it, as the cached
  * verdict is keyed by it: null when the record has no untracked file, for which
  * it cannot matter.
@@ -860,21 +466,8 @@ export function writeAddonSourcesStamp(addonPath, sources, build) {
  * @param {string | null} current the judging checkout's id
  * @returns {boolean | null}
  */
-function sameCheckoutKey(hasUntracked, recorded, current) {
+export function sameCheckoutKey(hasUntracked, recorded, current) {
 	return hasUntracked ? recorded !== null && recorded === current : null;
-}
-
-/**
- * Give `toAddonPath`, a copy of `fromAddonPath`, the record of the addon it was
- * copied from, naming the copy's own size and modification time.
- * @param {string} fromAddonPath
- * @param {string} toAddonPath
- */
-export function copyAddonSourcesStamp(fromAddonPath, toAddonPath) {
-	const recordPath = addonSourcesStampPath(fromAddonPath);
-	const text = readRegularFileText(recordPath);
-	if (text === undefined) throw new Error(`${recordPath} is not a regular file`);
-	writeStamp(toAddonPath, { ...JSON.parse(text), addon: addonIdentity(toAddonPath) });
 }
 
 /**
