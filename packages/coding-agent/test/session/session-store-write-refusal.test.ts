@@ -101,6 +101,11 @@ const cases: Array<[string, unknown, Kind]> = [
 		"outage",
 	],
 	[
+		"PgBouncer, to the clients waiting when the server rejects a login: the server's own wrong-password error (28P01)",
+		pgServerError("28P01", 'password authentication failed for user "app"'),
+		"none",
+	],
+	[
 		"PgBouncer 1.24 or later, after a failed server DNS lookup (08P01)",
 		pgServerError(
 			"08P01",

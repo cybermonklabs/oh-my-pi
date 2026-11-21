@@ -72,9 +72,9 @@ async function openSqlChild(storage: SqlSessionStorage, name: string): Promise<S
 }
 
 /** Close `child` as session dispose does (seal, then close), while the store refuses it. */
-async function closeRefused(child: SessionManager): Promise<string[]> {
+async function closeRefused(child: SessionManager, seal: { keepEntries?: boolean } = {}): Promise<string[]> {
 	const ids = heldIds(child);
-	child.seal();
+	child.seal(seal);
 	await expect(child.close()).rejects.toThrow();
 	return ids;
 }
@@ -146,6 +146,28 @@ describe("a session the store refused is sent again once another session's write
 
 		expect(storedFile(file)).toEqual(ids);
 		// Sent: the sealed session drops its transcript.
+		expect(child.getEntries()).toHaveLength(0);
+	});
+
+	it("a transcript sealed with keepEntries stays in memory after its held send lands, until it is released", async () => {
+		const dir = tempDir();
+		const { disk, childDir } = subagentDisk(dir);
+		const child = await openChild(dir, childDir, "Kept");
+		disk.full = true;
+		child.appendMessage(assistant("Kept: refused answer"));
+		const ids = await closeRefused(child, { keepEntries: true });
+		const file = child.getSessionFile() as string;
+		expect(child.holdsTranscript()).toBe(true);
+
+		disk.full = false;
+		const parent = SessionManager.create(dir.path(), dir.join("main"));
+		parent.appendMessage(assistant("the parent's write lands"));
+		await parent.close();
+
+		expect(storedFile(file)).toEqual(ids);
+		// Sent, and the hold is over; the entries stay for the owner that asked to keep them.
+		expect({ holds: child.holdsTranscript(), held: heldIds(child) }).toEqual({ holds: false, held: ids });
+		child.releaseRetainedEntries();
 		expect(child.getEntries()).toHaveLength(0);
 	});
 

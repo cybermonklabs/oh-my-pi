@@ -212,8 +212,10 @@ const PGBOUNCER_REFUSALS: readonly string[] = [
  * try again later (server_login_retry)"; 1.24.0 and later "server login has been failing, cached error:
  * <the last failed server connection's reason> (server_login_retry)". Outside a replication pool, a
  * login the server rejects leaves the server's own error text as that reason (server.c:193-194 in
- * 1.26.1), a wrong password's among them; so a pool whose logins fail for good reads as down too, as
- * with the 1.22.0 text, and its sessions keep their entries until the pool is fixed.
+ * 1.26.1), a wrong password's among them, so a write that meets this text reads as a store that is
+ * down, as with the 1.22.0 text. The clients waiting when the server rejects the login get the server's
+ * own SQLSTATE first (kill_pool_logins, server.c:74-117): 28P01 for a wrong password, which is no
+ * refusal, so a close that meets it is not held.
  */
 const PGBOUNCER_LOGIN_RETRY = "server login has been failing";
 

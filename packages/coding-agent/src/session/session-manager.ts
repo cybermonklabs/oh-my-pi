@@ -1021,6 +1021,8 @@ export class SessionManager {
 	#released = false;
 	/** Set by {@link releaseRetainedEntries}: `#entries` was cleared, so `#serializeBody()` is no longer authoritative. */
 	#entriesReleased = false;
+	/** Set by {@link seal} with `keepEntries`: the end of a hold does not release the entries. */
+	#keepsEntries = false;
 	/** Serializes async disk work (flush/close/atomic rewrite). Appends are synchronous and bypass it. */
 	#diskTail: Promise<void> = Promise.resolve();
 	#diskFailure: Error | undefined;
@@ -3192,7 +3194,8 @@ export class SessionManager {
 	 * a process that exits while the store still refuses loses them, as it
 	 * loses a live session's unsaved entries. Once the send lands, or the
 	 * hold ends because another writer owns the file, a sealed session drops
-	 * its transcript as {@link releaseRetainedEntries} does.
+	 * its transcript as {@link releaseRetainedEntries} does, unless it was
+	 * sealed with `keepEntries` (see {@link seal}).
 	 */
 	async #hold(): Promise<void> {
 		this.#heldBasis = (await this.#readStoredTranscript()).state;
@@ -3209,11 +3212,14 @@ export class SessionManager {
 		return this.#heldBasis !== undefined;
 	}
 
-	/** End the hold; a sealed session has nothing left to write, so it drops its transcript too. */
+	/**
+	 * End the hold; a sealed session has nothing left to write, so it drops its
+	 * transcript too, unless its owner sealed it with `keepEntries`.
+	 */
 	#unhold(): void {
 		this.#heldBasis = undefined;
 		this.#leaveStoreQueue();
-		if (this.#released && !this.#entriesReleased) this.releaseRetainedEntries();
+		if (this.#released && !this.#keepsEntries && !this.#entriesReleased) this.releaseRetainedEntries();
 	}
 
 	/** What the store holds at this session's path now; never rejects. */
@@ -3369,8 +3375,15 @@ export class SessionManager {
 	 * The final `close()` itself is scheduled after the bump and still runs;
 	 * pre-seal hot-path appends are already in the page cache. Idempotent;
 	 * terminal.
+	 *
+	 * With `keepEntries`, the end of a hold (see {@link #hold}) leaves the
+	 * entries in memory instead of releasing them: the owner stays open after
+	 * a failed close and still reads them (the interactive mode's `/export`).
+	 * A sealed session writes nothing else, so keeping them is safe; an
+	 * explicit {@link releaseRetainedEntries} still drops them.
 	 */
-	seal(): void {
+	seal(options: { keepEntries?: boolean } = {}): void {
+		if (options.keepEntries) this.#keepsEntries = true;
 		if (this.#released) return;
 		this.#released = true;
 		this.#diskEpoch++;
