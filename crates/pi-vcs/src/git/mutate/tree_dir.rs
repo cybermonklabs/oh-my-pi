@@ -228,8 +228,12 @@ pub enum Stop {
 	Mounted(PathBuf),
 	/// An entry the system would not remove, with the error: an `EBUSY` that
 	/// is no mount (an NFS client's `.nfs…` name for a deleted file still
-	/// open, a FUSE daemon's answer), or any other refusal of an `unlinkat`.
+	/// open, a FUSE daemon's or an SMB server's answer), or any other refusal
+	/// of an `unlinkat`.
 	Unremovable(PathBuf, io::Error),
+	/// A directory the emptying emptied and then could not remove, with the
+	/// stop that refusal gives ([`Self::Mounted`] or [`Self::Unremovable`]).
+	EmptiedNotRemoved(Box<Self>),
 	/// The system reports no mount ids, so a mount point cannot be told from
 	/// a directory of the tree's own filesystem.
 	NoMountIds,
@@ -261,6 +265,7 @@ impl Stop {
 			Self::Unremovable(at, err) => {
 				format!("has an entry the system would not remove ({}: {err})", tree.join(at).display())
 			},
+			Self::EmptiedNotRemoved(refusal) => refusal.reason(tree),
 			Self::NoMountIds => "is on a system that reports no mount ids (neither `statx` nor \
 			                     `/proc/self/fdinfo`), so a filesystem mounted in it cannot be told \
 			                     apart"
@@ -270,6 +275,33 @@ impl Stop {
 				 `/proc/self/fdinfo` failed ({err}), so a filesystem mounted in it cannot be told \
 				 apart"
 			),
+		}
+	}
+}
+
+/// How far the emptying got at the entry a [`Stop`] names, for its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reached {
+	/// The emptying had not touched the entry or anything below it.
+	NothingAtTheEntry,
+	/// The entry is a directory the emptying emptied and then could not
+	/// remove.
+	EmptiedTheDirectory,
+	/// The stop names no entry.
+	NoEntry,
+}
+
+impl Stop {
+	/// How far the emptying got at the entry this stop names.
+	pub const fn reached(&self) -> Reached {
+		match self {
+			Self::Changed(_)
+			| Self::Cycle(_)
+			| Self::TooDeep(_)
+			| Self::Mounted(_)
+			| Self::Unremovable(..) => Reached::NothingAtTheEntry,
+			Self::EmptiedNotRemoved(_) => Reached::EmptiedTheDirectory,
+			Self::NoMountIds | Self::MountIdUnread(_) => Reached::NoEntry,
 		}
 	}
 }
@@ -315,6 +347,8 @@ impl Root {
 	/// side effect, even on a FIFO or a device) without following a symlink,
 	/// is on another mount than the root. `None` when the entry is gone.
 	fn other_mount_at(&self, dir: RawFd, name: &CStr) -> io::Result<Option<bool>> {
+		#[cfg(test)]
+		super::test_hooks::count_probe();
 		let fd = match open_at(dir, name, libc::O_PATH) {
 			Ok(fd) => fd,
 			Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -328,7 +362,9 @@ impl Root {
 	/// point below the root: as [`Entry::mounted_below`] tells, and, for
 	/// anything but a directory where `statx` gave no mount id (before Linux
 	/// 5.8), as its `O_PATH` descriptor's mount id tells. A directory without
-	/// one is compared once opened ([`Self::other_mount`]).
+	/// one is compared once opened ([`Self::other_mount`]). The check walk
+	/// asks this of every entry; the emptying leaves a mounted file to the
+	/// `EBUSY` its unlink gets ([`Self::refusal`]).
 	fn mounted(&self, dir: RawFd, name: &CStr, entry: &Entry) -> io::Result<bool> {
 		if entry.mounted_below(&self.entry) {
 			return Ok(true);
@@ -340,21 +376,20 @@ impl Root {
 	}
 
 	/// The stop for `err`, the refusal of an `unlinkat` of the entry `name`
-	/// in the directory `dir` (at `path`): a mount point when the error is
-	/// `EBUSY` and the entry is on another mount than the root (a mount made
-	/// after the checks), else the entry with the error. An `EBUSY` alone is
-	/// no mount: NFS refuses with it to remove its `.nfs…` name for a deleted
-	/// file still open, and a FUSE daemon may answer it.
-	fn unlink_refused(&self, dir: RawFd, name: &CStr, path: &Path, err: io::Error) -> io::Error {
-		if err.raw_os_error() == Some(libc::EBUSY) {
-			match self.other_mount_at(dir, name) {
-				Ok(Some(true)) => return stop(Stop::Mounted(path.to_path_buf())),
-				Ok(_) => {},
-				Err(probe) if stop_of(&probe).is_some() => return probe,
-				Err(_) => {},
-			}
+	/// in the directory `dir` (at `path`), a file's or a directory's: a mount
+	/// point when the error is `EBUSY` and the entry's `O_PATH` descriptor is
+	/// on another mount than the root, else the entry with the error. An
+	/// `EBUSY` alone is no mount: NFS refuses with it to remove its `.nfs…`
+	/// name for a deleted file still open, a FUSE daemon passes its own
+	/// answer, and the SMB client maps a sharing violation to it. A probe that
+	/// fails keeps the entry and the `EBUSY`, which is still the true error.
+	fn refusal(&self, dir: RawFd, name: &CStr, path: &Path, err: io::Error) -> Stop {
+		if err.raw_os_error() == Some(libc::EBUSY)
+			&& matches!(self.other_mount_at(dir, name), Ok(Some(true)))
+		{
+			return Stop::Mounted(path.to_path_buf());
 		}
-		stop(Stop::Unremovable(path.to_path_buf(), err))
+		Stop::Unremovable(path.to_path_buf(), err)
 	}
 }
 
@@ -462,8 +497,9 @@ fn names(dir: RawFd) -> io::Result<Vec<CString>> {
 /// not a directory is unlinked without being opened, and a directory is
 /// opened only if the open reaches that same directory (`open_dir`). An
 /// entry that is a mount point stops it before anything on that mount is
-/// touched, and so does an entry the system would not remove. `ancestors`
-/// holds the directories open above, the root's first.
+/// touched (a file mounted where `statx` gives no mount id is known by its
+/// unlink's `EBUSY`), and so does an entry the system would not remove.
+/// `ancestors` holds the directories open above, the root's first.
 fn remove_all_in(
 	dir: RawFd,
 	at: &Path,
@@ -475,11 +511,11 @@ fn remove_all_in(
 		let Some(entry) = entry_at(dir, &name)? else {
 			continue;
 		};
-		if root.mounted(dir, &name, &entry)? {
+		if entry.mounted_below(&root.entry) {
 			return Err(stop(Stop::Mounted(path)));
 		}
 		if !entry.is_dir() {
-			unlink_entry(dir, &name, 0).map_err(|err| root.unlink_refused(dir, &name, &path, err))?;
+			unlink_entry(dir, &name, 0).map_err(|err| stop(root.refusal(dir, &name, &path, err)))?;
 			continue;
 		}
 		may_enter(ancestors, &entry, &path)?;
@@ -493,15 +529,13 @@ fn remove_all_in(
 		remove_all_in(child.as_raw_fd(), &path, root, ancestors)?;
 		ancestors.pop();
 		drop(child);
-		// A directory's `EBUSY` is a mount point or a root (`vfs_rmdir`); any
-		// other refusal (`ENOTEMPTY` where NFS left a `.nfs…` name) is given
-		// with the entry.
+		// Everything below the directory is gone now. Its removal can still be
+		// refused: by a mount made on it after it was opened (`EBUSY`), by a
+		// FUSE daemon or an SMB server (`EBUSY` with no mount), or by NFS
+		// (`ENOTEMPTY` where it left a `.nfs…` name). The stop says the
+		// directory was emptied.
 		unlink_entry(dir, &name, libc::AT_REMOVEDIR).map_err(|err| {
-			if err.raw_os_error() == Some(libc::EBUSY) {
-				stop(Stop::Mounted(path.clone()))
-			} else {
-				stop(Stop::Unremovable(path.clone(), err))
-			}
+			stop(Stop::EmptiedNotRemoved(Box::new(root.refusal(dir, &name, &path, err))))
 		})?;
 	}
 	Ok(())
@@ -782,38 +816,67 @@ mod tests {
 		}
 	}
 
-	/// An `unlinkat`'s `EBUSY` is a mount point only where the entry is on
-	/// another mount than the root (`/proc` below `/`); on an entry of the
-	/// root's mount it is the entry's own refusal (NFS's `.nfs…` name, FUSE),
-	/// and the stop keeps the error. Any other error is kept too. With mount
-	/// ids from `statx` and from `/proc/self/fdinfo` alone.
+	/// An `unlinkat`'s `EBUSY` is a mount point only where the entry, a file's
+	/// or a directory's, is on another mount than the root (`/proc` below
+	/// `/`); on an entry of the root's mount it is the entry's own refusal
+	/// (NFS's `.nfs…` name, FUSE, SMB), and the stop keeps the error. Any
+	/// other error is kept too, and so is the `EBUSY` when the probe fails.
+	/// With mount ids from `statx` and from `/proc/self/fdinfo` alone.
 	#[test]
 	fn an_unlink_refusal_is_a_mount_only_on_another_mount() {
 		use super::super::test_hooks::{self, MountIds};
 		let dir = tempfile::tempdir().unwrap();
 		fs::write(dir.path().join("plain"), "plain\n").unwrap();
+		fs::create_dir(dir.path().join("sub")).unwrap();
 		let slash = fs::File::open("/").unwrap();
+		let busy = || io::Error::from_raw_os_error(libc::EBUSY);
+		let kept = |stop: &Stop, at: &str, errno: i32| {
+			matches!(stop, Stop::Unremovable(path, err)
+				if path == Path::new(at) && err.raw_os_error() == Some(errno))
+		};
 		for ids in [MountIds::Statx, MountIds::FdinfoOnly] {
 			test_hooks::set_mount_ids(ids);
 			let root_fd = fs::File::open(dir.path()).unwrap();
 			let root = Root::of(root_fd.as_raw_fd()).unwrap();
-			let busy = || io::Error::from_raw_os_error(libc::EBUSY);
-			let err = root.unlink_refused(slash.as_raw_fd(), c"proc", Path::new("proc"), busy());
-			assert!(matches!(stop_of(&err), Some(Stop::Mounted(_))), "{ids:?}: /proc: {err}");
 			let fd = root_fd.as_raw_fd();
-			let err = root.unlink_refused(fd, c"plain", Path::new("plain"), busy());
-			let Some(Stop::Unremovable(at, kept)) = stop_of(&err) else {
-				panic!("{ids:?}: plain: {err}");
-			};
-			assert_eq!((at.as_path(), kept.raw_os_error()), (Path::new("plain"), Some(libc::EBUSY)));
+			let stop = root.refusal(slash.as_raw_fd(), c"proc", Path::new("proc"), busy());
+			assert!(matches!(stop, Stop::Mounted(_)), "{ids:?}: /proc: {stop}");
+			for (name, at) in [(c"plain", "plain"), (c"sub", "sub")] {
+				let stop = root.refusal(fd, name, Path::new(at), busy());
+				assert!(kept(&stop, at, libc::EBUSY), "{ids:?}: {at}: {stop}");
+			}
 			let denied = io::Error::from_raw_os_error(libc::EACCES);
-			let err = root.unlink_refused(fd, c"plain", Path::new("plain"), denied);
-			assert!(
-				matches!(stop_of(&err), Some(Stop::Unremovable(_, kept)) if kept.raw_os_error() == Some(libc::EACCES)),
-				"{ids:?}: {err}"
-			);
+			let stop = root.refusal(fd, c"plain", Path::new("plain"), denied);
+			assert!(kept(&stop, "plain", libc::EACCES), "{ids:?}: {stop}");
+			// A probe that fails (no mount ids here) keeps the entry and the
+			// `EBUSY`.
+			test_hooks::set_mount_ids(MountIds::None);
+			let stop = root.refusal(fd, c"plain", Path::new("plain"), busy());
+			assert!(kept(&stop, "plain", libc::EBUSY), "{ids:?}: failed probe: {stop}");
 			test_hooks::clear();
 		}
+	}
+
+	/// The emptying opens no `O_PATH` descriptor for the files it removes,
+	/// even where `statx` gives no mount id: a mounted file is known by its
+	/// unlink's `EBUSY`. The check walk probes each of them, which shows the
+	/// count works.
+	#[test]
+	fn the_emptying_probes_no_file_it_removes() {
+		use super::super::test_hooks::{self, MountIds};
+		let dir = tempfile::tempdir().unwrap();
+		for n in 0..20 {
+			fs::write(dir.path().join(format!("f{n}")), "x").unwrap();
+		}
+		test_hooks::set_mount_ids(MountIds::FdinfoOnly);
+		let tree = TreeDir::open(dir.path()).unwrap().unwrap();
+		assert!(tree.foreign_entry(&|_| false).unwrap().is_none());
+		let walked = test_hooks::probes();
+		tree.empty().unwrap();
+		let emptied = test_hooks::probes() - walked;
+		test_hooks::clear();
+		assert_eq!((walked, emptied), (20, 0), "probes of the check walk and of the emptying");
+		assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 	}
 
 	/// A symlink to a directory is not opened as the tree's root (under gVisor

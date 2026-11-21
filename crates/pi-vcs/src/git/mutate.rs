@@ -744,12 +744,14 @@ impl GitRepo {
 	/// mount ids (before Linux 5.8), each entry's is read from
 	/// `/proc/self/fdinfo`, a file's through an `O_PATH` descriptor. A mount
 	/// made during the emptying, or an entry the system will not remove (an NFS
-	/// client's `.nfs…` name for a deleted file still open), stops the emptying
-	/// there: nothing at that entry is touched, what the emptying reached before
-	/// it is gone, the registration is kept, and the message names the entry and
-	/// the error. The token stays on the emptied directory. Registrations
-	/// earlier reclaims moved out of git's view and did not delete go first.
-	/// Returns one note per removal, for the caller to show.
+	/// client's `.nfs…` name for a deleted file still open, an `EBUSY` from a
+	/// FUSE daemon or an SMB server), stops the emptying there: what the
+	/// emptying reached before it is gone, the registration is kept, and the
+	/// message names the entry and the error, and says whether the emptying had
+	/// touched nothing at that entry or had emptied that directory and then
+	/// could not remove it. The token stays on the emptied directory.
+	/// Registrations earlier reclaims moved out of git's view and did not delete
+	/// go first. Returns one note per removal, for the caller to show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
 		let common = &self.info().common_dir;
 		sweep_moved_registrations(common);
@@ -2841,21 +2843,32 @@ fn reclaim_tree(
 	// the add keeps an empty directory anyway.
 	dir.make_owner_writable()?;
 	if let Err(err) = dir.empty() {
-		return Err(match tree_dir::stop_of(&err) {
-			// Met after the checks: what the emptying reached before is gone.
-			Some(stop) => Error::backend(
-				"git worktree add",
-				format!(
-					"emptying '{}', the partial tree of an interrupted worktree add ({}), stopped: it \
-					 {}. Nothing at that entry or below it was touched, what the emptying reached \
-					 before it is gone, and the registration stays",
-					tree.display(),
-					admin.display(),
-					stop.reason(tree)
-				),
+		let stopped = match tree_dir::stop_of(&err) {
+			Some(stop) => {
+				let reached = match stop.reached() {
+					tree_dir::Reached::NothingAtTheEntry => {
+						"Nothing at that entry or below it was touched; what the emptying reached before \
+						 it is gone"
+					},
+					tree_dir::Reached::EmptiedTheDirectory => {
+						"That directory was emptied and then not removed; what the emptying reached \
+						 before it is gone"
+					},
+					tree_dir::Reached::NoEntry => "What the emptying reached before it stopped is gone",
+				};
+				format!("stopped: it {}. {reached}", stop.reason(tree))
+			},
+			None => format!("failed: {err}. What the emptying reached before it failed is gone"),
+		};
+		return Err(Error::backend(
+			"git worktree add",
+			format!(
+				"emptying '{}', the partial tree of an interrupted worktree add ({}), {stopped}, and \
+				 the registration stays",
+				tree.display(),
+				admin.display()
 			),
-			None => err.into(),
-		});
+		));
 	}
 	Ok(format!(
 		"emptied the partial tree an interrupted worktree add left at {}, with any file written or \
@@ -3000,6 +3013,8 @@ mod test_hooks {
 		#[cfg(target_os = "linux")]
 		static UNLINK_ERROR: RefCell<Option<ErrnoHook>> = const { RefCell::new(None) };
 		#[cfg(target_os = "linux")]
+		static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+		#[cfg(target_os = "linux")]
 		static MOUNT_IDS: std::cell::Cell<MountIds> = const { std::cell::Cell::new(MountIds::Statx) };
 	}
 
@@ -3025,6 +3040,18 @@ mod test_hooks {
 	#[cfg(target_os = "linux")]
 	pub fn mount_ids() -> MountIds {
 		MOUNT_IDS.with(std::cell::Cell::get)
+	}
+
+	/// Counts an `O_PATH` probe of an entry's mount on this thread.
+	#[cfg(target_os = "linux")]
+	pub fn count_probe() {
+		PROBES.with(|count| count.set(count.get() + 1));
+	}
+
+	/// The `O_PATH` probes of entries' mounts on this thread since [`clear`].
+	#[cfg(target_os = "linux")]
+	pub fn probes() -> usize {
+		PROBES.with(std::cell::Cell::get)
 	}
 
 	/// Makes the emptying on this thread fail its `unlinkat` of an entry with
@@ -3109,6 +3136,8 @@ mod test_hooks {
 		BEFORE_ENTRY_OPEN.with(|slot| *slot.borrow_mut() = None);
 		#[cfg(target_os = "linux")]
 		UNLINK_ERROR.with(|slot| *slot.borrow_mut() = None);
+		#[cfg(target_os = "linux")]
+		PROBES.with(|count| count.set(0));
 		#[cfg(target_os = "linux")]
 		MOUNT_IDS.with(|slot| slot.set(MountIds::Statx));
 	}
@@ -3799,7 +3828,8 @@ mod tests {
 			let err = emptied.unwrap_err();
 			assert_eq!(fs::read(&file).unwrap(), before, "{ids:?}: the emptying changed the file");
 			assert!(
-				matches!(tree_dir::stop_of(&err), Some(tree_dir::Stop::Mounted(at)) if at == Path::new("mounted")),
+				matches!(tree_dir::stop_of(&err), Some(tree_dir::Stop::Mounted(at))
+					if at == Path::new(file.file_name().unwrap())),
 				"{ids:?}: {err}"
 			);
 		}
@@ -3831,6 +3861,71 @@ mod tests {
 		);
 		assert!(err.contains("what the emptying reached before it is gone"), "{err}");
 		assert!(tree.join("partial").is_file() && admin.is_dir(), "{err}");
+	}
+
+	/// A directory the emptying emptied and then could not remove (NFS's
+	/// `ENOTEMPTY` where it left a `.nfs…` name, a FUSE daemon's or an SMB
+	/// server's `EBUSY`, which is no mount) is named with its error, and the
+	/// message says it was emptied, not that nothing there was touched. A
+	/// test hook makes the rmdir of `src` fail, as no test can make NFS, FUSE
+	/// or SMB do here.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_directory_emptied_and_then_not_removed_is_said_to_be_emptied() {
+		for errno in [libc::ENOTEMPTY, libc::EBUSY] {
+			let (_temp, repo) = fixture();
+			let trees = tempfile::tempdir().unwrap();
+			let tree = trees.path().join("wt");
+			let admin = abandoned_add(&repo, &tree, None);
+			fs::create_dir(tree.join("src")).unwrap();
+			fs::write(tree.join("src/main.rs"), "fn main() {}\n").unwrap();
+			test_hooks::set_unlink_error(move |name| (name == Path::new("src")).then_some(errno));
+			let result = repo.worktree_reclaim_abandoned(&tree);
+			test_hooks::clear();
+			let err = result.unwrap_err().to_string();
+			assert!(
+				err.contains(&format!(
+					"has an entry the system would not remove ({}: ",
+					tree.join("src").display()
+				)) && err.contains(&format!("os error {errno}"))
+					&& !err.contains("mounted"),
+				"errno {errno}: {err}"
+			);
+			assert!(
+				err.contains("That directory was emptied and then not removed")
+					&& !err.contains("Nothing at that entry"),
+				"errno {errno}: {err}"
+			);
+			assert!(
+				tree.join("src").is_dir() && !tree.join("src/main.rs").exists() && admin.is_dir(),
+				"errno {errno}: {err}"
+			);
+		}
+	}
+
+	/// A stop of the emptying that names no entry (no mount ids, here made
+	/// to fail between the check walk and the emptying) says nothing of an
+	/// entry.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_emptying_stop_that_names_no_entry_says_nothing_of_one() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		test_hooks::set_before_tree_removal(|_| {
+			test_hooks::set_mount_ids(test_hooks::MountIds::None);
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("stopped: it is on a system that reports no mount ids")
+				&& err.contains("What the emptying reached before it stopped is gone")
+				&& !err.contains("that entry"),
+			"{err}"
+		);
+		assert!(admin.is_dir(), "{err}");
 	}
 
 	/// A symlink below the tree's root is removed itself, never followed:
