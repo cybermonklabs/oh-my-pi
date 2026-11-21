@@ -1011,8 +1011,16 @@ mod tests {
 			.unwrap();
 	}
 
+	/// Whether the jj CLI runs here; when not, the calling test skips, after
+	/// this prints `skipped: <reason>`.
 	fn jj_available() -> bool {
-		Command::new("jj").arg("--version").output().is_ok()
+		match Command::new("jj").arg("--version").output() {
+			Ok(_) => true,
+			Err(err) => {
+				eprintln!("skipped: no jj CLI on PATH: {err}");
+				false
+			},
+		}
 	}
 
 	fn run_jj(root: &Path, args: &[&str]) -> String {
