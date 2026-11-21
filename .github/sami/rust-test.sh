@@ -146,6 +146,7 @@ entries() {
 entries rust-test-known-failures.txt 2 known-failures.tsv
 entries rust-test-known-skips.txt 2 known-skips.tsv
 entries rust-test-known-output.txt 2 known-output.tsv
+entries rust-test-known-raw-output.txt 2 known-raw-output.tsv
 entries rust-test-sanctioned-skips.txt 2 sanctioned.tsv
 entries rust-test-own-process.txt 2 own.tsv
 entries rust-test-root-targets.txt 2 roots.tsv
@@ -575,12 +576,32 @@ incomplete="$tmp/incomplete.txt"
 : >"$skips"
 : >"$outputs"
 : >"$incomplete"
+raw_output="$tmp/raw-output.tsv"
+: >"$raw_output"
 
-# scan_output <target> <log>...: the skips and the passing tests' output in
-# a libtest log, and in the stderr cargo kept beside it. Only a passing test
-# is read: a failed test fails the job anyway, and its report can quote a
-# tool's own `skipping` line (rsync's `skipping non-regular file`, run
-# 44807499064), which is no skip.
+# raw_lines <log> [<cargo stderr>]: what a test binary wrote outside
+# libtest's record: the log's lines that are no JSON event, and, from cargo's
+# stderr, the lines after its first `Running` line (before it, cargo's own
+# build output). Bazel's own lines in a test.log (its banner, and its line for
+# a test it timed out, which fails anyway), cargo's line after a failed test,
+# and blank lines are left out.
+# shellcheck disable=SC2016 # the patterns name a literal $0 and ${PAGER...}
+raw_lines() {
+	{
+		grep -av '^{' "$1" || true
+		if [ -n "${2:-}" ] && [ -f "$2" ]; then awk 'p; /^ +Running /{ p = 1 }' "$2"; fi
+	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass ' || true
+}
+
+# scan_output <target> <log> [<cargo stderr>]: the skips and the passing
+# tests' output in a libtest log, and what the test binary wrote outside its
+# record. Only a passing test's record is read: a failed test fails the job
+# anyway, and its report can quote a tool's own `skipping` line (rsync's
+# `skipping non-regular file`, run 44807499064), which is no skip. A line
+# outside the record is a skip when it has a skip word and names its test;
+# any other is kept for rust-test-known-raw-output.txt (below), except in a
+# cargo doctest run's log, where every line a doctest printed is in its
+# record (doc_attribute, one thread) and the lines outside are cargo's build.
 scan_output() {
 	local label="$1" line
 	shift
@@ -591,13 +612,18 @@ scan_output() {
 	jq -R -r --arg target "$label" --arg log "$1" '
 		fromjson? | select(type == "object" and .type == "test" and .event == "ok" and (.stdout // "") != "")
 		| "\($target)\t\(.name)\t\($log)"' "$1" >>"$outputs"
+	raw_lines "$@" >"$tmp/raw-here.txt"
 	while IFS= read -r line; do
 		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED)[\ :] ]]; then
 			printf '%s\t%s\n' "$label" "${BASH_REMATCH[1]}" >>"$skips"
 		else
 			error "Rust tests" "$label printed a skip line outside libtest's record that names no test: $line"
 		fi
-	done < <(cat -- "$@" | grep -v '^{' | grep -E "$raw_skip_line" || true)
+	done < <(grep -aE "$raw_skip_line" "$tmp/raw-here.txt" || true)
+	case "$label" in
+		*:doc | *:doc:*) ;;
+		*) grep -avE "$raw_skip_line" "$tmp/raw-here.txt" | awk -v t="$label" '{ gsub(/\t/, " "); print t "\t" $0 }' >>"$raw_output" || true ;;
+	esac
 }
 
 # check_root <target> <log>: a root target runs as root, so a test in it
@@ -816,6 +842,35 @@ while IFS=$'\t' read -r origin dir name; do
 done <"$tmp/doc-ignored.tsv"
 echo "::endgroup::"
 echo "\`\`\`ignore doc blocks, not tests, marked ignore by upstream: $(count "$tmp/doc-ignored.tsv")"
+
+# What test binaries wrote outside libtest's record (a child's or a thread's
+# write to the inherited stdout or stderr), which no test's record holds: each
+# distinct line must match an entry of .github/sami/rust-test-known-raw-output.txt
+# for its target (`<target> <extended regular expression of the whole line>
+# <why it is no skip>`); any other fails the job, since it can be a skip in
+# other words. An entry that matched nothing gets a notice.
+LC_ALL=C sort -u -o "$raw_output" "$raw_output"
+awk -F'\t' '
+	FILENAME == ARGV[1] { n[$1]++; re[$1, n[$1]] = $2; used[$1, n[$1]] = 0; next }
+	{
+		hit = 0
+		for (i = 1; i <= n[$1]; i++) if ($2 ~ ("^(" re[$1, i] ")$")) { hit = 1; used[$1, i] = 1 }
+		if (!hit) print "unknown\t" $1 "\t" $2
+	}
+	END { for (k in used) if (!used[k]) { split(k, p, SUBSEP); print "unused\t" p[1] "\t" re[p[1], p[2]] } }
+' "$tmp/known-raw-output.tsv" "$raw_output" | LC_ALL=C sort >"$tmp/raw-verdict.tsv"
+awk -F'\t' '$1 == "unknown" { print $2 }' "$tmp/raw-verdict.tsv" | LC_ALL=C sort -u >"$tmp/raw-targets.txt"
+while read -r label; do
+	awk -F'\t' -v t="$label" '$1 == "unknown" && $2 == t { print $3 }' "$tmp/raw-verdict.tsv" >"$tmp/raw-lines.txt"
+	error "Rust test printed" "$label wrote $(count "$tmp/raw-lines.txt") lines outside libtest's record that $sami/rust-test-known-raw-output.txt does not name (a skip in other words?), the first: $(sed -n 1p "$tmp/raw-lines.txt")"
+	echo "::group::$label: lines outside libtest's record that no entry names"
+	sed -n 1,40p "$tmp/raw-lines.txt"
+	echo "::endgroup::"
+done <"$tmp/raw-targets.txt"
+while IFS=$'\t' read -r _ label re; do
+	echo "::notice title=Known raw output did not happen::$label $re is in $sami/rust-test-known-raw-output.txt but matched no line"
+done < <(awk -F'\t' '$1 == "unused"' "$tmp/raw-verdict.tsv")
+echo "Lines outside libtest's record: $(count "$raw_output") distinct, $(awk -F'\t' '$1 == "unknown"' "$tmp/raw-verdict.tsv" | awk 'END { print NR }') named by no entry"
 
 # The cargo re-run reads each doctest's output, so it must have run the same
 # doctests as Bazel's doctest target of the crate (whose crate features can

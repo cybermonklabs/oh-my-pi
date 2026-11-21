@@ -231,6 +231,7 @@ run() {
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
 	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
 	list rust-test-macos.txt "${MACOS:-}" "macOS only"
+	{ echo '# raw'; [ -n "${KNOWN_RAW:-}" ] && printf '%s\n' "$KNOWN_RAW" | while IFS= read -r l; do printf '%s  prints it; no skip\n' "$l"; done; } >"$w/repo/.github/sami/rust-test-known-raw-output.txt"
 	local only_env=()
 	if [ -n "${ONLY:-}" ]; then
 		list only.txt "$ONLY" "macOS only"
@@ -354,6 +355,8 @@ fi
 sel="" ign=0 threads=""
 for a in "\$@"; do case "\$a" in --lib|--doc|--test) sel="\$a" ;; --ignored) ign=1 ;; --test-threads=1) threads=1 ;; esac; done
 echo "   Compiling demo v0.1.0" >&2
+# cargo names each test binary it runs; what follows on stderr is the binary's.
+[ "\$sel" = --doc ] || echo "     Running tests/wire.rs (target/debug/deps/wire-0)" >&2
 if [ "\$sel" = --doc ]; then
 	case " \${RUSTDOCFLAGS:-} " in *" -Zunstable-options --no-capture "*) ;; *) echo "stub: cargo test --doc without RUSTDOCFLAGS --no-capture (\${RUSTDOCFLAGS:-})" >&2; exit 2 ;; esac
 	[ "\$threads" = 1 ] || { echo "stub: cargo test --doc without --test-threads=1" >&2; exit 2; }
@@ -372,6 +375,7 @@ case "\$mode:\$sel" in
 	partial-test:--test) lt_partial; exit 0 ;;
 	stderr-skip:--test) echo "skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
 	stderr-skip-named:--test) echo "a::two: skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
+	stderr-raw:--test) echo "no free port: nothing to test" >&2; lt_pass a::one a::two; exit 0 ;;
 	filtered:--test) FILTERED=1 lt_pass a::one; exit 0 ;;
 	ignored:--test | ignored-fails:--test | ignored-and-doc-ignored:--test) lt_ignored a::one a::slow; exit 0 ;;
 	doc-ignored:--doc | ignored-and-doc-ignored:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ignored" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
@@ -609,6 +613,17 @@ run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' 
 CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=doc-extra run J114-cargo-doctest-without-bazel-counterpart 1 "crates/pi-diff src/lib.rs - h \\(line 20\\) ran in cargo's doctest run and not in Bazel's doctest target" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# R3-1: a line a test binary writes outside libtest's record (a child's or a
+# thread's write to the inherited stream) is a skip if it has a skip word,
+# and must match rust-test-known-raw-output.txt otherwise, or the job fails.
+RAWREC="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n{ \"type\": \"test\", \"event\": \"started\", \"name\": \"wt::carry\" }\nno free port: nothing to test\n{ \"type\": \"test\", \"name\": \"wt::carry\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'"
+run J116-raw-other-wording-fails 1 "$D wrote 1 lines outside libtest's record that .github/sami/rust-test-known-raw-output.txt does not name .*: no free port: nothing to test" '' "{ $P; rt $D PASSED $RAWREC; } >\"\$bep\"; exit 0"
+KNOWN_RAW="$D no free port: nothing to test" NOT_MSG='::error' run J117-raw-line-named 0 "Lines outside libtest's record: 1 distinct, 0 named by no entry" '' "{ $P; rt $D PASSED $RAWREC; } >\"\$bep\"; exit 0"
+KNOWN_RAW="$D (running 1 test|test result: .*)" NOT_MSG='::error' run J118-raw-entry-unused-is-a-notice 0 "::notice title=Known raw output did not happen::$D \\(running 1 test" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+KNOWN_RAW="$PR no free port: nothing to test" run J119-raw-entry-of-another-target 1 "$D wrote 1 lines outside libtest's record" '' "{ $P; rt $D PASSED $RAWREC; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run J120-bazel-banner-is-no-output 0 "Lines outside libtest's record: 0 distinct" '' "banner_pass() { printf '%s\n' 'exec \${PAGER:-/usr/bin/less} \"\$0\" || exit 1' 'Executing tests from $D' '-----------------------------------------------------------------------------'; FMT=json lt_pass a::one; }; { $P; rt $D PASSED banner_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=stderr-raw run J121-cargo-stderr-other-wording-fails 1 "sdk/rust/demo:test:wire wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+NOT_MSG='Compiling demo' run J122-cargo-build-output-is-no-output 0 "Lines outside libtest's record: 0 distinct" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
