@@ -1383,4 +1383,179 @@ mod tests {
 		);
 		assert!(!to.join("elsewhere/moved").exists(), "the move went through the link");
 	}
+
+	/// Runs `mv` with `args` and `stdin` in `dir`, returning the exit status
+	/// and standard error.
+	#[cfg(unix)]
+	fn mv_in(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String) {
+		let (code, capture) = run_util::<Mv>(args, stdin, dir);
+		(code, capture.err())
+	}
+
+	/// Where a symlink to nothing is the destination's name.
+	#[cfg(unix)]
+	fn dangling(path: &std::path::Path) {
+		std::os::unix::fs::symlink("missing", path).unwrap();
+	}
+
+	/// The link at `path`, if it is one.
+	#[cfg(unix)]
+	fn link_at(path: &std::path::Path) -> Option<std::path::PathBuf> {
+		fs::read_link(path).ok()
+	}
+
+	/// A symlink at the destination's name is a destination, even one that
+	/// points nowhere: GNU mv looks at the destination without following a
+	/// symlink there. Each expectation is GNU coreutils 9.7's, checked against
+	/// it and 9.4 in the same runs; `-n` is 9.5's and later (a silent skip
+	/// with status 0), as this port's `-n` is for any destination.
+	#[cfg(unix)]
+	#[test]
+	fn a_dangling_link_at_the_destination_is_a_destination() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("src")).unwrap();
+			fs::write(dir.join("src/moved"), b"moved").unwrap();
+			fs::create_dir(dir.join("dd")).unwrap();
+			dangling(&dir.join("dd/src"));
+			dir
+		};
+
+		// --backup: the link is moved aside, as any destination is, and the
+		// directory takes its name.
+		let dir = case("backup");
+		assert_eq!(mv_in(&dir, &["--backup=simple", "src", "dd"], ""), (0, String::new()), "backup");
+		assert_eq!(link_at(&dir.join("dd/src~")), Some("missing".into()), "backup: the link was not backed up");
+		assert_eq!(fs::read(dir.join("dd/src/moved")).unwrap(), b"moved", "backup: the directory did not move");
+
+		// -n: the destination exists, so nothing is moved.
+		let dir = case("no-clobber");
+		assert_eq!(mv_in(&dir, &["-n", "src", "dd"], ""), (0, String::new()), "-n");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-n: the link was replaced");
+		assert!(dir.join("src/moved").exists(), "-n: the source moved");
+
+		// --update=none: the same.
+		let dir = case("update-none");
+		assert_eq!(mv_in(&dir, &["--update=none", "src", "dd"], ""), (0, String::new()), "--update=none");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "--update=none: the link was replaced");
+
+		// -i: the link is a destination to ask about; declining keeps it.
+		let dir = cwd.path().join("interactive");
+		fs::create_dir_all(dir.join("dd")).unwrap();
+		fs::write(dir.join("src"), b"src").unwrap();
+		dangling(&dir.join("dd/src"));
+		assert_eq!(
+			mv_in(&dir, &["-i", "src", "dd"], "n\n"),
+			(1, "mv: overwrite 'dd/src'? ".to_owned()),
+			"-i: no prompt for the link"
+		);
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-i: the link was replaced");
+		assert_eq!(fs::read(dir.join("src")).unwrap(), b"src", "-i: the source moved");
+
+		// -u: the link's own time is the destination's; it is newer than
+		// the source, so nothing is moved.
+		let dir = cwd.path().join("update-older");
+		fs::create_dir_all(dir.join("dd")).unwrap();
+		fs::write(dir.join("src"), b"src").unwrap();
+		fs::File::options()
+			.write(true)
+			.open(dir.join("src"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+			.unwrap();
+		dangling(&dir.join("dd/src"));
+		assert_eq!(mv_in(&dir, &["-u", "src", "dd"], ""), (0, String::new()), "-u");
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "-u: the link was replaced");
+		assert_eq!(fs::read(dir.join("src")).unwrap(), b"src", "-u: the source moved");
+
+		// With neither, a directory does not replace the link (the control:
+		// this held before).
+		let dir = case("plain");
+		assert_eq!(
+			mv_in(&dir, &["src", "dd"], ""),
+			(1, "mv: cannot overwrite non-directory 'dd/src' with directory 'src'\n".to_owned()),
+			"plain"
+		);
+		assert_eq!(link_at(&dir.join("dd/src")), Some("missing".into()), "plain: the link was replaced");
+
+		// Without -i, a destination the user cannot write to is asked about
+		// when stdin is a terminal, but a link is writable whatever it points
+		// to, as GNU's `writable_destination` decides: a dangling link here
+		// would otherwise be asked about, which GNU never does.
+		let (host, _capture) = Host::for_test(Mv::NAME, "", &dir);
+		assert_eq!(
+			super::is_writable(&host, std::path::Path::new("dd/src")),
+			(true, None),
+			"the link is not writable"
+		);
+	}
+
+	/// `-u` does not skip a directory, whatever the destination's time: GNU
+	/// compares times only for a source that is not a directory, so a
+	/// directory moved onto a newer regular file is refused, not skipped.
+	#[cfg(unix)]
+	#[test]
+	fn update_older_does_not_skip_a_directory() {
+		let cwd = tempdir().unwrap();
+		fs::create_dir_all(cwd.path().join("src")).unwrap();
+		fs::create_dir(cwd.path().join("dd")).unwrap();
+		fs::write(cwd.path().join("dd/src"), b"kept").unwrap();
+		std::fs::File::open(cwd.path().join("src"))
+			.unwrap()
+			.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+			.unwrap();
+		assert_eq!(
+			mv_in(cwd.path(), &["-u", "src", "dd"], ""),
+			(1, "mv: cannot overwrite non-directory 'dd/src' with directory 'src'\n".to_owned())
+		);
+		assert_eq!(fs::read(cwd.path().join("dd/src")).unwrap(), b"kept");
+		assert!(cwd.path().join("src").is_dir());
+	}
+
+	/// With two operands, a directory moved onto a regular file or a symlink
+	/// is refused unless the destination is backed up (`-b`), as GNU mv
+	/// allows: then the destination is moved aside and the directory takes
+	/// its name. `--update=none` skips it with status 0.
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_replaces_a_non_directory_operand_only_with_a_backup() {
+		let cwd = tempdir().unwrap();
+		let case = |name: &str, link: bool| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("src")).unwrap();
+			fs::write(dir.join("src/moved"), b"moved").unwrap();
+			if link {
+				dangling(&dir.join("dest"));
+			} else {
+				fs::write(dir.join("dest"), b"kept").unwrap();
+			}
+			dir
+		};
+
+		let dir = case("file-backup", false);
+		assert_eq!(mv_in(&dir, &["-b", "src", "dest"], ""), (0, String::new()), "-b onto a file");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"kept", "-b onto a file: no backup");
+		assert_eq!(fs::read(dir.join("dest/moved")).unwrap(), b"moved", "-b onto a file: not moved");
+
+		let dir = case("link-backup", true);
+		assert_eq!(mv_in(&dir, &["-b", "src", "dest"], ""), (0, String::new()), "-b onto a link");
+		assert_eq!(link_at(&dir.join("dest~")), Some("missing".into()), "-b onto a link: no backup");
+		assert_eq!(fs::read(dir.join("dest/moved")).unwrap(), b"moved", "-b onto a link: not moved");
+
+		let dir = case("file-update-none", false);
+		assert_eq!(mv_in(&dir, &["--update=none", "src", "dest"], ""), (0, String::new()), "--update=none");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"kept", "--update=none: replaced");
+
+		// The controls: without a backup each is refused, as before.
+		for (name, link) in [("file", false), ("link", true)] {
+			let dir = case(name, link);
+			assert_eq!(
+				mv_in(&dir, &["src", "dest"], ""),
+				(1, "mv: cannot overwrite non-directory 'dest' with directory 'src'\n".to_owned()),
+				"{name}"
+			);
+			assert!(dir.join("src/moved").exists(), "{name}: the source moved");
+		}
+	}
 }
