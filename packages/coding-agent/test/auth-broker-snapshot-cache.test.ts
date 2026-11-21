@@ -293,12 +293,14 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 				return hang.promise;
 			},
 		});
+		// The client takes the global `fetch` when startup makes it; each call's signal is the one
+		// the deadline aborts.
+		const fetched = vi.spyOn(globalThis, "fetch");
 		vi.useFakeTimers();
 		try {
 			process.env.OMP_AUTH_BROKER_URL = server.url.toString();
 			process.env.OMP_AUTH_BROKER_TOKEN = TOKEN;
 			process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS = "0";
-			let settled = false;
 			const retries: AuthBrokerStartupRetry[] = [];
 			const retried = Promise.withResolvers<void>();
 			const discovered = discoverAuthStorage(tempDir, {
@@ -307,29 +309,45 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 					retried.resolve();
 				},
 			});
+			let settled = false;
 			const outcome = rejectionOf(discovered).finally(() => {
 				settled = true;
 			});
-			await requests[0].promise;
+			// Each step waits for an event only startup that is still running makes; if startup
+			// ends first, the step fails saying so rather than at the test's timeout.
+			const before = <T>(event: Promise<T>, what: string) =>
+				Promise.race([
+					event,
+					outcome.then(error => {
+						throw new Error(`startup ended before ${what}: ${error}`);
+					}),
+				]);
+			await before(requests[0].promise, "the first request");
 			// At 10 s the request timeout cuts the first attempt, and the client makes its second.
 			vi.advanceTimersByTime(10_000);
-			await requests[1].promise;
+			await before(requests[1].promise, "the second request");
 			// At 20 s it cuts that one too: startup reports one retry and waits 500 ms.
 			vi.advanceTimersByTime(10_000);
-			await retried.promise;
+			await before(retried.promise, "the retry");
 			expect(retries).toMatchObject([{ delayMs: 500, budgetMs: 30_000 }]);
 			vi.advanceTimersByTime(500);
-			await requests[2].promise;
-			// Short of 30 s of fake time, startup is still waiting on the broker.
+			await before(requests[2].promise, "the third request");
+			const third = fetched.mock.calls.at(-1)?.[1]?.signal;
+			expect(fetched).toHaveBeenCalledTimes(3);
+			// 1 ms short of 30 s, the third request is still in flight.
+			vi.advanceTimersByTime(9_499);
+			expect(third?.aborted).toBe(false);
 			expect(settled).toBe(false);
-			// At 30 s the deadline cancels the request in flight.
-			vi.advanceTimersByTime(9_500);
+			// At 30 s the deadline cancels it.
+			vi.advanceTimersByTime(1);
+			expect(third?.aborted).toBe(true);
 			expect(await outcome).toBeInstanceOf(AuthBrokerError);
 			// Giving up is not reported as one more retry.
 			expect(retries).toHaveLength(1);
 			expect(seen).toBe(3);
 		} finally {
 			vi.useRealTimers();
+			fetched.mockRestore();
 			hang.resolve(new Response(null, { status: 503 }));
 			server.stop(true);
 		}
