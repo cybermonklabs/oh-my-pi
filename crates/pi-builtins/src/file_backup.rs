@@ -585,12 +585,8 @@ pub(crate) mod tests {
 	fn a_numbered_name_past_the_name_limit_falls_back_to_a_tilde() {
 		let vfs = pi_vfs::BlockingFs::native();
 		let dir = tempfile::tempdir().unwrap();
-		match pathconf_name_max(dir.path()) {
-			Some(255) => {},
-			other => {
-				eprintln!("skipped: NAME_MAX here is {other:?}, not 255");
-				return;
-			},
+		if !fits_255_byte_names(dir.path()) {
+			return;
 		}
 		let name = |byte: char, length: usize| byte.to_string().repeat(length);
 		let cases = [
@@ -623,6 +619,19 @@ pub(crate) mod tests {
 		(max != -1).then_some(i64::from(max))
 	}
 
+	/// Whether the directory `dir` takes the 251- to 255-byte names the
+	/// long-name tests make (`NAME_MAX` is 255); prints a skip line saying
+	/// why when it does not, as on eCryptfs (143).
+	pub(crate) fn fits_255_byte_names(dir: &Path) -> bool {
+		match pathconf_name_max(dir) {
+			Some(255) => true,
+			other => {
+				eprintln!("skipped: NAME_MAX here is {other:?}, not 255");
+				false
+			},
+		}
+	}
+
 	/// Checks a caller of [`backup_path`] against an empty suffix: in a
 	/// directory holding `src` ("new") and `dest` ("old"), `run(dir)` must
 	/// move or copy `src` to `dest` with `-b -S ''` and return the exit
@@ -644,6 +653,9 @@ pub(crate) mod tests {
 	/// and back `D` up as `D~`, keeping `D.~9~`.
 	pub(crate) fn check_name_limit(run: impl Fn(&Path, &str) -> (i32, String)) {
 		let dir = tempfile::tempdir().unwrap();
+		if !fits_255_byte_names(dir.path()) {
+			return;
+		}
 		let long = "a".repeat(251);
 		fs::write(dir.path().join("src"), "new").unwrap();
 		fs::write(dir.path().join(&long), "old").unwrap();
@@ -652,5 +664,90 @@ pub(crate) mod tests {
 		assert_eq!(fs::read_to_string(dir.path().join(format!("{long}~"))).ok().as_deref(), Some("old"));
 		assert_eq!(fs::read_to_string(dir.path().join(&long)).unwrap(), "new");
 		assert_eq!(fs::read_to_string(dir.path().join(format!("{long}.~9~"))).unwrap(), "nine");
+	}
+
+	/// Checks a caller of [`backup_path`] (`util` is `mv`, `cp` or `ln`)
+	/// where a long name makes the backup give way to a `~` name that is the
+	/// source, the destination itself, or another entry. `run(dir, args)`
+	/// runs the utility in `dir` and returns its exit status and standard
+	/// error. Names: `D` is 251 bytes (beside `D.~9~`, so `D.~10~` is too
+	/// long and the backup is `D~`); `L` is 255 bytes of `a`, whose `~` name
+	/// is `A~`, 253 bytes of `a` and `~`, which is also the destination `E`
+	/// of the destination cases.
+	///
+	/// GNU coreutils 9.4 and 9.7, run on each case, refuse in mv and cp, with
+	/// these messages, every numbered backup whose `~` name an entry holds
+	/// (they rename it without replacing). They replace the entry in ln, and
+	/// a simple backup's `~` name in all three; where that entry is the source
+	/// or the destination itself, the old contents are lost with status 0
+	/// (cp fails, but after the loss, when the backup is its source). Here
+	/// those losses are refused instead: a backup that is the source with
+	/// GNU's "might destroy source", one that is the destination with
+	/// "cannot backup". ln replaces an unrelated entry, as GNU ln does.
+	pub(crate) fn check_long_name_backups(util: &str, run: impl Fn(&Path, &[&str]) -> (i32, String)) {
+		let root = tempfile::tempdir().unwrap();
+		if !fits_255_byte_names(root.path()) {
+			return;
+		}
+		let d = "d".repeat(251);
+		let (d_tilde, d_nine) = (format!("{d}~"), format!("{d}.~9~"));
+		let (l, cut) = ("a".repeat(255), format!("{}~", "a".repeat(253)));
+		let verb = match util {
+			"mv" => "moved",
+			"cp" => "copied",
+			_ => "linked",
+		};
+		let cannot_backup = |dest: &str| (1, format!("{util}: cannot backup '{dest}': File exists\n"));
+		let destroys = |dest: &str, source: &str| {
+			(1, format!("{util}: backing up '{dest}' might destroy source;  '{source}' not {verb}\n"))
+		};
+		let check = |case: &str, before: &[(&str, &str)], args: &[&str], expected: (i32, String), after: &[(&str, &str)]| {
+			let dir = root.path().join(case);
+			fs::create_dir(&dir).unwrap();
+			for (name, content) in before {
+				fs::write(dir.join(name), content).unwrap();
+			}
+			assert_eq!(run(&dir, args), expected, "{util} {case}");
+			for (name, content) in after {
+				assert_eq!(
+					fs::read_to_string(dir.join(name)).ok().as_deref(),
+					Some(*content),
+					"{util} {case}: {} bytes",
+					name.len()
+				);
+			}
+		};
+		let source_d = [(d.as_str(), "old"), (d_nine.as_str(), "nine"), (d_tilde.as_str(), "payload")];
+		check(
+			"source-numbered",
+			&source_d,
+			&["--backup=numbered", &d_tilde, &d],
+			if util == "ln" { destroys(&d, &d_tilde) } else { cannot_backup(&d) },
+			&source_d,
+		);
+		let source_cut = [(cut.as_str(), "payload"), (l.as_str(), "old")];
+		check(
+			"source-cut-numbered",
+			&source_cut,
+			&["--backup=numbered", &cut, &l],
+			if util == "ln" { destroys(&l, &cut) } else { cannot_backup(&l) },
+			&source_cut,
+		);
+		check("source-cut-simple", &source_cut, &["-b", &cut, &l], destroys(&l, &cut), &source_cut);
+		let destination = [(cut.as_str(), "old"), ("src", "new")];
+		for control in ["--backup=numbered", "-b", "--backup=existing"] {
+			let case = format!("destination{control}");
+			check(&case, &destination, &[control, "src", &cut], cannot_backup(&cut), &destination);
+		}
+		let unrelated = [(d.as_str(), "old"), (d_nine.as_str(), "nine"), (d_tilde.as_str(), "other"), ("src", "new")];
+		for control in ["--backup=numbered", "--backup=existing"] {
+			let case = format!("unrelated{control}");
+			if util == "ln" {
+				let replaced = [(d.as_str(), "new"), (d_nine.as_str(), "nine"), (d_tilde.as_str(), "old")];
+				check(&case, &unrelated, &[control, "src", &d], (0, String::new()), &replaced);
+			} else {
+				check(&case, &unrelated, &[control, "src", &d], cannot_backup(&d), &unrelated);
+			}
+		}
 	}
 }

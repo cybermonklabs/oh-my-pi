@@ -3980,4 +3980,16 @@ mod tests {
 			(code, capture.err())
 		});
 	}
+
+	/// `cp` with long names refuses each backup that would replace its source
+	/// or the destination itself, or that GNU cp refuses
+	/// ([`crate::file_backup::tests::check_long_name_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
+		crate::file_backup::tests::check_long_name_backups("cp", |dir, args| {
+			let (code, capture) = run_util::<Cp>(args, "", dir);
+			(code, capture.err())
+		});
+	}
 }

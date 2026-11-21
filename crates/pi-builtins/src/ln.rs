@@ -824,4 +824,58 @@ mod tests {
 			(code, capture.err())
 		});
 	}
+
+	/// `ln` with long names refuses each backup that would replace its source
+	/// or the destination itself, and replaces any other entry at the `~`
+	/// name, as GNU ln does
+	/// ([`crate::file_backup::tests::check_long_name_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
+		crate::file_backup::tests::check_long_name_backups("ln", |dir, args| {
+			let (code, capture) = run_util::<Ln>(args, "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -b dest~ dest` is refused, as GNU mv and cp refuse their own: the
+	/// backup of `dest` would replace the source `dest~` before the link to it
+	/// is made, losing its contents. This differs from GNU ln 9.4 and 9.7,
+	/// which rename `dest` over `dest~` (`ln.c`, plain `renameat`), exit 0 and
+	/// keep only the old `dest`. The same holds for a symbolic link, whose
+	/// relative target is read from the destination's directory, and
+	/// `--backup=numbered`, whose backup is `dest.~1~`, still links.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_that_is_the_destinations_backup_is_not_linked_over_it() {
+		let cwd = tempfile::tempdir().unwrap();
+		let case = |name: &str| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("d")).unwrap();
+			fs::write(dir.join("dest~"), "payload").unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			fs::write(dir.join("d/dest~"), "payload").unwrap();
+			fs::write(dir.join("d/dest"), "old").unwrap();
+			dir
+		};
+		let refused = |dest: &str, source: &str| {
+			(1, format!("ln: backing up '{dest}' might destroy source;  '{source}' not linked\n"))
+		};
+		for control in ["-b", "--backup=simple", "--backup=existing"] {
+			let dir = case(control.trim_start_matches('-'));
+			let (code, capture) = run_util::<Ln>(&[control, "dest~", "dest"], "", &dir);
+			assert_eq!((code, capture.err()), refused("dest", "dest~"), "{control}");
+			let (code, capture) = run_util::<Ln>(&[control, "-s", "dest~", "d/dest"], "", &dir);
+			assert_eq!((code, capture.err()), refused("d/dest", "dest~"), "{control} -s");
+			for sub in ["", "d/"] {
+				assert_eq!(fs::read_to_string(dir.join(format!("{sub}dest~"))).unwrap(), "payload", "{control}: {sub}dest~");
+				assert_eq!(fs::read_to_string(dir.join(format!("{sub}dest"))).unwrap(), "old", "{control}: {sub}dest");
+			}
+		}
+		let dir = case("numbered");
+		let (code, capture) = run_util::<Ln>(&["--backup=numbered", "dest~", "dest"], "", &dir);
+		assert_eq!((code, capture.err()), (0, String::new()), "numbered");
+		assert_eq!(fs::read_to_string(dir.join("dest")).unwrap(), "payload", "numbered: not linked");
+		assert_eq!(fs::read_to_string(dir.join("dest.~1~")).unwrap(), "old", "numbered: no backup");
+	}
 }

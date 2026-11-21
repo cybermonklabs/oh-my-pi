@@ -1145,7 +1145,9 @@ mod tests {
 	use tempfile::tempdir;
 
 	use super::Mv;
-	use crate::host::{Host, Utility, run_util, run_util_on};
+	#[cfg(unix)]
+	use crate::host::run_util_on;
+	use crate::host::{Host, Utility, run_util};
 
 	#[test]
 	fn relative_rename_uses_host_working_directory() {
@@ -1691,7 +1693,9 @@ mod tests {
 	/// On a provider whose metadata has no file identities, a source that is
 	/// the destination's simple backup is still refused: without both
 	/// identities the two names are compared by location, as cp compares
-	/// files. A `dest~` in another directory still moves.
+	/// files. A `dest~` in another directory, with another `dest~` beside
+	/// `dest`, still moves, and the backup replaces that `dest~`: the names
+	/// match there, so only the location comparison lets the move go on.
 	#[cfg(unix)]
 	#[test]
 	fn a_provider_without_file_ids_still_refuses_the_backup_as_source() {
@@ -1714,11 +1718,13 @@ mod tests {
 		let dir = cwd.path().join("elsewhere");
 		fs::create_dir_all(dir.join("s")).unwrap();
 		fs::write(dir.join("s/dest~"), b"payload").unwrap();
+		fs::write(dir.join("dest~"), b"other").unwrap();
 		fs::write(dir.join("dest"), b"old").unwrap();
 		let (code, capture) = run_util_on::<Mv>(&provider, &["-b", "s/dest~", "dest"], "", &dir);
 		assert_eq!((code, capture.err()), (0, String::new()), "elsewhere");
 		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "elsewhere: not moved");
 		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"old", "elsewhere: no backup");
+		assert!(!dir.join("s/dest~").exists(), "elsewhere: the source is still there");
 	}
 
 	/// `mv --backup=numbered` past the name limit backs up as GNU mv does
@@ -1735,5 +1741,14 @@ mod tests {
 	#[test]
 	fn an_empty_suffix_backs_up_with_a_tilde() {
 		crate::file_backup::tests::check_empty_suffix(|dir| mv_in(dir, &["-b", "-S", "", "src", "dest"], ""));
+	}
+
+	/// `mv` with long names refuses each backup that would replace its source
+	/// or the destination itself, or that GNU mv refuses
+	/// ([`crate::file_backup::tests::check_long_name_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
+		crate::file_backup::tests::check_long_name_backups("mv", |dir, args| mv_in(dir, args, ""));
 	}
 }

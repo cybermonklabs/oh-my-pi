@@ -3166,7 +3166,8 @@ mod testing {
 	}
 
 	/// [`run_util`] on the filesystem `fs` (a provider, say) instead of the
-	/// host's own.
+	/// host's own. Only Unix tests use it.
+	#[cfg(unix)]
 	pub(crate) fn run_util_on<U: Utility>(
 		fs: &pi_vfs::Fs,
 		argv: &[&str],
@@ -4129,7 +4130,10 @@ mod testing {
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util, run_util_on};
+pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
+#[cfg(all(test, unix))]
+#[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
+pub(crate) use testing::run_util_on;
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 #[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm")))]
