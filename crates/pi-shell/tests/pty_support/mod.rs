@@ -933,31 +933,48 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 /// of its command (`make_child` blocks `INT` there, and the new command
 /// never gets it), or to a stage it had forked that had not yet reset its
 /// traps (which then runs the EXIT trap itself). A caller whose shell runs
-/// shell code that never blocks does not wait so. Off Linux there is no
-/// `/proc`: it returns at once.
+/// shell code that never blocks does not wait so. Bounded as every wait
+/// ([`TIMEOUT`]): then it fails, naming the processes still running. Off
+/// Linux there is no `/proc`: it returns at once.
 pub fn wait_blocked(pid: i32) {
 	#[cfg(target_os = "linux")]
-	while !tree_blocked(pid) {
-		std::thread::sleep(Duration::from_millis(5));
+	{
+		let deadline = Instant::now() + TIMEOUT;
+		loop {
+			let mut running = Vec::new();
+			running_below(pid, &mut running);
+			if running.is_empty() {
+				return;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"after {TIMEOUT:?}, still running below {pid} (pid, state, name): {running:?}"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
 	}
 	#[cfg(not(target_os = "linux"))]
 	let _ = pid;
 }
 
-/// Whether `pid` and every process below it is blocked, stopped or gone
-/// ([`wait_blocked`]).
+/// Each of `pid` and the processes below it that is running or in an
+/// uninterruptible wait (state `R` or `D`), into `out` with its state and
+/// name ([`wait_blocked`]); one gone is none.
 #[cfg(target_os = "linux")]
-fn tree_blocked(pid: i32) -> bool {
+fn running_below(pid: i32, out: &mut Vec<(i32, String, String)>) {
 	let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-		return true;
+		return;
 	};
-	let state = stat
-		.rfind(')')
-		.and_then(|close| stat[close + 1..].split_whitespace().next());
-	if matches!(state, Some("R" | "D")) {
-		return false;
+	let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+		return;
+	};
+	let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+	if matches!(state, "R" | "D") {
+		out.push((pid, state.to_owned(), stat[open + 1..close].to_owned()));
 	}
-	children(pid).into_iter().all(tree_blocked)
+	for kid in children(pid) {
+		running_below(kid, out);
+	}
 }
 
 /// The children of `pid`: each of its threads' `children` file, or, where
