@@ -1,6 +1,6 @@
 load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -154,4 +154,12 @@ native_test(
     out = "pi-builtins_foreign_owner_test.bin",
     args = [FOREIGN_OWNER_TESTS],
     tags = ["no-sandbox"],
+)
+
+# rustdoc compiles the crate's sources too, so it takes the same list.
+rust_doc_test(
+    name = "pi-builtins_doc_test",
+    crate = ":pi-builtins",
+    crate_features = PI_BUILTINS_FEATURES,
+    deps = all_crate_deps(normal_dev = True),
 )

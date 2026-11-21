@@ -49,8 +49,7 @@ async fn core_fixture_cases() {
 
 #[tokio::test]
 async fn applies_all_21_portable_scenarios() {
-	let scenarios =
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apply_patch/scenarios");
+	let scenarios = common::fixtures_root().join("apply_patch/scenarios");
 	let mut directories = std::fs::read_dir(&scenarios)
 		.expect("scenario directory")
 		.filter_map(Result::ok)

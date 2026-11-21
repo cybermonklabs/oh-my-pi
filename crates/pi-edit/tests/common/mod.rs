@@ -198,11 +198,21 @@ fn substitute_tags(value: &mut Value, tags: &[(String, String)]) {
 	}
 }
 
+/// The fixtures tree. Under cargo the compile-time manifest dir exists at
+/// runtime; under Bazel the compile-time sandbox path is gone, so fall back to
+/// the runfiles-relative layout (test cwd is the workspace runfiles root and
+/// the fixtures ride along as `data`).
+pub fn fixtures_root() -> PathBuf {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+	if manifest.is_dir() {
+		return manifest;
+	}
+	PathBuf::from("crates/pi-edit/tests/fixtures")
+}
+
 /// Run every case in a fixture file for `default_mode`.
 pub async fn run_fixture(path: impl AsRef<Path>, default_mode: EditMode) {
-	let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("tests/fixtures")
-		.join(path);
+	let path = fixtures_root().join(path);
 	let text = std::fs::read_to_string(&path)
 		.unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
 	let root: Value = serde_json::from_str(&text)

@@ -36,7 +36,7 @@ fn signals_ignored_on_entry_remain_ignored() {
 		"-c",
 		"trap '' USR1; exec \"$1\" -c \"$2\"",
 		"_",
-		env!("CARGO_BIN_EXE_obash"),
+		obash_support::obash_path(),
 		"trap 'echo wrong' USR1; kill -USR1 $$; echo survived; trap -p USR1",
 	]));
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -49,7 +49,7 @@ fn inherited_sigpipe_ignore_cannot_be_overridden() {
 		"-c",
 		"trap '' PIPE; exec \"$1\" -c \"$2\"",
 		"_",
-		env!("CARGO_BIN_EXE_obash"),
+		obash_support::obash_path(),
 		"trap 'echo wrong' PIPE; kill -PIPE $$; trap -p PIPE; echo survived",
 	]));
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

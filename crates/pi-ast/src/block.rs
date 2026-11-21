@@ -1130,11 +1130,22 @@ mod tests {
 		(comparisons, none_verdicts)
 	}
 
+	/// The checkout the corpus tests sample. Under cargo the compile-time
+	/// manifest dir is in it. Under `bazel test` that path is a sandbox that
+	/// is gone at run time, and declared data would be a runfiles symlink
+	/// farm, which the walker under test does not follow; so
+	/// `PI_AST_REPO_CORPUS` names the checkout (`--test_env`).
+	fn repo_root() -> PathBuf {
+		std::env::var_os("PI_AST_REPO_CORPUS")
+			.filter(|root| !root.is_empty())
+			.map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."), PathBuf::from)
+	}
+
 	/// Repository `.ts` / `.py` / `.rs` sources, sorted for determinism. With a
 	/// budget, files are taken on a stride so the sample spans the whole tree
 	/// instead of one directory, skipping anything over 64 KiB.
 	async fn repo_files(byte_budget: Option<usize>) -> Vec<PathBuf> {
-		let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+		let root = repo_root();
 		let opts = pi_walker::walk::Options { gitignore: true, skip_git: true, ..Default::default() };
 		let walked =
 			pi_walker::walk::collect(&pi_walker::Fs::native(), &root, &opts, false, |_, entry| {
@@ -1199,11 +1210,12 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn pruned_walk_matches_unpruned_on_repo_corpus_sample() {
 		// Sandboxed runners (bazel test) stage only this crate's declared inputs,
-		// so the repository corpus this sweep samples is absent (or a symlink
-		// farm the walker cannot see through). Both surface as an empty scan —
-		// skip then. Whenever the scan finds anything, the evidence assert below
-		// still guards against a broken/undersized sample.
-		let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+		// so the repository corpus this sweep samples is absent unless
+		// PI_AST_REPO_CORPUS names the checkout ([`repo_root`]). An absent
+		// corpus surfaces as an empty scan — skip then. Whenever the scan finds
+		// anything, the evidence assert below still guards against a
+		// broken/undersized sample.
+		let root = repo_root();
 		if !root.join("packages").is_dir() {
 			eprintln!("skipping: repository corpus unavailable at {}", root.display());
 			return;
