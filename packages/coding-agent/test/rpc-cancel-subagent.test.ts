@@ -120,6 +120,9 @@ describe("handleRpcCancelSubagent", () => {
 	 * cancel of the run's cleanup until the test finishes it, which keeps the
 	 * subagent idle, holding its session and listed running through that cleanup.
 	 *
+	 * With `setupFails`, the run fails before its first prompt: the session
+	 * enables the parent-owned `todo` tool, and taking it away throws.
+	 *
 	 * The session mirrors AgentSession's steering queue: a steer queues a
 	 * steering user message under its `queueId`; each turn takes the queued
 	 * steers before its first model call, emits each as
@@ -129,7 +132,7 @@ describe("handleRpcCancelSubagent", () => {
 	 * session is drained into a turn of its own; and a prompt while a turn
 	 * streams meets `AgentBusyError`.
 	 */
-	function startSubagentAwaitingEvalJob(options: { firstTurnFails?: boolean } = {}) {
+	function startSubagentAwaitingEvalJob(options: { firstTurnFails?: boolean; setupFails?: boolean } = {}) {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const id = "Worker";
 		const childId = "Worker.Child";
@@ -235,10 +238,12 @@ describe("handleRpcCancelSubagent", () => {
 			extensionRunner: undefined,
 			sessionManager: { appendSessionInit: () => {} },
 			getActiveToolNames: () => ["eval", "yield"],
-			getEnabledToolNames: () => ["eval", "yield"],
+			getEnabledToolNames: () => (options.setupFails ? ["eval", "yield", "todo"] : ["eval", "yield"]),
 			getMountedXdevToolNames: () => [],
 			getToolByName: () => undefined,
-			setActiveToolsByName: async () => {},
+			setActiveToolsByName: async () => {
+				if (options.setupFails) throw new Error("tool registry unavailable");
+			},
 			setWorkPoolYieldItems: () => {},
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				listeners.add(listener);
@@ -741,6 +746,33 @@ describe("handleRpcCancelSubagent", () => {
 		expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
 		// The yield the run delivered stands; the cancel did not stop the run.
 		expect(result).toMatchObject({ exitCode: 0, aborted: false });
+	}, 30_000);
+
+	// Regression: a host cancels a subagent whose first run failed in its setup, before its first
+	// prompt (here taking a parent-owned tool away threw), as the run's cleanup leaves it idle and
+	// before the terminal lifecycle frame prunes the roster; the cancel kills and tombstones a
+	// subagent whose run already ended, where `cancel_subagent` answers `cancelled: false`.
+	test("cancel_subagent leaves a subagent idle whose first run failed in its setup while its cleanup still holds it", async () => {
+		const subagent = startSubagentAwaitingEvalJob({ setupFails: true });
+		let atIdle: { listed: string | undefined; cancelled: Promise<boolean> } | undefined;
+		const unsubscribe = AgentRegistry.global().onChange(event => {
+			if (atIdle || event.type !== "status_changed" || event.ref.id !== subagent.id) return;
+			if (event.ref.status !== "idle") return;
+			atIdle = {
+				listed: registry.getSubagents().find(snapshot => snapshot.id === subagent.id)?.status,
+				cancelled: handleRpcCancelSubagent(registry, subagent.id),
+			};
+		});
+		try {
+			const result = await subagent.run;
+
+			expect(result).toMatchObject({ exitCode: 1, aborted: false });
+			expect(atIdle?.listed).toBe("running");
+			await expect(atIdle?.cancelled).resolves.toBe(false);
+			expect(AgentRegistry.global().get(subagent.id)?.status).toBe("idle");
+		} finally {
+			unsubscribe();
+		}
 	}, 30_000);
 
 	// Regression: a host cancels a kept-alive subagent as its IRC wake turn ends, before the

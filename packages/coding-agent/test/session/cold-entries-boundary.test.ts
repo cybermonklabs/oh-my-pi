@@ -5,7 +5,7 @@
  * no cut, and the request an `experimental-context-rollover` compaction's
  * context recovers from before its kept entries stays whole.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
@@ -14,7 +14,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { ColdEntryStore, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { isColdMessage } from "@oh-my-pi/pi-coding-agent/session/cold-message";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -142,6 +142,7 @@ describe("what the cut leaves whole", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	});
 
@@ -260,6 +261,44 @@ describe("what the cut leaves whole", () => {
 		expect(behindRemote.filter(id => !isColdEntry(entryOf(manager, id)))).toEqual([]);
 		expect(manager.coldStoreStats().hydrations).toBe(hydrationsBefore);
 		expect(coldMessages(manager.buildSessionContext({ model: gpt }).messages)).toEqual([]);
+	});
+
+	// A /resume or /move that fails and rolls back keeps the agent's context; its next rebuild or
+	// prune pass must not leave that context's older messages to be read back on every request.
+	it("keeps whole the entries a model's context holds after a rollback restores the session's state", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const manager = await open(await writeSession(dir.path(), remoteCompactedSession()));
+		cleanups.push(() => manager.close());
+		// Claude cannot replay GPT's remote compaction `c2`: its context starts at `c1`'s kept `u1`.
+		const behindRemote = ["u1", "c1", "a1", "u2"];
+		expect(coldMessages(manager.buildSessionContext({ model: claude }).messages)).toEqual([]);
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+
+		manager.restoreState(manager.captureState());
+		manager.buildSessionContext();
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+		manager.recoolEntries();
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+	});
+
+	// After a switch to another provider whose first rebuild hit a transient read failure, every
+	// later request would read the older messages of the new model's context back from the store.
+	it("makes the new model's entries whole at the next build after a build that failed to read one", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const manager = await open(await writeSession(dir.path(), remoteCompactedSession()));
+		cleanups.push(() => manager.close());
+		manager.buildSessionContext({ model: gpt });
+		const behindRemote = ["u1", "c1", "a1", "u2"];
+		expect(behindRemote.filter(id => !isColdEntry(entryOf(manager, id)))).toEqual([]);
+
+		vi.spyOn(ColdEntryStore.prototype, "parse").mockImplementationOnce(() => {
+			throw new Error("EIO: i/o error, read");
+		});
+		expect(() => manager.buildSessionContext({ model: claude })).toThrow("EIO");
+		vi.restoreAllMocks();
+
+		expect(coldMessages(manager.buildSessionContext({ model: claude }).messages)).toEqual([]);
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
 	});
 
 	// A notes-backed rollover re-reads that request on every turn while it is cold.

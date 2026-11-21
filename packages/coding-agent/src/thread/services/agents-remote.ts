@@ -282,4 +282,8 @@ export class RemoteIrcBus implements IrcBusApi {
 	forgetAgent(agentId: string): void {
 		this.#remote.notify("forgetAgent", agentId);
 	}
+
+	holdSentMarks(agentId: string): () => void {
+		return this.#remote.callSync("holdSentMarks", agentId);
+	}
 }

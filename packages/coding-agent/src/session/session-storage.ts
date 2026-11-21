@@ -900,15 +900,30 @@ export class FileSessionStorage implements SessionStorage {
 	 * Claim the process-owned gate at `gatePath` ({@link #osGatePath}) for
 	 * `fpath`, failing closed after the same bounded wait the lockfile claim
 	 * uses. The native handle keeps ownership, never the file content, so
-	 * suspension and SIGKILL cannot strand it as stealable.
+	 * suspension and SIGKILL cannot strand it as stealable. On Linux a claim
+	 * of a gate another process holds blocks this thread for about 50 ms (see
+	 * `tryAcquireFileLock`), so every attempt but the last probes the gate
+	 * first and claims only one the probe finds free; a probe that reads a
+	 * just-released gate as held costs one poll.
 	 */
 	#acquireOsPublishLock(fpath: string, gatePath: string): NativeFileLock {
 		const deadline = Date.now() + SESSION_PUBLISH_LOCK_WAIT_MS;
 		for (;;) {
-			const gate = NativeFileLock.tryAcquire(gatePath);
-			if (gate.acquired) return gate;
-			gate.release();
-			if (Date.now() >= deadline) {
+			const lastAttempt = Date.now() >= deadline;
+			let held = false;
+			if (!lastAttempt && process.platform === "linux") {
+				try {
+					held = NativeFileLock.isHeld(gatePath);
+				} catch {
+					// The probe failed: the claim decides.
+				}
+			}
+			if (!held) {
+				const gate = NativeFileLock.tryAcquire(gatePath);
+				if (gate.acquired) return gate;
+				gate.release();
+			}
+			if (lastAttempt || (!held && Date.now() >= deadline)) {
 				throw new SessionLockError(fpath, "another writer holds the publish lock");
 			}
 			sleepSyncMs(SESSION_PUBLISH_LOCK_POLL_MS);

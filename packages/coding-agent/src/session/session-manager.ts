@@ -850,6 +850,8 @@ interface SessionManagerStateSnapshot {
 	entries: SessionEntry[];
 	/** The store the cold ones among `entries` were written to; shared with the manager that captured them. */
 	coldStore: ColdEntryStore | undefined;
+	/** The model the cut was last computed for, which the agent's context was built for. */
+	coldCutModel: Model | undefined;
 }
 
 /** {@link SessionManager.coldStoreStats}: how much of the session lives in its cold entry store. */
@@ -1200,7 +1202,8 @@ export class SessionManager {
 	 * the cut was last applied: set by {@link #setLeaf} when the leaf moves,
 	 * {@link #reindexEntries}, {@link #recordEntry} for a compaction,
 	 * {@link #staleColdBoundary} when it adopts a model, and
-	 * {@link #resetColdCut} when asked.
+	 * {@link #resetColdCut} when asked; cleared by {@link buildSessionContext}
+	 * once the build that applies the cut made its entries whole and returned.
 	 */
 	#coldCutStale = false;
 
@@ -2517,7 +2520,8 @@ export class SessionManager {
 	 * the model the cut was computed for adopts that model, whose readable
 	 * compaction can start the context earlier, and computes the cut again: the
 	 * first build for a model switched to reads no cold entry. A build that only
-	 * measures (`measureOnly`) changes neither.
+	 * measures (`measureOnly`) changes neither. The cut stays stale until the
+	 * build applies it ({@link buildSessionContext}).
 	 */
 	#staleColdBoundary(options: SessionContextBuildOptions | undefined): ColdBoundary | undefined {
 		if (!this.#coldStoreEnabled || options?.measureOnly) return undefined;
@@ -2528,7 +2532,6 @@ export class SessionManager {
 			this.#coldCutStale = true;
 		}
 		if (!this.#coldCutStale) return undefined;
-		this.#coldCutStale = false;
 		return coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel);
 	}
 
@@ -2704,6 +2707,7 @@ export class SessionManager {
 			header: structuredClone(this.#header),
 			entries: [...this.#entries],
 			coldStore: this.#coldStore,
+			coldCutModel: this.#coldCutModel,
 		};
 	}
 
@@ -2746,6 +2750,10 @@ export class SessionManager {
 		this.#taskSiblingCandidate = snapshot.taskSiblingCandidate;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
 		this.#resetColdCut(snapshot.coldStore, true);
+		// A rollback leaves the agent's context the one built for this model (a
+		// switch restores it, a move keeps it), so the cut recomputed at the next
+		// build or recool keeps whole what that context holds.
+		this.#coldCutModel = snapshot.coldCutModel;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 
@@ -3447,7 +3455,13 @@ export class SessionManager {
 		manager.#adoptColdStore(this.#coldStore);
 		manager.#reindexEntries();
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
+		try {
+			await manager.#rewriteAtomically();
+		} catch (error) {
+			// No caller gets the copy to close, so its hold on the store goes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
+		}
 		return manager;
 	}
 
@@ -4670,7 +4684,13 @@ export class SessionManager {
 			resolveFrameData: data => this.resolveFrameData(data),
 			...options,
 		});
-		if (boundary && this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
+		if (boundary) {
+			// Applied: a hydration or a build that threw left the cut stale, so the
+			// next build applied it again instead of reading the entries it keeps
+			// through their accessors.
+			this.#coldCutStale = false;
+			if (this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
+		}
 		return context;
 	}
 
@@ -5125,9 +5145,15 @@ export class SessionManager {
 			for (const entry of history.slice(repairedFrom)) manager.#index.insert(entry);
 		}
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		if (!options?.seance && options?.copyArtifacts !== false) {
-			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
+		try {
+			await manager.#rewriteAtomically();
+			if (!options?.seance && options?.copyArtifacts !== false) {
+				await copySessionArtifacts(sourcePath, manager.#sessionFile!);
+			}
+		} catch (error) {
+			// No caller gets the fork to close, so the store its load opened closes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
 		}
 		return manager;
 	}

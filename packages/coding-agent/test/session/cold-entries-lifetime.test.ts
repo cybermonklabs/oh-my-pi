@@ -33,6 +33,8 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** A value whose JSON text is longer than this is a body. */
 const LARGE_JSON_BYTES = 4096;
 const HAS_PROC_FD = fs.existsSync("/proc/self/fd");
+/** Root ignores directory permissions, so a read-only directory cannot be made for it. */
+const RUNS_AS_ROOT = process.getuid?.() === 0;
 /** Patch records are appended by `SessionManager.patchEntries`, which a build without the patch-record change lacks. */
 const HAS_PATCH_ENTRIES = "patchEntries" in SessionManager.prototype;
 type PatchingSessionManager = SessionManager & { patchEntries(patches: object[]): Promise<void> };
@@ -423,6 +425,48 @@ describe("older bodies stay out of memory and the store is released", () => {
 			const older = manager.getEntry("a1");
 			expect(older?.type === "message" ? older.message : undefined).toEqual(assistant(`a1 ${BODY}`));
 			await manager.close();
+			expect(descriptorsUnder(tmp.path())).toEqual([]);
+		},
+	);
+
+	// A copy whose write fails (a full disk, a session directory it may not write) is never handed to
+	// a caller that could close it: its hold must not keep the store's descriptor and disk until a
+	// collection.
+	it.skipIf(!HAS_PROC_FD || RUNS_AS_ROOT)(
+		"releases the store under os.tmpdir() when a copy of the session fails to write",
+		async () => {
+			using dir = TempDir.createSync("@omp-cold-lifetime-");
+			using tmp = TempDir.createSync("@omp-cold-lifetime-tmp-");
+			const file = await writeSession(dir.path(), compactedTwice());
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+			// Empty and left so: the temporary directory removes it with its parent.
+			const readOnly = path.join(dir.path(), "read-only");
+			fs.mkdirSync(readOnly, { mode: 0o500 });
+
+			const manager = await open(file);
+			expect(descriptorsUnder(tmp.path())).toHaveLength(1);
+			await expect(manager.persistCopy({ sessionDir: readOnly })).rejects.toThrow();
+			await manager.close();
+			expect(descriptorsUnder(tmp.path())).toEqual([]);
+		},
+	);
+
+	// A fork whose write fails is never handed to a caller that could close it: the store its load
+	// opened must not keep its descriptor and disk until a collection.
+	it.skipIf(!HAS_PROC_FD || RUNS_AS_ROOT)(
+		"releases the store under os.tmpdir() that a fork opened when the fork fails to write",
+		async () => {
+			using dir = TempDir.createSync("@omp-cold-lifetime-");
+			using tmp = TempDir.createSync("@omp-cold-lifetime-tmp-");
+			const file = await writeSession(dir.path(), compactedTwice());
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+			// Empty and left so: the temporary directory removes it with its parent.
+			const readOnly = path.join(dir.path(), "read-only");
+			fs.mkdirSync(readOnly, { mode: 0o500 });
+
+			await expect(
+				SessionManager.forkFrom(file, dir.path(), readOnly, new FileSessionStorage(), { suppressBreadcrumb: true }),
+			).rejects.toThrow();
 			expect(descriptorsUnder(tmp.path())).toEqual([]);
 		},
 	);

@@ -3480,6 +3480,12 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const userPrompted = records.some(record =>
 			record.role === "user" ? record.attribution === "user" : record.role === "developer" && record.userInitiated,
 		);
+		// The relay below asks what this agent sent each waker during the turn
+		// once the turn's owned work has settled. The idle TTL can park the agent
+		// before then, and the bus forgets a parked agent's marks: without the
+		// hold the relay sends a waker the answer it already has, and revives it
+		// when it is parked.
+		const releaseSentMarks = IrcBus.global().holdSentMarks(id);
 		return async turnError => {
 			unsubscribeTurn();
 			unsubscribeParentSteer();
@@ -3647,6 +3653,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						error: relayError instanceof Error ? relayError.message : String(relayError),
 					});
 				} finally {
+					releaseSentMarks();
 					relay.resolve();
 				}
 			}
@@ -5403,6 +5410,10 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			}
 			const session = monitor.takeActiveSession();
 			if (session) {
+				// A run that threw in its setup, before the drive that stamps its end,
+				// ended there: stamped before the cleanup leaves the ref idle, so no host
+				// reaches a run that failed and is only being cleaned up.
+				if (readyAt === undefined) AgentRegistry.global().markRunEnded(id, session);
 				monitor.captureSalvage(session);
 				if (options.keepAlive !== false && (!preparedSession || readyAt !== undefined)) {
 					attachIrcWakeTurnMonitor(session, wakeOptions);
