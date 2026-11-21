@@ -89,6 +89,8 @@ function rewriteSegment(
 	if (positionals.length < 1 || positionals.length > 2) return undefined;
 	// git refuses a reason without a lock; let it say so.
 	if (reason !== undefined && !lock) return undefined;
+	// git refuses `-b`/`-B` with `--detach` and creates nothing; let it say so.
+	if (branchFlag && detach) return undefined;
 
 	const argv = [...ompCmd, "worktree", "add"];
 	if (cwd) argv.push("-C", cwd);
@@ -117,6 +119,10 @@ export function rewriteGitWorktreeAdd(
 	ompCmd: readonly string[],
 	options: RewriteGitWorktreeAddOptions = {},
 ): string {
+	// Bash removes a backslash-newline (a line continuation) outside single
+	// quotes, and the lexer keeps both bytes; a command holding one is left to
+	// git, so no argument reaches omp with other bytes than bash gives git.
+	if (/\\\n/.test(command)) return command;
 	const segments = extractFlatShellCommandSegments(command);
 	if (segments.length === 0 || segments.some(segment => segment.pipedStdin)) return command;
 

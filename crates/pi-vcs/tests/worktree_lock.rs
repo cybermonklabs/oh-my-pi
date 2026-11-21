@@ -59,6 +59,51 @@ fn options(clone: WorktreeClone, lock: Option<&str>) -> WorktreeAddOptions {
 	WorktreeAddOptions { detach: true, clone, keep_changes: false, lock: lock.map(str::to_owned) }
 }
 
+/// Whether a clone backend works on the filesystem holding `root`.
+fn clone_works_on(root: &Path) -> bool {
+	let source = root.join("clone-probe-source");
+	let target = root.join("clone-probe-target");
+	fs::create_dir_all(&source).unwrap();
+	fs::write(source.join("file"), "probe\n").unwrap();
+	let works = pi_iso::clone_candidates(None).into_iter().any(|kind| {
+		let _ = fs::remove_dir_all(&target);
+		pi_iso::backend(kind)
+			.clone_tree(&source, &target, &pi_iso::CloneExclusions::default())
+			.is_ok()
+	});
+	fs::remove_dir_all(source).unwrap();
+	let _ = fs::remove_dir_all(target);
+	works
+}
+
+/// Adds `target` with `clone` and `lock`. The clone case must have run on the
+/// clone path; where no clone backend works it is skipped, and says so, since
+/// the ordinary checkout would pass it without testing the clone path.
+/// `None` when skipped.
+fn add(
+	temp: &Path,
+	repo: &GitRepo,
+	target: &Path,
+	clone: WorktreeClone,
+	lock: Option<&str>,
+) -> Option<()> {
+	if clone != WorktreeClone::Off && !clone_works_on(temp) {
+		eprintln!("SKIP: no working clone backend on this filesystem ({clone:?} case)");
+		return None;
+	}
+	let result = repo
+		.worktree_add(target, "HEAD", options(clone, lock))
+		.unwrap();
+	assert_eq!(
+		result.cloned_with.is_some(),
+		clone != WorktreeClone::Off,
+		"{clone:?}: cloned_with {:?}, clone error {:?}",
+		result.cloned_with,
+		result.clone_error
+	);
+	Some(())
+}
+
 /// The `locked` file holds exactly the bytes git writes for the same reason
 /// (an empty reason, and one that already ends in a newline, included), and
 /// `git worktree list` reports it as it reports git's own.
@@ -80,9 +125,9 @@ fn worktree_add_writes_the_lock_git_writes() {
 				"HEAD",
 			]);
 			let target = temp.path().join("target");
-			repo
-				.worktree_add(&target, "HEAD", options(clone, Some(reason)))
-				.unwrap();
+			if add(temp.path(), &repo, &target, clone, Some(reason)).is_none() {
+				continue;
+			}
 			assert_eq!(
 				fs::read(admin(&target).join("locked")).unwrap(),
 				fs::read(admin(&by_git).join("locked")).unwrap(),
@@ -115,9 +160,9 @@ fn worktree_add_without_a_lock_leaves_the_registration_unlocked() {
 	for clone in [WorktreeClone::Off, WorktreeClone::Auto] {
 		let (temp, _source, repo) = fixture();
 		let target = temp.path().join("target");
-		repo
-			.worktree_add(&target, "HEAD", options(clone, None))
-			.unwrap();
+		if add(temp.path(), &repo, &target, clone, None).is_none() {
+			continue;
+		}
 		assert!(
 			fs::symlink_metadata(admin(&target).join("locked")).is_err(),
 			"{clone:?}: an unlocked add wrote a lock"

@@ -817,6 +817,11 @@ export declare class VcsGitRepo {
   worktreeRemove(path: string, force: boolean, signal?: unknown | undefined | null): Promise<boolean>
   /** Prune worktrees. */
   worktreePrune(signal?: unknown | undefined | null): Promise<undefined>
+  /**
+   * Remove what each worktree add that died before it finished left
+   * behind; returns the trees removed.
+   */
+  worktreeSweepAbandoned(signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent subjects. */
   logSubjects(count: number, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent one-line commits. */

@@ -927,6 +927,16 @@ impl VcsGitRepo {
 		blocking("vcs.worktreePrune", self.inner.clone(), signal, |r| r.worktree_prune())
 	}
 
+	/// Remove what each worktree add that died before it finished left
+	/// behind; returns the trees removed.
+	#[napi]
+	pub fn worktree_sweep_abandoned(&self, signal: Option<Unknown>) -> Promise<Vec<String>> {
+		blocking("vcs.worktreeSweepAbandoned", self.inner.clone(), signal, |r| {
+			r.worktree_sweep_abandoned()
+				.map(|trees| trees.iter().map(path_string).collect())
+		})
+	}
+
 	/// Recent subjects.
 	#[napi]
 	pub fn log_subjects(&self, count: u32, signal: Option<Unknown>) -> Promise<Vec<String>> {

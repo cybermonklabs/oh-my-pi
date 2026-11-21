@@ -338,7 +338,10 @@ source's changes. A directory below the root that holds a `.git` entry is
 another checkout (a submodule, a linked worktree, a cloned dependency) and is
 never carried, even inside an ignored directory: a submodule's directory is
 left empty, as `git worktree add` leaves it. A destination inside the source is
-not copied into itself.
+not copied into itself. When keeping changes, the untracked files git reports
+below a directory holding a `.git` it treats as ordinary content (a tracked
+directory someone ran `git init` in, or a `.git` naming nothing) are carried;
+the `.git` itself is not.
 
 Clean clones also discard carried files that are untracked under the target
 commit's own ignore rules, after its tree and index have been written; caches
@@ -351,3 +354,10 @@ while the tree is out of reach. `worktree.lockReason` locks every worktree a
 `git worktree add` in bash creates through the clone rewrite with that reason,
 for setups whose `git` wrapper locks every add, since the rewrite runs omp in
 place of `git`; a command's own `--lock` keeps its own reason.
+
+A worktree add that fails removes its tree and its registration, as
+`git worktree add` does. While an add runs, its registration is locked
+(`locked initializing`, the lock git's own add holds), so `git worktree prune`
+leaves it alone. An add killed or terminated midway leaves that locked
+registration and its partial tree; the next worktree add in the same
+repository removes both first, so the same path can be added again.

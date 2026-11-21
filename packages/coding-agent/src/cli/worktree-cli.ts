@@ -62,7 +62,11 @@ export interface AddWorktreeOptions {
 	reason?: string;
 }
 
-/** The reason git records for `git worktree add --lock` without `--reason`. */
+/**
+ * The reason git records for `git worktree add --lock` without `--reason`. git
+ * writes it translated (`_("added with --lock")`); this is its untranslated
+ * text, which git writes under the C locale.
+ */
 const GIT_DEFAULT_LOCK_REASON = "added with --lock";
 
 export interface ListWorktreesOptions {
@@ -115,6 +119,14 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	const cwd = path.resolve(options.cwd ?? process.cwd());
 	const repository = vcs.requireGit(cwd);
+	// An add that died before it finished (a signal, a timeout's kill) left a
+	// registration that says so. Remove those first, so the same path can be
+	// added again; a tree that cannot be removed only warns.
+	try {
+		await repository.worktreeSweepAbandoned();
+	} catch (error) {
+		console.error(`warning: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	const worktreePath = path.resolve(cwd, options.path);
 	try {
 		const stat = await fs.stat(worktreePath);

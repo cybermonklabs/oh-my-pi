@@ -9,6 +9,9 @@
 ### Fixed
 
 - A clone-backed `omp worktree add` (and `git worktree add` in bash) no longer copies the source's untracked, unignored files unless keeping changes, never copies another checkout below the root (a directory holding `.git`: a submodule, a linked worktree, a cloned dependency, ignored or not), and no longer copies a destination inside the source into itself; a checkout with a checked-out submodule now clones instead of falling back to a plain checkout. Keeping changes no longer reads or writes a path through a symlink that replaced one of its directories
+- A worktree add (`omp worktree add`, `git worktree add` in bash, `/wt`, `github pr_checkout`) that fails no longer leaves its tree and a registration behind, locked or not: it removes both, as `git worktree add` does. One killed or terminated midway (a bash timeout) leaves its registration locked `initializing`, as git's own add does, and the next worktree add in that repository removes it and the partial tree, so the same path can be added again
+- Keeping changes on the clone path now carries the untracked files git reports below a directory holding a `.git` that git treats as ordinary content (a tracked directory someone ran `git init` in, a `.git` naming nothing), as the ordinary checkout already did
+- The bash rewrite of `git worktree add` leaves to git a command holding a backslash-newline, whose bytes bash changes, and one combining `-b`/`-B` with `--detach`, which git refuses
 
 ## [18.18.6] - 2026-11-09
 

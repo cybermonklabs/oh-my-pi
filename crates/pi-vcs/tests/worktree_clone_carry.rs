@@ -693,3 +693,101 @@ fn keeping_changes_carries_a_directory_that_replaced_a_tracked_file() {
 		}
 	}
 }
+
+/// Builds, in `source`, the layouts where git treats a directory holding a
+/// `.git` as ordinary content of the outer repository, each with an untracked
+/// file git's status reports: a tracked directory someone ran `git init` in
+/// (with a staged and a dirty tracked file in it too), a `.git` file naming an
+/// administrative directory that is gone, and an empty `.git` directory.
+fn content_dot_git_layouts(source: &Path) {
+	write(source, "nested/a.txt", "tracked\n");
+	write(source, "nested/staged.txt", "tracked\n");
+	git(source, &["add", "nested"]);
+	git(source, &["commit", "-qm", "nested is tracked"]);
+	write(source, "nested/staged.txt", "staged edit\n");
+	git(source, &["add", "nested/staged.txt"]);
+	git(&source.join("nested"), &["init", "-q"]);
+	write(source, "nested/a.txt", "dirty edit\n");
+	write(source, "nested/new.txt", "untracked below a tracked directory holding a .git\n");
+	write(source, "stray/.git", "gitdir: /nonexistent/admin\n");
+	write(source, "stray/work.txt", "untracked beside a .git naming nothing\n");
+	fs::create_dir_all(source.join("emptydot/.git")).unwrap();
+	write(source, "emptydot/work.txt", "untracked beside an empty .git\n");
+}
+
+/// Keeping changes carries, on the clone path as on the ordinary checkout,
+/// the untracked, dirty and staged files git reports below a directory
+/// holding a `.git` that git treats as ordinary content; the `.git` itself
+/// stays behind.
+#[test]
+fn keeping_changes_carries_what_git_reports_below_a_content_dot_git() {
+	let expected_files = [
+		("nested/a.txt", "dirty edit\n"),
+		("nested/staged.txt", "staged edit\n"),
+		("nested/new.txt", "untracked below a tracked directory holding a .git\n"),
+		("stray/work.txt", "untracked beside a .git naming nothing\n"),
+		("emptydot/work.txt", "untracked beside an empty .git\n"),
+	];
+	let mut carried = Vec::new();
+	for clone in [WorktreeClone::Off, WorktreeClone::Auto] {
+		let (temp, source, repo) = fixture();
+		if clone == WorktreeClone::Auto && !clone_works_on(temp.path()) {
+			eprintln!("SKIP: no working clone backend on this filesystem");
+			return;
+		}
+		content_dot_git_layouts(&source);
+		let source_status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+		for line in [
+			" M nested/a.txt",
+			"M  nested/staged.txt",
+			"?? nested/new.txt",
+			"?? stray/work.txt",
+			"?? emptydot/work.txt",
+		] {
+			assert!(
+				source_status.lines().any(|reported| reported == line),
+				"fixture: git status lacks {line:?}:\n{source_status}"
+			);
+		}
+		let target = temp.path().join("target");
+		let result = repo
+			.worktree_add(&target, "HEAD", WorktreeAddOptions {
+				detach: true,
+				clone,
+				keep_changes: true,
+				lock: None,
+			})
+			.unwrap();
+		assert_eq!(
+			result.cloned_with.is_some(),
+			clone == WorktreeClone::Auto,
+			"{clone:?}: {:?}",
+			result.clone_error
+		);
+		for (relative, contents) in expected_files {
+			assert_eq!(
+				fs::read_to_string(target.join(relative)).ok().as_deref(),
+				Some(contents),
+				"{clone:?}: {relative}"
+			);
+		}
+		for dot_git in ["nested/.git", "stray/.git", "emptydot/.git"] {
+			assert!(
+				fs::symlink_metadata(target.join(dot_git)).is_err(),
+				"{clone:?}: {dot_git} was carried"
+			);
+		}
+		assert_eq!(
+			git(&target, &["status", "--porcelain", "--untracked-files=all"]),
+			source_status,
+			"{clone:?}: the new tree's status differs from the source's"
+		);
+		let mut files = snapshot(&target);
+		files.retain(|path, _| !path.starts_with("node_modules"));
+		carried.push(files);
+	}
+	assert_eq!(
+		carried[0], carried[1],
+		"the ordinary checkout and the clone carried different files"
+	);
+}

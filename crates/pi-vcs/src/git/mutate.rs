@@ -617,12 +617,23 @@ impl GitRepo {
 	}
 
 	/// Create a linked worktree and materialize its checkout.
+	///
+	/// The registration exists, locked as `git worktree add` locks it, before
+	/// the first entry is written, and holds an add-in-progress marker until
+	/// the add finishes. Every failure removes the tree and the registration.
+	/// An add that dies before it finishes (a signal, a timeout's kill) leaves
+	/// a registration `git worktree list` reports as locked, whose marker no
+	/// process holds; this add, and every later one, first removes those with
+	/// [`Self::worktree_sweep_abandoned`].
 	pub fn worktree_add(
 		&self,
 		path: &Path,
 		ref_name: &str,
 		options: WorktreeAddOptions,
 	) -> Result<WorktreeAddResult> {
+		// Best effort: a tree that cannot be removed must not stop new adds.
+		// The caller that wants the error asks for the sweep itself.
+		let _ = self.worktree_sweep_abandoned();
 		let repo = self.gix()?;
 		let id = resolve_commit(&repo, ref_name)?;
 		if path.exists() && fs::read_dir(path)?.next().is_some() {
@@ -681,29 +692,32 @@ impl GitRepo {
 			WorktreeClone::Prefer(kind) => Some(Some(kind)),
 		};
 		let lock = options.lock.as_deref();
+		let mut pending = PendingWorktree::begin(path, &self.info().common_dir, &head, lock)?;
 		let mut clone_error = None;
 		if let Some(preferred) = preferred {
 			for kind in pi_iso::clone_candidates(preferred) {
-				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, lock) {
+				match self.worktree_add_cloned(&pending, id, kind, options.keep_changes) {
 					Ok(()) => {
+						pending.finish(lock)?;
 						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
 					},
 					Err(err) => {
 						clone_error = Some(err.to_string());
-						cleanup_worktree_add(path, &self.info().common_dir);
+						pending.reset_tree()?;
 					},
 				}
 			}
 		}
 
 		fs::create_dir_all(path)?;
-		let admin = register_worktree(path, &self.info().common_dir, &head, lock)?;
+		pending.link()?;
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		checkout_tree(&linked, &linked_repo, id, true)?;
 		if options.keep_changes {
-			self.seed_worktree_changes(path, &admin, id)?;
+			self.seed_worktree_changes(path, &pending.admin, id)?;
 		}
+		pending.finish(lock)?;
 		Ok(WorktreeAddResult { cloned_with: None, clone_error })
 	}
 
@@ -757,15 +771,16 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
+	/// Fills the pending registration's tree with a `kind` clone of the source
+	/// and reconciles it with the target commit.
 	fn worktree_add_cloned(
 		&self,
-		path: &Path,
+		pending: &PendingWorktree,
 		id: gix::hash::ObjectId,
-		head: &str,
 		kind: pi_iso::BackendKind,
 		keep_changes: bool,
-		lock: Option<&str>,
 	) -> Result<()> {
+		let path = pending.path.as_path();
 		let repo = self.gix()?;
 		for key in ["core.sparseCheckout", "core.splitIndex"] {
 			if repo.config_snapshot().string(key).is_some_and(|value| {
@@ -797,8 +812,8 @@ impl GitRepo {
 		let left_out = pi_iso::backend(kind)
 			.clone_tree(self.root(), path, &exclusions)
 			.map_err(|err| Error::backend("git worktree add", err))?;
-		let admin = register_worktree(path, &self.info().common_dir, head, lock)?;
-		fs::copy(&source_index, admin.join("index"))?;
+		pending.link()?;
+		fs::copy(&source_index, pending.admin.join("index"))?;
 
 		// Backends may clone entire subtrees atomically. Apply the same
 		// nonrelocatable-directory policy to every backend's disposable copy,
@@ -830,6 +845,23 @@ impl GitRepo {
 						copy_worktree_path(self.root(), path, relative)?;
 					} else if !behind_link(path, &relative.to_path_lossy())? {
 						fs::create_dir_all(path.join(relative.to_path_lossy()))?;
+					}
+				}
+				// git treats a directory holding a `.git` it cannot open (an
+				// empty one, or one naming an administrative directory that is
+				// gone), and one the outer index tracks, as ordinary content,
+				// and its status names the untracked files inside it: those
+				// are the user's work too. A checkout git can open is reported
+				// as itself (`?? dir/`), never by the files below it, so it
+				// stays out.
+				for relative in &untracked {
+					if relative
+						.to_path_lossy()
+						.ancestors()
+						.skip(1)
+						.any(|parent| excluded.contains(parent))
+					{
+						copy_worktree_path(self.root(), path, relative.as_bstr())?;
 					}
 				}
 			}
@@ -999,6 +1031,31 @@ impl GitRepo {
 			}
 		}
 		Ok(())
+	}
+
+	/// Remove what each [`Self::worktree_add`] that died before it finished
+	/// left behind: a registration holding an add-in-progress marker that no
+	/// process holds any more, and the tree it names while that tree is still
+	/// this registration's (its `.git` is missing, or names this
+	/// registration). A live add holds its marker and is left alone. Returns
+	/// the trees removed. An entry that cannot be removed stays for the next
+	/// sweep; its error is returned once the others are done.
+	pub fn worktree_sweep_abandoned(&self) -> Result<Vec<PathBuf>> {
+		let common = &self.info().common_dir;
+		let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
+			return Ok(Vec::new());
+		};
+		let mut removed = Vec::new();
+		let mut failure = None;
+		for entry in entries {
+			let admin = entry?.path();
+			match remove_abandoned_add(common, &admin) {
+				Ok(Some(tree)) => removed.push(tree),
+				Ok(None) => {},
+				Err(err) => failure = failure.or(Some(err)),
+			}
+		}
+		failure.map_or(Ok(removed), Err)
 	}
 }
 
@@ -2017,41 +2074,170 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 	}
 }
 
-/// Registers `path` as a linked worktree of `common` at `head`. With `lock`,
-/// the registration is locked from the moment it exists, as
-/// `git worktree add --lock --reason <lock>` locks it: git's `write_file`
-/// completes non-empty content that lacks a final newline with one, and
-/// writes an empty reason as an empty file.
-fn register_worktree(
-	path: &Path,
-	common: &Path,
-	head: &str,
-	lock: Option<&str>,
-) -> Result<PathBuf> {
-	fs::create_dir_all(path)?;
-	let name = worktree_admin_name(common, path);
-	let admin = common.join("worktrees").join(name);
-	fs::create_dir_all(&admin)?;
-	if let Some(reason) = lock {
-		let mut content = reason.to_owned();
-		if !content.is_empty() && !content.ends_with('\n') {
-			content.push('\n');
-		}
-		fs::write(admin.join("locked"), content)?;
-	}
-	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
-	fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
-	fs::write(admin.join("commondir"), "../..\n")?;
-	fs::write(admin.join("HEAD"), format!("{head}\n"))?;
-	Ok(admin)
+/// File a running [`GitRepo::worktree_add`] keeps locked in the new
+/// registration's administrative directory until the add finishes. A
+/// registration holding it unlocked is an add that died before it finished.
+const ADD_IN_PROGRESS: &str = "omp-add-in-progress";
+
+/// What `git worktree add` writes to a new registration's `locked` file while
+/// it fills the tree, so `git worktree prune` leaves the registration alone.
+const LOCK_WHILE_ADDING: &str = "initializing\n";
+
+/// A linked worktree's registration from its first write until
+/// [`GitRepo::worktree_add`] finishes. It is locked from the start, as git
+/// locks it (with the caller's reason, or git's `initializing`), and holds
+/// [`ADD_IN_PROGRESS`] locked by this process. Dropped before
+/// [`Self::finish`], it removes the tree and the registration.
+struct PendingWorktree {
+	path:     PathBuf,
+	admin:    PathBuf,
+	marker:   Option<fs::File>,
+	/// `path` was an empty directory before the add, and is left one.
+	existed:  bool,
+	finished: bool,
 }
 
-fn cleanup_worktree_add(path: &Path, common: &Path) {
-	let admin = registered_admin(&path.join(".git")).ok().flatten();
-	let _ = fs::remove_dir_all(path);
-	if let Some(admin) = admin.filter(|admin| admin.starts_with(common.join("worktrees"))) {
-		let _ = fs::remove_dir_all(admin);
+impl PendingWorktree {
+	/// Registers `path` as a linked worktree of `common` at `head`. With
+	/// `lock`, the lock is the caller's from the start, as
+	/// `git worktree add --lock --reason <lock>` writes it: git's `write_file`
+	/// completes non-empty content that lacks a final newline with one, and
+	/// writes an empty reason as an empty file.
+	fn begin(path: &Path, common: &Path, head: &str, lock: Option<&str>) -> Result<Self> {
+		let root = common.join("worktrees");
+		fs::create_dir_all(&root)?;
+		let admin = loop {
+			let admin = root.join(worktree_admin_name(common, path));
+			match fs::create_dir(&admin) {
+				Ok(()) => break admin,
+				Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
+				Err(err) => return Err(err.into()),
+			}
+		};
+		let mut pending = Self {
+			path: path.to_path_buf(),
+			admin,
+			marker: None,
+			existed: path.is_dir(),
+			finished: false,
+		};
+		// The marker is locked before it takes its name, so no sweep sees it
+		// unlocked while this add lives.
+		let staged = pending
+			.admin
+			.join(format!("{ADD_IN_PROGRESS}.{}", std::process::id()));
+		let marker = fs::File::create(&staged)?;
+		marker.lock()?;
+		fs::rename(&staged, pending.admin.join(ADD_IN_PROGRESS))?;
+		pending.marker = Some(marker);
+		let locked = match lock {
+			Some(reason) if !reason.is_empty() && !reason.ends_with('\n') => format!("{reason}\n"),
+			Some(reason) => reason.to_owned(),
+			None => LOCK_WHILE_ADDING.to_owned(),
+		};
+		fs::write(pending.admin.join("locked"), locked)?;
+		fs::write(
+			pending.admin.join("gitdir"),
+			format!("{}\n", git_metadata_path(&path.join(".git"))),
+		)?;
+		fs::write(pending.admin.join("commondir"), "../..\n")?;
+		fs::write(pending.admin.join("HEAD"), format!("{head}\n"))?;
+		Ok(pending)
 	}
+
+	/// Writes the tree's `.git`, which names the registration.
+	fn link(&self) -> Result<()> {
+		fs::create_dir_all(&self.path)?;
+		fs::write(self.path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&self.admin)))?;
+		Ok(())
+	}
+
+	/// Removes the tree of a failed attempt, keeping the registration for the
+	/// next one.
+	fn reset_tree(&self) -> Result<()> {
+		remove_existing(&self.path)
+	}
+
+	/// Ends the add: `locked` stays only when the caller asked for a lock, and
+	/// the marker goes.
+	fn finish(&mut self, lock: Option<&str>) -> Result<()> {
+		if lock.is_none() {
+			remove_existing(&self.admin.join("locked"))?;
+		}
+		fs::remove_file(self.admin.join(ADD_IN_PROGRESS))?;
+		drop(self.marker.take());
+		self.finished = true;
+		Ok(())
+	}
+}
+
+impl Drop for PendingWorktree {
+	/// An add that returns before it finished removes what it made: the tree
+	/// (an empty directory again where one was) and the registration.
+	fn drop(&mut self) {
+		if self.finished {
+			return;
+		}
+		let _ = remove_existing(&self.path);
+		if self.existed {
+			let _ = fs::create_dir_all(&self.path);
+		}
+		drop(self.marker.take());
+		let _ = fs::remove_dir_all(&self.admin);
+	}
+}
+
+/// Removes the registration `admin`, and the tree it names, when it holds an
+/// [`ADD_IN_PROGRESS`] marker that no process holds. The tree goes only while
+/// it is still this registration's (its `.git` is missing, or names `admin`)
+/// and is neither the checkout `common` belongs to nor above it. Returns the
+/// tree removed; `None` when `admin` has no marker, its add is alive, or only
+/// the registration went.
+fn remove_abandoned_add(common: &Path, admin: &Path) -> Result<Option<PathBuf>> {
+	let marker = match fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(admin.join(ADD_IN_PROGRESS))
+	{
+		Ok(marker) => marker,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(err) => return Err(err.into()),
+	};
+	match marker.try_lock() {
+		Ok(()) => {},
+		Err(fs::TryLockError::WouldBlock) => return Ok(None),
+		Err(fs::TryLockError::Error(err)) => return Err(err.into()),
+	}
+	let back = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+	let git_entry = Path::new(back.trim());
+	let mut removed = None;
+	if let Some(tree) = git_entry
+		.parent()
+		.filter(|tree| !back.trim().is_empty() && tree.file_name().is_some())
+		.filter(|tree| !common.starts_with(tree))
+	{
+		let ours = match fs::symlink_metadata(git_entry) {
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+			Ok(meta) if meta.is_file() => registered_admin(git_entry)
+				.ok()
+				.flatten()
+				.is_some_and(|named| same_path(&named, admin)),
+			_ => false,
+		};
+		if ours && fs::symlink_metadata(tree).is_ok() {
+			remove_existing(tree)?;
+			removed = Some(tree.to_path_buf());
+		}
+	}
+	drop(marker);
+	fs::remove_dir_all(admin)?;
+	Ok(removed)
+}
+
+/// Whether `a` and `b` name the same location, resolved where they exist.
+fn same_path(a: &Path, b: &Path) -> bool {
+	let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path));
+	resolve(a) == resolve(b)
 }
 
 /// Remove a file, symlink, or directory tree at `path`; missing is fine.
@@ -2260,6 +2446,83 @@ mod tests {
 		git(temp.path(), &["commit", "-qm", "base"]);
 		let repo = GitRepo::require(temp.path()).unwrap();
 		(temp, repo)
+	}
+
+	/// A registration as an add in progress leaves it: `locked initializing`,
+	/// a back-reference to `tree/.git`, and the add-in-progress marker, which
+	/// the returned file holds locked when `live`.
+	fn add_in_progress(
+		repo: &GitRepo,
+		name: &str,
+		tree: &Path,
+		live: bool,
+	) -> (PathBuf, Option<fs::File>) {
+		let admin = repo.info().common_dir.join("worktrees").join(name);
+		fs::create_dir_all(&admin).unwrap();
+		fs::write(admin.join("locked"), LOCK_WHILE_ADDING).unwrap();
+		fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&tree.join(".git"))))
+			.unwrap();
+		fs::write(admin.join("commondir"), "../..\n").unwrap();
+		let marker = fs::File::create(admin.join(ADD_IN_PROGRESS)).unwrap();
+		let held = live.then(|| {
+			marker.lock().unwrap();
+			marker
+		});
+		(admin, held)
+	}
+
+	#[test]
+	fn sweep_removes_an_abandoned_add_and_its_tree_and_leaves_a_live_one() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let dead_tree = trees.path().join("dead");
+		let live_tree = trees.path().join("live");
+		for tree in [&dead_tree, &live_tree] {
+			fs::create_dir_all(tree.join("partial")).unwrap();
+			fs::write(tree.join("partial/file"), "copied\n").unwrap();
+		}
+		let (dead_admin, _) = add_in_progress(&repo, "dead", &dead_tree, false);
+		let (live_admin, held) = add_in_progress(&repo, "live", &live_tree, true);
+		let removed = repo.worktree_sweep_abandoned().unwrap();
+		assert_eq!(removed, vec![dead_tree.clone()]);
+		assert!(!dead_tree.exists() && !dead_admin.exists(), "the abandoned add stayed");
+		assert!(
+			live_tree.join("partial/file").is_file() && live_admin.is_dir(),
+			"the live add was removed"
+		);
+		// Control: once its process lets go of the marker, the same add goes.
+		drop(held);
+		assert_eq!(repo.worktree_sweep_abandoned().unwrap(), vec![live_tree.clone()]);
+		assert!(!live_tree.exists() && !live_admin.exists());
+	}
+
+	#[test]
+	fn sweep_keeps_a_tree_that_is_not_the_abandoned_adds() {
+		let (temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		// A tree whose `.git` names another, live registration.
+		let reused = trees.path().join("reused");
+		repo
+			.worktree_add(&reused, "HEAD", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+				lock:         None,
+			})
+			.unwrap();
+		let (stale_admin, _) = add_in_progress(&repo, "stale", &reused, false);
+		// A registration naming the checkout that holds the repository.
+		let (main_admin, _) = add_in_progress(&repo, "main-checkout", temp.path(), false);
+		// A registration naming a directory that holds a repository of its own.
+		let foreign = trees.path().join("foreign");
+		fs::create_dir_all(foreign.join(".git")).unwrap();
+		let (foreign_admin, _) = add_in_progress(&repo, "foreign", &foreign, false);
+		assert_eq!(repo.worktree_sweep_abandoned().unwrap(), Vec::<PathBuf>::new());
+		assert!(!stale_admin.exists() && !main_admin.exists() && !foreign_admin.exists());
+		assert!(reused.join("a").is_file(), "a tree another registration owns was removed");
+		assert!(temp.path().join("a").is_file(), "the repository's own checkout was removed");
+		assert!(foreign.join(".git").is_dir(), "a directory holding its own repository was removed");
+		assert!(GitRepo::require(&reused).is_ok(), "the other registration was removed");
 	}
 
 	#[test]
