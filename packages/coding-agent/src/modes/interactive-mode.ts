@@ -150,6 +150,7 @@ import {
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
+import type { InputOrigin } from "../session/agent-session-types";
 import type { AgentViewSession } from "../session/agent-session-handle";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
@@ -4027,6 +4028,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			display?: boolean;
 			streamingBehavior?: "steer" | "followUp";
 			followUps?: string[];
+			origin?: InputOrigin;
 		},
 		options?: { preserveDraft?: boolean; clearEditor?: boolean },
 	): SubmittedUserInput {
@@ -4038,6 +4040,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			display: input.display,
 			streamingBehavior: input.streamingBehavior,
 			followUps: input.followUps,
+			origin: input.origin,
 			cancelled: false,
 			started: false,
 		};
@@ -7126,6 +7129,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 				images: input?.images,
 				propagateErrors: true,
+				origin: "outside",
 			});
 			return true;
 		}
@@ -7137,13 +7141,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(initialPrompt, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: initialPrompt, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: initialPrompt, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -7188,6 +7195,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					await invokeSkillCommandFromText(this, initialPrompt, "steer", {
 						images: input?.images,
 						propagateErrors: true,
+						origin: "outside",
 					});
 				} finally {
 					this.#vibeSkillInFlight--;
@@ -7209,6 +7217,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(initialPrompt, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
@@ -7220,7 +7229,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#vibeSkillInFlight > 0) return false;
 			const onInput = this.onInputCallback;
 			if (!onInput) return false;
-			onInput(this.startPendingSubmission({ text: initialPrompt, ...input }, { preserveDraft: true }));
+			onInput(
+				this.startPendingSubmission({ text: initialPrompt, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		};
 		if (dispatchViaWaiter()) return true;
@@ -7240,6 +7251,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.session.prompt(initialPrompt, {
 					streamingBehavior: "steer",
 					images,
+					origin: "outside",
 				}),
 			{ imageCount: images?.length ?? 0 },
 		);
@@ -7636,7 +7648,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#enterGoalMode({ objective, silent: true });
 		if (!this.goalModeEnabled) return;
 		this.#resetGoalContinuationSuppression();
-		await this.session.prompt(objective, { streamingBehavior: "steer" });
+		await this.session.prompt(objective, { streamingBehavior: "steer", origin: "outside" });
 	}
 
 	/** End the `working` hold of `init({ startupRun })` once the command-line prompts are dispatched. */
@@ -7658,13 +7670,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(objective, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: objective, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -7689,13 +7704,16 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.session.prompt(objective, {
 						streamingBehavior: "steer",
 						images,
+						origin: "outside",
 					}),
 				{ imageCount: images?.length ?? 0 },
 			);
 			return true;
 		}
 		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective, ...input }, { preserveDraft: true }));
+			this.onInputCallback(
+				this.startPendingSubmission({ text: objective, ...input, origin: "outside" }, { preserveDraft: true }),
+			);
 			return true;
 		}
 		return false;
@@ -8058,11 +8076,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
-						const input = this.startPendingSubmission({ text: refinement });
+						const input = this.startPendingSubmission({ text: refinement, origin: "outside" });
 						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
 						this.onInputCallback(input);
 					} else {
-						await this.session.prompt(refinement);
+						await this.session.prompt(refinement, { origin: "outside" });
 						this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
 				} else {

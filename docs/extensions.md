@@ -334,6 +334,7 @@ export default function (pi: ExtensionAPI) {
 - `deliverAs: "nextTurn"` — kept out of the editable pending-message UI; while streaming it waits for the next turn, and when idle without `triggerTurn` it is appended to context/history without starting a turn
 - `deliverAs: "aside"` — injected at the next agent step boundary without interrupting the current tool batch, except that it ends a running interruptible `wait` (the wait returns "Wait interrupted by message." and its job keeps running); when idle it normally starts a turn regardless of `triggerTurn`. Plan mode or user-interrupt auto-resume suppression folds it into context instead
 - `triggerTurn: true` — starts a turn when idle (also honored with `deliverAs: "nextTurn"`: idle prompts immediately; while streaming the queued message schedules an internal continuation)
+- `origin: "outside"` — the message relays input from outside the session: a person, or a harness on their behalf (for example a person's turn delivered from a chat or ticket system). Only such input ends the session's cyber-policy hold (an OpenAI `cyber_policy` refusal holds OpenAI's routes until input from outside the root session arrives). Leave it unset for messages the extension makes itself or relays from another agent. An omp without the option ignores it
 
 When idle without `triggerTurn`, ordinary `sendMessage` delivery appends the
 message without starting a turn. A `display: true` message is rendered
@@ -348,7 +349,7 @@ queues the prompt even when idle instead of starting a turn directly. `"aside"`
 injects at the next step boundary while a run is live and starts a turn when
 idle. The message is recorded with `attribution: "user"` unless you pass
 `attribution: "agent"`; use `"agent"` for text the extension generated or relayed
-from another agent.
+from another agent. `origin: "outside"` works as for `sendMessage`.
 
 `pi.sendUserInput(text, { deliverAs, tag })` runs text as if the user typed it, the way RPC mode runs a `prompt` command, and resolves with how it was handled:
 

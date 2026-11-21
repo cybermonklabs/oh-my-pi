@@ -204,6 +204,7 @@ import {
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
+import type { CyberPolicyClosureApi } from "./session/cyber-policy-closure";
 import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
@@ -731,6 +732,8 @@ export interface CreateAgentSessionOptions {
 	deadline?: number;
 	/** Cost gate of the parent session tree; without one the session starts its own from `session.warnCost` / `session.maxCost`. */
 	costGate?: CostGateApi;
+	/** Cyber-policy closure of the parent session tree; without one the session owns its own. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -2577,6 +2580,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			get costGate() {
 				return currentCostGate();
+			},
+			get cyberPolicyClosure() {
+				return session?.cyberPolicyClosure ?? options.cyberPolicyClosure;
 			},
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
@@ -4810,6 +4816,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getPromptTokens: () => session.lastPromptTokens(),
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
+						isRouteClosed: model => session.cyberPolicyClosure.isClosed(model),
 					});
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
 			let result = args;
@@ -5107,6 +5114,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		session = new AgentSession({
 			cacheWarmer,
 			costGate: options.costGate,
+			cyberPolicyClosure: options.cyberPolicyClosure,
 			advisorWatchdogPrompt,
 			advisorContextPrompt,
 			advisorMemoryPrompt,

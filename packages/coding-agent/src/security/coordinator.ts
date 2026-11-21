@@ -15,6 +15,7 @@ import securityPublishDescription from "../prompts/tools/security-publish.md" wi
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import { SessionManager } from "../session/session-manager";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
@@ -85,6 +86,8 @@ export interface SecurityCoordinatorHost {
 	sessionId?: string;
 	agentId?: string;
 	asyncJobManager?: AsyncJobManagerApi;
+	/** The host session tree's cyber-policy closure; a scan session shares it. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 }
 
 export interface SecurityPreflightInput {
@@ -259,6 +262,7 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 			providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
 		}),
 		providerSessionId,
+		cyberPolicyClosure: input.host.cyberPolicyClosure,
 		sessionManager: input.sessionManager,
 		customTools: [input.publicationTool],
 		toolNames: SECURITY_SESSION_TOOLS,

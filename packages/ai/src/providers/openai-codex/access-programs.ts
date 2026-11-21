@@ -13,6 +13,7 @@
  * from {@link configureCodexAccessPrograms}.
  */
 import { logger } from "@oh-my-pi/pi-utils";
+import { isCyberPolicyRefusal } from "../../error/flags";
 import type { Model } from "../../types";
 import type { RequestBody } from "./request-transformer";
 
@@ -81,6 +82,9 @@ export function dropRejectedCodexAccessPrograms(
 
 function isAccessProgramRejection(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
+	// OpenAI's cyber-policy text names `access_programs.cyber`; that refusal judges the content, and a
+	// replay without the program would send the flagged request again.
+	if (isCyberPolicyRefusal(error)) return false;
 	const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
 	// HTTP parsing promotes generic error.type to code; only specific codes rule out message fallback.
 	if (code !== undefined && code !== "invalid_request_error") return Object.hasOwn(REJECTION_CODES, code);

@@ -1285,8 +1285,8 @@ class PromptError:
     provider: str | None = None
     model: str | None = None
     http_status: int | None = None
-    code: Literal["cost_cap"] | None = None
-    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request."""
+    code: Literal["cost_cap", "cyber_policy"] | None = None
+    """`cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2737,7 +2737,7 @@ def parse_prompt_error(value: object, path: str = "PromptError") -> PromptError:
         provider=optional(payload, "provider", decode_str, path),
         model=optional(payload, "model", decode_str, path),
         http_status=optional(payload, "httpStatus", decode_int, path),
-        code=optional(payload, "code", cast('Decoder[Literal["cost_cap"]]', literal(frozenset({"cost_cap"}))), path),
+        code=optional(payload, "code", cast('Decoder[Literal["cost_cap", "cyber_policy"]]', literal(frozenset({"cost_cap", "cyber_policy"}))), path),
     )
 
 
