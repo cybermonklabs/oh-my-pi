@@ -1383,6 +1383,11 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const user = `lease_agent_${process.pid}`;
+				// The user is made for the host the server sees for this client (USER()'s host part), not '%': an
+				// account at a more specific host, such as MariaDB's anonymous ''@'localhost' that mariadb-install-db
+				// makes, outranks 'user'@'%' (MySQL manual, "Access Control, Stage 1: Connection Verification").
+				const [seen] = (await db.sql("SELECT SUBSTRING_INDEX(USER(), '@', -1) AS host")) as Array<{ host: string }>;
+				const account = `'${user}'@'${String(seen?.host).replaceAll("'", "''")}'`;
 				// A fresh secret per run, so no fixed credential sits in the test.
 				const secret = Bun.randomUUIDv7();
 				const parts = `${db.table}_parts`;
@@ -1404,9 +1409,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					`CREATE TABLE ${db.leaseTable} (session_id VARCHAR(512) NOT NULL PRIMARY KEY, holder VARCHAR(64) NOT NULL, ` +
 						"host VARCHAR(255) NOT NULL, pid BIGINT NOT NULL, acquired_at BIGINT NOT NULL, " +
 						`heartbeat_at BIGINT NOT NULL, INDEX ${db.leaseTable}_holder (holder))${options}`,
-					`CREATE USER '${user}'@'%' IDENTIFIED BY '${secret}'`,
+					`CREATE USER ${account} IDENTIFIED BY '${secret}'`,
 					...[db.table, parts, blobs, refs, db.leaseTable].map(
-						table => `GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON ${table} TO '${user}'@'%'`,
+						table => `GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON ${table} TO ${account}`,
 					),
 				]) {
 					await db.sql(statement);
@@ -1439,7 +1444,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					for (const name of [db.leaseTable, parts, blobs, refs, db.table]) {
 						await db.sql(`DROP TABLE IF EXISTS ${name}`);
 					}
-					await db.sql(`DROP USER IF EXISTS '${user}'@'%'`);
+					await db.sql(`DROP USER IF EXISTS ${account}`);
 				}
 			},
 			30_000,
