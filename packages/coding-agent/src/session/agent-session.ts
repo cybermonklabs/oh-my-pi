@@ -632,6 +632,14 @@ const cfgWorkspacePromptInputs = combine({
 const PLAN_MODE_REMINDER_MAX = 3;
 /** Custom message type of the plan mode instructions. */
 const PLAN_MODE_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
+/** Custom message type of the approved-plan reference. */
+const PLAN_MODE_REFERENCE_MESSAGE_TYPE = "plan-mode-reference";
+/**
+ * Custom session entry written when the prompt sent next carries the approved plan in its own text (the
+ * plan-approved prompt, {@link AgentSession.markPlanReferenceSent}): a branch that holds it and grows past it carries
+ * the plan as a reference message would.
+ */
+const PLAN_REFERENCE_PROMPT_ENTRY_TYPE = "plan-reference-prompt";
 /** Custom message type of the goal mode instructions. */
 const GOAL_MODE_CONTEXT_MESSAGE_TYPE = "goal-mode-context";
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
@@ -1182,12 +1190,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
-	#planReferenceSent = false;
 	/**
-	 * The branch entry the approved-plan reference went out after in this process (null: before the first entry), set
-	 * with {@link #planReferenceSent}: a branch that holds it and grows past it carries the reference.
+	 * Whether the current branch carries the approved-plan reference, so no request sends it again: read from the
+	 * branch whenever the session loads one ({@link #syncPlanReferenceToBranch}: at startup, on a switch, a `/tree` move
+	 * or a rewind), and set when this process sends it.
 	 */
-	#planReferenceSentAfter: string | null = null;
+	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
 	#planReferenceApproved = false;
 	#clientBridge: ClientBridge | undefined;
@@ -2202,8 +2210,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
-		// Only a recorded approval may turn a draft file into an execution reference.
-		this.#adoptPlanApprovalFromBranch();
+		// Only a recorded approval may turn a draft file into an execution reference, and a reference the loaded branch
+		// carries goes out no second time.
+		this.#syncPlanReferenceToBranch();
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
@@ -7889,7 +7898,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		const planReference = await this.#buildPlanReferenceMessage();
 		if (planReference) {
-			this.#notePlanReferenceSent();
+			this.#planReferenceSent = true;
 			missing.push(planReference);
 		}
 		const enabledToolNames = this.getEnabledToolNames();
@@ -8437,8 +8446,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#goalRuntime;
 	}
 
+	/**
+	 * Records that the prompt the caller sends next carries the approved plan in its own text (the plan-approved
+	 * prompt), so no reference goes out with it or after it. The record is kept on the branch
+	 * ({@link PLAN_REFERENCE_PROMPT_ENTRY_TYPE}), so a process that resumes the session, a switch back to it and a
+	 * `/tree` move read it as the reference it stands for.
+	 */
 	markPlanReferenceSent(): void {
-		this.#notePlanReferenceSent();
+		this.sessionManager.appendCustomEntry(PLAN_REFERENCE_PROMPT_ENTRY_TYPE);
+		this.#planReferenceSent = true;
 	}
 
 	/** Marks a reviewed plan as approved so later prompts may reference it. */
@@ -8647,7 +8663,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * rewrite (new session, compaction, edit). Inlines the plan body so the
 	 * executor need not re-read it; the durable `local://` path stays in the
 	 * prompt as the recovery route when a compressor expires the inline copy.
-	 * Returns null during plan mode, once already sent, or when no plan exists.
+	 * Returns null during plan mode, while the current branch carries it, or when
+	 * no plan exists.
 	 */
 	async #buildPlanReferenceMessage(): Promise<CustomMessage | null> {
 		if (this.#planModeState?.enabled) return null;
@@ -8665,7 +8682,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		return {
 			role: "custom",
-			customType: "plan-mode-reference",
+			customType: PLAN_MODE_REFERENCE_MESSAGE_TYPE,
 			content,
 			display: false,
 			attribution: "agent",
@@ -8673,10 +8690,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	/** Records that the approved-plan reference goes out now, after the current branch leaf. */
-	#notePlanReferenceSent(): void {
-		this.#planReferenceSent = true;
-		this.#planReferenceSentAfter = this.sessionManager.getLeafId();
+	/**
+	 * Whether the current branch carries the approved-plan reference: since its newest approval, compaction and context
+	 * reset (`/clear`), it holds a reference message, or a record that the prompt after it carried the plan
+	 * ({@link markPlanReferenceSent}) and that prompt. A reference before an approval was for the plan approved before,
+	 * and one before a compaction or reset is not in the context the requests send.
+	 */
+	#branchCarriesPlanReference(): boolean {
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			switch (entry.type) {
+				case "custom_message":
+					if (entry.customType === PLAN_MODE_REFERENCE_MESSAGE_TYPE) return true;
+					break;
+				case "custom":
+					if (entry.customType === PLAN_REFERENCE_PROMPT_ENTRY_TYPE) return index < branch.length - 1;
+					break;
+				case "mode_change":
+					if (typeof entry.data?.approvedPlanFilePath === "string") return false;
+					break;
+				case "compaction":
+				case "reset_boundary":
+					return false;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -8699,17 +8738,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * After a move to another branch or transcript: the approval it records ({@link #adoptPlanApprovalFromBranch}),
-	 * and whether it carries the reference this process sent, which it does when it holds the entry the reference went
-	 * out after and grows past it. One that lacks it gets it again with its next request.
+	 * Reads the plan state of the branch the session loaded (at startup, after a switch, a `/tree` move or a rewind):
+	 * the approval it records ({@link #adoptPlanApprovalFromBranch}), and whether it carries the reference
+	 * ({@link #branchCarriesPlanReference}), whichever process sent it. One that lacks it gets it with its next request.
 	 */
 	#syncPlanReferenceToBranch(): void {
 		this.#adoptPlanApprovalFromBranch();
-		if (!this.#planReferenceSent) return;
-		const branch = this.sessionManager.getBranchView();
-		const after = this.#planReferenceSentAfter;
-		const index = after === null ? -1 : branch.findIndex(entry => entry.id === after);
-		this.#planReferenceSent = (after === null || index >= 0) && index < branch.length - 1;
+		this.#planReferenceSent = this.#branchCarriesPlanReference();
 	}
 
 	#isScoutAvailable(): boolean {
@@ -9991,7 +10026,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// lost the approved plan (issue #4094). The compaction-success resets
 			// (issue #1246) still clear it for re-injection on the next turn.
 			if (planReferenceMessage) {
-				this.#notePlanReferenceSent();
+				this.#planReferenceSent = true;
 			}
 			try {
 				const run = this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
