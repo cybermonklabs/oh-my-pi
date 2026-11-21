@@ -31,6 +31,7 @@
  * listings and the TUI see the pool's work without a main-side registry entry.
  */
 import { CostCapError, CostGate } from "../../session/cost-gate";
+import { CyberPolicyClosure } from "../../session/cyber-policy-closure";
 import { ArtifactManager } from "../../session/artifacts";
 import { AgentStorage } from "../../session/agent-storage";
 import { EventBus } from "../../utils/event-bus";
@@ -43,11 +44,14 @@ import {
 	type ArtifactManagerProtocol,
 	COST_GATE_KIND,
 	type CostGateProtocol,
+	CYBER_POLICY_CLOSURE_KIND,
+	type CyberPolicyClosureProtocol,
 	EVENT_BUS_KIND,
 	type EventBusProtocol,
 	RemoteAgentStorage,
 	RemoteArtifactManager,
 	RemoteCostGate,
+	RemoteCyberPolicyClosure,
 	RemoteEventBus,
 } from "./runtime-remote";
 import { ignoreSettle, PeerCleanups } from "./support";
@@ -78,6 +82,27 @@ function serveCostGate(peer: WorkerPeer): RpcServe<CostGate, CostGateProtocol> {
 				}),
 			);
 			return gate.capped;
+		},
+	};
+}
+
+function serveCyberPolicyClosure(peer: WorkerPeer): RpcServe<CyberPolicyClosure, CyberPolicyClosureProtocol> {
+	return {
+		record: closure => closure.record(),
+		watch: (closure, listener) => {
+			const stop = cleanups.track(
+				peer.threadId,
+				closure.onChange(() => {
+					// A closed link rejects; the worker's exit releases the watch.
+					Promise.resolve(listener(closure.active)).then(
+						alive => {
+							if (!alive) stop();
+						},
+						() => {},
+					);
+				}),
+			);
+			return closure.active;
 		},
 	};
 }
@@ -133,6 +158,11 @@ export const runtimeThreadService: ThreadService = {
 			(value): value is CostGate => value instanceof CostGate,
 			serveCostGate(peer),
 		);
+		link.exportClass<CyberPolicyClosure, CyberPolicyClosureProtocol>(
+			CYBER_POLICY_CLOSURE_KIND,
+			(value): value is CyberPolicyClosure => value instanceof CyberPolicyClosure,
+			serveCyberPolicyClosure(peer),
+		);
 		link.exportClass<EventBus, EventBusProtocol>(
 			EVENT_BUS_KIND,
 			(value): value is EventBus => value instanceof EventBus,
@@ -152,6 +182,10 @@ export const runtimeThreadService: ThreadService = {
 	onWorkerExit: peer => cleanups.release(peer.threadId),
 	installWorker(link) {
 		link.importClass<RemoteCostGate, CostGateProtocol>(COST_GATE_KIND, remote => new RemoteCostGate(remote));
+		link.importClass<RemoteCyberPolicyClosure, CyberPolicyClosureProtocol>(
+			CYBER_POLICY_CLOSURE_KIND,
+			remote => new RemoteCyberPolicyClosure(remote),
+		);
 		link.importClass<RemoteEventBus, EventBusProtocol>(EVENT_BUS_KIND, remote => new RemoteEventBus(remote));
 		link.importClass<RemoteArtifactManager, ArtifactManagerProtocol>(
 			ARTIFACT_MANAGER_KIND,

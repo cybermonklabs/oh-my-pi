@@ -96,6 +96,7 @@ import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import { INTERRUPTED_TURN_ERROR } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
@@ -439,6 +440,8 @@ export interface ExecutorOptions {
 	cwd: string;
 	/** Cost gate of the parent session tree; the subagent's requests count toward it. */
 	costGate?: CostGateApi;
+	/** Cyber-policy closure of the parent session tree: a refusal anywhere in the tree closes OpenAI's routes to all of it. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
@@ -1306,6 +1309,8 @@ interface RunMonitorArgs {
 	modelRegistry?: ModelRegistry;
 	/** Parent settings for tiny-model label generation. */
 	settings?: Settings;
+	/** The parent tree's cyber-policy closure; the label request carries the assignment text. */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -1747,7 +1752,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// failures just leave the label unset.
 	const labelSource = assignment?.trim();
 	if (!args.description && args.modelRegistry && args.settings && labelSource) {
-		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal)
+		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal, args.cyberPolicyClosure)
 			.then(label => {
 				if (!label || abortSignal.aborted || progress.description) return;
 				progress.description = label;
@@ -2546,6 +2551,8 @@ async function driveSessionToResult(
 		const refusal = session.costCapRefusal;
 		return refusal !== refusalBefore ? refusal : undefined;
 	};
+	// A cyber-policy closure that kept the run from its model is why it produced no result.
+	const cyberStopBefore = session.cyberPolicyStop;
 	const checkAbort = () => {
 		if (abortSignal.aborted) {
 			aborted = monitor.isAbortedRun();
@@ -2838,6 +2845,11 @@ async function driveSessionToResult(
 		if (!delivered && refusal && !aborted) {
 			exitCode = 1;
 			error ??= refusal.message;
+		}
+		const cyberStop = session.cyberPolicyStop;
+		if (!delivered && cyberStop && cyberStop !== cyberStopBefore && !aborted) {
+			exitCode = 1;
+			error ??= cyberStop.message;
 		}
 
 		// A recorded yield that async-result deliveries superseded and the
@@ -4613,6 +4625,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		assignment,
 		description: options.description,
 		modelRegistry: options.modelRegistry,
+		cyberPolicyClosure: options.cyberPolicyClosure,
 		settings,
 		modelOverride,
 		modelRole,
@@ -4955,6 +4968,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				options: {
 					cwd: effectiveCwd,
 					costGate: options.costGate,
+					cyberPolicyClosure: options.cyberPolicyClosure,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 					authStorage,
 					modelRegistry,

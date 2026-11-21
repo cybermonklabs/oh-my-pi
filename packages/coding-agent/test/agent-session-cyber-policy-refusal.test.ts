@@ -11,6 +11,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { CyberPolicyClosureApi } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -55,6 +56,30 @@ const GATEWAY_MODELS_YML = `providers:
         name: gpt-6.1-sol
         contextWindow: 400000
         maxTokens: 128000
+  # A gateway whose OpenAI model has an alias the catalog cannot classify, under two provider names,
+  # beside a Claude model on the same gateway.
+  gw-a:
+    api: openai-responses
+    baseUrl: http://127.0.0.1:2/v1
+    auth: none
+    models:
+      - id: sol-review
+        name: sol-review
+        contextWindow: 400000
+        maxTokens: 128000
+      - id: claude-sonnet-4-5
+        name: claude-sonnet-4-5
+        contextWindow: 200000
+        maxTokens: 64000
+  gw-b:
+    api: openai-responses
+    baseUrl: http://127.0.0.1:2/v1
+    auth: none
+    models:
+      - id: sol-review
+        name: sol-review
+        contextWindow: 400000
+        maxTokens: 128000
 `;
 
 function selector(model: Model): string {
@@ -72,6 +97,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
+	const others: AgentSession[] = [];
 
 	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-cyber-policy-");
@@ -94,6 +120,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 			await session.dispose();
 			session = undefined;
 		}
+		for (const other of others.splice(0)) await other.dispose();
 		vi.restoreAllMocks();
 	});
 
@@ -109,12 +136,30 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		const openai = getBundledModel("openai", "gpt-5.5");
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const opus = getBundledModel("anthropic", "claude-opus-4-5");
-		if (!gateway || !gatewayAlias || !codex || !openai || !sonnet || !opus) {
+		const daybreak = getBundledModel("openai", "daybreak-blue-latest");
+		const aliasA = modelRegistry.find("gw-a", "sol-review");
+		const aliasB = modelRegistry.find("gw-b", "sol-review");
+		const gatewayClaude = modelRegistry.find("gw-a", "claude-sonnet-4-5");
+		if (
+			!gateway ||
+			!gatewayAlias ||
+			!codex ||
+			!openai ||
+			!sonnet ||
+			!opus ||
+			!daybreak ||
+			!aliasA ||
+			!aliasB ||
+			!gatewayClaude
+		) {
 			throw new Error("Expected the gateway routes from models.yml and the bundled test models");
 		}
 		// The catalog puts every OpenAI route below in one lineage, whatever provider serves it.
 		for (const model of [gateway, gatewayAlias, codex, openai]) expect(model.identity.class).toBe("openai");
-		return { gateway, gatewayAlias, codex, openai, sonnet, opus };
+		// It cannot classify OpenAI's Daybreak models or a gateway's own alias names.
+		for (const model of [daybreak, aliasA, aliasB]) expect(model.identity.class).toBe("unknown");
+		for (const model of [sonnet, opus, gatewayClaude]) expect(model.identity.class).toBe("anthropic");
+		return { gateway, gatewayAlias, codex, openai, sonnet, opus, daybreak, aliasA, aliasB, gatewayClaude };
 	}
 
 	/** A session whose requests are answered per route by `answer`; `requested` records each route asked. */
@@ -124,9 +169,21 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		maxRetries?: number;
 		answer: (model: Model, routeAttempt: number) => MockResponse;
 		tools?: AgentTool[];
-	}): { live: AgentSession; requested: string[]; fallbacks: string[] } {
+		/** The parent's closure, as a subagent session receives it. */
+		cyberPolicyClosure?: CyberPolicyClosureApi;
+		/** Keeps an earlier session alive beside this one. */
+		keepOthers?: boolean;
+	}): {
+		live: AgentSession;
+		requested: string[];
+		fallbacks: string[];
+		notices: string[];
+		nextRequest: () => Promise<void>;
+	} {
 		const requested: string[] = [];
 		const fallbacks: string[] = [];
+		const notices: string[] = [];
+		let waiter: PromiseWithResolvers<void> | undefined;
 		const attempts = new Map<string, number>();
 		const mock = createMockModel();
 		const agent = new Agent({
@@ -138,6 +195,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 				const attempt = (attempts.get(route) ?? 0) + 1;
 				attempts.set(route, attempt);
 				mock.push(options.answer(model, attempt));
+				waiter?.resolve();
 				return mock.stream(model, context, streamOptions);
 			},
 		});
@@ -149,12 +207,24 @@ describe("AgentSession after a cyber_policy refusal", () => {
 			"retry.fallbackChains": options.chains,
 		});
 		settings.setModelRole("default", selector(options.primary));
-		const live = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		session = live;
+		const live = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			cyberPolicyClosure: options.cyberPolicyClosure,
+		});
+		if (options.keepOthers) others.push(live);
+		else session = live;
 		live.subscribe(event => {
 			if (event.type === "retry_fallback_applied") fallbacks.push(event.to);
+			if (event.type === "notice") notices.push(event.message);
 		});
-		return { live, requested, fallbacks };
+		const nextRequest = () => {
+			waiter = Promise.withResolvers<void>();
+			return waiter.promise;
+		};
+		return { live, requested, fallbacks, notices, nextRequest };
 	}
 
 	it("sends the refused request to no other OpenAI route and lets another family take the turn", async () => {
@@ -296,5 +366,160 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		expect(requested).toEqual([selector(codex), selector(openai)]);
 		expect(fallbacks).toEqual([selector(openai)]);
 		expect(lastAssistant(live).stopReason).toBe("stop");
+	});
+
+	it("closes OpenAI routes the catalog cannot classify: Daybreak and a gateway alias", async () => {
+		const { codex, daybreak, aliasB, sonnet } = models();
+		const { live, requested } = startSession({
+			primary: codex,
+			chains: { [selector(codex)]: [selector(aliasB), selector(daybreak), selector(sonnet)] },
+			answer: model => (model.provider === sonnet.provider ? { content: ["answered by Claude"] } : CYBER_POLICY),
+		});
+
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+
+		expect(requested).toEqual([selector(codex), selector(sonnet)]);
+		expect(lastAssistant(live).stopReason).toBe("stop");
+	});
+
+	it("closes an unclassified route's aliases but not a known other family on the same gateway", async () => {
+		const { aliasA, aliasB, gatewayClaude } = models();
+		const { live, requested } = startSession({
+			primary: aliasA,
+			chains: { [selector(aliasA)]: [selector(aliasB), selector(gatewayClaude)] },
+			answer: model => (model.id === gatewayClaude.id ? { content: ["answered by Claude"] } : CYBER_POLICY),
+		});
+
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+
+		expect(requested).toEqual([selector(aliasA), selector(gatewayClaude)]);
+		expect(lastAssistant(live).stopReason).toBe("stop");
+	});
+
+	it("makes no model call for an automatic turn while every route left is closed, and keeps its input", async () => {
+		const { gateway, gatewayAlias, codex } = models();
+		const { live, requested, notices } = startSession({
+			primary: gateway,
+			chains: { [selector(gateway)]: [selector(gatewayAlias), selector(codex)] },
+			answer: () => CYBER_POLICY,
+		});
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(gateway)]);
+
+		// A background job result arrives: the session would start a turn of its own.
+		await live.sendCustomMessage(
+			{ customType: "test-job-result", content: "job finished", display: true },
+			{ triggerTurn: true },
+		);
+		await live.waitForIdle();
+
+		expect(requested).toEqual([selector(gateway)]);
+		expect(notices.some(notice => notice.includes("cyber_policy"))).toBe(true);
+		expect(live.messages.some(message => message.role === "custom" && message.customType === "test-job-result")).toBe(
+			true,
+		);
+
+		// A person's next prompt ends the closure: that prompt reaches the route again.
+		await live.prompt("Try another way");
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(gateway), selector(gateway)]);
+	});
+
+	it("keeps the closure through prompts the session makes itself, until a person's prompt", async () => {
+		const { codex, sonnet } = models();
+		const { live, requested, nextRequest } = startSession({
+			primary: codex,
+			chains: { [selector(codex)]: [selector(sonnet)] },
+			answer: model => (model.provider === codex.provider ? CYBER_POLICY : { content: ["answered by Claude"] }),
+		});
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(codex), selector(sonnet)]);
+
+		// The refusing route's cooldown runs out, then a hook continues the turn on its own.
+		modelRegistry.clearSuppressedSelectors();
+		const continued = nextRequest();
+		live.queueDeferredMessage({
+			role: "custom",
+			customType: "test-hook-continuation",
+			content: "Continue.",
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		await continued;
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(codex), selector(sonnet), selector(sonnet)]);
+
+		// A person's prompt ends the closure, and the primary comes back (it refuses again, and the
+		// walk then moves the turn to Claude once more).
+		const before = requested.length;
+		await live.prompt("Next request");
+		await live.waitForIdle();
+		expect(requested.slice(before)).toEqual([selector(codex), selector(sonnet)]);
+	});
+
+	it("sends no side-channel turn over the conversation to a closed route", async () => {
+		const { gateway, gatewayAlias } = models();
+		const { live, requested } = startSession({
+			primary: gateway,
+			chains: { [selector(gateway)]: [selector(gatewayAlias)] },
+			answer: () => CYBER_POLICY,
+		});
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+
+		await expect(live.runEphemeralTurn({ promptText: "Recap where things stand." })).rejects.toThrow("cyber_policy");
+		expect(requested).toEqual([selector(gateway)]);
+	});
+
+	it("shares the closure with a subagent session, in both directions", async () => {
+		const { codex, openai, sonnet } = models();
+		// The parent's refusal closes the routes; the child is configured for OpenAI.
+		const parent = startSession({
+			primary: codex,
+			chains: { [selector(codex)]: [selector(sonnet)] },
+			answer: model => (model.provider === codex.provider ? CYBER_POLICY : { content: ["answered by Claude"] }),
+			keepOthers: true,
+		});
+		await parent.live.prompt("Review this change");
+		await parent.live.waitForIdle();
+		const child = startSession({
+			primary: openai,
+			chains: {},
+			answer: () => ({ content: ["child answer"] }),
+			cyberPolicyClosure: parent.live.cyberPolicyClosure,
+			keepOthers: true,
+		});
+
+		await child.live.prompt("Subagent task");
+		await child.live.waitForIdle();
+
+		expect(child.requested).toEqual([]);
+		expect(child.live.cyberPolicyStop?.message).toContain("cyber_policy");
+		// The child's prompt is the parent's turn continuing: it does not end the parent's closure.
+		expect(parent.live.cyberPolicyClosure.isClosed(codex)).toBe(true);
+
+		// A refusal inside a fresh child closes the routes of the parent that started it.
+		const fresh = startSession({
+			primary: sonnet,
+			chains: {},
+			answer: () => ({ content: ["ok"] }),
+			keepOthers: true,
+		});
+		const refusingChild = startSession({
+			primary: openai,
+			chains: {},
+			answer: () => CYBER_POLICY,
+			cyberPolicyClosure: fresh.live.cyberPolicyClosure,
+			keepOthers: true,
+		});
+		await refusingChild.live.prompt("Subagent task");
+		await refusingChild.live.waitForIdle();
+		expect(fresh.live.cyberPolicyClosure.isClosed(codex)).toBe(true);
+		expect(fresh.live.cyberPolicyClosure.isClosed(sonnet)).toBe(false);
 	});
 });

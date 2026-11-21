@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- After an OpenAI `cyber_policy` refusal the session no longer sends the request again: it does not retry the model or rotate its accounts, and for the rest of the prompt the fallback walk, the usage-aware switch, the primary restore and the advisor's walk pass over every route to an OpenAI model, whichever provider serves it; a fallback of another family may still take the turn. An advisor refused this way is not re-sent its batch with the primary's reasoning stripped
+- After an OpenAI `cyber_policy` refusal no copy of the refused content goes to OpenAI again until your next prompt: the model call is not retried and its accounts are not rotated, and every route to an OpenAI model (whichever provider serves it) or to a model whose family the catalog cannot tell (OpenAI's Daybreak models, a gateway's alias names) stays closed to the whole session tree. The session's own follow-ups (job results, queued messages, hook continuations, IRC deliveries), its subagents, its advisors, title and task-label generation, memory completions, side turns and the prompt-cache warmer pass over closed routes: they move to an open fallback of another family, or make no model call and say why. Your next prompt (typed, RPC or a `.` continue) ends the closure
 
 ## [18.18.6] - 2026-11-09
 

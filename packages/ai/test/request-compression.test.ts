@@ -222,4 +222,36 @@ describe("wrapFetchForRequestCompression", () => {
 		expect(calls.map(call => call.headers["Content-Encoding"])).toEqual(["zstd"]);
 		expect(await response.text()).toBe(error);
 	});
+
+	// Codex assigns no rejection pattern, so any JSON 400 reads as a possible encoding rejection.
+	// A cyber-policy refusal judges the content; sending it again uncompressed is a second refusal.
+	it.each([
+		["with its code", '{"error":{"code":"cyber_policy","message":"Request rejected."}}'],
+		[
+			"by OpenAI's sentence",
+			'{"error":{"type":"invalid_request_error","message":"This content was flagged for possible cybersecurity risk."}}',
+		],
+	])("sends a Codex cyber-policy refusal %s once, never again uncompressed", async (_label, error) => {
+		const codex = model("openai-codex", "openai-codex-responses", "https://chatgpt.com/backend-api");
+		const { calls, fetch } = captureFetch([new Response(error, { status: 400 })]);
+
+		const response = await wrapFetchForRequestCompression(fetch, codex)(
+			"https://chatgpt.com/backend-api/codex/responses",
+			post(),
+		);
+
+		expect(calls.map(call => call.headers["Content-Encoding"])).toEqual(["zstd"]);
+		expect(response.status).toBe(400);
+		expect(await response.text()).toBe(error);
+	});
+
+	it("still resends a Codex JSON 400 that is not a refusal uncompressed", async () => {
+		const codex = model("openai-codex", "openai-codex-responses", "https://chatgpt.com/backend-api");
+		const error = '{"error":{"message":"Could not parse the request body."}}';
+		const { calls, fetch } = captureFetch([new Response(error, { status: 400 })]);
+
+		await wrapFetchForRequestCompression(fetch, codex)("https://chatgpt.com/backend-api/codex/responses", post());
+
+		expect(calls.map(call => call.headers["Content-Encoding"])).toEqual(["zstd", undefined]);
+	});
 });

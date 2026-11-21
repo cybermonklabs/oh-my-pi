@@ -259,6 +259,44 @@ describe("AgentSession memory backend lifecycle", () => {
 		]);
 	});
 
+	// A memory completion sends transcript text, so after OpenAI refuses content for cyber policy no
+	// memory candidate on an OpenAI route may receive it; another family may. Synthetic refusals only.
+	describe("after a cyber_policy refusal", () => {
+		const openai = () => getBundledModel("openai", "gpt-5.5")!;
+		const codex = () => getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		const claude = () => getBundledModel("anthropic", "claude-sonnet-4-6")!;
+
+		it("skips every OpenAI memory candidate while the refusal holds", async () => {
+			const sent: string[] = [];
+			spyOn(ai, "completeSimple").mockImplementation(async candidate => {
+				sent.push(`${candidate.provider}/${candidate.id}`);
+				return memoryReply(candidate);
+			});
+			const { current, complete } = await startMemoryCompletion([openai(), codex(), claude()]);
+			current.cyberPolicyClosure.record();
+
+			expect(await complete("Sam works at Globex.")).toBe("Sam works at Globex.");
+			expect(sent).toEqual([`${claude().provider}/${claude().id}`]);
+		});
+
+		it("records a memory candidate's refusal and asks no other OpenAI candidate", async () => {
+			const sent: string[] = [];
+			spyOn(ai, "completeSimple").mockImplementation(async candidate => {
+				sent.push(`${candidate.provider}/${candidate.id}`);
+				if (candidate.provider === "anthropic") return memoryReply(candidate);
+				return {
+					...memoryReply(candidate, "error"),
+					errorMessage: "cyber_policy: This content was flagged for possible cybersecurity risk.",
+				};
+			});
+			const { current, complete } = await startMemoryCompletion([openai(), codex(), claude()]);
+
+			expect(await complete("Sam works at Globex.")).toBe("Sam works at Globex.");
+			expect(sent).toEqual([`${openai().provider}/${openai().id}`, `${claude().provider}/${claude().id}`]);
+			expect(current.cyberPolicyClosure.isClosed(codex())).toBe(true);
+		});
+	});
+
 	it("does not journal unbilled local-inference memory completions", async () => {
 		const model = getBundledModel("local", "qwen2.5-1.5b")!;
 		spyOn(tinyModelClient, "complete").mockResolvedValue("Sam works at Globex.");

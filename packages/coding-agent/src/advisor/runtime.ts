@@ -64,6 +64,12 @@ export interface AdvisorRuntimeHost {
 	 */
 	beginAdvisorUpdate?(inProgress: boolean): void;
 	/**
+	 * Called before each batch is sent. Returns false to hold the batch: the advisor's model is on a
+	 * route a cyber-policy refusal closed and no open fallback exists. The runtime keeps the batch and
+	 * sends nothing until {@link AdvisorRuntime.resumeAfterClosedRoute}.
+	 */
+	ensureOpenRoute?(signal: AbortSignal): Promise<boolean>;
+	/**
 	 * Called with the error of every failed advisor turn, before the retry sleep
 	 * or the dropped-after-3 path. Lets the host apply credential-level remedies
 	 * and configured model fallback that the advisor loop cannot perform itself.
@@ -302,6 +308,8 @@ export class AdvisorRuntime {
 	#held: PendingDelta[] = [];
 	#busy = false;
 	#sessionTransitionPaused = false;
+	/** Holding its batches: its model's route is closed by a cyber-policy refusal and has no open fallback. */
+	#heldForClosedRoute = false;
 	#promptInFlight: Promise<void> | undefined;
 	#iterationAbort: AbortController | undefined;
 	#backlog = 0;
@@ -533,9 +541,10 @@ export class AdvisorRuntime {
 			this.#backlog < threshold ||
 			this.#quotaExhausted ||
 			this.#halted ||
-			// A paused runtime cannot drain until the transition resumes; release
+			// A paused or held runtime cannot drain until it resumes; release
 			// every waiter, as `pauseForSessionTransition` does for existing ones.
 			this.#sessionTransitionPaused ||
+			this.#heldForClosedRoute ||
 			// An advisor mid-failure/retry must NEVER gate the primary agent:
 			// its backlog cannot drain until the retry cycle resolves, and the
 			// primary would otherwise park for the full catch-up budget.
@@ -665,6 +674,13 @@ export class AdvisorRuntime {
 		if (!this.#sessionTransitionPaused) return;
 		this.#sessionTransitionPaused = false;
 		if (!this.#quotaExhausted && !this.#halted) void this.#drain();
+	}
+
+	/** Send the held batches once a person's prompt ends the cyber-policy closure that held them. */
+	resumeAfterClosedRoute(): void {
+		if (!this.#heldForClosedRoute) return;
+		this.#heldForClosedRoute = false;
+		if (!this.#quotaExhausted && !this.#halted && !this.#sessionTransitionPaused) void this.#drain();
 	}
 
 	/**
@@ -1288,11 +1304,11 @@ export class AdvisorRuntime {
 	}
 
 	async #drain(): Promise<void> {
-		if (this.#busy || this.#sessionTransitionPaused) return;
+		if (this.#busy || this.#sessionTransitionPaused || this.#heldForClosedRoute) return;
 		this.#busy = true;
 		try {
 			this.#syncModelIdentity();
-			while (!this.disposed && !this.#sessionTransitionPaused && this.#pending.length) {
+			while (!this.disposed && !this.#sessionTransitionPaused && !this.#heldForClosedRoute && this.#pending.length) {
 				this.#syncModelIdentity();
 				let popped: PendingDelta[];
 				if (this.#pending[0]?.overflowRecovery) {
@@ -1328,6 +1344,17 @@ export class AdvisorRuntime {
 					this.#pending.unshift(...popped);
 					continue;
 				}
+				// The batch carries the primary's transcript, refused content included: after a
+				// cyber-policy refusal it goes to no OpenAI route. The host walks the advisor to an
+				// open fallback, or the batch is held until a person's next prompt ends the closure.
+				if (this.host.ensureOpenRoute && !(await this.host.ensureOpenRoute(iterationAbort.signal))) {
+					this.#restoreSeenContextInFlight();
+					this.#pending.unshift(...popped);
+					this.#heldForClosedRoute = true;
+					this.#wakeAllWaiters();
+					continue;
+				}
+				this.#syncModelIdentity();
 
 				const { batchText, rawMessages, preparedMessages, finalTurns, wip, resetContext } = result;
 				// The single-block text is only needed when the multi-message split

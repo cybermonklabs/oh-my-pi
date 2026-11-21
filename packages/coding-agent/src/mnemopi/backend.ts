@@ -1,6 +1,7 @@
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
@@ -9,6 +10,7 @@ import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
+import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import { roleCandidatePool } from "../config/model-roles";
 import { resolveRoleChain } from "../config/model-resolver";
 import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
@@ -148,6 +150,7 @@ export const mnemopiBackend: MemoryBackend = {
 				modelRegistry,
 				sessionId,
 				session.sessionManager,
+				session.cyberPolicyClosure,
 			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			await installMnemopiState(session, config, getMnemopiSessionStateFromParent(options));
@@ -215,6 +218,7 @@ export const mnemopiBackend: MemoryBackend = {
 					session.modelRegistry,
 					session.sessionId,
 					session.sessionManager,
+					session.cyberPolicyClosure,
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
@@ -488,6 +492,7 @@ async function loadMnemopiConfigWithProviders(
 	modelRegistry: ModelRegistry,
 	sessionId: string,
 	usageLedger: Partial<JudgmentUsageLedger>,
+	cyberPolicyClosure: CyberPolicyClosureApi | undefined,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
 	config.providerOptions = await resolveMnemopiProviderOptions(
@@ -496,6 +501,7 @@ async function loadMnemopiConfigWithProviders(
 		modelRegistry,
 		sessionId,
 		usageLedger,
+		cyberPolicyClosure,
 	);
 	return config;
 }
@@ -525,6 +531,7 @@ async function resolveMnemopiProviderOptions(
 	modelRegistry: ModelRegistry,
 	sessionId: string,
 	usageLedger: Partial<JudgmentUsageLedger>,
+	cyberPolicyClosure: CyberPolicyClosureApi | undefined,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
@@ -578,6 +585,9 @@ async function resolveMnemopiProviderOptions(
 
 			for (const { model, thinkingLevel } of candidates) {
 				if (signal?.aborted) return null;
+				// The request carries transcript text: after a cyber-policy refusal no memory model on a
+				// route the session tree's closure holds closed receives it.
+				if (cyberPolicyClosure?.isClosed(model)) continue;
 				try {
 					if (model.api === "local-inference") {
 						const result = await tinyModelClient.complete(model.id, request.prompt, {
@@ -639,6 +649,7 @@ async function resolveMnemopiProviderOptions(
 					);
 					if (message.stopReason === "aborted" || signal?.aborted) return null;
 					if (message.stopReason === "error") {
+						if (AIError.isCyberPolicyRefusal(message)) cyberPolicyClosure?.record();
 						logger.warn("Mnemopi: memory completion model failed; trying the next configured fallback.", {
 							provider: model.provider,
 							model: model.id,
@@ -656,6 +667,7 @@ async function resolveMnemopiProviderOptions(
 						.trim();
 				} catch (error) {
 					if (signal?.aborted) return null;
+					if (AIError.isCyberPolicyRefusal(error)) cyberPolicyClosure?.record();
 					logger.warn("Mnemopi: memory completion model threw; trying the next configured fallback.", {
 						provider: model.provider,
 						model: model.id,

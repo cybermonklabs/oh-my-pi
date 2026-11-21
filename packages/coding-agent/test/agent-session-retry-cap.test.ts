@@ -2740,6 +2740,145 @@ describe("AgentSession retry delay cap", () => {
 		});
 	});
 
+	// The advisor's next batch carries the primary's transcript. While a cyber-policy refusal holds
+	// OpenAI's routes closed, an advisor on one must not receive it: it walks to another family or
+	// holds the batch until a person's next prompt. Synthetic refusals only.
+	describe("an advisor while a cyber_policy refusal holds", () => {
+		const advisorSelector = "openai/gpt-5.5";
+
+		/** A session whose primary answers per `primary`; returns the routes main and advisor asked. */
+		function startAdvisedSession(options: {
+			primary: Model;
+			answerPrimary: (model: Model) => MockResponse;
+			chains: Record<string, string[]>;
+			advisor: string;
+		}): { mainRequests: string[]; advisorRequests: string[]; answered: Promise<void> } {
+			registerMockApi(RETRY_CAP_MOCK_API_SOURCE);
+			authStorage.keys.setRuntime("openai", "openai-advisor-key");
+			authStorage.keys.setRuntime("openai-codex", "codex-test-key");
+			const mainRequests: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: options.primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, streamOptions) => {
+					mainRequests.push(`${requestedModel.provider}/${requestedModel.id}`);
+					const mock = createMockModel({
+						id: requestedModel.id,
+						provider: requestedModel.provider,
+						handler: () => options.answerPrimary(requestedModel),
+					});
+					return aiStream.streamSimple(mock.model, context, streamOptions);
+				},
+			});
+			const advisorRequests: string[] = [];
+			const answered = Promise.withResolvers<void>();
+			const settings = Settings.isolated({
+				"advisor.syncBacklog": "1",
+				"compaction.enabled": false,
+				"retry.maxRetries": 0,
+				"retry.modelFallback": true,
+				"retry.fallbackChains": options.chains,
+			});
+			settings.setModelRole("default", `${options.primary.provider}/${options.primary.id}`);
+			settings.setModelRole("advisor", options.advisor);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+				advisorTools: [],
+				advisorConfigs: [{ name: "reviewer", model: options.advisor }],
+				advisorStreamFn: (requestedModel, context, streamOptions) => {
+					advisorRequests.push(`${requestedModel.provider}/${requestedModel.id}`);
+					answered.resolve();
+					const mock = createMockModel({
+						id: requestedModel.id,
+						provider: requestedModel.provider,
+						handler: () => ({ content: ["Advice"], stopReason: "stop" }),
+					});
+					return aiStream.streamSimple(mock.model, context, streamOptions);
+				},
+			});
+			expect(session.setAdvisorEnabled(true)).toBe(true);
+			return { mainRequests, advisorRequests, answered: answered.promise };
+		}
+
+		it("walks an OpenAI advisor to another family after the primary's refusal", async () => {
+			const codex = getBundledModel("openai-codex", "gpt-5.6-sol");
+			const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!codex || !sonnet) throw new Error("Expected bundled test models to exist");
+			const run = startAdvisedSession({
+				primary: codex,
+				answerPrimary: model =>
+					model.provider === codex.provider
+						? CYBER_POLICY_FAILURE
+						: { content: ["Primary answered from Claude"], stopReason: "stop" },
+				chains: {
+					[`${codex.provider}/${codex.id}`]: [`${sonnet.provider}/${sonnet.id}`],
+					[advisorSelector]: ["anthropic/claude-haiku-4-5"],
+				},
+				advisor: advisorSelector,
+			});
+
+			await session?.prompt("Review this change");
+			await run.answered;
+			await session?.waitForIdle();
+
+			expect(run.mainRequests).toEqual([`${codex.provider}/${codex.id}`, `${sonnet.provider}/${sonnet.id}`]);
+			expect(run.advisorRequests).toHaveLength(1);
+			expect(run.advisorRequests[0]).toStartWith("anthropic/");
+		});
+
+		it("holds an OpenAI advisor's batch when no other family is reachable", async () => {
+			const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!sonnet) throw new Error("Expected bundled test models to exist");
+			// A refusal elsewhere in the session tree (a subagent's, say) during the primary's first turn.
+			let turns = 0;
+			const run = startAdvisedSession({
+				primary: sonnet,
+				answerPrimary: () => {
+					if (++turns === 1) session?.cyberPolicyClosure.record();
+					return { content: ["Primary complete"], stopReason: "stop" };
+				},
+				chains: { [advisorSelector]: [] },
+				advisor: advisorSelector,
+			});
+
+			await session?.prompt("Review this change");
+			await session?.waitForIdle();
+
+			expect(run.mainRequests).toEqual([`${sonnet.provider}/${sonnet.id}`]);
+			expect(run.advisorRequests).toEqual([]);
+
+			// A person's next prompt ends the closure, and the held batch goes out.
+			await session?.prompt("Carry on");
+			await run.answered;
+			await session?.waitForIdle();
+			expect(run.advisorRequests[0]).toBe(advisorSelector);
+		});
+
+		it("still reviews on a Claude advisor after the primary's refusal, as before", async () => {
+			const codex = getBundledModel("openai-codex", "gpt-5.6-sol");
+			const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!codex || !sonnet) throw new Error("Expected bundled test models to exist");
+			const run = startAdvisedSession({
+				primary: codex,
+				answerPrimary: model =>
+					model.provider === codex.provider
+						? CYBER_POLICY_FAILURE
+						: { content: ["Primary answered from Claude"], stopReason: "stop" },
+				chains: { [`${codex.provider}/${codex.id}`]: [`${sonnet.provider}/${sonnet.id}`] },
+				advisor: "anthropic/claude-haiku-4-5",
+			});
+
+			await session?.prompt("Review this change");
+			await run.answered;
+			await session?.waitForIdle();
+
+			expect(run.advisorRequests).toEqual(["anthropic/claude-haiku-4-5"]);
+		});
+	});
+
 	it("waits for the earliest sibling unblock instead of failing the delay cap", async () => {
 		// Regression: with every sibling credential momentarily blocked (e.g. a
 		// short post-401 or usage-probe block), a usage-limit 429 with a

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- An OpenAI `cyber_policy` refusal is no longer sent again: it judges the request's content, and each copy adds a refusal to the organization's record. It is classified as blocked content instead of an account policy, so the auth retry no longer rotates it through sibling credentials (also on a 403), the credential rotation neither blocks nor switches for it, a provider retry header cannot replay it, and the Codex provider no longer reads its text (which names `access_programs.cyber`) as an access-program rejection to replay without the program
+- An OpenAI `cyber_policy` refusal is no longer sent again: it judges the request's content, and each copy adds a refusal to the organization's record. It is classified as blocked content instead of an account policy, so the auth retry no longer rotates it through sibling credentials (also on a 403), the credential rotation neither blocks nor switches for it, and a provider retry header cannot replay it. No transport resends it: the OpenAI and Codex HTTP retries (also when a gateway relays it as a 5xx), Codex stream recovery (WebSocket-to-SSE replay, provider-error retry, access-program replay) and the compressed-upload fallback (which resent a Codex 400 uncompressed). A provider error that carries the `cyber_policy` code keeps it in the error message
 
 ## [18.18.4] - 2026-11-09
 

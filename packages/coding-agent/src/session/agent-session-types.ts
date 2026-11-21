@@ -50,6 +50,7 @@ import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SettingsGatedToolDelta, SystemPromptRebuilder } from "./session-tools";
 import type { CostGateApi } from "./cost-gate";
+import type { CyberPolicyClosureApi } from "./cyber-policy-closure";
 import type { SessionManager } from "./session-manager";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
@@ -201,6 +202,11 @@ export interface AgentSessionConfig {
 	disableExtensionDiscovery?: boolean;
 	/** Cost gate of the session tree; refuses this session's model requests at `session.maxCost`. */
 	costGate?: CostGateApi;
+	/**
+	 * The session tree's cyber-policy closure; a subagent receives its root's. Without one the session
+	 * owns a closure of its own, which only its own prompts from a person end.
+	 */
+	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
 	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */

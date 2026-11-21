@@ -2682,6 +2682,10 @@ class CodexStreamProcessor {
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
+		// An OpenAI `cyber_policy` refusal judges the request's content: no recovery below may send it
+		// again (replay, reconnect, another transport or program), since each copy adds a refusal to the
+		// organization's record.
+		if (AIError.isCyberPolicyRefusal(error)) return false;
 		if (
 			error instanceof CodexSteerCommitError &&
 			this.runtime.websocketState &&
@@ -4134,6 +4138,9 @@ async function openCodexSseEventStream(
 			maxAttempts: resolveCodexSseMaxAttempts(codexSseMaxAttempts),
 			defaultDelayMs: attempt => CODEX_RETRY_DELAY_MS * (attempt + 1),
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
+			// An OpenAI `cyber_policy` refusal, even one a gateway relays as a 5xx, is never
+			// sent again: each copy adds a refusal to the organization's record.
+			shouldRetryResponse: (_response, bodyText) => !AIError.isCyberPolicyRefusal(bodyText),
 			fetch: fetchAttempt,
 			timeout: false,
 		});

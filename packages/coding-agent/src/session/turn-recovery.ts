@@ -52,6 +52,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import type { CyberPolicyClosureApi } from "./cyber-policy-closure";
 import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
@@ -278,6 +279,8 @@ export interface TurnRecoveryHost {
 	thinkingLevelCeiling(): Effort | undefined;
 	/** The session never switches to a retry fallback model (a per-call `model` subagent). */
 	modelFallbackDisabled?(): boolean;
+	/** The session tree's cyber-policy closure: fallback searches pass over the routes it closes. */
+	cyberPolicyClosure?(): CyberPolicyClosureApi;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
 	isCompacting(): boolean;
@@ -404,12 +407,6 @@ export class TurnRecovery {
 	readonly #refusalWalkTried = new Set<string>();
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
 	readonly #accountPolicyRotationsRemaining = new Map<string, number>();
-	/**
-	 * Routes a `cyber_policy` refusal closed for the rest of its prompt (`promptSequence`): every
-	 * route to an OpenAI model, and the refusing route's own provider when the catalog cannot classify
-	 * its model. Every fallback search passes over them through `isRetryFallbackSelectorSuppressed`.
-	 */
-	#cyberRefusalClosed: { promptSequence: number; routes: Set<string> } | undefined;
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
@@ -1901,36 +1898,46 @@ export class TurnRecovery {
 
 	/**
 	 * Checks whether a fallback selector is passed over: in cooldown, or a route a `cyber_policy`
-	 * refusal closed for the rest of this prompt.
+	 * refusal closed until the next prompt from a person (`cyber-policy-closure.ts`).
 	 */
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean {
 		if (this.#host.modelRegistry.isSelectorSuppressed(selector.raw)) return true;
-		const closed = this.#cyberRefusalClosed;
-		if (!closed || closed.promptSequence !== this.#host.promptSequence()) return false;
+		const closure = this.#host.cyberPolicyClosure?.();
+		if (!closure?.active) return false;
 		const model =
 			resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings).model ??
 			this.#host.modelRegistry.find(selector.provider, selector.id);
-		return (
-			closed.routes.has(`provider:${model?.provider ?? selector.provider}`) ||
-			(!!model && closed.routes.has(model.identity.class))
-		);
+		return closure.isClosed(model);
 	}
 
 	/**
-	 * Records an OpenAI `cyber_policy` refusal (a failed assistant message or a thrown error) of
-	 * `model`'s request. The refusal judges the request's content, and every copy sent again to OpenAI
-	 * adds a refusal to the organization's record, so the call is not retried (the error is not
-	 * retryable) and, for the rest of this prompt, no fallback search picks a route to an OpenAI
-	 * model, whichever provider serves it. A model of another family may still take the turn.
+	 * Records an OpenAI `cyber_policy` refusal (a failed assistant message or a thrown error). The
+	 * refusal judges the request's content, and every copy sent again to OpenAI adds a refusal to the
+	 * organization's record, so the call is not retried (the error is not retryable) and the session
+	 * tree's closure keeps every OpenAI route, and every route whose family the catalog cannot tell,
+	 * from every fallback search until the next prompt from a person. A model of a known other family
+	 * may still take the turn.
 	 */
-	recordCyberPolicyRefusal(failure: unknown, model: Model | undefined = this.#host.model()): void {
-		if (!AIError.isCyberPolicyRefusal(failure)) return;
-		const promptSequence = this.#host.promptSequence();
-		if (this.#cyberRefusalClosed?.promptSequence !== promptSequence) {
-			// `cyber_policy` is OpenAI's refusal code: whatever route carried it, OpenAI refused it.
-			this.#cyberRefusalClosed = { promptSequence, routes: new Set(["openai"]) };
-		}
-		if (model?.identity.class === "unknown") this.#cyberRefusalClosed.routes.add(`provider:${model.provider}`);
+	recordCyberPolicyRefusal(failure: unknown): void {
+		if (AIError.isCyberPolicyRefusal(failure)) this.#host.cyberPolicyClosure?.().record();
+	}
+
+	/**
+	 * Switches off a route the cyber-policy closure holds closed onto the first open, keyed fallback
+	 * candidate. Unpinned: the primary comes back once a person's prompt ends the closure.
+	 */
+	async applyCyberPolicyFallback(signal: AbortSignal): Promise<boolean> {
+		if (!cfgRetryModelFallback.get(this.#host.settings) || this.#host.modelFallbackDisabled?.()) return false;
+		const currentModel = this.#host.model();
+		if (!currentModel || !this.#host.cyberPolicyClosure?.().isClosed(currentModel)) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		const fallback = await this.#findKeyedRetryFallback(currentSelector, currentModel, signal);
+		if (!fallback) return false;
+		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
+			apiKey: fallback.apiKey,
+			signal,
+			reason: "OpenAI refused this turn's content (cyber_policy)",
+		});
 	}
 
 	/** Records the cooldown that should suppress a failing selector. */
