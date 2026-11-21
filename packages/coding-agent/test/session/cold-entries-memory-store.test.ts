@@ -236,8 +236,8 @@ describe("older bodies kept compressed in memory when no store file can be used"
 			}
 			expect(read).toBeGreaterThan(bodiesBytes / 2);
 			expect(heldWhole(manager, beforeCut)).toEqual([]);
-			// The store keeps at most the one block a synchronous pass is reading and drops it once the
-			// task yields (spec R2: a read decompresses one block and keeps no whole copy after it).
+			// The store keeps at most the one block a synchronous pass is reading: a read keeps no
+			// decompressed block once the task yields.
 			await Bun.sleep(0);
 			// The record cache keeps at most 8 records; a kept block or body would hold the bodies' size.
 			expect(heldBytes() - before).toBeLessThan(bodiesBytes / 4);
