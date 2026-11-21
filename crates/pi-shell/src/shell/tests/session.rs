@@ -961,6 +961,43 @@ async fn exit_trap_fires_once_per_session_run() {
 	assert_eq!(run(&mut shell, "echo h").await, (0, "h\n".into()));
 }
 
+/// A command the session's shell runs in place of itself (an external, the
+/// last command of a run) leaves the shell's own signal rules once it ends:
+/// the next run ignores `kill -QUIT $$` and runs its EXIT trap on `kill
+/// -TERM $$`, as with no command before or a builtin (bash 5.2.21: `QUIT`
+/// ignored; with an EXIT trap, `TERM` runs it, then ends the shell, 143).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_run_in_place_leaves_the_shells_signal_rules() {
+	async fn run(shell: &mut ShellSessionCore, command: &str) -> (i32, String) {
+		let output = tempfile::tempfile().expect("capture file");
+		let result = shell
+			.run_test(command, &TestStdio::null().stdout(&output))
+			.await
+			.expect("run");
+		(exit_code(&result), read_capture(&output))
+	}
+
+	let cases: [(&str, (i32, &str)); 2] = [
+		("kill -QUIT $$; echo alive", (0, "alive\n")),
+		("trap 'echo x' EXIT; kill -TERM $$; echo after", (143, "x\n")),
+	];
+	let external = test_executable("true").display().to_string();
+	for first in [None, Some("echo builtin"), Some(external.as_str())] {
+		for (command, (status, stdout)) in cases {
+			let mut shell = default_session().await;
+			if let Some(first) = first {
+				assert_eq!(run(&mut shell, first).await.0, 0, "{first}");
+			}
+			assert_eq!(
+				run(&mut shell, command).await,
+				(status, stdout.into()),
+				"after {first:?}: {command}"
+			);
+		}
+	}
+}
+
 /// `Shell::pids` reports the in-flight run's live external children without
 /// waiting on the session lock that the running command holds, and goes
 /// empty once the run returns — including through cancellation.

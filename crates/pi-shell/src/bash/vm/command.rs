@@ -4597,6 +4597,12 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				st(vp).notice = end.notice.map(Box::new);
 			}
 			super::external_ended(k, vp, killed);
+			// The program run in place has ended (or is lost): the process is
+			// the shell's own again, with the shell's signal rules; a session
+			// runs its next command ([`super::untrapped::program_in_place`]).
+			if k.program_in_place && (vp.parent.is_none() || vp.in_place()) {
+				super::untrapped::program_in_place(k, cx, vp, false);
+			}
 			status
 		},
 		None => st(vp).status,
