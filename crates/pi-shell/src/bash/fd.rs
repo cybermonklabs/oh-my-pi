@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::bash::{
-	fs::{File, FileKind},
+	fs::{File, FileKind, Mark},
 	host::{OsHandle, StdFd},
 	mem::MemFile,
 };
@@ -198,6 +198,36 @@ impl FdRef {
 	pub fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_flush(cx),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	/// Wait until the writes the file took are out ([`File::poll_settle`]).
+	pub fn poll_settle(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle(cx),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	/// Write a prefix of `buf`, with its chunk's [`Mark`]
+	/// ([`File::poll_write_marked`]).
+	pub fn poll_write_marked(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_marked(cx, buf),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
+	/// Wait until this writer's chunks are out, with their first error
+	/// ([`File::poll_settle_marked`]).
+	pub fn poll_settle_marked(&self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle_marked(cx, marks),
 			None => Poll::Ready(Ok(())),
 		}
 	}

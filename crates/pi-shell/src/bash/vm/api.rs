@@ -69,10 +69,41 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_read(cx, buf))
 	}
 
-	/// Write to fd `fd` of the calling vproc (possibly partially).
+	/// Write to fd `fd` of the calling vproc (possibly partially). A chunk a
+	/// writer thread takes reports no error here: use [`Self::write_marked`]
+	/// and [`Self::settle_marked`] to get it.
 	pub fn write(&mut self, fd: i32, bytes: &[u8]) -> IoPoll<usize> {
 		let h = self.vproc().fds.handle(fd);
 		self.io(|cx| h.poll_write(cx, bytes))
+	}
+
+	/// Ready once what fd `fd` of the calling vproc took is out
+	/// ([`crate::bash::File::poll_settle`]): a tool settles its output
+	/// before it ends, so what runs next comes after it.
+	pub fn settle(&mut self, fd: i32) -> IoPoll<()> {
+		let h = self.vproc().fds.handle(fd);
+		self.io(|cx| h.poll_settle(cx))
+	}
+
+	/// [`Self::write`], with the [`Mark`](crate::bash::Mark) of the chunk a
+	/// writer thread took (`None` when it wrote as it took): settle it with
+	/// [`Self::settle_marked`] to get that chunk's error
+	/// ([`crate::bash::File::poll_write_marked`]).
+	pub fn write_marked(
+		&mut self,
+		fd: i32,
+		bytes: &[u8],
+	) -> IoPoll<(usize, Option<crate::bash::Mark>)> {
+		let h = self.vproc().fds.handle(fd);
+		self.io(|cx| h.poll_write_marked(cx, bytes))
+	}
+
+	/// Ready once the chunks of `marks`, which fd `fd` of the calling vproc
+	/// took, are out, with the first of their errors
+	/// ([`crate::bash::File::poll_settle_marked`]).
+	pub fn settle_marked(&mut self, fd: i32, marks: &[crate::bash::Mark]) -> IoPoll<()> {
+		let h = self.vproc().fds.handle(fd);
+		self.io(|cx| h.poll_settle_marked(cx, marks))
 	}
 
 	/// A variable as the calling vproc sees it. A store failure reads as

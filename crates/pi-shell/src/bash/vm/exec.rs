@@ -669,17 +669,47 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 }
 
-/// Write queued diagnostics; the fd that would block, if any. Write errors
-/// on a diagnostic stream are dropped, as bash does.
+/// Write queued diagnostics (`Kernel::diag`, xtrace lines, `fc -s`'s echo);
+/// the fd that would block, if any. An entry is done once it is written and
+/// the object that took its bytes has settled them
+/// ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)), so a command that runs next (an
+/// external that inherits the fd, a builtin writing to another fd of the
+/// same pipe) comes after it. That object, not whatever the fd names by
+/// then: a failed compound redirection restores the fds between the write
+/// and the settle. The chunk handed off last settles before the next one
+/// goes, and an entry stops at its first failed chunk; write errors on a
+/// diagnostic stream are dropped, as bash does.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	let mut cx = Context::from_waker(&k.waker);
 	while let Some(w) = vp.out.front_mut() {
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
-			Poll::Ready(Ok(n)) if n > 0 => {
+		let handle = vp.fds.handle(w.fd);
+		let done = w.off >= w.bytes.len();
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
+		if let Some(held) = &w.handed.file
+			&& (done || !held.same(&handle) || w.handed.mark.is_some())
+		{
+			let Poll::Ready(settled) = held.poll_settle_marked(&mut cx, w.handed.mark.as_slice())
+			else {
+				return Some(w.fd);
+			};
+			w.handed = super::proc::HandedOff::default();
+			if settled.is_err() {
+				vp.out.pop_front();
+				continue;
+			}
+		}
+		if done {
+			vp.out.pop_front();
+			continue;
+		}
+		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
+			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
-				if w.off >= w.bytes.len() {
-					vp.out.pop_front();
-				}
+				w.handed.mark = mark;
+				w.handed.file.get_or_insert(handle);
 			},
 			Poll::Ready(_) => {
 				vp.out.pop_front();
@@ -2398,9 +2428,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.out.push_back(PendingWrite::new(2, text.into())),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -2445,8 +2473,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, text.into()));
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).

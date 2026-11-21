@@ -1117,4 +1117,305 @@ mod tests {
 		child.kill().unwrap();
 		child.wait().unwrap();
 	}
+
+	/// A builtin's write that a descriptor's writer thread took and that
+	/// then failed (nothing reads the pipe any more) fails that builtin: a
+	/// write ends only at its flush, so `echo` reports the write error and
+	/// exits 1, and the failure is never lost. The writer thread is forced
+	/// in this test's child process, as Darwin always uses it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_write_that_fails_after_its_hand_off_fails_its_builtin() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_write_that_fails_after_its_hand_off_fails_its_builtin"),
+			|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(1)
+					.enable_all()
+					.build()
+					.unwrap();
+				let errors = runtime.block_on(async {
+					let mut s = session();
+					let (reader, writer) = io::pipe().unwrap();
+					drop(reader);
+					let (mut err_r, err_w) = io::pipe().unwrap();
+					let errors = std::thread::spawn(move || {
+						let mut e = String::new();
+						err_r.read_to_string(&mut e).unwrap();
+						e
+					});
+					let stdio = RunStdio {
+						stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+						stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+						stderr: Some(std::fs::File::from(std::os::fd::OwnedFd::from(err_w))),
+					};
+					tokio::time::timeout(
+						std::time::Duration::from_secs(10),
+						s.run(
+							"trap '' PIPE; echo y; echo \"status=$?\" >&2",
+							stdio,
+							CancellationToken::new(),
+						),
+					)
+					.await
+					.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+					.unwrap();
+					errors.join().unwrap()
+				});
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert!(errors.contains("Broken pipe"), "echo reports its write error: {errors:?}");
+			},
+		);
+	}
+
+	/// Runs `script` with fd 2 a full pipe, on the writer-thread route (the
+	/// test's child process). For the first 2 s nothing reads that pipe, so
+	/// what a command hands to its writer thread stays there: a later
+	/// command's line on fd 1 then shows that the later command ran before
+	/// the earlier command's output was out. Then the pipe is drained, and the
+	/// later command must run. Returns fd 1 while the pipe was held, fd 1 at
+	/// the end, and what the drained pipe held after its fill.
+	#[cfg(target_os = "linux")]
+	fn run_with_held_stderr(script: &str) -> (String, String, String) {
+		use std::os::fd::{AsRawFd, OwnedFd};
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(2)
+			.enable_all()
+			.build()
+			.unwrap();
+		let (mut held_r, held_w) = io::pipe().unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `held_w` owns the fd.
+		let capacity =
+			usize::try_from(unsafe { libc::fcntl(held_w.as_raw_fd(), libc::F_GETPIPE_SZ) }).unwrap();
+		std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
+		let (mut out_r, out_w) = io::pipe().unwrap();
+		let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let seen = std::sync::Arc::clone(&out);
+		let out_thread = std::thread::spawn(move || {
+			let mut buf = [0u8; 4096];
+			while let Ok(n) = out_r.read(&mut buf) {
+				if n == 0 {
+					break;
+				}
+				seen.lock().extend_from_slice(&buf[..n]);
+			}
+		});
+		let snapshot = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+		let (held_out, held_tail) = (std::sync::Arc::clone(&out), std::sync::Arc::clone(&snapshot));
+		let held_thread = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_secs(2));
+			*held_tail.lock() = String::from_utf8_lossy(&held_out.lock()).into_owned();
+			let mut all = Vec::new();
+			held_r.read_to_end(&mut all).unwrap();
+			all
+		});
+		runtime.block_on(async {
+			let mut s = session();
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(OwnedFd::from(out_w))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(held_w))),
+			};
+			let run = s.run(script, stdio, CancellationToken::new());
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+		});
+		drop(runtime);
+		let all = held_thread.join().unwrap();
+		out_thread.join().unwrap();
+		let held = snapshot.lock().clone();
+		let end = String::from_utf8_lossy(&out.lock()).into_owned();
+		(held, end, String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned())
+	}
+
+	/// One held-stderr case in the test's own child process: `after` is
+	/// absent while fd 2 is held, and present once it drains, and the held
+	/// text `held` reached fd 2.
+	#[cfg(target_os = "linux")]
+	fn next_command_waits_for_held_stderr(test: &str, script: &str, held: &str) {
+		crate::sys::in_blocking_writer_process(test, || {
+			let (while_held, end, drained) = run_with_held_stderr(script);
+			assert!(
+				!while_held.contains("after"),
+				"the next command ran before the earlier command's output was out: {while_held:?}"
+			);
+			assert!(end.contains("after"), "the next command never ran once fd 2 drained: {end:?}");
+			assert!(drained.contains(held), "the held output never reached fd 2: {drained:?}");
+		});
+	}
+
+	/// A diagnostic (`Kernel::diag`, written by `flush_out`).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_diagnostic_keeps_the_next_command_from_running"),
+			"nosuchcmd; echo after",
+			"not found",
+		);
+	}
+
+	/// An xtrace line, written by `flush_out` before the command it traces.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_xtrace_line_keeps_its_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_xtrace_line_keeps_its_command_from_running"),
+			"set -x; echo after",
+			"+ echo after",
+		);
+	}
+
+	/// `suspend`'s refusal (`extras::Refusal`).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_refusal_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_refusal_keeps_the_next_command_from_running"),
+			"suspend; echo after",
+			"suspend",
+		);
+	}
+
+	/// `fc -s`'s echo of the command it runs again.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_fc_echo_keeps_its_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_fc_echo_keeps_its_command_from_running"),
+			"history -s 'echo after'; fc -s",
+			"echo after",
+		);
+	}
+
+	/// A tool's message (`tools::Out`, `nohup` without an operand).
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_tool_message_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(module_path!(), "::a_held_tool_message_keeps_the_next_command_from_running"),
+			"nohup; echo after",
+			"nohup",
+		);
+	}
+
+	/// A diagnostic of a failed redirection of a compound command, held on
+	/// the redirection's target, keeps the next command from running: the
+	/// restore puts fd 2 back (here `/dev/null`, which takes everything at
+	/// once) before the held entry settles, so the settle must wait on the
+	/// file that took the bytes (fd 3, the held pipe), not on fd 2.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(
+				module_path!(),
+				"::a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running"
+			),
+			"exec 3>&2 2>/dev/null; { :; } 2>&3 >/nonexistent/out; echo after",
+			"nonexistent",
+		);
+	}
+
+	/// Runs `script` with fd `gone` (1 or 2) a pipe nothing reads, on the
+	/// writer-thread route (the test's child process): what the other stream
+	/// got, and how many chunks the writer threads failed.
+	#[cfg(target_os = "linux")]
+	fn run_into_a_readerless_pipe(script: &str, gone: i32) -> (String, usize) {
+		use std::os::fd::OwnedFd;
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut s = session();
+			let (reader, readerless) = io::pipe().unwrap();
+			drop(reader);
+			let (mut other_r, other_w) = io::pipe().unwrap();
+			let other = std::thread::spawn(move || {
+				let mut text = String::new();
+				other_r.read_to_string(&mut text).unwrap();
+				text
+			});
+			let (stdout, stderr) = if gone == 1 {
+				(readerless, other_w)
+			} else {
+				(other_w, readerless)
+			};
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
+				stdout: Some(std::fs::File::from(OwnedFd::from(stdout))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(stderr))),
+			};
+			tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				s.run(script, stdio, CancellationToken::new()),
+			)
+			.await
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within 10 s"))
+			.unwrap();
+			let text = other.join().unwrap();
+			(text, crate::sys::CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst))
+		})
+	}
+
+	/// A builtin's output of four chunks stops at the first one that fails:
+	/// bash stops at its first failed `write(2)`. Handing off the rest sends
+	/// a FIFO's next reader the tail without the head, or blocks the builtin
+	/// on the tail before it reports the failure.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_builtin_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_builtin_stops_at_its_first_failed_chunk"),
+			|| {
+				let (errors, failed) = run_into_a_readerless_pipe(
+					"trap '' PIPE; big=$(printf '%0200000d' 0); echo \"$big\"; echo \"status=$?\" >&2",
+					1,
+				);
+				assert!(errors.contains("status=1"), "echo's status: {errors:?}");
+				assert_eq!(errors.matches("Broken pipe").count(), 1, "one write error: {errors:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A diagnostic of two chunks (`Kernel::diag`, written by `flush_out`)
+	/// stops at the first one that fails, and the next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_diagnostic_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_diagnostic_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"big=$(printf '%070000d' 0); \"$big\"; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=127"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
+
+	/// A tool's message of two chunks (`tools::Out`, `timeout`'s usage
+	/// error naming its operand) stops at the first one that fails, and the
+	/// next command runs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_message_stops_at_its_first_failed_chunk() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_tool_message_stops_at_its_first_failed_chunk"),
+			|| {
+				let (out, failed) = run_into_a_readerless_pipe(
+					"timeout \"$(printf '%070000d' 0)x\" true; echo \"after=$?\"",
+					2,
+				);
+				assert!(out.contains("after=125"), "the next command: {out:?}");
+				assert_eq!(failed, 1, "chunks handed off after the first one failed");
+			},
+		);
+	}
 }

@@ -120,6 +120,58 @@ impl File for CaptureFile {
 	}
 }
 
+/// A captured output stream that keeps what is written until it is
+/// settled or flushed, as a host file's writer thread holds a chunk it
+/// took: only settled bytes are in the [`Capture`] (and, when dropped, the
+/// rest).
+struct BufferedCaptureFile {
+	buf:     Capture,
+	pending: Vec<u8>,
+}
+
+impl File for BufferedCaptureFile {
+	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+	}
+
+	fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		self.pending.extend_from_slice(buf);
+		Poll::Ready(Ok(buf.len()))
+	}
+
+	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.buf.0.lock().append(&mut self.pending);
+		Poll::Ready(Ok(()))
+	}
+
+	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.buf.0.lock().append(&mut self.pending);
+		Poll::Ready(Ok(()))
+	}
+
+	fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+		Err(io::ErrorKind::Unsupported.into())
+	}
+
+	fn kind(&self) -> FileKind {
+		FileKind::Pipe
+	}
+
+	fn os_handle(&self) -> Option<OsHandle> {
+		None
+	}
+
+	fn dup(&self) -> io::Result<Box<dyn File>> {
+		Ok(Box::new(Self { buf: self.buf.clone(), pending: Vec::new() }))
+	}
+}
+
+impl Drop for BufferedCaptureFile {
+	fn drop(&mut self) {
+		self.buf.0.lock().append(&mut self.pending);
+	}
+}
+
 /// Stdin from bytes; the read position is shared, so it survives a restore.
 struct Stdin(Arc<Mutex<(Vec<u8>, usize)>>);
 
@@ -291,6 +343,12 @@ pub struct FakeHost {
 	pipe_tap:    Option<Arc<dyn PipeTap>>,
 	/// [`Host::child_opens`](crate::bash::Host::child_opens) answers this.
 	child_opens: bool,
+	/// Stdout keeps writes until they are settled
+	/// ([`Self::with_buffered_stdout`]).
+	buffered:    bool,
+	/// Stderr too, into stdout's capture: one pipe for fds 1 and 2
+	/// ([`Self::with_buffered_output`]).
+	merged:      bool,
 }
 
 impl Default for FakeHost {
@@ -321,6 +379,8 @@ impl FakeHost {
 			census:      Arc::new(Census::default()),
 			pipe_tap:    None,
 			child_opens: false,
+			buffered:    false,
+			merged:      false,
 		}
 	}
 
@@ -330,6 +390,25 @@ impl FakeHost {
 	#[must_use]
 	pub const fn with_child_opens(mut self) -> Self {
 		self.child_opens = true;
+		self
+	}
+
+	/// Make stdout keep what is written until it is settled, as a host
+	/// file's writer thread holds a chunk it took: [`Self::stdout`] then
+	/// shows only settled output.
+	#[must_use]
+	pub const fn with_buffered_stdout(mut self) -> Self {
+		self.buffered = true;
+		self
+	}
+
+	/// Give fds 1 and 2 one pipe, [`Self::stdout`], each through a writer
+	/// of its own that keeps what it took until it is settled: the capture
+	/// then shows the order in which the two writers' output went out.
+	#[must_use]
+	pub const fn with_buffered_output(mut self) -> Self {
+		self.buffered = true;
+		self.merged = true;
 		self
 	}
 
@@ -617,7 +696,13 @@ impl crate::bash::Host for FakeHost {
 	fn stdio(&mut self, fd: StdFd) -> Option<Box<dyn File>> {
 		Some(match fd {
 			StdFd::Stdin => Box::new(Stdin(Arc::clone(&self.stdin))),
+			StdFd::Stdout if self.buffered => {
+				Box::new(BufferedCaptureFile { buf: self.stdout.clone(), pending: Vec::new() })
+			},
 			StdFd::Stdout => self.capture(&self.stdout, 1),
+			StdFd::Stderr if self.merged => {
+				Box::new(BufferedCaptureFile { buf: self.stdout.clone(), pending: Vec::new() })
+			},
 			StdFd::Stderr => self.capture(&self.stderr, 2),
 		})
 	}

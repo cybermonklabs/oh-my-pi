@@ -986,6 +986,16 @@ impl Host {
 		self.drain_output(false).await
 	}
 
+	/// Delivers all pending output now, also to a regular file, as an explicit
+	/// per-result flush (`rg --line-buffered`) asks.
+	///
+	/// # Errors
+	///
+	/// As [`Host::flush_output`].
+	pub async fn deliver_output(&self) -> io::Result<()> {
+		self.drain_output(true).await
+	}
+
 	/// Delivers pending output: all of it when `full`, else as
 	/// [`Host::flush_output`].
 	async fn drain_output(&self, full: bool) -> io::Result<()> {
@@ -1414,8 +1424,9 @@ pub trait CommandRunner: Send {
 /// the utility exits.
 ///
 /// Construct via [`Host::stdout_writer`]; [`StreamWriter::line`] and
-/// [`StreamWriter::block`] force a policy for utilities with explicit
-/// buffering flags (`rg --line-buffered`).
+/// [`StreamWriter::block`] force a policy. An async utility writes to
+/// [`StreamWriter::Async`] instead and asks the host when to deliver
+/// ([`Host::flush_output`], [`Host::deliver_output`]).
 pub(crate) enum StreamWriter {
 	/// Block-buffered: flushed when full, on drop, and on explicit `flush`.
 	Block(BufWriter<OpenFile>),
@@ -2033,13 +2044,6 @@ impl Opened {
 	}
 }
 
-/// Writes `text` to the descriptor `file` when it is open, ignoring failures:
-/// the diagnostics of an invocation that ends before it has a [`Host`].
-fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
-	if let Some(file) = file {
-		let _ = file.clone().write_fmt(text);
-	}
-}
 
 /// Drives a utility from raw arguments to an exit status.
 ///
@@ -2047,7 +2051,7 @@ fn write_to(file: Option<&OpenFile>, text: std::fmt::Arguments<'_>) {
 pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_sync::<U>();
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U>(invocation, spec) {
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
 			Err(code) => return code,
 		};
@@ -2072,7 +2076,7 @@ pub(crate) async fn run_utility<U: Utility>(invocation: Invocation) -> i32 {
 pub(crate) async fn run_async_utility<U: AsyncUtility>(invocation: Invocation) -> i32 {
 	let spec = Spec::of_async::<U>();
 	let Prepared { parsed, mut host, commands, cancel, cancel_flag, _cancel_on_drop } =
-		match prepare::<U>(invocation, spec) {
+		match prepare::<U>(invocation, spec).await {
 			Ok(prepared) => prepared,
 			Err(code) => return code,
 		};
@@ -2099,36 +2103,35 @@ struct Prepared<P> {
 /// Rewrites and parses `argv` and builds the host. `Err` carries the exit
 /// status when the invocation ends early (usage error, `--help`, host
 /// failure).
-fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
+async fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
 	let mut invocation = invocation.open(spec.name);
 	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 	let [_, stdout, stderr] = &invocation.stdio;
+	let cancel = invocation.cancel.clone();
 
 	let argv = match (spec.rewrite_argv)(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
-			write_to(stderr.as_ref(), format_args!("{}: {message}\n", spec.name));
+			report_async(stderr.clone(), format!("{}: {message}\n", spec.name), cancel).await;
 			return Err(spec.usage_error.into());
 		},
 	};
-
 	let parsed = match P::try_parse_from(&argv) {
 		Ok(parsed) => parsed,
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
 			if err.use_stderr() {
-				write_to(stderr.as_ref(), format_args!("{err}"));
+				report_async(stderr.clone(), err.to_string(), cancel).await;
 				return Err(spec.usage_error.into());
 			}
-			write_to(stdout.as_ref(), format_args!("{err}"));
+			report_async(stdout.clone(), err.to_string(), cancel).await;
 			return Err(0);
 		},
 	};
 
 	let runner = invocation.commands.take().filter(|_| spec.runs_commands);
-	let cancel = invocation.cancel.clone();
-	let mut host = build_host(invocation, spec)?;
+	let mut host = build_host(invocation, spec).await?;
 	let cancel_flag = host.cancel_flag();
 	let cancel_on_drop = CancelOnDrop(Arc::clone(&cancel_flag));
 	let commands = runner.map(|runner| {
@@ -2259,7 +2262,7 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 /// All output the body left pending is delivered before the status is
 /// settled, so a closed reader still ends it with [`SIGPIPE_EXIT_CODE`]; a
 /// cancelled command delivers nothing more.
-async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
+pub(crate) async fn run_caught_async<U: AsyncUtility>(parsed: U, host: &mut Host) -> i32 {
 	let outcome = {
 		let body = AssertUnwindSafe(async { parsed.run(host).await }).catch_unwind();
 		let mut body = pin!(body);
@@ -2319,7 +2322,7 @@ fn settle(name: &str, outcome: std::thread::Result<i32>, host: &mut Host) -> i32
 /// environment into an owned [`Host`] that can move to a blocking thread.
 /// `Err` carries the exit status when a closed descriptor cannot be backed by
 /// the null device.
-fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
+async fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 	let Spec { checks_stdout_path, owns_cancellation, async_io, .. } = spec;
 	let paths = invocation.paths();
 	let Opened {
@@ -2331,7 +2334,7 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, i32> {
 			if let Ok(stderr_file) = &stderr_file
 				&& let Some(error) = stdin.err().or(stdout.err())
 			{
-				write_to(Some(stderr_file), format_args!("{invoked}: {error}\n"));
+				report_async(Some(stderr_file.clone()), format!("{invoked}: {error}\n"), token.clone()).await;
 			}
 			return Err(1);
 		},
@@ -2711,17 +2714,30 @@ async fn drained_status(context: &ProcContext, code: i32) -> i32 {
 }
 
 /// Reports `text` on `file` (when open) through the async output sinks, for
-/// invocations that end before they have a host or context.
-pub(crate) async fn report_async(file: Option<OpenFile>, text: String) {
+/// invocations that end before they have a host or context. The shell's
+/// cancellation of the run ends the wait for room: a pipe nothing drains
+/// must not keep the run past its timeout.
+pub(crate) async fn report_async(file: Option<OpenFile>, text: String, cancel: Option<CancellationToken>) {
 	let Some(file) = file else {
 		return;
 	};
 	let sigpipe = Arc::new(Sigpipe::default());
-	let gate = CommandCancel { flag: Arc::new(AtomicBool::new(false)), token: None, silences: false };
+	let gate =
+		CommandCancel { flag: Arc::new(AtomicBool::new(false)), token: cancel.clone(), silences: false };
 	let regular_file = Destination::of(&file).regular_file;
 	let mut out = async_out_for(file, GuardedStream::Stderr, regular_file, &sigpipe, &gate);
 	let _ = out.write_all(text.as_bytes());
-	let _ = out.drain(true).await;
+	match cancel {
+		Some(token) => {
+			tokio::select! {
+				_ = out.drain(true) => {},
+				() = token.cancelled() => {},
+			}
+		},
+		None => {
+			let _ = out.drain(true).await;
+		},
+	}
 }
 
 /// Implements `clap::Parser` for a builder-style utility: `$ty` stores the
@@ -2770,11 +2786,17 @@ mod testing {
 
 	use parking_lot::Mutex;
 
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	use super::{Fd, Invocation};
 	use super::{
-		Arc, AsyncStreams, AsyncUtility, AtomicBool, CommandCancel, GuardedStream, HashMap, Host, OpenFile,
-		OsString, PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Spec, Stdin, StreamWriter, Utility, Write,
-		async_out_for, io, openfile, output_handle, run_caught, run_caught_async,
+		Arc, AsyncStreams, AsyncUtility, AtomicBool, CommandCancel, GuardedStream, HashMap, Host,
+		OpenFile, OsString, PathBuf, Read, ShellPaths, Sigpipe, SigpipeGuard, Spec, Stdin, StreamWriter,
+		Utility, Write, async_out_for, io, openfile, output_handle, run_caught, run_caught_async,
 	};
+	#[cfg(all(target_os = "linux", any(feature = "util.rg", feature = "util.find")))]
+	use super::run_async_utility;
+	#[cfg(all(target_os = "linux", feature = "util.cat"))]
+	use super::run_utility;
 
 	/// Captured in-memory output from [`Host::for_test`].
 	pub(crate) struct Capture {
@@ -3784,6 +3806,159 @@ mod testing {
 			assert_eq!(final_status(false, false, Some(3)), 3);
 			assert_eq!(final_status(true, false, None), 1);
 		}
+	}
+
+	/// A pipe's read end and its write end, which is full.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	fn full_pipe() -> (std::fs::File, std::fs::File, usize) {
+		use std::os::fd::{AsRawFd, OwnedFd};
+
+		let (reader, writer) = std::io::pipe().unwrap();
+		let mut writer = std::fs::File::from(OwnedFd::from(writer));
+		// SAFETY: F_GETPIPE_SZ takes no argument; `writer` owns this fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		writer.write_all(&vec![b'x'; capacity]).unwrap();
+		(std::fs::File::from(OwnedFd::from(reader)), writer, capacity)
+	}
+
+	/// Runs `run` on a current-thread runtime while a task on the same
+	/// thread drains the full stdout pipe, and returns its status; ends the
+	/// test naming `what` once 5 s pass. A write that waits in the kernel
+	/// holds the only thread, so the drain never runs.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	fn status_while_a_reader_drains<F: Future<Output = i32>>(
+		what: &'static str,
+		mut reader: std::fs::File,
+		capacity: usize,
+		run: impl FnOnce() -> F + Send + 'static,
+	) -> i32 {
+		use std::{sync::mpsc::channel, time::Duration};
+
+		let (done, finished) = channel();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let status = runtime.block_on(async {
+				let drain = async {
+					tokio::time::sleep(Duration::from_millis(100)).await;
+					reader.read_exact(&mut vec![0; capacity]).unwrap();
+					reader
+				};
+				let (status, _reader) = tokio::join!(run(), drain);
+				status
+			});
+			let _ = done.send(status);
+		});
+		finished
+			.recv_timeout(Duration::from_secs(5))
+			.unwrap_or_else(|_| panic!("DEADLINE fired: {what} did not return"))
+	}
+
+	/// `argv` as an invocation in a scratch directory with a file `f`
+	/// holding `hit`, its stdout the full pipe `stdout`.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	fn invocation_to(argv: &[&str], stdout: std::fs::File) -> (Invocation, tempfile::TempDir) {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "hit\n").unwrap();
+		let mut invocation = Invocation::new(
+			argv.iter().map(|arg| (*arg).to_owned()).collect(),
+			tree.path().to_path_buf(),
+			pi_vfs::Fs::native(),
+		);
+		invocation.stdio[1] = Fd::from(stdout);
+		(invocation, tree)
+	}
+
+	/// `--help` is rendered before a Host exists. It must yield to a reader
+	/// when stdout is the full capture pipe; a write on the runtime worker
+	/// never reaches that reader.
+	#[cfg(all(target_os = "linux", feature = "util.cat"))]
+	#[test]
+	fn help_to_a_full_output_pipe_yields_to_the_reader() {
+		let (reader, writer, capacity) = full_pipe();
+		let (invocation, _tree) = invocation_to(&["cat", "--help"], writer);
+		let status = status_while_a_reader_drains("cat --help", reader, capacity, move || {
+			run_utility::<crate::cat::Cat>(invocation)
+		});
+		assert_eq!(status, 0);
+	}
+
+	/// Usage text to a pipe nothing drains ends once the run is cancelled
+	/// (its timeout): the report must not keep the run.
+	#[cfg(all(target_os = "linux", feature = "util.cat"))]
+	#[test]
+	fn help_to_a_pipe_nothing_drains_ends_when_the_run_is_cancelled() {
+		use std::{sync::mpsc::channel, time::Duration};
+
+		let (reader, writer, _) = full_pipe();
+		let (mut invocation, _tree) = invocation_to(&["cat", "--help"], writer);
+		let token = tokio_util::sync::CancellationToken::new();
+		invocation.cancel = Some(token.clone());
+		let (done, finished) = channel();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let status = runtime.block_on(async {
+				let cancel = async {
+					tokio::time::sleep(Duration::from_millis(200)).await;
+					token.cancel();
+				};
+				let (status, ()) = tokio::join!(run_utility::<crate::cat::Cat>(invocation), cancel);
+				status
+			});
+			let _ = done.send(status);
+		});
+		finished
+			.recv_timeout(Duration::from_secs(5))
+			.expect("DEADLINE fired: cat --help outlived the run's cancellation");
+		drop(reader);
+	}
+
+	/// The real async adapter, `rg` with each explicit buffering flag, into a
+	/// full stdout pipe.
+	#[cfg(all(target_os = "linux", feature = "util.rg"))]
+	#[test]
+	fn rg_line_buffered_to_a_full_output_pipe_yields_to_the_reader() {
+		let (reader, writer, capacity) = full_pipe();
+		let (invocation, _tree) = invocation_to(&["rg", "--line-buffered", "hit", "f"], writer);
+		let status = status_while_a_reader_drains("rg --line-buffered", reader, capacity, move || {
+			run_async_utility::<crate::rg::Rg>(invocation)
+		});
+		assert_eq!(status, 0);
+	}
+
+	#[cfg(all(target_os = "linux", feature = "util.rg"))]
+	#[test]
+	fn rg_no_line_buffered_to_a_full_output_pipe_yields_to_the_reader() {
+		let (reader, writer, capacity) = full_pipe();
+		let (invocation, _tree) = invocation_to(&["rg", "--no-line-buffered", "hit", "f"], writer);
+		let status = status_while_a_reader_drains("rg --no-line-buffered", reader, capacity, move || {
+			run_async_utility::<crate::rg::Rg>(invocation)
+		});
+		assert_eq!(status, 0);
+	}
+
+	/// `find -help` and `find -version` print from the async body, so to a
+	/// full stdout pipe they must yield to the reader too.
+	#[cfg(all(target_os = "linux", feature = "util.find"))]
+	#[test]
+	fn find_help_to_a_full_output_pipe_yields_to_the_reader() {
+		let (reader, writer, capacity) = full_pipe();
+		let (invocation, _tree) = invocation_to(&["find", "-help"], writer);
+		let status = status_while_a_reader_drains("find -help", reader, capacity, move || {
+			run_async_utility::<crate::find::Find>(invocation)
+		});
+		assert_eq!(status, 0);
+	}
+
+	#[cfg(all(target_os = "linux", feature = "util.find"))]
+	#[test]
+	fn find_version_to_a_full_output_pipe_yields_to_the_reader() {
+		let (reader, writer, capacity) = full_pipe();
+		let (invocation, _tree) = invocation_to(&["find", "-version"], writer);
+		let status = status_while_a_reader_drains("find -version", reader, capacity, move || {
+			run_async_utility::<crate::find::Find>(invocation)
+		});
+		assert_eq!(status, 0);
 	}
 
 	#[cfg(unix)]

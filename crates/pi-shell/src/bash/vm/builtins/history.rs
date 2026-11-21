@@ -319,22 +319,6 @@ fn fc_index(list: &List, count: usize, spec: &[u8], above: usize) -> Option<usiz
 		.find(|&i| list.entries[i].starts_with(spec))
 }
 
-/// Write what of `bytes` fd `fd` takes without waiting, returning the rest.
-/// A builtin's queued output is written only after the frame it runs, so
-/// output that must come before that frame goes out here.
-fn write_now<'b>(ctx: &Ctx<'_, '_>, fd: i32, mut bytes: &'b [u8]) -> &'b [u8] {
-	let waker = ctx.k.waker.clone();
-	let mut tcx = std::task::Context::from_waker(&waker);
-	let handle = ctx.vp.fds.handle(fd);
-	while !bytes.is_empty() {
-		match handle.poll_write(&mut tcx, bytes) {
-			std::task::Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
-			_ => break,
-		}
-	}
-	bytes
-}
-
 /// `fc [-e ename] [-lnr] [first [last]]`, `fc -s [pat=rep …] [command]`
 /// (bash `fc.def`): list history entries (`-l`; `-n` without numbers, `-r`
 /// newest first) or run one again (`-s`, or `-e -`), echoing it to stderr
@@ -415,13 +399,14 @@ pub fn fc(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				command = command.replace(pat, rep).into();
 			}
 		}
-		// bash echoes the command before running it.
+		// bash echoes the command before running it. A builtin's own output is
+		// written after the frame it runs, so the echo goes with the
+		// diagnostics, which are written and settled before the command runs.
 		let mut echoed = command.clone();
 		echoed.push(b'\n');
-		let unwritten = write_now(&*ctx, 2, &echoed);
-		if !unwritten.is_empty() {
-			ctx.out_fd(2, unwritten);
-		}
+		ctx.vp
+			.out
+			.push_back(super::super::proc::PendingWrite::new(2, echoed));
 		// bash's `fc_replhist`: the command takes the `fc` line's place.
 		if list.pending
 			&& let Some(entry) = list.entries.last_mut()

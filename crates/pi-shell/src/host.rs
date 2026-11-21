@@ -27,8 +27,8 @@ use parking_lot::Mutex;
 use crate::{
 	bash::{
 		Deadline, Event, ExitStatus, ExtProc, FdRef, File, FileKind, Fs, IntrinsicId, Invocation,
-		ModeId, NativeRef, OsHandle, ResolveCtx, Resolved, Rlimit, Signal, SpawnFuture, SpawnSpec,
-		StdFd, StdioSpec, SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict,
+		Mark, ModeId, NativeRef, OsHandle, ResolveCtx, Resolved, Rlimit, Signal, SpawnFuture,
+		SpawnSpec, StdFd, StdioSpec, SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict,
 	},
 	output_decode,
 	sys::{End, Exits, NativeSpawner, OutputDecoding, Relays, Sessions, SpawnConfig, StdFile},
@@ -148,6 +148,22 @@ impl File for StreamFile {
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.with(Poll::Ready(Ok(())), |f| f.poll_flush(cx))
+	}
+
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle(cx))
+	}
+
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self.with(Poll::Ready(Ok((buf.len(), None))), |f| f.poll_write_marked(cx, buf))
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle_marked(cx, marks))
 	}
 
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {

@@ -118,10 +118,48 @@ pub trait DirIter: Send {
 pub trait File: Send {
 	/// Read into `buf`; `Ok(0)` is end of file. Must not block.
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
-	/// Write a prefix of `buf`. Must not block.
+	/// Write a prefix of `buf`. Must not block. A host file that hands the
+	/// bytes to a writer thread reports here no error of that chunk: a writer
+	/// that needs it writes with [`File::poll_write_marked`] and settles with
+	/// the mark, which only it holds.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
-	/// Flush buffered writes (called before the engine closes the fd).
+	/// Flush buffered writes. The engine does not call it when it closes an
+	/// fd; its callers are `FdHandle::flush` and `close` (the extras), a relay
+	/// or pump at the end of its stream, and a zsh multios tee.
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+	/// [`File::poll_write`], with the [`Mark`] of the chunk it handed to a
+	/// writer thread (`None` when it wrote as it took): the writer settles with
+	/// its own marks ([`File::poll_settle_marked`]) to get their errors.
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self.poll_write(cx, buf) {
+			Poll::Ready(Ok(n)) => Poll::Ready(Ok((n, None))),
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+	/// Ready once every write this file took is out of the shell: in the
+	/// kernel, or failed. It takes no write's error (a writer takes its own
+	/// with [`File::poll_settle_marked`]). A file that writes as it takes is
+	/// settled at once; a host file that hands writes to a writer thread
+	/// waits for it. The engine settles before it counts output as written,
+	/// so whatever runs next (an external that inherits the fd, another
+	/// writer on the same pipe) comes after it. Unlike [`File::poll_flush`]
+	/// this asks nothing of the object behind the file (a provider's flush
+	/// is not called).
+	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
+	}
+	/// [`File::poll_settle`] for one writer: Ready once its chunks (`marks`,
+	/// from [`File::poll_write_marked`]) are out, with the first error among
+	/// them, which it takes. Another writer's error is not returned.
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		let _ = marks;
+		self.poll_settle(cx)
+	}
 	/// Reposition (`<>` redirections, `read -N` on regular files).
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;
 	/// What kind of object this is.
@@ -130,6 +168,50 @@ pub trait File: Send {
 	fn os_handle(&self) -> Option<OsHandle>;
 	/// Duplicate (`n>&m` into an external, `exec 3>&1`).
 	fn dup(&self) -> io::Result<Box<dyn File>>;
+}
+
+/// One chunk a writer thread took for a write ([`File::poll_write_marked`]).
+///
+/// The chunk's result is kept in its mark and nowhere else, so only the
+/// writer holding the mark gets the chunk's error, by settling with it
+/// ([`File::poll_settle_marked`]): no other writer, settle or flush can take
+/// it, and a mark its writer drops goes away once the thread is done with
+/// the chunk. Clones share one result, which the first settle takes.
+#[derive(Clone, Debug)]
+pub struct Mark(std::sync::Arc<parking_lot::Mutex<Option<io::Result<()>>>>);
+
+impl Mark {
+	/// A chunk not written yet.
+	pub(crate) fn new() -> Self {
+		Self(std::sync::Arc::new(parking_lot::Mutex::new(None)))
+	}
+
+	/// The thread is done with the chunk: `Ok` once it is in the kernel,
+	/// else the write's error.
+	pub(crate) fn finish(&self, result: io::Result<()>) {
+		*self.0.lock() = Some(result);
+	}
+
+	/// Whether the thread is done with the chunk.
+	pub(crate) fn is_done(&self) -> bool {
+		self.0.lock().is_some()
+	}
+
+	/// The error of a chunk the thread is done with, which it takes: a later
+	/// call, or one for a chunk that went out or is not done, gives `Ok`.
+	pub(crate) fn take_error(&self) -> io::Result<()> {
+		let mut result = self.0.lock();
+		match result.take() {
+			Some(Err(e)) => {
+				*result = Some(Ok(()));
+				Err(e)
+			},
+			other => {
+				*result = other;
+				Ok(())
+			},
+		}
+	}
 }
 
 /// Kind of an open [`File`].

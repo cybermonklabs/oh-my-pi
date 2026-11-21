@@ -292,6 +292,10 @@ impl pi_vfs::FileHandle for FdHandle {
 	/// A zero-length write never waits: it fails only as a write would (an
 	/// engine pipe with no reader left is `BrokenPipe`), which is how an
 	/// extra asks whether its reader is gone (`OpenFile::reader_gone`).
+	/// Any other write returns once its bytes are out (written and settled,
+	/// [`crate::bash::File::poll_settle`]), so the command after the extra
+	/// comes after its output, and a chunk that failed after its hand-off
+	/// is this write's error.
 	async fn write(&self, buf: &[u8]) -> io::Result<usize> {
 		let fd = self.fd()?;
 		if buf.is_empty() {
@@ -300,7 +304,9 @@ impl pi_vfs::FileHandle for FdHandle {
 				Poll::Pending => Ok(0),
 			};
 		}
-		std::future::poll_fn(|cx| fd.poll_write(cx, buf)).await
+		let (n, mark) = std::future::poll_fn(|cx| fd.poll_write_marked(cx, buf)).await?;
+		std::future::poll_fn(|cx| fd.poll_settle_marked(cx, mark.as_slice())).await?;
+		Ok(n)
 	}
 
 	async fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
@@ -433,9 +439,14 @@ impl Drop for ExtraTask {
 
 /// A builtin pi withholds (`suspend`): says so on stderr, status 1.
 pub struct Refusal {
-	stderr:  FdRef,
-	message: Vec<u8>,
-	written: usize,
+	stderr:    FdRef,
+	message:   Vec<u8>,
+	written:   usize,
+	/// The chunk of the message a writer thread took last: settled before
+	/// the next one goes ([`crate::bash::File::poll_settle_marked`]).
+	mark:      Option<crate::bash::Mark>,
+	/// A cancelling signal arrived: end now, settled or not.
+	cancelled: bool,
 }
 
 impl Refusal {
@@ -443,26 +454,50 @@ impl Refusal {
 	pub(crate) fn new(name: &[u8], stderr: FdRef) -> Self {
 		let mut message = name.to_vec();
 		message.extend_from_slice(b": not available in this shell\n");
-		Self { stderr, message, written: 0 }
+		Self { stderr, message, written: 0, mark: None, cancelled: false }
 	}
 }
 
 impl Task for Refusal {
 	fn poll(&mut self, cx: &mut Context<'_>) -> Poll<i32> {
-		while self.written < self.message.len() {
-			match self.stderr.poll_write(cx, &self.message[self.written..]) {
-				Poll::Ready(Ok(n)) if n > 0 => self.written += n,
+		while !self.cancelled {
+			if let Some(mark) = &self.mark {
+				let settled = std::task::ready!(
+					self
+						.stderr
+						.poll_settle_marked(cx, std::slice::from_ref(mark))
+				);
+				self.mark = None;
 				// A closed or failing stderr loses the message.
-				Poll::Ready(_) => break,
+				if settled.is_err() {
+					return Poll::Ready(1);
+				}
+			}
+			if self.written >= self.message.len() {
+				break;
+			}
+			match self
+				.stderr
+				.poll_write_marked(cx, &self.message[self.written..])
+			{
+				Poll::Ready(Ok((n, mark))) if n > 0 => {
+					self.written += n;
+					self.mark = mark;
+				},
+				Poll::Ready(_) => return Poll::Ready(1),
 				Poll::Pending => return Poll::Pending,
 			}
+		}
+		// Out before what runs next ([`crate::bash::File::poll_settle`]).
+		if !self.cancelled && self.stderr.poll_settle(cx).is_pending() {
+			return Poll::Pending;
 		}
 		Poll::Ready(1)
 	}
 
 	fn signal(&mut self, sig: Signal) {
 		if cancels(sig) {
-			self.written = self.message.len();
+			self.cancelled = true;
 		}
 	}
 }
@@ -509,5 +544,69 @@ mod tests {
 			}
 		}
 		assert_eq!(native_name(SUSPEND), None);
+	}
+
+	/// An engine fd object that takes every write at once and has it out
+	/// only once `released`, as a host file's writer thread holds a chunk it
+	/// took (a tee over host files, a host file without an OS handle).
+	struct Held(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+	impl crate::bash::File for Held {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+				Poll::Ready(Ok(()))
+			} else {
+				Poll::Pending
+			}
+		}
+
+		fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<crate::bash::OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> io::Result<Box<dyn crate::bash::File>> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+	}
+
+	// Failure mode: an extra's write to an engine fd object returned when
+	// its bytes were handed off, so the extra ended, and the next command
+	// ran, before they were out. The write returns once they are.
+	#[test]
+	fn an_extras_write_to_an_engine_fd_returns_once_its_bytes_are_out() {
+		use pi_vfs::FileHandle as _;
+
+		let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let handle = FdHandle {
+			fd: Mutex::new(Some(FdRef::from_file(Box::new(Held(std::sync::Arc::clone(&released)))))),
+		};
+		let mut cx = Context::from_waker(Waker::noop());
+		let mut write = handle.write(b"x");
+		assert!(
+			write.as_mut().poll(&mut cx).is_pending(),
+			"the extra's write returned before its bytes were out"
+		);
+		released.store(true, std::sync::atomic::Ordering::SeqCst);
+		assert!(matches!(write.as_mut().poll(&mut cx), Poll::Ready(Ok(1))));
 	}
 }
