@@ -1221,6 +1221,72 @@ fn a_frame_deeper_than_serde_json_reads_closes_the_client() {
 	assert!(error.starts_with("Failed to decode RPC output: "), "{error}");
 }
 
+// If this regresses, an answer other than `get_tree` nested deeper than
+// `serde_json` reads (a `get_messages` answer holding a deeply nested tool
+// result) is decoded by recursion, which overflows the stack and aborts the
+// process, instead of closing the client with the protocol error it gave
+// before.
+#[test]
+fn a_deep_get_messages_answer_closes_the_client() {
+	let (client, _events, mut server) = connect(ready_v1(), Vec::new());
+	let script = thread::spawn(move || {
+		let frame = server.expect("get_messages");
+		let depth = 100_000;
+		let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+		let line = format!(
+			r#"{{"type":"response","id":{},"command":"get_messages","success":true,"data":{{"messages":{deep}}}}}"#,
+			frame["id"]
+		);
+		server
+			.out
+			.write_all(format!("{line}\n").as_bytes())
+			.unwrap();
+		server
+	});
+	let error = client.call(&GetMessagesCommand {}).unwrap_err();
+	assert!(
+		matches!(&error, Error::Protocol(message) if message.starts_with("Failed to decode RPC output: ")),
+		"{error:?}"
+	);
+	drop(script.join().unwrap());
+}
+
+// If this regresses, a `get_tree` answer whose envelope does not decode reaches
+// the event receiver with its deep `data`, and dropping the event overflows the
+// stack and aborts the process.
+#[test]
+fn a_deep_get_tree_answer_that_does_not_decode_arrives_without_its_data() {
+	let (_client, events, mut server) = connect(ready_v1(), Vec::new());
+	let depth = 100_000;
+	let line = format!(
+		r#"{{"type":"response","id":"late","command":"get_tree","success":"yes","data":{}{}}}"#,
+		"[".repeat(depth),
+		"]".repeat(depth)
+	);
+	server
+		.out
+		.write_all(format!("{line}\n").as_bytes())
+		.unwrap();
+	// A failure neither prints nor drops a value this deep: either would abort
+	// the test process.
+	match next_event(&events) {
+		Event::Undecodable { mut raw, .. } => {
+			assert_eq!(raw["command"], "get_tree");
+			if let Some(data) = raw
+				.as_object_mut()
+				.and_then(|members| members.remove("data"))
+			{
+				std::mem::forget(data);
+				panic!("the undecodable answer kept its data");
+			}
+		},
+		other => {
+			std::mem::forget(other);
+			panic!("expected the undecodable answer");
+		},
+	}
+}
+
 // If this regresses, `get_tree` on a long session (each entry two levels under
 // its parent) closes the client, or the tree it returns overflows the stack
 // and aborts the process when it is dropped.

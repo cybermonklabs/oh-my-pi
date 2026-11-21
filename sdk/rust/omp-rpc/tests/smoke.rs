@@ -4,11 +4,18 @@
 //! scripted OpenAI-compatible server in `test/rpc-wire/fake-openai-server.ts`.
 
 use std::{
+	ffi::OsStr,
+	fs::DirBuilder,
 	io::{BufRead, BufReader},
+	os::unix::fs::DirBuilderExt,
 	path::{Path, PathBuf},
 	process::{Command as Process, Stdio},
-	sync::{Arc, Mutex, mpsc::Receiver},
-	time::{Duration, Instant},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU32, Ordering},
+		mpsc::Receiver,
+	},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use omp_rpc::*;
@@ -35,6 +42,49 @@ fn repo_root() -> PathBuf {
 		.join("../../..")
 		.canonicalize()
 		.unwrap()
+}
+
+/// A directory of the test's own under the temp dir, removed on drop. It is
+/// made new with mode 0700 (`create`, not `create_dir_all`), so a directory
+/// another account made first under that name fails the test instead of
+/// serving as the host's agent directory.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+	fn new(prefix: &str) -> Self {
+		static MADE: AtomicU32 = AtomicU32::new(0);
+		for _ in 0..16 {
+			let nanos = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap()
+				.subsec_nanos();
+			let made = MADE.fetch_add(1, Ordering::Relaxed);
+			let name = format!("{prefix}-{}-{nanos:08x}-{made}", std::process::id());
+			let path = std::env::temp_dir().join(name);
+			match DirBuilder::new().mode(0o700).create(&path) {
+				Ok(()) => return Self(path),
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+				Err(error) => panic!("make {}: {error}", path.display()),
+			}
+		}
+		panic!("no free name for a private directory under {}", std::env::temp_dir().display());
+	}
+
+	fn path(&self) -> &Path {
+		&self.0
+	}
+}
+
+impl AsRef<OsStr> for PrivateDir {
+	fn as_ref(&self) -> &OsStr {
+		self.0.as_os_str()
+	}
+}
+
+impl Drop for PrivateDir {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_dir_all(&self.0);
+	}
 }
 
 fn assert_clean(seen: &[Event]) {
@@ -76,8 +126,7 @@ fn notification_type(event: &Event) -> String {
 #[ignore = "spawns the real omp server; run with --ignored"]
 fn smoke_real_server() {
 	let repo = repo_root();
-	let agent_dir = std::env::temp_dir().join(format!("omp-rpc-rust-smoke-{}", std::process::id()));
-	std::fs::create_dir_all(&agent_dir).unwrap();
+	let agent_dir = PrivateDir::new("omp-rpc-rust-smoke");
 	let mut process = Process::new("bun");
 	process
 		.args(["packages/coding-agent/src/cli.ts", "--mode", "rpc", "--no-session"])
@@ -197,7 +246,6 @@ fn smoke_real_server() {
 		std::thread::sleep(Duration::from_millis(20));
 	}
 	println!("server group gone {:?} after drop", dropped.elapsed());
-	let _ = std::fs::remove_dir_all(&agent_dir);
 }
 
 fn tool_names(turn: &PromptTurn) -> Vec<(&'static str, String)> {
@@ -217,8 +265,7 @@ fn tool_names(turn: &PromptTurn) -> Vec<(&'static str, String)> {
 #[ignore = "spawns the real omp server and a scripted model; run with --ignored"]
 fn smoke_scripted_model() {
 	let repo = repo_root();
-	let agent_dir = std::env::temp_dir().join(format!("omp-rpc-rust-model-{}", std::process::id()));
-	std::fs::create_dir_all(&agent_dir).unwrap();
+	let agent_dir = PrivateDir::new("omp-rpc-rust-model");
 	let mut model = Process::new("bun")
 		.arg("packages/coding-agent/test/rpc-wire/fake-openai-server.ts")
 		.arg(&agent_dir)
@@ -384,7 +431,6 @@ fn smoke_scripted_model() {
 	drop(client);
 	drop(model.stdin.take());
 	let _ = model.wait();
-	let _ = std::fs::remove_dir_all(&agent_dir);
 }
 
 fn prompt(message: &str) -> PromptCommand {
@@ -441,9 +487,8 @@ fn write_chain_session(dir: &Path) -> PathBuf {
 #[ignore = "spawns the real omp server; run with --ignored"]
 fn smoke_get_tree_deep_chain() {
 	let repo = repo_root();
-	let dir = std::env::temp_dir().join(format!("omp-rpc-rust-tree-{}", std::process::id()));
-	std::fs::create_dir_all(&dir).unwrap();
-	let session = write_chain_session(&dir);
+	let dir = PrivateDir::new("omp-rpc-rust-tree");
+	let session = write_chain_session(dir.path());
 	// Real RPC dispatch over the session file; its mock model is never called
 	// here.
 	let mut process = Process::new("bun");
@@ -500,5 +545,4 @@ fn smoke_get_tree_deep_chain() {
 		.call(&GetStateCommand {})
 		.expect("get_state after get_tree");
 	drop(client);
-	let _ = std::fs::remove_dir_all(&dir);
 }

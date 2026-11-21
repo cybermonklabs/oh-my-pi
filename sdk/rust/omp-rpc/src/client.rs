@@ -31,16 +31,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-	deep::{self, SERDE_JSON_MAX_DEPTH, drop_deep, nests_deeper_than},
+	deep::{self, SERDE_JSON_MAX_DEPTH, drop_deep, drop_deep_tree_data, nests_deeper_than},
 	frame::{FrameDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES},
 	host_tool::{HostTool, HostToolContext, text_payload},
 	host_uri::{HostUri, HostUriContext, uri_scheme},
 	turn::PromptTurn,
 	wire::{
-		AgentMessage, Command, GetMessagesCommand, GetMessagesPageCommand, HostToolResult,
-		HostUriOperation, HostUriResult, NegotiateProtocolCommand, PromptCommand, PromptResultEvent,
-		ReadyEvent, RpcAgentEvent, RpcInbound, RpcNotification, RpcResponse, RpcServerFrame,
-		SetHostToolsCommand, SetHostUriSchemesCommand,
+		AgentMessage, Command, GetMessagesCommand, GetMessagesPageCommand, GetTreeCommand,
+		HostToolResult, HostUriOperation, HostUriResult, NegotiateProtocolCommand, PromptCommand,
+		PromptResultEvent, ReadyEvent, RpcAgentEvent, RpcInbound, RpcNotification, RpcResponse,
+		RpcServerFrame, SetHostToolsCommand, SetHostUriSchemesCommand,
 	},
 };
 
@@ -124,7 +124,10 @@ pub enum Event {
 	/// value is dropped with [`drop_deep`](crate::drop_deep), since dropping it
 	/// by recursion would overflow the stack.
 	UnmatchedResponse(RpcResponse),
-	/// A known frame type whose payload failed to decode.
+	/// A known frame type whose payload failed to decode. A `get_tree` answer
+	/// here has no `data` when its `data` nested deeper than `serde_json` reads:
+	/// that is dropped with [`drop_deep`](crate::drop_deep), as for
+	/// [`UnmatchedResponse`](Self::UnmatchedResponse).
 	Undecodable { raw: Value, error: String },
 }
 
@@ -438,7 +441,13 @@ impl Shared {
 					return;
 				}
 				if let (Some(data), Some(members)) = (data, frame.as_object_mut()) {
-					members.insert("data".to_owned(), data);
+					// Only a get_tree answer's data can nest that deep (see
+					// `deep::parse`).
+					if nests_deeper_than(&data, SERDE_JSON_MAX_DEPTH) {
+						drop_deep(data);
+					} else {
+						members.insert("data".to_owned(), data);
+					}
 				}
 				let error = error.to_string();
 				if frame.get("type").and_then(Value::as_str) == Some("prompt_result")
@@ -456,15 +465,15 @@ impl Shared {
 			RpcServerFrame::Response(mut response) => {
 				// `data: null` decodes as no data, as serde decodes it.
 				response.data = data.filter(|data| !data.is_null());
+				// A failure's deep data would drop by recursion (see
+				// `deep::parse`).
+				if !response.success {
+					drop_deep_tree_data(&mut response);
+				}
 				let Some(mut response) = self.response(response) else {
 					return;
 				};
-				if let Some(data) = response
-					.data
-					.take_if(|data| nests_deeper_than(data, SERDE_JSON_MAX_DEPTH))
-				{
-					drop_deep(data);
-				}
+				drop_deep_tree_data(&mut response);
 				Event::UnmatchedResponse(response)
 			},
 			// Host tool and URI frames were consumed above; only malformed ones get here.
@@ -485,10 +494,15 @@ impl Shared {
 	}
 
 	/// Delivers a response to its waiter; returns it when nobody waits for it.
-	fn response(&self, response: RpcResponse) -> Option<RpcResponse> {
+	fn response(&self, mut response: RpcResponse) -> Option<RpcResponse> {
 		let mut state = self.state();
 		if let Some(id) = &response.id {
-			if let Some((_, waiter)) = state.pending.remove(id) {
+			if let Some((command, waiter)) = state.pending.remove(id) {
+				// Deep data reaches only the get_tree call it answers (see
+				// `deep::parse`).
+				if command != GetTreeCommand::NAME {
+					drop_deep_tree_data(&mut response);
+				}
 				// A call that timed out meanwhile no longer takes it.
 				if let Err(mpsc::SendError(Ok(RpcResponse { data: Some(data), .. }))) =
 					waiter.send(Ok(response))

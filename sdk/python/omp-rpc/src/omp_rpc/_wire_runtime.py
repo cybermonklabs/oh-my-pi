@@ -59,7 +59,7 @@ def decode_json(value: object, path: str) -> JsonValue:
 
 def _copy_json(value: object, path: str) -> JsonValue:
     """`decode_json` by recursion."""
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, _JSON_SCALARS):
         return cast(JsonValue, value)
     if isinstance(value, list):
         return [_copy_json(item, path) for item in value]
