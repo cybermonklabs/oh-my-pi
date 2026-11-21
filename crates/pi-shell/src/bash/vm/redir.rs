@@ -1192,6 +1192,13 @@ fn zsh_close(
 /// it waits.
 const TEE_HOLD: usize = 64 << 10;
 
+/// A write of at most this many bytes goes into a tee whole or not at all,
+/// as a pipe keeps a write of at most `PIPE_BUF` bytes whole, so another
+/// writer's bytes never land inside it. It is Linux's `PIPE_BUF`, used on
+/// every platform: macOS's is 512, so the tee keeps at least as much whole
+/// as a pipe does there.
+const TEE_WHOLE: usize = 4096;
+
 /// zsh's multio tee (`closemn` for output). Like zsh's tee process, which
 /// reads what the command wrote from a pipe, the tee owns what it takes: a
 /// write queues its bytes and returns, and the queue goes to each target in
@@ -1200,7 +1207,8 @@ const TEE_HOLD: usize = 64 << 10;
 /// writers share (an external's pump, then a builtin), and its duplicates
 /// share its queue, so no write's progress or failure is another's: each
 /// target goes through each write on its own, a write is `Pending` only
-/// when it took nothing, and a target whose chunk failed is skipped for the
+/// when it took nothing, a write of at most [`TEE_WHOLE`] bytes is taken
+/// whole, and a target whose chunk failed is skipped for the
 /// rest of the write that chunk belongs to (a target that is gone is
 /// skipped); the next write starts afresh. A tee reports no target's
 /// failure to its writers. The tee polls its targets with a waker of its
@@ -1223,7 +1231,8 @@ struct TeeShared {
 /// The callers of a tee that may be waiting on it: per waker, how many of
 /// its calls registered it, and the entry's generation. All are woken
 /// together, and taken off, when a target the tee polled is ready; when a
-/// call moved the queue on, all but that call's own caller are. A call
+/// call moved the queue on, all but that call's own caller are, and that
+/// caller's waker too when another call registered it. A call
 /// registers its waker before it polls the targets, so no target's wake can
 /// come before it, and takes its registration back once it is `Ready`: a
 /// waiter is a call still waiting, or one cancelled while it waited, until
@@ -1271,22 +1280,29 @@ impl Waiters {
 	}
 
 	/// Wakes every waiter but `caller`, which stays registered throughout:
-	/// a target's wake that comes while the others are woken finds it.
+	/// a target's wake that comes while the others are woken finds it. The
+	/// engine polls every vproc with one waker, so another call registered
+	/// under `caller`'s waker (its count above the caller's own one) can be
+	/// another vproc waiting on the tee: then `caller`'s waker is woken too,
+	/// still registered, and the engine polls them all again.
 	fn wake_others(&self, caller: &Waker) {
-		let others: Vec<Waker> = {
+		let wake: Vec<Waker> = {
 			let mut list = self.0.lock();
-			let mut others = Vec::new();
-			list.entries.retain(|(w, ..)| {
+			let mut wake = Vec::new();
+			list.entries.retain(|(w, calls, _)| {
 				if w.will_wake(caller) {
+					if *calls > 1 {
+						wake.push(w.clone());
+					}
 					true
 				} else {
-					others.push(w.clone());
+					wake.push(w.clone());
 					false
 				}
 			});
-			others
+			wake
 		};
-		for w in others {
+		for w in wake {
 			w.wake();
 		}
 	}
@@ -1459,7 +1475,12 @@ impl File for Tee {
 
 	/// Takes what fits beside what the targets have not taken yet, and
 	/// moves the queue on; `Pending`, with nothing taken, while the tee
-	/// holds [`TEE_HOLD`] bytes.
+	/// holds [`TEE_HOLD`] bytes, or while a write of at most [`TEE_WHOLE`]
+	/// bytes does not fit whole. A longer write takes what fits, as a pipe
+	/// does. Room is not reserved for a waiting write: under sustained
+	/// contention, longer writes can take the room a waiting short write
+	/// needs, and the short write goes in at the first poll that finds room
+	/// for it.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
 		if buf.is_empty() {
 			return Poll::Ready(Ok(0));
@@ -1467,9 +1488,9 @@ impl File for Tee {
 		self.with(cx, |s, tcx| {
 			let _ = s.drive(tcx);
 			let room = TEE_HOLD.saturating_sub(s.queued);
-			if room == 0 {
-				// A target that has not taken its bytes holds the tee's
-				// waker, which wakes this caller.
+			if room == 0 || (buf.len() <= TEE_WHOLE && buf.len() > room) {
+				// The queue holds bytes a target has not taken, and that
+				// target holds the tee's waker, which wakes this caller.
 				return Poll::Pending;
 			}
 			let n = buf.len().min(room);
@@ -2145,6 +2166,187 @@ mod tests {
 		assert_eq!(waiters.0.lock().entries.len(), 1, "C's release took D's registration");
 		waiters.release(other);
 		assert_eq!(waiters.0.lock().entries.len(), 0, "D's release left its entry");
+	}
+
+	/// What a [`Gate`] took, and whether it takes writes now.
+	#[derive(Default)]
+	struct GateState {
+		open:  bool,
+		got:   Vec<u8>,
+		waker: Option<Waker>,
+	}
+
+	/// A tee target that takes nothing until it opens, and everything after,
+	/// holding the waker of the last write it refused.
+	struct Gate(Arc<parking_lot::Mutex<GateState>>);
+
+	impl Gate {
+		fn closed() -> (Self, Arc<parking_lot::Mutex<GateState>>) {
+			let state = Arc::new(parking_lot::Mutex::new(GateState::default()));
+			(Self(Arc::clone(&state)), state)
+		}
+	}
+
+	impl File for Gate {
+		fn poll_read(
+			&mut self,
+			_cx: &mut Context<'_>,
+			_buf: &mut [u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+			let mut s = self.0.lock();
+			if !s.open {
+				s.waker = Some(cx.waker().clone());
+				return Poll::Pending;
+			}
+			s.got.extend_from_slice(buf);
+			Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> std::io::Result<Box<dyn File>> {
+			Ok(Box::new(Self(Arc::clone(&self.0))))
+		}
+	}
+
+	/// Opens the gate and wakes the write it refused last.
+	fn open(state: &parking_lot::Mutex<GateState>) {
+		let waker = {
+			let mut s = state.lock();
+			s.open = true;
+			s.waker.take()
+		};
+		if let Some(w) = waker {
+			w.wake();
+		}
+	}
+
+	/// Writes all of `buf[off..]` through `file`, waiting for wakes.
+	fn write_rest(file: &mut (impl File + ?Sized), buf: &[u8], mut off: usize) {
+		while off < buf.len() {
+			let n = ready("a write through the tee", |cx| file.poll_write(cx, &buf[off..]))
+				.expect("the tee refused a write");
+			off += n;
+		}
+	}
+
+	/// A line of `len` bytes of `byte`, ending in a newline.
+	fn line(byte: u8, len: usize) -> Vec<u8> {
+		let mut line = vec![byte; len];
+		line[len - 1] = b'\n';
+		line
+	}
+
+	// Failure mode: a tee split a write of at most `PIPE_BUF` bytes when
+	// the queue was near `TEE_HOLD`: it took the first part of A's line and
+	// returned it as written, and when B was polled before A's next call,
+	// B's line was queued between A's two parts, so every target got a torn
+	// line. A pipe keeps such a write whole, and so does zsh's tee, which
+	// reads from one. The tee takes a write of at most `TEE_WHOLE` bytes
+	// whole or not at all; a longer write still takes what fits.
+	#[test]
+	fn two_writers_lines_of_pipe_buf_bytes_never_interleave_in_a_tee() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		// The queue 100 bytes short of `TEE_HOLD`; the target takes nothing.
+		let filler = vec![b'F'; TEE_HOLD - 100];
+		let took = once(|cx| tee.poll_write(cx, &filler));
+		assert!(matches!(took, Poll::Ready(Ok(n)) if n == filler.len()), "{took:?}");
+		let a = line(b'A', TEE_WHOLE);
+		let b = line(b'B', TEE_WHOLE);
+		// B writes through a duplicate, as a second writer of the fd does.
+		let mut dup = tee.dup().unwrap();
+		let a_took = match once(|cx| tee.poll_write(cx, &a)) {
+			Poll::Ready(Ok(n)) => n,
+			Poll::Pending => 0,
+			Poll::Ready(Err(e)) => panic!("A's write: {e}"),
+		};
+		let b_took = match once(|cx| dup.poll_write(cx, &b)) {
+			Poll::Ready(Ok(n)) => n,
+			Poll::Pending => 0,
+			Poll::Ready(Err(e)) => panic!("B's write: {e}"),
+		};
+		// The target opens, and B is polled before A.
+		open(&state);
+		write_rest(&mut *dup, &b, b_took);
+		write_rest(&mut tee, &a, a_took);
+		let settled = ready("the tee's settle", |cx| tee.poll_settle(cx));
+		assert!(settled.is_ok(), "{settled:?}");
+		let got = std::mem::take(&mut state.lock().got);
+		assert!(got.starts_with(&filler), "the filler did not come first");
+		let rest = &got[filler.len()..];
+		assert!(
+			rest == [&b[..], &a[..]].concat() || rest == [&a[..], &b[..]].concat(),
+			"a line was torn: A took {a_took} bytes at first, and the lines after the filler start \
+			 {:?}",
+			String::from_utf8_lossy(&rest[..rest.len().min(8)])
+		);
+		// Control: a write longer than `TEE_WHOLE` still takes what fits.
+		let (gate, _state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let took = once(|cx| tee.poll_write(cx, &filler));
+		assert!(matches!(took, Poll::Ready(Ok(n)) if n == filler.len()), "{took:?}");
+		let long = line(b'L', TEE_WHOLE + 1);
+		let took = once(|cx| tee.poll_write(cx, &long));
+		assert!(matches!(took, Poll::Ready(Ok(100))), "a long write near TEE_HOLD: {took:?}");
+	}
+
+	// Failure mode: the engine polls every vproc with one waker. Vproc B
+	// waits in the tee's settle; vproc A's write through the tee registers
+	// the same waker again, and its drive finds the target ready (a host
+	// file whose readiness watch was dropped before it fired) and moves the
+	// queue on. The tee woke every waiter but A's waker, which is B's too,
+	// so B stayed parked until an unrelated wake. With another call
+	// registered under the caller's waker, the tee wakes that waker as well.
+	#[test]
+	fn a_call_that_moves_a_tee_wakes_another_call_sharing_its_waker() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let engine = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&engine));
+		let mut cx = Context::from_waker(&waker);
+		// B writes and waits in its settle.
+		assert!(matches!(tee.poll_write(&mut cx, b"b\n"), Poll::Ready(Ok(2))));
+		assert!(tee.poll_settle(&mut cx).is_pending(), "B's settle with the target closed");
+		// The target becomes ready without a wake.
+		state.lock().open = true;
+		engine.0.store(false, Ordering::SeqCst);
+		// A's write, with the engine's one waker, moves the queue on.
+		assert!(matches!(tee.poll_write(&mut cx, b"a\n"), Poll::Ready(Ok(2))));
+		assert!(
+			engine.0.load(Ordering::SeqCst),
+			"B waits in the tee under the engine's waker and was not woken"
+		);
+		assert!(tee.poll_settle(&mut cx).is_ready(), "B's settle after the wake");
+		assert_eq!(std::mem::take(&mut state.lock().got), b"b\na\n");
+		// Control: a call alone under its waker is not woken by its own move.
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let alone = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&alone));
+		let mut cx = Context::from_waker(&waker);
+		assert!(matches!(tee.poll_write(&mut cx, b"c\n"), Poll::Ready(Ok(2))));
+		state.lock().open = true;
+		assert!(tee.poll_settle(&mut cx).is_ready(), "the settle with the target open");
+		assert!(!alone.0.load(Ordering::SeqCst), "a call alone under its waker woke itself");
 	}
 
 	/// How many wakers a tee holds.

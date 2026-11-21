@@ -723,33 +723,88 @@ mod tests {
 	// hand-off error: it handed off chunk after chunk of the program's output
 	// until the program ended. The pump writes with marks, settles the chunk
 	// it handed off last before the next, and stops at the first failed one.
+	// The destination is a full FIFO, so the writer thread's write of the
+	// first chunk waits in the kernel, and the source holds four chunks and
+	// its end before the pump starts, so it never makes the pump wait. The
+	// pump is known to wait on that chunk before the FIFO's reader leaves and
+	// the chunk fails, and it is polled again only once its waker was woken:
+	// the chunk's settle is its only wake, so a settle that registers no
+	// waker fails here.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_pump_stops_at_the_first_chunk_its_destination_failed() {
+		use std::os::unix::fs::OpenOptionsExt;
+
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::a_pump_stops_at_the_first_chunk_its_destination_failed"),
 			|| {
-				let (reader, writer) = io::pipe().unwrap();
-				drop(reader);
-				let file = fs::File::from(std::os::fd::OwnedFd::from(writer));
+				let dir = tempfile::tempdir().unwrap();
+				let path = dir.path().join("dst");
+				let made = std::process::Command::new("mkfifo")
+					.arg(&path)
+					.status()
+					.unwrap();
+				assert!(made.success(), "mkfifo: {made}");
+				let held = fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				let mut filler = fs::OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				// Full to the byte: page writes, then single bytes.
+				for size in [4096, 1] {
+					loop {
+						match std::io::Write::write(&mut filler, &vec![b'F'; size]) {
+							Ok(_) => {},
+							Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+							Err(e) => panic!("filling the FIFO: {e}"),
+						}
+					}
+				}
+				let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
 				let mut dst = End::File(Box::new(crate::sys::StdFile::new(file)));
-				let (mut src, program) = os::pipe(false).unwrap();
-				let writes = std::thread::spawn(move || {
-					// Four chunks' worth; the write ends once the pump stops
-					// and our end of its pipe closes.
-					let _ = std::io::Write::write_all(&mut &program, &vec![b'x'; 4 * BUF]);
-				});
+				// Four chunks' worth and then the stream's end, all there before
+				// the pump starts: the source never makes the pump wait, so the
+				// settle of the destination's chunk is its only wake.
+				let mut src = End::File(Box::new(Preloaded(vec![b'x'; 4 * BUF], 0)));
 				let mut chunk = Chunk::new();
-				let woken = Arc::new(Woken::default());
+				let woken =
+					Arc::new(Unparks(std::sync::atomic::AtomicBool::new(false), std::thread::current()));
 				let waker = Waker::from(Arc::clone(&woken));
 				let mut cx = Context::from_waker(&waker);
-				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				// The first poll hands the first chunk to the destination's
+				// writer thread, which waits on the full FIFO, reads the second
+				// chunk, and waits on the first one's mark.
+				assert!(
+					chunk.poll_copy(&mut cx, &mut src, &mut dst).is_pending(),
+					"the pump ended with its destination full"
+				);
+				assert!(
+					chunk.mark.as_ref().is_some_and(|mark| !mark.is_done()),
+					"the pump does not wait on its first chunk"
+				);
+				woken.0.store(false, std::sync::atomic::Ordering::SeqCst);
+				drop(held);
+				let start = std::time::Instant::now();
+				let wait_for_wake = |what: &str| {
+					while !woken.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+						assert!(
+							start.elapsed() < std::time::Duration::from_secs(10),
+							"the pump was not woken {what}"
+						);
+						std::thread::park_timeout(std::time::Duration::from_millis(50));
+					}
+				};
+				wait_for_wake("when its chunk failed");
 				while chunk.poll_copy(&mut cx, &mut src, &mut dst).is_pending() {
-					assert!(std::time::Instant::now() < deadline, "the pump never stopped");
-					std::thread::sleep(std::time::Duration::from_millis(5));
+					wait_for_wake("to take its destination's refusal");
 				}
 				drop(src);
-				writes.join().unwrap();
+				drop(filler);
 				let failed = crate::sys::CHUNKS_FAILED.load(std::sync::atomic::Ordering::SeqCst);
 				assert_eq!(failed, 1, "chunks handed off after the first one failed");
 			},
@@ -762,6 +817,58 @@ mod tests {
 	impl Wake for Woken {
 		fn wake(self: Arc<Self>) {
 			self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+		}
+	}
+
+	/// Records a wake and unparks the test thread.
+	#[cfg(target_os = "linux")]
+	struct Unparks(std::sync::atomic::AtomicBool, std::thread::Thread);
+
+	#[cfg(target_os = "linux")]
+	impl Wake for Unparks {
+		fn wake(self: Arc<Self>) {
+			self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+			self.1.unpark();
+		}
+	}
+
+	/// A source whose bytes are all there: every read is ready, and the
+	/// stream ends after the last byte.
+	#[cfg(target_os = "linux")]
+	struct Preloaded(Vec<u8>, usize);
+
+	#[cfg(target_os = "linux")]
+	impl File for Preloaded {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			let rest = &self.0[self.1..];
+			let n = rest.len().min(buf.len());
+			buf[..n].copy_from_slice(&rest[..n]);
+			self.1 += n;
+			Poll::Ready(Ok(n))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn seek(&mut self, _pos: std::io::SeekFrom) -> io::Result<u64> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> crate::bash::FileKind {
+			crate::bash::FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<crate::bash::OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> io::Result<Box<dyn File>> {
+			Err(io::ErrorKind::Unsupported.into())
 		}
 	}
 }
