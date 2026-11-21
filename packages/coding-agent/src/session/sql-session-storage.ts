@@ -1846,22 +1846,22 @@ class SqlBlobTier implements SessionBlobTier {
 
 	/** One land's pass over the queued blobs, in the order they were queued (see {@link SqlBlobTier}). */
 	async #landQueued(): Promise<void> {
+		const failure = (hash: string, reason: string, cause: Error) =>
+			new Error(
+				`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
+					`so no transcript naming it is written yet: ${reason}`,
+				{ cause },
+			);
 		const queued = [...this.#queued];
-		// The error of the write whose repairs are spent, and that write's blob: the pass tries no blob after it.
-		let spent: Error | undefined;
-		let spentHash = "";
+		// The blob whose write's repairs are spent, with that write's error: the pass tries no blob after it.
+		let spent: { hash: string; error: Error } | undefined;
 		for (const [hash, blob] of queued) {
 			if (this.#queued.get(hash) !== blob) continue;
 			if (spent !== undefined) {
-				this.#failed.set(
-					hash,
-					new Error(
-						`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
-							`so no transcript naming it is written yet: it was not tried after session image ${spentHash} ` +
-							`met only PostgreSQL connections no transaction can repair: ${spent.message}`,
-						{ cause: spent },
-					),
-				);
+				const reason =
+					`it was not tried after session image ${spent.hash} ` +
+					`met only PostgreSQL connections no transaction can repair: ${spent.error.message}`;
+				this.#failed.set(hash, failure(hash, reason, spent.error));
 				continue;
 			}
 			try {
@@ -1869,18 +1869,8 @@ class SqlBlobTier implements SessionBlobTier {
 				this.#failed.delete(hash);
 			} catch (err) {
 				const error = toError(err);
-				this.#failed.set(
-					hash,
-					new Error(
-						`SqlSessionStorage: session image ${hash} did not reach ${this.#backend.table}_blobs, ` +
-							`so no transcript naming it is written yet: ${error.message}`,
-						{ cause: error },
-					),
-				);
-				if (this.#backend.repairsSpent(err)) {
-					spent = error;
-					spentHash = hash;
-				}
+				this.#failed.set(hash, failure(hash, error.message, error));
+				if (this.#backend.repairsSpent(err)) spent = { hash, error };
 			}
 		}
 	}
