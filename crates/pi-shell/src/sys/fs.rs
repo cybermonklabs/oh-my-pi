@@ -1013,18 +1013,41 @@ mod fifo {
 		/// creates: not that mode less the process's umask. In a process of
 		/// its own, whose umask (`0o077`) this test sets apart from the
 		/// shell's (`0o000`, so the mode asked is `0o666`); with the process's
-		/// mask known to the open and not.
+		/// mask known to the open and not. An open that went through the pin
+		/// instead would wait for a reader of the removed FIFO for ever: the
+		/// run of its own is bounded, and a run past the bound fails the test.
 		#[test]
 		fn a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode() {
-			use std::os::unix::fs::PermissionsExt;
+			use std::{
+				os::unix::fs::PermissionsExt,
+				process::Stdio,
+				time::{Duration, Instant},
+			};
 			const NAME: &str = "sys::fs::fifo::tests::a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode";
 			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			/// A correct run takes milliseconds.
+			const BOUND: Duration = Duration::from_secs(60);
 			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
-				let output = std::process::Command::new(std::env::current_exe().unwrap())
+				let mut child = std::process::Command::new(std::env::current_exe().unwrap())
 					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
 					.env(ALONE, NAME)
-					.output()
+					.stdout(Stdio::piped())
+					.stderr(Stdio::piped())
+					.spawn()
 					.unwrap();
+				let start = Instant::now();
+				while child.try_wait().unwrap().is_none() {
+					if start.elapsed() > BOUND {
+						let _ = child.kill();
+						let _ = child.wait();
+						panic!(
+							"the run of its own did not end within {BOUND:?}: the helper's open of the \
+							 removed FIFO waits for a reader, so it did not open the path"
+						);
+					}
+					thread::sleep(Duration::from_millis(5));
+				}
+				let output = child.wait_with_output().unwrap();
 				let (out, err) =
 					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
