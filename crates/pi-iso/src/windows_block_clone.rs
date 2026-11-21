@@ -109,7 +109,11 @@ mod imp {
 		exclusions: &CloneExclusions,
 	) -> IsoResult<Vec<PathBuf>> {
 		let lower = tree::canonical_existing_dir(lower, "block-clone source", IsoError::other)?;
-		tree::prepare_destination(merged, "block clone", remove_path)?;
+		// An empty directory already there is filled in place: its caller may
+		// know it. Anything else is replaced.
+		if !tree::is_empty_dir(merged) {
+			tree::prepare_destination(merged, "block clone", remove_path)?;
+		}
 		let result = (|| {
 			fs::create_dir_all(merged)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;

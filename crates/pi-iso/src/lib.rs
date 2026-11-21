@@ -277,8 +277,10 @@ pub trait IsolationBackend: Send + Sync {
 
 	/// Clone `lower` into `merged` copy-on-write, leaving out what
 	/// `exclusions` names, its paths taken relative to `lower`. A `merged`
-	/// inside `lower` is not cloned into itself. Returns the directories,
-	/// relative to `lower`, that a marker of `exclusions` left out.
+	/// inside `lower` is not cloned into itself. An empty directory already at
+	/// `merged` is filled in place, so a caller can know the directory before
+	/// anything is written into it. Returns the directories, relative to
+	/// `lower`, that a marker of `exclusions` left out.
 	fn clone_tree(
 		&self,
 		_lower: &Path,

@@ -358,6 +358,11 @@ place of `git`; a command's own `--lock` keeps its own reason.
 A worktree add that fails removes its tree and its registration, as
 `git worktree add` does. While an add runs, its registration is locked
 (`locked initializing`, the lock git's own add holds), so `git worktree prune`
-leaves it alone. An add killed or terminated midway leaves that locked
-registration and its partial tree; the next worktree add in the same
-repository removes both first, so the same path can be added again.
+and `omp worktree clear` leave it alone. An add killed or terminated midway
+leaves that locked registration and its partial tree. Another add of the same
+path removes both first and says so, while both are still what the stopped add
+left: nobody changed or removed its lock and the directory is the one it made.
+Otherwise that add refuses and names the registration, as git refuses a
+registered path; adds of other paths never touch it. On a filesystem that
+cannot lock files, an add goes on without its add-in-progress marker, and a
+killed one is never removed by a later add.

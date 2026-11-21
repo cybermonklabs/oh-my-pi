@@ -142,6 +142,8 @@ pub struct VcsWorktreeAddOptions {
 pub struct VcsWorktreeAddResult {
 	pub cloned_with: Option<IsoBackendKind>,
 	pub clone_error: Option<String>,
+	/// What the add did besides the checkout, for the caller to show.
+	pub notes:       Vec<String>,
 }
 /// Commit author identity.
 #[napi(object)]
@@ -904,6 +906,7 @@ impl VcsGitRepo {
 			.map(|result| VcsWorktreeAddResult {
 				cloned_with: result.cloned_with.map(to_napi_kind),
 				clone_error: result.clone_error,
+				notes:       result.notes,
 			})
 		})
 	}
@@ -927,13 +930,17 @@ impl VcsGitRepo {
 		blocking("vcs.worktreePrune", self.inner.clone(), signal, |r| r.worktree_prune())
 	}
 
-	/// Remove what each worktree add that died before it finished left
-	/// behind; returns the trees removed.
+	/// Remove the registration an interrupted worktree add of `path` left,
+	/// with the tree it made, so `path` can be added again; returns a note for
+	/// each removal. Refuses a registration of `path` it cannot prove abandoned.
 	#[napi]
-	pub fn worktree_sweep_abandoned(&self, signal: Option<Unknown>) -> Promise<Vec<String>> {
-		blocking("vcs.worktreeSweepAbandoned", self.inner.clone(), signal, |r| {
-			r.worktree_sweep_abandoned()
-				.map(|trees| trees.iter().map(path_string).collect())
+	pub fn worktree_reclaim_abandoned(
+		&self,
+		path: String,
+		signal: Option<Unknown>,
+	) -> Promise<Vec<String>> {
+		blocking("vcs.worktreeReclaimAbandoned", self.inner.clone(), signal, move |r| {
+			r.worktree_reclaim_abandoned(Path::new(&path))
 		})
 	}
 

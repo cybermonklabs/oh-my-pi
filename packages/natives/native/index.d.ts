@@ -818,10 +818,11 @@ export declare class VcsGitRepo {
   /** Prune worktrees. */
   worktreePrune(signal?: unknown | undefined | null): Promise<undefined>
   /**
-   * Remove what each worktree add that died before it finished left
-   * behind; returns the trees removed.
+   * Remove the registration an interrupted worktree add of `path` left,
+   * with the tree it made, so `path` can be added again; returns a note for
+   * each removal. Refuses a registration of `path` it cannot prove abandoned.
    */
-  worktreeSweepAbandoned(signal?: unknown | undefined | null): Promise<Array<string>>
+  worktreeReclaimAbandoned(path: string, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent subjects. */
   logSubjects(count: number, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent one-line commits. */
@@ -4315,6 +4316,8 @@ export interface VcsWorktreeAddOptions {
 export interface VcsWorktreeAddResult {
   clonedWith?: IsoBackendKind
   cloneError?: string
+  /** What the add did besides the checkout, for the caller to show. */
+  notes: Array<string>
 }
 
 /** One worktree listing row. */

@@ -119,15 +119,14 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	const cwd = path.resolve(options.cwd ?? process.cwd());
 	const repository = vcs.requireGit(cwd);
-	// An add that died before it finished (a signal, a timeout's kill) left a
-	// registration that says so. Remove those first, so the same path can be
-	// added again; a tree that cannot be removed only warns.
-	try {
-		await repository.worktreeSweepAbandoned();
-	} catch (error) {
-		console.error(`warning: ${error instanceof Error ? error.message : String(error)}`);
-	}
 	const worktreePath = path.resolve(cwd, options.path);
+	// An add of this path that died before it finished (a signal, a timeout's
+	// kill) left a registration that says so. It goes first, with the tree it
+	// made, so the path can be added again; one it cannot prove abandoned is
+	// refused here, before any branch is made.
+	for (const note of await repository.worktreeReclaimAbandoned(worktreePath)) {
+		console.error(chalk.dim(`note: ${note}`));
+	}
 	try {
 		const stat = await fs.stat(worktreePath);
 		const nonEmpty = !stat.isDirectory() || (await fs.readdir(worktreePath)).length > 0;
@@ -186,6 +185,9 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
+	}
+	for (const note of result.notes) {
+		console.error(chalk.dim(`note: ${note}`));
 	}
 	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha);
 	process.stderr.write(hook.stdout);

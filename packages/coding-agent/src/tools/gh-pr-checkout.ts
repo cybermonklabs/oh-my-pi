@@ -520,6 +520,9 @@ export async function checkoutPullRequest(
 						error: result.cloneError,
 					});
 				}
+				for (const note of result.notes) {
+					logger.warn("worktree add", { path: finalWorktreePath, note });
+				}
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 

@@ -1,8 +1,9 @@
 //! A `worktree add` stopped by a signal before it finishes leaves a
 //! registration git reports as locked (`locked initializing`, what git's own
-//! add holds while it fills a tree), and the next add removes the partial tree
-//! and that registration. While the stopped add's process lives, other adds
-//! leave it alone.
+//! add holds while it fills a tree). An add of another path leaves it alone; an
+//! add of the same path removes the partial tree and that registration, while
+//! both are still what the stopped add left, and refuses otherwise. While the
+//! stopped add's process lives, an add of its path is refused.
 //!
 //! The add runs in a child process: this test binary run again with
 //! [`CHILD_SOURCE`] set, on the test [`interrupted_add_child`] alone.
@@ -203,8 +204,9 @@ fn registrations(source: &Path) -> usize {
 	fs::read_dir(source.join(".git/worktrees")).map_or(0, |entries| entries.count())
 }
 
-/// Stops an add midway, checks what git and another add see while it lives,
-/// ends it with `kill`, and checks that the next add removes what it left.
+/// Stops an add midway, checks what git and other adds see while it lives,
+/// ends it with `kill`, checks that an add of another path leaves what it
+/// left, and that an add of its path removes it and says so.
 fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 	let (temp, source, repo) = fixture(10_000, tracked);
 	if clone != "off" && !clone_works_on(temp.path()) {
@@ -216,30 +218,60 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 	stop_mid_add(&child, &target, 50);
 	let listed_while_adding = listed_block(&source, &target);
 
-	// While the add lives, another add leaves it alone.
+	// While the add lives, an add of another path leaves it alone, and an
+	// add of its path is refused.
 	let beside = temp.path().join("beside");
 	repo
 		.worktree_add(&beside, "HEAD", options(WorktreeClone::Off))
 		.unwrap();
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("still running"), "{refused}");
 	assert!(count_entries(&target) >= 50, "an add removed the tree of an add that is still running");
 
 	end_stopped(child, kill);
 	let partial = count_entries(&target);
 	let after_kill = listed_block(&source, &target);
 
-	// The next add removes the partial tree and its registration.
+	// An add of another path leaves what the stopped add left.
 	let next = temp.path().join("next");
 	repo
 		.worktree_add(&next, "HEAD", options(WorktreeClone::Off))
 		.unwrap();
-	assert!(
-		!target.exists(),
-		"the next add left the stopped add's partial tree ({partial} entries at {})",
-		target.display()
+	assert_eq!(
+		count_entries(&target),
+		partial,
+		"an add of another path changed the stopped add's tree"
 	);
-	assert_eq!(listed_block(&source, &target), None, "the next add left the stopped add registered");
-	assert_eq!(registrations(&source), 2, "registrations other than `beside` and `next` remain");
-	assert_eq!(fs::read_to_string(next.join("a.txt")).unwrap(), "tracked\n");
+	assert!(
+		listed_block(&source, &target).is_some(),
+		"an add of another path removed the registration"
+	);
+
+	// An add of the same path removes the partial tree and its registration.
+	let again = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_or_else(|err| {
+			panic!("adding {} again ({partial} entries left): {err}", target.display())
+		});
+	assert!(
+		again
+			.notes
+			.iter()
+			.any(|note| note.contains("removed the partial tree")),
+		"{:?}",
+		again.notes
+	);
+	assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "tracked\n");
+	assert_eq!(
+		registrations(&source),
+		3,
+		"registrations other than `beside`, `next` and the new add remain"
+	);
+	let block = listed_block(&source, &target).unwrap();
+	assert!(!block.contains("locked"), "the new add is locked:\n{block}");
 
 	// While it ran, git saw the add's registration locked as its own add
 	// locks one, and after the kill it still did, so `git worktree prune`
@@ -258,21 +290,100 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 }
 
 #[test]
-fn a_clone_killed_midway_is_removed_by_the_next_add() {
+fn a_clone_killed_midway_is_removed_by_an_add_of_its_path() {
 	interrupt_and_recover("auto", false, libc::SIGKILL);
 }
 
 #[test]
-fn a_clone_terminated_midway_is_removed_by_the_next_add() {
+fn a_clone_terminated_midway_is_removed_by_an_add_of_its_path() {
 	interrupt_and_recover("auto", false, libc::SIGTERM);
 }
 
 #[test]
-fn a_checkout_killed_midway_is_removed_by_the_next_add() {
+fn a_checkout_killed_midway_is_removed_by_an_add_of_its_path() {
 	interrupt_and_recover("off", true, libc::SIGKILL);
 }
 
 #[test]
-fn a_checkout_terminated_midway_is_removed_by_the_next_add() {
+fn a_checkout_terminated_midway_is_removed_by_an_add_of_its_path() {
 	interrupt_and_recover("off", true, libc::SIGTERM);
+}
+
+/// A checkout killed midway: the temp dir, the source, the repository and the
+/// partial tree.
+fn abandoned() -> (TempDir, PathBuf, GitRepo, PathBuf) {
+	let (temp, source, repo) = fixture(10_000, true);
+	let target = temp.path().join("interrupted");
+	let child = spawn_add(&source, &target, "off");
+	stop_mid_add(&child, &target, 50);
+	end_stopped(child, libc::SIGKILL);
+	(temp, source, repo, target)
+}
+
+/// The administrative directory of the registration that names `tree`.
+fn admin_of(source: &Path, tree: &Path) -> PathBuf {
+	let wanted = format!("{}\n", tree.join(".git").display());
+	fs::read_dir(source.join(".git/worktrees"))
+		.unwrap()
+		.map(|entry| entry.unwrap().path())
+		.find(|admin| fs::read_to_string(admin.join("gitdir")).is_ok_and(|back| back == wanted))
+		.unwrap_or_else(|| panic!("no registration names {}", tree.display()))
+}
+
+/// Someone unlocked the killed add's worktree and works in it: an add of the
+/// path refuses, naming the registration, and removes nothing.
+#[test]
+fn an_add_refuses_a_killed_adds_tree_someone_unlocked() {
+	let (_temp, source, repo, target) = abandoned();
+	git(&source, &["worktree", "unlock", target.to_str().unwrap()]);
+	fs::write(target.join("my-work.txt"), "written after the add was killed\n").unwrap();
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("lock was changed or removed"), "{refused}");
+	assert!(refused.contains(&admin_of(&source, &target).display().to_string()), "{refused}");
+	assert!(target.join("my-work.txt").is_file(), "the unlocked tree was removed");
+	assert!(listed_block(&source, &target).is_some(), "the unlocked registration was removed");
+}
+
+/// Someone removed the killed add's tree and made the directory again with
+/// work of their own: an add of the path refuses and removes nothing.
+#[test]
+fn an_add_refuses_a_directory_made_again_in_a_killed_adds_place() {
+	let (_temp, source, repo, target) = abandoned();
+	fs::remove_dir_all(&target).unwrap();
+	fs::create_dir(&target).unwrap();
+	fs::write(target.join("my-work.txt"), "a directory of someone else's\n").unwrap();
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("not the one that add made"), "{refused}");
+	assert!(target.join("my-work.txt").is_file(), "the directory made again was removed");
+	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
+}
+
+/// A killed add whose registration names its tree by a relative `gitdir`,
+/// as `git worktree repair` writes it under `worktree.useRelativePaths`, is
+/// resolved against the registration, not the working directory.
+#[test]
+fn an_add_reclaims_a_killed_add_whose_gitdir_is_relative() {
+	let (_temp, source, repo, target) = abandoned();
+	let admin = admin_of(&source, &target);
+	// `<temp>/source/.git/worktrees/<id>` to `<temp>/interrupted/.git`.
+	fs::write(admin.join("gitdir"), "../../../../interrupted/.git\n").unwrap();
+	let again = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_or_else(|err| panic!("adding {} again: {err}", target.display()));
+	assert!(!admin.join("omp-add-in-progress").exists());
+	assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "tracked\n");
+	assert!(
+		again
+			.notes
+			.iter()
+			.any(|note| note.contains("removed the partial tree")),
+		"{:?}",
+		again.notes
+	);
 }

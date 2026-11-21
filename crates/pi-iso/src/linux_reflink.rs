@@ -104,10 +104,17 @@ mod imp {
 		exclusions: &CloneExclusions,
 	) -> IsoResult<Vec<PathBuf>> {
 		let lower = tree::canonical_existing_dir(lower, "reflink source", IsoError::other)?;
-		tree::prepare_destination(merged, "reflink clone", tree::remove_existing)?;
+		// An empty directory already there is filled in place: its caller may
+		// know it by its inode. Anything else is replaced.
+		let fill_in_place = tree::is_empty_dir(merged);
+		if !fill_in_place {
+			tree::prepare_destination(merged, "reflink clone", tree::remove_existing)?;
+		}
 		let result = (|| {
-			fs::create_dir(merged)
-				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
+			if !fill_in_place {
+				fs::create_dir(merged)
+					.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
+			}
 			let marked = tree::copy_dir_contents(&lower, merged, exclusions, &Reflink)?;
 			Reflink.finish_dir(&lower, merged)?;
 			Ok(marked)

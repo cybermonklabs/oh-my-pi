@@ -791,3 +791,53 @@ fn keeping_changes_carries_what_git_reports_below_a_content_dot_git() {
 		"the ordinary checkout and the clone carried different files"
 	);
 }
+
+/// Keeping changes on the clone path never carries the nonrelocatable
+/// directories the clone prunes, ignored or not: a Python virtual environment
+/// (Python's `venv` writes no `.gitignore` before 3.13) and a build directory
+/// holding `CMakeCache.txt`, beside a directory the `.git` marker left out or
+/// inside it.
+#[test]
+fn keeping_changes_leaves_out_an_unignored_environment_and_build_directory() {
+	let (temp, source, repo) = fixture();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	write(&source, "venv/pyvenv.cfg", "home = /usr/bin\n");
+	write(&source, "venv/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n");
+	write(&source, "build/CMakeCache.txt", "CMAKE_HOME_DIRECTORY:INTERNAL=/elsewhere\n");
+	write(&source, "build/out.o", "object\n");
+	write(&source, "stray/.git", "gitdir: /nonexistent/admin\n");
+	write(&source, "stray/work.txt", "untracked beside a .git naming nothing\n");
+	write(&source, "stray/env/pyvenv.cfg", "home = /usr/bin\n");
+	write(&source, "stray/env/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n");
+	let status = git(&source, &["status", "--porcelain", "--untracked-files=all"]);
+	for line in
+		["?? venv/pyvenv.cfg", "?? build/out.o", "?? stray/work.txt", "?? stray/env/pyvenv.cfg"]
+	{
+		assert!(
+			status.lines().any(|reported| reported == line),
+			"fixture: git status lacks {line:?}:\n{status}"
+		);
+	}
+	let target = temp.path().join("target");
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: true,
+			lock:         None,
+		})
+		.unwrap();
+	assert!(result.cloned_with.is_some(), "{:?}", result.clone_error);
+	for left_out in ["venv", "build", "stray/env"] {
+		assert!(fs::symlink_metadata(target.join(left_out)).is_err(), "{left_out} was carried");
+	}
+	assert_eq!(
+		fs::read_to_string(target.join("stray/work.txt"))
+			.ok()
+			.as_deref(),
+		Some("untracked beside a .git naming nothing\n")
+	);
+}
