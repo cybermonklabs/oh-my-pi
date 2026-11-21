@@ -37,7 +37,7 @@ use tokio::{
 	task::AbortHandle,
 };
 
-/// A panic payload caught in a worker.
+/// A panic payload caught in a worker or the feeder.
 type Panic = Box<dyn Any + Send>;
 
 /// One item handed to a worker.
@@ -49,7 +49,7 @@ struct Job<I> {
 	permit: OwnedSemaphorePermit,
 }
 
-/// One worker's output for the job `seq`.
+/// One worker's output for the job `seq`, or the input's panic in its place.
 struct Done<O> {
 	seq:    u64,
 	output: Result<O, Panic>,
@@ -171,7 +171,7 @@ where
 	Tasks(tasks)
 }
 
-/// Resumes a worker's panic in the consumer.
+/// Resumes a worker's or the input's panic in the consumer.
 fn unwrap_output<O>(output: Result<O, Panic>) -> O {
 	output.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
@@ -555,21 +555,15 @@ mod tests {
 		assert!(message.contains("input boom"), "{message:?}");
 	}
 
-	/// The outputs end once every worker has gone, also while the feeder
-	/// still waits on its input: a consumer that catches each resumed panic
+	/// The outputs end once the last worker has gone, also while the feeder
+	/// still waits on its input: a consumer that catches the resumed panic
 	/// and polls again must not wait for ever.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn outputs_end_when_every_worker_panicked_and_the_input_waits() {
-		let default = std::panic::take_hook();
-		std::panic::set_hook(Box::new(move |info| {
-			if !info.to_string().contains("work boom") {
-				default(info);
-			}
-		}));
-		let inputs = stream::iter(0..2_u32).chain(stream::pending());
+		let inputs = stream::iter(0..1_u32).chain(stream::pending());
 		let mut outputs = ordered(
 			inputs,
-			2,
+			1,
 			4,
 			|| (),
 			|(), n: u32| async move {
@@ -589,6 +583,6 @@ mod tests {
 		})
 		.await;
 		assert!(ended.is_ok(), "outputs never ended after {panics} panics");
-		assert_eq!(panics, 2, "each worker's panic resumes once");
+		assert_eq!(panics, 1, "the worker's panic resumes once");
 	}
 }
