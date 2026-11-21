@@ -1282,3 +1282,25 @@ pub(crate) fn temp_root() -> PathBuf {
 		.filter(|dir| dir.is_dir())
 		.unwrap_or_else(std::env::temp_dir)
 }
+
+/// Runs the test `name` (its path in this crate) again in a process of its
+/// own, and fails when that run fails or runs no test: `true` here, `false`
+/// in that process, which runs the test's body. For a test that reads or
+/// sets what is the process's (the kernel fallbacks, the scratch pool, the
+/// umask), so no other test of the same process changes it meanwhile.
+#[cfg(test)]
+pub(crate) fn alone(name: &str) -> bool {
+	const ALONE: &str = "PI_VFS_TEST_ALONE";
+	if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+		return false;
+	}
+	let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+		.args(["--exact", name, "--nocapture", "--test-threads=1"])
+		.env(ALONE, name)
+		.output()
+		.expect("run the test in a process of its own");
+	let (out, err) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+	assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
+	assert!(out.contains("1 passed"), "{name} ran no test in a process of its own:\n{out}\n{err}");
+	true
+}

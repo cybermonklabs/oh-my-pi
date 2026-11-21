@@ -16,7 +16,25 @@ use std::{
 	},
 };
 
-use super::check_relative;
+use super::{check_relative, entry_name};
+
+/// An entry name is exactly one component on every platform: an empty name,
+/// `.`, `..` and a name with a separator are refused everywhere, and on
+/// Windows also a name with a drive prefix (`C:x`), which a join to a
+/// directory's path would turn into that drive's current directory.
+#[test]
+fn entry_names_are_exactly_one_component() {
+	use std::ffi::OsStr;
+	for name in ["", ".", "..", "a/b", "/a", "a/"] {
+		assert!(entry_name(OsStr::new(name)).is_err(), "{name:?}");
+	}
+	for name in ["a", "a b", ".a", "a.", "..a"] {
+		assert!(entry_name(OsStr::new(name)).is_ok(), "{name:?}");
+	}
+	for name in ["C:x", "C:", "d:victim", "a\\b", "\\\\?\\x", "\\a"] {
+		assert_eq!(entry_name(OsStr::new(name)).is_err(), cfg!(windows), "{name:?}");
+	}
+}
 
 /// A walk-relative path splits on `/`, and on Windows on `\` too, so a `..`
 /// hidden behind `\` is refused there; elsewhere `\` is part of a name.
@@ -376,10 +394,11 @@ mod unix {
 	}
 
 	/// `open_at` opens the entry as the options say and never through a
-	/// symlink; a file it creates gets the requested mode less the umask, or
-	/// exactly less the facade's creation mask.
+	/// symlink, and creates a file only once (the modes it creates with are
+	/// checked in
+	/// `creations_get_the_mode_less_the_umask_or_exactly_less_the_mask`).
 	#[test]
-	fn open_at_opens_no_symlink_and_creates_with_the_mode_asked() {
+	fn open_at_opens_no_symlink_and_creates_once() {
 		let tree = Tree::new("open-at");
 		let rt = runtime();
 		for (label, root) in tree.roots() {
@@ -398,7 +417,7 @@ mod unix {
 				assert!(refused(&err), "{label} {flavor}: opened through l: {err:?}");
 				let created = format!("new-{flavor}");
 				let mut create = OpenOptions::new();
-				create.write(true).create_new(true).mode(0o640);
+				create.write(true).create_new(true);
 				open(&created, &create).unwrap().write_all(b"made").unwrap();
 				assert_eq!(std::fs::read(tree.at(&created)).unwrap(), b"made", "{label} {flavor}");
 				let err = open(&created, &create).unwrap_err();
@@ -408,24 +427,15 @@ mod unix {
 			let err = root.open_at(n("f"), &OpenOptions::new()).unwrap_err();
 			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{label}: no access mode: {err:?}");
 		}
-		// The host's creation mask: exactly 0o666 less 0o007, which a process
-		// umask of 0o022 alone would not give.
-		let masked = Fs::native().with_creation_mask(Some(0o007)).blocking();
-		let root = masked.open_dir(tree.at(""), true).unwrap();
-		let mut create = OpenOptions::new();
-		create.write(true).create_new(true).mode(0o666);
-		drop(root.open_at(n("masked"), &create).unwrap());
-		let mode = std::fs::metadata(tree.at("masked")).unwrap().mode() & 0o777;
-		assert_eq!(mode, 0o660, "creation mask: {mode:o}");
 		assert!(
 			tree.provider.take().contains(&"open mem://t/f".to_owned()),
 			"the provider opened the joined path"
 		);
 	}
 
-	/// `create_dir_at` makes the directory with the mode asked, refuses an
-	/// existing entry, and gives exactly the mode less a facade's creation
-	/// mask.
+	/// `create_dir_at` makes the directory named and refuses an existing
+	/// entry (its modes: see
+	/// `creations_get_the_mode_less_the_umask_or_exactly_less_the_mask`).
 	#[test]
 	fn create_dir_at_makes_the_directory_named() {
 		let tree = Tree::new("create-dir-at");
@@ -437,17 +447,11 @@ mod unix {
 			for made in ["made-sync", "made-async"] {
 				let meta = std::fs::symlink_metadata(tree.at(made)).unwrap();
 				assert!(meta.is_dir(), "{label}: {made}");
-				assert_eq!(meta.mode() & 0o777, 0o750, "{label}: {made}");
 				std::fs::remove_dir(tree.at(made)).unwrap();
 			}
 			let err = root.create_dir_at(n("f"), None).unwrap_err();
 			assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{label}");
 		}
-		let masked = Fs::native().with_creation_mask(Some(0o077)).blocking();
-		let root = masked.open_dir(tree.at(""), true).unwrap();
-		root.create_dir_at(n("masked"), None).unwrap();
-		let mode = std::fs::metadata(tree.at("masked")).unwrap().mode() & 0o777;
-		assert_eq!(mode, 0o700, "creation mask: {mode:o}");
 		assert!(
 			tree
 				.provider
@@ -551,8 +555,9 @@ mod unix {
 	}
 
 	/// `set_permissions_at` changes the mode of the entry, through a symlink
-	/// only with `follow`; without, a symlink is refused and its target keeps
-	/// its mode.
+	/// only with `follow`; without, a regular file changes and a symlink's
+	/// target keeps its mode: Linux and providers refuse the link, macOS
+	/// changes the link itself.
 	#[test]
 	fn set_permissions_at_follows_a_symlink_only_when_asked() {
 		let tree = Tree::new("chmod-at");
@@ -566,14 +571,25 @@ mod unix {
 			rt.block_on(root.set_permissions_at_async(n("l"), Permissions::from_mode(0o640), true))
 				.unwrap();
 			assert_eq!(mode(), 0o640, "{label}: through l");
-			let err = root
-				.set_permissions_at(n("l"), Permissions::from_mode(0o604), false)
-				.unwrap_err();
-			assert_eq!(mode(), 0o640, "{label}: l followed without follow ({err:?})");
-			let err = rt
-				.block_on(root.set_permissions_at_async(n("l"), Permissions::from_mode(0o604), false))
-				.unwrap_err();
-			assert_eq!(mode(), 0o640, "{label}: l followed without follow ({err:?})");
+			root
+				.set_permissions_at(n("f"), Permissions::from_mode(0o604), false)
+				.unwrap();
+			assert_eq!(mode(), 0o604, "{label}: a regular file without follow");
+			rt.block_on(root.set_permissions_at_async(n("f"), Permissions::from_mode(0o640), false))
+				.unwrap();
+			assert_eq!(mode(), 0o640, "{label}: a regular file without follow");
+			let changes_links = cfg!(target_os = "macos") && label == "host";
+			let sync = root.set_permissions_at(n("l"), Permissions::from_mode(0o604), false);
+			assert_eq!(mode(), 0o640, "{label}: l followed without follow ({sync:?})");
+			let asynchronous = rt.block_on(root.set_permissions_at_async(
+				n("l"),
+				Permissions::from_mode(0o604),
+				false,
+			));
+			assert_eq!(mode(), 0o640, "{label}: l followed without follow ({asynchronous:?})");
+			for result in [sync, asynchronous] {
+				assert_eq!(result.is_ok(), changes_links, "{label}: {result:?}");
+			}
 		}
 		assert!(
 			tree
@@ -716,6 +732,10 @@ mod unix {
 			let f = out.records().iter().find(|r| out.name(r) == b"f").unwrap();
 			assert_eq!(f.size, Some(4), "{label}");
 			let again = BlockingFs::native().open_dir(tree.at("d"), true).unwrap();
+			again.list_into(Detail::Minimal, 0, &mut out).unwrap();
+			assert_eq!(names(&out), [("inner".to_owned(), FileType::File)], "{label}: cleared first");
+			root.list_into(Detail::Full, 0, &mut out).unwrap();
+			let again = BlockingFs::native().open_dir(tree.at("d"), true).unwrap();
 			rt.block_on(again.list_into_async(Detail::Minimal, 0, &mut out))
 				.unwrap();
 			assert_eq!(names(&out), [("inner".to_owned(), FileType::File)], "{label}: cleared first");
@@ -742,23 +762,41 @@ mod unix {
 	}
 
 	/// The portable component walk below a root, which kernels without
-	/// `openat2` get, reaches regular files and directories but no symlink on
-	/// the way, inside the root or out of it.
+	/// `openat2` get, reaches regular files and directories two levels down,
+	/// each opened relative to the one before it, but no symlink on the way,
+	/// inside the root or out of it.
 	#[test]
 	fn the_component_walk_follows_no_symlink() {
 		let tree = Tree::new("walk");
+		std::fs::create_dir_all(tree.at("a/b")).unwrap();
+		std::fs::write(tree.at("a/b/file.txt"), "deep").unwrap();
 		std::os::unix::fs::symlink(tree.outside(), tree.at("esc")).unwrap();
+		std::os::unix::fs::symlink(tree.outside(), tree.at("a/esc")).unwrap();
+		std::fs::create_dir_all(tree.outside().join("b")).unwrap();
+		std::fs::write(tree.outside().join("b/file.txt"), "outside").unwrap();
 		let root = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
 		let super::super::DirRepr::Host { handle, .. } = &root.repr else {
 			panic!("a host root");
 		};
 		let mut scratch = super::super::native::Scratch::default();
 		let walk = super::super::native::open_beneath_walking;
+		let file = walk(&mut scratch, handle, b"a/b/file.txt", false).unwrap();
+		let mut contents = String::new();
+		std::fs::File::from(file)
+			.read_to_string(&mut contents)
+			.unwrap();
+		assert_eq!(contents, "deep");
+		assert!(walk(&mut scratch, handle, b"a/b", true).is_ok());
 		assert!(walk(&mut scratch, handle, b"d/inner", false).is_ok());
-		assert!(walk(&mut scratch, handle, b"d", true).is_ok());
-		for (rel, dir) in
-			[("l", false), ("ld/inner", false), ("esc/secret", false), ("ld", true), ("esc", true)]
-		{
+		for (rel, dir) in [
+			("l", false),
+			("ld/inner", false),
+			("esc/secret", false),
+			("a/esc/b/file.txt", false),
+			("a/esc/b", true),
+			("ld", true),
+			("esc", true),
+		] {
 			let err = walk(&mut scratch, handle, rel.as_bytes(), dir).unwrap_err();
 			assert!(matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{rel}: {err:?}");
 		}
@@ -805,5 +843,378 @@ mod unix {
 		}
 		assert_eq!(pool.0.lock().len(), MAX_POOLED);
 		assert!(pool.take().warmth() >= 8);
+	}
+
+	/// The calls' own scratch goes back to the pool when its thread ends, and
+	/// the next thread's first call takes it: a walk on threads that did not
+	/// exist before it pays for no fresh listing buffer. In a process of its
+	/// own, so no other test's thread takes the scratch in between.
+	#[test]
+	fn with_scratch_gives_a_new_thread_the_scratch_an_ended_thread_left() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::with_scratch_gives_a_new_thread_the_scratch_an_ended_thread_left",
+		) {
+			return;
+		}
+		const WORDS: usize = 1 << 15;
+		std::thread::spawn(|| crate::dir_handle::with_scratch(|s| s.warm(WORDS)))
+			.join()
+			.unwrap();
+		let warmth = std::thread::spawn(|| crate::dir_handle::with_scratch(|s| s.warmth()))
+			.join()
+			.unwrap();
+		assert!(warmth >= WORDS, "the second thread's scratch is fresh: {warmth} words");
+	}
+
+	/// The process umask the creation test sets in its own process.
+	const UMASK: libc::mode_t = 0o022;
+
+	/// Creations get the mode asked less the process umask, and under a
+	/// facade's creation mask exactly the mode less the mask: the kernel
+	/// still applies the umask when it creates the entry, so the mode is set
+	/// again after the create. In a process of its own, whose umask this test
+	/// sets.
+	#[test]
+	fn creations_get_the_mode_less_the_umask_or_exactly_less_the_mask() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::creations_get_the_mode_less_the_umask_or_exactly_less_the_mask",
+		) {
+			return;
+		}
+		// SAFETY: `umask` has no preconditions; nothing else runs in this
+		// process.
+		unsafe { libc::umask(UMASK) };
+		let tree = Tree::new("modes");
+		let rt = runtime();
+		let mode = |rel: &str| std::fs::symlink_metadata(tree.at(rel)).unwrap().mode() & 0o777;
+		let mut create = OpenOptions::new();
+		create.write(true).create_new(true).mode(0o666);
+		for (label, root) in tree.roots() {
+			drop(root.open_at(n("file-sync"), &create).unwrap());
+			drop(
+				rt.block_on(root.open_at_async(n("file-async"), &create))
+					.unwrap(),
+			);
+			root.create_dir_at(n("dir-sync"), Some(0o777)).unwrap();
+			rt.block_on(root.create_dir_at_async(n("dir-async"), Some(0o777)))
+				.unwrap();
+			for (rel, want) in
+				[("file-sync", 0o644), ("file-async", 0o644), ("dir-sync", 0o755), ("dir-async", 0o755)]
+			{
+				assert_eq!(mode(rel), want, "{label}: {rel}: {:o}", mode(rel));
+			}
+			for rel in ["file-sync", "file-async"] {
+				std::fs::remove_file(tree.at(rel)).unwrap();
+			}
+			for rel in ["dir-sync", "dir-async"] {
+				std::fs::remove_dir(tree.at(rel)).unwrap();
+			}
+		}
+		// A mask of 0o007 keeps the group's write bit, which the umask
+		// clears: only the mode set again after the create gives 0o660 and
+		// 0o770.
+		let masked = Fs::native().with_creation_mask(Some(0o007));
+		let root = masked.blocking().open_dir(tree.at(""), true).unwrap();
+		drop(root.open_at(n("file-sync"), &create).unwrap());
+		drop(
+			rt.block_on(root.open_at_async(n("file-async"), &create))
+				.unwrap(),
+		);
+		root.create_dir_at(n("dir-sync"), Some(0o777)).unwrap();
+		rt.block_on(root.create_dir_at_async(n("dir-async"), None))
+			.unwrap();
+		for (rel, want) in
+			[("file-sync", 0o660), ("file-async", 0o660), ("dir-sync", 0o770), ("dir-async", 0o770)]
+		{
+			assert_eq!(mode(rel), want, "masked: {rel}: {:o}", mode(rel));
+		}
+	}
+
+	/// A masked `create_dir_at` sets the mode on the directory it made, never
+	/// through a symlink swapped in for it before the mode is set: the file
+	/// that symlink names keeps its mode.
+	#[test]
+	fn a_masked_create_dir_at_sets_no_mode_through_a_symlink_swapped_in() {
+		let tree = Tree::new("mkdir-swap");
+		std::fs::write(tree.at("secret"), "key").unwrap();
+		std::fs::set_permissions(tree.at("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+		let (made, secret) = (tree.at("raced"), tree.at("secret"));
+		super::super::native::after_create_dir(b"raced", move || {
+			std::fs::remove_dir(&made).unwrap();
+			std::os::unix::fs::symlink(&secret, &made).unwrap();
+		});
+		let masked = Fs::native().with_creation_mask(Some(0o022)).blocking();
+		let root = masked.open_dir(tree.at(""), true).unwrap();
+		let created = root.create_dir_at(n("raced"), Some(0o777));
+		let swapped = std::fs::symlink_metadata(tree.at("raced")).unwrap();
+		assert!(swapped.is_symlink(), "the swap did not run ({created:?})");
+		let mode = std::fs::metadata(tree.at("secret")).unwrap().mode() & 0o777;
+		assert_eq!(mode, 0o600, "the mode went through the swapped-in link: {mode:o} ({created:?})");
+	}
+
+	/// A provider rename names its destination through the destination
+	/// handle's facade: two handles from two facades cross devices, and
+	/// neither tree changes, though both facades serve the same paths.
+	#[test]
+	fn a_rename_between_two_provider_facades_crosses_devices() {
+		let (a, b) = (Tree::new("rename-a"), Tree::new("rename-b"));
+		let rt = runtime();
+		let a_root = a.provider_fs().open_dir("mem://t", true).unwrap();
+		let b_d = b.provider_fs().open_dir("mem://t/d", true).unwrap();
+		for flavor in ["sync", "async"] {
+			let result = match flavor {
+				"sync" => a_root.rename_at(n("f"), &b_d, n("moved")),
+				_ => rt.block_on(a_root.rename_at_async(n("f"), &b_d, n("moved"))),
+			};
+			let err = result.unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::CrossesDevices, "{flavor}: {err:?}");
+			assert!(a.at("f").exists() && b.at("f").exists(), "{flavor}: a source moved");
+			assert!(!a.at("d/moved").exists() && !b.at("d/moved").exists(), "{flavor}: moved");
+		}
+	}
+
+	/// `open_at` opens no directory: `O_DIRECTORY` in its custom flags is
+	/// refused, for a directory and for a symlink to one, so a directory is
+	/// opened only by `open_dir_at`, with its care for kernels that follow a
+	/// symlink despite `O_NOFOLLOW`.
+	#[test]
+	fn open_at_refuses_o_directory() {
+		let tree = Tree::new("open-at-dir");
+		let rt = runtime();
+		let root = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
+		let mut options = OpenOptions::new();
+		options.read(true).custom_flags(libc::O_DIRECTORY);
+		for name in ["d", "ld"] {
+			let sync = root.open_at(n(name), &options).map(drop);
+			let asynchronous = rt.block_on(root.open_at_async(n(name), &options)).map(drop);
+			for result in [sync, asynchronous] {
+				let err = result.unwrap_err();
+				assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err:?}");
+			}
+		}
+	}
+
+	/// Without `follow`, `set_permissions_at` changes a regular file also on a
+	/// glibc before 2.32, whose `fchmodat` refuses `AT_SYMLINK_NOFOLLOW` for
+	/// every file with `EOPNOTSUPP` (emulated here for this thread); a
+	/// symlink is still refused, and its target keeps its mode.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn set_permissions_at_without_follow_changes_a_regular_file_on_an_old_glibc() {
+		let tree = Tree::new("chmod-old-glibc");
+		let mode = || std::fs::metadata(tree.at("f")).unwrap().mode() & 0o777;
+		let root = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
+		let _old = super::super::native::emulate_old_glibc();
+		root
+			.set_permissions_at(n("f"), Permissions::from_mode(0o604), false)
+			.unwrap();
+		assert_eq!(mode(), 0o604);
+		let err = root
+			.set_permissions_at(n("l"), Permissions::from_mode(0o600), false)
+			.unwrap_err();
+		assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP), "{err:?}");
+		assert_eq!(mode(), 0o604, "the link's target changed");
+	}
+
+	/// A facade's descriptor overlays apply below its directory handles: with
+	/// an overlay at `root/m`, a handle on `root` names `m` through the
+	/// facade, so `open_at` reads the overlay's file, not the host entry at
+	/// that path.
+	#[test]
+	fn a_handle_above_a_descriptor_overlay_opens_the_overlay() {
+		let tree = Tree::new("overlay");
+		std::fs::write(tree.at("m"), "host").unwrap();
+		std::fs::write(tree.outside().join("pinned"), "overlay").unwrap();
+		let rt = runtime();
+		let mut read = OpenOptions::new();
+		read.read(true);
+		for flavor in ["sync", "async"] {
+			// A mounted file keeps one offset for every open of it, so each
+			// flavor mounts its own.
+			let pinned = File::from(std::fs::File::open(tree.outside().join("pinned")).unwrap());
+			let fs = Fs::native().mount_file(tree.at("m"), pinned);
+			let root = match flavor {
+				"sync" => fs.blocking().open_dir(tree.at(""), true),
+				_ => rt.block_on(fs.open_dir(tree.at(""), true)),
+			}
+			.unwrap();
+			let file = root.open_at(n("m"), &read).unwrap();
+			let mut contents = String::new();
+			(&file).read_to_string(&mut contents).unwrap();
+			assert_eq!(contents, "overlay", "{flavor}: the host entry was opened");
+		}
+	}
+
+	/// Makes a FIFO at `path`.
+	fn mkfifo(path: &Path) {
+		use std::os::unix::ffi::OsStrExt;
+		let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+		// SAFETY: `path` is NUL-terminated.
+		assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+	}
+
+	/// Runs `body` on a thread of its own and fails when it has not ended
+	/// within [`HANG`]. A correct run ends in milliseconds: the bound only
+	/// turns a hang into a failure, after `release` frees the thread.
+	fn ends(what: &str, body: impl FnOnce() + Send + 'static, release: impl FnOnce()) {
+		const HANG: Duration = Duration::from_secs(60);
+		let (done, ended) = std::sync::mpsc::channel();
+		let thread = std::thread::spawn(move || {
+			body();
+			let _ = done.send(());
+		});
+		match ended.recv_timeout(HANG) {
+			Ok(()) => thread.join().unwrap(),
+			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				std::panic::resume_unwind(thread.join().unwrap_err());
+			},
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+				release();
+				panic!("{what}: still waiting after {HANG:?}");
+			},
+		}
+	}
+
+	/// Releases an open of `fifo`'s read end waiting for a writer.
+	fn release_reader(fifo: &Path) {
+		use std::os::unix::fs::OpenOptionsExt;
+		let _ = std::fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(fifo);
+	}
+
+	/// `open_at_async` of a FIFO waits for its other end off the runtime's
+	/// worker: on a current-thread runtime, the other end, opened by a task
+	/// of the same runtime, connects.
+	#[test]
+	fn open_at_async_of_a_fifo_leaves_the_runtime_free_for_its_other_end() {
+		let tree = Tree::new("fifo-open");
+		mkfifo(&tree.at("p"));
+		let reader = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
+		let writer = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
+		let fifo = tree.at("p");
+		ends(
+			"the FIFO's read end",
+			move || {
+				runtime().block_on(async move {
+					let other = tokio::spawn(async move {
+						let mut write = OpenOptions::new();
+						write.write(true);
+						writer.open_at_async(n("p"), &write).await.map(drop)
+					});
+					let mut read = OpenOptions::new();
+					read.read(true);
+					let file = reader.open_at_async(n("p"), &read).await.unwrap();
+					other.await.unwrap().unwrap();
+					drop(file);
+				});
+			},
+			|| release_reader(&fifo),
+		);
+	}
+
+	/// Under a cancellable facade, `open_at_async` of a FIFO with no other end
+	/// ends at the token with the facade's cancellation error.
+	#[test]
+	fn open_at_async_of_a_fifo_ends_at_the_token() {
+		let tree = Tree::new("fifo-token");
+		mkfifo(&tree.at("p"));
+		let token = tokio_util::sync::CancellationToken::new();
+		let fs = Fs::native().with_cancellation(token.clone());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let fifo = tree.at("p");
+		ends(
+			"the FIFO's read end under a token",
+			move || {
+				runtime().block_on(async move {
+					let mut read = OpenOptions::new();
+					read.read(true);
+					let cancel = async {
+						tokio::task::yield_now().await;
+						token.cancel();
+					};
+					let (opened, ()) = tokio::join!(root.open_at_async(n("p"), &read), cancel);
+					let err = opened.map(drop).unwrap_err();
+					assert!(crate::error::is_cancelled(&err), "{err:?}");
+				});
+			},
+			|| release_reader(&fifo),
+		);
+	}
+}
+
+#[cfg(windows)]
+mod windows {
+	use std::{ffi::OsStr, io, path::PathBuf};
+
+	use crate::{BlockingFs, OpenOptions};
+
+	/// A fresh directory below [`super::super::temp_root`], named for `tag`.
+	fn temp(tag: &str) -> PathBuf {
+		let path = super::super::temp_root().join(format!("pi-vfs-dh-{tag}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&path);
+		std::fs::create_dir_all(&path).unwrap();
+		path
+	}
+
+	fn create() -> OpenOptions {
+		let mut options = OpenOptions::new();
+		options.write(true).create(true).truncate(true);
+		options
+	}
+
+	/// A drive-relative name (`C:x`) is no entry name: every call refuses
+	/// it, and nothing is made in that drive's current directory.
+	#[test]
+	fn a_drive_relative_name_is_refused() {
+		let dir = temp("drive");
+		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
+		let victim = format!("pi-vfs-victim-{}", std::process::id());
+		let names = [format!("C:{victim}"), format!("c:{victim}"), "C:".to_owned()];
+		for name in &names {
+			let name = OsStr::new(name);
+			let opened = root.open_at(name, &create()).map(drop);
+			let made = root.create_dir_at(name, None);
+			let stat = root.stat_at(name, false).map(drop);
+			for (call, result) in [("open_at", opened), ("create_dir_at", made), ("stat_at", stat)] {
+				let err = result.unwrap_err();
+				assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{call}({name:?}): {err:?}");
+			}
+		}
+		let cwd = std::path::Path::new("C:")
+			.canonicalize()
+			.unwrap()
+			.join(&victim);
+		let leaked = cwd.exists();
+		let _ = std::fs::remove_file(&cwd);
+		let _ = std::fs::remove_dir(&cwd);
+		assert!(!leaked, "{} was made in C:'s current directory", cwd.display());
+	}
+
+	/// A handle on a reparse point (a directory symlink opened by
+	/// `open_dir_at`, which opens the link itself) makes no path-based call
+	/// through it: a creation there is refused, and nothing appears in the
+	/// link's target.
+	#[test]
+	fn a_handle_on_a_reparse_point_makes_nothing_through_it() {
+		let (dir, outside) = (temp("reparse"), temp("reparse-outside"));
+		if let Err(err) = std::os::windows::fs::symlink_dir(&outside, dir.join("d")) {
+			eprintln!("UNKNOWN: no directory symlink could be made here ({err}); nothing was checked");
+			return;
+		}
+		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
+		let d = match root.open_dir_at(OsStr::new("d")) {
+			Ok(d) => d,
+			Err(err) => {
+				eprintln!("open_dir_at refused the link itself ({err:?}): nothing to call through");
+				return;
+			},
+		};
+		let made = d.create_dir_at(OsStr::new("x"), None);
+		let opened = d.open_at(OsStr::new("f"), &create()).map(drop);
+		assert!(!outside.join("x").exists(), "create_dir_at made x in the link's target ({made:?})");
+		assert!(!outside.join("f").exists(), "open_at made f in the link's target ({opened:?})");
+		assert!(made.is_err() && opened.is_err(), "{made:?} {opened:?}");
 	}
 }

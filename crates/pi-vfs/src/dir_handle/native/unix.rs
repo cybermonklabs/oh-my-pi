@@ -510,11 +510,15 @@ pub(crate) fn create_dir_at(
 	mode: Option<u32>,
 	mask: Option<u32>,
 ) -> io::Result<()> {
+	#[cfg(test)]
+	let entry = name;
 	let name = s.cstr(name)?;
 	let requested = mode.unwrap_or(0o777);
 	let mode = mask.map_or(requested, |mask| requested & !mask);
 	// SAFETY: `name` is NUL-terminated.
 	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, mode as libc::mode_t) })?;
+	#[cfg(test)]
+	seams::fire_after_create_dir(entry);
 	if mask.is_some() {
 		// SAFETY: as above; the directory was just made, so `name` is one.
 		let _ = retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode as libc::mode_t, 0) });
@@ -607,6 +611,10 @@ pub(crate) fn set_permissions_at(
 ) -> io::Result<()> {
 	let name = s.cstr(name)?;
 	let mode = permissions.mode() as libc::mode_t;
+	#[cfg(all(test, target_os = "linux"))]
+	if !follow && seams::old_glibc() {
+		return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+	}
 	// SAFETY: `name` is NUL-terminated.
 	retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode, follow_flag(follow)) })
 }
@@ -644,4 +652,67 @@ pub(crate) fn chown_at(
 	let gid = gid.map_or(libc::gid_t::MAX, |gid| gid as libc::gid_t);
 	// SAFETY: `name` is NUL-terminated.
 	retry(|| unsafe { libc::fchownat(dir.as_raw_fd(), name, uid, gid, follow_flag(follow)) })
+}
+
+#[cfg(test)]
+pub(crate) use seams::after_create_dir;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use seams::emulate_old_glibc;
+
+/// Test seams: a hook between a call's steps, so a test can swap an entry
+/// exactly there, and an emulated glibc.
+#[cfg(test)]
+mod seams {
+	use parking_lot::Mutex;
+
+	type Hook = Box<dyn FnOnce() + Send>;
+
+	/// Hooks by entry name.
+	static AFTER_CREATE_DIR: Mutex<Vec<(Vec<u8>, Hook)>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` once, just after `create_dir_at` made an entry `name`,
+	/// before it sets the mode.
+	pub(crate) fn after_create_dir(name: &[u8], hook: impl FnOnce() + Send + 'static) {
+		AFTER_CREATE_DIR.lock().push((name.to_vec(), Box::new(hook)));
+	}
+
+	pub(super) fn fire_after_create_dir(name: &[u8]) {
+		let hook = {
+			let mut hooks = AFTER_CREATE_DIR.lock();
+			let found = hooks.iter().position(|(hooked, _)| hooked == name);
+			found.map(|index| hooks.swap_remove(index).1)
+		};
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	thread_local! {
+		static OLD_GLIBC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+
+	/// While the returned guard lives, this thread's `fchmodat` with
+	/// `AT_SYMLINK_NOFOLLOW` fails with `EOPNOTSUPP` for every file, as glibc
+	/// before 2.32 has it.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn emulate_old_glibc() -> OldGlibc {
+		OLD_GLIBC.set(true);
+		OldGlibc
+	}
+
+	#[cfg(target_os = "linux")]
+	pub(crate) struct OldGlibc;
+
+	#[cfg(target_os = "linux")]
+	impl Drop for OldGlibc {
+		fn drop(&mut self) {
+			OLD_GLIBC.set(false);
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	pub(super) fn old_glibc() -> bool {
+		OLD_GLIBC.get()
+	}
 }
