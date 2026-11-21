@@ -453,8 +453,12 @@ export interface AcpAgentOptions {
 	/**
 	 * Whether this run keeps its sessions in the session store; false under
 	 * `--no-session`. Without it the agent neither advertises nor serves
-	 * `session/load`, `session/resume` and `session/fork`, which read a stored
-	 * session, and refuses them naming `--no-session`. Defaults to true.
+	 * `session/list`, `session/load`, `session/resume` and `session/fork`, and
+	 * refuses each with -32601 naming `--no-session`, before it reads the store:
+	 * no session such a run lists or opens could be one it can serve. The
+	 * refusal covers a session of this run too: a `session/load` or
+	 * `session/resume` of a session `session/new` made earlier on the same
+	 * connection is refused as well. Defaults to true.
 	 */
 	persistSessions?: boolean;
 }
@@ -1082,10 +1086,8 @@ export class AcpAgent implements Agent {
 					image: true,
 				},
 				// Without persistence a session lives only in this process: there is no
-				// stored session to load, resume or fork (see AcpAgentOptions).
-				sessionCapabilities: this.#persistSessions
-					? { list: {}, fork: {}, resume: {}, close: {} }
-					: { list: {}, close: {} },
+				// stored session to list, load, resume or fork (see AcpAgentOptions).
+				sessionCapabilities: this.#persistSessions ? { list: {}, fork: {}, resume: {}, close: {} } : { close: {} },
 			},
 			// Top-level `_meta` (sibling of `agentCapabilities`) is where
 			// claude-agent-acp and codex-acp advertise steering; clients such as
@@ -1134,6 +1136,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+		this.#assertPersistedSessions("session/list");
 		if (params.cwd) {
 			this.#assertAbsoluteCwd(params.cwd);
 		}
@@ -2389,13 +2392,16 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	/** Refuses `method`, which reads a stored session, when this run keeps none (`--no-session`). */
+	/**
+	 * Refuses `method` when this run keeps no sessions (`--no-session`), with
+	 * -32601 ("not available"), whether the session it names is stored or live
+	 * in this process.
+	 */
 	#assertPersistedSessions(method: string): void {
 		if (this.#persistSessions) return;
-		throw RequestError.invalidRequest(
-			{ method },
-			`${method} requires session persistence; omp was started with --no-session`,
-		);
+		throw new RequestError(-32601, `${method} requires session persistence; omp was started with --no-session`, {
+			method,
+		});
 	}
 
 	#convertPromptBlocks(blocks: PromptRequest["prompt"]): { text: string; images: AgentImageContent[] } {

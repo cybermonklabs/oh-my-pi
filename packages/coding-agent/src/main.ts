@@ -594,8 +594,8 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		// --no-session keeps every session in memory, as the launch's own session does
-		// (createSessionManager): a session/new writes nothing to the store. session/load,
-		// session/resume and session/fork read a stored session, so the agent neither
+		// (createSessionManager): a session/new writes nothing to the store. session/list,
+		// session/load, session/resume and session/fork read the store, so the agent neither
 		// advertises nor serves them then (runAcpMode's persistSessions: false, below).
 		const nextSessionManager = args.parsedArgs.noSession
 			? SessionManager.inMemory(cwd)

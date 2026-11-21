@@ -670,30 +670,34 @@ describe("ACP agent without session persistence (--no-session)", () => {
 		return stored;
 	}
 
+	/** The refusal's code and message, or "(it succeeded)". */
 	async function refusal(promise: Promise<unknown>): Promise<string> {
 		try {
 			await promise;
 			return "(it succeeded)";
 		} catch (err) {
-			return err instanceof Error ? err.message : String(err);
+			const code = (err as { code?: unknown }).code;
+			return `${String(code)} ${err instanceof Error ? err.message : String(err)}`;
 		}
 	}
 
-	it("refuses session/load, session/resume and session/fork of a stored session, naming --no-session, and still serves session/new", async () => {
+	it("refuses session/list, session/load, session/resume and session/fork with -32601, naming --no-session, and still serves session/new", async () => {
 		const harness = await createHarness({ agentOptions: { persistSessions: false }, inMemorySessions: true });
 		const stored = await storedSession(harness.cwdA);
 		const before = harness.sessions.length;
 		const request = { sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] };
 
 		const messages = {
+			"session/list": await refusal(harness.agent.listSessions({ cwd: harness.cwdA })),
 			"session/load": await refusal(harness.agent.loadSession(request)),
 			"session/resume": await refusal(harness.agent.resumeSession(request)),
 			"session/fork": await refusal(harness.agent.unstable_forkSession(request)),
 		};
 
 		const refused = (method: string) =>
-			`Invalid request: ${method} requires session persistence; omp was started with --no-session`;
+			`-32601 ${method} requires session persistence; omp was started with --no-session`;
 		expect(messages).toEqual({
+			"session/list": refused("session/list"),
 			"session/load": refused("session/load"),
 			"session/resume": refused("session/resume"),
 			"session/fork": refused("session/fork"),
@@ -702,17 +706,23 @@ describe("ACP agent without session persistence (--no-session)", () => {
 		expect(harness.sessions.length).toBe(before);
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		expect(harness.findSession(created.sessionId)?.sessionManager.getSessionFile()).toBeUndefined();
+		// A session of this run is refused too, not only a stored one.
+		const live = { sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] };
+		expect({
+			"session/load": await refusal(harness.agent.loadSession(live)),
+			"session/resume": await refusal(harness.agent.resumeSession(live)),
+		}).toEqual({ "session/load": refused("session/load"), "session/resume": refused("session/resume") });
 		await harness.agent.dispose();
 	});
 
-	it("advertises session/load, resume and fork only when sessions persist", async () => {
+	it("advertises session/list, load, resume and fork only when sessions persist", async () => {
 		const without = await createHarness({ agentOptions: { persistSessions: false }, inMemorySessions: true });
 		const off = await without.agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
 		expect(off.agentCapabilities?.loadSession).toBe(false);
-		expect(off.agentCapabilities?.sessionCapabilities).toEqual({ list: {}, close: {} });
+		expect(off.agentCapabilities?.sessionCapabilities).toEqual({ close: {} });
 		await without.agent.dispose();
 
-		// Control: a run that keeps its sessions advertises all three.
+		// Control: a run that keeps its sessions advertises all four.
 		const withPersistence = await createHarness();
 		const on = await withPersistence.agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
 		expect(on.agentCapabilities?.loadSession).toBe(true);

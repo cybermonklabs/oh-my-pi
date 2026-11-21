@@ -2,15 +2,14 @@
  * `omp --mode acp --no-session`: a `session/new` keeps its session in memory, as
  * the launch's own session does under `--no-session`, so it opens and writes
  * nothing in the configured session store; and the agent neither advertises nor
- * serves `session/load`, `session/resume` and `session/fork`, which read a stored
- * session, so they open nothing either. (`session/list` still reads the store:
- * that read is the store's first use.) The launch runs through `runRootCommand`,
- * so the start-up's store resolution, the arguments the ACP session factory
- * receives and the options the ACP server gets are the CLI's own. `runAcpMode`
- * stands in for the ACP server: it makes sessions through the factory as
- * `session/new` does (acp-agent.ts, `#createNewSessionRecord`: the factory, then
- * `ensureOnDisk()`), or serves requests through an `AcpAgent` built with the
- * options it was given.
+ * serves `session/list`, `session/load`, `session/resume` and `session/fork`,
+ * which read the store, so they open nothing either. The launch runs through
+ * `runRootCommand`, so the start-up's store resolution, the arguments the ACP
+ * session factory receives and the options the ACP server gets are the CLI's
+ * own. `runAcpMode` stands in for the ACP server: it makes sessions through the
+ * factory as `session/new` does (acp-agent.ts, `#createNewSessionRecord`: the
+ * factory, then `ensureOnDisk()`), or serves requests through an `AcpAgent`
+ * built with the options it was given.
  */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
@@ -199,25 +198,30 @@ describe("omp --mode acp under session.storage: sql", () => {
 		expect(sqliteSessionRows(databasePath, created.sessionId ?? "")).toBe(1);
 	}, 30_000);
 
-	it("--no-session: the agent advertises no session/load, resume or fork, and refuses each, naming --no-session, without opening the store", async () => {
+	it("--no-session: the agent advertises only session/close, and refuses session/list, load, resume and fork with -32601, naming --no-session, without opening the store", async () => {
 		const dir = TempDir.createSync("@omp-acp-no-session-refuse-");
 		tempDirs.push(dir);
 		const databasePath = dir.join("sessions.db");
 		const refusals: Record<string, string | undefined> = {};
+		const refusal = async (promise: Promise<unknown>): Promise<string | undefined> => {
+			const error = await rejection(promise);
+			return error && `${String((error as { code?: unknown }).code)} ${error.message}`;
+		};
 		let capabilities: unknown;
 		await serveAcp(dir, `sqlite://${databasePath}`, ["--no-session"], async (createAcpSession, options) => {
 			const agent = acpAgent(createAcpSession, options);
 			capabilities = (await agent.initialize({ protocolVersion: 1, clientCapabilities: {} })).agentCapabilities;
 			const request = { sessionId: "0196f0d2-6b1e-7c4a-9f3e-2d5a8b7c6e41", cwd: dir.path(), mcpServers: [] };
-			refusals["session/load"] = (await rejection(agent.loadSession(request)))?.message;
-			refusals["session/resume"] = (await rejection(agent.resumeSession(request)))?.message;
-			refusals["session/fork"] = (await rejection(agent.unstable_forkSession(request)))?.message;
+			refusals["session/list"] = await refusal(agent.listSessions({ cwd: dir.path() }));
+			refusals["session/load"] = await refusal(agent.loadSession(request));
+			refusals["session/resume"] = await refusal(agent.resumeSession(request));
+			refusals["session/fork"] = await refusal(agent.unstable_forkSession(request));
 			await agent.dispose();
 		});
 
 		const caps = capabilities as { loadSession?: boolean; sessionCapabilities?: Record<string, unknown> } | undefined;
 		const refused = (method: string) =>
-			`Invalid request: ${method} requires session persistence; omp was started with --no-session`;
+			`-32601 ${method} requires session persistence; omp was started with --no-session`;
 		// One expectation, so a failing run shows every part of the answer at once.
 		expect({
 			loadSession: caps?.loadSession,
@@ -226,8 +230,9 @@ describe("omp --mode acp under session.storage: sql", () => {
 			tables: sqliteTables(databasePath),
 		}).toEqual({
 			loadSession: false,
-			sessionCapabilities: ["close", "list"],
+			sessionCapabilities: ["close"],
 			refusals: {
+				"session/list": refused("session/list"),
 				"session/load": refused("session/load"),
 				"session/resume": refused("session/resume"),
 				"session/fork": refused("session/fork"),
