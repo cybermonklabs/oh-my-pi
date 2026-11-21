@@ -9,6 +9,8 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+import * as openModule from "@oh-my-pi/pi-coding-agent/utils/open";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 // Regression coverage for #12238: when the session store keeps failing, the
@@ -135,6 +137,70 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 		expect(mode.isShuttingDown).toBe(false);
 		expect(mode.teardownFailed).toBe(true);
 		expect(await Bun.file(sessionDir).text()).toBe(BLOCKER);
+	});
+
+	it("after a failed close, /export writes the whole session and /dump finds it", async () => {
+		// The TUI stays open after a failed close, so its user can still save the session the store
+		// did not take: the close must keep the conversation in memory.
+		session.agent.replaceMessages([
+			{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() },
+			{
+				role: "assistant",
+				provider: "anthropic",
+				model: "claude-3-7-sonnet",
+				content: [{ type: "text", text: "yo" }],
+				stopReason: "stop",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				},
+				api: "anthropic-messages",
+				timestamp: Date.now(),
+			},
+		]);
+		const ids = sessionManager.getEntries().map(entry => entry.id);
+		expect(ids.length).toBeGreaterThanOrEqual(2);
+		await mode.shutdown();
+		expect(mode.teardownFailed).toBe(true);
+
+		vi.spyOn(openModule, "openPath").mockImplementation(() => {});
+		const statusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+		const output = path.join(tempDir.path(), "exported.html");
+		const errorsBefore = showErrorSpy.mock.calls.length;
+		// The bundled viewer, as a release has it: a source checkout's development viewer is not built
+		// here (export-subsessions.test.ts runs its export the same way).
+		const bundled = process.env.PI_BUNDLED;
+		process.env.PI_BUNDLED = "1";
+		try {
+			await mode.handleExportCommand(`/export ${output}`);
+		} finally {
+			if (bundled === undefined) delete process.env.PI_BUNDLED;
+			else process.env.PI_BUNDLED = bundled;
+		}
+		expect(showErrorSpy.mock.calls.slice(errorsBefore).map((call: unknown[]) => String(call[0]))).toEqual([]);
+		expect(statusSpy.mock.calls.map((call: unknown[]) => String(call[0]))).toContain(
+			`Session exported to: ${output}`,
+		);
+		const html = await Bun.file(output).text();
+		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+		expect(encoded).toBeDefined();
+		const exported = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8")) as {
+			entries: Array<{ id: string }>;
+		};
+		expect(exported.entries.map(entry => entry.id).slice(0, ids.length)).toEqual(ids);
+
+		const copy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+		await mode.handleDumpCommand();
+		const errors = showErrorSpy.mock.calls.map((call: unknown[]) => String(call[0]));
+		expect(errors).not.toContain("No messages to dump yet.");
+		expect(copy).toHaveBeenCalledTimes(1);
+		const dumped = String(copy.mock.calls[0]?.[0]);
+		expect(dumped).toContain("hi");
+		expect(dumped).toContain("yo");
 	});
 
 	it("exits without writing the session log on the second attempt", async () => {

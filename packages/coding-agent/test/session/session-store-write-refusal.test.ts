@@ -93,8 +93,11 @@ const cases: Array<[string, unknown, Kind]> = [
 		"outage",
 	],
 	[
-		"PgBouncer 1.24 or later, after a server login that failed (08P01)",
-		pgServerError("08P01", "server login has been failing, cached error: login failed (server_login_retry)"),
+		"PgBouncer 1.24 or later, after a server login the server rejected: a wrong password (08P01)",
+		pgServerError(
+			"08P01",
+			'server login has been failing, cached error: password authentication failed for user "app" (server_login_retry)',
+		),
 		"outage",
 	],
 	[

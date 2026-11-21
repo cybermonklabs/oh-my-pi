@@ -73,6 +73,13 @@ export interface AgentSessionDisposeOptions {
 	 * interrupted, so `omp --restore` goes on with it.
 	 */
 	reason?: postmortem.Reason;
+	/**
+	 * When the final close fails, keep the conversation in memory (the agent's messages and the session
+	 * manager's entries) instead of releasing it. The interactive mode sets it: after a failed teardown it
+	 * stays open, so its user can still `/export` or `/dump` the session the store did not take. Every
+	 * other caller releases it, as after a close that lands.
+	 */
+	keepTranscriptAfterFailedClose?: boolean;
 }
 
 /** Listener notified when command metadata changes. */

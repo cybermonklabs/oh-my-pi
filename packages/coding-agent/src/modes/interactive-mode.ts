@@ -2483,9 +2483,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
+				// A failed close leaves the TUI open (#handleTeardownError): keep the
+				// conversation in memory so `/export` and `/dump` still have it.
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 					reason,
+					keepTranscriptAfterFailedClose: true,
 				});
 			},
 		});
@@ -8466,6 +8469,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			} else {
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+					keepTranscriptAfterFailedClose: true,
 				});
 			}
 		} finally {

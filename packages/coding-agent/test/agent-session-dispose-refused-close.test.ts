@@ -3,7 +3,8 @@
  * close that lands drops, then rejects with the close's error: the agent's copy of the transcript, the
  * session manager's entries unless the manager holds them for a later send (a close the store refused
  * for an outage, SessionManager.holdsTranscript), and the account pools. A handler that outlives the drain
- * deadline is reset again once it settles, by the same deferred pass as after a close that lands.
+ * deadline is reset again once it settles, by the same deferred pass as after a close that lands. A caller
+ * that stays open after a failed close (the interactive mode) keeps both copies instead.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
@@ -202,7 +203,8 @@ describe("AgentSession dispose when the final close fails", () => {
 		}).toEqual({ holds: true, agent: 0, manager: held });
 	});
 
-	it("a failed close lifts the session's account pool", async () => {
+	/** A pool scope restricting {@link PROVIDER_SESSION_ID} to account c, of three stored accounts. */
+	async function pooledScope(): Promise<SessionAccountPoolScope> {
 		await authStorage.credentials.set(
 			"anthropic",
 			["a", "b", "c"].map(suffix => ({
@@ -215,16 +217,72 @@ describe("AgentSession dispose when the final close fails", () => {
 				orgId: `org-${suffix}`,
 			})),
 		);
-		const accountPoolScope = new SessionAccountPoolScope(
+		return new SessionAccountPoolScope(
 			authStorage,
 			{ anthropic: ["email:c@example.com|org:org-c"] },
 			PROVIDER_SESSION_ID,
 		);
+	}
+
+	it("a failed close lifts the session's account pool", async () => {
+		const accountPoolScope = await pooledScope();
 		const { session } = await refusedSession("EACCES", { accountPoolScope });
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("access-c");
 
 		await expect(session.dispose()).rejects.toThrow("EACCES");
 
 		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
+	});
+
+	it("a caller that stays open after a failed close keeps both copies (keepTranscriptAfterFailedClose)", async () => {
+		const { session } = await refusedSession("EACCES");
+		const held = heldIds(session.sessionManager);
+
+		await expect(session.dispose({ keepTranscriptAfterFailedClose: true })).rejects.toThrow("EACCES");
+
+		expect({
+			holds: session.sessionManager.holdsTranscript(),
+			agent: session.agent.state.messages.length,
+			manager: heldIds(session.sessionManager).slice(0, held.length),
+		}).toEqual({ holds: false, agent: 3, manager: held });
+	});
+
+	it("with keepTranscriptAfterFailedClose, the deferred pass keeps both copies too and lifts the pool", async () => {
+		const accountPoolScope = await pooledScope();
+		const stall = Promise.withResolvers<void>();
+		const { session } = await refusedSession("EACCES", { stallUntil: stall.promise, accountPoolScope });
+		const lifted = Promise.withResolvers<void>();
+		const release = accountPoolScope.release.bind(accountPoolScope);
+		vi.spyOn(accountPoolScope, "release").mockImplementation(() => {
+			release();
+			lifted.resolve();
+		});
+		const held = heldIds(session.sessionManager);
+
+		try {
+			await expect(session.dispose({ drainTimeoutMs: 20, keepTranscriptAfterFailedClose: true })).rejects.toThrow(
+				"EACCES",
+			);
+		} finally {
+			stall.resolve();
+		}
+		await lifted.promise;
+		expect(await authStorage.keys.get("anthropic", PROVIDER_SESSION_ID)).toBe("runtime-key");
+		expect({
+			agent: session.agent.state.messages.length >= 3,
+			manager: heldIds(session.sessionManager).slice(0, held.length),
+		}).toEqual({ agent: true, manager: held });
+	});
+
+	it("keepTranscriptAfterFailedClose keeps nothing when the close lands", async () => {
+		const { session, disk } = await refusedSession("ENOSPC");
+		disk.full = false;
+
+		await session.dispose({ keepTranscriptAfterFailedClose: true });
+
+		expect({
+			agent: session.agent.state.messages.length,
+			manager: session.sessionManager.getEntries().length,
+		}).toEqual({ agent: 0, manager: 0 });
 	});
 });

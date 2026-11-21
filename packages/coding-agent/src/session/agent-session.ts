@@ -6917,8 +6917,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A close that failed releases the same: nothing writes a sealed manager's
 		// entries, except the send of a transcript a close the store refused for
 		// an outage holds (SessionManager.holdsTranscript), which keeps the
-		// manager's entries until it lands or ends.
-		this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
+		// manager's entries until it lands or ends. A caller that stays open
+		// after a failed close (the interactive mode, whose user may still
+		// `/export` or `/dump` the session) keeps both copies instead.
+		const keepAll = closeError !== undefined && options.keepTranscriptAfterFailedClose === true;
+		if (!keepAll) this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
 		// A run past the deadline may still resolve keys, so the account pools
 		// are lifted only once the run has settled: here when it drained,
 		// otherwise in the deferred pass below. Each lease lifts only the
@@ -6939,7 +6942,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			void (async () => {
 				await this.agent.waitForIdle();
 				await this.#drainInFlightEventHandlers();
-				this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
+				if (!keepAll) {
+					this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
+				}
 				this.#accountPoolScope?.release();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
