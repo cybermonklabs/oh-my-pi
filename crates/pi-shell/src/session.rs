@@ -1911,22 +1911,34 @@ mod tests {
 		assert_eq!(sh(&mut s, "echo ok").await.stdout, "ok\n");
 	}
 
+	/// A cancel the TERM trap catches is escalated to KILL. The cancel comes
+	/// once the script says its trap is set: a cancel that reaches the run
+	/// before the `trap` command ends it by the TERM itself (143), and a
+	/// fixed 200 ms delay lost that race on a loaded machine.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trapped_term_escalates_to_kill() {
 		let mut s = session();
 		let cancel = CancellationToken::new();
+		let (reader, writer) = io::pipe().unwrap();
+		let stdio = RunStdio {
+			stdout: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+			..RunStdio::default()
+		};
 		let trigger = cancel.clone();
-		tokio::spawn(async move {
-			tokio::time::sleep(Duration::from_millis(200)).await;
+		let armed = std::thread::spawn(move || {
+			let mut line = String::new();
+			let _ = io::BufRead::read_line(&mut io::BufReader::new(reader), &mut line);
 			trigger.cancel();
+			line
 		});
 		// The TERM trap loops for ever, so only the KILL ends the run (137); a
 		// cancel that never escalated would hang the test until the runner's
 		// bound.
 		let outcome = s
-			.run("trap 'while :; do :; done' TERM; while :; do :; done", RunStdio::default(), cancel)
+			.run("trap 'while :; do :; done' TERM; echo armed; while :; do :; done", stdio, cancel)
 			.await
 			.unwrap();
+		assert_eq!(armed.join().unwrap(), "armed\n", "the cancel came once the trap was set");
 		assert!(outcome.cancelled);
 		assert_eq!(outcome.status, 137);
 	}

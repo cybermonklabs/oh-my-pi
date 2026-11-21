@@ -567,8 +567,9 @@ fn itemize_output_matches_reference() {
 	let dir = tempfile::tempdir().unwrap();
 	let src = dir.path().join("src");
 	make_tree(&src);
-	let old = fs::FileTimes::new()
-		.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000));
+	let old = fs::FileTimes::new().set_modified(
+		std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+	);
 	for side in ["ours", "theirs"] {
 		let root = dir.path().join(side);
 		fs::create_dir_all(&root).unwrap();
@@ -580,7 +581,10 @@ fn itemize_output_matches_reference() {
 	let (code, out, _) = run(&["-ai", "src/", "ours/"], dir.path());
 	assert_eq!(code, 0);
 	assert_eq!(out, String::from_utf8_lossy(&theirs.stdout));
-	assert!(out.starts_with(".d..t...... ./\n>f..t...... a\n"), "the times the fixture set are itemized: {out}");
+	assert!(
+		out.starts_with(".d..t...... ./\n>f..t...... a\n"),
+		"the times the fixture set are itemized: {out}"
+	);
 	let theirs = Command::new(&rsync).args(["-ai", "src/", "theirs/"]).current_dir(dir.path()).output().unwrap();
 	let (_, out, _) = run(&["-ai", "src/", "ours/"], dir.path());
 	assert_eq!(out, String::from_utf8_lossy(&theirs.stdout));
