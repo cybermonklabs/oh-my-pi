@@ -402,7 +402,7 @@ impl Tree {
 	}
 
 	/// The directory opens this traversal made so far.
-	#[cfg(test)]
+	#[cfg(all(test, unix))]
 	pub(crate) const fn opens(&self) -> Opens {
 		self.cx.opens
 	}

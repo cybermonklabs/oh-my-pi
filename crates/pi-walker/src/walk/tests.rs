@@ -961,6 +961,36 @@ async fn tree_walks_trees_deeper_than_the_thread_stack() {
 	}
 }
 
+/// A walk returns to every directory past the window of open directories
+/// and walks its remaining subdirectories, on every platform: each of 100
+/// levels holds a sibling `z` that the walk reaches only after the whole
+/// chain below it. On Windows a parent opens again below the root, as a
+/// relative open there cannot name `..`; elsewhere through its child's
+/// `..`. A parent lost on the way back reports its sibling as moved or
+/// replaced, or, with no subdirectory left, reports nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_trees_walk_every_sibling_on_the_way_back_up() {
+	const DEPTH: usize = 100;
+	let tmp = TempDir::new("tree-deep-siblings");
+	let mut dir = tmp.path().to_path_buf();
+	let (mut want, mut rel) = (Vec::new(), String::new());
+	for _ in 0..DEPTH {
+		std::fs::create_dir(dir.join("z")).expect("sibling");
+		dir.push("d");
+		std::fs::create_dir(&dir).expect("level");
+		want.push(format!("{rel}d"));
+		want.push(format!("{rel}z"));
+		rel.push_str("d/");
+	}
+	want.sort_unstable();
+	for contents_first in [false, true] {
+		let opts = TreeOptions { contents_first, ..Default::default() };
+		let mut seen = tree_paths(tmp.path(), &opts).await;
+		seen.sort_unstable();
+		assert_eq!(seen, want, "contents_first: {contents_first}");
+	}
+}
+
 /// Builds `depth` levels of `name` below `top`, each one opened relative to
 /// the one above (so building costs no path lookups however deep), each
 /// with an empty sibling directory `z` when `siblings` is set, and an empty
