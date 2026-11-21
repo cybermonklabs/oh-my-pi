@@ -393,6 +393,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
+import { approvedPlanFileOf } from "./cold-message";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
@@ -2743,12 +2744,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
-		// Only a recorded approval may turn a draft file into an execution reference.
+		// Only a recorded approval may turn a draft file into an execution reference. An older mode
+		// change names its approved plan file from memory, as goal mode records one every turn.
 		for (const entry of this.sessionManager.getBranch().reverse()) {
 			if (entry.type !== "mode_change") continue;
 			if (entry.mode === "plan" || entry.mode === "plan_paused") break;
-			if (typeof entry.data?.approvedPlanFilePath === "string") {
-				this.#planReferencePath = entry.data.approvedPlanFilePath;
+			const approvedPlanFile = approvedPlanFileOf(entry);
+			if (approvedPlanFile !== null) {
+				this.#planReferencePath = approvedPlanFile;
 				this.#planReferenceApproved = true;
 				break;
 			}

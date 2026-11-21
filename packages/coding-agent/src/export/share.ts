@@ -361,7 +361,7 @@ function redactShareEntry(
  * replaces: on a cold entry that read parses the entry's record from the cold
  * store, only for the share to throw the value away.
  */
-function withFields<T extends SessionEntry>(entry: T, fields: Readonly<Partial<Record<keyof T, unknown>>>): T {
+function withFields<T extends SessionEntry>(entry: T, fields: Readonly<Partial<NoInfer<T>>>): T {
 	const result: [string, unknown][] = Object.keys(entry).map(key => [
 		key,
 		Object.hasOwn(fields, key) ? Reflect.get(fields, key) : Reflect.get(entry, key),

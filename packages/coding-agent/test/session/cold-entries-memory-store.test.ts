@@ -205,10 +205,9 @@ describe("older bodies kept compressed in memory when no store file can be used"
 			quarterOfBodies();
 
 			const later: string[] = [];
-			let keep = "";
 			for (let index = 0; index < 32; index++)
 				later.push(manager.appendMessage(assistant(body(`b${index}`, 64 * 1024))));
-			keep = manager.appendMessage(user(body("keep2", 1024)));
+			const keep = manager.appendMessage(user(body("keep2", 1024)));
 			manager.appendCompaction(body("c2", 1024), undefined, keep, 2000);
 			manager.buildSessionContext();
 			expect(heldWhole(manager, [...beforeCut, ...later])).toEqual([]);
@@ -237,8 +236,35 @@ describe("older bodies kept compressed in memory when no store file can be used"
 			}
 			expect(read).toBeGreaterThan(bodiesBytes / 2);
 			expect(heldWhole(manager, beforeCut)).toEqual([]);
+			// The store keeps at most the one block a synchronous pass is reading and drops it once the
+			// task yields (spec R2: a read decompresses one block and keeps no whole copy after it).
+			await Bun.sleep(0);
 			// The record cache keeps at most 8 records; a kept block or body would hold the bodies' size.
 			expect(heldBytes() - before).toBeLessThan(bodiesBytes / 4);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	// A full rewrite, or any walk over every older entry, would otherwise decompress a whole block for
+	// each record it reads: about 2 ms a record, minutes for the 84,773 records of a long session.
+	it("decompresses a block once for a synchronous walk over its records, and again once the task yields", async () => {
+		using dir = TempDir.createSync("@omp-cold-memory-");
+		// About sixteen records a block: the first six share the first block.
+		const { entries, beforeCut } = compactedSession(48, 64 * 1024);
+		const file = await writeSession(dir.path(), entries);
+		vi.spyOn(os, "tmpdir").mockReturnValue(unusableTmp(dir.path()));
+		const manager = await open(file);
+		try {
+			expect(manager.coldStoreStats().storeInMemory).toBe(true);
+			const decompress = vi.spyOn(Bun, "zstdDecompressSync");
+			for (const id of beforeCut.slice(0, 5)) JSON.stringify(manager.getEntry(id));
+			expect(decompress).toHaveBeenCalledTimes(1);
+
+			await Bun.sleep(0);
+			// Not one of the records read above, which the record cache keeps parsed.
+			JSON.stringify(manager.getEntry(beforeCut[5]!));
+			expect(decompress).toHaveBeenCalledTimes(2);
 		} finally {
 			await manager.close();
 		}

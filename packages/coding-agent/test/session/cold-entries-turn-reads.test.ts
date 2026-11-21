@@ -14,6 +14,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -238,5 +239,85 @@ describe("the turns of a resumed long session read no older body", () => {
 		expect(await readsPerTurn({ callId: round => `call_h${round}`, latestKeepsNothing: true }, settings)).toEqual([
 			0, 0, 0, 0, 0,
 		]);
+	});
+});
+
+/** Older goal mode changes before the cut: more than the eight records a store keeps parsed. */
+const OLDER_GOAL_TURNS = 24;
+const APPROVED_PLAN = "local://APPROVED-PLAN.md";
+
+/**
+ * A resumed goal session: a plan mode change, the approval that names
+ * {@link APPROVED_PLAN}, then {@link OLDER_GOAL_TURNS} turns that each record a
+ * goal mode change (`g1` on) whose goal is too large to stay in memory, a
+ * compaction that keeps from `uk`, and the newest goal mode change after it.
+ */
+function goalSessionText(cwd: string): string {
+	const lines: object[] = [
+		{ type: "session", version: CURRENT_SESSION_VERSION, id: path.basename(cwd), timestamp: TIMESTAMP, cwd },
+	];
+	let parentId: string | null = null;
+	const add = (type: string, id: string, fields: object) => {
+		lines.push({ type, id, parentId, timestamp: TIMESTAMP, ...fields });
+		parentId = id;
+	};
+	const user = (id: string) =>
+		add("message", id, { message: { role: "user", content: [{ type: "text", text: text(id) }], timestamp: 1 } });
+	const goal = (id: string) =>
+		add("mode_change", id, { mode: "goal", data: { goal: { objective: text(id), status: "active" } } });
+	add("mode_change", "plan", { mode: "plan", data: { planFilePath: "local://PLAN.md" } });
+	add("mode_change", "approved", { mode: "none", data: { approvedPlanFilePath: APPROVED_PLAN } });
+	for (let turn = 1; turn <= OLDER_GOAL_TURNS; turn++) {
+		user(`gu${turn}`);
+		goal(`g${turn}`);
+	}
+	user("uk");
+	add("compaction", "c1", { summary: text("c1"), firstKeptEntryId: "uk", tokensBefore: 1000 });
+	goal("newest");
+	return lines.map(line => `${JSON.stringify(line)}\n`).join("");
+}
+
+describe("a resumed goal session reads no older mode change back", () => {
+	const cleanups: Array<() => Promise<void> | void> = [];
+
+	afterEach(async () => {
+		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	});
+
+	// Goal mode records a mode change every turn; a resume and every subagent start read each older
+	// one back from disk to find the approved plan, so they slow down as a goal session ages.
+	it("restores the approved plan without reading an older goal mode change", async () => {
+		const dir = TempDir.createSync("@omp-cold-goal-resume-");
+		cleanups.push(() => dir.removeSync());
+		const file = path.join(dir.path(), "sessions", "session.jsonl");
+		await Bun.write(file, goalSessionText(dir.path()));
+		const manager = await SessionManager.open(file, path.dirname(file), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		cleanups.push(() => manager.close());
+		const older = Array.from({ length: OLDER_GOAL_TURNS }, (_, index) => `g${index + 1}`);
+		expect(older.filter(id => !isColdEntry(manager.getEntry(id)!))).toEqual([]);
+
+		const authStorage = await AuthStorage.create(":memory:");
+		cleanups.push(() => authStorage.close());
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const agent = new Agent({
+			getApiKey: () => "anthropic-test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: manager.buildSessionContext().messages },
+			convertToLlm,
+			streamFn: createMockModel({ responses: [] }).stream,
+		});
+		const before = manager.coldStoreStats().materializations;
+		const session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		cleanups.push(() => session.dispose());
+
+		expect(manager.coldStoreStats().materializations - before).toBe(0);
+		expect(session.getPlanReferencePath()).toBe(APPROVED_PLAN);
 	});
 });

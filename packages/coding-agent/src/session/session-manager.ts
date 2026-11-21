@@ -54,6 +54,7 @@ import {
 	keptWholeByKind,
 	LoadedValueInterner,
 	isColdEntry,
+	readCompactions,
 	streamedKeptStart,
 } from "./cold-entries";
 import type { CompactionMethod } from "./compaction-methods";
@@ -4155,11 +4156,12 @@ export class SessionManager {
 		this.#durable = snapshot.durable
 			? durableFrontier(this.#entriesGeneration, snapshot.durable.count, snapshot.durable.size)
 			: undefined;
-		this.#resetColdCut(snapshot.coldStore, true);
+		this.#adoptColdStore(snapshot.coldStore);
 		// A rollback leaves the agent's context the one built for this model (a
 		// switch restores it, a move keeps it), so the cut recomputed at the next
 		// build or recool keeps whole what that context holds.
 		this.#coldCutModel = snapshot.coldCutModel;
+		this.#coldCutStale = true;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		// A rolled-back switch gives up the claim it took on the session it opened.
@@ -6684,7 +6686,7 @@ export class SessionManager {
 	 */
 	getBranchFromCut(): SessionEntry[] {
 		const branch = this.#index.branchView();
-		return branch.slice(coldCutPathIndex(branch, this.#coldCutModel));
+		return branch.slice(coldCutPathIndex(branch, readCompactions(branch, this.#coldCutModel)));
 	}
 
 	/**
@@ -6701,9 +6703,9 @@ export class SessionManager {
 			...options,
 		});
 		if (boundary) {
-			// Applied: a hydration or a build that threw left the cut stale, so the
-			// next build applied it again instead of reading the entries it keeps
-			// through their accessors.
+			// Applied: a hydration or a build that throws leaves the cut stale, so
+			// the next build applies it again instead of reading the entries it
+			// keeps through their accessors.
 			this.#coldCutStale = false;
 			if (this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
 		}

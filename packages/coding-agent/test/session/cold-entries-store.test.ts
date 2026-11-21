@@ -552,7 +552,7 @@ describe("cold entry store", () => {
 		} finally {
 			Object.defineProperty(process, "platform", platform);
 		}
-		if (!store) throw new Error("the store did not open");
+		if (!store || store.inMemory) throw new Error("the store did not open its file");
 		try {
 			const files = fs.readdirSync(coldDir);
 			expect(files).not.toContain(path.basename(gone));

@@ -21,38 +21,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import { FileSessionStorage, SessionLockError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { startNativeLockHolder } from "../helpers/native-lock-holder";
 
 /** Mirrors the OS-gate sidecar derived in `#withPublishLock`. */
 function osGatePath(lockPath: string): string {
 	return `${lockPath}.os`;
-}
-
-/** Starts a process that holds the native lock at `lockPath` until it is killed, and waits until it holds it. */
-async function startHolder(lockPath: string, readyPath: string): Promise<Bun.Subprocess<"ignore", "ignore", "pipe">> {
-	const holder = Bun.spawn(
-		[process.execPath, path.join(import.meta.dir, "../fixtures/native-lock-holder.ts"), lockPath, readyPath],
-		{
-			cwd: path.resolve(import.meta.dir, "../.."),
-			env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "pipe",
-		},
-	);
-	for (;;) {
-		try {
-			await fsp.access(readyPath);
-			return holder;
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			if (holder.exitCode !== null) {
-				throw new Error(
-					`lock holder exited before readiness (${holder.exitCode}): ${await new Response(holder.stderr).text()}`,
-				);
-			}
-		}
-	}
 }
 
 describe("publish lock OS gate", () => {
@@ -134,7 +107,7 @@ describe("publish lock OS gate", () => {
 			const sessionPath = path.join(tempDir, "session.jsonl");
 			storage.writeTextSync(sessionPath, "original\n");
 			const gatePath = osGatePath(path.join(tempDir, ".session.jsonl.lock"));
-			const holder = await startHolder(gatePath, path.join(tempDir, "holder-ready"));
+			const holder = await startNativeLockHolder(gatePath, path.join(tempDir, "holder-ready"));
 			try {
 				const claim = vi.spyOn(NativeFileLock, "tryAcquire");
 				expect(() => storage.writeTextSync(sessionPath, "B-content\n")).toThrow(SessionLockError);
