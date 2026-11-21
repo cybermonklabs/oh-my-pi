@@ -3,8 +3,15 @@
 //! The other end of a FIFO, a `/dev/fd/N` or a socket may be a vproc of the
 //! same engine, so a `read(2)` or `write(2)` that waits in the kernel would
 //! deadlock the scheduler. [`StdFile`](crate::sys::StdFile) therefore asks
-//! [`now`] first and only does I/O that cannot wait; otherwise it registers
-//! the engine waker with [`watch`] and returns `Pending`.
+//! [`now`] first and only does I/O that cannot wait; otherwise it stores the
+//! polling task's waker in its [`Waiters`] for that direction and returns
+//! `Pending`.
+//!
+//! Several tasks can wait on one file at once, each with a waker of its own:
+//! the engine (one waker for every vproc), a native extra writing the run's
+//! stdout from a thread of its own, a relay. [`Waiters`] keeps every one of
+//! them and holds one registration ([`watch`]) whose waker wakes them all,
+//! so a task's wait is never replaced by another's.
 //!
 //! The descriptor's flags are never changed: `O_NONBLOCK` lives on the open
 //! file description, which externals inherit and other processes may share.
@@ -25,10 +32,10 @@ use std::{
 	io::{self, PipeReader, PipeWriter, Read, Write},
 	os::fd::{AsRawFd, RawFd},
 	sync::{
-		LazyLock,
+		Arc, LazyLock,
 		atomic::{AtomicU64, Ordering},
 	},
-	task::Waker,
+	task::{Wake, Waker},
 	thread,
 };
 
@@ -86,6 +93,111 @@ impl Drop for Watch {
 /// Wake `waker` once `fd` is ready for `events`.
 pub fn watch(fd: RawFd, events: i16, waker: &Waker) -> io::Result<Watch> {
 	POLLER.add(fd, events, waker)
+}
+
+/// Most wakers one [`Waiters`] keeps at once. Past it, every stored waker is
+/// woken and forgotten: a live task polls again and waits anew, and the
+/// waker of a task dropped while it waited goes. However many wait, a
+/// [`Waiters`] holds one registration on the readiness thread.
+const MAX_WAITERS: usize = 64;
+
+/// The tasks waiting for one descriptor to become ready for one kind of
+/// I/O, all woken together by one registration on the readiness thread.
+///
+/// Each task's waker is stored once (an equal waker is not repeated), and a
+/// stored waker is only ever forgotten by waking it: when the descriptor is
+/// ready, when the set is full ([`MAX_WAITERS`]), when the registration
+/// cannot be made, or when the set is dropped with its file (the tasks then
+/// poll whatever stands in the file's place). A poll that finds the
+/// descriptor ready forgets nobody: a task that waited and then went on
+/// gets one spurious wake.
+#[derive(Debug, Default)]
+pub struct Waiters {
+	/// The registration on the readiness thread, whose waker is `fanout`.
+	watch:  Option<Watch>,
+	fanout: Arc<Fanout>,
+}
+
+/// The waker a [`Waiters`]' registration holds: it wakes every stored task.
+#[derive(Debug, Default)]
+struct Fanout(Mutex<Stored>);
+
+#[derive(Debug, Default)]
+struct Stored {
+	wakers: Vec<Waker>,
+	/// The readiness thread holds a registration with this set's waker. It
+	/// forgets the registration when it fires, which clears this.
+	armed:  bool,
+}
+
+impl Fanout {
+	/// Every stored waker, to wake outside the lock; the registration is
+	/// gone or going.
+	fn take(&self) -> Vec<Waker> {
+		let mut stored = self.0.lock();
+		stored.armed = false;
+		std::mem::take(&mut stored.wakers)
+	}
+}
+
+impl Wake for Fanout {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		for waker in self.take() {
+			waker.wake();
+		}
+	}
+}
+
+impl Waiters {
+	/// Store `waker` among the tasks waiting for `fd` to be ready for
+	/// `events`, and have the readiness thread wake them all once it is,
+	/// unless it already will.
+	pub fn wait(&mut self, fd: RawFd, events: i16, waker: &Waker) -> io::Result<()> {
+		let (evicted, arm) = {
+			let mut stored = self.fanout.0.lock();
+			let mut evicted = Vec::new();
+			if !stored.wakers.iter().any(|w| w.will_wake(waker)) {
+				if stored.wakers.len() >= MAX_WAITERS {
+					evicted = std::mem::take(&mut stored.wakers);
+				}
+				stored.wakers.push(waker.clone());
+			}
+			let arm = !stored.armed;
+			stored.armed = true;
+			(evicted, arm)
+		};
+		for w in evicted {
+			w.wake();
+		}
+		if arm {
+			// The readiness thread fired and forgot the last registration,
+			// or there was none.
+			self.watch = None;
+			match watch(fd, events, &Waker::from(Arc::clone(&self.fanout))) {
+				Ok(w) => self.watch = Some(w),
+				Err(e) => {
+					// Nothing would wake the stored tasks: each polls again
+					// and meets the error itself.
+					self.fanout.wake_by_ref();
+					return Err(e);
+				},
+			}
+		}
+		Ok(())
+	}
+}
+
+impl Drop for Waiters {
+	/// The file is going: its waiting tasks poll again and find out what
+	/// stands in its place.
+	fn drop(&mut self) {
+		self.watch = None;
+		self.fanout.wake_by_ref();
+	}
 }
 
 struct Entry {
@@ -177,6 +289,8 @@ fn run(mut wake: PipeReader) {
 		if ready.is_empty() {
 			continue;
 		}
+		#[cfg(test)]
+		let held = DISPATCH.lock();
 		let mut woken = Vec::with_capacity(ready.len());
 		POLLER.entries.lock().retain(|e| {
 			if ready.contains(&e.id) {
@@ -186,10 +300,25 @@ fn run(mut wake: PipeReader) {
 				true
 			}
 		});
+		#[cfg(test)]
+		drop(held);
 		for w in woken {
 			w.wake();
 		}
 	}
+}
+
+/// Test only: taken by the readiness thread between finding watched
+/// descriptors ready and taking their registrations ([`hold_wakes`]).
+#[cfg(test)]
+static DISPATCH: Mutex<()> = Mutex::new(());
+
+/// Test only: while the guard lives, the readiness thread wakes nobody. It
+/// stops before it takes the registrations it found ready, so a test can
+/// poll a file that is ready before the file's earlier waiters are woken.
+#[cfg(test)]
+pub(crate) fn hold_wakes() -> parking_lot::MutexGuard<'static, ()> {
+	DISPATCH.lock()
 }
 
 /// Wait until the wake pipe or a watched fd is ready: whether the wake pipe

@@ -9,10 +9,11 @@
 //! kernel on Unix: the other end may be a vproc of the same engine (a FIFO, a
 //! `/dev/fd/N` of a process substitution), and a terminal read must not stop
 //! the scheduler (`read -t` timers, other vprocs). [`StdFile`] checks
-//! readiness first and returns `Pending` with the waker registered on the
-//! shared readiness thread (`ready`); the descriptor's flags stay untouched,
-//! since externals inherit them. Windows pipes and consoles keep blocking
-//! I/O (anonymous pipes cannot be polled).
+//! readiness first and returns `Pending` with the waker stored among the
+//! tasks waiting in that direction, which one registration on the shared
+//! readiness thread wakes together (`ready::Waiters`); the descriptor's flags
+//! stay untouched, since externals inherit them. Windows pipes and consoles
+//! keep blocking I/O (anonymous pipes cannot be polled).
 //!
 //! Windows specifics: `test -x` holds for directories, files with a
 //! `PATHEXT` extension and files starting with `#!`; process substitution
@@ -51,25 +52,27 @@ pub struct StdFs {
 /// A host file, pipe or terminal as an engine [`File`].
 #[derive(Debug)]
 pub struct StdFile {
-	/// Pending readiness waits (pipes, sockets, terminals), one for reading
-	/// and one for writing: a terminal the line editor reads keys from is
-	/// written to meanwhile (job notices, the display), which must not
-	/// drop the read wait. Declared first so they are dropped, and
-	/// forgotten by the waiting thread, before `file` closes.
+	/// The tasks waiting for readiness (pipes, sockets, terminals), one set
+	/// for reading and one for writing: a terminal the line editor reads keys
+	/// from is written to meanwhile (job notices, the display), which must
+	/// not drop the read wait. Each set keeps every task that waits in it
+	/// (the engine and a native extra can write one file). Declared first so
+	/// they are dropped, and forgotten by the waiting thread, before `file`
+	/// closes.
 	#[cfg(unix)]
-	watch:  [Option<crate::sys::ready::Watch>; 2],
-	file:   fs::File,
-	kind:   FileKind,
+	waiters: [crate::sys::ready::Waiters; 2],
+	file:    fs::File,
+	kind:    FileKind,
 	/// Access mode of the open file description (`O_ACCMODE` bits of
 	/// `F_GETFL`; `None` when unknown).
 	#[cfg(unix)]
-	access: Option<libc::c_int>,
+	access:  Option<libc::c_int>,
 	/// The null device: a write is complete without a syscall.
-	null:   bool,
+	null:    bool,
 	/// Read-ahead of a regular file this engine opened for reading only
 	/// ([`StdFile::opened`]); `None` for every other file and once the
 	/// descriptor was handed out ([`File::os_handle`], [`File::dup`]).
-	ahead:  RefCell<Option<Ahead>>,
+	ahead:   RefCell<Option<Ahead>>,
 }
 
 /// Bytes of a regular file read from the kernel beyond what the engine
@@ -188,7 +191,7 @@ impl StdFile {
 			file,
 			kind,
 			#[cfg(unix)]
-			watch: [None, None],
+			waiters: Default::default(),
 			#[cfg(unix)]
 			access,
 			null,
@@ -213,7 +216,8 @@ impl StdFile {
 		allowed && waits(self.kind)
 	}
 
-	/// `Ready` when `events` are ready now; else registers `cx`'s waker.
+	/// `Ready` when `events` are ready now; else stores `cx`'s waker with
+	/// every other task waiting in that direction.
 	#[cfg(unix)]
 	fn ready(&mut self, cx: &Context<'_>, events: i16) -> Poll<io::Result<()>> {
 		use std::os::fd::AsRawFd;
@@ -222,28 +226,27 @@ impl StdFile {
 		let fd = self.file.as_raw_fd();
 		let slot = usize::from(events != ready::READ);
 		match ready::now(fd, events) {
-			Ok(true) => {
-				self.watch[slot] = None;
-				return Poll::Ready(Ok(()));
-			},
+			Ok(true) => return Poll::Ready(Ok(())),
 			Ok(false) => {},
 			Err(e) => return Poll::Ready(Err(e)),
 		}
-		// Replace any earlier watch of this direction, so only the latest
-		// waker is kept.
-		self.watch[slot] = None;
-		match ready::watch(fd, events, cx.waker()) {
-			Ok(w) => self.watch[slot] = Some(w),
-			Err(e) => return Poll::Ready(Err(e)),
+		// Another task may wait here too, with a waker of its own: both are
+		// woken once the descriptor is ready.
+		if let Err(e) = self.waiters[slot].wait(fd, events, cx.waker()) {
+			return Poll::Ready(Err(e));
 		}
-		// It may have become ready before the watch was registered; the
-		// poller would see that too, this only saves a round trip.
+		// It may have become ready before the wait was registered; the
+		// poller would see that too (one spurious wake), this only saves a
+		// round trip.
 		match ready::now(fd, events) {
-			Ok(true) => {
-				self.watch[slot] = None;
-				Poll::Ready(Ok(()))
+			Ok(true) => Poll::Ready(Ok(())),
+			Ok(false) => {
+				#[cfg(test)]
+				{
+					*PENDING.lock().entry(fd).or_default() += 1;
+				}
+				Poll::Pending
 			},
-			Ok(false) => Poll::Pending,
 			Err(e) => Poll::Ready(Err(e)),
 		}
 	}
@@ -278,6 +281,19 @@ impl StdFile {
 #[cfg(unix)]
 const fn waits(kind: FileKind) -> bool {
 	matches!(kind, FileKind::Pipe | FileKind::Socket | FileKind::Tty)
+}
+
+/// Test only: how many polls of each descriptor returned `Pending`, so a
+/// test can wait until a task waits on a file it cannot reach.
+#[cfg(all(test, unix))]
+static PENDING: std::sync::LazyLock<
+	parking_lot::Mutex<std::collections::HashMap<std::os::fd::RawFd, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test only: the polls of descriptor `fd` that returned `Pending` so far.
+#[cfg(all(test, unix))]
+pub(crate) fn pending_polls(fd: std::os::fd::RawFd) -> usize {
+	PENDING.lock().get(&fd).copied().unwrap_or(0)
 }
 
 /// The file's kind, and whether it is the null device. Only a character
@@ -1632,6 +1648,196 @@ mod tests {
 					thread::sleep(Duration::from_millis(5));
 				}
 			}
+
+			/// Whether it was woken (and not yet taken by [`Flag::wait`]).
+			fn woken(&self) -> bool {
+				self.0.load(std::sync::atomic::Ordering::SeqCst)
+			}
+		}
+
+		/// `file`'s write of `buf`, polled with `flag`'s waker.
+		fn write_with(file: &mut StdFile, flag: &Arc<Flag>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			let waker = Waker::from(Arc::clone(flag));
+			file.poll_write(&mut Context::from_waker(&waker), buf)
+		}
+
+		/// `file`'s read into `buf`, polled with `flag`'s waker.
+		fn read_with(
+			file: &mut StdFile,
+			flag: &Arc<Flag>,
+			buf: &mut [u8],
+		) -> Poll<io::Result<usize>> {
+			let waker = Waker::from(Arc::clone(flag));
+			file.poll_read(&mut Context::from_waker(&waker), buf)
+		}
+
+		/// A FIFO with no room left: its writer as a [`StdFile`] (a blocking
+		/// description, as a shell's stdout is), and a non-blocking reader that
+		/// drains it.
+		struct FullFifo {
+			writer: StdFile,
+			reader: fs::File,
+		}
+
+		impl FullFifo {
+			fn new() -> Self {
+				let path = host_path(&fifo()).unwrap().to_path_buf();
+				let reader = fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				let writer = StdFile::new(fs::OpenOptions::new().write(true).open(&path).unwrap());
+				// Filled through a non-blocking description of its own: large
+				// writes until none fits, then single bytes, so not one byte
+				// of room is left whatever the platform's unit of room.
+				let mut filler = fs::OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path)
+					.unwrap();
+				fs::remove_file(&path).unwrap();
+				let large = vec![b'f'; 1 << 16];
+				for chunk in [&large[..], &b"f"[..]] {
+					loop {
+						match filler.write(chunk) {
+							Ok(_) => {},
+							Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+							Err(e) => panic!("filling the FIFO: {e}"),
+						}
+					}
+				}
+				let fd = std::os::fd::AsRawFd::as_raw_fd(&writer.file);
+				assert!(
+					!crate::sys::ready::now(fd, crate::sys::ready::WRITE).unwrap(),
+					"the FIFO is full"
+				);
+				Self { writer, reader }
+			}
+
+			/// Read everything the FIFO holds.
+			fn drain(&mut self) {
+				let mut buf = vec![0u8; 1 << 16];
+				loop {
+					match self.reader.read(&mut buf) {
+						Ok(n) => assert!(n > 0, "the FIFO's writer is open"),
+						Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+						Err(e) => panic!("draining the FIFO: {e}"),
+					}
+				}
+			}
+		}
+
+		/// Wait for one wake of the readiness thread for a descriptor that is
+		/// ready now. A registration of a descriptor that is ready by then, and
+		/// was made before this one, has been woken by the time it returns:
+		/// the thread wakes what it finds ready in registration order.
+		fn one_round_of_wakes() {
+			let (_r, w) = io::pipe().unwrap();
+			let flag = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&flag));
+			let fd = std::os::fd::AsRawFd::as_raw_fd(&w);
+			let _watch = crate::sys::ready::watch(fd, crate::sys::ready::WRITE, &waker).unwrap();
+			flag.wait("the readiness thread's next round of wakes");
+		}
+
+		/// Two tasks waiting for room in one FIFO, each with its own waker,
+		/// are both woken when it drains: the engine (one waker for every
+		/// vproc) and a native extra on a thread of its own write one file,
+		/// the run's stdout.
+		#[test]
+		fn every_task_waiting_for_room_is_woken() {
+			let mut fifo = FullFifo::new();
+			let first = Arc::new(Flag::default());
+			let second = Arc::new(Flag::default());
+			assert!(write_with(&mut fifo.writer, &first, b"x").is_pending(), "no room");
+			assert!(write_with(&mut fifo.writer, &second, b"x").is_pending(), "no room");
+			fifo.drain();
+			second.wait("the second writer woken by the drain");
+			assert!(
+				first.woken(),
+				"the first writer was never woken by the drain: only the last waiting task's wake was \
+				 kept"
+			);
+		}
+
+		/// The same for two tasks waiting for input on one pipe.
+		#[test]
+		fn every_task_waiting_for_input_is_woken() {
+			let (r, mut w) = io::pipe().unwrap();
+			let mut reader = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(r)));
+			let first = Arc::new(Flag::default());
+			let second = Arc::new(Flag::default());
+			let mut buf = [0u8; 8];
+			assert!(read_with(&mut reader, &first, &mut buf).is_pending(), "no input");
+			assert!(read_with(&mut reader, &second, &mut buf).is_pending(), "no input");
+			w.write_all(b"x").unwrap();
+			second.wait("the second reader woken by the input");
+			assert!(
+				first.woken(),
+				"the first reader was never woken by the input: only the last waiting task's wake was \
+				 kept"
+			);
+		}
+
+		/// A write that finds room forgets nobody: a task that waited before
+		/// it is still woken once the readiness thread sees the room.
+		#[test]
+		fn a_write_that_finds_room_keeps_the_earlier_waiter() {
+			let mut fifo = FullFifo::new();
+			let first = Arc::new(Flag::default());
+			assert!(write_with(&mut fifo.writer, &first, b"x").is_pending(), "no room");
+			// The readiness thread wakes nobody until the second write is made.
+			let held = crate::sys::ready::hold_wakes();
+			fifo.drain();
+			let second = Arc::new(Flag::default());
+			let wrote = write_with(&mut fifo.writer, &second, b"y");
+			drop(held);
+			assert!(matches!(wrote, Poll::Ready(Ok(1))), "room after the drain: {wrote:?}");
+			// The FIFO stays writable, so the first writer's registration, if
+			// it is still there, is woken by this round at the latest.
+			one_round_of_wakes();
+			assert!(
+				first.woken(),
+				"the first writer was never woken: the write that found room dropped its wait"
+			);
+		}
+
+		/// Dropping a file wakes the tasks still waiting on it, which then
+		/// poll whatever stands in its place: the session drops a run's stdout
+		/// when the run ends, while a background job may still wait on it.
+		#[test]
+		fn dropping_a_file_wakes_its_waiting_tasks() {
+			let FullFifo { mut writer, reader: _reader } = FullFifo::new();
+			let waiting = Arc::new(Flag::default());
+			assert!(write_with(&mut writer, &waiting, b"x").is_pending(), "no room");
+			drop(writer);
+			assert!(waiting.woken(), "a task waiting on a dropped file was never woken");
+		}
+
+		/// However many tasks wait on one file, it keeps at most 64 wakers:
+		/// the task that finds them all taken wakes every stored one (each
+		/// polls again and waits anew) and is kept itself. One waker that
+		/// polls again (the engine's vprocs share one) is kept once.
+		#[test]
+		fn tasks_past_the_cap_wake_the_stored_ones() {
+			let mut fifo = FullFifo::new();
+			let flags: Vec<Arc<Flag>> = (0..=64).map(|_| Arc::default()).collect();
+			for _ in 0..100 {
+				assert!(write_with(&mut fifo.writer, &flags[0], b"x").is_pending(), "no room");
+			}
+			for flag in &flags[1..64] {
+				assert!(write_with(&mut fifo.writer, flag, b"x").is_pending(), "no room");
+			}
+			assert!(!flags.iter().any(|f| f.woken()), "64 waiters fit");
+			assert!(write_with(&mut fifo.writer, &flags[64], b"x").is_pending(), "no room");
+			assert!(
+				flags[..64].iter().all(|f| f.woken()),
+				"the 65th waiter did not wake the 64 stored ones"
+			);
+			assert!(!flags[64].woken(), "the 65th waiter waits");
+			fifo.drain();
+			flags[64].wait("the 65th waiter woken by the drain");
 		}
 
 		#[test]

@@ -1937,4 +1937,182 @@ mod tests {
 		child.kill().unwrap();
 		child.wait().unwrap();
 	}
+
+	/// How long a run of the stuck-extra tests below may take: each moves
+	/// about a megabyte through a pipe, so a run still going after this is
+	/// stuck, not slow.
+	const STUCK: Duration = Duration::from_secs(60);
+
+	/// A runtime of the test's own: a test that finds an extra stuck shuts it
+	/// down without waiting for the thread the extra's write blocks forever.
+	fn own_runtime() -> tokio::runtime::Runtime {
+		tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.unwrap()
+	}
+
+	/// Wait until `done` holds, checking every millisecond; `false` once
+	/// `given_up` is set.
+	fn until(done: impl Fn() -> bool, given_up: &AtomicBool) -> bool {
+		while !done() {
+			if given_up.load(Ordering::SeqCst) {
+				return false;
+			}
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		true
+	}
+
+	/// A native extra and a builtin that both wait for room on the run's
+	/// stdout are both woken when its reader drains it. With an event sink
+	/// (omp's live shell view) the extra writes the run's stdout through the
+	/// engine's object, from a thread of its own, and the builtin writes it
+	/// from the engine: two tasks wait on the one `StdFile` of the run's
+	/// stdout.
+	#[test]
+	fn an_extra_and_a_builtin_waiting_for_room_on_stdout_both_finish() {
+		use std::{io::Write, os::fd::AsRawFd, sync::atomic::AtomicUsize};
+		const EXTRA: usize = 1 << 20;
+		const BUILTIN: usize = 1 << 17;
+		let command =
+			format!("head -c {EXTRA} /dev/zero & read -r go; printf '%0{BUILTIN}d' 0; wait");
+		let (mut out_r, out_w) = io::pipe().unwrap();
+		let (in_r, mut in_w) = io::pipe().unwrap();
+		let out_w = std::fs::File::from(std::os::fd::OwnedFd::from(out_w));
+		let fd = out_w.as_raw_fd();
+		let waited = crate::sys::pending_polls(fd);
+		// Bytes read so far: the extra's NULs and printf's '0's; how far the
+		// reader got; whether the test gave up.
+		let read = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+		let stage = Arc::new(AtomicU8::new(0));
+		let given_up = Arc::new(AtomicBool::new(false));
+		let reader = {
+			let (read, stage, given_up) =
+				(Arc::clone(&read), Arc::clone(&stage), Arc::clone(&given_up));
+			std::thread::spawn(move || {
+				// The extra filled the pipe and waits for room.
+				if !until(|| crate::sys::pending_polls(fd) > waited, &given_up) {
+					return;
+				}
+				stage.store(1, Ordering::SeqCst);
+				in_w.write_all(b"go\n").unwrap();
+				// printf waits for room too, on the same file.
+				if !until(|| crate::sys::pending_polls(fd) > waited + 1, &given_up) {
+					return;
+				}
+				stage.store(2, Ordering::SeqCst);
+				let mut buf = vec![0u8; 1 << 16];
+				loop {
+					let n = out_r.read(&mut buf).unwrap();
+					if n == 0 {
+						break;
+					}
+					for &b in &buf[..n] {
+						read[usize::from(b != 0)].fetch_add(1, Ordering::SeqCst);
+					}
+				}
+			})
+		};
+		let runtime = own_runtime();
+		let ended = runtime.block_on(async {
+			let mut session = session();
+			let trace = Arc::new(crate::bash::trace::RunTrace::new(command.as_str()));
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::from(std::os::fd::OwnedFd::from(in_r))),
+				stdout: Some(out_w),
+				stderr: Some(std::fs::File::open("/dev/null").unwrap()),
+			};
+			let options = RunOptions { events: Some(trace), ..RunOptions::new(command.as_str()) };
+			tokio::time::timeout(STUCK, session.run_with(options, stdio, CancellationToken::new()))
+				.await
+		});
+		let Ok(outcome) = ended else {
+			given_up.store(true, Ordering::SeqCst);
+			let reached = [
+				"the extra never waited for room on stdout",
+				"printf never waited for room on stdout",
+				"both waited and the reader drained the pipe",
+			][usize::from(stage.load(Ordering::SeqCst))];
+			let (nuls, zeros) = (read[0].load(Ordering::SeqCst), read[1].load(Ordering::SeqCst));
+			// The stuck extra's thread waits forever: leave it.
+			runtime.shutdown_background();
+			panic!(
+				"the run never ended ({reached}): the native extra `head -c {EXTRA} /dev/zero` wrote \
+				 {nuls} of its {EXTRA} bytes and printf {zeros} of its {BUILTIN}; the extra's wait \
+				 for room on stdout was never woken"
+			);
+		};
+		assert_eq!(outcome.unwrap().status, 0);
+		reader.join().unwrap();
+		assert_eq!(
+			(read[0].load(Ordering::SeqCst), read[1].load(Ordering::SeqCst)),
+			(EXTRA, BUILTIN)
+		);
+	}
+
+	/// A background extra still waiting for room on a run's stdout when the
+	/// run ends is woken when the session drops that stdout, and ends: the
+	/// next run's `wait` returns.
+	#[test]
+	fn an_extra_left_waiting_on_a_finished_runs_stdout_ends() {
+		use std::{io::Write, os::fd::AsRawFd};
+		const EXTRA: usize = 1 << 20;
+		let command = format!("head -c {EXTRA} /dev/zero & read -r go");
+		// Nobody reads: the extra fills the pipe and waits for room.
+		let (out_r, out_w) = io::pipe().unwrap();
+		let (in_r, mut in_w) = io::pipe().unwrap();
+		let out_w = std::fs::File::from(std::os::fd::OwnedFd::from(out_w));
+		let fd = out_w.as_raw_fd();
+		let waited = crate::sys::pending_polls(fd);
+		let given_up = Arc::new(AtomicBool::new(false));
+		let go = {
+			let given_up = Arc::clone(&given_up);
+			std::thread::spawn(move || {
+				if until(|| crate::sys::pending_polls(fd) > waited, &given_up) {
+					in_w.write_all(b"go\n").unwrap();
+				}
+			})
+		};
+		let runtime = own_runtime();
+		let ended = runtime.block_on(async {
+			let mut session = session();
+			let trace = Arc::new(crate::bash::trace::RunTrace::new(command.as_str()));
+			let stdio = RunStdio {
+				stdin:  Some(std::fs::File::from(std::os::fd::OwnedFd::from(in_r))),
+				stdout: Some(out_w),
+				stderr: Some(std::fs::File::open("/dev/null").unwrap()),
+			};
+			let options = RunOptions { events: Some(trace), ..RunOptions::new(command.as_str()) };
+			let first =
+				tokio::time::timeout(STUCK, session.run_with(options, stdio, CancellationToken::new()))
+					.await;
+			let Ok(first) = first else {
+				return Err("the first run never ended: the extra never waited for room on stdout");
+			};
+			assert_eq!(first.unwrap().status, 0);
+			// The first run ended, and the session dropped its stdout while
+			// the extra still waited on it.
+			match tokio::time::timeout(STUCK, sh(&mut session, "wait; echo \"waited $?\"")).await {
+				Ok(waited) => Ok(waited.stdout),
+				Err(_) => Err("the second run's `wait` never returned"),
+			}
+		});
+		given_up.store(true, Ordering::SeqCst);
+		drop(out_r);
+		match ended {
+			Ok(stdout) => {
+				go.join().unwrap();
+				assert_eq!(stdout, "waited 0\n");
+			},
+			Err(why) => {
+				// The stuck extra's thread waits forever: leave it.
+				runtime.shutdown_background();
+				panic!(
+					"{why}: the native extra `head -c {EXTRA} /dev/zero` waiting for room on the first \
+					 run's stdout was never woken when the session dropped that stdout"
+				);
+			},
+		}
+	}
 }
