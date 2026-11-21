@@ -3,7 +3,7 @@
  * directory — task agents, project extensions, custom tools, and project MCP servers —
  * so the session sees the destination project's set, and moving back restores the source's.
  */
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -99,8 +99,17 @@ describe("/move re-scopes project-discovered capabilities", () => {
 	const tempDirs: string[] = [];
 	const originalProjectDir = getProjectDir();
 	const originalAgentDir = getAgentDir();
+	let originalStartupTimeout: string | undefined;
+
+	beforeEach(() => {
+		// The variable overrides the setting the test makes ("mcp.startupTimeoutMs": 0).
+		originalStartupTimeout = Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+		delete Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+	});
 
 	afterEach(() => {
+		if (originalStartupTimeout === undefined) delete Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+		else Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS = originalStartupTimeout;
 		setProjectDir(originalProjectDir);
 		setAgentDir(originalAgentDir);
 		AgentStorage.close();
@@ -172,7 +181,9 @@ describe("/move re-scopes project-discovered capabilities", () => {
 				});
 				expect(output.join("\n")).toContain("Moved to ");
 				expect(pendingDiscovery).toHaveBeenCalledTimes(reconnects + 1);
-				return pendingDiscovery.mock.calls[reconnects][0];
+				// In an object, so that awaiting `move` does not wait for it too: the checks
+				// right after `/move` run before the reconnect settles.
+				return { reconnect: pendingDiscovery.mock.calls[reconnects][0] };
 			};
 
 			expect(tools()).toEqual(expect.arrayContaining(["alpha_ext_tool", "alpha_custom_tool"]));
@@ -191,7 +202,7 @@ describe("/move re-scopes project-discovered capabilities", () => {
 			expect(customResult.content).toEqual([{ type: "text", text: cwdB }]);
 			expect(taskDescription()).toContain("beta-agent");
 			expect(taskDescription()).not.toContain("alpha-agent");
-			await toBeta;
+			await toBeta.reconnect;
 			expect(hasMcpProbe("beta")).toBe(true);
 			expect(hasMcpProbe("alpha")).toBe(false);
 
@@ -201,7 +212,7 @@ describe("/move re-scopes project-discovered capabilities", () => {
 			expect(tools()).not.toContain("beta_ext_tool");
 			expect(tools()).not.toContain("beta_custom_tool");
 			expect(taskDescription()).toContain("alpha-agent");
-			await backToAlpha;
+			await backToAlpha.reconnect;
 			expect(hasMcpProbe("alpha")).toBe(true);
 			expect(hasMcpProbe("beta")).toBe(false);
 		} finally {
