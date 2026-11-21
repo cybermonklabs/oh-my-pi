@@ -430,7 +430,7 @@ pub(crate) fn same_entry(filesystem: &BlockingFs, a: &Path, b: &Path) -> bool {
 /// file: by file identity when both have one on the same kind of
 /// filesystem, else by location ([`location`]).
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
-fn same_file(filesystem: &BlockingFs, a: &Path, follow_a: bool, b: &Path, follow_b: bool) -> bool {
+pub(crate) fn same_file(filesystem: &BlockingFs, a: &Path, follow_a: bool, b: &Path, follow_b: bool) -> bool {
 	let metadata = |path: &Path, follow: bool| {
 		if follow {
 			filesystem.metadata(path)

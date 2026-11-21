@@ -40,7 +40,7 @@ use uucore::{
 use crate::{
 	file_backup::{
 		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix, same_entry,
-		source_is_destination_backup,
+		same_file, source_is_destination_backup,
 	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
 	progress::stderr_draw_target,
@@ -1938,7 +1938,9 @@ fn back_up_own_entry(
 	};
 	match options.copy_mode {
 		CopyMode::Link => {
-			if paths_refer_to_same_file(&filesystem, &source_fs, backup, follow) {
+			// GNU reads the backup name with lstat for `-l` (`copy.c`), so a
+			// link `a~ -> a` is another file, replaced by a hard link of `a`.
+			if same_file(&filesystem, &source_fs, follow, backup, false) {
 				return Ok(false);
 			}
 			let original = if follow && filesystem.is_symlink(&source_fs) {
@@ -1970,6 +1972,18 @@ fn back_up_own_entry(
 					format!("cannot create symbolic link {} to {}", shown.quote(), source.quote()),
 				)
 			})?;
+			// `-p` gives the new link the source's times, as GNU's does.
+			copy_attributes(
+				host,
+				source,
+				&shown,
+				&options.attributes,
+				false,
+				follow,
+				options.set_selinux_context,
+				None,
+				DestFacts { symlink: Some(true), ..DestFacts::default() },
+			)?;
 		},
 		_ if !follow && filesystem.is_symlink(&source_fs) => {
 			let target = filesystem.read_link(&source_fs).map_err(|e| {
@@ -1977,6 +1991,19 @@ fn back_up_own_entry(
 			})?;
 			replace_entry(&filesystem, backup, |at| filesystem.symlink(&target, at))
 				.map_err(|e| CpError::IoErrContext(e, format!("cannot create symbolic link {}", shown.quote())))?;
+			// `-p` gives the copied link the link's own times, as `copy_link`
+			// does for any link it copies.
+			copy_attributes(
+				host,
+				source,
+				&shown,
+				&options.attributes,
+				false,
+				false,
+				options.set_selinux_context,
+				None,
+				DestFacts { symlink: Some(true), ..DestFacts::default() },
+			)?;
 		},
 		_ => {
 			refuse_same_file(true)?;
@@ -2023,11 +2050,18 @@ fn copy_into_backup(
 		Ok(metadata) if metadata.is_symlink() => {
 			match filesystem.metadata(backup) {
 				Ok(target) if target.is_dir() => return Err(overwrite_directory(&shown, source)),
-				Err(_) if !is_symlink_loop(&filesystem, backup) && host.var("POSIXLY_CORRECT").is_none() => {
-					return Err(CpError::Error(format!(
-						"not writing through dangling symlink {}",
-						shown.quote()
-					)));
+				// GNU refuses a link that leads nowhere, and reports any other
+				// failure to read where a link leads (`cannot stat`).
+				Err(error) if !is_symlink_loop(&filesystem, backup) => {
+					if error.kind() != io::ErrorKind::NotFound {
+						return Err(CpError::IoErrContext(error, format!("cannot stat {}", shown.quote())));
+					}
+					if host.var("POSIXLY_CORRECT").is_none() {
+						return Err(CpError::Error(format!(
+							"not writing through dangling symlink {}",
+							shown.quote()
+						)));
+					}
 				},
 				_ => {},
 			}
@@ -2240,12 +2274,14 @@ fn is_forbidden_to_copy_to_same_file(
 	}
 	if options.backup != BackupMode::None {
 		// GNU makes the backup of a destination that is the source's own
-		// entry only where the two names are the same string (`cp.c`): `a`
-		// and `./a` are the same file.
-		if source != dest && same_entry(filesystem, source_fs, dest_fs) {
+		// entry only where the two names are the same string (`STREQ` in
+		// `cp.c`, not their path components): `a` and `./a`, or `d//a` and
+		// `d/a`, are the same file.
+		if source.as_os_str() != dest.as_os_str() && same_entry(filesystem, source_fs, dest_fs) {
 			return true;
 		}
-		if options.force() && !source_is_symlink {
+		// `-f` makes that backup, with or without `-i`, as GNU's does.
+		if options.unlink_after_failed_open() && !source_is_symlink {
 			return false;
 		}
 		if source_is_symlink && !options.dereference {
@@ -2254,7 +2290,7 @@ fn is_forbidden_to_copy_to_same_file(
 		if dest_is_symlink {
 			return false;
 		}
-		if !dest_is_symlink && !source_is_symlink && dest != source {
+		if !dest_is_symlink && !source_is_symlink && dest.as_os_str() != source.as_os_str() {
 			return false;
 		}
 	}
@@ -2281,6 +2317,10 @@ fn is_forbidden_to_copy_to_same_file(
 /// on the options. Returns the backup made, if any, and whether the
 /// destination is the source's own entry, whose backup copy was the whole
 /// copy ([`back_up_own_entry`]).
+/// `own_backup` is the backup name where the destination is the source's own
+/// entry, as `copy_file` found it for `-u`: GNU copies to it in place of the
+/// destination (`cp.c`), so `--update=none` and `-i` look at it, and at
+/// nothing where nothing is there.
 fn handle_existing_dest(
 	host: &mut Host,
 	state: &CopyState,
@@ -2288,19 +2328,28 @@ fn handle_existing_dest(
 	dest: &Path,
 	options: &Options,
 	source_in_command_line: bool,
+	own_backup: Option<&Path>,
 ) -> CopyResult<(Option<PathBuf>, bool)> {
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
 	let dest_fs = host.resolve(dest);
-	if options.update == UpdateMode::None {
+	let asked_about = match own_backup {
+		Some(backup) => filesystem.symlink_metadata(backup).is_ok().then(|| backup_display(dest, backup)),
+		None => Some(dest.to_path_buf()),
+	};
+	if options.update == UpdateMode::None
+		&& let Some(path) = &asked_about
+	{
 		if options.debug {
-			let _ = writeln!(host.stdout, "skipped {}", dest.quote());
+			let _ = writeln!(host.stdout, "skipped {}", path.quote());
 		}
 		return Err(CpError::Skipped(false));
 	}
 
-	if options.update != UpdateMode::IfOlder {
-		options.overwrite.verify(host, dest, options.debug)?;
+	if options.update != UpdateMode::IfOlder
+		&& let Some(path) = &asked_about
+	{
+		options.overwrite.verify(host, path, options.debug)?;
 	}
 
 	// The backup would be renamed over a source that is the destination's
@@ -2325,9 +2374,13 @@ fn handle_existing_dest(
 	// GNU cp renames a numbered backup without replacing and fails when an
 	// entry holds a long name's `~` fallback; here `backup_path` refuses that
 	// name after an lstat (`exclusive`), and the backup below then replaces
-	// whatever is there.
-	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
-		.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?;
+	// whatever is there. The own entry's backup name `copy_file` found is
+	// that name.
+	let backup = match own_backup {
+		Some(backup) => Some(backup.to_path_buf()),
+		None => backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
+			.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?,
+	};
 	if let Some(backup) = &backup {
 		// A backup whose entry is the source's own, or one the source leads
 		// to when cp follows it, would replace what cp is about to read.
@@ -2769,7 +2822,7 @@ fn copy_file(
 	}
 
 	if options.remove_destination()
-		&& source != dest
+		&& source.as_os_str() != dest.as_os_str()
 		&& are_hardlinks_to_same_file(&filesystem, &source_fs, &dest_fs)
 	{
 		filesystem.remove_file(&dest_fs)?;
@@ -2789,10 +2842,26 @@ fn copy_file(
 					return Ok(());
 				}
 			} else if options.backup != BackupMode::None && !dest_is_symlink {
-				if source != dest || !options.force() {
+				if source.as_os_str() != dest.as_os_str() || !options.unlink_after_failed_open() {
 					return Ok(());
 				}
 			}
+		}
+		// A link cp follows, named again as the destination (`cp -fb l
+		// ./l`): GNU makes the own-entry backup only for the same name, so it
+		// backs the link up by renaming it, cannot open the source through
+		// the name it renamed, and renames the backup back.
+		if options.backup != BackupMode::None
+			&& source.as_os_str() != dest.as_os_str()
+			&& source_is_symlink
+			&& dereference
+			&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
+			&& same_entry(&filesystem, &source_fs, &dest_fs)
+		{
+			return Err(CpError::Error(format!(
+				"cannot open {} for reading: No such file or directory",
+				source.quote()
+			)));
 		}
 		// Disallow copying a file to itself, unless `--force` and
 		// `--backup` are both specified.
@@ -2813,25 +2882,41 @@ fn copy_file(
 		}
 	}
 
+	// GNU turns `cp -fb a a`, the same name of an existing destination with
+	// `-f`, into a copy of `a` to its backup name without a backup (`cp.c`),
+	// so `-u` and `-i` look at the backup name.
+	let own_backup = if check_existing_dest
+		&& options.backup != BackupMode::None
+		&& options.unlink_after_failed_open()
+		&& source.as_os_str() == dest.as_os_str()
+	{
+		backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true).ok().flatten()
+	} else {
+		None
+	};
+	let (update_fs, update_shown) = match &own_backup {
+		Some(backup) => (backup.clone(), backup_display(dest, backup)),
+		None => (dest_fs.to_path_buf(), dest.to_path_buf()),
+	};
 	// `-u`/`--update` decides before anything is backed up or removed.
-	if options.copy_mode == CopyMode::Update && filesystem.exists(&dest_fs) {
+	if options.copy_mode == CopyMode::Update && filesystem.exists(&update_fs) {
 		match options.update {
 			UpdateMode::All => {},
 			UpdateMode::None => {
 				if options.debug {
-					let _ = writeln!(host.stdout, "skipped {}", dest.quote());
+					let _ = writeln!(host.stdout, "skipped {}", update_shown.quote());
 				}
 				return Ok(());
 			},
 			UpdateMode::NoneFail => {
-				return Err(CpError::Error(format!("not replacing {}", dest.quote())));
+				return Err(CpError::Error(format!("not replacing {}", update_shown.quote())));
 			},
 			UpdateMode::IfOlder => {
-				let dest_time = filesystem.symlink_metadata(&dest_fs)?.modified()?;
+				let dest_time = filesystem.symlink_metadata(&update_fs)?.modified()?;
 				if source_metadata.modified()? <= dest_time {
 					return Ok(());
 				}
-				options.overwrite.verify(host, dest, options.debug)?;
+				options.overwrite.verify(host, &update_shown, options.debug)?;
 			},
 		}
 	}
@@ -2839,7 +2924,8 @@ fn copy_file(
 	let mut backup = None;
 	if check_existing_dest {
 		let own_entry;
-		(backup, own_entry) = handle_existing_dest(host, state, source, dest, options, source_in_command_line)?;
+		(backup, own_entry) =
+			handle_existing_dest(host, state, source, dest, options, source_in_command_line, own_backup.as_deref())?;
 		if own_entry {
 			return Ok(());
 		}
