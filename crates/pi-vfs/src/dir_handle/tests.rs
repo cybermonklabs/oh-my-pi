@@ -1872,9 +1872,12 @@ mod unix {
 	/// process. With the helper and releases reaching the FIFO through
 	/// `/proc`, where the helper waits on the renamed FIFO until a release
 	/// reaches it, and by name, as without `/proc`, where the helper finds
-	/// the name gone. Through a handle's `open_at_async` and the facade's own
-	/// open. Linux only: only there does a pin hold the FIFO. In a process of
-	/// its own, so the hooks take this test's pins and helpers.
+	/// the name gone (so the open can fail with `NotFound` before its first
+	/// poll returns). The control, taken in the hook while the pin is held:
+	/// the scan of descriptors sees the pin. Through a handle's
+	/// `open_at_async` and the facade's own open. Linux only: only there does
+	/// a pin hold the FIFO. In a process of its own, so the hooks take this
+	/// test's pins and helpers.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_fifo_renamed_just_after_its_pin_is_still_released() {
@@ -1895,33 +1898,49 @@ mod unix {
 				let name = format!("r-{route}-{by_name}");
 				let (fifo, parked) = (tree.at(&name), tree.at(&format!("parked-{route}-{by_name}")));
 				mkfifo(&fifo);
+				let (pinned_tx, pinned) = std::sync::mpsc::channel();
 				{
 					let (fifo, parked) = (fifo.clone(), parked.clone());
-					crate::fs::fifo_seam::after_pin(move || std::fs::rename(fifo, parked).unwrap());
+					crate::fs::fifo_seam::after_pin(move || {
+						std::fs::rename(fifo, &parked).unwrap();
+						let meta = std::fs::symlink_metadata(&parked).unwrap();
+						let id = (meta.dev(), meta.ino());
+						pinned_tx.send((id, descriptors_of(id).len())).unwrap();
+					});
 				}
 				let (started_tx, started) = std::sync::mpsc::channel();
 				let helper_opened = hook_next_fifo_helper(started_tx, None);
-				let id = runtime().block_on(async {
+				let through_proc = !by_name && Path::new("/proc/self/fd").is_dir();
+				runtime().block_on(async {
 					let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
 					tokio::select! {
 						biased;
-						_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+						opened = &mut open => {
+							// By name the helper may have found the name gone
+							// already.
+							let gone = opened
+								.as_ref()
+								.is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
+							assert!(
+								!through_proc && gone,
+								"{case}: a write-only FIFO open with no reader finished: {:?}",
+								opened.map(drop)
+							);
+						},
 						() = std::future::ready(()) => {},
 					}
 					started
 						.recv_timeout(HELPER_BOUND)
 						.unwrap_or_else(|_| panic!("{case}: the helper never started"));
-					let meta = std::fs::symlink_metadata(&parked).unwrap_or_else(|err| {
-						panic!("{case}: the rename after the pin did not run: {err}")
-					});
-					let id = (meta.dev(), meta.ino());
-					// The control: the scan sees the pin the open holds.
-					assert!(
-						!descriptors_of(id).is_empty(),
-						"{case}: no descriptor of the pinned FIFO is seen while its open waits"
-					);
-					id
 				});
+				let (id, seen) = pinned
+					.recv_timeout(HELPER_BOUND)
+					.unwrap_or_else(|_| panic!("{case}: the rename after the pin did not run"));
+				// The control: the scan sees the pin while it is held.
+				assert!(
+					seen > 0,
+					"{case}: no descriptor of the pinned FIFO is seen while it is pinned"
+				);
 				let Ok(opened) = helper_opened.recv_timeout(HELPER_BOUND) else {
 					release_reader_end(&parked);
 					panic!(
@@ -1932,7 +1951,6 @@ mod unix {
 				// Through `/proc` a release connected the helper to the FIFO;
 				// by name (also every way in a run without `/proc`) the helper
 				// found the name gone.
-				let through_proc = !by_name && Path::new("/proc/self/fd").is_dir();
 				assert_eq!(opened, through_proc, "{case}: whether the helper's open succeeded");
 				let start = std::time::Instant::now();
 				loop {
