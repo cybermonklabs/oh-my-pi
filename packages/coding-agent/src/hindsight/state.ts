@@ -4,6 +4,7 @@ import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import type { BasePromptRebuildOptions } from "../session/session-tools";
 import { type BankScope, ensureBankExists, type HindsightBankSet } from "./bank";
 import type { HindsightClientApi } from "./client";
 import type { HindsightConfig } from "./config";
@@ -640,7 +641,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 				}
 			}
 
-			await this.#loadAndPublishMentalModels(generation, previousSnippet, "MM load");
+			// A backend apply or a settings rebuild installed this state: under a held settings rebuild (a switch to
+			// Hindsight or a `hindsight.*` edit on a bound prompt) the snapshot is part of the held change and goes
+			// out with it.
+			await this.#loadAndPublishMentalModels(generation, previousSnippet, "MM load", { joinsHeldChange: true });
 		})();
 		await this.#settleMentalModelsLoadWithinDeadline(bootstrap, generation, previousSnippet);
 	}
@@ -692,6 +696,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		generation: number,
 		previousSnippet: string | undefined,
 		reason: "MM load" | "MM reload" | "MM transcript reload",
+		rebuild?: BasePromptRebuildOptions,
 	): Promise<void> {
 		const result = await tryLoadMentalModelsBlock(
 			this.client,
@@ -709,6 +714,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const published = await this.#refreshBaseSystemPromptAfter(
 			reason,
 			() => generation === this.#mentalModelsLoadGeneration,
+			rebuild,
 		);
 		if (generation !== this.#mentalModelsLoadGeneration) return;
 		if (!published) this.mentalModelsSnippet = previousSnippet;
@@ -755,9 +761,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	async #refreshBaseSystemPromptAfter(
 		reason: "MM load" | "MM reload" | "MM transcript reload",
 		commitIf?: () => boolean,
+		rebuild?: BasePromptRebuildOptions,
 	): Promise<boolean> {
 		try {
-			await this.session.refreshBaseSystemPrompt(commitIf);
+			await this.session.refreshBaseSystemPrompt(commitIf, rebuild);
 			return !commitIf || commitIf();
 		} catch (err) {
 			logger.debug(`Hindsight: refreshBaseSystemPrompt after ${reason} failed`, { error: String(err) });

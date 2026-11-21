@@ -515,6 +515,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import {
+	type BasePromptRebuildOptions,
 	customMessagesByType,
 	customMessagesOf,
 	promptDigestOfEntry,
@@ -7951,10 +7952,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
-	 * change started passes `settingsChange`, which holds it on a bound prompt (see
+	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change
+	 * in the background passes `joinsHeldChange`, which joins a held one (see
 	 * {@link SessionTools.refreshBaseSystemPrompt}).
 	 */
-	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: SettingsChangeOptions): Promise<void> {
+	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
 	}
 

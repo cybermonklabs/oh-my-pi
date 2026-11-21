@@ -626,14 +626,66 @@ function isRecordedSnapcompactRefusal(data: unknown): data is RefusedSnapcompact
 
 /**
  * The cut rule's last answer for an automatic model-summary compaction when it was "waits": the session and model it
- * was weighed for and the prompt cache entry it was weighed on, followed through each request that touched that entry
- * while it was live (`SessionMaintenance.#compactionWaits`).
+ * was weighed for, the prompt cache entry it was weighed on, followed through each request that touched that entry
+ * while it was live (`SessionMaintenance.#compactionWaits`), and the newest compaction on the branch then.
  */
 interface CompactionWait {
 	sessionId: string;
 	/** `provider/id` of the model the compaction was weighed for. */
 	modelKey: string;
 	entry: NonNullable<ContextCutSession["cacheEntry"]>;
+	/** Id of the branch's newest compaction when the rule answered, null with none: another one ends the wait. */
+	compactionId: string | null;
+}
+
+/** A {@link CompactionWait} the session records, with the branch leaf the rule answered at. */
+interface RecordedCompactionWait extends CompactionWait {
+	leafId: string;
+}
+
+/**
+ * Custom session entry holding a {@link RecordedCompactionWait}, written each time the cut rule answers "waits" for an
+ * automatic model-summary compaction on figures the session's newest record does not hold, on the branch current
+ * then: a process that reads the session from its file holds the wait of the newest record while it still applies,
+ * as the process that wrote it did.
+ */
+const COMPACTION_WAIT_ENTRY_TYPE = "compaction-wait";
+
+/**
+ * Custom session entry holding `{ version: 1, sessionId }`, written when a wait the session's newest
+ * {@link COMPACTION_WAIT_ENTRY_TYPE} record holds stops: the rule admits the compaction, or the wait no longer applies.
+ */
+const COMPACTION_WAIT_END_ENTRY_TYPE = "compaction-wait-end";
+
+function isRecordedCompactionWait(data: unknown): data is RecordedCompactionWait & { version: 1 } {
+	if (!isRecord(data) || data.version !== 1 || !isRecord(data.entry)) return false;
+	const { tier, touchedAt, ttlMs } = data.entry;
+	return (
+		typeof data.sessionId === "string" &&
+		typeof data.modelKey === "string" &&
+		typeof data.leafId === "string" &&
+		(typeof data.compactionId === "string" || data.compactionId === null) &&
+		(tier === "short" || tier === "long") &&
+		typeof touchedAt === "number" &&
+		(ttlMs === undefined || typeof ttlMs === "number")
+	);
+}
+
+function isRecordedCompactionWaitEnd(data: unknown): data is { version: 1; sessionId: string } {
+	return isRecord(data) && data.version === 1 && typeof data.sessionId === "string";
+}
+
+/**
+ * What one read of a session's entries records of the cut rule's waits: the newest {@link COMPACTION_WAIT_ENTRY_TYPE}
+ * record of the session, undefined when there is none or a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record ends it, kept
+ * current by this process's own writes; the session and read ({@link SessionManager.loadRevision}) it was taken for;
+ * and whether this process took it in since that read (`SessionMaintenance.#compactionWaits`).
+ */
+interface CompactionWaitRecords {
+	sessionId: string;
+	loadRevision: number;
+	newest: RecordedCompactionWait | undefined;
+	taken: boolean;
 }
 
 /** The figures of `entry` the cut rule reads, kept as they stand now. */
@@ -732,15 +784,23 @@ export class SessionMaintenance {
 	#recordedSnapcompactRefusals: SnapcompactRefusals | undefined;
 	/**
 	 * The cut rule's last answer for an automatic model-summary compaction, while it was "waits". While it holds, no
-	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run.
+	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run. A
+	 * process that read the session from its file takes it from the session's records ({@link #compactionWaits}).
 	 */
 	#compactionWait: CompactionWait | undefined;
+	/**
+	 * The newest wait the session records ({@link COMPACTION_WAIT_ENTRY_TYPE}): read once for each session the manager
+	 * holds and each time it reads the session's file, and kept current by this process's own writes
+	 * ({@link #sessionCompactionWaits}).
+	 */
+	#recordedCompactionWaits: CompactionWaitRecords | undefined;
 	/**
 	 * The read of the session's entries ({@link SessionManager.loadRevision}) when the cut rule last answered for an
 	 * automatic model-summary compaction ({@link #recordCompactionAnswer}); 0, as in a session this process began,
 	 * until it first answers. Another revision means this process read the session from its file (a resume, a
 	 * `/resume` switch) and knows no answer from before the read, while the process that wrote it may have been
-	 * waiting on the compaction ({@link deferThresholdCompactionToSpeculation} asks the rule first then).
+	 * waiting on the compaction: it takes the wait the session records while that applies ({@link #compactionWaits}),
+	 * and {@link deferThresholdCompactionToSpeculation} asks the rule first otherwise.
 	 */
 	#compactionAnswerRevision = 0;
 
@@ -946,52 +1006,174 @@ export class SessionMaintenance {
 
 	/**
 	 * Records the cut rule's answer for an automatic model-summary compaction: a wait on the entry the next request
-	 * reads, or nothing once the rule admitted it.
+	 * reads, or nothing once the rule admitted it. The session records it too, so a process that reads the session
+	 * from its file holds the same wait: a wait on figures its newest record does not hold writes a
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record, and an answer that ends the recorded wait a
+	 * {@link COMPACTION_WAIT_END_ENTRY_TYPE} one.
 	 */
 	#recordCompactionAnswer(admitted: boolean): void {
 		const model = this.#model;
 		const entry = admitted || !model ? undefined : this.#nextPromptCacheEntry();
-		this.#compactionAnswerRevision = this.#host.sessionManager.loadRevision;
-		this.#compactionWait =
+		const sessionManager = this.#host.sessionManager;
+		// The answer stands over the wait the session records.
+		const records = this.#sessionCompactionWaits();
+		records.taken = true;
+		this.#compactionAnswerRevision = sessionManager.loadRevision;
+		const wait: CompactionWait | undefined =
 			!model || !entry
 				? undefined
 				: {
-						sessionId: this.#host.sessionManager.getSessionId(),
+						sessionId: records.sessionId,
 						modelKey: `${model.provider}/${model.id}`,
 						entry: cacheEntryFigures(entry),
+						compactionId: getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null,
 					};
+		this.#compactionWait = wait;
+		if (!wait) {
+			this.#endRecordedCompactionWait(records);
+			return;
+		}
+		const newest = records.newest;
+		const leafId = sessionManager.getLeafId();
+		if (
+			leafId === null ||
+			(newest?.modelKey === wait.modelKey &&
+				newest.compactionId === wait.compactionId &&
+				newest.entry.tier === wait.entry.tier &&
+				newest.entry.touchedAt === wait.entry.touchedAt &&
+				newest.entry.ttlMs === wait.entry.ttlMs)
+		) {
+			return;
+		}
+		const recorded: RecordedCompactionWait = { ...wait, entry: { ...wait.entry }, leafId };
+		sessionManager.appendCustomEntry(COMPACTION_WAIT_ENTRY_TYPE, { version: 1, ...recorded });
+		records.newest = recorded;
 	}
 
 	/**
 	 * Whether the cut rule's last answer for an automatic model-summary compaction is still "waits" on the same cache
-	 * entry: same session and model, and the entry the next request reads is the one the rule waited on, readable, not
-	 * lapsed, and touched since only by requests that came while it was live. A lapse, an entry the next request
-	 * cannot read, a new entry, another session or model end the wait, as does a pass the rule admits (a forced reason
-	 * among them, {@link #recordCompactionAnswer}). The real pass asks the rule again at every maintenance point; this
-	 * only keeps a background summary from being requested, at a model call each, for a cut that cannot run yet.
+	 * entry: same session and model, the same newest compaction on the branch, and the entry the next request reads is
+	 * the one the rule waited on, readable, not lapsed, and touched since only by requests that came while it was
+	 * live. A lapse, an entry the next request cannot read, a new entry, another session, model or compaction end the
+	 * wait, as does a pass the rule admits (a forced reason among them, {@link #recordCompactionAnswer}); the session
+	 * records the end. A process that read the session from its file since it last answered takes the wait the session
+	 * records instead ({@link #takeRecordedCompactionWait}). The real pass asks the rule again at every maintenance
+	 * point; this only keeps a background summary from being requested, at a model call each, for a cut that cannot
+	 * run yet.
 	 */
 	#compactionWaits(): boolean {
+		const records = this.#sessionCompactionWaits();
+		if (!records.taken) {
+			records.taken = true;
+			if (this.#compactionAnswerRevision !== records.loadRevision) return this.#takeRecordedCompactionWait(records);
+		}
 		const wait = this.#compactionWait;
 		if (!wait) return false;
-		const model = this.#model;
 		const entry = this.#nextPromptCacheEntry();
-		if (
-			model &&
-			entry &&
-			!entry.refreshMissed &&
-			wait.sessionId === this.#host.sessionManager.getSessionId() &&
-			wait.modelKey === `${model.provider}/${model.id}` &&
-			entry.tier === wait.entry.tier &&
-			entry.touchedAt >= wait.entry.touchedAt &&
-			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
-			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
-			!promptCacheEntryLapsed(entry, Date.now())
-		) {
+		if (entry && entry.touchedAt >= wait.entry.touchedAt && this.#compactionWaitHolds(wait, entry)) {
 			wait.entry = cacheEntryFigures(entry);
 			return true;
 		}
 		this.#compactionWait = undefined;
+		if (wait.sessionId === records.sessionId) this.#endRecordedCompactionWait(records);
 		return false;
+	}
+
+	/**
+	 * Takes the wait of the session's newest record as this process's own while it still applies: as a wait holds
+	 * ({@link #compactionWaitHolds}), on a branch that carries the leaf the rule answered at. The record holds the touch
+	 * its writer saw when the request left, a moment after the reply this process reads from the file began, so the
+	 * branch, not that touch, shows the entry the next request reads is not an older one; the wait follows that entry
+	 * from then on. A record that does not apply is ended, as a wait that stops is, and the wait this process held
+	 * before the read gives way to the records either way.
+	 */
+	#takeRecordedCompactionWait(records: CompactionWaitRecords): boolean {
+		const recorded = records.newest;
+		const entry = this.#nextPromptCacheEntry();
+		if (
+			!recorded ||
+			!entry ||
+			this.#host.sessionManager.getBranchView().findLastIndex(branchEntry => branchEntry.id === recorded.leafId) <
+				0 ||
+			!this.#compactionWaitHolds(recorded, entry)
+		) {
+			this.#compactionWait = undefined;
+			this.#endRecordedCompactionWait(records);
+			return false;
+		}
+		this.#compactionWait = {
+			sessionId: recorded.sessionId,
+			modelKey: recorded.modelKey,
+			entry: cacheEntryFigures(entry),
+			compactionId: recorded.compactionId,
+		};
+		return true;
+	}
+
+	/**
+	 * Whether `entry`, the one the next request reads, keeps `wait` as the session stands now: same session and model,
+	 * the same newest compaction on the branch, and a readable entry of the same tier, touched again before the entry
+	 * the rule waited on lapsed and not lapsed since.
+	 */
+	#compactionWaitHolds(wait: CompactionWait, entry: ObservedPromptCacheEntry): boolean {
+		const model = this.#model;
+		const sessionManager = this.#host.sessionManager;
+		return (
+			model !== undefined &&
+			!entry.refreshMissed &&
+			wait.sessionId === sessionManager.getSessionId() &&
+			wait.modelKey === `${model.provider}/${model.id}` &&
+			wait.compactionId === (getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null) &&
+			entry.tier === wait.entry.tier &&
+			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
+			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
+			!promptCacheEntryLapsed(entry, Date.now())
+		);
+	}
+
+	/**
+	 * The newest wait the session records on every branch ({@link #recordedCompactionWaits}): the newest
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record of the session, unless a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record
+	 * follows it. A new read is not taken in yet, so the records, which hold every process's answers, stand over the
+	 * wait this process held before it ({@link #compactionWaits}).
+	 */
+	#sessionCompactionWaits(): CompactionWaitRecords {
+		const sessionManager = this.#host.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const loadRevision = sessionManager.loadRevision;
+		const cached = this.#recordedCompactionWaits;
+		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached;
+		let newest: RecordedCompactionWait | undefined;
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type !== "custom") continue;
+			const data = entry.data;
+			if (entry.customType === COMPACTION_WAIT_ENTRY_TYPE) {
+				if (isRecordedCompactionWait(data) && data.sessionId === sessionId) {
+					newest = {
+						sessionId,
+						modelKey: data.modelKey,
+						entry: { tier: data.entry.tier, touchedAt: data.entry.touchedAt, ttlMs: data.entry.ttlMs },
+						compactionId: data.compactionId,
+						leafId: data.leafId,
+					};
+				}
+			} else if (entry.customType === COMPACTION_WAIT_END_ENTRY_TYPE) {
+				if (isRecordedCompactionWaitEnd(data) && data.sessionId === sessionId) newest = undefined;
+			}
+		}
+		const read: CompactionWaitRecords = { sessionId, loadRevision, newest, taken: false };
+		this.#recordedCompactionWaits = read;
+		return read;
+	}
+
+	/** Records that the wait the session's newest record holds stopped, if it holds one. */
+	#endRecordedCompactionWait(records: CompactionWaitRecords): void {
+		if (!records.newest) return;
+		this.#host.sessionManager.appendCustomEntry(COMPACTION_WAIT_END_ENTRY_TYPE, {
+			version: 1,
+			sessionId: records.sessionId,
+		});
+		records.newest = undefined;
 	}
 
 	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */
@@ -2755,12 +2937,13 @@ export class SessionMaintenance {
 	 * extension must keep exact blocking semantics.
 	 *
 	 * A process that read the session from its file (a resume, a `/resume`
-	 * switch) asks the cut rule before its first summary since the read, with
-	 * the figures the real pass weighs (`pendingContextTokens`: the pending
-	 * prompt counted in `contextTokens`), and keeps the answer: the process
-	 * that wrote the session may have been waiting on this compaction on the
-	 * entry the next request reads, starting no summary, and a wait starts
-	 * none here either.
+	 * switch) takes the wait the session records while it still applies
+	 * ({@link #compactionWaits}); with none, it asks the cut rule before its
+	 * first summary since the read, with the figures the real pass weighs
+	 * (`pendingContextTokens`: the pending prompt counted in `contextTokens`),
+	 * and keeps the answer: the process that wrote the session may have been
+	 * waiting on this compaction on the entry the next request reads, starting
+	 * no summary, and a wait starts none here either.
 	 */
 	deferThresholdCompactionToSpeculation(
 		contextTokens: number,

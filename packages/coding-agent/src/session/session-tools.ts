@@ -216,6 +216,15 @@ export interface SettingsChangeOptions {
 	settingsChange?: readonly SettingChange[];
 }
 
+/** Options of a base prompt rebuild ({@link SessionTools.refreshBaseSystemPrompt}). */
+export interface BasePromptRebuildOptions extends SettingsChangeOptions {
+	/**
+	 * The rebuild finishes work a settings change started in the background (the mental-model load of a memory backend
+	 * state the change installed): while a settings rebuild is held it joins the hold and goes out with it.
+	 */
+	joinsHeldChange?: boolean;
+}
+
 /**
  * Renders the base prompt for an active tool set. `xdev` is the `xd://` state
  * to render: the live state, or a frozen prefix's committed roster when a
@@ -3991,15 +4000,24 @@ export class SessionTools {
 	 * Rebuilds the stable base prompt for the current tools and model.
 	 * `commitIf` lets asynchronous producers discard a stale rebuild atomically
 	 * after its inputs have been superseded. With `settingsChange` on a bound
-	 * prompt the rebuild is held ({@link #holdSettingsRebuild}). Any other rebuild
-	 * renders the live settings anyway, so one that changes the prompt runs a held
-	 * one with it; one that changes nothing of its own (it renders the build the
-	 * base stands in for again, {@link #baseStandIn}) keeps the base and the hold.
+	 * prompt the rebuild is held ({@link #holdSettingsRebuild}). With
+	 * `joinsHeldChange` while a settings rebuild is held, the rebuild is part of
+	 * the held change: its render becomes the build the bound base stands in for
+	 * ({@link #recordHeldSettingsBuild}) and goes out with the held rebuild. Any
+	 * other rebuild renders the live settings anyway, so one that changes the
+	 * prompt runs a held one with it; one that changes nothing of its own (it
+	 * renders the build the base stands in for again, {@link #baseStandIn}) keeps
+	 * the base and the hold.
 	 */
-	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: SettingsChangeOptions): Promise<void> {
+	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.runToolRegistryMutation(async () => {
 			if (this.#holdSettingsRebuild(options?.settingsChange)) {
 				await this.#recordHeldSettingsBuild();
+				return;
+			}
+			if (options?.joinsHeldChange && this.#heldSettingsRebuild) {
+				const render = await this.#prepareBaseSystemPrompt(commitIf);
+				if (render && commitIf?.() !== false) await this.#recordHeldSettingsBuild(render);
 				return;
 			}
 			const base = this.#baseSystemPrompt;
