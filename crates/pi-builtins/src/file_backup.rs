@@ -7,6 +7,7 @@
 
 use std::{
 	ffi::OsStr,
+	io,
 	path::{Path, PathBuf},
 };
 
@@ -88,8 +89,16 @@ pub(crate) fn determine_backup_suffix(matches: &ArgMatches, host: &Host) -> Stri
 	}
 }
 
-/// The backup name for `path` under `mode`, probing numbered backups through
-/// `filesystem`.
+/// The backup name for `path` under `mode`. A numbered backup is
+/// `name.~N~` with N one past the highest version among the entries of
+/// `path`'s directory, as GNU's `numbered_backup` (gnulib backupfile.c)
+/// reads them: every entry `name.~N~` counts, whatever it is, a symlink
+/// that points nowhere included, and N is digits without a leading zero,
+/// compared as a string so that no version overflows. `existing` numbers
+/// when any numbered backup is there, and uses `suffix` otherwise. A
+/// directory that cannot be listed is probed instead, `name.~1~` upward,
+/// for the first name no entry holds (`lstat`), so that the backup never
+/// lands on an entry.
 pub(crate) fn backup_path(
 	filesystem: &BlockingFs,
 	mode: BackupMode,
@@ -101,24 +110,72 @@ pub(crate) fn backup_path(
 		name.push(suffix);
 		with_file_name(path, name)
 	};
-	let numbered = || {
-		(1u64..)
-			.map(|index| simple(OsStr::new(&format!(".~{index}~"))))
-			.find(|candidate| !filesystem.exists(candidate))
-			.expect("backup index space is unbounded")
-	};
-	match mode {
-		BackupMode::None => None,
-		BackupMode::Simple => Some(simple(suffix.as_ref())),
-		BackupMode::Numbered => Some(numbered()),
-		BackupMode::Existing => {
-			if filesystem.exists(simple(OsStr::new(".~1~"))) {
-				Some(numbered())
-			} else {
-				Some(simple(suffix.as_ref()))
+	let numbered = |version: &str| simple(OsStr::new(&format!(".~{version}~")));
+	if matches!(mode, BackupMode::None | BackupMode::Simple) {
+		return (mode == BackupMode::Simple).then(|| simple(suffix.as_ref()));
+	}
+	match highest_backup(filesystem, path) {
+		Ok(Some(highest)) => Some(numbered(&next_version(&highest))),
+		Ok(None) if mode == BackupMode::Numbered => Some(numbered("1")),
+		Ok(None) => Some(simple(suffix.as_ref())),
+		Err(_) => {
+			let taken = |version: u64| filesystem.symlink_metadata(numbered(&version.to_string())).is_ok();
+			if mode == BackupMode::Existing && !taken(1) {
+				return Some(simple(suffix.as_ref()));
 			}
+			let free = (1u64..).find(|&version| !taken(version)).expect("backup versions are unbounded");
+			Some(numbered(&free.to_string()))
 		},
 	}
+}
+
+/// The highest version N, as its digits, among the entries `name.~N~` of
+/// `path`'s directory; `None` when there is none. An entry the listing
+/// cannot read is skipped, as GNU uses the highest version it read.
+fn highest_backup(filesystem: &BlockingFs, path: &Path) -> io::Result<Option<Vec<u8>>> {
+	let Some(name) = file_name(path) else {
+		return Ok(None);
+	};
+	let dir = parent_path(path)
+		.filter(|dir| !dir.as_os_str().is_empty())
+		.unwrap_or(Path::new("."));
+	let mut prefix = name.into_owned();
+	prefix.push(".~");
+	let prefix = prefix.as_encoded_bytes();
+	let mut highest: Option<Vec<u8>> = None;
+	for entry in filesystem.read_dir(dir)?.flatten() {
+		let entry = entry.file_name();
+		let Some(version) = entry
+			.as_encoded_bytes()
+			.strip_prefix(prefix)
+			.and_then(|rest| rest.strip_suffix(b"~"))
+		else {
+			continue;
+		};
+		let counts = matches!(version.first(), Some(b'1'..=b'9')) && version.iter().all(u8::is_ascii_digit);
+		if counts && highest.as_ref().is_none_or(|top| (version.len(), version) > (top.len(), top.as_slice())) {
+			highest = Some(version.to_vec());
+		}
+	}
+	Ok(highest)
+}
+
+/// `version` (ASCII digits) plus one, as digits.
+fn next_version(version: &[u8]) -> String {
+	let mut digits = version.to_vec();
+	let carried = digits.iter_mut().rev().all(|digit| {
+		if *digit == b'9' {
+			*digit = b'0';
+			true
+		} else {
+			*digit += 1;
+			false
+		}
+	});
+	if carried {
+		digits.insert(0, b'1');
+	}
+	String::from_utf8(digits).expect("ASCII digits")
 }
 
 /// Rebuilds the operand-relative display form of `backup`, created beside
