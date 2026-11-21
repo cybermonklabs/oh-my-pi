@@ -1,0 +1,11 @@
+# #[ignore]d tests the rust_test job in .github/workflows/sami-build.yml runs
+# anyway: each alone, after the other tests, with `--ignored --exact <name>`
+# and a 1200 s bound for that one run. The job fails unless each runs there
+# (exactly that test, not still ignored), and when it fails, like any test.
+# A target is a Bazel one (//...), or a cargo one as the test step labels it,
+# <directory>:<kind>:<name> (a cargo workspace in rust-test-cargo-workspaces.txt).
+# One per line: <target> <libtest test name>  <why it is #[ignore]d>.
+//crates/pi-ast:pi-ast_test block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus  a sweep of the whole repository (PI_AST_REPO_CORPUS); upstream runs it by hand in release builds
+//crates/pi-natives:pi_natives_test pty::zombie_repro_tests::cancelled_pty_sessions_do_not_leak_zombies  a storm of cancelled pty sessions that counts the test process's zombies, so no other test's children may be counted
+sdk/rust/omp-rpc:test:smoke smoke_real_server  runs the repository's omp server (bun packages/coding-agent/src/cli.ts --mode rpc), which needs bun, the dependencies and the native addon
+sdk/rust/omp-rpc:test:smoke smoke_scripted_model  runs the omp server against the scripted model server (packages/coding-agent/test/rpc-wire/fake-openai-server.ts)
