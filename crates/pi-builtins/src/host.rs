@@ -3230,15 +3230,21 @@ mod testing {
 	}
 
 	/// Hooks keyed by path, each run once by the first [`run_hook`] for its
-	/// path ([`SwapTree::swap_at`] registers them).
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	/// path ([`SwapTree::swap_at`] and [`hook_at`] register them).
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` at the first [`run_hook`] for `path`.
+	#[cfg(all(unix, feature = "util.rm"))]
+	pub(crate) fn hook_at(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+		HOOKS.lock().push((path, Box::new(hook)));
+	}
 
 	/// Runs (once) the hook a test registered for `path`, if any: the seam
 	/// where a test swaps an entry a walk listed before the utility reaches it.
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg"))]
+	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	pub(crate) fn run_hook(path: &std::path::Path) {
 		let hook = {
 			let mut hooks = HOOKS.lock();
@@ -4107,8 +4113,10 @@ mod testing {
 pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
-#[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
+#[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm")))]
 pub(crate) use testing::run_hook;
+#[cfg(all(test, unix, feature = "util.rm"))]
+pub(crate) use testing::hook_at;
 #[cfg(all(test, unix, any(feature = "util.find", feature = "util.grep", feature = "util.rg")))]
 pub(crate) use testing::SwapTree;
 

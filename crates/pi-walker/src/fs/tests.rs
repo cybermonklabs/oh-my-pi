@@ -15,7 +15,7 @@ impl TempDir {
 	fn new(tag: &str) -> Self {
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let n = NEXT.fetch_add(1, Ordering::Relaxed);
-		let path = std::env::temp_dir()
+		let path = crate::testing::temp_root()
 			.canonicalize()
 			.unwrap()
 			.join(format!("pg-fs-{tag}-{}-{n}", std::process::id()));

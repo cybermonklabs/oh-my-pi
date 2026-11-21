@@ -1,6 +1,7 @@
 //! Test-only helpers: an in-memory `mem://` provider, so walks and searches
 //! run through a non-native [`Fs`] with URL roots; the symlink-swap tree
-//! ([`SwapTree`]); and [`settle`] for the listing cache.
+//! ([`SwapTree`]); [`settle`] for the listing cache; and [`temp_root`], where
+//! tests make their trees.
 
 use std::{
 	collections::BTreeMap,
@@ -22,6 +23,20 @@ const MEM_DEV: u64 = 7;
 
 /// Symlink hops before resolution fails, like `ELOOP`.
 const MAX_HOPS: usize = 40;
+
+/// Where a test makes its trees: Bazel's per-test `TEST_TMPDIR` when it is
+/// set, else the system's temporary directory. `TEST_TMPDIR` lies below the
+/// test's sandbox directory, which Bazel removes, also after it kills the
+/// test; under the process-wrapper sandbox `/tmp` is the host's, where a
+/// killed test's tree would stay. A Bazel 9.2.0 server that removed a chain
+/// of 1,215 levels left in its sandbox died (exit 37; it survived 1,205), so
+/// every chain a test builds stays far shorter.
+pub fn temp_root() -> PathBuf {
+	std::env::var_os("TEST_TMPDIR")
+		.map(PathBuf::from)
+		.filter(|dir| dir.is_dir())
+		.unwrap_or_else(std::env::temp_dir)
+}
 
 #[derive(Debug)]
 enum Kind {
@@ -345,17 +360,19 @@ pub enum Outside {
 /// removes it.
 #[cfg(unix)]
 pub struct SwapTree {
-	base:           PathBuf,
+	base:             PathBuf,
 	/// The walk root.
-	pub root:       PathBuf,
+	pub root:         PathBuf,
 	/// The directory a swap replaces.
-	pub sub:        PathBuf,
+	pub sub:          PathBuf,
 	/// The final component of `sub`.
-	pub sub_name:   String,
+	pub sub_name:     String,
 	/// The name of the file listed in `sub`.
-	pub decoy_name: String,
-	outside:        PathBuf,
-	opened:         Arc<Mutex<Option<crate::fs::seam::Open>>>,
+	pub decoy_name:   String,
+	/// The name of the file in `outside/` ([`Outside`]).
+	pub outside_name: String,
+	outside:          PathBuf,
+	opened:           Arc<Mutex<Option<crate::fs::seam::Open>>>,
 }
 
 #[cfg(unix)]
@@ -365,7 +382,7 @@ impl SwapTree {
 		static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		let tag = format!("{tag}-{}-{n}", std::process::id());
-		let base = std::env::temp_dir()
+		let base = temp_root()
 			.canonicalize()
 			.expect("temp dir canonicalizes")
 			.join(format!("pi-walker-swap-{tag}"));
@@ -386,8 +403,17 @@ impl SwapTree {
 			Outside::OtherName => format!("secret-{tag}.txt"),
 			Outside::SameName => decoy_name.clone(),
 		};
-		std::fs::write(outside_dir.join(outside_name), "needle outside\n").expect("outside file");
-		Self { base, root, sub, sub_name, decoy_name, outside: outside_dir, opened: Arc::default() }
+		std::fs::write(outside_dir.join(&outside_name), "needle outside\n").expect("outside file");
+		Self {
+			base,
+			root,
+			sub,
+			sub_name,
+			decoy_name,
+			outside_name,
+			outside: outside_dir,
+			opened: Arc::default(),
+		}
 	}
 
 	/// Swaps `sub` for a symlink to `outside/` now.

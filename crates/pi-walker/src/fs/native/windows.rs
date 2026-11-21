@@ -55,10 +55,11 @@ use windows_sys::{
 			FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
 			FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
 			FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-			FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
-			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
-			FileDispositionInfo, FileDispositionInfoEx, GetFileInformationByHandle,
-			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE, SetFileInformationByHandle,
+			FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+			FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+			FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo, FileDispositionInfoEx,
+			GetFileInformationByHandle, GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE,
+			SetFileInformationByHandle,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
@@ -146,6 +147,17 @@ fn open_path(path: &Path, access: u32) -> io::Result<Handle> {
 		.access_mode(access)
 		.share_mode(SHARE_ALL)
 		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+		.open(path)?;
+	Ok(OwnedHandle::from(file))
+}
+
+/// [`open_path`] with `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a reparse
+/// point at `path` itself instead of its target.
+fn open_path_unlinked(path: &Path, access: u32) -> io::Result<Handle> {
+	let file = std::fs::OpenOptions::new()
+		.access_mode(access)
+		.share_mode(SHARE_ALL)
+		.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
 		.open(path)?;
 	Ok(OwnedHandle::from(file))
 }
@@ -303,10 +315,31 @@ pub(crate) fn open_dir(_s: &mut Scratch, path: &Path) -> io::Result<Handle> {
 	Ok(h)
 }
 
+/// Opens the directory at `path` without following a reparse point that is
+/// its final component: one there is refused (`ERROR_STOPPED_ON_SYMLINK`),
+/// as listings report every reparse point as a symlink.
+pub(crate) fn open_dir_unlinked(_s: &mut Scratch, path: &Path) -> io::Result<Handle> {
+	let h = open_path_unlinked(path, DIR_ACCESS)?;
+	let info = query_handle(&h)?;
+	if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
+	if info_of(&info).file_type != Some(FileType::Dir) {
+		return Err(win_error(ERROR_DIRECTORY));
+	}
+	Ok(h)
+}
+
 /// Opens the subdirectory `name` of `parent` without following a reparse
 /// point that replaced it since the listing.
 pub(crate) fn open_child(s: &mut Scratch, parent: &Handle, name: &[u8]) -> io::Result<Handle> {
 	nt_open(s, parent, name, DIR_ACCESS, FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT)
+}
+
+/// A relative `NtCreateFile` name cannot climb with `..`, so a parent is
+/// opened again below the root instead (the caller's fallback).
+pub(crate) fn open_parent(_s: &mut Scratch, _child: &Handle) -> io::Result<Handle> {
+	Err(io::ErrorKind::Unsupported.into())
 }
 
 const fn is_dot_or_dot_dot_utf16(name: &[u8]) -> bool {
@@ -828,7 +861,8 @@ mod tests {
 	/// query is not checked, and when none refused it the test prints UNKNOWN.
 	#[test]
 	fn a_file_that_refuses_the_attribute_query_is_stated_through_std() {
-		let held = std::env::temp_dir().join(format!("pi-walker-locked-{}", std::process::id()));
+		let held =
+			crate::testing::temp_root().join(format!("pi-walker-locked-{}", std::process::id()));
 		std::fs::write(&held, b"held").unwrap();
 		let lock = std::fs::OpenOptions::new()
 			.read(true)

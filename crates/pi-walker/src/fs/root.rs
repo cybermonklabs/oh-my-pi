@@ -61,7 +61,7 @@ mod tests {
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn resolve_dir_canonicalizes_and_rejects_non_directories() {
-		let root = std::env::temp_dir().join(format!("pi-walker-root-{}", std::process::id()));
+		let root = crate::testing::temp_root().join(format!("pi-walker-root-{}", std::process::id()));
 		std::fs::create_dir_all(root.join("real")).unwrap();
 		std::fs::write(root.join("file.txt"), "x").unwrap();
 		std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();

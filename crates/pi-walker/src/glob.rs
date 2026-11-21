@@ -364,7 +364,7 @@ mod tests {
 				.duration_since(UNIX_EPOCH)
 				.map_or(0, |d| d.as_nanos());
 			let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-			let path = std::env::temp_dir()
+			let path = crate::testing::temp_root()
 				.join(format!("pi-walker-glob-{}-{nanos}-{seq}", std::process::id()));
 			fs::create_dir_all(&path).expect("create temp dir");
 			Self(path.canonicalize().expect("canonical temp dir"))

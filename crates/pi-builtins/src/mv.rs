@@ -501,7 +501,7 @@ fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Option
 			host.fail(1);
 			Ok(())
 		},
-		Err(e) if target_is_dir => Err(MvFailure::Message(format!(
+		Err(e) if target_is_dir && !is_refusal(&e) => Err(MvFailure::Message(format!(
 			"cannot move {} to {}: {e}",
 			source.quote(),
 			target.quote()
@@ -725,7 +725,11 @@ fn move_files_into_dir(host: &mut Host, files: &[PathBuf], target_dir: &Path, op
 		match rename(host, sourcepath, &targetpath, options, display_manager.as_ref(), &mut copier) {
 			Err(e) if e.to_string().is_empty() => host.fail(1),
 			Err(e) => {
-				let e = format!("cannot move {} to {}: {e}", sourcepath.quote(), targetpath.quote());
+				let e = if is_refusal(&e) {
+					e.to_string()
+				} else {
+					format!("cannot move {} to {}: {e}", sourcepath.quote(), targetpath.quote())
+				};
 				if let Some(pb) = &display_manager {
 					pb.suspend(|| show(host, e));
 				} else {
@@ -802,6 +806,24 @@ fn rename(
 		}
 	}
 
+	// A directory replaces only a directory, as GNU mv decides before it moves
+	// anything. On one file system `rename(2)` refuses any other destination
+	// too (`ENOTDIR`), but across file systems it fails with `EXDEV` before it
+	// looks at the types, and the copy would remove the file or the link in
+	// the directory's place. A backup has moved the destination aside above.
+	if filesystem
+		.symlink_metadata(&from_fs)
+		.is_ok_and(|from| from.file_type().is_dir())
+		&& filesystem
+			.symlink_metadata(&to_fs)
+			.is_ok_and(|to| !to.file_type().is_dir())
+	{
+		return Err(io::Error::other(MvError::NonDirectoryToDirectory(
+			from.quote().to_string(),
+			to.quote().to_string(),
+		)));
+	}
+
 	// "to" may no longer exist if it was backed up
 	if filesystem.exists(&to_fs) && filesystem.is_dir(&to_fs) && !filesystem.is_symlink(&to_fs) {
 		// normalize behavior between *nix and windows
@@ -841,6 +863,12 @@ fn rename(
 /// move may be completed by copying and removing.
 fn crosses_devices(error: &io::Error) -> bool {
 	error.kind() == io::ErrorKind::CrossesDevices
+}
+
+/// Whether a failed move is one of mv's own refusals ([`MvError`]), whose
+/// message names both paths, as GNU's does.
+fn is_refusal(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<MvError>())
 }
 
 /// A wrapper around `rename`, so that if it fails, we try falling back on
@@ -883,10 +911,19 @@ fn rename_with_fallback(
 	};
 
 	// The copy replaces the destination as the rename would have: a
-	// directory is not merged into, a file is not written through.
+	// directory is not merged into, a file is not written through. A
+	// directory replaces only a directory: `rename` refused any other
+	// destination, and one put there since is refused the same way.
 	if file_type.is_dir() {
-		if filesystem.exists(&to_fs) {
-			filesystem.remove_dir_all(&to_fs)?;
+		match filesystem.symlink_metadata(&to_fs) {
+			Ok(to_meta) if to_meta.file_type().is_dir() => remove_moved_tree(host, to, &to_fs)?,
+			Ok(_) => {
+				return Err(io::Error::other(MvError::NonDirectoryToDirectory(
+					from.quote().to_string(),
+					to.quote().to_string(),
+				)));
+			},
+			Err(_) => {},
 		}
 	} else if filesystem.is_symlink(&to_fs) {
 		filesystem.remove_file(&to_fs).map_err(|err| {
@@ -912,10 +949,28 @@ fn rename_with_fallback(
 	}
 
 	if file_type.is_dir() {
-		filesystem.remove_dir_all(&from_fs)
+		remove_moved_tree(host, from, &from_fs)
 	} else {
 		filesystem.remove_file(&from_fs).map_err(describe)
 	}
+}
+
+/// Removes the tree at `path` (resolved: `fs_path`) that a move across
+/// filesystems replaces or copied: a symlink is removed itself, and a
+/// directory with everything in it. A native Unix tree goes through rm's own
+/// descriptor walk ([`crate::rm::remove_quietly`]), as GNU mv removes with
+/// rm's code: it opens each directory as the one `lstat` found, following no
+/// symlink, on every kernel. `std::fs::remove_dir_all` trusts `O_DIRECTORY |
+/// O_NOFOLLOW`, which gVisor before release-20261109.0 follows. rm reports
+/// its own errors, so a failure here is [`Reported`].
+fn remove_moved_tree(host: &mut Host, path: &Path, fs_path: &Path) -> io::Result<()> {
+	#[cfg(all(unix, not(target_os = "redox")))]
+	if host.fs().is_native_local(fs_path) {
+		return if crate::rm::remove_quietly(host, path) { Err(io::Error::other(Reported)) } else { Ok(()) };
+	}
+	#[cfg(not(all(unix, not(target_os = "redox"))))]
+	let _ = path;
+	host.fs().remove_dir_all(fs_path)
 }
 
 fn is_empty_dir(host: &Host, path: &Path) -> bool {
@@ -1150,5 +1205,182 @@ mod tests {
 		let (code, capture) = run_util::<Mv>(&["missing", "target"], "", fixture.path());
 		assert_eq!(code, 1);
 		assert_eq!(capture.err(), "mv: cannot stat 'missing': No such file or directory\n");
+	}
+
+	/// The removal that ends a directory move across filesystems goes, on a
+	/// native path, through rm's walk, which keeps only the directory it
+	/// stat'd: `mv-seam-tree/sub`, replaced by another real directory at rm's
+	/// seam just before its open, is refused, and that directory's file
+	/// stays. The kernel refuses nothing here, so this holds on Linux too.
+	/// `std::fs::remove_dir_all` would never reach rm's seam. The seam is
+	/// keyed by the walk's relative path, so no other test walks a tree of
+	/// this name: under `cargo test`, tests share the seam's hooks.
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_keeps_a_directory_swapped_in_after_its_stat() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		};
+		const TREE: &str = "mv-seam-tree";
+		let cwd = tempdir().unwrap();
+		let (tree, other) = (cwd.path().join(TREE), cwd.path().join("other"));
+		fs::create_dir_all(tree.join("sub")).unwrap();
+		fs::write(tree.join("sub/in"), b"").unwrap();
+		fs::create_dir(&other).unwrap();
+		fs::write(other.join("kept"), b"").unwrap();
+		let swapped = Arc::new(AtomicBool::new(false));
+		let (sub, parked, other_dir, seen) =
+			(tree.join("sub"), cwd.path().join("parked"), other.clone(), Arc::clone(&swapped));
+		crate::host::hook_at(std::path::Path::new(TREE).join("sub"), move || {
+			fs::rename(&sub, &parked).unwrap();
+			fs::rename(&other_dir, &sub).unwrap();
+			seen.store(true, Ordering::SeqCst);
+		});
+		let (mut host, _capture) = Host::for_test(Mv::NAME, "", cwd.path());
+		let removed = super::remove_moved_tree(&mut host, std::path::Path::new(TREE), &tree);
+		assert!(swapped.load(Ordering::SeqCst), "the removal did not go through rm's walk");
+		assert!(tree.join("sub/kept").exists(), "removed a directory that was not the one it stat'd");
+		assert!(removed.is_err(), "a refused directory was reported as removed");
+	}
+
+	/// The removal that ends a directory move across filesystems deletes
+	/// nothing outside the moved tree while `tree/sub` flips between a
+	/// directory and a symlink to `outside/`, 2,000 times. gVisor before
+	/// release-20261109.0 follows a final symlink to a directory despite
+	/// `O_NOFOLLOW` when `O_DIRECTORY` is set (google/gvisor#14786), the
+	/// flags with which `std::fs::remove_dir_all` opens each directory.
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+		use std::sync::atomic::{AtomicBool, Ordering};
+		const RUNS: usize = 2_000;
+		let mut escapes = 0;
+		for _ in 0..RUNS {
+			let cwd = tempdir().unwrap();
+			let (tree, parked, outside) =
+				(cwd.path().join("tree"), cwd.path().join("parked"), cwd.path().join("outside"));
+			let sub = tree.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			fs::create_dir_all(&outside).unwrap();
+			for i in 0..4 {
+				fs::write(sub.join(format!("in{i}")), b"").unwrap();
+				fs::write(outside.join(format!("victim{i}")), b"").unwrap();
+			}
+			let stop = AtomicBool::new(false);
+			std::thread::scope(|scope| {
+				scope.spawn(|| {
+					while !stop.load(Ordering::Relaxed) {
+						if fs::rename(&sub, &parked).is_err() {
+							std::thread::yield_now();
+							continue;
+						}
+						let _ = std::os::unix::fs::symlink(&outside, &sub);
+						for _ in 0..50 {
+							std::hint::spin_loop();
+						}
+						let _ = fs::remove_file(&sub);
+						let _ = fs::rename(&parked, &sub);
+					}
+				});
+				let (mut host, _capture) = Host::for_test(Mv::NAME, "", cwd.path());
+				let _ = super::remove_moved_tree(&mut host, std::path::Path::new("tree"), &tree);
+				stop.store(true, Ordering::Relaxed);
+			});
+			if (0..4).any(|i| !outside.join(format!("victim{i}")).exists()) {
+				escapes += 1;
+			}
+		}
+		eprintln!("{RUNS} runs swapping tree/sub: {escapes} removed a file outside the tree");
+		assert_eq!(escapes, 0, "the moved tree's removal went outside it through a swapped symlink");
+	}
+
+	/// A directory moved into a directory that holds a regular file, or a
+	/// symlink to a directory, at its name is refused as GNU mv 9.4 refuses it,
+	/// with exit status 1, and the file and the link stay. On one file system
+	/// `rename(2)` refuses it too (`ENOTDIR`).
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_does_not_replace_a_non_directory() {
+		let cwd = tempdir().unwrap();
+		refuses_to_replace_non_directories(cwd.path(), cwd.path());
+	}
+
+	/// The same from /dev/shm to the temporary directory, two file systems:
+	/// there `rename(2)` fails with `EXDEV` before it looks at the types, and
+	/// the move removed the file or the link to copy the directory in its
+	/// place.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_directory_moved_across_file_systems_does_not_replace_a_non_directory() {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let device = |path: &std::path::Path| fs::metadata(path).map(|metadata| metadata.dev());
+		match (device("/dev/shm".as_ref()), device(&env::temp_dir())) {
+			(Ok(shm), Ok(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let to = tempdir().unwrap();
+		refuses_to_replace_non_directories(from.path(), to.path());
+		// The copy fallback refuses on its own too: a non-directory put at
+		// the destination after the move's check is not removed.
+		let (mut host, _capture) = Host::for_test(Mv::NAME, "", to.path());
+		let (src, dest) = (from.path().join("src"), to.path().join("file-dest/src"));
+		let err = super::rename_with_fallback(
+			&mut host,
+			&src,
+			&dest,
+			None,
+			&mut crate::cp::MoveCopier::new(false),
+		)
+		.expect_err("the copy fallback replaced a regular file with a directory");
+		assert!(err.to_string().starts_with("cannot overwrite non-directory"), "{err}");
+		assert_eq!(fs::read(&dest).unwrap(), b"kept", "the fallback removed the file");
+		assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "the source changed");
+	}
+
+	/// Moves `from/src`, a directory, into `to/file-dest`, which holds a
+	/// regular file `src`, and into `to/link-dest`, which holds a symlink `src`
+	/// to a directory: each move must fail with GNU's message and leave both
+	/// sides as they were.
+	#[cfg(unix)]
+	fn refuses_to_replace_non_directories(from: &std::path::Path, to: &std::path::Path) {
+		let src = from.join("src");
+		fs::create_dir(&src).unwrap();
+		fs::write(src.join("moved"), b"moved").unwrap();
+		fs::create_dir_all(to.join("file-dest")).unwrap();
+		fs::write(to.join("file-dest/src"), b"kept").unwrap();
+		fs::create_dir_all(to.join("link-dest")).unwrap();
+		fs::create_dir(to.join("elsewhere")).unwrap();
+		std::os::unix::fs::symlink(to.join("elsewhere"), to.join("link-dest/src")).unwrap();
+		for dest in ["file-dest", "link-dest"] {
+			let target = to.join(dest);
+			let (code, capture) =
+				run_util::<Mv>(&[src.to_str().unwrap(), target.to_str().unwrap()], "", to);
+			assert_eq!(
+				(code, capture.err()),
+				(
+					1,
+					format!(
+						"mv: cannot overwrite non-directory '{}' with directory '{}'\n",
+						target.join("src").display(),
+						src.display()
+					)
+				),
+				"{dest}"
+			);
+			assert_eq!(fs::read(src.join("moved")).unwrap(), b"moved", "{dest}: the source changed");
+		}
+		assert_eq!(fs::read(to.join("file-dest/src")).unwrap(), b"kept", "the file was replaced");
+		assert_eq!(
+			fs::read_link(to.join("link-dest/src")).unwrap(),
+			to.join("elsewhere"),
+			"the link was replaced"
+		);
+		assert!(!to.join("elsewhere/moved").exists(), "the move went through the link");
 	}
 }
