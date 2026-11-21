@@ -13,7 +13,7 @@ use std::{
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use clap::ArgMatches;
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
-use pi_vfs::normalize_lexically;
+use pi_vfs::{join_path, normalize_lexically};
 use pi_vfs::{BlockingFs, child_path, file_name, parent_path, with_file_name};
 use uucore::backup_control::BackupMode;
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
@@ -349,30 +349,81 @@ pub(crate) fn source_is_destination_backup(
 /// the rename that makes the backup replaces the entry at `backup`, and the
 /// source is lost only when that entry is the source's own (a long name's
 /// `~` fallback, or `ln -b dest~ dest`, can be) or, when the source is
-/// followed (`follow_source`), the entry it resolves to. Another hard link
+/// followed (`follow_source`), an entry the source leads to: a symbolic
+/// link it passes through, or the file it resolves to. Another hard link
 /// of the source is another entry: replacing it leaves the source, as GNU's
-/// mv, cp and ln leave it. Entries are compared as GNU's `same_nameat`
-/// compares them, by name and directory ([`same_entry`]).
+/// mv, cp and ln leave it. With nothing at `backup` the backup replaces no
+/// entry (`ln -s -b dest~ dest`, before `dest~` exists).
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 pub(crate) fn backup_is_source(filesystem: &BlockingFs, source: &Path, follow_source: bool, backup: &Path) -> bool {
-	same_entry(filesystem, source, backup)
-		|| (follow_source
-			&& filesystem
-				.canonicalize(source)
-				.is_ok_and(|resolved| same_entry(filesystem, &resolved, backup)))
+	if filesystem.symlink_metadata(backup).is_err() {
+		return false;
+	}
+	if follow_source {
+		followed_entries(filesystem, source)
+			.iter()
+			.any(|entry| same_entry(filesystem, entry, backup))
+	} else {
+		same_entry(filesystem, source, backup)
+	}
 }
 
-/// Whether `a` and `b` name the same directory entry: the same name in the
-/// same directory, the directories compared as [`same_file`] compares files.
-/// Directories cannot be hard links, so that is one entry.
+/// The entries reading `path` passes through when it follows symbolic
+/// links: `path`'s own, each link its last name leads to in turn (a
+/// relative target read from the link's directory), and the file it
+/// resolves to. At most 40 links are followed, Linux's limit for one
+/// lookup.
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
-fn same_entry(filesystem: &BlockingFs, a: &Path, b: &Path) -> bool {
-	match (file_name(a), file_name(b)) {
-		(Some(a_name), Some(b_name)) if a_name == b_name => {
-			same_file(filesystem, backup_dir(a), true, backup_dir(b), true)
-		},
-		_ => false,
+fn followed_entries(filesystem: &BlockingFs, path: &Path) -> Vec<PathBuf> {
+	let mut entries = vec![path.to_path_buf()];
+	let mut current = path.to_path_buf();
+	for _ in 0..40 {
+		if !filesystem.symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink()) {
+			break;
+		}
+		let Ok(target) = filesystem.read_link(&current) else {
+			break;
+		};
+		current = match parent_path(&current) {
+			Some(parent) => join_path(parent, &target),
+			None => target,
+		};
+		entries.push(current.clone());
 	}
+	if let Ok(resolved) = filesystem.canonicalize(path) {
+		entries.push(resolved);
+	}
+	entries
+}
+
+/// Whether `a` and `b` name the same directory entry:
+/// - the same name in the same directory, as gnulib's `same_nameat` decides
+///   it, except that the directories are compared as [`same_file`] compares
+///   files, following a symbolic link to a directory as the rename does,
+///   where gnulib `lstat`s them;
+/// - or, where names fold (a case-insensitive filesystem, on which `DEST~`
+///   and `dest~` name one entry), one file with a single link, read with
+///   `lstat` under both names: a file with one link has one entry. A file
+///   with more links cannot be told apart this way; for cp, `copy_data`
+///   finds such a source replaced when it opens it, as GNU cp does.
+///
+/// Directories cannot be hard links, so a directory is one entry.
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
+pub(crate) fn same_entry(filesystem: &BlockingFs, a: &Path, b: &Path) -> bool {
+	let (Some(a_name), Some(b_name)) = (file_name(a), file_name(b)) else {
+		return false;
+	};
+	if a_name == b_name && same_file(filesystem, backup_dir(a), true, backup_dir(b), true) {
+		return true;
+	}
+	let (Ok(a_metadata), Ok(b_metadata)) = (filesystem.symlink_metadata(a), filesystem.symlink_metadata(b)) else {
+		return false;
+	};
+	a_metadata.nlink() == Some(1)
+		&& matches!(
+			(a_metadata.file_id(), b_metadata.file_id()),
+			(Some(a_id), Some(b_id)) if a_id.is_native() == b_id.is_native() && a_id == b_id
+		)
 }
 
 /// Whether `a` and `b`, each followed when its flag says so, are the same

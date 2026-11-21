@@ -39,7 +39,7 @@ use uucore::{
 
 use crate::{
 	file_backup::{
-		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix, same_entry,
 		source_is_destination_backup,
 	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
@@ -1859,22 +1859,27 @@ fn context_for(src: &Path, dest: &Path) -> String {
 	format!("{} -> {}", src.quote(), dest.quote())
 }
 
-/// Backs `dest` up to `backup_path`: renamed away, as GNU does, so the copy
-/// creates a new file; copied when `dest` is the source itself, which must
-/// stay readable.
-fn backup_dest(
-	filesystem: &BlockingFs,
-	dest: &Path,
-	dest_fs: &Path,
-	backup_path: &Path,
-	rename: bool,
-) -> CopyResult<()> {
-	if rename {
-		filesystem.rename(dest_fs, backup_path).map(drop)
-	} else {
-		filesystem.copy(dest_fs, backup_path).map(drop)
+/// Copies `from` to a new file beside `to` and renames it over `to`, so that
+/// whatever `to` holds is replaced, never written through: a symbolic link
+/// to another file, or another link of `from`'s own file.
+fn copy_aside(filesystem: &BlockingFs, from: &Path, to: &Path) -> io::Result<()> {
+	let dir = parent_path(to).unwrap_or(Path::new("."));
+	for attempt in 0..100 {
+		let temp = child_path(dir, format!(".cp-backup.{}.{attempt}", std::process::id()).as_ref());
+		match filesystem.open_with(&temp, OpenOptions::new().write(true).create_new(true)) {
+			Ok(file) => {
+				drop(file);
+				let copied = filesystem.copy(from, &temp).and_then(|_| filesystem.rename(&temp, to));
+				if copied.is_err() {
+					let _ = filesystem.remove_file(&temp);
+				}
+				return copied;
+			},
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+			Err(error) => return Err(error),
+		}
 	}
-	.map_err(|e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote())))
+	Err(io::ErrorKind::AlreadyExists.into())
 }
 
 /// The identity of `path`, when its filesystem reports one.
@@ -2040,12 +2045,12 @@ fn handle_existing_dest(
 	let mut is_dest_removed = false;
 	// GNU cp renames a numbered backup without replacing and fails when an
 	// entry holds a long name's `~` fallback; here `backup_path` refuses that
-	// name after an lstat (`exclusive`), and `backup_dest` then renames with
-	// replacement, as for a simple backup.
+	// name after an lstat (`exclusive`), and the backup below then replaces
+	// whatever is there.
 	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
 		.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?;
 	if let Some(backup) = &backup {
-		// A backup whose entry is the source's own, or the one it resolves
+		// A backup whose entry is the source's own, or one the source leads
 		// to when cp follows it, would replace what cp is about to read.
 		// Another hard link of the source is another entry and is replaced,
 		// as GNU cp replaces it.
@@ -2056,9 +2061,36 @@ fn handle_existing_dest(
 				source.quote()
 			)));
 		}
-		is_dest_removed = filesystem.is_symlink(&dest_fs)
-			|| !paths_refer_to_same_file(&filesystem, &source_fs, &dest_fs, true);
-		backup_dest(&filesystem, dest, &dest_fs, backup, is_dest_removed)?;
+		let cannot_backup = |e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote()));
+		if !filesystem.is_symlink(&dest_fs) && same_entry(&filesystem, &source_fs, &dest_fs) {
+			// `cp -fb a a`: the destination is the source's own entry, which
+			// the copy still reads, so the backup is a copy, as GNU makes it.
+			// GNU refuses a backup name that is the source's file; the copy
+			// is made under a new name and renamed over the backup name, so
+			// it never writes through what that name holds, where GNU does.
+			if paths_refer_to_same_file(&filesystem, &source_fs, backup, true) {
+				return Err(CpError::Error(format!(
+					"{} and {} are the same file",
+					source.quote(),
+					backup_display(dest, backup).quote()
+				)));
+			}
+			copy_aside(&filesystem, &dest_fs, backup).map_err(cannot_backup)?;
+		} else {
+			// GNU renames the destination to the backup name, and the copy
+			// then makes a new destination. Where the backup name is another
+			// link of the destination's own file the rename does nothing, and
+			// GNU's create of the destination then fails; this fails as GNU
+			// does, before anything changes.
+			if paths_refer_to_same_file(&filesystem, &dest_fs, backup, false) {
+				return Err(CpError::Error(format!(
+					"cannot create regular file {}: File exists",
+					dest.quote()
+				)));
+			}
+			filesystem.rename(&dest_fs, backup).map_err(cannot_backup)?;
+			is_dest_removed = true;
+		}
 	}
 	if !is_dest_removed {
 		delete_dest_if_needed_and_allowed(host, state, source, dest, options, source_in_command_line)?;
@@ -2929,6 +2961,20 @@ fn copy_data(
 	let source_file = filesystem.open(&source_fs).map_err(|e| {
 		CpError::IoErrContext(e, format!("cannot open {} for reading", source.quote()))
 	})?;
+	// GNU compares the source it opened with the one it read before the
+	// backup (copy.c, `copy_reg`): where another name of the source's file
+	// aliased the backup name (names that fold, a file with more links), the
+	// backup replaced that entry, and the copy would read the old destination.
+	if let (Some(before), Ok(opened)) = (source_metadata.file_id(), source_file.metadata())
+		&& opened
+			.file_id()
+			.is_some_and(|id| id.is_native() == before.is_native() && id != before)
+	{
+		return Err(CpError::Error(format!(
+			"skipping file {}, as it was replaced while being copied",
+			source.quote()
+		)));
+	}
 	// A stream destination (a FIFO, a device) is written, not truncated.
 	// Owner-writable until the final permissions are applied, so a handle can
 	// still be reopened to preserve timestamps.
