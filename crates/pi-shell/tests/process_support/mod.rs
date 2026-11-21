@@ -179,11 +179,12 @@ impl Run {
 		self
 	}
 
-	/// [`Self::go_signalled`] sends its signal only once the shell has also
-	/// blocked ([`wait_blocked`]): for the real bash, which acts on a signal
-	/// that comes before it blocks in `waitpid` only once the command has
-	/// ended, or at once. Not for obash, which runs a subshell's code in its
-	/// own process, so it can stay running while it waits.
+	/// [`Self::go_signalled`] sends its signal only once the shell and all it
+	/// runs have also blocked ([`wait_blocked`]): bash acts on a signal that
+	/// comes before it blocks in `waitpid` only once the command has ended,
+	/// or at once, and obash takes one it learns of before its wait began as
+	/// come while it ran shell code. Not for a shell that runs shell code
+	/// which never blocks (obash runs a subshell's code in its own process).
 	#[must_use]
 	pub const fn when_blocked(mut self) -> Self {
 		self.blocked = true;
@@ -250,9 +251,12 @@ impl Run {
 
 	/// Run it and send it `sig` once `started` exists (the file the command
 	/// it waits for makes when it has started): to its process group when
-	/// `group` ([`Self::own_group`]), else to the shell alone. Then wait for
-	/// it to end. A shell that ends before the file exists fails the test;
-	/// nextest's own timeout bounds one that never makes it.
+	/// `group` ([`Self::own_group`]), else to the shell alone. Then make
+	/// `started` with the extension `sent` (`$F.sent`), which a command waits
+	/// for to go on, so the signal comes while it runs however late it is
+	/// sent; and wait for the shell to end. A shell that ends before the
+	/// file exists fails the test; nextest's own timeout bounds one that
+	/// never makes it.
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
 		let (mut cmd, _link_dir) = self.command();
 		let mut child = cmd
@@ -268,13 +272,14 @@ impl Run {
 			std::thread::sleep(Duration::from_millis(5));
 		}
 		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
-		// The real bash blocked waiting for the command ([`Self::when_blocked`]).
+		// The shell blocked waiting for the command ([`Self::when_blocked`]).
 		if self.blocked {
 			wait_blocked(pid);
 		}
 		// SAFETY: kill takes integer ids; the child is not reaped yet.
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
+		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
 		outcome(child.wait_with_output().expect("wait for the shell"))
 	}
 }

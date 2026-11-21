@@ -922,43 +922,42 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 	Ok(out)
 }
 
-/// Wait until process `pid` is blocked (its state in `/proc/PID/stat` is
-/// `S`), stopped or gone, and so is every process below it that has a
-/// child of its own. A shell then waits (in `waitpid`, or reading its
-/// terminal), and so does each subshell of it that runs a command, so a
-/// signal sent now comes after each set its wait up. bash 5.2.21 acts on a
-/// terminating signal that comes before it blocks only once the wait ends,
-/// or at once; on a loaded machine a signal sent at the caller's other fact
-/// (a file the command made, a prompt on the screen) came that early, to
-/// bash or to a subshell it forked. A process with no child may run on (a
-/// busy subshell, a command): the signal reaches it from the kernel, and it
-/// does what its disposition says. Off Linux there is no `/proc`: it returns
-/// at once.
+/// Wait until process `pid` and every process below it is blocked (its
+/// state in `/proc/PID/stat` is `S`), stopped or gone. A shell then waits
+/// (in `waitpid`, or reading its terminal), and so does each subshell,
+/// stage or command of it, so a signal sent now comes after each set its
+/// wait up. bash 5.2.21 acts on a terminating signal that comes before it
+/// blocks only once the wait ends, or at once; on a loaded machine a signal
+/// sent at the caller's other fact (a file the command made, a prompt on
+/// the screen) came that early, to bash, to a subshell inside the `fork`
+/// of its command (`make_child` blocks `INT` there, and the new command
+/// never gets it), or to a stage it had forked that had not yet reset its
+/// traps (which then runs the EXIT trap itself). A caller whose shell runs
+/// shell code that never blocks does not wait so. Off Linux there is no
+/// `/proc`: it returns at once.
 pub fn wait_blocked(pid: i32) {
 	#[cfg(target_os = "linux")]
-	while !tree_blocked(pid, true) {
+	while !tree_blocked(pid) {
 		std::thread::sleep(Duration::from_millis(5));
 	}
 	#[cfg(not(target_os = "linux"))]
 	let _ = pid;
 }
 
-/// Whether `pid` (when `itself`, or when it has a child) and the processes
-/// below it that have a child are each blocked, stopped or gone
+/// Whether `pid` and every process below it is blocked, stopped or gone
 /// ([`wait_blocked`]).
 #[cfg(target_os = "linux")]
-fn tree_blocked(pid: i32, itself: bool) -> bool {
+fn tree_blocked(pid: i32) -> bool {
 	let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
 		return true;
 	};
 	let state = stat
 		.rfind(')')
 		.and_then(|close| stat[close + 1..].split_whitespace().next());
-	let kids = children(pid);
-	if (itself || !kids.is_empty()) && matches!(state, Some("R" | "D")) {
+	if matches!(state, Some("R" | "D")) {
 		return false;
 	}
-	kids.into_iter().all(|kid| tree_blocked(kid, false))
+	children(pid).into_iter().all(tree_blocked)
 }
 
 /// The children of `pid`: each of its threads' `children` file, or, where
