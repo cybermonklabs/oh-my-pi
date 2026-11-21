@@ -1170,7 +1170,13 @@ mod windows {
 	fn a_drive_relative_name_is_refused() {
 		let dir = temp("drive");
 		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
-		let victim = format!("pi-vfs-victim-{}", std::process::id());
+		// Unique per run: Wine reuses process ids, and a victim an earlier run
+		// made (a red run of this test) must not read as this run's.
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let victim = format!("pi-vfs-victim-{}-{nanos}", std::process::id());
 		let names = [format!("C:{victim}"), format!("c:{victim}"), "C:".to_owned()];
 		for name in &names {
 			let name = OsStr::new(name);
@@ -1203,11 +1209,22 @@ mod windows {
 			eprintln!("UNKNOWN: no directory symlink could be made here ({err}); nothing was checked");
 			return;
 		}
+		// Wine's CreateSymbolicLinkW is a stub that reports success and makes
+		// nothing: an instrument that made no link checks nothing.
+		if !std::fs::symlink_metadata(dir.join("d")).is_ok_and(|meta| meta.is_symlink()) {
+			eprintln!(
+				"UNKNOWN: the directory symlink was reported made but is not there; nothing was \
+				 checked"
+			);
+			return;
+		}
 		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
 		let d = match root.open_dir_at(OsStr::new("d")) {
 			Ok(d) => d,
 			Err(err) => {
-				eprintln!("open_dir_at refused the link itself ({err:?}): nothing to call through");
+				eprintln!(
+					"UNKNOWN: open_dir_at refused the link itself ({err:?}): nothing to call through"
+				);
 				return;
 			},
 		};
