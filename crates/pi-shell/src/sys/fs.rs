@@ -11,9 +11,9 @@
 //! the scheduler (`read -t` timers, other vprocs). [`StdFile`] checks
 //! readiness first and returns `Pending` with the waker stored among the
 //! tasks waiting in that direction, which one registration on the shared
-//! readiness thread wakes together (`ready::Waiters`); the descriptor's flags
-//! stay untouched, since externals inherit them. Windows pipes and consoles
-//! keep blocking I/O (anonymous pipes cannot be polled).
+//! readiness thread wakes together (`sys::wakers::Wakers`); the descriptor's
+//! flags stay untouched, since externals inherit them. Windows pipes and
+//! consoles keep blocking I/O (anonymous pipes cannot be polled).
 //!
 //! Windows specifics: `test -x` holds for directories, files with a
 //! `PATHEXT` extension and files starting with `#!`; process substitution
@@ -60,7 +60,7 @@ pub struct StdFile {
 	/// they are dropped, and forgotten by the waiting thread, before `file`
 	/// closes.
 	#[cfg(unix)]
-	waiters: [crate::sys::ready::Waiters; 2],
+	waiting: [Waiting; 2],
 	file:    fs::File,
 	kind:    FileKind,
 	/// Access mode of the open file description (`O_ACCMODE` bits of
@@ -73,6 +73,69 @@ pub struct StdFile {
 	/// ([`StdFile::opened`]); `None` for every other file and once the
 	/// descriptor was handed out ([`File::os_handle`], [`File::dup`]).
 	ahead:   RefCell<Option<Ahead>>,
+}
+
+/// The tasks waiting for one direction of a [`StdFile`] to be ready, and the
+/// one readiness watch whose waker wakes them all
+/// ([`Wakers`](crate::sys::wakers::Wakers)): a task's wait is never replaced
+/// by another's. Dropping it, with its file, wakes them: they poll whatever
+/// stands in the file's place.
+#[cfg(unix)]
+#[derive(Default)]
+struct Waiting {
+	watch: Option<crate::sys::ready::Watch>,
+	tasks: std::sync::Arc<crate::sys::wakers::Wakers>,
+}
+
+#[cfg(unix)]
+impl Waiting {
+	/// Store `waker` with the tasks waiting for `fd` to be ready for
+	/// `events`; the first one stored registers the watch that wakes them all.
+	fn wait(
+		&mut self,
+		fd: std::os::fd::RawFd,
+		events: i16,
+		waker: &std::task::Waker,
+	) -> io::Result<()> {
+		use std::{sync::Arc, task::Waker};
+
+		if self.tasks.add(waker) {
+			// Nothing watches the descriptor: the last watch fired, or there
+			// was none.
+			self.watch = None;
+			match crate::sys::ready::watch(fd, events, &Waker::from(Arc::clone(&self.tasks))) {
+				Ok(w) => self.watch = Some(w),
+				Err(e) => {
+					// Nothing would wake the stored tasks: each polls again
+					// and meets the error itself.
+					for w in self.tasks.take() {
+						w.wake();
+					}
+					return Err(e);
+				},
+			}
+		}
+		Ok(())
+	}
+}
+
+#[cfg(unix)]
+impl Drop for Waiting {
+	fn drop(&mut self) {
+		self.watch = None;
+		for w in self.tasks.take() {
+			w.wake();
+		}
+	}
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for Waiting {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Waiting")
+			.field("watch", &self.watch)
+			.finish_non_exhaustive()
+	}
 }
 
 /// Bytes of a regular file read from the kernel beyond what the engine
@@ -191,7 +254,7 @@ impl StdFile {
 			file,
 			kind,
 			#[cfg(unix)]
-			waiters: Default::default(),
+			waiting: Default::default(),
 			#[cfg(unix)]
 			access,
 			null,
@@ -232,7 +295,7 @@ impl StdFile {
 		}
 		// Another task may wait here too, with a waker of its own: both are
 		// woken once the descriptor is ready.
-		if let Err(e) = self.waiters[slot].wait(fd, events, cx.waker()) {
+		if let Err(e) = self.waiting[slot].wait(fd, events, cx.waker()) {
 			return Poll::Ready(Err(e));
 		}
 		// It may have become ready before the wait was registered; the
@@ -1815,10 +1878,11 @@ mod tests {
 			assert!(waiting.woken(), "a task waiting on a dropped file was never woken");
 		}
 
-		/// However many tasks wait on one file, it keeps at most 64 wakers:
+		/// However many tasks wait on one file, the first 64 wakers are kept;
 		/// the task that finds them all taken wakes every stored one (each
-		/// polls again and waits anew) and is kept itself. One waker that
-		/// polls again (the engine's vprocs share one) is kept once.
+		/// polls again and waits anew) and is kept itself (the set's cap then
+		/// doubles). One waker that polls again (the engine's vprocs share
+		/// one) is kept once.
 		#[test]
 		fn tasks_past_the_cap_wake_the_stored_ones() {
 			let mut fifo = FullFifo::new();

@@ -52,6 +52,8 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+#[cfg(unix)]
+mod wakers;
 
 #[cfg(all(test, unix))]
 pub(crate) use crate::sys::fs::pending_polls;
