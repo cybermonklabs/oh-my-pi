@@ -527,6 +527,45 @@ describe("K23: a refresh whose read of a source fails", () => {
 	});
 });
 
+describe("K32: a source rewritten in the clock tick of its read", () => {
+	it("K32: reads again each file a same-size rewrite left with the stat it had, and keeps its stamp once it has settled", async () => {
+		const [ymlBefore, ymlAfter] = ["yml-held-value-C1", "yml-held-value-C2"];
+		const [fileBefore, fileAfter] = ["file-held-value-D1", "file-held-value-D2"];
+		const tokenFile = await writeFile("same-tick.txt", fileBefore);
+		await Bun.write(projectYml, plainYml(ymlBefore));
+		// The stat of each file now: a rewrite of the same size in the same tick of the filesystem's
+		// clock leaves it as it is.
+		const frozen = new Map([tokenFile, projectYml].map(file => [file, fs.statSync(file, { bigint: true })]));
+		const changedMs = Math.max(...[...frozen.values()].map(stat => Number(stat.ctimeNs / 1_000_000n)));
+		// The masker reads in the millisecond after the last write.
+		clock = changedMs + 1;
+		const masker = maskerFor({ EXAMPLE_TOKEN_FILE: tokenFile });
+		const text = [ymlBefore, fileBefore, ymlAfter, fileAfter].join(" ");
+		expect(masker.snapshot(cwd).maskText(text)).toBe([YML_MARKER, FILE_MARKER, ymlAfter, fileAfter].join(" "));
+
+		// Both rotate within that tick, so each still has the stat the read saw.
+		await Bun.write(projectYml, plainYml(ymlAfter));
+		await Bun.write(tokenFile, fileAfter);
+		const realStatSync = fs.statSync;
+		spyOn(fs, "statSync").mockImplementation(
+			((file: fs.PathLike, options?: fs.StatSyncOptions) =>
+				(typeof file === "string" ? frozen.get(file) : undefined) ??
+				realStatSync(file, options)) as typeof fs.statSync,
+		);
+		await nextRun();
+		clock += MINUTE;
+		const masked = [YML_MARKER, FILE_MARKER, YML_MARKER, FILE_MARKER].join(" ");
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked);
+
+		// Settled by that read: the next refresh opens neither file.
+		const opens = spyOn(fs, "openSync");
+		await nextRun();
+		clock += MINUTE;
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked);
+		expect(opens.mock.calls.map(call => String(call[0])).filter(file => frozen.has(file))).toEqual([]);
+	});
+});
+
 describe("K24: matches that overlap", () => {
 	const LEFT = "left-part-AAAA";
 	const RIGHT = "AAAA-right-part";
