@@ -561,11 +561,11 @@ mod tests {
 		}
 	}
 
-	/// An executable stub standing in for `git`.
-	/// A stand-in `git` that runs `script`, written by a child
-	/// ([`crate::testprog`]): written here, a fork by another test's thread
-	/// could keep it open for writing, and running it would fail with
-	/// `ETXTBSY`.
+	/// An executable stub standing in for `git`, which runs `script`.
+	///
+	/// A child writes it ([`crate::testprog`]): written here, a fork by
+	/// another test's thread could keep it open for writing, and running it
+	/// would fail with `ETXTBSY`.
 	#[cfg(unix)]
 	fn stub(root: &TempDirGuard, script: &str) -> PathBuf {
 		let path = root.path().join("git");
