@@ -63,6 +63,27 @@ function captureBinds(afterBind?: () => Promise<void>): IpcServer[] {
 	return servers;
 }
 
+/**
+ * Record the scope lease the broker takes, so a case can check that the broker let it go: the first
+ * native lock it acquires whose path begins with the runtime dir's, wherever the broker keeps it (in
+ * the dir or beside it). A case that checked a fixed path would pass, checking nothing, once the
+ * lease moved.
+ */
+function recordLeasePath(runtimeDir: string): () => string {
+	const scope = path.resolve(runtimeDir);
+	const tryAcquire = FileLock.tryAcquire.bind(FileLock);
+	let leasePath: string | undefined;
+	spyOn(FileLock, "tryAcquire").mockImplementation((lockPath: string) => {
+		const lock = tryAcquire(lockPath);
+		if (leasePath === undefined && lock.acquired && lockPath.startsWith(scope)) leasePath = lockPath;
+		return lock;
+	});
+	return () => {
+		if (leasePath === undefined) throw new Error("the broker took no scope lease");
+		return leasePath;
+	};
+}
+
 describe.skipIf(process.platform === "win32")("daemon broker cleanup after a failure", () => {
 	const previousTitle = process.title;
 	let leaked: IpcServer[] = [];
@@ -128,9 +149,10 @@ describe.skipIf(process.platform === "win32")("daemon broker cleanup after a fai
 		await fs.mkdir(runtimeDir, { mode: 0o700 });
 		await fs.writeFile(path.join(runtimeDir, "broker.token"), "", { mode: 0o600 });
 
+		const leasePath = recordLeasePath(runtimeDir);
 		await expect(startBroker(projectDir, runtimeDir, {})).rejects.toThrow("Daemon broker token is empty");
 		// A held lease would make every later broker for this scope exit at once.
-		const lease = FileLock.tryAcquire(path.join(runtimeDir, "broker.pid"));
+		const lease = FileLock.tryAcquire(leasePath());
 		try {
 			expect(lease.acquired).toBe(true);
 		} finally {
@@ -145,6 +167,7 @@ describe.skipIf(process.platform === "win32")("daemon broker cleanup after a fai
 		await fs.mkdir(projectDir);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 60_000 });
 		leaked = captureBinds();
+		const leasePath = recordLeasePath(runtimeDir);
 		const listening = Promise.withResolvers<void>();
 		const broker = startBroker(projectDir, runtimeDir, { onListening: listening.resolve });
 		// Settle into a value so the rejection is asserted rather than reported as unhandled.
@@ -188,7 +211,7 @@ describe.skipIf(process.platform === "win32")("daemon broker cleanup after a fai
 			// The failure surfaces through run() instead of stranding it, and the cleanup still ran.
 			expect(await settled).toBe(failure);
 			expect(await acceptsConnection(daemonBrokerEndpoint(runtimeDir))).toBe(false);
-			const lease = FileLock.tryAcquire(path.join(runtimeDir, "broker.pid"));
+			const lease = FileLock.tryAcquire(leasePath());
 			try {
 				expect(lease.acquired).toBe(true);
 			} finally {

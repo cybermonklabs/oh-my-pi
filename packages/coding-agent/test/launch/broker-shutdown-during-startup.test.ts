@@ -60,14 +60,19 @@ function captureBrokerShutdown(): () => Promise<void> {
 	};
 }
 
-/** Run `observe` at the instant the broker drops its scope lease, to check what is still open then. */
+/**
+ * Run `observe` at the instant the broker drops its scope lease, to check what is still open then.
+ * The lease is the first native lock the broker acquires whose path begins with the runtime dir's,
+ * wherever the broker keeps it (in the dir or beside it); a fixed path would observe nothing once
+ * the lease moved.
+ */
 function observeLeaseRelease(runtimeDir: string, observe: () => void): void {
-	const pidPath = path.join(runtimeDir, "broker.pid");
+	const scope = path.resolve(runtimeDir);
 	const tryAcquire = FileLock.tryAcquire.bind(FileLock);
 	let observed = false;
 	spyOn(FileLock, "tryAcquire").mockImplementation((lockPath: string) => {
 		const lock = tryAcquire(lockPath);
-		if (observed || lockPath !== pidPath || !lock.acquired) return lock;
+		if (observed || !lockPath.startsWith(scope) || !lock.acquired) return lock;
 		observed = true;
 		const release = lock.release.bind(lock);
 		spyOn(lock, "release").mockImplementation(() => {
