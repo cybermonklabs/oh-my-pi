@@ -19,21 +19,20 @@ use std::{
 use super::{check_relative, entry_name};
 
 /// An entry name is exactly one component on every platform: an empty name,
-/// `.`, `..` and a name with a separator are refused everywhere, and on
-/// Windows also a name with a drive prefix (`C:x`), which a join to a
-/// directory's path would turn into that drive's current directory.
+/// `.`, `..` and a name with a separator are refused everywhere (on Windows
+/// `\` is one too). A name holding `:` is one entry here; a Windows host
+/// handle refuses it itself
+/// (`windows::a_colon_name_is_refused_on_the_host_and_taken_by_a_provider`).
 #[test]
 fn entry_names_are_exactly_one_component() {
 	use std::ffi::OsStr;
 	for name in ["", ".", "..", "a/b", "/a", "a/"] {
 		assert!(entry_name(OsStr::new(name)).is_err(), "{name:?}");
 	}
-	for name in ["a", "a b", ".a", "a.", "..a"] {
+	for name in ["a", "a b", ".a", "a.", "..a", "C:x", "ab:s", "x::$INDEX_ALLOCATION", "a:"] {
 		assert!(entry_name(OsStr::new(name)).is_ok(), "{name:?}");
 	}
-	for name in
-		["C:x", "C:", "d:victim", "a\\b", "\\\\?\\x", "\\a", "ab:s", "x::$INDEX_ALLOCATION", "a:"]
-	{
+	for name in ["a\\b", "\\\\?\\x", "\\a"] {
 		assert_eq!(entry_name(OsStr::new(name)).is_err(), cfg!(windows), "{name:?}");
 	}
 }
@@ -959,25 +958,45 @@ mod unix {
 	}
 
 	/// A masked `create_dir_at` sets the mode on the directory it made, never
-	/// through a symlink swapped in for it before the mode is set: the file
-	/// that symlink names keeps its mode.
+	/// on what was swapped in for it between `mkdirat` and the mode: a
+	/// symlink to a file, a regular file renamed there, or a hard link to a
+	/// file. Each such file keeps its mode (0600).
 	#[test]
-	fn a_masked_create_dir_at_sets_no_mode_through_a_symlink_swapped_in() {
+	fn a_masked_create_dir_at_sets_no_mode_on_what_was_swapped_in() {
 		let tree = Tree::new("mkdir-swap");
-		std::fs::write(tree.at("secret"), "key").unwrap();
-		std::fs::set_permissions(tree.at("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
-		let (made, secret) = (tree.at("raced"), tree.at("secret"));
-		super::super::native::after_create_dir(b"raced", move || {
-			std::fs::remove_dir(&made).unwrap();
-			std::os::unix::fs::symlink(&secret, &made).unwrap();
-		});
 		let masked = Fs::native().with_creation_mask(Some(0o022)).blocking();
 		let root = masked.open_dir(tree.at(""), true).unwrap();
-		let created = root.create_dir_at(n("raced"), Some(0o777));
-		let swapped = std::fs::symlink_metadata(tree.at("raced")).unwrap();
-		assert!(swapped.is_symlink(), "the swap did not run ({created:?})");
-		let mode = std::fs::metadata(tree.at("secret")).unwrap().mode() & 0o777;
-		assert_eq!(mode, 0o600, "the mode went through the swapped-in link: {mode:o} ({created:?})");
+		let mode = |rel: &str| std::fs::metadata(tree.at(rel)).unwrap().mode() & 0o777;
+		let mut changed = Vec::new();
+		for swap in ["symlink", "file", "hardlink"] {
+			let (name, victim) = (format!("raced-{swap}"), format!("victim-{swap}"));
+			std::fs::write(tree.at(&victim), "key").unwrap();
+			std::fs::set_permissions(tree.at(&victim), std::fs::Permissions::from_mode(0o600))
+				.unwrap();
+			let (made, target) = (tree.at(&name), tree.at(&victim));
+			super::super::native::after_create_dir(name.as_bytes(), move || {
+				std::fs::remove_dir(&made).unwrap();
+				match swap {
+					"symlink" => std::os::unix::fs::symlink(&target, &made),
+					"file" => std::fs::rename(&target, &made),
+					_ => std::fs::hard_link(&target, &made),
+				}
+				.unwrap();
+			});
+			let created = root.create_dir_at(n(&name), Some(0o777));
+			let swapped = std::fs::symlink_metadata(tree.at(&name)).unwrap();
+			assert!(!swapped.is_dir(), "{swap}: the swap did not run ({created:?})");
+			// The file the swap put there, or the one the link names.
+			let rel = if swap == "file" {
+				name.as_str()
+			} else {
+				victim.as_str()
+			};
+			if mode(rel) != 0o600 {
+				changed.push(format!("{swap}: {rel} {:o} ({created:?})", mode(rel)));
+			}
+		}
+		assert!(changed.is_empty(), "the directory's mode went to a swapped-in file: {changed:?}");
 	}
 
 	/// A provider rename names its destination through the destination
@@ -1201,11 +1220,12 @@ mod unix {
 	const HELPER_BOUND: Duration = Duration::from_secs(30);
 
 	/// A write-only open of a FIFO under a cancellable facade, dropped before
-	/// its helper reaches `open`, leaves no helper behind: the release keeps
-	/// the read end open while it waits, and tries again until the helper
-	/// connects, so the helper's open ends and a later reader and writer of
-	/// the FIFO meet each other, the reader reading what the writer wrote. In
-	/// a process of its own, so the hook takes this test's helper.
+	/// its helper reaches `open`, leaves no helper behind once the helper
+	/// reaches `open` within the release's second: the release keeps the
+	/// read end open while it waits and tries again, so the helper's open
+	/// ends, its file is closed, and a later reader and writer of the FIFO
+	/// meet each other, the reader reading what the writer wrote. In a
+	/// process of its own, so the hook takes this test's helper.
 	#[test]
 	fn a_fifo_open_dropped_before_its_helper_opens_takes_no_later_connection() {
 		if crate::dir_handle::alone(
@@ -1214,7 +1234,8 @@ mod unix {
 			return;
 		}
 		let tree = Tree::new("fifo-dropped");
-		mkfifo(&tree.at("p"));
+		let fifo = tree.at("p");
+		mkfifo(&fifo);
 		let (started_tx, started) = std::sync::mpsc::channel();
 		let (go, hold) = std::sync::mpsc::channel();
 		let helper_opened = hook_next_fifo_helper(started_tx, Some(hold));
@@ -1243,14 +1264,122 @@ mod unix {
 			assert!(opened, "the helper's open failed");
 		} else {
 			// Free the helper, so this process can end, then fail.
-			release_reader_end(&tree.at("p"));
+			release_reader_end(&fifo);
 			panic!("the helper's open was still waiting {HELPER_BOUND:?} after the drop");
 		}
-		// The FIFO is free: a reader and a writer that arrive now meet.
-		let fifo = tree.at("p");
-		let reader = std::thread::spawn(move || std::fs::read(fifo).unwrap());
-		std::fs::write(tree.at("p"), b"data").unwrap();
-		assert_eq!(reader.join().unwrap(), b"data", "the reader's connection was taken");
+		// The helper's file goes to the release, which closes it: until it
+		// has, a later reader could meet the helper's end and read EOF.
+		wait_until_no_writer(&fifo);
+		let exchange_fifo = fifo.clone();
+		ends(
+			"a later reader and writer of the FIFO",
+			move || {
+				let reader_fifo = exchange_fifo.clone();
+				let reader = std::thread::spawn(move || std::fs::read(reader_fifo).unwrap());
+				std::fs::write(&exchange_fifo, b"data").unwrap();
+				assert_eq!(reader.join().unwrap(), b"data", "the reader's connection was taken");
+			},
+			|| {
+				release_reader(&fifo);
+				release_reader_end(&fifo);
+			},
+		);
+	}
+
+	/// Returns once `fifo` has no writer: a non-blocking reader reads end of
+	/// file (0), where a writer that is still open makes it `EAGAIN`. The
+	/// verdict is the read's; [`HELPER_BOUND`] only turns a writer that never
+	/// closes into a failure.
+	fn wait_until_no_writer(fifo: &Path) {
+		use std::os::unix::fs::OpenOptionsExt;
+		let start = std::time::Instant::now();
+		loop {
+			let mut probe = std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(fifo)
+				.unwrap();
+			match probe.read(&mut [0u8; 1]) {
+				Ok(0) => return,
+				Ok(_) => panic!("{} holds data no test wrote", fifo.display()),
+				Err(err) if err.kind() == io::ErrorKind::WouldBlock => {},
+				Err(err) => panic!("{}: {err:?}", fifo.display()),
+			}
+			drop(probe);
+			assert!(start.elapsed() < HELPER_BOUND, "a writer of {} stayed open", fifo.display());
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	/// A release opens the other end only of the FIFO its open started on.
+	/// When the FIFO's name was given to another FIFO since (`rm p; mkfifo
+	/// p`), the release closes what it opened at once and stops, so a writer
+	/// to the new FIFO meets no reader that is about to go away (and would
+	/// lose what it wrote). Through a handle's `open_at_async` and through the
+	/// facade's own open. The helper is held before its `open`, so no release
+	/// can be answered. In a process of its own, so the hooks take this
+	/// test's helpers and releases.
+	#[test]
+	fn a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-replaced");
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let mut write = OpenOptions::new();
+		write.write(true);
+		for route in ["handle", "facade"] {
+			let name = format!("p-{route}");
+			let fifo = tree.at(&name);
+			mkfifo(&fifo);
+			let (started_tx, started) = std::sync::mpsc::channel();
+			let (go, hold) = std::sync::mpsc::channel();
+			let _opened = hook_next_fifo_helper(started_tx, Some(hold));
+			// Each release attempt: whether it held an end, and whether a
+			// writer to the FIFO now at the name met a reader then.
+			let attempts: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+			{
+				let (attempts, fifo) = (Arc::clone(&attempts), fifo.clone());
+				crate::fs::fifo_seam::on_release(move |held| {
+					use std::os::unix::fs::OpenOptionsExt;
+					let writer = std::fs::OpenOptions::new()
+						.write(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&fifo);
+					attempts.lock().push((held, writer.is_ok()));
+				});
+			}
+			runtime().block_on(async {
+				let open: std::pin::Pin<Box<dyn Future<Output = io::Result<File>>>> = match route {
+					"handle" => Box::pin(root.open_at_async(n(&name), &write)),
+					_ => Box::pin(fs.open_with(&fifo, &write)),
+				};
+				let mut open = open;
+				tokio::select! {
+					biased;
+					_ = &mut open => panic!("{route}: a write-only FIFO open with no reader finished"),
+					() = std::future::ready(()) => {},
+				}
+				started
+					.recv_timeout(HELPER_BOUND)
+					.unwrap_or_else(|_| panic!("{route}: the helper never started"));
+				// The name now names another FIFO; then the open is dropped.
+				std::fs::remove_file(&fifo).unwrap();
+				mkfifo(&fifo);
+			});
+			// The helper stays held before its `open` for the rest of the
+			// process.
+			std::mem::forget(go);
+			let attempts = attempts.lock().clone();
+			assert!(!attempts.is_empty(), "{route}: no release ran");
+			assert!(
+				attempts.iter().all(|&(_, met)| !met),
+				"{route}: a writer to the new FIFO met a release's end: {attempts:?}"
+			);
+		}
 	}
 
 	/// Opens `fifo`'s read end without blocking and closes it, which releases
@@ -1304,7 +1433,12 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
-	use std::{ffi::OsStr, io, path::PathBuf};
+	use std::{
+		ffi::OsStr,
+		io,
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
 
 	use crate::{BlockingFs, OpenOptions};
 
@@ -1415,5 +1549,84 @@ mod windows {
 		assert!(made.is_dir(), "{} was not made", made.display());
 		assert!(root.stat_at(OsStr::new(&name), false).unwrap().is_dir());
 		std::fs::remove_dir(&made).unwrap();
+	}
+
+	/// A provider that serves one directory at every path and records the
+	/// directories it is asked to make.
+	#[derive(Debug, Default)]
+	struct Recorder {
+		made: parking_lot::Mutex<Vec<PathBuf>>,
+	}
+
+	#[async_trait::async_trait]
+	impl crate::FileSystem for Recorder {
+		async fn open(&self, _path: &Path, _options: &OpenOptions) -> io::Result<crate::File> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		async fn metadata(&self, _path: &Path) -> io::Result<crate::Metadata> {
+			Ok(crate::Metadata::new(
+				crate::FileType::from_kind(crate::FileKind::Dir),
+				0,
+				crate::Permissions::from_mode(0o755),
+			))
+		}
+
+		async fn read_dir(&self, _path: &Path) -> io::Result<crate::ReadDir> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		async fn create_dir(&self, path: &Path, _mode: Option<u32>) -> io::Result<()> {
+			self.made.lock().push(path.to_path_buf());
+			Ok(())
+		}
+	}
+
+	/// A Windows host handle refuses an entry name holding `:` (a stream of
+	/// another entry, or a drive) and makes nothing; a provider's handle
+	/// takes it, since a provider's names are its own.
+	#[test]
+	fn a_colon_name_is_refused_on_the_host_and_taken_by_a_provider() {
+		let dir = temp("colon");
+		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
+		for name in ["ab:s", "x::$INDEX_ALLOCATION", "a:"] {
+			let err = root.create_dir_at(OsStr::new(name), None).unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err:?}");
+		}
+		assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the host made an entry");
+		let recorder = Arc::new(Recorder::default());
+		let fs = crate::Fs::new(Arc::clone(&recorder) as Arc<dyn crate::FileSystem>);
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		rt.block_on(async {
+			let provided = fs.open_dir("mem://t", true).await.unwrap();
+			provided
+				.create_dir_at_async(OsStr::new("ab:s"), None)
+				.await
+				.unwrap();
+		});
+		assert_eq!(recorder.made.lock().len(), 1, "the provider made no directory");
+	}
+
+	/// `open_at` opens no directory on Windows either:
+	/// `FILE_FLAG_BACKUP_SEMANTICS`, which lets `CreateFileW` open one, is
+	/// refused.
+	#[test]
+	fn open_at_refuses_backup_semantics() {
+		use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+		let dir = temp("backup");
+		std::fs::create_dir(dir.join("d")).unwrap();
+		let root = BlockingFs::native().open_dir(&dir, true).unwrap();
+		let mut options = OpenOptions::new();
+		options
+			.read(true)
+			.custom_flags(FILE_FLAG_BACKUP_SEMANTICS as i32);
+		let err = root
+			.open_at(OsStr::new("d"), &options)
+			.map(drop)
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
 	}
 }

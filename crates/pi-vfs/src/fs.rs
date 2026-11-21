@@ -481,7 +481,10 @@ impl Drop for FifoOpening {
 		if self.settled || !self.releasable {
 			return;
 		}
-		match (self.release)() {
+		let released = (self.release)();
+		#[cfg(test)]
+		fifo_seam::after_release(released.is_ok());
+		match released {
 			Ok(held) => {
 				// The helper's open returns as soon as it sees the release,
 				// which stays open while this waits.
@@ -528,7 +531,10 @@ fn release_attempt(
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) -> bool {
 	use std::sync::mpsc::RecvTimeoutError;
-	let held = match release() {
+	let released = release();
+	#[cfg(test)]
+	fifo_seam::after_release(released.is_ok());
+	let held = match released {
 		Ok(held) => Some(held),
 		Err(err) if err.raw_os_error() == Some(libc::ENXIO) => None,
 		Err(_) => return true,
@@ -538,17 +544,21 @@ fn release_attempt(
 	answered
 }
 
-/// Test seam: a hook a test sets for the next FIFO helper, run on the
+/// Test seams: a hook a test sets for the next FIFO helper, run on the
 /// helper's thread before its `open` (it may block, to hold the helper back)
-/// and after it (told whether the open succeeded).
+/// and after it (told whether the open succeeded); and a hook run after each
+/// release's open of the other end, while the end it opened is still held
+/// (told whether it opened one).
 #[cfg(all(test, unix))]
 pub(crate) mod fifo_seam {
 	use parking_lot::Mutex;
 
 	type Before = Box<dyn FnOnce() + Send>;
 	type After = Box<dyn FnOnce(bool) + Send>;
+	type Release = Box<dyn FnMut(bool) + Send>;
 
 	static NEXT: Mutex<Option<(Before, After)>> = Mutex::new(None);
+	static RELEASE: Mutex<Option<Release>> = Mutex::new(None);
 
 	/// Hooks the next FIFO helper that starts in this process.
 	pub(crate) fn set(
@@ -563,6 +573,17 @@ pub(crate) mod fifo_seam {
 		let (before, after) = NEXT.lock().take()?;
 		before();
 		Some(after)
+	}
+
+	/// Hooks every release attempt in this process from now on.
+	pub(crate) fn on_release(hook: impl FnMut(bool) + Send + 'static) {
+		*RELEASE.lock() = Some(Box::new(hook));
+	}
+
+	pub(super) fn after_release(held: bool) {
+		if let Some(hook) = RELEASE.lock().as_mut() {
+			hook(held);
+		}
 	}
 }
 
