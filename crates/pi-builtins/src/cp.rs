@@ -2260,12 +2260,17 @@ fn converts_to_backup(filesystem: &BlockingFs, source: &Path, dest: &Path, dest_
 		&& filesystem.is_file(dest_fs)
 }
 
-/// Whether the source is a link cp follows, named again as the destination by
-/// another string (`cp -fb l ./l`). GNU makes the own-entry backup only for the
-/// same string, so it backs the link up by renaming it, after `-i` asks and
-/// `-u` compares, cannot open the source through the name it renamed, and
-/// renames the backup back.
-fn renames_the_followed_source(
+/// Whether the source is a link cp follows whose own entry is the destination,
+/// with a backup that is not turned into a copy, under another string
+/// (`cp -fb l ./l`) or the same one (`cp -fb l l`, `l` leading to a FIFO; `cp
+/// -b l l`), or under any name with `--remove-destination` and no backup (`l
+/// ./l`, `l l`). GNU reads the destination with lstat there, another file
+/// than the one it follows, so it backs the link up by renaming it, after
+/// `-i` asks and `-u` compares, cannot open the source through the name it
+/// renamed, and renames the backup back. Under `--remove-destination` GNU
+/// removes the link and then cannot open it, losing the link: here the same
+/// refusal comes first and the link stays.
+fn loses_the_followed_source(
 	filesystem: &BlockingFs,
 	source: &Path,
 	dest: &Path,
@@ -2274,8 +2279,9 @@ fn renames_the_followed_source(
 	options: &Options,
 	source_in_command_line: bool,
 ) -> bool {
-	options.backup != BackupMode::None
-		&& source.as_os_str() != dest.as_os_str()
+	(options.backup != BackupMode::None
+		&& (source.as_os_str() != dest.as_os_str() || !converts_to_backup(filesystem, source, dest, dest_fs, options))
+		|| options.backup == BackupMode::None && options.remove_destination())
 		&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
 		&& options.dereference(source_in_command_line)
 		&& filesystem.is_symlink(source_fs)
@@ -2312,7 +2318,7 @@ fn is_forbidden_to_copy_to_same_file(
 		// `d/a`, are the same file.
 		if source.as_os_str() != dest.as_os_str()
 			&& same_entry(filesystem, source_fs, dest_fs)
-			&& !renames_the_followed_source(filesystem, source, dest, source_fs, dest_fs, options, source_in_command_line)
+			&& !loses_the_followed_source(filesystem, source, dest, source_fs, dest_fs, options, source_in_command_line)
 		{
 			return true;
 		}
@@ -2320,13 +2326,15 @@ fn is_forbidden_to_copy_to_same_file(
 		// `stat` reads the destination as a regular file. Another own entry
 		// with `-f` (a FIFO, a link to nothing read as a link) is the same file
 		// before any question or update check, as GNU's; `-l` does nothing
-		// there (`copy_file`).
+		// there (`copy_file`). A link cp follows to a file that is not regular
+		// goes the way of a backup by renaming, as GNU's does.
 		if converts_to_backup(filesystem, source, dest, dest_fs, options) {
 			return false;
 		}
 		if options.unlink_after_failed_open()
 			&& source.as_os_str() == dest.as_os_str()
 			&& options.copy_mode != CopyMode::Link
+			&& !loses_the_followed_source(filesystem, source, dest, source_fs, dest_fs, options, source_in_command_line)
 		{
 			return true;
 		}
@@ -2337,6 +2345,19 @@ fn is_forbidden_to_copy_to_same_file(
 			return false;
 		}
 		if !dest_is_symlink && !source_is_symlink && dest.as_os_str() != source.as_os_str() {
+			return false;
+		}
+	}
+	// `--remove-destination` unlinks the destination before it opens it, and
+	// GNU reads it with lstat (`copy.c`, `same_file_ok`): a symbolic link there
+	// is another file, which it replaces, and so is another hard link of a
+	// source that is not a link, in another entry. The source's own entry, by
+	// any name, is the same file, and nothing is removed before this check.
+	if options.backup == BackupMode::None && options.remove_destination() {
+		if dest_is_symlink && options.dereference(source_in_command_line) {
+			return false;
+		}
+		if !source_is_symlink && !dest_is_symlink && !same_entry(filesystem, source_fs, dest_fs) {
 			return false;
 		}
 	}
@@ -2399,7 +2420,7 @@ fn handle_existing_dest(
 	{
 		options.overwrite.verify(host, path, options.debug)?;
 	}
-	if renames_the_followed_source(&filesystem, source, dest, &source_fs, &dest_fs, options, source_in_command_line) {
+	if loses_the_followed_source(&filesystem, source, dest, &source_fs, &dest_fs, options, source_in_command_line) {
 		return Err(CpError::Error(format!(
 			"cannot open {} for reading: No such file or directory",
 			source.quote()
@@ -2848,21 +2869,6 @@ fn copy_file(
 				dest.quote()
 			)));
 		}
-		if paths_refer_to_same_file(&filesystem, &source_fs, &dest_fs, true)
-			&& options.remove_destination()
-			&& options.backup == BackupMode::None
-		{
-			filesystem.remove_file(&dest_fs)?;
-			dest_replaced = true;
-		}
-	}
-
-	if options.remove_destination()
-		&& source.as_os_str() != dest.as_os_str()
-		&& are_hardlinks_to_same_file(&filesystem, &source_fs, &dest_fs)
-	{
-		filesystem.remove_file(&dest_fs)?;
-		dest_replaced = true;
 	}
 
 	// `--attributes-only` keeps an existing destination's data, unless it is
@@ -2886,6 +2892,14 @@ fn copy_file(
 					}
 					return Ok(());
 				}
+			} else if options.backup == BackupMode::None && !dest_is_symlink {
+				// The destination is the source's file, already linked: GNU
+				// asks under `-i`, then does nothing (`copy.c`, `same_file_ok`),
+				// so `--remove-destination` removes nothing here.
+				if matches!(options.overwrite, OverwriteMode::Interactive(_)) {
+					options.overwrite.verify(host, dest, options.debug)?;
+				}
+				return Ok(());
 			}
 		}
 		// Disallow copying a file to itself, unless `--force` and
