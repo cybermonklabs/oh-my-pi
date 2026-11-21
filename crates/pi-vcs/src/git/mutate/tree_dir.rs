@@ -105,10 +105,11 @@ impl Entry {
 	/// such as btrfs, counts too). Devices are compared between directories
 	/// only: an overlay whose layers lie on two filesystems gives its files
 	/// another device than its directories, on one mount. Where `statx` gives
-	/// no mount id (before Linux 5.8), the walks read one from
-	/// `/proc/self/fdinfo` ([`mount_id`]): a directory's through the opened
-	/// directory, anything else's through an `O_PATH` descriptor
-	/// ([`Root::mounted`]).
+	/// no mount id (before Linux 5.8), both walks read a directory's from
+	/// `/proc/self/fdinfo` through the opened directory ([`mount_id`]); the
+	/// check walk reads anything else's through an `O_PATH` descriptor
+	/// ([`Root::mounted`]), and the emptying knows a mounted file by the
+	/// `EBUSY` its unlink gets ([`Root::refusal`]).
 	const fn mounted_below(&self, root: &Self) -> bool {
 		self.mount_root
 			|| matches!((self.mount, root.mount), (Some(mine), Some(theirs)) if mine != theirs)
@@ -287,20 +288,60 @@ pub enum Reached {
 	/// The entry is a directory the emptying emptied and then could not
 	/// remove.
 	EmptiedTheDirectory,
+	/// The entry is a directory the emptying removed every entry it found
+	/// in, and that still holds entries (`ENOTEMPTY`): an NFS client's
+	/// `.nfs…` name for a file still open, or an entry made meanwhile.
+	EntriesLeftInTheDirectory,
+	/// The entry is a directory the emptying emptied before a filesystem was
+	/// mounted on it; nothing on that filesystem was touched.
+	EmptiedUnderAMount,
 	/// The stop names no entry.
 	NoEntry,
 }
 
+impl Reached {
+	/// What the stop's message says of the entry and of the rest of the
+	/// emptying.
+	pub const fn sentence(self) -> &'static str {
+		match self {
+			Self::NothingAtTheEntry => {
+				"Nothing at that entry or below it was touched; what the emptying reached before it is \
+				 gone"
+			},
+			Self::EmptiedTheDirectory => {
+				"That directory was emptied and then not removed; what the emptying reached before it \
+				 is gone"
+			},
+			Self::EntriesLeftInTheDirectory => {
+				"The emptying removed every entry it found in that directory, and the directory still \
+				 holds entries it did not remove (an NFS client's `.nfs…` name for a file still open, \
+				 or an entry made meanwhile); what the emptying reached before it is gone"
+			},
+			Self::EmptiedUnderAMount => {
+				"The directory under that mount was emptied before the mount was made, and nothing on \
+				 the mounted filesystem was touched; what the emptying reached before it is gone"
+			},
+			Self::NoEntry => "What the emptying reached before it stopped is gone",
+		}
+	}
+}
+
 impl Stop {
 	/// How far the emptying got at the entry this stop names.
-	pub const fn reached(&self) -> Reached {
+	pub fn reached(&self) -> Reached {
 		match self {
 			Self::Changed(_)
 			| Self::Cycle(_)
 			| Self::TooDeep(_)
 			| Self::Mounted(_)
 			| Self::Unremovable(..) => Reached::NothingAtTheEntry,
-			Self::EmptiedNotRemoved(_) => Reached::EmptiedTheDirectory,
+			Self::EmptiedNotRemoved(refusal) => match refusal.as_ref() {
+				Self::Mounted(_) => Reached::EmptiedUnderAMount,
+				Self::Unremovable(_, err) if err.raw_os_error() == Some(libc::ENOTEMPTY) => {
+					Reached::EntriesLeftInTheDirectory
+				},
+				_ => Reached::EmptiedTheDirectory,
+			},
 			Self::NoMountIds | Self::MountIdUnread(_) => Reached::NoEntry,
 		}
 	}
@@ -877,6 +918,32 @@ mod tests {
 		test_hooks::clear();
 		assert_eq!((walked, emptied), (20, 0), "probes of the check walk and of the emptying");
 		assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+	}
+
+	/// The message names what the emptying did at the entry a stop names: a
+	/// directory with entries left (`ENOTEMPTY`) is not said to be emptied,
+	/// and a directory a filesystem was mounted on after it was opened is
+	/// not said to have had that filesystem emptied.
+	#[test]
+	fn reached_names_what_the_emptying_did() {
+		let at = || PathBuf::from("src");
+		let refused = |errno| Stop::Unremovable(at(), io::Error::from_raw_os_error(errno));
+		let emptied = |stop| Stop::EmptiedNotRemoved(Box::new(stop));
+		let cases = [
+			(refused(libc::EBUSY), Reached::NothingAtTheEntry),
+			(Stop::Mounted(at()), Reached::NothingAtTheEntry),
+			(emptied(refused(libc::EBUSY)), Reached::EmptiedTheDirectory),
+			(emptied(refused(libc::ENOTEMPTY)), Reached::EntriesLeftInTheDirectory),
+			(emptied(Stop::Mounted(at())), Reached::EmptiedUnderAMount),
+			(Stop::NoMountIds, Reached::NoEntry),
+		];
+		for (stop, reached) in cases {
+			assert_eq!(stop.reached(), reached, "{stop:?}");
+		}
+		let left = Reached::EntriesLeftInTheDirectory.sentence();
+		assert!(left.contains("still holds entries") && !left.contains("emptied"), "{left}");
+		let mount = Reached::EmptiedUnderAMount.sentence();
+		assert!(mount.contains("nothing on the mounted filesystem was touched"), "{mount}");
 	}
 
 	/// A symlink to a directory is not opened as the tree's root (under gVisor

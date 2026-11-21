@@ -2845,18 +2845,7 @@ fn reclaim_tree(
 	if let Err(err) = dir.empty() {
 		let stopped = match tree_dir::stop_of(&err) {
 			Some(stop) => {
-				let reached = match stop.reached() {
-					tree_dir::Reached::NothingAtTheEntry => {
-						"Nothing at that entry or below it was touched; what the emptying reached before \
-						 it is gone"
-					},
-					tree_dir::Reached::EmptiedTheDirectory => {
-						"That directory was emptied and then not removed; what the emptying reached \
-						 before it is gone"
-					},
-					tree_dir::Reached::NoEntry => "What the emptying reached before it stopped is gone",
-				};
-				format!("stopped: it {}. {reached}", stop.reason(tree))
+				format!("stopped: it {}. {}", stop.reason(tree), stop.reached().sentence())
 			},
 			None => format!("failed: {err}. What the emptying reached before it failed is gone"),
 		};
@@ -3863,44 +3852,123 @@ mod tests {
 		assert!(tree.join("partial").is_file() && admin.is_dir(), "{err}");
 	}
 
-	/// A directory the emptying emptied and then could not remove (NFS's
-	/// `ENOTEMPTY` where it left a `.nfs…` name, a FUSE daemon's or an SMB
-	/// server's `EBUSY`, which is no mount) is named with its error, and the
-	/// message says it was emptied, not that nothing there was touched. A
-	/// test hook makes the rmdir of `src` fail, as no test can make NFS, FUSE
-	/// or SMB do here.
+	/// A directory the emptying emptied and then could not remove (a FUSE
+	/// daemon's or an SMB server's `EBUSY`, which is no mount) is named with
+	/// its error, and the message says it was emptied, not that nothing there
+	/// was touched. A test hook makes the rmdir of `src` fail, as no test can
+	/// make FUSE or SMB do here.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_directory_emptied_and_then_not_removed_is_said_to_be_emptied() {
-		for errno in [libc::ENOTEMPTY, libc::EBUSY] {
-			let (_temp, repo) = fixture();
-			let trees = tempfile::tempdir().unwrap();
-			let tree = trees.path().join("wt");
-			let admin = abandoned_add(&repo, &tree, None);
-			fs::create_dir(tree.join("src")).unwrap();
-			fs::write(tree.join("src/main.rs"), "fn main() {}\n").unwrap();
-			test_hooks::set_unlink_error(move |name| (name == Path::new("src")).then_some(errno));
-			let result = repo.worktree_reclaim_abandoned(&tree);
-			test_hooks::clear();
-			let err = result.unwrap_err().to_string();
-			assert!(
-				err.contains(&format!(
-					"has an entry the system would not remove ({}: ",
-					tree.join("src").display()
-				)) && err.contains(&format!("os error {errno}"))
-					&& !err.contains("mounted"),
-				"errno {errno}: {err}"
-			);
-			assert!(
-				err.contains("That directory was emptied and then not removed")
-					&& !err.contains("Nothing at that entry"),
-				"errno {errno}: {err}"
-			);
-			assert!(
-				tree.join("src").is_dir() && !tree.join("src/main.rs").exists() && admin.is_dir(),
-				"errno {errno}: {err}"
-			);
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::create_dir(tree.join("src")).unwrap();
+		fs::write(tree.join("src/main.rs"), "fn main() {}\n").unwrap();
+		test_hooks::set_unlink_error(|name| (name == Path::new("src")).then_some(libc::EBUSY));
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains(&format!(
+				"has an entry the system would not remove ({}: ",
+				tree.join("src").display()
+			)) && err.contains("os error 16")
+				&& !err.contains("mounted"),
+			"{err}"
+		);
+		assert!(
+			err.contains("That directory was emptied and then not removed")
+				&& !err.contains("Nothing at that entry"),
+			"{err}"
+		);
+		assert!(
+			tree.join("src").is_dir() && !tree.join("src/main.rs").exists() && admin.is_dir(),
+			"{err}"
+		);
+	}
+
+	/// A directory that still holds entries when the emptying removes it
+	/// (`ENOTEMPTY`: an NFS client's `.nfs…` name for a file still open, or
+	/// an entry made meanwhile) is not said to be emptied. Here a real entry
+	/// is made in `src` while the emptying removes `src/main.rs`, after it
+	/// listed `src`, so the rmdir of `src` gets a real `ENOTEMPTY`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_directory_left_with_entries_is_not_said_to_be_emptied() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::create_dir(tree.join("src")).unwrap();
+		fs::write(tree.join("src/main.rs"), "fn main() {}\n").unwrap();
+		let late = tree.join("src/late");
+		let made = late.clone();
+		test_hooks::set_unlink_error(move |name| {
+			if name == Path::new("main.rs") {
+				fs::write(&made, "made meanwhile\n").unwrap();
+			}
+			None
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains(&format!(
+				"has an entry the system would not remove ({}: ",
+				tree.join("src").display()
+			)) && err.contains(&format!("os error {}", libc::ENOTEMPTY)),
+			"{err}"
+		);
+		assert!(
+			err.contains("the directory still holds entries it did not remove")
+				&& !err.contains("That directory was emptied")
+				&& !err.contains("Nothing at that entry"),
+			"{err}"
+		);
+		assert!(late.is_file() && !tree.join("src/main.rs").exists() && admin.is_dir(), "{err}");
+	}
+
+	/// An error of the emptying that is no stop (a subdirectory it may not
+	/// open, here made `0o000` between the check walk and the emptying) gets
+	/// the same context as a stop: the tree, the registration, what is gone
+	/// and that the registration stays.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_bare_error_of_the_emptying_gets_the_context_of_a_stop() {
+		use std::os::unix::fs::PermissionsExt;
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!("SKIP: root opens a directory of mode 0o000");
+			return;
 		}
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::create_dir(tree.join("sub")).unwrap();
+		fs::write(tree.join("sub/file"), "x\n").unwrap();
+		let sub = tree.join("sub");
+		let locked = sub.clone();
+		test_hooks::set_before_tree_removal(move |_| {
+			fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains(&format!(
+				"emptying '{}', the partial tree of an interrupted worktree add",
+				tree.display()
+			)) && err.contains("failed: Permission denied (os error 13)")
+				&& err.contains(
+					"What the emptying reached before it failed is gone, and the registration stays"
+				),
+			"{err}"
+		);
+		assert!(sub.join("file").is_file() && admin.is_dir(), "{err}");
 	}
 
 	/// A stop of the emptying that names no entry (no mount ids, here made

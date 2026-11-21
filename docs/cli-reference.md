@@ -381,19 +381,21 @@ from `/proc/self/fdinfo`, a file's through an `O_PATH` descriptor, so a mounted
 file is refused too. A mount made while the tree is being emptied, or an entry
 the system will not remove (an NFS client's `.nfs…` name for a deleted file
 still open, an `EBUSY` from a FUSE daemon or an SMB server), stops the emptying
-there: the message names the entry and the error and says whether that entry was
-untouched or was a directory emptied and then not removed, what the emptying
-reached before it is gone, and the registration stays. Symlinks in the tree are
-removed, never followed. A tree more than 256 directories deep is refused.
-Everything else the registration and the tree hold goes with them: any file
-written into the tree after the add stopped, anything staged there, and a merge
-or cherry-pick begun there. With `core.logAllRefUpdates=false`, a commit made
-there and left by a checkout back to the add's commit leaves no trace in `HEAD`
-and goes too. The token stays on the emptied directory. A directory made again
-in its place with `mkdir` never carries the token, even with the same inode; a
-copy that keeps extended attributes (`cp -a`, `tar --xattrs`) does. Otherwise
-that add refuses and names the registration, as git refuses a registered path;
-adds of other paths never touch it. Without user extended attributes (off Linux,
-or on a filesystem without them) the stopped add's tree is never emptied by a
-later add. On a filesystem that cannot lock files, an add goes on without its
-add-in-progress marker, and a killed one is never emptied by a later add.
+there: the message names the entry and the error and says what the emptying did
+there (nothing, or a directory emptied and not removed, or one still holding
+entries it did not remove, or one a filesystem was mounted on after it was
+emptied), what the emptying reached before it is gone, and the registration
+stays. Symlinks in the tree are removed, never followed. A tree more than 256
+directories deep is refused. Everything else the registration and the tree hold
+goes with them: any file written into the tree after the add stopped, anything
+staged there, and a merge or cherry-pick begun there. With
+`core.logAllRefUpdates=false`, a commit made there and left by a checkout back
+to the add's commit leaves no trace in `HEAD` and goes too. The token stays on
+the emptied directory. A directory made again in its place with `mkdir` never
+carries the token, even with the same inode; a copy that keeps extended
+attributes (`cp -a`, `tar --xattrs`) does. Otherwise that add refuses and names
+the registration, as git refuses a registered path; adds of other paths never
+touch it. Without user extended attributes (off Linux, or on a filesystem
+without them) the stopped add's tree is never emptied by a later add. On a
+filesystem that cannot lock files, an add goes on without its add-in-progress
+marker, and a killed one is never emptied by a later add.
