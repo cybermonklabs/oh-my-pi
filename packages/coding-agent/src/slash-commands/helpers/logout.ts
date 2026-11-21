@@ -1,4 +1,7 @@
 import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
+import { type DisabledCredentialSummary, isRecoverableDisabledCredential } from "@oh-my-pi/pi-ai/auth-storage";
+import { logger } from "@oh-my-pi/pi-utils";
+import { hasActiveAccount, toAccountIdentity } from "./usage-accounts";
 import type { AgentSession } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity, StoredAuthCredential } from "../../session/auth-storage";
 
@@ -14,15 +17,13 @@ function nonEmpty(value: string | undefined): string | undefined {
 	return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
-function oauthLabel(row: StoredAuthCredential): string {
-	const credential = row.credential;
-	if (credential.type !== "oauth") return `API key #${row.id}`;
+function oauthLabel(credential: OAuthAccountIdentity & { enterpriseUrl?: string }, fallback: string): string {
 	const base =
 		nonEmpty(credential.email) ??
 		nonEmpty(credential.accountId) ??
 		nonEmpty(credential.projectId) ??
 		nonEmpty(credential.enterpriseUrl) ??
-		`OAuth credential #${row.id}`;
+		fallback;
 	// Two subscriptions (orgs) can share one email — the org is the only
 	// user-visible way to tell which row a logout will remove.
 	const org = nonEmpty(credential.orgName) ?? nonEmpty(credential.orgId);
@@ -86,7 +87,10 @@ export function toLogoutAccounts(
 ): LogoutAccount[] {
 	return credentials
 		.map(row => {
-			const label = oauthLabel(row);
+			const label =
+				row.credential.type === "oauth"
+					? oauthLabel(row.credential, `OAuth credential #${row.id}`)
+					: `API key #${row.id}`;
 			const active =
 				row.credential.type === "oauth"
 					? oauthMatchesActiveIdentity(row, options.activeIdentity)
@@ -106,7 +110,32 @@ export function toLogoutAccounts(
 		});
 }
 
-/** Stored accounts `/logout` can remove for `provider`, active first. Reloads the store to see other processes' changes. */
+/** A credential store's tombstone listing, for one provider or for every provider. */
+export type DisabledCredentialLister = (provider?: string) => Promise<DisabledCredentialSummary[]>;
+
+/**
+ * Tombstones of logins a new login would restore ({@link isRecoverableDisabledCredential}).
+ * A lookup the store cannot answer — through an auth broker it is a request — logs and
+ * yields none, so a listing still offers the logins the store holds either way.
+ */
+async function recoverableTombstones(
+	listDisabled: DisabledCredentialLister,
+	provider?: string,
+): Promise<DisabledCredentialSummary[]> {
+	let tombstones: DisabledCredentialSummary[];
+	try {
+		tombstones = await listDisabled(provider);
+	} catch (error) {
+		logger.warn("Disabled credential lookup failed; logout lists the active logins only", {
+			provider,
+			error: String(error),
+		});
+		return [];
+	}
+	return tombstones.filter(summary => isRecoverableDisabledCredential(summary, tombstones));
+}
+
+/** Stored accounts `/logout` can remove, including recoverable failure-disabled logins. */
 export async function listLogoutAccounts(
 	authStorage: AuthStorage,
 	loginProvider: string,
@@ -114,10 +143,51 @@ export async function listLogoutAccounts(
 ): Promise<LogoutAccount[]> {
 	const provider = getOAuthCredentialProvider(loginProvider);
 	await authStorage.credentials.reload();
-	return toLogoutAccounts(provider, authStorage.credentials.list(provider), {
+	const rows = authStorage.credentials.list(provider);
+	const accounts = toLogoutAccounts(provider, rows, {
 		activeIdentity: authStorage.oauth.identity(provider, sessionId),
 		activeApiKey: authStorage.keys.source(provider)?.kind === "api_key",
 	});
+	const tombstones = await recoverableTombstones(scope => authStorage.credentials.listDisabled(scope), provider);
+	if (tombstones.length === 0) return accounts;
+	const active = rows.map(row => toAccountIdentity(provider, row.credential));
+	for (const summary of tombstones) {
+		// The user logged this account in again: one row to remove, not an active and a disabled one.
+		if (hasActiveAccount(summary, active)) continue;
+		accounts.push({
+			credentialId: summary.id,
+			provider,
+			label: `${oauthLabel(summary, `OAuth credential #${summary.id}`)} (disabled)`,
+			detail: `disabled · oauth #${summary.id}`,
+			type: summary.type,
+			active: false,
+		});
+	}
+	return accounts;
+}
+
+/** Providers with active credentials or recoverable failure-disabled logins to remove. */
+export async function listLogoutProviders(authStorage: AuthStorage): Promise<ReadonlySet<string>> {
+	await authStorage.credentials.reload();
+	return collectLogoutProviders(
+		authStorage.credentials.list().map(row => row.provider),
+		scope => authStorage.credentials.listDisabled(scope),
+	);
+}
+
+/**
+ * Providers a logout can still remove a login from: those with an active credential, and
+ * those whose only logins a failure disabled — removing one of those retires the tombstone
+ * that keeps a turn retrying the provider's key. `omp auth-broker logout` offers the same
+ * providers, reading its own store.
+ */
+export async function collectLogoutProviders(
+	activeProviders: Iterable<string>,
+	listDisabled: DisabledCredentialLister,
+): Promise<ReadonlySet<string>> {
+	const providers = new Set(activeProviders);
+	for (const summary of await recoverableTombstones(listDisabled)) providers.add(summary.provider);
+	return providers;
 }
 
 /**

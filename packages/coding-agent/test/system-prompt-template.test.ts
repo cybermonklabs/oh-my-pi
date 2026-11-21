@@ -35,9 +35,14 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
 	const previousAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+	// The user config is the temp home's `.omp`, not the test process's own config root.
+	const previousConfigRoot = process.env.OMP_CONFIG_ROOT;
+	const previousDownloadRoot = process.env.OMP_DOWNLOAD_ROOT;
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
 	restoreEnvValue("PI_CODING_AGENT_DIR", undefined);
+	restoreEnvValue("OMP_CONFIG_ROOT", undefined);
+	restoreEnvValue("OMP_DOWNLOAD_ROOT", undefined);
 	__resetDirsFromEnvForTests();
 	try {
 		return await fn({
@@ -52,6 +57,8 @@ async function withDiscoveryHome<T>(fn: (paths: DiscoveryPaths) => Promise<T>): 
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 		else process.env.USERPROFILE = previousUserProfile;
 		restoreEnvValue("PI_CODING_AGENT_DIR", previousAgentDirEnv);
+		restoreEnvValue("OMP_CONFIG_ROOT", previousConfigRoot);
+		restoreEnvValue("OMP_DOWNLOAD_ROOT", previousDownloadRoot);
 		__resetDirsFromEnvForTests();
 	}
 }

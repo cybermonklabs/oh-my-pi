@@ -10,6 +10,7 @@ import { ProcessTerminal, type Terminal } from "../terminal";
 import {
 	type Component,
 	Container,
+	type HistoryFlushOptions,
 	type RenderTimer,
 	type ResizeScrollbackMode,
 	type TerminalFramePlan,
@@ -275,7 +276,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		| undefined;
 	#historyReplayRequested = false;
 	#headerReplayPending = false;
-	#historyFlush = false;
+	/** The stop-time flush in progress, if any; its `maxRows` caps the rows it emits. */
+	#historyFlush: HistoryFlushOptions | undefined;
 	// The welcome header retires to terminal history exactly once, after the
 	// intro settles; until then it renders as mutable viewport chrome.
 	#headerRetired = false;
@@ -353,10 +355,12 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 
 	constructor(options: ComposerOptions = {}) {
 		ensureThemeSync();
-		// Host-owned hard exit: route through postmortem so a double-Ctrl-C during
-		// an open extension-load guard window exits cleanly instead of throwing
-		// ExtensionExitError through the guarded process.exit (#11789).
-		this.#exit = options.exit ?? (code => postmortem.exitProcess(code));
+		// Host-owned exit: postmortem's cleanup runs first (a SQL session store gives
+		// back the lease the launch took before its extensions load), then the exit
+		// goes past the guarded process.exit, so a double Ctrl-C during an open
+		// extension-load guard window exits cleanly instead of throwing
+		// ExtensionExitError (#11789).
+		this.#exit = options.exit ?? (code => void postmortem.exitAfterCleanup(code, { exit: "native" }));
 		this.#now = options.now ?? Date.now;
 		this.#preferences = { ...COMPOSER_DEFAULTS, ...options.preferences };
 		this.#applyWelcomeUpdate(options.welcome ?? {});
@@ -853,8 +857,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	}
 
 	/** Forces every currently eligible finalized prefix to retire before stop. */
-	beginHistoryFlush(): void {
-		this.#historyFlush = true;
+	beginHistoryFlush(options?: HistoryFlushOptions): void {
+		this.#historyFlush = options ?? {};
 		// A pending replay would re-render and re-stream the entire committed
 		// ledger during shutdown; the terminal already holds that history, so
 		// flush emits only genuinely un-retired rows. An already offered batch
@@ -864,6 +868,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		for (const child of this.#runtimeChildren) {
 			if (child instanceof TranscriptContainer) child.cancelReplay();
 		}
+	}
+
+	/** Ends the stop-time flush, so frames after `start()` resumes retire by pressure again. */
+	endHistoryFlush(): void {
+		this.#historyFlush = undefined;
 	}
 
 	#startHistoryReplay(): void {
@@ -989,7 +998,8 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 				// Only the comparison below reads the height, so the walk stops at
 				// the budget instead of rendering every replayed block (#12933).
 				const liveRows = transcript.liveRowCount(width, Math.max(0, rows - renderedHeader.length - chromeRows));
-				if (!this.#historyFlush && renderedHeader.length + chromeRows + liveRows <= rows) return undefined;
+				if (this.#historyFlush === undefined && renderedHeader.length + chromeRows + liveRows <= rows)
+					return undefined;
 				this.#offeredHistory = {
 					id: this.#nextHistoryId++,
 					rows: [...renderedHeader, ""],
@@ -1006,7 +1016,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 			this.#retiredHeaderRows = [];
 		}
 		const batch = this.#historyFlush
-			? transcript.peekFlushBatch(width)
+			? transcript.peekFlushBatch(width, this.#historyFlush.maxRows)
 			: transcript.peekFinalizedBatch(width, Math.max(0, rows - chromeRows));
 		if (batch === undefined) return undefined;
 		this.#offeredHistory = {

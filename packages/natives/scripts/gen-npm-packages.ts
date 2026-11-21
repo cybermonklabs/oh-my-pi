@@ -2,6 +2,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { addonSetDigest } from "./embed-native";
 
 export interface LeafTarget {
 	tag: string;
@@ -30,6 +31,16 @@ export interface LeafManifest {
 	};
 	engines: {
 		bun: string;
+	};
+	/**
+	 * The addons the package holds, recorded when it is generated: each one's size and
+	 * SHA-256, and the set's digest ({@link addonSetDigest}). A Windows install stages them into
+	 * `<natives dir>/<version>-<first 12 hex digits of digest>` and checks each copy against
+	 * its SHA-256, so it never hashes an addon to name that directory. Absent on dry runs.
+	 */
+	nativeAddons?: {
+		digest: string;
+		files: { filename: string; size: number; sha256: string }[];
 	};
 }
 
@@ -155,9 +166,17 @@ export async function generateNpmPackages({
 		if (missing) throw new Error(`Missing native addon files for ${target.tag} in ${nativeDir}`);
 		await fs.rm(leafDir, { recursive: true, force: true });
 		await fs.mkdir(leafDir, { recursive: true });
-		for (const file of files) {
-			await fs.copyFile(path.join(nativeDir, file), path.join(leafDir, file));
+		const addonFiles = [];
+		for (const filename of files) {
+			await fs.copyFile(path.join(nativeDir, filename), path.join(leafDir, filename));
+			const bytes = await Bun.file(path.join(leafDir, filename)).bytes();
+			addonFiles.push({
+				filename,
+				size: bytes.length,
+				sha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex"),
+			});
 		}
+		manifest.nativeAddons = { digest: addonSetDigest(addonFiles), files: addonFiles };
 		for (const file of NATIVE_LEAF_LEGAL_FILES) {
 			const source = path.join(packageDir, file);
 			if (!(await Bun.file(source).exists())) {

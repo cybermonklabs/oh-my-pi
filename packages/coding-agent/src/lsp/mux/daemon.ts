@@ -16,7 +16,12 @@ import { encodeMessageFrame, MessageFramer } from "../../jsonrpc/message-framing
 import { daemonClientForProject } from "../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
 import { daemonRuntimeDir } from "../../launch/paths";
-import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../../subprocess/worker-client";
+import {
+	ompDaemonSpecEnv,
+	resolveWorkerSpawnCmd,
+	SMOKE_TEST_TIMEOUT_MS,
+	workerEnvFromParent,
+} from "../../subprocess/worker-client";
 import type { LspJsonRpcRequest, LspJsonRpcResponse, LspTransport, LspWriteSink } from "../types";
 import {
 	LSP_MUX_DAEMON_NAME,
@@ -262,10 +267,10 @@ async function ensureLspMuxDaemon(projectDir: string, signal?: AbortSignal): Pro
 						name: LSP_MUX_DAEMON_NAME,
 						application: spawn.cmd[0]!,
 						args: spawn.cmd.slice(1),
-						env: {
+						env: ompDaemonSpecEnv({
 							[LSP_MUX_SOCKET_ENV]: endpoint,
 							[LSP_MUX_PROJECT_DIR_ENV]: client.projectDir,
-						},
+						}),
 						cwd: spawn.cwd ?? client.projectDir,
 						pty: false,
 						ready: { log: LSP_MUX_READY_PATTERN, timeoutMs: READY_TIMEOUT_MS },

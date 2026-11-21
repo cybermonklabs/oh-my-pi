@@ -42,7 +42,11 @@ const RETAINED_ARTIFACTS_CLEANUP_GRACE_MS = 60_000;
  */
 const RETAINED_ARTIFACTS_CLEANUP_MAX_WAIT_MS = DEFAULT_RETENTION_MS;
 const DEFAULT_MAX_RUNNING_JOBS = 15;
-/** Abort reason used only when the owning session shuts down the entire manager. */
+/**
+ * Abort reason of a shutdown: the owning session shutting down the entire manager, or a
+ * session that goes away without a stop cutting its own jobs off. The task executor parks
+ * (rather than tombstones) a subagent whose job it aborts, so `omp --restore` goes on with it.
+ */
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
 
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
@@ -206,7 +210,10 @@ export interface AsyncJobManagerOptions {
 	 * would leak one agent's result into another session.
 	 */
 	onJobComplete?: AsyncJobDeliverySink;
-	/** Running-job cap; a function is re-read on every capacity check so a live setting resizes the cap. */
+	/**
+	 * Running-job cap; `0` or less means no limit. A function is re-read on every capacity check so a
+	 * live setting resizes the cap.
+	 */
 	maxRunningJobs?: number | (() => number);
 	retentionMs?: number;
 	/**
@@ -340,8 +347,11 @@ export interface AsyncJobManagerApi {
 		result: AsyncJobRunResult,
 		options: { id?: string; ownerId?: string; agentId?: string },
 	): string;
-	/** Cancel one running job; a filter whose owner does not match reads as not-found. */
-	cancel(id: string, filter?: AsyncJobFilter): boolean;
+	/**
+	 * Cancel one running job, aborting it with `reason`; a filter whose owner does not
+	 * match reads as not-found.
+	 */
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean;
 	getJob(id: string): AsyncJob | undefined;
 	/** Running background jobs; foreground-backed jobs stay hidden until promoted. */
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[];
@@ -372,8 +382,8 @@ export interface AsyncJobManagerApi {
 	registerDeliverySink(ownerId: string, sink: AsyncJobDeliverySink): () => void;
 	/** Wait until every job owned by `ownerId` settled; false when `timeoutMs` elapses first. */
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean>;
-	/** Cancel every job owned by `ownerId`, then wait until `deadlineAt`. */
-	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult>;
+	/** Cancel every job owned by `ownerId`, aborting each with `reason`, then wait until `deadlineAt`. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason: unknown): Promise<AsyncJobReapResult>;
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean>;
 	isDeliverySuppressed(jobId: string): boolean;
 	/** True while a settled job's completion is queued or in flight — its push is on the way. */
@@ -474,11 +484,14 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		);
 	}
 
-	/** Effective running-job cap (at least 1), resolved at check time. */
+	/**
+	 * Effective running-job cap, resolved at check time: `Infinity` when the configured cap is `0` or
+	 * less, else the cap floored to at least 1.
+	 */
 	get #maxRunningJobs(): number {
 		const option = this.#maxRunningJobsOption;
-		const value = typeof option === "function" ? option() : option;
-		return Math.max(1, Math.floor(value ?? DEFAULT_MAX_RUNNING_JOBS));
+		const value = (typeof option === "function" ? option() : option) ?? DEFAULT_MAX_RUNNING_JOBS;
+		return value > 0 ? Math.max(1, Math.floor(value)) : Number.POSITIVE_INFINITY;
 	}
 
 	/** True when the running-job count has reached the configured cap. */
@@ -643,17 +656,18 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel a single job by id. When a filter is given and its owner does not
+	 * Cancel a single job by id, aborting it with `reason` (the platform's own
+	 * abort reason without one). When a filter is given and its owner does not
 	 * match the job's owner, the call is treated as not-found (returns false)
 	 * so cross-agent cancellation is rejected at the manager level.
 	 */
-	cancel(id: string, filter?: AsyncJobFilter): boolean {
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean {
 		const job = this.#jobs.get(id);
 		if (!job) return false;
 		if (filter && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
-		job.abortController.abort();
+		job.abortController.abort(reason);
 		return true;
 	}
 
@@ -903,13 +917,15 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
+	 * Cancel every job owned by `ownerId`, aborting each with `reason`, then wait only
+	 * until `deadlineAt`. A subagent of a job reads the kind of the cancel from `reason`
+	 * (`turnAbortKind`), so every caller says it.
 	 * The returned completion keeps waiting for actual process settlement when
 	 * the deadline expires, so callers can move that cleanup out of the
 	 * user-visible Task wait without losing ownership of the live work.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
+	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number, reason: unknown): Promise<AsyncJobReapResult> {
+		this.cancelAll({ ownerId }, reason);
 		const timeoutMs = Math.max(0, deadlineAt - Date.now());
 		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
 		if (settled) {

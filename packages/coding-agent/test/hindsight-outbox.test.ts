@@ -91,6 +91,10 @@ function fixture(overrides: Record<string, unknown> = {}, sessionId = "session-a
 		emitNotice: (_level: string, message: string) => notices.push(message),
 		subscribe: (_listener: AgentSessionEventListener) => () => {},
 		refreshBaseSystemPrompt: async () => {},
+		// The backend binds its outbox to the session's lifetime, so the fake needs the
+		// real session's disposer surface.
+		isDisposed: false,
+		addDisposer: (_dispose: () => void) => {},
 	};
 	const config = loadHindsightConfig(settings);
 	const state = new HindsightSessionState({

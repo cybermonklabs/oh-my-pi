@@ -42,6 +42,7 @@ import {
 	writeFileWithFallback,
 } from "../tools/file-write-fallback";
 import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
+import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
@@ -548,11 +549,22 @@ export class EditTool implements AgentTool<TInput> {
 		let outcome;
 		try {
 			outcome = await editSession.apply(
-				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
+				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false, signal },
 				(_error, request) => this.#write(request, signal),
 			);
 			if (outcome.isError && batch?.flush) {
-				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+				try {
+					await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+				} catch (error) {
+					// The flush runs on this call's signal, so after a cancel it rejects
+					// as aborted; the cancel outcome, which names what this call changed,
+					// is the result.
+					if (outcome.errorKind !== "cancelled") throw error;
+					logger.debug("LSP batch flush after a cancelled edit failed", {
+						batchId: batch.id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			}
 		} catch (error) {
 			if (batch?.flush) await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
@@ -564,6 +576,9 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		if (outcome.isError) {
+			// No write began after the abort; the text names what this call's
+			// earlier writes changed.
+			if (outcome.errorKind === "cancelled") throw new ToolAbortError(outcome.text);
 			return {
 				content: [{ type: "text", text: outcome.text }],
 				details: { diff: "", errorKind: outcome.errorKind },
@@ -703,6 +718,21 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		// Last check before anything touches disk: an aborted call begins no
+		// write. Past it, `apply` does not interrupt the write; an abort that
+		// lands meanwhile is seen only where a step below checks the signal:
+		// - the ACP bridge route checks once more just before it calls the
+		//   client; an abort seen there fails the write with the abort's
+		//   reason, and nothing is written;
+		// - otherwise the change lands (on disk, or through the client). With
+		//   LSP on, the LSP notice that follows it can still fail the write
+		//   ("Operation aborted"); else the write succeeds.
+		// A failed write ends the call as `write_failed`, naming no earlier
+		// file, or, in a call that closes an LSP batch, as the batch flush's
+		// error when that flush fails too. A write that succeeds is named by
+		// the next write's `cancelled` outcome; as the call's last write, the
+		// call succeeds.
+		if (signal?.aborted) return { written: "", cancelled: true };
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {

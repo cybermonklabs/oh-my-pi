@@ -709,6 +709,28 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_key).toBe("session-123");
 	});
 
+	it("routes a side request with its parent's session id while keeping its own request id", async () => {
+		// Gateways and providers send a conversation's requests to its prompt cache by the
+		// session id. A side request that sent its own id read the parent's prefix cold.
+		const captured = await captureOpenAIResponseHeaders({
+			sessionId: "main-session:side:1",
+			parentSessionId: "main-session",
+		});
+
+		expect(captured.sessionId).toBe("main-session");
+		expect(captured.clientRequestId).toBe("main-session:side:1");
+		expect(captured.body?.prompt_cache_key).toBe("main-session");
+	});
+
+	it("sets an OpenRouter side request's body session_id from its parent", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "workflow-123:side:1", parentSessionId: "workflow-123" },
+			openRouterResponsesModel,
+		);
+
+		expect(captured.body?.session_id).toBe("workflow-123");
+	});
+
 	it("xAI OAuth adapter request shaping does not mutate reused options", async () => {
 		const options: OpenAIResponsesOptions = {
 			sessionId: "session-123",

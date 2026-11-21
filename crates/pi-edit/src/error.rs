@@ -42,6 +42,12 @@ pub enum EditError {
 	/// The host writer callback failed; carries its message verbatim.
 	#[error("{0}")]
 	Writer(String),
+	/// The call was cancelled before a write began. `written` names what
+	/// earlier writes of the same call had already changed (`a.md`,
+	/// `a.md (moved to c.md)`, `a.md (deleted)`); those changes stay, and no
+	/// other file was touched.
+	#[error("{}", cancelled_message(.written))]
+	Cancelled { written: Vec<String> },
 	/// A check refused a payload that parsed; `reason` names the check.
 	#[error("{message}")]
 	Rejected { reason: Rejection, message: String },
@@ -104,6 +110,7 @@ impl EditError {
 		"unresolved_url",
 		"io",
 		"write_failed",
+		"cancelled",
 		"stale_tag",
 		"unknown_tag",
 		"other_file_tag",
@@ -163,9 +170,19 @@ impl EditError {
 			Self::Io { .. } if self.is_not_found() => "file_not_found",
 			Self::Io { .. } => "io",
 			Self::Writer(_) => "write_failed",
+			Self::Cancelled { .. } => "cancelled",
 			Self::Rejected { reason, .. } => reason.as_str(),
 			Self::InFile { source, .. } => source.kind(),
 		}
+	}
+}
+
+/// The model-facing text of [`EditError::Cancelled`].
+fn cancelled_message(written: &[String]) -> String {
+	if written.is_empty() {
+		"Edit cancelled before it wrote anything; no file was changed.".to_owned()
+	} else {
+		format!("Edit cancelled after changing {}; no other file was changed.", written.join(", "))
 	}
 }
 
@@ -218,6 +235,7 @@ mod tests {
 			io(std::io::ErrorKind::NotFound),
 			io(std::io::ErrorKind::PermissionDenied),
 			EditError::Writer("x".into()),
+			EditError::Cancelled { written: Vec::new() },
 			EditError::InFile { path: "a".into(), source: Box::new(EditError::apply("x")) },
 		];
 		errors.extend(rejections.map(|reason| EditError::rejected(reason, "x")));

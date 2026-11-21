@@ -9,9 +9,15 @@
 //! an extra) runs through `command`, so shell functions never run, as in
 //! pi's earlier shell; any other name is searched on the
 //! command's own `PATH` (with environment changes applied; the C library's
-//! default path without one) and runs by absolute path through `exec -a`, so
-//! the program sees the name it was asked for. Environment changes (`env -i`,
-//! `-u`, `NAME=VALUE`) apply in the subshell before the command, in order.
+//! default path without one) and runs by absolute path through `builtin
+//! exec -a`, so the program sees the name it was asked for and no function
+//! named `exec` runs instead. `command PROG` and `exec PROG` run PROG the
+//! same way: those builtins run nothing before they `exec` it. Environment
+//! changes (`env -i`, `-u`, `NAME=VALUE`) apply in the subshell before the
+//! command, in order. The subshell starts with none of the caller's shell
+//! functions, aliases or DEBUG, ERR and RETURN traps, with `xtrace` off and
+//! every builtin enabled, as a program's children see none of the caller's
+//! shell state ([`Script::as_program`]); what its command defines is its own.
 //!
 //! The subshell's stdin is what the utility asks for (the null device by
 //! default; `env`'s own stdin is the caller's fd 0); stdout and stderr are the
@@ -21,6 +27,27 @@
 //! subshell through `exec`, so their actual signal deaths reach the utility
 //! as [`CommandStatus::Signaled`], distinct from an ordinary exit of `128+n`.
 //! In-engine commands report [`CommandStatus::Exited`].
+//!
+//! An external the system refuses to `exec` because its command line is too
+//! long (`E2BIG`, or `ENAMETOOLONG` for a line past `_POSIX_ARG_MAX` whose
+//! paths fit) is the shell's diagnostic and status 126, unless the command
+//! asked to hear of it ([`ShellCommand::too_long_as_error`]) and is a program
+//! this callout `exec`s itself: then, on Unix, the shell prints nothing and
+//! the utility gets the error, so `xargs` can retry with fewer arguments.
+//! The same goes for the command of a wrapper the callout runs (`env`,
+//! `ifne`, `nohup`, `timeout`: [`WRAPPERS`]), which has done nothing a retry
+//! would repeat when it runs it and hands the refusal up
+//! ([`CallOutcome::TooLong`]), as GNU's utilities retry a line whose wrapper
+//! program the system refused (`env --env0-from` keeps it: it read a file).
+//! Another builtin's own `exec` (`xargs eval '…; exec prog'`) stays the
+//! shell's, since retrying would run what the builtin did before it again.
+//! A command that asked to hear of every refusal
+//! ([`ShellCommand::refusal_as_error`]: `env`, which reports a command it
+//! cannot run in coreutils' words) gets any other refusal of its program's
+//! `exec` the same way (`EACCES`, `ENOENT` of a `#!` interpreter,
+//! `ENAMETOOLONG` of a path); `ENOEXEC` runs the file as a script, as
+//! `execvp` does. xargs and find ask only for a line too long: any other
+//! refusal is the shell's diagnostic and status 126.
 
 use std::{
 	ffi::OsStr,
@@ -28,7 +55,10 @@ use std::{
 	io,
 	path::{Path, PathBuf},
 	pin::Pin,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicI32, Ordering},
+	},
 	task::{Context, Poll, Waker},
 };
 
@@ -39,8 +69,8 @@ use tokio_util::sync::CancellationToken;
 use super::{Child, ToolConfig, Turn};
 use crate::{
 	bash::{
-		CallOutcome, IntrinsicId, Lineage, ModeId, RunId, RunStdio, Script, ShellApi, ToolCall,
-		VprocSel,
+		CallOutcome, ExecRefusal, IntrinsicId, Lineage, ModeId, RunId, RunStdio, Script, ShellApi,
+		ToolCall, VprocSel,
 	},
 	extras::Done,
 	sys::StdFile,
@@ -64,11 +94,36 @@ struct Request {
 }
 
 /// What a requested command is, decided by the lookup before it is sent.
-enum Program {
+pub(super) enum Program {
 	/// A builtin: runs through `command`.
 	Builtin,
-	/// A program at this path: runs through `exec -a`.
-	Path(PathBuf),
+	/// A program at `path`: runs through `builtin exec -a`, in place of the
+	/// first `skip` words of the command line. Those words are a builtin that
+	/// runs nothing before it `exec`s the program ([`Lookup::wrapped`]), so a
+	/// line the system refuses as too long reaches the utility as for the
+	/// program alone.
+	Path { path: PathBuf, skip: usize },
+}
+
+/// The builtins that have done nothing a retry would repeat when they run
+/// their command, and hand a refusal of it as too long up to a caller that
+/// asked ([`ToolCall::too_long_to_caller`], [`CallOutcome::TooLong`]): the
+/// tools `nohup` and `timeout`, and the extras `env` (unless it read
+/// `--env0-from`) and `ifne` (whose input is the null device in a callout).
+/// GNU's utilities run them as programs, whose own `exec` the system
+/// refuses, so the line is split there too.
+const WRAPPERS: [&[u8]; 4] = [b"env", b"ifne", b"nohup", b"timeout"];
+
+impl Program {
+	/// Whether a refusal of the command `name` as too long can reach the
+	/// one who asked: the generated `exec` of a program, or a wrapper's own
+	/// command ([`WRAPPERS`]).
+	pub(super) fn hands_up_too_long(&self, name: &[u8]) -> bool {
+		match self {
+			Self::Path { .. } => true,
+			Self::Builtin => WRAPPERS.contains(&name),
+		}
+	}
 }
 
 /// The utility, once started.
@@ -77,6 +132,9 @@ struct Running {
 	cancel:    CancellationToken,
 	requests:  flume::Receiver<Request>,
 	env_names: Vec<BString>,
+	/// The error of a refusal as too long the utility hands up
+	/// (`pi_builtins`' `Invocation::too_long_to_caller`); zero until then.
+	too_long:  Option<Arc<AtomicI32>>,
 }
 
 /// A call of an extra that runs command lines.
@@ -117,6 +175,8 @@ impl Extra {
 				turn.config,
 			);
 			invocation.cancel = Some(cancel.clone());
+			let too_long = call.too_long_to_caller.then(|| Arc::new(AtomicI32::new(0)));
+			invocation.too_long_to_caller.clone_from(&too_long);
 			let lookup = Lookup {
 				path:   invocation.env.get("PATH").cloned(),
 				cwd:    invocation.cwd.clone(),
@@ -130,7 +190,7 @@ impl Extra {
 				.iter()
 				.map(|(name, _)| BString::from(name))
 				.collect();
-			self.running = Some(Running { done, cancel, requests: received, env_names });
+			self.running = Some(Running { done, cancel, requests: received, env_names, too_long });
 		}
 		let running = self.running.as_ref()?;
 		while let Ok(Request { command, program, reply }) = running.requests.try_recv() {
@@ -141,22 +201,51 @@ impl Extra {
 		match running.done.poll(&Context::from_waker(turn.waker)) {
 			// The utility waits for every command it started; one whose
 			// reply nobody awaits any more still ends before the call does.
-			Poll::Ready(code) if self.runs.is_empty() => Some(CallOutcome::Exit(code)),
+			Poll::Ready(code) if self.runs.is_empty() => {
+				let refused = running
+					.too_long
+					.as_ref()
+					.map_or(0, |slot| slot.load(Ordering::Relaxed));
+				Some(if refused == 0 {
+					CallOutcome::Exit(code)
+				} else {
+					CallOutcome::TooLong(refused)
+				})
+			},
 			_ => None,
 		}
 	}
 
 	/// `run` ended with `status`; `false` when it is not one of this call's
-	/// commands.
-	pub(super) fn on_done(&mut self, run: RunId, status: i32, signal: Option<i32>) -> bool {
+	/// commands. `refusal` is an `exec` the system refused, for a command
+	/// that asked to hear of it ([`ShellCommand::too_long_as_error`],
+	/// [`ShellCommand::refusal_as_error`]). A line too long reaches the
+	/// utility as its `errno`, so it retries the line; any other refusal
+	/// with the error's kind and text but no `errno`, so a utility that
+	/// cannot see the program the shell found (a name on `PATH`) never
+	/// takes a path's `ENAMETOOLONG` for a line too long.
+	pub(super) fn on_done(
+		&mut self,
+		run: RunId,
+		status: i32,
+		signal: Option<i32>,
+		refusal: Option<ExecRefusal>,
+	) -> bool {
 		let Some(at) = self.runs.iter().position(|(r, _)| *r == run) else {
 			return false;
 		};
 		let (_, reply) = self.runs.swap_remove(at);
 		let code = u8::try_from(status.rem_euclid(256)).unwrap_or(u8::MAX);
+		let outcome = match refusal {
+			Some(refusal) if refusal.too_long => Err(io::Error::from_raw_os_error(refusal.errno)),
+			Some(refusal) => {
+				let error = io::Error::from_raw_os_error(refusal.errno);
+				Err(io::Error::new(error.kind(), crate::bash::diag::strerror(&error).into_owned()))
+			},
+			None => Ok(signal.map_or(CommandStatus::Exited(code), CommandStatus::Signaled)),
+		};
 		// The utility may have stopped waiting (cancelled).
-		let outcome = signal.map_or(CommandStatus::Exited(code), CommandStatus::Signaled);
-		let _ = reply.send(Ok(outcome));
+		let _ = reply.send(outcome);
 		true
 	}
 
@@ -242,22 +331,33 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 		}
 	}
 	let mut args: Vec<BString> = command.args().iter().map(|arg| os_bytes(arg)).collect();
+	// Whether a refusal of the command as too long can reach the utility.
+	let hands_up = command.too_long_is_error() && program.hands_up_too_long(&args[0]);
 	match program {
-		Program::Builtin => source.extend_from_slice(b"command -- \"$@\""),
-		Program::Path(path) => {
-			let argv0 = command
-				.presented_argv0()
-				.map_or_else(|| args[0].clone(), os_bytes);
-			source.extend_from_slice(b"exec -a ");
-			quote(&mut source, &argv0);
-			source.extend_from_slice(b" -- \"$@\"");
-			args[0] = os_bytes(path.as_os_str());
+		// Quoted, so no alias applies (the caller's are hidden; see
+		// `exec_source`).
+		Program::Builtin => source.extend_from_slice(b"\\command -- \"$@\""),
+		Program::Path { path, skip } => {
+			exec_source(&mut source, &mut args, path, *skip, command.presented_argv0().map(os_bytes));
 		},
 	}
 	let mut script = Script::command(source);
 	script.foreign_env = foreign_env;
 	script.unexport_env = unexport_env;
 	script.args = Some(args);
+	// The utility stands for a program the caller started, whose children
+	// see none of the caller's functions, aliases, DEBUG, ERR or RETURN
+	// traps, `set -x` or `enable -n`: none can change the words above, nor
+	// run again with each retry of a refused line.
+	script.as_program = true;
+	// Only the generated `exec` of a program, or a wrapper's own command:
+	// another builtin may have done work before an `exec` of its own, which
+	// a retry would repeat.
+	script.too_long_to_host = hands_up;
+	// Every other refusal of the generated `exec` of a program too, for a
+	// utility that reports a command it cannot run in its own words (`env`).
+	script.refusals_to_host =
+		hands_up && matches!(program, Program::Path { .. }) && command.refusal_is_error();
 	// The working directory is logical, as after `cd`: `-execdir` hands over
 	// `<root>/./sub`, and the command's `$PWD` is `<root>/sub`.
 	script.cwd = command
@@ -265,6 +365,32 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 		.map(|dir| os_bytes(pi_vfs::normalize_lexically(dir).as_os_str()));
 	script.vproc = VprocSel::NewSubshellWithStdio([stdin, RunStdio::Inherit, RunStdio::Inherit]);
 	script
+}
+
+/// Appends to `source` the `exec` of the program at `path` in place of the
+/// first `skip` words of `args` (its positional parameters, rewritten to
+/// match), presented as `argv0` or else as the name it was asked for. The
+/// program runs by the path it was found at (for a name with a separator,
+/// joined to the working directory it was looked up in), as at 9058ab9d:
+/// the shell names that path in its diagnostics, and a script without `#!`
+/// gets it as its `$0`.
+fn exec_source(
+	source: &mut Vec<u8>,
+	args: &mut Vec<BString>,
+	path: &Path,
+	skip: usize,
+	argv0: Option<BString>,
+) {
+	args.drain(..skip);
+	let argv0 = argv0.unwrap_or_else(|| args[0].clone());
+	// `builtin`, as `command` for a builtin: a shell function named `exec`
+	// never runs (it would run again with each retry of a refused line).
+	// Quoted, so no alias applies: an alias the callout's own command
+	// defined before a tool's subshell (the caller's are hidden).
+	source.extend_from_slice(b"\\builtin exec -a ");
+	quote(source, &argv0);
+	source.extend_from_slice(b" -- \"$@\"");
+	args[0] = os_bytes(path.as_os_str());
 }
 
 /// fd 0 of a command: the null device unless the utility gave one. A host
@@ -344,7 +470,7 @@ fn cancelled() -> io::Error {
 }
 
 /// What a command name runs, as of the utility's start.
-struct Lookup {
+pub(super) struct Lookup {
 	/// The utility's `PATH`.
 	path:   Option<String>,
 	/// The utility's working directory.
@@ -353,6 +479,19 @@ struct Lookup {
 }
 
 impl Lookup {
+	/// The lookup a tool's own command gets: `call`'s `PATH` and working
+	/// directory.
+	pub(super) fn for_call(call: &ToolCall, config: &ToolConfig) -> Self {
+		Self {
+			path:   call
+				.env
+				.get(b"PATH")
+				.map(|path| path.to_str_lossy().into_owned()),
+			cwd:    call.cwd.to_path_lossy().into_owned(),
+			config: config.clone(),
+		}
+	}
+
 	/// How `command` runs; `NotFound` when nothing has its name,
 	/// `PermissionDenied` when only files that cannot be executed have it.
 	fn program(&self, command: &ShellCommand) -> io::Result<Program> {
@@ -361,18 +500,24 @@ impl Lookup {
 			.first()
 			.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
 		let cwd = command.dir().unwrap_or(&self.cwd);
+		if self.builtin(name) && !has_separator(name) {
+			return Ok(self.wrapped(command, cwd).unwrap_or(Program::Builtin));
+		}
+		let path = self.find(command.env_changes(), name, cwd)?;
+		Ok(Program::Path { path, skip: 0 })
+	}
+
+	/// The program `name` names, with the environment changes `changes`
+	/// applied to the utility's `PATH`.
+	fn find(&self, changes: &[EnvChange], name: &OsStr, cwd: &Path) -> io::Result<PathBuf> {
 		if has_separator(name) {
 			return match executable(&cwd.join(name)) {
-				Some(true) => Ok(Program::Path(cwd.join(name))),
+				Some(true) => Ok(cwd.join(name)),
 				Some(false) => Err(io::ErrorKind::PermissionDenied.into()),
 				None => Err(io::ErrorKind::NotFound.into()),
 			};
 		}
-		if self.builtin(name) {
-			return Ok(Program::Builtin);
-		}
-		let path = command
-			.env_changes()
+		let path = changes
 			.iter()
 			.fold(self.path.as_deref(), |path, change| match change {
 				EnvChange::Clear => None,
@@ -385,7 +530,7 @@ impl Lookup {
 		for dir in std::env::split_paths(OsStr::new(path)) {
 			let candidate = cwd.join(dir).join(name);
 			match executable(&candidate) {
-				Some(true) => return Ok(Program::Path(candidate)),
+				Some(true) => return Ok(candidate),
 				Some(false) => denied = true,
 				None => {},
 			}
@@ -398,9 +543,40 @@ impl Lookup {
 		Err(kind.into())
 	}
 
+	/// The program a builtin that runs nothing before it `exec`s one runs,
+	/// as if the utility had named it: `command PROG` and `exec PROG`
+	/// (optionally after `builtin`, or with `--`). `None` for anything else
+	/// (an option, a builtin or a missing program after the words, a
+	/// presented `argv[0]`), which runs as the builtin, reporting its own
+	/// errors. `env`, `ifne`, `nohup` and `timeout` run their command
+	/// themselves and hand a refusal of it up ([`WRAPPERS`]).
+	fn wrapped(&self, command: &ShellCommand, cwd: &Path) -> Option<Program> {
+		if command.presented_argv0().is_some() {
+			return None;
+		}
+		let args = command.args();
+		let word = |at: usize| args.get(at).and_then(|arg| arg.to_str());
+		let mut skip = usize::from(word(0) == Some("builtin"));
+		match word(skip)? {
+			"command" | "exec" => {
+				skip += 1;
+				if word(skip) == Some("--") {
+					skip += 1;
+				}
+			},
+			_ => return None,
+		}
+		let name = args.get(skip)?;
+		if name.as_encoded_bytes().first() == Some(&b'-') || self.builtin(name) {
+			return None;
+		}
+		let path = self.find(command.env_changes(), name, cwd).ok()?;
+		Some(Program::Path { path, skip })
+	}
+
 	/// Whether `name` runs in-process: an engine intrinsic, a tool or an
 	/// extra this shell offers.
-	fn builtin(&self, name: &OsStr) -> bool {
+	pub(super) fn builtin(&self, name: &OsStr) -> bool {
 		let name = os_bytes(name);
 		IntrinsicId::lookup(&name, ModeId::Bash).is_some()
 			|| self.config.lookup(name.as_bstr()).is_some()

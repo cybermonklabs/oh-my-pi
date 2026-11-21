@@ -1397,6 +1397,46 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 	});
 
+	it("sends a side request with its parent's session id in the header and metadata", async () => {
+		// A gateway pins a conversation to one organization by this id, and each organization
+		// keeps its own prompt cache. A side request that sent `<parent>:side:<n>` had no id the
+		// gateway accepts, so it went to either organization and read the parent's prefix cold.
+		const { promise, resolve } = Promise.withResolvers<{ sessionHeader: string | null; userId?: string }>();
+		const controller = new AbortController();
+		const fakeFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const body = JSON.parse(requestBodyText(init) ?? "{}") as { metadata?: { user_id?: string } };
+			resolve({
+				sessionHeader: new Headers(init?.headers).get("X-Claude-Code-Session-Id"),
+				userId: body.metadata?.user_id,
+			});
+			controller.abort();
+			return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+
+		streamAnthropic(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "sk-ant-oat-test",
+				isOAuth: true,
+				sessionId: "0190fb1e-0000-7000-8000-000000000001:side:15d0b21d57c3390a",
+				parentSessionId: "0190fb1e-0000-7000-8000-000000000001",
+				signal: controller.signal,
+				fetch: fakeFetch,
+			},
+		);
+
+		const sent = await promise;
+		expect(sent.sessionHeader).toBe("0190fb1e-0000-7000-8000-000000000001");
+		expect(JSON.parse(sent.userId ?? "{}").session_id).toBe("0190fb1e-0000-7000-8000-000000000001");
+	});
+
 	it("preserves real Claude Code JSON-format metadata.user_id for OAuth requests", async () => {
 		// Matches the shape produced by services/api/claude.ts → getAPIMetadata in
 		// the Claude Code source: { device_id, account_uuid, session_id, ...extra }.

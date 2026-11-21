@@ -40,6 +40,8 @@ mod linux_reflink;
 mod overlayfs;
 mod projfs;
 mod rcopy;
+#[cfg(all(test, unix))]
+mod testprog;
 mod tree;
 mod windows_block_clone;
 mod zfs;

@@ -222,7 +222,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 		},
 		publishCompleted: (manager, type, label, result, options) =>
 			manager.publishCompleted(type, label, result, options),
-		cancel: (manager, id, filter) => manager.cancel(id, filter),
+		cancel: (manager, id, filter, reason) => manager.cancel(id, filter, fromWireReason(reason)),
 		getJob: (manager, id) => {
 			const job = manager.getJob(id);
 			return job ? toJobWire(job) : undefined;
@@ -250,7 +250,8 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 				),
 			),
 		waitForOwnerJobs: (manager, ownerId, options) => manager.waitForOwnerJobs(ownerId, options),
-		cancelAndReapOwnerJobs: (manager, ownerId, deadlineAt) => manager.cancelAndReapOwnerJobs(ownerId, deadlineAt),
+		cancelAndReapOwnerJobs: (manager, ownerId, deadlineAt, reason) =>
+			manager.cancelAndReapOwnerJobs(ownerId, deadlineAt, fromWireReason(reason)),
 		drainDeliveries: (manager, options) => manager.drainDeliveries(options),
 		isDeliverySuppressed: (manager, jobId) => manager.isDeliverySuppressed(jobId),
 		isDeliveryPending: (manager, jobId) => manager.isDeliveryPending(jobId),

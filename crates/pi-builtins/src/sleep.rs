@@ -20,6 +20,19 @@ pub(crate) struct SleepCommand {
 	durations: Vec<String>,
 }
 
+impl SleepCommand {
+	/// The time `durations` ask for: their sum, saturating (`infinity` parses
+	/// as `Duration::MAX`), or the first that is not a time interval.
+	fn total(durations: &[String]) -> Result<Duration, &str> {
+		let mut total = Duration::ZERO;
+		for duration in durations {
+			let parsed = parse_duration(duration).ok_or(duration.as_str())?;
+			total = total.saturating_add(parsed);
+		}
+		Ok(total)
+	}
+}
+
 impl Process for SleepCommand {
 	fn run(&self, context: &ProcContext) -> impl Future<Output = std::io::Result<i32>> + Send {
 		let durations = &self.durations;
@@ -27,15 +40,13 @@ impl Process for SleepCommand {
 			if context.is_cancelled() {
 				return Ok(INTERRUPTED_EXIT_CODE);
 			}
-			let mut total = Duration::ZERO;
-			for duration in durations {
-				let Some(parsed) = parse_duration(duration) else {
+			let total = match Self::total(durations) {
+				Ok(total) => total,
+				Err(duration) => {
 					let _ = writeln!(context.stderr(), "sleep: invalid time interval '{duration}'");
 					return Ok(1);
-				};
-				// `infinity` parses as `Duration::MAX`; keep the sum saturating.
-				total = total.saturating_add(parsed);
-			}
+				},
+			};
 			context.flush_output().await?;
 			let sleep = time::sleep(total);
 			tokio::pin!(sleep);
@@ -54,13 +65,26 @@ impl Process for SleepCommand {
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	// No verdict here depends on the wall clock, which a loaded host
+	// stretches past any bound: a time is checked in `SleepCommand::total`,
+	// and a cancel by the exit code. `HANG` only names a sleep that never
+	// returns, rather than leaving it to the runner's timeout.
+	use std::{future::Future, time::Duration};
 
-	use tokio::time;
 	use tokio_util::sync::CancellationToken;
 
 	use super::SleepCommand;
 	use crate::{duration::parse_duration, host::run_proc};
+
+	/// Far above any correct run: a loaded host took over 100 ms for a 2 ms
+	/// sleep, not seconds.
+	const HANG: Duration = Duration::from_secs(30);
+
+	async fn returns<T>(what: &str, run: impl Future<Output = T>) -> T {
+		tokio::time::timeout(HANG, run)
+			.await
+			.unwrap_or_else(|_| panic!("{what} did not return within {HANG:?}"))
+	}
 
 	#[tokio::test]
 	async fn valid_durations_parse_and_short_sleep_completes() {
@@ -72,12 +96,13 @@ mod tests {
 		assert_eq!(parse_duration("0.000001h"), Some(Duration::from_micros(3600)));
 		assert_eq!(parse_duration("0.00000001d"), Some(Duration::from_micros(864)));
 
-		let (code, ..) = time::timeout(
-			Duration::from_millis(100),
+		let operands = ["0.001", "0.001s"].map(String::from);
+		assert_eq!(SleepCommand::total(&operands), Ok(Duration::from_millis(2)), "the operands sum");
+		let (code, ..) = returns(
+			"sleep 0.001 0.001s",
 			run_proc::<SleepCommand>(&["sleep", "0.001", "0.001s"], None),
 		)
-		.await
-		.expect("short sleep should complete promptly");
+		.await;
 		assert_eq!(code, 0);
 	}
 
@@ -92,17 +117,16 @@ mod tests {
 
 		// `sleep infinity` must block until cancelled rather than erroring out.
 		let token = CancellationToken::new();
-		let execution = async {
-			let ((code, ..), ()) =
-				tokio::join!(run_proc::<SleepCommand>(&["sleep", "infinity"], Some(token.clone())), async {
+		let ((code, ..), ()) = returns("a cancelled sleep infinity", async {
+			tokio::join!(
+				run_proc::<SleepCommand>(&["sleep", "infinity"], Some(token.clone())),
+				async {
 					tokio::task::yield_now().await;
 					token.cancel();
-				});
-			code
-		};
-		let code = time::timeout(Duration::from_millis(100), execution)
-			.await
-			.expect("cancelled infinite sleep should return promptly");
+				}
+			)
+		})
+		.await;
 		assert_eq!(code, 130);
 	}
 
@@ -124,18 +148,16 @@ mod tests {
 
 	#[tokio::test]
 	async fn cancelled_invocation_returns_promptly() {
+		// An hour, so the cancel always comes first: a sleep that ignored it
+		// fails at `HANG`, and one that ended first would exit 0.
 		let token = CancellationToken::new();
-		let execution = async {
-			let ((code, ..), ()) =
-				tokio::join!(run_proc::<SleepCommand>(&["sleep", "0.250"], Some(token.clone())), async {
-					tokio::task::yield_now().await;
-					token.cancel();
-				});
-			code
-		};
-		let code = time::timeout(Duration::from_millis(100), execution)
-			.await
-			.expect("cancelled sleep should return promptly");
+		let ((code, ..), ()) = returns("a cancelled sleep 3600", async {
+			tokio::join!(run_proc::<SleepCommand>(&["sleep", "3600"], Some(token.clone())), async {
+				tokio::task::yield_now().await;
+				token.cancel();
+			})
+		})
+		.await;
 		assert_eq!(code, 130);
 	}
 }

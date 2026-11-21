@@ -12,6 +12,7 @@ import {
 	splitBareSpecifier,
 	writeRuntimeManifest,
 } from "../src/runtime-install";
+import { createProductionChildEnv } from "../../../scripts/test-env";
 
 // Contract under test: runtime-installed packages (fastembed, Transformers.js
 // graphs) load inside compiled binaries through resolveRuntimeModule, which
@@ -416,7 +417,7 @@ describe("ensureRuntimeInstalled install lock", () => {
 			],
 			{
 				cwd: path.resolve(import.meta.dir, "../../.."),
-				env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
+				env: createProductionChildEnv({ PATH: process.env.PATH }),
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "pipe",

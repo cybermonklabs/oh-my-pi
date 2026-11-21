@@ -5,7 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { embeddedAddon } from "./embedded-addon.js";
+import { getNativesDir } from "./natives-dir.js";
 import { bindingsHaveReleaseIdentity, bindingsReleaseVersion, containsVersionStamp } from "./version-sentinel.js";
+import { addonSourcesStampPath, addonSourcesState, uniqueTempPath } from "./workspace-sources.js";
 
 /**
  * Native addon loader for `@oh-my-pi/pi-natives`.
@@ -55,22 +57,6 @@ function startupMarker(text) {
 	}
 }
 
-function getNativesDir() {
-	// Match pi-utils directory overrides without depending on pi-utils.
-	const override = process.env.PI_NATIVES_DIR?.trim();
-	if (override) {
-		let dir = override;
-		if (dir === "~") dir = os.homedir();
-		else if (dir.startsWith("~/") || dir.startsWith("~\\")) dir = os.homedir() + dir.slice(1);
-		if (path.isAbsolute(dir)) return path.normalize(dir);
-	}
-	const xdgDataHome = process.env.XDG_DATA_HOME;
-	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "omp"))) {
-		return path.join(xdgDataHome, "omp", "natives");
-	}
-	return path.join(os.homedir(), ".omp", "natives");
-}
-
 function resolveLeafPackageDir(platformTag) {
 	try {
 		const require_ = createRequire(import.meta.url);
@@ -78,6 +64,41 @@ function resolveLeafPackageDir(platformTag) {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The addons a native leaf package records in its package.json (`nativeAddons`,
+ * written by `scripts/gen-npm-packages.ts` when the package is built): each one's
+ * `filename`, `size` and `sha256`, and the set's `digest`. Null when the package
+ * records none, records them in another shape, or its package.json cannot be
+ * read: a leaf the loader cannot trust to name its addons is loaded where it is
+ * installed.
+ *
+ * @param {string} packageDir
+ * @returns {{ digest: string; files: { filename: string; size: number; sha256: string }[] } | null}
+ */
+function readPackageAddons(packageDir) {
+	try {
+		const { nativeAddons } = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+		const hex = /^[0-9a-f]{64}$/;
+		// The digest names a directory, so it must be the hex a build writes.
+		if (
+			hex.test(nativeAddons?.digest) &&
+			Array.isArray(nativeAddons.files) &&
+			nativeAddons.files.every(
+				file =>
+					typeof file?.filename === "string" &&
+					Number.isSafeInteger(file.size) &&
+					file.size >= 0 &&
+					hex.test(file.sha256),
+			)
+		) {
+			return nativeAddons;
+		}
+	} catch {
+		// No package.json, or not JSON: nothing to stage.
+	}
+	return null;
 }
 
 // =========================================================================
@@ -119,14 +140,15 @@ export function getAddonFilenames({ tag, arch, variant }) {
 
 /**
  * Decide whether the loader should mirror the package's `native/<filename>.node`
- * into the per-version cache directory (`~/.omp/natives/<version>/`) before loading.
+ * into this install's cache directory (`<natives dir>/<version>-<digest prefix>/`,
+ * named by the digest the leaf package records) before loading.
  *
  * Windows-only safety net for `bun install -g` updates: when a previous `omp`
  * process is running, bun cannot overwrite the locked `.node` inside
  * `node_modules/@oh-my-pi/pi-natives/native/`, leaving an old binary next to a
  * newer `index.js` and producing `<sym> is not a function` crashes on the next
- * launch. Staging into the version-pinned cache:
- *   1. Gives every package version its own filesystem path, so concurrent omp
+ * launch. Staging into the digest-named cache:
+ *   1. Gives every install's addons their own filesystem path, so concurrent omp
  *      processes never collide on the same file.
  *   2. Makes the running process keep its handle on the cache copy, freeing bun
  *      to overwrite the `node_modules` copy on subsequent updates.
@@ -193,67 +215,112 @@ export function resolveLoaderCandidates({
 
 // =========================================================================
 
-function parseReleaseVersion(version) {
-	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
-}
-
-function isOlderReleaseVersion(candidate, current) {
-	const candidateParts = parseReleaseVersion(candidate);
-	const currentParts = parseReleaseVersion(current);
-	if (!candidateParts || !currentParts) return false;
-	for (let index = 0; index < candidateParts.length; index++) {
-		if (candidateParts[index] !== currentParts[index]) {
-			return candidateParts[index] < currentParts[index];
-		}
-	}
-	return false;
-}
-
-// A concurrently starting older OMP binary creates or refreshes this directory
-// before extracting its addon. Keep fresh directories long enough for that
-// startup to finish; a later launch can reclaim them once they are genuinely
-// stale.
-const NATIVE_CACHE_CLEANUP_GRACE_MS = 10 * 60_000;
+/**
+ * Hex digits of the embedded addons' digest that name a compiled build's cache
+ * directory, `<version>-<digest prefix>`: 48 bits, so two builds do not collide by
+ * chance.
+ */
+const BUILD_DIGEST_PREFIX_LENGTH = 12;
 
 /**
- * Create a version cache directory and refresh its activity timestamp before
- * extraction or staging begins. Recursive mkdir does not update the mtime of
- * an existing directory, so the explicit touch is what protects interrupted
- * or partially populated caches from concurrent cleanup.
+ * The names of addon cache directories: `<major.minor.patch>-<digest prefix>`, a
+ * compiled build's or a Windows install's own, and `<major.minor.patch>`, where
+ * loaders before addon digests extracted and staged. Every other entry
+ * (`grammars`, prerelease names, files) is never cleaned up.
+ */
+const NATIVE_CACHE_DIR_NAME = new RegExp(`^\\d+\\.\\d+\\.\\d+(?:-[0-9a-f]{${BUILD_DIGEST_PREFIX_LENGTH}})?$`);
+
+/**
+ * A cache directory cleanup has claimed for removal (`.<name>.removing.<pid>.<uuid>`).
+ * The leading dot keeps it out of {@link NATIVE_CACHE_DIR_NAME}, so no start reaches it.
+ */
+const CLAIMED_CACHE_DIR_NAME = /^\..+\.removing\.\d+\.[0-9a-f-]{36}$/;
+
+// Every start marks the directory it loads from as used (`prepareNativeVersionDir`),
+// and cleanup keeps each directory used within this window, whatever its version:
+// two builds run in turn, of one release or of two, keep both their extracted
+// addons instead of extracting one at each switch, and a directory a concurrent
+// start is populating is never swept from under it. A build nobody has started
+// for a day loses its directory and extracts again if it ever starts.
+const NATIVE_CACHE_RETENTION_MS = 24 * 60 * 60_000;
+
+/**
+ * The file calls the addon cache makes: preparing, cleaning up, checking, reading, writing and
+ * restoring cache files. `node:fs`, unless a test replaces them.
+ * @type {typeof fs}
+ */
+let io = fs;
+
+/**
+ * Replace the addon cache's file calls (`undefined` restores them), so a test can rename a
+ * cache directory away between a check and the load, as a cleanup in another process can, or
+ * record the calls. The replacement reaches this module instance only.
+ * @param {Partial<typeof fs> | undefined} replacement
+ */
+export function __setAddonFileIoForTests(replacement) {
+	io = replacement ? { ...fs, ...replacement } : fs;
+}
+
+/**
+ * Create an addon cache directory and mark it used now, before extraction or
+ * staging begins. Recursive mkdir does not update the mtime of an existing
+ * directory, so the explicit touch is what keeps a directory in use, or
+ * partially populated, out of concurrent cleanup.
  *
  * @param {string} versionedDir
  */
 export function prepareNativeVersionDir(versionedDir) {
-	fs.mkdirSync(versionedDir, { recursive: true });
+	io.mkdirSync(versionedDir, { recursive: true });
 	const now = new Date();
-	fs.utimesSync(versionedDir, now, now);
+	io.utimesSync(versionedDir, now, now);
 }
 
 /**
- * Remove version-pinned native cache directories older than the loaded package.
- * Best-effort by design: permission errors and concurrent processes must not
- * abort startup after the native addon has already loaded successfully.
+ * Remove the addon cache directories no omp process has used for a day, other
+ * than `currentDir`, the one this process loads from. Best-effort by design:
+ * permission errors and concurrent processes must not abort startup after the
+ * native addon has already loaded successfully.
  *
- * @param {{ nativesDir: string; currentVersion: string }} input
+ * A start can mark a directory used just after this read its time, so a
+ * directory is first renamed to a private name, which a start no longer reaches,
+ * and its time read again: one marked used in between is renamed back, the rest
+ * removed. Private names left by a cleanup that stopped half-way go once they too
+ * are a day old.
+ *
+ * @param {{ nativesDir: string; currentDir: string }} input
  * @returns {string[]}
  */
-export function cleanupStaleNativeVersions({ nativesDir, currentVersion }) {
+export function cleanupStaleNativeVersions({ nativesDir, currentDir }) {
 	const removed = [];
 	let entries;
 	try {
-		entries = fs.readdirSync(nativesDir, { withFileTypes: true });
+		entries = io.readdirSync(nativesDir, { withFileTypes: true });
 	} catch {
 		return removed;
 	}
 
+	const stale = targetPath => Date.now() - io.statSync(targetPath).mtimeMs >= NATIVE_CACHE_RETENTION_MS;
 	for (const entry of entries) {
-		if (!entry.isDirectory() || !isOlderReleaseVersion(entry.name, currentVersion)) continue;
+		if (!entry.isDirectory()) continue;
 		const targetPath = path.join(nativesDir, entry.name);
 		try {
-			const stat = fs.statSync(targetPath);
-			if (Date.now() - stat.mtimeMs < NATIVE_CACHE_CLEANUP_GRACE_MS) continue;
-			fs.rmSync(targetPath, { recursive: true, force: true });
+			if (CLAIMED_CACHE_DIR_NAME.test(entry.name)) {
+				if (stale(targetPath)) io.rmSync(targetPath, { recursive: true, force: true });
+				continue;
+			}
+			if (!NATIVE_CACHE_DIR_NAME.test(entry.name) || targetPath === currentDir || !stale(targetPath)) continue;
+			const claimed = path.join(nativesDir, `.${entry.name}.removing.${process.pid}.${crypto.randomUUID()}`);
+			io.renameSync(targetPath, claimed);
+			if (!stale(claimed)) {
+				try {
+					io.renameSync(claimed, targetPath);
+				} catch {
+					// A start made a new directory there meanwhile; the claimed copy is no one's now.
+					io.rmSync(claimed, { recursive: true, force: true });
+				}
+				continue;
+			}
+			io.rmSync(claimed, { recursive: true, force: true });
 			removed.push(targetPath);
 		} catch {
 			// Stale caches are opportunistic cleanup only.
@@ -453,9 +520,17 @@ function isSafeEmbeddedAddonFilename(filename) {
 	return filename.length > 0 && path.basename(filename) === filename && !filename.includes("/") && !filename.includes("\\");
 }
 
-function isEmbeddedAddonFileCurrent(targetPath, file) {
+/**
+ * Whether `targetPath` already holds `file`, one addon of a set named by its
+ * digest. The directory is that set's own (`<version>-<digest prefix>`), and the
+ * loader puts a file in it only by renaming a copy whose SHA-256 it checked; so a
+ * regular file of the declared size is that copy, and any other size is a
+ * truncated file to replace. Hashing the file instead would read the whole addon
+ * at every start.
+ */
+function isCachedAddonCurrent(targetPath, file) {
 	try {
-		const stat = fs.statSync(targetPath);
+		const stat = io.statSync(targetPath);
 		if (!stat.isFile()) return false;
 		return stat.size === file.size;
 	} catch (err) {
@@ -464,18 +539,71 @@ function isEmbeddedAddonFileCurrent(targetPath, file) {
 	}
 }
 
-function writeEmbeddedAddonFile(targetPath, content) {
-	const tempPath = `${targetPath}.tmp.${process.pid}.${Date.now()}`;
+/**
+ * Throw unless `content` has the size and SHA-256 its manifest records for `file`;
+ * `kind` names the manifest (`Embedded`, `Staged`) in the error.
+ */
+function checkAddonBytes(kind, file, content) {
+	if (content.length !== file.size) {
+		throw new Error(`${kind} addon size mismatch for ${file.filename}: expected ${file.size}, got ${content.length}`);
+	}
+	const digest = new Bun.CryptoHasher("sha256").update(content).digest("hex");
+	if (digest !== file.sha256) {
+		throw new Error(`${kind} addon digest mismatch for ${file.filename}: expected sha256 ${file.sha256}, got ${digest}`);
+	}
+}
+
+/**
+ * Write `content` to `targetPath` so that a file there is whole, even after a
+ * crash: a temporary file synced to disk, renamed over the target, then the
+ * directory synced so the rename survives too (not on Windows, which cannot open
+ * a directory).
+ */
+function writeCachedAddon(targetPath, content) {
 	try {
-		fs.writeFileSync(tempPath, content, { mode: 0o755 });
-		fs.renameSync(tempPath, targetPath);
+		writeCachedAddonOnce(targetPath, content);
+	} catch (err) {
+		// Cleanup can claim a directory a start marked used a moment before
+		// (`cleanupStaleNativeVersions` renames it away, then back): write once
+		// more into the directory there now.
+		if (err?.code !== "ENOENT") throw err;
+		prepareNativeVersionDir(path.dirname(targetPath));
+		writeCachedAddonOnce(targetPath, content);
+	}
+}
+
+/** @see writeCachedAddon */
+function writeCachedAddonOnce(targetPath, content) {
+	// Unique per write: worker threads share this process's pid, and may share its clock's millisecond.
+	const tempPath = uniqueTempPath(targetPath);
+	try {
+		const fd = io.openSync(tempPath, "w", 0o755);
+		try {
+			io.writeFileSync(fd, content);
+			io.fsyncSync(fd);
+		} finally {
+			io.closeSync(fd);
+		}
+		io.renameSync(tempPath, targetPath);
 	} catch (err) {
 		try {
-			fs.unlinkSync(tempPath);
+			io.unlinkSync(tempPath);
 		} catch {
 			// Best-effort cleanup only.
 		}
 		throw err;
+	}
+	if (process.platform === "win32") return;
+	try {
+		const dirFd = io.openSync(path.dirname(targetPath), "r");
+		try {
+			io.fsyncSync(dirFd);
+		} finally {
+			io.closeSync(dirFd);
+		}
+	} catch {
+		// The file is whole and in place; a directory that cannot be synced only
+		// leaves the rename to the file system's own schedule.
 	}
 }
 
@@ -488,12 +616,10 @@ export function extractEmbeddedAddons({ files, targetDir }) {
 	const writtenPaths = [];
 	for (const file of files) {
 		const targetPath = path.join(targetDir, file.filename);
-		if (isEmbeddedAddonFileCurrent(targetPath, file)) continue;
-		const content = Bun.zstdDecompressSync(fs.readFileSync(file.zstdPath));
-		if (content.length !== file.size) {
-			throw new Error(`Embedded addon size mismatch for ${file.filename}: expected ${file.size}, got ${content.length}`);
-		}
-		writeEmbeddedAddonFile(targetPath, content);
+		if (isCachedAddonCurrent(targetPath, file)) continue;
+		const content = Bun.zstdDecompressSync(io.readFileSync(file.zstdPath));
+		checkAddonBytes("Embedded", file, content);
+		writeCachedAddon(targetPath, content);
 		writtenPaths.push(targetPath);
 	}
 	return writtenPaths;
@@ -525,38 +651,37 @@ function maybeExtractEmbeddedAddon(ctx, errors, file = selectEmbeddedAddonFile(c
 }
 
 /**
- * Mirror `leafPackageDir ?? nativeDir` addon binaries to
- * `versionedDir/<filename>.node` on Windows installs so the running process
- * cache path, never on the `node_modules` copy that bun must overwrite on
- * update. No-op on non-Windows, in workspace dev, and for compiled binaries —
- * see `shouldStageNodeModulesAddon` for the gating rules.
+ * On a Windows install, copy the addons the leaf package records
+ * (`ctx.stagedAddons`, from its package.json) into `versionedDir`, named by the
+ * digest the leaf records, so the running process holds its OS-level handle on
+ * that copy, never on the `node_modules` one bun must overwrite on update. Each
+ * copy is checked against the SHA-256 the leaf records and written durably; a
+ * copy already there of the recorded size is reused. Every start marks the
+ * directory used, so cleanup keeps it while this install runs. No-op on
+ * non-Windows, in workspace dev, for compiled binaries, and for a leaf that
+ * records no addons — see `shouldStageNodeModulesAddon` and `initLoaderContext`.
  */
-function maybeStageNodeModulesAddon(ctx, errors) {
+export function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
+	try {
+		prepareNativeVersionDir(ctx.versionedDir);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		errors.push(`staged addon dir: ${message}`);
+		return null;
+	}
 
 	let stagedPath = null;
 	for (const filename of ctx.addonFilenames) {
-		const sourcePath = path.join(ctx.leafPackageDir ?? ctx.nativeDir, filename);
+		const file = ctx.stagedAddons.files.find(entry => entry.filename === filename);
+		if (!file) continue;
 		const targetPath = path.join(ctx.versionedDir, filename);
-
-		if (fs.existsSync(targetPath)) {
-			stagedPath = stagedPath || targetPath;
-			continue;
-		}
-		if (!fs.existsSync(sourcePath)) continue;
-
 		try {
-			prepareNativeVersionDir(ctx.versionedDir);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			errors.push(`staged addon dir: ${message}`);
-			continue;
-		}
-
-		try {
-			// `copyFileSync` is atomic on Windows (CopyFileW) and avoids holding
-			// two large buffers in JS for the read/write dance.
-			fs.copyFileSync(sourcePath, targetPath);
+			if (!isCachedAddonCurrent(targetPath, file)) {
+				const content = io.readFileSync(path.join(ctx.leafPackageDir, filename));
+				checkAddonBytes("Staged", file, content);
+				writeCachedAddon(targetPath, content);
+			}
 			stagedPath = stagedPath || targetPath;
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -638,30 +763,45 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 /**
  * Identity of the addon `loadNative()` returned, in the shape the
  * missing-export diagnostic reports. Null until a load succeeds.
- * @type {{ path: string; version: string | null; packageVersion: string; stale: boolean } | null}
+ * @type {{ path: string; version: string | null; packageVersion: string; stale: boolean; builtFromOtherSources: boolean } | null}
  */
 let loadedAddon = null;
 
 /**
  * Describe a loaded addon so a symbol it predates can name the file, the
  * release the file came from, and the release this tree expects.
+ *
+ * A workspace load also asks whether the addon of this release was built from
+ * the checkout's own Rust sources (`workspace-sources.js`): the checkout skips
+ * release validation, so an addon built before its Rust sources changed would
+ * otherwise load as current. Only an addon whose build record names other
+ * sources is stale; one without a record (built before records existed, or
+ * copied in, as CI's prebuilt addons are) is not judged. Compiled binaries and
+ * package installs never ask.
  * @param {Record<string, unknown>} bindings
  * @param {string} candidate
- * @param {{ packageVersion: string }} ctx
+ * @param {{ packageVersion: string; isWorkspaceLoad: boolean; nativeDir: string }} ctx
  */
-function describeLoadedAddon(bindings, candidate, ctx) {
+export function describeLoadedAddon(bindings, candidate, ctx) {
 	const version = bindingsReleaseVersion(bindings);
+	const otherRelease = version !== ctx.packageVersion;
+	// `nativeDir` is `<checkout>/packages/natives/native` on a workspace load.
+	const builtFromOtherSources =
+		!otherRelease &&
+		ctx.isWorkspaceLoad &&
+		addonSourcesState(candidate, path.resolve(ctx.nativeDir, "..", "..", "..")) === "other";
 	return {
 		path: candidate,
 		version,
 		packageVersion: ctx.packageVersion,
-		stale: version !== ctx.packageVersion,
+		stale: otherRelease || builtFromOtherSources,
+		builtFromOtherSources,
 	};
 }
 
 /**
  * The addon behind this process's `@oh-my-pi/pi-natives` exports.
- * @returns {{ path: string; version: string | null; packageVersion: string; stale: boolean } | null}
+ * @returns {{ path: string; version: string | null; packageVersion: string; stale: boolean; builtFromOtherSources: boolean } | null}
  */
 export function nativeAddonStatus() {
 	return loadedAddon;
@@ -748,6 +888,12 @@ export function missingNativeExportMessage(symbolName, addon = loadedAddon) {
 	if (!addon.stale) {
 		return `@oh-my-pi/pi-natives export \`${symbolName}\` is missing from ${addon.path}; ${rebuild}.`;
 	}
+	if (addon.builtFromOtherSources) {
+		return (
+			`@oh-my-pi/pi-natives export \`${symbolName}\` is missing: ${addon.path} was built from Rust sources ` +
+			`other than this checkout's — ${rebuild}.`
+		);
+	}
 	const loaded = addon.version
 		? `the @oh-my-pi/pi-natives@${addon.version} addon`
 		: "an addon without a release stamp";
@@ -758,22 +904,27 @@ export function missingNativeExportMessage(symbolName, addon = loadedAddon) {
 }
 
 /**
- * One-line notice for a workspace tree running an addon from another release.
+ * One-line notice for a workspace tree running an addon from another release,
+ * or of this release built from other Rust sources than the checkout's.
  *
  * The missing-symbol stubs only speak when a caller touches a symbol the addon
- * does not carry. A symbol it does carry runs that release's behaviour — an
+ * does not carry. A symbol it does carry runs that build's behaviour — an
  * older shell, an older grep — with no marker at all, so this notice is the
  * only provenance those failures get.
  *
- * `stale` is any release difference, so the wording must not assume the addon
- * is the older side.
+ * `stale` is any release or source difference, so the wording must not assume
+ * the addon is the older side.
  * @param {NonNullable<ReturnType<typeof nativeAddonStatus>>} addon
  * @returns {string}
  */
 export function staleWorkspaceAddonNotice(addon) {
-	const loaded = addon.version ? `@oh-my-pi/pi-natives@${addon.version}` : "an addon without a release stamp";
+	const loaded = addon.builtFromOtherSources
+		? `${addon.path} was built from Rust sources other than this checkout's (its build recorded them in ` +
+			`${addonSourcesStampPath(addon.path)}).`
+		: `${addon.path} is ${addon.version ? `@oh-my-pi/pi-natives@${addon.version}` : "an addon without a release stamp"}, ` +
+			`but this checkout is @${addon.packageVersion}.`;
 	return (
-		`[pi-natives] ${addon.path} is ${loaded}, but this checkout is @${addon.packageVersion}. ` +
+		`[pi-natives] ${loaded} ` +
 		"Symbols this checkout expects may be missing and shared ones may behave differently; " +
 		"run `bun run build:native` before trusting results from this tree.\n"
 	);
@@ -879,8 +1030,8 @@ function installNativeTokioRuntime(bindings) {
 /**
  * Point the addon at `<nativesDir>/grammars`, where the agent downloads the
  * tree-sitter grammars that load as WebAssembly on demand (pi-utils
- * `getNativeGrammarsDir()` resolves the same path). Version cleanup never
- * touches it: only release-version directories are removed. Older addons
+ * `getNativeGrammarsDir()` resolves the same path). Cache cleanup never
+ * touches it: it removes only addon cache directories. Older addons
  * predating the export link every grammar and need no directory.
  */
 function configureGrammarDir(bindings, nativesDir) {
@@ -927,7 +1078,6 @@ export function initLoaderContext(overrides = {}) {
 	const nativeDir = overrides.nativeDir ?? path.join(import.meta.dir, "..", "native");
 	const execDir = path.dirname(process.execPath);
 	const nativesDir = getNativesDir();
-	const versionedDir = path.join(nativesDir, packageVersion);
 	const userDataDir =
 		platform === "win32"
 			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "omp")
@@ -951,11 +1101,23 @@ export function initLoaderContext(overrides = {}) {
 			: overrides.leafPackageDir === undefined
 				? resolveLeafPackageDir(platformTag)
 				: overrides.leafPackageDir;
-	const stageFromNodeModules = shouldStageNodeModulesAddon({
-		platform,
-		isCompiledBinary,
-		nativeDir: normalizedNativeDir,
-	});
+	// A Windows install stages the addons its leaf package records, with their digest,
+	// in its package.json; a leaf that records none is loaded where it is installed,
+	// never from a directory another install could have filled.
+	const stagedAddons =
+		leafPackageDir && shouldStageNodeModulesAddon({ platform, isCompiledBinary, nativeDir: normalizedNativeDir })
+			? readPackageAddons(leafPackageDir)
+			: null;
+	const stageFromNodeModules = stagedAddons !== null;
+	// A compiled binary extracts, and a Windows install stages, into a directory named
+	// by the digest of the addons it carries, computed when it was built
+	// (`scripts/embed-native.ts`, `scripts/gen-npm-packages.ts`): every build of a
+	// release carries one version, and only the digest tells two apart.
+	const addonDigest = isCompiledBinary ? embeddedAddon?.digest : stagedAddons?.digest;
+	const versionedDir = path.join(
+		nativesDir,
+		addonDigest ? `${packageVersion}-${addonDigest.slice(0, BUILD_DIGEST_PREFIX_LENGTH)}` : packageVersion,
+	);
 
 	const selectedVariant = resolveCpuVariant(getVariantOverride());
 	const addonFilenames = getAddonFilenames({ tag: platformTag, arch: process.arch, variant: selectedVariant });
@@ -987,6 +1149,7 @@ export function initLoaderContext(overrides = {}) {
 		versionedDir,
 		isCompiledBinary,
 		stageFromNodeModules,
+		stagedAddons,
 		selectedVariant,
 		addonFilenames,
 		addonLabel,
@@ -996,39 +1159,115 @@ export function initLoaderContext(overrides = {}) {
 	};
 }
 
+/**
+ * Exports of each `.node` file this copy of the loader opened, by the path it
+ * was opened at.
+ * @type {Map<string, Record<string, unknown>>}
+ */
+const openedAddons = new Map();
+
+/**
+ * Open one `.node` addon and return its exports, as `require` does for a
+ * `.node` file. `process.dlopen` rather than `require`: Bun's `require` cannot
+ * load any module from a path that contains `?` (it reads the path cut at the
+ * `?`), and the addon's directory follows `HOME`, `PI_NATIVES_DIR` or the
+ * install location, so it can hold one. `dlopen` takes the path as it is.
+ *
+ * Like `require`, it opens a file once and then returns the same exports:
+ * `loadNative()` runs again on every call of the lazy entrypoints
+ * (`clipboard.js`, `desktop.js`, …), and a second `dlopen` of the file runs the
+ * addon's init again, which makes new classes that `instanceof` against the
+ * first ones fails.
+ * @param {string} candidate
+ * @returns {Record<string, unknown>}
+ */
+export function openNativeAddon(candidate) {
+	const opened = openedAddons.get(candidate);
+	if (opened) return opened;
+	const addonModule = { exports: {} };
+	process.dlopen(addonModule, candidate);
+	openedAddons.set(candidate, addonModule.exports);
+	return addonModule.exports;
+}
+
+/**
+ * Have a file of this process's own cache directory there again after it
+ * vanished between the check that found it and its load: cleanup in another
+ * process renames a stale directory away for a moment while it checks whether a
+ * start marked it used (`cleanupStaleNativeVersions`). If cleanup has renamed it
+ * back, the file is there already; otherwise extracting or staging again makes
+ * the directory and writes the file. Returns whether `candidate` is there now.
+ */
+function restoreCachedAddon(ctx, errors, candidate) {
+	if (io.existsSync(candidate)) return true;
+	const filename = path.basename(candidate);
+	const embeddedFile = ctx.isCompiledBinary && embeddedAddon?.files.find(file => file.filename === filename);
+	if (embeddedFile) maybeExtractEmbeddedAddon(ctx, errors, embeddedFile);
+	else if (ctx.stageFromNodeModules) maybeStageNodeModulesAddon(ctx, errors);
+	else return false;
+	return io.existsSync(candidate);
+}
+
+/**
+ * Load the native addon. The cache checks and writes (extraction, staging, the retry below)
+ * go through the addon cache's file calls (`__setAddonFileIoForTests`).
+ */
 export function loadNative() {
 	startupMarker("native:loadNative:start");
 	const ctx = initLoaderContext();
-	const require_ = createRequire(import.meta.url);
 
 	const errors = [];
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
 	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors);
 	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	// Each path once: a load that fails is retried below for its own reason, never by
+	// finding the same path again further down the list.
+	const runtimeCandidates = [...new Set([...prepended, ...ctx.candidates])];
 	const fallbackEmbeddedFile =
 		ctx.selectedVariant === "modern" && embeddedAddon
 			? embeddedAddon.files.find(file => file.variant === "baseline")
 			: null;
 	const fallbackEmbeddedPath = fallbackEmbeddedFile && path.join(ctx.versionedDir, fallbackEmbeddedFile.filename);
+	const load = candidate => {
+		startupMarker(`native:require:${path.basename(candidate)}`);
+		const bindings = openNativeAddon(candidate);
+		validateLoadedBindings(ctx, bindings, candidate);
+		installNativeTokioRuntime(bindings);
+		configureGrammarDir(bindings, ctx.nativesDir);
+		// The lazy entrypoints call `loadNative()` on every use, and the resident addon does
+		// not change while the process runs, so it is described (its sources judged) once.
+		if (loadedAddon?.path !== candidate) loadedAddon = describeLoadedAddon(bindings, candidate, ctx);
+		reportStaleWorkspaceAddon(ctx, loadedAddon);
+		cleanupStaleNativeVersions({ nativesDir: ctx.nativesDir, currentDir: ctx.versionedDir });
+		startupMarker("native:loadNative:done");
+		return bindings;
+	};
 
 	for (const candidate of runtimeCandidates) {
 		if (fallbackEmbeddedFile && candidate === fallbackEmbeddedPath) {
 			maybeExtractEmbeddedAddon(ctx, errors, fallbackEmbeddedFile);
 		}
 		try {
-			startupMarker(`native:require:${path.basename(candidate)}`);
-			const bindings = require_(candidate);
-			validateLoadedBindings(ctx, bindings, candidate);
-			installNativeTokioRuntime(bindings);
-			configureGrammarDir(bindings, ctx.nativesDir);
-			loadedAddon = describeLoadedAddon(bindings, candidate, ctx);
-			reportStaleWorkspaceAddon(ctx, loadedAddon);
-	        cleanupStaleNativeVersions({ nativesDir: ctx.nativesDir, currentVersion: ctx.packageVersion });
-			startupMarker("native:loadNative:done");
-			return bindings;
+			return load(candidate);
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
+			let failure = err;
+			// Once: a file of this process's cache directory that was not there when it was
+			// opened, though the check before found it, whether cleanup has put it back since or
+			// not. `process.dlopen` reports a missing file only as `ERR_DLOPEN_FAILED`, with the
+			// system's own text, so any failed open there gets the one retry; a file that cannot
+			// be opened fails the same way again and is reported.
+			if (
+				path.dirname(candidate) === ctx.versionedDir &&
+				(failure?.code === "ERR_DLOPEN_FAILED" || !io.existsSync(candidate)) &&
+				restoreCachedAddon(ctx, errors, candidate)
+			) {
+				try {
+					return load(candidate);
+				} catch (retryErr) {
+					failure = retryErr;
+				}
+			}
+			const message = failure instanceof Error ? failure.message : String(failure);
 			errors.push(`${candidate}: ${message}`);
 		}
 	}

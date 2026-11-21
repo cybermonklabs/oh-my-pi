@@ -26,10 +26,13 @@ import { getConfigRootDir, logger, toError } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
+import { settingsStoreMask } from "../secrets/session-store-mask";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
+import { maskSessionEntry } from "../session/session-entry-mask";
 import { mintSessionId, SessionManager } from "../session/session-manager";
-import { FileSessionStorage } from "../session/session-storage";
+import { defaultSessionStorage, FileSessionStorage } from "../session/session-storage";
+import { assertSessionsOnDisk, COLLAB_REPLICA_DISK_ONLY_REASON } from "../session/session-storage-config";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { GuestLifecycleEmitter } from "../extensibility/extensions/lifecycle-mirror";
@@ -163,6 +166,16 @@ export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconc
 		return;
 	}
 	reconcileGuestIdleHostState(ctx, false);
+}
+
+/**
+ * Refuse a guest join unless sessions use file storage. The replica is a local
+ * file (see `#finalizeSnapshot`) loaded through the guest's own session
+ * storage; any other backend would resume an empty session in its place
+ * instead of the host's transcript.
+ */
+export function assertCollabReplicaStorage(): void {
+	assertSessionsOnDisk(defaultSessionStorage(), "/join", COLLAB_REPLICA_DISK_ONLY_REASON);
 }
 
 /** Streamed text of a text or thinking block; `undefined` for blocks speech never reads. */
@@ -326,6 +339,7 @@ export class CollabGuestLink {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		if (this.#ctx.collabGuest || this.#left) throw new Error("Already in a collab session (/leave first)");
+		assertCollabReplicaStorage();
 		this.#roomId = parsed.roomId;
 		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
@@ -520,7 +534,10 @@ export class CollabGuestLink {
 			parentSession: pending.header.id,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
-		const lines = [header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
+		// The replica is this guest's session store, so its own session's setting and agent dir mask it,
+		// as `createAgentSession` binds that session's manager.
+		const mask = settingsStoreMask(this.#ctx.settings, this.#ctx.sessionManager.getCwd());
+		const lines = [header, ...pending.entries].map(entry => JSON.stringify(maskSessionEntry(entry, mask))).join("\n");
 		const storage = new FileSessionStorage();
 		this.#replicaLease ??= storage.claimSession(this.#replicaId, replicaPath) ?? undefined;
 		// Published atomically: `omp gc` reads the replica's header to find its
