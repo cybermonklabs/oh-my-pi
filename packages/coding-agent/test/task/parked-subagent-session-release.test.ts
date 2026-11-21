@@ -1,17 +1,19 @@
 /**
  * A kept-alive subagent that parks must release its AgentSession while its
  * adoption (and therefore revivability) survives. The lifecycle manager holds
- * the run's reviver closure for as long as the agent stays adopted, so anything
- * that closure keeps reachable is retained for the life of the process; a
- * reviver that pins the disposed session leaks one full session graph per
- * spawned subagent.
+ * the agent's revive state for as long as the agent stays adopted, so anything
+ * that state keeps reachable is retained for the life of the process; a state
+ * that pins the disposed session, its settings overlay or its peer roster leaks
+ * them once per spawned subagent. A revive rebuilds what the state does not keep
+ * from the live parent and the transcript.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import type { Context } from "@oh-my-pi/pi-ai";
+import { createMockModel, type MockHandler, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -20,12 +22,14 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
 
 const AGENT_ID = "ParkedRelease";
+const TASK_AGENT: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 const MOCK_API_SOURCE = "test/parked-subagent-session-release";
 // After earlier files warm the session code, JSC's optimizing-JIT worklist can
 // keep an object referenced by an in-flight compile reachable for a few seconds
@@ -99,8 +103,74 @@ function writeAndObserveLiveSettings(id: string): WeakRef<Settings> {
 	return new WeakRef(session.settings);
 }
 
-/** Runs `AGENT_ID` to a finished keep-alive state; `release` drops the mock's session-bound recordings. */
-async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void }> {
+/** Observes weakly the peer roster the live session's transcript recorded (outside the test body). */
+function weakRefToRecordedRoster(id: string): WeakRef<object> {
+	const entries = localSession(AgentRegistry.global().get(id)?.session).sessionManager.getEntries();
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== "subagent-irc-roster") continue;
+		const data: unknown = entry.data;
+		if (
+			typeof data === "object" &&
+			data !== null &&
+			"roster" in data &&
+			typeof data.roster === "object" &&
+			data.roster
+		) {
+			return new WeakRef(data.roster);
+		}
+	}
+	throw new Error(`subagent ${id} recorded no peer roster`);
+}
+
+function registerPeer(id: string): void {
+	AgentRegistry.global().register({
+		id,
+		displayName: id,
+		kind: "sub",
+		session: null,
+		sessionFile: null,
+		status: "running",
+	});
+}
+
+/** System prompts of the run's own model calls (those offering `yield`; the task label call does not), in order. */
+function runPrompts(mock: MockModel): string[][] {
+	return mock.calls
+		.filter(call => (call.context.tools ?? []).some(tool => tool.name === "yield"))
+		.map(call => [...(call.context.systemPrompt ?? [])]);
+}
+
+function userTexts(context: Context): string[] {
+	return context.messages.flatMap(message =>
+		message.role !== "user"
+			? []
+			: [
+					typeof message.content === "string"
+						? message.content
+						: message.content.map(part => (part.type === "text" ? part.text : "")).join(""),
+				],
+	);
+}
+
+/** Yields `done`, or, on a later turn whose context still holds the original task, what it recalls of it. */
+const recallingHandler: MockHandler = context => {
+	if (!(context.tools ?? []).some(tool => tool.name === "yield")) return { content: ["label"] };
+	const texts = userTexts(context);
+	const data = texts.length > 1 && texts.some(text => text.includes("report done")) ? "recalled report done" : "done";
+	return { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data } }] };
+};
+
+interface KeptAliveRun {
+	mock: MockModel;
+	/** Drops the mock's session-bound recordings. */
+	release(): void;
+	close(): void;
+}
+
+/** Runs `AGENT_ID` to a finished keep-alive state. */
+async function runKeptAliveSubagent(
+	options: { handler?: MockHandler; tools?: string[]; enableIrc?: boolean } = {},
+): Promise<KeptAliveRun> {
 	// Under the isolated HOME: project discovery walks up from cwd and stops at os.homedir(). On Windows
 	// os.tmpdir() lives under the real home, so a cwd outside the fake HOME would walk into the real
 	// ~/.omp and load the developer's installed plugins as project plugins.
@@ -113,10 +183,12 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 	authStorage.keys.setRuntime("mock", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const mock = createMockModel({
-		handler: context =>
-			(context.tools ?? []).some(tool => tool.name === "yield")
-				? { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] }
-				: { content: ["label"] },
+		handler:
+			options.handler ??
+			(context =>
+				(context.tools ?? []).some(tool => tool.name === "yield")
+					? { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] }
+					: { content: ["label"] }),
 	});
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
 	const availableSpy = vi
@@ -126,7 +198,7 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 		const result = await runSubprocess({
 			cwd,
 			artifactsDir,
-			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
+			agent: { ...TASK_AGENT, tools: options.tools ?? ["read"] },
 			task: "report done",
 			index: 0,
 			id: AGENT_ID,
@@ -146,7 +218,7 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 			}),
 			enableLsp: false,
 			enableMCP: false,
-			enableIrc: false,
+			enableIrc: options.enableIrc ?? false,
 		});
 		expect(result.exitCode).toBe(0);
 	} catch (error) {
@@ -154,6 +226,7 @@ async function runKeptAliveSubagent(): Promise<{ release(): void; close(): void 
 		throw error;
 	}
 	return {
+		mock,
 		// Recorded mock calls carry stream options with closures bound to the session.
 		release: () => {
 			mock.reset();
@@ -194,6 +267,53 @@ it("parks without retaining the run's settings overlay and revives with the sett
 
 		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
 		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
+	} finally {
+		run.close();
+	}
+}, 30_000);
+
+// If this regresses, a parked subagent woken for a follow-up answers without the conversation it had, or under
+// settings other than the ones it wrote: its revival keeps no copy of either and must rebuild both.
+it("revives a parked subagent that answers a follow-up from its earlier messages, with the setting it wrote", async () => {
+	const run = await runKeptAliveSubagent({ handler: recallingHandler });
+	try {
+		writeAndObserveLiveSettings(AGENT_ID);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+
+		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
+		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
+		const followUp = await runSubagentFollowUpTurn({
+			id: AGENT_ID,
+			agent: TASK_AGENT,
+			message: "what did you report?",
+		});
+		expect(followUp.exitCode).toBe(0);
+		expect(followUp.output).toContain("recalled report done");
+	} finally {
+		run.close();
+	}
+}, 30_000);
+
+// If this regresses, every parked subagent keeps a copy of its peer roster for the rest of the process, or a revived
+// one sends a prompt other than the one it parked with and the provider writes its whole conversation to the
+// prompt cache again.
+it("revives with the peer roster its transcript recorded, keeping no copy of it while parked", async () => {
+	registerPeer("EarlyPeer");
+	const run = await runKeptAliveSubagent({ tools: ["read", "write"], enableIrc: true });
+	try {
+		const parkedPrompt = runPrompts(run.mock).at(-1);
+		if (!parkedPrompt) throw new Error("Expected the run to call the model");
+		expect(parkedPrompt.join("\n")).toContain("EarlyPeer");
+		const rosterRef = weakRefToRecordedRoster(AGENT_ID);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+		expect(await collected(rosterRef, COLLECT_DEADLINE_MS)).toBe(true);
+
+		registerPeer("LatePeer");
+		const followUp = await runSubagentFollowUpTurn({ id: AGENT_ID, agent: TASK_AGENT, message: "anything else?" });
+		expect(followUp.exitCode).toBe(0);
+		expect(runPrompts(run.mock)[0]).toEqual(parkedPrompt);
 	} finally {
 		run.close();
 	}

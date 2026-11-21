@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Parked task subagents keep only plain data for their revival, so a session that runs many subagents no longer grows with each one; a revived subagent reads the peer list its prompt showed back from its transcript and takes its settings from its parent as they are now, plus the settings it changed itself
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
 - A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context

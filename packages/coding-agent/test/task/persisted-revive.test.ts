@@ -2253,6 +2253,53 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(warm.requests[0]).toEqual(spawned.requests.at(-1)!);
 	});
 
+	/** Count of the peer roster records `sessionManager`'s transcript holds. */
+	function rosterRecords(sessionManager: SessionManager): number {
+		return sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom" && entry.customType === "subagent-irc-roster").length;
+	}
+
+	// If this regresses, a subagent's transcript gains another copy of its peer roster on every prompt rebuild, or a
+	// warm revive finds no record of the roster a block showed.
+	it("records each rendered roster block in the transcript once", async () => {
+		const cwd = makeTempDir("@pi-revive-roster-records-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		const manager = spawned.session.sessionManager;
+		expect(rosterRecords(manager)).toBe(1);
+		// A rebuild that leaves the rest of the prompt unchanged keeps the roster, so it renders the same block.
+		registerPeer();
+		await spawned.session.refreshBaseSystemPrompt();
+		expect(rosterRecords(manager)).toBe(1);
+		// A rebuild whose default blocks changed catches the roster up: a new block.
+		await spawned.session.setActiveToolsByName(["read"]);
+		expect(spawned.session.systemPrompt.join("\n")).toContain("`Peer`");
+		expect(rosterRecords(manager)).toBe(2);
+		await spawned.session.refreshBaseSystemPrompt();
+		expect(rosterRecords(manager)).toBe(2);
+		// The warm revive renders a block the transcript already records.
+		const { live } = await parkAndRevive(() => {});
+		expect(rosterRecords(live.sessionManager)).toBe(2);
+	});
+
+	// If this regresses, a subagent parked by a version that recorded no roster in its transcript comes back unable to
+	// render its prompt, or without the peers that are live now.
+	it("warm-revives a transcript that records no roster with the live registry's roster", async () => {
+		const cwd = makeTempDir("@pi-revive-unrecorded-roster-");
+		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
+		expect(spawned.requests.at(-1)!.join("\n")).toContain("(no other agents)");
+		await AgentLifecycleManager.global().park("prompt-blocks");
+		// Rename the records rather than drop them, so the transcript's entry tree stays whole.
+		const sessionFile = path.join(cwd, "prompt-blocks.jsonl");
+		const recorded = await Bun.file(sessionFile).text();
+		const unrecorded = recorded.replaceAll('"customType":"subagent-irc-roster"', '"customType":"older-version"');
+		expect(unrecorded).not.toBe(recorded);
+		await Bun.write(sessionFile, unrecorded);
+
+		const { warm } = await parkAndRevive(registerPeer);
+		expect(warm.requests[0]!.join("\n")).toContain("`Peer`");
+	});
+
 	it("replays the base a before_agent_start override was built from when the base rebuilds in the request window", async () => {
 		const cwd = makeTempDir("@pi-revive-override-window-");
 		let batch = 1;

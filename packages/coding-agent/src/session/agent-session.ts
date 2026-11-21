@@ -6969,8 +6969,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// revival path reopens the transcript from disk (AgentLifecycleManager
 		// reviver / persisted-revive / `history://`), so the in-memory copy is
 		// dead weight from here on. Dropping it lets a parked subagent's session
-		// graph shed its heavy payloads even while the lifecycle adoption record's
-		// reviver closure still references the session object. Fixes #8003.
+		// graph shed its heavy payloads even while something else still references
+		// the session object. Fixes #8003.
 		this.#releaseRetainedSessionMemory();
 		// A run past the deadline may still resolve keys, so the account pools
 		// are lifted only once the run has settled: here when it drained,
