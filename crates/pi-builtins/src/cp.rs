@@ -5288,6 +5288,290 @@ mod tests {
 		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
 	}
 
+	/// The probe matrix: `cp` across its operand forms (the source's own entry
+	/// by several names, a directory target, `-t`), the options that decide
+	/// what happens to an existing destination (`-f`, `-i`, `-u`, `-b`,
+	/// `--backup=numbered`, `-l`, `-s`, `-P`, `-L`, `-R`,
+	/// `--remove-destination`, alone and together) and the destination's kind
+	/// (none, a file, another link of the source, a link to the source, to
+	/// another file or to nothing, a directory; a directory copied into
+	/// itself). Each row of `cp-gnu-matrix.txt` is what GNU cp 9.7 does on a
+	/// Linux kernel, the same as uid 1000 and as root: its exit status,
+	/// standard error, and every entry on disk after it. GNU 9.4 gives the same
+	/// rows, but for leaving the source's name out of "cannot overwrite
+	/// directory 'a~' with non-directory". A row in `STATED` differs from GNU,
+	/// as the CHANGELOG states, with GNU's message, where GNU loses data and
+	/// this cp keeps it: `--remove-destination` onto a link cp follows that is
+	/// its own destination (`l l`, `l ./l`), which GNU removes and then cannot
+	/// read or link to; `cp -s --remove-destination a d`, whose `d/a` GNU
+	/// removes before it refuses the relative link; and `cp -fb a a` with a
+	/// link at `a~`, which GNU writes through, and here is replaced. And `cp -R
+	/// d d`, `-t d d` too, where GNU copies part of `d` into a new `d/d` before
+	/// it refuses, how much depending on the order it reads `d` (its rows here
+	/// are one run's), and this cp refuses before it writes anything.
+	///
+	/// A row is `id`, setup, arguments, standard input, exit status, standard
+	/// error (`\n` for a newline) and the entries after it, tab-separated. Setup
+	/// steps: `C>name` writes `C`, `target@name` makes a symbolic link,
+	/// `ln:a=b` makes `b` another link of `a`, `dir:d` makes a directory; then
+	/// every entry's own times are set to 1000000000, and `T:name=secs` sets
+	/// `name`'s (following a link). `<D>` is the row's directory.
+	#[cfg(unix)]
+	#[test]
+	fn cp_does_what_gnu_does_across_the_probe_matrix() {
+		use std::{
+			os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _},
+			path::{Path, PathBuf},
+		};
+		// Row id, then this cp's exit status, standard error and entries, where
+		// GNU loses data.
+		#[rustfmt::skip]
+		const STATED: &[(&str, i32, &str, &str)] = &[
+			("src-l-same/rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/L-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/L-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/L-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/iy-rd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/iy-rdf", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/iy-frd", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/un-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-rd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-rdf", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-same/l-frd", 1, "cp: cannot create hard link 'l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/L-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/L-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/L-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/iy-rd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/iy-rdf", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/iy-frd", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-rd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-rdf", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/un-frd", 1, "cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-rd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-rdf", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("src-l-dot/l-frd", 1, "cp: cannot create hard link './l' to 'l': No such file or directory\n", " a=A#1 l=link:a"),
+			("own-same-bk-link/fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/P-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/L-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/R-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/iy-fb", 0, "cp: overwrite 'a~'? ", " a=A#1 a~=A#1 o=O#1"),
+			("own-same-bk-link/un-fb", 0, "", " a=A#1 a~=A#1 o=O#1"),
+			("into-dir-ex/s-rd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/s-rdf", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("into-dir-ex/s-frd", 1, "cp: d/a: can make relative symbolic links only in current directory\n", " a=A#1 d=dir d/a=B#1"),
+			("dir-self/R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self/R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-f", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-rd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-rdf", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-frd", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-b", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-fb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-rdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-rdfb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-frdb", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-bn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+			("dir-self-t/R-fbn", 1, "cp: cannot copy a directory, 'd', into itself, 'd/d'\n", " d=dir d/f=A#1"),
+		];
+		let set_time = |path: &Path, secs: i64, follow: bool| {
+			let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `timespec` is plain data, all zero a valid value.
+			let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+			time.tv_sec = secs;
+			let times = [time, time];
+			let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+			// SAFETY: `path` is NUL-terminated and `times` holds two values,
+			// both outliving the call.
+			assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), flags) }, 0, "utimensat");
+		};
+		// Every entry below `dir`, as `find | sort` names it.
+		fn entries(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+			for entry in fs::read_dir(dir.join(rel)).unwrap() {
+				let name = rel.join(entry.unwrap().file_name());
+				let is_dir = fs::symlink_metadata(dir.join(&name)).unwrap().is_dir();
+				out.push(name.clone());
+				if is_dir {
+					entries(dir, &name, out);
+				}
+			}
+		}
+		let listing = |dir: &Path| {
+			let mut names = Vec::new();
+			entries(dir, Path::new(""), &mut names);
+			names.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+			names
+				.iter()
+				.map(|name| {
+					let path = dir.join(name);
+					let metadata = fs::symlink_metadata(&path).unwrap();
+					let shown = name.display();
+					if metadata.is_symlink() {
+						format!(" {shown}=link:{}", fs::read_link(&path).unwrap().display())
+					} else if metadata.is_dir() {
+						format!(" {shown}=dir")
+					} else {
+						format!(" {shown}={}#{}", fs::read_to_string(&path).unwrap(), metadata.nlink())
+					}
+				})
+				.collect::<String>()
+		};
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		let mut rows = 0;
+		let mut stated_rows = 0;
+		for (index, line) in include_str!("cp-gnu-matrix.txt").lines().enumerate() {
+			let [id, setup, args, input, code, err, after] = line.split('\t').collect::<Vec<_>>()[..] else {
+				panic!("row {index}: {line:?}");
+			};
+			rows += 1;
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			let steps: Vec<&str> = setup.split(' ').filter(|step| !step.is_empty()).collect();
+			for step in &steps {
+				if step.starts_with("T:") {
+				} else if let Some(name) = step.strip_prefix("dir:") {
+					fs::create_dir(dir.join(name)).unwrap();
+				} else if let Some((from, to)) = step.strip_prefix("ln:").and_then(|link| link.split_once('=')) {
+					fs::hard_link(dir.join(from), dir.join(to)).unwrap();
+				} else if let Some((contents, name)) = step.split_once('>') {
+					fs::write(dir.join(name), contents).unwrap();
+				} else if let Some((target, link)) = step.split_once('@') {
+					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+				} else {
+					panic!("{id}: setup step {step}");
+				}
+			}
+			let mut names = Vec::new();
+			entries(&dir, Path::new(""), &mut names);
+			for name in names {
+				set_time(&dir.join(name), 1_000_000_000, false);
+			}
+			for (name, secs) in steps.iter().filter_map(|step| step.strip_prefix("T:")?.split_once('=')) {
+				set_time(&dir.join(name), secs.parse().unwrap(), true);
+			}
+			let shown = dir.to_str().unwrap();
+			let argv: Vec<String> = args.split(' ').filter(|arg| !arg.is_empty()).map(|arg| arg.replace("<D>", shown)).collect();
+			let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+			let answer = if input.is_empty() { String::new() } else { format!("{input}\n") };
+			let (got, capture) = run_util::<Cp>(&argv, &answer, &dir);
+			let found = (got, capture.err().replace(shown, "<D>"), listing(&dir));
+			let gnu = (code.parse().unwrap(), err.replace("\\n", "\n"), after.to_owned());
+			let want = match STATED.iter().find(|stated| stated.0 == id) {
+				Some(&(_, code, err, after)) => {
+					stated_rows += 1;
+					let stated = (code, err.to_owned(), after.to_owned());
+					assert_ne!(stated, gnu, "{id}: a stated row is GNU's own");
+					stated
+				},
+				None => gnu,
+			};
+			if found != want || !capture.out().is_empty() {
+				failures.push(format!("{id}: cp {args}: {found:?}, stdout {:?}", capture.out()));
+			}
+		}
+		assert!(rows > 0, "the matrix has no rows");
+		assert_eq!(stated_rows, STATED.len(), "a stated row names no row of the matrix");
+		assert!(failures.is_empty(), "{} of {rows} rows differ from GNU:\n{}", failures.len(), failures.join("\n"));
+	}
+
+	/// `--attributes-only` onto the source's own entry is the same file, as
+	/// GNU cp 9.4 and 9.7 say it is (the same as uid 1000 and as root), with
+	/// or without `-f` and `--remove-destination`; `-fb a a` copies the
+	/// attributes to an empty `a~`, and `-l` does nothing.
+	#[cfg(unix)]
+	#[test]
+	fn attributes_only_onto_its_own_entry_is_the_same_file_as_gnu_says() {
+		let same = |a: &str, b: &str| format!("cp: '{a}' and '{b}' are the same file\n");
+		let ao = "--attributes-only";
+		#[rustfmt::skip]
+		let cases: [(&[&str], i32, String, &str); 10] = [
+			(&[ao, "a", "a"], 1, same("a", "a"), " a=A#1 b=B#1"),
+			(&[ao, "a", "./a"], 1, same("a", "./a"), " a=A#1 b=B#1"),
+			(&[ao, "a", "<D>/a"], 1, same("a", "<D>/a"), " a=A#1 b=B#1"),
+			(&[ao, "a", "b"], 0, String::new(), " a=A#1 b=B#1"),
+			(&[ao, "-f", "a", "./a"], 1, same("a", "./a"), " a=A#1 b=B#1"),
+			(&[ao, "--remove-destination", "a", "./a"], 1, same("a", "./a"), " a=A#1 b=B#1"),
+			(&[ao, "-fb", "a", "a"], 0, String::new(), " a=A#1 a~=#1 b=B#1"),
+			(&[ao, "-b", "a", "./a"], 1, same("a", "./a"), " a=A#1 b=B#1"),
+			(&[ao, "-l", "a", "./a"], 0, String::new(), " a=A#1 b=B#1"),
+			(&[ao, "-P", "a", "./a"], 1, same("a", "./a"), " a=A#1 b=B#1"),
+		];
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (args, code, err, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("a"), "A").unwrap();
+			fs::write(dir.join("b"), "B").unwrap();
+			let shown = dir.to_str().unwrap();
+			let args: Vec<String> = args.iter().map(|arg| arg.replace("<D>", shown)).collect();
+			let args: Vec<&str> = args.iter().map(String::as_str).collect();
+			let (got, capture) = run_util::<Cp>(&args, "", &dir);
+			let found = (got, capture.err().replace(shown, "<D>"), crate::file_backup::tests::listing(&dir));
+			if found != (code, err, after.to_owned()) {
+				failures.push(format!("cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
+	/// `cp -l -f`, and `cp -l -i` answered yes, replace a destination as GNU's
+	/// `force_linkat` does, never removing it before the new link is in place:
+	/// where the link cannot be made, here from /dev/shm to the temporary
+	/// directory (two file systems), the destination stays, with GNU's message
+	/// (GNU cp 9.4 and 9.7, as uid 1000 and as root). Without either, the
+	/// destination is there and the link fails with `File exists`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_hard_link_that_cannot_be_made_keeps_the_destination() {
+		use std::{os::unix::fs::MetadataExt as _, path::Path};
+		let root = tempdir().unwrap();
+		let device = |path: &Path| fs::metadata(path).map(|metadata| metadata.dev()).ok();
+		match (device("/dev/shm".as_ref()), device(root.path())) {
+			(Some(shm), Some(temp)) if shm != temp => {},
+			(shm, temp) => {
+				eprintln!("skipped: /dev/shm ({shm:?}) and the temporary directory ({temp:?}) are not two file systems");
+				return;
+			},
+		}
+		let from = tempfile::tempdir_in("/dev/shm").unwrap();
+		let source = from.path().join("a");
+		fs::write(&source, "A").unwrap();
+		let shown = source.to_str().unwrap();
+		let crossing = format!("cp: cannot create hard link 'b' to '{shown}': Invalid cross-device link\n");
+		#[rustfmt::skip]
+		let cases: [(&[&str], &str, String); 3] = [
+			(&["-l", "-f"], "", crossing.clone()),
+			(&["-l", "-i"], "y\n", format!("cp: overwrite 'b'? {crossing}")),
+			(&["-l"], "", format!("cp: cannot create hard link 'b' to '{shown}': File exists\n")),
+		];
+		for (flags, answer, err) in cases {
+			fs::write(root.path().join("b"), "B").unwrap();
+			let args: Vec<&str> = flags.iter().copied().chain([shown, "b"]).collect();
+			let (code, capture) = run_util::<Cp>(&args, answer, root.path());
+			assert_eq!((code, capture.err()), (1, err), "cp {}", args.join(" "));
+			assert_eq!(fs::read_to_string(root.path().join("b")).unwrap(), "B", "cp {}: the destination", args.join(" "));
+		}
+	}
+
 	/// The backup copy of `cp -fb a a` never writes through a symbolic link
 	/// put at `a~` after cp looked at the name (test hooks put it there,
 	/// pointing at `victim`): an existing regular `a~` is opened without
