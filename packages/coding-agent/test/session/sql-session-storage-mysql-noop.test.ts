@@ -253,18 +253,31 @@ describe("SqlSessionStorage (MySQL no-op replace)", () => {
 });
 
 describe("SqlSessionStorage (MySQL streamed rewrites)", () => {
-	it("stages a streamed rewrite, and writes one whose staging path would not fit VARCHAR(512) in one transaction", async () => {
+	// If this regresses, a session on MySQL storage whose path leaves no room for a staging path
+	// (longer than 473 characters) has its whole transcript decoded into one string at every full
+	// rewrite, or stages under a name past VARCHAR(512) and every full rewrite of it fails.
+	it("stages a streamed rewrite, under a hashed name of at most 512 characters when its staging path would not fit VARCHAR(512)", async () => {
 		const { client, stored, partPaths } = mysqlFake();
 		const storage = await SqlSessionStorage.create({ client });
 		const lines = ["title-slot-line\n", "header-line\n", "entry-one\n"];
 		const short = "/s/short.jsonl";
-		// 512 characters: its row fits, while its staging path would be 39 characters longer.
+		// 512 characters: its row fits, while `<path>#staging-<epoch>-<id>` would be 39 characters longer.
 		const long = `/s/${"l".repeat(512 - "/s/".length - ".jsonl".length)}.jsonl`;
+		const hash = new Bun.CryptoHasher("sha256").update(long).digest("hex");
 
 		for (const path of [short, long]) {
 			await storage.writeLinesAtomic(path, lines, { expectedSize: null });
 			expect(stored(path)).toBe(lines.join(""));
 		}
-		expect(partPaths.map(path => (path.startsWith(`${short}#staging-`) ? "staged" : path))).toEqual(["staged", long]);
+		// Every part went in under a staging path that fits, and was swapped in from there.
+		expect(
+			partPaths.map(path => ({
+				name: path.replace(/#staging-\d{13}-[0-9a-f]{16}$/, "#staging-<epoch>-<id>"),
+				fits: [...path].length <= 512,
+			})),
+		).toEqual([
+			{ name: `${short}#staging-<epoch>-<id>`, fits: true },
+			{ name: `#omp-staging/${hash}#staging-<epoch>-<id>`, fits: true },
+		]);
 	});
 });

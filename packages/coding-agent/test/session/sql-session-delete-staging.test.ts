@@ -7,7 +7,9 @@
  * directory, staging parts included. Each case runs against SQLite always and
  * against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
  * `OMP_TEST_SQL_MYSQL_URL` name a database; the MySQL-only cases, of a name
- * under the directory that starts below the space, run when the latter does.
+ * under the directory that starts below the space and of paths too long for a
+ * staging path (staged under a name made from their hash), run when the
+ * latter does.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -192,5 +194,46 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client write
 			parts: [],
 		});
 		release?.();
+	}, 120_000);
+});
+
+describe.skipIf(!MYSQL_URL)("deleting a MySQL session whose transcripts have paths too long for a staging path", () => {
+	it("removes the hashed staging sets of transcripts under the artifacts directory, one it never listed included", async () => {
+		// If this regresses, deleting a session on MySQL leaves the staging parts of a half-written subagent
+		// transcript whose path is longer than 473 characters: they are named by the path's hash, outside the
+		// key range of the artifacts directory, and no listing shows them.
+		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+		/** A transcript path of 490 characters under the artifacts directory. */
+		const long = (name: string): string =>
+			`${artifacts}${name}${"x".repeat(490 - artifacts.length - name.length - ".jsonl".length)}.jsonl`;
+		const listed = long("Listed-");
+		const unlisted = long("Unlisted-");
+		const store = await db.open({ claims: false });
+		const other = await db.open({ claims: false });
+		await store.writeText(file, transcript(ID, "parent"));
+		await store.writeText(listed, transcript(ID, "listed"));
+		await store.drain();
+		// Committed by another client after the deleting store last refreshed: the delete does not list it.
+		await other.writeText(unlisted, transcript(ID, "unlisted"));
+		await other.drain();
+		// What a writer killed during a staged full write of each leaves: a part under the hashed staging name.
+		for (const transcriptPath of [listed, unlisted]) {
+			const hash = new Bun.CryptoHasher("sha256").update(transcriptPath).digest("hex");
+			await db.sql(`INSERT INTO ${db.table}_parts (path, start_offset, content) VALUES (@1, 0, 'staged')`, [
+				`#omp-staging/${hash}#staging-${String(Date.now()).padStart(13, "0")}-0123456789abcdef`,
+			]);
+		}
+		expect((await partPathsUnder(db, "#omp-staging/")).length).toBe(2);
+		store.refresh = async () => {};
+
+		await store.deleteSessionWithArtifacts(file);
+		await store.drain();
+
+		expect({ paths: await db.paths(), staging: await partPathsUnder(db, "#omp-staging/") }).toEqual({
+			paths: [],
+			staging: [],
+		});
 	}, 120_000);
 });

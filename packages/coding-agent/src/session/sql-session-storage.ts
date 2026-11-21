@@ -6,9 +6,12 @@ import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, Snowfla
 import { digestStream } from "../utils/file-hash";
 import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
+	headerSessionId,
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
+	utf8PartEnd,
+	utf8Parts,
 } from "./indexed-session-storage";
 import {
 	type SessionAcquireOptions,
@@ -22,7 +25,7 @@ import {
 	sessionLeaseId,
 } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
-import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-title-slot";
+import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
@@ -192,9 +195,11 @@ interface DialectQueries {
 	 * "R/a/"; on MySQL and MariaDB as bytes, see below) and exactly those
 	 * rows' parts, then every part under `@dir` that has no row:
 	 * a staged full write's parts that its killed writer never swapped in, of
-	 * a path the delete may not know of. PostgreSQL and MySQL delete the rows
-	 * and their parts in one statement, so the parts deleted are those of the
-	 * rows deleted: a row another client commits between two statements would
+	 * a path the delete may not know of (on MySQL, not those of a path too
+	 * long for a staging path under `@dir`, see {@link longPathsUnder}).
+	 * PostgreSQL and MySQL delete the rows and their parts in one statement,
+	 * so the parts deleted are those of the rows deleted: a row another
+	 * client commits between two statements would
 	 * otherwise keep its row and lose its parts under READ COMMITTED; the
 	 * second statement deletes only parts whose row it does not see, found by
 	 * a range of the parts' primary key, from `@stem` (`@dir` without its
@@ -227,7 +232,8 @@ interface DialectQueries {
 	 */
 	deleteUnderScan: Statement[];
 	/**
-	 * Delete the staging parts named from `@low` (`<path>#staging-`) up to, not
+	 * Delete the staging parts named from `@low` (a path's staging prefix,
+	 * `<path>#staging-` or its hashed form, see `#stagingPrefix`) up to, not
 	 * including, `@high`: a primary-key range, and the prefix compared exactly
 	 * too (on PostgreSQL as code points, on MySQL and MariaDB as bytes, as in
 	 * {@link deleteUnder}), so a collation that orders the range otherwise, or
@@ -239,6 +245,13 @@ interface DialectQueries {
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
 	hasStaging: Statement;
+	/**
+	 * MySQL only: the session rows under `@dir`, found as {@link deleteUnder}
+	 * finds them, whose path is longer than `@fits` characters, row-locked:
+	 * their staging sets are named by the path's hash (see `#stagingPrefix`),
+	 * outside the key range of `@dir` that the directory delete takes.
+	 */
+	longPathsUnder: Statement | undefined;
 	/** The byte length of each staging part of `@path`, row-locked where the dialect can, so no peer deletes one before the swap. */
 	stagedBytes: Statement;
 	/** Insert a part; on SQLite with a rowid from `@now` (see {@link partRowids}). */
@@ -584,6 +597,11 @@ interface StagedPartRow {
 	len: number | bigint | string;
 }
 
+/** `longPathsUnder` row. */
+interface PathRow {
+	path: string;
+}
+
 /** `readChunksDigest` row: the digest in upper-case hex. */
 interface ChunksDigestRow {
 	digest: string;
@@ -805,10 +823,24 @@ const PAGE_SPAN_BYTES = 12 * 1024 * 1024;
 const MYSQL_PATH_CHARS = 512;
 /** Staging parts one transaction of a streamed full write inserts. */
 const STAGING_PARTS_PER_TRANSACTION = 16;
-/** Starts a staging path's suffix: `<path>#staging-<epoch ms, STAGING_EPOCH_DIGITS wide>-<id>`. */
+/** Starts a staging path's suffix: `<staging prefix><epoch ms, STAGING_EPOCH_DIGITS wide>-<id>`. */
 const STAGING_MARK = "#staging-";
 /** Digits of the epoch in a staging path, fixed so that the names of one path sort by age. */
 const STAGING_EPOCH_DIGITS = 13;
+/** Characters a staging path adds to its prefix: the epoch, "-" and a 16-hex Snowflake id. */
+const STAGING_ID_CHARS = STAGING_EPOCH_DIGITS + 1 + 16;
+/**
+ * The longest path whose staging path, `<path>#staging-<epoch>-<id>`, fits
+ * MySQL's `path` column; a longer one stages under its hash (see
+ * `#stagingPrefix`).
+ */
+const MYSQL_PLAIN_STAGING_CHARS = MYSQL_PATH_CHARS - STAGING_MARK.length - STAGING_ID_CHARS;
+/**
+ * Starts the staging prefix of a path longer than
+ * {@link MYSQL_PLAIN_STAGING_CHARS} on MySQL, followed by the path's SHA-256
+ * in hex and {@link STAGING_MARK}. No session path starts with "#".
+ */
+const HASHED_STAGING = "#omp-staging/";
 /** Age at which a staging set is a dead writer's: a live full write finishes far sooner. */
 const STALE_STAGING_MS = 60 * 60 * 1000;
 /** Hashes one blob size read asks for. */
@@ -1570,6 +1602,12 @@ function buildQueries(
 		hasStaging: sql(
 			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")} LIMIT 1`,
 		),
+		longPathsUnder: mysql
+			? sql(
+					`SELECT path FROM ${table} WHERE path >= @stem AND path < @dir_end AND ${startsWith("path", "@dir")} ` +
+						"AND CHAR_LENGTH(path) > @fits FOR UPDATE",
+				)
+			: undefined,
 		stagedBytes: sql(
 			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,
 		),
@@ -2001,63 +2039,6 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
 	return Buffer.concat(chunks);
 }
 
-/**
- * Where a part of `bytes` that starts at `start` and holds at most `maxBytes`
- * ends: at the end of `bytes` when it is that close, otherwise `maxBytes` on,
- * backed off continuation bytes (0b10xxxxxx) so no character straddles two
- * parts. A run of continuation bytes that long, never in valid UTF-8, is cut
- * at `maxBytes`.
- */
-function utf8PartEnd(bytes: Uint8Array, start: number, maxBytes: number): number {
-	const limit = start + maxBytes;
-	if (limit >= bytes.byteLength) return bytes.byteLength;
-	let end = limit;
-	while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
-	return end === start ? limit : end;
-}
-
-/**
- * Cut the UTF-8 bytes `chunks` yields into parts of at most `maxBytes`, each
- * ending on a character boundary, also where a character straddles two
- * chunks: a cut is made only once the byte after it has arrived.
- */
-async function* utf8Parts(
-	chunks: AsyncIterable<Uint8Array>,
-	maxBytes: number,
-): AsyncGenerator<{ text: string; byteLength: number }> {
-	let pending: Uint8Array[] = [];
-	let pendingBytes = 0;
-	for await (const chunk of chunks) {
-		pending.push(chunk);
-		pendingBytes += chunk.byteLength;
-		if (pendingBytes <= maxBytes) continue;
-		const bytes = Buffer.concat(pending, pendingBytes);
-		let start = 0;
-		while (bytes.byteLength - start > maxBytes) {
-			const end = utf8PartEnd(bytes, start, maxBytes);
-			yield { text: bytes.toString("utf8", start, end), byteLength: end - start };
-			start = end;
-		}
-		pending = [bytes.subarray(start)];
-		pendingBytes = bytes.byteLength - start;
-	}
-	if (pendingBytes > 0)
-		yield { text: Buffer.concat(pending, pendingBytes).toString("utf8"), byteLength: pendingBytes };
-}
-
-/** The UTF-8 text `chunks` yields, decoded as it arrives, and its byte count. */
-async function decodeChunks(chunks: AsyncIterable<Uint8Array>): Promise<{ text: string; bytes: number }> {
-	// A leading byte order mark is content here, as Buffer#toString keeps it.
-	const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
-	let text = "";
-	let bytes = 0;
-	for await (const chunk of chunks) {
-		text += decoder.decode(chunk, { stream: true });
-		bytes += chunk.byteLength;
-	}
-	return { text: text + decoder.decode(), bytes };
-}
-
 /** Bytes of a chunked read's digest on MySQL (see `DialectQueries.readChunksDigest`). */
 const CHUNKS_DIGEST_BYTES = 16;
 
@@ -2078,7 +2059,8 @@ function addChunkDigest(digest: Buffer, offset: number, bytes: Uint8Array): void
  * its metadata (`byte_len`, `mtime_ms`, title fields), plus rows of
  * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts one
  * part, a full write replaces them with parts of at most 1 MiB (a streamed
- * one stages them under `<path>#staging-…` first and swaps them in). A
+ * one stages them under `<path>#staging-…`, or on MySQL for a path too long
+ * for that a name made from its hash, first and swaps them in). A
  * session's content is the row's `content` (non-empty only for rows an older
  * version wrote) followed by its parts in offset order, which reads stream in
  * pages of parts. This process keeps only a metadata index (`size`,
@@ -2557,20 +2539,6 @@ interface LeaseFence {
 	readonly claim: LeaseClaim | undefined;
 	readonly sessionId: string;
 	readonly file: string;
-}
-
-/** The session id in the header at the start of `prefix` (past the title slot), or `undefined` when it has none. */
-function headerSessionId(prefix: string): string | undefined {
-	const text = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
-	const end = text.indexOf("\n");
-	if (end === -1) return undefined;
-	try {
-		const entry: unknown = JSON.parse(text.slice(0, end));
-		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
-			return typeof entry.id === "string" ? entry.id : undefined;
-		}
-	} catch {}
-	return undefined;
 }
 
 class SqlSessionStorageBackend implements SessionStorageBackend {
@@ -4335,18 +4303,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * {@link writeFull} from a stream. The parts go in under a staging path,
-	 * `<path>#staging-<epoch ms>-<id>`, {@link STAGING_PARTS_PER_TRANSACTION}
-	 * per transaction; then one transaction checks the session's size, deletes
-	 * the path's staging sets older than {@link STALE_STAGING_MS} (a dead
-	 * writer's), checks that every staged byte is still there (a staging set
-	 * another writer removed is a conflict), and swaps the staged parts in for
-	 * the session's. Staging parts have no row, so no listing or index sees
-	 * them. On failure it removes its own. Each of these transactions writes
-	 * under `path`'s lease, as {@link writeFull}'s one transaction does:
-	 * behind the claim fence, so the swap commits only while this store may
-	 * write the session. A path whose staging path would not fit the
-	 * dialect's path column (MySQL's 512 characters) is written whole through
-	 * {@link writeFull} instead.
+	 * `<staging prefix><epoch ms>-<id>` (see {@link #stagingPrefix}),
+	 * {@link STAGING_PARTS_PER_TRANSACTION} per transaction; then one
+	 * transaction checks the session's size, deletes the path's staging sets
+	 * older than {@link STALE_STAGING_MS} (a dead writer's), checks that every
+	 * staged byte is still there (a staging set another writer removed is a
+	 * conflict), and swaps the staged parts in for the session's. Staging parts
+	 * have no row, so no listing or index sees them. On failure it removes its
+	 * own. Each of these transactions writes under `path`'s lease, as
+	 * {@link writeFull}'s one transaction does: behind the claim fence, so the
+	 * swap commits only while this store may write the session.
 	 */
 	async writeFullStream(
 		path: string,
@@ -4357,17 +4323,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		expectedSize?: number | null,
 	): Promise<void> {
 		const now = Date.now();
-		const prefix = `${path}${STAGING_MARK}`;
+		const prefix = this.#stagingPrefix(path);
 		const stagingAt = (epochMs: number): string => `${prefix}${String(epochMs).padStart(STAGING_EPOCH_DIGITS, "0")}`;
 		const staging = `${stagingAt(now)}-${Snowflake.next()}`;
-		if (this.#adapter === "mysql" && [...staging].length > MYSQL_PATH_CHARS) {
-			const { text, bytes } = await decodeChunks(chunks);
-			if (bytes !== byteLength) {
-				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${bytes} bytes, not ${byteLength}`);
-			}
-			await this.writeFull(path, text, mtimeMs, title, expectedSize);
-			return;
-		}
 		const fences = this.#fencesOf([path]);
 		const fenced = async (work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> => {
 			await this.#awaitClaims(fences);
@@ -4876,16 +4834,27 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				this.#wrote(path);
 				if (!present || present.has(path)) await run(transaction, this.#q.deleteRow, { path });
 			}
+			// The staging sets the directory delete does not take: those of a path not under `dir`, and on
+			// MySQL those of a path too long for `<path>#staging-` names, named by its hash instead
+			// (#stagingPrefix): the explicit paths', and those of every row under `dir`, found before it goes.
+			const staged = new Set(
+				paths.filter(path => !under || !path.startsWith(under.dir) || this.#hashesStaging(path)),
+			);
 			if (under) {
 				if (this.#sqliteWrites) this.#sqliteWrites.every++;
+				if (this.#q.longPathsUnder) {
+					const rows = (await run(transaction, this.#q.longPathsUnder, {
+						...under,
+						fits: MYSQL_PLAIN_STAGING_CHARS,
+					})) as PathRow[];
+					for (const row of rows) staged.add(row.path);
+				}
 				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
 				for (const query of deletes) await run(transaction, query, under);
 			}
-			for (const path of ordered) {
-				await this.#deleteParts(transaction, path);
-				// The directory delete took the staging sets of every path under `dir`, which have no row.
-				if (!under || !path.startsWith(under.dir)) await this.#deleteStagingOf(transaction, path);
-			}
+			for (const path of ordered) await this.#deleteParts(transaction, path);
+			// In path order, as every other delete of this transaction takes its locks.
+			for (const path of [...staged].sort()) await this.#deleteStagingOf(transaction, path);
 			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
 			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, ordered, under));
 		});
@@ -5263,9 +5232,31 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (slots) slots[sqliteWriteSlot(path)]++;
 	}
 
+	/**
+	 * Whether `path`'s staging sets are named by its hash: on MySQL, a path
+	 * longer than {@link MYSQL_PLAIN_STAGING_CHARS} characters, whose
+	 * `<path>#staging-<epoch>-<id>` would not fit the 512-character `path`
+	 * column.
+	 */
+	#hashesStaging(path: string): boolean {
+		return this.#adapter === "mysql" && [...path].length > MYSQL_PLAIN_STAGING_CHARS;
+	}
+
+	/**
+	 * Starts the names of `path`'s staging sets: `<path>#staging-`, or, where
+	 * {@link #hashesStaging}, {@link HASHED_STAGING}, the SHA-256 of `path` in
+	 * hex and `#staging-` (86 characters, so every staging path of it fits).
+	 * Either is `path`'s alone, so a range from it reaches no other path's
+	 * staging sets.
+	 */
+	#stagingPrefix(path: string): string {
+		if (!this.#hashesStaging(path)) return `${path}${STAGING_MARK}`;
+		return `${HASHED_STAGING}${new Bun.CryptoHasher("sha256").update(path).digest("hex")}${STAGING_MARK}`;
+	}
+
 	/** Delete every staging set of `path`, whatever its age: a path that goes takes its unfinished full writes with it. */
 	#deleteStagingOf(transaction: SqlSessionStorageTransaction, path: string): Promise<void> {
-		const prefix = `${path}${STAGING_MARK}`;
+		const prefix = this.#stagingPrefix(path);
 		// The largest epoch bounds every name: code-point and locale collations alike order
 		// staging names by their epoch digits, while a punctuation bound sorts before digits
 		// in some (ICU puts ":" before "0").
