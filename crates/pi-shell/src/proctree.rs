@@ -1945,10 +1945,17 @@ mod tests {
 	/// (this test's parent, and pid 1 where it can be pinned) has another.
 	/// Nothing is asserted about two processes started together: on Linux
 	/// the mark counts 10 ms clock ticks, and a mark names a process only
-	/// with its pid.
+	/// with its pid. So the child is started only once a thread started
+	/// here is in a later tick than the parent: a parent that started the
+	/// test binary at once (a wrapper such as `timeout` or `taskset`) shared
+	/// the child's tick, and the marks were equal in 2 runs of 3.
 	#[cfg(unix)]
 	#[test]
 	fn start_mark_names_one_process() {
+		// SAFETY: getppid has no preconditions.
+		let parent = Process::from_pid(unsafe { libc::getppid() }).expect("pin the test's parent");
+		#[cfg(target_os = "linux")]
+		while thread_start_ticks() <= parent.inner.start_ticks() {}
 		let mut child = crate::testkit::child::dies_with_this_process(
 			std::process::Command::new("sleep").arg("600"),
 		)
@@ -1959,8 +1966,6 @@ mod tests {
 			Process::from_pid(pid).expect("pin the child"),
 			Process::from_pid(pid).expect("pin the child again"),
 		);
-		// SAFETY: getppid has no preconditions.
-		let parent = Process::from_pid(unsafe { libc::getppid() }).expect("pin the test's parent");
 		let init = Process::from_pid(1);
 		let marks = (first.start_mark(), again.start_mark(), parent.start_mark());
 		let init_mark = init.as_ref().map(Process::start_mark);
@@ -1978,6 +1983,25 @@ mod tests {
 			let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
 			assert!(child_mark.starts_with(&format!("{}:", boot.trim())), "{child_mark}");
 		}
+	}
+
+	/// The clock tick in which a thread started now starts: field 22 of its
+	/// `stat`, the count and the unit of Linux's start mark.
+	#[cfg(target_os = "linux")]
+	fn thread_start_ticks() -> u64 {
+		std::thread::spawn(|| {
+			// SAFETY: gettid takes no arguments.
+			let tid = unsafe { libc::gettid() };
+			let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+				.expect("this thread's stat");
+			// Field 3, the state, is the first after the name.
+			stat
+				.rsplit_once(") ")
+				.and_then(|(_, rest)| rest.split(' ').nth(22 - 3)?.parse().ok())
+				.expect("the start time")
+		})
+		.join()
+		.unwrap()
 	}
 
 	/// The boot id is read once per process: once a mark was read, no later
