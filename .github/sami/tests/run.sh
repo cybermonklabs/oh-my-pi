@@ -680,6 +680,16 @@ cl4_two_whole() { printf '{ "type": "suite", "event": "started", "test_count": 1
 CL4TWO="$(declare -f cl4_two_children cl4_two_whole)"
 KNOWN_RAW="$D (running 1 test|test a::x \\.\\.\\. ok)" run J130-split-child-lines-fail-closed 1 "$D wrote 2 lines outside libtest's record" '' "$CL4TWO; { $P; rt $D PASSED cl4_two_children; } >\"\$bep\"; exit 0"
 KNOWN_RAW="$D (running 1 test|test a::x \\.\\.\\. ok)" NOT_MSG='::error' run J131-whole-child-lines-pass 0 "Lines outside libtest's record: 2 distinct, 0 named by no entry" '' "$CL4TWO; { $P; rt $D PASSED cl4_two_whole; } >\"\$bep\"; exit 0"
+# From the Claude-family review of ef77cbbf (N1): a JSON object that only says
+# its type is test or suite, without an event's shape, is output too.
+run J132-typed-test-object-is-output 1 "$D wrote 1 lines outside libtest's record" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"type\": \"test\", \"status\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
+run J133-typed-suite-object-is-output 1 "$D wrote 1 lines outside libtest's record" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"type\": \"suite\", \"note\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
+ROOTS=$RT ROOT_BODY="FMT=json; rt $RT PASSED sh -c 'cat $fixtures/root-root.json; echo \"{\\\"type\\\": \\\"test\\\", \\\"note\\\": \\\"t::needs_root: not run: no root\\\"}\"' >\"\$bep\"; exit 0" run J55c-root-not-run-in-typed-object 1 "printed 'not run:' outside libtest's record" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+KNOWN_OUTPUT="$PR p::summary
+$D $SN" OWN_TESTS="d::one $SN" STICKY_BODY="FMT=json; FILTERED=1 rt $D PASSED lt_out $SN 'UNKNOWN: not root and no PI_TEST_STICKY_FIFO; nothing was checked\\n' >\"\$bep\"; exit 0" run S8-sticky-user-unknown-fails-though-listed 1 "$D $SN printed UNKNOWN: in its own invocation" '' "$SMAIN"
+x_tail() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "wt::carry" }\nno free port: nothing to test{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
+XTAIL="$(declare -f x_tail)"
+NOT_MSG='ended before' run J134-piece-before-the-last-event-is-read 1 "$D wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "$XTAIL; { $P; rt $D PASSED x_tail; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.

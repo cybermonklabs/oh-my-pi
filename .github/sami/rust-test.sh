@@ -690,13 +690,22 @@ incomplete="$tmp/incomplete.txt"
 raw_output="$tmp/raw-output.tsv"
 : >"$raw_output"
 
-# outside_record <log>: the log's lines that are no libtest event (a JSON
-# object whose type is test, suite or bench): what was written outside the
-# record. A line is judged by parsing it, not by its first character, so a
-# child's own JSON line, or `{ no free port: nothing to test }`, is output.
+# outside_record <log>: the log's lines that are no libtest event: what was
+# written outside the record. A line is judged by parsing it, not by its first
+# character, and is an event only in the shape this script's readers use: a
+# test event (started, ok, failed, ignored or timeout) with a name, a suite
+# event (started, ok or failed), or a bench result with a name. A child's own
+# JSON line, `{ no free port: nothing to test }`, or an object that only says
+# `"type": "test"`, is output. (untangle above knows an event by libtest's
+# one text shape; in every trial log the two agree.)
 outside_record() {
 	jq -R -r '. as $l | (try fromjson catch null) as $o
-		| if ($o | type) == "object" and ($o.type == "test" or $o.type == "suite" or $o.type == "bench") then empty else $l end' "$1"
+		| if ($o | type) == "object"
+			and (($o.type == "test" and ($o.name | type) == "string"
+					and ($o.event == "started" or $o.event == "ok" or $o.event == "failed" or $o.event == "ignored" or $o.event == "timeout"))
+				or ($o.type == "suite" and ($o.event == "started" or $o.event == "ok" or $o.event == "failed"))
+				or ($o.type == "bench" and ($o.name | type) == "string"))
+		then empty else $l end' "$1"
 }
 
 # raw_lines <log> [<cargo stderr>]: what a test binary wrote outside
@@ -704,11 +713,15 @@ outside_record() {
 # cargo's stderr, the lines after its first `Running` line (before it,
 # cargo's own build output). Bazel's own lines in a test.log (its banner, and
 # its line for a test it timed out, which fails anyway), cargo's line after a
-# failed test, and blank lines are left out, each matched whole.
+# failed test, and blank lines are left out, each matched whole. A log jq
+# cannot read to its end is an error: a shorter read could look clean.
 # shellcheck disable=SC2016 # the patterns name a literal $0, ${PAGER...} and backquotes
 raw_lines() {
+	if ! outside_record "$1" >"$tmp/outside-record.txt"; then
+		error "Rust tests" "jq could not read $1 to its end, so what its test binary wrote outside libtest's record is unknown"
+	fi
 	{
-		outside_record "$1"
+		cat -- "$tmp/outside-record.txt"
 		if [ -n "${2:-}" ] && [ -f "$2" ]; then awk 'p; /^ +Running /{ p = 1 }' "$2"; fi
 	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //[^ ]+$|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass `[^`]*`$' || true
 }
@@ -755,10 +768,11 @@ check_root() {
 	while read -r name; do
 		error "Rust tests" "$label $name printed 'not run:', though it runs as root"
 	done < <(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and ((.stdout // "") | test("not run:"))) | .name' "$log")
-	# grep -c, not -q: under pipefail a grep -q that stops early can kill the
-	# grep before it with SIGPIPE and read as clean.
-	if [ "$(outside_record "$log" | grep -c 'not run:' || true)" != 0 ]; then
-		error "Rust tests" "$label printed 'not run:' outside libtest's record, though it runs as root: $(outside_record "$log" | grep 'not run:' | sed -n 1p)"
+	if ! outside_record "$log" >"$tmp/outside-record.txt"; then
+		error "Rust tests" "jq could not read $log to its end, so its 'not run:' lines outside libtest's record are unknown"
+	fi
+	if [ "$(grep -c 'not run:' "$tmp/outside-record.txt" || true)" != 0 ]; then
+		error "Rust tests" "$label printed 'not run:' outside libtest's record, though it runs as root: $(grep -m 1 'not run:' "$tmp/outside-record.txt")"
 	fi
 	passed="$(jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object" and .type == "test" and .event == "ok")] | length' "$log")"
 	if [ "$passed" != "${root_tests[$label]}" ]; then
