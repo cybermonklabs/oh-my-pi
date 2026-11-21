@@ -11,7 +11,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { StreamRedactor } from "@oh-my-pi/pi-coding-agent/stream/redactor";
 import { getAgentDir, isRecord, logger, setAgentDir } from "@oh-my-pi/pi-utils";
-import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
+import { failNextReads, plainYml, settledClock, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 
 const MODULE_PATH = path.join(import.meta.dir, "../../src/secrets/session-store-mask.ts");
@@ -496,10 +496,13 @@ describe("K22: a held value set past the pattern size the engine accepts", () =>
 
 describe("K23: a refresh whose read of a source fails", () => {
 	it("K23: keeps masking what it holds, logs the source and the cause, and reads the source again at the next refresh", async () => {
-		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A2"];
-		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B2"];
+		// Each rotation changes the value's length, so it always changes the file's stat.
+		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A22"];
+		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B22"];
 		const tokenFile = await writeFile("rotating.txt", fileBefore);
 		await Bun.write(projectYml, plainYml(ymlBefore));
+		// Each read comes after both files have settled, so a read that succeeds keeps their stamps.
+		clock = settledClock([tokenFile, projectYml]);
 		const masker = maskerFor({ EXAMPLE_TOKEN_FILE: tokenFile });
 		const text = [ymlBefore, fileBefore, ymlAfter, fileAfter].join(" ");
 		const beforeRotation = [YML_MARKER, FILE_MARKER, ymlAfter, fileAfter].join(" ");
@@ -511,7 +514,8 @@ describe("K23: a refresh whose read of a source fails", () => {
 		const pending = failNextReads([projectYml, tokenFile]);
 		const warnings = sourceReadWarnings();
 		await nextRun();
-		clock += MINUTE;
+		// The rotated files have settled too: a stamp the failed read kept would hold at the next refresh.
+		clock = Math.max(clock + MINUTE, settledClock([tokenFile, projectYml]));
 		// The write goes on under what the masker held.
 		expect(masker.snapshot(cwd).maskText(text)).toBe(beforeRotation);
 		expect(pending.size).toBe(0);
@@ -524,6 +528,80 @@ describe("K23: a refresh whose read of a source fails", () => {
 			{ kind: "file", source: "EXAMPLE_TOKEN_FILE", cause: "EIO" },
 			{ kind: "secrets.yml", source: projectYml, cause: "EIO" },
 		]);
+	});
+});
+
+describe("K32: a source rewritten in the clock tick of its read", () => {
+	it("K32: reads again a file a same-size rewrite left with the stat its read saw, until a read 2 s after its last change keeps its stamp", async () => {
+		const ymlValues = ["yml-held-value-C1", "yml-held-value-C2", "yml-held-value-C3"];
+		const fileValues = ["file-held-value-D1", "file-held-value-D2", "file-held-value-D3"];
+		const tokenFile = await writeFile("same-tick.txt", fileValues[0]);
+		await Bun.write(projectYml, plainYml(ymlValues[0]));
+		const files = [tokenFile, projectYml];
+		// The stat each read sees: both files as one tick of the filesystem's clock left them, so a
+		// rewrite of the same size in that tick leaves the stat as it is.
+		const realStatSync = fs.statSync;
+		const frozen = new Map<string, fs.BigIntStats>();
+		const freezeAt = (tickMs: number): void => {
+			const tickNs = BigInt(tickMs) * 1_000_000n;
+			for (const file of files) {
+				const real = realStatSync(file, { bigint: true });
+				const times = { mtimeNs: tickNs, ctimeNs: tickNs, mtimeMs: BigInt(tickMs), ctimeMs: BigInt(tickMs) };
+				frozen.set(file, Object.assign(Object.create(Object.getPrototypeOf(real)), real, times));
+			}
+		};
+		spyOn(fs, "statSync").mockImplementation(
+			((file: fs.PathLike, options?: fs.StatSyncOptions) =>
+				(typeof file === "string" ? frozen.get(file) : undefined) ??
+				realStatSync(file, options)) as typeof fs.statSync,
+		);
+		const opens = spyOn(fs, "openSync");
+		/** The test's files the masker opened since call `start` of `openSync`. */
+		const openedSince = (start: number): string[] =>
+			opens.mock.calls
+				.slice(start)
+				.map(call => String(call[0]))
+				.filter(file => files.includes(file))
+				.sort();
+		const text = [0, 1, 2].flatMap(i => [ymlValues[i], fileValues[i]]).join(" ");
+		/** `text` masked by a masker that holds the first `held` values of each source. */
+		const masked = (held: number): string =>
+			[0, 1, 2].flatMap(i => (i < held ? [YML_MARKER, FILE_MARKER] : [ymlValues[i], fileValues[i]])).join(" ");
+		const tick = Number(realStatSync(projectYml, { bigint: true }).ctimeNs / 1_000_000n);
+		freezeAt(tick);
+		const masker = maskerFor({ EXAMPLE_TOKEN_FILE: tokenFile });
+
+		// The first read comes 1,999 ms after the tick: too soon to keep either stamp.
+		clock = tick + 1_999;
+		let start = opens.mock.calls.length;
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked(1));
+		expect(openedSince(start)).toEqual([...files].sort());
+
+		// Both rotate within that tick, so each still has the stat the read saw: each is read again.
+		await Bun.write(projectYml, plainYml(ymlValues[1]));
+		await Bun.write(tokenFile, fileValues[1]);
+		await nextRun();
+		clock += MINUTE;
+		start = opens.mock.calls.length;
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked(2));
+		expect(openedSince(start)).toEqual([...files].sort());
+
+		// Both rotate in a later tick, and the next read comes exactly 2,000 ms after it: it keeps both stamps.
+		await Bun.write(projectYml, plainYml(ymlValues[2]));
+		await Bun.write(tokenFile, fileValues[2]);
+		freezeAt(clock + MINUTE - 2_000);
+		await nextRun();
+		clock += MINUTE;
+		start = opens.mock.calls.length;
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked(3));
+		expect(openedSince(start)).toEqual([...files].sort());
+
+		// Settled by that read: the next refresh opens neither file.
+		await nextRun();
+		clock += MINUTE;
+		start = opens.mock.calls.length;
+		expect(masker.snapshot(cwd).maskText(text)).toBe(masked(3));
+		expect(openedSince(start)).toEqual([]);
 	});
 });
 

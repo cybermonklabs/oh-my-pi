@@ -2,6 +2,7 @@ import type * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, isEnotdir, isFsError, logger, toError } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { RACY_STAMP_WINDOW_MS } from "../tools/racy-stamp";
 import {
 	collectEnvSecretValues,
 	connectionUrlPasswords,
@@ -37,7 +38,11 @@ export interface SessionStoreMaskerOptions {
 	env?: () => Env;
 	/** Directory of the global secrets.yml. */
 	agentDir: string;
-	/** Clock for the refresh interval (default: `Date.now`). */
+	/**
+	 * Clock for the refresh interval, and to tell a file changed just before its read (default: `Date.now`).
+	 * It must give Unix-epoch milliseconds, comparable with file times: on a clock behind the files' change
+	 * times every file counts as just changed, so no stamp is kept and every refresh reads every file again.
+	 */
 	now?: () => number;
 }
 
@@ -142,6 +147,38 @@ interface ProjectState {
  */
 function stampOf(filePath: string, stat: fs.BigIntStats): string {
 	return `${filePath}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+/**
+ * How long a file must have gone unchanged before its stamp is trusted: a window after git's racy-clean
+ * rule, shared with the grep tool. A filesystem times a change by its clock's tick (a few milliseconds on
+ * Linux, up to two seconds elsewhere), so two writes in one tick leave the same mtime and ctime, and a
+ * rewrite of the same size then leaves the whole stamp as it was.
+ */
+const STAMP_SETTLE_NS = BigInt(RACY_STAMP_WINDOW_MS) * 1_000_000n;
+
+/**
+ * The stamp to keep for the file `stat` describes, read at `readAtMs` on the masker's clock: none while
+ * its last change is within {@link STAMP_SETTLE_NS} of the read, so the next refresh reads it again, as
+ * git reads again a file whose index entry was written in the tick of its last change. Otherwise a
+ * value rotated in the tick of the read before it would never be read.
+ *
+ * The file's times come from the filesystem's clock and the read time from the masker's. Where the
+ * filesystem's clock runs {@link STAMP_SETTLE_NS} or more behind (an NFS or SMB server, a VM share whose
+ * guest clock drifted), a file just changed already counts as settled, and a same-size rewrite in the
+ * tick of a read is missed as it was before this rule. git does not have this gap: it compares with the
+ * index file's own mtime, from the same clock.
+ */
+function settledStampOf(filePath: string, stat: fs.BigIntStats, readAtMs: number): string | undefined {
+	const changedNs = stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;
+	const readAtNs = BigInt(Math.trunc(readAtMs)) * 1_000_000n;
+	return changedNs + STAMP_SETTLE_NS <= readAtNs ? stampOf(filePath, stat) : undefined;
+}
+
+/** Keeps `stamp` as the stamp of `key`, or forgets the stamp of `key` when there is none to keep. */
+function keepStamp(stamps: Map<string, string>, key: string, stamp: string | undefined): void {
+	if (stamp === undefined) stamps.delete(key);
+	else stamps.set(key, stamp);
 }
 
 function collectSafely(kind: SessionStoreMaskSourceKind, collect: () => void): void {
@@ -292,6 +329,7 @@ export class SessionStoreMasker {
 
 	#collectFile(name: string, value: string): void {
 		const filePath = path.resolve(value);
+		const readAt = this.#now();
 		let read: SecretFileRead | UnchangedSecretFile;
 		try {
 			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
@@ -306,7 +344,7 @@ export class SessionStoreMasker {
 			return;
 		}
 		if ("unchanged" in read) return;
-		this.#fileStamps.set(name, stampOf(filePath, read.stat));
+		keepStamp(this.#fileStamps, name, settledStampOf(filePath, read.stat, readAt));
 		if ("skip" in read) {
 			this.#skipFile(name, read.skip, read.oversized);
 			return;
@@ -359,6 +397,7 @@ export class SessionStoreMasker {
 	}
 
 	#collectSecretsFile(filePath: string, scope: "project" | "global", held: HeldSet): void {
+		const readAt = this.#now();
 		let read: SecretFileRead | UnchangedSecretFile;
 		try {
 			// A file whose stamp has not changed is neither opened nor read: what it gave still holds.
@@ -373,9 +412,9 @@ export class SessionStoreMasker {
 			return;
 		}
 		if ("unchanged" in read) return;
-		// Stamped now that it is read or skipped: the same file gives the same result next time, a
-		// text that does not parse included.
-		this.#secretsFileStamps.set(filePath, stampOf(filePath, read.stat));
+		// Stamped now that it is read or skipped, once it has settled: the same file gives the same
+		// result next time, a text that does not parse included.
+		keepStamp(this.#secretsFileStamps, filePath, settledStampOf(filePath, read.stat, readAt));
 		if ("skip" in read) {
 			this.#skipSecretsFile(filePath, read.skip, read.oversized);
 			return;
