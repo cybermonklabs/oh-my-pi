@@ -19,26 +19,13 @@ import {
 	continuesCachedPrompt,
 	gatewayModelsYml,
 	gatewaySessionOptions,
-	type MessagesRequest,
+	imagesPerMessage,
 	mockGatewayFetch,
 } from "./helpers/anthropic-gateway";
 import { ONE_PIXEL_PNG } from "./helpers/skill-image-vision";
 
 /** The gateway's claude-opus-5-5 on a host that takes four images per request. */
 const MODELS_YML = gatewayModelsYml(1_000_000, 4);
-
-/** How many image blocks `request` sends. */
-function imagesIn(request: MessagesRequest): number {
-	return request.messages.reduce(
-		(sum, message) =>
-			sum +
-			(Array.isArray(message.content)
-				? message.content.filter(block => typeof block === "object" && block !== null && block.type === "image")
-						.length
-				: 0),
-		0,
-	);
-}
 
 /** `count` screenshots. */
 function images(count: number): ImageContent[] {
@@ -107,13 +94,13 @@ describe("image count clamp after another process continued a session this proce
 			if (!next || next === lastOfOther) throw new Error("Expected the request after the switch back");
 
 			// Precondition: the other process's last request sent four images, its forced drop's three and one more.
-			expect(imagesIn(lastOfOther)).toBe(4);
+			expect(imagesPerMessage(lastOfOther).reduce((total, count) => total + count, 0)).toBe(4);
 			// The request after the switch back sends the other process's last prompt as it sent it, the same images
 			// dropped, so it reads that prompt from the cache.
-			expect({ images: imagesIn(next), continues: continuesCachedPrompt(lastOfOther, next) }).toEqual({
-				images: 4,
-				continues: true,
-			});
+			expect({
+				images: imagesPerMessage(next).reduce((total, count) => total + count, 0),
+				continues: continuesCachedPrompt(lastOfOther, next),
+			}).toEqual({ images: 4, continues: true });
 		} finally {
 			await first.session.dispose();
 			first.authStorage.close();

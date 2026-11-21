@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- `estimateContextToolSchemaTokens()` takes the agent (`ToolDeclarationSource`) instead of its tool array, and counts the tool definitions its next request declares: the roster and each tool taken off it that a kept declaration still sends (`declaredTools()`), from its sent definition, counted again only when that definition changes
+- `estimateContextToolSchemaTokens()` takes the agent (`ToolDeclarationSource`) instead of its tool array, and counts the tool definitions its next request declares: the roster and each tool taken off it that a kept declaration still sends (`declaredTools()`), from its sent definition, counted again only when that definition changes. It reads the prune mode from the agent (`prunesToolDescriptions()`), so its options take only `sourceRevision`
 
 ### Fixed
 

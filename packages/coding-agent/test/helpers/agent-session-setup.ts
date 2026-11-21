@@ -73,6 +73,16 @@ export type OverlayRebuild =
 	| "refreshSkillsAndCommands"
 	| "holdToolDeclarationChange";
 
+/** How {@link reloadOverlay} waits for the calls a reload starts. */
+export interface ReloadOverlayOptions {
+	/**
+	 * Wait one turn of the event loop, with no delay, before collecting the calls, instead of one microtask: a listener
+	 * that awaits before its call (the auto-QA one awaits the workspace roots) reaches it within that turn, and exposes
+	 * no promise to await.
+	 */
+	eventLoopTurn?: boolean;
+}
+
 /**
  * Rewrites the overlay file with `content` and reloads it as the config watcher does, then waits for each call of the
  * session's `rebuilds` the change starts.
@@ -85,12 +95,14 @@ export async function reloadOverlay(
 		"reconcileBuiltinTools",
 		"refreshSkillsAndCommands",
 	],
+	{ eventLoopTurn = false }: ReloadOverlayOptions = {},
 ): Promise<void> {
 	const spies = rebuilds.map(rebuild => vi.spyOn(session, rebuild));
 	await Bun.write(overlay, content);
 	await settings.reloadFromDisk();
 	// The settings listeners run in the microtask the reload queued for them.
-	await Promise.resolve();
+	if (eventLoopTurn) await Bun.sleep(0);
+	else await Promise.resolve();
 	await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
 	for (const spy of spies) spy.mockRestore();
 }

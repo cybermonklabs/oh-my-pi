@@ -113,7 +113,6 @@ export class SessionStatsTracker {
 		const session = this.#host.session;
 		return estimateContextToolSchemaTokens(session.agent, this.#tokenizer, session.model, {
 			sourceRevision: session.settings?.revision,
-			pruneDescriptions: session.agent?.prunesToolDescriptions?.(session.model),
 		});
 	}
 

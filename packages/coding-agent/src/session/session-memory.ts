@@ -112,6 +112,11 @@ export class SessionMemory {
 	 * running backend, its tools and the prompt follow. Unset when live changes are disabled.
 	 */
 	#appliedSettings: Map<AnySetting, unknown> | undefined;
+	/**
+	 * The backend the running memory state follows: the one selected when the session started, then the one each
+	 * backend apply resolved ({@link #applyMemoryBackend}). A switch still waiting for its apply does not move it.
+	 */
+	#runningBackend: MemoryBackendId;
 	/** Dispatched setting changes still running, including backend hooks that run outside the transition queue. */
 	readonly #settingsChanges = new Set<Promise<void>>();
 
@@ -136,6 +141,7 @@ export class SessionMemory {
 		// Only Hindsight and Mnemopi recall into the conversation: under another backend, or with memory off, the
 		// transcript's recall is history the session does not send again, and its branch is not read for it.
 		const backend = cfgMemoryBackend.get(host.settings);
+		this.#runningBackend = backend;
 		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
 			this.adoptRecall(options.hiddenRecall?.(), options.recallChanges?.() ?? []);
 		}
@@ -187,7 +193,11 @@ export class SessionMemory {
 	/**
 	 * Live memory-setting edits: switching `memory.backend` re-applies everything;
 	 * edits to the active backend's own `<id>.*` settings go to its
-	 * `applySettings` hook, or re-apply the backend when it has none.
+	 * `applySettings` hook, or re-apply the backend when it has none. A hook
+	 * takes the edit in itself, so once it returns the backend's own settings
+	 * count as applied ({@link #takeSettingsChange}): a later apply or recall
+	 * withdrawal does not take the edit for a change of its own. A backend
+	 * switch written meanwhile is left to the apply it starts.
 	 */
 	async #applySettingsChange(changed: string[]): Promise<void> {
 		try {
@@ -207,7 +217,9 @@ export class SessionMemory {
 				return undefined;
 			});
 			// Backend hooks may re-enter `applyMemoryBackend`, so they run outside the transition.
-			await hook?.backend.applySettings?.(this.#host.memoryBackendSession(), hook.own);
+			if (!hook) return;
+			await hook.backend.applySettings?.(this.#host.memoryBackendSession(), hook.own);
+			this.#takeSettingsChange(hook.backend.id, { backendSwitch: false });
 		} catch (error) {
 			logger.warn("Memory lifecycle: applying setting change failed", { changed, error: String(error) });
 			this.#host.emitNotice("error", `Failed to apply memory settings: ${String(error)}`, "Memory");
@@ -251,13 +263,14 @@ export class SessionMemory {
 
 	/**
 	 * Withdraws the conversation's recall ({@link adoptRecall}) after the backend's recall was reset, then rebuilds the
-	 * base prompt. The memory settings the backend took in since the last apply (a Hindsight state rebuilt for an edit
-	 * of a `hindsight.*` setting) go with the rebuild ({@link #takeSettingsChange}), so a bound prompt holds it as it
-	 * holds a backend apply; `/memory clear` and a cwd move take in none and rebuild at once.
+	 * base prompt. The running backend's own settings it took in since the last apply (a Hindsight state rebuilt for an
+	 * edit of a `hindsight.*` setting) go with the rebuild ({@link #takeSettingsChange}), so a bound prompt holds it as
+	 * it holds a backend apply; `/memory clear` and a cwd move take in none and rebuild at once. A backend switch, and
+	 * the settings of the backend it selects, are left to the apply the switch starts.
 	 */
 	withdrawRecall(): Promise<void> {
 		this.adoptRecall(undefined, []);
-		const settingsChange = this.#takeSettingsChange(cfgMemoryBackend.get(this.#host.settings));
+		const settingsChange = this.#takeSettingsChange(this.#runningBackend, { backendSwitch: false });
 		return this.#host.refreshBaseSystemPrompt({ settingsChange });
 	}
 
@@ -440,7 +453,8 @@ export class SessionMemory {
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);
-				settingsChange = this.#takeSettingsChange(backend.id);
+				this.#runningBackend = backend.id;
+				settingsChange = this.#takeSettingsChange(backend.id, { backendSwitch: true });
 				await backend.start({
 					session: this.#host.memoryBackendSession(),
 					settings: this.#host.settings,
@@ -467,17 +481,23 @@ export class SessionMemory {
 	}
 
 	/**
-	 * The settings the backend `id` runs under (`memory.backend` and its own `<id>.*` settings) whose value moved since
-	 * an apply last took them in, each with the value taken in then; records the values now as taken in. Undefined when
-	 * none moved or live changes are disabled. Another backend's settings keep the value last taken in, so a switch to
-	 * it later names an edit made while it was inactive.
+	 * The settings of the backend `id` whose value moved since they were last taken in, each with the value taken in
+	 * then; records the values now as taken in. Those are its own `<id>.*` settings, and `memory.backend` too with
+	 * `backendSwitch`: only a backend apply ({@link #applyMemoryBackend}) takes a switch in, so a settings hook or a
+	 * recall withdrawal that ends while a switch waits for its apply leaves the switch for that apply to name and hold.
+	 * Undefined when none moved or live changes are disabled. Another backend's settings keep the value last taken in,
+	 * so a switch to it later names an edit made while it was inactive.
 	 */
-	#takeSettingsChange(id: MemoryBackendId): SettingChange[] | undefined {
+	#takeSettingsChange(
+		id: MemoryBackendId,
+		{ backendSwitch }: { backendSwitch: boolean },
+	): SettingChange[] | undefined {
 		const applied = this.#appliedSettings;
 		if (!applied) return undefined;
+		const own = `${id}.`;
 		const changes: SettingChange[] = [];
 		for (const [setting, previous] of applied) {
-			if (setting !== cfgMemoryBackend && !setting.id.startsWith(`${id}.`)) continue;
+			if (setting === cfgMemoryBackend ? !backendSwitch : !setting.id.startsWith(own)) continue;
 			const value = setting.get(this.#host.settings);
 			if (settingValuesEqual(value, previous)) continue;
 			changes.push({ setting, previous });

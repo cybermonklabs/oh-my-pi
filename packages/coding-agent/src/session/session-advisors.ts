@@ -2434,7 +2434,6 @@ export class SessionAdvisors {
 				fixedPromptTokens +
 					estimateContextToolSchemaTokens(agent, agent.tokenizer, model, {
 						sourceRevision: this.#host.settings.revision,
-						pruneDescriptions: agent.prunesToolDescriptions(model),
 					}) +
 					storedConversationTokens +
 					incomingTokens,

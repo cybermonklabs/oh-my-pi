@@ -7,7 +7,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, type OverlayRebuild } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -51,18 +51,22 @@ interface MaskedPair {
 	seed?(dir: TempDir): Promise<void>;
 }
 
+/**
+ * The note on auto-QA renders while auto-QA is on, with `write` active. `dev.autoqaConsent` decides that only while
+ * `dev.autoqa` is unset: an explicit `dev.autoqa` is the answer, and the consent is not read.
+ */
+const AUTOQA_CONSENT: MaskedPair = {
+	name: "`dev.autoqaConsent` under an unset `dev.autoqa`",
+	ids: ["dev.autoqa", "dev.autoqaConsent"],
+	tools: ["read", "write"],
+	start: `${LONG_ENTRIES}dev:\n  autoqa: false\n  autoqaConsent: denied\n`,
+	maskingChanged: `${LONG_ENTRIES}dev:\n  autoqaConsent: denied\n`,
+	maskedChanged: `${LONG_ENTRIES}dev:\n  autoqa: false\n  autoqaConsent: unset\n`,
+	bothChanged: `${LONG_ENTRIES}dev:\n  autoqaConsent: unset\n`,
+};
+
 const PAIRS: MaskedPair[] = [
-	{
-		// The note on auto-QA renders while auto-QA is on, with `write` active. `dev.autoqaConsent` decides that only
-		// while `dev.autoqa` is unset: an explicit `dev.autoqa` is the answer, and the consent is not read.
-		name: "`dev.autoqaConsent` under an unset `dev.autoqa`",
-		ids: ["dev.autoqa", "dev.autoqaConsent"],
-		tools: ["read", "write"],
-		start: `${LONG_ENTRIES}dev:\n  autoqa: false\n  autoqaConsent: denied\n`,
-		maskingChanged: `${LONG_ENTRIES}dev:\n  autoqaConsent: denied\n`,
-		maskedChanged: `${LONG_ENTRIES}dev:\n  autoqa: false\n  autoqaConsent: unset\n`,
-		bothChanged: `${LONG_ENTRIES}dev:\n  autoqaConsent: unset\n`,
-	},
+	AUTOQA_CONSENT,
 	{
 		// The local memory backend renders the consolidated summary cut to `memories.summaryInjectionTokenLimit`;
 		// with memory off nothing renders it, and the build does not read the limit.
@@ -155,6 +159,14 @@ const RELOAD_CALLS: readonly OverlayRebuild[] = [
 	"reconcileBuiltinTools",
 	"holdToolDeclarationChange",
 ];
+
+/**
+ * Rewrites the overlay and reloads it as the config watcher does, then waits for each call of the session the change
+ * starts. The auto-QA listener reaches its rebuild only after awaiting the workspace roots, so the wait takes one turn
+ * of the event loop.
+ */
+const reload = (harness: Harness, content: string): Promise<void> =>
+	reloadOverlay(harness, content, RELOAD_CALLS, { eventLoopTurn: true });
 
 interface Harness {
 	session: AgentSession;
@@ -253,22 +265,6 @@ describe("a prompt setting and the setting that masks it, changed in two reloads
 	/** The system prompt of the first request of a session started on `overlay`. */
 	async function systemOnSettings(pair: MaskedPair, overlay: string): Promise<string> {
 		return withoutCacheControl((await firstRequestOn(pair, overlay)).system);
-	}
-
-	/**
-	 * Rewrites the overlay and reloads it as the config watcher does, then waits for each call of the session the
-	 * change starts. The auto-QA listener reaches its rebuild only after awaiting the workspace roots, so every pending
-	 * listener step runs before the calls are collected.
-	 */
-	async function reload(harness: Harness, content: string): Promise<void> {
-		const spies = RELOAD_CALLS.map(call => vi.spyOn(harness.session, call));
-		await Bun.write(harness.overlay, content);
-		await harness.settings.reloadFromDisk();
-		// The listener exposes no promise to await: one turn of the event loop, with no delay, lets each listener
-		// reach the calls spied on.
-		await Bun.sleep(0);
-		await Promise.all(spies.flatMap(spy => spy.mock.results.map(result => result.value)));
-		for (const spy of spies) spy.mockRestore();
 	}
 
 	/**
@@ -377,6 +373,28 @@ describe("a prompt setting and the setting that masks it, changed in two reloads
 				system: undefined,
 				tools: undefined,
 			});
+		}, 60_000);
+	});
+
+	describe("`dev.autoqaConsent` changed in an earlier reload and again in the one that changes `dev.autoqa`", () => {
+		it("names the masked setting in the notice with the value the prompt was built with", async () => {
+			const harness = await startSession(AUTOQA_CONSENT, AUTOQA_CONSENT.start);
+			await harness.session.prompt("first");
+			// The consent moves while the explicit `dev.autoqa: false` keeps it unread.
+			await reload(harness, `${LONG_ENTRIES}dev:\n  autoqa: false\n  autoqaConsent: granted\n`);
+			await harness.session.prompt("between the two changes");
+			// `dev.autoqa` unset: the build reads the consent, which moves again.
+			await reload(harness, AUTOQA_CONSENT.bothChanged);
+			await harness.session.prompt("after both changes");
+
+			const [first, , last] = harness.requests;
+			if (!first || !last) throw new Error("Expected the requests around the changes");
+			const notices = textOf(last.messages.slice(first.messages.length));
+			// Precondition: the change is held, and the system prompt is the one built under `denied`.
+			expect(notices).toContain("is held");
+			expect(withoutCacheControl(last.system)).toBe(withoutCacheControl(first.system));
+			expect(notices).toContain('`dev.autoqaConsent`: `"denied"` → `"unset"`');
+			expect(notices).not.toContain('"granted"');
 		}, 60_000);
 	});
 });

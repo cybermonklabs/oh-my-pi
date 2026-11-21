@@ -596,6 +596,18 @@ interface RefusedSnapcompact {
 }
 
 /**
+ * The {@link RefusedSnapcompact} records one read of a session's entries holds, oldest first, with the session and
+ * the read ({@link SessionManager.loadRevision}) they were read for, and the latest pass this process saw refused
+ * since that read: a new read starts with none.
+ */
+interface SnapcompactRefusals {
+	sessionId: string;
+	loadRevision: number;
+	refusals: RefusedSnapcompact[];
+	remembered: RefusedSnapcompact | undefined;
+}
+
+/**
  * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal on the branch current then, after
  * the leaf the archive was weighed on: a process that resumes the session finds the figures among the entries of every
  * branch and weighs them on any branch that carries that leaf before it starts another pass.
@@ -711,18 +723,13 @@ export class SessionMaintenance {
 	 * and whether the cut rule withheld a pass at it ({@link #prunePassesWithheld}).
 	 */
 	#pruneOffer: { sessionId: string; leafId: string | null; withheld: boolean } | undefined;
-	/** The latest automatic snapcompact pass the cut rule refused after rendering ({@link #snapcompactMayBeAdmitted}). */
-	#refusedSnapcompact: RefusedSnapcompact | undefined;
 	/**
-	 * The refusals the session records ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}) on every branch, oldest first, with the
-	 * session and the read of its entries ({@link SessionManager.loadRevision}) they were read for: read once for each
-	 * session the manager holds and each time it reads the session's file (again after a switch to another session, or
-	 * back to one another process continued meanwhile), and kept current by this process's own writes
-	 * ({@link #sessionSnapcompactRefusals}).
+	 * The refusals the session records ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}) on every branch and the latest pass
+	 * the cut rule refused after rendering ({@link #snapcompactMayBeAdmitted}): read once for each session the manager
+	 * holds and each time it reads the session's file (again after a switch to another session, or back to one another
+	 * process continued meanwhile), and kept current by this process's own writes ({@link #sessionSnapcompactRefusals}).
 	 */
-	#recordedSnapcompactRefusals:
-		| { sessionId: string; loadRevision: number; refusals: RefusedSnapcompact[] }
-		| undefined;
+	#recordedSnapcompactRefusals: SnapcompactRefusals | undefined;
 	/**
 	 * The cut rule's last answer for an automatic model-summary compaction, while it was "waits". While it holds, no
 	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run.
@@ -5679,14 +5686,13 @@ export class SessionMaintenance {
 			candidate !== undefined &&
 			candidate.contextKey === (contextKey ??= this.#snapcompactContextKey(branch, settings)) &&
 			branch.findLastIndex(entry => entry.id === candidate.leafId) >= 0;
-		// Read first: a new read of the session's file forgets the refusal this process remembers.
 		const recorded = this.#sessionSnapcompactRefusals();
-		let refused = this.#refusedSnapcompact;
+		let refused = recorded.remembered;
 		if (!applies(refused)) {
 			// A refusal this process does not remember: one an earlier process recorded (a resumed session), on this
 			// branch or on another that carries the leaf it was weighed on.
-			refused = recorded.findLast(applies);
-			this.#refusedSnapcompact = refused;
+			refused = recorded.refusals.findLast(applies);
+			recorded.remembered = refused;
 		}
 		if (refused) {
 			return this.#cutRuleAdmits(
@@ -5703,19 +5709,19 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * The refusals the session records on every branch, oldest first ({@link #recordedSnapcompactRefusals}). Each
-	 * record sits after the refused leaf on the branch current when it was written, while the process that wrote it
-	 * weighs it on every branch that carries that leaf, so a process that resumes the session reads them all. A new
-	 * read of them forgets the refusal this process remembers ({@link #refusedSnapcompact}): read again from the
-	 * session's file, they hold every process's refusals, and the newest that applies stands over this process's own
+	 * The refusals the session records on every branch, oldest first, and the refusal this process remembers since
+	 * they were read ({@link #recordedSnapcompactRefusals}). Each record sits after the refused leaf on the branch
+	 * current when it was written, while the process that wrote it weighs it on every branch that carries that leaf, so
+	 * a process that resumes the session reads them all. A new read remembers no refusal: read again from the session's
+	 * file, the records hold every process's refusals, and the newest that applies stands over this process's own
 	 * (another process may have refused a pass on a branch that carries this one's leaf since).
 	 */
-	#sessionSnapcompactRefusals(): RefusedSnapcompact[] {
+	#sessionSnapcompactRefusals(): SnapcompactRefusals {
 		const sessionManager = this.#host.sessionManager;
 		const sessionId = sessionManager.getSessionId();
 		const loadRevision = sessionManager.loadRevision;
 		const cached = this.#recordedSnapcompactRefusals;
-		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached.refusals;
+		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached;
 		const refusals: RefusedSnapcompact[] = [];
 		for (const entry of sessionManager.getEntries()) {
 			if (entry.type !== "custom" || entry.customType !== SNAPCOMPACT_REFUSAL_ENTRY_TYPE) continue;
@@ -5724,9 +5730,15 @@ export class SessionMaintenance {
 				refusals.push({ afterTokens: data.afterTokens, leafId: data.leafId, contextKey: data.contextKey });
 			}
 		}
-		this.#recordedSnapcompactRefusals = { sessionId, loadRevision, refusals };
-		this.#refusedSnapcompact = undefined;
-		return refusals;
+		const read: SnapcompactRefusals = { sessionId, loadRevision, refusals, remembered: undefined };
+		this.#recordedSnapcompactRefusals = read;
+		return read;
+	}
+
+	/** Forgets the refusal this process remembers ({@link #recordedSnapcompactRefusals}). */
+	#forgetSnapcompactRefusal(): void {
+		const recorded = this.#recordedSnapcompactRefusals;
+		if (recorded) recorded.remembered = undefined;
 	}
 
 	/**
@@ -6780,22 +6792,21 @@ export class SessionMaintenance {
 					const leafId = pathEntriesForCompaction.at(-1)?.id;
 					// A refusal with no leaf to weigh a later branch against is not kept.
 					if (leafId === undefined) {
-						this.#refusedSnapcompact = undefined;
+						this.#forgetSnapcompactRefusal();
 					} else {
 						const refused: RefusedSnapcompact = {
 							afterTokens: projectedAfter,
 							leafId,
 							contextKey: this.#snapcompactContextKey(pathEntriesForCompaction, effectiveSettings),
 						};
-						// Read before the refusal is remembered: a first read forgets what this process remembers.
-						const refusals = this.#sessionSnapcompactRefusals();
-						this.#refusedSnapcompact = refused;
+						const recorded = this.#sessionSnapcompactRefusals();
+						recorded.remembered = refused;
 						// Kept in the session, so a process that resumes it weighs these figures before it starts.
 						this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, {
 							version: 1,
 							...refused,
 						});
-						refusals.push(refused);
+						recorded.refusals.push(refused);
 					}
 					await this.#emitLifecycleEvent(
 						{
@@ -6810,7 +6821,7 @@ export class SessionMaintenance {
 					);
 					return COMPACTION_CHECK_NONE;
 				}
-				this.#refusedSnapcompact = undefined;
+				this.#forgetSnapcompactRefusal();
 				this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
 			}
 			if (projectedAfter < candidateTokensBefore) {

@@ -236,16 +236,6 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 	});
 }
 
-function cacheMemoryToolDeveloperInstructions(
-	session: MemoryInstructionSession,
-	sessionFile: string | undefined,
-	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
-	settings: Settings,
-): string | undefined {
-	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot });
-	return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
-}
-
 /**
  * Drop the per-session memory instruction snapshot after explicit memory state
  * changes that must affect the active conversation immediately, such as
@@ -281,7 +271,7 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
 	const learned = cachedLearned ?? baseline?.learned ?? "";
 	const snapshot = current ? { summary: current.summary, learned } : undefined;
-	cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot });
 }
 
 /**
@@ -316,7 +306,8 @@ export async function buildMemoryToolDeveloperInstructions(
 	}
 
 	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
-	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot });
+	return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 }
 
 /**

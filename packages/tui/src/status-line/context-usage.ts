@@ -327,6 +327,21 @@ export function estimateToolSchemaTokens(
 	return tokens;
 }
 
+/** What {@link withdrawnToolDefinitions} took from one declared list: the roster it filtered by and the result. */
+interface WithdrawnToolDefinitions {
+	tools: ToolSchemaSource;
+	withdrawn: readonly ContextTool[];
+}
+
+/**
+ * Per declared list ({@link ToolDeclarationSource.declaredTools}), the withdrawn
+ * definitions last taken from it. An agent gives the same list until its
+ * tools, its declaration or its sent definitions change, so a repeated call
+ * compares references only. Lists are caller-owned, so a WeakMap keeps the
+ * state off them.
+ */
+const WITHDRAWN_TOOL_DEFINITIONS = new WeakMap<readonly ContextTool[], WithdrawnToolDefinitions>();
+
 /**
  * The definitions the next request to `model` declares for tools not on
  * `tools`, `agent`'s roster: on a provider that keeps its tool declaration
@@ -340,17 +355,23 @@ function withdrawnToolDefinitions(
 ): readonly ContextTool[] {
 	const declared = agent?.declaredTools?.(model);
 	if (!declared || declared === tools) return EMPTY_TOOLS;
+	const cached = WITHDRAWN_TOOL_DEFINITIONS.get(declared);
+	if (cached?.tools === tools) return cached.withdrawn;
 	const active = new Set(tools.map(tool => tool.name));
-	const withdrawn = declared.filter(tool => !active.has(tool.name));
-	return withdrawn.length > 0 ? withdrawn : EMPTY_TOOLS;
+	const filtered = declared.filter(tool => !active.has(tool.name));
+	const withdrawn = filtered.length > 0 ? filtered : EMPTY_TOOLS;
+	WITHDRAWN_TOOL_DEFINITIONS.set(declared, { tools, withdrawn });
+	return withdrawn;
 }
 
 /**
  * Whether two lists of definitions carry the same names, descriptions and
- * schemas in the same order. A declared list is rebuilt on each call (a
- * deferred tool as a copy), so its definitions compare by field, not by object.
+ * schemas in the same order. A declared list is built again each time the
+ * agent's tools, its declaration or its sent definitions change (a deferred
+ * tool as a copy), so lists of two builds compare by field, not by object.
  */
 function sameToolDefinitions(left: readonly ContextTool[], right: readonly ContextTool[]): boolean {
+	if (left === right) return true;
 	if (left.length !== right.length) return false;
 	for (let index = 0; index < left.length; index++) {
 		const a = left[index];
@@ -398,23 +419,42 @@ function withdrawnToolTokens(
 /**
  * Count the tool definitions the next request to `model` carries in context:
  * `agent`'s roster, as {@link estimateToolSchemaTokens} counts and caches it,
- * and each withdrawn tool a kept declaration still sends
- * ({@link ToolDeclarationSource.declaredTools}), counted from its sent
- * definition, again only when those definitions change. A server-side deferred
- * catalog counts nothing.
+ * description-stripped where `agent` prunes the descriptions it sends
+ * ({@link ToolDeclarationSource.prunesToolDescriptions}), and each withdrawn
+ * tool a kept declaration still sends ({@link ToolDeclarationSource.declaredTools}),
+ * counted from its sent definition, again only when those definitions change.
+ * A server-side deferred catalog counts nothing.
  */
 export function estimateContextToolSchemaTokens(
 	agent: ToolDeclarationSource | undefined,
 	tokenizer: Tokenizer,
 	model: Model | undefined,
-	options: ToolSchemaEstimateOptions = {},
+	options: Pick<ToolSchemaEstimateOptions, "sourceRevision"> = {},
 ): number {
 	if (model?.toolSchemasInContext === false) return 0;
 	const tools = agent?.state?.tools ?? EMPTY_TOOLS;
+	return declaredToolSchemaTokens(agent, tools, withdrawnToolDefinitions(agent, tools, model), tokenizer, model, {
+		sourceRevision: options.sourceRevision,
+		pruneDescriptions: agent?.prunesToolDescriptions?.(model) === true,
+	});
+}
+
+/**
+ * {@link estimateContextToolSchemaTokens} from what its caller computed
+ * already: `tools`, `agent`'s roster, `withdrawn`, the definitions
+ * {@link withdrawnToolDefinitions} gives, and the prune mode in `options`.
+ */
+function declaredToolSchemaTokens(
+	agent: ToolDeclarationSource | undefined,
+	tools: ToolSchemaSource,
+	withdrawn: readonly ContextTool[],
+	tokenizer: Tokenizer,
+	model: Model | undefined,
+	options: ToolSchemaEstimateOptions,
+): number {
+	if (model?.toolSchemasInContext === false) return 0;
 	const tokens = estimateToolSchemaTokens(tools, tokenizer, options);
-	return agent
-		? tokens + withdrawnToolTokens(agent, withdrawnToolDefinitions(agent, tools, model), tokenizer)
-		: tokens;
+	return agent ? tokens + withdrawnToolTokens(agent, withdrawn, tokenizer) : tokens;
 }
 
 /**
@@ -520,7 +560,7 @@ export function computeNonMessageTokens(
 	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
 	const tokens =
 		tokenizer.countTokens(Array.from(systemPromptParts, part => part ?? "")) +
-		estimateContextToolSchemaTokens(session.agent, tokenizer, session.model, {
+		declaredToolSchemaTokens(session.agent, entry.toolsRef, entry.withdrawnTools, tokenizer, session.model, {
 			sourceRevision,
 			pruneDescriptions: entry.pruneToolDescriptions,
 		});
@@ -547,7 +587,7 @@ export function computeNonMessageBreakdown(
 } {
 	const entry = nonMessageTokenCacheEntry(session, tokenizer, sourceRevision);
 	if (entry.breakdown && entry.skillful === skillful) return entry.breakdown;
-	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const tools = entry.toolsRef;
 	const skillsTokens =
 		skillful === false
 			? 0
@@ -555,7 +595,7 @@ export function computeNonMessageBreakdown(
 					renderedSkills(session.renderedSkills ?? session.skills ?? EMPTY_SKILLS, tools),
 					tokenizer,
 				);
-	const toolsTokens = estimateContextToolSchemaTokens(session.agent, tokenizer, session.model, {
+	const toolsTokens = declaredToolSchemaTokens(session.agent, tools, entry.withdrawnTools, tokenizer, session.model, {
 		sourceRevision,
 		pruneDescriptions: entry.pruneToolDescriptions,
 	});

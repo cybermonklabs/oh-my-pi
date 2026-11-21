@@ -16,13 +16,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { estimateToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
-import { answer, gatewayModelsYml, mockGatewayFetch, textOf, type WireTool } from "./helpers/anthropic-gateway";
-
-/** A tool definition as a `/v1/messages` request declares it. */
-interface DeclaredWireTool extends WireTool {
-	description?: string;
-	input_schema?: unknown;
-}
+import { answer, gatewayModelsYml, mockGatewayFetch, textOf, wireToolTokens } from "./helpers/anthropic-gateway";
 
 /** An advisor `grep` whose definition is large next to an advisor update: a few thousand tokens. */
 const grepTool: AgentTool = {
@@ -79,7 +73,7 @@ async function secondReviewCarriesFirstUpdate(withdraw: boolean): Promise<boolea
 
 		await session.prompt("first update");
 		const first = requests[0];
-		const declared = (first?.tools as DeclaredWireTool[] | undefined)?.find(tool => tool.name === "grep");
+		const declared = first?.tools?.find(tool => tool.name === "grep");
 		// Precondition: the first review sent the first update and declared `grep`.
 		expect(textOf(first?.messages)).toContain("first update");
 		if (!declared?.description) throw new Error("Expected the advisor's first request to declare grep");
@@ -89,11 +83,7 @@ async function secondReviewCarriesFirstUpdate(withdraw: boolean): Promise<boolea
 		expect(advisor.declaredTools(advisorModel).map(tool => tool.name)).toContain("grep");
 		expect(advisor.state.tools.some(tool => tool.name === "grep")).toBe(!withdraw);
 		const tokenizer = advisor.tokenizer;
-		const declaredTokens = tokenizer.countTokens([
-			declared.name,
-			declared.description,
-			JSON.stringify(declared.input_schema),
-		]);
+		const declaredTokens = wireToolTokens(tokenizer, declared);
 		const activeFloor =
 			tokenizer.countTokens(advisor.state.systemPrompt) +
 			estimateToolSchemaTokens(advisor.state.tools, tokenizer, {

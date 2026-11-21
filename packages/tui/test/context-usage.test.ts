@@ -281,9 +281,10 @@ describe("computeNonMessageTokens / computeNonMessageBreakdown memoization", () 
  * Contract: on a model that keeps its tool declaration across a conversation,
  * the next request still declares a tool taken off the roster, and the
  * non-message totals count it from its sent definition. `Agent.declaredTools`
- * builds a new list on each call (a deferred tool as a copy), so the count is
- * kept while the withdrawn definitions are the same: a rebuilt total or a
- * replaced roster does not count them again, a new declaration does.
+ * builds a new list each time the agent's tools, its declaration or its sent
+ * definitions change (a deferred tool as a copy), so the count is kept while
+ * the withdrawn definitions are the same: a rebuilt total or a replaced roster
+ * does not count them again, a new declaration does.
  */
 describe("withdrawn declared tool accounting", () => {
 	it("counts a withdrawn tool's sent definition again only when that definition changes", () => {
@@ -292,7 +293,7 @@ describe("withdrawn declared tool accounting", () => {
 		let withdrawn = { name: "bash", description: "Run a shell command and return its output.", parameters };
 		const agent = {
 			state: { tools: [readTool] },
-			// A new list on each call, the withdrawn tool as a copy, as a deferred one is.
+			// A new list on each call, the withdrawn tool as a copy, as a new build of the agent's list gives it.
 			declaredTools: () => [readTool, { ...withdrawn }],
 		};
 		const session = { systemPrompt: ["base"], agent };

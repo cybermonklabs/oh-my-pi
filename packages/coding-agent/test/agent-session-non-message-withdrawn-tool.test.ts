@@ -19,14 +19,8 @@ import {
 	gatewaySessionOptions,
 	type MessagesRequest,
 	mockGatewayFetch,
-	type WireTool,
+	wireToolTokens,
 } from "./helpers/anthropic-gateway";
-
-/** A tool definition as a `/v1/messages` request declares it. */
-interface DeclaredWireTool extends WireTool {
-	description?: string;
-	input_schema?: unknown;
-}
 
 /** The non-message figure counted from the active roster alone: system prompt and active tool definitions. */
 function activeRosterFigure(session: AgentSession): number {
@@ -85,7 +79,7 @@ describe("non-message figure on a session whose requests still declare a withdra
 		await runTwoPrompts(tempDir, true, (session, requests) => {
 			const second = requests[1];
 			if (!second) throw new Error("Expected the second request");
-			const withdrawn = (second.tools as DeclaredWireTool[] | undefined)?.find(tool => tool.name === "debug");
+			const withdrawn = second.tools?.find(tool => tool.name === "debug");
 			// Precondition: the tool left the roster, and the request still declared it, its rendered examples in its
 			// description.
 			expect(session.agent.state.tools.map(tool => tool.name)).not.toContain("debug");
@@ -94,13 +88,8 @@ describe("non-message figure on a session whose requests still declare a withdra
 
 			// Its definition as the wire carries it, its rendered examples once, in its description.
 			const tokenizer = session.agent.tokenizer;
-			const withdrawnTokens = tokenizer.countTokens([
-				withdrawn.name,
-				withdrawn.description,
-				JSON.stringify(withdrawn.input_schema),
-			]);
 			expect(computeNonMessageTokens(session, tokenizer, session.settings.revision)).toBe(
-				activeRosterFigure(session) + withdrawnTokens,
+				activeRosterFigure(session) + wireToolTokens(tokenizer, withdrawn),
 			);
 		});
 	}, 60_000);
