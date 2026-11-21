@@ -50,7 +50,10 @@ use std::{
 /// An [`is_unsupported`] error when the files cannot share extents
 /// (different filesystems, a filesystem without cloning, an unsupported
 /// platform) or `dst` cannot be swapped for a clone; otherwise the failing
-/// call. On error no clone is left behind and an existing `dst` is unchanged.
+/// call. Where the clone itself fails, the error is the system's own, as GNU
+/// `cp --reflink=always` reports it: across filesystems the cross-device
+/// error, elsewhere what the filesystem answers. On error no clone is left
+/// behind and an existing `dst` is unchanged.
 pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
 	let existing = match fs::metadata(dst) {
 		Ok(metadata) if metadata.is_file() => Some(metadata),
@@ -58,8 +61,6 @@ pub fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
 		Err(err) if err.kind() == io::ErrorKind::NotFound => None,
 		Err(err) => return Err(err),
 	};
-	#[cfg(unix)]
-	check_same_device(src, dst, existing.as_ref())?;
 	match existing {
 		None => {
 			clone_new(src, dst)?;
@@ -121,26 +122,6 @@ pub(crate) use imp::{CLONE_NOFOLLOW, clonefile};
 
 fn unsupported(reason: &str) -> io::Error {
 	io::Error::new(io::ErrorKind::Unsupported, reason)
-}
-
-/// Fails before touching `dst` when it is on another device than `src`, which
-/// no platform can clone across.
-#[cfg(unix)]
-fn check_same_device(src: &Path, dst: &Path, existing: Option<&Metadata>) -> io::Result<()> {
-	use std::os::unix::fs::MetadataExt as _;
-
-	let dst_dev = if let Some(metadata) = existing {
-		metadata.dev()
-	} else {
-		let parent = dst.parent().filter(|parent| !parent.is_empty());
-		// Let the clone itself report a missing directory.
-		let Ok(metadata) = fs::metadata(parent.unwrap_or_else(|| Path::new("."))) else {
-			return Ok(());
-		};
-		metadata.dev()
-	};
-	(fs::metadata(src)?.dev() == dst_dev)
-		.ok_or_else(|| unsupported("source and destination are on different devices"))
 }
 
 /// Replaces the regular file `dst` (described by `metadata`) with a clone of
@@ -212,14 +193,14 @@ fn clone_new(src: &Path, dst: &Path) -> io::Result<()> {
 	clonefile(src, dst, 0)
 }
 
-/// Creates the missing `dst` as a clone of `src`, removing it again on
-/// failure.
+/// Creates the missing `dst` as a clone of `src`, removing it again on any
+/// failure of the clone.
 ///
 /// Returns `src` and `dst` still open, so the tree-cloning backends, which
 /// clone into fresh directories, read the source's metadata and apply it to
 /// the clone through the handles rather than by path, and skip
-/// [`clone_file`]'s existence probe and device check: a clone across devices
-/// fails with an [`is_unsupported`] error anyway.
+/// [`clone_file`]'s existence probe: a clone across devices fails with an
+/// [`is_unsupported`] error anyway.
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub(crate) fn clone_new(src: &Path, dst: &Path) -> io::Result<(File, File)> {
 	let src = File::open(src)?;
@@ -432,5 +413,176 @@ mod imp {
 					| ERROR_ACCESS_DENIED
 			)
 		})
+	}
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+	use std::{
+		fs::{self, File},
+		io,
+		os::unix::fs::MetadataExt as _,
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{clone_file, imp};
+
+	/// A fresh directory under `parent`, removed with its entries on drop.
+	struct Scratch(PathBuf);
+
+	impl Scratch {
+		fn under(parent: &Path) -> io::Result<Self> {
+			static NEXT: AtomicU64 = AtomicU64::new(0);
+			let dir = parent.join(format!(
+				".cow-test-{}-{}",
+				std::process::id(),
+				NEXT.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&dir)?;
+			Ok(Self(dir))
+		}
+	}
+
+	impl Drop for Scratch {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	/// What `FICLONE` itself answers for `src` into a new file in `dir`:
+	/// `None` for a clone, else the error number.
+	fn kernel(src: &Path, dir: &Path) -> Option<i32> {
+		let probe = dir.join("probe");
+		let dst = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&probe)
+			.unwrap();
+		let answer = imp::clone_into(&File::open(src).unwrap(), &dst);
+		drop(dst);
+		fs::remove_file(&probe).unwrap();
+		answer
+			.err()
+			.map(|error| error.raw_os_error().expect("an OS error"))
+	}
+
+	fn names(dir: &Path) -> Vec<String> {
+		let mut names: Vec<_> = fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect();
+		names.sort();
+		names
+	}
+
+	/// Clones `src` to a new `b` and over an existing `c` in `dir`, and
+	/// returns what differs from `want`, `FICLONE`'s own answer: the same
+	/// error number, as GNU `cp --reflink=always` reports it, and after a
+	/// failure no `b`, `c` unchanged and no temporary clone left in `dir`.
+	fn check(case: &str, src: &Path, dir: &Path, want: Option<i32>) -> Vec<String> {
+		let mut failures = Vec::new();
+		let before = names(dir);
+		let new = dir.join("b");
+		let got = clone_file(src, &new)
+			.err()
+			.map(|error| error.raw_os_error());
+		if got != want.map(Some) {
+			failures.push(format!("{case}: a new destination: {got:?}, where FICLONE says {want:?}"));
+		}
+		match want {
+			None => assert_eq!(fs::read(&new).unwrap(), b"A", "{case}: the clone"),
+			Some(_) if new.exists() => failures.push(format!("{case}: the failed clone left b")),
+			Some(_) => {},
+		}
+		let _ = fs::remove_file(&new);
+		let kept = dir.join("c");
+		fs::write(&kept, "C").unwrap();
+		let got = clone_file(src, &kept)
+			.err()
+			.map(|error| error.raw_os_error());
+		if got != want.map(Some) {
+			failures
+				.push(format!("{case}: an existing destination: {got:?}, where FICLONE says {want:?}"));
+		}
+		if want.is_some() && fs::read(&kept).unwrap() != b"C" {
+			failures.push(format!("{case}: the failed clone changed c"));
+		}
+		fs::remove_file(&kept).unwrap();
+		if names(dir) != before {
+			failures.push(format!("{case}: left {:?} behind, where {before:?} was", names(dir)));
+		}
+		failures
+	}
+
+	/// `clone_file` gives the answer `FICLONE` gives for the same two files,
+	/// in one directory of whatever filesystem the test runs on (an
+	/// overlayfs answers `EOPNOTSUPP` where it cannot clone, though a file
+	/// and its directory can show different devices there), on tmpfs, and
+	/// from `/dev/shm` into the temporary directory where they are two
+	/// filesystems (`EXDEV` on Linux; gVisor answers `EOPNOTSUPP` to every
+	/// clone): it decides nothing before the clone, and a failed clone leaves
+	/// nothing behind.
+	#[test]
+	fn clone_file_answers_as_ficlone_does() {
+		let temp = Scratch::under(&std::env::temp_dir()).unwrap();
+		let shm = Scratch::under(Path::new("/dev/shm")).ok();
+		let device = |dir: &Path| fs::metadata(dir).unwrap().dev();
+		let mut cases = vec![("one directory", temp.0.clone(), temp.0.clone())];
+		match &shm {
+			Some(shm) => {
+				cases.push(("one directory on /dev/shm", shm.0.clone(), shm.0.clone()));
+				if device(&shm.0) == device(&temp.0) {
+					eprintln!("skipped: /dev/shm and the temporary directory are one filesystem");
+				} else {
+					cases.push(("two filesystems", shm.0.clone(), temp.0.clone()));
+				}
+			},
+			None => eprintln!("skipped: no /dev/shm to make a directory in"),
+		}
+		let mut failures = Vec::new();
+		for (case, src_dir, dir) in cases {
+			let src = src_dir.join("a");
+			if !src.exists() {
+				fs::write(&src, "A").unwrap();
+			}
+			let want = kernel(&src, &dir);
+			eprintln!(
+				"{case}: FICLONE says {}",
+				want.map_or_else(
+					|| "yes".to_owned(),
+					|code| io::Error::from_raw_os_error(code).to_string()
+				)
+			);
+			failures.extend(check(case, &src, &dir, want));
+		}
+		assert!(failures.is_empty(), "{}", failures.join("\n"));
+	}
+
+	/// A clone refused for its source, here a character device (`EINVAL` on
+	/// Linux: not a regular file; gVisor answers `EOPNOTSUPP`), also leaves no
+	/// destination behind. Making the device needs root (`CAP_MKNOD`);
+	/// elsewhere the test says it skipped.
+	#[test]
+	fn a_clone_refused_for_a_device_leaves_nothing() {
+		let temp = Scratch::under(&std::env::temp_dir()).unwrap();
+		let device = temp.0.join("null");
+		let path = std::ffi::CString::new(device.as_os_str().as_encoded_bytes()).unwrap();
+		// SAFETY: `path` is a NUL-terminated path that outlives the call.
+		if unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(1, 3)) } != 0 {
+			eprintln!("skipped: no character device can be made here: {}", io::Error::last_os_error());
+			return;
+		}
+		let want = kernel(&device, &temp.0);
+		eprintln!(
+			"a character device: FICLONE says {}",
+			want.map_or_else(
+				|| "yes".to_owned(),
+				|code| io::Error::from_raw_os_error(code).to_string()
+			)
+		);
+		assert!(want.is_some(), "FICLONE from a character device: a clone");
+		let failures = check("a character device", &device, &temp.0, want);
+		assert!(failures.is_empty(), "{}", failures.join("\n"));
 	}
 }
