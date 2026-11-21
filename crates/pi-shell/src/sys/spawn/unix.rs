@@ -168,8 +168,8 @@ fn next_wait(mb: &Arc<Mailbox>) -> Option<Wait> {
 pub(super) struct State {
 	/// The process umask when the spawner was created: `posix_spawn` cannot
 	/// set one, so specs asking for another take the fork path.
-	umask:     Option<u32>,
-	groups:    Mutex<Groups>,
+	umask:       Option<u32>,
+	groups:      Mutex<Groups>,
 	/// Optional libc extension: without it `posix_spawn` cannot set the cwd
 	/// (glibc < 2.29), so such libcs take the fork path. The gate also keeps
 	/// `POSIX_SPAWN_SETSID` (glibc 2.26+) off libcs older than that, where
@@ -177,7 +177,11 @@ pub(super) struct State {
 	/// into "the cwd is already right, skip `addchdir`": glibc 2.17–2.25 would
 	/// then reach `posix_spawn` and fail every `Place::Session` spawn.
 	#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
-	add_chdir: Option<posix::AddChdir>,
+	add_chdir:   Option<posix::AddChdir>,
+	/// The record of every abandon escalation, in the order the externals
+	/// were dropped.
+	#[cfg(test)]
+	escalations: Mutex<Vec<Arc<Mutex<Escalation>>>>,
 }
 
 /// Scopes the spawner created, for leak checks.
@@ -263,13 +267,115 @@ impl Scope {
 	}
 
 	/// KILL whatever is left in the scope after the external exited
-	/// (identity-pinned; a `Process` scope has nothing beyond the pid).
-	fn sweep(self) {
-		let _ = match self {
+	/// (identity-pinned; a `Process` scope has nothing beyond the pid): the
+	/// processes signalled, or the error of a scan that read only some.
+	fn sweep(self) -> io::Result<Vec<ProcInfo>> {
+		match self {
 			Self::Group(id) => proc::kill_group(id, Signal::Kill),
 			Self::Session(id) => proc::kill_session(id, Signal::Kill),
-			Self::Process { .. } => return,
+			Self::Process { .. } => Ok(Vec::new()),
+		}
+	}
+
+	/// The live (not zombie) processes of the scope.
+	#[cfg(test)]
+	fn members(self) -> io::Result<Vec<ProcInfo>> {
+		let mut all = match self {
+			Self::Group(id) => proc::group_members(id)?,
+			Self::Session(id) => proc::session_members(id)?,
+			Self::Process { pid } => proc::read(pid)?.into_iter().collect(),
 		};
+		all.retain(|p| p.state != ProcState::Zombie);
+		Ok(all)
+	}
+}
+
+/// What the abandon escalation of one external did, as it recorded it
+/// ([`NativeSpawner::escalations`](super::NativeSpawner::escalations)): what
+/// tests assert on, rather than on how long a process took to go on a busy
+/// host.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct Escalation {
+	/// The scope's id: session, group, or the external's own pid.
+	pub scope:     i32,
+	/// The external still ran when its `ExtProc` was dropped (rather than
+	/// having exited without the engine collecting it).
+	pub running:   bool,
+	/// When the `ExtProc` was dropped.
+	pub abandoned: Instant,
+	/// The KILL step, once it ran.
+	pub fired:     Option<Fired>,
+}
+
+/// The KILL step of an [`Escalation`].
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct Fired {
+	/// The deadline it waited for: when the escalation scheduled KILL.
+	pub due:    Instant,
+	/// When it ran.
+	pub at:     Instant,
+	/// The scope's live processes just before it: what TERM and the grace
+	/// left.
+	pub alive:  Result<Vec<ProcInfo>, String>,
+	/// KILL went to the scope: its leader still ran.
+	pub killed: bool,
+	/// The processes the sweep then sent KILL, once it ran (identity-pinned).
+	pub swept:  Option<Result<Vec<ProcInfo>, String>>,
+}
+
+/// Where an abandon escalation records what it does ([`Escalation`]): in
+/// test builds only, a no-op otherwise.
+#[derive(Clone)]
+struct Journal(#[cfg(test)] Arc<Mutex<Escalation>>);
+
+impl Journal {
+	/// The record of the escalation of `scope`, whose `ExtProc` was dropped
+	/// at `abandoned` while it ran (`running`) or after it exited, opened in
+	/// `state`.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn open(state: &State, scope: Scope, running: bool, abandoned: Instant) -> Self {
+		#[cfg(test)]
+		{
+			let entry =
+				Arc::new(Mutex::new(Escalation { scope: scope.id(), running, abandoned, fired: None }));
+			state.escalations.lock().push(Arc::clone(&entry));
+			Self(entry)
+		}
+		#[cfg(not(test))]
+		{
+			let _ = (state, scope, running, abandoned);
+			Self()
+		}
+	}
+
+	/// The KILL step, due at `due`, runs now on `scope`; `killed` when it
+	/// sends KILL to it. Called before the signal goes out.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn fire(&self, scope: Scope, killed: bool, due: Instant) {
+		#[cfg(test)]
+		{
+			let at = Instant::now();
+			let alive = scope.members().map_err(|e| e.to_string());
+			self.0.lock().fired = Some(Fired { due, at, alive, killed, swept: None });
+		}
+		#[cfg(not(test))]
+		let _ = (self, scope, killed, due);
+	}
+
+	/// The sweep after the KILL step ran, with this outcome.
+	#[cfg_attr(not(test), expect(clippy::missing_const_for_fn, reason = "records in test builds"))]
+	fn swept(&self, outcome: &io::Result<Vec<ProcInfo>>) {
+		#[cfg(test)]
+		if let Some(fired) = &mut self.0.lock().fired {
+			fired.swept = Some(match outcome {
+				Ok(swept) => Ok(swept.clone()),
+				Err(error) => Err(error.to_string()),
+			});
+		}
+		#[cfg(not(test))]
+		let _ = (self, outcome);
 	}
 }
 
@@ -282,7 +388,20 @@ impl State {
 			groups: Mutex::new(Groups { list: Vec::new(), next_sweep: SWEEP }),
 			#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
 			add_chdir: posix::add_chdir(),
+			#[cfg(test)]
+			escalations: Mutex::new(Vec::new()),
 		}
+	}
+
+	/// The record of every abandon escalation so far.
+	#[cfg(test)]
+	pub(super) fn escalations(&self) -> Vec<Escalation> {
+		self
+			.escalations
+			.lock()
+			.iter()
+			.map(|entry| entry.lock().clone())
+			.collect()
 	}
 
 	/// The process umask when the spawner was created.
@@ -1493,14 +1612,14 @@ fn wait_exit(pid: i32, tracker: &Tracker) -> ExitStatus {
 }
 
 /// A pidfd of child `pid` (close-on-exec; readable once it exited); `None`
-/// where the kernel has none (before 5.3) or refuses it.
+/// where the kernel has none (before 5.3) or refuses it. The child is
+/// unreaped, so no failure means it is gone: each leaves it to a waiter.
 #[cfg(target_os = "linux")]
 fn pidfd_open(pid: i32) -> Option<OwnedFd> {
-	// SAFETY: plain syscall without pointer arguments; the result is checked.
-	let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-	let fd = RawFd::try_from(fd).ok().filter(|&fd| fd >= 0)?;
-	// SAFETY: a successful pidfd_open returned a descriptor we own.
-	Some(unsafe { OwnedFd::from_raw_fd(fd) })
+	match crate::sys::proc::pidfd_open(pid, None) {
+		Ok(pi_builtins::proc_sys::Pidfd::Open(fd)) => Some(fd),
+		_ => None,
+	}
 }
 
 /// The exit status of `pid` if it has exited, leaving it unreaped (Linux
@@ -1687,7 +1806,8 @@ impl Drop for UnixProc {
 			self.unpark();
 			return;
 		}
-		match life.abandon(Instant::now(), grace) {
+		let now = Instant::now();
+		match life.abandon(now, grace) {
 			Abandon::Exited => {
 				drop(life);
 				self.shared.state.reap(self.pid);
@@ -1700,7 +1820,8 @@ impl Drop for UnixProc {
 				let _ = self.scope.signal(Signal::Cont);
 				drop(life);
 				self.shared.state.reap(self.pid);
-				escalate_at(&self.tracker, self.scope, sweep_at);
+				let journal = Journal::open(&self.shared.state, self.scope, false, now);
+				escalate_at(&self.tracker, self.scope, sweep_at, journal);
 			},
 			Abandon::Escalate { term, kill_at } => {
 				// Under the lock: the waiter cannot record the exit and reap
@@ -1711,7 +1832,8 @@ impl Drop for UnixProc {
 				// A stopped (paused) group acts on TERM only once continued.
 				let _ = self.scope.signal(Signal::Cont);
 				drop(life);
-				escalate_at(&self.tracker, self.scope, kill_at);
+				let journal = Journal::open(&self.shared.state, self.scope, true, now);
+				escalate_at(&self.tracker, self.scope, kill_at, journal);
 				// Parked: a waiter observes the exit and reaps.
 				#[cfg(target_os = "linux")]
 				self.unpark();
@@ -1722,69 +1844,87 @@ impl Drop for UnixProc {
 
 /// [`escalate`] on a thread of its own; at once when no thread can be
 /// started (KILL now rather than never).
-fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant) {
+fn escalate_at(tracker: &Arc<Tracker>, scope: Scope, kill_at: Instant, journal: Journal) {
 	let waiter = Arc::clone(tracker);
+	let fallback = journal.clone();
 	let started = thread::Builder::new()
 		.name("obash-kill".into())
 		.stack_size(SMALL_STACK)
-		.spawn(move || escalate(&waiter, scope, kill_at));
+		.spawn(move || escalate(&waiter, scope, kill_at, &journal));
 	if started.is_err() {
 		let now = Instant::now();
 		tracker.lock().schedule_kill(now);
-		escalate(tracker, scope, now);
+		escalate(tracker, scope, now, &fallback);
 	}
 }
 
 /// After `kill_at`: KILL the scope if its leader is still running (under the
 /// lock, so it is unreaped), then every straggler left in a group or session
-/// (identity-pinned).
-fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant) {
+/// (identity-pinned). `journal` records each step.
+fn escalate(tracker: &Tracker, scope: Scope, kill_at: Instant, journal: &Journal) {
 	let now = Instant::now();
 	if kill_at > now {
 		thread::sleep(kill_at - now);
 	}
 	{
 		let mut life = tracker.lock();
-		if life.take_kill(Instant::now().max(kill_at)) {
+		let kill = life.take_kill(Instant::now().max(kill_at));
+		journal.fire(scope, kill, kill_at);
+		if kill {
 			let _ = scope.signal(Signal::Kill);
 		}
 	}
-	scope.sweep();
+	journal.swept(&scope.sweep());
 }
 
-fn leftover_procs(shared: &Shared) -> io::Result<Vec<(Scope, ProcInfo)>> {
+/// The processes left in the recorded scopes, and whether the scan read
+/// every process ([`proc::scan`]): one it could not read may be a leftover.
+fn leftover_procs(shared: &Shared) -> (Vec<(Scope, ProcInfo)>, io::Result<()>) {
 	// Keep process-only scopes unreaped until their identities have been
 	// read: otherwise a recycled pid could appear to be our external.
 	let mut groups = shared.state.groups.lock();
 	let me = std::process::id() as i32;
-	let table = proc::list()?;
+	let (table, complete) = proc::scan();
+	// A scope whose members were not read stays while `alive` says so.
 	groups
 		.list
 		.retain(|s| table.iter().any(|p| s.contains(p)) || s.alive());
 	groups.next_sweep = groups.list.len() + SWEEP;
-	Ok(table
+	let left = table
 		.into_iter()
 		.filter(|p| p.pid != me && p.state != ProcState::Zombie)
 		.filter_map(|p| groups.list.iter().find(|g| g.contains(&p)).map(|g| (*g, p)))
-		.collect())
+		.collect();
+	(left, complete)
 }
 
 fn leftover((s, p): &(Scope, ProcInfo)) -> Leftover {
 	Leftover { pid: p.pid as u32, group: s.id() as u32, name: p.name.clone() }
 }
 
+/// The leftovers; an error when the scan could not read every process,
+/// since an unread one may be left over.
 pub(super) fn leftovers(shared: &Shared) -> io::Result<Vec<Leftover>> {
-	Ok(leftover_procs(shared)?.iter().map(leftover).collect())
+	let (left, complete) = leftover_procs(shared);
+	complete?;
+	Ok(left.iter().map(leftover).collect())
 }
 
+/// Sends KILL to the leftovers the scan read, then reports whether it read
+/// and signalled every process: one that cannot be signalled does not keep
+/// the rest from being killed.
 pub(super) fn kill_leftovers(shared: &Shared) -> io::Result<Vec<Leftover>> {
+	let (left, complete) = leftover_procs(shared);
 	let mut killed = Vec::new();
-	for entry in leftover_procs(shared)? {
-		if proc::signal_pinned(&entry.1, Signal::Kill)? {
-			killed.push(leftover(&entry));
+	let mut signalled = Ok(());
+	for entry in left {
+		match proc::signal_pinned(&entry.1, Signal::Kill) {
+			Ok(true) => killed.push(leftover(&entry)),
+			Ok(false) => {},
+			Err(error) => signalled = signalled.and(Err(error)),
 		}
 	}
-	Ok(killed)
+	complete.and(signalled).map(|()| killed)
 }
 
 #[cfg(test)]

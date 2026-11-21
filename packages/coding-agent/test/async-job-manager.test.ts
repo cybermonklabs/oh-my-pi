@@ -3,6 +3,7 @@ import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
+import { plainTurnAbortReason } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -429,7 +430,7 @@ describe("AsyncJobManager", () => {
 			{ ownerId: "owner" },
 		);
 
-		const reap = await manager.cancelAndReapOwnerJobs("owner", Date.now());
+		const reap = await manager.cancelAndReapOwnerJobs("owner", Date.now(), plainTurnAbortReason("stop"));
 
 		expect(reap.settled).toBe(false);
 		expect(reap.pendingJobIds).toEqual([jobId]);
@@ -457,7 +458,7 @@ describe("AsyncJobManager", () => {
 			if (kind === "single") manager.cancel(jobId);
 			else manager.cancelAll({ ownerId: "owner" });
 			vi.advanceTimersByTime(50);
-			const reap = await manager.cancelAndReapOwnerJobs("owner", Date.now());
+			const reap = await manager.cancelAndReapOwnerJobs("owner", Date.now(), plainTurnAbortReason("stop"));
 			expect(reap.settled).toBe(false);
 			expect(reap.pendingJobIds).toEqual([jobId]);
 			release.resolve();

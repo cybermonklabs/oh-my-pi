@@ -10,7 +10,7 @@ use std::{
 	io,
 	path::{Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -522,6 +522,9 @@ struct Shared {
 	filter:    PathFilter,
 	opts:      GrepOptions,
 	halt:      Arc<AtomicBool>,
+	/// The budgeted pass's walk root, open once its traversal has listed it;
+	/// candidates open below it.
+	root_dir:  OnceLock<Arc<Dir>>,
 }
 
 /// A search worker's state, kept across the files it searches.
@@ -640,6 +643,7 @@ pub async fn grep(fs: &Fs, root: &Path, mut opts: GrepOptions) -> Result<GrepRes
 		filter,
 		opts,
 		halt,
+		root_dir: OnceLock::new(),
 	});
 	if file_type == Some(FileType::File) {
 		// Its own task: a streamed native file is searched by a synchronous
@@ -685,13 +689,19 @@ pub async fn grep(fs: &Fs, root: &Path, mut opts: GrepOptions) -> Result<GrepRes
 	}
 }
 
-/// Opens the file at walk-relative `rel` for a budgeted pass, by path.
+/// Opens the file at walk-relative `rel` for a budgeted pass below the walk
+/// root's handle, following no symlink on the way: grep never follows links
+/// (`follow_links: false` above), so it reads only files below the root.
 async fn open_candidate(
 	shared: &Shared,
 	session: &mut Session,
 	rel: &[u8],
 ) -> io::Result<(File, FileInfo)> {
-	session.open_file(&shared.fs.join(&shared.root, rel)).await
+	let root = shared
+		.root_dir
+		.get()
+		.ok_or_else(|| io::Error::other("the walk root is not open"))?;
+	session.open_file_beneath(root, rel).await
 }
 
 /// A file the unbounded walk found worth searching.
@@ -786,8 +796,9 @@ impl walk::Sink for SearchSink {
 }
 
 /// Searches one directory's candidates on the worker that listed it: opened
-/// relative to `dir` while the walk holds the listed directory, otherwise by
-/// absolute path.
+/// relative to `dir` while the walk holds the listed directory, otherwise
+/// below the walk root's handle ([`Worker::open_file`]), never following a
+/// symlink (grep never follows links).
 async fn search_directory<M: Matcher + Sync>(
 	search: &Search<'_, M>,
 	shared: &Shared,
@@ -803,8 +814,8 @@ async fn search_directory<M: Matcher + Sync>(
 			break;
 		}
 		let opened = match dir {
-			Some(dir) => session.open_file_at(dir, candidate.name()).await,
-			None => session.open_file(worker.abs_rel(&candidate.rel)).await,
+			Some(dir) => session.open_file_at(dir, candidate.name(), false).await,
+			None => worker.open_file(session, &candidate.rel).await,
 		};
 		let Ok((mut file, info)) = opened else {
 			continue;
@@ -976,7 +987,16 @@ fn candidates(
 				};
 				match step {
 					Step::Prune => tree.skip_dir(),
-					Step::Candidate(rel) => return Some((rel, (tree, shared, failure, abs_root))),
+					Step::Candidate(rel) => {
+						// Candidates exist only once the root is open; publish it
+						// for the workers before the first one leaves.
+						if shared.root_dir.get().is_none()
+							&& let Some(root) = tree.root_dir()
+						{
+							let _ = shared.root_dir.set(Arc::clone(root));
+						}
+						return Some((rel, (tree, shared, failure, abs_root)));
+					},
 					Step::Other => {},
 				}
 			}

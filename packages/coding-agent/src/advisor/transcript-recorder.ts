@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { StoreMaskingBinding } from "../secrets/session-store-mask";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
 import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
@@ -206,6 +207,8 @@ export class AdvisorTranscriptRecorder {
 	#windowFile: string | undefined;
 	/** Storage the transcript is written to; `undefined` opens it in the default session storage. */
 	readonly #storage: SessionStorage | undefined;
+	/** Store masking binding every transcript manager the recorder opens is bound with ({@link setStoreMasking}). */
+	#storeMasking: StoreMaskingBinding | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -232,6 +235,14 @@ export class AdvisorTranscriptRecorder {
 					() => {},
 				)
 			: Promise.resolve();
+	}
+
+	/**
+	 * Bind the owning session manager's store masking binding (see `SessionManager.setStoreMasking`)
+	 * to every transcript manager the recorder opens; call it before the first record.
+	 */
+	setStoreMasking(binding: StoreMaskingBinding | undefined): void {
+		this.#storeMasking = binding;
 	}
 
 	/**
@@ -296,6 +307,7 @@ export class AdvisorTranscriptRecorder {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
+				if (this.#storeMasking) this.#manager.setStoreMasking(this.#storeMasking);
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

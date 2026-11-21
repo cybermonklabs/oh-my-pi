@@ -74,6 +74,7 @@ import {
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
 import { toolReadsSkillUris } from "../system-prompt";
+import { plainTurnAbortReason } from "./exit-diagnostics";
 
 import type { CustomMessage } from "./messages";
 import { SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
@@ -536,7 +537,7 @@ export class SessionTools {
 		isIdle: () => !this.#host.isStreaming(),
 		hasQueuedMessages: () => this.#host.queuedMessageCount() > 0,
 		abort: () => {
-			this.#host.agent.abort();
+			this.#host.agent.abort(plainTurnAbortReason("stop"));
 		},
 		settings: this.#host.settings,
 		localProtocolOptions: this.#host.localProtocolOptions(),

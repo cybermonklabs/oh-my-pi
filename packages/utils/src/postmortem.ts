@@ -32,6 +32,8 @@ interface CleanupRegistration {
 	deadlineMs: number | undefined;
 	/** Printed to stderr when exit waits on this callback alone; see {@link CleanupRegistrationOptions.waitMessage}. */
 	waitMessage: string | undefined;
+	/** Started only once every other callback of the pass has settled; see {@link CleanupRegistrationOptions.afterOthers}. */
+	afterOthers: boolean;
 	cancelled: boolean;
 	lastPass: number;
 }
@@ -59,6 +61,10 @@ let activeCleanupKeepAlive = false;
 // Promises of callbacks invoked late (registered while a pass runs), joined by
 // the active pass before it settles so `cleanup()`/signal exits await them.
 let activeLatePromises: Promise<void>[] | undefined;
+// The late callbacks of the running pass that are not `afterOthers`: its `afterOthers` callbacks wait for them too.
+let activeLateOthers: Promise<void>[] | undefined;
+// Settles once every callback of the running pass that is not `afterOthers` has settled, late ones included.
+let activeOthersSettled: Promise<void> | undefined;
 // Deadline of the running pass, so callbacks invoked late can extend it too.
 let activePassDeadline: CleanupPassDeadline | undefined;
 const CLEANUP_DEADLINE_MS = 10_000;
@@ -192,9 +198,15 @@ function runCleanup(reason: Reason, keepAlive = false): Promise<void> {
 	activeCleanupReason = reason;
 	activeCleanupKeepAlive = keepAlive;
 	const late: Promise<void>[] = [];
+	const lateOthers: Promise<void>[] = [];
 	activeLatePromises = late;
+	activeLateOthers = lateOthers;
 	const settle = (): void => {
 		if (activeLatePromises === late) activeLatePromises = undefined;
+		if (activeLateOthers === lateOthers) {
+			activeLateOthers = undefined;
+			activeOthersSettled = undefined;
+		}
 		if (cleanupPass !== pass) return;
 		cleanupStage = keepAlive ? "idle" : "complete";
 		if (keepAlive) {
@@ -260,16 +272,35 @@ function runCleanup(reason: Reason, keepAlive = false): Promise<void> {
 	// Snapshot the pass. Registrations added while a keep-alive cleanup runs are
 	// invoked by register() when appropriate and remain active for later passes.
 	const snapshot = callbackList.toReversed();
-	const promises = snapshot.map(registration => {
-		return Promise.try(() => {
+	const invoke = (registration: CleanupRegistration): Promise<void> =>
+		Promise.try(() => {
 			const pending = invokeCleanup(registration, reason, keepAlive, pass);
 			if (pending && registration.deadlineMs !== undefined) {
 				passDeadline.extend(pending, registration.deadlineMs, registration.waitMessage);
 			}
 			return pending;
 		});
-	});
-	void Promise.allSettled(promises.filter((_, index) => snapshot[index]?.deadlineMs === undefined)).then(() => {
+	const others = snapshot.filter(registration => !registration.afterOthers);
+	const lastOnes = snapshot.filter(registration => registration.afterOthers);
+	// `afterOthers` callbacks start once every other callback of this pass has
+	// settled, late ones included, and not at all once the pass has ended. The
+	// promise is published before the others run, so an `afterOthers` callback
+	// one of them registers waits for them too.
+	const nonLast = Promise.withResolvers<void>();
+	activeOthersSettled = nonLast.promise;
+	const otherPromises = others.map(invoke);
+	void (async () => {
+		await Promise.allSettled(otherPromises);
+		while (lateOthers.length > 0) await Promise.allSettled(lateOthers.splice(0));
+		nonLast.resolve();
+	})();
+	const lastPromises = lastOnes.map(registration =>
+		nonLast.promise.then(() => (passDone ? undefined : invoke(registration))),
+	);
+	const promises = [...otherPromises, ...lastPromises];
+	// A hold's wait line is printed once every other callback without a `deadlineMs` of its own has settled.
+	// `afterOthers` callbacks are not among them: they start only once the hold itself has settled.
+	void Promise.allSettled(otherPromises.filter((_, index) => others[index]?.deadlineMs === undefined)).then(() => {
 		othersSettled = true;
 		deadlineTimers.push(setTimeout(announce, 0));
 	});
@@ -862,9 +893,12 @@ export interface CleanupRegistrationOptions {
 	 */
 	exitOnly?: boolean;
 	/**
-	 * How long a pass waits for this callback, when that is longer than the
-	 * default 10 s cleanup deadline. It extends the pass only while the callback
-	 * is still pending: one that settles early ends its hold at once.
+	 * How long a pass waits for this callback once it starts, when that is
+	 * longer than what is left of the default 10 s cleanup deadline. It extends
+	 * the pass only while the callback is still pending: one that settles early
+	 * ends its hold at once. An `afterOthers` callback starts late, so its bound
+	 * counts from its own start, and can run past the 10 s deadline when another
+	 * callback's `deadlineMs` held the pass open that long.
 	 */
 	deadlineMs?: number;
 	/**
@@ -872,9 +906,23 @@ export interface CleanupRegistrationOptions {
 	 * appended, if exit is still waiting on this callback once every other
 	 * callback has finished (a terminal owner has then released the screen), or
 	 * at the default 10 s deadline when another callback is still running.
-	 * Nothing is printed when the callback finishes first.
+	 * `afterOthers` callbacks do not count: they wait for this one. Nothing is
+	 * printed when the callback finishes first.
 	 */
 	waitMessage?: string;
+	/**
+	 * Start this callback only once every other callback of the same pass has
+	 * settled, resolved or rejected, late registrations included, still bounded
+	 * by the pass's deadline: a callback that releases what the others would
+	 * have released (a lease the session's own teardown gives back), so it finds
+	 * only what they left. A pass that ends at its deadline before the others
+	 * settle does not start it. Without a `deadlineMs` of its own it gets no time
+	 * past the 10 s deadline: when another callback's `deadlineMs` held the pass
+	 * open past it, it starts once that callback settles and the pass ends at
+	 * once. With a `deadlineMs` of its own, the pass waits for it that long after
+	 * the others settle. `afterOthers` callbacks start together.
+	 */
+	afterOthers?: boolean;
 }
 
 /**
@@ -889,6 +937,11 @@ export interface CleanupRegistrationOptions {
  * normal callbacks also run immediately for the current pass. Registrations
  * made during a real exit run immediately.
  *
+ * An `afterOthers` callback starts once the others of its pass have settled
+ * and gets no time past the pass's 10 s deadline unless it has a `deadlineMs`
+ * of its own: one that must finish after a peer's own `deadlineMs` held the
+ * pass open that long (a release at exit) sets its bound.
+ *
  * Returns a function that permanently cancels the registration.
  */
 export function register(
@@ -902,6 +955,7 @@ export function register(
 		exitOnly: options.exitOnly ?? false,
 		deadlineMs: options.deadlineMs,
 		waitMessage: options.waitMessage,
+		afterOthers: options.afterOthers ?? false,
 		cancelled: false,
 		lastPass: 0,
 	};
@@ -912,7 +966,14 @@ export function register(
 	};
 	const invokeLate = (reason: Reason, keepAlive: boolean): void => {
 		try {
-			const pending = invokeCleanup(registration, reason, keepAlive, cleanupPass);
+			const pass = cleanupPass;
+			const run = (): Promise<void> | void => invokeCleanup(registration, reason, keepAlive, pass);
+			// An `afterOthers` callback registered while a pass runs waits for that pass's others too,
+			// and does not start once the pass has ended.
+			const othersSettled = registration.afterOthers ? activeOthersSettled : undefined;
+			const pending = othersSettled
+				? othersSettled.then(() => (cleanupPass === pass && cleanupStage === "running" ? run() : undefined))
+				: run();
 			if (!pending) return;
 			const tracked = pending.catch(error => {
 				const err = toError(error);
@@ -921,6 +982,7 @@ export function register(
 			// Join the active pass so cleanup()/signal exits await it; after a
 			// completed exit pass there is nothing left to join.
 			activeLatePromises?.push(tracked);
+			if (!registration.afterOthers) activeLateOthers?.push(tracked);
 			if (registration.deadlineMs !== undefined) {
 				activePassDeadline?.extend(tracked, registration.deadlineMs, registration.waitMessage);
 			}
@@ -1005,4 +1067,27 @@ async function runQuit(code: number, exitMode: "guarded" | "native", options: Qu
  */
 export function quit(code: number = 0, options: QuitOptions = {}): Promise<void> {
 	return runQuit(code, "guarded", options);
+}
+
+/** Controls how {@link exitAfterCleanup} ends the process once the cleanup has run. */
+export interface ExitAfterCleanupOptions extends QuitOptions {
+	/**
+	 * `"guarded"` (the default) ends through the current `process.exit`. `"native"` ends through {@link exitProcess},
+	 * past a temporary process-exit guard (the extension-load guard, #11789), as the signal handlers do after their
+	 * cleanup: for a host-owned exit that can run while such a guard is open, such as the startup composer's keys.
+	 */
+	exit?: "guarded" | "native";
+}
+
+/**
+ * Runs all cleanup callbacks, then exits with `code`, as {@link quit} does, for a caller that must not go on: it does
+ * not return. Use it instead of `process.exit` or {@link exitProcess} wherever an asynchronous cleanup callback must
+ * finish before the process ends (a SQL session store's lease release): `process.exit` starts the callbacks without
+ * waiting for them, and {@link exitProcess} runs none. For the main thread; in a worker it ends the process, as
+ * `process.exit` does there.
+ */
+export async function exitAfterCleanup(code: number, options: ExitAfterCleanupOptions = {}): Promise<never> {
+	// On the main thread runQuit ends the process; in a worker it returns after the cleanup.
+	await runQuit(code, options.exit ?? "guarded", options);
+	return process.exit(code);
 }

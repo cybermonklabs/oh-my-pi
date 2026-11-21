@@ -1526,7 +1526,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
-				autoBgManager.cancel(job.jobId);
+				// The command's job aborts with the call's own reason, as an eval cell's does; a shell
+				// starts no subagent that reads it.
+				autoBgManager.cancel(job.jobId, undefined, signal?.reason);
 				autoBgManager.releaseForegroundJob(job.jobId);
 				throw new ToolAbortError(job.getLatestText() || "Command aborted");
 			}

@@ -19,7 +19,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, bareAgentId, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, agentAncestors, bareAgentId, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
@@ -240,34 +240,27 @@ export function createPersistedSubagentReviverFactory(
 			return undefined;
 		}
 		// taskDepth drives real capability gating (task-spawn allowance, memory
-		// startup, …); derive it from the persisted parent chain rather than
-		// assuming a fixed level. The chain's root is either the literal
-		// MAIN_AGENT_ID or (ACP) an unregistered top-level session id such as
-		// `acp:<session-id>` — ACP hosts several concurrent top-level sessions,
-		// none of which is ever itself an AgentRef (only subagents/advisors are
-		// registered) — so neither root is itself a subagent generation. Stop at
-		// the owning session's own root (MAIN_AGENT_ID, this ctx's own agent id,
-		// or any id with no registered ref at all) rather than only the literal
-		// "Main" id, or an ACP-rooted direct child is counted at depth 2 instead
-		// of 1 and every subsequent child spawn is rejected by the default
-		// `task.maxRecursionDepth`.
+		// startup, …); derive it from the recorded parent chain, which keeps a
+		// parent that ended since, rather than assuming a fixed level. The chain's
+		// root is either the literal MAIN_AGENT_ID or (ACP) an unregistered
+		// top-level session id such as `acp:<session-id>` — ACP hosts several
+		// concurrent top-level sessions, none of which is ever itself an AgentRef
+		// (only subagents/advisors are registered) — so neither root is itself a
+		// subagent generation. Stop at the owning session's own root (MAIN_AGENT_ID
+		// or this ctx's own agent id) rather than only the literal "Main" id, or an
+		// ACP-rooted direct child is counted at depth 2 instead of 1 and every
+		// subsequent child spawn is rejected by the default `task.maxRecursionDepth`.
+		// A non-root ancestor with no registered ref is a real generation: one that
+		// ended, or one the persisted scan chose not to register (an incomplete
+		// mid-spawn stub it recursed past without adding — see
+		// registerPersistedSubagentsFromDir's `metadata.incomplete` branch).
+		// agentAncestors lists it, so it counts, or a descendant beneath that gap
+		// undercounts its true depth and can out-spawn `task.maxRecursionDepth`.
 		const rootAgentId = ctx.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		let taskDepth = 1;
-		let parentId = ref.parentId;
-		const seen = new Set<string>();
-		while (parentId && parentId !== MAIN_AGENT_ID && parentId !== rootAgentId && !seen.has(parentId)) {
-			seen.add(parentId);
+		for (const ancestorId of agentAncestors(registry, ref)) {
+			if (ancestorId === MAIN_AGENT_ID || ancestorId === rootAgentId) break;
 			taskDepth++;
-			const parentRef = registry.get(parentId);
-			// An unresolved non-root parentId is a real ancestor generation the
-			// persisted scan chose not to register (an incomplete mid-spawn stub
-			// it recursed past without adding — see
-			// registerPersistedSubagentsFromDir's `metadata.incomplete` branch),
-			// not the family root: count it before giving up, or a descendant
-			// beneath that gap undercounts its true depth and can out-spawn
-			// `task.maxRecursionDepth`.
-			if (!parentRef) break;
-			parentId = parentRef.parentId;
 		}
 		return async expectedRef => {
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.
@@ -647,6 +640,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		// Anchor artifacts to the revived ref's own dir (its parent's children
 		// dir), not the live root session's, matching the spawn callers (#11563).
 		artifactsDir: path.dirname(sessionFile),
+		storeMaskCwd: spec.settings.getCwd(),
 	});
 	return session;
 }

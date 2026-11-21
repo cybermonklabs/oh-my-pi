@@ -22,6 +22,9 @@ packages/natives/native/.build/
 packages/snapcompact/research/results/
 # Host-built addons: every image that needs one compiles it from source.
 **/*.node
+# A host build's record of the Rust sources it compiled (`<addon>.sources.json`):
+# a build output like the addon, and in the context it would change the seed key.
+**/*.node.sources.json
 
 # Per-host scratch the pi codebase uses for parallel agents / worktrees.
 .fallow/

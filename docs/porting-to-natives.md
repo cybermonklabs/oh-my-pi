@@ -125,9 +125,9 @@ Confirm the export is present and `__piNativesBuildVersion()` reports the packag
 
 ### Stale variant or cache wins
 
-x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled and staged Windows loads can also win from `<getNativesDir()>/<version>` before package paths. The root honors `PI_NATIVES_DIR` first (trimmed, `~`-expanded, and normalized; empty or relative values are ignored), then `$XDG_DATA_HOME/omp/natives` when `$XDG_DATA_HOME/omp` exists, otherwise `~/.omp/natives`.
+x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled loads can also win from their build's `<getNativesDir()>/<version>-<digest prefix>`, and staged Windows loads from their leaf package's `<getNativesDir()>/<version>-<digest prefix>`, before package paths. `getNativesDir()` (`@oh-my-pi/pi-natives/natives-dir`, shared with pi-utils) names that directory; [The natives directory](natives-addon-loader-runtime.md#the-natives-directory) has the rule.
 
-Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. The loader best-effort deletes older `major.minor.patch` cache directories after a successful load only when their mtime is at least ten minutes old; it preserves the current-version directory.
+Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. After a successful load the loader best-effort deletes the cache directories (`<major.minor.patch>` and `<major.minor.patch>-<digest prefix>`) no omp process has used for a day; it preserves its own directory.
 
 ### Declarations changed but shipping addon did not
 

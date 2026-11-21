@@ -512,7 +512,10 @@ export declare class PowerAssertion {
 
 /** Stable process reference. */
 export declare class Process {
-  /** Open a stable process reference from a PID. */
+  /**
+   * Open a stable process reference from a PID: `null` when the process is
+   * gone, or cannot be pinned (no descriptor left, `pidfd_open` blocked).
+   */
   static fromPid(pid: number): Process | null
   /** Open stable process references whose executable path matches exactly. */
   static fromPath(path: string): Array<Process>
@@ -520,22 +523,42 @@ export declare class Process {
   get pid(): number
   /** Parent process id for this process, when available. */
   get ppid(): number | null
+  /**
+   * The kernel's start mark of this process, read when it was pinned: on
+   * Linux the boot id and the start in clock ticks since that boot
+   * (`/proc/<pid>/stat` field 22); on macOS and Windows the start time the
+   * kernel recorded. A pid recorded with its mark names that process
+   * alone (one that reused the pid has another mark), whatever the wall
+   * clock did since. `null` when the boot id cannot be read (no descriptor
+   * left, a sandbox that hides it): no mark is known, which proves nothing
+   * about the process.
+   */
+  get startMark(): string | null
   /** Launch arguments for this process. */
   args(): Array<string>
   /**
-   * Send `signal` to this process and its descendants, children first.
+   * Send `signal` to this process and its descendants, children first, and
+   * to its process group when it leads one; returns how many processes were
+   * signalled.
    *
    * On Linux and macOS the signal is forwarded as-is. On Windows there is no
    * signal abstraction, so the `signal` argument is ignored and the entire
    * tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
    * hard-kill signal.
+   *
+   * Throws when the walk could not read every process of the tree (no
+   * descriptor left, say): everything it read, and the process group, were
+   * signalled, but a descendant outside the group may not have been.
    */
   killTree(signal?: number | undefined | null): number
   /**
    * Gracefully terminate this process and its descendants.
    *
    * By default this waits 1000ms after polite termination before
-   * hard-killing. Pass `graceful_ms < 0` to skip the graceful phase.
+   * hard-killing. Pass `graceful_ms < 0` to skip the graceful phase. Rejects
+   * when the hard wave's walk could not read every process of the tree,
+   * once everything it read (and the process group the root leads) was
+   * killed.
    */
   terminate(options?: ProcessTerminateOptions | undefined | null): Promise<boolean>
   /**
@@ -546,7 +569,11 @@ export declare class Process {
   waitForExit(options?: ProcessWaitOptions | undefined | null): Promise<boolean>
   /** Process group id for this process, when supported by the platform. */
   groupId(): number | null
-  /** Direct children of this process as stable process references. */
+  /**
+   * Direct children of this process as stable process references. Throws
+   * when a candidate could not be read (no descriptor left, say): a child
+   * may be missing from what was found.
+   */
   children(): Array<Process>
   /** Current status of this process reference. */
   status(): ProcessStatus
@@ -2246,6 +2273,14 @@ export interface GlobMatch {
   mtime?: number
   /** File size in bytes for regular files. */
   size?: number
+  /**
+   * `true` when the listing shows a symbolic link at `path`, reported as
+   * `Symlink` or, under a `File` or `Dir` filter, as its target (absent
+   * otherwise). Pass it as `readFileBeneath`'s `followSymlink` to read
+   * what the walk listed; the link is then followed wherever its chain
+   * points at read time.
+   */
+  symlink?: boolean
 }
 
 /** Input options for `glob`, including traversal, filtering, and cancellation. */
@@ -3397,6 +3432,81 @@ export interface PtyStartOptions {
 export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxHeightPx: number, scale?: number | undefined | null, cell?: SvgCell | undefined | null): Promise<Uint8Array>
 
 /**
+ * Read a file a `glob` listed, below the root the glob walked, without
+ * following a symlink the walk did not follow.
+ *
+ * Opens `root` by path as the walk opened it, then the file below that
+ * handle: no symlink on the way is followed (a directory swapped for a
+ * symlink since the listing is refused), and a symlink at the final name
+ * is followed only with `followSymlink`, then wherever its chain points at
+ * read time (not confined below `root`). One open serves the whole read:
+ * the size check against `maxBytes`, the binary probe, then the rest of the
+ * bytes, each byte read once. The read stops at the size the file had when
+ * it was opened (growth after the open is not read); a file that reports
+ * size 0, such as a pseudo file, is read to its end or to `maxBytes`,
+ * without the binary probe.
+ *
+ * # Errors
+ * Rejects when `root` is not a directory, `path` is not walk-relative, a
+ * symlink is refused (`ELOOP` or `ENOTDIR` on Unix,
+ * `ERROR_STOPPED_ON_SYMLINK` on Windows), the file is a directory or a
+ * special file, the file's size is one the allocator refuses (beyond the
+ * address space, or above memory where overcommit is limited) and no
+ * `maxBytes` skips it first (`out of memory`), or the open or a read fails.
+ */
+export declare function readFileBeneath(options: ReadFileBeneathOptions): Promise<ReadFileBeneathResult>
+
+/** Input options for `readFileBeneath`. */
+export interface ReadFileBeneathOptions {
+  /**
+   * Directory the file is below: the `path` a `glob` walked. It is
+   * resolved as the walk resolves it, so a symlink there is followed.
+   */
+  root: string
+  /**
+   * The file's walk-relative path below `root` (`GlobMatch.path`):
+   * `/`-separated, no part empty, `.`, or `..`.
+   */
+  path: string
+  /**
+   * Follow a symlink at the final name, as the walk listed it (pass
+   * `GlobMatch.symlink`): the link, and any link its target names, is
+   * followed wherever it points when the file is opened, inside `root` or
+   * out of it. A symlink on the way to the final name is always refused;
+   * without this, one at the final name is refused too.
+   */
+  followSymlink?: boolean
+  /**
+   * Leave a file larger than this many bytes unread (`skip: "large"`); a
+   * file that reports size 0, such as a pseudo file, is read up to this
+   * many bytes instead. 0 or absent: no limit.
+   */
+  maxBytes?: number
+  /**
+   * Leave a file unread (`skip: "binary"`) when a NUL byte is in its
+   * first this many bytes; a file that reports size 0 is not probed. 0 or
+   * absent: no probe.
+   */
+  binaryProbeBytes?: number
+  /**
+   * Read only the file's first this many bytes (the probe looks no
+   * further); a file larger than `maxBytes` is still left unread. 0 or
+   * absent: the whole file.
+   */
+  prefixBytes?: number
+}
+
+/** Result of `readFileBeneath`. */
+export interface ReadFileBeneathResult {
+  /** Size of the opened file in bytes. */
+  size: number
+  /** Why the file was left unread; absent when `content` holds it. */
+  skip?: ReadSkip
+  /** The file's bytes; absent when `skip` is set. */
+  content?: Uint8Array
+}
+
+/**
  * Read an image from the system clipboard.
  *
  * Returns `Ok(None)` when no image data is available.
@@ -3405,6 +3515,14 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+/** Why `readFileBeneath` left a file unread. */
+export declare enum ReadSkip {
+  /** The file is larger than `maxBytes`. */
+  Large = 'large',
+  /** The first `binaryProbeBytes` bytes hold a NUL byte. */
+  Binary = 'binary'
+}
 
 /**
  * Read plain text from the system clipboard.

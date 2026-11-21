@@ -407,6 +407,9 @@
 	"packages/coding-agent/src/session/session-index.ts": [
 		"PI_CODING_AGENT_DIR"
 	],
+	"packages/coding-agent/src/session/session-manager.ts": [
+		"OMP_SESSION_EXCLUSIVE"
+	],
 	"packages/coding-agent/src/session/settings.ts": [
 		"PI_TINY_DEVICE",
 		"PI_TINY_DTYPE"
@@ -756,8 +759,11 @@
 		"OMP_JUDGMENT_CACHE_DB",
 		"OMP_WORKTREE_DIR",
 		"PI_CONFIG_DIR",
-		"PI_NATIVES_DIR",
 		"PWD"
+	],
+	"packages/utils/src/env.ts": [
+		"PI_NATIVES_DIR",
+		"PI_TEST_RUNTIME"
 	],
 	"packages/utils/src/logger.ts": [
 		"OMP_LOG_LEVEL"
@@ -775,9 +781,6 @@
 	],
 	"packages/utils/src/ptree.ts": [
 		"BUN_BE_BUN"
-	],
-	"packages/utils/src/test-runtime.ts": [
-		"PI_TEST_RUNTIME"
 	],
 	"packages/utils/src/which.ts": [
 		"DEVELOPER_DIR"

@@ -1133,8 +1133,8 @@ async function registerPersistedSubagentsFromDir(
 				(existing.status === "idle" || existing.status === "aborted")
 			) {
 				const [sourceHeaderId, copiedHeaderId] = await Promise.all([
-					readSessionHeaderId(existing.sessionFile),
-					readSessionHeaderId(sessionFile),
+					readSessionHeaderId(existing.sessionFile, storage),
+					readSessionHeaderId(sessionFile, storage),
 				]);
 				if (!shouldContinue()) return;
 				if (sourceHeaderId !== undefined && sourceHeaderId === copiedHeaderId && registry.get(id) === existing) {

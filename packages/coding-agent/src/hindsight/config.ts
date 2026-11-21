@@ -66,8 +66,8 @@ export interface HindsightConfig {
 	recallMaxQueryChars: number;
 	recallPromptPreamble: string;
 	/**
-	 * First wait (ms) after a failed automatic recall before the next one; each further
-	 * consecutive failure doubles it, up to 16 times. `0` or less never waits.
+	 * First pause (ms) after a failed automatic recall. Each further failure doubles it, up to
+	 * 30 minutes, or up to this value when it is larger. `0` or less turns it off.
 	 */
 	recallCooldownMs: number;
 

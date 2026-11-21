@@ -751,10 +751,13 @@ export interface StreamOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/**
 	 * Session a side request branches from, so it can read the parent's cached
-	 * prefix. Providers that keep per-conversation request controls (OpenAI
+	 * prefix. The request presents this id wherever a conversation id routes it
+	 * to a prompt cache: session headers, Claude `metadata.user_id`, and the
+	 * prompt-cache key and OpenRouter `session_id` when no explicit key is set.
+	 * Its own `sessionId` keeps only its provider state and per-request ids.
+	 * Providers that keep per-conversation request controls (OpenAI
 	 * `configuration_update` effort baselines) plan the request against a copy
-	 * of that session's controls, never changing the parent's state; the Codex
-	 * backend also routes it with the parent's cache affinity (session headers).
+	 * of that session's controls, never changing the parent's state.
 	 */
 	parentSessionId?: string;
 	/**
@@ -1515,6 +1518,12 @@ export interface AssistantMessage {
 	errorStatus?: number;
 	/** Structured machine-readable error classifier; see `utils/error-id.ts` for bit layout and helpers. */
 	errorId?: number;
+	/**
+	 * The turn failed because no credential could give a key when the request was
+	 * made (a thrown `CredentialUnavailableError`): nothing was sent to the
+	 * provider, so a resume can go on with the turn.
+	 */
+	credentialUnavailable?: true;
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection

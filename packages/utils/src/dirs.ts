@@ -17,6 +17,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { __resetNativesDirForTests, getNativesDir, resolveAbsoluteDir } from "@oh-my-pi/pi-natives/natives-dir";
 import { expandWindowsLongPath } from "@oh-my-pi/pi-natives/path";
 import { engines, version } from "../package.json" with { type: "json" };
 import { isEnoent, isEnotdir } from "./fs-error";
@@ -613,11 +614,13 @@ export function __resetProfileSnapshotForTests(): void {
  * Test-only: rebuild profile + directory state from the current process env.
  * Production code keeps the module-load profile stable; tests that mutate
  * `setAgentDir`/`setProfile` need an exact restore point after they put env vars
- * back.
+ * back. The natives directory, fixed for the process at its first use, resolves
+ * again too.
  */
 export function __resetDirsFromEnvForTests(): void {
 	activeProfile = readProfileFromEnvSafe();
 	__resetProfileSnapshotForTests();
+	__resetNativesDirForTests();
 	refreshDirsFromEnv();
 }
 
@@ -758,26 +761,6 @@ export function getPluginsLockfile(home?: string): string {
 /** Get the remote mount directory (~/.omp/remote). */
 export function getRemoteDir(): string {
 	return dirs.rootSubdir("remote", "data");
-}
-
-/**
- * Expand a leading `~` and require an absolute result. Returns `undefined` for
- * empty/whitespace input or a path that is still relative after expansion.
- *
- * Worktree bases and the natives directory are process-global: a worktree base
- * is consumed by both creation (PR checkout, task isolation) and cleanup
- * (`omp worktree`), and every launch extracts or loads the native addon from
- * the same natives directory. A relative value would resolve against whatever
- * cwd happened to launch `omp`, so those readers could disagree — we refuse it
- * rather than silently bind it to cwd.
- */
-function resolveAbsoluteDir(value: string | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	let p = trimmed;
-	if (p === "~") p = os.homedir();
-	else if (p.startsWith("~/") || p.startsWith("~\\")) p = os.homedir() + p.slice(1);
-	return path.isAbsolute(p) ? path.normalize(p) : undefined;
 }
 
 let worktreesDirOverride: string | undefined;
@@ -949,14 +932,13 @@ export function getNativeGrammarsDir(): string {
 }
 
 /**
- * Get the natives directory. PI_NATIVES_DIR overrides it, then `OMP_DOWNLOAD_ROOT`, then the
- * usual cache root; relative values are ignored.
+ * The natives directory, one answer per process: the addon loader resolves it with the same
+ * function, at the first use, so the addon and the agent never name different directories,
+ * even after a `.env` file sets a directory variable. omp's children that are omp take it from
+ * a handoff (`NATIVES_DIR_HANDOFF_ENV_KEY`: `workerEnvFromParent`, `brokerEnvFromParent`,
+ * `ompDaemonSpecEnv`); other children resolve for themselves.
  */
-export function getNativesDir(): string {
-	return (
-		resolveAbsoluteDir(process.env.PI_NATIVES_DIR) ?? downloadSubdir("natives") ?? dirs.rootSubdir("natives", "cache")
-	);
-}
+export { getNativesDir };
 
 /** Get the stats database path (~/.omp/stats.db). */
 export function getStatsDbPath(): string {

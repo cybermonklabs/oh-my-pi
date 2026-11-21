@@ -75,7 +75,7 @@ import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds, setSessionPinned } from "../../session/session-pins";
 import { defaultSessionStorage } from "../../session/session-storage";
 import { assertSessionsOnDisk, STATS_DISK_ONLY_REASON } from "../../session/session-storage-config";
-import { listLogoutAccounts, logoutCredential } from "../../slash-commands/helpers/logout";
+import { listLogoutAccounts, listLogoutProviders, logoutCredential } from "../../slash-commands/helpers/logout";
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { describeRedeemOutcome, toResetUsageAccounts } from "../../slash-commands/helpers/reset-usage";
 import { toSessionPinAccounts } from "../../slash-commands/helpers/session-pin";
@@ -1949,7 +1949,7 @@ export class SelectorController {
 								}
 								const storage = defaultSessionStorage();
 								try {
-									await storage.deleteSessionWithArtifacts(session.path);
+									await SessionManager.deleteSessionFile(session.path, storage);
 									return true;
 								} catch (error) {
 									throw new Error(
@@ -1965,13 +1965,15 @@ export class SelectorController {
 									// claim it; the live rename would then fork onto
 									// a sibling and still report success, leaving the
 									// row here pointing at the old path. Claim the
-									// lease up front and refuse while it is held by
-									// someone else. A storage with no lease (SQL)
-									// has no other owner to refuse for.
+									// lease up front, waiting for SQL storage's answer,
+									// and refuse while someone else holds it. A storage
+									// that claims nothing has no other owner to refuse for.
 									const storage = this.ctx.sessionManager.getStorage();
-									const claim = storage.claimSession
-										? storage.claimSession(session.id, session.path)
-										: () => {};
+									const claim = storage.acquireSessionClaim
+										? await storage.acquireSessionClaim(session.id, session.path)
+										: storage.claimSession
+											? storage.claimSession(session.id, session.path)
+											: () => {};
 									if (!claim) {
 										throw new Error(
 											"Failed to rename session: it is currently in use by another omp process",
@@ -2230,8 +2232,8 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		// Delete the session file and artifacts directory, refusing while another process holds it
+		await SessionManager.deleteSessionFile(sessionFile, storage);
 
 		// Show session selector
 		this.ctx.showStatus("Session deleted");
@@ -2427,13 +2429,14 @@ export class SelectorController {
 		}
 
 		const { getOAuthProviders, OAuthSelectorComponent } = await loadProviderAuthUi();
+		let logoutProviders: ReadonlySet<string> | undefined;
 		if (mode === "logout") {
 			await this.#refreshOAuthProviderAuthState();
-			const oauthProviders = getOAuthProviders();
-			const loggedInProviders = oauthProviders.filter(provider =>
-				this.ctx.session.modelRegistry.authStorage.credentials.has(provider.id),
-			);
-			if (loggedInProviders.length === 0) {
+			const removableProviders = await listLogoutProviders(this.ctx.session.modelRegistry.authStorage);
+			logoutProviders = removableProviders;
+			if (
+				!getOAuthProviders().some(provider => removableProviders.has(provider.storeCredentialsAs ?? provider.id))
+			) {
 				this.ctx.showStatus("No stored provider credentials to log out. Remove env or config auth at its source.");
 				return;
 			}
@@ -2459,6 +2462,7 @@ export class SelectorController {
 				},
 				{
 					disabledProviders: cfgDisabledProviders.get(settings),
+					logoutProviders,
 					validateAuth: async (selectedProviderId: string) => {
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,

@@ -34,6 +34,7 @@ import {
 	validateGoalStartup,
 	validateRestoreLaunch,
 	validateRestorePrompt,
+	validateSessionIdLaunch,
 	validateToolNames,
 } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -128,10 +129,16 @@ import {
 	type SessionContinuation,
 	type SessionInfo,
 } from "./session/session-listing";
-import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
-import { setDefaultSessionStorage } from "./session/session-storage";
+import {
+	ForkSourceNotFoundError,
+	isSessionExclusive,
+	SessionManager,
+	SessionMoveRefusedError,
+} from "./session/session-manager";
+import { defaultSessionStorage, setDefaultSessionStorage } from "./session/session-storage";
 import { resolveSessionStorage, SessionStorageConfigError } from "./session/session-storage-config";
-import { forkIfMovedAway } from "./session/session-transfer";
+import { forkIfMovedAway, lastSessionTransfer } from "./session/session-transfer";
+import { SESSION_OPEN_CLAIM_WAIT_MS } from "./session/sql-session-storage";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
 	discoverSystemPromptOverride,
@@ -310,20 +317,24 @@ function applyProtocolDefaults(host: ProtocolHost, targetSettings: Settings = se
 	}
 }
 
+// From `createSessionManager` on, a launch may hold its session's lease (SQL storage). Its exits go through
+// `postmortem.exitAfterCleanup`, whose cleanup gives the lease back before the process ends, and never through a
+// bare `process.exit`, which starts that cleanup without waiting for it and leaves the row until it expires.
+
 /** `--no-ui` only applies to RPC modes; reject it elsewhere (exit 1). */
-function rejectNoUiWithoutRpc(args: Pick<Args, "noUi" | "mode">): void {
+async function rejectNoUiWithoutRpc(args: Pick<Args, "noUi" | "mode">): Promise<void> {
 	if (!args.noUi || args.mode === "rpc" || args.mode === "rpc-ui") return;
 	process.stderr.write(`${chalk.red("Error: --no-ui requires --mode rpc or --mode rpc-ui")}\n`);
-	process.exit(1);
+	await postmortem.exitAfterCleanup(1);
 }
 
 /** Fail an interactive launch whose stdin is not a terminal: the TUI cannot run there. */
-function exitWithoutTerminal(): never {
+function exitWithoutTerminal(): Promise<never> {
 	process.stderr.write(
 		`${chalk.red("Error: interactive mode requires a terminal, but stdin is not a TTY.")}\n` +
 			`Pass a prompt (\`${APP_NAME} -p "…"\`), pipe one on stdin, or use \`--mode rpc\`.\n`,
 	);
-	process.exit(2);
+	return postmortem.exitAfterCleanup(2);
 }
 
 /** Reads a non-TTY stdin stream as prompt text. */
@@ -634,8 +645,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			args.rawArgs,
 		);
 		const effectiveArgs = reparsedArgs ?? args.parsedArgs;
+		// The ACP server goes on serving its other sessions ({@link AgentSessionDisposeOptions.ownedJobsEnd}).
 		if (effectiveArgs.invalidFlagValues.length > 0) {
-			await nextSession.dispose();
+			await nextSession.dispose({ ownedJobsEnd: "stop" });
 			throw new CliUsageError(effectiveArgs.invalidFlagValues.join("\n"));
 		}
 		const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
@@ -643,7 +655,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			try {
 				validateToolNames(requestedTools, nextSession.getAllToolNames());
 			} catch (error) {
-				await nextSession.dispose();
+				await nextSession.dispose({ ownedJobsEnd: "stop" });
 				throw error;
 			}
 		}
@@ -882,7 +894,11 @@ async function runInteractiveMode(
 	}
 }
 
-type SessionPromptResult = "accepted" | "declined" | "unavailable";
+/**
+ * `"keep"`: open the session where it is stored, with the launch directory as
+ * its working directory, as `--resume <path>` does.
+ */
+type SessionPromptResult = "accepted" | "declined" | "unavailable" | "keep";
 
 type SessionPrompt = (session: SessionInfo) => Promise<SessionPromptResult>;
 
@@ -903,6 +919,11 @@ async function promptMoveSession(session: SessionInfo): Promise<SessionPromptRes
 	}
 }
 
+/** Protocol modes (`rpc`, `rpc-ui`, `acp`) own stdin and stdout, so they never ask. */
+async function keepSessionInPlace(): Promise<SessionPromptResult> {
+	return "keep";
+}
+
 /**
  * Friendly CLI failure raised by {@link createSessionManager} when the user's
  * session-resolution flags (`--resume`/`--fork`/missing-directory move prompts)
@@ -919,12 +940,12 @@ export class SessionResolutionError extends Error {
 	}
 }
 
-function exitForSessionResolutionError(error: SessionResolutionError): never {
+function exitForSessionResolutionError(error: SessionResolutionError): Promise<never> {
 	process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
 	if (error.hint) {
 		process.stderr.write(`${chalk.dim(error.hint)}\n`);
 	}
-	process.exit(1);
+	return postmortem.exitAfterCleanup(1);
 }
 
 function resolveForeignSessionSource(
@@ -951,6 +972,7 @@ function isForeignSessionImport(parsed: Pick<Args, "fromClaude" | "fromCodex">):
 type MissingCwdMoveResult =
 	| { status: "not-needed" }
 	| { status: "declined" }
+	| { status: "kept" }
 	| { status: "moved"; manager: SessionManager };
 
 async function moveMissingCwdSessionIfNeeded(
@@ -968,6 +990,9 @@ async function moveMissingCwdSessionIfNeeded(
 	// A removed worktree of this checkout's repository: its session belongs here, no question to ask.
 	if (!(await SessionManager.isFromRemovedWorktree(session, cwd, sessionDir))) {
 		const movePromptResult = await askToMoveSession(session);
+		if (movePromptResult === "keep") {
+			return { status: "kept" };
+		}
 		if (movePromptResult === "unavailable") {
 			throw new SessionResolutionError(
 				`Session "${sessionArg}" belongs to a directory that no longer exists (${sourceCwd}); run interactively to move it into the current project.`,
@@ -1266,7 +1291,7 @@ function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSessi
 	}
 }
 /**
- * Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager.
+ * Resolves CLI session flags into an existing, forked, in-memory, new, or cancelled session manager.
  *
  * `nativeFlagOwnership: "preliminary"` is reserved for the startup parse,
  * before extensions establish whether a built-in-named flag belongs to them.
@@ -1283,6 +1308,23 @@ export async function createSessionManager(
 		onSessionContinuation?: (continuation: SessionContinuation) => void;
 	} = {},
 ): Promise<SessionManager | undefined> {
+	if (parsed.sessionId !== undefined) {
+		const sessionId = parsed.sessionId;
+		// A stored session holds the id when `--resume <id>` would open it: the same scopes and storage,
+		// matched by the exact id.
+		const manager = await SessionManager.createWithSessionId(
+			cwd,
+			parsed.sessionDir,
+			sessionId,
+			async () => (await resolveResumeTarget(sessionId, cwd, parsed.sessionDir, { exactId: true })) !== undefined,
+		);
+		if (!manager) {
+			throw new SessionResolutionError(
+				`Session "${sessionId}" already exists; resume it with --resume ${sessionId}.`,
+			);
+		}
+		return manager;
+	}
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
@@ -1327,9 +1369,12 @@ export async function createSessionManager(
 
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
+		// A launcher's recorded id (OMP_SESSION_EXCLUSIVE=1), and an exact id, open
+		// exactly that session: no continuation an older build recorded is followed.
+		const followContinuation = !isSessionExclusive();
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
 			// The conversation may have gone on in a sibling file while another process held this one.
-			const continuation = await findSessionContinuation(sessionArg);
+			const continuation = followContinuation ? await findSessionContinuation(sessionArg) : undefined;
 			if (continuation) options.onSessionContinuation?.(continuation);
 			let manager: SessionManager;
 			try {
@@ -1347,14 +1392,17 @@ export async function createSessionManager(
 				}
 				throw err;
 			}
-			// A copy whose conversation moved to another machine continues as a fork.
-			return await forkIfMovedAway(manager, parsed.sessionDir);
+			return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(manager, parsed.sessionDir));
 		}
-		const target = await resolveResumeTarget(sessionArg, cwd, parsed.sessionDir);
+		const target =
+			followContinuation && !EXACT_SESSION_ID.test(sessionArg)
+				? await resolveResumeTarget(sessionArg, cwd, parsed.sessionDir)
+				: await resolveResumableSession(sessionArg, cwd, parsed.sessionDir, defaultSessionStorage());
 		if (!target) {
 			throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
-		const { session, continuation } = target;
+		const { session } = target;
+		const continuation = "continuation" in target ? target.continuation : undefined;
 		if (continuation) options.onSessionContinuation?.(continuation);
 		const moveResult = await moveMissingCwdSessionIfNeeded(
 			sessionArg,
@@ -1364,19 +1412,26 @@ export async function createSessionManager(
 			askToMoveSession,
 		);
 		if (moveResult.status === "moved") {
-			return await forkIfMovedAway(moveResult.manager, parsed.sessionDir);
+			return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(moveResult.manager, parsed.sessionDir));
 		}
 		if (moveResult.status === "declined") {
 			return undefined;
 		}
-		return await forkIfMovedAway(await SessionManager.open(session.path, parsed.sessionDir), parsed.sessionDir);
+		return await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.open(session.path, parsed.sessionDir),
+				parsed.sessionDir,
+			),
+		);
 	}
 	if (parsed.continue) {
-		return await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
+		return await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+					onSessionContinuation: options.onSessionContinuation,
+				}),
+				parsed.sessionDir,
+			),
 		);
 	}
 	// --resume without value is handled separately (needs picker UI)
@@ -1389,12 +1444,17 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	// An explicit startup goal starts fresh even when implicit auto-resume is configured.
+	// It claims the session at open but waits for no other holder: a start that
+	// names no session and picks none never waits.
 	if (parsed.goal === undefined && cfgAutoResume.get(activeSettings)) {
-		const manager = await forkIfMovedAway(
-			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
-				onSessionContinuation: options.onSessionContinuation,
-			}),
-			parsed.sessionDir,
+		const manager = await claimOpenedSession(
+			await forkIfMovedAwayUnlessExclusive(
+				await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, {
+					onSessionContinuation: options.onSessionContinuation,
+				}),
+				parsed.sessionDir,
+			),
+			{ wait: false },
 		);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
@@ -1403,6 +1463,61 @@ export async function createSessionManager(
 	}
 	// Default case (new session) returns undefined, SDK will create one
 	return undefined;
+}
+
+/** A whole session id, as `--resume` takes one: it opens exactly that session. */
+const EXACT_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * {@link forkIfMovedAway}, except under `OMP_SESSION_EXCLUSIVE=1`: a
+ * `departed` entry (`omp session moved`, or one another process appended)
+ * never moves the launcher's recorded id. The start logs the entry, naming
+ * it, and opens the session itself, which it writes its next turn to.
+ */
+async function forkIfMovedAwayUnlessExclusive(manager: SessionManager, sessionDir?: string): Promise<SessionManager> {
+	if (!isSessionExclusive()) return forkIfMovedAway(manager, sessionDir);
+	const marker = lastSessionTransfer(manager.getEntries());
+	if (marker?.kind !== "departed") return manager;
+	logger.warn("Session holds a departed entry; OMP_SESSION_EXCLUSIVE=1 opens it anyway", {
+		sessionId: manager.getSessionId(),
+		sessionFile: manager.getSessionFile(),
+		departedTo: marker.to,
+	});
+	process.stderr.write(
+		`Session ${manager.getSessionId()} holds a departed entry (moved to ${marker.to}); OMP_SESSION_EXCLUSIVE=1 opens it here anyway.\n`,
+	);
+	return manager;
+}
+
+/**
+ * Claim the session `manager` opened before anything else sees it, on a
+ * storage that can tell at once (SQL storage; see
+ * `SessionManager.claimOpenedSession`). An explicit resume (`--resume`, the
+ * session `--continue` picks, the picker's pick) first waits up to
+ * {@link SESSION_OPEN_CLAIM_WAIT_MS} for another holder's lease to go or
+ * expire, telling the person on stderr, so a resume after its holder was
+ * killed keeps the id; the automatic resume (`wait: false`) does not. One
+ * still held then moves to a minted id, or, under `OMP_SESSION_EXCLUSIVE=1`,
+ * ends the process non-zero naming the holder. On file storage only a
+ * launcher-named session (`OMP_SESSION_EXCLUSIVE=1`) waits, for a holder that
+ * is still ending; a file lease does not name its holder.
+ */
+async function claimOpenedSession(manager: SessionManager, options: { wait?: boolean } = {}): Promise<SessionManager> {
+	if (options.wait === false) {
+		await manager.claimOpenedSession();
+		return manager;
+	}
+	await manager.claimOpenedSession({
+		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+		onWait: holder => {
+			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
+			process.stderr.write(
+				`Session ${manager.getSessionId()} is held by another omp process${by}; ` +
+					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
+			);
+		},
+	});
+	return manager;
 }
 
 /** Discover APPEND_SYSTEM.md file if no CLI append system prompt was provided */
@@ -1548,7 +1663,7 @@ export async function buildSessionOptions(
 			process.stderr.write(
 				`${chalk.red(resolved.error ?? `Provider "${resolved.disabledProvider}" is disabled.`)}\n`,
 			);
-			process.exit(1);
+			await postmortem.exitAfterCleanup(1);
 		}
 		const matchedAfterMissingRolePattern = (resolved.configuredPatternIndex ?? 0) > 0;
 		if (matchedAfterMissingRolePattern) {
@@ -1575,7 +1690,7 @@ export async function buildSessionOptions(
 				options.modelPattern = parsed.model;
 			} else {
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
-				process.exit(1);
+				await postmortem.exitAfterCleanup(1);
 			}
 		} else if (resolved.model) {
 			options.model = resolved.model;
@@ -1906,7 +2021,7 @@ export async function runRootCommand(
 		// A pending invalid `--mode` leaves `mode` unset; report it (exit 2) at the
 		// post-extension recheck before judging `--no-ui` against the mode.
 		if (parsedArgs.invalidFlagValues.length === 0) {
-			rejectNoUiWithoutRpc(parsedArgs);
+			await rejectNoUiWithoutRpc(parsedArgs);
 		}
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
@@ -1956,6 +2071,7 @@ export async function runRootCommand(
 		// Before session resolution: resume, fork, and import act on these same
 		// startup-parse flags, so rejecting later would leave forked or imported
 		// transcripts (or an opened picker) behind a usage error.
+		validateSessionIdLaunch(parsedArgs);
 		validateGoalLaunch(parsedArgs, isInteractive);
 		validateRestoreLaunch(parsedArgs, isInteractive);
 		// Without piped text the prompt must come from argv, which only the
@@ -1971,7 +2087,7 @@ export async function runRootCommand(
 			parsedArgs.unrecognizedFlags.length === 0 &&
 			parsedArgs.invalidFlagValues.length === 0
 		) {
-			exitWithoutTerminal();
+			return exitWithoutTerminal();
 		}
 		// Only the interactive host renders a focusable Agent Hub / subagent session
 		// tree; declare it so headless subagent optimizations (e.g. skipping replan
@@ -2240,7 +2356,7 @@ export async function runRootCommand(
 					parsedArgs,
 					cwd,
 					settingsInstance,
-					promptMoveSession,
+					isProtocolMode ? keepSessionInPlace : promptMoveSession,
 					{
 						nativeFlagOwnership: "preliminary",
 						onSessionContinuation: continuation => resumedContinuations.push(continuation),
@@ -2249,7 +2365,7 @@ export async function runRootCommand(
 			}
 		} catch (error: unknown) {
 			if (error instanceof SessionResolutionError) {
-				exitForSessionResolutionError(error);
+				await exitForSessionResolutionError(error);
 			}
 			throw error;
 		}
@@ -2283,7 +2399,7 @@ export async function runRootCommand(
 		if (typeof parsedArgs.resume === "string" && !sessionManager) {
 			writeStartupNotice(parsedArgs, `${chalk.dim("Resume cancelled: session was not moved.")}\n`);
 			stopStartupWatchdog();
-			process.exit(0);
+			return postmortem.exitAfterCleanup(0);
 		}
 
 		// Handle --resume (no value): show session picker. Skipped under
@@ -2315,7 +2431,7 @@ export async function runRootCommand(
 				if (preloadedAllSessions.sessions.length === 0) {
 					writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
 					stopStartupWatchdog();
-					process.exit(0);
+					return postmortem.exitAfterCleanup(0);
 				}
 			}
 			pauseStartupWatchdog();
@@ -2335,7 +2451,7 @@ export async function runRootCommand(
 				// in-session `/resume` picker (selector-controller.ts) takes a different
 				// onCancel that just closes the overlay — only this startup path exits.
 				stopStartupWatchdog();
-				process.exit(0);
+				return postmortem.exitAfterCleanup(0);
 			}
 			// A preliminary row (indexed title, no content read) lacks the recorded
 			// cwd the removed-worktree check below needs.
@@ -2343,17 +2459,32 @@ export async function runRootCommand(
 			const continuation = await findSessionContinuation(selected.path);
 			if (continuation) resumedContinuations.push(continuation);
 			const chosen = continuation?.session ?? selected;
-			try {
-				sessionManager = await forkIfMovedAway(
-					(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
-						? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
-						: await SessionManager.open(chosen.path),
-					parsedArgs.sessionDir,
-				);
-			} catch (error: unknown) {
-				if (error instanceof SessionResolutionError) exitForSessionResolutionError(error);
-				throw error;
+			// The pick replaces the session `createSessionManager` resumed on its own (`autoResume`): that one is closed
+			// once the pick holds its claim, so its lease goes back and another process can open it. A pick of that
+			// same session keeps its manager and opens no second one: a second manager of one session would be refused
+			// wherever a session has one writer, and move the pick to a new id. It is an explicit resume all the same,
+			// so it claims as one, with the wait the automatic resume skipped (a no-op where that one already holds it).
+			const replaced = sessionManager;
+			let pickedManager: SessionManager;
+			if (replaced !== undefined && replaced.getSessionFile() === chosen.path) {
+				pickedManager = await claimOpenedSession(replaced);
+			} else {
+				try {
+					pickedManager = await claimOpenedSession(
+						await forkIfMovedAwayUnlessExclusive(
+							(await SessionManager.isFromRemovedWorktree(chosen, cwd, parsedArgs.sessionDir))
+								? await openRelocatedSession(chosen, cwd, parsedArgs.sessionDir)
+								: await SessionManager.open(chosen.path),
+							parsedArgs.sessionDir,
+						),
+					);
+				} catch (error: unknown) {
+					if (error instanceof SessionResolutionError) await exitForSessionResolutionError(error);
+					throw error;
+				}
+				if (replaced && replaced !== pickedManager) await replaced.close();
 			}
+			sessionManager = pickedManager;
 			const previousCwd = cwd;
 			// A relocated session's `chosen.cwd` is the removed worktree: missing, so the launch cwd stays.
 			const recordedCwd = chosen.cwd || sessionManager.getRecordedCwd() || sessionManager.getCwd();
@@ -2474,7 +2605,7 @@ export async function runRootCommand(
 				process.stderr.write(
 					`${chalk.red("--api-key requires a model to be specified via --model, --provider/--model, or --models")}\n`,
 				);
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 			if (sessionOptions.model) {
 				authStorage.keys.setRuntime(sessionOptions.model.provider, parsedArgs.apiKey);
@@ -2504,7 +2635,7 @@ export async function runRootCommand(
 				(sessionOptions.additionalExtensionPaths?.length ?? 0) === 0 &&
 				reportInvalidFlagValues(parsedArgs)
 			) {
-				process.exit(2);
+				return postmortem.exitAfterCleanup(2);
 			}
 			const createAcpSession = createAcpSessionFactory({
 				baseOptions: sessionOptions,
@@ -2567,7 +2698,7 @@ export async function runRootCommand(
 				validateSessionPersistenceArgs(initialArgs);
 			} catch (error: unknown) {
 				if (error instanceof SessionResolutionError) {
-					exitForSessionResolutionError(error);
+					await exitForSessionResolutionError(error);
 				}
 				throw error;
 			}
@@ -2594,9 +2725,9 @@ export async function runRootCommand(
 			const invalidValues = reportInvalidFlagValues(initialArgs);
 			const unknownFlags = reportUnrecognizedFlags(initialArgs);
 			if (invalidValues || unknownFlags) {
-				process.exit(2);
+				return postmortem.exitAfterCleanup(2);
 			}
-			rejectNoUiWithoutRpc(parsedArgs);
+			await rejectNoUiWithoutRpc(parsedArgs);
 			validateRestorePrompt(initialArgs);
 			if (initialArgs.goal !== undefined) {
 				validateGoalStartup(
@@ -2607,7 +2738,7 @@ export async function runRootCommand(
 				);
 			}
 			if (autoPrintNeedsArgPrompt && initialArgs.messages.length === 0 && initialArgs.fileArgs.length === 0) {
-				exitWithoutTerminal();
+				return exitWithoutTerminal();
 			}
 			const processedFiles =
 				initialArgs.fileArgs.length > 0
@@ -2856,12 +2987,12 @@ export async function runRootCommand(
 					process.stderr.write(
 						`\nRun \`${APP_NAME} models find <pattern>\` to search, or \`${APP_NAME} models\` to list all.\n`,
 					);
-					process.exit(1);
+					return postmortem.exitAfterCleanup(1);
 				}
 				process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 				process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 				process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-				process.exit(1);
+				return postmortem.exitAfterCleanup(1);
 			}
 
 			if (mode === "rpc" || mode === "rpc-ui" || isInteractive) {
@@ -2906,7 +3037,7 @@ export async function runRootCommand(
 				if ($env.PI_TIMING) {
 					logger.printTimings();
 					if (logger.shouldExitAfterTimings()) {
-						process.exit(0);
+						return postmortem.exitAfterCleanup(0);
 					}
 				}
 				const startupLease = takeStartupComposerLease();

@@ -23,6 +23,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { getAgentDir, getSessionsDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { withGcLock } from "./gc-lock";
+import { CANONICAL_SESSION_ID_RE } from "./session-id-format";
 import { sessionStagingPath } from "./session-storage";
 
 /** Suffix `gc --archive` gives a transcript it has compressed. */
@@ -76,18 +77,25 @@ export async function listArchivedSessionFiles(agentDir?: string): Promise<strin
 
 /**
  * Archived transcripts whose file name carries `sessionArg` as an id prefix,
- * newest session first. The name is `<timestamp>_<id>.jsonl.gz`, so this needs
- * no decompression and stays cheap with a large archive.
+ * newest session first. A full session id (a lowercase UUID), or `exact`,
+ * names only the archive whose id is exactly `sessionArg`, so it never selects
+ * another session whose id extends it. The name is `<timestamp>_<id>.jsonl.gz`,
+ * so this needs no decompression and stays cheap with a large archive.
  */
-export async function findArchivedSessionFiles(sessionArg: string, agentDir?: string): Promise<string[]> {
+export async function findArchivedSessionFiles(
+	sessionArg: string,
+	agentDir?: string,
+	exact = false,
+): Promise<string[]> {
 	const needle = sessionArg.toLowerCase();
 	if (!needle) return [];
+	const exactOnly = exact || CANONICAL_SESSION_ID_RE.test(needle);
 	const matches: string[] = [];
 	for (const file of await listArchivedSessionFiles(agentDir)) {
 		const name = path.basename(file, ARCHIVED_SESSION_SUFFIX).toLowerCase();
 		const separator = name.lastIndexOf("_");
 		const id = separator < 0 ? name : name.slice(separator + 1);
-		if (name.startsWith(needle) || id.startsWith(needle)) matches.push(file);
+		if (exactOnly ? id === needle : name.startsWith(needle) || id.startsWith(needle)) matches.push(file);
 	}
 	return matches;
 }
