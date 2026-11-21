@@ -208,27 +208,52 @@ pub(crate) struct PatternBytes {
 	/// `$` is then written `\z`, as PCRE2's `$` holds before a final newline
 	/// too.
 	pub gap:         Option<u8>,
-	/// For [`Target::Rust`], whether each pattern byte is written as the
-	/// character grep's copy of a line matched whole holds for that byte
-	/// ([`byte_character`]), which no `.`, bracket expression or class
-	/// escape then matches.
-	pub as_chars:    bool,
+	/// For [`Target::Rust`], the set of [`byte_character`] whose character
+	/// each pattern byte is written as, the one grep's copy of a line
+	/// matched whole holds for that byte, which no `.`, bracket expression,
+	/// class escape or such character written in the pattern then matches.
+	pub byte_chars:  Option<usize>,
 }
 
-/// The character grep's copy of a line that is not UTF-8, matched whole
-/// under `-x`, holds for its byte `byte`, which is no UTF-8: a Yi syllable,
-/// which is a word character, for a byte whose character is a letter, as
-/// GNU's word assertions read it (`printf 'a\377\n' | grep -cx $'a\\>\377'`
-/// is 0), and else a character for private use, which is none. No case
-/// folds either.
-pub(crate) fn byte_character(byte: u8) -> char {
-	let base = if char::from(byte).is_alphabetic() { 0xA000 } else { 0xE000 };
-	char::from_u32(base + u32::from(byte)).expect("a Yi syllable or a character for private use")
+/// The base of each set of [`byte_character`], which gives a byte whose
+/// character is a letter the Yi syllable its value past the base.
+const BYTE_CHARACTER_BASES: [u32; 3] = [0xA000, 0xA080, 0xA100];
+
+/// How far a set's characters for a byte whose character is no letter are
+/// from those for a letter: they are characters for private use.
+const NO_LETTER_OFFSET: u32 = 0x4000;
+
+/// How many sets [`byte_character`] gives characters from, so that grep can
+/// take one that a line does not hold.
+#[cfg(feature = "util.grep")]
+pub(crate) const BYTE_CHARACTER_SETS: usize = BYTE_CHARACTER_BASES.len();
+
+/// The character of the set `set` that grep's copy of a line that is not
+/// UTF-8, matched whole under `-x`, holds for its byte `byte`, which is no
+/// UTF-8: a Yi syllable, which is a word character, for a byte whose
+/// character is a letter, as GNU's word assertions read it (`printf
+/// 'a\377\n' | grep -cx $'a\\>\377'` is 0), and else a character for private
+/// use, which is none. No case folds either.
+pub(crate) fn byte_character(byte: u8, set: usize) -> char {
+	let offset = if char::from(byte).is_alphabetic() { 0 } else { NO_LETTER_OFFSET };
+	let c = BYTE_CHARACTER_BASES[set] + offset + u32::from(byte);
+	char::from_u32(c).expect("a Yi syllable or a character for private use")
 }
 
-/// The characters [`byte_character`] gives for the bytes that are no UTF-8,
-/// from 0x80 up, as members of a class.
-pub(crate) const BYTE_CHARACTERS: &str = r"\x{A080}-\x{A0FF}\x{E080}-\x{E0FF}";
+/// Whether [`byte_character`] gives `c` from the set `set` for a byte that
+/// is no UTF-8, from 0x80 up.
+pub(crate) fn is_byte_character(c: char, set: usize) -> bool {
+	let c = u32::from(c);
+	let held = |base: u32| (base + 0x80..base + 0x100).contains(&c);
+	held(BYTE_CHARACTER_BASES[set]) || held(BYTE_CHARACTER_BASES[set] + NO_LETTER_OFFSET)
+}
+
+/// The characters of [`is_byte_character`] for the set `set`, as members of
+/// a class.
+fn byte_characters(set: usize) -> String {
+	let range = |base: u32| format!(r"\x{{{:X}}}-\x{{{:X}}}", base + 0x80, base + 0xFF);
+	range(BYTE_CHARACTER_BASES[set]) + &range(BYTE_CHARACTER_BASES[set] + NO_LETTER_OFFSET)
+}
 
 /// How strictly a pattern is read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -380,7 +405,7 @@ fn translator(
 		strictness,
 		icase,
 		multiline,
-		bytes: PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None, as_chars: false },
+		bytes: PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None, byte_chars: None },
 		atom: None,
 		quantified: false,
 		atom_is_anchor: false,
@@ -1211,15 +1236,21 @@ impl Translator<'_> {
 
 	fn literal(&mut self, c: char) {
 		let start = self.out.len();
-		match char_byte(c).filter(|_| self.bytes.raw) {
-			Some(byte) if self.bytes.as_chars => {
-				self.out.push_str(&format!(r"\x{{{:X}}}", u32::from(byte_character(byte))));
+		match (char_byte(c).filter(|_| self.bytes.raw), self.bytes.byte_chars) {
+			(Some(byte), Some(set)) => {
+				self.out.push_str(&format!(r"\x{{{:X}}}", u32::from(byte_character(byte, set))));
 			},
-			Some(byte) => push_raw_byte(&mut self.out, byte, self.target),
-			None if self.icase && self.target.folds_unicode() && case_differs(c) => {
+			(Some(byte), None) => push_raw_byte(&mut self.out, byte, self.target),
+			// The copy holds such a character only for a byte that is no
+			// UTF-8, which the character does not match: `printf 'a\377\n' |
+			// grep -cx $'a\352\203\277'` (U+A0FF) is 0.
+			(None, Some(set)) if is_byte_character(c, set) => {
+				self.out.push_str(r"[^\x00-\x{10FFFF}]");
+			},
+			(None, _) if self.icase && self.target.folds_unicode() && case_differs(c) => {
 				push_case_literal(&mut self.out, c);
 			},
-			None => {
+			(None, _) => {
 				push_literal(&mut self.out, c);
 				if c == '.' {
 					self.guard(start);
@@ -1232,7 +1263,7 @@ impl Translator<'_> {
 	/// Writes the atom `out` holds from `start`, a `.`, a bracket expression
 	/// or a class escape, so that it does not match the stand-in byte where
 	/// there is one ([`PatternBytes`]), nor the characters of pattern bytes
-	/// ([`PatternBytes::as_chars`]): for PCRE2 `.` becomes
+	/// ([`PatternBytes::byte_chars`]): for PCRE2 `.` becomes
 	/// `(?:(?![\x{5F}\x{0A}]).)`, the gap left out too, and for the `regex`
 	/// crate `\w` becomes `[\w--[\x{5F}]]` and `.` becomes `[^\n\x{5F}]`.
 	fn guard(&mut self, start: usize) {
@@ -1248,8 +1279,8 @@ impl Translator<'_> {
 			},
 			(Target::Rust, stand_in) => {
 				let mut left_out = stand_in.map(|byte| format!(r"\x{{{byte:02X}}}")).unwrap_or_default();
-				if self.bytes.as_chars {
-					left_out.push_str(BYTE_CHARACTERS);
+				if let Some(set) = self.bytes.byte_chars {
+					left_out.push_str(&byte_characters(set));
 				}
 				if left_out.is_empty() {
 					return;
@@ -1257,9 +1288,19 @@ impl Translator<'_> {
 				if &self.out[start..] == "." {
 					self.out.truncate(start);
 					self.out.push_str(&format!(r"[^\n{left_out}]"));
-				} else {
-					self.out.insert(start, '[');
-					self.out.push_str(&format!("--[{left_out}]]"));
+					return;
+				}
+				// A class read with case (see `close_class`) is subtracted
+				// from inside the group that reads it so: `(?-i:[[aA]--[…]])`.
+				let with_case = self.out[start..].starts_with("(?-i:");
+				let class_start = if with_case { start + "(?-i:".len() } else { start };
+				if with_case {
+					self.out.pop();
+				}
+				self.out.insert(class_start, '[');
+				self.out.push_str(&format!("--[{left_out}]]"));
+				if with_case {
+					self.out.push(')');
 				}
 			},
 			_ => {},
@@ -2849,7 +2890,7 @@ mod tests {
 		let translated = |pattern: &[u8], target: Target, utf8_locale: bool| {
 			let (text, raw) = pattern_text(pattern);
 			assert!(raw, "{pattern:?}");
-			let bytes = PatternBytes { raw, utf8_locale, stand_in: None, gap: None, as_chars: false };
+			let bytes = PatternBytes { raw, utf8_locale, stand_in: None, gap: None, byte_chars: None };
 			translate_raw(&text, Dialect::Basic, target, false, bytes)
 		};
 		// The C locale reads a byte to a character, the C.UTF-8 one does not.
@@ -2879,7 +2920,7 @@ mod tests {
 		// case.
 		let folded = |pattern: &[u8], target: Target| {
 			let text = pattern_text(pattern).0;
-			let bytes = PatternBytes { raw: true, utf8_locale: true, stand_in: None, gap: None, as_chars: false };
+			let bytes = PatternBytes { raw: true, utf8_locale: true, stand_in: None, gap: None, byte_chars: None };
 			translate_raw(&text, Dialect::Basic, target, true, bytes)
 		};
 		assert_eq!(folded(b"[\xc0-\xc1]", Target::Rust), Ok("(?-i:[\u{c0}-\u{c1}\u{e0}-\u{e1}])".to_owned()));
@@ -2930,7 +2971,7 @@ mod tests {
 	#[test]
 	fn a_bracket_member_outside_ascii_is_its_bytes_in_the_c_locale() {
 		// If this regresses, `LC_ALL=C grep '[é]'` matches no byte of `é`.
-		let c = PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None, as_chars: false };
+		let c = PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None, byte_chars: None };
 		assert_eq!(translate_raw("[é]", Dialect::Basic, Target::RustBytes, false, c), Ok("[é]".to_owned()));
 	}
 
@@ -2943,7 +2984,7 @@ mod tests {
 		// 'b.\|\(x\)\1'` counts 1 where GNU grep 3.11 counts 0, and `printf
 		// 'a\200\n' | LC_ALL=C.UTF-8 grep -c 'a$\|\(x\)\1'` 1 where it counts 0.
 		let bytes =
-			PatternBytes { raw: false, utf8_locale: true, stand_in: Some(b'_'), gap: Some(b'\n'), as_chars: false };
+			PatternBytes { raw: false, utf8_locale: true, stand_in: Some(b'_'), gap: Some(b'\n'), byte_chars: None };
 		let guarded = r"a(?:(?![\x{5F}\x{0A}]).)*(?:(?![\x{5F}\x{0A}])[b])(?:(?![\x{5F}\x{0A}])\w)\z";
 		assert_eq!(translate_raw(r"a.*[b]\w$", Dialect::Basic, Target::Pcre, false, bytes), Ok(guarded.to_owned()));
 		// For the `regex` crate each is a class without it, of either case,
@@ -2957,22 +2998,47 @@ mod tests {
 	}
 
 	/// For a copy of a line matched whole under `-x`, a pattern byte is
-	/// written as its character there, which no other atom matches.
+	/// written as its character there, from the set the copy takes, which no
+	/// other atom matches.
 	#[test]
 	fn a_pattern_byte_is_its_character_in_a_copy_matched_whole() {
 		// If this regresses, `printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx
 		// $'a\\>\377'` counts 1 where GNU grep 3.11 counts 0.
-		let bytes = PatternBytes { raw: true, utf8_locale: true, stand_in: None, gap: None, as_chars: true };
-		let written =
-			|pattern: &[u8]| translate_raw(&pattern_text(pattern).0, Dialect::Basic, Target::Rust, false, bytes);
-		assert_eq!(written(b"a\\>\xff."), Ok(r"a\>\x{A0FF}[^\n\x{A080}-\x{A0FF}\x{E080}-\x{E0FF}]".to_owned()));
-		let whole = |pattern: &[u8], line: &str| {
-			regex::Regex::new(&format!("^(?:{})$", written(pattern).unwrap())).unwrap().is_match(line)
+		let written = |pattern: &[u8], icase: bool, set: usize| {
+			let bytes =
+				PatternBytes { raw: true, utf8_locale: true, stand_in: None, gap: None, byte_chars: Some(set) };
+			translate_raw(&pattern_text(pattern).0, Dialect::Basic, Target::Rust, icase, bytes)
 		};
-		assert!(!whole(b"a\\>\xff", "a\u{A0FF}"));
-		assert!(whole(b"a\\B\xff", "a\u{A0FF}"));
-		assert!(whole(b"a\\>\x80", "a\u{E080}"));
-		assert!(!whole(b"a.", "a\u{E080}"));
-		assert!(!whole(b"a\\w", "a\u{A0FF}"));
+		assert_eq!(
+			written(b"a\\>\xff.", false, 0),
+			Ok(r"a\>\x{A0FF}[^\n\x{A080}-\x{A0FF}\x{E080}-\x{E0FF}]".to_owned())
+		);
+		assert_eq!(
+			written(b"a\\>\xff.", false, 2),
+			Ok(r"a\>\x{A1FF}[^\n\x{A180}-\x{A1FF}\x{E180}-\x{E1FF}]".to_owned())
+		);
+		// A character of the set written in a pattern matches nothing, and one
+		// of another set itself.
+		let expected = [r"[^\x00-\x{10FFFF}]", "\u{A100}"].concat();
+		assert_eq!(written("\u{A0FF}\u{A100}".as_bytes(), false, 0), Ok(expected));
+		let whole = |pattern: &[u8], icase: bool, line: &str| {
+			let written = format!("^(?:{})$", written(pattern, icase, 0).unwrap());
+			let engine = regex::RegexBuilder::new(&written).case_insensitive(icase).build().unwrap();
+			engine.is_match(line)
+		};
+		assert!(!whole(b"a\\>\xff", false, "a\u{A0FF}"));
+		assert!(whole(b"a\\B\xff", false, "a\u{A0FF}"));
+		assert!(whole(b"a\\>\x80", false, "a\u{E080}"));
+		assert!(!whole(b"a.", false, "a\u{E080}"));
+		assert!(!whole(b"a\\w", false, "a\u{A0FF}"));
+		// Under `-i` a class read with case keeps it: `printf 'b\377\n' |
+		// grep -cxi $'[a]\\B\377'` is 0.
+		assert_eq!(
+			written(b"[a]\\B\xff", true, 0),
+			Ok(r"(?-i:[[aA]--[\x{A080}-\x{A0FF}\x{E080}-\x{E0FF}]])\B\x{A0FF}".to_owned())
+		);
+		assert!(whole(b"[a]\\B\xff", true, "A\u{A0FF}"));
+		assert!(!whole(b"[a]\\B\xff", true, "b\u{A0FF}"));
+		assert!(!whole(b"[^a]\\B\xff", true, "a\u{A0FF}"));
 	}
 }

@@ -402,10 +402,51 @@ describe("builtin grep: -x with a pattern byte and a word assertion, in the C.UT
 		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -aox $'a\\B\377'`, "a\xff\n", 0],
 		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -ax $'a\\>\377'`, "", 1],
 		[String.raw`printf 'a\377\nb\n' | LC_ALL=C.UTF-8 grep -ax $'a\\B\377\\|b'`, "a\xff\nb\n", 0],
+		// Regressed: under `-i` the guard made a class read with case into a class of other members.
+		[String.raw`printf 'b\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[a]\\B\377'`, "0\n", 1],
+		[String.raw`printf 'Z\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[a]\\B\377'`, "0\n", 1],
+		[String.raw`printf '_\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[a]\\B\377'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[^a]\\B\377'`, "0\n", 1],
+		[String.raw`printf 'a\377c\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377[b]'`, "0\n", 1],
+		[String.raw`printf 'a\377b\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377[^b]'`, "0\n", 1],
+		[String.raw`printf 'a\377d\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377[a-c]'`, "0\n", 1],
+		[String.raw`printf 'a\377c\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377[\303\251]'`, "0\n", 1],
+		[String.raw`printf 'a\377c\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377[b[:digit:]]'`, "0\n", 1],
+		[String.raw`printf 'a\377c\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\>\377[b]\\|a\\B\377[b]'`, "0\n", 1],
+		// Regressed: PCRE2, which runs a back-reference, matched the byte with `.`, `[^x]` and `\w`.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'[\351]' -e '\<a.\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'[\351]' -e '\<a[^x]\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'[\351]' -e '\<a\w\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx $'\\(a\\)\\1*.\\|\\<[\377]'`, "0\n", 1],
+		// Regressed: a pattern's own U+A0FF matched the byte 0xFF.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\352\203\277' -e $'\\<\377'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx $'a\352\203\277\\|\\<\377'`, "0\n", 1],
+		// Regressed: a line holding U+A080 was read as text, where the assertions read 0xFF as no word character.
+		[String.raw`printf 'a\377 \352\202\200\n' | LC_ALL=C.UTF-8 grep -cx $'a\\>\377 \352\202\200'`, "0\n", 1],
+		// Not GNU's answer before: the same line as text matched no pattern byte beside `\B`, `.` or `-i`.
+		[String.raw`printf 'a\377 \352\202\200\n' | LC_ALL=C.UTF-8 grep -cx $'a\\B\377 \352\202\200'`, "1\n", 0],
+		[String.raw`printf 'A\377 \352\202\200\n' | LC_ALL=C.UTF-8 grep -cxi $'a\\B\377 \352\202\200'`, "1\n", 0],
+		[String.raw`printf 'a\377\352\202\277\n' | LC_ALL=C.UTF-8 grep -cx $'a\\B\377.'`, "1\n", 0],
 		// Already GNU's answer, kept: another byte, a byte whose character is no letter, and `.`.
 		[String.raw`printf 'a\351\n' | LC_ALL=C.UTF-8 grep -cx $'a\\B\377'`, "0\n", 1],
 		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cx $'a\\>\200'`, "1\n", 0],
 		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx $'a.\\>'`, "0\n", 1],
+		// Already GNU's answer, kept: a class with case under `-i`, and patterns holding U+A080, U+A100, U+A180 or U+A0FF.
+		[String.raw`printf 'A\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[a]\\B\377'`, "1\n", 0],
+		[String.raw`printf 'b\377\n' | LC_ALL=C.UTF-8 grep -cxi $'[^a]\\B\377'`, "1\n", 0],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\\>\377' -e $'\352\202\200'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\\B\377' -e $'\352\202\200'`, "1\n", 0],
+		[
+			String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\\>\377' -e $'\352\202\200\352\204\200\352\206\200'`,
+			"0\n",
+			1,
+		],
+		[
+			String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\\B\377' -e $'\352\202\200\352\204\200\352\206\200'`,
+			"1\n",
+			0,
+		],
+		[String.raw`printf 'a\352\203\277\n' | LC_ALL=C.UTF-8 grep -cx -e $'a\352\203\277' -e $'\\<\377'`, "1\n", 0],
 	]);
 });
 
