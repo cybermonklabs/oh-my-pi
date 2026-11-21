@@ -2769,8 +2769,10 @@ mod tests {
 			let temp = init(&[("tool", b"run\n")]);
 			git(temp.path(), &["update-index", "--chmod=+x", "tool"]);
 			git(temp.path(), &["commit", "-qm", "executable"]);
-			// Forced: the worktree file keeps its old mode where the
-			// filesystem has no executable bit to set.
+			// Forced: `update-index --chmod=+x` changed only the index, so the
+			// worktree file is still 0644, and where git tracks the executable
+			// bit (`core.fileMode`) a plain `git rm` refuses it as locally
+			// modified.
 			git(temp.path(), &["rm", "-q", "-f", "tool"]);
 			let patch = git(temp.path(), &["diff", "--cached", "--no-ext-diff"]);
 			git(temp.path(), &["commit", "-qm", "remove"]);
