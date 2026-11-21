@@ -16,6 +16,10 @@
 - Sped up `LinearRegExp` searches for required literals, lookbehinds, and other patterns on long inputs.
 - Sped up `LinearRegExp` misses for patterns with a required suffix and for patterns with large character alphabets.
 
+### Fixed
+
+- Fixed `bun test` runs reading your `~/.env`, `~/.omp/.env` and agent-dir `.env`: a test process now reads only the project's `.env`, and sets `PI_TEST_RUNTIME=1` so that a child started with its `process.env` reads none of them either
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

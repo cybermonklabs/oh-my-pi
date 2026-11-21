@@ -21,7 +21,8 @@ const DEVELOPER_ENV_PREFIXES = ["PI_", "OMP_", "MNEMOPI_", "OTEL_"];
 
 /**
  * The other names that do: the XDG roots omp's directories follow (`packages/utils/src/dirs.ts`),
- * and the directories omp reads Claude's, Copilot's, gh's and glab's configuration from.
+ * the directories omp reads Claude's, Copilot's, gh's and glab's configuration from, and the
+ * credential files, profile and endpoints the AWS and Google providers read.
  */
 const DEVELOPER_ENV_NAMES: Record<string, true> = {
 	XDG_CONFIG_HOME: true,
@@ -32,36 +33,59 @@ const DEVELOPER_ENV_NAMES: Record<string, true> = {
 	COPILOT_HOME: true,
 	GH_CONFIG_DIR: true,
 	GLAB_CONFIG_DIR: true,
+	AWS_PROFILE: true,
+	AWS_CONFIG_FILE: true,
+	AWS_SHARED_CREDENTIALS_FILE: true,
+	AWS_WEB_IDENTITY_TOKEN_FILE: true,
+	AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: true,
+	AWS_CONTAINER_CREDENTIALS_FULL_URI: true,
+	AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: true,
+	GOOGLE_APPLICATION_CREDENTIALS: true,
 };
+
+/**
+ * Whether `name` points a process at the developer's configuration ({@link DEVELOPER_ENV_PREFIXES},
+ * {@link DEVELOPER_ENV_NAMES}). Windows compares environment names without case, so there
+ * `pi_coding_agent_dir` is `PI_CODING_AGENT_DIR`.
+ */
+export function isDeveloperEnvName(name: string, platform: NodeJS.Platform = process.platform): boolean {
+	const key = platform === "win32" ? name.toUpperCase() : name;
+	return DEVELOPER_ENV_NAMES[key] === true || DEVELOPER_ENV_PREFIXES.some(prefix => key.startsWith(prefix));
+}
 
 /**
  * The environment of a child a test starts as production: an omp CLI, fixture or probe that must not
  * count as a test child. It is `base` (the test's own environment, unless a site passes less)
- * without the names that point it at the developer's configuration ({@link DEVELOPER_ENV_PREFIXES},
- * {@link DEVELOPER_ENV_NAMES}), the test-runtime marker among them. A site that needs one sets it on
- * the result. It is the child's whole environment, as `Bun.spawn` takes `env`.
+ * without the names that point it at the developer's configuration ({@link isDeveloperEnvName}),
+ * the test-runtime marker among them. A site that needs one sets it on the result. It is the child's
+ * whole environment, as `Bun.spawn` takes `env`.
  *
  * HOME (and USERPROFILE on Windows) is a new empty directory of the child's own, removed when the
  * scope that made it ends ({@link removeWhenScopeEnds}): the test, or the `describe` block. Made in
- * a `beforeAll` hook, it is removed right after the hook, before the first test.
+ * a `beforeAll` hook, it is removed right after the hook, before the first test. Made in a
+ * concurrent test, it is removed when the process exits.
  *
  * A version manager's shims on PATH (mise's, asdf's) choose a version from the home's
- * configuration, and fail in a new one ("No version is set for shim: bun"). So this Bun goes on
- * PATH as `bun` and `bunx`, and the real `git`, `jj` and `node` go before their wrappers
- * ({@link productionChildPath}).
+ * configuration, and fail in a new one ("No version is set for shim: bun"). So this Bun answers to
+ * `bun` and `bunx`, and the real `git`, `jj` and `node`, where one is found past their wrappers, go
+ * before them ({@link productionChildPath}).
  */
 export function createProductionChildEnv(
 	base: Record<string, string | undefined> = process.env,
 ): Record<string, string> {
+	const win32 = process.platform === "win32";
 	const env: Record<string, string> = {};
 	for (const [name, value] of Object.entries(base)) {
-		if (value === undefined || DEVELOPER_ENV_NAMES[name] === true) continue;
-		if (!DEVELOPER_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) env[name] = value;
+		if (value === undefined || isDeveloperEnvName(name)) continue;
+		// The home is replaced below; on Windows a differently cased copy would be a second name.
+		const key = win32 ? name.toUpperCase() : name;
+		if (key === "HOME" || (win32 && key === "USERPROFILE")) continue;
+		env[name] = value;
 	}
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-home-"));
 	removeWhenScopeEnds(home);
 	env.HOME = home;
-	if (process.platform === "win32") env.USERPROFILE = home;
+	if (win32) env.USERPROFILE = home;
 	// Windows names PATH `Path`, and a plain object's keys keep that case.
 	const pathName = Object.keys(env).find(name => name.toUpperCase() === "PATH") ?? "PATH";
 	env[pathName] = productionChildPath(env[pathName] ?? "");
@@ -71,37 +95,55 @@ export function createProductionChildEnv(
 /** The tools a production child runs by name whose wrappers find their version through the home. */
 const WRAPPED_TOOLS = ["git", "jj", "node"];
 
-/** The names Bun answers to, with the arguments that make Bun each one: `bunx` is `bun x`. */
-const BUN_NAMES: Record<string, readonly string[]> = { bun: [], bunx: ["x"] };
+/** The names Bun answers to. A Bun run as `bunx` is `bun x`, on every platform. */
+const BUN_NAMES = ["bun", "bunx"];
 
 /**
- * `searchPath` with a directory of its own first when it needs one. That directory holds this Bun
- * (`process.execPath`) as `bun` and `bunx` when the first of each on `searchPath` is not this Bun,
- * and the real one of each of {@link WRAPPED_TOOLS} whose first copy on `searchPath` is a wrapper
- * ({@link findRealTool}). Each is linked alone, so every other name resolves as on `searchPath`.
+ * `searchPath` with directories of its own first when it needs them, so that `bun` and `bunx` are
+ * this Bun (`process.execPath`) when the first of each on `searchPath` is not, and each of
+ * {@link WRAPPED_TOOLS} is the real one when its first copy on `searchPath` is a wrapper and a real
+ * one is found ({@link findRealTool}). Every other name resolves as on `searchPath`.
+ *
+ * On POSIX, one directory holds a link to each, so only that name moves ahead. On Windows a link
+ * needs a privilege, and a `.cmd` launcher cannot pass an argument that holds `"` or `%` (Bun
+ * refuses such an argument for a batch file). So this Bun is hard-linked there as `bun.exe` and
+ * `bunx.exe`, and a real tool's own directory goes ahead instead of a link to it: Git for
+ * Windows' `git.exe` finds the rest of Git from its own path.
  */
 function productionChildPath(searchPath: string): string {
-	const links = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-bin-"));
-	removeWhenScopeEnds(links);
-	let linked = false;
-	const link = (name: string, file: string, args: readonly string[] = []) => {
-		if (process.platform === "win32") {
-			fs.writeFileSync(path.join(links, `${name}.cmd`), windowsLauncher(file, args));
-		} else {
-			fs.symlinkSync(file, path.join(links, name));
+	const win32 = process.platform === "win32";
+	let links: string | undefined;
+	const link = (name: string, file: string) => {
+		if (links === undefined) {
+			links = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-bin-"));
+			removeWhenScopeEnds(links);
 		}
-		linked = true;
+		if (win32) hardLinkOrCopy(file, path.join(links, `${name}.exe`));
+		else fs.symlinkSync(file, path.join(links, name));
 	};
 	const thisBun = fs.realpathSync(process.execPath);
-	for (const [name, args] of Object.entries(BUN_NAMES)) {
+	for (const name of BUN_NAMES) {
 		const found = Bun.which(name, { PATH: searchPath });
-		if (found === null || fs.realpathSync(found) !== thisBun) link(name, process.execPath, args);
+		if (found === null || fs.realpathSync(found) !== thisBun) link(name, process.execPath);
 	}
+	const toolDirs = new Set<string>();
 	for (const tool of WRAPPED_TOOLS) {
 		const file = findRealTool(searchPath, tool);
-		if (file !== undefined) link(tool, file);
+		if (file === undefined) continue;
+		if (win32) toolDirs.add(path.dirname(file));
+		else link(tool, file);
 	}
-	return linked ? [links, searchPath].filter(Boolean).join(path.delimiter) : searchPath;
+	return [links, ...toolDirs, searchPath].filter(Boolean).join(path.delimiter);
+}
+
+/** A hard link to `file` at `target`, or a copy when they are on different volumes. */
+function hardLinkOrCopy(file: string, target: string): void {
+	try {
+		fs.linkSync(file, target);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+		fs.copyFileSync(file, target);
+	}
 }
 
 /** A wrapper is a file in a directory named `shims`, or whose real path is in one. */
@@ -113,8 +155,8 @@ function isWrapper(file: string): boolean {
 /**
  * The real `tool` when the first one on `searchPath` is a wrapper: the first past the wrappers (where
  * a version manager's activation puts its installs), or, when none follows them (a PATH with mise's
- * shims alone), the file the first wrapper says it runs ({@link askWrapper}). Undefined when the
- * first `tool` is not a wrapper, or no real one is found.
+ * shims alone), the file the first wrapper says it runs ({@link askWrapper}; only node can say).
+ * Undefined when the first `tool` is not a wrapper, or no real one is found.
  */
 function findRealTool(searchPath: string, tool: string): string | undefined {
 	let wrapper: string | undefined;
@@ -172,29 +214,20 @@ function askWrapper(wrapper: string, tool: string, searchPath: string): string |
 }
 
 /**
- * A `<tool>.cmd` that runs `file` with `args` and then the arguments it was given, and exits with its
- * status: Windows needs a privilege to make a link. A `%` in the path is doubled, as a batch file
- * reads `%%` as one, and a `file` that is itself a batch file is run with `call`, which returns.
- */
-function windowsLauncher(file: string, args: readonly string[]): string {
-	const quoted = `"${file.replaceAll("%", "%%")}"`;
-	const run = /\.(?:cmd|bat)$/i.test(file) ? `call ${quoted}` : quoted;
-	return `@${[run, ...args].join(" ")} %*\r\n@exit /b %ERRORLEVEL%\r\n`;
-}
-
-/**
  * Removes `dir` when the scope that calls this ends: the scope of the `afterAll` it registers. From
  * inside a test, that test, so the directory is gone at the next test; from a `describe` body, that
- * block; from a `beforeAll` hook, the hook itself. Outside the test runner (a fixture that imports
- * this), `afterAll` refuses with "outside of the test runner" and the process's `exit` event removes
- * the directory instead.
+ * block; from a `beforeAll` hook, the hook itself. Where Bun gives no such scope, the process's
+ * `exit` event removes the directory instead: outside the test runner (a fixture that imports this),
+ * where `afterAll` refuses with "outside of the test runner", and in a concurrent test, where Bun
+ * refuses `afterAll` and `onTestFinished` alike ("cannot be called inside a concurrent test").
  */
 function removeWhenScopeEnds(dir: string): void {
 	const remove = () => fs.rmSync(dir, { recursive: true, force: true });
 	try {
 		afterAll(remove);
 	} catch (error) {
-		if (!(error instanceof Error && error.message.includes("outside of the test runner"))) throw error;
+		const message = error instanceof Error ? error.message : "";
+		if (!message.includes("outside of the test runner") && !message.includes("inside a concurrent test")) throw error;
 		process.on("exit", remove);
 	}
 }
