@@ -18,7 +18,8 @@ const SHELL_ONLY_LOCALE: &str = "omp_rsync_latin1";
 /// prints a non-ASCII name's bytes (measured: `env -i LOCPATH=… LC_ALL=…
 /// rsync -ai "src/ünï.txt" dst/` prints them) where the C locale escapes
 /// them. `None` on a host without locale sources, which cannot host the
-/// scenario at all.
+/// scenario at all: the calling test skips, after this prints
+/// `skipped: <reason>`.
 #[cfg(target_os = "linux")]
 fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 	let locales = dir.join("locales");
@@ -29,7 +30,24 @@ fn shell_only_locale(dir: &Path) -> Option<PathBuf> {
 		.output();
 	fs::create_dir_all(dir.join("src")).unwrap();
 	fs::write(dir.join("src/ünï.txt"), b"x\n").unwrap();
-	built.is_ok_and(|built| built.status.success()).then_some(locales)
+	localedef_built(built, "en_US ISO-8859-1").then_some(locales)
+}
+
+/// Whether a `localedef` run built its locale; when not, a skip line for
+/// the calling test.
+#[cfg(target_os = "linux")]
+fn localedef_built(built: std::io::Result<std::process::Output>, what: &str) -> bool {
+	match built {
+		Ok(out) if out.status.success() => true,
+		Ok(out) => {
+			eprintln!("skipped: localedef could not build {what}: {}", String::from_utf8_lossy(&out.stderr).trim());
+			false
+		},
+		Err(err) => {
+			eprintln!("skipped: localedef could not run for {what}: {err}");
+			false
+		},
+	}
 }
 
 /// Makes every path below `parent` one no process can enter, root
@@ -639,12 +657,12 @@ fn a_descriptor_limit_with_two_to_spare_still_answers() {
 }
 
 /// A second locale under `<dir>/<name>`, in `codeset`. `None` on a host
-/// without locale sources.
+/// without locale sources (and a skip line for the calling test).
 #[cfg(target_os = "linux")]
 fn generated_locale(dir: &Path, name: &str, codeset: &str) -> Option<PathBuf> {
 	fs::create_dir_all(dir.join(name)).unwrap();
 	let built = Command::new("localedef").args(["-i", "en_US", "-f", codeset]).arg(dir.join(name)).output();
-	built.is_ok_and(|built| built.status.success()).then(|| dir.to_path_buf())
+	localedef_built(built, &format!("en_US {codeset}")).then(|| dir.to_path_buf())
 }
 
 /// A directory name is not a list element: a working directory holding a
@@ -1526,7 +1544,13 @@ fn the_shells_conversion_configuration_reaches_the_lookup() {
 		.env("LOCPATH", &locales)
 		.env("GCONV_PATH", &gconv)
 		.output();
-	let Ok(reference) = reference else { return };
+	let reference = match reference {
+		Ok(reference) => reference,
+		Err(err) => {
+			eprintln!("skipped: /usr/bin/locale could not run: {err}");
+			return;
+		},
+	};
 	let reference = String::from_utf8_lossy(&reference.stdout).trim().to_owned();
 	let locales = locales.to_str().unwrap().to_owned();
 	let gconv = gconv.to_str().unwrap().to_owned();
@@ -1541,14 +1565,15 @@ fn the_shells_conversion_configuration_reaches_the_lookup() {
 
 /// A German and an English locale, both UTF-8 and complete, under
 /// `<dir>/utility-locales`, built with `localedef`. `None` on a host without
-/// locale sources. Nothing here depends on what the host has installed.
+/// locale sources (and a skip line for the calling test). Nothing here
+/// depends on what the host has installed.
 #[cfg(target_os = "linux")]
 fn utility_locales(dir: &Path) -> Option<PathBuf> {
 	let locales = dir.join("utility-locales");
 	for (name, source) in [("de_XX.UTF-8", "de_DE"), ("en_XX.UTF-8", "en_US")] {
 		fs::create_dir_all(locales.join(name)).unwrap();
 		let built = Command::new("localedef").args(["-i", source, "-f", "UTF-8"]).arg(locales.join(name)).output();
-		if !built.is_ok_and(|built| built.status.success()) {
+		if !localedef_built(built, &format!("{source} UTF-8")) {
 			return None;
 		}
 	}
