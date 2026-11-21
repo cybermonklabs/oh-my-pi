@@ -1889,32 +1889,49 @@ fn replace_entry(filesystem: &BlockingFs, path: &Path, make: impl Fn(&Path) -> i
 	Err(io::ErrorKind::AlreadyExists.into())
 }
 
+/// GNU 9.7's error for a directory where a non-directory would go (9.4's
+/// leaves out the source).
+fn overwrite_directory(directory: &Path, source: &Path) -> CpError {
+	CpError::Error(format!(
+		"cannot overwrite directory {} with non-directory {}",
+		directory.quote(),
+		source.quote()
+	))
+}
+
 /// Makes the backup of a destination that is the source's own entry (`cp
 /// -fb a a`) as GNU cp makes it: a copy of the source in the current mode,
-/// after which nothing is left to copy. `-l` links the backup name to the
-/// source's file (nothing to do where it already is that file); `-s` makes
-/// it a symbolic link to the source as named; a symbolic link read as a
-/// link (`-P`) is copied as a link; otherwise the data is copied
-/// ([`copy_into_backup`]). `-s` and a data copy are refused where the
-/// backup name is the source's file, which they would replace or truncate.
+/// after which nothing is left to copy. Returns whether it made anything.
+/// A directory at the backup name is refused in every mode. `-l` links the
+/// backup name to the source's file (nothing to do where it already is that
+/// file); `-s` makes it a symbolic link to the source as named, refused for
+/// a relative source outside the current directory as GNU refuses any such
+/// link; a symbolic link read as a link (`-P`) is copied as a link;
+/// otherwise the data is copied ([`copy_into_backup`]). `-s` and a data copy
+/// are refused where the backup name is the source's file, which they would
+/// replace or truncate: `-s` reads the backup name with lstat, as GNU does,
+/// so a link `a~ -> a` is replaced. The errors are GNU's.
 fn back_up_own_entry(
-	host: &Host,
+	host: &mut Host,
 	source: &Path,
 	dest: &Path,
 	backup: &Path,
 	options: &Options,
 	source_in_command_line: bool,
-) -> CopyResult<()> {
+) -> CopyResult<bool> {
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
 	let follow = options.dereference(source_in_command_line);
-	let cannot_backup = |e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote()));
-	let refuse_same_file = || {
-		if paths_refer_to_same_file(&filesystem, &source_fs, backup, true) {
+	let shown = backup_display(dest, backup);
+	if filesystem.symlink_metadata(backup).is_ok_and(|metadata| metadata.is_dir()) {
+		return Err(overwrite_directory(&shown, source));
+	}
+	let refuse_same_file = |follow_backup: bool| {
+		if paths_refer_to_same_file(&filesystem, &source_fs, backup, follow_backup) {
 			return Err(CpError::Error(format!(
 				"{} and {} are the same file",
 				source.quote(),
-				backup_display(dest, backup).quote()
+				shown.quote()
 			)));
 		}
 		Ok(())
@@ -1922,7 +1939,7 @@ fn back_up_own_entry(
 	match options.copy_mode {
 		CopyMode::Link => {
 			if paths_refer_to_same_file(&filesystem, &source_fs, backup, follow) {
-				return Ok(());
+				return Ok(false);
 			}
 			let original = if follow && filesystem.is_symlink(&source_fs) {
 				filesystem.canonicalize_with(
@@ -1930,101 +1947,165 @@ fn back_up_own_entry(
 					&CanonicalizeOptions::new(MissingHandling::Missing, ResolveMode::Physical),
 				)?
 			} else {
-				source_fs
+				source_fs.clone()
 			};
-			replace_entry(&filesystem, backup, |at| filesystem.hard_link(&original, at)).map_err(cannot_backup)
+			replace_entry(&filesystem, backup, |at| filesystem.hard_link(&original, at)).map_err(|e| {
+				CpError::IoErrContext(
+					e,
+					format!("cannot create hard link {} to {}", shown.quote(), source.quote()),
+				)
+			})?;
 		},
 		CopyMode::SymLink => {
-			refuse_same_file()?;
-			replace_entry(&filesystem, backup, |at| filesystem.symlink(source, at)).map_err(cannot_backup)
+			if !source.is_absolute() && !is_virtual_path(source) && !dest_in_working_directory(host, &shown) {
+				return Err(CpError::Error(format!(
+					"{}: can make relative symbolic links only in current directory",
+					shown.maybe_quote()
+				)));
+			}
+			refuse_same_file(false)?;
+			replace_entry(&filesystem, backup, |at| filesystem.symlink(source, at)).map_err(|e| {
+				CpError::IoErrContext(
+					e,
+					format!("cannot create symbolic link {} to {}", shown.quote(), source.quote()),
+				)
+			})?;
 		},
 		_ if !follow && filesystem.is_symlink(&source_fs) => {
 			let target = filesystem.read_link(&source_fs).map_err(|e| {
 				CpError::IoErrContext(e, format!("cannot read symbolic link {}", source.quote()))
 			})?;
-			replace_entry(&filesystem, backup, |at| filesystem.symlink(&target, at)).map_err(cannot_backup)
+			replace_entry(&filesystem, backup, |at| filesystem.symlink(&target, at))
+				.map_err(|e| CpError::IoErrContext(e, format!("cannot create symbolic link {}", shown.quote())))?;
 		},
 		_ => {
-			refuse_same_file()?;
-			copy_into_backup(host, source, dest, backup, options)
+			refuse_same_file(true)?;
+			copy_into_backup(host, source, dest, backup, options, follow)?;
 		},
 	}
+	Ok(true)
 }
 
 /// Copies the data of `source`, which is cp's own destination, into its
-/// backup `backup`, as GNU cp writes it: a regular file there is written in
-/// place, so it keeps its mode, its owner and its other hard links, and the
-/// directory needs no write permission; one that cannot be opened for
-/// writing is replaced (this runs under `-f`); with nothing there the backup
-/// is a new file with the source's mode. A directory there is refused, with
-/// GNU 9.7's message. A symbolic link there is replaced by a new file
-/// renamed over it, never written through, where GNU writes through it. The
-/// data goes through the handles opened, and no path is opened twice.
-fn copy_into_backup(host: &Host, source: &Path, dest: &Path, backup: &Path, options: &Options) -> CopyResult<()> {
+/// backup `backup`, as GNU cp writes it. A regular file there is opened
+/// without following a link put there since the lstat (`O_NOFOLLOW`) and
+/// written in place, so it keeps its mode, its owner and its other hard
+/// links, and the directory needs no write permission; one that cannot be
+/// opened is removed and created again (this runs under `-f`). With nothing
+/// there the backup is created exclusively (`O_EXCL`), with the source's
+/// mode. A symbolic link there is followed to decide, as for any
+/// destination: a dangling one ("not writing through dangling symlink") and
+/// one that leads to a directory are refused, as GNU refuses them; any other
+/// is replaced by a new file renamed over it, never written through, where
+/// GNU writes through it. The data goes through the handles opened, and `-p`
+/// gives the backup the source's attributes.
+fn copy_into_backup(
+	host: &mut Host,
+	source: &Path,
+	dest: &Path,
+	backup: &Path,
+	options: &Options,
+	follow: bool,
+) -> CopyResult<()> {
 	let filesystem = host.fs().clone();
 	let shown = backup_display(dest, backup);
-	let cannot_backup = |e| CpError::IoErrContext(e, format!("cannot backup {}", dest.quote()));
+	let cannot_create = |e| CpError::IoErrContext(e, format!("cannot create regular file {}", shown.quote()));
 	let source_file = filesystem.open(host.resolve(source)).map_err(|e| {
 		CpError::IoErrContext(e, format!("cannot open {} for reading", source.quote()))
 	})?;
-	let mode = source_file.metadata().map_err(cannot_backup)?.permissions().mode() & 0o777;
-	let copy = |file: &File| {
-		if options.attributes_only {
-			return Ok(());
-		}
-		copy_stream_data(host, &source_file, file, source, &shown)
-	};
-	match filesystem.symlink_metadata(backup) {
-		Ok(metadata) if metadata.is_dir() => Err(CpError::Error(format!(
-			"cannot overwrite directory {} with non-directory {}",
-			shown.quote(),
-			source.quote()
-		))),
+	let source_metadata = source_file
+		.metadata()
+		.map_err(|e| CpError::IoErrContext(e, format!("cannot stat {}", source.quote())))?;
+	let mode = source_metadata.permissions().mode() & 0o777;
+	let create = |at: &Path| filesystem.open_with(at, OpenOptions::new().write(true).create_new(true).mode(mode));
+	let existing = filesystem.symlink_metadata(backup);
+	let (file, temp) = match &existing {
 		Ok(metadata) if metadata.is_symlink() => {
+			match filesystem.metadata(backup) {
+				Ok(target) if target.is_dir() => return Err(overwrite_directory(&shown, source)),
+				Err(_) if !is_symlink_loop(&filesystem, backup) && host.var("POSIXLY_CORRECT").is_none() => {
+					return Err(CpError::Error(format!(
+						"not writing through dangling symlink {}",
+						shown.quote()
+					)));
+				},
+				_ => {},
+			}
 			let mut created = None;
 			for temp in names_beside(backup) {
-				match filesystem.open_with(&temp, OpenOptions::new().write(true).create_new(true).mode(mode)) {
+				match create(&temp) {
 					Ok(file) => {
-						created = Some((temp, file));
+						created = Some((file, Some(temp)));
 						break;
 					},
 					Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
-					Err(error) => return Err(cannot_backup(error)),
+					Err(error) => return Err(cannot_create(error)),
 				}
 			}
-			let (temp, file) = created.ok_or_else(|| cannot_backup(io::ErrorKind::AlreadyExists.into()))?;
-			let made = copy(&file)
-				.and_then(|()| file.close().map_err(cannot_backup))
-				.and_then(|()| filesystem.rename(&temp, backup).map_err(cannot_backup));
-			if made.is_err() {
-				let _ = filesystem.remove_file(&temp);
-			}
-			made
+			created.ok_or_else(|| cannot_create(io::ErrorKind::AlreadyExists.into()))?
 		},
-		existing => {
-			let mut open = OpenOptions::new();
-			open.write(true).create(true).truncate(!options.attributes_only).mode(mode);
-			// Never through a symbolic link put at the name since the lstat.
-			#[cfg(unix)]
-			if filesystem.is_native_local(backup) {
-				open.custom_flags(libc::O_NOFOLLOW);
-			}
+		_ => {
 			// The seam where a test puts an entry at the backup name after cp
 			// looked at it, before cp opens it.
 			#[cfg(test)]
 			crate::host::run_hook(backup);
-			let file = match filesystem.open_with(backup, &open) {
-				Ok(file) => file,
-				Err(_) if existing.is_ok() && options.unlink_after_failed_open() => {
-					filesystem.remove_file(backup).map_err(cannot_backup)?;
-					filesystem.open_with(backup, &open).map_err(cannot_backup)?
-				},
-				Err(error) => return Err(cannot_backup(error)),
-			};
-			copy(&file)?;
-			file.close().map_err(|e| CpError::IoErrContext(e, format!("failed to close {}", shown.quote())))
+			if existing.is_ok() {
+				let mut open = OpenOptions::new();
+				open.write(true).truncate(!options.attributes_only);
+				#[cfg(unix)]
+				if filesystem.is_native_local(backup) {
+					open.custom_flags(libc::O_NOFOLLOW);
+				}
+				match filesystem.open_with(backup, &open) {
+					Ok(file) => (file, None),
+					Err(error) if !options.unlink_after_failed_open() => return Err(cannot_create(error)),
+					Err(_) => {
+						match filesystem.remove_file(backup) {
+							Ok(()) => {},
+							Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+							Err(error) => {
+								return Err(CpError::IoErrContext(error, format!("cannot remove {}", shown.quote())));
+							},
+						}
+						(create(backup).map_err(cannot_create)?, None)
+					},
+				}
+			} else {
+				(create(backup).map_err(cannot_create)?, None)
+			}
 		},
+	};
+	let written = if options.attributes_only {
+		Ok(())
+	} else {
+		copy_stream_data(host, &source_file, &file, source, &shown)
+	};
+	let made = written
+		.and_then(|()| {
+			file.close()
+				.map_err(|e| CpError::IoErrContext(e, format!("failed to close {}", shown.quote())))
+		})
+		.and_then(|()| match &temp {
+			Some(temp) => filesystem.rename(temp, backup).map_err(cannot_create),
+			None => Ok(()),
+		});
+	if made.is_err()
+		&& let Some(temp) = &temp
+	{
+		let _ = filesystem.remove_file(temp);
 	}
+	made?;
+	copy_attributes(
+		host,
+		source,
+		&shown,
+		&options.attributes,
+		false,
+		follow,
+		options.set_selinux_context,
+		Some(&source_metadata),
+		DestFacts { symlink: Some(false), ..DestFacts::default() },
+	)
 }
 
 /// GNU's error where the rename that makes a backup did nothing (the backup
@@ -2042,6 +2123,9 @@ fn create_refused(
 	let exists = |what: String| Some(CpError::Error(format!("{what}: File exists")));
 	let link = |what: String| if options.unlink_after_failed_open() { None } else { exists(what) };
 	match options.copy_mode {
+		// GNU replaces the destination with a hard link where `-f` or `-i`
+		// lets it unlink one (`copy.c`), and a symbolic link only under `-f`.
+		CopyMode::Link if matches!(options.overwrite, OverwriteMode::Interactive(_)) => None,
 		CopyMode::Link => link(format!("cannot create hard link {} to {}", dest.quote(), source.quote())),
 		CopyMode::SymLink => link(format!("cannot create symbolic link {} to {}", dest.quote(), source.quote())),
 		CopyMode::AttrOnly => exists(format!("cannot create regular file {}", dest.quote())),
@@ -2151,14 +2235,10 @@ fn is_forbidden_to_copy_to_same_file(
 		return false;
 	}
 	if options.backup != BackupMode::None {
-		// A FIFO or a device would be read by its backup copy, which waits
-		// for a writer; GNU refuses it as the same file.
-		let read = if options.dereference(source_in_command_line) {
-			filesystem.metadata(source_fs)
-		} else {
-			filesystem.symlink_metadata(source_fs)
-		};
-		if !matches!(options.copy_mode, CopyMode::Link | CopyMode::SymLink) && read.is_ok_and(|metadata| is_stream(&metadata)) {
+		// GNU makes the backup of a destination that is the source's own
+		// entry only where the two names are the same string (`cp.c`): `a`
+		// and `./a` are the same file.
+		if source != dest && same_entry(filesystem, source_fs, dest_fs) {
 			return true;
 		}
 		if options.force() && !source_is_symlink {
@@ -2270,9 +2350,33 @@ fn handle_existing_dest(
 					format!("{} and {} are the same file", source.quote(), dest.quote())
 				}));
 			}
+			// A FIFO or a device would be read by its backup copy, which waits
+			// for a writer: GNU refuses it as the same file, and with `-l`
+			// does nothing.
+			let read = if options.dereference(source_in_command_line) {
+				filesystem.metadata(&source_fs)
+			} else {
+				filesystem.symlink_metadata(&source_fs)
+			};
+			if read.is_ok_and(|metadata| is_stream(&metadata)) {
+				if options.copy_mode == CopyMode::Link {
+					return Ok((None, true));
+				}
+				return Err(CpError::Error(format!(
+					"{} and {} are the same file",
+					source.quote(),
+					dest.quote()
+				)));
+			}
 			// `cp -fb a a`: the destination is the source's own entry, so
-			// its backup is a copy, and the copy is all there is to do.
-			back_up_own_entry(host, source, dest, backup, options, source_in_command_line)?;
+			// its backup is a copy, and the copy is all there is to do. `-v`
+			// reports it as GNU does, `'a' -> 'a~'`.
+			if back_up_own_entry(host, source, dest, backup, options, source_in_command_line)?
+				&& options.verbose
+				&& !options.move_mode
+			{
+				state.say(host, context_for(source, &backup_display(dest, backup)));
+			}
 			return Ok((Some(backup.clone()), true));
 		}
 		// GNU renames the destination to the backup name, and the copy then
