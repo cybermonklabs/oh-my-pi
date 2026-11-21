@@ -18,7 +18,7 @@
 
 ### Fixed
 
-- Fixed `bun test` processes reading your `~/.env`, `~/.omp/.env` and agent-dir `.env` (an `E2E=1` run still loads them for live provider tests)
+- Fixed `bun test` processes reading your `~/.env`, `~/.omp/.env` and agent-dir `.env`
 
 ## [19.0.0] - 2026-11-18
 

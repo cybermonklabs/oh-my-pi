@@ -7,7 +7,12 @@
  * `GOOGLE_APPLICATION_CREDENTIALS`), so when `E2E` is set in the environment this module loads them
  * with the loader's own rule: in the loader's order, a name already set left as it is, an empty
  * value never hiding a later file's, and `OTEL_*` kept out of the environment
- * (`claimOmpOtelEnvFileEntry`). Import it before the provider code reads the environment.
+ * (`claimOmpOtelEnvFileEntry`).
+ *
+ * The test preload (`./e2e-preload.ts`) loads this module first, so even provider code that reads a
+ * setting when it loads sees it. `./oauth.ts` and `./helpers` import it too, for a run whose working
+ * directory has no such preload: there it loads only when they do, after the provider modules a test
+ * file imports before them.
  */
 import * as os from "node:os";
 import * as path from "node:path";

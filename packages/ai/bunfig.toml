@@ -1,0 +1,3 @@
+[test]
+# An E2E=1 run loads the developer's dotenv files before any test file loads (test/e2e-preload.ts).
+preload = ["./test/e2e-preload.ts"]

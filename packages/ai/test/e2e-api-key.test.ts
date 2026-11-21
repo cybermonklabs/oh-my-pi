@@ -125,3 +125,64 @@ describe("an E2E run's environment", () => {
 		CHILD_TIMEOUT_MS,
 	);
 });
+
+/**
+ * `NO_STRICT`, which `src/utils/schema/adapt.ts` reads from `PI_NO_STRICT` when it loads, in a
+ * `bun test` run of a file that imports it before `./oauth.ts`, as the live suites import provider
+ * code first. The run is in this package, so its `bun test` preload runs, and its agent dir's `.env`
+ * sets `PI_NO_STRICT=1`.
+ */
+async function loadTimeNoStrict(env: Record<string, string>): Promise<string> {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ai-e2e-load-"));
+	try {
+		fs.mkdirSync(path.join(home, ".omp", "agent"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".omp", "agent", ".env"), "PI_NO_STRICT=1\n");
+		const adapt = path.join(import.meta.dir, "..", "src", "utils", "schema", "adapt.ts");
+		const oauth = path.join(import.meta.dir, "oauth.ts");
+		// A test file's name, so omp's loader counts the run as a test run, as it does a package's own files.
+		const fixture = path.join(home, "load-time.test.ts");
+		fs.writeFileSync(
+			fixture,
+			`import { test } from "bun:test";
+import { NO_STRICT } from ${JSON.stringify(adapt)};
+import ${JSON.stringify(oauth)};
+test("reads NO_STRICT", () => console.log("NO_STRICT " + NO_STRICT));
+`,
+		);
+		const childEnv: Record<string, string> = { ...createProductionChildEnv(), HOME: home, USERPROFILE: home };
+		delete childEnv.E2E;
+		const proc = Bun.spawn([process.execPath, "test", fixture], {
+			cwd: path.join(import.meta.dir, ".."),
+			env: { ...childEnv, ...env },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		return /NO_STRICT (\w+)/.exec(`${stdout}${stderr}`)?.[1] ?? `no output: ${stdout}${stderr}`;
+	} finally {
+		fs.rmSync(home, { recursive: true, force: true });
+	}
+}
+
+describe("an E2E run's settings read when a module loads", () => {
+	it(
+		"reach provider code that loads before ./oauth.ts, through this package's bun test preload",
+		async () => {
+			expect(await loadTimeNoStrict({ E2E: "1" })).toBe("true");
+		},
+		CHILD_TIMEOUT_MS,
+	);
+
+	it(
+		"stay unread outside an E2E run",
+		async () => {
+			expect(await loadTimeNoStrict({})).toBe("false");
+		},
+		CHILD_TIMEOUT_MS,
+	);
+});

@@ -13,6 +13,9 @@ saveTextLockfile = true
 ".lark" = "text"
 
 [test]
+# An E2E=1 run loads the developer's dotenv files before any test file loads
+# (packages/ai/test/e2e-preload.ts; packages/ai and packages/coding-agent have the same preload).
+preload = ["./packages/ai/test/e2e-preload.ts"]
 # bun test does NOT honor .gitignore; prune robomp's repo clones and
 # scratch dirs so a root-level `bun test` doesn't walk into them.
 #

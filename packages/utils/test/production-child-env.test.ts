@@ -89,38 +89,88 @@ describe("createProductionChildEnv", () => {
 });
 
 describe("createProductionChildEnv in concurrent tests", () => {
-	const fixture = path.join(import.meta.dir, "fixtures", "production-child-env-concurrent.ts");
+	const helper = path.join(import.meta.dir, "..", "..", "..", "scripts", "test-env.ts");
+
+	/**
+	 * Runs `bun test <args>` on two test files, each with two concurrent tests that make a production
+	 * child's environment, and returns the directories each file's tests made, in the order the files
+	 * ran. Each test makes a home and a directory for `bun` (an empty PATH has none).
+	 */
+	async function run(args: string[]): Promise<{ file: string; dirs: string[] }[]> {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-concurrent-"));
+		try {
+			const files = ["first", "second"].map(name => path.join(root, `${name}.ts`));
+			for (const file of files) {
+				fs.writeFileSync(
+					file,
+					`import { test } from "bun:test";
+import * as path from "node:path";
+import { createProductionChildEnv } from ${JSON.stringify(helper)};
+for (const n of [1, 2]) {
+	test.concurrent("makes a production child's environment " + n, () => {
+		const env = createProductionChildEnv({ PATH: "" });
+		console.log("DIRS " + JSON.stringify({ file: ${JSON.stringify(path.basename(file))}, dirs: [env.HOME, env.PATH.split(path.delimiter)[0]] }));
+	});
+}
+`,
+				);
+			}
+			const proc = Bun.spawn([process.execPath, "test", ...args, ...files], {
+				cwd: path.join(import.meta.dir, ".."),
+				env: process.env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(exitCode, stderr).toBe(0);
+			const byFile = new Map<string, string[]>();
+			for (const line of `${stdout}${stderr}`.split("\n")) {
+				if (!line.startsWith("DIRS ")) continue;
+				const { file, dirs } = JSON.parse(line.slice("DIRS ".length)) as { file: string; dirs: string[] };
+				byFile.set(file, [...(byFile.get(file) ?? []), ...dirs]);
+			}
+			expect(
+				[...byFile.values()].map(dirs => dirs.length),
+				`${stdout}${stderr}`,
+			).toEqual([4, 4]);
+			return [...byFile].map(([file, dirs]) => ({ file, dirs }));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}
+
+	const left = (dirs: string[]) => dirs.filter(dir => fs.existsSync(dir));
 
 	// Bun refuses every hook in a concurrent test, and runs no `exit` handler of a `bun test`
-	// process: the test file's own hook removes these directories. Each run is a `bun test` child,
-	// so its directories are checked after it ends.
-	for (const args of [[], ["--isolate"], ["--parallel"]]) {
+	// process: the test file's own hook removes these directories, so each run is a `bun test` child
+	// whose directories are checked after it ends.
+	for (const args of [["--isolate"], ["--parallel"]]) {
 		it(
-			`removes the directories when the test file ends (bun test ${args.join(" ")})`,
+			`removes the directories of every file when it ends, as bun test ${args.join(" ")} loads the helper for each file`,
 			async () => {
-				const proc = Bun.spawn([process.execPath, "test", ...args, fixture], {
-					cwd: path.join(import.meta.dir, ".."),
-					env: process.env,
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				const [stdout, stderr, exitCode] = await Promise.all([
-					new Response(proc.stdout).text(),
-					new Response(proc.stderr).text(),
-					proc.exited,
-				]);
-				expect(exitCode, stderr).toBe(0);
-				const dirs = `${stdout}${stderr}`
-					.split("\n")
-					.filter(line => line.startsWith("DIRS "))
-					.flatMap(line => JSON.parse(line.slice("DIRS ".length)) as string[]);
-				// Each of the two tests made a home and a directory for `bun`.
-				expect(dirs.length, `${stdout}${stderr}`).toBe(4);
-				expect(dirs.filter(dir => fs.existsSync(dir))).toEqual([]);
+				for (const { dirs } of await run(args)) expect(left(dirs)).toEqual([]);
 			},
 			CHILD_TIMEOUT_MS,
 		);
 	}
+
+	it(
+		"removes only the first file's directories in a plain bun test, which shares the helper between files",
+		async () => {
+			const [first, second] = await run([]);
+			try {
+				expect(left(first.dirs)).toEqual([]);
+				expect(left(second.dirs)).toEqual(second.dirs);
+			} finally {
+				for (const dir of second.dirs) fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+		CHILD_TIMEOUT_MS,
+	);
 });
 
 describe("hardLinkOrCopy", () => {
