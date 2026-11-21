@@ -1023,10 +1023,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}),
 			);
 		}
-		// Set right after the last abort check before a file, archive or SQLite write: from then
-		// the write goes ahead, and an abort no longer ends the call (see untilAbortedBeforeWrite).
-		// A handler-owned write (messages, devices, settings) never sets it: its handler sees the
-		// signal itself, and the call keeps returning at the abort.
+		// Set right after the last abort check before a file, archive or SQLite write, or by a
+		// handler right before it changes a local file (`conflict://`, through the write context's
+		// `onWriteBegin`): from then the write goes ahead, and an abort no longer ends the call
+		// (see untilAbortedBeforeWrite). Other handler-owned writes (messages, devices, settings,
+		// `ssh://` and RPC host URIs) never set it: their handlers get the signal themselves, and
+		// the call keeps returning at the abort.
 		let writeBegan = false;
 		const beginWrite = () => {
 			writeBegan = true;
@@ -1066,11 +1068,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						}
 						emitWriteProgress(onUpdate, cleanBytes, path);
 					}
+					// The last check before the handler: past it, the handler sees the signal itself.
+					signal?.throwIfAborted();
 					const handlerResult = await router.write(
 						path,
 						cleanContent,
 						sessionWriteContext(this.session, {
 							signal,
+							onWriteBegin: beginWrite,
 							toolCall: { id: _toolCallId, onUpdate, context },
 						}),
 					);

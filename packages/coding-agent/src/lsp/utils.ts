@@ -524,16 +524,22 @@ export function mergeCodeActions(
 export interface CodeActionApplyDependencies {
 	resolveCodeAction?: (action: CodeAction) => Promise<CodeAction>;
 	applyWorkspaceEdit: (edit: WorkspaceEdit) => Promise<string[]>;
-	executeCommand: (command: Command) => Promise<void>;
-	/** The call's signal (its cancel and its deadline): once the edit has changed files, a command it stops is reported, not thrown. */
+	/**
+	 * Run `command` on the server. Its server may carry it out by sending `workspace/applyEdit`
+	 * back; the implementation adds the applied lines of each such edit to `serverEdits`, also
+	 * when the command's request rejects.
+	 */
+	executeCommand: (command: Command, serverEdits: string[]) => Promise<void>;
+	/** The call's signal (its cancel and its deadline): once files have changed, a command it stops is reported, not thrown. */
 	signal?: AbortSignal;
 }
 
 export interface AppliedCodeActionResult {
 	title: string;
+	/** The action's own edit, then the edits its server applied while its command ran. */
 	edits: string[];
 	executedCommands: string[];
-	/** Commands the call's signal stopped waiting for after the edit had changed files. */
+	/** Commands the call's signal stopped waiting for after files had changed. */
 	abortedCommands?: string[];
 }
 
@@ -541,13 +547,35 @@ function isCommandItem(action: CodeAction | Command): action is Command {
 	return typeof action.command === "string";
 }
 
+/**
+ * Run `command` and add the edits its server applied to `edits`. Once some edit has changed
+ * files (the action's own, or one the server applied for the command), a command the call's
+ * signal stops is reported in the result instead of failing the call, since the changes stay.
+ */
+async function runCommand(
+	command: Command,
+	dependencies: CodeActionApplyDependencies,
+	edits: string[],
+): Promise<Pick<AppliedCodeActionResult, "executedCommands" | "abortedCommands">> {
+	const serverEdits: string[] = [];
+	try {
+		await dependencies.executeCommand(command, serverEdits);
+		return { executedCommands: [command.command] };
+	} catch (error) {
+		if (edits.length + serverEdits.length === 0 || !dependencies.signal?.aborted) throw error;
+		return { executedCommands: [], abortedCommands: [command.command] };
+	} finally {
+		edits.push(...serverEdits);
+	}
+}
+
 export async function applyCodeAction(
 	action: CodeAction | Command,
 	dependencies: CodeActionApplyDependencies,
 ): Promise<AppliedCodeActionResult | null> {
 	if (isCommandItem(action)) {
-		await dependencies.executeCommand(action);
-		return { title: action.title, edits: [], executedCommands: [action.command] };
+		const edits: string[] = [];
+		return { title: action.title, edits, ...(await runCommand(action, dependencies, edits)) };
 	}
 
 	let resolvedAction = action;
@@ -560,25 +588,15 @@ export async function applyCodeAction(
 	}
 
 	const edits = resolvedAction.edit ? await dependencies.applyWorkspaceEdit(resolvedAction.edit) : [];
-	const executedCommands: string[] = [];
-	let abortedCommands: string[] | undefined;
-	if (resolvedAction.command) {
-		try {
-			await dependencies.executeCommand(resolvedAction.command);
-			executedCommands.push(resolvedAction.command.command);
-		} catch (error) {
-			// The edit has already changed files, and the abort does not undo them: the
-			// call reports the edit as applied and the command as aborted.
-			if (edits.length === 0 || !dependencies.signal?.aborted) throw error;
-			abortedCommands = [resolvedAction.command.command];
-		}
-	}
+	const commandRun = resolvedAction.command
+		? await runCommand(resolvedAction.command, dependencies, edits)
+		: { executedCommands: [] };
 
-	if (edits.length === 0 && executedCommands.length === 0) {
+	if (edits.length === 0 && commandRun.executedCommands.length === 0) {
 		return null;
 	}
 
-	return { title: resolvedAction.title, edits, executedCommands, ...(abortedCommands ? { abortedCommands } : {}) };
+	return { title: resolvedAction.title, edits, ...commandRun };
 }
 
 const GLOB_PATTERN_CHARS = /[*?[{]/;

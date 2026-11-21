@@ -5,7 +5,7 @@ import { glob } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
-import { resolveSyscallTarget } from "../tools/path-utils";
+import { formatPathRelativeToCwd, resolveSyscallTarget } from "../tools/path-utils";
 import { findRepoRoot } from "../capability/fs";
 import { getConfig } from "./config";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
@@ -23,6 +23,7 @@ import type {
 	LspWriteSink,
 	PublishDiagnosticsParams,
 	ServerConfig,
+	ServerEditWatcher,
 	WorkspaceEdit,
 } from "./types";
 import {
@@ -822,7 +823,9 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 }
 
 /**
- * Handle workspace/applyEdit requests from the server.
+ * Handle workspace/applyEdit requests from the server. A command of ours that is running
+ * (see {@link collectServerEdits}) gets this edit's applied lines once its files are written,
+ * before the open documents are brought up to date.
  */
 async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
 	const params = message.params as { edit?: WorkspaceEdit };
@@ -836,11 +839,38 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 		return;
 	}
 
+	const watchers = [...(client.serverEditWatchers ?? [])];
+	const landed = Promise.withResolvers<void>();
+	for (const watcher of watchers) watcher.landing.add(landed.promise);
 	try {
-		await applyWorkspaceEditWithLsp(params.edit, client.cwd);
+		await applyWorkspaceEditWithLsp(params.edit, client.cwd, undefined, applied => {
+			for (const watcher of watchers) watcher.edits.push(...applied);
+			landed.resolve();
+		});
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
 		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
+	} finally {
+		landed.resolve();
+	}
+}
+
+/**
+ * Run `run`, a request to `client` that its server may carry out by sending
+ * `workspace/applyEdit` back (a code action's command), and add to `into` the applied
+ * lines of each such edit that starts while it runs. Settles as `run` does, but only once
+ * those edits have written their files, so a caller that `run` rejected (its call was
+ * aborted) still sees what the server changed.
+ */
+export async function collectServerEdits<T>(client: LspClient, into: string[], run: () => Promise<T>): Promise<T> {
+	const watcher: ServerEditWatcher = { edits: into, landing: new Set() };
+	const watchers = (client.serverEditWatchers ??= new Set());
+	watchers.add(watcher);
+	try {
+		return await run();
+	} finally {
+		watchers.delete(watcher);
+		await Promise.all(watcher.landing);
 	}
 }
 
@@ -882,48 +912,92 @@ function uriIsWithin(uri: string, root: string): boolean {
 }
 
 /**
- * Reconcile open overlays and file watchers with the ops a workspace edit actually performed.
- * The ops have already changed the files, so the caller's abort does not stop this: each
- * step is bounded by its own {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}, as the notice is. A
- * client whose step fails is logged and left; the notice still goes out, and nothing here
- * rejects.
+ * A signal that aborts `ms` after `signal` does (`ms` from now if it already has), or none
+ * when there is no `signal`: a step that starts or runs after the caller's abort gets that
+ * long, and without an abort it waits as long as it takes.
  */
-async function reconcileExecutedChanges(executed: ExecutedWorkspaceChange[], cwd: string): Promise<void> {
-	if (executed.length === 0) return;
+function boundAfterAbort(signal: AbortSignal | undefined, ms: number): { signal?: AbortSignal; dispose(): void } {
+	if (!signal) return { dispose() {} };
+	if (signal.aborted) return { signal: AbortSignal.timeout(ms), dispose() {} };
+	const bound = new AbortController();
+	const onAbort = () => {
+		const timeout = AbortSignal.timeout(ms);
+		timeout.addEventListener("abort", () => bound.abort(timeout.reason), { once: true });
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	return { signal: bound.signal, dispose: () => signal.removeEventListener("abort", onAbort) };
+}
+
+/**
+ * Reconcile open overlays and file watchers with the ops a workspace edit actually performed.
+ * The ops have already changed the files, so the caller's abort does not stop this. Each
+ * step (a `didClose` for a deleted document, a refresh of an open one) runs on its own: one
+ * that fails is logged and named in the returned notes, and the other files' steps still
+ * run. Without an abort a step waits as long as the server takes; once `signal` aborts, a
+ * step still to finish gets {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS} from then, and a server
+ * that stops reading is torn down by the write the bound cuts short. The notice still goes
+ * out, and nothing here rejects.
+ */
+async function reconcileExecutedChanges(
+	executed: ExecutedWorkspaceChange[],
+	cwd: string,
+	signal: AbortSignal | undefined,
+): Promise<string[]> {
+	if (executed.length === 0) return [];
 	const { finalUris, deletedRoots, watchedFiles } = workspaceEditChanges(executed);
 	const workspace = path.resolve(cwd);
 	const activeClients = Array.from(clients.values()).filter(
 		client => client.status === "ready" && path.resolve(client.cwd) === workspace,
 	);
-	const stepBound = () => AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
+	const notes: string[] = [];
+	const step = async (activeClient: LspClient, what: string, run: (stepSignal?: AbortSignal) => Promise<void>) => {
+		// A client torn down by an earlier step's bound is gone; its later steps would only fail.
+		if (clients.get(activeClient.name) !== activeClient) {
+			notes.push(`Note: ${activeClient.config.command} was not told of ${what}: the server was stopped.`);
+			return;
+		}
+		const bound = boundAfterAbort(signal, WATCHED_FILES_NOTIFY_TIMEOUT_MS);
+		try {
+			await run(bound.signal);
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			logger.warn("LSP overlay reconciliation after a workspace edit failed", {
+				client: activeClient.name,
+				step: what,
+				error: reason,
+			});
+			notes.push(`Note: ${activeClient.config.command} was not told of ${what} (${reason}).`);
+		} finally {
+			bound.dispose();
+		}
+	};
+	const shown = (uri: string) => formatPathRelativeToCwd(uriToFile(uri), cwd);
 
 	await Promise.all(
 		activeClients.map(async activeClient => {
-			try {
-				for (const uri of Array.from(activeClient.openFiles.keys())) {
-					let deleted = false;
-					for (const root of deletedRoots) {
-						if (uriIsWithin(uri, root)) {
-							deleted = true;
-							break;
-						}
+			for (const uri of Array.from(activeClient.openFiles.keys())) {
+				let deleted = false;
+				for (const root of deletedRoots) {
+					if (uriIsWithin(uri, root)) {
+						deleted = true;
+						break;
 					}
-					if (!deleted) continue;
-					await closeDocument(activeClient, uri, stepBound());
 				}
-				for (const uri of finalUris) {
-					if (!activeClient.openFiles.has(uri)) continue;
-					await refreshFile(activeClient, uriToFile(uri), stepBound());
-				}
-			} catch (err) {
-				logger.warn("LSP overlay reconciliation after a workspace edit failed", {
-					client: activeClient.name,
-					error: err instanceof Error ? err.message : String(err),
-				});
+				if (!deleted) continue;
+				await step(activeClient, `the removal of ${shown(uri)}`, stepSignal =>
+					closeDocument(activeClient, uri, stepSignal),
+				);
+			}
+			for (const uri of finalUris) {
+				if (!activeClient.openFiles.has(uri)) continue;
+				await step(activeClient, `the new text of ${shown(uri)}`, stepSignal =>
+					refreshFile(activeClient, uriToFile(uri), stepSignal),
+				);
 			}
 		}),
 	);
 	await notifyWorkspaceWatchedFiles(cwd, watchedFiles);
+	return notes;
 }
 
 /**
@@ -936,20 +1010,27 @@ async function reconcileExecutedChanges(executed: ExecutedWorkspaceChange[], cwd
  *
  * A `signal` already aborted when the call starts stops it before it changes anything;
  * the edit itself does not watch the signal. Once the edit has run, the abort stops
- * nothing: the call reports what it changed, and the servers are told of it.
+ * nothing: the call reports what it changed, and the servers are told of it. The result
+ * lists the applied changes, then a note for each server that was not brought up to date.
+ * `onApplied` gets the applied changes as soon as the files are written, before that.
  */
 export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
+	onApplied?: (applied: string[]) => void,
 ): Promise<string[]> {
 	throwIfAborted(signal);
 	const executed: ExecutedWorkspaceChange[] = [];
+	let applied: string[];
 	try {
-		return (await applyWorkspaceEdit(edit, cwd, change => executed.push(change))).applied;
-	} finally {
-		await reconcileExecutedChanges(executed, cwd);
+		({ applied } = await applyWorkspaceEdit(edit, cwd, change => executed.push(change)));
+	} catch (err) {
+		await reconcileExecutedChanges(executed, cwd, signal);
+		throw err;
 	}
+	onApplied?.(applied);
+	return [...applied, ...(await reconcileExecutedChanges(executed, cwd, signal))];
 }
 
 interface DynamicCapabilityRegistration {

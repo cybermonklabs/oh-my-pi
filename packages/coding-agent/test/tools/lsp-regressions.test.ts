@@ -6114,7 +6114,11 @@ describe("lsp regressions", () => {
 				);
 
 				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
-				expect(settled).toEqual([expect.stringContaining("n.ts")]);
+				// The step the bound cut short is named: the server was not told of the new text.
+				expect(settled).toEqual([
+					"Applied 1 edit(s) to n.ts",
+					expect.stringMatching(/^Note: fake-lsp was not told of the new text of n\.ts \(/),
+				]);
 			} finally {
 				await lspClient.shutdownAll();
 				tempDir.removeSync();
@@ -6170,6 +6174,10 @@ describe("lsp regressions", () => {
 			return { target, settled, controller };
 		}
 
+		/** The line that names commands a code-action call stopped waiting for. */
+		const NOT_WAITED =
+			"  Command(s) not waited for, because the call was cancelled or timed out (edits the server applied for them by then are listed above; it may still apply more):";
+
 		const fixItWithCommand = (uri: string): CodeAction => ({
 			title: "Fix it",
 			kind: "quickfix",
@@ -6196,9 +6204,7 @@ describe("lsp regressions", () => {
 				expect(settled).not.toBeInstanceOf(Error);
 				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
 				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:');
-				expect(text).toContain(
-					"  Command(s) not waited for, because the call was cancelled or timed out (the server may not have run them):\n    fix.it",
-				);
+				expect(text).toContain(`${NOT_WAITED}\n    fix.it`);
 			} finally {
 				await lspClient.shutdownAll();
 				tempDir.removeSync();
@@ -6236,6 +6242,248 @@ describe("lsp regressions", () => {
 				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
 				expect(text).toStartWith("LSP error:");
 				expect(text).toContain("fix.it failed");
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		/**
+		 * An `onCommand` for {@link applyFixIt}: the server carries out the command by asking the
+		 * client to apply `edit` (`workspace/applyEdit`), and the call is aborted once the client
+		 * has answered that it applied it, before the server answers the command.
+		 */
+		const serverAppliesThenAbort =
+			(edit: () => WorkspaceEdit) => (_message: RpcMessage, srv: FakeLspServer, controller: AbortController) => {
+				srv.send({ jsonrpc: "2.0", id: "server-edit", method: "workspace/applyEdit", params: { edit: edit() } });
+				void srv
+					.waitFor(reply => reply.id === "server-edit" && reply.method === undefined)
+					.then(() => controller.abort());
+			};
+		const serverEditOf = (file: string, from: number, to: number): WorkspaceEdit => ({
+			changes: {
+				[fileToUri(file)]: [
+					{ range: { start: { line: 0, character: from }, end: { line: 0, character: to } }, newText: "new" },
+				],
+			},
+		});
+
+		it("a code action whose command has the server apply an edit, then the abort, reports that edit", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-command-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					serverAppliesThenAbort(() => serverEditOf(target, 18, 21)),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bare command that has the server apply an edit, then the abort, reports that edit", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-bare-command-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					serverAppliesThenAbort(() => serverEditOf(target, 18, 21)),
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a code action with an edit and a command lists the edit its server applied to another file", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-second-file-");
+			try {
+				const other = path.join(tempDir.path(), "m.ts");
+				await Bun.write(other, 'export const m = "old";\n');
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					fixItWithCommand,
+					serverAppliesThenAbort(() => serverEditOf(other, 18, 21)),
+				);
+
+				expect(await Bun.file(other).text()).toBe('export const m = "new";\n');
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toBe(
+					`Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n    Applied 1 edit(s) to m.ts\n${NOT_WAITED}\n    fix.it`,
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit with no abort waits for a slow server, and does not stop it", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-slow-server-no-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// A fake clock for timeout signals: a bound only elapses when the test fires it.
+				const timeouts: AbortController[] = [];
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					return timeout.signal;
+				});
+				// The server stops reading at the next write, until the test lets it go on.
+				const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+				const stalled = Promise.withResolvers<void>();
+				const resume = Promise.withResolvers<void>();
+				let stalls = 0;
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(async () => {
+					if (stalls++ === 0) {
+						stalled.resolve();
+						await resume.promise;
+					}
+					return flush();
+				});
+
+				const call = settle(lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path()));
+				await stalled.promise;
+				// Every bound running now elapses; then the server reads again.
+				for (const timeout of timeouts) timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
+				resume.resolve();
+				const settledCall = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ settled: settledCall, killed: server.killed }).toEqual({
+					settled: [expect.stringContaining("n.ts")],
+					killed: false,
+				});
+				const didChange = await server.waitFor(message => message.method === "textDocument/didChange");
+				expect(didChange.params).toMatchObject({ contentChanges: [{ text: 'export const a = "new";\n' }] });
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit aborted while the server is not reading is bounded from the abort", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-slow-server-then-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				const timeouts: AbortController[] = [];
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					return timeout.signal;
+				});
+				// From the next write the server never reads again.
+				const stalled = Promise.withResolvers<void>();
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => {
+					stalled.resolve();
+					return Promise.withResolvers<number>().promise;
+				});
+				const controller = new AbortController();
+
+				const call = settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+				await stalled.promise;
+				// The abort comes while the refresh waits; then every bound running elapses.
+				controller.abort();
+				for (const timeout of timeouts) timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
+				const settledCall = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ killed: server.killed, applied: (settledCall as string[])[0] }).toEqual({
+					killed: true,
+					applied: "Applied 1 edit(s) to n.ts",
+				});
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit whose refresh of one file fails still refreshes the other, and names the failure", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-one-refresh-fails-");
+			try {
+				const first = path.join(tempDir.path(), "a.ts");
+				const second = path.join(tempDir.path(), "b.ts");
+				await Bun.write(first, 'export const a = "old";\n');
+				await Bun.write(second, 'export const b = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, first);
+				await lspClient.ensureFileOpen(client, second);
+				// Once both files are written, the first file's refresh is refused when it reads the file.
+				let written = 0;
+				const write = Bun.write;
+				vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+					const bytes: number = await Reflect.apply(write, Bun, args);
+					if (args[0] === first || args[0] === second) written++;
+					return bytes;
+				}) as never);
+				// `readTextFromDisk` stats through the `node:fs/promises` namespace.
+				const realStat = fsp.stat;
+				vi.spyOn(fsp, "stat").mockImplementation((async (target: fs.PathLike) => {
+					if (written === 2 && target === first) {
+						throw Object.assign(new Error(`EACCES: permission denied, stat '${first}'`), { code: "EACCES" });
+					}
+					return await realStat(target);
+				}) as typeof fsp.stat);
+				const edit: WorkspaceEdit = {
+					documentChanges: [first, second].map((file): TextDocumentEdit => ({
+						textDocument: { uri: fileToUri(file), version: null },
+						edits: [
+							{ range: { start: { line: 0, character: 18 }, end: { line: 0, character: 21 } }, newText: "new" },
+						],
+					})),
+				};
+
+				const applied = await lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path());
+
+				expect(applied.slice(0, 2)).toEqual(["Applied 1 edit(s) to a.ts", "Applied 1 edit(s) to b.ts"]);
+				expect(applied.slice(2)).toEqual([
+					expect.stringMatching(/^Note: .+ was not told of the new text of a\.ts \(EACCES: permission denied/),
+				]);
+				const didChangeB = await server.waitFor(
+					message =>
+						message.method === "textDocument/didChange" &&
+						JSON.stringify(message.params).includes(fileToUri(second)),
+				);
+				expect(didChangeB.params).toMatchObject({ contentChanges: [{ text: 'export const b = "new";\n' }] });
 			} finally {
 				await lspClient.shutdownAll();
 				tempDir.removeSync();
