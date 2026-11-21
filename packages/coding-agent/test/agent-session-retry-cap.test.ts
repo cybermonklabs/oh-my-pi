@@ -2877,6 +2877,34 @@ describe("AgentSession retry delay cap", () => {
 
 			expect(run.advisorRequests).toEqual(["anthropic/claude-haiku-4-5"]);
 		});
+
+		// With `advisor.enabled` on, the session builds its advisors in its constructor. Their runs are this tree's
+		// model calls, so each advisor must carry the session's closure as its scope from the start: copied after
+		// the primary agent's scope was set, never before it.
+		it("an advisor built when the session starts runs in the session's model-call scope", () => {
+			const codex = getBundledModel("openai-codex", "gpt-5.6-sol");
+			if (!codex) throw new Error("Expected bundled test models to exist");
+			const settings = Settings.isolated({ "advisor.enabled": true, "compaction.enabled": false });
+			settings.setModelRole("default", `${codex.provider}/${codex.id}`);
+			settings.setModelRole("advisor", "anthropic/claude-haiku-4-5");
+			session = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model: codex, systemPrompt: ["Test"], tools: [], messages: [] },
+				}),
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+				advisorTools: [],
+				advisorConfigs: [{ name: "reviewer", model: "anthropic/claude-haiku-4-5" }],
+			});
+
+			const advisor = session.getAdvisorAgent();
+			if (!advisor) throw new Error("Expected an advisor built at construction");
+			expect(advisor.modelCallScope).toBeDefined();
+			expect(advisor.modelCallScope).toBe(session.agent.modelCallScope);
+			expect(advisor.modelCallScope).toBe(session.cyberPolicyClosure);
+		});
 	});
 
 	it("waits for the earliest sibling unblock instead of failing the delay cap", async () => {

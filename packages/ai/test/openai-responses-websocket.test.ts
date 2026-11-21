@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import type { ServerWebSocket } from "bun";
 import { streamSimple } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { type as schemaType } from "@oh-my-pi/omptype";
 import { streamOpenAIResponses, type OpenAIResponsesOptions } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type {
@@ -57,6 +58,29 @@ describe("standard OpenAI Responses WebSocket opt-in", () => {
 		expect(result.content).toMatchObject([{ type: "text", text: "HTTP" }]);
 		expect(fixture.httpRequests).toHaveLength(1);
 		expect(fixture.upgrades).toHaveLength(0);
+	});
+
+	// Each WebSocket send (the first, a transient-stream retry, a fallback) reads the model-call guards before it
+	// goes out. Called past the call's own checkpoint, a held model sends nothing over WebSocket or HTTP; with no
+	// hold the same call sends one WebSocket request (the control).
+	it.each([
+		["sends nothing over the WebSocket while a model-call hold stands", true],
+		["sends the WebSocket request when no hold stands (control)", false],
+	])("%s", async (_name, held) => {
+		const fixture = endpoint();
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		try {
+			const result = await streamOpenAIResponses(fixture.model, fixture.context, {
+				...fixture.options,
+				preferWebsockets: true,
+			}).result();
+
+			expect(fixture.requests).toHaveLength(held ? 0 : 1);
+			expect(fixture.httpRequests).toHaveLength(0);
+			expect(result.stopReason).toBe(held ? "error" : "stop");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("runs an explicit WS payload hook for an already-aborted request without connecting", async () => {

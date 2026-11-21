@@ -10,6 +10,7 @@ import {
 	structuredCloneJSON,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { assertModelCallAllowed } from "../model-call-guard";
 import { getEnvApiKey } from "../env-api-key";
 import type {
 	AssistantMessage,
@@ -991,6 +992,9 @@ const streamOpenAIResponsesOnce = (
 						if ("background" in requestParams && requestParams.background === true) {
 							throw new Error("OpenAI responses WebSocket requests do not support background: true");
 						}
+						// Each WebSocket send (the first, a transient-stream retry, a fallback) reads the model-call
+						// guards before it goes out; the HTTP path reads them in `postOpenAIStream`.
+						assertModelCallAllowed(model);
 						const lease = webSocketLease!;
 						return lease.session.events(requestParams, {
 							signal: requestSignal,

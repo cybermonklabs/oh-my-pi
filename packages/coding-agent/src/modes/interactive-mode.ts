@@ -1850,7 +1850,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingPlanReview:
 		| {
 				request: PlanReviewRequestedEvent;
-				remote?: { choice: PlanReviewChoice; feedback?: string };
+				/** An extension's pick: its origin is only what the extension passes (`input.origin`). */
+				remote?: { choice: PlanReviewChoice; feedback?: string; origin?: InputOrigin };
 				/** Applies a remote tier pick to the review's slider selection; undefined when the slider is hidden. */
 				selectTier?: (role: string) => boolean;
 		  }
@@ -6568,7 +6569,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	resolvePlanReview(
 		reviewId: string,
 		choice: PlanReviewChoice,
-		input?: { feedback?: string; role?: string },
+		input?: { feedback?: string; role?: string; origin?: InputOrigin },
 	): boolean {
 		const pending = this.#pendingPlanReview;
 		const pick = this.#planReviewPick;
@@ -6581,7 +6582,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const approves = choice === "execute" || choice === "compact" || choice === "keep";
 			if (!approves || !pending.selectTier?.(input.role)) return false;
 		}
-		pending.remote = { choice, feedback };
+		pending.remote = { choice, feedback, origin: input?.origin };
 		if (pick(option.label)) return true;
 		pending.remote = undefined;
 		return false;
@@ -6872,6 +6873,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			compactBeforeExecute?: boolean;
 			executionModel?: ResolvedRoleModel;
 			reviewOwner: object;
+			/**
+			 * The pick's origin: `"outside"` for a person's pick in the review, and for an extension's only
+			 * when it passes `origin: "outside"`. It ends the session's cyber-policy hold only then.
+			 */
+			origin: InputOrigin | undefined;
 		},
 	): Promise<boolean> {
 		const previousPresentation = this.#planModePreviousToolPresentation ?? {
@@ -6935,8 +6941,8 @@ export class InteractiveMode implements InteractiveModeContext {
 					undefined,
 					undefined,
 					outcome => this.#applyDeferredPlanModelTransition(outcome, options.executionModel),
-					// A person's plan approval: input from outside the session.
-					{ internalGuidance: compactionPrompt, readerModel, origin: "outside" },
+					// The pick's origin: a person's plan approval is input from outside the session.
+					{ internalGuidance: compactionPrompt, readerModel, origin: options.origin },
 				);
 			}
 		} finally {
@@ -7048,20 +7054,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution directive behind it as a synthetic follow-up. If `isStreaming`
 		// flips true between the check and dispatch (the same fire-and-forget race
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
-		// A person approved the plan: input from outside the session.
+		// The pick's origin: a person's plan approval is input from outside the session.
 		if (this.session.isStreaming) {
 			await this.session.followUp(planModePrompt, undefined, {
 				synthetic: true,
-				origin: "outside",
+				origin: options.origin,
 			});
 		} else {
 			try {
-				await this.session.prompt(planModePrompt, { synthetic: true, origin: "outside" });
+				await this.session.prompt(planModePrompt, { synthetic: true, origin: options.origin });
 			} catch (error) {
 				if (!(error instanceof AgentBusyError)) throw error;
 				await this.session.followUp(planModePrompt, undefined, {
 					synthetic: true,
-					origin: "outside",
+					origin: options.origin,
 				});
 			}
 		}
@@ -7994,6 +8000,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const choice = await choicePromise;
 		if (this.#pendingPlanReview === pending) this.#pendingPlanReview = undefined;
 		const remote = pending.remote;
+		// A person's pick in the review is input from outside the session; an extension's pick is so only when
+		// the extension says it relays a person's (`ctx.resolvePlanReview(..., { origin: "outside" })`).
+		const pickOrigin: InputOrigin | undefined = remote ? remote.origin : "outside";
 		const closePlanReview = (): void => {
 			this.#hidePlanReview(pending);
 			this.ui.requestRender();
@@ -8068,6 +8077,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					compactBeforeExecute: choice === "Approve and compact context",
 					executionModel,
 					reviewOwner: pending,
+					origin: pickOrigin,
 				});
 				if (executionDispatched) this.#planReviewAnnotationState.delete(annotationStateKey);
 			} catch (error) {
@@ -8084,11 +8094,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			try {
 				if (refinement.trim()) {
 					if (this.onInputCallback) {
-						const input = this.startPendingSubmission({ text: refinement, origin: "outside" });
+						const input = this.startPendingSubmission({ text: refinement, origin: pickOrigin });
 						this.#planReviewAnnotationStateBySubmission.set(input, annotationStateKey);
 						this.onInputCallback(input);
 					} else {
-						await this.session.prompt(refinement, { origin: "outside" });
+						await this.session.prompt(refinement, { origin: pickOrigin });
 						this.#planReviewAnnotationState.delete(annotationStateKey);
 					}
 				} else {

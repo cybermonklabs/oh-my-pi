@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { addModelCallGuard, type JudgmentRequest, ModelCallRefusedError, NativeJudge } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import type { Context, FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { withReplaySafeStreamRetry } from "@oh-my-pi/pi-ai/utils/empty-completion-retry";
 import { postOpenAIStream } from "@oh-my-pi/pi-ai/utils/openai-http";
 import { resetRequestCompressionForTesting } from "@oh-my-pi/pi-ai/utils/request-compression";
 import * as piUtils from "@oh-my-pi/pi-utils";
@@ -249,6 +251,109 @@ describe("a cyber_policy refusal on the OpenAI transports", () => {
 
 		expect(attempts).toBe(expected);
 		expect(error).toBeInstanceOf(Error);
+	});
+
+	// A Codex request retries a 429 after a backoff. A hold that begins while the first attempt is out (another
+	// call of the tree meets a refusal) holds the retry: the tree's content is not sent again.
+	it.each([
+		["holds the retry of a Codex 429 when a hold begins during its backoff", true, 1],
+		["retries a Codex 429 when no hold begins (control)", false, 2],
+	])("%s", async (_label, holdDuringBackoff, expected) => {
+		let held = false;
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		const { requests, fetch } = codexFetch(() => {
+			held = holdDuringBackoff;
+			return new Response(
+				JSON.stringify({ error: { type: "rate_limit_exceeded", message: "Rate limit reached." } }),
+				{
+					status: 429,
+					headers: { "content-type": "application/json", "retry-after-ms": "1" },
+				},
+			);
+		});
+		try {
+			const result = await streamOpenAICodexResponses(model, context, {
+				apiKey: codexToken("acct-codex-429"),
+				fetch,
+			}).result();
+
+			expect(requests()).toBe(expected);
+			expect(result.stopReason).toBe(holdDuringBackoff ? "error" : "stop");
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A native judgment retries an ordinary 503 inside one guarded call; a hold that begins while the first
+	// attempt is out holds the retry. The ordinary 503 above, with no hold, is sent three times (the control).
+	it("holds a native judgment's retry when a hold begins during its backoff", async () => {
+		let attempts = 0;
+		let held = false;
+		const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+		const judge = new NativeJudge({
+			api: "typesafe",
+			provider: "typesafe",
+			model: "typesafe/jev-latest",
+			baseUrl: "https://gateway.local",
+			apiKey: "test",
+			catalogModel: MODEL,
+			fetch: async () => {
+				attempts++;
+				held = true;
+				return new Response(JSON.stringify({ error: { type: "server_error", message: "upstream unavailable" } }), {
+					status: 503,
+					headers: { "content-type": "application/json", "retry-after-ms": "1" },
+				});
+			},
+		});
+		const request = { state: "s", questions: { q: { type: "noul", instructions: "Question?" } } };
+		try {
+			const error = await judge.judge(request as unknown as JudgmentRequest).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+
+			expect(attempts).toBe(1);
+			expect(error).toBeInstanceOf(ModelCallRefusedError);
+		} finally {
+			removeGuard();
+		}
+	});
+
+	// A replay-safe stream retry sends the whole request again after a wait (here, after an empty completion).
+	// A hold that begins during that wait holds the retry: one request, and the call ends on the held error.
+	describe("a replay-safe stream retry", () => {
+		const MOCK_API_SOURCE = "test/cyber-policy-transport";
+		beforeEach(() => registerMockApi(MOCK_API_SOURCE));
+		afterEach(() => unregisterCustomApis(MOCK_API_SOURCE));
+
+		it.each([
+			["holds the retry of an empty completion when a hold begins during its wait", true, 1],
+			["retries an empty completion when no hold begins (control)", false, 3],
+		])("%s", async (_label, holdDuringWait, expected) => {
+			const empty = createMockModel({ id: "gpt-5.5", handler: { content: [] } });
+			let held = false;
+			const removeGuard = addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) });
+			try {
+				const result = await withReplaySafeStreamRetry(
+					empty,
+					context,
+					{
+						providerRetryWait: async () => {
+							held = holdDuringWait;
+						},
+					},
+					(attemptModel, attemptContext, attemptOptions) =>
+						empty.stream(attemptModel, attemptContext, attemptOptions),
+					{ retryEmptyCompletion: true },
+				).result();
+
+				expect(empty.calls).toHaveLength(expected);
+				if (holdDuringWait) expect(result.errorMessage).toContain("held: cyber_policy");
+			} finally {
+				removeGuard();
+			}
+		});
 	});
 
 	it("keeps a refusal's code in the message when the provider text omits it", async () => {

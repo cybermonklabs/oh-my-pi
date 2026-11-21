@@ -371,6 +371,35 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(prompt.mock.calls.find(isPlanApprovedCall)).toBeDefined();
 	});
 
+	// The session's cyber-policy hold ends only on input from outside it. A person's pick in the review is such
+	// input; an extension's answer is so only when the extension says it relays a person's pick (`input.origin`).
+	it.each([
+		["an extension's own approval carries no origin", undefined, undefined],
+		["an approval an extension relays as a person's carries outside", "outside", "outside"],
+	] as const)("%s", async (_name, passed, expected) => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.");
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const recorder = planReviewRecorder("remote", (event, ctx) => {
+			ctx.resolvePlanReview(event.reviewId, "execute", passed ? { origin: passed } : undefined);
+		});
+		await loadExtensions(recorder.extension);
+
+		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
+		await recorder.resolved;
+
+		const approved = prompt.mock.calls.find(isPlanApprovedCall);
+		expect(approved).toBeDefined();
+		expect((approved?.[1] as { origin?: string } | undefined)?.origin).toBe(expected);
+	});
+
 	it("keeps the review open when a remote answer is stale, disabled, or incomplete", async () => {
 		const planFilePath = "local://PLAN.md";
 		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
@@ -633,7 +662,8 @@ describe("InteractiveMode plan review rendering", () => {
 		const resolved = await recorder.resolved;
 
 		expect(answered).toBe(true);
-		expect(prompt).toHaveBeenCalledWith("  keep indentation\n", { origin: "outside" });
+		// An extension's own refinement is not a person's input: it carries no origin.
+		expect(prompt).toHaveBeenCalledWith("  keep indentation\n", { origin: undefined });
 		expect(resolved).toMatchObject({ choice: "refine", by: "extension" });
 	});
 
@@ -709,7 +739,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
 		expect(answers).toEqual([true, false]);
-		expect(prompt).toHaveBeenCalledWith("FIRST choice", { origin: "outside" });
+		expect(prompt).toHaveBeenCalledWith("FIRST choice", { origin: undefined });
 		expect(prompt).not.toHaveBeenCalledWith("SECOND choice");
 		expect(events.filter(event => event.type === "plan_review_resolved")).toHaveLength(1);
 		expect(events.find(event => event.type === "plan_review_resolved")).toMatchObject({
@@ -889,7 +919,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await delivered.promise;
 
 		expect(accepted).toBe(true);
-		expect(prompt).toHaveBeenCalledWith("split step 2", { origin: "outside" });
+		expect(prompt).toHaveBeenCalledWith("split step 2", { origin: undefined });
 		expect(secondExtensionEvents).toEqual(["plan_review_requested", "plan_review_resolved"]);
 	});
 

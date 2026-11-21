@@ -21,6 +21,11 @@ import type { CyberPolicyClosureApi } from "@oh-my-pi/pi-coding-agent/session/cy
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import * as imageVision from "@oh-my-pi/pi-coding-agent/utils/image-vision-fallback";
+import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+
+/** A 1x1 PNG, for a prompt that carries an image. */
+const PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
 /**
  * OpenAI refuses a request whose content it flags for cybersecurity risk with the error code
@@ -924,5 +929,104 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		await other.live.runEphemeralTurn({ promptText: "A side question", tools: false });
 
 		expect(other.requested).toEqual([selector(openai)]);
+	});
+
+	// The session's other own model calls that hosts reach directly run in its tree's scope too: `navigateTree`'s
+	// branch summary (ACP, RPC, an extension's context), `generateTitle` (the TUI's first-message title) and the
+	// description of an image sent to a text-only model. Another tree's hold does not take them for calls made
+	// outside every session.
+	describe("another tree's own model calls are not held by this tree's refusal", () => {
+		async function refuseThenStartOther() {
+			const { gateway, openai } = models();
+			const refusing = startSession({ primary: gateway, chains: {}, answer: () => CYBER_POLICY });
+			const other = startSession({
+				primary: openai,
+				chains: {},
+				answer: () => ({ content: ["answered"] }),
+				keepOthers: true,
+			});
+			return { refusing, other, openai };
+		}
+		async function refuse(refusing: ReturnType<typeof startSession>) {
+			await refusing.live.prompt("Review this change");
+			await refusing.live.waitForIdle();
+			expect(refusing.live.cyberPolicyClosure.active).toBe(true);
+		}
+		/** A model call on an OpenAI model, as the title and vision helpers make: sent unless a guard holds it. */
+		function openAICall(openai: Model, sent: string[]) {
+			const mock = createMockModel({
+				provider: openai.provider,
+				id: openai.id,
+				handler: () => {
+					sent.push(selector(openai));
+					return { content: ["done"] };
+				},
+			});
+			return () =>
+				streamSimple(mock.model, { messages: [{ role: "user", content: "x", timestamp: Date.now() }] }).result();
+		}
+
+		it("its branch summary", async () => {
+			const { refusing, other, openai } = await refuseThenStartOther();
+			await other.live.prompt("First task");
+			await other.live.waitForIdle();
+			const firstUser = other.live.sessionManager
+				.getEntries()
+				.find(entry => entry.type === "message" && entry.message.role === "user");
+			if (!firstUser) throw new Error("Expected the first user entry");
+			await refuse(refusing);
+
+			await other.live.navigateTree(firstUser.id, { summarize: true });
+
+			expect(other.requested).toEqual([selector(openai), selector(openai)]);
+		});
+
+		it("its title", async () => {
+			const { refusing, other, openai } = await refuseThenStartOther();
+			const sent: string[] = [];
+			const call = openAICall(openai, sent);
+			vi.spyOn(titleGenerator, "generateSessionTitle").mockImplementation(async () =>
+				(await call()).stopReason === "stop" ? "A title" : null,
+			);
+			await refuse(refusing);
+
+			expect(await other.live.generateTitle("A first message")).toBe("A title");
+			expect(sent).toEqual([selector(openai)]);
+		});
+
+		// A host calls `followUp` (and `steer`) directly, outside the session's own entry scope (`prompt` enters it
+		// through its admission): the description of an image queued that way must still run in the tree's scope.
+		it("its image description", async () => {
+			const { refusing, other, openai } = await refuseThenStartOther();
+			const sent: string[] = [];
+			const call = openAICall(openai, sent);
+			vi.spyOn(imageVision, "shouldDescribeImagesForTextModel").mockReturnValue(true);
+			vi.spyOn(imageVision, "describeAttachedImagesForTextModel").mockImplementation(async () =>
+				(await call()).stopReason === "stop" ? [{ type: "text", text: "a pixel" }] : [],
+			);
+			await refuse(refusing);
+
+			await other.live.followUp("Look at this", [{ type: "image", data: PIXEL_PNG, mimeType: "image/png" }]);
+
+			expect(sent).toEqual([selector(openai)]);
+		});
+	});
+
+	// A turn the hold held ends with the hold's own error, which names `cyber_policy` so nothing retries it.
+	// Turn recovery must not record that error as a refusal: no request was sent and OpenAI refused nothing.
+	it("turn recovery does not record a held turn's error as a refusal", async () => {
+		const { gateway } = models();
+		const { live, requested } = startSession({ primary: gateway, chains: {}, answer: () => CYBER_POLICY });
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(live.cyberPolicyClosure.active).toBe(true);
+		const record = vi.spyOn(live.cyberPolicyClosure, "record");
+
+		// The session's own prompt keeps the hold: its turn is held and sends nothing.
+		await live.prompt("Carry on");
+		await live.waitForIdle();
+
+		expect(requested).toEqual([selector(gateway)]);
+		expect(record).not.toHaveBeenCalled();
 	});
 });
