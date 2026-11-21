@@ -127,6 +127,35 @@ function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessio
 	};
 }
 
+/** `client`, and the statement of its transactions it waits on: the last one sent whose answer has not come. */
+function inFlightClient(client: SqlSessionStorageClient): {
+	client: SqlSessionStorageClient;
+	waiting(): { query: string; ms: number } | undefined;
+} {
+	let current: { query: string; at: number } | undefined;
+	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		async unsafe(query, values) {
+			const mine = { query, at: performance.now() };
+			current = mine;
+			try {
+				return await executor.unsafe(query, values);
+			} finally {
+				if (current === mine) current = undefined;
+			}
+		},
+	});
+	return {
+		client: {
+			options: client.options,
+			unsafe: (query, values) => client.unsafe(query, values),
+			transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
+			end: () => client.end?.() ?? Promise.resolve(),
+			...reserveWrapped(client, wrap),
+		},
+		waiting: () => (current ? { query: current.query, ms: performance.now() - current.at } : undefined),
+	};
+}
+
 async function blobHashes(db: LeaseDb): Promise<string[]> {
 	return (await db.sql(`SELECT sha256 FROM ${db.table}_blobs`)).map(row => String(row.sha256)).sort();
 }
@@ -1478,9 +1507,12 @@ describe("session blobs in the SQL session storage", () => {
 			// the rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
 			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
 			// gap. InnoDB rolls one back (1213), and the retry runs it again. MariaDB 11.8.1 and later use the
-			// primary key for the `substr` (MDEV-34911): the lock is a range over A and its directory, never takes
-			// the gap before C, and the race does not start. The end state is asserted on every server, and the
-			// deadlock count from the lock's plan, read with EXPLAIN before the race: 1 on a scan, 0 on a range.
+			// primary key for the `substr` (MDEV-34911): the lock is a range over A and its directory, plus the first
+			// row past it, C, with the gap before it, which keeps new rows out of the directory. B is in that gap, so
+			// the rename's UPDATE still waits for the delete (the next case shows it), but the range never reaches D:
+			// the delete never waits for the rename, only one side waits, and there is no deadlock. The end state is
+			// asserted on every server, and the deadlock count from the lock's plan, read with EXPLAIN before the race:
+			// 1 on a scan, 0 on a range.
 			it.skipIf(adapter !== "mysql")(
 				"runs the rolled-back side again when a delete with artifacts meets a rename's destination that has no row: one deadlock where the delete's lock scans the table (MySQL, MariaDB before 11.8.1), none where it is a range (MariaDB 11.8.1 and later)",
 				async () => {
@@ -1533,6 +1565,106 @@ describe("session blobs in the SQL session storage", () => {
 						c: (await db.row(c))?.content,
 						deadlocks: deadlocks.length,
 					}).toEqual({ paths: [b, c], b: moved, c: transcript(ID, "kept apart"), deadlocks: scans ? 1 : 0 });
+				},
+			);
+
+			// The wait behind the case above, read from the server: with the delete held right after its directory lock,
+			// a rename D → B waits for it. Where that lock scans, it holds D, and the rename waits at its lock of D.
+			// Where it is a range (MariaDB 11.8.1 and later), the rename locks D and waits at its UPDATE into B: the
+			// range lock also takes C, the first row past the directory, with the gap before it, where B goes. Either
+			// way the delete waits for nothing the rename holds, so it commits, the rename goes on, and nothing
+			// deadlocks.
+			it.skipIf(adapter !== "mysql")(
+				"makes a rename into the gap after a deleted artifacts directory wait until the delete commits: at its lock of the source where the delete's lock scans, at its UPDATE into the gap before the next row where it is a range",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					let gate: GatedClient | undefined;
+					let tracked: ReturnType<typeof inFlightClient> | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							tracked = inFlightClient(deadlockLog(client, deadlocks));
+							return tracked.client;
+						},
+					});
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								deadlockLog(client, deadlocks),
+								new RegExp(`^SELECT path FROM \\S*\\b${db.table}\\b WHERE path IN \\(.*FOR UPDATE$`),
+								"after",
+							);
+							return gate.client;
+						},
+					});
+					const [a, b, c, d] = ["a", "b-dst", "c", "d-src"].map(name =>
+						db.dir.join("sessions", `${name}.jsonl`),
+					) as [string, string, string, string];
+					const moved = transcript(ID, "moved");
+					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
+					await renamer.writeText(d, moved);
+					await renamer.drain();
+					await deleter.refresh();
+					const dir = `${a.slice(0, -".jsonl".length)}/`;
+					const [plan] = (await db.sql(
+						`EXPLAIN SELECT path FROM ${db.table} WHERE path IN (@1) OR substr(path, 1, @2) = @3 ORDER BY path FOR UPDATE`,
+						[a, [...dir].length, dir],
+					)) as Array<{ type?: unknown }>;
+					const scans = plan?.type !== "range";
+
+					gate?.close();
+					const deleting = deleter.deleteSessionWithArtifacts(a);
+					let renaming: Promise<void> | undefined;
+					let settled = false;
+					let waits = "none";
+					let lockWaits = 0;
+					let waitedForTheDelete = false;
+					try {
+						await Promise.race([gate?.paused(), deleting]);
+						renaming = renamer.rename(d, b).finally(() => {
+							settled = true;
+						});
+						// The wait: the statement the rename has had in flight for 200 ms, and the server's own count of
+						// transactions waiting for a lock (no other transaction runs on the server in this case).
+						const until = Date.now() + 3000;
+						while (Date.now() < until && !settled) {
+							const pending = tracked?.waiting();
+							if (pending && pending.ms >= 200) {
+								waits = /^UPDATE\b/i.test(pending.query)
+									? "update"
+									: /\bFOR UPDATE$/i.test(pending.query)
+										? "lock"
+										: pending.query.slice(0, 80);
+								const [row] = (await db.sql(
+									"SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX WHERE trx_state = 'LOCK WAIT'",
+								)) as Array<{ n?: unknown }>;
+								lockWaits = Number(row?.n ?? 0);
+								if (lockWaits > 0) break;
+							}
+							await Bun.sleep(25);
+						}
+						waitedForTheDelete = !settled;
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([deleting, renaming]);
+					expect({
+						waits,
+						lockWaits,
+						waitedForTheDelete,
+						paths: await db.paths(),
+						b: (await db.row(b))?.content,
+						deadlocks: deadlocks.length,
+					}).toEqual({
+						waits: scans ? "lock" : "update",
+						lockWaits: 1,
+						waitedForTheDelete: true,
+						paths: [b, c],
+						b: moved,
+						deadlocks: 0,
+					});
 				},
 			);
 

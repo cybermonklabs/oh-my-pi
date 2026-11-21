@@ -4261,9 +4261,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * index for the `substr` (MySQL, MariaDB before 11.8.1), the lock scans and
 	 * locks every row, gaps too, in path order, as the directory's `DELETE`
 	 * that follows does anyway; MariaDB 11.8.1 and later use the primary key
-	 * for it (MDEV-34911) and lock only the directory's range. PostgreSQL
-	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
-	 * time.
+	 * for it (MDEV-34911) and lock the directory's range and the first row
+	 * past it with the gap before that row, so an insert into that gap (a
+	 * rename's destination) waits for the delete, while the lock reaches no
+	 * row past that one. PostgreSQL locks no gap. Elsewhere nothing is
+	 * answered; SQLite runs one writer at a time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
