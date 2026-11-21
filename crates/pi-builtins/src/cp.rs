@@ -5025,6 +5025,106 @@ mod tests {
 		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
 	}
 
+	/// Own entries GNU cp 9.4 and 9.7 do not turn into a copy to the backup
+	/// name, and the questions `-i` asks and the times `-u` compares, as GNU's
+	/// (the same as uid 1000 and as root). GNU turns `cp -fb a a` into a copy
+	/// of `a` to `a~` only where `stat` reads `a` as a regular file (`cp.c`),
+	/// and asks about, and compares with, `a~` only where `stat` of it succeeds
+	/// (`copy.c`):
+	/// - a FIFO, or a link to nothing read as a link, that is its own
+	///   destination is the same file before any question or update check;
+	/// - `-l` asks about a destination that is already the source's file and
+	///   then does nothing, a FIFO own entry included;
+	/// - a link at `a~` to nothing is not asked about, and `-u` compares `a`
+	///   with what a link at `a~` leads to;
+	/// - `cp -fb l ./l` (`l` a link cp follows) asks and compares before it
+	///   cannot open `l`, and names `l` as it was given (`.//l`).
+	///
+	/// Rows ending in `(stated)` differ from GNU, as stated in the CHANGELOG:
+	/// a link at `a~` is replaced, where GNU writes through it.
+	#[cfg(unix)]
+	#[test]
+	fn an_own_entry_is_asked_about_and_compared_as_gnu_does() {
+		use std::os::unix::ffi::OsStrExt as _;
+		let same_p = "cp: 'p' and 'p' are the same file\n";
+		let open_l = "cp: cannot open 'l' for reading: No such file or directory\n";
+		let dangling = "cp: not writing through dangling symlink 'a~'\n";
+		#[rustfmt::skip]
+		let cases: [(&str, &str, &[&str], &str, i32, &str, &str); 29] = [
+			("fifo -i y", "fifo:p old>p~", &["-R", "-i", "-fb", "p", "p"], "y\n", 1, same_p, " p=fifo p~=old#1"),
+			("fifo -i n", "fifo:p old>p~", &["-R", "-i", "-fb", "p", "p"], "n\n", 1, same_p, " p=fifo p~=old#1"),
+			("fifo -i none", "fifo:p", &["-R", "-i", "-fb", "p", "p"], "", 1, same_p, " p=fifo"),
+			("fifo -u newer", "fifo:p t:p=1000000000 old>p~ t:p~=2000000000", &["-R", "-u", "-fb", "p", "p"], "", 1, same_p, " p=fifo p~=old#1"),
+			("fifo -u none", "fifo:p", &["-R", "-u", "-fb", "p", "p"], "", 1, same_p, " p=fifo"),
+			("fifo -l", "fifo:p", &["-l", "-fb", "p", "p"], "", 0, "", " p=fifo"),
+			("fifo -l -i y", "fifo:p", &["-l", "-i", "-fb", "p", "p"], "y\n", 0, "cp: overwrite 'p'? ", " p=fifo"),
+			("fifo -l -i n", "fifo:p", &["-l", "-i", "-fb", "p", "p"], "n\n", 1, "cp: overwrite 'p'? ", " p=fifo"),
+			("-l -i -b ./a y", "A>a", &["-l", "-i", "-b", "a", "./a"], "y\n", 0, "cp: overwrite './a'? ", " a=A#1"),
+			("-l -i -b ./a n", "A>a", &["-l", "-i", "-b", "a", "./a"], "n\n", 1, "cp: overwrite './a'? ", " a=A#1"),
+			("-l -i -fb ./a y", "A>a", &["-l", "-i", "-fb", "a", "./a"], "y\n", 0, "cp: overwrite './a'? ", " a=A#1"),
+			("-l -i -fb ./a n", "A>a", &["-l", "-i", "-fb", "a", "./a"], "n\n", 1, "cp: overwrite './a'? ", " a=A#1"),
+			("-l -i -b a y", "A>a", &["-l", "-i", "-b", "a", "a"], "y\n", 0, "cp: overwrite 'a'? ", " a=A#1"),
+			("-l -i -b a n", "A>a", &["-l", "-i", "-b", "a", "a"], "n\n", 1, "cp: overwrite 'a'? ", " a=A#1"),
+			("-l -i -fb no a~", "A>a", &["-l", "-i", "-fb", "a", "a"], "n\n", 0, "", " a=A#2 a~=A#2"),
+			("-l -i -fb a~ y", "A>a old>a~", &["-l", "-i", "-fb", "a", "a"], "y\n", 0, "cp: overwrite 'a~'? ", " a=A#2 a~=A#2"),
+			("-l -i -fb a~ n", "A>a old>a~", &["-l", "-i", "-fb", "a", "a"], "n\n", 1, "cp: overwrite 'a~'? ", " a=A#1 a~=old#1"),
+			("-i dangling a~", "A>a missing@a~", &["-i", "-fb", "a", "a"], "y\n", 1, dangling, " a=A#1 a~=link:missing"),
+			("-i a~ -> u (stated)", "A>a U>u u@a~", &["-i", "-fb", "a", "a"], "y\n", 0, "cp: overwrite 'a~'? ", " a=A#1 a~=A#1 u=U#1"),
+			("-u u older (stated)", "A>a t:a=2000000000 U>u t:u=1000000000 u@a~", &["-u", "-fb", "a", "a"], "", 0, "", " a=A#1 a~=A#1 u=U#1"),
+			("-u u newer", "A>a t:a=1000000000 U>u t:u=2000000000 u@a~ lt:a~=500000000", &["-u", "-fb", "a", "a"], "", 0, "", " a=A#1 a~=link:u u=U#1"),
+			("-u dangling a~", "A>a missing@a~", &["-u", "-fb", "a", "a"], "", 1, dangling, " a=A#1 a~=link:missing"),
+			("-P dangling own", "missing@l", &["-P", "-fb", "l", "l"], "", 1, "cp: 'l' and 'l' are the same file\n", " l=link:missing"),
+			("dangling own", "missing@l", &["-fb", "l", "l"], "", 1, "cp: cannot stat 'l': No such file or directory\n", " l=link:missing"),
+			("-i l ./l y", "A>a a@l", &["-i", "-fb", "l", "./l"], "y\n", 1, "cp: overwrite './l'? cp: cannot open 'l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("-i l ./l n", "A>a a@l", &["-i", "-fb", "l", "./l"], "n\n", 1, "cp: overwrite './l'? ", " a=A#1 l=link:a"),
+			("-u l ./l older", "A>a t:a=1000000000 a@l lt:l=2000000000", &["-u", "-fb", "l", "./l"], "", 0, "", " a=A#1 l=link:a"),
+			("-u l ./l newer", "A>a t:a=2000000000 a@l lt:l=1000000000", &["-u", "-fb", "l", "./l"], "", 1, open_l, " a=A#1 l=link:a"),
+			(".//l ./l", "A>a a@l", &["-fb", ".//l", "./l"], "", 1, "cp: cannot open './/l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+		];
+		// A path's times, set without opening it (a FIFO would wait), following
+		// a link or not.
+		let set_time = |path: &std::path::Path, secs: i64, follow: bool| {
+			let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+			// SAFETY: `timespec` is plain data, all zero a valid value.
+			let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+			time.tv_sec = secs;
+			let times = [time, time];
+			let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+			// SAFETY: `path` is NUL-terminated and `times` holds two values,
+			// both outliving the call.
+			assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), flags) }, 0, "utimensat");
+		};
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (case, setup, args, answer, code, err, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			for step in setup.split(' ') {
+				if let Some(name) = step.strip_prefix("fifo:") {
+					let path = std::ffi::CString::new(dir.join(name).into_os_string().into_encoded_bytes()).unwrap();
+					// SAFETY: `path` is a NUL-terminated path that outlives the call.
+					assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{case}: mkfifo");
+				} else if let Some(rest) = step.strip_prefix("lt:") {
+					let (name, secs) = rest.split_once('=').unwrap();
+					set_time(&dir.join(name), secs.parse().unwrap(), false);
+				} else if let Some(rest) = step.strip_prefix("t:") {
+					let (name, secs) = rest.split_once('=').unwrap();
+					set_time(&dir.join(name), secs.parse().unwrap(), true);
+				} else if let Some((contents, name)) = step.split_once('>') {
+					fs::write(dir.join(name), contents).unwrap();
+				} else if let Some((target, link)) = step.split_once('@') {
+					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+				}
+			}
+			let (got, capture) = run_util::<Cp>(args, answer, &dir);
+			let found = (got, capture.err(), crate::file_backup::tests::listing(&dir));
+			if found != (code, err.to_owned(), after.to_owned()) {
+				failures.push(format!("{case}: cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
 	/// The backup copy of `cp -fb a a` never writes through a symbolic link
 	/// put at `a~` after cp looked at the name (test hooks put it there,
 	/// pointing at `victim`): an existing regular `a~` is opened without
