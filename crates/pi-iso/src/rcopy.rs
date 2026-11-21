@@ -562,13 +562,14 @@ mod tests {
 	}
 
 	/// An executable stub standing in for `git`.
+	/// A stand-in `git` that runs `script`, written by a child
+	/// ([`crate::testprog`]): written here, a fork by another test's thread
+	/// could keep it open for writing, and running it would fail with
+	/// `ETXTBSY`.
 	#[cfg(unix)]
 	fn stub(root: &TempDirGuard, script: &str) -> PathBuf {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		let path = root.path().join("git");
-		fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write stub git");
-		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("make stub executable");
+		crate::testprog::write(&path, &format!("#!/bin/sh\n{script}\n"));
 		path
 	}
 
