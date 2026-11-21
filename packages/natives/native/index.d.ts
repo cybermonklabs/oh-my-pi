@@ -205,7 +205,11 @@ export declare class EditSession {
   /**
    * Stage and apply the finished edit through `writer`. Never rejects for
    * engine failures: those come back as `isError` outcomes carrying the
-   * model-facing message.
+   * model-facing message. Once `request.signal` fires, no further write is
+   * handed to `writer`, and a call stopped that way ends as `cancelled`,
+   * naming what the call's earlier writes changed. `apply` does not
+   * interrupt a write already handed over (see `EditApplyRequest.signal` for
+   * how it ends the call, and for what a writer must check itself).
    */
   apply(request: EditApplyRequest, writer: (error: Error | null, request: EditWriteRequest) => Promise<EditWriteResponse>): Promise<EditApplyOutcome>
   /** Stop the preview pump and release buffers. */
@@ -1844,6 +1848,19 @@ export interface EditApplyOutcome {
 export interface EditApplyRequest {
   lspBatchId?: string
   lspFlush: boolean
+  /**
+   * Abort signal of the tool call. Once it fires, `apply` hands no further
+   * write to the host writer, and a call stopped that way ends as
+   * `cancelled`, naming what the call's earlier writes changed. `apply` does
+   * not interrupt a write the host has already begun, and the call ends as
+   * that write's result: if the host fails it, `write_failed` with the
+   * host's error, naming no earlier file; if it succeeds, it is named by the
+   * cancel at the next write, or, as the call's last write, the call
+   * succeeds. A write handed over just before the abort can still reach the
+   * writer after it: a writer that must start nothing after the abort checks
+   * its own signal first and returns `cancelled: true`.
+   */
+  signal?: unknown
 }
 
 /**
@@ -2008,6 +2025,11 @@ export interface EditWriteResponse {
   written: string
   /** `FileDiagnosticsResult` serialized by the host; opaque here. */
   diagnosticsJson?: string
+  /**
+   * The host did not begin this write because the call was cancelled, and
+   * touched nothing; `apply` then reports the call as cancelled.
+   */
+  cancelled?: boolean
 }
 
 /** Ellipsis strategy for [`truncate_to_width`]. */

@@ -46,11 +46,14 @@ pub type RewriteFn = Box<dyn Fn(&WriteRequest) -> String + Send + Sync>;
 /// post-state) and records every request.
 #[derive(Default)]
 pub struct DiskWriter {
-	pub requests: Mutex<Vec<WriteRequest>>,
+	pub requests:  Mutex<Vec<WriteRequest>>,
 	/// Optional override of the text the writer reports as persisted.
-	pub rewrite:  Option<RewriteFn>,
+	pub rewrite:   Option<RewriteFn>,
 	/// When set, the Nth (0-based) write fails with this message.
-	pub fail_at:  Option<(usize, String)>,
+	pub fail_at:   Option<(usize, String)>,
+	/// When set, the Nth (0-based) write is refused as cancelled, touching
+	/// nothing, as a host writer does once the call's abort signal fired.
+	pub cancel_at: Option<usize>,
 }
 
 #[async_trait]
@@ -61,6 +64,9 @@ impl EditWriter for DiskWriter {
 			requests.push(request.clone());
 			requests.len() - 1
 		};
+		if self.cancel_at == Some(index) {
+			return Err(EditError::Cancelled { written: Vec::new() });
+		}
 		if let Some((at, message)) = &self.fail_at
 			&& *at == index
 		{

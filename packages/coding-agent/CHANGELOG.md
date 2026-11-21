@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A cancelled `edit` no longer starts a write after the cancel. Before, an edit cancelled while it resolved an internal-URL target, recovered a missing path, or wrote the files of a multi-file edit went on to write them, even though the call was already reported as aborted (for example, a subagent cancelled with its edit pending). Now the call ends as aborted, and its message names what the call's earlier writes changed (a move by its source and destination), also when the cancelled edit closes an LSP batch. A write already under way when the cancel arrives is not stopped by the edit engine; it sees the cancel only where it checks for one itself, and the call ends as that write's result. Through an ACP client, a cancel seen just before the client is asked to write fails the write, and nothing is written; otherwise the change lands, and with LSP on, the LSP notice that follows it can still fail the write ("Operation aborted"). A failed write ends the call as a failed write (`write_failed`) that names no earlier file, or, when the call closes an LSP batch whose flush then fails on the cancel too, as that flush's "Operation aborted"; a write that succeeds is named in the cancel message, or, as the call's last write, the call succeeds.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
