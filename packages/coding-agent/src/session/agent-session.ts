@@ -6901,16 +6901,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// already durable, and close() (scheduled post-seal) still flushes and
 		// closes the writer.
 		this.sessionManager.seal();
+		let closeError: { error: unknown } | undefined;
 		try {
 			await this.sessionManager.close();
 		} catch (error) {
-			// A close the store refused can leave the transcript held by the
-			// session manager, which writes it once a later write lands on the
-			// same store and then drops it (SessionManager.holdsTranscript). This
-			// session's own copy is dead weight either way: drop it now, as the
-			// release below would, and leave the manager's entries to the send.
-			if (this.sessionManager.holdsTranscript()) this.#releaseRetainedSessionMemory({ keepTranscript: true });
-			throw error;
+			closeError = { error };
 		}
 
 		// Release retained conversation memory. dispose() is terminal, and every
@@ -6919,7 +6914,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// dead weight from here on. Dropping it lets a parked subagent's session
 		// graph shed its heavy payloads even while the lifecycle adoption record's
 		// reviver closure still references the session object. Fixes #8003.
-		this.#releaseRetainedSessionMemory();
+		// A close that failed releases the same: nothing writes a sealed manager's
+		// entries, except the send of a transcript a close the store refused for
+		// an outage holds (SessionManager.holdsTranscript), which keeps the
+		// manager's entries until it lands or ends.
+		this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
 		// A run past the deadline may still resolve keys, so the account pools
 		// are lifted only once the run has settled: here when it drained,
 		// otherwise in the deferred pass below. Each lease lifts only the
@@ -6940,10 +6939,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			void (async () => {
 				await this.agent.waitForIdle();
 				await this.#drainInFlightEventHandlers();
-				this.#releaseRetainedSessionMemory();
+				this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
 				this.#accountPoolScope?.release();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
+		if (closeError) throw closeError.error;
 	}
 
 	/**

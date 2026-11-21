@@ -183,17 +183,43 @@ const STORE_REFUSED_SQLSTATES: Record<string, true> = {
 };
 /**
  * PgBouncer sends every error of its own as SQLSTATE 08P01 (protocol violation), which PostgreSQL
- * sends for a malformed message. These of PgBouncer 1.22.0's messages mean it cannot reach the server,
- * has no room for the query, or lost the server connection mid-query, for now; every other 08P01 is not
- * a refusal.
+ * sends for a malformed message. These texts mean it cannot reach the server, has no room for the
+ * client or the query, lost the server connection mid-query, or is shutting down, for now; every other
+ * 08P01 is not a refusal. Read from PgBouncer's source at every release from 1.22.0 to 1.26.1; each
+ * text names the releases that send it and where it is in 1.26.1.
  */
 const PGBOUNCER_REFUSALS: readonly string[] = [
-	"server login has been failing, try again later (server_login_retry)",
+	// 1.22.0 and later, janitor.c:344: a query waited query_wait_timeout for a server.
 	"query_wait_timeout",
+	// 1.22.0 and later, janitor.c:369: a login waited client_login_timeout for a server that is down.
 	"client_login_timeout (server down)",
+	// Client limits: max_client_conn since 1.22.0 (client.c:1088), the per-database and per-user
+	// limits since 1.24.0 (client.c:478, :514).
 	"no more connections allowed (max_client_conn)",
+	"client connections exceeded (max_db_client_connections)",
+	"client connections exceeded (max_user_client_connections)",
+	// 1.22.0 and later, server.c:812: the server connection ended mid-query.
 	"server conn crashed?",
+	// 1.23.0 and later, janitor.c:340 and objects.c:811: a client waiting for a server while PgBouncer
+	// shuts down after its servers (SIGINT, SHUTDOWN WAIT_FOR_SERVERS).
+	"server shutting down",
+	// 1.25.0 and later, objects.c:2061: a login while PgBouncer shuts down.
+	"pooler is shutting down",
 ];
+/**
+ * The start of the error a client gets while PgBouncer's logins to the server have been failing
+ * (server_login_retry, objects.c:888 in 1.26.1). 1.22.0 to 1.23.1 send "server login has been failing,
+ * try again later (server_login_retry)"; 1.24.0 and later "server login has been failing, cached error:
+ * <the last failed server connection's reason> (server_login_retry)". The reason can be a login the
+ * server rejected (its own error went to the clients waiting then), so a pool whose logins fail for
+ * good reads as down too, as with the 1.22.0 text.
+ */
+const PGBOUNCER_LOGIN_RETRY = "server login has been failing";
+
+/** Whether PgBouncer's 08P01 text `message` is one of {@link PGBOUNCER_REFUSALS} or a login retry. */
+function isPgBouncerRefusal(message: string): boolean {
+	return message.startsWith(PGBOUNCER_LOGIN_RETRY) || PGBOUNCER_REFUSALS.includes(message);
+}
 
 /** A write conflict and a held publish lock are faults in who writes, never the store refusing. */
 function isWriterFault(error: unknown): boolean {
@@ -242,7 +268,7 @@ function refusalOf(error: unknown, depth: number): StoreRefusal | undefined {
 function pgSqlStateRefusal(error: Error): boolean {
 	const { errno } = error as { errno?: unknown };
 	if (typeof errno !== "string") return false;
-	if (errno === "08P01") return PGBOUNCER_REFUSALS.includes(error.message);
+	if (errno === "08P01") return isPgBouncerRefusal(error.message);
 	return Object.hasOwn(STORE_REFUSED_SQLSTATES, errno);
 }
 

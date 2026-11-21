@@ -3,7 +3,8 @@
  * in memory for a later send. An outage (a full disk, a store that is down, busy or read-only for now)
  * also waits for another session's write to land on the same store; a permission refusal waits only on
  * the session's own writes. Every other error rejects or latches as before. The SQL shapes are the ones
- * Bun 1.4.4's client gives against PostgreSQL 16, PgBouncer 1.22.0 in front of it, and SQLite.
+ * Bun 1.4.4's client gives against PostgreSQL 16, PgBouncer 1.22.0 and 1.26.1 in front of it, and
+ * SQLite; PgBouncer's texts are read from its source at every release from 1.22.0 to 1.26.1.
  */
 import { describe, expect, it } from "bun:test";
 import { SessionPersistenceIndeterminateError } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -81,6 +82,60 @@ const cases: Array<[string, unknown, Kind]> = [
 		pgServerError("08P01", "server conn crashed?"),
 		"outage",
 	],
+	[
+		"PgBouncer 1.24 or later with PostgreSQL down, after a failed connect (08P01)",
+		pgServerError("08P01", "server login has been failing, cached error: connect failed (server_login_retry)"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later, after a server connect that timed out (08P01)",
+		pgServerError("08P01", "server login has been failing, cached error: connect timeout (server_login_retry)"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later, after a server login that failed (08P01)",
+		pgServerError("08P01", "server login has been failing, cached error: login failed (server_login_retry)"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later, after a failed server DNS lookup (08P01)",
+		pgServerError(
+			"08P01",
+			"server login has been failing, cached error: server DNS lookup failed (server_login_retry)",
+		),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later, a login retry text cut at PgBouncer's 127 characters (08P01)",
+		pgServerError("08P01", `server login has been failing, cached error: ${"r".repeat(200)}`.slice(0, 127)),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later at its per-database client limit (08P01)",
+		pgServerError("08P01", "client connections exceeded (max_db_client_connections)"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.24 or later at its per-user client limit (08P01)",
+		pgServerError("08P01", "client connections exceeded (max_user_client_connections)"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.23 or later shutting down after its servers, a client waiting for one (08P01)",
+		pgServerError("08P01", "server shutting down"),
+		"outage",
+	],
+	[
+		"PgBouncer 1.25 or later shutting down, a new login (08P01)",
+		pgServerError("08P01", "pooler is shutting down"),
+		"outage",
+	],
+	[
+		"a PgBouncer text with the login retry words later in it (08P01)",
+		pgServerError("08P01", "unsupported startup parameter: server login has been failing"),
+		"none",
+	],
+	["PgBouncer's own query limit, query_timeout (08P01)", pgServerError("08P01", "query_timeout"), "none"],
 	[
 		"PostgreSQL at max_connections, direct or forwarded by PgBouncer (53300)",
 		pgServerError("53300", "remaining connection slots are reserved for roles with the SUPERUSER attribute"),
