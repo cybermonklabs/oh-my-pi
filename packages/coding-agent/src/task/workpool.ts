@@ -2,7 +2,7 @@ import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { type: "text" };
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
-import { recordEvalAgentJobs } from "../eval/agent-job-records";
+import { recordEvalAgentJobs, recordHandovers } from "../eval/agent-job-records";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { plainTurnAbortReason } from "../session/exit-diagnostics";
@@ -31,6 +31,8 @@ export interface WorkPoolItem {
 	agentId?: string;
 	batchId?: string;
 	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	/** The parent's top-level `eval` call whose cell pushed the item; a worker it starts records it. */
+	spawnCallId?: string;
 }
 
 /** Keep-alive subagent and its queued work within a pool. */
@@ -43,6 +45,8 @@ export interface WorkPoolAgent {
 	contextTokens?: number;
 	contextWindow?: number;
 	jobId?: string;
+	/** The call that pushed the item the worker was started for ({@link WorkPoolItem.spawnCallId}). */
+	spawnCallId?: string;
 }
 
 /** One turn assigned to a pool agent and tracked as an internal job. */
@@ -156,14 +160,17 @@ export class WorkPool {
 		return configured > 0 ? configured : Infinity;
 	}
 
-	/** Queue items and start the aggregate pool job on the first non-empty push. */
-	push(texts: string[]): string[] {
+	/**
+	 * Queue items and start the aggregate pool job on the first non-empty push. `spawnCallId` is the
+	 * parent's top-level `eval` call the pushing cell runs under.
+	 */
+	push(texts: string[], spawnCallId?: string): string[] {
 		if (this.closed) throw new ToolError(`workpool ${this.name} is closed`);
 		if (texts.length === 0) return [];
 		const queued: WorkPoolItem[] = [];
 		for (const text of texts) {
 			const seq = this.#nextSeq++;
-			const item: WorkPoolItem = { id: `${this.name}#${seq}`, seq, text, status: "queued" };
+			const item: WorkPoolItem = { id: `${this.name}#${seq}`, seq, text, status: "queued", spawnCallId };
 			this.items.push(item);
 			queued.push(item);
 		}
@@ -202,6 +209,17 @@ export class WorkPool {
 					manager.consumeJobResults(batchIds);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
+					// The aggregate result hands the owner every batch's output: record each worker's handover, on
+					// disk, before it does, which settles the `owed` record written at the worker's spawn. An aborted
+					// pool hands nothing over: a stop ends the workers' runs, and a shutdown leaves them owed, so
+					// `omp --restore` relaunches a worker the owner still waits on.
+					if (!signal.aborted) {
+						await recordHandovers(
+							this.session,
+							// Keyed as `peek` keys them, so a batch it already handed over is not recorded again.
+							this.batches.map(batch => ({ agentId: batch.agentId, jobId: batch.id })),
+						);
+					}
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
 					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
 					return this.#renderAggregateResult();
@@ -304,12 +322,20 @@ export class WorkPool {
 		const index = this.#nextAgentIndex++;
 		const id = await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
 		if (this.closed || item.status !== "queued") return;
-		// The worker's run is owed to the pool's owner until its batch's result is delivered: record that, on
-		// disk, before the worker starts, so `omp --restore` relaunches a worker the owner still waits on after
-		// the call that pushed the work has finished. The batch's delivery settles it.
+		// The worker's run is owed to the pool's owner until a result of its batch is handed over: record that,
+		// on disk, before the worker starts, so `omp --restore` relaunches a worker the owner still waits on
+		// after the call that pushed the work has finished. The pool's aggregate result, or a `peek` that
+		// returns a settled batch, writes the handover that settles it.
 		await recordEvalAgentJobs(this.session, [id], "owed");
 		if (this.closed || item.status !== "queued") return;
-		const agent: WorkPoolAgent = { id, index, state: "running", queue: [item], turns: 0 };
+		const agent: WorkPoolAgent = {
+			id,
+			index,
+			state: "running",
+			queue: [item],
+			turns: 0,
+			spawnCallId: item.spawnCallId,
+		};
 		item.agentId = id;
 		this.agents.push(agent);
 		this.#card("spawned", id, `[${item.id}] ${item.text}`);
@@ -396,6 +422,7 @@ export class WorkPool {
 						const execution = await runStructuredSubagent({
 							session: this.session,
 							invocationKind: "eval",
+							spawnCallId: agent.spawnCallId,
 							assignment: message,
 							...(this.context ? { context: this.context } : {}),
 							agent: this.policy.agentName,

@@ -20,6 +20,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
 	AgentTool,
+	AgentToolContext,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolSpeculationPolicy,
@@ -1070,6 +1071,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/** Start one spawn's subagent run behind the session semaphore. */
 	#launch(spawn: {
 		toolCallId: string;
+		/** The parent's top-level call the spawn was requested under, recorded in the child's `session_init`. */
+		spawnCallId: string;
 		params: SpawnParams;
 		index: number;
 		agentId?: string;
@@ -1089,6 +1092,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					run.timing,
 					spawn.detached ? run.onArtifactsRetained : undefined,
 					run.tools,
+					spawn.spawnCallId,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
@@ -1118,7 +1122,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			cfgAsyncEnabled.get(this.session.settings) && this.session.asyncJobManager !== undefined && !blocking;
 		const agentId = await this.#outputManager().allocate(spawn.name?.trim() || generateTaskName());
 		if (signal.aborted) return undefined;
-		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
+		// A streamed launch belongs to the call that streams it, also before its `tool_execution_start`.
+		return this.#launch({ toolCallId, spawnCallId: toolCallId, params: spawn, index, agentId, detached });
 	}
 
 	/**
@@ -1185,11 +1190,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		rawParams: unknown,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const launchSession = this.#launchSessions.get(toolCallId);
 		this.#launchSessions.delete(toolCallId);
+		// A bridged call (an eval cell's `tool.task`) names the top-level call its cell runs under.
+		const spawnCallId = context?.spawnCallId ?? toolCallId;
 		try {
-			return await this.#dispatch(toolCallId, rawParams, launchSession, signal, onUpdate);
+			return await this.#dispatch(toolCallId, rawParams, launchSession, signal, onUpdate, spawnCallId);
 		} finally {
 			// No-op once dispatch adopted; otherwise nothing launched early may outlive the call.
 			launchSession?.discard("task call settled without adopting speculative launches");
@@ -1200,8 +1208,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		toolCallId: string,
 		rawParams: unknown,
 		launchSession: TaskLaunchSession | undefined,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TaskToolDetails> | undefined,
+		spawnCallId: string,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		// Schema defaults fill `agent` for model calls, but internal callers
 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
@@ -1320,6 +1329,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				defaultAgent,
 				signal,
 				onUpdate,
+				spawnCallId,
 			);
 			if (!advisory) return result;
 			let appended = false;
@@ -1449,6 +1459,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const jobId = this.#registerSpawnJob({
 					manager,
 					toolCallId,
+					spawnCallId,
 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
 					agentId: spawn.agentId,
 					run: spawn.run,
@@ -1553,6 +1564,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		});
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
+			spawnCallId,
 			params,
 			defaultAgent,
 			signal,
@@ -1618,6 +1630,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	#registerSpawnJob(options: {
 		manager: AsyncJobManagerApi;
 		toolCallId: string;
+		spawnCallId: string;
 		spawnParams: SpawnParams;
 		agentId: string;
 		/** Run already started while the call streamed; the job adopts it instead of launching. */
@@ -1631,6 +1644,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const {
 			manager,
 			toolCallId,
+			spawnCallId,
 			spawnParams,
 			agentId,
 			run,
@@ -1708,6 +1722,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 				const activeRun = (spawnRun ??= this.#launch({
 					toolCallId,
+					spawnCallId,
 					params: spawnParams,
 					index: progress.index,
 					agentId,
@@ -1846,8 +1861,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		params: TaskParams,
 		spawns: SyncSpawnRef[],
 		defaultAgent: string,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TaskToolDetails> | undefined,
+		spawnCallId: string,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
@@ -1855,6 +1871,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				spawn.run ??
 				this.#launch({
 					toolCallId,
+					spawnCallId,
 					params: spawnParamsFor(params, spawn.item, defaultAgent),
 					index: spawn.index,
 					agentId: spawn.preAllocatedId,
@@ -1882,6 +1899,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
+			spawnCallId,
 			params,
 			defaultAgent,
 			signal,
@@ -1918,13 +1936,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 */
 	async #runSyncSpawns(args: {
 		toolCallId: string;
+		spawnCallId: string;
 		params: TaskParams;
 		defaultAgent: string;
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
 	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
-		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
+		const { toolCallId, spawnCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
 		const { results } = await mapWithConcurrencyLimitAllSettled(
 			spawns,
 			spawns.length,
@@ -1933,6 +1952,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.run ??
 					this.#launch({
 						toolCallId,
+						spawnCallId,
 						params: spawnParamsFor(params, spawn.item, defaultAgent),
 						index: spawn.index,
 						agentId: spawn.preAllocatedId,
@@ -1991,6 +2011,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
 		tools?: TextTap,
+		spawnCallId: string = toolCallId,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -2023,6 +2044,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				identity: { id: preAllocatedId, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
+				spawnCallId,
 				detached,
 				// Detached (async) spawns advertise `agent://<id>` handles in the
 				// eventual async-result delivery, which can land well after this

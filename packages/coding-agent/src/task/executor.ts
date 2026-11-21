@@ -472,6 +472,13 @@ export interface ExecutorOptions {
 	id: string;
 	parentToolCallId?: string;
 	/**
+	 * The parent's top-level tool call this spawn was requested under: the `task` call, or the
+	 * `eval` call whose cell made it (a bridged `tool.task`, `agent()`, a work pool's worker).
+	 * Recorded in the child's `session_init` so `omp --restore` can tell which cut-off call
+	 * started a subagent it relaunches.
+	 */
+	spawnCallId?: string;
+	/**
 	 * Spawn runs as a detached background job (parent turn not blocked on it).
 	 * Rides the subagent lifecycle/progress payloads so HUD-style surfaces can
 	 * skip spawns the transcript already renders inline. See
@@ -5321,6 +5328,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
+				spawnCallId: options.spawnCallId,
 			});
 
 			abortSignal.addEventListener(

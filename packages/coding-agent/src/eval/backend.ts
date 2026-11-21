@@ -45,6 +45,8 @@ export interface ExecutorBackendExecOptions {
 	onReply?: (text: string) => void;
 	/** Receives the subagents whose results the cell's bridged calls hand it. */
 	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
+	/** The `eval` call the cell runs under: the spawns its bridged calls make record it as theirs. */
+	spawnCallId?: string;
 }
 
 /** Result returned by a backend's execute(). */

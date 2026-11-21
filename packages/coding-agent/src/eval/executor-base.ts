@@ -84,6 +84,8 @@ export interface KernelExecutorBaseOptions {
 	onReply?: (text: string) => void;
 	/** Receives the subagents whose results the cell's bridged calls hand it. */
 	onAgentResults?: PyToolBridgeEntry["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link PyToolBridgeEntry.spawnCallId}). */
+	spawnCallId?: string;
 	toolSession?: ToolSession;
 	bridgeSessionId?: string;
 	artifactId?: string;
@@ -543,6 +545,7 @@ export async function executeWithKernelBase<
 					emitStatus,
 					onReply: options.onReply,
 					onAgentResults: options.onAgentResults,
+					spawnCallId: options.spawnCallId,
 					shadowCell: getActiveEvalShadowCell(),
 					abortRequested: () => {
 						return abortShield.abortRequested;

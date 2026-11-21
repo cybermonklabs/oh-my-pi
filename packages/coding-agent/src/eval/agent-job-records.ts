@@ -5,13 +5,13 @@
  *
  * A job is `owed` from its spawn until its result is handed to the session: an eval `agent()`
  * job, a background spawn a bridged `tool.task` starts, whose "started" result names no
- * settled run, and a work pool's worker, whose batch results the pool's own job delivers.
- * A cell's `wait()` and a bridged `tool.wait` write `delivered` first and then hand
- * the result over, so a process that goes away between the two leaves `delivered`, and restore
- * never runs that run again; a background `task` spawn's result a bridged `tool.wait` hands a
- * cell is recorded the same way. A handle's `status()`, `done()` and `attempts()` hand the cell
- * no result and write nothing. A result the session receives as an `async-result` message needs
- * no marker: that message is the handover and its record at once.
+ * settled run, and a work pool's worker. A cell's `wait()` and a bridged `tool.wait` write
+ * `delivered` first and then hand the result over, so a process that goes away between the two
+ * leaves `delivered`, and restore never runs that run again; a background `task` spawn's result
+ * a bridged `tool.wait` hands a cell is recorded the same way, and so is each worker's batch
+ * the pool's aggregate result or a `peek` hands over. A handle's `status()`, `done()` and
+ * `attempts()` hand the cell no result and write nothing. A result the session receives as an
+ * `async-result` message needs no marker: that message is the handover and its record at once.
  */
 import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";

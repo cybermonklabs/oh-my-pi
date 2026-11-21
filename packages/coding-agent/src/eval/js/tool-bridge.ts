@@ -66,6 +66,11 @@ export interface ToolBridgeOptions {
 	onReply?: (text: string) => void;
 	/** Receives the subagents whose results a bridged call hands the cell. */
 	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
+	/**
+	 * The parent's top-level `eval` call the cell runs under. The spawns a bridged call makes
+	 * (`tool.task`, `agent()`, a work pool's workers) record it as the call that started them.
+	 */
+	spawnCallId?: string;
 }
 
 type ToolValue =
@@ -347,6 +352,12 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					if (progress) options.emitStatus?.({ op: "mcp_progress", id: toolCallId, tool: name, ...progress });
 				}
 			: undefined;
+	// The call's spawns record the `eval` call the cell runs under; a session with no tool context records none.
+	const toolContext = options.session.getToolContext?.();
+	const callContext =
+		toolContext === undefined || options.spawnCallId === undefined
+			? toolContext
+			: { ...toolContext, spawnCallId: options.spawnCallId };
 	try {
 		// A delegated-work tool pauses only the cell's runtime-work watchdog; the turn's
 		// signal still reaches it. Without a status sink the pause wrapper is a no-op.
@@ -354,13 +365,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			DELEGATED_WORK_TOOLS.has(name) ? options.emitStatus : undefined,
 			async () => {
 				try {
-					return await tool.execute(
-						toolCallId,
-						validatedArgs,
-						options.signal,
-						onUpdate,
-						options.session.getToolContext?.(),
-					);
+					return await tool.execute(toolCallId, validatedArgs, options.signal, onUpdate, callContext);
 				} finally {
 					settled = true;
 				}

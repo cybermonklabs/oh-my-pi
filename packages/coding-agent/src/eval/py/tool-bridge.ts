@@ -39,6 +39,8 @@ export interface PyToolBridgeEntry {
 	onReply?: (text: string) => void;
 	/** Receives the subagents whose results bridged calls hand the cell. */
 	onAgentResults?: ToolBridgeOptions["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link ToolBridgeOptions.spawnCallId}). */
+	spawnCallId?: string;
 	abortRequested?: () => boolean;
 }
 
@@ -137,6 +139,7 @@ async function callSessionToolPromptOnAbort(
 		emitStatus: entry.emitStatus,
 		onReply: entry.onReply,
 		onAgentResults: entry.onAgentResults,
+		spawnCallId: entry.spawnCallId,
 		identity,
 	});
 	const signal = entry.shieldedSignal ?? entry.signal;

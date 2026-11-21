@@ -6840,8 +6840,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#fallbackExtensionTimers?.clearAll();
 		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
 		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}); so does a SIGINT, the user's
-		// Ctrl+C in print and JSON mode (or `kill -INT`), a stop as Esc is. Any other dispose cuts it
-		// off, so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt.
+		// Ctrl+C in print and JSON mode (or `kill -INT` there and in interactive mode and ACP), a stop
+		// as Esc is. RPC mode disposes on no signal: a `kill -INT` there only records the process exit,
+		// so `omp --restore` goes on with that turn. Any other dispose cuts it off, so `omp --restore`
+		// goes on with it: a turn waiting to retry keeps its failed attempt.
 		// When the process is going away for any other postmortem reason but a manual cleanup (its
 		// exit, a SIGTERM such as a pod release, a fatal error), a turn still in flight is labeled as
 		// interrupted, which `omp --restore` continues: nobody chose that end. A dispose the process

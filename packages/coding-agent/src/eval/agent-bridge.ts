@@ -57,6 +57,8 @@ export interface EvalAgentBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** The parent's top-level `eval` call the cell runs under; the job's subagent records it. */
+	spawnCallId?: string;
 }
 
 /** Handle returned immediately after an eval subagent job is registered. */
@@ -229,6 +231,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					const execution = await runStructuredSubagent({
 						session: options.session,
 						invocationKind: "eval",
+						spawnCallId: options.spawnCallId,
 						assignment: parsed.prompt,
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
 						...(parsed.model !== undefined ? { perCallModel: parsed.model } : {}),

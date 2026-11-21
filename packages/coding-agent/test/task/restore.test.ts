@@ -17,15 +17,19 @@ import {
 	type AsyncResultDetails,
 	ASYNC_RESULT_MESSAGE_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
+import { recordEvalAgentJobs, recordHandovers } from "@oh-my-pi/pi-coding-agent/eval/agent-job-records";
 import {
 	createInterruptedTurnAbortMessage,
 	SESSION_EXIT_CUSTOM_TYPE,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { GENERIC_ABORT_SENTINEL, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { VIBE_CLI_AGENT, VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -106,13 +110,16 @@ async function keyUnresolvedTurn(dir: string): Promise<Message[]> {
 	}
 }
 
-/** Writes subagent `id`'s transcript under the main session `mainFile`, with its spawn contract. */
+/**
+ * Writes subagent `id`'s transcript under the main session `mainFile`, with its spawn contract:
+ * `spawnCallId` names the parent's call the spawn was requested under.
+ */
 async function writeSubagent(
 	mainFile: string,
 	cwd: string,
 	id: string,
 	messages: Message[],
-	options?: { agent?: string; normalExit?: boolean },
+	options?: { agent?: string; normalExit?: boolean; spawnCallId?: string },
 ): Promise<string> {
 	const file = path.join(mainFile.slice(0, -6), `${id}.jsonl`);
 	const manager = await SessionManager.open(file, undefined, undefined, {
@@ -125,6 +132,7 @@ async function writeSubagent(
 		task: `${id} task`,
 		tools: ["read", "yield"],
 		agent: options?.agent,
+		spawnCallId: options?.spawnCallId,
 	});
 	for (const message of messages) manager.appendMessage(message);
 	if (options?.normalExit) {
@@ -368,6 +376,8 @@ describe("restoreSession (omp --restore)", () => {
 		"Spawned",
 		"PoolWorker",
 		"Replaced",
+		"Vibe-1",
+		"Reused",
 	];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
@@ -376,13 +386,17 @@ describe("restoreSession (omp --restore)", () => {
 		vi.restoreAllMocks();
 		setSystemTime();
 		for (const id of ids) AgentRegistry.global().unregister(id);
+		VibeSessionRegistry.resetGlobalForTests();
 		await manager?.dispose({ timeoutMs: 1000 });
 		manager = undefined;
 		tempDir?.removeSync();
 		tempDir = undefined;
 	});
 
-	/** Restores the parent session `main` in a new process, as its last one left it: what went on. */
+	/**
+	 * Restores the parent session `main` in a new process, as its last one left it: what went on, and
+	 * the parent's own resumed turn, called with the cut-off calls that started relaunched subagents.
+	 */
 	async function restoreParent(main: SessionManager, mainFile: string) {
 		const entries = main.getEntries();
 		const leafId = main.getLeafId();
@@ -392,14 +406,15 @@ describe("restoreSession (omp --restore)", () => {
 		const followUp = vi
 			.spyOn(executorModule, "runSubagentFollowUpTurn")
 			.mockImplementation(async options => subagentResult(options.id));
+		const restoreTurn = vi.fn(async (_options: { relaunched?: Record<string, readonly string[]> }) => false);
 		const outcome = await restoreSession({
 			sessionManager: { getSessionFile: () => mainFile, getEntries: () => entries, getLeafId: () => leafId },
 			asyncJobManager: manager,
 			settings: Settings.isolated(),
-			restoreInterruptedTurn: vi.fn(async () => false),
+			restoreInterruptedTurn: restoreTurn,
 		} as unknown as AgentSession);
 		for (const id of outcome.subagents) await manager.getJob(id)?.promise;
-		return { outcome, followUp };
+		return { outcome, followUp, restoreTurn };
 	}
 
 	/** A parent session that asked for work: its file, and the manager that writes it. */
@@ -1059,6 +1074,264 @@ describe("restoreSession (omp --restore)", () => {
 		expect(outcome.subagents).not.toContain("PoolWorker");
 	});
 
+	it("relaunches a backgrounded cell's subagent spawned while a later call ran, and leaves that call's own worker", async () => {
+		// If this regresses, the paused yield's window leaves out every spawn inside a finished call's run, whoever
+		// made it: the backgrounded cell's subagent, whose transcript began while the later call ran, is left though
+		// the run still waits on the cell; or that call's own worker, whose failure it handed over, is relaunched.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const { outer, outerFile } = await openOuter(main, mainFile, cwd);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_bg", "eval"));
+		tick();
+		outer.appendMessage(
+			toolResultMessage("call_outer_bg", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+		);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_fg", "eval"));
+		tick();
+		await writeSubagent(outerFile, cwd, "CellWorker", stranded, { normalExit: true, spawnCallId: "call_outer_bg" });
+		await writeSubagent(outerFile, cwd, "ForegroundWorker", stranded, {
+			normalExit: true,
+			spawnCallId: "call_outer_fg",
+		});
+		tick();
+		outer.appendMessage(toolResultMessage("call_outer_fg", "eval", {}));
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+		outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+		await outer.close();
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toContain("CellWorker");
+		expect(outcome.subagents).not.toContain("ForegroundWorker");
+	});
+
+	for (const [label, inner, parked] of [
+		["leaves a grandchild its parked parent's `owed` record names", "owed", true],
+		["leaves a grandchild a process exit cut off under a parked parent", "cut off", true],
+		[
+			"control: relaunches a grandchild a process exit cut off under a paused yield restore goes on with",
+			"cut off",
+			false,
+		],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, the subagent under a run parked at its yield, which restore does not go on with, is
+			// relaunched with that run as its owner when a record names it or its own request was cut off: no session
+			// takes its result, and the work runs again for nothing.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			const { outer, outerFile } = await openOuter(main, mainFile, cwd);
+			tick();
+			outer.appendMessage(toolCallMessage("call_outer_bg", "eval"));
+			tick();
+			// An `agent()` job the cell started: owed to Outer until its result is handed over.
+			if (inner === "owed")
+				await recordEvalAgentJobs({ sessionManager: outer } as unknown as ToolSession, ["Inner"], "owed");
+			await writeSubagent(outerFile, cwd, "Inner", inner === "owed" ? stranded : cutOff, {
+				normalExit: inner === "owed",
+				spawnCallId: "call_outer_bg",
+			});
+			tick();
+			outer.appendMessage(
+				toolResultMessage("call_outer_bg", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+			);
+			tick();
+			outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+			outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+			if (parked) {
+				// The executor parks the run: it stops the session with an abort that gives no reason.
+				outer.appendMessage(
+					assistant({
+						stopReason: "aborted",
+						errorMessage: GENERIC_ABORT_SENTINEL,
+						errorId: AIError.create(AIError.Flag.Abort),
+					}),
+				);
+			}
+			await outer.close();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			if (parked) expect(outcome.subagents).not.toContain("Inner");
+			else expect(outcome.subagents).toContain("Inner");
+		});
+	}
+
+	for (const [label, handedOver] of [
+		["leaves a work pool's worker whose batch the pool handed over, by the records the pool writes", true],
+		["control: relaunches a work pool's worker still owed when the process went away", false],
+	] as const) {
+		it(label, async () => {
+			// If this regresses, a worker whose failure the pool already handed its owner is relaunched, and the owner
+			// gets that result twice; or a worker the owner still waits on is left.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			const records = { sessionManager: main } as unknown as ToolSession;
+			tick();
+			main.appendMessage(toolCallMessage("call_pool", "eval"));
+			tick();
+			await recordEvalAgentJobs(records, ["PoolWorker"], "owed");
+			await writeSubagent(mainFile, cwd, "PoolWorker", stranded, { normalExit: true, spawnCallId: "call_pool" });
+			tick();
+			main.appendMessage(toolResultMessage("call_pool", "eval", {}));
+			tick();
+			if (handedOver) await recordHandovers(records, [{ agentId: "PoolWorker", jobId: "pool-PoolWorker-1" }]);
+			tick();
+			main.appendMessage(assistant({ content: [{ type: "text", text: "Waiting on the pool." }] }));
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).toEqual(handedOver ? [] : ["PoolWorker"]);
+		});
+	}
+
+	/** The parent's reply that calls `bash` (`call_bash`) and `task` (`call_task`) at once. */
+	function bashAndTaskBatch(): AssistantMessage {
+		return assistant({
+			content: [
+				{ type: "toolCall", id: "call_bash", name: "bash", arguments: { command: "bun test" } },
+				{ type: "toolCall", id: "call_task", name: "task", arguments: { agent: "task", task: "work" } },
+			],
+			stopReason: "toolUse",
+		});
+	}
+
+	function appendExecutionStart(main: SessionManager, toolCallId: string, toolName: string): void {
+		main.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+			toolCallId,
+			toolName,
+			startedAt: new Date().toISOString(),
+		});
+	}
+
+	it("names for the resumed turn the cut-off call each relaunched subagent's spawn record names, not each call whose run covers it", async () => {
+		// If this regresses, a cut-off `bash` that ran while a backgrounded cell spawned is not run again, and its
+		// result says it started that subagent; or a streamed launch made before its call started is not named, and
+		// its `task` call runs again beside the relaunched subagent.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendMessage(toolCallMessage("call_cell", "eval"));
+		tick();
+		main.appendMessage(
+			toolResultMessage("call_cell", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+		);
+		tick();
+		main.appendMessage(bashAndTaskBatch());
+		tick();
+		// The streamed launch spawned before its call's `tool_execution_start`.
+		await writeSubagent(mainFile, cwd, "Streamed", cutOff, { spawnCallId: "call_task" });
+		tick();
+		appendExecutionStart(main, "call_bash", "bash");
+		appendExecutionStart(main, "call_task", "task");
+		tick();
+		// While both calls ran, the backgrounded cell spawned its own subagent, and an older version wrote one that
+		// names no call.
+		await writeSubagent(mainFile, cwd, "CellSpawn", cutOff, { spawnCallId: "call_cell" });
+		await writeSubagent(mainFile, cwd, "Unnamed", cutOff);
+
+		const { outcome, restoreTurn } = await restoreParent(main, mainFile);
+
+		expect([...outcome.subagents].sort()).toEqual(["CellSpawn", "Streamed", "Unnamed"]);
+		expect(restoreTurn).toHaveBeenCalledWith({ relaunched: { call_task: ["Streamed"] } });
+	});
+
+	it("names the skipped call again when a second process end inside the resumed batch has restore relaunch its subagent again", async () => {
+		// If this regresses, the second restore reads the skipped call's run as the replay's instant, which leaves out
+		// its subagent's spawn: the call runs again and starts the work a second time.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		const anchor = main.appendMessage(bashAndTaskBatch());
+		tick();
+		appendExecutionStart(main, "call_bash", "bash");
+		appendExecutionStart(main, "call_task", "task");
+		tick();
+		await writeSubagent(mainFile, cwd, "Worker", cutOff, { spawnCallId: "call_task" });
+		tick();
+		// The first restore strips the batch's cut-off results onto another branch and runs the batch again from its
+		// reply: the `task` call is blocked with the skip result, and the process ends again while `bash` runs.
+		main.branch(anchor);
+		appendExecutionStart(main, "call_task", "task");
+		main.appendMessage(toolResultMessage("call_task", "task", {}, true));
+		appendExecutionStart(main, "call_bash", "bash");
+
+		const { outcome, restoreTurn } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toEqual(["Worker"]);
+		expect(restoreTurn).toHaveBeenCalledWith({ relaunched: { call_task: ["Worker"] } });
+	});
+
+	it("names the skipped call again at a second restore when the first cut-off result, now on the branch the replay left, named its subagent", async () => {
+		// If this regresses, the second restore reads the subagent as work its parent left, since its only record is
+		// the cut-off eval result (the cell got the subagent's aborted run) that the first restore's replay moved off
+		// the selected branch: it is not relaunched, and the eval call runs again and starts a second subagent.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		const anchor = main.appendMessage(
+			assistant({
+				content: [
+					{
+						type: "toolCall",
+						id: "call_eval",
+						name: "eval",
+						arguments: { language: "js", code: "tool.task(...)" },
+					},
+					{ type: "toolCall", id: "call_bash", name: "bash", arguments: { command: "bun test" } },
+				],
+				stopReason: "toolUse",
+			}),
+		);
+		tick();
+		appendExecutionStart(main, "call_eval", "eval");
+		tick();
+		await writeSubagent(mainFile, cwd, "Worker", cutOff, { spawnCallId: "call_eval" });
+		tick();
+		main.appendMessage(
+			toolResultMessage(
+				"call_eval",
+				"eval",
+				{ agentResults: [{ id: "Worker", aborted: true, handedAt: Date.now() }] },
+				true,
+			),
+		);
+		tick();
+		main.branch(anchor);
+		appendExecutionStart(main, "call_eval", "eval");
+		main.appendMessage(toolResultMessage("call_eval", "eval", {}, true));
+		appendExecutionStart(main, "call_bash", "bash");
+
+		const { outcome, restoreTurn } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toEqual(["Worker"]);
+		expect(restoreTurn).toHaveBeenCalledWith({ relaunched: { call_eval: ["Worker"] } });
+	});
+
+	it("leaves a subagent whose recorded call a reply on a branch the parent left made, though no result names it", async () => {
+		// If this regresses, a subagent of work the parent left (it went back before that reply and went on another
+		// way) is placed in the current conversation by its transcript's time alone, and the new conversation gets
+		// a result for a job it never started.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		const input = main.appendMessage({ role: "user", content: "Read the notes.", timestamp: Date.now() });
+		tick();
+		main.appendMessage(toolCallMessage("call_left", "task"));
+		tick();
+		await writeSubagent(mainFile, cwd, "LeftWorker", cutOff, { spawnCallId: "call_left" });
+		tick();
+		main.branch(input);
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Starting over." }] }));
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toEqual([]);
+	});
+
 	it("relaunches only the streamed reply's spawn when the replaced reply forked after the input, from a summary both branches share", async () => {
 		// If this regresses, the replacement window opens at the first entry after the input, which here is the
 		// summary both branches share, before the replaced reply: that reply's spawn is relaunched for a conversation
@@ -1254,6 +1527,102 @@ describe("restoreSession (omp --restore)", () => {
 
 		expect(outcome).toEqual({ turn: false, subagents: [] });
 		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	for (const [label, claimed] of [
+		[
+			"never relaunches a key-stranded vibe worker that interactive mode rehydrated, though a cut-off vibe_wait waited on it",
+			true,
+		],
+		["control: relaunches the same key-stranded subagent when no vibe record claims it", false],
+	] as const) {
+		it(label, async () => {
+			// Interactive mode rehydrates vibe workers as subagent refs before `--restore` runs, so the persisted roster
+			// keeps them. If this regresses, `--restore` runs the vibe worker's turn as a task job beside vibe mode's own
+			// record of it, whose director decides its next turn.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			const lifecycle = (data: Record<string, unknown>) =>
+				main.appendCustomEntry("vibe-session-lifecycle", {
+					version: 1,
+					id: "Vibe-1",
+					ownerId: MAIN_AGENT_ID,
+					parentSessionId: main.getSessionId(),
+					...data,
+				});
+			tick();
+			main.appendMessage(toolCallMessage("call_spawn", "vibe_spawn"));
+			if (claimed) {
+				lifecycle({
+					action: "spawn",
+					cli: "fast",
+					agent: VIBE_CLI_AGENT.fast,
+					childSessionFile: "Vibe-1.jsonl",
+					createdAt: Date.now(),
+				});
+			}
+			tick();
+			main.appendMessage(toolResultMessage("call_spawn", "vibe_spawn", {}));
+			tick();
+			main.appendMessage(toolCallMessage("call_vibe_wait", "vibe_wait"));
+			if (claimed) lifecycle({ action: "turn-started", turn: 1 });
+			// The worker's transcript begins inside the cut-off call's window, so only vibe mode's claim keeps it out.
+			tick();
+			await writeSubagent(mainFile, cwd, "Vibe-1", stranded, { normalExit: true });
+			setSystemTime();
+			// Interactive mode's start-up, before `--restore`: vibe mode registers its resumable worker.
+			const rehydrated = await VibeSessionRegistry.global().rehydrate({
+				getSessionId: () => main.getSessionId(),
+				getSessionFile: () => mainFile,
+				sessionManager: main as unknown as ToolSession["sessionManager"],
+				settings: Settings.isolated(),
+			});
+			expect(rehydrated).toBe(claimed ? 1 : 0);
+			if (claimed) {
+				expect(AgentRegistry.global().get("Vibe-1")).toMatchObject({ kind: "sub", parentId: MAIN_AGENT_ID });
+			}
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome).toEqual({ turn: false, subagents: claimed ? [] : ["Vibe-1"] });
+		});
+	}
+
+	it("relaunches a later spawn of an id a discarded launch never wrote a transcript for, cut off with no record yet", async () => {
+		// If this regresses, the old discard record decides for the id however late: a later process allocated the id
+		// again (the discarded launch never wrote a transcript), its spawn had written no record when the process went
+		// away inside the call, and `--restore` leaves a subagent its parent still waits on.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendCustomEntry("task-launch-discarded", { agentId: "Reused" });
+		tick();
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Moved on." }] }));
+		main.appendMessage({ role: "user", content: "try again", timestamp: Date.now() });
+		tick();
+		main.appendMessage(toolCallMessage("call_task_again", "task"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Reused", stranded, { normalExit: true });
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Reused"] });
+	});
+
+	it("leaves a launch whose discard record is on the selected branch and came after its transcript began", async () => {
+		// The guard beside the reused-id case: the discard still decides for the launch it was written for.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendMessage(toolCallMessage("call_task_stream", "task"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Reused", stranded, { normalExit: true });
+		tick();
+		main.appendCustomEntry("task-launch-discarded", { agentId: "Reused" });
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
 	});
 
 	/**

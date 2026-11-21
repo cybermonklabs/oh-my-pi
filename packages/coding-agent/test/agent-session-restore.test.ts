@@ -210,8 +210,8 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 					: "";
 			if ("call_1" in relaunched) {
 				expect(text).toContain("is not run again");
-				expect(text).toContain("Worker");
-				expect(text).toContain("follow-up turn");
+				expect(text).toContain("Subagent Worker it started was relaunched by --restore and goes on with its work.");
+				expect(text).toContain("as its own follow-up turn unless a `wait` takes it");
 			} else {
 				expect(text).not.toContain("is not run again");
 			}

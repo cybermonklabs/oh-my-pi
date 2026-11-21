@@ -621,6 +621,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					sessionAbortController,
 					emitUpdate,
 					foreground,
+					toolCallId: _toolCallId,
 				}),
 			);
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
@@ -831,9 +832,21 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		emitUpdate?: (text: string, details: EvalToolDetails) => void;
 		/** Whether the call still waits on the cells; `out://` replies are drawn only then. */
 		foreground: () => boolean;
+		/** The `eval` call the cells run under: the spawns their bridged calls make record it as theirs. */
+		toolCallId: string;
 	}): Promise<AgentToolResult<EvalToolDetails | undefined>> {
-		const { session, cells, languages, notice, excludeWebP, signal, sessionAbortController, emitUpdate, foreground } =
-			options;
+		const {
+			session,
+			cells,
+			languages,
+			notice,
+			excludeWebP,
+			signal,
+			sessionAbortController,
+			emitUpdate,
+			foreground,
+			toolCallId,
+		} = options;
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
 		let outputDumped = false;
@@ -1001,6 +1014,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						},
 						onReply,
 						onAgentResults,
+						spawnCallId: toolCallId,
 						onStatus: event => {
 							if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
 								idle?.pause();

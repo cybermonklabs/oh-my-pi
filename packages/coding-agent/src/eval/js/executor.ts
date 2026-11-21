@@ -32,6 +32,8 @@ export interface JsExecutorOptions {
 	onReply?: (text: string) => void;
 	/** Receives the subagents whose results the cell's bridged calls hand it. */
 	onAgentResults?: ExecutorBackendExecOptions["onAgentResults"];
+	/** The `eval` call the cell runs under ({@link ExecutorBackendExecOptions.spawnCallId}). */
+	spawnCallId?: string;
 	signal?: AbortSignal;
 	sessionId: string;
 	/** Logical owner identifier; scopes retained-worker cleanup. */
@@ -176,6 +178,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				signal,
 				onReply: options.onReply,
 				onAgentResults: options.onAgentResults,
+				spawnCallId: options.spawnCallId,
 				onText: chunk => outputSink.push(chunk),
 				onDisplay: output => {
 					if (output.type === "status") {
