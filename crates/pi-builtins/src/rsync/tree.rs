@@ -853,7 +853,7 @@ impl Tree {
 						}
 						let path = self.inner.root.join(OsStr::from_bytes(at.name.as_bytes()));
 						sys::bind_socket_at(at.dir.fd(), &at.name, &path)?;
-						chmod_nofollow(at.dir.fd(), &at.name, perm)?;
+						chmod_nofollow(at.dir.fd(), &at.name, perm, false)?;
 					}
 				},
 				NodeKind::CharDevice(rdev) => {
@@ -882,7 +882,7 @@ impl Tree {
 		let current = sys::st_mode(&st) & 0o7777;
 		let wanted = (current & 0o7000) | (mode & 0o777 & !mask);
 		if current != wanted {
-			let _ = chmod_nofollow(at.dir.fd(), &at.name, wanted);
+			let _ = chmod_nofollow(at.dir.fd(), &at.name, wanted, false);
 		}
 	}
 
@@ -940,16 +940,29 @@ impl Tree {
 
 	// ----- attributes ---------------------------------------------------------
 
-	/// Never follows a final symlink (lchmod semantics; Unsupported where impossible).
+	/// Sets the permission bits of `rel`, which is not a symlink. A symlink in
+	/// its place (a `-K` directory symlink, or one swapped in) is refused with
+	/// `ELOOP` and never followed, as upstream's `do_chmod_atfd` refuses it.
 	pub(crate) fn chmod(&self, rel: &Path, mode: u32) -> io::Result<()> {
+		self.set_mode(rel, mode, false)
+	}
+
+	/// Sets the permission bits of the symlink `rel` itself (upstream's
+	/// `lchmod`); `EOPNOTSUPP` where the platform cannot (Linux).
+	pub(crate) fn lchmod(&self, rel: &Path, mode: u32) -> io::Result<()> {
+		self.set_mode(rel, mode, true)
+	}
+
+	/// [`Self::chmod`], or [`Self::lchmod`] when `link`.
+	fn set_mode(&self, rel: &Path, mode: u32, link: bool) -> io::Result<()> {
 		#[cfg(unix)]
 		if let Some(root) = self.native_root() {
 			let at = self.locate(root, rel)?;
-			return chmod_nofollow(at.dir.fd(), &at.name, mode & 0o7777);
+			return chmod_nofollow(at.dir.fd(), &at.name, mode & 0o7777, link);
 		}
 		let path = self.path_of(rel)?;
 		if self.inner.fs.symlink_metadata(&path)?.is_symlink() {
-			return Err(err::unsupported());
+			return Err(if link { err::unsupported() } else { err::looped() });
 		}
 		self.inner.fs.set_permissions(&path, Permissions::from_mode(mode & 0o7777))
 	}
@@ -1205,16 +1218,21 @@ impl Tree {
 	}
 }
 
-/// chmod of `dir/name` that never follows a final symlink: a regular file,
-/// directory, or (on Linux) FIFO is pinned with `O_NOFOLLOW` and changed
-/// with `fchmod`; a symlink gets `fchmodat(AT_SYMLINK_NOFOLLOW)` (lchmod;
-/// `EOPNOTSUPP` where the platform cannot); anything else falls back to
+/// chmod of `dir/name` that never follows a final symlink. A symlink there is
+/// changed itself with `fchmodat(AT_SYMLINK_NOFOLLOW)` when `link` (lchmod;
+/// `EOPNOTSUPP` where the platform cannot) and refused with `ELOOP`
+/// otherwise, as upstream's `do_fchmodat_nofollow` refuses it. A regular
+/// file, directory, or (on Linux) FIFO is pinned with `O_NOFOLLOW` and
+/// changed with `fchmod`; anything else falls back to
 /// `fchmodat(AT_SYMLINK_NOFOLLOW)`. On macOS a FIFO is never opened (that
 /// would make us a reader); an ungrantable setgid is retried without it.
 #[cfg(unix)]
-fn chmod_nofollow(dir: BorrowedFd<'_>, name: &std::ffi::CStr, mode: u32) -> io::Result<()> {
+fn chmod_nofollow(dir: BorrowedFd<'_>, name: &std::ffi::CStr, mode: u32, link: bool) -> io::Result<()> {
 	let st = sys::fstatat(Some(dir), name, true)?;
 	if sys::is_lnk(&st) {
+		if !link {
+			return Err(err::looped());
+		}
 		return sys::fchmodat(Some(dir), name, mode, true);
 	}
 	let fifo = sys::is_fifo(&st);
@@ -1595,13 +1613,32 @@ mod tests {
 			std::fs::write(base.join("file"), b"").unwrap();
 			std::fs::set_permissions(base.join("file"), std::fs::Permissions::from_mode(0o600)).unwrap();
 			symlink("file", base.join("link")).unwrap();
+			std::fs::create_dir(base.join("dir")).unwrap();
+			std::fs::set_permissions(base.join("dir"), std::fs::Permissions::from_mode(0o755)).unwrap();
+			symlink("dir", base.join("dirlink")).unwrap();
 			let tree = open_tree(&base, &TreeOpts::default());
-			let _ = tree.chmod(Path::new("link"), 0o777);
-			let mode = std::fs::metadata(base.join("file")).unwrap().permissions().mode();
-			assert_eq!(mode & 0o7777, 0o600);
+			let mode = |rel: &str| std::fs::metadata(base.join(rel)).unwrap().permissions().mode() & 0o7777;
+			// A symlink where a file's or directory's mode is to be set (a -K
+			// directory symlink) is refused with ELOOP, as upstream's
+			// do_chmod_atfd refuses it, and its target is left alone.
+			for link in ["link", "dirlink"] {
+				let err = tree.chmod(Path::new(link), 0o700).unwrap_err();
+				assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "chmod {link}: {err}");
+			}
+			assert_eq!((mode("file"), mode("dir")), (0o600, 0o755));
+			// A symlink's own mode (lchmod) is set where the platform can, and is
+			// unsupported where it cannot (Linux); the target is left alone.
+			for link in ["link", "dirlink"] {
+				if let Err(err) = tree.lchmod(Path::new(link), 0o700) {
+					let unsupported = [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
+					assert!(err.raw_os_error().is_some_and(|e| unsupported.contains(&e)), "lchmod {link}: {err}");
+				}
+			}
+			assert_eq!((mode("file"), mode("dir")), (0o600, 0o755));
 			tree.chmod(Path::new("file"), 0o640).unwrap();
-			let mode = std::fs::metadata(base.join("file")).unwrap().permissions().mode();
-			assert_eq!(mode & 0o7777, 0o640);
+			assert_eq!(mode("file"), 0o640);
+			tree.chmod(Path::new("dir"), 0o700).unwrap();
+			assert_eq!(mode("dir"), 0o700);
 			tree.chmod(Path::new(""), 0o750).unwrap();
 			let mode = std::fs::metadata(&base).unwrap().permissions().mode();
 			assert_eq!(mode & 0o7777, 0o750);
