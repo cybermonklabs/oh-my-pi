@@ -1617,7 +1617,8 @@ mod tests {
 		let (dir, tree) = scratch();
 		let path = dir.path().join("ro");
 		std::fs::write(&path, b"").unwrap();
-		if tree.set_xattr(Path::new("ro"), bytes_os(&test_name("rsynctest.probe")).unwrap(), b"1", false).is_err() {
+		if let Err(err) = tree.set_xattr(Path::new("ro"), bytes_os(&test_name("rsynctest.probe")).unwrap(), b"1", false) {
+			eprintln!("skipped: no user xattrs on the temporary filesystem: {err}");
 			return;
 		}
 		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
