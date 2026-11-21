@@ -129,10 +129,15 @@ function nestedImage(details: unknown, key: string): unknown {
 	return Array.isArray(inner) ? inner[0] : undefined;
 }
 
+/** The hash of `value` when it is a blob reference. */
+function refHash(value: unknown): string | undefined {
+	return typeof value === "string" ? BLOB_REF.exec(value)?.[1] : undefined;
+}
+
 /** The hashes of the blob references at the two images of stored `details`, sorted. */
 function imageHashes(details: unknown): string[] {
 	return [nestedImage(details, "images"), nestedImage(details, "content")]
-		.map(image => (isRecord(image) && typeof image.data === "string" ? BLOB_REF.exec(image.data)?.[1] : undefined))
+		.map(image => (isRecord(image) ? refHash(image.data) : undefined))
 		.filter((hash): hash is string => hash !== undefined)
 		.sort();
 }
@@ -141,9 +146,7 @@ function imageHashes(details: unknown): string[] {
 function listedUrlHashes(details: unknown): string[] {
 	const list = isRecord(details) ? details.image_url : undefined;
 	const urls: unknown[] = Array.isArray(list) ? list : [];
-	return urls
-		.map(url => (typeof url === "string" ? BLOB_REF.exec(url)?.[1] : undefined))
-		.filter((hash): hash is string => hash !== undefined);
+	return urls.map(url => refHash(url)).filter((hash): hash is string => hash !== undefined);
 }
 
 interface Store {
@@ -271,16 +274,7 @@ for (const backend of backends) {
 				const cold = await fullWrite(true);
 				vi.restoreAllMocks();
 
-				const reopened = await SessionManager.open(file, path.dirname(file), store.storage, {
-					suppressBreadcrumb: true,
-				});
-				let reloaded: unknown;
-				try {
-					// As a client receives it: a cold entry's fields read back from its record.
-					reloaded = detailsOf(JSON.parse(JSON.stringify(reopened.getEntry("t1"))));
-				} finally {
-					await reopened.close();
-				}
+				const { details: reloaded } = await reload(true);
 				const refs = await store.refs(file);
 
 				expect({

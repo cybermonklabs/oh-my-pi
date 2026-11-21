@@ -12,6 +12,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { runAnonymizeCommand } from "../src/cli/anonymize-cli";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "../src/session/session-context";
 import type { SessionEntry } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -74,7 +75,7 @@ describe("omp anonymize on a session with a kept or retried failed turn", () => 
 		const sessionFile = result.session.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected the session to persist a file");
 		const live = contextShape(result.session.agent.state.messages);
-		expect(live).toEqual(["user", "assistant[text]", "custom:continue-reminder", "assistant[text]"]);
+		expect(live).toEqual(["user", "assistant[text]", `custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`, "assistant[text]"]);
 
 		const anonymized = await anonymizeAndOpen(sessionFile, "text-cut");
 		try {

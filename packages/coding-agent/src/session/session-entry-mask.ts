@@ -755,7 +755,7 @@ function maskArray(
 		const item = items[i];
 		let next: unknown;
 		if (typeof item === "string") {
-			next = keepStrings || keptImageSite(item, arrayKey, walk) !== undefined ? item : walk.text(item);
+			next = keepStrings ? item : maskFree(item, arrayKey, walk);
 		} else if (at !== undefined && isPlainObject(item)) {
 			const before = walk.replacements;
 			next = maskChild(item, walk, at);
