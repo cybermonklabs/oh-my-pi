@@ -205,7 +205,9 @@ export declare class EditSession {
   /**
    * Stage and apply the finished edit through `writer`. Never rejects for
    * engine failures: those come back as `isError` outcomes carrying the
-   * model-facing message.
+   * model-facing message. Once `request.signal` fires no further write
+   * begins; the outcome is then `cancelled` and names the files already
+   * written.
    */
   apply(request: EditApplyRequest, writer: (error: Error | null, request: EditWriteRequest) => Promise<EditWriteResponse>): Promise<EditApplyOutcome>
   /** Stop the preview pump and release buffers. */
@@ -1844,6 +1846,11 @@ export interface EditApplyOutcome {
 export interface EditApplyRequest {
   lspBatchId?: string
   lspFlush: boolean
+  /**
+   * Abort signal of the tool call. Once it fires no further write begins:
+   * the outcome is `cancelled` and names the files already written.
+   */
+  signal?: unknown
 }
 
 /**
@@ -2008,6 +2015,11 @@ export interface EditWriteResponse {
   written: string
   /** `FileDiagnosticsResult` serialized by the host; opaque here. */
   diagnosticsJson?: string
+  /**
+   * The host did not begin this write because the call was cancelled, and
+   * touched nothing; `apply` then reports the call as cancelled.
+   */
+  cancelled?: boolean
 }
 
 /** Ellipsis strategy for [`truncate_to_width`]. */

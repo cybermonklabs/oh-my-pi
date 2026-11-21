@@ -42,6 +42,7 @@ import {
 	writeFileWithFallback,
 } from "../tools/file-write-fallback";
 import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
+import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
@@ -548,7 +549,7 @@ export class EditTool implements AgentTool<TInput> {
 		let outcome;
 		try {
 			outcome = await editSession.apply(
-				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
+				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false, signal },
 				(_error, request) => this.#write(request, signal),
 			);
 			if (outcome.isError && batch?.flush) {
@@ -564,6 +565,9 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		if (outcome.isError) {
+			// Nothing more was written once the call was aborted; the text names
+			// any file an earlier write of this call had already changed.
+			if (outcome.errorKind === "cancelled") throw new ToolAbortError(outcome.text);
 			return {
 				content: [{ type: "text", text: outcome.text }],
 				details: { diff: "", errorKind: outcome.errorKind },
@@ -703,6 +707,9 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		// Last check before anything touches disk: an aborted call begins no
+		// write. Past this point the write runs to its end and is reported.
+		if (signal?.aborted) return { written: "", cancelled: true };
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {

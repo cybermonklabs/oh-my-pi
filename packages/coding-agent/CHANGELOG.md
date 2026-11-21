@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A cancelled `edit` no longer writes after the cancel. Before, an edit cancelled while it resolved an internal-URL target, recovered a missing path, or wrote the files of a multi-file edit went on to write them, even though the call was already reported as aborted (for example, a subagent cancelled with its edit pending). Now the call ends as aborted, and its message names any file an earlier write of the same call had already changed.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

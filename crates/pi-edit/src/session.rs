@@ -78,6 +78,9 @@ pub struct WriteResponse {
 /// Host-side byte owner.
 #[async_trait]
 pub trait EditWriter: Send + Sync {
+	/// Write one file. A writer that will not begin the write because the
+	/// call was cancelled returns [`EditError::Cancelled`] having touched
+	/// nothing; [`Session::apply`] then fills in the files already written.
 	async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse>;
 }
 
@@ -323,7 +326,9 @@ impl Session {
 	/// failure aborts before the first write), enforce the plan-mode guard
 	/// for every file, then write in payload order. A writer failure aborts
 	/// the loop; files already written stay written and the error is
-	/// returned verbatim. URL targets never reuse preview-time answers (see
+	/// returned verbatim, except a writer's [`EditError::Cancelled`], which
+	/// comes back naming the files this call had already written. URL
+	/// targets never reuse preview-time answers (see
 	/// [`Self::begin_apply_url_targets`]).
 	///
 	/// # Errors
@@ -367,7 +372,17 @@ impl Session {
 						flush_lsp:    request.lsp_flush && last_write == Some(index),
 						lsp_batch_id: request.lsp_batch_id.clone(),
 					})
-					.await?
+					.await
+					.map_err(|err| match err {
+						EditError::Cancelled { .. } => EditError::Cancelled {
+							written: files
+								.iter()
+								.filter(|done: &&FileOutcome| done.op != FileOp::Noop)
+								.map(|done| done.display.clone())
+								.collect(),
+						},
+						other => other,
+					})?
 			};
 
 			let mut tag: Option<String> = None;

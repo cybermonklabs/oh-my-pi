@@ -535,6 +535,39 @@ async fn writer_failure_is_surfaced_verbatim() {
 }
 
 #[tokio::test]
+async fn a_cancel_before_the_first_write_changes_no_file() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", SOURCE);
+	ws.write("b.rs", SOURCE);
+	let writer = DiskWriter { cancel_at: Some(0), ..Default::default() };
+	let err = ws
+		.apply_raw(&format!("{}{}", sloppy_payload("a.rs"), sloppy_payload("b.rs")), &writer)
+		.await
+		.expect_err("cancelled");
+	assert_eq!(err.kind(), "cancelled", "{err}");
+	assert_eq!(err.to_string(), "Edit cancelled before it wrote anything; no file was changed.");
+	assert_eq!(writer.requests.lock().len(), 1, "no write is asked after the cancel");
+	assert_eq!(ws.read("a.rs").unwrap(), SOURCE);
+	assert_eq!(ws.read("b.rs").unwrap(), SOURCE);
+}
+
+#[tokio::test]
+async fn a_cancel_between_files_names_the_files_already_written() {
+	let ws = Workspace::new(EditMode::Sloppy);
+	ws.write("a.rs", SOURCE);
+	ws.write("b.rs", SOURCE);
+	let writer = DiskWriter { cancel_at: Some(1), ..Default::default() };
+	let err = ws
+		.apply_raw(&format!("{}{}", sloppy_payload("a.rs"), sloppy_payload("b.rs")), &writer)
+		.await
+		.expect_err("cancelled");
+	assert_eq!(err.kind(), "cancelled", "{err}");
+	assert_eq!(err.to_string(), "Edit cancelled after writing a.rs; no other file was changed.");
+	assert_eq!(ws.read("a.rs").unwrap(), SOURCE.replace("let x = 1;", "let x = 2;"));
+	assert_eq!(ws.read("b.rs").unwrap(), SOURCE);
+}
+
+#[tokio::test]
 async fn plan_mode_rejects_working_tree_writes_before_writing() {
 	let mut ws = Workspace::new(EditMode::Replace);
 	ws.config.policy.plan_active = true;
