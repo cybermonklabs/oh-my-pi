@@ -1099,15 +1099,17 @@ async fn deep_walks_open_every_directory_relative_to_its_parent() {
 }
 
 /// A directory the walk gave its handle up for, and returns to through its
-/// child's `..`, is taken back only as itself. Here the child is moved
-/// elsewhere while the walk is below it: its `..` is then another
-/// directory, whose entries must not be walked as the parent's, so the
-/// parent is opened again below the root, and checked the same way. When
-/// that path also names another directory, the parent's remaining
-/// subdirectories are reported, not entered.
+/// child's `..`, is taken back only with the identity it recorded (device
+/// and inode). Here the child is moved elsewhere while the walk is below it:
+/// its `..` is then another directory, whose entries must not be walked as
+/// the parent's, so the parent is opened again below the root, and checked
+/// the same way. When that path also names another directory, the parent's
+/// remaining subdirectories are reported, not entered. An identity can be
+/// reused: a directory made after the parent was removed can get its inode
+/// number, and is then taken in its place.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_parent_the_walk_returns_to_is_taken_back_only_as_itself() {
+async fn a_parent_the_walk_returns_to_is_taken_back_only_with_its_recorded_identity() {
 	for replace_parent in [false, true] {
 		let tmp = make_tree("tree-moved", &["p/z/kept", "o/z/secret"]);
 		std::fs::create_dir(tmp.path().join("p/a")).unwrap();
