@@ -2,6 +2,7 @@ import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
+	utf8Parts,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
 import { eexist } from "./session-storage-errors";
@@ -42,6 +43,10 @@ export interface RedisSessionStorageOptions {
 
 const DEFAULT_PREFIX = "omp:sessions:";
 const DEFAULT_SCAN_COUNT = 500;
+/** Bytes of each part a streamed full write appends to its staging key. */
+const STAGING_PART_BYTES = 1024 * 1024;
+/** How long a staging key lives after its last part: a live full write finishes far sooner. */
+const STALE_STAGING_MS = 60 * 60 * 1000;
 
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
@@ -62,6 +67,50 @@ else
 	redis.call("HDEL", KEYS[3], ARGV[2])
 end
 return {1, string.len(ARGV[1])}`;
+
+// One part of a streamed full write: appended to the write's staging key,
+// which then expires ARGV[2] ms later, so a killed writer's key goes.
+const STAGE_PART_SCRIPT = `-- OMP_STAGE_PART
+local size = redis.call("APPEND", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return size`;
+
+// One script, so the size check, the swap of the staging key (KEYS[1]) over
+// the file key, and its mtime and title run with no other client's command
+// between. ARGV[5] is the expected size ("" for none, "-1" for no key),
+// ARGV[6] the body's byte length. Returns {1, size} once swapped; {0, actual}
+// when the size check refuses, and {-1, staged} when the staging key does not
+// hold the body (it expired), both after deleting the staging key.
+const WRITE_STAGED_SCRIPT = `-- OMP_WRITE_STAGED
+local expected = ARGV[5]
+if expected ~= "" then
+	local actual = -1
+	if redis.call("EXISTS", KEYS[2]) == 1 then
+		actual = redis.call("STRLEN", KEYS[2])
+	end
+	if actual ~= tonumber(expected) then
+		redis.call("DEL", KEYS[1])
+		return {0, actual}
+	end
+end
+local staged = redis.call("STRLEN", KEYS[1])
+if staged ~= tonumber(ARGV[6]) then
+	redis.call("DEL", KEYS[1])
+	return {-1, staged}
+end
+if staged == 0 then
+	redis.call("SET", KEYS[2], "")
+else
+	redis.call("RENAME", KEYS[1], KEYS[2])
+	redis.call("PERSIST", KEYS[2])
+end
+redis.call("HSET", KEYS[3], ARGV[1], ARGV[2])
+if ARGV[3] == "1" then
+	redis.call("HSET", KEYS[4], ARGV[1], ARGV[4])
+else
+	redis.call("HDEL", KEYS[4], ARGV[1])
+end
+return {1, staged}`;
 
 const APPEND_SCRIPT = `-- OMP_APPEND
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
@@ -165,7 +214,9 @@ function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefine
  * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
  * single sibling HASH. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
- * `listFilesSync` calls remain available without mirroring full content.
+ * `listFilesSync` calls remain available without mirroring full content. A
+ * full rewrite streams in parts to a staging key of its own and swaps it in
+ * (see `writeFullStream`), so the transcript is never one value here.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/**
@@ -275,6 +326,66 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		const encodedActual = Array.isArray(result) ? Number(result[1]) : Number.NaN;
 		const actualSize = encodedActual === -1 ? null : Number.isFinite(encodedActual) ? encodedActual : null;
 		throw new SessionWriteConflictError(path, expectedSize, actualSize);
+	}
+
+	/**
+	 * {@link writeFull} from a stream. Each part of at most
+	 * {@link STAGING_PART_BYTES}, ending on a character boundary, is appended
+	 * to a staging key of this write's alone, `<prefix>staging:<path>#<random
+	 * UUID>`, which expires {@link STALE_STAGING_MS} after its last part, so a
+	 * killed writer's goes; then one script checks the session's size, checks
+	 * that the staging key holds the whole body, renames it over the file key
+	 * and sets the mtime and title. No other write knows the staging key, so
+	 * none can rename it, and no listing sees it (they scan file keys). A
+	 * failure deletes it and leaves the session as it was.
+	 */
+	async writeFullStream(
+		path: string,
+		chunks: AsyncIterable<Uint8Array>,
+		byteLength: number,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void> {
+		const staging = `${this.#prefix}staging:${path}#${crypto.randomUUID()}`;
+		let result: unknown;
+		try {
+			let staged = 0;
+			for await (const part of utf8Parts(chunks, STAGING_PART_BYTES)) {
+				await this.#client.send("EVAL", [STAGE_PART_SCRIPT, "1", staging, part.text, String(STALE_STAGING_MS)]);
+				staged += part.byteLength;
+			}
+			if (staged !== byteLength) {
+				throw new Error(`RedisSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
+			}
+			result = await this.#client.send("EVAL", [
+				WRITE_STAGED_SCRIPT,
+				"4",
+				staging,
+				this.#fileKey(path),
+				this.#metaKey(),
+				this.#titleMetaKey(),
+				path,
+				String(mtimeMs),
+				title ? "1" : "0",
+				title ? encodeTitleMeta(title) : "",
+				expectedSize === undefined ? "" : String(expectedSize ?? -1),
+				String(byteLength),
+			]);
+		} catch (err) {
+			try {
+				await this.#client.send("DEL", [staging]);
+			} catch {
+				// The write's own failure is the one to report; the staging key expires.
+			}
+			throw err;
+		}
+		const [status, size] = Array.isArray(result) ? result.map(Number) : [Number.NaN, Number.NaN];
+		if (status === 1) return;
+		if (status === 0) throw new SessionWriteConflictError(path, expectedSize ?? null, size === -1 ? null : size);
+		throw new Error(
+			`RedisSessionStorage: the staging key of a full write of ${path} held ${size} bytes, not ${byteLength}`,
+		);
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {

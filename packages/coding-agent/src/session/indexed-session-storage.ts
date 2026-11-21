@@ -70,8 +70,10 @@ export interface SessionStorageBackend {
 	/**
 	 * {@link writeFull} of the UTF-8 bytes `chunks` yields, `byteLength` in all,
 	 * without holding them whole; the same size check, and the content replaced
-	 * all at once. Optional: without it the storage reads the spooled body back
-	 * whole and calls {@link writeFull}.
+	 * all at once. A stream that fails, or ends short, replaces nothing.
+	 * Optional: without it the storage reads the spooled body back whole and
+	 * calls {@link writeFull}, and a full rewrite whose spool cannot be used
+	 * fails.
 	 */
 	writeFullStream?(
 		path: string,
@@ -327,6 +329,147 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 	}
 }
 
+/** The session id in the header at the start of `prefix` (past the title slot), or `undefined` when it has none. */
+export function headerSessionId(prefix: string): string | undefined {
+	const text = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
+	const end = text.indexOf("\n");
+	if (end === -1) return undefined;
+	try {
+		const entry: unknown = JSON.parse(text.slice(0, end));
+		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
+			return typeof entry.id === "string" ? entry.id : undefined;
+		}
+	} catch {}
+	return undefined;
+}
+
+/** A full-write body's UTF-8 byte length and SHA-256 (hex), and the title slot and session id read from its head. */
+interface MeasuredLines {
+	bytes: number;
+	hash: string;
+	title: SessionTitleUpdate | undefined;
+	sessionId: string | undefined;
+}
+
+/**
+ * The UTF-8 bytes of `lines` in chunks of at most {@link LINE_STREAM_CHUNK}
+ * bytes, iterating them once and never holding their concatenation: a chunk
+ * holds as many lines as fit, and a longer line is cut across chunks, never
+ * inside a character. Each chunk is a buffer of its own, or, with `reuse`,
+ * a view of one buffer that the next chunk overwrites.
+ */
+function* encodeLines(lines: Iterable<string>, reuse = false): Generator<Uint8Array> {
+	const encoder = new TextEncoder();
+	let buffer = Buffer.allocUnsafe(LINE_STREAM_CHUNK);
+	let used = 0;
+	for (const line of lines) {
+		for (let read = 0; read < line.length;) {
+			const encoded = encoder.encodeInto(read === 0 ? line : line.slice(read), buffer.subarray(used));
+			read += encoded.read;
+			used += encoded.written;
+			// The rest of the line does not fit: the buffer is full, to within a character.
+			if (read < line.length) {
+				yield buffer.subarray(0, used);
+				if (!reuse) buffer = Buffer.allocUnsafe(LINE_STREAM_CHUNK);
+				used = 0;
+			}
+		}
+	}
+	if (used > 0) yield buffer.subarray(0, used);
+}
+
+/**
+ * Measure `lines` for a full write streamed from them ({@link streamLines}):
+ * the size and SHA-256 of their UTF-8 bytes, and the title slot read from
+ * their head as {@link spoolLines} reads it, from the lines that make up its
+ * first {@link LINE_STREAM_CHUNK} UTF-16 units, and the header's session id.
+ * Iterates them once.
+ */
+function measureLines(lines: Iterable<string>): MeasuredLines {
+	let head = "";
+	function* noteHead(): Generator<string> {
+		for (const line of lines) {
+			if (head.length < LINE_STREAM_CHUNK) head += line;
+			yield line;
+		}
+	}
+	const hasher = new Bun.CryptoHasher("sha256");
+	let bytes = 0;
+	for (const chunk of encodeLines(noteHead(), true)) {
+		hasher.update(chunk);
+		bytes += chunk.byteLength;
+	}
+	return {
+		bytes,
+		hash: hasher.digest("hex"),
+		title: titleUpdateFromSlot(parseTitleSlotFromContent(head)),
+		sessionId: headerSessionId(head),
+	};
+}
+
+/**
+ * The UTF-8 bytes of `lines` ({@link encodeLines}) for a backend's streamed
+ * write, read from the lines again. The stream fails at its end, so the
+ * backend replaces nothing, when they are not the bytes `measured` holds:
+ * the lines changed after {@link measureLines} read them.
+ */
+async function* streamLines(lines: Iterable<string>, measured: MeasuredLines): AsyncGenerator<Uint8Array> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	let bytes = 0;
+	for (const chunk of encodeLines(lines)) {
+		hasher.update(chunk);
+		bytes += chunk.byteLength;
+		yield chunk;
+	}
+	if (bytes !== measured.bytes || hasher.digest("hex") !== measured.hash) {
+		throw new Error(`The lines of a session rewrite changed after they were measured (${measured.bytes} bytes)`);
+	}
+}
+
+/**
+ * Where a part of `bytes` that starts at `start` and holds at most `maxBytes`
+ * ends: at the end of `bytes` when it is that close, otherwise `maxBytes` on,
+ * backed off continuation bytes (0b10xxxxxx) so no character straddles two
+ * parts. A run of continuation bytes that long, never in valid UTF-8, is cut
+ * at `maxBytes`.
+ */
+export function utf8PartEnd(bytes: Uint8Array, start: number, maxBytes: number): number {
+	const limit = start + maxBytes;
+	if (limit >= bytes.byteLength) return bytes.byteLength;
+	let end = limit;
+	while (end > start && (bytes[end] & 0xc0) === 0x80) end--;
+	return end === start ? limit : end;
+}
+
+/**
+ * Cut the UTF-8 bytes `chunks` yields into parts of at most `maxBytes`, each
+ * ending on a character boundary, also where a character straddles two
+ * chunks: a cut is made only once the byte after it has arrived.
+ */
+export async function* utf8Parts(
+	chunks: AsyncIterable<Uint8Array>,
+	maxBytes: number,
+): AsyncGenerator<{ text: string; byteLength: number }> {
+	let pending: Uint8Array[] = [];
+	let pendingBytes = 0;
+	for await (const chunk of chunks) {
+		pending.push(chunk);
+		pendingBytes += chunk.byteLength;
+		if (pendingBytes <= maxBytes) continue;
+		const bytes = Buffer.concat(pending, pendingBytes);
+		let start = 0;
+		while (bytes.byteLength - start > maxBytes) {
+			const end = utf8PartEnd(bytes, start, maxBytes);
+			yield { text: bytes.toString("utf8", start, end), byteLength: end - start };
+			start = end;
+		}
+		pending = [bytes.subarray(start)];
+		pendingBytes = bytes.byteLength - start;
+	}
+	if (pendingBytes > 0)
+		yield { text: Buffer.concat(pending, pendingBytes).toString("utf8"), byteLength: pendingBytes };
+}
+
 /**
  * `chunks` with the title slot laid over their first
  * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotContent}
@@ -517,7 +660,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	/**
 	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
 	 * publishes it from there, so the body is never one string. When the spool
-	 * cannot be used it publishes the joined lines instead (see
+	 * cannot be used it streams the lines to the backend instead (see
 	 * {@link #linesBody}). A subclass or spy that intercepts
 	 * {@link writeTextSync} still sees every full rewrite: the lines are then
 	 * joined and routed through it.
@@ -581,18 +724,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	/**
 	 * The body of a full rewrite of `lines`: spooled to a temporary file, or,
 	 * when the spool cannot be made, opened or written (`os.tmpdir()` read-only
-	 * or full, or its spool directory not private to this account), the joined
-	 * lines, as {@link writeTextSync} publishes them, with one warning per
-	 * store. The join reads `lines` again, so an iterator, which yields its
-	 * lines only once, is read into an array first. A throw from `lines`
-	 * itself (an entry that cannot be read or serialized) is no spool failure:
-	 * it propagates as it is, with no join and no warning.
+	 * or full, or its spool directory not private to this account), streamed
+	 * from the lines themselves ({@link #streamedBody}), with one warning per
+	 * store. That reads `lines` again, so an iterator, which yields its lines
+	 * only once, is read into an array first. A throw from `lines` itself (an
+	 * entry that cannot be read or serialized) is no spool failure: it
+	 * propagates as it is, with no second read and no warning.
 	 */
 	#linesBody(path: string, lines: Iterable<string>): FullBody {
 		// An iterator is its own iterable, and yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
-		const once = iterator === lines ? Array.from(lines) : undefined;
-		const readable: Iterable<string> = once ?? lines;
+		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
 		let linesFailed = false;
 		// Only a throw from `readable` lands in the catch: a throw from the spool's
 		// own writes ends the iteration through `return`, which runs no catch.
@@ -608,15 +750,64 @@ export class IndexedSessionStorage implements SessionStorage {
 			return this.#spoolBody(path, spoolLines(noteLinesFailure()));
 		} catch (err) {
 			if (linesFailed) throw err;
+			const spoolError = toError(err).message;
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
-				logger.warn("Session rewrites are joined in memory: their spool file cannot be used", {
+				logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
 					dir: spoolDir(),
-					error: toError(err).message,
+					error: spoolError,
 				});
 			}
-			return this.#textBody(path, (once ?? Array.from(lines)).join(""));
+			return this.#streamedBody(path, readable, spoolError);
 		}
+	}
+
+	/**
+	 * The body of a full rewrite of `lines` that has no spool: measured now
+	 * ({@link measureLines}), and read from the lines again when it publishes,
+	 * through the backend's streamed write ({@link streamLines}), so it is
+	 * never one value; a backend without one cannot take it. A publish that
+	 * fails replaces nothing, and is logged as an error naming the session,
+	 * the path and the cause, besides failing the write as any publish does;
+	 * the next full rewrite tries the spool, and this, again. A refusal the
+	 * caller resolves (a size conflict, a lost claim) is not logged.
+	 */
+	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
+		const measured = measureLines(lines);
+		return {
+			byteLength: measured.bytes,
+			title: measured.title,
+			publish: async (mtimeMs, expectedSize) => {
+				try {
+					if (!this.#backend.writeFullStream) {
+						throw new Error("Session storage backend has no streamed full write (writeFullStream)");
+					}
+					await this.#backend.writeFullStream(
+						path,
+						streamLines(lines, measured),
+						measured.bytes,
+						mtimeMs,
+						measured.title,
+						expectedSize,
+					);
+				} catch (err) {
+					if (!(err instanceof SessionWriteConflictError) && !(err instanceof SessionLeaseLostError)) {
+						logger.error("Session rewrite not stored: its spool cannot be used, and streaming it failed", {
+							session: measured.sessionId,
+							path,
+							error: toError(err).message,
+							spoolError,
+						});
+					}
+					throw err;
+				}
+			},
+			// Compared by size and SHA-256, chunk by chunk, with what the lines measured.
+			isStored: async () => {
+				const stored = await digestStream(this.#backendChunks(path, 0));
+				return stored.bytes === measured.bytes && stored.hash === measured.hash;
+			},
+		};
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
@@ -800,7 +991,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
 	 * publishes it from there, and after a failed publish compares the stored
 	 * bytes with the spool by size and SHA-256. When the spool cannot be used
-	 * it publishes the joined lines instead (see {@link #linesBody}). A
+	 * it streams the lines to the backend instead (see {@link #linesBody}). A
 	 * subclass or spy that intercepts {@link writeTextAtomic} still sees every
 	 * full rewrite: the lines are then joined and routed through it.
 	 */

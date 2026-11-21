@@ -51,6 +51,7 @@
 - Under `session.storage: sql` on PostgreSQL with a nondeterministic (such as case-insensitive) collation on the `path` columns, deleting a session no longer deletes the sessions, or fails the in-progress saves, under another directory whose name differs only in letter case.
 - Under `session.storage: sql` on SQLite, a parts table holding a rowid past 2^53 (as a copy or restore tool that keeps rowids can leave) no longer makes a session's appends and rewrites fail (`datatype mismatch`, `UNIQUE constraint failed`) or its chunked reads fail with a read conflict.
 - Under `session.storage: sql` on SQLite, resuming, opening, forking or exporting a long session that an older omp sharing the database (or this process itself) re-creates while it is read no longer gives the old transcript's first entries followed by the new one's: the read checks what it read when it ends and reads the session again.
+- A full rewrite of a long session (a recovery, a branch) no longer holds the whole transcript as one string on Redis session storage, nor on SQL session storage when the temporary directory cannot hold its spool or, on MySQL, when the session's path is longer than 473 characters: it streams to the store in parts, or fails with a logged error and leaves the stored session as it was.
 
 ### Security
 

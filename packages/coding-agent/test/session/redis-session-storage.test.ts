@@ -11,16 +11,34 @@
  * - `deleteSessionWithArtifacts` removes both the JSONL key and any sidecar
  *   keys under the artifacts prefix;
  * - `refresh()` re-loads the keyspace, so a peer process's writes become
- *   visible after an explicit re-scan.
+ *   visible after an explicit re-scan;
+ * - a full rewrite streams in parts to a staging key of its own and swaps it
+ *   in, whether or not the local spool can be used.
  */
 
 import { RedisClient } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
 import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+/** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
+function rewriteLines(text: string, count = 3): string[] {
+	return [
+		serializeTitleSlot({ title: `Title ${text}`, source: "user", updatedAt: "2026-11-21T00:00:00.000Z" }),
+		`${JSON.stringify({ type: "session", version: 3, id: "redis-rewrite", timestamp: "t0", cwd: "/cwd" })}\n`,
+		...Array.from(
+			{ length: count },
+			(_, n) =>
+				`${JSON.stringify({ type: "custom", customType: "n", id: `e${n}`, parentId: null, data: { text } })}\n`,
+		),
+	];
+}
 
 interface FakeRedisCall {
 	method: string;
@@ -96,6 +114,33 @@ function createFakeRedis(): FakeRedis {
 				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
 				else getHash(titleKey).delete(filePath);
 				return 1;
+			}
+			if (script.includes("OMP_STAGE_PART")) {
+				checkFailure("append");
+				const [stagingKey] = keys;
+				const [part] = argv;
+				const next = (strings.get(stagingKey) ?? "") + part;
+				strings.set(stagingKey, next);
+				return Buffer.byteLength(next, "utf-8");
+			}
+			if (script.includes("OMP_WRITE_STAGED")) {
+				// As the script runs on a Redis 7 server: refused ({0, actual} or {-1, staged}) after deleting the staging key.
+				checkFailure("rename");
+				checkFailure("hset");
+				const [stagingKey, fileKey, metaKey, titleKey] = keys;
+				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength] = argv;
+				const current = strings.get(fileKey);
+				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf-8");
+				const staged = strings.get(stagingKey) ?? "";
+				const stagedSize = Buffer.byteLength(staged, "utf-8");
+				strings.delete(stagingKey);
+				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
+				if (stagedSize !== Number(byteLength)) return [-1, stagedSize];
+				strings.set(fileKey, staged);
+				getHash(metaKey).set(filePath, mtimeMs);
+				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
+				else getHash(titleKey).delete(filePath);
+				return [1, stagedSize];
 			}
 			if (script.includes("OMP_APPEND")) {
 				checkFailure("append");
@@ -550,6 +595,72 @@ describe("RedisSessionStorage", () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await expect(storage.unlink("/sessions/p/ghost.jsonl")).rejects.toMatchObject({ code: "ENOENT" });
 	});
+
+	// If this regresses, a full rewrite on Redis storage holds the whole transcript as one string
+	// (read back from the spool, or joined when the spool cannot be used), or leaves staging keys
+	// behind, and a long session's memory grows with its age.
+	it("streams a full rewrite to a staging key of its own and swaps it in, with the spool and without it", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/rewrite.jsonl";
+		await storage.writeText(sessionPath, "old\n");
+		const scripts = (): string[] =>
+			redis.calls
+				.filter(call => call.method === "send")
+				.map(call => String((call.args[1] as string[])[0]).split("\n")[0] ?? "");
+		const stagingKeys = (): string[] =>
+			redis.calls
+				.filter(call => call.method === "send" && String((call.args[1] as string[])[0]).includes("OMP_STAGE_PART"))
+				.map(call => String((call.args[1] as string[])[2]));
+		const withSpool = rewriteLines("with the spool");
+		const withoutSpool = rewriteLines("without the spool");
+		redis.calls.length = 0;
+
+		await storage.writeLinesAtomic(sessionPath, withSpool, { expectedSize: 4 });
+		const spooled = { scripts: scripts(), stored: redis.strings.get(`omp:sessions:file:${sessionPath}`) };
+		const firstStaging = stagingKeys();
+		redis.calls.length = 0;
+		using tmp = TempDir.createSync("@omp-redis-rewrite-tmp-");
+		fs.writeFileSync(tmp.join("not-a-directory"), "a regular file\n");
+		const originalTmpdir = process.env.TMPDIR;
+		process.env.TMPDIR = tmp.join("not-a-directory", "tmp");
+		try {
+			storage.writeLinesSync(sessionPath, withoutSpool, { expectedSize: Buffer.byteLength(withSpool.join("")) });
+			await storage.drain();
+		} finally {
+			if (originalTmpdir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpdir;
+		}
+		const streamed = { scripts: scripts(), stored: redis.strings.get(`omp:sessions:file:${sessionPath}`) };
+
+		expect({ spooled, streamed }).toEqual({
+			spooled: { scripts: ["-- OMP_STAGE_PART", "-- OMP_WRITE_STAGED"], stored: withSpool.join("") },
+			streamed: { scripts: ["-- OMP_STAGE_PART", "-- OMP_WRITE_STAGED"], stored: withoutSpool.join("") },
+		});
+		expect(JSON.parse(redis.hashes.get("omp:sessions:title")?.get(sessionPath) ?? "{}")).toMatchObject({
+			title: "Title without the spool",
+		});
+		// Each write staged under a key of its own, and none is left.
+		expect(new Set([...firstStaging, ...stagingKeys()]).size).toBe(2);
+		expect([...redis.strings.keys()].filter(key => key.includes(":staging:"))).toEqual([]);
+	});
+
+	// If this regresses, a full rewrite on Redis storage that another client's write made stale
+	// replaces that client's session anyway, or leaves its staging key behind.
+	it("refuses a staged rewrite whose size check fails, deleting its staging key and leaving the session", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const peer = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/stale.jsonl";
+		await storage.writeText(sessionPath, "ours\n");
+		await peer.refresh();
+		await peer.writeText(sessionPath, "theirs, longer\n");
+
+		await expect(
+			storage.writeLinesAtomic(sessionPath, rewriteLines("stale"), { expectedSize: Buffer.byteLength("ours\n") }),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+
+		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("theirs, longer\n");
+		expect([...redis.strings.keys()].filter(key => key.includes(":staging:"))).toEqual([]);
+	});
 });
 
 // The fake above does not run Lua; these run the move and remove scripts on a
@@ -646,5 +757,36 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await storage.readTextFrom("/s/w.jsonl", 9, 0)).toEqual({ text: "", size: bytes.length });
 		await client.send("DEL", [`${prefix}file:/s/w.jsonl`]);
 		await expect(storage.readTextFrom("/s/w.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	// If this regresses, a full rewrite on a Redis server leaves its session expiring with the
+	// staging key's time to live, splits a character between parts, leaves staging keys behind, or
+	// replaces a session another client changed meanwhile.
+	it("swaps a streamed rewrite in from its staging key, and a refused one deletes the key and leaves the session", async () => {
+		const { client, storage } = await open();
+		const other = await open();
+		// About 2.7 MB of three-byte characters: several parts, cut between characters.
+		const lines = rewriteLines("€".repeat(300_000), 3);
+		const body = lines.join("");
+		await storage.writeText("/s/r.jsonl", "old\n");
+
+		await storage.writeLinesAtomic("/s/r.jsonl", lines, { expectedSize: 4 });
+
+		expect({
+			stored: await client.get(`${prefix}file:/s/r.jsonl`),
+			ttl: await client.send("PTTL", [`${prefix}file:/s/r.jsonl`]),
+			title: JSON.parse(String(await hget(client, "title", "/s/r.jsonl"))).title,
+			staging: await client.send("KEYS", [`${prefix}staging:*`]),
+		}).toEqual({ stored: body, ttl: -1, title: JSON.parse(lines[0] ?? "{}").title, staging: [] });
+
+		await other.storage.refresh();
+		await other.storage.writeText("/s/r.jsonl", "theirs\n");
+		await expect(
+			storage.writeLinesAtomic("/s/r.jsonl", rewriteLines("stale"), { expectedSize: Buffer.byteLength(body) }),
+		).rejects.toBeInstanceOf(SessionWriteConflictError);
+		expect({
+			stored: await client.get(`${prefix}file:/s/r.jsonl`),
+			staging: await client.send("KEYS", [`${prefix}staging:*`]),
+		}).toEqual({ stored: "theirs\n", staging: [] });
 	});
 });

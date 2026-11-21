@@ -2,13 +2,23 @@
  * SQL session storage saves a full rewrite when the spool it streams the
  * lines through cannot be used: `os.tmpdir()` read-only, a spool write that
  * fails as a full disk does, or a spool directory that another account could
- * enter. The rewrite then stores the joined lines, as `writeTextSync` does,
- * and the store warns once, not on every rewrite. A throw from the lines
- * themselves is no spool failure, and fails the rewrite as it is.
+ * enter. The rewrite then streams the lines to the store's staged write
+ * straight from the lines, never joined, and the store warns once, not on
+ * every rewrite. When that streamed write fails too, the rewrite fails where
+ * its caller sees it, logs an error naming the session, the path and the
+ * cause, and leaves the stored copy whole; the next rewrite tries again. A
+ * store whose backend has no streamed write fails such a rewrite rather than
+ * join it. A throw from the lines themselves is no spool failure, and fails
+ * the rewrite as it is.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+	IndexedSessionStorage,
+	type SessionStorageBackend,
+	type SessionStorageIndexEntry,
+} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -109,6 +119,62 @@ function failSpoolWritesUnder(dir: string): { refused: () => number } {
 		});
 	}) as typeof fs.writeFileSync);
 	return { refused: () => refused };
+}
+
+/** Make `os.tmpdir()` a path under a regular file in `tmp`, where no spool directory can be made. */
+function tmpdirUnderRegularFile(tmp: TempDir): void {
+	fs.writeFileSync(tmp.join("not-a-directory"), "a regular file\n");
+	process.env.TMPDIR = tmp.join("not-a-directory", "tmp");
+}
+
+/** A backend that keeps each session's text in memory and has no streamed full write; it records each `writeFull` body's length. */
+class NoStreamBackend implements SessionStorageBackend {
+	readonly sessions = new Map<string, string>();
+	readonly writeFullBytes: number[] = [];
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		return Promise.resolve([]);
+	}
+	readFull(path: string): Promise<string | null> {
+		return Promise.resolve(this.sessions.get(path) ?? null);
+	}
+	readSlices(): Promise<[string, string]> {
+		return Promise.resolve(["", ""]);
+	}
+	writeFull(path: string, content: string): Promise<void> {
+		this.writeFullBytes.push(Buffer.byteLength(content));
+		this.sessions.set(path, content);
+		return Promise.resolve();
+	}
+	append(path: string, line: string): Promise<void> {
+		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
+		return Promise.resolve();
+	}
+	updateSessionTitle(): Promise<void> {
+		return Promise.resolve();
+	}
+	truncate(path: string): Promise<void> {
+		this.sessions.set(path, "");
+		return Promise.resolve();
+	}
+	remove(paths: string[]): Promise<void> {
+		for (const path of paths) this.sessions.delete(path);
+		return Promise.resolve();
+	}
+	move(): Promise<void> {
+		return Promise.resolve();
+	}
+}
+
+/** What `promise` settles with: undefined when it resolves, the reason when it rejects. */
+function failureOf(promise: Promise<unknown>): Promise<unknown> {
+	return promise.then(
+		() => undefined,
+		(err: unknown) => err,
+	);
 }
 
 describe("SQL session storage full rewrites when the spool cannot be used", () => {
@@ -218,10 +284,10 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 	);
 
 	// If this regresses, a rewrite whose own lines fail (an entry that cannot be read back or
-	// serialized) is reported as an unusable spool, reads the whole transcript a second time to join
+	// serialized) is reported as an unusable spool, reads the whole transcript a second time to stream
 	// it, and uses up the store's one warning, so a real spool failure later goes unreported.
 	it.skipIf(process.getuid === undefined)(
-		"rethrows a throw from the lines of a rewrite without joining them or using up the spool warning",
+		"rethrows a throw from the lines of a rewrite without reading them again or using up the spool warning",
 		async () => {
 			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
 			process.env.TMPDIR = tmp.path();
@@ -258,4 +324,95 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			});
 		},
 	);
+
+	// If this regresses, a rewrite whose spool cannot be used and whose streamed write then fails
+	// either swaps in bytes other than those it measured, or fails with nothing in the log, and the
+	// session the user resumes later silently lacks what that rewrite carried.
+	it("fails a rewrite whose streamed write fails, logging the session, the path and the cause, and keeps the stored copy", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		tmpdirUnderRegularFile(tmp);
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		let reads = 0;
+		// Each read after the first gives other bytes of the same length, as entries changed since the first would.
+		const changing: Iterable<string> = {
+			*[Symbol.iterator]() {
+				reads++;
+				yield* sessionLines(reads === 1 ? "first read" : "later read");
+			},
+		};
+
+		await withSqliteStorage(async storage => {
+			const before = sessionLines("before", 1).join("");
+			await storage.writeText(SYNC_FILE, before);
+			await storage.writeText(ATOMIC_FILE, before);
+			const expectedSize = Buffer.byteLength(before);
+
+			storage.writeLinesSync(SYNC_FILE, changing, { expectedSize });
+			const syncFailure = await failureOf(storage.drain());
+			reads = 0;
+			const atomicFailure = await failureOf(storage.writeLinesAtomic(ATOMIC_FILE, changing, { expectedSize }));
+
+			expect({
+				syncFailed: syncFailure instanceof Error,
+				atomicFailed: atomicFailure instanceof Error,
+				stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+				sizes: [storage.statSync(SYNC_FILE).size, storage.statSync(ATOMIC_FILE).size],
+			}).toEqual({
+				syncFailed: true,
+				atomicFailed: true,
+				stored: [before, before],
+				sizes: [expectedSize, expectedSize],
+			});
+			expect(error.mock.calls.map(([, context]) => context)).toEqual([
+				expect.objectContaining({ session: ID, path: SYNC_FILE, error: expect.stringContaining("changed") }),
+				expect.objectContaining({ session: ID, path: ATOMIC_FILE, error: expect.stringContaining("changed") }),
+			]);
+
+			// The next full rewrites try again, and store.
+			const { stored, written } = await rewriteBothWays(storage);
+			expect(stored).toEqual(written);
+		});
+	});
+
+	// If this regresses, a store whose backend has no streamed write joins the whole transcript into
+	// one string at every full rewrite while its spool cannot be used, and a long session's memory
+	// grows with its age until the process is killed.
+	it("fails a rewrite on a backend without a streamed write instead of joining it, and keeps the stored copy", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		tmpdirUnderRegularFile(tmp);
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const backend = new NoStreamBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const before = sessionLines("before", 1).join("");
+		await storage.writeText(SYNC_FILE, before);
+		await storage.writeText(ATOMIC_FILE, before);
+		const expectedSize = Buffer.byteLength(before);
+		backend.writeFullBytes.length = 0;
+
+		storage.writeLinesSync(SYNC_FILE, sessionLines("written by writeLinesSync"), { expectedSize });
+		const syncFailure = await failureOf(storage.drain());
+		const atomicFailure = await failureOf(
+			storage.writeLinesAtomic(ATOMIC_FILE, sessionLines("written by writeLinesAtomic"), { expectedSize }),
+		);
+
+		expect({
+			failures: [String(syncFailure), String(atomicFailure)],
+			writeFullBytes: backend.writeFullBytes,
+			stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+		}).toEqual({
+			failures: [
+				expect.stringContaining("no streamed full write"),
+				expect.stringContaining("no streamed full write"),
+			],
+			writeFullBytes: [],
+			stored: [before, before],
+		});
+		expect(error.mock.calls.map(([, context]) => context)).toEqual([
+			expect.objectContaining({ session: ID, path: SYNC_FILE }),
+			expect.objectContaining({ session: ID, path: ATOMIC_FILE }),
+		]);
+	});
 });
