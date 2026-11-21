@@ -56,21 +56,32 @@ mod imp {
 	};
 
 	pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
+		os_pipe_with(prefill, private)
+	}
+
+	/// [`os_pipe`] with the opener of private ends given, so a test can refuse
+	/// them.
+	fn os_pipe_with(
+		prefill: &[u8],
+		open: impl Fn(RawFd, bool) -> io::Result<fs::File>,
+	) -> Option<(Box<dyn File>, Box<dyn File>)> {
 		let (r, w) = io::pipe().ok()?;
 		let (read, write) =
 			(Shared::new(OwnedFd::from(r), false), Shared::new(OwnedFd::from(w), true));
-		if !prefill.is_empty() {
-			// The only reader is ours, so a write that does not fit would wait
-			// forever: the private end takes what fits, and anything left over
-			// means this pipe cannot hold what the memory pipe had.
-			let mut ours = private(write.file.as_raw_fd(), true).ok()?;
-			let mut done = 0;
-			while done < prefill.len() {
-				match ours.write(&prefill[done..]) {
-					Ok(n) if n > 0 => done += n,
-					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
-					_ => return None,
-				}
+		// Every engine handle reads and writes through a private end of its
+		// own. Where none can be opened (no `/proc` mounted), the pipe stays in
+		// memory, pumped: shared, it would fail the shell's own stages.
+		open(read.file.as_raw_fd(), false).ok()?;
+		let mut ours = open(write.file.as_raw_fd(), true).ok()?;
+		// The only reader is ours, so a write that does not fit would wait
+		// forever: the private end takes what fits, and anything left over
+		// means this pipe cannot hold what the memory pipe had.
+		let mut done = 0;
+		while done < prefill.len() {
+			match ours.write(&prefill[done..]) {
+				Ok(n) if n > 0 => done += n,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+				_ => return None,
 			}
 		}
 		Some((Box::new(read), Box::new(write)))
@@ -499,6 +510,26 @@ mod imp {
 			// SAFETY: restores this thread's mask saved above.
 			unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, ptr::null_mut()) };
 			assert!(!raised, "the shell's write raised SIGPIPE");
+		}
+
+		// Failure mode: with no `/proc` the private ends cannot be opened, yet
+		// the pipe is shared, and the shell's own stages then fail to read or
+		// write it (an empty prefill opened no private end before the pipe was
+		// handed out).
+		#[test]
+		fn no_private_ends_means_no_os_pipe() {
+			let refuse =
+				|_: RawFd, _: bool| -> io::Result<fs::File> { Err(io::ErrorKind::NotFound.into()) };
+			assert!(os_pipe_with(b"", refuse).is_none(), "an empty prefill");
+			assert!(os_pipe_with(b"x", refuse).is_none(), "a prefill");
+			let refuse_reads = |fd: RawFd, write: bool| {
+				if write {
+					private(fd, write)
+				} else {
+					Err(io::ErrorKind::NotFound.into())
+				}
+			};
+			assert!(os_pipe_with(b"", refuse_reads).is_none(), "only the write end opens");
 		}
 	}
 }

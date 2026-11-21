@@ -258,6 +258,38 @@ fn two_external_stages_are_one_pipe() {
 	]);
 }
 
+/// With no `/proc` mounted the shell cannot open its own ends of an OS pipe,
+/// so the pipe between stages stays in memory, pumped, and a stage of shell
+/// code between two externals still gets every byte. `/proc` is hidden in a
+/// user and mount namespace; where `unshare` cannot make one, the test prints
+/// `skipped:` and checks nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_code_stages_without_proc() {
+	let hide = "mount -t tmpfs none /proc && exec \"$0\" -c \"$1\"";
+	let probe = Command::new("unshare")
+		.args(["-rm", "sh", "-c", "mount -t tmpfs none /proc && test ! -e /proc/self", "-"])
+		.output();
+	match probe {
+		Ok(out) if out.status.success() => {},
+		other => {
+			println!("skipped: no user and mount namespace to hide /proc: {other:?}");
+			return;
+		},
+	}
+	let script = "/usr/bin/printf 'a\\nb\\n' | while read -r l; do echo \"got $l\"; done | /bin/cat";
+	let out = Command::new("unshare")
+		.args(["-rm", "sh", "-c", hide, env!("CARGO_BIN_EXE_obash"), script])
+		.stdin(Stdio::null())
+		.output()
+		.expect("run obash with /proc hidden");
+	assert_eq!(
+		String::from_utf8_lossy(&out.stdout),
+		"got a\ngot b\n",
+		"obash with /proc hidden: {out:?}"
+	);
+}
+
 /// A stage of shell code between externals reads and writes the OS pipe
 /// itself: the output and every stage's status are bash's and zsh's, a line
 /// `read` takes leaves the rest to the external after it, more than a pipe's
