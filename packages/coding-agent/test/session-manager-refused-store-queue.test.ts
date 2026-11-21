@@ -128,7 +128,7 @@ describe("a session the store refused is sent again once another session's write
 		});
 	}
 
-	it("a transcript whose close the file store refused is kept, and written once another session's write and close land", async () => {
+	it("a transcript whose close the file store refused is kept, written once another session's write and close land, and then released", async () => {
 		const dir = tempDir();
 		const { disk, childDir } = subagentDisk(dir);
 		const child = await openChild(dir, childDir, "Closed");
@@ -136,6 +136,8 @@ describe("a session the store refused is sent again once another session's write
 		child.appendMessage(assistant("Closed: refused answer"));
 		const ids = await closeRefused(child);
 		const file = child.getSessionFile() as string;
+		// Held: the transcript stays in memory while the store refuses it.
+		expect(child.getEntries()).toHaveLength(ids.length - 1);
 
 		disk.full = false;
 		const parent = SessionManager.create(dir.path(), dir.join("main"));
@@ -143,6 +145,8 @@ describe("a session the store refused is sent again once another session's write
 		await parent.close();
 
 		expect(storedFile(file)).toEqual(ids);
+		// Sent: the sealed session drops its transcript.
+		expect(child.getEntries()).toHaveLength(0);
 	});
 
 	for (const refusal of ["read-only", "connection"] as const) {
@@ -235,16 +239,36 @@ describe("a session the store refused is sent again once another session's write
 		const child = await openChild(dir, childDir, "Held");
 		disk.full = true;
 		child.appendMessage(assistant("Held: refused answer"));
-		await closeRefused(child);
-		disk.attempts.splice(0);
-
-		const parent = SessionManager.create(dir.path(), dir.join("main"));
-		parent.appendMessage(assistant("the parent's write lands"));
-		expect(disk.attempts).toEqual([]);
-
+		const ids = await closeRefused(child);
+		const file = child.getSessionFile() as string;
 		disk.full = false;
+
+		// A held send's first step reads its stored file: note each read of the child's file, inside a
+		// landing write or after it. All file stores share one queue, and sessions other test files left in
+		// it can come before this child, so writes land until the child's send has started.
+		let landing = false;
+		const inside: string[] = [];
+		const after: string[] = [];
+		const readText = FileSessionStorage.prototype.readText;
+		vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementation(function (
+			this: FileSessionStorage,
+			fpath: string,
+		) {
+			if (fpath === file) (landing ? inside : after).push(fpath);
+			return readText.call(this, fpath);
+		});
+		const parent = SessionManager.create(dir.path(), dir.join("main"));
+		for (let landed = 0; landed < 200 && inside.length + after.length === 0; landed++) {
+			landing = true;
+			parent.appendMessage(assistant(`the parent's write ${landed} lands`));
+			landing = false;
+			await nextTurn();
+		}
+		await until(() => inside.length + after.length > 0, "the held send after a landing write");
+
+		expect({ inside: inside.length, after: after.length > 0 }).toEqual({ inside: 0, after: true });
 		await parent.close();
-		expect(disk.attempts.length).toBeGreaterThan(0);
+		expect(storedFile(file)).toEqual(ids);
 	});
 
 	it("a refused session whose own next write fails for another reason leaves the queue: other sessions' writes no longer send it", async () => {
@@ -290,7 +314,7 @@ describe("a session the store refused is sent again once another session's write
 		await child.close().catch(() => undefined);
 	});
 
-	it("held transcripts stay in memory until the store accepts them: 25 closed while it refused all land, then none is left", async () => {
+	it("held transcripts stay in memory until the store accepts them: 25 closed while it refused all land, are released, and none is left", async () => {
 		const dir = tempDir();
 		const { disk, childDir } = subagentDisk(dir);
 		const children: SessionManager[] = [];
@@ -301,6 +325,8 @@ describe("a session the store refused is sent again once another session's write
 			child.appendMessage(assistant("refused answer"));
 			ids.push(await closeRefused(child));
 		}
+		// Held: every transcript is still in memory.
+		expect(children.map(child => child.getEntries().length)).toEqual(ids.map(own => own.length - 1));
 
 		disk.full = false;
 		const parent = SessionManager.create(dir.path(), dir.join("main"));
@@ -309,6 +335,8 @@ describe("a session the store refused is sent again once another session's write
 		for (const [i, child] of children.entries()) {
 			expect(storedFile(child.getSessionFile() as string)).toEqual(ids[i]!);
 		}
+		// Sent: every one is released.
+		expect(children.map(child => child.getEntries().length)).toEqual(ids.map(() => 0));
 
 		// Nothing is left to send: a later close sends none of them.
 		disk.attempts.splice(0);
@@ -317,24 +345,73 @@ describe("a session the store refused is sent again once another session's write
 	});
 });
 
+describe("a session the store refuses for permission waits only on its own writes", () => {
+	it("is not sent by other sessions' landed writes, and its own next append writes once the permission is back", async () => {
+		const dir = tempDir();
+		const { disk, childDir } = subagentDisk(dir);
+		const child = await openChild(dir, childDir, "Denied");
+		disk.error = () => fsError("EACCES", "EACCES: permission denied, open");
+		disk.full = true;
+		child.appendMessage(assistant("Denied: refused answer"));
+		const file = child.getSessionFile() as string;
+		expect(storedFile(file)).not.toEqual(heldIds(child));
+		// The permission is back, but no other session's write can show it.
+		disk.full = false;
+		disk.attempts.splice(0);
+
+		const parent = SessionManager.create(dir.path(), dir.join("main"));
+		for (let landed = 1; landed <= 3; landed++) {
+			parent.appendMessage(assistant(`landed write ${landed}`));
+			await nextTurn();
+		}
+		await parent.close();
+		expect(disk.attempts).toEqual([]);
+
+		child.appendMessage(assistant("Denied: its own next answer"));
+		await child.flush();
+		expect(storedFile(file)).toEqual(heldIds(child));
+		await child.close();
+	});
+
+	it("a close it refuses is not held: no later write sends it", async () => {
+		const dir = tempDir();
+		const { disk, childDir } = subagentDisk(dir);
+		const child = await openChild(dir, childDir, "Denied");
+		disk.error = () => fsError("EACCES", "EACCES: permission denied, open");
+		disk.full = true;
+		child.appendMessage(assistant("Denied: refused answer"));
+		const ids = await closeRefused(child);
+		const file = child.getSessionFile() as string;
+
+		disk.full = false;
+		disk.attempts.splice(0);
+		const parent = SessionManager.create(dir.path(), dir.join("main"));
+		parent.appendMessage(assistant("the parent's write lands"));
+		await parent.close();
+
+		expect(disk.attempts).toEqual([]);
+		expect(storedFile(file)).not.toEqual(ids);
+	});
+});
+
 describe("a held send never replaces a file another writer changed", () => {
 	/** A child whose close was refused after "Held: first answer" was stored, and its file. */
-	async function heldChild(dir: TempDir): Promise<{ disk: FullDisk; file: string }> {
+	async function heldChild(dir: TempDir): Promise<{ disk: FullDisk; file: string; child: SessionManager }> {
 		const { disk, childDir } = subagentDisk(dir);
 		const child = await openChild(dir, childDir, "Held");
 		disk.full = true;
 		child.appendMessage(assistant("Held: refused answer"));
 		await closeRefused(child);
-		return { disk, file: child.getSessionFile() as string };
+		return { disk, file: child.getSessionFile() as string, child };
 	}
 
 	for (const [what, replacement] of [
 		["in place, at the same length", "Held: FIRST ANSWER"],
 		["keeping its entries, at another length", "Held: first answer, pruned by maintenance"],
 	] as const) {
-		it(`another writer rewrote it ${what}`, async () => {
+		it(`another writer rewrote it ${what}: kept, and the dropped transcript is released`, async () => {
 			const dir = tempDir();
-			const { disk, file } = await heldChild(dir);
+			const { disk, file, child } = await heldChild(dir);
 			const theirs = fs.readFileSync(file, "utf8").replace("Held: first answer", replacement);
 			fs.writeFileSync(file, theirs);
 
@@ -346,6 +423,7 @@ describe("a held send never replaces a file another writer changed", () => {
 
 			expect(fs.readFileSync(file, "utf8")).toBe(theirs);
 			expect(disk.attempts).toEqual([]);
+			expect(child.getEntries()).toHaveLength(0);
 		});
 	}
 

@@ -121,6 +121,7 @@ import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
+	isSessionStoreOutage,
 	isSessionStoreWriteRefusal,
 	MemorySessionStorage,
 	type SessionStorage,
@@ -1150,11 +1151,12 @@ export class SessionManager {
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
 		if (!this.#diskFailure) this.#diskFailure = error;
-		// Only a refusal waits for the store to accept writes again. A conflict
-		// or any other failure of a live session is its own fault, not the
-		// store's: it leaves the queue, and its own next append retries, as
-		// before. A held transcript leaves it in #sendHeld.
-		if (isSessionStoreWriteRefusal(error)) this.#joinStoreQueue();
+		// Only an outage waits for the store to accept writes again. A
+		// permission refusal, a conflict or any other failure of a live session
+		// does not end when another session's write lands: it leaves the queue,
+		// and its own next append retries, as before. A held transcript leaves
+		// it in #sendHeld.
+		if (isSessionStoreOutage(error)) this.#joinStoreQueue();
 		else if (!this.#heldBasis) this.#leaveStoreQueue();
 		// A line that failed to land leaves its blob refs unreferenced on disk,
 		// so the next persist must re-check those blobs instead of trusting the memo.
@@ -3188,16 +3190,30 @@ export class SessionManager {
 	 * another one (see {@link #sendHeld}). Nothing limits how long or how
 	 * many: held transcripts stay in memory until the store accepts them, and
 	 * a process that exits while the store still refuses loses them, as it
-	 * loses a live session's unsaved entries.
+	 * loses a live session's unsaved entries. Once the send lands, or the
+	 * hold ends because another writer owns the file, a sealed session drops
+	 * its transcript as {@link releaseRetainedEntries} does.
 	 */
 	async #hold(): Promise<void> {
 		this.#heldBasis = (await this.#readStoredTranscript()).state;
 		this.#joinStoreQueue();
 	}
 
+	/**
+	 * Whether a close the store refused keeps this session's transcript in
+	 * memory until a later write that lands on the same store sends it (see
+	 * {@link #hold}). The session releases the transcript itself once the
+	 * hold ends; its owner need not keep anything else for it.
+	 */
+	holdsTranscript(): boolean {
+		return this.#heldBasis !== undefined;
+	}
+
+	/** End the hold; a sealed session has nothing left to write, so it drops its transcript too. */
 	#unhold(): void {
 		this.#heldBasis = undefined;
 		this.#leaveStoreQueue();
+		if (this.#released && !this.#entriesReleased) this.releaseRetainedEntries();
 	}
 
 	/** What the store holds at this session's path now; never rejects. */
@@ -3267,7 +3283,7 @@ export class SessionManager {
 			return this.#heldSent(body.bytes);
 		} catch (error) {
 			this.#noteDiskFailure(error);
-			if (!isSessionStoreWriteRefusal(error)) this.#dropHeld(sessionFile, toError(error).message);
+			if (!isSessionStoreOutage(error)) this.#dropHeld(sessionFile, toError(error).message);
 		} finally {
 			release?.();
 		}
@@ -3277,8 +3293,8 @@ export class SessionManager {
 		this.#clearDiskError();
 		this.#fileIsCurrent = true;
 		this.#rewriteRequired = false;
-		this.#unhold();
 		this.#recordFullRewrite(bytes);
+		this.#unhold();
 	}
 
 	#dropHeld(sessionFile: string, reason: string): void {

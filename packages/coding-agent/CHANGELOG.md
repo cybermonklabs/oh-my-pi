@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A subagent launched while the session store refuses writes (a full, quota-exceeded or read-only disk, a SQL store that is down or read-only) now starts at once: its transcript stays in memory and is written once the store accepts writes, as the main session's is. A seance fork and a switch to a new session path start the same way. A session whose close the store refused keeps its transcript until a later write lands on the same store. A session whose directory the store refuses to make now starts and warns instead of failing at start
+- A subagent launched while the session store refuses writes (a full or quota-exceeded disk, a SQL store that is down, busy or read-only, including PostgreSQL behind PgBouncer) now starts at once: its transcript stays in memory and is written once the store accepts writes, as the main session's is. A fork (`--fork`, `/tan`, a subagent's seance fork) and a switch to a new session path start the same way; resuming a session that moved away and unpacking a session whose local copy diverged still fail, as their notice cannot be written, and drop the fork. A session whose close the store refused keeps its transcript until a later write lands on the same store, and then releases it. A session whose directory the store refuses to make now starts and warns instead of failing at start. A session the store refuses for permission (`EACCES`, `EPERM`, a read-only file system or SQLite database) also starts, but only its own writes try again
 - On a session store that sessions share, one session's failed write no longer fails another session's flush or close once a later write has landed on the store
 
 ## [18.18.6] - 2026-11-09

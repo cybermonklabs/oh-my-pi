@@ -6901,7 +6901,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// already durable, and close() (scheduled post-seal) still flushes and
 		// closes the writer.
 		this.sessionManager.seal();
-		await this.sessionManager.close();
+		try {
+			await this.sessionManager.close();
+		} catch (error) {
+			// A close the store refused can leave the transcript held by the
+			// session manager, which writes it once a later write lands on the
+			// same store and then drops it (SessionManager.holdsTranscript). This
+			// session's own copy is dead weight either way: drop it now, as the
+			// release below would, and leave the manager's entries to the send.
+			if (this.sessionManager.holdsTranscript()) this.#releaseRetainedSessionMemory({ keepTranscript: true });
+			throw error;
+		}
 
 		// Release retained conversation memory. dispose() is terminal, and every
 		// revival path reopens the transcript from disk (AgentLifecycleManager
@@ -6936,14 +6946,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	/** Drop the in-memory conversation state after the terminal dispose flush. */
-	#releaseRetainedSessionMemory(): void {
+	/**
+	 * Drop the in-memory conversation state after the terminal dispose flush. With `keepTranscript`, the
+	 * session manager keeps its entries: a close the store refused holds them for a later send.
+	 */
+	#releaseRetainedSessionMemory(options: { keepTranscript?: boolean } = {}): void {
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
 		this.#tools.releaseRestoredTranscript();
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
-		this.sessionManager.releaseRetainedEntries();
+		if (!options.keepTranscript) this.sessionManager.releaseRetainedEntries();
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */

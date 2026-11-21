@@ -45,33 +45,27 @@ function tempDir(): TempDir {
 	return dir;
 }
 
-const REFUSED_CODES = ["ENOSPC", "EDQUOT", "EROFS", "EACCES", "EPERM"] as const;
-
 describe("a new session file whose first write the store refuses", () => {
-	for (const code of REFUSED_CODES) {
-		it(`opens after one refused attempt (${code}) and writes every entry once the file store accepts writes`, async () => {
-			const dir = tempDir();
-			const sessionDir = dir.join("sessions");
-			const sessionFile = path.join(sessionDir, "child.jsonl");
-			const disk = installFullDisk(fpath => fpath.startsWith(sessionDir + path.sep));
-			disk.error = () => fsError(code);
+	it("opens after one refused attempt (ENOSPC) and writes every entry once the file store accepts writes", async () => {
+		const dir = tempDir();
+		const sessionDir = dir.join("sessions");
+		const sessionFile = path.join(sessionDir, "child.jsonl");
+		const disk = installFullDisk(fpath => fpath.startsWith(sessionDir + path.sep));
+		const manager = await SessionManager.open(sessionFile, sessionDir, undefined, { initialCwd: dir.path() });
+		// One attempt: the open neither waits for the store nor retries before it returns.
+		expect(disk.attempts).toEqual([path.resolve(sessionFile)]);
+		expect(fs.existsSync(sessionFile)).toBe(false);
 
-			const manager = await SessionManager.open(sessionFile, sessionDir, undefined, { initialCwd: dir.path() });
-			// One attempt: the open neither waits for the store nor retries before it returns.
-			expect(disk.attempts).toEqual([path.resolve(sessionFile)]);
-			expect(fs.existsSync(sessionFile)).toBe(false);
+		manager.appendMessage({ role: "user", content: "while refused", timestamp: Date.now() });
+		expect(fs.existsSync(sessionFile)).toBe(false);
 
-			manager.appendMessage({ role: "user", content: "while refused", timestamp: Date.now() });
-			expect(fs.existsSync(sessionFile)).toBe(false);
-
-			disk.full = false;
-			manager.appendMessage(assistant("after the disk accepts writes"));
-			await manager.flush();
-			expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).toEqual(heldIds(manager));
-			expect(manager.getEntries()).toHaveLength(2);
-			await manager.close();
-		});
-	}
+		disk.full = false;
+		manager.appendMessage(assistant("after the disk accepts writes"));
+		await manager.flush();
+		expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).toEqual(heldIds(manager));
+		expect(manager.getEntries()).toHaveLength(2);
+		await manager.close();
+	});
 
 	for (const refusal of ["read-only", "connection"] as const) {
 		it(`opens and writes every entry once a SQL store that refused with a ${refusal} error accepts writes`, async () => {
@@ -264,28 +258,28 @@ describe("errors that are not refusals still reject the open, as before", () => 
 });
 
 describe("a session whose directory the store refuses to make", () => {
-	for (const code of REFUSED_CODES) {
-		it(`starts (${code}), reports the refusal of its first write, and writes once the location accepts writes`, async () => {
-			const dir = tempDir();
-			const sessionDir = dir.join("sessions");
-			const disk = installFullDisk(fpath => fpath.startsWith(sessionDir + path.sep));
-			disk.error = () => fsError(code);
+	// A permission refusal (the classifier test has every code of both kinds): the session starts, and its
+	// own next append writes once the location accepts writes.
+	it("starts (EROFS), reports the refusal of its first write, and writes once the location accepts writes", async () => {
+		const dir = tempDir();
+		const sessionDir = dir.join("sessions");
+		const disk = installFullDisk(fpath => fpath.startsWith(sessionDir + path.sep));
+		disk.error = () => fsError("EROFS", "EROFS: read-only file system, mkdir");
 
-			const manager = SessionManager.create(dir.path(), sessionDir);
-			const seen: string[] = [];
-			manager.onPersistenceError(error => seen.push(error.message));
-			manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
-			manager.appendMessage(assistant("the first write is refused"));
-			expect(seen).toHaveLength(1);
-			expect(fs.existsSync(sessionDir)).toBe(false);
+		const manager = SessionManager.create(dir.path(), sessionDir);
+		const seen: string[] = [];
+		manager.onPersistenceError(error => seen.push(error.message));
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(assistant("the first write is refused"));
+		expect(seen).toHaveLength(1);
+		expect(fs.existsSync(sessionDir)).toBe(false);
 
-			disk.full = false;
-			manager.appendMessage(assistant("the location accepts writes"));
-			await manager.flush();
-			expect(storedIds(fs.readFileSync(manager.getSessionFile() as string, "utf8"))).toEqual(heldIds(manager));
-			await manager.close();
-		});
-	}
+		disk.full = false;
+		manager.appendMessage(assistant("the location accepts writes"));
+		await manager.flush();
+		expect(storedIds(fs.readFileSync(manager.getSessionFile() as string, "utf8"))).toEqual(heldIds(manager));
+		await manager.close();
+	});
 
 	it("starts when the default session directory is refused (EDQUOT), and writes once the location accepts writes", async () => {
 		const dir = tempDir();

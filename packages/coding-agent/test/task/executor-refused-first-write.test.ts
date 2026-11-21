@@ -143,7 +143,7 @@ it("a subagent launched while its transcript's writes are refused runs, and the 
 	expect(held.length).toBeGreaterThan(2);
 }, 30_000);
 
-it("a subagent whose writes the store refuses from its first turn, and which parks while refused, keeps its transcript until the next write that lands", async () => {
+it("a subagent whose writes the store refuses from its first turn, and which parks while refused, keeps its transcript until the next write that lands, then releases it", async () => {
 	const artifactsDir = path.join(root, "artifacts");
 	// The launch lands; the store refuses from the subagent's first model request on.
 	const disk = installFullDisk(fpath => fpath.startsWith(artifactsDir + path.sep), false);
@@ -153,7 +153,9 @@ it("a subagent whose writes the store refuses from its first turn, and which par
 	});
 	expect({ exitCode: run.result.exitCode, error: run.result.error }).toEqual({ exitCode: 0, error: undefined });
 	expect(disk.refused).toBeGreaterThan(0);
-	const manager = localSession(AgentRegistry.global().get(AGENT_ID)?.session).sessionManager;
+	const session = localSession(AgentRegistry.global().get(AGENT_ID)?.session);
+	const manager = session.sessionManager;
+	expect(session.messages.length).toBeGreaterThan(0);
 	// The idle-TTL park: the subagent's session closes while every write is still refused. The park
 	// itself adds an entry, so the transcript is read after it.
 	await AgentLifecycleManager.global()
@@ -163,6 +165,8 @@ it("a subagent whose writes the store refuses from its first turn, and which par
 	expect(held.length).toBeGreaterThan(2);
 	const sessionFile = path.join(artifactsDir, `${AGENT_ID}.jsonl`);
 	expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).not.toEqual(held);
+	// The session's own copy is dropped at the park; the manager holds the transcript for the send.
+	expect(session.messages).toHaveLength(0);
 
 	disk.full = false;
 	const parent = SessionManager.create(path.join(root, "home", "work"), path.join(root, "parent-sessions"));
@@ -170,6 +174,8 @@ it("a subagent whose writes the store refuses from its first turn, and which par
 	await parent.close();
 
 	expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).toEqual(held);
+	// Sent: the manager drops the transcript too.
+	expect(manager.getEntries()).toHaveLength(0);
 }, 30_000);
 
 it("control: a subagent launched into a directory that accepts writes runs and keeps its whole transcript", async () => {

@@ -142,33 +142,58 @@ export class SessionLockError extends Error {
 }
 
 /**
- * Error codes of a store that refuses writes: a file system that is full (`ENOSPC`, `EDQUOT`),
- * read-only or denies the write; Bun's SQL client with a PostgreSQL connection refused, closed or not
- * answered; and a SQLite database that is read-only or full.
+ * The two kinds of refused write. An outage (a full disk, a store that is down, busy or read-only for
+ * now) ends when the store comes back, so a session waits for a write to land on the same store. A
+ * permission refusal (a directory or database the process may not write, a read-only mount) ends only
+ * when someone changes the permission, which no write of another session shows: the session starts, and
+ * only its own writes try again.
  */
-const STORE_REFUSED_CODES: Record<string, true> = {
-	ENOSPC: true,
-	EDQUOT: true,
-	EROFS: true,
-	EACCES: true,
-	EPERM: true,
-	ERR_POSTGRES_CONNECTION_REFUSED: true,
-	ERR_POSTGRES_CONNECTION_CLOSED: true,
-	ERR_POSTGRES_CONNECTION_TIMEOUT: true,
-	SQLITE_READONLY: true,
-	SQLITE_FULL: true,
+type StoreRefusal = "outage" | "permission";
+
+/**
+ * Error codes of a store that refuses writes, by kind: a file system that is full (`ENOSPC`, `EDQUOT`),
+ * or that is read-only or denies the write; Bun's SQL client with a PostgreSQL connection refused,
+ * closed or not answered; and a SQLite database that is full, or read-only.
+ */
+const STORE_REFUSED_CODES: Record<string, StoreRefusal> = {
+	ENOSPC: "outage",
+	EDQUOT: "outage",
+	EROFS: "permission",
+	EACCES: "permission",
+	EPERM: "permission",
+	ERR_POSTGRES_CONNECTION_REFUSED: "outage",
+	ERR_POSTGRES_CONNECTION_CLOSED: "outage",
+	ERR_POSTGRES_CONNECTION_TIMEOUT: "outage",
+	SQLITE_FULL: "outage",
+	SQLITE_READONLY: "permission",
 };
 /**
- * PostgreSQL SQLSTATEs of a server that refuses writes: a read-only transaction (25006, a pooled backend
- * left read-only), a full disk (53100), and a server that ends or refuses connections (57P01-57P03).
+ * PostgreSQL SQLSTATEs of a server that refuses writes for now (see {@link pgSqlStateRefusal}): a
+ * read-only transaction (25006, a pooled backend left read-only), a full disk (53100), too many
+ * connections (53300), and a server that ends or refuses connections (57P01-57P03). PgBouncer forwards a
+ * server's login error to its clients with the server's SQLSTATE, except 57P03, for which they wait.
  */
 const STORE_REFUSED_SQLSTATES: Record<string, true> = {
 	"25006": true,
 	"53100": true,
+	"53300": true,
 	"57P01": true,
 	"57P02": true,
 	"57P03": true,
 };
+/**
+ * PgBouncer sends every error of its own as SQLSTATE 08P01 (protocol violation), which PostgreSQL
+ * sends for a malformed message. These of PgBouncer 1.22.0's messages mean it cannot reach the server,
+ * has no room for the query, or lost the server connection mid-query, for now; every other 08P01 is not
+ * a refusal.
+ */
+const PGBOUNCER_REFUSALS: readonly string[] = [
+	"server login has been failing, try again later (server_login_retry)",
+	"query_wait_timeout",
+	"client_login_timeout (server down)",
+	"no more connections allowed (max_client_conn)",
+	"server conn crashed?",
+];
 
 /** A write conflict and a held publish lock are faults in who writes, never the store refusing. */
 function isWriterFault(error: unknown): boolean {
@@ -178,30 +203,47 @@ function isWriterFault(error: unknown): boolean {
 /**
  * Whether `error` is the session store refusing a write, as opposed to a fault in the write itself or
  * in who writes. A session keeps its entries in memory through a refusal and writes them once the store
- * accepts writes again. A write conflict, a held publish lock, a database permission or schema error, a
- * missing path, and every other error are not refusals. An error that wraps others counts by what it
- * wraps: a failed repair (an `AggregateError`, such as `SessionPersistenceIndeterminateError`) is a
- * refusal when the store refused one of the writes it met and none of them was a writer's fault, and an
- * uncoded error is a refusal when its `cause` is.
+ * accepts writes again (see {@link isSessionStoreOutage} for which refusals other sessions' writes end).
+ * A write conflict, a held publish lock, a database permission or schema error, a missing path, and
+ * every other error are not refusals. An error that wraps others counts by what it wraps: a failed
+ * repair (an `AggregateError`, such as `SessionPersistenceIndeterminateError`) is a refusal when the
+ * store refused one of the writes it met and none of them was a writer's fault, and an uncoded error is
+ * a refusal when its `cause` is.
  */
 export function isSessionStoreWriteRefusal(error: unknown): boolean {
-	return isRefusal(error, 0);
+	return refusalOf(error, 0) !== undefined;
 }
 
-/** {@link isSessionStoreWriteRefusal}, `depth` wrappers in; deeper than four is not a refusal. */
-function isRefusal(error: unknown, depth: number): boolean {
-	if (!(error instanceof Error) || depth > 4 || isWriterFault(error)) return false;
+/**
+ * Whether `error` is a refusal that ends when the store comes back (a full disk, a store that is down,
+ * busy or read-only for now), so a later write that lands on the same store is the time to try again.
+ * A permission refusal (`EACCES`, `EPERM`, `EROFS`, `SQLITE_READONLY`) is a refusal but not an outage.
+ */
+export function isSessionStoreOutage(error: unknown): boolean {
+	return refusalOf(error, 0) === "outage";
+}
+
+/** The kind of refusal `error` is, `depth` wrappers in; deeper than four is none. */
+function refusalOf(error: unknown, depth: number): StoreRefusal | undefined {
+	if (!(error instanceof Error) || depth > 4 || isWriterFault(error)) return undefined;
 	if (error instanceof AggregateError) {
 		const errors: unknown[] = error.errors;
-		return errors.some(inner => isRefusal(inner, depth + 1)) && !errors.some(isWriterFault);
+		if (errors.some(isWriterFault)) return undefined;
+		const kinds = errors.map(inner => refusalOf(inner, depth + 1));
+		return kinds.includes("outage") ? "outage" : kinds.includes("permission") ? "permission" : undefined;
 	}
-	const { code, errno } = error as { code?: unknown; errno?: unknown };
-	if (typeof code !== "string") return isRefusal(error.cause, depth + 1);
-	if (Object.hasOwn(STORE_REFUSED_CODES, code)) return true;
-	// Bun's PostgreSQL client gives a server error's SQLSTATE as `errno`.
-	return (
-		code === "ERR_POSTGRES_SERVER_ERROR" && typeof errno === "string" && Object.hasOwn(STORE_REFUSED_SQLSTATES, errno)
-	);
+	const { code } = error as { code?: unknown };
+	if (typeof code !== "string") return refusalOf(error.cause, depth + 1);
+	if (Object.hasOwn(STORE_REFUSED_CODES, code)) return STORE_REFUSED_CODES[code];
+	return code === "ERR_POSTGRES_SERVER_ERROR" && pgSqlStateRefusal(error) ? "outage" : undefined;
+}
+
+/** Whether a PostgreSQL server error, as Bun's client gives it, is a refusal (its SQLSTATE is `errno`). */
+function pgSqlStateRefusal(error: Error): boolean {
+	const { errno } = error as { errno?: unknown };
+	if (typeof errno !== "string") return false;
+	if (errno === "08P01") return PGBOUNCER_REFUSALS.includes(error.message);
+	return Object.hasOwn(STORE_REFUSED_SQLSTATES, errno);
 }
 
 /**
