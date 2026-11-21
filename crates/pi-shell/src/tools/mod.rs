@@ -453,25 +453,51 @@ impl Child {
 	}
 }
 
-/// Output a tool writes to the caller's fds, in order, without blocking.
+/// Output a tool writes to the caller's fds, in order, without blocking:
+/// each entry's fd, the bytes still to write, and the mark of the chunk a
+/// writer thread took last.
 #[derive(Default)]
-struct Out(VecDeque<(i32, Vec<u8>)>);
+struct Out(VecDeque<(i32, Vec<u8>, Option<crate::bash::Mark>)>);
 
 impl Out {
 	fn push(&mut self, fd: i32, bytes: impl Into<Vec<u8>>) {
 		let bytes = bytes.into();
 		if !bytes.is_empty() {
-			self.0.push_back((fd, bytes));
+			self.0.push_back((fd, bytes, None));
 		}
 	}
 
-	/// Write what fits; `true` once everything is written (or failed: a
-	/// closed stderr loses the message, as it would for any command).
+	/// Write what fits; `true` once everything is written and settled (or
+	/// failed: a closed stderr loses the message, as it would for any
+	/// command). The chunk a writer thread took last settles before the next
+	/// one goes, so an entry stops at its first failed chunk. An entry stays
+	/// until its fd has settled, so what runs after the tool comes after its
+	/// output.
 	fn flush(&mut self, api: &mut ShellApi<'_, '_>) -> bool {
-		while let Some((fd, bytes)) = self.0.front_mut() {
-			match api.write(*fd, bytes) {
-				IoPoll::Ready(Ok(n)) if n > 0 && n < bytes.len() => {
+		while let Some((fd, bytes, mark)) = self.0.front_mut() {
+			if let Some(taken) = mark {
+				match api.settle_marked(*fd, std::slice::from_ref(taken)) {
+					IoPoll::Ready(Ok(())) => *mark = None,
+					IoPoll::Ready(Err(_)) => {
+						self.0.pop_front();
+						continue;
+					},
+					IoPoll::WouldBlock(_) => return false,
+				}
+			}
+			if bytes.is_empty() {
+				match api.settle(*fd) {
+					IoPoll::Ready(_) => {
+						self.0.pop_front();
+					},
+					IoPoll::WouldBlock(_) => return false,
+				}
+				continue;
+			}
+			match api.write_marked(*fd, bytes) {
+				IoPoll::Ready(Ok((n, taken))) if n > 0 => {
 					bytes.drain(..n);
+					*mark = taken;
 				},
 				IoPoll::Ready(_) => {
 					self.0.pop_front();

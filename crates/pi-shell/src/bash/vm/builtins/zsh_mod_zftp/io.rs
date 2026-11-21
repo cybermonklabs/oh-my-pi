@@ -226,9 +226,12 @@ pub enum ZftpAns {
 #[derive(Default)]
 pub struct ZftpLive {
 	/// The timer of the timeout or deadline.
-	timer: Option<Box<dyn Timer>>,
+	timer:     Option<Box<dyn Timer>>,
 	/// The step under way.
-	step:  Step,
+	step:      Step,
+	/// What a writer thread took of a [`ZftpOp::Write`] or [`ZftpOp::Out`]
+	/// and has not written yet ([`crate::bash::FdRef::poll_write_out`]).
+	unsettled: crate::bash::Unsettled,
 }
 
 /// What a [`ZftpLive`] waits for.
@@ -477,7 +480,8 @@ pub fn perform(
 			if l.timer.as_mut().is_some_and(|t| t.poll(tcx).is_ready()) {
 				return Ok(ZftpAns::Wrote(Err(Fail::timeout())));
 			}
-			match vp.fds.handle(*fd).poll_write(tcx, data) {
+			let unsettled = &mut l.unsettled;
+			match vp.fds.handle(*fd).poll_write_out(tcx, data, unsettled) {
 				Poll::Ready(Ok(n)) => ZftpAns::Wrote(Ok(n)),
 				Poll::Ready(Err(e)) => ZftpAns::Wrote(Err(Fail::of(&e))),
 				Poll::Pending => return Err(WaitKey::Write { fd: *fd }),
@@ -491,7 +495,7 @@ pub fn perform(
 			};
 			let h = vp.fds.handle(*fd);
 			while off < data.len() {
-				match h.poll_write(tcx, &data[off..]) {
+				match h.poll_write_out(tcx, &data[off..], &mut l.unsettled) {
 					Poll::Ready(Ok(n)) if n > 0 => off += n,
 					Poll::Ready(_) => break,
 					Poll::Pending => {
@@ -511,7 +515,7 @@ pub fn perform(
 					l.timer = Some(cx.host.timer(Deadline(at)));
 				}
 			}
-			let ZftpLive { timer, step } = l;
+			let ZftpLive { timer, step, .. } = l;
 			let Step::Line(st) = step else {
 				unreachable!("set above");
 			};
@@ -702,13 +706,16 @@ type Moved = Result<usize, Option<io::Error>>;
 /// helpers, block mode included), kept across polls.
 struct Xfer {
 	/// zsh's `lsbuf`: kept across reads, as the C stack buffer is.
-	buf:   Vec<u8>,
+	buf:       Vec<u8>,
 	/// zsh's `ascbuf`.
-	asc:   Vec<u8>,
-	at:    XferAt,
+	asc:       Vec<u8>,
+	at:        XferAt,
 	/// The timer of the read or write in flight.
-	timer: XferTimer,
-	out:   XferOut,
+	timer:     XferTimer,
+	out:       XferOut,
+	/// What a writer thread took of the write in flight and has not
+	/// written yet ([`crate::bash::FdRef::poll_write_out`]).
+	unsettled: crate::bash::Unsettled,
 }
 
 /// The timeout of the call in flight.
@@ -735,11 +742,12 @@ enum XferAt {
 impl Xfer {
 	fn new(spec: &XferSpec) -> Self {
 		Self {
-			buf:   vec![0; BUFSIZE],
-			asc:   vec![0; ASCSIZE],
-			at:    XferAt::Read,
-			timer: XferTimer::Unarmed,
-			out:   XferOut { eof: spec.eof, ..XferOut::default() },
+			buf:       vec![0; BUFSIZE],
+			asc:       vec![0; ASCSIZE],
+			at:        XferAt::Read,
+			timer:     XferTimer::Unarmed,
+			out:       XferOut { eof: spec.eof, ..XferOut::default() },
+			unsettled: crate::bash::Unsettled::default(),
 		}
 	}
 
@@ -918,7 +926,7 @@ impl Xfer {
 						// zsh `zfwrite_block`: the header in one write.
 						let len = end - off;
 						let h = [0, (len >> 8) as u8, (len & 0xff) as u8];
-						let polled = hout.poll_write(tcx, &h);
+						let polled = hout.poll_write_out(tcx, &h, &mut self.unsettled);
 						let r = match self.call(tcx, cx, wtmout, polled) {
 							Poll::Ready(r) => r,
 							Poll::Pending => return Err(WaitKey::Write { fd: fdout }),
@@ -948,7 +956,7 @@ impl Xfer {
 						}
 						continue;
 					}
-					let polled = hout.poll_write(tcx, &self.buf[off..end]);
+					let polled = hout.poll_write_out(tcx, &self.buf[off..end], &mut self.unsettled);
 					let r = match self.call(tcx, cx, wtmout, polled) {
 						Poll::Ready(r) => r,
 						Poll::Pending => return Err(WaitKey::Write { fd: fdout }),

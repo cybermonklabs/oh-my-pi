@@ -2305,7 +2305,11 @@ impl AsyncUtility for Rg {
 	// Every mode writes through the async stdout sink. A raw writer over
 	// `host.stdout` blocks on a provider file (an engine pipe), which panics on
 	// a current-thread runtime. `--line-buffered` output is delivered after each
-	// file and each chunk of standard input, as grep's is.
+	// file and each chunk of standard input, as grep's is, and whole, also to a
+	// regular file, which a 64 KiB batch would keep back.
+	if cli.line_buffered && !cli.no_line_buffered {
+		host.line_buffer_output();
+	}
 	let mut out = host.stdout_writer();
 	let (patterns, mut paths) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
@@ -2354,7 +2358,10 @@ impl AsyncUtility for Rg {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::host::run_async_util;
+	use crate::{
+		host::{Host, run_async_util, run_caught_async},
+		openfile::OpenFile,
+	};
 	#[cfg(unix)]
 	use crate::host::{SwapTree, tree_with_sparse_file};
 
@@ -2378,6 +2385,115 @@ mod tests {
 		assert!(!out.contains("outside"), "read through the swapped link: {out:?} {err:?}");
 		let (_, followed, _) = run(&["-L", "needle", root_arg], "").await;
 		assert!(followed.contains("needle outside"), "-L follows the link: {followed:?}");
+	}
+
+	/// Both explicit buffering flags must keep output in AsyncOut until the
+	/// host drains it. Their old raw StreamWriter wrote from this runtime
+	/// worker and blocked before the reader below could run.
+	#[cfg(target_os = "linux")]
+	fn explicit_buffering_to_a_full_pipe_yields_to_the_reader(flag: &str) {
+		use std::{
+			io::{Read as _, Write as _},
+			os::fd::{AsRawFd, OwnedFd},
+			sync::mpsc::channel,
+			time::Duration,
+		};
+
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "hit\n").unwrap();
+		let (reader, writer) = std::io::pipe().unwrap();
+		let mut writer = std::fs::File::from(OwnedFd::from(writer));
+		// SAFETY: F_GETPIPE_SZ takes no argument; `writer` owns this fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		writer.write_all(&vec![b'x'; capacity]).unwrap();
+		let (done, finished) = channel();
+		let root = tree.path().to_path_buf();
+		let flag = flag.to_owned();
+		let label = flag.clone();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let status = runtime.block_on(async {
+				let (mut host, _) = Host::for_test_async("rg", "", root);
+				host.set_test_stdout(OpenFile::from(writer));
+				let parsed = Rg::try_parse_from(["rg", flag.as_str(), "hit", "f"]).unwrap();
+				let run = run_caught_async::<Rg>(parsed, &mut host);
+				let drain = async {
+					tokio::time::sleep(Duration::from_millis(100)).await;
+					let mut reader = std::fs::File::from(OwnedFd::from(reader));
+					reader.read_exact(&mut vec![0; capacity]).unwrap();
+					reader
+				};
+				let (status, _reader) = tokio::join!(run, drain);
+				status
+			});
+			let _ = done.send(status);
+		});
+		assert_eq!(
+			finished.recv_timeout(Duration::from_secs(5)).expect("DEADLINE fired: rg did not return"),
+			0,
+			"{label}"
+		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn line_buffered_output_to_a_full_pipe_yields_to_the_reader() {
+		explicit_buffering_to_a_full_pipe_yields_to_the_reader("--line-buffered");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn no_line_buffered_output_to_a_full_pipe_yields_to_the_reader() {
+		explicit_buffering_to_a_full_pipe_yields_to_the_reader("--no-line-buffered");
+	}
+
+	/// `rg --line-buffered` to a regular file writes each result as it is
+	/// found: with stdin still open, the file holds the hit before rg ends.
+	/// Async output must not keep it back for a 64 KiB file batch.
+	#[cfg(unix)]
+	#[test]
+	fn line_buffered_output_to_a_regular_file_is_written_per_result() {
+		use std::{
+			io::Write as _,
+			os::fd::OwnedFd,
+			sync::mpsc::channel,
+			time::{Duration, Instant},
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("result");
+		let out = std::fs::File::create(&path).unwrap();
+		let (stdin_reader, mut stdin_writer) = std::io::pipe().unwrap();
+		let stdin = std::fs::File::from(OwnedFd::from(stdin_reader));
+		let (done, finished) = channel();
+		let root = dir.path().to_path_buf();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let status = runtime.block_on(async {
+				let (mut host, _) = Host::for_test_async("rg", "", root);
+				host.set_test_stdout(OpenFile::from(out));
+				host.set_test_stdin(OpenFile::from(stdin));
+				let parsed = Rg::try_parse_from(["rg", "--line-buffered", "hit", "-"]).unwrap();
+				run_caught_async::<Rg>(parsed, &mut host).await
+			});
+			let _ = done.send(status);
+		});
+		stdin_writer.write_all(b"hit\n").unwrap();
+		let start = Instant::now();
+		loop {
+			let got = std::fs::read(&path).unwrap();
+			if got == b"hit\n" {
+				break;
+			}
+			assert!(
+				start.elapsed() < Duration::from_secs(5),
+				"the file holds {got:?} while rg waits for more input"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		drop(stdin_writer);
+		assert_eq!(finished.recv_timeout(Duration::from_secs(5)).expect("rg ended"), 0);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

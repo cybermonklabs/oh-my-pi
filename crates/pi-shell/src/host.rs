@@ -27,8 +27,8 @@ use parking_lot::Mutex;
 use crate::{
 	bash::{
 		Deadline, Event, ExitStatus, ExtProc, FdRef, File, FileKind, Fs, IntrinsicId, Invocation,
-		ModeId, NativeRef, OsHandle, ResolveCtx, Resolved, Rlimit, Signal, SpawnFuture, SpawnSpec,
-		StdFd, StdioSpec, SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict,
+		Mark, ModeId, NativeRef, OsHandle, ResolveCtx, Resolved, Rlimit, Signal, SpawnFuture,
+		SpawnSpec, StdFd, StdioSpec, SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict,
 	},
 	output_decode,
 	sys::{End, Exits, NativeSpawner, OutputDecoding, Relays, Sessions, SpawnConfig, StdFile},
@@ -212,20 +212,22 @@ impl File for StreamFile {
 		})
 	}
 
+	/// The one write path: marked, observed and ordered. The plain and the
+	/// marked write are this one without a tag.
 	fn poll_write_tagged(
 		&mut self,
 		cx: &mut Context<'_>,
 		bytes: &[u8],
 		tag: Option<crate::bash::CmdTag>,
-	) -> Poll<io::Result<usize>> {
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		let _order = self.write_order.as_ref().map(|order| order.lock());
 		let mut slot = self.slots[self.index].lock();
 		let Some(file) = slot.as_mut() else {
-			return Poll::Ready(Ok(bytes.len()));
+			return Poll::Ready(Ok((bytes.len(), None)));
 		};
-		let result = file.poll_write(cx, bytes);
+		let result = file.poll_write_marked(cx, bytes);
 		if self.index != 0
-			&& let Poll::Ready(Ok(n)) = &result
+			&& let Poll::Ready(Ok((n, _))) = &result
 			&& *n != 0
 			&& let Some(events) = &self.events
 		{
@@ -241,11 +243,27 @@ impl File for StreamFile {
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-		self.poll_write_tagged(cx, buf, None)
+		self.poll_write_marked(cx, buf).map_ok(|(n, _)| n)
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.with(Poll::Ready(Ok(())), |f| f.poll_flush(cx))
+	}
+
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle(cx))
+	}
+
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self.poll_write_tagged(cx, buf, None)
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle_marked(cx, marks))
 	}
 
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {

@@ -1396,4 +1396,73 @@ mod tests {
 		assert!(shared.preview_pass(&mut session).is_none());
 		assert!(session.preview().files.is_empty());
 	}
+
+	/// Writes each staged file to disk itself, in place of the host's callback.
+	struct DiskWriter;
+
+	#[async_trait]
+	impl EditWriter for DiskWriter {
+		async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse> {
+			let written = request.content.unwrap_or_default();
+			std::fs::write(&request.absolute, &written)
+				.map_err(|err| EditError::Writer(err.to_string()))?;
+			Ok(WriteResponse { written, diagnostics_json: None })
+		}
+	}
+
+	/// The edit tool's apply is a task on the same runtime as the shell. A
+	/// shell builtin that keeps writing to its output pipe while nothing
+	/// drains it (the run's output channel is full and never read) must not
+	/// hold that runtime's only worker in a write that waits in the kernel:
+	/// then the apply is never polled, and the edit never lands. The bound
+	/// runs on this thread.
+	#[cfg(unix)]
+	#[test]
+	fn an_edit_applies_while_a_shell_writes_to_a_full_output_pipe() {
+		use std::time::{Duration, Instant};
+
+		const BOUND: Duration = Duration::from_secs(10);
+		let tree = Scratch::new("full-pipe");
+		tree.write("src/a.ts", "old\n");
+		let host = napi::tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.unwrap();
+		let (chunks, undrained) = flume::bounded::<String>(1);
+		host.spawn(async move {
+			let options = pi_shell::ShellRunOptions {
+				command: "while :; do echo 0123456789abcdefghi; done".to_owned(),
+				..Default::default()
+			};
+			let cancel = pi_shell::cancel::CancelToken::new(Some(20_000));
+			let _ = pi_shell::Shell::new(None)
+				.run(options, Some(chunks), cancel)
+				.await;
+		});
+		// The output reader parks on the full channel; from then on nothing
+		// drains the pipe, and the builtin fills it within milliseconds.
+		let start = Instant::now();
+		while !undrained.is_full() {
+			assert!(start.elapsed() < BOUND, "the shell wrote nothing");
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		std::thread::sleep(Duration::from_millis(500));
+		let shared = Arc::new(shared_with_finished_patch(&tree.0, UPDATE_PATCH));
+		let (done_tx, done_rx) = std::sync::mpsc::channel();
+		host.spawn(async move {
+			shared.begin_apply();
+			let mut session = shared.session.lock().await;
+			shared.drain_into(&mut session);
+			let outcome = session.apply(ApplyRequest::default(), &DiskWriter).await;
+			let _ = done_tx.send(outcome.map(|_| ()).map_err(|err| err.to_string()));
+		});
+		let outcome = done_rx.recv_timeout(BOUND);
+		drop(undrained);
+		host.shutdown_background();
+		let outcome = outcome
+			.unwrap_or_else(|_| panic!("DEADLINE fired: the apply did not return within {BOUND:?}"));
+		assert_eq!(outcome, Ok(()));
+		assert_eq!(std::fs::read_to_string(tree.0.join("src/a.ts")).unwrap(), "new\n");
+	}
 }

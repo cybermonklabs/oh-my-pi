@@ -16,7 +16,6 @@ use super::{
 	model::{Entry, HA_ACTIVE, Hist},
 	scalar,
 	words::lex_words,
-	write_now,
 	zsh::in_builtin,
 };
 use crate::bash::{
@@ -223,13 +222,11 @@ pub fn reader_line(
 	match expand_reader_line(cx.store, vp, &text) {
 		Ok(Expanded::Same) => text,
 		Ok(Expanded::Line(t)) => {
-			vp.out
-				.push_back(PendingWrite { fd: 2, bytes: t.clone(), off: 0 });
+			vp.out.push_back(PendingWrite::new(2, t.clone()));
 			t
 		},
 		Ok(Expanded::Print(t)) => {
-			vp.out
-				.push_back(PendingWrite { fd: 2, bytes: t.clone(), off: 0 });
+			vp.out.push_back(PendingWrite::new(2, t.clone()));
 			let now = cx.host.wall().secs;
 			if let Err(e) = record_line(k, cx.store, vp, &t, now) {
 				k.fail(e);
@@ -242,7 +239,7 @@ pub fn reader_line(
 			bytes.extend_from_slice(b": ");
 			bytes.extend_from_slice(&msg);
 			bytes.push(b'\n');
-			vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+			vp.out.push_back(PendingWrite::new(2, bytes));
 			BString::default()
 		},
 		Err(e) => {
@@ -511,10 +508,12 @@ pub(super) fn edit(
 	let Some(contents) = contents else {
 		return done(1);
 	};
-	let unwritten = write_now(&*ctx, 2, &contents).to_vec();
-	if !unwritten.is_empty() {
-		ctx.out_fd(2, &unwritten);
-	}
+	// The edited lines are echoed before they run. A builtin's own output is
+	// written after the frame it runs, so the echo goes with the diagnostics,
+	// which are written and settled before the commands run.
+	ctx.vp
+		.out
+		.push_back(crate::bash::vm::proc::PendingWrite::new(2, contents.clone()));
 	// bash's `fc_replhist`: the edited lines take the `fc` line's place.
 	if list.pending {
 		list.pop();

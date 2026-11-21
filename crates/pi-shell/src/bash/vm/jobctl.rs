@@ -233,14 +233,16 @@ pub fn format_job(vp: &Vproc, number: u32, how: JobLine, platform: Platform) -> 
 pub fn notice(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
 	match &k.jobctl.shtty {
 		Some(tty) => write_all(tty, bytes),
-		None => vp
-			.out
-			.push_back(PendingWrite { fd: 1, bytes: BString::from(bytes), off: 0 }),
+		None => vp.out.push_back(PendingWrite::new(1, BString::from(bytes))),
 	}
 }
 
 /// Write to the terminal while it takes the bytes (a terminal does not
-/// refuse a notice's few dozen).
+/// refuse a notice's few dozen). It cannot wait, so it does not settle
+/// what the terminal's writer thread took: that thread is SHTTY's, which
+/// the line editor shares ([`shtty_file`]) and settles before its display
+/// counts as written, so the notice is out before the editor's next bytes;
+/// a failed notice is lost, as zsh ignores `shout`'s errors.
 fn write_all(fd: &FdRef, mut bytes: &[u8]) {
 	let mut cx = Context::from_waker(Waker::noop());
 	while !bytes.is_empty() {
@@ -1265,8 +1267,7 @@ pub fn check_before_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> boo
 		(false, true) => b"There are stopped jobs.\n",
 		(false, false) => b"There are running jobs.\n",
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: BString::from(msg), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, BString::from(msg)));
 	k.jobctl.stopmsg = 2;
 	true
 }

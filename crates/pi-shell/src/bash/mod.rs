@@ -73,8 +73,8 @@ pub use crate::bash::{
 		CompiledUnit, CustomEvent, Event, EventData, EventKind, EventMask, EventSink, NodeRef,
 		Origin, SpanRef, WaitKey,
 	},
-	fd::{BadFd, FdFlags, FdRef},
-	fs::{DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, OpenFlags, Stat},
+	fd::{BadFd, FdFlags, FdRef, Unsettled},
+	fs::{DirEntry, DirIter, File, FileKind, Fs, FsPending, FsPoll, Mark, OpenFlags, Stat},
 	host::{
 		ChildRedir, ChildRedirs, CpuTimes, Deadline, EnvView, ExitStatus, ExtProc, Host, Invocation,
 		Lineage, Login, Logins, OsHandle, PgroupSpec, PipeMirror, PipeTap, ProcEvent, ResolveCtx,

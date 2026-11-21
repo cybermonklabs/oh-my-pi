@@ -31,6 +31,7 @@ use std::{
 	},
 	task::Waker,
 	thread,
+	time::{Duration, Instant},
 };
 
 use parking_lot::{Condvar, Mutex};
@@ -40,14 +41,51 @@ pub const READ: i16 = libc::POLLIN;
 /// Wait for output space.
 pub const WRITE: i16 = libc::POLLOUT;
 
-/// Bytes a write may carry after [`now`] reported `WRITE` without risking a
-/// wait: `PIPE_BUF` (POSIX: a pipe that polls writable takes this much).
+/// The most a write carries after [`now`] reported `WRITE`: `PIPE_BUF`. A
+/// Linux pipe polls writable only with a free page, which takes that much.
 #[cfg(target_os = "linux")]
-pub const WRITE_CHUNK: usize = libc::PIPE_BUF;
-/// Bytes a write may carry after [`now`] reported `WRITE` without risking a
-/// wait: `PIPE_BUF` of `<sys/syslimits.h>`.
+pub(crate) const WRITE_CHUNK: usize = libc::PIPE_BUF;
+/// The most a write carries after [`now`] reported `WRITE`: `PIPE_BUF` of
+/// `<sys/syslimits.h>` (POSIX: a pipe that polls writable takes this much).
 #[cfg(not(target_os = "linux"))]
-pub const WRITE_CHUNK: usize = 512;
+pub(crate) const WRITE_CHUNK: usize = 512;
+
+/// Bytes a write to `fd` may carry without waiting once [`now`] reported
+/// `WRITE`: at most [`WRITE_CHUNK`], and for a pipe no more than it has
+/// free (its capacity less what it holds). A pipe can poll writable with
+/// less than `PIPE_BUF` free: gVisor reports `POLLOUT` with one byte free,
+/// and then fails a non-blocking write of more than the free space with
+/// `EAGAIN`. 0 when a pipe that still has a reader is full. The capacity
+/// is read on every call: `F_SETPIPE_SZ` can change it at any time.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn write_room(fd: RawFd) -> usize {
+	// SAFETY: `F_GETPIPE_SZ` takes no argument; `fd` is the caller's open
+	// descriptor.
+	let capacity = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+	let mut queued: libc::c_int = 0;
+	// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which is
+	// valid for the call; `fd` is the caller's open descriptor.
+	let status = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &raw mut queued) };
+	if capacity < 0 || status < 0 {
+		// Not a pipe (a socket or a terminal).
+		return WRITE_CHUNK;
+	}
+	match usize::try_from(capacity.saturating_sub(queued)).unwrap_or(0) {
+		// A pipe whose reader left fails a write at once (`EPIPE`).
+		0 if failed(fd) => WRITE_CHUNK,
+		free => free.min(WRITE_CHUNK),
+	}
+}
+
+/// Whether `fd` reports an error or a hang-up now (a pipe's write end whose
+/// reader closed).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn failed(fd: RawFd) -> bool {
+	let mut p = libc::pollfd { fd, events: 0, revents: 0 };
+	// SAFETY: one valid pollfd; a zero timeout never waits.
+	let n = unsafe { libc::poll(&raw mut p, 1, 0) };
+	n > 0 && (p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+}
 
 /// Whether `fd` is ready for `events` right now (also when it hung up or
 /// failed: the I/O then reports end of file or the error without waiting).
@@ -90,6 +128,13 @@ pub fn watch(fd: RawFd, events: i16, waker: &Waker) -> io::Result<Watch> {
 	POLLER.add(fd, events, waker)
 }
 
+/// Wake `waker` once `after` has passed: the retry for a descriptor that
+/// polls ready but took nothing, where a readiness watch would fire at once.
+#[cfg(target_os = "linux")]
+pub fn wake_after(waker: &Waker, after: Duration) -> io::Result<()> {
+	POLLER.timer(Instant::now() + after, waker)
+}
+
 struct Entry {
 	id:     u64,
 	fd:     RawFd,
@@ -99,6 +144,8 @@ struct Entry {
 
 struct Poller {
 	entries: Mutex<Vec<Entry>>,
+	/// One-shot timed wakes ([`wake_after`]).
+	timers:  Mutex<Vec<(Instant, Waker)>>,
 	next:    AtomicU64,
 	/// Write end of the wake pipe; `None` when the thread could not start.
 	wake:    Option<PipeWriter>,
@@ -132,6 +179,7 @@ impl Poller {
 		});
 		Self {
 			entries: Mutex::new(Vec::new()),
+			timers:  Mutex::new(Vec::new()),
 			next:    AtomicU64::new(1),
 			wake:    started.ok(),
 			polling: Mutex::new(Polling::default()),
@@ -151,6 +199,17 @@ impl Poller {
 		// A full wake pipe already guarantees a rescan.
 		let _ = (&*wake).write(&[1]);
 		Ok(Watch(id))
+	}
+
+	#[cfg(target_os = "linux")]
+	fn timer(&self, at: Instant, waker: &Waker) -> io::Result<()> {
+		let Some(wake) = &self.wake else {
+			return Err(io::Error::other(PollerDown));
+		};
+		self.timers.lock().push((at, waker.clone()));
+		// A full wake pipe already guarantees a rescan.
+		let _ = (&*wake).write(&[1]);
+		Ok(())
 	}
 
 	/// Forgets watch `id`. If the readiness thread's current wait includes
@@ -239,7 +298,14 @@ fn run(mut wake: PipeReader) {
 			polling.ids.clear();
 			polling.ids.extend(watched.iter().map(|w| w.id));
 		}
-		let (woke, ready) = wait(wake.as_raw_fd(), &watched);
+		let timeout = POLLER
+			.timers
+			.lock()
+			.iter()
+			.map(|(at, _)| *at)
+			.min()
+			.map(|at| at.saturating_duration_since(Instant::now()));
+		let (woke, ready) = wait(wake.as_raw_fd(), &watched, timeout);
 		{
 			let mut polling = POLLER.polling.lock();
 			polling.ids.clear();
@@ -250,28 +316,44 @@ fn run(mut wake: PipeReader) {
 			// Data is present, so this read returns at once.
 			let _ = wake.read(&mut drain);
 		}
-		if ready.is_empty() {
-			continue;
-		}
 		let mut woken = Vec::with_capacity(ready.len());
-		POLLER.entries.lock().retain(|e| {
-			if ready.contains(&e.id) {
-				woken.push(e.waker.clone());
+		let now = Instant::now();
+		POLLER.timers.lock().retain(|(at, waker)| {
+			if *at <= now {
+				woken.push(waker.clone());
 				false
 			} else {
 				true
 			}
 		});
+		if !ready.is_empty() {
+			POLLER.entries.lock().retain(|e| {
+				if ready.contains(&e.id) {
+					woken.push(e.waker.clone());
+					false
+				} else {
+					true
+				}
+			});
+		}
 		for w in woken {
 			w.wake();
 		}
 	}
 }
 
-/// Wait until the wake pipe or a watched fd is ready: whether the wake pipe
-/// fired, and the ids that are ready.
+/// `timeout` as `poll(2)` milliseconds, rounded up; `-1` waits for ever.
 #[cfg(not(target_os = "macos"))]
-fn wait(wake: RawFd, watched: &[Watched]) -> (bool, Vec<u64>) {
+fn poll_timeout(timeout: Option<Duration>) -> libc::c_int {
+	timeout.map_or(-1, |d| {
+		libc::c_int::try_from(d.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
+	})
+}
+
+/// Wait until the wake pipe or a watched fd is ready, or `timeout` passed:
+/// whether the wake pipe fired, and the ids that are ready.
+#[cfg(not(target_os = "macos"))]
+fn wait(wake: RawFd, watched: &[Watched], timeout: Option<Duration>) -> (bool, Vec<u64>) {
 	let mut fds: Vec<libc::pollfd> = Vec::with_capacity(watched.len() + 1);
 	fds.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
 	fds.extend(watched.iter().map(|w| libc::pollfd {
@@ -279,8 +361,9 @@ fn wait(wake: RawFd, watched: &[Watched]) -> (bool, Vec<u64>) {
 		events:  w.events,
 		revents: 0,
 	}));
-	// SAFETY: `fds` holds `fds.len()` valid pollfds; -1 waits for any.
-	let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+	// SAFETY: `fds` holds `fds.len()` valid pollfds.
+	let n =
+		unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout(timeout)) };
 	if n < 0 {
 		return (false, Vec::new());
 	}
@@ -343,9 +426,10 @@ fn is_open(fd: RawFd) -> bool {
 
 /// macOS: `select(2)` over the fds below `FD_SETSIZE`; others are polled
 /// every 20 ms. A closed watched fd (`EBADF`) is reported ready, so its
-/// owner sees the error instead of the thread spinning.
+/// owner sees the error instead of the thread spinning. `timeout` bounds
+/// the wait for the timed wakes.
 #[cfg(target_os = "macos")]
-fn wait(wake: RawFd, watched: &[Watched]) -> (bool, Vec<u64>) {
+fn wait(wake: RawFd, watched: &[Watched], timeout: Option<Duration>) -> (bool, Vec<u64>) {
 	let (mut rd, mut wr) = (fd_set(), fd_set());
 	let mut nfds = 0;
 	let mut add = |fd: RawFd, set: &mut libc::fd_set| {
@@ -367,12 +451,22 @@ fn wait(wake: RawFd, watched: &[Watched]) -> (bool, Vec<u64>) {
 			add(w.fd, &mut rd);
 		}
 	}
-	let mut tick = libc::timeval { tv_sec: 0, tv_usec: 20_000 };
-	let timeout = if slow {
-		&raw mut tick
+	let tick = if slow {
+		Some(Duration::from_millis(20))
 	} else {
-		std::ptr::null_mut()
+		None
 	};
+	let limit = match (tick, timeout) {
+		(Some(a), Some(b)) => Some(a.min(b)),
+		(a, b) => a.or(b),
+	};
+	let mut tv = limit.map(|d| libc::timeval {
+		tv_sec:  libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX),
+		tv_usec: libc::suseconds_t::try_from(d.subsec_micros()).unwrap_or(0),
+	});
+	let timeout = tv
+		.as_mut()
+		.map_or(std::ptr::null_mut(), |tv| std::ptr::from_mut(tv));
 	// SAFETY: both sets are valid; the timeout is valid or null (wait).
 	let n = unsafe { libc::select(nfds, &raw mut rd, &raw mut wr, std::ptr::null_mut(), timeout) };
 	if n < 0 {
@@ -521,5 +615,64 @@ mod tests {
 				"a writer paired with a reader end the program closed: {writer:?}"
 			);
 		}
+	}
+
+	/// A watched read end that closes lets its pipe go at once: the waiting
+	/// thread holds a reference to every file it waits on, so a watch whose
+	/// drop left that wait running kept the pipe's reader alive until
+	/// something else woke the thread, and the writer went on writing into a
+	/// pipe nobody can read. In a process of its own, where nothing else
+	/// wakes the thread. Before `r` closes, the thread's current wait includes
+	/// the watch ([`Polling`]). The writer side is read with a `poll(2)` for
+	/// no event, which reports `POLLERR` once the pipe has no reader; no byte
+	/// is written, since a byte would make `r` readable and end the wait.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn closing_a_watched_read_end_gives_its_writer_a_broken_pipe() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::closing_a_watched_read_end_gives_its_writer_a_broken_pipe"),
+			|| {
+				let (r, w) = io::pipe().unwrap();
+				let watch = watch(r.as_raw_fd(), READ, Waker::noop()).unwrap();
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while !POLLER.polling.lock().ids.contains(&watch.0) {
+					assert!(Instant::now() < deadline, "the thread never waited on `r`");
+					thread::yield_now();
+				}
+				drop(watch);
+				drop(r);
+				let mut pfd = libc::pollfd { fd: w.as_raw_fd(), events: 0, revents: 0 };
+				// SAFETY: one valid pollfd for our open descriptor.
+				let n = unsafe { libc::poll(&raw mut pfd, 1, 2000) };
+				assert!(
+					n == 1 && pfd.revents & libc::POLLERR != 0,
+					"the pipe still had a reader 2 s after its only read end closed (poll {n}, revents \
+					 {:#x})",
+					pfd.revents
+				);
+			},
+		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_timed_wake_fires_after_its_delay() {
+		let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		struct Set(Arc<std::sync::atomic::AtomicBool>, thread::Thread);
+		impl Wake for Set {
+			fn wake(self: Arc<Self>) {
+				self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+				self.1.unpark();
+			}
+		}
+		let start = Instant::now();
+		let waker = Waker::from(Arc::new(Set(Arc::clone(&flag), thread::current())));
+		wake_after(&waker, Duration::from_millis(30)).unwrap();
+		let deadline = start + Duration::from_secs(10);
+		while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+			assert!(Instant::now() < deadline, "the timed wake never fired");
+			thread::park_timeout(Duration::from_millis(100));
+		}
+		assert!(start.elapsed() >= Duration::from_millis(30), "{:?}", start.elapsed());
 	}
 }

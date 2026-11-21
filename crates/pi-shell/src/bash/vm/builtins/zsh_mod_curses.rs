@@ -328,12 +328,14 @@ fn flush(ctx: &mut Ctx<'_, '_>, c: &mut Curses) {
 }
 
 /// Write curses' buffered output now (before `input` waits for a key):
-/// parks while the terminal does not take it.
+/// parks while the terminal does not take it, or while what its writer
+/// thread took is not out yet ([`crate::bash::FdRef::poll_write_out`]), so
+/// the screen is out before the key is read.
 fn flush_now(ctx: &Ctx<'_, '_>, c: &mut Curses) -> Result<(), Need> {
 	let h = ctx.vp.fds.handle(1);
 	let mut tcx = Context::from_waker(&ctx.k.waker);
 	while !c.pending.is_empty() {
-		match h.poll_write(&mut tcx, &c.pending) {
+		match h.poll_write_out(&mut tcx, &c.pending, &mut c.unsettled) {
 			Poll::Ready(Ok(n)) if n > 0 => {
 				c.pending = c.pending.split_off(n.min(c.pending.len()));
 			},

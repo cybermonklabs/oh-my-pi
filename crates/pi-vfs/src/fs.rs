@@ -795,7 +795,10 @@ impl Fs {
 	pub async fn write(&self, path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
 		let (path, contents) = (path.as_ref(), contents.as_ref());
 		match self.route(path)? {
-			Route::Native => std::fs::write(path, contents),
+			Route::Native => {
+				let (path, contents) = (path.to_path_buf(), contents.to_vec());
+				offload(move || std::fs::write(path, contents)).await
+			},
 			Route::Provider(provider) => self.guard(provider.write(path, contents)).await,
 			Route::Mounted(file) => {
 				mount_open_async(file, &create_options())

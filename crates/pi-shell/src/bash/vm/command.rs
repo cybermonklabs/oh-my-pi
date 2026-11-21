@@ -598,9 +598,9 @@ fn plain_statement(
 	};
 	let written = match &res {
 		Ok(outcome) if matches!(outcome.control, Control::None) => write_now(k, vp, &chunks),
-		_ => Err((0, 0)),
+		_ => Err((0, 0, super::proc::HandedOff::default())),
 	};
-	if let (Ok(outcome), Ok(())) = (&res, written) {
+	if let (Ok(outcome), Ok(())) = (&res, &written) {
 		state::drop_scope(&mut k.root, cx.store, vp);
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
@@ -622,11 +622,12 @@ fn plain_statement(
 			if let Some(flow) = settle_builtin(k, vp, cx, line, id, sc, outcome, chunks, false) {
 				return Some(flow);
 			}
-			if let Err((done, off)) = written {
+			if let Err((done, off, handed)) = written {
 				let writes = &mut st(vp).writes;
 				writes.drain(..done);
 				if let Some(w) = writes.front_mut() {
 					w.off = off;
+					w.handed = handed;
 				}
 			}
 		},
@@ -660,13 +661,21 @@ fn seeded_exec(
 	e
 }
 
-/// Write a fast-path builtin's output now. `Err((n, off))`: the first `n`
-/// chunks and `off` bytes of the next went out, the rest is for the
-/// staged output, which also takes all of it (`Err((0, 0))`) when it has a
-/// diagnostic to render or the shell has output queued before it.
-fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usize)> {
+/// Write a fast-path builtin's output now. `Err((n, off, handed))`: the
+/// first `n` chunks and `off` bytes of the next went out, the rest is for
+/// the staged output, which also takes all of it (`Err((0, 0, _))`) when it
+/// has a diagnostic to render or the shell has output queued before it.
+/// Only bytes that are out of the shell count: a chunk a writer thread took
+/// ([`crate::bash::File::poll_write_marked`]) is out once it settles, so
+/// the fast path stops there and the staged output settles it (`handed`),
+/// which makes its error the builtin's and keeps the next command after it.
+fn write_now(
+	k: &Kernel,
+	vp: &Vproc,
+	chunks: &[Chunk],
+) -> Result<(), (usize, usize, super::proc::HandedOff)> {
 	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
-		return Err((0, 0));
+		return Err((0, 0, super::proc::HandedOff::default()));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
 	for (i, c) in chunks.iter().enumerate() {
@@ -676,11 +685,15 @@ fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usi
 		let handle = vp.fds.handle(*fd);
 		let mut off = 0;
 		while off < bytes.len() {
-			match handle.poll_write(&mut tcx, &bytes[off..]) {
-				Poll::Ready(Ok(n)) if n > 0 => off += n,
+			match handle.poll_write_marked(&mut tcx, &bytes[off..]) {
+				Poll::Ready(Ok((n, None))) if n > 0 => off += n,
+				Poll::Ready(Ok((n, Some(mark)))) if n > 0 => {
+					let handed = super::proc::HandedOff { file: Some(handle), mark: Some(mark) };
+					return Err((i, off + n, handed));
+				},
 				// Blocked, failed or refused: the staged output waits or
 				// reports it.
-				_ => return Err((i, off)),
+				_ => return Err((i, off, super::proc::HandedOff::default())),
 			}
 		}
 	}
@@ -1180,8 +1193,7 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
+	s.writes.push_back(PendingWrite::new(1, text));
 	s.stage = Stage::Output;
 	None
 }
@@ -1933,11 +1945,10 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
-							fd:    2,
-							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
-							off:   0,
-						});
+						vp.out.push_back(PendingWrite::new(
+							2,
+							BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
+						));
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
@@ -2970,7 +2981,7 @@ fn zsh_funcnest(
 		utf8:   false,
 	});
 	vp.out
-		.push_back(super::proc::PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		.push_back(super::proc::PendingWrite::new(2, bytes.into()));
 	vp.status = 1;
 	Some(Flow::Discard(1))
 }
@@ -3191,8 +3202,7 @@ fn parse_autoload(
 					let site = crate::bash::diag::ZshSite { prefix: name, line, utf8: false };
 					bytes.extend_from_slice(&crate::bash::diag::render_zsh(&diag, site));
 				}
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				vp.out.push_back(PendingWrite::new(2, bytes.into()));
 				return Err(());
 			},
 		}
@@ -4173,7 +4183,7 @@ fn settle_builtin(
 			.as_mut()
 			.expect("exec")
 			.writes
-			.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+			.push_back(PendingWrite::new(fd, bytes.into()));
 	}
 	let e = sc.exec.as_mut().expect("exec");
 	e.status = outcome.status;
@@ -4324,10 +4334,8 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 		let text = k.render_diag(cx, vp, line, &Diag::Usage { msg: msg.into() }.by("exec"));
 		let s = st(vp);
 		s.argv = argv;
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: USAGE.into(), off: 0 });
+		s.writes.push_back(PendingWrite::new(2, text.into()));
+		s.writes.push_back(PendingWrite::new(2, USAGE.into()));
 		s.status = 2;
 		s.stage = Stage::Output;
 		return None;
@@ -4770,59 +4778,63 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 	}
 }
 
-/// Write the command's own output in order (pollable).
+/// Write the command's own output in order (pollable). A write is done once
+/// its bytes are handed off and the object that took them has settled its
+/// own chunks ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)): a host file's writer thread takes
+/// a chunk at once and writes it later, so the settle is where that write
+/// fails, and its error, and only its, is this command's, as a write error
+/// is. The chunk handed off last settles before the next one goes (the
+/// thread is idle for that hand-off anyway), so a command stops at its first
+/// failed chunk, as bash stops at its first failed `write(2)`.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	// Most commands queued nothing: no waker (two atomic ops) for them.
 	st(vp).writes.front()?;
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
 	loop {
-		let state = st(vp);
-		let pending = state.writes.front()?;
-		if pending.off >= pending.bytes.len() {
-			state.writes.pop_front();
-			continue;
-		}
-		let fd = pending.fd;
+		let fd = st(vp).writes.front()?.fd;
 		let handle = vp.fds.handle(fd);
-		let state = st(vp);
-		let pending = state.writes.front_mut().expect("checked");
-		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
-			Poll::Ready(Ok(written)) if written > 0 => {
-				pending.off += written;
-				if pending.off >= pending.bytes.len() {
-					state.writes.pop_front();
+		let pending = st(vp).writes.front_mut().expect("checked");
+		let done = pending.off >= pending.bytes.len();
+		// The chunk handed off last is out before the next one goes; what
+		// another object took (the fd was restored in between) is out there
+		// before the rest goes to this one.
+		let settled = match &pending.handed.file {
+			Some(held) if done || !held.same(&handle) || pending.handed.mark.is_some() => {
+				match held.poll_settle_marked(&mut tcx, pending.handed.mark.as_slice()) {
+					Poll::Ready(result) => Some(result),
+					Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
 				}
 			},
+			_ => None,
+		};
+		match settled {
+			Some(Err(err)) => {
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
+				}
+				continue;
+			},
+			Some(Ok(())) => pending.handed = super::proc::HandedOff::default(),
+			None => {},
+		}
+		if done {
+			st(vp).writes.pop_front();
+			continue;
+		}
+		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
+			Poll::Ready(Ok((written, mark))) if written > 0 => {
+				pending.off += written;
+				pending.handed.mark = mark;
+				pending.handed.file.get_or_insert(handle);
+			},
 			Poll::Ready(res) => {
-				state.writes.retain(|queued| queued.fd != fd);
-				if fd != 2 {
-					let err = res
-						.err()
-						.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
-					if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
-						// The virtual SIGPIPE ends this shell silently, as it ends
-						// a bash pipeline child.
-						let platform = k.engine.config().platform;
-						return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
-					}
-					if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-						zsh_write_error(k, vp, cx, line, fd, &err);
-						continue;
-					}
-					let state = st(vp);
-					// bash's `help` does not check its writes.
-					if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
-						continue;
-					}
-					let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
-					state.status = 1;
-					// Through the command's own fd 2 (`2>&1 >&4`), while its
-					// redirections are in place.
-					let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-					st(vp)
-						.writes
-						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				let err = res
+					.err()
+					.unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
 				}
 			},
 			Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
@@ -4869,12 +4881,49 @@ fn zsh_write_error(
 	}
 	for d in diags {
 		let bytes = k.render_diag(cx, vp, line, &d);
-		st(vp)
-			.writes
-			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
 	}
 }
 
+/// A write to `fd` failed: drop what is queued for it, and report the error
+/// as the command's (bash's `write error`, zsh's through
+/// [`zsh_write_error`]), or end the shell on `SIGPIPE`. A failed write to
+/// fd 2 is dropped without a report.
+fn write_failed(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	fd: i32,
+	err: std::io::Error,
+) -> Option<Flow> {
+	st(vp).writes.retain(|queued| queued.fd != fd);
+	if fd == 2 {
+		return None;
+	}
+	if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
+		// The virtual SIGPIPE ends this shell silently, as it ends
+		// a bash pipeline child.
+		let platform = k.engine.config().platform;
+		return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+	}
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		zsh_write_error(k, vp, cx, line, fd, &err);
+		return None;
+	}
+	let state = st(vp);
+	// bash's `help` does not check its writes.
+	if state.target == Some(Target::Intrinsic(IntrinsicId::Help)) {
+		return None;
+	}
+	let cmd = Cow::Owned(String::from_utf8_lossy(&state.argv[0]).into_owned());
+	state.status = 1;
+	// Through the command's own fd 2 (`2>&1 >&4`), while its
+	// redirections are in place.
+	let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
+	st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
+	None
+}
 /// Whether `SIGPIPE` is ignored (`trap '' PIPE`), so a write to a pipe
 /// without readers reports `Broken pipe` instead of ending the shell.
 fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
@@ -4955,7 +5004,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, bytes));
 	}
 }
 

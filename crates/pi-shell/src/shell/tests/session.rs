@@ -641,6 +641,315 @@ fn async_utility_waiting_on_stdin_is_cancelled_by_timeout() {
 	assert_eq!((result.exit_code, output.as_str()), (Some(124), ""));
 }
 
+/// A builtin keeps writing to the output pipe while nothing drains it (the
+/// output channel is bounded and never read), so the pipe fills. The run
+/// must still end at its timeout: a write that waits in the kernel for room
+/// would hold the runtime's only worker, and then neither the timeout nor
+/// the end of the run could come. The bound runs on this thread.
+#[cfg(unix)]
+#[test]
+fn a_builtin_writing_to_a_full_output_pipe_still_times_out() {
+	const BOUND: Duration = Duration::from_secs(10);
+	let _guard = shell_test_lock().blocking_lock();
+	let (chunks, undrained) = flume::bounded::<String>(1);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let options = ShellExecuteOptions {
+			command: "while :; do echo 0123456789abcdefghi; done".to_string(),
+			timeout_ms: Some(1000),
+			..Default::default()
+		};
+		let _ = tx.send(runtime.block_on(execute_shell(
+			options,
+			Some(chunks),
+			CancelToken::new(Some(1000)),
+		)));
+	});
+	let result = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within {BOUND:?}"))
+		.expect("execute_shell");
+	drop(undrained);
+	assert!(result.timed_out, "{result:?}");
+}
+
+/// The writer-thread route, Darwin's only one, forced on Linux in this
+/// test's child process: the same one-worker output-pipe run must reach
+/// its timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_builtin_writing_to_a_full_output_pipe_through_the_writer_thread_still_times_out() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::a_builtin_writing_to_a_full_output_pipe_through_the_writer_thread_still_times_out"
+		),
+		a_builtin_writing_to_a_full_output_pipe_still_times_out,
+	);
+}
+
+/// Whether `pid` is a zombie: it exited and its parent has not reaped it.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+	std::fs::read_to_string(format!("/proc/{pid}/stat"))
+		.ok()
+		.and_then(|stat| Some(stat.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+		.unwrap_or(false)
+}
+
+/// The shape that froze agents' shells, made deterministic: one builtin
+/// write leaves the capture pipe's room off a `PIPE_BUF` multiple, and a
+/// write larger than the pipe follows (`printf x; printf '%0300000d\n' 0`).
+/// Under gVisor a pipe polls writable with one byte free, and a blocking
+/// write of up to `PIPE_BUF` then waited in the kernel on the runtime's only
+/// worker, where the capture's reader and every timer run. On a one-worker
+/// runtime the run must deliver all its bytes, and a timer started beside
+/// it must fire.
+#[cfg(unix)]
+#[test]
+fn a_run_that_overfills_its_capture_lets_a_timer_beside_it_fire() {
+	const BOUND: Duration = Duration::from_secs(15);
+	let _guard = shell_test_lock().blocking_lock();
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let _ = tx.send(runtime.block_on(async {
+			let timer = tokio::spawn(tokio::time::sleep(Duration::from_secs(2)));
+			let run = capture_unlocked(
+				"printf x; printf '%0300000d\\n' 0",
+				None,
+				None,
+				CancelToken::default(),
+			)
+			.await;
+			timer.await.expect("the timer task");
+			run
+		}));
+	});
+	let (result, output) = rx.recv_timeout(BOUND).unwrap_or_else(|_| {
+		panic!("DEADLINE fired: the run or the timer beside it did not settle within {BOUND:?}")
+	});
+	assert_eq!(result.exit_code, Some(0), "{result:?}");
+	assert_eq!(output.len(), 300_002, "every byte of the run reached the capture");
+}
+
+/// A real external child that exits while a builtin writes to a full
+/// output pipe nothing drains must be reaped: its `waitpid` runs on the
+/// runtime (`UnixProc`'s `Drop` and `reap`,
+/// `crates/pi-shell/src/sys/spawn/unix.rs`), which a write that waited in the
+/// kernel would hold for good. The child is `/bin/sh` by absolute path, so it
+/// is an external process, and it writes its own pid. A control first shows
+/// that the check sees a child nobody reaped.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_external_child_of_a_run_with_a_full_output_pipe_is_reaped() {
+	const BOUND: Duration = Duration::from_secs(15);
+	let mut control = std::process::Command::new("/bin/true")
+		.spawn()
+		.expect("spawn the control");
+	let seen = std::time::Instant::now();
+	while !is_zombie(control.id()) {
+		assert!(seen.elapsed() < Duration::from_secs(5), "the control never showed as a zombie");
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	control.wait().expect("reap the control");
+	assert!(!is_zombie(control.id()), "the control was reaped");
+
+	let _guard = shell_test_lock().blocking_lock();
+	let stamp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let pidfile = std::env::temp_dir().join(format!("pi-shell-reap-{}-{stamp}", std::process::id()));
+	let command = format!(
+		"/bin/sh -c 'echo $$ > {}; sleep 0.3' & while :; do echo 0123456789abcdefghi; done",
+		pidfile.display()
+	);
+	let (chunks, undrained) = flume::bounded::<String>(1);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let options = ShellExecuteOptions { command, timeout_ms: Some(2000), ..Default::default() };
+		let result =
+			runtime.block_on(execute_shell(options, Some(chunks), CancelToken::new(Some(2000))));
+		runtime.shutdown_timeout(Duration::from_secs(3));
+		let _ = tx.send(result);
+	});
+	let result = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within {BOUND:?}"))
+		.expect("execute_shell");
+	drop(undrained);
+	assert!(result.timed_out, "{result:?}");
+	let pid: u32 = std::fs::read_to_string(&pidfile)
+		.expect("the external wrote its pid")
+		.trim()
+		.parse()
+		.expect("a pid");
+	let _ = std::fs::remove_file(&pidfile);
+	let reaped = std::time::Instant::now();
+	while is_zombie(pid) {
+		assert!(reaped.elapsed() < Duration::from_secs(2), "the external {pid} is left a zombie");
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
+/// The same through the writer-thread route, forced on Linux in this
+/// test's child process.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_is_reaped() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_is_reaped"
+		),
+		an_external_child_of_a_run_with_a_full_output_pipe_is_reaped,
+	);
+}
+
+/// A run that succeeded, as a failed close finds it.
+#[cfg(unix)]
+fn succeeded() -> RunOutcome {
+	RunOutcome { status: 0, cancelled: false, exited: false, cwd: BString::default() }
+}
+
+/// A failed close is said on the command's stderr and fails the command.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_close_failure_is_reported_on_stderr_and_fails_the_command() {
+	use std::io::Read as _;
+
+	let (mut reader, writer) = pipe_to_files("output").expect("pipe");
+	let mut stderr = crate::sys::StdFile::new(writer);
+	let mut result = Ok(succeeded());
+	let err = io::Error::other("lost");
+	report_close_failure(&mut stderr, &err, &mut result, &CancellationToken::new()).await;
+	drop(stderr);
+	let mut said = String::new();
+	reader.read_to_string(&mut said).expect("read the report");
+	assert_eq!(said, "pi-shell: closing a file failed: lost\n");
+	assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
+}
+
+/// The report of a failed close goes to the run's output pipe. With that
+/// pipe full and nothing draining it, the report must give up at its limit:
+/// a write that waited in the kernel would hold the runtime's only worker
+/// for good. The bound runs on this thread.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_close_failure_report_to_a_full_output_pipe_gives_up_at_its_limit() {
+	use std::{io::Write as _, os::fd::AsRawFd};
+
+	const BOUND: Duration = Duration::from_secs(10);
+	let (reader, writer) = pipe_to_files("output").expect("pipe");
+	// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+	let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+	let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+	(&writer)
+		.write_all(&vec![b'q'; capacity])
+		.expect("fill the pipe");
+	let mut stderr = crate::sys::StdFile::new(writer);
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.enable_all()
+			.build()
+			.expect("single-worker runtime");
+		let mut result = Ok(succeeded());
+		let err = io::Error::other("lost");
+		runtime.block_on(report_close_failure(
+			&mut stderr,
+			&err,
+			&mut result,
+			&CancellationToken::new(),
+		));
+		let _ = tx.send(result.map(|outcome| outcome.status).ok());
+	});
+	let status = rx
+		.recv_timeout(BOUND)
+		.unwrap_or_else(|_| panic!("DEADLINE fired: the report did not return within {BOUND:?}"));
+	assert_eq!(status, Some(1));
+	drop(reader);
+}
+
+/// The report of a failed close is out before the run closes the
+/// descriptor. Through a writer thread (Darwin, Windows, a Linux terminal,
+/// socket or failed reopen), the record is taken at once and written later,
+/// so the report must wait for its flush: otherwise the last write before the
+/// close could fail with nobody waiting for it. The pipe is full when the
+/// report starts, so the thread cannot have written the record at the first
+/// poll; a report that returns there returned before its record was out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_close_failure_report_through_the_writer_thread_returns_only_once_written() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::a_close_failure_report_through_the_writer_thread_returns_only_once_written"
+		),
+		|| {
+			use std::{
+				io::{Read as _, Write as _},
+				os::fd::AsRawFd,
+				pin::pin,
+				task::Poll,
+			};
+
+			const RECORD: &[u8] = b"pi-shell: closing a file failed: lost\n";
+			let (mut reader, writer) = pipe_to_files("output").expect("pipe");
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+			(&writer)
+				.write_all(&vec![b'q'; capacity])
+				.expect("fill the pipe");
+			let mut stderr = crate::sys::StdFile::new(writer);
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime");
+			let mut result = Ok(succeeded());
+			let err = io::Error::other("lost");
+			let token = CancellationToken::new();
+			let drain = runtime.block_on(async {
+				let mut report = pin!(report_close_failure(&mut stderr, &err, &mut result, &token));
+				let first = std::future::poll_fn(|cx| Poll::Ready(report.as_mut().poll(cx))).await;
+				assert!(
+					first.is_pending(),
+					"the report returned while the writer thread still held its record"
+				);
+				let drain = std::thread::spawn(move || {
+					let mut all = Vec::new();
+					reader.read_to_end(&mut all).expect("drain the output pipe");
+					all
+				});
+				report.await;
+				drain
+			});
+			drop(stderr);
+			let all = drain.join().expect("the drain thread");
+			assert_eq!(all.len(), capacity + RECORD.len());
+			assert_eq!(&all[capacity..], RECORD, "the record reached the pipe whole");
+			assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
+		},
+	);
+}
+
 #[cfg(unix)]
 #[test]
 fn read_process_substitution_assigns_line() {
@@ -2712,4 +3021,48 @@ async fn pipe_tap_forwards_every_byte_and_counts_them() {
 	assert_eq!(read.data.len(), written.min(1 << 20));
 	assert!(read.data.ends_with(format!("\n{LAST}\n").as_bytes()));
 	assert!(!read.open);
+}
+
+/// A failed close's record keeps its newline however long the error is:
+/// it is cut to what one hand-off to the descriptor's writer thread takes
+/// (on Windows every pipe write goes through one), so it goes out whole.
+/// A record longer than a hand-off had its first 64 KiB handed off and its
+/// rest, newline included, dropped.
+#[test]
+fn a_long_close_failure_record_goes_out_whole_with_its_newline() {
+	use std::io::Read as _;
+
+	let (mut reader, writer) = std::io::pipe().expect("pipe");
+	#[cfg(unix)]
+	let writer = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+	#[cfg(windows)]
+	let writer = std::fs::File::from(std::os::windows::io::OwnedHandle::from(writer));
+	let drained = std::thread::spawn(move || {
+		let mut all = Vec::new();
+		reader.read_to_end(&mut all).expect("drain the output pipe");
+		all
+	});
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("runtime");
+	let mut result = Ok(RunOutcome {
+		status:    0,
+		cancelled: false,
+		exited:    false,
+		cwd:       BString::default(),
+	});
+	let err = io::Error::other("x".repeat(100 << 10));
+	let mut stderr = crate::sys::StdFile::new(writer);
+	runtime.block_on(report_close_failure(
+		&mut stderr,
+		&err,
+		&mut result,
+		&CancellationToken::new(),
+	));
+	drop(stderr);
+	let all = drained.join().expect("the drain thread");
+	assert!(all.starts_with(b"pi-shell: closing a file failed: "), "{} bytes", all.len());
+	assert_eq!(all.last(), Some(&b'\n'), "the record lost its end: {} bytes", all.len());
+	assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
 }

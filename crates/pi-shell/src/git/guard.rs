@@ -1705,4 +1705,91 @@ mod tests {
 			1
 		);
 	}
+
+	/// The guard's note about the changes it saved is out before git runs.
+	/// Here stderr is a full pipe, on the writer-thread route (the test's
+	/// child process), so the note stays on fd 2's writer thread until the
+	/// pipe drains after 2 s: until then git must not have started, so the
+	/// file it restores still holds the edit. Once the pipe drains, git runs
+	/// and restores it, and the note reached fd 2.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn the_save_note_is_out_before_git_runs() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_save_note_is_out_before_git_runs"),
+			|| {
+				use std::{
+					io::Read as _,
+					os::{
+						fd::{AsRawFd as _, OwnedFd},
+						unix::ffi::OsStrExt as _,
+					},
+				};
+
+				use bstr::BString;
+
+				use crate::session::{RunOptions, RunStdio, Session, SessionConfig};
+
+				let (_temp, repo) = fixture();
+				let worktree = repo.parent().expect("fixture parent").join("wt");
+				git(&repo, &["worktree", "add", "-q", "-b", "topic", &worktree.to_string_lossy()]);
+				std::fs::write(worktree.join("tracked.txt"), "mine\n").expect("edit");
+				let (mut held_r, held_w) = std::io::pipe().unwrap();
+				// SAFETY: `F_GETPIPE_SZ` takes no argument; `held_w` owns the fd.
+				let capacity =
+					usize::try_from(unsafe { libc::fcntl(held_w.as_raw_fd(), libc::F_GETPIPE_SZ) })
+						.unwrap();
+				std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
+				let file = worktree.join("tracked.txt");
+				let held_thread = std::thread::spawn(move || {
+					std::thread::sleep(std::time::Duration::from_secs(2));
+					let while_held = std::fs::read_to_string(&file).expect("read tracked");
+					let mut all = Vec::new();
+					held_r.read_to_end(&mut all).unwrap();
+					(while_held, all)
+				});
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.unwrap();
+				runtime.block_on(async {
+					let mut env: Vec<(BString, BString)> = std::env::vars_os()
+						.filter(|(name, _)| {
+							!["PI_SMART_GIT", "PI_GIT_GUARD"].contains(&name.to_str().unwrap_or(""))
+						})
+						.map(|(k, v)| (BString::from(k.as_bytes()), BString::from(v.as_bytes())))
+						.collect();
+					env.push(("PI_SMART_GIT".into(), "0".into()));
+					env.push(("PI_GIT_GUARD".into(), "1".into()));
+					let mut session = Session::new(SessionConfig {
+						env,
+						cwd: BString::from(worktree.as_os_str().as_bytes()),
+						fs: Box::new(crate::sys::StdFs::default()),
+						vfs: None,
+						runtime: tokio::runtime::Handle::current(),
+						output_decoding: None,
+						term_grace: crate::host::TERM_GRACE,
+					})
+					.expect("session");
+					let stdio = RunStdio {
+						stdin:  Some(std::fs::File::open("/dev/null").expect("/dev/null")),
+						stdout: Some(std::fs::File::create("/dev/null").expect("/dev/null")),
+						stderr: Some(std::fs::File::from(OwnedFd::from(held_w))),
+					};
+					let options =
+						RunOptions::new("unset -v \"${!GIT_CONFIG@}\"; git checkout tracked.txt");
+					let run =
+						session.run_with(options, stdio, tokio_util::sync::CancellationToken::new());
+					let _ = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+				});
+				drop(runtime);
+				let (while_held, all) = held_thread.join().unwrap();
+				let drained = String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned();
+				assert_eq!(while_held, "mine\n", "git ran before the guard's note was out");
+				assert_eq!(read(&worktree), "tracked\n", "git never ran once fd 2 drained");
+				assert!(drained.contains("saved your uncommitted changes as"), "{drained:?}");
+			},
+		);
+	}
 }

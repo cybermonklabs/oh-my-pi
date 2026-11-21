@@ -137,8 +137,10 @@ pub enum FdAnswer {
 /// A socket or lock operation of an [`FdProbe`] in flight
 /// ([`Live::Fd`]).
 pub enum FdLive {
-	/// Bytes of a [`FdProbe::Write`] written so far.
-	Written(usize),
+	/// Bytes of a [`FdProbe::Write`] written so far, and what a writer thread
+	/// took after them and has not written yet
+	/// ([`crate::bash::FdRef::poll_write_out`]).
+	Written(usize, crate::bash::Unsettled),
 	/// [`FdProbe::Resolve`] in flight.
 	Resolve(Box<dyn FsPending<Vec<IpAddr>>>),
 	/// [`FdProbe::HostName`] in flight.
@@ -437,7 +439,9 @@ fn read_once(
 	Ok(FdAnswer::Read { data: BString::from(std::mem::take(input)), timed_out: false })
 }
 
-/// zsh `bin_syswrite`'s loop of `write(2)`s.
+/// zsh `bin_syswrite`'s loop of `write(2)`s. A chunk counts once it is out
+/// of the shell ([`crate::bash::FdRef::poll_write_out`]), so the count and
+/// the error are those of `write(2)`.
 fn write_all(
 	tcx: &mut Context<'_>,
 	vp: &Vproc,
@@ -445,16 +449,16 @@ fn write_all(
 	fd: i32,
 	data: &[u8],
 ) -> Result<FdAnswer, WaitKey> {
-	let mut done = match &sc.live {
-		Live::Fd(live) => match **live {
-			FdLive::Written(n) => n,
-			_ => 0,
+	let (mut done, mut unsettled) = match &mut sc.live {
+		Live::Fd(live) => match &mut **live {
+			FdLive::Written(n, unsettled) => (*n, std::mem::take(unsettled)),
+			_ => (0, crate::bash::Unsettled::default()),
 		},
-		_ => 0,
+		_ => (0, crate::bash::Unsettled::default()),
 	};
 	let h = vp.fds.handle(fd);
 	while done < data.len() {
-		match h.poll_write(tcx, &data[done..]) {
+		match h.poll_write_out(tcx, &data[done..], &mut unsettled) {
 			Poll::Ready(Ok(0)) => {
 				sc.live = Live::None;
 				let e = io::Error::from(io::ErrorKind::WriteZero);
@@ -467,7 +471,7 @@ fn write_all(
 				return Ok(FdAnswer::Wrote { n: done, err: Some(FsErr::of(&e)) });
 			},
 			Poll::Pending => {
-				sc.live = Live::Fd(Box::new(FdLive::Written(done)));
+				sc.live = Live::Fd(Box::new(FdLive::Written(done, unsettled)));
 				return Err(WaitKey::Write { fd });
 			},
 		}

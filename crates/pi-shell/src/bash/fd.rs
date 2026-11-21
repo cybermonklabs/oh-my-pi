@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::bash::{
-	fs::{File, FileKind},
+	fs::{File, FileKind, Mark},
 	host::{OsHandle, StdFd},
 	mem::MemFile,
 };
@@ -325,13 +325,14 @@ impl FdRef {
 		output.base.clone()
 	}
 
-	/// Write with a known execution identity without allocating a handle.
+	/// [`Self::poll_write_marked`] with a known execution identity, without
+	/// allocating a handle.
 	pub fn poll_write_tagged(
 		&self,
 		cx: &mut Context<'_>,
 		bytes: &[u8],
 		tag: crate::bash::ids::CmdTag,
-	) -> Poll<io::Result<usize>> {
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		match self.0.state.lock().file() {
 			Some(file) => file.poll_write_tagged(cx, bytes, Some(tag)),
 			None => Poll::Ready(Err(bad_fd())),
@@ -359,6 +360,64 @@ impl FdRef {
 			Some(f) => f.poll_flush(cx),
 			None => Poll::Ready(Ok(())),
 		}
+	}
+
+	/// Wait until the writes the file took are out ([`File::poll_settle`]).
+	pub fn poll_settle(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle(cx),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	/// Write a prefix of `buf`, with its chunk's [`Mark`]
+	/// ([`File::poll_write_marked`]).
+	pub fn poll_write_marked(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_marked(cx, buf),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
+	/// Wait until this writer's chunks are out, with their first error
+	/// ([`File::poll_settle_marked`]).
+	pub fn poll_settle_marked(&self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle_marked(cx, marks),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	/// A write that is done only once its bytes are out of the shell: in the
+	/// kernel, or failed with the write's error. It is
+	/// [`Self::poll_write_marked`], then [`Self::poll_settle_marked`] of the
+	/// chunk a writer thread took, which `unsettled` keeps while it is
+	/// `Pending`; the caller polls again through this fd from the same
+	/// offset (it counts nothing written), and the chunk is settled and
+	/// counted before anything else goes. For a writer that polls a write to
+	/// its end: each chunk is out before the next one goes, and the last one
+	/// before the write is done, so what runs next comes after it.
+	pub fn poll_write_out(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		unsettled: &mut Unsettled,
+	) -> Poll<io::Result<usize>> {
+		if unsettled.0.is_none() {
+			match std::task::ready!(self.poll_write_marked(cx, buf)) {
+				Ok((n, Some(mark))) => unsettled.0 = Some((n, mark)),
+				other => return Poll::Ready(other.map(|(n, _)| n)),
+			}
+		}
+		let (n, mark) = unsettled.0.as_ref().expect("set above");
+		let settled = std::task::ready!(self.poll_settle_marked(cx, std::slice::from_ref(mark)));
+		let n = *n;
+		unsettled.0 = None;
+		Poll::Ready(settled.map(|()| n))
 	}
 
 	/// Kind of the underlying object; `None` when closed or lost.
@@ -404,6 +463,20 @@ impl FdRef {
 	}
 }
 
+/// The chunk of a [`FdRef::poll_write_out`] that a writer thread took and
+/// that has not settled yet: its length and its [`Mark`]. Live state of one
+/// host file: not saved, and not part of any value it sits in.
+#[derive(Clone, Debug, Default)]
+pub struct Unsettled(Option<(usize, Mark)>);
+
+impl PartialEq for Unsettled {
+	fn eq(&self, _: &Self) -> bool {
+		true
+	}
+}
+
+impl Eq for Unsettled {}
+
 /// Trace-only forwarding descriptor. Its base is always an unwrapped
 /// visible capture, so retagging cannot build a chain of wrappers.
 struct TaggedOutput {
@@ -417,6 +490,16 @@ impl File for TaggedOutput {
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+		self.poll_write_marked(cx, bytes).map_ok(|(n, _)| n)
+	}
+
+	/// The base's tagged write: the chunk's mark is the base's, which the
+	/// writer settles through this fd.
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		self.base.poll_write_tagged(cx, bytes, self.tag)
 	}
 
@@ -425,7 +508,7 @@ impl File for TaggedOutput {
 		cx: &mut Context<'_>,
 		bytes: &[u8],
 		tag: Option<crate::bash::ids::CmdTag>,
-	) -> Poll<io::Result<usize>> {
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		self
 			.base
 			.poll_write_tagged(cx, bytes, tag.unwrap_or(self.tag))
@@ -433,6 +516,14 @@ impl File for TaggedOutput {
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.base.poll_flush(cx)
+	}
+
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.base.poll_settle(cx)
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[Mark]) -> Poll<io::Result<()>> {
+		self.base.poll_settle_marked(cx, marks)
 	}
 
 	fn seek(&mut self, pos: crate::bash::fs::SeekFrom) -> io::Result<u64> {
