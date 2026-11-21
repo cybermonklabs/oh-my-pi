@@ -43,8 +43,10 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 }
 
 /// The categories a locale environment names, with the mask `newlocale`
-/// knows each by: the six POSIX ones and, on Linux, the six glibc adds. A
-/// utility's `setlocale(LC_ALL, "")` has to load every one of them.
+/// knows each by: the six POSIX ones and, with glibc, the six glibc adds. A
+/// utility's `setlocale(LC_ALL, "")` has to load every one of them. musl
+/// knows only the POSIX six (`locale.h`), and the libc crate gives the other
+/// masks for glibc alone among the Linux libraries.
 #[cfg(unix)]
 const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_CTYPE", libc::LC_CTYPE_MASK),
@@ -53,17 +55,17 @@ const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_COLLATE", libc::LC_COLLATE_MASK),
 	("LC_MONETARY", libc::LC_MONETARY_MASK),
 	("LC_MESSAGES", libc::LC_MESSAGES_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_PAPER", libc::LC_PAPER_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_NAME", libc::LC_NAME_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_ADDRESS", libc::LC_ADDRESS_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_TELEPHONE", libc::LC_TELEPHONE_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_MEASUREMENT", libc::LC_MEASUREMENT_MASK),
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
 	("LC_IDENTIFICATION", libc::LC_IDENTIFICATION_MASK),
 ];
 
