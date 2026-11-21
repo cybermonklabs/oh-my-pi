@@ -3725,7 +3725,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * so input to a subagent ends nothing.
 	 */
 	#endCyberPolicyClosureFrom(origin: InputOrigin | undefined): void {
-		if (origin === "outside") this.#ownsCyberPolicyClosure?.end();
+		if (origin !== "outside") return;
+		// What the end starts (an advisor's held batch resuming) runs as this tree's own work: in its scope.
+		runInModelCallScope(this.#cyberPolicyClosure, () => this.#ownsCyberPolicyClosure?.end());
 	}
 
 	/** Records and announces a cost-cap refusal of the next model request; `undefined` lets it through. */
@@ -8607,13 +8609,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const controller = new AbortController();
 		this.#imageDescriptionAbortControllers.add(controller);
 		try {
-			return await this.#providerBoundary.buildImageDescriptionNotice(
-				normalizedImages,
-				AbortSignal.any([
-					controller.signal,
-					AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS),
-					...(signal ? [signal] : []),
-				]),
+			// The vision call is this tree's own model call (`steer`/`followUp` reach here from any host):
+			// in its scope.
+			return await runInModelCallScope(this.#cyberPolicyClosure, () =>
+				this.#providerBoundary.buildImageDescriptionNotice(
+					normalizedImages,
+					AbortSignal.any([
+						controller.signal,
+						AbortSignal.timeout(IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS),
+						...(signal ? [signal] : []),
+					]),
+				),
 			);
 		} finally {
 			this.#imageDescriptionAbortControllers.delete(controller);
@@ -8836,6 +8842,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					options?.onPromptAdmitted?.();
 				}
 			: options?.onPromptAdmitted;
+		// Input from outside the session (a person, the harness or an RPC client) may reach OpenAI again
+		// after a cyber-policy refusal; prompts the session, its extensions or its agents make keep the
+		// closure. It ends here, before a command the input names runs, so a person's typed `/mycommand`
+		// ends it for what that command's handler sends.
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
@@ -8886,9 +8897,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (options?.userInitiated ?? !options?.synthetic) this.#noteUserTurn();
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-		// Input from outside the session (a person, the harness or an RPC client) may reach OpenAI again
-		// after a cyber-policy refusal; prompts the session, its extensions or its agents make keep the closure.
-		this.#endCyberPolicyClosureFrom(options?.origin);
 
 		// If streaming, queue via steer()/followUp()/aside based on option
 		if (this.isStreaming) {
@@ -11986,7 +11994,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * `customSystemPrompt` swaps the title prompt for special-purpose titling
 	 * (e.g. plan-save filename topics) without touching the session override.
 	 */
-	async generateTitle(
+	generateTitle(firstMessage: string, customSystemPrompt?: string, signal?: AbortSignal): Promise<string | null> {
+		// Public and called by hosts (the TUI's first-message title): its model call is this tree's, in its scope.
+		return this.#inLogContext(() => this.#generateTitle(firstMessage, customSystemPrompt, signal));
+	}
+
+	async #generateTitle(
 		firstMessage: string,
 		customSystemPrompt?: string,
 		signal?: AbortSignal,
@@ -13738,7 +13751,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * streaming assistant text so the model sees the half-finished response
 	 * rather than missing context.
 	 */
-	async runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+	runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+		// Public and called directly (`/btw`, `/omfg`, an extension's context): its model calls are this
+		// tree's, in its scope, so another tree's hold does not see them as made outside every session.
+		return this.#inLogContext(() => this.#runEphemeralTurn(args));
+	}
+
+	async #runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
 		const model = this.model;
 		if (!model) {
 			throw new Error("No active model on session");

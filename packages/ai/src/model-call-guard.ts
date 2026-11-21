@@ -130,6 +130,29 @@ export function guardModelCall(
 }
 
 /**
+ * The guards' second read, right before a request leaves: the reason a guard that sees the current call
+ * holds `model` now, else `undefined`. {@link guardModelCall} reads the guards when a call starts; a call
+ * can then wait (a provider slot, a key resolution, a header resolution) or send again (an auth-retry
+ * attempt, a transport resend, a live steer), so each send reads them again. A held send is not reported
+ * to the guards: nothing was sent.
+ */
+export function modelCallHoldReason(model: Model<Api>): string | undefined {
+	return guards.size === 0 ? undefined : refusal(applicable(), model);
+}
+
+/** {@link modelCallHoldReason} for a streaming send: the held call's stream when held. */
+export function heldModelCall(model: Model<Api>): AssistantMessageEventStream | undefined {
+	const reason = modelCallHoldReason(model);
+	return reason === undefined ? undefined : refusedCall(model, reason);
+}
+
+/** {@link modelCallHoldReason} for a request-style send: throws {@link ModelCallRefusedError} when held. */
+export function assertModelCallAllowed(model: Model<Api>): void {
+	const reason = modelCallHoldReason(model);
+	if (reason !== undefined) throw new ModelCallRefusedError(model, reason);
+}
+
+/**
  * Runs `request` unless a guard that sees it holds `model` (then rejects with
  * {@link ModelCallRefusedError}), and reports an error it throws to those guards before the caller
  * sees it.

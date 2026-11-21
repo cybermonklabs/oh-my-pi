@@ -1522,6 +1522,8 @@ export class SessionAdvisors {
 				serviceTierResolver: advisorServiceTierResolver,
 			});
 			advisorAgent.setDisableReasoning(shouldDisableReasoning(advisorThinkingLevel));
+			// An advisor's runs are this tree's model calls: in its scope, as the primary agent's are.
+			advisorAgent.modelCallScope = this.#host.agent.modelCallScope;
 			advisorAgent.setModelResolver(model => this.#host.modelRegistry.fitContextWindow(model, this.#host.settings));
 			let advisorLoopGuardStopped = false;
 			// The advisor's own loop needs the same repeated-tool-call bound the

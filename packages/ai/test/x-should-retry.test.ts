@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import * as AIError from "../src/error";
 import { OpenAIHttpError, postOpenAIStream } from "../src/utils/openai-http";
+import { createMockModel } from "../src/providers/mock";
 import { mockFetch } from "./helpers/fetch-mock";
+
+/** The model the request is for: `postOpenAIStream` reads the model-call guards before each resend. */
+const MODEL = createMockModel({ handler: { content: [] } });
 
 // A retrying gateway that already exhausted its own attempts answers with a
 // terminal 5xx plus `x-should-retry: false`. The removed `openai` SDK obeyed
@@ -22,6 +26,7 @@ async function captureStreamError(response: () => Response): Promise<{ attempts:
 	});
 	const error = await postOpenAIStream({
 		url: "http://gateway.local/v1/chat/completions",
+		model: MODEL,
 		headers: {},
 		body: {},
 		signal: new AbortController().signal,

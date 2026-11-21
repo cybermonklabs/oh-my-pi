@@ -52,7 +52,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import type { CyberPolicyClosureApi } from "./cyber-policy-closure";
+import { type CyberPolicyClosureApi, isRecordableCyberPolicyRefusal } from "./cyber-policy-closure";
 import {
 	assistantTurnProducedOutput,
 	isEmptyAssistantStop,
@@ -1919,7 +1919,8 @@ export class TurnRecovery {
 	 * may still take the turn.
 	 */
 	recordCyberPolicyRefusal(failure: unknown): void {
-		if (AIError.isCyberPolicyRefusal(failure)) this.#host.cyberPolicyClosure?.().record();
+		// A call the hold itself held names the code too; only OpenAI's own refusal is recorded.
+		if (isRecordableCyberPolicyRefusal(failure)) this.#host.cyberPolicyClosure?.().record();
 	}
 
 	/**

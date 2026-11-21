@@ -6935,7 +6935,8 @@ export class InteractiveMode implements InteractiveModeContext {
 					undefined,
 					undefined,
 					outcome => this.#applyDeferredPlanModelTransition(outcome, options.executionModel),
-					{ internalGuidance: compactionPrompt, readerModel },
+					// A person's plan approval: input from outside the session.
+					{ internalGuidance: compactionPrompt, readerModel, origin: "outside" },
 				);
 			}
 		} finally {
@@ -7047,17 +7048,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		// execution directive behind it as a synthetic follow-up. If `isStreaming`
 		// flips true between the check and dispatch (the same fire-and-forget race
 		// noted below), catch `AgentBusyError` and fall back to the same queue.
+		// A person approved the plan: input from outside the session.
 		if (this.session.isStreaming) {
 			await this.session.followUp(planModePrompt, undefined, {
 				synthetic: true,
+				origin: "outside",
 			});
 		} else {
 			try {
-				await this.session.prompt(planModePrompt, { synthetic: true });
+				await this.session.prompt(planModePrompt, { synthetic: true, origin: "outside" });
 			} catch (error) {
 				if (!(error instanceof AgentBusyError)) throw error;
 				await this.session.followUp(planModePrompt, undefined, {
 					synthetic: true,
+					origin: "outside",
 				});
 			}
 		}
@@ -7492,14 +7496,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				initial: rest?.trim() || undefined,
 			});
 			const images = input?.images?.length ? input.images : undefined;
+			// A person's `/guided-goal`: input from outside the session.
 			if (this.session.isStreaming) {
-				await this.session.followUp(kickoff, images, { synthetic: true });
+				await this.session.followUp(kickoff, images, { synthetic: true, origin: "outside" });
 			} else {
 				try {
-					await this.session.prompt(kickoff, images ? { synthetic: true, images } : { synthetic: true });
+					await this.session.prompt(
+						kickoff,
+						images ? { synthetic: true, images, origin: "outside" } : { synthetic: true, origin: "outside" },
+					);
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
-					await this.session.followUp(kickoff, images, { synthetic: true });
+					await this.session.followUp(kickoff, images, { synthetic: true, origin: "outside" });
 				}
 			}
 			return true;
@@ -9556,7 +9564,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		customInstructions?: string,
 		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
-		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
+		options?: Pick<CompactOptions, "internalGuidance" | "readerModel" | "origin">,
 	): Promise<CompactionOutcome> {
 		return this.#commandController.handleCompactCommand(customInstructions, mode, beforeFlush, options);
 	}

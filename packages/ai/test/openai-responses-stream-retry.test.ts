@@ -623,6 +623,7 @@ describe("OpenAI Responses transient stream retry", () => {
 
 		const { response } = await postOpenAIStream({
 			url: "https://example.openai.azure.com/openai/v1/responses",
+			model,
 			headers: {},
 			body: {},
 			signal: new AbortController().signal,

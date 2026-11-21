@@ -2091,7 +2091,7 @@ export class CommandController {
 		customInstructions?: string,
 		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
-		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
+		options?: Pick<CompactOptions, "internalGuidance" | "readerModel" | "origin">,
 	): Promise<CompactionOutcome> {
 		const entries = this.ctx.sessionManager.getEntries();
 		const messageCount = entries.filter(e => e.type === "message").length;
@@ -2116,9 +2116,17 @@ export class CommandController {
 				beforeFlush,
 				mode,
 				options.readerModel,
+				options.origin,
 			);
 		}
-		return this.executeCompaction(customInstructions, false, beforeFlush, mode, options?.readerModel);
+		return this.executeCompaction(
+			customInstructions,
+			false,
+			beforeFlush,
+			mode,
+			options?.readerModel,
+			options?.origin,
+		);
 	}
 
 	/**
@@ -2190,9 +2198,15 @@ export class CommandController {
 		// `executeCompaction` calls the hook right before it flushes the queue; "Nothing to compact"
 		// returns before both, so the held follow-ups are released here instead.
 		let compactionFlushes = false;
-		await this.handleCompactCommand(request.instructions, request.mode, () => {
-			compactionFlushes = true;
-		});
+		// A person's `/compact`, queued for the next yield: input from outside the session.
+		await this.handleCompactCommand(
+			request.instructions,
+			request.mode,
+			() => {
+				compactionFlushes = true;
+			},
+			{ origin: "outside" },
+		);
 		if (!compactionFlushes) await this.ctx.flushCompactionQueue({ willRetry: false });
 	}
 
@@ -2234,6 +2248,12 @@ export class CommandController {
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
 		mode?: CompactMode,
 		readerModel?: Model,
+		/**
+		 * `"outside"` only from a person's action (`/compact`, a queued `/compact`, a model switch, plan
+		 * approve-and-compact): it ends the session's cyber-policy hold. A `/loop` compaction passes none,
+		 * and an extension's `ctx.compact()` keeps its own `CompactOptions.origin`.
+		 */
+		origin?: CompactOptions["origin"],
 	): Promise<CompactionOutcome> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
@@ -2273,13 +2293,11 @@ export class CommandController {
 			// The slash path passes `mode` positionally; the extension path carries
 			// it inside the options object. Either source wins over no mode.
 			const effectiveMode = mode ?? baseOptions?.mode;
-			// A person's `/compact` (or a person's action that compacts, such as a model switch): input
-			// from outside the session.
 			const options = {
 				...baseOptions,
 				...(effectiveMode ? { mode: effectiveMode } : {}),
 				...(readerModel ? { readerModel } : {}),
-				origin: "outside" as const,
+				...(origin ? { origin } : {}),
 			};
 			await this.ctx.session.compact(instructions, options);
 

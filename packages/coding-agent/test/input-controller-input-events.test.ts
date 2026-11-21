@@ -57,7 +57,9 @@ async function createHarness(factory: ExtensionFactory) {
 		isCompacting: false,
 		queuedMessageCount: 0,
 		prompt,
-		followUp: vi.fn(async (_text: string, _images?: ImageContent[]) => {}),
+		followUp: vi.fn(
+			async (_text: string, _images?: ImageContent[], _options?: { origin?: "outside" | "inside" }) => {},
+		),
 		buildUserSkillPrompt: buildSkillPromptMessage,
 		promptCustomMessage: vi.fn(async () => true),
 		abort: vi.fn(async () => {}),
@@ -167,7 +169,7 @@ describe("interactive native input ingress", () => {
 			{ type: "input", source: "interactive", text: "changed [Image #1]", images: [transformedImage] },
 		]);
 		expect(h.prompt.mock.calls).toEqual([
-			["changed [Image #1] final", { streamingBehavior: "followUp", images: [transformedImage] }],
+			["changed [Image #1] final", { streamingBehavior: "followUp", images: [transformedImage], origin: "outside" }],
 		]);
 		expect(h.editor.pendingImages).toEqual([transformedImage]);
 		const link = h.editor.pendingImageLinks[0];
@@ -254,7 +256,7 @@ describe("interactive native input ingress", () => {
 		const h = await createHarness(() => {});
 		h.draftWithImage("/queue inspect [Image #1]");
 		await h.pressSubmit(FOLLOW_UP);
-		expect(h.session.followUp.mock.calls).toEqual([["inspect [Image #1]", [originalImage]]]);
+		expect(h.session.followUp.mock.calls).toEqual([["inspect [Image #1]", [originalImage], { origin: "outside" }]]);
 	});
 
 	it("Ctrl+Enter /queue that rejects restores its text and image beside a newer draft", async () => {
@@ -298,8 +300,8 @@ describe("interactive native input ingress", () => {
 		await submitting;
 
 		expect(h.session.followUp.mock.calls).toEqual([
-			["first [Image #1]", [originalImage]],
-			["second", undefined],
+			["first [Image #1]", [originalImage], { origin: "outside" }],
+			["second", undefined, { origin: "outside" }],
 		]);
 		expect(h.editor.getExpandedText()).toBe("=> second\n\nnewer [Image #1]");
 		expect(h.editor.pendingImages).toEqual([newerImage]);
@@ -321,7 +323,7 @@ describe("interactive native input ingress", () => {
 		h.draftWithImage("newer [Image #1]");
 		release.resolve();
 		await submitting;
-		expect(h.session.followUp.mock.calls).toEqual([["inspect the result", undefined]]);
+		expect(h.session.followUp.mock.calls).toEqual([["inspect the result", undefined, { origin: "outside" }]]);
 		expect(h.editor.getExpandedText()).toBe("newer [Image #1]");
 		expect(h.editor.pendingImages).toEqual([originalImage]);
 		expect(h.editor.pendingImageLinks).toEqual(["local://original.png"]);
@@ -344,7 +346,7 @@ describe("interactive native input ingress", () => {
 		release.resolve();
 		await submitting;
 
-		expect(h.session.followUp.mock.calls).toEqual([["inspect [Image #1]", [originalImage]]]);
+		expect(h.session.followUp.mock.calls).toEqual([["inspect [Image #1]", [originalImage], { origin: "outside" }]]);
 		expect(h.editor.getExpandedText()).toBe("/queue inspect [Image #2]\n\nnewer [Image #1]");
 		expect(h.editor.pendingImages).toEqual([newerImage, originalImage]);
 		expect(h.editor.pendingImageLinks).toEqual(["local://newer.jpg", "local://original.png"]);
@@ -539,6 +541,7 @@ describe("interactive native input ingress", () => {
 			expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", {
 				streamingBehavior: "steer",
 				images: [newerImage],
+				origin: "outside",
 			});
 		},
 	);
@@ -633,7 +636,11 @@ describe("interactive native input ingress", () => {
 
 		await h.pressSubmit(ENTER);
 
-		expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", { streamingBehavior: "steer", images: [newerImage] });
+		expect(h.prompt).toHaveBeenCalledWith("newer [Image #1]", {
+			streamingBehavior: "steer",
+			images: [newerImage],
+			origin: "outside",
+		});
 	});
 
 	it.each(["/clear", "/export"])(
@@ -723,6 +730,7 @@ describe("interactive native input ingress", () => {
 			expect(focusedPrompt).toHaveBeenCalledWith("focused chat", {
 				streamingBehavior: key === ENTER ? "steer" : "followUp",
 				images: undefined,
+				origin: "outside",
 			});
 			for (const text of ["/clear", "!echo blocked", "$ print('blocked')"]) {
 				h.editor.setText(text);
@@ -749,7 +757,10 @@ describe("interactive native input ingress", () => {
 
 		clearImages = true;
 		await h.pressSubmit(FOLLOW_UP);
-		expect(h.prompt.mock.calls[1]).toEqual(["text only", { streamingBehavior: "followUp", images: [] }]);
+		expect(h.prompt.mock.calls[1]).toEqual([
+			"text only",
+			{ streamingBehavior: "followUp", images: [], origin: "outside" },
+		]);
 		expect(h.editor.getText()).toBe("text only");
 		expect(h.editor.pendingImages).toEqual([]);
 		expect(h.editor.pendingImageLinks).toEqual([]);
@@ -767,7 +778,9 @@ describe("interactive native input ingress", () => {
 		h.editor.setText("original");
 		await h.pressSubmit(ENTER);
 		expect(seen).toEqual([{ type: "input", source: "interactive", text: "original", images: undefined }]);
-		expect(h.prompt.mock.calls).toEqual([["transformed", { streamingBehavior: "steer", images: undefined }]]);
+		expect(h.prompt.mock.calls).toEqual([
+			["transformed", { streamingBehavior: "steer", images: undefined, origin: "outside" }],
+		]);
 
 		const callback = vi.fn();
 		h.ctx.onInputCallback = callback;

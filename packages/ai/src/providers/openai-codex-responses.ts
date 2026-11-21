@@ -28,6 +28,7 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
+import { modelCallHoldReason } from "../model-call-guard";
 import type {
 	Api,
 	AssistantMessage,
@@ -2384,8 +2385,12 @@ class CodexStreamProcessor {
 			return;
 		}
 		this.#steerConnection = connection;
+		// Each steer is a send into the response in flight: it reads the model-call guards again, and a held
+		// steer is handed back (no input), so the session delivers it with its next request, which they hold.
 		this.#steerPump = new CodexSteerPump(source, connection, messages =>
-			toSteerInputItems(convertMessages(this.model, { messages: [...messages] })),
+			modelCallHoldReason(this.model) === undefined
+				? toSteerInputItems(convertMessages(this.model, { messages: [...messages] }))
+				: undefined,
 		);
 		this.#steerPump.start(responseId);
 	}

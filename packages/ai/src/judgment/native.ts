@@ -556,7 +556,9 @@ export class NativeJudge implements Judge {
 				headers: response.headers,
 			});
 			const transient = response.status === 408 || response.status === 429 || response.status >= 500;
-			if (!transient || attempt + 1 >= MAX_ATTEMPTS) throw error;
+			// A cyber_policy refusal is never sent again, whatever its status (a gateway relays it as a 5xx): it
+			// ends here, and the model-call guard around `judge` records it.
+			if (!transient || AIError.isCyberPolicyRefusal(text) || attempt + 1 >= MAX_ATTEMPTS) throw error;
 			await Bun.sleep(backoffMs(attempt, response.headers));
 		}
 	}

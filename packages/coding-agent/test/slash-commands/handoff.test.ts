@@ -22,6 +22,8 @@ function acpRuntime({
 	const runtime = {
 		session: { isStreaming, isGeneratingHandoff, handoff },
 		output,
+		// An ACP client's command, as the ACP agent's runtime marks it: input from outside the session.
+		origin: "outside",
 	} as unknown as SlashCommandRuntime;
 	return { handoff, output, runtime };
 }
@@ -44,11 +46,11 @@ describe("/handoff dispatch (ACP)", () => {
 	it("passes focus instructions through, undefined when bare", async () => {
 		const h1 = acpRuntime({ handoffResult: { document: "doc" } });
 		await executeAcpBuiltinSlashCommand("/handoff focus on auth", h1.runtime);
-		expect(h1.handoff).toHaveBeenCalledWith("focus on auth");
+		expect(h1.handoff).toHaveBeenCalledWith("focus on auth", { origin: "outside" });
 
 		const h2 = acpRuntime({ handoffResult: { document: "doc" } });
 		await executeAcpBuiltinSlashCommand("/handoff", h2.runtime);
-		expect(h2.handoff).toHaveBeenCalledWith(undefined);
+		expect(h2.handoff).toHaveBeenCalledWith(undefined, { origin: "outside" });
 	});
 
 	it("leaves the RPC command queue free while handoff generation runs", async () => {
