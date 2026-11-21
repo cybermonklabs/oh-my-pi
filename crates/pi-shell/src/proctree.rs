@@ -169,14 +169,15 @@ mod platform {
 		match hooked.and_then(|()| fs::read(format!("/proc/{id}/status"))) {
 			Ok(status) => status
 				.split(|&byte| byte == b'\n')
-				.filter_map(|line| {
+				// From the end: the first `Tgid:` line found is the kernel's.
+				.rev()
+				.find_map(|line| {
 					std::str::from_utf8(line.strip_prefix(b"Tgid:")?)
 						.ok()?
 						.trim()
 						.parse()
 						.ok()
 				})
-				.last()
 				.map(Some)
 				.ok_or_else(|| io::ErrorKind::InvalidData.into()),
 			Err(error) if crate::sys::proc::out_of_reach(id, &error) => Ok(None),
