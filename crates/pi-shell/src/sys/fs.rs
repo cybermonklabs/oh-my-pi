@@ -766,18 +766,22 @@ mod fifo {
 	use bstr::BStr;
 	use pi_vfs::FifoOpen;
 
-	use super::{StdFile, custom_flags, host_path, options};
+	use super::{StdFile, create_with_mode, custom_flags, host_path, options};
 	use crate::bash::{File, FsPending, OpenFlags};
 
 	/// A FIFO open in flight.
 	struct Pending(FifoOpen<fs::File>);
 
 	/// `Some` when `path` is a FIFO opened for reading only or writing only
-	/// (`O_RDWR` never blocks on a FIFO).
+	/// (`O_RDWR` never blocks on a FIFO). `umask` is the process's
+	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
+	/// the path that creates a file (the FIFO was removed since the look)
+	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
 	pub fn pending(
 		path: &BStr,
 		flags: OpenFlags,
 		mode: u32,
+		umask: Option<u32>,
 	) -> Option<Box<dyn FsPending<Box<dyn File>>>> {
 		let write = flags.contains(OpenFlags::WRITE);
 		if flags.contains(OpenFlags::READ) == write {
@@ -788,20 +792,32 @@ mod fifo {
 		if !meta.file_type().is_fifo() {
 			return None;
 		}
-		let mut opts = options(flags, mode);
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
 		let creates = flags.contains(OpenFlags::CREATE);
 		#[cfg(test)]
 		let name = host.to_path_buf();
 		let open = FifoOpen::start(host, &meta, nofollow, creates, move |path, pinned| {
 			#[cfg(test)]
-			ROUTES.lock().push((name, pinned));
-			// A pin is checked not to be a symbolic link already, and its
-			// `/proc/self/fd/N` always is one.
-			if pinned {
-				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+			{
+				ROUTES.lock().push((name.clone(), pinned));
+				let hook = {
+					let mut hooks = BEFORE_OPEN.lock();
+					let at = hooks.iter().position(|(path, _)| *path == name);
+					at.map(|at| hooks.remove(at).1)
+				};
+				if let Some(hook) = hook {
+					hook();
+				}
 			}
-			opts.open(path)
+			if pinned {
+				// A pin is checked not to be a symbolic link already, and its
+				// `/proc/self/fd/N` always is one.
+				let mut opts = options(flags, mode);
+				opts.custom_flags(custom_flags(flags) & !libc::O_NOFOLLOW);
+				return opts.open(path);
+			}
+			// The path, opened as the plain open of it opens it.
+			create_with_mode(path, flags, mode, umask, false)
 		});
 		Some(Box::new(Pending(open)))
 	}
@@ -812,6 +828,16 @@ mod fifo {
 	#[cfg(test)]
 	static ROUTES: parking_lot::Mutex<Vec<(std::path::PathBuf, bool)>> =
 		parking_lot::Mutex::new(Vec::new());
+
+	/// A test hook and the path whose next helper runs it.
+	#[cfg(test)]
+	type BeforeOpen = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+
+	/// Test hook: run once by the helper of the next open of the path it is
+	/// keyed by, after the look at the path and just before the helper's own
+	/// open.
+	#[cfg(test)]
+	static BEFORE_OPEN: parking_lot::Mutex<Vec<BeforeOpen>> = parking_lot::Mutex::new(Vec::new());
 
 	impl FsPending<Box<dyn File>> for Pending {
 		fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Box<dyn File>>> {
@@ -894,7 +920,8 @@ mod fifo {
 			// SAFETY: `c` is a NUL-terminated string that outlives the call.
 			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
 			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
-			let start = |p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0).unwrap();
+			let start =
+				|p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0, None).unwrap();
 
 			let mut open = start(&path);
 			// Be the writer the helper waits for, once it waits.
@@ -959,7 +986,8 @@ mod fifo {
 				("< (read)", OpenFlags::READ, false),
 			];
 			for (label, flags, _) in cases {
-				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666).unwrap();
+				let mut open =
+					pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
 				if let Err(e) = result(&mut *open, || {}) {
 					panic!("{label}: {e}");
 				}
@@ -976,6 +1004,61 @@ mod fifo {
 				.map(|&(_, pinned)| pinned)
 				.collect();
 			assert_eq!(got, want, "through the pin, for {:?}", cases.map(|(label, ..)| label));
+		}
+
+		/// A `>` whose FIFO is removed between the shell's look at it and the
+		/// helper's open of the path creates a regular file there, as
+		/// `open(2)` of the path would, with exactly the mode the shell asks
+		/// (`0o666` less the shell's umask), as every other `>` gives a file it
+		/// creates: not that mode less the process's umask. In a process of
+		/// its own, whose umask (`0o077`) this test sets apart from the
+		/// shell's (`0o000`, so the mode asked is `0o666`); with the process's
+		/// mask known to the open and not.
+		#[test]
+		fn a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode() {
+			use std::os::unix::fs::PermissionsExt;
+			const NAME: &str = "sys::fs::fifo::tests::a_redirect_whose_fifo_goes_before_the_open_creates_the_file_with_the_shells_mode";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let output = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.output()
+					.unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+			// SAFETY: `umask` has no preconditions; no other test runs in this
+			// process.
+			unsafe { libc::umask(0o077) };
+			let flags = OpenFlags::WRITE
+				.with(OpenFlags::CREATE)
+				.with(OpenFlags::TRUNC);
+			let mut wrong = Vec::new();
+			for (label, umask) in [("process mask known", Some(0o077)), ("process mask unknown", None)]
+			{
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				let gone = path.clone();
+				BEFORE_OPEN
+					.lock()
+					.push((path.clone(), Box::new(move || fs::remove_file(&gone).unwrap())));
+				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, umask)
+					.unwrap_or_else(|| panic!("{label}: no FIFO open"));
+				if let Err(err) = result(&mut *open, || {}) {
+					panic!("{label}: {err}");
+				}
+				let meta = fs::symlink_metadata(&path).unwrap();
+				let made = (meta.file_type().is_file(), meta.permissions().mode() & 0o7777);
+				if made != (true, 0o666) {
+					wrong
+						.push(format!("{label}: made (regular file, mode) {made:?}, not (true, 0o666)"));
+				}
+			}
+			assert!(wrong.is_empty(), "{wrong:#?}");
 		}
 
 		/// With `fs.protected_fifos` at 1 or more, an open that may create of
@@ -1047,7 +1130,8 @@ mod fifo {
 					);
 					return;
 				}
-				let by_helper = outcome(result(&mut *pending(name, flags, 0o666).unwrap(), || {}));
+				let by_helper =
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
 				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
 					FsPoll::Ready(opened) => opened,
 					FsPoll::Pending(mut open) => result(&mut *open, || {}),
@@ -1369,7 +1453,7 @@ impl Fs for StdFs {
 			}
 		}
 		#[cfg(unix)]
-		if let Some(pending) = fifo::pending(path, flags, mode) {
+		if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
 			return FsPoll::Pending(pending);
 		}
 		FsPoll::Ready(open(path, flags, mode, self.umask))
