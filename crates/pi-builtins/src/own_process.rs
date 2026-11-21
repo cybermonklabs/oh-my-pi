@@ -17,7 +17,10 @@ const OWN_PROCESS: &str = "PI_BUILTINS_TEST_OWN_PROCESS";
 /// Whether the calling test is to run its body here: `true` in the process
 /// this started for it. Otherwise this starts that process, this test binary
 /// again for the test alone, waits for it, fails unless it ran that test and
-/// the test passed, and returns `false`.
+/// the test passed, prints what the test printed there (not libtest's own
+/// lines), and returns `false`. So a test that skipped itself in the child
+/// (`skipped: <reason>`) says so in the output of the test that called this,
+/// as it would have run in this process.
 ///
 /// The test is named by its thread: libtest runs each test on a thread named
 /// after the test's whole path (`locale::tests::name`). Call this first, on
@@ -40,11 +43,39 @@ pub(crate) fn own_process() -> bool {
 	let err = String::from_utf8_lossy(&ran.stderr);
 	assert!(ran.status.success(), "{test} failed in its own process:\n{out}{err}");
 	assert!(out.contains("1 passed"), "{test} did not run in its own process:\n{out}{err}");
+	let (printed, eprinted) = test_output(test, &out, &err);
+	for line in printed {
+		println!("{line}");
+	}
+	for line in eprinted {
+		eprintln!("{line}");
+	}
 	false
 }
 
+/// The lines `test` printed to its stdout and stderr in the process
+/// [`own_process`] started for it, without libtest's own lines. libtest
+/// writes only to stdout, and with `--nocapture` and one thread it starts a
+/// test's line (`test <name> ... `) before the test runs, so what the test
+/// prints to stdout can follow it on that line, and `ok` then ends it.
+fn test_output<'a>(test: &str, out: &'a str, err: &'a str) -> (Vec<&'a str>, Vec<&'a str>) {
+	let started = format!("test {test} ... ");
+	let printed = out
+		.lines()
+		.map(|line| line.strip_prefix(started.as_str()).unwrap_or(line))
+		.filter(|line| {
+			!(line.is_empty()
+				|| *line == "ok"
+				|| line.starts_with("running ")
+				|| line.starts_with("test result: "))
+		})
+		.collect();
+	let eprinted = err.lines().filter(|line| !line.is_empty()).collect();
+	(printed, eprinted)
+}
+
 mod tests {
-	use super::own_process;
+	use super::{own_process, test_output};
 
 	/// The test's thread names it, so `own_process` runs the body in a child
 	/// whose own thread has the same name, and nowhere else: the parent's call
@@ -69,5 +100,22 @@ mod tests {
 		let message = joined.expect_err("own_process ran off the test thread");
 		let message = message.downcast_ref::<String>().cloned().unwrap_or_default();
 		assert!(message.contains("must be called on a test's own thread"), "{message}");
+	}
+
+	/// What a test printed in its own process reaches the caller, and
+	/// libtest's lines do not: a skip line on stderr, and stdout that follows
+	/// libtest's `test <name> ... ` on its line.
+	#[test]
+	fn the_tests_own_lines_are_kept_and_libtests_left_out() {
+		let out = "\nrunning 1 test\ntest a::b ... measured 3\nok\n\ntest result: ok. 1 passed; 0 \
+		           failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.01s\n\n";
+		let err = "skipped: no user xattrs on the temporary filesystem\n";
+		assert_eq!(
+			test_output("a::b", out, err),
+			(vec!["measured 3"], vec!["skipped: no user xattrs on the temporary filesystem"])
+		);
+		let quiet = "\nrunning 1 test\ntest a::b ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 \
+		             ignored; 0 measured; 4 filtered out; finished in 0.01s\n\n";
+		assert_eq!(test_output("a::b", quiet, ""), (Vec::<&str>::new(), Vec::<&str>::new()));
 	}
 }

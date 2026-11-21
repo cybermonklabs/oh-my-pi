@@ -15,18 +15,24 @@ fn run(argv: &[&str], cwd: &Path) -> (i32, String, String) {
 	(code, cap.out(), cap.err())
 }
 
-/// The reference rsync 3.x binary, when one is installed.
+/// The reference rsync 3.x binary, when one is installed. Without one, the
+/// calling test skips: it prints `skipped: <reason>`, as every test that
+/// cannot run here does, and returns.
 fn reference() -> Option<PathBuf> {
 	let mut candidates = vec![PathBuf::from("/opt/homebrew/bin/rsync")];
 	if let Some(path) = std::env::var_os("PATH") {
 		candidates.extend(std::env::split_paths(&path).map(|d| d.join("rsync")));
 	}
-	candidates.into_iter().find(|p| {
+	let found = candidates.into_iter().find(|p| {
 		Command::new(p)
 			.arg("--version")
 			.output()
 			.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).starts_with("rsync  version 3."))
-	})
+	});
+	if found.is_none() {
+		eprintln!("skipped: no rsync 3.x on PATH");
+	}
+	found
 }
 
 /// A small tree: a file, a nested file, and (unix) a symlink.
@@ -552,20 +558,39 @@ fn local_archive_copy_then_noop_rerun() {
 	assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
 }
 
+/// The builtin itemizes a transfer as rsync 3.5.1 does, given the same
+/// destination: both are the same older tree, an `a` of the source's size
+/// and a root, whose mtimes the fixture sets to one time far from the
+/// source's. Written at the moment they are, the two destinations would get
+/// whatever mtimes the clock gave them: compared by the second (the default
+/// `--modify-window`), a host slow enough that a second ended between the
+/// two writes gave `ours/` the source's times and `theirs/` later ones, so
+/// the tools were compared on different trees; and where no second ended,
+/// neither tool had a time to itemize, nor `a` to send.
 #[test]
 fn itemize_output_matches_reference() {
 	let Some(rsync) = reference() else { return };
 	let dir = tempfile::tempdir().unwrap();
 	let src = dir.path().join("src");
 	make_tree(&src);
-	fs::create_dir_all(dir.path().join("ours")).unwrap();
-	fs::create_dir_all(dir.path().join("theirs")).unwrap();
-	fs::write(dir.path().join("ours/a"), b"old!!\n").unwrap();
-	fs::write(dir.path().join("theirs/a"), b"old!!\n").unwrap();
+	let old = fs::FileTimes::new().set_modified(
+		std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+	);
+	for side in ["ours", "theirs"] {
+		let root = dir.path().join(side);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("a"), b"old!!\n").unwrap();
+		fs::set_times_nofollow(root.join("a"), old).unwrap();
+		fs::set_times_nofollow(&root, old).unwrap();
+	}
 	let theirs = Command::new(&rsync).args(["-ai", "src/", "theirs/"]).current_dir(dir.path()).output().unwrap();
 	let (code, out, _) = run(&["-ai", "src/", "ours/"], dir.path());
 	assert_eq!(code, 0);
 	assert_eq!(out, String::from_utf8_lossy(&theirs.stdout));
+	assert!(
+		out.starts_with(".d..t...... ./\n>f..t...... a\n"),
+		"the times the fixture set are itemized: {out}"
+	);
 	let theirs = Command::new(&rsync).args(["-ai", "src/", "theirs/"]).current_dir(dir.path()).output().unwrap();
 	let (_, out, _) = run(&["-ai", "src/", "ours/"], dir.path());
 	assert_eq!(out, String::from_utf8_lossy(&theirs.stdout));

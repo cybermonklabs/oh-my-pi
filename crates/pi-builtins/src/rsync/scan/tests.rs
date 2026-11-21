@@ -647,8 +647,9 @@ fn fake_super_stat_xattr_is_folded_into_entries() {
 	let tree = Tree::open(&pi_vfs::BlockingFs::native(), &z, &TreeOpts::default()).unwrap();
 	let name = crate::rsync::xattr::rsync_internal_name(b"stat");
 	let name = std::ffi::OsStr::from_bytes(&name);
-	if tree.set_xattr(Path::new("achar"), name, b"20644 1,3 0:0", false).is_err() {
-		return; // no user xattrs on this filesystem
+	if let Err(err) = tree.set_xattr(Path::new("achar"), name, b"20644 1,3 0:0", false) {
+		eprintln!("skipped: no user xattrs on the temporary filesystem: {err}");
+		return;
 	}
 	let mut o = base_opts();
 	o.am_root = -1;
