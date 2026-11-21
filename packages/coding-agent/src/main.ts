@@ -480,10 +480,10 @@ export async function submitInteractiveInput(
 				display: input.display ?? false,
 				attribution: "agent" as const,
 			};
-			input.dispatched = await session.promptCustomMessage(message, { streamingBehavior });
+			input.dispatched = await session.promptCustomMessage(message, { streamingBehavior, origin: input.origin });
 		} else if (input.resume) {
 			// No queue intent: a continue shortcut interrupts a running turn instead.
-			await session.resume();
+			await session.resume({ origin: input.origin });
 		} else if (isKnownSkillCommand(skillHost, input.text)) {
 			// Resubmitted skill text must dispatch through the skill path, or the
 			// model receives a literal `/skill:` token.
@@ -493,6 +493,7 @@ export async function submitInteractiveInput(
 				optimistic: true,
 				propagateErrors: true,
 				followUps: input.followUps,
+				origin: input.origin,
 			});
 		} else {
 			let forwarded = false;
@@ -501,6 +502,7 @@ export async function submitInteractiveInput(
 					images: input.images,
 					streamingBehavior,
 					followUps: input.followUps,
+					origin: input.origin,
 				});
 			} catch (error: unknown) {
 				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
@@ -852,7 +854,7 @@ async function runInteractiveMode(
 			// before this dispatch runs (the composer accepts input as soon as the
 			// first turn starts): the CLI message queues into that turn instead of
 			// dying with AgentBusyError.
-			await session.prompt(initialMessage, { images: initialImages, streamingBehavior: "steer" });
+			await session.prompt(initialMessage, { images: initialImages, streamingBehavior: "steer", origin: "outside" });
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);
@@ -861,7 +863,7 @@ async function runInteractiveMode(
 
 	for (const message of initialMessages) {
 		try {
-			await session.prompt(message, { streamingBehavior: "steer" });
+			await session.prompt(message, { streamingBehavior: "steer", origin: "outside" });
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 			mode.showError(errorMessage);

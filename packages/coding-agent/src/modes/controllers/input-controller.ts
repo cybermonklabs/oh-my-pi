@@ -1142,12 +1142,12 @@ export class InputController {
 			if (text === "." || (text === "c" && !this.ctx.isGuidedGoalInterviewActive())) {
 				if (this.ctx.onInputCallback) {
 					this.ctx.editor.clearDraft();
-					this.ctx.onInputCallback({ text, cancelled: false, started: true, resume: true });
+					this.ctx.onInputCallback({ text, cancelled: false, started: true, resume: true, origin: "outside" });
 				} else if (this.ctx.session.isStreaming) {
 					// The input loop is parked on the running turn's prompt; resume here.
 					this.ctx.editor.clearDraft();
 					try {
-						await this.ctx.session.resume();
+						await this.ctx.session.resume({ origin: "outside" });
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					}
@@ -1372,7 +1372,7 @@ export class InputController {
 			if (this.#isLocalExtensionCommand(text)) {
 				this.ctx.editor.clearDraft(text);
 				try {
-					await this.ctx.session.prompt(text, { images: inputImages });
+					await this.ctx.session.prompt(text, { images: inputImages, origin: "outside" });
 				} catch (error) {
 					// Restore the snapshot only when nothing newer was attached
 					// while the command ran; otherwise the newer draft wins.
@@ -1406,7 +1406,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, origin: "outside" }),
 						{ imageCount: images?.length ?? 0 },
 					);
 					// An inline `/loop` body arms the loop only after dispatch
@@ -1464,6 +1464,7 @@ export class InputController {
 						images,
 						imageLinks: inputImageLinks,
 						streamingBehavior: "steer",
+						origin: "outside",
 					},
 					{ clearEditor: false },
 				);
@@ -1483,7 +1484,7 @@ export class InputController {
 				try {
 					const forwarded = await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images, origin: "outside" }),
 						{
 							imageCount: images?.length ?? 0,
 						},
@@ -1699,9 +1700,13 @@ export class InputController {
 			if (isContinueShortcut) {
 				await target.resume();
 			} else {
-				await this.ctx.withLocalSubmission(text, () => target.prompt(text, { streamingBehavior, images }), {
-					imageCount: images?.length ?? 0,
-				});
+				// A person's input to the focused subagent: a subagent's closure is its root's, so this
+				// ends nothing, but the input did cross the boundary.
+				await this.ctx.withLocalSubmission(
+					text,
+					() => target.prompt(text, { streamingBehavior, images, origin: "outside" }),
+					{ imageCount: images?.length ?? 0 },
+				);
 			}
 		} catch (error) {
 			// Hand the message back, mirroring the main submit error path: restore
@@ -1935,6 +1940,7 @@ export class InputController {
 				imageLinks: draftImageLinks,
 				optimistic: true,
 				propagateErrors: true,
+				origin: "outside",
 			});
 			if (!dispatched) restoreDraft();
 			return dispatched;
@@ -2052,13 +2058,20 @@ export class InputController {
 							imageLinks,
 							streamingBehavior: "followUp",
 							followUps,
+							origin: "outside",
 						}),
 					);
 				} else {
 					try {
 						await this.ctx.withLocalSubmission(
 							first,
-							() => this.ctx.session.prompt(first, { images, streamingBehavior: "followUp", followUps }),
+							() =>
+								this.ctx.session.prompt(first, {
+									images,
+									streamingBehavior: "followUp",
+									followUps,
+									origin: "outside",
+								}),
 							{ imageCount: images?.length ?? 0 },
 						);
 					} catch (error) {
@@ -2075,9 +2088,11 @@ export class InputController {
 			while (queuedCount < messages.length) {
 				const message = messages[queuedCount] ?? "";
 				const queuedImages = queuedCount === 0 ? images : undefined;
-				await this.ctx.withLocalSubmission(message, () => this.ctx.session.followUp(message, queuedImages), {
-					imageCount: queuedImages?.length ?? 0,
-				});
+				await this.ctx.withLocalSubmission(
+					message,
+					() => this.ctx.session.followUp(message, queuedImages, { origin: "outside" }),
+					{ imageCount: queuedImages?.length ?? 0 },
+				);
 				queuedCount++;
 			}
 		} catch (error) {
@@ -2255,7 +2270,11 @@ export class InputController {
 				await this.ctx.withLocalSubmission(
 					text,
 					() => {
-						const pending = this.ctx.session.prompt(text, { streamingBehavior: "followUp", images });
+						const pending = this.ctx.session.prompt(text, {
+							streamingBehavior: "followUp",
+							images,
+							origin: "outside",
+						});
 						admitted();
 						return pending;
 					},
@@ -2275,7 +2294,7 @@ export class InputController {
 			await this.ctx.withLocalSubmission(
 				text,
 				() => {
-					const pending = this.ctx.session.prompt(text, { images });
+					const pending = this.ctx.session.prompt(text, { images, origin: "outside" });
 					admitted();
 					return pending;
 				},

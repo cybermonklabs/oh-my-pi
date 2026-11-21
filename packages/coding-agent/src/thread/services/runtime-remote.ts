@@ -1,7 +1,7 @@
 /**
  * Wire protocols and worker-side implementations of the per-root runtime
- * objects a subagent run receives by reference: the tree's {@link CostGate},
- * {@link EventBus}es, {@link ArtifactManager}, and main's {@link AgentStorage}.
+ * objects a subagent run receives by reference: the tree's {@link CostGate} and
+ * cyber-policy closure, {@link EventBus}es, {@link ArtifactManager}, and main's {@link AgentStorage}.
  * The main-side halves live in `./runtime`.
  */
 import type { AssistantMessageEventStream, ServiceTier, StoredAuthCredential } from "@oh-my-pi/pi-ai";
@@ -9,6 +9,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { type ArtifactManagerApi, writeArtifact } from "../../session/artifacts";
 import type { AgentStorageApi, ModelPerfSample, ModelPerfStats } from "../../session/agent-storage";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../../session/cost-gate";
+import { type CyberPolicyClosureApi, closedByCyberPolicy } from "../../session/cyber-policy-closure";
 import { EventBus } from "../../utils/event-bus";
 import type { RemoteObject, RpcMethod } from "../rpc";
 import { localUnsubscribe, type WireCallback, type WireUnsubscribe } from "./support";
@@ -21,6 +22,8 @@ export const EVENT_BUS_KIND = "event-bus";
 export const ARTIFACT_MANAGER_KIND = "artifact-manager";
 /** Remote-object kind of an open agent.db handle. */
 export const AGENT_STORAGE_KIND = "agent-storage";
+/** Remote-object kind of a session tree's cyber-policy closure. */
+export const CYBER_POLICY_CLOSURE_KIND = "cyber-policy-closure";
 
 /** Protocol of kind {@link COST_GATE_KIND}. */
 export type CostGateProtocol = {
@@ -33,6 +36,17 @@ export type CostGateProtocol = {
 	 * returns `false` (its worker gate was collected) or the worker exits.
 	 */
 	watchCap: RpcMethod<[listener: (capped: boolean) => boolean | Promise<boolean>], boolean>;
+};
+
+/** Protocol of kind {@link CYBER_POLICY_CLOSURE_KIND}. */
+export type CyberPolicyClosureProtocol = {
+	record: RpcMethod<[], void>;
+	/**
+	 * Subscribe `listener` to changes of whether the closure holds; returns whether it holds now.
+	 * Main drops the subscription once the listener returns `false` (its worker closure was
+	 * collected) or the worker exits.
+	 */
+	watch: RpcMethod<[listener: (active: boolean) => boolean | Promise<boolean>], boolean>;
 };
 
 /** Protocol of kind {@link EVENT_BUS_KIND}. */
@@ -142,6 +156,69 @@ export class RemoteCostGate implements CostGateApi {
 			() => {},
 		);
 		return stream;
+	}
+}
+
+/**
+ * Worker-side {@link CyberPolicyClosureApi}: whether the closure holds lives on main's closure and
+ * is mirrored here by one watch, made on first use, so checking a model call costs no blocking call.
+ * A refusal recorded here holds the mirror at once and tells main, which tells every other holder.
+ */
+export class RemoteCyberPolicyClosure implements CyberPolicyClosureApi {
+	readonly #remote: RemoteObject<CyberPolicyClosureProtocol>;
+	/** Main's {@link CyberPolicyClosureApi.active}, kept current by the watch; `undefined` before it. */
+	#active: boolean | undefined;
+	readonly #listeners = new Set<() => void>();
+
+	constructor(remote: RemoteObject<CyberPolicyClosureProtocol>) {
+		this.#remote = remote;
+	}
+
+	get active(): boolean {
+		return this.#active ?? this.#watch();
+	}
+
+	#watch(): boolean {
+		// Weak: main holds the listener until the worker exits; a collected closure ends the watch.
+		const closure = new WeakRef(this);
+		this.#active = this.#remote.callSync("watch", active => {
+			const target = closure.deref();
+			if (!target) return false;
+			target.#adopt(active);
+			return true;
+		});
+		return this.#active;
+	}
+
+	#adopt(active: boolean): void {
+		if (this.#active === active) return;
+		this.#active = active;
+		for (const listener of Array.from(this.#listeners)) {
+			try {
+				listener();
+			} catch (error) {
+				logger.warn("Cyber-policy closure listener failed", { error: String(error) });
+			}
+		}
+	}
+
+	isClosed(model: Parameters<CyberPolicyClosureApi["isClosed"]>[0]): boolean {
+		return this.active && model !== undefined && closedByCyberPolicy(model);
+	}
+
+	record(): void {
+		if (this.#active === undefined) this.#watch();
+		this.#remote.notify("record");
+		this.#adopt(true);
+	}
+
+	/** Listeners run after {@link active} has adopted the change. */
+	onChange(onChange: () => void): () => void {
+		if (this.#active === undefined) this.#watch();
+		this.#listeners.add(onChange);
+		return () => {
+			this.#listeners.delete(onChange);
+		};
 	}
 }
 

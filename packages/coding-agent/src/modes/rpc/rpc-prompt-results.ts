@@ -223,6 +223,12 @@ function promptError(message: AssistantMessage): RpcPromptError {
 		model: message.model,
 		retryable: AIError.is(errorId, AIError.Flag.Transient),
 	};
+	// A cyber-policy refusal (a gateway's 5xx or transient wording included) or a request held for one:
+	// resubmitting the same content is refused again and adds to the organization's record.
+	if (AIError.isCyberPolicyRefusal(message)) {
+		error.retryable = false;
+		error.code = "cyber_policy";
+	}
 	if (message.errorStatus !== undefined) error.httpStatus = message.errorStatus;
 	return error;
 }

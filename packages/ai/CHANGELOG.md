@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `addModelCallGuard({ refuse, settled }, scope?)` registers a check on model calls, and `runInModelCallScope(scope, fn)` runs `fn` in a scope; a guard with a scope sees only its own scope's calls and the calls made outside every scope: `stream`, `streamSimple` (and so `complete` and `completeSimple`), `generateImage`, `synthesizeSpeech` and native judgments of a catalog model consult every guard before the request is built, return a held call as an error (or reject with `ModelCallRefusedError`) without sending anything, and report how each call they let through ended
+
+### Fixed
+
+- An OpenAI `cyber_policy` refusal is no longer sent again: it judges the request's content, and each copy adds a refusal to the organization's record. It is classified as blocked content instead of an account policy, so the auth retry no longer rotates it through sibling credentials (also on a 403), the credential rotation neither blocks nor switches for it, and a provider retry header cannot replay it. No transport resends it: the OpenAI and Codex HTTP retries (also when a gateway relays it as a 5xx), Codex stream recovery (WebSocket-to-SSE replay, provider-error retry, access-program replay) and the compressed-upload fallback (which resent a Codex 400 uncompressed). A provider error that carries the `cyber_policy` code keeps it in the error message
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

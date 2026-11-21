@@ -388,6 +388,8 @@ export class RateLimits implements LimitsApi {
 	 *   temporarily block only that requested model, then rotate.
 	 * - other account-scoped policy denial → temporarily block that account
 	 *   without marking its credential suspect, then rotate through siblings.
+	 * - `cyber_policy` refusal → no block and no switch: it judges the request's
+	 *   content, which a sibling would receive too.
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
@@ -405,6 +407,7 @@ export class RateLimits implements LimitsApi {
 	): Promise<CredentialRotation> {
 		await this.#deps.pool.adoptExternalChanges();
 		const error = options?.error;
+		if (AIError.isCyberPolicyRefusal(error)) return { switched: false };
 		const status = AIError.status(error);
 		const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
 		const exactCursorModelPolicy = AIError.isCursorPlanAccountPolicyError(error, provider);
