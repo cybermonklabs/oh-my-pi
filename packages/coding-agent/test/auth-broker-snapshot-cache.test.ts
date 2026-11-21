@@ -279,21 +279,20 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 	});
 
 	test("fails startup once the broker stays unreachable for the whole retry budget", async () => {
-		// The broker accepts connections and never answers.
-		const reached = Promise.withResolvers<void>();
+		// The broker accepts connections and never answers. Each startup fetch makes two attempts,
+		// each cut by the client's 10 s request timeout, so startup retries once within its 30 s
+		// budget, whose deadline then cancels the third request in flight. Fake time moves only
+		// once the broker has seen the request the step waits for, never by event-loop turns.
 		const hang = Promise.withResolvers<Response>();
+		const requests = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+		let seen = 0;
 		const server = Bun.serve({
 			port: 0,
 			fetch: () => {
-				reached.resolve();
+				requests[seen++]?.resolve();
 				return hang.promise;
 			},
 		});
-		const turn = () => {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			setImmediate(resolve);
-			return promise;
-		};
 		vi.useFakeTimers();
 		try {
 			process.env.OMP_AUTH_BROKER_URL = server.url.toString();
@@ -301,22 +300,34 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS = "0";
 			let settled = false;
 			const retries: AuthBrokerStartupRetry[] = [];
-			const discovered = discoverAuthStorage(tempDir, { onBrokerRetry: retry => retries.push(retry) });
+			const retried = Promise.withResolvers<void>();
+			const discovered = discoverAuthStorage(tempDir, {
+				onBrokerRetry: retry => {
+					retries.push(retry);
+					retried.resolve();
+				},
+			});
 			const outcome = rejectionOf(discovered).finally(() => {
 				settled = true;
 			});
-			await reached.promise;
+			await requests[0].promise;
+			// At 10 s the request timeout cuts the first attempt, and the client makes its second.
+			vi.advanceTimersByTime(10_000);
+			await requests[1].promise;
+			// At 20 s it cuts that one too: startup reports one retry and waits 500 ms.
+			vi.advanceTimersByTime(10_000);
+			await retried.promise;
+			expect(retries).toMatchObject([{ delayMs: 500, budgetMs: 30_000 }]);
+			vi.advanceTimersByTime(500);
+			await requests[2].promise;
 			// Short of 30 s of fake time, startup is still waiting on the broker.
-			for (let second = 1; second < 30; second++) {
-				vi.advanceTimersByTime(1_000);
-				await turn();
-			}
 			expect(settled).toBe(false);
 			// At 30 s the deadline cancels the request in flight.
-			vi.advanceTimersByTime(1_000);
+			vi.advanceTimersByTime(9_500);
 			expect(await outcome).toBeInstanceOf(AuthBrokerError);
 			// Giving up is not reported as one more retry.
-			expect(retries).toEqual([]);
+			expect(retries).toHaveLength(1);
+			expect(seen).toBe(3);
 		} finally {
 			vi.useRealTimers();
 			hang.resolve(new Response(null, { status: 503 }));
