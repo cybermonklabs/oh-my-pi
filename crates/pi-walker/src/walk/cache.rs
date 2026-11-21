@@ -11,7 +11,8 @@
 //! are listed again.
 //!
 //! Only filesystems whose sessions report [`crate::fs::Session::stable_stamps`]
-//! take part; providers, network, FUSE, and overlay mounts are always listed.
+//! take part; providers, network, FUSE, and overlay mounts are always listed,
+//! and so are gVisor's 9p mounts of host volumes.
 //! Only [`crate::Detail::Minimal`] walks use the cache: file sizes and mtimes
 //! change without touching their directory's stamp. The cache holds at most
 //! about 64 MiB of listings, dropping whole shards when full. It needs no
