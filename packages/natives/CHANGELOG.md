@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed bash tool calls that show the live shell view hanging when a built-in utility (`cat`, `head`, `sort`, …) and a shell builtin such as `printf` waited for room in the call's output at the same time: only the one that waited last was woken, so the utility never finished and `wait` never returned. A utility still waiting on a finished call's output is now woken when that output closes, so a later `wait` returns.
+- Fixed bash tool calls that show the live shell view hanging when a built-in utility (`cat`, `head`, `sort`, …) and a shell builtin such as `printf` waited for room in the call's output at the same time: only the one that waited last was woken, so the utility never finished and `wait` never returned. The same hang came with or without the live view when the utility wrote through a zsh multios redirection (`>&1 >file`). A utility still waiting on a finished call's output is now woken when that output closes, so a later `wait` returns. Reading `$PENDING` or printing a job notice no longer keeps the line editor from waking when keys arrive or the terminal has room.
 
 ## [18.18.6] - 2026-11-09
 

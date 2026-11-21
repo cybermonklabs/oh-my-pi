@@ -10,11 +10,16 @@
 //! readiness watch) wakes every task waiting in it.
 
 use std::{
+	collections::HashMap,
 	sync::Arc,
 	task::{Wake, Waker},
 };
 
 use parking_lot::Mutex;
+
+/// The room a set keeps for slots however few keys hold one, until the last
+/// key goes ([`WaitKey`]'s drop); below twice it, it gives none back.
+const MIN_ROOM: usize = 16;
 
 /// The wakers of the tasks waiting on one thing, one slot per [`WaitKey`].
 #[derive(Default)]
@@ -22,18 +27,15 @@ pub struct Wakers(Mutex<Set>);
 
 #[derive(Default)]
 struct Set {
-	slots:   Vec<Slot>,
-	/// Free slots, reused before the vector grows.
-	free:    Vec<usize>,
+	/// The slots of the keys that hold one, by the key's id.
+	slots:   HashMap<u64, Slot>,
+	/// The id of the next key to take a slot.
+	next:    u64,
 	/// How many slots hold a waker.
 	waiting: usize,
 }
 
-#[derive(Default)]
 enum Slot {
-	/// No key holds it.
-	#[default]
-	Free,
 	/// Its key's task waits.
 	Waiting(Waker),
 	/// Its key's task was woken and has not waited since.
@@ -44,7 +46,65 @@ enum Slot {
 /// its slot there, freed when the key is dropped. The waiting future holds
 /// it, so a task dropped while it waits leaves nothing behind.
 #[derive(Default)]
-pub struct WaitKey(Option<(Arc<Wakers>, usize)>);
+pub struct WaitKey {
+	/// The set this key waits in, and the id of its slot there.
+	slot: Option<(Arc<Wakers>, u64)>,
+	/// Keys of its own for things the task waits on at once ([`Self::sub`]).
+	subs: Vec<Self>,
+}
+
+impl WaitKey {
+	/// The key of the `i`th of several things this key's task waits on at
+	/// once, through one object (a zsh multios tee waits on each of its
+	/// targets). A key waits in one set at a time, so each thing needs a key
+	/// of its own. It belongs to this key and is dropped with it.
+	pub fn sub(&mut self, i: usize) -> &mut Self {
+		if self.subs.len() <= i {
+			self.subs.resize_with(i + 1, Self::default);
+		}
+		&mut self.subs[i]
+	}
+
+	/// The id of this key's slot in `set`, once it has waited there. It stays
+	/// the key's until the key is dropped or waits in another set, and no
+	/// other key of `set` ever has it: a thing waited on can tell its tasks
+	/// apart by it (a provider file keeps a write's result for the task that
+	/// started it).
+	pub fn id_in(&self, set: &Arc<Wakers>) -> Option<u64> {
+		self
+			.slot
+			.as_ref()
+			.filter(|(wakers, _)| Arc::ptr_eq(wakers, set))
+			.map(|(_, id)| *id)
+	}
+
+	/// Leave the set this key waits in: free its slot, and drop its waker,
+	/// if the task still waited, outside the lock. Its sub keys stay.
+	fn leave(&mut self) {
+		let Some((wakers, id)) = self.slot.take() else {
+			return;
+		};
+		let freed = {
+			let mut set = wakers.0.lock();
+			let freed = set.slots.remove(&id);
+			if matches!(freed, Some(Slot::Waiting(_))) {
+				set.waiting -= 1;
+			}
+			if set.slots.is_empty() {
+				// The last key is gone: give the memory back.
+				set.slots = HashMap::new();
+			} else if set.slots.capacity() > 2 * MIN_ROOM && set.slots.len() * 4 < set.slots.capacity()
+			{
+				// Room for about as many slots as keys hold, not for as many as
+				// the set ever held.
+				let room = (set.slots.len() * 2).max(MIN_ROOM);
+				set.slots.shrink_to(room);
+			}
+			freed
+		};
+		drop(freed);
+	}
+}
 
 impl Wakers {
 	/// `key`'s task waits here with `waker`, which replaces the one it waited
@@ -53,32 +113,30 @@ impl Wakers {
 	/// them, and the caller registers the one wait that does.
 	pub fn wait(self: &Arc<Self>, key: &mut WaitKey, waker: &Waker) -> bool {
 		if key
-			.0
+			.slot
 			.as_ref()
 			.is_some_and(|(set, _)| !Arc::ptr_eq(set, self))
 		{
-			*key = WaitKey::default();
+			key.leave();
 		}
 		let (first, replaced) = {
 			let mut set = self.0.lock();
-			let at = if let Some((_, at)) = &key.0 {
-				*at
+			let id = if let Some((_, id)) = &key.slot {
+				*id
 			} else {
-				let at = set.free.pop().unwrap_or_else(|| {
-					set.slots.push(Slot::Free);
-					set.slots.len() - 1
-				});
-				key.0 = Some((Arc::clone(self), at));
-				at
+				let id = set.next;
+				set.next += 1;
+				key.slot = Some((Arc::clone(self), id));
+				id
 			};
-			if let Slot::Waiting(old) = &set.slots[at]
+			if let Some(Slot::Waiting(old)) = set.slots.get(&id)
 				&& old.will_wake(waker)
 			{
 				return false;
 			}
 			let first = set.waiting == 0;
-			let replaced = std::mem::replace(&mut set.slots[at], Slot::Waiting(waker.clone()));
-			if matches!(replaced, Slot::Waiting(_)) {
+			let replaced = set.slots.insert(id, Slot::Waiting(waker.clone()));
+			if matches!(replaced, Some(Slot::Waiting(_))) {
 				(false, replaced)
 			} else {
 				set.waiting += 1;
@@ -96,7 +154,7 @@ impl Wakers {
 		let mut set = self.0.lock();
 		let mut wakers = Vec::with_capacity(set.waiting);
 		set.waiting = 0;
-		for slot in &mut set.slots {
+		for slot in set.slots.values_mut() {
 			if matches!(slot, Slot::Waiting(_))
 				&& let Slot::Waiting(waker) = std::mem::replace(slot, Slot::Woken)
 			{
@@ -104,6 +162,12 @@ impl Wakers {
 			}
 		}
 		wakers
+	}
+
+	/// Whether the key whose slot is `id` still holds it: neither dropped nor
+	/// gone to wait in another set.
+	pub fn holds(&self, id: u64) -> bool {
+		self.0.lock().slots.contains_key(&id)
 	}
 }
 
@@ -120,28 +184,9 @@ impl Wake for Wakers {
 }
 
 impl Drop for WaitKey {
-	/// Free the slot; its waker, if the task still waited, is dropped outside
-	/// the lock.
+	/// Free the slot (its sub keys free theirs as they drop).
 	fn drop(&mut self) {
-		let Some((wakers, at)) = self.0.take() else {
-			return;
-		};
-		let freed = {
-			let mut set = wakers.0.lock();
-			let freed = std::mem::take(&mut set.slots[at]);
-			if matches!(freed, Slot::Waiting(_)) {
-				set.waiting -= 1;
-			}
-			if set.free.len() + 1 == set.slots.len() {
-				// The last key is gone: give the memory back.
-				set.slots = Vec::new();
-				set.free = Vec::new();
-			} else {
-				set.free.push(at);
-			}
-			freed
-		};
-		drop(freed);
+		self.leave();
 	}
 }
 
@@ -151,15 +196,19 @@ impl Wakers {
 	pub(crate) fn held(&self) -> usize {
 		let set = self.0.lock();
 		set.slots
-			.iter()
+			.values()
 			.filter(|s| matches!(s, Slot::Waiting(_)))
 			.count()
 	}
 
 	/// Test only: slots taken by keys.
 	pub(crate) fn keys(&self) -> usize {
-		let set = self.0.lock();
-		set.slots.len() - set.free.len()
+		self.0.lock().slots.len()
+	}
+
+	/// Test only: how many slots the set has room for without growing.
+	fn room(&self) -> usize {
+		self.0.lock().slots.capacity()
 	}
 }
 
@@ -315,6 +364,30 @@ mod tests {
 		assert_eq!(Arc::strong_count(&task), 1, "the set keeps no clone of the waker");
 	}
 
+	// Failure mode (review of #111 at 3b9fe7ab): a set kept room for as many
+	// slots as the most keys it held at once until its last key went: 10,000
+	// slots for one waiting key. It gives the room back as keys go, wherever
+	// the keys that stay took their slots.
+	#[test]
+	fn a_set_gives_back_room_as_its_keys_go() {
+		let wakers = Arc::new(Wakers::default());
+		let mut tasks = live(10_000);
+		for t in &mut tasks {
+			wakers.wait(&mut t.key, &t.waker);
+		}
+		assert!(wakers.room() >= 10_000);
+		let stays = tasks.swap_remove(5_000);
+		for i in shuffled(tasks.len(), 0x6a09_e667_f3bc_c908) {
+			tasks[i].key = WaitKey::default();
+		}
+		assert_eq!((wakers.held(), wakers.keys()), (1, 1));
+		assert!(wakers.room() <= 4 * MIN_ROOM, "room for {} slots kept for one key", wakers.room());
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert_eq!(stays.task.wakes(), 1, "the key that stays still waits");
+		drop(stays);
+		assert_eq!(wakers.room(), 0, "the last key gives all the room back");
+	}
+
 	// Failure mode: a task that polls again takes a second slot, and the
 	// set grows with every poll of a live task.
 	#[test]
@@ -357,5 +430,62 @@ mod tests {
 		one.wait(&mut key, &waker);
 		assert!(two.wait(&mut key, &waker));
 		assert_eq!((one.keys(), two.keys()), (0, 1));
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): a task that waits on two
+	// things at once through one object (a zsh multios tee's targets) with
+	// one key waited only on the last, so the first one's readiness never
+	// woke it. Each sub key waits in its own set, and they go with their key.
+	#[test]
+	fn sub_keys_wait_in_sets_of_their_own() {
+		let (one, two) = (Arc::new(Wakers::default()), Arc::new(Wakers::default()));
+		let task = Arc::new(Task::default());
+		let waker = Waker::from(Arc::clone(&task));
+		let mut key = WaitKey::default();
+		one.wait(key.sub(0), &waker);
+		two.wait(key.sub(1), &waker);
+		assert_eq!((one.held(), two.held()), (1, 1));
+		// The key itself waits elsewhere, and moves on: its sub keys stay.
+		let (three, four) = (Arc::new(Wakers::default()), Arc::new(Wakers::default()));
+		three.wait(&mut key, &waker);
+		four.wait(&mut key, &waker);
+		assert_eq!((one.keys(), two.keys(), three.keys(), four.keys()), (1, 1, 0, 1));
+		Waker::from(Arc::clone(&one)).wake();
+		assert_eq!(task.wakes(), 1, "the first thing's readiness wakes the task");
+		Waker::from(Arc::clone(&two)).wake();
+		assert_eq!(task.wakes(), 2, "the second thing's readiness wakes it too");
+		one.wait(key.sub(0), &waker);
+		drop(key);
+		assert_eq!((one.keys(), two.keys(), four.keys()), (0, 0, 0), "sub keys go with their key");
+	}
+
+	// Failure mode: a thing that keeps a result for the task that asked for
+	// it (a provider file's write) gave it to another task, because two keys
+	// shared an id or a key's id changed while it lived, or kept it for good
+	// after the task's key was gone.
+	#[test]
+	fn a_key_keeps_its_id_and_no_other_key_gets_it() {
+		let (set, other) = (Arc::new(Wakers::default()), Arc::new(Wakers::default()));
+		let waker = Waker::from(Arc::new(Task::default()));
+		let (mut a, mut b) = (WaitKey::default(), WaitKey::default());
+		assert_eq!(a.id_in(&set), None, "no id before it waits");
+		set.wait(&mut a, &waker);
+		let id = a.id_in(&set).unwrap();
+		Waker::from(Arc::clone(&set)).wake();
+		set.wait(&mut a, &waker);
+		assert_eq!(a.id_in(&set), Some(id), "the same id after a wake and a new wait");
+		set.wait(&mut b, &waker);
+		assert_ne!(b.id_in(&set), Some(id));
+		assert!(set.holds(id));
+		drop(a);
+		assert!(!set.holds(id), "a dropped key holds nothing");
+		// The set empties, gives its room back, and gives out ids again.
+		drop(b);
+		let mut c = WaitKey::default();
+		set.wait(&mut c, &waker);
+		assert_ne!(c.id_in(&set), Some(id), "an id is never given again");
+		other.wait(&mut c, &waker);
+		assert_eq!(c.id_in(&set), None, "a key that waits elsewhere has no id here");
+		assert_eq!(set.keys(), 0);
 	}
 }

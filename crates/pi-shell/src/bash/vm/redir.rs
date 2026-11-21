@@ -1218,23 +1218,30 @@ fn zsh_close(
 /// zsh's multio tee (`closemn` for output): every write goes to each
 /// target in turn; a target that is gone (closed, failed) is skipped. A
 /// write that cannot finish keeps how far each target got, for the
-/// caller's retry of the same bytes.
+/// caller's retry of the same bytes. A task writing with a key of its own
+/// (a native extra) waits on each target with a sub key of it: a key waits
+/// on one thing at a time.
 struct Tee {
 	targets: Vec<FdRef>,
 	done:    Vec<usize>,
 }
 
-impl File for Tee {
-	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
-		Poll::Ready(Ok(0))
-	}
-
-	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+impl Tee {
+	fn write(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		mut key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<std::io::Result<usize>> {
 		self.done.resize(self.targets.len(), 0);
 		let mut pending = false;
-		for (t, done) in self.targets.iter().zip(&mut self.done) {
+		for (i, (t, done)) in self.targets.iter().zip(&mut self.done).enumerate() {
 			while *done < buf.len() {
-				match t.poll_write(cx, &buf[*done..]) {
+				let polled = match key.as_deref_mut() {
+					Some(key) => t.poll_write_keyed(cx, &buf[*done..], key.sub(i)),
+					None => t.poll_write(cx, &buf[*done..]),
+				};
+				match polled {
 					Poll::Ready(Ok(n)) if n > 0 => *done += n,
 					Poll::Ready(_) => *done = buf.len(),
 					Poll::Pending => {
@@ -1249,6 +1256,26 @@ impl File for Tee {
 		}
 		self.done.fill(0);
 		Poll::Ready(Ok(buf.len()))
+	}
+}
+
+impl File for Tee {
+	fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+		Poll::Ready(Ok(0))
+	}
+
+	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+		self.write(cx, buf, None)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		_tag: Option<crate::bash::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<std::io::Result<usize>> {
+		self.write(cx, bytes, Some(key))
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -1278,21 +1305,46 @@ impl File for Tee {
 }
 
 /// zsh's multio cat (`closemn` for input): reads each source to its end in
-/// turn.
+/// turn. It waits on one source at a time, so a task reading with a key of
+/// its own waits with that key.
 struct Cat {
 	sources: Vec<FdRef>,
 	at:      usize,
 }
 
-impl File for Cat {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+impl Cat {
+	fn read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		mut key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<std::io::Result<usize>> {
 		while let Some(src) = self.sources.get(self.at) {
-			match src.poll_read(cx, buf) {
+			let polled = match key.as_deref_mut() {
+				Some(key) => src.poll_read_keyed(cx, buf, key),
+				None => src.poll_read(cx, buf),
+			};
+			match polled {
 				Poll::Ready(Ok(0)) => self.at += 1,
 				other => return other,
 			}
 		}
 		Poll::Ready(Ok(0))
+	}
+}
+
+impl File for Cat {
+	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+		self.read(cx, buf, None)
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<std::io::Result<usize>> {
+		self.read(cx, buf, Some(key))
 	}
 
 	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
@@ -1387,5 +1439,93 @@ fn open_into(
 			k.diag(cx, vp, line, d);
 			Err(Halt::Failed)
 		},
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::{io::Write, os::fd::OwnedFd, task::Waker};
+
+	use super::*;
+	use crate::sys::{
+		StdFile, WaitKey,
+		test_fifos::{Flag, FullFifo, drain},
+	};
+
+	fn fd(file: StdFile) -> FdRef {
+		FdRef::from_file(Box::new(file))
+	}
+
+	fn cx(flag: &Arc<Flag>) -> Waker {
+		Waker::from(Arc::clone(flag))
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): a native extra writing
+	// through a zsh multios tee (`head … >&1 >/dev/null &`) waited on the
+	// run's stdout with the engine's own wait, which the engine's next write
+	// replaced: the extra was never woken. With one key for all targets it
+	// would wait only on the last one it found full.
+	#[test]
+	fn a_tee_waits_on_each_target_with_the_callers_key() {
+		let FullFifo { writer: a, reader: mut drain_a } = FullFifo::new();
+		let FullFifo { writer: b, reader: mut drain_b } = FullFifo::new();
+		let (a, b) = (fd(a), fd(b));
+		let mut tee = Tee { targets: vec![a.clone(), b], done: vec![0; 2] };
+		let (extra, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let mut key = WaitKey::default();
+		let (xw, ew) = (cx(&extra), cx(&engine));
+		assert!(
+			tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key)
+				.is_pending(),
+			"both targets are full"
+		);
+		// The engine writes the first target too, as its owner.
+		assert!(
+			a.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut drain_a);
+		extra.wait("the extra, waiting on the tee's first target, woken by its drain");
+		engine.wait("the engine, waiting on the same target, woken by the same drain");
+		// The first target takes the bytes now; the wait on the second stands.
+		assert!(
+			tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key)
+				.is_pending(),
+			"the second target is full"
+		);
+		drain(&mut drain_b);
+		extra.wait("the extra, waiting on the tee's second target, woken by its drain");
+		assert!(matches!(
+			tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key),
+			Poll::Ready(Ok(1))
+		));
+	}
+
+	// Failure mode: a native extra reading through a zsh multios cat waited
+	// on its source with the engine's own wait, which the engine's next read
+	// replaced.
+	#[test]
+	fn a_cat_waits_on_its_source_with_the_callers_key() {
+		let (r, mut w) = std::io::pipe().unwrap();
+		let src = fd(StdFile::new(std::fs::File::from(OwnedFd::from(r))));
+		let mut cat = Cat { sources: vec![src.clone()], at: 0 };
+		let (extra, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let mut key = WaitKey::default();
+		let (xw, ew) = (cx(&extra), cx(&engine));
+		let mut buf = [0u8; 8];
+		assert!(
+			cat.poll_read_keyed(&mut Context::from_waker(&xw), &mut buf, &mut key)
+				.is_pending(),
+			"no input"
+		);
+		assert!(
+			src.poll_read(&mut Context::from_waker(&ew), &mut buf)
+				.is_pending(),
+			"no input"
+		);
+		w.write_all(b"x").unwrap();
+		extra.wait("the extra, reading through the cat, woken by the input");
+		engine.wait("the engine, reading the same source, woken by the same input");
 	}
 }

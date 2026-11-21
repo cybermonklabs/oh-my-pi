@@ -1509,7 +1509,7 @@ fn lock_file(path: &BStr) -> io::Result<Box<dyn File>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	fn ready<T>(p: FsPoll<T>) -> io::Result<T> {
@@ -1531,7 +1531,7 @@ mod tests {
 	}
 
 	#[cfg(unix)]
-	mod fifos {
+	pub(crate) mod fifos {
 		use std::{
 			io::{Read, Write},
 			os::unix::fs::OpenOptionsExt,
@@ -1633,9 +1633,14 @@ mod tests {
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
 			let path = fifo();
 			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
-			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			// The write open completes at once when the reader's open has
+			// already started (its helper counts as a reader), else later.
+			let w = StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0);
 			let mut reader = finish(&mut r);
-			let mut writer = finish(&mut w);
+			let mut writer = match w {
+				FsPoll::Ready(file) => file.unwrap(),
+				FsPoll::Pending(mut w) => finish(&mut w),
+			};
 			assert_eq!(reader.kind(), FileKind::Pipe);
 			let flag = Arc::new(Flag::default());
 			let waker = Waker::from(Arc::clone(&flag));
@@ -1672,10 +1677,22 @@ mod tests {
 			}
 			flag.wait("writer woken once space freed up");
 			drop(writer);
-			assert!(
-				matches!(reader.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))),
-				"end of file after the writer closed"
-			);
+			// End of file can come a moment after `writer` is dropped (seen
+			// in multi-threaded runs, on runc and under gVisor); it comes with
+			// the hangup, which wakes the reader. Counted in wakes, not time.
+			let mut wakes = 0;
+			loop {
+				match reader.poll_read(&mut cx, &mut buf) {
+					Poll::Ready(Ok(0)) => break,
+					Poll::Pending if wakes < 2 => {
+						flag.wait("reader woken by the writer's close");
+						wakes += 1;
+					},
+					other => {
+						panic!("end of file after the writer closed: {other:?} after {wakes} wakes")
+					},
+				}
+			}
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
 		}
 
@@ -1753,7 +1770,7 @@ mod tests {
 
 		/// A waker that records being woken.
 		#[derive(Default)]
-		struct Flag(std::sync::atomic::AtomicBool);
+		pub(crate) struct Flag(std::sync::atomic::AtomicBool);
 
 		impl Wake for Flag {
 			fn wake(self: Arc<Self>) {
@@ -1762,7 +1779,8 @@ mod tests {
 		}
 
 		impl Flag {
-			fn wait(&self, what: &str) {
+			/// Wait up to 10 seconds to be woken, then take the wake.
+			pub(crate) fn wait(&self, what: &str) {
 				let deadline = Instant::now() + Duration::from_secs(10);
 				while !self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
 					assert!(Instant::now() < deadline, "not woken: {what}");
@@ -1771,7 +1789,7 @@ mod tests {
 			}
 
 			/// Whether it was woken (and not yet taken by [`Flag::wait`]).
-			fn woken(&self) -> bool {
+			pub(crate) fn woken(&self) -> bool {
 				self.0.load(std::sync::atomic::Ordering::SeqCst)
 			}
 		}
@@ -1819,14 +1837,14 @@ mod tests {
 
 		/// A FIFO with no room left: its writer as a [`StdFile`] (a blocking
 		/// description, as a shell's stdout is), and a non-blocking reader that
-		/// drains it.
-		struct FullFifo {
-			writer: StdFile,
-			reader: fs::File,
+		/// drains it ([`drain`]).
+		pub(crate) struct FullFifo {
+			pub(crate) writer: StdFile,
+			pub(crate) reader: fs::File,
 		}
 
 		impl FullFifo {
-			fn new() -> Self {
+			pub(crate) fn new() -> Self {
 				let path = host_path(&fifo()).unwrap().to_path_buf();
 				let reader = fs::OpenOptions::new()
 					.read(true)
@@ -1862,14 +1880,19 @@ mod tests {
 			}
 
 			/// Read everything the FIFO holds.
-			fn drain(&mut self) {
-				let mut buf = vec![0u8; 1 << 16];
-				loop {
-					match self.reader.read(&mut buf) {
-						Ok(n) => assert!(n > 0, "the FIFO's writer is open"),
-						Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-						Err(e) => panic!("draining the FIFO: {e}"),
-					}
+			pub(crate) fn drain(&mut self) {
+				drain(&mut self.reader);
+			}
+		}
+
+		/// Read everything a full FIFO's reader (non-blocking) can read now.
+		pub(crate) fn drain(reader: &mut fs::File) {
+			let mut buf = vec![0u8; 1 << 16];
+			loop {
+				match reader.read(&mut buf) {
+					Ok(n) => assert!(n > 0, "the FIFO's writer is open"),
+					Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+					Err(e) => panic!("draining the FIFO: {e}"),
 				}
 			}
 		}

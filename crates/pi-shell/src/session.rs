@@ -1972,11 +1972,41 @@ mod tests {
 	/// stdout.
 	#[test]
 	fn an_extra_and_a_builtin_waiting_for_room_on_stdout_both_finish() {
+		extra_and_builtin_both_finish("head -c {EXTRA} /dev/zero &", true);
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): an extra writing through a
+	// zsh multios tee waited on the run's stdout with the engine's own wait,
+	// which `printf`'s replaced, and the run hung. A tee has no OS handle, so
+	// the extra writes through it with or without an event sink.
+	#[test]
+	fn an_extra_writing_through_a_multios_tee_and_a_builtin_both_finish() {
+		extra_and_builtin_both_finish(
+			"emulate zsh -c 'head -c {EXTRA} /dev/zero >&1 >/dev/null &'",
+			true,
+		);
+	}
+
+	/// The same without an event sink.
+	#[test]
+	fn an_extra_writing_through_a_multios_tee_without_an_event_sink_finishes() {
+		extra_and_builtin_both_finish(
+			"emulate zsh -c 'head -c {EXTRA} /dev/zero >&1 >/dev/null &'",
+			false,
+		);
+	}
+
+	/// Run `{background}`, then `read -r go; printf '%0{BUILTIN}d' 0; wait`,
+	/// where `background` starts an extra writing `EXTRA` NULs to stdout
+	/// (`{EXTRA}` in it is replaced): the reader lets the extra fill the pipe
+	/// and wait, then `printf` wait, then drains it. Both must finish within
+	/// [`STUCK`].
+	fn extra_and_builtin_both_finish(background: &str, events: bool) {
 		use std::{io::Write, os::fd::AsRawFd, sync::atomic::AtomicUsize};
 		const EXTRA: usize = 1 << 20;
 		const BUILTIN: usize = 1 << 17;
-		let command =
-			format!("head -c {EXTRA} /dev/zero & read -r go; printf '%0{BUILTIN}d' 0; wait");
+		let background = background.replace("{EXTRA}", &EXTRA.to_string());
+		let command = format!("{background}\nread -r go; printf '%0{BUILTIN}d' 0; wait");
 		let (mut out_r, out_w) = io::pipe().unwrap();
 		let (in_r, mut in_w) = io::pipe().unwrap();
 		let out_w = std::fs::File::from(std::os::fd::OwnedFd::from(out_w));
@@ -2017,13 +2047,15 @@ mod tests {
 		let runtime = own_runtime();
 		let ended = runtime.block_on(async {
 			let mut session = session();
-			let trace = Arc::new(crate::bash::trace::RunTrace::new(command.as_str()));
 			let stdio = RunStdio {
 				stdin:  Some(std::fs::File::from(std::os::fd::OwnedFd::from(in_r))),
 				stdout: Some(out_w),
 				stderr: Some(std::fs::File::open("/dev/null").unwrap()),
 			};
-			let options = RunOptions { events: Some(trace), ..RunOptions::new(command.as_str()) };
+			let mut options = RunOptions::new(command.as_str());
+			if events {
+				options.events = Some(Arc::new(crate::bash::trace::RunTrace::new(command.as_str())));
+			}
 			tokio::time::timeout(STUCK, session.run_with(options, stdio, CancellationToken::new()))
 				.await
 		});
@@ -2038,9 +2070,9 @@ mod tests {
 			// The stuck extra's thread waits forever: leave it.
 			runtime.shutdown_background();
 			panic!(
-				"the run never ended ({reached}): the native extra `head -c {EXTRA} /dev/zero` wrote \
-				 {nuls} of its {EXTRA} bytes and printf {zeros} of its {BUILTIN}; the extra's wait \
-				 for room on stdout was never woken"
+				"the run never ended ({reached}): the native extra of `{background}` wrote {nuls} of \
+				 its {EXTRA} bytes and printf {zeros} of its {BUILTIN}; the extra's wait for room on \
+				 stdout was never woken"
 			);
 		};
 		assert_eq!(outcome.unwrap().status, 0);

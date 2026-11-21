@@ -58,6 +58,10 @@ mod wakers;
 
 #[cfg(all(test, unix))]
 pub(crate) use crate::sys::fs::pending_polls;
+/// Test only: a full FIFO whose writer is a [`StdFile`], and a waker that
+/// records being woken.
+#[cfg(all(test, unix))]
+pub(crate) use crate::sys::fs::tests::fifos as test_fifos;
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;
 pub use crate::sys::{

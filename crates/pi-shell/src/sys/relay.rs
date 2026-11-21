@@ -711,4 +711,34 @@ mod tests {
 		assert_eq!(out, b"hi\ndone\n");
 		assert!(took < Duration::from_secs(1), "waited for the leftover: {took:?}");
 	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the relay's
+	// key. A relay writing a program's output into an engine object that the
+	// engine writes too waits there with its own key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_relay_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = crate::bash::FdRef::from_file(Box::new(writer));
+		let (pipe, mut program) = os::pipe(false).unwrap();
+		program.write_all(b"x").unwrap();
+		let mut relay = Relay::new(pipe, None, End::Fd(sink.clone()));
+		let (relayed, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (rw, ew) = (Waker::from(Arc::clone(&relayed)), Waker::from(Arc::clone(&engine)));
+		assert!(relay.poll(&mut Context::from_waker(&rw)).is_pending(), "no room");
+		assert_eq!(relay.raw_len, 1, "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		relayed.wait("the relay, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
+	}
 }

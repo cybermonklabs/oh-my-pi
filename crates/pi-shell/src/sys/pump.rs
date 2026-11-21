@@ -692,6 +692,42 @@ mod tests {
 		assert!(rest.is_empty(), "the child reads end of file");
 	}
 
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the pump's
+	// key. A pump copying a program's output into an engine object that the
+	// engine writes too waits there with its copy's key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_pump_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = FdRef::from_file(Box::new(writer));
+		let (mut ours, child) = os::pipe(false).unwrap();
+		(&child).write_all(b"x").unwrap();
+		let mut dst = End::Fd(sink.clone());
+		let mut chunk = Chunk::new();
+		let (pump, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (pw, ew) = (Waker::from(Arc::clone(&pump)), Waker::from(Arc::clone(&engine)));
+		assert!(
+			chunk
+				.poll_copy(&mut Context::from_waker(&pw), &mut ours, &mut dst)
+				.is_pending(),
+			"no room"
+		);
+		assert_eq!(chunk.pending(), b"x", "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		pump.wait("the pump, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
+	}
+
 	#[derive(Default)]
 	struct Woken(std::sync::atomic::AtomicBool);
 

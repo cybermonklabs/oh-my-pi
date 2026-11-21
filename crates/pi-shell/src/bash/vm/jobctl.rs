@@ -240,11 +240,14 @@ pub fn notice(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
 }
 
 /// Write to the terminal while it takes the bytes (a terminal does not
-/// refuse a notice's few dozen).
+/// refuse a notice's few dozen). The write waits with a key of its own,
+/// dropped at once: as the terminal's owner, it would replace the editor's
+/// wait for room with a waker that wakes nobody.
 fn write_all(fd: &FdRef, mut bytes: &[u8]) {
 	let mut cx = Context::from_waker(Waker::noop());
+	let mut key = crate::sys::WaitKey::default();
 	while !bytes.is_empty() {
-		match fd.poll_write(&mut cx, bytes) {
+		match fd.poll_write_keyed(&mut cx, bytes, &mut key) {
 			Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
 			_ => return,
 		}
@@ -1581,5 +1584,33 @@ impl Shell {
 			let _ = term.set_process_group(0, pgrp.orig);
 		}
 		self.k.jobctl.pgrp = None;
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use std::sync::Arc;
+
+	use super::*;
+	use crate::sys::test_fifos::{Flag, FullFifo, drain};
+
+	// Failure mode (review of #111 at 3b9fe7ab): a job notice written to a
+	// terminal with no room polled it as its owner with a waker that wakes
+	// nobody, which replaced the editor's wait for room: the drain did not
+	// wake the editor.
+	#[test]
+	fn a_notice_keeps_the_editors_wait_for_room() {
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let tty = FdRef::from_file(Box::new(writer));
+		let editor = Arc::new(Flag::default());
+		let waker = Waker::from(Arc::clone(&editor));
+		assert!(
+			tty.poll_write(&mut Context::from_waker(&waker), b"x")
+				.is_pending(),
+			"no room"
+		);
+		write_all(&tty, b"[1]  + done       sleep 1\n");
+		drain(&mut reader);
+		editor.wait("the editor, waiting for room, woken by the drain");
 	}
 }
