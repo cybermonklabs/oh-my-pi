@@ -158,4 +158,37 @@ describe("workpool model validation", () => {
 		await runEvalWorkpool({ op: "push", name: "picked", items: ["one"] }, { session });
 		expect(await requested.promise).toEqual(model);
 	});
+
+	it("records each worker it spawns as owed, on disk, before the worker starts", async () => {
+		// If this regresses, a pool worker leaves no record: once the call that pushed the work has finished, a worker
+		// whose key failed while its batch still ran is in no window, and `omp --restore` leaves it, though the pool's
+		// owner still waits on its result.
+		vi.spyOn(discovery, "discoverAgents").mockResolvedValue({ agents: [SCOUT], projectAgentsDir: null });
+		const log: string[] = [];
+		const started = Promise.withResolvers<void>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
+			log.push("worker started");
+			started.resolve();
+			throw new Error("stop after dispatch");
+		});
+		const session: ToolSession = {
+			...makeSession(),
+			sessionManager: {
+				appendCustomEntry: (customType: string, data?: unknown) => {
+					const state = data && typeof data === "object" && "state" in data ? String(data.state) : "?";
+					log.push(`append ${customType} ${state}`);
+					return "entry";
+				},
+				flush: async () => {
+					await Promise.resolve();
+					log.push("flushed");
+				},
+			},
+		} as unknown as ToolSession;
+		await runEvalWorkpool({ op: "create", name: "owed", agent: "scout" }, { session });
+		await runEvalWorkpool({ op: "push", name: "owed", items: ["one"] }, { session });
+		await started.promise;
+
+		expect(log).toEqual(["append eval-agent-job owed", "flushed", "worker started"]);
+	});
 });

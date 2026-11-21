@@ -2,6 +2,7 @@ import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { type: "text" };
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
+import { recordEvalAgentJobs } from "../eval/agent-job-records";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { plainTurnAbortReason } from "../session/exit-diagnostics";
@@ -302,6 +303,11 @@ export class WorkPool {
 	async #spawn(item: WorkPoolItem): Promise<void> {
 		const index = this.#nextAgentIndex++;
 		const id = await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
+		if (this.closed || item.status !== "queued") return;
+		// The worker's run is owed to the pool's owner until its batch's result is delivered: record that, on
+		// disk, before the worker starts, so `omp --restore` relaunches a worker the owner still waits on after
+		// the call that pushed the work has finished. The batch's delivery settles it.
+		await recordEvalAgentJobs(this.session, [id], "owed");
 		if (this.closed || item.status !== "queued") return;
 		const agent: WorkPoolAgent = { id, index, state: "running", queue: [item], turns: 0 };
 		item.agentId = id;

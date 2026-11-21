@@ -4,8 +4,9 @@
  * subagent ({@link readEvalAgentJobRecord}).
  *
  * A job is `owed` from its spawn until its result is handed to the session: an eval `agent()`
- * job, and a background spawn a bridged `tool.task` starts, whose "started" result names no
- * settled run. A cell's `wait()` and a bridged `tool.wait` write `delivered` first and then hand
+ * job, a background spawn a bridged `tool.task` starts, whose "started" result names no
+ * settled run, and a work pool's worker, whose batch results the pool's own job delivers.
+ * A cell's `wait()` and a bridged `tool.wait` write `delivered` first and then hand
  * the result over, so a process that goes away between the two leaves `delivered`, and restore
  * never runs that run again; a background `task` spawn's result a bridged `tool.wait` hands a
  * cell is recorded the same way. A handle's `status()`, `done()` and `attempts()` hand the cell
@@ -16,7 +17,7 @@ import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
 
-/** Custom entry type of an eval job record: an `agent()` job's, or a bridged `tool.task` background spawn's. */
+/** Custom entry type of an eval job record: an `agent()` job's, a bridged `tool.task` background spawn's, or a work pool worker's. */
 export const EVAL_AGENT_JOB_CUSTOM_TYPE = "eval-agent-job";
 
 /** `owed`: spawned, its result not yet handed to the session; `delivered`: handed over, or being handed over. */
