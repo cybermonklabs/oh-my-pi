@@ -1021,7 +1021,13 @@ impl Session {
 	/// on it.
 	pub fn stable_stamps(&mut self, dir: &Dir, stamp: &Stamp) -> bool {
 		match (&self.imp, &dir.repr) {
-			(Imp::Native(_), DirRepr::Native(h)) => native::stable_stamps(h, stamp),
+			(Imp::Native(_), DirRepr::Native(h)) => {
+				#[cfg(test)]
+				if seam::trusts_stamps(stamp.dev) {
+					return true;
+				}
+				native::stable_stamps(h, stamp)
+			},
 			_ => false,
 		}
 	}
@@ -1095,7 +1101,8 @@ async fn list_with(
 /// stat) of an entry by that name runs it just before the call, so the test
 /// can swap the entry for a symlink exactly there, without a racing writer.
 /// A test can also make every directory open on its own thread fail
-/// ([`fail_opens`]), as a short burst of `EMFILE` would.
+/// ([`fail_opens`]), as a short burst of `EMFILE` would, and have the listing
+/// cache trust the stamps of a filesystem ([`trust_stamps`]).
 #[cfg(test)]
 pub(crate) mod seam {
 	use std::{cell::RefCell, io, path::Path};
@@ -1198,6 +1205,26 @@ pub(crate) mod seam {
 		rel.rsplit(|&b| super::is_rel_separator(b))
 			.next()
 			.unwrap_or(rel)
+	}
+
+	/// Devices whose stamps [`super::Session::stable_stamps`] takes as stable
+	/// whatever their filesystem ([`trust_stamps`]).
+	static TRUSTED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+	/// Has [`super::Session::stable_stamps`] take the stamps on device `dev`
+	/// as stable, as on a filesystem it admits, from now on and in the whole
+	/// process: a walk stores its listings on its workers' threads.
+	#[cfg_attr(not(unix), expect(dead_code, reason = "only Unix test trees take a device's stamps"))]
+	pub(crate) fn trust_stamps(dev: u64) {
+		let mut trusted = TRUSTED.lock();
+		if !trusted.contains(&dev) {
+			trusted.push(dev);
+		}
+	}
+
+	/// Whether [`trust_stamps`] was called for `dev`.
+	pub(crate) fn trusts_stamps(dev: u64) -> bool {
+		TRUSTED.lock().contains(&dev)
 	}
 }
 

@@ -31,11 +31,29 @@ const MAX_HOPS: usize = 40;
 /// killed test's tree would stay. A Bazel 9.2.0 server that removed a chain
 /// of 1,215 levels left in its sandbox died (exit 37; it survived 1,205), so
 /// every chain a test builds stays far shorter.
+///
+/// The listing cache takes the stamps of this directory's filesystem as
+/// stable ([`crate::fs::seam::trust_stamps`]), as it takes those of the
+/// local filesystems it admits. It refuses others by design, and a test's
+/// temporary directory can lie on one: a container's root filesystem is an
+/// overlay, and gVisor serves every volume from the host as 9p. There a
+/// cached-listing test would walk fresh listings only, and fail or pass
+/// without testing the cache. What the cache cannot see there is a change
+/// made outside the machine (in an overlay's lower directory, or by another
+/// writer on gVisor's host); the tests change their trees from inside, and
+/// each such change moves its directory's stamp on those filesystems too.
 pub fn temp_root() -> PathBuf {
-	std::env::var_os("TEST_TMPDIR")
+	let root = std::env::var_os("TEST_TMPDIR")
 		.map(PathBuf::from)
 		.filter(|dir| dir.is_dir())
-		.unwrap_or_else(std::env::temp_dir)
+		.unwrap_or_else(std::env::temp_dir);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt as _;
+		let meta = std::fs::metadata(&root).expect("the temporary directory exists");
+		crate::fs::seam::trust_stamps(meta.dev());
+	}
+	root
 }
 
 #[derive(Debug)]
