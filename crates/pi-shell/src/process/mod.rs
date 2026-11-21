@@ -2,11 +2,12 @@
 //!
 //! [`main`] takes a shell's command line (`zsh [zsh options] …`,
 //! `bash [GNU long option] [option] …`, `sh …`; `argv[0]`'s base name picks
-//! the dialect) to its exit status, the way the real shell does: bash's or
-//! zsh's option parsing and messages, `--help`/`--version`, the startup
-//! files, a `-c` command, a script operand or a script read from stdin a
-//! line at a time, run over this process's own terminal, signals and
-//! descriptors by [`NativeHost`].
+//! the dialect) to how it ends ([`Exit`]), the way the real shell does:
+//! bash's or zsh's option parsing and messages, `--help`/`--version`, the
+//! startup files, a `-c` command, a script operand or a script read from
+//! stdin a line at a time, run over this process's own terminal, signals and
+//! descriptors by [`NativeHost`]. The caller ends its process so
+//! ([`Exit::end`]).
 //!
 //! Two callers: the `obash` binary (a standalone process; it adds its test
 //! modes on top of the pieces here) and `omp zsh|bash|sh`, which runs the
@@ -33,9 +34,9 @@ use std::{
 use bstr::BString;
 
 pub use self::host::{NativeHost, ignored_on_entry, inherited_fds};
+use self::signals::RuntimeSignals;
 #[cfg(unix)]
-use self::signals::die_of;
-use self::signals::{Death, RuntimeSignals};
+use self::signals::{Death, die_of};
 use crate::{
 	bash::{
 		Budget, CallOutcome, Cx, Dialect, Engine, EngineConfig, EventMask, MemStore, ModeId, Origin,
@@ -52,7 +53,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessOptions {
 	/// The shell runs inside another runtime's process (Bun, for
-	/// `omp zsh`), which keeps running or exits after [`main`] returns:
+	/// `omp zsh`), which ends as the shell ends ([`Exit::end`]) or keeps
+	/// running after [`main`] returns:
 	///
 	/// - signals: of HUP, INT, QUIT, TERM, PIPE, ALRM, TSTP, TTIN, TTOU, CHLD,
 	///   WINCH and CONT, those the runtime caught with a handler (and `SIGPIPE`,
@@ -478,35 +480,63 @@ fn zsh_version_text() -> Vec<u8> {
 	format!("zsh 5.9 ({host})\n").into_bytes()
 }
 
+/// How the process shell ended ([`main`]): its exit status, or (Unix) the
+/// signal it died of; elsewhere a process dies of no signal, and the status
+/// says how the shell ended.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "the process ends as the shell ended: `Exit::end`"]
+pub struct Exit {
+	/// The exit status (0–255).
+	status: i32,
+	/// The signal the shell died of ([`Shell::killed_by`],
+	/// [`Shell::exec_signal`]).
+	#[cfg(unix)]
+	death:  Option<Death>,
+}
+
+impl Exit {
+	/// An end by exit status `status` alone.
+	const fn with_status(status: i32) -> Self {
+		Self {
+			status,
+			#[cfg(unix)]
+			death: None,
+		}
+	}
+
+	/// End the process as the shell ended: a shell that died of a signal
+	/// (`kill -TERM $$` without a trap, an `INT` it acts on, an `exec`ed
+	/// program killed by one) does not return, the process dies of the same
+	/// signal, as zsh's and bash's do, so that its parent sees
+	/// `WIFSIGNALED`; else the status the process should exit with. Called
+	/// once [`main`] has returned: an embedded shell's runtime has its
+	/// dispositions back, and the signal's default action ends it.
+	#[must_use]
+	pub fn end(self) -> i32 {
+		#[cfg(unix)]
+		if let Some(death) = self.death {
+			die_of(death);
+		}
+		self.status
+	}
+}
+
 /// The process shell: the command line `argv` (`argv[0]` names the shell)
-/// to the exit status (0–255) the process should exit with. Standard
+/// to how it ended ([`Exit`]: the caller ends its process so). Standard
 /// output is flushed before it returns.
-///
-/// A standalone shell that died of a signal (`kill -TERM $$` without a
-/// trap, or an `exec`ed program killed by one) does not return: the
-/// process dies of the same signal, as zsh and bash do, so that its parent
-/// sees `WIFSIGNALED`.
-pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOptions) -> i32 {
+pub fn main<A: Into<BString>>(argv: impl IntoIterator<Item = A>, opts: ProcessOptions) -> Exit {
 	let argv: Vec<BString> = argv.into_iter().map(Into::into).collect();
 	let mut launch = match start(&argv, false) {
 		Start::Run(launch) => launch,
-		Start::Exit(status) => return status,
+		Start::Exit(status) => return Exit::with_status(status),
 	};
 	if let Some(status) = pretty_print_mode(&mut launch) {
-		return status;
+		return Exit::with_status(status);
 	}
 	let Launch { args, env, input } = *launch;
-	let (status, death) = run(&args, env, input, opts);
+	let exit = run(&args, env, input, opts);
 	let _ = io::stdout().flush();
-	#[cfg(unix)]
-	if let Some(death) = death
-		&& !opts.embedded
-	{
-		die_of(death);
-	}
-	#[cfg(not(unix))]
-	let _ = death;
-	status
+	exit
 }
 
 /// bash's `--pretty-print` instead of running: the status when `launch`
@@ -530,14 +560,9 @@ pub fn pretty_print_mode(launch: &mut Launch) -> Option<i32> {
 }
 
 /// Run the shell `args` describes on `input`, with the process environment
-/// `env`; the exit status (0–255), and the signal the shell died of
+/// `env`: how it ended, its exit status (0–255) and the signal it died of
 /// ([`Shell::killed_by`], [`Shell::exec_signal`]).
-fn run(
-	args: &ShellArgs,
-	env: Vec<(BString, BString)>,
-	input: Input,
-	opts: ProcessOptions,
-) -> (i32, Option<Death>) {
+fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: ProcessOptions) -> Exit {
 	// Declared first, dropped last: the runtime gets its dispositions back
 	// after the host has put its trap handlers back.
 	let _runtime = if opts.embedded {
@@ -545,7 +570,7 @@ fn run(
 			Ok(saved) => Some(saved),
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return (2, None);
+				return Exit::with_status(2);
 			},
 		}
 	} else {
@@ -569,7 +594,7 @@ fn run(
 			Ok(shell) => shell,
 			Err(err) => {
 				eprintln!("{}: {err}", args.shell_name);
-				return (2, None);
+				return Exit::with_status(2);
 			},
 		};
 	let root = Vpid(cfg.vpid_base);
@@ -578,6 +603,7 @@ fn run(
 	shell.set_event_mask(EventMask::NONE);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
+	#[cfg(unix)]
 	let death = shell
 		.killed_by()
 		.map(|signal| Death { signal, passed_on: false })
@@ -601,7 +627,11 @@ fn run(
 		mem::forget(store);
 		mem::forget(engine);
 	}
-	(status & 0xff, death)
+	Exit {
+		status: status & 0xff,
+		#[cfg(unix)]
+		death,
+	}
 }
 
 /// The new shell's initial state from the command line `args`.

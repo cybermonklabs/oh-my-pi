@@ -476,7 +476,9 @@ mod unix {
 #[cfg(unix)]
 pub use unix::{RuntimeSignals, Signals, handed_over};
 
-/// The signal a standalone shell dies of (`run`).
+/// The signal the shell died of ([`super::Exit`]). Unix only: elsewhere a
+/// process dies of no signal.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct Death {
 	/// The signal's number.

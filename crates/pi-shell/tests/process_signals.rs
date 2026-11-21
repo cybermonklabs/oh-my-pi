@@ -1126,6 +1126,68 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	]);
 }
 
+/// The variable that makes this test binary, run again, the embedded shell
+/// of [`an_embedded_bash_dies_of_the_int_it_acts_on`], on its script.
+const EMBEDDED_SCRIPT: &str = "PI_SHELL_EMBEDDED_SCRIPT";
+
+/// One run of `run` (the real bash's `-c` string, or the embedded shell's)
+/// with `F` set, in a process group of its own, which gets `INT` once the
+/// command has made `$F` (with `waits`, once the shell has also blocked):
+/// what it wrote to `$F.out`, and how it ended.
+fn int_to_the_group(run: Run, waits: bool) -> (String, Option<End>) {
+	let dir = tempfile::tempdir().expect("a directory for the start file");
+	let started = dir.path().join("started");
+	let run = run.env("F", &started).own_group();
+	let run = if waits { run.when_blocked() } else { run };
+	let end = run.go_signalled(&started, libc::SIGINT, true).end();
+	let out = fs::read_to_string(started.with_extension("out")).unwrap_or_default();
+	(out, end)
+}
+
+/// The process shell embedded in a runtime, as `omp bash` runs it
+/// (`pi_shell::process::main` with `embedded`, then `Exit::end`, as
+/// pi-natives' `runShellMain` does), ends as bash does on an `INT` to its
+/// process group that it acts on: it dies of `SIGINT`, so that its parent
+/// sees the death (a calling bash takes an exit of 130 for a child that
+/// caught the signal, `child_caught_sigint`, and its loop goes on): in shell
+/// code, and after its EXIT trap. The shell runs in this test binary again,
+/// on a thread of libtest's, which the kernel does not give the group's
+/// signal first; a runtime runs it on its main thread, which it does. A
+/// command that dies of the signal is pi-natives' test of `runShellMain`
+/// (`native.test.ts`), on Bun's main thread: here the main thread could
+/// take the signal after the engine has seen the command's end. The
+/// shell's output goes to `$F.out`, past the test harness's own lines.
+#[test]
+fn an_embedded_bash_dies_of_the_int_it_acts_on() {
+	const NAME: &str = "an_embedded_bash_dies_of_the_int_it_acts_on";
+	if let Some(script) = std::env::var_os(EMBEDDED_SCRIPT) {
+		let argv = [b"bash".to_vec(), b"-c".to_vec(), script.into_vec()];
+		let opts = pi_shell::process::ProcessOptions { embedded: true };
+		std::process::exit(pi_shell::process::main(argv, opts).end());
+	}
+	let this = std::env::current_exe().expect("this test binary");
+	for (script, out) in [
+		("exec >\"$F.out\"; : > \"$F\"; while :; do :; done", ""),
+		("exec >\"$F.out\"; trap 'echo x' EXIT; : > \"$F\"; while :; do :; done", "x\n"),
+	] {
+		let waits = false;
+		let embedded = Run::new(&this, "process_signals", &["--exact", NAME, "--nocapture"])
+			.env(EMBEDDED_SCRIPT, script);
+		assert_eq!(
+			int_to_the_group(embedded, waits),
+			(out.to_owned(), Some(Signal(libc::SIGINT))),
+			"embedded: {script}"
+		);
+		if let Some(real) = real_bash() {
+			assert_eq!(
+				int_to_the_group(Run::script(real, "bash", script), waits),
+				(out.to_owned(), Some(Signal(libc::SIGINT))),
+				"bash: {script}"
+			);
+		}
+	}
+}
+
 /// A signal the shell catches ends it (bash's EXIT trap, zsh's `HUP`
 /// handler) while it waits for a foreground command: the command outlives
 /// the shell, as bash's `termsig_handler` and zsh's `zexit` leave it, and so

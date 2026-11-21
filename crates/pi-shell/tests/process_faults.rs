@@ -59,10 +59,10 @@ fn child(embedded: bool) -> ! {
 		// SAFETY: none: a deliberate fault, a write to an unmapped address.
 		unsafe { std::ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
 	});
-	let code = pi_shell::process::main(["bash", "-c", SCRIPT], pi_shell::process::ProcessOptions {
+	let exit = pi_shell::process::main(["bash", "-c", SCRIPT], pi_shell::process::ProcessOptions {
 		embedded,
 	});
-	std::process::exit(code)
+	std::process::exit(exit.end())
 }
 
 /// Run test `test` again as the child of `case`: how it ended and what it
