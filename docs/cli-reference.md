@@ -360,9 +360,14 @@ A worktree add that fails removes its tree and its registration, as
 (`locked initializing`, the lock git's own add holds), so `git worktree prune`
 and `omp worktree clear` leave it alone. An add killed or terminated midway
 leaves that locked registration and its partial tree. Another add of the same
-path removes both first and says so, while both are still what the stopped add
-left: nobody changed or removed its lock and the directory is the one it made.
+path empties that tree (the directory stays) and removes the registration
+first, and says so, while both are still what the stopped add left: nobody
+changed or removed its lock, the directory still carries the random token the
+add set on it as an extended attribute (a directory made again in its place
+never does, even with the same inode), and any `.git` in it is the add's own.
 Otherwise that add refuses and names the registration, as git refuses a
-registered path; adds of other paths never touch it. On a filesystem that
-cannot lock files, an add goes on without its add-in-progress marker, and a
-killed one is never removed by a later add.
+registered path; adds of other paths never touch it. Where there are no user
+extended attributes (off Linux, or on a filesystem without them) the stopped
+add's tree is never emptied by a later add. On a filesystem that cannot lock
+files, an add goes on without its add-in-progress marker, and a killed one is
+never removed by a later add.

@@ -2120,10 +2120,10 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 
 /// File a running [`GitRepo::worktree_add`] keeps locked in the new
 /// registration's administrative directory until the add finishes. Its first
-/// line records the tree directory the add made (`tree <dev> <ino>`, or
-/// `tree -` before there is one); the rest is exactly what the add wrote to
-/// `locked`. A registration holding it unlocked is an add that died before it
-/// finished.
+/// line records the tree directory the add made (`tree <dev> <ino> <token>`,
+/// see [`TreeMark`], or `tree -` before there is one or where it cannot be
+/// marked); the rest is exactly what the add wrote to `locked`. A
+/// registration holding it unlocked is an add that died before it finished.
 const ADD_IN_PROGRESS: &str = "omp-add-in-progress";
 
 /// What `git worktree add` writes to a new registration's `locked` file while
@@ -2193,31 +2193,24 @@ impl PendingWorktree {
 		Ok(pending)
 	}
 
-	/// The marker's content for a tree directory with `identity`.
-	fn record(&self, identity: Option<(u64, u64)>) -> String {
-		match identity {
-			Some((dev, ino)) => format!("tree {dev} {ino}\n{}", self.locked),
+	/// The marker's content for a tree directory marked `mark`.
+	fn record(&self, mark: Option<&TreeMark>) -> String {
+		match mark {
+			Some(TreeMark { dev, ino, token }) => format!("tree {dev} {ino} {token}\n{}", self.locked),
 			None => format!("tree -\n{}", self.locked),
 		}
 	}
 
-	/// Makes the tree directory (an empty one already there is kept) and
-	/// records it in the marker before anything is written into it, so a
-	/// later add can tell it from a directory someone made in its place.
+	/// Makes the tree directory (an empty one already there is kept), marks
+	/// it and records the mark in the marker before anything is written into
+	/// it, so a later add can tell it from a directory someone made in its
+	/// place.
 	fn make_tree(&self) -> Result<()> {
 		fs::create_dir_all(&self.path)?;
 		let Some(marker) = &self.marker else {
 			return Ok(());
 		};
-		#[cfg(unix)]
-		let identity = {
-			use std::os::unix::fs::MetadataExt;
-			let meta = fs::symlink_metadata(&self.path)?;
-			Some((meta.dev(), meta.ino()))
-		};
-		#[cfg(not(unix))]
-		let identity = None;
-		let record = self.record(identity);
+		let record = self.record(mark_tree(&self.path).as_ref());
 		let mut file = marker;
 		io::Seek::seek(&mut file, io::SeekFrom::Start(0))?;
 		io::Write::write_all(&mut file, record.as_bytes())?;
@@ -2232,10 +2225,15 @@ impl PendingWorktree {
 		Ok(())
 	}
 
-	/// Replaces the tree of a failed attempt with a fresh, recorded directory,
-	/// keeping the registration for the next attempt.
+	/// Empties the tree of a failed attempt (the directory stays: it can be
+	/// a mount point) and marks it afresh, keeping the registration for the
+	/// next attempt.
 	fn reset_tree(&self) -> Result<()> {
-		remove_existing(&self.path)?;
+		if fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_dir()) {
+			remove_contents(&self.path)?;
+		} else {
+			remove_existing(&self.path)?;
+		}
 		self.make_tree()
 	}
 
@@ -2261,6 +2259,7 @@ impl PendingWorktree {
 			}
 			release(marker);
 		}
+		clear_tree_mark(&self.path);
 		if lock.is_none()
 			&& let Err(err) = remove_existing(&self.admin.join("locked"))
 		{
@@ -2276,7 +2275,9 @@ impl PendingWorktree {
 
 impl Drop for PendingWorktree {
 	/// An add that returns before it finished removes what it made: the tree
-	/// (an empty directory again where one was) and the registration.
+	/// (an empty directory again where one was) and the registration. The
+	/// marker is released last, so no reclaim can take the registration
+	/// while it is still there.
 	fn drop(&mut self) {
 		if self.finished {
 			return;
@@ -2285,10 +2286,162 @@ impl Drop for PendingWorktree {
 		if self.existed {
 			let _ = fs::create_dir_all(&self.path);
 		}
+		let _ = fs::remove_dir_all(&self.admin);
 		if let Some(marker) = self.marker.take() {
 			release(marker);
 		}
-		let _ = fs::remove_dir_all(&self.admin);
+	}
+}
+
+/// What an add records of the tree directory it made: its device and inode,
+/// and a random token it set on the directory as an extended attribute. A
+/// directory someone made again in its place can get the same device and
+/// inode, but never the token.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code, reason = "Windows never marks a tree or reads a mark back"))]
+struct TreeMark {
+	dev:   u64,
+	ino:   u64,
+	token: String,
+}
+
+#[cfg(unix)]
+impl TreeMark {
+	/// Parses a mark as a marker records it after `tree `:
+	/// `<dev> <ino> <token>`.
+	fn parse(text: &str) -> Option<Self> {
+		let mut parts = text.split(' ');
+		let mark = Self {
+			dev:   parts.next()?.parse().ok()?,
+			ino:   parts.next()?.parse().ok()?,
+			token: parts.next().filter(|token| !token.is_empty())?.to_owned(),
+		};
+		parts.next().is_none().then_some(mark)
+	}
+
+	/// Whether `meta` and `token` are the directory this mark was set on.
+	fn is(&self, meta: &fs::Metadata, token: Option<&str>) -> bool {
+		use std::os::unix::fs::MetadataExt;
+		meta.is_dir()
+			&& meta.dev() == self.dev
+			&& meta.ino() == self.ino
+			&& token == Some(self.token.as_str())
+	}
+}
+
+/// Sets a fresh token on the directory `dir` and returns its mark; `None`
+/// where the filesystem keeps no user extended attributes, or off Linux, so
+/// that a later add never takes a directory there for this add's.
+#[cfg(target_os = "linux")]
+fn mark_tree(dir: &Path) -> Option<TreeMark> {
+	use std::os::unix::fs::MetadataExt;
+	let token = tree_mark::set(dir).ok()?;
+	let meta = fs::symlink_metadata(dir).ok()?;
+	Some(TreeMark { dev: meta.dev(), ino: meta.ino(), token })
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn mark_tree(_dir: &Path) -> Option<TreeMark> {
+	None
+}
+
+/// The token on the directory `dir`, `None` when it has none.
+#[cfg(unix)]
+fn tree_token(dir: &Path) -> io::Result<Option<String>> {
+	#[cfg(target_os = "linux")]
+	{
+		tree_mark::get(dir)
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = dir;
+		Ok(None)
+	}
+}
+
+/// Removes the token from `dir`, where there is one. A token left behind
+/// matches no marker, so a failure only leaves an unused attribute.
+#[cfg(target_os = "linux")]
+fn clear_tree_mark(dir: &Path) {
+	tree_mark::clear(dir);
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn clear_tree_mark(_dir: &Path) {}
+
+/// The token an add sets on its tree directory, in the user extended
+/// attribute [`tree_mark::NAME`]. The directory is never followed through a
+/// symlink.
+#[cfg(target_os = "linux")]
+mod tree_mark {
+	use std::{
+		ffi::{CStr, CString},
+		fmt::Write,
+		io,
+		os::unix::ffi::OsStrExt,
+		path::Path,
+	};
+
+	/// The attribute's name.
+	pub const NAME: &CStr = c"user.omp.worktree-add";
+
+	fn c_path(path: &Path) -> io::Result<CString> {
+		CString::new(path.as_os_str().as_bytes())
+			.map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+	}
+
+	/// Sets a fresh random token on `dir` and returns it.
+	pub fn set(dir: &Path) -> io::Result<String> {
+		let mut bytes = [0_u8; 16];
+		// SAFETY: `bytes` is a live, writable buffer of the length passed.
+		let got = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+		if got != bytes.len() as isize {
+			return Err(io::Error::last_os_error());
+		}
+		let mut token = String::with_capacity(2 * bytes.len());
+		for byte in bytes {
+			let _ = write!(token, "{byte:02x}");
+		}
+		let path = c_path(dir)?;
+		// SAFETY: both names are live NUL-terminated strings, and the value
+		// pointer and length describe `token`'s bytes.
+		let rc = unsafe {
+			libc::lsetxattr(path.as_ptr(), NAME.as_ptr(), token.as_ptr().cast(), token.len(), 0)
+		};
+		if rc != 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(token)
+	}
+
+	/// The token on `dir`, `None` when it has none.
+	pub fn get(dir: &Path) -> io::Result<Option<String>> {
+		let path = c_path(dir)?;
+		let mut buf = [0_u8; 64];
+		// SAFETY: both names are live NUL-terminated strings, and `buf` is a
+		// live, writable buffer of the length passed.
+		let len = unsafe {
+			libc::lgetxattr(path.as_ptr(), NAME.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+		};
+		if len < 0 {
+			let err = io::Error::last_os_error();
+			return if err.raw_os_error() == Some(libc::ENODATA) {
+				Ok(None)
+			} else {
+				Err(err)
+			};
+		}
+		Ok(std::str::from_utf8(&buf[..len as usize])
+			.ok()
+			.map(str::to_owned))
+	}
+
+	/// Removes the token from `dir`; a failure is ignored.
+	pub fn clear(dir: &Path) {
+		if let Ok(path) = c_path(dir) {
+			// SAFETY: both names are live NUL-terminated strings.
+			unsafe { libc::lremovexattr(path.as_ptr(), NAME.as_ptr()) };
+		}
 	}
 }
 
@@ -2358,7 +2511,13 @@ fn resolve_leaf(path: &Path) -> PathBuf {
 /// when the marker went or changed meanwhile (the add finished, or another
 /// add took the registration), so there is nothing of a dead add left here.
 fn reclaim_abandoned_add(common: &Path, admin: &Path, tree: &Path) -> Result<Option<String>> {
-	let marker = match fs::File::open(admin.join(ADD_IN_PROGRESS)) {
+	// Open for writing too: an NFS client emulates `flock` with a whole-file
+	// `fcntl` lock, and an exclusive one needs a writable descriptor.
+	let marker = match fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(admin.join(ADD_IN_PROGRESS))
+	{
 		Ok(marker) => marker,
 		Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(err) => return Err(err.into()),
@@ -2374,7 +2533,7 @@ fn reclaim_with_marker(
 	tree: &Path,
 	marker: &fs::File,
 ) -> Result<Option<String>> {
-	let refuse = |why: String| {
+	let refuse = |why: &str| {
 		Error::backend(
 			"git worktree add",
 			format!(
@@ -2388,9 +2547,19 @@ fn reclaim_with_marker(
 	};
 	match marker.try_lock() {
 		Ok(()) => {},
-		Err(fs::TryLockError::WouldBlock) => return Err(refuse("that is still running".into())),
+		Err(fs::TryLockError::WouldBlock) => {
+			return Err(Error::backend(
+				"git worktree add",
+				format!(
+					"'{}' is being added by another worktree add that is still running ({}); wait for \
+					 it to finish",
+					tree.display(),
+					admin.display()
+				),
+			));
+		},
 		Err(fs::TryLockError::Error(err)) => {
-			return Err(refuse(format!("whose marker cannot be locked here ({err})")));
+			return Err(refuse(&format!("whose marker cannot be locked here ({err})")));
 		},
 	}
 	#[cfg(unix)]
@@ -2406,41 +2575,53 @@ fn reclaim_with_marker(
 		}
 		let mut record = String::new();
 		io::Read::read_to_string(&mut &*marker, &mut record)?;
+		let refuse_record = || {
+			refuse("whose marker records nothing to check, or whose lock was changed or removed since")
+		};
 		let Some((first, locked)) = record.split_once('\n') else {
-			return Err(refuse("whose marker records nothing to check".into()));
+			return Err(refuse_record());
 		};
 		let made = match first.strip_prefix("tree ") {
 			Some("-") => None,
-			Some(identity) => {
-				let parsed = identity
-					.split_once(' ')
-					.and_then(|(dev, ino)| Some((dev.parse::<u64>().ok()?, ino.parse::<u64>().ok()?)));
-				match parsed {
-					Some(identity) => Some(identity),
-					None => return Err(refuse("whose marker records nothing to check".into())),
-				}
-			},
-			None => return Err(refuse("whose marker records nothing to check".into())),
+			Some(text) => Some(TreeMark::parse(text).ok_or_else(refuse_record)?),
+			None => return Err(refuse_record()),
 		};
 		if fs::read(admin.join("locked")).ok().as_deref() != Some(locked.as_bytes()) {
-			return Err(refuse("whose lock was changed or removed since".into()));
+			return Err(refuse_record());
 		}
-		let tree_is_its_own = match fs::symlink_metadata(tree) {
-			Err(err) if err.kind() == io::ErrorKind::NotFound => false,
-			Ok(meta) if meta.is_dir() && made == Some((meta.dev(), meta.ino())) => true,
-			Ok(_) => {
-				return Err(refuse("and the directory there is not the one that add made".into()));
+		let note = match fs::symlink_metadata(tree) {
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {
+				format!(
+					"removed the registration an interrupted worktree add of {} left",
+					tree.display()
+				)
 			},
 			Err(err) => return Err(err.into()),
-		};
-		let note = if tree_is_its_own {
-			if common.starts_with(resolve_leaf(tree)) {
-				return Err(refuse("and holds this repository".into()));
-			}
-			remove_existing(tree)?;
-			format!("removed the partial tree an interrupted worktree add left at {}", tree.display())
-		} else {
-			format!("removed the registration an interrupted worktree add of {} left", tree.display())
+			Ok(meta) => {
+				let token = tree_token(tree).ok().flatten();
+				if !made
+					.as_ref()
+					.is_some_and(|made| made.is(&meta, token.as_deref()))
+				{
+					return Err(refuse(
+						"and the directory there cannot be told apart from one made again in its place",
+					));
+				}
+				if common.starts_with(resolve_leaf(tree)) {
+					return Err(refuse("and holds this repository"));
+				}
+				if !git_entry_is_ours(tree, admin) {
+					return Err(refuse("and holds a `.git` that is not this registration's"));
+				}
+				// The directory stays: it can be a mount point, and the add
+				// keeps an empty directory anyway.
+				remove_contents(tree)?;
+				clear_tree_mark(tree);
+				format!(
+					"emptied the partial tree an interrupted worktree add left at {}",
+					tree.display()
+				)
+			},
 		};
 		// Removed while the marker is held, so no other add can take it first.
 		fs::remove_dir_all(admin)?;
@@ -2449,8 +2630,37 @@ fn reclaim_with_marker(
 	#[cfg(not(unix))]
 	{
 		let _ = common;
-		Err(refuse("that this platform cannot check".into()))
+		Err(refuse("that this platform cannot check"))
 	}
+}
+
+/// Whether `tree` holds no `.git`, or a `.git` file naming the registration
+/// `admin`: anything else (a repository of its own, a `.git` naming another
+/// registration) is not the interrupted add's to remove.
+#[cfg(unix)]
+fn git_entry_is_ours(tree: &Path, admin: &Path) -> bool {
+	let entry = tree.join(".git");
+	match fs::symlink_metadata(&entry) {
+		Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+		Ok(meta) if meta.is_file() => fs::read_to_string(&entry)
+			.ok()
+			.and_then(|text| {
+				text
+					.trim()
+					.strip_prefix("gitdir:")
+					.map(|raw| tree.join(raw.trim()))
+			})
+			.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin)),
+		_ => false,
+	}
+}
+
+/// Removes everything in the directory `dir`, keeping the directory.
+fn remove_contents(dir: &Path) -> Result<()> {
+	for entry in fs::read_dir(dir)? {
+		remove_existing(&entry?.path())?;
+	}
+	Ok(())
 }
 
 /// Remove a file, symlink, or directory tree at `path`; missing is fine.
@@ -2675,20 +2885,31 @@ mod tests {
 		admin
 	}
 
+	/// Whether `dir` is an empty directory.
+	#[cfg(target_os = "linux")]
+	fn is_empty_dir(dir: &Path) -> bool {
+		fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+	}
+
+	#[cfg(target_os = "linux")]
 	#[test]
-	fn reclaim_removes_a_dead_adds_tree_and_registration_and_reports_it() {
+	fn reclaim_empties_a_dead_adds_tree_removes_its_registration_and_reports_it() {
+		use std::os::unix::fs::MetadataExt;
 		let (_temp, repo) = fixture();
 		let trees = tempfile::tempdir().unwrap();
 		let tree = trees.path().join("wt");
 		let admin = abandoned_add(&repo, &tree, None);
+		let inode = fs::metadata(&tree).unwrap().ino();
 		let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
 		assert_eq!(notes.len(), 1, "{notes:?}");
-		assert!(notes[0].contains("removed the partial tree"), "{notes:?}");
-		assert!(!tree.exists() && !admin.exists());
+		assert!(notes[0].contains("emptied the partial tree"), "{notes:?}");
+		assert!(is_empty_dir(&tree) && !admin.exists());
+		assert_eq!(fs::metadata(&tree).unwrap().ino(), inode, "the directory was not kept");
+		assert_eq!(tree_token(&tree).unwrap(), None, "the add's token stayed on the directory");
 		// With a lock of the caller's, too.
 		let admin = abandoned_add(&repo, &tree, Some("in use"));
 		assert_eq!(repo.worktree_reclaim_abandoned(&tree).unwrap().len(), 1);
-		assert!(!tree.exists() && !admin.exists());
+		assert!(is_empty_dir(&tree) && !admin.exists());
 	}
 
 	#[test]
@@ -2703,22 +2924,95 @@ mod tests {
 			.worktree_reclaim_abandoned(&live)
 			.unwrap_err()
 			.to_string();
-		assert!(err.contains("still running") && err.contains("nothing was removed"), "{err}");
+		assert!(err.contains("another worktree add that is still running"), "{err}");
+		assert!(!err.contains("Remove the directory"), "{err}");
 		assert!(live.join("partial").is_file() && pending.admin.is_dir());
 		drop(pending);
 		// A marker with no record (written by hand, or emptied) is refused.
-		let bare = trees.path().join("bare");
-		let admin = abandoned_add(&repo, &bare, None);
-		fs::write(admin.join(ADD_IN_PROGRESS), "").unwrap();
-		let err = repo
-			.worktree_reclaim_abandoned(&bare)
-			.unwrap_err()
-			.to_string();
-		assert!(err.contains("records nothing"), "{err}");
-		assert!(bare.join("partial").is_file() && admin.is_dir());
+		#[cfg(unix)]
+		{
+			let bare = trees.path().join("bare");
+			let admin = abandoned_add(&repo, &bare, None);
+			fs::write(admin.join(ADD_IN_PROGRESS), "").unwrap();
+			let err = repo
+				.worktree_reclaim_abandoned(&bare)
+				.unwrap_err()
+				.to_string();
+			assert!(err.contains("records nothing"), "{err}");
+			assert!(bare.join("partial").is_file() && admin.is_dir());
+		}
 	}
 
-	#[cfg(unix)]
+	/// Where the reclaim cannot check a tree, it refuses and keeps it.
+	#[cfg(windows)]
+	#[test]
+	fn reclaim_refuses_where_the_platform_cannot_check() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("cannot check"), "{err}");
+		assert!(tree.join("partial").is_file() && admin.is_dir());
+	}
+
+	/// A directory made again in the tree's place can get the same device
+	/// and inode; without the add's token it is refused and kept.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_directory_without_the_adds_token() {
+		use std::os::unix::fs::MetadataExt;
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		// The same inode without the token: what a filesystem that reuses
+		// the inode at once gives a directory made again.
+		let same = trees.path().join("same-inode");
+		let admin = abandoned_add(&repo, &same, None);
+		tree_mark::clear(&same);
+		fs::write(same.join("my-work.txt"), "mine\n").unwrap();
+		let err = repo
+			.worktree_reclaim_abandoned(&same)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("cannot be told apart"), "{err}");
+		assert!(same.join("my-work.txt").is_file() && admin.is_dir());
+		// A directory really made again, whatever inode it gets.
+		let again = trees.path().join("made-again");
+		let admin = abandoned_add(&repo, &again, None);
+		let before = fs::metadata(&again).unwrap().ino();
+		fs::remove_dir_all(&again).unwrap();
+		fs::create_dir(&again).unwrap();
+		fs::write(again.join("my-work.txt"), "mine\n").unwrap();
+		eprintln!(
+			"made again with the same inode: {}",
+			fs::metadata(&again).unwrap().ino() == before
+		);
+		assert!(repo.worktree_reclaim_abandoned(&again).is_err());
+		assert!(again.join("my-work.txt").is_file() && admin.is_dir());
+	}
+
+	/// A repository someone made in the tree after the add died is theirs.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_tree_holding_a_repository_of_its_own() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::remove_file(tree.join(".git")).unwrap();
+		git(&tree, &["init", "-q", "-b", "main"]);
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("`.git` that is not this registration's"), "{err}");
+		assert!(tree.join(".git/HEAD").is_file() && tree.join("partial").is_file() && admin.is_dir());
+	}
+
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn reclaim_leaves_a_registration_whose_marker_changed_after_it_was_opened() {
 		let (_temp, repo) = fixture();
@@ -2730,7 +3024,14 @@ mod tests {
 		let mut pending = PendingWorktree::begin(&done, &common, &head, Some("in use")).unwrap();
 		pending.link().unwrap();
 		fs::write(done.join("work"), "finished\n").unwrap();
-		let stale = fs::File::open(pending.admin.join(ADD_IN_PROGRESS)).unwrap();
+		let open = |path: &Path| {
+			fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(path)
+				.unwrap()
+		};
+		let stale = open(&pending.admin.join(ADD_IN_PROGRESS));
 		let admin = pending.admin.clone();
 		assert!(pending.finish(Some("in use")).is_empty());
 		drop(pending);
@@ -2741,26 +3042,27 @@ mod tests {
 		let dead = trees.path().join("dead");
 		let admin = abandoned_add(&repo, &dead, None);
 		let marker = admin.join(ADD_IN_PROGRESS);
-		let stale = fs::File::open(&marker).unwrap();
+		let stale = open(&marker);
 		let record = fs::read(&marker).unwrap();
 		fs::remove_file(&marker).unwrap();
 		fs::write(&marker, &record).unwrap();
-		let holder = fs::File::open(&marker).unwrap();
+		let holder = open(&marker);
 		holder.lock().unwrap();
 		assert_eq!(reclaim_with_marker(&common, &admin, &dead, &stale).unwrap(), None);
 		assert!(dead.join("partial").is_file() && admin.is_dir(), "a taken registration was removed");
 		// Control: the same registration, once its holder lets go, is the dead
 		// add's and goes.
 		drop(holder);
-		let fresh = fs::File::open(&marker).unwrap();
+		let fresh = open(&marker);
 		assert!(
 			reclaim_with_marker(&common, &admin, &dead, &fresh)
 				.unwrap()
 				.is_some()
 		);
-		assert!(!dead.exists() && !admin.exists());
+		assert!(is_empty_dir(&dead) && !admin.exists());
 	}
 
+	#[cfg(target_os = "linux")]
 	#[test]
 	fn reclaim_resolves_a_relative_gitdir_against_the_registration() {
 		let (temp, repo) = fixture();
@@ -2774,7 +3076,43 @@ mod tests {
 			Some(resolve_leaf(&tree))
 		);
 		assert_eq!(repo.worktree_reclaim_abandoned(&tree).unwrap().len(), 1);
-		assert!(!tree.exists() && !admin.exists());
+		assert!(is_empty_dir(&tree) && !admin.exists());
+	}
+
+	/// A failed add's `Drop` removes the registration before it lets go of
+	/// the marker, so a reclaim waiting on that marker finds no
+	/// registration to remove (a later add may reuse its name).
+	#[cfg(unix)]
+	#[test]
+	fn drop_removes_the_registration_before_it_releases_the_marker() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let head = git(repo.root(), &["rev-parse", "HEAD"]);
+		for round in 0..50 {
+			let tree = trees.path().join(format!("wt{round}"));
+			let pending = PendingWorktree::begin(&tree, &repo.info().common_dir, &head, None).unwrap();
+			for file in 0..20 {
+				fs::write(tree.join(format!("f{file}")), "partial\n").unwrap();
+			}
+			let marker = pending.admin.join(ADD_IN_PROGRESS);
+			let waiter = fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(&marker)
+				.unwrap();
+			let (ready, wait_ready) = std::sync::mpsc::channel();
+			let reclaim = std::thread::spawn(move || {
+				ready.send(()).unwrap();
+				waiter.lock().unwrap();
+				marker.exists()
+			});
+			wait_ready.recv().unwrap();
+			drop(pending);
+			assert!(
+				!reclaim.join().unwrap(),
+				"round {round}: the marker was free while the registration was still there"
+			);
+		}
 	}
 
 	/// git only warns when it cannot remove its lock at the end of an add;

@@ -7,7 +7,7 @@
 //!
 //! The add runs in a child process: this test binary run again with
 //! [`CHILD_SOURCE`] set, on the test [`interrupted_add_child`] alone.
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::{
 	env, fs,
@@ -228,7 +228,7 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
 		.unwrap_err()
 		.to_string();
-	assert!(refused.contains("still running"), "{refused}");
+	assert!(refused.contains("another worktree add that is still running"), "{refused}");
 	assert!(count_entries(&target) >= 50, "an add removed the tree of an add that is still running");
 
 	end_stopped(child, kill);
@@ -260,7 +260,7 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 		again
 			.notes
 			.iter()
-			.any(|note| note.contains("removed the partial tree")),
+			.any(|note| note.contains("emptied the partial tree")),
 		"{:?}",
 		again.notes
 	);
@@ -352,15 +352,48 @@ fn an_add_refuses_a_killed_adds_tree_someone_unlocked() {
 #[test]
 fn an_add_refuses_a_directory_made_again_in_a_killed_adds_place() {
 	let (_temp, source, repo, target) = abandoned();
+	let before = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&target).unwrap());
 	fs::remove_dir_all(&target).unwrap();
 	fs::create_dir(&target).unwrap();
+	let after = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&target).unwrap());
+	eprintln!("made again with the same inode: {}", before == after);
 	fs::write(target.join("my-work.txt"), "a directory of someone else's\n").unwrap();
 	let refused = repo
 		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
 		.unwrap_err()
 		.to_string();
-	assert!(refused.contains("not the one that add made"), "{refused}");
+	assert!(refused.contains("cannot be told apart"), "{refused}");
 	assert!(target.join("my-work.txt").is_file(), "the directory made again was removed");
+	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
+}
+
+/// Someone replaced the killed add's `.git` with a repository of their own
+/// and committed there: an add of the path refuses, as git refuses a path
+/// that exists, and the repository stays.
+#[test]
+fn an_add_refuses_a_killed_adds_tree_holding_a_repository_of_its_own() {
+	let (_temp, source, repo, target) = abandoned();
+	fs::remove_file(target.join(".git")).unwrap();
+	git(&target, &["init", "-q", "-b", "main"]);
+	fs::write(target.join("my-work.txt"), "committed after the add was killed\n").unwrap();
+	git(&target, &["add", "my-work.txt"]);
+	git(&target, &[
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@example.com",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-qm",
+		"mine",
+	]);
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("`.git` that is not this registration's"), "{refused}");
+	assert_eq!(git(&target, &["log", "-1", "--format=%s"]), "mine", "the repository was removed");
 	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
 }
 
@@ -382,7 +415,7 @@ fn an_add_reclaims_a_killed_add_whose_gitdir_is_relative() {
 		again
 			.notes
 			.iter()
-			.any(|note| note.contains("removed the partial tree")),
+			.any(|note| note.contains("emptied the partial tree")),
 		"{:?}",
 		again.notes
 	);
