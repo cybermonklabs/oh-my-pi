@@ -1,7 +1,29 @@
 import { expect, test } from "bun:test";
 import { AsyncJobManager } from "../../src/async";
-import { runEvalWait } from "../../src/eval/handle-bridge";
+import { runEvalStatus, runEvalWait } from "../../src/eval/handle-bridge";
 import type { ToolSession } from "../../src/tools";
+import { evalHeldAgentResults } from "../../src/tools/eval";
+
+test("an eval cell keeps each subagent's latest handover, whatever order the bridged calls report them in", () => {
+	// If this regresses, a background eval job that reports an older handover (its own cell's time) after a newer
+	// `peek()` handover overwrites it: `omp --restore` reads the turn the subagent began between the two as a new
+	// run and relaunches work whose result the parent already got. The eval tool records its bridged calls'
+	// handovers through this recorder (`EvalTool.execute`).
+	const clock = [3_000, 4_000, 5_000];
+	const held = evalHeldAgentResults(() => clock.shift() ?? Number.NaN);
+	expect(held.list()).toBeUndefined();
+	held.onAgentResults([{ id: "Pool-1" }]);
+	held.onAgentResults([
+		{ id: "Pool-1", at: 1_000 },
+		{ id: "Worker", at: 2_000 },
+	]);
+	held.onAgentResults([{ id: "Worker", at: 2_500, aborted: true }]);
+
+	expect(held.list()).toEqual([
+		{ id: "Pool-1", at: 3_000 },
+		{ id: "Worker", at: 2_500, aborted: true },
+	]);
+});
 
 test("settled eval progress is emitted once", async () => {
 	const manager = new AsyncJobManager({});
@@ -27,6 +49,31 @@ test("settled eval progress is emitted once", async () => {
 		},
 	);
 	expect(events.filter(event => event.op === "agent")).toHaveLength(1);
+	await manager.dispose();
+});
+
+test("records the settled agent handle a wait() hands an eval cell, not one a status poll reads", async () => {
+	// If this regresses, a `status()` or `done()` poll, which gives the cell only the status, reads as a handover:
+	// `omp --restore` then takes the parent for holding a result its cell never got.
+	const manager = new AsyncJobManager({});
+	const id = manager.register("task", "Worker", async () => "failed", {
+		id: "worker-job",
+		ownerId: "Main",
+		agentId: "Worker",
+	});
+	await manager.getJob(id)?.promise;
+	const session = { asyncJobManager: manager, getAgentId: () => "Main" } as Partial<ToolSession> as ToolSession;
+	const held: Array<{ id: string }> = [];
+
+	const polled = runEvalStatus(
+		{ item: { kind: "agent", id } },
+		{ session, onAgentResults: results => held.push(...results) },
+	);
+	expect(polled.status).toBe("completed");
+	expect(held).toEqual([]);
+
+	await runEvalWait({ items: [{ kind: "agent", id }] }, { session, onAgentResults: results => held.push(...results) });
+	expect(held).toEqual([{ id: "Worker" }]);
 	await manager.dispose();
 });
 

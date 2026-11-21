@@ -11,8 +11,11 @@ import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import type { EvalShadowCellSession } from "@oh-my-pi/pi-coding-agent/eval/speculation/cell-session";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 
 function createTool(name: string, execute: AgentTool["execute"]): AgentTool {
 	return {
@@ -76,6 +79,143 @@ describe("callSessionTool", () => {
 
 		expect(result).toBe("hello");
 		expect(statuses).toEqual([expect.objectContaining({ op: "read", path: "/tmp/demo.txt", chars: 5 })]);
+	});
+
+	it("records the subagent results a bridged tool.task hands an eval cell", async () => {
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [
+				{
+					id: "Worker",
+					index: 0,
+					agent: "task",
+					agentSource: "user",
+					task: "work",
+					exitCode: 1,
+					output: "",
+					stderr: "",
+					truncated: false,
+					durationMs: 5,
+					tokens: 0,
+					requests: 1,
+				},
+				{
+					id: "Lost",
+					index: 1,
+					agent: "task",
+					agentSource: "user",
+					task: "work",
+					exitCode: 1,
+					output: "",
+					stderr: "",
+					truncated: false,
+					durationMs: 5,
+					tokens: 0,
+					requests: 1,
+					aborted: true,
+					workerLost: true,
+				},
+			],
+			totalDurationMs: 5,
+		};
+		const held: unknown[] = [];
+		await callSessionTool(
+			"task",
+			{},
+			{
+				session: createSession([
+					createTool("task", async () => ({ content: [{ type: "text", text: "failed" }], details })),
+				]),
+				onAgentResults: results => held.push(...results),
+			},
+		);
+
+		expect(held).toEqual([{ id: "Worker" }, { id: "Lost", aborted: true, workerLost: true }]);
+	});
+
+	it("records the subagent results a bridged tool.wait({}) hands an eval cell: spawns, agent() handles and eval jobs", async () => {
+		// If this regresses, a cell's `await tool.wait({})` takes a background subagent's failed result and its
+		// delivery (no async-result follows), while the eval result records nothing: `omp --restore` then
+		// relaunches the subagent after the parent went on.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		try {
+			const jobs = [
+				manager.register(
+					"task",
+					"Worker",
+					async () => {
+						throw new Error("No API key for provider: anthropic");
+					},
+					{ id: "Worker", ownerId: "Main", agentId: "Worker" },
+				),
+				manager.register("task", "agent()", async () => "done", {
+					id: "agent-job",
+					ownerId: "Main",
+					agentId: "Helper",
+				}),
+				manager.register(
+					"eval",
+					"eval",
+					async ({ reportProgress }) => {
+						await reportProgress("done", { agentResults: [{ id: "Inner", aborted: true }] });
+						return "done";
+					},
+					{ id: "eval-job", ownerId: "Main" },
+				),
+			];
+			for (const id of jobs) await manager.getJob(id)?.promise.catch(() => undefined);
+			const session: ToolSession = {
+				...createSession([]),
+				settings: Settings.isolated({ "launch.enabled": false }),
+				asyncJobManager: manager,
+				getAgentId: () => "Main",
+			};
+			const wait = new WaitTool(session);
+			session.getToolByName = name => (name === "wait" ? (wait as unknown as AgentTool) : undefined);
+			const held: unknown[] = [];
+
+			await callSessionTool("wait", {}, { session, onAgentResults: results => held.push(...results) });
+
+			expect(held).toHaveLength(3);
+			expect(held).toEqual(
+				expect.arrayContaining([{ id: "Worker" }, { id: "Helper" }, { id: "Inner", aborted: true }]),
+			);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
+	});
+
+	it("records the workers a work pool's job hands an eval cell through a bridged tool.wait({})", async () => {
+		// If this regresses, a cell that waits on a pool's job gets every worker's result, but the eval result
+		// names none of them, and `omp --restore` relaunches workers whose failures the parent already got.
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		try {
+			const pool = manager.register(
+				"task",
+				"notes",
+				async ({ reportProgress }) => {
+					await reportProgress("drained", { agentResults: [{ id: "notes-1" }] });
+					return "Pool `notes` completed";
+				},
+				{ id: "notes", ownerId: "Main" },
+			);
+			await manager.getJob(pool)?.promise;
+			const session: ToolSession = {
+				...createSession([]),
+				settings: Settings.isolated({ "launch.enabled": false }),
+				asyncJobManager: manager,
+				getAgentId: () => "Main",
+			};
+			const wait = new WaitTool(session);
+			session.getToolByName = name => (name === "wait" ? (wait as unknown as AgentTool) : undefined);
+			const held: unknown[] = [];
+
+			await callSessionTool("wait", {}, { session, onAgentResults: results => held.push(...results) });
+
+			expect(held).toContainEqual({ id: "notes-1" });
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
 	});
 
 	it("returns a large result whole, without the model's artifact spill or notices", async () => {

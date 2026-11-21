@@ -15,7 +15,12 @@ import {
 	type EvictedJob,
 } from "./job-manager";
 
-import { renderStructuredJson, structuredStatusLabel, taskAgentHandles } from "../session/async-job-delivery";
+import {
+	readEvalAgentResults,
+	renderStructuredJson,
+	structuredStatusLabel,
+	taskAgentHandles,
+} from "../session/async-job-delivery";
 import { AGENT_KILL_LABEL, type InterruptReason } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -221,6 +226,10 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 		}
 		const running = latest.status === "running";
 		const widget = current ? session.asyncJobManager?.widgets?.view(current) : undefined;
+		// A settled job records the subagent results it handed over (an eval job's cells', a work pool's workers');
+		// a `wait` that takes the job's delivery must carry them, or `omp --restore` reads the parent as still
+		// waiting on them.
+		const agentResults = running ? undefined : readEvalAgentResults(latest.latestDetails);
 		return {
 			id: latest.id,
 			type: latest.type,
@@ -247,6 +256,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			...(!resultConsumed && latest.structured ? { structured: latest.structured } : {}),
 			...(latest.type === "task" ? { agentUrlId: current?.agentId ?? latest.id } : {}),
 			...(latest.agentOutputPublished !== undefined ? { agentOutputPublished: latest.agentOutputPublished } : {}),
+			...(agentResults ? { agentResults } : {}),
 		};
 	});
 }

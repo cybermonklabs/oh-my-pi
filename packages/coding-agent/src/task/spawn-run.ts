@@ -65,13 +65,17 @@ export class SpawnRun {
 	readonly started: Promise<SpawnLaunchTiming>;
 	/** The run's payload; rejects only when `started` does. */
 	readonly result: Promise<AgentToolResult<TaskToolDetails>>;
+	/** Told the abort reason once the run is discarded. */
+	readonly #onDiscard: ((abortReason: unknown) => void) | undefined;
 
 	/** Acquire a permit, then run `body` and release the permit when it settles. */
 	constructor(
 		permit: SpawnPermit,
 		body: (run: SpawnRunBody) => Promise<AgentToolResult<TaskToolDetails>>,
 		readonly identity: SpawnIdentity,
+		onDiscard?: (abortReason: unknown) => void,
 	) {
+		this.#onDiscard = onDiscard;
 		const invokedAt = Date.now();
 		this.started = permit.acquire(this.#controller.signal).then(() => ({ invokedAt, acquiredAt: Date.now() }));
 		this.result = this.started.then(async timing => {
@@ -124,12 +128,19 @@ export class SpawnRun {
 		}
 	}
 
-	/** Abort an unadopted run and drop anything it retained; nothing ever consumes its result. */
-	discard(reason: string): void {
+	/**
+	 * Abort an unadopted run and drop anything it retained; nothing ever consumes its result.
+	 * The run aborts with `abortReason`: by default an error naming `reason`, which stops a
+	 * sync run's turn; a discard caused by the call's own abort passes that abort's reason,
+	 * so the run stops or is cut off with it, as its parent's turn is.
+	 */
+	discard(reason: string, abortReason: unknown = new Error(reason)): void {
+		if (this.#discarded) return;
 		this.#discarded = true;
-		this.#controller.abort(new Error(reason));
+		this.#controller.abort(abortReason);
 		const retained = this.#retainedCleanup;
 		this.#retainedCleanup = undefined;
 		if (retained) void retained();
+		this.#onDiscard?.(abortReason);
 	}
 }

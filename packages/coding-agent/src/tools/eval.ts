@@ -55,7 +55,7 @@ import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveAdvertisedEvalBackends, resolveEvalBackends } from "./eval-backends";
-import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
+import { type EvalHeldAgentResult, recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
@@ -282,6 +282,40 @@ function formatEvalInputLanguage(value: string): string {
 	if (value === "py" || value === "python") return "python";
 	if (value === "js" || value === "javascript") return "javascript";
 	return value;
+}
+
+/**
+ * Records subagent handovers in `held`, by id: one without its own time is dated `now`, and an id's latest
+ * handover wins whatever order they are reported in. A background eval job reports when its own cell got a
+ * result, which can be older than a handover the reporting cell got since; `omp --restore` reads a turn the
+ * subagent began after an id's latest handover as a new run.
+ */
+function recordHeldAgentResults(
+	held: Map<string, EvalHeldAgentResult>,
+	results: readonly EvalHeldAgentResult[],
+	now: number,
+): void {
+	for (const result of results) {
+		const at = result.at ?? now;
+		const known = held.get(result.id)?.at;
+		if (known === undefined || known <= at) held.set(result.id, { ...result, at });
+	}
+}
+
+/**
+ * The subagent handovers one eval call records: its bridged calls report them through
+ * `onAgentResults` ({@link recordHeldAgentResults}, dated by `clock`), and `list()` gives what the
+ * call's result records, or nothing when no call handed one over.
+ */
+export function evalHeldAgentResults(clock: () => number = Date.now): {
+	onAgentResults: (results: EvalHeldAgentResult[]) => void;
+	list: () => EvalHeldAgentResult[] | undefined;
+} {
+	const held = new Map<string, EvalHeldAgentResult>();
+	return {
+		onAgentResults: results => recordHeldAgentResults(held, results, clock()),
+		list: () => (held.size > 0 ? [...held.values()] : undefined),
+	};
 }
 
 export class EvalTool implements AgentTool<typeof evalSchema> {
@@ -791,6 +825,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 			const images: ImageContent[] = [];
 			const replies: string[] = [];
+			// Subagents whose results the cells' bridged calls handed them, by id, each with when it was handed over
+			// (a result an eval job's own cells got keeps their time). The result records them, so `omp --restore`
+			// knows this parent already holds those results, and which turn each one settles.
+			const heldAgentResults = evalHeldAgentResults();
+			const onAgentResults = heldAgentResults.onAgentResults;
 
 			const cellResults: EvalCellResult[] = cells.map(cell => ({
 				index: cell.index,
@@ -930,6 +969,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							outputSink!.push(chunk);
 						},
 						onReply,
+						onAgentResults,
 						onStatus: event => {
 							if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
 								idle?.pause();
@@ -1042,6 +1082,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						languages,
 						cells: cellResults,
 						replies: replies.length > 0 ? replies : undefined,
+						agentResults: heldAgentResults.list(),
 						isError: true,
 					};
 					if (notice) details.notice = notice;
@@ -1072,6 +1113,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				languages,
 				cells: cellResults,
 				replies: replies.length > 0 ? replies : undefined,
+				agentResults: heldAgentResults.list(),
 			};
 			if (notice) details.notice = notice;
 

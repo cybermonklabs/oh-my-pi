@@ -4,6 +4,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { Settings } from "../config/settings";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { EVAL_AGENT_SPAWN_MESSAGE_TYPE } from "./agent-record";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import {
 	buildStructuredSubagentRecoveryHint,
@@ -215,6 +216,8 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			throw new ToolError("agent() needs the session's async job manager; unavailable here");
 		}
 		const id = await reserveStructuredSubagentId(options.session, { label: parsed.label });
+		// Durable positive evidence for --restore if the parent exits before this background job delivers.
+		options.session.sessionManager?.appendCustomEntry(EVAL_AGENT_SPAWN_MESSAGE_TYPE, { id, status: "unsettled" });
 		const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		manager.register(
 			"task",

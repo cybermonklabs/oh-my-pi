@@ -9,6 +9,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/eval/py/tool-bridge";
 import type { EvalShadowCellSession } from "@oh-my-pi/pi-coding-agent/eval/speculation/cell-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { $which, isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
@@ -74,6 +75,46 @@ describe("Python tool bridge HTTP server", () => {
 			const body = await res.json();
 			expect(res.status).toBe(200);
 			expect(body).toEqual({ ok: true, value: "file body" });
+		} finally {
+			unregister();
+		}
+	});
+
+	it("records the subagent results a Python cell's tool.task hands it", async () => {
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [
+				{
+					id: "Worker",
+					index: 0,
+					agent: "task",
+					agentSource: "user",
+					task: "work",
+					exitCode: 1,
+					output: "",
+					stderr: "",
+					truncated: false,
+					durationMs: 5,
+					tokens: 0,
+					requests: 1,
+				},
+			],
+			totalDurationMs: 5,
+		};
+		const held: unknown[] = [];
+		const info = await ensurePyToolBridge();
+		const sessionId = `python-task-result-${crypto.randomUUID()}`;
+		const unregister = registerPyToolBridge(sessionId, "run", {
+			toolSession: makeSession(
+				new Map([["task", makeFakeTool("task", [], { content: [{ type: "text", text: "failed" }], details })]]),
+			),
+			onAgentResults: results => held.push(...results),
+		});
+		try {
+			const res = await call(info, { session: sessionId, run: "run", name: "task", args: {} });
+			const body = await res.json();
+			expect(body).toMatchObject({ ok: true, value: { text: "failed", details } });
+			expect(held).toEqual([{ id: "Worker" }]);
 		} finally {
 			unregister();
 		}

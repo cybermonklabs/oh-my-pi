@@ -33,20 +33,29 @@ import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { invalidateAllCommandConfigs } from "@oh-my-pi/pi-coding-agent/config/resolve-config-value";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { isolateDaemonForSmokeTest, probeDaemon } from "@oh-my-pi/pi-coding-agent/daemon/client";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { hasRestorableTurn, SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { __resetDirsFromEnvForTests, isPidAlive, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -197,6 +206,42 @@ function taskDetails(messages: readonly AgentMessage[]): TaskToolDetails | undef
 /** Requests that offered `toolName`: the turns of a session, not its label or title requests. */
 function turnsOffering(model: MockModel, toolName: string): MockCall[] {
 	return model.calls.filter(call => (call.context.tools ?? []).some(tool => tool.name === toolName));
+}
+
+/**
+ * The entries of the branch that ends at `leafId`, root first. A local walk, so the file
+ * also runs where the shared branch helper does not exist yet (the base and the release).
+ */
+function branchTo(entries: readonly SessionEntry[], leafId: string | null): SessionEntry[] {
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const branch: SessionEntry[] = [];
+	for (let entry = leafId ? byId.get(leafId) : undefined; entry;) {
+		branch.unshift(entry);
+		entry = entry.parentId ? byId.get(entry.parentId) : undefined;
+	}
+	return branch;
+}
+
+/** How the last message of `branch` ended its turn, when an assistant wrote it. */
+function assistantTail(branch: readonly SessionEntry[]) {
+	const tail = branch.filter(entry => entry.type === "message").at(-1);
+	if (tail?.type !== "message" || tail.message.role !== "assistant") return undefined;
+	const { stopReason, errorMessage, credentialUnavailable } = tail.message;
+	return { stopReason, errorMessage, credentialUnavailable };
+}
+
+/** Holds the backoff wait (a wait of a second or more) until it is aborted; shorter waits pass at once. */
+function holdBackoff() {
+	const started = Promise.withResolvers<void>();
+	const wait = vi.spyOn(scheduler, "wait").mockImplementation(async (delayMs, options) => {
+		options?.signal?.throwIfAborted();
+		if (delayMs < 1_000) return;
+		started.resolve();
+		const held = Promise.withResolvers<void>();
+		options?.signal?.addEventListener("abort", () => held.reject(options.signal?.reason), { once: true });
+		await held.promise;
+	});
+	return { started: started.promise, wait };
 }
 
 /**
@@ -524,17 +569,28 @@ function keyFileCommand(file: string): string {
 	return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
 }
 
-/** A turn on a real `Agent` whose one request ends as `streamFn` makes it end: the failed message. */
-async function storedFailedTurn(streamFn: StreamFn): Promise<AssistantMessage> {
+/**
+ * A turn on a real `Agent` whose one request ends as `streamFn` makes it end, stored
+ * in a session whose process then exits normally: the failed message, and whether
+ * `omp --restore` would go on with the session.
+ */
+async function storedFailedTurn(streamFn: StreamFn): Promise<{ failed: AssistantMessage; restorable: boolean }> {
 	const agent = new Agent({
 		getApiKey: async () => "test-key",
 		initialState: { model: bundledModel(ANTHROPIC_MODEL), systemPrompt: ["Test"], tools: [], messages: [] },
 		streamFn,
 	});
 	await agent.prompt("work");
+	const sessionManager = SessionManager.inMemory();
+	for (const message of agent.state.messages as Message[]) sessionManager.appendMessage(message);
+	sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+		reason: "dispose",
+		kind: "normal",
+		recordedAt: new Date().toISOString(),
+	});
 	const failed = agent.state.messages.at(-1);
 	if (failed?.role !== "assistant") throw new Error("Expected the turn to end on an assistant message");
-	return failed;
+	return { failed, restorable: hasRestorableTurn(sessionManager.getBranch()) };
 }
 
 describe("AgentSession: a provider key that cannot be resolved for a moment", () => {
@@ -612,13 +668,13 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 	}
 
 	for (const mode of OUTAGE_MODES) {
-		it(`ends the turn past the bound on an error marked credentialUnavailable (${mode})`, async () => {
-			// If this regresses, the turn ends at once, or ends unmarked, as though a provider had refused it.
+		it(`ends the turn with a resumable error past the bound, and omp --restore finishes it (${mode})`, async () => {
+			// If this regresses, the turn ends at once unmarked, and `--restore` finds nothing to go on with.
 			const ctx = await setUp();
 			const keys = keyOutage(ctx, mode);
 			const worker = await openSession(ctx, {
 				maxRetries: 2,
-				sessionManager: SessionManager.inMemory(),
+				sessionManager: SessionManager.create(root.path(), root.join("sessions")),
 				outage: { keys, startOn: "probe", resolvesWhileDown: Number.POSITIVE_INFINITY },
 			});
 			mockSchedulerWaitWithClock();
@@ -638,6 +694,28 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 			expect(worker.retryStarts.map(event => event.attempt)).toEqual([1, 2]);
 			expect(worker.retryEnds).toEqual([expect.objectContaining({ success: false, attempt: 2 })]);
 			expect(worker.mock.calls).toHaveLength(1);
+
+			// The worker process exits normally on the failed turn. (The cleanup's later dispose
+			// of the same session returns this call's promise.)
+			const sessionFile = worker.session.sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await worker.session.dispose();
+
+			// The key is readable again; a new process restores the session.
+			await keys.end();
+			const restarted = await openSession(ctx, {
+				maxRetries: 2,
+				sessionManager: await SessionManager.open(sessionFile),
+			});
+			await expect(restarted.session.restoreInterruptedTurn()).resolves.toBe(true);
+			await restarted.session.waitForIdle();
+
+			const last = lastAssistant(restarted.session);
+			expect(last.stopReason).toBe("stop");
+			expect(last.content).toContainEqual({ type: "text", text: FINAL_ANSWER });
+			// It went on from the tool result: one request, and the tool did not run again.
+			expect(restarted.mock.calls).toHaveLength(1);
+			expect(restarted.probeRuns).toEqual([]);
 		});
 	}
 
@@ -671,8 +749,8 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		expect(mock.calls).toHaveLength(0);
 	});
 
-	it("a `!command` key that printed nothing ends the turn after the command's own cap of 3 retries", async () => {
-		// If this regresses, the turn spends all of retry.maxRetries on a command that keeps failing.
+	it("a `!command` key that printed nothing past its retry cap leaves a turn omp --restore finishes", async () => {
+		// If this regresses, the failed turn is final: `--restore` finds nothing to go on with.
 		const keyFile = root.join("key.txt");
 		await Bun.write(keyFile, "FAIL");
 		const ctx = await setUp({
@@ -685,13 +763,13 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 				},
 			},
 		});
-		// Command results and failure windows are process-wide.
+		// Command results and failure windows are process-wide; a new process starts without them.
 		cleanups.push(() => invalidateAllCommandConfigs());
 		const model = ctx.modelRegistry.find(COMMAND_PROVIDER, "custom-model");
 		if (!model) throw new Error("Expected the command-keyed test model");
 		const worker = await openSession(ctx, {
 			maxRetries: 10,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.create(root.path(), root.join("sessions")),
 			model,
 		});
 		mockSchedulerWaitWithClock();
@@ -709,6 +787,27 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		}).toEqual({ stopReason: "error", credentialUnavailable: true, retryAttempts: [1, 2, 3] });
 		expect(failed.errorMessage).toContain(`The apiKey command for provider ${COMMAND_PROVIDER} produced no key`);
 		expect(worker.mock.calls).toHaveLength(0);
+
+		const sessionFile = worker.session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		await worker.session.dispose();
+
+		// The command prints a key again; a new process restores the session.
+		await Bun.write(keyFile, "recovered-key");
+		invalidateAllCommandConfigs();
+		const restarted = await openSession(ctx, {
+			maxRetries: 10,
+			sessionManager: await SessionManager.open(sessionFile),
+			model,
+		});
+		await expect(restarted.session.restoreInterruptedTurn()).resolves.toBe(true);
+		await restarted.session.waitForIdle();
+
+		const last = lastAssistant(restarted.session);
+		expect(last.stopReason).toBe("stop");
+		expect(last.content).toContainEqual({ type: "text", text: FINAL_ANSWER });
+		expect(restarted.mock.calls).toHaveLength(2);
+		expect(restarted.probeRuns).toEqual(["x"]);
 	});
 
 	it("retries a turn whose auth broker cannot be reached while a tool runs, and finishes once it answers", async () => {
@@ -897,6 +996,110 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		expect(waited).not.toContain("No job finished");
 	}, 30_000);
 
+	it("a retry that a fork superseded while it was announced leaves its turn for omp --restore, after an earlier stop", async () => {
+		// If this regresses, a retry that a session transition superseded reads as the user's stop once the session saw
+		// any stop before: the turn ends on a "Retry cancelled" record, and `--restore` leaves a turn nobody stopped.
+		const ctx = await setUp();
+		const keys = keyOutage(ctx, "credential-disabled");
+		await keys.start();
+		const sessionManager = SessionManager.create(root.path(), root.join("sessions"));
+		const forking: { session?: AgentSession } = {};
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				// The user forks the session (`/fork`) while the retry's announcement is handled.
+				pi.on("auto_retry_start", async () => {
+					await forking.session?.fork();
+				});
+			},
+			root.path(),
+			new EventBus(),
+			runtime,
+			"fork-during-retry",
+		);
+		const { session, mock, retryEnds } = await openSession(ctx, {
+			maxRetries: 2,
+			sessionManager,
+			outage: { keys, startOn: "prompt", resolvesWhileDown: Number.POSITIVE_INFINITY },
+			extensionRunner: new ExtensionRunner([extension], runtime, root.path(), sessionManager, ctx.modelRegistry),
+		});
+		forking.session = session;
+		mockSchedulerWaitWithClock();
+		// Earlier, the user stopped a retry (an RPC `abort_retry`, sent while none ran).
+		session.abortRetry();
+		const firstFile = sessionManager.getSessionFile();
+
+		await session.prompt("run the probe");
+		await session.waitForIdle();
+
+		// The fork superseded the retry: the turn did not go on, and no request went out without a key.
+		expect(sessionManager.getSessionFile()).not.toBe(firstFile);
+		expect(retryEnds).toEqual([
+			expect.objectContaining({ success: false, attempt: 1, finalError: "Retry cancelled" }),
+		]);
+		expect(mock.calls).toHaveLength(0);
+		// Nobody stopped the turn: its marked failed attempt is still its tail, and `--restore` goes on with it.
+		const branch = sessionManager.getBranch();
+		expect(assistantTail(branch)).toMatchObject({ stopReason: "error", credentialUnavailable: true });
+		expect(hasRestorableTurn(branch)).toBe(true);
+	}, 30_000);
+
+	/** Stops of a parent's turn, the user's and the session's own; each must stop the sync subagent it waits on. */
+	const PARENT_STOPS: Record<string, (parent: AgentSession) => Promise<unknown>> = {
+		"the user's Esc or an RPC `abort`": parent => parent.abort({ reason: USER_INTERRUPT_LABEL }),
+		"a bare abort() with no reason": parent => parent.abort(),
+		"/new": parent => parent.newSession(),
+	};
+
+	for (const [stop, stopParent] of Object.entries(PARENT_STOPS)) {
+		it(`a parent's stop (${stop}) stops its sync subagent waiting to retry its key, and omp --restore leaves it`, async () => {
+			// If this regresses, the parent's stop reads to the subagent as its parent's process exit: the subagent's
+			// turn keeps its key marker, and `--restore` of the parent sends the stopped work again.
+			const { parent, workerModel } = await openParentWithKeyedWorker({ async: false, retryDelayMs: 5_000 });
+			const backoff = holdBackoff();
+			const prompting = parent.prompt("Delegate reading the notes.").catch(() => undefined);
+			// The worker's first request went out; its next one has no key and waits out the backoff.
+			await backoff.started;
+			expect(turnsOffering(workerModel, "read")).toHaveLength(1);
+			const parentFile = parent.sessionManager.getSessionFile();
+			if (!parentFile) throw new Error("Expected a persisted parent session file");
+			// The parent's turn is stopped, then the user quits.
+			await stopParent(parent);
+			await prompting;
+			backoff.wait.mockRestore();
+			await parent.dispose();
+			await AgentLifecycleManager.global().dispose();
+
+			const subSessions = Object.values(await collectSubSessions(parentFile));
+			expect(subSessions).toHaveLength(1);
+			const worker = subSessions[0]!;
+			const branch = branchTo(worker.entries, worker.leafId);
+			// The stop ended the worker's turn after its marked attempt.
+			expect(assistantTail(branch)).toEqual({
+				stopReason: "aborted",
+				errorMessage: "Retry cancelled",
+				credentialUnavailable: undefined,
+			});
+			expect(hasRestorableTurn(branch)).toBe(false);
+
+			// A new process restores the parent: no subagent goes on.
+			const manager = new AsyncJobManager({});
+			cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
+			manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
+			const followUp = vi
+				.spyOn(executorModule, "runSubagentFollowUpTurn")
+				.mockRejectedValue(new Error("relaunched a subagent whose parent stopped it"));
+			const restoring = {
+				sessionManager: await SessionManager.open(parentFile),
+				asyncJobManager: manager,
+				settings: Settings.isolated(),
+				restoreInterruptedTurn: vi.fn(async () => false),
+			} as unknown as AgentSession;
+			await expect(restoreSession(restoring)).resolves.toEqual({ turn: false, subagents: [] });
+			expect(followUp).not.toHaveBeenCalled();
+		}, 30_000);
+	}
+
 	/** Ways the user ends a provider's credentials; each must end a turn at once, never retry it. */
 	const USER_REMOVALS: Record<string, (authStorage: AuthStorage) => Promise<void>> = {
 		"removed the credential": authStorage => authStorage.credentials.remove("anthropic"),
@@ -913,8 +1116,8 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 
 	for (const [removal, remove] of Object.entries(USER_REMOVALS)) {
 		it(`ends the turn at once, and refuses the next prompt, when the user ${removal}`, async () => {
-			// If this regresses, the turn waits out the retry budget for a key the user removed, or the next
-			// prompt starts another such turn.
+			// If this regresses, the turn waits out the retry budget for a key the user removed, the next
+			// prompt starts another such turn, or `--restore` resumes it.
 			const ctx = await setUp();
 			const keys: KeyOutage = { start: () => remove(ctx.authStorage), end: async () => {} };
 			const { session, mock, retryStarts } = await openSession(ctx, {
@@ -938,6 +1141,7 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 			session.setPromptDropped(prompt => dropped.push(prompt.text));
 			await expect(session.prompt("again")).rejects.toThrow("No API key found for anthropic");
 			expect(dropped).toEqual(["again"]);
+			await expect(session.restoreInterruptedTurn()).resolves.toBe(false);
 		});
 	}
 
@@ -998,21 +1202,22 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 		expect(authStorage.credentials.has("github-copilot")).toBe(true);
 	});
 
-	it("a thrown error that is no CredentialUnavailableError leaves an unmarked turn", async () => {
-		// If this regresses, a turn that failed for good reads as one whose key could not be resolved.
+	it("a thrown error that is no CredentialUnavailableError leaves an unmarked turn that is not restorable", async () => {
+		// If this regresses, `--restore` relaunches a turn that failed for good, even after a normal exit.
 		// The text names a missing key, but the error is no CredentialUnavailableError: only that class marks a turn.
-		const failed = await storedFailedTurn(() => {
+		const { failed, restorable } = await storedFailedTurn(() => {
 			throw new Error("No API key for provider: anthropic");
 		});
-		expect({ stopReason: failed.stopReason, credentialUnavailable: failed.credentialUnavailable }).toEqual({
-			stopReason: "error",
-			credentialUnavailable: undefined,
-		});
+		expect({
+			stopReason: failed.stopReason,
+			credentialUnavailable: failed.credentialUnavailable,
+			restorable,
+		}).toEqual({ stopReason: "error", credentialUnavailable: undefined, restorable: false });
 	});
 
-	it("a streamed provider error with status 529 leaves an unmarked turn", async () => {
-		// If this regresses, a turn the provider answered reads as one whose key could not be resolved.
-		const failed = await storedFailedTurn(model => {
+	it("a streamed provider error with status 529 leaves an unmarked turn that is not restorable", async () => {
+		// If this regresses, `--restore` relaunches a turn the provider answered, even after a normal exit.
+		const { failed, restorable } = await storedFailedTurn(model => {
 			const stream = new AssistantMessageEventStream();
 			const overloaded: AssistantMessage = {
 				...createAssistantMessage(""),
@@ -1031,10 +1236,11 @@ describe("AgentSession: a provider key that cannot be resolved for a moment", ()
 			return stream;
 		});
 		expect(failed.errorStatus).toBe(529);
-		expect({ stopReason: failed.stopReason, credentialUnavailable: failed.credentialUnavailable }).toEqual({
-			stopReason: "error",
-			credentialUnavailable: undefined,
-		});
+		expect({
+			stopReason: failed.stopReason,
+			credentialUnavailable: failed.credentialUnavailable,
+			restorable,
+		}).toEqual({ stopReason: "error", credentialUnavailable: undefined, restorable: false });
 	});
 
 	it("leaves a pooled session's missing key final, as before", async () => {

@@ -151,6 +151,7 @@ import { combine, type SettingsScope } from "../config/registry";
 import { type Settings, withActiveSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
 import { releaseCompletionHandles } from "../eval/completion-bridge";
+import { evalAgentResultId, EVAL_AGENT_SPAWN_MESSAGE_TYPE } from "../eval/agent-record";
 import { releaseJudgmentBatches } from "../eval/judgment-batch-bridge";
 import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PythonResult } from "../eval/py/executor";
@@ -411,6 +412,7 @@ import {
 	createInterruptedTurnAbortMessage,
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
+	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -4035,6 +4037,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = job ? Math.max(0, (job.endTime ?? Date.now()) - job.startTime) : undefined;
+		// This state transition must happen before the result is queued. If the process crashes
+		// between them, `delivered` is conservative: --restore must never relaunch a run whose
+		// parent might already have received its result.
+		const evalAgentId = evalAgentResultId(job);
+		if (evalAgentId) {
+			this.sessionManager.appendCustomEntry(EVAL_AGENT_SPAWN_MESSAGE_TYPE, {
+				id: evalAgentId,
+				status: "delivered",
+			});
+		}
 		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
 			jobId,
 			result: formatted,
@@ -5998,8 +6010,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
-	/** Cancel scheduled continuations; `reason` labels a continuation already running, as `agent.abort(reason)` does. */
-	async #cancelPostPromptTasks(reason?: string): Promise<void> {
+	/**
+	 * Cancel scheduled continuations. `reason` is the abort reason of a continuation already
+	 * running, as `agent.abort(reason)` gives its turn: its text labels the turn's end, and its
+	 * kind ({@link turnAbortKind}) stops a sync subagent of that turn or cuts it off. Give the
+	 * reason the turn's own abort gives, or the platform's reason marked with its kind.
+	 */
+	async #cancelPostPromptTasks(reason: string | DOMException): Promise<void> {
 		this.#postPromptTasksAbortController.abort(reason);
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#ttsr.resolveResume();
@@ -7223,11 +7240,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
-		this.abortRetry();
+		// A process ending under a turn cuts it off instead of stopping it: a turn waiting to
+		// retry keeps its failed attempt, and a turn still in flight is labelled as interrupted,
+		// so `omp --restore` goes on with it. Any other dispose (a quit) stops the turn, also one
+		// waiting to retry. The reason says the kind to a sync subagent of the turn or of a
+		// continuation already running.
+		const cutOff = cutsTurnOff(options.reason);
+		this.#recovery.abortRetry({ cutOff });
 		this.abortCompaction();
-		// A process ending under a turn still in flight cuts it off instead of
-		// stopping it: label it as interrupted so `omp --restore` goes on with it.
-		const abortReason = cutsTurnOff(options.reason) ? INTERRUPTED_TURN_ERROR : undefined;
+		const abortReason = cutOff ? INTERRUPTED_TURN_ERROR : plainTurnAbortReason("stop");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);
 		this.agent.abort(abortReason);
 		try {
@@ -7465,7 +7486,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		//     re-deliver stale tool output into the cleared conversation
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
-		await this.#cancelPostPromptTasks();
+		await this.#cancelPostPromptTasks(plainTurnAbortReason("stop"));
 		this.#cancelOwnAsyncJobs();
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
@@ -12736,16 +12757,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * message's `errorMessage`. Interrupt reasons (`USER_INTERRUPT_LABEL` for a person and
 	 * `AGENT_KILL_LABEL` for a parent agent's kill) also flag the abort as deliberate. Omit it for
 	 * internal/lifecycle aborts.
+	 *
+	 * The abort stops a turn waiting to retry: the turn ends with an aborted record
+	 * after its failed attempt, and `omp --restore` leaves it. That is right when
+	 * whoever aborts takes the aborted result: the user's stop, or an owner whose
+	 * own turn goes on. `cutOff` is for a session that is going away instead. The
+	 * agent's abort reason tells the turn's tools which it is ({@link turnAbortKind}),
+	 * so a sync subagent stops or is cut off with its parent.
 	 */
 	async abort(options?: {
 		goalReason?: "interrupted" | "internal";
 		reason?: string;
+		/**
+		 * The session's process is going away (an exit, a signal, a shutdown): a turn
+		 * waiting to retry is cut off, not stopped, and keeps its failed attempt as its
+		 * tail, so `omp --restore` goes on with it. The interrupted-turn reason
+		 * (`INTERRUPTED_TURN_ERROR`), which a shutdown gives, cuts the turn off too; a
+		 * cut-off gives no other reason.
+		 */
+		cutOff?: boolean;
 		/** Force queued user follow-ups into the continuation after a user interrupt. */
 		deliverQueuedMessages?: boolean;
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = isInterruptReason(options?.reason);
+		const cutOff = options?.cutOff === true || options?.reason === INTERRUPTED_TURN_ERROR;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		// Latch only when the interrupt stops something; an idle Esc would otherwise fold
 		// every later background completion for the rest of the session. A paused run counts:
@@ -12777,7 +12814,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#abortAutolearnCapture();
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			for (const controller of this.#imageDescriptionAbortControllers) controller.abort(options?.reason);
-			this.abortRetry();
+			this.#recovery.abortRetry({ cutOff });
 			this.#promptGeneration++;
 			// Cancel any awaited pre-dispatch setup (e.g. Hindsight auto-recall) so the
 			// admitted submission unwinds now instead of at the recall timeout (#12668).
@@ -12795,11 +12832,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} else {
 				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
 			}
+			// Without a reason of the caller's, the reason still says whether this stops the turn or cuts it off,
+			// to the turn and to a continuation already running, which aborts first (`AbortSignal.any` keeps it).
+			// An eval cell of the turn aborts first too, from the eval abort below: it gets the same reason.
+			const turnAbortReason = options?.reason ?? plainTurnAbortReason(cutOff ? "cutOff" : "stop");
 			this.abortBash();
-			this.abortEval();
+			this.abortEval(turnAbortReason);
 			const computerControlRevocation = revokeComputerControlForOwner(this.#eval.getKernelOwnerId());
-			const postPromptDrain = this.#cancelPostPromptTasks(options?.reason);
-			this.agent.abort(options?.reason);
+			const postPromptDrain = this.#cancelPostPromptTasks(turnAbortReason);
+			this.agent.abort(turnAbortReason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
 			this.#persistToolResultsEndedWhileDisconnected();
@@ -12809,8 +12850,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// agent_end is awaited: a message_end stalled in an extension hook would
 			// otherwise hold /new and every abort for the full handler timeout.
 			await this.#drainAgentEndMaintenance();
-			this.abortRetry();
-			await this.#cancelPostPromptTasks();
+			this.#recovery.abortRetry({ cutOff });
+			await this.#cancelPostPromptTasks(turnAbortReason);
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
@@ -13976,7 +14017,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	// Auto-Retry
 	// =========================================================================
 
-	/** Cancel an in-progress retry. */
+	/** Cancel an in-progress retry: the user stops the turn, so it ends as aborted and `omp --restore` leaves it. */
 	abortRetry(): void {
 		this.#recovery.abortRetry();
 	}
@@ -14018,8 +14059,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
 	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
 	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A turn that finished, failed, or the user interrupted stays
-	 * as it is.
+	 * transcript stops. A turn that failed because no request could resolve its
+	 * provider key is retried the same way, even after a normal exit: nothing was
+	 * sent, and a worker that exits on it has nothing else to resume it. A turn
+	 * that finished, failed otherwise, or the user interrupted stays as it is.
 	 *
 	 * @returns whether a continuation was scheduled; false while a turn runs, without
 	 * a model, or with nothing left unfinished.
@@ -14117,10 +14160,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Cancel running Python execution.
+	 * Cancel running eval executions (user Python, eval tool cells) with `reason`, by
+	 * default the platform's reason marked as a stop: a sync subagent a cell started
+	 * stops or is cut off by its kind ({@link turnAbortKind}).
 	 */
-	abortEval(): void {
-		this.#eval.abort();
+	abortEval(reason: unknown = plainTurnAbortReason("stop")): void {
+		this.#eval.abort(reason);
 	}
 
 	/** Whether a Python execution is currently running */
@@ -15136,7 +15181,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.sessionManager.flush();
 		// Last refusal point. Nothing below is rolled back when the transition stops, so an
 		// idle-only snapshot refuses here, after the flush awaits but before any state of the
-		// old session (pending messages, async jobs, auto-learn capture) is discarded.
+		// old session (pending messages, auto-learn capture) is discarded.
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 
 		// Clear pending messages (bound to old session state)
@@ -15147,7 +15192,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -15174,6 +15218,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As on a switch: the outgoing session's background jobs share this agent id, so their
+			// results would otherwise land in the new transcript (their deliveries wait while the
+			// transition runs). They are cancelled once the new session exists, so a work pool this
+			// stops records its discards in the session the user goes on with, which kept the pool's
+			// spawn records, as well as in the one it left. Only a delivery waits: on the empty-session
+			// path (a branch from a user message that is the session's first entry) the manager's
+			// `newSession` and `setSessionName` await after the swap, so a record a running job or cell
+			// appends in that window, such as a pool's spawn record or an eval cell's handover record,
+			// goes into the new session.
+			this.#cancelOwnAsyncJobs();
 			this.#prunedTerminalFailure = undefined;
 			this.#clearSessionScopedToolState();
 			this.#rehydrateCheckpointRewindState();
@@ -15262,7 +15316,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			: undefined;
 
 		await withTimeout(
-			this.#cancelPostPromptTasks(),
+			this.#cancelPostPromptTasks(plainTurnAbortReason("stop")),
 			POST_PROMPT_DRAIN_TIMEOUT_MS,
 			"Timed out draining post-prompt tasks before /btw branch",
 		);
@@ -15278,7 +15332,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -15301,6 +15354,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As in {@link #branchIntoNewSession}: cancelled once the new session exists. Before the
+			// branch, a work pool this stops would append its discards to the leaf this branch is
+			// pinned to, and the branch would refuse the changed session.
+			this.#cancelOwnAsyncJobs();
 
 			this.#prunedTerminalFailure = undefined;
 			this.#clearSessionScopedToolState();
@@ -15776,7 +15833,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isIdle: () => !this.isStreaming,
 			hasQueuedMessages: () => this.queuedMessageCount > 0,
 			abort: () => {
-				this.agent.abort();
+				this.agent.abort(plainTurnAbortReason("stop"));
 			},
 			settings: this.settings,
 			ui: uiContext,

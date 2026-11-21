@@ -26,6 +26,7 @@ import {
 	type ConfiguredThinkingLevel,
 	wrapTextWithAnsi,
 } from "../render/render-utils";
+import type { EvalHeldAgentResult } from "./eval";
 import type { StructuredSubagentOutput } from "./task";
 import { describeJobTiles, type JobTile, type JobWidgetView, renderJobTileLines } from "./job-widget";
 import type { RenderResultOptions, ToolRenderer, ToolActivitySummary } from "./renderer";
@@ -106,6 +107,12 @@ export interface JobSnapshot {
 	 * turn's output; undefined where the body does not report it.
 	 */
 	agentOutputPublished?: boolean;
+	/**
+	 * The subagent results a settled job handed over: an eval job's (its cells' bridged calls were
+	 * handed them, `EvalToolDetails.agentResults`) or a work pool's (its workers', as of its drain);
+	 * `omp --restore` reads them as the caller's.
+	 */
+	agentResults?: EvalHeldAgentResult[];
 }
 
 /** Outcome of cancelling one background job. */

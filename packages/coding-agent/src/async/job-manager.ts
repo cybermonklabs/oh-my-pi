@@ -386,8 +386,11 @@ export interface AsyncJobManagerApi {
 		result: AsyncJobRunResult,
 		options: { id?: string; ownerId?: string; agentId?: string },
 	): string;
-	/** Cancel one running job; a filter whose owner does not match reads as not-found. */
-	cancel(id: string, filter?: AsyncJobFilter): boolean;
+	/**
+	 * Cancel one running job; a filter whose owner does not match reads as not-found. `reason` is
+	 * forwarded to the job's `AbortController.abort`, as {@link AsyncJobManager.cancelAll} does.
+	 */
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean;
 	getJob(id: string): AsyncJob | undefined;
 	/** Running background jobs; foreground-backed jobs stay hidden until promoted. */
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[];
@@ -726,15 +729,17 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	/**
 	 * Cancel a single job by id. When a filter is given and its owner does not
 	 * match the job's owner, the call is treated as not-found (returns false)
-	 * so cross-agent cancellation is rejected at the manager level.
+	 * so cross-agent cancellation is rejected at the manager level. `reason` is
+	 * forwarded to the job's `AbortController.abort`: a job that cancels the jobs
+	 * it owns passes its own abort reason on, so a shutdown stays a shutdown.
 	 */
-	cancel(id: string, filter?: AsyncJobFilter): boolean {
+	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean {
 		const job = this.#jobs.get(id);
 		if (!job) return false;
 		if (filter && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
-		job.abortController.abort();
+		job.abortController.abort(reason);
 		this.#notifyJobsChanged(id);
 		return true;
 	}

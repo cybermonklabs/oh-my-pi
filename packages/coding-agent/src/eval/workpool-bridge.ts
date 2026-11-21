@@ -6,8 +6,9 @@ import {
 	normalizeModelSelector,
 	resolveEffectiveSubagentPolicy,
 } from "../task/structured-subagent";
-import { type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
+import { settledWorkerResults, type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
 import type { ToolSession } from "../tools";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
 
@@ -18,6 +19,8 @@ interface EvalWorkpoolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	/** Receives the workers whose settled turns a `peek()` shows the cell (`ToolBridgeOptions.onAgentResults`). */
+	onAgentResults?: (results: EvalHeldAgentResult[]) => void;
 }
 
 export type EvalWorkpoolResult =
@@ -127,7 +130,14 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		return { ids };
 	}
 	if (op === "status") return pool.status();
-	if (op === "peek") return pool.peek();
+	if (op === "peek") {
+		// The cell reads each settled batch's output: those workers' results are handed over. `status()` shows
+		// only states and counts.
+		const result = pool.peek();
+		const settled = settledWorkerResults(result.batches);
+		if (settled.length > 0) options.onAgentResults?.(settled);
+		return result;
+	}
 	if (op === "close") {
 		const result = pool.close();
 		options.emitStatus?.({ op: "workpool", action: "close", pool: name, count: result.dropped.length });

@@ -173,6 +173,8 @@ const probe: RuntimeProbe = async (op, ...args) => {
 		case "cancelAllShutdown":
 			manager(args[0]).cancelAll(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 			return true;
+		case "cancelShutdown":
+			return manager(args[0]).cancel(String(args[1]), undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 		case "sink":
 			manager(args[0]).registerDeliverySink(String(args[1]), (jobId, text, job) => {
 				deliveries.push({ jobId, text, status: job?.status, isRow: job instanceof RemoteAsyncJob });

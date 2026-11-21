@@ -370,7 +370,18 @@ export interface ToolSession {
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactsDir">>;
+		Partial<
+			Pick<
+				SessionManager,
+				| "getSessionId"
+				| "getLeafId"
+				| "appendModelUsage"
+				| "getArtifactsDir"
+				| "getLeftSessionsMark"
+				| "getLeftSessions"
+				| "appendCustomEntriesToSession"
+			>
+		>;
 	/**
 	 * Session-owned raw SSE capture, shared with the `/debug` report. Optional:
 	 * helper and standalone contexts without one simply forgo `/debug` capture.

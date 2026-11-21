@@ -198,4 +198,28 @@ describe("runEvalAgent", () => {
 
 		expect(recordEvalSubagentUsage).not.toHaveBeenCalled();
 	});
+
+	it("persists an unsettled agent() spawn before its background job can settle", async () => {
+		const agent: AgentDefinition = {
+			name: "task",
+			description: "Task agent",
+			systemPrompt: "Handle task",
+			source: "bundled",
+		};
+		const sessionManager = SessionManager.inMemory();
+		const session = createBudgetSession(sessionManager);
+		const appendCustomEntry = vi.fn();
+		const manager = new AsyncJobManager({});
+		jobManagers.add(manager);
+		Object.assign(session, { sessionManager: { appendCustomEntry }, asyncJobManager: manager });
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		const release = Promise.withResolvers<SingleResult>();
+		vi.spyOn(taskExecutor, "runSubprocess").mockReturnValue(release.promise);
+
+		const handle = await runEvalAgent({ prompt: "do work", agent: "task" }, { session });
+
+		expect(appendCustomEntry).toHaveBeenCalledWith("eval_agent_spawn", { id: handle.id, status: "unsettled" });
+		release.resolve(createResult({ id: handle.id }));
+		await session.asyncJobManager?.getJob(handle.id)?.promise;
+	});
 });

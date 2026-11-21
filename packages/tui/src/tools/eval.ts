@@ -113,6 +113,22 @@ export interface EvalCellResult {
 	statusEventsElided?: number;
 }
 
+/**
+ * A subagent whose result a bridged call handed the cell (`tool.task`, `tool.wait`, `wait()`,
+ * a work pool's `peek()`), with the run-end flags its `task` result records, or a work pool
+ * worker whose settled turn the pool's own job hands over.
+ */
+export interface EvalHeldAgentResult {
+	id: string;
+	aborted?: boolean;
+	workerLost?: boolean;
+	/**
+	 * When the result was handed over, in epoch ms: when a cell was handed it, or when a work pool
+	 * drained. A turn the subagent began after it is a new run.
+	 */
+	at?: number;
+}
+
 /** Tool result detail object surfaced to the UI/transcript. */
 export interface EvalToolDetails {
 	cells?: EvalCellResult[];
@@ -134,6 +150,8 @@ export interface EvalToolDetails {
 	languages?: EvalLanguage[];
 	/** Optional human-readable notice (e.g. fallback explanation). */
 	notice?: string;
+	/** Subagents whose results the cell's bridged calls handed it; `omp --restore` reads them as the parent's. */
+	agentResults?: EvalHeldAgentResult[];
 	/** Present when the cell was auto-backgrounded as an async job; `cancelled`: killed before it finished. */
 	async?: {
 		state: "running" | "completed" | "failed" | "cancelled";
