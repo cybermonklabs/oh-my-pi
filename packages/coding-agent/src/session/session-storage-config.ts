@@ -16,8 +16,10 @@
  * string: an unreadable or empty file, contents the driver cannot parse as a
  * connection URL (the driver's own error embeds the string, so it is not
  * attached as a cause either), and a database that cannot be opened each
- * refuse in those terms. There is no fallback to file storage: a misconfigured
- * `sql` refuses to start rather than quietly writing sessions somewhere else.
+ * refuse in those terms; the last also names the driver's code and, when a
+ * server answered, the SQLSTATE it answered with. There is no fallback to file
+ * storage: a misconfigured `sql` refuses to start rather than quietly writing
+ * sessions somewhere else.
  */
 
 import { toError } from "@oh-my-pi/pi-utils";
@@ -43,12 +45,13 @@ const SESSION_SQL_DSN_FILE_SETTING = cfgSessionSqlDsnFile.id;
 // spending Bun's default ten database backends for every omp process. Return
 // them between turns; a lifetime cap would only churn actively used connections.
 //
-// No connection-level setting is sent: PgBouncer before 1.26 (agents-postgres
-// runs 1.25.2 in transaction mode) refuses a `search_path` startup parameter,
-// and a transaction-mode pool would not keep a session-level `SET` for this
-// client anyway. The store locks `search_path` in each transaction instead
-// (`SET LOCAL`), which the pool keeps within that transaction, and names only
-// `pg_catalog` objects in the one statement it sends alone (the heartbeat).
+// No connection-level setting is sent: PgBouncer before 1.26 in transaction
+// mode refuses a `search_path` startup parameter, and a transaction-mode pool
+// would not keep a session-level `SET` for this client anyway. The store runs
+// each transaction on one connection it reserves, and its opening sets with
+// `SET LOCAL` every session setting the store depends on, `search_path`
+// included (see sql-session-postgres-settings.ts), which the pool keeps within
+// that transaction.
 const SESSION_SQL_POOL_MAX = 2;
 const SESSION_SQL_POOL_IDLE_TIMEOUT_SECONDS = 5;
 
@@ -117,12 +120,32 @@ export async function resolveSessionStorage({ settings, env }: ResolveSessionSto
 		void client.end().catch(() => undefined);
 		const error = toError(err);
 		const code = "code" in error ? error.code : undefined;
-		const detail = typeof code === "string" && code.length > 0 ? `${error.message} (${code})` : error.message;
+		const labels = [code, serverSqlState(error)].filter(
+			(label): label is string => typeof label === "string" && label.length > 0,
+		);
+		const detail = labels.length > 0 ? `${error.message} (${labels.join(" ")})` : error.message;
 		throw new SessionStorageConfigError(
 			`${source} names ${dsnFile}, but the session database could not be opened: ${detail}`,
 			{ cause: error },
 		);
 	}
+}
+
+/** Five digits or upper-case letters: the SQL standard's SQLSTATE, which PostgreSQL and MySQL both send. */
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+
+/**
+ * The SQLSTATE a database server refused with, when the driver read one: Bun
+ * keeps PostgreSQL's as `errno` and MySQL's as `sqlState`. Each driver gives
+ * every server refusal one `code` (`ERR_POSTGRES_SERVER_ERROR`,
+ * `ERR_MYSQL_SERVER_ERROR`), so the SQLSTATE is what tells a server that
+ * refuses for now (PostgreSQL 57P03, starting up; 53300, no connection slot
+ * left) from one that will keep refusing (28P01, a password it rejects).
+ */
+function serverSqlState(error: Error): string | undefined {
+	const state =
+		error instanceof SQL.PostgresError ? error.errno : error instanceof SQL.MySQLError ? error.sqlState : undefined;
+	return state !== undefined && SQLSTATE.test(state) ? state : undefined;
 }
 
 /**

@@ -11,6 +11,7 @@ import { describe, expect, it } from "bun:test";
 import { listAllSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
 import {
 	SqlSessionStorage,
 	type SqlSessionStorageClient,
@@ -611,7 +612,10 @@ describe("SqlSessionStorage (SQLite concurrency)", () => {
 interface CapturedQuery {
 	sql: string;
 	values: unknown[] | undefined;
-	/** The transaction that sent it, numbered from 1 in `transaction()` call order; `null` for the bare client. */
+	/**
+	 * The transaction that sent it, numbered from 1 in `transaction()` and `reserve()` call order (on
+	 * PostgreSQL each transaction of the store is one reserved connection); `null` for the bare client.
+	 */
 	transaction: number | null;
 }
 
@@ -623,20 +627,15 @@ interface FakeServer {
 	resetVal?: string;
 }
 
-const READ_WRITE = "SET TRANSACTION READ WRITE";
 const READ_ONLY_READ = "SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'";
-/** Every PostgreSQL transaction locks its function and operator lookup to `pg_catalog` before its work. */
-const SEARCH_PATH = "SET LOCAL search_path = pg_catalog, pg_temp";
+/** The stub's probe finds none of the opening's conditional parameters, so every opening holds none of them. */
+const NONE: ReadonlySet<string> = new Set();
+/** What every PostgreSQL read transaction sends before its work; the opening locks search_path to pg_catalog. */
+const READ_OPENING = pgOpening("read", NONE);
 /** What every PostgreSQL write transaction sends before its work. */
-const WRITE_OPENING = [READ_WRITE, SEARCH_PATH, READ_ONLY_READ];
+const WRITE_OPENING = [pgOpening("write", NONE), READ_ONLY_READ];
 /** What every PostgreSQL start-up transaction sends before its work. */
-const START_UP_OPENING = [
-	READ_WRITE,
-	"SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-	SEARCH_PATH,
-	READ_ONLY_READ,
-	expect.stringMatching(/^SELECT pg_advisory_xact_lock\(\d+\)$/),
-];
+const START_UP_OPENING = [...WRITE_OPENING, expect.stringMatching(/^SELECT pg_advisory_xact_lock\(\d+\)$/)];
 
 function capturingClient(
 	adapter: "postgres" | "mysql",
@@ -659,8 +658,6 @@ function capturingClient(
 					? [{ name: "path" }, { name: "sha256" }]
 					: [{ name: "sha256" }];
 			}
-			// A read sent alone with its search_path lock: one (empty) result per statement.
-			if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
 			return [];
 		},
 	});
@@ -671,6 +668,11 @@ function capturingClient(
 		async transaction(callback) {
 			transactions += 1;
 			return callback(handle(transactions));
+		},
+		// PostgreSQL: each connection the store reserves runs one of its transactions.
+		async reserve() {
+			transactions += 1;
+			return { ...handle(transactions), release() {}, async close() {} };
 		},
 	};
 	return { client, queries };
@@ -712,13 +714,22 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			...START_UP_OPENING,
 			expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
 			made?.sql,
+			"COMMIT",
 		]);
-		// The look outside the lock came first, alone, with its search_path lock.
-		expect(queries[0]?.sql).toMatch(/^SET LOCAL search_path = pg_catalog, pg_temp; SELECT pg_catalog\.to_regclass\(/);
+		// The look outside the lock came before it, alone in a read transaction whose opening locks search_path.
+		const look = queries.find(query => query.sql.startsWith("SELECT pg_catalog.to_regclass("));
+		expect(look?.transaction).toBeLessThan(made?.transaction ?? 0);
+		expect(inOneTransaction(queries.filter(query => query.transaction === look?.transaction))).toEqual([
+			READ_OPENING,
+			expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
+			"COMMIT",
+		]);
 
-		const loadIndex = queries.find(q => q.sql.startsWith(`${SEARCH_PATH}; SELECT path`));
+		const loadIndex = queries.find(q => q.sql.startsWith("SELECT path"));
 		expect(loadIndex?.sql).toContain("byte_len");
 		expect(loadIndex?.sql).not.toMatch(/\bcontent\b/);
+		// It too runs in a read transaction of its own, behind the read opening.
+		expect(queries.find(query => query.transaction === loadIndex?.transaction)?.sql).toBe(READ_OPENING);
 
 		const appendStart = queries.length;
 		const writer = storage.openWriter("/s/p.jsonl");
@@ -731,9 +742,11 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		expect(inOneTransaction(appended)).toEqual([
 			...WRITE_OPENING,
 			expect.stringContaining('INSERT INTO "public".omp_session_files_parts'),
+			"COMMIT",
 		]);
-		expect(appended[3]?.sql).not.toContain("||");
-		expect(appended[3]?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
+		const append = appended[WRITE_OPENING.length];
+		expect(append?.sql).not.toContain("||");
+		expect(append?.values).toEqual(["/s/p.jsonl", expect.any(Number), 6, "chunk\n"]);
 
 		// A title update is one statement, alone in a transaction behind the write opening.
 		await storage.writeText("/s/titled.jsonl", "titled\n");
@@ -742,6 +755,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		expect(inOneTransaction(queries.slice(titleStart))).toEqual([
 			...WRITE_OPENING,
 			expect.stringMatching(/^UPDATE "public"\.omp_session_files SET title = /),
+			"COMMIT",
 		]);
 
 		for (const query of queries) {
@@ -755,11 +769,12 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 	it("PostgreSQL refuses to write when the session keeps a read-only default it started with", async () => {
 		const server: FakeServer = { setting: "on", resetVal: "on" };
 		const { client, queries } = capturingClient("postgres", server);
-		// Start-up refuses before it waits for the start-up lock or makes a table.
+		// Start-up refuses before it waits for the start-up lock or makes a table, and rolls its transaction back.
 		await expect(SqlSessionStorage.create({ client })).rejects.toThrow("default_transaction_read_only");
-		expect(inOneTransaction(queries.slice(queries.findIndex(query => query.sql === READ_WRITE)))).toEqual(
-			START_UP_OPENING.slice(0, 4),
-		);
+		expect(inOneTransaction(queries.slice(queries.findIndex(query => query.sql === WRITE_OPENING[0])))).toEqual([
+			...START_UP_OPENING.slice(0, -1),
+			"ROLLBACK",
+		]);
 
 		server.resetVal = "off";
 		const storage = await SqlSessionStorage.create({ client });
@@ -767,13 +782,13 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 
 		const writeStart = queries.length;
 		await expect(storage.writeText("/s/refused.jsonl", "body\n")).rejects.toThrow("default_transaction_read_only");
-		expect(inOneTransaction(queries.slice(writeStart))).toEqual(WRITE_OPENING);
+		expect(inOneTransaction(queries.slice(writeStart))).toEqual([...WRITE_OPENING, "ROLLBACK"]);
 
 		const appendStart = queries.length;
 		const writer = storage.openWriter("/s/refused-append.jsonl");
 		await expect(writer.append("chunk\n")).rejects.toThrow("default_transaction_read_only");
 		await expect(writer.close()).rejects.toThrow("default_transaction_read_only");
-		expect(inOneTransaction(queries.slice(appendStart))).toEqual(WRITE_OPENING);
+		expect(inOneTransaction(queries.slice(appendStart))).toEqual([...WRITE_OPENING, "ROLLBACK"]);
 	});
 
 	// Neither answer is a read-only default the session keeps, so the store
@@ -795,6 +810,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 				...START_UP_OPENING,
 				expect.stringMatching(/^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /),
 				made?.sql,
+				"COMMIT",
 			]);
 
 			const writeStart = queries.length;
@@ -807,6 +823,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 				// A full write replaces the session's references too: it reads them first, to lock their blobs'
 				// rows before it deletes them; it names no blob and the stub has none, so it locks, deletes and adds none.
 				expect.stringMatching(/^SELECT sha256, path FROM "public"\.omp_session_files_refs WHERE path IN /),
+				"COMMIT",
 			]);
 
 			const appendStart = queries.length;
@@ -816,6 +833,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			expect(inOneTransaction(queries.slice(appendStart))).toEqual([
 				...WRITE_OPENING,
 				expect.stringContaining('INSERT INTO "public".omp_session_files_parts'),
+				"COMMIT",
 			]);
 		});
 	}
@@ -894,12 +912,15 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 	it("explicit `adapter` option overrides the reported adapter", async () => {
 		const client: SqlSessionStorageClient = {
 			options: { adapter: "" }, // empty / missing
-			async unsafe(sql) {
-				if (sql.startsWith(`${SEARCH_PATH}; `)) return [[], []];
+			async unsafe() {
 				return [];
 			},
 			async transaction(callback) {
 				return callback(client);
+			},
+			// The store runs every PostgreSQL statement on a reserved connection.
+			async reserve() {
+				return { unsafe: async () => [], release() {}, async close() {} };
 			},
 		};
 		const storage = await SqlSessionStorage.create({ client, adapter: "postgres" });

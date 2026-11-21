@@ -307,56 +307,52 @@ export async function rejection(promise: Promise<unknown>): Promise<unknown> {
 	);
 }
 
-/** Wait until `check` holds, polling; fails after `ms`. */
-export async function until(check: () => Promise<boolean> | boolean, ms = 10_000): Promise<void> {
+/**
+ * Wait until `check` holds, polling every `pollMs`; fails after `ms`, naming
+ * `what` when given.
+ */
+export async function until(
+	check: () => Promise<boolean> | boolean,
+	ms = 10_000,
+	{ what, pollMs = 25 }: { what?: string; pollMs?: number } = {},
+): Promise<void> {
 	const deadline = Date.now() + ms;
 	while (!(await check())) {
-		if (Date.now() > deadline) throw new Error(`the condition did not hold within ${ms} ms`);
-		await Bun.sleep(25);
+		if (Date.now() > deadline) {
+			throw new Error(
+				what === undefined
+					? `the condition did not hold within ${ms} ms`
+					: `timed out after ${ms} ms waiting for ${what}`,
+			);
+		}
+		await Bun.sleep(pollMs);
 	}
 }
 
-/** SQL words that open a parenthesis without calling a function. */
-const SQL_PAREN_WORDS: Record<string, true> = {
-	AND: true,
-	OR: true,
-	NOT: true,
-	IN: true,
-	ANY: true,
-	ALL: true,
-	EXISTS: true,
-	VALUES: true,
-	WHERE: true,
-	AS: true,
-	ON: true,
-	RETURNING: true,
-};
-
 /**
- * The functions, operators and casts `sql` names without `pg_catalog`: what
- * a connection's own `search_path` could resolve to another login's object
- * when the statement runs outside a transaction that locks it. String
- * literals, quoted identifiers, parameters, `OPERATOR(pg_catalog.…)`,
- * `pg_catalog.<function>(` and `::pg_catalog.<type>` are set aside first;
- * what is left must name nothing a search can find. `SET <column> =` is an
- * assignment, not an operator.
+ * The `reserve` of a wrapper of `client`: each call reserves one real
+ * connection of `client` and hands the store that connection with its
+ * `unsafe` wrapped by `wrap`, as the wrapper wraps a transaction's, so a
+ * wrapper keeps what it records or injects on PostgreSQL, where the store
+ * sends every statement on a reserved connection. `wrap` runs once per
+ * reserved connection. Empty when `client` has no `reserve`.
  */
-export function unqualifiedNames(sql: string): string[] {
-	const rest = sql
-		.replace(/'(?:[^']|'')*'/g, " ")
-		.replace(/"(?:[^"]|"")*"/g, "X")
-		.replace(/OPERATOR\(pg_catalog\.[^)]+\)/g, " ")
-		.replace(/::pg_catalog\.\w+(?:\[\])?/g, " ")
-		.replace(/pg_catalog\.\w+\s*\(/g, "(")
-		.replace(/\$\d+/g, " ")
-		.replace(/\bSET\s+\w+\s*=/gi, " ; ");
-	const found: string[] = [];
-	for (const match of rest.matchAll(/::\s*[\w.]+|[=<>!~*/%^&|#@+-]+/g)) found.push(match[0]);
-	for (const match of rest.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) {
-		const word = match[1] as string;
-		if (!SQL_PAREN_WORDS[word.toUpperCase()]) found.push(`${word}(`);
-	}
-	return found;
+export function reserveWrapped(
+	client: SqlSessionStorageClient,
+	wrap: (connection: SqlSessionStorageTransaction) => SqlSessionStorageTransaction,
+): Pick<SqlSessionStorageClient, "reserve"> {
+	const reserve = client.reserve?.bind(client);
+	if (!reserve) return {};
+	return {
+		async reserve() {
+			const connection = await reserve();
+			return {
+				unsafe: wrap(connection).unsafe,
+				release: () => connection.release(),
+				close: () => connection.close(),
+			};
+		},
+	};
 }
 
 /** A client from {@link gatedClient} and the gate that holds its transactions open. */
@@ -371,9 +367,10 @@ export interface GatedClient {
 }
 
 /**
- * `client`, whose transactions pause right after (or, with `when: "before"`,
- * right before) the statement `pause` matches, until the test opens the gate:
- * so a write transaction stays open with the test choosing how long.
+ * `client`, whose transactions (on PostgreSQL, its reserved connections)
+ * pause right after (or, with `when: "before"`, right before) the statement
+ * `pause` matches, until the test opens the gate: so a write transaction
+ * stays open with the test choosing how long.
  */
 export function gatedClient(
 	client: SqlSessionStorageClient,
@@ -400,6 +397,7 @@ export function gatedClient(
 		unsafe: (query, values) => client.unsafe(query, values),
 		transaction: callback => client.transaction(transaction => callback(gated(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, gated),
 	};
 	return {
 		client: wrapped,

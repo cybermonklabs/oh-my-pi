@@ -19,6 +19,7 @@ import {
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -110,10 +111,22 @@ class Db implements AsyncDisposable {
 	}
 
 	/** A second client of the same database; SQLite's in-memory database lives only on the first. */
-	connect(options: { max?: number } = {}): SqlClient {
+	connect(options: { max?: number; connection?: Record<string, string> } = {}): SqlClient {
 		if (this.adapter === "sqlite") return this.client;
 		const client = new SQL(this.url, options);
 		this.#clients.push(client);
+		return client;
+	}
+
+	/**
+	 * A second client of one connection whose lock waits end after 1 s. On PostgreSQL that is the connection's own
+	 * `lock_timeout`, a start parameter, which the opening of every store transaction keeps (`SET LOCAL lock_timeout
+	 * TO DEFAULT`) where it sets a session-level `SET` back; on MySQL a session-level `innodb_lock_wait_timeout`.
+	 */
+	async lockBoundClient(): Promise<SqlClient> {
+		if (this.adapter === "postgres") return this.connect({ max: 1, connection: { lock_timeout: "1s" } });
+		const client = this.connect({ max: 1 });
+		await client.unsafe("SET SESSION innodb_lock_wait_timeout = 1");
 		return client;
 	}
 
@@ -556,10 +569,7 @@ for (const { adapter, url } of BACKENDS) {
 			await using db = new Db(adapter, url ?? "");
 			const storage = await db.open();
 			await storage.writeText("/locked.jsonl", "locked\n");
-			const starter = db.connect({ max: 1 });
-			await starter.unsafe(
-				adapter === "postgres" ? "SET lock_timeout = '1s'" : "SET SESSION innodb_lock_wait_timeout = 1",
-			);
+			const starter = await db.lockBoundClient();
 
 			const release = Promise.withResolvers<void>();
 			const locked = Promise.withResolvers<void>();
@@ -590,10 +600,7 @@ for (const { adapter, url } of BACKENDS) {
 			await seed.writeText(artifact, "");
 			// The peer gives up on a lock after 1 s, so a peer the delete blocks
 			// fails on its own instead of waiting for a commit that waits on it.
-			const peerClient = db.connect({ max: 1 });
-			await peerClient.unsafe(
-				adapter === "postgres" ? "SET lock_timeout = '1s'" : "SET SESSION innodb_lock_wait_timeout = 1",
-			);
+			const peerClient = await db.lockBoundClient();
 			const peer = await db.open({ client: peerClient });
 
 			// Pause the delete right after its first statement on the session's
@@ -618,6 +625,7 @@ for (const { adapter, url } of BACKENDS) {
 					db.client.transaction(async transaction =>
 						work({ unsafe: (sql, values) => run(sql, values, transaction) }),
 					),
+				...reserveWrapped(db.client, connection => ({ unsafe: (sql, values) => run(sql, values, connection) })),
 			};
 			const deleter = await SqlSessionStorage.create({ client: pausing, table: db.table });
 			await deleter.deleteSessionWithArtifacts(session);

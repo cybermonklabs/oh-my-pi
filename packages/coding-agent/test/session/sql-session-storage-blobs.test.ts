@@ -36,6 +36,7 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	rejection,
+	reserveWrapped,
 	transcript,
 	until,
 } from "./sql-session-lease-fixture";
@@ -96,6 +97,7 @@ function failing(client: SqlSessionStorageClient, pattern: RegExp, times: number
 		},
 		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, wrap),
 	};
 }
 
@@ -116,6 +118,7 @@ function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessio
 		unsafe: (query, values) => client.unsafe(query, values),
 		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, wrap),
 	};
 }
 
@@ -1421,21 +1424,20 @@ describe("session blobs in the SQL session storage", () => {
 						}[adapter],
 					);
 				};
+				const collided = (transaction: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+					unsafe(query, values) {
+						collide(query);
+						return transaction.unsafe(query, values);
+					},
+				});
 				const renamer = await db.open({
 					claims: false,
 					wrap: client => ({
 						options: client.options,
 						unsafe: (query, values) => client.unsafe(query, values),
-						transaction: callback =>
-							client.transaction(transaction =>
-								callback({
-									unsafe(query, values) {
-										collide(query);
-										return transaction.unsafe(query, values);
-									},
-								}),
-							),
+						transaction: callback => client.transaction(transaction => callback(collided(transaction))),
 						end: () => client.end?.() ?? Promise.resolve(),
+						...reserveWrapped(client, collided),
 					}),
 				});
 				const [src, dst] = ["a-src", "b-dst"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [
@@ -1779,5 +1781,6 @@ function recordingClient(client: SqlSessionStorageClient, queries: string[]): Sq
 		},
 		transaction: callback => client.transaction(transaction => callback(wrap(transaction))),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, wrap),
 	};
 }

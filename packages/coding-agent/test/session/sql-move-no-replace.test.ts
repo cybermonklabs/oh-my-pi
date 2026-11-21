@@ -21,6 +21,7 @@ import {
 import { getSessionsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
 import { readStoredSession } from "../helpers/sql-session-storage";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string | undefined }> = [
 	{ adapter: "sqlite", url: "sqlite" },
@@ -355,6 +356,7 @@ describe.skipIf(!process.env.OMP_TEST_SQL_POSTGRES_URL)("deleting a postgres-sto
 			options: client.options,
 			unsafe: (query, values) => client.unsafe(query, values),
 			transaction: work => client.transaction(transaction => work(hooked(transaction))),
+			...reserveWrapped(client, hooked),
 		}));
 
 		await deleter.storage.deleteSessionWithArtifacts(source);
