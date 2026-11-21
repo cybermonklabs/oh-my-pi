@@ -1765,4 +1765,48 @@ mod tests {
 	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
 		crate::file_backup::tests::check_long_name_backups("mv", |dir, args| mv_in(dir, args, ""));
 	}
+
+	/// `mv CONTROL a dest`, where `dest~` is another hard link of `a`, backs
+	/// `dest` up over that link and moves, as GNU mv does
+	/// ([`crate::file_backup::tests::check_hard_link_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_over_another_hard_link_of_the_source_is_made() {
+		crate::file_backup::tests::check_hard_link_backups("mv", false, |dir, control| {
+			mv_in(dir, &[control, "a", "dest"], "")
+		});
+	}
+
+	/// `mv -b dest~ dest`, where `dest~` is a symbolic link (to a file, or
+	/// to nothing), is refused: the backup of `dest` would replace the link,
+	/// the source's own entry, and the move would then put `dest` back,
+	/// losing the link. This differs from GNU mv 9.4 and 9.7, which exit 0
+	/// there and lose the link: GNU's `source_is_dst_backup` compares the link
+	/// with the file it points to, which is never the link itself.
+	/// `--backup=numbered` backs `dest` up as `dest.~1~` and moves the link,
+	/// as GNU does.
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_named_as_the_backup_is_not_moved_over_the_destination() {
+		let cwd = tempdir().unwrap();
+		for target in ["t", "missing"] {
+			let dir = cwd.path().join(target);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("t"), b"T").unwrap();
+			fs::write(dir.join("dest"), b"old").unwrap();
+			std::os::unix::fs::symlink(target, dir.join("dest~")).unwrap();
+			assert_eq!(
+				mv_in(&dir, &["-b", "dest~", "dest"], ""),
+				(1, "mv: backing up 'dest' might destroy source;  'dest~' not moved\n".to_owned()),
+				"to {target}"
+			);
+			assert_eq!(link_at(&dir.join("dest~")), Some(target.into()), "to {target}: the link was lost");
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "to {target}: dest replaced");
+			assert_eq!(fs::read(dir.join("t")).unwrap(), b"T", "to {target}: t changed");
+			// The control: a numbered backup leaves the link's entry alone.
+			assert_eq!(mv_in(&dir, &["--backup=numbered", "dest~", "dest"], ""), (0, String::new()), "to {target}");
+			assert_eq!(link_at(&dir.join("dest")), Some(target.into()), "to {target}: the link was not moved");
+			assert_eq!(fs::read(dir.join("dest.~1~")).unwrap(), b"old", "to {target}: no numbered backup");
+		}
+	}
 }

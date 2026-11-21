@@ -905,4 +905,41 @@ mod tests {
 		assert_eq!(fs::read_to_string(dir.join("dest")).unwrap(), "payload", "numbered: not linked");
 		assert_eq!(fs::read_to_string(dir.join("dest.~1~")).unwrap(), "old", "numbered: no backup");
 	}
+
+	/// `ln CONTROL a dest` and `ln -s CONTROL a dest`, where `dest~` is
+	/// another hard link of `a`, back `dest` up over that link and link, as
+	/// GNU ln does ([`crate::file_backup::tests::check_hard_link_backups`]):
+	/// the backup replaces only that link, never `a`.
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_over_another_hard_link_of_the_source_is_made() {
+		crate::file_backup::tests::check_hard_link_backups("ln", false, |dir, control| {
+			let (code, capture) = run_util::<Ln>(&[control, "a", "dest"], "", dir);
+			(code, capture.err())
+		});
+		crate::file_backup::tests::check_hard_link_backups("ln", true, |dir, control| {
+			let (code, capture) = run_util::<Ln>(&[control, "-s", "a", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -L -b x dest`, where `x` is a symbolic link to `dest~`, is
+	/// refused: ln follows `x`, and the backup of `dest` would replace the
+	/// file it links to. GNU ln 9.4 and 9.7 exit 0 there, with `dest~`'s
+	/// contents lost and `dest` a link to the old `dest`.
+	#[cfg(unix)]
+	#[test]
+	fn a_followed_source_link_to_the_backup_is_not_linked_over_it() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest~"), "payload").unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		std::os::unix::fs::symlink("dest~", dir.path().join("x")).unwrap();
+		let (code, capture) = run_util::<Ln>(&["-L", "-b", "x", "dest"], "", dir.path());
+		assert_eq!(
+			(code, capture.err()),
+			(1, "ln: backing up 'dest' might destroy source;  'x' not linked\n".to_owned())
+		);
+		assert_eq!(fs::read_to_string(dir.path().join("dest~")).unwrap(), "payload");
+		assert_eq!(fs::read_to_string(dir.path().join("dest")).unwrap(), "old");
+	}
 }

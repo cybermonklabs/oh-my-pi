@@ -770,22 +770,30 @@ pub(crate) mod tests {
 
 	/// Checks a caller of [`backup_path`] (`util` is `mv`, `cp` or `ln`)
 	/// where a long name makes the backup give way to a `~` name that is the
-	/// source, the destination itself, or another entry. `run(dir, args)`
-	/// runs the utility in `dir` and returns its exit status and standard
-	/// error. Names: `D` is 251 bytes (beside `D.~9~`, so `D.~10~` is too
-	/// long and the backup is `D~`); `L` is 255 bytes of `a`, whose `~` name
-	/// is `A~`, 253 bytes of `a` and `~`, which is also the destination `E`
-	/// of the destination cases.
+	/// source, the destination itself, another hard link of the source, or
+	/// another entry. `run(dir, args)` runs the utility in `dir` and returns
+	/// its exit status and standard error. Names: `D` is 251 bytes (beside
+	/// `D.~9~`, so `D.~10~` is too long and the backup is `D~`); `L` is 255
+	/// bytes of `a`, whose `~` name is `A~`, 253 bytes of `a` and `~`, which
+	/// is also the destination `E` of the destination cases.
 	///
-	/// GNU coreutils 9.4 and 9.7, run on each case, refuse in mv and cp, with
-	/// these messages, every numbered backup whose `~` name an entry holds
-	/// (they rename it without replacing). They replace the entry in ln, and
-	/// a simple backup's `~` name in all three; where that entry is the source
-	/// or the destination itself, the old contents are lost with status 0
-	/// (cp fails, but after the loss, when the backup is its source). Here
-	/// those losses are refused instead: a backup that is the source with
-	/// GNU's "might destroy source", one that is the destination with
-	/// "cannot backup". ln replaces an unrelated entry, as GNU ln does.
+	/// GNU coreutils 9.4 and 9.7, run on each case:
+	/// - mv and cp refuse every numbered backup whose `~` name an entry
+	///   holds, with these "cannot backup" messages (they rename it without
+	///   replacing); ln replaces that entry, and all three replace a simple
+	///   backup's `~` name.
+	/// - Where that entry is the source, mv and ln exit 0 with the source's
+	///   contents lost (cp fails, but after the loss).
+	/// - Where it is the destination itself, mv's `-b` and ln exit 0 with the
+	///   old contents lost; cp fails with "cannot create regular file 'E':
+	///   File exists" and keeps `E`.
+	/// - Where it is another hard link of the source, ln replaces it and
+	///   keeps the source.
+	///
+	/// Here the losses are refused: a backup that is the source's own entry
+	/// with GNU's "might destroy source", one that is the destination itself
+	/// with "cannot backup" (cp's message is not GNU's there). ln replaces an
+	/// unrelated entry, and another link of its source, as GNU ln does.
 	pub(crate) fn check_long_name_backups(util: &str, run: impl Fn(&Path, &[&str]) -> (i32, String)) {
 		let root = tempfile::tempdir().unwrap();
 		if !fits_255_byte_names(root.path()) {
@@ -849,6 +857,64 @@ pub(crate) mod tests {
 				check(&case, &unrelated, &[control, "src", &d], (0, String::new()), &replaced);
 			} else {
 				check(&case, &unrelated, &[control, "src", &d], cannot_backup(&d), &unrelated);
+			}
+		}
+		// Another hard link of the source holds the `~` name: replacing it
+		// removes only that link, and GNU ln does; GNU's mv and cp refuse it
+		// as any held name.
+		let dir = root.path().join("hardlink-numbered");
+		fs::create_dir(&dir).unwrap();
+		for (name, content) in [("s", "S"), (d.as_str(), "old"), (d_nine.as_str(), "nine")] {
+			fs::write(dir.join(name), content).unwrap();
+		}
+		fs::hard_link(dir.join("s"), dir.join(&d_tilde)).unwrap();
+		let args = ["--backup=numbered", "s", d.as_str()];
+		let (expected, after) = if util == "ln" {
+			((0, String::new()), [("s", "S"), (d.as_str(), "S"), (d_tilde.as_str(), "old"), (d_nine.as_str(), "nine")])
+		} else {
+			(cannot_backup(&d), [("s", "S"), (d.as_str(), "old"), (d_tilde.as_str(), "S"), (d_nine.as_str(), "nine")])
+		};
+		assert_eq!(run(&dir, &args), expected, "{util} hardlink-numbered");
+		for (name, content) in after {
+			assert_eq!(
+				fs::read_to_string(dir.join(name)).ok().as_deref(),
+				Some(content),
+				"{util} hardlink-numbered: {} bytes",
+				name.len()
+			);
+		}
+	}
+
+	/// Checks a caller of [`backup_path`] (`util` is `mv`, `cp` or `ln`, and
+	/// `symbolic` for `ln -s`) where the backup name `dest~` is another hard
+	/// link of the source `a`: renaming `dest` over it removes only that link
+	/// and leaves `a`, so the backup is made, as GNU 9.4 and 9.7 make it in
+	/// every backup mode. In each mode, in a directory holding `a` ("A"),
+	/// `dest` ("old") and `dest~` (a hard link of `a`), `run(dir, control)`
+	/// must run `<util> CONTROL a dest` and succeed: `dest` is `a`'s file (a
+	/// symbolic link to `a` for `ln -s`), the backup holds "old", and `a` is
+	/// gone after mv and kept otherwise.
+	pub(crate) fn check_hard_link_backups(util: &str, symbolic: bool, run: impl Fn(&Path, &str) -> (i32, String)) {
+		let root = tempfile::tempdir().unwrap();
+		for control in ["-b", "--backup=simple", "--backup=existing", "--backup=numbered"] {
+			let case = format!("{util}{}{control}", if symbolic { " -s" } else { "" });
+			let dir = root.path().join(control.trim_start_matches('-'));
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("a"), "A").unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			fs::hard_link(dir.join("a"), dir.join("dest~")).unwrap();
+			assert_eq!(run(&dir, control), (0, String::new()), "{case}");
+			let backup = if control == "--backup=numbered" { "dest.~1~" } else { "dest~" };
+			assert_eq!(fs::read_to_string(dir.join(backup)).ok().as_deref(), Some("old"), "{case}: no backup at {backup}");
+			if symbolic {
+				assert_eq!(fs::read_link(dir.join("dest")).ok().as_deref(), Some(Path::new("a")), "{case}: dest");
+			} else {
+				assert_eq!(fs::read_to_string(dir.join("dest")).ok().as_deref(), Some("A"), "{case}: dest");
+			}
+			let source = (util != "mv").then_some("A");
+			assert_eq!(fs::read_to_string(dir.join("a")).ok().as_deref(), source, "{case}: the source");
+			if control == "--backup=numbered" {
+				assert_eq!(fs::read_to_string(dir.join("dest~")).ok().as_deref(), Some("A"), "{case}: dest~ replaced");
 			}
 		}
 	}
