@@ -24,6 +24,7 @@ import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { rejectionOf } from "../helpers/rejection";
+import { fillDiskUnder, pathUnderRegularFile, spoolWarnings } from "../helpers/spool-unusable";
 
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
@@ -78,11 +79,6 @@ async function rewriteBothWays(storage: SqlSessionStorage): Promise<{ stored: st
 	};
 }
 
-/** The warnings among `calls` (a `logger.warn` spy's) that are about the spool. */
-function spoolWarnings(calls: ReadonlyArray<readonly unknown[]>): ReadonlyArray<readonly unknown[]> {
-	return calls.filter(([message]) => String(message).includes("spool"));
-}
-
 /** Whether descriptor `fd` of this process is open on a file under `dir`. */
 function isUnder(fd: number, dir: string): boolean {
 	try {
@@ -90,42 +86,6 @@ function isUnder(fd: number, dir: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-/**
- * Fail every `writeFileSync` to a descriptor open on a file under `dir`, the
- * write the spool fills its file with, with ENOSPC after half its bytes
- * landed, as a disk that fills during the write does. Counts those writes.
- */
-function failSpoolWritesUnder(dir: string): { refused: () => number } {
-	let refused = 0;
-	const writeFileSync = fs.writeFileSync;
-	vi.spyOn(fs, "writeFileSync").mockImplementation(((
-		file: fs.PathOrFileDescriptor,
-		data: string | NodeJS.ArrayBufferView,
-		...rest: unknown[]
-	) => {
-		if (typeof file !== "number" || !isUnder(file, dir)) {
-			Reflect.apply(writeFileSync, fs, [file, data, ...rest]);
-			return;
-		}
-		refused++;
-		const bytes =
-			typeof data === "string" ? Buffer.from(data) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-		writeFileSync(file, bytes.subarray(0, bytes.byteLength >> 1));
-		throw Object.assign(new Error("ENOSPC: no space left on device, write"), {
-			code: "ENOSPC",
-			errno: -28,
-			syscall: "write",
-		});
-	}) as typeof fs.writeFileSync);
-	return { refused: () => refused };
-}
-
-/** Make `os.tmpdir()` a path under a regular file in `tmp`, where no spool directory can be made. */
-function tmpdirUnderRegularFile(tmp: TempDir): void {
-	fs.writeFileSync(tmp.join("not-a-directory"), "a regular file\n");
-	process.env.TMPDIR = tmp.join("not-a-directory", "tmp");
 }
 
 /**
@@ -212,7 +172,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
 			process.env.TMPDIR = tmp.path();
 			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-			const disk = failSpoolWritesUnder(tmp.path());
+			const disk = fillDiskUnder(tmp.path());
 
 			await withSqliteStorage(async storage => {
 				const { stored, written } = await rewriteBothWays(storage);
@@ -234,31 +194,28 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 
 	// If this regresses, a rewrite handed its lines by a generator, which yields them only once, stores
 	// only the lines the failed spool left unread (here none) when the spool write fails.
-	it.skipIf(!HAS_PROC_FD)(
-		"stores every line a generator yields when the spool write of its rewrite fails",
-		async () => {
-			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
-			process.env.TMPDIR = tmp.path();
-			vi.spyOn(logger, "warn").mockImplementation(() => {});
-			const disk = failSpoolWritesUnder(tmp.path());
-			const lines = sessionLines("yielded once");
-			function* yieldOnce(): Generator<string> {
-				yield* lines;
-			}
+	it("stores every line a generator yields when the spool write of its rewrite fails", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		process.env.TMPDIR = tmp.path();
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const disk = fillDiskUnder(tmp.path());
+		const lines = sessionLines("yielded once");
+		function* yieldOnce(): Generator<string> {
+			yield* lines;
+		}
 
-			await withSqliteStorage(async storage => {
-				storage.writeLinesSync(SYNC_FILE, yieldOnce());
-				await storage.drain();
-				await storage.writeLinesAtomic(ATOMIC_FILE, yieldOnce());
+		await withSqliteStorage(async storage => {
+			storage.writeLinesSync(SYNC_FILE, yieldOnce());
+			await storage.drain();
+			await storage.writeLinesAtomic(ATOMIC_FILE, yieldOnce());
 
-				expect(disk.refused()).toBe(2);
-				expect([await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)]).toEqual([
-					lines.join(""),
-					lines.join(""),
-				]);
-			});
-		},
-	);
+			expect(disk.refused()).toBe(2);
+			expect([await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)]).toEqual([
+				lines.join(""),
+				lines.join(""),
+			]);
+		});
+	});
 
 	// If this regresses, full rewrites spool the transcript into a directory other accounts can enter,
 	// or one another account made first and controls, instead of keeping it out of their reach.
@@ -328,7 +285,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 	// session the user resumes later silently lacks what that rewrite carried.
 	it("fails a rewrite whose streamed write fails, logging the session, the path and the cause, and keeps the stored copy", async () => {
 		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
-		tmpdirUnderRegularFile(tmp);
+		process.env.TMPDIR = pathUnderRegularFile(tmp);
 		vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
 		let reads = 0;
@@ -378,7 +335,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 	// grows with its age until the process is killed.
 	it("fails a rewrite on a backend without a streamed write instead of joining it, and keeps the stored copy", async () => {
 		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
-		tmpdirUnderRegularFile(tmp);
+		process.env.TMPDIR = pathUnderRegularFile(tmp);
 		vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
 		const backend = new NoStreamBackend();
@@ -419,7 +376,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 	// ran, and one over a stored copy with the same bytes reports itself stored without being written.
 	it("fails an atomic rewrite on a backend without a streamed write without reading the stored copy back", async () => {
 		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
-		tmpdirUnderRegularFile(tmp);
+		process.env.TMPDIR = pathUnderRegularFile(tmp);
 		vi.spyOn(logger, "warn").mockImplementation(() => {});
 		vi.spyOn(logger, "error").mockImplementation(() => {});
 		const backend = new NoStreamBackend();

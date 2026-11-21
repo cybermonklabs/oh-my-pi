@@ -16,7 +16,6 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import type {
 	IndexedSessionStorage,
 	SessionStorageBackend,
@@ -31,6 +30,8 @@ import {
 import { digestStream } from "@oh-my-pi/pi-coding-agent/utils/file-hash";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { RedisClient, SQL } from "bun";
+import { Longest, recordMethod } from "../helpers/longest-value";
+import { fillDiskUnder, pathUnderRegularFile, spoolWarnings } from "../helpers/spool-unusable";
 
 const MiB = 1024 * 1024;
 /** No string or buffer handed to or returned by the backend during a rewrite may reach past this. */
@@ -126,25 +127,26 @@ interface Seen {
 }
 
 /**
- * Notes, while recording, the longest string or buffer handed to or returned
- * by a backend's methods, each chunk of a stream handed to or returned by one
- * included, and which methods ran. It wraps the methods on the backend object
- * itself, so a call the backend makes to its own methods (a streamed write
- * that falls back to `writeFull`) is noted too, and the backend's private
- * state stays reachable.
+ * Records, from `start()` to `stop()`, the longest string or buffer handed to
+ * or returned by a backend's methods, as {@link recordMethod} notes them, and
+ * which methods ran. It wraps the methods on the backend object itself, so a
+ * call the backend makes to its own methods (a streamed write that falls back
+ * to `writeFull`) is recorded too, and the backend's private state stays
+ * reachable.
  */
 class BackendWatch {
-	#seen: Seen = { bytes: 0, what: "nothing", calls: [] };
-	#recording = false;
+	readonly #longest = new Longest();
+	#calls: string[] = [];
 
 	start(): void {
-		this.#seen = { bytes: 0, what: "nothing", calls: [] };
-		this.#recording = true;
+		this.#longest.reset();
+		this.#calls = [];
 	}
 
 	stop(): Seen {
-		this.#recording = false;
-		return this.#seen;
+		const seen = { bytes: this.#longest.bytes, what: this.#longest.what, calls: this.#calls };
+		this.#calls = [];
+		return seen;
 	}
 
 	instrument(backend: SessionStorageBackend): SessionStorageBackend {
@@ -152,46 +154,13 @@ class BackendWatch {
 		for (const name of BACKEND_METHODS) {
 			const method = members[name];
 			if (typeof method !== "function") continue;
+			const recorded = recordMethod(backend, name, method, this.#longest);
 			members[name] = (...args: unknown[]): unknown => {
-				if (this.#recording) this.#seen.calls.push(name);
-				const result: unknown = Reflect.apply(
-					method,
-					backend,
-					args.map(arg => this.#watch(arg, `handed to ${name}`)),
-				);
-				if (result instanceof Promise) return result.then(value => this.#watch(value, `returned by ${name}`));
-				return this.#watch(result, `returned by ${name}`);
+				this.#calls.push(name);
+				return recorded(...args);
 			};
 		}
 		return backend;
-	}
-
-	#note(bytes: number, what: string): void {
-		if (!this.#recording || bytes <= this.#seen.bytes) return;
-		this.#seen.bytes = bytes;
-		this.#seen.what = what;
-	}
-
-	/**
-	 * Note `value` when it is a string or a buffer, or holds one as an element
-	 * or a field; a stream comes back wrapped, so its chunks are noted as they
-	 * pass.
-	 */
-	#watch(value: unknown, what: string, nested = false): unknown {
-		if (typeof value === "string") this.#note(Buffer.byteLength(value), `a string ${what}`);
-		else if (value instanceof Uint8Array) this.#note(value.byteLength, `a buffer ${what}`);
-		else if (!nested && typeof value === "object" && value !== null) {
-			if (Symbol.asyncIterator in value) return this.#chunks(value as AsyncIterable<unknown>, `streamed ${what}`);
-			for (const field of Object.values(value)) this.#watch(field, what, true);
-		}
-		return value;
-	}
-
-	async *#chunks(chunks: AsyncIterable<unknown>, what: string): AsyncGenerator<unknown> {
-		for await (const chunk of chunks) {
-			this.#watch(chunk, what, true);
-			yield chunk;
-		}
 	}
 }
 
@@ -265,43 +234,6 @@ async function openStore(kind: BackendKind, url: string, watch: BackendWatch): P
 }
 
 /**
- * Fill the disk under `dir` for the spool: each `writeFileSync` to a
- * descriptor `openSync` opened on a file under `dir` (the spool fills its
- * file with `writeFileSync`) lands half its bytes and fails with ENOSPC, as a
- * write to a disk that fills does. `vi.restoreAllMocks()` undoes it.
- */
-function fillDiskUnder(dir: string): void {
-	const openSync = fs.openSync;
-	const writeFileSync = fs.writeFileSync;
-	const spoolFds = new Set<number>();
-	vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]): number => {
-		const fd: number = Reflect.apply(openSync, fs, [file, ...rest]);
-		if (String(file).startsWith(`${dir}${path.sep}`)) spoolFds.add(fd);
-		return fd;
-	}) as typeof fs.openSync);
-	vi.spyOn(fs, "writeFileSync").mockImplementation(((
-		file: fs.PathOrFileDescriptor,
-		data: string | NodeJS.ArrayBufferView,
-		...rest: unknown[]
-	): void => {
-		if (typeof file !== "number" || !spoolFds.has(file)) {
-			Reflect.apply(writeFileSync, fs, [file, data, ...rest]);
-			return;
-		}
-		// The spool closes its descriptor once a write fails, and a later open may reuse the number.
-		spoolFds.delete(file);
-		const bytes =
-			typeof data === "string" ? Buffer.from(data) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-		writeFileSync(file, bytes.subarray(0, bytes.byteLength >> 1));
-		throw Object.assign(new Error("ENOSPC: no space left on device, write"), {
-			code: "ENOSPC",
-			errno: -28,
-			syscall: "write",
-		});
-	}) as typeof fs.writeFileSync);
-}
-
-/**
  * Ways the spool cannot be used. Each makes `os.tmpdir()` (the directory
  * returned) one the spool cannot write under, starting from the empty
  * directory `scratch`; `cause` is the error code the spool's failure names.
@@ -325,10 +257,7 @@ const UNUSABLE_SPOOLS: ReadonlyArray<{
 		name: "os.tmpdir() is under a regular file",
 		skip: false,
 		cause: "ENOTDIR",
-		make: scratch => {
-			fs.writeFileSync(scratch.join("not-a-directory"), "a regular file\n");
-			return scratch.join("not-a-directory", "tmp");
-		},
+		make: pathUnderRegularFile,
 	},
 	{
 		name: "os.tmpdir() is full",
@@ -442,9 +371,7 @@ for (const { kind, url } of BACKENDS) {
 			return {
 				outcome,
 				seen,
-				spoolWarnings: warn.mock.calls
-					.filter(([message]) => String(message).includes("spool"))
-					.map(([, context]) => context),
+				spoolWarnings: spoolWarnings(warn.mock.calls).map(([, context]) => context),
 				stored: await storedDigest(store.storage, file, REWRITE.lines),
 			};
 		}
@@ -466,7 +393,8 @@ for (const { kind, url } of BACKENDS) {
 							largest: seen.what,
 							bytes: seen.bytes,
 							bounded: seen.bytes <= BOUND,
-						}).toMatchObject({ outcome: "stored", bounded: true });
+							staged: seen.calls.includes("writeFullStream"),
+						}).toMatchObject({ outcome: "stored", bounded: true, staged: true });
 						// The spool was tried, failed as this case makes it fail, and the store said so once.
 						expect(spoolWarnings).toEqual([
 							expect.objectContaining({ error: expect.stringContaining(spool.cause) }),

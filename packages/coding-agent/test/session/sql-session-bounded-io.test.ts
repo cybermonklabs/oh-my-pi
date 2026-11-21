@@ -41,6 +41,7 @@ import {
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { getBlobsDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { byteSize, Longest, recordStorage } from "../helpers/longest-value";
 import { readOnlyDefault, readStoredSession } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
@@ -124,29 +125,6 @@ function sha256(data: string | Uint8Array): string {
 	return new Bun.CryptoHasher("sha256").update(data).digest("hex");
 }
 
-function byteSize(value: unknown): number {
-	if (typeof value === "string") return Buffer.byteLength(value);
-	if (value instanceof Uint8Array) return value.byteLength;
-	return 0;
-}
-
-/** The largest string or buffer an instrumented path saw, in UTF-8 bytes, and what it was. */
-class Longest {
-	bytes = 0;
-	what = "nothing";
-
-	note(bytes: number, what: string): void {
-		if (bytes <= this.bytes) return;
-		this.bytes = bytes;
-		this.what = what;
-	}
-
-	reset(): void {
-		this.bytes = 0;
-		this.what = "nothing";
-	}
-}
-
 function expectBounded(longest: Longest): void {
 	expect({ largest: longest.what, bytes: longest.bytes, bounded: longest.bytes <= BOUND }).toMatchObject({
 		bounded: true,
@@ -189,50 +167,6 @@ function instrument(
 				callback({ unsafe: (query, values) => exec(transaction, query, values) }),
 			),
 	};
-}
-
-async function* noteChunks(chunks: AsyncIterable<unknown>, longest: Longest, name: string): AsyncGenerator<unknown> {
-	for await (const chunk of chunks) {
-		longest.note(byteSize(chunk), `a chunk ${name} yielded`);
-		yield chunk;
-	}
-}
-
-/**
- * `storage` behind a proxy that notes every string handed to or returned by
- * its methods, each element of an array argument (a full write's lines), the
- * text of a `{ text, size }` result (a ranged read), and each chunk a returned
- * stream yields. Methods run on the storage itself.
- */
-function recordStorage(storage: SqlSessionStorage, longest: Longest): SqlSessionStorage {
-	const noteValue = (value: unknown, what: string): void => {
-		if (Array.isArray(value)) for (const item of value) longest.note(byteSize(item), `an element of ${what}`);
-		else if (typeof value === "object" && value !== null && "text" in value) {
-			longest.note(byteSize(value.text), `the text of ${what}`);
-		} else longest.note(byteSize(value), what);
-	};
-	return new Proxy(storage, {
-		get(target, key) {
-			const member: unknown = Reflect.get(target, key, target);
-			if (typeof member !== "function") return member;
-			const name = String(key);
-			return (...args: unknown[]) => {
-				for (const arg of args) noteValue(arg, `an argument of ${name}`);
-				const result: unknown = member.apply(target, args);
-				if (result instanceof Promise) {
-					return result.then((value: unknown) => {
-						noteValue(value, `the result of ${name}`);
-						return value;
-					});
-				}
-				if (typeof result === "object" && result !== null && Symbol.asyncIterator in result) {
-					return noteChunks(result as AsyncIterable<unknown>, longest, name);
-				}
-				noteValue(result, `the result of ${name}`);
-				return result;
-			};
-		},
-	});
 }
 
 let tableSeq = 0;
