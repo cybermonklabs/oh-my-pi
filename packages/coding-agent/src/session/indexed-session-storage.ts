@@ -185,6 +185,10 @@ export class IndexedSessionStorage implements SessionStorage {
 	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
 	readonly #refreshWindows = new Set<Set<string>>();
 	#firstDrainError: Error | undefined;
+	/** Set by {@link openOnFirstUse} until the first use has opened the storage. */
+	#deferredOpen: (() => Promise<void>) | undefined;
+	/** The deferred open in flight, shared by every use that waits for it. */
+	#opening: Promise<void> | undefined;
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		const actualSize = this.#index.get(path)?.size ?? null;
@@ -199,7 +203,49 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async initialize(): Promise<void> {
 		await this.#backend.init();
-		await this.refresh();
+		await this.#loadIndex();
+	}
+
+	/**
+	 * Defer {@link initialize} to this storage's first use, for a process that
+	 * may never touch the store (`omp --no-session`): until then nothing
+	 * reaches the backend. The first asynchronous operation, queued write or
+	 * {@link refresh} opens it and waits for it. A failed open is that use's
+	 * error, as `describeFailure` words it, and the next use tries again.
+	 * Synchronous reads before the open see only this process's own writes, as
+	 * they see no row another process commits until the next refresh.
+	 */
+	openOnFirstUse(describeFailure: (err: unknown) => Error = toError): void {
+		this.#deferredOpen = async () => {
+			try {
+				await this.#backend.init();
+				await this.#loadIndex();
+			} catch (err) {
+				throw describeFailure(err);
+			}
+		};
+	}
+
+	/**
+	 * The open {@link openOnFirstUse} deferred, started now if no use has
+	 * started it, and shared by every use that waits for it; `undefined` once
+	 * the storage is open. A caller awaits only when it is set, so a storage
+	 * that opened at once runs every operation with the awaits it always had.
+	 */
+	pendingOpen(): Promise<void> | undefined {
+		const open = this.#deferredOpen;
+		if (!open) return undefined;
+		this.#opening ??= open().then(
+			() => {
+				this.#deferredOpen = undefined;
+				this.#opening = undefined;
+			},
+			err => {
+				this.#opening = undefined;
+				throw err;
+			},
+		);
+		return this.#opening;
 	}
 
 	/**
@@ -207,9 +253,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * processes created, changed, or removed since the last load show in
 	 * `existsSync`, `statSync`, and the listings. A path this storage has an
 	 * operation in flight for, or changes while the backend read runs, keeps
-	 * its local entry: the read cannot describe a write it may predate.
+	 * its local entry: the read cannot describe a write it may predate. On a
+	 * storage whose open was deferred and has not run, this is that open.
 	 */
 	async refresh(): Promise<void> {
+		if (this.#deferredOpen) return this.pendingOpen();
+		await this.#loadIndex();
+	}
+
+	async #loadIndex(): Promise<void> {
 		const window = new Set<string>(this.#pendingFrames.keys());
 		this.#refreshWindows.add(window);
 		try {
@@ -305,6 +357,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
@@ -360,10 +413,12 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	exists(path: string): Promise<boolean> {
-		return Promise.resolve(this.existsSync(path));
+		const opening = this.pendingOpen();
+		return opening ? opening.then(() => this.existsSync(path)) : Promise.resolve(this.existsSync(path));
 	}
 
 	async readText(path: string): Promise<string> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		await this.#awaitPath(path);
@@ -374,6 +429,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		const prefixLimit = normalizeByteLimit(prefixBytes);
@@ -393,6 +449,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * inside it reads from the start and overlays the slot.
 	 */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		await this.#awaitPath(path);
@@ -427,6 +484,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
@@ -441,6 +499,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
 		await this.#awaitPath(path);
@@ -503,6 +562,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async #rename(src: string, dst: string, noReplace: boolean): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(src);
 		await this.#awaitPath(dst);
 		const entry = this.#index.get(src);
@@ -531,6 +591,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async unlink(path: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
@@ -546,6 +607,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		if (this.#deferredOpen) await this.pendingOpen();
 		// Rows another client committed under the artifacts directory (a
 		// subagent transcript, a draft) go too: the refresh brings the ones
 		// committed so far into this view, and the backend removes every key
@@ -777,7 +839,9 @@ export class IndexedSessionStorage implements SessionStorage {
 			path =>
 				(options.abortOnPredecessorFailure ? this.#pathPending.get(path) : this.#pathTails.get(path)) ?? RESOLVED,
 		);
-		const operation = Promise.all(previous).then(task);
+		// A write queued while the open is deferred (see openOnFirstUse) waits for it; any other runs as it always did.
+		const settled = Promise.all(previous);
+		const operation = (this.#deferredOpen ? settled.then(() => this.pendingOpen()) : settled).then(task);
 		const tracked = operation.catch(err => {
 			const error = toError(err);
 			// A write the claim fence refused changed nothing, and its caller

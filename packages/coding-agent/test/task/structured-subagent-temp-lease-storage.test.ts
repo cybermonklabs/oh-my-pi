@@ -7,6 +7,7 @@
  * remove the transcripts from the storage as well as the local directory.
  */
 import { SQL } from "bun";
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -18,6 +19,7 @@ import {
 	type SessionStorage,
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { resolveSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -25,6 +27,19 @@ import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+/** The tables of the SQLite file at `databasePath`: none until a store's open has run its DDL. */
+function sqliteTables(databasePath: string): string[] {
+	if (!fs.existsSync(databasePath)) return [];
+	const db = new Database(databasePath, { readonly: true });
+	try {
+		const rows = db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all();
+		return (rows as Array<{ name: string }>).map(row => row.name);
+	} finally {
+		db.close();
+	}
+}
 
 const AGENT: AgentDefinition = {
 	name: "worker",
@@ -114,5 +129,47 @@ describe("temporary subagent artifacts lease", () => {
 		expect(path.basename(artifactsDir)).toStartWith("omp-task-");
 		expect(transcripts.filter(file => storage.existsSync(file))).toEqual([]);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	// A --no-session run installs its configured store opened on first use: the
+	// subagent is that first use, and it ends as it does with a store opened at start-up.
+	it("opens a store resolved for first use when the subagent writes, and cleanup still removes the rows", async () => {
+		using dir = TempDir.createSync("@omp-temp-lease-first-use-");
+		const databasePath = dir.join("sessions.db");
+		const dsnFile = dir.join("dsn");
+		await Bun.write(dsnFile, `sqlite://${databasePath}\n`);
+		const storage = await resolveSessionStorage({
+			settings: Settings.isolated(),
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			openOnFirstUse: true,
+		});
+		setDefaultSessionStorage(storage);
+		// Nothing ran on the database yet: no table is made.
+		expect(sqliteTables(databasePath)).toEqual([]);
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [AGENT], projectAgentsDir: null });
+		let artifactsDir = "";
+		const transcripts: string[] = [];
+		const presentDuringRun: string[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			artifactsDir = options.artifactsDir ?? "";
+			const own = path.join(artifactsDir, `${options.id}.jsonl`);
+			await storage.writeText(own, '{"type":"session","id":"child"}\n');
+			transcripts.push(own);
+			if (storage.existsSync(own)) presentDuringRun.push(own);
+			return result(options.id);
+		});
+
+		await runStructuredSubagent({
+			session: sessionWithoutFile(),
+			invocationKind: "task",
+			assignment: "Inspect the target.",
+			agent: "worker",
+		});
+
+		expect(presentDuringRun).toEqual(transcripts);
+		expect(sqliteTables(databasePath)).toContain("omp_session_files");
+		expect(transcripts.filter(file => storage.existsSync(file))).toEqual([]);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		await storage.drain();
 	});
 });
