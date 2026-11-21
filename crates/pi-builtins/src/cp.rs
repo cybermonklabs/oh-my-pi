@@ -3890,4 +3890,71 @@ mod tests {
 			(code, capture.err())
 		});
 	}
+
+	/// cp refuses a source that is the destination's simple backup as GNU
+	/// does: by the source's name and file, in every mode but numbered,
+	/// whatever the backup's own name would be. Beside `dest.~3~`, or a
+	/// dangling `dest.~1~`, `-b` and `existing` would back up to a numbered
+	/// name, and GNU 9.4 and 9.7 still refuse; `numbered` copies and backs
+	/// up to `dest.~4~` or `dest.~2~`.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_that_is_the_destinations_simple_backup_is_not_copied_over_it() {
+		let cwd = tempfile::tempdir().unwrap();
+		let case = |name: &str, dangling_first: bool| {
+			let dir = cwd.path().join(name);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("dest~"), b"payload").unwrap();
+			fs::write(dir.join("dest"), b"old").unwrap();
+			if dangling_first {
+				std::os::unix::fs::symlink("missing", dir.join("dest.~1~")).unwrap();
+			} else {
+				fs::write(dir.join("dest.~3~"), b"three").unwrap();
+			}
+			dir
+		};
+		for control in ["-b", "--backup=existing"] {
+			for dangling_first in [false, true] {
+				let what = format!("{control}, dangling .~1~: {dangling_first}");
+				let dir = case(&format!("{}-{dangling_first}", control.trim_start_matches('-')), dangling_first);
+				let (code, capture) = run_util::<Cp>(&[control, "dest~", "dest"], "", &dir);
+				assert_eq!(
+					(code, capture.err()),
+					(1, "cp: backing up 'dest' might destroy source;  'dest~' not copied\n".to_owned()),
+					"{what}"
+				);
+				assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "{what}: dest replaced");
+				assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "{what}: the source changed");
+			}
+		}
+		for (dangling_first, backup) in [(false, "dest.~4~"), (true, "dest.~2~")] {
+			let dir = case(&format!("numbered-{dangling_first}"), dangling_first);
+			let (code, capture) = run_util::<Cp>(&["--backup=numbered", "dest~", "dest"], "", &dir);
+			assert_eq!((code, capture.err()), (0, String::new()), "numbered");
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "numbered: not copied");
+			assert_eq!(fs::read(dir.join(backup)).unwrap(), b"old", "numbered: no backup at {backup}");
+		}
+	}
+
+	/// `cp --backup=numbered` past the name limit backs up as GNU cp does
+	/// ([`crate::file_backup::tests::check_name_limit`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_past_the_name_limit_ends_in_a_tilde() {
+		crate::file_backup::tests::check_name_limit(|dir, name| {
+			let (code, capture) = run_util::<Cp>(&["--backup=numbered", "src", name], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `cp -b -S ''` backs up to `dest~`, as GNU cp does
+	/// ([`crate::file_backup::tests::check_empty_suffix`]).
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_suffix_backs_up_with_a_tilde() {
+		crate::file_backup::tests::check_empty_suffix(|dir| {
+			let (code, capture) = run_util::<Cp>(&["-b", "-S", "", "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
 }

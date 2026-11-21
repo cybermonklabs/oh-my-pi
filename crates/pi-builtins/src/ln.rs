@@ -801,4 +801,26 @@ mod tests {
 			(code, capture.err())
 		});
 	}
+
+	/// `ln --backup=numbered` past the name limit backs up as GNU ln does
+	/// ([`crate::file_backup::tests::check_name_limit`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_past_the_name_limit_ends_in_a_tilde() {
+		crate::file_backup::tests::check_name_limit(|dir, name| {
+			let (code, capture) = run_util::<Ln>(&["--backup=numbered", "src", name], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -b -S ''` backs up to `dest~`, as GNU ln does
+	/// ([`crate::file_backup::tests::check_empty_suffix`]).
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_suffix_backs_up_with_a_tilde() {
+		crate::file_backup::tests::check_empty_suffix(|dir| {
+			let (code, capture) = run_util::<Ln>(&["-b", "-S", "", "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
 }

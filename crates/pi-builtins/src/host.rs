@@ -3165,6 +3165,25 @@ mod testing {
 		(code, capture)
 	}
 
+	/// [`run_util`] on the filesystem `fs` (a provider, say) instead of the
+	/// host's own.
+	pub(crate) fn run_util_on<U: Utility>(
+		fs: &pi_vfs::Fs,
+		argv: &[&str],
+		stdin: &str,
+		cwd: impl Into<PathBuf>,
+	) -> (i32, Capture) {
+		let cwd = cwd.into();
+		let spec = Spec::of_sync::<U>();
+		let (mut host, capture) = test_host(spec, stdin, cwd.clone());
+		host.paths = ShellPaths::new(cwd, fs, None, std::iter::empty());
+		let code = match parse_for_test::<U>(spec, argv, &mut host) {
+			Ok(parsed) => run_caught::<U>(parsed, &mut host),
+			Err(code) => code,
+		};
+		(code, capture)
+	}
+
 	/// [`run_util`] for an [`AsyncUtility`]: the body is awaited in place and
 	/// its output drained into the [`Capture`] before it returns.
 	pub(crate) async fn run_async_util<U: AsyncUtility>(
@@ -4110,7 +4129,7 @@ mod testing {
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util};
+pub(crate) use testing::{Capture, TestRunner, run_async_util, run_extra, run_proc, run_util, run_util_on};
 #[cfg(all(test, unix, feature = "util.grep"))]
 pub(crate) use testing::tree_with_sparse_file;
 #[cfg(all(test, any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm")))]

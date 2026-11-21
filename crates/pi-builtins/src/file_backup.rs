@@ -190,11 +190,92 @@ pub(crate) fn backup_display(operand: &Path, backup: &Path) -> PathBuf {
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
-	use std::{fs, os::unix::fs::symlink, path::Path};
+	use std::{
+		fs, io,
+		os::unix::fs::symlink,
+		path::{Path, PathBuf},
+		sync::Arc,
+	};
 
 	use uucore::backup_control::BackupMode;
 
 	use super::backup_path;
+
+	/// A provider over host files that reports no file identities, as a
+	/// provider whose metadata carries no device and inode does (the shell's
+	/// own may omit them). With `cut_listings`, every listing ends with an
+	/// error before its first entry, as std's `ReadDir` stops at its first
+	/// error.
+	#[derive(Debug, Default)]
+	pub(crate) struct HostWithoutIds {
+		cut_listings: bool,
+	}
+
+	impl HostWithoutIds {
+		/// A filesystem over this provider.
+		pub(crate) fn fs(cut_listings: bool) -> pi_vfs::Fs {
+			pi_vfs::Fs::new(Arc::new(Self { cut_listings }))
+		}
+	}
+
+	/// `metadata` without its identity: the kind, length, permissions and
+	/// modification time only.
+	fn without_id(metadata: pi_vfs::Metadata) -> pi_vfs::Metadata {
+		let plain = pi_vfs::Metadata::new(metadata.file_type(), metadata.len(), metadata.permissions());
+		match metadata.modified() {
+			Ok(time) => plain.with_modified(time),
+			Err(_) => plain,
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for HostWithoutIds {
+		async fn open(&self, path: &Path, options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			pi_vfs::Fs::default().open_with(path, options).await
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			pi_vfs::Fs::default().metadata(path).await.map(without_id)
+		}
+
+		async fn symlink_metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			pi_vfs::Fs::default().symlink_metadata(path).await.map(without_id)
+		}
+
+		async fn read_dir(&self, path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			let listing = pi_vfs::Fs::default().read_dir(path).await?;
+			if self.cut_listings {
+				return Ok(pi_vfs::ReadDir::from_entries(vec![Err(io::Error::other(
+					"the listing was cut short",
+				))]));
+			}
+			Ok(listing)
+		}
+
+		async fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+			pi_vfs::Fs::default().read_link(path).await
+		}
+
+		async fn create_dir(&self, path: &Path, _mode: Option<u32>) -> io::Result<()> {
+			pi_vfs::Fs::default().create_dir(path).await
+		}
+
+		async fn remove_file(&self, path: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().remove_file(path).await
+		}
+
+		async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().remove_dir(path).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().rename(from, to).await
+		}
+
+		async fn set_permissions(&self, path: &Path, permissions: pi_vfs::Permissions) -> io::Result<()> {
+			pi_vfs::Fs::default().set_permissions(path, permissions).await
+		}
+	}
 
 	/// One directory of [`check_numbered_backups`]: what is at `dest.~N~`
 	/// before the backup (`None` for a symlink to nothing), the
@@ -281,10 +362,12 @@ pub(crate) mod tests {
 		}
 	}
 
-	/// A directory that cannot be listed (search permission only) is
-	/// probed instead, `name.~1~` upward, for the first name no entry holds,
-	/// a symlink to nothing included; GNU would try `name.~1~` and keep
-	/// trying, so neither replaces an entry.
+	/// A directory that cannot be listed (search permission only) shows no
+	/// numbered backup. `existing` then uses the simple name, as GNU 9.4 and
+	/// 9.7 do in mv, cp and ln. `numbered` takes the first name no entry
+	/// holds by `lstat`, a symlink to nothing included, from `name.~1~` up.
+	/// That is not GNU's: there mv and cp retry `name.~1~` without end, and ln
+	/// replaces it.
 	#[test]
 	fn a_directory_that_cannot_be_listed_is_probed_for_a_free_backup_name() {
 		use std::os::unix::fs::PermissionsExt as _;
@@ -302,6 +385,107 @@ pub(crate) mod tests {
 			return;
 		}
 		assert_eq!(numbered, Some(dir.path().join("dest.~2~")));
-		assert_eq!(existing, Some(dir.path().join("dest.~2~")));
+		assert_eq!(existing, Some(dir.path().join("dest~")));
+	}
+
+	/// A listing that ends early, with an error, is not taken as complete:
+	/// the name is confirmed free by `lstat`, past an entry the listing never
+	/// showed, so a numbered backup does not replace one. GNU reads a cut
+	/// listing too, but renames without replacing and lists again. With no
+	/// numbered backup seen, `existing` uses the simple name, as GNU does.
+	#[test]
+	fn a_listing_cut_short_never_picks_an_occupied_name() {
+		let vfs = HostWithoutIds::fs(true).blocking();
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		fs::write(dir.path().join("dest.~1~"), "keep").unwrap();
+		let dest = dir.path().join("dest");
+		assert_eq!(backup_path(&vfs, BackupMode::Numbered, &dest, "~"), Some(dir.path().join("dest.~2~")));
+		assert_eq!(backup_path(&vfs, BackupMode::Existing, &dest, "~"), Some(dir.path().join("dest~")));
+	}
+
+	/// A numbered name too long for its directory gives way to the name with
+	/// `~`, cut to fit if need be, as gnulib's `check_extension` does, with
+	/// the limit one under `NAME_MAX` (255 here, so 254). GNU 9.4 gives each
+	/// of these:
+	/// - a 250-byte `A`: `A.~1~` (254 bytes, fits);
+	/// - a 251-byte `B` beside `B.~9~`: `B.~10~` would be 256 bytes, so `B~`;
+	/// - a 251-byte `C` beside `C.~8~`: `C.~9~` (255 bytes), as long as the
+	///   name listed, which is not checked;
+	/// - a 255-byte `D`: `D.~1~` would be 259 bytes, so its first 253 bytes
+	///   and `~` (254);
+	/// - a 254-byte `E` under `existing` with no numbered backup: the simple
+	///   name `E~` (255 bytes) is checked too, so its first 253 bytes and `~`.
+	#[test]
+	fn a_numbered_name_past_the_name_limit_falls_back_to_a_tilde() {
+		let vfs = pi_vfs::BlockingFs::native();
+		let dir = tempfile::tempdir().unwrap();
+		match pathconf_name_max(dir.path()) {
+			Some(255) => {},
+			other => {
+				eprintln!("skipped: NAME_MAX here is {other:?}, not 255");
+				return;
+			},
+		}
+		let name = |byte: char, length: usize| byte.to_string().repeat(length);
+		let cases = [
+			(name('a', 250), None, BackupMode::Numbered, format!("{}.~1~", name('a', 250))),
+			(name('b', 251), Some("9"), BackupMode::Numbered, format!("{}~", name('b', 251))),
+			(name('c', 251), Some("8"), BackupMode::Numbered, format!("{}.~9~", name('c', 251))),
+			(name('d', 255), None, BackupMode::Numbered, format!("{}~", name('d', 253))),
+			(name('e', 254), None, BackupMode::Existing, format!("{}~", name('e', 253))),
+		];
+		for (file, listed, mode, expected) in cases {
+			fs::write(dir.path().join(&file), "old").unwrap();
+			if let Some(version) = listed {
+				fs::write(dir.path().join(format!("{file}.~{version}~")), "listed").unwrap();
+			}
+			assert_eq!(
+				backup_path(&vfs, mode, &dir.path().join(&file), "~"),
+				Some(dir.path().join(&expected)),
+				"{} bytes, listed {listed:?}, {mode:?}",
+				file.len()
+			);
+		}
+	}
+
+	/// `NAME_MAX` of the directory `dir`, as pathconf reports it.
+	fn pathconf_name_max(dir: &Path) -> Option<i64> {
+		use std::os::unix::ffi::OsStrExt as _;
+		let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+		// SAFETY: `dir` is a NUL-terminated path that outlives the call.
+		let max = unsafe { libc::pathconf(dir.as_ptr(), libc::_PC_NAME_MAX) };
+		(max != -1).then_some(i64::from(max))
+	}
+
+	/// Checks a caller of [`backup_path`] against an empty suffix: in a
+	/// directory holding `src` ("new") and `dest` ("old"), `run(dir)` must
+	/// move or copy `src` to `dest` with `-b -S ''` and return the exit
+	/// status and standard error. GNU takes an empty suffix as `~`: `dest~`
+	/// keeps the old `dest`, where an empty one would name the backup `dest`
+	/// and lose it.
+	pub(crate) fn check_empty_suffix(run: impl Fn(&Path) -> (i32, String)) {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("src"), "new").unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		assert_eq!(run(dir.path()), (0, String::new()));
+		assert_eq!(fs::read_to_string(dir.path().join("dest~")).ok().as_deref(), Some("old"));
+	}
+
+	/// Checks a caller of [`backup_path`] against the name limit: in a
+	/// directory holding `src` ("new"), a 251-byte `D` ("old") and `D.~9~`
+	/// ("nine"), `run(dir, D)` must back `D` up numbered, as `src D` does,
+	/// and return the exit status and standard error. GNU 9.4 and 9.7 succeed
+	/// and back `D` up as `D~`, keeping `D.~9~`.
+	pub(crate) fn check_name_limit(run: impl Fn(&Path, &str) -> (i32, String)) {
+		let dir = tempfile::tempdir().unwrap();
+		let long = "a".repeat(251);
+		fs::write(dir.path().join("src"), "new").unwrap();
+		fs::write(dir.path().join(&long), "old").unwrap();
+		fs::write(dir.path().join(format!("{long}.~9~")), "nine").unwrap();
+		assert_eq!(run(dir.path(), &long), (0, String::new()));
+		assert_eq!(fs::read_to_string(dir.path().join(format!("{long}~"))).ok().as_deref(), Some("old"));
+		assert_eq!(fs::read_to_string(dir.path().join(&long)).unwrap(), "new");
+		assert_eq!(fs::read_to_string(dir.path().join(format!("{long}.~9~"))).unwrap(), "nine");
 	}
 }

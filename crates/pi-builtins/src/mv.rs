@@ -1161,7 +1161,7 @@ mod tests {
 	use tempfile::tempdir;
 
 	use super::Mv;
-	use crate::host::{Host, Utility, run_util};
+	use crate::host::{Host, Utility, run_util, run_util_on};
 
 	#[test]
 	fn relative_rename_uses_host_working_directory() {
@@ -1702,5 +1702,54 @@ mod tests {
 		assert!(cwd.path().join("dd/src").is_dir(), "the directory was not moved");
 		assert_eq!(link_at(&cwd.path().join("dd/src.~1~")), Some("gone".into()), "the earlier backup was lost");
 		assert_eq!(link_at(&cwd.path().join("dd/src.~2~")), Some("missing".into()), "the link was not backed up");
+	}
+
+	/// On a provider whose metadata has no file identities, a source that is
+	/// the destination's simple backup is still refused: without both
+	/// identities the two names are compared by location, as cp compares
+	/// files. A `dest~` in another directory still moves.
+	#[cfg(unix)]
+	#[test]
+	fn a_provider_without_file_ids_still_refuses_the_backup_as_source() {
+		let provider = crate::file_backup::tests::HostWithoutIds::fs(false);
+		let cwd = tempdir().unwrap();
+		for control in ["--backup=simple", "--backup=existing", "-b"] {
+			let dir = cwd.path().join(control.trim_start_matches('-'));
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("dest~"), b"payload").unwrap();
+			fs::write(dir.join("dest"), b"old").unwrap();
+			let (code, capture) = run_util_on::<Mv>(&provider, &[control, "dest~", "dest"], "", &dir);
+			assert_eq!(
+				(code, capture.err()),
+				(1, "mv: backing up 'dest' might destroy source;  'dest~' not moved\n".to_owned()),
+				"{control}"
+			);
+			assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"payload", "{control}: the source was lost");
+			assert_eq!(fs::read(dir.join("dest")).unwrap(), b"old", "{control}: dest replaced");
+		}
+		let dir = cwd.path().join("elsewhere");
+		fs::create_dir_all(dir.join("s")).unwrap();
+		fs::write(dir.join("s/dest~"), b"payload").unwrap();
+		fs::write(dir.join("dest"), b"old").unwrap();
+		let (code, capture) = run_util_on::<Mv>(&provider, &["-b", "s/dest~", "dest"], "", &dir);
+		assert_eq!((code, capture.err()), (0, String::new()), "elsewhere");
+		assert_eq!(fs::read(dir.join("dest")).unwrap(), b"payload", "elsewhere: not moved");
+		assert_eq!(fs::read(dir.join("dest~")).unwrap(), b"old", "elsewhere: no backup");
+	}
+
+	/// `mv --backup=numbered` past the name limit backs up as GNU mv does
+	/// ([`crate::file_backup::tests::check_name_limit`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_past_the_name_limit_ends_in_a_tilde() {
+		crate::file_backup::tests::check_name_limit(|dir, name| mv_in(dir, &["--backup=numbered", "src", name], ""));
+	}
+
+	/// `mv -b -S ''` backs up to `dest~`, as GNU mv does
+	/// ([`crate::file_backup::tests::check_empty_suffix`]).
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_suffix_backs_up_with_a_tilde() {
+		crate::file_backup::tests::check_empty_suffix(|dir| mv_in(dir, &["-b", "-S", "", "src", "dest"], ""));
 	}
 }
