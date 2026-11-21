@@ -1,8 +1,10 @@
 /**
- * One omp process of `agent-session-no-strict-tool-digest.test.ts`, run as `bun <this file> <input JSON>`: the
- * providers read `PI_NO_STRICT` once, when they load, so each process the test runs with or without it is its own.
- * On the gateway's claude-opus-5-5 with `read` and `edit` (a tool the Anthropic provider declares as strict unless
- * `PI_NO_STRICT` is set; an OpenAI one asks strict decoding for every tool not marked `strict: false` unless it is),
+ * One omp process of `agent-session-no-strict-tool-digest.test.ts` (and of
+ * `agent-session-no-strict-unchanged-tools.test.ts`), run as `bun <this file> <input JSON>`: the providers read
+ * `PI_NO_STRICT` once, when they load, so each process the test runs with or without it is its own. On the gateway's
+ * claude-opus-5-5 with the input's tools, `read` and `edit` unless given (`edit` is a tool the Anthropic provider
+ * declares as strict unless `PI_NO_STRICT` is set; an OpenAI one asks strict decoding for every tool not marked
+ * `strict: false` unless it is),
  * on Anthropic's messages API or the input's OpenAI API, on the input's session file or a new session, it reads the
  * prompt cache status, sends each prompt at its minute, and writes what it saw to the input's `out` file.
  */
@@ -36,6 +38,8 @@ export interface ProcessInput {
 	out: string;
 	/** The OpenAI API the gateway serves the model on; Anthropic's messages API without one. */
 	api?: OpenAIGatewayApi;
+	/** The tools the session starts with; `read` and `edit` unless given. */
+	toolNames?: string[];
 }
 
 /** What the process saw. */
@@ -70,7 +74,7 @@ try {
 		modelRegistry,
 		settings: Settings.isolated({ "providers.cacheRetention": "long" }),
 		model,
-		toolNames: ["read", "edit"],
+		toolNames: input.toolNames ?? ["read", "edit"],
 		contextFiles: [{ path: path.join(input.dir, "AGENTS.md"), content: input.agentsMd }],
 		skills: [],
 	});
