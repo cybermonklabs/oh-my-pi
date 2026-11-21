@@ -543,8 +543,9 @@ async function placeSession(
 	arrival: SessionTransferDetails,
 ): Promise<{ sessionFile: string; id: string }> {
 	let placed: string | undefined;
+	let manager: SessionManager | undefined;
 	try {
-		const manager = await open();
+		manager = await open();
 		placed = manager.getSessionFile();
 		const id = manager.getSessionId();
 		try {
@@ -555,6 +556,10 @@ async function placeSession(
 		if (!placed) throw new SessionTransferError("Unpacked session has no session file.");
 		return { sessionFile: placed, id };
 	} catch (error) {
+		// A store that refused the session's writes leaves them kept for a
+		// later write to send; this unpack failed, so drop them, and nothing
+		// writes the files removed here.
+		manager?.releaseRetainedEntries();
 		if (placed) await removeSessionFiles(placed);
 		throw error;
 	}
@@ -683,7 +688,15 @@ export async function forkIfMovedAway(manager: SessionManager, sessionDir?: stri
 	const cwd = manager.getCwd();
 	await manager.close();
 	const fork = await SessionManager.forkFrom(source, cwd, sessionDir, undefined, { repairInterruptedTail: true });
-	await appendTransferNotice(fork, { kind: "forked", source, to: marker.to });
+	try {
+		await appendTransferNotice(fork, { kind: "forked", source, to: marker.to });
+	} catch (error) {
+		// A store that refused the fork's writes leaves them kept for a later
+		// write to send; this resume failed, so drop the fork, and nothing
+		// writes it later.
+		fork.releaseRetainedEntries();
+		throw error;
+	}
 	logger.info("Resumed a session that moved away; continuing in a fork", {
 		source,
 		movedTo: marker.to,

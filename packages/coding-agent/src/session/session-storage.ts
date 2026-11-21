@@ -142,6 +142,140 @@ export class SessionLockError extends Error {
 }
 
 /**
+ * The two kinds of refused write. An outage (a full disk, a store that is down, busy or read-only for
+ * now) ends when the store comes back, so a session waits for a write to land on the same store. A
+ * permission refusal (a directory or database the process may not write, a read-only mount) ends only
+ * when someone changes the permission, which no write of another session shows: the session starts, and
+ * only its own writes try again.
+ */
+type StoreRefusal = "outage" | "permission";
+
+/**
+ * Error codes of a store that refuses writes, by kind: a file system that is full (`ENOSPC`, `EDQUOT`),
+ * or that is read-only or denies the write; Bun's SQL client with a PostgreSQL connection refused,
+ * closed or not answered; and a SQLite database that is full, or read-only.
+ */
+const STORE_REFUSED_CODES: Record<string, StoreRefusal> = {
+	ENOSPC: "outage",
+	EDQUOT: "outage",
+	EROFS: "permission",
+	EACCES: "permission",
+	EPERM: "permission",
+	ERR_POSTGRES_CONNECTION_REFUSED: "outage",
+	ERR_POSTGRES_CONNECTION_CLOSED: "outage",
+	ERR_POSTGRES_CONNECTION_TIMEOUT: "outage",
+	SQLITE_FULL: "outage",
+	SQLITE_READONLY: "permission",
+};
+/**
+ * PostgreSQL SQLSTATEs of a server that refuses writes for now (see {@link pgSqlStateRefusal}): a
+ * read-only transaction (25006, a pooled backend left read-only), a full disk (53100), too many
+ * connections (53300), and a server that ends or refuses connections (57P01-57P03). PgBouncer forwards a
+ * server's login error to its clients with the server's SQLSTATE, except 57P03, for which they wait.
+ */
+const STORE_REFUSED_SQLSTATES: Record<string, true> = {
+	"25006": true,
+	"53100": true,
+	"53300": true,
+	"57P01": true,
+	"57P02": true,
+	"57P03": true,
+};
+/**
+ * PgBouncer sends every error of its own as SQLSTATE 08P01 (protocol violation), which PostgreSQL
+ * sends for a malformed message. These texts mean it cannot reach the server, has no room for the
+ * client or the query, lost the server connection mid-query, or is shutting down, for now; every other
+ * 08P01 is not a refusal. Read from PgBouncer's source at every release from 1.22.0 to 1.26.1; each
+ * text names the releases that send it and where it is in 1.26.1.
+ */
+const PGBOUNCER_REFUSALS: readonly string[] = [
+	// 1.22.0 and later, janitor.c:344: a query waited query_wait_timeout for a server.
+	"query_wait_timeout",
+	// 1.22.0 and later, janitor.c:369: a login waited client_login_timeout for a server that is down.
+	"client_login_timeout (server down)",
+	// Client limits: max_client_conn since 1.22.0 (client.c:1088), the per-database and per-user
+	// limits since 1.24.0 (client.c:478, :514).
+	"no more connections allowed (max_client_conn)",
+	"client connections exceeded (max_db_client_connections)",
+	"client connections exceeded (max_user_client_connections)",
+	// 1.22.0 and later, server.c:812: the server connection ended mid-query.
+	"server conn crashed?",
+	// 1.23.0 and later, janitor.c:340 and objects.c:811: a client waiting for a server while PgBouncer
+	// shuts down after its servers (SIGINT, SHUTDOWN WAIT_FOR_SERVERS).
+	"server shutting down",
+	// 1.25.0 and later, objects.c:2061: a login while PgBouncer shuts down.
+	"pooler is shutting down",
+];
+/**
+ * The start of the error a client gets while PgBouncer's logins to the server have been failing
+ * (server_login_retry, objects.c:888 in 1.26.1). 1.22.0 to 1.23.1 send "server login has been failing,
+ * try again later (server_login_retry)"; 1.24.0 and later "server login has been failing, cached error:
+ * <the last failed server connection's reason> (server_login_retry)". Outside a replication pool, a
+ * login the server rejects leaves the server's own error text as that reason (server.c:193-194 in
+ * 1.26.1), a wrong password's among them, so a write that meets this text reads as a store that is
+ * down, as with the 1.22.0 text. The clients waiting when the server rejects the login get the server's
+ * own SQLSTATE first (kill_pool_logins, server.c:74-117): 28P01 for a wrong password, which is no
+ * refusal, so a close that meets it is not held.
+ */
+const PGBOUNCER_LOGIN_RETRY = "server login has been failing";
+
+/** Whether PgBouncer's 08P01 text `message` is one of {@link PGBOUNCER_REFUSALS} or a login retry. */
+function isPgBouncerRefusal(message: string): boolean {
+	return message.startsWith(PGBOUNCER_LOGIN_RETRY) || PGBOUNCER_REFUSALS.includes(message);
+}
+
+/** A write conflict and a held publish lock are faults in who writes, never the store refusing. */
+function isWriterFault(error: unknown): boolean {
+	return error instanceof SessionWriteConflictError || error instanceof SessionLockError;
+}
+
+/**
+ * Whether `error` is the session store refusing a write, as opposed to a fault in the write itself or
+ * in who writes. A session keeps its entries in memory through a refusal and writes them once the store
+ * accepts writes again (see {@link isSessionStoreOutage} for which refusals other sessions' writes end).
+ * A write conflict, a held publish lock, a database permission or schema error, a missing path, and
+ * every other error are not refusals. An error that wraps others counts by what it wraps: a failed
+ * repair (an `AggregateError`, such as `SessionPersistenceIndeterminateError`) is a refusal when the
+ * store refused one of the writes it met and none of them was a writer's fault, and an uncoded error is
+ * a refusal when its `cause` is.
+ */
+export function isSessionStoreWriteRefusal(error: unknown): boolean {
+	return refusalOf(error, 0) !== undefined;
+}
+
+/**
+ * Whether `error` is a refusal that ends when the store comes back (a full disk, a store that is down,
+ * busy or read-only for now), so a later write that lands on the same store is the time to try again.
+ * A permission refusal (`EACCES`, `EPERM`, `EROFS`, `SQLITE_READONLY`) is a refusal but not an outage.
+ */
+export function isSessionStoreOutage(error: unknown): boolean {
+	return refusalOf(error, 0) === "outage";
+}
+
+/** The kind of refusal `error` is, `depth` wrappers in; deeper than four is none. */
+function refusalOf(error: unknown, depth: number): StoreRefusal | undefined {
+	if (!(error instanceof Error) || depth > 4 || isWriterFault(error)) return undefined;
+	if (error instanceof AggregateError) {
+		const errors: unknown[] = error.errors;
+		if (errors.some(isWriterFault)) return undefined;
+		const kinds = errors.map(inner => refusalOf(inner, depth + 1));
+		return kinds.includes("outage") ? "outage" : kinds.includes("permission") ? "permission" : undefined;
+	}
+	const { code } = error as { code?: unknown };
+	if (typeof code !== "string") return refusalOf(error.cause, depth + 1);
+	if (Object.hasOwn(STORE_REFUSED_CODES, code)) return STORE_REFUSED_CODES[code];
+	return code === "ERR_POSTGRES_SERVER_ERROR" && pgSqlStateRefusal(error) ? "outage" : undefined;
+}
+
+/** Whether a PostgreSQL server error, as Bun's client gives it, is a refusal (its SQLSTATE is `errno`). */
+function pgSqlStateRefusal(error: Error): boolean {
+	const { errno } = error as { errno?: unknown };
+	if (typeof errno !== "string") return false;
+	if (errno === "08P01") return isPgBouncerRefusal(error.message);
+	return Object.hasOwn(STORE_REFUSED_SQLSTATES, errno);
+}
+
+/**
  * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
  * backend MUST check `expectedSize` and call `commitGuard()` synchronously
  * immediately before it makes the staged content visible at `path`. Failed
@@ -254,9 +388,14 @@ export interface SessionStorage {
 	 * writes complete in-body; async backends (Redis/SQL via
 	 * {@link IndexedSessionStorage}) await their per-path queues so a caller
 	 * driving a graceful shutdown does not exit while a fire-and-forget
-	 * `writeTextSync` publish is still on the wire.
+	 * `writeTextSync` publish is still on the wire. Rejects with a failure of
+	 * such a publish not reported before: one to `path`, or one to another
+	 * path while no write has landed on the store since it (it may be the
+	 * store refusing every write); with `path` omitted, the first to any path.
+	 * Once a later write lands, another session's failed write is never
+	 * reported to `path`'s drain.
 	 */
-	drain(): Promise<void>;
+	drain(path?: string): Promise<void>;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors

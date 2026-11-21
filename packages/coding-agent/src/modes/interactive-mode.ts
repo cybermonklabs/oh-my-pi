@@ -2483,10 +2483,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
-				await this.session.dispose({
-					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
-					reason,
-				});
+				await this.#disposeSession(reason);
 			},
 		});
 		// Forward the postmortem reason (SIGTERM/SIGHUP/uncaughtException/…) so the
@@ -8309,6 +8306,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#quitHostOwned(0);
 	}
 
+	/**
+	 * Dispose the session as every teardown of this mode does: the shared teardown that `init()` registers
+	 * and the direct dispose before it. A failed close leaves the TUI open ({@link #handleTeardownError}),
+	 * so the conversation stays in memory and `/export` and `/dump` still have it.
+	 */
+	#disposeSession(reason?: postmortem.Reason): Promise<void> {
+		return this.session.dispose({
+			mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
+			reason,
+			keepTranscriptAfterFailedClose: true,
+		});
+	}
+
 	#handleTeardownError(action: "close" | "restart", error: unknown): void {
 		this.#isShuttingDown = false;
 		const detail = error instanceof Error ? error.message : String(error);
@@ -8464,9 +8474,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#signalTeardown) {
 				await this.#signalTeardown();
 			} else {
-				await this.session.dispose({
-					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
-				});
+				await this.#disposeSession();
 			}
 		} finally {
 			clearTimeout(stillClosingTimer);

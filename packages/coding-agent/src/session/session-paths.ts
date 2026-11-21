@@ -14,7 +14,7 @@ import {
 } from "@oh-my-pi/pi-utils/dirs";
 import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
-import type { SessionStorage } from "./session-storage";
+import { isSessionStoreWriteRefusal, type SessionStorage } from "./session-storage";
 
 const migratedSessionRoots = new Set<string>();
 
@@ -306,7 +306,14 @@ export function computeDefaultSessionDir(
 	if (shadowedHomeDirName) migrateNamedSessionDir(shadowedHomeDirName, sessionDir, sessionsRoot);
 	if (shadowedHomeHashedDirName) migrateNamedSessionDir(shadowedHomeHashedDirName, sessionDir, sessionsRoot);
 	migrateHashedSessionDir(hashedDirName, sessionDir, sessionsRoot);
-	storage.ensureDirSync(sessionDir);
+	try {
+		storage.ensureDirSync(sessionDir);
+	} catch (error) {
+		// A store that refuses the directory refuses the session's writes too;
+		// the first one makes it, and its refusal is reported and retried as any
+		// refused write is. Any other error stops the caller, as before.
+		if (!isSessionStoreWriteRefusal(error)) throw error;
+	}
 	return sessionDir;
 }
 

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A subagent launched while the session store refuses writes (a full or quota-exceeded disk, a SQL store that is down, busy or read-only, including PostgreSQL behind PgBouncer 1.22.0 to 1.26.1) now starts at once: its transcript stays in memory and is written once the store accepts writes, as the main session's is. Behind PgBouncer, a write that meets its login-retry error for a login the server rejected (a wrong password, for one) also reads as a store that is down; the writes waiting when the server rejects the login get the server's own error instead (28P01 for a wrong password), which is no refusal, so a close that meets it is not kept. A fork (`--fork`, a subagent's seance fork) and a switch to a new session path start the same way. `/tan` still fails while its parent session holds a write the store refused, because it writes and flushes the parent before it forks. Resuming a session that moved away and unpacking a session whose local copy diverged still fail, as their notice cannot be written, and drop the fork. A session whose close the store refused for an outage keeps its transcript until a later write lands on the same store, and then releases it; a close the store refused for permission is not kept, and the entries it could not write are lost. A session whose directory the store refuses to make now starts and warns instead of failing at start. A session the store refuses for permission (`EACCES`, `EPERM`, a read-only file system or SQLite database) also starts, but only its own writes try again
+- On a session store that sessions share, one session's failed write no longer fails another session's flush or close once a later write has landed on the store
+- A disposed session whose final close fails now releases its in-memory transcript, but for the entries a close refused for an outage holds for the later send, and lifts its account pools, as one whose close lands does; before, a parked subagent whose close failed kept both. The interactive mode, which stays open after a failed close, keeps the whole transcript, also once a held close's send lands or ends, so `/export` and `/dump` still have it
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
