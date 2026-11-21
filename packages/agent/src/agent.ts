@@ -23,6 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import { anthropicDeclaredTools, anthropicKeepsToolDeclaration } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -38,11 +39,11 @@ import {
 	steeringQueueState,
 	unpairedToolCallTail,
 } from "./agent-loop";
-import type { AppendOnlyContextManager } from "./append-only-context";
+import { type AppendOnlyContextManager, toolSpecsFingerprint } from "./append-only-context";
 import { agentPauseGate } from "./pause";
 import { RepeatedPerCallMessages } from "./repeated-per-call-messages";
 import { isProviderRefusalMessage } from "./replay-policy";
-import { SentToolDefinitions } from "./sent-tool-definitions";
+import { latestToolDeclaration, type RecordedToolDeclaration, SentToolDefinitions } from "./sent-tool-definitions";
 import { Tokenizer } from "./tokenizer";
 import {
 	createAdditionalContextMessage,
@@ -443,6 +444,19 @@ export class Agent {
 		request?: ProviderContextRequest,
 	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
+	/** {@link declaredToolsFingerprint} for the inputs it was last computed from. */
+	#declaredToolsMemo:
+		| {
+				model: Model | undefined;
+				tools: AgentTool[];
+				intentTracing: boolean;
+				intentDescription: string | undefined;
+				pruneDescriptions: boolean;
+				declaration: RecordedToolDeclaration | undefined;
+				sentRevision: number;
+				fingerprint: string;
+		  }
+		| undefined;
 	/** What this Agent's previous main request sent per call; side requests leave it alone. */
 	#repeatedPerCallMessages = new RepeatedPerCallMessages();
 	#steeringQueue: AgentMessage[] = [];
@@ -683,6 +697,58 @@ export class Agent {
 	 */
 	copySentToolDefinitions(keep?: (name: string) => boolean): SentToolDefinitions {
 		return this.#sentToolDefinitions.copy(keep);
+	}
+
+	/**
+	 * Fingerprint of the tool definitions the next main request on `model` declares, as the wire carries them: the
+	 * active tools, normalized as that request sends them, and on a provider that keeps its tool declaration
+	 * across a conversation, in the order and with the deferral that declaration gives them, each withdrawn tool it
+	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}). Withdrawing such a
+	 * tool leaves the fingerprint as it was; a withdrawn tool this agent never sent (a resumed process's) leaves the
+	 * declaration, which changes it.
+	 */
+	declaredToolsFingerprint(model: Model | undefined): string {
+		const tools = this.#state.tools;
+		const intentTracing = this.#intentTracing;
+		const intentDescription = this.#intentDescription;
+		const pruneDescriptions = this.prunesToolDescriptions(model);
+		// An owned dialect carries the tools in the prompt, where no declaration is kept.
+		const declaration =
+			model?.api === "anthropic-messages" &&
+			anthropicKeepsToolDeclaration(model as Model<"anthropic-messages">) &&
+			!this.#ownedDialect(model)
+				? latestToolDeclaration(this.#state.messages)
+				: undefined;
+		const sentRevision = this.#sentToolDefinitions.revision;
+		const memo = this.#declaredToolsMemo;
+		if (
+			memo !== undefined &&
+			memo.model === model &&
+			memo.tools === tools &&
+			memo.intentTracing === intentTracing &&
+			memo.intentDescription === intentDescription &&
+			memo.pruneDescriptions === pruneDescriptions &&
+			memo.declaration === declaration &&
+			memo.sentRevision === sentRevision
+		) {
+			return memo.fingerprint;
+		}
+		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
+		const declared = declaration
+			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
+			: active;
+		const fingerprint = toolSpecsFingerprint(declared);
+		this.#declaredToolsMemo = {
+			model,
+			tools,
+			intentTracing,
+			intentDescription,
+			pruneDescriptions,
+			declaration,
+			sentRevision,
+			fingerprint,
+		};
+		return fingerprint;
 	}
 
 	/**

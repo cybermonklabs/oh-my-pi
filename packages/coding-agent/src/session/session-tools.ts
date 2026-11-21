@@ -375,6 +375,10 @@ interface StoredSystemPrompt {
 	blocks: string[];
 	/** Top-level tools active when the blocks were stored. */
 	toolNames: string[];
+	/** The `xd://` devices the blocks list ({@link PromptListing.xdevNames}). */
+	xdevNames: string[];
+	/** The skills the blocks list, each with the description they give ({@link PromptListing.skills}). */
+	skills: Array<{ name: string; description: string }>;
 	/** {@link SessionToolsOptions.operatorPromptDigest} of the process that stored them. */
 	operatorDigest: string;
 }
@@ -384,7 +388,7 @@ interface StoredSystemPrompt {
  * change from the model, and since when: a settings rebuild held on it, or a resumed process's own build it was
  * restored in place of. A resumed process that restores that prompt keeps the change waiting no longer than the
  * process that recorded it would have ({@link WITHHELD_CHANGE_MAX_AGE_MS}), whichever branch of the session holds
- * the record.
+ * the record, until a {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} record ends it.
  */
 const SYSTEM_PROMPT_HOLD_CUSTOM_TYPE = "system-prompt-hold";
 
@@ -394,6 +398,20 @@ interface SystemPromptHold {
 	digest: string;
 	/** When the change was made (Unix milliseconds), by the clock of the process that recorded it. */
 	since: number;
+}
+
+/**
+ * Custom entry recording that the base prompt a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names withholds
+ * nothing any longer although it keeps its bytes: the change each {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE} record before
+ * it names went out in the tool definitions alone, or nothing of it was left to withhold. A resumed process that
+ * restores that prompt dates what it withholds from a later hold record, or from the restore.
+ */
+const SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE = "system-prompt-hold-end";
+
+/** Data of a {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} entry. */
+interface SystemPromptHoldEnd {
+	/** Digest of the base prompt whose holds end, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	digest: string;
 }
 
 /**
@@ -422,6 +440,16 @@ interface WithheldChange {
 	 * under the change on another view records it there ({@link SessionTools.recordReplyPrompt}).
 	 */
 	recordedOn: readonly SessionEntry[] | undefined;
+	/**
+	 * The session holds a {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE} record of the change that no
+	 * {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} record ended, so ending the change ends the record too.
+	 */
+	recorded: boolean;
+	/**
+	 * The session whose transcript the prompt withholds the change from: its records are written to that session's
+	 * file alone, never to one the session switched to since.
+	 */
+	readonly sessionId: string;
 }
 
 /**
@@ -600,14 +628,26 @@ export function customMessagesOf(byType: CustomMessagesByType, customType: strin
 	return byType.get(customType) ?? NO_CUSTOM_MESSAGES;
 }
 
-/** The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one. */
+/** Whether `value` lists skills by name, each with a description, as a {@link StoredSystemPrompt} stores them. */
+function isListedSkills(value: unknown): value is StoredSystemPrompt["skills"] {
+	return (
+		Array.isArray(value) &&
+		value.every(skill => isRecord(skill) && typeof skill.name === "string" && typeof skill.description === "string")
+	);
+}
+
+/**
+ * The prompt a branch entry stores, or `undefined` when it is no such record or a malformed one: one without the
+ * devices and skills it lists cannot tell the `xd://` and skill notices what the model holds.
+ */
 function storedPromptOfEntry(entry: SessionEntry): StoredSystemPrompt | undefined {
 	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_CUSTOM_TYPE || !isRecord(entry.data)) {
 		return undefined;
 	}
-	const { digest, blocks, toolNames, operatorDigest } = entry.data;
-	if (typeof digest !== "string" || typeof operatorDigest !== "string") return undefined;
-	return isStringList(blocks) && isStringList(toolNames) ? { digest, blocks, toolNames, operatorDigest } : undefined;
+	const { digest, blocks, toolNames, xdevNames, skills, operatorDigest } = entry.data;
+	if (typeof digest !== "string" || typeof operatorDigest !== "string" || !isListedSkills(skills)) return undefined;
+	if (!isStringList(blocks) || !isStringList(toolNames) || !isStringList(xdevNames)) return undefined;
+	return { digest, blocks, toolNames, xdevNames, skills, operatorDigest };
 }
 
 /** The change a branch entry records as withheld, or `undefined` when it is no such record or a malformed one. */
@@ -617,6 +657,15 @@ function promptHoldOfEntry(entry: SessionEntry): SystemPromptHold | undefined {
 	}
 	const { digest, since } = entry.data;
 	return typeof digest === "string" && typeof since === "number" ? { digest, since } : undefined;
+}
+
+/** The digest of the prompt whose holds a branch entry ends, or `undefined` when it is no such record. */
+function promptHoldEndOfEntry(entry: SessionEntry): string | undefined {
+	if (entry.type !== "custom" || entry.customType !== SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE || !isRecord(entry.data)) {
+		return undefined;
+	}
+	const { digest } = entry.data;
+	return typeof digest === "string" ? digest : undefined;
 }
 
 /** Index of the newest entry of `branch` that records a prompt other than `digest`; -1 when none does. */
@@ -875,16 +924,55 @@ interface XdevMountNoticePreview {
 	history: readonly AgentMessage[];
 }
 
-/** The top-level tools and `xd://` devices a system prompt tells the model of ({@link SessionTools.#promptListing}). */
+/**
+ * The top-level tools, `xd://` devices and skills a system prompt tells the model of
+ * ({@link SessionTools.#promptListing}).
+ */
 interface PromptListing {
 	readonly toolNames: readonly string[];
 	readonly xdevNames: ReadonlySet<string>;
+	/**
+	 * The skills a restored transcript prompt lists, each with the description it gives. Undefined for a prompt this
+	 * process built, which lists {@link SessionTools.promptSkills}.
+	 */
+	readonly skills?: ReadonlyMap<string, string>;
+}
+
+/** The skills of `skills` a system prompt lists: the ones not hidden. */
+function listedSkills(skills: readonly Skill[]): Skill[] {
+	return skills.filter(skill => skill.hide !== true);
+}
+
+/** A withheld change with the members a move to another transcript or a rebuild changes in place. */
+interface WithheldChangeState<T extends WithheldChange> {
+	readonly change: T;
+	readonly due: boolean;
+	readonly recorded: boolean;
+	readonly recordedOn: readonly SessionEntry[] | undefined;
+}
+
+/** `change`, if any, with the members {@link WithheldChangeState} keeps as they are now. */
+function withheldChangeState<T extends WithheldChange>(change: T | undefined): WithheldChangeState<T> | undefined {
+	return change && { change, due: change.due, recorded: change.recorded, recordedOn: change.recordedOn };
+}
+
+/** The change `state` names with the members it kept put back; undefined without one. */
+function restoreWithheldChange<T extends WithheldChange>(state: WithheldChangeState<T> | undefined): T | undefined {
+	if (!state) return undefined;
+	const { change } = state;
+	change.due = state.due;
+	change.recorded = state.recorded;
+	change.recordedOn = state.recordedOn;
+	return change;
 }
 
 /**
  * The committed base prompt with what a commit records beside it ({@link SessionTools.basePromptState}): what it
  * lists, the roster it rendered and whether a roster change is held out of it, the surface the tool definitions render
- * from, the tool signature it was applied for, and the model key and inline-descriptor decision it was rendered with.
+ * from, the tool signature it was applied for, and the model key and inline-descriptor decision it was rendered with;
+ * and what the base keeps in place of a rebuild: the restored transcript's stored prompt with the build it stands in
+ * for (a move to another transcript ends it), the held settings rebuild and the skill list the prompt renders (a
+ * rebuild that renders the live state ends the hold and takes the registry's skills), and a spent hold not yet ended.
  */
 export interface BasePromptState {
 	readonly systemPrompt: string[];
@@ -895,6 +983,23 @@ export interface BasePromptState {
 	readonly appliedToolSignature: string | undefined;
 	readonly modelKey: string | undefined;
 	readonly inlineDescriptors: boolean | undefined;
+	readonly restoredTranscript: { reply: AgentMessage; promptDigest: string | undefined } | undefined;
+	readonly basePromptRestored: boolean;
+	readonly restoredPrompt: WithheldChangeState<RestoredPrompt> | undefined;
+	readonly standIn: { base: readonly string[]; build: readonly string[] } | undefined;
+	readonly heldSettingsRebuild: WithheldChangeState<HeldSettingsRebuild> | undefined;
+	readonly promptSkills: Skill[];
+	readonly spentHold: WithheldChangeState<WithheldChange> | undefined;
+	/**
+	 * The tool set the prompt goes with: the enabled names, the `xd://` mounts, the registry and the built-in names
+	 * (a rebuild that ends a held reconcile applies the reconciled set).
+	 */
+	readonly toolSet: {
+		readonly enabled: ReadonlySet<string>;
+		readonly mounted: readonly string[] | undefined;
+		readonly registry: ReadonlyMap<string, AgentTool>;
+		readonly builtIn: ReadonlySet<string>;
+	};
 }
 
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
@@ -940,6 +1045,13 @@ export class SessionTools {
 	 * its `base` is the base. See {@link replaceRestoredPromptIfDue}.
 	 */
 	#restoredPrompt: RestoredPrompt | undefined;
+	/**
+	 * A change the session records a hold on ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}) whose prompt withholds nothing
+	 * here although this process sends its bytes: the resumed transcript's prompt, which this process's own build
+	 * reproduced at startup or later ({@link #settleRestoredPrompt}). Ended at the first reply under that prompt, or
+	 * before a new hold on it is recorded; dropped at a reply under another prompt, which records that prompt.
+	 */
+	#spentHold: WithheldChange | undefined;
 	/**
 	 * A base prompt that keeps its bytes in place of a prompt this process built for itself: a restored
 	 * transcript's stored prompt in place of this process's own startup build ({@link #restoreTranscriptPrompt}),
@@ -1159,6 +1271,7 @@ export class SessionTools {
 
 	/** The committed base prompt and what a commit records beside it, for a caller that may have to put them back. */
 	get basePromptState(): BasePromptState {
+		const standIn = this.#baseStandIn;
 		return {
 			systemPrompt: this.#baseSystemPrompt,
 			listing: this.#basePromptListing,
@@ -1168,13 +1281,29 @@ export class SessionTools {
 			appliedToolSignature: this.#lastAppliedToolSignature,
 			modelKey: this.#promptModelKey,
 			inlineDescriptors: this.#promptInlineDescriptors,
+			restoredTranscript: this.#restoredTranscript,
+			basePromptRestored: this.#basePromptRestored,
+			restoredPrompt: withheldChangeState(this.#restoredPrompt),
+			// A rebuild records its newest build in place.
+			standIn: standIn && { base: standIn.base, build: standIn.build },
+			heldSettingsRebuild: withheldChangeState(this.#heldSettingsRebuild),
+			promptSkills: this.#promptSkills,
+			spentHold: withheldChangeState(this.#spentHold),
+			toolSet: {
+				enabled: new Set(this.#enabledToolNames),
+				mounted: this.#xdev ? [...this.#xdev.mountedNames] : undefined,
+				registry: new Map(this.#toolRegistry),
+				builtIn: new Set(this.#builtInToolNames),
+			},
 		};
 	}
 
 	/**
 	 * Puts back a base prompt with what its commit recorded ({@link basePromptState}), without applying it to the
 	 * agent: a rolled-back session switch restores the prompt a rebuild replaced, and the roster and mount notices then
-	 * compare against what that prompt lists, not the rebuild's.
+	 * compare against what that prompt lists, not the rebuild's. A restored transcript prompt the switch left comes
+	 * back as the base it was, still kept for the transcript's cache entry, and a held settings change a rebuild sent
+	 * is held again, so the next request continues the prompt the transcript's last one sent.
 	 */
 	restoreBasePromptState(state: BasePromptState): void {
 		this.#baseSystemPrompt = state.systemPrompt;
@@ -1185,6 +1314,22 @@ export class SessionTools {
 		this.#lastAppliedToolSignature = state.appliedToolSignature;
 		this.#promptModelKey = state.modelKey;
 		this.#promptInlineDescriptors = state.inlineDescriptors;
+		this.#restoredTranscript = state.restoredTranscript;
+		this.#basePromptRestored = state.basePromptRestored;
+		this.#restoredPrompt = restoreWithheldChange(state.restoredPrompt);
+		this.#baseStandIn = state.standIn && { base: state.standIn.base, build: state.standIn.build };
+		this.#heldSettingsRebuild = restoreWithheldChange(state.heldSettingsRebuild);
+		this.#promptSkills = state.promptSkills;
+		this.#spentHold = restoreWithheldChange(state.spentHold);
+		const { toolSet } = state;
+		this.#enabledToolNames = new Set(toolSet.enabled);
+		if (toolSet.mounted) this.#setMountedNames(toolSet.mounted);
+		// The registry is shared with the `xd://` state: refilled in place.
+		this.#toolRegistry.clear();
+		for (const [name, tool] of toolSet.registry) this.#toolRegistry.set(name, tool);
+		this.#builtInToolNames = new Set(toolSet.builtIn);
+		// The caller gave the agent its previous tools back.
+		this.#setActiveToolNames?.(this.getActiveToolNames());
 	}
 
 	/**
@@ -2083,7 +2228,9 @@ export class SessionTools {
 	/**
 	 * Runs `rebuild` with `held` ended: the hold is cleared, the prompt lists the registry's skills when it held a
 	 * rediscovery, and the tools declare what they render now. A `rebuild` that throws restores the skills, and the
-	 * hold unless another one began meanwhile.
+	 * hold unless another one began meanwhile. A rebuild that leaves the base with the held prompt's bytes sends
+	 * the change in the tool definitions alone, so the held prompt withholds nothing any more
+	 * ({@link #endWithheldChange}).
 	 */
 	async #runReleasingHold(held: HeldSettingsRebuild, rebuild: () => Promise<void>): Promise<void> {
 		this.#heldSettingsRebuild = undefined;
@@ -2097,6 +2244,9 @@ export class SessionTools {
 			throw error;
 		} finally {
 			this.#setAgentTools(this.#host.agent.state.tools);
+		}
+		if (!this.#host.isDisposed() && systemPromptDigest(this.#baseSystemPrompt) === held.digest) {
+			this.#endWithheldChange(held);
 		}
 	}
 
@@ -2561,17 +2711,44 @@ export class SessionTools {
 	 * restored transcript prompt, a held settings rebuild) also records when the
 	 * change was made, unless the branch records it already: a branch `/tree`
 	 * moved to, or one copied into another session file, then carries it as the
-	 * branch the change began on does.
+	 * branch the change began on does. A reply under the prompt of a spent hold
+	 * ({@link #spentHold}) ends the session's record of it.
 	 */
 	recordReplyPrompt(reply: AgentMessage): void {
 		const call = this.#replyCalls.get(reply);
 		if (call === undefined) return;
 		this.recordPromptDigest(call.prompt);
 		this.recordToolsDigest(call.tools);
+		this.#settleRestoredPrompt();
+		this.#endSpentHold(call.prompt);
+		// A reply under another prompt records it, which ends the spent hold's record on this branch.
+		this.#spentHold = undefined;
 		const restored = this.#restoredPrompt;
 		if (restored?.digest === call.prompt) this.#recordWithheldChange(restored);
 		const held = this.#heldSettingsRebuild;
 		if (held?.digest === call.prompt) this.#recordWithheldChange(held);
+	}
+
+	/**
+	 * Drops the restored transcript prompt once the base replaced it with the same bytes (this process's own build
+	 * reproduced it): it withholds nothing any more, so a hold the session records on it is spent ({@link #spentHold}).
+	 */
+	#settleRestoredPrompt(): void {
+		const restored = this.#restoredPrompt;
+		if (!restored || restored.base === this.#baseSystemPrompt || !sameItems(restored.base, this.#baseSystemPrompt)) {
+			return;
+		}
+		this.#restoredPrompt = undefined;
+		if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
+		if (restored.recorded) this.#spentHold = restored;
+	}
+
+	/** Ends the session's record of the spent hold ({@link #spentHold}) when it is on the prompt `digest` names. */
+	#endSpentHold(digest: string): void {
+		const spent = this.#spentHold;
+		if (spent?.digest !== digest) return;
+		this.#spentHold = undefined;
+		this.#endWithheldChange(spent);
 	}
 
 	/**
@@ -2609,6 +2786,10 @@ export class SessionTools {
 			digest,
 			blocks: [...this.baseOfSystemPrompt(this.#host.agent.state.systemPrompt)],
 			toolNames: this.getActiveToolNames(),
+			xdevNames: [...this.#basePromptListing.xdevNames],
+			skills: this.#basePromptListing.skills
+				? [...this.#basePromptListing.skills].map(([name, description]) => ({ name, description }))
+				: listedSkills(this.#promptSkills).map(({ name, description }) => ({ name, description })),
 			operatorDigest,
 		};
 		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_CUSTOM_TYPE, stored);
@@ -2633,31 +2814,54 @@ export class SessionTools {
 	 * Records on the current branch that the base prompt `change` names withholds
 	 * a change made at its `since`, for a resumed process that restores that
 	 * prompt ({@link #withheldChangeSince}), unless the branch records that time
-	 * or an earlier one since it last recorded another prompt. Nothing reads it
-	 * when the operator inputs cannot be compared, so nothing is recorded then.
+	 * since it last recorded another prompt or ended a hold on this one. A spent
+	 * hold on the same prompt ({@link #spentHold}) is ended first, so the record
+	 * follows the end. Nothing reads it when the operator inputs cannot be
+	 * compared, so nothing is recorded then.
 	 */
 	#recordWithheldChange(change: WithheldChange): void {
 		if (this.#operatorPromptDigest === undefined) return;
+		if (change.sessionId !== this.#host.sessionManager.getSessionId()) return;
+		this.#settleRestoredPrompt();
+		this.#endSpentHold(change.digest);
 		const branch = this.#host.sessionManager.getBranchView();
 		if (change.recordedOn === branch) return;
 		// The view grows in place with the record and the entries after it.
 		change.recordedOn = branch;
+		change.recorded = true;
 		const other = otherPromptRecordIndex(branch, change.digest);
 		for (let index = branch.length - 1; index > other; index--) {
+			if (promptHoldEndOfEntry(branch[index]) === change.digest) break;
 			const withheld = promptHoldOfEntry(branch[index]);
-			if (withheld?.digest === change.digest && withheld.since <= change.since) return;
+			if (withheld?.digest === change.digest && withheld.since === change.since) return;
 		}
 		const record: SystemPromptHold = { digest: change.digest, since: change.since };
 		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, record);
 	}
 
 	/**
+	 * Records that the base prompt `change` names withholds nothing any more while it keeps its bytes
+	 * ({@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE}): a resumed process that restores that prompt then dates what it
+	 * withholds from a later hold record, or from the restore. Only a change the session records is ended.
+	 */
+	#endWithheldChange(change: WithheldChange): void {
+		if (!change.recorded || this.#operatorPromptDigest === undefined) return;
+		if (change.sessionId !== this.#host.sessionManager.getSessionId()) return;
+		change.recorded = false;
+		change.recordedOn = undefined;
+		const record: SystemPromptHoldEnd = { digest: change.digest };
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE, record);
+	}
+
+	/**
 	 * When the session records that the base prompt `digest` names began to
 	 * withhold a change: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
 	 * record naming it written after the current branch last recorded another
-	 * prompt, on any branch. The change was made to the process, not to a
-	 * branch: `/tree` onto a branch that holds no record of it, before a restart,
-	 * leaves it no less old.
+	 * prompt, on any branch, and after the last
+	 * {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} record naming it, on any branch.
+	 * The change was made to the process, not to a branch: `/tree` onto a branch
+	 * that holds no record of it, before a restart, leaves it no less old, and a
+	 * change that went out on another branch went out of the process.
 	 */
 	#withheldChangeSince(digest: string): number | undefined {
 		const branch = this.#host.sessionManager.getBranchView();
@@ -2665,6 +2869,10 @@ export class SessionTools {
 		const entries = this.#host.sessionManager.getEntries();
 		let since: number | undefined;
 		for (let index = other < 0 ? 0 : entries.indexOf(branch[other]) + 1; index < entries.length; index++) {
+			if (promptHoldEndOfEntry(entries[index]) === digest) {
+				since = undefined;
+				continue;
+			}
 			const withheld = promptHoldOfEntry(entries[index]);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
 		}
@@ -2703,17 +2911,34 @@ export class SessionTools {
 		const promptDigest = this.#restoredTranscript?.promptDigest;
 		const operatorDigest = this.#operatorPromptDigest;
 		if (!promptDigest || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
-		if (systemPromptDigest(this.#baseSystemPrompt) === promptDigest) return;
+		if (systemPromptDigest(this.#baseSystemPrompt) === promptDigest) {
+			// This process's own build is the transcript's prompt: a hold the session records on it withholds nothing.
+			const since = this.#withheldChangeSince(promptDigest);
+			if (since !== undefined) {
+				this.#spentHold = {
+					digest: promptDigest,
+					since,
+					due: false,
+					recordedOn: undefined,
+					recorded: true,
+					sessionId: this.#host.sessionManager.getSessionId(),
+				};
+			}
+			return;
+		}
 		const stored = this.#storedPrompt(promptDigest);
 		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
 		if (!this.#host.transcriptPromptCacheLive(promptDigest)) return;
+		const recordedSince = this.#withheldChangeSince(promptDigest);
 		const restoredPrompt: RestoredPrompt = {
 			base: stored.blocks,
 			digest: promptDigest,
 			// The earliest the session records, else the restore.
-			since: this.#withheldChangeSince(promptDigest) ?? Date.now(),
+			since: recordedSince ?? Date.now(),
 			due: false,
 			recordedOn: undefined,
+			recorded: recordedSince !== undefined,
+			sessionId: this.#host.sessionManager.getSessionId(),
 		};
 		// The change the stored prompt would withhold is due already: this process's own build goes out.
 		if (withheldChangeDue(restoredPrompt, false)) return;
@@ -2722,8 +2947,13 @@ export class SessionTools {
 		this.#basePromptRestored = true;
 		this.#restoredPrompt = restoredPrompt;
 		this.#applyAgentSystemPrompt(stored.blocks);
-		// The transcript's requests carried the stored roster: a request's roster notice tells what differs now.
-		this.#basePromptListing = { toolNames: stored.toolNames, xdevNames: this.#basePromptListing.xdevNames };
+		// The transcript's requests carried the stored roster, devices and skills: a request's roster, mount and skill
+		// notices tell what differs now.
+		this.#basePromptListing = {
+			toolNames: stored.toolNames,
+			xdevNames: new Set(stored.xdevNames),
+			skills: new Map(stored.skills.map(({ name, description }) => [name, description])),
+		};
 	}
 
 	/** {@link #restoredPrompt} while it is the base. */
@@ -2774,6 +3004,10 @@ export class SessionTools {
 				this.#restoredPrompt ??= { ...restored, due: true };
 				throw error;
 			}
+			// This process's own build came out with the stored bytes: they withhold nothing any more.
+			if (!this.#host.isDisposed() && systemPromptDigest(this.#baseSystemPrompt) === restored.digest) {
+				this.#endWithheldChange(restored);
+			}
 		});
 	}
 
@@ -2786,9 +3020,12 @@ export class SessionTools {
 	leaveRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
 		this.#basePromptRestored = false;
+		// The left transcript's hold records stay as they are in its session file.
+		this.#spentHold = undefined;
 		const restored = this.#restoredPrompt;
 		if (!restored) return;
 		restored.due = true;
+		restored.recorded = false;
 		if (this.#baseStandIn?.base === restored.base) this.#baseStandIn = undefined;
 	}
 
@@ -3156,9 +3393,10 @@ export class SessionTools {
 
 	/**
 	 * Builds the hidden notice of skills the live registry has gained, changed or lost since the system
-	 * prompt and the notices still in context listed them. A changed description is announced again
-	 * because the model routes on it. Gated like the prompt's skill list: `skillful` on and an enabled
-	 * tool, top-level or `xd://`-mounted, that reads `skill://`.
+	 * prompt and the notices still in context listed them: the skills a restored transcript prompt lists
+	 * ({@link PromptListing.skills}), else the ones this process's prompt renders. A changed description is
+	 * announced again because the model routes on it. Gated like the prompt's skill list: `skillful` on and an
+	 * enabled tool, top-level or `xd://`-mounted, that reads `skill://`.
 	 */
 	takeSkillNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
@@ -3166,8 +3404,10 @@ export class SessionTools {
 	): CustomMessage<SkillNoticeDetails> | undefined {
 		if (cfgSkillful.get(this.#host.settings) !== true) return undefined;
 		if (!enabledToolNames.some(name => toolReadsSkillUris(this.getToolByName(name)))) return undefined;
-		const listed = (skills: readonly Skill[]) => skills.filter(skill => skill.hide !== true);
-		const known = new Map(listed(this.#promptSkills).map(skill => [skill.name, skill.description]));
+		const known = new Map<string, string>(
+			this.#basePromptListing.skills ??
+				listedSkills(this.#promptSkills).map(skill => [skill.name, skill.description]),
+		);
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== SKILL_NOTICE_MESSAGE_TYPE) continue;
 			const details = message.details;
@@ -3179,7 +3419,7 @@ export class SessionTools {
 			}
 			for (const name of details.removed) if (typeof name === "string") known.delete(name);
 		}
-		const { added, updated, removed } = listingDelta(known, listed(this.#skills));
+		const { added, updated, removed } = listingDelta(known, listedSkills(this.#skills));
 		if (added.length === 0 && updated.length === 0 && removed.length === 0) return undefined;
 		return {
 			role: "custom",
@@ -3601,6 +3841,8 @@ export class SessionTools {
 				since: Date.now(),
 				due: false,
 				recordedOn: undefined,
+				recorded: false,
+				sessionId: this.#host.sessionManager.getSessionId(),
 				before,
 				notices: [],
 				disabledTools: new Map(),

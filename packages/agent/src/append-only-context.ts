@@ -493,7 +493,10 @@ function normalizeWireTools(tools: AgentContext["tools"], options: BuildOptions)
 	);
 }
 
-/** The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the description. */
+/**
+ * The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the
+ * description. A provider that defers a declared tool's loading marks it `deferLoading`.
+ */
 function wireToolFields(t: Tool) {
 	return {
 		n: t.name,
@@ -502,7 +505,16 @@ function wireToolFields(t: Tool) {
 		s: t.strict,
 		cf: t.customFormat,
 		cw: t.customWireName,
+		dl: t.deferLoading,
 	};
+}
+
+/**
+ * Fingerprint of provider-bound tool specs as a request declares them, in order: a same-name tool whose description,
+ * schema, `strict`, `customFormat`, `customWireName` or deferral changed, or another order, makes another one.
+ */
+export function toolSpecsFingerprint(tools: readonly Tool[]): string {
+	return hashPayload(JSON.stringify(tools.map(wireToolFields)));
 }
 
 /**
@@ -512,7 +524,7 @@ function wireToolFields(t: Tool) {
  * `strict`, `customFormat` or `customWireName` changed makes another one.
  */
 export function wireToolsFingerprint(tools: AgentContext["tools"], options: BuildOptions): string {
-	return hashPayload(JSON.stringify(normalizeWireTools(tools, options).map(wireToolFields)));
+	return toolSpecsFingerprint(normalizeWireTools(tools, options));
 }
 
 function computeFingerprint(systemPrompt: string[], tools: Tool[], options: BuildOptions): string {

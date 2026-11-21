@@ -5,11 +5,11 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { all as allSettings, combine, type Derived } from "../config/registry";
 import type { Settings } from "../config/settings";
-import type { HindsightSessionState } from "../hindsight/state";
+import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
 import type { RecallChangesReport } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
-import type { MnemopiSessionState } from "../mnemopi/state";
+import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -33,6 +33,12 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 		),
 	);
 	return memorySettings;
+}
+
+/** Each memory backend's tracking of the transcript ({@link SessionMemory.conversationTracking}). */
+export interface ConversationTracking {
+	readonly hindsight: HindsightConversationTracking | undefined;
+	readonly mnemopi: MnemopiConversationTracking | undefined;
 }
 
 /** Capabilities borrowed from the owning AgentSession. */
@@ -266,6 +272,22 @@ export class SessionMemory {
 		if (!state || state.aliasOf) return false;
 		state.resetConversationTracking();
 		return true;
+	}
+
+	/** The backends' transcript tracking a new transcript resets ({@link resetContextForNewTranscript}). */
+	conversationTracking(): ConversationTracking {
+		const hindsight = this.#host.getHindsightSessionState();
+		const mnemopi = this.#host.getMnemopiSessionState();
+		return {
+			hindsight: hindsight && !hindsight.aliasOf ? hindsight.conversationTracking() : undefined,
+			mnemopi: mnemopi && !mnemopi.aliasOf ? mnemopi.conversationTracking() : undefined,
+		};
+	}
+
+	/** Puts back the tracking {@link conversationTracking} took, while rolling back a failed session switch. */
+	restoreConversationTracking(tracking: ConversationTracking): void {
+		if (tracking.hindsight) this.#host.getHindsightSessionState()?.restoreConversationTracking(tracking.hindsight);
+		if (tracking.mnemopi) this.#host.getMnemopiSessionState()?.restoreConversationTracking(tracking.mnemopi);
 	}
 
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */

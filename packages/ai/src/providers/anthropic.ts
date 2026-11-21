@@ -4796,10 +4796,89 @@ function diffAnthropicActiveTools(
 	return changes;
 }
 
+/** What a live request declares in its top-level `tools` ({@link declareAnthropicTools}). */
+interface AnthropicToolDeclaration {
+	/** The declared names, in wire order. */
+	declared: string[];
+	/** The declared names sent with `defer_loading`. */
+	deferred: Set<string>;
+	/** The definition of each declared name, in wire order, a deferred one with `deferLoading`. */
+	tools: Tool[];
+}
+
+/**
+ * The top-level `tools` a live request declares on a model that keeps its tool
+ * declaration ({@link anthropicKeepsToolDeclaration}): the declaration `latest`
+ * (the tool controls the newest response recorded) holds, minus names with no
+ * definition in `tools` or `inactiveTools`, plus newly active tools appended
+ * with `defer_loading`. Without a record, `tools` as given.
+ */
+function declareAnthropicTools(
+	tools: readonly Tool[],
+	inactiveTools: readonly Tool[] | undefined,
+	latest: AnthropicToolControls | undefined,
+): AnthropicToolDeclaration {
+	const definitions = new Map<string, Tool>();
+	for (const tool of tools) definitions.set(tool.name, tool);
+	for (const tool of inactiveTools ?? []) {
+		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
+	}
+	let declared = tools.map(tool => tool.name);
+	const deferred = new Set<string>();
+	if (latest) {
+		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
+		declared = latest.declared.filter(name => definitions.has(name));
+		const declaredSet = new Set(declared);
+		for (const name of latest.deferred) {
+			if (declaredSet.has(name)) deferred.add(name);
+		}
+		for (const tool of tools) {
+			if (declaredSet.has(tool.name)) continue;
+			declared.push(tool.name);
+			declaredSet.add(tool.name);
+			deferred.add(tool.name);
+		}
+		// The API rejects a declaration whose tools are all deferred (a tool-less
+		// conversation gaining tools, or a resume that kept none of the loaded
+		// ones), so load them all and let the controls replay availability.
+		if (declared.every(name => deferred.has(name))) deferred.clear();
+	}
+	const declaredTools: Tool[] = [];
+	for (const name of declared) {
+		const tool = definitions.get(name);
+		if (tool) declaredTools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
+	}
+	return { declared, deferred, tools: declaredTools };
+}
+
+/**
+ * Whether requests on `model` keep their top-level tool declaration across a
+ * conversation, announcing availability changes as controls instead: a tool
+ * taken off the roster stays declared ({@link anthropicDeclaredTools}).
+ */
+export function anthropicKeepsToolDeclaration(model: Model<"anthropic-messages">): boolean {
+	return model.compat.supportsMidConversationToolChanges === true;
+}
+
+/**
+ * The top-level `tools` a live request declares, in wire order, on a model that
+ * keeps its tool declaration ({@link anthropicKeepsToolDeclaration}): `latest`,
+ * the tool controls the newest response recorded (`requestControls.tools`),
+ * minus each name with no definition in `tools` (the active tools) or
+ * `inactiveTools` (the withdrawn ones the sender can re-declare), plus each
+ * newly active tool, appended with `deferLoading`.
+ */
+export function anthropicDeclaredTools(
+	tools: readonly Tool[],
+	inactiveTools: readonly Tool[] | undefined,
+	latest: NonNullable<AnthropicRequestControls["tools"]>,
+): Tool[] {
+	return declareAnthropicTools(tools, inactiveTools, latest).tools;
+}
+
 /**
  * Keep top-level `tools` byte-stable across a conversation. The declared list
- * is the latest record's, minus names with no definition in `tools` or
- * `inactiveTools`, plus newly active tools appended with `defer_loading`.
+ * is the latest record's ({@link declareAnthropicTools}).
  * Every recorded active-set change is replayed as a control before the
  * response of the request that made it; the change this request makes goes
  * at the tail. Records at a different index than they were written at are
@@ -4817,11 +4896,6 @@ function planAnthropicToolControls(
 	ownChange: boolean,
 ): { tools: Tool[] | undefined; inserts: AnthropicControlInsert[]; record: AnthropicToolControls | undefined } {
 	if (!enabled || !context.tools) return { tools: context.tools, inserts: [], record: undefined };
-	const definitions = new Map<string, Tool>();
-	for (const tool of context.tools) definitions.set(tool.name, tool);
-	for (const tool of context.inactiveTools ?? []) {
-		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
-	}
 	const activeNames = context.tools.map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
@@ -4831,26 +4905,10 @@ function planAnthropicToolControls(
 		}
 	}
 	const inserts: AnthropicControlInsert[] = [];
-	let declared = activeNames;
-	const deferred = new Set<string>();
 	const latest = toolRecords.at(-1);
+	const { declared, deferred, tools } = declareAnthropicTools(context.tools, context.inactiveTools, latest?.tools);
 	if (latest) {
-		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
-		declared = latest.tools.declared.filter(name => definitions.has(name));
 		const declaredSet = new Set(declared);
-		for (const name of latest.tools.deferred) {
-			if (declaredSet.has(name)) deferred.add(name);
-		}
-		for (const name of activeNames) {
-			if (declaredSet.has(name)) continue;
-			declared.push(name);
-			declaredSet.add(name);
-			deferred.add(name);
-		}
-		// The API rejects a declaration whose tools are all deferred (a tool-less
-		// conversation gaining tools, or a resume that kept none of the loaded
-		// ones), so load them all and let the controls below replay availability.
-		if (declared.every(name => deferred.has(name))) deferred.clear();
 		// The chain starts from what the top-level declaration makes active, so a
 		// rewritten history converges on the current roster instead of trusting a
 		// record whose earlier controls were summarized away.
@@ -4865,11 +4923,6 @@ function planAnthropicToolControls(
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
 	}
 
-	const tools: Tool[] = [];
-	for (const name of declared) {
-		const tool = definitions.get(name);
-		if (tool) tools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
-	}
 	return {
 		tools,
 		inserts,
@@ -5214,7 +5267,7 @@ function buildParams(
 	const toolPlan = planAnthropicToolControls(
 		context,
 		records,
-		model.compat.supportsMidConversationToolChanges === true,
+		anthropicKeepsToolDeclaration(model),
 		!compactionRequest,
 	);
 

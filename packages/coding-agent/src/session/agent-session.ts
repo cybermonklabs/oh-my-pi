@@ -46,7 +46,6 @@ import {
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
 	type ThinkingLevel,
 	type ToolChoiceDirective,
-	wireToolsFingerprint,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
@@ -1515,17 +1514,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
 	readonly #promptCacheDispatch = new WeakMap<Context, () => void>();
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
-	#promptCacheShapeMemo:
-		| {
-				model: Model | undefined;
-				tools: unknown;
-				systemPrompt: unknown;
-				intentTracing: boolean;
-				intentDescription: string | undefined;
-				pruneToolDescriptions: boolean;
-				shape: PromptCacheShape;
-		  }
-		| undefined;
+	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -6236,21 +6225,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** The request inputs outside the transcript that are part of the cache key; rebuilt only when one of them is replaced. */
 	#promptCacheShape(model: Model | undefined): PromptCacheShape {
-		const { tools, systemPrompt } = this.agent.state;
+		const { systemPrompt } = this.agent.state;
 		const thinkingLevel = this.thinkingLevel;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
-		const intentTracing = this.agent.intentTracing;
-		const intentDescription = this.agent.intentDescription;
-		const pruneToolDescriptions = this.agent.prunesToolDescriptions(model);
+		// The definitions as the wire declares them: a refreshed MCP tool keeps its name, and a tool taken off the
+		// roster that the request keeps declared changes nothing.
+		const tools = this.agent.declaredToolsFingerprint(model);
 		const memo = this.#promptCacheShapeMemo;
 		if (
 			memo !== undefined &&
 			memo.model === model &&
-			memo.tools === tools &&
 			memo.systemPrompt === systemPrompt &&
-			memo.intentTracing === intentTracing &&
-			memo.intentDescription === intentDescription &&
-			memo.pruneToolDescriptions === pruneToolDescriptions &&
+			memo.shape.tools === tools &&
 			memo.shape.thinkingLevel === thinkingLevel &&
 			memo.shape.retention === retention
 		) {
@@ -6260,20 +6246,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
-			// The specs as the wire carries them: a refreshed MCP tool keeps its name.
-			tools: wireToolsFingerprint(tools, { intentTracing, intentDescription, pruneToolDescriptions }),
+			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
 		};
-		this.#promptCacheShapeMemo = {
-			model,
-			tools,
-			systemPrompt,
-			intentTracing,
-			intentDescription,
-			pruneToolDescriptions,
-			shape,
-		};
+		this.#promptCacheShapeMemo = { model, systemPrompt, shape };
 		return shape;
 	}
 
@@ -14393,6 +14370,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousBasePrompt = this.#tools.basePromptState;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
 		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
+		// The target transcript starts without this one's recall; a rolled-back switch keeps the conversation's.
+		const previousHiddenMemoryRecall = this.#memory.hiddenRecall;
+		const previousMemoryRecallChanges = this.#memory.recallChanges;
+		const previousMemoryTracking = this.#memory.conversationTracking();
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
 		const previousTaskSiblingCandidate = this.sessionManager.getTaskSiblingCandidate();
@@ -14665,6 +14646,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The prompt with what it lists, so the notices compare against what the request carries.
 			this.#tools.restoreBasePromptState(previousBasePrompt);
 			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
+			this.#memory.adoptRecall(previousHiddenMemoryRecall, previousMemoryRecallChanges);
+			this.#memory.restoreConversationTracking(previousMemoryTracking);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);
 			this.agent.replaceQueues(
