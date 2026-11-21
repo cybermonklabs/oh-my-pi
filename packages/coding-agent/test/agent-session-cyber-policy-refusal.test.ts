@@ -10,6 +10,8 @@ import { createMockModel, type MockModel, type MockResponse, registerMockApi } f
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { sendSessionUserInput } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/send-user-input-handler";
+import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -184,6 +186,8 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		cyberPolicyClosure?: CyberPolicyClosureApi;
 		/** Keeps an earlier session alive beside this one. */
 		keepOthers?: boolean;
+		/** Skills the session runs as `/skill:<name>` commands. */
+		skills?: Skill[];
 	}): { live: AgentSession; requested: string[]; fallbacks: string[]; nextRequest: () => Promise<void> } {
 		const requested: string[] = [];
 		const fallbacks: string[] = [];
@@ -230,6 +234,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 			settings,
 			modelRegistry,
 			cyberPolicyClosure: options.cyberPolicyClosure,
+			...(options.skills && { skills: options.skills, skillsSettings: { enableSkillCommands: true } }),
 		});
 		if (options.keepOthers) others.push(live);
 		else session = live;
@@ -530,6 +535,71 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		await live.waitForIdle();
 
 		expect(requested).toEqual([selector(gateway), selector(gateway)]);
+	});
+
+	// A bridge relays a person's typed Send through `pi.sendUserInput` with `origin: "outside"`: the prompt
+	// it submits, a skill, and the prompt a built-in submits (`/force:<tool> <prompt>`) each end the closure.
+	// The extension's own `sendUserInput`, with no origin, keeps it.
+	it.each([
+		["a prompt", "A person's Send"],
+		["a skill", "/skill:reviewer focus on risks"],
+		["a built-in's prompt", "/force:noop A person's forced Send"],
+	] as const)("sendUserInput of %s ends the closure only when tagged as from outside", async (_name, text) => {
+		const { gateway } = models();
+		const skillPath = path.join(tempDir.path(), "SKILL.md");
+		fs.writeFileSync(skillPath, "---\nname: reviewer\ndescription: Review code\n---\n\nReview the supplied code.\n");
+		const noop: AgentTool = {
+			name: "noop",
+			label: "No-op",
+			description: "Does nothing",
+			parameters: type({}),
+			execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+		};
+		const { live, requested } = startSession({
+			primary: gateway,
+			chains: {},
+			answer: () => CYBER_POLICY,
+			tools: [noop],
+			skills: [
+				{
+					name: "reviewer",
+					description: "Review code",
+					filePath: skillPath,
+					baseDir: tempDir.path(),
+					source: "project",
+				},
+			],
+		});
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(live.cyberPolicyClosure.active).toBe(true);
+
+		// The extension's own input: no origin.
+		await sendSessionUserInput(live, text);
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(gateway)]);
+		expect(live.cyberPolicyClosure.active).toBe(true);
+
+		// A person's typed Send, relayed.
+		await sendSessionUserInput(live, text, { origin: "outside" });
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(gateway), selector(gateway)]);
+	});
+
+	// A built-in the text names runs with the relayed origin too: a person's `/compact` sent through a bridge
+	// ends the closure, as typing it does; the extension's own keeps it.
+	it("sendUserInput of a built-in ends the closure only when tagged as from outside", async () => {
+		const { gateway } = models();
+		const { live } = startSession({ primary: gateway, chains: {}, answer: () => CYBER_POLICY });
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(live.cyberPolicyClosure.active).toBe(true);
+
+		// The compaction itself may fail on this fixture: only who sent the command decides the closure.
+		await sendSessionUserInput(live, "/compact").catch(() => {});
+		expect(live.cyberPolicyClosure.active).toBe(true);
+		await sendSessionUserInput(live, "/compact", { origin: "outside" }).catch(() => {});
+		expect(live.cyberPolicyClosure.active).toBe(false);
 	});
 
 	// `/compact`, `/handoff` and `/tree` from a person (TUI) or an RPC client are input from outside; the
