@@ -5063,7 +5063,11 @@ mod tests {
 	/// - a link at `a~` to nothing is not asked about, and `-u` compares `a`
 	///   with what a link at `a~` leads to;
 	/// - `cp -fb l ./l` (`l` a link cp follows) asks and compares before it
-	///   cannot open `l`, and names `l` as it was given (`.//l`).
+	///   cannot open `l`, and names `l` as it was given (`.//l`), and so does
+	///   `cp -fb l l` where `l` leads to a FIFO (`stat` reads no regular file,
+	///   so nothing is turned into a copy, and the destination's lstat, a
+	///   link, is another file than the FIFO cp follows); `-P` or `-R` reads
+	///   `l` itself, which is the same file.
 	///
 	/// Rows ending in `(stated)` differ from GNU, as stated in the CHANGELOG:
 	/// a link at `a~` is replaced, where GNU writes through it.
@@ -5080,7 +5084,7 @@ mod tests {
 		let open_l = "cp: cannot open 'l' for reading: No such file or directory\n";
 		let dangling = "cp: not writing through dangling symlink 'a~'\n";
 		#[rustfmt::skip]
-		let cases: [(&str, &str, &[&str], &str, i32, &str, &str); 29] = [
+		let cases: [(&str, &str, &[&str], &str, i32, &str, &str); 36] = [
 			("fifo -i y", "fifo:p old>p~", &["-R", "-i", "-fb", "p", "p"], "y\n", 1, same_p, " p=fifo p~=old#1"),
 			("fifo -i n", "fifo:p old>p~", &["-R", "-i", "-fb", "p", "p"], "n\n", 1, same_p, " p=fifo p~=old#1"),
 			("fifo -i none", "fifo:p", &["-R", "-i", "-fb", "p", "p"], "", 1, same_p, " p=fifo"),
@@ -5110,6 +5114,13 @@ mod tests {
 			("-u l ./l older", "A>a t:a=1000000000 a@l lt:l=2000000000", &["-u", "-fb", "l", "./l"], "", 0, "", " a=A#1 l=link:a"),
 			("-u l ./l newer", "A>a t:a=2000000000 a@l lt:l=1000000000", &["-u", "-fb", "l", "./l"], "", 1, open_l, " a=A#1 l=link:a"),
 			(".//l ./l", "A>a a@l", &["-fb", ".//l", "./l"], "", 1, "cp: cannot open './/l' for reading: No such file or directory\n", " a=A#1 l=link:a"),
+			("fifo link -fb l l", "fifo:p p@l", &["-fb", "l", "l"], "", 1, open_l, " l=link:p p=fifo"),
+			("fifo link -i y", "fifo:p p@l", &["-i", "-fb", "l", "l"], "y\n", 1, "cp: overwrite 'l'? cp: cannot open 'l' for reading: No such file or directory\n", " l=link:p p=fifo"),
+			("fifo link -i n", "fifo:p p@l", &["-i", "-fb", "l", "l"], "n\n", 1, "cp: overwrite 'l'? ", " l=link:p p=fifo"),
+			("fifo link -u older", "fifo:p t:p=1000000000 p@l", &["-u", "-fb", "l", "l"], "", 0, "", " l=link:p p=fifo"),
+			("fifo link -u newer", "fifo:p t:p=2000000000 p@l lt:l=1000000000", &["-u", "-fb", "l", "l"], "", 1, open_l, " l=link:p p=fifo"),
+			("fifo link -P", "fifo:p p@l", &["-P", "-fb", "l", "l"], "", 1, "cp: 'l' and 'l' are the same file\n", " l=link:p p=fifo"),
+			("fifo link -R", "fifo:p p@l", &["-R", "-fb", "l", "l"], "", 1, "cp: 'l' and 'l' are the same file\n", " l=link:p p=fifo"),
 		];
 		// A path's times, set without opening it (a FIFO would wait), following
 		// a link or not.
@@ -5174,6 +5185,89 @@ mod tests {
 					args.join(" ")
 				));
 			} else if found != (code, err.to_owned(), after.to_owned()) {
+				failures.push(format!("{case}: cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
+	/// `--remove-destination` keeps a source that is its own destination, as
+	/// GNU cp 9.4 and 9.7 do (the same as uid 1000 and as root): GNU decides
+	/// whether the two are the same file (`copy.c`, `same_file_ok`) before it
+	/// backs up or removes anything. It removes a destination that is a
+	/// symbolic link, or another hard link of the source's file in another
+	/// entry; the source's own entry, by any name (`./a`, `.`, an absolute
+	/// path, `d//a`), is the same file. `<D>` stands for the row's directory.
+	///
+	/// Rows ending in `(stated)` differ from GNU, as stated in the CHANGELOG:
+	/// GNU's `cp --remove-destination l ./l` and `l l`, `l` a link it follows,
+	/// remove `l` and then cannot open it; here `l` stays.
+	#[cfg(unix)]
+	#[test]
+	fn a_remove_destination_keeps_its_own_source_as_gnu_does() {
+		let same = |a: &str, b: &str| format!("cp: '{a}' and '{b}' are the same file\n");
+		let open_l = "cp: cannot open 'l' for reading: No such file or directory\n".to_owned();
+		let rd = "--remove-destination";
+		#[rustfmt::skip]
+		let cases: [(&str, &str, &[&str], i32, String, &str); 30] = [
+			("own ./a", "A>a", &[rd, "a", "./a"], 1, same("a", "./a"), " a=A#1"),
+			("own .", "A>a", &[rd, "a", "."], 1, same("a", "./a"), " a=A#1"),
+			("own absolute", "A>a", &[rd, "<D>/a", "a"], 1, same("<D>/a", "a"), " a=A#1"),
+			("own d//a", "dir:d A>d/a", &[rd, "d//a", "d/a"], 1, same("d//a", "d/a"), " d=dir d/a=A#1"),
+			("own d/./a", "dir:d A>d/a", &[rd, "d/./a", "d/a"], 1, same("d/./a", "d/a"), " d=dir d/a=A#1"),
+			("own a a", "A>a", &[rd, "a", "a"], 1, same("a", "a"), " a=A#1"),
+			("own into d", "dir:d A>d/a", &[rd, "d/a", "d"], 1, same("d/a", "d/a"), " d=dir d/a=A#1"),
+			("own ./a, 2 links", "A>a ln:a=b", &[rd, "a", "./a"], 1, same("a", "./a"), " a=A#2 b=A#2"),
+			("own -f ./a", "A>a", &[rd, "-f", "a", "./a"], 1, same("a", "./a"), " a=A#1"),
+			("own -l ./a", "A>a", &[rd, "-l", "a", "./a"], 0, String::new(), " a=A#1"),
+			("own -s ./a", "A>a", &[rd, "-s", "<D>/a", "./a"], 1, same("<D>/a", "./a"), " a=A#1"),
+			("own -b ./a", "A>a", &[rd, "-b", "a", "./a"], 1, same("a", "./a"), " a=A#1"),
+			("own -fb ./a", "A>a", &[rd, "-fb", "a", "./a"], 1, same("a", "./a"), " a=A#1"),
+			("own -fb a a", "A>a", &[rd, "-fb", "a", "a"], 0, String::new(), " a=A#1 a~=A#1"),
+			("link ./l (stated)", "A>a a@l", &[rd, "l", "./l"], 1, open_l.clone(), " a=A#1 l=link:a"),
+			("link -P ./l", "A>a a@l", &[rd, "-P", "l", "./l"], 1, same("l", "./l"), " a=A#1 l=link:a"),
+			("link -b ./l", "A>a a@l", &[rd, "-b", "l", "./l"], 1, open_l.clone(), " a=A#1 l=link:a"),
+			("link -P -b ./l", "A>a a@l", &[rd, "-P", "-b", "l", "./l"], 1, same("l", "./l"), " a=A#1 l=link:a"),
+			("link onto its target", "A>a a@l", &[rd, "l", "a"], 1, same("l", "a"), " a=A#1 l=link:a"),
+			("link l l (stated)", "A>a a@l", &[rd, "l", "l"], 1, open_l.clone(), " a=A#1 l=link:a"),
+			("link -P l l", "A>a a@l", &[rd, "-P", "l", "l"], 1, same("l", "l"), " a=A#1 l=link:a"),
+			("link -b l l", "A>a a@l", &[rd, "-b", "l", "l"], 1, open_l, " a=A#1 l=link:a"),
+			("-l onto a link to the source", "A>a a@l", &[rd, "-l", "a", "l"], 0, String::new(), " a=A#2 l=A#2"),
+			("-l onto a link to the source, no -r-d", "A>a a@l", &["-l", "a", "l"], 1, "cp: cannot create hard link 'l' to 'a': File exists\n".to_owned(), " a=A#1 l=link:a"),
+			("another link", "A>a ln:a=b", &[rd, "a", "b"], 0, String::new(), " a=A#1 b=A#1"),
+			("another link in d", "dir:d A>a ln:a=d/b", &[rd, "a", "d/b"], 0, String::new(), " a=A#1 d=dir d/b=A#1"),
+			("another link -b", "A>a ln:a=b", &[rd, "-b", "a", "b"], 0, String::new(), " a=A#2 b=A#1 b~=A#2"),
+			("a link to the source", "A>a a@l", &[rd, "a", "l"], 0, String::new(), " a=A#1 l=A#1"),
+			("a link to the source -b", "A>a a@l", &[rd, "-b", "a", "l"], 0, String::new(), " a=A#1 l=A#1 l~=link:a"),
+			("another file", "A>a B>b", &[rd, "a", "b"], 0, String::new(), " a=A#1 b=A#1"),
+		];
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (case, setup, args, code, err, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			for step in setup.split(' ') {
+				if let Some(name) = step.strip_prefix("dir:") {
+					fs::create_dir(dir.join(name)).unwrap();
+				} else if let Some((from, to)) = step.strip_prefix("ln:").and_then(|link| link.split_once('=')) {
+					fs::hard_link(dir.join(from), dir.join(to)).unwrap();
+				} else if let Some((contents, name)) = step.split_once('>') {
+					fs::write(dir.join(name), contents).unwrap();
+				} else if let Some((target, link)) = step.split_once('@') {
+					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+				}
+			}
+			let shown = dir.to_str().unwrap();
+			let args: Vec<String> = args.iter().map(|arg| arg.replace("<D>", shown)).collect();
+			let args: Vec<&str> = args.iter().map(String::as_str).collect();
+			let (got, capture) = run_util::<Cp>(&args, "", &dir);
+			// `find | sort`: the entries of `d` follow `d`, the last name here.
+			let mut entries = crate::file_backup::tests::listing(&dir);
+			if dir.join("d").is_dir() {
+				entries += &crate::file_backup::tests::listing(&dir.join("d")).replace(' ', " d/");
+			}
+			let found = (got, capture.err(), entries);
+			if found != (code, err.replace("<D>", shown), after.to_owned()) {
 				failures.push(format!("{case}: cp {}: {found:?}", args.join(" ")));
 			}
 		}
