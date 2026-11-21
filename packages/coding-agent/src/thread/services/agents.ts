@@ -22,7 +22,12 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { IrcBus } from "../../irc/bus";
-import { type AdoptOptions, type AgentReviver, AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import {
+	type AdoptOptions,
+	type AgentReviver,
+	AgentLifecycleManager,
+	runReviver,
+} from "../../registry/agent-lifecycle";
 import { AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
 import type { WorkerThreadLink } from "../protocol";
@@ -161,7 +166,9 @@ export class MainSessionBridge {
 	/**
 	 * Record a reviver this worker handed to `lifecycle` for `id`; returns the adopt options
 	 * to pass on, whose reviver holds the worker (and its idle shutdown off) while a revive
-	 * runs there. The record is dropped when the adoption lets go of the reviver.
+	 * runs there. The record is dropped when the adoption lets go of the reviver. A worker
+	 * sends even a plain-data reviver as a function it keeps (see `RemoteAgentLifecycle.adopt`):
+	 * main holds that function's proxy, wrapped here, until the adoption drops it or the worker exits.
 	 */
 	adopted(lifecycle: AgentLifecycleManager, id: string, opts: AdoptOptions): AdoptOptions {
 		const revive = opts.revive;
@@ -170,7 +177,7 @@ export class MainSessionBridge {
 		const held: AgentReviver = async expected => {
 			const release = peer.retain?.();
 			try {
-				return await revive(expected);
+				return await runReviver(revive, expected);
 			} finally {
 				release?.();
 			}

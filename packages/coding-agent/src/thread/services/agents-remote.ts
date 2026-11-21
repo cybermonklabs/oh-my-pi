@@ -12,14 +12,17 @@
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentAwaitsApi } from "../../registry/agent-awaits";
-import type {
-	AdoptOptions,
-	AgentLifecycleApi,
-	AgentLifecycleDisposeOptions,
-	AgentReleaseOptions,
-	ColdReviveOptions,
-	LiveAgentTarget,
-	PersistedSubagentReviverFactory,
+import {
+	type AdoptedReviver,
+	type AdoptOptions,
+	type AgentLifecycleApi,
+	type AgentLifecycleDisposeOptions,
+	type AgentReleaseOptions,
+	type AgentReviver,
+	type ColdReviveOptions,
+	type LiveAgentTarget,
+	type PersistedSubagentReviverFactory,
+	runReviver,
 } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
@@ -194,6 +197,16 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
+/**
+ * `revive` as a function main can call across the link: a plain-data reviver's state holds this
+ * thread's live objects, which cannot be copied, so the worker keeps it behind a function. Built
+ * here, handed nothing else: JSC keeps an enclosing function's `arguments` reachable from its arrow
+ * closures, so one built inside `adopt` would pin all of that call's arguments.
+ */
+function crossThreadReviver(revive: AdoptedReviver): AgentReviver {
+	return typeof revive === "function" ? revive : expected => runReviver(revive, expected);
+}
+
 /** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
@@ -206,8 +219,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		throw new Error("The persisted subagent reviver factory is owned by the main thread");
 	}
 
+	/** A reviver stays on this thread with the session it rebuilds; main holds a proxy of it. */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
-		this.#remote.notify("adopt", id, opts, expected);
+		const revive = opts.revive && crossThreadReviver(opts.revive);
+		this.#remote.notify("adopt", id, revive === opts.revive ? opts : { ...opts, revive }, expected);
 	}
 
 	has(id: string, expected?: AgentRefExpectation): boolean {

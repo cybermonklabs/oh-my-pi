@@ -1,7 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, AssistantMessageEvent } from "@oh-my-pi/pi-ai";
+import { createMockModel, type MockContent } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { AgentSession } from "../../src/session/agent-session";
+import { convertToLlm } from "../../src/session/messages";
+import { SessionManager } from "../../src/session/session-manager";
 import { SubagentSpawnSignal } from "../../src/thread/subagent-spawn-signal";
 import {
 	prewarmSubagentWorker,
@@ -127,6 +133,60 @@ describe("prewarmSubagentWorker", () => {
 			await worker.ready;
 			expect(worker.runs).toBe(0);
 		} finally {
+			pool.dispose();
+		}
+	});
+});
+
+describe("AgentSession subagent worker prewarm", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		setSubagentWorkerPoolForTests(undefined);
+	});
+
+	it("counts each assistant message's task items from zero", async () => {
+		// If this regresses, a later message's task call is counted on top of the earlier
+		// messages' (or not at all), so the pool boots workers for spawns that never come.
+		const pool = new SubagentWorkerPool({ maxWorkers: () => 0 });
+		setSubagentWorkerPoolForTests(pool);
+		const prewarm = vi.spyOn(pool, "prewarm");
+		const taskCall = (task: string): MockContent => ({
+			type: "toolCall",
+			name: "task",
+			arguments: {
+				context: "c",
+				tasks: [
+					{ agent: "task", task },
+					{ agent: "task", task },
+				],
+			},
+		});
+		const mock = createMockModel({
+			responses: [{ content: [taskCall("first")] }, { content: [taskCall("second")] }, { content: ["done"] }],
+		});
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				convertToLlm,
+				streamFn: mock.stream,
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		try {
+			await session.prompt("spawn two subagents, twice");
+			await session.waitForIdle();
+			// Per message: one spawn once the task call starts, two once both items open.
+			expect(prewarm.mock.calls).toEqual([[1], [2], [1], [2]]);
+		} finally {
+			await session.dispose();
+			authStorage.close();
 			pool.dispose();
 		}
 	});

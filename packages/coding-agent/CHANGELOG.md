@@ -80,6 +80,7 @@
 - Fixed full rewrites of large file-backed sessions retaining a second transcript-sized serialization; file storage now streams the journal and verifies uncertain publication by an exact streamed comparison.
 - Fixed `omp --resume <path>` reading a session's whole transcript into one string to confirm it is unchanged when its storage can stream it; the check now hashes the transcript as it streams.
 - Fixed confirming a session rewrite whose acknowledgement failed by reading the whole stored transcript into one string when its storage can stream it; the stored bytes are now compared by size and SHA-256 as they stream.
+- Parked task subagents keep only plain data for their revival, so a session that runs many subagents no longer grows with each one; a revived subagent reads the peer list its prompt showed back from its transcript and takes its settings from its parent as they are now, plus the settings it changed itself
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
 - A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context
@@ -220,6 +221,7 @@
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
 - The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
 - A resumed session gives back a provider image's data URL listed under `image_url` (in a tool result's `details`, for example) instead of its `blob:sha256:` reference
+- Parked task subagents no longer keep settings listeners in memory, and the subagent worker booted ahead of a `task` call counts only the current answer's task calls
 
 ### Breaking Changes
 

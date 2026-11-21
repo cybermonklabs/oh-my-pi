@@ -5321,6 +5321,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		}
 		// Spawning tool calls are streaming: boot a subagent worker they will need while their arguments stream.
+		// The loop emits a message's first `start` as `message_start`, not as an update: each assistant
+		// message's count starts from zero there.
+		if (event.type === "message_start" && event.message.role === "assistant") this.#spawnSignal?.reset();
 		const expectedSpawns =
 			event.type === "message_update" ? this.#spawnSignal?.observe(event.assistantMessageEvent) : undefined;
 		if (expectedSpawns) prewarmSubagentWorker(this.settings, this.#modelRegistry, expectedSpawns);
@@ -7696,8 +7699,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// revival path reopens the transcript from disk (AgentLifecycleManager
 		// reviver / persisted-revive / `history://`), so the in-memory copy is
 		// dead weight from here on. Dropping it lets a parked subagent's session
-		// graph shed its heavy payloads even while the lifecycle adoption record's
-		// reviver closure still references the session object. Fixes #8003.
+		// graph shed its heavy payloads even while something else still references
+		// the session object. Fixes #8003.
 		this.#releaseRetainedSessionMemory();
 		// A run past the deadline may still resolve keys, so the account pools
 		// are lifted only once the run has settled: here when it drained,

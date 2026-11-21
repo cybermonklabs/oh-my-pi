@@ -638,6 +638,19 @@ function physicalTargetSegments(target: string, pathApi: typeof path = path): st
 // Settings Class
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Drops an {@link Settings.overlay} child's forwarder from its parent's `#childForwarders` once the
+ * child is collected. Without it the forwarder stays until the parent's next change, so a parent
+ * that seldom changes keeps one per child it ever made (one per subagent). The held value names the
+ * parent's set and the forwarder, never the child; it holds the parent, which the child holds anyway.
+ */
+const childForwarderCleanup = new FinalizationRegistry<{
+	forwarders: Set<SettingChangeListener>;
+	forward: SettingChangeListener;
+}>(({ forwarders, forward }) => {
+	forwarders.delete(forward);
+});
+
 export class Settings {
 	#configPath: string | null;
 	#cwd: string;
@@ -681,7 +694,7 @@ export class Settings {
 	/** Change listeners bucketed by the `slot` of the setting they observe ({@link onEffectiveChange}). */
 	#changeListeners: (Set<SettingChangeListener> | undefined)[] = [];
 	/** Forwarders of every change into live {@link overlay} children. */
-	#childForwarders = new Set<SettingChangeListener>();
+	readonly #childForwarders = new Set<SettingChangeListener>();
 	/** Instance this overlay reads through to ({@link overlay}); overlays never persist or write back. */
 	#parent: Settings | undefined;
 	/** A subagent-derived view inherits its parent's grant authority; host-created overlays do not. */
@@ -750,7 +763,9 @@ export class Settings {
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
 		this.#persist = !options.inMemory && options.readOnly !== true;
-		liveSettingsInstances.add(new WeakRef(this));
+		const ref = new WeakRef(this);
+		liveSettingsInstances.add(ref);
+		liveSettingsInstanceCleanup.register(this, ref);
 		if (options.overrides) this.#overrides = this.#overrideLayer(options.overrides);
 	}
 
@@ -881,7 +896,8 @@ export class Settings {
 		inheritWarnings(child, this);
 		child.#rebuildMerged();
 		// The parent holds only a weak reference, so a discarded child is collected without an
-		// explicit dispose; its listener unsubscribes on the next parent change.
+		// explicit dispose; `childForwarderCleanup` then drops its listener. Finalizers may run late,
+		// so the listener also unsubscribes itself on the next parent change after the collection.
 		const ref = new WeakRef(child);
 		const forward: SettingChangeListener = setting => {
 			const target = ref.deref();
@@ -892,6 +908,7 @@ export class Settings {
 			target.#applyParentChange(setting);
 		};
 		this.#childForwarders.add(forward);
+		childForwarderCleanup.register(child, { forwarders: this.#childForwarders, forward });
 		return child;
 	}
 
@@ -4337,6 +4354,14 @@ export class Settings {
  * retain instances; the set is cleared on every test reset.
  */
 const liveSettingsInstances = new Set<WeakRef<Settings>>();
+/**
+ * Deletes a collected instance's WeakRef from {@link liveSettingsInstances}: outside tests nothing
+ * clears the set, so a process that builds settings per subagent would keep one dead WeakRef each.
+ * The held value is the WeakRef itself, which never retains its instance.
+ */
+const liveSettingsInstanceCleanup = new FinalizationRegistry<WeakRef<Settings>>(ref => {
+	liveSettingsInstances.delete(ref);
+});
 
 const activeSettingsScope = new AsyncLocalStorage<Settings>();
 
