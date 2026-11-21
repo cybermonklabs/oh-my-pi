@@ -86,7 +86,7 @@ Three search-related builtins are worth calling out:
 
 Symlinks swapped in during a walk:
 
-- `grep -r`, `rg`, `fd` and `find` walk with `pi-walker`. A walk that does not follow symlinks opens each directory relative to its parent, without following a symlink there. `find` without `-L` or `-H` checks its starting point with `lstat`, and opens it the same way. `grep -r`, `rg` and `fd` follow a starting point that is a symlink, as GNU grep, ripgrep and fd do.
+- `grep -r`, `rg`, `fd` and `find` walk with `pi-walker`. A walk that does not follow symlinks opens each directory relative to its parent, or below the walk's root, without following a symlink on the way. `find` without `-L` or `-H` checks its starting point with `lstat`, and opens it the same way. `grep -r`, `rg` and `fd` follow a starting point that is a symlink, as GNU grep, ripgrep and fd do.
 - `rm -r`, and `mv` of a directory across filesystems, remove with `rm`'s descriptor walk. It opens each directory, the operand included, only as the directory that `lstat` found.
 - `chmod -R` walks by path, so it follows a directory that is swapped for a symlink at any depth.
 - `du` walks by path, so it follows a directory that is swapped for a symlink at any depth.
