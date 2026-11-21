@@ -14,17 +14,45 @@
  * lockfile, and the holder's own publish lands cleanly once released.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import { FileSessionStorage, SessionLockError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 
 /** Mirrors the OS-gate sidecar derived in `#withPublishLock`. */
 function osGatePath(lockPath: string): string {
 	return `${lockPath}.os`;
+}
+
+/** Starts a process that holds the native lock at `lockPath` until it is killed, and waits until it holds it. */
+async function startHolder(lockPath: string, readyPath: string): Promise<Bun.Subprocess<"ignore", "ignore", "pipe">> {
+	const holder = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "../fixtures/native-lock-holder.ts"), lockPath, readyPath],
+		{
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+		},
+	);
+	for (;;) {
+		try {
+			await fsp.access(readyPath);
+			return holder;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			if (holder.exitCode !== null) {
+				throw new Error(
+					`lock holder exited before readiness (${holder.exitCode}): ${await new Response(holder.stderr).text()}`,
+				);
+			}
+		}
+	}
 }
 
 describe("publish lock OS gate", () => {
@@ -35,6 +63,7 @@ describe("publish lock OS gate", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await fsp.rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -94,4 +123,28 @@ describe("publish lock OS gate", () => {
 		await expect(writer.close()).rejects.toBeInstanceOf(SessionLockError);
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("original\n");
 	});
+
+	// If this regresses, a session write that waits on the gate another omp process holds makes a
+	// native claim on every poll, each blocking the thread about 50 ms on Linux, where a probe answers
+	// at once.
+	it.skipIf(process.platform !== "linux")(
+		"waits on a gate another process holds by probing it, with one claim at the end of the wait",
+		async () => {
+			const storage = new FileSessionStorage();
+			const sessionPath = path.join(tempDir, "session.jsonl");
+			storage.writeTextSync(sessionPath, "original\n");
+			const gatePath = osGatePath(path.join(tempDir, ".session.jsonl.lock"));
+			const holder = await startHolder(gatePath, path.join(tempDir, "holder-ready"));
+			try {
+				const claim = vi.spyOn(NativeFileLock, "tryAcquire");
+				expect(() => storage.writeTextSync(sessionPath, "B-content\n")).toThrow(SessionLockError);
+				expect(claim.mock.calls.filter(([claimed]) => claimed === gatePath)).toHaveLength(1);
+			} finally {
+				holder.kill();
+				await holder.exited;
+			}
+			expect(fs.readFileSync(sessionPath, "utf8")).toBe("original\n");
+		},
+		10_000,
+	);
 });

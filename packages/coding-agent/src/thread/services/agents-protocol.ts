@@ -108,4 +108,6 @@ export type IrcBusProtocol = {
 	unreadCount: RpcMethod<[agentId: string], number>;
 	recordReply: RpcMethod<[from: string, to: string], void>;
 	forgetAgent: RpcMethod<[agentId: string], void>;
+	/** Returns a sync release, which main also runs if the worker dies first. */
+	holdSentMarks: RpcMethod<[agentId: string], () => void>;
 };

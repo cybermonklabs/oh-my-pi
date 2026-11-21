@@ -310,6 +310,8 @@ function serveBus(bridge: MainSessionBridge): RpcServe<IrcBus, IrcBusProtocol> {
 		unreadCount: (bus, agentId) => bus.unreadCount(agentId),
 		recordReply: (bus, from, to) => bus.recordReply(from, to),
 		forgetAgent: (bus, agentId) => bus.forgetAgent(agentId),
+		// A hold a dead worker took must not keep its agent's marks for the rest of the session.
+		holdSentMarks: (bus, agentId) => bridge.track(bus.holdSentMarks(agentId)),
 	};
 }
 

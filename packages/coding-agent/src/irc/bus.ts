@@ -107,6 +107,12 @@ export interface IrcBusApi {
 	 * is live; see {@link IrcBus.forgetAgent}.
 	 */
 	forgetAgent(agentId: string): void;
+	/**
+	 * Keep `agentId`'s sent and progress marks, which its wake turn's relay
+	 * asks once the turn ends, through a park, kill or removal until the
+	 * returned release runs; see {@link IrcBus.holdSentMarks}.
+	 */
+	holdSentMarks(agentId: string): () => void;
 }
 
 export class IrcBus implements IrcBusApi {
@@ -178,6 +184,8 @@ export class IrcBus implements IrcBusApi {
 	#sendSeq = 0;
 	/** Sends awaiting their delivery; {@link forgetAgent} flags those from or to the agent it forgets. */
 	readonly #inFlight = new Set<InFlightSend>();
+	/** Open {@link holdSentMarks} holds, by agent. */
+	readonly #sentMarkHolds = new Map<string, number>();
 	readonly #unsubscribe: () => void;
 
 	constructor(registry: AgentRegistryApi = AgentRegistry.global(), lifecycle?: AgentLifecycleApi) {
@@ -227,21 +235,21 @@ export class IrcBus implements IrcBusApi {
 		}
 		// The bus forgets an agent parked, killed or unregistered during the
 		// delivery (see forgetAgent). A sender forgotten so records nothing, as a
-		// mark recorded now would outlive it; a recipient forgotten so is handled
-		// below. Comparing an agent's registry entry before and after cannot tell:
-		// a revival reuses the parked entry, so a recipient the send revived and
-		// that parked again before the delivery returned reads parked at both
-		// ends. An agent the bus did not forget records as usual, a parked one or
-		// one the registry never held included; one forgotten and revived since
-		// is live.
-		if (receipt.outcome === "failed" || (flight.fromForgotten && !isLive(this.#registry.get(message.from)))) {
+		// mark recorded now would outlive it, unless its sent marks are held
+		// (holdSentMarks); a recipient forgotten so is handled below. Comparing an
+		// agent's registry entry before and after cannot tell: a revival reuses
+		// the parked entry, so a recipient the send revived and that parked again
+		// before the delivery returned reads parked at both ends. An agent the bus
+		// did not forget records as usual, a parked one or one the registry never
+		// held included; one forgotten and revived since is live.
+		if (receipt.outcome === "failed" || (flight.fromForgotten && !this.#keepsSentMarks(message.from))) {
 			return receipt;
 		}
 		// A recipient forgotten during the delivery keeps only what forgetAgent
-		// keeps of it: a live sender's sent and progress marks, which the wake-turn
-		// relay of the sender's turn still asks, and no direct mark.
+		// keeps of it: a live or held sender's sent and progress marks, which the
+		// wake-turn relay of the sender's turn still asks, and no direct mark.
 		const recipientForgotten = flight.toForgotten && !isLive(this.#registry.get(flight.to));
-		if (recipientForgotten && !isLive(this.#registry.get(message.from))) return receipt;
+		if (recipientForgotten && !this.#keepsSentMarks(message.from)) return receipt;
 		// The receipt names who received it: the lifecycle can readdress the
 		// message after this call resolved the name.
 		if (message.progress) {
@@ -280,22 +288,26 @@ export class IrcBus implements IrcBusApi {
 	 * the same reason a live sender keeps its sent and progress marks for the
 	 * forgotten agent, so a waker that parked during the turn that answered it
 	 * is not sent that answer again, which would revive it; those go once the
-	 * sender itself is forgotten. The direct marks go on both sides at once, so
-	 * {@link unansweredSends} never meets a question whose answer was dropped,
-	 * and a question the agent asks once revived orders after every mark kept
-	 * for it ({@link SendMark.seq}). Nothing goes until this bus's registry
-	 * reports the agent parked, aborted or gone. A send still delivering from
-	 * it then records no mark; one still delivering to it records only a live
-	 * sender's sent or progress mark, no direct mark, and buffers nothing for
-	 * it.
+	 * sender itself is forgotten. An agent whose sent marks are held
+	 * ({@link holdSentMarks}: its wake turn's relay has yet to ask them) keeps
+	 * its sent and progress rows, and is a sender that keeps them for a
+	 * forgotten agent too, until the hold is released. The direct marks go on
+	 * both sides at once, so {@link unansweredSends} never meets a question
+	 * whose answer was dropped, and a question the agent asks once revived
+	 * orders after every mark kept for it ({@link SendMark.seq}). Nothing goes
+	 * until this bus's registry reports the agent parked, aborted or gone. A
+	 * send still delivering from it then records no mark unless its sent marks
+	 * are held; one still delivering to it records only a live or held sender's
+	 * sent or progress mark, no direct mark, and buffers nothing for it.
 	 */
 	forgetAgent(agentId: string): void {
 		if (isLive(this.#registry.get(agentId))) return;
+		const held = this.#sentMarkHolds.has(agentId);
 		for (const table of [this.#lastSent, this.#lastDirect, this.#lastProgress, this.#lastJobReply]) {
-			table.delete(agentId);
-			const liveSendersKeep = table === this.#lastSent || table === this.#lastProgress;
+			const sendersKeep = table === this.#lastSent || table === this.#lastProgress;
+			if (!(held && sendersKeep)) table.delete(agentId);
 			for (const [from, marks] of table) {
-				if (liveSendersKeep && isLive(this.#registry.get(from))) continue;
+				if (sendersKeep && this.#keepsSentMarks(from)) continue;
 				if (marks.delete(agentId) && marks.size === 0) table.delete(from);
 			}
 		}
@@ -307,6 +319,37 @@ export class IrcBus implements IrcBusApi {
 			if (flight.from === agentId) flight.fromForgotten = true;
 			if (flight.to === agentId) flight.toForgotten = true;
 		}
+	}
+
+	/**
+	 * Keep `agentId`'s sent and progress marks until the returned release
+	 * runs, whether the agent stays live or not: the task executor holds them
+	 * through a wake turn, whose relay asks {@link sentSince} once the turn's
+	 * owned work has settled, and the idle TTL can park the agent before then.
+	 * Without the hold, forgetting the parked agent drops its mark of the
+	 * answer it sent its waker, and the relay sends that answer again, reviving
+	 * a parked waker. The last release forgets what a forgotten agent kept;
+	 * releasing twice does nothing.
+	 */
+	holdSentMarks(agentId: string): () => void {
+		this.#sentMarkHolds.set(agentId, (this.#sentMarkHolds.get(agentId) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const left = (this.#sentMarkHolds.get(agentId) ?? 1) - 1;
+			if (left > 0) {
+				this.#sentMarkHolds.set(agentId, left);
+				return;
+			}
+			this.#sentMarkHolds.delete(agentId);
+			this.forgetAgent(agentId);
+		};
+	}
+
+	/** Whether `agentId` keeps its sent and progress marks: it is live, or they are held ({@link holdSentMarks}). */
+	#keepsSentMarks(agentId: string): boolean {
+		return this.#sentMarkHolds.has(agentId) || isLive(this.#registry.get(agentId));
 	}
 
 	/**

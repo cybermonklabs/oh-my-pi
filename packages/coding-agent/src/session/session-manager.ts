@@ -979,6 +979,8 @@ interface SessionManagerStateSnapshot {
 	entries: SessionEntry[];
 	/** The store the cold ones among `entries` were written to; shared with the manager that captured them. */
 	coldStore: ColdEntryStore | undefined;
+	/** The model the cut was last computed for, which the agent's context was built for. */
+	coldCutModel: Model | undefined;
 }
 
 /** {@link SessionManager.coldStoreStats}: how much of the session lives in its cold entry store. */
@@ -991,6 +993,13 @@ export interface ColdStoreStats {
 	materializations: number;
 	/** Cold entries made whole again. */
 	hydrations: number;
+	/**
+	 * Whether the store keeps new records compressed in memory: no store file
+	 * could be made under `os.tmpdir()`, or a write to it failed.
+	 */
+	storeInMemory: boolean;
+	/** Bytes of the compressed blocks of records the store keeps in memory. */
+	compressedBytes: number;
 }
 
 /** Options of {@link SessionManager.buildSessionContext}. */
@@ -1454,8 +1463,6 @@ export class SessionManager {
 	readonly #coldStoreEnabled: boolean;
 	/** The store new cold entries go to; created when the first entry turns cold. */
 	#coldStore: ColdEntryStore | undefined;
-	/** A store could not be opened since the last load: entries stay whole instead of trying again for each. */
-	#coldStoreUnavailable = false;
 	/** The model the cut was last computed for (see `coldCutPathIndex`); unset until a context build names one. */
 	#coldCutModel: Model | undefined;
 	/**
@@ -1463,7 +1470,8 @@ export class SessionManager {
 	 * the cut was last applied: set by {@link #setLeaf} when the leaf moves,
 	 * {@link #reindexEntries}, {@link #recordEntry} for a compaction,
 	 * {@link #staleColdBoundary} when it adopts a model, and
-	 * {@link #resetColdCut} when asked.
+	 * {@link #resetColdCut} when asked; cleared by {@link buildSessionContext}
+	 * once the build that applies the cut made its entries whole and returned.
 	 */
 	#coldCutStale = false;
 
@@ -3814,7 +3822,6 @@ export class SessionManager {
 	 */
 	#resetColdCut(store: ColdEntryStore | undefined, stale: boolean): void {
 		this.#adoptColdStore(store);
-		this.#coldStoreUnavailable = false;
 		this.#coldCutModel = undefined;
 		this.#coldCutStale = stale;
 	}
@@ -3828,25 +3835,22 @@ export class SessionManager {
 	}
 
 	/**
-	 * The store new cold entries go to, created on first use; undefined when
-	 * none can be opened, and then not tried again before the next load.
+	 * The store new cold entries go to, created on first use: over a file, or
+	 * kept compressed in memory where none can be made.
 	 */
-	#openColdStore(): ColdEntryStore | undefined {
-		if (this.#coldStore || this.#coldStoreUnavailable) return this.#coldStore;
+	#openColdStore(): ColdEntryStore {
+		if (this.#coldStore) return this.#coldStore;
 		const store = ColdEntryStore.open(this.#blobs);
-		if (store) this.#adoptColdStore(store);
-		else this.#coldStoreUnavailable = true;
+		this.#adoptColdStore(store);
 		return store;
 	}
 
 	/**
-	 * Whether a convert pass can make an entry cold, as `#openColdStore`
-	 * answers: false while no store can be opened before the next load, or
-	 * once the store takes no new record (a write to it failed, or it closed).
-	 * {@link convertToColdEntry} then keeps every entry whole.
+	 * Whether a convert pass can make an entry cold: false once the store
+	 * closed, when {@link convertToColdEntry} keeps every entry whole.
 	 */
 	#coldStoreTakesRecords(): boolean {
-		return this.#coldStore ? this.#coldStore.writable : !this.#coldStoreUnavailable;
+		return this.#coldStore?.writable ?? true;
 	}
 
 	/**
@@ -3870,7 +3874,8 @@ export class SessionManager {
 	 * the model the cut was computed for adopts that model, whose readable
 	 * compaction can start the context earlier, and computes the cut again: the
 	 * first build for a model switched to reads no cold entry. A build that only
-	 * measures (`measureOnly`) changes neither.
+	 * measures (`measureOnly`) changes neither. The cut stays stale until the
+	 * build applies it ({@link buildSessionContext}).
 	 */
 	#staleColdBoundary(options: SessionContextBuildOptions | undefined): ColdBoundary | undefined {
 		if (!this.#coldStoreEnabled || options?.measureOnly) return undefined;
@@ -3881,7 +3886,6 @@ export class SessionManager {
 			this.#coldCutStale = true;
 		}
 		if (!this.#coldCutStale) return undefined;
-		this.#coldCutStale = false;
 		return coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel);
 	}
 
@@ -4069,6 +4073,7 @@ export class SessionManager {
 			header: structuredClone(this.#header),
 			entries: [...this.#entries],
 			coldStore: this.#coldStore,
+			coldCutModel: this.#coldCutModel,
 		};
 	}
 
@@ -4151,6 +4156,10 @@ export class SessionManager {
 			? durableFrontier(this.#entriesGeneration, snapshot.durable.count, snapshot.durable.size)
 			: undefined;
 		this.#resetColdCut(snapshot.coldStore, true);
+		// A rollback leaves the agent's context the one built for this model (a
+		// switch restores it, a move keeps it), so the cut recomputed at the next
+		// build or recool keeps whole what that context holds.
+		this.#coldCutModel = snapshot.coldCutModel;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		// A rolled-back switch gives up the claim it took on the session it opened.
@@ -4504,8 +4513,6 @@ export class SessionManager {
 			entries: SessionEntry[];
 			index: SessionEntryIndex;
 			store: ColdEntryStore | undefined;
-			/** A store could not be opened: the entries stay whole. */
-			storeUnavailable: boolean;
 			/** Entries before this index were offered to the store by a compaction's kept start. */
 			cooled: number;
 			/** Entries carrying replay metadata a resume strips, sanitized once the load-time passes ran. */
@@ -4514,15 +4521,11 @@ export class SessionManager {
 			entries: [],
 			index: new SessionEntryIndex(),
 			store: undefined,
-			storeUnavailable: false,
 			cooled: 0,
 			unsanitized: [],
 		};
 		const openStore = () => {
-			if (!intake.store && !intake.storeUnavailable) {
-				intake.store = ColdEntryStore.open(this.#blobs);
-				intake.storeUnavailable = intake.store === undefined;
-			}
+			intake.store ??= ColdEntryStore.open(this.#blobs);
 			return intake.store;
 		};
 		const startMigration = (current: SessionHeader): SessionEntryMigration => {
@@ -5275,7 +5278,13 @@ export class SessionManager {
 		manager.#adoptColdStore(this.#coldStore);
 		manager.#reindexEntries();
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
+		try {
+			await manager.#rewriteAtomically();
+		} catch (error) {
+			// No caller gets the copy to close, so its hold on the store goes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
+		}
 		return manager;
 	}
 
@@ -6666,9 +6675,11 @@ export class SessionManager {
 	/**
 	 * The active-leaf branch from the cut on: the first entry the model context
 	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
-	 * bodies stay in memory, except patch records and a user's to-do edit older
-	 * than the newest to-do snapshot, so a reader of the recent turns reads no
-	 * older body.
+	 * bodies stay in memory, except the records no turn reads there (patch
+	 * records, `session_exit` records, a user's to-do edit, a to-do HUD choice
+	 * or a mode change older than the newest of its kind, a compaction older
+	 * than the one the context starts from), so a reader of the recent turns
+	 * reads no older body.
 	 * The whole branch when the context uses no compaction.
 	 */
 	getBranchFromCut(): SessionEntry[] {
@@ -6689,7 +6700,13 @@ export class SessionManager {
 			resolveFrameData: data => this.resolveFrameData(data),
 			...options,
 		});
-		if (boundary && this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
+		if (boundary) {
+			// Applied: a hydration or a build that threw left the cut stale, so the
+			// next build applied it again instead of reading the entries it keeps
+			// through their accessors.
+			this.#coldCutStale = false;
+			if (this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
+		}
 		return context;
 	}
 
@@ -6795,6 +6812,8 @@ export class SessionManager {
 			storeBytes: store?.bytes ?? 0,
 			materializations: store?.materializations ?? 0,
 			hydrations: store?.hydrations ?? 0,
+			storeInMemory: store?.inMemory ?? false,
+			compressedBytes: store?.compressedBytes ?? 0,
 		};
 	}
 
@@ -7205,9 +7224,15 @@ export class SessionManager {
 			for (const entry of history.slice(repairedFrom)) manager.#index.insert(entry);
 		}
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		if (!options?.seance && options?.copyArtifacts !== false) {
-			await copySessionArtifacts(sourcePath, manager.#sessionFile!, storage);
+		try {
+			await manager.#rewriteAtomically();
+			if (!options?.seance && options?.copyArtifacts !== false) {
+				await copySessionArtifacts(sourcePath, manager.#sessionFile!, storage);
+			}
+		} catch (error) {
+			// No caller gets the fork to close, so the store its load opened closes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
 		}
 		return manager;
 	}

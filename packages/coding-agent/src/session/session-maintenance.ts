@@ -4744,9 +4744,10 @@ export class SessionMaintenance {
 	 * a maxFrames derived from the trigger threshold instead of the window:
 	 * `planArchive` truncates the oldest chars to fit, so the rebuilt entry
 	 * genuinely shrinks. The rebuilt entry keeps the stale entry's
-	 * `firstKeptEntryId`, so the kept tail is untouched, and persisting
-	 * through `appendCompaction()` lets the write-time superseded-compaction
-	 * elision drop the stale frame payload from the JSONL automatically.
+	 * `firstKeptEntryId`, so the kept tail is untouched. The stale entry stays
+	 * in the JSONL with its frames and archive text (nothing elides it on
+	 * write); in memory it goes to the cold store, since no context build
+	 * reads a compaction older than the one it starts from.
 	 */
 	async #rescueSnapcompactFrameOverflow(
 		branchEntries: SessionEntry[],

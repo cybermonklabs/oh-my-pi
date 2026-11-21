@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { IrcBus, type IrcBusApi } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -220,5 +220,41 @@ describe("IRC bus: no state kept for a parked or removed agent", () => {
 
 		expect(turn.revivals()).toBe(0);
 		expect(registry.get("0-L")?.status).toBe("parked");
+	});
+
+	// Regression: L asks X, X answers L in the wake turn L's message started and L parks; X's turn
+	// then waits on a job of its own, and X's idle TTL parks X before the turn ends. The bus drops
+	// every mark of the parked X, so the wake-turn relay finds no answer to L, sends L the same
+	// answer again, and revives the parked L for a model turn on an answer it already has.
+	it("keeps an answerer's answer while its idle TTL parks it before its wake turn ends, so the relay does not revive the waker", async () => {
+		const lifecycle = AgentLifecycleManager.global();
+		const turn = await peerWakeTurn();
+		await bus.send({ from: "0-X", to: "0-L", body: "yes, leave it to me" });
+		registry.setStatus("0-L", "idle");
+		await lifecycle.park("0-L");
+		// X's turn has ended; its observation waits for X's own job while the idle TTL runs out.
+		const xParked = Promise.withResolvers<void>();
+		const unsubscribe = registry.onChange(event => {
+			if (event.ref.id === "0-X" && event.ref.status === "parked") xParked.resolve();
+		});
+		vi.useFakeTimers();
+		try {
+			lifecycle.adopt("0-X", { idleTtlMs: 50, revive: async () => fakeSession() });
+			registry.setStatus("0-X", "idle");
+			vi.advanceTimersByTime(50);
+		} finally {
+			vi.useRealTimers();
+		}
+		await xParked.promise;
+		unsubscribe();
+		// What the relay asks once the turn ends.
+		expect(bus.sentSince("0-X", "0-L", turn.turnStart)).toBe(true);
+
+		await turn.turnEnded();
+
+		expect(turn.revivals()).toBe(0);
+		expect(registry.get("0-L")?.status).toBe("parked");
+		// The relay asked; the parked X keeps no marks after it.
+		expect(bus.sentSince("0-X", "0-L", turn.turnStart)).toBe(false);
 	});
 });

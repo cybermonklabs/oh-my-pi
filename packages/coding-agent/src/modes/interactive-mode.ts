@@ -218,11 +218,11 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
+import { TODO_HUD_STATE_CUSTOM_TYPE } from "../session/session-entries";
 import {
 	createTodoHudStateData,
 	getTodoHudVisibility,
 	nextActionableTask,
-	TODO_HUD_STATE_CUSTOM_TYPE,
 	type TodoHudStateEntryData,
 } from "../tools/todo";
 import {

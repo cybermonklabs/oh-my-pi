@@ -8,7 +8,7 @@
 - Added `expandTilde(path, home?)` (`@oh-my-pi/pi-utils/path`), which expands a leading `~` to the home directory; `@oh-my-pi/pi-coding-agent/tools/path-utils` re-exports it ([#17931](https://github.com/can1357/oh-my-pi/pull/17931) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
-- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`
+- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`; unlike `writeArchive` it empties `destPath` before it writes, so a failure leaves a truncated file there (write to a staging file and rename it on success)
 - Added `ArchiveReader.readFileChunks` to read an archive member in bounded chunks; plain tar files on disk yield reads of at most 1 MiB
 - Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
 - Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
@@ -18,6 +18,7 @@
 - `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it.
 - `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it. One without a `deadlineMs` of its own gets no time past the 10 s deadline: when another callback's `deadlineMs` held the pass open that long, it starts once that callback settles and the pass ends at once. With a `deadlineMs` of its own, the pass waits for it that long once it starts, also past the 10 s deadline. A `deadlineMs` callback's `waitMessage` does not wait for `afterOthers` callbacks.
 - `postmortem.exitAfterCleanup(code, { exit })`: runs every cleanup callback, then exits, and does not return, for a caller that must not go on; unlike `process.exit`, it waits for asynchronous cleanup callbacks first, and unlike `exitProcess`, it runs them at all. `exit: "native"` ends through `exitProcess`, past the extension-load guard, for a host-owned exit that can come while extensions load.
+- Added `tryAcquireFileLockUnlessHeld`, which answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
 
 ### Changed
 

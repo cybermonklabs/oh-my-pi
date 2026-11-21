@@ -74,6 +74,17 @@ export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 }
 
 /**
+ * {@link tryAcquireFileLock} for a caller that tries again later: while
+ * another holder owns the lease, a probe answers `null` at once where a claim
+ * would block the thread (about 50 ms on Linux). The probe can also read a
+ * just-released lease as held, which costs such a caller one retry; a probe
+ * that fails leaves the answer to the claim.
+ */
+export function tryAcquireFileLockUnlessHeld(filePath: string): FileLockHandle | null {
+	return attemptLock(getLockPath(filePath), false);
+}
+
+/**
  * Whether any holder, including this process, owns the lease, observed without
  * taking it. Under gVisor the probe can make a concurrent `tryAcquireFileLock`
  * find the lease in use for a few milliseconds, which that claim retries, so

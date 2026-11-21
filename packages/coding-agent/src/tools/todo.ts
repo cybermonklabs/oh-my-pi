@@ -13,7 +13,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
-import { type SessionEntry, todoSnapshotPhases } from "../session/session-entries";
+import { type SessionEntry, TODO_HUD_STATE_CUSTOM_TYPE, todoSnapshotPhases } from "../session/session-entries";
 
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 
@@ -154,8 +154,6 @@ export function nextActionableTask(phases: readonly TodoPhase[]): TodoItem | und
 	return firstPending;
 }
 
-export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
-
 export type TodoHudVisibility = "dismissed" | "revealed";
 
 export interface TodoSnapshotIdentity {
@@ -196,7 +194,11 @@ export function getLatestTodoSnapshotIdentity(entries: SessionEntry[]): TodoSnap
 	return { sourceEntryId, fingerprint: todoPhasesFingerprint(latest) };
 }
 
-/** Return the persisted HUD choice only when it targets the current canonical snapshot exactly. */
+/**
+ * Return the persisted HUD choice only when it targets the current canonical
+ * snapshot exactly. Only a choice recorded after that snapshot can, so the
+ * walk stops there and reads no older one (each kept in the cold store).
+ */
 export function getTodoHudVisibility(
 	entries: SessionEntry[],
 	phases: readonly TodoPhase[],
@@ -205,6 +207,7 @@ export function getTodoHudVisibility(
 	if (!snapshot || snapshot.fingerprint !== todoPhasesFingerprint(phases)) return undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
+		if (entry.id === snapshot.sourceEntryId) break;
 		if (entry.type !== "custom" || entry.customType !== TODO_HUD_STATE_CUSTOM_TYPE) continue;
 		const data = entry.data as Partial<TodoHudStateEntryData> | undefined;
 		if (

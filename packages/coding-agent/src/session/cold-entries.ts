@@ -1,5 +1,6 @@
 /**
- * Older entry bodies on disk instead of in memory.
+ * Older entry bodies out of memory: on disk, or compressed in memory where no
+ * store file can be used.
  *
  * The model context only needs the entries of the current branch from the
  * latest compaction's cut on (see {@link coldBoundary}). An entry before the
@@ -31,8 +32,15 @@ import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { type BlobStore, isBlobRef } from "./blob-store";
-import { COLD_OWNER, type ColdMessageSlots } from "./cold-message";
-import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
+import {
+	COLD_OWNER,
+	COLD_ROLLOVER_REQUEST,
+	type ColdCustomMessageSlots,
+	type ColdMessageSlots,
+	coldRolloverRequestMark,
+} from "./cold-message";
+import { CONTEXT_NOTES_ENTRY_TYPE, contextNotesEntriesRead } from "./context-notes";
+import { SESSION_EXIT_CUSTOM_TYPE, TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
 import { forgetConvertMemo } from "./messages";
 import { getReadableCompactionEntry, isRolloverRequestEntry } from "./session-context";
 import {
@@ -40,6 +48,7 @@ import {
 	type FileEntry,
 	type SessionEntry,
 	TITLE_CHANGE_ENTRY_TYPE,
+	TODO_HUD_STATE_CUSTOM_TYPE,
 	todoSnapshotPhases,
 	USER_TODO_EDIT_CUSTOM_TYPE,
 } from "./session-entries";
@@ -69,8 +78,17 @@ const CACHE_ENTRIES = 8;
  * `lazyImageDataSync` when a context build selects it.
  */
 const CACHE_BYTES = 16 * 1024 * 1024;
-/** Records are written in batches of about this size. */
+/**
+ * Records are written to the store's file, or compressed into one block when
+ * the store keeps them in memory, in batches of at least this size.
+ */
 const WRITE_BATCH_BYTES = 1024 * 1024;
+/**
+ * zstd level of a block of records kept in memory. Measured on two long
+ * transcripts: 17.2 MiB of records took 3.9 MiB, 344.3 MiB took 65.7 MiB, and
+ * a read of one record (decompress its 1 MiB block, slice it) 1.6 to 2.0 ms.
+ */
+const BLOCK_ZSTD_LEVEL = 3;
 /**
  * Record bytes read back, or written by a load, between two full collections.
  * One synchronous loop over many cold entries (an extension reading every
@@ -97,15 +115,15 @@ function paceCollection(bytes: number): void {
  * Entry types that stay whole before the cut: extension and feature state
  * (every `custom` type but those {@link keptWholeByKind} names), and the
  * selections a resume restores (model of each role, thinking level, service
- * tier, mode, TTSR rules, labels, credential pins, `/clear` boundaries, usage,
- * titles). {@link entriesKeptWholeOnPath} adds entries by position.
+ * tier, TTSR rules, labels, credential pins, `/clear` boundaries, usage,
+ * titles). {@link entriesKeptWholeOnPath} adds entries by position, among
+ * them the newest mode change.
  */
 const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]>([
 	"custom",
 	"model_change",
 	"thinking_level_change",
 	"service_tier_change",
-	"mode_change",
 	"ttsr_injection",
 	"label",
 	"credential_pin",
@@ -115,9 +133,9 @@ const ENTRY_TYPES_KEPT_WHOLE: ReadonlySet<string> = new Set<SessionEntry["type"]
 ]);
 
 /**
- * The `custom` type that goes cold like a message, and wherever it lies: the
- * patch records that hold the new values of the entries they patch, which a
- * load applies to those entries; no turn reads the records themselves.
+ * The `custom` type of the patch records that hold the new values of the
+ * entries they patch, which a load applies to those entries; no turn reads
+ * the records themselves.
  */
 const PATCH_RECORD_CUSTOM_TYPE = "entry_patch";
 
@@ -142,8 +160,9 @@ function isCoreColdCustom(entry: SessionEntry): boolean {
 
 /** Whether `entry` stays whole wherever it lies, by its type ({@link ENTRY_TYPES_KEPT_WHOLE}). */
 export function keptWholeByKind(entry: SessionEntry): boolean {
-	if (!ENTRY_TYPES_KEPT_WHOLE.has(entry.type) || isCoreColdCustom(entry)) return false;
-	return entry.type !== "custom" || entry.customType !== PATCH_RECORD_CUSTOM_TYPE;
+	if (!ENTRY_TYPES_KEPT_WHOLE.has(entry.type) || isCoreColdCustom(entry) || isStoredPastCut(entry)) return false;
+	// The context reads only the notebook revisions it builds from, kept whole by position.
+	return entry.type !== "custom" || entry.customType !== CONTEXT_NOTES_ENTRY_TYPE;
 }
 
 /** Fields that always stay data: the tree structure every walk reads. */
@@ -212,21 +231,31 @@ const MESSAGE_IDENTITY_FIELDS: ReadonlySet<string> = new Set([
  * Entries of `path` kept whole before the cut although their type is not:
  * the newest `session_init` (the contract a revived subagent rebuilds from),
  * the newest canonical to-do snapshot, a `todo` result that records the list
- * or a user's edit of it (what the to-do list restores from), and the request
- * the context of an `experimental-context-rollover` compaction takes from
- * before its kept entries ({@link rolloverRequest}), for the compaction a
- * context build starts from with no model and the one it starts from for
- * `model`.
+ * or a user's edit of it (what the to-do list restores from), the newest to-do
+ * HUD choice and the newest mode change (what a resume restores; older ones
+ * are read by nothing), the notebook revisions every context build reads
+ * ({@link contextNotesEntriesRead}), and the request the context of an
+ * `experimental-context-rollover` compaction takes from before its kept
+ * entries ({@link rolloverRequest}), for the compaction a context build
+ * starts from with no model and the one it starts from for `model`.
  */
 export function entriesKeptWholeOnPath(path: readonly SessionEntry[], model: Model | undefined): Set<SessionEntry> {
-	const kept = new Set<SessionEntry>();
+	const kept = new Set<SessionEntry>(contextNotesEntriesRead(path));
 	let sessionInit = false;
 	let todo = false;
-	for (let index = path.length - 1; index >= 0 && !(sessionInit && todo); index--) {
+	let hudState = false;
+	let modeChange = false;
+	for (let index = path.length - 1; index >= 0 && !(sessionInit && todo && hudState && modeChange); index--) {
 		const entry = path[index]!;
 		if (entry.type === "session_init") {
 			if (!sessionInit) kept.add(entry);
 			sessionInit = true;
+		} else if (entry.type === "mode_change") {
+			if (!modeChange) kept.add(entry);
+			modeChange = true;
+		} else if (entry.type === "custom" && entry.customType === TODO_HUD_STATE_CUSTOM_TYPE) {
+			if (!hudState) kept.add(entry);
+			hudState = true;
 		} else if (!todo && todoSnapshotPhases(entry)) {
 			kept.add(entry);
 			todo = true;
@@ -368,11 +397,12 @@ export interface ColdBoundary {
 /**
  * Which of `entries` (file order) belong in the store while the leaf ends
  * `path`: every entry except those the context reads (the current path from
- * the cut on, but the patch records and the user's edits of the to-do list
- * but the newest snapshot, which no context or turn reads), those kept whole
- * by kind ({@link keptWholeByKind}) and those kept whole by position on the
- * path ({@link entriesKeptWholeOnPath}). An entry off the current path is
- * cold wherever it lies.
+ * the cut on, but the records no context or turn reads there:
+ * {@link isStoredPastCut}, and a compaction older than every compaction a
+ * build reads, as the stale entry a snapcompact frame rescue replaces), those
+ * kept whole by kind ({@link keptWholeByKind}) and those kept whole by
+ * position on the path ({@link entriesKeptWholeOnPath}). An entry off the
+ * current path is cold wherever it lies.
  */
 export function coldBoundary(
 	entries: readonly SessionEntry[],
@@ -381,9 +411,10 @@ export function coldBoundary(
 ): ColdBoundary {
 	const cut = coldCutPathIndex(path, model);
 	const whole = cut > 0 ? entriesKeptWholeOnPath(path, model) : new Set<SessionEntry>();
+	const firstReadCompaction = cut > 0 ? firstReadCompactionIndex(path, model) : 0;
 	for (let index = cut; index < path.length; index++) {
 		const entry = path[index]!;
-		if (cut > 0 && isStoredPastCut(entry)) continue;
+		if (cut > 0 && (isStoredPastCut(entry) || (entry.type === "compaction" && index < firstReadCompaction))) continue;
 		whole.add(entry);
 	}
 	const cold = new Uint8Array(entries.length);
@@ -394,11 +425,36 @@ export function coldBoundary(
 	return { cold };
 }
 
-/** Whether `entry` goes to the store from the cut on too: a patch record, or a user's edit of the to-do list. */
+/**
+ * Index in `path` of the oldest compaction a context build reads: the newest
+ * compaction, or the newest `model` can replay when that one is older; a build
+ * for `model` passes over those between them, reading their preserved data.
+ * Nothing reads a compaction before it but for its small values (the display
+ * transcript marks it superseded).
+ */
+function firstReadCompactionIndex(path: readonly SessionEntry[], model: Model | undefined): number {
+	const newest = getReadableCompactionEntry(path, undefined);
+	const readable = model ? getReadableCompactionEntry(path, model) : newest;
+	return Math.min(newest ? path.indexOf(newest) : 0, readable ? path.indexOf(readable) : 0);
+}
+
+/**
+ * Whether `entry` goes to the store from the cut on too, unless kept whole by
+ * position: a record no turn reads (a patch record, which a load applies; a
+ * `session_exit` record, of which a resume reads only the newest's kind and
+ * how many tool calls were pending, not their arguments), or one a newer
+ * entry of its kind supersedes (a user's edit of the to-do list, a to-do HUD
+ * choice, a mode change: only the newest on the path is read).
+ */
 function isStoredPastCut(entry: SessionEntry): boolean {
+	if (entry.type === "mode_change") return true;
+	if (entry.type !== "custom") return false;
+	const type = entry.customType;
 	return (
-		entry.type === "custom" &&
-		(entry.customType === PATCH_RECORD_CUSTOM_TYPE || entry.customType === USER_TODO_EDIT_CUSTOM_TYPE)
+		type === PATCH_RECORD_CUSTOM_TYPE ||
+		type === USER_TODO_EDIT_CUSTOM_TYPE ||
+		type === SESSION_EXIT_CUSTOM_TYPE ||
+		type === TODO_HUD_STATE_CUSTOM_TYPE
 	);
 }
 
@@ -627,7 +683,7 @@ function freezeAndMeasure(value: unknown): number {
 	return units;
 }
 
-/** What the finalizer needs to release a store; must not refer to the store. */
+/** What the finalizer needs to release a store's file; must not refer to the store. */
 interface StoreHandle {
 	fd: number;
 	/** Set on Windows, where an open file cannot be unlinked: deleted when the store goes. */
@@ -636,9 +692,19 @@ interface StoreHandle {
 	closed: boolean;
 }
 
+/** Records from store offset `start` to `end`, whole, kept compressed in memory. */
+interface CompressedBlock {
+	readonly start: number;
+	readonly end: number;
+	readonly data: Uint8Array;
+}
+
 const windowsStoreHandles = new Set<StoreHandle>();
 let windowsExitHookInstalled = false;
-/** Whether a store that could not be opened was reported; the cause is the host's, so once is enough. */
+/**
+ * Whether a store whose file could not be made was reported; the cause is the
+ * host's, so once per process is enough.
+ */
 let openFailureLogged = false;
 /** A store file's name: the pid of the process that made it, then a UUID. */
 const STORE_FILE_NAME = /^(\d+)-[0-9a-f-]+\.jsonl$/;
@@ -679,6 +745,39 @@ function assertPrivateDirectory(dir: string, uid: number): void {
 	}
 }
 
+/**
+ * Make a store's file under `os.tmpdir()/omp-cold-<uid>/`, a directory the
+ * account owns alone, and unlink it once open outside Windows. Throws when the
+ * file cannot be made (`os.tmpdir()` read-only, under a regular file, full,
+ * out of descriptors) or the directory is not the account's alone.
+ */
+function openStoreFile(): StoreHandle {
+	// One directory per account: `os.tmpdir()` is shared between accounts on
+	// Linux and the directory is 0700, so under one shared name the first
+	// account would own it and every other account's open would fail.
+	const uid = process.getuid?.();
+	const dir = path.join(os.tmpdir(), uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const windows = process.platform === "win32";
+	if (windows) sweepStaleStores(dir);
+	else if (uid !== undefined) assertPrivateDirectory(dir, uid);
+	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
+	const fd = fs.openSync(file, "wx+", 0o600);
+	const handle: StoreHandle = { fd, path: undefined, closed: false };
+	if (windows) {
+		handle.path = file;
+		trackWindowsStore(handle);
+		return handle;
+	}
+	try {
+		fs.unlinkSync(file);
+	} catch (error) {
+		fs.closeSync(fd);
+		throw error;
+	}
+	return handle;
+}
+
 function releaseStoreHandle(handle: StoreHandle): void {
 	if (handle.closed) return;
 	handle.closed = true;
@@ -715,29 +814,41 @@ interface CachedRecord {
 }
 
 /**
- * One loaded manager's records of cold entries: a file under
- * `os.tmpdir()/omp-cold-<uid>/`, a directory the account owns alone,
- * unlinked as soon as it is open on POSIX (its disk is freed when the
- * descriptor closes, and a killed process leaves nothing; on Windows it is
+ * One loaded manager's records of cold entries, with one of two backings.
+ * Normally a file under `os.tmpdir()/omp-cold-<uid>/`, a directory the account
+ * owns alone, unlinked as soon as it is open on POSIX (its disk is freed when
+ * the descriptor closes, and a killed process leaves nothing; on Windows it is
  * deleted when the store is closed or collected and at exit, and a later
  * process deletes a killed process's file at its first store open, unless
- * that pid is in use again). A record is the entry exactly as the manager
- * held it, with image data replaced by blob references. Every cold entry
- * refers to its store, so a clone sharing the entries keeps it open as long
- * as it needs it; the last manager holding it closes it when that manager
- * closes ({@link release}).
+ * that pid is in use again). Where that file cannot be made, and from a
+ * failed write to it on (a full disk), the records are kept in memory instead,
+ * zstd-compressed in blocks of whole records of at least
+ * {@link WRITE_BATCH_BYTES}; the records gathered for the next block stay as
+ * bytes, and the records the file already holds are read from it. A read of a
+ * record in a block decompresses that block and keeps nothing of it but the
+ * parsed record in the record cache. No other directory is used. A record is
+ * the entry exactly as the manager held it, with image data replaced by blob
+ * references. Every cold entry refers to its store, so a clone sharing the
+ * entries keeps it open as long as it needs it; the last manager holding it
+ * closes it when that manager closes ({@link release}).
  */
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;
-	readonly #handle: StoreHandle;
-	/** Bytes handed out to records, written or pending. */
+	/** The store's file; undefined for a store kept in memory from its start. */
+	readonly #handle: StoreHandle | undefined;
+	#closed = false;
+	/** Bytes handed out to records. */
 	#bytes = 0;
-	/** Bytes on disk; every later byte is in `#pending`. */
+	/** Bytes in the file; every later record is in a block or in `#pending`. */
 	#written = 0;
+	/** Whether new records go to compressed blocks: there is no file, or a write to it failed. */
+	#inMemory: boolean;
+	/** The records past the file kept compressed, in offset order. */
+	readonly #blocks: CompressedBlock[] = [];
+	#compressedBytes = 0;
+	/** The records after the file and the blocks, gathered for the next write or block, in offset order. */
 	#pending: Buffer[] = [];
 	#pendingBytes = 0;
-	/** Set when a write failed: the pending records stay in memory and the store takes no new one. */
-	#writeFailed = false;
 	/** Managers holding the store ({@link retain}). */
 	#holders = 0;
 	/** Whether an entry that stayed whole because its record could not be made was reported. */
@@ -755,62 +866,52 @@ export class ColdEntryStore {
 	#hydrations = 0;
 
 	/**
-	 * A new store, or undefined when its file cannot be made (`os.tmpdir()`
-	 * read-only, missing and impossible to create, out of descriptors) or its
-	 * directory is not one the account owns alone: the caller then keeps its
-	 * entries whole, as a session without a store does.
+	 * A new store: over a file, or in memory where its file cannot be made
+	 * (`os.tmpdir()` read-only, under a regular file, full, out of descriptors,
+	 * or its directory not one the account owns alone), which is logged once
+	 * per process with the reason.
 	 */
-	static open(blobs: BlobStore): ColdEntryStore | undefined {
+	static open(blobs: BlobStore): ColdEntryStore {
 		try {
-			return new ColdEntryStore(blobs);
+			return new ColdEntryStore(blobs, openStoreFile());
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;
-				logger.warn("Older session entries stay in memory: their store cannot be opened", {
-					error: error instanceof Error ? error.message : String(error),
-				});
+				logger.warn(
+					"Older session entries are kept compressed in memory: their store cannot be made under the temporary directory",
+					{ error: error instanceof Error ? error.message : String(error) },
+				);
 			}
-			return undefined;
+			return new ColdEntryStore(blobs, undefined);
 		}
 	}
 
-	/** Throws when the file cannot be made; {@link open} returns undefined instead. */
-	constructor(blobs: BlobStore) {
+	/** A store over the file `handle` holds, or in memory without one; see {@link open}. */
+	constructor(blobs: BlobStore, handle: StoreHandle | undefined) {
 		this.#blobs = blobs;
-		// One directory per account: `os.tmpdir()` is shared between accounts on
-		// Linux and the directory is 0700, so under one shared name the first
-		// account would own it and every other account's open would fail.
-		const uid = process.getuid?.();
-		const dir = path.join(os.tmpdir(), uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
-		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-		const windows = process.platform === "win32";
-		if (windows) sweepStaleStores(dir);
-		else if (uid !== undefined) assertPrivateDirectory(dir, uid);
-		const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
-		const fd = fs.openSync(file, "wx+", 0o600);
-		this.#handle = { fd, path: undefined, closed: false };
-		if (windows) {
-			this.#handle.path = file;
-			trackWindowsStore(this.#handle);
-		} else {
-			try {
-				fs.unlinkSync(file);
-			} catch (error) {
-				fs.closeSync(fd);
-				throw error;
-			}
-		}
-		storeRegistry.register(this, this.#handle, this);
+		this.#handle = handle;
+		this.#inMemory = handle === undefined;
+		if (handle) storeRegistry.register(this, handle, this);
 	}
 
-	/** Whether the store takes new records: it is open and no write to it failed. */
+	/** Whether the store takes new records: it is open. */
 	get writable(): boolean {
-		return !this.#writeFailed && !this.#handle.closed;
+		return !this.#closed;
 	}
 
 	/** Bytes of records written to the store. */
 	get bytes(): number {
 		return this.#bytes;
+	}
+
+	/** Whether new records are kept compressed in memory: the store has no file, or a write to it failed. */
+	get inMemory(): boolean {
+		return this.#inMemory;
+	}
+
+	/** Bytes of the compressed blocks the store keeps in memory. */
+	get compressedBytes(): number {
+		return this.#compressedBytes;
 	}
 
 	/** Records read and parsed to serve an accessor read (cache misses). */
@@ -891,15 +992,20 @@ export class ColdEntryStore {
 
 	/** Close the store now; a later read of one of its records throws. */
 	close(): void {
-		storeRegistry.unregister(this);
+		this.#closed = true;
 		this.#cache.clear();
 		this.#pending = [];
+		this.#pendingBytes = 0;
+		this.#blocks.length = 0;
+		this.#compressedBytes = 0;
+		if (!this.#handle) return;
+		storeRegistry.unregister(this);
 		releaseStoreHandle(this.#handle);
 	}
 
 	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. Only while {@link writable}. */
 	append(data: Buffer): ColdRecord {
-		if (!this.writable) throw new Error("A cold entry store that failed or closed cannot take a record.");
+		if (!this.writable) throw new Error("A cold entry store that closed cannot take a record.");
 		const record: ColdRecord = { store: this, offset: this.#bytes, length: data.length };
 		this.#pending.push(data);
 		this.#pendingBytes += data.length;
@@ -914,47 +1020,95 @@ export class ColdEntryStore {
 	}
 
 	/**
-	 * Write the pending records. A failed write keeps them in memory, joined in
-	 * one buffer, where reads still find them; the store then takes no new
-	 * record and tries no write again, so a full disk costs one attempt.
+	 * Write the gathered records to the file, or compress them into one block
+	 * when the store keeps its records in memory. A failed write (a full disk)
+	 * moves the store to blocks, the records that write held first, and tries
+	 * no write again, so a full disk costs one attempt; the file keeps serving
+	 * the records it holds.
 	 */
-	#flush(): boolean {
-		if (this.#pendingBytes === 0) return true;
-		if (this.#writeFailed) return false;
+	#flush(): void {
+		if (this.#pendingBytes === 0) return;
 		const data = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending, this.#pendingBytes);
-		this.#pending = [data];
-		try {
-			let done = 0;
-			while (done < data.length) {
-				done += fs.writeSync(this.#handle.fd, data, done, data.length - done, this.#written + done);
-			}
-		} catch (error) {
-			this.#writeFailed = true;
-			logger.warn("Older session entries stay in memory: writing their store failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return false;
-		}
-		this.#written += data.length;
 		this.#pending = [];
 		this.#pendingBytes = 0;
-		return true;
+		if (this.#handle && !this.#inMemory) {
+			try {
+				let done = 0;
+				while (done < data.length) {
+					done += fs.writeSync(this.#handle.fd, data, done, data.length - done, this.#written + done);
+				}
+				this.#written += data.length;
+				return;
+			} catch (error) {
+				this.#inMemory = true;
+				logger.warn("Older session entries are kept compressed in memory: writing their store failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		const start = this.#bytes - data.length;
+		const block: CompressedBlock = {
+			start,
+			end: this.#bytes,
+			data: Bun.zstdCompressSync(data, { level: BLOCK_ZSTD_LEVEL }),
+		};
+		this.#blocks.push(block);
+		this.#compressedBytes += block.data.byteLength;
 	}
 
 	#read(record: ColdRecord): Buffer {
-		if (this.#handle.closed) throw new Error("An older session entry was read after its session closed.");
-		if (record.offset >= this.#written && !this.#flush()) {
-			const start = record.offset - this.#written;
-			return this.#pending[0]!.subarray(start, start + record.length);
+		if (this.#closed) throw new Error("An older session entry was read after its session closed.");
+		const pendingStart = this.#bytes - this.#pendingBytes;
+		if (record.offset >= pendingStart) {
+			// A file store writes the batch the record is in, and reads it back
+			// from where that left it; a store in memory reads the gathered bytes.
+			if (!this.#inMemory) this.#flush();
+			else return this.#readPending(record, pendingStart);
 		}
+		if (record.offset < this.#written) return this.#readFile(record);
+		return this.#readBlock(record);
+	}
+
+	/** `record` among the gathered records, which start at store offset `start`. */
+	#readPending(record: ColdRecord, start: number): Buffer {
+		let offset = start;
+		for (const data of this.#pending) {
+			if (offset === record.offset && data.length === record.length) return data;
+			offset += data.length;
+		}
+		throw new Error("A cold session entry's record is missing from its store.");
+	}
+
+	#readFile(record: ColdRecord): Buffer {
+		const fd = this.#handle?.fd;
+		if (fd === undefined) throw new Error("A cold session entry's record is missing from its store.");
 		const data = Buffer.allocUnsafe(record.length);
 		let done = 0;
 		while (done < record.length) {
-			const read = fs.readSync(this.#handle.fd, data, done, record.length - done, record.offset + done);
+			const read = fs.readSync(fd, data, done, record.length - done, record.offset + done);
 			if (read === 0) throw new Error("A cold session entry's record is truncated.");
 			done += read;
 		}
 		return data;
+	}
+
+	/** `record` from the block that holds it, decompressed for this read only. */
+	#readBlock(record: ColdRecord): Buffer {
+		const blocks = this.#blocks;
+		let low = 0;
+		let high = blocks.length - 1;
+		while (low <= high) {
+			const middle = (low + high) >>> 1;
+			const block = blocks[middle]!;
+			if (record.offset < block.start) high = middle - 1;
+			else if (record.offset >= block.end) low = middle + 1;
+			else {
+				const data = Bun.zstdDecompressSync(block.data);
+				const at = record.offset - block.start;
+				return Buffer.from(data.buffer, data.byteOffset + at, record.length);
+			}
+		}
+		throw new Error("A cold session entry's record is missing from its store.");
 	}
 }
 
@@ -987,6 +1141,8 @@ export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boole
 	delete slots[COLD_STORE];
 	delete slots[COLD_OFFSET];
 	delete slots[COLD_LENGTH];
+	const markSlots: ColdCustomMessageSlots = entry;
+	delete markSlots[COLD_ROLLOVER_REQUEST];
 	setHiddenSlot(entry, COLD_FORMER, record);
 	record.store.noteHydration();
 	return true;
@@ -1092,6 +1248,8 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 		if (!Object.hasOwn(copy, key)) setOwnField(copy, key, overrides?.[key]);
 	}
 	setRecordSlots(copy, record);
+	const mark = coldRolloverRequestMark(entry);
+	if (mark !== undefined) setHiddenSlot(copy, COLD_ROLLOVER_REQUEST, mark);
 	return copy as unknown as SessionEntry;
 }
 
@@ -1109,14 +1267,13 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * from a load, which converts a whole transcript in one burst: the record's
  * bytes count toward the next full collection
  * ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns false,
- * changing nothing, when every value stays, `entry` is cold already, there
- * is no store that takes records (`openStore` returns undefined, or a write
- * to the store failed), or the record cannot be made (an image the blob
- * store cannot take; reported once per store): the entry then stays whole.
+ * changing nothing, when every value stays, `entry` is cold already, the
+ * store is closed, or the record cannot be made (an image the blob store
+ * cannot take; reported once per store): the entry then stays whole.
  */
 export function convertToColdEntry(
 	entry: SessionEntry,
-	openStore: () => ColdEntryStore | undefined,
+	openStore: () => ColdEntryStore,
 	options?: { imagesExternalized?: boolean; paced?: boolean },
 ): boolean {
 	if (isColdEntry(entry) || !Object.isExtensible(entry)) return false;
@@ -1137,7 +1294,7 @@ export function convertToColdEntry(
 	if (entryKeys.length === 0 && messageKeys.length === 0) return false;
 
 	const store = openStore();
-	if (!store?.writable) return false;
+	if (!store.writable) return false;
 	let text: string;
 	try {
 		text = options?.imagesExternalized ? (stringifyJson(entry) ?? "null") : entryRecordText(entry, store.blobs);
@@ -1150,6 +1307,8 @@ export function convertToColdEntry(
 	const former = slots[COLD_FORMER];
 	const record = former && store.holds(former, data) ? former : store.append(data);
 	delete slots[COLD_FORMER];
+	// Decided while every value is still in memory; see COLD_ROLLOVER_REQUEST.
+	if (entry.type === "custom_message") setHiddenSlot(entry, COLD_ROLLOVER_REQUEST, isRolloverRequestEntry(entry));
 	setRecordSlots(entry, record);
 	for (const key of entryKeys) Object.defineProperty(entry, key, entryFieldAccessor(key));
 	if (shell && messageKeys.length > 0) {
@@ -1180,7 +1339,7 @@ export function hydrateKeptEntries(
 export function convertColdEntries(
 	entries: readonly SessionEntry[],
 	boundary: ColdBoundary,
-	openStore: () => ColdEntryStore | undefined,
+	openStore: () => ColdEntryStore,
 	options?: { paced?: boolean },
 ): void {
 	for (let index = 0; index < entries.length; index++) {

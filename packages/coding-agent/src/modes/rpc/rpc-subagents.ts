@@ -337,7 +337,8 @@ export interface RpcOwnedSubagent {
  * async jobs (an eval `agent()` handle) is idle there while `get_subagents`
  * still lists it running. The executor stamps `lifecycle.endedAt` once a run's
  * drive ends (a first run, a follow-up turn or an IRC wake turn), whatever the
- * outcome, a thrown drive included, and acceptance also stamps
+ * outcome, a thrown drive included, and once a first run fails in its setup
+ * before its drive; acceptance also stamps
  * `lifecycle.acceptedAt`; both happen before the cleanup and the terminal
  * lifecycle frame that prunes the roster, so an accepted idle ref, and one
  * whose run failed or stopped and is only being cleaned up, stay out of reach.

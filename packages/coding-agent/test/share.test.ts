@@ -929,4 +929,82 @@ describe("buildShareSnapshot over cold entries", () => {
 			await whole.close();
 		}
 	});
+
+	// Regression: a share with secrets masked reads back from the cold store, and resolves, the record of
+	// every older compaction, branch summary and custom message whose kept text is short, only to drop
+	// its details or preserved data, which costs a read and parse per entry on each share.
+	test("drops the details of cold summaries and custom messages without reading their records", async () => {
+		using dir = TempDir.createSync("@omp-share-cold-");
+		const secret = "hunter2-XYZZY";
+		const timestamp = "2026-06-12T00:00:00.000Z";
+		const dropped = { notes: [`${secret} ${"x".repeat(2048)}`] };
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "cold",
+			timestamp,
+			cwd: dir.path(),
+		};
+		// Only the three kinds lie before the cut: a cold message's content is read back whatever its size.
+		const entries = [
+			{
+				type: "custom_message",
+				id: "m0",
+				parentId: null,
+				timestamp,
+				customType: "note",
+				content: "short",
+				display: true,
+				details: dropped,
+			},
+			{
+				type: "branch_summary",
+				id: "b0",
+				parentId: "m0",
+				timestamp,
+				fromId: "m0",
+				summary: "left",
+				details: dropped,
+			},
+			{
+				type: "compaction",
+				id: "c0",
+				parentId: "b0",
+				timestamp,
+				summary: "done",
+				firstKeptEntryId: "b0",
+				tokensBefore: 10,
+				details: dropped,
+				preserveData: dropped,
+			},
+			messageEntry("u1", "c0", "the token is in the details"),
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "u1",
+				timestamp,
+				summary: "done",
+				firstKeptEntryId: "u1",
+				tokensBefore: 10,
+			},
+		];
+		const file = path.join(dir.path(), "session.jsonl");
+		await Bun.write(file, [header, ...entries].map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const cold = await openSession(file, true);
+		const whole = await openSession(file, false);
+		try {
+			expect(["c0", "b0", "m0"].map(id => isColdEntry(cold.getEntry(id)!))).toEqual([true, true, true]);
+			const readsBefore = cold.coldStoreStats().materializations;
+
+			const snapshot = buildShareSnapshot(cold, { obfuscator });
+
+			expect(cold.coldStoreStats().materializations).toBe(readsBefore);
+			expect(JSON.stringify(snapshot)).toBe(JSON.stringify(buildShareSnapshot(whole, { obfuscator })));
+			expect(JSON.stringify(snapshot)).not.toContain(secret);
+		} finally {
+			await cold.close();
+			await whole.close();
+		}
+	});
 });

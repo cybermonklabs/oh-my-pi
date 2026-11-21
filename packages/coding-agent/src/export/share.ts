@@ -306,25 +306,23 @@ function redactShareEntry(
 		case "message":
 			return { ...entry, message: redactShareMessage(o, entry.message, sharedRegexSecretValues) };
 		case "compaction":
-			return {
-				...entry,
+			return withFields(entry, {
 				summary: o.obfuscate(entry.summary, sharedRegexSecretValues),
 				shortSummary:
 					entry.shortSummary === undefined ? undefined : o.obfuscate(entry.shortSummary, sharedRegexSecretValues),
 				details: undefined,
 				preserveData: undefined,
-			};
+			});
 		case "branch_summary":
-			return { ...entry, summary: o.obfuscate(entry.summary, sharedRegexSecretValues), details: undefined };
+			return withFields(entry, { summary: o.obfuscate(entry.summary, sharedRegexSecretValues), details: undefined });
 		case "custom_message":
-			return {
-				...entry,
+			return withFields(entry, {
 				content: redactShareContent(o, entry.content, sharedRegexSecretValues),
 				details: undefined,
-			};
+			});
 		case "custom":
 		case "mode_change":
-			return withoutData(entry);
+			return withFields(entry, { data: undefined });
 		case "session_init":
 			return {
 				...entry,
@@ -358,19 +356,21 @@ function redactShareEntry(
 }
 
 /**
- * `entry` with its opaque `data` dropped, the fields and their order those of
- * `{ ...entry, data: undefined }`, built without reading `data`: on a cold
- * entry that read parses the entry's record from the cold store, only for the
- * share to throw it away.
+ * `entry` with `fields` set, the fields and their order those of
+ * `{ ...entry, ...fields }`, built without reading the values `fields`
+ * replaces: on a cold entry that read parses the entry's record from the cold
+ * store, only for the share to throw the value away.
  */
-function withoutData<T extends SessionEntry>(entry: T): T {
-	const fields: [string, unknown][] = Object.keys(entry).map(key => [
+function withFields<T extends SessionEntry>(entry: T, fields: Readonly<Partial<Record<keyof T, unknown>>>): T {
+	const result: [string, unknown][] = Object.keys(entry).map(key => [
 		key,
-		key === "data" ? undefined : Reflect.get(entry, key),
+		Object.hasOwn(fields, key) ? Reflect.get(fields, key) : Reflect.get(entry, key),
 	]);
-	fields.push(["data", undefined]);
-	// `entry`'s own fields with `data` cleared, which is what `T` allows of it.
-	return Object.fromEntries(fields) as unknown as T;
+	for (const key of Object.keys(fields)) {
+		if (!Object.hasOwn(entry, key)) result.push([key, Reflect.get(fields, key)]);
+	}
+	// `entry`'s own fields with those of `fields` set, which is what `T` allows of it.
+	return Object.fromEntries(result) as unknown as T;
 }
 
 function redactShareContent(

@@ -5,7 +5,7 @@
  * no cut, and the request an `experimental-context-rollover` compaction's
  * context recovers from before its kept entries stays whole.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
@@ -14,7 +14,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { ColdEntryStore, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { isColdMessage } from "@oh-my-pi/pi-coding-agent/session/cold-message";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -142,6 +142,7 @@ describe("what the cut leaves whole", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	});
 
@@ -262,6 +263,44 @@ describe("what the cut leaves whole", () => {
 		expect(coldMessages(manager.buildSessionContext({ model: gpt }).messages)).toEqual([]);
 	});
 
+	// A /resume or /move that fails and rolls back keeps the agent's context; its next rebuild or
+	// prune pass must not leave that context's older messages to be read back on every request.
+	it("keeps whole the entries a model's context holds after a rollback restores the session's state", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const manager = await open(await writeSession(dir.path(), remoteCompactedSession()));
+		cleanups.push(() => manager.close());
+		// Claude cannot replay GPT's remote compaction `c2`: its context starts at `c1`'s kept `u1`.
+		const behindRemote = ["u1", "c1", "a1", "u2"];
+		expect(coldMessages(manager.buildSessionContext({ model: claude }).messages)).toEqual([]);
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+
+		manager.restoreState(manager.captureState());
+		manager.buildSessionContext();
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+		manager.recoolEntries();
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+	});
+
+	// After a switch to another provider whose first rebuild hit a transient read failure, every
+	// later request would read the older messages of the new model's context back from the store.
+	it("makes the new model's entries whole at the next build after a build that failed to read one", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const manager = await open(await writeSession(dir.path(), remoteCompactedSession()));
+		cleanups.push(() => manager.close());
+		manager.buildSessionContext({ model: gpt });
+		const behindRemote = ["u1", "c1", "a1", "u2"];
+		expect(behindRemote.filter(id => !isColdEntry(entryOf(manager, id)))).toEqual([]);
+
+		vi.spyOn(ColdEntryStore.prototype, "parse").mockImplementationOnce(() => {
+			throw new Error("EIO: i/o error, read");
+		});
+		expect(() => manager.buildSessionContext({ model: claude })).toThrow("EIO");
+		vi.restoreAllMocks();
+
+		expect(coldMessages(manager.buildSessionContext({ model: claude }).messages)).toEqual([]);
+		expect(behindRemote.filter(id => isColdEntry(entryOf(manager, id)))).toEqual([]);
+	});
+
 	// A notes-backed rollover re-reads that request on every turn while it is cold.
 	it("keeps whole the request a context-rollover compaction recovers from before its kept entries, live and after a resume", async () => {
 		using dir = TempDir.createSync("@omp-cold-boundary-");
@@ -289,5 +328,54 @@ describe("what the cut leaves whole", () => {
 		expect(context.map(found => found.role)).toEqual([...expectedRoles]);
 		expect(coldMessages(context)).toEqual([]);
 		expect(isColdEntry(entryOf(resumed, "a0"))).toBe(true);
+	});
+
+	// The walk that finds a rollover's request passes over the turn's async-result deliveries and peer
+	// IRC messages; reading their records back on every context build costs a parse each per turn.
+	it("finds a context-rollover compaction's request past cold custom messages without reading them", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const customMessage = (id: string, parentId: string | null, customType: string, details: object) => ({
+			type: "custom_message",
+			id,
+			parentId,
+			timestamp: TIMESTAMP,
+			customType,
+			content: `${id} ${BODY}`,
+			display: true,
+			details,
+			attribution: "agent",
+		});
+		// The parent's IRC message is the request; ten deliveries and peer messages follow it, more than the
+		// record cache keeps.
+		const entries: object[] = [
+			customMessage("p0", null, "irc:incoming", { from: "0-Main", message: `p0 ${BODY}`, fromParent: true }),
+		];
+		let parentId = "p0";
+		for (let index = 0; index < 10; index++) {
+			const id = `x${index}`;
+			entries.push(
+				index % 2 === 0
+					? customMessage(id, parentId, "async-result", { job: id, output: `${id} ${BODY}` })
+					: customMessage(id, parentId, "irc:incoming", { from: "0-Peer", message: `${id} ${BODY}` }),
+			);
+			parentId = id;
+		}
+		entries.push(
+			message("k0", parentId, assistant(`k0 ${BODY}`)),
+			compaction("c1", "k0", "k0", { details: { kind: "experimental-context-rollover" } }),
+			message("a1", "c1", assistant(`a1 ${BODY}`)),
+		);
+		const manager = await open(await writeSession(dir.path(), entries));
+		cleanups.push(() => manager.close());
+		expect(isColdEntry(entryOf(manager, "x0"))).toBe(true);
+		expect(isColdEntry(entryOf(manager, "x1"))).toBe(true);
+		const readsBefore = manager.coldStoreStats().materializations;
+
+		for (let build = 0; build < 3; build++) {
+			const context = manager.buildSessionContext().messages;
+			expect(context.map(found => found.role)).toEqual(["compactionSummary", "custom", "assistant", "assistant"]);
+			expect(JSON.stringify(context[1])).toContain("p0 ");
+		}
+		expect(manager.coldStoreStats().materializations).toBe(readsBefore);
 	});
 });
