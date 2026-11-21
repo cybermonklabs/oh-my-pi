@@ -316,6 +316,14 @@ describe("builtin grep: a word assertion beside a byte that is not UTF-8, in the
 		[String.raw`printf 'a\377 _0123456789\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
 		[String.raw`printf 'a\377 _0123456789\n' | LC_ALL=C.UTF-8 grep -c 'a\>\|\(x\)\1'`, "0\n", 1],
 		[String.raw`printf 'a\377 _0123456789ZQXJ\n' | LC_ALL=C.UTF-8 grep -ic 'A\>'`, "0\n", 1],
+		// Regressed: with a back-reference, `\B` did not hold at the end after such a byte.
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c '\B$\|\(x\)\1'`, "1\n", 0],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c '\(x\)\1\|\B'`, "1\n", 0],
+		[String.raw`printf '\200\n' | LC_ALL=C.UTF-8 grep -c '\(x\)\1\|\B$'`, "1\n", 0],
+		[String.raw`printf 'a\200\0' | LC_ALL=C.UTF-8 grep -zc '\B$\|\(x\)\1'`, "1\n", 0],
+		// Regressed: a literal `ı` matched the byte without case, as `i`.
+		[String.raw`printf 'zqxjvbpygfwmucldrhn \377\n' | LC_ALL=C.UTF-8 grep -ic $'\\<\304\261'`, "0\n", 1],
+		[String.raw`printf 'zqxjvbpygfwmucldrhn \377\n' | LC_ALL=C.UTF-8 grep -ic $'\304\261\\|\\<q'`, "0\n", 1],
 		// Already GNU's answer, kept: a byte whose character is no letter, `.`, `\B` beside a
 		// word character, and `K` (U+212A), which is `k` without case.
 		[String.raw`printf 'ab\200\n' | LC_ALL=C.UTF-8 grep -c 'b\>\|\(x\)\1'`, "1\n", 0],
@@ -325,12 +333,39 @@ describe("builtin grep: a word assertion beside a byte that is not UTF-8, in the
 		[String.raw`printf '\200\n' | LC_ALL=C.UTF-8 grep -c '\<'`, "0\n", 1],
 		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c 'a\B'`, "0\n", 1],
 		[String.raw`printf '\200a\n' | LC_ALL=C.UTF-8 grep -c '\Ba'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c 'a$\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\200b\n' | LC_ALL=C.UTF-8 grep -c 'a.b\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\200b\n' | LC_ALL=C.UTF-8 grep -c 'a\Wb\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a \200\n' | LC_ALL=C.UTF-8 grep -c 'a\s*$\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\200b\0' | LC_ALL=C.UTF-8 grep -zc 'a.b\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'zqxjvbpygfwmucldrhno \377 I\n' | LC_ALL=C.UTF-8 grep -aio $'\\<\304\261'`, "I\n", 0],
 		[String.raw`printf 'a\377 k\342\204\252\n' | LC_ALL=C.UTF-8 grep -ic 'a\>\|\(x\)\1'`, "0\n", 1],
 		[
 			String.raw`printf 'a\377 z_0123456789 \342\204\252\n' | LC_ALL=C.UTF-8 grep -io '\(\w\)\1\|\<.'`,
 			"a\nz\n\xe2\x84\xaa\n",
 			0,
 		],
+	]);
+});
+
+describe("builtin grep: -x with a word assertion beside a byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 matches such a byte with nothing but a pattern byte, so
+	// no such pattern matches a line holding one whole.
+	cases([
+		// Regressed: a piece of the line between such bytes was matched whole.
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cx 'a\>'`, "0\n", 1],
+		[String.raw`printf '\200a\n' | LC_ALL=C.UTF-8 grep -cx '\<a'`, "0\n", 1],
+		[String.raw`printf 'a\200b\n' | LC_ALL=C.UTF-8 grep -cx 'a\>\|b'`, "0\n", 1],
+		[String.raw`printf 'x\200foo\n' | LC_ALL=C.UTF-8 grep -cx '\<foo\>'`, "0\n", 1],
+		[String.raw`printf 'ab\200cd\n' | LC_ALL=C.UTF-8 grep -cx 'cd\>'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cx 'a\b.*'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cxw 'a\>'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cxE 'a\>.*|b'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -vcx 'a\>'`, "1\n", 0],
+		// Already GNU's answer, kept.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cx 'a\>.*'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cx 'a\>\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -cx '.*'`, "0\n", 1],
 	]);
 });
 
@@ -348,6 +383,8 @@ describe("builtin grep: -w with a word assertion beside a byte that is not UTF-8
 		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cw 'a\>\|\(x\)\1'`, "0\n", 1],
 		[String.raw`printf '\377b c\n' | LC_ALL=C.UTF-8 grep -cw '\<b\|\(x\)\1'`, "0\n", 1],
 		[String.raw`printf 'a\377b c\n' | LC_ALL=C.UTF-8 grep -ow 'a\B'`, "a\n", 0],
+		// Regressed: a shorter alternative was printed, not the longest whose edges hold.
+		[String.raw`printf '\200a b cd\n' | LC_ALL=C.UTF-8 grep -aow '\<a\|a b\|a b c'`, "a b\n", 0],
 		// Already GNU's answer, kept: `-w`'s edges beside the byte, and the longest match at a
 		// start whose edges hold.
 		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cw a`, "1\n", 0],
@@ -359,6 +396,9 @@ describe("builtin grep: -w with a word assertion beside a byte that is not UTF-8
 		[String.raw`printf '\377ab c9\n' | LC_ALL=C.UTF-8 grep -ow 'a[a-z ]*\|\<q'`, "ab\n", 0],
 		[String.raw`printf '\377ab c\n' | LC_ALL=C.UTF-8 grep -ow 'a\|ab\>'`, "ab\n", 0],
 		[String.raw`printf 'ab\377 ab x\n' | LC_ALL=C.UTF-8 grep -ow '\<a\|\<ab'`, "ab\nab\n", 0],
+		[String.raw`printf '\377a b cd\n' | LC_ALL=C.UTF-8 grep -aow 'a\>\|a b\|a b c'`, "a b\n", 0],
+		[String.raw`printf '\200a b cd x\n' | LC_ALL=C.UTF-8 grep -aow '\<a b c\|\<a'`, "a\n", 0],
+		[String.raw`printf 'a b cd\n' | LC_ALL=C.UTF-8 grep -ow '\<a\|a b\|a b c'`, "a b\n", 0],
 	]);
 });
 
