@@ -1495,7 +1495,14 @@ pub(crate) fn alone(name: &str) -> bool {
 	if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
 		return false;
 	}
-	let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+	// Without `/proc` (a root where none is mounted) `current_exe` cannot
+	// read `/proc/self/exe`; the path this process was started by names the
+	// binary then.
+	let exe = std::env::current_exe()
+		.ok()
+		.or_else(|| std::env::args_os().next().map(PathBuf::from))
+		.expect("the test binary");
+	let output = std::process::Command::new(exe)
 		.args(["--exact", name, "--nocapture", "--test-threads=1"])
 		.env(ALONE, name)
 		.output()

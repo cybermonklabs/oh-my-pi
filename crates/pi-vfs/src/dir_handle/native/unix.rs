@@ -549,8 +549,8 @@ fn set_made_dir_mode(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> i
 	{
 		let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 		let fd = openat_mode(dir.as_raw_fd(), name, flags, 0)?;
-		let by_fd =
-			CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| nul_in_path())?;
+		let by_fd = CString::new(format!("{}/self/fd/{}", proc_root(), fd.as_raw_fd()))
+			.map_err(|_| nul_in_path())?;
 		// SAFETY: `by_fd` is NUL-terminated.
 		match retry(|| unsafe { libc::chmod(by_fd.as_ptr(), mode) }) {
 			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
@@ -560,6 +560,24 @@ fn set_made_dir_mode(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> i
 	let fd = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)?;
 	// SAFETY: `fd` is an open descriptor.
 	retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
+}
+
+/// Where [`set_made_dir_mode`] finds `/proc`.
+#[cfg(all(target_os = "linux", not(test)))]
+const fn proc_root() -> &'static str {
+	"/proc"
+}
+
+/// Where [`set_made_dir_mode`] finds `/proc`; with
+/// [`seams::set_mode_without_proc`] on, a path that is not there, as when no
+/// `/proc` is mounted.
+#[cfg(all(target_os = "linux", test))]
+fn proc_root() -> &'static str {
+	if seams::mode_without_proc() {
+		"/nonexistent-proc"
+	} else {
+		"/proc"
+	}
 }
 
 /// `unlinkat` of `name` in `dir`: an empty directory with `dir_entry`, else
@@ -737,7 +755,7 @@ pub(crate) fn chown_at(
 #[cfg(test)]
 pub(crate) use seams::after_create_dir;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use seams::emulate_old_glibc;
+pub(crate) use seams::{emulate_old_glibc, set_mode_without_proc};
 
 /// Whether this process may open `name` in `dir` with `mode` (`R_OK`,
 /// `W_OK`), by its effective IDs.
@@ -765,7 +783,8 @@ pub(crate) fn touch_fifo_at(dir: &Handle, name: &[u8], write: bool) -> io::Resul
 }
 
 /// Test seams: a hook between a call's steps, so a test can swap an entry
-/// exactly there, and an emulated glibc.
+/// exactly there, an emulated glibc, and a switch that makes the masked
+/// mode be set as without `/proc`.
 #[cfg(test)]
 mod seams {
 	use parking_lot::Mutex;
@@ -792,6 +811,24 @@ mod seams {
 		if let Some(hook) = hook {
 			hook();
 		}
+	}
+
+	#[cfg(target_os = "linux")]
+	static MODE_WITHOUT_PROC: std::sync::atomic::AtomicBool =
+		std::sync::atomic::AtomicBool::new(false);
+
+	/// Makes masked `create_dir_at` calls in this process from now on set
+	/// the mode as without `/proc` (`on`): the `chmod` of
+	/// `/proc/self/fd/N` names a path that is not there, as when no `/proc`
+	/// is mounted.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn set_mode_without_proc(on: bool) {
+		MODE_WITHOUT_PROC.store(on, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	#[cfg(target_os = "linux")]
+	pub(super) fn mode_without_proc() -> bool {
+		MODE_WITHOUT_PROC.load(std::sync::atomic::Ordering::SeqCst)
 	}
 
 	#[cfg(target_os = "linux")]

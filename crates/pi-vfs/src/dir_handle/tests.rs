@@ -870,6 +870,33 @@ mod unix {
 	/// The process umask the creation test sets in its own process.
 	const UMASK: libc::mode_t = 0o022;
 
+	/// The ways a masked `create_dir_at` sets the mode again, each as `(id,
+	/// label)`: on Linux through `/proc` and, by the test switch, as without
+	/// it; elsewhere through a descriptor of the directory.
+	fn mode_routes() -> &'static [(&'static str, &'static str)] {
+		if cfg!(target_os = "linux") {
+			&[("proc", "through /proc"), ("no-proc", "as without /proc")]
+		} else {
+			&[("fd", "through a descriptor")]
+		}
+	}
+
+	/// Makes this process's masked `create_dir_at` calls take the way `id`
+	/// of [`mode_routes`].
+	fn use_mode_route(id: &str) {
+		#[cfg(target_os = "linux")]
+		super::super::native::set_mode_without_proc(id == "no-proc");
+		#[cfg(not(target_os = "linux"))]
+		let _ = id;
+	}
+
+	/// Whether `/proc/self/fd` is there, so that a masked mode can be set
+	/// through it; in a run without `/proc` every way of [`mode_routes`] goes
+	/// without it.
+	fn proc_fd_is_there() -> bool {
+		cfg!(target_os = "linux") && Path::new("/proc/self/fd").is_dir()
+	}
+
 	/// Creations get the mode asked less the process umask, and under a
 	/// facade's creation mask exactly the mode less the mask: the kernel
 	/// still applies the umask when it creates the entry, so the mode is set
@@ -957,12 +984,69 @@ mod unix {
 		}
 	}
 
+	/// A masked `create_dir_at` whose mode has no owner read (0o333 under a
+	/// mask of 0, which the umask makes 0o311 at the create) gives that mode
+	/// by every way it sets it again ([`mode_routes`]). Without `/proc` the
+	/// mode is set through a descriptor opened to read the directory, so the
+	/// directory must be made with the owner's bits for that open. In a run
+	/// without `/proc` mounted every way is that one. As root that open needs
+	/// no owner bits, so this cannot fail there. In a process of its own,
+	/// whose umask and way of setting the mode this test sets.
+	#[test]
+	fn a_masked_create_dir_at_gives_a_mode_without_owner_read_with_or_without_proc() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_masked_create_dir_at_gives_a_mode_without_owner_read_with_or_without_proc",
+		) {
+			return;
+		}
+		// SAFETY: `umask` has no preconditions; nothing else runs in this
+		// process.
+		unsafe { libc::umask(UMASK) };
+		let tree = Tree::new("mode-333");
+		let rt = runtime();
+		let unmasked = Fs::native().with_creation_mask(Some(0));
+		let root = unmasked.blocking().open_dir(tree.at(""), true).unwrap();
+		let mut made = Vec::new();
+		for &(id, label) in mode_routes() {
+			use_mode_route(id);
+			let (sync, in_async) = (format!("made-{id}"), format!("made-{id}-async"));
+			made.push((format!("{label}, sync"), root.create_dir_at(n(&sync), Some(0o333)), sync));
+			let result = rt.block_on(root.create_dir_at_async(n(&in_async), Some(0o333)));
+			made.push((format!("{label}, async"), result, in_async));
+		}
+		let mut wrong = Vec::new();
+		for (case, result, rel) in &made {
+			let got = std::fs::symlink_metadata(tree.at(rel)).map(|meta| meta.mode() & 0o777);
+			if !matches!((result, &got), (Ok(()), Ok(0o333))) {
+				let shown = got
+					.as_ref()
+					.map_or_else(|err| format!("unknown ({err})"), |mode| format!("{mode:o}"));
+				wrong.push(format!("{case}: {result:?}, mode {shown}"));
+			}
+			// The tree's removal lists it, which needs the owner's read bit.
+			if got.is_ok() {
+				std::fs::set_permissions(tree.at(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+			}
+		}
+		if !proc_fd_is_there() {
+			eprintln!("note: /proc/self/fd is not there, so every way went without /proc");
+		}
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!(
+				"note: as root the read-only open needs no owner bits, so this cannot fail here"
+			);
+		}
+		assert!(wrong.is_empty(), "a masked create_dir_at of 0o333 under a mask of 0: {wrong:?}");
+	}
+
 	/// Under a process umask that clears the owner's read bit (0400), a
 	/// masked `create_dir_at` never reports success with a mode other than
-	/// the one asked less the mask. On Linux it gives that mode: it is set
-	/// again on the directory made without opening it to read. Elsewhere it
-	/// may fail instead. Root can open any directory, so as root the old way
-	/// passes too. In a process of its own, whose umask this test sets.
+	/// the one asked less the mask. On Linux with `/proc` it gives that mode:
+	/// it is set again on the directory made without opening it to read.
+	/// Elsewhere, and without `/proc`, it may fail instead. Root can open any
+	/// directory, so as root the old way passes too. In a process of its own,
+	/// whose umask this test sets.
 	#[test]
 	fn a_masked_create_dir_at_gives_the_mode_under_a_umask_without_owner_read() {
 		if crate::dir_handle::alone(
@@ -988,11 +1072,11 @@ mod unix {
 		for (rel, _) in &modes {
 			std::fs::set_permissions(tree.at(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
 		}
-		let linux = cfg!(target_os = "linux");
+		let through_proc = proc_fd_is_there();
 		for ((rel, result), (_, got)) in results.iter().zip(modes) {
 			match result {
 				Ok(()) => assert_eq!(got, 0o755, "{rel}: reported made, with mode {got:o}"),
-				Err(err) if linux => panic!("{rel}: {err:?} (mode {got:o})"),
+				Err(err) if through_proc => panic!("{rel}: {err:?} (mode {got:o})"),
 				Err(_) => {},
 			}
 		}
@@ -1006,49 +1090,173 @@ mod unix {
 
 	/// A masked `create_dir_at` sets the mode on the directory it made, never
 	/// on what was swapped in for it between `mkdirat` and the mode: a
-	/// symlink to a file, a regular file renamed there, or a hard link to a
-	/// file. Each such file keeps its mode (0600), and the call returns the
-	/// error of the open that found something else at the name.
+	/// symlink to a file, a regular file renamed there, a hard link to a
+	/// file, or a symlink to a directory (which gVisor's plain `O_RDONLY |
+	/// O_DIRECTORY | O_NOFOLLOW` open follows). Each keeps its mode (a file
+	/// 0600, the directory 0700), and the call returns the error of the open
+	/// that found something else at the name. By every way the mode is set
+	/// again ([`mode_routes`]). In a process of its own, whose way of setting
+	/// the mode this test sets.
 	#[test]
 	fn a_masked_create_dir_at_sets_no_mode_on_what_was_swapped_in() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_masked_create_dir_at_sets_no_mode_on_what_was_swapped_in",
+		) {
+			return;
+		}
 		let tree = Tree::new("mkdir-swap");
 		let masked = Fs::native().with_creation_mask(Some(0o022)).blocking();
 		let root = masked.open_dir(tree.at(""), true).unwrap();
 		let mode = |rel: &str| std::fs::metadata(tree.at(rel)).unwrap().mode() & 0o777;
 		let (mut changed, mut reported) = (Vec::new(), Vec::new());
-		for swap in ["symlink", "file", "hardlink"] {
-			let (name, victim) = (format!("raced-{swap}"), format!("victim-{swap}"));
-			std::fs::write(tree.at(&victim), "key").unwrap();
-			std::fs::set_permissions(tree.at(&victim), std::fs::Permissions::from_mode(0o600))
-				.unwrap();
-			let (made, target) = (tree.at(&name), tree.at(&victim));
-			super::super::native::after_create_dir(name.as_bytes(), move || {
-				std::fs::remove_dir(&made).unwrap();
-				match swap {
-					"symlink" => std::os::unix::fs::symlink(&target, &made),
-					"file" => std::fs::rename(&target, &made),
-					_ => std::fs::hard_link(&target, &made),
+		for &(id, label) in mode_routes() {
+			use_mode_route(id);
+			for swap in ["symlink", "file", "hardlink", "dirlink"] {
+				let (name, victim) = (format!("raced-{swap}-{id}"), format!("victim-{swap}-{id}"));
+				let kept = if swap == "dirlink" {
+					std::fs::create_dir(tree.at(&victim)).unwrap();
+					0o700
+				} else {
+					std::fs::write(tree.at(&victim), "key").unwrap();
+					0o600
+				};
+				std::fs::set_permissions(tree.at(&victim), std::fs::Permissions::from_mode(kept))
+					.unwrap();
+				let (made, target) = (tree.at(&name), tree.at(&victim));
+				super::super::native::after_create_dir(name.as_bytes(), move || {
+					std::fs::remove_dir(&made).unwrap();
+					match swap {
+						"symlink" | "dirlink" => std::os::unix::fs::symlink(&target, &made),
+						"file" => std::fs::rename(&target, &made),
+						_ => std::fs::hard_link(&target, &made),
+					}
+					.unwrap();
+				});
+				let created = root.create_dir_at(n(&name), Some(0o777));
+				let swapped = std::fs::symlink_metadata(tree.at(&name)).unwrap();
+				assert!(!swapped.is_dir(), "{label}, {swap}: the swap did not run ({created:?})");
+				// What the swap put there, or what the link names.
+				let rel = if swap == "file" {
+					name.as_str()
+				} else {
+					victim.as_str()
+				};
+				if mode(rel) != kept {
+					changed.push(format!("{label}, {swap}: {rel} {:o} ({created:?})", mode(rel)));
 				}
-				.unwrap();
-			});
-			let created = root.create_dir_at(n(&name), Some(0o777));
-			let swapped = std::fs::symlink_metadata(tree.at(&name)).unwrap();
-			assert!(!swapped.is_dir(), "{swap}: the swap did not run ({created:?})");
-			// The file the swap put there, or the one the link names.
-			let rel = if swap == "file" {
-				name.as_str()
-			} else {
-				victim.as_str()
-			};
-			if mode(rel) != 0o600 {
-				changed.push(format!("{swap}: {rel} {:o} ({created:?})", mode(rel)));
-			}
-			if created.is_ok() {
-				reported.push(swap);
+				if created.is_ok() {
+					reported.push(format!("{label}, {swap}"));
+				}
 			}
 		}
-		assert!(changed.is_empty(), "the directory's mode went to a swapped-in file: {changed:?}");
+		assert!(changed.is_empty(), "the directory's mode went to what was swapped in: {changed:?}");
 		assert!(reported.is_empty(), "create_dir_at reported made after these swaps: {reported:?}");
+	}
+
+	/// The user a test acts as where it needs one that is not root.
+	const OTHER: libc::uid_t = 65534;
+
+	/// While it lives, this process's effective user is `uid`; root again
+	/// after. For a test in a process of its own that runs as root.
+	struct ActAs;
+
+	impl ActAs {
+		fn user(uid: libc::uid_t) -> Self {
+			// SAFETY: `seteuid` has no preconditions; the test runs alone.
+			let set = unsafe { libc::seteuid(uid) };
+			assert_eq!(set, 0, "seteuid({uid}): {}", io::Error::last_os_error());
+			Self
+		}
+	}
+
+	impl Drop for ActAs {
+		fn drop(&mut self) {
+			// SAFETY: as above; the saved user is root.
+			unsafe { libc::seteuid(0) };
+		}
+	}
+
+	/// A masked `create_dir_at` returns the error of the call that sets the
+	/// mode again, after which the directory at the name keeps its mode: a
+	/// directory root owns, renamed in at the name between `mkdirat` and that
+	/// call while the process acts as another user, who may not set its mode
+	/// (`EPERM`, or `EACCES` where `/proc/self/fd` is closed to a process
+	/// whose effective user changed). By every way the mode is set again
+	/// ([`mode_routes`]), sync and async. As root only, which can make a
+	/// directory that user does not own and then act as that user; as any
+	/// other user this checks nothing and says so. In a process of its own,
+	/// whose effective user and way of setting the mode this test sets.
+	#[test]
+	fn a_masked_create_dir_at_returns_the_error_of_setting_the_mode() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_masked_create_dir_at_returns_the_error_of_setting_the_mode",
+		) {
+			return;
+		}
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } != 0 {
+			eprintln!(
+				"UNKNOWN: not root, so no directory of another user can be put at the name; nothing \
+				 was checked"
+			);
+			return;
+		}
+		let tree = Tree::new("mkdir-eperm");
+		let top = tree.at("");
+		let closed = top
+			.ancestors()
+			.skip(1)
+			.find(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.mode() & 0o001 == 0));
+		if let Some(closed) = closed {
+			eprintln!(
+				"UNKNOWN: {} is closed to other users, so they cannot reach the tree; nothing was \
+				 checked",
+				closed.display()
+			);
+			return;
+		}
+		std::os::unix::fs::chown(tree.at(""), Some(OTHER), Some(OTHER)).unwrap();
+		let masked = Fs::native().with_creation_mask(Some(0o022));
+		let root = masked.blocking().open_dir(tree.at(""), true).unwrap();
+		let rt = runtime();
+		let mut wrong = Vec::new();
+		for &(id, label) in mode_routes() {
+			use_mode_route(id);
+			for call in ["sync", "async"] {
+				let (name, victim) = (format!("raced-{id}-{call}"), format!("victim-{id}-{call}"));
+				// Root's, and open to all, so that only setting its mode fails.
+				std::fs::create_dir(tree.at(&victim)).unwrap();
+				std::fs::set_permissions(tree.at(&victim), std::fs::Permissions::from_mode(0o755))
+					.unwrap();
+				let (made, target) = (tree.at(&name), tree.at(&victim));
+				super::super::native::after_create_dir(name.as_bytes(), move || {
+					std::fs::remove_dir(&made).unwrap();
+					std::fs::rename(&target, &made).unwrap();
+				});
+				let created = {
+					let _other = ActAs::user(OTHER);
+					if call == "sync" {
+						root.create_dir_at(n(&name), Some(0o700))
+					} else {
+						rt.block_on(root.create_dir_at_async(n(&name), Some(0o700)))
+					}
+				};
+				let at_name = std::fs::symlink_metadata(tree.at(&name))
+					.map(|meta| (meta.uid(), meta.mode() & 0o777));
+				let refused = created
+					.as_ref()
+					.is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied);
+				if !(refused && matches!(at_name, Ok((0, 0o755)))) {
+					let shown = at_name.map(|(uid, mode)| format!("owner {uid}, mode {mode:o}"));
+					wrong.push(format!("{label}, {call}: {created:?}; at the name: {shown:?}"));
+				}
+			}
+		}
+		assert!(
+			wrong.is_empty(),
+			"a masked create_dir_at over a directory another user owns (a permission error and \
+			 root's 755 expected): {wrong:?}"
+		);
 	}
 
 	/// A provider rename names its destination through the destination
@@ -1366,9 +1574,9 @@ mod unix {
 		}
 	}
 
-	/// Tries of each replaced-FIFO case: ext4, XFS and overlayfs give a freed
-	/// inode number to the next file made often but not always, so one try
-	/// can miss the reuse a case is about.
+	/// Tries of each replaced-FIFO case: ext4 and overlayfs on it give a
+	/// freed inode number to the next file made often but not always, so one
+	/// try can miss the reuse a case is about.
 	const REPLACE_TRIES: usize = 25;
 
 	/// The inode number of the entry at `path`.
@@ -1488,20 +1696,30 @@ mod unix {
 	}
 
 	/// Whether the thread `tid` of this process waits in an `open`: its
-	/// `/proc/self/task/<tid>/syscall` names `openat`, or, where that file is
-	/// not there, its state is sleeping. `None` when neither can be read.
+	/// `/proc/self/task/<tid>/syscall` names `openat` (or, on x86_64, `open`,
+	/// which musl's `open()` issues there). Where that file is not there
+	/// (gVisor), its state is sleeping, which a thread waiting on a lock also
+	/// shows, so there this does not prove the thread is in `open`. `None`
+	/// when neither can be read.
 	#[cfg(target_os = "linux")]
 	fn waits_in_open(tid: libc::c_long) -> Option<bool> {
 		if let Ok(syscall) = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
 			let number = syscall.split_whitespace().next()?;
-			return Some(
-				number
-					.parse::<libc::c_long>()
-					.is_ok_and(|n| n == libc::SYS_openat),
-			);
+			return Some(number.parse::<libc::c_long>().is_ok_and(is_open_call));
 		}
 		let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
 		Some(stat.rsplit_once(')')?.1.trim_start().starts_with('S'))
+	}
+
+	/// Whether the system call `number` opens a file by path: `openat`, and
+	/// on x86_64 also `open`.
+	#[cfg(target_os = "linux")]
+	fn is_open_call(number: libc::c_long) -> bool {
+		#[cfg(target_arch = "x86_64")]
+		if number == libc::SYS_open {
+			return true;
+		}
+		number == libc::SYS_openat
 	}
 
 	/// A release reaches the FIFO its open waits on after the FIFO's name was
@@ -1586,6 +1804,206 @@ mod unix {
 				);
 			}
 		}
+	}
+
+	/// The descriptors of this process that are of the file whose (device,
+	/// inode) is `id`, by `fstat` of every descriptor number below the
+	/// process's limit (at most 65536), so it needs no `/proc`.
+	#[cfg(target_os = "linux")]
+	#[allow(clippy::unnecessary_cast, reason = "stat field widths differ by platform")]
+	fn descriptors_of(id: (u64, u64)) -> Vec<libc::c_int> {
+		// SAFETY: `sysconf` has no preconditions.
+		let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+		let limit = libc::c_int::try_from(limit.clamp(0, 1 << 16)).unwrap_or(1 << 16);
+		(0..limit)
+			.filter(|&fd| {
+				let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+				// SAFETY: `st` is a valid out-pointer; a number that is no
+				// open descriptor fails with `EBADF`.
+				if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+					return false;
+				}
+				// SAFETY: `fstat` succeeded and filled `st`.
+				let st = unsafe { st.assume_init() };
+				(st.st_dev as u64, st.st_ino as u64) == id
+			})
+			.collect()
+	}
+
+	/// A FIFO open whose FIFO is renamed just after its pin, before anything
+	/// else of the open runs, is still released when it is dropped: the
+	/// helper's open ends, and no descriptor of the FIFO stays in this
+	/// process. With the helper and releases reaching the FIFO through
+	/// `/proc`, where the helper waits on the renamed FIFO until a release
+	/// reaches it, and by name, as without `/proc`, where the helper finds
+	/// the name gone. Through a handle's `open_at_async` and the facade's own
+	/// open. Linux only: only there does a pin hold the FIFO. In a process of
+	/// its own, so the hooks take this test's pins and helpers.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_fifo_renamed_just_after_its_pin_is_still_released() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_fifo_renamed_just_after_its_pin_is_still_released",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-renamed");
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let mut write = OpenOptions::new();
+		write.write(true);
+		for by_name in [false, true] {
+			crate::fs::fifo_seam::open_by_name(by_name);
+			for route in ["handle", "facade"] {
+				let case = format!("{route}, by name {by_name}");
+				let name = format!("r-{route}-{by_name}");
+				let (fifo, parked) = (tree.at(&name), tree.at(&format!("parked-{route}-{by_name}")));
+				mkfifo(&fifo);
+				{
+					let (fifo, parked) = (fifo.clone(), parked.clone());
+					crate::fs::fifo_seam::after_pin(move || std::fs::rename(fifo, parked).unwrap());
+				}
+				let (started_tx, started) = std::sync::mpsc::channel();
+				let helper_opened = hook_next_fifo_helper(started_tx, None);
+				let id = runtime().block_on(async {
+					let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
+					tokio::select! {
+						biased;
+						_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+						() = std::future::ready(()) => {},
+					}
+					started
+						.recv_timeout(HELPER_BOUND)
+						.unwrap_or_else(|_| panic!("{case}: the helper never started"));
+					let meta = std::fs::symlink_metadata(&parked).unwrap_or_else(|err| {
+						panic!("{case}: the rename after the pin did not run: {err}")
+					});
+					let id = (meta.dev(), meta.ino());
+					// The control: the scan sees the pin the open holds.
+					assert!(
+						!descriptors_of(id).is_empty(),
+						"{case}: no descriptor of the pinned FIFO is seen while its open waits"
+					);
+					id
+				});
+				let Ok(opened) = helper_opened.recv_timeout(HELPER_BOUND) else {
+					release_reader_end(&parked);
+					panic!(
+						"{case}: the helper still waited on the renamed FIFO {HELPER_BOUND:?} after the \
+						 drop"
+					);
+				};
+				// Through `/proc` a release connected the helper to the FIFO;
+				// by name (also every way in a run without `/proc`) the helper
+				// found the name gone.
+				let through_proc = !by_name && Path::new("/proc/self/fd").is_dir();
+				assert_eq!(opened, through_proc, "{case}: whether the helper's open succeeded");
+				let start = std::time::Instant::now();
+				loop {
+					let held = descriptors_of(id);
+					if held.is_empty() {
+						break;
+					}
+					assert!(
+						start.elapsed() < HELPER_BOUND,
+						"{case}: descriptors {held:?} of the renamed FIFO stayed open"
+					);
+					std::thread::sleep(Duration::from_millis(1));
+				}
+			}
+		}
+	}
+
+	/// A FIFO open under a cancellable facade refuses what the same open
+	/// without a token refuses, with the same error: an exclusive create of
+	/// the FIFO (`O_CREAT | O_EXCL` among the custom flags: `EEXIST`), and a
+	/// read-only or append open that truncates (`EINVAL`). A handle's
+	/// `open_at` and `open_at_async` are compared with a handle's `open_at`
+	/// without a token, the facade's own blocking and async opens with the
+	/// facade's open without one; on Linux with the helper reaching the FIFO
+	/// through `/proc` and by name, as without `/proc`. Both ends of the FIFO
+	/// are held open throughout, so an open that goes ahead where the plain
+	/// one fails ends at once instead of waiting. In a process of its own, as
+	/// the by-name switch is the process's.
+	#[test]
+	fn a_fifo_open_refuses_what_the_plain_open_refuses() {
+		use std::os::unix::fs::OpenOptionsExt;
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_fifo_open_refuses_what_the_plain_open_refuses",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-refused");
+		let fifo = tree.at("p");
+		mkfifo(&fifo);
+		let reader = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+			.unwrap();
+		let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+		let (mut exclusive, mut read, mut append) =
+			(OpenOptions::new(), OpenOptions::new(), OpenOptions::new());
+		exclusive
+			.write(true)
+			.custom_flags(libc::O_CREAT | libc::O_EXCL);
+		read.read(true).truncate(true);
+		append.append(true).truncate(true);
+		let cases = [
+			("an exclusive create", exclusive),
+			("a read that truncates", read),
+			("an append that truncates", append),
+		];
+		// An error as its kind and its OS error: the facade's open refuses an
+		// invalid combination before any system call, a handle's `open_at`
+		// with the system call's `EINVAL`.
+		let error = |opened: io::Result<File>| {
+			opened
+				.map(drop)
+				.map_err(|err| (err.kind(), err.raw_os_error()))
+		};
+		let plain = BlockingFs::native();
+		let plain_root = plain.open_dir(tree.at(""), true).unwrap();
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let rt = runtime();
+		let mut wrong = Vec::new();
+		for by_name in [false, true] {
+			crate::fs::fifo_seam::open_by_name(by_name);
+			for (case, options) in &cases {
+				let by_facade = error(plain.open_with(&fifo, options));
+				let by_handle = error(plain_root.open_at(n("p"), options));
+				// The control: both plain opens refuse it, with one kind.
+				assert!(
+					matches!((&by_facade, &by_handle), (Err((a, _)), Err((b, _))) if a == b),
+					"{case}: the plain opens gave {by_facade:?} and {by_handle:?}"
+				);
+				let got = [
+					("a handle's open_at", error(root.open_at(n("p"), options)), &by_handle),
+					(
+						"a handle's open_at_async",
+						error(rt.block_on(root.open_at_async(n("p"), options))),
+						&by_handle,
+					),
+					("the facade's open", error(fs.blocking().open_with(&fifo, options)), &by_facade),
+					(
+						"the facade's async open",
+						error(rt.block_on(fs.open_with(&fifo, options))),
+						&by_facade,
+					),
+				];
+				for (route, result, want) in got {
+					if result != *want {
+						wrong.push(format!(
+							"{case}, {route}, by name {by_name}: {result:?} where the plain open gives \
+							 {want:?}"
+						));
+					}
+				}
+			}
+		}
+		drop((reader, writer));
+		assert!(wrong.is_empty(), "FIFO opens under a token: {wrong:#?}");
 	}
 
 	/// Opens `fifo`'s read end without blocking and closes it, which releases

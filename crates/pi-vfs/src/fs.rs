@@ -374,7 +374,12 @@ impl FifoPin {
 		// SAFETY: `raw` was just opened, and nothing else owns it.
 		let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 		let st = fstat(fd.as_raw_fd())?;
-		Ok(is_fifo(&st).then(|| Self { dev: st.st_dev as u64, ino: st.st_ino as u64, fd }))
+		let pin = is_fifo(&st).then(|| Self { dev: st.st_dev as u64, ino: st.st_ino as u64, fd });
+		#[cfg(test)]
+		if pin.is_some() {
+			fifo_seam::fire_after_pin();
+		}
+		Ok(pin)
 	}
 
 	/// Pins the FIFO `name` names relative to the directory `dir`
@@ -390,7 +395,12 @@ impl FifoPin {
 		}
 		// SAFETY: `fstatat` succeeded and filled `st`.
 		let st = unsafe { st.assume_init() };
-		Ok(is_fifo(&st).then_some(Self { dev: st.st_dev as u64, ino: st.st_ino as u64 }))
+		let pin = is_fifo(&st).then_some(Self { dev: st.st_dev as u64, ino: st.st_ino as u64 });
+		#[cfg(test)]
+		if pin.is_some() {
+			fifo_seam::fire_after_pin();
+		}
+		Ok(pin)
 	}
 
 	/// `/proc/self/fd/N` of the pin, where the open and its releases reach
@@ -754,8 +764,9 @@ fn release_attempt(
 /// helper's thread before its `open` (it may block, to hold the helper back)
 /// and after it (told whether the open succeeded); a hook run after each
 /// release's open of the other end, while the end it opened is still held
-/// (told whether it opened one); and a switch that makes pinned FIFO opens
-/// open the name, as they do without `/proc`.
+/// (told whether it opened one); a hook run just after the next FIFO pin is
+/// taken; and a switch that makes pinned FIFO opens open the name, as they
+/// do without `/proc`.
 #[cfg(all(test, unix))]
 pub(crate) mod fifo_seam {
 	use std::sync::atomic::{AtomicBool, Ordering};
@@ -768,6 +779,7 @@ pub(crate) mod fifo_seam {
 
 	static NEXT: Mutex<Option<(Before, After)>> = Mutex::new(None);
 	static RELEASE: Mutex<Option<Release>> = Mutex::new(None);
+	static AFTER_PIN: Mutex<Option<Before>> = Mutex::new(None);
 	static BY_NAME: AtomicBool = AtomicBool::new(false);
 
 	/// Makes pinned FIFO opens in this process from now on open the name and
@@ -804,6 +816,23 @@ pub(crate) mod fifo_seam {
 	pub(super) fn after_release(held: bool) {
 		if let Some(hook) = RELEASE.lock().as_mut() {
 			hook(held);
+		}
+	}
+
+	/// Hooks the next FIFO pin taken in this process: `hook` runs just after
+	/// the pin, before anything else of its open.
+	#[cfg_attr(
+		not(target_os = "linux"),
+		allow(dead_code, reason = "only a Linux test renames a pinned FIFO")
+	)]
+	pub(crate) fn after_pin(hook: impl FnOnce() + Send + 'static) {
+		*AFTER_PIN.lock() = Some(Box::new(hook));
+	}
+
+	pub(super) fn fire_after_pin() {
+		let hook = AFTER_PIN.lock().take();
+		if let Some(hook) = hook {
+			hook();
 		}
 	}
 }
