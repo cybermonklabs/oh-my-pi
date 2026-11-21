@@ -2557,17 +2557,15 @@ mod tests {
 			walk.0
 		};
 		// A listed candidate that cannot be pinned (no descriptor left) and is
-		// gone when its status is read is skipped: a process reaped before the
-		// walk, which a test hook lists as the kernel would have a moment ago.
-		let reaped = {
-			let mut gone = std::process::Command::new("true").spawn().unwrap();
-			let reaped = i32::try_from(gone.id()).unwrap();
-			gone.wait().unwrap();
-			reaped
-		};
+		// gone when its status is read is skipped. A test hook lists it as the
+		// kernel would have a task that ended a moment ago, by an id no process
+		// can have (Linux allocates pids below 2^22): a pid this test reaped
+		// itself could be given to a new process before the walk reads it, and
+		// that process, unpinnable through the hook, failed the walk.
+		let gone = i32::MAX;
 		let gone_since_listed = {
-			platform::LIST_ALSO.set(reaped);
-			let fails = crate::sys::proc::fail_pidfds(vec![(reaped, libc::EMFILE)]);
+			platform::LIST_ALSO.set(gone);
+			let fails = crate::sys::proc::fail_pidfds(vec![(gone, libc::EMFILE)]);
 			let walk = walk(false, false);
 			drop(fails);
 			platform::LIST_ALSO.set(0);
@@ -2607,7 +2605,7 @@ mod tests {
 		assert_eq!(
 			gone_since_listed,
 			(Ok(()), kernel),
-			"a candidate gone since it was listed, {reaped}"
+			"a candidate gone since it was listed, {gone}"
 		);
 		let taken = if pidfds { vec![child] } else { tasks.clone() };
 		assert_eq!(
