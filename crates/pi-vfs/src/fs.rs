@@ -152,6 +152,30 @@ fn host_mask(scope: &Scope) -> Option<u32> {
 	scope.creation_mask.filter(|_| cfg!(unix))
 }
 
+/// How an open creates a missing file: `None` when it creates none, else
+/// `Some(exclusive)`, `exclusive` when it creates only a new file. Through
+/// `create` or `create_new`, and on Unix through `O_CREAT` (with `O_EXCL`)
+/// among its custom flags, which the kernel honours alike.
+const fn creation(options: &OpenOptions) -> Option<bool> {
+	#[cfg(unix)]
+	let (custom, custom_exclusive) = {
+		let flags = options.get_custom_flags();
+		(
+			flags & libc::O_CREAT != 0,
+			flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL,
+		)
+	};
+	#[cfg(not(unix))]
+	let (custom, custom_exclusive) = (false, false);
+	if options.is_create_new() || custom_exclusive {
+		Some(true)
+	} else if options.is_create() || custom {
+		Some(false)
+	} else {
+		None
+	}
+}
+
 /// Opens a host path under the facade's creation mask: a file the open
 /// creates gets exactly its requested mode (`0o666` by default) less the
 /// mask. The mask replaces the process umask, which the kernel still applies
@@ -161,9 +185,9 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 	let Some(mask) = host_mask(scope) else {
 		return native::open(path, options);
 	};
-	if !(options.is_create() || options.is_create_new()) {
+	let Some(exclusive_only) = creation(options) else {
 		return native::open(path, options);
-	}
+	};
 	let mode = options.get_mode().unwrap_or(0o666) & !mask;
 	let mut masked = options.clone();
 	masked.mode(mode);
@@ -178,7 +202,7 @@ fn native_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<
 			let _ = file.set_permissions(Permissions::from_mode(mode));
 			Ok(file)
 		},
-		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !options.is_create_new() => {
+		Err(err) if err.kind() == io::ErrorKind::AlreadyExists && !exclusive_only => {
 			native::open(path, &masked)
 		},
 		Err(err) => Err(err),
@@ -307,7 +331,7 @@ fn start_fifo(
 		return Err(crate::cancelled());
 	}
 	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
-	let creates = options.is_create() || options.get_custom_flags() & libc::O_CREAT != 0;
+	let creates = creation(options).is_some();
 	let (scope, options) = (scope.clone(), options.clone());
 	Ok(FifoOpen::start(path, meta, nofollow, creates, move |path, pinned| {
 		if !pinned {

@@ -1027,6 +1027,9 @@ mod fifo {
 			const ALONE: &str = "PI_SHELL_TEST_ALONE";
 			/// A correct run takes milliseconds.
 			const BOUND: Duration = Duration::from_secs(60);
+			// The child's output is read only once it has exited. It prints a
+			// few lines; output past a pipe's buffer (64 KiB on Linux) would
+			// stall it until the bound, and the test would fail there.
 			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
 				let mut child = std::process::Command::new(std::env::current_exe().unwrap())
 					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
