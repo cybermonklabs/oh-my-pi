@@ -136,29 +136,26 @@ impl OutputDecoder {
 	///   finish it, if they come;
 	/// - otherwise, on a decoder that reads the code page or can fall back to
 	///   it, where the code page ends it: one byte later if the code page reads
-	///   the released bytes as ending in a lead byte and that byte is in the
-	///   code page's trail range (`is_dbcs_trail`), else right after them;
+	///   the released bytes as ending in a lead byte and reads that lead with
+	///   the next byte as one character, else right after them;
 	/// - otherwise (UTF-8 with no fallback) after the continuation bytes that
 	///   came before the sequence broke off: with the released bytes they are
 	///   one invalid sequence, the U+FFFD the release gave out.
 	///
-	/// The trail range of 932, 936 and 950 includes the ASCII characters `@`
-	/// through `~`, and 949's the ASCII letters: a `D` that a process still
-	/// holding the pipe writes right after a released lead byte is dropped.
-	/// The next command's output never is, since it has a relay and a pipe of
-	/// its own. The bytes after the released character are decoded as if it
-	/// had never been written.
+	/// The byte a released lead takes can be ASCII: `@` through `~` after
+	/// some leads of 932, 936 and 950, and a letter after some leads of 949.
+	/// A `D` that a process still holding the pipe writes right after such a
+	/// lead is dropped. The next command's output never is, since it has a
+	/// relay and a pipe of its own. The bytes after the released character
+	/// are decoded as if it had never been written.
+	///
+	/// A second release before that character ends gives nothing: all that
+	/// is held then is that character.
 	pub fn release(&mut self) -> String {
-		// A character an earlier release gave out the start of ends here, as
-		// at the end of the stream.
-		let mut out = if self.released > 0 {
-			self.settle_released(true);
-			self.drain(false)
-		} else {
-			String::new()
-		};
-		if self.pending.is_empty() {
-			return out;
+		// A push settles the released character unless it still waits for
+		// its rest as UTF-8, and then nothing after it is held.
+		if self.released > 0 || self.pending.is_empty() {
+			return String::new();
 		}
 		// After a push, `pending` holds at most the start of one character:
 		// everything before it was decoded.
@@ -166,11 +163,9 @@ impl OutputDecoder {
 		#[cfg(windows)]
 		if matches!(self.mode, Mode::Utf8) && self.can_fallback_to_acp() {
 			// What the end of the stream would read, in the code page.
-			out.push_str(&self.decode_acp(&self.pending));
-			return out;
+			return self.decode_acp(&self.pending);
 		}
-		out.push_str(REPLACEMENT);
-		out
+		REPLACEMENT.to_owned()
 	}
 
 	/// Once the bytes after the released ones show where their character
@@ -216,26 +211,24 @@ impl OutputDecoder {
 				}
 				Some(invalid.unwrap_or(start.len()))
 			},
+			// A push adds at least one byte before it settles, so the byte
+			// after the released ones is there unless the stream ended.
 			#[cfg(windows)]
-			Mode::Acp => {
-				if self.pending.len() == self.released && !eof {
-					return None;
-				}
-				Some(self.released + usize::from(self.trail_follows()))
-			},
+			Mode::Acp => Some(self.released + usize::from(self.trail_follows())),
 		}
 	}
 
 	/// Whether the code page reads the released bytes as ending in a lead
-	/// byte, and the byte after them as its trail.
+	/// byte, and that lead with the byte after them as one character.
 	#[cfg(windows)]
 	fn trail_follows(&self) -> bool {
 		let held = &self.pending[..self.released];
-		complete_acp_len(self.fallback_codepage, held, false) < held.len()
+		let lead_at = complete_acp_len(self.fallback_codepage, held, false);
+		lead_at < held.len()
 			&& self
 				.pending
 				.get(self.released)
-				.is_some_and(|&byte| is_dbcs_trail(self.fallback_codepage, byte))
+				.is_some_and(|&byte| one_character(self.fallback_codepage, [held[lead_at], byte]))
 	}
 
 	fn drain(&mut self, eof: bool) -> String {
@@ -710,23 +703,12 @@ fn is_dbcs_lead(codepage: u32, byte: u8) -> bool {
 	unsafe { windows_sys::Win32::Globalization::IsDBCSLeadByteEx(codepage, byte) != 0 }
 }
 
-/// Whether `byte` is in the trail range of the double-byte code page
-/// `codepage`: a byte its lead bytes take as a character's second byte. In
-/// 932, 936 and 950 the range includes the ASCII characters `@` through `~`
-/// (0x40-0x7E), and in 949 the ASCII letters. Another page gets the union of
-/// the four, which is 936's.
+/// Whether `codepage` reads `pair`, a lead byte and the byte after it, as
+/// one character, by the system's own table.
 #[cfg(windows)]
-const fn is_dbcs_trail(codepage: u32, byte: u8) -> bool {
-	match codepage {
-		// Shift_JIS
-		932 => matches!(byte, 0x40..=0x7e | 0x80..=0xfc),
-		// Unified Hangul Code
-		949 => matches!(byte, 0x41..=0x5a | 0x61..=0x7a | 0x81..=0xfe),
-		// Big5
-		950 => matches!(byte, 0x40..=0x7e | 0xa1..=0xfe),
-		// GBK
-		_ => matches!(byte, 0x40..=0x7e | 0x80..=0xfe),
-	}
+fn one_character(codepage: u32, pair: [u8; 2]) -> bool {
+	decode_codepage(codepage, &pair, windows_sys::Win32::Globalization::MB_ERR_INVALID_CHARS)
+		.is_some_and(|text| text.chars().count() == 1)
 }
 
 /// Bytes at the start of `bytes` that form complete ACP characters.
@@ -874,6 +856,22 @@ mod tests {
 		assert_eq!(decoder.finish(), "");
 	}
 
+	/// A second release while the first one's character still waits for its
+	/// rest gives nothing: all that is held is that character, given out
+	/// already. Its rest (here AD, the end of 中) is dropped when it comes,
+	/// and `本` after it is read as UTF-8.
+	#[test]
+	fn a_second_release_gives_nothing_more() {
+		let mut decoder = OutputDecoder::utf8();
+		assert_eq!(decoder.push(&[0xe4]), "");
+		assert_eq!(decoder.release(), "\u{FFFD}");
+		assert_eq!(decoder.push(&[0xb8]), "");
+		assert_eq!(decoder.release(), "");
+		assert_eq!(decoder.push(&[0xad]), "");
+		assert_eq!(decoder.push("本\n".as_bytes()), "本\n");
+		assert_eq!(decoder.finish(), "");
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn gbk_decodes_to_chinese() {
@@ -994,8 +992,8 @@ mod tests {
 		assert_eq!(decoder.release(), "\u{FFFD}");
 		assert!(!crate::sys::ByteDecoder::holds_bytes(&decoder), "the released lead is out");
 		assert_eq!(decoder.push(&[0xc4, 0xd6, 0xd0, 0xce, 0xc4, b'\r', b'\n']), "中文\r\n");
-		// The drop is one byte, and only a trail-range byte: an ASCII control
-		// after a released lead is kept.
+		// The drop is one byte, and only one the released lead takes: an
+		// ASCII control after a released lead is kept.
 		assert_eq!(decoder.push(&[0xce]), "");
 		assert_eq!(decoder.release(), "\u{FFFD}");
 		assert_eq!(decoder.push(b"\r\nok"), "\r\nok");
@@ -1076,47 +1074,74 @@ mod tests {
 		}
 	}
 
-	/// The byte dropped after a released lead must be in that code page's own
-	/// trail range: in 949 `[` is not, and it is kept, whether the stream was
-	/// still read as UTF-8 or already from the code page.
+	/// After a released lead byte, the next byte is dropped only when the
+	/// code page reads the two as one character, not whenever some lead of
+	/// the page takes that byte. 949 reads no character from C7 and `[` or
+	/// `D` (C7 begins 한, C7 D1), so they are kept after a released C7,
+	/// whether the stream was still read as UTF-8 (C7 is also a UTF-8 lead)
+	/// or already from the code page. In 936 a held A3 (the lead of `，`, no
+	/// UTF-8 lead) means the stream is read from the code page: the release
+	/// gives U+FFFD, and `D` after it is dropped exactly when the system's
+	/// table reads A3 44 as one character (a user-defined character of GBK,
+	/// which tables that map that area to private use read).
 	#[cfg(windows)]
 	#[test]
-	fn release_drops_only_a_byte_its_code_page_takes_as_a_trail() {
-		// C7, the lead of 한, held while reading UTF-8.
-		let mut decoder = OutputDecoder::with_fallback_codepage(949);
-		assert_eq!(decoder.push(b"ok \xc7"), "ok ");
-		assert!(!decoder.release().is_empty());
-		assert_eq!(decoder.push(b"[INFO]\n"), "[INFO]\n");
-		// 글 (B1 DB) read from the code page, then C7 held.
-		let mut decoder = OutputDecoder::with_fallback_codepage(949);
-		assert_eq!(decoder.push(&[0xb1, 0xdb, 0xc7]), "글");
+	fn release_drops_a_byte_only_where_the_released_lead_takes_it() {
+		use windows_sys::Win32::Globalization::MB_ERR_INVALID_CHARS;
+		let one_character = |codepage, pair: [u8; 2]| {
+			decode_codepage(codepage, &pair, MB_ERR_INVALID_CHARS)
+				.is_some_and(|text| text.chars().count() == 1)
+		};
+		assert!(!one_character(949, [0xc7, b'D']), "949 reads C7 44 as one character");
+		assert!(!one_character(949, [0xc7, b'[']), "949 reads C7 5B as one character");
+		assert!(one_character(949, [0xc7, 0xd1]), "949 does not read C7 D1 as 한");
+		for text in ["Data\n", "[INFO]\n"] {
+			// C7 held while reading UTF-8.
+			let mut decoder = OutputDecoder::with_fallback_codepage(949);
+			assert_eq!(decoder.push(b"ok \xc7"), "ok ");
+			let mut ended = OutputDecoder::with_fallback_codepage(949);
+			assert_eq!(ended.push(&[0xc7]), "");
+			assert_eq!(decoder.release(), ended.finish());
+			assert_eq!(decoder.push(text.as_bytes()), text, "949, reading UTF-8");
+			// 글 (B1 DB) read from the code page, then C7 held.
+			let mut decoder = OutputDecoder::with_fallback_codepage(949);
+			assert_eq!(decoder.push(&[0xb1, 0xdb, 0xc7]), "글");
+			assert_eq!(decoder.release(), "\u{FFFD}");
+			assert_eq!(decoder.push(text.as_bytes()), text, "949, reading the code page");
+			assert_eq!(decoder.finish(), "");
+		}
+		let pair = decode_codepage(936, &[0xa3, b'D'], MB_ERR_INVALID_CHARS);
+		eprintln!("TABLE 936 reads A3 44 as {pair:?}");
+		let pairs = one_character(936, [0xa3, b'D']);
+		let mut decoder = OutputDecoder::with_fallback_codepage(936);
+		assert_eq!(decoder.push(b"ok \xa3"), "ok ");
 		assert_eq!(decoder.release(), "\u{FFFD}");
-		assert_eq!(decoder.push(b"[INFO]\n"), "[INFO]\n");
+		assert_eq!(decoder.push(b"Data\n"), if pairs { "ata\n" } else { "Data\n" }, "936");
 		assert_eq!(decoder.finish(), "");
 	}
 
-	/// The trail ranges are the code pages' own: a byte is in one exactly
-	/// when some lead byte of that page takes it as the second byte of one
-	/// character, by the system's own tables.
+	/// The ASCII bytes that a lead byte can take as its trail, by the
+	/// system's own tables, are the ones `OutputDecoder::release` names: `@`
+	/// through `~` in 932, 936 and 950, and the letters in 949.
 	#[cfg(windows)]
 	#[test]
-	fn dbcs_trail_ranges_are_the_code_pages_own() {
+	fn ascii_a_lead_byte_can_take_as_its_trail() {
 		use windows_sys::Win32::Globalization::MB_ERR_INVALID_CHARS;
 		for codepage in [932, 936, 949, 950] {
-			let leads: Vec<u8> = (0..=u8::MAX)
+			let named = |byte: u8| match codepage {
+				949 => byte.is_ascii_alphabetic(),
+				_ => matches!(byte, b'@'..=b'~'),
+			};
+			let leads: Vec<u8> = (0x80..=u8::MAX)
 				.filter(|&byte| is_dbcs_lead(codepage, byte))
 				.collect();
 			assert!(!leads.is_empty(), "code page {codepage} has no lead bytes");
-			for byte in 0..=u8::MAX {
+			for byte in 0..0x80 {
 				let taken = leads.iter().any(|&lead| {
 					decode_codepage(codepage, &[lead, byte], MB_ERR_INVALID_CHARS)
 						.is_some_and(|text| text.chars().count() == 1)
 				});
-				assert_eq!(
-					is_dbcs_trail(codepage, byte),
-					taken,
-					"code page {codepage}, byte {byte:#04x}"
-				);
+				assert_eq!(taken, named(byte), "code page {codepage}, byte {byte:#04x}");
 			}
 		}
 	}

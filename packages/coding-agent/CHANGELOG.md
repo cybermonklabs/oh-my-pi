@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Where the shell decodes program output (Windows with a legacy code page), output that ends inside a character no longer comes after the next command's output when the program leaves a process holding its output open. The cost: that character comes out at once as the code page reads its start (日 cut short is `鏃` under code page 936), and the rest of it that the left-running process writes later is dropped: the bytes that finish it as UTF-8, or else the one byte after a lone double-byte lead when it is in that code page's trail range, which includes ASCII `@` through `~` in code pages 932, 936 and 950 and the ASCII letters in 949
+- Where the shell decodes program output (Windows with a legacy code page), output that ends inside a character no longer comes after the next command's output when the program leaves a process holding its output open. The cost: that character comes out at once, as the code page reads its start while the output is still read as UTF-8 (日 cut short is `鏃` under code page 936), or as U+FFFD when the output was already read from the code page; the rest of it that the left-running process writes later is dropped: the bytes that finish it as UTF-8, or else the one byte after a lone double-byte lead when the code page reads the two as one character, which can be ASCII `@` through `~` in code pages 932, 936 and 950 and an ASCII letter in 949
 
 ## [18.18.6] - 2026-11-09
 
