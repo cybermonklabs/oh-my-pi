@@ -2,11 +2,12 @@
  * Census of the records that hold a copy of another entry's body: a
  * `session_exit` record (the arguments of the tool calls pending at an exit),
  * the revisions of the context notebook, the to-do HUD choices (the list's
- * JSON text), the mode changes a goal records every turn (the goal's
- * objective) and the stale snapcompact compaction a frame rescue replaces
- * (its archive text). Each one no context build reads goes to the cold store,
- * before the cut and from the cut on, so no record kept whole holds a copy of
- * a cold body; the ones a build or a resume reads stay whole.
+ * JSON text), the mode changes a goal records every turn and the record it
+ * leaves when it completes (each the goal's objective), and the stale
+ * snapcompact compaction a frame rescue replaces (its archive text). Each one
+ * no context build reads goes to the cold store, before the cut and from the
+ * cut on, so no record kept whole holds a copy of a cold body; the ones a
+ * build or a resume reads stay whole.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
@@ -75,6 +76,15 @@ function goalSnapshot(id: string) {
 	return { type: "mode_change", id, mode: "goal", data: { goal: { objective: `${id} ${BODY}`, status: "active" } } };
 }
 
+function goalCompleted(id: string) {
+	return custom(id, "goal-completed", {
+		objective: `${id} ${BODY}`,
+		tokensUsed: 10,
+		tokenBudget: 50,
+		timeUsedSeconds: 3,
+	});
+}
+
 function snapcompact(id: string, extra: object) {
 	return {
 		type: "compaction",
@@ -89,9 +99,10 @@ function snapcompact(id: string, extra: object) {
 
 /**
  * Before the cut at `keep`: the start, older notes `n1` and the newest `n2`, a
- * HUD choice, an exit record and a goal snapshot. From the cut on: the stale
- * snapcompact compaction `stale` and its rescue `rescue` (same kept entry and
- * size), two goal snapshots and the newest HUD choice, a reply and an exit.
+ * HUD choice, an exit record, a goal snapshot and its completion record. From
+ * the cut on: the stale snapcompact compaction `stale` and its rescue `rescue`
+ * (same kept entry and size), a goal snapshot and its completion record, the
+ * newest HUD choice and goal snapshot, a reply and an exit.
  */
 function censusSession(): object[] {
 	return chain([
@@ -101,11 +112,13 @@ function censusSession(): object[] {
 		hudChoice("h1"),
 		sessionExit("s1"),
 		goalSnapshot("m1"),
+		goalCompleted("g1"),
 		notes("n2"),
 		{ type: "message", id: "keep", message: { role: "user", content: `keep ${BODY}`, timestamp: 1 } },
 		snapcompact("stale", { preserveData: { snapcompact: { text: `archive ${BODY}`, frames: [] } } }),
 		snapcompact("rescue", {}),
 		goalSnapshot("m3"),
+		goalCompleted("g2"),
 		hudChoice("h2"),
 		goalSnapshot("m4"),
 		{ type: "message", id: "a1", message: assistant(`a1 ${BODY}`) },
@@ -146,14 +159,14 @@ describe("records that copy another entry's body", () => {
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	});
 
-	// A long /goal session (a snapshot per turn), a notebook saved many times or many HUD toggles
-	// would otherwise keep every copy whole for the rest of the session, while the bodies they copy
-	// are out of memory.
+	// A long /goal session (a snapshot per turn, a record per completed goal), a notebook saved many
+	// times or many HUD toggles would otherwise keep every copy whole for the rest of the session,
+	// while the bodies they copy are out of memory.
 	it("sends every copy no build reads to the store, live and after a resume, and builds from the ones it reads", async () => {
 		using dir = TempDir.createSync("@omp-cold-census-");
 		const file = await writeSession(dir.path(), censusSession());
 		const expected = {
-			cold: ["u0", "a0", "n1", "h1", "s1", "m1", "stale", "m3", "s2"],
+			cold: ["u0", "a0", "n1", "h1", "s1", "m1", "g1", "stale", "m3", "g2", "s2"],
 			whole: ["n2", "keep", "rescue", "h2", "m4", "a1"],
 		};
 
@@ -169,7 +182,9 @@ describe("records that copy another entry's body", () => {
 		expect(resumed.coldStoreStats().materializations).toBe(readsBefore);
 		expect(census(resumed)).toEqual(expected);
 
-		// Live: a new goal snapshot and HUD choice supersede the newest, which go to the store at the next cut.
+		// Live: a goal's completion record, and a new goal snapshot and HUD choice that supersede the
+		// newest, go to the store at the next cut.
+		const completed = resumed.appendCustomEntry("goal-completed", goalCompleted("g3").data);
 		resumed.appendModeChange("goal", { goal: { objective: `m5 ${BODY}`, status: "active" } });
 		resumed.appendCustomEntry("todo_hud_state", {
 			sourceEntryId: "a0",
@@ -178,7 +193,7 @@ describe("records that copy another entry's body", () => {
 		});
 		resumed.recoolEntries();
 		const live = census(resumed);
-		expect(live.cold).toEqual(expect.arrayContaining(["m4", "h2"]));
+		expect(live.cold).toEqual(expect.arrayContaining(["m4", "h2", completed]));
 		expect(resumed.buildSessionContext().modeData).toMatchObject({ goal: { status: "active" } });
 		expect(JSON.stringify(resumed.buildSessionContext().modeData)).toContain("m5 ");
 	});

@@ -46,7 +46,7 @@
 - A share with secret masking on no longer reads older tool start markers, to-do list edits, compactions, branch summaries and custom messages back from disk only to drop their data
 - A subagent that answers an IRC message in the turn that message woke it for no longer sends the sender that answer a second time, reviving it, when its own idle timeout parks it while that turn still waits on its background work
 - A session write that waits on another omp process's write, and Hindsight's retried memory delivery while another omp process delivers, no longer block for about 50 ms on every attempt
-- A long session no longer keeps whole the older goal snapshots, context notebook revisions, to-do HUD choices and exit records, nor a snapcompact compaction a frame rescue replaced, each holding a copy of bodies that are out of memory
+- A long session no longer keeps whole the older goal snapshots, goal completion records, context notebook revisions, to-do HUD choices and exit records, nor a snapcompact compaction a frame rescue replaced, each holding a copy of bodies that are out of memory
 - A `/resume` or `/move` that fails and rolls back, or a context rebuild that failed to read an older message, no longer leaves messages of the current model's context to be read back from disk on every request
 - RPC `cancel_subagent` and `steer_subagent` no longer reach a subagent whose first run failed before its first prompt while it is being cleaned up
 - A session copy or fork that fails to write frees its temporary file of older entry bodies at once instead of at the next garbage collection

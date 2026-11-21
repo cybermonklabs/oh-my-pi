@@ -11,7 +11,12 @@
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import { logger } from "@oh-my-pi/pi-utils";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../../goals/settings";
-import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../../goals/state";
+import {
+	GOAL_COMPLETED_CUSTOM_TYPE,
+	type GoalModeState,
+	goalContinuationActivity,
+	goalFromModeData,
+} from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { nextActionableTask } from "../../tools/todo";
 
@@ -294,7 +299,7 @@ export class RpcGoalController {
 		const state = this.#session.getGoalModeState();
 		this.#session.setGoalModeState(undefined);
 		this.#session.sessionManager.appendModeChange("none");
-		this.#session.sessionManager.appendCustomEntry("goal-completed", {
+		this.#session.sessionManager.appendCustomEntry(GOAL_COMPLETED_CUSTOM_TYPE, {
 			objective: state?.goal.objective,
 			tokensUsed: state?.goal.tokensUsed,
 			tokenBudget: state?.goal.tokenBudget,
