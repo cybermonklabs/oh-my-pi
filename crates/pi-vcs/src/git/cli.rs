@@ -492,6 +492,10 @@ fn terminate_sync(child: &mut std::process::Child, grace: Duration) {
 			std::thread::sleep(Duration::from_millis(10));
 		}
 	}
+	// Off unix there is no SIGTERM to give `grace` to: the kill below is the
+	// only signal.
+	#[cfg(not(unix))]
+	let _ = grace;
 	let _ = child.kill();
 	let _ = child.wait();
 }

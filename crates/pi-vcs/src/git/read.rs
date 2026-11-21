@@ -1650,7 +1650,10 @@ fn stat_cache_checks() -> std::sync::MutexGuard<'static, HashMap<PathBuf, StatCa
 
 #[cfg(test)]
 mod tests {
-	use std::{env, fs, process::Command};
+	// `env` serves only the Linux-only lock-skip test and its re-executed child.
+	#[cfg(target_os = "linux")]
+	use std::env;
+	use std::{fs, process::Command};
 
 	use tempfile::TempDir;
 
@@ -2392,9 +2395,13 @@ mod tests {
 	/// [`status_poll_retries_after_an_optional_lock_skip`]. The parent creates
 	/// a real repository and puts a wrapper in the child's `PATH`, so the test
 	/// can control an otherwise unobservable optional-lock interleaving without
-	/// mutating the test process's environment.
+	/// mutating the test process's environment. The test runs on Linux only,
+	/// so the variables and the wrapper below exist only there.
+	#[cfg(target_os = "linux")]
 	const ENV_LOCK_SKIP_REPO: &str = "PI_VCS_TEST_LOCK_SKIP_REPO";
+	#[cfg(target_os = "linux")]
 	const ENV_LOCK_SKIP_INDEX_LOCK: &str = "PI_VCS_TEST_LOCK_SKIP_INDEX_LOCK";
+	#[cfg(target_os = "linux")]
 	const ENV_LOCK_SKIP_MARKER: &str = "PI_VCS_TEST_LOCK_SKIP_MARKER";
 
 	/// A `git` wrapper for the re-executed child. The first status runs while
@@ -2402,6 +2409,7 @@ mod tests {
 	/// inspect the filesystem. The first index refresh recreates that lock just
 	/// for the refresh command, which makes a non-optional refresh report
 	/// contention by failing. Later invocations delegate directly to real git.
+	#[cfg(target_os = "linux")]
 	const LOCK_SKIP_GIT_WRAPPER: &str = r#"#!/bin/sh
 case "$1" in
 	--no-optional-locks) command="$2" ;;
