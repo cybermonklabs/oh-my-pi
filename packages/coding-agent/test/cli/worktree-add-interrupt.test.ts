@@ -40,7 +40,7 @@ describe.skipIf(process.platform === "win32")("omp worktree add after an add tha
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
-	it("adds the same path again: the killed add's partial tree and registration are removed first", async () => {
+	it("adds the same path again: the killed add's partial tree is emptied and its registration removed first", async () => {
 		const worktree = path.join(root, "wt");
 		const killed = Bun.spawn(["bun", cli, "worktree", "add", "--detach", worktree, "HEAD"], {
 			cwd: repo,

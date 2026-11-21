@@ -210,3 +210,53 @@ fn a_failed_clone_leaves_the_checkout_a_writable_tree() {
 	assert!(target.join(".git").is_file(), "{result:?}");
 	assert_eq!(git(&target, &["rev-parse", "HEAD"]), git(&source, &["rev-parse", "HEAD"]));
 }
+
+/// An add into an empty directory the user can write but does not own (a
+/// mount point, or one in a directory owned by root) succeeds, as git's does:
+/// where a clone attempt fails, the directory keeps its mode, and only its
+/// owner may change a mode, even to the same value.
+///
+/// It needs such a directory, which a test run as an unprivileged user cannot
+/// make: the builds Job makes one as root and names it in
+/// `PI_VCS_TEST_FOREIGN_EMPTY_DIR`. Run with `--ignored`.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs an empty directory owned by another user: PI_VCS_TEST_FOREIGN_EMPTY_DIR"]
+fn an_add_into_an_empty_directory_someone_else_owns_succeeds() {
+	use std::os::unix::fs::MetadataExt;
+	let target = PathBuf::from(
+		std::env::var("PI_VCS_TEST_FOREIGN_EMPTY_DIR")
+			.expect("PI_VCS_TEST_FOREIGN_EMPTY_DIR names an empty directory owned by another user"),
+	);
+	// SAFETY: `geteuid` takes nothing and cannot fail.
+	let me = unsafe { libc::geteuid() };
+	let meta = fs::metadata(&target).unwrap();
+	assert_ne!(meta.uid(), me, "{} is owned by this user", target.display());
+	assert_eq!(fs::read_dir(&target).unwrap().count(), 0, "{} is not empty", target.display());
+	let mode = meta.mode() & 0o7777;
+	let temp = tempfile::tempdir().unwrap();
+	let source = temp.path().join("source");
+	fs::create_dir(&source).unwrap();
+	git(&source, &["init", "-q", "-b", "main"]);
+	for (key, value) in
+		[("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")]
+	{
+		git(&source, &["config", key, value]);
+	}
+	fs::write(source.join("a.txt"), "tracked\n").unwrap();
+	git(&source, &["add", "."]);
+	git(&source, &["commit", "-qm", "A"]);
+	let repo = GitRepo::require(&source).unwrap();
+	let result = repo
+		.worktree_add(&target, "HEAD", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Auto,
+			keep_changes: false,
+			lock:         None,
+		})
+		.unwrap_or_else(|err| panic!("the add into {} failed: {err}", target.display()));
+	eprintln!("cloned_with={:?} clone_error={:?}", result.cloned_with, result.clone_error);
+	assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "tracked\n");
+	let after = fs::metadata(&target).unwrap();
+	assert_eq!((after.ino(), after.mode() & 0o7777), (meta.ino(), mode), "the directory changed");
+}

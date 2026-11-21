@@ -724,16 +724,21 @@ impl GitRepo {
 	/// again. Only a registration that names `path` and holds the
 	/// add-in-progress marker is considered. It goes when no process holds
 	/// that marker any more, its `locked` file holds exactly what the add
-	/// wrote, and `path` is missing, or is still the directory the add made
-	/// (same device and inode, and the token the add set on it) with no
-	/// `.git` in it but the add's own gitfile at its root. Files written into
-	/// that tree after the add stopped are removed with it. A live add, a
-	/// lock someone changed or removed, a directory made again in its place,
-	/// a repository anywhere in the tree, or a platform that cannot check
-	/// these is refused with a message naming the registration, and nothing
-	/// is removed. Returns one note per removal, for the caller to show.
+	/// wrote, its `HEAD` is still what the add wrote and has no reflog, and
+	/// `path` is missing, or is still the directory the add made (same device
+	/// and inode, and the token the add set on it) with no repository in it
+	/// (no `.git` but the add's own gitfile at its root, and no bare
+	/// repository). Files written into that tree after the add stopped, and
+	/// changes staged there, are removed with it. A live add, a lock someone
+	/// changed or removed, a commit or checkout made there, a directory made
+	/// again in its place, a repository anywhere in the tree, or a platform
+	/// that cannot check these is refused with a message naming the
+	/// registration, and nothing is removed. Registrations earlier reclaims
+	/// moved out of git's view and did not delete go first. Returns one note
+	/// per removal, for the caller to show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
 		let common = &self.info().common_dir;
+		sweep_moved_registrations(common);
 		let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
 			return Ok(Vec::new());
 		};
@@ -2124,8 +2129,10 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 /// registration's administrative directory until the add finishes. Its first
 /// line records the tree directory the add made (`tree <dev> <ino> <token>`,
 /// see [`TreeMark`], or `tree -` before there is one or where it cannot be
-/// marked); the rest is exactly what the add wrote to `locked`. A
-/// registration holding it unlocked is an add that died before it finished.
+/// marked), its second what the add wrote to the registration's `HEAD`
+/// (`head <value>`), and the rest is exactly what the add wrote to `locked`.
+/// A registration holding it unlocked is an add that died before it
+/// finished.
 const ADD_IN_PROGRESS: &str = "omp-add-in-progress";
 
 /// What `git worktree add` writes to a new registration's `locked` file while
@@ -2143,6 +2150,8 @@ struct PendingWorktree {
 	admin:    PathBuf,
 	/// What `locked` holds while the add runs.
 	locked:   String,
+	/// What the registration's `HEAD` holds, without its final newline.
+	head:     String,
 	/// The locked marker; `None` where the filesystem cannot lock, so no later
 	/// add can take this registration for an abandoned one.
 	marker:   Option<fs::File>,
@@ -2179,6 +2188,7 @@ impl PendingWorktree {
 			path: path.to_path_buf(),
 			admin,
 			locked,
+			head: head.to_owned(),
 			marker: None,
 			existed: fs::symlink_metadata(path)
 				.ok()
@@ -2202,10 +2212,11 @@ impl PendingWorktree {
 
 	/// The marker's content for a tree directory marked `mark`.
 	fn record(&self, mark: Option<&TreeMark>) -> String {
-		match mark {
-			Some(TreeMark { dev, ino, token }) => format!("tree {dev} {ino} {token}\n{}", self.locked),
-			None => format!("tree -\n{}", self.locked),
-		}
+		let tree = match mark {
+			Some(TreeMark { dev, ino, token }) => format!("tree {dev} {ino} {token}"),
+			None => "tree -".to_owned(),
+		};
+		format!("{tree}\nhead {}\n{}", self.head, self.locked)
 	}
 
 	/// Makes the tree directory (an empty one already there is kept), marks
@@ -2236,16 +2247,22 @@ impl PendingWorktree {
 	/// registration for the next attempt. A clone copies the source root's
 	/// mode onto the tree, which can leave it unwritable. A directory that
 	/// was there before the add (it can be a mount point) stays, emptied,
-	/// with the mode it had; one the add made goes, and is made again as the
-	/// add first made it.
+	/// and gets the mode it had back where the attempt changed it; one the
+	/// attempt removed is made again with that mode (a new inode). One the
+	/// add made goes, and is made again as the add first made it.
 	fn reset_tree(&self) -> Result<()> {
 		let is_dir = fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.is_dir());
 		match &self.existed {
 			Some(mode) if is_dir => {
-				fs::set_permissions(&self.path, mode.clone())?;
+				restore_mode(&self.path, mode)?;
 				remove_contents(&self.path)?;
 			},
-			_ => {
+			Some(mode) => {
+				remove_existing(&self.path)?;
+				fs::create_dir_all(&self.path)?;
+				restore_mode(&self.path, mode)?;
+			},
+			None => {
 				#[cfg(unix)]
 				if is_dir {
 					make_owner_writable(&self.path)?;
@@ -2304,7 +2321,7 @@ impl Drop for PendingWorktree {
 		let _ = remove_existing(&self.path);
 		if let Some(mode) = &self.existed {
 			let _ = fs::create_dir_all(&self.path);
-			let _ = fs::set_permissions(&self.path, mode.clone());
+			let _ = restore_mode(&self.path, mode);
 		}
 		let _ = fs::remove_dir_all(&self.admin);
 		#[cfg(test)]
@@ -2490,16 +2507,26 @@ mod tree_dir {
 		Ok(())
 	}
 
-	/// Looks in the directory `dir` (at `at` below the tree's root) for an
-	/// entry named `.git`, skipping the root's own, and queues every
-	/// subdirectory it opens without following a symlink.
+	/// Looks in the directory `dir` (at `at` below the tree's root) for a
+	/// repository: an entry named `.git` (the root's own is skipped), or, below
+	/// the root, `dir` itself holding `HEAD`, `objects` and `refs` (a bare
+	/// repository). Queues every subdirectory it opens without following a
+	/// symlink.
 	fn git_entry_in(
 		dir: RawFd,
 		at: &Path,
 		root: bool,
 		pending: &mut Vec<(OwnedFd, PathBuf)>,
 	) -> io::Result<Option<PathBuf>> {
-		for name in names(dir)? {
+		let names = names(dir)?;
+		if !root
+			&& [&b"HEAD"[..], b"objects", b"refs"]
+				.iter()
+				.all(|wanted| names.iter().any(|name| name.as_bytes() == *wanted))
+		{
+			return Ok(Some(at.to_path_buf()));
+		}
+		for name in names {
 			let relative = at.join(OsStr::from_bytes(name.as_bytes()));
 			if name.as_bytes() == b".git" {
 				if root {
@@ -2562,8 +2589,9 @@ mod tree_dir {
 				.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin))
 		}
 
-		/// The first `.git` below this directory's root (the root's own
-		/// `.git` is not looked at), relative to the root, walking every
+		/// The first repository below this directory's root, relative to the
+		/// root: an entry named `.git` (the root's own is not looked at), or a
+		/// directory holding `HEAD`, `objects` and `refs`. Walks every
 		/// subdirectory without following a symlink.
 		pub fn nested_git_entry(&self) -> io::Result<Option<PathBuf>> {
 			let mut pending = Vec::new();
@@ -2595,9 +2623,18 @@ mod tree_dir {
 			remove_all_in(self.0.as_raw_fd())
 		}
 
-		/// Removes the add's token from this directory; a failure is ignored.
-		pub fn clear_mark(&self) {
-			tree_mark::clear_fd(self.0.as_raw_fd());
+		/// Removes the token from this directory if it is still `token`; a
+		/// failure is ignored. Another add of the same path may have set its
+		/// own since, which stays.
+		pub fn clear_mark_if(&self, token: &str) {
+			if tree_mark::get_fd(self.0.as_raw_fd())
+				.ok()
+				.flatten()
+				.as_deref()
+				== Some(token)
+			{
+				tree_mark::clear_fd(self.0.as_raw_fd());
+			}
 		}
 	}
 }
@@ -2775,10 +2812,11 @@ fn resolve_leaf(path: &Path) -> PathBuf {
 }
 
 /// Removes the registration `admin`, which names `tree` and holds an
-/// [`ADD_IN_PROGRESS`] marker, with `tree`, when the add that made it is
-/// dead and both are still what it left. Returns the note to show; `None`
-/// when the marker went or changed meanwhile (the add finished, or another
-/// add took the registration), so there is nothing of a dead add left here.
+/// [`ADD_IN_PROGRESS`] marker, and empties `tree`, when the add that made
+/// them is dead and both are still what it left. Returns the note to show;
+/// `None` when the marker went or changed meanwhile (the add finished, or
+/// another add took the registration), so there is nothing of a dead add
+/// left here.
 fn reclaim_abandoned_add(common: &Path, admin: &Path, tree: &Path) -> Result<Option<String>> {
 	// Open for writing too: an NFS client emulates `flock` with a whole-file
 	// `fcntl` lock, and an exclusive one needs a writable descriptor.
@@ -2791,12 +2829,7 @@ fn reclaim_abandoned_add(common: &Path, admin: &Path, tree: &Path) -> Result<Opt
 		Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
 		Err(err) => return Err(err.into()),
 	};
-	let result = reclaim_with_marker(common, admin, tree, &marker);
-	// The lock belongs to the open file, which a child forked but not yet
-	// exec'd shares for a moment; unlocking frees it for every holder, so a
-	// retry right after a refusal is not taken for a live add.
-	release(marker);
-	result
+	reclaim_with_marker(common, admin, tree, marker)
 }
 
 /// [`reclaim_abandoned_add`] with the marker already open, as a reclaim that
@@ -2805,8 +2838,64 @@ fn reclaim_with_marker(
 	common: &Path,
 	admin: &Path,
 	tree: &Path,
-	marker: &fs::File,
+	marker: fs::File,
 ) -> Result<Option<String>> {
+	let checked = take_abandoned_add(common, admin, tree, &marker);
+	// The marker goes before the moved registration is deleted: on NFS a file
+	// still open when it is deleted is renamed to `.nfs…` instead, which
+	// keeps its directory. Unlocking also frees the lock for a child forked
+	// but not yet exec'd, which shares the open file, so a retry right after a
+	// refusal is not taken for a live add.
+	release(marker);
+	Ok(checked?.map(Reclaimed::finish))
+}
+
+/// What a reclaim took from a dead add while its marker was held: the note
+/// so far, the registration moved out of git's view, and (on Linux) the
+/// emptied tree with the token the add set on it.
+struct Reclaimed {
+	note:  String,
+	moved: PathBuf,
+	#[cfg(target_os = "linux")]
+	tree:  Option<(tree_dir::TreeDir, String)>,
+}
+
+impl Reclaimed {
+	/// Deletes the moved registration and clears the add's token from the
+	/// tree, only if the tree still holds that token: an add of the same path
+	/// that started after the registration moved has set its own. Returns the
+	/// note, with what could not be deleted.
+	fn finish(self) -> String {
+		use std::fmt::Write as _;
+		#[cfg(test)]
+		test_hooks::after_registration_moved(&self.moved);
+		let mut note = self.note;
+		if let Err(err) = fs::remove_dir_all(&self.moved)
+			&& err.kind() != io::ErrorKind::NotFound
+		{
+			let _ = write!(
+				note,
+				"; could not delete the removed registration {}: {err}",
+				self.moved.display()
+			);
+		}
+		#[cfg(target_os = "linux")]
+		if let Some((dir, token)) = self.tree {
+			dir.clear_mark_if(&token);
+		}
+		note
+	}
+}
+
+/// Checks that the registration `admin` is a dead add's and still what it
+/// left, empties its tree and moves the registration out of git's view, all
+/// while `marker` is held. `None` when the marker went or changed meanwhile.
+fn take_abandoned_add(
+	common: &Path,
+	admin: &Path,
+	tree: &Path,
+	marker: &fs::File,
+) -> Result<Option<Reclaimed>> {
 	let refuse = |why: &str| {
 		Error::backend(
 			"git worktree add",
@@ -2852,7 +2941,13 @@ fn reclaim_with_marker(
 		let refuse_record = || {
 			refuse("whose marker records nothing to check, or whose lock was changed or removed since")
 		};
-		let Some((first, locked)) = record.split_once('\n') else {
+		let Some((first, rest)) = record.split_once('\n') else {
+			return Err(refuse_record());
+		};
+		let Some((head, locked)) = rest
+			.split_once('\n')
+			.and_then(|(line, locked)| Some((line.strip_prefix("head ")?, locked)))
+		else {
 			return Err(refuse_record());
 		};
 		let made = match first.strip_prefix("tree ") {
@@ -2863,21 +2958,35 @@ fn reclaim_with_marker(
 		if fs::read(admin.join("locked")).ok().as_deref() != Some(locked.as_bytes()) {
 			return Err(refuse_record());
 		}
-		let (note, dir) = reclaim_tree(common, admin, tree, made.as_ref(), &refuse)?;
-		// Removed while the marker is held, so no other add can take it first.
-		let leftover = remove_registration(common, admin)?;
-		// The token goes after: until the registration is gone, a retry must
-		// still find the tree it can empty. A token left behind matches no
-		// marker.
-		#[cfg(target_os = "linux")]
-		if let Some(dir) = dir {
-			dir.clear_mark();
+		// A commit or a checkout in the tree after the add died is recorded
+		// only here: `HEAD` moves (a detached commit is reachable from nothing
+		// else) and `logs/HEAD` appears. Removing the registration would lose
+		// both.
+		if fs::read_to_string(admin.join("HEAD")).ok().as_deref() != Some(&format!("{head}\n")) {
+			return Err(refuse(
+				"whose HEAD moved since that add wrote it (a commit or a checkout there), which \
+				 removing it would lose",
+			));
 		}
+		match fs::symlink_metadata(admin.join("logs").join("HEAD")) {
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+			_ => {
+				return Err(refuse(
+					"whose HEAD has a reflog (a commit or a checkout there), which removing it would \
+					 lose",
+				));
+			},
+		}
+		let (note, dir) = reclaim_tree(common, admin, tree, made.as_ref(), &refuse)?;
+		// Moved while the marker is held, so no other add can take it first.
+		let moved = move_registration(common, admin)?;
 		#[cfg(not(target_os = "linux"))]
 		let _ = dir;
-		Ok(Some(match leftover {
-			Some(leftover) => format!("{note}; {leftover}"),
-			None => note,
+		Ok(Some(Reclaimed {
+			note,
+			moved,
+			#[cfg(target_os = "linux")]
+			tree: dir.zip(made.map(|made| made.token)),
 		}))
 	}
 	#[cfg(not(unix))]
@@ -2976,23 +3085,55 @@ fn reclaim_tree(
 	}
 }
 
+/// Prefix of a registration a reclaim moved out of `worktrees/` before
+/// deleting it.
+const MOVED_REGISTRATION: &str = "omp-removed-worktree-";
+
 /// Takes the registration `admin` out of git's view at once, by moving it out
-/// of `worktrees/` into the common directory, then deletes it. A move that
-/// fails leaves the registration whole, so a later add finds and retries it.
-/// Returns a note when the moved copy could not be deleted.
+/// of `worktrees/` into the common directory, and returns where it went. A
+/// move that fails leaves the registration whole, so a later add finds and
+/// retries it.
 #[cfg(unix)]
-fn remove_registration(common: &Path, admin: &Path) -> io::Result<Option<String>> {
+fn move_registration(common: &Path, admin: &Path) -> io::Result<PathBuf> {
 	let name = admin
 		.file_name()
 		.map_or_else(String::new, |name| name.to_string_lossy().into_owned());
 	let stamp = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_or(0, |since| since.as_nanos());
-	let moved = common.join(format!("omp-removed-worktree-{name}-{}-{stamp}", std::process::id()));
+	let moved = common.join(format!("{MOVED_REGISTRATION}{name}-{}-{stamp}", std::process::id()));
 	fs::rename(admin, &moved)?;
-	Ok(fs::remove_dir_all(&moved)
-		.err()
-		.map(|err| format!("could not delete the removed registration {}: {err}", moved.display())))
+	Ok(moved)
+}
+
+/// Deletes the registrations earlier reclaims moved out of `worktrees/` and
+/// did not get to delete (a kill between the move and the delete, or a file
+/// that could not go). Git never reads them; a failure is left for the next
+/// add.
+fn sweep_moved_registrations(common: &Path) {
+	let Ok(entries) = fs::read_dir(common) else {
+		return;
+	};
+	for entry in entries.filter_map(std::result::Result::ok) {
+		if entry
+			.file_name()
+			.to_string_lossy()
+			.starts_with(MOVED_REGISTRATION)
+			&& entry.file_type().is_ok_and(|kind| kind.is_dir())
+		{
+			let _ = fs::remove_dir_all(entry.path());
+		}
+	}
+}
+
+/// Gives `dir` the permissions `mode` when it has others. Only the owner (or
+/// root) may change a mode, even to the same value, so a directory someone
+/// else owns that still has its mode is left alone.
+fn restore_mode(dir: &Path, mode: &fs::Permissions) -> io::Result<()> {
+	if fs::symlink_metadata(dir)?.permissions() != *mode {
+		fs::set_permissions(dir, mode.clone())?;
+	}
+	Ok(())
 }
 
 /// Adds the owner's read, write and search bits to the directory `dir`'s
@@ -3019,6 +3160,23 @@ mod test_hooks {
 	thread_local! {
 		static BEFORE_MARKER_RELEASE: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static BEFORE_TREE_REMOVAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
+		static AFTER_REGISTRATION_MOVED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+	}
+
+	/// Runs `hook` with the moved registration's path after a reclaim on
+	/// this thread let go of the marker and before it deletes the moved
+	/// registration and clears the token, until [`clear`].
+	#[cfg(target_os = "linux")]
+	pub fn set_after_registration_moved(hook: impl FnMut(&Path) + 'static) {
+		AFTER_REGISTRATION_MOVED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+	}
+
+	pub fn after_registration_moved(moved: &Path) {
+		AFTER_REGISTRATION_MOVED.with(|slot| {
+			if let Some(hook) = slot.borrow_mut().as_mut() {
+				hook(moved);
+			}
+		});
 	}
 
 	/// Runs `hook` with the tree's path just before a reclaim on this thread
@@ -3047,6 +3205,7 @@ mod test_hooks {
 	pub fn clear() {
 		BEFORE_MARKER_RELEASE.with(|slot| *slot.borrow_mut() = None);
 		BEFORE_TREE_REMOVAL.with(|slot| *slot.borrow_mut() = None);
+		AFTER_REGISTRATION_MOVED.with(|slot| *slot.borrow_mut() = None);
 	}
 
 	pub fn before_marker_release(admin: &Path) {
@@ -3519,6 +3678,154 @@ mod tests {
 		fs::set_permissions(moved[0].join("stuck"), fs::Permissions::from_mode(0o700)).unwrap();
 	}
 
+	/// A commit or a checkout in a dead add's tree is recorded only in its
+	/// registration (`HEAD`, `logs/HEAD`); the reclaim refuses rather than
+	/// lose it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_tree_whose_head_moved_or_has_a_reflog() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		// A commit on the detached HEAD the add wrote.
+		let committed = trees.path().join("committed");
+		let admin = abandoned_add(&repo, &committed, None);
+		git(&committed, &[
+			"-c",
+			"user.name=T",
+			"-c",
+			"user.email=t@example.com",
+			"-c",
+			"commit.gpgsign=false",
+			"commit",
+			"-q",
+			"--allow-empty",
+			"-m",
+			"mine",
+		]);
+		let commit = git(&committed, &["rev-parse", "HEAD"]);
+		let err = repo
+			.worktree_reclaim_abandoned(&committed)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("HEAD moved"), "{err}");
+		assert_eq!(git(&committed, &["rev-parse", "HEAD"]), commit, "the commit is gone");
+		assert!(committed.join("partial").is_file() && admin.is_dir());
+		// HEAD moved with no reflog.
+		let moved = trees.path().join("moved");
+		let admin = abandoned_add(&repo, &moved, None);
+		fs::write(admin.join("HEAD"), "ref: refs/heads/elsewhere\n").unwrap();
+		let err = repo
+			.worktree_reclaim_abandoned(&moved)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("HEAD moved"), "{err}");
+		assert!(moved.join("partial").is_file() && admin.is_dir());
+		// HEAD as the add wrote it, with a reflog.
+		let logged = trees.path().join("logged");
+		let admin = abandoned_add(&repo, &logged, None);
+		fs::create_dir_all(admin.join("logs")).unwrap();
+		fs::write(admin.join("logs/HEAD"), "").unwrap();
+		let err = repo
+			.worktree_reclaim_abandoned(&logged)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("reflog"), "{err}");
+		assert!(logged.join("partial").is_file() && admin.is_dir());
+	}
+
+	/// A bare repository below the tree's root (`git init --bare`, a mirror
+	/// clone) is someone's work: the reclaim refuses and keeps it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_tree_holding_a_bare_repository_below_its_root() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		git(&tree, &["init", "-q", "--bare", "nested/m.git"]);
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("holds a repository below its root"), "{err}");
+		assert!(tree.join("nested/m.git/HEAD").is_file() && admin.is_dir());
+	}
+
+	/// A registration an earlier reclaim moved out of `worktrees/` and did not
+	/// delete (killed between the move and the delete) goes at the next add.
+	#[cfg(unix)]
+	#[test]
+	fn a_reclaim_deletes_registrations_earlier_reclaims_moved() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let left = common.join("omp-removed-worktree-wt-123-456");
+		fs::create_dir_all(left.join("logs")).unwrap();
+		fs::write(left.join("gitdir"), "/nowhere/.git\n").unwrap();
+		fs::write(left.join("logs/HEAD"), "").unwrap();
+		let trees = tempfile::tempdir().unwrap();
+		assert!(
+			repo
+				.worktree_reclaim_abandoned(&trees.path().join("unrelated"))
+				.unwrap()
+				.is_empty()
+		);
+		assert!(!left.exists(), "a moved registration was left behind");
+	}
+
+	/// A reclaim lets go of the dead add's marker before it deletes the moved
+	/// registration: on NFS a file still open when it is deleted is renamed
+	/// `.nfs…` instead, and its directory cannot go.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_reclaim_lets_go_of_the_marker_before_deleting_the_moved_registration() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let _admin = abandoned_add(&repo, &tree, None);
+		let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+		let record = std::rc::Rc::clone(&seen);
+		test_hooks::set_after_registration_moved(move |moved| {
+			let marker = fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(moved.join(ADD_IN_PROGRESS))
+				.unwrap();
+			record.borrow_mut().push(marker.try_lock().is_ok());
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		assert!(result.is_ok(), "{result:?}");
+		assert_eq!(
+			*seen.borrow(),
+			vec![true],
+			"the marker was still held when the moved registration was deleted"
+		);
+	}
+
+	/// An add of the same path that starts after the dead add's registration
+	/// moved sets its own token on the tree; the reclaim clears only the dead
+	/// add's.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_reclaim_keeps_a_token_another_add_set_after_the_move() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let _admin = abandoned_add(&repo, &tree, None);
+		let theirs = std::rc::Rc::new(std::cell::RefCell::new(None));
+		let record = std::rc::Rc::clone(&theirs);
+		let path = tree.clone();
+		test_hooks::set_after_registration_moved(move |_| {
+			*record.borrow_mut() = Some(tree_mark::set(&path).unwrap());
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		assert!(result.is_ok(), "{result:?}");
+		let theirs = theirs.borrow().clone();
+		assert!(theirs.is_some(), "the seam did not run");
+		assert_eq!(tree_mark::get(&tree).unwrap(), theirs, "the other add's token was cleared");
+	}
+
 	/// `reset_tree` keeps a directory that was there before the add (a
 	/// mount point, say) with the mode it had, and makes the add's own
 	/// directory again, writable, whatever mode a clone copied onto it.
@@ -3558,6 +3865,27 @@ mod tests {
 				tree.display()
 			);
 		}
+	}
+
+	/// A directory that was there before the add and that a failed clone
+	/// attempt removed (pi-iso removes a removable destination) is made again
+	/// with the mode it had.
+	#[cfg(unix)]
+	#[test]
+	fn reset_tree_makes_a_removed_directory_that_was_there_again_with_its_mode() {
+		use std::os::unix::fs::PermissionsExt;
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let head = git(repo.root(), &["rev-parse", "HEAD"]);
+		let kept = trees.path().join("kept");
+		fs::create_dir(&kept).unwrap();
+		fs::set_permissions(&kept, fs::Permissions::from_mode(0o750)).unwrap();
+		let pending = PendingWorktree::begin(&kept, &repo.info().common_dir, &head, None).unwrap();
+		fs::remove_dir_all(&kept).unwrap();
+		pending.reset_tree().unwrap();
+		let mode = fs::metadata(&kept).unwrap().permissions().mode() & 0o777;
+		assert_eq!(mode, 0o750, "made again with mode {mode:o}");
+		assert!(is_empty_dir_any(&kept));
 	}
 
 	/// A finished add leaves no token on its tree.
@@ -3605,7 +3933,7 @@ mod tests {
 		let admin = pending.admin.clone();
 		assert!(pending.finish(Some("in use")).is_empty());
 		drop(pending);
-		assert_eq!(reclaim_with_marker(&common, &admin, &done, &stale).unwrap(), None);
+		assert_eq!(reclaim_with_marker(&common, &admin, &done, stale).unwrap(), None);
 		assert!(done.join("work").is_file() && admin.is_dir(), "a finished add was removed");
 		// Another add took the registration's marker after the reclaim opened
 		// the dead add's: its record still matches the tree.
@@ -3618,14 +3946,14 @@ mod tests {
 		fs::write(&marker, &record).unwrap();
 		let holder = open(&marker);
 		holder.lock().unwrap();
-		assert_eq!(reclaim_with_marker(&common, &admin, &dead, &stale).unwrap(), None);
+		assert_eq!(reclaim_with_marker(&common, &admin, &dead, stale).unwrap(), None);
 		assert!(dead.join("partial").is_file() && admin.is_dir(), "a taken registration was removed");
 		// Control: the same registration, once its holder lets go, is the dead
 		// add's and goes.
-		drop(holder);
+		release(holder);
 		let fresh = open(&marker);
 		assert!(
-			reclaim_with_marker(&common, &admin, &dead, &fresh)
+			reclaim_with_marker(&common, &admin, &dead, fresh)
 				.unwrap()
 				.is_some()
 		);

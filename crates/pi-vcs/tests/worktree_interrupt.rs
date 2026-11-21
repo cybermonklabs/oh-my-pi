@@ -1,9 +1,10 @@
 //! A `worktree add` stopped by a signal before it finishes leaves a
 //! registration git reports as locked (`locked initializing`, what git's own
 //! add holds while it fills a tree). An add of another path leaves it alone; an
-//! add of the same path removes the partial tree and that registration, while
-//! both are still what the stopped add left, and refuses otherwise. While the
-//! stopped add's process lives, an add of its path is refused.
+//! add of the same path empties the partial tree (the directory stays) and
+//! removes that registration, while both are still what the stopped add left,
+//! and refuses otherwise. While the stopped add's process lives, an add of its
+//! path is refused.
 //!
 //! The add runs in a child process: this test binary run again with
 //! [`CHILD_SOURCE`] set, on the test [`interrupted_add_child`] alone.
@@ -253,7 +254,8 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 		"an add of another path removed the registration"
 	);
 
-	// An add of the same path removes the partial tree and its registration.
+	// An add of the same path empties the partial tree and removes its
+	// registration.
 	let again = repo
 		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
 		.unwrap_or_else(|err| {
@@ -293,22 +295,22 @@ fn interrupt_and_recover(clone: &str, tracked: bool, kill: libc::c_int) {
 }
 
 #[test]
-fn a_clone_killed_midway_is_removed_by_an_add_of_its_path() {
+fn a_clone_killed_midway_is_emptied_by_an_add_of_its_path() {
 	interrupt_and_recover("auto", false, libc::SIGKILL);
 }
 
 #[test]
-fn a_clone_terminated_midway_is_removed_by_an_add_of_its_path() {
+fn a_clone_terminated_midway_is_emptied_by_an_add_of_its_path() {
 	interrupt_and_recover("auto", false, libc::SIGTERM);
 }
 
 #[test]
-fn a_checkout_killed_midway_is_removed_by_an_add_of_its_path() {
+fn a_checkout_killed_midway_is_emptied_by_an_add_of_its_path() {
 	interrupt_and_recover("off", true, libc::SIGKILL);
 }
 
 #[test]
-fn a_checkout_terminated_midway_is_removed_by_an_add_of_its_path() {
+fn a_checkout_terminated_midway_is_emptied_by_an_add_of_its_path() {
 	interrupt_and_recover("off", true, libc::SIGTERM);
 }
 
@@ -428,6 +430,37 @@ fn an_add_refuses_a_killed_adds_tree_with_a_repository_cloned_below_its_root() {
 		.to_string();
 	assert!(refused.contains("holds a repository below its root"), "{refused}");
 	assert_eq!(git(&dep, &["log", "-1", "--format=%s"]), "unpushed", "the clone was removed");
+	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
+}
+
+/// The agent kept working in the killed add's tree and committed on its
+/// detached HEAD: git records that commit only in the registration
+/// (`HEAD`, `logs/HEAD`). An add of the path refuses, as git refuses a path
+/// that exists, and the commit stays reachable.
+#[test]
+fn an_add_refuses_a_killed_adds_tree_with_a_commit_on_its_head() {
+	let (_temp, source, repo, target) = abandoned();
+	git(&target, &[
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@example.com",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-q",
+		"--allow-empty",
+		"-m",
+		"fix",
+	]);
+	let commit = git(&target, &["rev-parse", "HEAD"]);
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("HEAD moved"), "{refused}");
+	assert_eq!(git(&target, &["rev-parse", "HEAD"]), commit, "the commit is gone");
+	assert_eq!(git(&target, &["log", "-1", "--format=%s"]), "fix");
 	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
 }
 

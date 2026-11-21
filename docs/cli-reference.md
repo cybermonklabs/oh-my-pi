@@ -363,16 +363,18 @@ leaves that locked registration and its partial tree. On Linux, where the
 filesystem keeps user extended attributes, another add of the same path then
 empties that tree (the directory stays) and removes the registration first,
 and says so, when it can tell both are still the stopped add's: nobody changed
-or removed its lock, the directory is the one the add made (same device and
-inode, and the random token the add set on it as an extended attribute), and
-the tree holds no `.git` but the add's own gitfile at its root. Any other file
-written into that tree after the add stopped is removed with it. A directory
-made again in its place with `mkdir` never carries the token, even with the
-same inode; a copy that keeps extended attributes (`cp -a`, `tar --xattrs`)
-does. Otherwise that add refuses and names the registration, as git refuses a
-registered path, and so does it when a repository was cloned or initialised
-anywhere in the tree; adds of other paths never touch it. Without user
-extended attributes (off Linux, or on a filesystem without them) the stopped
-add's tree is never emptied by a later add. On a filesystem that cannot lock
-files, an add goes on without its add-in-progress marker, and a killed one is
-never removed by a later add.
+or removed its lock, its `HEAD` is still what the add wrote and has no reflog
+(no commit or checkout was made there), the directory is the one the add made
+(same device and inode, and the random token the add set on it as an extended
+attribute), and the tree holds no repository: no `.git` but the add's own
+gitfile at its root, and no bare repository (a directory holding `HEAD`,
+`objects` and `refs`). Any other file written into that tree after the add
+stopped, and anything staged there, is removed with it. A directory made again
+in its place with `mkdir` never carries the token, even with the same inode; a
+copy that keeps extended attributes (`cp -a`, `tar --xattrs`) does. Otherwise
+that add refuses and names the registration, as git refuses a registered path;
+adds of other paths never touch it. Without user extended attributes (off
+Linux, or on a filesystem without them) the stopped add's tree is never
+emptied by a later add. On a filesystem that cannot lock files, an add goes on
+without its add-in-progress marker, and a killed one is never emptied by a
+later add.

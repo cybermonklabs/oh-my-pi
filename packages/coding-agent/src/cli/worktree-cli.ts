@@ -121,9 +121,9 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	const repository = vcs.requireGit(cwd);
 	const worktreePath = path.resolve(cwd, options.path);
 	// An add of this path that died before it finished (a signal, a timeout's
-	// kill) left a registration that says so. It goes first, with the tree it
-	// made, so the path can be added again; one it cannot prove abandoned is
-	// refused here, before any branch is made.
+	// kill) left a registration that says so. It goes first and the tree it
+	// made is emptied, so the path can be added again; one it cannot prove
+	// abandoned is refused here, before any branch is made.
 	for (const note of await repository.worktreeReclaimAbandoned(worktreePath)) {
 		console.error(chalk.dim(`note: ${note}`));
 	}
