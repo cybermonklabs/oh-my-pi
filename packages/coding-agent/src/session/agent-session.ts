@@ -6826,15 +6826,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#fallbackExtensionTimers?.clearAll();
 		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
 		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}). Any other dispose cuts it off,
-		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt, and a
-		// process exit labels a turn still in flight as interrupted. The reason says the kind to a
-		// sync subagent of the turn or of a continuation already running.
+		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt. When
+		// the process is going away (its exit, a signal such as a pod's SIGTERM, a fatal error: any
+		// postmortem reason but a manual cleanup), a turn still in flight is labeled as interrupted,
+		// which `omp --restore` continues: nobody chose that end. A dispose the process lives on after
+		// (no reason, or a manual one) gives the platform's own reason, marked as a cut-off. The
+		// reason says the kind to a sync subagent of the turn or of a continuation already running.
 		const stop = options.ownedJobsEnd === "stop";
 		this.#recovery.abortRetry({ cutOff: !stop });
 		this.abortCompaction();
+		const processEnds = options.reason !== undefined && options.reason !== postmortem.Reason.MANUAL;
 		const abortReason = stop
 			? plainTurnAbortReason("stop")
-			: options.reason === postmortem.Reason.EXIT
+			: processEnds
 				? INTERRUPTED_TURN_ERROR
 				: plainTurnAbortReason("cutOff");
 		const postPromptDrain = this.#cancelPostPromptTasks(abortReason);

@@ -28,6 +28,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { EVAL_STATE_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/eval/state";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -299,14 +300,23 @@ async function openParentWithKeyedWorkers(
 /**
  * Ends the parent's process once its subagent runs settled (every live session closes),
  * then has a new process restore the parent's session from its file: what `--restore`
- * relaunched, the parent's entries it read, and the subagent transcripts it judged. An entry
- * `neutralize` selects is read as a custom entry of another type, in its place in the tree.
+ * relaunched, the parent's entries it read and its leaf, the subagent transcripts it judged,
+ * and the jobs whose results reached the parent. An entry `neutralize` selects is read as a
+ * custom entry of another type, in its place in the tree. `resumed` writes what the new
+ * process appends to the parent's transcript as it starts, before `--restore` reads it.
  */
 async function restoreInNewProcess(
 	parent: AgentSession,
 	runs: readonly Promise<SingleResult>[],
 	neutralize?: (entry: SessionEntry) => boolean,
-): Promise<{ outcome: RestoreOutcome; parentEntries: SessionEntry[]; subagents: SubSession[] }> {
+	resumed?: (manager: SessionManager) => void,
+): Promise<{
+	outcome: RestoreOutcome;
+	parentEntries: SessionEntry[];
+	parentLeafId: string | null;
+	subagents: SubSession[];
+	delivered: string[];
+}> {
 	await Promise.allSettled(runs);
 	const parentFile = parent.sessionManager.getSessionFile();
 	if (!parentFile) throw new Error("Expected a persisted parent session file");
@@ -317,6 +327,7 @@ async function restoreInNewProcess(
 	AgentRegistry.resetGlobalForTests();
 	// The new process reads the parent's transcript as the last one left it in its file.
 	const reopened = await SessionManager.open(parentFile, undefined, undefined, { suppressBreadcrumb: true });
+	resumed?.(reopened);
 	const parentEntries = reopened
 		.getEntries()
 		.map(entry =>
@@ -326,7 +337,10 @@ async function restoreInNewProcess(
 	await reopened.close();
 	const manager = new AsyncJobManager({});
 	cleanups.push(() => manager.dispose({ timeoutMs: 1000 }));
-	manager.registerDeliverySink(MAIN_AGENT_ID, () => {});
+	const delivered: string[] = [];
+	manager.registerDeliverySink(MAIN_AGENT_ID, jobId => {
+		delivered.push(jobId);
+	});
 	vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => subagentResult(options.id));
 	const outcome = await restoreSession({
 		sessionManager: { getSessionFile: () => parentFile, getEntries: () => parentEntries, getLeafId: () => leafId },
@@ -335,7 +349,14 @@ async function restoreInNewProcess(
 		restoreInterruptedTurn: vi.fn(async () => false),
 	} as unknown as AgentSession);
 	for (const id of outcome.subagents) await manager.getJob(id)?.promise;
-	return { outcome, parentEntries, subagents: Object.values(await collectSubSessions(parentFile)) };
+	await manager.drainDeliveries({ filter: { ownerId: MAIN_AGENT_ID } });
+	return {
+		outcome,
+		parentEntries,
+		parentLeafId: leafId,
+		subagents: Object.values(await collectSubSessions(parentFile)),
+		delivered,
+	};
 }
 
 function subagentResult(id: string): SingleResult {
@@ -626,6 +647,43 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		expect(outcome.subagents).toEqual(ids);
 	}, 30_000);
 
+	it("relaunches the subagent a SIGTERM to the parent cut off, restores the parent's turn and delivers the result to it", async () => {
+		// If this regresses, a signal's teardown aborts the parent's turn with the platform's own reason, so the turn
+		// ends on a plain abort instead of the interrupted-turn record: `omp --restore` does not continue it, and, once
+		// the resumed process wrote its eval runtime snapshot, it no longer relaunches the subagent the signal cut off.
+		// A pod release or restart ends every role this way; nobody chose that stop.
+		const { parent, runs } = await openParentWithKeyedWorkers("eval");
+		const backoff = holdBackoff(1);
+		const turn = parent.prompt("Delegate reading the notes from a script.");
+		await backoff.allHeld;
+		expect(runs).toHaveLength(1);
+		await parent.dispose({ reason: postmortem.Reason.SIGTERM });
+		await turn;
+
+		const { outcome, parentEntries, parentLeafId, subagents, delivered } = await restoreInNewProcess(
+			parent,
+			runs,
+			undefined,
+			// The resumed process writes its eval runtime snapshot as it starts, before `--restore` reads the transcript.
+			manager =>
+				manager.appendCustomMessageEntry(
+					EVAL_STATE_CONTEXT_TYPE,
+					"Eval runtime: no kernel.",
+					false,
+					undefined,
+					"agent",
+				),
+		);
+		backoff.wait.mockRestore();
+
+		const ids = subagents.map(sub => sub.agentId);
+		expect(ids).toHaveLength(1);
+		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
+		expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(true);
+		expect(outcome.subagents).toEqual(ids);
+		expect(delivered).toEqual(ids);
+	}, 30_000);
+
 	it("relaunches the subagent an abort that cut the parent's turn off left, as the worktree exit's does", async () => {
 		// If this regresses, the session's abort hands the eval cell no reason of the turn's, so the cell stops its
 		// `tool.task` call: the TUI's worktree exit, which cuts the parent's turn off, ends the subagent's turn on an
@@ -647,9 +705,10 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		expect(outcome.subagents).toEqual(ids);
 	}, 30_000);
 
-	it("leaves the subagent the user's stop ended", async () => {
+	it("leaves the subagent the user's stop ended (control for the SIGTERM case: same window, same resumed snapshot)", async () => {
 		// If this regresses, the user's stop reaches the cell's subagent as a cut-off: its turn keeps the marked
-		// error, and `omp --restore` relaunches work the user stopped.
+		// error, and `omp --restore` relaunches work the user stopped; or the parent's stopped turn reads as one a
+		// process exit cut off, and `--restore` continues it.
 		const { parent, runs } = await openParentWithKeyedWorkers("eval");
 		const backoff = holdBackoff(1);
 		const turn = parent.prompt("Delegate reading the notes from a script.");
@@ -658,12 +717,26 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		await parent.abort({ reason: USER_INTERRUPT_LABEL });
 		await turn;
 
-		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		const { outcome, parentEntries, parentLeafId, subagents, delivered } = await restoreInNewProcess(
+			parent,
+			runs,
+			undefined,
+			manager =>
+				manager.appendCustomMessageEntry(
+					EVAL_STATE_CONTEXT_TYPE,
+					"Eval runtime: no kernel.",
+					false,
+					undefined,
+					"agent",
+				),
+		);
 		backoff.wait.mockRestore();
 
 		expect(subagents.map(turnEnd)).toEqual([
 			{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
 		]);
+		expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(false);
 		expect(outcome.subagents).toEqual([]);
+		expect(delivered).toEqual([]);
 	}, 30_000);
 });

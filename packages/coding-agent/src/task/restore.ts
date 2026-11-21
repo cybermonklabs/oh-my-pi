@@ -26,6 +26,7 @@ import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
 import { readEvalAgentJobRecord } from "../eval/agent-job-records";
+import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
@@ -354,12 +355,15 @@ function settledJobAgentIds(details: unknown): string[] {
 	return ids;
 }
 
-/** Whether a transcript entry is input that starts a turn: a message other than a reply or a tool result, or a custom message. */
+/**
+ * Whether a transcript entry is input that starts a turn: a message other than a reply or a tool
+ * result, or a custom message, but for the eval runtime snapshot a process writes as it starts
+ * (`EVAL_STATE_CONTEXT_TYPE`): context the resumed process adds before `omp --restore` reads the
+ * transcript, not an input anyone sent.
+ */
 function isTurnInput(entry: SessionEntry): boolean {
-	return (
-		entry.type === "custom_message" ||
-		(entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult")
-	);
+	if (entry.type === "custom_message") return entry.customType !== EVAL_STATE_CONTEXT_TYPE;
+	return entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult";
 }
 
 /**
