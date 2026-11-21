@@ -534,24 +534,37 @@ pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send +
 /// ([`FIFO_RELEASE_ATTEMPTS`]). The helper's descriptor is closed, and the
 /// open fails with [`crate::cancelled`]. Other opens of the same end waiting
 /// at that moment are released too: a reader reads EOF, a writer's first
-/// write fails with `EPIPE`. On Linux the releases reach the FIFO the open
-/// started on, whatever its name holds later ([`FifoPin`]), and so does the
-/// helper, unless the open has `O_CREAT`: the helper then opens the name
-/// with the caller's options ([`creates`]). Elsewhere the helper and its
-/// releases open the name, and a release that reached another FIFO closes
-/// it at once and stops.
+/// write fails with `EPIPE`. Where `/proc/self/fd` is there (Linux with
+/// `/proc`), the releases reach the FIFO the open started on, whatever its
+/// name holds later ([`FifoPin`]), and so does the helper, unless the open
+/// has `O_CREAT`: the helper then opens the name with the caller's options
+/// ([`creates`]). Elsewhere (off Linux, and on Linux without `/proc`) the
+/// helper and its releases open the name, and a release that reached
+/// another FIFO closes it at once and stops.
 ///
-/// The open with `O_CREAT` leaves a window on Linux: if the name is given to
-/// another FIFO B between the pin and the helper's open (`rm p; mkfifo p`),
-/// the helper waits on B, which no release reaches (each opens the pinned
-/// FIFO). A cancel then runs every attempt, about a second, and the open
-/// fails with [`crate::cancelled`]; the helper thread stays blocked in
-/// `open`, holding the pin's descriptor (on a handle, also its duplicate of
-/// the directory's descriptor), until B's next peer connects. That peer
-/// meets an end that closes at once: a reader reads end of file, a writer's
-/// first write fails with `EPIPE`. No release can reach the helper there
-/// without opening the other end of whatever FIFO the name holds, which
-/// would complete another open waiting on B.
+/// An open with `O_CREAT` leaves a window where `/proc/self/fd` is there: if
+/// the name is given to another FIFO B between the pin and the helper's
+/// open (`rm p; mkfifo p`), the helper waits on B, which no release reaches
+/// (each opens the pinned FIFO). A cancel then runs every attempt, about a
+/// second; an async open's cancel spends that second on the runtime worker
+/// that awaits it ([`Self::wait_async`]). The open fails with
+/// [`crate::cancelled`], and the helper thread stays blocked in `open`,
+/// holding the pin's descriptor (on a handle, also its duplicate of the
+/// directory's descriptor), until B's next peer connects. If B's name goes
+/// first (a script that ends with `rm p`), nothing can open B again, and
+/// the thread and those descriptors stay for the life of the process. A
+/// peer that connects completes the helper's open; the helper's end closes
+/// once its result finds nobody to receive it. A reader peer then reads end
+/// of file; a writer peer's writes before that close land in B's buffer and
+/// are lost, and its writes after it fail with `EPIPE`.
+///
+/// That window is a trade-off, not a limit. One last release attempt by
+/// name (the `release_by_name` that [`Self::start_pinned`] takes), made only
+/// for an open with `O_CREAT` and only after every pinned attempt went
+/// unanswered, would reach the helper on B. It is not made: it would also
+/// complete every other open waiting on B's same end, and B is a FIFO this
+/// open never pinned; keeping a release from reaching a FIFO its open did
+/// not start on is what the pin is for.
 ///
 /// An open that is dropped before it finishes (the job that made it was
 /// aborted, its run task was dropped) is released the same way, on a

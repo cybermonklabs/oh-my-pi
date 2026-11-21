@@ -1689,10 +1689,12 @@ mod unix {
 	/// with the helper and releases reaching the FIFO by name, as without
 	/// `/proc`. In a process of its own, apart from the `/proc` half: there
 	/// each release keeps trying for about a second on a thread of its own
-	/// (its helper is held), and the by-name switch is the process's, so a
-	/// switch made under such a release would turn its next attempt into a
-	/// by-name one, whose writer can meet the end this test's release holds
-	/// for a moment before it finds another FIFO and closes it.
+	/// (its helper is held), and the by-name switch is the process's. A
+	/// release still trying after the switch finds no reopen path, so its
+	/// attempt opens nothing; but the test's release hook still runs for that
+	/// attempt, and the hook's writer probe on the current FIFO can meet the
+	/// end this test's by-name release holds for a moment, between its open
+	/// and its check, before it finds another FIFO and closes it.
 	#[test]
 	fn a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on_by_name() {
 		if crate::dir_handle::alone(

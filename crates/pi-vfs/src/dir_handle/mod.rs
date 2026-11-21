@@ -623,13 +623,14 @@ fn host_fifo_end(
 }
 
 /// Starts the open of `end` of the FIFO `name` in `handle`, pinned as `pin`,
-/// on a helper thread ([`FifoOpening::start_pinned`]). On Linux each release
-/// reaches the pinned FIFO through `/proc/self/fd`, and so does the helper,
-/// unless the open has `O_CREAT`: that helper opens `name` with the caller's
-/// options, relative to a duplicate of the directory's descriptor.
-/// Elsewhere the helper opens `name` there, and each release opens its
-/// other end there without blocking and closes it at once when it is
-/// another FIFO. No check of the name decides whether a release runs.
+/// on a helper thread ([`FifoOpening::start_pinned`]). Where `/proc/self/fd`
+/// is there (Linux with `/proc`), each release reaches the pinned FIFO
+/// through it, and so does the helper, unless the open has `O_CREAT`: that
+/// helper opens `name` with the caller's options, relative to a duplicate of
+/// the directory's descriptor. Elsewhere (off Linux, and on Linux without
+/// `/proc`) the helper opens `name` there, and each release opens its other
+/// end there without blocking and closes it at once when it is another
+/// FIFO. No check of the name decides whether a release runs.
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
