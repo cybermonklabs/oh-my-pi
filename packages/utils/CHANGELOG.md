@@ -9,7 +9,8 @@
 - Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
 - Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
 - Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time
-- Added `tryAcquireFileLockUnlessHeld`, which answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
+- Added `tryAcquireFileLockUnlessHeld`, which on Linux answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
+- Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to on that `RangeError`, which gives `JSON.stringify`'s bytes
 
 ### Fixed
 

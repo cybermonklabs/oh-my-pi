@@ -4,11 +4,13 @@
  *
  * The model context only needs the entries of the current branch from the
  * latest compaction's cut on (see {@link coldBoundary}). An entry before the
- * cut, or off the current branch, becomes *cold*, as do, from the cut on, a
- * patch record and a user's edit of the to-do list that is not the newest
- * snapshot: the same object, converted in place, whose small values stay data
- * properties and whose large values become enumerable accessors that read the
- * entry's record back from a {@link ColdEntryStore}. A cold message keeps as
+ * cut, or off the current branch, becomes *cold*, as do, from the cut on, the
+ * records no context or turn reads there ({@link isStoredPastCut}, but for the
+ * newest of a kind kept whole by position) and a compaction older than every
+ * compaction a context build reads: the same object, converted in place, whose
+ * small values stay data properties and whose large values become enumerable
+ * accessors that read the entry's record back from a {@link ColdEntryStore}.
+ * A cold message keeps as
  * data only the small values of the fields that readers walking the whole
  * branch on every turn read ({@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}); its
  * other fields are accessors whatever their size. A cold to-do edit or tool
@@ -33,10 +35,13 @@ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import {
+	approvedPlanFileOf,
+	COLD_APPROVED_PLAN_FILE,
 	COLD_OWNER,
 	COLD_ROLLOVER_REQUEST,
 	type ColdCustomMessageSlots,
 	type ColdMessageSlots,
+	type ColdModeChangeSlots,
 	coldRolloverRequestMark,
 } from "./cold-message";
 import { CONTEXT_NOTES_ENTRY_TYPE, contextNotesEntriesRead } from "./context-notes";
@@ -80,7 +85,10 @@ const CACHE_ENTRIES = 8;
 const CACHE_BYTES = 16 * 1024 * 1024;
 /**
  * Records are written to the store's file, or compressed into one block when
- * the store keeps them in memory, in batches of at least this size.
+ * the store keeps them in memory, in batches of about this size: a batch
+ * closes at the record that takes it past this size, and a file store's read
+ * of a record still gathered writes the batch at once, so a write can be
+ * smaller and so can the block a failed write leaves.
  */
 const WRITE_BATCH_BYTES = 1024 * 1024;
 /**
@@ -227,19 +235,33 @@ const MESSAGE_IDENTITY_FIELDS: ReadonlySet<string> = new Set([
 	"customType",
 ]);
 
+/** The compactions a context build on a path can start from. */
+export interface ReadCompactions {
+	/** The newest compaction on the path: the one a build with no model starts from. */
+	readonly newest: CompactionEntry | null;
+	/** The newest compaction the model can replay; `newest` with no model. */
+	readonly readable: CompactionEntry | null;
+}
+
+/** {@link ReadCompactions} of `path` for `model`. */
+export function readCompactions(path: readonly SessionEntry[], model: Model | undefined): ReadCompactions {
+	const newest = getReadableCompactionEntry(path, undefined);
+	return { newest, readable: model ? getReadableCompactionEntry(path, model) : newest };
+}
+
 /**
  * Entries of `path` kept whole before the cut although their type is not:
  * the newest `session_init` (the contract a revived subagent rebuilds from),
  * the newest canonical to-do snapshot, a `todo` result that records the list
  * or a user's edit of it (what the to-do list restores from), the newest to-do
- * HUD choice and the newest mode change (what a resume restores; older ones
- * are read by nothing), the notebook revisions every context build reads
- * ({@link contextNotesEntriesRead}), and the request the context of an
- * `experimental-context-rollover` compaction takes from before its kept
- * entries ({@link rolloverRequest}), for the compaction a context build
- * starts from with no model and the one it starts from for `model`.
+ * HUD choice and the newest mode change (what a resume restores; of an older
+ * one a resume reads only its mode and the approved plan file it names, both
+ * in memory: {@link COLD_APPROVED_PLAN_FILE}), the notebook revisions every
+ * context build reads ({@link contextNotesEntriesRead}), and the request the
+ * context of an `experimental-context-rollover` compaction takes from before
+ * its kept entries ({@link rolloverRequest}), for each of `compactions`.
  */
-export function entriesKeptWholeOnPath(path: readonly SessionEntry[], model: Model | undefined): Set<SessionEntry> {
+export function entriesKeptWholeOnPath(path: readonly SessionEntry[], compactions: ReadCompactions): Set<SessionEntry> {
 	const kept = new Set<SessionEntry>(contextNotesEntriesRead(path));
 	let sessionInit = false;
 	let todo = false;
@@ -261,8 +283,7 @@ export function entriesKeptWholeOnPath(path: readonly SessionEntry[], model: Mod
 			todo = true;
 		}
 	}
-	const newest = getReadableCompactionEntry(path, undefined);
-	const readable = model ? getReadableCompactionEntry(path, model) : newest;
+	const { newest, readable } = compactions;
 	for (const compaction of readable === newest ? [newest] : [newest, readable]) {
 		const request = compaction ? rolloverRequest(path, compaction) : undefined;
 		if (request) kept.add(request);
@@ -295,15 +316,13 @@ function rolloverRequest(path: readonly SessionEntry[], compaction: CompactionEn
 
 /**
  * Index in `path` of the cut for the leaf that `path` ends at: the first entry
- * the context keeps ({@link compactionKeptStart}) of the newest compaction on
- * the path and, with `model`, of the newest compaction `model` can replay,
+ * the context keeps ({@link compactionKeptStart}) of each of `compactions`,
  * whichever comes first. 0 (nothing cold) when the context uses no compaction.
  */
-export function coldCutPathIndex(path: readonly SessionEntry[], model: Model | undefined): number {
-	const compactions = [getReadableCompactionEntry(path, undefined)];
-	if (model) compactions.push(getReadableCompactionEntry(path, model));
+export function coldCutPathIndex(path: readonly SessionEntry[], compactions: ReadCompactions): number {
+	const { newest, readable } = compactions;
 	let start = path.length;
-	for (const compaction of compactions) {
+	for (const compaction of readable === newest ? [newest] : [newest, readable]) {
 		if (!compaction) return 0;
 		start = Math.min(start, compactionKeptStart(path, compaction, path.indexOf(compaction)));
 	}
@@ -409,9 +428,10 @@ export function coldBoundary(
 	path: readonly SessionEntry[],
 	model: Model | undefined,
 ): ColdBoundary {
-	const cut = coldCutPathIndex(path, model);
-	const whole = cut > 0 ? entriesKeptWholeOnPath(path, model) : new Set<SessionEntry>();
-	const firstReadCompaction = cut > 0 ? firstReadCompactionIndex(path, model) : 0;
+	const compactions = readCompactions(path, model);
+	const cut = coldCutPathIndex(path, compactions);
+	const whole = cut > 0 ? entriesKeptWholeOnPath(path, compactions) : new Set<SessionEntry>();
+	const firstReadCompaction = cut > 0 ? firstReadCompactionIndex(path, compactions) : 0;
 	for (let index = cut; index < path.length; index++) {
 		const entry = path[index]!;
 		if (cut > 0 && (isStoredPastCut(entry) || (entry.type === "compaction" && index < firstReadCompaction))) continue;
@@ -426,15 +446,15 @@ export function coldBoundary(
 }
 
 /**
- * Index in `path` of the oldest compaction a context build reads: the newest
- * compaction, or the newest `model` can replay when that one is older; a build
- * for `model` passes over those between them, reading their preserved data.
- * Nothing reads a compaction before it but for its small values (the display
- * transcript marks it superseded).
+ * Index in `path` of the oldest of `compactions`, the oldest compaction a
+ * context build reads: the newest compaction, or the newest the model can
+ * replay when that one is older; a build for the model passes over those
+ * between them, reading their preserved data. Nothing reads a compaction
+ * before it but for its small values (the display transcript marks it
+ * superseded).
  */
-function firstReadCompactionIndex(path: readonly SessionEntry[], model: Model | undefined): number {
-	const newest = getReadableCompactionEntry(path, undefined);
-	const readable = model ? getReadableCompactionEntry(path, model) : newest;
+function firstReadCompactionIndex(path: readonly SessionEntry[], compactions: ReadCompactions): number {
+	const { newest, readable } = compactions;
 	return Math.min(newest ? path.indexOf(newest) : 0, readable ? path.indexOf(readable) : 0);
 }
 
@@ -444,7 +464,9 @@ function firstReadCompactionIndex(path: readonly SessionEntry[], model: Model | 
  * `session_exit` record, of which a resume reads only the newest's kind and
  * how many tool calls were pending, not their arguments), or one a newer
  * entry of its kind supersedes (a user's edit of the to-do list, a to-do HUD
- * choice, a mode change: only the newest on the path is read).
+ * choice, a mode change: only the newest on the path is read whole; of an
+ * older mode change a resume reads only its mode and the approved plan file it
+ * names, both in memory: {@link COLD_APPROVED_PLAN_FILE}).
  */
 function isStoredPastCut(entry: SessionEntry): boolean {
 	if (entry.type === "mode_change") return true;
@@ -699,6 +721,12 @@ interface CompressedBlock {
 	readonly data: Uint8Array;
 }
 
+/** A {@link CompressedBlock} decompressed: its records' bytes, from store offset `block.start`. */
+interface DecompressedBlock {
+	readonly block: CompressedBlock;
+	readonly data: Buffer;
+}
+
 const windowsStoreHandles = new Set<StoreHandle>();
 let windowsExitHookInstalled = false;
 /**
@@ -822,11 +850,14 @@ interface CachedRecord {
  * process deletes a killed process's file at its first store open, unless
  * that pid is in use again). Where that file cannot be made, and from a
  * failed write to it on (a full disk), the records are kept in memory instead,
- * zstd-compressed in blocks of whole records of at least
+ * zstd-compressed in blocks of whole records of about
  * {@link WRITE_BATCH_BYTES}; the records gathered for the next block stay as
  * bytes, and the records the file already holds are read from it. A read of a
- * record in a block decompresses that block and keeps nothing of it but the
- * parsed record in the record cache. No other directory is used. A record is
+ * record in a block decompresses that block, and the reads after it in the
+ * same synchronous pass share it while they stay in that block, so a pass over
+ * the records in store order decompresses each block once; the block is
+ * dropped as soon as the pass ends (in a microtask), leaving only the parsed
+ * records in the record cache. No other directory is used. A record is
  * the entry exactly as the manager held it, with image data replaced by blob
  * references. Every cold entry refers to its store, so a clone sharing the
  * entries keeps it open as long as it needs it; the last manager holding it
@@ -845,7 +876,12 @@ export class ColdEntryStore {
 	#inMemory: boolean;
 	/** The records past the file kept compressed, in offset order. */
 	readonly #blocks: CompressedBlock[] = [];
-	#compressedBytes = 0;
+	/**
+	 * The block the latest read decompressed, for the reads of the same
+	 * synchronous pass (a full rewrite, a walk of every entry); dropped in a
+	 * microtask, so nothing of it outlives the pass ({@link #readBlock}).
+	 */
+	#decompressed: DecompressedBlock | undefined;
 	/** The records after the file and the blocks, gathered for the next write or block, in offset order. */
 	#pending: Buffer[] = [];
 	#pendingBytes = 0;
@@ -887,7 +923,7 @@ export class ColdEntryStore {
 	}
 
 	/** A store over the file `handle` holds, or in memory without one; see {@link open}. */
-	constructor(blobs: BlobStore, handle: StoreHandle | undefined) {
+	private constructor(blobs: BlobStore, handle: StoreHandle | undefined) {
 		this.#blobs = blobs;
 		this.#handle = handle;
 		this.#inMemory = handle === undefined;
@@ -911,7 +947,9 @@ export class ColdEntryStore {
 
 	/** Bytes of the compressed blocks the store keeps in memory. */
 	get compressedBytes(): number {
-		return this.#compressedBytes;
+		let bytes = 0;
+		for (const block of this.#blocks) bytes += block.data.byteLength;
+		return bytes;
 	}
 
 	/** Records read and parsed to serve an accessor read (cache misses). */
@@ -993,7 +1031,7 @@ export class ColdEntryStore {
 		this.#pending = [];
 		this.#pendingBytes = 0;
 		this.#blocks.length = 0;
-		this.#compressedBytes = 0;
+		this.#decompressed = undefined;
 		if (!this.#handle) return;
 		storeRegistry.unregister(this);
 		releaseStoreHandle(this.#handle);
@@ -1049,7 +1087,6 @@ export class ColdEntryStore {
 			data: Bun.zstdCompressSync(data, { level: BLOCK_ZSTD_LEVEL }),
 		};
 		this.#blocks.push(block);
-		this.#compressedBytes += block.data.byteLength;
 	}
 
 	#read(record: ColdRecord): Buffer {
@@ -1088,8 +1125,28 @@ export class ColdEntryStore {
 		return data;
 	}
 
-	/** `record` from the block that holds it, decompressed for this read only. */
+	/**
+	 * `record` from the block that holds it: the block the latest read
+	 * decompressed when the record is in it, else its block decompressed and
+	 * kept for the reads of the same synchronous pass, which drops it once the
+	 * pass ends.
+	 */
 	#readBlock(record: ColdRecord): Buffer {
+		let decompressed = this.#decompressed;
+		if (!decompressed || record.offset < decompressed.block.start || record.offset >= decompressed.block.end) {
+			const block = this.#blockOf(record);
+			decompressed = { block, data: Bun.zstdDecompressSync(block.data) };
+			this.#decompressed = decompressed;
+			queueMicrotask(() => {
+				this.#decompressed = undefined;
+			});
+		}
+		const at = record.offset - decompressed.block.start;
+		return decompressed.data.subarray(at, at + record.length);
+	}
+
+	/** The block that holds `record`. */
+	#blockOf(record: ColdRecord): CompressedBlock {
 		const blocks = this.#blocks;
 		let low = 0;
 		let high = blocks.length - 1;
@@ -1098,11 +1155,7 @@ export class ColdEntryStore {
 			const block = blocks[middle]!;
 			if (record.offset < block.start) high = middle - 1;
 			else if (record.offset >= block.end) low = middle + 1;
-			else {
-				const data = Bun.zstdDecompressSync(block.data);
-				const at = record.offset - block.start;
-				return Buffer.from(data.buffer, data.byteOffset + at, record.length);
-			}
+			else return block;
 		}
 		throw new Error("A cold session entry's record is missing from its store.");
 	}
@@ -1139,6 +1192,8 @@ export function hydrateColdEntry(entry: object, options?: { resolveBlobs?: boole
 	delete slots[COLD_LENGTH];
 	const markSlots: ColdCustomMessageSlots = entry;
 	delete markSlots[COLD_ROLLOVER_REQUEST];
+	const modeChangeSlots: ColdModeChangeSlots = entry;
+	delete modeChangeSlots[COLD_APPROVED_PLAN_FILE];
 	setHiddenSlot(entry, COLD_FORMER, record);
 	record.store.noteHydration();
 	return true;
@@ -1246,6 +1301,9 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 	setRecordSlots(copy, record);
 	const mark = coldRolloverRequestMark(entry);
 	if (mark !== undefined) setHiddenSlot(copy, COLD_ROLLOVER_REQUEST, mark);
+	const modeChangeSlots: ColdModeChangeSlots = entry as object;
+	const planFile = modeChangeSlots[COLD_APPROVED_PLAN_FILE];
+	if (planFile !== undefined) setHiddenSlot(copy, COLD_APPROVED_PLAN_FILE, planFile);
 	return copy as unknown as SessionEntry;
 }
 
@@ -1303,8 +1361,9 @@ export function convertToColdEntry(
 	const former = slots[COLD_FORMER];
 	const record = former && store.holds(former, data) ? former : store.append(data);
 	delete slots[COLD_FORMER];
-	// Decided while every value is still in memory; see COLD_ROLLOVER_REQUEST.
+	// Decided while every value is still in memory; see COLD_ROLLOVER_REQUEST and COLD_APPROVED_PLAN_FILE.
 	if (entry.type === "custom_message") setHiddenSlot(entry, COLD_ROLLOVER_REQUEST, isRolloverRequestEntry(entry));
+	else if (entry.type === "mode_change") setHiddenSlot(entry, COLD_APPROVED_PLAN_FILE, approvedPlanFileOf(entry));
 	setRecordSlots(entry, record);
 	for (const key of entryKeys) Object.defineProperty(entry, key, entryFieldAccessor(key));
 	if (shell && messageKeys.length > 0) {

@@ -1,3 +1,5 @@
+import type { ModeChangeEntry } from "./session-entries";
+
 /**
  * The mark a cold session entry's message carries (`convertToColdEntry` in
  * `cold-entries.ts`): a hidden slot naming the entry whose record in the store
@@ -39,4 +41,29 @@ export interface ColdCustomMessageSlots {
 export function coldRolloverRequestMark(entry: object): boolean | undefined {
 	const slots: ColdCustomMessageSlots = entry;
 	return slots[COLD_ROLLOVER_REQUEST];
+}
+
+/**
+ * The mark a cold `mode_change` entry carries: the `approvedPlanFilePath` its
+ * `data` names, or null when it names none, taken as the entry went cold. A
+ * session's construction walks the mode changes back to the newest plan mode
+ * for the plan a reviewer approved, and a goal records a mode change on every
+ * turn whose `data` (the goal) a cold entry reads back from the store; the
+ * mark answers for it from memory. Kept here, as {@link COLD_OWNER} is, so
+ * the session can read it without importing the store.
+ */
+export const COLD_APPROVED_PLAN_FILE = Symbol("omp.coldApprovedPlanFile");
+
+/** The hidden slot of a cold `mode_change` entry. */
+export interface ColdModeChangeSlots {
+	[COLD_APPROVED_PLAN_FILE]?: string | null;
+}
+
+/** The approved plan file mode change `entry` names, or null: from its mark while cold, so no record is read. */
+export function approvedPlanFileOf(entry: ModeChangeEntry): string | null {
+	const slots: ColdModeChangeSlots = entry as object;
+	const mark = slots[COLD_APPROVED_PLAN_FILE];
+	if (mark !== undefined) return mark;
+	const planFile = entry.data?.approvedPlanFilePath;
+	return typeof planFile === "string" ? planFile : null;
 }

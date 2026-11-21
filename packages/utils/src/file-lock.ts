@@ -74,14 +74,16 @@ export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 }
 
 /**
- * {@link tryAcquireFileLock} for a caller that tries again later: while
- * another holder owns the lease, a probe answers `null` at once where a claim
- * would block the thread (about 50 ms on Linux). The probe can also read a
- * just-released lease as held, which costs such a caller one retry; a probe
- * that fails leaves the answer to the claim.
+ * {@link tryAcquireFileLock} for a caller that tries again later: on Linux,
+ * while another holder owns the lease, a probe answers `null` at once where a
+ * claim would block the thread for about 50 ms; elsewhere a claim answers at
+ * once, so no probe runs. The probe can also read a just-released lease as
+ * held, which costs such a caller one retry; a probe that fails leaves the
+ * answer to the claim.
  */
 export function tryAcquireFileLockUnlessHeld(filePath: string): FileLockHandle | null {
-	return attemptLock(getLockPath(filePath), false);
+	const lockPath = getLockPath(filePath);
+	return process.platform === "linux" ? attemptLock(lockPath, false) : tryAcquireLock(lockPath);
 }
 
 /**
