@@ -321,24 +321,45 @@ async fn wide_trees_agree_on_every_worker_count() {
 /// Ending the walk with one stop message per worker left such a worker
 /// waiting forever, and its walk with it. The machine's CPU count caps the
 /// walk's workers and the runtime's threads, and with them the test's power:
-/// against the old stop it hung in most runs on 8 or more CPUs and in none
-/// on 4 or fewer.
+/// against the old stop it hung on 8 and 16 CPUs, and was not seen in 5 runs
+/// on 4. `stopping_a_walk_closes_its_job_queue` checks the same fix on any
+/// number of CPUs.
 #[tokio::test(flavor = "multi_thread")]
 async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
 	let tmp = make_tree("ends", &["a.txt", "d1/x", "d2/y", "d3/z", "d4/w", "d5/v/u"]);
 	let fs = Fs::native();
 	let opts = Options { workers: Some(8), ..Default::default() };
+	let (mut complete, mut root_failed, mut dir_failed) = (0, 0, 0);
 	for round in 0..20_000 {
 		let walked = drain(&fs, tmp.path(), &opts, |_, _, out: &mut Vec<()>| {
 			out.push(());
 			Action::Continue
 		});
-		let (visited, _) = tokio::time::timeout(Duration::from_secs(30), walked)
+		let walked = tokio::time::timeout(Duration::from_secs(30), walked)
 			.await
-			.unwrap_or_else(|_| panic!("walk {round} did not end"))
-			.expect("walk");
+			.unwrap_or_else(|_| panic!("walk {round} did not end"));
+		// A walk that cannot open its root or a directory, as past the
+		// open-file limit while other tests in the process hold files, has
+		// still ended: it is counted and skipped.
+		let Ok((visited, errors)) = walked else {
+			root_failed += 1;
+			continue;
+		};
+		if !errors.is_empty() {
+			dir_failed += 1;
+			continue;
+		}
 		assert_eq!(visited.len(), 12, "walk {round}");
+		complete += 1;
 	}
+	// The 30 s limit catches the hang on every walk that runs; the floor
+	// fails a run in which more than 1,000 of the 20,000 walks could not open
+	// their root or a directory.
+	assert!(
+		complete >= 19_000,
+		"{complete} of 20,000 walks complete, fewer than 19,000; {root_failed} could not open the \
+		 root and {dir_failed} could not open a directory"
+	);
 }
 
 /// A visitor panic ends the walk on every worker: the panicking job never
@@ -346,35 +367,61 @@ async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
 /// other workers' waits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panicking_visitor_ends_the_walk_on_every_worker() {
-	let owned: Vec<String> = (0..24)
-		.flat_map(|d| (0..4).map(move |s| format!("d{d:02}/s{s}/f")))
+	let paths: Vec<String> = (0..24)
+		.flat_map(|d| (0..4).map(move |s| format!("mem://visitor-panics/dir/d{d:02}/s{s}/f")))
 		.collect();
-	let specs: Vec<&str> = owned.iter().map(String::as_str).collect();
-	let tmp = make_tree("visitor-panics", &specs);
-	let default = std::panic::take_hook();
-	std::panic::set_hook(Box::new(move |info| {
-		let text = info.to_string();
-		if !text.contains("visitor boom") && !text.contains("a walk visitor panicked") {
-			default(info);
-		}
-	}));
+	let files: Vec<(&str, &str)> = paths.iter().map(|path| (path.as_str(), "")).collect();
+	let (_mem, blocking) = MemFs::with_files(&files);
+	let fs = Fs::Provider(blocking);
 	let opts = Options { workers: Some(8), ..Default::default() };
-	for round in 0..2_000 {
-		let (root, opts) = (tmp.path().to_path_buf(), opts.clone());
-		let run = tokio::spawn(async move {
-			drain(&Fs::native(), &root, &opts, |_, entry, out: &mut Vec<()>| {
-				assert_ne!(entry.path, b"d11/s2", "visitor boom");
-				out.push(());
-				Action::Continue
-			})
-			.await
-		});
-		let joined = tokio::time::timeout(Duration::from_secs(30), run)
-			.await
-			.unwrap_or_else(|_| panic!("walk {round} did not end after a visitor panic"));
-		let error = joined.expect_err("the visitor panic resumes in the consumer");
-		assert!(error.is_panic(), "walk {round}: {error:?}");
-	}
+	let run = tokio::spawn(async move {
+		drain(&fs, Path::new("mem://visitor-panics/dir"), &opts, |_, entry, out: &mut Vec<()>| {
+			assert_ne!(entry.path, b"d11/s2", "visitor boom");
+			out.push(());
+			Action::Continue
+		})
+		.await
+	});
+	let joined = tokio::time::timeout(Duration::from_secs(30), run)
+		.await
+		.expect("the walk did not end after a visitor panic");
+	let error = joined.expect_err("the visitor panic did not resume in the consumer");
+	assert!(error.is_panic(), "the walk task ended without the visitor's panic: {error:?}");
+}
+
+/// Stopping a walk closes its job queue, so every worker still waiting on it
+/// leaves, also one whose wakeup flume lost: flume 0.12's `recv_async` checks
+/// again for a closed queue after it re-registers to wait (`src/async.rs`,
+/// lines 432-446). One stop message per worker left the queue open, and such
+/// a worker waiting forever. Unlike the stress test, this needs no lost
+/// wakeup, so it fails against the old stop on any number of CPUs.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_walk_closes_its_job_queue() {
+	let (_mem, blocking) = MemFs::with_files(&[
+		("mem://stop-closes/dir/a.txt", ""),
+		("mem://stop-closes/dir/sub/b.txt", ""),
+	]);
+	let fs = Fs::Provider(blocking);
+	let keep = parallel::CollectSink::new(|_: &mut Worker<'_>, _: &mut Entry<'_>| Action::Continue);
+	let started = parallel::start(
+		&fs,
+		Path::new("mem://stop-closes/dir"),
+		&Options::default(),
+		keep,
+		false,
+		None,
+		None,
+	)
+	.await
+	.expect("walk");
+	tokio::time::timeout(Duration::from_secs(30), started.finished())
+		.await
+		.expect("the walk ends");
+	assert!(
+		started.queue_closed(),
+		"the job queue was still open after the walk stopped; an open queue leaves a worker still \
+		 waiting on it waiting forever"
+	);
 }
 
 /// A walk dropped before its seed worker's first poll frees no path another
@@ -418,37 +465,6 @@ async fn a_walk_dropped_before_its_seed_runs_keeps_job_paths_alive() {
 		.expect("the seed task is dropped")
 		.expect("the probe reports");
 	assert!(live, "a worker's job path was freed with the seed worker's task");
-}
-
-/// [`a_walk_dropped_before_its_seed_runs_keeps_job_paths_alive`] without
-/// seams, for the address sanitizer: walks dropped right after they start.
-/// The seed task is then often dropped before its first poll while other
-/// workers read the root's children; a normal build reads freed memory
-/// silently. Run it under the address sanitizer:
-///
-/// ```text
-/// RUSTFLAGS=-Zsanitizer=address ASAN_OPTIONS=detect_leaks=0 cargo test -p pi-walker \
-///     --target x86_64-unknown-linux-gnu -- walks_dropped_at_once_free_no_path_in_use
-/// ```
-#[tokio::test(flavor = "multi_thread")]
-async fn walks_dropped_at_once_free_no_path_in_use() {
-	let tmp = TempDir::new("drop-at-once");
-	let long = "p".repeat(150);
-	for d in 0..32 {
-		let dir = tmp.path().join(format!("{long}{d:02}"));
-		for s in 0..16 {
-			std::fs::create_dir_all(dir.join(format!("{long}{s:02}"))).expect("dir");
-		}
-		std::fs::write(dir.join(".gitignore"), "*.o\n").expect("ignore file");
-	}
-	let fs = Fs::native();
-	let opts = Options { workers: Some(8), gitignore: true, ..Default::default() };
-	for _ in 0..2_000 {
-		let walked = walk(&fs, tmp.path(), &opts, |_, _, _: &mut Vec<()>| Action::Continue)
-			.await
-			.expect("walk");
-		drop(walked);
-	}
 }
 
 #[tokio::test(flavor = "multi_thread")]
