@@ -6,12 +6,12 @@
  *
  * E2E tests are disabled by default. Set E2E=1 environment variable to enable.
  */
+import "./e2e-env";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import path from "node:path";
 import { getOAuthApiKey } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
-import { $flag, getAgentDir, getConfigRootDir, isEnoent, parseEnvFile } from "@oh-my-pi/pi-utils";
+import { $flag, getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 
 /**
  * E2E tests require explicit opt-in via E2E=1 environment variable.
@@ -20,28 +20,13 @@ import { $flag, getAgentDir, getConfigRootDir, isEnoent, parseEnvFile } from "@o
 const E2E_ENABLED = $flag("E2E");
 
 /**
- * The developer's own dotenv files, in the loader's order (`docs/environment-variables.md`): the
- * agent dir's `.env`, then the config root's, then `~/.env`, the first to set a name winning. A test
- * process does not load them (`packages/utils/src/env.ts`); an E2E run reads its keys from them here.
- */
-let developerDotenv: Record<string, string> | undefined;
-
-/**
- * Get an API key, but only if E2E tests are enabled: from the environment, else from the developer's
- * dotenv files, where omp itself would find it. A key found in a file is also set in `Bun.env`, as
- * omp's loader would set it, so the provider code under test reads the same key.
+ * Get an API key from environment, but only if E2E tests are enabled. An E2E run also has the keys
+ * of the developer's own dotenv files there (`./e2e-env.ts`).
  * Use this in skipIf conditions: `describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))(...)`
  */
 export function e2eApiKey(envVar: string): string | undefined {
 	if (!E2E_ENABLED) return undefined;
-	if (Bun.env[envVar]) return Bun.env[envVar];
-	const files: Record<string, string> = (developerDotenv ??= Object.assign(
-		{},
-		...[os.homedir(), getConfigRootDir(), getAgentDir()].map(dir => parseEnvFile(path.join(dir, ".env"))),
-	));
-	const value = files[envVar];
-	if (value) Bun.env[envVar] = value;
-	return value || undefined;
+	return Bun.env[envVar];
 }
 
 const AUTH_PATH = path.join(getAgentDir(), "testauth.db");

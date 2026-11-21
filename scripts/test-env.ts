@@ -11,6 +11,7 @@ import { afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils/temp";
 
 /**
  * Prefixes of the names that point a process at the developer's own configuration: omp's settings
@@ -63,7 +64,9 @@ export function isDeveloperEnvName(name: string, platform: NodeJS.Platform = pro
  * HOME (and USERPROFILE on Windows) is a new empty directory of the child's own, removed when the
  * scope that made it ends ({@link removeWhenScopeEnds}): the test, or the `describe` block. Made in
  * a `beforeAll` hook, it is removed right after the hook, before the first test. Made in a
- * concurrent test, it is removed when the process exits.
+ * concurrent test, it is removed when the test file ends. On Windows, APPDATA and LOCALAPPDATA are
+ * directories in that home (its only contents), so the child finds no credentials the developer's
+ * tools keep there.
  *
  * A version manager's shims on PATH (mise's, asdf's) choose a version from the home's
  * configuration, and fail in a new one ("No version is set for shim: bun"). So this Bun answers to
@@ -79,18 +82,27 @@ export function createProductionChildEnv(
 		if (value === undefined || isDeveloperEnvName(name)) continue;
 		// The home is replaced below; on Windows a differently cased copy would be a second name.
 		const key = win32 ? name.toUpperCase() : name;
-		if (key === "HOME" || (win32 && key === "USERPROFILE")) continue;
+		if (key === "HOME" || (win32 && WINDOWS_HOME_NAMES[key] === true)) continue;
 		env[name] = value;
 	}
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-test-home-"));
 	removeWhenScopeEnds(home);
 	env.HOME = home;
-	if (win32) env.USERPROFILE = home;
+	if (win32) {
+		env.USERPROFILE = home;
+		env.APPDATA = path.join(home, "AppData", "Roaming");
+		env.LOCALAPPDATA = path.join(home, "AppData", "Local");
+		fs.mkdirSync(env.APPDATA, { recursive: true });
+		fs.mkdirSync(env.LOCALAPPDATA, { recursive: true });
+	}
 	// Windows names PATH `Path`, and a plain object's keys keep that case.
 	const pathName = Object.keys(env).find(name => name.toUpperCase() === "PATH") ?? "PATH";
 	env[pathName] = productionChildPath(env[pathName] ?? "");
 	return env;
 }
+
+/** The names a Windows child finds its home by, all set to the new home's directories. */
+const WINDOWS_HOME_NAMES: Record<string, true> = { USERPROFILE: true, APPDATA: true, LOCALAPPDATA: true };
 
 /** The tools a production child runs by name whose wrappers find their version through the home. */
 const WRAPPED_TOOLS = ["git", "jj", "node"];
@@ -102,13 +114,15 @@ const BUN_NAMES = ["bun", "bunx"];
  * `searchPath` with directories of its own first when it needs them, so that `bun` and `bunx` are
  * this Bun (`process.execPath`) when the first of each on `searchPath` is not, and each of
  * {@link WRAPPED_TOOLS} is the real one when its first copy on `searchPath` is a wrapper and a real
- * one is found ({@link findRealTool}). Every other name resolves as on `searchPath`.
+ * one is found ({@link findRealTool}).
  *
- * On POSIX, one directory holds a link to each, so only that name moves ahead. On Windows a link
- * needs a privilege, and a `.cmd` launcher cannot pass an argument that holds `"` or `%` (Bun
- * refuses such an argument for a batch file). So this Bun is hard-linked there as `bun.exe` and
- * `bunx.exe`, and a real tool's own directory goes ahead instead of a link to it: Git for
- * Windows' `git.exe` finds the rest of Git from its own path.
+ * On POSIX, one directory holds a link to each, so only that name moves ahead: every other name
+ * resolves as on `searchPath`. On Windows a link needs a privilege, and a `.cmd` launcher cannot
+ * pass an argument that holds `"` or `%` (Bun refuses such an argument for a batch file). So this
+ * Bun is hard-linked there as `bun.exe` and `bunx.exe` ({@link hardLinkOrCopy}), and a real tool's
+ * own directory goes ahead instead of a link to it, since Git for Windows' `git.exe` finds the rest
+ * of Git from its own path: the other programs in that directory (`npm` beside `node`, Git's own
+ * commands beside `git`) then come first too.
  */
 function productionChildPath(searchPath: string): string {
 	const win32 = process.platform === "win32";
@@ -136,12 +150,15 @@ function productionChildPath(searchPath: string): string {
 	return [links, ...toolDirs, searchPath].filter(Boolean).join(path.delimiter);
 }
 
-/** A hard link to `file` at `target`, or a copy when they are on different volumes. */
-function hardLinkOrCopy(file: string, target: string): void {
+/**
+ * @internal Exported for tests only. A hard link to `file` at `target`, or a copy when the link
+ * fails: Windows refuses one across volumes, on a FAT volume, and to a file the user cannot write,
+ * such as a `bun.exe` installed for every user.
+ */
+export function hardLinkOrCopy(file: string, target: string, link: typeof fs.linkSync = fs.linkSync): void {
 	try {
-		fs.linkSync(file, target);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+		link(file, target);
+	} catch {
 		fs.copyFileSync(file, target);
 	}
 }
@@ -214,20 +231,47 @@ function askWrapper(wrapper: string, tool: string, searchPath: string): string |
 }
 
 /**
+ * The directories made in a concurrent test, where Bun refuses every hook ("cannot be called inside
+ * a concurrent test"): {@link removeConcurrentTestDirs} removes them when the test file ends.
+ */
+const concurrentTestDirs = new Set<string>();
+
+function removeConcurrentTestDirs(): void {
+	for (const dir of concurrentTestDirs) removeSyncWithRetries(dir);
+	concurrentTestDirs.clear();
+}
+
+/**
+ * A hook for the test file that imports this module: Bun registers an `afterAll` made while a test
+ * file loads for that file, and runs it after the file's last test. `bun test --parallel` (each
+ * package's `test` script) and `--isolate` load this module again for every test file. A plain
+ * `bun test` of several files shares modules between them, so there the hook belongs to the first
+ * file that imports this module, and a later file's concurrent tests leave their directories.
+ */
+try {
+	afterAll(removeConcurrentTestDirs);
+} catch (error) {
+	if (!isOutsideTestRunner(error)) throw error;
+}
+
+function isOutsideTestRunner(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("outside of the test runner");
+}
+
+/**
  * Removes `dir` when the scope that calls this ends: the scope of the `afterAll` it registers. From
  * inside a test, that test, so the directory is gone at the next test; from a `describe` body, that
- * block; from a `beforeAll` hook, the hook itself. Where Bun gives no such scope, the process's
- * `exit` event removes the directory instead: outside the test runner (a fixture that imports this),
- * where `afterAll` refuses with "outside of the test runner", and in a concurrent test, where Bun
- * refuses `afterAll` and `onTestFinished` alike ("cannot be called inside a concurrent test").
+ * block; from a `beforeAll` hook, the hook itself. In a concurrent test the test file's hook removes
+ * it ({@link concurrentTestDirs}). Outside the test runner (a fixture that imports this), where
+ * `afterAll` refuses with "outside of the test runner", the process's `exit` event removes it.
  */
 function removeWhenScopeEnds(dir: string): void {
-	const remove = () => fs.rmSync(dir, { recursive: true, force: true });
+	const remove = () => removeSyncWithRetries(dir);
 	try {
 		afterAll(remove);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : "";
-		if (!message.includes("outside of the test runner") && !message.includes("inside a concurrent test")) throw error;
-		process.on("exit", remove);
+		if (error instanceof Error && error.message.includes("inside a concurrent test")) concurrentTestDirs.add(dir);
+		else if (isOutsideTestRunner(error)) process.on("exit", remove);
+		else throw error;
 	}
 }

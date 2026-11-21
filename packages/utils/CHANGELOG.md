@@ -18,7 +18,7 @@
 
 ### Fixed
 
-- Fixed `bun test` runs reading your `~/.env`, `~/.omp/.env` and agent-dir `.env`: a test process now reads only the project's `.env`, and sets `PI_TEST_RUNTIME=1` so that a child started with its `process.env` reads none of them either
+- Fixed `bun test` processes reading your `~/.env`, `~/.omp/.env` and agent-dir `.env` (an `E2E=1` run still loads them for live provider tests)
 
 ## [19.0.0] - 2026-11-18
 

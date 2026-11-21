@@ -2,12 +2,15 @@ import { describe, expect, it, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createProductionChildEnv, isDeveloperEnvName } from "../../../scripts/test-env";
+import { createProductionChildEnv, hardLinkOrCopy, isDeveloperEnvName } from "../../../scripts/test-env";
 
 const win32 = process.platform === "win32";
 
 /** A value that a `.cmd` launcher could not pass: Bun refuses `"` and `%` in a batch file's arguments. */
 const AWKWARD = 'a"%b';
+
+/** Each case that starts a `bun test` child gets this long: the child loads the helper and runs two tests. */
+const CHILD_TIMEOUT_MS = 60_000;
 
 describe("createProductionChildEnv", () => {
 	it("drops the names that point a child at the developer's configuration, and gives it an empty home", () => {
@@ -27,7 +30,8 @@ describe("createProductionChildEnv", () => {
 		expect(env.KEEP_ME).toBe("kept");
 		for (const name of Object.keys(dropped)) expect(env[name]).toBeUndefined();
 		expect(env.HOME).not.toBe("/dev/home");
-		expect(fs.readdirSync(env.HOME)).toEqual([]);
+		// On Windows the home holds the APPDATA and LOCALAPPDATA directories, and nothing else.
+		expect(fs.readdirSync(env.HOME)).toEqual(win32 ? ["AppData"] : []);
 	});
 
 	it("compares names without case on Windows, and with case elsewhere", () => {
@@ -39,11 +43,23 @@ describe("createProductionChildEnv", () => {
 	});
 
 	test.skipIf(!win32)("drops a lower-case name, and keeps one home, on Windows", () => {
-		const env = createProductionChildEnv({ PATH: "", pi_coding_agent_dir: "C:\\dev\\agent", UserProfile: "C:\\dev" });
+		const env = createProductionChildEnv({
+			PATH: "",
+			pi_coding_agent_dir: "C:\\dev\\agent",
+			UserProfile: "C:\\dev",
+			appdata: "C:\\dev\\AppData\\Roaming",
+			LocalAppData: "C:\\dev\\AppData\\Local",
+		});
 		const names = Object.keys(env).map(name => name.toUpperCase());
 		expect(names).not.toContain("PI_CODING_AGENT_DIR");
-		expect(names.filter(name => name === "USERPROFILE")).toEqual(["USERPROFILE"]);
+		for (const name of ["USERPROFILE", "APPDATA", "LOCALAPPDATA"]) {
+			expect(names.filter(each => each === name)).toEqual([name]);
+		}
 		expect(env.USERPROFILE).toBe(env.HOME);
+		expect(env.APPDATA).toBe(path.join(env.HOME, "AppData", "Roaming"));
+		expect(env.LOCALAPPDATA).toBe(path.join(env.HOME, "AppData", "Local"));
+		expect(fs.existsSync(env.APPDATA)).toBe(true);
+		expect(fs.existsSync(env.LOCALAPPDATA)).toBe(true);
 	});
 
 	let home: string | undefined;
@@ -72,14 +88,60 @@ describe("createProductionChildEnv", () => {
 	});
 });
 
-// Bun refuses `afterAll` and `onTestFinished` in a test that runs concurrently with another.
 describe("createProductionChildEnv in concurrent tests", () => {
-	for (const n of [1, 2]) {
-		test.concurrent(`gives a home (${n})`, () => {
-			const env = createProductionChildEnv({ PATH: "" });
-			expect(fs.existsSync(env.HOME)).toBe(true);
-		});
+	const fixture = path.join(import.meta.dir, "fixtures", "production-child-env-concurrent.ts");
+
+	// Bun refuses every hook in a concurrent test, and runs no `exit` handler of a `bun test`
+	// process: the test file's own hook removes these directories. Each run is a `bun test` child,
+	// so its directories are checked after it ends.
+	for (const args of [[], ["--isolate"], ["--parallel"]]) {
+		it(
+			`removes the directories when the test file ends (bun test ${args.join(" ")})`,
+			async () => {
+				const proc = Bun.spawn([process.execPath, "test", ...args, fixture], {
+					cwd: path.join(import.meta.dir, ".."),
+					env: process.env,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				expect(exitCode, stderr).toBe(0);
+				const dirs = `${stdout}${stderr}`
+					.split("\n")
+					.filter(line => line.startsWith("DIRS "))
+					.flatMap(line => JSON.parse(line.slice("DIRS ".length)) as string[]);
+				// Each of the two tests made a home and a directory for `bun`.
+				expect(dirs.length, `${stdout}${stderr}`).toBe(4);
+				expect(dirs.filter(dir => fs.existsSync(dir))).toEqual([]);
+			},
+			CHILD_TIMEOUT_MS,
+		);
 	}
+});
+
+describe("hardLinkOrCopy", () => {
+	it("copies the file when the hard link fails, whatever the reason", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-link-"));
+		try {
+			const file = path.join(dir, "tool");
+			fs.writeFileSync(file, "the tool");
+			// EXDEV: another volume. EPERM: a FAT volume, or a file the user cannot write (a bun.exe
+			// installed for every user). EACCES: a directory the user cannot list.
+			for (const code of ["EXDEV", "EPERM", "EACCES"]) {
+				const target = path.join(dir, `link-${code}`);
+				hardLinkOrCopy(file, target, () => {
+					throw Object.assign(new Error(`link refused: ${code}`), { code });
+				});
+				expect(fs.readFileSync(target, "utf8")).toBe("the tool");
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("the production child's PATH", () => {
