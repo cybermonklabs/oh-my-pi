@@ -143,6 +143,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
+		settings: Settings.isolated(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		getMountedXdevToolNames: () => [],
@@ -313,6 +314,7 @@ describe("runSubprocess result acceptance", () => {
 			id: AGENT_ID,
 			agent: baseAgent,
 			message: "continue",
+			storeMaskCwd: "/tmp",
 		});
 
 		expect(result.exitCode).toBe(0);
@@ -326,7 +328,7 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -366,7 +368,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -417,6 +419,7 @@ describe("runSubprocess result acceptance", () => {
 			agent: baseAgent,
 			structured: false,
 			artifactsDir,
+			storeMaskCwd: "/tmp",
 		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
@@ -478,7 +481,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -527,7 +536,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -576,7 +591,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const accepted = '{"report":"accepted verdict"}';
@@ -620,7 +641,13 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			artifactsDir,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -674,6 +701,7 @@ describe("runSubprocess result acceptance", () => {
 				structured: false,
 				artifactsDir,
 				signal: AbortSignal.abort("cancelled"),
+				storeMaskCwd: "/tmp",
 			});
 			expect(result.aborted).toBe(true);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
@@ -704,7 +732,7 @@ describe("runSubprocess result acceptance", () => {
 				session: harness.session,
 				status: "idle",
 			});
-			attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+			attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 			const observer = harness.wakeObserver();
 			if (!observer) throw new Error("wake-turn observer was not registered");
 			const parent = {
@@ -757,7 +785,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: false,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {
@@ -809,7 +842,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		// The parent's message reaches the idle child through the real bus and bridge, as a live send would.
@@ -875,7 +908,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, storeMaskCwd: "/tmp" });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -934,7 +967,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: true });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {
@@ -983,7 +1021,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: true });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {
@@ -1041,7 +1084,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: true });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {
@@ -1093,7 +1141,12 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: true });
+		attachIrcWakeTurnMonitor(harness.session, {
+			id: AGENT_ID,
+			agent: baseAgent,
+			structured: true,
+			storeMaskCwd: "/tmp",
+		});
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const parent = {

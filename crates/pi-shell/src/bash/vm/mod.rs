@@ -216,46 +216,82 @@ impl Default for ShellInit {
 /// A script to run ([`Shell::submit`]).
 pub struct Script {
 	/// Source bytes.
-	pub source:       Arc<[u8]>,
+	pub source:           Arc<[u8]>,
 	/// Where they came from (diagnostic prefixes, events).
-	pub origin:       Origin,
+	pub origin:           Origin,
 	/// Mode to parse and run in; the vproc's mode before the run comes
 	/// back when it ends (`None`: the shell's current mode, which an
 	/// `emulate` in the script changes for later runs too).
-	pub mode:         Option<ModeId>,
+	pub mode:             Option<ModeId>,
 	/// Positional parameters for the script, replacing the inherited current
 	/// positional scope in a new subshell without changing its caller.
-	pub args:         Option<Vec<BString>>,
+	pub args:             Option<Vec<BString>>,
 	/// Which virtual process runs it.
-	pub vproc:        VprocSel,
+	pub vproc:            VprocSel,
 	/// Opaque host tag, echoed in `RunStart`.
-	pub tag:          u64,
+	pub tag:              u64,
 	/// Working directory for the run.
-	pub cwd:          Option<BString>,
+	pub cwd:              Option<BString>,
 	/// Exported variables for the run.
-	pub env:          Vec<(BString, BString)>,
+	pub env:              Vec<(BString, BString)>,
 	/// Changes to inherited non-shell environment entries for a new subshell.
 	/// A `None` name clears them; otherwise `None` removes and `Some` sets.
-	pub foreign_env:  Vec<(Option<BString>, Option<BString>)>,
+	pub foreign_env:      Vec<(Option<BString>, Option<BString>)>,
 	/// Shell variable names whose inherited bindings must not be exported in
 	/// the new subshell, including bindings hidden by local scopes.
-	pub unexport_env: Vec<BString>,
+	pub unexport_env:     Vec<BString>,
+	/// On Unix, the host hears of an `exec` replacing the run's vproc that
+	/// the system refuses because the command line is too long (`E2BIG`,
+	/// `ENAMETOOLONG`): the shell prints nothing for it, the run ends with
+	/// status 126, and [`Shell::exec_refusal`] has the error. A callout can
+	/// then retry with fewer arguments (`xargs`). A tool the run calls hears
+	/// of it as well ([`ToolCall::too_long_to_caller`]) and hands such a
+	/// refusal of its own command up the same way ([`CallOutcome::TooLong`]).
+	/// Set it only for a script that runs nothing before that `exec` or tool
+	/// (a callout's generated `exec` of a program, or its call of `timeout`,
+	/// `nohup`, `env` or `ifne`, in a subshell with [`Script::as_program`];
+	/// the `exec` of the program `timeout` or `nohup` runs): a retry would
+	/// run all of it again.
+	pub too_long_to_host: bool,
+	/// With [`Script::too_long_to_host`], the host hears of every other
+	/// refusal of that `exec` too (`EACCES`, `ENOENT` of a `#!` interpreter,
+	/// `ENAMETOOLONG` of a path), and of an `exec` that found nothing to run
+	/// (`ENOENT`; `EACCES` for a directory), the same way: nothing printed,
+	/// status 126 (127 for `ENOENT`), [`Shell::exec_refusal`] has the error.
+	/// `ENOEXEC` is no refusal: the file runs as a script. Set it only for an
+	/// `exec` whose host reports a command it cannot run in its own words:
+	/// `env`'s callout, and the `exec` of the program `timeout` or `nohup`
+	/// runs (coreutils' `failed to run command`).
+	pub refusals_to_host: bool,
+	/// The new subshell stands for a program the caller started (a callout
+	/// running a utility's command), whose children never see the caller's
+	/// shell-only state. It starts with none of the caller's functions (its
+	/// exported ones reach programs in the environment, as `BASH_FUNC_`
+	/// entries, and can no longer be called), aliases or DEBUG, ERR and
+	/// RETURN traps (even under `functrace` or `errtrace`), with `xtrace`
+	/// off and every builtin enabled. What the subshell defines or sets
+	/// itself is its own, as in any shell: a function its command defines
+	/// runs, a `trap` it sets fires.
+	pub as_program:       bool,
 }
 
 impl Script {
 	/// A command script (`-c` semantics) on the root vproc.
 	pub fn command(source: impl Into<Arc<[u8]>>) -> Self {
 		Self {
-			source:       source.into(),
-			origin:       Origin::Command,
-			mode:         None,
-			args:         None,
-			vproc:        VprocSel::Root,
-			tag:          0,
-			cwd:          None,
-			env:          Vec::new(),
-			foreign_env:  Vec::new(),
-			unexport_env: Vec::new(),
+			source:           source.into(),
+			origin:           Origin::Command,
+			mode:             None,
+			args:             None,
+			vproc:            VprocSel::Root,
+			tag:              0,
+			cwd:              None,
+			env:              Vec::new(),
+			foreign_env:      Vec::new(),
+			unexport_env:     Vec::new(),
+			too_long_to_host: false,
+			refusals_to_host: false,
+			as_program:       false,
 		}
 	}
 }
@@ -341,23 +377,30 @@ pub enum Step {
 #[derive(Clone, Debug)]
 pub struct ToolCall {
 	/// From [`Resolved::Tool`](crate::bash::Resolved::Tool).
-	pub tool:      ToolRef,
+	pub tool:               ToolRef,
 	/// Expanded argv.
-	pub argv:      Vec<BString>,
+	pub argv:               Vec<BString>,
 	/// Calling vproc.
-	pub vpid:      Vpid,
+	pub vpid:               Vpid,
 	/// Output tag of this execution.
-	pub tag:       CmdTag,
+	pub tag:                CmdTag,
 	/// Working directory.
-	pub cwd:       BString,
+	pub cwd:                BString,
 	/// fds 0, 1, 2 (also reachable by number through [`ShellApi`]).
-	pub stdio:     [FdRef; 3],
+	pub stdio:              [FdRef; 3],
 	/// Further open fds.
-	pub extra_fds: Vec<(i32, FdRef)>,
+	pub extra_fds:          Vec<(i32, FdRef)>,
 	/// Environment.
-	pub env:       EnvView,
+	pub env:                EnvView,
 	/// File-creation mask: the shell's `umask`.
-	pub umask:     u32,
+	pub umask:              u32,
+	/// The calling run was submitted with [`Script::too_long_to_host`]: a
+	/// tool that has done nothing a retry would repeat when it runs its
+	/// command (`timeout`, `nohup`; the extras `env` without `--env0-from`
+	/// and `ifne`) answers [`CallOutcome::TooLong`] when the system
+	/// refuses that command's line as too long, so the host that submitted
+	/// the run retries with fewer arguments (`xargs`).
+	pub too_long_to_caller: bool,
 }
 
 /// How a host callout ended.
@@ -369,6 +412,24 @@ pub enum CallOutcome {
 	Signaled(Signal),
 	/// Failed: printed as `name: line N: tool: msg`, status 1.
 	Error(BString),
+	/// For a call with [`ToolCall::too_long_to_caller`]: the system refused
+	/// the tool's command as too long with this error (`E2BIG`,
+	/// `ENAMETOOLONG`). The calling run hears of it as of its own refused
+	/// `exec`: status 126, nothing printed, and [`Shell::exec_refusal`] has
+	/// the error.
+	TooLong(i32),
+}
+
+/// An `exec` the system refused, that the run's host hears of instead of
+/// a diagnostic ([`Shell::exec_refusal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecRefusal {
+	/// The error (`errno`).
+	pub errno:    i32,
+	/// The command line is too long ([`Script::too_long_to_host`]: a
+	/// utility retries it with fewer arguments), as against a command that
+	/// cannot run ([`Script::refusals_to_host`]).
+	pub too_long: bool,
 }
 
 /// One shell: transient execution state only (scheduler, vprocs, frames,
@@ -507,6 +568,12 @@ pub struct Kernel {
 	pub exec_signals:       HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal:    Option<(RunId, i32)>,
+	/// `exec`s the system refused, replacing a run submitted with
+	/// [`Script::too_long_to_host`], pending its completion report; not
+	/// imaged, like `exec_signals`.
+	pub exec_refusals:      HashMap<RunId, ExecRefusal>,
+	/// Refusal associated with the most recently reported run.
+	pub reported_refusal:   Option<(RunId, ExecRefusal)>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
@@ -628,6 +695,8 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			exec_refusals: HashMap::new(),
+			reported_refusal: None,
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
@@ -1770,6 +1839,8 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			too_long_to_host: script.too_long_to_host,
+			refusals_to_host: script.refusals_to_host,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -1784,7 +1855,16 @@ impl Shell {
 		};
 		let p = &self.procs[parent];
 		let mut overlay = p.overlay.clone().unwrap_or_default();
-		if !script.foreign_env.is_empty() {
+		// The caller's exported functions reach a program's children in its
+		// environment alone (`Script::as_program` hides the functions).
+		let mut exported = Vec::new();
+		if script.as_program
+			&& let Some(store) = store.as_deref_mut()
+			&& let Err(err) = command::exported_functions(store, p, &mut exported)
+		{
+			self.k.root.fail(err);
+		}
+		if !script.foreign_env.is_empty() || !exported.is_empty() {
 			let mut foreign = match store.as_deref_mut() {
 				Some(store) => match state::record(store, p, Key::Misc(MiscKey::ForeignEnv)) {
 					Ok(Some(Record::Words(entries))) => entries.clone(),
@@ -1799,6 +1879,13 @@ impl Shell {
 					_ => Vec::new(),
 				},
 			};
+			for (name, value) in exported {
+				foreign.retain(|entry| entry.split(|&b| b == b'=').next() != Some(name.as_slice()));
+				let mut entry = name;
+				entry.push(b'=');
+				entry.extend_from_slice(&value);
+				foreign.push(entry);
+			}
 			for (name, value) in script.foreign_env {
 				if let Some(name) = name {
 					foreign.retain(|entry| entry.split(|&b| b == b'=').next() != Some(name.as_slice()));
@@ -1848,6 +1935,35 @@ impl Shell {
 			for scope in &mut scopes {
 				if let Some(Some(var)) = scope.vars.get_mut(&name) {
 					var.attrs = var.attrs.without(Attrs::EXPORT);
+				}
+			}
+		}
+		if script.as_program {
+			use crate::bash::store::{Table, TrapKey};
+			// No record in the overlay hides the caller's, as an unset trap.
+			for key in [TrapKey::Debug, TrapKey::Err, TrapKey::Return] {
+				overlay.records.insert(KeyBuf::Trap(key), None);
+			}
+			// A program's children neither trace nor see the caller's
+			// `enable -n`.
+			overlay
+				.records
+				.insert(KeyBuf::Opt(OptId::Xtrace), Some(Record::Opt(false)));
+			overlay
+				.records
+				.insert(KeyBuf::Misc(MiscKey::DisabledBuiltins), Some(Record::Words(Vec::new())));
+			// Nor its functions and aliases, hidden the same way: one the
+			// subshell defines is its own.
+			if let Some(store) = store.as_deref_mut() {
+				for table in [Table::Func, Table::Alias, Table::ZshAlias] {
+					match state::scan(&self.k.root, store, p, table) {
+						Ok(defined) => {
+							for (key, _) in defined {
+								overlay.records.insert(key, None);
+							}
+						},
+						Err(err) => self.k.root.fail(err),
+					}
 				}
 			}
 		}
@@ -2142,6 +2258,11 @@ impl Shell {
 	fn report(&mut self) -> Option<Step> {
 		if let Some((run, status)) = self.k.done.pop_front() {
 			self.k.reported_signal = self.k.exec_signals.remove(&run).map(|signal| (run, signal));
+			self.k.reported_refusal = self
+				.k
+				.exec_refusals
+				.remove(&run)
+				.map(|refusal| (run, refusal));
 			return Some(Step::Done { run, status });
 		}
 		let (id, call) = self.k.calls_out.pop_front()?;
@@ -2282,6 +2403,7 @@ impl Shell {
 		let vpid = (p.vpid, p.mode);
 		for run in &runs {
 			self.k.exec_signals.remove(&run.id);
+			self.k.exec_refusals.remove(&run.id);
 			if run.started {
 				self
 					.k
@@ -2540,6 +2662,18 @@ impl Shell {
 			.reported_signal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, signal)| signal)
+	}
+
+	/// The `exec` the system refused, replacing `run`, if `run` was
+	/// submitted with [`Script::too_long_to_host`] (a line too long) or
+	/// [`Script::refusals_to_host`] (any refusal). Ask immediately after its
+	/// [`Step::Done`].
+	pub fn exec_refusal(&self, run: RunId) -> Option<ExecRefusal> {
+		self
+			.k
+			.reported_refusal
+			.filter(|(id, _)| *id == run)
+			.map(|(_, refusal)| refusal)
 	}
 
 	/// Number of the root's background jobs that still wait for a running

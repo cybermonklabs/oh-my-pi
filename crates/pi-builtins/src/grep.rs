@@ -1058,21 +1058,30 @@ struct FileSearch {
 	matched:   io::Result<bool>,
 }
 
-/// What one search worker reuses across files: its searcher, read buffer, output buffer, and the opener of a native tree's files.
+/// What one search worker reuses across files: its searcher, read buffer, output buffer, and the opener of a walked tree's files.
 struct Worker {
 	searcher: Searcher,
 	buf:      Vec<u8>,
 	out:      Vec<u8>,
-	opener:   Option<FileOpener>,
+	opener:   Option<Opener>,
 	/// Reused for the path of each listed file.
 	path:     PathBuf,
 	/// Reused for the displayed name of each listed file.
 	display:  PathBuf,
 }
 
+/// How a worker opens a listed file: below the walk's root handle with no
+/// symlink followed on the way, for a walk that does not follow symlinks
+/// (`-r`); by path through the file's directory, for a native walk that does
+/// (`-R`).
+enum Opener {
+	Beneath(pi_walker::fs::Session, Arc<pi_walker::fs::Dir>),
+	Path(FileOpener),
+}
+
 /// A file being searched.
 enum Input {
-	/// A regular file a native walk listed, opened relative to its directory.
+	/// A regular file a walk listed, opened by the walker.
 	Listed(pi_walker::fs::File),
 	Source(stdio::Source),
 }
@@ -1082,7 +1091,7 @@ impl Input {
 	/// than from the path it was opened by.
 	async fn metadata(&self) -> Option<pi_vfs::Metadata> {
 		match self {
-			Self::Listed(file) => file.metadata().ok(),
+			Self::Listed(file) => file.metadata_async().await.ok(),
 			Self::Source(source) => source.handle_metadata().await,
 		}
 	}
@@ -1121,8 +1130,8 @@ struct Listed {
 /// Everything the concurrent per-file searches of one directory operand share.
 struct DirSearch<M> {
 	fs:       pi_vfs::Fs,
-	/// The directory operand's files; a native tree's open through each
-	/// worker's [`FileOpener`]. `None` for a file operand.
+	/// The directory operand's files, opened through each worker's
+	/// [`Opener`]. `None` for a file operand.
 	listed:   Option<Listed>,
 	halt:     Halt,
 	operand:  OsString,
@@ -1142,11 +1151,13 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			searcher: self.searcher.build(),
 			buf:      vec![0u8; READ_CHUNK],
 			out:      Vec::new(),
-			opener:   self
-				.listed
-				.as_ref()
-				.filter(|listed| listed.layer.is_native())
-				.map(|listed| FileOpener::new(&listed.layer)),
+			opener:   self.listed.as_ref().and_then(|listed| match listed.files.root_dir() {
+				Some(root) => Some(Opener::Beneath(listed.layer.session(), Arc::clone(root))),
+				None => listed
+					.layer
+					.is_native()
+					.then(|| Opener::Path(FileOpener::new(&listed.layer))),
+			}),
 			path:     PathBuf::new(),
 			display:  PathBuf::new(),
 		}
@@ -1213,17 +1224,43 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		Ok(sink.any_match)
 	}
 
-	/// Opens `path`: a listed file of a native tree through the worker's
-	/// opener, anything that fails there (a special file, an error) through
-	/// `fs`, which reports it as a standalone open would.
-	async fn open(&self, worker: &mut Worker, path: &Path) -> io::Result<Input> {
-		if let Some(opener) = &mut worker.opener
-			&& self.fs.is_native_local(path)
-			&& let Ok(file) = opener.open(path).await
-		{
-			return Ok(Input::Listed(file));
+	/// Opens `path`, the listed file at walk-relative `rel` (`None` for a file
+	/// operand). A walk that does not follow symlinks opens it below the
+	/// walk's root with no symlink followed on the way, and never by path, so
+	/// a symlink swapped in since the listing is refused. A symlink that is the
+	/// file itself (its directory still opens below the root) is skipped with
+	/// no message and no error status (`None`), as GNU grep skips a file whose
+	/// `O_NOFOLLOW` open finds a symlink; one on the way to it is an error.
+	/// Otherwise a native tree's file opens through the worker's by-path
+	/// opener, and anything that fails there (a special file, an error)
+	/// through `fs`, which reports it as a standalone open would.
+	async fn open(&self, worker: &mut Worker, rel: Option<&[u8]>, path: &Path) -> io::Result<Option<Input>> {
+		match (&mut worker.opener, rel) {
+			(Some(Opener::Beneath(session, root)), Some(rel)) => {
+				return match session.open_file_beneath(root, rel).await {
+					Ok((file, _)) => Ok(Some(Input::Listed(file))),
+					Err(err) if pi_walker::fs::is_symlink_refusal(&err) => {
+						let parent = rel
+							.iter()
+							.rposition(|&b| pi_walker::fs::is_rel_separator(b))
+							.map(|at| &rel[..at]);
+						let file_is_the_link = match parent {
+							Some(parent) => session.open_dir_beneath(root, parent).await.is_ok(),
+							None => true,
+						};
+						if file_is_the_link { Ok(None) } else { Err(err) }
+					},
+					Err(err) => Err(err),
+				};
+			},
+			(Some(Opener::Path(opener)), Some(_)) if self.fs.is_native_local(path) => {
+				if let Ok(file) = opener.open(path).await {
+					return Ok(Some(Input::Listed(file)));
+				}
+			},
+			_ => {},
 		}
-		stdio::Source::open(&self.fs, path).await.map(Input::Source)
+		stdio::Source::open(&self.fs, path).await.map(|source| Some(Input::Source(source)))
 	}
 
 	/// Searches the `index`th listed file, its paths built in the worker's
@@ -1238,14 +1275,14 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		} else {
 			display = display_path_for_operand(&self.operand, &self.resolved, &path);
 		}
-		let found = self.search_at(worker, &path, &display).await;
+		let found = self.search_at(worker, Some(rel), &path, &display).await;
 		(worker.path, worker.display) = (path, display);
 		found
 	}
 
 	async fn search(&self, worker: &mut Worker, path: &Path) -> FileSearch {
 		let display_path = display_path_for_operand(&self.operand, &self.resolved, path);
-		self.search_at(worker, path, &display_path).await
+		self.search_at(worker, None, path, &display_path).await
 	}
 
 	/// The search of a file that is also the file stdout lands in, refused
@@ -1278,9 +1315,16 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		}
 	}
 
-	async fn search_at(&self, worker: &mut Worker, path: &Path, display_path: &Path) -> FileSearch {
-		match self.open(worker, path).await {
-			Ok(mut input) => {
+	async fn search_at(
+		&self,
+		worker: &mut Worker,
+		rel: Option<&[u8]>,
+		path: &Path,
+		display_path: &Path,
+	) -> FileSearch {
+		match self.open(worker, rel, path).await {
+			Ok(None) => FileSearch { out: Vec::new(), err: Vec::new(), had_error: false, matched: Ok(false) },
+			Ok(Some(mut input)) => {
 				if self.opts.refuse_output_file && self.is_output_file(&input).await {
 					return self.refused(display_path);
 				}
@@ -1341,6 +1385,8 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 			return Ok(false);
 		},
 	};
+	#[cfg(test)]
+	crate::host::run_hook(resolved);
 	let mut errors: Vec<_> = files.errors().iter().collect();
 	errors.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 	for error in errors {
@@ -1361,7 +1407,7 @@ async fn search_dir<M: Matcher + Clone + Send + Sync + 'static, W: Write + Send>
 		matcher:  matcher.clone(),
 		searcher: searcher.clone(),
 		opts:     opts.clone(),
-		stdout:   host.stdout_file(),
+		stdout:   host.stdout_file().await,
 	});
 	let mut any = false;
 	let mut failed = None;
@@ -1701,7 +1747,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 			// `--label` names standard input everywhere else, so it names it
 			// in the refusal diagnostic too.
 			let input_name = cli.label.as_deref().unwrap_or_else(|| OsStr::new("(standard input)"));
-			if opts.refuse_output_file && host.stdin_is_stdout() {
+			if opts.refuse_output_file && host.stdin_is_stdout().await {
 				// GNU grep refuses standard input that is the file its output
 				// lands in: the matches it writes would be read back and
 				// matched again, so the input is never read.
@@ -1787,7 +1833,7 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 					matcher:  matcher.clone(),
 					searcher: builder.clone(),
 					opts:     opts.clone(),
-					stdout:   host.stdout_file(),
+					stdout:   host.stdout_file().await,
 				};
 				// Its own task, so dropping this body (cancellation) raises the
 				// halt flag the search checks between reads.
@@ -1998,7 +2044,87 @@ mod tests {
 	use crate::openfile as openfiles;
 	use crate::host::{Host, run_async_util, run_caught_async};
 	#[cfg(unix)]
-	use crate::host::tree_with_sparse_file;
+	use crate::host::{SwapTree, tree_with_sparse_file};
+
+	const ONE_FILE: &[u8] = b"needle\n";
+
+	/// One read-only provider file, `mem://d/f`; nothing else exists.
+	#[derive(Debug)]
+	struct OneFile;
+
+	fn one_file_meta() -> pi_vfs::Metadata {
+		pi_vfs::Metadata::new(
+			pi_vfs::FileType::from_kind(pi_vfs::FileKind::File),
+			ONE_FILE.len() as u64,
+			pi_vfs::Permissions::from_mode(0o644),
+		)
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for OneFile {
+		fn is_native_local(&self, path: &Path) -> bool {
+			!pi_vfs::is_virtual_path(path)
+		}
+
+		async fn open(&self, path: &Path, _options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(pi_vfs::File::from_handle(OneFileHandle))
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			if path != Path::new("mem://d/f") {
+				return Err(io::ErrorKind::NotFound.into());
+			}
+			Ok(one_file_meta())
+		}
+
+		async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			Err(io::ErrorKind::NotFound.into())
+		}
+	}
+
+	#[derive(Debug)]
+	struct OneFileHandle;
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileHandle for OneFileHandle {
+		async fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+			Ok(0)
+		}
+
+		async fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+			Err(io::ErrorKind::PermissionDenied.into())
+		}
+
+		async fn seek(&self, _pos: io::SeekFrom) -> io::Result<u64> {
+			Ok(0)
+		}
+
+		async fn metadata(&self) -> io::Result<pi_vfs::Metadata> {
+			Ok(one_file_meta())
+		}
+	}
+
+	/// grep asks a walked file's identity (is it the file stdout lands in?)
+	/// from its async body. For a file a walk opened on a provider tree the
+	/// blocking query panicked on a current-thread runtime, so `grep -r` over
+	/// that tree into a regular file ended with `internal error`.
+	#[tokio::test(flavor = "current_thread")]
+	async fn a_listed_provider_file_reports_its_identity_on_a_current_thread_runtime() {
+		let vfs = pi_vfs::Fs::new(Arc::new(OneFile));
+		let mut session = pi_walker::Fs::new(&vfs, Path::new("mem://d")).session();
+		let (file, _) = session
+			.open_file(Path::new("mem://d/f"))
+			.await
+			.expect("open the provider file");
+		let opened = Input::Listed(file)
+			.metadata()
+			.await
+			.expect("the opened file's identity");
+		assert_eq!(opened.len(), ONE_FILE.len() as u64);
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn path_separator_rewrites_the_native_separator_on_windows() {
@@ -2062,6 +2188,43 @@ mod tests {
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
 		(code, capture.out(), capture.err())
+	}
+
+	/// `grep -r` reads no file through a directory swapped, between the
+	/// walk's listing and the file's open, for a symlink to a directory
+	/// outside the operand that holds a file of the listed name, and reports
+	/// the refused open (exit 2); `-R`, which follows symlinks, still reads
+	/// through the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_grep_reads_no_file_through_a_directory_swapped_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		tree.swap_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert!(!out.contains("outside"), "read through the swapped link: {out:?} {err:?}");
+		assert!(code == 2 && err.contains("sub/decoy.txt: "), "{code} {err:?}");
+		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
+	}
+
+	/// `grep -r` skips a listed file swapped for a symlink after the walk with
+	/// no message and no error status, as GNU grep 3.11 does (its `O_NOFOLLOW`
+	/// open fails with `ELOOP`), and searches the others; `-R` reads through
+	/// the link.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_grep_skips_a_file_swapped_for_a_symlink_after_the_walk() {
+		let tree = SwapTree::new("needle inside\n", "needle outside\n");
+		std::fs::write(tree.sub.join("other.txt"), "needle other\n").unwrap();
+		tree.swap_file_at(tree.root.clone());
+		let root_arg = tree.root.to_str().unwrap();
+		let (code, out, err) = run(&["-r", "needle", root_arg], "").await;
+		assert!(tree.swapped(), "the swap ran");
+		assert_eq!((code, out, err), (0, format!("{root_arg}/sub/other.txt:needle other\n"), String::new()));
+		let (_, followed, _) = run(&["-R", "needle", root_arg], "").await;
+		assert!(followed.contains("needle outside"), "-R follows the link: {followed:?}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

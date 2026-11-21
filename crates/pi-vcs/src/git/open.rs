@@ -286,12 +286,12 @@ impl ConfigScopes {
 	}
 }
 
-/// The boolean value of the environment variable `name`, as git 2.43's
-/// `git_env_bool` (parse.c) reads it through `git_parse_maybe_bool`: `true`,
-/// `yes` and `on` are true and `false`, `no`, `off` and the empty string false,
-/// in any case; anything else is a C `int` as `git_parse_int` reads it,
-/// true when nonzero. A value that is neither is refused with git's message,
-/// as git refuses it with `die()`.
+/// The boolean value of the environment variable `name`, as git's
+/// `git_env_bool` reads it through `git_parse_maybe_bool`: `true`, `yes` and
+/// `on` are true and `false`, `no`, `off` and the empty string false, in any
+/// case; anything else is a C `int` as `git_parse_int` reads it, true when
+/// nonzero. A value that is neither is refused with git's message, as git
+/// refuses it with `die()`.
 fn git_env_bool(name: &str, value: &OsStr) -> Result<bool> {
 	let text = value.to_str();
 	let parsed = text.and_then(|text| match text.to_ascii_lowercase().as_str() {
@@ -311,7 +311,16 @@ fn git_env_bool(name: &str, value: &OsStr) -> Result<bool> {
 /// `strtoimax(value, &end, 0)`, which skips leading white space and takes an
 /// optional sign and a `0x` (hexadecimal) or `0` (octal) prefix, then a unit
 /// of `k`, `m` or `g` in either case (1024, 1024², 1024³) and nothing else.
-/// The scaled number must lie within `-INT_MAX..=INT_MAX`.
+/// The scaled number must lie within `INT_MIN..=INT_MAX`, git's bound since
+/// 2.50.0 (git commit 8f282bdff0b4, "parse: fix off-by-one for minimum signed
+/// values").
+///
+/// Git before 2.50.0 bounds it by `-INT_MAX..=INT_MAX`: it refuses `INT_MIN`
+/// (`-2147483648`, `-2097152k`, `-2048m`, `-2g`) and dies when it reads its
+/// configuration. This takes the newer bound, which needs no run of the git
+/// binary to learn its version: a user of an older git who sets `INT_MIN`
+/// gets the refusal from git itself, and this reads the value as every git
+/// that accepts it does.
 fn git_parse_int(value: &str) -> Option<i64> {
 	let unsigned = value.trim_start_matches([' ', '\t', '\n', '\u{b}', '\u{c}', '\r']);
 	let (negative, unsigned) = match unsigned.as_bytes().first() {
@@ -347,8 +356,8 @@ fn git_parse_int(value: &str) -> Option<i64> {
 		"g" | "G" => 1 << 30,
 		_ => return None,
 	};
-	let max = i64::from(i32::MAX);
-	if (number < 0 && -max / factor > number) || (number > 0 && max / factor < number) {
+	let (min, max) = (i64::from(i32::MIN), i64::from(i32::MAX));
+	if (number < 0 && min / factor > number) || (number > 0 && max / factor < number) {
 		return None;
 	}
 	Some(number * factor)
@@ -419,13 +428,26 @@ mod tests {
 		("1x", None),
 		("2g", None),
 		("2147483648", None),
-		("-2147483648", None),
+		("-2147483649", None),
+		("-2097153k", None),
 		("99999999999999999999", None),
 	];
 
+	/// `INT_MIN` in each unit. Git reads it as an integer, so true, from git
+	/// 2.50.0 (git commit 8f282bdff0b4, "parse: fix off-by-one for minimum
+	/// signed values"), and `git_env_bool` follows that rule; git before 2.50.0
+	/// refuses it as below `-INT_MAX`.
+	const INT_MIN_CASES: &[&str] = &["-2147483648", "-2097152k", "-2048m", "-2g"];
+
+	/// The first git release, `(major, minor)`, that reads [`INT_MIN_CASES`]
+	/// as integers.
+	const INT_MIN_SINCE: (u32, u32) = (2, 50);
+
 	#[test]
 	fn git_env_bool_reads_each_class_as_git_does() {
-		for &(value, expected) in NOSYSTEM_CASES {
+		// `INT_MIN` is true, as git 2.50.0 and later read it.
+		let int_min = INT_MIN_CASES.iter().map(|&value| (value, Some(true)));
+		for (value, expected) in NOSYSTEM_CASES.iter().copied().chain(int_min) {
 			let parsed = git_env_bool("GIT_CONFIG_NOSYSTEM", value.as_ref());
 			match expected {
 				Some(expected) => {
@@ -444,6 +466,8 @@ mod tests {
 
 	/// The same values given to the git binary: a refused value fails with
 	/// git's message, and a system file is read exactly when the value is false.
+	/// [`INT_MIN_CASES`] are compared with the answer of this binary's version,
+	/// as `git --version` names it: true from git 2.50.0, refused before.
 	///
 	/// The message's wording is the binary's own (git 2.43 says "bad boolean
 	/// environment value", git 2.39 "bad boolean config value"), so it is read
@@ -482,7 +506,13 @@ mod tests {
 			"git's refusal does not name the variable: {probe_stderr}"
 		);
 
-		for &(value, expected) in NOSYSTEM_CASES {
+		let version = Command::new("git").arg("--version").output().unwrap();
+		assert!(version.status.success(), "git --version: {version:?}");
+		let version = git_version(&String::from_utf8_lossy(&version.stdout));
+		let int_min = (version >= INT_MIN_SINCE).then_some(true);
+		let int_min = INT_MIN_CASES.iter().map(|&value| (value, int_min));
+
+		for (value, expected) in NOSYSTEM_CASES.iter().copied().chain(int_min) {
 			let output = run(value);
 			let stdout = String::from_utf8_lossy(&output.stdout);
 			let git = if output.status.success() {
@@ -495,8 +525,32 @@ mod tests {
 				);
 				None
 			};
-			assert_eq!(git, expected, "GIT_CONFIG_NOSYSTEM={value:?}");
+			assert_eq!(git, expected, "GIT_CONFIG_NOSYSTEM={value:?} with git {version:?}");
 		}
+	}
+
+	/// The `(major, minor)` release of a `git --version` answer.
+	fn git_version(answer: &str) -> (u32, u32) {
+		let numbers = answer.trim().strip_prefix("git version ");
+		let parsed = numbers.and_then(|numbers| {
+			let mut numbers = numbers.split(['.', ' ']).map(str::parse);
+			Some((numbers.next()?.ok()?, numbers.next()?.ok()?))
+		});
+		parsed.unwrap_or_else(|| panic!("not a git version: {answer:?}"))
+	}
+
+	#[test]
+	fn git_version_reads_each_release_form() {
+		assert_eq!(git_version("git version 2.43.0\n"), (2, 43));
+		assert_eq!(git_version("git version 2.39.5 (Apple Git-154)\n"), (2, 39));
+		assert_eq!(git_version("git version 2.47.1.windows.1\n"), (2, 47));
+		assert_eq!(git_version("git version 2.50.0.rc0\n"), (2, 50));
+	}
+
+	#[test]
+	#[should_panic(expected = "not a git version")]
+	fn git_version_refuses_an_answer_without_one() {
+		git_version("git: command not found\n");
 	}
 
 	#[test]

@@ -250,6 +250,12 @@ export function reportStaleWorkspaceAddon(
 export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
 
 /**
+ * Open one `.node` addon with `process.dlopen` and return its exports, as
+ * `require` does; unlike Bun's `require`, it loads from a path that holds `?`.
+ */
+export function openNativeAddon(candidate: string): Record<string, unknown>;
+
+/**
  * Load the native addon. The cache checks and writes (extraction, staging, and the one retry of
  * a cache file that vanished between the check that found it and its load, as it does while
  * cleanup in another process holds its directory renamed away) go through the addon cache's

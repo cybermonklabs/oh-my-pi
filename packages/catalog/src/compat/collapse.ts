@@ -34,6 +34,7 @@
  * entry. That makes it safe at every source — discovery, the catalog
  * generator, and the model-manager merge point.
  */
+import { runToCompletion } from "@oh-my-pi/pi-utils/event-loop-slice";
 import { buildModel } from "../build";
 import { Effort, THINKING_EFFORTS } from "../effort";
 import type { AntigravityModelWireProfile, Api, Model, ModelSpec, Provider, ThinkingConfig } from "../types";
@@ -1151,6 +1152,14 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
 	specs: readonly TSpec[],
 	opts?: { table?: VariantCollapseTable },
 ): TSpec[] {
+	return runToCompletion(collapseVariantsSteps(specs, opts));
+}
+
+/** {@link collapseVariants} with one slice unit per provider collapsed. */
+export function* collapseVariantsSteps<TSpec extends VariantSpecLike>(
+	specs: readonly TSpec[],
+	opts?: { table?: VariantCollapseTable },
+): Generator<void, TSpec[], undefined> {
 	if (opts?.table !== undefined) return collapseWithTable(specs, opts.table);
 	const byProvider = new Map<string, TSpec[]>();
 	for (const spec of specs) {
@@ -1163,6 +1172,7 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
 	}
 	const out: TSpec[] = [];
 	for (const [provider, slice] of byProvider) {
+		yield;
 		const table = reviewedCollapseTable(provider);
 		let result = table ? collapseWithTable(slice, table) : slice;
 		if (provider === "cursor") {
@@ -1178,6 +1188,7 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
 		registerCollapsedVariantAliases(provider, result);
 		out.push(...result);
 	}
+	yield;
 	retargetCollapsedModelReferences(out);
 	return out;
 }
@@ -1190,9 +1201,25 @@ export function collapseVariants<TSpec extends VariantSpecLike>(
  * pass through by reference.
  */
 export function collapseBuiltVariants<TApi extends Api>(models: readonly Model<TApi>[]): Model<TApi>[] {
-	const collapsed = collapseVariants(models);
+	return runToCompletion(collapseBuiltVariantsSteps(models));
+}
+
+/** {@link collapseBuiltVariants} with one slice unit per provider collapsed and per logical model rebuilt. */
+export function* collapseBuiltVariantsSteps<TApi extends Api>(
+	models: readonly Model<TApi>[],
+): Generator<void, Model<TApi>[], undefined> {
+	const collapsed = yield* collapseVariantsSteps(models);
 	const inputRefs = new Set<Model<TApi>>(models);
-	return collapsed.map(model => (inputRefs.has(model) ? model : buildModel(projectModelSpec(model))));
+	const out: Model<TApi>[] = [];
+	for (const model of collapsed) {
+		if (inputRefs.has(model)) {
+			out.push(model);
+			continue;
+		}
+		yield;
+		out.push(buildModel(projectModelSpec(model)));
+	}
+	return out;
 }
 
 function projectModelSpec<TApi extends Api>(model: Model<TApi>): ModelSpec<TApi> {

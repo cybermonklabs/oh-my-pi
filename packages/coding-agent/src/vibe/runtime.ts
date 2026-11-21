@@ -34,6 +34,8 @@ import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { OwnedJobsEnd } from "../session/agent-session-types";
+import { ownedJobsAbortReason, plainTurnAbortReason } from "../session/exit-diagnostics";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { defaultSessionStorage, type SessionStorage, sessionTreeStorage } from "../session/session-storage";
 import { getBundledAgent } from "../task/agents";
@@ -613,8 +615,10 @@ export class VibeSessionRegistry {
 		}
 	}
 
-	#trackAgentRelease(id: string, ref: AgentRef, action: "detach" | "release"): TrackedVibeTeardown {
-		return trackVibeTeardown(AgentLifecycleManager.global().release(id, ref), error => {
+	/** Release a worker's session; `end` says how its own jobs end ({@link OwnedJobsEnd}). */
+	#trackAgentRelease(id: string, ref: AgentRef, action: "detach" | "release", end: OwnedJobsEnd): TrackedVibeTeardown {
+		const release = AgentLifecycleManager.global().release(id, ref, { dispose: { ownedJobsEnd: end } });
+		return trackVibeTeardown(release, error => {
 			logger.warn(`vibe: failed to ${action} worker session`, {
 				id,
 				error: error instanceof Error ? error.message : String(error),
@@ -635,8 +639,9 @@ export class VibeSessionRegistry {
 		ref: AgentRef,
 		deadline: number,
 		action: "detach" | "release",
+		end: OwnedJobsEnd,
 	): Promise<void> {
-		const task = this.#trackAgentRelease(id, ref, action);
+		const task = this.#trackAgentRelease(id, ref, action, end);
 		await waitForVibeTeardown([task], deadline);
 		this.#finishAgentRelease(id, ref, task, action);
 	}
@@ -669,12 +674,13 @@ export class VibeSessionRegistry {
 		}
 		if (existing?.status === "aborted" && !existing.session) return;
 		if (existing && !registry.setStatus(id, "aborted", existing)) return;
+		// A terminal worker was killed: its own jobs stop with it.
 		if (existing && teardownDeadline !== undefined) {
-			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release");
+			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release", "stop");
 		} else if (existing && AgentLifecycleManager.global().has(id, existing)) {
-			await AgentLifecycleManager.global().release(id, existing);
+			await AgentLifecycleManager.global().release(id, existing, { dispose: { ownedJobsEnd: "stop" } });
 		} else if (existing?.session) {
-			await existing.session.dispose();
+			await existing.session.dispose({ ownedJobsEnd: "stop" });
 		}
 		const current = registry.get(id);
 		if (current && current !== existing) return;
@@ -1028,8 +1034,18 @@ export class VibeSessionRegistry {
 		return { settled, stillRunning, timedOut: waitEndedByTimeout && settled.length === 0 };
 	}
 
-	/** Detach one parent's process-local workers without tombstoning their persisted conversations. */
-	async suspendScope(scope: VibeOwnerScope, manager?: AsyncJobManagerApi): Promise<number> {
+	/**
+	 * Detach one parent's process-local workers without tombstoning their persisted conversations.
+	 * `end` says how the worker turns it cancels, and the jobs each worker owns, end ({@link OwnedJobsEnd}):
+	 * the parent's teardown and a switch of the parent session both stop them, so `omp --restore` does
+	 * not relaunch a worker turn they interrupt (a vibe turn interrupted by a restart is not resumed).
+	 */
+	async suspendScope(
+		scope: VibeOwnerScope,
+		manager: AsyncJobManagerApi | undefined,
+		end: OwnedJobsEnd,
+	): Promise<number> {
+		const turnAbortReason = ownedJobsAbortReason(end);
 		const records = [...this.#records.values()].filter(record => matchesScope(record, scope));
 		const teardown = records.map(record => ({
 			record,
@@ -1043,12 +1059,12 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 			record.lastActivity = "suspended for parent-session switch";
 			this.#records.delete(scopeKey(scope, record.id));
-			if (record.turn && manager) manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
+			if (record.turn && manager) manager.cancel(record.turn.jobId, { ownerId: record.ownerId }, turnAbortReason);
 		}
 		const deadline = Date.now() + this.#teardownGraceMs;
 		const cleanup = teardown.map(entry => ({
 			...entry,
-			releaseTask: entry.ref ? this.#trackAgentRelease(entry.record.id, entry.ref, "detach") : undefined,
+			releaseTask: entry.ref ? this.#trackAgentRelease(entry.record.id, entry.ref, "detach", end) : undefined,
 			jobTask: entry.job ? this.#trackJobSettlement(entry.record, entry.job) : undefined,
 		}));
 		await waitForVibeTeardown(
@@ -1062,24 +1078,29 @@ export class VibeSessionRegistry {
 					id: record.id,
 					jobId: job.id,
 				});
-				this.#continueSuspendedCleanup(scope, record, jobTask);
+				this.#continueSuspendedCleanup(scope, record, jobTask, end);
 			}
 			if (this.#records.has(scopeKey(scope, record.id))) continue;
 			const lateRef = this.#registeredAgent(record);
 			if (lateRef && lateRef !== ref) {
-				await this.#releaseRefWithinDeadline(record.id, lateRef, deadline, "detach");
+				await this.#releaseRefWithinDeadline(record.id, lateRef, deadline, "detach", end);
 			}
 		}
 		return records.length;
 	}
 
-	#continueSuspendedCleanup(scope: VibeOwnerScope, record: VibeRecord, jobTask: TrackedVibeTeardown): void {
+	#continueSuspendedCleanup(
+		scope: VibeOwnerScope,
+		record: VibeRecord,
+		jobTask: TrackedVibeTeardown,
+		end: OwnedJobsEnd,
+	): void {
 		void jobTask.promise
 			.then(async () => {
 				if (this.#records.has(scopeKey(scope, record.id))) return;
 				const lateRef = this.#registeredAgent(record);
 				if (!lateRef) return;
-				await this.#releaseRefWithinDeadline(record.id, lateRef, Date.now() + this.#teardownGraceMs, "detach");
+				await this.#releaseRefWithinDeadline(record.id, lateRef, Date.now() + this.#teardownGraceMs, "detach", end);
 			})
 			.catch(error => {
 				logger.warn("vibe: failed to finish suspended worker cleanup", {
@@ -1188,13 +1209,13 @@ export class VibeSessionRegistry {
 		if (record.turn && manager) {
 			const job = manager.getJob(record.turn.jobId);
 			if (job) settlingJobs.add(job);
-			cancelledTurn = manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
+			cancelledTurn = manager.cancel(record.turn.jobId, { ownerId: record.ownerId }, plainTurnAbortReason("stop"));
 		}
 		record.state = "dead";
 		record.lastActivityAt = Date.now();
 		record.lastActivity = "killed";
 		const deadline = teardownDeadline ?? Date.now() + this.#teardownGraceMs;
-		const releaseTask = registered ? this.#trackAgentRelease(record.id, registered, "release") : undefined;
+		const releaseTask = registered ? this.#trackAgentRelease(record.id, registered, "release", "stop") : undefined;
 		const jobCleanup = [...settlingJobs].map(job => ({ job, task: this.#trackJobSettlement(record, job) }));
 		await waitForVibeTeardown(
 			[releaseTask, ...jobCleanup.map(entry => entry.task)].filter(task => task !== undefined),
@@ -1418,6 +1439,7 @@ export class VibeSessionRegistry {
 								eventBus: session.eventBus,
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
+								storeMaskCwd: session.settings.getCwd(),
 							});
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {

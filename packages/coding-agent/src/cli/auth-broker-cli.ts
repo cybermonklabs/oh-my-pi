@@ -25,6 +25,7 @@ import {
 	getOAuthProviders,
 	isSameOAuthAccount,
 	listProvidersWithEnvKey,
+	LOGGED_OUT_BY_USER,
 	matchesReplacementCredential,
 	type OAuthCredential,
 	type OAuthProvider,
@@ -41,6 +42,7 @@ import { $ } from "bun";
 import { refreshManagedMcpOAuthCredential } from "../mcp/oauth-credentials";
 import { isManagedMCPOAuthCredentialId, mcpOAuthServerUrlFromCredentialId } from "../mcp/oauth-flow";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { collectLogoutProviders } from "../slash-commands/helpers/logout";
 import { pickIndex, pickOAuthProvider, runTerminalOAuthLogin } from "./oauth-terminal";
 import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
 
@@ -273,7 +275,13 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
 		if (!providerArg) {
-			const stored = store.listProviders();
+			// Also the providers whose only logins a failure disabled: the logout retires those
+			// tombstones, which a turn would otherwise keep retrying the provider's key for.
+			const stored = [
+				...(await collectLogoutProviders(store.listProviders(), provider =>
+					store.listDisabledCredentials(provider),
+				)),
+			];
 			if (stored.length === 0) {
 				process.stdout.write("No credentials stored.\n");
 				return;
@@ -285,7 +293,7 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 				rl.close();
 			}
 		}
-		await store.deleteAuthCredentials(providerArg, "logged out by user");
+		await store.deleteAuthCredentials(providerArg, LOGGED_OUT_BY_USER);
 		process.stdout.write(`Logged out of ${providerArg}\n`);
 	} finally {
 		store.close();

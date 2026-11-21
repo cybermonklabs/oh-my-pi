@@ -29,12 +29,13 @@ import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { AgentSessionEvent, UsageFallbackConfirmation } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { AgentSessionDisposeOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { getConfigRootDir, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, postmortem, removeWithRetries, setAgentDir, withTimeout } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
 	ClientCapabilities,
@@ -144,6 +145,7 @@ class FakeAgentSession {
 	getAgentId(): string | undefined {
 		return undefined;
 	}
+	disposeOptions: AgentSessionDisposeOptions | undefined;
 	fastMode = false;
 	clientBridge: ClientBridge | undefined;
 	forcedToolChoice: string | undefined;
@@ -374,8 +376,9 @@ class FakeAgentSession {
 		return true;
 	}
 
-	async dispose(): Promise<void> {
+	async dispose(options?: AgentSessionDisposeOptions): Promise<void> {
 		this.disposed = true;
+		this.disposeOptions = options;
 		await this.sessionManager.close();
 	}
 
@@ -701,6 +704,20 @@ describe("ACP agent", () => {
 		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
 		expect(harness.sessions.at(-1)?.sessionId).toBe(continued);
 		await harness.agent.dispose();
+	});
+
+	it("stops the jobs of a session it closes while it serves others, and lets its exit cut them off", async () => {
+		// If this regresses, closing one ACP session while the server goes on cuts off its jobs and those of the idle
+		// subagents its end releases, as the server's exit does: their subagents record a process exit that did not
+		// happen, and `omp --restore` relaunches their turns.
+		const harness = await createHarness();
+		const closed = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const kept = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		await harness.agent.closeSession({ sessionId: closed.sessionId });
+		expect(harness.findSession(closed.sessionId)?.disposeOptions).toEqual({ ownedJobsEnd: "stop" });
+
+		await harness.agent.dispose(postmortem.Reason.SIGTERM);
+		expect(harness.findSession(kept.sessionId)?.disposeOptions).toEqual({ reason: postmortem.Reason.SIGTERM });
 	});
 
 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {

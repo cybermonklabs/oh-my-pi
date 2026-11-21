@@ -407,6 +407,9 @@
 	"packages/coding-agent/src/session/session-index.ts": [
 		"PI_CODING_AGENT_DIR"
 	],
+	"packages/coding-agent/src/session/session-manager.ts": [
+		"OMP_SESSION_EXCLUSIVE"
+	],
 	"packages/coding-agent/src/session/settings.ts": [
 		"PI_TINY_DEVICE",
 		"PI_TINY_DTYPE"

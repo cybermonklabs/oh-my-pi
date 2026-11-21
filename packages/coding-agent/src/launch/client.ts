@@ -285,9 +285,11 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			// the socket.
 		}
 		this.#spawnBroker();
-		const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+		// The monotonic clock: a step of the wall clock neither holds the wait for
+		// the broker past CONNECT_TIMEOUT_MS nor ends it early.
+		const deadline = performance.now() + CONNECT_TIMEOUT_MS;
 		let lastError: Error | undefined;
-		while (Date.now() < deadline) {
+		while (performance.now() < deadline) {
 			try {
 				this.#bindSocket(await IpcConnection.connect(this.#endpoint, { framing: "lines", timeoutMs: 250 }));
 				return;

@@ -102,6 +102,7 @@ function createMockSession(
 		model: { api: "anthropic-messages" } as never,
 		extensionRunner: undefined as never,
 		sessionManager: { appendSessionInit: () => {} } as never,
+		settings: Settings.isolated(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
@@ -723,6 +724,7 @@ describe("runSubprocess soft request budget", () => {
 			softRequestBudget: 2,
 			softRequestBudgetNotice: true,
 			eventBus,
+			storeMaskCwd: "/tmp",
 		});
 
 		const observer = handle.wakeObserver();

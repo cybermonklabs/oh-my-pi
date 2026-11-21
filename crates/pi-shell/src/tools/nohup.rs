@@ -6,9 +6,17 @@
 //! end its externals at teardown. A signal aimed at the `nohup` itself
 //! (`kill $!` of `nohup cmd &`, `kill %1`) still reaches the command, as it
 //! reaches the program a real `nohup` `exec`s. Unlike coreutils, `SIGHUP` is
-//! not masked and output is not redirected to `nohup.out`.
+//! not masked and output is not redirected to `nohup.out`, so `nohup` does
+//! nothing visible before its command starts: as the command of `xargs` or
+//! `find -exec … +`, it hands a refusal of that command as too long up to
+//! them ([`CallOutcome::TooLong`]), and they retry the line in halves, each
+//! with a `nohup` of its own, as GNU's retry a line whose `nohup` the system
+//! refused. A command it cannot run is reported as coreutils' `nohup`
+//! reports it: `nohup: failed to run command NAME: strerror`, with `NAME`
+//! quoted as a shell word (GNU's `quoteaf`: `'a b'`, `"it's"`), status 126,
+//! or 127 when nothing is found (a `#!` interpreter included).
 
-use bstr::BString;
+use bstr::{BString, ByteSlice};
 
 use super::{Child, Out, Turn};
 use crate::bash::{CallOutcome, ShellApi, ToolCall};
@@ -59,8 +67,12 @@ pub(super) struct Nohup {
 	out:              Out,
 	/// The command, until it starts.
 	command:          Option<Vec<BString>>,
+	/// The command's name, once it started.
+	name:             BString,
 	/// The answer without running anything.
 	exit:             Option<i32>,
+	/// Whether the failure to run the command was reported.
+	reported:         bool,
 }
 
 impl Nohup {
@@ -81,7 +93,15 @@ impl Nohup {
 				(None, Some(EXIT_FAILURE))
 			},
 		};
-		Self { child: Child::default(), call, out, command, exit }
+		Self {
+			child: Child::default(),
+			call,
+			out,
+			command,
+			name: BString::default(),
+			exit,
+			reported: false,
+		}
 	}
 
 	pub(super) fn advance(
@@ -90,10 +110,38 @@ impl Nohup {
 		turn: &mut Turn<'_>,
 	) -> Option<CallOutcome> {
 		if let Some(command) = self.command.take() {
-			self.child.start(api, turn, &self.call, command, true, "");
+			self.name = command.first().cloned().unwrap_or_default();
+			self
+				.child
+				.start(api, turn, &self.call, command, true, "", true);
 		}
 		let code = self.exit.or(self.child.status)?;
-		self.out.flush(api).then_some(CallOutcome::Exit(code))
+		let outcome = if self.exit.is_some() {
+			CallOutcome::Exit(code)
+		} else if let Some(errno) = self.child.too_long(&self.call) {
+			// A caller that retries a refused line hears of it, as of a
+			// `nohup` whose own `exec` the system refused.
+			CallOutcome::TooLong(errno)
+		} else if let Some((status, text)) = self.child.cannot_run(&self.call) {
+			// coreutils' words and status (126; 127 when nothing is found).
+			if !std::mem::replace(&mut self.reported, true) {
+				let env = &self.call.env;
+				// The call's environment, as coreutils' `setlocale(LC_ALL, "")`
+				// reads it.
+				let utf8 = pi_builtins::extras::ctype_is_utf8_in(|var| {
+					env.get(var.as_bytes())
+						.and_then(|value| value.to_str().ok())
+				});
+				let name = pi_builtins::extras::gnu_quote_shell(utf8, &self.name.to_str_lossy());
+				self
+					.out
+					.push(2, format!("nohup: failed to run command {name}: {text}\n"));
+			}
+			CallOutcome::Exit(status)
+		} else {
+			CallOutcome::Exit(code)
+		};
+		self.out.flush(api).then_some(outcome)
 	}
 }
 

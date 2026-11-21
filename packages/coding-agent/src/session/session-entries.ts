@@ -88,6 +88,11 @@ export interface NewSessionOptions {
 	additionalDirectories?: string[];
 	/** Directory for the new session file (and later `/new` sessions); defaults to the current session directory. */
 	sessionDir?: string;
+	/**
+	 * Id for the new session, in place of a minted one: for a launcher that records the id
+	 * before the session starts. The caller makes sure no stored session holds it.
+	 */
+	sessionId?: string;
 }
 
 export interface SessionEntryBase {
@@ -396,6 +401,36 @@ export function resolveSessionLeafId(entries: readonly SessionEntry[]): string |
 	const leafId = sessionEntryLeafId(last);
 	if (leafId === null || leafId === last.id || entries.some(entry => entry.id === leafId)) return leafId;
 	return lastSelfSelectedLeafId(entries);
+}
+
+/**
+ * Entries from the root to `leaf`, following `parentId`. Corrupt or pre-fix files can contain
+ * parent cycles; the walk stops at the first repeat, so it is bounded.
+ */
+export function branchPath(leaf: SessionEntry, byId: ReadonlyMap<string, SessionEntry>): SessionEntry[] {
+	const path: SessionEntry[] = [];
+	const seen = new Set<string>();
+	let current: SessionEntry | undefined = leaf;
+	while (current && !seen.has(current.id)) {
+		seen.add(current.id);
+		path.push(current);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return path.reverse();
+}
+
+/**
+ * The branch a file's replay selects: the entries from the root to its active leaf (see {@link resolveSessionLeafId}).
+ * A caller that already resolved the leaf of these same entries passes it as `leafId`.
+ */
+export function activeBranch(
+	entries: readonly SessionEntry[],
+	leafId: string | null = resolveSessionLeafId(entries),
+): SessionEntry[] {
+	if (leafId === null) return [];
+	const byId = new Map(entries.map(entry => [entry.id, entry]));
+	const leaf = byId.get(leafId);
+	return leaf ? branchPath(leaf, byId) : [];
 }
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */

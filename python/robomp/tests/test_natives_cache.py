@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -23,6 +24,9 @@ from robomp.natives_cache import (
     NativesCache,
     compute_key,
 )
+
+if TYPE_CHECKING:
+    from tests.conftest import GitConfigSeries
 
 REPO = "octo/widget"
 
@@ -310,6 +314,18 @@ def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: P
 def test_compute_key_raises_on_non_repo(tmp_path: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         compute_key(tmp_path, target="linux-arm64")
+
+
+def test_compute_key_git_env_appends_safe_directory_after_inherited_git_config(
+    tmp_path: Path, git_config: GitConfigSeries, inherited_git_config: list[tuple[str, str]]
+) -> None:
+    # The user's own GIT_CONFIG_* entries stay ahead of safe.directory, and no
+    # slot is left past the count.
+    repo_dir = tmp_path / "repo"
+    env = natives_cache._git_safe_directory_env(repo_dir)
+
+    assert git_config.entries(env) == [*inherited_git_config, ("safe.directory", str(repo_dir))]
+    assert git_config.past_count(env) == {}
 
 
 # ---- populate / capture ----

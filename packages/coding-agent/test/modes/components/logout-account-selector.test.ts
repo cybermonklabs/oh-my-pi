@@ -1,12 +1,27 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { AuthStorage, isAutoDisabledCredential } from "@oh-my-pi/pi-ai";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
+import { OAuthSelectorComponent } from "@oh-my-pi/pi-tui/overlays/oauth-selector";
+import type { Component } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 import { LogoutAccountSelectorComponent } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { StoredAuthCredential } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { toLogoutAccounts } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/logout";
+import {
+	listLogoutAccounts,
+	listLogoutProviders,
+	logoutCredential,
+	toLogoutAccounts,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/logout";
 
 beforeAll(async () => {
 	await initTheme();
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("LogoutAccountSelectorComponent", () => {
 	it("starts on the active stored account and selects that credential", () => {
@@ -58,4 +73,256 @@ describe("LogoutAccountSelectorComponent", () => {
 
 		expect(selected).toEqual([12]);
 	});
+
+	it("lists a failure-disabled login as removable and retires it on logout", async () => {
+		await using temp = await TempDir.create("@logout-disabled-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "disabled@example.test",
+					orgId: "org-disabled",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			await authStorage.credentials.disable(id, "oauth refresh failed: invalid_grant");
+			const accounts = await listLogoutAccounts(authStorage, "anthropic", "logout-session");
+			expect(accounts).toHaveLength(1);
+			expect(accounts[0]?.label).toContain("(disabled)");
+			expect(accounts).toEqual([
+				expect.objectContaining({
+					credentialId: id,
+					active: false,
+					label: expect.stringContaining("disabled@example.test"),
+					detail: expect.stringContaining("disabled"),
+				}),
+			]);
+			const registry = new ModelRegistry(authStorage, temp.join("models.yml"));
+			vi.spyOn(registry, "refreshProvider").mockResolvedValue(undefined);
+			const session = { modelRegistry: registry, sessionId: "logout-session", refreshScopedModels: async () => {} };
+			expect((await logoutCredential(session, "anthropic", id)).removed).toBe(true);
+			expect((await authStorage.credentials.listDisabled("anthropic")).some(isAutoDisabledCredential)).toBe(false);
+			expect(await listLogoutAccounts(authStorage, "anthropic", "logout-session")).toEqual([]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("lists the stored accounts and providers when the tombstone lookup fails", async () => {
+		// If this regresses, an auth broker that cannot answer the tombstone lookup leaves the user
+		// unable to remove even an active account: the selector only reports that it could not load them.
+		await using temp = await TempDir.create("@logout-lookup-failed-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "active@example.test",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			vi.spyOn(authStorage.credentials, "listDisabled").mockRejectedValue(new Error("auth broker unreachable"));
+
+			expect(await listLogoutAccounts(authStorage, "anthropic", "logout-session")).toEqual([
+				expect.objectContaining({ credentialId: id, label: expect.stringContaining("active@example.test") }),
+			]);
+			expect([...(await listLogoutProviders(authStorage))]).toEqual(["anthropic"]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("lists one account when a recoverable tombstone names the same login as an active row", async () => {
+		// If this regresses, /logout offers the account twice — once plain and once "(disabled)" —
+		// after the user logged in again, and removing the disabled row removes nothing of theirs.
+		await using temp = await TempDir.create("@logout-relogin-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "relogin@example.test",
+					orgId: "org-relogin",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			// The login a failure tore down before the user logged in again, as a broker that predates
+			// `identityKey` reports it: the account's identity, no store key to compare.
+			vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+				{
+					id: id + 100,
+					provider: "anthropic",
+					type: "oauth",
+					email: "relogin@example.test",
+					orgId: "org-relogin",
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			]);
+
+			const accounts = await listLogoutAccounts(authStorage, "anthropic", "logout-session");
+
+			expect(accounts.map(account => account.credentialId)).toEqual([id]);
+			expect(accounts[0]?.label).not.toContain("(disabled)");
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("lists a recoverable tombstone of another member of the active login's organization beside it", async () => {
+		// If this regresses, another member's login in the same organization hides this member's failure-disabled
+		// one: /logout cannot remove it, and its sessions keep waiting for its key.
+		await using temp = await TempDir.create("@logout-org-member-");
+		const authStorage = await AuthStorage.create(temp.join("auth.db"));
+		try {
+			await authStorage.credentials.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access",
+					refresh: "refresh",
+					expires: Date.now() + 60_000,
+					email: "member-b@example.test",
+					orgId: "org-shared",
+				},
+			]);
+			const id = authStorage.credentials.list("anthropic")[0]!.id;
+			// Member A's login a failure tore down, as a broker that predates `identityKey` reports it.
+			vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+				{
+					id: id + 100,
+					provider: "anthropic",
+					type: "oauth",
+					email: "member-a@example.test",
+					orgId: "org-shared",
+					cause: "oauth refresh failed: invalid_grant",
+				},
+			]);
+
+			const accounts = await listLogoutAccounts(authStorage, "anthropic", "logout-session");
+
+			expect(accounts).toEqual([
+				expect.objectContaining({ credentialId: id, label: expect.stringContaining("member-b@example.test") }),
+				expect.objectContaining({
+					credentialId: id + 100,
+					active: false,
+					label: expect.stringContaining("member-a@example.test"),
+				}),
+			]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	/** Another account's login beside the active one, sharing one identifier with it and differing in another. */
+	const sharedIdentifierAccounts = [
+		{
+			account: "Codex Team seat that shares the active login's account id",
+			provider: "openai-codex",
+			active: { email: "seat-b@example.test", accountId: "acct-team" },
+			failed: { email: "seat-a@example.test", accountId: "acct-team" },
+		},
+		{
+			account: "Anthropic organization of the active login's email",
+			provider: "anthropic",
+			active: { email: "shared@example.test", orgId: "org-live" },
+			failed: { email: "shared@example.test", orgId: "org-dead" },
+		},
+	];
+
+	for (const { account, provider, active, failed } of sharedIdentifierAccounts) {
+		it(`lists a recoverable tombstone of another ${account} beside it`, async () => {
+			// If this regresses, the active login hides the other account's failure-disabled one when the broker
+			// predates `identityKey`: /logout cannot remove it, and its sessions keep waiting for its key.
+			await using temp = await TempDir.create("@logout-shared-identifier-");
+			const authStorage = await AuthStorage.create(temp.join("auth.db"));
+			try {
+				await authStorage.credentials.set(provider, [
+					{ type: "oauth", access: "access", refresh: "refresh", expires: Date.now() + 60_000, ...active },
+				]);
+				const id = authStorage.credentials.list(provider)[0]!.id;
+				// The other account's login a failure tore down, as a broker that predates `identityKey` reports it.
+				vi.spyOn(authStorage.credentials, "listDisabled").mockResolvedValue([
+					{ id: id + 100, provider, type: "oauth", ...failed, cause: "oauth refresh failed: invalid_grant" },
+				]);
+
+				const accounts = await listLogoutAccounts(authStorage, provider, "logout-session");
+
+				expect(accounts.map(row => [row.credentialId, row.label.endsWith("(disabled)")])).toEqual([
+					[id, false],
+					[id + 100, true],
+				]);
+			} finally {
+				authStorage.close();
+			}
+		});
+	}
+
+	for (const explicitProvider of [true, false]) {
+		it(`offers and removes a failure-disabled login through the ${explicitProvider ? "account" : "provider"} selector`, async () => {
+			await using temp = await TempDir.create("@logout-selector-disabled-");
+			const authStorage = await AuthStorage.create(temp.join("auth.db"));
+			try {
+				await Settings.init({ inMemory: true });
+				await authStorage.credentials.set("anthropic", [
+					{
+						type: "oauth",
+						access: "access",
+						refresh: "refresh",
+						expires: Date.now() + 60_000,
+						email: "disabled@example.test",
+					},
+				]);
+				const id = authStorage.credentials.list("anthropic")[0]!.id;
+				await authStorage.credentials.disable(id, "oauth refresh failed: invalid_grant");
+				const registry = new ModelRegistry(authStorage, temp.join("models.yml"));
+				vi.spyOn(registry, "refreshProvider").mockResolvedValue(undefined);
+				vi.spyOn(registry, "getApiKeyForProvider").mockResolvedValue(undefined);
+				const completed = Promise.withResolvers<void>();
+				const ctx = createInteractiveModeContext({
+					// The logout path refreshes the session's scoped models after the removal.
+					session: { modelRegistry: registry, sessionId: "logout-session", refreshScopedModels: async () => {} },
+					present: () => completed.resolve(),
+					showError: error => completed.reject(new Error(error)),
+				});
+				const controller = new SelectorController(ctx);
+				const shown: Component[] = [];
+				const accountOpened = Promise.withResolvers<void>();
+				controller.showSelector = create => {
+					const result = create(() => {});
+					shown.push(result.component);
+					if (result.component instanceof LogoutAccountSelectorComponent) accountOpened.resolve();
+				};
+				// Keep a failed selector assertion from leaving a rejecting fixture promise behind.
+				void completed.promise.catch(() => {});
+				await controller.showOAuthSelector("logout", explicitProvider ? "anthropic" : undefined);
+				if (!explicitProvider) {
+					const provider = shown[0];
+					expect(provider).toBeInstanceOf(OAuthSelectorComponent);
+					provider!.handleInput?.("anthropic");
+					provider!.handleInput?.("\n");
+					await accountOpened.promise;
+					expect(shown).toHaveLength(2);
+				}
+				const selector = shown.at(-1);
+				expect(selector).toBeInstanceOf(LogoutAccountSelectorComponent);
+				expect(selector!.render(100).map(Bun.stripANSI).join("\n")).toContain("(disabled)");
+				selector!.handleInput?.("\n");
+				await completed.promise;
+				expect((await authStorage.credentials.listDisabled("anthropic")).some(isAutoDisabledCredential)).toBe(
+					false,
+				);
+			} finally {
+				authStorage.close();
+			}
+		});
+	}
 });

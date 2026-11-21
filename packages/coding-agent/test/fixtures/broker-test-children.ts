@@ -50,7 +50,7 @@ function isolatedEnv(dir: TempDir): Record<string, string> {
 it("starts an RPC child and reads its state", async () => {
 	using dir = TempDir.createSync("@omp-broker-rpc-child-");
 	const client = new RpcClient({
-		cliPath,
+		command: [process.execPath, cliPath],
 		cwd: dir.path(),
 		env: isolatedEnv(dir),
 		provider: "openai",

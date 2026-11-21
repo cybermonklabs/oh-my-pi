@@ -26,7 +26,7 @@ import {
 import { Settings } from "../config/settings";
 import type { Setting } from "../config/registry";
 
-import { BLOB_HASH_RE, BLOB_STAGING_RE, blobStagingPath } from "../session/blob-store";
+import { BLOB_HASH_RE, BLOB_STAGING_RE, blobStagingPath, type SessionBlobSweep } from "../session/blob-store";
 import { listSessionsReadOnly, type SessionInfo, type SessionStatus } from "../session/session-listing";
 import { parseTerminalBreadcrumb } from "../session/session-paths";
 import {
@@ -118,7 +118,7 @@ export interface GcCommandFlags {
 	wal?: boolean;
 	stale?: boolean;
 	compress?: boolean;
-	/** Session id prefix or archive path to bring back out of the archive. */
+	/** Session id prefix (a full id matches only exactly) or archive path to bring back out of the archive. */
 	restore?: string;
 	strip?: boolean;
 	coldArchiveAfterDays?: number;
@@ -143,6 +143,8 @@ export interface BlobGcResult {
 	deleted: number;
 	bytes: number;
 	errors: string[];
+	/** Under SQL session storage: the blob table's rows no session names (see `SessionBlobTier.sweep`). */
+	table?: SessionBlobSweep;
 }
 
 export interface ArchiveGcResult {
@@ -168,7 +170,7 @@ export interface ArchiveGcResult {
 }
 
 export interface RestoreGcResult {
-	/** What the caller asked for: a session id prefix or an archive path. */
+	/** What the caller asked for: a session id prefix (a full id matches only exactly) or an archive path. */
 	query: string;
 	archivePath?: string;
 	sessionPath?: string;
@@ -1037,6 +1039,15 @@ async function runBlobGc(
 			result.wouldDelete += 1;
 			result.bytes += file.bytes;
 			if (options.apply) await unlinkBlobFile(file.path, result);
+		}
+		// Under SQL session storage, the blob table's rows no session names go as well, while the
+		// sessions read above are still held.
+		if (storage.blobTier) {
+			try {
+				result.table = await storage.blobTier.sweep(referenced.hashes, deleteBeforeMs, options.apply);
+			} catch (error) {
+				result.errors.push(`blob table: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 		return result;
 	} finally {
@@ -2053,6 +2064,10 @@ function renderText(result: GcResult): string {
 		lines.push(
 			`blobs: ${result.blobs.deleted}/${result.blobs.wouldDelete} files, ${formatBytes(result.blobs.bytes)}, ${result.blobs.referenced} refs`,
 		);
+		if (result.blobs.table) {
+			const table = result.blobs.table;
+			lines.push(`blob table: ${table.deleted}/${table.candidates} rows, ${formatBytes(table.bytes)}`);
+		}
 		if (result.blobs.errors.length > 0) lines.push(`blob errors: ${result.blobs.errors.length}`);
 	}
 	if (result.archive) {

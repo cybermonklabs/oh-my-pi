@@ -18,6 +18,7 @@
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
 - A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+- A turn that fails with a thrown `CredentialUnavailableError` now carries its transient classification (`errorId`) on the error message, so a host's turn retry can treat it as retryable, and marks the message `credentialUnavailable`, so a resume can go on with the turn ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar)).
 
 ### Breaking Changes
 

@@ -1160,6 +1160,37 @@ export function initLoaderContext(overrides = {}) {
 }
 
 /**
+ * Exports of each `.node` file this copy of the loader opened, by the path it
+ * was opened at.
+ * @type {Map<string, Record<string, unknown>>}
+ */
+const openedAddons = new Map();
+
+/**
+ * Open one `.node` addon and return its exports, as `require` does for a
+ * `.node` file. `process.dlopen` rather than `require`: Bun's `require` cannot
+ * load any module from a path that contains `?` (it reads the path cut at the
+ * `?`), and the addon's directory follows `HOME`, `PI_NATIVES_DIR` or the
+ * install location, so it can hold one. `dlopen` takes the path as it is.
+ *
+ * Like `require`, it opens a file once and then returns the same exports:
+ * `loadNative()` runs again on every call of the lazy entrypoints
+ * (`clipboard.js`, `desktop.js`, …), and a second `dlopen` of the file runs the
+ * addon's init again, which makes new classes that `instanceof` against the
+ * first ones fails.
+ * @param {string} candidate
+ * @returns {Record<string, unknown>}
+ */
+export function openNativeAddon(candidate) {
+	const opened = openedAddons.get(candidate);
+	if (opened) return opened;
+	const addonModule = { exports: {} };
+	process.dlopen(addonModule, candidate);
+	openedAddons.set(candidate, addonModule.exports);
+	return addonModule.exports;
+}
+
+/**
  * Have a file of this process's own cache directory there again after it
  * vanished between the check that found it and its load: cleanup in another
  * process renames a stale directory away for a moment while it checks whether a
@@ -1184,7 +1215,6 @@ function restoreCachedAddon(ctx, errors, candidate) {
 export function loadNative() {
 	startupMarker("native:loadNative:start");
 	const ctx = initLoaderContext();
-	const require_ = createRequire(import.meta.url);
 
 	const errors = [];
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
@@ -1200,7 +1230,7 @@ export function loadNative() {
 	const fallbackEmbeddedPath = fallbackEmbeddedFile && path.join(ctx.versionedDir, fallbackEmbeddedFile.filename);
 	const load = candidate => {
 		startupMarker(`native:require:${path.basename(candidate)}`);
-		const bindings = require_(candidate);
+		const bindings = openNativeAddon(candidate);
 		validateLoadedBindings(ctx, bindings, candidate);
 		installNativeTokioRuntime(bindings);
 		configureGrammarDir(bindings, ctx.nativesDir);
@@ -1222,11 +1252,13 @@ export function loadNative() {
 		} catch (err) {
 			let failure = err;
 			// Once: a file of this process's cache directory that was not there when it was
-			// loaded (`MODULE_NOT_FOUND`), though the check before found it, whether cleanup has
-			// put it back since or not.
+			// opened, though the check before found it, whether cleanup has put it back since or
+			// not. `process.dlopen` reports a missing file only as `ERR_DLOPEN_FAILED`, with the
+			// system's own text, so any failed open there gets the one retry; a file that cannot
+			// be opened fails the same way again and is reported.
 			if (
 				path.dirname(candidate) === ctx.versionedDir &&
-				(failure?.code === "MODULE_NOT_FOUND" || !io.existsSync(candidate)) &&
+				(failure?.code === "ERR_DLOPEN_FAILED" || !io.existsSync(candidate)) &&
 				restoreCachedAddon(ctx, errors, candidate)
 			) {
 				try {
