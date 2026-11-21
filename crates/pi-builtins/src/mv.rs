@@ -13,14 +13,14 @@ use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, error::Err
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use pi_vfs::{
 	BlockingFs, CanonicalizeOptions, MissingHandling, ResolveMode, child_path, file_name,
-	is_virtual_path, parent_path,
+	is_virtual_path, parent_path, with_file_name,
 };
 use rustc_hash::FxHashSet;
 use thiserror::Error;
 #[cfg(unix)]
 use uucore::fs::display_permissions_unix;
 use uucore::{
-	backup_control::{self, BackupMode, source_is_target_backup},
+	backup_control::{self, BackupMode},
 	display::Quotable,
 	fs::path_ends_with_terminator,
 	update_control::{self, UpdateMode},
@@ -47,6 +47,8 @@ enum MvError {
 	DirectoryToNonDirectory(String),
 	#[error("cannot overwrite non-directory {1} with directory {0}")]
 	NonDirectoryToDirectory(String, String),
+	#[error("backing up {0} might destroy source;  {1} not moved")]
+	BackupWouldDestroySource(String, String),
 	#[error("target {0}: Not a directory")]
 	NotADirectory(String),
 	#[error("target directory {0}: Not a directory")]
@@ -425,20 +427,6 @@ fn parse_paths(files: &[OsString], opts: &Options) -> Vec<PathBuf> {
 }
 
 fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Options) -> MvResult<()> {
-	if opts.backup == BackupMode::Simple && source_is_target_backup(source, target, &opts.suffix) {
-		return Err(
-			io::Error::new(
-				io::ErrorKind::NotFound,
-				format!(
-					"backing up {} might destroy source;  {} not moved",
-					target.quote(),
-					source.quote()
-				),
-			)
-			.into(),
-		);
-	}
-
 	let filesystem = host.fs().clone();
 	let source_fs = host.resolve(source);
 	let target_fs = host.resolve(target);
@@ -787,6 +775,18 @@ fn rename(
 			},
 		}
 
+		// The backup would be renamed over a source that is the destination's
+		// simple backup, so GNU refuses one in every mode but numbered, where
+		// the backup takes a fresh `.~N~` name (`copy.c`, `source_is_dst_backup`).
+		if !matches!(opts.backup, BackupMode::None | BackupMode::Numbered)
+			&& source_is_destination_backup(&filesystem, &from_fs, &to_fs, &opts.suffix)
+		{
+			return Err(io::Error::other(MvError::BackupWouldDestroySource(
+				to.quote().to_string(),
+				from.quote().to_string(),
+			)));
+		}
+
 		// numbered-backup probing goes through the injected filesystem.
 		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix);
 		if let Some(backup) = &backup {
@@ -859,6 +859,26 @@ fn crosses_devices(error: &io::Error) -> bool {
 /// message names both paths, as GNU's does.
 fn is_refusal(error: &io::Error) -> bool {
 	error.get_ref().is_some_and(|inner| inner.is::<MvError>())
+}
+
+/// Whether `from` is `to`'s simple backup, as GNU's `source_is_dst_backup`
+/// decides: its name is `to`'s with `suffix` added, and the entry of that
+/// name beside `to`, followed, is the same file as `from`, not followed. A
+/// `dest~` elsewhere is another file, and `./dest~` is the same one.
+fn source_is_destination_backup(filesystem: &BlockingFs, from: &Path, to: &Path, suffix: &str) -> bool {
+	let (Some(from_name), Some(to_name)) = (file_name(from), file_name(to)) else {
+		return false;
+	};
+	let mut backup_name = to_name.into_owned();
+	backup_name.push(suffix);
+	if *from_name != *backup_name {
+		return false;
+	}
+	let backup = with_file_name(to, &backup_name);
+	match (filesystem.symlink_metadata(from), filesystem.metadata(&backup)) {
+		(Ok(from), Ok(backup)) => from.same_file(&backup),
+		_ => false,
+	}
 }
 
 /// A wrapper around `rename`, so that if it fails, we try falling back on
