@@ -302,7 +302,8 @@ export async function runRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted },
+		// An RPC client's command: input from outside the session.
+		{ streamingBehavior, queueChipText: invocation.queueChipText, onPromptAdmitted, origin: "outside" },
 	);
 }
 
@@ -857,7 +858,7 @@ export async function handleRpcSteerSubagent(
 	const unsubscribe = session.subscribe(event => {
 		if (event.type === "agent_start") accepted.resolve();
 	});
-	session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true }).then(
+	session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true, origin: "outside" }).then(
 		() => accepted.resolve(),
 		err => {
 			accepted.reject(err);
@@ -1910,12 +1911,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
+			// An RPC client's prompt, steer or follow-up is input from outside the session.
 			if (command.type === "steer") {
-				await session.steer(text, images);
+				await session.steer(text, images, { origin: "outside" });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
-				await session.followUp(text, images);
+				await session.followUp(text, images, { origin: "outside" });
 				return "admitted";
 			}
 			if (command.type === "prompt") {
@@ -1942,6 +1944,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					settings: session.settings,
 					cwd: session.sessionManager.getCwd(),
 					output: commandOutput => output({ type: "command_output", text: commandOutput }),
+					// An RPC client's command: input from outside the session.
+					origin: "outside",
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
 					mcpManager: options.mcpManager,
@@ -1997,6 +2001,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						images,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
 						onPromptAdmitted,
+						origin: "outside",
 					}),
 				results: promptResults,
 				onError: onPromptError(command.id, command.type),
@@ -2184,6 +2189,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						allowAskReopen: true,
 						// Rechecked after the summary: work may have started while it ran.
 						requireIdle: true,
+						// An RPC client's request: input from outside the session.
+						origin: "outside",
 					});
 				} catch (err) {
 					if (err instanceof SessionBusyError) return error(id, "navigate_tree", err.message, "session_busy");
@@ -2594,7 +2601,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "compact": {
-				const result = await session.compact(command.customInstructions);
+				const result = await session.compact(command.customInstructions, { origin: "outside" });
 				return success(id, "compact", result);
 			}
 
@@ -2700,7 +2707,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (session.isStreaming) {
 					return error(id, "handoff", "Cannot hand off while a response is in progress");
 				}
-				const result = await session.handoff(command.customInstructions);
+				const result = await session.handoff(command.customInstructions, { origin: "outside" });
 				return success(id, "handoff", result ? { savedPath: result.savedPath } : null);
 			}
 

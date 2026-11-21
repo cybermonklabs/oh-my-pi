@@ -4178,9 +4178,9 @@ pub struct PromptError {
 	pub model: Option<String>,
 	#[serde(rename = "httpStatus", default, skip_serializing_if = "Option::is_none")]
 	pub http_status: Option<i64>,
-	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request.
+	/// `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub code: Option<LitCostCap>,
+	pub code: Option<PromptErrorCode>,
 }
 
 /// Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`.
@@ -5978,23 +5978,20 @@ impl LogoutAccountType {
 	}
 }
 
-/// The constant `"cost_cap"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct LitCostCap;
-
-impl Serialize for LitCostCap {
-	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-		serializer.serialize_str("cost_cap")
-	}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptErrorCode {
+	#[serde(rename = "cost_cap")]
+	CostCap,
+	#[serde(rename = "cyber_policy")]
+	CyberPolicy,
 }
 
-impl<'de> Deserialize<'de> for LitCostCap {
-	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		let value = Value::deserialize(deserializer)?;
-		if value.as_str() == Some("cost_cap") {
-			Ok(Self)
-		} else {
-			Err(D::Error::custom(format!("expected \"cost_cap\", got {value}")))
+impl PromptErrorCode {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::CostCap => "cost_cap",
+			Self::CyberPolicy => "cyber_policy",
 		}
 	}
 }

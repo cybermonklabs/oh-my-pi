@@ -1083,8 +1083,8 @@ export interface PromptError {
 	provider?: string;
 	model?: string;
 	httpStatus?: number;
-	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. */
-	code?: "cost_cap";
+	/** `cost_cap`: the session reached `session.maxCost` (`--max-cost`) and omp did not send the next request. `cyber_policy`: OpenAI refused the content for cybersecurity risk, or omp held the request after such a refusal; resubmitting the same content is refused again. */
+	code?: "cost_cap" | "cyber_policy";
 }
 
 /** Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`. */

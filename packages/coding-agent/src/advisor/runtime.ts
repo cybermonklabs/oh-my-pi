@@ -69,6 +69,8 @@ export interface AdvisorRuntimeHost {
 	 * sends nothing until {@link AdvisorRuntime.resumeAfterClosedRoute}.
 	 */
 	ensureOpenRoute?(signal: AbortSignal): Promise<boolean>;
+	/** Whether the advisor's model is still on a closed route; read after a hold is set. */
+	isRouteClosed?(): boolean;
 	/**
 	 * Called with the error of every failed advisor turn, before the retry sleep
 	 * or the dropped-after-3 path. Lets the host apply credential-level remedies
@@ -1351,6 +1353,12 @@ export class AdvisorRuntime {
 					this.#restoreSeenContextInFlight();
 					this.#pending.unshift(...popped);
 					this.#heldForClosedRoute = true;
+					// A person's prompt that ended the closure while the walk above was awaited found
+					// nothing held to resume: read the route again now the hold is set.
+					if (this.host.isRouteClosed?.() === false) {
+						this.#heldForClosedRoute = false;
+						continue;
+					}
 					this.#wakeAllWaiters();
 					continue;
 				}

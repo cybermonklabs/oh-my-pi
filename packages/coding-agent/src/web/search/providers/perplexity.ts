@@ -17,6 +17,7 @@ import {
 	type Usage,
 	withOAuthAccess,
 } from "@oh-my-pi/pi-ai";
+import { guardModelCall } from "@oh-my-pi/pi-ai/model-call-guard";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -500,29 +501,37 @@ async function callPerplexityApi(
 		collectPerplexityMetadata(metadata, event.data);
 	};
 
-	const message = config.useResponses
-		? await drainAssistantStream(
-				streamOpenAIResponses(buildPerplexityResponsesModel(request), context, {
-					apiKey: config.apiKey,
-					maxTokens: request.max_tokens ?? undefined,
-					temperature: request.temperature ?? undefined,
-					signal: requestSignal,
-					fetch: fetchImpl,
-					extraBody: buildPerplexityExtraBody(request),
-					onSseEvent,
-				}),
-			)
-		: await drainAssistantStream(
-				streamOpenAICompletions(buildPerplexityCompletionsModel(request), context, {
-					apiKey: config.apiKey,
-					maxTokens: request.max_tokens ?? undefined,
-					temperature: request.temperature ?? undefined,
-					signal: requestSignal,
-					fetch: fetchImpl,
-					onPayload: payload => applyPerplexityExtraBody(payload, request),
-					onSseEvent,
-				}),
-			);
+	// Direct provider calls (Perplexity's own wire options) pass the process's model-call guard here,
+	// as `stream`/`streamSimple` callers do there.
+	let events: AssistantMessageEventStream;
+	if (config.useResponses) {
+		const model = buildPerplexityResponsesModel(request);
+		events = guardModelCall(model, () =>
+			streamOpenAIResponses(model, context, {
+				apiKey: config.apiKey,
+				maxTokens: request.max_tokens ?? undefined,
+				temperature: request.temperature ?? undefined,
+				signal: requestSignal,
+				fetch: fetchImpl,
+				extraBody: buildPerplexityExtraBody(request),
+				onSseEvent,
+			}),
+		);
+	} else {
+		const model = buildPerplexityCompletionsModel(request);
+		events = guardModelCall(model, () =>
+			streamOpenAICompletions(model, context, {
+				apiKey: config.apiKey,
+				maxTokens: request.max_tokens ?? undefined,
+				temperature: request.temperature ?? undefined,
+				signal: requestSignal,
+				fetch: fetchImpl,
+				onPayload: payload => applyPerplexityExtraBody(payload, request),
+				onSseEvent,
+			}),
+		);
+	}
+	const message = await drainAssistantStream(events);
 
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
 		throwPerplexityStreamError(message);

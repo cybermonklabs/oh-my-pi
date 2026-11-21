@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env, getProviderInFlightRoot, isEnoent, isPidAlive, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
+import { guardModelCall } from "./model-call-guard";
 import {
 	createAuthRetryKeyState,
 	isApiKeyResolver,
@@ -831,8 +832,18 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	return guardModelCall(model, () => streamUnguarded(model, context, options));
+}
+
+function streamUnguarded<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: OptionsForApi<TApi>,
+): AssistantMessageEventStream {
 	if (model.resolveHeaders) {
-		return withResolvedModelHeaders(model, options?.signal, resolvedModel => stream(resolvedModel, context, options));
+		return withResolvedModelHeaders(model, options?.signal, resolvedModel =>
+			streamUnguarded(resolvedModel, context, options),
+		);
 	}
 	if (!model.requiresGlyphTokenization) {
 		return withThinkingLoopGuard(model, options, opts =>
@@ -1173,6 +1184,14 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	return guardModelCall(model, () => streamSimpleUnguarded(model, context, options));
+}
+
+function streamSimpleUnguarded<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
 	const sessionOptions = withInferenceSessionId(options);
 	// Unverified thinking is opt-in: without a requested effort the request is
 	// byte-identical to a non-reasoning model's.
@@ -1426,18 +1445,18 @@ function streamSimpleRequest<TApi extends Api>(
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	} else if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
 		const providerOptions = mapOptionsForApi(
 			model,
 			requestOptions,
 			typeof requestOptions.apiKey === "string" ? requestOptions.apiKey : getEnvApiKey(model.provider),
 		);
-		return stream(model, context, providerOptions);
+		return streamUnguarded(model, context, providerOptions);
 	}
 
 	// The resolver form is handled by the wrapper above; only a static string
@@ -1512,7 +1531,7 @@ function streamSimpleRequest<TApi extends Api>(
 	}
 	const providerModel = getProviderDefinition(model.provider)?.prepareModel?.(model) ?? model;
 	const providerOptions = mapOptionsForApi(providerModel, requestOptions, apiKey);
-	return stream(providerModel, context, providerOptions);
+	return streamUnguarded(providerModel, context, providerOptions);
 }
 
 export async function completeSimple<TApi extends Api>(

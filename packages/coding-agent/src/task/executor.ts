@@ -1309,8 +1309,6 @@ interface RunMonitorArgs {
 	modelRegistry?: ModelRegistry;
 	/** Parent settings for tiny-model label generation. */
 	settings?: Settings;
-	/** The parent tree's cyber-policy closure; the label request carries the assignment text. */
-	cyberPolicyClosure?: CyberPolicyClosureApi;
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -1752,7 +1750,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// failures just leave the label unset.
 	const labelSource = assignment?.trim();
 	if (!args.description && args.modelRegistry && args.settings && labelSource) {
-		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal, args.cyberPolicyClosure)
+		generateTaskLabel(labelSource, args.modelRegistry, args.settings, id, abortSignal)
 			.then(label => {
 				if (!label || abortSignal.aborted || progress.description) return;
 				progress.description = label;
@@ -2551,8 +2549,6 @@ async function driveSessionToResult(
 		const refusal = session.costCapRefusal;
 		return refusal !== refusalBefore ? refusal : undefined;
 	};
-	// A cyber-policy closure that kept the run from its model is why it produced no result.
-	const cyberStopBefore = session.cyberPolicyStop;
 	const checkAbort = () => {
 		if (abortSignal.aborted) {
 			aborted = monitor.isAbortedRun();
@@ -2845,11 +2841,6 @@ async function driveSessionToResult(
 		if (!delivered && refusal && !aborted) {
 			exitCode = 1;
 			error ??= refusal.message;
-		}
-		const cyberStop = session.cyberPolicyStop;
-		if (!delivered && cyberStop && cyberStop !== cyberStopBefore && !aborted) {
-			exitCode = 1;
-			error ??= cyberStop.message;
 		}
 
 		// A recorded yield that async-result deliveries superseded and the
@@ -4625,7 +4616,6 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		assignment,
 		description: options.description,
 		modelRegistry: options.modelRegistry,
-		cyberPolicyClosure: options.cyberPolicyClosure,
 		settings,
 		modelOverride,
 		modelRole,

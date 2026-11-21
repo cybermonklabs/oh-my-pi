@@ -1,12 +1,5 @@
-import type { Model } from "@oh-my-pi/pi-ai";
-
-/** `notice` source of the session's reports that a closed route kept it from a model call. */
-export const CYBER_POLICY_NOTICE_SOURCE = "cyber-policy";
-
-/** A model call the closure kept from being sent. */
-export interface CyberPolicyStop {
-	readonly message: string;
-}
+import { addModelCallGuard, type Model } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 
 /**
  * Whether a refusal closes `model`'s route: an OpenAI model, whichever provider serves it, and a
@@ -17,9 +10,9 @@ export function closedByCyberPolicy(model: Pick<Model, "identity">): boolean {
 	return model.identity.class === "openai" || model.identity.class === "unknown";
 }
 
-/** The message a session reports when the closure keeps it from a model call. */
-export function cyberPolicyStopMessage(model: Pick<Model, "provider" | "id">): string {
-	return `OpenAI refused this turn's content (cyber_policy); no request goes to ${model.provider}/${model.id} or another OpenAI route until your next prompt.`;
+/** Why the process's model-call guard held a request to `model`. Names `cyber_policy`, so the error is not retried. */
+export function cyberPolicyHoldMessage(model: Pick<Model, "provider" | "id">): string {
+	return `OpenAI refused content of this session (cyber_policy); no request goes to ${model.provider}/${model.id} or another OpenAI route until the root session's next input from outside it.`;
 }
 
 /**
@@ -41,12 +34,12 @@ export interface CyberPolicyClosureApi {
 /**
  * After OpenAI refuses a request's content for cyber policy (`cyber_policy`), each copy of that
  * content sent again to OpenAI adds a refusal to the organization's record, and repeated refusals
- * can revoke its access. The closure keeps every route {@link closedByCyberPolicy} closes away from
- * the whole session tree until the next prompt a person (or the harness on their behalf) sends;
- * only the root session ends it. The session's own prompts (job results, queued drains, hook
- * continuations, IRC deliveries, advisor turns), its subagents, title generation, memory
- * completions and the prompt-cache warmer keep it. A model of a known other family may still take
- * the work.
+ * can revoke its access. The closure holds every route {@link closedByCyberPolicy} closes. The root
+ * session owns it; its subagents share it. Only input that crosses the root session's outer boundary
+ * (`origin: "outside"`: a person, or the harness or an RPC client on their behalf) ends it; input made
+ * inside the session (loops, job results, queued drains, extensions without that origin, other agents'
+ * messages, advisor turns) keeps it. {@link installCyberPolicyGuard} enforces it at the process's
+ * model-call checkpoint and records the refusals that checkpoint sees.
  */
 export class CyberPolicyClosure implements CyberPolicyClosureApi {
 	#active = false;
@@ -66,7 +59,7 @@ export class CyberPolicyClosure implements CyberPolicyClosureApi {
 		this.#notify();
 	}
 
-	/** Ends the closure: the next prompt a person sends may reach OpenAI again. */
+	/** Ends the closure: requests may reach OpenAI again. */
 	end(): void {
 		if (!this.#active) return;
 		this.#active = false;
@@ -83,4 +76,47 @@ export class CyberPolicyClosure implements CyberPolicyClosureApi {
 	#notify(): void {
 		for (const listener of Array.from(this.#listeners)) listener();
 	}
+}
+
+const installed = new Map<CyberPolicyClosureApi, { holders: number; remove: () => void }>();
+
+/**
+ * Enforces `closure` at the process's model-call checkpoint (`addModelCallGuard` in pi-ai), which every
+ * model call passes: while the closure holds, a request to a closed route is held (an error naming
+ * `cyber_policy`, no request sent), whichever caller makes it, a run already in flight included. Every
+ * `cyber_policy` refusal a call meets is recorded. One guard per closure, however many sessions of
+ * the tree hold it; returns the release.
+ *
+ * The closure is the guard's scope: a session enters it for its agent's runs and its own work
+ * (`runInModelCallScope`), so the guard sees that tree's calls and the calls made outside every
+ * scope, never another tree's. A call outside every scope (a host's own call outside any session)
+ * is held while any tree's closure holds, and its refusal closes every tree's routes: in a process
+ * that runs several session trees (an SDK host, an ACP agent, a server), that errs toward sending
+ * nothing.
+ */
+export function installCyberPolicyGuard(closure: CyberPolicyClosureApi): () => void {
+	let entry = installed.get(closure);
+	if (!entry) {
+		const remove = addModelCallGuard(
+			{
+				refuse: model => (closure.isClosed(model) ? cyberPolicyHoldMessage(model) : undefined),
+				settled: (_model, outcome) => {
+					if (AIError.isCyberPolicyRefusal(outcome)) closure.record();
+				},
+			},
+			closure,
+		);
+		entry = { holders: 0, remove };
+		installed.set(closure, entry);
+	}
+	entry.holders++;
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		const current = installed.get(closure);
+		if (!current || --current.holders > 0) return;
+		current.remove();
+		installed.delete(closure);
+	};
 }

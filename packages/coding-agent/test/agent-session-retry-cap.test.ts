@@ -2851,7 +2851,7 @@ describe("AgentSession retry delay cap", () => {
 			expect(run.advisorRequests).toEqual([]);
 
 			// A person's next prompt ends the closure, and the held batch goes out.
-			await session?.prompt("Carry on");
+			await session?.prompt("Carry on", { origin: "outside" });
 			await run.answered;
 			await session?.waitForIdle();
 			expect(run.advisorRequests[0]).toBe(advisorSelector);

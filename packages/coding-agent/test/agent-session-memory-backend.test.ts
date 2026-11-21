@@ -5,7 +5,9 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as ai from "@oh-my-pi/pi-ai";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { runInModelCallScope } from "@oh-my-pi/pi-ai";
+import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -259,41 +261,70 @@ describe("AgentSession memory backend lifecycle", () => {
 		]);
 	});
 
-	// A memory completion sends transcript text, so after OpenAI refuses content for cyber policy no
-	// memory candidate on an OpenAI route may receive it; another family may. Synthetic refusals only.
+	// A memory completion sends transcript text. While a cyber-policy refusal holds, the process's
+	// model-call checkpoint lets no memory candidate on an OpenAI route receive it; another family may.
+	// The candidates are mock-API models with real ids, so mnemopi's real `completeSimple` runs through
+	// the checkpoint to the mock's handler. Synthetic refusals only.
 	describe("after a cyber_policy refusal", () => {
-		const openai = () => getBundledModel("openai", "gpt-5.5")!;
-		const codex = () => getBundledModel("openai-codex", "gpt-5.6-sol")!;
-		const claude = () => getBundledModel("anthropic", "claude-sonnet-4-6")!;
+		const MOCK_API_SOURCE = "test/memory-cyber-policy";
+		beforeEach(() => registerMockApi(MOCK_API_SOURCE));
+		afterEach(() => unregisterCustomApis(MOCK_API_SOURCE));
 
-		it("skips every OpenAI memory candidate while the refusal holds", async () => {
+		function candidates(answer: (provider: string) => MockResponse) {
 			const sent: string[] = [];
-			spyOn(ai, "completeSimple").mockImplementation(async candidate => {
-				sent.push(`${candidate.provider}/${candidate.id}`);
-				return memoryReply(candidate);
-			});
-			const { current, complete } = await startMemoryCompletion([openai(), codex(), claude()]);
+			const make = (provider: string, id: string) =>
+				createMockModel({
+					provider,
+					id,
+					handler: () => {
+						sent.push(`${provider}/${id}`);
+						return answer(provider);
+					},
+				});
+			const openai = make("openai", "gpt-5.5");
+			const codex = make("openai-codex", "gpt-5.6-sol");
+			const claude = make("anthropic", "claude-sonnet-4-6");
+			expect([openai, codex, claude].map(model => model.identity.class)).toEqual(["openai", "openai", "anthropic"]);
+			return { sent, openai, codex, claude };
+		}
+		const MEMORY: MockResponse = { content: ["Sam works at Globex."] };
+		const REFUSAL: MockResponse = {
+			stopReason: "error",
+			errorMessage: "cyber_policy: This content was flagged for possible cybersecurity risk.",
+		};
+
+		it("sends no memory request to an OpenAI candidate while the refusal holds", async () => {
+			const { sent, openai, codex, claude } = candidates(() => MEMORY);
+			const { current, complete } = await startMemoryCompletion([openai, codex, claude]);
 			current.cyberPolicyClosure.record();
 
-			expect(await complete("Sam works at Globex.")).toBe("Sam works at Globex.");
-			expect(sent).toEqual([`${claude().provider}/${claude().id}`]);
+			expect(await runInModelCallScope(current.cyberPolicyClosure, () => complete("Sam works at Globex."))).toBe(
+				"Sam works at Globex.",
+			);
+			expect(sent).toEqual(["anthropic/claude-sonnet-4-6"]);
 		});
 
-		it("records a memory candidate's refusal and asks no other OpenAI candidate", async () => {
-			const sent: string[] = [];
-			spyOn(ai, "completeSimple").mockImplementation(async candidate => {
-				sent.push(`${candidate.provider}/${candidate.id}`);
-				if (candidate.provider === "anthropic") return memoryReply(candidate);
-				return {
-					...memoryReply(candidate, "error"),
-					errorMessage: "cyber_policy: This content was flagged for possible cybersecurity risk.",
-				};
-			});
-			const { current, complete } = await startMemoryCompletion([openai(), codex(), claude()]);
+		it("records a memory candidate's refusal, and no other OpenAI candidate receives the text", async () => {
+			const { sent, openai, codex, claude } = candidates(provider => (provider === "anthropic" ? MEMORY : REFUSAL));
+			const { current, complete } = await startMemoryCompletion([openai, codex, claude]);
 
-			expect(await complete("Sam works at Globex.")).toBe("Sam works at Globex.");
-			expect(sent).toEqual([`${openai().provider}/${openai().id}`, `${claude().provider}/${claude().id}`]);
-			expect(current.cyberPolicyClosure.isClosed(codex())).toBe(true);
+			expect(await runInModelCallScope(current.cyberPolicyClosure, () => complete("Sam works at Globex."))).toBe(
+				"Sam works at Globex.",
+			);
+			expect(sent).toEqual(["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]);
+			expect(current.cyberPolicyClosure.isClosed(codex)).toBe(true);
+		});
+
+		it("still tries the next OpenAI candidate after an ordinary failure, as before", async () => {
+			const { sent, openai, codex, claude } = candidates(provider =>
+				provider === "openai" ? { stopReason: "error", errorMessage: "400 Invalid request" } : MEMORY,
+			);
+			const { current, complete } = await startMemoryCompletion([openai, codex, claude]);
+
+			expect(await runInModelCallScope(current.cyberPolicyClosure, () => complete("Sam works at Globex."))).toBe(
+				"Sam works at Globex.",
+			);
+			expect(sent).toEqual(["openai/gpt-5.5", "openai-codex/gpt-5.6-sol"]);
 		});
 	});
 

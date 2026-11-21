@@ -1,5 +1,6 @@
 import type { Api, Model } from "@oh-my-pi/pi-catalog/types";
 import * as AIError from "../error";
+import { guardModelRequest } from "../model-call-guard";
 import { synthesizeOpenAiSpeech } from "./openai-speech";
 import type { SpeechOptions, SpeechRequest, SpeechResult } from "./types";
 import { synthesizeXaiSpeech } from "./xai-tts";
@@ -18,18 +19,23 @@ export function isSpeechApi(api: Api): api is SpeechApi {
 	return api === "xai-tts" || api === "openai-speech";
 }
 
-/** Synthesize speech through the transport selected by the catalog model's `api`. */
+/**
+ * Synthesize speech through the transport selected by the catalog model's `api`. The text is
+ * model-written, so the request passes the process's model-call guard.
+ */
 export function synthesizeSpeech(
 	model: Model<Api>,
 	request: SpeechRequest,
 	options: SpeechOptions,
 ): Promise<SpeechResult> {
-	switch (model.api) {
-		case "xai-tts":
-			return synthesizeXaiSpeech(model, request, options);
-		case "openai-speech":
-			return synthesizeOpenAiSpeech(model, request, options);
-		default:
-			throw new AIError.ConfigurationError(`Unsupported speech API: ${model.api}`);
-	}
+	return guardModelRequest(model, () => {
+		switch (model.api) {
+			case "xai-tts":
+				return synthesizeXaiSpeech(model, request, options);
+			case "openai-speech":
+				return synthesizeOpenAiSpeech(model, request, options);
+			default:
+				throw new AIError.ConfigurationError(`Unsupported speech API: ${model.api}`);
+		}
+	});
 }

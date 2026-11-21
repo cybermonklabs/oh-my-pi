@@ -1626,6 +1626,7 @@ export class SessionAdvisors {
 					);
 				},
 				ensureOpenRoute: signal => this.#ensureAdvisorOpenRoute(advisorRef, signal),
+				isRouteClosed: () => this.#host.cyberPolicyClosure().isClosed(advisorRef.agent.state.model),
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {

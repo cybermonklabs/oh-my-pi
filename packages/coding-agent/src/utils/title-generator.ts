@@ -14,7 +14,6 @@ import {
 	type Model,
 	retryTransientCompletion,
 } from "@oh-my-pi/pi-ai";
-import * as AIError from "@oh-my-pi/pi-ai/error";
 import { StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
 import { writeTerminalSequence } from "@oh-my-pi/pi-tui";
 import { isNativeRendering, onNativeRenderingChange } from "@oh-my-pi/pi-tui/native/state";
@@ -27,7 +26,6 @@ import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
 import type { Settings } from "../config/settings";
-import type { CyberPolicyClosureApi } from "../session/cyber-policy-closure";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { formatTitleUserMessage } from "../tiny/message-preproc";
@@ -204,9 +202,6 @@ export type TitleUsageReporter = (message: AssistantMessage) => void;
  *   OAuth credential should seed an isolated title-request session.
  * @param onUsage Optional reporter for every title attempt the provider billed,
  *   so the caller can record its usage on the session's cost ledger.
- * @param cyberPolicyClosure The session tree's cyber-policy closure: a title request carries the
- *   user's text, so no title model on a route it closes is asked, and a title model's
- *   `cyber_policy` refusal closes OpenAI's routes to the rest of the title walk and the tree.
  */
 export async function generateSessionTitle(
 	firstMessage: string,
@@ -219,7 +214,6 @@ export async function generateSessionTitle(
 	signal?: AbortSignal,
 	credentialSourceSessionId?: string,
 	onUsage?: TitleUsageReporter,
-	cyberPolicyClosure?: CyberPolicyClosureApi,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -249,7 +243,6 @@ export async function generateSessionTitle(
 			titleSystemPrompt,
 			credentialSourceSessionId,
 			onUsage,
-			cyberPolicyClosure,
 		);
 	}
 
@@ -330,7 +323,6 @@ async function generateTitleOnlineWithModels(
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
 	onUsage?: TitleUsageReporter,
-	cyberPolicyClosure?: CyberPolicyClosureApi,
 ): Promise<string | null> {
 	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	// The model is always asked to wrap the title in `<title>...</title>` and
@@ -349,14 +341,8 @@ async function generateTitleOnlineWithModels(
 			id: model.id,
 			model: modelName,
 		};
-		if (cyberPolicyClosure?.isClosed(model)) {
-			logger.debug("title-generator: skipped a route closed by a cyber_policy refusal", {
-				...modelContext,
-				reason: "cyber-policy-closed",
-			});
-			continue;
-		}
 		logger.debug("title-generator: start", modelContext);
+
 		if (signal?.aborted) {
 			logger.debug("title-generator: aborted before attempt", {
 				...modelContext,
@@ -447,7 +433,6 @@ async function generateTitleOnlineWithModels(
 			}
 
 			if (response.stopReason === "error") {
-				if (AIError.isCyberPolicyRefusal(response)) cyberPolicyClosure?.record();
 				logger.warn("title-generator: response error", {
 					...modelContext,
 					reason: "provider-response-error",
@@ -486,7 +471,6 @@ async function generateTitleOnlineWithModels(
 				});
 				return null;
 			}
-			if (AIError.isCyberPolicyRefusal(err)) cyberPolicyClosure?.record();
 			logger.warn("title-generator: error", {
 				...modelContext,
 				reason: "exception",

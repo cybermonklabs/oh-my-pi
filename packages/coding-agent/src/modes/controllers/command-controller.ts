@@ -2273,14 +2273,14 @@ export class CommandController {
 			// The slash path passes `mode` positionally; the extension path carries
 			// it inside the options object. Either source wins over no mode.
 			const effectiveMode = mode ?? baseOptions?.mode;
-			const options =
-				baseOptions || effectiveMode || readerModel
-					? {
-							...baseOptions,
-							...(effectiveMode ? { mode: effectiveMode } : {}),
-							...(readerModel ? { readerModel } : {}),
-						}
-					: undefined;
+			// A person's `/compact` (or a person's action that compacts, such as a model switch): input
+			// from outside the session.
+			const options = {
+				...baseOptions,
+				...(effectiveMode ? { mode: effectiveMode } : {}),
+				...(readerModel ? { readerModel } : {}),
+				origin: "outside" as const,
+			};
 			await this.ctx.session.compact(instructions, options);
 
 			compactingLoader.stop();
@@ -2353,7 +2353,7 @@ export class CommandController {
 		try {
 			// Handoff generation runs as a oneshot request; the document is then
 			// committed as a compaction entry on this session.
-			const result = await this.ctx.session.handoff(customInstructions);
+			const result = await this.ctx.session.handoff(customInstructions, { origin: "outside" });
 
 			if (!result) {
 				this.ctx.showError("Handoff cancelled");

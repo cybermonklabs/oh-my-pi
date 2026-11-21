@@ -82,7 +82,7 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, runInModelCallScope, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
@@ -320,6 +320,7 @@ import type {
 	FollowUpOptions,
 	FreshSessionResult,
 	HandoffResult,
+	InputOrigin,
 	ModelCycleResult,
 	Prewalk,
 	PromptOptions,
@@ -382,13 +383,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
-import {
-	CYBER_POLICY_NOTICE_SOURCE,
-	CyberPolicyClosure,
-	type CyberPolicyClosureApi,
-	type CyberPolicyStop,
-	cyberPolicyStopMessage,
-} from "./cyber-policy-closure";
+import { CyberPolicyClosure, type CyberPolicyClosureApi, installCyberPolicyGuard } from "./cyber-policy-closure";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
@@ -1024,11 +1019,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** False for a subagent, whose gate belongs to its session tree's root. */
 	readonly #ownsCostGate: boolean;
 	#costCapRefusal: CostCapRefusal | undefined;
-	/** The session tree's cyber-policy closure (see {@link CyberPolicyClosure}). */
+	/** The session tree's cyber-policy closure (`cyber-policy-closure.ts`). */
 	readonly #cyberPolicyClosure: CyberPolicyClosureApi;
-	/** Set when this session owns the closure (no root gave it one): only its own prompts from a person end it. */
+	/** Set when this session owns the closure (no root gave it one): only input from outside it ends it. */
 	readonly #ownsCyberPolicyClosure: CyberPolicyClosure | undefined;
-	#cyberPolicyStop: CyberPolicyStop | undefined;
 	/** Entries of tools mounted under `xd://`; empty when virtual devices are unmounted. */
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
@@ -3072,28 +3066,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		syncCostCapGate();
 		this.addDisposer(this.#costGate.onCapChange(syncCostCapGate));
 		this.addDisposer(() => removeCostCapGate?.());
-		// While a cyber-policy refusal holds OpenAI's routes closed, no model call of this session goes
-		// to one: the hook moves the session to an open fallback before the call is built, and the gate
-		// stops a call that still has none (registered only while the closure holds, as the cost gate).
-		let removeCyberPolicyGate: (() => void) | undefined;
-		const syncCyberPolicyGate = () => {
-			if (this.#cyberPolicyClosure.active) {
-				if (removeCyberPolicyGate) return;
-				const removeHook = this.agent.addBeforeModelCallHook(signal => this.#leaveClosedRoute(signal));
-				const removeGate = this.agent.addBeforeModelCall(() => this.#refuseClosedRoute());
-				removeCyberPolicyGate = () => {
-					removeHook();
-					removeGate();
-				};
-			} else if (removeCyberPolicyGate) {
-				removeCyberPolicyGate();
-				removeCyberPolicyGate = undefined;
-				this.#advisors.resumeAfterClosedRoute();
-			}
-		};
-		syncCyberPolicyGate();
-		this.addDisposer(this.#cyberPolicyClosure.onChange(syncCyberPolicyGate));
-		this.addDisposer(() => removeCyberPolicyGate?.());
+		// The tree's cyber-policy closure is enforced at the process's model-call checkpoint
+		// (`installCyberPolicyGuard`): every model call of every caller, a run in flight included, is
+		// held while the closure closes its route. Before each of this session's own calls the hook
+		// moves it to an open fallback, so another family can take the turn.
+		// The closure is the scope of this tree's model calls: the agent's runs and the session's own
+		// work enter it, so another tree's guard in this process never holds them, and theirs never
+		// records this tree's refusals.
+		this.agent.modelCallScope = this.#cyberPolicyClosure;
+		this.addDisposer(installCyberPolicyGuard(this.#cyberPolicyClosure));
+		this.addDisposer(this.agent.addBeforeModelCallHook(signal => this.#leaveClosedRoute(signal)));
+		this.addDisposer(
+			this.#cyberPolicyClosure.onChange(() => {
+				if (!this.#cyberPolicyClosure.active) this.#advisors.resumeAfterClosedRoute();
+			}),
+		);
 
 		const handoffHost: SessionHandoffHost = {
 			agent: this.agent,
@@ -3720,14 +3707,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.emitNotice("error", refusal.message, COST_GATE_NOTICE_SOURCE);
 	}
 
-	/** The session tree's cyber-policy closure; subagents, title generation and memory completions share it. */
+	/** The session tree's cyber-policy closure; its subagents share it. */
 	get cyberPolicyClosure(): CyberPolicyClosureApi {
 		return this.#cyberPolicyClosure;
-	}
-
-	/** The latest model call the cyber-policy closure kept from being sent; a run reports it as its stop reason. */
-	get cyberPolicyStop(): CyberPolicyStop | undefined {
-		return this.#cyberPolicyStop;
 	}
 
 	/** Moves the session off a closed route onto an open fallback before the next model call is built. */
@@ -3736,21 +3718,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#recovery.applyCyberPolicyFallback(signal ?? new AbortController().signal);
 	}
 
-	/** Keeps a model call from a closed route that has no open fallback; the run ends and says why. */
-	#refuseClosedRoute(): AgentPreModelCallStop | undefined {
-		const model = this.model;
-		if (!model || !this.#cyberPolicyClosure.isClosed(model)) return undefined;
-		const stop: CyberPolicyStop = { message: cyberPolicyStopMessage(model) };
-		this.#cyberPolicyStop = stop;
-		this.emitNotice("error", stop.message, CYBER_POLICY_NOTICE_SOURCE);
-		return { stop: true, reason: stop.message };
-	}
-
-	/** A prompt from a person (or the harness or RPC client on their behalf) ends this session's own closure. */
-	#endCyberPolicyClosureOnPersonPrompt(): void {
-		if (!this.#ownsCyberPolicyClosure) return;
-		this.#ownsCyberPolicyClosure.end();
-		this.#cyberPolicyStop = undefined;
+	/**
+	 * Input that crossed the session's outer boundary (`origin: "outside"`: a person, or the harness or an
+	 * RPC client on their behalf) ends the closure this session owns. A subagent's closure is its root's,
+	 * so input to a subagent ends nothing.
+	 */
+	#endCyberPolicyClosureFrom(origin: InputOrigin | undefined): void {
+		if (origin === "outside") this.#ownsCyberPolicyClosure?.end();
 	}
 
 	/** Records and announces a cost-cap refusal of the next model request; `undefined` lets it through. */
@@ -3786,9 +3760,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#admittedSubmissionsSettled.promise;
 	}
 
-	/** Run session work outside an agent run (prompt setup, manual maintenance) under the agent's log context. */
+	/**
+	 * Run session work outside an agent run (prompt setup, manual maintenance) under the agent's log
+	 * context, in this tree's model-call scope.
+	 */
 	#inLogContext<T>(work: () => T): T {
-		return this.agent.logContext ? logger.withContext(this.agent.logContext, work) : work();
+		return runInModelCallScope(this.#cyberPolicyClosure, () =>
+			this.agent.logContext ? logger.withContext(this.agent.logContext, work) : work(),
+		);
 	}
 
 	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
@@ -7848,6 +7827,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		// A person's `/compact` or an RPC client's compact request is input from outside the session.
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#inLogContext(() => this.#maintenance.compact(customInstructions, options));
 	}
 
@@ -8715,7 +8696,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * @throws {AgentBusyError} when another turn claims the session between the interrupt and the continuation.
 	 * @throws {Error} when there is no conversation to resume.
 	 */
-	async resume(): Promise<void> {
+	async resume(options?: { origin?: InputOrigin }): Promise<void> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (!this.isStreaming) return this.#resumeIdle();
 		// waitForIdle() reads a pending unwind as busy. Hold one from the interrupt
 		// until the continuation is live, so a host driving this session to a result
@@ -8766,7 +8748,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#noteUserTurn();
 		this.#todo.resetCycle();
 		this.#resetPromptMaintenanceState();
-		this.#endCyberPolicyClosureOnPersonPrompt();
 		this.#scheduleAgentContinue({ source: "manual-continue", turnRecords: [prompt] });
 	}
 
@@ -8903,9 +8884,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (options?.userInitiated ?? !options?.synthetic) this.#noteUserTurn();
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-		// A person's prompt (typed, RPC or the CLI's initial message) may reach OpenAI again after a
-		// cyber-policy refusal; prompts the session or its agents make keep the closure.
-		if (promptAttribution === "user" || options?.userInitiated === true) this.#endCyberPolicyClosureOnPersonPrompt();
+		// Input from outside the session (a person, the harness or an RPC client) may reach OpenAI again
+		// after a cyber-policy refusal; prompts the session, its extensions or its agents make keep the closure.
+		this.#endCyberPolicyClosureFrom(options?.origin);
 
 		// If streaming, queue via steer()/followUp()/aside based on option
 		if (this.isStreaming) {
@@ -9109,12 +9090,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps"> & {
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "onPromptAdmitted" | "followUps" | "origin"
+		> & {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
 		},
 	): Promise<boolean> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
 	}
 
@@ -9976,6 +9961,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		await this.#queueUserMessage(expandedText, images, "steer", {
 			timestamp: submittedAt,
 			attribution: options?.attribution,
@@ -10001,6 +9987,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stamp before image preprocessing so a queued image follow-up measures
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp", {
 				timestamp: submittedAt,
@@ -10877,8 +10864,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** Where this message came from; see {@link InputOrigin}. Default: inside. */
+			origin?: InputOrigin;
 		},
 	): Promise<boolean> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
 	}
 
@@ -11125,6 +11115,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 
 		let deliveredAsAside = false;
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		if (options?.deliverAs === "aside") {
 			if (this.isStreaming) {
 				if (!(await this.#queueUserMessage(text, images, "aside", { attribution: options.attribution }))) {
@@ -11996,7 +11987,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					costGate.record(message.usage.cost.total);
 					this.#reportTitleUsage(usageOwner, message);
 				},
-				this.#cyberPolicyClosure,
 			),
 		);
 		if (await this.#sessionGenerationChanged(sessionGeneration)) return null;
@@ -12988,6 +12978,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#endCyberPolicyClosureFrom(options?.origin);
 		return this.#inLogContext(() => this.#maintenance.handoff(customInstructions, options));
 	}
 
@@ -13717,9 +13708,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!model) {
 			throw new Error("No active model on session");
 		}
-		// A side turn sends the conversation, refused content included: no copy goes to a route the
-		// cyber-policy closure holds closed.
-		if (this.#cyberPolicyClosure.isClosed(model)) throw new Error(cyberPolicyStopMessage(model));
 		const modelDescription = `${model.provider}/${model.id} (${model.api})`;
 		const sessionGeneration = this.#sessionGeneration;
 		const assertEphemeralTurnReady = () => {
@@ -14820,8 +14808,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			 * or the branch summary were awaited, before any tree change is made.
 			 */
 			requireIdle?: boolean;
+			/** `"outside"` when a person (`/tree`) or an RPC client asked for this move; see {@link InputOrigin}. */
+			origin?: InputOrigin;
 		} = {},
 	): Promise<NavigateTreeResult> {
+		this.#endCyberPolicyClosureFrom(options.origin);
 		const queued = this.#enterSessionTransition(() => this.navigateTree(targetId, options));
 		if (queued) return queued;
 		using _transition = this.#beginSessionTransition();
