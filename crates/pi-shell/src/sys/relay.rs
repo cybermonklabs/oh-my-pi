@@ -33,12 +33,13 @@
 //! reported, so the next command's output does not overtake them. They need
 //! not be the program's: a process it left running may have written them
 //! before the exit, and a character that process finishes later then comes
-//! out broken: its start as the release gave it, its rest dropped. The
-//! release does not end the stream: the decoder decodes what follows as
-//! before. The relay itself goes on to the end of the stream, as a plain pipe
-//! would carry that process's output: once the `ExtProc` is dropped it runs
-//! as adopted work (`pump::orphan`), and releases what the decoder holds at
-//! the end.
+//! out broken: its start as the release gave it, and its rest, as the
+//! decoder reads the bytes that come next, dropped. The release does not end
+//! the stream: the decoder decodes the bytes after that character as if it
+//! had never been written. The relay itself goes on to the end of the
+//! stream, as a plain pipe would carry that process's output: once the
+//! `ExtProc` is dropped it runs as adopted work (`pump::orphan`), and
+//! releases what the decoder holds at the end.
 
 use std::{
 	fs,
@@ -73,11 +74,12 @@ pub trait ByteDecoder: Send {
 	fn finish(&mut self) -> String;
 	/// Give out the held bytes now, while the stream goes on (another
 	/// process may still write into it). The held bytes come out once, as a
-	/// replacement character or as the decoder's own reading of them; the
-	/// bytes that would have finished their character are dropped when they
-	/// come next, and how the decoder reads what follows does not change. A
-	/// relay calls it at most once, when its program has exited and the end of
-	/// the stream has not come within a short grace.
+	/// replacement character or as the decoder's own reading of them. The
+	/// bytes that come next and that the decoder reads as the rest of their
+	/// character are dropped, and no others; the bytes after that character
+	/// are decoded as if it had never been written. A relay calls it at most
+	/// once, when its program has exited and the end of the stream has not
+	/// come within a short grace.
 	fn release(&mut self) -> String;
 }
 
@@ -260,8 +262,9 @@ impl Relay {
 			return false;
 		}
 		if self.released {
-			// What the release gave out is in the sink; what the decoder holds
-			// now came after it and waits for the rest of its character.
+			// What the release gave out is in the sink. The decoder may still
+			// hold bytes: the released ones until what comes next shows where
+			// their character ends, and what came after them.
 			return true;
 		}
 		let Some(decoder) = self
@@ -283,8 +286,10 @@ impl Relay {
 		// process holds the pipe. Whose the held bytes are is unknown (the
 		// program's, or what that process wrote before the exit), but the
 		// next command's output must not overtake them: they go into the
-		// sink now, ahead of the exit, once. The stream goes on, and the
-		// decoder reads what follows as before.
+		// sink now, ahead of the exit, once. The stream goes on: the decoder
+		// drops the rest of the released character when it comes and
+		// decodes the bytes after it as if that character had never been
+		// written.
 		self.released = true;
 		self.text = decoder.release().into_bytes();
 		self.sent = 0;
