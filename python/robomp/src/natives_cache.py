@@ -35,13 +35,16 @@ log = logging.getLogger(__name__)
 # different ordering would produce a different key. Cover every input the
 # napi build reads: all workspace crates (pi-natives transitively depends on
 # pi-ast/pi-iso/pi-shell), the workspace Cargo manifest + lock, the rust
-# toolchain pin, and the natives package itself (build script + scripts/* +
-# package.json with napi config).
+# toolchain pin, cargo's configuration (`.cargo/config.toml`: rustflags and
+# linker settings), and the natives package itself (build script + scripts/* +
+# package.json with napi config). The Dockerfile's image-seed key lists the
+# same paths in the same order.
 CACHE_KEY_PATHS: tuple[str, ...] = (
     "crates",
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain.toml",
+    ".cargo",
     "packages/natives",
 )
 
@@ -54,6 +57,12 @@ _CACHED_COMPANION_FILES: tuple[str, ...] = (
     "index.js",
     "embedded-addon.js",
 )
+# ``<addon>.sources.json``: the native build's record of the Rust sources it
+# compiled, which the workspace loader compares with the checkout
+# (packages/natives/native/workspace-sources.js). Optional: it travels with its
+# addon when the build wrote one, and an entry without one is still served,
+# leaving the loader nothing to judge the addon by, as for any unrecorded addon.
+_SOURCES_RECORD_SUFFIX = ".sources.json"
 _MANIFEST_FILENAME = "manifest.json"
 _LOCKFILE_NAME = ".lock"
 
@@ -336,10 +345,22 @@ class NativesCache:
         with _directory(entry) as source, _directory(native_dir, create=True, owner=owner) as dest:
             if owner is not None:
                 os.fchown(dest, *owner)
-            names = sorted(name for name in os.listdir(source) if fnmatch.fnmatchcase(name, _CACHED_NODE_GLOB))
+            entry_names = os.listdir(source)
+            names = sorted(name for name in entry_names if fnmatch.fnmatchcase(name, _CACHED_NODE_GLOB))
             for name in (*names, *_CACHED_COMPANION_FILES):
                 _copy_file(source, dest, name, owner=owner)
                 copied.append(native_dir / name)
+            for name in names:
+                record = f"{name}{_SOURCES_RECORD_SUFFIX}"
+                if record in entry_names:
+                    _copy_file(source, dest, record, owner=owner)
+                    copied.append(native_dir / record)
+                else:
+                    # A record an earlier build left here names another addon.
+                    try:
+                        os.unlink(record, dir_fd=dest)
+                    except FileNotFoundError:
+                        pass
         return CacheHit(cache_dir=entry, files=tuple(copied))
 
     # ---- capture (cache ← workspace) ----
@@ -363,9 +384,15 @@ class NativesCache:
             expected_uid = os.geteuid()
         try:
             with _directory(native_dir) as source:
-                node_names = sorted(name for name in os.listdir(source) if fnmatch.fnmatchcase(name, _CACHED_NODE_GLOB))
-                if not node_names or any(name not in os.listdir(source) for name in _CACHED_COMPANION_FILES):
+                source_names = os.listdir(source)
+                node_names = sorted(name for name in source_names if fnmatch.fnmatchcase(name, _CACHED_NODE_GLOB))
+                if not node_names or any(name not in source_names for name in _CACHED_COMPANION_FILES):
                     return None
+                records = [
+                    f"{name}{_SOURCES_RECORD_SUFFIX}"
+                    for name in node_names
+                    if f"{name}{_SOURCES_RECORD_SUFFIX}" in source_names
+                ]
 
                 repo_root = self.repo_root(repo)
                 repo_root.mkdir(parents=True, exist_ok=True)
@@ -380,7 +407,7 @@ class NativesCache:
                     staging.mkdir(parents=True)
                     try:
                         with _directory(staging) as dest:
-                            for name in (*node_names, *_CACHED_COMPANION_FILES):
+                            for name in (*node_names, *records, *_CACHED_COMPANION_FILES):
                                 _copy_file(source, dest, name, expected_uid=expected_uid)
                         manifest = {
                             "key": key,

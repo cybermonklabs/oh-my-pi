@@ -16,7 +16,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
 import { daemonClientForGlobal } from "../../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../../launch/ensure";
-import { resolveWorkerSpawnCmd } from "../../../subprocess/worker-client";
+import { ompDaemonSpecEnv, resolveWorkerSpawnCmd } from "../../../subprocess/worker-client";
 import { throwIfAborted } from "../../tool-errors";
 import { probeCdpResponse, probeCdpStatus } from "../attach";
 import { DEFAULT_RELAY_URL } from "./kind";
@@ -100,7 +100,7 @@ export async function ensureRelayDaemon(opts: { cdpUrl: string; signal?: AbortSi
 						name,
 						application: spawn.cmd[0]!,
 						args: [...spawn.cmd.slice(1), "--port", port],
-						env: {},
+						env: ompDaemonSpecEnv({}),
 						cwd: spawn.cwd ?? client.projectDir,
 						pty: false,
 						ready: { log: READY_LOG_PATTERN, timeoutMs: READY_TIMEOUT_MS },

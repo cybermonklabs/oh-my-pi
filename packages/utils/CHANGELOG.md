@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `getNativesDir()` and `getNativeGrammarsDir()` now name the directory the addon loader uses, the same for every profile, instead of a per-profile directory. It still follows `PI_NATIVES_DIR`, `OMP_DOWNLOAD_ROOT`, `OMP_CONFIG_ROOT` and `PI_CONFIG_DIR`, so two omp processes started with different values of those name different directories
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

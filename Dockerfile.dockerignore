@@ -62,6 +62,9 @@ packages/natives/native/.build/
 # `pi_natives.linux-*.node` riding in would be copied to /out alongside it.
 # (Also drops the ~760 MB of dev addons a working checkout accumulates.)
 **/*.node
+# A host build's record of the Rust sources it compiled (`<addon>.sources.json`):
+# a build output like the addon; in the context it would change the seed key.
+**/*.node.sources.json
 packages/ai/test/.temp-images/
 sdk/python/omp-rpc/src/omp_rpc.egg-info/
 python/robomp/data/
