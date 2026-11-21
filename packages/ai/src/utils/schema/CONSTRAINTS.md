@@ -170,6 +170,7 @@ If any remain, schema is incompatible.
 ## 4) Practical provider mapping
 
 - **OpenAI-compatible strict paths** (`openai-completions`, `openai-responses`, `openai-codex-responses`):
+   - Take each function tool's `strict` flag and schema from `openAIFunctionTools` (`providers/openai-tool-strict.ts`), which `Agent.declaredToolsFingerprint` reads too (`openAIStrictnessHashedTools`): a gate moved out of it lets the wire and the declared-tools hash drift.
    - Use `adaptSchemaForStrict`.
    - Emit `strict: true` only when effective strict enforcement succeeded.
 

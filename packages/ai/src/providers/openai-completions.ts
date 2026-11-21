@@ -50,15 +50,7 @@ import {
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
-import {
-	adaptSchemaForStrict,
-	findStrictToolSchemaViolation,
-	flattenExclusiveRequiredRootUnion,
-	NO_STRICT,
-	normalizeSchemaForMoonshot,
-	sanitizeSchemaForGrammar,
-	toolWireSchema,
-} from "../utils/schema";
+import { findStrictToolSchemaViolation, normalizeSchemaForMoonshot, sanitizeSchemaForGrammar } from "../utils/schema";
 import {
 	type HealedToolCall,
 	StreamMarkupHealing,
@@ -122,6 +114,7 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
+import { openAIFunctionTools } from "./openai-tool-strict";
 import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
@@ -696,12 +689,8 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	omitStainlessTimeoutHeader?: boolean;
 }
 
-type AppliedToolStrictMode = "mixed" | "all_strict" | "none";
-type ToolStrictModeOverride = Exclude<ResolvedOpenAICompat["toolStrictMode"], "mixed"> | undefined;
-
 type BuiltOpenAICompletionTools = {
 	tools: ChatCompletionTool[];
-	toolStrictMode: AppliedToolStrictMode;
 	/** True when at least one wire tool was sent with `strict: true`. */
 	strictToolsApplied: boolean;
 };
@@ -929,9 +918,8 @@ const streamOpenAICompletionsOnce = (
 			const completionsUrl = query
 				? `${trimmedBaseUrl}/chat/completions?${new URLSearchParams(query)}`
 				: `${trimmedBaseUrl}/chat/completions`;
-			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
-				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
+			const createCompletionsStream = async () => {
+				const builtParams = buildParams(model, context, options, disableStrictTools);
 				appliedStrictTools = builtParams.strictToolsApplied;
 				let params = builtParams.params;
 				// Tool-triggered suppression is a hard wire constraint; cached
@@ -1050,7 +1038,7 @@ const streamOpenAICompletionsOnce = (
 				) {
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
+					openaiStream = await createCompletionsStream();
 				} else {
 					if (
 						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
@@ -1065,7 +1053,7 @@ const streamOpenAICompletionsOnce = (
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
+					openaiStream = await createCompletionsStream();
 				}
 			}
 			if (premiumRequestsTotal !== undefined) {
@@ -2078,10 +2066,9 @@ function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
-	toolStrictModeOverride?: ToolStrictModeOverride,
+	disableStrictTools = false,
 ): {
 	params: OpenAICompletionsParams;
-	toolStrictMode: AppliedToolStrictMode;
 	strictToolsApplied: boolean;
 	reasoningEffortFallbackAllowed: boolean;
 } {
@@ -2095,7 +2082,6 @@ function buildParams(
 		messages: [],
 		stream: true,
 	};
-	let toolStrictMode: AppliedToolStrictMode = "none";
 	let strictToolsApplied = false;
 
 	if (initialCompat.supportsUsageInStreaming !== false) {
@@ -2140,9 +2126,8 @@ function buildParams(
 	applyOpenAIServiceTier(params, options?.serviceTier, model);
 
 	if (context.tools?.length) {
-		const builtTools = convertTools(context.tools, initialCompat, toolStrictModeOverride);
+		const builtTools = convertTools(context.tools, initialCompat, disableStrictTools);
 		params.tools = builtTools.tools;
-		toolStrictMode = builtTools.toolStrictMode;
 		strictToolsApplied = builtTools.strictToolsApplied;
 	} else if (context.tools === undefined && hasToolHistory(context.messages)) {
 		// Anthropic (via LiteLLM/proxy) requires the `tools` param when the conversation
@@ -2280,7 +2265,6 @@ function buildParams(
 
 	return {
 		params,
-		toolStrictMode,
 		strictToolsApplied,
 		reasoningEffortFallbackAllowed: finalPolicy.reasoning.disableReason !== "tools",
 	};
@@ -2934,46 +2918,19 @@ export function convertMessages(
 function convertTools(
 	tools: Tool[],
 	compat: ResolvedOpenAICompat,
-	toolStrictModeOverride?: ToolStrictModeOverride,
+	disableStrictTools = false,
 ): BuiltOpenAICompletionTools {
 	const rejectRootObjectUnion = compat.rejectRootObjectUnion;
-	const adaptedTools = tools.map(tool => {
-		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false;
-		const baseParameters = rejectRootObjectUnion
-			? flattenExclusiveRequiredRootUnion(toolWireSchema(tool))
-			: toolWireSchema(tool);
-		const adapted = adaptSchemaForStrict(baseParameters, strict);
-		return {
-			tool,
-			baseParameters,
-			parameters: adapted.schema,
-			strict: adapted.strict,
-		};
-	});
-
-	const requestedStrictMode = toolStrictModeOverride ?? compat.toolStrictMode;
-	const toolStrictMode =
-		requestedStrictMode === "none"
-			? "none"
-			: requestedStrictMode === "all_strict"
-				? adaptedTools.every(tool => tool.strict)
-					? "all_strict"
-					: "none"
-				: "mixed";
-
+	// `openAIFunctionTools` keeps the author's explicit `strict: false` (some backends over-fill optional properties
+	// when it is absent, #4336) only in "mixed" mode against a provider that understands the field: the
+	// `all_strict → none` collapse and `supportsStrictMode: false` paths deliberately keep the wire flag uniformly
+	// absent.
+	const declared = openAIFunctionTools({ api: "openai-completions", compat, disableStrictTools }, tools);
 	const wireTools: ChatCompletionTool[] = [];
 	let anyStrictEmitted = false;
-	for (const { tool, baseParameters, parameters, strict } of adaptedTools) {
-		const includeStrict = toolStrictMode === "all_strict" || (toolStrictMode === "mixed" && strict);
-		// `strict: false` is semantically distinct from omitted `strict` on some
-		// backends: with it absent, optional properties may be over-filled with
-		// placeholder values (#4336). Preserve the author's explicit `false`,
-		// but only in "mixed" mode against a provider that understands the
-		// field — the `all_strict → none` collapse and `supportsStrictMode:
-		// false` paths deliberately keep the wire flag uniformly absent.
-		const includeExplicitFalse =
-			!includeStrict && tool.strict === false && toolStrictMode === "mixed" && compat.supportsStrictMode !== false;
-		const wireParameters = includeStrict ? parameters : baseParameters;
+	for (let index = 0; index < tools.length; index++) {
+		const tool = tools[index]!;
+		const { strict, parameters } = declared[index]!;
 		// Moonshot/Kimi native hosts validate against the stricter MFJS subset
 		// (const→enum, typed enums, no validators) and 400 otherwise.
 		// Grammar-constrained local backends (llama.cpp, LM Studio, vLLM)
@@ -2982,10 +2939,10 @@ function convertTools(
 		// `toolWireSchema` emits for open fields (issue #5914).
 		const emittedParameters =
 			compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(wireParameters) as Record<string, unknown>)
+				? (normalizeSchemaForMoonshot(parameters) as Record<string, unknown>)
 				: compat.toolSchemaFlavor === "grammar"
-					? sanitizeSchemaForGrammar(wireParameters)
-					: wireParameters;
+					? sanitizeSchemaForGrammar(parameters)
+					: parameters;
 		const violation = findStrictToolSchemaViolation(emittedParameters, "#", { rejectRootObjectUnion });
 		if (violation) {
 			logger.warn(
@@ -2993,7 +2950,7 @@ function convertTools(
 			);
 			continue;
 		}
-		if (includeStrict) anyStrictEmitted = true;
+		if (strict === true) anyStrictEmitted = true;
 		wireTools.push({
 			type: "function",
 			function: {
@@ -3001,14 +2958,13 @@ function convertTools(
 				description: tool.description || "",
 				parameters: emittedParameters,
 				// Only include strict if provider supports it. Some reject unknown fields.
-				...(includeStrict ? { strict: true } : includeExplicitFalse ? { strict: false } : {}),
+				...(strict === undefined ? {} : { strict }),
 			},
 		});
 	}
 
 	return {
 		tools: wireTools,
-		toolStrictMode,
 		strictToolsApplied: wireTools.length > 0 && anyStrictEmitted,
 	};
 }

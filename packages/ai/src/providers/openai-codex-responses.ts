@@ -74,7 +74,6 @@ import {
 import { getProxyForUrl } from "../utils/proxy";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { getHeadersFromError, getRetryAfterMsFromHeaders, type HeadersLike } from "../utils/retry-after";
-import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { toWebSocketHeaders, toWebSocketUrl } from "../utils/websocket";
 import { compactGrammarDefinition } from "./grammar";
 import {
@@ -101,6 +100,7 @@ import { CodexApiError } from "./openai-codex/response-handler";
 import { getCodexAttestationHeader } from "./openai-codex-attestation";
 export { createOpenAICodexCompactionRequestContext } from "./openai-codex-compaction";
 import { getOpenAICodexWebSocketEnvValue } from "./openai-codex-transport";
+import { openAIFunctionTools } from "./openai-tool-strict";
 import {
 	createCodexProviderSessionState,
 	getCodexProviderSessionState,
@@ -4517,40 +4517,45 @@ export function convertOpenAICodexResponsesTools(
 	tools: Tool[],
 	model: Model<"openai-codex-responses">,
 ): CodexToolPayload[] {
-	const allowFreeform = model.applyPatchToolType === "freeform";
-	const payloads: CodexToolPayload[] = [];
-	for (const tool of tools) {
-		// Subscription models default to the function fallback. Explicit metadata
-		// remains authoritative for future Codex endpoints that implement GA computer use.
-		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
-			payloads.push({ type: "computer" });
-			continue;
-		}
-		if (allowFreeform && tool.customFormat) {
-			payloads.push({
-				type: "custom",
-				name: tool.customWireName ?? tool.name,
+	const declared = openAIFunctionTools(
+		{
+			api: "openai-codex-responses",
+			compat: model.compat,
+			freeformApplyPatch: model.applyPatchToolType === "freeform",
+			// Subscription models default to the function fallback. Explicit metadata
+			// remains authoritative for future Codex endpoints that implement GA computer use.
+			computerUse: model.supportsComputerUse === true,
+		},
+		tools,
+	);
+	return tools.map((tool, index): CodexToolPayload => {
+		const functionTool = declared[index];
+		if (functionTool) {
+			const { strict, parameters } = functionTool;
+			return {
+				type: "function",
+				name: tool.name,
 				description: tool.description || "",
-				format: {
-					type: "grammar",
-					syntax: tool.customFormat.syntax,
-					definition: compactGrammarDefinition(tool.customFormat.syntax, tool.customFormat.definition),
-				},
-			});
-			continue;
+				parameters,
+				...(strict === undefined ? {} : { strict }),
+			};
 		}
-		const strict = !!(!NO_STRICT && tool.strict);
-		const baseParameters = sanitizeSchemaForOpenAIResponses(toolWireSchema(tool), { repairArrayItems: true });
-		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(baseParameters, strict);
-		payloads.push({
-			type: "function",
-			name: tool.name,
-			description: tool.description || "",
-			parameters,
-			...(effectiveStrict ? { strict: true } : !NO_STRICT && tool.strict === false ? { strict: false } : {}),
-		});
-	}
-	return payloads;
+		// The native computer tool, or a freeform custom tool.
+		const customFormat =
+			tool.native?.type === "computer" && model.supportsComputerUse === true ? undefined : tool.customFormat;
+		return customFormat
+			? {
+					type: "custom",
+					name: tool.customWireName ?? tool.name,
+					description: tool.description || "",
+					format: {
+						type: "grammar",
+						syntax: customFormat.syntax,
+						definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
+					},
+				}
+			: { type: "computer" };
+	});
 }
 
 export class CodexWebSocketTransportError extends Error {

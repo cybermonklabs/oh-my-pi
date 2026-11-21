@@ -6,6 +6,7 @@
 
 - Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation (never while Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to its provider), and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
 - Added `@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch` with `experimentalBetasDisabled()`, whether `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to a model's provider, and `withoutDisabledExperimentalBetas()`, the model with the compat an `anthropic` request then goes out with (no strict tools, no mid-conversation tool changes, …)
+- Added `@oh-my-pi/pi-ai/providers/openai-tool-strict`: `openAIFunctionTools()`, the `strict` flag and schema each function tool of an OpenAI request (chat completions, Responses, Codex) goes out with for the request's compat, `PI_NO_STRICT` and strict-tools fallback, the `all_strict` collapse included (the three providers build their function tools from it); `openAIToolsRequest()`, the request an `openrouter` or OpenAI model's main requests declare tools with; and `openAIStrictnessHashedTools()`, the tools as a strictness-aware hash reads them (as they are under default settings, `strict: null` where a tool goes out without the flag it has by default)
 
 ## [18.18.4] - 2026-11-09
 

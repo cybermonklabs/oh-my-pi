@@ -46,15 +46,7 @@ import { toolNamesByWire } from "../utils/tool-names";
 import { isOpenAIResponsesProgressEvent } from "../utils/websocket";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { waitForRetry } from "../utils/retry-wait";
-import {
-	adaptSchemaForStrict,
-	findStrictToolSchemaViolation,
-	flattenExclusiveRequiredRootUnion,
-	NO_STRICT,
-	normalizeSchemaForMoonshot,
-	sanitizeSchemaForOpenAIResponses,
-	toolWireSchema,
-} from "../utils/schema";
+import { findStrictToolSchemaViolation } from "../utils/schema";
 import {
 	isForcedToolChoice,
 	mapToOpenAIResponsesToolChoice,
@@ -127,6 +119,7 @@ import {
 	shouldRetryWithoutStrictTools,
 	throwOpenAIResponsesEventError,
 } from "./openai-shared";
+import { openAIFunctionTools } from "./openai-tool-strict";
 import { readOpenRouterGenerationError } from "./openrouter-generation";
 import {
 	OPENAI_RESPONSES_PROVIDER_SESSION_STATE_PREFIX,
@@ -1895,9 +1888,8 @@ export function buildParams(
 	if (context.tools) {
 		const disableStrictTools =
 			disableStrictToolsOverride || isStrictToolsDisabledForScope(providerSessionState, strictToolsScope);
-		const strictMode = !disableStrictTools && model.compat.supportsStrictMode !== false;
 		const emittedTools: Tool[] = [];
-		const tools = convertTools(context.tools, strictMode, model, undefined, emittedTools);
+		const tools = convertTools(context.tools, !disableStrictTools, model, undefined, emittedTools);
 		params.tools = tools;
 		strictToolsApplied = tools.some(t => (t as { strict?: boolean }).strict === true);
 		if (toolNaming) {
@@ -2093,7 +2085,10 @@ export function mapOpenAIResponsesToolChoiceForTools(
 		: { ...mapped, name: encodeResponsesToolName(mapped.name, naming) };
 }
 
-/** @internal Exported for tests. */
+/**
+ * @internal Exported for tests. `strictMode: false` sends no tool as strict (the request's strict-tools fallback);
+ * otherwise each function tool's flag and schema are {@link openAIFunctionTools}'s for the Responses API.
+ */
 export function convertTools(
 	tools: Tool[],
 	strictMode: boolean,
@@ -2105,49 +2100,49 @@ export function convertTools(
 	/** Filled with the source tool of each returned entry, index-aligned with the result. */
 	emittedTools?: Tool[],
 ): OpenAITool[] {
-	const allowFreeform = supportsFreeformApplyPatch(model);
 	const rejectRootObjectUnion = model.compat.rejectRootObjectUnion;
 	const toolNaming = responsesToolNaming(model);
+	// Models without native computer support get the computer tool as a plain function tool (name, description,
+	// schema), so function-calling models can still drive the desktop.
+	const declared = openAIFunctionTools(
+		{
+			api: "openai-responses",
+			compat: model.compat,
+			freeformApplyPatch: supportsFreeformApplyPatch(model),
+			computerUse: model.supportsComputerUse === true,
+			disableStrictTools: !strictMode,
+		},
+		tools,
+	);
 	const out: OpenAITool[] = [];
-	for (const tool of tools) {
-		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
+	for (let index = 0; index < tools.length; index++) {
+		const tool = tools[index]!;
+		const functionTool = declared[index];
+		if (!functionTool) {
+			// The native computer tool, or a freeform custom tool.
 			emittedTools?.push(tool);
-			out.push({ type: "computer" });
+			const customFormat =
+				tool.native?.type === "computer" && model.supportsComputerUse === true ? undefined : tool.customFormat;
+			out.push(
+				customFormat
+					? ({
+							type: "custom",
+							// Tool advertises its wire-level name (e.g. `apply_patch`) — the
+							// agent-loop dispatcher will match incoming calls by either the
+							// internal `name` or `customWireName`.
+							name: tool.customWireName ?? tool.name,
+							description: tool.description || "",
+							format: {
+								type: "grammar",
+								syntax: customFormat.syntax,
+								definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
+							},
+						} as unknown as OpenAITool)
+					: { type: "computer" },
+			);
 			continue;
 		}
-		// Models without native computer support fall through and receive the
-		// tool as a plain function tool (name/description/schema below), so
-		// function-calling models can still drive the desktop.
-		if (allowFreeform && tool.customFormat) {
-			emittedTools?.push(tool);
-			out.push({
-				type: "custom",
-				// Tool advertises its wire-level name (e.g. `apply_patch`) — the
-				// agent-loop dispatcher will match incoming calls by either the
-				// internal `name` or `customWireName`.
-				name: tool.customWireName ?? tool.name,
-				description: tool.description || "",
-				format: {
-					type: "grammar",
-					syntax: tool.customFormat.syntax,
-					definition: compactGrammarDefinition(tool.customFormat.syntax, tool.customFormat.definition),
-				},
-			} as unknown as OpenAITool);
-			continue;
-		}
-		const strict = !NO_STRICT && strictMode && tool.strict !== false;
-		const baseParameters = toolWireSchema(tool);
-		// MFJS must run AFTER the Responses sanitizer: the sanitizer normalizes
-		// `{}` → `true` (issue #1179), and Moonshot's validator rejects boolean
-		// subschemas ("property schema … must be an object"), so the Moonshot
-		// pass re-coerces them last.
-		const sanitized = sanitizeSchemaForOpenAIResponses(baseParameters);
-		const providerParameters = rejectRootObjectUnion ? flattenExclusiveRequiredRootUnion(sanitized) : sanitized;
-		const responseParameters =
-			model.compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(providerParameters) as Record<string, unknown>)
-				: providerParameters;
-		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(responseParameters, strict);
+		const { strict, parameters } = functionTool;
 		// Quarantine a tool whose emitted schema carries a provider-rejecting
 		// enum/const-vs-type contradiction: dropping just that tool keeps the rest
 		// of the request valid instead of letting one bad MCP schema 400 the whole
@@ -2166,17 +2161,13 @@ export function convertTools(
 			parameters,
 			// `strict: false` and an omitted `strict` are NOT equivalent for every
 			// OpenAI-compat backend — some over-fill optional args when the flag is
-			// absent (#4336). Preserve the author's explicit `false` unless the
-			// provider is explicitly known not to understand the field
-			// (`supportsStrictMode: false`) or the strict-schema fallback is
-			// active — both paths rely on a uniformly absent wire flag. Mirrors the
-			// `supportsStrictMode !== false` gate used by openai-completions
-			// (#4527).
-			...(effectiveStrict
-				? { strict: true }
-				: !NO_STRICT && strictMode && tool.strict === false
-					? { strict: false }
-					: {}),
+			// absent (#4336). `openAIFunctionTools` preserves the author's explicit
+			// `false` unless the provider is explicitly known not to understand the
+			// field (`supportsStrictMode: false`), the strict-schema fallback is
+			// active or `PI_NO_STRICT` is set — those paths rely on a uniformly
+			// absent wire flag. Mirrors the `supportsStrictMode !== false` gate used
+			// by openai-completions (#4527).
+			...(strict === undefined ? {} : { strict }),
 		} as OpenAITool);
 	}
 	return out;
