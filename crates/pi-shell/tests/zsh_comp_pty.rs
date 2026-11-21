@@ -40,8 +40,12 @@ const STARTUP: Duration = Duration::from_secs(60);
 /// Bound of one step (completion functions print nothing while they work).
 const STEP: Duration = Duration::from_secs(30);
 
-/// The fixture every case starts from (after `fpath`).
-const FIXTURE: &str = "PS1='%# '
+/// The fixture every case starts from (after `fpath`). The prompt and the
+/// mark of a line left without its newline are a literal `%`, not `%#`,
+/// which is `#` for root (`PROMPT_EOL_MARK`'s default is `%B%S%#%s%b`): the
+/// snapshots hold for the user the tests run as.
+const FIXTURE: &str = "PS1='%% '
+PROMPT_EOL_MARK='%B%S%%%s%b'
 mkdir -p ~/fx/dir1 ~/fx/dir2 ~/bin
 : >~/fx/file1 >~/fx/file2 >~/fx/foo.c >~/fx/foo.h
 for c in fxcmd-one fxcmd-two fxtool; do print '#!/bin/sh' >~/bin/$c; chmod +x ~/bin/$c; done
@@ -94,7 +98,7 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 	let _ = write!(rcfile, "\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RE''ADY\n");
 	let mut pty = shell()
 		.args(["-f", "-i"])
-		.env("PS1", "%# ")
+		.env("PS1", "%% ")
 		.env("LC_COLLATE", "C")
 		.rc_file(".zshrc", rcfile)
 		.zle_sync()

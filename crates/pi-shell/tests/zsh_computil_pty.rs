@@ -27,7 +27,9 @@ const KEY: Duration = Duration::from_millis(60);
 /// The bound of waits that run `compinit` or completion functions.
 const SLOW: Duration = Duration::from_secs(120);
 
-/// `zsh -f -i` with a plain prompt and the rc file `rc`, in `cwd`.
+/// `zsh -f -i` with a plain prompt (a literal `%`, not `%#`, which is `#`
+/// for root: [`compsys_kill_signals`]'s screen holds for any user) and the
+/// rc file `rc`, in `cwd`.
 fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
@@ -35,7 +37,7 @@ fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 		Spawn::zsh()
 	};
 	s.args(["-f", "-i"])
-		.env("PS1", "%# ")
+		.env("PS1", "%% ")
 		.rc_file(".zshrc", rc)
 		.zle_sync()
 		.size(24, 80)
