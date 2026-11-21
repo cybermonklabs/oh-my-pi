@@ -42,6 +42,7 @@ import {
 	type ColdCustomMessageSlots,
 	type ColdMessageSlots,
 	type ColdModeChangeSlots,
+	coldApprovedPlanFileMark,
 	coldRolloverRequestMark,
 } from "./cold-message";
 import { CONTEXT_NOTES_ENTRY_TYPE, contextNotesEntriesRead } from "./context-notes";
@@ -237,16 +238,19 @@ const MESSAGE_IDENTITY_FIELDS: ReadonlySet<string> = new Set([
 
 /** The compactions a context build on a path can start from. */
 export interface ReadCompactions {
-	/** The newest compaction on the path: the one a build with no model starts from. */
-	readonly newest: CompactionEntry | null;
-	/** The newest compaction the model can replay; `newest` with no model. */
-	readonly readable: CompactionEntry | null;
+	/**
+	 * The newest compaction on the path, the one a build with no model starts
+	 * from, then the newest the model can replay when that is another one;
+	 * null where the path has no compaction, or none the model can replay.
+	 */
+	readonly distinct: readonly (CompactionEntry | null)[];
 }
 
 /** {@link ReadCompactions} of `path` for `model`. */
 export function readCompactions(path: readonly SessionEntry[], model: Model | undefined): ReadCompactions {
 	const newest = getReadableCompactionEntry(path, undefined);
-	return { newest, readable: model ? getReadableCompactionEntry(path, model) : newest };
+	const readable = model ? getReadableCompactionEntry(path, model) : newest;
+	return { distinct: readable === newest ? [newest] : [newest, readable] };
 }
 
 /**
@@ -283,8 +287,7 @@ export function entriesKeptWholeOnPath(path: readonly SessionEntry[], compaction
 			todo = true;
 		}
 	}
-	const { newest, readable } = compactions;
-	for (const compaction of readable === newest ? [newest] : [newest, readable]) {
+	for (const compaction of compactions.distinct) {
 		const request = compaction ? rolloverRequest(path, compaction) : undefined;
 		if (request) kept.add(request);
 	}
@@ -320,9 +323,8 @@ function rolloverRequest(path: readonly SessionEntry[], compaction: CompactionEn
  * whichever comes first. 0 (nothing cold) when the context uses no compaction.
  */
 export function coldCutPathIndex(path: readonly SessionEntry[], compactions: ReadCompactions): number {
-	const { newest, readable } = compactions;
 	let start = path.length;
-	for (const compaction of readable === newest ? [newest] : [newest, readable]) {
+	for (const compaction of compactions.distinct) {
 		if (!compaction) return 0;
 		start = Math.min(start, compactionKeptStart(path, compaction, path.indexOf(compaction)));
 	}
@@ -454,8 +456,9 @@ export function coldBoundary(
  * superseded).
  */
 function firstReadCompactionIndex(path: readonly SessionEntry[], compactions: ReadCompactions): number {
-	const { newest, readable } = compactions;
-	return Math.min(newest ? path.indexOf(newest) : 0, readable ? path.indexOf(readable) : 0);
+	let first = path.length;
+	for (const compaction of compactions.distinct) first = Math.min(first, compaction ? path.indexOf(compaction) : 0);
+	return first;
 }
 
 /**
@@ -1305,8 +1308,7 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
 	setRecordSlots(copy, record);
 	const mark = coldRolloverRequestMark(entry);
 	if (mark !== undefined) setHiddenSlot(copy, COLD_ROLLOVER_REQUEST, mark);
-	const modeChangeSlots: ColdModeChangeSlots = entry as object;
-	const planFile = modeChangeSlots[COLD_APPROVED_PLAN_FILE];
+	const planFile = coldApprovedPlanFileMark(entry);
 	if (planFile !== undefined) setHiddenSlot(copy, COLD_APPROVED_PLAN_FILE, planFile);
 	return copy as unknown as SessionEntry;
 }

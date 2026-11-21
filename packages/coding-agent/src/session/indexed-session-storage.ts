@@ -762,15 +762,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
 		const measured = measureLines(lines);
+		const writeFullStream = this.#backend.writeFullStream;
 		return {
 			byteLength: measured.bytes,
 			title: measured.title,
 			publish: async (mtimeMs, expectedSize) => {
 				try {
-					if (!this.#backend.writeFullStream) {
+					if (!writeFullStream) {
 						throw new Error("Session storage backend has no streamed full write (writeFullStream)");
 					}
-					await this.#backend.writeFullStream(
+					await writeFullStream.call(
+						this.#backend,
 						path,
 						streamLines(lines, measured),
 						measured.bytes,
@@ -793,7 +795,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			// Compared by size and SHA-256, chunk by chunk, with what the lines measured. A backend
 			// without a streamed write was handed nothing, so nothing it holds is this write's: no read.
 			isStored: async () => {
-				if (!this.#backend.writeFullStream) return false;
+				if (!writeFullStream) return false;
 				const stored = await digestStream(this.#backendChunks(path, 0));
 				return stored.bytes === measured.bytes && stored.hash === measured.hash;
 			},

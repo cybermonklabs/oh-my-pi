@@ -59,10 +59,15 @@ export interface ColdModeChangeSlots {
 	[COLD_APPROVED_PLAN_FILE]?: string | null;
 }
 
+/** {@link COLD_APPROVED_PLAN_FILE} of `entry`; undefined unless it is a cold `mode_change`. */
+export function coldApprovedPlanFileMark(entry: object): string | null | undefined {
+	const slots: ColdModeChangeSlots = entry;
+	return slots[COLD_APPROVED_PLAN_FILE];
+}
+
 /** The approved plan file mode change `entry` names, or null: from its mark while cold, so no record is read. */
 export function approvedPlanFileOf(entry: ModeChangeEntry): string | null {
-	const slots: ColdModeChangeSlots = entry as object;
-	const mark = slots[COLD_APPROVED_PLAN_FILE];
+	const mark = coldApprovedPlanFileMark(entry);
 	if (mark !== undefined) return mark;
 	const planFile = entry.data?.approvedPlanFilePath;
 	return typeof planFile === "string" ? planFile : null;

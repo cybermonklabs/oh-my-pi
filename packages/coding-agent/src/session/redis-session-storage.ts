@@ -218,6 +218,11 @@ function sizeConflict(path: string, expectedSize: number | null, actual: number)
 	return new SessionWriteConflictError(path, expectedSize, actual === -1 || !Number.isFinite(actual) ? null : actual);
 }
 
+/** A write script's `{status, size}` reply as two numbers, each NaN where the reply has no number. */
+function writeReply(result: unknown): [status: number, size: number] {
+	return Array.isArray(result) ? [Number(result[0]), Number(result[1])] : [Number.NaN, Number.NaN];
+}
+
 /**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
  * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
@@ -331,9 +336,9 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			expectedSize === undefined ? "" : String(expectedSize ?? -1),
 		]);
 		if (expectedSize === undefined) return;
-		const written = Array.isArray(result) && Number(result[0]) === 1;
-		if (written) return;
-		throw sizeConflict(path, expectedSize, Array.isArray(result) ? Number(result[1]) : Number.NaN);
+		const [status, size] = writeReply(result);
+		if (status === 1) return;
+		throw sizeConflict(path, expectedSize, size);
 	}
 
 	/**
@@ -388,7 +393,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			}
 			throw err;
 		}
-		const [status, size] = Array.isArray(result) ? result.map(Number) : [Number.NaN, Number.NaN];
+		const [status, size] = writeReply(result);
 		if (status === 1) return;
 		if (status === 0) throw sizeConflict(path, expectedSize ?? null, size);
 		throw new Error(

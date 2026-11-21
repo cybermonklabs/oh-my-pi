@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as vm from "node:vm";
 import {
 	stableStringifyJson,
 	stringifyDeepJson,
@@ -71,6 +72,40 @@ function thrown(fn: () => unknown): unknown {
 	return "nothing thrown";
 }
 
+/** What `write` gives for each of `cases`, by name: its text, or what it throws, so two writers compare case by case. */
+function outcomes(
+	cases: Readonly<Record<string, unknown>>,
+	write: (value: unknown) => string | undefined,
+): Record<string, unknown> {
+	const results: Record<string, unknown> = {};
+	for (const [name, value] of Object.entries(cases)) {
+		let text: string | undefined;
+		const error = thrown(() => {
+			text = write(value);
+		});
+		results[name] = { text, error };
+	}
+	return results;
+}
+
+/**
+ * `[1, 2]` behind a proxy that reports `length` as its length. Reading more
+ * than eight elements throws, so a writer that misreads the length fails at
+ * once instead of writing `null` until memory runs out.
+ */
+function arrayReporting(length: unknown): unknown[] {
+	let reads = 0;
+	return new Proxy([1, 2], {
+		get(target, key, receiver) {
+			if (key === "length") return length;
+			if (typeof key === "string" && /^\d+$/.test(key) && ++reads > 8) {
+				throw new Error("read past the reported length");
+			}
+			return Reflect.get(target, key, receiver);
+		},
+	});
+}
+
 /**
  * A value `levels` containers deep whose levels take turns among the shapes
  * `JSON.stringify` treats apart: values it leaves out of an object and writes
@@ -132,39 +167,18 @@ function deepValue(levels: number): unknown {
 	return value;
 }
 
-/** A generated value and the text `JSON.stringify` gives for it. */
-interface Stringified {
-	readonly value: unknown;
-	readonly text: string;
-}
-
-/**
- * {@link deepValue} at the most levels, doubling from 4,000, that
- * `JSON.stringify` still writes here, with its text: at least half the depth
- * at which it runs out of stack. Bun's `JSON.stringify` takes seconds near
- * that depth (its time grows with the square of the depth), so the text of
- * the last success is kept rather than written again.
- */
-function deepestStringified(): Stringified {
-	let deepest: Stringified | undefined;
-	for (let levels = 4_000; ; levels *= 2) {
-		const value = deepValue(levels);
-		try {
-			deepest = { value, text: JSON.stringify(value) };
-		} catch (error) {
-			if (!(error instanceof RangeError)) throw error;
-			if (!deepest) throw new Error(`JSON.stringify ran out of stack at ${levels} levels`);
-			return deepest;
-		}
-	}
-}
-
 // The RPC encoder writes a frame through `stringifyDeepJson`; a byte that differs from
 // `JSON.stringify`'s is a frame the client parses to a different value than the host sent.
 describe("stringifyJsonIteratively", () => {
+	const otherRealm = vm.createContext({});
+	const fromOtherRealm = (source: string): unknown => vm.runInContext(source, otherRealm);
+
 	it("writes JSON.stringify's bytes for each kind of value", () => {
 		const shared = { x: 1 };
 		const callable = Object.assign(() => 1, { toJSON: () => "callable" });
+		// Values a `toJSON` returns that have a `toJSON` of their own, which `JSON.stringify` does not call.
+		const callableWithToJSON = Object.assign(() => 1, { toJSON: () => "called again" });
+		const boxWithToJSON = Object.assign(new Number(5), { toJSON: (key: string) => `box ${key}` });
 		const hole: unknown[] = [0];
 		hole[2] = 2;
 		const cases: Record<string, unknown> = {
@@ -177,8 +191,27 @@ describe("stringifyJsonIteratively", () => {
 			undefined,
 			function: () => 1,
 			symbol: Symbol("s"),
-			boxed: [new Number(3), new String("s"), new Boolean(false)],
+			boxed: [new Number(3), new String("s"), new Boolean(false), new Number(-0), new Number(Number.NaN)],
 			boxedRoot: new String("root"),
+			boxedInOtherRealm: {
+				number: fromOtherRealm("new Number(7)"),
+				string: fromOtherRealm('new String("ab")'),
+				boolean: fromOtherRealm("new Boolean(false)"),
+			},
+			boxedRootInOtherRealm: fromOtherRealm('new String("root")'),
+			boxedWithObjectPrototype: {
+				number: Object.setPrototypeOf(new Number(3), Object.prototype),
+				string: Object.setPrototypeOf(new String("s"), Object.prototype),
+				boolean: Object.setPrototypeOf(new Boolean(true), Object.prototype),
+			},
+			boxedOverrides: [
+				Object.assign(new Number(1), { valueOf: () => 7 }),
+				Object.assign(new String("s"), { toString: () => "t" }),
+				Object.assign(new Boolean(false), { valueOf: () => true }),
+			],
+			boxedSymbol: { a: Object(Symbol("s")), keyed: Object.assign(Object(Symbol("s")), { k: [1] }) },
+			numberPrototypeObject: { a: Object.assign(Object.create(Number.prototype), { x: 1 }) },
+			boxWithToJSON: { a: boxWithToJSON },
 			empty: { object: {}, array: [] },
 			keyOrder: { b: 1, 2: 2, a: 3, 1: 4 },
 			escapedKeys: { 'a"b': 1, "\n": 2, "\u2028": 3 },
@@ -190,6 +223,12 @@ describe("stringifyJsonIteratively", () => {
 			toJSONContainer: { a: { toJSON: () => ({ nested: [1, { toJSON: () => 2 }] }) } },
 			toJSONUndefined: { gone: { toJSON: () => undefined }, list: [{ toJSON: () => undefined }] },
 			toJSONRoot: { toJSON: (key: string) => ({ root: key }) },
+			toJSONReturnsCallableWithToJSON: {
+				a: { toJSON: () => callableWithToJSON },
+				list: [{ toJSON: () => callableWithToJSON }],
+			},
+			toJSONRootReturnsCallableWithToJSON: { toJSON: () => callableWithToJSON },
+			toJSONReturnsBoxWithToJSON: { a: { toJSON: () => boxWithToJSON } },
 			callableToJSON: { callable },
 			date: new Date(0),
 			symbolKey: { [Symbol("x")]: 1, a: 2 },
@@ -205,9 +244,7 @@ describe("stringifyJsonIteratively", () => {
 			buffer: Buffer.from("ab"),
 			sharedNotCycle: { a: shared, b: [shared, shared] },
 		};
-		for (const [name, value] of Object.entries(cases)) {
-			expect([name, stringifyJsonIteratively(value)]).toEqual([name, JSON.stringify(value)]);
-		}
+		expect(outcomes(cases, stringifyJsonIteratively)).toEqual(outcomes(cases, value => JSON.stringify(value)));
 	});
 
 	it("throws JSON.stringify's errors for a cycle, a bigint and a throwing toJSON", () => {
@@ -221,15 +258,54 @@ describe("stringifyJsonIteratively", () => {
 				},
 			},
 		};
-		for (const value of [cycle, { n: 1n }, [Object(1n)], failing]) {
-			expect(thrown(() => stringifyJsonIteratively(value))).toEqual(thrown(() => JSON.stringify(value)));
+		const cases: Record<string, unknown> = {
+			cycle,
+			bigint: { n: 1n },
+			boxedBigInt: [Object(1n)],
+			boxedBigIntInOtherRealm: { a: fromOtherRealm("Object(1n)") },
+			bigintFromValueOf: { a: Object.assign(new Number(1), { valueOf: () => 1n }) },
+			failing,
+		};
+		expect(outcomes(cases, stringifyJsonIteratively)).toEqual(outcomes(cases, value => JSON.stringify(value)));
+	});
+
+	// With `BigInt.prototype.toJSON` installed (as a host that sends bigints as text does), a bigint
+	// a `toJSON` returns would be written as that text where `JSON.stringify` throws.
+	it("calls no toJSON on the bigint a toJSON returns, as JSON.stringify does", () => {
+		Object.defineProperty(BigInt.prototype, "toJSON", { configurable: true, writable: true, value: () => "big" });
+		try {
+			const cases: Record<string, unknown> = {
+				returned: { a: { toJSON: () => 5n } },
+				own: { n: 1n, boxed: Object(1n) },
+			};
+			expect(outcomes(cases, stringifyJsonIteratively)).toEqual(outcomes(cases, value => JSON.stringify(value)));
+		} finally {
+			Reflect.deleteProperty(BigInt.prototype, "toJSON");
 		}
 	});
 
-	it("writes JSON.stringify's bytes for a generated value at least half as deep as its depth limit", () => {
-		const { value, text } = deepestStringified();
-		expect(stringifyJsonIteratively(value) === text).toBe(true);
-	}, 120_000);
+	// An array proxy reporting a length that is not a whole number made the writer write `,null`
+	// until the process ran out of memory.
+	it("reads an array's length as JSON.stringify does", () => {
+		const lengths: Record<string, unknown> = {
+			string: "2",
+			fraction: 2.5,
+			negative: -1,
+			notANumber: Number.NaN,
+			bigint: 2n,
+		};
+		const arrays = (): Record<string, unknown> =>
+			Object.fromEntries(Object.entries(lengths).map(([name, length]) => [name, arrayReporting(length)]));
+		expect(outcomes(arrays(), stringifyJsonIteratively)).toEqual(outcomes(arrays(), value => JSON.stringify(value)));
+	});
+
+	// Every shape of `deepValue` appears 500 times and the text crosses the writer's chunk join many
+	// times; deeper, Bun's `JSON.stringify` takes seconds (its time grows with the square of the
+	// depth), so the 100,000-deep chain below tests the writer alone.
+	it("writes JSON.stringify's bytes for a generated value 4,000 levels deep", () => {
+		const value = deepValue(4_000);
+		expect(stringifyJsonIteratively(value) === JSON.stringify(value)).toBe(true);
+	});
 });
 
 // RPC `get_tree` of a session longer than about 10,000 entries nests each one under its parent,

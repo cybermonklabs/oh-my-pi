@@ -1,3 +1,5 @@
+import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
+
 /**
  * Try to parse JSON, returning null on failure.
  */
@@ -97,19 +99,22 @@ const JSON_PIECES_PER_CHUNK = 1024;
  * `JSON.stringify(value)` with no replacer and no indent, written with an
  * explicit stack instead of recursion, so a value of any depth serializes.
  * It walks objects and arrays as `JSON.stringify` does: each value's
- * `toJSON(key)` first, an object's keys in `Object.keys` order, `undefined`,
- * a function and a symbol left out of an object and written `null` in an
- * array, and a cycle a `TypeError`. Every other value (a string, number,
- * boolean, `null`, bigint or boxed primitive) is written by `JSON.stringify`
- * itself, so its bytes and errors are that function's. It takes several
- * times as long as `JSON.stringify` on a shallow value, but Bun's slows with
- * depth: {@link stringifyDeepJson} runs this writer where `JSON.stringify`
- * runs out of stack, and a caller that knows a value is deep can call it
- * directly.
+ * `toJSON(key)` first, an object's keys in `Object.keys` order, an array's
+ * `length` converted to a whole number first (a proxy can report any value),
+ * `undefined`, a function and a symbol left out of an object and written
+ * `null` in an array, and a cycle a `TypeError`. It writes every other value
+ * as `JSON.stringify` does, without calling its `toJSON` a second time
+ * ({@link scalarJson}): a boxed primitive, told by its internal slot as that
+ * function tells it, is unwrapped, a bigint throws that function's
+ * `TypeError`, and a string, number, boolean or `null` is written by
+ * `JSON.stringify` itself. It takes several times as long as
+ * `JSON.stringify` on a shallow value, but Bun's slows with depth:
+ * {@link stringifyDeepJson} runs this writer where `JSON.stringify` runs out
+ * of stack, and a caller that knows a value is deep can call it directly.
  */
 export function stringifyJsonIteratively(value: unknown): string | undefined {
 	const root = jsonValueOf(value, "");
-	if (!isJsonContainer(root)) return JSON.stringify(root);
+	if (!isJsonContainer(root)) return scalarJson(root);
 	// The text so far: chunks of joined pieces, and the pieces since, so the engine holds a few
 	// long strings instead of one short string per value (millions for a long session's tree).
 	const chunks: string[] = [];
@@ -138,7 +143,7 @@ export function stringifyJsonIteratively(value: unknown): string | undefined {
 		if (open.has(container)) throw new TypeError("JSON.stringify cannot serialize cyclic structures.");
 		open.add(container);
 		if (Array.isArray(container)) {
-			stack.push({ container, keys: undefined, length: container.length, index: 0, written: false });
+			stack.push({ container, keys: undefined, length: jsonArrayLength(container), index: 0, written: false });
 			write("[");
 		} else {
 			const keys = Object.keys(container);
@@ -164,7 +169,7 @@ export function stringifyJsonIteratively(value: unknown): string | undefined {
 			enter(member);
 			continue;
 		}
-		const text: string | undefined = JSON.stringify(member);
+		const text = scalarJson(member);
 		if (text === undefined && frame.keys) continue;
 		write(prefix(frame, key) + (text ?? "null"));
 		frame.written = true;
@@ -184,13 +189,46 @@ function jsonValueOf(value: unknown, key: string): unknown {
 	return typeof toJSON === "function" ? Reflect.apply(toJSON, value, [key]) : value;
 }
 
-/** Whether `JSON.stringify` writes `value` as an object or an array: an object that is neither callable nor a boxed primitive. */
+/**
+ * Whether `JSON.stringify` writes `value` as an object or an array: an object
+ * that is neither callable nor a boxed number, string, boolean or bigint, told
+ * by the internal slot as `JSON.stringify` tells it (so a box from another
+ * realm, or one whose prototype changed, is still a box). A boxed symbol is an
+ * object to it.
+ */
 function isJsonContainer(value: unknown): value is object {
 	return (
 		typeof value === "object" &&
 		value !== null &&
-		!(value instanceof Number || value instanceof String || value instanceof Boolean || value instanceof BigInt)
+		!(isNumberObject(value) || isStringObject(value) || isBooleanObject(value) || isBigIntObject(value))
 	);
+}
+
+/**
+ * The text `JSON.stringify` writes for `value`, a value after its `toJSON`
+ * that is not an object or array to it ({@link isJsonContainer}): `undefined`
+ * for `undefined`, a function or a symbol; a boxed primitive unwrapped by its
+ * internal slot (a number and a string converted, so through an overridden
+ * `valueOf` or `toString`); a bigint a `TypeError`. Its `toJSON` is not
+ * called again, as `JSON.stringify(value)` would call it.
+ */
+function scalarJson(value: unknown): string | undefined {
+	let primitive = value;
+	// Unary plus is the ToNumber `JSON.stringify` applies: `Number()` would convert a bigint
+	// an overridden `valueOf` returns, where ToNumber throws.
+	if (isNumberObject(value)) primitive = +value;
+	else if (isStringObject(value)) primitive = String(value);
+	else if (isBooleanObject(value)) primitive = Boolean.prototype.valueOf.call(value);
+	else if (isBigIntObject(value)) primitive = BigInt.prototype.valueOf.call(value);
+	if (typeof primitive === "bigint") throw new TypeError("JSON.stringify cannot serialize BigInt.");
+	if (primitive === undefined || typeof primitive === "function" || typeof primitive === "symbol") return undefined;
+	return JSON.stringify(primitive);
+}
+
+/** `array.length` as `JSON.stringify` reads it (ToLength), for a proxy that reports a length that is not a whole number. */
+function jsonArrayLength(array: readonly unknown[]): number {
+	// Unary plus is ToNumber, which throws for a bigint where `Number()` converts it.
+	return Math.min(Math.max(Math.trunc(+array.length) || 0, 0), Number.MAX_SAFE_INTEGER);
 }
 
 function stableJsonClone(value: unknown): unknown {

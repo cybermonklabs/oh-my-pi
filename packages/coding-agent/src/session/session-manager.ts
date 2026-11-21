@@ -4158,10 +4158,10 @@ export class SessionManager {
 			: undefined;
 		this.#adoptColdStore(snapshot.coldStore);
 		// A rollback leaves the agent's context the one built for this model (a
-		// switch restores it, a move keeps it), so the cut recomputed at the next
-		// build or recool keeps whole what that context holds.
+		// switch restores it, a move keeps it), so the cut `#applyEntries` marked
+		// stale, recomputed at the next build or recool, keeps whole what that
+		// context holds.
 		this.#coldCutModel = snapshot.coldCutModel;
-		this.#coldCutStale = true;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		// A rolled-back switch gives up the claim it took on the session it opened.
