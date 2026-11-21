@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__setAddonFileIoForTests,
 	cleanupStaleNativeVersions,
 	type EmbeddedAddon,
 	type EmbeddedAddonFile,
@@ -201,7 +202,7 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 			[
 				`import * as fs from "node:fs";`,
 				`import * as path from "node:path";`,
-				`import { loadNative } from ${JSON.stringify(path.join(loaderDir, "loader-state.js"))};`,
+				`import { __setAddonFileIoForTests, loadNative } from ${JSON.stringify(path.join(loaderDir, "loader-state.js"))};`,
 				`let claimed = null;`,
 				`let dir = null;`,
 				`let putBack = false;`,
@@ -220,7 +221,8 @@ describe("a compiled binary whose cache directory cleanup claims during the star
 				`	}`,
 				`	return fs.existsSync(target);`,
 				`} };`,
-				`try { loadNative({ io }); console.log(JSON.stringify({ loaded: true, claimed, putBack })); }`,
+				`__setAddonFileIoForTests(io);`,
+				`try { loadNative(); console.log(JSON.stringify({ loaded: true, claimed, putBack })); }`,
 				`catch (err) { console.log(JSON.stringify({ loaded: false, claimed, error: String(err?.message ?? err).split("\\n").slice(0, 4).join(" | ") })); }`,
 			].join("\n"),
 		);
@@ -336,7 +338,12 @@ describe("embedded addon extraction", () => {
 		const file = await manifestFile("durable", "durable addon bytes");
 		const { io, calls } = recordingFs();
 
-		extractEmbeddedAddons({ files: [file], targetDir, io });
+		__setAddonFileIoForTests(io);
+		try {
+			extractEmbeddedAddons({ files: [file], targetDir });
+		} finally {
+			__setAddonFileIoForTests(undefined);
+		}
 
 		expect(calls).toEqual(durableWriteCalls(path.join(targetDir, file.filename), targetDir));
 	});
@@ -359,7 +366,12 @@ describe("embedded addon extraction", () => {
 			},
 		};
 
-		expect(extractEmbeddedAddons({ files: [file], targetDir, io })).toEqual([path.join(targetDir, file.filename)]);
+		__setAddonFileIoForTests(io);
+		try {
+			expect(extractEmbeddedAddons({ files: [file], targetDir })).toEqual([path.join(targetDir, file.filename)]);
+		} finally {
+			__setAddonFileIoForTests(undefined);
+		}
 		expect(await Bun.file(path.join(targetDir, file.filename)).text()).toBe("claimed addon bytes");
 	});
 });
@@ -430,7 +442,13 @@ describe("addon cache cleanup", () => {
 				},
 			} as typeof nodeFs;
 
-			const removed = cleanupStaleNativeVersions({ nativesDir, currentDir: path.join(nativesDir, "none"), io });
+			__setAddonFileIoForTests(io);
+			let removed: string[];
+			try {
+				removed = cleanupStaleNativeVersions({ nativesDir, currentDir: path.join(nativesDir, "none") });
+			} finally {
+				__setAddonFileIoForTests(undefined);
+			}
 
 			expect(marked).toBe(true);
 			expect(removed).toEqual([]);

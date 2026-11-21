@@ -26,6 +26,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__setAddonFileIoForTests,
 	getAddonFilenames,
 	initLoaderContext,
 	maybeStageNodeModulesAddon,
@@ -320,7 +321,12 @@ describe("windows staging into the leaf package's digest directory", () => {
 		const ctx = windowsInstall(install.leafDir);
 		const { io, calls } = recordingFs();
 
-		maybeStageNodeModulesAddon(ctx, [], io);
+		__setAddonFileIoForTests(io);
+		try {
+			maybeStageNodeModulesAddon(ctx, []);
+		} finally {
+			__setAddonFileIoForTests(undefined);
+		}
 
 		const staged = ctx.addonFilenames.filter(filename => install.addons.has(filename));
 		expect(staged.length).toBeGreaterThan(0);

@@ -109,8 +109,6 @@ export interface CleanupStaleNativeVersionsInput {
 	nativesDir: string;
 	/** The cache directory this process loads from; never removed. */
 	currentDir: string;
-	/** `node:fs`; tests pass one that marks a directory used between cleanup's reads. */
-	io?: typeof nodeFs;
 }
 
 /**
@@ -124,18 +122,15 @@ export function cleanupStaleNativeVersions(input: CleanupStaleNativeVersionsInpu
 export function prepareNativeVersionDir(versionedDir: string): void;
 
 /**
- * The `node:fs` calls that write an addon into the cache; the loader uses `node:fs`, and
- * tests pass one that records the calls.
+ * Replace the addon cache's file calls (`undefined` restores `node:fs`), for tests: a cleanup
+ * that renames a directory away between a check and the load, or calls to record. It reaches
+ * this module instance only.
  */
-export type AddonFileIo = Pick<
-	typeof nodeFs,
-	"openSync" | "writeFileSync" | "fsyncSync" | "closeSync" | "renameSync" | "unlinkSync" | "statSync" | "existsSync"
->;
+export function __setAddonFileIoForTests(replacement: Partial<typeof nodeFs> | undefined): void;
 
 export interface ExtractEmbeddedAddonsInput {
 	files: EmbeddedAddonFile[];
 	targetDir: string;
-	io?: AddonFileIo;
 }
 
 /**
@@ -152,11 +147,7 @@ export function extractEmbeddedAddons(input: ExtractEmbeddedAddonsInput): string
  * reuse a copy of the recorded size, and mark the directory used. Returns the first staged
  * path in candidate order, or null; failures are appended to `errors`.
  */
-export function maybeStageNodeModulesAddon(
-	ctx: NativeLoaderContext,
-	errors: string[],
-	io?: AddonFileIo,
-): string | null;
+export function maybeStageNodeModulesAddon(ctx: NativeLoaderContext, errors: string[]): string | null;
 
 export interface SelectCpuVariantInput {
 	arch: string;
@@ -259,9 +250,9 @@ export function reportStaleWorkspaceAddon(
 export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
 
 /**
- * Load the native addon. `io` (default `node:fs`) is used for the cache checks and writes:
- * extraction, staging, and the one retry of a cache file that vanished between the check that
- * found it and its load, as it does while cleanup in another process holds its directory renamed
- * away. Tests pass one that does that rename.
+ * Load the native addon. The cache checks and writes (extraction, staging, and the one retry of
+ * a cache file that vanished between the check that found it and its load, as it does while
+ * cleanup in another process holds its directory renamed away) go through the addon cache's
+ * file calls ({@link __setAddonFileIoForTests}).
  */
-export function loadNative(options?: { io?: typeof nodeFs }): Record<string, unknown>;
+export function loadNative(): Record<string, unknown>;

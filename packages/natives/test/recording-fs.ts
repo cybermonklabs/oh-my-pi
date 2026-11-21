@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 
 /**
  * `node:fs` with the calls that write an addon into the cache recorded by path, for the
- * loader's `io` test seam; every call goes through to the real file system. A temporary
- * file's name reads `<temp>`.
+ * loader's `__setAddonFileIoForTests`; every call goes through to the real file system. A
+ * temporary file's name reads `<temp>`.
  */
 export function recordingFs() {
 	const calls: string[] = [];
