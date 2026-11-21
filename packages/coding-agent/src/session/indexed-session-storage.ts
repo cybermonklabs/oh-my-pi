@@ -139,7 +139,18 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	readonly #pendingFrames = new Map<string, IndexAppend[]>();
 	#nextMtimeMs = 0;
-	#firstDrainError: Error | undefined;
+	/**
+	 * The first failure of a drain-tracked backend op per path, until a {@link drain} of that path, or of
+	 * the whole store, reports it.
+	 */
+	readonly #drainErrors = new Map<string, Error>();
+	/**
+	 * The first drain-tracked failure since the last write that landed on the store, and the paths whose
+	 * drains it was reported to. Until another write lands it may be the store refusing every write, so
+	 * the drain of every path reports it, once per path. Once a write lands the store accepts writes,
+	 * and the failure counts only against its own paths (see {@link #drainErrors}).
+	 */
+	#unconfirmedFailure: { error: Error; reportedTo: Set<string> } | undefined;
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		const actualSize = this.#index.get(path)?.size ?? null;
@@ -169,7 +180,14 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	async drain(): Promise<void> {
+	/**
+	 * Quiesce every pending backend op, then report a failure of a drain-tracked op not reported before.
+	 * With `path`: the first failure on `path`, else a failure on another path while no write has landed
+	 * on the store since it (it may be the store refusing every write), once per path. Without `path`: the
+	 * first failure on any path. A failure on another path after a write landed is never reported to
+	 * `path`'s drain.
+	 */
+	async drain(path?: string): Promise<void> {
 		// Quiesce EVERY pending backend operation, not just the drain-tracked
 		// fire-and-forget publishes: an atomic write whose commit guard passed
 		// just before a terminal seal is still on the wire with
@@ -178,9 +196,24 @@ export class IndexedSessionStorage implements SessionStorage {
 		while (this.#drainPending.size > 0 || this.#pathPending.size > 0) {
 			await Promise.allSettled([...this.#drainPending, ...this.#pathPending.values()]);
 		}
-		const error = this.#firstDrainError;
-		this.#firstDrainError = undefined;
-		if (error) throw error;
+		if (path === undefined) {
+			const first = this.#drainErrors.values().next().value;
+			this.#drainErrors.clear();
+			this.#unconfirmedFailure = undefined;
+			if (first) throw first;
+			return;
+		}
+		const own = this.#drainErrors.get(path);
+		this.#drainErrors.delete(path);
+		const unconfirmed = this.#unconfirmedFailure;
+		if (own) {
+			unconfirmed?.reportedTo.add(path);
+			throw own;
+		}
+		if (unconfirmed && !unconfirmed.reportedTo.has(path)) {
+			unconfirmed.reportedTo.add(path);
+			throw unconfirmed.error;
+		}
 	}
 
 	ensureDirSync(_dir: string): void {
@@ -349,7 +382,7 @@ export class IndexedSessionStorage implements SessionStorage {
 						const current = this.#index.get(path);
 						if (current?.mtimeMs === mtimeMs) this.#restoreIndex(path, previous);
 						this.#abandonFrame(path, mtimeMs);
-						return;
+						return false;
 					}
 					await this.#backend.writeFull(path, content, mtimeMs, title, options?.expectedSize);
 				},
@@ -533,7 +566,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		return next;
 	}
 
-	#enqueuePath(path: string, task: () => Promise<void>, options: EnqueueOptions): Promise<void> {
+	#enqueuePath(path: string, task: () => Promise<void | false>, options: EnqueueOptions): Promise<void> {
 		return this.#enqueuePaths([path], task, options);
 	}
 
@@ -611,7 +644,11 @@ export class IndexedSessionStorage implements SessionStorage {
 		);
 	}
 
-	#enqueuePaths(paths: readonly string[], task: () => Promise<void>, options: EnqueueOptions): Promise<void> {
+	/**
+	 * Queue `task`, a backend write, behind the pending ops on `paths`. A task that resolves to `false`
+	 * wrote nothing.
+	 */
+	#enqueuePaths(paths: readonly string[], task: () => Promise<void | false>, options: EnqueueOptions): Promise<void> {
 		const unique = uniquePaths(paths);
 		// Predecessor choice (rJDg): a positional publish with no backend CAS
 		// token (backend.append) chains on the uncaught pending op so it
@@ -623,10 +660,19 @@ export class IndexedSessionStorage implements SessionStorage {
 			path =>
 				(options.abortOnPredecessorFailure ? this.#pathPending.get(path) : this.#pathTails.get(path)) ?? RESOLVED,
 		);
-		const operation = Promise.all(previous).then(task);
+		const operation = Promise.all(previous)
+			.then(task)
+			.then(wrote => {
+				// A write landed: the store accepts writes, so an earlier failure
+				// was not the whole store's.
+				if (wrote !== false) this.#unconfirmedFailure = undefined;
+			});
 		const tracked = operation.catch(err => {
 			const error = toError(err);
-			if (options.trackDrain && !this.#firstDrainError) this.#firstDrainError = error;
+			if (options.trackDrain) {
+				for (const path of unique) if (!this.#drainErrors.has(path)) this.#drainErrors.set(path, error);
+				this.#unconfirmedFailure ??= { error, reportedTo: new Set() };
+			}
 			throw error;
 		});
 		const tail = tracked.catch(() => {});

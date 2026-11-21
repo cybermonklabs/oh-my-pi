@@ -1505,7 +1505,7 @@ export class SessionManager {
 			}
 			let drainError: Error | undefined;
 			try {
-				await this.#storage.drain();
+				await this.#storage.drain(this.#sessionFile);
 			} catch (error) {
 				drainError = toError(error);
 			}
@@ -1577,7 +1577,7 @@ export class SessionManager {
 			if (retryPath) return this.#publishAuthoritativeBody(retryPath, operationError, commitGuard, recoveries + 1);
 			const recoveryErrors = [toError(error)];
 			try {
-				await this.#storage.drain();
+				await this.#storage.drain(target);
 			} catch (drainFailure) {
 				recoveryErrors.push(toError(drainFailure));
 			}
@@ -2966,7 +2966,7 @@ export class SessionManager {
 		// on IndexedSessionStorage during `flushSync`) so callers relying on
 		// flush() see the write durably visible to readers.
 		await this.#scheduleDiskWork(async () => {
-			await this.#storage.drain();
+			await this.#storage.drain(this.#sessionFile);
 		});
 		await this.#pendingArtifactCopy?.done;
 		if (this.#diskFailure) throw this.#diskFailure;
@@ -3311,7 +3311,7 @@ export class SessionManager {
 		// a fire-and-forget publish is still on the wire.
 		await this.#scheduleDiskWork(
 			async () => {
-				await this.#storage.drain();
+				await this.#storage.drain(this.#sessionFile);
 			},
 			{ ignorePriorError: true },
 		);

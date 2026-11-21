@@ -5,6 +5,7 @@
 ### Fixed
 
 - A subagent launched while the session store refuses writes (a full, quota-exceeded or read-only disk, a SQL store that is down or read-only) now starts at once: its transcript stays in memory and is written once the store accepts writes, as the main session's is. A seance fork and a switch to a new session path start the same way. A session whose close the store refused keeps its transcript until a later write lands on the same store. A session whose directory the store refuses to make now starts and warns instead of failing at start
+- On a session store that sessions share, one session's failed write no longer fails another session's flush or close once a later write has landed on the store
 
 ## [18.18.6] - 2026-11-09
 
