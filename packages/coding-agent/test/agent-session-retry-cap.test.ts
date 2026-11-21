@@ -2370,7 +2370,7 @@ describe("AgentSession retry delay cap", () => {
 		expect(last.content).toContainEqual({ type: "text", text: "recovered after sibling account" });
 	});
 
-	it("tries every Codex account before the configured model fallback on cyber-policy denials", async () => {
+	it("sends a cyber-policy refusal to no sibling Codex account and no OpenAI fallback", async () => {
 		const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
 		const fallbackModel = getBundledModel("openai", "gpt-5.5");
 		if (!primaryModel || !fallbackModel) {
@@ -2396,7 +2396,7 @@ describe("AgentSession retry delay cap", () => {
 				if (!apiKey) throw new Error("Expected streamSimple to pass a resolved string API key");
 				requestedKeys.push(apiKey);
 				return new Set(requestedKeys).size >= 4
-					? { content: ["recovered on cyber-approved account"], stopReason: "stop" }
+					? { content: ["answered on another account"], stopReason: "stop" }
 					: CYBER_POLICY_FAILURE;
 			},
 		});
@@ -2418,7 +2418,7 @@ describe("AgentSession retry delay cap", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 0,
+			"retry.maxRetries": 3,
 			"retry.modelFallback": true,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
@@ -2442,21 +2442,13 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Continue authorized security work");
 		await session.waitForIdle();
 
-		expect(requestedModels).toEqual([
-			`${primaryModel.provider}/${primaryModel.id}`,
-			`${primaryModel.provider}/${primaryModel.id}`,
-			`${primaryModel.provider}/${primaryModel.id}`,
-			`${primaryModel.provider}/${primaryModel.id}`,
-		]);
-		expect(requestedKeys).toHaveLength(4);
-		expect([...requestedKeys].sort()).toEqual(["codex-key-A", "codex-key-B", "codex-key-C", "codex-key-D"]);
+		// One request: no sibling account (transport or turn), no same-route retry, and the only
+		// fallback is another OpenAI route.
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		expect(requestedKeys).toHaveLength(1);
 		expect(fallbackEvents).toEqual([]);
-		expect(session.model?.provider).toBe(primaryModel.provider);
-		expect(session.model?.id).toBe(primaryModel.id);
-		expect(lastAssistant(session).content).toContainEqual({
-			type: "text",
-			text: "recovered on cyber-approved account",
-		});
+		expect(session.isRetrying).toBe(false);
+		expect(lastAssistant(session).errorMessage).toContain("code=cyber_policy");
 	});
 
 	it.each([false, true])(
@@ -2499,10 +2491,9 @@ describe("AgentSession retry delay cap", () => {
 					if (sagaAttempts > maxRetries + keys.length + 1) {
 						return { content: ["unexpected retry past account bound"], stopReason: "stop" };
 					}
-					return {
-						stopReason: "error",
-						errorMessage: key === keys[0] ? CYBER_POLICY_ERROR : modelDenial,
-					};
+					// An account-scoped denial on every account (a cyber-policy refusal no longer is one:
+					// it ends the call, see the test above).
+					return { stopReason: "error", errorMessage: modelDenial };
 				},
 			});
 			const fallbackMock = createMockModel({
@@ -2590,7 +2581,7 @@ describe("AgentSession retry delay cap", () => {
 			provider: primaryModel.provider,
 			handler: (_context, options) => {
 				requestedKeys.push(resolveInitialApiKey(options?.apiKey));
-				if (requestedKeys.length === 1) return { stopReason: "error", errorMessage: CYBER_POLICY_ERROR };
+				if (requestedKeys.length === 1) return { stopReason: "error", errorMessage: modelDenial };
 				// The first denied account is about to unblock, but the saga has
 				// already tried both accounts and must not wait to offer it again.
 				const firstRow = rows.find(
@@ -2635,11 +2626,12 @@ describe("AgentSession retry delay cap", () => {
 		expect(lastAssistant(session).errorMessage).toContain(modelDenial);
 	});
 
-	it("tries sibling Codex accounts before advisor model fallback on cyber-policy denials", async () => {
+	it("moves an advisor refused for cyber policy to another family, past every OpenAI account and route", async () => {
 		const mainModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const advisorModel = getBundledModel("openai-codex", "gpt-5.6-sol");
-		const fallbackModel = getBundledModel("openai", "gpt-5.5");
-		if (!mainModel || !advisorModel || !fallbackModel) {
+		const openaiFallback = getBundledModel("openai", "gpt-5.5");
+		const otherFamily = getBundledModel("anthropic", "claude-haiku-4-5");
+		if (!mainModel || !advisorModel || !openaiFallback || !otherFamily) {
 			throw new Error("Expected bundled main, advisor, and fallback test models to exist");
 		}
 
@@ -2651,24 +2643,39 @@ describe("AgentSession retry delay cap", () => {
 			{ type: "api_key", key: "advisor-codex-key-C" },
 		]);
 
-		const mainMock = createMockModel({ responses: [{ content: ["Primary complete"] }] });
+		// Primary reasoning in the batch: a refusal must not be resent with it stripped either.
+		const mainMock = createMockModel({
+			responses: [
+				{ content: [{ type: "thinking", thinking: "Primary reasoning about the change." }, "Primary complete"] },
+			],
+		});
 		const requestedAdvisorKeys: string[] = [];
 		const advisorRecovered = Promise.withResolvers<void>();
-		const advisorMock = createMockModel({
-			id: advisorModel.id,
-			provider: advisorModel.provider,
-			handler: (_context, options) => {
-				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
-				if (!apiKey) throw new Error("Expected advisor streamSimple to pass a resolved string API key");
-				requestedAdvisorKeys.push(apiKey);
-				if (new Set(requestedAdvisorKeys).size < 3) return CYBER_POLICY_FAILURE;
+		const refusingMock = (model: Model) =>
+			createMockModel({
+				id: model.id,
+				provider: model.provider,
+				handler: (_context, options) => {
+					const apiKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
+					if (!apiKey) throw new Error("Expected advisor streamSimple to pass a resolved string API key");
+					requestedAdvisorKeys.push(apiKey);
+					return CYBER_POLICY_FAILURE;
+				},
+			});
+		const advisorMock = refusingMock(advisorModel);
+		const openaiMock = refusingMock(openaiFallback);
+		const otherFamilyMock = createMockModel({
+			id: otherFamily.id,
+			provider: otherFamily.provider,
+			handler: () => {
 				advisorRecovered.resolve();
-				return { content: ["Advisor recovered on cyber-approved account"], stopReason: "stop" };
+				return { content: ["Advisor answered from another family"], stopReason: "stop" };
 			},
 		});
 		const requestedAdvisorModels: string[] = [];
 		const advisorSelector = `${advisorModel.provider}/${advisorModel.id}`;
-		const fallbackSelector = `${fallbackModel.provider}/${fallbackModel.id}`;
+		const openaiSelector = `${openaiFallback.provider}/${openaiFallback.id}`;
+		const otherFamilySelector = `${otherFamily.provider}/${otherFamily.id}`;
 		const agent = new Agent({
 			getApiKey: model => `${model.provider}-test-key`,
 			initialState: {
@@ -2686,7 +2693,7 @@ describe("AgentSession retry delay cap", () => {
 			"retry.maxRetries": 0,
 			"retry.modelFallback": true,
 			"retry.fallbackChains": {
-				[advisorSelector]: [fallbackSelector],
+				[advisorSelector]: [openaiSelector, otherFamilySelector],
 			},
 		});
 		settings.setModelRole("default", `${mainModel.provider}/${mainModel.id}`);
@@ -2700,8 +2707,15 @@ describe("AgentSession retry delay cap", () => {
 			advisorTools: [],
 			advisorConfigs: [{ name: "cyber-policy", model: advisorSelector }],
 			advisorStreamFn: (requestedModel, context, options) => {
-				requestedAdvisorModels.push(`${requestedModel.provider}/${requestedModel.id}`);
-				return aiStream.streamSimple(advisorMock.model, context, options);
+				const requested = `${requestedModel.provider}/${requestedModel.id}`;
+				requestedAdvisorModels.push(requested);
+				const mock =
+					requested === advisorSelector
+						? advisorMock
+						: requested === openaiSelector
+							? openaiMock
+							: otherFamilyMock;
+				return aiStream.streamSimple(mock.model, context, options);
 			},
 		});
 
@@ -2715,16 +2729,14 @@ describe("AgentSession retry delay cap", () => {
 		await advisorRecovered.promise;
 		await session.waitForIdle();
 
-		expect(requestedAdvisorModels).toEqual([advisorSelector, advisorSelector, advisorSelector]);
-		expect([...requestedAdvisorKeys].sort()).toEqual([
-			"advisor-codex-key-A",
-			"advisor-codex-key-B",
-			"advisor-codex-key-C",
-		]);
-		expect(fallbackEvents).toEqual([]);
+		expect(requestedAdvisorModels).toEqual([advisorSelector, otherFamilySelector]);
+		// One Codex account received the batch (selection picks which); no sibling and no OpenAI fallback did.
+		expect(requestedAdvisorKeys).toHaveLength(1);
+		expect(requestedAdvisorKeys[0]).toStartWith("advisor-codex-key-");
+		expect(fallbackEvents).toEqual([expect.objectContaining({ to: otherFamilySelector })]);
 		expect(session.getAdvisorAgent()?.state.model).toMatchObject({
-			provider: advisorModel.provider,
-			id: advisorModel.id,
+			provider: otherFamily.provider,
+			id: otherFamily.id,
 		});
 	});
 

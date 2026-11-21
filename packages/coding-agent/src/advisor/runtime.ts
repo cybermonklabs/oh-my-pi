@@ -1449,9 +1449,13 @@ export class AdvisorRuntime {
 					if (classifierRefusal) {
 						// Stripping only recovers when it changes what was sent: a batch
 						// without primary reasoning would be resent byte-for-byte and
-						// refused again, so it goes straight to the model fallback.
+						// refused again, so it goes straight to the model fallback. A
+						// cyber-policy refusal is never resent to the model that refused it,
+						// stripped or not: each copy adds a refusal to the organization's record.
 						const strippingChangesBatch =
-							this.#includeThinking && this.#renderPreparedDelta(preparedMessages, wip, false) !== renderBatch();
+							!AIError.isCyberPolicyRefusal(terminalFailure ?? err) &&
+							this.#includeThinking &&
+							this.#renderPreparedDelta(preparedMessages, wip, false) !== renderBatch();
 						this.#includeThinking = false;
 						if (strippingChangesBatch) {
 							// Do NOT advance #seenContext here: the requeued batch is

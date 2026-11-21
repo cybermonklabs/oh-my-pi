@@ -2875,6 +2875,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isRetryFallbackSelectorSuppressed: selector => this.#recovery.isRetryFallbackSelectorSuppressed(selector),
 			noteRetryFallbackCooldown: (selector, retryAfterMs, errorMessage) =>
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
+			recordCyberPolicyRefusal: (message, model) => this.#recovery.recordCyberPolicyRefusal(message, model),
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
 			sessionId: () => this.sessionId,
 			restrictOAuthAccounts: providerSessionId => this.#accountPoolScope?.restrict(providerSessionId),
@@ -5182,6 +5183,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// replayed. Visible/side-effecting output then remains terminal while its
 			// credential is still blocked or rotated exactly once.
 			await this.#recovery.recordUsageLimitOutcome(msg);
+			// A cyber-policy refusal closes every OpenAI route to the fallback walk for the rest of this
+			// prompt, before any recovery below can pick one.
+			this.#recovery.recordCyberPolicyRefusal(msg);
 
 			let compactionResult = COMPACTION_CHECK_NONE;
 			let checkedCompaction = false;

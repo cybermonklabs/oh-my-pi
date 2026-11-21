@@ -1083,8 +1083,7 @@ function isRetryableUpstreamError(
 	if (AIError.isAuthRetryableError(error)) return true;
 	// 401 means the credential is bad; 403 is its valid-token twin (access
 	// denied by plan, model policy, or org restriction — a sibling account may
-	// not share it). Explicit account-scoped policy errors such as Codex
-	// `cyber_policy` are likewise rotatable. The exact ChatGPT-account model
+	// not share it). The exact ChatGPT-account model
 	// denial is rotatable only when its provider and requested model match.
 	// Usage-limit phrasing (Codex's
 	// "You have hit your ChatGPT usage limit", Anthropic's "usage_limit_reached",

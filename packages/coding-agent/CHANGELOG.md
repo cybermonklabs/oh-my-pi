@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- After an OpenAI `cyber_policy` refusal the session no longer sends the request again: it does not retry the model or rotate its accounts, and for the rest of the prompt the fallback walk, the usage-aware switch, the primary restore and the advisor's walk pass over every route to an OpenAI model, whichever provider serves it; a fallback of another family may still take the turn. An advisor refused this way is not re-sent its batch with the primary's reasoning stripped
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

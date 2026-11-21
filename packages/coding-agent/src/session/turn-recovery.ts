@@ -404,6 +404,12 @@ export class TurnRecovery {
 	readonly #refusalWalkTried = new Set<string>();
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
 	readonly #accountPolicyRotationsRemaining = new Map<string, number>();
+	/**
+	 * Routes a `cyber_policy` refusal closed for the rest of its prompt (`promptSequence`): every
+	 * route to an OpenAI model, and the refusing route's own provider when the catalog cannot classify
+	 * its model. Every fallback search passes over them through `isRetryFallbackSelectorSuppressed`.
+	 */
+	#cyberRefusalClosed: { promptSequence: number; routes: Set<string> } | undefined;
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
@@ -1893,9 +1899,38 @@ export class TurnRecovery {
 		this.#fallbackRoutedFor = undefined;
 	}
 
-	/** Checks whether a fallback selector remains in cooldown. */
+	/**
+	 * Checks whether a fallback selector is passed over: in cooldown, or a route a `cyber_policy`
+	 * refusal closed for the rest of this prompt.
+	 */
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean {
-		return this.#host.modelRegistry.isSelectorSuppressed(selector.raw);
+		if (this.#host.modelRegistry.isSelectorSuppressed(selector.raw)) return true;
+		const closed = this.#cyberRefusalClosed;
+		if (!closed || closed.promptSequence !== this.#host.promptSequence()) return false;
+		const model =
+			resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings).model ??
+			this.#host.modelRegistry.find(selector.provider, selector.id);
+		return (
+			closed.routes.has(`provider:${model?.provider ?? selector.provider}`) ||
+			(!!model && closed.routes.has(model.identity.class))
+		);
+	}
+
+	/**
+	 * Records an OpenAI `cyber_policy` refusal (a failed assistant message or a thrown error) of
+	 * `model`'s request. The refusal judges the request's content, and every copy sent again to OpenAI
+	 * adds a refusal to the organization's record, so the call is not retried (the error is not
+	 * retryable) and, for the rest of this prompt, no fallback search picks a route to an OpenAI
+	 * model, whichever provider serves it. A model of another family may still take the turn.
+	 */
+	recordCyberPolicyRefusal(failure: unknown, model: Model | undefined = this.#host.model()): void {
+		if (!AIError.isCyberPolicyRefusal(failure)) return;
+		const promptSequence = this.#host.promptSequence();
+		if (this.#cyberRefusalClosed?.promptSequence !== promptSequence) {
+			// `cyber_policy` is OpenAI's refusal code: whatever route carried it, OpenAI refused it.
+			this.#cyberRefusalClosed = { promptSequence, routes: new Set(["openai"]) };
+		}
+		if (model?.identity.class === "unknown") this.#cyberRefusalClosed.routes.add(`provider:${model.provider}`);
 	}
 
 	/** Records the cooldown that should suppress a failing selector. */

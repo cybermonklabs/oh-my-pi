@@ -528,6 +528,8 @@ export interface SessionAdvisorsHost {
 	): RetryFallbackSelector[];
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean;
 	noteRetryFallbackCooldown(currentSelector: string, retryAfterMs: number | undefined, errorMessage: string): void;
+	/** Closes every OpenAI route to the fallback walk for the rest of the prompt after a `cyber_policy` refusal. */
+	recordCyberPolicyRefusal(failure: unknown, model: Model): void;
 	createCodexCompactionContext(options: {
 		trigger: CodexCompactionContext["trigger"];
 		reason: CodexCompactionContext["reason"];
@@ -2116,6 +2118,9 @@ export class SessionAdvisors {
 		if (overflowVeto) {
 			return false;
 		}
+		// A cyber-policy refusal closes every OpenAI route to the walk below (and the main agent's) for
+		// the rest of the prompt; it is not an account policy, so no credential rotation either.
+		this.#host.recordCyberPolicyRefusal(assistantFailure ?? error, currentModel);
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
