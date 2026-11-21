@@ -69,10 +69,12 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_read(cx, buf))
 	}
 
-	/// Write to fd `fd` of the calling vproc (possibly partially).
+	/// Write to fd `fd` of the calling vproc (possibly partially), with its
+	/// key ([`Vproc::write_key`]).
 	pub fn write(&mut self, fd: i32, bytes: &[u8]) -> IoPoll<usize> {
 		let h = self.vproc().fds.handle(fd);
-		self.io(|cx| h.poll_write(cx, bytes))
+		let key = std::sync::Arc::clone(&self.vproc().write_key);
+		self.io(|cx| h.poll_write_keyed(cx, bytes, &mut key.lock()))
 	}
 
 	/// A variable as the calling vproc sees it. A store failure reads as

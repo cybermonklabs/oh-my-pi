@@ -121,7 +121,16 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+	/// The key this vproc writes with ([`crate::sys::WaitKey`]): an object
+	/// that several writers write at once (a zsh multios tee, a provider
+	/// file) keeps each writer's progress by it. Every vproc has its own: a
+	/// subshell gets a new one, never its parent's. Never serialized.
+	pub write_key:     WriteKey,
 }
+
+/// [`Vproc::write_key`], behind an `Arc` so a write site can hold it while
+/// it borrows other parts of the vproc; never shared with another vproc.
+pub type WriteKey = Arc<parking_lot::Mutex<crate::sys::WaitKey>>;
 
 /// The terminal of the session a vproc runs in when it is not the shell's
 /// ([`VprocZsh::ctty`]).
@@ -1754,8 +1763,10 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B. Each vproc's write key (`Vproc::write_key`, 8 B and
+// one allocation): the bench measured 1,840 B per idle vproc before it and
+// 1,912 B with it.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

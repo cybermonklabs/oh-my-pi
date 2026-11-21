@@ -1677,9 +1677,10 @@ pub(crate) mod tests {
 			}
 			flag.wait("writer woken once space freed up");
 			drop(writer);
-			// End of file can come a moment after `writer` is dropped (seen
-			// in multi-threaded runs, on runc and under gVisor); it comes with
-			// the hangup, which wakes the reader. Counted in wakes, not time.
+			// End of file can come a moment after `writer` is dropped: a child
+			// that another thread is forking holds a copy of the write end
+			// until it execs. It comes with the hangup, which wakes the
+			// reader. Counted in wakes, not time.
 			let mut wakes = 0;
 			loop {
 				match reader.poll_read(&mut cx, &mut buf) {

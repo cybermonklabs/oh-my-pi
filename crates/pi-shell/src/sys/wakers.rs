@@ -388,6 +388,68 @@ mod tests {
 		assert_eq!(wakers.room(), 0, "the last key gives all the room back");
 	}
 
+	// Failure mode (review of #111 at bd60965e): no test failed when giving
+	// room back freed a slot whose key still waited, since one key stayed
+	// and a plant that freed the first waiting slot rarely picked it. Here
+	// 100 of 10,000 keys stay, taken from all through the set, in 8 rounds
+	// of 9,900 other keys that come and go in a random order. After each
+	// round the set holds the 100, each with its id, and one fire wakes each
+	// once.
+	#[test]
+	fn keys_that_stay_keep_their_waits_as_the_set_gives_back_room() {
+		let wakers = Arc::new(Wakers::default());
+		let mut stays = live(100);
+		for (round, seed) in [
+			0xbb67_ae85_84ca_a73b_u64,
+			0x3c6e_f372_fe94_f82b,
+			0xa54f_f53a_5f1d_36f1,
+			0x510e_527f_ade6_82d1,
+			0x9b05_688c_2b3e_6c1f,
+			0x1f83_d9ab_fb41_bd6b,
+			0x5be0_cd19_137e_2179,
+			0xcbbb_9d5d_c105_9ed8,
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let mut others = live(9_900);
+			// The 100 wait between the others, so their slots are all
+			// through the set.
+			for (i, t) in others.iter_mut().enumerate() {
+				if i % 99 == 0 && i / 99 < 100 {
+					let s = &mut stays[i / 99];
+					wakers.wait(&mut s.key, &s.waker);
+				}
+				wakers.wait(&mut t.key, &t.waker);
+			}
+			let ids: Vec<u64> = stays
+				.iter()
+				.map(|s| s.key.id_in(&wakers).unwrap())
+				.collect();
+			let room = wakers.room();
+			assert!(room >= 10_000, "round {round}: room for {room} slots");
+			for i in shuffled(others.len(), seed) {
+				others[i].key = WaitKey::default();
+			}
+			assert!(wakers.room() < room / 8, "round {round}: no room given back ({room} slots)");
+			assert_eq!((wakers.held(), wakers.keys()), (100, 100), "round {round}");
+			for (s, id) in stays.iter().zip(&ids) {
+				assert_eq!(
+					s.key.id_in(&wakers),
+					Some(*id),
+					"round {round}: a key that stays lost its id"
+				);
+			}
+			Waker::from(Arc::clone(&wakers)).wake();
+			let wakes: Vec<usize> = stays.iter().map(|s| s.task.wakes()).collect();
+			assert!(wakes.iter().all(|&w| w == round + 1), "round {round}: wakes {wakes:?}");
+			assert!(
+				others.iter().all(|t| t.task.wakes() == 0),
+				"round {round}: a dropped key was woken"
+			);
+		}
+	}
+
 	// Failure mode: a task that polls again takes a second slot, and the
 	// set grows with every poll of a live task.
 	#[test]

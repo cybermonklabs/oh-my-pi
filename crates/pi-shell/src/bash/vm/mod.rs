@@ -2816,6 +2816,8 @@ impl Vproc {
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,
+			// A key of its own, a subshell's too (`child_running`).
+			write_key: proc::WriteKey::default(),
 		}
 	}
 

@@ -453,8 +453,9 @@ fn write_all(
 		_ => 0,
 	};
 	let h = vp.fds.handle(fd);
+	let mut key = vp.write_key.lock();
 	while done < data.len() {
-		match h.poll_write(tcx, &data[done..]) {
+		match h.poll_write_keyed(tcx, &data[done..], &mut key) {
 			Poll::Ready(Ok(0)) => {
 				sc.live = Live::None;
 				let e = io::Error::from(io::ErrorKind::WriteZero);

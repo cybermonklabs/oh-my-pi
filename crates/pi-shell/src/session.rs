@@ -1996,53 +1996,78 @@ mod tests {
 		);
 	}
 
+	/// Bytes the first writer of [`two_writers_finish`] writes: it fills
+	/// the pipe and waits.
+	const EXTRA: usize = 1 << 20;
+	/// Bytes the second writer writes.
+	const BUILTIN: usize = 1 << 17;
+
 	/// Run `{background}`, then `read -r go; printf '%0{BUILTIN}d' 0; wait`,
 	/// where `background` starts an extra writing `EXTRA` NULs to stdout
-	/// (`{EXTRA}` in it is replaced): the reader lets the extra fill the pipe
-	/// and wait, then `printf` wait, then drains it. Both must finish within
-	/// [`STUCK`].
+	/// (`{EXTRA}` in it is replaced). See [`two_writers_finish`].
 	fn extra_and_builtin_both_finish(background: &str, events: bool) {
+		two_writers_finish(
+			&format!("{background}\nread -r go; printf '%0{{BUILTIN}}d' 0; wait"),
+			events,
+			&[(0, EXTRA), (b'0', BUILTIN)],
+		);
+	}
+
+	/// Run `command` (`{EXTRA}` and `{BUILTIN}` in it are replaced): a first
+	/// writer fills the run's stdout and waits for room, `read -r go` lets a
+	/// second one start, and it waits too; then a reader drains the pipe a
+	/// chunk at a time. The run must finish within [`STUCK`] with status 0
+	/// and stdout must hold exactly `expect` (byte, count).
+	fn two_writers_finish(command: &str, events: bool, expect: &[(u8, usize)]) {
 		use std::{io::Write, os::fd::AsRawFd, sync::atomic::AtomicUsize};
-		const EXTRA: usize = 1 << 20;
-		const BUILTIN: usize = 1 << 17;
-		let background = background.replace("{EXTRA}", &EXTRA.to_string());
-		let command = format!("{background}\nread -r go; printf '%0{BUILTIN}d' 0; wait");
+		let command = command
+			.replace("{EXTRA}", &EXTRA.to_string())
+			.replace("{BUILTIN}", &BUILTIN.to_string());
 		let (mut out_r, out_w) = io::pipe().unwrap();
 		let (in_r, mut in_w) = io::pipe().unwrap();
 		let out_w = std::fs::File::from(std::os::fd::OwnedFd::from(out_w));
 		let fd = out_w.as_raw_fd();
 		let waited = crate::sys::pending_polls(fd);
-		// Bytes read so far: the extra's NULs and printf's '0's; how far the
-		// reader got; whether the test gave up.
-		let read = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+		// How many of each byte the reader read; how far it got; whether the
+		// test gave up.
+		let read: Arc<Vec<AtomicUsize>> = Arc::new((0..256).map(|_| AtomicUsize::new(0)).collect());
 		let stage = Arc::new(AtomicU8::new(0));
 		let given_up = Arc::new(AtomicBool::new(false));
 		let reader = {
 			let (read, stage, given_up) =
 				(Arc::clone(&read), Arc::clone(&stage), Arc::clone(&given_up));
 			std::thread::spawn(move || {
-				// The extra filled the pipe and waits for room.
+				// The first writer filled the pipe and waits for room.
 				if !until(|| crate::sys::pending_polls(fd) > waited, &given_up) {
 					return;
 				}
 				stage.store(1, Ordering::SeqCst);
 				in_w.write_all(b"go\n").unwrap();
-				// printf waits for room too, on the same file.
+				// The second waits for room too, on the same file.
 				if !until(|| crate::sys::pending_polls(fd) > waited + 1, &given_up) {
 					return;
 				}
 				stage.store(2, Ordering::SeqCst);
-				let mut buf = vec![0u8; 1 << 16];
+				// A slow reader, 4 KiB at a time, so both writers keep
+				// waiting for room while it drains.
+				let mut buf = vec![0u8; 4 << 10];
 				loop {
 					let n = out_r.read(&mut buf).unwrap();
 					if n == 0 {
 						break;
 					}
 					for &b in &buf[..n] {
-						read[usize::from(b != 0)].fetch_add(1, Ordering::SeqCst);
+						read[usize::from(b)].fetch_add(1, Ordering::SeqCst);
 					}
+					std::thread::sleep(Duration::from_micros(500));
 				}
 			})
+		};
+		let counts = |read: &[AtomicUsize]| -> Vec<(u8, usize)> {
+			(0..=255u8)
+				.map(|b| (b, read[usize::from(b)].load(Ordering::SeqCst)))
+				.filter(|&(_, n)| n > 0)
+				.collect()
 		};
 		let runtime = own_runtime();
 		let ended = runtime.block_on(async {
@@ -2062,24 +2087,60 @@ mod tests {
 		let Ok(outcome) = ended else {
 			given_up.store(true, Ordering::SeqCst);
 			let reached = [
-				"the extra never waited for room on stdout",
-				"printf never waited for room on stdout",
+				"the first writer never waited for room on stdout",
+				"the second writer never waited for room on stdout",
 				"both waited and the reader drained the pipe",
 			][usize::from(stage.load(Ordering::SeqCst))];
-			let (nuls, zeros) = (read[0].load(Ordering::SeqCst), read[1].load(Ordering::SeqCst));
-			// The stuck extra's thread waits forever: leave it.
+			let got = counts(&read);
+			// A stuck extra's thread waits forever: leave it.
 			runtime.shutdown_background();
 			panic!(
-				"the run never ended ({reached}): the native extra of `{background}` wrote {nuls} of \
-				 its {EXTRA} bytes and printf {zeros} of its {BUILTIN}; the extra's wait for room on \
-				 stdout was never woken"
+				"the run never ended ({reached}): stdout held (byte, count) {got:?} of {expect:?} \
+				 from `{command}`"
 			);
 		};
 		assert_eq!(outcome.unwrap().status, 0);
 		reader.join().unwrap();
-		assert_eq!(
-			(read[0].load(Ordering::SeqCst), read[1].load(Ordering::SeqCst)),
-			(EXTRA, BUILTIN)
+		assert_eq!(counts(&read), expect, "stdout (byte, count) from `{command}`");
+	}
+
+	// Failure mode (review of #111 at bd60965e): a zsh multios tee kept one
+	// progress for all its writers. An extra and `printf` writing through
+	// one tee to a slow reader used each other's progress: stdout held
+	// 229,376 to 901,120 NULs and 425,984 to 3,309,568 '0's, and the run
+	// ended with status 0.
+	#[test]
+	fn an_extra_and_a_builtin_through_one_multios_tee_write_their_bytes_once() {
+		two_writers_finish(
+			"emulate zsh -c '{ head -c {EXTRA} /dev/zero & read -r go; printf %0{BUILTIN}d 0; wait; \
+			 } >&1 >/dev/null'",
+			true,
+			&[(0, EXTRA), (b'0', BUILTIN)],
+		);
+	}
+
+	// Failure mode (review of #111 at bd60965e): two vprocs writing through
+	// one tee wrote as one writer, the engine, and used each other's
+	// progress. Each vproc writes with its own key.
+	#[test]
+	fn two_builtins_through_one_multios_tee_write_their_bytes_once() {
+		two_writers_finish(
+			"emulate zsh -c '{ printf %{EXTRA}s \"\" & read -r go; printf %0{BUILTIN}d 0; wait; } \
+			 >&1 >/dev/null'",
+			true,
+			&[(b' ', EXTRA), (b'0', BUILTIN)],
+		);
+	}
+
+	// Failure mode: the same with the same bytes from both vprocs. Writers
+	// told apart by their bytes would take one write for the other.
+	#[test]
+	fn two_builtins_writing_the_same_bytes_through_one_tee_write_them_once_each() {
+		two_writers_finish(
+			"emulate zsh -c '{ printf %0{EXTRA}d 0 & read -r go; printf %0{BUILTIN}d 0; wait; } >&1 \
+			 >/dev/null'",
+			true,
+			&[(b'0', EXTRA + BUILTIN)],
 		);
 	}
 

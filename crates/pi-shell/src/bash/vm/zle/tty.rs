@@ -41,10 +41,14 @@ pub struct Tty {
 	/// `$TERM` they belong to.
 	pub caps:
 		Option<(bstr::BString, std::sync::Arc<crate::bash::vm::builtins::zsh_prompt::TermCaps>)>,
+	/// The key the editor's display writes use ([`crate::sys::WaitKey`]),
+	/// as each vproc's writes use its own: a subshell's copy gets a new one.
+	pub key:     crate::sys::WaitKey,
 }
 
 impl Clone for Tty {
-	/// A subshell's copy: the same terminal, nothing pending.
+	/// A subshell's copy: the same terminal, nothing pending, a key of its
+	/// own.
 	fn clone(&self) -> Self {
 		Self {
 			file:    self.file.clone(),
@@ -54,6 +58,7 @@ impl Clone for Tty {
 			fetch:   self.fetch,
 			size:    self.size,
 			caps:    self.caps.clone(),
+			key:     crate::sys::WaitKey::default(),
 		}
 	}
 }
@@ -71,6 +76,7 @@ impl Tty {
 			fetch: false,
 			size: (80, 24),
 			caps: None,
+			key: crate::sys::WaitKey::default(),
 		})
 	}
 
@@ -157,13 +163,17 @@ impl Tty {
 		self.out.extend_from_slice(bytes);
 	}
 
-	/// Write what is queued; the wait key while the terminal will not
-	/// take more. A write error drops the bytes (zsh ignores them too).
+	/// Write what is queued, with the editor's key; the wait key while the
+	/// terminal will not take more. A write error drops the bytes (zsh
+	/// ignores them too).
 	pub fn flush(&mut self, k: &Kernel) -> Option<WaitKey> {
 		let mut tcx = Context::from_waker(&k.waker);
 		let mut off = 0;
 		while off < self.out.len() {
-			match self.file.poll_write(&mut tcx, &self.out[off..]) {
+			match self
+				.file
+				.poll_write_keyed(&mut tcx, &self.out[off..], &mut self.key)
+			{
 				Poll::Ready(Ok(n)) if n > 0 => off += n,
 				Poll::Ready(_) => {
 					off = self.out.len();
@@ -230,6 +240,7 @@ mod tests {
 			fetch:   false,
 			size:    (80, 24),
 			caps:    None,
+			key:     crate::sys::WaitKey::default(),
 		};
 		let editor = Arc::new(Flag::default());
 		let waker = Waker::from(Arc::clone(&editor));

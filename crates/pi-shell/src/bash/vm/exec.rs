@@ -832,6 +832,8 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// on a diagnostic stream are dropped, as bash does.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
+	let key = std::sync::Arc::clone(&vp.write_key);
+	let mut key = key.lock();
 	// The editor's display bytes still pending were queued before anything
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
 	// terminal gets them first, as zsh's blocking writes order them.
@@ -854,7 +856,11 @@ pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 			// No editor any more: its fallback, standard error.
 			w.fd = 2;
 		}
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
+		match vp
+			.fds
+			.handle(w.fd)
+			.poll_write_keyed(&mut cx, &w.bytes[w.off..], &mut key)
+		{
 			Poll::Ready(Ok(n)) if n > 0 => {
 				w.off += n;
 				if w.off >= w.bytes.len() {

@@ -14,6 +14,7 @@
 //! 1992-1997 Paul Falstad and the zsh development group).
 
 use std::{
+	collections::HashMap,
 	sync::Arc,
 	task::{Context, Poll},
 };
@@ -892,7 +893,7 @@ fn place(vp: &mut Vproc, fd: i32, h: FdRef, output: bool, multios: bool) -> Resu
 	fds.push(h);
 	let all = fds.clone();
 	let merged: Box<dyn File> = if output {
-		Box::new(Tee { done: vec![0; all.len()], targets: all })
+		Box::new(Tee::new(all))
 	} else {
 		Box::new(Cat { sources: all, at: 0 })
 	};
@@ -1218,28 +1219,61 @@ fn zsh_close(
 /// zsh's multio tee (`closemn` for output): every write goes to each
 /// target in turn; a target that is gone (closed, failed) is skipped. A
 /// write that cannot finish keeps how far each target got, for the
-/// caller's retry of the same bytes. A task writing with a key of its own
-/// (a native extra) waits on each target with a sub key of it: a key waits
-/// on one thing at a time.
+/// writer's retry of the same bytes. Several writers can each have a write
+/// under way (a native extra and a builtin, two vprocs), so that is kept per
+/// writer, by its key ([`crate::sys::WaitKey`]). A writer with a key waits
+/// on each target with a sub key of it: a key waits on one thing at a time.
 struct Tee {
 	targets: Vec<FdRef>,
-	done:    Vec<usize>,
+	/// How far each target got with the write a writer has under way, by
+	/// the writer's id in `writers`.
+	done:    HashMap<u64, Vec<usize>>,
+	/// Names the writers: each key's id here (nothing fires this set).
+	writers: Arc<crate::sys::Wakers>,
+	/// The key of keyless writes.
+	own:     crate::sys::WaitKey,
 }
 
 impl Tee {
+	fn new(targets: Vec<FdRef>) -> Self {
+		Self {
+			targets,
+			done: HashMap::new(),
+			writers: Arc::default(),
+			own: crate::sys::WaitKey::default(),
+		}
+	}
+
 	fn write(
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
-		mut key: Option<&mut crate::sys::WaitKey>,
+		key: Option<&mut crate::sys::WaitKey>,
 	) -> Poll<std::io::Result<usize>> {
-		self.done.resize(self.targets.len(), 0);
+		let keyed = key.is_some();
+		let key = match key {
+			Some(key) => key,
+			None => &mut self.own,
+		};
+		self.writers.wait(key, cx.waker());
+		let me = key
+			.id_in(&self.writers)
+			.expect("a key that waits here has an id here");
+		// A writer whose key is gone (dropped with its task) left its write.
+		let writers = &self.writers;
+		self.done.retain(|id, _| *id == me || writers.holds(*id));
+		let targets = &self.targets;
+		let done = self
+			.done
+			.entry(me)
+			.or_insert_with(|| vec![0; targets.len()]);
 		let mut pending = false;
-		for (i, (t, done)) in self.targets.iter().zip(&mut self.done).enumerate() {
+		for (i, (t, done)) in targets.iter().zip(done.iter_mut()).enumerate() {
 			while *done < buf.len() {
-				let polled = match key.as_deref_mut() {
-					Some(key) => t.poll_write_keyed(cx, &buf[*done..], key.sub(i)),
-					None => t.poll_write(cx, &buf[*done..]),
+				let polled = if keyed {
+					t.poll_write_keyed(cx, &buf[*done..], key.sub(i))
+				} else {
+					t.poll_write(cx, &buf[*done..])
 				};
 				match polled {
 					Poll::Ready(Ok(n)) if n > 0 => *done += n,
@@ -1254,7 +1288,7 @@ impl Tee {
 		if pending {
 			return Poll::Pending;
 		}
-		self.done.fill(0);
+		self.done.remove(&me);
 		Poll::Ready(Ok(buf.len()))
 	}
 }
@@ -1300,7 +1334,7 @@ impl File for Tee {
 	}
 
 	fn dup(&self) -> std::io::Result<Box<dyn File>> {
-		Ok(Box::new(Self { targets: self.targets.clone(), done: Vec::new() }))
+		Ok(Box::new(Self::new(self.targets.clone())))
 	}
 }
 
@@ -1470,7 +1504,7 @@ mod tests {
 		let FullFifo { writer: a, reader: mut drain_a } = FullFifo::new();
 		let FullFifo { writer: b, reader: mut drain_b } = FullFifo::new();
 		let (a, b) = (fd(a), fd(b));
-		let mut tee = Tee { targets: vec![a.clone(), b], done: vec![0; 2] };
+		let mut tee = Tee::new(vec![a.clone(), b]);
 		let (extra, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
 		let mut key = WaitKey::default();
 		let (xw, ew) = (cx(&extra), cx(&engine));
@@ -1500,6 +1534,48 @@ mod tests {
 			tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key),
 			Poll::Ready(Ok(1))
 		));
+	}
+
+	// Failure mode (review of #111 at bd60965e): a tee kept one progress for
+	// all its writers. An extra's write stopped after the 10 bytes its target
+	// had room for; the engine's write went on from byte 10, and its end reset
+	// the progress, so the extra wrote all its bytes again: 110 `A`s and 90
+	// `B`s. Each writer keeps its own progress, keyed (the extra) or not.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a few hundred bytes; no bytecount dependency")]
+	fn two_writers_on_one_tee_keep_their_own_progress() {
+		use crate::bash::mem::{PIPE_CAPACITY, pipe};
+		fn drain(r: &mut crate::bash::mem::PipeReader, out: &mut Vec<u8>) {
+			let mut buf = vec![0u8; PIPE_CAPACITY];
+			while let Poll::Ready(Ok(n)) =
+				r.poll_read(&mut Context::from_waker(Waker::noop()), &mut buf)
+			{
+				if n == 0 {
+					break;
+				}
+				out.extend_from_slice(&buf[..n]);
+			}
+		}
+		let noop = &mut Context::from_waker(Waker::noop());
+		let (mut r, mut w) = pipe();
+		let fill = vec![b'.'; PIPE_CAPACITY - 10];
+		assert!(matches!(w.poll_write(noop, &fill), Poll::Ready(Ok(n)) if n == fill.len()));
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(w))]);
+		let mut key = WaitKey::default();
+		let (a, b) = ([b'A'; 100], [b'B'; 100]);
+		assert!(tee.poll_write_keyed(noop, &a, None, &mut key).is_pending(), "10 of 100 fit");
+		// The reader empties the pipe; the engine's write comes first.
+		let mut out = Vec::new();
+		drain(&mut r, &mut out);
+		assert!(matches!(tee.poll_write(noop, &b), Poll::Ready(Ok(100))), "the engine's write");
+		assert!(
+			matches!(tee.poll_write_keyed(noop, &a, None, &mut key), Poll::Ready(Ok(100))),
+			"the extra's write"
+		);
+		drop(tee);
+		drain(&mut r, &mut out);
+		let count = |c: u8| out.iter().filter(|&&b| b == c).count();
+		assert_eq!((count(b'.'), count(b'A'), count(b'B')), (fill.len(), 100, 100));
 	}
 
 	// Failure mode: a native extra reading through a zsh multios cat waited
