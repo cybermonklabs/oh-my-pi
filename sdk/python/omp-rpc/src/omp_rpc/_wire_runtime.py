@@ -27,20 +27,42 @@ class UnknownNotification:
     parse_error: str | None = field(default=None, kw_only=True)
 
 
-def decode_json(value: object, path: str) -> JsonValue:
-    """Deep-copies a JSON value, rejecting anything JSON cannot represent."""
+def _json_shell(value: object, path: str, pending: list[tuple[object, object]]) -> JsonValue:
+    """`value` when it is a JSON scalar, else an empty container of its kind, queued in `pending` with it."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return cast(JsonValue, value)
+    copy: JsonValue
     if isinstance(value, list):
-        return [decode_json(item, path) for item in value]
-    if isinstance(value, dict):
-        cloned: JsonObject = {}
-        for key, item in value.items():
+        copy = []
+    elif isinstance(value, dict):
+        copy = {}
+    else:
+        raise ValueError(f"{path} must be JSON-serializable")
+    pending.append((value, copy))
+    return copy
+
+
+def decode_json(value: object, path: str) -> JsonValue:
+    """Deep-copies a JSON value, rejecting anything JSON cannot represent.
+
+    Walks with a stack of its own, not recursion, so a value of any depth
+    copies: `get_tree` nests each session entry two levels under its parent.
+    """
+    pending: list[tuple[object, object]] = []
+    copy = _json_shell(value, path, pending)
+    while pending:
+        source, target = pending.pop()
+        if isinstance(source, list):
+            items = cast(list[JsonValue], target)
+            for item in source:
+                items.append(_json_shell(item, path, pending))
+            continue
+        members = cast(JsonObject, target)
+        for key, item in cast(dict[object, object], source).items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} must contain string keys")
-            cloned[key] = decode_json(item, path)
-        return cloned
-    raise ValueError(f"{path} must be JSON-serializable")
+            members[key] = _json_shell(item, path, pending)
+    return copy
 
 
 def decode_json_object(value: object, path: str) -> JsonObject:
