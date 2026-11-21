@@ -321,30 +321,43 @@ async fn wide_trees_agree_on_every_worker_count() {
 /// Ending the walk with one stop message per worker left such a worker
 /// waiting forever, and its walk with it. The machine's CPU count caps the
 /// walk's workers and the runtime's threads, and with them the test's power:
-/// against the old stop it hung on 8 and 16 CPUs and never on 4.
+/// against the old stop it hung on 8 and 16 CPUs, and was not seen in 5 runs
+/// on 4.
 #[tokio::test(flavor = "multi_thread")]
 async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
 	let tmp = make_tree("ends", &["a.txt", "d1/x", "d2/y", "d3/z", "d4/w", "d5/v/u"]);
 	let fs = Fs::native();
 	let opts = Options { workers: Some(8), ..Default::default() };
+	let (mut complete, mut root_failed, mut dir_failed) = (0, 0, 0);
 	for round in 0..20_000 {
 		let walked = drain(&fs, tmp.path(), &opts, |_, _, out: &mut Vec<()>| {
 			out.push(());
 			Action::Continue
 		});
-		let (visited, errors) = tokio::time::timeout(Duration::from_secs(30), walked)
+		let walked = tokio::time::timeout(Duration::from_secs(30), walked)
 			.await
-			.unwrap_or_else(|_| panic!("walk {round} did not end"))
-			.expect("walk");
-		// A directory the walk could not open, such as one past the open-file
-		// limit while other tests in the process hold files, leaves its
-		// entries out; only a walk with no directory error must have all 12.
-		assert!(
-			visited.len() == 12 || !errors.is_empty(),
-			"walk {round}: {} of 12 entries, directory errors {errors:?}",
-			visited.len()
-		);
+			.unwrap_or_else(|_| panic!("walk {round} did not end"));
+		// A walk that cannot open its root or a directory, as past the
+		// open-file limit while other tests in the process hold files, has
+		// still ended: it is counted and skipped.
+		let Ok((visited, errors)) = walked else {
+			root_failed += 1;
+			continue;
+		};
+		if !errors.is_empty() {
+			dir_failed += 1;
+			continue;
+		}
+		assert_eq!(visited.len(), 12, "walk {round}");
+		complete += 1;
 	}
+	// The 30 s limit catches the hang on every walk that runs; the floor only
+	// fails a run in which almost no walk could open its directories.
+	assert!(
+		complete >= 19_000,
+		"{complete} of 20,000 walks complete, fewer than 19,000; {root_failed} could not open the \
+		 root and {dir_failed} could not open a directory"
+	);
 }
 
 /// A visitor panic ends the walk on every worker: the panicking job never
@@ -378,6 +391,7 @@ async fn a_panicking_visitor_ends_the_walk_on_every_worker() {
 		}
 	}));
 	let opts = Options { workers: Some(8), ..Default::default() };
+	let (mut panicked, mut skipped) = (0, 0);
 	for round in 0..2_000 {
 		let (root, opts) = (tmp.path().to_path_buf(), opts.clone());
 		let run = tokio::spawn(async move {
@@ -391,9 +405,23 @@ async fn a_panicking_visitor_ends_the_walk_on_every_worker() {
 		let joined = tokio::time::timeout(Duration::from_secs(30), run)
 			.await
 			.unwrap_or_else(|_| panic!("walk {round} did not end after a visitor panic"));
-		let error = joined.expect_err("the visitor panic resumes in the consumer");
-		assert!(error.is_panic(), "walk {round}: {error:?}");
+		match joined {
+			Err(error) => {
+				assert!(error.is_panic(), "walk {round}: {error:?}");
+				panicked += 1;
+			},
+			// The walk could not open its root or `d11` (past the open-file
+			// limit), so its visitor never reached the panicking entry.
+			Ok(Err(WalkError::Root { .. })) => skipped += 1,
+			Ok(Ok((_, errors))) if !errors.is_empty() => skipped += 1,
+			Ok(Ok(_)) => panic!("walk {round}: the visitor panic did not resume in the consumer"),
+		}
 	}
+	assert!(
+		panicked >= 1_000,
+		"{panicked} of 2,000 walks reached the visitor panic; {skipped} could not open their root \
+		 or a directory"
+	);
 }
 
 /// A walk dropped before its seed worker's first poll frees no path another
