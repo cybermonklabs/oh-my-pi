@@ -521,6 +521,24 @@ export function mergeCodeActions(
 	return [...merged, ...(extra ?? []).filter(action => !seen.has(JSON.stringify(action)))];
 }
 
+/**
+ * An LSP call's failure or abort that the caller must hear more about: changes it made that
+ * stay, or edits its server may still apply. The message is the cause's, then `detail`; the
+ * lsp tool keeps `detail` in what it reports, also for an abort or a timeout.
+ */
+export class LspOutcomeError extends Error {
+	constructor(
+		readonly detail: string,
+		cause: unknown,
+		/** The changes made that stay, as the lines a workspace edit reports. */
+		readonly applied: readonly string[] = [],
+	) {
+		const reason = (cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, "");
+		super(`${reason}. ${detail}`, { cause });
+		this.name = "LspOutcomeError";
+	}
+}
+
 export interface CodeActionApplyDependencies {
 	resolveCodeAction?: (action: CodeAction) => Promise<CodeAction>;
 	applyWorkspaceEdit: (edit: WorkspaceEdit) => Promise<string[]>;
@@ -550,7 +568,10 @@ function isCommandItem(action: CodeAction | Command): action is Command {
 /**
  * Run `command` and add the edits its server applied to `edits`. Once some edit has changed
  * files (the action's own, or one the server applied for the command), a command the call's
- * signal stops is reported in the result instead of failing the call, since the changes stay.
+ * signal stops is reported in the result instead of failing the call, since the changes stay;
+ * a command that fails otherwise fails the call naming those changes. A command the signal
+ * stops before anything changed ends the call as aborted, saying that the server may still
+ * apply edits for it.
  */
 async function runCommand(
 	command: Command,
@@ -562,8 +583,20 @@ async function runCommand(
 		await dependencies.executeCommand(command, serverEdits);
 		return { executedCommands: [command.command] };
 	} catch (error) {
-		if (edits.length + serverEdits.length === 0 || !dependencies.signal?.aborted) throw error;
-		return { executedCommands: [], abortedCommands: [command.command] };
+		const changed = [...edits, ...serverEdits];
+		if (dependencies.signal?.aborted) {
+			if (changed.length > 0) return { executedCommands: [], abortedCommands: [command.command] };
+			throw new LspOutcomeError(
+				`The call did not wait for the command ${command.command}; its server may still apply edits for it.`,
+				error,
+			);
+		}
+		if (changed.length === 0) throw error;
+		throw new LspOutcomeError(
+			`Before the command ${command.command} failed, the code action made these changes, which stay: ${changed.join("; ")}.`,
+			error,
+			changed,
+		);
 	} finally {
 		edits.push(...serverEdits);
 	}

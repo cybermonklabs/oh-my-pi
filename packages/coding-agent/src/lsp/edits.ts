@@ -308,21 +308,22 @@ export interface WorkspaceEditResult {
  * All text-edit batches are overlap-validated before anything is written so a
  * conflict throws without leaving the workspace half-applied.
  *
- * `onExecuted` fires after each filesystem mutation. When a later op throws,
- * the callback has already reported the executed prefix — callers that must
- * reconcile external state (e.g. LSP overlays) rely on this because the
- * returned {@link WorkspaceEditResult} is lost on failure.
+ * `onExecuted` fires after each filesystem mutation, with the line `applied` gets for it.
+ * When a later op throws, the callback has already reported the executed prefix —
+ * callers that must reconcile external state (e.g. LSP overlays) or report what changed
+ * rely on this because the returned {@link WorkspaceEditResult} is lost on failure.
  */
 export async function applyWorkspaceEdit(
 	edit: WorkspaceEdit,
 	cwd: string,
-	onExecuted?: (change: ExecutedWorkspaceChange) => void,
+	onExecuted?: (change: ExecutedWorkspaceChange, applied: string) => void,
 ): Promise<WorkspaceEditResult> {
 	const applied: string[] = [];
 	const executed: ExecutedWorkspaceChange[] = [];
-	const record = (change: ExecutedWorkspaceChange) => {
+	const record = (change: ExecutedWorkspaceChange, line: string) => {
+		applied.push(line);
 		executed.push(change);
-		onExecuted?.(change);
+		onExecuted?.(change, line);
 	};
 
 	if (edit.documentChanges) {
@@ -334,8 +335,10 @@ export async function applyWorkspaceEdit(
 			if (op.kind === "text") {
 				const filePath = uriToFile(op.uri);
 				await applyTextEdits(filePath, op.edits);
-				applied.push(`Applied ${op.edits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
-				record({ kind: "edit", uri: op.uri });
+				record(
+					{ kind: "edit", uri: op.uri },
+					`Applied ${op.edits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`,
+				);
 			} else if (op.kind === "create") {
 				const filePath = uriToFile(op.uri);
 				await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -352,8 +355,7 @@ export async function applyWorkspaceEdit(
 					}
 					continue;
 				}
-				applied.push(`Created ${formatPathRelativeToCwd(filePath, cwd)}`);
-				record({ kind: "create", uri: op.uri });
+				record({ kind: "create", uri: op.uri }, `Created ${formatPathRelativeToCwd(filePath, cwd)}`);
 			} else if (op.kind === "rename") {
 				const oldPath = uriToFile(op.oldUri);
 				const newPath = uriToFile(op.newUri);
@@ -398,7 +400,10 @@ export async function applyWorkspaceEdit(
 							} catch {
 								// Restoration failed: the destination really is gone, so
 								// report it to reconciliation as an executed delete.
-								record({ kind: "delete", uri: op.newUri });
+								record(
+									{ kind: "delete", uri: op.newUri },
+									`Deleted ${formatPathRelativeToCwd(newPath, cwd)} (a rename onto it failed)`,
+								);
 							}
 							await fs.rm(displaced.dir, { recursive: true, force: true }).catch(() => {});
 						}
@@ -413,8 +418,10 @@ export async function applyWorkspaceEdit(
 						});
 					}
 				}
-				applied.push(`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`);
-				record({ kind: "rename", oldUri: op.oldUri, newUri: op.newUri });
+				record(
+					{ kind: "rename", oldUri: op.oldUri, newUri: op.newUri },
+					`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`,
+				);
 			} else {
 				const filePath = uriToFile(op.uri);
 				try {
@@ -428,8 +435,7 @@ export async function applyWorkspaceEdit(
 					if (!(op.options?.ignoreIfNotExists && isEnoent(error))) throw error;
 					continue;
 				}
-				applied.push(`Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
-				record({ kind: "delete", uri: op.uri });
+				record({ kind: "delete", uri: op.uri }, `Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
 			}
 		}
 	} else if (edit.changes) {
@@ -443,8 +449,10 @@ export async function applyWorkspaceEdit(
 			if (textEdits.length === 0) continue;
 			const filePath = uriToFile(uri);
 			await applyTextEdits(filePath, textEdits);
-			applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
-			record({ kind: "edit", uri });
+			record(
+				{ kind: "edit", uri },
+				`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`,
+			);
 		}
 	}
 
