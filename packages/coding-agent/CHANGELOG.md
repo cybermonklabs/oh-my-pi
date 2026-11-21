@@ -5,7 +5,7 @@
 ### Added
 
 - `origin: "outside"` on `AgentSession.prompt`, `steer`, `followUp`, `resume`, `sendUserMessage`, `sendCustomMessage` and `promptCustomMessage`, and on extensions' `pi.sendMessage` and `pi.sendUserMessage`, marks input that crossed the session's outer boundary (a person, or a harness or RPC client on their behalf). The TUI, print mode, RPC and ACP set it on what a person or client sends; an extension that relays a person's input sets it itself
-- `origin: "outside"` on `pi.sendUserInput`: a bridge that relays a person's typed Send sets it, and the prompt, skill or built-in the text runs then ends the session's cyber-policy hold, as typed input does; the extension's own `sendUserInput` leaves it unset and keeps the hold
+- `origin: "outside"` on `pi.sendUserInput`: a bridge that relays a person's typed Send to the root session sets it, and the prompt or skill the text submits, a relayed `/compact` or `/handoff`, and the prompt a built-in submits then end the session's cyber-policy hold, as typed input does (other built-ins read no origin); the extension's own `sendUserInput` leaves it unset and keeps the hold
 
 ### Fixed
 

@@ -121,6 +121,8 @@ export async function sendSessionUserInput(
 			settings: session.settings,
 			cwd: session.sessionManager.getCwd(),
 			...commandHost,
+			// After the host: the caller's origin decides, so a host built from a typed-input runtime (one that
+			// carries `origin: "outside"`) cannot mark the extension's own command as a person's.
 			origin,
 			output: line => {
 				printed.push(line);

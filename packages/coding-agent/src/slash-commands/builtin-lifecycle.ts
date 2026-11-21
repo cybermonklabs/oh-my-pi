@@ -251,7 +251,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
 				try {
-					// Typed by a person or client (TUI, RPC, ACP, print): the runtime says so with its origin.
+					// The runtime's origin: `"outside"` when a person or client typed it (TUI, RPC, ACP, print) or an
+					// extension relays a person's command; unset for the session's or an extension's own command.
 					await runtime.session.compact(parsed.instructions, {
 						...(parsed.mode ? { mode: parsed.mode } : {}),
 						origin: runtime.origin,
