@@ -1192,11 +1192,12 @@ async fn a_parent_the_walk_returns_to_is_taken_back_only_with_its_recorded_ident
 
 /// A parent the walk gave its handle up for, and cannot open again when it
 /// returns to it, keeps its place: its subdirectories that the walk cannot
-/// open are reported with the open's own error, and those it can open once
-/// the failure ends are walked. Here every directory open on this thread
-/// fails with `EMFILE` from the report of `p/a/d`, the last before the walk
-/// leaves `p/a` for `p`, until the walk reports an error. Losing `p` instead
-/// reported `p/y` and `p/z` as moved or replaced, and walked neither.
+/// open are reported with the open's error, which names the parent, and
+/// those it can open once the failure ends are walked. Here every directory
+/// open on this thread fails with `EMFILE` from the report of `p/a/d`, the
+/// last before the walk leaves `p/a` for `p`, until the walk reports an
+/// error. Losing `p` instead reported `p/y` and `p/z` as moved or replaced,
+/// and walked neither.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
@@ -1236,7 +1237,14 @@ async fn a_parent_the_walk_cannot_open_again_keeps_its_place() {
 	}
 	drop(cursor);
 	assert!(failing.is_none(), "the walk reported no error while its opens failed");
-	assert_eq!(errors, [("p/y".to_owned(), emfile().to_string())]);
+	assert_eq!(errors, [(
+		"p/y".to_owned(),
+		format!(
+			"cannot open the parent directory {} again: {}",
+			tmp.path().join("p").display(),
+			emfile()
+		)
+	)]);
 	assert_eq!(seen, ["p/a", "p/y", "p/z/kept", "p/z", "p"]);
 }
 
@@ -1289,6 +1297,100 @@ async fn a_lost_parent_follows_no_link() {
 	let moved = "the directory was moved or replaced during the walk".to_owned();
 	assert_eq!(seen, ["p/a", "p/l", "p/z"]);
 	assert_eq!(errors, [("p/l".to_owned(), moved.clone()), ("p/z".to_owned(), moved)]);
+}
+
+/// A parent the walk gave its handle up for, and whose read permission is
+/// taken away while the walk is below it, still has its remaining
+/// subdirectories walked on Linux: entering them needs only its search
+/// permission, as it did through the handle it gave up. The walk takes the
+/// parent back through its child's `..`, and, with the child moved away,
+/// below the root or by path; each open is search-only (`O_PATH`). Opening
+/// it for reading reported `p/y` and `p/z` as `Permission denied` and walked
+/// neither. Where no search-only open exists, each is reported with an error
+/// that names the parent, whose open failed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_that_cannot_be_read_again_is_still_walked() {
+	use std::os::unix::fs::PermissionsExt as _;
+	for follow in [Follow::Roots, Follow::Always] {
+		for move_child in [false, true] {
+			let case = format!("{follow:?}, child moved: {move_child}");
+			let tmp = make_tree("tree-unreadable-parent", &["o/kept", "p/y/kept", "p/z/kept"]);
+			std::fs::create_dir(tmp.path().join("p/a")).unwrap();
+			// Far enough below `p` for `p` to give its handle up.
+			chain_by_descriptor(&tmp.path().join("p/a"), 70, "d", false);
+			let opts = TreeOptions { follow, ..Default::default() };
+			let mut cursor = Tree::new(&Fs::native(), tmp.path(), &opts)
+				.await
+				.expect("tree");
+			let (mut seen, mut errors, mut privileged) = (Vec::new(), Vec::new(), None);
+			while let Some(event) = cursor.next().await {
+				match event {
+					Event::Entry(entry) => {
+						let path = String::from_utf8_lossy(entry.path).into_owned();
+						if path.ends_with("/leaf") {
+							// While the walk is at the bottom of `p/a`.
+							let p = tmp.path().join("p");
+							if move_child {
+								std::fs::rename(p.join("a"), tmp.path().join("o/a")).unwrap();
+							}
+							std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o311)).unwrap();
+							privileged = Some(std::fs::read_dir(&p).is_ok());
+						}
+						if path.starts_with('p') && !path.starts_with("p/a/") {
+							seen.push(path);
+						}
+					},
+					Event::Error(error) => {
+						let path = error
+							.path
+							.strip_prefix(tmp.path())
+							.unwrap()
+							.to_string_lossy()
+							.into_owned();
+						errors.push((path, error.error.to_string()));
+					},
+				}
+			}
+			let opens = cursor.opens();
+			drop(cursor);
+			std::fs::set_permissions(tmp.path().join("p"), std::fs::Permissions::from_mode(0o755))
+				.unwrap();
+			match privileged {
+				None => panic!("{case}: the walk never reached the leaf"),
+				Some(true) => {
+					eprintln!("skipped: {case}: this process reads a directory without read permission");
+					continue;
+				},
+				Some(false) => {},
+			}
+			if cfg!(target_os = "linux") {
+				assert!(errors.is_empty(), "{case}: {errors:?}");
+				assert_eq!(seen, ["p", "p/a", "p/y", "p/y/kept", "p/z", "p/z/kept"], "{case}");
+				// With the child in place every parent comes back through its
+				// child's `..`, `p` included, as a search-only open of `..`:
+				// the root's open is the only one that looks a path up.
+				if !move_child {
+					assert_eq!(
+						opens.walked, 1,
+						"{case}: a parent was opened again by its path: {opens:?}"
+					);
+				}
+			} else {
+				let denied = format!(
+					"cannot open the parent directory {} again: {}",
+					tmp.path().join("p").display(),
+					std::io::Error::from_raw_os_error(libc::EACCES)
+				);
+				assert_eq!(
+					errors,
+					[("p/y".to_owned(), denied.clone()), ("p/z".to_owned(), denied)],
+					"{case}"
+				);
+				assert_eq!(seen, ["p", "p/a", "p/y", "p/z"], "{case}");
+			}
+		}
+	}
 }
 
 /// A walk stopped at the leaf of a deep ignore chain releases its frames one

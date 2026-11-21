@@ -22,7 +22,9 @@ use uucore::{
 };
 
 use crate::{
-	file_backup::{backup_display, backup_path},
+	file_backup::{
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
+	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
 };
 
@@ -165,9 +167,10 @@ fn ln_main(matches: &ArgMatches, host: &mut Host) -> LnResult<()> {
 		OverwriteMode::NoClobber
 	};
 
-	let backup_mode = backup_control::determine_backup_mode(matches)
-		.map_err(|error| LnError::Message(error.to_string()))?;
-	let backup_suffix = backup_control::determine_backup_suffix(matches);
+	// The shell's `VERSION_CONTROL` and `SIMPLE_BACKUP_SUFFIX`, as cp and mv
+	// read them; an empty suffix is `~`.
+	let backup_mode = determine_backup_mode(matches, &*host).map_err(LnError::Message)?;
+	let backup_suffix = determine_backup_suffix(matches, &*host);
 
 	// When we have "-L" or "-L -P", false otherwise
 	let logical = matches.get_flag(options::LOGICAL);
@@ -514,8 +517,33 @@ fn link(host: &mut Host, src: &Path, dst: &Path, settings: &Settings) -> LnResul
 	};
 
 	if filesystem.is_symlink(&dst_fs) || filesystem.exists(&dst_fs) {
-		// Probe numbered backups from the resolved destination.
-		backup = backup_path(&filesystem, settings.backup, &dst_fs, &settings.suffix);
+		// Probe numbered backups from the resolved destination. GNU ln renames
+		// the backup with replacement, so an entry at a long name's `~` name
+		// is replaced; one that is the destination itself is refused.
+		backup = backup_path(&filesystem, settings.backup, &dst_fs, &settings.suffix, false)
+			.map_err(|_| LnError::Message(format!("cannot backup {}: File exists", dst.quote())))?;
+		// The backup must not replace the source the link is made to: for
+		// a hard link the file at `src`, for a symbolic one the entry its
+		// target names from the link's directory. GNU ln does not check
+		// this (`ln.c` renames with a plain `renameat`) and loses the
+		// source's contents in `ln -b dest~ dest`; this refuses it, as GNU
+		// mv and cp refuse their own.
+		if let Some(backup) = &backup {
+			let (linked, follow) = if settings.symbolic {
+				let at = parent_path(&dst_fs).unwrap_or(Path::new("."));
+				(Cow::Owned(at.join(&*source)), false)
+			} else {
+				(Cow::Borrowed(src_fs.as_path()), settings.logical)
+			};
+			if backup_is_source(&filesystem, &linked, follow, backup) {
+				return Err(LnError::Message(format!(
+					"backing up {} might destroy source;  {} not linked",
+					dst.quote(),
+					src.quote()
+				))
+				.into());
+			}
+		}
 		if settings.backup == BackupMode::Existing && !settings.symbolic {
 			// when ln --backup f f, it should detect that it is the same file
 			if paths_refer_to_same_file(&filesystem, &src_fs, &dst_fs) {
@@ -787,5 +815,182 @@ mod tests {
 		assert!(capture.out().contains("Usage:"));
 		assert!(capture.out().contains("Make links between files."));
 		assert_eq!(capture.err(), "");
+	}
+
+	/// `ln --backup` never makes its numbered backup over an entry already
+	/// at a backup name, a symlink that points nowhere included, and numbers
+	/// after the highest one, as GNU ln does
+	/// ([`crate::file_backup::tests::check_numbered_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn numbered_backups_count_every_entry_at_a_backup_name() {
+		crate::file_backup::tests::check_numbered_backups(|dir, control| {
+			let (code, capture) = run_util::<Ln>(&[&format!("--backup={control}"), "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln --backup=numbered` past the name limit backs up as GNU ln does
+	/// ([`crate::file_backup::tests::check_name_limit`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_numbered_backup_past_the_name_limit_ends_in_a_tilde() {
+		crate::file_backup::tests::check_name_limit(|dir, name| {
+			let (code, capture) = run_util::<Ln>(&["--backup=numbered", "src", name], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -b -S ''` backs up to `dest~`, as GNU ln does
+	/// ([`crate::file_backup::tests::check_empty_suffix`]).
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_suffix_backs_up_with_a_tilde() {
+		crate::file_backup::tests::check_empty_suffix(|dir| {
+			let (code, capture) = run_util::<Ln>(&["-b", "-S", "", "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln` with long names refuses each backup that would replace its source
+	/// or the destination itself, and replaces any other entry at the `~`
+	/// name, as GNU ln does
+	/// ([`crate::file_backup::tests::check_long_name_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_long_name_backup_never_replaces_the_source_or_the_destination() {
+		crate::file_backup::tests::check_long_name_backups("ln", |dir, args| {
+			let (code, capture) = run_util::<Ln>(args, "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -b dest~ dest` is refused, as GNU mv and cp refuse their own: the
+	/// backup of `dest` would replace the source `dest~` before the link to it
+	/// is made, losing its contents. This differs from GNU ln 9.4 and 9.7,
+	/// which rename `dest` over `dest~` (`ln.c`, plain `renameat`), exit 0 and
+	/// keep only the old `dest`. The same holds for a symbolic link, whose
+	/// relative target is read from the destination's directory, and
+	/// `--backup=numbered`, whose backup is `dest.~1~`, still links.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_that_is_the_destinations_backup_is_not_linked_over_it() {
+		let cwd = tempfile::tempdir().unwrap();
+		let case = |name: &str| {
+			let dir = cwd.path().join(name);
+			fs::create_dir_all(dir.join("d")).unwrap();
+			fs::write(dir.join("dest~"), "payload").unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			fs::write(dir.join("d/dest~"), "payload").unwrap();
+			fs::write(dir.join("d/dest"), "old").unwrap();
+			dir
+		};
+		let refused = |dest: &str, source: &str| {
+			(1, format!("ln: backing up '{dest}' might destroy source;  '{source}' not linked\n"))
+		};
+		for control in ["-b", "--backup=simple", "--backup=existing"] {
+			let dir = case(control.trim_start_matches('-'));
+			let (code, capture) = run_util::<Ln>(&[control, "dest~", "dest"], "", &dir);
+			assert_eq!((code, capture.err()), refused("dest", "dest~"), "{control}");
+			let (code, capture) = run_util::<Ln>(&[control, "-s", "dest~", "d/dest"], "", &dir);
+			assert_eq!((code, capture.err()), refused("d/dest", "dest~"), "{control} -s");
+			for sub in ["", "d/"] {
+				assert_eq!(fs::read_to_string(dir.join(format!("{sub}dest~"))).unwrap(), "payload", "{control}: {sub}dest~");
+				assert_eq!(fs::read_to_string(dir.join(format!("{sub}dest"))).unwrap(), "old", "{control}: {sub}dest");
+			}
+		}
+		let dir = case("numbered");
+		let (code, capture) = run_util::<Ln>(&["--backup=numbered", "dest~", "dest"], "", &dir);
+		assert_eq!((code, capture.err()), (0, String::new()), "numbered");
+		assert_eq!(fs::read_to_string(dir.join("dest")).unwrap(), "payload", "numbered: not linked");
+		assert_eq!(fs::read_to_string(dir.join("dest.~1~")).unwrap(), "old", "numbered: no backup");
+	}
+
+	/// `ln CONTROL a dest` and `ln -s CONTROL a dest`, where `dest~` is
+	/// another hard link of `a`, back `dest` up over that link and link, as
+	/// GNU ln does ([`crate::file_backup::tests::check_hard_link_backups`]):
+	/// the backup replaces only that link, never `a`.
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_over_another_hard_link_of_the_source_is_made() {
+		crate::file_backup::tests::check_hard_link_backups("ln", false, |dir, control| {
+			let (code, capture) = run_util::<Ln>(&[control, "a", "dest"], "", dir);
+			(code, capture.err())
+		});
+		crate::file_backup::tests::check_hard_link_backups("ln", true, |dir, control| {
+			let (code, capture) = run_util::<Ln>(&[control, "-s", "a", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
+
+	/// `ln -L -b x dest`, where `x` is a symbolic link to `dest~`, is
+	/// refused: ln follows `x`, and the backup of `dest` would replace the
+	/// file it links to. GNU ln 9.4 and 9.7 exit 0 there, with `dest~`'s
+	/// contents lost and `dest` a link to the old `dest`.
+	#[cfg(unix)]
+	#[test]
+	fn a_followed_source_link_to_the_backup_is_not_linked_over_it() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest~"), "payload").unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		std::os::unix::fs::symlink("dest~", dir.path().join("x")).unwrap();
+		let (code, capture) = run_util::<Ln>(&["-L", "-b", "x", "dest"], "", dir.path());
+		assert_eq!(
+			(code, capture.err()),
+			(1, "ln: backing up 'dest' might destroy source;  'x' not linked\n".to_owned())
+		);
+		assert_eq!(fs::read_to_string(dir.path().join("dest~")).unwrap(), "payload");
+		assert_eq!(fs::read_to_string(dir.path().join("dest")).unwrap(), "old");
+	}
+
+	/// `ln -L -b x dest`, where `x -> dest~ -> a`, is refused: ln follows the
+	/// chain, and the backup would replace the link `dest~` it passes through,
+	/// so `dest` would be linked to the old `dest`. GNU ln 9.4 and 9.7 exit 0
+	/// there with `dest` and `dest~` the old file (`dest=old#2 dest~=old#2`)
+	/// and the link lost.
+	#[cfg(unix)]
+	#[test]
+	fn a_followed_chain_through_the_backup_is_not_linked_over_it() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a"), "payload").unwrap();
+		std::os::unix::fs::symlink("a", dir.path().join("dest~")).unwrap();
+		std::os::unix::fs::symlink("dest~", dir.path().join("x")).unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		let (code, capture) = run_util::<Ln>(&["-L", "-b", "x", "dest"], "", dir.path());
+		assert_eq!(
+			(code, capture.err()),
+			(1, "ln: backing up 'dest' might destroy source;  'x' not linked\n".to_owned())
+		);
+		assert_eq!(
+			crate::file_backup::tests::listing(dir.path()),
+			" a=payload#1 dest=old#1 dest~=link:a x=link:dest~"
+		);
+	}
+
+	/// `ln -s -b dest~ dest` with nothing at `dest~` links `dest` to `dest~`
+	/// and backs `dest` up there, as GNU ln 9.4 and 9.7 do: the backup
+	/// replaces no entry, so it cannot replace the source. With `dest~`
+	/// present it is refused ([`a_source_that_is_the_destinations_backup_is_not_linked_over_it`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_symbolic_link_to_a_free_backup_name_is_made() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		let (code, capture) = run_util::<Ln>(&["-s", "-b", "dest~", "dest"], "", dir.path());
+		assert_eq!((code, capture.err()), (0, String::new()));
+		assert_eq!(crate::file_backup::tests::listing(dir.path()), " dest=link:dest~ dest~=old#1");
+	}
+
+	/// `ln -b DEST~ dest` and `ln -s -b DEST~ dest` where names fold
+	/// ([`crate::file_backup::tests::check_folded_sources`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_source_whose_name_folds_to_the_backup_is_not_linked_over_it() {
+		for util in ["ln", "ln -s"] {
+			crate::file_backup::tests::check_folded_sources(util, |fs, dir, args| {
+				let (code, capture) = crate::host::run_util_on::<Ln>(fs, args, "", dir);
+				(code, capture.err())
+			});
+		}
 	}
 }

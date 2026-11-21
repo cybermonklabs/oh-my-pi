@@ -673,6 +673,21 @@ impl Session {
 		Ok(Dir { repr })
 	}
 
+	/// Opens the directory at an absolute path, following symlinks, only to
+	/// reach what is below it: the handle opens children and identifies the
+	/// directory, and cannot list it. On Linux this needs only search
+	/// permission on the directory (`O_PATH`), as an open through a handle
+	/// already held does; elsewhere it opens as [`Self::open_dir`] does.
+	pub(crate) async fn open_dir_to_search(&mut self, path: &Path) -> io::Result<Dir> {
+		#[cfg(test)]
+		seam::dir_open(seam::last(path), seam::Open::Path)?;
+		let repr = match &mut self.imp {
+			Imp::Native(s) => DirRepr::Native(native::open_dir_to_search(s, path)?),
+			Imp::Provider(fs) => DirRepr::Provider(provider::open_dir(fs, path).await?),
+		};
+		Ok(Dir { repr })
+	}
+
 	/// Opens the directory at an absolute path without following a symlink
 	/// that is its final component, as [`Self::open_child`] opens a listed
 	/// one: a symlink there is refused (`ENOTDIR` on Unix), even on a kernel
@@ -706,8 +721,10 @@ impl Session {
 
 	/// Opens the directory `..` of `child`, which is its parent only while
 	/// `child` has not moved: callers check the identity of what they get.
-	/// Fails with [`io::ErrorKind::Unsupported`] where `..` cannot be opened
-	/// relative to a handle (Windows, providers).
+	/// The handle only reaches what is below it, as
+	/// [`Self::open_dir_to_search`]'s does. Fails with
+	/// [`io::ErrorKind::Unsupported`] where `..` cannot be opened relative to
+	/// a handle (Windows, providers).
 	pub(crate) fn open_parent(&mut self, child: &Dir) -> io::Result<Dir> {
 		#[cfg(test)]
 		seam::dir_open(b"..", seam::Open::Parent)?;
@@ -848,6 +865,29 @@ impl Session {
 		let repr = match (&mut self.imp, &root.repr) {
 			(Imp::Native(s), DirRepr::Native(h)) => {
 				DirRepr::Native(native::open_dir_beneath(s, h, rel)?)
+			},
+			(Imp::Provider(fs), DirRepr::Provider(path)) => {
+				DirRepr::Provider(provider::open_dir_unlinked(fs, provider::beneath(path, rel)).await?)
+			},
+			_ => return Err(foreign_dir()),
+		};
+		Ok(Dir { repr })
+	}
+
+	/// Opens the directory at the walk-relative `rel` below the open directory
+	/// `root` as [`Self::open_dir_beneath`] does, only to reach what is below
+	/// it, as [`Self::open_dir_to_search`] opens one.
+	pub(crate) async fn open_dir_beneath_to_search(
+		&mut self,
+		root: &Dir,
+		rel: &[u8],
+	) -> io::Result<Dir> {
+		check_relative(rel)?;
+		#[cfg(test)]
+		seam::dir_open(seam::last_of(rel), seam::Open::Beneath)?;
+		let repr = match (&mut self.imp, &root.repr) {
+			(Imp::Native(s), DirRepr::Native(h)) => {
+				DirRepr::Native(native::open_dir_beneath_to_search(s, h, rel)?)
 			},
 			(Imp::Provider(fs), DirRepr::Provider(path)) => {
 				DirRepr::Provider(provider::open_dir_unlinked(fs, provider::beneath(path, rel)).await?)
