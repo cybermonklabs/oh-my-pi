@@ -31,9 +31,9 @@ use std::{
 };
 
 use crate::{
-	bre::{byte_char, char_byte, simple_lower, simple_upper},
+	bre::{byte_char, push_char_bytes, simple_lower, simple_upper},
 	host::ShellPaths,
-	sed::error_handling::{SedError, SedResult},
+	sed::error_handling::SedResult,
 };
 
 use crate::sed::{
@@ -68,8 +68,6 @@ pub struct ProcessingContext {
 	/// the shell would open them, and supplies the filesystem that every
 	/// sed file access (including `-i`) goes through.
 	pub paths:            ShellPaths,
-	/// What the `y` commands need of the shell's `LC_CTYPE`.
-	pub y_locale:         YLocale,
 
 	// Other context
 	/// Currently processed input file name (not script) in quoted form
@@ -110,38 +108,6 @@ impl ProcessingContext {
 	/// else the newline.
 	pub const fn delimiter(&self) -> u8 {
 		if self.null_data { b'\0' } else { b'\n' }
-	}
-}
-
-/// What the `y` commands need of the locale. GNU sed reads a `y` command's
-/// strings as characters in a UTF-8 locale, and each byte as one in the C
-/// locale: `y/é/e/` maps `é` in C.UTF-8, and is "strings for `y' command
-/// are different lengths" in C. Strings of ASCII, no character of the first
-/// repeated, read alike in both; for any others the shell's `LC_CTYPE` is
-/// asked once, after the script is compiled ([`Self::resolve`]).
-#[derive(Debug, Default, Clone)]
-pub struct YLocale {
-	/// Whether the shell's `LC_CTYPE` is UTF-8, once asked.
-	pub utf8:   Option<bool>,
-	/// Whether some `y` command's strings read otherwise in the two locales.
-	pub asks:   bool,
-	/// The first `y` command's error that holds in the C locale alone, and
-	/// the first that holds in a UTF-8 locale alone, both compiled past.
-	pub errors: [Option<SedError>; 2],
-}
-
-impl YLocale {
-	/// Asks `utf8` whether the shell's `LC_CTYPE` is UTF-8, where some `y`
-	/// command's strings read otherwise in the two locales, and fails with
-	/// the first such command's error that holds in that locale: compiling
-	/// went on past it, so it precedes any error compiling met after it.
-	pub fn resolve(&mut self, utf8: impl FnOnce() -> bool) -> SedResult<()> {
-		if !self.asks {
-			return Ok(());
-		}
-		let utf8 = utf8();
-		self.utf8 = Some(utf8);
-		self.errors[usize::from(utf8)].take().map_or(Ok(()), Err)
 	}
 }
 
@@ -416,41 +382,59 @@ impl Default for Transliteration {
 	}
 }
 
+/// The characters of a `y` string as a UTF-8 locale reads its bytes: each
+/// character whose UTF-8 they hold, and each byte that is no UTF-8 alone.
+fn utf8_items(bytes: &[u8]) -> impl Iterator<Item = Result<char, u8>> + '_ {
+	bytes
+		.utf8_chunks()
+		.flat_map(|chunk| chunk.valid().chars().map(Ok).chain(chunk.invalid().iter().map(|&byte| Err(byte))))
+}
+
 impl Transliteration {
-	/// Create through character mappings from `source` to `target`, the
-	/// characters a UTF-8 locale reads `parse_transliteration`'s bytes as. A
-	/// byte that is no UTF-8 is no character of a line that is UTF-8: as a
-	/// source it maps that byte alone, and as a target it is written as that
-	/// byte, as GNU sed writes it in C.UTF-8 (`printf 'cafe\n' | sed
-	/// 'y/e/\xe9/'` writes `caf\351`). A source character given twice keeps
-	/// its first target, as there: `echo a | sed 'y/aa/12/'` prints `1`.
-	pub fn from_strings(source: &str, target: &str) -> Self {
+	/// Create through character mappings from `source` to `target`, read as
+	/// a UTF-8 locale reads `parse_transliteration`'s bytes ([`utf8_items`]),
+	/// or `None` where they differ in length read so. A byte that is no
+	/// UTF-8 is no character of a line that is UTF-8: as a source it maps
+	/// that byte alone, and as a target it is written as that byte, as GNU
+	/// sed writes it in C.UTF-8 (`printf 'cafe\n' | sed 'y/e/\xe9/'` writes
+	/// `caf\351`). A character is itself, one from U+10FF80 too, which
+	/// stands for such a byte elsewhere (see [`Self::push_target`]). A
+	/// source character given twice keeps its first target, as there: `echo
+	/// a | sed 'y/aa/12/'` prints `1`.
+	pub fn from_strings(source: &[u8], target: &[u8]) -> Option<Self> {
+		if utf8_items(source).count() != utf8_items(target).count() {
+			return None;
+		}
 		let mut result = Self::default();
 		let mut mapped = HashSet::new();
-		for (from, to) in source.chars().zip(target.chars()) {
+		for (from, to) in utf8_items(source).zip(utf8_items(target)) {
 			if !mapped.insert(from) {
 				continue;
 			}
-			match char_byte(from) {
-				Some(byte) => result.bytes[usize::from(byte)] = to,
-				None => result.insert(from, to),
+			result.byte_target |= to.is_err();
+			let to = to.unwrap_or_else(byte_char);
+			match from {
+				Ok(from) => result.insert(from, to),
+				Err(byte) => result.bytes[usize::from(byte)] = to,
 			}
-			result.byte_target |= char_byte(to).is_some();
 		}
-		result
+		Some(result)
 	}
 
 	/// Create through byte mappings from `source` to `target`, as GNU sed
-	/// reads the strings in the C locale, a byte to a character: `LC_ALL=C
-	/// sed 'y/\xc3\xa9/eE/'` maps the two bytes of `é`. A source byte given
-	/// twice keeps its last target, as there: `echo a | LC_ALL=C sed
-	/// 'y/aa/12/'` prints `2`.
-	pub fn from_bytes(source: &[u8], target: &[u8]) -> Self {
+	/// reads the strings in the C locale, a byte to a character, or `None`
+	/// where they differ in length: `LC_ALL=C sed 'y/\xc3\xa9/eE/'` maps the
+	/// two bytes of `é`. A source byte given twice keeps its last target, as
+	/// there: `echo a | LC_ALL=C sed 'y/aa/12/'` prints `2`.
+	pub fn from_bytes(source: &[u8], target: &[u8]) -> Option<Self> {
+		if source.len() != target.len() {
+			return None;
+		}
 		let mut result = Self { chars: false, ..Self::default() };
 		for (&from, &to) in source.iter().zip(target) {
 			result.bytes[usize::from(from)] = byte_char(to);
 		}
-		result
+		Some(result)
 	}
 
 	/// Set a transliteration mapping from one character to another.
@@ -488,28 +472,18 @@ impl Transliteration {
 	pub const fn writes_bytes(&self) -> bool {
 		self.byte_target
 	}
-}
 
-/// A `y` command's strings, read as GNU sed reads them in each locale (see
-/// [`YLocale`]): `utf8` as characters, `c` as bytes, each `None` where the
-/// strings differ in length read so. Strings that read alike in both have
-/// `c` alone.
-#[derive(Debug)]
-pub struct YStrings {
-	pub utf8: Option<Transliteration>,
-	pub c:    Option<Transliteration>,
-}
-
-impl YStrings {
-	/// The transliteration of the locale `utf8` answers: the C locale's
-	/// where it was not asked, as no `y` command's strings asked it.
-	pub fn get(&self, utf8: Option<bool>) -> &Transliteration {
-		self.utf8
-			.as_ref()
-			.filter(|_| utf8 == Some(true))
-			.or(self.c.as_ref())
-			.or(self.utf8.as_ref())
-			.expect("a y command's strings read in some locale")
+	/// Appends to `out` what the target `mapped` writes: the byte it stands
+	/// for (`bre::byte_char`) where the strings were read as bytes or some
+	/// target is a byte that is no UTF-8, else the character, one from
+	/// U+10FF80 too: `printf 'ab\n' | sed $'y/ab/\364\217\276\200c/'` writes
+	/// U+10FF80 whole in C.UTF-8.
+	pub fn push_target(&self, out: &mut Vec<u8>, mapped: char) {
+		if self.chars && !self.byte_target {
+			out.extend_from_slice(mapped.encode_utf8(&mut [0; 4]).as_bytes());
+		} else {
+			push_char_bytes(out, mapped);
+		}
 	}
 }
 
@@ -598,7 +572,7 @@ pub enum CommandData {
 	Number(usize),                              // Number for 'l', 'q', 'Q' (GNU)
 	Substitution(Box<Substitution>),            // Substitute command 's'
 	Text(Rc<str>),                              // Text for 'a', 'c', 'i'
-	Transliteration(Box<YStrings>),             // Transliteration command 'y'
+	Transliteration(Box<Transliteration>),      // Transliteration command 'y'
 }
 
 #[derive(Debug, Clone)]
@@ -792,7 +766,7 @@ mod tests {
 	// from_strings
 	#[test]
 	fn test_basic_transliteration() {
-		let t = Transliteration::from_strings("abcδ", "1234");
+		let t = Transliteration::from_strings("abcδ".as_bytes(), b"1234").unwrap();
 
 		assert_eq!(t.lookup('a'), '1');
 		assert_eq!(t.lookup('b'), '2');
@@ -805,7 +779,7 @@ mod tests {
 	fn test_unicode_slow_path() {
 		let source = "é漢🦀";
 		let target = "e文c";
-		let t = Transliteration::from_strings(source, target);
+		let t = Transliteration::from_strings(source.as_bytes(), target.as_bytes()).unwrap();
 
 		assert_eq!(t.lookup('é'), 'e');
 		assert_eq!(t.lookup('漢'), '文');
@@ -819,10 +793,32 @@ mod tests {
 		// A source given twice keeps its first target read as characters,
 		// as GNU sed 4.9 does in C.UTF-8, and its last read as bytes, as in
 		// the C locale.
-		let t = Transliteration::from_strings("aa", "12");
+		let t = Transliteration::from_strings(b"aa", b"12").unwrap();
 		assert_eq!(t.lookup('a'), '1');
-		let t = Transliteration::from_bytes(b"aa", b"12");
+		let t = Transliteration::from_bytes(b"aa", b"12").unwrap();
 		assert_eq!(t.lookup_byte(b'a'), '2');
+	}
+
+	#[test]
+	fn a_y_character_from_u10ff80_is_itself_in_a_utf8_locale() {
+		// If this regresses, `printf 'ab\n' | LC_ALL=C.UTF-8 sed
+		// $'y/ab/\364\217\276\200c/'` writes the byte 0x80 then `c`, where
+		// GNU sed 4.9 writes U+10FF80 then `c`.
+		let t = Transliteration::from_strings(b"ab", "\u{10FF80}c".as_bytes()).unwrap();
+		assert_eq!(t.lookup('a'), '\u{10FF80}');
+		assert!(!t.writes_bytes());
+		let mut out = Vec::new();
+		t.push_target(&mut out, t.lookup('a'));
+		assert_eq!(out, "\u{10FF80}".as_bytes());
+		// A byte that is no UTF-8 is that byte, as a source and a target.
+		let t = Transliteration::from_strings(b"\x80a", b"b\xe9").unwrap();
+		assert_eq!(t.lookup_byte(0x80), 'b');
+		assert!(t.writes_bytes());
+		let mut out = Vec::new();
+		t.push_target(&mut out, t.lookup('a'));
+		assert_eq!(out, b"\xe9");
+		assert!(Transliteration::from_strings("é".as_bytes(), b"e").is_some());
+		assert!(Transliteration::from_bytes("é".as_bytes(), b"e").is_none());
 	}
 }
 }
@@ -842,11 +838,11 @@ use std::{cell::RefCell, mem, path::PathBuf, rc::Rc};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::openfile::OpenFile;
-use crate::{bre::pattern_text, host::ShellPaths};
+use crate::host::ShellPaths;
 use crate::sed::{
 	command::{
 		Address, CaseFold, Command, CommandData, ProcessingContext, ReplacementPart,
-		ReplacementTemplate, Substitution, Transliteration, YStrings,
+		ReplacementTemplate, Substitution, Transliteration,
 	},
 	delimited_parser::{
 		UNTERMINATED_ADDRESS, UNTERMINATED_S, parse_byte_escape, parse_char_escape,
@@ -903,13 +899,16 @@ pub fn compile(
 	compile_with_provider(ScriptLineProvider::new(scripts), context)
 }
 
-/// Compiles scripts with access to the builtin standard input.
+/// Compiles scripts with access to the builtin standard input, and to the
+/// shell's answer to whether its `LC_CTYPE` is UTF-8, which `ctype_utf8`
+/// gives where a `y` command needs it.
 pub fn compile_with_stdin(
 	scripts: Vec<ScriptValue>,
 	context: &mut ProcessingContext,
 	stdin: OpenFile,
+	ctype_utf8: &dyn Fn() -> bool,
 ) -> SedResult<Option<Rc<RefCell<Command>>>> {
-	let provider = ScriptLineProvider::with_stdin(scripts, stdin, context.paths.clone());
+	let provider = ScriptLineProvider::with_stdin(scripts, stdin, context.paths.clone(), ctype_utf8);
 	compile_with_provider(provider, context)
 }
 
@@ -1711,7 +1710,7 @@ fn compile_trans_command(
 	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	cmd: &mut Command,
-	context: &mut ProcessingContext,
+	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past 'y'
 	// A line that ends here is `scan_delimiter`'s: `sed y` is "-e
@@ -1728,35 +1727,23 @@ fn compile_trans_command(
 	let target = parse_transliteration(lines, line)?;
 	// GNU sed reads the strings' bytes as characters in a UTF-8 locale, and
 	// each byte as one in the C locale: `LC_ALL=C sed 'y/é/e/'` is "strings
-	// for `y' command are different lengths". Strings that read otherwise
-	// in the two are compiled for both, and the locale asked once the whole
-	// script is (see `YLocale`), where an error that holds in one alone is
-	// reported if it holds there.
+	// for `y' command are different lengths". Strings of ASCII, no byte of
+	// the first repeated, read alike in both; for any others the shell's
+	// `LC_CTYPE` is asked, once, at the first such command, whose error comes
+	// before any later command opens its `w` file.
 	let mut repeated = [false; 256];
-	let asks = !source.is_ascii()
-		|| !target.is_ascii()
-		|| source.iter().any(|&byte| std::mem::replace(&mut repeated[usize::from(byte)], true));
-	let c = (source.len() == target.len()).then(|| Transliteration::from_bytes(&source, &target));
-	let utf8 = asks
-		.then(|| {
-			let (source, target) = (pattern_text(&source).0, pattern_text(&target).0);
-			(source.chars().count() == target.chars().count())
-				.then(|| Transliteration::from_strings(&source, &target))
-		})
-		.flatten();
-	let different = "strings for `y' command are different lengths";
-	match (&c, &utf8) {
-		(None, None) => return compilation_error(lines, line, different),
-		(None, Some(_)) | (Some(_), None) if asks => {
-			let slot = &mut context.y_locale.errors[usize::from(c.is_some())];
-			if slot.is_none() {
-				*slot = compilation_error::<()>(lines, line, different).err();
-			}
-		},
-		_ => {},
-	}
-	context.y_locale.asks |= asks;
-	cmd.data = CommandData::Transliteration(Box::new(YStrings { utf8, c }));
+	let alike = source.is_ascii()
+		&& target.is_ascii()
+		&& !source.iter().any(|&byte| std::mem::replace(&mut repeated[usize::from(byte)], true));
+	let trans = if alike || lines.ctype_is_utf8() {
+		Transliteration::from_strings(&source, &target)
+	} else {
+		Transliteration::from_bytes(&source, &target)
+	};
+	let Some(trans) = trans else {
+		return compilation_error(lines, line, "strings for `y' command are different lengths");
+	};
+	cmd.data = CommandData::Transliteration(Box::new(trans));
 	line.advance(); // move past last delimiter
 	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
@@ -2277,13 +2264,13 @@ mod tests {
 	use crate::sed::fast_io::IOChunk;
 
 	// Return an empty line provider and a char provider for the specified str.
-	fn make_providers(input: &str) -> (ScriptLineProvider, ScriptCharProvider) {
+	fn make_providers(input: &str) -> (ScriptLineProvider<'static>, ScriptCharProvider) {
 		let lines = ScriptLineProvider::new(vec![]); // Empty for tests
 		let line = ScriptCharProvider::new(input);
 		(lines, line)
 	}
 
-	fn make_line_provider(lines: &[&str]) -> ScriptLineProvider {
+	fn make_line_provider(lines: &[&str]) -> ScriptLineProvider<'static> {
 		let input = lines
 			.iter()
 			.map(|s| ScriptValue::StringVal((*s).to_string()))
@@ -2455,7 +2442,7 @@ mod tests {
 	}
 
 	// compile_re
-	fn dummy_providers() -> (ScriptLineProvider, ScriptCharProvider) {
+	fn dummy_providers() -> (ScriptLineProvider<'static>, ScriptCharProvider) {
 		make_providers("dummy input")
 	}
 
@@ -4055,7 +4042,7 @@ pub mod delimited_parser {
 use std::char;
 
 use crate::{
-	bre::{byte_char, push_char_bytes},
+	bre::byte_char,
 	sed::error_handling::SedResult,
 };
 
@@ -4465,8 +4452,9 @@ pub fn parse_regex(
 /// character of `X` (`\c\\` that of `\`, `\c` before any other escape an
 /// error, `\c` at the end nothing); `\dNNN`, `\oNNN` and `\xHH`, the byte of
 /// that value mod 256; and any other `\X`, `\\` too, the `X` alone, so
-/// `y/\u00E9/e/` is "strings for `y' command are different lengths". The
-/// locale reads the bytes as characters (see `compile_trans_command`):
+/// `y/\u00E9/e/` is "strings for `y' command are different lengths". A
+/// character of the script is its UTF-8, one from U+10FF80 too. The locale
+/// reads the bytes as characters (see `compile_trans_command`):
 /// `y/\xc3\xa9/e/` maps `é` in C.UTF-8.
 pub fn parse_transliteration(
 	lines: &mut ScriptLineProvider,
@@ -4509,7 +4497,7 @@ pub fn parse_transliteration(
 	while let Some((&c, after)) = rest.split_first() {
 		rest = after;
 		if c != '\\' {
-			push_char_bytes(&mut bytes, c);
+			push_utf8(&mut bytes, c);
 			continue;
 		}
 		// `text` holds a backslash only before the character it escapes.
@@ -4533,7 +4521,7 @@ pub fn parse_transliteration(
 				[target, after @ ..] => {
 					// GNU takes the first byte of the character after `\c`.
 					let start = bytes.len();
-					push_char_bytes(&mut bytes, *target);
+					push_utf8(&mut bytes, *target);
 					bytes[start] = bytes[start].to_ascii_uppercase() ^ 0x40;
 					rest = after;
 				},
@@ -4550,23 +4538,28 @@ pub fn parse_transliteration(
 					.map_while(|digit| digit.to_digit(radix))
 					.fold((0, 0_u32), |(digits, value), digit| (digits + 1, value * radix + digit));
 				if digits == 0 {
-					push_char_bytes(&mut bytes, escaped);
+					push_utf8(&mut bytes, escaped);
 				} else {
 					bytes.push(value.to_le_bytes()[0]);
 					rest = &rest[digits..];
 				}
 			},
-			other => push_char_bytes(&mut bytes, other),
+			other => push_utf8(&mut bytes, other),
 		}
 	}
 	Ok(bytes)
+}
+
+/// Appends the UTF-8 of `c` to `bytes`.
+fn push_utf8(bytes: &mut Vec<u8>, c: char) {
+	bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn make_providers(input: &str) -> (ScriptLineProvider, ScriptCharProvider) {
+	fn make_providers(input: &str) -> (ScriptLineProvider<'static>, ScriptCharProvider) {
 		let lines = ScriptLineProvider::new(vec![]); // Empty for tests
 		let line = ScriptCharProvider::new(input);
 		(lines, line)
@@ -5187,7 +5180,7 @@ use crate::sed::{
 };
 
 /// Error reported while compiling or executing a sed program.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SedError {
 	code: i32,
 	message: String,
@@ -9186,7 +9179,7 @@ use pi_vfs::BlockingFs;
 use uucore::display::Quotable;
 
 use crate::{
-	bre::{byte_char, char_byte, push_char_bytes},
+	bre::{byte_char, char_byte},
 	host::Host,
 };
 use crate::sed::error_handling::{IoContext, SedResult};
@@ -9630,12 +9623,12 @@ fn substitute(
 /// `printf 'caf\303\251\377\n' | sed 'y/é/e/'` prints `cafe\377`, and
 /// `printf 'a\364\217\276\200\377\n' | sed 'y/a/b/'` keeps the character
 /// U+10FF80 whole. Where it read them as bytes, as in the C locale, every
-/// line is read a byte at a time. A target that is a byte that is no UTF-8
-/// is written as that byte, and the line is then byte text where it is no
-/// UTF-8 any more.
+/// line is read a byte at a time. A target is written as
+/// [`Transliteration::push_target`] says, and the line is then byte text
+/// where it is no UTF-8 any more.
 fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 	let mut replaced = false;
-	if !pattern.is_bytes() && trans.reads_chars() && !trans.writes_bytes() {
+	if trans.reads_chars() && !trans.writes_bytes() && !pattern.is_bytes() {
 		// A line that is UTF-8 stays so.
 		let text = pattern.as_str();
 		let mut result = String::with_capacity(text.len());
@@ -9655,8 +9648,13 @@ fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 	// it changed.
 	let map_byte = |result: &mut Vec<u8>, byte: u8| {
 		let mapped = trans.lookup_byte(byte);
-		push_char_bytes(result, mapped);
-		mapped != byte_char(byte)
+		let changed = mapped != byte_char(byte);
+		if changed {
+			trans.push_target(result, mapped);
+		} else {
+			result.push(byte);
+		}
+		changed
 	};
 	if trans.reads_chars() {
 		for chunk in line.utf8_chunks() {
@@ -9666,7 +9664,7 @@ fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 					result.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
 				} else {
 					replaced = true;
-					push_char_bytes(&mut result, mapped);
+					trans.push_target(&mut result, mapped);
 				}
 			}
 			for &byte in chunk.invalid() {
@@ -10070,7 +10068,7 @@ fn process_file(
 				},
 				'y' => {
 					let trans = extract_variant!(command, Transliteration);
-					transliterate(&mut pattern, trans.get(context.y_locale.utf8));
+					transliterate(&mut pattern, trans);
 				},
 				'z' => {
 					// Clear the pattern contents, but preserve newline state
@@ -10367,16 +10365,21 @@ pub enum ScriptValue {
 
 /// The provider of script lines across all specified scripts
 /// Scripts can be specified to sed as files or as strings.
-pub struct ScriptLineProvider {
-	sources:     Vec<ScriptValue>,
-	state:       State,
-	stdin:       Option<OpenFile>,
-	paths:       ShellPaths,
+pub struct ScriptLineProvider<'a> {
+	sources:        Vec<ScriptValue>,
+	state:          State,
+	stdin:          Option<OpenFile>,
+	paths:          ShellPaths,
 	/// How many expressions (`-e` and the script operand) have been read.
-	expressions: usize,
+	expressions:    usize,
 	/// Where the line last read lies; kept once every script is read, for an
 	/// error found at the end.
-	place:       Place,
+	place:          Place,
+	/// Asks the shell whether its `LC_CTYPE` is UTF-8; see
+	/// [`Self::ctype_is_utf8`].
+	ctype_question: &'a dyn Fn() -> bool,
+	/// Its answer, once asked.
+	ctype_utf8:     Option<bool>,
 }
 
 /// Where the line last read lies, as GNU sed counts it in a compile error.
@@ -10408,19 +10411,35 @@ enum State {
 	Done, // All scripts have been processed
 }
 
-impl ScriptLineProvider {
-	/// Construct the script provider from the specified script sources
+impl<'a> ScriptLineProvider<'a> {
+	/// Construct the script provider from the specified script sources, for
+	/// a UTF-8 locale.
 	#[cfg(test)]
 	pub fn new(sources: Vec<ScriptValue>) -> Self {
-		Self::build(sources, None, ShellPaths::default())
+		fn utf8() -> bool {
+			true
+		}
+		Self::build(sources, None, ShellPaths::default(), &utf8)
 	}
 
-	/// Constructs a provider with the builtin stdin stream.
-	pub fn with_stdin(sources: Vec<ScriptValue>, stdin: OpenFile, paths: ShellPaths) -> Self {
-		Self::build(sources, Some(stdin), paths)
+	/// Constructs a provider with the builtin stdin stream, and the shell's
+	/// answer to whether its `LC_CTYPE` is UTF-8, which `ctype_question`
+	/// gives.
+	pub fn with_stdin(
+		sources: Vec<ScriptValue>,
+		stdin: OpenFile,
+		paths: ShellPaths,
+		ctype_question: &'a dyn Fn() -> bool,
+	) -> Self {
+		Self::build(sources, Some(stdin), paths, ctype_question)
 	}
 
-	fn build(sources: Vec<ScriptValue>, stdin: Option<OpenFile>, paths: ShellPaths) -> Self {
+	fn build(
+		sources: Vec<ScriptValue>,
+		stdin: Option<OpenFile>,
+		paths: ShellPaths,
+		ctype_question: &'a dyn Fn() -> bool,
+	) -> Self {
 		Self {
 			sources,
 			state: State::NotStarted,
@@ -10428,7 +10447,16 @@ impl ScriptLineProvider {
 			paths,
 			expressions: 0,
 			place: Place::start(ScriptSource::Expression(1)),
+			ctype_question,
+			ctype_utf8: None,
 		}
+	}
+
+	/// Whether the shell's `LC_CTYPE` is UTF-8, which a `y` command whose
+	/// strings read otherwise in the two locales asks: asked of the shell
+	/// the first time, and kept.
+	pub fn ctype_is_utf8(&mut self) -> bool {
+		*self.ctype_utf8.get_or_insert_with(self.ctype_question)
 	}
 
 	/// Return the currently processed script line number.
@@ -10596,9 +10624,9 @@ impl fmt::Debug for State {
 }
 
 #[cfg(test)]
-impl ScriptLineProvider {
+impl ScriptLineProvider<'_> {
 	pub fn with_active_state(input_name: &str, line_number: usize) -> Self {
-		let mut provider = Self::build(vec![], None, ShellPaths::default());
+		let mut provider = Self::new(vec![]);
 		provider.state = State::Active {
 			input_name: input_name.to_string(),
 			index:      0,
@@ -10750,7 +10778,7 @@ use crate::host::{Host, ShellPaths, Utility, format_usage, matches_parser};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::{
-	command::{ProcessingContext, StringSpace, YLocale},
+	command::{ProcessingContext, StringSpace},
 	fast_io::write_text_bytes,
 	processor::process_all_files,
 	script_line_provider::ScriptValue,
@@ -10767,9 +10795,9 @@ fn sed_main(matches: &ArgMatches, host: &mut Host) -> SedResult<()> {
 	let (scripts, files) = get_scripts_files(matches)?;
 	let mut context = build_context(matches, host.paths());
 
-	let compiled = compiler::compile_with_stdin(scripts, &mut context, host.stdin.file().clone());
-	context.y_locale.resolve(|| crate::locale::ctype_is_utf8(host))?;
-	let executable = compiled?;
+	let stdin = host.stdin.file().clone();
+	let ctype_utf8 = || crate::locale::ctype_is_utf8(host);
+	let executable = compiler::compile_with_stdin(scripts, &mut context, stdin, &ctype_utf8)?;
 	process_all_files(executable, files, &mut context, host)?;
 	Ok(())
 }
@@ -10989,7 +11017,6 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		unbuffered:       matches.get_flag("unbuffered"),
 		null_data:        matches.get_flag("null-data"),
 		paths:            paths.clone(),
-		y_locale:         YLocale::default(),
 
 		// Other context
 		input_name:           "<stdin>".to_string(),
@@ -11588,5 +11615,19 @@ mod tests {
 		assert_eq!((code, capture.err()), (1, refusal.to_owned()));
 		let (code, capture) = crate::host::run_util::<Sed>(&[r"y/a\xff/\xc3\xa9/", "in"], "", dir.path());
 		assert_eq!((code, capture.stdout()), (0, b"\xc3\xa9\n".to_vec()));
+	}
+
+	#[test]
+	fn builtin_y_error_comes_before_a_later_w_file_is_opened() {
+		// GNU sed 4.9 reports a `y` command's error before it opens the file
+		// of a later `w`: `echo keep >out; printf 'x\n' | LC_ALL=C sed -e
+		// 'y/é/e/' -e 'w out'` leaves `out` holding `keep`. The error was
+		// reported once the whole script was compiled, `out` emptied first.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("out"), "keep\n").unwrap();
+		let (code, capture) = crate::host::run_util::<Sed>(&["-e", "y/é/e/", "-e", "w out"], "x\n", dir.path());
+		let refusal = "sed: -e expression #1, char 7: strings for `y' command are different lengths\n";
+		assert_eq!((code, capture.err()), (1, refusal.to_owned()));
+		assert_eq!(std::fs::read_to_string(dir.path().join("out")).unwrap(), "keep\n");
 	}
 }

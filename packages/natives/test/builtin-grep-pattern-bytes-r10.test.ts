@@ -255,6 +255,23 @@ describe("builtin grep: -w beside a byte that is not UTF-8, in the C.UTF-8 local
 		[String.raw`printf 'ab\377c\n' | LC_ALL=C.UTF-8 grep -ow 'ab\|c'`, "ab\nc\n", 0],
 		// Regressed: the second `a` alone was printed.
 		[String.raw`printf 'a\377 a\n' | LC_ALL=C.UTF-8 grep -ow a`, "a\na\n", 0],
+		// Regressed: a match that crossed the byte was refused, and the shorter one GNU takes,
+		// which ends at the byte, was not tried.
+		[String.raw`printf 'ab\377cd\n' | LC_ALL=C.UTF-8 grep -ow 'a.*'`, "ab\n", 0],
+		[String.raw`printf 'a\377a\377\n' | LC_ALL=C.UTF-8 grep -cw 'a.*'`, "1\n", 0],
+		[String.raw`printf '\377ab\377\n' | LC_ALL=C.UTF-8 grep -ow '[^x]*'`, "ab\n", 0],
+		// Regressed: `-o` printed `a`, as the longest alternative was searched without the byte
+		// as an edge.
+		[String.raw`printf 'a b\377\n' | LC_ALL=C.UTF-8 grep -ow 'a\|a b'`, "a b\n", 0],
+		// Already GNU's answer, kept: `$` holds at the end of the line alone, `é` is a word
+		// character, and the byte 0x7F is a character.
+		[String.raw`printf 'ab\377cd\n' | LC_ALL=C.UTF-8 grep -cw 'a.*$'`, "0\n", 1],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -cw a`, "0\n", 1],
+		[String.raw`printf 'ab\377cd\n' | LC_ALL=C.UTF-8 grep -ow '[a-z]*'`, "ab\ncd\n", 0],
+		[String.raw`printf 'ab\377cd\n' | LC_ALL=C.UTF-8 grep -bow cd`, "3:cd\n", 0],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -ow 'a\|ab'`, "ab\n", 0],
+		[String.raw`printf 'a\177b\377\n' | LC_ALL=C.UTF-8 grep -cw 'a.b'`, "1\n", 0],
+		[String.raw`printf 'a\377\0' | LC_ALL=C.UTF-8 grep -zcw a`, "1\n", 0],
 	]);
 });
 
@@ -268,7 +285,11 @@ describe("builtin grep: -P on a line that is not UTF-8, in the C.UTF-8 locale", 
 		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '^\w'`, "0\n", 1],
 		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '\w'`, "0\n", 1],
 		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '[[:alpha:]]'`, "0\n", 1],
+		// Regressed: the word test read `é` as a word character, counted 0.
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -cw a`, "1\n", 0],
+		[String.raw`printf 'x\303\251y\377\n' | LC_ALL=C.UTF-8 grep -P -cw y`, "1\n", 0],
 		// Already GNU's answer, kept.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -P -cw a`, "1\n", 0],
 		[String.raw`printf 'a\377b\n' | LC_ALL=C.UTF-8 grep -P -c 'a.b'`, "0\n", 1],
 		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -P -ic $'\303\251'`, "1\n", 0],
 		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -P -c '\x{e9}'`, "1\n", 0],
@@ -299,6 +320,21 @@ describe("builtin grep: without case, the counterparts GNU gives a letter", () =
 		// Already GNU's answer, kept: `É` for `é`, and `K` for `k` beside a back-reference.
 		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic $'\303\251'`, "1\n", 0],
 		[String.raw`printf 'ka\n' | LC_ALL=C.UTF-8 grep -ic 'K\(a\)\1*'`, "1\n", 0],
+	]);
+});
+
+describe("builtin grep: a back-reference among the patterns, on a line that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 reads the characters of such a line as in a line that is
+	// UTF-8: `é` is a letter and a word character, of either case.
+	cases([
+		// Regressed: each read `é` as no letter, or without case.
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c '^\w\|\(x\)\1'`, "1\n", 0],
+		[String.raw`printf '\303\211\377\n' | LC_ALL=C.UTF-8 grep -ic -e $'\303\251' -e '\(x\)\1'`, "1\n", 0],
+		[String.raw`printf 'a\303\251\377\n' | LC_ALL=C.UTF-8 grep -cw -e a -e '\(x\)\1'`, "0\n", 1],
+		[String.raw`printf '\303\251\377\n' | LC_ALL=C.UTF-8 grep -c -e '^[[:alpha:]]' -e '\(x\)\1'`, "1\n", 0],
+		// Already GNU's answer, kept.
+		[String.raw`printf 'x\377y\n' | LC_ALL=C.UTF-8 grep -c -e 'x.y' -e '\(q\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -cw -e '\(a\)\1*'`, "1\n", 0],
 	]);
 });
 
