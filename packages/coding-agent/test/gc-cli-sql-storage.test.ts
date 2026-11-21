@@ -3,6 +3,10 @@
  * A phase may delete only what the configured storage proves dead: the files
  * on disk can veto a deletion, never authorize one. Phases that work only on
  * session files on disk refuse, and say so.
+ *
+ * The command-line refusal of `--strip` runs against SQLite always, and
+ * against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
+ * `OMP_TEST_SQL_MYSQL_URL` name a server, each in a database of its own.
  */
 import { SQL } from "bun";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
@@ -20,6 +24,9 @@ import {
 	hashPath,
 } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { cliDatabase, LEASE_BACKENDS } from "./session/sql-session-lease-fixture";
+
+const CLI_ENTRY = path.join(import.meta.dir, "..", "src", "cli.ts");
 
 let root: string;
 let client: SQL | undefined;
@@ -188,33 +195,59 @@ describe("omp gc --stale under session.storage: sql", () => {
 });
 
 describe("omp gc disk-only phases under session.storage: sql", () => {
+	/**
+	 * A cold session file on disk with replay data outside its latest replay
+	 * turn: the first response's signed reasoning is what `--strip` removes, so
+	 * a strip that ran would change the bytes as well as report itself.
+	 */
 	async function coldLocalSession(): Promise<{ file: string; bytes: Uint8Array }> {
 		const file = path.join(getSessionsDir(root), "project", "cold.jsonl");
+		const assistant = (thinking: string, signature: string) =>
+			JSON.stringify({
+				type: "message",
+				message: {
+					role: "assistant",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "stop",
+					content: [
+						{ type: "thinking", thinking, thinkingSignature: signature },
+						{ type: "text", text: "done" },
+					],
+				},
+			});
+		const prompt = JSON.stringify({
+			type: "message",
+			message: { role: "user", content: [{ type: "text", text: "again" }] },
+		});
 		await Bun.write(
 			file,
-			`${transcript("cold", "old")}${JSON.stringify({ type: "message", message: { role: "assistant", content: [] } })}\n`,
+			`${transcript("cold", "old")}${assistant("earlier", "EqQBearly")}\n${prompt}\n${assistant("latest", "EqQBlatest")}\n`,
 		);
 		const old = new Date(Date.now() - 90 * 86_400_000);
 		await fs.utimes(file, old, old);
 		return { file, bytes: await Bun.file(file).bytes() };
 	}
 
-	for (const phase of ["archive", "compress"] as const) {
+	for (const phase of ["archive", "compress", "strip"] as const) {
 		test(`--${phase} --apply refuses, names the storage, and leaves session files alone`, async () => {
 			const { file, bytes } = await coldLocalSession();
 
 			const result = await runGcCommand({
 				flags: {
 					agentDir: root,
-					...(phase === "archive" ? { archive: true } : { compress: true }),
+					[phase]: true,
 					apply: true,
 					coldArchiveAfterDays: 0,
 					retainNewestGlobal: 0,
 					retainNewestPerCwd: 0,
 					compressAfterDays: 0,
+					stripAfterDays: 0,
 				},
 			});
 
+			expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
 			expect(result[phase]).toBeUndefined();
 			expect(result.refused).toEqual([
 				{ phase, requested: true, reason: expect.stringContaining("unavailable with session.storage: sql") },
@@ -222,7 +255,6 @@ describe("omp gc disk-only phases under session.storage: sql", () => {
 			expect(collectGcErrors(result)).toEqual([
 				expect.stringContaining(`${phase}: unavailable with session.storage: sql`),
 			]);
-			expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
 			expect(await Bun.file(path.join(root, "archive")).exists()).toBe(false);
 		});
 	}
@@ -236,4 +268,61 @@ describe("omp gc disk-only phases under session.storage: sql", () => {
 		expect(collectGcErrors(result)).toEqual([]);
 		expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
 	});
+
+	// What a person runs: `omp gc --strip --apply` under each SQL backend fails
+	// with one line naming the storage and the reason, and changes no file.
+	for (const backend of LEASE_BACKENDS) {
+		test.skipIf(!backend.url)(
+			`omp gc --strip --apply on ${backend.adapter} exits 1 naming the storage and leaves session files alone`,
+			async () => {
+				const db = backend.adapter === "sqlite" ? undefined : await cliDatabase(backend.adapter, backend.url!);
+				try {
+					const dsnFile = path.join(root, "cli.dsn");
+					await Bun.write(dsnFile, `${db?.dsn ?? `sqlite:${path.join(root, "cli-sessions.db")}`}\n`);
+					const { file, bytes } = await coldLocalSession();
+
+					const proc = Bun.spawn(
+						[
+							process.execPath,
+							CLI_ENTRY,
+							"gc",
+							"--strip",
+							"--apply",
+							"--strip-after-days",
+							"0",
+							"--agent-dir",
+							root,
+						],
+						{
+							cwd: root,
+							env: {
+								...process.env,
+								NO_COLOR: "1",
+								PI_CODING_AGENT_DIR: root,
+								OMP_SESSION_STORAGE: "sql",
+								OMP_SESSION_SQL_DSN_FILE: dsnFile,
+							},
+							stdin: "ignore",
+							stdout: "pipe",
+							stderr: "pipe",
+						},
+					);
+					const [exitCode, stdout, stderr] = await Promise.all([
+						proc.exited,
+						new Response(proc.stdout).text(),
+						new Response(proc.stderr).text(),
+					]);
+
+					expect(exitCode, `${stdout}\n${stderr}`).toBe(1);
+					expect(stderr).toContain(
+						"- strip: unavailable with session.storage: sql: stripping rewrites session files on disk",
+					);
+					expect(await Bun.file(file).bytes()).toEqual(new Uint8Array(bytes));
+				} finally {
+					await db?.[Symbol.asyncDispose]();
+				}
+			},
+			60_000,
+		);
+	}
 });
