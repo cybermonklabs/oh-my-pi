@@ -4148,9 +4148,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 							let consumer = stage_text(unit, info, i + 1);
 							tap.open(BStr::new(&producer), BStr::new(&consumer))
 						});
+						// Untapped, the pipe becomes an OS pipe once an external
+						// takes an end, so two external stages share it as
+						// bash's do; a tapped one stays in memory for its mirror.
 						let (r, w) = match mirror {
 							Some(mirror) => mem::tapped_pipe(mirror),
-							None => mem::pipe(),
+							None => mem::stage_pipe(),
 						};
 						let w = FdRef::mem(w);
 						fds.set(1, Some(w.clone()));

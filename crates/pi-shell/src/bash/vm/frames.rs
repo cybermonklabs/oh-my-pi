@@ -126,10 +126,14 @@ impl FdImager {
 		if let Some(&i) = self.by_obj.get(&h.key()) {
 			return i;
 		}
-		let mem = h.with_mem(|m| {
-			let (key, end) = m.key();
-			(self.mem(key, || m.image()), end)
-		});
+		// A pipe that became an OS pipe has no image (its bytes are in the
+		// kernel, externals hold its ends): it is lost, as a host file is.
+		let mem = h
+			.with_mem(|m| {
+				let (key, end) = m.key();
+				m.image().map(|img| (self.mem(key, || img), end))
+			})
+			.flatten();
 		let img = match (mem, h.origin(), h.kind()) {
 			(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
 			(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
@@ -562,7 +566,7 @@ impl Shell {
 				});
 			}
 			for (fd, h) in p.fds.iter() {
-				if h.origin() == FdOrigin::Host
+				if (h.origin() == FdOrigin::Host || h.is_os_pipe())
 					&& let Some(kind) = h.kind()
 				{
 					report.lost.push(Lost::Fd { vpid: p.vpid, fd, kind });
@@ -1383,5 +1387,27 @@ mod tests {
 		assert!(r.poll_read(&mut cx, &mut buf).is_pending(), "the duplicate writer keeps it open");
 		drop(w2);
 		assert!(matches!(r.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "then EOF");
+	}
+
+	// Failure mode: a pipe that became an OS pipe is imaged as a memory pipe
+	// (its kernel bytes and the externals' ends silently dropped) instead of
+	// lost, so a restore would pretend to resume it.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[test]
+	fn a_pipe_shared_with_externals_is_imaged_as_lost() {
+		use super::FdObjImage;
+		use crate::bash::fd::FdOrigin;
+		let (r, w) = crate::bash::mem::stage_pipe();
+		let (r, w) = (FdRef::mem(r), FdRef::mem(w));
+		let (pr, pw) = crate::bash::mem::stage_pipe();
+		let (pr, pw) = (FdRef::mem(pr), FdRef::mem(pw));
+		w.share_with_external(crate::sys::stage_pipe::os_pipe);
+		assert!(r.is_os_pipe() && w.is_os_pipe() && !pr.is_os_pipe());
+		let mut img = FdImager::default();
+		let ids = [img.fd(&r), img.fd(&w), img.fd(&pr), img.fd(&pw)];
+		assert!(matches!(img.objs[ids[0] as usize], FdObjImage::Lost(FdOrigin::Mem)));
+		assert!(matches!(img.objs[ids[1] as usize], FdObjImage::Lost(FdOrigin::Mem)));
+		assert!(matches!(img.objs[ids[2] as usize], FdObjImage::Mem { .. }), "a memory pipe images");
+		assert_eq!(img.mems.len(), 1, "only the memory pipe has an image");
 	}
 }

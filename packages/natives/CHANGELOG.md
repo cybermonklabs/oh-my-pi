@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Two external commands joined by a pipe in the bash and zsh shells (`a | b`) now share one OS pipe on Linux, as they do under bash and zsh: they keep exchanging output when the shell itself dies, and the bytes no longer pass through the shell's process. A pipe the bash tool mirrors as a pipe stream still runs through the shell, and on macOS and Windows every pipe still does.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
