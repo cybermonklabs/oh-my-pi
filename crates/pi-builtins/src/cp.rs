@@ -5067,6 +5067,11 @@ mod tests {
 	///
 	/// Rows ending in `(stated)` differ from GNU, as stated in the CHANGELOG:
 	/// a link at `a~` is replaced, where GNU writes through it.
+	///
+	/// A cp that opens a row's FIFO for reading would wait for a writer and
+	/// hang the test: while the row runs, the test opens the FIFO's write end
+	/// without waiting and closes it, so that cp reads end-of-file and the row
+	/// fails at once, saying so.
 	#[cfg(unix)]
 	#[test]
 	fn an_own_entry_is_asked_about_and_compared_as_gnu_does() {
@@ -5141,9 +5146,34 @@ mod tests {
 					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
 				}
 			}
+			// The write end opens without waiting only while something has the
+			// FIFO open for reading, which here only cp can do.
+			let fifos: Vec<_> = setup.split(' ').filter_map(|step| step.strip_prefix("fifo:")).map(|name| dir.join(name)).collect();
+			let (row_done, done) = std::sync::mpsc::channel::<()>();
+			let guard = (!fifos.is_empty()).then(|| {
+				std::thread::spawn(move || {
+					use std::os::unix::fs::OpenOptionsExt as _;
+					let mut read = false;
+					while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+						done.recv_timeout(std::time::Duration::from_millis(100))
+					{
+						for fifo in &fifos {
+							read |= fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(fifo).is_ok();
+						}
+					}
+					read
+				})
+			});
 			let (got, capture) = run_util::<Cp>(args, answer, &dir);
+			drop(row_done);
+			let read_fifo = guard.is_some_and(|guard| guard.join().unwrap());
 			let found = (got, capture.err(), crate::file_backup::tests::listing(&dir));
-			if found != (code, err.to_owned(), after.to_owned()) {
+			if read_fifo {
+				failures.push(format!(
+					"{case}: cp {}: cp opened the FIFO for reading and waited for a writer (the test closed a write end to end the wait): {found:?}",
+					args.join(" ")
+				));
+			} else if found != (code, err.to_owned(), after.to_owned()) {
 				failures.push(format!("{case}: cp {}: {found:?}", args.join(" ")));
 			}
 		}
