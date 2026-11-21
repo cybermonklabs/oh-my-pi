@@ -104,6 +104,7 @@ import {
 	type OpenAICompletionsParams,
 	type OpenAIPromptCacheOptions,
 	type OpenAIRequestSetup,
+	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
 	parseAzureDeploymentNameMap,
 	readOpenRouterRawMetadata,
@@ -115,6 +116,7 @@ import {
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
 import { openAIFunctionTools } from "./openai-tool-strict";
+import { OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX, reportProviderFallback } from "./provider-fallbacks";
 import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
@@ -695,8 +697,6 @@ type BuiltOpenAICompletionTools = {
 	strictToolsApplied: boolean;
 };
 
-const OPENAI_COMPLETIONS_PROVIDER_SESSION_STATE_PREFIX = "openai-completions:";
-
 type OpenAICompletionsProviderSessionState = ProviderSessionState &
 	OpenAIStrictToolsState &
 	OpenAIReasoningEffortFallbackState;
@@ -716,7 +716,7 @@ function createOpenAICompletionsProviderSessionState(): OpenAICompletionsProvide
 }
 
 function getOpenAICompletionsProviderSessionState(
-	model: Model<"openai-completions">,
+	model: Pick<Model<"openai-completions">, "provider" | "id">,
 	baseUrl: string | undefined,
 	providerSessionState: Map<string, ProviderSessionState> | undefined,
 ): OpenAICompletionsProviderSessionState | undefined {
@@ -727,6 +727,23 @@ function getOpenAICompletionsProviderSessionState(
 	const created = createOpenAICompletionsProviderSessionState();
 	providerSessionState.set(key, created);
 	return created;
+}
+
+/**
+ * Puts back the strict-tools fallback an earlier process of the session kept for `scope` (see
+ * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): its requests send no tool as strict, as the requests after the
+ * endpoint rejected strict tools did.
+ */
+export function restoreOpenAICompletionsStrictToolsFallback(
+	providerSessionState: Map<string, ProviderSessionState>,
+	scope: OpenAIStrictToolsScope,
+): void {
+	const state = getOpenAICompletionsProviderSessionState(
+		{ provider: scope.provider, id: scope.modelId },
+		scope.baseUrl,
+		providerSessionState,
+	);
+	disableStrictToolsForScope(state, scope);
 }
 
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
@@ -1037,6 +1054,7 @@ const streamOpenAICompletionsOnce = (
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
 				) {
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
+					reportProviderFallback(options?.providerSessionState);
 					disableStrictTools = true;
 					openaiStream = await createCompletionsStream();
 				} else {
@@ -1052,6 +1070,7 @@ const streamOpenAICompletionsOnce = (
 					// Remember the rejection for the rest of the session so every
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
+					reportProviderFallback(options?.providerSessionState);
 					disableStrictTools = true;
 					openaiStream = await createCompletionsStream();
 				}

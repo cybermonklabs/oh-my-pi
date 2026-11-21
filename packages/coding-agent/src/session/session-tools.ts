@@ -1199,6 +1199,8 @@ export class SessionTools {
 	#restoredTranscript: RestoredTranscript | undefined;
 	/** Digests of the last primary model call, until its reply ends. */
 	#capturedCall: ModelCallDigests | undefined;
+	/** The active tools when the last primary model call captured its digests, until its reply ends. */
+	#capturedCallTools: AgentTool[] | undefined;
 	/** Digests of the call each primary reply with provider output was produced by. */
 	readonly #replyCalls = new WeakMap<AgentMessage, ModelCallDigests>();
 	/** Newest {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record of a branch view ({@link scanNewestRecord}). */
@@ -2915,6 +2917,7 @@ export class SessionTools {
 		const promptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
 		const toolsDigest = this.#host.toolDefinitionsDigest();
 		this.#capturedCall = { prompt: promptDigest, tools: toolsDigest };
+		this.#capturedCallTools = this.#host.agent.state.tools;
 		if (this.#heldSettingsRebuild) return;
 		if (this.#host.model()?.thinking?.prefixBinding !== true) {
 			this.#sentDeclarations = undefined;
@@ -2939,6 +2942,29 @@ export class SessionTools {
 	}
 
 	/**
+	 * Called when a provider turned its strict-tools fallback on in the session's provider state: the endpoint
+	 * rejected strict tools, so the call in flight retries sending its tools without `strict`. The digest of its tool
+	 * definitions is taken again for the tools it captured, now that the fallback counts in it, and so are the
+	 * declarations kept with that digest (what the call declares, what a held rebuild keeps declaring), so its reply
+	 * records the definitions the retry sent. A call the fallback does not reach keeps its digest. Gives whether a
+	 * call in flight now counts other tool definitions.
+	 */
+	recountCapturedCallTools(): boolean {
+		const call = this.#capturedCall;
+		const tools = this.#capturedCallTools;
+		if (!call || !tools) return false;
+		const recounted = this.#host.toolDefinitionsDigest(tools);
+		if (recounted === call.tools) return false;
+		this.#capturedCall = { prompt: call.prompt, tools: recounted };
+		const sent = this.#sentDeclarations;
+		if (sent?.toolsDigest === call.tools) this.#sentDeclarations = { ...sent, toolsDigest: recounted };
+		const held = this.#heldSettingsRebuild;
+		const kept = held?.declarations;
+		if (held && kept?.toolsDigest === call.tools) held.declarations = { ...kept, toolsDigest: recounted };
+		return true;
+	}
+
+	/**
 	 * Called synchronously when a primary reply ends. A reply carrying provider
 	 * output was produced by the last captured call; one without (a call
 	 * stopped before it was sent, an abort before the first event) binds nothing,
@@ -2947,6 +2973,7 @@ export class SessionTools {
 	bindReplyToCapturedPrompt(reply: AgentMessage): void {
 		const call = this.#capturedCall;
 		this.#capturedCall = undefined;
+		this.#capturedCallTools = undefined;
 		if (call === undefined || reply.role !== "assistant") return;
 		if (reply.content.some(block => block.type !== "text" || block.text.length > 0)) {
 			this.#replyCalls.set(reply, call);

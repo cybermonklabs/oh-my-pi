@@ -210,6 +210,7 @@ import {
 	anthropicKeepsToolDeclaration,
 	declareAnthropicTools,
 } from "./anthropic-tool-declaration";
+import { ANTHROPIC_FALLBACK_FLAGS, type AnthropicFallback, reportProviderFallback } from "./provider-fallbacks";
 
 export {
 	applyClaudeToolPrefix,
@@ -528,6 +529,24 @@ function getAnthropicProviderSessionState(
 	// fresh state has nothing to lower and only takes the stamp.
 	if (anchor !== undefined) observeAnthropicFastModeRearm(state, anchor.fastModeRearmGeneration);
 	return state;
+}
+
+/**
+ * Puts back a fallback an earlier process of the session kept for an endpoint and model (see
+ * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): the requests there leave out what the endpoint rejected, as the
+ * requests after its 400 did.
+ */
+export function restoreAnthropicFallback(
+	providerSessionState: Map<string, ProviderSessionState>,
+	fallback: AnthropicFallback,
+): void {
+	const state = getAnthropicProviderSessionState(providerSessionState, undefined, fallback.baseUrl, fallback.modelId);
+	if (!state) return;
+	if (fallback.off === "thinking-blocks") {
+		for (const key of fallback.blocks) state.prefixDroppedThinkingBlocks.add(key);
+	} else {
+		state[ANTHROPIC_FALLBACK_FLAGS[fallback.off]] = true;
+	}
 }
 
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
@@ -3309,6 +3328,7 @@ const streamAnthropicOnce = (
 						});
 						if (providerSessionState) {
 							providerSessionState.strictToolsDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						disableStrictTools = true;
 						params = await rebuildParams(streamFailure);
@@ -3412,7 +3432,9 @@ const streamAnthropicOnce = (
 						});
 						prefixBindingRetryAttempted = true;
 						prefixMismatchBehavior = undefined;
-						dropAllThinking = !rememberPrefixBindingFailure(params, streamFailureMessage, providerSessionState);
+						const droppedBound = rememberPrefixBindingFailure(params, streamFailureMessage, providerSessionState);
+						if (droppedBound) reportProviderFallback(options?.providerSessionState);
+						dropAllThinking = !droppedBound;
 						params = await rebuildParams(streamFailure);
 						providerRetryAttempt = 0;
 						output.content.length = 0;
@@ -3453,6 +3475,7 @@ const streamAnthropicOnce = (
 							latestTurnThinkingRetryAttempted = true;
 							if (providerSessionState) {
 								for (const key of keys) providerSessionState.prefixDroppedThinkingBlocks.add(key);
+								reportProviderFallback(options?.providerSessionState);
 							} else {
 								dropAllThinking = true;
 							}
@@ -3489,6 +3512,7 @@ const streamAnthropicOnce = (
 						);
 						if (providerSessionState) {
 							providerSessionState.replayUnsignedThinkingDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						forceDemoteUnsignedThinking = true;
 						params = await rebuildParams(streamFailure);
@@ -3530,6 +3554,7 @@ const streamAnthropicOnce = (
 						);
 						if (providerSessionState) {
 							providerSessionState.thinkingReplayDisabled = true;
+							reportProviderFallback(options?.providerSessionState);
 						}
 						droppedAllThinkingForSignature = true;
 						dropAllThinking = true;
@@ -3784,12 +3809,14 @@ const streamAnthropicOnce = (
 			if (providerSessionState) {
 				if (cacheControlRejectionReplayed) {
 					providerSessionState.cacheControlUnsupported = true;
+					reportProviderFallback(options?.providerSessionState);
 				} else if (cacheControlOptionRejectionReplayed) {
 					// The narrow latch, so the rest of the session keeps sending
 					// breakpoints. Exclusive with the one above: when both rungs ran,
 					// the field refusal is what carried the turn and what the next turn
 					// must start from.
 					providerSessionState.cacheControlOptionsUnsupported = true;
+					reportProviderFallback(options?.providerSessionState);
 				}
 			}
 			stream.push({

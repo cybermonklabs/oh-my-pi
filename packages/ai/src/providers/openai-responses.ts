@@ -127,6 +127,7 @@ import {
 	storesResponsesServerSide,
 } from "./openai-responses-state";
 import { isResponsesWebSocketProgressEvent, ResponsesWebSocketTransportError } from "./responses-websocket-connection";
+import { reportProviderFallback } from "./provider-fallbacks";
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
@@ -533,6 +534,19 @@ function getOpenAIResponsesProviderSessionState(
 	const created = createOpenAIResponsesProviderSessionState(model);
 	providerSessionState.set(key, created);
 	return created;
+}
+
+/**
+ * Puts back the strict-tools fallback an earlier process of the session kept for `scope` (see
+ * `@oh-my-pi/pi-ai/providers/provider-fallbacks`): requests for `model`'s provider send no tool as strict for that
+ * scope, as the requests after the endpoint rejected strict tools did.
+ */
+export function restoreOpenAIResponsesStrictToolsFallback(
+	providerSessionState: Map<string, ProviderSessionState>,
+	model: Model<"openai-responses">,
+	scope: OpenAIStrictToolsScope,
+): void {
+	disableStrictToolsForScope(getOpenAIResponsesProviderSessionState(model, providerSessionState), scope);
 }
 
 function isOpenAIResponsesStatefulEnabled(
@@ -1124,6 +1138,7 @@ const streamOpenAIResponsesOnce = (
 								strictRetryAvailable = false;
 								forceDisableStrictTools = true;
 								disableStrictToolsForScope(providerSessionState, strictToolsScope);
+								reportProviderFallback(options?.providerSessionState);
 								const fallback = await prepareRequest(true);
 								chained = fallback.chained;
 								activeRawRequestDump.body = chained.params;

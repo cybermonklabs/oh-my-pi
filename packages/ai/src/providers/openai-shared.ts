@@ -152,7 +152,8 @@ export interface OpenAIStrictToolsScope {
 
 export interface OpenAIStrictToolsState {
 	strictTools: {
-		disabledModelScopes: Set<string>;
+		/** Each scope whose endpoint rejected strict tools, by `${provider}:${baseUrl}:${modelId}`. */
+		disabledModelScopes: Map<string, OpenAIStrictToolsScope>;
 	};
 }
 
@@ -588,7 +589,7 @@ export function parseAzureDeploymentNameMap(value: string | undefined): Map<stri
 export function createOpenAIStrictToolsState(): OpenAIStrictToolsState {
 	return {
 		strictTools: {
-			disabledModelScopes: new Set<string>(),
+			disabledModelScopes: new Map<string, OpenAIStrictToolsScope>(),
 		},
 	};
 }
@@ -623,7 +624,11 @@ export function disableStrictToolsForScope(
 	scope: OpenAIStrictToolsScope | undefined,
 ): void {
 	if (!scope) return;
-	state?.strictTools.disabledModelScopes.add(`${scope.provider}:${scope.baseUrl ?? ""}:${scope.modelId}`);
+	state?.strictTools.disabledModelScopes.set(`${scope.provider}:${scope.baseUrl ?? ""}:${scope.modelId}`, {
+		provider: scope.provider,
+		baseUrl: scope.baseUrl,
+		modelId: scope.modelId,
+	});
 }
 
 /**

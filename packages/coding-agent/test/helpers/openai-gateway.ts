@@ -113,16 +113,20 @@ function answer(api: OpenAIGatewayApi, turn: number): Response {
 }
 
 /**
- * Spies on `fetch` as the gateway's `api`: each request to its path is recorded and answered with a text reply that
- * read the cache; a request to any other URL throws.
+ * Spies on `fetch` as the gateway's `api`: each request to its path is recorded and answered with what `refuse` gives
+ * for it, else a text reply that read the cache; a request to any other URL throws.
  */
-export function mockOpenAIGatewayFetch(api: OpenAIGatewayApi): { requests: GatewayRequest[]; restore(): void } {
+export function mockOpenAIGatewayFetch(
+	api: OpenAIGatewayApi,
+	refuse?: (request: GatewayRequest) => Response | undefined,
+): { requests: GatewayRequest[]; restore(): void } {
 	const requests: GatewayRequest[] = [];
 	const spy = vi.spyOn(globalThis, "fetch").mockImplementation(
 		asGlobalFetch(async (input, init) => {
 			if (String(input) !== `${GATEWAY}${PATHS[api]}`) throw new Error(`Unexpected request to ${String(input)}`);
-			requests.push(JSON.parse(requestBodyText(init) ?? "{}"));
-			return answer(api, requests.length);
+			const request: GatewayRequest = JSON.parse(requestBodyText(init) ?? "{}");
+			requests.push(request);
+			return refuse?.(request) ?? answer(api, requests.length);
 		}),
 	);
 	return { requests, restore: () => spy.mockRestore() };
