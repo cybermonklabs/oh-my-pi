@@ -38,7 +38,7 @@ import {
 	type SessionHeader,
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
-import { isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
+import { imageAt, isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
@@ -965,7 +965,7 @@ function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string)
 	if (typeof value !== "object" || value === null) return;
 	const holder = value as Record<string, unknown>;
 	const site = resolvedImageSiteOf(holder, key);
-	const ref = site === undefined ? undefined : holder[site];
+	const ref = site === undefined ? undefined : imageAt(holder, site);
 	if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
 		sites.push({ holder, key: site, ref, asDataUrl: false });
 		// An image payload's other fields hold no image.

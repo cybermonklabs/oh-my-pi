@@ -6,7 +6,6 @@ import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, Snowfla
 import { digestStream } from "../utils/file-hash";
 import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
-	headerSessionId,
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
@@ -22,6 +21,7 @@ import {
 	type SessionStorage,
 	SessionWriteConflictError,
 	claimSessionLease,
+	sessionHeaderIdInPrefix,
 	sessionLeaseId,
 } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
@@ -196,7 +196,8 @@ interface DialectQueries {
 	 * rows' parts, then every part under `@dir` that has no row:
 	 * a staged full write's parts that its killed writer never swapped in, of
 	 * a path the delete may not know of (on MySQL, not those of a path too
-	 * long for a staging path under `@dir`, see {@link longPathsUnder}).
+	 * long for a staging path under `@dir`, staged under its hash, see
+	 * `#stagingPrefix`).
 	 * PostgreSQL and MySQL delete the rows and their parts in one statement,
 	 * so the parts deleted are those of the rows deleted: a row another
 	 * client commits between two statements would
@@ -245,13 +246,6 @@ interface DialectQueries {
 	deleteStaging: Statement;
 	/** Whether {@link deleteStaging} would find any part, read without locking. */
 	hasStaging: Statement;
-	/**
-	 * MySQL only: the session rows under `@dir`, found as {@link deleteUnder}
-	 * finds them, whose path is longer than `@fits` characters, row-locked:
-	 * their staging sets are named by the path's hash (see `#stagingPrefix`),
-	 * outside the key range of `@dir` that the directory delete takes.
-	 */
-	longPathsUnder: Statement | undefined;
 	/** The byte length of each staging part of `@path`, row-locked where the dialect can, so no peer deletes one before the swap. */
 	stagedBytes: Statement;
 	/** Insert a part; on SQLite with a rowid from `@now` (see {@link partRowids}). */
@@ -597,11 +591,6 @@ interface StagedPartRow {
 	len: number | bigint | string;
 }
 
-/** `longPathsUnder` row. */
-interface PathRow {
-	path: string;
-}
-
 /** `readChunksDigest` row: the digest in upper-case hex. */
 interface ChunksDigestRow {
 	digest: string;
@@ -660,6 +649,14 @@ interface HashRow {
 /** A row with only a path column. */
 interface PathRow {
 	path: string;
+}
+
+/** What `#lockSessionRowsForWrite` answers. */
+interface LockedSessionRows {
+	/** MySQL and MariaDB without `under`: the paths whose rows it locked, the only ones the caller changes. Elsewhere `undefined`. */
+	present: ReadonlySet<string> | undefined;
+	/** PostgreSQL and MySQL with `under`: every row it locked, of the paths named and under the directory. Elsewhere none. */
+	locked: readonly PathRow[];
 }
 
 /** A reference row. */
@@ -1602,12 +1599,6 @@ function buildQueries(
 		hasStaging: sql(
 			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")} LIMIT 1`,
 		),
-		longPathsUnder: mysql
-			? sql(
-					`SELECT path FROM ${table} WHERE path >= @stem AND path < @dir_end AND ${startsWith("path", "@dir")} ` +
-						"AND CHAR_LENGTH(path) > @fits FOR UPDATE",
-				)
-			: undefined,
 		stagedBytes: sql(
 			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,
 		),
@@ -3105,7 +3096,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await claim.after;
 		for (const file of claim.paths.keys()) {
 			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch(() => [""]);
-			const id = headerSessionId(head ?? "");
+			const id = sessionHeaderIdInPrefix(head ?? "");
 			if (id !== undefined && id !== (claim.headers.get(file) ?? claim.sessionId)) {
 				claim.foreign = true;
 				return false;
@@ -4827,7 +4818,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
-			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
+			const { present, locked } = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
 			const ordered = [...new Set(paths)].sort();
 			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
 			for (const path of ordered) {
@@ -4836,25 +4827,24 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			// The staging sets the directory delete does not take: those of a path not under `dir`, and on
 			// MySQL those of a path too long for `<path>#staging-` names, named by its hash instead
-			// (#stagingPrefix): the explicit paths', and those of every row under `dir`, found before it goes.
+			// (#stagingPrefix): the explicit paths', and those of every row under `dir`, locked above.
 			const staged = new Set(
 				paths.filter(path => !under || !path.startsWith(under.dir) || this.#hashesStaging(path)),
 			);
 			if (under) {
 				if (this.#sqliteWrites) this.#sqliteWrites.every++;
-				if (this.#q.longPathsUnder) {
-					const rows = (await run(transaction, this.#q.longPathsUnder, {
-						...under,
-						fits: MYSQL_PLAIN_STAGING_CHARS,
-					})) as PathRow[];
-					for (const row of rows) staged.add(row.path);
+				for (const { path } of locked) {
+					if (path.startsWith(under.dir) && this.#hashesStaging(path)) staged.add(path);
 				}
 				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
 				for (const query of deletes) await run(transaction, query, under);
 			}
 			for (const path of ordered) await this.#deleteParts(transaction, path);
-			// In path order, as every other delete of this transaction takes its locks.
-			for (const path of [...staged].sort()) await this.#deleteStagingOf(transaction, path);
+			// In ascending order of the key ranges they lock, each from a path's staging prefix (#stagingPrefix),
+			// as every other delete of this transaction takes its locks.
+			for (const prefix of [...staged].map(path => this.#stagingPrefix(path)).sort()) {
+				await this.#deleteStagingFrom(transaction, prefix);
+			}
 			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
 			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, ordered, under));
 		});
@@ -4899,7 +4889,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			this.#wrote(dst);
 			// Both session rows first, in path order, before either changes; only rows there are change. A `dst`
 			// with no row is taken by the UPDATE below, after `src`'s (see docs/session.md, "Races").
-			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
+			const { present } = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
 			if (present && !present.has(src)) throw enoent(src);
 			if (!noReplace && (!present || present.has(dst))) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
@@ -4919,8 +4909,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// Staging sets stay under the name their writer staged them for: the
 			// source's are left with no session, and so are a replaced destination's.
 			// They are parts under those paths, so they go before any blob row is locked.
-			await this.#deleteStagingOf(transaction, src);
-			if (!noReplace) await this.#deleteStagingOf(transaction, dst);
+			await this.#deleteStagingFrom(transaction, this.#stagingPrefix(src));
+			if (!noReplace) await this.#deleteStagingFrom(transaction, this.#stagingPrefix(dst));
 			// The references change last, the rows of every blob they name locked first: the replaced session's
 			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared). Each moves by
 			// its key: an UPDATE of `src`'s range would lock, on MySQL, next-key ranges over it and the gap after,
@@ -5007,28 +4997,30 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * locked (see {@link #sessionRowsThere}), as {@link #lockBlobRows} does for
 	 * blob rows: a locking read of a missing path locks its gap, and an insert
 	 * into that gap at another path (a rename's destination, a new session)
-	 * would wait for it. Then it answers the paths whose rows it locked, and
-	 * the caller changes only those. With `under` MySQL can use no index (the
-	 * prefix is compared as bytes, as {@link DialectQueries.deleteUnder} compares
-	 * it), so the lock scans and locks every row, gaps too, in path order. PostgreSQL
-	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
-	 * time.
+	 * would wait for it. Then it answers, as `present`, the paths whose rows
+	 * it locked, and the caller changes only those. With `under` MySQL can use
+	 * no index (the prefix is compared as bytes, as
+	 * {@link DialectQueries.deleteUnder} compares it), so the lock scans and
+	 * locks every row, gaps too, in path order; PostgreSQL locks no gap. There
+	 * it answers, as `locked`, every row it locked, and no `present`: the
+	 * caller changes every path. Elsewhere nothing is answered; SQLite runs
+	 * one writer at a time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
 		there: ReadonlySet<string> | undefined,
 		under?: { dir: string; len: number },
-	): Promise<ReadonlySet<string> | undefined> {
+	): Promise<LockedSessionRows> {
 		const lock = this.#q.lockSessionRowsForWrite;
-		if (!lock) return undefined;
+		if (!lock) return { present: undefined, locked: [] };
 		const ordered = [...new Set(paths)].sort();
 		if (!there || under) {
-			await run(transaction, lock(ordered.length, under !== undefined), {
+			const rows = (await run(transaction, lock(ordered.length, under !== undefined), {
 				...listValues("p", ordered),
 				...(under ?? {}),
-			});
-			return undefined;
+			})) as PathRow[];
+			return { present: undefined, locked: under ? rows : [] };
 		}
 		// One key per statement (see #lockBlobRows): MySQL may plan an IN list as a scan, which locks other rows.
 		const present = new Set<string>();
@@ -5037,7 +5029,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			const rows = (await run(transaction, lock(1, false), listValues("p", [path]))) as PathRow[];
 			for (const row of rows) present.add(row.path);
 		}
-		return present;
+		return { present, locked: [] };
 	}
 
 	/** The references of `paths`, read without a lock. */
@@ -5254,9 +5246,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return `${HASHED_STAGING}${new Bun.CryptoHasher("sha256").update(path).digest("hex")}${STAGING_MARK}`;
 	}
 
-	/** Delete every staging set of `path`, whatever its age: a path that goes takes its unfinished full writes with it. */
-	#deleteStagingOf(transaction: SqlSessionStorageTransaction, path: string): Promise<void> {
-		const prefix = this.#stagingPrefix(path);
+	/**
+	 * Delete every staging set named from `prefix`, a path's staging prefix
+	 * ({@link #stagingPrefix}), whatever its age: a path that goes takes its
+	 * unfinished full writes with it.
+	 */
+	#deleteStagingFrom(transaction: SqlSessionStorageTransaction, prefix: string): Promise<void> {
 		// The largest epoch bounds every name: code-point and locale collations alike order
 		// staging names by their epoch digits, while a punctuation bound sorts before digits
 		// in some (ICU puts ":" before "0").

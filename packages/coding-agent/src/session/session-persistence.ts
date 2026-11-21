@@ -120,6 +120,14 @@ export function resolvedImageSiteOf(value: unknown, key: string | undefined): Im
 }
 
 /**
+ * The image `value` holds at `site`, its {@link imageSiteOf} site: `value`
+ * itself, a string under `image_url`, or else its field `site`.
+ */
+export function imageAt(value: unknown, site: ImageSite): unknown {
+	return typeof value === "string" ? value : (value as Record<string, unknown>)[site];
+}
+
+/**
  * The {@link imageSiteOf} site of `value` whose image a persisted line
  * externalizes: a data URL, or base64 that is no blob reference yet and at
  * least {@link BLOB_EXTERNALIZE_THRESHOLD} long (a smaller image stays inline).
@@ -127,7 +135,7 @@ export function resolvedImageSiteOf(value: unknown, key: string | undefined): Im
 function externalizedImageSite(value: unknown, key: string | undefined): ImageSite | undefined {
 	const site = imageSiteOf(value, key);
 	if (site === undefined) return undefined;
-	const image = typeof value === "string" ? value : (value as Record<string, unknown>)[site];
+	const image = imageAt(value, site);
 	if (typeof image !== "string") return undefined;
 	if (site === IMAGE_URL_KEY) return isImageDataUrl(image) ? site : undefined;
 	return isBlobRef(image) || image.length < BLOB_EXTERNALIZE_THRESHOLD ? undefined : site;

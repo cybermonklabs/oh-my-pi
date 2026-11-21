@@ -7,6 +7,7 @@ import {
 	childDirNames,
 	childKeyName,
 	LINE_STREAM_CHUNK,
+	sessionHeaderIdInPrefix,
 	SessionLeaseLostError,
 	SessionWriteConflictError,
 	type SessionStorage,
@@ -329,20 +330,6 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 	}
 }
 
-/** The session id in the header at the start of `prefix` (past the title slot), or `undefined` when it has none. */
-export function headerSessionId(prefix: string): string | undefined {
-	const text = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
-	const end = text.indexOf("\n");
-	if (end === -1) return undefined;
-	try {
-		const entry: unknown = JSON.parse(text.slice(0, end));
-		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
-			return typeof entry.id === "string" ? entry.id : undefined;
-		}
-	} catch {}
-	return undefined;
-}
-
 /** A full-write body's UTF-8 byte length and SHA-256 (hex), and the title slot and session id read from its head. */
 interface MeasuredLines {
 	bytes: number;
@@ -403,7 +390,7 @@ function measureLines(lines: Iterable<string>): MeasuredLines {
 		bytes,
 		hash: hasher.digest("hex"),
 		title: titleUpdateFromSlot(parseTitleSlotFromContent(head)),
-		sessionId: headerSessionId(head),
+		sessionId: sessionHeaderIdInPrefix(head),
 	};
 }
 

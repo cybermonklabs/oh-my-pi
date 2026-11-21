@@ -50,7 +50,7 @@ import { isBoxedPrimitive } from "node:util/types";
 import { countNewlines, isRecord, stringifyJson, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { BLOB_HASH_RE, BLOB_PREFIX, isBlobRef } from "./blob-store";
-import { type ImageSite, resolvedImageSiteOf } from "./session-persistence";
+import { type ImageSite, imageAt, resolvedImageSiteOf } from "./session-persistence";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /** A child the parent copy leaves out: an object key omitted, an array item removed. */
@@ -636,22 +636,12 @@ export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
  * and drop them. Returns `fields` itself when it holds nothing to mask, or when `mask` is `null`
  * or empty.
  */
-export function maskEntryFields<T>(
-	fields: T,
-	type: string,
-	mask: SessionStoreMask | null,
-	form: MaskedForm = "live",
-): T {
+export function maskEntryFields<T>(fields: T, type: string, mask: SessionStoreMask | null, form: MaskedForm): T {
 	return maskFieldsAt(fields, POSITIONS.entry, type, mask, form);
 }
 
 /** {@link maskEntryFields} for fields of a `message` entry's message of `role`. */
-export function maskMessageFields<T>(
-	fields: T,
-	role: string,
-	mask: SessionStoreMask | null,
-	form: MaskedForm = "live",
-): T {
+export function maskMessageFields<T>(fields: T, role: string, mask: SessionStoreMask | null, form: MaskedForm): T {
 	return maskFieldsAt(fields, POSITIONS.message, role, mask, form);
 }
 
@@ -829,7 +819,7 @@ function maskFreeObject(obj: Record<string, unknown>, walk: MaskWalk, key: strin
 function keptImageSite(value: unknown, key: string | number, walk: MaskWalk): ImageSite | undefined {
 	const site = typeof key === "string" ? resolvedImageSiteOf(value, key) : undefined;
 	if (site === undefined || (site !== "data" && walk.form === "live")) return undefined;
-	const image = typeof value === "string" ? value : (value as Record<string, unknown>)[site];
+	const image = imageAt(value, site);
 	return typeof image === "string" && isBlobRef(image) && BLOB_HASH_RE.test(image.slice(BLOB_PREFIX.length))
 		? site
 		: undefined;

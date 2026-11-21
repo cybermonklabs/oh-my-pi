@@ -401,7 +401,7 @@ export function maskEntryPatchRecord(
 	record: CustomEntry,
 	targets: EntryPatchTargets,
 	mask: SessionStoreMask | null,
-	form: MaskedForm = "live",
+	form: MaskedForm,
 ): CustomEntry {
 	if (mask === null || mask.empty) return record;
 	const data = record.data;
