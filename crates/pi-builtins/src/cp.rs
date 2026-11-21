@@ -2249,6 +2249,39 @@ fn is_symlink_loop(filesystem: &BlockingFs, path: &Path) -> bool {
 	false
 }
 
+/// Whether GNU turns this copy into a copy of the source to its backup name
+/// (`cp.c`): `-f` (with or without `-i`) and a backup, the two names the same
+/// string, and a destination `stat` reads as a regular file. A FIFO, a device
+/// or a link to nothing that is its own destination is not turned.
+fn converts_to_backup(filesystem: &BlockingFs, source: &Path, dest: &Path, dest_fs: &Path, options: &Options) -> bool {
+	options.backup != BackupMode::None
+		&& options.unlink_after_failed_open()
+		&& source.as_os_str() == dest.as_os_str()
+		&& filesystem.is_file(dest_fs)
+}
+
+/// Whether the source is a link cp follows, named again as the destination by
+/// another string (`cp -fb l ./l`). GNU makes the own-entry backup only for the
+/// same string, so it backs the link up by renaming it, after `-i` asks and
+/// `-u` compares, cannot open the source through the name it renamed, and
+/// renames the backup back.
+fn renames_the_followed_source(
+	filesystem: &BlockingFs,
+	source: &Path,
+	dest: &Path,
+	source_fs: &Path,
+	dest_fs: &Path,
+	options: &Options,
+	source_in_command_line: bool,
+) -> bool {
+	options.backup != BackupMode::None
+		&& source.as_os_str() != dest.as_os_str()
+		&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
+		&& options.dereference(source_in_command_line)
+		&& filesystem.is_symlink(source_fs)
+		&& same_entry(filesystem, source_fs, dest_fs)
+}
+
 /// Decide whether source and destination files are the same and
 /// copying is forbidden.
 ///
@@ -2277,12 +2310,25 @@ fn is_forbidden_to_copy_to_same_file(
 		// entry only where the two names are the same string (`STREQ` in
 		// `cp.c`, not their path components): `a` and `./a`, or `d//a` and
 		// `d/a`, are the same file.
-		if source.as_os_str() != dest.as_os_str() && same_entry(filesystem, source_fs, dest_fs) {
+		if source.as_os_str() != dest.as_os_str()
+			&& same_entry(filesystem, source_fs, dest_fs)
+			&& !renames_the_followed_source(filesystem, source, dest, source_fs, dest_fs, options, source_in_command_line)
+		{
 			return true;
 		}
-		// `-f` makes that backup, with or without `-i`, as GNU's does.
-		if options.unlink_after_failed_open() && !source_is_symlink {
+		// `-f` makes that backup, with or without `-i`, as GNU's does, where
+		// `stat` reads the destination as a regular file. Another own entry
+		// with `-f` (a FIFO, a link to nothing read as a link) is the same file
+		// before any question or update check, as GNU's; `-l` does nothing
+		// there (`copy_file`).
+		if converts_to_backup(filesystem, source, dest, dest_fs, options) {
 			return false;
+		}
+		if options.unlink_after_failed_open()
+			&& source.as_os_str() == dest.as_os_str()
+			&& options.copy_mode != CopyMode::Link
+		{
+			return true;
 		}
 		if source_is_symlink && !options.dereference {
 			return false;
@@ -2334,7 +2380,9 @@ fn handle_existing_dest(
 	let source_fs = host.resolve(source);
 	let dest_fs = host.resolve(dest);
 	let asked_about = match own_backup {
-		Some(backup) => filesystem.symlink_metadata(backup).is_ok().then(|| backup_display(dest, backup)),
+		// GNU asks about the backup name only where `stat` of it succeeds
+		// (`copy.c`): a link to nothing there is a new destination.
+		Some(backup) => filesystem.metadata(backup).is_ok().then(|| backup_display(dest, backup)),
 		None => Some(dest.to_path_buf()),
 	};
 	if options.update == UpdateMode::None
@@ -2350,6 +2398,12 @@ fn handle_existing_dest(
 		&& let Some(path) = &asked_about
 	{
 		options.overwrite.verify(host, path, options.debug)?;
+	}
+	if renames_the_followed_source(&filesystem, source, dest, &source_fs, &dest_fs, options, source_in_command_line) {
+		return Err(CpError::Error(format!(
+			"cannot open {} for reading: No such file or directory",
+			source.quote()
+		)));
 	}
 
 	// The backup would be renamed over a source that is the destination's
@@ -2406,24 +2460,6 @@ fn handle_existing_dest(
 				} else {
 					format!("{} and {} are the same file", source.quote(), dest.quote())
 				}));
-			}
-			// A FIFO or a device would be read by its backup copy, which waits
-			// for a writer: GNU refuses it as the same file, and with `-l`
-			// does nothing.
-			let read = if options.dereference(source_in_command_line) {
-				filesystem.metadata(&source_fs)
-			} else {
-				filesystem.symlink_metadata(&source_fs)
-			};
-			if read.is_ok_and(|metadata| is_stream(&metadata)) {
-				if options.copy_mode == CopyMode::Link {
-					return Ok((None, true));
-				}
-				return Err(CpError::Error(format!(
-					"{} and {} are the same file",
-					source.quote(),
-					dest.quote()
-				)));
 			}
 			// `cp -fb a a`: the destination is the source's own entry, so
 			// its backup is a copy, and the copy is all there is to do. `-v`
@@ -2842,26 +2878,15 @@ fn copy_file(
 					return Ok(());
 				}
 			} else if options.backup != BackupMode::None && !dest_is_symlink {
-				if source.as_os_str() != dest.as_os_str() || !options.unlink_after_failed_open() {
+				// Unless GNU turns this into a copy to the backup name, the link
+				// is already there: GNU asks under `-i`, then does nothing.
+				if !converts_to_backup(&filesystem, source, dest, &dest_fs, options) {
+					if matches!(options.overwrite, OverwriteMode::Interactive(_)) {
+						options.overwrite.verify(host, dest, options.debug)?;
+					}
 					return Ok(());
 				}
 			}
-		}
-		// A link cp follows, named again as the destination (`cp -fb l
-		// ./l`): GNU makes the own-entry backup only for the same name, so it
-		// backs the link up by renaming it, cannot open the source through
-		// the name it renamed, and renames the backup back.
-		if options.backup != BackupMode::None
-			&& source.as_os_str() != dest.as_os_str()
-			&& source_is_symlink
-			&& dereference
-			&& matches!(options.copy_mode, CopyMode::Copy | CopyMode::Update)
-			&& same_entry(&filesystem, &source_fs, &dest_fs)
-		{
-			return Err(CpError::Error(format!(
-				"cannot open {} for reading: No such file or directory",
-				source.quote()
-			)));
 		}
 		// Disallow copying a file to itself, unless `--force` and
 		// `--backup` are both specified.
@@ -2882,14 +2907,10 @@ fn copy_file(
 		}
 	}
 
-	// GNU turns `cp -fb a a`, the same name of an existing destination with
-	// `-f`, into a copy of `a` to its backup name without a backup (`cp.c`),
-	// so `-u` and `-i` look at the backup name.
-	let own_backup = if check_existing_dest
-		&& options.backup != BackupMode::None
-		&& options.unlink_after_failed_open()
-		&& source.as_os_str() == dest.as_os_str()
-	{
+	// GNU turns `cp -fb a a`, the same name of an existing regular destination
+	// with `-f`, into a copy of `a` to its backup name without a backup
+	// (`cp.c`), so `-u` and `-i` look at the backup name, as `stat` reads it.
+	let own_backup = if check_existing_dest && converts_to_backup(&filesystem, source, dest, &dest_fs, options) {
 		backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true).ok().flatten()
 	} else {
 		None
@@ -2912,7 +2933,11 @@ fn copy_file(
 				return Err(CpError::Error(format!("not replacing {}", update_shown.quote())));
 			},
 			UpdateMode::IfOlder => {
-				let dest_time = filesystem.symlink_metadata(&update_fs)?.modified()?;
+				let dest_time = match own_backup {
+					Some(_) => filesystem.metadata(&update_fs)?,
+					None => filesystem.symlink_metadata(&update_fs)?,
+				}
+				.modified()?;
 				if source_metadata.modified()? <= dest_time {
 					return Ok(());
 				}
