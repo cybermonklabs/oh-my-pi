@@ -246,9 +246,10 @@ function removeConcurrentTestDirs(): void {
  * file loads for that file, and runs it after the file's last test, before the file's own top-level
  * `afterAll` hooks (registered after its imports). So a child that a concurrent test starts must end
  * within its test. `bun test --parallel` (each package's `test` script) and `--isolate` load this
- * module again for every test file. A plain `bun test` of several files, and `--parallel
- * --no-isolate`, share modules between files, so there the hook belongs to the first file that
- * imports this module, and a later file's concurrent tests leave their directories.
+ * module again for every test file. A plain `bun test` of several files shares modules between
+ * files, so there the hook belongs to the first file that imports this module, and a later file's
+ * concurrent tests leave their directories. `--parallel --no-isolate` shares them within each
+ * worker process, so there each worker removes its first importing file's directories.
  */
 try {
 	afterAll(removeConcurrentTestDirs);

@@ -2,7 +2,9 @@ import { describe, expect, it, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseFlag } from "@oh-my-pi/pi-utils";
 import { createProductionChildEnv } from "../../../scripts/test-env";
+import { E2E_FLAG_VALUES, isE2E } from "./e2e-preload";
 
 /** The key a suite asks `e2eApiKey` for, a setting beside it, and an exporter setting. */
 const KEY = "E2E_KEY_PROBE_API_KEY";
@@ -127,10 +129,35 @@ describe("an E2E run's environment", () => {
 });
 
 /**
+ * Runs `bun test` on a test file holding `text`, in this package's directory (so its `bun test`
+ * preload runs) with `home` as HOME and `env` on top of a production child's environment, which has
+ * no `E2E` and no test-runtime marker. Returns what the run printed.
+ */
+async function bunTestChild(home: string, text: string, env: Record<string, string>): Promise<string> {
+	// A test file's name, so omp's loader counts the run as a test run, as it does a package's own files.
+	const fixture = path.join(home, "child.test.ts");
+	fs.writeFileSync(fixture, text);
+	const childEnv: Record<string, string> = { ...createProductionChildEnv(), HOME: home, USERPROFILE: home };
+	delete childEnv.E2E;
+	const proc = Bun.spawn([process.execPath, "test", fixture], {
+		cwd: path.join(import.meta.dir, ".."),
+		env: { ...childEnv, ...env },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	expect(exitCode, stderr).toBe(0);
+	return `${stdout}${stderr}`;
+}
+
+/**
  * `NO_STRICT`, which `src/utils/schema/adapt.ts` reads from `PI_NO_STRICT` when it loads, in a
  * `bun test` run of a file that imports it before `./oauth.ts`, as the live suites import provider
- * code first. The run is in this package, so its `bun test` preload runs, and its agent dir's `.env`
- * sets `PI_NO_STRICT=1`.
+ * code first. The agent dir's `.env` sets `PI_NO_STRICT=1`.
  */
 async function loadTimeNoStrict(env: Record<string, string>): Promise<string> {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ai-e2e-load-"));
@@ -139,31 +166,38 @@ async function loadTimeNoStrict(env: Record<string, string>): Promise<string> {
 		fs.writeFileSync(path.join(home, ".omp", "agent", ".env"), "PI_NO_STRICT=1\n");
 		const adapt = path.join(import.meta.dir, "..", "src", "utils", "schema", "adapt.ts");
 		const oauth = path.join(import.meta.dir, "oauth.ts");
-		// A test file's name, so omp's loader counts the run as a test run, as it does a package's own files.
-		const fixture = path.join(home, "load-time.test.ts");
-		fs.writeFileSync(
-			fixture,
+		const output = await bunTestChild(
+			home,
 			`import { test } from "bun:test";
 import { NO_STRICT } from ${JSON.stringify(adapt)};
 import ${JSON.stringify(oauth)};
 test("reads NO_STRICT", () => console.log("NO_STRICT " + NO_STRICT));
 `,
+			env,
 		);
-		const childEnv: Record<string, string> = { ...createProductionChildEnv(), HOME: home, USERPROFILE: home };
-		delete childEnv.E2E;
-		const proc = Bun.spawn([process.execPath, "test", fixture], {
-			cwd: path.join(import.meta.dir, ".."),
-			env: { ...childEnv, ...env },
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		expect(exitCode, stderr).toBe(0);
-		return /NO_STRICT (\w+)/.exec(`${stdout}${stderr}`)?.[1] ?? `no output: ${stdout}${stderr}`;
+		return /NO_STRICT (\w+)/.exec(output)?.[1] ?? `no output: ${output}`;
+	} finally {
+		fs.rmSync(home, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Whether the preload loaded `@oh-my-pi/pi-utils` before a test file that imports nothing: its env
+ * loader sets the test-runtime marker `PI_TEST_RUNTIME=1` when it loads in a test run, and nothing
+ * else in the child sets it.
+ */
+async function preloadLoadedUtils(env: Record<string, string>): Promise<string> {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ai-e2e-order-"));
+	try {
+		const output = await bunTestChild(
+			home,
+			`import { test } from "bun:test";
+const marker = String(Bun.env.PI_TEST_RUNTIME);
+test("reads the marker", () => console.log("MARKER " + marker));
+`,
+			env,
+		);
+		return /MARKER (\w+)/.exec(output)?.[1] ?? `no output: ${output}`;
 	} finally {
 		fs.rmSync(home, { recursive: true, force: true });
 	}
@@ -185,4 +219,47 @@ describe("an E2E run's settings read when a module loads", () => {
 		},
 		CHILD_TIMEOUT_MS,
 	);
+});
+
+describe("the bun test preload", () => {
+	for (const [value, loads] of [
+		["1", true],
+		["0", false],
+		["false", false],
+		[undefined, false],
+	] as const) {
+		it(
+			`${loads ? "loads" : "loads nothing"} before the test files when E2E is ${value === undefined ? "unset" : JSON.stringify(value)}`,
+			async () => {
+				expect(await preloadLoadedUtils(value === undefined ? {} : { E2E: value })).toBe(loads ? "1" : "undefined");
+			},
+			CHILD_TIMEOUT_MS,
+		);
+	}
+
+	it("reads E2E as $flag does", () => {
+		const values = [
+			"",
+			"0",
+			"1",
+			"y",
+			"Y",
+			"n",
+			"true",
+			"TRUE",
+			"True",
+			"false",
+			"yes",
+			"YES",
+			"no",
+			"on",
+			"ON",
+			"off",
+			" 1",
+		];
+		for (const value of [...values, ...E2E_FLAG_VALUES]) {
+			expect(isE2E(value), JSON.stringify(value)).toBe(parseFlag(value));
+		}
+		expect(isE2E(undefined)).toBe(parseFlag(undefined));
+	});
 });
