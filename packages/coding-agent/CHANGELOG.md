@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Deleting a project's daemon runtime directory while its broker runs no longer lets a second broker take the same project: the broker now locks `<scope>.broker.lock` beside that directory in `~/.omp/run/daemons/`. These files are empty, one for each project scope ever used, and are never removed. A broker also steps back while a broker of an older omp version holds the project.
+- Deleting a project's daemon runtime directory while its broker runs no longer lets a second broker take the same project: the broker now locks `<scope>.broker.lock` beside that directory in `~/.omp/run/daemons/`. These files are empty, one for each project scope ever used, and are never removed. A broker also steps back while a broker of an older omp version holds the project, though not when both start at the same moment.
 
 ## [18.18.6] - 2026-11-09
 

@@ -379,6 +379,9 @@ async function holdsLiveForeignLease(pidPath: string, endpoint: string): Promise
  * refused while anyone holds `broker.pid`'s lock: on Linux the open-file
  * description query plus the probe of the older build's abstract name, on
  * macOS `F_GETLK` (which sees the older `flock`), on Windows the mutex listing.
+ * That is checked once, before this broker writes `broker.pid`, so an older
+ * build that starts at the same moment can still take the scope: it can lock
+ * `broker.pid` after the check and read it before this broker writes it.
  */
 async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise<BrokerLease | null> {
 	const pidPath = path.join(runtimeDir, PID_FILE);
