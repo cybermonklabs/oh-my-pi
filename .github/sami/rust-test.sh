@@ -28,7 +28,11 @@
 #   - a test named in .github/sami/rust-test-own-process.txt does not run
 #     alone in an invocation of its own, or also runs in the main one;
 #   - a target in .github/sami/rust-test-root-targets.txt prints `not run:`,
-#     or passes another number of tests than its line names.
+#     or passes another number of tests than its line names;
+#   - a sticky-directory FIFO test (`refused_in_a_sticky_directory` in its
+#     name) does not run alone twice, as the runner's user given the FIFO
+#     RUST_TEST_STICKY_FIFO names and as root, or prints there (`UNKNOWN:`,
+#     it checked nothing).
 # It leaves each test binary's listing in $RUNNER_TEMP/rust-test/listings
 # (index.tsv names the binary of each), for the macOS job's inventory
 # (.github/sami/rust-test-macos-inventory.sh).
@@ -66,6 +70,9 @@
 #                       gets a directory of its own under it, as its TMPDIR
 #   PI_TEST_REAL_BASH   the bash 5.2.21 the bash-oracle tests compare with
 #   PI_AST_REPO_CORPUS  the checkout pi-ast's corpus test walks
+#   RUST_TEST_STICKY_FIFO  (when a sticky-directory FIFO test is in the tree) a
+#                       0666 FIFO of a third user in a world-writable sticky
+#                       directory root owns, with fs.protected_fifos at 1
 # and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above).
 # .github/sami/tests/run.sh runs this script against stubs of bazelisk and
 # rustup.
@@ -193,6 +200,20 @@ while IFS=$'\t' read -r target name; do
 	own+=("$target"$'\t'"$name")
 	skip_flags+=(--test_arg=--skip --test_arg="$name")
 done <"$tmp/own.tsv"
+# The sticky-directory FIFO tests (pi-shell's and pi-vfs's, with
+# `refused_in_a_sticky_directory` in their names) check that the kernel's
+# fs.protected_fifos refuses an open that may create of a FIFO another user
+# owns in a world-writable sticky directory that user does not own. They need
+# such a FIFO, and cannot run in the sandbox: linux-sandbox maps one uid, so
+# every other owner reads as the overflow uid there. So the main invocation
+# takes them out (libtest's --skip matches a part of the name), and each runs
+# alone out of the sandbox twice (below): as the runner's user, given the FIFO
+# the job made (RUST_TEST_STICKY_FIFO), and as root, which makes its own.
+# Another test with that word in its name is taken out and run the same way;
+# one renamed away from it runs in the main invocation, where it prints
+# `UNKNOWN:` and fails as any unlisted output does.
+sticky_word=refused_in_a_sticky_directory
+skip_flags+=(--test_arg=--skip --test_arg="$sticky_word")
 # .github/sami/rust-test-ignored.txt names Bazel targets (`//…`) and cargo
 # ones (`<directory>:<kind>:<name>`, as the cargo branch below labels them).
 ignored_run=()
@@ -261,6 +282,44 @@ bep_rows() {
 rows="$tmp/rows.tsv"
 : >"$rows"
 nlog=0
+# untangle <label> <log>: the log, in place, with each libtest event that
+# shares a line with output written outside the record moved to a line of its
+# own. A test's child process or thread can write a line to the stream it
+# inherited in more than one write (Rust's stderr is unbuffered and writes a
+# formatted line in pieces), and an event libtest writes between two of them
+# starts on that line: in run 44936196181 `pi-builtins_test: invalid length:
+# '7` and a test's `ok` event shared a line and the closing `'` came two
+# lines later, so the event read as raw output and the binary as ended early.
+# The pieces of the raw line are joined again at its next piece outside an
+# event. When an event moved, the log as written is kept as <log>.tangled.
+untangle() {
+	local moved
+	moved="$(awk -v out="$2.untangled" '
+		{
+			if (match($0, /\{ "type": "(test|suite|bench)", /) && RSTART > 1 && substr($0, length($0)) == "}") {
+				held = held substr($0, 1, RSTART - 1)
+				print substr($0, RSTART) >out
+				n++
+			} else if (substr($0, 1, 10) == "{ \"type\": ") {
+				print >out
+			} else {
+				print held $0 >out
+				held = ""
+			}
+		}
+		END {
+			if (held != "") print held >out
+			print n + 0
+		}' "$2")"
+	if [ "$moved" = 0 ]; then
+		rm -f -- "$2.untangled"
+		return 0
+	fi
+	mv -- "$2" "$2.tangled"
+	mv -- "$2.untangled" "$2"
+	echo "::notice title=Rust tests::$1: $moved libtest events shared a line with output written outside the record, and were moved to lines of their own (the log as written: $2.tangled)"
+}
+
 # collect <invocation> <event log>: its rows, each log copied to a path of its
 # own at once, since a later bazel test of the same target writes its
 # test.log to the same path (run 44831606057).
@@ -278,6 +337,7 @@ collect() {
 			nlog=$((nlog + 1))
 			copy="$tmp/logs/$nlog.log"
 			cp "$log" "$copy"
+			untangle "$label" "$copy"
 			# testlogs/<package>/<target>/test.log, or a retried attempt's
 			# log in test_attempts/ below it: the binary is bin/<package>/<target>.
 			bin="$(dirname "$log")"
@@ -348,6 +408,21 @@ if [ -z "$only" ]; then
 		IFS=$'\t' read -r target name <<<"${own[$i]}"
 		bazel_test "own-$i" "$tmpdir_under" --test_arg=--exact --test_arg="$name" -- "$target"
 	done
+	# The sticky-directory FIFO tests the main invocation's binaries list:
+	# each alone, out of the sandbox, as the runner's user with the job's
+	# FIFO (a user who owns neither the FIFO nor its directory).
+	sticky=()
+	while IFS=$'\t' read -r target bin; do
+		[ -x "$bin" ] || continue
+		while IFS= read -r name; do sticky+=("$target"$'\t'"$name"); done < <("$bin" --list 2>/dev/null | sed -n 's/: test$//p' | awk -v w="$sticky_word" 'index($0, w)')
+	done < <(awk -F'\t' '$7 == "main" && $2 == "rust_test rule" && $6 != "-" { print $1 "\t" $6 }' "$rows" | LC_ALL=C sort -u)
+	if [ "${#sticky[@]}" -gt 0 ] && [ ! -p "${RUST_TEST_STICKY_FIFO:-}" ]; then
+		stop "the tree has ${#sticky[@]} sticky-directory FIFO tests, and RUST_TEST_STICKY_FIFO names no FIFO [${RUST_TEST_STICKY_FIFO:-}]"
+	fi
+	for i in "${!sticky[@]}"; do
+		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
+		bazel_test "sticky-user-$i" "$tmpdir_under" --strategy=TestRunner=local --test_env=PI_TEST_STICKY_FIFO="$RUST_TEST_STICKY_FIFO" --test_arg=--exact --test_arg="$name" -- "$target"
+	done
 	# Each #[ignore]d test the job runs anyway, alone, with --ignored. One
 	# run alone can take longer than Bazel's 300 s default for a medium test
 	# (pi-ast's whole-repository sweep), so these get 1200 s.
@@ -361,6 +436,12 @@ if [ -z "$only" ]; then
 	for i in "${!ignored_root[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_root[$i]}"
 		bazel_test "ignored-root-$i" "$root_under" --strategy=TestRunner=local --test_timeout=1200 --test_arg=--ignored --test_arg=--exact --test_arg="$name" -- "$target"
+	done
+	# Each sticky-directory FIFO test again as root, which makes its own FIFO
+	# of another user (it is given none).
+	for i in "${!sticky[@]}"; do
+		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
+		bazel_test "sticky-root-$i" "$root_under" --strategy=TestRunner=local --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 else
 	# Only the listed tests, and the canary: each target once, with libtest's
@@ -394,6 +475,12 @@ if [ -z "$only" ]; then
 		IFS=$'\t' read -r target name <<<"${own[$i]}"
 		check_alone "Own-process test" "own-$i" "$target" "$name"
 	done
+	for i in "${!sticky[@]}"; do
+		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
+		check_alone "Sticky-directory FIFO test, as the runner's user" "sticky-user-$i" "$target" "$name"
+		check_alone "Sticky-directory FIFO test, as root" "sticky-root-$i" "$target" "$name"
+	done
+	echo "Sticky-directory FIFO tests, each run as the runner's user and as root: ${#sticky[@]}"
 	for i in "${!ignored_run[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_run[$i]}"
 		check_alone "Ignored test" "ignored-$i" "$target" "$name"
@@ -462,10 +549,12 @@ cargo_test() {
 	if [ "$doc" = 1 ]; then
 		err="$log.raw"
 		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		untangle "$label" "$err"
 		doc_attribute <"$err" >"$log"
 		: >"$log.err"
 	else
 		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+		untangle "$label" "$log"
 	fi
 	if [ "$code" = 0 ]; then
 		printf '%s\tcargo test\tPASSED\tpassed\t%s\t-\t%s\n' "$label" "$log" "$inv" >>"$rows"

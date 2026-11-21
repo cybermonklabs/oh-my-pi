@@ -426,6 +426,29 @@ jobs:
           # (the main invocation runs as the runner's user).
           [ "$(id -u)" != 0 ] || fail "the job runs as root, so nothing is unreadable to it"
           echo "user: $(id -un) ($(id -u)); user xattrs and localedef work"
+          # The sticky-directory FIFO tests (pi-shell's and pi-vfs's) check
+          # that fs.protected_fifos refuses an open that may create of a FIFO
+          # another user owns in a world-writable sticky directory that user
+          # does not own. The test step runs each as root, and as the
+          # runner's user given this FIFO: mode 0666, of uid 65534, in a 1777
+          # directory of root's. The probe opens it as the tests' plain open
+          # does, and the kernel must refuse it.
+          sudo sysctl -w fs.protected_fifos=1
+          [ "$(cat /proc/sys/fs/protected_fifos)" -ge 1 ] || fail "fs.protected_fifos is not 1 or more"
+          sudo install -d -o root -g root -m 1777 /mnt/reflink/sticky
+          sudo mkfifo -m 0666 /mnt/reflink/sticky/report.txt
+          sudo chown 65534:65534 /mnt/reflink/sticky/report.txt
+          ls -ld /mnt/reflink/sticky /mnt/reflink/sticky/report.txt
+          python3 -c 'import os, sys
+          try:
+              os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK, 0o666)
+          except PermissionError:
+              sys.exit(0)
+          except OSError as err:
+              sys.exit(f"the open gave {err}, not EACCES")
+          sys.exit("the open went ahead")' /mnt/reflink/sticky/report.txt ||
+            fail "an open that may create of /mnt/reflink/sticky/report.txt was not refused, so fs.protected_fifos does not hold here"
+          echo "fs.protected_fifos: $(cat /proc/sys/fs/protected_fifos); the sticky directory's FIFO is refused to $(id -un)"
       # sdk/rust/omp-rpc's two #[ignore]d smoke tests run the repository's
       # omp server (`bun packages/coding-agent/src/cli.ts --mode rpc`), so the
       # test step runs them alone with --ignored (rust-test-ignored.txt)
@@ -458,6 +481,7 @@ jobs:
         run: |
           RUST_TEST_PATH="$HOME/rsync-ref/bin:$HOME/jj-ref/bin:/usr/local/bin:/usr/bin:/bin" \
             RUST_TEST_TMPDIR=/mnt/reflink/tmp \
+            RUST_TEST_STICKY_FIFO=/mnt/reflink/sticky/report.txt \
             PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
             bash .github/sami/rust-test.sh

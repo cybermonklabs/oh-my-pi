@@ -137,8 +137,9 @@ fakebin() {
 	} >"$b"
 	chmod +x "$b"
 }
-# record_names <log>: the tests a libtest record reports.
-record_names() { jq -R -r 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored")) | .name' "$1"; }
+# record_names <log>: the tests a libtest record reports, an event that shares
+# a line with raw output included (the binary lists every test it ran).
+record_names() { sed 's/^.*{ "type": /{ "type": /' "$1" | jq -R -r 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored")) | .name'; }
 # target <rule> <label> <status> <writer...>: a target and its one log; its
 # binary lists the tests its record reports, plus EXTRA_LISTED.
 target() {
@@ -207,10 +208,11 @@ own_default() {
 # Environment of a case: KNOWN_SKIPS, KNOWN_OUTPUT, SANCTIONED, OWN,
 # IGNORED_RUN, IGNORED_ROOT, CHILD_ENTRIES, MACOS, ONLY (lines of `<target>
 # <name>`; ONLY sets RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), ROOTS
-# and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY and IGN_ROOT_BODY (the stub's
-# answer to those invocations), OWN_TESTS and OWN_PRINTS (for own_default),
-# MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS, NOT_MSG (a regex the output must not
-# match).
+# and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY, IGN_ROOT_BODY, STICKY_BODY
+# and STICKY_ROOT_BODY (the stub's answer to those invocations), OWN_TESTS and
+# OWN_PRINTS (for own_default), MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS,
+# STICKY_FIFO (`none`: RUST_TEST_STICKY_FIFO names no FIFO), NOT_MSG (a regex
+# the output must not match).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -275,12 +277,13 @@ if [ "\${args[0]}" = query ]; then
 	exit "\$rc"
 fi
 [ "\${args[0]}" = test ] || { echo "stub: bazelisk \${args[*]}" >&2; exit 2; }
-bep="" under="" names=() targets=() ignored=0
+bep="" under="" names=() targets=() ignored=0 fifo=""
 for ((i = 0; i < \${#args[@]}; i++)); do
 	case "\${args[i]}" in
 		--build_event_json_file=*) bep="\${args[i]#*=}" ;;
 		--run_under=*) under="\${args[i]#*=}" ;;
 		--test_arg=--ignored) ignored=1 ;;
+		--test_env=PI_TEST_STICKY_FIFO=*) fifo="\${args[i]#*=*=}" ;;
 		--test_arg=--exact)
 			for ((j = i + 1; j < \${#args[@]}; j++)); do
 				case "\${args[j]}" in --test_arg=-*) break ;; --test_arg=*) names+=("\${args[j]#--test_arg=}") ;; *) break ;; esac
@@ -295,6 +298,10 @@ case "\$under" in sudo*) inv=root ;; esac
 if [ "\${#names[@]}" -gt 0 ]; then
 	if [ "\$ignored" = 1 ]; then
 		[ "\$inv" = root ] && inv=ignored-root || inv=ignored
+	elif [ "\$inv" = root ]; then
+		inv=sticky-root
+	elif [ -n "\$fifo" ]; then
+		inv=sticky-user
 	else
 		inv=own
 	fi
@@ -309,11 +316,14 @@ if [ "${LEGACY:-0}" != 1 ]; then
 	has --test_env=PI_AST_REPO_CORPUS=\$PI_AST_REPO_CORPUS
 	has --sandbox_writable_path=\$RUST_TEST_TMPDIR
 	want_under="/bin/sh $w/repo/.github/sami/rust-test-tmpdir.sh \$RUST_TEST_TMPDIR"
-	[ "\$inv" = root ] || [ "\$inv" = ignored-root ] && want_under="sudo -E env PATH=\$RUST_TEST_PATH \$want_under"
+	[ "\$inv" = root ] || [ "\$inv" = ignored-root ] || [ "\$inv" = sticky-root ] && want_under="sudo -E env PATH=\$RUST_TEST_PATH \$want_under"
 	[ "\$under" = "\$want_under" ] || { echo "stub: bazel test (\$inv) runs under [\$under], not [\$want_under]" >&2; exit 2; }
+	[ "\$inv" != main ] || has "--test_arg=--skip --test_arg=refused_in_a_sticky_directory"
+	[ "\$inv" != sticky-user ] || [ "\$fifo" = "\$RUST_TEST_STICKY_FIFO" ] || { echo "stub: bazel test (\$inv) gives PI_TEST_STICKY_FIFO=[\$fifo], not [\$RUST_TEST_STICKY_FIFO]" >&2; exit 2; }
+	[ "\$inv" = sticky-user ] || [ -z "\$fifo" ] || { echo "stub: bazel test (\$inv) gives PI_TEST_STICKY_FIFO" >&2; exit 2; }
 fi
 case "\$inv" in ignored | ignored-root) has --test_timeout=1200 ;; esac
-[ "\$inv" = ignored-root ] && has --strategy=TestRunner=local
+case "\$inv" in ignored-root | sticky-user | sticky-root) has --strategy=TestRunner=local ;; esac
 if [ "\$inv" = main ]; then
 	[ "\${targets[0]:-}" = //crates/... ] || { echo "stub: main run's targets are [\${targets[*]}]" >&2; exit 2; }
 	for r in ${ROOTS:-}; do has "-\$r"; done
@@ -327,6 +337,8 @@ else
 		own) $(printf '%s' "${OWN_BODY:-own_default}") ;;
 		ignored) $(printf '%s' "${IGN_BODY:-own_default}") ;;
 		ignored-root) $(printf '%s' "${IGN_ROOT_BODY:-own_default}") ;;
+		sticky-user) $(printf '%s' "${STICKY_BODY:-own_default}") ;;
+		sticky-root) $(printf '%s' "${STICKY_ROOT_BODY:-own_default}") ;;
 	esac
 fi
 FMT=text
@@ -376,6 +388,7 @@ case "\$mode:\$sel" in
 	stderr-skip:--test) echo "skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
 	stderr-skip-named:--test) echo "a::two: skipped: no bun on PATH" >&2; lt_pass a::one a::two; exit 0 ;;
 	stderr-raw:--test) echo "no free port: nothing to test" >&2; lt_pass a::one a::two; exit 0 ;;
+	tangled:--test) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "event": "started", "name": "a::one" }\nno free port: noth{ "type": "test", "name": "a::one", "event": "ok" }\n{ "type": "test", "event": "started", "name": "a::two" }\ning to test\n{ "type": "test", "name": "a::two", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	filtered:--test) FILTERED=1 lt_pass a::one; exit 0 ;;
 	ignored:--test | ignored-fails:--test | ignored-and-doc-ignored:--test) lt_ignored a::one a::slow; exit 0 ;;
 	doc-ignored:--doc | ignored-and-doc-ignored:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ignored" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
@@ -391,9 +404,13 @@ EOF
 	chmod +x "$w/bin/rustup"
 	printf '#!/bin/sh\nOFFLINE_WRAPPED=1 exec "$@"\n' >"$w/bin/offline"
 	chmod +x "$w/bin/offline"
-	local out rc
+	local out rc fifo="$w/sticky/report.txt"
+	mkdir -p "$w/sticky"
+	mkfifo "$fifo"
+	[ "${STICKY_FIFO:-}" != none ] || fifo=""
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
+		RUST_TEST_STICKY_FIFO="$fifo" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
@@ -624,6 +641,27 @@ KNOWN_RAW="$PR no free port: nothing to test" run J119-raw-entry-of-another-targ
 NOT_MSG='::error' run J120-bazel-banner-is-no-output 0 "Lines outside libtest's record: 0 distinct" '' "banner_pass() { printf '%s\n' 'exec \${PAGER:-/usr/bin/less} \"\$0\" || exit 1' 'Executing tests from $D' '-----------------------------------------------------------------------------'; FMT=json lt_pass a::one; }; { $P; rt $D PASSED banner_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=stderr-raw run J121-cargo-stderr-other-wording-fails 1 "sdk/rust/demo:test:wire wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 NOT_MSG='Compiling demo' run J122-cargo-build-output-is-no-output 0 "Lines outside libtest's record: 0 distinct" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# A raw line written in pieces, with libtest's event between two of them on
+# the same line (run 44936196181): the event is moved to a line of its own and
+# counts, and the raw line's pieces are joined again.
+tangled_rec() { printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "event": "started", "name": "b::len" }\n%s{ "type": "test", "name": "b::len", "event": "ok" }\n{ "type": "test", "event": "started", "name": "b::next" }\n%s\n{ "type": "test", "name": "b::next", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n' "$1" "$2"; }
+TANGLE="$(declare -f tangled_rec)"
+KNOWN_RAW="$D b2sum: bad length 7" NOT_MSG='::error|ended before' run J123-tangled-event-counts 0 "$D: 1 libtest events shared a line with output written outside the record" '' "$TANGLE; { $P; rt $D PASSED tangled_rec 'b2sum: bad len' 'gth 7'; } >\"\$bep\"; exit 0"
+NOT_MSG='ended before' run J124-tangled-raw-other-wording-fails 1 "$D wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "$TANGLE; { $P; rt $D PASSED tangled_rec 'no free port: noth' 'ing to test'; } >\"\$bep\"; exit 0"
+NOT_MSG='ended before' run J125-tangled-raw-skip-marker-fails 1 "$D b::next skipped itself and is not in" '' "$TANGLE; { $P; rt $D PASSED tangled_rec 'b::next: skip' 'ped: no port'; } >\"\$bep\"; exit 0"
+CARGO_MODE=tangled NOT_MSG='ended before|planned 2 tests and reported 1' run J126-cargo-tangled-raw-other-wording-fails 1 "sdk/rust/demo:test:wire wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# The sticky-directory FIFO tests: taken out of the main invocation, then run
+# alone twice out of the sandbox, as the runner's user given the job's FIFO
+# and as root; each must run, pass and print nothing there.
+SN=d::x::an_open_is_refused_in_a_sticky_directory
+SMAIN="{ $P; listed $D d::one $SN -- d::one; } >\"\$bep\"; exit 0"
+OWN_TESTS="d::one $SN" NOT_MSG='::error' run S1-sticky-test-runs-as-user-and-root 0 "Sticky-directory FIFO tests, each run as the runner's user and as root: 1" '' "$SMAIN"
+OWN_TESTS="d::one $SN" run S1b-sticky-test-names-its-runs 0 "Sticky-directory FIFO test, as root ran alone: $D $SN \\(ok\\)" '' "$SMAIN"
+OWN_TESTS="d::one $SN" OWN_PRINTS="$SN" run S2-sticky-test-prints-there 1 "$D $SN printed and is not in .github/sami/rust-test-known-output.txt" '' "$SMAIN"
+OWN_TESTS="d::one $SN" STICKY_ROOT_BODY="FMT=json; FILTERED=1 rt $D FAILED lt_fail $SN >\"\$bep\"; exit 3" run S3-sticky-test-fails-as-root 1 "$D $SN failed and is not in" '' "$SMAIN"
+OWN_TESTS="d::one $SN" STICKY_FIFO=none run S4-sticky-test-without-fifo 1 "the tree has 1 sticky-directory FIFO tests, and RUST_TEST_STICKY_FIFO names no FIFO" '' "$SMAIN"
+OWN_TESTS="d::one $SN" STICKY_BODY=": >\"\$bep\"; exit 0" run S5-sticky-user-run-missing 1 "Sticky-directory FIFO test, as the runner's user::$D has no one test log for $SN in its own invocation" '' "$SMAIN"
+STICKY_FIFO=none NOT_MSG='::error' run S6-no-sticky-test-needs-no-fifo 0 "Sticky-directory FIFO tests, each run as the runner's user and as root: 0" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
