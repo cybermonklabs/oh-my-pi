@@ -643,7 +643,8 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 
 			// A backend apply or a settings rebuild installed this state: under a held settings rebuild (a switch to
 			// Hindsight or a `hindsight.*` edit on a bound prompt) the snapshot is part of the held change and goes
-			// out with it.
+			// out with it, and in a resumed process that still sends the transcript's stored prompt in place of its
+			// own startup build it is part of that build and goes out with it.
 			await this.#loadAndPublishMentalModels(generation, previousSnippet, "MM load", { joinsHeldChange: true });
 		})();
 		await this.#settleMentalModelsLoadWithinDeadline(bootstrap, generation, previousSnippet);

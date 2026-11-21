@@ -320,8 +320,9 @@ async function installPrimaryState(
 	// turn races and is covered in `beforeAgentStartPrompt` via
 	// `mentalModelsLoadPromise`. Subsequent turns see the populated cache
 	// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`; while the
-	// switch or edit that installed this state is held on a bound prompt, that
-	// rebuild joins the hold and goes out with it.
+	// switch or edit that installed this state is held on a bound prompt, or a
+	// resumed process still sends the transcript's stored prompt, that rebuild
+	// joins the withheld change and goes out with it.
 	if (config.mentalModelsEnabled) {
 		state.mentalModelsLoadPromise = state.runMentalModelLoad(scope).catch(err => {
 			logger.debug("Hindsight: mental-model bootstrap failed", { bankId: state.bankId, error: String(err) });

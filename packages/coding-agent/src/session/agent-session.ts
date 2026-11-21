@@ -8003,9 +8003,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
-	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change
-	 * in the background passes `joinsHeldChange`, which joins a held one (see
-	 * {@link SessionTools.refreshBaseSystemPrompt}).
+	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change,
+	 * or this process's startup, in the background passes `joinsHeldChange`, which joins a held one or the kept
+	 * restored transcript prompt (see {@link SessionTools.refreshBaseSystemPrompt}).
 	 */
 	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
