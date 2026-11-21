@@ -2419,8 +2419,11 @@ export class SessionAdvisors {
 		// Provider usage (including cache reads and generated output) is the
 		// trustworthy anchor for accumulated context. Add only the trailing incoming
 		// delta to that arm. Floor it by a full local estimate — fixed advisor system
-		// prompt, tool schemas, stored messages, and incoming delta — so provider
-		// under-reporting or payload transforms cannot suppress maintenance.
+		// prompt, the tool definitions the request declares (a tool taken off the
+		// roster that a kept declaration still sends included, counted again only
+		// when its sent definition changes), stored messages, and incoming delta —
+		// so provider under-reporting or payload transforms cannot suppress
+		// maintenance.
 		// Schema overhead depends on the model, so promotion re-evaluates the
 		// local arm against the promoted model's schema policy.
 		const providerContextTokens = this.#estimateAdvisorContextTokens(advisor) + incomingTokens;
@@ -2429,7 +2432,7 @@ export class SessionAdvisors {
 			compactionContextTokens(
 				providerContextTokens,
 				fixedPromptTokens +
-					estimateContextToolSchemaTokens(agent.state.tools, agent.tokenizer, model, {
+					estimateContextToolSchemaTokens(agent, agent.tokenizer, model, {
 						sourceRevision: this.#host.settings.revision,
 						pruneDescriptions: agent.prunesToolDescriptions(model),
 					}) +

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `estimateContextToolSchemaTokens()` takes the agent (`ToolDeclarationSource`) instead of its tool array, and counts the tool definitions its next request declares: the roster and each tool taken off it that a kept declaration still sends (`declaredTools()`), from its sent definition, counted again only when that definition changes
+
+### Fixed
+
+- `computeNonMessageTokens()` and `computeNonMessageBreakdown()` count a tool taken off the roster that the source's agent still declares, so the status line and the compaction figures built on them no longer count too low on a model that keeps its tool declaration
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
