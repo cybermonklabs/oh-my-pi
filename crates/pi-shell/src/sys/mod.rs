@@ -56,6 +56,7 @@ pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;

@@ -19,14 +19,27 @@
 //! writes only once the shell is a zombie or gone, so what it writes can reach
 //! the output only through a pipe the shell does not hold. The run's output is
 //! read to its end, which comes once every process holding it has ended.
+//!
+//! A run that has not ended after [`RUN_BOUND`] fails, naming the processes
+//! of its shell's group that still run, and they are killed: `cargo test`
+//! puts no bound on a test, and a regression here hangs.
 
 #![cfg(unix)]
 
 use std::{
+	io::Read,
 	os::unix::process::{CommandExt, ExitStatusExt},
 	path::{Path, PathBuf},
-	process::{Command, Stdio},
+	process::{Child, Command, Output, Stdio},
+	time::{Duration, Instant},
 };
+
+/// How long one run may take before it fails as a hang. The longest correct
+/// run measured is under 6 s (gVisor,
+/// `a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu`); nextest's `ci`
+/// profile ends a whole test at 240 s, and this ends one run first, naming what
+/// is stuck.
+const RUN_BOUND: Duration = Duration::from_secs(60);
 
 /// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +164,7 @@ fn run(
 			Ok(())
 		});
 	}
+	cmd.process_group(0);
 	let mut child = cmd.spawn().expect("start the shell");
 	if let Some(signal) = signal {
 		let wait_cat = script.contains("$F.cat");
@@ -159,18 +173,86 @@ fn run(
 				let out = child.wait_with_output().expect("read the shell's output");
 				panic!("{script}: the shell ended ({status}) before its stages ran: {out:?}");
 			}
-			std::thread::sleep(std::time::Duration::from_millis(5));
+			std::thread::sleep(Duration::from_millis(5));
 		}
 		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
 		// SAFETY: kill takes integer ids; the child is not reaped yet.
 		assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal the shell");
 	}
-	let out = child.wait_with_output().expect("wait for the shell");
+	let out = finish(child, script, |_| {});
 	let end = out
 		.status
 		.code()
 		.map_or_else(|| End::Signal(out.status.signal().unwrap_or(0)), End::Exit);
 	(out.stdout, end)
+}
+
+/// Wait for `child` (spawned as a process group of its own, stdout and
+/// stderr piped) to end and for its output to end, calling `tick` with its
+/// pid about every 10 ms while it runs. Past [`RUN_BOUND`] the run fails:
+/// the message names the processes of the child's group that still run
+/// (`ps`), and the group is killed.
+fn finish(mut child: Child, script: &str, mut tick: impl FnMut(libc::pid_t)) -> Output {
+	let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+	let drain = |r: Option<Box<dyn Read + Send>>| {
+		std::thread::spawn(move || {
+			let mut all = Vec::new();
+			if let Some(mut r) = r {
+				r.read_to_end(&mut all).expect("read the run's output");
+			}
+			all
+		})
+	};
+	let stdout = drain(
+		child
+			.stdout
+			.take()
+			.map(|r| Box::new(r) as Box<dyn Read + Send>),
+	);
+	let stderr = drain(
+		child
+			.stderr
+			.take()
+			.map(|r| Box::new(r) as Box<dyn Read + Send>),
+	);
+	let deadline = Instant::now() + RUN_BOUND;
+	let mut status = None;
+	while status.is_none() || !stdout.is_finished() || !stderr.is_finished() {
+		if status.is_none() {
+			status = child.try_wait().expect("look at the shell");
+			if status.is_none() {
+				tick(pid);
+			}
+		}
+		if Instant::now() >= deadline {
+			let group = pid.to_string();
+			let left = Command::new("ps")
+				.args(["-A", "-o", "pgid=,pid=,ppid=,stat=,args="])
+				.output()
+				.map_or_else(
+					|e| format!("(ps: {e})"),
+					|o| {
+						String::from_utf8_lossy(&o.stdout)
+							.lines()
+							.filter(|l| l.split_whitespace().next() == Some(group.as_str()))
+							.fold(String::new(), |all, l| all + l + "\n")
+					},
+				);
+			// SAFETY: kill takes integer ids; the group is the run's own.
+			unsafe { libc::kill(-pid, libc::SIGKILL) };
+			let _ = child.wait();
+			panic!(
+				"{script}: still running after {RUN_BOUND:?} (shell {pid}, ended: {status:?}); its \
+				 group:\n{left}"
+			);
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	Output {
+		status: status.expect("ended"),
+		stdout: stdout.join().expect("the output reader"),
+		stderr: stderr.join().expect("the error reader"),
+	}
 }
 
 struct Case {
@@ -382,10 +464,14 @@ fn end_of_file_waits_for_every_writer() {
 
 /// Two vprocs of shell code write to one shared pipe end while a slow
 /// external reads it, so the pipe fills over and over and the two writers
-/// park and resume on the one engine waker. A wait one writer's progress drops
-/// without a wake leaves the other parked for good: the run hangs and the
-/// harness's bound reports it. The reader is `sh`'s `read`, which takes the
-/// pipe a byte at a time.
+/// park and resume on the one engine waker. This is coverage of two writers
+/// on one shared end; the regression test of a wait one writer's progress
+/// drops is `sys::stage_pipe`'s
+/// `a_vproc_that_writes_keeps_the_wait_of_another_vproc_with_its_waker`,
+/// which is deterministic where this needs a race (b73c49b0's code passed
+/// it 10 of 10 on runc and hung once in 10 on gVisor). A hang fails at
+/// [`RUN_BOUND`], naming what still runs. The reader is `sh`'s `read`, which
+/// takes the pipe a byte at a time.
 #[test]
 fn two_shell_code_writers_share_one_end() {
 	check("two_shell_code_writers_share_one_end", &[Case::new(
@@ -395,4 +481,53 @@ fn two_shell_code_writers_share_one_end() {
 		 1)); done; echo $n'",
 		"600\n",
 	)]);
+}
+
+/// A shell-code writer that waits on a full shared pipe uses no CPU while it
+/// waits: 100 lines of 3001 bytes into a reader that takes one line, then
+/// sleeps 10 ms. obash's own CPU time (its threads, from `/proc/PID/stat`,
+/// read until it ends) must stay under a quarter of the run's wall time.
+/// gVisor polls a pipe writable whenever any byte fits, while a write of at
+/// most `PIPE_BUF` bytes needs room for all of it; a writer that waited for
+/// the first spun 70 to 90 % of a CPU there. On the Linux kernel's pipes it
+/// never did.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_shell_code_writer_waiting_on_a_full_pipe_uses_no_cpu() {
+	let script = "l=$(printf '%03000d' 0); i=0; while [ $i -lt 100 ]; do echo \"$l\"; i=$((i + \
+	              1)); done | /bin/sh -c 'i=0; while [ $i -lt 100 ]; do /usr/bin/head -c 3001 > \
+	              /dev/null; /bin/sleep 0.01; i=$((i + 1)); done; echo read'";
+	// SAFETY: sysconf only reads.
+	let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+	let started = Instant::now();
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_obash"));
+	cmd.arg0("bash")
+		.args(["-c", script])
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0);
+	let child = cmd.spawn().expect("start obash");
+	// obash's own user and system time so far, in ticks (fields 14 and 15).
+	let mut used = 0u64;
+	let out = finish(child, script, |pid| {
+		if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+			let fields: Vec<&str> = stat
+				.rsplit_once(')')
+				.map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+			if let (Some(u), Some(s)) = (fields.get(11), fields.get(12)) {
+				used = u.parse::<u64>().unwrap_or(0) + s.parse::<u64>().unwrap_or(0);
+			}
+		}
+	});
+	let wall = started.elapsed().as_secs_f64();
+	let cpu = used as f64 / tick;
+	assert_eq!(
+		(out.status.code(), String::from_utf8_lossy(&out.stdout)),
+		(Some(0), "read\n".into()),
+		"{script}: {out:?}"
+	);
+	println!("obash CPU {cpu:.2} s over {wall:.2} s");
+	assert!(wall >= 1.0, "the reader sleeps 100 x 10 ms, so the run takes 1 s: {wall:.2} s");
+	assert!(cpu <= wall / 4.0, "obash used {cpu:.2} s of CPU over {wall:.2} s while it waited");
 }
