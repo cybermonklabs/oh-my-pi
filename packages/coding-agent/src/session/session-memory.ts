@@ -3,14 +3,22 @@
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { all as allSettings, combine, type Derived } from "../config/registry";
+import {
+	type AnySetting,
+	all as allSettings,
+	combine,
+	type Derived,
+	type SettingChange,
+	settingValuesEqual,
+} from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
 import type { RecallChangesReport } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
-import type { MemoryBackendStartOptions } from "../memory-backend/types";
+import type { MemoryBackendId, MemoryBackendStartOptions } from "../memory-backend/types";
 import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
+import type { SettingsChangeOptions } from "./session-tools";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 
@@ -65,8 +73,13 @@ export interface SessionMemoryHost {
 	getMnemopiSessionState(): MnemopiSessionState | undefined;
 	takeMnemopiSessionState(): MnemopiSessionState | undefined;
 	setBaseSystemPrompt(prompt: string[]): void;
-	refreshBaseSystemPrompt(): Promise<void>;
-	replaceMemoryTools(tools: AgentTool[]): Promise<void>;
+	/**
+	 * Rebuilds the base prompt; with `settingsChange` (the memory settings a backend apply took in) a bound prompt
+	 * holds the rebuild (`SessionTools.refreshBaseSystemPrompt`).
+	 */
+	refreshBaseSystemPrompt(options?: SettingsChangeOptions): Promise<void>;
+	/** Swaps the memory tools; with `settingsChange` a bound prompt holds the swap (`SessionTools.replaceMemoryTools`). */
+	replaceMemoryTools(tools: AgentTool[], options?: SettingsChangeOptions): Promise<void>;
 }
 
 /** Owns memory backend transitions and transcript-scoped memory state. */
@@ -94,6 +107,11 @@ export class SessionMemory {
 	#queuedApply: { retainMnemopi: boolean; done: Promise<void> } | undefined;
 	/** Memory settings as last dispatched to `#applySettingsChange`; unset when live changes are disabled. */
 	#observedSettings: Record<string, unknown> | undefined;
+	/**
+	 * Each memory setting's value as a backend apply last took it in ({@link #applyMemoryBackend}): the value the
+	 * running backend, its tools and the prompt follow. Unset when live changes are disabled.
+	 */
+	#appliedSettings: Map<AnySetting, unknown> | undefined;
 	/** Dispatched setting changes still running, including backend hooks that run outside the transition queue. */
 	readonly #settingsChanges = new Set<Promise<void>>();
 
@@ -126,6 +144,7 @@ export class SessionMemory {
 		if (options.memoryEnabled !== false && this.#memoryAgentDir && this.#memoryTaskDepth === 0) {
 			const value = memorySettingsValue();
 			this.#observedSettings = value.get(host.settings);
+			this.#appliedSettings = new Map(value.sources.map(setting => [setting, setting.get(host.settings)] as const));
 			value.listen(host, () => this.#observeSettings());
 		}
 	}
@@ -228,6 +247,18 @@ export class SessionMemory {
 	/** The reports of what changed in a reused recall's memories that the conversation carries, oldest first. */
 	get recallChanges(): readonly RecallChangesReport[] {
 		return this.#recallChanges;
+	}
+
+	/**
+	 * Withdraws the conversation's recall ({@link adoptRecall}) after the backend's recall was reset, then rebuilds the
+	 * base prompt. The memory settings the backend took in since the last apply (a Hindsight state rebuilt for an edit
+	 * of a `hindsight.*` setting) go with the rebuild ({@link #takeSettingsChange}), so a bound prompt holds it as it
+	 * holds a backend apply; `/memory clear` and a cwd move take in none and rebuild at once.
+	 */
+	withdrawRecall(): Promise<void> {
+		this.adoptRecall(undefined, []);
+		const settingsChange = this.#takeSettingsChange(cfgMemoryBackend.get(this.#host.settings));
+		return this.#host.refreshBaseSystemPrompt({ settingsChange });
 	}
 
 	/** Rekeys every active memory backend to the current provider session. */
@@ -389,12 +420,19 @@ export class SessionMemory {
 		return transition;
 	}
 
+	/**
+	 * Starts the selected backend and swaps its tools and prompt in. The memory settings it takes in that moved since
+	 * the last apply ({@link #takeSettingsChange}) go with the swap and the rebuild, so a bound prompt holds both as it
+	 * holds any settings change: its tools and bytes stay as sent until the hold is due, and the settings notice tells
+	 * the model. An apply that takes in no change (a cwd move, an explicit re-apply) swaps them in at once.
+	 */
 	async #applyMemoryBackend(retainMnemopi: boolean): Promise<void> {
 		if (this.#host.isDisposed()) return;
 		const cwd = this.#host.cwd();
 		// A cwd move (or its rollback) may reach here before the rebind does:
 		// drain the outgoing state without capturing the transcript under a stale scope.
 		const retain = retainMnemopi && (this.#runtimeCwd ?? cwd) === cwd;
+		let settingsChange: SettingChange[] | undefined;
 		try {
 			await this.#disposeMemoryBackendState(true, retain);
 			// The backend starts again without a recall and recalls afresh at the next turn.
@@ -402,6 +440,7 @@ export class SessionMemory {
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);
+				settingsChange = this.#takeSettingsChange(backend.id);
 				await backend.start({
 					session: this.#host.memoryBackendSession(),
 					settings: this.#host.settings,
@@ -411,13 +450,13 @@ export class SessionMemory {
 				});
 			}
 			if (this.#host.isDisposed()) return;
-			await this.#refreshMemoryTools();
+			await this.#refreshMemoryTools(settingsChange);
 			if (this.#host.isDisposed()) return;
-			await this.#host.refreshBaseSystemPrompt();
+			await this.#host.refreshBaseSystemPrompt({ settingsChange });
 		} catch (error) {
 			await this.#disposeMemoryBackendState(false);
 			if (!this.#host.isDisposed()) {
-				await this.#replaceMemoryTools([]).catch(refreshError => {
+				await this.#replaceMemoryTools([], settingsChange).catch(refreshError => {
 					logger.warn("Failed to remove memory tools after backend apply error", {
 						error: String(refreshError),
 					});
@@ -427,12 +466,32 @@ export class SessionMemory {
 		}
 	}
 
-	async #refreshMemoryTools(): Promise<void> {
-		const tools = (await this.#createMemoryTools?.()) ?? [];
-		await this.#replaceMemoryTools(tools);
+	/**
+	 * The settings the backend `id` runs under (`memory.backend` and its own `<id>.*` settings) whose value moved since
+	 * an apply last took them in, each with the value taken in then; records the values now as taken in. Undefined when
+	 * none moved or live changes are disabled. Another backend's settings keep the value last taken in, so a switch to
+	 * it later names an edit made while it was inactive.
+	 */
+	#takeSettingsChange(id: MemoryBackendId): SettingChange[] | undefined {
+		const applied = this.#appliedSettings;
+		if (!applied) return undefined;
+		const changes: SettingChange[] = [];
+		for (const [setting, previous] of applied) {
+			if (setting !== cfgMemoryBackend && !setting.id.startsWith(`${id}.`)) continue;
+			const value = setting.get(this.#host.settings);
+			if (settingValuesEqual(value, previous)) continue;
+			changes.push({ setting, previous });
+			applied.set(setting, value);
+		}
+		return changes.length > 0 ? changes : undefined;
 	}
 
-	#replaceMemoryTools(tools: AgentTool[]): Promise<void> {
-		return this.#host.replaceMemoryTools(tools);
+	async #refreshMemoryTools(settingsChange: readonly SettingChange[] | undefined): Promise<void> {
+		const tools = (await this.#createMemoryTools?.()) ?? [];
+		await this.#replaceMemoryTools(tools, settingsChange);
+	}
+
+	#replaceMemoryTools(tools: AgentTool[], settingsChange: readonly SettingChange[] | undefined): Promise<void> {
+		return this.#host.replaceMemoryTools(tools, { settingsChange });
 	}
 }
