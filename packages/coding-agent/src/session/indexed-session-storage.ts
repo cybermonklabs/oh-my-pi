@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ConcatSink, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { ConcatSink, countNewlines, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
 import {
 	childDirNames,
@@ -300,18 +300,24 @@ function sweepStaleSpools(dir: string): void {
 
 /**
  * The head of a full write's lines, which its title slot and the header's
- * session id are read from: the lines that make up their first
- * {@link LINE_STREAM_CHUNK} UTF-16 units, so at least the whole first line.
- * The spool ({@link spoolLines}) and a write streamed from the lines
- * ({@link measureLines}) both read it here, so they read the same title.
+ * session id are read from: the lines through the second newline (the title
+ * slot is read to the first, the session id at most to the second), at most
+ * those that make up the first {@link LINE_STREAM_CHUNK} UTF-16 units, and
+ * always the whole first line. The spool ({@link spoolLines}) and a write
+ * streamed from the lines ({@link measureLines}) both read it here, so they
+ * read the same title.
  */
 class LinesHead {
 	#text = "";
+	#newlines = 0;
 
 	/** `lines` as they are, noting the head as they pass. */
 	*note(lines: Iterable<string>): Generator<string> {
 		for (const line of lines) {
-			if (this.#text.length < LINE_STREAM_CHUNK) this.#text += line;
+			if (this.#newlines < 2 && this.#text.length < LINE_STREAM_CHUNK) {
+				this.#text += line;
+				this.#newlines += countNewlines(line);
+			}
 			yield line;
 		}
 	}
