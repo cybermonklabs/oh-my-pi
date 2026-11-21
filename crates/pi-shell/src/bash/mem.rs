@@ -58,7 +58,7 @@ pub struct PipeState {
 	/// The OS pipe this one became ([`MemFile::share_with_external`]): from
 	/// then on `buf` holds only bytes given back to the pipe
 	/// ([`PipeReader::unread`]: what a host feed held when its external
-	/// ended, zcurses' input), which come before what the OS pipe holds.
+	/// ended), which come before what the OS pipe holds.
 	os:        Option<OsEnds>,
 	/// An external took the read end of the OS pipe while bytes waited in
 	/// `buf`, so the host feeds it through a pump, which may hold bytes no
@@ -71,10 +71,10 @@ pub struct PipeState {
 /// ([`Host::os_pipe`](crate::bash::Host::os_pipe)): each one's
 /// [`File::os_handle`] is the descriptor externals inherit, and its reads and
 /// writes go through a non-blocking end opened with the pipe, which every
-/// engine handle of that end shares and which keeps a wakeup for each task
-/// waiting on it. An end is closed with its last engine handle, so end of
-/// file and `EPIPE` come from the kernel once no process holds the other end,
-/// as for any pipe.
+/// engine handle of that end shares and which wakes every task waiting on it
+/// once the end is ready. An end is closed with its last engine handle, so end
+/// of file and `EPIPE` come from the kernel once no process holds the other
+/// end, as for any pipe.
 struct OsEnds {
 	read:  Option<Box<dyn File>>,
 	write: Option<Box<dyn File>>,
@@ -138,11 +138,11 @@ pub fn tapped_pipe(mirror: Arc<dyn PipeMirror>) -> (PipeReader, PipeWriter) {
 impl PipeReader {
 	/// Push `bytes` back ahead of the buffered data (beyond the capacity if
 	/// need be) and wake the waiters
-	/// ([`FdRef::unread`](crate::bash::FdRef::unread): a host feed's held
-	/// bytes when its external ends, zcurses' input). On a pipe that became
-	/// an OS pipe they come before what the OS pipe holds, so an external
-	/// that takes the read end while they wait is fed through the host's
-	/// pump ([`File::os_handle`] is `None`).
+	/// ([`FdRef::unread`](crate::bash::FdRef::unread), whose one caller is a
+	/// host feed giving back what it held when its external ends). On a pipe
+	/// that became an OS pipe they come before what the OS pipe holds, so an
+	/// external that takes the read end while they wait is fed through the
+	/// host's pump ([`File::os_handle`] is `None`).
 	pub fn unread(&self, bytes: &[u8]) {
 		let mut s = self.0.lock();
 		for &b in bytes.iter().rev() {

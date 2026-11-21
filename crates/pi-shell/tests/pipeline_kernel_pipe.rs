@@ -379,3 +379,20 @@ fn end_of_file_waits_for_every_writer() {
 		),
 	]);
 }
+
+/// Two vprocs of shell code write to one shared pipe end while a slow
+/// external reads it, so the pipe fills over and over and the two writers
+/// park and resume on the one engine waker. A wait one writer's progress drops
+/// without a wake leaves the other parked for good: the run hangs and the
+/// harness's bound reports it. The reader is `sh`'s `read`, which takes the
+/// pipe a byte at a time.
+#[test]
+fn two_shell_code_writers_share_one_end() {
+	check("two_shell_code_writers_share_one_end", &[Case::new(
+		Dialect::Bash,
+		"big=$(printf '%0600d' 0); w() { i=0; while [ $i -lt 300 ]; do echo \"$1$big\"; i=$((i + \
+		 1)); done; }; { w a & w b; wait; } | /bin/sh -c 'n=0; while IFS= read -r l; do n=$((n + \
+		 1)); done; echo $n'",
+		"600\n",
+	)]);
+}

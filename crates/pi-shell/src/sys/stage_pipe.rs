@@ -10,9 +10,11 @@
 //! stage of shell code then takes what the pipe holds or has room for and is
 //! woken by the readiness thread for the rest, never waiting in the kernel,
 //! while the descriptions the externals share stay blocking (`O_NONBLOCK`
-//! belongs to the description). Each task waiting on an end keeps a readiness
-//! wait of its own, so tasks polling one end with their own wakers (the
-//! engine, an extra's fd, a host feed) do not take each other's wakeups.
+//! belongs to the description). All the tasks waiting on an end (the
+//! engine's vprocs, which share one waker, an extra's fd, a host feed) share
+//! one readiness wait, which wakes them all once the end is ready, as the
+//! memory pipe wakes all its waiters; a waiting task is only ever forgotten
+//! by waking it.
 //!
 //! Where the private ends cannot be opened (no `/proc` mounted) no OS pipe is
 //! made, and the memory pipe stays, pumped.
@@ -51,7 +53,8 @@ mod imp {
 			unix::fs::OpenOptionsExt,
 		},
 		ptr,
-		task::{Context, Poll, Waker},
+		sync::Arc,
+		task::{Context, Poll, Wake, Waker},
 	};
 
 	use crate::{
@@ -209,47 +212,106 @@ mod imp {
 		}
 	}
 
+	/// Most wakers one end keeps waiting at once. Past it, every stored waker
+	/// is woken and forgotten: a live task polls again and waits anew, and the
+	/// waker of a task dropped while it waited goes. However many wait, an end
+	/// holds one registration on the readiness thread.
+	const MAX_WAITERS: usize = 64;
+
+	/// The tasks waiting on one private end, all woken together, as the memory
+	/// pipe wakes all its waiters. Every engine vproc polls with the engine's
+	/// one waker, so one stored waker can stand for several vprocs: a waker is
+	/// only ever removed by waking it.
+	#[derive(Default)]
+	struct Waiters {
+		wakers: Vec<Waker>,
+		/// The readiness thread holds a watch with this set's waker. It
+		/// forgets the watch when it fires, which clears this.
+		armed:  bool,
+	}
+
+	/// The waker the readiness thread holds for one private end: it wakes
+	/// every task waiting on the end.
+	#[derive(Default)]
+	struct Fanout(parking_lot::Mutex<Waiters>);
+
+	impl Wake for Fanout {
+		fn wake(self: Arc<Self>) {
+			self.wake_by_ref();
+		}
+
+		fn wake_by_ref(self: &Arc<Self>) {
+			let wakers = {
+				let mut w = self.0.lock();
+				w.armed = false;
+				std::mem::take(&mut w.wakers)
+			};
+			for w in wakers {
+				w.wake();
+			}
+		}
+	}
+
 	/// A private non-blocking description of one end. Its I/O takes what is
 	/// there and returns `Pending` for the rest, with the polling task's waker
-	/// registered on the readiness thread.
+	/// stored until the readiness thread finds the end ready.
 	struct Private {
-		/// One readiness wait per task waiting on this end, with its waker;
-		/// declared first: forgotten by the readiness thread before the
+		/// Declared first: forgotten by the readiness thread before the
 		/// descriptor closes.
-		waits: Vec<(Waker, ready::Watch)>,
-		file:  fs::File,
-		write: bool,
+		watch:   Option<ready::Watch>,
+		waiters: Arc<Fanout>,
+		file:    fs::File,
+		write:   bool,
 	}
 
 	impl Private {
-		const fn new(file: fs::File, write: bool) -> Self {
-			Self { waits: Vec::new(), file, write }
+		fn new(file: fs::File, write: bool) -> Self {
+			Self { watch: None, waiters: Arc::default(), file, write }
 		}
 
-		/// Register `waker` for `events`, replacing only that task's earlier
-		/// wait: every task waiting on this end keeps a wait of its own, as
-		/// the memory pipe keeps every waiter.
+		/// Store `waker` among the tasks waiting on this end (once: an equal
+		/// waker is not repeated) and have the readiness thread wake them all
+		/// once the end is ready for `events`. Nothing is removed here except
+		/// by waking it (the cap), so a waker that stands for several vprocs
+		/// never loses one of their waits.
 		fn wait(&mut self, waker: &Waker, events: i16) -> io::Result<()> {
-			self.waits.retain(|(w, _)| !w.will_wake(waker));
-			let watch = ready::watch(self.file.as_raw_fd(), events, waker)?;
-			self.waits.push((waker.clone(), watch));
+			let (evicted, arm) = {
+				let mut w = self.waiters.0.lock();
+				let mut evicted = Vec::new();
+				if !w.wakers.iter().any(|stored| stored.will_wake(waker)) {
+					if w.wakers.len() >= MAX_WAITERS {
+						evicted = std::mem::take(&mut w.wakers);
+					}
+					w.wakers.push(waker.clone());
+				}
+				let arm = !w.armed;
+				w.armed = true;
+				(evicted, arm)
+			};
+			for stored in evicted {
+				stored.wake();
+			}
+			if arm {
+				// The readiness thread fired and forgot the last watch, or
+				// there was none.
+				self.watch = None;
+				let fanout = Waker::from(Arc::clone(&self.waiters));
+				match ready::watch(self.file.as_raw_fd(), events, &fanout) {
+					Ok(watch) => self.watch = Some(watch),
+					Err(e) => {
+						self.waiters.0.lock().armed = false;
+						return Err(e);
+					},
+				}
+			}
 			Ok(())
 		}
 
-		/// Bytes moved or the end failed: every other waiting task is woken to
-		/// poll again (a needless wake costs one poll), and the waits are
-		/// forgotten, as the memory pipe wakes all its waiters.
-		fn wake_others(&mut self, waker: &Waker) {
-			for (w, _watch) in self.waits.drain(..) {
-				if !w.will_wake(waker) {
-					w.wake();
-				}
-			}
-		}
-
 		/// `op` on the non-blocking descriptor; on `WouldBlock` the task's
-		/// waker is registered for `events` and `op` tried once more, as
-		/// readiness may have come before the registration.
+		/// waker is stored for `events` and `op` tried once more, as readiness
+		/// may have come before the registration. Success removes no waiter:
+		/// the readiness thread wakes them when the end is ready, and a task
+		/// that waited and then went on gets one spurious wake.
 		fn poll_io(
 			&mut self,
 			cx: &Context<'_>,
@@ -261,10 +323,7 @@ mod imp {
 				match op(&self.file) {
 					Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
-					r => {
-						self.wake_others(cx.waker());
-						return Poll::Ready(r);
-					},
+					r => return Poll::Ready(r),
 				}
 				if registered {
 					return Poll::Pending;
@@ -281,8 +340,8 @@ mod imp {
 		/// ask whether the reader is gone): a non-blocking `read(2)` or
 		/// `write(2)` of nothing returns at once, so `poll(2)` answers instead,
 		/// as the memory pipe does: `Ok(0)` when ready, `Pending` (the task's
-		/// waker registered) when not, and on the write end `BrokenPipe` once
-		/// no reader is left (`POLLERR`).
+		/// waker stored) when not, and on the write end `BrokenPipe` once no
+		/// reader is left (`POLLERR`).
 		fn poll_ready(&mut self, cx: &Context<'_>, events: i16) -> Poll<io::Result<usize>> {
 			let mut registered = false;
 			loop {
@@ -291,7 +350,6 @@ mod imp {
 					Err(e) => return Poll::Ready(Err(e)),
 				};
 				if revents != 0 {
-					self.waits.retain(|(w, _)| !w.will_wake(cx.waker()));
 					if self.write && revents & libc::POLLERR != 0 {
 						return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
 					}
@@ -451,6 +509,83 @@ mod imp {
 			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(1))));
 			drop(w);
 			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "end of file");
+		}
+
+		// Failure mode (review round 2, finding 1): every engine vproc polls
+		// with the engine's one waker. Vproc V1 parks on a full pipe; vproc
+		// V2 then writes a little, with the same waker, and that success
+		// dropped V1's wait without waking anyone, so V1 was never woken once
+		// the pipe had room. Linux pipes make this deterministic: with every
+		// page of the pipe in use and the last one partly full, a 4096-byte
+		// write waits (and the pipe does not poll writable) while a 1-byte
+		// write still fits in the last page.
+		#[test]
+		fn a_vproc_that_writes_keeps_the_wait_of_another_vproc_with_its_waker() {
+			let (r, mut w) = os_pipe(b"").unwrap();
+			let fd = RawFd::try_from(w.os_handle().unwrap().0).unwrap();
+			// SAFETY: F_GETPIPE_SZ and sysconf only read.
+			let (size, page) =
+				unsafe { (libc::fcntl(fd, libc::F_GETPIPE_SZ), libc::sysconf(libc::_SC_PAGESIZE)) };
+			let (size, page) = (usize::try_from(size).unwrap(), usize::try_from(page).unwrap());
+			let engine = Arc::new(Flag::default());
+			let waker = Waker::from(Arc::clone(&engine));
+			let mut cx = Context::from_waker(&waker);
+			let full_page = vec![1u8; page];
+			for _ in 1..size / page {
+				assert!(matches!(w.poll_write(&mut cx, &full_page), Poll::Ready(Ok(n)) if n == page));
+			}
+			assert!(matches!(w.poll_write(&mut cx, &[2u8; 100]), Poll::Ready(Ok(100))));
+			// V1 parks.
+			assert!(w.poll_write(&mut cx, &full_page).is_pending(), "a page does not fit");
+			// V2, same waker, writes one byte into the last page.
+			assert!(matches!(w.poll_write(&mut cx, b"3"), Poll::Ready(Ok(1))), "a byte still fits");
+			// The reader empties the pipe: V1 must be woken to write its page.
+			let mut all = vec![0u8; (size / page - 1) * page + 101];
+			external(r.as_ref()).read_exact(&mut all).unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			while !engine.0.load(Ordering::SeqCst) {
+				assert!(
+					std::time::Instant::now() < deadline,
+					"the parked vproc was not woken within 30 s of the pipe having room"
+				);
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+		}
+
+		// Failure mode (review round 2, finding 3): a task dropped while it
+		// waited on an idle end kept its own registration on the readiness
+		// thread, so each short-lived extra cancelled there added one
+		// descriptor to the thread's poll set; or a cap forgets a waiter
+		// without waking it.
+		#[test]
+		fn tasks_waiting_on_an_idle_end_share_one_wait_and_stay_bounded() {
+			let (r, w) = io::pipe().unwrap();
+			let mut end = Private::new(private(r.as_raw_fd(), false).unwrap(), false);
+			let flags: Vec<Arc<Flag>> = (0..200).map(|_| Arc::default()).collect();
+			let mut buf = [0u8; 8];
+			for flag in &flags {
+				let waker = Waker::from(Arc::clone(flag));
+				assert!(
+					end.poll_read(&mut Context::from_waker(&waker), &mut buf)
+						.is_pending()
+				);
+				assert!(
+					end.waiters.0.lock().wakers.len() <= MAX_WAITERS,
+					"the stored wakers stay bounded"
+				);
+			}
+			assert!(end.watch.is_some(), "one registration on the readiness thread");
+			// Every waiter a cap forgot was woken; the rest wake once a byte
+			// comes.
+			(&w).write_all(b"x").unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			while !flags.iter().all(|f| f.0.load(Ordering::SeqCst)) {
+				assert!(
+					std::time::Instant::now() < deadline,
+					"a waiting task was not woken within 30 s"
+				);
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
 		}
 
 		// Failure mode: bytes the memory pipe held are lost or reordered when
