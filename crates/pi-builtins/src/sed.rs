@@ -31,7 +31,7 @@ use std::{
 };
 
 use crate::{
-	bre::{byte_char, push_char_bytes, simple_lower, simple_upper},
+	bre::{push_utf8, simple_lower, simple_upper},
 	host::ShellPaths,
 	sed::error_handling::SedResult,
 };
@@ -347,16 +347,28 @@ pub struct Substitution {
 /// It comprises all UCS-2 characters.  We use a fast lookup array for these.
 const COMMON_UNICODE: usize = 2048;
 
+/// What a `y` string holds at one place, and a line too: a character, or a
+/// byte that is no UTF-8 (where the strings are read as bytes, as in the C
+/// locale, every one is a byte).
+pub type YItem = Result<char, u8>;
+
+/// Appends the bytes of `item`: a character's UTF-8, or the byte.
+pub fn push_item(out: &mut Vec<u8>, item: YItem) {
+	match item {
+		Ok(c) => push_utf8(out, c),
+		Err(byte) => out.push(byte),
+	}
+}
+
 #[derive(Debug)]
 /// Transliteration command (y)
 pub struct Transliteration {
-	fast:        [char; COMMON_UNICODE],
-	slow:        HashMap<char, char>,
+	fast:        [YItem; COMMON_UNICODE],
+	slow:        HashMap<char, YItem>,
 	/// What each byte a line holds apart from any character becomes: in the
 	/// C locale each byte of the line, in a UTF-8 locale each that is no
-	/// UTF-8 (`y/\xe9/e/`). A target is the character that stands for its
-	/// byte where it is one that is no UTF-8 (`bre::byte_char`).
-	bytes:       [char; 256],
+	/// UTF-8 (`y/\xe9/e/`).
+	bytes:       [YItem; 256],
 	/// Whether the strings were read as characters, as GNU sed reads them in
 	/// a UTF-8 locale, else as bytes, as in the C locale.
 	chars:       bool,
@@ -368,23 +380,21 @@ pub struct Transliteration {
 impl Default for Transliteration {
 	/// Create a new Transliteration with identity mapping for the fast-path.
 	fn default() -> Self {
-		let mut fast = ['\0'; COMMON_UNICODE];
-		for (i, slot) in fast.iter_mut().enumerate() {
-			*slot = char::from_u32(i as u32).unwrap_or('\0');
-		}
 		Self {
-			fast,
-			slow: HashMap::new(),
-			bytes: std::array::from_fn(|byte| byte_char(byte as u8)),
-			chars: true,
+			fast:        std::array::from_fn(|i| {
+				Ok(char::from_u32(i as u32).expect("each value below U+0800 is a scalar value"))
+			}),
+			slow:        HashMap::new(),
+			bytes:       std::array::from_fn(|byte| Err(byte as u8)),
+			chars:       true,
 			byte_target: false,
 		}
 	}
 }
 
-/// The characters of a `y` string as a UTF-8 locale reads its bytes: each
+/// The items of a `y` string as a UTF-8 locale reads its bytes: each
 /// character whose UTF-8 they hold, and each byte that is no UTF-8 alone.
-fn utf8_items(bytes: &[u8]) -> impl Iterator<Item = Result<char, u8>> + '_ {
+fn utf8_items(bytes: &[u8]) -> impl Iterator<Item = YItem> + '_ {
 	bytes
 		.utf8_chunks()
 		.flat_map(|chunk| chunk.valid().chars().map(Ok).chain(chunk.invalid().iter().map(|&byte| Err(byte))))
@@ -397,10 +407,10 @@ impl Transliteration {
 	/// UTF-8 is no character of a line that is UTF-8: as a source it maps
 	/// that byte alone, and as a target it is written as that byte, as GNU
 	/// sed writes it in C.UTF-8 (`printf 'cafe\n' | sed 'y/e/\xe9/'` writes
-	/// `caf\351`). A character is itself, one from U+10FF80 too, which
-	/// stands for such a byte elsewhere (see [`Self::push_target`]). A
-	/// source character given twice keeps its first target, as there: `echo
-	/// a | sed 'y/aa/12/'` prints `1`.
+	/// `caf\351`); a character is itself, one from U+10FF80 too (`printf
+	/// 'ab\n' | sed $'y/ab/\\xe9\364\217\276\200/'` writes `351 364 217 276
+	/// 200`). A source character given twice keeps its first target, as
+	/// there: `echo a | sed 'y/aa/12/'` prints `1`.
 	pub fn from_strings(source: &[u8], target: &[u8]) -> Option<Self> {
 		if utf8_items(source).count() != utf8_items(target).count() {
 			return None;
@@ -412,7 +422,6 @@ impl Transliteration {
 				continue;
 			}
 			result.byte_target |= to.is_err();
-			let to = to.unwrap_or_else(byte_char);
 			match from {
 				Ok(from) => result.insert(from, to),
 				Err(byte) => result.bytes[usize::from(byte)] = to,
@@ -432,13 +441,13 @@ impl Transliteration {
 		}
 		let mut result = Self { chars: false, ..Self::default() };
 		for (&from, &to) in source.iter().zip(target) {
-			result.bytes[usize::from(from)] = byte_char(to);
+			result.bytes[usize::from(from)] = Err(to);
 		}
 		Some(result)
 	}
 
 	/// Set a transliteration mapping from one character to another.
-	fn insert(&mut self, from: char, to: char) {
+	fn insert(&mut self, from: char, to: YItem) {
 		let cp = from as usize;
 		if cp < COMMON_UNICODE {
 			self.fast[cp] = to;
@@ -448,18 +457,18 @@ impl Transliteration {
 	}
 
 	/// Look up a character transliteration.
-	pub fn lookup(&self, ch: char) -> char {
+	pub fn lookup(&self, ch: char) -> YItem {
 		let cp = ch as usize;
 		if cp < COMMON_UNICODE {
 			self.fast[cp]
 		} else {
-			self.slow.get(&ch).copied().unwrap_or(ch)
+			self.slow.get(&ch).copied().unwrap_or(Ok(ch))
 		}
 	}
 
 	/// Look up the transliteration of a byte a line holds apart from any
 	/// character; see `bytes`.
-	pub fn lookup_byte(&self, byte: u8) -> char {
+	pub fn lookup_byte(&self, byte: u8) -> YItem {
 		self.bytes[usize::from(byte)]
 	}
 
@@ -471,19 +480,6 @@ impl Transliteration {
 	/// Whether some target is a byte that is no UTF-8; see `byte_target`.
 	pub const fn writes_bytes(&self) -> bool {
 		self.byte_target
-	}
-
-	/// Appends to `out` what the target `mapped` writes: the byte it stands
-	/// for (`bre::byte_char`) where the strings were read as bytes or some
-	/// target is a byte that is no UTF-8, else the character, one from
-	/// U+10FF80 too: `printf 'ab\n' | sed $'y/ab/\364\217\276\200c/'` writes
-	/// U+10FF80 whole in C.UTF-8.
-	pub fn push_target(&self, out: &mut Vec<u8>, mapped: char) {
-		if self.chars && !self.byte_target {
-			out.extend_from_slice(mapped.encode_utf8(&mut [0; 4]).as_bytes());
-		} else {
-			push_char_bytes(out, mapped);
-		}
 	}
 }
 
@@ -712,43 +708,43 @@ mod tests {
 	#[test]
 	fn test_identity_lookup_fast_path() {
 		let t = Transliteration::default();
-		assert_eq!(t.lookup('A'), 'A');
-		assert_eq!(t.lookup('z'), 'z');
-		assert_eq!(t.lookup('\u{07FF}'), '\u{07FF}'); // highest 2-byte UTF-8 char
+		assert_eq!(t.lookup('A'), Ok('A'));
+		assert_eq!(t.lookup('z'), Ok('z'));
+		assert_eq!(t.lookup('\u{07FF}'), Ok('\u{07FF}')); // highest 2-byte UTF-8 char
 	}
 
 	#[test]
 	fn test_identity_lookup_slow_path() {
 		let t = Transliteration::default();
-		assert_eq!(t.lookup('\u{0800}'), '\u{0800}'); // just outside fast path
-		assert_eq!(t.lookup('\u{1F600}'), '\u{1F600}'); // 😀
+		assert_eq!(t.lookup('\u{0800}'), Ok('\u{0800}')); // just outside fast path
+		assert_eq!(t.lookup('\u{1F600}'), Ok('\u{1F600}')); // 😀
 	}
 
 	#[test]
 	fn test_insert_and_lookup_fast_path() {
 		let mut t = Transliteration::default();
-		t.insert('a', 'α');
-		t.insert('b', 'β');
-		assert_eq!(t.lookup('a'), 'α');
-		assert_eq!(t.lookup('b'), 'β');
-		assert_eq!(t.lookup('c'), 'c'); // unchanged
+		t.insert('a', Ok('α'));
+		t.insert('b', Ok('β'));
+		assert_eq!(t.lookup('a'), Ok('α'));
+		assert_eq!(t.lookup('b'), Ok('β'));
+		assert_eq!(t.lookup('c'), Ok('c')); // unchanged
 	}
 
 	#[test]
 	fn test_insert_and_lookup_slow_path() {
 		let mut t = Transliteration::default();
-		t.insert('🦀', 'c'); // U+1F980 Crab emoji -> 'c'
-		assert_eq!(t.lookup('🦀'), 'c');
-		assert_eq!(t.lookup('🦁'), '🦁'); // unchanged
+		t.insert('🦀', Ok('c')); // U+1F980 Crab emoji -> 'c'
+		assert_eq!(t.lookup('🦀'), Ok('c'));
+		assert_eq!(t.lookup('🦁'), Ok('🦁')); // unchanged
 	}
 
 	#[test]
 	fn test_overwrite_mapping() {
 		let mut t = Transliteration::default();
-		t.insert('x', '1');
-		assert_eq!(t.lookup('x'), '1');
-		t.insert('x', '2');
-		assert_eq!(t.lookup('x'), '2');
+		t.insert('x', Ok('1'));
+		assert_eq!(t.lookup('x'), Ok('1'));
+		t.insert('x', Ok('2'));
+		assert_eq!(t.lookup('x'), Ok('2'));
 	}
 
 	#[test]
@@ -756,11 +752,11 @@ mod tests {
 		let mut t = Transliteration::default();
 		for cp in 0..COMMON_UNICODE {
 			if let Some(ch) = char::from_u32(cp as u32) {
-				t.insert(ch, ' ');
+				t.insert(ch, Ok(' '));
 			}
 		}
-		assert_eq!(t.lookup('A'), ' ');
-		assert_eq!(t.lookup('\u{07FF}'), ' ');
+		assert_eq!(t.lookup('A'), Ok(' '));
+		assert_eq!(t.lookup('\u{07FF}'), Ok(' '));
 	}
 
 	// from_strings
@@ -768,11 +764,11 @@ mod tests {
 	fn test_basic_transliteration() {
 		let t = Transliteration::from_strings("abcδ".as_bytes(), b"1234").unwrap();
 
-		assert_eq!(t.lookup('a'), '1');
-		assert_eq!(t.lookup('b'), '2');
-		assert_eq!(t.lookup('c'), '3');
-		assert_eq!(t.lookup('δ'), '4');
-		assert_eq!(t.lookup('e'), 'e'); // not mapped, fallback
+		assert_eq!(t.lookup('a'), Ok('1'));
+		assert_eq!(t.lookup('b'), Ok('2'));
+		assert_eq!(t.lookup('c'), Ok('3'));
+		assert_eq!(t.lookup('δ'), Ok('4'));
+		assert_eq!(t.lookup('e'), Ok('e')); // not mapped, fallback
 	}
 
 	#[test]
@@ -781,11 +777,11 @@ mod tests {
 		let target = "e文c";
 		let t = Transliteration::from_strings(source.as_bytes(), target.as_bytes()).unwrap();
 
-		assert_eq!(t.lookup('é'), 'e');
-		assert_eq!(t.lookup('漢'), '文');
-		assert_eq!(t.lookup('🦀'), 'c');
-		assert_eq!(t.lookup('x'), 'x'); // fast fallback
-		assert_eq!(t.lookup('文'), '文'); // slow fallback
+		assert_eq!(t.lookup('é'), Ok('e'));
+		assert_eq!(t.lookup('漢'), Ok('文'));
+		assert_eq!(t.lookup('🦀'), Ok('c'));
+		assert_eq!(t.lookup('x'), Ok('x')); // fast fallback
+		assert_eq!(t.lookup('文'), Ok('文')); // slow fallback
 	}
 
 	#[test]
@@ -794,29 +790,26 @@ mod tests {
 		// as GNU sed 4.9 does in C.UTF-8, and its last read as bytes, as in
 		// the C locale.
 		let t = Transliteration::from_strings(b"aa", b"12").unwrap();
-		assert_eq!(t.lookup('a'), '1');
+		assert_eq!(t.lookup('a'), Ok('1'));
 		let t = Transliteration::from_bytes(b"aa", b"12").unwrap();
-		assert_eq!(t.lookup_byte(b'a'), '2');
+		assert_eq!(t.lookup_byte(b'a'), Err(b'2'));
 	}
 
 	#[test]
-	fn a_y_character_from_u10ff80_is_itself_in_a_utf8_locale() {
+	fn a_y_target_is_a_character_or_a_byte() {
 		// If this regresses, `printf 'ab\n' | LC_ALL=C.UTF-8 sed
-		// $'y/ab/\364\217\276\200c/'` writes the byte 0x80 then `c`, where
-		// GNU sed 4.9 writes U+10FF80 then `c`.
-		let t = Transliteration::from_strings(b"ab", "\u{10FF80}c".as_bytes()).unwrap();
-		assert_eq!(t.lookup('a'), '\u{10FF80}');
-		assert!(!t.writes_bytes());
-		let mut out = Vec::new();
-		t.push_target(&mut out, t.lookup('a'));
-		assert_eq!(out, "\u{10FF80}".as_bytes());
-		// A byte that is no UTF-8 is that byte, as a source and a target.
-		let t = Transliteration::from_strings(b"\x80a", b"b\xe9").unwrap();
-		assert_eq!(t.lookup_byte(0x80), 'b');
+		// $'y/ab/\\xe9\364\217\276\200/'` writes U+10FF80 as the byte 0x80,
+		// where GNU sed 4.9 writes `351 364 217 276 200`, or `printf
+		// 'x\200\n' | sed $'y/\\x80/\364\217\276\200/'` keeps the byte 0x80.
+		let t = Transliteration::from_strings(b"ab", b"\xe9\xf4\x8f\xbe\x80").unwrap();
+		assert_eq!((t.lookup('a'), t.lookup('b')), (Err(0xe9), Ok('\u{10FF80}')));
 		assert!(t.writes_bytes());
 		let mut out = Vec::new();
-		t.push_target(&mut out, t.lookup('a'));
-		assert_eq!(out, b"\xe9");
+		push_item(&mut out, t.lookup('b'));
+		assert_eq!(out, "\u{10FF80}".as_bytes());
+		let t = Transliteration::from_strings(b"\x80", "\u{10FF80}".as_bytes()).unwrap();
+		assert_eq!(t.lookup_byte(0x80), Ok('\u{10FF80}'));
+		assert!(!t.writes_bytes());
 		assert!(Transliteration::from_strings("é".as_bytes(), b"e").is_some());
 		assert!(Transliteration::from_bytes("é".as_bytes(), b"e").is_none());
 	}
@@ -4042,7 +4035,7 @@ pub mod delimited_parser {
 use std::char;
 
 use crate::{
-	bre::byte_char,
+	bre::{byte_char, push_utf8},
 	sed::error_handling::SedResult,
 };
 
@@ -4548,11 +4541,6 @@ pub fn parse_transliteration(
 		}
 	}
 	Ok(bytes)
-}
-
-/// Appends the UTF-8 of `c` to `bytes`.
-fn push_utf8(bytes: &mut Vec<u8>, c: char) {
-	bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
 }
 
 #[cfg(test)]
@@ -9179,7 +9167,7 @@ use pi_vfs::BlockingFs;
 use uucore::display::Quotable;
 
 use crate::{
-	bre::{byte_char, char_byte},
+	bre::char_byte,
 	host::Host,
 };
 use crate::sed::error_handling::{IoContext, SedResult};
@@ -9187,7 +9175,7 @@ use crate::sed::error_handling::{IoContext, SedResult};
 use crate::sed::{
 	command::{
 		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, StringSpace,
-		Transliteration,
+		Transliteration, YItem, push_item,
 	},
 	error_handling::{ScriptLocation, input_runtime_error, script_end_error},
 	fast_io::{IOChunk, LineReader, OutputBuffer, append_text, line_text},
@@ -9623,17 +9611,16 @@ fn substitute(
 /// `printf 'caf\303\251\377\n' | sed 'y/é/e/'` prints `cafe\377`, and
 /// `printf 'a\364\217\276\200\377\n' | sed 'y/a/b/'` keeps the character
 /// U+10FF80 whole. Where it read them as bytes, as in the C locale, every
-/// line is read a byte at a time. A target is written as
-/// [`Transliteration::push_target`] says, and the line is then byte text
-/// where it is no UTF-8 any more.
+/// line is read a byte at a time. A target is written as [`push_item`]
+/// writes it, and the line is then byte text where it is no UTF-8 any more.
 fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 	let mut replaced = false;
 	if trans.reads_chars() && !trans.writes_bytes() && !pattern.is_bytes() {
-		// A line that is UTF-8 stays so.
+		// A line that is UTF-8 stays so: every target is a character.
 		let text = pattern.as_str();
 		let mut result = String::with_capacity(text.len());
 		for c in text.chars() {
-			let mapped = trans.lookup(c);
+			let mapped = trans.lookup(c).expect("no target is a byte");
 			replaced |= mapped != c;
 			result.push(mapped);
 		}
@@ -9644,36 +9631,23 @@ fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
 	}
 	let line = pattern.bytes();
 	let mut result = Vec::with_capacity(line.len());
-	// Maps a byte a line holds apart from any character, telling whether
-	// it changed.
-	let map_byte = |result: &mut Vec<u8>, byte: u8| {
-		let mapped = trans.lookup_byte(byte);
-		let changed = mapped != byte_char(byte);
-		if changed {
-			trans.push_target(result, mapped);
-		} else {
-			result.push(byte);
-		}
-		changed
+	// Writes what an item of the line becomes, telling whether it changed.
+	let mut map = |item: YItem, mapped: YItem| {
+		push_item(&mut result, mapped);
+		replaced |= mapped != item;
 	};
 	if trans.reads_chars() {
 		for chunk in line.utf8_chunks() {
 			for c in chunk.valid().chars() {
-				let mapped = trans.lookup(c);
-				if mapped == c {
-					result.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
-				} else {
-					replaced = true;
-					trans.push_target(&mut result, mapped);
-				}
+				map(Ok(c), trans.lookup(c));
 			}
 			for &byte in chunk.invalid() {
-				replaced |= map_byte(&mut result, byte);
+				map(Err(byte), trans.lookup_byte(byte));
 			}
 		}
 	} else {
 		for &byte in line.iter() {
-			replaced |= map_byte(&mut result, byte);
+			map(Err(byte), trans.lookup_byte(byte));
 		}
 	}
 	// The line's bytes borrow the pattern space, which is replaced below.
