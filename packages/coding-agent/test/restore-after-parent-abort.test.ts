@@ -718,38 +718,43 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		expect(outcome.subagents).toEqual(ids);
 	}, 30_000);
 
-	it("leaves the subagent the user's stop ended (control for the SIGTERM case: same window, same resumed snapshot)", async () => {
-		// If this regresses, the user's stop reaches the cell's subagent as a cut-off: its turn keeps the marked
-		// error, and `omp --restore` relaunches work the user stopped; or the parent's stopped turn reads as one a
-		// process exit cut off, and `--restore` continues it.
-		const { parent, runs } = await openParentWithKeyedWorkers("eval");
-		const backoff = holdBackoff(1);
-		const turn = parent.prompt("Delegate reading the notes from a script.");
-		await backoff.allHeld;
-		expect(runs).toHaveLength(1);
-		await parent.abort({ reason: USER_INTERRUPT_LABEL });
-		await turn;
+	for (const [stop, stopParent] of [
+		["Esc", (parent: AgentSession) => parent.abort({ reason: USER_INTERRUPT_LABEL })],
+		["Ctrl+C in print mode (SIGINT)", (parent: AgentSession) => parent.dispose({ reason: postmortem.Reason.SIGINT })],
+	] as const) {
+		it(`leaves the subagent the user's ${stop} stopped (control for the SIGTERM case: same window, same resumed snapshot)`, async () => {
+			// If this regresses, the user's stop reaches the cell's subagent as a cut-off: its turn keeps the marked
+			// error, and `omp --restore` relaunches work the user stopped; or the parent's stopped turn reads as one a
+			// process exit cut off, and `--restore` continues it. Ctrl+C is the user's stop, as Esc is, not a SIGTERM.
+			const { parent, runs } = await openParentWithKeyedWorkers("eval");
+			const backoff = holdBackoff(1);
+			const turn = parent.prompt("Delegate reading the notes from a script.");
+			await backoff.allHeld;
+			expect(runs).toHaveLength(1);
+			await stopParent(parent);
+			await turn;
 
-		const { outcome, parentEntries, parentLeafId, subagents, delivered } = await restoreInNewProcess(
-			parent,
-			runs,
-			undefined,
-			manager =>
-				manager.appendCustomMessageEntry(
-					EVAL_STATE_CONTEXT_TYPE,
-					"Eval runtime: no kernel.",
-					false,
-					undefined,
-					"agent",
-				),
-		);
-		backoff.wait.mockRestore();
+			const { outcome, parentEntries, parentLeafId, subagents, delivered } = await restoreInNewProcess(
+				parent,
+				runs,
+				undefined,
+				manager =>
+					manager.appendCustomMessageEntry(
+						EVAL_STATE_CONTEXT_TYPE,
+						"Eval runtime: no kernel.",
+						false,
+						undefined,
+						"agent",
+					),
+			);
+			backoff.wait.mockRestore();
 
-		expect(subagents.map(turnEnd)).toEqual([
-			{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
-		]);
-		expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(false);
-		expect(outcome.subagents).toEqual([]);
-		expect(delivered).toEqual([]);
-	}, 30_000);
+			expect(subagents.map(turnEnd)).toEqual([
+				{ stopReason: "aborted", credentialUnavailable: undefined, restorable: false },
+			]);
+			expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(false);
+			expect(outcome.subagents).toEqual([]);
+			expect(delivered).toEqual([]);
+		}, 30_000);
+	}
 });

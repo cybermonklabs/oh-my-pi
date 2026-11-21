@@ -6839,14 +6839,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
 		// A dispose that says `"stop"` stops the turn, also one waiting to retry, so `omp --restore`
-		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}). Any other dispose cuts it off,
-		// so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt. When
-		// the process is going away (its exit, a signal such as a pod's SIGTERM, a fatal error: any
-		// postmortem reason but a manual cleanup), a turn still in flight is labeled as interrupted,
-		// which `omp --restore` continues: nobody chose that end. A dispose the process lives on after
-		// (no reason, or a manual one) gives the platform's own reason, marked as a cut-off. The
-		// reason says the kind to a sync subagent of the turn or of a continuation already running.
-		const stop = options.ownedJobsEnd === "stop";
+		// leaves it ({@link AgentSessionDisposeOptions.ownedJobsEnd}); so does a SIGINT, the user's
+		// Ctrl+C in print and JSON mode (or `kill -INT`), a stop as Esc is. Any other dispose cuts it
+		// off, so `omp --restore` goes on with it: a turn waiting to retry keeps its failed attempt.
+		// When the process is going away for any other postmortem reason but a manual cleanup (its
+		// exit, a SIGTERM such as a pod release, a fatal error), a turn still in flight is labeled as
+		// interrupted, which `omp --restore` continues: nobody chose that end. A dispose the process
+		// lives on after (no reason, or a manual one) gives the platform's own reason, marked as a
+		// cut-off. The reason says the kind to a sync subagent of the turn or of a continuation
+		// already running.
+		const stop = options.ownedJobsEnd === "stop" || options.reason === postmortem.Reason.SIGINT;
 		this.#recovery.abortRetry({ cutOff: !stop });
 		this.abortCompaction();
 		const processEnds = options.reason !== undefined && options.reason !== postmortem.Reason.MANUAL;

@@ -366,6 +366,8 @@ describe("restoreSession (omp --restore)", () => {
 		"Unsettled",
 		"Streamed",
 		"Spawned",
+		"PoolWorker",
+		"Replaced",
 	];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
@@ -967,6 +969,121 @@ describe("restoreSession (omp --restore)", () => {
 		const { outcome } = await restoreParent(main, mainFile);
 
 		expect(outcome.subagents).toContain("Inner");
+	});
+
+	/** Opens parent subagent Outer under `main`, its task prompt written. */
+	async function openOuter(main: SessionManager, mainFile: string, cwd: string) {
+		appendTaskSpawn(main, "Outer");
+		const outerFile = path.join(mainFile.slice(0, -6), "Outer.jsonl");
+		const outer = await SessionManager.open(outerFile, undefined, undefined, {
+			initialCwd: cwd,
+			parentSession: mainFile,
+			suppressBreadcrumb: true,
+		});
+		outer.appendSessionInit({ systemPrompt: ["sub prompt"], task: "Outer task", tools: ["eval", "yield"] });
+		outer.appendMessage({ role: "user", content: "Outer task", timestamp: Date.now() });
+		return { outer, outerFile };
+	}
+
+	it("leaves a paused yield's grandchild when the executor's abort parked its parent, which restore does not go on with", async () => {
+		// If this regresses, the subagent the parked run's backgrounded cell spawned is relaunched with that run as its
+		// owner, but the run is not continued (its tail is the executor's abort), so the relaunched result reaches no
+		// one: the work runs again for nothing.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const { outer, outerFile } = await openOuter(main, mainFile, cwd);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_eval", "eval"));
+		tick();
+		outer.appendMessage(
+			toolResultMessage("call_outer_eval", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+		);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+		outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+		// The executor parks the run: it stops the session with an abort that gives no reason.
+		outer.appendMessage(
+			assistant({
+				stopReason: "aborted",
+				errorMessage: GENERIC_ABORT_SENTINEL,
+				errorId: AIError.create(AIError.Flag.Abort),
+			}),
+		);
+		tick();
+		await writeSubagent(outerFile, cwd, "Inner", stranded, { normalExit: true });
+		await outer.close();
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).not.toContain("Outer");
+		expect(outcome.subagents).not.toContain("Inner");
+	});
+
+	it("relaunches a paused yield's backgrounded work's subagent but not the worker of a finished call that handed its failure over", async () => {
+		// If this regresses, the paused yield's window opens at the oldest pending job and takes in a work-pool worker
+		// whose failure a later foreground cell already got (its pool result names no one): it is relaunched, and the
+		// parent gets its result a second time. The backgrounded cell's own subagent, spawned after the yield, stays
+		// the run's.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const { outer, outerFile } = await openOuter(main, mainFile, cwd);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_bg", "eval"));
+		tick();
+		outer.appendMessage(
+			toolResultMessage("call_outer_bg", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+		);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_pool", "eval"));
+		tick();
+		await writeSubagent(outerFile, cwd, "PoolWorker", stranded, { normalExit: true });
+		tick();
+		outer.appendMessage(
+			toolResultMessage("call_outer_pool", "eval", {
+				language: "js",
+				cells: [
+					{ code: "await pool.run(items)", language: "js", output: "PoolWorker failed.", status: "complete" },
+				],
+			}),
+		);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+		outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+		tick();
+		await writeSubagent(outerFile, cwd, "Inner", stranded, { normalExit: true });
+		await outer.close();
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toContain("Inner");
+		expect(outcome.subagents).not.toContain("PoolWorker");
+	});
+
+	it("relaunches only the streamed reply's spawn when the replaced reply forked after the input, from a summary both branches share", async () => {
+		// If this regresses, the replacement window opens at the first entry after the input, which here is the
+		// summary both branches share, before the replaced reply: that reply's spawn is relaunched for a conversation
+		// that abandoned it.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const input = main.getLeafId();
+		if (!input) throw new Error("Expected the parent's input entry");
+		tick();
+		main.branchWithSummary(input, "S1: the work so far.");
+		const shared = main.getLeafId();
+		if (!shared) throw new Error("Expected the shared summary entry");
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_replaced", "eval"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Replaced", stranded, { normalExit: true });
+		tick();
+		// The parent went back onto the shared summary; selecting it saved a second summary there.
+		main.branchWithSummary(shared, "S2: the replaced reply ran a cell.");
+		tick();
+		await writeSubagent(mainFile, cwd, "Streamed", stranded, { normalExit: true });
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Streamed"] });
 	});
 
 	for (const [records, details, relaunched] of [

@@ -332,10 +332,15 @@ function settle(settled: Map<string, number>, id: string, at: number): void {
 	if (prior === undefined || (Number.isFinite(at) && !(prior >= at))) settled.set(id, at);
 }
 
-/** When (epoch ms) a call the parent's process ended inside started, and when its turn ended (`Infinity`: it never did). */
+/**
+ * When (epoch ms) a call the parent's process ended inside started, and when its turn ended
+ * (`Infinity`: it never did); a spawn inside one of the `excluded` spans (a finished call's own
+ * run) is not this window's.
+ */
 interface CutOffWindow {
 	startedAt: number;
 	endedAt: number;
+	excluded?: ReadonlyArray<{ startedAt: number; endedAt: number }>;
 }
 
 /**
@@ -493,19 +498,25 @@ function messageStartedAt(entry: Extract<SessionEntry, { type: "message" }>): nu
  *   call is the last reply that makes calls; with no reply saved, the reply that streamed when the
  *   process went away ({@link replyStreamStartedAt}). The window runs on to the end. A run that a
  *   terminal `yield` ended ({@link yieldEndsRun}) is not live, though the executor then stops the
- *   session with an abort that gives no reason; one whose async work was still pending at that
- *   `yield` is, since the executor parks the run there until that work settles
- *   ({@link pendingAsyncWorkSince}).
+ *   session with an abort that gives no reason. One whose async work was still pending at that
+ *   `yield` is parked there until that work settles; when restore goes on with that run
+ *   (`continued`, its turn restorable), the work's own spawns are the run's
+ *   ({@link pendingAsyncWork}). A parked run restore does not go on with has no window: a
+ *   relaunched subagent's result would reach no one.
  * - The latest reply with a call no result answers: the agent loop answers every call it finishes,
  *   an aborted one too, so the process ended inside it (a hard kill). Its window ends at the next
  *   input after it, when the conversation went on.
  * A call before the live one got its result, an older turn ended, and a branch the parent left is
  * not on this one, so none of them opens a window.
  */
-function cutOffWindows(conversation: readonly SessionEntry[], entries: readonly SessionEntry[]): CutOffWindow[] {
+function cutOffWindows(
+	conversation: readonly SessionEntry[],
+	entries: readonly SessionEntry[],
+	continued: boolean,
+): CutOffWindow[] {
 	const windows: CutOffWindow[] = [];
-	const live = liveCallStartedAt(conversation, entries);
-	if (live !== undefined) windows.push({ startedAt: live, endedAt: Number.POSITIVE_INFINITY });
+	const live = liveCallWindow(conversation, entries, continued);
+	if (live) windows.push(live);
 	const answered = new Set<string>();
 	for (const entry of conversation) {
 		if (entry.type === "message" && entry.message.role === "toolResult") answered.add(entry.message.toolCallId);
@@ -524,24 +535,27 @@ function cutOffWindows(conversation: readonly SessionEntry[], entries: readonly 
 	return windows;
 }
 
-/** When the call of the conversation's live last turn started ({@link cutOffWindows}); undefined when that turn is not live. */
-function liveCallStartedAt(
+/** The window of the conversation's live last turn ({@link cutOffWindows}); undefined when that turn is not live. */
+function liveCallWindow(
 	conversation: readonly SessionEntry[],
 	entries: readonly SessionEntry[],
-): number | undefined {
+	continued: boolean,
+): CutOffWindow | undefined {
+	const open = (startedAt: number | undefined): CutOffWindow | undefined =>
+		startedAt === undefined ? undefined : { startedAt, endedAt: Number.POSITIVE_INFINITY };
 	for (let index = conversation.length - 1; index >= 0; index--) {
 		const entry = conversation[index]!;
-		if (isTurnInput(entry)) return replyStreamStartedAt(conversation, entries, index);
+		if (isTurnInput(entry)) return open(replyStreamStartedAt(conversation, entries, index));
 		if (entry.type !== "message") continue;
 		const { message } = entry;
 		if (message.role === "toolResult") {
 			if (message.toolName === "yield" && !message.isError && yieldEndsRun(message.details)) {
-				return pendingAsyncWorkSince(conversation, index);
+				return continued ? pendingAsyncWork(conversation, index) : undefined;
 			}
 			continue;
 		}
 		if (message.role !== "assistant") continue;
-		if (message.content.some(part => part.type === "toolCall")) return messageStartedAt(entry);
+		if (message.content.some(part => part.type === "toolCall")) return open(messageStartedAt(entry));
 		// A reply that ended the turn, other than the record of a process exit.
 		if (!isProcessExitRecord(message)) return undefined;
 	}
@@ -549,15 +563,19 @@ function liveCallStartedAt(
 }
 
 /**
- * When the earliest async work of the conversation that was still pending at
- * `conversation[beforeIndex]` started (epoch ms); undefined when none was. Async work is a
- * backgrounded eval cell or background `task` spawn (its result's `async` job), or an eval job
- * record that is `owed`; it settles with its job's delivery (`async-result`), a `wait` that lists
- * it settled, or its `delivered` record. A job started where the reply that made its call began.
+ * The window of the async work of the conversation that was still pending at
+ * `conversation[beforeIndex]`, a terminal `yield`'s result; undefined when none was. Async work
+ * is a backgrounded eval cell or background `task` spawn (its result's `async` job), or an eval
+ * job record that is `owed`; it settles with its job's delivery (`async-result`), a `wait` that
+ * lists it settled, or its `delivered` record. The window opens where the earliest pending job
+ * began (where the reply that made its call began, or its `owed` record) and leaves out every
+ * other call of the conversation that got its result: a subagent spawned while such a call ran
+ * (a work-pool or `vibe_wait` worker, whose failure the call handed over) is that call's.
  */
-function pendingAsyncWorkSince(conversation: readonly SessionEntry[], beforeIndex: number): number | undefined {
+function pendingAsyncWork(conversation: readonly SessionEntry[], beforeIndex: number): CutOffWindow | undefined {
 	const calledAt = new Map<string, number>();
-	const pending = new Map<string, number>();
+	const pending = new Map<string, { startedAt: number; callId?: string }>();
+	const finished: Array<{ callId: string; endedAt: number }> = [];
 	for (const entry of conversation.slice(0, beforeIndex)) {
 		if (entry.type === "message" && entry.message.role === "assistant") {
 			for (const part of entry.message.content) {
@@ -566,19 +584,34 @@ function pendingAsyncWorkSince(conversation: readonly SessionEntry[], beforeInde
 		}
 		const job = readEvalAgentJobRecord(entry);
 		if (job) {
-			if (job.state === "owed") pending.set(job.agentId, Date.parse(entry.timestamp));
+			if (job.state === "owed") pending.set(job.agentId, { startedAt: Date.parse(entry.timestamp) });
 			else pending.delete(job.agentId);
 		}
 		if (entry.type === "message" && entry.message.role === "toolResult") {
+			const { toolCallId } = entry.message;
 			const async = isRecord(entry.message.details) ? entry.message.details.async : undefined;
 			const jobId = isRecord(async) && async.state === "running" ? stringProperty(async, "jobId") : undefined;
-			if (jobId) pending.set(jobId, calledAt.get(entry.message.toolCallId) ?? Date.parse(entry.timestamp));
+			if (jobId) {
+				pending.set(jobId, {
+					startedAt: calledAt.get(toolCallId) ?? Date.parse(entry.timestamp),
+					callId: toolCallId,
+				});
+			}
+			finished.push({ callId: toolCallId, endedAt: Date.parse(entry.timestamp) });
 		}
 		for (const id of settledJobIds(entry)) pending.delete(id);
 	}
-	let since: number | undefined;
-	for (const startedAt of pending.values()) if (since === undefined || startedAt < since) since = startedAt;
-	return since;
+	if (pending.size === 0) return undefined;
+	let startedAt = Number.POSITIVE_INFINITY;
+	const pendingCalls = new Set<string>();
+	for (const job of pending.values()) {
+		if (job.startedAt < startedAt) startedAt = job.startedAt;
+		if (job.callId) pendingCalls.add(job.callId);
+	}
+	const excluded = finished
+		.filter(call => !pendingCalls.has(call.callId) && calledAt.has(call.callId))
+		.map(call => ({ startedAt: calledAt.get(call.callId)!, endedAt: call.endedAt }));
+	return { startedAt, endedAt: Number.POSITIVE_INFINITY, excluded };
 }
 
 /** Every id a job report says settled: an `async-result` delivery's or a `wait` snapshot's settled jobs, by job and subagent id. */
@@ -603,10 +636,10 @@ function settledJobIds(entry: SessionEntry): string[] {
 /**
  * When the reply to the input at `conversation[inputIndex]` began streaming, its turn having no
  * reply saved: when the input was written. When the parent replaced a reply to that input, on a
- * branch it left, the new reply began after the parent went back to the input, which only an
- * entry the selected branch wrote after it can place (a branch summary, say): its time, and
- * undefined with none, since a spawn of the replaced reply made after its last saved entry
- * cannot be told from one of the new reply.
+ * branch it left, the new reply began after the parent went back to the latest point the two
+ * branches share, which only an entry the selected branch wrote after that point can place (a
+ * branch summary, say): its time, and undefined with none, since a spawn of the replaced reply
+ * made after its last saved entry cannot be told from one of the new reply.
  */
 function replyStreamStartedAt(
 	conversation: readonly SessionEntry[],
@@ -615,15 +648,16 @@ function replyStreamStartedAt(
 ): number | undefined {
 	const onBranch = new Map(conversation.map((entry, index) => [entry.id, index]));
 	const parentOf = new Map(entries.map(entry => [entry.id, entry.parentId]));
-	const replaced = entries.some(entry => {
-		if (onBranch.has(entry.id)) return false;
+	let forkIndex = -1;
+	for (const entry of entries) {
+		if (onBranch.has(entry.id)) continue;
 		let ancestor = entry.parentId;
 		while (ancestor && !onBranch.has(ancestor)) ancestor = parentOf.get(ancestor) ?? null;
 		const forkedAt = ancestor ? onBranch.get(ancestor) : undefined;
-		return forkedAt !== undefined && forkedAt >= inputIndex;
-	});
-	if (!replaced) return Date.parse(conversation[inputIndex]!.timestamp);
-	const next = conversation[inputIndex + 1];
+		if (forkedAt !== undefined && forkedAt >= inputIndex && forkedAt > forkIndex) forkIndex = forkedAt;
+	}
+	if (forkIndex < 0) return Date.parse(conversation[inputIndex]!.timestamp);
+	const next = conversation[forkIndex + 1];
 	return next ? Date.parse(next.timestamp) : undefined;
 }
 
@@ -674,7 +708,7 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		settled,
 		owedJobs,
 		clearedAt,
-		cutOffWindows: cutOffWindows(branch.slice(conversationStart), entries),
+		cutOffWindows: cutOffWindows(branch.slice(conversationStart), entries, hasRestorableTurn(branch)),
 	};
 }
 
@@ -753,7 +787,12 @@ class SpawnRecords {
 		if (!sub.header || parent.discarded.has(sub.agentId)) return false;
 		const spawnedAt = Date.parse(sub.header.timestamp);
 		if (!Number.isFinite(spawnedAt)) return false;
-		return parent.cutOffWindows.some(window => spawnedAt >= window.startedAt && spawnedAt <= window.endedAt);
+		return parent.cutOffWindows.some(
+			window =>
+				spawnedAt >= window.startedAt &&
+				spawnedAt <= window.endedAt &&
+				!window.excluded?.some(span => spawnedAt >= span.startedAt && spawnedAt <= span.endedAt),
+		);
 	}
 
 	/** What the parent `key` records (`null`: the session itself); undefined for a parent not collected. */

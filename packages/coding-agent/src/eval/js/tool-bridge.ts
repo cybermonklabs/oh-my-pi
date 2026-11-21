@@ -377,8 +377,11 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			const settledIds = new Set(result.details.results.map(agent => agent.id));
 			// A background spawn's "started" result settles no run: record it `owed`, on disk before the cell goes
 			// on, as `agent()` does, so `omp --restore` knows the parent still waits on it. Only the call's own
-			// spawns: the nested snapshots of its progress name the spawns' own subagents.
-			const started = (result.details.progress ?? []).map(spawn => spawn.id).filter(id => !settledIds.has(id));
+			// spawns that started (queued or running): the nested snapshots of its progress name the spawns' own
+			// subagents, and a spawn whose job never registered (`failed`) has no run to wait on.
+			const started = (result.details.progress ?? [])
+				.filter(spawn => (spawn.status === "pending" || spawn.status === "running") && !settledIds.has(spawn.id))
+				.map(spawn => spawn.id);
 			await recordEvalAgentJobs(options.session, started, "owed");
 			if (result.details.results.length > 0) {
 				const handedAt = Date.now();

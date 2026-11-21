@@ -197,10 +197,12 @@ test("a concurrent eval wait of the same run waits for the first wait's record t
 	await manager.dispose();
 });
 
-test("a bridged tool.task records each background spawn it starts as owed before the cell goes on", async () => {
+test("a bridged tool.task records each background spawn it starts as owed before the cell goes on, and not one that never started", async () => {
 	// If this regresses, a background spawn a cell starts through `tool.task` leaves no record: its "started" result
 	// settles no run, so a process that goes away before the spawn's result reaches the parent leaves a subagent
-	// `omp --restore` never relaunches, though the parent never got its result.
+	// `omp --restore` never relaunches, though the parent never got its result. Or a spawn whose job never registered
+	// (`failed` in the progress) is written `owed` with nothing to clear it, and every later terminal yield of the
+	// run reads as a pause.
 	const log: string[] = [];
 	const taskTool: AgentTool = {
 		name: "task",
@@ -215,7 +217,10 @@ test("a bridged tool.task records each background spawn it starts as owed before
 					projectAgentsDir: null,
 					results: [],
 					totalDurationMs: 5,
-					progress: [{ index: 0, id: "Worker", agent: "task", agentSource: "user", status: "running", task: "t" }],
+					progress: [
+						{ index: 0, id: "Worker", agent: "task", agentSource: "user", status: "running", task: "t" },
+						{ index: 1, id: "Lost", agent: "task", agentSource: "user", status: "failed", task: "t" },
+					],
 					async: { state: "running", jobId: "Worker", type: "task" },
 				},
 			};

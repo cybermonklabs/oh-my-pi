@@ -78,9 +78,10 @@ export interface AgentSessionDisposeOptions {
 	 * paths). When set, the persisted `session_exit` diagnostic records it
 	 * instead of the generic `"dispose"` used for normal programmatic disposal
 	 * (`/quit`, test teardown, subagent completion). Every reason but `MANUAL`
-	 * (the process exit, a subagent cut off by its owner's shutdown, a signal
-	 * such as SIGTERM, a fatal error) also records a turn still in flight as
-	 * interrupted, so `omp --restore` goes on with it.
+	 * and `SIGINT` (the process exit, a subagent cut off by its owner's
+	 * shutdown, a SIGTERM, a fatal error) also records a turn still in flight as
+	 * interrupted, so `omp --restore` goes on with it. `SIGINT` (Ctrl+C in print
+	 * or JSON mode) stops the turn, as Esc does, and `omp --restore` leaves it.
 	 */
 	reason?: postmortem.Reason;
 	/**

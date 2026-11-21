@@ -52,7 +52,11 @@ interface Handover {
 	written: Promise<void>;
 }
 
-/** Per session transcript, the handover record of each job run (keyed by {@link runKey}), settled or still in flight. */
+/**
+ * Per session manager, the handover record of each job run (keyed by {@link runKey}), settled or
+ * still in flight. `/new` and a session switch keep the manager, so one map can span several
+ * transcripts; job ids do not repeat across them, so no run's record stands for another's.
+ */
 const handovers = new WeakMap<object, Map<string, Handover>>();
 
 /** A job run's identity within its session: its subagent and its job. A follow-up turn is no job run. */
