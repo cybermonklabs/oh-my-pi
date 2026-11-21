@@ -875,20 +875,6 @@ const SESSION_HEADER_FIRST_READ_BYTES = 8 * 1024;
 /** Reused across calls: reading a header never yields, so one buffer serves every read. */
 const sessionHeaderBuffer = Buffer.allocUnsafe(SESSION_HEADER_PREFIX_BYTES);
 
-/** The session id in the first header line of `prefix`, past the title slot. */
-function parseSessionHeaderId(prefix: string): string | undefined {
-	const body = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
-	const end = body.indexOf("\n");
-	if (end === -1) return undefined;
-	try {
-		const entry: unknown = JSON.parse(body.slice(0, end));
-		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
-			return typeof entry.id === "string" ? entry.id : undefined;
-		}
-	} catch {}
-	return undefined;
-}
-
 /**
  * The session id in the header of the file at `sessionPath`, read
  * synchronously from a bounded prefix (past the title slot), or `undefined`
@@ -899,11 +885,11 @@ function readSessionHeaderIdSync(sessionPath: string): string | undefined {
 		const fd = fs.openSync(sessionPath, "r");
 		try {
 			const read = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_FIRST_READ_BYTES, 0);
-			const id = parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, read));
+			const id = sessionHeaderIdInPrefix(sessionHeaderBuffer.toString("utf8", 0, read));
 			// Only a file whose header line did not fit is read again.
 			if (id !== undefined || read < SESSION_HEADER_FIRST_READ_BYTES) return id;
 			const full = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_PREFIX_BYTES, 0);
-			return parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, full));
+			return sessionHeaderIdInPrefix(sessionHeaderBuffer.toString("utf8", 0, full));
 		} finally {
 			fs.closeSync(fd);
 		}
