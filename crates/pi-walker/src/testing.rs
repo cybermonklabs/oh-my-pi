@@ -31,11 +31,48 @@ const MAX_HOPS: usize = 40;
 /// killed test's tree would stay. A Bazel 9.2.0 server that removed a chain
 /// of 1,215 levels left in its sandbox died (exit 37; it survived 1,205), so
 /// every chain a test builds stays far shorter.
+///
+/// A test's temporary directory can lie on a filesystem the listing cache
+/// refuses by design: a container's root filesystem is an overlay, and gVisor
+/// serves every volume from the host as 9p. There a cached-listing test would
+/// walk fresh listings only, and fail or pass without testing the cache. On
+/// those two the cache takes this directory's stamps as stable
+/// ([`crate::fs::seam::trust_stamps`]). What it cannot see there is a change
+/// made outside the machine (in an overlay's lower directory, or by another
+/// writer on gVisor's host); the tests change their trees from inside, and
+/// each such change moves its directory's stamp on those filesystems too.
+/// Every other filesystem is left to the cache's own check, so on ext4, XFS
+/// or tmpfs a check that refused them fails the cached-listing tests.
 pub fn temp_root() -> PathBuf {
-	std::env::var_os("TEST_TMPDIR")
+	let root = std::env::var_os("TEST_TMPDIR")
 		.map(PathBuf::from)
 		.filter(|dir| dir.is_dir())
-		.unwrap_or_else(std::env::temp_dir)
+		.unwrap_or_else(std::env::temp_dir);
+	#[cfg(target_os = "linux")]
+	if refused_by_design(&root) {
+		use std::os::unix::fs::MetadataExt as _;
+		let meta = std::fs::metadata(&root).expect("the temporary directory exists");
+		crate::fs::seam::trust_stamps(meta.dev());
+	}
+	root
+}
+
+/// Whether `dir` lies on overlayfs or 9p, the filesystems [`temp_root`] can be
+/// on that the listing cache refuses by design. Read from `statfs` here, not
+/// from the cache's own check, which the tests are to check.
+#[cfg(target_os = "linux")]
+fn refused_by_design(dir: &Path) -> bool {
+	const OVERLAYFS: u32 = 0x794c_7630;
+	const V9FS: u32 = 0x0102_1997;
+	let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+		.expect("no NUL in the temporary directory");
+	let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+	// SAFETY: `path` is NUL-terminated and `fs` is a valid out-pointer.
+	let done = unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) };
+	assert_eq!(done, 0, "statfs {}: {}", dir.display(), io::Error::last_os_error());
+	// SAFETY: `statfs` succeeded and filled `fs`.
+	let magic = unsafe { fs.assume_init_ref() }.f_type as u32;
+	matches!(magic, OVERLAYFS | V9FS)
 }
 
 #[derive(Debug)]

@@ -527,7 +527,11 @@ fn stamp_at(dir: RawFd, path: *const c_char, flags: c_int) -> io::Result<FileInf
 
 /// Admits local filesystems that keep sub-second timestamps from the local
 /// clock. NFS, CIFS, FUSE, and overlayfs (whose merged directories need not
-/// change when a lower layer does) are listed every time.
+/// change when a lower layer does) are listed every time, and so is 9p:
+/// gVisor reports 9p for every mount it serves from the host, whatever the
+/// host's filesystem is, and on a shared mount (`cache=remote_revalidating`,
+/// as GKE Sandbox mounts a persistent volume) the stamps and the other
+/// writers are the host's. gVisor's own tmpfs mounts are admitted.
 pub(super) fn fine_timestamps(fd: RawFd) -> bool {
 	const EXT4: u32 = 0xef53;
 	const XFS: u32 = 0x5846_5342;

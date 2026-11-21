@@ -793,24 +793,60 @@ fn a_size_the_allocator_refuses_fails_with_out_of_memory() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_a_sparse_file_beyond_the_address_space_fails_with_out_of_memory() {
-	let tmp = TempDir::new("huge");
-	tmp.write("small", b"small");
-	let huge = std::fs::File::create(tmp.0.join("huge")).unwrap();
-	if let Err(err) = huge.set_len(1 << 50) {
-		eprintln!(
-			"UNKNOWN: no 1 PiB sparse file on this filesystem ({err}); the read was not checked"
-		);
-		return;
-	}
-	drop(huge);
+	let (_files, dir, huge, small) = sparse_files();
 	let mut s = Fs::native().session();
-	let dir = s.open_dir(&tmp.0).await.unwrap();
-	let (mut file, info) = s.open_file_at(&dir, b"huge", false).await.unwrap();
+	let dir = s.open_dir(&dir).await.unwrap();
+	let (mut file, info) = s.open_file_at(&dir, huge.as_bytes(), true).await.unwrap();
 	assert_eq!(info.size, 1 << 50);
 	let mut buf = Vec::new();
 	let err = file.read_into(&mut buf, u64::MAX).await.unwrap_err();
 	assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err:?}");
-	assert_eq!(read_all(&mut s, &dir, "small", u64::MAX).await.0, b"small");
+	let (mut file, _) = s.open_file_at(&dir, small.as_bytes(), true).await.unwrap();
+	file.read_into(&mut buf, u64::MAX).await.unwrap();
+	assert_eq!(buf, b"small");
+}
+
+/// What keeps a 1 PiB sparse file and a file holding `small`, the directory
+/// they are in, and their names there. On Linux both are memfds, named by
+/// their descriptors in `/proc/self/fd`: a memfd lies on tmpfs, which holds a
+/// 1 PiB file on any machine, and a temporary directory need not. ext4
+/// refuses a file over 16 TiB (`EFBIG`), and a gVisor 9p mount of ext4 takes
+/// the truncation and keeps the size 0.
+#[cfg(target_os = "linux")]
+fn sparse_files() -> (impl Sized, PathBuf, String, String) {
+	use std::{
+		io::Write as _,
+		os::fd::{AsRawFd as _, FromRawFd as _},
+	};
+	let memfd = |name: &std::ffi::CStr| {
+		// SAFETY: `name` is NUL-terminated and outlives the call.
+		let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+		assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+		// SAFETY: `memfd_create` returned a fresh descriptor owned from here.
+		unsafe { std::fs::File::from_raw_fd(fd) }
+	};
+	let huge = memfd(c"huge");
+	huge
+		.set_len(1 << 50)
+		.expect("tmpfs holds a 1 PiB sparse file");
+	let mut small = memfd(c"small");
+	small.write_all(b"small").unwrap();
+	let names = (huge.as_raw_fd().to_string(), small.as_raw_fd().to_string());
+	([huge, small], PathBuf::from("/proc/self/fd"), names.0, names.1)
+}
+
+/// [`sparse_files`] in a temporary directory, whose filesystem must hold a
+/// 1 PiB sparse file (APFS does).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn sparse_files() -> (impl Sized, PathBuf, String, String) {
+	let tmp = TempDir::new("huge");
+	tmp.write("small", b"small");
+	let huge = std::fs::File::create(tmp.0.join("huge")).unwrap();
+	huge
+		.set_len(1 << 50)
+		.expect("a 1 PiB sparse file in the temporary directory");
+	let dir = tmp.0.clone();
+	(tmp, dir, "huge".to_owned(), "small".to_owned())
 }
 
 /// Pseudo files report size 0 yet have contents.
