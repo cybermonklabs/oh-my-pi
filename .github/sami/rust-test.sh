@@ -277,30 +277,41 @@ bep_rows() {
 # The rows of every log, one per line, tab-separated: target, rule, status,
 # kind (passed, failed or none), the log's copy, the test binary beside the
 # original log (bin/ for testlogs/), and the invocation (main, root, own-<n>,
-# ignored-<n>, ignored-root-<n>, only-<n> or cargo). An empty field is `-`:
-# bash's read joins adjacent tabs.
+# ignored-<n>, ignored-root-<n>, sticky-user-<n>, sticky-root-<n>, only-<n>,
+# cargo or ignored-cargo-<n>). An empty field is `-`: bash's read joins
+# adjacent tabs.
 rows="$tmp/rows.tsv"
 : >"$rows"
 nlog=0
-# untangle <label> <log>: the log, in place, with each libtest event that
-# shares a line with output written outside the record moved to a line of its
-# own. A test's child process or thread can write a line to the stream it
-# inherited in more than one write (Rust's stderr is unbuffered and writes a
-# formatted line in pieces), and an event libtest writes between two of them
-# starts on that line: in run 44936196181 `pi-builtins_test: invalid length:
-# '7` and a test's `ok` event shared a line and the closing `'` came two
-# lines later, so the event read as raw output and the binary as ended early.
-# The pieces of the raw line are joined again at its next piece outside an
-# event. When an event moved, the log as written is kept as <log>.tangled.
+# untangle <label> <log> [doc]: the log, in place, with each libtest event
+# that shares a line with output written outside the record moved to a line
+# of its own. A test's child process or thread can write a line to the stream
+# it inherited in more than one write (Rust's stderr is unbuffered and writes
+# a formatted line in pieces), and an event libtest writes between two of
+# them starts on that line: in run 44936196181 `pi-builtins_test: invalid
+# length: '7` and a test's `ok` event shared a line and the closing `'` came
+# two lines later, so the event read as raw output and the binary as ended
+# early. The pieces of the raw line are joined again at its next piece outside
+# an event. In a doctest run (`doc`: one thread, and a doctest's output is the
+# lines between its start and its result), the text before an event is
+# that doctest's own, so it goes on a line of its own just before the event.
+# When an event moved, the job log shows each line as written, and the log as
+# written is kept as <log>.tangled.
 untangle() {
 	local moved
-	moved="$(awk -v out="$2.untangled" '
+	moved="$(awk -v out="$2.untangled" -v orig="$2.tangled-lines" -v doc="${3:-}" '
 		{
 			if (match($0, /\{ "type": "(test|suite|bench)", /) && RSTART > 1 && substr($0, length($0)) == "}") {
-				held = held substr($0, 1, RSTART - 1)
+				if (doc != "") {
+					print held substr($0, 1, RSTART - 1) >out
+					held = ""
+				} else {
+					held = held substr($0, 1, RSTART - 1)
+				}
 				print substr($0, RSTART) >out
+				print >orig
 				n++
-			} else if (substr($0, 1, 10) == "{ \"type\": ") {
+			} else if ($0 ~ /^\{ "type": "(test|suite|bench)", .*\}$/) {
 				print >out
 			} else {
 				print held $0 >out
@@ -317,7 +328,11 @@ untangle() {
 	fi
 	mv -- "$2" "$2.tangled"
 	mv -- "$2.untangled" "$2"
-	echo "::notice title=Rust tests::$1: $moved libtest events shared a line with output written outside the record, and were moved to lines of their own (the log as written: $2.tangled)"
+	echo "::notice title=Rust tests::$1: $moved libtest events shared a line with output written outside the record, and were moved to lines of their own (the lines as written are below)"
+	echo "::group::$1: lines where an event followed other output"
+	cat -- "$2.tangled-lines"
+	echo "::endgroup::"
+	rm -f -- "$2.tangled-lines"
 }
 
 # collect <invocation> <event log>: its rows, each log copied to a path of its
@@ -479,6 +494,13 @@ if [ -z "$only" ]; then
 		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
 		check_alone "Sticky-directory FIFO test, as the runner's user" "sticky-user-$i" "$target" "$name"
 		check_alone "Sticky-directory FIFO test, as root" "sticky-root-$i" "$target" "$name"
+		# The tests print `UNKNOWN:` when they checked nothing; that fails here
+		# whatever rust-test-known-output.txt says.
+		while IFS= read -r log; do
+			if [ "$(grep -ac 'UNKNOWN:' "$log" || true)" != 0 ]; then
+				error "Rust test skips" "$target $name printed UNKNOWN: in its own invocation, so it checked nothing: $(grep -a -m 1 'UNKNOWN:' "$log")"
+			fi
+		done < <(awk -F'\t' -v a="sticky-user-$i" -v b="sticky-root-$i" '($7 == a || $7 == b) && $5 != "-" { print $5 }' "$rows")
 	done
 	echo "Sticky-directory FIFO tests, each run as the runner's user and as root: ${#sticky[@]}"
 	for i in "${!ignored_run[@]}"; do
@@ -549,7 +571,7 @@ cargo_test() {
 	if [ "$doc" = 1 ]; then
 		err="$log.raw"
 		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
-		untangle "$label" "$err"
+		untangle "$label" "$err" doc
 		doc_attribute <"$err" >"$log"
 		: >"$log.err"
 	else
@@ -668,18 +690,27 @@ incomplete="$tmp/incomplete.txt"
 raw_output="$tmp/raw-output.tsv"
 : >"$raw_output"
 
+# outside_record <log>: the log's lines that are no libtest event (a JSON
+# object whose type is test, suite or bench): what was written outside the
+# record. A line is judged by parsing it, not by its first character, so a
+# child's own JSON line, or `{ no free port: nothing to test }`, is output.
+outside_record() {
+	jq -R -r '. as $l | (try fromjson catch null) as $o
+		| if ($o | type) == "object" and ($o.type == "test" or $o.type == "suite" or $o.type == "bench") then empty else $l end' "$1"
+}
+
 # raw_lines <log> [<cargo stderr>]: what a test binary wrote outside
-# libtest's record: the log's lines that are no JSON event, and, from cargo's
-# stderr, the lines after its first `Running` line (before it, cargo's own
-# build output). Bazel's own lines in a test.log (its banner, and its line for
-# a test it timed out, which fails anyway), cargo's line after a failed test,
-# and blank lines are left out.
-# shellcheck disable=SC2016 # the patterns name a literal $0 and ${PAGER...}
+# libtest's record: the log's lines that are no libtest event, and, from
+# cargo's stderr, the lines after its first `Running` line (before it,
+# cargo's own build output). Bazel's own lines in a test.log (its banner, and
+# its line for a test it timed out, which fails anyway), cargo's line after a
+# failed test, and blank lines are left out, each matched whole.
+# shellcheck disable=SC2016 # the patterns name a literal $0, ${PAGER...} and backquotes
 raw_lines() {
 	{
-		grep -av '^{' "$1" || true
+		outside_record "$1"
 		if [ -n "${2:-}" ] && [ -f "$2" ]; then awk 'p; /^ +Running /{ p = 1 }' "$2"; fi
-	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass ' || true
+	} | grep -avE '^[[:space:]]*$|^exec \$\{PAGER:-/usr/bin/less\} "\$0" \|\| exit 1$|^Executing tests from //[^ ]+$|^-{20,}$|^-- Test timed out at .* --$|^error: test failed, to rerun pass `[^`]*`$' || true
 }
 
 # scan_output <target> <log> [<cargo stderr>]: the skips and the passing
@@ -726,8 +757,8 @@ check_root() {
 	done < <(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and ((.stdout // "") | test("not run:"))) | .name' "$log")
 	# grep -c, not -q: under pipefail a grep -q that stops early can kill the
 	# grep before it with SIGPIPE and read as clean.
-	if [ "$(grep -v '^{' "$log" | grep -c 'not run:' || true)" != 0 ]; then
-		error "Rust tests" "$label printed 'not run:' outside libtest's record, though it runs as root: $(grep -v '^{' "$log" | grep 'not run:' | sed -n 1p)"
+	if [ "$(outside_record "$log" | grep -c 'not run:' || true)" != 0 ]; then
+		error "Rust tests" "$label printed 'not run:' outside libtest's record, though it runs as root: $(outside_record "$log" | grep 'not run:' | sed -n 1p)"
 	fi
 	passed="$(jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object" and .type == "test" and .event == "ok")] | length' "$log")"
 	if [ "$passed" != "${root_tests[$label]}" ]; then

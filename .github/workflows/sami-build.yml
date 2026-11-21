@@ -134,8 +134,12 @@ jobs:
     # marker `skipped: <reason>` or a word the tree's tests used before it
     # (`skipping`, `SKIP`, `not run`, `UNCOMPARED`) is a skip, and any other
     # output fails unless .github/sami/rust-test-known-output.txt names the
-    # test. A test that returns early and prints nothing passes: no log shows
-    # it, so each test that can skip prints the marker before it returns.
+    # test. A line a test's child or thread writes outside libtest's record
+    # fails unless .github/sami/rust-test-known-raw-output.txt names it. The
+    # sticky-directory FIFO tests run alone out of the sandbox, as the
+    # runner's user given the FIFO the precondition step makes, and as root.
+    # A test that returns early and prints nothing passes: no log shows it,
+    # so each test that can skip prints the marker before it returns.
     name: Rust tests (bazel)
     runs-on: ubuntu-22.04
     # Uncached, the build and the tests took 17 to 25 minutes (runs

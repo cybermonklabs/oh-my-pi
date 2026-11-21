@@ -6,7 +6,11 @@
 # words. An entry names its target, then an extended regular expression the
 # whole line must match (no two spaces in a row), then, after two spaces, what
 # prints it and why that is no skip. Add an entry only after reading the test
-# that prints the line. An entry that matches no line gets a notice.
+# that prints the line. An entry that matches no line gets a notice. Two
+# child processes that write to the same stream at once can split each
+# other's lines (a line can reach the stream in more than one write): no
+# entry matches the pieces, and the job fails. That red is real output in a
+# broken shape, not a new line to name; run the job again before adding an entry.
 # One per line: <bazel test target> <regular expression>  <who prints it; why it is no skip>.
 //crates/pi-builtins:pi-builtins_test pi-builtins_test: invalid length: '7'  b2sum's refusal of the length 7 that b2sum::tests::length_must_be_a_multiple_of_eight gives it, on the process's stderr; the test asserts the refusal
 //crates/pi-builtins:pi-builtins_test kernel [^ ]+, stack rlimit [0-9]+ \(hard [0-9]+\), sysconf\(_SC_ARG_MAX\) [0-9]+: the kernel (refused|ran) the full line of [0-9]+ (files|arguments) .+  find's and xargs's argument-limit tests report what the kernel did with the full line, after asserting it was halved or run whole

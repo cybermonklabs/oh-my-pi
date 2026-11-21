@@ -395,6 +395,7 @@ case "\$mode:\$sel" in
 	doc-skip:--doc) lt_out 'src/lib.rs - f (line 3)' 'skipped: no reference rsync\\n'; exit 0 ;;
 	doc-raw-skip:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nskipped: no reference rsync\n'; echo "a line on stderr" >&2; printf '{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "event": "started", "name": "src/lib.rs - g (line 9)" }\n{ "type": "test", "name": "src/lib.rs - g (line 9)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	doc-raw-print:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nno free port: nothing to test\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
+	doc-raw-nonl:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "src/lib.rs - f (line 3)" }\nno free port: nothing to test{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	doc-empty:--doc) printf '{ "type": "suite", "event": "started", "test_count": 0 }\n{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
 	doc-extra:--doc) printf '{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "test", "name": "src/lib.rs - h (line 20)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; exit 0 ;;
 	*:--doc) printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "name": "src/lib.rs - f (line 3)", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0 }\n'; exit 0 ;;
@@ -515,6 +516,7 @@ ROOTS=$RT ROOT_BODY=": >\"\$bep\"; exit 0" run J52-root-run-no-result 1 "$RT is 
 run J53-not-run-outside-root-targets-is-a-skip 1 "$D t::needs_root skipped itself and is not in" '' "{ $P; rt $D PASSED cat $fixtures/root-nonroot.json; } >\"\$bep\"; exit 0"
 ROOTS=$RT ROOT_COUNT=3 ROOT_BODY="FMT=json; rt $RT PASSED cat $fixtures/root-root.json >\"\$bep\"; exit 0" run J54-root-count-mismatch 1 "$RT passed 2 tests, and .github/sami/rust-test-root-targets.txt names 3" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 ROOTS=$RT ROOT_BODY="FMT=json; rt $RT PASSED sh -c 'cat $fixtures/root-root.json; echo \"t::needs_root: not run: written to fd 2\"' >\"\$bep\"; exit 0" run J55-root-raw-not-run 1 "printed 'not run:' outside libtest's record" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+ROOTS=$RT ROOT_BODY="FMT=json; rt $RT PASSED sh -c 'cat $fixtures/root-root.json; echo \"{ t::needs_root: not run: on a line that starts with a brace }\"' >\"\$bep\"; exit 0" run J55b-root-raw-not-run-brace-line 1 "printed 'not run:' outside libtest's record, though it runs as root: \\{ t::needs_root" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 ROOTS=$RT ROOT_COUNT=1 ROOT_BODY="FMT=json; rt $RT PASSED cat $fixtures/root-stderr-nonroot.json >\"\$bep\"; exit 0" run J56-real-stderr-not-run 1 "$RT t::foreign_owner_refused printed 'not run:'" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # The foreign-owner target is a skylib native_test of pi-builtins_test's
 # binary: its tests are the ones the main invocation's BUILD skip takes out.
@@ -662,6 +664,22 @@ OWN_TESTS="d::one $SN" STICKY_ROOT_BODY="FMT=json; FILTERED=1 rt $D FAILED lt_fa
 OWN_TESTS="d::one $SN" STICKY_FIFO=none run S4-sticky-test-without-fifo 1 "the tree has 1 sticky-directory FIFO tests, and RUST_TEST_STICKY_FIFO names no FIFO" '' "$SMAIN"
 OWN_TESTS="d::one $SN" STICKY_BODY=": >\"\$bep\"; exit 0" run S5-sticky-user-run-missing 1 "Sticky-directory FIFO test, as the runner's user::$D has no one test log for $SN in its own invocation" '' "$SMAIN"
 STICKY_FIFO=none NOT_MSG='::error' run S6-no-sticky-test-needs-no-fifo 0 "Sticky-directory FIFO tests, each run as the runner's user and as root: 0" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+KNOWN_OUTPUT="$PR p::summary
+$D $SN" OWN_TESTS="d::one $SN" STICKY_ROOT_BODY="FMT=json; FILTERED=1 rt $D PASSED lt_out $SN 'UNKNOWN: no FIFO; nothing was checked\\n' >\"\$bep\"; exit 0" run S7-sticky-unknown-fails-though-listed 1 "$D $SN printed UNKNOWN: in its own invocation, so it checked nothing" '' "$SMAIN"
+# From the Claude-family review of fa27bafb: a line outside the record is
+# judged by parsing it, not by its first character (F1); a doctest's output
+# with no newline before its result stays that doctest's (F2); two children
+# whose writes split each other's lines fail closed (F3), and whole lines pass.
+cl4_raw() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "wt::carry" }\n%s\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n' "$1"; }
+CL4RAW="$(declare -f cl4_raw)"
+run J127-brace-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*: \\{ no free port: nothing to test \\}" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{ no free port: nothing to test }'; } >\"\$bep\"; exit 0"
+run J128-json-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*status" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"status\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
+CARGO_MODE=doc-raw-nonl NOT_MSG='ended before' run J129-doctest-output-without-newline-fails 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+cl4_two_children() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\ntest a::x ... \nrunning 1 test\nok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
+cl4_two_whole() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\n\nrunning 1 test\ntest a::x ... ok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
+CL4TWO="$(declare -f cl4_two_children cl4_two_whole)"
+KNOWN_RAW="$D (running 1 test|test a::x \\.\\.\\. ok)" run J130-split-child-lines-fail-closed 1 "$D wrote 2 lines outside libtest's record" '' "$CL4TWO; { $P; rt $D PASSED cl4_two_children; } >\"\$bep\"; exit 0"
+KNOWN_RAW="$D (running 1 test|test a::x \\.\\.\\. ok)" NOT_MSG='::error' run J131-whole-child-lines-pass 0 "Lines outside libtest's record: 2 distinct, 0 named by no entry" '' "$CL4TWO; { $P; rt $D PASSED cl4_two_whole; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
