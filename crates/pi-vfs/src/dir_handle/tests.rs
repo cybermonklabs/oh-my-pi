@@ -1007,14 +1007,15 @@ mod unix {
 	/// A masked `create_dir_at` sets the mode on the directory it made, never
 	/// on what was swapped in for it between `mkdirat` and the mode: a
 	/// symlink to a file, a regular file renamed there, or a hard link to a
-	/// file. Each such file keeps its mode (0600).
+	/// file. Each such file keeps its mode (0600), and the call returns the
+	/// error of the open that found something else at the name.
 	#[test]
 	fn a_masked_create_dir_at_sets_no_mode_on_what_was_swapped_in() {
 		let tree = Tree::new("mkdir-swap");
 		let masked = Fs::native().with_creation_mask(Some(0o022)).blocking();
 		let root = masked.open_dir(tree.at(""), true).unwrap();
 		let mode = |rel: &str| std::fs::metadata(tree.at(rel)).unwrap().mode() & 0o777;
-		let mut changed = Vec::new();
+		let (mut changed, mut reported) = (Vec::new(), Vec::new());
 		for swap in ["symlink", "file", "hardlink"] {
 			let (name, victim) = (format!("raced-{swap}"), format!("victim-{swap}"));
 			std::fs::write(tree.at(&victim), "key").unwrap();
@@ -1042,8 +1043,12 @@ mod unix {
 			if mode(rel) != 0o600 {
 				changed.push(format!("{swap}: {rel} {:o} ({created:?})", mode(rel)));
 			}
+			if created.is_ok() {
+				reported.push(swap);
+			}
 		}
 		assert!(changed.is_empty(), "the directory's mode went to a swapped-in file: {changed:?}");
+		assert!(reported.is_empty(), "create_dir_at reported made after these swaps: {reported:?}");
 	}
 
 	/// A provider rename names its destination through the destination
