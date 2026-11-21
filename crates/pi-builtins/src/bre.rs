@@ -197,10 +197,10 @@ pub(crate) struct PatternBytes {
 	/// byte in a bracket expression is.
 	pub utf8_locale: bool,
 	/// A byte that no `.`, bracket expression or class escape may match, for
-	/// [`Target::Pcre`]: grep searches a copy of a line that is not UTF-8
-	/// holding it for some of the line's bytes that are no UTF-8, where a
-	/// word assertion reads them as GNU's regex matcher does. The `regex`
-	/// crate's engine is compiled with it as its line terminator instead.
+	/// [`Target::Pcre`] and [`Target::Rust`]: grep searches a copy of a line
+	/// that is not UTF-8 holding it for some of the line's bytes that are no
+	/// UTF-8, where a word assertion reads them as GNU's regex matcher does
+	/// (see `Translator::guard`).
 	pub stand_in:    Option<u8>,
 }
 
@@ -407,6 +407,12 @@ fn holds(pattern: &str, found: impl Fn(char, bool) -> bool) -> bool {
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn has_backreference(pattern: &str) -> bool {
 	holds(pattern, |c, escaped| escaped && matches!(c, '1'..='9'))
+}
+
+/// Whether `pattern` holds a word assertion: `\<`, `\>`, `\b` or `\B`.
+#[cfg(feature = "util.grep")]
+pub(crate) fn has_word_assertion(pattern: &str) -> bool {
+	holds(pattern, |c, escaped| escaped && matches!(c, '<' | '>' | 'b' | 'B'))
 }
 
 /// Whether `pattern`, of [`pattern_text`], holds a pattern byte that is no
@@ -1193,13 +1199,29 @@ impl Translator<'_> {
 		self.set_atom(start);
 	}
 
-	/// Writes the atom `out` holds from `start` so that it does not match
-	/// the stand-in byte, where there is one for PCRE2 ([`PatternBytes`]):
-	/// `.` becomes `(?:(?!\x{5F}).)`.
+	/// Writes the atom `out` holds from `start`, a `.`, a bracket expression
+	/// or a class escape, so that it does not match the stand-in byte where
+	/// there is one ([`PatternBytes`]): for PCRE2 `.` becomes
+	/// `(?:(?!\x{5F}).)`, and for the `regex` crate `\w` becomes
+	/// `[\w--\x{5F}]` and `.` becomes `[^\n\x{5F}]`.
 	fn guard(&mut self, start: usize) {
-		if let Some(byte) = self.bytes.stand_in.filter(|_| self.target == Target::Pcre) {
-			self.out.insert_str(start, &format!(r"(?:(?!\x{{{byte:02X}}})"));
-			self.out.push(')');
+		let Some(byte) = self.bytes.stand_in else {
+			return;
+		};
+		match self.target {
+			Target::Pcre => {
+				self.out.insert_str(start, &format!(r"(?:(?!\x{{{byte:02X}}})"));
+				self.out.push(')');
+			},
+			Target::Rust if &self.out[start..] == "." => {
+				self.out.truncate(start);
+				self.out.push_str(&format!(r"[^\n\x{{{byte:02X}}}]"));
+			},
+			Target::Rust => {
+				self.out.insert(start, '[');
+				self.out.push_str(&format!(r"--\x{{{byte:02X}}}]"));
+			},
+			Target::RustBytes | Target::PcreBytes | Target::Fancy => {},
 		}
 	}
 
@@ -2871,8 +2893,8 @@ mod tests {
 		assert_eq!(translate_raw("[é]", Dialect::Basic, Target::RustBytes, false, c), Ok("[é]".to_owned()));
 	}
 
-	/// For PCRE2 a pattern is written so that no `.`, bracket expression or
-	/// class escape matches the stand-in that grep's copy of a line holds.
+	/// A pattern is written so that no `.`, bracket expression or class
+	/// escape matches the stand-in that grep's copy of a line holds.
 	#[test]
 	fn a_stand_in_is_matched_by_no_atom_but_a_literal() {
 		// If this regresses, `printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c
@@ -2880,7 +2902,12 @@ mod tests {
 		let bytes = PatternBytes { raw: false, utf8_locale: true, stand_in: Some(b'_') };
 		let guarded = r"a(?:(?!\x{5F}).)*(?:(?!\x{5F})[b])(?:(?!\x{5F})\w)";
 		assert_eq!(translate_raw(r"a.*[b]\w", Dialect::Basic, Target::Pcre, false, bytes), Ok(guarded.to_owned()));
-		// The `regex` crate's engine leaves it out itself.
-		assert_eq!(translate_raw("a.", Dialect::Basic, Target::Rust, false, bytes), Ok("a.".to_owned()));
+		// For the `regex` crate each is a class without it, of either case.
+		let bytes = PatternBytes { stand_in: Some(b'z'), ..bytes };
+		let guarded = r"a[^\n\x{7A}][[^x]--\x{7A}][\w--\x{7A}]";
+		assert_eq!(translate_raw(r"a.[^x]\w", Dialect::Basic, Target::Rust, false, bytes), Ok(guarded.to_owned()));
+		let engine = regex::bytes::RegexBuilder::new(guarded).case_insensitive(true).build().unwrap();
+		assert!(engine.is_match(b"abcd") && engine.is_match(b"ABCD"));
+		assert!(!engine.is_match(b"azcd") && !engine.is_match(b"abzd") && !engine.is_match(b"abcz"));
 	}
 }

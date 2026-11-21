@@ -307,12 +307,58 @@ describe("builtin grep: a word assertion beside a byte that is not UTF-8, in the
 		[String.raw`printf 'a\377b c\n' | LC_ALL=C.UTF-8 grep -ao '\<[a-z]\>'`, "c\n", 0],
 		// Regressed: the `regex` crate read 0x80 as part of the `a` before it.
 		[String.raw`printf 'a\200b c\n' | LC_ALL=C.UTF-8 grep -ao '\<[a-z]\>'`, "a\nb\nc\n", 0],
-		// Already GNU's answer, kept: a byte whose character is no letter, and `.`.
+		// Regressed: `\B` held beside no byte whose character is no letter.
+		[String.raw`printf '\200\n' | LC_ALL=C.UTF-8 grep -c '^\B'`, "1\n", 0],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c '\B$'`, "1\n", 0],
+		[String.raw`printf ' \200\n' | LC_ALL=C.UTF-8 grep -c ' \B'`, "1\n", 0],
+		[String.raw`printf ' \200 \n' | LC_ALL=C.UTF-8 grep -o '\B.'`, " \n \n", 0],
+		// Regressed: a line holding `_` and every digit was read as text.
+		[String.raw`printf 'a\377 _0123456789\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
+		[String.raw`printf 'a\377 _0123456789\n' | LC_ALL=C.UTF-8 grep -c 'a\>\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377 _0123456789ZQXJ\n' | LC_ALL=C.UTF-8 grep -ic 'A\>'`, "0\n", 1],
+		// Already GNU's answer, kept: a byte whose character is no letter, `.`, `\B` beside a
+		// word character, and `K` (U+212A), which is `k` without case.
 		[String.raw`printf 'ab\200\n' | LC_ALL=C.UTF-8 grep -c 'b\>\|\(x\)\1'`, "1\n", 0],
 		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c 'b.\|\(x\)\1'`, "0\n", 1],
 		[String.raw`printf '\200ab\n' | LC_ALL=C.UTF-8 grep -c '\<a'`, "1\n", 0],
 		[String.raw`printf 'a\262 b\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "1\n", 0],
 		[String.raw`printf '\200\n' | LC_ALL=C.UTF-8 grep -c '\<'`, "0\n", 1],
+		[String.raw`printf 'a\200\n' | LC_ALL=C.UTF-8 grep -c 'a\B'`, "0\n", 1],
+		[String.raw`printf '\200a\n' | LC_ALL=C.UTF-8 grep -c '\Ba'`, "0\n", 1],
+		[String.raw`printf 'a\377 k\342\204\252\n' | LC_ALL=C.UTF-8 grep -ic 'a\>\|\(x\)\1'`, "0\n", 1],
+		[
+			String.raw`printf 'a\377 z_0123456789 \342\204\252\n' | LC_ALL=C.UTF-8 grep -io '\(\w\)\1\|\<.'`,
+			"a\nz\n\xe2\x84\xaa\n",
+			0,
+		],
+	]);
+});
+
+describe("builtin grep: -w with a word assertion beside a byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 reads such a byte whose character is a letter as a word
+	// character for the assertions, and as none for `-w`'s edges.
+	cases([
+		// Regressed: the assertions read the byte as no word character.
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cw 'a\>'`, "0\n", 1],
+		[String.raw`printf '\377b c\n' | LC_ALL=C.UTF-8 grep -cw '\<b'`, "0\n", 1],
+		[String.raw`printf 'x\377a b\n' | LC_ALL=C.UTF-8 grep -cw '\ba'`, "0\n", 1],
+		[String.raw`printf 'A\377 b\n' | LC_ALL=C.UTF-8 grep -ciw 'a\>'`, "0\n", 1],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cwE 'a\>|zz'`, "0\n", 1],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -ow 'a\>\|b'`, "b\n", 0],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cw 'a\>\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf '\377b c\n' | LC_ALL=C.UTF-8 grep -cw '\<b\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377b c\n' | LC_ALL=C.UTF-8 grep -ow 'a\B'`, "a\n", 0],
+		// Already GNU's answer, kept: `-w`'s edges beside the byte, and the longest match at a
+		// start whose edges hold.
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -cw a`, "1\n", 0],
+		[String.raw`printf '\377b c\n' | LC_ALL=C.UTF-8 grep -cw 'b\>'`, "1\n", 0],
+		[String.raw`printf '\377b c\n' | LC_ALL=C.UTF-8 grep -cw 'b\>\|\(x\)\1'`, "1\n", 0],
+		[String.raw`printf 'a\200 b\n' | LC_ALL=C.UTF-8 grep -cw 'a\>'`, "1\n", 0],
+		[String.raw`printf 'a\377b c\n' | LC_ALL=C.UTF-8 grep -ow 'b\>'`, "b\n", 0],
+		[String.raw`printf 'abc\377d\n' | LC_ALL=C.UTF-8 grep -ow '\<a[a-z]*'`, "abc\n", 0],
+		[String.raw`printf '\377ab c9\n' | LC_ALL=C.UTF-8 grep -ow 'a[a-z ]*\|\<q'`, "ab\n", 0],
+		[String.raw`printf '\377ab c\n' | LC_ALL=C.UTF-8 grep -ow 'a\|ab\>'`, "ab\n", 0],
+		[String.raw`printf 'ab\377 ab x\n' | LC_ALL=C.UTF-8 grep -ow '\<a\|\<ab'`, "ab\nab\n", 0],
 	]);
 });
 
