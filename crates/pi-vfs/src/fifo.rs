@@ -667,20 +667,48 @@ mod tests {
 		drop(reader);
 	}
 
-	/// On Linux the drop reaches the node the open started on, though its
-	/// path now names another FIFO. The old FIFO is moved aside, not
-	/// removed, so the new one cannot reuse its inode number and pass for it.
+	/// Where procfs reaches the pin (Linux with `/proc`), the drop reaches the
+	/// node the open started on, though its path now names another FIFO, and
+	/// the helper has ended when the drop returns. Without procfs the drop
+	/// reaches the FIFO by its path, which names the other FIFO, so it leaves
+	/// the helper (see [`FifoOpen`], "What is left"); the helper waits on the
+	/// old FIFO (or on the new one, had it not opened before the rename)
+	/// until a writer of it opens, which this test then is. The old FIFO is
+	/// moved aside, not removed, so the new one cannot reuse its inode number
+	/// and pass for it.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_drop_releases_a_helper_whose_path_now_names_another_fifo() {
 		let (_dir, path) = new_fifo();
 		let opened = opening(&path, false, read_end);
 		let shared = Arc::clone(&opened.shared);
-		fs::rename(&path, path.with_extension("old")).unwrap();
+		let old = path.with_extension("old");
+		fs::rename(&path, &old).unwrap();
 		make_fifo(&path);
 		drop(opened);
-		assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
-		assert!(!has_reader(&path));
+		if Path::new("/proc/self/fd").is_dir() {
+			assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
+			assert!(!has_reader(&path));
+			return;
+		}
+		assert!(shared.slot.lock().left, "without procfs the drop did not leave the helper");
+		// A writer of the FIFO the helper waits on ends its open; a writer's
+		// open fails with ENXIO until the helper is in `open(2)`. The writers
+		// stay open until the helper has ended.
+		let mut writers = Vec::new();
+		while Arc::strong_count(&shared) != 1 {
+			for fifo in [&old, &path] {
+				if let Ok(writer) = fs::OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(fifo)
+				{
+					writers.push(writer);
+				}
+			}
+			thread::yield_now();
+		}
+		assert!(!writers.is_empty(), "the helper ended with no writer of its FIFO");
 	}
 
 	/// An open that creates (`O_CREAT`) is handed the path it was given, so
