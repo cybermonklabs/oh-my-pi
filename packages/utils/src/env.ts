@@ -8,7 +8,7 @@ import {
 	startedWithNativesDirHandoff,
 } from "@oh-my-pi/pi-natives/natives-dir";
 import { getAgentDir, getConfigRootDir, getProjectDir, refreshDirsFromEnv } from "./dirs";
-import { isBunTestProcess, isBunTestRuntime } from "./test-runtime";
+import { isBunTestRuntime } from "./test-runtime";
 
 export * from "./test-runtime";
 export * from "./worker-host";
@@ -142,19 +142,29 @@ const launchEnvValues = readLaunchEnv();
 const projectEnvNamesLoadedByOmp = new Set<string>();
 
 /**
+ * Whether the test preload (`scripts/test-preload.ts`) ran in this process. It puts
+ * `PI_TEST_RUNTIME=1` in the process's environment, which each thread's copy holds, and the
+ * environment the process was started with lacks it. That holds in every thread of a direct
+ * `bun test`, whatever its entry or `NODE_ENV`. A child a test starts was started with the mark,
+ * so it reads its launch environment as any process does.
+ */
+const testPreloadRanHere = Bun.env.PI_TEST_RUNTIME === "1" && launchEnvValues?.get("PI_TEST_RUNTIME") !== "1";
+
+/**
  * `PI_NATIVES_DIR` as omp was started with it, before omp applied its own `.env` files
  * (undefined when it was not set; where the platform keeps no copy of the launch environment
- * and Bun loaded none of its own, the value now). The commands the agent runs get this value,
- * never the directory omp resolved, so a command, and an omp it starts with its own `HOME`,
- * resolves the natives directory for itself. omp's children that are omp take the resolved
- * directory from a handoff instead (`NATIVES_DIR_HANDOFF_ENV_KEY`), which commands never get.
+ * and Bun loaded none of its own, the value when this module loads). The commands the agent
+ * runs get this value, never the directory omp resolved, so a command, and an omp it starts with
+ * its own `HOME`, resolves the natives directory for itself. omp's children that are omp take
+ * the resolved directory from a handoff instead (`NATIVES_DIR_HANDOFF_ENV_KEY`), which commands
+ * never get.
  *
- * In the process `bun test` runs its files in, the value the test preload left, which is the
- * one this module sees as it loads: the preload removes the developer's value from the process,
- * and `/proc/self/environ` still lists it.
+ * Where the test preload ran ({@link testPreloadRanHere}), the value it left, which is the one
+ * this module sees as it loads: the preload removes the developer's value from the process, and
+ * `/proc/self/environ` still lists it.
  */
 const nativesDirAtLaunch =
-	launchEnvValues && !isBunTestProcess() ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
+	launchEnvValues && !testPreloadRanHere ? launchEnvValues.get("PI_NATIVES_DIR") : Bun.env.PI_NATIVES_DIR;
 
 /**
  * Puts `PI_NATIVES_DIR` in `env` as omp was started with it, or takes it out when omp was

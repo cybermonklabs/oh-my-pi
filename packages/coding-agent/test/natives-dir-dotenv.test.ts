@@ -378,43 +378,91 @@ describe("a direct bun test run", () => {
 		await fs.rm(tempRoot, { recursive: true, force: true });
 	});
 
-	it("gives commands and workers the PI_NATIVES_DIR the test preload left, not the developer's", async () => {
-		// The preload removes the developer's PI_NATIVES_DIR from the test process before any
-		// test module loads; /proc/self/environ still lists the environment it started with.
-		const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
-		const workerClientTs = path.join(import.meta.dir, "../src/subprocess/worker-client.ts");
-		const preload = path.join(import.meta.dir, "../../../scripts/test-preload.ts");
-		await Bun.write(
-			path.join(tempRoot, "probe.test.ts"),
-			`import { test } from "bun:test";
-const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
+	it.each([
+		["a test file", "probe.test.ts", {}],
+		["a test file under NODE_ENV=production", "probe.test.ts", { NODE_ENV: "production" }],
+		["an entry with no test name", "fixture.ts", {}],
+	] as const)(
+		"gives commands and workers the PI_NATIVES_DIR the test preload left, not the developer's (%s)",
+		async (_label, entry, extraEnv) => {
+			// The preload removes the developer's PI_NATIVES_DIR from the test process before any
+			// test module loads; /proc/self/environ still lists the environment it started with.
+			// Each thread of that process asks: the test's own thread and a worker thread it starts
+			// (as subagents run on worker threads), whose entry is the worker's script.
+			const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
+			const workerClientTs = path.join(import.meta.dir, "../src/subprocess/worker-client.ts");
+			const preload = path.join(import.meta.dir, "../../../scripts/test-preload.ts");
+			const report = `const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
 const { workerEnvFromParent } = await import(${JSON.stringify(workerClientTs)});
-test("probe", () => {
-	console.log("PROBE " + JSON.stringify({ seen: process.env.PI_NATIVES_DIR ?? null, command: filterChildShellEnv(process.env).PI_NATIVES_DIR ?? null, worker: workerEnvFromParent().PI_NATIVES_DIR ?? null }));
+const report = () => ({ seen: process.env.PI_NATIVES_DIR ?? null, command: filterChildShellEnv(process.env).PI_NATIVES_DIR ?? null, worker: workerEnvFromParent().PI_NATIVES_DIR ?? null });
+`;
+			await Bun.write(
+				path.join(tempRoot, "probe-thread.ts"),
+				`import { parentPort } from "node:worker_threads";\n${report}parentPort.postMessage(report());\n`,
+			);
+			await Bun.write(
+				path.join(tempRoot, entry),
+				`import { test } from "bun:test";
+import { Worker } from "node:worker_threads";
+${report}
+test("probe", async () => {
+	const thread = await new Promise((resolve, reject) => {
+		const worker = new Worker(${JSON.stringify(path.join(tempRoot, "probe-thread.ts"))});
+		worker.once("message", message => { worker.terminate(); resolve(message); });
+		worker.once("error", reject);
+	});
+	console.log("PROBE " + JSON.stringify({ main: report(), thread }));
 });
 `,
-		);
-		const run = async (launch: string | undefined) => {
-			const child = Bun.spawn([process.execPath, "test", "--preload", preload, "./probe.test.ts"], {
-				cwd: tempRoot,
-				env: { ...process.env, PI_NATIVES_DIR: launch },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-				child.exited,
-			]);
-			expect({ exitCode, stderr: exitCode === 0 ? "" : stderr }).toEqual({ exitCode: 0, stderr: "" });
-			const line = `${stdout}\n${stderr}`.split("\n").find(entry => entry.startsWith("PROBE "));
-			if (!line) throw new Error(`the probe printed nothing:\n${stdout}\n${stderr}`);
-			return JSON.parse(line.slice("PROBE ".length));
-		};
+			);
+			const run = async (launch: string | undefined) => {
+				// A developer's shell: no test marker, and NODE_ENV as the case gives it (bun test
+				// sets it to test when it is unset).
+				const env: Record<string, string | undefined> = { ...process.env, PI_NATIVES_DIR: launch, ...extraEnv };
+				delete env.PI_TEST_RUNTIME;
+				if (!("NODE_ENV" in extraEnv)) delete env.NODE_ENV;
+				delete env.BUN_ENV;
+				const child = Bun.spawn([process.execPath, "test", "--preload", preload, `./${entry}`], {
+					cwd: tempRoot,
+					env,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect({ exitCode, stderr: exitCode === 0 ? "" : stderr }).toEqual({ exitCode: 0, stderr: "" });
+				const line = `${stdout}\n${stderr}`.split("\n").find(output => output.startsWith("PROBE "));
+				if (!line) throw new Error(`the probe printed nothing:\n${stdout}\n${stderr}`);
+				return JSON.parse(line.slice("PROBE ".length));
+			};
 
-		const cleared = { seen: null, command: null, worker: null };
-		expect(await run(path.join(tempRoot, "developer-natives"))).toEqual(cleared);
-		// Control: a run started without it.
-		expect(await run(undefined)).toEqual(cleared);
-	}, 120_000);
+			const cleared = { seen: null, command: null, worker: null };
+			expect(await run(path.join(tempRoot, "developer-natives"))).toEqual({ main: cleared, thread: cleared });
+			// Control: a run started without it.
+			expect(await run(undefined)).toEqual({ main: cleared, thread: cleared });
+		},
+		120_000,
+	);
+	it("lets a child a test starts give its commands the PI_NATIVES_DIR it was started with", async () => {
+		// Started with the test marker, as a test starts an omp: its launch environment is what
+		// the test gave it, so its commands get that value even after the variable left
+		// `process.env`.
+		const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
+		const given = path.join(tempRoot, "given-natives");
+		const script = `delete process.env.PI_NATIVES_DIR;
+const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
+console.log(JSON.stringify(filterChildShellEnv(process.env).PI_NATIVES_DIR ?? null));`;
+		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+			env: { ...process.env, PI_TEST_RUNTIME: "1", PI_NATIVES_DIR: given },
+			stdout: "pipe",
+			stderr: "inherit",
+		});
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+
+		expect(exitCode).toBe(0);
+		expect(JSON.parse(stdout.trim())).toBe(given);
+	}, 60_000);
 });

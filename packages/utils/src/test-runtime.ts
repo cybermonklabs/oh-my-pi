@@ -9,16 +9,7 @@ const BUN_TEST_ENTRY_PATTERN = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
  * `scripts/test-preload.ts`, which puts that marker in the environment every child inherits.
  */
 export function isBunTestRuntime(): boolean {
-	return Bun.env.PI_TEST_RUNTIME === "1" || isBunTestProcess();
-}
-
-/**
- * True in the process `bun test` runs the test files in, as against a child a test starts: its
- * entrypoint is a test file. In this repository that process starts from the environment the
- * test preload (`scripts/test-preload.ts`) left, which the copy of the launch environment the
- * kernel keeps (`/proc/self/environ`) does not show.
- */
-export function isBunTestProcess(): boolean {
+	if (Bun.env.PI_TEST_RUNTIME === "1") return true;
 	const hasTestEnvironment = Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test";
 	return hasTestEnvironment && BUN_TEST_ENTRY_PATTERN.test(Bun.main);
 }
