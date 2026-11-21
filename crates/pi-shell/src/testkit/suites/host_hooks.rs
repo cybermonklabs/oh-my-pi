@@ -411,3 +411,56 @@ fn an_external_starts_only_after_the_output_before_it_is_flushed() {
 	assert_eq!(run(&mut r, "echo a; printf b; /x/ext"), (0, false));
 	assert_eq!(*at_spawn.lock(), b"a\nb", "the external started before the shell's output was out");
 }
+
+/// What fds 1 and 2, one pipe with a writer each, hold when the external
+/// `/x/ext` that `script` runs starts, and when the run ends.
+fn one_pipe_at_spawn(script: &str) -> (String, String) {
+	let host = FakeHost::new().with_buffered_output();
+	let pipe = host.stdout.clone();
+	let at_spawn = Arc::new(Mutex::new(Vec::new()));
+	let seen = Arc::clone(&at_spawn);
+	let host = host.with_spawner(Box::new(move |_: SpawnSpec<'_>| {
+		*seen.lock() = pipe.bytes();
+		Ok(Box::new(Exited(0)) as Box<dyn ExtProc>)
+	}));
+	let all = host.stdout.clone();
+	let mut r = Rig::new(host, skeleton_init(&[]));
+	let _ = run(&mut r, script);
+	drop(r);
+	let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+	(text(at_spawn.lock().clone()), text(all.bytes()))
+}
+
+// Failure mode: a diagnostic handed to fd 2's writer is still held when an
+// external on the same pipe starts (`nosuchcmd; /bin/echo hi` printed `hi`
+// before the error). A queued diagnostic is done only once settled.
+#[test]
+fn a_diagnostic_is_out_before_an_external_on_the_same_pipe_starts() {
+	let (at_spawn, _) = one_pipe_at_spawn("nosuchcmd; /x/ext");
+	assert!(
+		at_spawn.contains("not found"),
+		"the external started before the diagnostic: {at_spawn:?}"
+	);
+}
+
+// Failure mode: an xtrace line handed to fd 2's writer is still held when
+// the external it traces starts (`set -x; /bin/echo hi` printed `hi` first).
+#[test]
+fn an_xtrace_line_is_out_before_the_external_it_traces_starts() {
+	let (at_spawn, _) = one_pipe_at_spawn("set -x; /x/ext");
+	assert!(
+		at_spawn.contains("+ /x/ext"),
+		"the external started before its trace line: {at_spawn:?}"
+	);
+}
+
+// Failure mode: a diagnostic on fd 2 and the next builtin's line on fd 1,
+// one pipe with a writer each, come out in the wrong order (`nosuchcmd;
+// echo done` gave `done` before the error, which bash always writes first).
+#[test]
+fn a_diagnostic_comes_before_the_next_builtins_line_on_the_same_pipe() {
+	let (_, all) = one_pipe_at_spawn("nosuchcmd; echo done");
+	let (error, done) = (all.find("not found"), all.find("done"));
+	assert!(error.is_some() && done.is_some(), "{all:?}");
+	assert!(error < done, "the next builtin's line came before the diagnostic: {all:?}");
+}

@@ -1233,6 +1233,15 @@ impl File for Tee {
 		Poll::Ready(Ok(()))
 	}
 
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		for t in &self.targets {
+			if t.poll_settle(cx).is_pending() {
+				return Poll::Pending;
+			}
+		}
+		Poll::Ready(Ok(()))
+	}
+
 	fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
 		Err(std::io::ErrorKind::Unsupported.into())
 	}

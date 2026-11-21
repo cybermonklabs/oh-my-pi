@@ -121,8 +121,9 @@ impl File for CaptureFile {
 }
 
 /// A captured output stream that keeps what is written until it is
-/// flushed, as a host file's writer thread holds a chunk it took: only
-/// flushed bytes are in the [`Capture`] (and, when dropped, the rest).
+/// settled or flushed, as a host file's writer thread holds a chunk it
+/// took: only settled bytes are in the [`Capture`] (and, when dropped, the
+/// rest).
 struct BufferedCaptureFile {
 	buf:     Capture,
 	pending: Vec<u8>,
@@ -139,6 +140,11 @@ impl File for BufferedCaptureFile {
 	}
 
 	fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.buf.0.lock().append(&mut self.pending);
+		Poll::Ready(Ok(()))
+	}
+
+	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.buf.0.lock().append(&mut self.pending);
 		Poll::Ready(Ok(()))
 	}
@@ -337,9 +343,12 @@ pub struct FakeHost {
 	pipe_tap:    Option<Arc<dyn PipeTap>>,
 	/// [`Host::child_opens`](crate::bash::Host::child_opens) answers this.
 	child_opens: bool,
-	/// Stdout keeps writes until they are flushed
+	/// Stdout keeps writes until they are settled
 	/// ([`Self::with_buffered_stdout`]).
 	buffered:    bool,
+	/// Stderr too, into stdout's capture: one pipe for fds 1 and 2
+	/// ([`Self::with_buffered_output`]).
+	merged:      bool,
 }
 
 impl Default for FakeHost {
@@ -371,6 +380,7 @@ impl FakeHost {
 			pipe_tap:    None,
 			child_opens: false,
 			buffered:    false,
+			merged:      false,
 		}
 	}
 
@@ -383,12 +393,22 @@ impl FakeHost {
 		self
 	}
 
-	/// Make stdout keep what is written until it is flushed, as a host
+	/// Make stdout keep what is written until it is settled, as a host
 	/// file's writer thread holds a chunk it took: [`Self::stdout`] then
-	/// shows only flushed output.
+	/// shows only settled output.
 	#[must_use]
 	pub const fn with_buffered_stdout(mut self) -> Self {
 		self.buffered = true;
+		self
+	}
+
+	/// Give fds 1 and 2 one pipe, [`Self::stdout`], each through a writer
+	/// of its own that keeps what it took until it is settled: the capture
+	/// then shows the order in which the two writers' output went out.
+	#[must_use]
+	pub const fn with_buffered_output(mut self) -> Self {
+		self.buffered = true;
+		self.merged = true;
 		self
 	}
 
@@ -680,6 +700,9 @@ impl crate::bash::Host for FakeHost {
 				Box::new(BufferedCaptureFile { buf: self.stdout.clone(), pending: Vec::new() })
 			},
 			StdFd::Stdout => self.capture(&self.stdout, 1),
+			StdFd::Stderr if self.merged => {
+				Box::new(BufferedCaptureFile { buf: self.stdout.clone(), pending: Vec::new() })
+			},
 			StdFd::Stderr => self.capture(&self.stderr, 2),
 		})
 	}

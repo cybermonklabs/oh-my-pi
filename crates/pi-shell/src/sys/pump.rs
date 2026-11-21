@@ -111,6 +111,16 @@ impl PollIo for End {
 	}
 }
 
+impl End {
+	/// Ready once the writes this end took are out ([`File::poll_settle`]).
+	pub(super) fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self {
+			Self::Fd(f) => f.poll_settle(cx),
+			Self::File(f) => f.poll_settle(cx),
+		}
+	}
+}
+
 impl PollIo for OsPipe {
 	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
 		Self::poll_read(self, cx, buf)

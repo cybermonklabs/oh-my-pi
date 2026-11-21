@@ -1061,8 +1061,10 @@ async fn report_close_failure(
 	let mut line = format!("pi-shell: closing a file failed: {err}\n");
 	#[cfg(unix)]
 	let limit = crate::sys::WRITE_CHUNK;
+	// One hand-off to the descriptor's writer thread, so the record goes out
+	// whole or not at all.
 	#[cfg(not(unix))]
-	let limit = usize::MAX;
+	let limit = crate::sys::BLOCKING_WRITE_CHUNK;
 	if line.len() > limit {
 		let mut end = limit.saturating_sub(1);
 		while !line.is_char_boundary(end) {
@@ -1072,11 +1074,11 @@ async fn report_close_failure(
 		line.push('\n');
 	}
 	// A writer thread takes the record at once and writes it later: the
-	// report is out, or has failed, only once it is flushed, so nothing the
+	// report is out, or has failed, only once it has settled, so nothing the
 	// run wrote last before it closes the descriptor is left unreported.
 	let write = async {
 		std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes())).await?;
-		std::future::poll_fn(|cx| crate::bash::File::poll_flush(stderr, cx)).await
+		std::future::poll_fn(|cx| crate::bash::File::poll_settle(stderr, cx)).await
 	};
 	tokio::select! {
 		_ = write => {},

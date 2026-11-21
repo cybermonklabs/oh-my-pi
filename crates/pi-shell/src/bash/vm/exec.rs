@@ -669,18 +669,27 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 }
 
-/// Write queued diagnostics; the fd that would block, if any. Write errors
-/// on a diagnostic stream are dropped, as bash does.
+/// Write queued diagnostics (`Kernel::diag`, xtrace lines, `fc -s`'s echo);
+/// the fd that would block, if any. An entry is done once it is written and
+/// settled ([`crate::bash::File::poll_settle`]), so a command that runs next
+/// (an external that inherits the fd, a builtin writing to another fd of
+/// the same pipe) comes after it. Write errors on a diagnostic stream are
+/// dropped, as bash does.
 pub fn flush_out(k: &Kernel, vp: &mut Vproc) -> Option<i32> {
 	let mut cx = Context::from_waker(&k.waker);
 	while let Some(w) = vp.out.front_mut() {
-		match vp.fds.handle(w.fd).poll_write(&mut cx, &w.bytes[w.off..]) {
-			Poll::Ready(Ok(n)) if n > 0 => {
-				w.off += n;
-				if w.off >= w.bytes.len() {
+		let handle = vp.fds.handle(w.fd);
+		if w.off >= w.bytes.len() {
+			match handle.poll_settle(&mut cx) {
+				Poll::Ready(_) => {
 					vp.out.pop_front();
-				}
-			},
+				},
+				Poll::Pending => return Some(w.fd),
+			}
+			continue;
+		}
+		match handle.poll_write(&mut cx, &w.bytes[w.off..]) {
+			Poll::Ready(Ok(n)) if n > 0 => w.off += n,
 			Poll::Ready(_) => {
 				vp.out.pop_front();
 			},

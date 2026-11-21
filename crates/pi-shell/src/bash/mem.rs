@@ -424,6 +424,10 @@ impl File for MemFile {
 		self.file().poll_flush(cx)
 	}
 
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.file().poll_settle(cx)
+	}
+
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
 		self.file().seek(pos)
 	}

@@ -215,14 +215,25 @@ impl Relay {
 		let Some(target) = self.target else {
 			return false;
 		};
-		self.consumed >= target
-			&& self.sent >= self.text.len()
-			&& (!self.decoder.holds_bytes()
-				|| self
-					.grace
-					.get_or_insert_with(|| Timer::after(HOLD_GRACE))
-					.poll(cx)
-					.is_ready())
+		if self.consumed < target || self.sent < self.text.len() {
+			return false;
+		}
+		// What was handed to the sink is out of the shell: a host file's
+		// writer thread takes text at once and writes it later, and the next
+		// command must come after it.
+		if self
+			.sink
+			.poll_settle(&mut Context::from_waker(cx.waker()))
+			.is_pending()
+		{
+			return false;
+		}
+		!self.decoder.holds_bytes()
+			|| self
+				.grace
+				.get_or_insert_with(|| Timer::after(HOLD_GRACE))
+				.poll(cx)
+				.is_ready()
 	}
 }
 
@@ -627,5 +638,70 @@ mod tests {
 				.await;
 		assert_eq!(out, b"hi\ndone\n");
 		assert!(took < Duration::from_secs(1), "waited for the leftover: {took:?}");
+	}
+
+	/// A sink that takes every write at once and has it out only once
+	/// `released`, as a host file's writer thread holds a chunk it took.
+	struct Held(Arc<std::sync::atomic::AtomicBool>);
+
+	impl crate::bash::File for Held {
+		fn poll_read(&mut self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			Poll::Ready(Ok(buf.len()))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+			if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+				Poll::Ready(Ok(()))
+			} else {
+				Poll::Pending
+			}
+		}
+
+		fn seek(&mut self, _pos: io::SeekFrom) -> io::Result<u64> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> crate::bash::FileKind {
+			crate::bash::FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> io::Result<Box<dyn crate::bash::File>> {
+			Err(io::ErrorKind::Unsupported.into())
+		}
+	}
+
+	// Failure mode: a relay counted the text it handed to its sink as
+	// forwarded, so the program's exit was reported, and the next command
+	// ran, while the sink's writer thread still held the text. The program
+	// has exited (its pipe stays open, as a process it left running holds
+	// it) and every byte it wrote is read and handed off: the relay is
+	// drained only once the sink has its text out.
+	#[test]
+	fn a_relay_is_drained_only_once_its_sink_has_settled() {
+		let (pipe, mut program) = os::pipe(false).unwrap();
+		std::io::Write::write_all(&mut program, b"abc").unwrap();
+		let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let sink = End::File(Box::new(Held(Arc::clone(&released))));
+		let mut relay = Relay::new(pipe, Latin1 { hold: false }.decoder(), sink);
+		let mut cx = Context::from_waker(Waker::noop());
+		// The text is read and handed to the sink; the pipe stays open.
+		assert!(relay.poll(&mut cx).is_pending());
+		assert_eq!(relay.consumed, 3);
+		assert!(!relay.drained(&cx), "drained while the sink still held the text");
+		released.store(true, std::sync::atomic::Ordering::SeqCst);
+		assert!(relay.drained(&cx), "not drained once the sink had the text out");
+		drop(program);
 	}
 }

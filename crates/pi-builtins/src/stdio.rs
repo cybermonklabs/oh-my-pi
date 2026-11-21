@@ -108,7 +108,15 @@ impl Native {
 				&& pi_vfs::fd_reads_can_block(fd)
 			{
 				// A write that can wait never runs inline on the worker.
-				return match fd.try_clone_to_owned().map(descriptor::Descriptor::gated) {
+				#[cfg(test)]
+				let owned = if descriptor::OPEN_DUP_FAILS.get() {
+					Err(io::Error::from_raw_os_error(libc::EMFILE))
+				} else {
+					fd.try_clone_to_owned()
+				};
+				#[cfg(not(test))]
+				let owned = fd.try_clone_to_owned();
+				return match owned.map(descriptor::Descriptor::gated) {
 					Ok(Ok(descriptor)) => Self::Descriptor(descriptor),
 					Ok(Err(_)) | Err(_) => Self::Blocking(handle.clone()),
 				};
@@ -589,6 +597,9 @@ mod descriptor {
 		/// Test only: in this thread, the dup for blocking writes fails with
 		/// `EMFILE`.
 		pub(super) static DUP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+		/// Test only: in this thread, the dup `Native::open` makes to register
+		/// a descriptor fails with `EMFILE`.
+		pub(super) static OPEN_DUP_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 	}
 
 	impl Descriptor {
@@ -1067,6 +1078,63 @@ mod tests {
 			Err(e) => panic!("{e}"),
 		}
 		drop(reader);
+	}
+
+	/// A descriptor that can block but cannot be duplicated to register it
+	/// (`EMFILE`) writes on the blocking pool: on a current-thread runtime a
+	/// write to a full pipe nothing reads leaves the runtime's thread free (a
+	/// timer on it fires), and ends with the pipe's error once the reader
+	/// leaves. A write on the runtime's thread would hold it for good; the
+	/// bound runs on the calling thread.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_descriptor_that_cannot_be_registered_writes_on_the_blocking_pool() {
+		use std::{
+			os::fd::AsRawFd as _,
+			sync::mpsc::{RecvTimeoutError, channel},
+			time::Duration,
+		};
+
+		let (reader, writer) = std::io::pipe().unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+		let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+		let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+		std::fs::File::from(OwnedFd::from(writer.try_clone().unwrap()))
+			.write_all(&vec![b'q'; capacity])
+			.unwrap();
+		let (tx, rx) = channel();
+		std::thread::spawn(move || {
+			descriptor::OPEN_DUP_FAILS.set(true);
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap();
+			let result = runtime.block_on(async {
+				let file = OpenFile::from(std::fs::File::from(OwnedFd::from(writer)));
+				let mut native = Native::open(&file, false);
+				assert!(matches!(native, Native::Blocking(_)), "not the blocking-pool route");
+				let write = native.write_all(b"x".to_vec());
+				tokio::pin!(write);
+				tokio::select! {
+					_ = &mut write => panic!("a write to a full pipe nothing reads returned"),
+					() = tokio::time::sleep(Duration::from_millis(50)) => {},
+				}
+				drop(reader);
+				write.await.1
+			});
+			let _ = tx.send(result);
+		});
+		match rx.recv_timeout(Duration::from_secs(10)) {
+			Ok(result) => assert_eq!(
+				result.as_ref().err().map(io::Error::kind),
+				Some(io::ErrorKind::BrokenPipe),
+				"{result:?}"
+			),
+			Err(RecvTimeoutError::Timeout) => {
+				panic!("DEADLINE fired: the write waited in the kernel on the runtime's thread")
+			},
+			Err(e) => panic!("{e}"),
+		}
 	}
 }
 

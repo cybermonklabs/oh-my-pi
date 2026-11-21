@@ -2553,3 +2553,47 @@ async fn pipe_tap_forwards_every_byte_and_counts_them() {
 	assert!(read.data.ends_with(format!("\n{LAST}\n").as_bytes()));
 	assert!(!read.open);
 }
+
+/// A failed close's record keeps its newline however long the error is:
+/// it is cut to what one hand-off to the descriptor's writer thread takes
+/// (on Windows every pipe write goes through one), so it goes out whole.
+/// A record longer than a hand-off had its first 64 KiB handed off and its
+/// rest, newline included, dropped.
+#[test]
+fn a_long_close_failure_record_goes_out_whole_with_its_newline() {
+	use std::io::Read as _;
+
+	let (mut reader, writer) = std::io::pipe().expect("pipe");
+	#[cfg(unix)]
+	let writer = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+	#[cfg(windows)]
+	let writer = std::fs::File::from(std::os::windows::io::OwnedHandle::from(writer));
+	let drained = std::thread::spawn(move || {
+		let mut all = Vec::new();
+		reader.read_to_end(&mut all).expect("drain the output pipe");
+		all
+	});
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("runtime");
+	let mut result = Ok(RunOutcome {
+		status:    0,
+		cancelled: false,
+		exited:    false,
+		cwd:       BString::default(),
+	});
+	let err = io::Error::other("x".repeat(100 << 10));
+	let mut stderr = crate::sys::StdFile::new(writer);
+	runtime.block_on(report_close_failure(
+		&mut stderr,
+		&err,
+		&mut result,
+		&CancellationToken::new(),
+	));
+	drop(stderr);
+	let all = drained.join().expect("the drain thread");
+	assert!(all.starts_with(b"pi-shell: closing a file failed: "), "{} bytes", all.len());
+	assert_eq!(all.last(), Some(&b'\n'), "the record lost its end: {} bytes", all.len());
+	assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
+}

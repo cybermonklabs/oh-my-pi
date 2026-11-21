@@ -202,6 +202,14 @@ impl FdRef {
 		}
 	}
 
+	/// Wait until the writes the file took are out ([`File::poll_settle`]).
+	pub fn poll_settle(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle(cx),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
 	/// Kind of the underlying object; `None` when closed or lost.
 	pub fn kind(&self) -> Option<FileKind> {
 		self.0.state.lock().file_ref().map(File::kind)

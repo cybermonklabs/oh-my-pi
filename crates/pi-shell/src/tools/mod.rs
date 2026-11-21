@@ -389,12 +389,23 @@ impl Out {
 		}
 	}
 
-	/// Write what fits; `true` once everything is written (or failed: a
-	/// closed stderr loses the message, as it would for any command).
+	/// Write what fits; `true` once everything is written and settled (or
+	/// failed: a closed stderr loses the message, as it would for any
+	/// command). An entry stays until its fd has settled, so what runs after
+	/// the tool comes after its output.
 	fn flush(&mut self, api: &mut ShellApi<'_, '_>) -> bool {
 		while let Some((fd, bytes)) = self.0.front_mut() {
+			if bytes.is_empty() {
+				match api.settle(*fd) {
+					IoPoll::Ready(_) => {
+						self.0.pop_front();
+					},
+					IoPoll::WouldBlock(_) => return false,
+				}
+				continue;
+			}
 			match api.write(*fd, bytes) {
-				IoPoll::Ready(Ok(n)) if n > 0 && n < bytes.len() => {
+				IoPoll::Ready(Ok(n)) if n > 0 => {
 					bytes.drain(..n);
 				},
 				IoPoll::Ready(_) => {

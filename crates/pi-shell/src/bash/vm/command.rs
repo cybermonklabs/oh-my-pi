@@ -3212,9 +3212,10 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 }
 
 /// Write the command's own output in order (pollable). A write is done once
-/// its bytes are handed off and flushed: a host file's writer thread takes a
-/// chunk at once and writes it later, so the flush is where that write
-/// fails, and its error is this command's, as a write error is.
+/// its bytes are handed off and settled ([`crate::bash::File::poll_settle`]): a
+/// host file's writer thread takes a chunk at once and writes it later, so the
+/// settle is where that write fails, and its error is this command's, as a
+/// write error is.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
@@ -3223,7 +3224,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 		let (fd, handed_off) = (pending.fd, pending.off >= pending.bytes.len());
 		let handle = vp.fds.handle(fd);
 		if handed_off {
-			match handle.poll_flush(&mut tcx) {
+			match handle.poll_settle(&mut tcx) {
 				Poll::Ready(Ok(())) => {
 					st(vp).writes.pop_front();
 				},

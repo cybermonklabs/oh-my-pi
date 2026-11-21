@@ -122,6 +122,17 @@ pub trait File: Send {
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
 	/// Flush buffered writes (called before the engine closes the fd).
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+	/// Ready once every write this file took is out of the shell: in the
+	/// kernel, or failed (with that error, as the next write would get it).
+	/// A file that writes as it takes is settled at once; a host file that
+	/// hands writes to a writer thread waits for it. The engine settles
+	/// before it counts output as written, so whatever runs next (an
+	/// external that inherits the fd, another writer on the same pipe) comes
+	/// after it. Unlike [`File::poll_flush`] this asks nothing of the object
+	/// behind the file (a provider's flush is not called).
+	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Poll::Ready(Ok(()))
+	}
 	/// Reposition (`<>` redirections, `read -N` on regular files).
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;
 	/// What kind of object this is.

@@ -41,6 +41,8 @@ pub mod rlimit;
 pub mod shebang;
 mod spawn;
 
+#[cfg(not(unix))]
+pub(crate) use fs::BLOCKING_WRITE_CHUNK;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use fs::in_blocking_writer_process;
 #[cfg(unix)]

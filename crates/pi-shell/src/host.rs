@@ -150,6 +150,10 @@ impl File for StreamFile {
 		self.with(Poll::Ready(Ok(())), |f| f.poll_flush(cx))
 	}
 
+	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle(cx))
+	}
+
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
 		self.with(Err(io::ErrorKind::Unsupported.into()), |f| f.seek(pos))
 	}

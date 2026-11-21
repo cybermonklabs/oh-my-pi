@@ -75,6 +75,14 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_write(cx, bytes))
 	}
 
+	/// Ready once what fd `fd` of the calling vproc took is out
+	/// ([`crate::bash::File::poll_settle`]): a tool settles its output
+	/// before it ends, so what runs next comes after it.
+	pub fn settle(&mut self, fd: i32) -> IoPoll<()> {
+		let h = self.vproc().fds.handle(fd);
+		self.io(|cx| h.poll_settle(cx))
+	}
+
 	/// A variable as the calling vproc sees it. A store failure reads as
 	/// unset and abandons the running scripts at the next step.
 	pub fn get_var(&mut self, name: &BStr) -> Option<VarValue> {
