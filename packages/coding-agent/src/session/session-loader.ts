@@ -875,17 +875,23 @@ function hasImageUrl(value: unknown): value is { image_url: string } {
 	return typeof value === "object" && value !== null && "image_url" in value && typeof value.image_url === "string";
 }
 
-/** A persisted blob reference and the field that holds it. */
+/**
+ * A persisted blob reference and the place that holds it: a field of an
+ * object, or an element of an array (a provider image URL listed under
+ * `image_url`).
+ */
 interface BlobRefSite {
-	holder: Record<string, unknown>;
-	key: string;
+	holder: Record<string, unknown> | unknown[];
+	key: string | number;
 	ref: string;
 	/** Provider image URLs persist the whole data URL; image payloads persist bare base64. */
 	asDataUrl: boolean;
 }
 
 /**
- * Collect the blob references in session image blocks and provider image URLs.
+ * Collect the blob references in session image blocks and provider image URLs,
+ * an `image_url` string field or a string element of an array under `image_url`
+ * (persistence externalizes both: an array passes its key to its elements).
  * Snapcompact frames stay as references until context rebuilding selects them.
  */
 function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string): void {
@@ -895,7 +901,14 @@ function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string)
 	}
 
 	if (Array.isArray(value)) {
-		for (const item of value) collectBlobRefSites(item, sites, key);
+		for (let index = 0; index < value.length; index++) {
+			const item: unknown = value[index];
+			if (key === "image_url" && typeof item === "string" && isBlobRef(item)) {
+				sites.push({ holder: value, key: index, ref: item, asDataUrl: true });
+			} else {
+				collectBlobRefSites(item, sites, key);
+			}
+		}
 		return;
 	}
 
@@ -986,7 +999,7 @@ async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore)
 				})();
 				resolved.set(key, data);
 			}
-			site.holder[site.key] = await data;
+			Reflect.set(site.holder, site.key, await data);
 		}),
 	);
 }
@@ -1015,7 +1028,7 @@ export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: Bl
 				: resolveImageDataSync(blobStore, site.ref);
 			resolved.set(key, data);
 		}
-		site.holder[site.key] = data;
+		Reflect.set(site.holder, site.key, data);
 	}
 }
 

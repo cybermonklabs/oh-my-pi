@@ -9,7 +9,11 @@ import type {
 	FileEntry,
 	SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { resolveBlobRefsInEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import {
+	loadEntriesFromFile,
+	resolveBlobRefsInEntries,
+	resolveBlobRefsInEntriesSync,
+} from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import {
 	forgetExternalizedImages,
 	prepareEntryForPersistence,
@@ -223,6 +227,42 @@ describe("session image persistence", () => {
 		expect(mutatedRef).not.toBe(ref);
 		expect(first.getSync(parseBlobRef(mutatedRef) ?? "")?.toString("base64")).toBe(image.data);
 	});
+
+	// If this regresses, a resumed session shows and sends a provider image listed under
+	// `image_url` (in a tool result's `details`, say) as its `blob:sha256:` reference instead
+	// of the image: persistence externalizes it, and the load leaves the reference in place.
+	it.each(["asynchronous", "synchronous"] as const)(
+		"gives back a data URL listed under image_url when a session file loads (%s resolver)",
+		async mode => {
+			using tempDir = TempDir.createSync("@session-image-url-list-");
+			const blobStore = new BlobStore(path.join(tempDir.path(), "blobs"));
+			const dataUrl = `data:image/png;base64,${Buffer.alloc(1500, 8).toString("base64")}`;
+			const original = messageEntry({
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "screenshot",
+				content: [text("captured")],
+				details: { image_url: [dataUrl] },
+				isError: false,
+				timestamp: 0,
+			});
+
+			const file = path.join(tempDir.path(), "session.jsonl");
+			const header = { type: "session", version: 3, id: "s", timestamp: new Date(0).toISOString(), cwd: "/" };
+			const persisted = prepareEntryForPersistence(original, blobStore);
+			await Bun.write(file, `${JSON.stringify(header)}\n${JSON.stringify(persisted)}\n`);
+			const lines = (await Bun.file(file).text()).trim().split("\n");
+			const written = (JSON.parse(lines[1] ?? "{}") as ToolResultEntry).message.details as { image_url: string[] };
+			expect(written.image_url).toHaveLength(1);
+			expect(isBlobRef(written.image_url[0] ?? "")).toBe(true);
+
+			const loaded = await loadEntriesFromFile(file);
+			if (mode === "asynchronous") await resolveBlobRefsInEntries(loaded, blobStore);
+			else resolveBlobRefsInEntriesSync(loaded, blobStore);
+			const resolved = loaded.find((entry): entry is ToolResultEntry => entry.type === "message");
+			expect(resolved?.message.details).toEqual({ image_url: [dataUrl] });
+		},
+	);
 });
 
 /** Strict base64 the way a provider's decoder validates it: only the base64
