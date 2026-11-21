@@ -6,7 +6,12 @@
  * omp-like process (`sql-session-lease-process.ts`) that holds or resumes a
  * session through its own store. Every database fixture makes its own
  * session and lease tables and drops them, and every store gets its own
- * client, so two stores are two lease holders, as two processes are.
+ * client, so two stores are two lease holders, as two processes are. A login
+ * a MySQL-family test makes is made for the host the server sees for its
+ * client (`USER()`), not `'%'`: the anonymous accounts that MariaDB's
+ * `mariadb-install-db` makes (`''@'localhost'`, `''@'<host>'`) outrank a
+ * `'user'@'%'` login for a client on 127.0.0.1, which then fails with
+ * "Access denied".
  */
 import * as path from "node:path";
 import {

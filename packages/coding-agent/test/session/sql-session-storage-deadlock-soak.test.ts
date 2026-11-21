@@ -54,9 +54,10 @@ function errorKind(error: unknown): string {
 	return `${String(code)}: ${message.slice(0, 60)}`;
 }
 
-function isDeadlock(error: unknown): boolean {
+/** A conflict the store runs again: a deadlock, or MariaDB's write conflict (error 1020, "Record has changed since last read"). */
+function isConflict(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
-	return /deadlock/i.test(message) || /40P01/.test(message);
+	return /deadlock|record has changed since last read/i.test(message) || /40P01/.test(message);
 }
 
 /** The blob tier's queue, past its interface: forget a landed blob so the next store of it inserts again. */
@@ -69,7 +70,7 @@ interface TierInternals {
 describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 	for (const { adapter, url } of LEASE_BACKENDS) {
 		it.skipIf(!url)(
-			`runs ${WORKERS} workers for ${SOAK_MS} ms on ${adapter} with no deadlock`,
+			`runs ${WORKERS} workers for ${SOAK_MS} ms on ${adapter} with no deadlock or write conflict`,
 			async () => {
 				const originalAgentDir = getAgentDir();
 				const agentDir = TempDir.createSync("@omp-sql-soak-");
@@ -100,7 +101,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					const owned = stores.map((_store, worker) => bytes(100 + worker, 512));
 					const counts = new Map<
 						string,
-						{ ops: number; deadlocks: number; other: number; kinds: Map<string, number> }
+						{ ops: number; conflicts: number; other: number; kinds: Map<string, number> }
 					>();
 					const failures: string[] = [];
 					const ops: Array<
@@ -178,7 +179,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 								const reasons = settled.flatMap(result =>
 									result.status === "rejected" ? [result.reason] : [],
 								);
-								const reason = reasons.find(isDeadlock) ?? reasons[0];
+								const reason = reasons.find(isConflict) ?? reasons[0];
 								if (reason !== undefined) throw reason;
 							},
 						],
@@ -190,14 +191,14 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 							const mine = worker === 0 ? ops : ops.filter(([kind]) => kind !== "parted insert");
 							while (performance.now() < deadline) {
 								const [kind, op] = pick(mine);
-								const count = counts.get(kind) ?? { ops: 0, deadlocks: 0, other: 0, kinds: new Map() };
+								const count = counts.get(kind) ?? { ops: 0, conflicts: 0, other: 0, kinds: new Map() };
 								counts.set(kind, count);
 								count.ops++;
 								try {
 									await op(store, paths, worker);
 								} catch (error) {
-									if (isDeadlock(error)) {
-										count.deadlocks++;
+									if (isConflict(error)) {
+										count.conflicts++;
 										const message = error instanceof Error ? error.message : String(error);
 										if (failures.length < 5) failures.push(`${kind}: ${message.slice(0, 200)}`);
 									} else {
@@ -211,7 +212,7 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					);
 					const summary = [...counts].map(
 						([kind, count]) =>
-							`${kind} ${count.ops} ops, ${count.deadlocks} deadlocks, ${count.other} other errors`,
+							`${kind} ${count.ops} ops, ${count.conflicts} conflicts (deadlock or 1020), ${count.other} other errors`,
 					);
 					console.log(`SOAK ${adapter}: ${summary.join("; ")}`);
 					for (const [kind, count] of counts) {
@@ -240,9 +241,9 @@ describe.skipIf(!(SOAK_MS > 0))("SqlSessionStorage deadlock soak", () => {
 					);
 					for (const line of broken.slice(0, 5)) console.log(`SOAK ${adapter} broken: ${line}`);
 					expect({
-						deadlocks: [...counts.values()].reduce((sum, count) => sum + count.deadlocks, 0),
+						conflicts: [...counts.values()].reduce((sum, count) => sum + count.conflicts, 0),
 						broken,
-					}).toEqual({ deadlocks: 0, broken: [] });
+					}).toEqual({ conflicts: 0, broken: [] });
 				} finally {
 					setAgentDir(originalAgentDir);
 					agentDir.removeSync();

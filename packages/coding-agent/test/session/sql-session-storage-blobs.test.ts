@@ -1472,17 +1472,17 @@ describe("session blobs in the SQL session storage", () => {
 			});
 
 			// The one deadlock the lock order leaves (docs/session.md, "Races"): a rename whose destination has no
-			// row takes that key by its UPDATE, after the source's lock, and a delete with the artifacts directory
-			// locks every row and gap of the session table in path order on MySQL and MariaDB (it can use no index).
-			// The rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
+			// row takes that key by its UPDATE, after the source's lock. A delete with the artifacts directory locks
+			// `path IN (…) OR substr(path, 1, n) = dir`. Where the server uses no index for the `substr` (MySQL 8.4,
+			// MariaDB before 11.8.1), that lock scans and locks every row and gap of the session table in path order:
+			// the rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
 			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
-			// gap. InnoDB rolls one back, and the retry runs it again: both end as they would alone.
-			// The contract is that end state, asserted on every server. The deadlock itself is MySQL's lock
-			// behaviour, asserted exactly there. MariaDB 11.8.9 (`innodb_snapshot_isolation` ON) met neither a
-			// deadlock nor a write conflict here in any of our runs; one there, rolled back and run again, ends the
-			// same, so its count may be 0 or 1.
+			// gap. InnoDB rolls one back (1213), and the retry runs it again. MariaDB 11.8.1 and later use the
+			// primary key for the `substr` (MDEV-34911): the lock is a range over A and its directory, never takes
+			// the gap before C, and the race does not start. The end state is asserted on every server, and the
+			// deadlock count from the lock's plan, read with EXPLAIN before the race: 1 on a scan, 0 on a range.
 			it.skipIf(adapter !== "mysql")(
-				"deadlocks once on MySQL (at most once on MariaDB), and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
+				"runs the rolled-back side again when a delete with artifacts meets a rename's destination that has no row: one deadlock where the delete's lock scans the table (MySQL, MariaDB before 11.8.1), none where it is a range (MariaDB 11.8.1 and later)",
 				async () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
 					const deadlocks: string[] = [];
@@ -1507,6 +1507,13 @@ describe("session blobs in the SQL session storage", () => {
 					await renamer.writeText(d, moved);
 					await renamer.drain();
 					await deleter.refresh();
+					// The plan of the delete's lock (#lockSessionRowsForWrite with `under`), on the rows the race meets.
+					const dir = `${a.slice(0, -".jsonl".length)}/`;
+					const [plan] = (await db.sql(
+						`EXPLAIN SELECT path FROM ${db.table} WHERE path IN (@1) OR substr(path, 1, @2) = @3 ORDER BY path FOR UPDATE`,
+						[a, [...dir].length, dir],
+					)) as Array<{ type?: unknown }>;
+					const scans = plan?.type !== "range";
 
 					gate?.close();
 					const renaming = renamer.rename(d, b);
@@ -1524,9 +1531,8 @@ describe("session blobs in the SQL session storage", () => {
 						paths: await db.paths(),
 						b: (await db.row(b))?.content,
 						c: (await db.row(c))?.content,
-					}).toEqual({ paths: [b, c], b: moved, c: transcript(ID, "kept apart") });
-					if (db.server === "mariadb") expect([0, 1]).toContain(deadlocks.length);
-					else expect(deadlocks.length).toBe(1);
+						deadlocks: deadlocks.length,
+					}).toEqual({ paths: [b, c], b: moved, c: transcript(ID, "kept apart"), deadlocks: scans ? 1 : 0 });
 				},
 			);
 

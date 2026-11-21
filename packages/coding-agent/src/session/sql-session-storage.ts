@@ -2706,8 +2706,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 						);
 						break;
 					} catch (err) {
-						// Two claims of a missing row both insert: one deadlocks (on MariaDB it can meet a write
-						// conflict instead) or meets the other's row, and runs again.
+						// Two claims of a missing row both insert: one deadlocks (1213), meets the other's row or is
+						// refused by NOWAIT, and runs again. The claim makes no plain read before its NOWAIT locking
+						// read, so it has no read view and MariaDB's 1020 cannot happen here; the check keeps it anyway.
 						if (attempt >= WRITE_ATTEMPTS || !(isRetryableConflict(err) || isPrimaryKeyViolation(err))) throw err;
 						held = false;
 						await Bun.sleep(Math.random() * 20 * attempt);
@@ -4256,9 +4257,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * blob rows: a locking read of a missing path locks its gap, and an insert
 	 * into that gap at another path (a rename's destination, a new session)
 	 * would wait for it. Then it answers the paths whose rows it locked, and
-	 * the caller changes only those. With `under` MySQL can use no index
-	 * (`substr`), so the lock scans and locks every row, gaps too, in path
-	 * order, as the directory's `DELETE` that follows does anyway. PostgreSQL
+	 * the caller changes only those. With `under`, where the server can use no
+	 * index for the `substr` (MySQL, MariaDB before 11.8.1), the lock scans and
+	 * locks every row, gaps too, in path order, as the directory's `DELETE`
+	 * that follows does anyway; MariaDB 11.8.1 and later use the primary key
+	 * for it (MDEV-34911) and lock only the directory's range. PostgreSQL
 	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
 	 * time.
 	 */
