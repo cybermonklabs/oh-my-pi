@@ -254,8 +254,8 @@ fn a_background_pipelines_bang_is_its_last_process() {
 	}
 }
 
-/// A login-HOME case: obash runs as `argv0` with `args` (and `env` set),
-/// without `HOME`, and prints `stdout`.
+/// A login-HOME case: obash runs as `argv0` with `--noprofile` and `args`
+/// (and `env` set), without `HOME`, and prints `stdout`.
 struct LoginCase {
 	argv0:  &'static str,
 	args:   Vec<OsString>,
@@ -268,7 +268,10 @@ struct LoginCase {
 /// (`-bash -l` sets none) and not in posix mode at startup (`-o posix`,
 /// `--posix`, `POSIXLY_CORRECT`, `POSIX_PEDANTIC`; an `sh`'s posix mode
 /// starts after). `$0` does not decide: it is the name after `-c string`,
-/// or the script.
+/// or the script. Each shell runs with `--noprofile`: a login shell (`-l`)
+/// reads the machine's `/etc/profile` and the user's `~/.profile`, whose
+/// commands are the machine's (rustup's `. "$HOME/.cargo/env"` prints an
+/// error where `HOME` is unset); `--noprofile` leaves `HOME` as it is.
 #[test]
 fn bash_sets_home_only_as_a_login_shell_by_argv0() {
 	const SHOW: &str = "echo \"[${HOME-unset}] [$0]\"";
@@ -282,7 +285,10 @@ fn bash_sets_home_only_as_a_login_shell_by_argv0() {
 	let show = OsString::from(SHOW);
 	let case = |argv0, args: &[&OsStr], env, stdout: String| LoginCase {
 		argv0,
-		args: args.iter().map(|&a| a.to_owned()).collect(),
+		args: std::iter::once(OsStr::new("--noprofile"))
+			.chain(args.iter().copied())
+			.map(OsStr::to_owned)
+			.collect(),
 		env,
 		stdout,
 	};
@@ -315,6 +321,60 @@ fn bash_sets_home_only_as_a_login_shell_by_argv0() {
 		if let Some(bash) = real_bash() {
 			assert_eq!(ours, run(bash.as_os_str()), "{shown}");
 		}
+	}
+}
+
+/// A login shell without `HOME` reads its profile in the home the password
+/// database names: bash expands the startup files' `~` as any other
+/// (`HOME`, else `sh_get_home_dir`). It runs in a user and mount namespace
+/// (`unshare --user --map-root-user --mount`) where the test's own password
+/// database, bind-mounted over `/etc/passwd`, names a home of the test's,
+/// whose `.profile` prints a line, and `/etc/profile` is an empty file.
+/// Where no such namespace can be made, the test says so.
+#[test]
+fn a_login_shell_without_home_reads_the_profile_in_its_password_database_home() {
+	const MOUNT: &str = "mount --bind \"$PI_TEST_PASSWD\" /etc/passwd && mount --bind \
+	                     \"$PI_TEST_PROFILE\" /etc/profile && exec \"$0\" \"$@\"";
+	let dir = tempfile::tempdir().expect("a directory for the home and the files");
+	let home = dir.path().join("home");
+	fs::create_dir(&home).expect("make the home");
+	fs::write(home.join(".profile"), "echo profile-read\n").expect("write the profile");
+	let passwd = dir.path().join("passwd");
+	fs::write(&passwd, format!("root:x:0:0:root:{}:/bin/sh\n", home.display()))
+		.expect("write the password database");
+	let profile = dir.path().join("profile");
+	fs::write(&profile, "").expect("write /etc/profile's stand-in");
+	let wrap = ["unshare", "--user", "--map-root-user", "--mount", "/bin/sh", "-c", MOUNT];
+	let run = |program: &OsStr| {
+		Run::new(program, "bash", &["-l", "-c", "echo body"])
+			.under(&wrap)
+			.env("PI_TEST_PASSWD", &passwd)
+			.env("PI_TEST_PROFILE", &profile)
+			.env_remove("HOME")
+			.env_remove("BASH_ENV")
+			.env_remove("ENV")
+			.go()
+	};
+	let probe = Command::new(wrap[0])
+		.args(&wrap[1..])
+		.arg("true")
+		.env("PI_TEST_PASSWD", &passwd)
+		.env("PI_TEST_PROFILE", &profile)
+		.output();
+	if !probe.as_ref().is_ok_and(|out| out.status.success()) {
+		zsh_oracle::uncompared(&format!(
+			"no user and mount namespace to give the shell a password database: {probe:?}"
+		));
+		return;
+	}
+	let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+	assert_eq!(
+		(String::from_utf8_lossy(&ours.stdout), ours.end()),
+		("profile-read\nbody\n".into(), Some(Exit(0))),
+		"{ours:?}"
+	);
+	if let Some(bash) = real_bash() {
+		assert_eq!(ours, run(bash.as_os_str()));
 	}
 }
 

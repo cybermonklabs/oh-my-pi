@@ -649,10 +649,13 @@ pub fn shell_init(
 ) -> ShellInit {
 	let interactive = args.is_interactive(io::stdin().is_terminal() && io::stderr().is_terminal());
 	let mut options = args.startup_options(&env, interactive);
+	// The startup files' `~` expands as any other: `HOME`, else the home the
+	// password database names (bash `sh_get_home_dir`, zsh's default `HOME`;
+	// `/` for a uid without an entry, as both give).
 	let home = env
 		.iter()
 		.find(|(n, _)| n.as_slice() == b"HOME")
-		.map_or_else(BString::default, |(_, v)| v.clone());
+		.map_or_else(startup_home, |(_, v)| v.clone());
 	let report = |what: &[u8], msg: &[u8]| {
 		let mut line = args.shell_name.to_vec();
 		if !what.is_empty() {
@@ -736,6 +739,18 @@ pub fn shell_init(
 		zsh_fpath,
 		profile: Profile::User,
 		login_home,
+	}
+}
+
+/// The home the startup files are found in where the environment has no
+/// `HOME`: the password database's ([`crate::sys::user::read_user`]), or `/`
+/// for a uid without an entry.
+fn startup_home() -> BString {
+	let home = crate::sys::user::read_user().home;
+	if home.is_empty() {
+		BString::from("/")
+	} else {
+		home
 	}
 }
 
