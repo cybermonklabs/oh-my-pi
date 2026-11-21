@@ -25,12 +25,15 @@ import {
 
 /**
  * The roles and block kinds of a model context, without the text, which the
- * export redacts: `assistant[text call]`, `result`, `user`.
+ * export redacts: `assistant[text call]`, `result`, `user`, and each custom
+ * message as `custom:` and its type, so a comparison holds the hidden continue
+ * reminder a kept turn's continuation sent.
  */
 function contextShape(messages: readonly AgentMessage[]): string[] {
 	return messages.flatMap(message => {
 		if (message.role === "user") return ["user"];
 		if (message.role === "toolResult") return ["result"];
+		if (message.role === "custom") return [`custom:${message.customType}`];
 		if (message.role !== "assistant") return [];
 		const blocks = message.content.map(block =>
 			block.type === "text" ? "text" : block.type === "toolCall" ? "call" : block.type,
@@ -71,7 +74,7 @@ describe("omp anonymize on a session with a kept or retried failed turn", () => 
 		const sessionFile = result.session.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected the session to persist a file");
 		const live = contextShape(result.session.agent.state.messages);
-		expect(live).toEqual(["user", "assistant[text]", "assistant[text]"]);
+		expect(live).toEqual(["user", "assistant[text]", "custom:continue-reminder", "assistant[text]"]);
 
 		const anonymized = await anonymizeAndOpen(sessionFile, "text-cut");
 		try {
