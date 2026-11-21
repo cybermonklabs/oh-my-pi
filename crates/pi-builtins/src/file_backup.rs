@@ -130,3 +130,121 @@ pub(crate) fn backup_display(operand: &Path, backup: &Path) -> PathBuf {
 		_ => backup.to_path_buf(),
 	}
 }
+
+#[cfg(all(test, unix))]
+pub(crate) mod tests {
+	use std::{fs, os::unix::fs::symlink, path::Path};
+
+	use uucore::backup_control::BackupMode;
+
+	use super::backup_path;
+
+	/// One directory of [`check_numbered_backups`]: what is at `dest.~N~`
+	/// before the backup (`None` for a symlink to nothing), the
+	/// `--backup` CONTROL word, and the backup name GNU coreutils picks.
+	type Case = (&'static str, &'static str, &'static [(&'static str, Option<&'static str>)], &'static str);
+
+	/// The cases each caller of [`backup_path`] is checked against; GNU
+	/// coreutils 9.4 and 9.7 pick these backup names. A numbered backup goes
+	/// after the highest `dest.~N~` the directory holds, whatever kind of
+	/// entry that is, a symlink that points nowhere included; `existing`
+	/// numbers when any numbered backup is there.
+	const CASES: [Case; 4] = [
+		("dangling", "numbered", &[("dest.~1~", None)], "dest.~2~"),
+		("dangling-existing", "existing", &[("dest.~1~", None)], "dest.~2~"),
+		("gap", "numbered", &[("dest.~1~", Some("one")), ("dest.~3~", Some("three"))], "dest.~4~"),
+		("only-third-existing", "existing", &[("dest.~3~", Some("three"))], "dest.~4~"),
+	];
+
+	/// Checks a caller of [`backup_path`]: in a directory per case holding
+	/// `src` ("new"), `dest` ("old") and the case's backups, `run(dir,
+	/// control)` must replace `dest` with `src`'s content, backing `dest` up
+	/// as `--backup=control`, and return the exit status and standard error.
+	/// The backup must be the name GNU picks, and every entry that was at a
+	/// backup name must stay as it was.
+	pub(crate) fn check_numbered_backups(run: impl Fn(&Path, &str) -> (i32, String)) {
+		let root = tempfile::tempdir().unwrap();
+		for (case, control, before, backup) in CASES {
+			let dir = root.path().join(case);
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("src"), "new").unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			for &(name, content) in before {
+				match content {
+					Some(content) => fs::write(dir.join(name), content).unwrap(),
+					None => symlink("missing", dir.join(name)).unwrap(),
+				}
+			}
+			assert_eq!(run(&dir, control), (0, String::new()), "{case}");
+			assert_eq!(
+				fs::read_to_string(dir.join(backup)).ok().as_deref(),
+				Some("old"),
+				"{case}: dest was not backed up as {backup}"
+			);
+			assert_eq!(fs::read_to_string(dir.join("dest")).unwrap(), "new", "{case}");
+			for &(name, content) in before {
+				match content {
+					Some(content) => {
+						assert_eq!(fs::read_to_string(dir.join(name)).unwrap(), content, "{case}: {name} changed");
+					},
+					None => assert_eq!(
+						fs::read_link(dir.join(name)).ok().as_deref(),
+						Some(Path::new("missing")),
+						"{case}: the link at {name} was replaced"
+					),
+				}
+			}
+		}
+	}
+
+	/// The version after the highest is counted as GNU counts it: a version
+	/// is digits with no leading zero followed by `~`, compared as a string,
+	/// so `dest.~9~` gives `dest.~10~` and a very long version is no
+	/// overflow; other names that start alike do not count.
+	#[test]
+	fn numbered_backups_follow_the_highest_version_as_gnu_reads_it() {
+		let vfs = pi_vfs::BlockingFs::native();
+		let cases: [(&[&str], &str); 4] = [
+			(&["dest.~9~"], "dest.~10~"),
+			(&["dest.~99999999999999999999999~"], "dest.~100000000000000000000000~"),
+			(&["dest.~07~", "dest.~2x~", "dest.~3", "dest.~4~~", "dest~", "dest.~5~.bak", "other.~8~"], "dest.~1~"),
+			(&["dest.~2~", "dest.~10~", "dest.~9~"], "dest.~11~"),
+		];
+		for (entries, expected) in cases {
+			let dir = tempfile::tempdir().unwrap();
+			fs::write(dir.path().join("dest"), "old").unwrap();
+			for entry in entries {
+				symlink("missing", dir.path().join(entry)).unwrap();
+			}
+			assert_eq!(
+				backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~"),
+				Some(dir.path().join(expected)),
+				"{entries:?}"
+			);
+		}
+	}
+
+	/// A directory that cannot be listed (search permission only) is
+	/// probed instead, `name.~1~` upward, for the first name no entry holds,
+	/// a symlink to nothing included; GNU would try `name.~1~` and keep
+	/// trying, so neither replaces an entry.
+	#[test]
+	fn a_directory_that_cannot_be_listed_is_probed_for_a_free_backup_name() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let vfs = pi_vfs::BlockingFs::native();
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		symlink("missing", dir.path().join("dest.~1~")).unwrap();
+		fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o311)).unwrap();
+		let listable = fs::read_dir(dir.path()).is_ok();
+		let numbered = backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~");
+		let existing = backup_path(&vfs, BackupMode::Existing, &dir.path().join("dest"), "~");
+		fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+		if listable {
+			eprintln!("skipped: this process lists a directory without read permission");
+			return;
+		}
+		assert_eq!(numbered, Some(dir.path().join("dest.~2~")));
+		assert_eq!(existing, Some(dir.path().join("dest.~2~")));
+	}
+}

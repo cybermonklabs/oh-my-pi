@@ -3877,4 +3877,17 @@ mod tests {
 			assert_eq!(fs::metadata(path(dest)).unwrap().permissions().mode() & 0o7777, 0o644, "{flag}");
 		}
 	}
+
+	/// `cp --backup` never makes its numbered backup over an entry already
+	/// at a backup name, a symlink that points nowhere included, and numbers
+	/// after the highest one, as GNU cp does
+	/// ([`crate::file_backup::tests::check_numbered_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn numbered_backups_count_every_entry_at_a_backup_name() {
+		crate::file_backup::tests::check_numbered_backups(|dir, control| {
+			let (code, capture) = run_util::<Cp>(&[&format!("--backup={control}"), "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
 }

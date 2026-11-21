@@ -1559,4 +1559,17 @@ mod tests {
 			assert!(dir.join("src/moved").exists(), "{name}: the source moved");
 		}
 	}
+
+	/// `mv --backup` never makes its numbered backup over an entry already
+	/// at a backup name, a symlink that points nowhere included, and numbers
+	/// after the highest one, as GNU mv does
+	/// ([`crate::file_backup::tests::check_numbered_backups`]).
+	#[cfg(unix)]
+	#[test]
+	fn numbered_backups_count_every_entry_at_a_backup_name() {
+		crate::file_backup::tests::check_numbered_backups(|dir, control| {
+			let (code, capture) = run_util::<Mv>(&[&format!("--backup={control}"), "src", "dest"], "", dir);
+			(code, capture.err())
+		});
+	}
 }
