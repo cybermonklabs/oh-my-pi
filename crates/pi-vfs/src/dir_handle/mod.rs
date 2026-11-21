@@ -62,7 +62,7 @@ use tokio::runtime::Handle;
 
 pub use self::listing::{Detail, FileInfo, FileType, Listing, Record, Stamp};
 #[cfg(unix)]
-use crate::fs::{FifoEnd, FifoId, FifoOpening, FifoRelease, same_fifo};
+use crate::fs::{FifoEnd, FifoOpening, FifoPin};
 use crate::{
 	error::crosses_devices,
 	file::File,
@@ -231,22 +231,35 @@ fn not_one_entry() -> io::Error {
 
 impl DirHandle {
 	/// `name`'s bytes when it is one entry name of this directory:
-	/// [`entry_name`]'s rule, and on a Windows host handle no `:`, which
-	/// would make the name a drive's current directory (`C:x`, which a join
-	/// to the directory's path turns into that) or a stream of another entry
-	/// (`a:s`, `x::$INDEX_ALLOCATION`). A provider's names are its own: a
-	/// listing of one may hold `:`, and its calls take such a name.
+	/// [`entry_name`]'s rule, and on Windows no `:` where the name reaches a
+	/// host path (a host handle, or a path handle whose path is no URL), as
+	/// it would make the name a drive's current directory (`C:x`, which a
+	/// join to the directory's path turns into that) or a stream of another
+	/// entry (`a:s`, `x::$INDEX_ALLOCATION`). A URL provider's names are its
+	/// own: a listing of one may hold `:`, and its calls take such a name.
 	#[cfg_attr(
 		not(windows),
-		allow(clippy::unused_self, reason = "only a Windows host refuses more")
+		allow(clippy::unused_self, reason = "only Windows host paths refuse more")
 	)]
 	fn entry<'n>(&self, name: &'n OsStr) -> io::Result<&'n [u8]> {
 		let bytes = entry_name(name)?;
 		#[cfg(windows)]
-		if matches!(self.repr, DirRepr::Host { .. }) && bytes.contains(&b':') {
+		if bytes.contains(&b':') && self.names_host_paths() {
 			return Err(not_one_entry());
 		}
 		Ok(bytes)
+	}
+
+	/// Whether this handle's entry names become host paths: a host handle,
+	/// or a path handle whose path is no URL (one from
+	/// [`Fs::open_dir_by_path`] over a host path, or a facade's handle above
+	/// a descriptor overlay).
+	#[cfg(windows)]
+	fn names_host_paths(&self) -> bool {
+		match &self.repr {
+			DirRepr::Host { .. } => true,
+			DirRepr::Provider(provided) => !crate::is_virtual_path(&provided.path),
+		}
 	}
 }
 
@@ -534,9 +547,9 @@ fn host_open_at(
 ) -> io::Result<File> {
 	#[cfg(unix)]
 	if let Some(token) = &scope.cancel
-		&& let Some((end, id)) = host_fifo_end(s, handle, name, options)
+		&& let Some((end, pin)) = host_fifo_end(s, handle, name, options)
 	{
-		let file = host_fifo_open(handle, scope, name, options, end, id, token)?.wait(token)?;
+		let file = host_fifo_open(handle, scope, name, options, end, pin, token)?.wait(token)?;
 		return Ok(file.bind_host(token.clone(), true));
 	}
 	open_host_entry(s, handle, scope, name, options)
@@ -557,9 +570,9 @@ async fn host_open_at_async(
 	options: &OpenOptions,
 ) -> io::Result<File> {
 	#[cfg(unix)]
-	if let Some((end, id)) = with_scratch(|s| host_fifo_end(s, handle, name, options)) {
+	if let Some((end, pin)) = with_scratch(|s| host_fifo_end(s, handle, name, options)) {
 		let token = scope.cancel.clone().unwrap_or_default();
-		let file = host_fifo_open(handle, scope, name, options, end, id, &token)?
+		let file = host_fifo_open(handle, scope, name, options, end, pin, &token)?
 			.wait_async(&token)
 			.await?;
 		return Ok(if scope.cancel.is_some() {
@@ -585,18 +598,18 @@ fn open_host_entry(
 }
 
 /// The end of a FIFO an `open_at` of `name` with `options` waits on, and the
-/// FIFO's identity: when the open can block (read-only or write-only,
-/// without `O_NONBLOCK`, not creating the entry new) and `name` is a FIFO,
-/// by one `fstatat` that does not follow a symlink there (the open refuses
-/// one anyway). If the entry changes between the `fstatat` and the open, it
-/// is opened as the `fstatat` described it, as the facade's opens are.
+/// FIFO, pinned ([`FifoPin`]; `None` when it was gone by the pin): when the
+/// open can block (read-only or write-only, without `O_NONBLOCK`, not
+/// creating the entry new) and `name` is a FIFO, by one `fstatat` that does
+/// not follow a symlink there (the open refuses one anyway), then the pin.
 #[cfg(unix)]
 fn host_fifo_end(
 	s: &mut native::Scratch,
 	handle: &native::Handle,
 	name: &[u8],
 	options: &OpenOptions,
-) -> Option<(FifoEnd, FifoId)> {
+) -> Option<(FifoEnd, Option<FifoPin>)> {
+	use std::os::fd::AsRawFd;
 	if options.is_create_new() || options.get_custom_flags() & libc::O_NONBLOCK != 0 {
 		return None;
 	}
@@ -606,15 +619,21 @@ fn host_fifo_end(
 		_ => return None,
 	};
 	let meta = native::stat_at(s, handle, name, false).ok()?;
-	let id = meta.dev().zip(meta.ino())?;
-	meta.file_type().is_fifo().then_some((end, id))
+	if !meta.file_type().is_fifo() {
+		return None;
+	}
+	let pin = std::ffi::CString::new(name)
+		.ok()
+		.and_then(|name| FifoPin::at(handle.as_raw_fd(), &name, false).ok().flatten());
+	Some((end, pin))
 }
 
-/// Starts the open of `end` of the FIFO `name` in `handle`, whose identity
-/// was `id` when the open started, on a helper thread ([`FifoOpening`]),
-/// through a duplicate of the directory's descriptor. A cancelled or dropped
-/// open is released by a non-blocking open of the other end relative to the
-/// same directory, of that FIFO only ([`same_fifo`]).
+/// Starts the open of `end` of the FIFO `name` in `handle`, pinned as `pin`,
+/// on a helper thread ([`FifoOpening::start_pinned`]). On Linux the helper
+/// and each release reach the pinned FIFO through `/proc/self/fd`;
+/// elsewhere the helper opens `name` relative to a duplicate of the
+/// directory's descriptor, and each release opens its other end there
+/// without blocking and closes it at once when it is another FIFO.
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -622,26 +641,23 @@ fn host_fifo_open(
 	name: &[u8],
 	options: &OpenOptions,
 	end: FifoEnd,
-	id: FifoId,
+	pin: Option<FifoPin>,
 	token: &tokio_util::sync::CancellationToken,
 ) -> io::Result<FifoOpening> {
-	use std::os::unix::fs::MetadataExt;
 	let dir = Arc::new(handle.try_clone()?);
 	let releasable = native::may_access_at(handle, name, end.release_access());
-	let (open_dir, open_name, options, mask) =
+	let (open_dir, open_name, open_options, mask) =
 		(Arc::clone(&dir), name.to_vec(), options.clone(), host_mask(scope));
 	let (release_name, writer) = (name.to_vec(), end.released_by_writer());
-	let release: FifoRelease = Arc::new(move || {
-		let end = std::fs::File::from(native::touch_fifo_at(&dir, &release_name, writer)?);
-		let meta = end.metadata()?;
-		same_fifo((meta.dev(), meta.ino()), id)?;
-		Ok(Box::new(end) as Box<dyn Send>)
-	});
-	FifoOpening::spawn(
+	FifoOpening::start_pinned(
+		pin,
+		end,
+		options,
 		move || {
-			with_scratch(|s| native::open_at(s, &open_dir, &open_name, &options, mask)).map(File::from)
+			with_scratch(|s| native::open_at(s, &open_dir, &open_name, &open_options, mask))
+				.map(File::from)
 		},
-		release,
+		move || native::touch_fifo_at(&dir, &release_name, writer).map(std::fs::File::from),
 		releasable,
 		token,
 	)
@@ -890,12 +906,16 @@ impl DirHandle {
 
 	/// Creates the directory `name` with `mode` (`0o777` by default) as the
 	/// facade's creations give it: less the process umask, or exactly less
-	/// the facade's creation mask.
+	/// the facade's creation mask. On the host the masked mode is set again
+	/// on the directory made; a non-directory put at the name meanwhile is
+	/// refused and keeps its mode.
 	///
 	/// # Errors
 	///
 	/// A `name` that is not one entry name; the creation's errors (an entry
-	/// that exists already included).
+	/// that exists already included); on the host, the error of setting the
+	/// masked mode (`ENOTDIR` when something else is at the name by then),
+	/// after which the directory stays with the mode it was made with.
 	pub fn create_dir_at(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
 		let bytes = self.entry(name)?;
 		self.call(

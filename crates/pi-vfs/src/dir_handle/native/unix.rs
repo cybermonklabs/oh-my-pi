@@ -501,14 +501,13 @@ pub(crate) fn open_at(
 }
 
 /// `mkdirat` of `name` in `dir` with `mode` (`0o777` by default) less the
-/// process umask; with a creation `mask`, exactly `mode` less `mask`. For
-/// that, the directory is made with the owner's read, write and search bits
-/// too, so this process can always open it, and the mode is set on a descriptor
-/// of it opened as [`open_child`] opens one (`O_DIRECTORY | O_NOFOLLOW`):
-/// whatever was swapped in for it since `mkdirat` (a symlink, a regular file,
-/// a hard link to another file) is refused and keeps its mode. Best effort,
-/// as the facade's creations: when that open fails, the directory keeps the
-/// owner bits it was made with.
+/// process umask; with a creation `mask`, exactly `mode` less `mask`, set
+/// again after the create on the directory made ([`set_made_dir_mode`]). A
+/// symlink or any other non-directory put at the name since `mkdirat` is
+/// refused and keeps its mode, and the call fails; a directory renamed in at
+/// the name is not told apart and gets the mode. When the mode cannot be
+/// set, the call fails, and the directory stays with the mode it was made
+/// with.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -521,7 +520,9 @@ pub(crate) fn create_dir_at(
 	let name = s.cstr(name)?;
 	let requested = mode.unwrap_or(0o777);
 	let mode = mask.map_or(requested, |mask| requested & !mask) as libc::mode_t;
-	let made = if mask.is_some() {
+	// Off Linux the mode is set again through a descriptor that needs the
+	// owner's read and search bits, so the directory is made with them too.
+	let made = if mask.is_some() && cfg!(not(target_os = "linux")) {
 		mode | libc::S_IRWXU
 	} else {
 		mode
@@ -530,13 +531,35 @@ pub(crate) fn create_dir_at(
 	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, made) })?;
 	#[cfg(test)]
 	seams::fire_after_create_dir(entry);
-	if mask.is_some()
-		&& let Ok(fd) = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
-	{
-		// SAFETY: `fd` is an open descriptor.
-		let _ = retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) });
+	if mask.is_some() {
+		set_made_dir_mode(dir, name, mode)?;
 	}
 	Ok(())
+}
+
+/// Sets `mode` on the directory `name` in `dir`, refusing anything else at
+/// the name (`ENOTDIR`), a symlink included: on Linux through an
+/// `O_PATH | O_DIRECTORY | O_NOFOLLOW` descriptor, which needs no permission
+/// on the directory itself, and `chmod` of its `/proc/self/fd/N`; without
+/// `/proc`, and elsewhere, through a read-only descriptor opened as
+/// [`open_child`] opens one, and `fchmod`, which needs the owner's read bit
+/// (a process umask can clear it).
+fn set_made_dir_mode(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> io::Result<()> {
+	#[cfg(target_os = "linux")]
+	{
+		let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+		let fd = openat_mode(dir.as_raw_fd(), name, flags, 0)?;
+		let by_fd =
+			CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| nul_in_path())?;
+		// SAFETY: `by_fd` is NUL-terminated.
+		match retry(|| unsafe { libc::chmod(by_fd.as_ptr(), mode) }) {
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+			result => return result,
+		}
+	}
+	let fd = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)?;
+	// SAFETY: `fd` is an open descriptor.
+	retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
 }
 
 /// `unlinkat` of `name` in `dir`: an empty directory with `dir_entry`, else
