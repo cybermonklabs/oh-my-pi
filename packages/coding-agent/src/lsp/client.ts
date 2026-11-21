@@ -1023,7 +1023,8 @@ async function reconcileExecutedChanges(
  * error propagates so mutated files never keep stale overlays.
  *
  * A `signal` already aborted when the call starts stops it before it changes anything;
- * the edit itself does not watch the signal. Once the edit has run, the abort stops
+ * the edit itself watches the signal only while a recursive delete lists its tree, before
+ * that delete removes anything. Once the edit has run, the abort stops
  * nothing: the call reports what it changed, and the servers are told of it. The result
  * lists the applied changes, then a note for each server that was not brought up to date.
  * `onApplied` gets the applied changes as soon as the files are written, before that; when
@@ -1043,10 +1044,15 @@ export async function applyWorkspaceEditWithLsp(
 	const appliedSoFar: string[] = [];
 	let applied: string[];
 	try {
-		({ applied } = await applyWorkspaceEdit(edit, cwd, (change, line) => {
-			executed.push(change);
-			appliedSoFar.push(line);
-		}));
+		({ applied } = await applyWorkspaceEdit(
+			edit,
+			cwd,
+			(change, line) => {
+				executed.push(change);
+				if (line !== undefined) appliedSoFar.push(line);
+			},
+			signal,
+		));
 	} catch (err) {
 		onApplied?.([...appliedSoFar], err);
 		const notes = await reconcileExecutedChanges(executed, cwd, signal);

@@ -1,7 +1,9 @@
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEexist, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
+import { throwIfAborted } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type {
 	CreateFile,
@@ -303,31 +305,95 @@ export interface WorkspaceEditResult {
 	executed: ExecutedWorkspaceChange[];
 }
 
+/** How many paths a recursive delete that stops partway names; one more line counts the rest. */
+const PARTIAL_DELETE_NAMED = 20;
+
+/** A directory entry whose type the filesystem did not report (some report none). */
+function isUntyped(entry: Dirent): boolean {
+	return !(
+		entry.isFile() ||
+		entry.isDirectory() ||
+		entry.isSymbolicLink() ||
+		entry.isFIFO() ||
+		entry.isSocket() ||
+		entry.isBlockDevice() ||
+		entry.isCharacterDevice()
+	);
+}
+
 /**
- * After a recursive delete of `root` failed, record each path it held (`held`, relative,
- * as `readdir(root, { recursive: true })` lists them) that is gone, as a delete: the
- * failed op may have removed part of the tree before it stopped.
+ * Delete the directory `root` and everything in it from a walk of its tree, as `rm -r` would,
+ * following no symbolic link.
+ *
+ * The walk reads each directory with `readdir(…, { withFileTypes: true })` and goes into
+ * directory entries only: a link is a path to remove, never a directory to read (an entry with
+ * no type is a directory only if `lstat` says so). Without links the walk cannot loop (an entry
+ * has one parent, a directory cannot be hard-linked, and mounts nest as a finite tree), so it
+ * lists each path of the tree once. It checks `signal` before each directory it reads; an abort
+ * there, or an error while it lists (a directory it cannot read, say), ends the delete before
+ * anything is removed.
+ *
+ * Then it removes exactly what it listed: every entry that is not a directory, then the
+ * directories bottom-up, `root` last. A path that fails to go is left, and the rest still go;
+ * the first failure is thrown at the end. A path added to the tree after the walk is not
+ * removed, so its directory stays and fails the delete; a listed path already gone is skipped.
+ * Once removal has begun, `signal` no longer stops it. Each path removed is added to `removed`,
+ * relative to `root`, as it goes, so a caller can name them when the delete fails.
  */
-async function recordRemovedBeforeFailure(
-	root: string,
-	held: string[],
-	cwd: string,
-	record: (change: ExecutedWorkspaceChange, line: string) => void,
-): Promise<void> {
-	const shownRoot = formatPathRelativeToCwd(root, cwd);
-	for (const relative of held) {
+async function deleteTree(root: string, signal: AbortSignal | undefined, removed: string[]): Promise<void> {
+	const others: string[] = [];
+	// The directories to read, then to remove, relative to `root` ("" is `root`). Each comes
+	// after its parent, so the reverse order is bottom-up.
+	const directories = [""];
+	for (let next = 0; next < directories.length; next++) {
+		throwIfAborted(signal);
+		const relative = directories[next];
+		for (const entry of await fs.readdir(path.join(root, relative), { withFileTypes: true })) {
+			const child = path.join(relative, entry.name);
+			const isDirectory =
+				entry.isDirectory() || (isUntyped(entry) && (await fs.lstat(path.join(root, child))).isDirectory());
+			(isDirectory ? directories : others).push(child);
+		}
+	}
+	let failure: { error: unknown } | undefined;
+	const remove = async (relative: string, directory: boolean) => {
 		const absolute = path.join(root, relative);
 		try {
-			await fs.lstat(absolute);
-			continue;
+			if (directory) await fs.rmdir(absolute);
+			else await fs.unlink(absolute);
 		} catch (error) {
-			if (!isEnoent(error)) continue;
+			if (!isEnoent(error)) failure ??= { error };
+			return;
 		}
-		record(
-			{ kind: "delete", uri: fileToUri(absolute) },
-			`Deleted ${formatPathRelativeToCwd(absolute, cwd)} (the recursive delete of ${shownRoot} stopped partway)`,
-		);
-	}
+		if (relative !== "") removed.push(relative);
+	};
+	for (const relative of others) await remove(relative, false);
+	for (let next = directories.length - 1; next >= 0; next--) await remove(directories[next], true);
+	if (failure) throw failure.error;
+}
+
+/**
+ * After a recursive delete of `root` failed, record each path it removed first (`removed`,
+ * relative to `root`) as a delete. The first {@link PARTIAL_DELETE_NAMED} are named, one line
+ * counts the rest, and every one is an executed change, so the servers are told of all of them.
+ */
+function recordRemovedBeforeFailure(
+	root: string,
+	removed: string[],
+	cwd: string,
+	record: (change: ExecutedWorkspaceChange, line?: string) => void,
+): void {
+	const shownRoot = formatPathRelativeToCwd(root, cwd);
+	const why = `(the recursive delete of ${shownRoot} stopped partway)`;
+	removed.forEach((relative, index) => {
+		const absolute = path.join(root, relative);
+		let line: string | undefined;
+		if (index < PARTIAL_DELETE_NAMED) line = `Deleted ${formatPathRelativeToCwd(absolute, cwd)} ${why}`;
+		else if (index === PARTIAL_DELETE_NAMED) {
+			line = `Deleted ${removed.length - PARTIAL_DELETE_NAMED} more paths under ${shownRoot} ${why}`;
+		}
+		record({ kind: "delete", uri: fileToUri(absolute) }, line);
+	});
 }
 
 /**
@@ -335,22 +401,28 @@ async function recordRemovedBeforeFailure(
  * All text-edit batches are overlap-validated before anything is written so a
  * conflict throws without leaving the workspace half-applied.
  *
- * `onExecuted` fires after each filesystem mutation, with the line `applied` gets for it.
+ * `onExecuted` fires after each filesystem mutation, with the line `applied` gets for it;
+ * a path a recursive delete removed past the ones it names has no line of its own (see
+ * {@link recordRemovedBeforeFailure}).
  * When a later op throws, the callback has already reported the executed prefix —
  * callers that must reconcile external state (e.g. LSP overlays) or report what changed
  * rely on this because the returned {@link WorkspaceEditResult} is lost on failure. A
  * recursive delete that throws after removing part of its tree reports each path it
  * removed before it throws.
+ *
+ * Only a recursive delete watches `signal`, while it lists the tree, before it removes
+ * anything (see {@link deleteTree}); the other ops do not.
  */
 export async function applyWorkspaceEdit(
 	edit: WorkspaceEdit,
 	cwd: string,
-	onExecuted?: (change: ExecutedWorkspaceChange, applied: string) => void,
+	onExecuted?: (change: ExecutedWorkspaceChange, applied?: string) => void,
+	signal?: AbortSignal,
 ): Promise<WorkspaceEditResult> {
 	const applied: string[] = [];
 	const executed: ExecutedWorkspaceChange[] = [];
-	const record = (change: ExecutedWorkspaceChange, line: string) => {
-		applied.push(line);
+	const record = (change: ExecutedWorkspaceChange, line?: string) => {
+		if (line !== undefined) applied.push(line);
 		executed.push(change);
 		onExecuted?.(change, line);
 	};
@@ -453,21 +525,20 @@ export async function applyWorkspaceEdit(
 				);
 			} else {
 				const filePath = uriToFile(op.uri);
-				// A recursive delete can remove part of a tree and then fail: what it held is
-				// listed first, so the paths it did remove can be recorded.
-				let held: string[] | undefined;
+				// A recursive delete can remove part of a tree and then fail: it records the
+				// paths it removed as it goes, so they can be named.
+				const removed: string[] = [];
 				try {
 					const stat = await fs.lstat(filePath);
-					if (stat.isDirectory() && !stat.isSymbolicLink() && !op.options?.recursive) {
-						await fs.rmdir(filePath);
-					} else {
-						if (op.options?.recursive && stat.isDirectory() && !stat.isSymbolicLink()) {
-							held = await fs.readdir(filePath, { recursive: true });
-						}
+					if (!stat.isDirectory() || stat.isSymbolicLink()) {
 						await fs.rm(filePath, { recursive: op.options?.recursive ?? false });
+					} else if (op.options?.recursive) {
+						await deleteTree(filePath, signal, removed);
+					} else {
+						await fs.rmdir(filePath);
 					}
 				} catch (error) {
-					if (held) await recordRemovedBeforeFailure(filePath, held, cwd, record);
+					recordRemovedBeforeFailure(filePath, removed, cwd, record);
 					if (!(op.options?.ignoreIfNotExists && isEnoent(error))) throw error;
 					continue;
 				}
