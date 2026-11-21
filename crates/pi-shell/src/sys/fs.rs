@@ -1712,8 +1712,29 @@ mod tests {
 		/// drop came before used to enter `open(2)` afterwards and stay on the
 		/// FIFO, so the next writer's data went to it. The tests in `fifo`
 		/// hold each point of the helper's start in turn.
+		///
+		/// A process that another test of this process forks holds a copy of
+		/// every descriptor until its exec, a helper's end of this FIFO too,
+		/// and the checks see that copy as an end the drop left behind. So the
+		/// rounds run in a process of their own, where no other test runs.
 		#[test]
 		fn dropping_a_pending_fifo_open_releases_the_helper() {
+			const NAME: &str =
+				"sys::fs::tests::fifos::dropping_a_pending_fifo_open_releases_the_helper";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let output = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.output()
+					.unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
 			for round in 0..200 {
