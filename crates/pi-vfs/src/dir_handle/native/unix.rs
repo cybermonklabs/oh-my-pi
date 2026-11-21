@@ -74,6 +74,20 @@ impl Scratch {
 	}
 }
 
+#[cfg(test)]
+impl Scratch {
+	/// Grows the listing buffer to at least `words` 8-byte words, as a
+	/// listing grows it.
+	pub(crate) fn warm(&mut self, words: usize) {
+		self.buf.reserve(words);
+	}
+
+	/// The listing buffer's capacity, in 8-byte words.
+	pub(crate) fn warmth(&self) -> usize {
+		self.buf.capacity()
+	}
+}
+
 /// Entry type of a `d_type` value; `None` for special files and `DT_UNKNOWN`.
 pub(super) const fn type_of_dt(dt: u8) -> Option<FileType> {
 	match dt {

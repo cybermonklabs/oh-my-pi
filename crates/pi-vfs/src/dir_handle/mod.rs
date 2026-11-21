@@ -70,26 +70,85 @@ use crate::{
 /// 4 on macOS (APFS contention), 8 on Linux, 4 elsewhere.
 pub const WORKERS: usize = native::WORKERS;
 
-thread_local! {
-	/// The host calls' syscall scratch, one per thread.
-	static SCRATCH: RefCell<native::Scratch> = RefCell::new(native::Scratch::default());
+/// Scratch kept between threads, so a thread's first host call does not pay
+/// for a fresh listing buffer (128 KiB on Linux, allocated and faulted in):
+/// a tree walk often runs on threads that did not exist before it.
+static POOL: ScratchPool = ScratchPool::new();
+
+/// Most scratch a [`ScratchPool`] keeps.
+const MAX_POOLED: usize = 32;
+
+/// Spare syscall scratch, at most [`MAX_POOLED`].
+struct ScratchPool(parking_lot::Mutex<Vec<native::Scratch>>);
+
+impl ScratchPool {
+	const fn new() -> Self {
+		Self(parking_lot::Mutex::new(Vec::new()))
+	}
+
+	/// A kept scratch, or a fresh one.
+	fn take(&self) -> native::Scratch {
+		self.0.lock().pop().unwrap_or_default()
+	}
+
+	/// Keeps `scratch` unless the pool is full.
+	fn give(&self, scratch: native::Scratch) {
+		let mut kept = self.0.lock();
+		if kept.len() < MAX_POOLED {
+			kept.push(scratch);
+		}
+	}
 }
 
-/// Runs `call` with this thread's scratch, or with a fresh one where the
-/// thread's is in use (a call made from inside another's syscall, as a test
-/// hook does) or already destroyed (a thread-local destructor).
+/// A thread's scratch: taken from its pool on the thread's first host call,
+/// given back when the thread ends.
+struct Pooled {
+	pool:    &'static ScratchPool,
+	scratch: Option<native::Scratch>,
+}
+
+impl Pooled {
+	const fn from(pool: &'static ScratchPool) -> Self {
+		Self { pool, scratch: None }
+	}
+
+	fn get(&mut self) -> &mut native::Scratch {
+		self.scratch.get_or_insert_with(|| self.pool.take())
+	}
+}
+
+impl Drop for Pooled {
+	fn drop(&mut self) {
+		if let Some(scratch) = self.scratch.take() {
+			self.pool.give(scratch);
+		}
+	}
+}
+
+thread_local! {
+	/// The host calls' syscall scratch, one per thread.
+	static SCRATCH: RefCell<Pooled> = const { RefCell::new(Pooled::from(&POOL)) };
+}
+
+/// Runs `call` with this thread's scratch, or with one of its own from
+/// [`POOL`] where the thread's is in use (a call made from inside another's
+/// syscall, as a test hook does) or already destroyed (a thread-local
+/// destructor).
 fn with_scratch<T>(call: impl FnOnce(&mut native::Scratch) -> T) -> T {
 	let mut call = Some(call);
 	let done = SCRATCH
 		.try_with(|cell| {
 			let mut scratch = cell.try_borrow_mut().ok()?;
-			call.take().map(|call| call(&mut scratch))
+			call.take().map(|call| call(scratch.get()))
 		})
 		.ok()
 		.flatten();
 	match (done, call) {
 		(Some(done), _) => done,
-		(None, Some(call)) => call(&mut native::Scratch::default()),
+		(None, Some(call)) => {
+			let mut own = Pooled::from(&POOL);
+			call(own.get())
+		},
 		(None, None) => unreachable!("a call that ran returned its result"),
 	}
 }

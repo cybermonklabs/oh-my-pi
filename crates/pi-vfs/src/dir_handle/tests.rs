@@ -763,4 +763,47 @@ mod unix {
 			assert!(matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)), "{rel}: {err:?}");
 		}
 	}
+
+	/// A thread's scratch goes back to its pool when the thread ends, and the
+	/// next thread's first call takes it, warm: a walk on threads that did
+	/// not exist before it does not pay for fresh listing buffers.
+	#[test]
+	fn a_new_thread_takes_the_scratch_an_ended_thread_gave_back() {
+		use crate::dir_handle::{Pooled, ScratchPool};
+		static KEPT: ScratchPool = ScratchPool::new();
+		let on_a_new_thread = |words: Option<usize>| {
+			std::thread::spawn(move || {
+				let mut pooled = Pooled::from(&KEPT);
+				let scratch = pooled.get();
+				if let Some(words) = words {
+					scratch.warm(words);
+				}
+				scratch.warmth()
+			})
+			.join()
+			.unwrap()
+		};
+		assert!(on_a_new_thread(Some(4096)) >= 4096);
+		assert!(
+			on_a_new_thread(None) >= 4096,
+			"the second thread got a fresh scratch, not the one the first gave back"
+		);
+		assert_eq!(KEPT.0.lock().len(), 1, "the second thread gave its scratch back too");
+	}
+
+	/// A pool keeps at most `MAX_POOLED` scratch, and an empty one gives a
+	/// fresh scratch.
+	#[test]
+	fn a_scratch_pool_keeps_at_most_its_bound() {
+		use crate::dir_handle::{MAX_POOLED, ScratchPool, native::Scratch};
+		let pool = ScratchPool::new();
+		assert_eq!(pool.take().warmth(), 0);
+		for _ in 0..MAX_POOLED + 3 {
+			let mut scratch = Scratch::default();
+			scratch.warm(8);
+			pool.give(scratch);
+		}
+		assert_eq!(pool.0.lock().len(), MAX_POOLED);
+		assert!(pool.take().warmth() >= 8);
+	}
 }
