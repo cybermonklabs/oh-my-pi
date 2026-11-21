@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import * as openModule from "@oh-my-pi/pi-coding-agent/utils/open";
+import * as exportHtml from "@oh-my-pi/pi-coding-agent/export/html";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 // Regression coverage for #12238: when the session store keeps failing, the
@@ -171,27 +172,20 @@ describe("InteractiveMode shutdown when the session store keeps failing (#12238)
 		const statusSpy = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
 		const output = path.join(tempDir.path(), "exported.html");
 		const errorsBefore = showErrorSpy.mock.calls.length;
-		// The bundled viewer, as a release has it: a source checkout's development viewer is not built
-		// here (export-subsessions.test.ts runs its export the same way).
-		const bundled = process.env.PI_BUNDLED;
-		process.env.PI_BUNDLED = "1";
-		try {
-			await mode.handleExportCommand(`/export ${output}`);
-		} finally {
-			if (bundled === undefined) delete process.env.PI_BUNDLED;
-			else process.env.PI_BUNDLED = bundled;
-		}
+		// What the export would write, from the export's own snapshot of the session (buildSessionData).
+		// The page itself is not written: a source checkout's export viewer is not built in a test tree,
+		// and the module keeps the page it builds for the whole process.
+		let exported: { entries: Array<{ id: string }> } | undefined;
+		vi.spyOn(exportHtml, "exportSessionToHtml").mockImplementation(async (sm, state, options) => {
+			exported = exportHtml.buildSessionData(sm, state);
+			return typeof options === "object" && options.outputPath ? options.outputPath : output;
+		});
+		await mode.handleExportCommand(`/export ${output}`);
 		expect(showErrorSpy.mock.calls.slice(errorsBefore).map((call: unknown[]) => String(call[0]))).toEqual([]);
 		expect(statusSpy.mock.calls.map((call: unknown[]) => String(call[0]))).toContain(
 			`Session exported to: ${output}`,
 		);
-		const html = await Bun.file(output).text();
-		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
-		expect(encoded).toBeDefined();
-		const exported = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8")) as {
-			entries: Array<{ id: string }>;
-		};
-		expect(exported.entries.map(entry => entry.id).slice(0, ids.length)).toEqual(ids);
+		expect(exported?.entries.map(entry => entry.id).slice(0, ids.length)).toEqual(ids);
 
 		const copy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
 		await mode.handleDumpCommand();
