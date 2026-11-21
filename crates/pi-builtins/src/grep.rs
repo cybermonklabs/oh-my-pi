@@ -166,14 +166,14 @@ pub(crate) fn for_each_nonempty_match<M: Matcher>(
 ///
 /// GNU prints the longest match at each position and never prints an empty
 /// one, while the engines prefer the first alternative that matches there.
-/// `longest_at` answers, for the position the engine's match starts at, the
-/// longest non-empty match any alternative has there; with no alternative to
-/// search it answers `None` and the engine's own match is printed.
+/// `longest_at` answers, for the engine's match, the longest non-empty match
+/// any alternative has where it starts; with no alternative to search it
+/// answers `None` and the engine's own match is printed.
 fn for_each_match_with(
 	mut find: impl FnMut(usize) -> io::Result<Option<grep_matcher::Match>>,
 	line: &[u8],
 	line_offset: u64,
-	mut longest_at: impl FnMut(usize) -> io::Result<Option<grep_matcher::Match>>,
+	mut longest_at: impl FnMut(grep_matcher::Match) -> io::Result<Option<grep_matcher::Match>>,
 	mut visit: impl FnMut(grep_matcher::Match, u64) -> io::Result<()>,
 ) -> io::Result<()> {
 	let mut at = 0usize;
@@ -181,7 +181,7 @@ fn for_each_match_with(
 		let Some(found) = find(at)? else {
 			break;
 		};
-		let printed = match longest_at(found.start())? {
+		let printed = match longest_at(found)? {
 			Some(longest) => longest,
 			None if !found.is_empty() => found,
 			// An empty match with nothing longer at that position prints
@@ -590,7 +590,8 @@ struct Alternatives {
 	/// reads.
 	word_engines: OnceLock<Option<Vec<Engine>>>,
 	/// The same, for the copy of such a line with each stand-in of
-	/// [`STAND_INS`] ([`ByteLines::Assertions`]).
+	/// [`STAND_INS`] ([`ByteLines::Assertions`]), compiled without `-w`,
+	/// whose edges [`LineMatcher::for_each_match`] checks itself.
 	stand_in_engines: [OnceLock<Option<Vec<Engine>>>; STAND_INS.len()],
 }
 
@@ -605,9 +606,10 @@ impl Alternatives {
 			Reading::Words => {
 				(&self.word_engines, MatcherSpec { stand_in: Some(self.spec.terminator()), ..self.spec })
 			},
-			Reading::Assertions(slot) => {
-				(&self.stand_in_engines[slot], MatcherSpec { stand_in: Some(STAND_INS[slot]), ..self.spec })
-			},
+			Reading::Assertions(slot) => (
+				&self.stand_in_engines[slot],
+				MatcherSpec { stand_in: Some(STAND_INS[slot]), word: false, ..self.spec },
+			),
 		};
 		engines
 			.get_or_init(|| {
@@ -939,8 +941,10 @@ fn translate_patterns(
 	target: bre::Target,
 	spec: MatcherSpec,
 ) -> Result<Vec<String>, String> {
-	let bytes =
-		bre::PatternBytes { raw: spec.raw_bytes, utf8_locale: spec.utf8_locale, stand_in: spec.stand_in };
+	// A stand-in that is the record's terminator the engine leaves out
+	// itself (see `build_matcher`).
+	let stand_in = spec.stand_in.filter(|&byte| byte != spec.terminator());
+	let bytes = bre::PatternBytes { raw: spec.raw_bytes, utf8_locale: spec.utf8_locale, stand_in };
 	patterns
 		.iter()
 		.map(|pattern| bre::translate_raw(pattern, dialect, target, spec.ignore_case, bytes))
@@ -1206,10 +1210,12 @@ struct MatcherSpec {
 	/// where every byte is a character. Asked only where it decides
 	/// something (see `Grep::run`), and else true.
 	utf8_locale: bool,
-	/// The byte the engine is compiled never to match, which a copy of a
-	/// line that is not UTF-8 holds for some of its bytes that are no UTF-8
-	/// ([`LineMatcher::copy`]): the `regex` crate's engine holds it as its
-	/// line terminator, and PCRE2's patterns are written not to match it
+	/// A byte the engine is compiled never to match, which a copy of a line
+	/// that is not UTF-8 holds for some of its bytes that are no UTF-8
+	/// ([`LineMatcher::copy`]). Where it is set, the `regex` crate's engine
+	/// holds the record's terminator as its line terminator, which such a
+	/// copy holds for its other bytes that are no UTF-8, and a stand-in that
+	/// is not the terminator the patterns are written not to match
 	/// ([`bre::PatternBytes::stand_in`]).
 	stand_in:    Option<u8>,
 }
@@ -1248,10 +1254,8 @@ fn build_matcher(patterns: &[String], spec: MatcherSpec) -> Result<Engine, Strin
 		.word(spec.word && !spec.line_regexp)
 		.whole_line(spec.line_regexp)
 		.unicode(!spec.bytes);
-	if let Some(byte) = spec.stand_in {
-		builder.line_terminator(Some(byte));
-	} else if spec.null_data {
-		builder.line_terminator(Some(b'\0'));
+	if spec.stand_in.is_some() || spec.null_data {
+		builder.line_terminator(Some(spec.terminator()));
 	}
 	// A BRE is a distinct dialect, not an ERE with different escaping: `\+`
 	// is the operator and a bare `+` is a literal. Both dialects go through
@@ -1375,7 +1379,7 @@ fn pattern_alternatives(patterns: &[String], spec: MatcherSpec) -> Option<Altern
 		engines: OnceLock::new(),
 		byte_engines: OnceLock::new(),
 		word_engines: OnceLock::new(),
-		stand_in_engines: Default::default(),
+		stand_in_engines: std::array::from_fn(|_| OnceLock::new()),
 	})
 }
 
@@ -1422,9 +1426,19 @@ struct LineMatcher<M> {
 
 /// The bytes a copy of a line that is not UTF-8 may hold for its bytes that
 /// are no UTF-8 whose character is a letter ([`ByteLines::Assertions`]):
-/// word characters that no case folds, the first the patterns and the line
-/// hold neither of.
-const STAND_INS: [u8; 11] = *b"_0123456789";
+/// ASCII word characters, the first that the patterns and the line hold in
+/// neither case, so that no case folds a character of either to it. The
+/// rarest letters come first, so that one engine serves most lines, a
+/// line of a log holding `_` and every digit too. `k` and `s` are left out:
+/// the engines without case fold them with `K` (U+212A) and `ſ` (U+017F),
+/// which the line may hold and which a pattern written not to match the
+/// stand-in would then not match either.
+const STAND_INS: [u8; 35] = *b"zqxjvbpygfwmucldrhnioate_0123456789";
+
+/// Whether `haystack` holds the ASCII byte `byte` in either case.
+fn holds_either_case(haystack: &[u8], byte: u8) -> bool {
+	memchr::memchr2(byte, byte.to_ascii_uppercase(), haystack).is_some()
+}
 
 /// How a search reads a line that is not UTF-8.
 enum ByteLines<M> {
@@ -1442,15 +1456,231 @@ enum ByteLines<M> {
 	/// assertions, a word character where that is a letter. `printf
 	/// 'a\377\n' | grep -c 'a\>'` is 0 (`ÿ`), and `printf 'a\200\n' | grep -c
 	/// 'a\>'` is 1. Each stand-in of [`STAND_INS`] the patterns do not hold
-	/// (`free`) has an engine of its own, which `build` compiles at the first
+	/// (`free`) has engines of their own, which `build` compiles at the first
 	/// line it reads.
 	Assertions {
-		engines: [OnceLock<Option<M>>; STAND_INS.len()],
+		engines: [OnceLock<Option<StandIn<M>>>; STAND_INS.len()],
 		free:    [bool; STAND_INS.len()],
-		build:   Box<dyn Fn(u8) -> Option<M> + Send + Sync>,
+		build:   Box<dyn Fn(u8) -> Option<StandIn<M>> + Send + Sync>,
 	},
 	/// With an engine of its own.
 	Engine(M),
+}
+
+/// The engines of [`ByteLines::Assertions`] for one stand-in, and what the
+/// copy of a line they search holds ([`LineMatcher::copy`]).
+struct StandIn<M> {
+	/// The stand-in, which the copy holds for each byte that is no UTF-8
+	/// whose character is a letter.
+	letter:       u8,
+	/// What the copy holds for each other byte that is no UTF-8, which the
+	/// engines match nothing in and read as no word character. For the
+	/// `regex` crate's it is the record's terminator, their line terminator:
+	/// its `\B` and its edges under `-w` hold beside no byte that is no
+	/// UTF-8, where GNU's hold beside such a byte (`printf '\200\n' | grep -c
+	/// '^\B'` is 1). For PCRE2's, whose `$` holds before a final newline, it
+	/// is 0xFF.
+	gap:          u8,
+	/// Compiled without `-w`.
+	engine:       M,
+	/// Under `-w`, compiled with it; see [`Self::find_at`].
+	words:        Option<M>,
+	/// Under `-w`, each alternative of the patterns ([`bre::alternatives`])
+	/// compiled alone without it, where there are several and at most
+	/// [`SEPARATE_ALTERNATIVE_LIMIT`].
+	alternatives: Vec<M>,
+}
+
+impl<M: Matcher> StandIn<M> {
+	/// The first match at or after `from` in `line`, which is not UTF-8, in
+	/// its copy `copy`.
+	///
+	/// Under `-w` the assertions read a byte that is no UTF-8 whose
+	/// character is a letter as a word character, while `-w`'s edges read it
+	/// as none, as GNU grep does: `printf 'a\377 b\n' | grep -cw 'a\>'` is 0,
+	/// where `-cw a` is 1, and `printf 'a\377b c\n' | grep -ow 'a\B'` prints
+	/// `a`. The engine compiled with `-w` (`words`) reads the stand-in as a
+	/// word character at its edges too, so it misses a word beside one.
+	/// Where the copy holds the stand-in, each start of a match of `engine`
+	/// up to the start of the one `words` finds is checked as GNU checks its
+	/// own: the start's edge in `line` ([`word_character_before`]), then the
+	/// longest match there whose end's edge holds ([`Self::word_end`]), of
+	/// `engine` and of each alternative, as GNU's engine takes the longest.
+	/// The match that starts first is taken, the longer at one start.
+	/// `search` keeps what is found from one call to the next in one copy.
+	fn find_at(
+		&self,
+		line: &[u8],
+		copy: &[u8],
+		from: usize,
+		search: &mut WordSearch,
+	) -> Result<Option<grep_matcher::Match>, M::Error> {
+		let Some(words) = &self.words else {
+			return self.engine.find_at(copy, from);
+		};
+		let found = next_found(words, &mut search.words, copy, from)?;
+		if !*search.holds_letter.get_or_insert_with(|| memchr::memchr(self.letter, copy).is_some()) {
+			return Ok(found);
+		}
+		let bound = found.map_or(copy.len(), |found| found.start());
+		if search.alternatives.is_empty() {
+			search.alternatives.resize(self.alternatives.len(), None);
+		}
+		let mut at = from;
+		while let Some(candidate) = next_found(&self.engine, &mut search.engine, copy, at)?
+			&& candidate.start() <= bound
+		{
+			let start = candidate.start();
+			if !word_character_before(line, start) {
+				let first = candidate.end();
+				let mut end = self.word_end(&self.engine, line, copy, start, first, &mut search.cut)?;
+				for (alternative, cached) in self.alternatives.iter().zip(&mut search.alternatives) {
+					if let Some(own) = next_found(alternative, cached, copy, start)?
+						&& own.start() == start
+					{
+						let cut = &mut search.cut;
+						end = end.max(self.word_end(alternative, line, copy, start, own.end(), cut)?);
+					}
+				}
+				if let Some(end) = end {
+					return Ok(longer_first(found, Some(grep_matcher::Match::new(start, end))));
+				}
+			}
+			// GNU searches again from the next character.
+			let Some(after) = (start + 1..=copy.len())
+				.find(|&at| copy.get(at).is_none_or(|&byte| starts_character(byte)))
+			else {
+				break;
+			};
+			at = after;
+		}
+		Ok(found)
+	}
+
+	/// Where a match of `engine` at `start` in `copy`, the copy of `line`,
+	/// ends where `-w`'s edge holds in `line`: at `end`, the end of the match
+	/// `engine` found, or else at the end of a shorter match, as GNU grep
+	/// tries one where the end of a match fails that edge
+	/// ([`Self::shorter`]); `None` where none does.
+	fn word_end(
+		&self,
+		engine: &M,
+		line: &[u8],
+		copy: &[u8],
+		start: usize,
+		end: usize,
+		cut: &mut Vec<u8>,
+	) -> Result<Option<usize>, M::Error> {
+		let mut end = Some(end);
+		while let Some(at) = end
+			&& word_character_at(line, at)
+		{
+			end = self.shorter(engine, line, copy, start, at, cut)?;
+		}
+		Ok(end)
+	}
+
+	/// The end of a match of `engine` at `start` in `copy`, the copy of
+	/// `line`, shorter than one that ends at `end`, which ends where `-w`'s
+	/// edge may hold in `line`. The engine reads the copy up to there and
+	/// then `gap`, which it matches nothing in and reads as no word
+	/// character, so that `$` holds nowhere before it; it reads from one
+	/// character before `start`, which its assertions read. `cut` holds what
+	/// it reads.
+	fn shorter(
+		&self,
+		engine: &M,
+		line: &[u8],
+		copy: &[u8],
+		start: usize,
+		end: usize,
+		cut: &mut Vec<u8>,
+	) -> Result<Option<usize>, M::Error> {
+		let Some(limit) = (start + 1..end)
+			.rev()
+			.find(|&at| starts_character(copy[at]) && !word_character_at(line, at))
+		else {
+			return Ok(None);
+		};
+		let window = start.saturating_sub(4);
+		cut.clear();
+		cut.extend_from_slice(&copy[window..limit]);
+		cut.push(self.gap);
+		let found = engine.find_at(&cut[..], start - window)?;
+		Ok(found
+			.filter(|found| found.start() == start - window && !found.is_empty())
+			.map(|found| window + found.end()))
+	}
+}
+
+/// What [`StandIn::find_at`] keeps from one call to the next in one copy of
+/// a line, so that the copy is searched about once however many matches
+/// `-o` prints in it.
+#[derive(Default)]
+struct WordSearch {
+	/// Whether the copy holds the stand-in, asked at the first call.
+	holds_letter: Option<bool>,
+	/// Where the engine compiled with `-w` next matches.
+	words:        bre::CachedMatch,
+	/// Where the engine compiled without it next matches.
+	engine:       bre::CachedMatch,
+	/// Where each alternative next matches.
+	alternatives: Vec<bre::CachedMatch>,
+	/// What [`StandIn::shorter`] searches.
+	cut:          Vec<u8>,
+}
+
+/// The first match of `engine` at or after `at` in `haystack`, which
+/// `cached` keeps from one call to the next in the same haystack
+/// ([`bre::next_match`]).
+fn next_found<M: Matcher>(
+	engine: &M,
+	cached: &mut bre::CachedMatch,
+	haystack: &[u8],
+	at: usize,
+) -> Result<Option<grep_matcher::Match>, M::Error> {
+	let found = bre::next_match(cached, at, || {
+		engine.find_at(haystack, at).map(|found| found.map(|found| (found.start(), found.end())))
+	})?;
+	Ok(found.map(|(start, end)| grep_matcher::Match::new(start, end)))
+}
+
+/// Whether `byte` starts a character of UTF-8, or is no UTF-8, rather than
+/// continuing a character.
+const fn starts_character(byte: u8) -> bool {
+	!matches!(byte, 0x80..=0xBF)
+}
+
+/// Whether `c` is a word character to the `regex` crate, whose edges under
+/// `-w` read it.
+fn is_word_character(c: char) -> bool {
+	static WORD: LazyLock<regex::Regex> =
+		LazyLock::new(|| regex::Regex::new(r"^\w$").expect("`\\w` compiles"));
+	if c.is_ascii() {
+		return c == '_' || c.is_ascii_alphanumeric();
+	}
+	WORD.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// Whether the character of `line` that starts at `at` is a word character
+/// to `-w`'s edges, which read a byte that is no UTF-8, or the end of the
+/// line, as none, as GNU grep does.
+fn word_character_at(line: &[u8], at: usize) -> bool {
+	line[at..line.len().min(at + 4)]
+		.utf8_chunks()
+		.next()
+		.and_then(|chunk| chunk.valid().chars().next())
+		.is_some_and(is_word_character)
+}
+
+/// The same, for the character of `line` that ends at `at`.
+fn word_character_before(line: &[u8], at: usize) -> bool {
+	line[at.saturating_sub(4)..at]
+		.utf8_chunks()
+		.last()
+		.filter(|chunk| chunk.invalid().is_empty())
+		.and_then(|chunk| chunk.valid().chars().next_back())
+		.is_some_and(is_word_character)
 }
 
 /// How one line is read: the outcome of [`LineMatcher::reading`].
@@ -1479,16 +1709,7 @@ const fn byte_lines_spec(spec: MatcherSpec) -> MatcherSpec {
 /// Whether `patterns`, of the dialect `mode` reads, hold a word assertion:
 /// `\<`, `\>`, `\b` or `\B`.
 fn holds_word_assertion(patterns: &[String], mode: MatchMode) -> bool {
-	mode != MatchMode::Fixed
-		&& patterns.iter().any(|pattern| {
-			let mut chars = pattern.chars();
-			while let Some(c) = chars.next() {
-				if c == '\\' && matches!(chars.next(), Some('<' | '>' | 'b' | 'B')) {
-					return true;
-				}
-			}
-			false
-		})
+	mode != MatchMode::Fixed && patterns.iter().any(|pattern| bre::has_word_assertion(pattern))
 }
 
 /// The size of the first window [`LineMatcher::search`] reads, in bytes.
@@ -1498,18 +1719,18 @@ const FIRST_WINDOW: usize = 256;
 /// `patterns` with `spec` and which `engine` takes out of what it returns.
 /// Where `text` already reads a byte to a character (`spec.bytes`), it reads
 /// every line. `rust` tells whether `text` is the `regex` crate's, whose
-/// edges under `-w` take nothing next to a byte that is no UTF-8.
+/// edges under `-w` and `\B` hold next to no byte that is no UTF-8.
 fn line_matcher<M: Send + Sync + 'static>(
 	text: M,
 	patterns: Vec<String>,
 	spec: MatcherSpec,
-	terminator: u8,
 	engine: impl Fn(Engine) -> Option<M> + Send + Sync + 'static,
 	rust: bool,
 ) -> LineMatcher<M>
 where
 	M: Matcher,
 {
+	let terminator = spec.terminator();
 	let bytes = (!spec.bytes && !reads_bytes_as_text(&patterns, spec)).then(|| {
 		let build: Box<dyn FnOnce() -> ByteLines<M> + Send> = Box::new(move || {
 			if !spec.utf8_locale || spec.mode == MatchMode::Perl {
@@ -1518,23 +1739,57 @@ where
 					.and_then(&engine)
 					.map_or(ByteLines::Text, ByteLines::Engine);
 			}
-			if spec.word && !spec.line_regexp {
-				if !rust {
-					return ByteLines::Text;
+			let words = spec.word && !spec.line_regexp;
+			if !spec.raw_bytes && holds_word_assertion(&patterns, spec.mode) {
+				let free = STAND_INS.map(|byte| {
+					!patterns.iter().any(|pattern| holds_either_case(pattern.as_bytes(), byte))
+				});
+				// Under `-w`, the alternatives GNU's engine takes the longest
+				// of; see `StandIn::find_at`.
+				let mut alternatives: Vec<String> = match dialect_of(spec.mode) {
+					Some(dialect) if words => patterns
+						.iter()
+						.flat_map(|pattern| bre::alternatives(pattern, dialect, bre::Split::Grep))
+						.filter(|alternative| !alternative.is_empty())
+						.take(SEPARATE_ALTERNATIVE_LIMIT + 1)
+						.collect(),
+					_ => Vec::new(),
+				};
+				if !(2..=SEPARATE_ALTERNATIVE_LIMIT).contains(&alternatives.len()) {
+					alternatives.clear();
 				}
-				return build_matcher(&patterns, MatcherSpec { stand_in: Some(terminator), ..spec })
-					.ok()
-					.and_then(&engine)
-					.map_or(ByteLines::Text, |edges| ByteLines::Words { edges, raw_bytes: spec.raw_bytes });
+				let gap = if rust { terminator } else { 0xFF };
+				let build = move |letter| {
+					let spec = MatcherSpec { stand_in: Some(letter), word: false, ..spec };
+					let compile = |set: &[String], spec| build_matcher(set, spec).ok().and_then(&engine);
+					let words = if words {
+						Some(compile(patterns.as_slice(), MatcherSpec { word: true, ..spec })?)
+					} else {
+						None
+					};
+					// An alternative that does not compile leaves the longest
+					// match to the engine of them all.
+					let alternatives = alternatives
+						.iter()
+						.map(|alternative| compile(std::slice::from_ref(alternative), spec))
+						.collect::<Option<Vec<_>>>()
+						.unwrap_or_default();
+					let whole = compile(patterns.as_slice(), spec)?;
+					Some(StandIn { letter, gap, engine: whole, words, alternatives })
+				};
+				return ByteLines::Assertions {
+					engines: std::array::from_fn(|_| OnceLock::new()),
+					free,
+					build: Box::new(build),
+				};
 			}
-			if spec.raw_bytes || !holds_word_assertion(&patterns, spec.mode) {
+			if !words || !rust {
 				return ByteLines::Text;
 			}
-			let free = STAND_INS.map(|byte| !patterns.iter().any(|pattern| pattern.as_bytes().contains(&byte)));
-			let build = move |byte| {
-				build_matcher(&patterns, MatcherSpec { stand_in: Some(byte), ..spec }).ok().and_then(&engine)
-			};
-			ByteLines::Assertions { engines: Default::default(), free, build: Box::new(build) }
+			build_matcher(&patterns, MatcherSpec { stand_in: Some(terminator), ..spec })
+				.ok()
+				.and_then(&engine)
+				.map_or(ByteLines::Text, |edges| ByteLines::Words { edges, raw_bytes: spec.raw_bytes })
 		});
 		Arc::new(LazyLock::new(build))
 	});
@@ -1574,22 +1829,50 @@ impl<M: Matcher> LineMatcher<M> {
 			ByteLines::Assertions { engines, free, build } => (0..STAND_INS.len())
 				.find(|&slot| {
 					let byte = STAND_INS[slot];
-					free[slot] && !line.contains(&byte) && engines[slot].get_or_init(|| build(byte)).is_some()
+					free[slot]
+						&& !holds_either_case(line, byte)
+						&& engines[slot].get_or_init(|| build(byte)).is_some()
 				})
 				.map_or(Reading::Text, Reading::Assertions),
 		}
 	}
 
 	/// The engine that reads a line as `reading` says, in the line's copy
-	/// ([`Self::copy`]) for [`Reading::Words`] and [`Reading::Assertions`].
+	/// ([`Self::copy`]) for [`Reading::Words`]. A line read as
+	/// [`Reading::Assertions`] is searched by [`Self::assertion_match`].
 	fn engine(&self, reading: Reading) -> &M {
 		match (reading, self.byte_lines()) {
 			(Reading::Bytes, ByteLines::Engine(engine))
 			| (Reading::Words, ByteLines::Words { edges: engine, .. }) => engine,
-			(Reading::Assertions(slot), ByteLines::Assertions { engines, .. }) => {
-				engines[slot].get().and_then(Option::as_ref).unwrap_or(&self.text)
-			},
 			_ => &self.text,
+		}
+	}
+
+	/// The engines of a line read as `reading` says, where that is
+	/// [`Reading::Assertions`].
+	fn stand_in(&self, reading: Reading) -> Option<&StandIn<M>> {
+		match (reading, self.byte_lines()) {
+			(Reading::Assertions(slot), ByteLines::Assertions { engines, .. }) => {
+				engines[slot].get().and_then(Option::as_ref)
+			},
+			_ => None,
+		}
+	}
+
+	/// The first match at or after `from` in `line`, which is not UTF-8, read
+	/// as `reading` ([`Reading::Assertions`]) says, in its copy `copy`;
+	/// `search` keeps what is found from one call to the next in that copy.
+	fn assertion_match(
+		&self,
+		line: &[u8],
+		copy: &[u8],
+		reading: Reading,
+		from: usize,
+		search: &mut WordSearch,
+	) -> Result<Option<grep_matcher::Match>, M::Error> {
+		match self.stand_in(reading) {
+			Some(stand_in) => stand_in.find_at(line, copy, from, search),
+			None => self.text.find_at(line, from),
 		}
 	}
 
@@ -1599,16 +1882,15 @@ impl<M: Matcher> LineMatcher<M> {
 	/// `-w` ([`Self::word_match`]) each byte that is no UTF-8 is the record's
 	/// terminator, which no line holds. For a word assertion
 	/// ([`ByteLines::Assertions`]) each one whose character is a letter is
-	/// the stand-in, and each other the byte 0xFF, which the engines read as
-	/// no word character on either side: the `regex` crate reads a byte from
-	/// 0x80 to 0xBF as part of the character before it, so that `printf
-	/// 'a\200b c\n' | grep -o '\<[a-z]\>'` missed the `b`.
+	/// the stand-in ([`StandIn::letter`]), and each other [`StandIn::gap`].
+	/// PCRE2, which runs a back-reference, reads `\B` at the end of the line
+	/// after 0xFF as false: `printf 'a\200\n' | grep -c '\B$\|\(x\)\1'` is 0,
+	/// where GNU's is 1.
 	fn copy(&self, line: &[u8], reading: Reading) -> Vec<u8> {
-		let stand_in = |byte: u8| match reading {
-			Reading::Assertions(slot) if char::from(byte).is_alphabetic() => STAND_INS[slot],
-			Reading::Assertions(_) => 0xFF,
-			_ => self.terminator,
-		};
+		let (letter, gap) = self
+			.stand_in(reading)
+			.map_or((self.terminator, self.terminator), |stand_in| (stand_in.letter, stand_in.gap));
+		let stand_in = |byte: u8| if char::from(byte).is_alphabetic() { letter } else { gap };
 		let mut copy = Vec::with_capacity(line.len());
 		for chunk in line.utf8_chunks() {
 			copy.extend_from_slice(chunk.valid().as_bytes());
@@ -1660,7 +1942,10 @@ impl<M: Matcher> LineMatcher<M> {
 	/// alternatives search that copy too. Under `-w` the alternatives that
 	/// hold a pattern byte, which matches a byte that is no UTF-8 in the line
 	/// alone, search the line itself as well, as [`Self::word_match`] does:
-	/// `printf 'a\377 b\n' | grep -aow $'a\\|a\377'` prints `a\377`.
+	/// `printf 'a\377 b\n' | grep -aow $'a\\|a\377'` prints `a\377`. Those of
+	/// a line read for its word assertions are compiled without `-w` (see
+	/// [`StandIn::find_at`]): one is taken where its end in the line is
+	/// `-w`'s, and the engine's match where it is longer.
 	fn for_each_match(
 		&self,
 		line: &[u8],
@@ -1675,10 +1960,13 @@ impl<M: Matcher> LineMatcher<M> {
 		let searched = if copied { &copy[..] } else { line };
 		let raw_words =
 			reading == Reading::Words && matches!(self.byte_lines(), ByteLines::Words { raw_bytes: true, .. });
+		let assertion_words = self.stand_in(reading).is_some_and(|stand_in| stand_in.words.is_some());
 		let mut text_next = None;
+		let mut search = WordSearch::default();
 		let find = |at| {
 			let found = match reading {
 				Reading::Words => self.word_match(line, &copy, &mut text_next, at),
+				Reading::Assertions(_) => self.assertion_match(line, &copy, reading, at, &mut search),
 				_ => self.engine(reading).find_at(searched, at),
 			};
 			found.map_err(|error| io::Error::other(error.to_string()))
@@ -1687,16 +1975,23 @@ impl<M: Matcher> LineMatcher<M> {
 		let [in_copy, in_line] = next;
 		in_copy.clear();
 		in_line.clear();
-		let longest_at = |start| {
+		let longest_at = |found: grep_matcher::Match| {
 			let Some(alternatives) = alternatives else {
 				return Ok(None);
 			};
+			let start = found.start();
 			let mut longest = None;
 			if let Some(engines) = alternatives.engines(reading) {
 				if in_copy.is_empty() {
 					in_copy.resize(engines.len(), None);
 				}
 				longest = longest_match_at(engines, in_copy, searched, start)?;
+				if assertion_words {
+					longest = longer_first(
+						longest.filter(|longest| !word_character_at(line, longest.end())),
+						Some(found).filter(|found| !found.is_empty()),
+					);
+				}
 			}
 			if raw_words && let Some(engines) = alternatives.engines(Reading::Text) {
 				if in_line.is_empty() {
@@ -1792,7 +2087,8 @@ impl<M: Matcher> LineMatcher<M> {
 							let found = if reading == Reading::Words {
 								self.word_match(line, &copy, &mut None, at_line - start)?
 							} else {
-								self.engine(reading).find_at(&copy, at_line - start)?
+								let search = &mut WordSearch::default();
+								self.assertion_match(line, &copy, reading, at_line - start, search)?
 							};
 							found.map(|found| {
 								from_match(grep_matcher::Match::new(start + found.start(), start + found.end()))
@@ -3150,7 +3446,6 @@ impl AsyncUtility for Grep {
 	let prints_matches = cli.only_matching && !cli.invert && !output_suppressed;
 	let alternatives =
 		prints_matches.then(|| pattern_alternatives(&patterns, spec)).flatten().map(Arc::new);
-	let terminator = if cli.null_data { b'\0' } else { b'\n' };
 
 	// `-o` prints no context line, and GNU still groups its output by the
 	// context counts, printing a `--` between two groups.
@@ -3183,7 +3478,7 @@ impl AsyncUtility for Grep {
 		record: RecordFormat {
 			path_separator: None,
 			null_paths:     cli.null_paths,
-			terminator,
+			terminator:     spec.terminator(),
 		},
 		group_separator: resolve_group_separator(&cli, &matches),
 		line_buffered: cli.line_buffered,
@@ -3201,7 +3496,6 @@ impl AsyncUtility for Grep {
 				text,
 				patterns,
 				spec,
-				terminator,
 				|engine| match engine {
 					Engine::Rust(engine) => Some(engine),
 					Engine::Pcre(_) => None,
@@ -3216,7 +3510,6 @@ impl AsyncUtility for Grep {
 				text,
 				patterns,
 				spec,
-				terminator,
 				|engine| match engine {
 					Engine::Pcre(engine) => Some(engine),
 					Engine::Rust(_) => None,
@@ -4397,7 +4690,7 @@ mod tests {
 			Engine::Rust(inner) => Some(Counting { inner, read: Arc::clone(&engines_read) }),
 			Engine::Pcre(_) => None,
 		};
-		line_matcher(Counting { inner, read: Arc::clone(read) }, patterns, spec, b'\n', engine, true)
+		line_matcher(Counting { inner, read: Arc::clone(read) }, patterns, spec, engine, true)
 	}
 
 	/// 2,000 Latin-1 lines, each selected by `caf.`, which matches such a
@@ -4408,7 +4701,9 @@ mod tests {
 	/// line about once. So they do under `-w` in a UTF-8 locale, where a
 	/// rejected match of `a.*` was tried again one byte on, to the end of
 	/// the line each time (`printf 'a\377'` 20,000 times: 2.2 s), and at
-	/// each match `-ow` prints in such a line.
+	/// each match `-ow` prints in such a line, beside a word assertion too,
+	/// where the engine of `-w` was searched again to the end of the line at
+	/// each match (`printf 'a\377 '` 100,000 times under `-ow 'a\B'`: 85 s).
 	#[test]
 	fn a_search_reads_each_line_that_is_not_utf8_about_once() {
 		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4442,6 +4737,56 @@ mod tests {
 		assert_eq!(printed, 80_000);
 		let read = read.load(Ordering::Relaxed);
 		assert!(read <= 4 * line.len(), "the engines read {read} bytes of a {}-byte line", line.len());
+
+		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let matcher = counting_matcher(r"a\B", MatcherSpec { word: true, ..BRE_SPEC }, &read);
+		let line = b"a\xff ".repeat(20_000);
+		let mut printed = 0;
+		matcher
+			.for_each_match(&line, 0, None, &mut Default::default(), |_, _| {
+				printed += 1;
+				Ok(())
+			})
+			.unwrap();
+		assert_eq!(printed, 20_000);
+		let read = read.load(Ordering::Relaxed);
+		assert!(read <= 4 * line.len(), "the engines read {read} bytes of a {}-byte line", line.len());
+	}
+
+	/// In a line that is not UTF-8, a word assertion reads a byte whose
+	/// character is a letter as a word character and `-w`'s edges read it as
+	/// none, as GNU grep 3.11 reads them; `\B` holds beside a byte whose
+	/// character is no word character; and a line holding `_` and every digit
+	/// is read so too.
+	#[test]
+	fn a_word_assertion_and_w_read_a_letter_byte_apart() {
+		let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let lines = |pattern: &str, spec: MatcherSpec, haystack: &[u8]| {
+			let matcher = counting_matcher(pattern, spec, &read);
+			let mut selected = Selected(0);
+			SearcherBuilder::new().build().search_slice(&matcher, haystack, &mut selected).unwrap();
+			selected.0
+		};
+		let words = MatcherSpec { word: true, ..BRE_SPEC };
+		// If these regress, `printf 'a\377 b\n' | grep -cw 'a\>'` counts 1
+		// where GNU counts 0, and `printf '\377ab c\n' | grep -cw 'a\|ab\>'`
+		// counts 0 where GNU counts 1.
+		assert_eq!(lines(r"a\>", words, b"a\xff b\n"), 0);
+		assert_eq!(lines("a", words, b"a\xff b\n"), 1);
+		assert_eq!(lines(r"a\B", words, b"a\xffb c\n"), 1);
+		assert_eq!(lines(r"a\|ab\>", words, b"\xffab c\n"), 1);
+		assert_eq!(lines(r"a\>", BRE_SPEC, b"a\xff _0123456789\n"), 0);
+		assert_eq!(lines(r"^\B", BRE_SPEC, b"\x80\n"), 1);
+		// `-ow` prints the longest match at each start whose edges hold.
+		let matcher = counting_matcher(r"\<a\|\<ab", words, &read);
+		let mut printed = Vec::new();
+		matcher
+			.for_each_match(b"ab\xff ab x", 0, None, &mut Default::default(), |found, _| {
+				printed.push((found.start(), found.end()));
+				Ok(())
+			})
+			.unwrap();
+		assert_eq!(printed, [(0, 2), (4, 6)]);
 	}
 
 	/// The spec of a plain BRE search.
