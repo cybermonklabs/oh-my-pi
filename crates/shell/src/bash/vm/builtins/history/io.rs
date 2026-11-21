@@ -394,10 +394,10 @@ fn read(
 }
 
 /// [`HistOp::Write`]: open, then write `data`. How much is written is a
-/// count, kept as 8 bytes in the scratch's input buffer and set to 0 when
-/// the open starts; never the file's position, which a FIFO, a pipe or a
-/// socket does not have (the seek fails, and the whole history would go
-/// out again on every poll).
+/// count, kept as 8 bytes in the scratch's input buffer, which
+/// [`crate::bash::vm::probe::begin`] empties when the probe begins; never
+/// the file's position, which a FIFO, a pipe or a socket does not have (the
+/// seek fails, and the whole history would go out again on every poll).
 fn write(
 	tcx: &mut Context<'_>,
 	cx: &mut Cx<'_>,
@@ -416,16 +416,10 @@ fn write(
 	let input = &mut sc.io.get_or_insert_with(Box::default).input;
 	loop {
 		match &mut sc.live {
-			Live::None => {
-				// A new write: what an earlier op left in the buffer is no
-				// count of this one.
-				input.clear();
-				input.extend_from_slice(&0u64.to_le_bytes());
-				match cx.host.fs().open(BStr::new(path), flags, mode) {
-					FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
-					FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
-					FsPoll::Pending(f) => sc.live = Live::Open(f),
-				}
+			Live::None => match cx.host.fs().open(BStr::new(path), flags, mode) {
+				FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
+				FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
+				FsPoll::Pending(f) => sc.live = Live::Open(f),
 			},
 			Live::Open(f) => match f.poll(tcx) {
 				Poll::Ready(Ok(file)) => sc.live = Live::File(file),
