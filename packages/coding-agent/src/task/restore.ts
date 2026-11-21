@@ -28,7 +28,7 @@ import { AsyncJobError } from "../async";
 import { readEvalAgentJobRecord } from "../eval/agent-job-records";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, type AgentRef } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import {
@@ -36,6 +36,7 @@ import {
 	endsOnCredentialUnavailableTurn,
 	hasRestorableTurn,
 	isInterruptedTurnAbort,
+	readToolExecutionStart,
 } from "../session/exit-diagnostics";
 import { isReasonlessAbort, isUserInterruptAbort } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
@@ -67,24 +68,38 @@ export interface RestoreOutcome {
 /**
  * Has `session` go on with what its last process left unfinished: its subagents'
  * interrupted turns, each as a background job of its parent (registered first, so
- * a resumed turn waiting on such a job finds it), then its own interrupted turn.
+ * a resumed turn waiting on such a job finds it), then its own interrupted turn. A
+ * resumed turn does not run again a cut-off call that started a subagent restore
+ * relaunched ({@link relaunchedByCutOffCall}).
  */
 export async function restoreSession(session: AgentSession, options: RestoreOptions = {}): Promise<RestoreOutcome> {
-	const subagents = await restoreSubagents(session, options);
-	const turn = await session.restoreInterruptedTurn();
-	return { turn, subagents };
+	const { ids, relaunchedByCall } = await restoreSubagents(session, options);
+	const turn = await session.restoreInterruptedTurn({ relaunched: relaunchedByCall });
+	return { turn, subagents: ids };
+}
+
+/** A subagent `--restore` goes on with, and what its job needs. */
+interface Relaunch {
+	key: string;
+	sub: SubSession;
+	ref: AgentRef & { sessionFile: string };
+	init: NonNullable<ReturnType<typeof extractSessionInit>>;
 }
 
 /**
  * Has every subagent of `session` that its last process left mid-turn go on with that
  * turn (see the module docs). Nothing is restored for a session without a file, or
  * without background jobs (the `async.enabled` setting off), which could not deliver
- * the results.
+ * the results. Returns the relaunched ids, and for `session`'s own cut-off batch the
+ * calls that started relaunched subagents.
  */
-async function restoreSubagents(session: AgentSession, options: RestoreOptions): Promise<string[]> {
+async function restoreSubagents(
+	session: AgentSession,
+	options: RestoreOptions,
+): Promise<{ ids: string[]; relaunchedByCall: Record<string, string[]> }> {
 	const sessionFile = session.sessionManager.getSessionFile();
 	const manager = session.asyncJobManager;
-	if (!sessionFile || !manager) return [];
+	if (!sessionFile || !manager) return { ids: [], relaunchedByCall: {} };
 	const registry = AgentRegistry.global();
 	await ensurePersistedRoster(registry, sessionFile);
 	const subSessions = await collectSubSessions(sessionFile, {
@@ -108,7 +123,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 	 * nothing above it.
 	 */
 	const stoppedAtOrAbove = new Map<string, SubSession>();
-	const restored: string[] = [];
+	const relaunches: Relaunch[] = [];
 	for (const key of keys) {
 		const sub = subSessions[key]!;
 		// The selected branch, as the subagent's own session reopens it: entries on other branches
@@ -142,9 +157,31 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 			logger.debug("Interrupted subagent cannot be revived; not restored", { id });
 			continue;
 		}
+		relaunches.push({ key, sub, ref: { ...ref, sessionFile: ref.sessionFile }, init });
+	}
+	// Each parent's resumed turn learns which of its cut-off calls started a relaunched subagent before any
+	// relaunch starts, so a relaunched parent does not run that call again either.
+	const childrenOf = new Map<string | null, SubSession[]>();
+	for (const { sub } of relaunches) {
+		const siblings = childrenOf.get(sub.parent) ?? [];
+		siblings.push(sub);
+		childrenOf.set(sub.parent, siblings);
+	}
+	const relaunchedByCallOf = (parentKey: string | null): Record<string, string[]> => {
+		const children = childrenOf.get(parentKey);
+		if (!children) return {};
+		const parent = parentKey === null ? undefined : subSessions[parentKey];
+		const branch = parent
+			? activeBranch(parent.entries, parent.leafId)
+			: activeBranch(session.sessionManager.getEntries(), session.sessionManager.getLeafId());
+		return relaunchedByCutOffCall(branch, children);
+	};
+	for (const { key, sub, ref, init } of relaunches) {
+		const id = sub.agentId;
 		const sessionFileOfRef = ref.sessionFile;
 		const agentName = persistedAgentName(ref.displayName, init);
 		const structured = init.tools.includes("yield");
+		const restoreRelaunched = relaunchedByCallOf(key);
 		manager.register(
 			"task",
 			id,
@@ -154,6 +191,7 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 					agent: persistedAgentDefinition(ref.displayName, init),
 					message: init.task,
 					restore: true,
+					restoreRelaunched,
 					structured,
 					workPoolYieldItems: init.workPoolYieldItems,
 					outputSchema: init.outputSchema,
@@ -174,10 +212,72 @@ async function restoreSubagents(session: AgentSession, options: RestoreOptions):
 			},
 			{ id, agentId: id, ownerId: ref.parentId },
 		);
-		restored.push(id);
 	}
-	if (restored.length > 0) logger.info("Restored interrupted subagents", { ids: restored });
-	return restored;
+	const ids = relaunches.map(({ sub }) => sub.agentId);
+	if (ids.length > 0) logger.info("Restored interrupted subagents", { ids });
+	return { ids, relaunchedByCall: relaunchedByCallOf(null) };
+}
+
+/**
+ * The calls of a parent's cut-off batch that started subagents `--restore` relaunches, each with
+ * those subagents' ids. The batch is the last reply with tool calls on the parent's current
+ * conversation (`branch` selected, after its last `/clear`); a call started a subagent whose
+ * transcript began while the call ran: from its `tool_execution_start` marker to its result, or
+ * to the end when the process went away before the result. A call that never started started
+ * nothing. Calls that ran at once and both cover a spawn each count it: neither runs again.
+ */
+export function relaunchedByCutOffCall(
+	branch: readonly SessionEntry[],
+	relaunched: readonly SubSession[],
+): Record<string, string[]> {
+	let start = 0;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		if (branch[index]!.type === "reset_boundary") {
+			start = index + 1;
+			break;
+		}
+	}
+	const conversation = branch.slice(start);
+	let batchIndex = -1;
+	for (let index = conversation.length - 1; index >= 0; index--) {
+		const entry = conversation[index]!;
+		if (
+			entry.type === "message" &&
+			entry.message.role === "assistant" &&
+			entry.message.content.some(part => part.type === "toolCall")
+		) {
+			batchIndex = index;
+			break;
+		}
+	}
+	if (batchIndex < 0) return {};
+	const batch = conversation[batchIndex] as Extract<SessionEntry, { type: "message" }>;
+	const callIds = new Set<string>();
+	if (batch.message.role === "assistant") {
+		for (const part of batch.message.content) if (part.type === "toolCall") callIds.add(part.id);
+	}
+	const windows = new Map<string, { startedAt: number; endedAt: number }>();
+	for (const entry of conversation.slice(batchIndex + 1)) {
+		const marker = readToolExecutionStart(entry);
+		if (marker && callIds.has(marker.toolCallId) && !windows.has(marker.toolCallId)) {
+			windows.set(marker.toolCallId, { startedAt: Date.parse(marker.startedAt), endedAt: Number.POSITIVE_INFINITY });
+			continue;
+		}
+		if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
+		const window = windows.get(entry.message.toolCallId);
+		if (window && window.endedAt === Number.POSITIVE_INFINITY) window.endedAt = Date.parse(entry.timestamp);
+	}
+	const byCall: Record<string, string[]> = {};
+	for (const sub of relaunched) {
+		if (!sub.header) continue;
+		const spawnedAt = Date.parse(sub.header.timestamp);
+		if (!Number.isFinite(spawnedAt)) continue;
+		for (const [callId, window] of windows) {
+			if (!(spawnedAt >= window.startedAt && spawnedAt <= window.endedAt)) continue;
+			(byCall[callId] ??= []).push(sub.agentId);
+		}
+	}
+	return byCall;
 }
 
 /**

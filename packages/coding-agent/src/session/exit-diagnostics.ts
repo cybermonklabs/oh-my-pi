@@ -355,6 +355,18 @@ export function sessionExitFollowsLastMessage(entries: readonly SessionEntry[]):
 	return false;
 }
 
+/**
+ * The result text of a cut-off call `omp --restore` does not run again because restore
+ * relaunched the subagents it started (`relaunched`): the model reads that the work goes on
+ * and that each result comes as its own follow-up turn.
+ */
+export function restoreSkippedCallReason(relaunched: readonly string[]): string {
+	const names = relaunched.join(", ");
+	const subject = relaunched.length === 1 ? `Subagent ${names} it started` : `Subagents ${names} it started`;
+	const verb = relaunched.length === 1 ? "was" : "were";
+	return `This call was cut off when the previous process ended and is not run again: ${subject} ${verb} relaunched by --restore and go on with their work. Each result arrives as its own follow-up turn; do not start that work again.`;
+}
+
 /** Pairs unresolved calls at the end of an interrupted turn with result messages. */
 export function createInterruptedToolResults(
 	entries: readonly SessionEntry[],
@@ -436,7 +448,8 @@ export function summarizeToolArguments(args: unknown): ToolArgumentSummary | und
 	return summary.command !== undefined || summary.path !== undefined ? summary : undefined;
 }
 
-function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
+/** The `tool_execution_start` marker `entry` holds; undefined for any other entry. */
+export function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
 	if (entry.type !== "custom" || entry.customType !== TOOL_EXECUTION_START_CUSTOM_TYPE) return undefined;
 	const data = entry.data;
 	if (!isObject(data)) return undefined;

@@ -394,6 +394,7 @@ import {
 	hasRestorableTurn,
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
+	restoreSkippedCallReason,
 	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
@@ -1096,6 +1097,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#cancelExitRecorder?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
+	/**
+	 * Cut-off calls `restoreInterruptedTurn` does not run again, each with the subagents it
+	 * started that `omp --restore` relaunched; {@link #beforeToolCall} blocks each once. Cleared
+	 * when the continuation's run ends.
+	 */
+	#restoreSkippedCalls: Map<string, readonly string[]> | undefined;
 	/** Last observed `workspace.additionalDirectories`, diffed on change to add/remove only settings-seeded roots. */
 	#settingsWorkspaceDirectories: readonly string[] = [];
 	/** Last observed auto-QA gate; the system prompt advertises `xd://report_issue` only while it holds. */
@@ -5028,6 +5035,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			// The calls a restored turn skips are its first batch's; nothing later can repeat their ids.
+			this.#restoreSkippedCalls = undefined;
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -5829,6 +5838,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const relaunched = this.#restoreSkippedCalls?.get(ctx.toolCall.id);
+		if (relaunched) {
+			this.#restoreSkippedCalls?.delete(ctx.toolCall.id);
+			return { block: true, reason: restoreSkippedCallReason(relaunched) };
+		}
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -13467,15 +13481,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
 	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
 	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A turn that failed because no request could resolve its
-	 * provider key is retried the same way, even after a normal exit: nothing was
-	 * sent, and a worker that exits on it has nothing else to resume it. A turn
-	 * that finished, failed otherwise, or the user interrupted stays as it is.
+	 * transcript stops. A call in `options.relaunched` does not run again: it started
+	 * subagents restore relaunched, whose results come as follow-up turns, so running it
+	 * again would start that work twice; it gets a result that says so
+	 * ({@link restoreSkippedCallReason}), and the batch's other calls run again. A turn
+	 * that failed because no request could resolve its provider key is retried the same
+	 * way, even after a normal exit: nothing was sent, and a worker that exits on it has
+	 * nothing else to resume it. A turn that finished, failed otherwise, or the user
+	 * interrupted stays as it is.
 	 *
 	 * @returns whether a continuation was scheduled; false while a turn runs, without
 	 * a model, or with nothing left unfinished.
 	 */
-	async restoreInterruptedTurn(): Promise<boolean> {
+	async restoreInterruptedTurn(
+		options: { relaunched?: Readonly<Record<string, readonly string[]>> } = {},
+	): Promise<boolean> {
 		const branch = this.sessionManager.getBranch();
 		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
 		const model = this.model;
@@ -13490,7 +13510,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.sessionManager.appendMessage(abort);
 			this.replaceMessagesFromSessionContext(this.buildDisplaySessionContext().messages);
 		}
-		return this.retry();
+		const relaunched = Object.entries(options.relaunched ?? {}).filter(([, ids]) => ids.length > 0);
+		this.#restoreSkippedCalls = relaunched.length > 0 ? new Map(relaunched) : undefined;
+		const scheduled = await this.retry();
+		if (!scheduled) this.#restoreSkippedCalls = undefined;
+		return scheduled;
 	}
 
 	// =========================================================================

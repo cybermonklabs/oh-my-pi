@@ -2589,9 +2589,11 @@ async function driveSessionToResult(
 		onPromptBusy?: () => Promise<void>;
 		/** Go on with the interrupted turn instead of sending `task`, which only labels the run. */
 		restore?: boolean;
+		/** With {@link restore}: the cut-off calls not to run again, each with the subagents it started that restore relaunched. */
+		restoreRelaunched?: Readonly<Record<string, readonly string[]>>;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore } = options;
+	const { solutionSpace, onPromptBusy, restore, restoreRelaunched } = options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2681,7 +2683,7 @@ async function driveSessionToResult(
 			let promptAttempts = 0;
 			for (;;) {
 				try {
-					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
+					if (restore) await awaitAbortable(session.restoreInterruptedTurn({ relaunched: restoreRelaunched }));
 					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
 					break;
 				} catch (error) {
@@ -3854,6 +3856,11 @@ export interface FollowUpTurnOptions {
 	 * `message` (`omp --restore`: {@link AgentSession.restoreInterruptedTurn}).
 	 */
 	restore?: boolean;
+	/**
+	 * With {@link restore}: the cut-off calls of the interrupted turn that started subagents
+	 * `--restore` relaunched, each with their ids; the turn does not run those calls again.
+	 */
+	restoreRelaunched?: Readonly<Record<string, readonly string[]>>;
 	index?: number;
 	description?: string;
 	/** Explicit pre-expansion model role alias retained from the original run. */
@@ -4061,6 +4068,7 @@ async function driveFollowUpTurn(
 			outcome = await driveSessionToResult(session, monitor, message, {
 				structured,
 				restore: options.restore,
+				restoreRelaunched: options.restoreRelaunched,
 				onPromptBusy: async () => {
 					attemptUnsubscribe();
 					logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });

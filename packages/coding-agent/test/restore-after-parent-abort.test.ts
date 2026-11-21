@@ -316,6 +316,8 @@ async function restoreInNewProcess(
 	parentLeafId: string | null;
 	subagents: SubSession[];
 	delivered: string[];
+	/** The restored parent session's `restoreInterruptedTurn`, as `restoreSession` called it. */
+	restoreTurn: ReturnType<typeof vi.fn>;
 }> {
 	await Promise.allSettled(runs);
 	const parentFile = parent.sessionManager.getSessionFile();
@@ -342,11 +344,12 @@ async function restoreInNewProcess(
 		delivered.push(jobId);
 	});
 	vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(async options => subagentResult(options.id));
+	const restoreTurn = vi.fn(async (_options?: unknown) => false);
 	const outcome = await restoreSession({
 		sessionManager: { getSessionFile: () => parentFile, getEntries: () => parentEntries, getLeafId: () => leafId },
 		asyncJobManager: manager,
 		settings: Settings.isolated(),
-		restoreInterruptedTurn: vi.fn(async () => false),
+		restoreInterruptedTurn: restoreTurn,
 	} as unknown as AgentSession);
 	for (const id of outcome.subagents) await manager.getJob(id)?.promise;
 	await manager.drainDeliveries({ filter: { ownerId: MAIN_AGENT_ID } });
@@ -356,6 +359,7 @@ async function restoreInNewProcess(
 		parentLeafId: leafId,
 		subagents: Object.values(await collectSubSessions(parentFile)),
 		delivered,
+		restoreTurn,
 	};
 }
 
@@ -647,42 +651,51 @@ describe("omp --restore after the parent's abort reached a sync subagent its Jav
 		expect(outcome.subagents).toEqual(ids);
 	}, 30_000);
 
-	it("relaunches the subagent a SIGTERM to the parent cut off, restores the parent's turn and delivers the result to it", async () => {
-		// If this regresses, a signal's teardown aborts the parent's turn with the platform's own reason, so the turn
-		// ends on a plain abort instead of the interrupted-turn record: `omp --restore` does not continue it, and, once
-		// the resumed process wrote its eval runtime snapshot, it no longer relaunches the subagent the signal cut off.
-		// A pod release or restart ends every role this way; nobody chose that stop.
-		const { parent, runs } = await openParentWithKeyedWorkers("eval");
-		const backoff = holdBackoff(1);
-		const turn = parent.prompt("Delegate reading the notes from a script.");
-		await backoff.allHeld;
-		expect(runs).toHaveLength(1);
-		await parent.dispose({ reason: postmortem.Reason.SIGTERM });
-		await turn;
+	for (const [signal, reason] of [
+		["a SIGTERM", postmortem.Reason.SIGTERM],
+		["the process exit", postmortem.Reason.EXIT],
+	] as const) {
+		it(`relaunches the subagent ${signal} to the parent cut off, restores the parent's turn without running the cut-off call again, and delivers the result to it`, async () => {
+			// If this regresses, a signal's teardown aborts the parent's turn with the platform's own reason, so the turn
+			// ends on a plain abort instead of the interrupted-turn record: `omp --restore` does not continue it, and,
+			// once the resumed process wrote its eval runtime snapshot, it no longer relaunches the subagent the signal
+			// cut off; or the restored turn is not told that the cut-off call started the relaunched subagent, so it runs
+			// that call again and the work starts twice. A pod release or restart ends every role this way.
+			const { parent, runs } = await openParentWithKeyedWorkers("eval");
+			const backoff = holdBackoff(1);
+			const turn = parent.prompt("Delegate reading the notes from a script.");
+			await backoff.allHeld;
+			expect(runs).toHaveLength(1);
+			await parent.dispose({ reason });
+			await turn;
 
-		const { outcome, parentEntries, parentLeafId, subagents, delivered } = await restoreInNewProcess(
-			parent,
-			runs,
-			undefined,
-			// The resumed process writes its eval runtime snapshot as it starts, before `--restore` reads the transcript.
-			manager =>
-				manager.appendCustomMessageEntry(
-					EVAL_STATE_CONTEXT_TYPE,
-					"Eval runtime: no kernel.",
-					false,
-					undefined,
-					"agent",
-				),
-		);
-		backoff.wait.mockRestore();
+			const { outcome, parentEntries, parentLeafId, subagents, delivered, restoreTurn } = await restoreInNewProcess(
+				parent,
+				runs,
+				undefined,
+				// The resumed process writes its eval runtime snapshot as it starts, before `--restore` reads the transcript.
+				manager =>
+					manager.appendCustomMessageEntry(
+						EVAL_STATE_CONTEXT_TYPE,
+						"Eval runtime: no kernel.",
+						false,
+						undefined,
+						"agent",
+					),
+			);
+			backoff.wait.mockRestore();
 
-		const ids = subagents.map(sub => sub.agentId);
-		expect(ids).toHaveLength(1);
-		expect(subagents.map(turnEnd)).toEqual([{ stopReason: "error", credentialUnavailable: true, restorable: true }]);
-		expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(true);
-		expect(outcome.subagents).toEqual(ids);
-		expect(delivered).toEqual(ids);
-	}, 30_000);
+			const ids = subagents.map(sub => sub.agentId);
+			expect(ids).toHaveLength(1);
+			expect(subagents.map(turnEnd)).toEqual([
+				{ stopReason: "error", credentialUnavailable: true, restorable: true },
+			]);
+			expect(hasRestorableTurn(activeBranch(parentEntries, parentLeafId))).toBe(true);
+			expect(outcome.subagents).toEqual(ids);
+			expect(delivered).toEqual(ids);
+			expect(restoreTurn).toHaveBeenCalledWith({ relaunched: { [CELL_CALL.id]: ids } });
+		}, 30_000);
+	}
 
 	it("relaunches the subagent an abort that cut the parent's turn off left, as the worktree exit's does", async () => {
 		// If this regresses, the session's abort hands the eval cell no reason of the turn's, so the cell stops its
