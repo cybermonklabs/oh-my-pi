@@ -8,6 +8,7 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	filterProviderReplayMessages,
+	type ProviderContextRequest,
 	resolveTelemetry,
 	type StreamFn,
 	type ThinkingLevel,
@@ -4716,17 +4717,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// the main loop and every advisor get their own. Only the main loop
 		// journals its reminders in the session and asks the session's cut rule
 		// about its forced image drops: an advisor's history is not the session's.
+		// A side request (`buildSideRequestContext`) is no part of the history
+		// either: it reads the conversation's image drops and changes none.
 		const createTransformProviderContext = (
 			journal?: DateCwdReminderJournal,
 			imageClamp = new ProviderImageClamp(),
 		) => {
 			const dateCwdReminder = new DateCwdReminderInjector(journal);
-			return async (context: Context, transformModel: Model): Promise<Context> => {
+			const sideImageClamp = imageClamp.sideRequestClamp();
+			return async (context: Context, transformModel: Model, request?: ProviderContextRequest): Promise<Context> => {
+				const clamp = request?.sideRequest ? sideImageClamp : imageClamp;
 				let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 				// The archive was sized for the model active at the last context build; a model switch may have lowered the budget.
 				transformed = capArchiveFrameBytes(transformed, transformModel);
 				transformed = await snapcompactInline.transform(transformed, transformModel);
-				transformed = imageClamp.clampImageCount(transformed, transformModel);
+				transformed = clamp.clampImageCount(transformed, transformModel);
 				transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 				// After the model-specific normalizers: they carry better wording for the
 				// cases they own (STB WebP), so this stays the backstop for everything
@@ -4734,7 +4739,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				transformed = await dropUnreadableContextImages(transformed, transformModel);
 				transformed = await blobBroker.decorateContext(transformed, transformModel);
 				// Byte budget after decoration: URL/file-referenced images carry no inline bytes.
-				transformed = imageClamp.clampImageBytes(transformed, transformModel);
+				transformed = clamp.clampImageBytes(transformed, transformModel);
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
@@ -4746,7 +4751,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision. Each forced drop is kept on the branch, so a resumed
+		// as forced; asking it logs the decision. Each forced drop is kept in the session, so a resumed
 		// process drops the same images.
 		const mainImageClamp = new ProviderImageClamp(site => {
 			if (session) session.admitsProviderContextCut(providerContextCut(site));
@@ -5824,7 +5829,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					// The primary's chain, reminder placements and count-clamp image drops, so the capture matches its
-					// cached prompt; its byte-clamp drops stay its own and never ask the session's cut rule.
+					// cached prompt; a drop of its own (a forced count drop, its byte-clamp drops) stays its own, out of
+					// the session's record, and never asks the session's cut rule.
 					transformProviderContext: createTransformProviderContext(
 						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
 						mainImageClamp.sideRequestClamp(),

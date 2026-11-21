@@ -8,6 +8,7 @@
 - Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
 - Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop
 - Added `AgentLoopConfig.getMissingContextMessages` and `Agent.setMissingContextMessageProvider()`: asked before each model call with the call's context, the messages they return join that turn's input messages, emitted and recorded like the others
+- Added `ProviderContextRequest`: `Agent.buildSideRequestContext()` passes `{ sideRequest: true }` as the third argument of `transformProviderContext`, so a transform that keeps state for the conversation's requests can read it there and leave it as the loop's requests left it
 
 ### Fixed
 

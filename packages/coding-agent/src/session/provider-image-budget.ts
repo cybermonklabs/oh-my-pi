@@ -380,17 +380,20 @@ interface StickyImageDrop {
 /**
  * Conversations whose drops one clamp remembers, each by the turn that carried its oldest image at its first forced
  * drop: each compaction starts another, and a branch switch can go back to the history before it. The oldest is
- * forgotten first.
+ * forgotten first; a clamp with a record finds it there again.
  */
 const MAX_STICKY_IMAGE_CONVERSATIONS = 8;
 
 /** A forced image drop, with the context as the clamp received it and as it sends it. */
 export type ForcedImageDrop = (site: "image-count-clamp" | "image-byte-clamp", before: Context, after: Context) => void;
 
-/** Custom session entry holding a conversation's count-clamp drops as a forced drop left them. */
+/**
+ * Custom session entry holding a conversation's count-clamp drops as a forced drop left them, or as the last request of
+ * a transcript without such entries left them ({@link ProviderImageClamp}).
+ */
 const IMAGE_DROP_ENTRY_TYPE = "provider-image-drop";
 
-/** A conversation's count-clamp drops as a forced drop left them. */
+/** A conversation's count-clamp drops as a forced drop, or a transcript without a record, left them. */
 export interface RecordedImageDrop {
 	/** The turn ({@link turnOf}) that names the conversation. */
 	turn: string;
@@ -400,10 +403,13 @@ export interface RecordedImageDrop {
 	dropped: readonly string[];
 }
 
-/** Where a clamp keeps its conversations' forced drops beyond its process. */
+/** Where a clamp keeps its conversations' drops beyond its process. */
 export interface ImageDropRecord {
-	/** The drops recorded, oldest first. */
-	read(): Iterable<RecordedImageDrop>;
+	/**
+	 * The newest drop recorded for each turn that names a conversation ({@link RecordedImageDrop.turn}), on every
+	 * branch: the process that recorded them dropped the same images on every branch it went to.
+	 */
+	drops(): ReadonlyMap<string, RecordedImageDrop>;
 	write(drop: RecordedImageDrop): void;
 }
 
@@ -418,26 +424,35 @@ function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { versi
 }
 
 /**
- * The {@link ImageDropRecord} of the session `sessionManager` holds: an {@link IMAGE_DROP_ENTRY_TYPE} entry on its
- * branch at each forced drop, read back by a process that resumes it, the way the branch keeps its other state.
+ * The {@link ImageDropRecord} of the session `sessionManager` holds: an {@link IMAGE_DROP_ENTRY_TYPE} entry, on the
+ * branch current then, at each drop the clamp keeps. A process that resumes the session reads the entries of every
+ * branch, as the process that wrote them remembered them on every branch: a `/tree` move to a branch that went on from
+ * before a forced drop still drops that drop's images. They are read once for each session the manager holds (again
+ * after a switch to another one); the record's own writes keep them current.
  */
 export function sessionImageDropRecord(
-	sessionManager: Pick<SessionManager, "getBranchView" | "appendCustomEntry">,
+	sessionManager: Pick<SessionManager, "getEntries" | "getSessionId" | "appendCustomEntry">,
 ): ImageDropRecord {
-	return {
-		*read() {
-			for (const entry of sessionManager.getBranchView()) {
-				if (
-					entry.type === "custom" &&
-					entry.customType === IMAGE_DROP_ENTRY_TYPE &&
-					isRecordedImageDrop(entry.data)
-				) {
-					yield entry.data;
-				}
+	let session: string | undefined;
+	const drops = new Map<string, RecordedImageDrop>();
+	const read = (): ReadonlyMap<string, RecordedImageDrop> => {
+		const id = sessionManager.getSessionId();
+		if (id === session) return drops;
+		session = id;
+		drops.clear();
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === IMAGE_DROP_ENTRY_TYPE && isRecordedImageDrop(entry.data)) {
+				drops.set(entry.data.turn, entry.data);
 			}
-		},
+		}
+		return drops;
+	};
+	return {
+		drops: read,
 		write(drop) {
+			read();
 			sessionManager.appendCustomEntry(IMAGE_DROP_ENTRY_TYPE, { version: 1, ...drop });
+			drops.set(drop.turn, drop);
 		},
 	};
 }
@@ -462,10 +477,20 @@ export function sessionImageDropRecord(
  * turn's images. A compaction replaces that turn, so the history it leaves is another conversation whose drops are
  * recomputed from its own images; so are the drops of a model whose budget differs.
  *
- * Each forced drop is written to the clamp's record as well ({@link sessionImageDropRecord}: an entry on the
- * session's branch), and a conversation the clamp does not remember is looked up there once its images pass the
- * budget, so a process that resumes the session drops the images the previous one dropped instead of making another
- * forced drop of a different set.
+ * Each drop the clamp keeps is written to its record as well ({@link sessionImageDropRecord}: an entry on the
+ * session's branch current then), and a conversation the clamp does not remember is looked up there, among the drops
+ * of every branch, before its images are counted: a process that resumes the session drops the images the previous
+ * one dropped, on a branch that went on from before a forced drop and once a prune brought the images under the
+ * budget too, instead of sending them again or making another forced drop of a different set. A session that holds
+ * no record was written by a process that recorded none (the base release, whose clamp dropped in each request the
+ * oldest images past the budget, {@link clampProviderContextImages}): a conversation of it takes the drops that
+ * clamp made in its last request, the history before the newest reply of the same model, and keeps and records them,
+ * so the first request after the resume sends what that request sent. Where the session file lacks drops the clamp
+ * remembers (a branch copied into another file), the next request that uses them records them there.
+ *
+ * A side request ({@link sideRequestClamp}: a `/btw` question, a compaction summary, a handoff, an auto-learn
+ * capture) is no part of the conversation's history. It drops what the conversation drops, so its shared prefix
+ * reads the conversation's cache, but a forced drop it makes is its own: it remembers, records and reports nothing.
  *
  * The byte clamp ({@link clampProviderContextImageBytes}) keeps the newest user message and the newest image tool
  * result past the byte budget while they fit the body limit, and which messages those are moves with every turn: a
@@ -476,8 +501,10 @@ export function sessionImageDropRecord(
 export class ProviderImageClamp {
 	#drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
 	readonly #onForcedDrop: ForcedImageDrop | undefined;
-	/** Where each forced drop is kept for a later process; none keeps them in memory only. */
+	/** Where each drop the clamp keeps is kept for a later process; none keeps them in memory only. */
 	readonly #record: ImageDropRecord | undefined;
+	/** Whether the clamp serves side requests ({@link sideRequestClamp}): it reads the drops and changes none. */
+	#side = false;
 	/** Images the byte clamp evicted from the previous request. */
 	#byteDrops = 0;
 
@@ -487,39 +514,71 @@ export class ProviderImageClamp {
 	}
 
 	/**
-	 * A clamp for a side request of this conversation: it shares the count clamp's drops and their record, so it sends
-	 * the images this conversation sends, but it counts its own byte drops and reports no forced drop.
+	 * A clamp for a side request of this conversation: it reads the count clamp's drops and their record, so it sends
+	 * the images this conversation sends, but a side request is no part of the conversation's history, so it keeps
+	 * the drops of a forced drop to itself, counts its own byte drops and reports no forced drop.
 	 */
 	sideRequestClamp(): ProviderImageClamp {
 		const side = new ProviderImageClamp(undefined, this.#record);
 		side.#drops = this.#drops;
+		side.#side = true;
 		return side;
 	}
 
 	/**
-	 * The conversation `context` continues among those whose drops this clamp remembers: the one named by the oldest
-	 * turn `context` carries that names one, whether or not that turn still carries its images.
+	 * The conversation `context` continues among those whose drops this clamp remembers or its record holds (a
+	 * previous process's, on a resumed session): the one named by the oldest turn `context` carries that names one,
+	 * whether or not that turn still carries its images.
 	 */
 	#conversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
-		if (this.#drops.size === 0) return undefined;
-		const known = oldestKnownTurn(context, turn => this.#drops.get(turn));
+		const recorded = this.#record?.drops();
+		if (this.#drops.size === 0 && !recorded?.size) return undefined;
+		const known = oldestKnownTurn(context, turn => this.#drops.get(turn) ?? this.#adopt(turn, recorded?.get(turn)));
 		return known && { turn: known.turn, drop: known.value };
 	}
 
+	/** `recorded` as the clamp remembers drops, remembered from now on unless the clamp serves side requests. */
+	#adopt(turn: string, recorded: RecordedImageDrop | undefined): StickyImageDrop | undefined {
+		if (!recorded) return undefined;
+		const drop = { budget: recorded.budget, dropped: new Set(recorded.dropped) };
+		if (!this.#side) this.#drops.set(turn, drop);
+		return drop;
+	}
+
 	/**
-	 * The conversation `context` continues among those whose drops the record holds (a previous process's, on a
-	 * resumed session), found as {@link #conversationOf} finds one, and remembered from then on.
+	 * The drops of a conversation of a session that holds no record: a process that recorded none wrote it (the base
+	 * release, which dropped the oldest images past the budget in each request, {@link clampProviderContextImages}), so
+	 * its last request, the history before the newest reply, dropped the oldest of `names` past the budget. Undefined
+	 * where the clamp has no record, that request fit the budget, or another model gave the reply: its drops were for
+	 * another budget, and this model reads none of its cache.
 	 */
-	#recordedConversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
-		if (!this.#record) return undefined;
-		const recorded = new Map<string, RecordedImageDrop>();
-		for (const drop of this.#record.read()) recorded.set(drop.turn, drop);
-		if (recorded.size === 0) return undefined;
-		const known = oldestKnownTurn(context, turn => recorded.get(turn));
-		if (!known) return undefined;
-		const drop = { budget: known.value.budget, dropped: new Set(known.value.dropped) };
-		this.#drops.set(known.turn, drop);
-		return { turn: known.turn, drop };
+	#unrecordedDrops(
+		context: Context,
+		model: Model,
+		metadataWire: boolean,
+		budget: number,
+		names: readonly string[],
+	): Set<string> | undefined {
+		if (!this.#record || this.#record.drops().size > 0) return undefined;
+		const reply = context.messages.findLastIndex(message => message.role === "assistant");
+		const answered = context.messages[reply];
+		if (answered?.role !== "assistant" || answered.provider !== model.provider || answered.model !== model.id) {
+			return undefined;
+		}
+		let sent = 0;
+		for (let index = 0; index < reply; index++) sent += messageImageCount(context.messages[index], metadataWire);
+		return sent > budget ? new Set(names.slice(0, sent - budget)) : undefined;
+	}
+
+	/** Whether the record, where the clamp has one, holds `drop` for `turn`. */
+	#recordHolds(turn: string, drop: StickyImageDrop): boolean {
+		if (!this.#record) return true;
+		const recorded = this.#record.drops().get(turn);
+		return (
+			recorded?.budget === drop.budget &&
+			recorded.dropped.length === drop.dropped.size &&
+			recorded.dropped.every(name => drop.dropped.has(name))
+		);
 	}
 
 	/**
@@ -531,24 +590,20 @@ export class ProviderImageClamp {
 		if (!model.input.includes("image")) return context;
 		const metadataWire = sendsComputerScreenshotMetadata(model);
 		const budget = providerImageBudget(model);
-		// Whether the images pass the budget, where it was counted for a conversation the clamp does not remember.
-		let overBudget: boolean | undefined;
-		let conversation = this.#conversationOf(context);
-		if (!conversation) {
-			overBudget = countImages(context, metadataWire) > budget;
-			if (!overBudget) return context;
-			// A resumed conversation drops again what the previous process dropped.
-			conversation = this.#recordedConversationOf(context);
-		}
+		// Looked up before the images are counted: once a prune brought them under the budget, the drops still go.
+		const conversation = this.#conversationOf(context);
 		const state = conversation?.drop.budget === budget ? conversation.drop : undefined;
-		if (!state && !(overBudget ?? countImages(context, metadataWire) > budget)) return context;
-		const dropped = state?.dropped ?? new Set<string>();
+		if (!state && countImages(context, metadataWire) <= budget) return context;
 		const names = [...imageKeys(context, metadataWire)];
+		const inherited = conversation ? undefined : this.#unrecordedDrops(context, model, metadataWire, budget, names);
+		const known = state?.dropped ?? inherited ?? new Set<string>();
 		let sent = 0;
 		for (const name of names) {
-			if (!dropped.has(name)) sent++;
+			if (!known.has(name)) sent++;
 		}
 		const forced = sent > budget;
+		// A forced drop adds to a copy: the conversation's drops change only where the clamp keeps them.
+		const dropped = forced ? new Set(known) : known;
 		// A forced drop keeps half the budget, or as many of the newest message's images as the budget carries if more.
 		let excess = forced
 			? sent - Math.min(budget, Math.max(Math.ceil(budget / 2), newestMessageImageCount(context, metadataWire)))
@@ -563,14 +618,16 @@ export class ProviderImageClamp {
 			positions.push(position);
 		}
 		const clamped = dropImagesAt(context, model, metadataWire, positions);
-		if (forced) {
-			const turn = conversation?.turn ?? oldestImageTurn(context, metadataWire);
-			if (turn !== undefined) {
-				this.#drops.set(turn, { budget, dropped });
-				this.#record?.write({ turn, budget, dropped: [...dropped] });
-			}
-			this.#onForcedDrop?.("image-count-clamp", context, clamped);
+		// A side request's drops are its own.
+		if (this.#side) return clamped;
+		// The record holds the drops each of the conversation's requests leaves: a forced drop's, those a transcript
+		// without a record carried, and remembered ones the session file lacks (a branch copied into another one).
+		const turn = conversation?.turn ?? oldestImageTurn(context, metadataWire);
+		if (turn !== undefined && (forced || inherited || (state && !this.#recordHolds(turn, state)))) {
+			this.#drops.set(turn, { budget, dropped });
+			this.#record?.write({ turn, budget, dropped: [...dropped] });
 		}
+		if (forced) this.#onForcedDrop?.("image-count-clamp", context, clamped);
 		return clamped;
 	}
 

@@ -63,6 +63,7 @@ import type {
 	AsideBoundary,
 	AsideMessage,
 	PrepareQueuedMessages,
+	ProviderContextRequest,
 	QueuedMessageGate,
 	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
@@ -71,6 +72,9 @@ import type {
 	ToolChoiceDirective,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
+
+/** The request {@link Agent.buildSideRequestContext} passes its provider-context transform. */
+const SIDE_REQUEST: ProviderContextRequest = { sideRequest: true };
 
 /**
  * Default convertToLlm: Keep only LLM-compatible replay messages.
@@ -128,9 +132,14 @@ export interface AgentOptions {
 
 	/**
 	 * Optional transform applied after provider context assembly and before
-	 * telemetry capture/provider send.
+	 * telemetry capture/provider send. A side request ({@link Agent.buildSideRequestContext})
+	 * passes `{ sideRequest: true }`; the loop's own requests pass no `request`.
 	 */
-	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 
 	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
@@ -428,7 +437,11 @@ export class Agent {
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
 	/** What this Agent's previous main request sent per call; side requests leave it alone. */
 	#repeatedPerCallMessages = new RepeatedPerCallMessages();
@@ -972,7 +985,9 @@ export class Agent {
 	 * cache. Never touches the append-only log or the tool-choice queue. Owned/
 	 * in-band dialect sessions stay tools-less (matching their no-native-tools wire
 	 * shape and avoiding tool-markup leakage). `llmMessages` is already converted
-	 * (and, in production, obfuscated) by the caller.
+	 * (and, in production, obfuscated) by the caller. The provider-context transform
+	 * is told the request is a side request, so state it keeps for the conversation's
+	 * requests (image drops) stays as the loop's requests left it.
 	 *
 	 * `systemPrompt` defaults to the live agent prompt so the side request hits the
 	 * same cached prefix as the main loop. Callers that must pin a different prompt
@@ -998,7 +1013,9 @@ export class Agent {
 		// Side requests reuse the main loop's sent definitions without recording their own; attached before the
 		// transform too, so a request-size clamp in it measures them.
 		context = this.#sentToolDefinitions.withInactiveTools(context);
-		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
+		if (this.#transformProviderContext) {
+			context = await this.#transformProviderContext(context, model, SIDE_REQUEST);
+		}
 		context = this.#sentToolDefinitions.withInactiveTools(context);
 		return context;
 	}
