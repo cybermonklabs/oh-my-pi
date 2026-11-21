@@ -267,14 +267,29 @@ fn apply(w: &Path, tweak: &str) {
 			write_file(&j("dst/big-1.bin"), &big, 0o644, OLD, 0);
 		}
 		// A destination symlink to a directory inside the destination (`-K`).
+		// The directory has src/sub's mode, so `-a` has no mode to set through
+		// the symlink whatever a new directory gets from the umask or a setgid
+		// parent (which would make the reference fail the chmod, below).
 		"keepdir" => {
 			fs::create_dir_all(j("dst/realsub")).unwrap();
+			chmod(&j("dst/realsub"), 0o755);
 			symlink("realsub", j("dst/sub")).unwrap();
 			set_time(&j("dst/sub"), OLD, 0);
 		}
-		// A destination symlink to a directory outside the destination.
+		// The same with a mode unlike src/sub's: `-a` sets the mode of a
+		// directory whose name is a symlink, which the reference refuses with
+		// ELOOP (exit 23) whatever a no-follow chmod of a symlink answers.
+		"keepdir_perms" => {
+			fs::create_dir_all(j("dst/realsub")).unwrap();
+			chmod(&j("dst/realsub"), 0o700);
+			symlink("realsub", j("dst/sub")).unwrap();
+			set_time(&j("dst/sub"), OLD, 0);
+		}
+		// A destination symlink to a directory outside the destination, with
+		// src/sub's mode (see `keepdir`).
 		"keepdir_out" => {
 			fs::create_dir_all(j("elsewhere")).unwrap();
+			chmod(&j("elsewhere"), 0o755);
 			fs::create_dir_all(j("dst")).unwrap();
 			symlink("../elsewhere", j("dst/sub")).unwrap();
 			set_time(&j("dst/sub"), OLD, 0);

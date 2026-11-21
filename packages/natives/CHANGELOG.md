@@ -46,6 +46,7 @@
 ### Changed
 
 - A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
+- Fixed the bash tool's built-in `rsync -K` (`--keep-dirlinks`) reporting `Operation not supported (95)` where rsync 3.5.1 reports `Too many levels of symbolic links (40)`: when the destination name of a directory is a symlink to a directory and the modes differ, rsync refuses to set the mode through the symlink with `ELOOP` (exit 23), and the built-in now refuses it the same way. A symlink's own mode is still set with lchmod where the platform can
 
 ## [18.18.6] - 2026-11-09
 
