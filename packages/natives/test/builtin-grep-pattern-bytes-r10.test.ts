@@ -272,6 +272,47 @@ describe("builtin grep: -w beside a byte that is not UTF-8, in the C.UTF-8 local
 		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -ow 'a\|ab'`, "ab\n", 0],
 		[String.raw`printf 'a\177b\377\n' | LC_ALL=C.UTF-8 grep -cw 'a.b'`, "1\n", 0],
 		[String.raw`printf 'a\377\0' | LC_ALL=C.UTF-8 grep -zcw a`, "1\n", 0],
+		// Regressed: the alternative holding a pattern byte, which matches the byte in the line
+		// alone, was not printed, the shorter one in its stead.
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -aow $'a\\|a\377'`, "a\xff\n", 0],
+		[String.raw`printf 'ab\377 c\n' | LC_ALL=C.UTF-8 grep -aow $'ab\\|ab\377'`, "ab\xff\n", 0],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -aow $'a\377\\|a'`, "a\xff\n", 0],
+		// Already GNU's answer, kept.
+		[String.raw`printf 'x \377a b\n' | LC_ALL=C.UTF-8 grep -aow $'\377a'`, "\xffa\n", 0],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -acw $'a\377\\|zz'`, "1\n", 0],
+		[String.raw`printf 'a\377 b\n' | LC_ALL=C.UTF-8 grep -ao $'a\\|a\377'`, "a\xff\n", 0],
+	]);
+});
+
+describe("builtin grep: a word assertion beside a byte that is not UTF-8, in the C.UTF-8 locale", () => {
+	// GNU grep 3.11 reads `\<`, `\>`, `\b` and `\B` with its regex matcher,
+	// which takes such a byte for the character of its value: a word
+	// character where that is a letter (0xFF is `ÿ`, 0xAA `ª`), else not
+	// (0x80, 0xB2 `²`). Nothing else matches the byte.
+	cases([
+		// Regressed: the byte was no word character to the assertions.
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c 'b\>\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c 'b\B\|\(x\)\1'`, "1\n", 0],
+		[String.raw`printf '\377ab\n' | LC_ALL=C.UTF-8 grep -c '\<a\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -cE 'b\>|(x)\1'`, "0\n", 1],
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
+		[String.raw`printf '\377ab\n' | LC_ALL=C.UTF-8 grep -c '\<a'`, "0\n", 1],
+		[String.raw`printf 'a\252 b\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
+		[String.raw`printf 'a\377_\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "0\n", 1],
+		[String.raw`printf 'a\377\0' | LC_ALL=C.UTF-8 grep -zc 'a\>'`, "0\n", 1],
+		[String.raw`printf 'A\377\n' | LC_ALL=C.UTF-8 grep -ic 'a\>'`, "0\n", 1],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -cE 'b\b'`, "0\n", 1],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c 'b\w*\>'`, "0\n", 1],
+		[String.raw`printf '\377\n' | LC_ALL=C.UTF-8 grep -c '\<'`, "1\n", 0],
+		[String.raw`printf 'a\377b c\n' | LC_ALL=C.UTF-8 grep -ao '\<[a-z]\>'`, "c\n", 0],
+		// Regressed: the `regex` crate read 0x80 as part of the `a` before it.
+		[String.raw`printf 'a\200b c\n' | LC_ALL=C.UTF-8 grep -ao '\<[a-z]\>'`, "a\nb\nc\n", 0],
+		// Already GNU's answer, kept: a byte whose character is no letter, and `.`.
+		[String.raw`printf 'ab\200\n' | LC_ALL=C.UTF-8 grep -c 'b\>\|\(x\)\1'`, "1\n", 0],
+		[String.raw`printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c 'b.\|\(x\)\1'`, "0\n", 1],
+		[String.raw`printf '\200ab\n' | LC_ALL=C.UTF-8 grep -c '\<a'`, "1\n", 0],
+		[String.raw`printf 'a\262 b\n' | LC_ALL=C.UTF-8 grep -c 'a\>'`, "1\n", 0],
+		[String.raw`printf '\200\n' | LC_ALL=C.UTF-8 grep -c '\<'`, "0\n", 1],
 	]);
 });
 

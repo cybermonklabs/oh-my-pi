@@ -517,6 +517,13 @@ describe("builtin sed: `y` reads its strings by the locale", () => {
 			error(char(11), "strings for `y' command are different lengths"),
 			1,
 		],
+		// So it is beside a target that is a byte. Regressed: U+10FF80 was written as the byte
+		// 0x80, and a source byte mapped to it was kept.
+		[String.raw`printf 'ab\n' | LC_ALL=C.UTF-8 sed $'y/ab/\\xe9\364\217\276\200/'`, "\xe9\xf4\x8f\xbe\x80\n", 0],
+		[String.raw`printf 'ab\n' | LC_ALL=C.UTF-8 sed $'y/ab/\364\217\276\200\\xff/'`, "\xf4\x8f\xbe\x80\xff\n", 0],
+		[String.raw`printf 'x\200\n' | LC_ALL=C.UTF-8 sed $'y/\\x80/\364\217\276\200/'`, "x\xf4\x8f\xbe\x80\n", 0],
+		// Already GNU's answer, kept.
+		[String.raw`printf 'a\377\n' | LC_ALL=C.UTF-8 sed $'y/a\\xff/\\xffa/'`, "\xffa\n", 0],
 	]);
 });
 
