@@ -941,10 +941,11 @@ export async function visitEntriesFromFile(
 	await visitSessionFile(filePath, storage, visit, { throwIfMissing: true });
 }
 
-/** A persisted blob reference and the field that holds it. */
+/** A persisted blob reference and the place that holds it. */
 interface BlobRefSite {
-	holder: Record<string, unknown>;
-	key: string;
+	/** The object whose field `key` holds the reference, or the array whose element `key` holds it. */
+	holder: Record<string, unknown> | unknown[];
+	key: string | number;
 	ref: string;
 	/** Provider image URLs persist the whole data URL; image payloads persist bare base64. */
 	asDataUrl: boolean;
@@ -953,12 +954,21 @@ interface BlobRefSite {
 /**
  * Collect the blob references in `value`, a node under `key` of its holder,
  * and below it, wherever persistence externalizes an image and a load resolves
- * it ({@link resolvedImageSiteOf}). An array's elements sit under the array's
- * key. Snapcompact frames stay as references until context rebuilding selects them.
+ * it ({@link resolvedImageSiteOf}). An array's elements, a string one too, sit
+ * under the array's key. Snapcompact frames stay as references until context
+ * rebuilding selects them.
  */
 function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string): void {
 	if (Array.isArray(value)) {
-		for (const item of value) collectBlobRefSites(item, sites, key);
+		for (let index = 0; index < value.length; index++) {
+			const item: unknown = value[index];
+			if (typeof item !== "string") {
+				collectBlobRefSites(item, sites, key);
+			} else if (resolvedImageSiteOf(item, key) !== undefined && isBlobRef(item)) {
+				// A provider image's URL listed under `image_url`: its blob holds the whole data URL.
+				sites.push({ holder: value, key: index, ref: item, asDataUrl: true });
+			}
+		}
 		return;
 	}
 
@@ -1042,7 +1052,7 @@ function addBlobRefNames(values: readonly unknown[], into: Map<string, string | 
 	for (const site of blobRefSites(values)) {
 		const hash = parseBlobRef(site.ref);
 		if (!hash || into.has(hash)) continue;
-		const mimeType = site.holder.mimeType;
+		const mimeType = Array.isArray(site.holder) ? undefined : site.holder.mimeType;
 		into.set(hash, typeof mimeType === "string" ? mimeType : undefined);
 	}
 }
@@ -1075,7 +1085,7 @@ async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore)
 				})();
 				resolved.set(key, data);
 			}
-			site.holder[site.key] = await data;
+			Reflect.set(site.holder, site.key, await data);
 		}),
 	);
 }
@@ -1312,7 +1322,7 @@ export function resolveBlobRefsInEntriesSync(
 				: resolveImageDataSync(blobStore, site.ref);
 			resolved.set(key, data);
 		}
-		site.holder[site.key] = data;
+		Reflect.set(site.holder, site.key, data);
 		if (containsBlobRef(data)) unresolved = true;
 	}
 	if (!unresolved || !blobStore.tier) return;

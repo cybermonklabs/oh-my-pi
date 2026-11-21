@@ -40,11 +40,11 @@
  *   where persistence externalizes the image and a load resolves it, by the rule both use
  *   ({@link resolvedImageSiteOf}). In every entry, the `data` of a `content` image block or an
  *   `images` image. In a cold entry's record ({@link MaskedForm} `record`) also the `result` of a
- *   generated image (`image_generation_call`) and an `image_url`, and an array nested in an array
- *   sits under the outer array's key: the record holds the reference there where the live entry
- *   holds the data a load resolved, so the store gets the same bytes cold or whole. A snapcompact
- *   frame's `data`, which a load leaves as a reference, any other blob reference in free content,
- *   and image data that is no blob reference, are masked.
+ *   generated image (`image_generation_call`) and an `image_url`, a string in a list under it too,
+ *   and an array nested in an array sits under the outer array's key: the record holds the
+ *   reference there where the live entry holds the data a load resolved, so the store gets the
+ *   same bytes cold or whole. A snapcompact frame's `data`, which a load leaves as a reference, any
+ *   other blob reference in free content, and image data that is no blob reference, are masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
 import { countNewlines, isRecord, stringifyJson, tryParseJson } from "@oh-my-pi/pi-utils";
@@ -738,8 +738,9 @@ function maskChild(value: Record<string, unknown>, walk: MaskWalk, at: Position)
 /**
  * `items`, an array in its stored form under `arrayKey` of its holder, masked: with `at`, each
  * plain-object element at `at`; with `keepStrings`, each primitive-string element kept; every other
- * element free content, a plain object ({@link maskFreeObject}) under `arrayKey`, and in a cold
- * entry's record a nested array too.
+ * element free content. A plain object ({@link maskFreeObject}), a string (KR14: an image URL's
+ * blob reference, {@link keptImageSite}) and, in a cold entry's record, a nested array sit under
+ * `arrayKey`.
  */
 function maskArray(
 	items: unknown[],
@@ -754,7 +755,7 @@ function maskArray(
 		const item = items[i];
 		let next: unknown;
 		if (typeof item === "string") {
-			next = keepStrings ? item : walk.text(item);
+			next = keepStrings || keptImageSite(item, arrayKey, walk) !== undefined ? item : walk.text(item);
 		} else if (at !== undefined && isPlainObject(item)) {
 			const before = walk.replacements;
 			next = maskChild(item, walk, at);
@@ -807,14 +808,15 @@ function maskFreeObject(obj: Record<string, unknown>, walk: MaskWalk, key: strin
 }
 
 /**
- * KR14: the site of the image `value`, free content under `key` of its holder, holds as a blob
- * reference where a load resolves it ({@link resolvedImageSiteOf}), or `undefined`: `data` or
- * `result`, a field of `value`, or `image_url`, `value` itself. In a cold entry's record every such
- * site counts: there the reference is what persistence wrote for the image, where the live entry
- * holds base64 or a data URL. In a live entry only `data` of a `content` image block or an `images`
- * image counts; a free `image_url` or generated image holds the data a load resolved there. A
- * snapcompact frame, which a load leaves as a reference, and a blob reference anywhere else hold no
- * image a load reads: they are masked as the out-of-position cases of KR7-KR9 mask them.
+ * KR14: the site of the image `value`, free content under `key` of its holder (an array element
+ * under its array's key), holds as a blob reference where a load resolves it
+ * ({@link resolvedImageSiteOf}), or `undefined`: `data` or `result`, a field of `value`, or
+ * `image_url`, `value` itself. In a cold entry's record every such site counts: there the reference
+ * is what persistence wrote for the image, where the live entry holds base64 or a data URL. In a
+ * live entry only `data` of a `content` image block or an `images` image counts; a free
+ * `image_url` or generated image holds the data a load resolved there. A snapcompact frame, which a
+ * load leaves as a reference, and a blob reference anywhere else hold no image a load reads: they
+ * are masked as the out-of-position cases of KR7-KR9 mask them.
  */
 function keptImageSite(value: unknown, key: string | number, walk: MaskWalk): ImageSite | undefined {
 	const site = typeof key === "string" ? resolvedImageSiteOf(value, key) : undefined;
