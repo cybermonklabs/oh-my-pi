@@ -1856,9 +1856,11 @@ mod tests {
 
 	/// Between two external stages a tapped pipe stays in memory, pumped, so
 	/// the tap and the run's trace see every byte in order. On Linux (the
-	/// probe reads `/proc`, and only Linux shares the pipe), the stages of a
-	/// tapped pipe each have a pipe of their own to the shell, and an
-	/// untapped pipe between the same stages is one OS pipe.
+	/// probe reads `/proc`) and macOS (it `stat`s each stage's end), the
+	/// stages of a tapped pipe each have a pipe of their own to the shell, and
+	/// an untapped pipe between the same stages is one OS pipe. On macOS the
+	/// two ends of an anonymous pipe `stat` as two inodes, so there the probe
+	/// sees one pipe only in the shell's FIFO, which is what it checks.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_tapped_pipe_between_externals_mirrors_every_byte_and_an_untapped_one_is_shared() {
 		#[derive(Default)]
@@ -1885,11 +1887,19 @@ mod tests {
 				self.0.lock().1 = true;
 			}
 		}
+		#[cfg(not(target_os = "macos"))]
 		const ONE_PIPE: &str = "w=$(/bin/mktemp -d); /bin/sh -c 'x=$(readlink /proc/$$/fd/1); \
 		                        printf \"%s\\n\" \"$x\" > \"$1/w\"' sh \"$w\" | /bin/sh -c \
 		                        'x=$(readlink /proc/$$/fd/0); printf \"%s\\n\" \"$x\" > \"$1/r\"' \
 		                        sh \"$w\"; if [ \"$(/bin/cat \"$w/w\")\" = \"$(/bin/cat \"$w/r\")\" \
 		                        ]; then echo one-pipe; else echo two-pipes; fi; /bin/rm -rf \"$w\"";
+		#[cfg(target_os = "macos")]
+		const ONE_PIPE: &str = "w=$(/usr/bin/mktemp -d); /bin/sh -c 'exec 3>&1; x=$(/usr/bin/stat \
+		                        -L -f %d:%i /dev/fd/3); printf \"%s\\n\" \"$x\" > \"$1/w\"' sh \
+		                        \"$w\" | /bin/sh -c 'exec 3<&0; x=$(/usr/bin/stat -L -f %d:%i \
+		                        /dev/fd/3); printf \"%s\\n\" \"$x\" > \"$1/r\"' sh \"$w\"; if [ \
+		                        \"$(/bin/cat \"$w/w\")\" = \"$(/bin/cat \"$w/r\")\" ]; then echo \
+		                        one-pipe; else echo two-pipes; fi; /bin/rm -rf \"$w\"";
 		// awk, not wc, whose count BSD pads with spaces.
 		const SEQ: &str = "/usr/bin/seq 1 20000 | /usr/bin/awk 'END { print NR }'";
 		let seq: String = (1..=20000).map(|n| n.to_string() + "\n").collect();
@@ -1914,7 +1924,7 @@ mod tests {
 			assert!(bytes.as_slice() == seq.as_bytes() && *closed, "the tap saw every byte in order");
 		}
 		assert_eq!(trace_output(&trace.snapshot()), c.stdout);
-		if cfg!(target_os = "linux") {
+		if cfg!(any(target_os = "linux", target_os = "macos")) {
 			let trace = Arc::new(crate::bash::trace::RunTrace::new(ONE_PIPE));
 			let c = capture(&mut s, tapped(ONE_PIPE, &Arc::new(Taps::default()), &trace)).await;
 			assert_eq!(c.stdout, "two-pipes\n", "a tapped pipe stays in memory");

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- On Linux, two external commands joined by a pipe in the bash and zsh shells (`a | b`) now share one OS pipe, as they do under bash and zsh: they keep exchanging output when the shell itself dies, and the bytes no longer pass through the shell's process. A pipe the bash tool mirrors as a pipe stream still runs through the shell, and so does every pipe on a Linux host without `/proc` mounted. On macOS and Windows the pipe between external commands is still the shell's in-process pipe, pumped through the shell, so those commands still lose output when the shell dies; a separate change fixes that.
+- Two external commands joined by a pipe in the bash and zsh shells (`a | b`) now share one OS pipe on Linux, macOS and Windows, as they do under bash and zsh: they keep exchanging output when the shell itself dies, and the bytes no longer pass through the shell's process. A pipe the bash tool mirrors as a pipe stream still runs through the shell, and so does every pipe on a Linux host without `/proc` mounted, on a macOS host whose temporary directory cannot hold a FIFO, and on the BSDs.
 
 ## [18.18.6] - 2026-11-09
 

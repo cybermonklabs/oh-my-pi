@@ -2,48 +2,64 @@
 //! its ends ([`Host::os_pipe`](crate::bash::Host::os_pipe)), so two external
 //! stages share one kernel pipe, as bash's and zsh's do.
 //!
-//! Linux only. The pipe's two descriptors are ordinary blocking ones, and the
-//! externals inherit them. The shell never reads or writes through them: when
-//! the pipe is made it reopens each end once through `/proc/self/fd/N`, which
-//! makes a new open file description of the same pipe, and sets that one
-//! non-blocking. Every engine handle of an end shares that description. A
-//! stage of shell code then takes what the pipe holds or has room for and is
-//! woken by the readiness thread for the rest, never waiting in the kernel,
-//! while the descriptions the externals share stay blocking (`O_NONBLOCK`
-//! belongs to the description). All the tasks waiting on an end (the
-//! engine's vprocs, which share one waker, an extra's fd, a host feed) share
-//! one readiness wait, which wakes them all once the end is ready, as the
-//! memory pipe wakes all its waiters; a waiting task is only ever forgotten
-//! by waking it.
+//! Linux and macOS: the pipe's two descriptors are ordinary blocking ones, and
+//! the externals inherit them. The shell never reads or writes through them:
+//! when the pipe is made it opens a second, non-blocking open file
+//! description of each end, and every engine handle of an end shares that
+//! description. A stage of shell code then takes what the pipe holds or has
+//! room for and is woken by the readiness thread for the rest, never waiting
+//! in the kernel, while the descriptions the externals share stay blocking
+//! (`O_NONBLOCK` belongs to the description). All the tasks waiting on an end
+//! (the engine's vprocs, which share one waker, an extra's fd, a host feed)
+//! share one readiness wait, which wakes them all once the end is ready, as
+//! the memory pipe wakes all its waiters; a waiting task is only ever
+//! forgotten by waking it.
 //!
-//! Where the private ends cannot be opened (no `/proc` mounted) no OS pipe is
-//! made, and the memory pipe stays, pumped.
+//! - Linux: an anonymous pipe, whose ends are reopened once through
+//!   `/proc/self/fd/N`. Where they cannot be (no `/proc` mounted) no OS pipe is
+//!   made, and the memory pipe stays, pumped.
+//! - macOS: `/dev/fd/N` there duplicates the descriptor and shares its
+//!   description, so the pipe is a FIFO, made in a private directory under the
+//!   temporary directory and opened twice per end (the externals' blocking
+//!   descriptions and the shell's non-blocking ones), then unlinked with its
+//!   directory before anyone gets an end. Where it cannot be made, the memory
+//!   pipe stays. The shell's write description has `F_SETNOSIGPIPE`, as macOS
+//!   sends a write's `SIGPIPE` to the whole process.
+//! - Windows: see [`windows`].
 //!
-//! Elsewhere there is no such private description: macOS's `/dev/fd/N` and the
-//! BSDs' duplicate the descriptor and share its description, and Windows'
-//! anonymous pipes cannot be polled. Those hosts keep the memory pipe, which
-//! their pumps connect to each external: the stages then exchange bytes
-//! through the shell's process, and lose them when it dies.
+//! Elsewhere (the BSDs) there is no such private description: those hosts
+//! keep the memory pipe, which their pumps connect to each external. The
+//! stages then exchange bytes through the shell's process, and lose them when
+//! it dies.
 
 use crate::bash::File;
+
+#[cfg(windows)]
+mod windows;
 
 /// A new OS pipe already holding `prefill`: `(read, write)`.
 ///
 /// See [`Host::os_pipe`](crate::bash::Host::os_pipe) for what the two ends
 /// give. `None` when the pipe cannot be made, a private end cannot be opened,
 /// or `prefill` does not fit in it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 	imp::os_pipe(prefill)
 }
 
+/// A new OS pipe already holding `prefill` (see [`windows`]).
+#[cfg(windows)]
+pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
+	windows::os_pipe(prefill)
+}
+
 /// No OS pipe here (see the module docs): the memory pipe stays.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
 pub fn os_pipe(_prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 	None
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 mod imp {
 	use std::{
 		fs,
@@ -62,12 +78,19 @@ mod imp {
 		sys::ready,
 	};
 
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
 		os_pipe_with(prefill, private)
 	}
 
+	#[cfg(target_os = "macos")]
+	pub fn os_pipe(prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
+		fifo_pipe(&std::env::temp_dir(), prefill)
+	}
+
 	/// [`os_pipe`] with the opener of private ends given, so a test can refuse
 	/// them.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn os_pipe_with(
 		prefill: &[u8],
 		open: impl Fn(RawFd, bool) -> io::Result<fs::File>,
@@ -94,8 +117,101 @@ mod imp {
 		Some((Box::new(Shared { file: r, own: reads }), Box::new(Shared { file: w, own: writes })))
 	}
 
+	/// macOS: the pipe is a FIFO made in a private directory under `tmp`
+	/// (see the module docs). `None` when it cannot be made or opened, or
+	/// `prefill` does not fit in it (a FIFO holds 8 KiB there).
+	#[cfg(target_os = "macos")]
+	fn fifo_pipe(tmp: &std::path::Path, prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
+		let [ours_read, ours_write, theirs_read, theirs_write] = fifo_descriptions(tmp).ok()?;
+		// SAFETY: fcntl on a descriptor we own; the flag is its
+		// description's, which only the shell's ends share.
+		if unsafe { libc::fcntl(ours_write.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) } < 0 {
+			return None;
+		}
+		// The only reader is ours, so a write that does not fit would wait
+		// forever: the private end takes what fits, and anything left over
+		// means this pipe cannot hold what the memory pipe had.
+		let mut done = 0;
+		while done < prefill.len() {
+			match (&ours_write).write(&prefill[done..]) {
+				Ok(n) if n > 0 => done += n,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+				_ => return None,
+			}
+		}
+		let reads = Private::new(ours_read, false);
+		let writes = Private::new(ours_write, true);
+		Some((
+			Box::new(Shared { file: theirs_read, own: reads }),
+			Box::new(Shared { file: theirs_write, own: writes }),
+		))
+	}
+
+	/// Four open file descriptions of a new FIFO: the shell's non-blocking
+	/// read and write ones, then the externals' blocking read and write ones.
+	/// The FIFO and its directory (mode 0700, under `tmp`) are removed before
+	/// this returns, whatever the outcome; the pipe lives on in its open
+	/// descriptions, all close-on-exec.
+	#[cfg(target_os = "macos")]
+	fn fifo_descriptions(tmp: &std::path::Path) -> io::Result<[fs::File; 4]> {
+		use std::{
+			ffi::{CString, OsString},
+			os::unix::ffi::{OsStrExt, OsStringExt},
+			path::PathBuf,
+		};
+		let template = CString::new(tmp.join("obash-pipe.XXXXXX").as_os_str().as_bytes())?;
+		let mut name = template.into_bytes_with_nul();
+		// SAFETY: `name` is a NUL-terminated template that `mkdtemp` fills in
+		// place.
+		if unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null() {
+			return Err(io::Error::last_os_error());
+		}
+		name.pop();
+		let dir = PathBuf::from(OsString::from_vec(name));
+		let fifo = dir.join("pipe");
+		let opened = (|| {
+			let path = CString::new(fifo.as_os_str().as_bytes())?;
+			// SAFETY: a NUL-terminated path.
+			if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } < 0 {
+				return Err(io::Error::last_os_error());
+			}
+			let open = |write: bool| {
+				fs::OpenOptions::new()
+					.read(!write)
+					.write(write)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&fifo)
+			};
+			// The shell's read end first: a FIFO's non-blocking read open
+			// needs no writer, and every write open after it finds a reader
+			// (one with none fails with `ENXIO`).
+			let ours_read = open(false)?;
+			let ours_write = open(true)?;
+			let theirs_read = blocking(open(false)?)?;
+			let theirs_write = blocking(open(true)?)?;
+			Ok([ours_read, ours_write, theirs_read, theirs_write])
+		})();
+		let _ = fs::remove_file(&fifo);
+		let _ = fs::remove_dir(&dir);
+		opened
+	}
+
+	/// `file` with `O_NONBLOCK` cleared on its description.
+	#[cfg(target_os = "macos")]
+	fn blocking(file: fs::File) -> io::Result<fs::File> {
+		let fd = file.as_raw_fd();
+		// SAFETY: fcntl on a descriptor we own, of a description only it has.
+		let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+		// SAFETY: as above.
+		if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(file)
+	}
+
 	/// The `revents` of `fd` for `events` right now (`poll(2)`, zero
 	/// timeout); `POLLERR` and `POLLHUP` come whatever `events` asks.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn revents(fd: RawFd, events: i16) -> io::Result<i16> {
 		let mut p = libc::pollfd { fd, events, revents: 0 };
 		loop {
@@ -111,6 +227,28 @@ mod imp {
 		}
 	}
 
+	/// The `revents` of `fd` for `events` right now. macOS `poll(2)` reports
+	/// neither a FIFO's end of file nor a gone reader (measured), so readiness
+	/// is `select(2)`'s ([`ready::now`]), and an empty `write(2)` tells a gone
+	/// reader (`POLLERR`): on the shell's write description, which has
+	/// `F_SETNOSIGPIPE`, it fails with `EPIPE` and raises no signal.
+	#[cfg(target_os = "macos")]
+	fn revents(fd: RawFd, events: i16) -> io::Result<i16> {
+		if events == ready::WRITE {
+			// SAFETY: a write of no bytes from no buffer.
+			if unsafe { libc::write(fd, ptr::null(), 0) } < 0 {
+				let e = io::Error::last_os_error();
+				if e.raw_os_error() == Some(libc::EPIPE) {
+					return Ok(libc::POLLERR);
+				}
+				if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+					return Err(e);
+				}
+			}
+		}
+		Ok(if ready::now(fd, events)? { events } else { 0 })
+	}
+
 	/// `write(2)` of `buf` to `file`, reporting a pipe whose readers are all
 	/// gone as `BrokenPipe` without raising `SIGPIPE`. The engine turns the
 	/// error into the writing stage's own `SIGPIPE` (status 141), as bash's
@@ -118,6 +256,7 @@ mod imp {
 	/// end the whole shell, whose process the stage shares. `SIGPIPE` is
 	/// blocked in this thread for the write, and the one an `EPIPE` raised is
 	/// taken back unless one was already pending.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn write_quietly(mut file: &fs::File, buf: &[u8]) -> io::Result<usize> {
 		// SAFETY: the sets are valid, zero-initialised `sigset_t`s filled by
 		// the libc calls; the mask is restored before returning.
@@ -147,11 +286,22 @@ mod imp {
 		}
 	}
 
+	/// `write(2)` of `buf` to `file`, the shell's write description, which has
+	/// `F_SETNOSIGPIPE` ([`fifo_pipe`]): a pipe whose readers are all gone
+	/// reports `EPIPE` (`BrokenPipe`) and raises no `SIGPIPE`, which macOS
+	/// would send to the whole process. The engine turns the error into the
+	/// writing stage's own `SIGPIPE` (status 141).
+	#[cfg(target_os = "macos")]
+	fn write_quietly(mut file: &fs::File, buf: &[u8]) -> io::Result<usize> {
+		file.write(buf)
+	}
+
 	/// A new open file description of the pipe end `fd`, non-blocking and
 	/// close-on-exec. Linux opens an anonymous pipe's write end even when no
 	/// reader holds the pipe (its first write then fails with `EPIPE`); a
 	/// kernel that refuses that open with `ENXIO`, as `open(2)` refuses it for
 	/// a FIFO, gets `BrokenPipe`, which the write would have given.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
 	fn private(fd: RawFd, write: bool) -> io::Result<fs::File> {
 		fs::OpenOptions::new()
 			.read(!write)
@@ -165,6 +315,21 @@ mod imp {
 					e
 				}
 			})
+	}
+
+	/// Another descriptor of the shell's own non-blocking description `fd` of
+	/// a pipe end, close-on-exec: macOS cannot open a second description of
+	/// an unlinked FIFO.
+	#[cfg(target_os = "macos")]
+	fn private(fd: RawFd, _write: bool) -> io::Result<fs::File> {
+		use std::os::fd::FromRawFd;
+		// SAFETY: duplicates a descriptor the caller holds open.
+		let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+		if new < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: a fresh descriptor nobody else owns.
+		Ok(fs::File::from(unsafe { OwnedFd::from_raw_fd(new) }))
 	}
 
 	/// One end of the pipe as the shell holds it: its blocking descriptor,
@@ -208,7 +373,14 @@ mod imp {
 		/// never asks: its handles of an end share this one's.
 		fn dup(&self) -> io::Result<Box<dyn File>> {
 			let write = self.own.write;
-			Ok(Box::new(Private::new(private(self.file.as_raw_fd(), write)?, write)))
+			// Linux opens it from the externals' descriptor; macOS duplicates
+			// the shell's own.
+			let from = if cfg!(target_os = "macos") {
+				&self.own.file
+			} else {
+				&self.file
+			};
+			Ok(Box::new(Private::new(private(from.as_raw_fd(), write)?, write)))
 		}
 	}
 
@@ -262,11 +434,23 @@ mod imp {
 		waiters: Arc<Fanout>,
 		file:    fs::File,
 		write:   bool,
+		/// macOS: a read of this end met end of file. A FIFO there stops
+		/// selecting readable once one has (measured), and no writer can come
+		/// back to an unlinked FIFO whose writers are all gone.
+		#[cfg(target_os = "macos")]
+		ended:   bool,
 	}
 
 	impl Private {
 		fn new(file: fs::File, write: bool) -> Self {
-			Self { watch: None, waiters: Arc::default(), file, write }
+			Self {
+				watch: None,
+				waiters: Arc::default(),
+				file,
+				write,
+				#[cfg(target_os = "macos")]
+				ended: false,
+			}
 		}
 
 		/// Store `waker` among the tasks waiting on this end (once: an equal
@@ -343,6 +527,10 @@ mod imp {
 		/// waker stored) when not, and on the write end `BrokenPipe` once no
 		/// reader is left (`POLLERR`).
 		fn poll_ready(&mut self, cx: &Context<'_>, events: i16) -> Poll<io::Result<usize>> {
+			#[cfg(target_os = "macos")]
+			if self.ended {
+				return Poll::Ready(Ok(0));
+			}
 			let mut registered = false;
 			loop {
 				let revents = match revents(self.file.as_raw_fd(), events) {
@@ -374,7 +562,12 @@ mod imp {
 			if buf.is_empty() {
 				return self.poll_ready(cx, ready::READ);
 			}
-			self.poll_io(cx, ready::READ, |mut f| f.read(buf))
+			let read = self.poll_io(cx, ready::READ, |mut f| f.read(buf));
+			#[cfg(target_os = "macos")]
+			if matches!(read, Poll::Ready(Ok(0))) {
+				self.ended = true;
+			}
+			read
 		}
 
 		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -511,6 +704,22 @@ mod imp {
 			assert!(matches!(rd.poll_read(&mut cx, &mut buf), Poll::Ready(Ok(0))), "end of file");
 		}
 
+		// Failure mode: once a read met end of file, an empty read (`read -t
+		// 0`) waits instead of answering at once (a macOS FIFO stops selecting
+		// readable after that read).
+		#[test]
+		fn an_empty_read_after_end_of_file_is_ready() {
+			let (mut r, w) = os_pipe(b"x").unwrap();
+			drop(w);
+			let mut buf = [0u8; 8];
+			assert!(matches!(r.poll_read(&mut noop(), &mut buf), Poll::Ready(Ok(1))));
+			assert!(matches!(r.poll_read(&mut noop(), &mut buf), Poll::Ready(Ok(0))), "end of file");
+			assert!(
+				matches!(r.poll_read(&mut noop(), &mut []), Poll::Ready(Ok(0))),
+				"an empty read after end of file is ready"
+			);
+		}
+
 		// Failure mode (review round 2, finding 1): every engine vproc polls
 		// with the engine's one waker. Vproc V1 parks on a full pipe; vproc
 		// V2 then writes a little, with the same waker, and that success
@@ -519,6 +728,7 @@ mod imp {
 		// page of the pipe in use and the last one partly full, a 4096-byte
 		// write waits (and the pipe does not poll writable) while a 1-byte
 		// write still fits in the last page.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		#[test]
 		fn a_vproc_that_writes_keeps_the_wait_of_another_vproc_with_its_waker() {
 			let (r, mut w) = os_pipe(b"").unwrap();
@@ -560,6 +770,13 @@ mod imp {
 		#[test]
 		fn tasks_waiting_on_an_idle_end_share_one_wait_and_stay_bounded() {
 			let (r, w) = io::pipe().unwrap();
+			// macOS's `private` shares the description: make it non-blocking,
+			// as Linux's own reopening is.
+			#[cfg(target_os = "macos")]
+			// SAFETY: fcntl on a descriptor this test owns.
+			unsafe {
+				libc::fcntl(r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+			}
 			let mut end = Private::new(private(r.as_raw_fd(), false).unwrap(), false);
 			let flags: Vec<Arc<Flag>> = (0..200).map(|_| Arc::default()).collect();
 			let mut buf = [0u8; 8];
@@ -626,6 +843,7 @@ mod imp {
 		}
 
 		/// Whether a `SIGPIPE` is pending for this thread; takes it if so.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		fn take_sigpipe() -> bool {
 			// SAFETY: valid zeroed sets filled by libc; a zero timeout only
 			// takes a signal already pending.
@@ -644,6 +862,7 @@ mod imp {
 		// here stays pending for it whatever the disposition (Linux queues a
 		// blocked signal even when ignored), and other tests' writes cannot
 		// raise it on this thread.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		#[test]
 		fn a_broken_pipe_raises_no_sigpipe() {
 			// SAFETY: valid sets; only this test thread's mask changes, and it
@@ -679,6 +898,7 @@ mod imp {
 		// the pipe is shared, and the shell's own stages then fail to read or
 		// write it (an empty prefill opened no private end before the pipe was
 		// handed out).
+		#[cfg(any(target_os = "linux", target_os = "android"))]
 		#[test]
 		fn no_private_ends_means_no_os_pipe() {
 			let refuse =
@@ -693,6 +913,82 @@ mod imp {
 				}
 			};
 			assert!(os_pipe_with(b"", refuse_reads).is_none(), "only the write end opens");
+		}
+
+		/// `f` in a forked child with `SIGPIPE` at its default action: its
+		/// exit status, or the signal that ended it. The child runs only `f`
+		/// and `_exit`.
+		#[cfg(target_os = "macos")]
+		fn in_child(f: impl FnOnce() -> i32) -> Result<i32, i32> {
+			// SAFETY: the child changes its own disposition, runs `f` (a
+			// `write(2)` and no allocation or lock) and exits without
+			// unwinding; the parent waits for exactly that pid.
+			unsafe {
+				let pid = libc::fork();
+				assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+				if pid == 0 {
+					libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+					libc::_exit(f());
+				}
+				let mut status = 0;
+				assert_eq!(libc::waitpid(pid, &raw mut status, 0), pid);
+				if libc::WIFSIGNALED(status) {
+					Err(libc::WTERMSIG(status))
+				} else {
+					Ok(libc::WEXITSTATUS(status))
+				}
+			}
+		}
+
+		// Failure mode: the shell's write raises a real `SIGPIPE`, which on
+		// macOS goes to the whole process and would end the shell, where
+		// bash's stage alone dies of it. Each write runs in a child whose
+		// `SIGPIPE` is at its default action, so a raised one ends it.
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn a_broken_pipe_raises_no_sigpipe() {
+			let (r, w) = os_pipe(b"").unwrap();
+			let mut wd = w.dup().unwrap();
+			let theirs = RawFd::try_from(w.os_handle().unwrap().0).unwrap();
+			drop(r);
+			// The control: a plain write on the externals' description.
+			let plain = in_child(|| {
+				// SAFETY: a one-byte write from a static buffer.
+				unsafe { libc::write(theirs, b"x".as_ptr().cast(), 1) };
+				4
+			});
+			assert_eq!(
+				plain,
+				Err(libc::SIGPIPE),
+				"a plain write to a pipe with no reader raises SIGPIPE"
+			);
+			let shells = in_child(|| match wd.poll_write(&mut noop(), b"x") {
+				Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => 3,
+				_ => 4,
+			});
+			assert_eq!(
+				shells,
+				Ok(3),
+				"the shell's write fails as a broken pipe and raises no SIGPIPE"
+			);
+		}
+
+		// Failure mode: a FIFO that cannot be made is shared anyway (or the
+		// shell fails), or the FIFO or its directory stays behind.
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn the_fifo_leaves_nothing_behind_and_none_means_no_os_pipe() {
+			let tmp = tempfile::tempdir().unwrap();
+			let left = || std::fs::read_dir(tmp.path()).unwrap().count();
+			let (r, w) = fifo_pipe(tmp.path(), b"x").expect("a FIFO pipe");
+			assert_eq!(left(), 0, "the FIFO and its directory are unlinked at once");
+			let mut got = [0u8; 1];
+			drop(w);
+			let mut from = r.dup().unwrap();
+			assert!(matches!(from.poll_read(&mut noop(), &mut got), Poll::Ready(Ok(1))));
+			assert!(fifo_pipe(tmp.path(), &vec![1u8; 1 << 20]).is_none(), "1 MiB does not fit");
+			assert_eq!(left(), 0, "a refused prefill leaves nothing either");
+			assert!(fifo_pipe(&tmp.path().join("missing"), b"").is_none(), "no directory, no pipe");
 		}
 	}
 }

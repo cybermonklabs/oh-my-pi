@@ -1396,7 +1396,7 @@ mod tests {
 	// lost, so a restore would pretend to resume it; or (review finding 4) it
 	// is imaged as lost but restore does not report it, since restore reports
 	// a lost fd only where the image names a host object's kind.
-	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
 	#[test]
 	fn a_pipe_shared_with_externals_is_lost_on_externalize_and_restore() {
 		use super::{FdObjImage, FdRebuild, FileKind};
