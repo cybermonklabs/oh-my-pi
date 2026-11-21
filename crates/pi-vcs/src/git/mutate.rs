@@ -2344,6 +2344,7 @@ impl TreeMark {
 	}
 
 	/// Whether `meta` and `token` are the directory this mark was set on.
+	#[cfg(target_os = "linux")]
 	fn is(&self, meta: &fs::Metadata, token: Option<&str>) -> bool {
 		use std::os::unix::fs::MetadataExt;
 		meta.is_dir()
@@ -2369,16 +2370,236 @@ const fn mark_tree(_dir: &Path) -> Option<TreeMark> {
 	None
 }
 
-/// The token on the directory `dir`, `None` when it has none or it cannot be
-/// read.
+/// The tree directory a reclaim checks and empties, held open from the
+/// check to the removal, so a path swapped for a symlink or another directory
+/// in between is never followed: the checks and the removal all go through
+/// this descriptor, never through the path again.
 #[cfg(target_os = "linux")]
-fn tree_token(dir: &Path) -> Option<String> {
-	tree_mark::get(dir).ok().flatten()
-}
+mod tree_dir {
+	use std::{
+		ffi::{CStr, CString, OsStr},
+		fs, io,
+		os::{
+			fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+			unix::ffi::OsStrExt,
+		},
+		path::{Path, PathBuf},
+	};
 
-#[cfg(all(unix, not(target_os = "linux")))]
-const fn tree_token(_dir: &Path) -> Option<String> {
-	None
+	use super::{TreeMark, resolve_leaf, tree_mark};
+
+	/// An open directory: `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`.
+	pub struct TreeDir(fs::File);
+
+	fn c_name(name: &OsStr) -> io::Result<CString> {
+		CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+	}
+
+	/// `openat(dir, name, flags | O_CLOEXEC | O_NOFOLLOW)`.
+	fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+		// SAFETY: `name` is a live NUL-terminated string; the flags take no
+		// mode argument.
+		let fd =
+			unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+		if fd < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `fd` was just opened and nothing else owns it.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+	}
+
+	/// `unlinkat(dir, name, flags)`; a name already gone is fine.
+	fn unlink_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+		// SAFETY: `name` is a live NUL-terminated string.
+		if unsafe { libc::unlinkat(dir, name.as_ptr(), flags) } == 0 {
+			return Ok(());
+		}
+		let err = io::Error::last_os_error();
+		if err.kind() == io::ErrorKind::NotFound {
+			Ok(())
+		} else {
+			Err(err)
+		}
+	}
+
+	/// The names in the directory `dir`, without `.` and `..`.
+	fn names(dir: RawFd) -> io::Result<Vec<CString>> {
+		// `fdopendir` takes the descriptor over, so it gets a duplicate.
+		// SAFETY: `dir` is an open descriptor.
+		let dup = unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) };
+		if dup < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `dup` is an open directory descriptor this function owns.
+		let stream = unsafe { libc::fdopendir(dup) };
+		if stream.is_null() {
+			let err = io::Error::last_os_error();
+			// SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+			unsafe { libc::close(dup) };
+			return Err(err);
+		}
+		// The duplicate shares the original's offset, which an earlier
+		// listing of the same descriptor moved: start from the beginning.
+		// SAFETY: `stream` is the open stream just made.
+		unsafe { libc::rewinddir(stream) };
+		let mut names = Vec::new();
+		loop {
+			// SAFETY: as above. A null result is the end or an error, told
+			// apart by `errno`, which is cleared first.
+			let entry = unsafe {
+				*libc::__errno_location() = 0;
+				libc::readdir(stream)
+			};
+			if entry.is_null() {
+				// SAFETY: reading the thread's `errno`.
+				let errno = unsafe { *libc::__errno_location() };
+				// SAFETY: `stream` is open; closing it closes `dup`.
+				unsafe { libc::closedir(stream) };
+				if errno != 0 {
+					return Err(io::Error::from_raw_os_error(errno));
+				}
+				return Ok(names);
+			}
+			// SAFETY: a non-null entry's `d_name` is a NUL-terminated string
+			// that stays valid until the next `readdir`.
+			let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+			if name != c"." && name != c".." {
+				names.push(name.to_owned());
+			}
+		}
+	}
+
+	/// Removes everything in the directory `dir`, never following a symlink:
+	/// each subdirectory is opened `O_NOFOLLOW` from its parent, and a name
+	/// that turned into a symlink or a file meanwhile is unlinked itself.
+	fn remove_all_in(dir: RawFd) -> io::Result<()> {
+		for name in names(dir)? {
+			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+				Ok(child) => {
+					remove_all_in(child.as_raw_fd())?;
+					drop(child);
+					unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
+				},
+				Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+				Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+					unlink_at(dir, &name, 0)?;
+				},
+				Err(err) => return Err(err),
+			}
+		}
+		Ok(())
+	}
+
+	/// Looks in the directory `dir` (at `at` below the tree's root) for an
+	/// entry named `.git`, skipping the root's own, and queues every
+	/// subdirectory it opens without following a symlink.
+	fn git_entry_in(
+		dir: RawFd,
+		at: &Path,
+		root: bool,
+		pending: &mut Vec<(OwnedFd, PathBuf)>,
+	) -> io::Result<Option<PathBuf>> {
+		for name in names(dir)? {
+			let relative = at.join(OsStr::from_bytes(name.as_bytes()));
+			if name.as_bytes() == b".git" {
+				if root {
+					continue;
+				}
+				return Ok(Some(relative));
+			}
+			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+				Ok(child) => pending.push((child, relative)),
+				Err(err)
+					if err.kind() == io::ErrorKind::NotFound
+						|| matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {},
+				Err(err) => return Err(err),
+			}
+		}
+		Ok(None)
+	}
+
+	impl TreeDir {
+		/// Opens the directory at `path` without following a symlink there;
+		/// `None` when nothing is there, an error when it is not a directory.
+		pub fn open(path: &Path) -> io::Result<Option<Self>> {
+			let path = c_name(path.as_os_str())?;
+			match open_at(libc::AT_FDCWD, &path, libc::O_RDONLY | libc::O_DIRECTORY) {
+				Ok(fd) => Ok(Some(Self(fs::File::from(fd)))),
+				Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+				Err(err) => Err(err),
+			}
+		}
+
+		/// Whether this is the directory `mark` was set on: the same device
+		/// and inode, carrying the same token.
+		pub fn is(&self, mark: &TreeMark) -> io::Result<bool> {
+			let meta = self.0.metadata()?;
+			let token = tree_mark::get_fd(self.0.as_raw_fd())?;
+			Ok(mark.is(&meta, token.as_deref()))
+		}
+
+		/// Whether this directory holds no `.git`, or a `.git` file naming the
+		/// registration `admin` (a relative name taken from `tree`, the path
+		/// it was opened at): anything else (a repository of its own, a
+		/// `.git` naming another registration) is not the interrupted add's
+		/// to remove.
+		pub fn git_entry_is_ours(&self, tree: &Path, admin: &Path) -> bool {
+			let entry = match open_at(self.0.as_raw_fd(), c".git", libc::O_RDONLY) {
+				Ok(fd) => fs::File::from(fd),
+				Err(err) => return err.kind() == io::ErrorKind::NotFound,
+			};
+			if !entry.metadata().is_ok_and(|meta| meta.is_file()) {
+				return false;
+			}
+			io::read_to_string(entry)
+				.ok()
+				.and_then(|text| {
+					text
+						.trim()
+						.strip_prefix("gitdir:")
+						.map(|raw| tree.join(raw.trim()))
+				})
+				.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin))
+		}
+
+		/// The first `.git` below this directory's root (the root's own
+		/// `.git` is not looked at), relative to the root, walking every
+		/// subdirectory without following a symlink.
+		pub fn nested_git_entry(&self) -> io::Result<Option<PathBuf>> {
+			let mut pending = Vec::new();
+			if let Some(found) = git_entry_in(self.0.as_raw_fd(), Path::new(""), true, &mut pending)? {
+				return Ok(Some(found));
+			}
+			while let Some((dir, at)) = pending.pop() {
+				if let Some(found) = git_entry_in(dir.as_raw_fd(), &at, false, &mut pending)? {
+					return Ok(Some(found));
+				}
+			}
+			Ok(None)
+		}
+
+		/// Adds the owner's read, write and search bits to this directory's
+		/// mode, so its entries can be removed and new ones written.
+		pub fn make_owner_writable(&self) -> io::Result<()> {
+			use std::os::unix::fs::PermissionsExt;
+			let mut mode = self.0.metadata()?.permissions();
+			if mode.mode() & 0o700 != 0o700 {
+				mode.set_mode(mode.mode() | 0o700);
+				self.0.set_permissions(mode)?;
+			}
+			Ok(())
+		}
+
+		/// Removes everything in this directory, keeping the directory.
+		pub fn empty(&self) -> io::Result<()> {
+			remove_all_in(self.0.as_raw_fd())
+		}
+
+		/// Removes the add's token from this directory; a failure is ignored.
+		pub fn clear_mark(&self) {
+			tree_mark::clear_fd(self.0.as_raw_fd());
+		}
+	}
 }
 
 /// Removes the token from `dir`, where there is one. A token left behind
@@ -2437,6 +2658,7 @@ mod tree_mark {
 	}
 
 	/// The token on `dir`, `None` when it has none.
+	#[cfg(test)]
 	pub fn get(dir: &Path) -> io::Result<Option<String>> {
 		let path = c_path(dir)?;
 		let mut buf = [0_u8; 64];
@@ -2456,6 +2678,31 @@ mod tree_mark {
 		Ok(std::str::from_utf8(&buf[..len as usize])
 			.ok()
 			.map(str::to_owned))
+	}
+
+	/// The token on the open directory `fd`, `None` when it has none.
+	pub fn get_fd(fd: std::os::fd::RawFd) -> io::Result<Option<String>> {
+		let mut buf = [0_u8; 64];
+		// SAFETY: the name is a live NUL-terminated string, and `buf` is a
+		// live, writable buffer of the length passed.
+		let len = unsafe { libc::fgetxattr(fd, NAME.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+		if len < 0 {
+			let err = io::Error::last_os_error();
+			return if err.raw_os_error() == Some(libc::ENODATA) {
+				Ok(None)
+			} else {
+				Err(err)
+			};
+		}
+		Ok(std::str::from_utf8(&buf[..len as usize])
+			.ok()
+			.map(str::to_owned))
+	}
+
+	/// Removes the token from the open directory `fd`; a failure is ignored.
+	pub fn clear_fd(fd: std::os::fd::RawFd) {
+		// SAFETY: the name is a live NUL-terminated string.
+		unsafe { libc::fremovexattr(fd, NAME.as_ptr()) };
 	}
 
 	/// Removes the token from `dir`; a failure is ignored.
@@ -2616,56 +2863,18 @@ fn reclaim_with_marker(
 		if fs::read(admin.join("locked")).ok().as_deref() != Some(locked.as_bytes()) {
 			return Err(refuse_record());
 		}
-		let note = match fs::symlink_metadata(tree) {
-			Err(err) if err.kind() == io::ErrorKind::NotFound => {
-				format!(
-					"removed the registration an interrupted worktree add of {} left",
-					tree.display()
-				)
-			},
-			Err(err) => return Err(err.into()),
-			Ok(meta) => {
-				let token = tree_token(tree);
-				if !made
-					.as_ref()
-					.is_some_and(|made| made.is(&meta, token.as_deref()))
-				{
-					return Err(refuse(
-						"and the directory there cannot be told apart from one made again in its place",
-					));
-				}
-				if common.starts_with(resolve_leaf(tree)) {
-					return Err(refuse("and holds this repository"));
-				}
-				if !git_entry_is_ours(tree, admin) {
-					return Err(refuse("and holds a `.git` that is not this registration's"));
-				}
-				// The add's own tree never holds a `.git` below its root: the
-				// clone leaves out directories a `.git` marks, and a checkout
-				// writes a submodule as an empty directory.
-				if let Some(nested) = nested_git_entry(tree)? {
-					return Err(refuse(&format!(
-						"and holds a repository below its root ({})",
-						nested.display()
-					)));
-				}
-				// The directory stays, writable by its owner: it can be a
-				// mount point, and the add keeps an empty directory anyway.
-				make_owner_writable(tree)?;
-				remove_contents(tree)?;
-				format!(
-					"emptied the partial tree an interrupted worktree add left at {}, with any file \
-					 written into it after that add stopped",
-					tree.display()
-				)
-			},
-		};
+		let (note, dir) = reclaim_tree(common, admin, tree, made.as_ref(), &refuse)?;
 		// Removed while the marker is held, so no other add can take it first.
 		let leftover = remove_registration(common, admin)?;
 		// The token goes after: until the registration is gone, a retry must
 		// still find the tree it can empty. A token left behind matches no
 		// marker.
-		clear_tree_mark(tree);
+		#[cfg(target_os = "linux")]
+		if let Some(dir) = dir {
+			dir.clear_mark();
+		}
+		#[cfg(not(target_os = "linux"))]
+		let _ = dir;
 		Ok(Some(match leftover {
 			Some(leftover) => format!("{note}; {leftover}"),
 			None => note,
@@ -2678,50 +2887,93 @@ fn reclaim_with_marker(
 	}
 }
 
-/// Whether `tree` holds no `.git`, or a `.git` file naming the registration
-/// `admin`: anything else (a repository of its own, a `.git` naming another
-/// registration) is not the interrupted add's to remove.
-#[cfg(unix)]
-fn git_entry_is_ours(tree: &Path, admin: &Path) -> bool {
-	let entry = tree.join(".git");
-	match fs::symlink_metadata(&entry) {
-		Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-		Ok(meta) if meta.is_file() => fs::read_to_string(&entry)
-			.ok()
-			.and_then(|text| {
-				text
-					.trim()
-					.strip_prefix("gitdir:")
-					.map(|raw| tree.join(raw.trim()))
-			})
-			.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin)),
-		_ => false,
+/// Empties the tree an interrupted add left at `tree` while it is still the
+/// directory that add made (`made`) and holds no repository, and returns the
+/// note to show with the directory, held open so its token can go after the
+/// registration; a tree that is gone leaves only the registration to remove.
+/// Anything else is refused with `refuse`, and nothing is removed. The tree
+/// is opened once, without following a symlink, and every check and the
+/// removal go through that descriptor.
+#[cfg(target_os = "linux")]
+fn reclaim_tree(
+	common: &Path,
+	admin: &Path,
+	tree: &Path,
+	made: Option<&TreeMark>,
+	refuse: &impl Fn(&str) -> Error,
+) -> Result<(String, Option<tree_dir::TreeDir>)> {
+	let not_made_here =
+		|| refuse("and the directory there cannot be told apart from one made again in its place");
+	let dir = match tree_dir::TreeDir::open(tree) {
+		Ok(Some(dir)) => dir,
+		Ok(None) => {
+			return Ok((
+				format!(
+					"removed the registration an interrupted worktree add of {} left",
+					tree.display()
+				),
+				None,
+			));
+		},
+		Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+			return Err(not_made_here());
+		},
+		Err(err) => return Err(err.into()),
+	};
+	if !made.is_some_and(|made| dir.is(made).unwrap_or(false)) {
+		return Err(not_made_here());
 	}
+	if common.starts_with(resolve_leaf(tree)) {
+		return Err(refuse("and holds this repository"));
+	}
+	if !dir.git_entry_is_ours(tree, admin) {
+		return Err(refuse("and holds a `.git` that is not this registration's"));
+	}
+	// The add's own tree never holds a `.git` below its root: the clone leaves
+	// out directories a `.git` marks, and a checkout writes a submodule as an
+	// empty directory.
+	if let Some(nested) = dir.nested_git_entry()? {
+		return Err(refuse(&format!(
+			"and holds a repository below its root ({})",
+			tree.join(nested).display()
+		)));
+	}
+	#[cfg(test)]
+	test_hooks::before_tree_removal(tree);
+	// The directory stays, writable by its owner: it can be a mount point, and
+	// the add keeps an empty directory anyway.
+	dir.make_owner_writable()?;
+	dir.empty()?;
+	Ok((
+		format!(
+			"emptied the partial tree an interrupted worktree add left at {}, with any file written \
+			 into it after that add stopped",
+			tree.display()
+		),
+		Some(dir),
+	))
 }
 
-/// The first `.git` below the root of `tree` (the root's own `.git` is not
-/// looked at), walking every directory without following a symlink.
-#[cfg(unix)]
-fn nested_git_entry(tree: &Path) -> io::Result<Option<PathBuf>> {
-	let mut pending = Vec::new();
-	for entry in fs::read_dir(tree)? {
-		let entry = entry?;
-		if entry.file_name() != ".git" && entry.file_type()?.is_dir() {
-			pending.push(entry.path());
-		}
+/// Off Linux an add marks no tree (`made` is always `None`), so only a tree
+/// that is gone is reclaimed: its registration is removed.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reclaim_tree(
+	_common: &Path,
+	_admin: &Path,
+	tree: &Path,
+	_made: Option<&TreeMark>,
+	refuse: &impl Fn(&str) -> Error,
+) -> Result<(String, Option<()>)> {
+	match fs::symlink_metadata(tree) {
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((
+			format!("removed the registration an interrupted worktree add of {} left", tree.display()),
+			None,
+		)),
+		Err(err) => Err(err.into()),
+		Ok(_) => Err(refuse(
+			"and the directory there cannot be told apart from one made again in its place",
+		)),
 	}
-	while let Some(dir) = pending.pop() {
-		for entry in fs::read_dir(&dir)? {
-			let entry = entry?;
-			if entry.file_name() == ".git" {
-				return Ok(Some(entry.path()));
-			}
-			if entry.file_type()?.is_dir() {
-				pending.push(entry.path());
-			}
-		}
-	}
-	Ok(None)
 }
 
 /// Takes the registration `admin` out of git's view at once, by moving it out
@@ -2766,6 +3018,23 @@ mod test_hooks {
 
 	thread_local! {
 		static BEFORE_MARKER_RELEASE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+		static BEFORE_TREE_REMOVAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
+	}
+
+	/// Runs `hook` with the tree's path just before a reclaim on this thread
+	/// empties it, until [`clear`].
+	#[cfg(target_os = "linux")]
+	pub fn set_before_tree_removal(hook: impl FnMut(&Path) + 'static) {
+		BEFORE_TREE_REMOVAL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+	}
+
+	#[cfg(target_os = "linux")]
+	pub fn before_tree_removal(tree: &Path) {
+		BEFORE_TREE_REMOVAL.with(|slot| {
+			if let Some(hook) = slot.borrow_mut().as_mut() {
+				hook(tree);
+			}
+		});
 	}
 
 	/// Runs `hook` with the registration's administrative directory just
@@ -2777,6 +3046,7 @@ mod test_hooks {
 
 	pub fn clear() {
 		BEFORE_MARKER_RELEASE.with(|slot| *slot.borrow_mut() = None);
+		BEFORE_TREE_REMOVAL.with(|slot| *slot.borrow_mut() = None);
 	}
 
 	pub fn before_marker_release(admin: &Path) {
@@ -3377,6 +3647,40 @@ mod tests {
 		);
 		assert_eq!(repo.worktree_reclaim_abandoned(&tree).unwrap().len(), 1);
 		assert!(is_empty_dir(&tree) && !admin.exists());
+	}
+
+	/// The tree swapped for a symlink to someone's directory between the
+	/// reclaim's checks and its removal: nothing is removed through the
+	/// symlink; the add's own tree, moved away, is what gets emptied.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_removes_nothing_through_a_symlink_swapped_in_after_the_checks() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let _admin = abandoned_add(&repo, &tree, None);
+		let victim = trees.path().join("victim");
+		fs::create_dir(&victim).unwrap();
+		fs::write(victim.join("theirs.txt"), "not the add's\n").unwrap();
+		let moved = trees.path().join("wt-moved");
+		let (from, to, target) = (tree.clone(), moved.clone(), victim.clone());
+		test_hooks::set_before_tree_removal(move |_| {
+			fs::rename(&from, &to).unwrap();
+			std::os::unix::fs::symlink(&target, &from).unwrap();
+		});
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		assert!(
+			victim.join("theirs.txt").is_file(),
+			"the reclaim removed a file through the symlink swapped in: {result:?}"
+		);
+		assert!(
+			fs::symlink_metadata(&tree)
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert!(is_empty_dir(&moved), "the add's own tree, moved away, was not emptied: {result:?}");
 	}
 
 	/// A failed add's `Drop` removes the registration before it lets go of
