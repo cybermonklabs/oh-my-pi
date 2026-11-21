@@ -179,6 +179,9 @@ function appendTaskSpawn(main: SessionManager, id: string): void {
 
 const KEY_ERROR = "Retry budget exhausted after 2 retries: No API key for provider: anthropic";
 
+/** When subagent FollowedUp's first turn ran, in the follow-up cases. */
+const FOLLOW_UP_START = Date.parse("2026-11-17T12:00:00.000Z");
+
 /** A turn that ended because no request could resolve its provider key, even after its retries. */
 const stranded: Message[] = [
 	{ role: "user", content: "work", timestamp: Date.now() },
@@ -361,6 +364,7 @@ describe("restoreSession (omp --restore)", () => {
 		"Delivered",
 		"FollowedUp",
 		"Unsettled",
+		"Streamed",
 	];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
@@ -672,25 +676,66 @@ describe("restoreSession (omp --restore)", () => {
 		expect(followUp).not.toHaveBeenCalled();
 	});
 
-	for (const [path, toolName, details] of [
-		["a backgrounded eval cell", "eval", { async: { state: "running", jobId: "eval-job", type: "eval" } }],
-		["an eval cell's await tool.wait({})", "eval", {}],
-		["an eval workpool batch", "eval", { workpool: { state: "running", ids: ["Batch"] } }],
-		["vibe_wait", "vibe_wait", { sessions: ["Vibe"] }],
+	/** Sets the system clock to `start`, and returns a step that moves it one second on. */
+	function clockFrom(start: number): () => void {
+		let now = start;
+		setSystemTime(new Date(now));
+		return () => setSystemTime(new Date((now += 1_000)));
+	}
+
+	/** The parent's assistant message that calls `toolName` (id `callId`), and nothing else. */
+	function toolCallMessage(callId: string, toolName: string): AssistantMessage {
+		return assistant({
+			content: [{ type: "toolCall", id: callId, name: toolName, arguments: {} }],
+			stopReason: "toolUse",
+		});
+	}
+
+	/** The result of the parent's call `callId` to `toolName`, with `details`. */
+	function toolResultMessage(callId: string, toolName: string, details: unknown, isError = false): ToolResultMessage {
+		return {
+			role: "toolResult",
+			toolCallId: callId,
+			toolName,
+			content: [{ type: "text", text: `${toolName} returned.` }],
+			details,
+			isError,
+			timestamp: Date.now(),
+		};
+	}
+
+	it("does not relaunch a key-stranded subagent of a backgrounded eval cell that no parent record names", async () => {
+		// A backgrounded cell's own result reaches the parent as a job delivery, which names no subagent the cell ran.
+		const { main, mainFile, cwd } = openParent();
+		appendParentToolResult(main, "eval", { async: { state: "running", jobId: "eval-job", type: "eval" } });
+		await writeSubagent(mainFile, cwd, "Background", stranded, { normalExit: true });
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Going on." }] }));
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	for (const [source, toolName, details] of [
+		["an eval workpool batch", "eval", { workpool: { state: "completed", ids: ["Worker"] } }],
+		["vibe_wait", "vibe_wait", { sessions: ["Worker"] }],
 	] as const) {
-		it(`does not relaunch a key-stranded subagent without a positive parent wait record after ${path}`, async () => {
-			const id = path.includes("wait")
-				? "Wait"
-				: path.includes("workpool")
-					? "Batch"
-					: path.includes("vibe")
-						? "Vibe"
-						: "Background";
+		it(`does not relaunch a worker of ${source} whose failure the parent got, when a later call of that turn is cut off`, async () => {
+			// If this regresses, the cut-off window opens at the turn's input instead of at the call the process went away
+			// inside: a worker whose failure an earlier call of the same turn returned is relaunched, and the parent gets
+			// its result a second time.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 			const { main, mainFile, cwd } = openParent();
-			appendParentToolResult(main, toolName, details);
-			await writeSubagent(mainFile, cwd, id, stranded, { normalExit: true });
-			// The parent took its result and went on: nothing it wrote says it still waits.
-			main.appendMessage(assistant({ content: [{ type: "text", text: "Going on." }] }));
+			tick();
+			main.appendMessage(toolCallMessage("call_batch", toolName));
+			tick();
+			await writeSubagent(mainFile, cwd, "Worker", stranded, { normalExit: true });
+			tick();
+			main.appendMessage(toolResultMessage("call_batch", toolName, details));
+			tick();
+			// The turn's next call, which the parent's process went away inside.
+			main.appendMessage(toolCallMessage("call_read", "read"));
 
 			const { outcome, followUp } = await restoreParent(main, mainFile);
 
@@ -700,14 +745,206 @@ describe("restoreSession (omp --restore)", () => {
 	}
 
 	it("does not relaunch a key-stranded subagent after its parent moved off the branch that ran eval", async () => {
+		// If this regresses, restore reads the branch the parent left: its `owed` record reads as a wait, and the
+		// parent receives a result for a job its conversation never started.
 		const { main, mainFile, cwd } = openParent();
 		const beforeEval = main.getLeafId();
 		if (!beforeEval) throw new Error("Expected the initial parent branch entry");
+		appendAgentJobRecord(main, "Moved", "owed");
 		appendParentToolResult(main, "eval", {});
 		await writeSubagent(mainFile, cwd, "Moved", stranded, { normalExit: true });
 		main.branch(beforeEval);
 		main.appendMessage({ role: "user", content: "other branch", timestamp: Date.now() });
 		main.appendMessage(assistant({ content: [{ type: "text", text: "Answered on the other branch." }] }));
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	it("does not relaunch a spawn of a reply the parent replaced, though the new reply's cut-off turn keeps the same input", async () => {
+		// If this regresses, the cut-off window opens at the input both branches share, before the replaced reply's
+		// spawns: a subagent of a reply the parent abandoned is relaunched for a turn that never started it.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const input = main.getLeafId();
+		if (!input) throw new Error("Expected the parent's input entry");
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_replaced", "eval"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Replaced", stranded, { normalExit: true });
+		tick();
+		// The reply was regenerated from the same input; the process went away inside the new reply's call.
+		main.branch(input);
+		main.appendMessage(toolCallMessage("call_read_new", "read"));
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	it("relaunches only the spawn of the reply that streamed at the cut-off, not one of the reply it replaced", async () => {
+		// If this regresses, the window of the reply that streamed when the process went away opens at the input both
+		// replies share, before the replaced reply's spawns: one of them is relaunched for a turn that never started
+		// it; or the streaming reply's own spawn, which no record names yet, is not relaunched.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const input = main.getLeafId();
+		if (!input) throw new Error("Expected the parent's input entry");
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_replaced", "eval"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Replaced", stranded, { normalExit: true });
+		tick();
+		main.appendMessage(toolResultMessage("call_eval_replaced", "eval", {}));
+		tick();
+		main.appendMessage(assistant({ content: [{ type: "text", text: "The replaced reply." }] }));
+		// The reply was regenerated from the same input; the process went away while the new one streamed, after
+		// it launched a subagent and before the reply was saved.
+		tick();
+		main.branch(input);
+		await writeSubagent(mainFile, cwd, "Streamed", stranded, { normalExit: true });
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Streamed"] });
+	});
+
+	it("does not relaunch a key-stranded subagent of a turn its parent ended by an abort that gave a reason", async () => {
+		// If this regresses, an abort with a caller's own reason reads as a process exit here though it reads as a turn
+		// the parent took everywhere else: the subagent of a turn that lived on and ended is relaunched.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_reason", "eval"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Reasoned", stranded, { normalExit: true });
+		tick();
+		main.appendMessage(toolResultMessage("call_eval_reason", "eval", {}));
+		tick();
+		main.appendMessage(assistant({ stopReason: "aborted", errorMessage: "Superseded by the owner's next task" }));
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	it("does not relaunch a later turn's unrecorded subagent because an earlier turn left a task call unanswered", async () => {
+		// If this regresses, a `task` call a hard kill left without a result keeps the whole conversation waiting: every
+		// unrecorded subagent of every later turn is relaunched, though those turns ended.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendMessage(toolCallMessage("call_old_task", "task"));
+		tick();
+		// After the kill the user went on (`omp -c` repairs nothing without an exit record).
+		main.appendMessage({ role: "user", content: "go on", timestamp: Date.now() });
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_later", "eval"));
+		tick();
+		await writeSubagent(mainFile, cwd, "Later", stranded, { normalExit: true });
+		tick();
+		main.appendMessage(toolResultMessage("call_eval_later", "eval", {}));
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Done." }] }));
+
+		const { outcome, followUp } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: [] });
+		expect(followUp).not.toHaveBeenCalled();
+	});
+
+	for (const [end, endRecords] of Object.entries({
+		"its terminal yield's result": () => [] as Message[],
+		"the abort without a reason the executor stops its session with after that yield": () => [
+			assistant({
+				stopReason: "aborted",
+				errorMessage: GENERIC_ABORT_SENTINEL,
+				errorId: AIError.create(AIError.Flag.Abort),
+			}),
+		],
+	})) {
+		it(`does not relaunch an unrecorded subagent of a parent subagent whose run ended with ${end}`, async () => {
+			// If this regresses, a parent subagent's finished run reads as a turn its process cut off: every subagent it
+			// left without a record is relaunched, and its result goes to a parent whose run is over.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			appendTaskSpawn(main, "Outer");
+			const outer = await SessionManager.open(
+				path.join(mainFile.slice(0, -6), "Outer.jsonl"),
+				undefined,
+				undefined,
+				{
+					initialCwd: cwd,
+					parentSession: mainFile,
+					suppressBreadcrumb: true,
+				},
+			);
+			outer.appendSessionInit({ systemPrompt: ["sub prompt"], task: "Outer task", tools: ["eval", "yield"] });
+			outer.appendMessage({ role: "user", content: "Outer task", timestamp: Date.now() });
+			tick();
+			outer.appendMessage(toolCallMessage("call_outer_eval", "eval"));
+			tick();
+			await writeSubagent(path.join(mainFile.slice(0, -6), "Outer.jsonl"), cwd, "Inner", stranded, {
+				normalExit: true,
+			});
+			tick();
+			outer.appendMessage(toolResultMessage("call_outer_eval", "eval", {}));
+			tick();
+			outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+			outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+			for (const message of endRecords()) outer.appendMessage(message);
+			await outer.close();
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome.subagents).not.toContain("Inner");
+		});
+	}
+
+	for (const [records, details, relaunched] of [
+		["leaves it when the eval result's agentResults names it", { agentResults: [{ id: "Held" }] }, false],
+		["control: relaunches it when the eval result names no agent result", {}, true],
+	] as const) {
+		it(`a key-stranded subagent whose failure the parent's cut-off eval cell got through tool.task: ${records}`, async () => {
+			// The process went away inside the cell that got the failure. Only `agentResults` shows the handover: without
+			// it, the cut-off call reads as still waiting on what it spawned.
+			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+			const { main, mainFile, cwd } = openParent();
+			tick();
+			main.appendMessage(toolCallMessage("call_eval_cut", "eval"));
+			tick();
+			await writeSubagent(mainFile, cwd, "Held", stranded, { normalExit: true });
+			tick();
+			main.appendMessage(toolResultMessage("call_eval_cut", "eval", details, true));
+			main.appendMessage(
+				assistant({
+					stopReason: "aborted",
+					errorMessage: GENERIC_ABORT_SENTINEL,
+					errorId: AIError.create(AIError.Flag.Abort),
+				}),
+			);
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome).toEqual({ turn: false, subagents: relaunched ? ["Held"] : [] });
+		});
+	}
+
+	it("does not relaunch a background subagent whose failure an eval cell's tool.wait handed over", async () => {
+		// The records a bridged `tool.wait` leaves: `delivered` before the cell gets the result, and the subagent in
+		// the eval result's `agentResults`.
+		const { main, mainFile, cwd } = openParent();
+		for (const message of parentTaskCall("Spawned", "started")) main.appendMessage(message);
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Spawned is running." }] }));
+		await writeSubagent(mainFile, cwd, "Spawned", stranded, { normalExit: true });
+		main.appendMessage({ role: "user", content: "check on it", timestamp: Date.now() });
+		main.appendMessage(toolCallMessage("call_eval_wait", "eval"));
+		appendAgentJobRecord(main, "Spawned", "delivered");
+		main.appendMessage(toolResultMessage("call_eval_wait", "eval", { agentResults: [{ id: "Spawned" }] }));
+		main.appendMessage(assistant({ content: [{ type: "text", text: "Spawned could not run." }] }));
 
 		const { outcome, followUp } = await restoreParent(main, mainFile);
 
@@ -927,46 +1164,95 @@ describe("restoreSession (omp --restore)", () => {
 		it(`relaunches a subagent whose follow-up turn ended without its key when its parent holds only an earlier turn's result: ${record}`, async () => {
 			// If this regresses, the result of the subagent's first turn reads as the failure of the turn its parent
 			// messaged it for: the parent waits on that turn, and `--restore` never goes on with it.
-			const start = Date.parse("2026-11-17T12:00:00.000Z");
-			setSystemTime(new Date(start));
+			setSystemTime(new Date(FOLLOW_UP_START));
 			const { main, mainFile, cwd } = openParent();
 			for (const message of parentTaskCall("FollowedUp", "started")) main.appendMessage(message);
-			const sub = await SessionManager.open(
-				path.join(mainFile.slice(0, -6), "FollowedUp.jsonl"),
-				undefined,
-				undefined,
-				{
-					initialCwd: cwd,
-					parentSession: mainFile,
-					suppressBreadcrumb: true,
-				},
-			);
-			sub.appendSessionInit({ systemPrompt: ["sub prompt"], task: "FollowedUp task", tools: ["read", "yield"] });
-			sub.appendMessage({ role: "user", content: "FollowedUp task", timestamp: Date.now() });
-			sub.appendMessage(assistant({ content: [{ type: "text", text: "first part done" }] }));
-			// The parent got that first result, then messaged the subagent to go on.
-			setSystemTime(new Date(start + 60_000));
-			deliver(main, "FollowedUp", "completed");
-			main.appendMessage(assistant({ content: [{ type: "text", text: "Asked FollowedUp for the rest." }] }));
-			// The message woke the subagent; that turn ended because its key could not be resolved.
-			setSystemTime(new Date(start + 120_000));
-			sub.appendCustomMessageEntry("irc:incoming", "Now do the rest.", true, {
-				from: MAIN_AGENT_ID,
-				message: "Now do the rest.",
+			await writeFollowedUp(mainFile, cwd, () => {
+				deliver(main, "FollowedUp", "completed");
+				main.appendMessage(assistant({ content: [{ type: "text", text: "Asked FollowedUp for the rest." }] }));
 			});
-			sub.appendMessage(assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }));
-			sub.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
-				reason: "dispose",
-				kind: "normal",
-				recordedAt: new Date().toISOString(),
-			});
-			await sub.close();
-			setSystemTime();
 
 			const { outcome, followUp } = await restoreParent(main, mainFile);
 
 			expect(outcome).toEqual({ turn: false, subagents: ["FollowedUp"] });
 			expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "FollowedUp", restore: true });
 		});
+	}
+
+	/** The records an eval cell leaves when a bridged call hands it subagent `id`'s result. */
+	const evalHandovers: Record<string, { agentJob: boolean; record: (main: SessionManager, id: string) => void }> = {
+		"an eval cell's tool.task result": {
+			agentJob: false,
+			record: (main, id) => appendParentToolResult(main, "eval", { agentResults: [{ id }] }),
+		},
+		"an agent() job's wait() in a foreground cell": {
+			agentJob: true,
+			record: (main, id) => {
+				appendAgentJobRecord(main, id, "delivered");
+				appendParentToolResult(main, "eval", { agentResults: [{ id }] });
+			},
+		},
+		"an agent() job's wait() in a backgrounded cell": {
+			agentJob: true,
+			record: (main, id) => appendAgentJobRecord(main, id, "delivered"),
+		},
+	};
+
+	for (const [handover, { agentJob, record }] of Object.entries(evalHandovers)) {
+		it(`relaunches a subagent whose follow-up turn ended without its key after ${handover} handed its parent the first turn's result`, async () => {
+			// If this regresses, the eval handover of the subagent's first result reads as the failure of the turn its
+			// parent messaged it for: `--restore` never goes on with that turn, as it does for a `task` spawn's.
+			setSystemTime(new Date(FOLLOW_UP_START));
+			const { main, mainFile, cwd } = openParent();
+			if (agentJob) appendAgentJobRecord(main, "FollowedUp", "owed");
+			await writeFollowedUp(mainFile, cwd, () => {
+				record(main, "FollowedUp");
+				main.appendMessage(assistant({ content: [{ type: "text", text: "Asked FollowedUp for the rest." }] }));
+			});
+
+			const { outcome, followUp } = await restoreParent(main, mainFile);
+
+			expect(outcome).toEqual({ turn: false, subagents: ["FollowedUp"] });
+			expect(followUp.mock.calls[0]![0]).toMatchObject({ id: "FollowedUp", restore: true });
+		});
+	}
+
+	/**
+	 * Subagent FollowedUp's transcript under `mainFile`: a first turn that finished at
+	 * {@link FOLLOW_UP_START}, then, two minutes later, a turn its parent's message woke, which ended
+	 * because its key could not be resolved. `parentRecords` runs a minute after the first turn, to
+	 * write what the parent recorded between the two.
+	 */
+	async function writeFollowedUp(mainFile: string, cwd: string, parentRecords: () => void): Promise<void> {
+		setSystemTime(new Date(FOLLOW_UP_START));
+		const sub = await SessionManager.open(
+			path.join(mainFile.slice(0, -6), "FollowedUp.jsonl"),
+			undefined,
+			undefined,
+			{
+				initialCwd: cwd,
+				parentSession: mainFile,
+				suppressBreadcrumb: true,
+			},
+		);
+		sub.appendSessionInit({ systemPrompt: ["sub prompt"], task: "FollowedUp task", tools: ["read", "yield"] });
+		sub.appendMessage({ role: "user", content: "FollowedUp task", timestamp: Date.now() });
+		sub.appendMessage(assistant({ content: [{ type: "text", text: "first part done" }] }));
+		setSystemTime(new Date(FOLLOW_UP_START + 60_000));
+		parentRecords();
+		// The message woke the subagent; that turn ended because its key could not be resolved.
+		setSystemTime(new Date(FOLLOW_UP_START + 120_000));
+		sub.appendCustomMessageEntry("irc:incoming", "Now do the rest.", true, {
+			from: MAIN_AGENT_ID,
+			message: "Now do the rest.",
+		});
+		sub.appendMessage(assistant({ stopReason: "error", errorMessage: KEY_ERROR, credentialUnavailable: true }));
+		sub.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+		});
+		await sub.close();
+		setSystemTime();
 	}
 });

@@ -1,8 +1,24 @@
 import { expect, test } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "../../src/async";
 import { EVAL_STATUS_BRIDGE_NAME, runEvalStatus, runEvalWait } from "../../src/eval/handle-bridge";
 import { callSessionTool } from "../../src/eval/js/tool-bridge";
 import type { ToolSession } from "../../src/tools";
+
+/** A session manager that logs each eval job record appended and each flush, in order, into `log`. */
+function loggingSessionManager(log: string[]) {
+	return {
+		appendCustomEntry: (customType: string, data?: unknown) => {
+			log.push(`append ${customType} ${JSON.stringify(data)}`);
+			return "entry";
+		},
+		flush: async () => {
+			await Promise.resolve();
+			log.push("flushed");
+		},
+	};
+}
 
 test("settled eval progress is emitted once", async () => {
 	const manager = new AsyncJobManager({});
@@ -31,7 +47,9 @@ test("settled eval progress is emitted once", async () => {
 	await manager.dispose();
 });
 
-test("settled eval wait and status report the agent result the cell holds", async () => {
+test("eval wait reports the agent result it hands the cell, and status reports none", async () => {
+	// If this regresses, a `status()` or `done()` poll, which gives the cell only the run's state, reads to
+	// `omp --restore` as the handover of a result the cell never got.
 	const manager = new AsyncJobManager({});
 	const id = manager.register("task", "Scout", async () => "done", {
 		id: "settled-agent-result",
@@ -48,35 +66,33 @@ test("settled eval wait and status report the agent result the cell holds", asyn
 	};
 
 	runEvalStatus({ item: { kind: "agent", id } }, options);
+	expect(held).toEqual([]);
 	await runEvalWait({ items: [{ kind: "agent", id }] }, options);
-
-	expect(held).toEqual([{ id: "Scout" }, { id: "Scout" }]);
+	expect(held).toEqual([{ id: "Scout" }]);
 	await manager.dispose();
 });
 
-test("eval wait and status write `delivered` to disk before the cell gets a settled agent's result", async () => {
+test("eval wait writes `delivered` once, to disk, before the cell gets a settled agent's result; status writes nothing", async () => {
 	// If this regresses, a process that goes away after the cell read the result but before anything recorded it
-	// leaves the job `owed`, and `omp --restore` runs a subagent whose result the parent already has.
+	// leaves the job `owed`, and `omp --restore` runs a subagent whose result the parent already has; or a second
+	// wait() moves the handover's time past a turn the parent then messaged the subagent for; or every status poll
+	// writes a false handover and flushes the disk.
 	const manager = new AsyncJobManager({});
 	const ids = ["Waited", "Statused"].map(agentId =>
 		manager.register("task", agentId, async () => "done", { id: agentId, ownerId: "Main", agentId }),
 	);
 	await Promise.all(ids.map(id => manager.getJob(id)?.promise));
 	const log: string[] = [];
-	const sessionManager = {
-		appendCustomEntry: (customType: string, data?: unknown) => {
-			log.push(`append ${customType} ${JSON.stringify(data)}`);
-			return "entry";
-		},
-		flush: async () => {
-			await Promise.resolve();
-			log.push("flushed");
-		},
-	};
-	const session = { asyncJobManager: manager, getAgentId: () => "Main", sessionManager } as unknown as ToolSession;
+	const session = {
+		asyncJobManager: manager,
+		getAgentId: () => "Main",
+		sessionManager: loggingSessionManager(log),
+	} as unknown as ToolSession;
 
 	await runEvalWait({ items: [{ kind: "agent", id: "Waited" }] }, { session });
 	log.push("wait returned");
+	await runEvalWait({ items: [{ kind: "agent", id: "Waited" }] }, { session });
+	log.push("second wait returned");
 	await callSessionTool(EVAL_STATUS_BRIDGE_NAME, { item: { kind: "agent", id: "Statused" } }, { session });
 	log.push("status returned");
 
@@ -84,10 +100,74 @@ test("eval wait and status write `delivered` to disk before the cell gets a sett
 		'append eval-agent-job {"agentId":"Waited","state":"delivered"}',
 		"flushed",
 		"wait returned",
-		'append eval-agent-job {"agentId":"Statused","state":"delivered"}',
-		"flushed",
+		"second wait returned",
 		"status returned",
 	]);
+	await manager.dispose();
+});
+
+test("a bridged tool.wait records each subagent result it hands the cell before the cell gets it", async () => {
+	// If this regresses, a result a cell takes through `tool.wait` reaches no record `omp --restore` reads: an
+	// `agent()` job stays `owed` and a background `task` spawn stays "started", so the subagent runs again for a
+	// parent that already acted on its failure.
+	const manager = new AsyncJobManager({});
+	const id = manager.register("task", "Worker", async () => "done", {
+		id: "Worker",
+		ownerId: "Main",
+		agentId: "Worker",
+	});
+	await manager.getJob(id)?.promise;
+	const log: string[] = [];
+	const waitTool: AgentTool = {
+		name: "wait",
+		label: "Wait",
+		description: "Waits for background jobs",
+		parameters: type({}),
+		async execute() {
+			log.push("wait ran");
+			return {
+				content: [{ type: "text", text: "Worker failed." }],
+				details: {
+					op: "wait",
+					jobs: [
+						{
+							id: "Worker",
+							type: "task",
+							status: "failed",
+							label: "Worker",
+							durationMs: 5,
+							agentUrlId: "Worker",
+						},
+						{ id: "Busy", type: "task", status: "running", label: "Busy", durationMs: 5, agentUrlId: "Busy" },
+						{ id: "bash-1", type: "bash", status: "completed", label: "ls", durationMs: 5 },
+					],
+				},
+			};
+		},
+	};
+	const session = {
+		asyncJobManager: manager,
+		getAgentId: () => "Main",
+		sessionManager: loggingSessionManager(log),
+		getToolByName: (name: string) => (name === "wait" ? waitTool : undefined),
+	} as unknown as ToolSession;
+	const held: Array<{ id: string }> = [];
+	const onAgentResults = (results: Array<{ id: string }>) => held.push(...results);
+
+	await callSessionTool("wait", {}, { session, onAgentResults });
+	log.push("cell got the result");
+	await callSessionTool("wait", {}, { session, onAgentResults });
+	log.push("cell got it again");
+
+	expect(log).toEqual([
+		"wait ran",
+		'append eval-agent-job {"agentId":"Worker","state":"delivered"}',
+		"flushed",
+		"cell got the result",
+		"wait ran",
+		"cell got it again",
+	]);
+	expect(held).toEqual([{ id: "Worker" }, { id: "Worker" }]);
 	await manager.dispose();
 });
 

@@ -16,11 +16,12 @@
  * ordinary `async-result` of a job with the subagent's id, the id its first run's
  * job had, so a parent waiting on that job finds it again. A turn that ended because
  * its key could not be resolved handed its parent the failure at once: it goes on only
- * while the parent still waits on it, holding no result that settles it recorded since
- * the turn began ({@link SpawnRecords.awaitedByParent}); a parent that holds the failure
- * acts on it.
+ * on a record that its parent still waits on that turn ({@link SpawnRecords.parentStillWaits}).
+ * A parent that holds the failure acts on it, and a missing record proves nothing: a parent can
+ * background a cell, leave a branch, or take a result through another tool.
  */
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
 import { isTaskToolDetails, taskCardAgentIds } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError } from "../async";
@@ -41,10 +42,12 @@ import { extractSessionInit, type SessionManager } from "../session/session-mana
 import { collectSubSessions, type SubSession } from "../session/sub-sessions";
 import { RETRY_CANCELLED } from "../session/turn-recovery";
 import type { EventBus } from "../utils/event-bus";
+import { yieldEndsRun } from "../tools/yield";
 import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
 import { persistedAgentDefinition, persistedAgentName } from "./persisted-revive";
 import { formatTaskResultSummary } from "./result-summary";
 import { cfgTaskMaxRuntimeMs } from "./settings";
+import { readDiscardedLaunch } from "./speculative-launch";
 
 /** Where restored subagents' lifecycle and progress frames go, as a live run's do. */
 export interface RestoreOptions {
@@ -191,26 +194,47 @@ function endsOnStop(branch: readonly SessionEntry[]): boolean {
 }
 
 /**
- * What a parent transcript records of the subagents its `task` calls spawned:
- * `current`, those its `task` results name in the conversation on the active branch
- * after its last `/clear` (`reset_boundary`); `named`, those of every `task` result,
- * on any branch; `held`, those whose result that conversation holds
- * ({@link heldResultAgentIds}), each with when its latest such result was written, in epoch ms;
- * `waitsOnSpawnsSince`, from when (epoch ms) that conversation still waits on every subagent
- * spawned: the start of a `task` call that has no result (the call its process ended inside),
- * or of a last turn its process cut off ({@link liveTurnStartedAt}); undefined without either.
+ * What a parent transcript records of the subagents it spawned and of their results. Its
+ * current conversation is its active branch after its last `/clear` (`reset_boundary`).
  */
 interface SpawnedSubagents {
+	/** Those its `task` results in the current conversation name, settled or not (a background spawn's "started" result names it only in its progress). */
 	current: Set<string>;
+	/** Those any record of the current conversation names ({@link recordedAgentIds}). */
+	inConversation: Set<string>;
+	/** Those any record names, on any branch, before or after the last `/clear`. */
 	named: Set<string>;
-	held: Map<string, number>;
+	/** Streamed launches nobody adopted, from their discard records ({@link readDiscardedLaunch}): never the parent's work. */
+	discarded: Set<string>;
+	/**
+	 * Those whose result the current conversation holds ({@link heldResultAgentIds}) or whose eval
+	 * `agent()` job's latest record is `delivered`, each with when its latest such record was
+	 * written, in epoch ms. `delivered` is written before the result reaches the cell, so a process
+	 * that went away between the two leaves it.
+	 */
+	settled: Map<string, number>;
+	/** Eval `agent()` jobs whose latest record in the current conversation is `owed`: a result still owed to the parent. */
+	owedJobs: Set<string>;
 	/** When that last `/clear` was written, in epoch ms; undefined without one. */
 	clearedAt: number | undefined;
-	waitsOnSpawnsSince: number | undefined;
-	/** Eval `agent()` jobs whose latest record in that conversation is `owed`: a result still owed to the parent. */
-	owedJobs: Set<string>;
-	/** Eval `agent()` jobs whose latest record is `delivered`, each with when it was written, in epoch ms. */
-	deliveredJobs: Map<string, number>;
+	/** The windows of the calls the parent's process ended inside ({@link cutOffWindows}). */
+	cutOffWindows: CutOffWindow[];
+}
+
+/** When (epoch ms) a call the parent's process ended inside started, and when its turn ended (`Infinity`: it never did). */
+interface CutOffWindow {
+	startedAt: number;
+	endedAt: number;
+}
+
+/**
+ * The subagent ids a parent's transcript entry names: a `task` result's (its settled results and
+ * its spawns' progress), the ones an `eval` result's `agentResults`, a job delivery or a `wait`
+ * hands it, and an eval `agent()` job record's.
+ */
+function recordedAgentIds(entry: SessionEntry): string[] {
+	const job = readEvalAgentJobRecord(entry);
+	return [...taskResultAgentIds(entry), ...heldResultAgentIds(entry, true), ...(job ? [job.agentId] : [])];
 }
 
 /** The subagent ids a persisted `task` tool result names: its settled results and its spawns' progress. */
@@ -262,19 +286,27 @@ function evalHeldAgentIds(details: unknown, wentOn: boolean): string[] {
 /**
  * Whether a parent's transcript entry is a turn it took, so it read the results before it
  * on its branch: an assistant message, other than the record that ends a turn when its
- * process goes away. That is the interrupted-turn abort ({@link isInterruptedTurnAbort}),
- * which exit recovery writes and a dispose for the process exit leaves, or the abort
- * without a reason ({@link isReasonlessAbort}) that a dispose for anything else leaves
- * (a quit, `/restart`, a signal). A stop the session makes itself (`/new`, the task
- * executor ending a parent subagent's run) leaves that record too, but it stops the turn's
- * sync subagents with it, and `--restore` leaves their turns anyway. The user's stop gives
- * its own reason: the parent lived on and chose to stop there.
+ * process goes away ({@link isProcessExitRecord}). A stop the session makes itself (`/new`,
+ * the task executor ending a parent subagent's run) leaves that record too, but it stops the
+ * turn's sync subagents with it, and `--restore` leaves their turns anyway. The user's stop
+ * gives its own reason: the parent lived on and chose to stop there.
  */
 function parentWentOn(entry: SessionEntry): boolean {
-	if (entry.type !== "message" || entry.message.role !== "assistant") return false;
-	const { message } = entry;
-	const reasonlessAbort = message.stopReason === "aborted" && isReasonlessAbort(message);
-	return !isInterruptedTurnAbort(message) && !reasonlessAbort;
+	return entry.type === "message" && entry.message.role === "assistant" && !isProcessExitRecord(entry.message);
+}
+
+/**
+ * Whether `message` is the record a turn ends on when its process goes away: the
+ * interrupted-turn abort ({@link isInterruptedTurnAbort}), which exit recovery writes and a
+ * dispose for the process exit leaves, or the abort without a reason ({@link isReasonlessAbort})
+ * that a dispose for anything else leaves (a quit, `/restart`, a signal). An abort that gives a
+ * reason (the user's stop, a stopped retry, a caller's own reason) ended a turn that lived on.
+ */
+function isProcessExitRecord(message: AgentMessage): boolean {
+	return (
+		isInterruptedTurnAbort(message) ||
+		(message.role === "assistant" && message.stopReason === "aborted" && isReasonlessAbort(message))
+	);
 }
 
 /**
@@ -297,6 +329,14 @@ function settledJobAgentIds(details: unknown): string[] {
 	return ids;
 }
 
+/** Whether a transcript entry is input that starts a turn: a message other than a reply or a tool result, or a custom message. */
+function isTurnInput(entry: SessionEntry): boolean {
+	return (
+		entry.type === "custom_message" ||
+		(entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult")
+	);
+}
+
 /**
  * When the branch's last turn began, in epoch ms: when the input that started it was
  * written (the task prompt, or the message that woke the subagent again), the last entry
@@ -305,48 +345,117 @@ function settledJobAgentIds(details: unknown): string[] {
 function lastTurnStartedAt(branch: readonly SessionEntry[]): number | undefined {
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index]!;
-		const input =
-			entry.type === "custom_message" ||
-			(entry.type === "message" && entry.message.role !== "assistant" && entry.message.role !== "toolResult");
-		if (input) return Date.parse(entry.timestamp);
+		if (isTurnInput(entry)) return Date.parse(entry.timestamp);
+	}
+	return undefined;
+}
+
+/** When an assistant message started, in epoch ms: a streamed launch can spawn before the message is saved. */
+function messageStartedAt(entry: Extract<SessionEntry, { type: "message" }>): number {
+	return Number.isFinite(entry.message.timestamp) ? entry.message.timestamp : Date.parse(entry.timestamp);
+}
+
+/**
+ * The windows of the calls a parent's process ended inside, read on its current conversation
+ * (`conversation`, part of the branch `entries` selects): a subagent no record names, spawned in
+ * one, is that call's work.
+ * - The last turn, when it was still live as the transcript was last written: it ends in a reply's
+ *   calls, their results, or the record a process exit leaves ({@link isProcessExitRecord}). Its
+ *   call is the last reply that makes calls; with no reply saved, the reply that streamed when the
+ *   process went away, from the turn's input on, or from the last entry of a reply it replaced
+ *   there. The window runs on to the end. A turn its run ended with a terminal `yield`
+ *   ({@link yieldEndsRun}) is not live, though the executor then stops the session with an abort
+ *   that gives no reason.
+ * - The latest reply with a call no result answers: the agent loop answers every call it finishes,
+ *   an aborted one too, so the process ended inside it (a hard kill). Its window ends at the next
+ *   input after it, when the conversation went on.
+ * A call before the live one got its result, an older turn ended, and a branch the parent left is
+ * not on this one, so none of them opens a window.
+ */
+function cutOffWindows(conversation: readonly SessionEntry[], entries: readonly SessionEntry[]): CutOffWindow[] {
+	const windows: CutOffWindow[] = [];
+	const live = liveCallStartedAt(conversation, entries);
+	if (live !== undefined) windows.push({ startedAt: live, endedAt: Number.POSITIVE_INFINITY });
+	const answered = new Set<string>();
+	for (const entry of conversation) {
+		if (entry.type === "message" && entry.message.role === "toolResult") answered.add(entry.message.toolCallId);
+	}
+	for (let index = conversation.length - 1; index >= 0; index--) {
+		const entry = conversation[index]!;
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		if (!entry.message.content.some(part => part.type === "toolCall" && !answered.has(part.id))) continue;
+		const nextInput = conversation.slice(index + 1).find(isTurnInput);
+		windows.push({
+			startedAt: messageStartedAt(entry),
+			endedAt: nextInput ? Date.parse(nextInput.timestamp) : Number.POSITIVE_INFINITY,
+		});
+		break;
+	}
+	return windows;
+}
+
+/** When the call of the conversation's live last turn started ({@link cutOffWindows}); undefined when that turn is not live. */
+function liveCallStartedAt(
+	conversation: readonly SessionEntry[],
+	entries: readonly SessionEntry[],
+): number | undefined {
+	for (let index = conversation.length - 1; index >= 0; index--) {
+		const entry = conversation[index]!;
+		if (isTurnInput(entry)) return replyStreamStartedAt(conversation, entries, index);
+		if (entry.type !== "message") continue;
+		const { message } = entry;
+		if (message.role === "toolResult") {
+			if (message.toolName === "yield" && !message.isError && yieldEndsRun(message.details)) return undefined;
+			continue;
+		}
+		if (message.role !== "assistant") continue;
+		if (message.content.some(part => part.type === "toolCall")) return messageStartedAt(entry);
+		// A reply that ended the turn, other than the record of a process exit.
+		if (!isProcessExitRecord(message)) return undefined;
 	}
 	return undefined;
 }
 
 /**
- * When the conversation's last turn began (epoch ms), while that turn was still live when the
- * transcript was last written: it has no reply yet, ends in a tool call or a tool result, or ends
- * on the record a process going away leaves ({@link isInterruptedTurnAbort}, {@link isReasonlessAbort}).
- * Such a parent still waits on what that turn started. Undefined for a turn that ended.
+ * When the reply to the input at `conversation[inputIndex]` began streaming, its turn having no
+ * reply saved: when the input was written, or after the last entry of a reply the parent replaced
+ * on a branch it left there, whose calls ended before the parent went back to the input.
  */
-function liveTurnStartedAt(conversation: readonly SessionEntry[]): number | undefined {
-	const tail = conversation.findLast(entry => entry.type === "message" || entry.type === "custom_message");
-	if (!tail) return undefined;
-	if (tail.type === "message" && tail.message.role === "assistant") {
-		const { message } = tail;
-		const endsInCall = message.content.some(part => part.type === "toolCall");
-		const exitRecord =
-			isInterruptedTurnAbort(message) ||
-			(message.stopReason === "aborted" &&
-				!isUserInterruptAbort(message) &&
-				message.errorMessage !== RETRY_CANCELLED);
-		if (!endsInCall && !exitRecord) return undefined;
+function replyStreamStartedAt(
+	conversation: readonly SessionEntry[],
+	entries: readonly SessionEntry[],
+	inputIndex: number,
+): number {
+	const onBranch = new Map(conversation.map((entry, index) => [entry.id, index]));
+	const parentOf = new Map(entries.map(entry => [entry.id, entry.parentId]));
+	let startedAt = Date.parse(conversation[inputIndex]!.timestamp);
+	for (const entry of entries) {
+		if (onBranch.has(entry.id)) continue;
+		let ancestor = entry.parentId;
+		while (ancestor && !onBranch.has(ancestor)) ancestor = parentOf.get(ancestor) ?? null;
+		const forkedAt = ancestor ? onBranch.get(ancestor) : undefined;
+		if (forkedAt === undefined || forkedAt < inputIndex) continue;
+		const writtenAt = Date.parse(entry.timestamp);
+		if (writtenAt > startedAt) startedAt = writtenAt;
 	}
-	return lastTurnStartedAt(conversation);
+	return startedAt;
 }
 
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
 	const named = new Set<string>();
-	for (const entry of entries) for (const id of taskResultAgentIds(entry)) named.add(id);
+	const discarded = new Set<string>();
+	for (const entry of entries) {
+		for (const id of recordedAgentIds(entry)) named.add(id);
+		const launch = readDiscardedLaunch(entry);
+		if (launch) discarded.add(launch);
+	}
 	const current = new Set<string>();
-	const held = new Map<string, number>();
+	const inConversation = new Set<string>();
+	const settled = new Map<string, number>();
+	const owedJobs = new Set<string>();
+	const seenJobs = new Set<string>();
 	let clearedAt: number | undefined;
 	let conversationStart = 0;
-	let pendingTaskCallAt: number | undefined;
-	const answeredCalls = new Set<string>();
-	const owedJobs = new Set<string>();
-	const deliveredJobs = new Map<string, number>();
-	const seenJobs = new Set<string>();
 	// Whether the parent took a turn after the entry being read ({@link parentWentOn}).
 	let wentOn = false;
 	const branch = activeBranch(entries, leafId);
@@ -357,52 +466,41 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 			conversationStart = index + 1;
 			break;
 		}
-		if (entry.type === "message" && entry.message.role === "toolResult") answeredCalls.add(entry.message.toolCallId);
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const pending = entry.message.content.some(
-				part => part.type === "toolCall" && part.name === "task" && !answeredCalls.has(part.id),
-			);
-			// The message starts before the call is saved, and a streamed launch can spawn in between.
-			if (pending)
-				pendingTaskCallAt = Number.isFinite(entry.message.timestamp)
-					? entry.message.timestamp
-					: Date.parse(entry.timestamp);
-		}
+		for (const id of taskResultAgentIds(entry)) current.add(id);
+		for (const id of recordedAgentIds(entry)) inConversation.add(id);
+		const writtenAt = Date.parse(entry.timestamp);
+		// Read from the leaf back: the first record of a job, and the first result naming a subagent, is its latest.
 		const job = readEvalAgentJobRecord(entry);
-		// Read from the leaf back: the first record of a job is its latest.
 		if (job && !seenJobs.has(job.agentId)) {
 			seenJobs.add(job.agentId);
 			if (job.state === "owed") owedJobs.add(job.agentId);
-			else deliveredJobs.set(job.agentId, Date.parse(entry.timestamp));
+			else if (!settled.has(job.agentId)) settled.set(job.agentId, writtenAt);
 		}
-		for (const id of taskResultAgentIds(entry)) current.add(id);
-		// Read from the leaf back: the first result naming a subagent is its latest.
-		for (const id of heldResultAgentIds(entry, wentOn)) if (!held.has(id)) held.set(id, Date.parse(entry.timestamp));
+		for (const id of heldResultAgentIds(entry, wentOn)) if (!settled.has(id)) settled.set(id, writtenAt);
 		if (parentWentOn(entry)) wentOn = true;
 	}
-	const liveTurnAt = liveTurnStartedAt(branch.slice(conversationStart));
-	const since = [pendingTaskCallAt, liveTurnAt].filter((at): at is number => at !== undefined && Number.isFinite(at));
 	return {
 		current,
+		inConversation,
 		named,
-		held,
-		clearedAt,
-		waitsOnSpawnsSince: since.length > 0 ? Math.min(...since) : undefined,
+		discarded,
+		settled,
 		owedJobs,
-		deliveredJobs,
+		clearedAt,
+		cutOffWindows: cutOffWindows(branch.slice(conversationStart), entries),
 	};
 }
 
 /**
- * Whether `sub` was spawned in its parent's current conversation, judged by `spawned`,
- * the parent's `task` results: one after the parent's last `/clear` on its active branch
- * names it. A result anywhere else (before that `/clear`, or on a branch the parent
- * left) places it in work the parent left behind. When no result names it, the parent's
- * process ended inside the call that spawned it, before the result was written: the
- * subagent's transcript then says when it was spawned, which must be after that `/clear`.
+ * Whether `sub` was spawned in its parent's current conversation, judged by `spawned`: a
+ * record of that conversation names it. A record anywhere else (before the last `/clear`, or
+ * on a branch the parent left) places it in work the parent left behind. When no record
+ * names it, the parent's process ended inside the call that spawned it, before the call's
+ * result was written: the subagent's transcript then says when it was spawned, which must be
+ * after that `/clear`.
  */
 function spawnedInCurrentConversation(sub: SubSession, spawned: SpawnedSubagents): boolean {
-	if (spawned.current.has(sub.agentId)) return true;
+	if (spawned.inConversation.has(sub.agentId)) return true;
 	if (spawned.named.has(sub.agentId)) return false;
 	if (spawned.clearedAt === undefined || !sub.header) return true;
 	// An unreadable time judges nothing, and the subagent goes on.
@@ -445,31 +543,30 @@ class SpawnRecords {
 	}
 
 	/**
-	 * Whether `sub`'s own parent positively records that it still waits on `sub`'s turn that began
-	 * at `turnStartedAt` (epoch ms): a result in its current conversation names `sub`'s run and none
-	 * written since settles it, or no record names `sub` and the parent still waited on what it
-	 * spawned when `sub` was spawned ({@link SpawnedSubagents.waitsOnSpawnsSince}). Missing records
-	 * are not evidence: a parent can background a cell, leave a branch, or wait through another tool.
+	 * Whether `sub`'s own parent records that it still waits on `sub`'s turn that began at
+	 * `turnStartedAt` (epoch ms), read in this order:
+	 * - a result of `sub`'s run handed over (`settled`): written since the turn began, it settles
+	 *   the turn; written before, it answered an earlier turn, and this one is a turn the parent
+	 *   messaged `sub` for, so the parent waits (an unreadable or unknown time judges nothing, and
+	 *   the result stands);
+	 * - else a `task` result that names the run and settles none of it (`current`: a background
+	 *   spawn's "started" result, or a sync call's result the process exit cut off), or an eval
+	 *   `agent()` job still `owed`: the parent waits;
+	 * - else `sub` was spawned in the window of a call the parent's process went away inside
+	 *   ({@link SpawnedSubagents.cutOffWindows}), and is not a streamed launch that call discarded
+	 *   unadopted.
+	 * Nothing else is evidence of a wait.
 	 */
 	parentStillWaits(sub: SubSession, turnStartedAt: number | undefined): boolean {
 		const parent = this.#ofParent(sub.parent);
 		if (!parent) return false;
-		// A job result handed over (or being handed over: `delivered` is written first) never runs again;
-		// a later turn the parent messaged the subagent for is a new run.
-		const deliveredAt = parent.deliveredJobs.get(sub.agentId);
-		if (deliveredAt !== undefined && !(turnStartedAt !== undefined && deliveredAt < turnStartedAt)) return false;
-		if (parent.current.has(sub.agentId)) {
-			const heldAt = parent.held.get(sub.agentId);
-			if (heldAt === undefined) return true;
-			// An unreadable or unknown time judges nothing, and the result stands.
-			return turnStartedAt !== undefined && heldAt < turnStartedAt;
-		}
-		if (parent.named.has(sub.agentId) || parent.held.has(sub.agentId)) return false;
-		if (parent.owedJobs.has(sub.agentId)) return true;
-		const since = parent.waitsOnSpawnsSince;
-		if (since === undefined || !sub.header) return false;
+		const settledAt = parent.settled.get(sub.agentId);
+		if (settledAt !== undefined) return turnStartedAt !== undefined && settledAt < turnStartedAt;
+		if (parent.current.has(sub.agentId) || parent.owedJobs.has(sub.agentId)) return true;
+		if (!sub.header || parent.discarded.has(sub.agentId)) return false;
 		const spawnedAt = Date.parse(sub.header.timestamp);
-		return Number.isFinite(spawnedAt) && spawnedAt >= since;
+		if (!Number.isFinite(spawnedAt)) return false;
+		return parent.cutOffWindows.some(window => spawnedAt >= window.startedAt && spawnedAt <= window.endedAt);
 	}
 
 	/** What the parent `key` records (`null`: the session itself); undefined for a parent not collected. */

@@ -4,7 +4,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { appendEvalAgentJobRecords, recordEvalAgentJobs } from "./agent-job-records";
+import { recordHandovers } from "./agent-job-records";
 import { withBridgeTimeoutPause } from "./bridge-timeout";
 import { type CompletionAttempt, getCompletionHandle, type CompletionHandleEntry } from "./completion-bridge";
 import type { JsStatusEvent } from "./js/shared/types";
@@ -294,21 +294,18 @@ export async function runEvalWait(
 				throw new ToolAbortError(undefined, { cause: options.signal?.reason });
 			}
 			const snapshots = resolved.map(snapshot);
-			const settledAgentIds = resolved
-				.filter(handle => "job" in handle && handle.job.status !== "running")
-				.map(handle => handle.ref.id);
-			const settledAgents = resolved.flatMap(handle =>
-				"job" in handle && handle.job.status !== "running" ? [{ id: handle.job.agentId ?? handle.job.id }] : [],
+			const settled = resolved.flatMap((handle): Array<Extract<ResolvedHandle, { job: unknown }>> =>
+				"job" in handle && handle.job.status !== "running" ? [handle] : [],
 			);
+			const settledAgents = settled.map(handle => ({ id: handle.job.agentId ?? handle.job.id }));
 			// `delivered` reaches the disk before the cell gets the results: a process that goes away in between
 			// leaves `delivered`, which `omp --restore` never runs again.
-			await recordEvalAgentJobs(
+			await recordHandovers(
 				options.session,
-				settledAgents.map(agent => agent.id),
-				"delivered",
+				settled.map(handle => ({ agentId: handle.job.agentId ?? handle.job.id, job: handle.job })),
 			);
 			const manager = options.session.asyncJobManager;
-			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			if (manager && settled.length > 0) manager.consumeJobResults(settled.map(handle => handle.ref.id));
 			if (settledAgents.length > 0) options.onAgentResults?.(settledAgents);
 			return { items: snapshots };
 		},
@@ -317,18 +314,13 @@ export async function runEvalWait(
 }
 
 /**
- * Return one handle's current state without waiting or consuming it. A settled agent's snapshot
- * carries its result to the cell, so its `delivered` record is appended first; the caller waits
- * for the session's writes ({@link ToolSession.sessionManager}) before it hands the snapshot over.
+ * Return one handle's current state without waiting or consuming it. The cell's `status()`,
+ * `done()` and `attempts()` read only the state and the attempts from it, never a result, so it
+ * records no handover and reports no agent result.
  */
 export function runEvalStatus(args: unknown, options: EvalHandleBridgeOptions): EvalHandleSnapshot {
 	const resolved = resolveHandle(parseSingleRef(args), options);
 	const result = snapshot(resolved);
-	if ("job" in resolved && resolved.job.status !== "running") {
-		const id = resolved.job.agentId ?? resolved.job.id;
-		appendEvalAgentJobRecords(options.session, [id], "delivered");
-		options.onAgentResults?.([{ id }]);
-	}
 	if ("completion" in resolved) result.attempts = resolved.completion.attempts.map(attempt => ({ ...attempt }));
 	return result;
 }

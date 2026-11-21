@@ -83,7 +83,7 @@ import {
 	type StructuredSubagentRequest,
 } from "./structured-subagent";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
-import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
+import { TASK_LAUNCH_DISCARDED_CUSTOM_TYPE, type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 import type { TextTap } from "../job-widgets/text-tap";
 import type { SubagentToolResult } from "./executor";
 import { appendToolResult, createTaskWidgetInputs } from "./widget-inputs";
@@ -897,6 +897,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return typeof plan === "string" ? undefined : plan.spawns;
 		},
 		start: (toolCallId, spawn, index, signal) => this.#startSpeculative(toolCallId, spawn, index, signal),
+		discard: (run, reason) => this.#discardLaunch(run, reason),
 	};
 
 	/**
@@ -1120,6 +1121,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return this.#launch({ toolCallId, params: spawn, index, agentId, detached });
 	}
 
+	/**
+	 * Abort a speculative run nobody adopted, and record that in the parent's transcript: a run
+	 * whose turn ended on a key error before the discard reached it would otherwise read to
+	 * `omp --restore` as a spawn of the call the parent's process went away inside.
+	 */
+	#discardLaunch(run: SpawnRun, reason: string): void {
+		this.session.sessionManager?.appendCustomEntry(TASK_LAUNCH_DISCARDED_CUSTOM_TYPE, {
+			agentId: run.identity.agentId,
+		});
+		run.discard(reason);
+	}
+
 	#getSpawnSemaphore(): Semaphore {
 		const max = cfgTaskMaxConcurrency.get(this.session.settings);
 		if (this.#spawnSemaphore) {
@@ -1271,7 +1284,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const adopted = launchSession ? await launchSession.adopt(normalizedSpawnParams) : new Map<number, SpawnRun>();
 		for (const [index, run] of adopted) {
 			if (run.identity.detached === (manager !== undefined && !itemBlocking[index])) continue;
-			run.discard("task execution mode changed after speculative launch");
+			this.#discardLaunch(run, "task execution mode changed after speculative launch");
 			adopted.delete(index);
 		}
 		const depthCapacity = canSpawnAtDepth(

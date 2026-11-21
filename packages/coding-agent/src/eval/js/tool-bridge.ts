@@ -17,6 +17,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
+import { recordHandovers, waitHandedSubagents } from "../agent-job-records";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
 import { EVAL_COMPLETION_BRIDGE_NAME, type EvalCompletionHandleResult, runEvalCompletion } from "../completion-bridge";
@@ -280,10 +281,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		return await runEvalWait(args, options);
 	}
 	if (name === EVAL_STATUS_BRIDGE_NAME) {
-		const status = runEvalStatus(args, options);
-		// A settled agent's `delivered` record reaches the disk before the cell reads its result.
-		await options.session.sessionManager?.flush();
-		return status;
+		return runEvalStatus(args, options);
 	}
 	if (name === EVAL_CANCEL_BRIDGE_NAME) {
 		return runEvalCancel(args, options);
@@ -383,6 +381,19 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					...(agent.workerLost ? { workerLost: true } : {}),
 				})),
 			);
+		}
+		if (name === "wait") {
+			// A wait hands the cell its settled jobs' results and consumes them, so no delivery records the
+			// handover: record each subagent's before the cell gets it, and name it in the eval result.
+			const handed = waitHandedSubagents(result.details);
+			if (handed.length > 0) {
+				const manager = options.session.asyncJobManager;
+				await recordHandovers(
+					options.session,
+					handed.map(run => ({ agentId: run.agentId, job: manager?.getJob(run.jobId) })),
+				);
+				options.onAgentResults?.(handed.map(run => ({ id: run.agentId })));
+			}
 		}
 		const replies = reply === undefined ? toolResultReplies(result.details) : [reply];
 		if (replies.length > 0) {

@@ -103,6 +103,12 @@ const AGENT_CELL = [
 	"try { print(await wait([handle])); } catch (error) { print(String(error)); }",
 ].join("\n");
 
+/** A cell that runs the worker as an `agent()` job and takes its result with the bridged `tool.wait`. */
+const AGENT_TOOL_WAIT_CELL = [
+	`await agent(${JSON.stringify(TASK_ARGS.tasks[0]!.task)}, { agent: ${JSON.stringify(WORKER.name)} });`,
+	"try { print(await tool.wait({})); } catch (error) { print(String(error)); }",
+].join("\n");
+
 const DELEGATIONS = {
 	"a task call": { type: "toolCall" as const, id: "call_task", name: "task", arguments: TASK_ARGS },
 	"an eval cell's tool.task": {
@@ -128,6 +134,12 @@ const DELEGATIONS = {
 		id: "call_agent_background_eval",
 		name: "eval",
 		arguments: { language: "js", code: AGENT_CELL, timeout: 0 },
+	},
+	"an eval cell's agent() and tool.wait()": {
+		type: "toolCall" as const,
+		id: "call_agent_tool_wait_eval",
+		name: "eval",
+		arguments: { language: "js", code: AGENT_TOOL_WAIT_CELL, timeout: 0 },
 	},
 };
 
@@ -205,7 +217,12 @@ async function runParent(call: (typeof DELEGATIONS)[keyof typeof DELEGATIONS]) {
 			"eval.autoBackground.enabled": call.id === "call_agent_background_eval",
 			"eval.autoBackground.thresholdMs": 1,
 		}),
-		toolNames: call.name === "eval" ? ["eval", "task"] : ["task"],
+		toolNames:
+			call.name !== "eval"
+				? ["task"]
+				: call.id === "call_agent_tool_wait_eval"
+					? ["eval", "task", "wait"]
+					: ["eval", "task"],
 		spawns: "*",
 		disableExtensionDiscovery: true,
 		skills: [],

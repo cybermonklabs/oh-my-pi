@@ -2,7 +2,8 @@
  * `omp --restore` and a parent's sync subagents waiting to retry a key that could not
  * be resolved, when the parent's abort reaches them: a launch the parent's streamed
  * `task` call discards unadopted is stopped, so `--restore` relaunches nothing for a job
- * the parent never adopted; launches the call adopted but never started, because the
+ * the parent never adopted, nor for one whose retries ran out before the discard, which
+ * the parent's transcript records; launches the call adopted but never started, because the
  * call was aborted first, follow that abort: the parent's process exit leaves them
  * restorable, the parent's stop ends them; a stop of a continuation turn (one a queued
  * steer started) without a reason stops its subagent too; the parent's process exit
@@ -18,6 +19,7 @@ import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import type { AgentToolCall, SpeculativeOperationSink } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import * as envApiKey from "@oh-my-pi/pi-ai/env-api-key";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
@@ -31,8 +33,8 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { hasRestorableTurn } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
-import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { hasRestorableTurn, plainTurnAbortReason } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { GENERIC_ABORT_SENTINEL, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { activeBranch, type SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { collectSubSessions, type SubSession } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
@@ -162,6 +164,23 @@ function holdBackoff(expected: number) {
 	return { allHeld: Promise.all(holds.map(hold => hold.promise)), wait };
 }
 
+/** Makes every retry backoff pass at once; returns the spies, to restore. */
+function instantBackoff() {
+	// Turn recovery sleeps through sleepLong and sleepUntil, which recheck the real clock, so an instant
+	// scheduler.wait alone would be called again and again until the real deadline.
+	return [
+		vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+			options?.signal?.throwIfAborted();
+		}),
+		vi.spyOn(piUtils, "sleepLong").mockImplementation(async (_delayMs, signal) => {
+			signal?.throwIfAborted();
+		}),
+		vi.spyOn(piUtils, "sleepUntil").mockImplementation(async (_deadlineMs, signal) => {
+			signal?.throwIfAborted();
+		}),
+	];
+}
+
 /**
  * A parent session on the production SDK path whose batch `task` tool runs `WORKER`
  * subagents in sync (no background jobs); a turn of its model spawns one worker, by a
@@ -222,9 +241,11 @@ async function openParentWithKeyedWorkers(
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [WORKER], projectAgentsDir: null });
 	const runSubprocess = executorModule.runSubprocess;
 	const runs: Promise<SingleResult>[] = [];
+	const firstRunStarted = Promise.withResolvers<void>();
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(options => {
 		const run = runSubprocess(options);
 		runs.push(run);
+		firstRunStarted.resolve();
 		return run;
 	});
 	const { session } = await createAgentSession({
@@ -272,17 +293,19 @@ async function openParentWithKeyedWorkers(
 			: await task?.speculation?.stream?.open({ coordinator: launchSink, parentToolCallId: CALL.id });
 	if (!task || (options.openSpeculation !== false && !launches))
 		throw new Error("Expected the task tool to launch streamed items");
-	return { parent: session, task, launches, runs };
+	return { parent: session, task, launches, runs, firstRunStarted: firstRunStarted.promise };
 }
 
 /**
  * Ends the parent's process once its subagent runs settled (every live session closes),
  * then has a new process restore the parent's session from its file: what `--restore`
- * relaunched, the parent's entries it read, and the subagent transcripts it judged.
+ * relaunched, the parent's entries it read, and the subagent transcripts it judged. An entry
+ * `neutralize` selects is read as a custom entry of another type, in its place in the tree.
  */
 async function restoreInNewProcess(
 	parent: AgentSession,
 	runs: readonly Promise<SingleResult>[],
+	neutralize?: (entry: SessionEntry) => boolean,
 ): Promise<{ outcome: RestoreOutcome; parentEntries: SessionEntry[]; subagents: SubSession[] }> {
 	await Promise.allSettled(runs);
 	const parentFile = parent.sessionManager.getSessionFile();
@@ -294,7 +317,11 @@ async function restoreInNewProcess(
 	AgentRegistry.resetGlobalForTests();
 	// The new process reads the parent's transcript as the last one left it in its file.
 	const reopened = await SessionManager.open(parentFile, undefined, undefined, { suppressBreadcrumb: true });
-	const parentEntries = reopened.getEntries();
+	const parentEntries = reopened
+		.getEntries()
+		.map(entry =>
+			entry.type === "custom" && neutralize?.(entry) ? { ...entry, customType: "neutralized-by-test" } : entry,
+		);
 	const leafId = reopened.getLeafId();
 	await reopened.close();
 	const manager = new AsyncJobManager({});
@@ -374,11 +401,111 @@ describe("omp --restore after a streamed task call discarded a sync launch waiti
 	}, 30_000);
 });
 
+describe("omp --restore after the parent's process exit cut off a streamed task call that discarded a launch whose retries had run out", () => {
+	for (const [label, keepDiscardRecord] of [
+		["relaunches nothing: the parent's transcript records the discard", true],
+		["control: relaunches the launch when the discard record is read as another entry", false],
+	] as const) {
+		it(
+			label,
+			async () => {
+				// If this regresses, a launch nobody adopted, whose turn ended on its key error while the call still
+				// streamed, reads as a spawn of the call the parent's process went away inside: `omp --restore` relaunches
+				// it, and the parent gets a result for a job it never adopted.
+				const waits = instantBackoff();
+				const { parent, launches, runs, firstRunStarted } = await openParentWithKeyedWorkers();
+				if (!launches) throw new Error("Expected streamed launches");
+				parent.sessionManager.appendMessage({
+					role: "user",
+					content: "Delegate reading the notes.",
+					timestamp: Date.now(),
+				});
+				// The reply that makes the call starts streaming here; the process exit saves it cut off (below).
+				const replyStartedAt = Date.now();
+				const launched = batchCall(["SpentWorker"]);
+				await launches.update(CALL, JSON.stringify(launched));
+				// The worker's retries run out, and its turn ends on the key error, while the call still streams.
+				await firstRunStarted;
+				await Promise.allSettled(runs);
+				expect(runs).toHaveLength(1);
+				// The call finishes with other arguments, so dispatch never adopts the launch; then the process goes away.
+				await launches.finalize({
+					toolCall: CALL,
+					args: { ...launched, tasks: [{ ...launched.tasks[0]!, task: "Summarize the notes instead." }] },
+				});
+				const cutOffReply: AssistantMessage = {
+					role: "assistant",
+					content: [{ ...CALL, arguments: launched }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "parent-model",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "aborted",
+					errorMessage: GENERIC_ABORT_SENTINEL,
+					errorId: AIError.create(AIError.Flag.Abort),
+					timestamp: replyStartedAt,
+				};
+				parent.sessionManager.appendMessage(cutOffReply);
+
+				const { outcome, subagents } = await restoreInNewProcess(
+					parent,
+					runs,
+					keepDiscardRecord
+						? undefined
+						: entry => entry.type === "custom" && entry.customType === "task-launch-discarded",
+				);
+				for (const wait of waits) wait.mockRestore();
+
+				const ids = subagents.map(sub => sub.agentId);
+				expect(ids).toHaveLength(1);
+				expect(subagents.map(turnEnd)).toEqual([
+					{ stopReason: "error", credentialUnavailable: true, restorable: true },
+				]);
+				expect(outcome.subagents).toEqual(keepDiscardRecord ? [] : ids);
+			},
+			30_000,
+		);
+	}
+});
+
+describe("omp --restore after a sync task call was stopped before the launches it adopted started", () => {
+	it("follows the parent's stop", async () => {
+		// If this regresses, the subagents the call adopted read its stop as a cut-off: their turns keep the marked
+		// error, and `--restore` relaunches the subagents of a call the parent stopped.
+		const { parent, task, launches, runs } = await openParentWithKeyedWorkers();
+		const backoff = holdBackoff(2);
+		const launched = batchCall(["FirstWorker", "SecondWorker"]);
+		if (!launches) throw new Error("Expected streamed launches");
+		await launches.update(CALL, JSON.stringify(launched));
+		await backoff.allHeld;
+		expect(runs).toHaveLength(2);
+		await launches.finalize({ toolCall: CALL, args: launched });
+		// The parent's turn was stopped while the call was being dispatched, before its spawns started.
+		const call = new AbortController();
+		call.abort(plainTurnAbortReason("stop"));
+		await task.execute(CALL.id, launched, call.signal);
+
+		const { outcome, subagents } = await restoreInNewProcess(parent, runs);
+		backoff.wait.mockRestore();
+
+		expect(subagents.map(sub => sub.agentId)).toHaveLength(2);
+		expect(outcome.subagents).toEqual([]);
+		const stopped: TurnEnd = { stopReason: "aborted", credentialUnavailable: undefined, restorable: false };
+		expect(subagents.map(turnEnd)).toEqual([stopped, stopped]);
+	}, 30_000);
+});
+
 describe("omp --restore after a real parent task turn is cut off while its two sync subagents wait to retry their keys", () => {
 	it("relaunches both subagents", async () => {
-		// A real message_end persists the pending task call before the tool runs (agent-loop.ts:1660-1663,
-		// :1800; agent-session.ts:5378-5379, :4927-4930). A process exit writes the interrupt record,
-		// supplying evidence (b) and (c) for both launches.
+		// The agent loop ends the assistant message, with its pending `task` call, and the session saves it before the
+		// call's tool runs; the process exit then writes the interrupt record. That cut-off call spawned both launches.
 		const { parent, runs } = await openParentWithKeyedWorkers("task", {
 			openSpeculation: false,
 			workerNames: ["FirstWorker", "SecondWorker"],
@@ -407,19 +534,7 @@ describe("omp --restore after a real parent task turn is cut off while its two s
 			openSpeculation: false,
 			workerNames: ["FirstWorker", "SecondWorker"],
 		});
-		// Both workers' backoffs pass at once. Turn recovery sleeps through sleepLong, which rechecks the real
-		// clock, so an instant scheduler.wait alone would be called again and again until the real deadline.
-		const waits = [
-			vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
-				options?.signal?.throwIfAborted();
-			}),
-			vi.spyOn(piUtils, "sleepLong").mockImplementation(async (_delayMs, signal) => {
-				signal?.throwIfAborted();
-			}),
-			vi.spyOn(piUtils, "sleepUntil").mockImplementation(async (_deadlineMs, signal) => {
-				signal?.throwIfAborted();
-			}),
-		];
+		const waits = instantBackoff();
 		await parent.prompt("Delegate reading the notes.");
 		expect(runs).toHaveLength(2);
 

@@ -113,8 +113,8 @@ export interface EvalCellResult {
 	statusEventsElided?: number;
 }
 /**
- * A subagent whose result a bridged call handed the cell (`tool.task`, `wait()`, a handle's
- * status), with the run-end flags its `task` result records.
+ * A subagent whose result a bridged call handed the cell (`tool.task`, `tool.wait`, `wait()`),
+ * with the run-end flags its `task` result records.
  */
 export interface EvalHeldAgentResult {
 	id: string;
@@ -143,7 +143,12 @@ export interface EvalToolDetails {
 	languages?: EvalLanguage[];
 	/** Optional human-readable notice (e.g. fallback explanation). */
 	notice?: string;
-	/** Subagents whose results the cell's bridged calls handed it; `omp --restore` reads them as the parent's. */
+	/**
+	 * Subagents whose results the cell's bridged calls handed it; `omp --restore` reads them as the
+	 * parent's. Only a cell that finishes in the foreground records them: a backgrounded cell's result
+	 * reaches the parent as a job delivery, which does not carry them. A `wait()` or `tool.wait`
+	 * handover is also recorded where it happens, as an eval job record.
+	 */
 	agentResults?: EvalHeldAgentResult[];
 	/** Present when the cell was auto-backgrounded as an async job; `cancelled`: killed before it finished. */
 	async?: {
