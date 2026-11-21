@@ -722,8 +722,8 @@ export class EditTool implements AgentTool<TInput> {
 		// write. Past it, `apply` does not interrupt the write; an abort that
 		// lands meanwhile is seen only where a step below checks the signal:
 		// - the ACP bridge route checks once more just before it calls the
-		//   client; an abort seen there fails the write with the abort's
-		//   reason, and nothing is written;
+		//   client; an abort seen there fails the write ("Operation aborted"),
+		//   and nothing is written;
 		// - otherwise the change lands (on disk, or through the client). With
 		//   LSP on, the LSP notice that follows it can still fail the write
 		//   ("Operation aborted"); else the write succeeds.
