@@ -35,6 +35,7 @@
 - Switching back with `/resume` to a session another omp process continued meanwhile no longer rewrites the cached prompt past a provider's image limit: the first request after the switch drops the images the other process's last request dropped, instead of the ones this process dropped before it left the session
 - Switching back with `/resume` to a session another omp process continued meanwhile no longer renders a snapcompact archive again when that process's cut rule already refused one for the same history: its refusal is read again with the session
 - A session resumed in a new process, or switched to with `/resume`, while the cut rule makes a model-summary compaction above the threshold wait on a live cached prompt, no longer starts a background summary (a model call) before it asks the rule: it asks first, and starts none while the rule waits, as the process before it
+- `/context` now lists a tool taken off the roster that a Claude model's requests still declare, with its estimated size, among the tool definitions
 
 ## [18.18.6] - 2026-11-09
 

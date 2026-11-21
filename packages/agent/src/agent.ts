@@ -19,6 +19,7 @@ import {
 	streamSimple,
 	type TextContent,
 	type ThinkingBudgets,
+	type Tool,
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
@@ -716,14 +717,7 @@ export class Agent {
 		const intentTracing = this.#intentTracing;
 		const intentDescription = this.#intentDescription;
 		const pruneDescriptions = this.prunesToolDescriptions(model);
-		// An owned dialect carries the tools in the prompt, where no declaration is kept.
-		const declaration =
-			model !== undefined &&
-			isAnthropicMessagesModel(model) &&
-			anthropicKeepsToolDeclaration(model) &&
-			!this.#ownedDialect(model)
-				? latestToolDeclaration(this.#state.messages)
-				: undefined;
+		const declaration = this.#toolDeclaration(model);
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
@@ -760,6 +754,33 @@ export class Agent {
 			};
 		}
 		return fingerprint;
+	}
+
+	/**
+	 * The tools the next main request on `model` declares, in wire order, as {@link declaredToolsFingerprint} hashes
+	 * them: the active tools as they are (not normalized for the wire), and on a provider that keeps its tool
+	 * declaration across a conversation, each withdrawn tool it still holds as this agent last sent it, a newly
+	 * active tool with `deferLoading`.
+	 */
+	declaredTools(model: Model | undefined): Tool[] {
+		const active = this.#state.tools;
+		const declaration = this.#toolDeclaration(model);
+		return declaration
+			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
+			: active;
+	}
+
+	/**
+	 * The declaration the next main request on `model` keeps ({@link latestToolDeclaration}): undefined on a provider
+	 * that keeps none, and under an owned dialect, which carries the tools in the prompt.
+	 */
+	#toolDeclaration(model: Model | undefined): RecordedToolDeclaration | undefined {
+		return model !== undefined &&
+			isAnthropicMessagesModel(model) &&
+			anthropicKeepsToolDeclaration(model) &&
+			!this.#ownedDialect(model)
+			? latestToolDeclaration(this.#state.messages)
+			: undefined;
 	}
 
 	/**

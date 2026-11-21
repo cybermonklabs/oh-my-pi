@@ -10,6 +10,7 @@
 - Added `AgentLoopConfig.getMissingContextMessages` and `Agent.setMissingContextMessageProvider()`: asked before each model call with the call's context, the messages they return join that turn's input messages, emitted and recorded like the others
 - Added `ProviderContextRequest`: `Agent.buildSideRequestContext()` passes `{ sideRequest: true }` as the third argument of `transformProviderContext`, so a transform that keeps state for the conversation's requests can read it there and leave it as the loop's requests left it
 - Added `Agent.declaredToolsFingerprint()`, a hash of the tool definitions the next main request declares as the wire carries them: a withdrawn tool Anthropic keeps declared counts, in declaration order and with deferred loading; its `tools` argument gives the hash the request would declare with other tools in place of the active ones; with `toolSpecsFingerprint()` over provider-bound tool specs, `latestToolDeclaration()` and `SentToolDefinitions.inactiveFor()` and `revision`
+- Added `Agent.declaredTools()`: the tools the next main request declares, in wire order, the active tools as given and a withdrawn tool Anthropic keeps declared as the agent last sent it
 
 ### Fixed
 
