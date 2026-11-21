@@ -1,8 +1,9 @@
 /**
- * A subagent launched while its transcript cannot be written still runs. Its session file lives under
- * a directory that is a dangling link at launch, so every write of the default file store fails, as on
- * a disk or mount that went away. The subagent still asks the model; once the directory is back, its
- * next append writes the whole transcript. The control launches into a directory that exists.
+ * A subagent launched while the store refuses its transcript's writes (a full disk: ENOSPC on every
+ * directory and write under its transcript's directory) still runs. It asks the model, and once the
+ * store accepts writes again its transcript is written whole: by its next append, or, when it parked
+ * while refused, by the next write another session lands. The control launches on a disk that accepts
+ * writes.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -21,6 +22,7 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
+import { installFullDisk, storedIds } from "../helpers/refusing-session-stores";
 
 const AGENT_ID = "RefusedStore";
 const MOCK_API_SOURCE = "test/executor-refused-first-write";
@@ -63,16 +65,6 @@ afterEach(async () => {
 	closeModelCache();
 	await removeWithRetries(root);
 });
-
-/** The ids a session file holds, header first, in file order (the title slot line carries none). */
-function storedIds(content: string): string[] {
-	return content
-		.split("\n")
-		.filter(line => line.trim().length > 0)
-		.map(line => JSON.parse(line) as { type: string; id?: string })
-		.filter(record => record.type !== "title")
-		.map(record => record.id as string);
-}
 
 /**
  * Runs `AGENT_ID` to its yield with its transcript under `artifactsDir`; `beforeFirstTurn` runs when the
@@ -135,43 +127,48 @@ async function transcriptOf(artifactsDir: string): Promise<{ stored: string[]; h
 	};
 }
 
-it("a subagent launched while its transcript cannot be written runs, and the transcript is written once writes come back", async () => {
-	const store = path.join(root, "store");
+it("a subagent launched while its transcript's writes are refused runs, and the transcript is written once writes come back", async () => {
 	const artifactsDir = path.join(root, "artifacts");
-	// Dangling until the subagent's first model request: every write under it fails (ENOENT).
-	fs.symlinkSync(store, artifactsDir, "dir");
+	const disk = installFullDisk(fpath => fpath.startsWith(artifactsDir + path.sep));
 
-	const run = await runSubagent(artifactsDir, () => fs.mkdirSync(store));
+	const run = await runSubagent(artifactsDir, () => {
+		disk.full = false;
+	});
 
 	expect({ exitCode: run.result.exitCode, error: run.result.error }).toEqual({ exitCode: 0, error: undefined });
 	expect(run.turns).toBeGreaterThan(0);
+	expect(disk.refused).toBeGreaterThan(0);
 	const { stored, held } = await transcriptOf(artifactsDir);
 	expect(stored).toEqual(held);
 	expect(held.length).toBeGreaterThan(2);
 }, 30_000);
 
-it("a subagent that runs and parks while its transcript cannot be written keeps it, and it is written after the next write that lands", async () => {
-	const store = path.join(root, "store");
+it("a subagent whose writes the store refuses from its first turn, and which parks while refused, keeps its transcript until the next write that lands", async () => {
 	const artifactsDir = path.join(root, "artifacts");
-	fs.symlinkSync(store, artifactsDir, "dir");
+	// The launch lands; the store refuses from the subagent's first model request on.
+	const disk = installFullDisk(fpath => fpath.startsWith(artifactsDir + path.sep), false);
 
-	const run = await runSubagent(artifactsDir, () => {});
+	const run = await runSubagent(artifactsDir, () => {
+		disk.full = true;
+	});
 	expect({ exitCode: run.result.exitCode, error: run.result.error }).toEqual({ exitCode: 0, error: undefined });
+	expect(disk.refused).toBeGreaterThan(0);
 	const manager = localSession(AgentRegistry.global().get(AGENT_ID)?.session).sessionManager;
-	// The idle-TTL park: the subagent's session closes while every write still fails.
+	// The idle-TTL park: the subagent's session closes while every write is still refused. The park
+	// itself adds an entry, so the transcript is read after it.
 	await AgentLifecycleManager.global()
 		.park(AGENT_ID)
 		.catch(() => undefined);
+	const held = [manager.getHeader()?.id as string, ...manager.getEntries().map(entry => entry.id)];
+	expect(held.length).toBeGreaterThan(2);
 	const sessionFile = path.join(artifactsDir, `${AGENT_ID}.jsonl`);
-	expect(fs.existsSync(sessionFile)).toBe(false);
+	expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).not.toEqual(held);
 
-	fs.mkdirSync(store);
+	disk.full = false;
 	const parent = SessionManager.create(path.join(root, "home", "work"), path.join(root, "parent-sessions"));
 	await parent.ensureOnDisk();
 	await parent.close();
 
-	const held = [manager.getHeader()?.id as string, ...manager.getEntries().map(entry => entry.id)];
-	expect(held.length).toBeGreaterThan(2);
 	expect(storedIds(fs.readFileSync(sessionFile, "utf8"))).toEqual(held);
 }, 30_000);
 

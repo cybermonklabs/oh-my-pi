@@ -1,7 +1,7 @@
 /**
  * A subagent's artifacts directory sits beside its parent's transcript, on the parent's store. Under the
- * file store that location is the session store itself, so a location that refuses writes must not
- * fail the launch: the directory is made by the first write that needs it, once it can be.
+ * file store that location is the session store itself, so a location that refuses writes (read-only:
+ * EROFS) must not fail the launch: the directory is made by the first write that needs it, once it can be.
  */
 import { afterEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -82,20 +82,31 @@ async function launch(sessionFile: string, beforeRun: () => Promise<void>) {
 	return { settled, dispatched };
 }
 
-it("launches a subagent whose parent's session directory refuses writes, and its artifacts land once it accepts them", async () => {
+it("launches a subagent whose artifacts directory the parent's read-only location refuses, and its artifacts land once it accepts writes", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-refused-artifacts-"));
 	roots.push(root);
-	const store = path.join(root, "store");
-	// Dangling until the run: nothing can be made under it.
-	await fs.symlink(store, path.join(root, "sessions"), "dir");
+	await fs.mkdir(path.join(root, "sessions"));
 	const parentFile = path.join(root, "sessions", "parent.jsonl");
+	const artifactsDir = path.join(root, "sessions", "parent");
+	let readOnly = true;
+	const realMkdir = fs.mkdir;
+	vi.spyOn(fs, "mkdir").mockImplementation((async (
+		target: Parameters<typeof fs.mkdir>[0],
+		options?: Parameters<typeof fs.mkdir>[1],
+	) => {
+		if (readOnly && path.resolve(String(target)).startsWith(artifactsDir))
+			throw Object.assign(new Error(`EROFS: read-only file system, mkdir '${target}'`), { code: "EROFS" });
+		return realMkdir(target, options);
+	}) as typeof fs.mkdir);
 
-	const { settled, dispatched } = await launch(parentFile, () => fs.mkdir(store));
+	const { settled, dispatched } = await launch(parentFile, async () => {
+		readOnly = false;
+	});
 
 	expect(settled.result.exitCode).toBe(0);
 	expect(dispatched).toHaveLength(1);
-	expect(dispatched[0]?.artifactsDir).toBe(path.join(root, "sessions", "parent"));
-	expect(await fs.readFile(path.join(store, "parent", `${dispatched[0]?.id}.md`), "utf8")).toBe("done");
+	expect(dispatched[0]?.artifactsDir).toBe(artifactsDir);
+	expect(await fs.readFile(path.join(artifactsDir, `${dispatched[0]?.id}.md`), "utf8")).toBe("done");
 });
 
 it("control: a subagent of a parent whose session directory accepts writes launches and keeps its artifacts, as before", async () => {

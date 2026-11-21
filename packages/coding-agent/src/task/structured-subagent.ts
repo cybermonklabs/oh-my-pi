@@ -738,10 +738,11 @@ async function leaseArtifacts(
 ): Promise<ArtifactLease> {
 	const sessionFile = session.getSessionFile();
 	if (sessionFile) {
-		// Beside the parent's transcript, on the parent's store: the first write
-		// that needs it makes it (the subagent's transcript, its output), so a
-		// store that refuses writes fails those writes, which retry, and never
-		// the launch.
+		// Beside the parent's transcript, on the parent's store. The first write
+		// that needs it makes it: the subagent's transcript, whose refused
+		// writes its session keeps and sends again, or an output file, whose
+		// failure is logged. A store that refuses writes never fails the launch
+		// here.
 		const artifactsDir = sessionFile.slice(0, -6);
 		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
 	}

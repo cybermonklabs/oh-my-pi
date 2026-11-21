@@ -142,6 +142,69 @@ export class SessionLockError extends Error {
 }
 
 /**
+ * Error codes of a store that refuses writes: a file system that is full (`ENOSPC`, `EDQUOT`),
+ * read-only or denies the write; Bun's SQL client with a PostgreSQL connection refused, closed or not
+ * answered; and a SQLite database that is read-only or full.
+ */
+const STORE_REFUSED_CODES: Record<string, true> = {
+	ENOSPC: true,
+	EDQUOT: true,
+	EROFS: true,
+	EACCES: true,
+	EPERM: true,
+	ERR_POSTGRES_CONNECTION_REFUSED: true,
+	ERR_POSTGRES_CONNECTION_CLOSED: true,
+	ERR_POSTGRES_CONNECTION_TIMEOUT: true,
+	SQLITE_READONLY: true,
+	SQLITE_FULL: true,
+};
+/**
+ * PostgreSQL SQLSTATEs of a server that refuses writes: a read-only transaction (25006, a pooled backend
+ * left read-only), a full disk (53100), and a server that ends or refuses connections (57P01-57P03).
+ */
+const STORE_REFUSED_SQLSTATES: Record<string, true> = {
+	"25006": true,
+	"53100": true,
+	"57P01": true,
+	"57P02": true,
+	"57P03": true,
+};
+
+/** A write conflict and a held publish lock are faults in who writes, never the store refusing. */
+function isWriterFault(error: unknown): boolean {
+	return error instanceof SessionWriteConflictError || error instanceof SessionLockError;
+}
+
+/**
+ * Whether `error` is the session store refusing a write, as opposed to a fault in the write itself or
+ * in who writes. A session keeps its entries in memory through a refusal and writes them once the store
+ * accepts writes again. A write conflict, a held publish lock, a database permission or schema error, a
+ * missing path, and every other error are not refusals. An error that wraps others counts by what it
+ * wraps: a failed repair (an `AggregateError`, such as `SessionPersistenceIndeterminateError`) is a
+ * refusal when the store refused one of the writes it met and none of them was a writer's fault, and an
+ * uncoded error is a refusal when its `cause` is.
+ */
+export function isSessionStoreWriteRefusal(error: unknown): boolean {
+	return isRefusal(error, 0);
+}
+
+/** {@link isSessionStoreWriteRefusal}, `depth` wrappers in; deeper than four is not a refusal. */
+function isRefusal(error: unknown, depth: number): boolean {
+	if (!(error instanceof Error) || depth > 4 || isWriterFault(error)) return false;
+	if (error instanceof AggregateError) {
+		const errors: unknown[] = error.errors;
+		return errors.some(inner => isRefusal(inner, depth + 1)) && !errors.some(isWriterFault);
+	}
+	const { code, errno } = error as { code?: unknown; errno?: unknown };
+	if (typeof code !== "string") return isRefusal(error.cause, depth + 1);
+	if (Object.hasOwn(STORE_REFUSED_CODES, code)) return true;
+	// Bun's PostgreSQL client gives a server error's SQLSTATE as `errno`.
+	return (
+		code === "ERR_POSTGRES_SERVER_ERROR" && typeof errno === "string" && Object.hasOwn(STORE_REFUSED_SQLSTATES, errno)
+	);
+}
+
+/**
  * Optional guards applied by {@link SessionStorage.writeTextAtomic}. The
  * backend MUST check `expectedSize` and call `commitGuard()` synchronously
  * immediately before it makes the staged content visible at `path`. Failed

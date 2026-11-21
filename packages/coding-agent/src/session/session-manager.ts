@@ -121,6 +121,7 @@ import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
+	isSessionStoreWriteRefusal,
 	MemorySessionStorage,
 	type SessionStorage,
 	type SessionStorageWriter,
@@ -146,8 +147,11 @@ const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
 
-/** Errors that mean a location refuses to make a session directory, not that something else broke. */
-const REFUSED_DIRECTORY_CODES = new Set(["EEXIST", "ENOSPC", "EROFS", "EACCES"]);
+/** What a store holds at a session's path: nothing, a body (by length and hash), or unknown. */
+type StoredTranscriptState =
+	| { kind: "absent" }
+	| { kind: "unread" }
+	| { kind: "present"; size: number; hash: number | bigint };
 
 /** A fresh session id. */
 export function mintSessionId(): string {
@@ -1005,14 +1009,13 @@ export class SessionManager {
 
 	/** The single open append writer; the manager only ever writes one file at a time. */
 	#writer: SessionStorageWriter | undefined;
-	/** Set while a closed transcript the store refused waits to be sent again (see {@link #hold}). */
-	#held = false;
-	/** The send of a held transcript in flight, so a trigger never starts a second one beside it. */
-	#heldSend: Promise<void> | undefined;
-	/** A live session's resend is queued (see {@link #queueResend}). */
-	#resendQueued = false;
-	/** {@link releaseRetainedEntries} came while the transcript was held: release it once it is sent. */
-	#releaseWhenSent = false;
+	/**
+	 * What the store held when this session's close was refused; set only while the transcript is held
+	 * (see {@link #hold}).
+	 */
+	#heldBasis: StoredTranscriptState | undefined;
+	/** The send the store queue started for this session, while it runs (see {@link #sendOnce}). */
+	#storeSend: Promise<void> | undefined;
 	/** Sealed by {@link releaseRetainedEntries}: every later append/title/rewrite is a dropped no-op. */
 	#released = false;
 	/** Set by {@link releaseRetainedEntries}: `#entries` was cleared, so `#serializeBody()` is no longer authoritative. */
@@ -1093,13 +1096,12 @@ export class SessionManager {
 			try {
 				this.#storage.ensureDirSync(this.#sessionDir);
 			} catch (error) {
-				// A location that refuses the directory (full, read-only, not
-				// writable, a file in its place) refuses the session's writes
-				// too. Every store write makes its directory, so the first one
-				// does, and its failure is latched, reported and retried as any
-				// refused write is: the session starts. Any other error stops
-				// the start, as before.
-				if (!REFUSED_DIRECTORY_CODES.has((error as NodeJS.ErrnoException | undefined)?.code ?? "")) throw error;
+				// A store that refuses the directory (full, read-only, denied)
+				// refuses the session's writes too. Every store write makes its
+				// directory, so the first one does, and its refusal is latched,
+				// reported and retried as any refused write is: the session
+				// starts. Any other error stops the start, as before.
+				if (!isSessionStoreWriteRefusal(error)) throw error;
 			}
 		}
 	}
@@ -1124,7 +1126,7 @@ export class SessionManager {
 	#clearDiskError(): void {
 		this.#diskFailure = undefined;
 		this.#diskFailureLogged = false;
-		if (!this.#held) SessionManager.#waitingTranscripts.get(SessionManager.#storeKey(this.#storage))?.delete(this);
+		if (!this.#heldBasis) this.#leaveStoreQueue();
 	}
 
 	/**
@@ -1148,7 +1150,12 @@ export class SessionManager {
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
 		if (!this.#diskFailure) this.#diskFailure = error;
-		this.#waitForStore();
+		// Only a refusal waits for the store to accept writes again. A conflict
+		// or any other failure of a live session is its own fault, not the
+		// store's: it leaves the queue, and its own next append retries, as
+		// before. A held transcript leaves it in #sendHeld.
+		if (isSessionStoreWriteRefusal(error)) this.#joinStoreQueue();
+		else if (!this.#heldBasis) this.#leaveStoreQueue();
 		// A line that failed to land leaves its blob refs unreferenced on disk,
 		// so the next persist must re-check those blobs instead of trusting the memo.
 		forgetExternalizedImages(this.#blobs);
@@ -1606,12 +1613,12 @@ export class SessionManager {
 	}
 	#recordDurableAppend(line: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
-		void SessionManager.#sendWaitingTranscripts(this.#storage, this);
+		SessionManager.#storeAccepted(this.#storage, this);
 	}
 
 	#recordFullRewrite(bytes: number): void {
 		this.#expectedDiskSize = bytes;
-		void SessionManager.#sendWaitingTranscripts(this.#storage, this);
+		SessionManager.#storeAccepted(this.#storage, this);
 	}
 
 	/**
@@ -1835,6 +1842,27 @@ export class SessionManager {
 			},
 			{ epoch: startEpoch },
 		);
+	}
+
+	/**
+	 * The first write of a new session file (a subagent's transcript, a seance
+	 * fork). A store that refuses it leaves the session as a refused append
+	 * does: the refusal is latched and reported, the entries stay in memory,
+	 * and a later write sends them (this session's next append, or a write
+	 * another session lands on the same store, see {@link #storeAccepted}).
+	 * One attempt, no wait. Any other error rejects, as before. Resolves to
+	 * whether the write landed.
+	 */
+	async #writeNewSessionFile(): Promise<boolean> {
+		this.#forceFileCreation = true;
+		try {
+			await this.#rewriteAtomically();
+			return true;
+		} catch (error) {
+			if (!isSessionStoreWriteRefusal(error)) throw error;
+			this.#rewriteRequired = true;
+			return false;
+		}
 	}
 
 	/**
@@ -2463,25 +2491,12 @@ export class SessionManager {
 					`Cannot resume session "${resolvedSessionFile}": the session file holds no entries. The file was not modified.`,
 				);
 			}
-			// Explicit but empty/missing path (e.g. --session flag): start fresh but
-			// keep the requested path and materialize the header immediately.
+			// Explicit but empty/missing path (e.g. a subagent's transcript):
+			// start fresh but keep the requested path and materialize the header
+			// immediately.
 			this.#resetToNewSession(options?.newSession, resolvedSessionFile);
 			this.#expectedDiskSize = sourceSize;
-			this.#forceFileCreation = true;
-			try {
-				await this.#rewriteAtomically();
-			} catch (err) {
-				// A store that refuses this first write (a full disk, a store that
-				// is down) leaves the session as a refused append does: the failure
-				// is latched and reported, the header stays in memory, and the next
-				// append's full rewrite writes it with every later entry. The open
-				// neither waits nor retries. A write conflict means another writer
-				// made the file: it rejects as before.
-				if (err instanceof SessionWriteConflictError) throw err;
-				this.#rewriteRequired = true;
-				return;
-			}
-			this.#fileIsCurrent = true;
+			if (await this.#writeNewSessionFile()) this.#fileIsCurrent = true;
 			return;
 		}
 
@@ -3029,187 +3044,246 @@ export class SessionManager {
 	}
 
 	/**
-	 * Flush, then close the append writer. A close the store refused keeps
-	 * the transcript (see {@link #hold}); one that lands sends the sessions
-	 * waiting on this store, and waits for the held ones.
+	 * Flush, then close the append writer. A close that rejects while the
+	 * store refuses this session's writes keeps the transcript (see
+	 * {@link #hold}). A close that lands sends the sessions the same store
+	 * refused and waits for those sends (see {@link #sendRefusedSessions}).
 	 */
 	async close(): Promise<void> {
 		try {
 			await this.#closeOnce();
 		} catch (error) {
-			if (this.#diskFailure && this.#sessionFile && !this.#entriesReleased && this.#shouldHaveSessionFile())
-				this.#hold();
+			// The rejection can be a repair failure that wraps the refusal
+			// (SessionPersistenceIndeterminateError); the queue is where the
+			// refusal itself was admitted (see #noteDiskFailure).
+			if (this.#waitsForStore() && this.#sessionFile && !this.#entriesReleased && this.#shouldHaveSessionFile())
+				await this.#hold();
 			throw error;
 		}
-		await SessionManager.#sendWaitingTranscripts(this.#storage, this);
+		await SessionManager.#sendRefusedSessions(this.#storage, this);
 	}
 
-	/**
-	 * Sessions whose writes the store refused, by store: live ones with
-	 * unsaved entries, and closed ones that hold their transcript (see
-	 * {@link #hold}). A write that lands on the store sends each of them again
-	 * (see {@link #sendWaitingTranscripts}).
-	 */
-	static readonly #waitingTranscripts = new WeakMap<object, Set<SessionManager>>();
+	/** Sessions whose writes a store refused, oldest first, by store (see {@link #storeAccepted}). */
+	static readonly #refusedSessions = new WeakMap<object, Set<SessionManager>>();
 
 	/** Every file store writes the one local file system, so all of them share one key. */
 	static #storeKey(storage: SessionStorage): object {
 		return storage instanceof FileSessionStorage ? FileSessionStorage : storage;
 	}
 
-	/**
-	 * A write just landed on `storage`: send every session waiting on it,
-	 * other than `sender`, once more. A live session writes its unsaved
-	 * entries as its next append would (see {@link #queueResend}); a closed
-	 * one sends its held transcript (see {@link #sendHeld}), and a send
-	 * already in flight is joined, not doubled. Never rejects, and never runs
-	 * on `sender`'s disk queue, so a waiting session cannot hold up the
-	 * writes of the session that sent it. Resolves once the held sends
-	 * settle.
-	 */
-	static #sendWaitingTranscripts(storage: SessionStorage, sender: SessionManager): Promise<unknown> {
-		const waiting = SessionManager.#waitingTranscripts.get(SessionManager.#storeKey(storage));
-		if (!waiting || waiting.size === 0) return Promise.resolve();
-		const sends: Promise<void>[] = [];
-		for (const manager of waiting) {
-			if (manager === sender) continue;
-			if (!manager.#held) {
-				manager.#queueResend();
-				continue;
-			}
-			manager.#heldSend ??= manager.#sendHeld().finally(() => {
-				manager.#heldSend = undefined;
-			});
-			sends.push(manager.#heldSend);
-		}
-		return Promise.all(sends);
-	}
-
-	/** Wait, with the other sessions the store refused, for the next write that lands on it. */
-	#waitForStore(): void {
+	/** Wait, behind the sessions the store refused before, for a write that lands on it. */
+	#joinStoreQueue(): void {
 		if (!this.#persist || !this.#sessionFile) return;
 		const key = SessionManager.#storeKey(this.#storage);
-		let waiting = SessionManager.#waitingTranscripts.get(key);
-		if (!waiting) {
-			waiting = new Set();
-			SessionManager.#waitingTranscripts.set(key, waiting);
+		let queue = SessionManager.#refusedSessions.get(key);
+		if (!queue) {
+			queue = new Set();
+			SessionManager.#refusedSessions.set(key, queue);
 		}
-		waiting.add(this);
+		queue.add(this);
+	}
+
+	#leaveStoreQueue(): void {
+		SessionManager.#refusedSessions.get(SessionManager.#storeKey(this.#storage))?.delete(this);
 	}
 
 	/**
-	 * One more write of a live session's unsaved entries, queued behind the
-	 * write that just landed: the write its next append would make, so an
-	 * idle session's entries reach the store once it accepts writes again.
+	 * Whether this session waits for a write to land on its store: the store
+	 * refused one of its writes and none has landed for it since.
 	 */
-	#queueResend(): void {
-		if (this.#resendQueued) return;
-		this.#resendQueued = true;
-		queueMicrotask(() => {
-			this.#resendQueued = false;
-			if (
-				this.#released ||
-				this.#atomicEntryBatch ||
-				!this.#diskFailure ||
-				!this.#sessionFile ||
-				!this.#shouldHaveSessionFile()
-			)
-				return;
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
-			this.#rewriteSynchronously();
-		});
+	#waitsForStore(): boolean {
+		return SessionManager.#refusedSessions.get(SessionManager.#storeKey(this.#storage))?.has(this) ?? false;
 	}
 
 	/**
-	 * Keep this closed transcript in memory until a
-	 * send of it lands: the next write any session lands on the same store
-	 * sends it once (see {@link #sendWaitingTranscripts}), with no timer and
-	 * no limit, as a live session's next append resends what a refused one
-	 * missed. A process that exits while the store still refuses loses it, as
-	 * it loses a live session's unsaved entries.
+	 * A write just landed on `storage`: send the oldest session the store
+	 * refused, other than `sender`, once more, after the landing write returns.
+	 * One send per landed write: the sent session goes to the back of the
+	 * queue, so the next landed write sends the next one. A send that lands is
+	 * itself a landed write, so once the store accepts writes again the queue
+	 * drains one session after another. A session leaves the queue when its
+	 * write lands, or when its held transcript is dropped.
 	 */
-	#hold(): void {
-		this.#held = true;
-		this.#waitForStore();
+	static #storeAccepted(storage: SessionStorage, sender: SessionManager): void {
+		const queue = SessionManager.#refusedSessions.get(SessionManager.#storeKey(storage));
+		if (!queue) return;
+		for (const manager of queue) {
+			if (manager === sender || manager.#storeSend) continue;
+			queue.delete(manager);
+			queue.add(manager);
+			void manager.#sendOnce();
+			return;
+		}
+	}
+
+	/**
+	 * A close that landed: send every session the store refused once, oldest
+	 * first, one at a time, and wait for them, so a process that exits after
+	 * this close keeps them. A session the store refuses again stays queued
+	 * for later landed writes; the ones behind it are still sent.
+	 */
+	static async #sendRefusedSessions(storage: SessionStorage, sender: SessionManager): Promise<void> {
+		const queue = SessionManager.#refusedSessions.get(SessionManager.#storeKey(storage));
+		if (!queue) return;
+		// A snapshot: sends change the queue as they go.
+		for (const manager of Array.from(queue)) {
+			if (manager !== sender && queue.has(manager)) await manager.#sendOnce();
+		}
+	}
+
+	/** One send of this session, started after the caller returns; a send already running is joined. */
+	#sendOnce(): Promise<void> {
+		if (this.#storeSend) return this.#storeSend;
+		const send = Promise.resolve()
+			.then(() => (this.#heldBasis ? this.#sendHeld() : this.#resendRefusedEntries()))
+			.finally(() => {
+				this.#storeSend = undefined;
+			});
+		this.#storeSend = send;
+		return send;
+	}
+
+	/**
+	 * One more write of this live session's entries after the store refused
+	 * them: the full rewrite its next append would make, on its own disk queue
+	 * and under its atomic persistence lock, so it never overlaps this
+	 * session's own writes or repair. A session that wrote meanwhile, or is
+	 * closing, is left alone. Never rejects: a refusal is latched and keeps
+	 * the session queued.
+	 */
+	async #resendRefusedEntries(): Promise<void> {
+		try {
+			await this.#withAtomicPersistenceLock(async () => {
+				if (this.#released || !this.#diskFailure || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
+				const startEpoch = this.#diskEpoch;
+				await this.#scheduleDiskWork(
+					async () => {
+						// The writer whose append the store refused keeps that error; the
+						// rewrite replaces the file, and the next append opens a new one, as
+						// a synchronous rewrite does.
+						this.#closeWriterEventually();
+						this.#fileIsCurrent = false;
+						this.#rewriteRequired = true;
+						if (await this.#runFencedAtomicRewrite(startEpoch)) {
+							this.#fileIsCurrent = true;
+							this.#materializeBreadcrumb();
+							this.#rewriteRequired = false;
+							this.#hasTitleSlot = true;
+							this.#clearDiskError();
+						}
+					},
+					{ epoch: startEpoch, ignorePriorError: true },
+				);
+			});
+		} catch {
+			// Latched by the disk queue; a refusal keeps this session queued.
+		}
+	}
+
+	/**
+	 * Keep this closed transcript in memory, as a live session keeps the
+	 * entries a store refused, and wait with the other sessions the store
+	 * refused (see {@link #storeAccepted}). The stored transcript the close
+	 * left is read first, before the close rejects, so a send never replaces
+	 * another one (see {@link #sendHeld}). Nothing limits how long or how
+	 * many: held transcripts stay in memory until the store accepts them, and
+	 * a process that exits while the store still refuses loses them, as it
+	 * loses a live session's unsaved entries.
+	 */
+	async #hold(): Promise<void> {
+		this.#heldBasis = (await this.#readStoredTranscript()).state;
+		this.#joinStoreQueue();
 	}
 
 	#unhold(): void {
-		this.#held = false;
-		SessionManager.#waitingTranscripts.get(SessionManager.#storeKey(this.#storage))?.delete(this);
-		if (this.#releaseWhenSent) {
-			this.#releaseWhenSent = false;
-			this.releaseRetainedEntries();
+		this.#heldBasis = undefined;
+		this.#leaveStoreQueue();
+	}
+
+	/** What the store holds at this session's path now; never rejects. */
+	async #readStoredTranscript(): Promise<{ state: StoredTranscriptState; text?: string }> {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return { state: { kind: "absent" } };
+		try {
+			const text = await this.#storage.readText(sessionFile);
+			return { state: { kind: "present", size: Buffer.byteLength(text, "utf8"), hash: Bun.hash(text) }, text };
+		} catch (error) {
+			return { state: { kind: isEnoent(error) ? "absent" : "unread" } };
 		}
 	}
 
 	/**
-	 * One send of the held transcript: the whole body, against the size this
-	 * manager last saw stored. A refusal keeps it held for the next write
-	 * that lands. The store holding another size is this manager's to replace
-	 * only when it holds nothing or only this session's own entries (a write
-	 * of its own the store kept after all); entries it does not hold, or
-	 * another session's file, are another writer's, and are never
-	 * overwritten: the hold ends there.
+	 * Whether the store still holds the transcript this session's close left:
+	 * absent then and now, or the same content as then. When the close could
+	 * not read it, the byte length this session last stored and its header.
+	 */
+	#storedAsLeft(left: StoredTranscriptState, now: StoredTranscriptState, text: string | undefined): boolean {
+		if (left.kind === "absent") return now.kind === "absent";
+		if (left.kind === "present") return now.kind === "present" && now.size === left.size && now.hash === left.hash;
+		if (now.kind === "absent") return this.#expectedDiskSize === null;
+		if (now.kind !== "present" || now.size !== this.#expectedDiskSize || text === undefined) return false;
+		const parsed = parseSessionContent(text);
+		return !parsed.invalidHeader && (parsed.entries[0] as SessionHeader | undefined)?.id === this.#sessionId;
+	}
+
+	/**
+	 * One send of the held transcript, only over the stored transcript the
+	 * close left (see {@link #storedAsLeft}). The store holding exactly this
+	 * transcript already counts as sent. Any other stored state is another
+	 * writer's and is never replaced: the hold ends with a warning. A stored
+	 * file that cannot be read keeps the hold without a write. Never rejects:
+	 * a refusal is latched and keeps the hold.
 	 */
 	async #sendHeld(): Promise<void> {
 		const sessionFile = this.#sessionFile;
-		if (!this.#held || !sessionFile) return;
+		const left = this.#heldBasis;
+		if (!sessionFile || !left || this.#entriesReleased) {
+			this.#unhold();
+			return;
+		}
 		let release: (() => void) | null | undefined;
 		try {
 			// A closed session gave up its claim: take it again for the send, and
 			// leave the transcript to a session that holds it now.
 			release = this.#storage.claimSession?.(this.#sessionId, sessionFile);
-			if (release === null) {
-				logger.warn("Dropped a held session transcript another session now owns", { sessionFile });
-				this.#unhold();
-				return;
-			}
-			let body = this.#serializeBody();
-			const write = (expectedSize: number | null | undefined, lines: Iterable<string>) => {
-				const options = { expectedSize };
-				return this.#storage.writeLinesAtomic
-					? this.#storage.writeLinesAtomic(sessionFile, [...lines], options)
-					: this.#storage.writeTextAtomic(sessionFile, [...lines].join(""), options);
-			};
+			if (release === null) return this.#dropHeld(sessionFile, "another session owns the file");
+			const now = await this.#readStoredTranscript();
+			if (now.state.kind === "unread") return;
+			const body = this.#serializeBody();
+			if (now.text !== undefined && textMatchesLines(now.text, body.lines)) return this.#heldSent(body.bytes);
+			if (!this.#storedAsLeft(left, now.state, now.text))
+				return this.#dropHeld(sessionFile, "another writer changed the file");
+			const options = { expectedSize: now.state.kind === "present" ? now.state.size : null };
 			try {
-				await write(this.#expectedDiskSize, body.lines);
+				await (this.#storage.writeLinesAtomic
+					? this.#storage.writeLinesAtomic(sessionFile, body.lines, options)
+					: this.#storage.writeTextAtomic(sessionFile, body.lines.join(""), options));
 			} catch (error) {
 				if (!(error instanceof SessionWriteConflictError)) throw error;
-				const stored = await this.#storage.readText(sessionFile).catch(() => undefined);
-				const parsed = stored === undefined ? undefined : parseSessionContent(stored);
-				const ours =
-					parsed === undefined ||
-					(!parsed.invalidHeader &&
-						(parsed.entries[0] as SessionHeader | undefined)?.id === this.#sessionId &&
-						parsed.entries.slice(1).every(entry => this.#index.has((entry as SessionEntry).id)));
-				if (!ours) {
-					logger.warn("Dropped a held session transcript another writer changed", {
-						sessionFile,
-						error: error.message,
-					});
-					this.#unhold();
-					return;
-				}
-				const storedSize =
-					stored !== undefined
-						? Buffer.byteLength(stored, "utf8")
-						: this.#storage.existsSync(sessionFile)
-							? this.#storage.statSync(sessionFile).size
-							: null;
-				body = this.#serializeBody();
-				await write(storedSize, body.lines);
+				const after = await this.#readStoredTranscript();
+				if (after.text !== undefined && textMatchesLines(after.text, body.lines)) return this.#heldSent(body.bytes);
+				return this.#dropHeld(sessionFile, "another writer changed the file");
 			}
-			this.#clearDiskError();
-			this.#fileIsCurrent = true;
-			this.#rewriteRequired = false;
-			this.#unhold();
-			this.#recordFullRewrite(body.bytes);
+			return this.#heldSent(body.bytes);
 		} catch (error) {
 			this.#noteDiskFailure(error);
+			if (!isSessionStoreWriteRefusal(error)) this.#dropHeld(sessionFile, toError(error).message);
 		} finally {
 			release?.();
 		}
+	}
+
+	#heldSent(bytes: number): void {
+		this.#clearDiskError();
+		this.#fileIsCurrent = true;
+		this.#rewriteRequired = false;
+		this.#unhold();
+		this.#recordFullRewrite(bytes);
+	}
+
+	#dropHeld(sessionFile: string, reason: string): void {
+		logger.warn("Dropped a held session transcript", { sessionFile, reason });
+		this.#unhold();
 	}
 
 	async #closeOnce(): Promise<void> {
@@ -3304,16 +3378,13 @@ export class SessionManager {
 	 */
 	releaseRetainedEntries(): void {
 		this.seal();
-		// A held transcript still has to reach the store (see #hold): release it once it does.
-		if (this.#held) {
-			this.#releaseWhenSent = true;
-			return;
-		}
 		this.#entries = [];
 		this.#index.clear();
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
+		// With its entries gone there is nothing left to send.
+		this.#unhold();
 	}
 
 	getCwd(): string {
@@ -4574,8 +4645,7 @@ export class SessionManager {
 			SessionManager.#repairForkedInterruptedTail(history, manager.#index.pathTo());
 			manager.#index.rebuild(history);
 		}
-		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
+		await manager.#writeNewSessionFile();
 		if (!options?.seance && options?.copyArtifacts !== false) {
 			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
 		}
