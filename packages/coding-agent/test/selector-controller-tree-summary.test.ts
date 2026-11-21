@@ -136,6 +136,7 @@ describe("SelectorController tree branch summaries", () => {
 			summarize: false,
 			customInstructions: undefined,
 			allowAskReopen: true,
+			origin: "outside",
 		});
 	});
 
@@ -151,6 +152,7 @@ describe("SelectorController tree branch summaries", () => {
 			summarize: true,
 			customInstructions: undefined,
 			allowAskReopen: true,
+			origin: "outside",
 		});
 	});
 
@@ -167,6 +169,7 @@ describe("SelectorController tree branch summaries", () => {
 			summarize: true,
 			customInstructions: undefined,
 			allowAskReopen: true,
+			origin: "outside",
 		});
 	});
 
@@ -187,6 +190,7 @@ describe("SelectorController tree branch summaries", () => {
 			summarize: true,
 			customInstructions: undefined,
 			allowAskReopen: true,
+			origin: "outside",
 		});
 	});
 });

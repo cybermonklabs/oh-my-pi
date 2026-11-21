@@ -37,7 +37,7 @@ import { cfgPlanAutosave, cfgPlanAutosaveDir } from "@oh-my-pi/pi-coding-agent/p
 
 /**
  * Matches the plan-approved synthetic-prompt dispatch. `#approvePlan` calls
- * `session.prompt(rendered, { synthetic: true })` exclusively for that case,
+ * `session.prompt(rendered, { synthetic: true, origin: "outside" })` exclusively for that case,
  * so the `synthetic: true` option flag is the unique discriminator.
  */
 const isPlanApprovedCall = (args: unknown[]): boolean =>
@@ -633,7 +633,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const resolved = await recorder.resolved;
 
 		expect(answered).toBe(true);
-		expect(prompt).toHaveBeenCalledWith("  keep indentation\n");
+		expect(prompt).toHaveBeenCalledWith("  keep indentation\n", { origin: "outside" });
 		expect(resolved).toMatchObject({ choice: "refine", by: "extension" });
 	});
 
@@ -709,7 +709,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
 		expect(answers).toEqual([true, false]);
-		expect(prompt).toHaveBeenCalledWith("FIRST choice");
+		expect(prompt).toHaveBeenCalledWith("FIRST choice", { origin: "outside" });
 		expect(prompt).not.toHaveBeenCalledWith("SECOND choice");
 		expect(events.filter(event => event.type === "plan_review_resolved")).toHaveLength(1);
 		expect(events.find(event => event.type === "plan_review_resolved")).toMatchObject({
@@ -889,7 +889,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await delivered.promise;
 
 		expect(accepted).toBe(true);
-		expect(prompt).toHaveBeenCalledWith("split step 2");
+		expect(prompt).toHaveBeenCalledWith("split step 2", { origin: "outside" });
 		expect(secondExtensionEvents).toEqual(["plan_review_requested", "plan_review_resolved"]);
 	});
 
@@ -1024,7 +1024,7 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
-		expect(promptSpy).toHaveBeenCalledWith(feedback);
+		expect(promptSpy).toHaveBeenCalledWith(feedback, { origin: "outside" });
 	});
 
 	it("retains queued Refine annotations until the pending submission starts", async () => {
@@ -1418,7 +1418,8 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(artifactAtPrompt).toBe("pre-approval handoff");
 		expect(planAtPrompt).toBe(planContent);
 		expect(await Bun.file(oldArtifactPath).text()).toBe("pre-approval handoff");
-		expect(prompt).toHaveBeenCalledWith(expect.any(String), { synthetic: true });
+		// A person approved the plan: input from outside the session.
+		expect(prompt).toHaveBeenCalledWith(expect.any(String), { synthetic: true, origin: "outside" });
 	});
 
 	it("offers approve-and-keep-context as a distinct plan approval path", async () => {
@@ -1643,6 +1644,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(await Bun.file(resolvedFinalPlanPath).text()).toBe("# Plan\n\nKeep context.");
 		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
+			origin: "outside",
 		});
 	});
 
@@ -1880,6 +1882,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(clear).toHaveBeenCalledTimes(1);
 		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
+			origin: "outside",
 		});
 	});
 

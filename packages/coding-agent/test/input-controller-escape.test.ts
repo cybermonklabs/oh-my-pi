@@ -347,6 +347,7 @@ describe("InputController escape behavior", () => {
 				images: undefined,
 				imageLinks: undefined,
 				streamingBehavior: "steer",
+				origin: "outside",
 			},
 			{ clearEditor: false },
 		);
@@ -514,7 +515,7 @@ describe("InputController escape behavior", () => {
 			await editor.onSubmit?.("/sitrep");
 
 			expect(spies.handleBtwCommand).not.toHaveBeenCalled();
-			expect(spies.prompt).toHaveBeenCalledWith("/sitrep", { images: undefined });
+			expect(spies.prompt).toHaveBeenCalledWith("/sitrep", { images: undefined, origin: "outside" });
 		});
 
 		const image: ImageContent = { type: "image", data: "aGk=", mimeType: "image/png" };

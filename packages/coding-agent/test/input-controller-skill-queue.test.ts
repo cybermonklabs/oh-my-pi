@@ -58,6 +58,7 @@ type PromptCustomMessage = Mock<
 			queueOnly?: boolean;
 			onPromptQueued?: (queued: readonly unknown[]) => void;
 			onPromptAdmitted?: () => void;
+			origin?: "outside" | "inside";
 		},
 	) => Promise<void>
 >;
@@ -196,6 +197,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			origin: "outside",
 		});
 		expect(promptCustomMessage.mock.calls[0]?.[0].details.__queueChipText).toBeUndefined();
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
@@ -265,6 +267,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			origin: "outside",
 		});
 	});
 
@@ -316,6 +319,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
 			streamingBehavior: "steer",
 			queueChipText: "/skill:test-skill arg1 arg2",
+			origin: "outside",
 		});
 		expect(promptCustomMessage.mock.calls[0]?.[0].details.__queueChipText).toBeUndefined();
 	});
@@ -519,12 +523,14 @@ describe("compaction skill re-invocation", () => {
 		expect(renderedText.text).toContain("arg1 arg2");
 		expect(message.content[1]).toEqual(image);
 		expect(message.details).toMatchObject({ name: "test-skill", args: "arg1 arg2", lineCount: 1 });
-		// The flush also passes its own admission callbacks; the skill prompt is sent, not queue-only.
+		// The flush also passes its own admission callbacks; the skill prompt is sent, not queue-only, and as a
+		// person typed it, from outside the session.
 		expect(options).toEqual({
 			streamingBehavior: "followUp",
 			queueChipText: "/skill:test-skill arg1 arg2",
 			onPromptQueued: expect.any(Function),
 			onPromptAdmitted: expect.any(Function),
+			origin: "outside",
 		});
 		expect(prompt).not.toHaveBeenCalled();
 		expect(steer).not.toHaveBeenCalled();

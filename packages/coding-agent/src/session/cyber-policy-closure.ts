@@ -1,4 +1,4 @@
-import { addModelCallGuard, type Model } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard, type Model, ModelCallRefusedError } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 
 /**
@@ -10,9 +10,38 @@ export function closedByCyberPolicy(model: Pick<Model, "identity">): boolean {
 	return model.identity.class === "openai" || model.identity.class === "unknown";
 }
 
+const HOLD_PREFIX = "OpenAI refused content of this session (cyber_policy); no request goes to ";
+
 /** Why the process's model-call guard held a request to `model`. Names `cyber_policy`, so the error is not retried. */
 export function cyberPolicyHoldMessage(model: Pick<Model, "provider" | "id">): string {
-	return `OpenAI refused content of this session (cyber_policy); no request goes to ${model.provider}/${model.id} or another OpenAI route until the root session's next input from outside it.`;
+	return `${HOLD_PREFIX}${model.provider}/${model.id} or another OpenAI route until the root session's next input from outside it.`;
+}
+
+function isHeldCall(link: unknown): boolean {
+	if (link instanceof ModelCallRefusedError) return true;
+	const text =
+		link instanceof Error
+			? link.message
+			: typeof link === "object" && link !== null && "errorMessage" in link && typeof link.errorMessage === "string"
+				? link.errorMessage
+				: "";
+	return text.startsWith(HOLD_PREFIX);
+}
+
+/**
+ * Whether `outcome` is a refusal to record: OpenAI's own `cyber_policy` refusal. A call the hold itself
+ * held names the code too (so nothing retries it), anywhere in its cause chain; recording it would start
+ * the hold again after a person's input ended it, with no new refusal.
+ */
+export function isRecordableCyberPolicyRefusal(outcome: unknown): boolean {
+	if (!AIError.isCyberPolicyRefusal(outcome)) return false;
+	const seen = new Set<unknown>();
+	for (let link: unknown = outcome; link !== undefined && link !== null && !seen.has(link);) {
+		seen.add(link);
+		if (isHeldCall(link)) return false;
+		link = link instanceof Error ? link.cause : undefined;
+	}
+	return true;
 }
 
 /**
@@ -101,7 +130,7 @@ export function installCyberPolicyGuard(closure: CyberPolicyClosureApi): () => v
 			{
 				refuse: model => (closure.isClosed(model) ? cyberPolicyHoldMessage(model) : undefined),
 				settled: (_model, outcome) => {
-					if (AIError.isCyberPolicyRefusal(outcome)) closure.record();
+					if (isRecordableCyberPolicyRefusal(outcome)) closure.record();
 				},
 			},
 			closure,

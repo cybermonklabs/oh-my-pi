@@ -1609,6 +1609,8 @@ export class UiHelpers {
 								...built.options,
 								onPromptQueued: onFirstQueued,
 								onPromptAdmitted: onFirstAdmitted,
+								// Typed by a person while the session compacted: input from outside the session.
+								origin: "outside",
 							})
 							.then(sent => {
 								if (sent === false) onFirstDropped();
@@ -1622,6 +1624,8 @@ export class UiHelpers {
 						images: first.images,
 						onPromptQueued: onFirstQueued,
 						onPromptAdmitted: onFirstAdmitted,
+						// Typed by a person while the session compacted: input from outside the session.
+						origin: "outside",
 					})
 					.catch((error: unknown) => {
 						disposeFirstPrompt();

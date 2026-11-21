@@ -10,12 +10,15 @@ import { createMockModel, type MockModel, type MockResponse, registerMockApi } f
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { submitInteractiveInput } from "@oh-my-pi/pi-coding-agent/main";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CyberPolicyClosureApi } from "@oh-my-pi/pi-coding-agent/session/cyber-policy-closure";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 /**
  * OpenAI refuses a request whose content it flags for cybersecurity risk with the error code
@@ -184,6 +187,9 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		cyberPolicyClosure?: CyberPolicyClosureApi;
 		/** Keeps an earlier session alive beside this one. */
 		keepOthers?: boolean;
+		/** The session's manager and extensions, when a test registers extension commands. */
+		sessionManager?: SessionManager;
+		extensionRunner?: ExtensionRunner;
 	}): { live: AgentSession; requested: string[]; fallbacks: string[]; nextRequest: () => Promise<void> } {
 		const requested: string[] = [];
 		const fallbacks: string[] = [];
@@ -226,10 +232,13 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		settings.setModelRole("default", selector(options.primary));
 		const live = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 			settings,
 			modelRegistry,
 			cyberPolicyClosure: options.cyberPolicyClosure,
+			// Side turns (`runEphemeralTurn`, the idle recap) go to the same mock-API models as the agent's turns.
+			sideStreamFn: (model, context, streamOptions) => streamSimple(mockFor(model), context, streamOptions),
+			extensionRunner: options.extensionRunner,
 		});
 		if (options.keepOthers) others.push(live);
 		else session = live;
@@ -517,6 +526,76 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		expect(requested).toEqual([selector(gateway), selector(gateway)]);
 	});
 
+	// A person's typed `/command` is input from outside: it ends the closure before its handler runs, so what
+	// the handler sends (untagged, as an extension's own send is) reaches the route. The same command with no
+	// origin, the session's own, keeps the closure and its handler's send is held.
+	it("a person's typed extension command ends the closure before its handler sends", async () => {
+		const { gateway } = models();
+		const sessionManager = SessionManager.inMemory();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerCommand("relay", {
+					handler: async () => {
+						pi.sendUserMessage("from the command");
+					},
+				});
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"relay-command",
+		);
+		const extensionRunner = new ExtensionRunner([extension], runtime, process.cwd(), sessionManager, modelRegistry);
+		const { live, requested } = startSession({
+			primary: gateway,
+			chains: {},
+			answer: () => CYBER_POLICY,
+			sessionManager,
+			extensionRunner,
+		});
+		await live.prompt("Review this change");
+		await live.waitForIdle();
+		expect(live.cyberPolicyClosure.active).toBe(true);
+
+		// Bound as a mode binds it: the extension's own sends reach the session, untagged.
+		extensionRunner.initialize(
+			{
+				sendUserMessage: (content, sendOptions) => live.sendUserMessage(content, sendOptions),
+			} as Parameters<ExtensionRunner["initialize"]>[0],
+			// A command's context reads the model (its `model` getter runs when the context is built).
+			{ getModel: () => live.model } as Parameters<ExtensionRunner["initialize"]>[1],
+		);
+
+		// The handler's send is not awaited by the command, so each step waits for what the send produced, bounded
+		// only so a broken send fails instead of hanging: the held message in the transcript, then the request.
+		const until = async (done: () => boolean, what: string): Promise<void> => {
+			for (let tries = 0; tries < 500 && !done(); tries++) await Bun.sleep(10);
+			if (!done()) throw new Error(`never happened: ${what}`);
+		};
+		const sentByHandler = () =>
+			live.messages.filter(
+				message =>
+					message.role === "user" &&
+					(typeof message.content === "string"
+						? message.content
+						: message.content.map(part => (part.type === "text" ? part.text : "")).join("")
+					).includes("from the command"),
+			).length;
+
+		// The session's own command (no origin): the handler's send reaches the session and is held.
+		await live.prompt("/relay");
+		await until(() => sentByHandler() === 1, "the handler's first send reaching the session");
+		await live.waitForIdle();
+		expect(requested).toEqual([selector(gateway)]);
+		expect(live.cyberPolicyClosure.active).toBe(true);
+
+		// A person's typed command: the closure ends first, so the handler's send reaches the route.
+		await live.prompt("/relay", { origin: "outside" });
+		await until(() => requested.length === 2, "the handler's second send reaching the route");
+		expect(requested).toEqual([selector(gateway), selector(gateway)]);
+	});
+
 	it("a custom message relaying a person's turn ends the closure", async () => {
 		const { gateway } = models();
 		const { live, requested } = startSession({ primary: gateway, chains: {}, answer: () => CYBER_POLICY });
@@ -753,5 +832,27 @@ describe("AgentSession after a cyber_policy refusal", () => {
 
 		expect(other.requested).toEqual([selector(openai)]);
 		expect(lastAssistant(other.live).stopReason).toBe("stop");
+	});
+
+	// `runEphemeralTurn` (`/btw`, `/omfg`, an extension's context) is public and called directly: its model
+	// call runs in its own tree's scope, so another tree's hold does not take it for a call made outside
+	// every session.
+	it("another tree's ephemeral side turn is not held by this tree's refusal", async () => {
+		const { gateway, openai } = models();
+		const refusing = startSession({ primary: gateway, chains: {}, answer: () => CYBER_POLICY });
+		const other = startSession({
+			primary: openai,
+			chains: {},
+			answer: () => ({ content: ["answered"] }),
+			keepOthers: true,
+		});
+
+		await refusing.live.prompt("Review this change");
+		await refusing.live.waitForIdle();
+		expect(refusing.live.cyberPolicyClosure.active).toBe(true);
+
+		await other.live.runEphemeralTurn({ promptText: "A side question", tools: false });
+
+		expect(other.requested).toEqual([selector(openai)]);
 	});
 });

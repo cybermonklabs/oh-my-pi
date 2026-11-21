@@ -319,7 +319,8 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				ctx.runYieldCompaction();
 				return;
 			}
-			await ctx.handleCompactCommand(parsed.instructions, parsed.mode);
+			// A person's `/compact`: input from outside the session.
+			await ctx.handleCompactCommand(parsed.instructions, parsed.mode, undefined, { origin: "outside" });
 		},
 	},
 	{

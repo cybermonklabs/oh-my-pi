@@ -15,7 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env, getProviderInFlightRoot, isEnoent, isPidAlive, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
-import { guardModelCall } from "./model-call-guard";
+import { assertModelCallAllowed, guardModelCall, heldModelCall } from "./model-call-guard";
 import {
 	createAuthRetryKeyState,
 	isApiKeyResolver,
@@ -651,6 +651,9 @@ function withProviderInFlightLimit<
 	// exempt (see `healLeakedThinking`); healing is otherwise idempotent.
 	const limit = resolveProviderInFlightLimit(model.provider, options);
 	if (limit === undefined) {
+		// The guards' second read: a hold that began while this call waited (a key, its headers) holds it.
+		const held = heldModelCall(model);
+		if (held) return held;
 		options?.beforeDispatch?.();
 		return healLeakedThinking(model, dispatch(false));
 	}
@@ -688,6 +691,8 @@ function withProviderInFlightLimit<
 			if (options?.signal?.aborted) {
 				throw options.signal.reason ?? new AIError.AbortError("Provider request aborted before dispatch");
 			}
+			// The guards' second read: a hold that began while this call waited for its slot holds it.
+			assertModelCallAllowed(model);
 			options?.beforeDispatch?.();
 			const inner = healLeakedThinking(model, dispatch(true));
 			let terminalEvent: AssistantMessageEvent | undefined;

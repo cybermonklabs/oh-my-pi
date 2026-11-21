@@ -118,4 +118,25 @@ describe("model-call guard", () => {
 		await runInModelCallScope(mine, () => streamSimple(model, context).result());
 		expect(reported).toEqual(["mine"]);
 	});
+
+	// A call can wait after the guards' first read (its key resolution here; a provider slot or its headers
+	// elsewhere). The send reads them again, so a hold that began during the wait holds it.
+	it.each([
+		["holds a call whose hold began while it waited for its key", true, 0],
+		["sends a call that waited for its key when no hold began (control)", false, 1],
+	])("%s", async (_name, holdDuringWait, sent) => {
+		const model = createMockModel({ id: "gpt-5.5", handler: { content: ["hi"] } });
+		let held = false;
+		removals.push(addModelCallGuard({ refuse: () => (held ? "held: cyber_policy" : undefined) }));
+
+		const result = await streamSimple(model, context, {
+			apiKey: async () => {
+				held = holdDuringWait;
+				return "key";
+			},
+		}).result();
+
+		expect(model.calls).toHaveLength(sent);
+		expect(result.stopReason).toBe(holdDuringWait ? "error" : "stop");
+	});
 });

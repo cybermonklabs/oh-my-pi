@@ -45,6 +45,8 @@ function buildCtx(compact: InteractiveModeContext["session"]["compact"]) {
 		statusContainer,
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 		session: { compact },
+		// handleCompactCommand compacts only a session with at least two messages.
+		sessionManager: { getEntries: () => [{ type: "message" }, { type: "message" }] },
 		rebuildChatFromMessages,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
@@ -129,6 +131,43 @@ describe("executeCompaction UI lifecycle", () => {
 		// the instant rebuildChatFromMessages ran (1 leaked loader without the fix).
 		expect(statusAtRebuild()).toBe(0);
 	});
+
+	// Only a person's action ends the session's cyber-policy hold: a compaction takes its origin from its
+	// caller and never forces one.
+	describe("the origin a compaction carries", () => {
+		const done = async (): Promise<CompactionResult<unknown>> => ({
+			summary: "",
+			firstKeptEntryId: "",
+			tokensBefore: 0,
+		});
+		const originOf = (compact: { mock: { calls: unknown[][] } }) =>
+			(compact.mock.calls[0]?.[1] as { origin?: string } | undefined)?.origin;
+
+		it("a /loop compaction (`loop.mode: compact`, `handleCompactCommand()` with no arguments) carries none", async () => {
+			const compact = vi.fn(done);
+			await new CommandController(buildCtx(compact).ctx).handleCompactCommand();
+			expect(compact).toHaveBeenCalledTimes(1);
+			expect(originOf(compact)).toBeUndefined();
+		});
+
+		it("a person's /compact carries outside", async () => {
+			const compact = vi.fn(done);
+			await new CommandController(buildCtx(compact).ctx).handleCompactCommand("focus", undefined, undefined, {
+				origin: "outside",
+			});
+			expect(originOf(compact)).toBe("outside");
+		});
+
+		it("an extension's ctx.compact() keeps its own origin, none included", async () => {
+			const inside = vi.fn(done);
+			await new CommandController(buildCtx(inside).ctx).executeCompaction({ origin: "inside" }, false);
+			expect(originOf(inside)).toBe("inside");
+
+			const none = vi.fn(done);
+			await new CommandController(buildCtx(none).ctx).executeCompaction({}, false);
+			expect(originOf(none)).toBeUndefined();
+		});
+	});
 });
 
 describe("compaction queued for the next yield", () => {
@@ -206,7 +245,7 @@ describe("compaction queued for the next yield", () => {
 
 		await controller.runYieldCompaction();
 
-		expect(handleCompactCommand).toHaveBeenCalledWith(undefined, "soft", expect.any(Function));
+		expect(handleCompactCommand).toHaveBeenCalledWith(undefined, "soft", expect.any(Function), { origin: "outside" });
 		expect(ctx.yieldCompaction).toBeUndefined();
 	});
 
@@ -239,7 +278,7 @@ describe("compaction queued for the next yield", () => {
 
 		await controller.runYieldCompaction();
 
-		expect(handleCompactCommand).toHaveBeenCalledWith(undefined, "soft", expect.any(Function));
+		expect(handleCompactCommand).toHaveBeenCalledWith(undefined, "soft", expect.any(Function), { origin: "outside" });
 	});
 
 	it("releases held follow-ups when there is nothing to compact", async () => {

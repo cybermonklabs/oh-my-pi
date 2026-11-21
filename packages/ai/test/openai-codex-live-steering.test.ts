@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { addModelCallGuard } from "@oh-my-pi/pi-ai/model-call-guard";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
 import {
 	type OpenAICodexResponsesOptions,
@@ -292,6 +293,65 @@ describe("codex live steering", () => {
 		expect(second.content).toEqual([expect.objectContaining({ type: "text", text: "Tabs it is" })]);
 		expect(creates()).toHaveLength(1);
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
+	});
+
+	// A steer is a send into the response in flight, so it reads the model-call guards first. While a hold
+	// stands on the model, the steer is handed back (rejected) and goes with the next request, which the
+	// guard holds; nothing reaches the socket. The test above is the control: with no hold, the steer is sent.
+	it("hands a steer back while a model-call hold stands on the model", async () => {
+		let socketRef: ScriptedWebSocket | undefined;
+		installSocket((frame, socket) => {
+			socketRef = socket;
+			if (frame.type !== "response.create") return;
+			// Stream part of an answer and wait: the response ends once the steer is settled.
+			socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Plan"));
+		});
+		let outcome: "accepted" | "rejected" | undefined;
+		let claimed = false;
+		const source: LiveSteering = {
+			// After its one claim the source idles until the pump stops.
+			wait: async signal => {
+				if (!claimed || signal.aborted) return;
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => resolve(), { once: true });
+				await promise;
+			},
+			claim: async (): Promise<LiveSteerClaim | undefined> => {
+				if (claimed) return undefined;
+				claimed = true;
+				return {
+					messages: [{ role: "user", content: "use tabs", timestamp: Date.now() }],
+					accept: () => {
+						outcome = "accepted";
+					},
+					reject: () => {
+						outcome = "rejected";
+						socketRef?.emit({
+							type: "response.completed",
+							response: { id: "resp_1", status: "completed", usage: USAGE },
+						});
+					},
+				};
+			},
+		};
+		const model = createGpt6Model();
+		const removeGuard = addModelCallGuard({
+			refuse: candidate => (candidate.id === model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			const result = await streamOpenAICodexResponses(
+				model,
+				{ systemPrompt: SYSTEM, messages: [user] },
+				options(new Map(), source),
+			).result();
+
+			expect(outcome).toBe("rejected");
+			expect(steers()).toEqual([]);
+			expect(result.stopReason).toBe("stop");
+		} finally {
+			removeGuard();
+		}
 	});
 
 	it("returns pending tool output without repeating steering the server already queued", async () => {

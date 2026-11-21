@@ -612,7 +612,7 @@ export interface InteractiveModeContext {
 		customInstructions?: string,
 		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
-		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
+		options?: Pick<CompactOptions, "internalGuidance" | "readerModel" | "origin">,
 	): Promise<CompactionOutcome>;
 	handleHandoffCommand(customInstructions?: string): Promise<void>;
 	handleShakeCommand(mode: ShakeMode): Promise<void>;

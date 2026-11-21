@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import { addModelCallGuard, type AuthStorage } from "@oh-my-pi/pi-ai";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -441,6 +441,48 @@ describe("OpenAI API-billed Responses web search", () => {
 				message: "OpenAI API key was rejected (401): type=invalid_request_error, code=invalid_api_key",
 			});
 		} finally {
+			fixture.authStorage.close();
+		}
+	});
+
+	// A web search is a model call (its query is drawn from the conversation): while a model-call hold stands
+	// on the selected model it sends nothing; with no hold the same search is sent.
+	it.each([
+		["holds a search while a model-call hold stands on the selected model", true],
+		["sends the same search when no hold stands (control)", false],
+	])("%s", async (_name, held) => {
+		const fixture = createFixture();
+		let requests = 0;
+		const fetch: FetchImpl = async () => {
+			requests++;
+			return Response.json({
+				output: [
+					{
+						type: "web_search_call",
+						status: "completed",
+						action: {
+							type: "search",
+							query: "held lookup",
+							sources: [{ type: "url", url: "https://search.example.test/held", title: "Held result" }],
+						},
+					},
+					{ type: "message", content: [{ type: "output_text", text: "Found it." }] },
+				],
+			});
+		};
+		const removeGuard = addModelCallGuard({
+			refuse: model => (held && model.id === fixture.model.id ? "held: cyber_policy" : undefined),
+		});
+		try {
+			const outcome = await searchOpenAIResponses(makeParams(fixture, fetch)).then(
+				() => "sent",
+				(error: unknown) => String(error),
+			);
+			expect(requests).toBe(held ? 0 : 1);
+			if (held) expect(outcome).toContain("held: cyber_policy");
+			else expect(outcome).toBe("sent");
+		} finally {
+			removeGuard();
 			fixture.authStorage.close();
 		}
 	});

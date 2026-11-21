@@ -1006,6 +1006,7 @@ const streamOpenAIResponsesOnce = (
 					}
 					const { events, response, requestId } = await postOpenAIStream<ResponseStreamEvent>({
 						url: requestUrl,
+						model,
 						headers: headersWithTimeout,
 						body: requestParams,
 						signal: requestSignal,

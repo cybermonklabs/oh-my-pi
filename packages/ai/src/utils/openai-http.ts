@@ -17,10 +17,11 @@
 import { fetchWithRetry, readSseJsonOrText, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { OpenAIHttpError } from "../error";
+import { assertModelCallAllowed, ModelCallRefusedError } from "../model-call-guard";
 
 export { OpenAIHttpError };
 
-import type { FetchImpl } from "../types";
+import type { Api, FetchImpl, Model } from "../types";
 import type { CapturedHttpErrorResponse } from "./http-inspector";
 import { getShouldRetryFromHeaders } from "./retry-after";
 
@@ -64,6 +65,8 @@ function isConcurrencyAdmissionRejection(response: Response, bodyText: string): 
 
 export interface OpenAIStreamRequestInit {
 	url: string;
+	/** The model the request is for: each resend reads the model-call guards again first. */
+	model: Model<Api>;
 	headers: Record<string, string>;
 	/** JSON request body; serialized once per call (retries resend the same bytes). */
 	body: unknown;
@@ -101,7 +104,14 @@ export interface OpenAIStreamHandle<TEvent> {
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
 	let response: Response;
 	try {
-		response = await fetchWithRetry(init.url, {
+		// Each resend reads the model-call guards again, in the URL callback that `fetchWithRetry` calls before
+		// every attempt and outside its retry: a hold that began during the backoff holds the resend, and the
+		// held error leaves here unretried. (`prepareInit` would rebuild the headers as a `Headers` object.)
+		const url = (attempt: number): string => {
+			if (attempt > 0) assertModelCallAllowed(init.model);
+			return init.url;
+		};
+		response = await fetchWithRetry(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
 			body: JSON.stringify(init.body),
@@ -125,6 +135,8 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 			timeout: false,
 		});
 	} catch (error) {
+		// A resend the guards held sent nothing: keep its error as it is.
+		if (error instanceof ModelCallRefusedError) throw error;
 		// Transport rejection after the retry budget: name the host and the cause
 		// instead of surfacing the runtime's bare `getaddrinfo …` text.
 		throw AIError.networkFailureError(error, init.url);

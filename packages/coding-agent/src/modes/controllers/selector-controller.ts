@@ -794,9 +794,11 @@ export class SelectorController {
 			switched = true;
 			await apply();
 		};
-		// The target reads what this pass writes: no provider-native method it cannot replay.
+		// The target reads what this pass writes: no provider-native method it cannot replay. A person's model
+		// switch: input from outside the session.
 		const outcome = await this.ctx.handleCompactCommand(undefined, undefined, switchAfterCompaction, {
 			readerModel: model,
+			origin: "outside",
 		});
 		await switchAfterCompaction(outcome);
 	}
