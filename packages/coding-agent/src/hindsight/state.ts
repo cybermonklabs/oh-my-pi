@@ -4,6 +4,7 @@ import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import type { BasePromptRebuildOptions } from "../session/session-tools";
 import { type BankScope, ensureBankExists, type HindsightBankSet } from "./bank";
 import type { HindsightClientApi } from "./client";
 import type { HindsightConfig } from "./config";
@@ -243,6 +244,18 @@ function extendRetentionPrefixKey(key: string, messages: HindsightMessage[], fro
 	return key;
 }
 
+/** A transcript's recall, retention and mental-model tracking ({@link HindsightSessionState.conversationTracking}). */
+export interface HindsightConversationTracking {
+	readonly lastRetainedTurn: number;
+	readonly hasRecalledForFirstTurn: boolean;
+	readonly lastRecallSnippet: string | undefined;
+	readonly lastRetainedMessageIndex: number;
+	readonly cachedTranscript: string;
+	readonly lastRetainedPrefixKey: string;
+	readonly mentalModelsSnippet: string | undefined;
+	readonly mentalModelsLoadedAt: number | undefined;
+}
+
 /** Per-session Hindsight runtime state owned by its AgentSession. */
 export class HindsightSessionState implements HindsightSessionStateApi {
 	/** Session id used for retain-queue metadata. */
@@ -326,6 +339,38 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
 		this.#lastRetainedPrefixKey = "";
+	}
+
+	/** What {@link resetConversationTracking} and a transcript's mental-model reload change, for {@link restoreConversationTracking}. */
+	conversationTracking(): HindsightConversationTracking {
+		return {
+			lastRetainedTurn: this.lastRetainedTurn,
+			hasRecalledForFirstTurn: this.hasRecalledForFirstTurn,
+			lastRecallSnippet: this.lastRecallSnippet,
+			lastRetainedMessageIndex: this.#lastRetainedMessageIndex,
+			cachedTranscript: this.#cachedTranscript,
+			lastRetainedPrefixKey: this.#lastRetainedPrefixKey,
+			mentalModelsSnippet: this.mentalModelsSnippet,
+			mentalModelsLoadedAt: this.mentalModelsLoadedAt,
+		};
+	}
+
+	/**
+	 * Puts back the tracking of a transcript the session returns to (a session switch that failed after it reset the
+	 * tracking for the target): its first turn already recalled, and its prompt keeps the mental models it was sent
+	 * with. A recall or a mental-model reload still running for the target is dropped.
+	 */
+	restoreConversationTracking(tracking: HindsightConversationTracking): void {
+		this.#recallGeneration++;
+		this.#mentalModelsLoadGeneration++;
+		this.lastRetainedTurn = tracking.lastRetainedTurn;
+		this.hasRecalledForFirstTurn = tracking.hasRecalledForFirstTurn;
+		this.lastRecallSnippet = tracking.lastRecallSnippet;
+		this.#lastRetainedMessageIndex = tracking.lastRetainedMessageIndex;
+		this.#cachedTranscript = tracking.cachedTranscript;
+		this.#lastRetainedPrefixKey = tracking.lastRetainedPrefixKey;
+		this.mentalModelsSnippet = tracking.mentalModelsSnippet;
+		this.mentalModelsLoadedAt = tracking.mentalModelsLoadedAt;
 	}
 
 	/**
@@ -546,6 +591,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		if (persisted !== undefined) {
 			return {
 				context: persisted.text || undefined,
+				reused: true,
 				commit: () => this.#commitRecall(generation, persisted.text, false),
 			};
 		}
@@ -625,7 +671,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 				}
 			}
 
-			await this.#loadAndPublishMentalModels(generation, previousSnippet, "MM load");
+			// A backend apply or a settings rebuild installed this state: under a held settings rebuild (a switch to
+			// Hindsight or a `hindsight.*` edit on a bound prompt) the snapshot is part of the held change and goes
+			// out with it.
+			await this.#loadAndPublishMentalModels(generation, previousSnippet, "MM load", { joinsHeldChange: true });
 		})();
 		await this.#settleMentalModelsLoadWithinDeadline(bootstrap, generation, previousSnippet);
 	}
@@ -677,6 +726,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		generation: number,
 		previousSnippet: string | undefined,
 		reason: "MM load" | "MM reload" | "MM transcript reload",
+		rebuild?: BasePromptRebuildOptions,
 	): Promise<void> {
 		const result = await tryLoadMentalModelsBlock(
 			this.client,
@@ -694,6 +744,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const published = await this.#refreshBaseSystemPromptAfter(
 			reason,
 			() => generation === this.#mentalModelsLoadGeneration,
+			rebuild,
 		);
 		if (generation !== this.#mentalModelsLoadGeneration) return;
 		if (!published) this.mentalModelsSnippet = previousSnippet;
@@ -740,9 +791,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	async #refreshBaseSystemPromptAfter(
 		reason: "MM load" | "MM reload" | "MM transcript reload",
 		commitIf?: () => boolean,
+		rebuild?: BasePromptRebuildOptions,
 	): Promise<boolean> {
 		try {
-			await this.session.refreshBaseSystemPrompt(commitIf);
+			await this.session.refreshBaseSystemPrompt(commitIf, rebuild);
 			return !commitIf || commitIf();
 		} catch (err) {
 			logger.debug(`Hindsight: refreshBaseSystemPrompt after ${reason} failed`, { error: String(err) });

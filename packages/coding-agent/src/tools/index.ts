@@ -40,6 +40,7 @@ import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, canSpawnAtDepth } from "../task/types";
+import type { PerCallModelAdvertisement } from "../task/model-approval";
 import { type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
@@ -384,6 +385,11 @@ export interface ToolSession {
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
 	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
+	/**
+	 * Why a call to the tool or `xd://` device `name`, bare or `xd://`-prefixed, is refused: a held settings change
+	 * disabled it while the bound prompt still lists it, until the rebuild. Undefined when calls to it run.
+	 */
+	heldToolRefusal?: (name: string) => string | undefined;
 	/** Current session context for eval-bridged tool execution. */
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Tool names the eval description advertises as callable from cells; frozen with the cached prompt prefix. */
@@ -432,6 +438,21 @@ export interface ToolSession {
 	 * hidden notice. Absent when the embedder has no base-prompt surface.
 	 */
 	advertisedSessionAgents?: () => readonly AgentDefinition[];
+	/**
+	 * Discovered agents baked into the current base prompt surface, listed by
+	 * the task description instead of the latest scan so a rescan mid-session
+	 * does not mutate the provider tool prefix; the delta rides a hidden notice.
+	 * Undefined when the embedder has no base-prompt surface or the surface
+	 * holds no scan; the description then lists the latest scan.
+	 */
+	advertisedDiscoveredAgents?: () => readonly AgentDefinition[] | undefined;
+	/**
+	 * Per-call model approvals baked into the current base prompt surface,
+	 * listed by the task and eval descriptions instead of the live settings;
+	 * a change rides a hidden notice. Undefined when the embedder has no
+	 * base-prompt surface or per-call models were off at its last rebuild.
+	 */
+	advertisedPerCallModels?: () => PerCallModelAdvertisement | undefined;
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
 	/** Get the current session model string, regardless of how it was chosen */

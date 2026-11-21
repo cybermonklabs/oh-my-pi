@@ -9,6 +9,7 @@
 - Added `stderrSharesStdoutTerminal()`, which reports whether stderr is the terminal stdout writes to ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
 - Added `headerRetryAfterMs` to `RetryHintOptions`: `extractRetryHint` merges an already parsed response-header delay with the body's signals, longest first ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - Added `OMP_CONFIG_ROOT`, an absolute config root that replaces `~/.omp` on every OS (profiles, the default agent directory, and all state, data and caches move under it), and `OMP_DOWNLOAD_ROOT`, a config root that holds only the version-fixed downloads (the managed Chromium, the native addon and its grammars, FastEmbed models and runtime, tiny models), so several config roots share one copy; added `getConfigRootOverride()` and `getBrowserStateDir()`. The test preload gives every test process a config root of its own and shares only the developer's downloads
+- Added `isStringList()`, a type guard for an array whose every item is a string
 
 ### Fixed
 

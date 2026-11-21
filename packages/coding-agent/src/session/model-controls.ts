@@ -158,6 +158,11 @@ export interface ModelControlsHost {
 	promptGeneration(): number;
 	resolveActiveEditMode(): EditModeSetting;
 	syncAfterModelChange(previousEditMode: EditModeSetting): Promise<void>;
+	/**
+	 * Runs a model switch, from the agent's switch to the new model through its {@link syncAfterModelChange}, as one
+	 * step that main requests wait for: one sent between the two would go out on the new model with the old prompt.
+	 */
+	trackModelSwitch<T>(modelSwitch: () => Promise<T>): Promise<T>;
 	setModelWithProviderSessionReset(model: Model, selection?: "explicit" | "automatic"): Promise<void>;
 	clearActiveRetryFallback(): void;
 	clearInheritedProviderPromptCacheKey(): void;
@@ -321,27 +326,29 @@ export class ModelControls {
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(targetModel);
-		this.#host.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`, role);
-		if (options?.persist) {
-			this.#host.settings.setModelRole(
-				role,
-				formatRoleModelValue(
-					this.#host.settings,
-					this.#host.modelRegistry,
+		await this.#host.trackModelSwitch(async () => {
+			await this.#host.setModelWithProviderSessionReset(targetModel);
+			this.#host.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`, role);
+			if (options?.persist) {
+				this.#host.settings.setModelRole(
 					role,
-					targetModel,
-					options.selector,
-					options.thinkingLevel,
-				),
-			);
-		}
-		this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
+					formatRoleModelValue(
+						this.#host.settings,
+						this.#host.modelRegistry,
+						role,
+						targetModel,
+						options.selector,
+						options.thinkingLevel,
+					),
+				);
+			}
+			this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
 
-		// Re-apply thinking for the newly selected model. Prefer the model's
-		// configured defaultLevel; otherwise preserve the current level (or auto).
-		this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
-		await this.#host.syncAfterModelChange(previousEditMode);
+			// Re-apply thinking for the newly selected model. Prefer the model's
+			// configured defaultLevel; otherwise preserve the current level (or auto).
+			this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
+			await this.#host.syncAfterModelChange(previousEditMode);
+		});
 		return { switched: true };
 	}
 
@@ -367,21 +374,27 @@ export class ModelControls {
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(targetModel));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(targetModel, selection);
-		this.#host.sessionManager.appendModelChange(
-			`${targetModel.provider}/${targetModel.id}`,
-			options?.prewalk ? PREWALK_MODEL_CHANGE_ROLE : options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
-		);
-		this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
+		await this.#host.trackModelSwitch(async () => {
+			await this.#host.setModelWithProviderSessionReset(targetModel, selection);
+			this.#host.sessionManager.appendModelChange(
+				`${targetModel.provider}/${targetModel.id}`,
+				options?.prewalk
+					? PREWALK_MODEL_CHANGE_ROLE
+					: options?.ephemeral
+						? EPHEMERAL_MODEL_CHANGE_ROLE
+						: "temporary",
+			);
+			this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
 
-		// Apply explicit thinking level if given; otherwise prefer the model's
-		// configured defaultLevel; otherwise re-clamp the current level (or auto).
-		if (thinkingLevel !== undefined) {
-			this.setThinkingLevel(thinkingLevel);
-		} else {
-			this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
-		}
-		await this.#host.syncAfterModelChange(previousEditMode);
+			// Apply explicit thinking level if given; otherwise prefer the model's
+			// configured defaultLevel; otherwise re-clamp the current level (or auto).
+			if (thinkingLevel !== undefined) {
+				this.setThinkingLevel(thinkingLevel);
+			} else {
+				this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
+			}
+			await this.#host.syncAfterModelChange(previousEditMode);
+		});
 	}
 
 	/**
@@ -489,13 +502,15 @@ export class ModelControls {
 		// Apply model
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(next.model));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(next.model);
-		this.#host.sessionManager.appendModelChange(`${next.model.provider}/${next.model.id}`);
-		this.#host.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
+		await this.#host.trackModelSwitch(async () => {
+			await this.#host.setModelWithProviderSessionReset(next.model);
+			this.#host.sessionManager.appendModelChange(`${next.model.provider}/${next.model.id}`);
+			this.#host.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
 
-		// Apply the scoped model's configured thinking level, preserving auto.
-		this.setThinkingLevel(this.#autoThinking ? AUTO_THINKING : next.thinkingLevel);
-		await this.#host.syncAfterModelChange(previousEditMode);
+			// Apply the scoped model's configured thinking level, preserving auto.
+			this.setThinkingLevel(this.#autoThinking ? AUTO_THINKING : next.thinkingLevel);
+			await this.#host.syncAfterModelChange(previousEditMode);
+		});
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -520,12 +535,14 @@ export class ModelControls {
 
 		this.#host.modelRegistry.clearSuppressedSelector(formatModelStringWithRouting(nextModel));
 		this.#host.clearActiveRetryFallback();
-		await this.#host.setModelWithProviderSessionReset(nextModel);
-		this.#host.sessionManager.appendModelChange(`${nextModel.provider}/${nextModel.id}`);
-		this.#host.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
-		// Re-apply the current thinking level (or auto) for the newly selected model
-		this.#reapplyThinkingLevel();
-		await this.#host.syncAfterModelChange(previousEditMode);
+		await this.#host.trackModelSwitch(async () => {
+			await this.#host.setModelWithProviderSessionReset(nextModel);
+			this.#host.sessionManager.appendModelChange(`${nextModel.provider}/${nextModel.id}`);
+			this.#host.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
+			// Re-apply the current thinking level (or auto) for the newly selected model
+			this.#reapplyThinkingLevel();
+			await this.#host.syncAfterModelChange(previousEditMode);
+		});
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}

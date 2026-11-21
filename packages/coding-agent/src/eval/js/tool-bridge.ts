@@ -87,6 +87,10 @@ function toolResultHasError(result: AgentToolResult): boolean {
 }
 
 function getTool(session: ToolSession, name: string): AgentTool {
+	// A tool a held settings change disabled stays listed until the rebuild; a call to it is refused as a direct call
+	// to it is, with the reason.
+	const heldRefusal = session.heldToolRefusal?.(name);
+	if (heldRefusal) throw new ToolError(heldRefusal);
 	const tool = session.getToolForEvalBridge ? session.getToolForEvalBridge(name) : session.getToolByName?.(name);
 	if (tool) return tool;
 	// A registry hit means the tool exists, but the session does not expose it here.

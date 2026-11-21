@@ -1163,6 +1163,8 @@ export class SessionManager {
 	#titleRevision = 0;
 	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
 	#bodyRevision = 0;
+	/** Bumped each time the entries are read in whole ({@link loadRevision}). */
+	#loadRevision = 0;
 	#sessionFile: string | undefined;
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
@@ -2886,6 +2888,7 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
+		this.#loadRevision++;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
@@ -3910,6 +3913,7 @@ export class SessionManager {
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
 		manager.#entries = structuredClone(this.#entries);
+		manager.#loadRevision++;
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
@@ -4581,6 +4585,18 @@ export class SessionManager {
 		return this.#bodyRevision;
 	}
 
+	/**
+	 * Bumped each time the entries are read in whole: a session file opened, resumed or read again (a `/resume` of the
+	 * session already held, a reload), copied into a new session (`forkFrom`: `omp --fork`, a resume of a session that
+	 * moved away, a `/tan` or task fork; {@link persistCopy}), a captured state restored. Records read from the entries
+	 * and kept by session (image drops, snapcompact refusals, the cut rule's waits) are read again at a new revision:
+	 * another process may have continued the session file since this one last read it, and the records a read brings
+	 * stand over what this process held before it.
+	 */
+	get loadRevision(): number {
+		return this.#loadRevision;
+	}
+
 	/** Tracks user rename requests; background title updates do not invalidate them. */
 	get titleRevision(): number {
 		return this.#titleRevision;
@@ -5019,6 +5035,22 @@ export class SessionManager {
 		};
 		this.#recordEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Append `message`, a custom message the agent was sent, as its entry ({@link appendCustomMessageEntry}). The entry
+	 * keeps the message's own timestamp: what names a turn by it (the image clamp, the date/cwd reminder) finds, after
+	 * a re-read, the same turn the model was sent.
+	 */
+	appendCustomMessage<T>(message: CustomMessage<T>): string {
+		return this.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution,
+			message.timestamp,
+		);
 	}
 
 	/** Append a TTSR injection entry recording which rules were injected. */
@@ -5680,6 +5712,7 @@ export class SessionManager {
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
+		manager.#loadRevision++;
 		manager.#index.rebuild(history);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (options?.repairInterruptedTail) {

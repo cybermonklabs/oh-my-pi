@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -37,9 +37,18 @@ describe("AgentSession tool-call loop guard", () => {
 		await session?.dispose();
 		authStorage.close();
 		tempDir.removeSync();
+		vi.restoreAllMocks();
 	});
 
-	it("injects a hidden redirect before the next model call", async () => {
+	/** Whether `message` is the loop guard's hidden redirect. */
+	const isRedirect = (message: AgentMessage): message is CustomMessage =>
+		message.role === "custom" && message.customType === "tool-call-loop-redirect";
+
+	/**
+	 * A session whose model runs the same bash command twice, which trips the loop guard, then stops; `contexts` holds
+	 * the context of each model call.
+	 */
+	function loopingSession(): { session: AgentSession; contexts: Context[] } {
 		const model = createMockModel({ provider: "openai", id: "gpt-test" }).model;
 		const modelRegistry = new ModelRegistry(authStorage);
 		const contexts: Context[] = [];
@@ -97,25 +106,44 @@ describe("AgentSession tool-call loop guard", () => {
 			"model.toolCallLoopGuard.exemptTools": ["wait"],
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		session = new AgentSession({
+		const looping = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings,
 			modelRegistry,
 			toolRegistry: new Map([[bashTool.name, bashTool]]),
 		});
+		session = looping;
+		return { session: looping, contexts };
+	}
 
-		await session.prompt("run checks");
-		await session.waitForIdle();
+	it("injects a hidden redirect before the next model call", async () => {
+		const { session: looping, contexts } = loopingSession();
+		await looping.prompt("run checks");
+		await looping.waitForIdle();
 
 		expect(contexts).toHaveLength(3);
 		expect(JSON.stringify(contexts[2]!.messages)).toContain("tool_call_loop_detected");
 		expect(JSON.stringify(contexts[2]!.messages)).toContain("1263 passed, 4 skipped");
-		const redirects = session.agent.state.messages.filter(
-			(message): message is CustomMessage =>
-				message.role === "custom" && message.customType === "tool-call-loop-redirect",
-		);
+		const redirects = looping.agent.state.messages.filter(isRedirect);
 		expect(redirects).toHaveLength(1);
 		expect(redirects[0]!.display).toBe(false);
+	});
+
+	it("stores the redirect under the timestamp it was sent with", async () => {
+		// The clock the agent stamps messages with runs a second ahead of the one the session's entries are dated by,
+		// as when a millisecond passes between taking the redirect and storing it.
+		const now = Date.now;
+		vi.spyOn(Date, "now").mockImplementation(() => now.call(Date) + 1_000);
+		const { session: looping } = loopingSession();
+		await looping.prompt("run checks");
+		await looping.waitForIdle();
+
+		const sent = looping.agent.state.messages.find(isRedirect);
+		if (!sent) throw new Error("Expected the redirect in agent state");
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's drops,
+		// the date/cwd reminder's placements): it must find the turn the agent sent.
+		const reread = looping.sessionManager.buildSessionContext().messages.find(isRedirect);
+		expect(reread?.timestamp).toBe(sent.timestamp);
 	});
 });

@@ -73,6 +73,8 @@ function newSession(
 		beforeRequest?: () => Promise<void>;
 		/** Prompt-cache key inherited from the session a fork was taken from. */
 		forkPromptCacheKey?: string;
+		/** Digest of the operator's prompt inputs, as `createAgentSession` passes it. */
+		operatorPromptDigest?: string;
 	} = {},
 ): TestSession {
 	const read = createTool("read");
@@ -81,7 +83,10 @@ function newSession(
 		[read.name, read],
 		[bash.name, bash],
 	]);
-	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }] });
+	// Each reply comes from the session's model and writes the prompt cache, as a Claude reply does, so a resumed
+	// transcript has a cache entry to keep.
+	const reply = { content: ["ok"], usage: { cacheWrite: 100 } };
+	const mock = createMockModel({ id: model.id, provider: model.provider, responses: [reply, reply] });
 	const contexts: Message[][] = [];
 	const systemPrompts: string[][] = [];
 	const promptCacheKeys: (string | undefined)[] = [];
@@ -115,7 +120,11 @@ function newSession(
 		agent,
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: async () => "test-key",
+			find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
+			isUsingOAuth: () => false,
+		} as never,
 		toolRegistry,
 		builtInToolNames: ["read", "bash"],
 		providerPromptCacheKeySource: options.forkPromptCacheKey ? "fork" : undefined,
@@ -128,6 +137,7 @@ function newSession(
 		rebuildSystemPrompt: async toolNames => ({
 			systemPrompt: [await rebuilder.rebuildSystemPrompt(toolNames)],
 		}),
+		operatorPromptDigest: options.operatorPromptDigest,
 	});
 	return {
 		session,
@@ -214,13 +224,16 @@ describe("prefix-bound tool roster changes", () => {
 
 	describe("after a resume", () => {
 		/** Transcript of a process that sent its first turn with `toolNames` active. */
-		async function liveTranscript(toolNames = ["read", "bash"]): Promise<{
+		async function liveTranscript(
+			toolNames = ["read", "bash"],
+			operatorPromptDigest?: string,
+		): Promise<{
 			sessionManager: SessionManager;
 			replyEntryId: string;
 			systemPrompt: string[];
 		}> {
 			const sessionManager = SessionManager.inMemory();
-			const live = newSession(createPrefixBindingModel(), { sessionManager });
+			const live = newSession(createPrefixBindingModel(), { sessionManager, operatorPromptDigest });
 			sessions.push(live.session);
 			await live.session.setActiveToolPresentation(toolNames, []);
 			await live.session.prompt("first");
@@ -415,6 +428,45 @@ describe("prefix-bound tool roster changes", () => {
 
 			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
+		describe("whose process builds another prompt from the same operator inputs", () => {
+			const operatorPromptDigest = "operator-inputs";
+
+			it("keeps the transcript's stored prompt through a tool that registers late", async () => {
+				const transcript = await liveTranscript(["read", "bash"], operatorPromptDigest);
+				const resumed = newSession(createPrefixBindingModel(), {
+					sessionManager: transcript.sessionManager,
+					operatorPromptDigest,
+				});
+				sessions.push(resumed.session);
+				// A skill description or context file renders otherwise in this process.
+				resumed.changePromptInputs();
+				await resumed.session.setActiveToolPresentation(["read"], []);
+				await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+				await resumed.session.prompt("second");
+
+				expect(resumed.systemPrompts[0]).toEqual(transcript.systemPrompt);
+				expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
+			});
+
+			it("sends this process's own build at the first request when a tool the stored prompt lists is gone", async () => {
+				const transcript = await liveTranscript(["read", "bash"], operatorPromptDigest);
+				const resumed = newSession(createPrefixBindingModel(), {
+					sessionManager: transcript.sessionManager,
+					operatorPromptDigest,
+				});
+				sessions.push(resumed.session);
+				await resumed.session.setActiveToolPresentation(["read"], []);
+
+				await resumed.session.prompt("second");
+
+				// The first request declares other tools than the transcript's last one, so it reads none of the cache
+				// entry the stored prompt was kept for: this process's own build goes out, with nothing to announce.
+				expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+				expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
+			});
 		});
 
 		/** Kept out of the test body so no strong local binding outlives the capture. */

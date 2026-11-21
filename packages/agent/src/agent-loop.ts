@@ -1469,6 +1469,12 @@ async function runLoopBody(
 						await config.syncContextBeforeModelCall(currentContext, signal);
 					}
 					if (signal?.aborted && (await endAbortedBeforeModel(turnMessages, turnOpen))) return;
+					// A message the call must carry that the context lacks joins this turn's inputs.
+					for (const message of (await config.getMissingContextMessages?.(currentContext)) ?? []) {
+						currentContext.messages.push(message);
+						newMessages.push(message);
+						turnMessages.push(message);
+					}
 
 					if (!directiveResolvedForTurn) {
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
@@ -2105,6 +2111,12 @@ async function prepareProviderCall(
 				pruneDescriptions: pruneToolDescriptions,
 			}),
 		};
+	}
+	// After the append-only log, which keeps the object it first synced for each byte-stable position: a repeated
+	// per-call message it holds from an earlier request still goes out as history.
+	if (config.repeatedPerCallMessages) {
+		const messages = config.repeatedPerCallMessages.settle(llmContext.messages);
+		if (messages !== llmContext.messages) llmContext = { ...llmContext, messages };
 	}
 	// Before the transform too, so a request-size clamp in it measures the withdrawn definitions the provider
 	// re-declares; recomputed below against what the transform returns.

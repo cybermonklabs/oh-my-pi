@@ -3,13 +3,22 @@
 import type { Agent, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { all as allSettings, combine, type Derived } from "../config/registry";
+import {
+	type AnySetting,
+	all as allSettings,
+	combine,
+	type Derived,
+	type SettingChange,
+	settingValuesEqual,
+} from "../config/registry";
 import type { Settings } from "../config/settings";
-import type { HindsightSessionState } from "../hindsight/state";
+import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
+import type { RecallChangesReport } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
-import type { MemoryBackendStartOptions } from "../memory-backend/types";
-import type { MnemopiSessionState } from "../mnemopi/state";
+import type { MemoryBackendId, MemoryBackendStartOptions } from "../memory-backend/types";
+import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
+import type { SettingsChangeOptions } from "./session-tools";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
 
@@ -34,6 +43,19 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 	return memorySettings;
 }
 
+/**
+ * What a transcript leaves in the session's memory state ({@link SessionMemory.conversationTracking}): the base prompt
+ * captured before a per-turn memory promotion, the recall the conversation carries as hidden messages, and each memory
+ * backend's tracking of the transcript.
+ */
+export interface ConversationTracking {
+	readonly promotionSnapshot: string[] | undefined;
+	readonly hiddenRecall: string | undefined;
+	readonly recallChanges: readonly RecallChangesReport[];
+	readonly hindsight: HindsightConversationTracking | undefined;
+	readonly mnemopi: MnemopiConversationTracking | undefined;
+}
+
 /** Capabilities borrowed from the owning AgentSession. */
 export interface SessionMemoryHost {
 	agent: Agent;
@@ -51,8 +73,13 @@ export interface SessionMemoryHost {
 	getMnemopiSessionState(): MnemopiSessionState | undefined;
 	takeMnemopiSessionState(): MnemopiSessionState | undefined;
 	setBaseSystemPrompt(prompt: string[]): void;
-	refreshBaseSystemPrompt(): Promise<void>;
-	replaceMemoryTools(tools: AgentTool[]): Promise<void>;
+	/**
+	 * Rebuilds the base prompt; with `settingsChange` (the memory settings a backend apply took in) a bound prompt
+	 * holds the rebuild (`SessionTools.refreshBaseSystemPrompt`).
+	 */
+	refreshBaseSystemPrompt(options?: SettingsChangeOptions): Promise<void>;
+	/** Swaps the memory tools; with `settingsChange` a bound prompt holds the swap (`SessionTools.replaceMemoryTools`). */
+	replaceMemoryTools(tools: AgentTool[], options?: SettingsChangeOptions): Promise<void>;
 }
 
 /** Owns memory backend transitions and transcript-scoped memory state. */
@@ -64,12 +91,32 @@ export class SessionMemory {
 	#memoryBackendTransition: Promise<void> = Promise.resolve();
 	#localMemoryStartupAbort: AbortController | undefined;
 	#baseSystemPromptBeforeMemoryPromotion: string[] | undefined;
+	/**
+	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
+	 * instead of a system block (`MEMORY_RECALL_MESSAGE_TYPE`); each request sends it where its context lacks it.
+	 */
+	#hiddenRecall: string | undefined;
+	/**
+	 * The reports of what changed in a reused recall's memories that the conversation carries as hidden
+	 * `memory-recall-changes` messages, oldest first; each request sends one again where its context lacks it.
+	 */
+	#recallChanges: readonly RecallChangesReport[] = [];
 	/** Cwd the running backend state was built for; a transcript is never retained after it moved. */
 	#runtimeCwd: string | undefined;
 	/** Apply waiting behind the current transition; later requests join it. */
 	#queuedApply: { retainMnemopi: boolean; done: Promise<void> } | undefined;
 	/** Memory settings as last dispatched to `#applySettingsChange`; unset when live changes are disabled. */
 	#observedSettings: Record<string, unknown> | undefined;
+	/**
+	 * Each memory setting's value as a backend apply last took it in ({@link #applyMemoryBackend}): the value the
+	 * running backend, its tools and the prompt follow. Unset when live changes are disabled.
+	 */
+	#appliedSettings: Map<AnySetting, unknown> | undefined;
+	/**
+	 * The backend the running memory state follows: the one selected when the session started, then the one each
+	 * backend apply resolved ({@link #applyMemoryBackend}). A switch still waiting for its apply does not move it.
+	 */
+	#runningBackend: MemoryBackendId;
 	/** Dispatched setting changes still running, including backend hooks that run outside the transition queue. */
 	readonly #settingsChanges = new Set<Promise<void>>();
 
@@ -81,17 +128,29 @@ export class SessionMemory {
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
 			createMemoryTools?: () => Promise<AgentTool[]>;
+			/** Reads the recall the loaded transcript's branch delivered as a hidden message (`findDeliveredRecall`). */
+			hiddenRecall?: () => string | undefined;
+			/** Reads the reports of a reused recall's changes the loaded branch delivered (`findDeliveredRecallChanges`). */
+			recallChanges?: () => readonly RecallChangesReport[];
 		},
 	) {
 		this.#host = host;
 		this.#memoryAgentDir = options.memoryAgentDir;
 		this.#memoryTaskDepth = options.memoryTaskDepth ?? 0;
 		this.#createMemoryTools = options.createMemoryTools;
+		// Only Hindsight and Mnemopi recall into the conversation: under another backend, or with memory off, the
+		// transcript's recall is history the session does not send again, and its branch is not read for it.
+		const backend = cfgMemoryBackend.get(host.settings);
+		this.#runningBackend = backend;
+		if (options.memoryEnabled !== false && (backend === "hindsight" || backend === "mnemopi")) {
+			this.adoptRecall(options.hiddenRecall?.(), options.recallChanges?.() ?? []);
+		}
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
 		if (options.memoryEnabled !== false && this.#memoryAgentDir && this.#memoryTaskDepth === 0) {
 			const value = memorySettingsValue();
 			this.#observedSettings = value.get(host.settings);
+			this.#appliedSettings = new Map(value.sources.map(setting => [setting, setting.get(host.settings)] as const));
 			value.listen(host, () => this.#observeSettings());
 		}
 	}
@@ -134,7 +193,11 @@ export class SessionMemory {
 	/**
 	 * Live memory-setting edits: switching `memory.backend` re-applies everything;
 	 * edits to the active backend's own `<id>.*` settings go to its
-	 * `applySettings` hook, or re-apply the backend when it has none.
+	 * `applySettings` hook, or re-apply the backend when it has none. A hook
+	 * takes the edit in itself, so once it returns the backend's own settings
+	 * count as applied ({@link #takeSettingsChange}): a later apply or recall
+	 * withdrawal does not take the edit for a change of its own. A backend
+	 * switch written meanwhile is left to the apply it starts.
 	 */
 	async #applySettingsChange(changed: string[]): Promise<void> {
 		try {
@@ -154,7 +217,9 @@ export class SessionMemory {
 				return undefined;
 			});
 			// Backend hooks may re-enter `applyMemoryBackend`, so they run outside the transition.
-			await hook?.backend.applySettings?.(this.#host.memoryBackendSession(), hook.own);
+			if (!hook) return;
+			await hook.backend.applySettings?.(this.#host.memoryBackendSession(), hook.own);
+			this.#takeSettingsChange(hook.backend.id, { backendSwitch: false });
 		} catch (error) {
 			logger.warn("Memory lifecycle: applying setting change failed", { changed, error: String(error) });
 			this.#host.emitNotice("error", `Failed to apply memory settings: ${String(error)}`, "Memory");
@@ -164,11 +229,6 @@ export class SessionMemory {
 	/** Current serialized backend transition, used by prompt and disposal drains. */
 	get transition(): Promise<void> {
 		return this.#memoryBackendTransition;
-	}
-
-	/** Base prompt captured before a per-turn memory promotion. */
-	get promotionSnapshot(): string[] | undefined {
-		return this.#baseSystemPromptBeforeMemoryPromotion;
 	}
 
 	/** Clears the per-turn memory promotion after a canonical prompt rebuild. */
@@ -181,10 +241,39 @@ export class SessionMemory {
 		this.#baseSystemPromptBeforeMemoryPromotion ??= prompt;
 	}
 
-	/** Restores a promotion snapshot while rolling back a failed session switch. */
-	restorePromotionSnapshot(prompt: string[] | undefined): void {
-		this.#baseSystemPromptBeforeMemoryPromotion = prompt;
+	/** The recall the conversation carries as a hidden message; undefined when its recall, if any, is a system block. */
+	get hiddenRecall(): string | undefined {
+		return this.#hiddenRecall;
 	}
+
+	/**
+	 * Records what the recall the backend just adopted leaves the conversation carrying: `hidden` rides the messages
+	 * (undefined when it does not), with the reports of what changed in a reused recall's memories (none for a fresh
+	 * one). `adoptRecall(undefined, [])` withdraws the conversation's recall, which no later request sends.
+	 */
+	adoptRecall(hidden: string | undefined, changes: readonly RecallChangesReport[]): void {
+		this.#hiddenRecall = hidden;
+		this.#recallChanges = changes;
+	}
+
+	/** The reports of what changed in a reused recall's memories that the conversation carries, oldest first. */
+	get recallChanges(): readonly RecallChangesReport[] {
+		return this.#recallChanges;
+	}
+
+	/**
+	 * Withdraws the conversation's recall ({@link adoptRecall}) after the backend's recall was reset, then rebuilds the
+	 * base prompt. The running backend's own settings it took in since the last apply (a Hindsight state rebuilt for an
+	 * edit of a `hindsight.*` setting) go with the rebuild ({@link #takeSettingsChange}), so a bound prompt holds it as
+	 * it holds a backend apply; `/memory clear` and a cwd move take in none and rebuild at once. A backend switch, and
+	 * the settings of the backend it selects, are left to the apply the switch starts.
+	 */
+	withdrawRecall(): Promise<void> {
+		this.adoptRecall(undefined, []);
+		const settingsChange = this.#takeSettingsChange(this.#runningBackend, { backendSwitch: false });
+		return this.#host.refreshBaseSystemPrompt({ settingsChange });
+	}
+
 	/** Rekeys every active memory backend to the current provider session. */
 	rekeyForCurrentSessionId(): void {
 		this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -226,8 +315,31 @@ export class SessionMemory {
 		return true;
 	}
 
+	/** What a new transcript resets ({@link resetContextForNewTranscript}), for a failed session switch to put back. */
+	conversationTracking(): ConversationTracking {
+		const hindsight = this.#host.getHindsightSessionState();
+		const mnemopi = this.#host.getMnemopiSessionState();
+		return {
+			promotionSnapshot: this.#baseSystemPromptBeforeMemoryPromotion,
+			hiddenRecall: this.#hiddenRecall,
+			recallChanges: this.#recallChanges,
+			hindsight: hindsight && !hindsight.aliasOf ? hindsight.conversationTracking() : undefined,
+			mnemopi: mnemopi && !mnemopi.aliasOf ? mnemopi.conversationTracking() : undefined,
+		};
+	}
+
+	/** Puts back the state {@link conversationTracking} took, while rolling back a failed session switch. */
+	restoreConversationTracking(tracking: ConversationTracking): void {
+		this.#baseSystemPromptBeforeMemoryPromotion = tracking.promotionSnapshot;
+		this.adoptRecall(tracking.hiddenRecall, tracking.recallChanges);
+		if (tracking.hindsight) this.#host.getHindsightSessionState()?.restoreConversationTracking(tracking.hindsight);
+		if (tracking.mnemopi) this.#host.getMnemopiSessionState()?.restoreConversationTracking(tracking.mnemopi);
+	}
+
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */
 	async resetContextForNewTranscript(): Promise<void> {
+		// The new transcript does not carry the old one's recall, and the backend recalls afresh for it.
+		this.adoptRecall(undefined, []);
 		const hadPromotedMemoryPrompt = this.#baseSystemPromptBeforeMemoryPromotion !== undefined;
 		const resetHindsight = this.#resetHindsightConversationTrackingIfHindsight();
 		const resetMnemopi = this.#resetMnemopiConversationTrackingIfMnemopi();
@@ -321,17 +433,28 @@ export class SessionMemory {
 		return transition;
 	}
 
+	/**
+	 * Starts the selected backend and swaps its tools and prompt in. The memory settings it takes in that moved since
+	 * the last apply ({@link #takeSettingsChange}) go with the swap and the rebuild, so a bound prompt holds both as it
+	 * holds any settings change: its tools and bytes stay as sent until the hold is due, and the settings notice tells
+	 * the model. An apply that takes in no change (a cwd move, an explicit re-apply) swaps them in at once.
+	 */
 	async #applyMemoryBackend(retainMnemopi: boolean): Promise<void> {
 		if (this.#host.isDisposed()) return;
 		const cwd = this.#host.cwd();
 		// A cwd move (or its rollback) may reach here before the rebind does:
 		// drain the outgoing state without capturing the transcript under a stale scope.
 		const retain = retainMnemopi && (this.#runtimeCwd ?? cwd) === cwd;
+		let settingsChange: SettingChange[] | undefined;
 		try {
 			await this.#disposeMemoryBackendState(true, retain);
+			// The backend starts again without a recall and recalls afresh at the next turn.
+			this.adoptRecall(undefined, []);
 			this.#runtimeCwd = cwd;
 			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#host.isDisposed()) {
 				const backend = await resolveMemoryBackend(this.#host.settings);
+				this.#runningBackend = backend.id;
+				settingsChange = this.#takeSettingsChange(backend.id, { backendSwitch: true });
 				await backend.start({
 					session: this.#host.memoryBackendSession(),
 					settings: this.#host.settings,
@@ -341,13 +464,13 @@ export class SessionMemory {
 				});
 			}
 			if (this.#host.isDisposed()) return;
-			await this.#refreshMemoryTools();
+			await this.#refreshMemoryTools(settingsChange);
 			if (this.#host.isDisposed()) return;
-			await this.#host.refreshBaseSystemPrompt();
+			await this.#host.refreshBaseSystemPrompt({ settingsChange });
 		} catch (error) {
 			await this.#disposeMemoryBackendState(false);
 			if (!this.#host.isDisposed()) {
-				await this.#replaceMemoryTools([]).catch(refreshError => {
+				await this.#replaceMemoryTools([], settingsChange).catch(refreshError => {
 					logger.warn("Failed to remove memory tools after backend apply error", {
 						error: String(refreshError),
 					});
@@ -357,12 +480,38 @@ export class SessionMemory {
 		}
 	}
 
-	async #refreshMemoryTools(): Promise<void> {
-		const tools = (await this.#createMemoryTools?.()) ?? [];
-		await this.#replaceMemoryTools(tools);
+	/**
+	 * The settings of the backend `id` whose value moved since they were last taken in, each with the value taken in
+	 * then; records the values now as taken in. Those are its own `<id>.*` settings, and `memory.backend` too with
+	 * `backendSwitch`: only a backend apply ({@link #applyMemoryBackend}) takes a switch in, so a settings hook or a
+	 * recall withdrawal that ends while a switch waits for its apply leaves the switch for that apply to name and hold.
+	 * Undefined when none moved or live changes are disabled. Another backend's settings keep the value last taken in,
+	 * so a switch to it later names an edit made while it was inactive.
+	 */
+	#takeSettingsChange(
+		id: MemoryBackendId,
+		{ backendSwitch }: { backendSwitch: boolean },
+	): SettingChange[] | undefined {
+		const applied = this.#appliedSettings;
+		if (!applied) return undefined;
+		const own = `${id}.`;
+		const changes: SettingChange[] = [];
+		for (const [setting, previous] of applied) {
+			if (setting === cfgMemoryBackend ? !backendSwitch : !setting.id.startsWith(own)) continue;
+			const value = setting.get(this.#host.settings);
+			if (settingValuesEqual(value, previous)) continue;
+			changes.push({ setting, previous });
+			applied.set(setting, value);
+		}
+		return changes.length > 0 ? changes : undefined;
 	}
 
-	#replaceMemoryTools(tools: AgentTool[]): Promise<void> {
-		return this.#host.replaceMemoryTools(tools);
+	async #refreshMemoryTools(settingsChange: readonly SettingChange[] | undefined): Promise<void> {
+		const tools = (await this.#createMemoryTools?.()) ?? [];
+		await this.#replaceMemoryTools(tools, settingsChange);
+	}
+
+	#replaceMemoryTools(tools: AgentTool[], settingsChange: readonly SettingChange[] | undefined): Promise<void> {
+		return this.#host.replaceMemoryTools(tools, { settingsChange });
 	}
 }

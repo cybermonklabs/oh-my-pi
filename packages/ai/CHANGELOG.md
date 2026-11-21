@@ -10,6 +10,8 @@
 - Added `errorDisplayText`, `editErrorText`, `clearErrorText` and `errorRetryHeaders` for the split error fields, an optional header retry delay on `extractProviderRetryHint`, `parseRateLimitReason`, `matchesUsageLimitText`, `isUsageLimitOutcome`, `is402BillingCapBody` and `isConcurrencyCapExclusion`, and `retryAfterMs` on `RotateCredentialOptions` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - `AIError.Flag.Connection` marks a failure that died on the wire with no HTTP status and no capacity signal — a cut stream, a closed socket, a truncated chunked transfer — so callers can tell it apart from a 429, a 529 or an overload
 - Added `CredentialUnavailableError`, a transient error for a configured credential source that produced no key; unlike `MissingApiKeyError`, a retry may succeed ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
+- Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation (never while Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to its provider), and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
+- Added `@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch` with `experimentalBetasDisabled()`, whether `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to a model's provider, and `withoutDisabledExperimentalBetas()`, the model with the compat an `anthropic` request then goes out with (no strict tools, no mid-conversation tool changes, …)
 
 ### Fixed
 

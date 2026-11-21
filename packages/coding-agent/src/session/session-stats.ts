@@ -108,12 +108,11 @@ export class SessionStatsTracker {
 		return this.#host.agent.tokenizer;
 	}
 
-	/** Tool-schema tokens the active model carries in its prompt. */
+	/** Tool-schema tokens the active model carries in its prompt: the definitions the next request declares. */
 	#currentToolSchemaTokens(): number {
 		const session = this.#host.session;
-		return estimateContextToolSchemaTokens(session.agent?.state?.tools ?? [], this.#tokenizer, session.model, {
+		return estimateContextToolSchemaTokens(session.agent, this.#tokenizer, session.model, {
 			sourceRevision: session.settings?.revision,
-			pruneDescriptions: session.agent?.prunesToolDescriptions?.(session.model),
 		});
 	}
 

@@ -9,6 +9,7 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	filterProviderReplayMessages,
+	type ProviderContextRequest,
 	resolveTelemetry,
 	type StreamFn,
 	type ThinkingLevel,
@@ -87,7 +88,7 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine } from "./config/registry";
+import { bindEffects, combine, everySetting, type SettingChange, trackSettingsReads } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -168,6 +169,7 @@ import { mapPromptArguments } from "./mcp/prompt-args";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { resolveMCPToolAlias } from "./mcp/tool-bridge";
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+import { findDeliveredRecall, withoutDeliveredRecall } from "./memory-backend/recall-entry";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionStateApi } from "./mnemopi/state";
 import autolearnCaptureRefused from "./prompts/system/autolearn-capture-refused.md" with { type: "text" };
@@ -204,6 +206,7 @@ import {
 	loadEffectiveAuthAccountPolicyConfig,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import { providerContextCut } from "./session/context-cut";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
 import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
@@ -226,9 +229,9 @@ import {
 } from "./session/messages";
 import {
 	capArchiveFrameBytes,
-	clampProviderContextImageBytes,
-	clampProviderContextImages,
 	dropUnreadableContextImages,
+	ProviderImageClamp,
+	sessionImageDropRecord,
 } from "./session/provider-image-budget";
 import {
 	expandDefaultRetryFallbackChains,
@@ -446,12 +449,6 @@ import {
 	cfgTaskMaxConcurrency,
 	ovnfsCommand,
 } from "./task/settings";
-
-/** Agent-level tool-call switches, snapshotted by the agent loop per prompt run. */
-const cfgToolCallSwitches = combine({
-	intentTracing: cfgToolsIntentTracing,
-	abortOnFabricatedResult: cfgToolsAbortOnFabricatedResult,
-});
 
 /** Settings skill and file slash-command discovery reads (foreign sources gated by the provider lists). */
 const cfgSkillsAndCommandsDiscovery = combine({
@@ -1535,7 +1532,7 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 }
 
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
-/** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
+/** Matches the truncation applied to per-server instructions inside `renderSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 /** Built-ins `createTools` force-includes into explicit tool lists; the active set mirrors them. */
 const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context"];
@@ -2108,7 +2105,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		return scan;
 	};
 	// Undefined until needed: enabling `includeWorkspaceTree` mid-session scans
-	// on the next prompt rebuild (see rebuildSystemPrompt).
+	// on the next prompt rebuild (see renderSystemPrompt).
 	let workspaceTreePromise: Promise<WorkspaceTree> | undefined = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
 		: cfgIncludeWorkspaceTree.get(settings)
@@ -2736,6 +2733,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
+			heldToolRefusal: name => session?.heldToolRefusal(name),
 			getAdvertisedEvalToolNames: () => session?.getAdvertisedEvalToolNames() ?? [],
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it
@@ -2746,6 +2744,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getSessionSpawns: () => options.spawns ?? "*",
 			getSessionAgents: () => session?.getSessionAgents() ?? [],
 			advertisedSessionAgents: () => session?.getAdvertisedSessionAgents() ?? [],
+			advertisedDiscoveredAgents: () => session?.getAdvertisedDiscoveredAgents(),
+			advertisedPerCallModels: () => session?.getAdvertisedPerCallModels(),
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
@@ -2820,7 +2820,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
-			settings,
+			/**
+			 * The session's settings, except inside a call to a tool a held settings change keeps declared as
+			 * sent: there the ones it was declared under, so the call runs as declared (`SessionTools`).
+			 */
+			get settings() {
+				return session?.toolCallSettings ?? settings;
+			},
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
@@ -4435,12 +4441,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					toolSession.deviceOnlyWrite !== true),
 		});
 
-		// Resolve the live inline-descriptors setting against the active model.
+		// Resolve the inline-descriptors setting of `source` against the active model.
 		// `auto` enforces the per-model policy (inline for Gemini, off otherwise), so
 		// a mid-session model switch re-decides it. Prompt and agent (description
 		// pruning) must agree: every prompt rebuild re-syncs the agent's pruning.
-		const resolveInlineToolDescriptors = (): boolean =>
-			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(settings), (agent?.state.model ?? model)?.id);
+		const resolveInlineToolDescriptors = (source: Settings): boolean =>
+			shouldInlineToolDescriptors(cfgInlineToolDescriptors.get(source), (agent?.state.model ?? model)?.id);
+		// The settings the requests read: the live ones, or while a held settings change keeps the bound prompt, the
+		// ones it was sent with.
+		const requestSettings = (): Settings => (hasSession ? session.requestSettings : settings);
 		// Latest memory backend instructions rendered for advisor system prompts.
 		// Populated by the initial rebuildSystemPrompt below (before the session is
 		// constructed) and refreshed on every later rebuild via
@@ -4477,7 +4486,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (!own || own.size === 0) return hosted;
 			return new Map([...own, ...hosted].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)));
 		};
-		const rebuildSystemPrompt: SystemPromptRebuilder = async (
+		const renderSystemPrompt: SystemPromptRebuilder = async (
 			toolNames,
 			tools,
 			xdev,
@@ -4538,17 +4547,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 			}
 			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
-			const memoryInstructions = memoryBackend
+			const backendInstructions = memoryBackend
 				? await memoryBackend.buildDeveloperInstructions(agentDir, sessionManager.getCwd(), settings, session)
 				: undefined;
-			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
+			// Advisors get the backend's memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
 			// tool-availability caveat lives in the wrapper template.
-			advisorMemoryPrompt = formatAdvisorMemoryPrompt(memoryInstructions);
+			advisorMemoryPrompt = formatAdvisorMemoryPrompt(backendInstructions);
 			if (hasSession) session.setAdvisorMemoryPrompt(advisorMemoryPrompt);
-			const inlineToolDescriptors = resolveInlineToolDescriptors();
-			// Unset only during the initial build; the agent is constructed with it.
-			if (agent) agent.pruneToolDescriptions = inlineToolDescriptors;
+			const inlineToolDescriptors = resolveInlineToolDescriptors(settings);
+			// Unset only during the initial build; the agent is constructed with them. The request switches follow
+			// the settings the requests read, so a switch changes with the prompt that describes it.
+			if (agent) {
+				const source = requestSettings();
+				agent.pruneToolDescriptions = resolveInlineToolDescriptors(source);
+				agent.intentTracing = cfgToolsIntentTracing.get(source);
+			}
 			// A fixed string or array in systemPrompt replaces all generated blocks.
 			// Preserve the bookkeeping above, but skip discovering or rendering a
 			// template whose output would be discarded.
@@ -4556,6 +4570,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return {
 					systemPrompt: typeof options.systemPrompt === "string" ? [options.systemPrompt] : options.systemPrompt,
 				};
+			}
+			// Advisors keep the recall; the prompt leaves out one the conversation carries as a hidden message, on every
+			// branch: a request whose context lacks that message sends it again (`AgentSession.hiddenMemoryRecall`).
+			let memoryInstructions = backendInstructions;
+			const hiddenRecall = hasSession
+				? session.hiddenMemoryRecall
+				: findDeliveredRecall(sessionManager.getBranchView());
+			if (memoryBackend && hiddenRecall !== undefined) {
+				const instructions = await memoryBackend.buildDeveloperInstructions(
+					agentDir,
+					sessionManager.getCwd(),
+					settings,
+					session,
+					{ recallDelivered: true },
+				);
+				memoryInstructions = withoutDeliveredRecall(instructions, hiddenRecall);
 			}
 
 			// Build combined append prompt: memory instructions + auto-learn guidance
@@ -4708,6 +4738,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
 		};
+		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
+		// them, whether or not a listener rebuilds the prompt for it (`SessionTools.holdToolDeclarationChange`).
+		const rebuildSystemPrompt: SystemPromptRebuilder = async (toolNames, tools, xdev) => {
+			const { value, read } = await trackSettingsReads(settings, () => renderSystemPrompt(toolNames, tools, xdev));
+			return { ...value, settingsRead: read };
+		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
@@ -4808,7 +4844,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
 		// so that subagents launched in the same parallel batch can see each other in
-		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
+		// their initial `# IRC Peers` block (rendered inside `renderSystemPrompt`).
 		// The session reference is attached after construction below.
 		const registrationInput = {
 			id: resolvedAgentId,
@@ -4873,7 +4909,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 
 		setSessionActiveToolNames(initialToolNames);
-		const { systemPrompt } = await logger.time(
+		const { systemPrompt, settingsRead: baseSettingsRead } = await logger.time(
 			"buildSystemPrompt",
 			rebuildSystemPrompt,
 			initialToolNames,
@@ -4957,16 +4993,25 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			blobBroker,
 		);
 		// One transform per conversation: the date/cwd reminder remembers what each
-		// conversation was sent, so the main loop and every advisor get their own.
-		// Only the main loop journals its reminders in the session.
-		const createTransformProviderContext = (journal?: DateCwdReminderJournal) => {
+		// conversation was sent, and the image clamp what each request dropped, so
+		// the main loop and every advisor get their own. Only the main loop
+		// journals its reminders in the session and asks the session's cut rule
+		// about its forced image drops: an advisor's history is not the session's.
+		// A side request (`buildSideRequestContext`) is no part of the history
+		// either: it reads the conversation's image drops and changes none.
+		const createTransformProviderContext = (
+			journal?: DateCwdReminderJournal,
+			imageClamp = new ProviderImageClamp(),
+		) => {
 			const dateCwdReminder = new DateCwdReminderInjector(journal);
-			return async (context: Context, transformModel: Model): Promise<Context> => {
+			const sideImageClamp = imageClamp.sideRequestClamp();
+			return async (context: Context, transformModel: Model, request?: ProviderContextRequest): Promise<Context> => {
+				const clamp = request?.sideRequest ? sideImageClamp : imageClamp;
 				let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 				// The archive was sized for the model active at the last context build; a model switch may have lowered the budget.
 				transformed = capArchiveFrameBytes(transformed, transformModel);
 				transformed = await snapcompactInline.transform(transformed, transformModel);
-				transformed = clampProviderContextImages(transformed, transformModel);
+				transformed = clamp.clampImageCount(transformed, transformModel);
 				transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 				// After the model-specific normalizers: they carry better wording for the
 				// cases they own (STB WebP), so this stays the backstop for everything
@@ -4974,7 +5019,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				transformed = await dropUnreadableContextImages(transformed, transformModel);
 				transformed = await blobBroker.decorateContext(transformed, transformModel);
 				// Byte budget after decoration: URL/file-referenced images carry no inline bytes.
-				transformed = clampProviderContextImageBytes(transformed, transformModel);
+				transformed = clamp.clampImageBytes(transformed, transformModel);
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
@@ -4985,8 +5030,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 			};
 		};
+		// A request past the image budget cannot be served without the drop, so the rule admits it
+		// as forced; asking it logs the decision. Each forced drop is kept in the session, so a resumed
+		// process drops the same images.
+		const mainImageClamp = new ProviderImageClamp(site => {
+			if (session) session.admitsProviderContextCut(providerContextCut(site));
+		}, sessionImageDropRecord(sessionManager));
 		const transformProviderContext = createTransformProviderContext(
 			createSessionDateCwdReminderJournal(sessionManager),
+			mainImageClamp,
 		);
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
@@ -5084,11 +5136,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
-		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
+		const transformToolCallArguments = (args: Record<string, unknown>, toolName: string): Record<string, unknown> => {
 			let result = args;
-			const maxTimeout = cfgToolsMaxTimeout.get(settings);
-			if (maxTimeout > 0 && typeof result.timeout === "number") {
-				result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
+			if (typeof result.timeout === "number") {
+				// A call to a tool a held settings change keeps declared as sent runs under the settings it was
+				// declared under.
+				const maxTimeout = cfgToolsMaxTimeout.get(
+					(hasSession && session.toolCallSettingsFor(toolName)) || settings,
+				);
+				if (maxTimeout > 0) result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
 			}
 			if (obfuscator?.hasSecrets()) {
 				result = deobfuscateToolArguments(obfuscator, result);
@@ -5216,10 +5272,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			suggestFallbackToolNames: suggestDeviceToolNames,
 			intentTracing: cfgToolsIntentTracing.get(settings),
 			intentDescription: spotlightExperiment ? SPOTLIGHT_INTENT_DESCRIPTION : undefined,
-			pruneToolDescriptions: resolveInlineToolDescriptors(),
+			pruneToolDescriptions: resolveInlineToolDescriptors(settings),
 			// Per request against the model actually requested, so `tools.format`
-			// changes and model switches reach the next provider call.
-			dialectResolver: dialectModel => resolveDialect(cfgToolsFormat.get(settings), dialectModel),
+			// changes and model switches reach the next provider call; a change a
+			// held settings rebuild keeps from the bound prompt waits for the rebuild.
+			dialectResolver: dialectModel => resolveDialect(cfgToolsFormat.get(requestSettings()), dialectModel),
 			abortOnFabricatedToolResult: cfgToolsAbortOnFabricatedResult.get(settings),
 			speculativeToolExecution,
 			getToolChoice: () => session?.nextToolChoiceDirective(),
@@ -5379,6 +5436,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// primary agent gets in its system prompt, so the read-only reviewer judges
 		// against the user's standing project rules instead of advising blind.
 		const advisorContextPrompt = formatAdvisorContextPrompt(contextFiles);
+		// The prompt inputs the operator gives explicitly: a resumed transcript's stored prompt is sent again only
+		// while they are unchanged (`SessionTools`). A prompt function cannot be compared, so it never is.
+		const operatorPromptDigest =
+			typeof options.systemPrompt === "function"
+				? undefined
+				: Bun.hash
+						.wyhash(
+							JSON.stringify([
+								options.systemPrompt,
+								options.customSystemPrompt,
+								options.systemPromptTemplate,
+								options.appendSystemPrompt,
+							]),
+						)
+						.toString(16);
 		// Owned only when this session created the manager; subagents receive a
 		// parent's manager via `options.mcpManager` and MUST NOT disconnect it.
 		// Advisor spend recorded before this resume is restored off the critical
@@ -5414,7 +5486,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionPaths,
 			disableExtensionDiscovery: options.disableExtensionDiscovery,
 			autoApprove: options.autoApprove,
-			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
+			spawns: options.spawns,
 			evalKernelOwnerId,
 			// Children borrow their parent's manager but never dispose it.
 			ownedAsyncJobManager: asyncJobManager,
@@ -5471,6 +5543,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			baseSettingsRead,
+			operatorPromptDigest,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
 			presentationPinnedToolNames,
@@ -5549,9 +5623,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// `tools.format` catalog dialect, personality, …), so a bulk change rebuilds once.
 		// Hide Secrets first switches outbound obfuscation on the live obfuscator (earlier
 		// placeholders keep deobfuscating, the first switch-on builds it): the prompt
-		// reports its state.
-		cfgSystemPromptInputs.listen(session, async (next, previous) => {
-			if (next.secretsEnabled !== previous.secretsEnabled) {
+		// reports its state. Each settings-started rebuild below passes the change, so a
+		// bound prompt holds it until a cut, a lapsed cache entry or five minutes on (`SessionTools`).
+		cfgSystemPromptInputs.listenChanges(session, async settingsChange => {
+			if (settingsChange.some(change => change.setting === cfgSecretsEnabled)) {
 				try {
 					if (cfgSecretsEnabled.get(settings) && !obfuscator) {
 						const built = await buildSecretObfuscator(cwd, agentDir, options.agentDir);
@@ -5567,34 +5642,48 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 			if (session.isDisposed) return;
 			try {
-				await session.refreshBaseSystemPrompt();
+				await session.refreshBaseSystemPrompt(undefined, { settingsChange });
 			} catch (error) {
 				session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
 			}
 		});
-		// Agent-level tool-call switches: the loop snapshots them per prompt run, so a
-		// change applies from the next run without splitting one response's schema/strip.
-		// The prompt listener above republishes the intent-field guidance.
-		cfgToolCallSwitches.listen(session, ({ intentTracing, abortOnFabricatedResult }) => {
-			agent.intentTracing = intentTracing;
+		// The loop snapshots this switch per prompt run. `tools.intentTracing` is synced by each
+		// prompt build instead (`renderSystemPrompt`), with the intent-field guidance it renders.
+		cfgToolsAbortOnFabricatedResult.listen(session, abortOnFabricatedResult => {
 			agent.abortOnFabricatedToolResult = abortOnFabricatedResult;
 		});
 		// Tool-gating settings add or remove the tools they gate and refresh the
 		// prompt once per coalesced change. Restricted (structured) sessions keep the
 		// exact host-provided tool list they were built with.
 		if (!restrictToolNames) {
-			const reconcileGatedTools = async (options?: { refreshPrompt?: boolean }): Promise<void> => {
+			const reconcileGatedTools = async (options: {
+				refreshPrompt?: boolean;
+				settingsChange: readonly SettingChange[];
+			}): Promise<void> => {
 				try {
 					await session.reconcileBuiltinTools(options);
 				} catch (error) {
 					session.emitNotice("error", `Failed to apply tool settings: ${error}`);
 				}
 			};
-			cfgSessionToolGates.listen(session, () => reconcileGatedTools());
+			cfgSessionToolGates.listenChanges(session, settingsChange => reconcileGatedTools({ settingsChange }));
 			// `find.enabled: auto` follows the judge role; a role change only touches
 			// the prompt when it actually adds or removes `find`.
-			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
+			cfgModelRoles.listenChanges(session, settingsChange =>
+				reconcileGatedTools({ refreshPrompt: false, settingsChange }),
+			);
 		}
+		// Any other setting a tool definition renders (`tools.maxTimeout` in the `bash` and
+		// `eval` descriptions, `task.enableEffort` in the `task` schema) starts no rebuild of
+		// its own; on a bound prompt its change is held as the ones above are when it alters
+		// what an active tool declares.
+		everySetting().listenChanges(session, async settingsChange => {
+			try {
+				await session.holdToolDeclarationChange(settingsChange);
+			} catch (error) {
+				session.emitNotice("error", `Failed to hold a tool definition change: ${error}`);
+			}
+		});
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the
 		// advisor transcript size (issue #9553).
@@ -5711,9 +5800,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 		if (agentKind === "main") {
 			// Live skills/commands discovery settings: rediscover skills and file slash
-			// commands, rebuild the prompt, and notify command pickers (TUI/RPC/ACP).
-			// `enabledProviders`/`disabledProviders` gate foreign provider sources.
-			cfgSkillsAndCommandsDiscovery.listen(session, () => session.refreshSkillsAndCommands());
+			// commands, rebuild the prompt (held on a bound prompt), and notify command
+			// pickers (TUI/RPC/ACP). `enabledProviders`/`disabledProviders` gate foreign
+			// provider sources.
+			cfgSkillsAndCommandsDiscovery.listenChanges(session, settingsChange =>
+				session.refreshSkillsAndCommands({ settingsChange }),
+			);
 			// Live `extensions` / `disabledExtensions`: a settings-governed extension whose
 			// source leaves the rediscovered set is suspended (handlers, commands, tools,
 			// renderers, shortcuts, file fallbacks) and a returning source resumes. Modules
@@ -6049,11 +6141,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					cwdResolver: () => sessionManager.getCwd(),
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
-					// The primary's chain and reminder placements, so the capture matches its cached prompt.
-					transformProviderContext: createTransformProviderContext({
-						...createSessionDateCwdReminderJournal(sessionManager),
-						record: () => {},
-					}),
+					// The primary's chain, reminder placements and count-clamp image drops, so the capture matches its
+					// cached prompt; a drop of its own (a forced count drop, its byte-clamp drops) stays its own, out of
+					// the session's record, and never asks the session's cut rule.
+					transformProviderContext: createTransformProviderContext(
+						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
+						mainImageClamp.sideRequestClamp(),
+					),
 					temperature: agent.temperature,
 					topP: agent.topP,
 					topK: agent.topK,
@@ -6071,7 +6165,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					intentTracing: agent.intentTracing,
 					intentDescription: agent.intentDescription,
 					pruneToolDescriptions: agent.pruneToolDescriptions,
-					dialect: resolveDialect(cfgToolsFormat.get(settings), captureModel),
+					dialect: resolveDialect(cfgToolsFormat.get(session.requestSettings), captureModel),
 					abortOnFabricatedToolResult: cfgToolsAbortOnFabricatedResult.get(settings),
 					appendOnlyContext: shouldEnableAppendOnlyContext(
 						cfgProviderAppendOnlyContext.get(settings),

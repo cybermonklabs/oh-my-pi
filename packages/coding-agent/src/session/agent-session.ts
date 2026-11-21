@@ -25,6 +25,7 @@ import {
 	type AfterToolCallResult,
 	type Agent,
 	AgentBusyError,
+	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentPreModelCallStop,
@@ -49,7 +50,6 @@ import {
 	type ThinkingLevel,
 	type ToolChoiceDirective,
 	type ToolExecution,
-	wireToolsFingerprint,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
@@ -138,7 +138,7 @@ import {
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
-import { combine, type SettingsScope } from "../config/registry";
+import { combine, type SettingChange, type SettingsScope } from "../config/registry";
 import { type Settings, withActiveSettings } from "../config/settings";
 import { RawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
 import { getEditStore } from "../edit/store";
@@ -190,7 +190,12 @@ import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sh
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { JobWidgetEntry } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { DaemonCompletionNotification } from "../launch/protocol";
-import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
+import {
+	findDeliveredRecall,
+	findDeliveredRecallChanges,
+	MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+	MEMORY_RECALL_MESSAGE_TYPE,
+} from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -281,6 +286,7 @@ import { prewarmSubagentWorker } from "../thread/subagent-worker";
 import { SubagentSpawnSignal } from "../thread/subagent-spawn-signal";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { AgentDefinition } from "../task/types";
+import type { PerCallModelAdvertisement } from "../task/model-approval";
 import type { ModelMention } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { ModelMentionRegistry, type ResolvedModelMention } from "./model-mentions";
 import { parseCommandArgs } from "../utils/command-args";
@@ -391,6 +397,7 @@ import {
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
+import { type ContextCut, promptCacheEntryLapsed } from "./context-cut";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
@@ -525,7 +532,17 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { promptDigestOfEntry, type RefreshSkillsOptions, SessionTools, type SessionToolsHost } from "./session-tools";
+import {
+	type BasePromptRebuildOptions,
+	customMessagesByType,
+	customMessagesOf,
+	promptDigestOfEntry,
+	type RefreshSkillsOptions,
+	SessionTools,
+	type SessionToolsHost,
+	type SettingsChangeOptions,
+	toolsDigestOfEntry,
+} from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -593,6 +610,7 @@ import {
 	cfgThemeLight,
 } from "../modes/settings";
 import { cfgTaskBatch, cfgTaskDisabledAgents, perCallModelEnabled } from "../task/settings";
+import { isScoutSpawnable } from "../task/spawn-policy";
 import {
 	cfgBranchSummaryReserveTokens,
 	cfgCompactionModelThresholds,
@@ -632,6 +650,18 @@ const cfgWorkspacePromptInputs = combine({
 });
 
 const PLAN_MODE_REMINDER_MAX = 3;
+/** Custom message type of the plan mode instructions. */
+const PLAN_MODE_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
+/** Custom message type of the approved-plan reference. */
+const PLAN_MODE_REFERENCE_MESSAGE_TYPE = "plan-mode-reference";
+/**
+ * Custom session entry written when the prompt sent next carries the approved plan in its own text (the
+ * plan-approved prompt, {@link AgentSession.markPlanReferenceSent}): a branch that holds it and grows past it carries
+ * the plan as a reference message would.
+ */
+const PLAN_REFERENCE_PROMPT_ENTRY_TYPE = "plan-reference-prompt";
+/** Custom message type of the goal mode instructions. */
+const GOAL_MODE_CONTEXT_MESSAGE_TYPE = "goal-mode-context";
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 /**
@@ -808,6 +838,8 @@ interface BranchPromptCacheObservation {
 	compacted: boolean;
 	/** Digest of the base prompt the reply was produced under; undefined when none is recorded. */
 	promptDigest: string | undefined;
+	/** Digest of the tool definitions the reply's request declared; undefined when none is recorded. */
+	toolsDigest: string | undefined;
 	/**
 	 * Lifetime the provider named for the entry, from the newest reply of the same model that reported its
 	 * cache-write split (a reply that only read the entry reports none); undefined when no reply named one.
@@ -825,6 +857,8 @@ interface BranchPromptCacheScan {
 	scanned: number;
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
+	/** Newest tool definitions digest recorded in the scanned entries. */
+	toolsDigest: string | undefined;
 	observation: BranchPromptCacheObservation | undefined;
 	/** The newest reply's model and the lifetime it named for the entry it wrote; see `reportedTtlMs`. */
 	reported: { provider: string; model: string; ttlMs: number } | undefined;
@@ -838,6 +872,11 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		const digest = promptDigestOfEntry(entry);
 		if (digest !== null) {
 			scan.digest = digest;
+			continue;
+		}
+		const toolsDigest = toolsDigestOfEntry(entry);
+		if (toolsDigest !== null) {
+			scan.toolsDigest = toolsDigest;
 			continue;
 		}
 		const observation = scan.observation;
@@ -873,6 +912,7 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 			refreshMissed: false,
 			compacted: false,
 			promptDigest: scan.digest,
+			toolsDigest: scan.toolsDigest,
 			reportedTtlMs:
 				reported?.provider === reply.provider && reported.model === reply.model ? reported.ttlMs : undefined,
 		};
@@ -1220,12 +1260,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#experimentalContextNotesReminder: { prompt: string; generation: number } | undefined;
 	#planModeState: PlanModeState | undefined;
 	#vibeModeState: VibeModeState | undefined;
+	/**
+	 * The branch entry the newest vibe mode note went out after (null: before the first entry), unset until one goes
+	 * out while vibe mode is on. The note is never persisted, so this is the branch's record that it carried one
+	 * ({@link #branchCarriesVibeModeNote}).
+	 */
+	#vibeModeNoteSentAfter: string | null | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	readonly #advisors: SessionAdvisors;
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
+	/**
+	 * Whether the current branch carries the approved-plan reference, so no request sends it again: read from the
+	 * branch whenever the session loads one ({@link #syncPlanReferenceToBranch}: at startup, on a switch, a `/tree` move
+	 * or a rewind), and set when this process sends it.
+	 */
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
 	#planReferenceApproved = false;
@@ -1324,7 +1375,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Registry recording this agent blocked on the user while a {@link waitForUser} dialog is open. */
 	readonly #agentRegistry: AgentRegistryApi | undefined;
 	#agentKind: "main" | "sub" = "main";
-	#scoutAllowedBySpawnPolicy = true;
+	/** The session's spawn policy ({@link AgentSessionConfig.spawns}). */
+	readonly #spawns: string;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	/** OAuth account pools enforced on this session's key lookups; lifted on dispose. */
@@ -1601,17 +1653,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#lastRequestArm: { sessionId: string; shape: PromptCacheShape; messages: readonly AgentMessage[] } | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
-	#promptCacheShapeMemo:
-		| {
-				model: Model | undefined;
-				tools: unknown;
-				systemPrompt: unknown;
-				intentTracing: boolean;
-				intentDescription: string | undefined;
-				pruneToolDescriptions: boolean;
-				shape: PromptCacheShape;
-		  }
-		| undefined;
+	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -2712,16 +2754,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
-		// Only a recorded approval may turn a draft file into an execution reference.
-		for (const entry of this.sessionManager.getBranch().reverse()) {
-			if (entry.type !== "mode_change") continue;
-			if (entry.mode === "plan" || entry.mode === "plan_paused") break;
-			if (typeof entry.data?.approvedPlanFilePath === "string") {
-				this.#planReferencePath = entry.data.approvedPlanFilePath;
-				this.#planReferenceApproved = true;
-				break;
-			}
-		}
+		// Only a recorded approval may turn a draft file into an execution reference, and a reference the loaded branch
+		// carries goes out no second time.
+		this.#syncPlanReferenceToBranch();
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
@@ -2832,6 +2867,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			settings: this.settings,
+			requestSettings: () => this.#tools.requestSettings,
 			model: () => this.model,
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -2865,6 +2901,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			promptGeneration: () => this.#promptGeneration,
 			resolveActiveEditMode: () => this.#tools.resolveActiveEditMode(),
 			syncAfterModelChange: previousEditMode => this.#tools.syncAfterModelChange(previousEditMode),
+			trackModelSwitch: modelSwitch => this.#tools.trackModelSwitch(modelSwitch),
 			setModelWithProviderSessionReset: async (model, selection = "explicit") => {
 				await this.#setModelWithProviderSessionReset(model);
 				// Only a completed explicit selection, including same-model reselection, takes ownership.
@@ -3001,14 +3038,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#tools.setBaseSystemPrompt(prompt);
 				this.agent.setSystemPrompt(prompt);
 			},
-			refreshBaseSystemPrompt: () => this.#tools.refreshBaseSystemPrompt(),
-			replaceMemoryTools: tools => this.#tools.replaceMemoryTools(tools),
+			refreshBaseSystemPrompt: options => this.#tools.refreshBaseSystemPrompt(undefined, options),
+			replaceMemoryTools: (tools, options) => this.#tools.replaceMemoryTools(tools, options),
 		};
 		this.#memory = new SessionMemory(memoryHost, {
 			memoryEnabled: this.memoryEnabled,
 			memoryAgentDir: config.memoryAgentDir,
 			memoryTaskDepth: config.memoryTaskDepth,
 			createMemoryTools: config.createMemoryTools,
+			hiddenRecall: () => findDeliveredRecall(this.sessionManager.getBranchView()),
+			recallChanges: () => findDeliveredRecallChanges(this.sessionManager.getBranchView()),
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
@@ -3193,6 +3232,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			return thunks;
 		});
+		this.agent.setMissingContextMessageProvider(context => this.#missingContextMessages(context));
 		this.#convertToLlm = config.convertToLlm ?? convertToLlm;
 		this.getXdevToolEntries = config.getXdevToolEntries ?? (() => []);
 		const sessionToolsHost: SessionToolsHost = {
@@ -3212,11 +3252,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			steeringArrivalRelease: seq => this.#steeringArrivalRelease(seq),
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
+			sessionSpawns: () => this.#spawns,
 			model: () => this.model,
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
+			transcriptPromptCacheLive: promptDigest => {
+				const entry = this.#inferredPromptCacheEntry(promptDigest);
+				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
+			},
+			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
+			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			notifyCommandMetadataChanged: () => this.#notifyCommandMetadataChanged(),
 			localProtocolOptions: () => this.#localProtocolOptions(),
@@ -3243,6 +3290,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
+			baseSettingsRead: config.baseSettingsRead,
+			operatorPromptDigest: config.operatorPromptDigest,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
 			skillsSettings: config.skillsSettings,
@@ -3314,7 +3363,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// replay-safe and transient provider errors after it stay retryable —
 		// same buffering contract print mode declares via setTextOutputCommitted.
 		this.#textOutputCommitted = this.#agentKind === "main";
-		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
+		this.#spawns = config.spawns ?? "*";
 		this.#ircAwaitingAssignment = config.awaitingAssignment === true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#accountPoolScope = config.accountPoolScope;
@@ -3578,6 +3627,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
+			observedPromptCacheEntry: () => this.observedPromptCacheEntry(),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
 			generateHandoffDocument: (customInstructions, options) =>
@@ -3603,6 +3653,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#maintenance.renderArchiveForModel(context.messages),
 			),
 		);
+		// A request waits for a model switch in progress, so the first request on the new model carries its prompt.
+		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
+		// A held settings rebuild, and a kept restored transcript prompt, give way to this process's live build at the
+		// first request after a cut the cut rule admits under them that rewrites everything after the system prompt
+		// and tools anyway (its kept prefix `p` is at most their tokens: a compaction, a forced rescue), after the
+		// prompt cache entry lapses, or five minutes after the change they withhold, whichever comes first
+		// ({@link #releaseWithheldPromptChangesIfDue}). A cheaper cut, such as a tail prune, would turn into a rewrite
+		// of the whole prompt. A provider-context cut (an image clamp) is made in a request whose prompt is already
+		// taken, so it never counts.
+		this.addDisposer(
+			this.#maintenance.onContextCutAdmitted(cut => {
+				if (!this.#tools.withholdsPromptChange || cut.providerContext) return;
+				if (cut.prefixTokens <= computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision)) {
+					this.#tools.noteRewritingCutAdmitted();
+				}
+			}),
+		);
+		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#releaseWithheldPromptChangesIfDue()));
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
 		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
@@ -3858,12 +3926,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#releasePowerAssertion();
 			this.#acquirePowerAssertion();
 		});
-		cfgWorkspacePromptInputs.listen(this, async () => {
+		cfgWorkspacePromptInputs.listenChanges(this, async settingsChange => {
 			const rootsChanged = await this.#syncSettingsWorkspaceDirectories();
 			const autoQaEnabled = isAutoQaEnabled(this.settings);
 			const autoQaChanged = autoQaEnabled !== this.#autoQaEnabled;
 			this.#autoQaEnabled = autoQaEnabled;
-			if ((rootsChanged || autoQaChanged) && !this.#isDisposed) await this.refreshBaseSystemPrompt();
+			if ((rootsChanged || autoQaChanged) && !this.#isDisposed) {
+				await this.refreshBaseSystemPrompt(undefined, { settingsChange });
+			}
 		});
 	}
 
@@ -5046,7 +5116,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (message.role === "hookMessage" || message.role === "custom") {
 			// One-run instructions must not return from persisted history: prewalk
 			// nudges are consumed once, and Vibe context is rebuilt only while active.
-			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
+			if (message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
+				if (this.#vibeModeState?.enabled) this.#vibeModeNoteSentAfter = this.sessionManager.getLeafId();
+			} else if (!isPrewalkPlanNudge(message)) {
 				this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
@@ -5477,15 +5549,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end") {
 			await messageEndPersistence;
 			if (this.#promptGeneration !== eventPromptGeneration) return;
-			if (interruptedThinkingMessage) {
-				this.sessionManager.appendCustomMessageEntry(
-					interruptedThinkingMessage.customType,
-					interruptedThinkingMessage.content,
-					interruptedThinkingMessage.display,
-					interruptedThinkingMessage.details,
-					interruptedThinkingMessage.attribution,
-				);
-			}
+			if (interruptedThinkingMessage) this.sessionManager.appendCustomMessage(interruptedThinkingMessage);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -6388,8 +6452,30 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
+
 	/**
-	 * Emits the extension `tool_call` event for a loop-dispatched call at
+	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
+	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
+	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a
+	 * cut under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after
+	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before
+	 * every main request, and before a user prompt takes its hidden notices.
+	 */
+	async #releaseWithheldPromptChangesIfDue(): Promise<void> {
+		if (!this.#tools.withholdsPromptChange) return;
+		const lapsed = this.#maintenance.promptCacheLapsed();
+		try {
+			await this.#tools.replaceRestoredPromptIfDue(lapsed);
+			await this.#tools.absorbHeldSettingsRebuild(lapsed);
+		} catch (error) {
+			logger.warn("Rebuild of a withheld prompt change failed", { error: String(error) });
+		}
+	}
+
+	/**
+	 * Refuses a call to a tool a held settings rebuild disabled, with the reason
+	 * ({@link SessionTools.heldToolRefusal}). Otherwise emits the extension
+	 * `tool_call` event for a loop-dispatched call at
 	 * arg-prep time — before concurrency scheduling, `tool_execution_start`,
 	 * and the wrapper's approval gate. A handler block becomes a blocked tool
 	 * result; a handler `input` revision becomes the arguments the loop
@@ -6399,6 +6485,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const heldRefusal = this.#tools.heldToolRefusal(ctx.tool.name);
+		if (heldRefusal) return { block: true, reason: heldRefusal };
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -6790,21 +6878,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** The request inputs outside the transcript that are part of the cache key; rebuilt only when one of them is replaced. */
 	#promptCacheShape(model: Model | undefined): PromptCacheShape {
-		const { tools, systemPrompt } = this.agent.state;
+		const { systemPrompt } = this.agent.state;
 		const thinkingLevel = this.thinkingLevel;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
-		const intentTracing = this.agent.intentTracing;
-		const intentDescription = this.agent.intentDescription;
-		const pruneToolDescriptions = this.agent.prunesToolDescriptions(model);
+		// The definitions as the wire declares them: a refreshed MCP tool keeps its name, and a tool taken off the
+		// roster that the request keeps declared changes nothing.
+		const tools = this.agent.declaredToolsFingerprint(model);
 		const memo = this.#promptCacheShapeMemo;
 		if (
 			memo !== undefined &&
 			memo.model === model &&
-			memo.tools === tools &&
 			memo.systemPrompt === systemPrompt &&
-			memo.intentTracing === intentTracing &&
-			memo.intentDescription === intentDescription &&
-			memo.pruneToolDescriptions === pruneToolDescriptions &&
+			memo.shape.tools === tools &&
 			memo.shape.thinkingLevel === thinkingLevel &&
 			memo.shape.retention === retention
 		) {
@@ -6814,20 +6899,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
-			// The specs as the wire carries them: a refreshed MCP tool keeps its name.
-			tools: wireToolsFingerprint(tools, { intentTracing, intentDescription, pruneToolDescriptions }),
+			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
 		};
-		this.#promptCacheShapeMemo = {
-			model,
-			tools,
-			systemPrompt,
-			intentTracing,
-			intentDescription,
-			pruneToolDescriptions,
-			shape,
-		};
+		this.#promptCacheShapeMemo = { model, systemPrompt, shape };
 		return shape;
 	}
 
@@ -6839,24 +6915,44 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * counted it (the status line); otherwise it is counted here.
 	 */
 	getPromptCacheStatus(nowMs = Date.now(), nextTokens?: number): PromptCacheStatus | undefined {
-		const warmer = this.#cacheWarmer;
-		if (!warmer) return undefined;
+		if (!this.#cacheWarmer) return undefined;
+		const current = this.#currentPromptCacheEntry();
+		if (!current) return undefined;
+		return promptCacheStatus(current.entry, {
+			nowMs,
+			warming: current.warming,
+			nextTokens: nextTokens ?? this.getContextUsage()?.tokens ?? 0,
+		});
+	}
+
+	/**
+	 * The prompt cache entry the next request would read, the one {@link getPromptCacheStatus}
+	 * reports: touched by the newest real or warm request that hit it, with its tier and lifetime.
+	 * Unlike {@link promptCacheEntry}, it holds without a warmer, from the branch's newest cached
+	 * reply. Undefined with no reply that used the cache.
+	 */
+	observedPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+		return this.#currentPromptCacheEntry()?.entry;
+	}
+
+	/**
+	 * The warmer's confirmed entry while it still extends the branch on screen, with its warming
+	 * state; otherwise the entry the branch's own newest cached reply left.
+	 */
+	#currentPromptCacheEntry(): { entry: ObservedPromptCacheEntry; warming?: CacheWarmingStatus } | undefined {
 		const view =
-			this.#promptCacheArmSessionId === this.sessionManager.getSessionId() ? warmer.confirmedView : undefined;
+			this.#promptCacheArmSessionId === this.sessionManager.getSessionId()
+				? this.#cacheWarmer?.confirmedView
+				: undefined;
 		const confirmed = view?.entry;
 		const change = confirmed?.change;
 		// A replaced transcript (rewind, branch switch, reload, compaction) no longer extends the
 		// armed request; the branch now on screen says what its own replies cached.
-		const live = confirmed !== undefined && change?.kind !== "history";
-		const entry: ObservedPromptCacheEntry | undefined = live
-			? { ...confirmed, change, inferred: false }
-			: this.#inferredPromptCacheEntry();
-		if (!entry) return undefined;
-		return promptCacheStatus(entry, {
-			nowMs,
-			warming: live ? view?.warming : undefined,
-			nextTokens: nextTokens ?? this.getContextUsage()?.tokens ?? 0,
-		});
+		if (confirmed !== undefined && change?.kind !== "history") {
+			return { entry: { ...confirmed, change, inferred: false }, warming: view?.warming };
+		}
+		const inferred = this.#inferredPromptCacheEntry();
+		return inferred ? { entry: inferred } : undefined;
 	}
 
 	/**
@@ -6892,11 +6988,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * The entry the branch's newest cached reply left, for a transcript this
 	 * process has not sent yet (a reopened or switched session): touched at the
 	 * reply's send time or a later warm refresh that hit, under the lifetime its
-	 * model declares for the tier the reply wrote. Thinking level, tools and
-	 * credential at the time are unknown; model, compaction and the system
-	 * prompt digest recorded for that reply are not.
+	 * model declares for the tier the reply wrote. Thinking level and
+	 * credential at the time are unknown; model, compaction and the digests of
+	 * the tool definitions and system prompt recorded for that reply are not,
+	 * and the next request is taken to send the current tool definitions and
+	 * base prompt. `promptDigest` names another base prompt for it, the one a
+	 * resumed process may restore while its tools are not all in yet (tools
+	 * that register late): the tool definitions are not compared then.
 	 */
-	#inferredPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+	#inferredPromptCacheEntry(promptDigest?: string): ObservedPromptCacheEntry | undefined {
 		const observed = this.#branchPromptCacheObservation();
 		if (!observed) return undefined;
 		const { reply } = observed;
@@ -6929,7 +7029,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			change = { kind: "retention" };
 		} else if (observed.compacted) {
 			change = { kind: "compaction" };
-		} else if (observed.promptDigest !== undefined && observed.promptDigest !== this.#tools.currentPromptDigest()) {
+		} else if (
+			promptDigest === undefined &&
+			observed.toolsDigest !== undefined &&
+			observed.toolsDigest !== this.#promptCacheShape(current).tools
+		) {
+			// Tool definitions come before the system prompt in cache order.
+			change = { kind: "tools" };
+		} else if (
+			observed.promptDigest !== undefined &&
+			observed.promptDigest !== (promptDigest ?? this.#tools.currentPromptDigest())
+		) {
 			change = { kind: "system-prompt" };
 		}
 		return {
@@ -6953,7 +7063,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const branch = this.sessionManager.getBranchView();
 		let scan = this.#branchPromptCacheScan;
 		if (scan?.branch !== branch) {
-			scan = { branch, scanned: 0, digest: undefined, observation: undefined, reported: undefined };
+			scan = {
+				branch,
+				scanned: 0,
+				digest: undefined,
+				toolsDigest: undefined,
+				observation: undefined,
+				reported: undefined,
+			};
 			this.#branchPromptCacheScan = scan;
 		}
 		if (scan.scanned < branch.length) scanBranchPromptCache(scan);
@@ -7797,6 +7914,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (this.sessionManager.getPersistenceFailure()) this.#queuePersistenceFailureMessage();
 
 		resetCapabilities();
+		// The cleared transcript reads no cache entry a restored prompt was kept for: this process's own build goes out.
+		this.#tools.leaveRestoredTranscript();
 		await this.refreshBaseSystemPrompt();
 
 		return { droppedCount };
@@ -8173,6 +8292,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.getToolForEvalBridge(name);
 	}
 
+	/**
+	 * Why a call to the tool or `xd://` device `name` is refused while a held settings change keeps it listed
+	 * ({@link SessionTools.heldToolRefusal}); undefined when calls to it run.
+	 */
+	heldToolRefusal(name: string): string | undefined {
+		return this.#tools.heldToolRefusal(name);
+	}
+
 	/** Names currently authorized through the eval bridge. */
 	getEvalBridgeToolNames(): string[] {
 		return this.#tools.getEvalBridgeToolNames();
@@ -8192,10 +8319,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Re-resolves settings-gated tools (built-in `*.enabled` toggles, eval backends,
 	 * image/speech generation, `tools.xdev`) against live settings and refreshes the
 	 * prompt once (`refreshPrompt: false` refreshes only if the tool set changed). The
-	 * SDK runs it whenever a gating setting changes; other runtime owners may call it
-	 * after changing an input the gate reads.
+	 * SDK runs it whenever a gating setting changes, passing the change, which holds
+	 * the reapply on a bound prompt (see {@link SessionTools.reconcileBuiltinTools});
+	 * other runtime owners may call it after changing an input the gate reads.
 	 */
-	reconcileBuiltinTools(options?: { refreshPrompt?: boolean }): Promise<void> {
+	reconcileBuiltinTools(options?: { refreshPrompt?: boolean } & SettingsChangeOptions): Promise<void> {
 		return this.#tools.reconcileBuiltinTools(options);
 	}
 
@@ -8309,9 +8437,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * system prompt, and notifies command-metadata listeners (TUI autocomplete, RPC/ACP
 	 * command lists). Serialized so overlapping reloads apply in call order. Always
 	 * re-emits `resources_discover`: its callers (cwd change, `/reload-plugins`, extension-source
-	 * edits) all change which directories extensions contribute.
+	 * edits) all change which directories extensions contribute. A refresh a settings change
+	 * started passes `settingsChange`, which holds the prompt rebuild on a bound prompt (see
+	 * {@link SessionTools.refreshSkills}).
 	 */
-	refreshSkillsAndCommands(): Promise<void> {
+	refreshSkillsAndCommands(options?: SettingsChangeOptions): Promise<void> {
 		const refresh = this.#skillsAndCommandsRefresh
 			.catch(() => {})
 			.then(async () => {
@@ -8322,7 +8452,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				});
 				// Resets the capability cache again, rediscovers skills, rebuilds the prompt,
 				// and fires the command-metadata notification after both lists are current.
-				await this.#tools.refreshSkills({ rediscover: true });
+				await this.#tools.refreshSkills({ ...options, rediscover: true });
 			});
 		this.#skillsAndCommandsRefresh = refresh;
 		return refresh;
@@ -8379,6 +8509,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.advertisedSessionAgents;
 	}
 
+	/**
+	 * Discovered agents frozen into the task description (see
+	 * {@link SessionTools.advertisedDiscoveredAgents}). A later rescan rides a
+	 * hidden notice so the provider cache prefix stays intact.
+	 */
+	getAdvertisedDiscoveredAgents(): readonly AgentDefinition[] | undefined {
+		return this.#tools.advertisedDiscoveredAgents;
+	}
+
+	/**
+	 * Per-call model approvals frozen into the task and eval descriptions (see
+	 * {@link SessionTools.advertisedPerCallModels}). A later change rides a
+	 * hidden notice so the provider cache prefix stays intact.
+	 */
+	getAdvertisedPerCallModels(): PerCallModelAdvertisement | undefined {
+		return this.#tools.advertisedPerCallModels;
+	}
+
 	/** Cancels the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#memory.cancelLocalMemoryStartup();
@@ -8405,9 +8553,151 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#memory.settle();
 	}
 
-	/** Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. */
-	refreshBaseSystemPrompt(commitIf?: () => boolean): Promise<void> {
-		return this.#tools.refreshBaseSystemPrompt(commitIf);
+	/**
+	 * The recall the memory backend adopted that the conversation carries as a hidden `memory-recall` message
+	 * instead of a system block; a prompt rebuild leaves it out of the memory instructions.
+	 */
+	get hiddenMemoryRecall(): string | undefined {
+		return this.#memory.hiddenRecall;
+	}
+
+	/**
+	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
+	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state), then
+	 * rebuilds the base prompt: no later request sends them again, and the rebuild asks the backend for its whole
+	 * memory instructions. A rebuild for the memory settings a rebuilt state took in is held on a bound prompt
+	 * ({@link SessionMemory.withdrawRecall}).
+	 */
+	withdrawMemoryRecall(): Promise<void> {
+		return this.#memory.withdrawRecall();
+	}
+
+	/**
+	 * The hidden messages a model call must carry that its context lacks, decided from the call's own context:
+	 * - the conversation's hidden recall ({@link hiddenMemoryRecall}) where neither the system prompt nor a
+	 *   `memory-recall` message holds it: a branch the delivered message is not on (`/tree` to before it), a
+	 *   compaction that summarized it (before the turn or between its tool calls) and an older recall the context
+	 *   holds in its place each leave it out;
+	 * - each report of what changed in a reused recall's memories that no `memory-recall-changes` message in the
+	 *   context holds;
+	 * - the approved-plan reference a compaction re-armed after the turn was prepared (the turn's own pre-prompt
+	 *   compaction, one between its tool calls), which would otherwise wait for the next prompt;
+	 * - the plan, goal and vibe mode instructions of an active mode where no message of their kind is in the context
+	 *   but the current branch carried one since its last `/clear` (a compaction summarized it): a turn whose history
+	 *   never carried one, such as one an extension started before any prompt, gets none, as the prompt path adds
+	 *   them at each prompt ({@link #branchCarriesCustomMessage}, {@link #branchCarriesVibeModeNote});
+	 * - the notices of what changed since the prompt the model holds that the context no longer tells it, the top-level
+	 *   tools and `xd://` devices included ({@link SessionTools.missingContextNotices}).
+	 * The call sends them after its newest content, and later calls replay them from there.
+	 */
+	async #missingContextMessages(context: AgentContext): Promise<AgentMessage[]> {
+		const missing: AgentMessage[] = [];
+		const byType = customMessagesByType(context.messages);
+		const recall = this.#memory.hiddenRecall;
+		if (
+			recall &&
+			!customMessagesOf(byType, MEMORY_RECALL_MESSAGE_TYPE).some(message => message.content === recall) &&
+			!context.systemPrompt.some(block => block.includes(recall))
+		) {
+			missing.push({
+				role: "custom",
+				customType: MEMORY_RECALL_MESSAGE_TYPE,
+				content: recall,
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+		}
+		const recallChanges = this.#memory.recallChanges;
+		const newestChanges = recallChanges.at(-1);
+		if (newestChanges) {
+			const carried = new Set<unknown>(
+				customMessagesOf(byType, MEMORY_RECALL_CHANGES_MESSAGE_TYPE).map(message => message.content),
+			);
+			for (const report of recallChanges) {
+				if (carried.has(report.content)) continue;
+				missing.push({
+					role: "custom",
+					customType: MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+					content: report.content,
+					// With every report in the context again, the memories still current are the newest report's.
+					details: newestChanges.details,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
+		}
+		const planReference = await this.#buildPlanReferenceMessage();
+		if (planReference) {
+			this.#planReferenceSent = true;
+			missing.push(planReference);
+		}
+		const enabledToolNames = this.getEnabledToolNames();
+		if (!byType.has(PLAN_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const planMode = await this.#buildPlanModeMessage(enabledToolNames);
+			if (planMode && this.#branchCarriesCustomMessage(PLAN_MODE_CONTEXT_MESSAGE_TYPE)) missing.push(planMode);
+		}
+		if (!byType.has(GOAL_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const goalMode = this.#buildGoalModeMessage();
+			if (goalMode && this.#branchCarriesCustomMessage(GOAL_MODE_CONTEXT_MESSAGE_TYPE)) missing.push(goalMode);
+		}
+		if (!byType.has(VIBE_MODE_CONTEXT_MESSAGE_TYPE)) {
+			const vibeMode = this.#buildVibeModeMessage();
+			if (vibeMode && this.#branchCarriesVibeModeNote()) missing.push(vibeMode);
+		}
+		missing.push(...this.#tools.missingContextNotices(byType, context.systemPrompt, enabledToolNames));
+		return missing;
+	}
+
+	/**
+	 * Whether the current branch since its newest context reset (`/clear`) holds a `custom_message` entry of
+	 * `customType`: a mode note its history carried, which a context without one lost to a compaction. Scans from the
+	 * newest entry; a note goes out at each prompt, so a hit is near the end.
+	 */
+	#branchCarriesCustomMessage(customType: string): boolean {
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "reset_boundary") return false;
+			if (entry.type === "custom_message" && entry.customType === customType) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the current branch since its newest context reset (`/clear`) carried a vibe mode note. The note is never
+	 * persisted, so the record is the entry the newest one went out after ({@link #vibeModeNoteSentAfter}): the branch
+	 * holds it and grows past it.
+	 */
+	#branchCarriesVibeModeNote(): boolean {
+		const after = this.#vibeModeNoteSentAfter;
+		if (after === undefined) return false;
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.id === after) return index < branch.length - 1;
+			if (entry.type === "reset_boundary") return false;
+		}
+		return after === null && branch.length > 0;
+	}
+
+	/**
+	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
+	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change
+	 * in the background passes `joinsHeldChange`, which joins a held one (see
+	 * {@link SessionTools.refreshBaseSystemPrompt}).
+	 */
+	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
+		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
+	}
+
+	/**
+	 * Holds a settings change on a bound prompt that alters what an active tool declares, whatever setting it is
+	 * (see {@link SessionTools.holdToolDeclarationChange}).
+	 */
+	holdToolDeclarationChange(settingsChange: readonly SettingChange[]): Promise<void> {
+		return this.#tools.holdToolDeclarationChange(settingsChange);
 	}
 
 	/** Replaces connected MCP tools and enables them immediately. */
@@ -8487,6 +8777,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	get compactionSpeculation(): "idle" | "running" | "armed" {
 		return this.#maintenance.speculationState;
 	}
+	/**
+	 * Whether an automatic cut of the context runs now, by the cut rule over this session's figures
+	 * (`decideContextCut` in the agent's compaction package); see {@link SessionMaintenance.admitsContextCut}.
+	 * Called by provider-context transforms with a `providerContextCut()` cut, which never runs a held settings rebuild.
+	 */
+	admitsProviderContextCut(cut: ContextCut): boolean {
+		return this.#maintenance.admitsContextCut(cut);
+	}
+
 	/** Strip image content from the current branch and persist the rewrite. */
 	dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		return this.#maintenance.dropImages();
@@ -8827,6 +9126,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	setVibeModeState(state: VibeModeState | undefined): void {
 		this.#vibeModeState = state;
 		if (state?.enabled) return;
+		this.#vibeModeNoteSentAfter = undefined;
 
 		const isVibeContext = (message: AgentMessage): boolean =>
 			message.role === "custom" && message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE;
@@ -8879,7 +9179,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#goalRuntime;
 	}
 
+	/**
+	 * Records that the prompt the caller sends next carries the approved plan in its own text (the plan-approved
+	 * prompt), so no reference goes out with it or after it. The record is kept on the branch
+	 * ({@link PLAN_REFERENCE_PROMPT_ENTRY_TYPE}), so a process that resumes the session, a switch back to it and a
+	 * `/tree` move read it as the reference it stands for.
+	 */
 	markPlanReferenceSent(): void {
+		this.sessionManager.appendCustomEntry(PLAN_REFERENCE_PROMPT_ENTRY_TYPE);
 		this.#planReferenceSent = true;
 	}
 
@@ -8914,7 +9221,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
-		this.#tools.resetAnnouncedMounts();
 		// A `/new`, session switch, or tree navigation reuses tool-call ids, so a
 		// still-cached background-task snapshot from the old conversation must not
 		// survive to be replayed by a focus rebuild in the reset session (#10447).
@@ -9091,7 +9397,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * rewrite (new session, compaction, edit). Inlines the plan body so the
 	 * executor need not re-read it; the durable `local://` path stays in the
 	 * prompt as the recovery route when a compressor expires the inline copy.
-	 * Returns null during plan mode, once already sent, or when no plan exists.
+	 * Returns null during plan mode, while the current branch carries it, or when
+	 * no plan exists.
 	 */
 	async #buildPlanReferenceMessage(): Promise<CustomMessage | null> {
 		if (this.#planModeState?.enabled) return null;
@@ -9109,7 +9416,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		return {
 			role: "custom",
-			customType: "plan-mode-reference",
+			customType: PLAN_MODE_REFERENCE_MESSAGE_TYPE,
 			content,
 			display: false,
 			attribution: "agent",
@@ -9117,11 +9424,69 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	#isScoutAvailable(): boolean {
-		return this.#scoutAllowedBySpawnPolicy && !cfgTaskDisabledAgents.get(this.settings).includes("scout");
+	/**
+	 * Whether the current branch carries the approved-plan reference: since its newest approval, compaction and context
+	 * reset (`/clear`), it holds a reference message, or a record that the prompt after it carried the plan
+	 * ({@link markPlanReferenceSent}) and that prompt. A reference before an approval was for the plan approved before,
+	 * and one before a compaction or reset is not in the context the requests send.
+	 */
+	#branchCarriesPlanReference(): boolean {
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			switch (entry.type) {
+				case "custom_message":
+					if (entry.customType === PLAN_MODE_REFERENCE_MESSAGE_TYPE) return true;
+					break;
+				case "custom":
+					if (entry.customType === PLAN_REFERENCE_PROMPT_ENTRY_TYPE) return index < branch.length - 1;
+					break;
+				case "mode_change":
+					if (typeof entry.data?.approvedPlanFilePath === "string") return false;
+					break;
+				case "compaction":
+				case "reset_boundary":
+					return false;
+			}
+		}
+		return false;
 	}
 
-	async #buildPlanModeMessage(): Promise<CustomMessage | null> {
+	/**
+	 * Adopts the plan approval the current branch records: the approved plan of its newest mode change, unless plan
+	 * mode was entered after it. A branch that records none has no approved plan.
+	 */
+	#adoptPlanApprovalFromBranch(): void {
+		this.#planReferenceApproved = false;
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "mode_change") continue;
+			if (entry.mode === "plan" || entry.mode === "plan_paused") return;
+			if (typeof entry.data?.approvedPlanFilePath === "string") {
+				this.#planReferencePath = entry.data.approvedPlanFilePath;
+				this.#planReferenceApproved = true;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Reads the plan state of the branch the session loaded (at startup, after a switch, a `/tree` move or a rewind):
+	 * the approval it records ({@link #adoptPlanApprovalFromBranch}), and whether it carries the reference
+	 * ({@link #branchCarriesPlanReference}), whichever process sent it. One that lacks it gets it with its next request.
+	 */
+	#syncPlanReferenceToBranch(): void {
+		this.#adoptPlanApprovalFromBranch();
+		this.#planReferenceSent = this.#branchCarriesPlanReference();
+	}
+
+	#isScoutAvailable(): boolean {
+		return isScoutSpawnable(cfgTaskDisabledAgents.get(this.settings), this.#spawns);
+	}
+
+	/** The plan mode instructions while plan mode is on; `capableToolNames`, when given, are the enabled tool names. */
+	async #buildPlanModeMessage(capableToolNames?: readonly string[]): Promise<CustomMessage | null> {
 		const state = this.#planModeState;
 		if (!state?.enabled) return null;
 		const sessionPlanUrl = "local://PLAN.md";
@@ -9135,15 +9500,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		const planExists = fs.existsSync(resolvedPlanPath);
 		// Capability gates, not the visible surface: `xd://`-mounted tools stay callable.
-		const capableToolNames = this.getEnabledToolNames();
+		const toolNames = capableToolNames ?? this.getEnabledToolNames();
 		const content = prompt.render(planModeActivePrompt, {
 			planFilePath: displayPlanPath,
 			planExists,
 			askToolName: "ask",
 			writeToolName: "write",
 			editToolName: "edit",
-			askAvailable: capableToolNames.includes("ask"),
-			taskAvailable: capableToolNames.includes("task"),
+			askAvailable: toolNames.includes("ask"),
+			taskAvailable: toolNames.includes("task"),
 			isHashlineEditMode: this.#resolveActiveEditMode() === "hashline",
 			reentry: state.reentry ?? false,
 			iterative: state.workflow === "iterative",
@@ -9152,7 +9517,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		return {
 			role: "custom",
-			customType: "plan-mode-context",
+			customType: PLAN_MODE_CONTEXT_MESSAGE_TYPE,
 			content,
 			display: false,
 			attribution: "agent",
@@ -9166,7 +9531,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const todoContext = this.#buildGoalTodoContext();
 		return {
 			role: "custom",
-			customType: "goal-mode-context",
+			customType: GOAL_MODE_CONTEXT_MESSAGE_TYPE,
 			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
 			display: false,
 			attribution: "agent",
@@ -10053,7 +10418,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		generation: number,
 		signal: AbortSignal | undefined,
 		origin: "direct" | "queued",
-	): Promise<QueuedMessagePreparation & { baseXdevCatalogDelivered: boolean }> {
+	): Promise<QueuedMessagePreparation> {
 		const sessionGeneration = this.#sessionGeneration;
 		const alreadyDisposing = this.#isDisposed && origin === "direct";
 		const isCurrent = () =>
@@ -10061,7 +10426,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#sessionGeneration === sessionGeneration &&
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
-		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
+		const cancelled = { commit: () => undefined };
 		if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
 		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
 		if (pendingMCPDiscovery) {
@@ -10133,7 +10498,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			if (!overrideIsCurrent()) continue;
 			return {
-				baseXdevCatalogDelivered: result?.systemPrompt === undefined,
 				commit: () => {
 					// No await may separate ownership validation from publishing memory and policy.
 					if (!isCurrent() || !overrideIsCurrent()) return undefined;
@@ -10275,13 +10639,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return false;
 			}
 
-			// Pending tool-roster and xd:// deltas accompany the next user-authored
-			// prompt, never an agent-initiated continuation. Reserve their pre-user
-			// position now. Non-consuming previews count toward pre-prompt context
-			// maintenance, while the live deltas are consumed only after maintenance:
-			// promotion/summary can rebuild the base prompt and clear a roster delta
-			// it subsumes, avoiding a contradictory materialized notice.
-			const xdevMountNoticeIndex = messages.length;
+			// Reserve the position before the prompt's message for the hidden
+			// notices built after pre-prompt maintenance (see below).
+			const hiddenNoticeIndex = messages.length;
 			messages.push(message);
 			// Inject pending "nextTurn" messages as context alongside the user message.
 			for (const msg of this.#pendingNextTurnMessages) {
@@ -10318,7 +10678,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const preparedMessages = preparation.commit();
 			if (!preparedMessages) return false;
 			messages.push(...preparedMessages);
-			const baseXdevCatalogDelivered = preparation.baseXdevCatalogDelivered;
 
 			// Auto thinking: classify this real user turn and set the effective level
 			// before the model request. A user-invoked `/skill:<name>` arrives as a
@@ -10339,20 +10698,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			// Only the xd:// mount notice can carry substantial inline docs (up to
 			// XDEV_DOCS_TOTAL_BUDGET), so preview it in a copy and let context
-			// maintenance see the request's true size without consuming a delta a
-			// rebuild may supersede. The tool-roster notice is a tiny name list with
-			// no budget impact, so it is not previewed here — it must always ship
-			// alongside the schema change it describes (see below).
-			const previewXdevMountNotice = isUserQueuedMessage(message)
-				? this.#tools.peekPendingXdevMountNotice({ baseCatalogDelivered: baseXdevCatalogDelivered })
-				: undefined;
-			const maintenanceMessages = previewXdevMountNotice?.notice ? [...messages] : messages;
-			if (maintenanceMessages !== messages && previewXdevMountNotice?.notice) {
-				maintenanceMessages.splice(xdevMountNoticeIndex, 0, previewXdevMountNotice.notice);
+			// maintenance see the request's true size. The tool-roster notice is a
+			// tiny name list with no budget impact, so it is not previewed here — it
+			// must always ship alongside the schema change it describes (see below).
+			const previewXdevMountNotice = this.#tools.peekXdevMountNotice();
+			const maintenanceMessages = previewXdevMountNotice.notice ? [...messages] : messages;
+			if (previewXdevMountNotice.notice) {
+				maintenanceMessages.splice(hiddenNoticeIndex, 0, previewXdevMountNotice.notice);
 			}
 			await logger.time("prompt:prePromptCompaction", () =>
 				this.#maintenance.runPrePromptCompactionIfNeeded(maintenanceMessages),
 			);
+			if (this.#promptGeneration !== generation) {
+				return false;
+			}
+			// A withheld prompt change that is due (a held settings rebuild, a kept restored transcript prompt) goes
+			// into this request's prompt, a held one instead of its notice.
+			await this.#releaseWithheldPromptChangesIfDue();
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
@@ -10374,36 +10736,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
-			// Consume the xd:// notice only when its previewed revision still holds.
-			// A mount delta or catalog rebuild during the await invalidates it: any
-			// additions carried by the delivered base are recorded as announced,
-			// while remaining notice content waits for the next context check.
-			// The roster notice is re-derived from the live delta here and always
-			// delivered, keeping the model's stated availability in lockstep with
-			// the wire tool list even when a roster change landed during maintenance.
-			const xdevMountNotice = previewXdevMountNotice
-				? this.#tools.takePendingXdevMountNotice({
-						baseCatalogDelivered: baseXdevCatalogDelivered,
-						expectedContentKey: previewXdevMountNotice.contentKey,
-					})
-				: undefined;
-			const toolRosterNotice = isUserQueuedMessage(message)
-				? this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered })
-				: undefined;
-			const evalPreludeNotice = isUserQueuedMessage(message) ? this.#tools.takeEvalPreludeNotice() : undefined;
-			const sessionAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeSessionAgentNotice() : undefined;
-			const skillNotice = isUserQueuedMessage(message) ? this.#tools.takeSkillNotice() : undefined;
-			if (xdevMountNotice || toolRosterNotice || evalPreludeNotice || sessionAgentNotice || skillNotice) {
-				messages.splice(
-					xdevMountNoticeIndex,
-					0,
-					...(xdevMountNotice ? [xdevMountNotice] : []),
-					...(toolRosterNotice ? [toolRosterNotice] : []),
-					...(evalPreludeNotice ? [evalPreludeNotice] : []),
-					...(sessionAgentNotice ? [sessionAgentNotice] : []),
-					...(skillNotice ? [skillNotice] : []),
-				);
-			}
+			// Each hidden notice is derived from the context after maintenance: a
+			// rebuild it ran (promotion, a summary) absorbs what the rebuilt prompt
+			// lists, so the request never carries both a rebuilt roster or catalog and
+			// a contradicting notice. The xd:// notice goes out as its preview
+			// budgeted it, or waits for the next prompt's estimate when it changed
+			// during the await. The roster notice always ships, keeping the model's
+			// stated availability in lockstep with the wire tool list even when a
+			// roster change landed during maintenance. Each later request gets the
+			// ones its context lacks from #missingContextMessages.
+			const hiddenNotices = [
+				this.#tools.takeXdevMountNotice(previewXdevMountNotice),
+				this.#tools.takeToolRosterNotice(),
+				// This condition only sets where the history notices go: before a user prompt. A continuation the agent
+				// started gets each one its context lacks from the per-request hook, after its message.
+				...(isUserQueuedMessage(message) ? this.#tools.historyNotices() : []),
+			].filter(notice => notice !== undefined);
+			if (hiddenNotices.length > 0) messages.splice(hiddenNoticeIndex, 0, ...hiddenNotices);
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
@@ -11763,13 +12112,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return outcome.sessionClaimed;
 			}
 			this.agent.appendMessage(normalizedAppMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				normalizedAppMessage.customType,
-				normalizedAppMessage.content,
-				normalizedAppMessage.display,
-				normalizedAppMessage.details,
-				normalizedAppMessage.attribution,
-			);
+			this.sessionManager.appendCustomMessage(normalizedAppMessage);
 			return false;
 		}
 
@@ -12361,6 +12704,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Frozen skill-URI hint visibility snapshot (see {@link SessionTools.skillHintVisible}). */
 	getSkillHintVisible(): boolean {
 		return this.#tools.skillHintVisible;
+	}
+
+	/**
+	 * The settings a tool call reads in place of the session's: inside a call to a tool a held settings change keeps
+	 * declared as sent, the ones it was declared under ({@link SessionTools.toolCallSettings}); otherwise undefined.
+	 */
+	get toolCallSettings(): Settings | undefined {
+		return this.#tools.toolCallSettings;
+	}
+
+	/**
+	 * The settings a call to the tool `name` runs under, for work done on it outside the tool (its arguments'
+	 * transform): while a held settings change keeps the tool declared as sent and alters what it would declare, the
+	 * ones it was declared under ({@link SessionTools.toolCallSettingsFor}); otherwise undefined.
+	 */
+	toolCallSettingsFor(name: string): Settings | undefined {
+		return this.#tools.toolCallSettingsFor(name);
+	}
+
+	/**
+	 * The settings the agent's requests read beside the system prompt and the tool declarations (intent field,
+	 * description pruning, tool-call dialect): under a held settings change, the values the bound prompt was sent
+	 * with ({@link SessionTools.requestSettings}); otherwise the session's own.
+	 */
+	get requestSettings(): Settings {
+		return this.#tools.requestSettings;
 	}
 
 	/** Skill loading warnings captured by SDK */
@@ -13248,6 +13617,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// directory set, not the previous session's — refresh before the next
 			// turn goes out.
 			resetCapabilities();
+			// A restored transcript's stored prompt stays with that transcript.
+			this.#tools.leaveRestoredTranscript();
 			await this.refreshBaseSystemPrompt();
 
 			this.#reseedCostGate();
@@ -13922,8 +14293,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!checkpointState) {
 			return;
 		}
-		// The rewound turn's reply is the exploration branch's newest, so this records its prompt.
+		// The rewound turn's reply is the exploration branch's newest, so these record its prompt and tools.
 		const explorationPromptDigest = this.#tools.recordedPromptDigest();
+		const explorationToolsDigest = this.#tools.recordedToolsDigest();
 		this.#bash.withBranchTransition(() => {
 			try {
 				this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
@@ -13960,8 +14332,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 				if (calls.length > 0) {
 					const callIds = new Set(calls.map(call => call.id));
-					// The rewind branch ends at the checkpoint, whose recorded prompt may predate this reply's.
+					// The rewind branch ends at the checkpoint, whose records may predate this reply's.
 					this.#tools.recordPromptDigest(explorationPromptDigest);
+					this.#tools.recordToolsDigest(explorationToolsDigest);
 					this.sessionManager.appendMessage(
 						sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }),
 					);
@@ -13988,6 +14361,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
+		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the rewind branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
@@ -15007,9 +15383,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
 		const previousServiceTierByFamily = this.serviceTierByFamily;
 		const previousTools = [...this.agent.state.tools];
-		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
+		const previousBasePrompt = this.#tools.basePromptState;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
+		// The target transcript starts without this one's recall; a rolled-back switch keeps the conversation's memory
+		// state.
+		const previousMemoryTracking = this.#memory.conversationTracking();
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
 		const previousTaskSiblingCandidate = this.sessionManager.getTaskSiblingCandidate();
@@ -15142,6 +15520,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#advisors.resetSessionState({ preserveCost: true });
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
 			} else if (didReloadConversationChange) {
@@ -15231,6 +15610,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					error: String(error),
 				});
 			}
+			// A prompt restored for the session left behind stays with it.
+			if (switchingToDifferentSession) this.#tools.leaveRestoredTranscript();
+			// A held settings change keeps declaring what the request the loaded branch continues from declared.
+			this.#tools.followBranchDeclarations();
 			// Refresh the workspace-roots block to match the resumed session's directory set.
 			// Wrapped so a rebuild failure (e.g. a gate that intentionally fails in tests)
 			// doesn't roll back an otherwise-successful session switch.
@@ -15280,8 +15663,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
 			this.agent.setTools(previousTools);
-			this.#tools.setBaseSystemPrompt(previousBaseSystemPrompt);
-			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
+			// The prompt with what it lists, so the notices compare against what the request carries.
+			this.#tools.restoreBasePromptState(previousBasePrompt);
+			this.#memory.restoreConversationTracking(previousMemoryTracking);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);
 			this.agent.replaceQueues(
@@ -15336,6 +15720,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			this.#advisors.resetAllRuntimes();
 			this.#advisors.reattachRecorderFeeds();
 			this.#reconnectToAgent();
@@ -15506,6 +15891,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
+			this.#syncPlanReferenceToBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
@@ -15526,6 +15912,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			if (!skipConversationRestore) {
 				this.replaceMessagesFromSessionContext(sessionContext.messages);
+				// A held settings change keeps declaring what the request the new file continues from declared.
+				this.#tools.followBranchDeclarations();
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
@@ -15976,6 +16364,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
+		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;
