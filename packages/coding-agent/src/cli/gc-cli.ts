@@ -243,7 +243,7 @@ export interface CompressGcResult {
 
 /** A phase this run did not perform because it works only on session files on disk. */
 export interface GcRefusal {
-	phase: "archive" | "compress" | "restore";
+	phase: "strip" | "archive" | "compress" | "restore";
 	/** The phase was named on the command line, so its refusal fails the run. */
 	requested: boolean;
 	reason: string;
@@ -2254,6 +2254,7 @@ const DISK_ONLY_PHASE_REASONS = {
 		"compression rewrites session files on disk in place, but this store keeps sessions as database rows that phase cannot see",
 	restore:
 		"a restore writes the archived session back as a file in the sessions tree, but this store reads sessions from database rows",
+	strip: "stripping rewrites session files on disk, but this store keeps sessions as database rows that phase cannot see",
 } as const;
 
 export async function runGcCommand(args: GcCommandArgs): Promise<GcResult> {
@@ -2279,6 +2280,7 @@ export async function runGcCommand(args: GcCommandArgs): Promise<GcResult> {
 			const storage =
 				options.restoreTarget !== undefined ||
 				options.runStale ||
+				options.runStrip ||
 				options.runBlobs ||
 				options.runArchive ||
 				options.runCompress
@@ -2310,7 +2312,10 @@ export async function runGcCommand(args: GcCommandArgs): Promise<GcResult> {
 			// Pruned collab replicas release their blobs to this run's sweep.
 			if (options.runStale && storage) next.stale = await runStaleGc(options, storage);
 			// Before archiving and compressing, which then store the stripped transcripts.
-			if (options.runStrip) next.strip = await runStripGc(options, archiveRoot);
+			if (options.runStrip) {
+				if (sessionsOnDisk) next.strip = await runStripGc(options, archiveRoot);
+				else refuse("strip", args.flags.strip);
+			}
 			if (options.runBlobs && storage) {
 				// On the result, so the JSON route carries it too: the
 				// renderer held the only copy and `--json` bypasses it.

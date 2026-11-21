@@ -212,7 +212,12 @@ import { cfgTaskAgentIdleTtlMs } from "./task/settings";
 import { cfgSkillsIncludeSkills } from "./extensibility/settings";
 import { cfgWorkspaceAdditionalDirectories } from "./session/context-settings";
 
-type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
+type RunAcpMode = (
+	createSession: AcpSessionFactory,
+	initialSession?: AgentSession,
+	/** `persistSessions: false` under --no-session (AcpAgentOptions in modes/acp/acp-agent.ts). */
+	options?: { persistSessions?: boolean },
+) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<number>;
 type RunRpcMode = (session: AgentSession, options?: RpcModeOptions) => Promise<never>;
 
@@ -552,7 +557,7 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools" | "invalidFlagValues">;
+	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools" | "invalidFlagValues" | "noSession">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
@@ -590,7 +595,14 @@ async function loadTrustedSessionExtensions(
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
-		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
+		// --no-session keeps every session in memory, as the launch's own session does
+		// (createSessionManager): a session/new writes nothing to the store. session/list,
+		// session/load, session/resume, session/fork and omp's _omp/ listing methods read the
+		// store, so the agent neither advertises nor serves them then (runAcpMode's
+		// persistSessions: false, below).
+		const nextSessionManager = args.parsedArgs.noSession
+			? SessionManager.inMemory(cwd)
+			: SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
@@ -2123,12 +2135,16 @@ export async function runRootCommand(
 		// Install the configured session storage before anything lists or opens a
 		// session — every session listing and SessionManager below reads through
 		// this default. A refusal names only the variable or setting and the path;
-		// it never echoes the connection string.
+		// it never echoes the connection string. Under --no-session the run keeps
+		// no session of its own, so the database opens only when something uses
+		// it (a subagent's transcript): one that is down or locked must neither
+		// end nor stall a run that never touches it.
 		try {
 			setDefaultSessionStorage(
 				await logger.time("resolveSessionStorage", resolveSessionStorage, {
 					settings: settingsInstance,
 					env: process.env,
+					openOnFirstUse: parsedArgs.noSession === true,
 				}),
 			);
 		} catch (error) {
@@ -2654,7 +2670,7 @@ export async function runRootCommand(
 			// Startup is over: stop recording spans, or every later session and subagent
 			// appends to the timing tree for the life of the server.
 			logger.endTiming();
-			await runAcpMode(createAcpSession);
+			await runAcpMode(createAcpSession, undefined, { persistSessions: !parsedArgs.noSession });
 		} else {
 			// Resolve extension-registered CLI flags before creating the session so a
 			// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb

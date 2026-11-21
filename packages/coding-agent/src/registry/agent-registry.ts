@@ -11,6 +11,7 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
+import type { SessionStorage } from "../session/session-storage";
 import { AgentAwaits, type AgentAwaitsApi } from "./agent-awaits";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -97,6 +98,24 @@ const kMintedRef = Symbol("agent-registry.ref");
 /** Whether `value` is a ref object minted by an {@link AgentRegistry} on this thread (thread bridges encode these). */
 export function isMintedAgentRef(value: unknown): value is AgentRef {
 	return typeof value === "object" && value !== null && Reflect.get(value, kMintedRef) === true;
+}
+
+/**
+ * The storage holding each ref's transcript, when known: the storage of the
+ * session that last attached to it, or the one a persisted roster scan read it
+ * from. Kept beside the ref rather than on it, because refs cross the worker
+ * RPC boundary and a storage holds a database client.
+ */
+const refStorages = new WeakMap<AgentRef, SessionStorage>();
+
+/** Record the storage holding `ref`'s transcript; `undefined` keeps what was known. */
+export function recordRefSessionStorage(ref: AgentRef, storage: SessionStorage | undefined): void {
+	if (storage) refStorages.set(ref, storage);
+}
+
+/** The storage holding `ref`'s transcript, when its session or its roster scan said. */
+export function refSessionStorage(ref: AgentRef): SessionStorage | undefined {
+	return refStorages.get(ref);
 }
 
 /**
@@ -294,6 +313,8 @@ export class AgentRegistry implements AgentRegistryApi {
 			lifecycle: input.lifecycle,
 		};
 		Object.defineProperty(ref, kMintedRef, { value: true });
+		// Test doubles and remote proxies may carry no session manager.
+		recordRefSessionStorage(ref, input.session?.sessionManager?.getStorage?.());
 		this.#refs.set(ref.id, ref);
 		// A real agent under this id shadows any name bound to a live session,
 		// so the binding is stale from here on.
@@ -325,7 +346,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		const current = this.#refs.get(id);
 		if (current !== expected || current.status !== "aborted" || current.session) return undefined;
 		// The killed generation's ancestry, recorded while its parents were registered: they may be gone since.
-		return this.#mint(
+		const reopened = this.#mint(
 			{
 				id,
 				displayName: current.displayName,
@@ -339,6 +360,8 @@ export class AgentRegistry implements AgentRegistryApi {
 			},
 			agentAncestors(this, current),
 		);
+		recordRefSessionStorage(reopened, refSessionStorage(current));
+		return reopened;
 	}
 
 	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
@@ -481,6 +504,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		// createAgentSession after an explicit kill.
 		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
 		ref.session = session;
+		recordRefSessionStorage(ref, session.sessionManager?.getStorage?.());
 		if (sessionFile !== undefined) {
 			// A replacement transcript starts a new cumulative-cost identity.
 			if (ref.sessionFile !== sessionFile && ref.history?.directCost !== undefined) {
