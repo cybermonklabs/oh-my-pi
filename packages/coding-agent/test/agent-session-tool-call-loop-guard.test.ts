@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -41,16 +41,8 @@ describe("AgentSession tool-call loop guard", () => {
 	});
 
 	/** Whether `message` is the loop guard's hidden redirect. */
-	function isRedirect(message: unknown): message is CustomMessage {
-		return (
-			typeof message === "object" &&
-			message !== null &&
-			"role" in message &&
-			message.role === "custom" &&
-			"customType" in message &&
-			message.customType === "tool-call-loop-redirect"
-		);
-	}
+	const isRedirect = (message: AgentMessage): message is CustomMessage =>
+		message.role === "custom" && message.customType === "tool-call-loop-redirect";
 
 	/**
 	 * A session whose model runs the same bash command twice, which trips the loop guard, then stops; `contexts` holds

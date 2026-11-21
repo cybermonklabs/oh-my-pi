@@ -53,7 +53,9 @@ export class SentToolDefinitions {
 	 * there are none or the request declares no tools ({@link inactiveFor}).
 	 */
 	withInactiveTools(context: Context): Context {
-		const inactiveTools = this.inactiveFor(latestToolDeclaration(context.messages), context.tools ?? []);
+		const inactiveTools = context.tools?.length
+			? this.inactiveFor(latestToolDeclaration(context.messages), context.tools)
+			: undefined;
 		if (!inactiveTools && !context.inactiveTools) return context;
 		return { ...context, inactiveTools };
 	}

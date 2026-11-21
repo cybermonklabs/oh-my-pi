@@ -974,7 +974,10 @@ interface RestoredPrompt extends WithheldChange, HeldSettings {
 	readonly base: readonly string[];
 }
 
-/** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids, tool names and its change, never a credential. */
+/**
+ * Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids, tool names and its change, never a credential's
+ * value.
+ */
 interface SettingsNoticeDetails {
 	settings: string[];
 	/** Each setting it names but a credential, with the value it gives now: what a resumed process counts as told. */
@@ -986,7 +989,7 @@ interface SettingsNoticeDetails {
 	/** Tools it gives as enabled after the rebuild that no notice before it on its branch did. */
 	enabledTools: string[];
 	/** Tools a notice before it on its branch gave as enabled after the rebuild that no longer are. */
-	withdrawnTools: string[];
+	noLongerEnabledTools: string[];
 	/** The {@link HeldSettings.id} of the change the notice describes. */
 	hold: string;
 	/** The notice's index in that change's {@link HeldSettings.notices}. */
@@ -4210,9 +4213,6 @@ export class SessionTools {
 		if (!held) {
 			const restored = this.#keptRestoredPrompt();
 			const before = new Map(restored?.before);
-			for (const { setting, previous } of settingsChange) {
-				if (!before.has(setting)) before.set(setting, previous);
-			}
 			held = {
 				id: restored?.id ?? crypto.randomUUID(),
 				...this.#withheldChange(this.currentPromptDigest(), Date.now(), false),
@@ -4223,27 +4223,35 @@ export class SessionTools {
 				enabledTools: new Set(),
 				reconcile: false,
 				skills: false,
-				declarations: this.#keptDeclarations(before),
+				declarations: undefined,
 				declared: new WeakMap(),
 				toolSettings: this.#settingsWith(before, () => this.#heldSettingsRebuild?.before === before),
 			};
+			// Not the session's hold yet, so nothing is recorded; the declarations it keeps read every setting it holds.
+			this.#holdMoreSettings(held, settingsChange);
+			held.declarations = this.#keptDeclarations(before);
 			this.#heldSettingsRebuild = held;
 			this.#recordWithheldChange(held);
 			this.#setAgentTools(this.#host.agent.state.tools);
 			return held;
 		}
+		this.#holdMoreSettings(held, settingsChange);
+		return held;
+	}
+
+	/**
+	 * Adds to `held` each setting of `changes` it does not hold yet, with its previous value, and when one was added
+	 * and `held` is the session's hold, records the settings it holds that its records on the current branch do not
+	 * name yet.
+	 */
+	#holdMoreSettings(held: HeldSettingsRebuild, changes: readonly SettingChange[]): void {
 		let grown = false;
-		for (const { setting, previous } of settingsChange) {
+		for (const { setting, previous } of changes) {
 			if (held.before.has(setting)) continue;
 			held.before.set(setting, previous);
 			grown = true;
 		}
-		if (grown) this.#recordGrownHold(held);
-		return held;
-	}
-
-	/** Records the settings `held` holds that its records on the current branch do not name yet. */
-	#recordGrownHold(held: HeldSettingsRebuild): void {
+		if (!grown || this.#heldSettingsRebuild !== held) return;
 		// The branch's records may name fewer settings than the hold holds now.
 		held.recordedOn = undefined;
 		this.#recordWithheldChange(held);
@@ -4538,13 +4546,10 @@ export class SessionTools {
 		}
 		if (earlier.length === 0) return;
 		const surface = surfaceRead ?? (await this.#promptSurfaceReads());
-		let grown = false;
-		for (const { setting, previous } of earlier) {
-			if (surface.has(setting) || held.before.has(setting)) continue;
-			held.before.set(setting, previous);
-			grown = true;
-		}
-		if (grown && this.#heldSettingsRebuild === held) this.#recordGrownHold(held);
+		this.#holdMoreSettings(
+			held,
+			earlier.filter(({ setting }) => !surface.has(setting)),
+		);
 	}
 
 	/**
@@ -4641,7 +4646,7 @@ export class SessionTools {
 			disabledTools: disabledTools.filter(name => !toldDisabled.includes(name)),
 			reenabledTools: toldDisabled.filter(name => !disabledTools.includes(name)),
 			enabledTools: enabledTools.filter(name => !toldEnabled.includes(name)),
-			withdrawnTools: toldEnabled.filter(name => !enabledTools.includes(name)),
+			noLongerEnabledTools: toldEnabled.filter(name => !enabledTools.includes(name)),
 		};
 		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
 		held.notices.push({ values, disabledTools, enabledTools });
@@ -4694,17 +4699,18 @@ export class SessionTools {
 	}
 
 	/**
-	 * Why a call to `name` is refused: a held settings rebuild unregistered it while its definition stays in the
-	 * bound prompt until the rebuild. Undefined for every other tool.
+	 * Why a call to `name`, bare or `xd://`-prefixed, is refused: a held settings rebuild unregistered it while its
+	 * definition stays in the bound prompt until the rebuild. Undefined for every other tool.
 	 */
 	heldToolRefusal(name: string): string | undefined {
+		const bareName = stripXdUrlPrefix(name);
 		const held = this.#heldSettingsRebuild;
-		const gates = held?.disabledTools.get(name);
+		const gates = held?.disabledTools.get(bareName);
 		if (!held || !gates) return undefined;
 		const changes = gates.map(setting =>
 			settingChangeView(setting, held.before.get(setting), setting.get(this.#host.settings)),
 		);
-		return prompt.render(heldToolRefusalPrompt, { tool: name, changes, rebuildBy: withheldChangeDeadline(held) });
+		return prompt.render(heldToolRefusalPrompt, { tool: bareName, changes, rebuildBy: withheldChangeDeadline(held) });
 	}
 
 	async #prepareBaseSystemPrompt(isCurrent?: () => boolean): Promise<SystemPromptPreparation | undefined> {

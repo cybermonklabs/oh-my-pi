@@ -12,7 +12,6 @@ import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
@@ -90,7 +89,7 @@ function toolResultHasError(result: AgentToolResult): boolean {
 function getTool(session: ToolSession, name: string): AgentTool {
 	// A tool a held settings change disabled stays listed until the rebuild; a call to it is refused as a direct call
 	// to it is, with the reason.
-	const heldRefusal = session.heldToolRefusal?.(stripXdUrlPrefix(name));
+	const heldRefusal = session.heldToolRefusal?.(name);
 	if (heldRefusal) throw new ToolError(heldRefusal);
 	const tool = session.getToolForEvalBridge ? session.getToolForEvalBridge(name) : session.getToolByName?.(name);
 	if (tool) return tool;

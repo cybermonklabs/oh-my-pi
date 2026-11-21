@@ -4,7 +4,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -13,6 +13,7 @@ import {
 	mockGatewayFetch,
 	textOf,
 	toolCallAnswer,
+	toolResultOf,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
 
@@ -30,20 +31,6 @@ const MNEMOPI_ON = `${LONG_ENTRIES}mnemopi:\n  noEmbeddings: true\n  llmMode: no
 
 /** {@link MNEMOPI_ON} with memory switched off, which withdraws the memory devices. */
 const MNEMOPI_OFF = MNEMOPI_ON.replace("backend: mnemopi", "backend: off");
-
-/** The calls of the session a memory switch may start. */
-const RELOAD_CALLS: readonly OverlayRebuild[] = [
-	"refreshBaseSystemPrompt",
-	"reconcileBuiltinTools",
-	"holdToolDeclarationChange",
-];
-
-/** The tool result a request carries for the call `toolUseId`. */
-function toolResultOf(request: MessagesRequest | undefined, toolUseId: string): Record<string, unknown> | undefined {
-	return request?.messages
-		.flatMap(message => (Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : []))
-		.find(block => block.type === "tool_result" && block.tool_use_id === toolUseId);
-}
 
 describe("a tool a held memory switch disables, reached other than by a direct call", () => {
 	afterEach(() => {

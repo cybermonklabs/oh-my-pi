@@ -6,7 +6,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -31,13 +31,6 @@ const PRAGMATIC_MEMORY_OFF = `${LONG_ENTRIES}memory:\n  backend: off\npersonalit
 
 /** A consolidated memory summary the local backend renders. */
 const MEMORY_SUMMARY = Array.from({ length: 30 }, (_, index) => `Project fact ${index}: keep it.`).join("\n");
-
-/** The calls of the session a settings reload may start. */
-const RELOAD_CALLS: readonly OverlayRebuild[] = [
-	"refreshBaseSystemPrompt",
-	"reconcileBuiltinTools",
-	"holdToolDeclarationChange",
-];
 
 describe("a held settings change that takes in another setting after its notice, across a restart", () => {
 	afterEach(() => {

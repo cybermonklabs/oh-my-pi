@@ -694,7 +694,9 @@ interface CompactionWaitRecords {
 }
 
 /** The figures of `entry` the cut rule reads, kept as they stand now. */
-function cacheEntryFigures(entry: ObservedPromptCacheEntry): NonNullable<ContextCutSession["cacheEntry"]> {
+function cacheEntryFigures(
+	entry: NonNullable<ContextCutSession["cacheEntry"]>,
+): NonNullable<ContextCutSession["cacheEntry"]> {
 	return { tier: entry.tier, touchedAt: entry.touchedAt, ttlMs: entry.ttlMs };
 }
 
@@ -1053,7 +1055,7 @@ export class SessionMaintenance {
 		) {
 			return;
 		}
-		const recorded: CompactionWait = { ...wait, entry: { ...wait.entry } };
+		const recorded: CompactionWait = { ...wait };
 		sessionManager.appendCustomEntry(COMPACTION_WAIT_ENTRY_TYPE, { version: 1, ...recorded });
 		records.newest = recorded;
 	}
@@ -1153,7 +1155,7 @@ export class SessionMaintenance {
 				if (isRecordedCompactionWait(data)) {
 					newest = {
 						modelKey: data.modelKey,
-						entry: { tier: data.entry.tier, touchedAt: data.entry.touchedAt, ttlMs: data.entry.ttlMs },
+						entry: cacheEntryFigures(data.entry),
 						compactionId: data.compactionId,
 						leafId: data.leafId,
 					};

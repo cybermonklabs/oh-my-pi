@@ -32,6 +32,7 @@ import {
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
+import { NO_STRICT } from "@oh-my-pi/pi-ai/utils/schema/adapt";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import {
@@ -723,8 +724,9 @@ export class Agent {
 	 * active. Withdrawing such a tool beside an active one leaves the fingerprint as it was; it changes when the last
 	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
 	 * process's) leaves the declaration. Where the request sends no tool as strict ({@link #withholdsStrictTools}),
-	 * each tool counts as marked `strict: false`, so turning Claude Code's experimental-beta kill switch on or off
-	 * changes it. With `tools`, the fingerprint the request would declare with them in place of the active tools.
+	 * each tool counts as marked `strict: false`, so turning `PI_NO_STRICT` or Claude Code's experimental-beta kill
+	 * switch on or off changes it. With `tools`, the fingerprint the request would declare with them in place of the
+	 * active tools.
 	 */
 	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
@@ -812,27 +814,29 @@ export class Agent {
 	 * off), and under an owned dialect, which carries the tools in the prompt.
 	 */
 	#toolDeclaration(model: Model | undefined): RecordedToolDeclaration | undefined {
-		return model !== undefined &&
-			isAnthropicMessagesModel(model) &&
-			anthropicKeepsToolDeclaration(model) &&
-			!this.#ownedDialect(model)
+		const wireModel = this.#anthropicWireModel(model);
+		return wireModel && anthropicKeepsToolDeclaration(wireModel)
 			? latestToolDeclaration(this.#state.messages)
 			: undefined;
 	}
 
 	/**
-	 * Whether the next main request on `model` sends no tool as strict: on Anthropic, where the compat the request
-	 * goes out with disables strict tools ({@link withoutDisabledExperimentalBetas}: Claude Code's experimental-beta
-	 * kill switch, or a host whose compat rejects them); not under an owned dialect, which carries the tools in the
-	 * prompt.
+	 * Whether the next main request on `model` sends no tool as strict: on Anthropic, under `PI_NO_STRICT`
+	 * ({@link NO_STRICT}, the value the provider read when it loaded), or where the compat the request goes out with
+	 * disables strict tools ({@link withoutDisabledExperimentalBetas}: Claude Code's experimental-beta kill switch, or a
+	 * host whose compat rejects them); not under an owned dialect, which carries the tools in the prompt.
 	 */
 	#withholdsStrictTools(model: Model | undefined): boolean {
+		const wireModel = this.#anthropicWireModel(model);
 		return (
-			model !== undefined &&
-			isAnthropicMessagesModel(model) &&
-			withoutDisabledExperimentalBetas(model).compat.disableStrictTools === true &&
-			!this.#ownedDialect(model)
+			wireModel !== undefined &&
+			(NO_STRICT || withoutDisabledExperimentalBetas(wireModel).compat.disableStrictTools === true)
 		);
+	}
+
+	/** `model` when the next main request on it goes out on Anthropic's messages API, not under an owned dialect. */
+	#anthropicWireModel(model: Model | undefined): Model<"anthropic-messages"> | undefined {
+		return model !== undefined && isAnthropicMessagesModel(model) && !this.#ownedDialect(model) ? model : undefined;
 	}
 
 	/**

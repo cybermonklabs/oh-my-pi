@@ -4,7 +4,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -22,13 +22,6 @@ const MEMORY_OFF = `${LEARNING}memory:\n  backend: off\n`;
 
 /** {@link LEARNING} under the local memory backend, which offers the `learn` tool. */
 const LOCAL_MEMORY = `${LEARNING}memory:\n  backend: local\n`;
-
-/** The calls of the session a memory switch may start. */
-const RELOAD_CALLS: readonly OverlayRebuild[] = [
-	"refreshBaseSystemPrompt",
-	"reconcileBuiltinTools",
-	"holdToolDeclarationChange",
-];
 
 describe("a memory switch held on a bound prompt that enables a tool, switched back", () => {
 	afterEach(() => {

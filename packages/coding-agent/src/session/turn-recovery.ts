@@ -54,6 +54,7 @@ import type {
 } from "./agent-session-types";
 import {
 	assistantTurnProducedOutput,
+	type CustomMessage,
 	isEmptyAssistantStop,
 	isEmptyErrorTurn,
 	isUserAuthoredMessage,
@@ -3316,24 +3317,16 @@ export class TurnRecovery {
 	#maybeInjectThinkingLoopRedirect(id: number): void {
 		if (!AIError.is(id, AIError.Flag.ThinkingLoop)) return;
 		if (cfgModelLoopGuardEnabled.get(this.#host.settings) !== true) return;
-		// One timestamp for the message sent and the entry stored: a re-read names the same turn.
-		const timestamp = Date.now();
-		this.#host.agent.appendMessage({
+		const redirect: CustomMessage = {
 			role: "custom",
 			customType: THINKING_LOOP_REDIRECT_TYPE,
 			content: thinkingLoopRedirectTemplate,
 			display: false,
 			attribution: "agent",
-			timestamp,
-		});
-		this.#host.sessionManager.appendCustomMessageEntry(
-			THINKING_LOOP_REDIRECT_TYPE,
-			thinkingLoopRedirectTemplate,
-			false,
-			undefined,
-			"agent",
-			timestamp,
-		);
+			timestamp: Date.now(),
+		};
+		this.#host.agent.appendMessage(redirect);
+		this.#host.sessionManager.appendCustomMessage(redirect);
 	}
 	#maybeInjectMalformedFunctionCallRedirect(
 		id: number,

@@ -29,6 +29,7 @@ import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" w
 import ttsrWarningTemplate from "../prompts/system/ttsr-warning.md" with { type: "text" };
 import type { AgentSessionEvent } from "./agent-session-events";
 import { escapeHarnessTags } from "./harness-tags";
+import type { CustomMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
 import { TtsrToolInspector } from "./ttsr-outputs";
 
@@ -725,25 +726,17 @@ export class TtsrCoordinator {
 				const injection = this.#getInjectionContent();
 				if (injection) {
 					const details = { rules: injection.rules.map(rule => rule.name), matched: injection.matched };
-					// One timestamp for the message sent and the entry stored: a re-read names the same turn.
-					const timestamp = Date.now();
-					this.#host.agent.appendMessage({
+					const injected: CustomMessage = {
 						role: "custom",
 						customType: "ttsr-injection",
 						content: injection.content,
 						display: false,
 						details,
 						attribution: "agent",
-						timestamp,
-					});
-					this.#host.sessionManager.appendCustomMessageEntry(
-						"ttsr-injection",
-						injection.content,
-						false,
-						details,
-						"agent",
-						timestamp,
-					);
+						timestamp: Date.now(),
+					};
+					this.#host.agent.appendMessage(injected);
+					this.#host.sessionManager.appendCustomMessage(injected);
 					this.#markInjected(details.rules);
 				}
 				this.#host.scheduleAgentContinue({

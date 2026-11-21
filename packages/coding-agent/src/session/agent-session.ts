@@ -4948,17 +4948,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end") {
 			await messageEndPersistence;
 			if (this.#promptGeneration !== eventPromptGeneration) return;
-			if (interruptedThinkingMessage) {
-				this.sessionManager.appendCustomMessageEntry(
-					interruptedThinkingMessage.customType,
-					interruptedThinkingMessage.content,
-					interruptedThinkingMessage.display,
-					interruptedThinkingMessage.details,
-					interruptedThinkingMessage.attribution,
-					// The timestamp the agent sent it with: a re-read names the same turn.
-					interruptedThinkingMessage.timestamp,
-				);
-			}
+			if (interruptedThinkingMessage) this.sessionManager.appendCustomMessage(interruptedThinkingMessage);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -11280,16 +11270,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return outcome.sessionClaimed;
 			}
 			this.agent.appendMessage(normalizedAppMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				normalizedAppMessage.customType,
-				normalizedAppMessage.content,
-				normalizedAppMessage.display,
-				normalizedAppMessage.details,
-				normalizedAppMessage.attribution,
-				// Its own timestamp, as the default append below keeps one: the image clamp and the date/cwd reminder
-				// name the turn by it, and after a re-read they must find the turn the model was sent.
-				normalizedAppMessage.timestamp,
-			);
+			this.sessionManager.appendCustomMessage(normalizedAppMessage);
 			return false;
 		}
 

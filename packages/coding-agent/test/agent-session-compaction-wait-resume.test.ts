@@ -6,28 +6,25 @@
  * prompt sends.
  */
 import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
-import { SUMMARIZATION_SYSTEM_PROMPT } from "@oh-my-pi/pi-agent-core/compaction/utils";
-import type { AssistantMessage, UserMessage } from "@oh-my-pi/pi-ai";
-import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import {
-	answer,
 	continuesCachedPrompt,
-	GATEWAY,
 	gatewayModelsYml,
 	gatewaySessionOptions,
-	type MessagesRequest,
-	textOf,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
-import { asGlobalFetch } from "./helpers/fetch-mock";
+import {
+	processSettings,
+	recordGateway,
+	type SentRequest,
+	SUMMARY_COMPACTION_WAITS,
+	transcript,
+} from "./helpers/compaction-wait";
 
 /** A 400,000-token window: its prompt budget is far above the configured threshold, so no cut is forced. */
 const CONTEXT_WINDOW = 400_000;
@@ -39,13 +36,6 @@ const THRESHOLD_MARGIN = 2_000;
  */
 const BAND_MARGIN = 4_000;
 const HOUR_MS = 60 * 60_000;
-/** What the transcript's newest reply says its request sent, far below the context the next requests send. */
-const EARLIER_PROMPT_TOKENS = 1_000;
-const FILLER = "the quick brown fox jumps over the lazy dog. ".repeat(64);
-const TURNS = 64;
-
-/** The rule's answer for the model-summary compaction while it waits, as a timeline entry. */
-const SUMMARY_COMPACTION_WAITS = "cut rule: compaction-soft waits";
 
 /** The compaction threshold of each process around a restart, and when omp restarts. */
 interface RestartScenario {
@@ -81,13 +71,6 @@ const BAND_WITHOUT_A_WAIT: RestartScenario = {
 	resumedThreshold: contextTokens => contextTokens + BAND_MARGIN,
 };
 
-/** A request the gateway received: a main request for the prompt being sent, a summary request, or another. */
-interface SentRequest {
-	url: string;
-	body: MessagesRequest;
-	kind: "main" | "summary" | "other";
-}
-
 interface ProcessRun {
 	/** Every request the process sent, oldest first. */
 	requests: SentRequest[];
@@ -97,44 +80,6 @@ interface ProcessRun {
 	compacted: boolean;
 	/** The session file the process wrote. */
 	sessionFile: string;
-}
-
-/** The transcript a session was resumed with: 64 turns, ~90,000 tokens, whose newest reply sent a small prompt. */
-function transcript(): (UserMessage | AssistantMessage)[] {
-	const now = Date.now();
-	const messages: (UserMessage | AssistantMessage)[] = [];
-	for (let i = 0; i < TURNS; i++) {
-		messages.push({
-			role: "user",
-			content: [{ type: "text", text: `turn ${i}: ${FILLER}` }],
-			timestamp: now - 60_000,
-		});
-		const promptTokens = i === TURNS - 1 ? EARLIER_PROMPT_TOKENS : 0;
-		messages.push({
-			role: "assistant",
-			content: [{ type: "text", text: `reply ${i}: ${FILLER}` }],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "claude-opus-5-5",
-			stopReason: "stop",
-			usage: {
-				input: 0,
-				output: promptTokens > 0 ? 100 : 0,
-				cacheRead: promptTokens,
-				cacheWrite: 0,
-				totalTokens: promptTokens > 0 ? promptTokens + 100 : 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: now - 59_000,
-		});
-	}
-	return messages;
-}
-
-/** Whether `request` is the main request for `prompt`: its last message is the user's prompt. */
-function sendsPrompt(request: MessagesRequest, prompt: string): boolean {
-	const last = request.messages.at(-1);
-	return last?.role === "user" && textOf(last.content).includes(prompt);
 }
 
 describe("a model-summary compaction the cut rule waits on, across a restart", () => {
@@ -148,18 +93,6 @@ describe("a model-summary compaction the cut rule waits on, across a restart", (
 		for (const tempDir of tempDirs.splice(0)) await tempDir.remove();
 	});
 
-	/** The settings each process loads: summary compaction in the background over `thresholdTokens`. */
-	function processSettings(thresholdTokens: number): Settings {
-		return Settings.isolated({
-			"providers.cacheRetention": "long",
-			"compaction.methodOrder": ["soft"],
-			"compaction.asyncEnabled": true,
-			"compaction.autoContinue": false,
-			"compaction.keepRecentTokens": 4000,
-			"compaction.thresholdTokens": thresholdTokens,
-		});
-	}
-
 	/**
 	 * One process on `sessionManager`'s session: sends each prompt and lets its background summary settle before the
 	 * next one, then exits. Every request it sends is recorded; main requests are answered with a reply that wrote
@@ -172,44 +105,7 @@ describe("a model-summary compaction the cut rule waits on, across a restart", (
 		replyPromptTokens: number,
 		prompts: string[],
 	): Promise<ProcessRun> {
-		const requests: SentRequest[] = [];
-		const timeline: string[] = [];
-		let current = "";
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-			asGlobalFetch(async (input, init) => {
-				const url = String(input);
-				const body = JSON.parse(requestBodyText(init) ?? "{}") as MessagesRequest;
-				const kind = sendsPrompt(body, current)
-					? "main"
-					: textOf(body.system).includes(SUMMARIZATION_SYSTEM_PROMPT)
-						? "summary"
-						: "other";
-				requests.push({ url, body, kind });
-				timeline.push(`${kind} request`);
-				if (url !== `${GATEWAY}/v1/messages`) throw new Error(`Unexpected request to ${url}`);
-				return kind === "main"
-					? answer(requests.length, { cacheWriteTokens: replyPromptTokens })
-					: answer(requests.length);
-			}),
-		);
-		// The background summary logs when it arms or fails; each prompt waits for that before the next one.
-		let speculationSettled: (() => void) | undefined;
-		const debug = logger.debug.bind(logger);
-		const debugSpy = vi.spyOn(logger, "debug").mockImplementation((message, context) => {
-			if (message === "Context cut decision" && context) {
-				timeline.push(`cut rule: ${String(context.site)} ${String(context.reason)}`);
-			}
-			if (message === "Speculative compaction armed" || message === "Speculative compaction failed") {
-				speculationSettled?.();
-			}
-			return debug(message, context);
-		});
-		const settleSpeculation = async (session: AgentSession): Promise<void> => {
-			if (session.compactionSpeculation !== "running") return;
-			const settled = Promise.withResolvers<void>();
-			speculationSettled = settled.resolve;
-			await settled.promise;
-		};
+		const gateway = recordGateway(replyPromptTokens);
 		const authStorage = createInMemoryAuthStorage();
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const model = modelRegistry.find("anthropic", "claude-opus-5-5");
@@ -226,26 +122,20 @@ describe("a model-summary compaction the cut rule waits on, across a restart", (
 			skills: [],
 		});
 		try {
-			for (const prompt of prompts) {
-				current = prompt;
-				await session.prompt(prompt);
-				await session.waitForIdle();
-				await settleSpeculation(session);
-			}
+			for (const prompt of prompts) await gateway.send(session, prompt);
 			const sessionFile = sessionManager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected a persisted session");
 			await sessionManager.flush();
 			return {
-				requests,
-				timeline,
+				requests: gateway.requests,
+				timeline: gateway.timeline,
 				compacted: sessionManager.getBranch().some(entry => entry.type === "compaction"),
 				sessionFile,
 			};
 		} finally {
 			await session.dispose();
 			authStorage.close();
-			fetchSpy.mockRestore();
-			debugSpy.mockRestore();
+			gateway.restore();
 		}
 	}
 

@@ -322,15 +322,7 @@ export class IrcBridge {
 		}
 		if (this.#host.planModeEnabled()) {
 			this.#host.agent.appendMessage(record);
-			this.#host.sessionManager.appendCustomMessageEntry(
-				record.customType,
-				record.content,
-				record.display,
-				record.details,
-				record.attribution ?? "agent",
-				// The message's own time, which the record was sent with: a re-read names the same turn.
-				record.timestamp,
-			);
+			this.#host.sessionManager.appendCustomMessage(record);
 			return "injected";
 		}
 		this.#host.wakeForIrc([record]);

@@ -22,6 +22,7 @@ import {
 	mockGatewayFetch,
 	withoutCacheControl,
 } from "./helpers/anthropic-gateway";
+import { restoreEnvValue } from "./helpers/settings-test-state";
 
 const KILL_SWITCH = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS";
 
@@ -46,8 +47,7 @@ async function runProcess(
 	steps: (session: AgentSession) => Promise<void>,
 ): Promise<{ requests: MessagesRequest[]; sessionFile: string }> {
 	const previous = process.env[KILL_SWITCH];
-	if (inputs.killSwitch) process.env[KILL_SWITCH] = "1";
-	else delete process.env[KILL_SWITCH];
+	restoreEnvValue(KILL_SWITCH, inputs.killSwitch ? "1" : undefined);
 	const { requests, restore } = mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
 	const authStorage = createInMemoryAuthStorage();
 	try {
@@ -79,8 +79,7 @@ async function runProcess(
 	} finally {
 		authStorage.close();
 		restore();
-		if (previous === undefined) delete process.env[KILL_SWITCH];
-		else process.env[KILL_SWITCH] = previous;
+		restoreEnvValue(KILL_SWITCH, previous);
 	}
 }
 

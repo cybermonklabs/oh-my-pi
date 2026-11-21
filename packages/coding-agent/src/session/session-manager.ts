@@ -3836,6 +3836,22 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Append `message`, a custom message the agent was sent, as its entry ({@link appendCustomMessageEntry}). The entry
+	 * keeps the message's own timestamp: what names a turn by it (the image clamp, the date/cwd reminder) finds, after
+	 * a re-read, the same turn the model was sent.
+	 */
+	appendCustomMessage<T>(message: CustomMessage<T>): string {
+		return this.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution,
+			message.timestamp,
+		);
+	}
+
 	/** Append a TTSR injection entry recording which rules were injected. */
 	appendTtsrInjection(ruleNames: string[]): string {
 		const entry: TtsrInjectionEntry = {
