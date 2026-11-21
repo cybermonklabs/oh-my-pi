@@ -5,8 +5,11 @@
 //! - **Unix**: our end is non-blocking (it is ours alone: close-on-exec and
 //!   never handed to a child, so `O_NONBLOCK` on its open file description
 //!   affects nobody else). I/O that would wait registers the task's waker with
-//!   the process-wide readiness poller ([`ready::watch`]). The timer is a
-//!   `timerfd` (Linux) or a kqueue timer (BSD, macOS), watched the same way.
+//!   the process-wide readiness poller ([`ready::watch`]); on Linux a write to
+//!   a pipe that would wait is made by the end's own thread instead ([`Room`]),
+//!   which the kernel wakes once it fits, since a pipe that polls writable need
+//!   not have room for it. The timer is a `timerfd` (Linux) or a kqueue timer
+//!   (BSD, macOS), watched the same way.
 //! - **Windows**: anonymous pipes cannot do overlapped I/O, so a pump pipe is a
 //!   private named-pipe instance: our server end is overlapped, the child's
 //!   client end is an ordinary synchronous handle. Our end is bound to the
@@ -20,6 +23,7 @@
 //!   the task polling it.
 //!
 //! [`ready::watch`]: crate::sys::ready::watch
+//! [`Room`]: crate::sys::room::Room
 
 use std::{
 	fs, io,
@@ -75,6 +79,27 @@ impl OsPipe {
 	)]
 	pub fn available(&mut self) -> io::Result<usize> {
 		self.0.available()
+	}
+
+	/// Our end of a feed's pipe, which [`reclaim`] reads back through the
+	/// child's end `read`. Linux: a write that would wait is made by the end's
+	/// room thread only where a non-blocking description of `read` can be
+	/// opened now, through which [`reclaim`] drains the pipe while it finishes
+	/// that write; else the write waits for the pipe to poll writable.
+	#[cfg_attr(
+		not(any(target_os = "linux", target_os = "android")),
+		allow(
+			clippy::unused_self,
+			clippy::missing_const_for_fn,
+			clippy::needless_pass_by_ref_mut,
+			reason = "only Linux makes a room thread"
+		)
+	)]
+	pub fn for_reclaim(&mut self, read: &fs::File) {
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		self.0.for_reclaim(read);
+		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+		let _ = read;
 	}
 
 	/// Our end of a [`named_pipe`] the child reads, before there is data
@@ -145,6 +170,8 @@ mod imp {
 	};
 
 	use crate::sys::ready;
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	use crate::sys::room::Room;
 
 	/// Our non-blocking end of a pump pipe or socket pair.
 	pub struct OsPipe(pub(super) UnixEnd);
@@ -158,7 +185,27 @@ mod imp {
 		/// before the descriptor closes.
 		read_watch:  Option<ready::Watch>,
 		write_watch: Option<ready::Watch>,
+		/// Linux: the thread a write to a pipe that would wait is handed to,
+		/// made at the first such write.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		room:        RoomSlot,
+		/// Linux, a feed's end: a non-blocking description of the child's
+		/// end, through which [`reclaim`] drains the pipe while the room
+		/// thread finishes its write.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		drain:       Option<fs::File>,
 		file:        fs::File,
+	}
+
+	/// A write end's [`Room`], once a write waited.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	enum RoomSlot {
+		Unmade,
+		Made(Room),
+		/// Not a pipe (a socket pair end, whose writes take what fits, so
+		/// `POLLOUT` means what it says there), no room could be made, or a
+		/// feed's end whose pipe [`reclaim`] could not drain.
+		None,
 	}
 
 	pub fn pipe(child_reads: bool) -> io::Result<(OsPipe, fs::File)> {
@@ -201,7 +248,15 @@ mod imp {
 			if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
 				return Err(io::Error::last_os_error());
 			}
-			Ok(Self { read_watch: None, write_watch: None, file: fs::File::from(fd) })
+			Ok(Self {
+				read_watch: None,
+				write_watch: None,
+				#[cfg(any(target_os = "linux", target_os = "android"))]
+				room: RoomSlot::Unmade,
+				#[cfg(any(target_os = "linux", target_os = "android"))]
+				drain: None,
+				file: fs::File::from(fd),
+			})
 		}
 
 		pub fn poll_read(&mut self, cx: &Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
@@ -211,9 +266,99 @@ mod imp {
 		}
 
 		pub fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			if let Some(r) = self.poll_write_pipe(cx, buf) {
+				return r;
+			}
 			let Self { write_watch, file, .. } = self;
 			let fd = file.as_raw_fd();
 			poll_io(cx, fd, ready::WRITE, write_watch, || (&*file).write(buf))
+		}
+
+		/// Linux: a write to a pipe. One that would wait is made by the end's
+		/// room thread, which the kernel wakes once it fits: gVisor polls a
+		/// pipe writable whenever any byte fits, while a write of at most
+		/// `PIPE_BUF` bytes is atomic and fails with `EAGAIN` unless all of
+		/// it does, so a writer that waited for `POLLOUT` woke and failed over
+		/// and over. `None` where the end has no room: the write then waits
+		/// for `POLLOUT`.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn poll_write_pipe(
+			&mut self,
+			cx: &Context<'_>,
+			buf: &[u8],
+		) -> Option<Poll<io::Result<usize>>> {
+			if matches!(self.room, RoomSlot::Unmade) {
+				// Made at the end's first write that would wait.
+				loop {
+					match (&self.file).write(buf) {
+						Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+						Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+						r => return Some(Poll::Ready(r)),
+					}
+				}
+				self.room = Room::new(self.file.as_raw_fd()).map_or(RoomSlot::None, RoomSlot::Made);
+			}
+			let RoomSlot::Made(room) = &self.room else {
+				return None;
+			};
+			let file = &self.file;
+			Some(room.poll_write(cx, buf, |b| (&*file).write(b)))
+		}
+
+		/// See [`super::OsPipe::for_reclaim`].
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		pub fn for_reclaim(&mut self, read: &fs::File) {
+			use std::os::unix::fs::OpenOptionsExt;
+			self.drain = fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+				.open(format!("/proc/self/fd/{}", read.as_raw_fd()))
+				.ok();
+			if self.drain.is_none() {
+				self.room = RoomSlot::None;
+			}
+		}
+
+		/// Linux: finish the write of `held` the room thread may have in
+		/// hand, reading what the pipe holds into `back` meanwhile through
+		/// the drain, since that write is made only as the pipe empties; how
+		/// many bytes of `held` the thread made. With no write in hand the
+		/// thread makes one of `held` now, the same way, which changes
+		/// nothing for the bytes given back.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		fn settle(&self, held: &[u8], back: &mut Vec<u8>) -> usize {
+			let (RoomSlot::Made(room), Some(mut drain)) = (&self.room, self.drain.as_ref()) else {
+				return 0;
+			};
+			if held.is_empty() {
+				return 0;
+			}
+			let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+			let cx = Context::from_waker(&waker);
+			let mut buf = vec![0u8; 64 << 10];
+			loop {
+				if let Poll::Ready(r) =
+					room.poll_write(&cx, held, |_| Err(io::ErrorKind::WouldBlock.into()))
+				{
+					return r.map_or(0, |n| n.min(held.len()));
+				}
+				let mut took = false;
+				loop {
+					match drain.read(&mut buf) {
+						Ok(n) if n > 0 => {
+							back.extend_from_slice(&buf[..n]);
+							took = true;
+						},
+						Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+						_ => break,
+					}
+				}
+				if !took {
+					// Woken by the thread once the write is made.
+					std::thread::park_timeout(Duration::from_millis(10));
+				}
+			}
 		}
 
 		#[allow(
@@ -237,13 +382,33 @@ mod imp {
 	}
 
 	/// What a feed's pipe still holds, read through the child's end `read`
-	/// once our write end `pipe` is closed: the pipe's only writer is gone,
-	/// so the read ends at end of file instead of waiting.
-	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File) -> Vec<u8> {
-		drop(pipe);
+	/// once our write end `pipe` is closed (the pipe's only writer gone, the
+	/// read ends at end of file instead of waiting), then the bytes of `held`
+	/// (taken from the engine object for the pipe) the pipe never took.
+	/// Linux: a write of `held` the end's room thread may have in hand is
+	/// finished first ([`UnixEnd::settle`]), so the bytes it made come back
+	/// from the pipe, once and in order.
+	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
 		let mut back = Vec::new();
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		let made = pipe.as_ref().map_or(0, |p| p.0.settle(held, &mut back));
+		#[cfg(not(any(target_os = "linux", target_os = "android")))]
+		let made = 0;
+		drop(pipe);
 		let _ = read.read_to_end(&mut back);
+		back.extend_from_slice(&held[made..]);
 		back
+	}
+
+	/// Linux: a waker that unparks the thread that made it.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	struct Unpark(std::thread::Thread);
+
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	impl std::task::Wake for Unpark {
+		fn wake(self: std::sync::Arc<Self>) {
+			self.0.unpark();
+		}
 	}
 
 	/// Run `op` on the non-blocking `fd`; on `WouldBlock` register the
@@ -771,13 +936,15 @@ mod imp {
 	/// What a feed's pipe still holds, read through the child's end `read`
 	/// once our write end `pipe` is closed (at once: its write in flight is
 	/// cancelled, see [`WinEnd::close`]), followed by the part of that write
-	/// the pipe never took. With our end closed the read ends at end of file
-	/// instead of waiting.
-	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File) -> Vec<u8> {
+	/// the pipe never took, then the bytes of `held` (taken from the engine
+	/// object for the pipe, never written). With our end closed the read ends
+	/// at end of file instead of waiting.
+	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
 		let unsent = pipe.map_or_else(Vec::new, |p| p.0.close());
 		let mut back = Vec::new();
 		let _ = read.read_to_end(&mut back);
 		back.extend_from_slice(&unsent);
+		back.extend_from_slice(held);
 		back
 	}
 
@@ -1338,5 +1505,110 @@ mod imp {
 				st.owner_gone = true;
 			}
 		}
+	}
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod write_wait_tests {
+	use std::{
+		io::Read,
+		os::fd::AsRawFd,
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
+		task::{Context, Poll, Wake, Waker},
+		time::{Duration, Instant},
+	};
+
+	use super::{pipe, reclaim};
+
+	/// A waker that counts its wakes.
+	#[derive(Default)]
+	struct Count(AtomicUsize);
+
+	impl Wake for Count {
+		fn wake(self: Arc<Self>) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	// Failure mode: a pump write of at most `PIPE_BUF` bytes (atomic: all of
+	// it or `EAGAIN`) into a pipe with less room than that was woken as soon
+	// as the pipe polled writable. gVisor polls a pipe writable whenever any
+	// byte fits, so the pump retried, got `EAGAIN` and waited again at once,
+	// spinning a CPU for as long as the reader left less room than the write
+	// needed. The write must be made, and its task woken, only once it fits.
+	// The Linux kernel polls a pipe writable only when a page is free, so
+	// there the old wait did not wake early either.
+	#[test]
+	fn a_pump_write_that_does_not_fit_is_woken_only_once_its_room_comes() {
+		let (mut ours, mut theirs) = pipe(true).expect("a pump pipe the child reads");
+		// SAFETY: F_GETPIPE_SZ and sysconf only read.
+		let (size, page) = unsafe {
+			(libc::fcntl(theirs.as_raw_fd(), libc::F_GETPIPE_SZ), libc::sysconf(libc::_SC_PAGESIZE))
+		};
+		let (size, page) = (usize::try_from(size).unwrap(), usize::try_from(page).unwrap());
+		let count = Arc::new(Count::default());
+		let waker = Waker::from(Arc::clone(&count));
+		let cx = Context::from_waker(&waker);
+		// Every page in use, the last one 100 bytes full.
+		for _ in 1..size / page {
+			assert!(matches!(ours.poll_write(&cx, &vec![1u8; page]), Poll::Ready(Ok(n)) if n == page));
+		}
+		assert!(matches!(ours.poll_write(&cx, &[2u8; 100]), Poll::Ready(Ok(100))));
+		// A page-sized write does not fit, and waits.
+		let line = vec![3u8; page];
+		assert!(ours.poll_write(&cx, &line).is_pending(), "a page does not fit");
+		// The reader takes 50 bytes: room for page - 50 bytes, still not
+		// the page. Nothing may wake the write for this.
+		let mut some = [0u8; 50];
+		theirs.read_exact(&mut some).unwrap();
+		std::thread::sleep(Duration::from_millis(300));
+		assert_eq!(count.0.load(Ordering::SeqCst), 0, "woken before the room for the page came");
+		// The reader takes the rest of the first page: now it fits.
+		let mut rest = vec![0u8; page - 50];
+		theirs.read_exact(&mut rest).unwrap();
+		let deadline = Instant::now() + Duration::from_secs(30);
+		while count.0.load(Ordering::SeqCst) == 0 {
+			assert!(Instant::now() < deadline, "not woken within 30 s of the room coming");
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		assert!(matches!(ours.poll_write(&cx, &line), Poll::Ready(Ok(n)) if n == page));
+	}
+
+	// Failure mode: a feed given back while the end's room thread has a write
+	// of its held bytes in hand gives those bytes back twice: the thread makes
+	// them into the pipe as the give-back drains it, and they come back again
+	// as bytes the pipe never took.
+	#[test]
+	fn a_feed_given_back_with_a_write_in_hand_gives_each_byte_back_once() {
+		let (mut ours, theirs) = pipe(true).expect("a pump pipe the child reads");
+		ours.for_reclaim(&theirs);
+		let count = Arc::new(Count::default());
+		let waker = Waker::from(Arc::clone(&count));
+		let cx = Context::from_waker(&waker);
+		// Whole pages until one does not fit: that one is in the thread's
+		// hand, and the pump holds it.
+		let mut expected = Vec::new();
+		let mut held = None;
+		for i in 0..1024u32 {
+			let page = vec![u8::try_from(i % 250).unwrap() + 1; 4096];
+			match ours.poll_write(&cx, &page) {
+				Poll::Ready(Ok(4096)) => expected.extend_from_slice(&page),
+				Poll::Pending => {
+					held = Some(page);
+					break;
+				},
+				other => panic!("a page write: {other:?}"),
+			}
+		}
+		let held = held.expect("the pipe filled");
+		std::thread::sleep(Duration::from_millis(100));
+		assert_eq!(count.0.load(Ordering::SeqCst), 0, "the page was made with the pipe full");
+		let back = reclaim(Some(ours), &theirs, &held);
+		expected.extend_from_slice(&held);
+		assert_eq!(back.len(), expected.len(), "each byte once");
+		assert!(back == expected, "in order");
 	}
 }

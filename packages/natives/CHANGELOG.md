@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- On Linux under gVisor, the bash and zsh shells no longer spin a CPU while they feed a slow reader through their pump (a process substitution, a here-document, a pipe the bash tool mirrors as a pipe stream): a write the pipe cannot take now is made by a thread of the pipe's own, which the kernel wakes once the write fits, where the pump retried it each time the pipe had room for any byte.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
