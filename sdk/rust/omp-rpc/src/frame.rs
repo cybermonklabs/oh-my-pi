@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::deep::{self, dispose};
+use crate::deep::{self, drop_deep};
 
 /// Physical stdout frame limit a v2 server must advertise.
 pub(crate) const MAX_FRAME_BYTES: i64 = 1024 * 1024;
@@ -34,11 +34,11 @@ impl FrameDecoder {
 	pub(crate) fn push(&mut self, value: Value) -> Result<Option<Value>, String> {
 		if value.get("type").and_then(Value::as_str) != Some("rpc_chunk") {
 			if self.pending.is_some() {
-				dispose(value);
+				drop_deep(value);
 				return Err("RPC chunk sequence was interrupted".to_owned());
 			}
 			if !value.is_object() {
-				dispose(value);
+				drop_deep(value);
 				return Err("RPC frame must be a JSON object".to_owned());
 			}
 			return Ok(Some(value));
@@ -110,7 +110,7 @@ impl FrameDecoder {
 		let frame = deep::parse(text.as_bytes())
 			.map_err(|_| "Failed to decode reassembled RPC frame".to_owned())?;
 		if !frame.is_object() {
-			dispose(frame);
+			drop_deep(frame);
 			return Err("RPC frame must be a JSON object".to_owned());
 		}
 		Ok(Some(frame))

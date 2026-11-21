@@ -3440,7 +3440,7 @@ pub struct SessionEntries {
 /// Raw session tree roots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTree {
-	pub tree: Vec<Map<String, Value>>,
+	pub tree: crate::DeepJson<Vec<Map<String, Value>>>,
 	#[serde(rename = "leafId", deserialize_with = "Deserialize::deserialize")]
 	pub leaf_id: Option<String>,
 }

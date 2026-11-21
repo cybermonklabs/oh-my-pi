@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-	deep::{self, dispose},
+	deep::{self, SERDE_JSON_MAX_DEPTH, drop_deep, nests_deeper_than},
 	frame::{FrameDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES},
 	host_tool::{HostTool, HostToolContext, text_payload},
 	host_uri::{HostUri, HostUriContext, uri_scheme},
@@ -118,7 +118,11 @@ pub enum Event {
 	/// Unsolicited frame; unrecognized types arrive as
 	/// [`RpcNotification::Unknown`].
 	Notification(RpcNotification),
-	/// A response whose id matched no pending call.
+	/// A response whose id matched no pending call (one that timed out, among
+	/// others). Its `data` is `None` when it nested deeper than `serde_json`
+	/// reads (128 levels), as a long session's `get_tree` answer does: such a
+	/// value is dropped with [`drop_deep`](crate::drop_deep), since dropping it
+	/// by recursion would overflow the stack.
 	UnmatchedResponse(RpcResponse),
 	/// A known frame type whose payload failed to decode.
 	Undecodable { raw: Value, error: String },
@@ -428,9 +432,9 @@ impl Shared {
 				{
 					let _ = waiter.send(Err(Error::Json(error)));
 					if let Some(data) = data {
-						dispose(data);
+						drop_deep(data);
 					}
-					dispose(frame);
+					drop_deep(frame);
 					return;
 				}
 				if let (Some(data), Some(members)) = (data, frame.as_object_mut()) {
@@ -450,11 +454,18 @@ impl Shared {
 		};
 		let event = match decoded {
 			RpcServerFrame::Response(mut response) => {
-				response.data = data;
-				match self.response(response) {
-					Some(response) => Event::UnmatchedResponse(response),
-					None => return,
+				// `data: null` decodes as no data, as serde decodes it.
+				response.data = data.filter(|data| !data.is_null());
+				let Some(mut response) = self.response(response) else {
+					return;
+				};
+				if let Some(data) = response
+					.data
+					.take_if(|data| nests_deeper_than(data, SERDE_JSON_MAX_DEPTH))
+				{
+					drop_deep(data);
 				}
+				Event::UnmatchedResponse(response)
 			},
 			// Host tool and URI frames were consumed above; only malformed ones get here.
 			RpcServerFrame::RpcHostRequest(_) => return,
@@ -465,10 +476,11 @@ impl Shared {
 			RpcServerFrame::Unknown(raw) => Event::Notification(RpcNotification::Unknown(raw)),
 		};
 		// The host may drop the receiver; keep serving calls.
-		if let Err(mpsc::SendError(Event::UnmatchedResponse(RpcResponse { data: Some(data), .. }))) =
-			events.send(event)
+		if let Err(mpsc::SendError(Event::UnmatchedResponse(RpcResponse {
+			data: Some(data), ..
+		}))) = events.send(event)
 		{
-			dispose(data);
+			drop_deep(data);
 		}
 	}
 
@@ -482,7 +494,7 @@ impl Shared {
 					waiter.send(Ok(response))
 				{
 					drop(state);
-					dispose(data);
+					drop_deep(data);
 				}
 				return None;
 			}
@@ -972,6 +984,11 @@ impl Client {
 			Ok(response) => response?,
 			Err(RecvTimeoutError::Timeout) => {
 				self.shared.state().pending.remove(id);
+				// A response the reader sent just before the entry went is still
+				// in the channel: drop its data with the loop, not by recursion.
+				if let Ok(Ok(RpcResponse { data: Some(data), .. })) = rx.try_recv() {
+					drop_deep(data);
+				}
 				return Err(Error::Timeout { command: command.to_owned() });
 			},
 			Err(RecvTimeoutError::Disconnected) => return Err(Error::Closed),

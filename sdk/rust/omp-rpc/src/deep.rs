@@ -4,24 +4,62 @@
 //! another and dropping one both recurse once per level, which overflows the
 //! stack long before the tree of a long session ends: `get_tree` nests each
 //! entry two levels under its parent. [`parse`] builds a value on a stack of
-//! its own, [`dispose`] drops one the same way, and [`Detached`] moves a parsed
-//! value into a result field instead of rebuilding it.
+//! its own, [`drop_deep`] drops one the same way, [`DeepJson`] holds a decoded
+//! value that drops with that loop, and [`Detached`] moves a parsed value into
+//! a result field instead of rebuilding it.
 
-use serde::de::Error as _;
+use std::{
+	fmt,
+	ops::{Deref, DerefMut},
+};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::{Map, Value};
 
-/// `serde_json::from_slice::<Value>(text)`, also for text nested deeper than
-/// it reads. Scalars and member names are still read by `serde_json`.
+/// `serde_json::from_slice::<Value>(text)`, also for a response frame that
+/// nests deeper than it reads, but only in its `data`: the client moves a
+/// response's `data` into its result without recursion, while decoding any
+/// other value copies it by recursion, so text that nests that deep elsewhere
+/// fails as `serde_json` fails it. Scalars and member names are still read by
+/// `serde_json`.
 pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
-	match serde_json::from_slice(text) {
-		Ok(value) => Ok(value),
-		// Text it refuses for another reason fails the deep parse too.
-		Err(error) => parse_deep(text).map_err(|_| error),
+	let error = match serde_json::from_slice(text) {
+		Ok(value) => return Ok(value),
+		Err(error) => error,
+	};
+	// Text it refuses for another reason fails the deep parse too.
+	let Ok(value) = parse_deep(text) else {
+		return Err(error);
+	};
+	if is_deep_only_in_data(&value) {
+		Ok(value)
+	} else {
+		drop_deep(value);
+		Err(error)
 	}
 }
 
+/// Whether `value` is a response frame whose members other than `data` nest
+/// no deeper than `serde_json` reads.
+fn is_deep_only_in_data(value: &Value) -> bool {
+	let Some(members) = value.as_object() else {
+		return false;
+	};
+	members.get("type").and_then(Value::as_str) == Some("response")
+		&& members
+			.iter()
+			.all(|(key, member)| key == "data" || !nests_deeper_than(member, SERDE_JSON_MAX_DEPTH - 1))
+}
+
 /// Drops `value` without recursing into it.
-pub(crate) fn dispose(value: Value) {
+///
+/// Dropping a [`Value`] the ordinary way recurses once per level of nesting,
+/// so a value nested tens of thousands of levels deep overflows the thread's
+/// stack and aborts the process. `get_tree` nests each session entry two
+/// levels under its parent: give each root of a long session's tree here
+/// (`drop_deep(Value::Object(root))`), or each node you take apart, instead of
+/// letting the tree go out of scope.
+pub fn drop_deep(value: Value) {
 	let mut pending = vec![value];
 	while let Some(value) = pending.pop() {
 		match value {
@@ -29,6 +67,117 @@ pub(crate) fn dispose(value: Value) {
 			Value::Object(members) => pending.extend(members.into_iter().map(|(_, member)| member)),
 			_ => {},
 		}
+	}
+}
+
+/// How many levels of arrays and objects `serde_json` reads and decodes at
+/// most.
+pub(crate) const SERDE_JSON_MAX_DEPTH: usize = 128;
+
+/// Whether `value` nests more than `levels` levels of arrays and objects.
+pub(crate) fn nests_deeper_than(value: &Value, levels: usize) -> bool {
+	let mut pending = vec![(value, 1)];
+	while let Some((value, depth)) = pending.pop() {
+		match value {
+			Value::Array(_) | Value::Object(_) if depth > levels => return true,
+			Value::Array(items) => pending.extend(items.iter().map(|item| (item, depth + 1))),
+			Value::Object(members) => {
+				pending.extend(members.values().map(|member| (member, depth + 1)));
+			},
+			_ => {},
+		}
+	}
+	false
+}
+
+/// A raw JSON shape a [`DeepJson`] holds: a [`Value`], a `Map<String, Value>`,
+/// or a `Vec` or `Option` of one.
+pub trait DeepJsonValue: Default {
+	/// `self` as one JSON value, which [`drop_deep`] takes apart.
+	fn into_value(self) -> Value;
+}
+
+impl DeepJsonValue for Value {
+	fn into_value(self) -> Value {
+		self
+	}
+}
+
+impl DeepJsonValue for Map<String, Value> {
+	fn into_value(self) -> Value {
+		Value::Object(self)
+	}
+}
+
+impl<T: DeepJsonValue> DeepJsonValue for Vec<T> {
+	fn into_value(self) -> Value {
+		Value::Array(self.into_iter().map(T::into_value).collect())
+	}
+}
+
+impl<T: DeepJsonValue> DeepJsonValue for Option<T> {
+	fn into_value(self) -> Value {
+		self.map_or(Value::Null, T::into_value)
+	}
+}
+
+/// JSON that may nest deeper than a thread's stack can drop by recursion, as
+/// the `get_tree` answer of a long session does (`SessionTree::tree`). It
+/// reads as the `T` it derefs to, serializes and deserializes as `T`, and
+/// drops its value with [`drop_deep`]'s loop. [`into_inner`](Self::into_inner)
+/// takes the value out; give that to [`drop_deep`] when done, or take it
+/// apart. `Debug`, `Clone`, `PartialEq` and `Serialize` work on the value as
+/// `T`'s do, and recurse as they do.
+#[derive(Clone, PartialEq)]
+pub struct DeepJson<T: DeepJsonValue>(T);
+
+impl<T: DeepJsonValue> DeepJson<T> {
+	/// Holds `value`.
+	pub fn new(value: T) -> Self {
+		Self(value)
+	}
+
+	/// The value, which drops by recursion unless given to [`drop_deep`].
+	pub fn into_inner(mut self) -> T {
+		std::mem::take(&mut self.0)
+	}
+}
+
+impl<T: DeepJsonValue> Deref for DeepJson<T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.0
+	}
+}
+
+impl<T: DeepJsonValue> DerefMut for DeepJson<T> {
+	fn deref_mut(&mut self) -> &mut T {
+		&mut self.0
+	}
+}
+
+impl<T: DeepJsonValue> Drop for DeepJson<T> {
+	fn drop(&mut self) {
+		drop_deep(std::mem::take(&mut self.0).into_value());
+	}
+}
+
+impl<T: DeepJsonValue + fmt::Debug> fmt::Debug for DeepJson<T> {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Debug::fmt(&self.0, formatter)
+	}
+}
+
+impl<T: DeepJsonValue + Serialize> Serialize for DeepJson<T> {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		self.0.serialize(serializer)
+	}
+}
+
+impl<'de, T: DeepJsonValue + Deserialize<'de>> Deserialize<'de> for DeepJson<T> {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		T::deserialize(deserializer).map(Self)
 	}
 }
 
@@ -53,7 +202,7 @@ fn parse_deep(text: &[u8]) -> Result<Value, serde_json::Error> {
 	let parsed = parse_into(text, &mut open);
 	// Left open by an error: their members may nest deep.
 	while let Some(container) = open.pop() {
-		dispose(container.into_value());
+		drop_deep(container.into_value());
 	}
 	parsed
 }
@@ -96,7 +245,7 @@ fn parse_into(text: &[u8], open: &mut Vec<Open>) -> Result<Value, serde_json::Er
 			let Some(container) = open.last_mut() else {
 				at = skip_space(text, at);
 				if at != text.len() {
-					dispose(value);
+					drop_deep(value);
 					return Err(syntax_error(text, at));
 				}
 				return Ok(value);
@@ -149,10 +298,15 @@ fn scalar_end(text: &[u8], at: usize) -> Result<usize, serde_json::Error> {
 		return string_end(text, at);
 	}
 	let mut end = at;
-	while matches!(text.get(end), Some(b'-' | b'+' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')) {
+	while matches!(text.get(end), Some(b'-' | b'+' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'))
+	{
 		end += 1;
 	}
-	if end == at { Err(syntax_error(text, at)) } else { Ok(end) }
+	if end == at {
+		Err(syntax_error(text, at))
+	} else {
+		Ok(end)
+	}
 }
 
 /// End of the string at `at`, past its closing quote.
@@ -237,7 +391,9 @@ impl<T: RawJson> RawJson for Vec<T> {
 	const EXPECTED: &'static str = "an array";
 
 	fn fits(value: &Value) -> bool {
-		value.as_array().is_some_and(|items| items.iter().all(T::fits))
+		value
+			.as_array()
+			.is_some_and(|items| items.iter().all(T::fits))
 	}
 
 	fn take(value: Value) -> Self {
@@ -256,7 +412,23 @@ impl<T: RawJson> RawJson for Option<T> {
 	}
 
 	fn take(value: Value) -> Self {
-		if value.is_null() { None } else { Some(T::take(value)) }
+		if value.is_null() {
+			None
+		} else {
+			Some(T::take(value))
+		}
+	}
+}
+
+impl<T: DeepJsonValue + RawJson> RawJson for DeepJson<T> {
+	const EXPECTED: &'static str = T::EXPECTED;
+
+	fn fits(value: &Value) -> bool {
+		T::fits(value)
+	}
+
+	fn take(value: Value) -> Self {
+		Self(T::take(value))
 	}
 }
 
@@ -292,7 +464,7 @@ impl Detached {
 			return Ok(());
 		};
 		if !T::fits(&value) {
-			dispose(value);
+			drop_deep(value);
 			return Err(serde_json::Error::custom(format_args!(
 				"invalid type for `{key}`: expected {}",
 				T::EXPECTED
@@ -305,7 +477,7 @@ impl Detached {
 
 impl Drop for Detached {
 	fn drop(&mut self) {
-		self.0.drain(..).flatten().for_each(dispose);
+		self.0.drain(..).flatten().for_each(drop_deep);
 	}
 }
 
@@ -329,8 +501,18 @@ mod tests {
 			assert_eq!(parse_deep(text.as_bytes()).unwrap(), expected, "{text}");
 		}
 		for text in [
-			"[1,]", r#"{"a"}"#, r#"{"a":1,}"#, "[1 2]", "{a:1}", "[", "", "1 2", "[01]", "tru",
-			r#"{"a":1}x"#, "\"\u{1}\"",
+			"[1,]",
+			r#"{"a"}"#,
+			r#"{"a":1,}"#,
+			"[1 2]",
+			"{a:1}",
+			"[",
+			"",
+			"1 2",
+			"[01]",
+			"tru",
+			r#"{"a":1}x"#,
+			"\"\u{1}\"",
 		] {
 			assert!(parse_deep(text.as_bytes()).is_err(), "{text}");
 		}
@@ -341,16 +523,32 @@ mod tests {
 		let depth = 200_000;
 		let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
 		assert!(serde_json::from_str::<Value>(&text).is_err());
-		let mut value = parse(text.as_bytes()).unwrap();
+		let mut value = parse_deep(text.as_bytes()).unwrap();
 		let mut levels = 0;
 		while let Value::Array(mut items) = value {
 			levels += 1;
 			value = items.pop().unwrap_or(Value::Null);
 		}
 		assert_eq!(levels, depth);
-		dispose(parse(text.as_bytes()).unwrap());
+		drop_deep(parse_deep(text.as_bytes()).unwrap());
 		// An error after a deep member disposes of what it built.
 		let broken = format!("[{}{},x]", "[".repeat(depth), "]".repeat(depth));
-		assert!(parse(broken.as_bytes()).is_err());
+		assert!(parse_deep(broken.as_bytes()).is_err());
+	}
+
+	#[test]
+	fn parses_deeper_than_serde_json_only_in_the_data_of_a_response() {
+		let depth = 200_000;
+		let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+		let response =
+			format!(r#"{{"type":"response","command":"get_tree","success":true,"data":{deep}}}"#);
+		drop_deep(parse(response.as_bytes()).unwrap());
+		for text in [
+			deep.clone(),
+			format!(r#"{{"type":"big","pad":{deep}}}"#),
+			format!(r#"{{"type":"response","command":"get_tree","success":false,"error":{deep}}}"#),
+		] {
+			assert!(parse(text.as_bytes()).is_err());
+		}
 	}
 }

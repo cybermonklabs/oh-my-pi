@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Rust SDK: `SessionTree::tree` is a `DeepJson<Vec<Map<String, Value>>>`, which derefs to the list of roots and drops a tree of any depth without overflowing the stack; take the list out with `into_inner()` and drop it with `drop_deep`
+
 ### Changed
 
 - A resumed session keeps in memory only the entries since its latest compaction: older message bodies, tool results and summaries wait in a temporary file and are read back when something asks for them, so long sessions take far less memory

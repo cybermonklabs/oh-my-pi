@@ -16,7 +16,8 @@
  * - unions without a discriminator → enums decoded by trying members in order
  *   (untagged serde enums for unions of inline types such as `MessageContent`)
  * - `x-unknown-fallback` fields → `OrUnknown<T>` (raw JSON + error when `T` fails);
- *   `x-scalar-or-array` fields also accept a bare scalar as a one-element list
+ *   `x-scalar-or-array` fields also accept a bare scalar as a one-element list;
+ *   `x-deep-json` fields (raw JSON only) → `DeepJson<T>`, which drops its value with a loop
  * - commands → `<Name>Command` structs implementing the `Command` trait; a result's
  *   raw JSON members (`Value`, `Map<String, Value>`, or a `Vec`/`Option` of one) are
  *   moved into their fields rather than rebuilt through serde, which recurses once
@@ -414,7 +415,7 @@ class RustEmitter {
 			const owner = `${def.name}${pascal(field.key)}`;
 			const inner = nonNull(field.type);
 			const nullable = inner !== undefined;
-			if (def.open && (field.unknownFallback || field.scalarOrArray)) {
+			if (def.open && (field.unknownFallback || field.scalarOrArray || field.deepJson)) {
 				throw new Error(
 					`${def.name}.${field.key}: open records decode leniently; fallback keywords are unsupported`,
 				);
@@ -424,6 +425,12 @@ class RustEmitter {
 				this.#helpers.add("orUnknown");
 				const known = `OrUnknown<${this.render(inner ?? field.type, owner)}>`;
 				base = nullable ? `Option<${known}>` : known;
+			}
+			if (field.deepJson) {
+				if (!this.#isRawJson(field.type) || field.unknownFallback || field.scalarOrArray) {
+					throw new Error(`${def.name}.${field.key}: x-deep-json needs a raw JSON field without other keywords`);
+				}
+				base = `crate::DeepJson<${base}>`;
 			}
 			const attrs: string[] = [];
 			if (field.key !== name.replace(/^r#/, "")) attrs.push(`rename = ${str(field.key)}`);
