@@ -103,9 +103,13 @@ describe("a memory backend switch held on a bound prompt when the process exits"
 			await session.settleMemoryBackend();
 		});
 		// What a session on memory off sends: the prompt the held rebuild commits.
-		const fresh = await runProcess(dir, MEMORY_OFF, undefined, session => session.prompt("a fresh session"));
+		const fresh = await runProcess(dir, MEMORY_OFF, undefined, async session => {
+			await session.prompt("a fresh session");
+		});
 		// The session is resumed at once, its cache entry warm, with memory off.
-		const resumed = await runProcess(dir, MEMORY_OFF, live.sessionFile, session => session.prompt("second"));
+		const resumed = await runProcess(dir, MEMORY_OFF, live.sessionFile, async session => {
+			await session.prompt("second");
+		});
 
 		const [first] = live.requests;
 		const [rebuilt] = fresh.requests;
