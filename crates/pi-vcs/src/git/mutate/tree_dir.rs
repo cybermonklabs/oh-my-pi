@@ -292,8 +292,9 @@ pub enum Reached {
 	/// in, and that still holds entries (`ENOTEMPTY`): an NFS client's
 	/// `.nfs…` name for a file still open, or an entry made meanwhile.
 	EntriesLeftInTheDirectory,
-	/// The entry is a directory the emptying emptied before a filesystem was
-	/// mounted on it; nothing on that filesystem was touched.
+	/// The entry is a directory a filesystem was mounted on after the
+	/// emptying opened it: the emptying emptied it through that descriptor,
+	/// and nothing on the mounted filesystem was touched.
 	EmptiedUnderAMount,
 	/// The stop names no entry.
 	NoEntry,
@@ -318,8 +319,9 @@ impl Reached {
 				 or an entry made meanwhile); what the emptying reached before it is gone"
 			},
 			Self::EmptiedUnderAMount => {
-				"The directory under that mount was emptied before the mount was made, and nothing on \
-				 the mounted filesystem was touched; what the emptying reached before it is gone"
+				"That directory was emptied through the descriptor the emptying opened before a \
+				 filesystem was mounted on it, and nothing on the mounted filesystem was touched; what \
+				 the emptying reached before it is gone"
 			},
 			Self::NoEntry => "What the emptying reached before it stopped is gone",
 		}
@@ -943,7 +945,11 @@ mod tests {
 		let left = Reached::EntriesLeftInTheDirectory.sentence();
 		assert!(left.contains("still holds entries") && !left.contains("emptied"), "{left}");
 		let mount = Reached::EmptiedUnderAMount.sentence();
-		assert!(mount.contains("nothing on the mounted filesystem was touched"), "{mount}");
+		assert!(
+			mount.contains("opened before a filesystem was mounted on it")
+				&& mount.contains("nothing on the mounted filesystem was touched"),
+			"{mount}"
+		);
 	}
 
 	/// A symlink to a directory is not opened as the tree's root (under gVisor

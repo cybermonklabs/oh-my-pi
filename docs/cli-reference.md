@@ -384,7 +384,7 @@ still open, an `EBUSY` from a FUSE daemon or an SMB server), stops the emptying
 there: the message names the entry and the error and says what the emptying did
 there (nothing, or a directory emptied and not removed, or one still holding
 entries it did not remove, or one a filesystem was mounted on after it was
-emptied), what the emptying reached before it is gone, and the registration
+opened), what the emptying reached before it is gone, and the registration
 stays. Symlinks in the tree are removed, never followed. A tree more than 256
 directories deep is refused. Everything else the registration and the tree hold
 goes with them: any file written into the tree after the add stopped, anything
