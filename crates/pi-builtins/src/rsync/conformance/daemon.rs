@@ -48,9 +48,19 @@ impl Daemon {
 		fs::write(&secrets, "alice:sekrit\n").unwrap();
 		fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
 		fs::write(dir.join("motd"), MOTD).unwrap();
+		// Started by root, rsyncd runs each module's transfers as the user and
+		// group `nobody` unless `uid` and `gid` name others (rsync 3.5.1,
+		// clientserver.c, rsync_module): `nobody` can write nothing in `rw` and
+		// read none of the fixture's 0600 and 0700 entries, so every transfer
+		// would end with code 23 on both clients. As root the transfers keep
+		// root's ids, as a daemon any other user starts keeps that user's. Only
+		// root names a `gid`: rsyncd calls setgroups(2) for it, which fails for
+		// any other user.
+		let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
+		let ids = if uid.is_root() { format!("uid = {uid}\ngid = {gid}\n") } else { String::new() };
 		let (d, w) = (dir.display(), w.display());
 		let conf = format!(
-			"pid file = {d}/pid\nlog file = {d}/log\nmotd file = {d}/motd\nuse chroot = no\n\
+			"{ids}pid file = {d}/pid\nlog file = {d}/log\nmotd file = {d}/motd\nuse chroot = no\n\
 			 munge symlinks = no\n\n\
 			 [rw]\n\tpath = {w}/rw\n\tcomment = read-write module\n\tread only = no\n\n\
 			 [ro]\n\tpath = {w}/src\n\tcomment = read-only module\n\n\
