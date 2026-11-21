@@ -22,7 +22,9 @@ use uucore::{
 };
 
 use crate::{
-	file_backup::{backup_display, backup_path, determine_backup_mode, determine_backup_suffix},
+	file_backup::{
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
+	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
 };
 
@@ -515,8 +517,33 @@ fn link(host: &mut Host, src: &Path, dst: &Path, settings: &Settings) -> LnResul
 	};
 
 	if filesystem.is_symlink(&dst_fs) || filesystem.exists(&dst_fs) {
-		// Probe numbered backups from the resolved destination.
-		backup = backup_path(&filesystem, settings.backup, &dst_fs, &settings.suffix);
+		// Probe numbered backups from the resolved destination. GNU ln renames
+		// the backup with replacement, so an entry at a long name's `~` name
+		// is replaced; one that is the destination itself is refused.
+		backup = backup_path(&filesystem, settings.backup, &dst_fs, &settings.suffix, false)
+			.map_err(|_| LnError::Message(format!("cannot backup {}: File exists", dst.quote())))?;
+		// The backup must not replace the source the link is made to: for
+		// a hard link the file at `src`, for a symbolic one the entry its
+		// target names from the link's directory. GNU ln does not check
+		// this (`ln.c` renames with a plain `renameat`) and loses the
+		// source's contents in `ln -b dest~ dest`; this refuses it, as GNU
+		// mv and cp refuse their own.
+		if let Some(backup) = &backup {
+			let (linked, follow) = if settings.symbolic {
+				let at = parent_path(&dst_fs).unwrap_or(Path::new("."));
+				(Cow::Owned(at.join(&*source)), false)
+			} else {
+				(Cow::Borrowed(src_fs.as_path()), settings.logical)
+			};
+			if backup_is_source(&filesystem, &linked, follow, backup) {
+				return Err(LnError::Message(format!(
+					"backing up {} might destroy source;  {} not linked",
+					dst.quote(),
+					src.quote()
+				))
+				.into());
+			}
+		}
 		if settings.backup == BackupMode::Existing && !settings.symbolic {
 			// when ln --backup f f, it should detect that it is the same file
 			if paths_refer_to_same_file(&filesystem, &src_fs, &dst_fs) {

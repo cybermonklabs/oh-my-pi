@@ -12,7 +12,7 @@ use std::{
 
 #[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use clap::ArgMatches;
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 use pi_vfs::normalize_lexically;
 use pi_vfs::{BlockingFs, child_path, file_name, parent_path, with_file_name};
 use uucore::backup_control::BackupMode;
@@ -92,6 +92,11 @@ pub(crate) fn determine_backup_suffix(matches: &ArgMatches, host: &Host) -> Stri
 	}
 }
 
+/// A backup that must not be made, as [`backup_path`] says. Its callers
+/// report GNU's `cannot backup 'D': File exists`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BackupExists;
+
 /// The backup name for `path` under `mode`, as gnulib's `backupfile.c`
 /// chooses it. A numbered backup is `name.~N~` with N one past the highest
 /// version among the entries of `path`'s directory: every entry `name.~N~`
@@ -100,23 +105,35 @@ pub(crate) fn determine_backup_suffix(matches: &ArgMatches, host: &Host) -> Stri
 /// no version overflows. `existing` numbers when the listing shows a
 /// numbered backup, and uses `suffix` otherwise, also when the directory
 /// cannot be listed. A numbered name that is new, or longer than every one
-/// listed, and too long for the directory gives way to a name ending in `~`
-/// ([`fit_name`]).
+/// listed, and the simple name `existing` falls back to, give way to a name
+/// ending in `~` when too long for the directory ([`fallback_name`]).
+///
+/// `Err(BackupExists)` where that `~` name must not be taken:
+/// - It is `path` itself (a name ending in `~`, cut to fit): the rename
+///   would leave `path` in place and the caller then replace it, so no
+///   backup is kept. GNU's mv and cp refuse it in a numbered mode; in a
+///   simple one, and in ln, GNU 9.4 and 9.7 lose the old contents with
+///   status 0 (cp fails, keeping them).
+/// - `exclusive`, in a numbered mode, and an entry holds it: GNU's mv and cp
+///   rename a numbered backup without replacing (`RENAME_NOREPLACE`) and fail
+///   `EEXIST` on the `~` name. GNU's ln replaces it; its callers pass
+///   `exclusive` false.
 ///
 /// A listing that fails, or ends early with an error, may miss an entry at
 /// the numbered name it gives, so that name is then confirmed free by
-/// `lstat`, from its version upward, and the backup never lands on an entry.
-/// GNU instead renames without replacing and lists again: where the
-/// directory cannot be listed, mv and cp then retry `name.~1~` without end,
-/// and ln replaces it. In a numbered mode GNU also renames the `~` name
-/// without replacing, and fails when an entry holds it; here the backup
-/// replaces that entry, as a simple backup does.
+/// `lstat`, from its version upward. That check and the caller's rename are
+/// two steps, and the rename replaces an entry made between them, as it does
+/// after a complete listing; GNU closes that gap by renaming without
+/// replacing and listing again. Where the directory cannot be listed, GNU
+/// 9.4 and 9.7's mv and cp retry `name.~1~` without end (gnulib fe173e9544
+/// makes them fail with `EEXIST`), and their ln replaces it.
 pub(crate) fn backup_path(
 	filesystem: &BlockingFs,
 	mode: BackupMode,
 	path: &Path,
 	suffix: impl AsRef<OsStr>,
-) -> Option<PathBuf> {
+	exclusive: bool,
+) -> Result<Option<PathBuf>, BackupExists> {
 	let simple = |suffix: &OsStr| {
 		let mut name = file_name(path).unwrap_or_default().into_owned();
 		name.push(suffix);
@@ -127,16 +144,15 @@ pub(crate) fn backup_path(
 		simple(OsStr::new(&format!(".~{version}~")))
 	};
 	match mode {
-		BackupMode::None => return None,
-		BackupMode::Simple => return Some(simple(suffix.as_ref())),
+		BackupMode::None => return Ok(None),
+		BackupMode::Simple => return Ok(Some(simple(suffix.as_ref()))),
 		BackupMode::Existing | BackupMode::Numbered => {},
 	}
 	let listing = list_backups(filesystem, path);
 	let mut version = match &listing.highest {
 		Some(highest) => next_version(highest),
-		None if mode == BackupMode::Existing => {
-			return Some(fit_name(filesystem, path, simple(suffix.as_ref())));
-		},
+		// A simple backup is renamed with replacement, by GNU too.
+		None if mode == BackupMode::Existing => return fit(filesystem, path, simple(suffix.as_ref()), false),
 		None => b"1".to_vec(),
 	};
 	if !listing.complete {
@@ -151,9 +167,28 @@ pub(crate) fn backup_path(
 		.highest
 		.is_some_and(|highest| highest.len() == version.len())
 	{
-		return Some(backup);
+		return Ok(Some(backup));
 	}
-	Some(fit_name(filesystem, path, backup))
+	fit(filesystem, path, backup, exclusive)
+}
+
+/// `backup`, or the `~` name it gives way to when too long
+/// ([`fallback_name`]), unless that name must not be taken: it is `path`
+/// itself, or, for a backup renamed without replacing (`no_replace`), an
+/// entry holds it ([`backup_path`]).
+fn fit(
+	filesystem: &BlockingFs,
+	path: &Path,
+	backup: PathBuf,
+	no_replace: bool,
+) -> Result<Option<PathBuf>, BackupExists> {
+	let Some(fallback) = fallback_name(filesystem, path, &backup) else {
+		return Ok(Some(backup));
+	};
+	if fallback == path || (no_replace && filesystem.symlink_metadata(&fallback).is_ok()) {
+		return Err(BackupExists);
+	}
+	Ok(Some(fallback))
 }
 
 /// What a listing of a file's directory says about its numbered backups.
@@ -230,35 +265,33 @@ fn next_version(version: &[u8]) -> Vec<u8> {
 	digits
 }
 
-/// `backup`, or, when its name is too long for the directory, `path`'s name
-/// cut to fit with `~` after it, as gnulib's `check_extension` decides: the
-/// name keeps every byte it can, at most one under the limit
-/// ([`name_limit`]). A name of 14 bytes or fewer (`NAME_MAX_MINIMUM`) always
-/// fits.
-fn fit_name(filesystem: &BlockingFs, path: &Path, backup: PathBuf) -> PathBuf {
+/// The name `backup` gives way to when its name is too long for the
+/// directory: `path`'s name cut to fit with `~` after it, as gnulib's
+/// `check_extension` decides (it keeps every byte it can, at most one under
+/// the limit, [`name_limit`]); `None` when it fits. A name of 14 bytes or
+/// fewer (`NAME_MAX_MINIMUM`) always fits.
+fn fallback_name(filesystem: &BlockingFs, path: &Path, backup: &Path) -> Option<PathBuf> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-		let length = file_name(&backup).map_or(0, |name| name.len());
+		let length = file_name(backup).map_or(0, |name| name.len());
 		if length <= NAME_MAX_MINIMUM {
-			return backup;
+			return None;
 		}
-		let Some(limit) = name_limit(filesystem, backup_dir(path)) else {
-			return backup;
-		};
+		let limit = name_limit(filesystem, backup_dir(path))?;
 		if length <= limit {
-			return backup;
+			return None;
 		}
 		let name = file_name(path).unwrap_or_default();
 		let keep = if limit <= name.len() { limit.saturating_sub(1) } else { name.len() };
 		let mut cut = name.as_bytes()[..keep].to_vec();
 		cut.push(b'~');
-		with_file_name(path, std::ffi::OsString::from_vec(cut))
+		Some(with_file_name(path, std::ffi::OsString::from_vec(cut)))
 	}
 	#[cfg(not(unix))]
 	{
-		let _ = (filesystem, path);
-		backup
+		let _ = (filesystem, path, backup);
+		None
 	}
 }
 
@@ -309,27 +342,44 @@ pub(crate) fn source_is_destination_backup(
 	if *from_name != *backup_name {
 		return false;
 	}
-	let backup = with_file_name(to, &backup_name);
-	let from_metadata = if follow_from {
-		filesystem.metadata(from)
-	} else {
-		filesystem.symlink_metadata(from)
+	same_file(filesystem, from, follow_from, &with_file_name(to, &backup_name), true)
+}
+
+/// Whether making the backup `backup` would replace the source `source`
+/// (followed when `follow_source`): the rename that makes it replaces the
+/// entry at `backup`, and that entry is the source's, as a long name's `~`
+/// fallback can be. Decided as [`source_is_destination_backup`] decides,
+/// with `backup` not followed.
+#[cfg(any(feature = "util.ln", feature = "util.mv"))]
+pub(crate) fn backup_is_source(filesystem: &BlockingFs, source: &Path, follow_source: bool, backup: &Path) -> bool {
+	same_file(filesystem, source, follow_source, backup, false)
+}
+
+/// Whether `a` and `b`, each followed when its flag says so, are the same
+/// file: by file identity when both have one on the same kind of
+/// filesystem, else by location ([`location`]).
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
+fn same_file(filesystem: &BlockingFs, a: &Path, follow_a: bool, b: &Path, follow_b: bool) -> bool {
+	let metadata = |path: &Path, follow: bool| {
+		if follow {
+			filesystem.metadata(path)
+		} else {
+			filesystem.symlink_metadata(path)
+		}
 	};
-	let (Ok(from_metadata), Ok(backup_metadata)) = (from_metadata, filesystem.metadata(&backup)) else {
+	let (Ok(a_metadata), Ok(b_metadata)) = (metadata(a, follow_a), metadata(b, follow_b)) else {
 		return false;
 	};
-	match (from_metadata.file_id(), backup_metadata.file_id()) {
-		(Some(from_id), Some(backup_id)) if from_id.is_native() == backup_id.is_native() => {
-			from_id == backup_id
-		},
-		_ => location(filesystem, from, follow_from) == location(filesystem, &backup, true),
+	match (a_metadata.file_id(), b_metadata.file_id()) {
+		(Some(a_id), Some(b_id)) if a_id.is_native() == b_id.is_native() => a_id == b_id,
+		_ => location(filesystem, a, follow_a) == location(filesystem, b, follow_b),
 	}
 }
 
 /// Where `path` is: with `follow`, the canonical file (the host file a
 /// provider path aliases, if any); without, its entry in its canonical
 /// directory. Lexical where neither can be read.
-#[cfg(any(feature = "util.cp", feature = "util.mv"))]
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 fn location(filesystem: &BlockingFs, path: &Path, follow: bool) -> PathBuf {
 	let canonical = |path: &Path| match filesystem.backing_path(path).ok().flatten() {
 		Some(backing) => filesystem.canonicalize(&backing).ok(),
@@ -364,7 +414,7 @@ pub(crate) mod tests {
 
 	use uucore::backup_control::BackupMode;
 
-	use super::backup_path;
+	use super::{BackupExists, backup_path};
 
 	/// A provider over host files that reports no file identities, as a
 	/// provider whose metadata carries no device and inode does (the shell's
@@ -520,8 +570,8 @@ pub(crate) mod tests {
 				symlink("missing", dir.path().join(entry)).unwrap();
 			}
 			assert_eq!(
-				backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~"),
-				Some(dir.path().join(expected)),
+				backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~", true),
+				Ok(Some(dir.path().join(expected))),
 				"{entries:?}"
 			);
 		}
@@ -531,8 +581,9 @@ pub(crate) mod tests {
 	/// numbered backup. `existing` then uses the simple name, as GNU 9.4 and
 	/// 9.7 do in mv, cp and ln. `numbered` takes the first name no entry
 	/// holds by `lstat`, a symlink to nothing included, from `name.~1~` up.
-	/// That is not GNU's: there mv and cp retry `name.~1~` without end, and ln
-	/// replaces it.
+	/// That is not GNU's: there GNU 9.4 and 9.7's mv and cp retry `name.~1~`
+	/// without end (gnulib fe173e9544 makes them fail), and their ln replaces
+	/// it.
 	#[test]
 	fn a_directory_that_cannot_be_listed_is_probed_for_a_free_backup_name() {
 		use std::os::unix::fs::PermissionsExt as _;
@@ -542,15 +593,15 @@ pub(crate) mod tests {
 		symlink("missing", dir.path().join("dest.~1~")).unwrap();
 		fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o311)).unwrap();
 		let listable = fs::read_dir(dir.path()).is_ok();
-		let numbered = backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~");
-		let existing = backup_path(&vfs, BackupMode::Existing, &dir.path().join("dest"), "~");
+		let numbered = backup_path(&vfs, BackupMode::Numbered, &dir.path().join("dest"), "~", true);
+		let existing = backup_path(&vfs, BackupMode::Existing, &dir.path().join("dest"), "~", true);
 		fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 		if listable {
 			eprintln!("skipped: this process lists a directory without read permission");
 			return;
 		}
-		assert_eq!(numbered, Some(dir.path().join("dest.~2~")));
-		assert_eq!(existing, Some(dir.path().join("dest~")));
+		assert_eq!(numbered, Ok(Some(dir.path().join("dest.~2~"))));
+		assert_eq!(existing, Ok(Some(dir.path().join("dest~"))));
 	}
 
 	/// A listing that ends early, with an error, is not taken as complete:
@@ -565,8 +616,8 @@ pub(crate) mod tests {
 		fs::write(dir.path().join("dest"), "old").unwrap();
 		fs::write(dir.path().join("dest.~1~"), "keep").unwrap();
 		let dest = dir.path().join("dest");
-		assert_eq!(backup_path(&vfs, BackupMode::Numbered, &dest, "~"), Some(dir.path().join("dest.~2~")));
-		assert_eq!(backup_path(&vfs, BackupMode::Existing, &dest, "~"), Some(dir.path().join("dest~")));
+		assert_eq!(backup_path(&vfs, BackupMode::Numbered, &dest, "~", true), Ok(Some(dir.path().join("dest.~2~"))));
+		assert_eq!(backup_path(&vfs, BackupMode::Existing, &dest, "~", true), Ok(Some(dir.path().join("dest~"))));
 	}
 
 	/// A numbered name too long for its directory gives way to the name with
@@ -602,10 +653,61 @@ pub(crate) mod tests {
 				fs::write(dir.path().join(format!("{file}.~{version}~")), "listed").unwrap();
 			}
 			assert_eq!(
-				backup_path(&vfs, mode, &dir.path().join(&file), "~"),
-				Some(dir.path().join(&expected)),
+				backup_path(&vfs, mode, &dir.path().join(&file), "~", true),
+				Ok(Some(dir.path().join(&expected))),
 				"{} bytes, listed {listed:?}, {mode:?}",
 				file.len()
+			);
+		}
+	}
+
+	/// The `~` name a long name gives way to is refused where it must not be
+	/// taken: when it is the file itself, always; when an entry holds it, in a
+	/// numbered mode, for callers that rename without replacing (`exclusive`,
+	/// GNU's mv and cp), not for one that replaces (GNU's ln). A simple
+	/// backup's `~` name (`existing` with no numbered backup) replaces an
+	/// entry, as GNU's does in all three.
+	#[test]
+	fn a_held_fallback_name_is_refused_where_gnu_refuses_it() {
+		let vfs = pi_vfs::BlockingFs::native();
+		let dir = tempfile::tempdir().unwrap();
+		if !fits_255_byte_names(dir.path()) {
+			return;
+		}
+		let held = |file: &str, entries: &[&str]| {
+			let case = dir.path().join(format!("{}-{}", file.len(), entries.len()));
+			fs::create_dir(&case).unwrap();
+			fs::write(case.join(file), "old").unwrap();
+			for entry in entries {
+				fs::write(case.join(entry), "held").unwrap();
+			}
+			case.join(file)
+		};
+		let d = "d".repeat(251);
+		let (d_tilde, d_nine) = (format!("{d}~"), format!("{d}.~9~"));
+		let e = format!("{}~", "e".repeat(253));
+		let f = "f".repeat(254);
+		let f_cut = format!("{}~", "f".repeat(253));
+		// An entry holds the numbered backup's `~` name.
+		let path = held(&d, &[&d_nine, &d_tilde]);
+		for mode in [BackupMode::Numbered, BackupMode::Existing] {
+			assert_eq!(backup_path(&vfs, mode, &path, "~", true), Err(BackupExists), "{mode:?}");
+			assert_eq!(backup_path(&vfs, mode, &path, "~", false), Ok(Some(path.with_file_name(&d_tilde))), "{mode:?}");
+		}
+		// The `~` name is the file itself.
+		let path = held(&e, &[]);
+		for mode in [BackupMode::Numbered, BackupMode::Existing] {
+			for exclusive in [true, false] {
+				assert_eq!(backup_path(&vfs, mode, &path, "~", exclusive), Err(BackupExists), "{mode:?} {exclusive}");
+			}
+		}
+		// A simple backup's `~` name replaces the entry there.
+		let path = held(&f, &[&f_cut]);
+		for exclusive in [true, false] {
+			assert_eq!(
+				backup_path(&vfs, BackupMode::Existing, &path, "~", exclusive),
+				Ok(Some(path.with_file_name(&f_cut))),
+				"{exclusive}"
 			);
 		}
 	}

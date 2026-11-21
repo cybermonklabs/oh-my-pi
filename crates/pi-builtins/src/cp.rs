@@ -2038,7 +2038,9 @@ fn handle_existing_dest(
 		)));
 	}
 	let mut is_dest_removed = false;
-	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix);
+	// A numbered backup is renamed without replacing, as GNU cp renames it.
+	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
+		.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?;
 	if let Some(backup) = &backup {
 		// Any backup name that is the source itself, as the `~` name a long
 		// name gives way to can be, would destroy it too.

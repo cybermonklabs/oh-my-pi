@@ -29,7 +29,7 @@ use uucore::{
 use crate::{
 	cp::{CpError, MoveCopier},
 	file_backup::{
-		backup_display, backup_path, determine_backup_mode, determine_backup_suffix,
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
 		source_is_destination_backup,
 	},
 	host::{Host, Utility, format_usage, matches_parser},
@@ -52,6 +52,8 @@ enum MvError {
 	NonDirectoryToDirectory(String, String),
 	#[error("backing up {0} might destroy source;  {1} not moved")]
 	BackupWouldDestroySource(String, String),
+	#[error("cannot backup {0}: File exists")]
+	CannotBackup(String),
 	#[error("target {0}: Not a directory")]
 	NotADirectory(String),
 	#[error("target directory {0}: Not a directory")]
@@ -791,8 +793,20 @@ fn rename(
 			)));
 		}
 
-		// numbered-backup probing goes through the injected filesystem.
-		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix);
+		// numbered-backup probing goes through the injected filesystem. A
+		// numbered backup is renamed without replacing, as GNU mv renames it,
+		// and one whose name, cut to fit, is the source is refused as one
+		// that is the source's by name: the rename would replace it.
+		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix, true)
+			.map_err(|_| io::Error::other(MvError::CannotBackup(to.quote().to_string())))?;
+		if let Some(backup) = &backup
+			&& backup_is_source(&filesystem, &from_fs, false, backup)
+		{
+			return Err(io::Error::other(MvError::BackupWouldDestroySource(
+				to.quote().to_string(),
+				from.quote().to_string(),
+			)));
+		}
 		if let Some(backup) = &backup {
 			// The existing file is only moved aside: its copy, if any, is
 			// neither reported nor linked to the moved files.
