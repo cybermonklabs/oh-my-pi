@@ -377,6 +377,14 @@ interface StickyImageDrop {
 	dropped: Set<string>;
 }
 
+/** The drops a clamp and its side-request clamps remember, with the read of the record they go with. */
+interface RememberedImageDrops {
+	/** {@link ImageDropRecord.loadRevision} when they were remembered; undefined for a clamp without a record. */
+	loadRevision: number | undefined;
+	/** Each conversation's drops, by the turn that names it ({@link RecordedImageDrop.turn}). */
+	conversations: LRUCache<string, StickyImageDrop>;
+}
+
 /**
  * Conversations whose drops one clamp remembers, each by the turn that carried its oldest image at its first forced
  * drop: each compaction starts another, and a branch switch can go back to the history before it. The oldest is
@@ -406,6 +414,12 @@ export interface RecordedImageDrop {
 /** Where a clamp keeps its conversations' drops beyond its process. */
 export interface ImageDropRecord {
 	/**
+	 * The read of the session's entries the record holds ({@link SessionManager.loadRevision}): it changes when the
+	 * session file is read again, and the drops read then, which another process may have added to, stand over the
+	 * ones a clamp remembers.
+	 */
+	loadRevision(): number;
+	/**
 	 * The newest drop recorded for each turn that names a conversation ({@link RecordedImageDrop.turn}), on every
 	 * branch: the process that recorded them dropped the same images on every branch it went to.
 	 */
@@ -427,18 +441,21 @@ function isRecordedImageDrop(data: unknown): data is RecordedImageDrop & { versi
  * The {@link ImageDropRecord} of the session `sessionManager` holds: an {@link IMAGE_DROP_ENTRY_TYPE} entry, on the
  * branch current then, at each drop the clamp keeps. A process that resumes the session reads the entries of every
  * branch, as the process that wrote them remembered them on every branch: a `/tree` move to a branch that went on from
- * before a forced drop still drops that drop's images. They are read once for each session the manager holds (again
- * after a switch to another one); the record's own writes keep them current.
+ * before a forced drop still drops that drop's images. They are read once for each session the manager holds and each
+ * time it reads the session's file ({@link SessionManager.loadRevision}: a switch back to a session another process
+ * continued meanwhile); the record's own writes keep them current.
  */
 export function sessionImageDropRecord(
-	sessionManager: Pick<SessionManager, "getEntries" | "getSessionId" | "appendCustomEntry">,
+	sessionManager: Pick<SessionManager, "getEntries" | "getSessionId" | "appendCustomEntry" | "loadRevision">,
 ): ImageDropRecord {
 	let session: string | undefined;
+	let loadRevision: number | undefined;
 	const drops = new Map<string, RecordedImageDrop>();
 	const read = (): ReadonlyMap<string, RecordedImageDrop> => {
 		const id = sessionManager.getSessionId();
-		if (id === session) return drops;
+		if (id === session && sessionManager.loadRevision === loadRevision) return drops;
 		session = id;
+		loadRevision = sessionManager.loadRevision;
 		drops.clear();
 		for (const entry of sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === IMAGE_DROP_ENTRY_TYPE && isRecordedImageDrop(entry.data)) {
@@ -448,6 +465,7 @@ export function sessionImageDropRecord(
 		return drops;
 	};
 	return {
+		loadRevision: () => sessionManager.loadRevision,
 		drops: read,
 		write(drop) {
 			read();
@@ -486,7 +504,10 @@ export function sessionImageDropRecord(
  * oldest images past the budget, {@link clampProviderContextImages}): a conversation of it takes the drops that
  * clamp made in its last request, the history before the newest reply of the same model, and keeps and records them,
  * so the first request after the resume sends what that request sent. Where the session file lacks drops the clamp
- * remembers (a branch copied into another file), the next request that uses them records them there.
+ * remembers (a branch copied into another file), the next request that uses them records them there. When the
+ * session's file is read again (a `/resume` back to a session another process continued meanwhile), the clamp
+ * forgets what it remembers and follows the record read then, as a process that resumed the session does: the other
+ * process's drops are the ones its last request sent.
  *
  * A side request ({@link sideRequestClamp}: a `/btw` question, a compaction summary, a handoff, an auto-learn
  * capture) is no part of the conversation's history. It drops what the conversation drops, so its shared prefix
@@ -499,7 +520,11 @@ export function sessionImageDropRecord(
  * drop that evicts more than the previous request is reported as forced.
  */
 export class ProviderImageClamp {
-	#drops = new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS });
+	/** The drops this clamp's conversations left, shared with its side-request clamps ({@link #drops}). */
+	#memory: RememberedImageDrops = {
+		loadRevision: undefined,
+		conversations: new LRUCache<string, StickyImageDrop>({ max: MAX_STICKY_IMAGE_CONVERSATIONS }),
+	};
 	readonly #onForcedDrop: ForcedImageDrop | undefined;
 	/** Where each drop the clamp keeps is kept for a later process; none keeps them in memory only. */
 	readonly #record: ImageDropRecord | undefined;
@@ -520,9 +545,24 @@ export class ProviderImageClamp {
 	 */
 	sideRequestClamp(): ProviderImageClamp {
 		const side = new ProviderImageClamp(undefined, this.#record);
-		side.#drops = this.#drops;
+		side.#memory = this.#memory;
 		side.#side = true;
 		return side;
+	}
+
+	/**
+	 * The drops this clamp remembers, by the turn that names each conversation. They are forgotten once the session's
+	 * file is read again ({@link ImageDropRecord.loadRevision}): the record read then holds the drops of every process
+	 * that continued the session, and those stand over this process's.
+	 */
+	get #drops(): LRUCache<string, StickyImageDrop> {
+		const memory = this.#memory;
+		const loadRevision = this.#record?.loadRevision();
+		if (memory.loadRevision !== loadRevision) {
+			memory.loadRevision = loadRevision;
+			memory.conversations.clear();
+		}
+		return memory.conversations;
 	}
 
 	/**
@@ -532,8 +572,9 @@ export class ProviderImageClamp {
 	 */
 	#conversationOf(context: Context): { turn: string; drop: StickyImageDrop } | undefined {
 		const recorded = this.#record?.drops();
-		if (this.#drops.size === 0 && !recorded?.size) return undefined;
-		const known = oldestKnownTurn(context, turn => this.#drops.get(turn) ?? this.#adopt(turn, recorded?.get(turn)));
+		const drops = this.#drops;
+		if (drops.size === 0 && !recorded?.size) return undefined;
+		const known = oldestKnownTurn(context, turn => drops.get(turn) ?? this.#adopt(turn, recorded?.get(turn)));
 		return known && { turn: known.turn, drop: known.value };
 	}
 
