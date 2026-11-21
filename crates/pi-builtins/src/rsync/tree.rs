@@ -1731,7 +1731,10 @@ mod tests {
 			let name = OsStr::new("user.rsync.test");
 			match tree.set_xattr(Path::new("file"), name, b"value", false) {
 				// Filesystems without user xattrs (tmpfs on old kernels).
-				Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
+				Err(err) if err.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+					eprintln!("skipped: no user xattrs on the temporary filesystem: {err}");
+					return;
+				},
 				other => other.unwrap(),
 			}
 			assert_eq!(tree.get_xattr(Path::new("file"), name, false).unwrap(), Some(b"value".to_vec()));

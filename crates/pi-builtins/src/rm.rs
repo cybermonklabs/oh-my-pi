@@ -2244,6 +2244,7 @@ mod tests {
 			Some((code, capture.err()))
 		};
 		let Some((code, err)) = run("-rf") else {
+			eprintln!("skipped: this user writes into a directory of mode 555 (root), so nothing is unremovable");
 			return;
 		};
 
