@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Subagents on worker threads that save the provider file cache's index in the same millisecond no longer share one temporary file, which could fail the save or leave an index the next load drops
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

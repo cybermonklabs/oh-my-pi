@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
@@ -577,4 +580,128 @@ describe("ProviderFileManager", () => {
 		expect(deleted).toEqual([]);
 		manager.save();
 	});
+});
+
+/**
+ * Several caches saving one index at once, each in a worker thread of this process, as subagent
+ * sessions on worker threads do, or each in a process of its own. Nothing is mocked: the
+ * writers start together and each saves the index `rounds` times.
+ */
+describe("ProviderFileCache writers of one index", () => {
+	const providerFileTypes = path.join(import.meta.dir, "../src/blob-broker/provider-file-types.ts");
+	// Each save syncs the index to disk (writeFileAtomicallySync), which a loaded disk makes slow.
+	const rounds = 100;
+	const writerBody = `const { ProviderFileCache, hashProviderFileContent } = await import(${JSON.stringify(providerFileTypes)});
+const run = (indexPath, id, rounds) => {
+	const cache = new ProviderFileCache(indexPath, { saveDebounceMs: 60_000 });
+	const contentHash = hashProviderFileContent(new Uint8Array([id]));
+	const errors = [];
+	for (let round = 0; round < rounds; round++) {
+		cache.set("openai", "account-" + id, contentHash, {
+			provider: "openai",
+			id: "file-" + id + "-" + round,
+			mimeType: "image/png",
+			bytes: 1,
+			delete: { method: "DELETE", url: "https://api.openai.com/v1/files/file-" + id, headers: {} },
+		});
+		try {
+			cache.save();
+		} catch (error) {
+			errors.push(String(error?.code ?? error));
+		}
+	}
+	return errors;
+};
+`;
+
+	/**
+	 * Whether the index after the writers parses and holds only entries the writers set. How many
+	 * it holds is not checked: a cache that loads the index after the other writer's first save
+	 * keeps that writer's entry as well.
+	 */
+	async function readIndex(indexPath: string): Promise<{ parses: boolean; ids: boolean }> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await Bun.file(indexPath).text());
+		} catch {
+			return { parses: false, ids: false };
+		}
+		const entries = parsed && typeof parsed === "object" && "entries" in parsed ? parsed.entries : undefined;
+		const ids = Array.isArray(entries) ? entries.map(entry => entry?.handle?.id) : [];
+		return {
+			parses: true,
+			ids: ids.length > 0 && ids.every(id => typeof id === "string" && /^file-[12]-\d+$/.test(id)),
+		};
+	}
+
+	test("two worker threads of one process saving one index never share a temporary file", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-cache-threads-");
+		const indexPath = tempDir.join("provider-files.json");
+		const script = tempDir.join("writer.ts");
+		// Both threads wait at a shared barrier, then save at once.
+		await Bun.write(
+			script,
+			`import { parentPort, workerData } from "node:worker_threads";
+${writerBody}
+const { indexPath, id, rounds, barrier } = workerData;
+const arrived = new Int32Array(barrier);
+Atomics.add(arrived, 0, 1);
+while (Atomics.load(arrived, 0) < 2) Atomics.wait(arrived, 0, Atomics.load(arrived, 0), 1);
+parentPort.postMessage(run(indexPath, id, rounds));
+`,
+		);
+		const barrier = new SharedArrayBuffer(4);
+		const errors = await Promise.all(
+			[1, 2].map(id => {
+				const worker = new Worker(script, { workerData: { indexPath, id, rounds, barrier } });
+				const { promise, resolve, reject } = Promise.withResolvers<string[]>();
+				worker.once("message", resolve);
+				worker.once("error", reject);
+				worker.once("exit", code => reject(new Error(`writer ${id} exited with ${code} before its result`)));
+				return promise.finally(() => worker.terminate());
+			}),
+		);
+
+		expect(errors.flat()).toEqual([]);
+		expect(await readIndex(indexPath)).toEqual({ parses: true, ids: true });
+	}, 120_000);
+
+	test("two processes saving one index never share a temporary file (control for the harness)", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-cache-processes-");
+		const indexPath = tempDir.join("provider-files.json");
+		const script = tempDir.join("writer.ts");
+		// Each process says it is ready (a file of its own), and both save once the test makes
+		// the `go` file.
+		await Bun.write(
+			script,
+			`${writerBody}
+import * as fs from "node:fs";
+const [indexPath, id, rounds, dir] = [process.argv[2], Number(process.argv[3]), Number(process.argv[4]), process.argv[5]];
+fs.writeFileSync(dir + "/ready-" + id, "");
+while (!fs.existsSync(dir + "/go")) Bun.sleepSync(1);
+console.log(JSON.stringify(run(indexPath, id, rounds)));
+`,
+		);
+		const children = [1, 2].map(id =>
+			Bun.spawn([process.execPath, script, indexPath, String(id), String(rounds), tempDir.path()], {
+				stdout: "pipe",
+				stderr: "inherit",
+			}),
+		);
+		const ready = () => [1, 2].every(id => fs.existsSync(tempDir.join(`ready-${id}`)));
+		// Another process's readiness has no event this process can await: poll the files it
+		// writes. The poll only waits; no verdict depends on its timing.
+		while (!ready()) await Bun.sleep(5);
+		await Bun.write(tempDir.join("go"), "");
+		const errors = await Promise.all(
+			children.map(async child => {
+				const [text, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+				expect(exitCode).toBe(0);
+				return JSON.parse(text.trim()) as string[];
+			}),
+		);
+
+		expect(errors.flat()).toEqual([]);
+		expect(await readIndex(indexPath)).toEqual({ parses: true, ids: true });
+	}, 120_000);
 });
