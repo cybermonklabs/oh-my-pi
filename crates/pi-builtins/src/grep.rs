@@ -211,22 +211,18 @@ fn longest_match_at(
 	line: &[u8],
 	start: usize,
 ) -> io::Result<Option<grep_matcher::Match>> {
-	let mut longest: Option<(usize, usize)> = None;
+	let mut longest: Option<grep_matcher::Match> = None;
 	for (pattern, cached) in patterns.iter().zip(next.iter_mut()) {
-		let found = bre::next_match(cached, start, || {
-			pattern
-				.find_at(line, start)
-				.map(|found| found.map(|found| (found.start(), found.end())))
-				.map_err(|error| io::Error::other(error.to_string()))
-		})?;
-		if let Some((at, end)) = found
-			&& at == start
-			&& end > longest.map_or(start, |(_, best)| best)
+		let found = next_found(pattern, cached, line, start)
+			.map_err(|error| io::Error::other(error.to_string()))?;
+		if let Some(found) = found
+			&& found.start() == start
+			&& found.end() > longest.map_or(start, |best| best.end())
 		{
-			longest = Some((at, end));
+			longest = Some(found);
 		}
 	}
-	Ok(longest.map(|(at, end)| grep_matcher::Match::new(at, end)))
+	Ok(longest)
 }
 
 /// Of two matches, the one that starts first, the longer at one start.
@@ -942,9 +938,11 @@ fn translate_patterns(
 	spec: MatcherSpec,
 ) -> Result<Vec<String>, String> {
 	// A stand-in that is the record's terminator the engine leaves out
-	// itself (see `build_matcher`).
+	// itself (see `build_matcher`). Beside any other, the copy of the line
+	// holds the terminator for its other bytes that are no UTF-8.
 	let stand_in = spec.stand_in.filter(|&byte| byte != spec.terminator());
-	let bytes = bre::PatternBytes { raw: spec.raw_bytes, utf8_locale: spec.utf8_locale, stand_in };
+	let gap = stand_in.map(|_| spec.terminator());
+	let bytes = bre::PatternBytes { raw: spec.raw_bytes, utf8_locale: spec.utf8_locale, stand_in, gap };
 	patterns
 		.iter()
 		.map(|pattern| bre::translate_raw(pattern, dialect, target, spec.ignore_case, bytes))
@@ -1212,11 +1210,11 @@ struct MatcherSpec {
 	utf8_locale: bool,
 	/// A byte the engine is compiled never to match, which a copy of a line
 	/// that is not UTF-8 holds for some of its bytes that are no UTF-8
-	/// ([`LineMatcher::copy`]). Where it is set, the `regex` crate's engine
-	/// holds the record's terminator as its line terminator, which such a
-	/// copy holds for its other bytes that are no UTF-8, and a stand-in that
-	/// is not the terminator the patterns are written not to match
-	/// ([`bre::PatternBytes::stand_in`]).
+	/// ([`LineMatcher::copy`]). Where it is set, the copy holds the record's
+	/// terminator for the line's other such bytes, which the `regex` crate's
+	/// engine holds as its line terminator, and the patterns are written not
+	/// to match a stand-in that is not the terminator, nor for PCRE2 the
+	/// terminator ([`bre::PatternBytes`]).
 	stand_in:    Option<u8>,
 }
 
@@ -1432,8 +1430,12 @@ struct LineMatcher<M> {
 /// line of a log holding `_` and every digit too. `k` and `s` are left out:
 /// the engines without case fold them with `K` (U+212A) and `ſ` (U+017F),
 /// which the line may hold and which a pattern written not to match the
-/// stand-in would then not match either.
-const STAND_INS: [u8; 35] = *b"zqxjvbpygfwmucldrhnioate_0123456789";
+/// stand-in would then not match either. So is `i`: GNU without case
+/// matches `ı` (U+0131) to `I` and `i`, and a literal `ı` is written as a
+/// class of the three ([`bre::push_case_literal`]), which no guard keeps
+/// from the stand-in: `printf 'zqxjvbpygfwmucldrhn \377\n' | grep -ic
+/// '\<ı'` is 0.
+const STAND_INS: [u8; 34] = *b"zqxjvbpygfwmucldrhnoate_0123456789";
 
 /// Whether `haystack` holds the ASCII byte `byte` in either case.
 fn holds_either_case(haystack: &[u8], byte: u8) -> bool {
@@ -1473,13 +1475,13 @@ struct StandIn<M> {
 	/// The stand-in, which the copy holds for each byte that is no UTF-8
 	/// whose character is a letter.
 	letter:       u8,
-	/// What the copy holds for each other byte that is no UTF-8, which the
-	/// engines match nothing in and read as no word character. For the
-	/// `regex` crate's it is the record's terminator, their line terminator:
-	/// its `\B` and its edges under `-w` hold beside no byte that is no
-	/// UTF-8, where GNU's hold beside such a byte (`printf '\200\n' | grep -c
-	/// '^\B'` is 1). For PCRE2's, whose `$` holds before a final newline, it
-	/// is 0xFF.
+	/// The record's terminator, which no line holds, and which the copy
+	/// holds for each other byte that is no UTF-8: the engines match nothing
+	/// in it ([`bre::PatternBytes::gap`]) and read it as no word character,
+	/// as GNU reads such a byte. A byte that is no UTF-8 they read otherwise:
+	/// the `regex` crate's `\B` and edges under `-w` hold beside none
+	/// (`printf '\200\n' | grep -c '^\B'` is 1), and PCRE2's `\B` at the end
+	/// of the subject after one was true in some builds and false in others.
 	gap:          u8,
 	/// Compiled without `-w`.
 	engine:       M,
@@ -1501,12 +1503,15 @@ impl<M: Matcher> StandIn<M> {
 	/// where `-cw a` is 1, and `printf 'a\377b c\n' | grep -ow 'a\B'` prints
 	/// `a`. The engine compiled with `-w` (`words`) reads the stand-in as a
 	/// word character at its edges too, so it misses a word beside one.
-	/// Where the copy holds the stand-in, each start of a match of `engine`
-	/// up to the start of the one `words` finds is checked as GNU checks its
-	/// own: the start's edge in `line` ([`word_character_before`]), then the
-	/// longest match there whose end's edge holds ([`Self::word_end`]), of
-	/// `engine` and of each alternative, as GNU's engine takes the longest.
-	/// The match that starts first is taken, the longer at one start.
+	/// Where the copy holds the stand-in, or there are alternatives, each
+	/// start of a match of `engine` up to the start of the one `words` finds
+	/// is checked as GNU checks its own: the start's edge in `line`
+	/// ([`word_character_before`]), then the longest match there whose end's
+	/// edge holds ([`Self::word_end`]), of `engine` and of each alternative,
+	/// as GNU's engine takes the longest where `words` takes the first
+	/// alternative whose edges hold: `printf '\200a b cd\n' | grep -ow
+	/// '\<a\|a b\|a b c'` prints `a b`. The match that starts first is taken,
+	/// the longer at one start.
 	/// `search` keeps what is found from one call to the next in one copy.
 	fn find_at(
 		&self,
@@ -1519,7 +1524,9 @@ impl<M: Matcher> StandIn<M> {
 			return self.engine.find_at(copy, from);
 		};
 		let found = next_found(words, &mut search.words, copy, from)?;
-		if !*search.holds_letter.get_or_insert_with(|| memchr::memchr(self.letter, copy).is_some()) {
+		let holds_letter =
+			*search.holds_letter.get_or_insert_with(|| memchr::memchr(self.letter, copy).is_some());
+		if !holds_letter && self.alternatives.is_empty() {
 			return Ok(found);
 		}
 		let bound = found.map_or(copy.len(), |found| found.start());
@@ -1740,7 +1747,11 @@ where
 					.map_or(ByteLines::Text, ByteLines::Engine);
 			}
 			let words = spec.word && !spec.line_regexp;
-			if !spec.raw_bytes && holds_word_assertion(&patterns, spec.mode) {
+			// Under `-x` such a line is matched whole by no pattern without a
+			// pattern byte, as nothing else matches a byte that is no UTF-8:
+			// `printf 'a\200\n' | grep -cx 'a\>'` is 0. It is read as text,
+			// whose engine matches no such byte either.
+			if !spec.raw_bytes && !spec.line_regexp && holds_word_assertion(&patterns, spec.mode) {
 				let free = STAND_INS.map(|byte| {
 					!patterns.iter().any(|pattern| holds_either_case(pattern.as_bytes(), byte))
 				});
@@ -1758,7 +1769,6 @@ where
 				if !(2..=SEPARATE_ALTERNATIVE_LIMIT).contains(&alternatives.len()) {
 					alternatives.clear();
 				}
-				let gap = if rust { terminator } else { 0xFF };
 				let build = move |letter| {
 					let spec = MatcherSpec { stand_in: Some(letter), word: false, ..spec };
 					let compile = |set: &[String], spec| build_matcher(set, spec).ok().and_then(&engine);
@@ -1775,7 +1785,7 @@ where
 						.collect::<Option<Vec<_>>>()
 						.unwrap_or_default();
 					let whole = compile(patterns.as_slice(), spec)?;
-					Some(StandIn { letter, gap, engine: whole, words, alternatives })
+					Some(StandIn { letter, gap: terminator, engine: whole, words, alternatives })
 				};
 				return ByteLines::Assertions {
 					engines: std::array::from_fn(|_| OnceLock::new()),
@@ -1883,9 +1893,6 @@ impl<M: Matcher> LineMatcher<M> {
 	/// terminator, which no line holds. For a word assertion
 	/// ([`ByteLines::Assertions`]) each one whose character is a letter is
 	/// the stand-in ([`StandIn::letter`]), and each other [`StandIn::gap`].
-	/// PCRE2, which runs a back-reference, reads `\B` at the end of the line
-	/// after 0xFF as false: `printf 'a\200\n' | grep -c '\B$\|\(x\)\1'` is 0,
-	/// where GNU's is 1.
 	fn copy(&self, line: &[u8], reading: Reading) -> Vec<u8> {
 		let (letter, gap) = self
 			.stand_in(reading)
@@ -1926,10 +1933,7 @@ impl<M: Matcher> LineMatcher<M> {
 		if !raw_bytes {
 			return Ok(in_copy);
 		}
-		let in_line = bre::next_match(text_next, from, || {
-			self.text.find_at(line, from).map(|found| found.map(|found| (found.start(), found.end())))
-		})?
-		.map(|(start, end)| grep_matcher::Match::new(start, end));
+		let in_line = next_found(&self.text, text_next, line, from)?;
 		Ok(longer_first(in_copy, in_line))
 	}
 
@@ -4940,16 +4944,26 @@ mod tests {
 		assert_eq!(lines(r"a\|ab\>", words, b"\xffab c\n"), 1);
 		assert_eq!(lines(r"a\>", BRE_SPEC, b"a\xff _0123456789\n"), 0);
 		assert_eq!(lines(r"^\B", BRE_SPEC, b"\x80\n"), 1);
+		// No such line is matched whole under `-x`: `printf 'a\200\n' | grep
+		// -cx 'a\>'` is 0. Nor is the stand-in matched by a literal `ı`
+		// without case.
+		assert_eq!(lines(r"a\>", MatcherSpec { line_regexp: true, ..BRE_SPEC }, b"a\x80\n"), 0);
+		let icase = MatcherSpec { ignore_case: true, ..BRE_SPEC };
+		assert_eq!(lines("\\<\u{131}", icase, b"zqxjvbpygfwmucldrhn \xff\n"), 0);
 		// `-ow` prints the longest match at each start whose edges hold.
-		let matcher = counting_matcher(r"\<a\|\<ab", words, &read);
-		let mut printed = Vec::new();
-		matcher
-			.for_each_match(b"ab\xff ab x", 0, None, &mut Default::default(), |found, _| {
-				printed.push((found.start(), found.end()));
-				Ok(())
-			})
-			.unwrap();
-		assert_eq!(printed, [(0, 2), (4, 6)]);
+		let printed = |pattern: &str, line: &[u8]| {
+			let matcher = counting_matcher(pattern, words, &read);
+			let mut printed = Vec::new();
+			matcher
+				.for_each_match(line, 0, None, &mut Default::default(), |found, _| {
+					printed.push((found.start(), found.end()));
+					Ok(())
+				})
+				.unwrap();
+			printed
+		};
+		assert_eq!(printed(r"\<a\|\<ab", b"ab\xff ab x"), [(0, 2), (4, 6)]);
+		assert_eq!(printed(r"\<a\|a b\|a b c", b"\x80a b cd"), [(1, 4)]);
 	}
 
 	/// The spec of a plain BRE search.

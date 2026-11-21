@@ -202,6 +202,12 @@ pub(crate) struct PatternBytes {
 	/// UTF-8, where a word assertion reads them as GNU's regex matcher does
 	/// (see `Translator::guard`).
 	pub stand_in:    Option<u8>,
+	/// For [`Target::Pcre`], another byte no such atom may match: the
+	/// record's terminator, which that copy holds for the line's other bytes
+	/// that are no UTF-8 (the `regex` crate's engine leaves it out itself).
+	/// `$` is then written `\z`, as PCRE2's `$` holds before a final newline
+	/// too.
+	pub gap:         Option<u8>,
 }
 
 /// How strictly a pattern is read.
@@ -354,7 +360,7 @@ fn translator(
 		strictness,
 		icase,
 		multiline,
-		bytes: PatternBytes { raw: false, utf8_locale: false, stand_in: None },
+		bytes: PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None },
 		atom: None,
 		quantified: false,
 		atom_is_anchor: false,
@@ -1158,7 +1164,8 @@ impl Translator<'_> {
 	fn dollar(&mut self) {
 		if self.dialect == Dialect::Extended || ends_branch(&self.chars) {
 			let start = self.out.len();
-			self.out.push('$');
+			let gap = self.target == Target::Pcre && self.bytes.gap.is_some();
+			self.out.push_str(if gap { r"\z" } else { "$" });
 			self.anchor_atom(start);
 			return;
 		}
@@ -1202,15 +1209,20 @@ impl Translator<'_> {
 	/// Writes the atom `out` holds from `start`, a `.`, a bracket expression
 	/// or a class escape, so that it does not match the stand-in byte where
 	/// there is one ([`PatternBytes`]): for PCRE2 `.` becomes
-	/// `(?:(?!\x{5F}).)`, and for the `regex` crate `\w` becomes
-	/// `[\w--\x{5F}]` and `.` becomes `[^\n\x{5F}]`.
+	/// `(?:(?![\x{5F}\x{0A}]).)`, the gap left out too, and for the `regex`
+	/// crate `\w` becomes `[\w--\x{5F}]` and `.` becomes `[^\n\x{5F}]`.
 	fn guard(&mut self, start: usize) {
 		let Some(byte) = self.bytes.stand_in else {
 			return;
 		};
 		match self.target {
 			Target::Pcre => {
-				self.out.insert_str(start, &format!(r"(?:(?!\x{{{byte:02X}}})"));
+				let mut guarded = format!(r"(?:(?![\x{{{byte:02X}}}");
+				if let Some(gap) = self.bytes.gap {
+					guarded.push_str(&format!(r"\x{{{gap:02X}}}"));
+				}
+				guarded.push_str("])");
+				self.out.insert_str(start, &guarded);
 				self.out.push(')');
 			},
 			Target::Rust if &self.out[start..] == "." => {
@@ -2808,7 +2820,7 @@ mod tests {
 		let translated = |pattern: &[u8], target: Target, utf8_locale: bool| {
 			let (text, raw) = pattern_text(pattern);
 			assert!(raw, "{pattern:?}");
-			let bytes = PatternBytes { raw, utf8_locale, stand_in: None };
+			let bytes = PatternBytes { raw, utf8_locale, stand_in: None, gap: None };
 			translate_raw(&text, Dialect::Basic, target, false, bytes)
 		};
 		// The C locale reads a byte to a character, the C.UTF-8 one does not.
@@ -2838,7 +2850,7 @@ mod tests {
 		// case.
 		let folded = |pattern: &[u8], target: Target| {
 			let text = pattern_text(pattern).0;
-			let bytes = PatternBytes { raw: true, utf8_locale: true, stand_in: None };
+			let bytes = PatternBytes { raw: true, utf8_locale: true, stand_in: None, gap: None };
 			translate_raw(&text, Dialect::Basic, target, true, bytes)
 		};
 		assert_eq!(folded(b"[\xc0-\xc1]", Target::Rust), Ok("(?-i:[\u{c0}-\u{c1}\u{e0}-\u{e1}])".to_owned()));
@@ -2889,20 +2901,23 @@ mod tests {
 	#[test]
 	fn a_bracket_member_outside_ascii_is_its_bytes_in_the_c_locale() {
 		// If this regresses, `LC_ALL=C grep '[é]'` matches no byte of `é`.
-		let c = PatternBytes { raw: false, utf8_locale: false, stand_in: None };
+		let c = PatternBytes { raw: false, utf8_locale: false, stand_in: None, gap: None };
 		assert_eq!(translate_raw("[é]", Dialect::Basic, Target::RustBytes, false, c), Ok("[é]".to_owned()));
 	}
 
 	/// A pattern is written so that no `.`, bracket expression or class
-	/// escape matches the stand-in that grep's copy of a line holds.
+	/// escape matches the stand-in or the gap that grep's copy of a line
+	/// holds, and for PCRE2 so that `$` holds at its end alone.
 	#[test]
 	fn a_stand_in_is_matched_by_no_atom_but_a_literal() {
 		// If this regresses, `printf 'ab\377\n' | LC_ALL=C.UTF-8 grep -c
-		// 'b.\|\(x\)\1'` counts 1 where GNU grep 3.11 counts 0.
-		let bytes = PatternBytes { raw: false, utf8_locale: true, stand_in: Some(b'_') };
-		let guarded = r"a(?:(?!\x{5F}).)*(?:(?!\x{5F})[b])(?:(?!\x{5F})\w)";
-		assert_eq!(translate_raw(r"a.*[b]\w", Dialect::Basic, Target::Pcre, false, bytes), Ok(guarded.to_owned()));
-		// For the `regex` crate each is a class without it, of either case.
+		// 'b.\|\(x\)\1'` counts 1 where GNU grep 3.11 counts 0, and `printf
+		// 'a\200\n' | LC_ALL=C.UTF-8 grep -c 'a$\|\(x\)\1'` 1 where it counts 0.
+		let bytes = PatternBytes { raw: false, utf8_locale: true, stand_in: Some(b'_'), gap: Some(b'\n') };
+		let guarded = r"a(?:(?![\x{5F}\x{0A}]).)*(?:(?![\x{5F}\x{0A}])[b])(?:(?![\x{5F}\x{0A}])\w)\z";
+		assert_eq!(translate_raw(r"a.*[b]\w$", Dialect::Basic, Target::Pcre, false, bytes), Ok(guarded.to_owned()));
+		// For the `regex` crate each is a class without it, of either case,
+		// and its line terminator leaves the gap out.
 		let bytes = PatternBytes { stand_in: Some(b'z'), ..bytes };
 		let guarded = r"a[^\n\x{7A}][[^x]--\x{7A}][\w--\x{7A}]";
 		assert_eq!(translate_raw(r"a.[^x]\w", Dialect::Basic, Target::Rust, false, bytes), Ok(guarded.to_owned()));
