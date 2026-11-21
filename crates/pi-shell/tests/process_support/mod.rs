@@ -3,6 +3,8 @@
 //! comparisons need ([`real_bash`]), and a signal sent from outside once the
 //! command a shell waits for has started ([`Run::go_signalled`]).
 
+#![allow(dead_code, reason = "each test crate uses a subset")]
+
 use std::{
 	ffi::{OsStr, OsString},
 	fmt,
