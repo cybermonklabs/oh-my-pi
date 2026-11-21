@@ -21,6 +21,7 @@
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
 - A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context
+- A finished background `task` call no longer keeps every subagent's recent output and tool calls in memory for the rest of the session
 - Checking whether another omp process runs a session, as `omp gc` does, no longer blocks about 50 ms for each session another omp process runs
 - A session that runs many subagents with IRC on no longer keeps IRC state in memory for each subagent once it is parked, killed or released
 - The context figure that the status line, compaction and the rate-limit fallback read now counts the latest answer itself (its text, the thinking that is sent back and its tool-call arguments), so a rate limit after a long answer or a large file write no longer moves a session whose context is past `retry.rateLimitFallbackMaxContextTokens` down the chain
