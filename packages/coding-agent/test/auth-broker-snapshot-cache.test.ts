@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { flush } from "./helpers/fake-clock";
 import { rejectionOf } from "./helpers/rejection";
 
 const ENV_KEYS = [
@@ -69,6 +70,8 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
 		for (const key of ENV_KEYS) {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
@@ -282,14 +285,14 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 		// The broker accepts connections and never answers. Each startup fetch makes two attempts,
 		// each cut by the client's 10 s request timeout, so startup retries once within its 30 s
 		// budget, whose deadline then cancels the third request in flight. Fake time moves only
-		// once the broker has seen the request the step waits for, never by event-loop turns.
+		// in fixed steps, each after the event it waits for, never by event-loop turns.
 		const hang = Promise.withResolvers<Response>();
 		const requests = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
-		let seen = 0;
+		const unseen = [...requests];
 		const server = Bun.serve({
 			port: 0,
 			fetch: () => {
-				requests[seen++]?.resolve();
+				unseen.shift()?.resolve();
 				return hang.promise;
 			},
 		});
@@ -330,12 +333,20 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			vi.advanceTimersByTime(10_000);
 			await before(retried.promise, "the retry");
 			expect(retries).toMatchObject([{ delayMs: 500, budgetMs: 30_000 }]);
-			vi.advanceTimersByTime(500);
+			// No third request before 500 ms of fake time. Fixed steps, not a step to the next timer: the wait
+			// is `scheduler.wait`, which Bun may stop faking. Exactly one turn, not `flush()`'s default: where
+			// that wait runs on real time, the check must come before it can fire.
+			vi.advanceTimersByTime(499);
+			await flush(1);
+			expect(fetched).toHaveBeenCalledTimes(2);
+			vi.advanceTimersByTime(1);
 			await before(requests[2].promise, "the third request");
 			const third = fetched.mock.calls.at(-1)?.[1]?.signal;
 			expect(fetched).toHaveBeenCalledTimes(3);
 			// 1 ms short of 30 s, the third request is still in flight.
 			vi.advanceTimersByTime(9_499);
+			// Let the promise jobs that advance queued run, so an early end shows below.
+			await flush(1);
 			expect(third?.aborted).toBe(false);
 			expect(settled).toBe(false);
 			// At 30 s the deadline cancels it.
@@ -344,10 +355,11 @@ describe("discoverAuthStorage auth-broker snapshot cache", () => {
 			expect(await outcome).toBeInstanceOf(AuthBrokerError);
 			// Giving up is not reported as one more retry.
 			expect(retries).toHaveLength(1);
-			expect(seen).toBe(3);
+			// Counted at the `fetch` spy, so a request started at the deadline counts too.
+			expect(fetched).toHaveBeenCalledTimes(3);
 		} finally {
-			vi.useRealTimers();
-			fetched.mockRestore();
+			// A check that fails before 30 s leaves startup retrying: fire its budget before real timers return.
+			vi.advanceTimersByTime(30_000);
 			hang.resolve(new Response(null, { status: 503 }));
 			server.stop(true);
 		}
