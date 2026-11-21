@@ -48,6 +48,12 @@ export class ConflictProtocolHandler implements ProtocolHandler {
 	}
 
 	async write(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult> {
-		return writeConflictUri(callerSession(context), url.rawHref ?? url.href, content, context?.signal);
+		return writeConflictUri(
+			callerSession(context),
+			url.rawHref ?? url.href,
+			content,
+			context?.signal,
+			context?.onWriteBegin,
+		);
 	}
 }

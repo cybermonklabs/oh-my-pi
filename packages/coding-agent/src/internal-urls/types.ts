@@ -342,6 +342,12 @@ export interface WriteContext {
 	cwd?: string;
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
+	/**
+	 * Called by a handler right before it changes a local file, after its last check of
+	 * `signal`. From then the caller (the `write` tool) waits for the handler and reports
+	 * what it wrote, as for a file write that has begun, instead of returning at the abort.
+	 */
+	onWriteBegin?: () => void;
 	/** Calling session's `local://` root mapping — see {@link ResolveContext.localProtocolOptions}. */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**

@@ -20,6 +20,7 @@ import { clampTimeout, resolveLspTimeouts, TOOL_TIMEOUTS } from "../tools/tool-t
 import {
 	applyWorkspaceEditWithLsp,
 	clearInitializationFailure,
+	collectServerEdits,
 	ensureWorkspaceFolders,
 	getActiveClients,
 	getOrCreateClient,
@@ -1515,17 +1516,20 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
 							applyWorkspaceEdit: async edit => applyWorkspaceEditWithLsp(edit, this.session.cwd, signal),
-							executeCommand: async commandItem => {
-								await sendRequest(
-									client,
-									"workspace/executeCommand",
-									{
-										command: commandItem.command,
-										arguments: commandItem.arguments ?? [],
-									},
-									signal,
+							executeCommand: async (commandItem, serverEdits) => {
+								await collectServerEdits(client, serverEdits, () =>
+									sendRequest(
+										client,
+										"workspace/executeCommand",
+										{
+											command: commandItem.command,
+											arguments: commandItem.arguments ?? [],
+										},
+										signal,
+									),
 								);
 							},
+							signal,
 						});
 
 						if (!appliedAction) {
@@ -1541,6 +1545,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						if (appliedAction.executedCommands.length > 0) {
 							summaryLines.push("  Executed command(s):");
 							summaryLines.push(...appliedAction.executedCommands.map(commandName => `    ${commandName}`));
+						}
+						if (appliedAction.abortedCommands?.length) {
+							summaryLines.push(
+								"  Command(s) not waited for, because the call was cancelled or timed out (edits the server applied for them by then are listed above; it may still apply more):",
+							);
+							summaryLines.push(...appliedAction.abortedCommands.map(commandName => `    ${commandName}`));
 						}
 
 						output = `Applied "${appliedAction.title}":\n${summaryLines.join("\n")}`;
