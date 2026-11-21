@@ -453,12 +453,14 @@ export interface AcpAgentOptions {
 	/**
 	 * Whether this run keeps its sessions in the session store; false under
 	 * `--no-session`. Without it the agent neither advertises nor serves
-	 * `session/list`, `session/load`, `session/resume` and `session/fork`, and
-	 * refuses each with -32601 naming `--no-session`, before it reads the store:
-	 * no session such a run lists or opens could be one it can serve. The
-	 * refusal covers a session of this run too: a `session/load` or
-	 * `session/resume` of a session `session/new` made earlier on the same
-	 * connection is refused as well. Defaults to true.
+	 * `session/list`, `session/load`, `session/resume` and `session/fork`, nor
+	 * serves omp's own listing methods `_omp/sessions/listAll`,
+	 * `_omp/projects/list` and `_omp/chats/byCwd`, and refuses each with -32601
+	 * naming `--no-session`, before it reads the store: no session such a run
+	 * lists or opens could be one it can serve. The refusal covers a session of
+	 * this run too: a `session/load` or `session/resume` of a session
+	 * `session/new` made earlier on the same connection is refused as well.
+	 * Defaults to true.
 	 */
 	persistSessions?: boolean;
 }
@@ -1657,6 +1659,7 @@ export class AcpAgent implements Agent {
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
+				this.#assertPersistedSessions(method);
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(5000, params.limit as number)) : 1000;
 				const sessions = await SessionManager.listAll();
 				const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
@@ -1666,6 +1669,7 @@ export class AcpAgent implements Agent {
 				};
 			}
 			case "_omp/projects/list": {
+				this.#assertPersistedSessions(method);
 				const sessions = await SessionManager.listAll();
 				const buckets = new Map<
 					string,
@@ -1694,6 +1698,7 @@ export class AcpAgent implements Agent {
 				return { projects, totalSessions: sessions.length };
 			}
 			case "_omp/chats/byCwd": {
+				this.#assertPersistedSessions(method);
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				if (!cwd) throw new Error("cwd required");
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(500, params.limit as number)) : 100;

@@ -3,13 +3,14 @@
  * the launch's own session does under `--no-session`, so it opens and writes
  * nothing in the configured session store; and the agent neither advertises nor
  * serves `session/list`, `session/load`, `session/resume` and `session/fork`,
- * which read the store, so they open nothing either. The launch runs through
- * `runRootCommand`, so the start-up's store resolution, the arguments the ACP
- * session factory receives and the options the ACP server gets are the CLI's
- * own. `runAcpMode` stands in for the ACP server: it makes sessions through the
- * factory as `session/new` does (acp-agent.ts, `#createNewSessionRecord`: the
- * factory, then `ensureOnDisk()`), or serves requests through an `AcpAgent`
- * built with the options it was given.
+ * nor omp's own listing methods (`_omp/sessions/listAll`, `_omp/projects/list`,
+ * `_omp/chats/byCwd`), which read the store, so they open nothing either. The
+ * launch runs through `runRootCommand`, so the start-up's store resolution, the
+ * arguments the ACP session factory receives and the options the ACP server
+ * gets are the CLI's own. `runAcpMode` stands in for the ACP server: it makes
+ * sessions through the factory as `session/new` does (acp-agent.ts,
+ * `#createNewSessionRecord`: the factory, then `ensureOnDisk()`), or serves
+ * requests through an `AcpAgent` built with the options it was given.
  */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
@@ -198,7 +199,7 @@ describe("omp --mode acp under session.storage: sql", () => {
 		expect(sqliteSessionRows(databasePath, created.sessionId ?? "")).toBe(1);
 	}, 30_000);
 
-	it("--no-session: the agent advertises only session/close, and refuses session/list, load, resume and fork with -32601, naming --no-session, without opening the store", async () => {
+	it("--no-session: the agent advertises only session/close, and refuses session/list, load, resume, fork and omp's listing methods with -32601, naming --no-session, without opening the store", async () => {
 		const dir = TempDir.createSync("@omp-acp-no-session-refuse-");
 		tempDirs.push(dir);
 		const databasePath = dir.join("sessions.db");
@@ -216,6 +217,9 @@ describe("omp --mode acp under session.storage: sql", () => {
 			refusals["session/load"] = await refusal(agent.loadSession(request));
 			refusals["session/resume"] = await refusal(agent.resumeSession(request));
 			refusals["session/fork"] = await refusal(agent.unstable_forkSession(request));
+			refusals["_omp/sessions/listAll"] = await refusal(agent.extMethod("_omp/sessions/listAll", {}));
+			refusals["_omp/projects/list"] = await refusal(agent.extMethod("_omp/projects/list", {}));
+			refusals["_omp/chats/byCwd"] = await refusal(agent.extMethod("_omp/chats/byCwd", { cwd: dir.path() }));
 			await agent.dispose();
 		});
 
@@ -236,6 +240,9 @@ describe("omp --mode acp under session.storage: sql", () => {
 				"session/load": refused("session/load"),
 				"session/resume": refused("session/resume"),
 				"session/fork": refused("session/fork"),
+				"_omp/sessions/listAll": refused("_omp/sessions/listAll"),
+				"_omp/projects/list": refused("_omp/projects/list"),
+				"_omp/chats/byCwd": refused("_omp/chats/byCwd"),
 			},
 			tables: [],
 		});

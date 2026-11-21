@@ -681,7 +681,7 @@ describe("ACP agent without session persistence (--no-session)", () => {
 		}
 	}
 
-	it("refuses session/list, session/load, session/resume and session/fork with -32601, naming --no-session, and still serves session/new", async () => {
+	it("refuses session/list, session/load, session/resume, session/fork and omp's listing methods with -32601, naming --no-session, and still serves session/new", async () => {
 		const harness = await createHarness({ agentOptions: { persistSessions: false }, inMemorySessions: true });
 		const stored = await storedSession(harness.cwdA);
 		const before = harness.sessions.length;
@@ -692,6 +692,9 @@ describe("ACP agent without session persistence (--no-session)", () => {
 			"session/load": await refusal(harness.agent.loadSession(request)),
 			"session/resume": await refusal(harness.agent.resumeSession(request)),
 			"session/fork": await refusal(harness.agent.unstable_forkSession(request)),
+			"_omp/sessions/listAll": await refusal(harness.agent.extMethod("_omp/sessions/listAll", {})),
+			"_omp/projects/list": await refusal(harness.agent.extMethod("_omp/projects/list", {})),
+			"_omp/chats/byCwd": await refusal(harness.agent.extMethod("_omp/chats/byCwd", { cwd: harness.cwdA })),
 		};
 
 		const refused = (method: string) =>
@@ -701,6 +704,9 @@ describe("ACP agent without session persistence (--no-session)", () => {
 			"session/load": refused("session/load"),
 			"session/resume": refused("session/resume"),
 			"session/fork": refused("session/fork"),
+			"_omp/sessions/listAll": refused("_omp/sessions/listAll"),
+			"_omp/projects/list": refused("_omp/projects/list"),
+			"_omp/chats/byCwd": refused("_omp/chats/byCwd"),
 		});
 		// The refusals made no session.
 		expect(harness.sessions.length).toBe(before);
