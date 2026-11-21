@@ -649,6 +649,12 @@ impl crate::bash::Host for PiHost {
 		self.pipe_tap.clone()
 	}
 
+	/// Two external stages share one OS pipe where the platform gives the
+	/// shell a private non-blocking end of it ([`crate::sys::stage_pipe`]).
+	fn os_pipe(&mut self, prefill: &[u8]) -> Option<(Box<dyn File>, Box<dyn File>)> {
+		crate::sys::stage_pipe::os_pipe(prefill)
+	}
+
 	fn fs(&mut self) -> &mut dyn Fs {
 		&mut *self.fs
 	}

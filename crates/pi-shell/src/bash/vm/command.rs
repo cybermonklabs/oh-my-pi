@@ -33,8 +33,8 @@ use crate::bash::{
 	fd::{FdOrigin, FdRef},
 	fs::StatKind,
 	host::{
-		ChildRedirs, EnvView, ExitStatus, Invocation, ProcEvent, ResolveCtx, Resolved, SpawnSpec,
-		StdioSpec, Via,
+		ChildRedirs, EnvView, ExitStatus, Host, Invocation, ProcEvent, ResolveCtx, Resolved,
+		SpawnSpec, StdioSpec, Via,
 	},
 	ids::{CallId, CmdTag, IntrinsicId, RunId},
 	ir::{self, AssignVal, Op, Part, Unit},
@@ -2419,13 +2419,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				env: &env,
 				cwd: BStr::new(&vp.cwd),
 				stdio: [
-					stdio_spec(&vp.fds.handle(0), false),
-					stdio_spec(&vp.fds.handle(1), true),
-					stdio_spec(&vp.fds.handle(2), true),
+					stdio_spec(cx.host, &vp.fds.handle(0), false),
+					stdio_spec(cx.host, &vp.fds.handle(1), true),
+					stdio_spec(cx.host, &vp.fds.handle(2), true),
 				],
 				extra_fds: extra_fds(vp)
 					.iter()
-					.map(|(fd, h)| (*fd, stdio_spec(h, false)))
+					.map(|(fd, h)| (*fd, stdio_spec(cx.host, h, false)))
 					.collect(),
 				pgroup,
 				tag,
@@ -5154,8 +5154,11 @@ fn spawn_error(name: BString, err: std::io::Error) -> (Diag, i32) {
 
 /// How an external gets fd object `h`, as its input or its `output`: a
 /// slot the script closed stays closed (bash's child inherits it so); an
-/// object a restore lost reads as the null device.
-fn stdio_spec(h: &FdRef, output: bool) -> StdioSpec {
+/// object a restore lost reads as the null device. An end of a pipe between
+/// pipeline stages first becomes an end of an OS pipe the host makes
+/// ([`FdRef::share_with_external`]), which the external then inherits.
+fn stdio_spec(host: &mut dyn Host, h: &FdRef, output: bool) -> StdioSpec {
+	h.share_with_external(|prefill| host.os_pipe(prefill));
 	let os = if output {
 		h.os_output_handle()
 	} else {

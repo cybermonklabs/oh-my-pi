@@ -546,7 +546,7 @@ fn kind_of(ft: fs::FileType) -> StatKind {
 	StatKind::CharDev
 }
 
-fn stat_of(meta: &fs::Metadata) -> Stat {
+pub(super) fn stat_of(meta: &fs::Metadata) -> Stat {
 	let kind = kind_of(meta.file_type());
 	let since_epoch = |t: io::Result<std::time::SystemTime>| {
 		t.ok()

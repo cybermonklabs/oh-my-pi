@@ -16,6 +16,9 @@
 //! - [`Parker`]: blocks a drive loop's thread until the engine may make
 //!   progress; on Linux it also waits for the exits of externals spawned with
 //!   [`Exits::Park`].
+//! - [`stage_pipe`]: the OS pipe a pipeline's memory pipe becomes once an
+//!   external takes one of its ends, so two external stages share one kernel
+//!   pipe (Linux; elsewhere the memory pipe stays and is pumped).
 //! - `proc` (Unix): the process table, session and group membership,
 //!   identity-pinned signals.
 //! - [`pathext`]: Windows `PATHEXT` executable resolution.
@@ -44,14 +47,18 @@ mod ready;
 pub mod regex;
 mod relay;
 pub mod rlimit;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod room;
 pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
 mod spawn;
+pub mod stage_pipe;
 pub mod tty;
 pub mod uname;
 pub mod user;
 pub mod utmp;
+mod wakers;
 
 #[cfg(windows)]
 pub(crate) use crate::sys::spawn::break_console_groups;
