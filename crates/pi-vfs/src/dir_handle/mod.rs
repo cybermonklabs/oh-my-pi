@@ -44,6 +44,8 @@ mod tests;
 #[cfg(any(windows, test))]
 mod wtf8;
 
+#[cfg(unix)]
+use std::sync::Arc;
 use std::{
 	borrow::Cow,
 	cell::RefCell,
@@ -55,6 +57,8 @@ use std::{
 use tokio::runtime::Handle;
 
 pub use self::listing::{Detail, FileInfo, FileType, Listing, Record, Stamp};
+#[cfg(unix)]
+use crate::fs::{FifoEnd, FifoOpening, FifoRelease};
 use crate::{
 	error::crosses_devices,
 	file::File,
@@ -206,11 +210,18 @@ impl fmt::Debug for DirHandle {
 	}
 }
 
-/// `name`'s bytes when it is one entry name: not empty, `.` or `..`, and
-/// holding no separator.
+/// `name`'s bytes when it is one entry name: exactly one normal path
+/// component, so not empty, `.` or `..`, holding no separator, and on Windows
+/// carrying no drive or UNC prefix (`C:x`, which a join to a directory's path
+/// would turn into that drive's current directory).
 fn entry_name(name: &OsStr) -> io::Result<&[u8]> {
 	let bytes = name.as_encoded_bytes();
-	if matches!(bytes, b"" | b"." | b"..") || bytes.iter().any(|&b| is_rel_separator(b)) {
+	let mut parts = Path::new(name).components();
+	let one = matches!(
+		(parts.next(), parts.next()),
+		(Some(std::path::Component::Normal(part)), None) if part == name
+	);
+	if !one || bytes.iter().any(|&b| is_rel_separator(b)) {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name"));
 	}
 	Ok(bytes)
@@ -464,9 +475,11 @@ async fn provider_open_dir_at(provided: &Provided, name: &OsStr) -> io::Result<D
 	Ok(provided.dir(path))
 }
 
-/// The host side of [`DirHandle::open_at`]: the file is bound to the
-/// facade's scope, as its host opens bind theirs, so its reads observe the
-/// scope's cancellation.
+/// The host side of [`DirHandle::open_at`] for blocking callers: the file is
+/// bound to the facade's scope, as its host opens bind theirs, so its reads
+/// observe the scope's cancellation. Under a cancellable scope on Unix, a
+/// FIFO's wait for its other end observes the token too
+/// ([`host_fifo_end`]).
 fn host_open_at(
 	s: &mut native::Scratch,
 	handle: &native::Handle,
@@ -474,9 +487,110 @@ fn host_open_at(
 	name: &[u8],
 	options: &OpenOptions,
 ) -> io::Result<File> {
-	let mask = scope.creation_mask.filter(|_| cfg!(unix));
-	let file = native::open_at(s, handle, name, options, mask)?;
+	#[cfg(unix)]
+	if let Some(token) = &scope.cancel
+		&& let Some(end) = host_fifo_end(s, handle, name, options)
+	{
+		let file = host_fifo_open(handle, scope, name, options, end, token)?.wait(token)?;
+		return Ok(file.bind_host(token.clone(), true));
+	}
+	open_host_entry(s, handle, scope, name, options)
+}
+
+/// The host side of [`DirHandle::open_at_async`]. On Unix a FIFO's wait for
+/// its other end runs on a helper thread and is awaited, so it never holds
+/// the runtime worker that end may need (a task of the same runtime), and
+/// it observes the scope's token.
+#[cfg_attr(
+	not(unix),
+	allow(clippy::unused_async, reason = "the FIFO wait is awaited only on Unix")
+)]
+async fn host_open_at_async(
+	handle: &native::Handle,
+	scope: &Scope,
+	name: &[u8],
+	options: &OpenOptions,
+) -> io::Result<File> {
+	#[cfg(unix)]
+	if let Some(end) = with_scratch(|s| host_fifo_end(s, handle, name, options)) {
+		let token = scope.cancel.clone().unwrap_or_default();
+		let file = host_fifo_open(handle, scope, name, options, end, &token)?
+			.wait_async(&token)
+			.await?;
+		return Ok(if scope.cancel.is_some() {
+			file.bind_host(token, true)
+		} else {
+			file
+		});
+	}
+	with_scratch(|s| open_host_entry(s, handle, scope, name, options))
+}
+
+/// Opens `name` in `handle` under `scope`'s creation mask, the file bound
+/// to the scope.
+fn open_host_entry(
+	s: &mut native::Scratch,
+	handle: &native::Handle,
+	scope: &Scope,
+	name: &[u8],
+	options: &OpenOptions,
+) -> io::Result<File> {
+	let file = native::open_at(s, handle, name, options, host_mask(scope))?;
 	Ok(File::from(file).bind(scope))
+}
+
+/// The end of a FIFO an `open_at` of `name` with `options` waits on: when
+/// the open can block (read-only or write-only, without `O_NONBLOCK`, not
+/// creating the entry new) and `name` is a FIFO, by one `fstatat` that does
+/// not follow a symlink there (the open refuses one anyway). If the entry
+/// changes between the `fstatat` and the open, it is opened as the
+/// `fstatat` described it, as the facade's opens are.
+#[cfg(unix)]
+fn host_fifo_end(
+	s: &mut native::Scratch,
+	handle: &native::Handle,
+	name: &[u8],
+	options: &OpenOptions,
+) -> Option<FifoEnd> {
+	if options.is_create_new() || options.get_custom_flags() & libc::O_NONBLOCK != 0 {
+		return None;
+	}
+	let end = match (options.is_read(), options.is_writable()) {
+		(true, false) if !options.is_create() => FifoEnd::Read,
+		(false, true) => FifoEnd::Write,
+		_ => return None,
+	};
+	let meta = native::stat_at(s, handle, name, false).ok()?;
+	meta.file_type().is_fifo().then_some(end)
+}
+
+/// Starts the open of `end` of the FIFO `name` in `handle` on a helper
+/// thread ([`FifoOpening`]), through a duplicate of the directory's
+/// descriptor; a cancelled or dropped open is released by a non-blocking
+/// open of the other end relative to the same directory.
+#[cfg(unix)]
+fn host_fifo_open(
+	handle: &native::Handle,
+	scope: &Scope,
+	name: &[u8],
+	options: &OpenOptions,
+	end: FifoEnd,
+	token: &tokio_util::sync::CancellationToken,
+) -> io::Result<FifoOpening> {
+	let dir = Arc::new(handle.try_clone()?);
+	let releasable = native::may_access_at(handle, name, end.release_access());
+	let (open_dir, open_name, options, mask) =
+		(Arc::clone(&dir), name.to_vec(), options.clone(), host_mask(scope));
+	let (release_name, writer) = (name.to_vec(), end.released_by_writer());
+	let release: FifoRelease = Arc::new(move || native::touch_fifo_at(&dir, &release_name, writer));
+	FifoOpening::spawn(
+		move || {
+			with_scratch(|s| native::open_at(s, &open_dir, &open_name, &options, mask)).map(File::from)
+		},
+		release,
+		releasable,
+		token,
+	)
 }
 
 const fn provider_dir_options(mode: Option<u32>) -> DirOptions {
@@ -499,7 +613,9 @@ impl DirHandle {
 			(DirRepr::Host { handle, .. }, DirRepr::Host { handle: to, .. }) => {
 				Ok(RenamePair::Host(handle, to))
 			},
-			(DirRepr::Provider(from), DirRepr::Provider(to)) => Ok(RenamePair::Provider(from, to)),
+			(DirRepr::Provider(from), DirRepr::Provider(to)) if from.fs.ptr_eq(&to.fs) => {
+				Ok(RenamePair::Provider(from, to))
+			},
 			_ => Err(crosses_devices()),
 		}
 	}
@@ -674,18 +790,25 @@ impl DirHandle {
 
 	/// Opens the entry `name` as `options` say, never through a symlink
 	/// there: `ELOOP` on Unix, `ERROR_STOPPED_ON_SYMLINK` on Windows, and on a
-	/// provider [`is_symlink_refusal`]'s error for one there when checked. A
-	/// file it creates gets the mode `options` give (`0o666` by default) as
-	/// the facade's host opens give it: less the process umask, or exactly
-	/// less the facade's creation mask. The file's reads observe the facade's
-	/// cancellation, as files opened through the facade do; a FIFO's open
-	/// itself waits for its other end, without the token.
+	/// provider [`is_symlink_refusal`]'s error for one there when checked. No
+	/// directory: `O_DIRECTORY` is refused, as [`Self::open_dir_at`] opens
+	/// one. A file it creates gets the mode `options` give (`0o666` by
+	/// default) as the facade's host opens give it: less the process umask,
+	/// or exactly less the facade's creation mask. The file's reads observe
+	/// the facade's cancellation, as files opened through the facade do.
+	///
+	/// A FIFO's open waits for its other end. On the host on Unix,
+	/// [`Self::open_at_async`] waits on a helper thread, holding no runtime
+	/// worker, and this call waits on the calling thread; both observe a
+	/// cancellable facade's token, as the facade's own opens do.
 	///
 	/// # Errors
 	///
-	/// A `name` that is not one entry name; the refusal of a symlink; the
-	/// open's errors, `EINVAL` for options [`std::fs::OpenOptions`] refuses
-	/// included.
+	/// A `name` that is not one entry name; the refusal of a symlink;
+	/// [`io::ErrorKind::InvalidInput`] for `O_DIRECTORY`; the open's errors,
+	/// `EINVAL` for options [`std::fs::OpenOptions`] refuses included; the
+	/// facade's cancellation error once its token fires during a FIFO's
+	/// wait.
 	pub fn open_at(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
 		let bytes = entry_name(name)?;
 		self.call(
@@ -701,12 +824,10 @@ impl DirHandle {
 	/// As for [`Self::open_at`].
 	pub async fn open_at_async(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
 		let bytes = entry_name(name)?;
-		self
-			.call_async(
-				|s, handle, scope| host_open_at(s, handle, scope, bytes, options),
-				|provided| provider_open_at(provided, name, options),
-			)
-			.await
+		match &self.repr {
+			DirRepr::Host { handle, scope } => host_open_at_async(handle, scope, bytes, options).await,
+			DirRepr::Provider(provided) => provider_open_at(provided, name, options).await,
+		}
 	}
 
 	/// Creates the directory `name` with `mode` (`0o777` by default) as the
@@ -772,13 +893,15 @@ impl DirHandle {
 	}
 
 	/// Renames the entry `from` to the entry `to` of `to_dir`, replacing what
-	/// `rename(2)` replaces. Both handles must be host handles or both
-	/// provider handles.
+	/// `rename(2)` replaces. Both handles must be host handles, or both path
+	/// handles on one facade ([`Fs::ptr_eq`]): the rename is one call of that
+	/// facade, which resolves both paths.
 	///
 	/// # Errors
 	///
 	/// A name that is not one entry name; [`crate::crosses_devices`] for one
-	/// host and one provider handle; the rename's errors.
+	/// host and one path handle, or path handles on two facades; the rename's
+	/// errors.
 	pub fn rename_at(&self, from: &OsStr, to_dir: &Self, to: &OsStr) -> io::Result<()> {
 		let (from_bytes, to_bytes) = (entry_name(from)?, entry_name(to)?);
 		match self.rename_pair(to_dir)? {
@@ -1288,7 +1411,7 @@ pub(crate) fn temp_root() -> PathBuf {
 /// in that process, which runs the test's body. For a test that reads or
 /// sets what is the process's (the kernel fallbacks, the scratch pool, the
 /// umask), so no other test of the same process changes it meanwhile.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn alone(name: &str) -> bool {
 	const ALONE: &str = "PI_VFS_TEST_ALONE";
 	if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
@@ -1299,7 +1422,8 @@ pub(crate) fn alone(name: &str) -> bool {
 		.env(ALONE, name)
 		.output()
 		.expect("run the test in a process of its own");
-	let (out, err) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+	let (out, err) =
+		(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 	assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
 	assert!(out.contains("1 passed"), "{name} ran no test in a process of its own:\n{out}\n{err}");
 	true

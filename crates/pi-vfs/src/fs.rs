@@ -279,7 +279,7 @@ async fn native_open_scoped_async(
 /// The end of a FIFO an open takes.
 #[cfg(unix)]
 #[derive(Clone, Copy)]
-enum FifoEnd {
+pub(crate) enum FifoEnd {
 	/// Waits for a writer.
 	Read,
 	/// Waits for a reader.
@@ -289,11 +289,16 @@ enum FifoEnd {
 #[cfg(unix)]
 impl FifoEnd {
 	/// The `faccessat` mode a release of this end needs: it opens the other.
-	const fn release_access(self) -> libc::c_int {
+	pub(crate) const fn release_access(self) -> libc::c_int {
 		match self {
 			Self::Read => libc::W_OK,
 			Self::Write => libc::R_OK,
 		}
+	}
+
+	/// Whether a release of this end opens the write end.
+	pub(crate) const fn released_by_writer(self) -> bool {
+		matches!(self, Self::Read)
 	}
 
 	/// A non-blocking open of the other end, which releases a waiting open
@@ -313,6 +318,11 @@ impl FifoEnd {
 /// open, one poll slice apart, before it leaves the helper blocked.
 #[cfg(unix)]
 const FIFO_RELEASE_ATTEMPTS: usize = 10;
+
+/// A non-blocking open of the other end of the FIFO a [`FifoOpening`] opens,
+/// closed at once; `ENXIO` while no open of this end waits yet.
+#[cfg(unix)]
+pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 /// One end of a FIFO being opened on a helper thread, so that the wait for
 /// the other end observes a token and, for async callers, holds no runtime
@@ -338,9 +348,8 @@ const FIFO_RELEASE_ATTEMPTS: usize = 10;
 /// writer's first write fails with `EPIPE`, the next reader reads EOF. Without
 /// a token the whole command would have stayed blocked there instead.
 #[cfg(unix)]
-struct FifoOpening {
-	path:       PathBuf,
-	end:        FifoEnd,
+pub(crate) struct FifoOpening {
+	release:    FifoRelease,
 	releasable: bool,
 	opened:     std::sync::mpsc::Receiver<io::Result<File>>,
 	/// Notified once the helper has sent its result.
@@ -351,6 +360,7 @@ struct FifoOpening {
 
 #[cfg(unix)]
 impl FifoOpening {
+	/// Opens `end` of the FIFO at `path` under `scope`.
 	fn start(
 		scope: &Scope,
 		path: &Path,
@@ -358,32 +368,45 @@ impl FifoOpening {
 		end: FifoEnd,
 		token: &CancellationToken,
 	) -> io::Result<Self> {
+		let (scope, owned_path, options) = (scope.clone(), path.to_path_buf(), options.clone());
+		let release_path = path.to_path_buf();
+		let release: FifoRelease =
+			Arc::new(move || native::open(&release_path, &end.release_options()).map(drop));
+		Self::spawn(
+			move || native_open(&scope, &owned_path, &options),
+			release,
+			may_access(path, end.release_access()),
+			token,
+		)
+	}
+
+	/// Runs `open`, a blocking open of one end of a FIFO, on a helper thread;
+	/// `release` opens the other end without blocking, which this process
+	/// may when `releasable`.
+	pub(crate) fn spawn(
+		open: impl FnOnce() -> io::Result<File> + Send + 'static,
+		release: FifoRelease,
+		releasable: bool,
+		token: &CancellationToken,
+	) -> io::Result<Self> {
 		if token.is_cancelled() {
 			return Err(crate::cancelled());
 		}
 		let (sender, opened) = std::sync::mpsc::sync_channel(1);
 		let done = Arc::new(tokio::sync::Notify::new());
-		let (scope, owned_path, options, notify) =
-			(scope.clone(), path.to_path_buf(), options.clone(), done.clone());
+		let notify = done.clone();
 		std::thread::Builder::new()
 			.name("pi-vfs-fifo-open".to_owned())
 			.spawn(move || {
 				// After a cancellation nobody receives; the file then closes here.
-				let _ = sender.send(native_open(&scope, &owned_path, &options));
+				let _ = sender.send(open());
 				notify.notify_one();
 			})?;
-		Ok(Self {
-			path: path.to_path_buf(),
-			end,
-			releasable: may_access(path, end.release_access()),
-			opened,
-			done,
-			settled: false,
-		})
+		Ok(Self { release, releasable, opened, done, settled: false })
 	}
 
 	/// Waits for the open on this thread, in poll slices, checking `token`.
-	fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
+	pub(crate) fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
 		use std::sync::mpsc::RecvTimeoutError;
 		loop {
 			match self.opened.recv_timeout(POLL_SLICE) {
@@ -402,7 +425,7 @@ impl FifoOpening {
 	}
 
 	/// Awaits the open or `token`, whichever comes first.
-	async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
+	pub(crate) async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
 		tokio::select! {
 			biased;
 			() = self.done.notified() => {},
@@ -427,7 +450,7 @@ impl FifoOpening {
 	/// slices.
 	fn cancel(mut self) -> io::Result<File> {
 		if self.releasable {
-			release_fifo_open(&self.path, self.end, &self.opened);
+			release_fifo_open(&*self.release, &self.opened);
 		}
 		self.settled = true;
 		Err(crate::cancelled())
@@ -445,8 +468,8 @@ impl Drop for FifoOpening {
 		if self.settled || !self.releasable {
 			return;
 		}
-		match native::open(&self.path, &self.end.release_options()) {
-			Ok(_release) => {
+		match (self.release)() {
+			Ok(()) => {
 				// The helper's open returns as soon as it sees the release.
 				let _ = self.opened.recv_timeout(POLL_SLICE);
 				return;
@@ -456,41 +479,39 @@ impl Drop for FifoOpening {
 		}
 		let (_, placeholder) = std::sync::mpsc::sync_channel(0);
 		let opened = std::mem::replace(&mut self.opened, placeholder);
-		let (path, end) = (std::mem::take(&mut self.path), self.end);
+		let release = Arc::clone(&self.release);
 		let _ = std::thread::Builder::new()
 			.name("pi-vfs-fifo-release".to_owned())
-			.spawn(move || release_fifo_open(&path, end, &opened));
+			.spawn(move || release_fifo_open(&*release, &opened));
 	}
 }
 
-/// Releases a helper's open of one end of the FIFO at `path`; see
-/// [`release_attempt`]. Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
+/// Releases a helper's open of one end of a FIFO; see [`release_attempt`].
+/// Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
 #[cfg(unix)]
 fn release_fifo_open(
-	path: &Path,
-	end: FifoEnd,
+	release: &(dyn Fn() -> io::Result<()> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) {
 	for _ in 0..FIFO_RELEASE_ATTEMPTS {
-		if release_attempt(path, end, opened) {
+		if release_attempt(release, opened) {
 			break;
 		}
 	}
 }
 
-/// One attempt to release a helper's open of one end of the FIFO at `path`:
-/// a non-blocking open of the other end, then a wait of one poll slice for
-/// the helper's result, which is dropped. `false` when another attempt is
-/// due: the helper has not reached `open` yet (`ENXIO`) and has not
-/// answered.
+/// One attempt to release a helper's open of one end of a FIFO: a
+/// non-blocking open of the other end (`release`), then a wait of one poll
+/// slice for the helper's result, which is dropped. `false` when another
+/// attempt is due: the helper has not reached `open` yet (`ENXIO`) and has
+/// not answered.
 #[cfg(unix)]
 fn release_attempt(
-	path: &Path,
-	end: FifoEnd,
+	release: &(dyn Fn() -> io::Result<()> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) -> bool {
 	use std::sync::mpsc::RecvTimeoutError;
-	if let Err(err) = native::open(path, &end.release_options())
+	if let Err(err) = release()
 		&& err.raw_os_error() != Some(libc::ENXIO)
 	{
 		return true;
@@ -838,6 +859,15 @@ impl Fs {
 			.map(|mount| &mount.file)
 	}
 
+	/// Whether a descriptor overlay is mounted below `path`, which a host
+	/// directory handle would reach past.
+	fn mounts_below(&self, path: &Path) -> bool {
+		self
+			.mounts
+			.as_ref()
+			.is_some_and(|mounts| mounts.iter().any(|mount| mount.path.starts_with(path)))
+	}
+
 	fn route(&self, path: &Path) -> io::Result<Route<'_>> {
 		if let Some(file) = self.mounted(path) {
 			return Ok(Route::Mounted(file));
@@ -1014,7 +1044,10 @@ impl Fs {
 	/// Unix, also on a kernel that follows one despite `O_NOFOLLOW`;
 	/// `ERROR_STOPPED_ON_SYMLINK` on Windows; [`not_a_directory`] on a
 	/// provider). A host handle keeps this facade's creation mask and
-	/// cancellation for the files and directories it creates and opens.
+	/// cancellation for the files and directories it creates and opens. A
+	/// host directory with a descriptor overlay mounted below it opens as a
+	/// path handle on this facade ([`Self::open_dir_by_path`]), so its calls
+	/// reach the overlay, as this facade's own calls do.
 	///
 	/// # Errors
 	///
@@ -1023,8 +1056,10 @@ impl Fs {
 	pub async fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
 		let path = path.as_ref();
 		match self.route(path)? {
-			Route::Native => DirHandle::open_host(path, follow, &self.scope),
-			Route::Provider(_) => {
+			Route::Native if !self.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.scope)
+			},
+			Route::Native | Route::Provider(_) => {
 				DirHandle::open_provider(self, Handle::try_current().ok(), path, follow).await
 			},
 			Route::Mounted(_) => Err(not_a_directory()),
@@ -1694,8 +1729,10 @@ impl BlockingFs {
 	pub fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
 		let path = path.as_ref();
 		match self.fs.route(path)? {
-			Route::Native => DirHandle::open_host(path, follow, &self.fs.scope),
-			Route::Provider(_) => {
+			Route::Native if !self.fs.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.fs.scope)
+			},
+			Route::Native | Route::Provider(_) => {
 				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
 				block_on(
 					self.runtime.as_ref(),

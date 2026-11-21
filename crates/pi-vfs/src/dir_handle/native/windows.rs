@@ -67,6 +67,7 @@ use windows_sys::{
 			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FileDispositionInfo,
 			FileDispositionInfoEx, GetFileInformationByHandle, GetFinalPathNameByHandleW,
 			GetVolumeInformationByHandleW, ReadFile, SYNCHRONIZE, SetFileInformationByHandle,
+			VOLUME_NAME_GUID,
 		},
 		System::IO::{IO_STATUS_BLOCK, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 	},
@@ -865,19 +866,30 @@ pub(crate) fn stable_stamps(h: &Handle, _stamp: &Stamp) -> bool {
 // The general calls of `DirHandle`: each names one entry of `dir`.
 
 /// The final path of the directory `h` (`\\?\` form), which the general
-/// calls join an entry name to.
+/// calls join an entry name to: with its drive letter, or on a volume that
+/// has none, its volume GUID (`\\?\Volume{...}\`).
 fn final_path(h: &Handle) -> io::Result<PathBuf> {
+	match final_path_as(h, FILE_NAME_NORMALIZED) {
+		// No drive letter for the volume: `GetFinalPathNameByHandleW`'s
+		// documented error for `VOLUME_NAME_DOS` there.
+		Err(err)
+			if err.raw_os_error()
+				== Some(windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND as i32) =>
+		{
+			final_path_as(h, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID)
+		},
+		result => result,
+	}
+}
+
+/// [`final_path`] with `GetFinalPathNameByHandleW`'s `flags`.
+fn final_path_as(h: &Handle, flags: u32) -> io::Result<PathBuf> {
 	use std::os::windows::ffi::OsStringExt;
 	let mut buf = vec![0u16; 512];
 	loop {
 		// SAFETY: `buf` is writable for the length passed.
 		let n = unsafe {
-			GetFinalPathNameByHandleW(
-				h.as_raw_handle(),
-				buf.as_mut_ptr(),
-				buf.len() as u32,
-				FILE_NAME_NORMALIZED,
-			)
+			GetFinalPathNameByHandleW(h.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, flags)
 		} as usize;
 		if n == 0 {
 			return Err(io::Error::last_os_error());
@@ -892,7 +904,13 @@ fn final_path(h: &Handle) -> io::Result<PathBuf> {
 }
 
 /// The entry `name` (one WTF-8 component) of the directory `h`, by path.
+/// A handle on a reparse point (a directory symlink or junction
+/// [`open_child`] opened itself) is refused (`ERROR_STOPPED_ON_SYMLINK`):
+/// its path names the link, which a path-based call would follow.
 fn entry_path(h: &Handle, name: &[u8]) -> io::Result<PathBuf> {
+	if query_handle(h)?.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return Err(win_error(ERROR_STOPPED_ON_SYMLINK));
+	}
 	Ok(final_path(h)?.join(os_name(name)))
 }
 

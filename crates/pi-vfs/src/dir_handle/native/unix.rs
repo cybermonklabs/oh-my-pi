@@ -437,6 +437,15 @@ pub(crate) fn stat_at(
 /// combination it refuses), then the custom flags past the access mode.
 fn open_flags(options: &OpenOptions) -> io::Result<c_int> {
 	let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
+	if options.get_custom_flags() & libc::O_DIRECTORY != 0 {
+		// A directory opens only through `open_dir_at`, which refuses a
+		// symlink also on a kernel that follows one despite `O_NOFOLLOW`
+		// when `O_DIRECTORY` is set.
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"open_at opens no directory: open it with open_dir_at",
+		));
+	}
 	let (read, write, append) = (options.is_read(), options.is_write(), options.is_append());
 	let access = match (read, write, append) {
 		(true, false, false) => libc::O_RDONLY,
@@ -501,8 +510,11 @@ pub(crate) fn open_at(
 }
 
 /// `mkdirat` of `name` in `dir` with `mode` (`0o777` by default) less the
-/// process umask; with a creation `mask`, exactly `mode` less `mask` (set
-/// again after the create, best effort).
+/// process umask; with a creation `mask`, exactly `mode` less `mask`: the
+/// mode is set again after the create, on a descriptor of the directory
+/// opened as [`open_child`] opens one, so never through a symlink swapped in
+/// for it. Best effort: a directory this process cannot open (no owner read
+/// in the mode asked) keeps the stricter mode the process umask left.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -519,9 +531,11 @@ pub(crate) fn create_dir_at(
 	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, mode as libc::mode_t) })?;
 	#[cfg(test)]
 	seams::fire_after_create_dir(entry);
-	if mask.is_some() {
-		// SAFETY: as above; the directory was just made, so `name` is one.
-		let _ = retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode as libc::mode_t, 0) });
+	if mask.is_some()
+		&& let Ok(made) = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
+	{
+		// SAFETY: `made` is an open descriptor.
+		let _ = retry(|| unsafe { libc::fchmod(made.as_raw_fd(), mode as libc::mode_t) });
 	}
 	Ok(())
 }
@@ -601,7 +615,10 @@ pub(crate) fn read_link_at(s: &mut Scratch, dir: &Handle, name: &[u8]) -> io::Re
 }
 
 /// `fchmodat` of `name` in `dir`; without `follow` a symlink there is not
-/// followed (Linux refuses to change one: `EOPNOTSUPP`).
+/// followed: Linux refuses to change one (`EOPNOTSUPP`), macOS changes the
+/// link itself. On a Linux glibc before 2.32, whose `fchmodat` refuses
+/// `AT_SYMLINK_NOFOLLOW` for every file, a file that is no symlink is
+/// changed through an `O_PATH` descriptor of it instead, as glibc 2.32 does.
 pub(crate) fn set_permissions_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -611,12 +628,49 @@ pub(crate) fn set_permissions_at(
 ) -> io::Result<()> {
 	let name = s.cstr(name)?;
 	let mode = permissions.mode() as libc::mode_t;
-	#[cfg(all(test, target_os = "linux"))]
-	if !follow && seams::old_glibc() {
-		return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-	}
 	// SAFETY: `name` is NUL-terminated.
-	retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode, follow_flag(follow)) })
+	let chmod =
+		|| retry(|| unsafe { libc::fchmodat(dir.as_raw_fd(), name, mode, follow_flag(follow)) });
+	#[cfg(all(test, target_os = "linux"))]
+	let changed = if !follow && seams::old_glibc() {
+		Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+	} else {
+		chmod()
+	};
+	#[cfg(not(all(test, target_os = "linux")))]
+	let changed = chmod();
+	#[cfg(target_os = "linux")]
+	if !follow
+		&& let Err(err) = &changed
+		&& err.raw_os_error() == Some(libc::EOPNOTSUPP)
+	{
+		return chmod_unlinked(dir, name, mode);
+	}
+	changed
+}
+
+/// Changes the mode of `name` in `dir` unless it is a symlink (then
+/// `EOPNOTSUPP`), through an `O_PATH | O_NOFOLLOW` descriptor of it and its
+/// `/proc/self/fd` name: the mode goes to the inode opened, never through a
+/// symlink swapped in after the open. Without `/proc` the refusal stands.
+#[cfg(target_os = "linux")]
+fn chmod_unlinked(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> io::Result<()> {
+	let refused = || io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+	let fd =
+		openat_mode(dir.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0)?;
+	let mut st = MaybeUninit::<libc::stat>::uninit();
+	// SAFETY: `fd` is open and `st` is a valid out-pointer.
+	cvt(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) })?;
+	// SAFETY: `fstat` succeeded and filled `st`.
+	if unsafe { st.assume_init_ref() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+		return Err(refused());
+	}
+	let by_fd = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| refused())?;
+	// SAFETY: `by_fd` is NUL-terminated.
+	match retry(|| unsafe { libc::chmod(by_fd.as_ptr(), mode) }) {
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Err(refused()),
+		result => result,
+	}
 }
 
 /// `utimensat` of `name` in `dir`: [`FileTime::Omit`] keeps a time,
@@ -659,6 +713,30 @@ pub(crate) use seams::after_create_dir;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use seams::emulate_old_glibc;
 
+/// Whether this process may open `name` in `dir` with `mode` (`R_OK`,
+/// `W_OK`), by its effective IDs.
+pub(crate) fn may_access_at(dir: &Handle, name: &[u8], mode: c_int) -> bool {
+	let Ok(name) = CString::new(name) else {
+		return false;
+	};
+	// SAFETY: `name` is NUL-terminated.
+	unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+}
+
+/// A non-blocking open of one end of the FIFO `name` in `dir` (the write end
+/// with `write`), closed at once: it connects to an open of the other end
+/// that waits for it. `ENXIO` for a write end no reader waits for yet.
+pub(crate) fn touch_fifo_at(dir: &Handle, name: &[u8], write: bool) -> io::Result<()> {
+	let name = CString::new(name).map_err(|_| nul_in_path())?;
+	let access = if write {
+		libc::O_WRONLY
+	} else {
+		libc::O_RDONLY
+	};
+	let flags = access | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+	openat_mode(dir.as_raw_fd(), name.as_ptr(), flags, 0).map(drop)
+}
+
 /// Test seams: a hook between a call's steps, so a test can swap an entry
 /// exactly there, and an emulated glibc.
 #[cfg(test)]
@@ -673,7 +751,9 @@ mod seams {
 	/// Runs `hook` once, just after `create_dir_at` made an entry `name`,
 	/// before it sets the mode.
 	pub(crate) fn after_create_dir(name: &[u8], hook: impl FnOnce() + Send + 'static) {
-		AFTER_CREATE_DIR.lock().push((name.to_vec(), Box::new(hook)));
+		AFTER_CREATE_DIR
+			.lock()
+			.push((name.to_vec(), Box::new(hook)));
 	}
 
 	pub(super) fn fire_after_create_dir(name: &[u8]) {
