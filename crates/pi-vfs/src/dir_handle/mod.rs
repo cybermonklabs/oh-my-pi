@@ -599,9 +599,10 @@ fn open_host_entry(
 
 /// The end of a FIFO an `open_at` of `name` with `options` waits on, and the
 /// FIFO, pinned ([`FifoPin`]; `None` when it was gone by the pin): when the
-/// open can block (read-only or write-only, without `O_NONBLOCK`, not
-/// creating the entry new) and `name` is a FIFO, by one `fstatat` that does
-/// not follow a symlink there (the open refuses one anyway), then the pin.
+/// open can wait on a FIFO it finds ([`FifoEnd::of`]) and `name` is a FIFO,
+/// by one `fstatat` that does not follow a symlink there (the open refuses
+/// one anyway), then the pin. The pin is a second call: a FIFO put at the
+/// name in between is the one pinned.
 #[cfg(unix)]
 fn host_fifo_end(
 	s: &mut native::Scratch,
@@ -610,14 +611,7 @@ fn host_fifo_end(
 	options: &OpenOptions,
 ) -> Option<(FifoEnd, Option<FifoPin>)> {
 	use std::os::fd::AsRawFd;
-	if options.is_create_new() || options.get_custom_flags() & libc::O_NONBLOCK != 0 {
-		return None;
-	}
-	let end = match (options.is_read(), options.is_writable()) {
-		(true, false) if !options.is_create() => FifoEnd::Read,
-		(false, true) => FifoEnd::Write,
-		_ => return None,
-	};
+	let end = FifoEnd::of(options)?;
 	let meta = native::stat_at(s, handle, name, false).ok()?;
 	if !meta.file_type().is_fifo() {
 		return None;
@@ -633,7 +627,8 @@ fn host_fifo_end(
 /// and each release reach the pinned FIFO through `/proc/self/fd`;
 /// elsewhere the helper opens `name` relative to a duplicate of the
 /// directory's descriptor, and each release opens its other end there
-/// without blocking and closes it at once when it is another FIFO.
+/// without blocking and closes it at once when it is another FIFO. No check
+/// of the name decides whether a release runs.
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -645,7 +640,6 @@ fn host_fifo_open(
 	token: &tokio_util::sync::CancellationToken,
 ) -> io::Result<FifoOpening> {
 	let dir = Arc::new(handle.try_clone()?);
-	let releasable = native::may_access_at(handle, name, end.release_access());
 	let (open_dir, open_name, open_options, mask) =
 		(Arc::clone(&dir), name.to_vec(), options.clone(), host_mask(scope));
 	let (release_name, writer) = (name.to_vec(), end.released_by_writer());
@@ -658,7 +652,6 @@ fn host_fifo_open(
 				.map(File::from)
 		},
 		move || native::touch_fifo_at(&dir, &release_name, writer).map(std::fs::File::from),
-		releasable,
 		token,
 	)
 }
@@ -907,15 +900,17 @@ impl DirHandle {
 	/// Creates the directory `name` with `mode` (`0o777` by default) as the
 	/// facade's creations give it: less the process umask, or exactly less
 	/// the facade's creation mask. On the host the masked mode is set again
-	/// on the directory made; a non-directory put at the name meanwhile is
-	/// refused and keeps its mode.
+	/// on the directory at the name by then: the one made, or a directory
+	/// renamed in meanwhile, which is not told apart; a non-directory put
+	/// there is refused and keeps its mode.
 	///
 	/// # Errors
 	///
 	/// A `name` that is not one entry name; the creation's errors (an entry
 	/// that exists already included); on the host, the error of setting the
-	/// masked mode (`ENOTDIR` when something else is at the name by then),
-	/// after which the directory stays with the mode it was made with.
+	/// masked mode (`ENOTDIR` when something else is at the name by then,
+	/// `EPERM` for a directory another user owns), after which the directory
+	/// stays with the mode it was made with.
 	pub fn create_dir_at(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
 		let bytes = self.entry(name)?;
 		self.call(

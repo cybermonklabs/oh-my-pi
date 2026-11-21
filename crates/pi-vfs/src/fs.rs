@@ -198,8 +198,9 @@ enum ScopedOpen {
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
 	/// the wait goes through [`FifoOpening`], which the token can interrupt.
-	/// `pin` is the FIFO the `stat` saw ([`FifoPin`]); `None` when it was
-	/// gone by then, and the open then has no release.
+	/// `pin` is the FIFO at the path when the pin was taken, just after the
+	/// `stat` ([`FifoPin`]; a FIFO put there in between is the one pinned);
+	/// `None` when it was gone by then, and the open then has no release.
 	#[cfg(unix)]
 	Fifo { token: CancellationToken, end: FifoEnd, pin: Option<FifoPin> },
 }
@@ -207,8 +208,9 @@ enum ScopedOpen {
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
 /// one `stat` first. It says whether the file's reads must poll (see
 /// [`crate::reads_can_block`]) and whether the open itself can block: a
-/// FIFO's open waits for the other end. Without a token, for any other open,
-/// or when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
+/// FIFO's open waits for the other end, unless the open never waits on a
+/// FIFO it finds ([`FifoEnd::of`]). Without a token, for any other open, or
+/// when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
 /// changes between the `stat` and the open, the file is opened as the `stat`
 /// described it.
 #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn, reason = "const only off Unix"))]
@@ -218,16 +220,17 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 		&& !options.is_create_new()
 	{
 		use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
-		let end = match (options.is_read(), options.is_writable()) {
-			(true, false) if !options.is_create() => FifoEnd::Read,
-			(false, true) => FifoEnd::Write,
+		match (options.is_read(), options.is_writable()) {
+			(true, false) if !options.is_create() => {},
+			(false, true) => {},
 			_ => return ScopedOpen::Plain,
-		};
+		}
 		let Ok(meta) = std::fs::metadata(path) else {
 			return ScopedOpen::Plain;
 		};
-		let kind = meta.file_type();
-		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
+		if meta.file_type().is_fifo()
+			&& let Some(end) = FifoEnd::of(options)
+		{
 			let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
 			let pin = std::ffi::CString::new(path.as_os_str().as_bytes())
 				.ok()
@@ -300,11 +303,33 @@ pub(crate) enum FifoEnd {
 
 #[cfg(unix)]
 impl FifoEnd {
-	/// The `faccessat` mode a release of this end needs: it opens the other.
-	pub(crate) const fn release_access(self) -> libc::c_int {
-		match self {
-			Self::Read => libc::W_OK,
-			Self::Write => libc::R_OK,
+	/// The end of a FIFO an open with `options` waits on: a read-only open
+	/// that creates nothing, or a write-only one, without `O_NONBLOCK`.
+	/// `None` for every other open, and for one that never waits on a FIFO
+	/// it finds: one the plain open refuses before it looks at the entry
+	/// (`EINVAL`: truncating or creating without write access, or appending
+	/// with truncation, the combinations `std` refuses), and an exclusive
+	/// create (`create_new`, or `O_CREAT | O_EXCL` among the custom flags),
+	/// which fails with `EEXIST` on any entry. Those take the plain open,
+	/// which gives their error.
+	pub(crate) const fn of(options: &OpenOptions) -> Option<Self> {
+		let custom = options.get_custom_flags();
+		let exclusive = libc::O_CREAT | libc::O_EXCL;
+		if options.is_create_new()
+			|| custom & exclusive == exclusive
+			|| custom & libc::O_NONBLOCK != 0
+		{
+			return None;
+		}
+		let (write, append, truncate) =
+			(options.is_write(), options.is_append(), options.is_truncate());
+		if (!write && !append && (truncate || options.is_create())) || (append && truncate) {
+			return None;
+		}
+		match (options.is_read(), write || append) {
+			(true, false) => Some(Self::Read),
+			(false, true) => Some(Self::Write),
+			_ => None,
 		}
 	}
 
@@ -339,7 +364,7 @@ const FIFO_RELEASE_ATTEMPTS: usize = 10;
 /// starts and kept until the open and every release of it have ended. An
 /// `O_PATH` open runs no `fifo_open`, so it is neither a reader nor a writer.
 /// While it is open the FIFO's inode is not freed, so its number goes to no
-/// other file (ext4, XFS and overlayfs give a freed number to the next file
+/// other file (ext4 and overlayfs on it give a freed number to the next file
 /// made, often the FIFO made at the same name: `rm p; mkfifo p`). Where
 /// `/proc/self/fd` is there, the helper opens `/proc/self/fd/N` of it and
 /// each release opens the other end there, so both reach this FIFO whatever
@@ -462,9 +487,10 @@ const fn is_fifo(st: &libc::stat) -> bool {
 	st.st_mode & libc::S_IFMT == libc::S_IFIFO
 }
 
-/// `options` for an open of a pinned FIFO through `/proc/self/fd/N`: no
-/// creation (the FIFO is there) and no `O_NOFOLLOW`, which would refuse the
-/// magic link itself.
+/// `options`, which [`FifoEnd::of`] took, for an open of a pinned FIFO
+/// through `/proc/self/fd/N`: creation and truncation change nothing on the
+/// FIFO that is there, so they are dropped, and so is `O_NOFOLLOW`, which
+/// would refuse the magic link itself.
 #[cfg(unix)]
 fn reopen_options(options: &OpenOptions) -> OpenOptions {
 	let mut reopen = options.clone();
@@ -491,17 +517,16 @@ pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send +
 /// worker. The helper runs the ordinary blocking open, so the open returns
 /// exactly when it would without a token: once the other end connects.
 ///
-/// Once the token fires, when this process may open the other end, a
-/// non-blocking open of the other end connects to the waiting open and closes
-/// at once; it is tried again while the helper has not reached `open` yet,
-/// one poll slice apart, for about a second ([`FIFO_RELEASE_ATTEMPTS`]). The
-/// helper's descriptor is closed, and the open fails with
-/// [`crate::cancelled`]. Other opens of the same end waiting at that moment
-/// are released too: a reader reads EOF, a writer's first write fails with
-/// `EPIPE`. On Linux the helper and its releases reach the FIFO the open
-/// started on, whatever its name holds later ([`FifoPin`]); elsewhere they
-/// open the name, and a release that reached another FIFO closes it at once
-/// and stops.
+/// Once the token fires, a non-blocking open of the other end connects to
+/// the waiting open and closes at once; it is tried again while the helper
+/// has not reached `open` yet, one poll slice apart, for about a second
+/// ([`FIFO_RELEASE_ATTEMPTS`]). The helper's descriptor is closed, and the
+/// open fails with [`crate::cancelled`]. Other opens of the same end waiting
+/// at that moment are released too: a reader reads EOF, a writer's first
+/// write fails with `EPIPE`. On Linux the helper and its releases reach the
+/// FIFO the open started on, whatever its name holds later ([`FifoPin`]);
+/// elsewhere they open the name, and a release that reached another FIFO
+/// closes it at once and stops.
 ///
 /// An open that is dropped before it finishes (the job that made it was
 /// aborted, its run task was dropped) is released the same way, on a
@@ -509,21 +534,20 @@ pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send +
 /// after the last attempt, about a second on, still takes the next
 /// connection of the other end and closes it.
 ///
-/// When it may not (a FIFO this process can read but not write, or the
-/// reverse), or the release fails, the open still fails with
+/// When the release fails (this process may not open the other end: a FIFO
+/// it can read but not write, or the reverse), the open still fails with
 /// [`crate::cancelled`], but the helper stays blocked in `open` until the
 /// other end arrives. It then takes that connection and closes it: the next
 /// writer's first write fails with `EPIPE`, the next reader reads EOF. Without
 /// a token the whole command would have stayed blocked there instead.
 #[cfg(unix)]
 pub(crate) struct FifoOpening {
-	release:    FifoRelease,
-	releasable: bool,
-	opened:     std::sync::mpsc::Receiver<io::Result<File>>,
+	release: FifoRelease,
+	opened:  std::sync::mpsc::Receiver<io::Result<File>>,
 	/// Notified once the helper has sent its result.
-	done:       Arc<tokio::sync::Notify>,
+	done:    Arc<tokio::sync::Notify>,
 	/// Whether the open has ended: its result was taken, or it was released.
-	settled:    bool,
+	settled: bool,
 }
 
 #[cfg(unix)]
@@ -546,7 +570,6 @@ impl FifoOpening {
 			options,
 			move || native_open(&scope, &owned_path, &open_options),
 			move || release_options.open(&release_path),
-			may_access(path, end.release_access()),
 			token,
 		)
 	}
@@ -558,22 +581,23 @@ impl FifoOpening {
 	/// `release_by_name`, a non-blocking open of the other end at the name,
 	/// whose end the pin then checks. Both keep the pin until they end, so
 	/// its descriptor is not closed, nor its number given to another file,
-	/// while they can use it. `releasable` says whether this process may open
-	/// the other end; without a pin there is no release.
+	/// while they can use it. Whether this process may open the other end
+	/// is the release's own open to find (`EACCES`), never a check of the
+	/// name, which can name another file, or none, by then. Without a pin
+	/// there is no release.
 	pub(crate) fn start_pinned(
 		pin: Option<FifoPin>,
 		end: FifoEnd,
 		options: &OpenOptions,
 		by_name: impl FnOnce() -> io::Result<File> + Send + 'static,
 		release_by_name: impl Fn() -> io::Result<std::fs::File> + Send + Sync + 'static,
-		releasable: bool,
 		token: &CancellationToken,
 	) -> io::Result<Self> {
 		use std::os::fd::AsFd;
 		let Some(pin) = pin.map(Arc::new) else {
 			// Nothing identifies the FIFO (it was gone when the open started).
 			let refuse: FifoRelease = Arc::new(|| Err(io::Error::other("no FIFO pinned; no release")));
-			return Self::spawn(by_name, refuse, false, token);
+			return Self::spawn(by_name, refuse, token);
 		};
 		let (open_pin, release_pin) = (Arc::clone(&pin), pin);
 		if release_pin.reopen_path().is_some() {
@@ -589,7 +613,6 @@ impl FifoOpening {
 					let path = release_pin.reopen_path().ok_or_else(gone)?;
 					Ok(Box::new(release_options.open(path)?) as Box<dyn Send>)
 				}),
-				releasable,
 				token,
 			);
 		}
@@ -604,18 +627,15 @@ impl FifoOpening {
 				release_pin.check(end.as_fd())?;
 				Ok(Box::new(end) as Box<dyn Send>)
 			}),
-			releasable,
 			token,
 		)
 	}
 
 	/// Runs `open`, a blocking open of one end of a FIFO, on a helper thread;
-	/// `release` opens the other end without blocking, which this process
-	/// may when `releasable`.
+	/// `release` opens the other end without blocking.
 	pub(crate) fn spawn(
 		open: impl FnOnce() -> io::Result<File> + Send + 'static,
 		release: FifoRelease,
-		releasable: bool,
 		token: &CancellationToken,
 	) -> io::Result<Self> {
 		if token.is_cancelled() {
@@ -638,7 +658,7 @@ impl FifoOpening {
 				let _ = sender.send(opened);
 				notify.notify_one();
 			})?;
-		Ok(Self { release, releasable, opened, done, settled: false })
+		Ok(Self { release, opened, done, settled: false })
 	}
 
 	/// Waits for the open on this thread, in poll slices, checking `token`.
@@ -680,14 +700,11 @@ impl FifoOpening {
 		}
 	}
 
-	/// Ends a cancelled open: releases the helper's open when this process may
-	/// open the other end. The release takes microseconds unless the helper
-	/// has not reached `open` yet, and is bounded by [`FIFO_RELEASE_ATTEMPTS`]
-	/// slices.
+	/// Ends a cancelled open: releases the helper's open. The release takes
+	/// microseconds unless the helper has not reached `open` yet, and is
+	/// bounded by [`FIFO_RELEASE_ATTEMPTS`] slices.
 	fn cancel(mut self) -> io::Result<File> {
-		if self.releasable {
-			release_fifo_open(&*self.release, &self.opened);
-		}
+		release_fifo_open(&*self.release, &self.opened);
 		self.settled = true;
 		Err(crate::cancelled())
 	}
@@ -703,7 +720,7 @@ impl Drop for FifoOpening {
 	/// again for about a second ([`FIFO_RELEASE_ATTEMPTS`]), so that no
 	/// runtime worker waits for it.
 	fn drop(&mut self) {
-		if self.settled || !self.releasable {
+		if self.settled {
 			return;
 		}
 		if release_attempt(&*self.release, &self.opened) {
@@ -840,18 +857,6 @@ pub(crate) mod fifo_seam {
 #[cfg(unix)]
 fn helper_exited() -> io::Error {
 	io::Error::other("FIFO open thread exited")
-}
-
-/// Whether this process may open `path` with `mode` (`R_OK`, `W_OK`), by its
-/// effective IDs.
-#[cfg(unix)]
-fn may_access(path: &Path, mode: libc::c_int) -> bool {
-	use std::os::unix::ffi::OsStrExt;
-	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-		return false;
-	};
-	// SAFETY: `path` is a NUL-terminated string alive for the call.
-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
 }
 
 /// Reads a whole host file. Under a cancellable scope the read goes through

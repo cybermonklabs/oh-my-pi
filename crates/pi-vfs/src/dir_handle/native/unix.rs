@@ -502,12 +502,13 @@ pub(crate) fn open_at(
 
 /// `mkdirat` of `name` in `dir` with `mode` (`0o777` by default) less the
 /// process umask; with a creation `mask`, exactly `mode` less `mask`, set
-/// again after the create on the directory made ([`set_made_dir_mode`]). A
-/// symlink or any other non-directory put at the name since `mkdirat` is
-/// refused and keeps its mode, and the call fails; a directory renamed in at
-/// the name is not told apart and gets the mode. When the mode cannot be
-/// set, the call fails, and the directory stays with the mode it was made
-/// with.
+/// again after the create on the directory at the name
+/// ([`set_made_dir_mode`]). A symlink or any other non-directory put at the
+/// name since `mkdirat` is refused and keeps its mode, and the call fails; a
+/// directory renamed in at the name is not told apart and gets the mode.
+/// When the mode cannot be set, the call fails with that error, and the
+/// directory stays as it was made: `mode` and the owner's bits, less the
+/// process umask.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -520,9 +521,11 @@ pub(crate) fn create_dir_at(
 	let name = s.cstr(name)?;
 	let requested = mode.unwrap_or(0o777);
 	let mode = mask.map_or(requested, |mask| requested & !mask) as libc::mode_t;
-	// Off Linux the mode is set again through a descriptor that needs the
-	// owner's read and search bits, so the directory is made with them too.
-	let made = if mask.is_some() && cfg!(not(target_os = "linux")) {
+	// Where `/proc` is not there (and off Linux) the mode is set again
+	// through a descriptor opened to read the directory, which needs the
+	// owner's read and search bits, so the directory is made with the
+	// owner's bits too; through `/proc` the final mode is set all the same.
+	let made = if mask.is_some() {
 		mode | libc::S_IRWXU
 	} else {
 		mode
@@ -542,8 +545,9 @@ pub(crate) fn create_dir_at(
 /// `O_PATH | O_DIRECTORY | O_NOFOLLOW` descriptor, which needs no permission
 /// on the directory itself, and `chmod` of its `/proc/self/fd/N`; without
 /// `/proc`, and elsewhere, through a read-only descriptor opened as
-/// [`open_child`] opens one, and `fchmod`, which needs the owner's read bit
-/// (a process umask can clear it).
+/// [`open_child`] opens one, and `fchmod`. That open needs the owner's read
+/// bit, which [`create_dir_at`] makes the directory with, but a process
+/// umask can clear (0400): then a caller other than root gets `EACCES`.
 fn set_made_dir_mode(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> io::Result<()> {
 	#[cfg(target_os = "linux")]
 	{
@@ -756,16 +760,6 @@ pub(crate) fn chown_at(
 pub(crate) use seams::after_create_dir;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use seams::{emulate_old_glibc, set_mode_without_proc};
-
-/// Whether this process may open `name` in `dir` with `mode` (`R_OK`,
-/// `W_OK`), by its effective IDs.
-pub(crate) fn may_access_at(dir: &Handle, name: &[u8], mode: c_int) -> bool {
-	let Ok(name) = CString::new(name) else {
-		return false;
-	};
-	// SAFETY: `name` is NUL-terminated.
-	unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode, libc::AT_EACCESS) == 0 }
-}
 
 /// A non-blocking open of one end of the FIFO `name` in `dir` (the write end
 /// with `write`): it connects to an open of the other end that waits for it,
