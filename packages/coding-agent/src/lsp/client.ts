@@ -826,7 +826,9 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 /**
  * Handle workspace/applyEdit requests from the server. A command of ours that is running
  * (see {@link collectServerEdits}) gets this edit's applied lines once its files are written,
- * before the open documents are brought up to date.
+ * or once it has failed (with the changes it made and the failure), before the open
+ * documents are brought up to date: that reconcile has no bound, and the command's call
+ * must not wait for it.
  */
 async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
 	const params = message.params as { edit?: WorkspaceEdit };
@@ -844,19 +846,20 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	const landed = Promise.withResolvers<void>();
 	for (const watcher of watchers) watcher.landing.add(landed.promise);
 	try {
-		await applyWorkspaceEditWithLsp(params.edit, client.cwd, undefined, applied => {
-			for (const watcher of watchers) watcher.edits.push(...applied);
+		await applyWorkspaceEditWithLsp(params.edit, client.cwd, undefined, (applied, failure) => {
+			// An edit that failed partway still changed files: the running command reports them.
+			const lines =
+				failure !== undefined && applied.length > 0
+					? [
+							...applied,
+							`The rest of the server's edit failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+						]
+					: applied;
+			for (const watcher of watchers) watcher.edits.push(...lines);
 			landed.resolve();
 		});
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
-		// An edit that failed partway still changed files: the running command reports them.
-		if (err instanceof LspOutcomeError && err.applied.length > 0) {
-			const reason = err.cause instanceof Error ? err.cause.message : String(err.cause);
-			for (const watcher of watchers) {
-				watcher.edits.push(...err.applied, `The rest of the server's edit failed: ${reason}`);
-			}
-		}
 		await sendResponse(client, message.id, { applied: false, failureReason: String(err) }, "workspace/applyEdit");
 	} finally {
 		landed.resolve();
@@ -1023,7 +1026,9 @@ async function reconcileExecutedChanges(
  * the edit itself does not watch the signal. Once the edit has run, the abort stops
  * nothing: the call reports what it changed, and the servers are told of it. The result
  * lists the applied changes, then a note for each server that was not brought up to date.
- * `onApplied` gets the applied changes as soon as the files are written, before that.
+ * `onApplied` gets the applied changes as soon as the files are written, before that; when
+ * the edit fails, it gets the changes made before the failure and the edit's error, also
+ * before the reconcile.
  * An edit that fails after it changed files rejects with an {@link LspOutcomeError} that
  * names those changes (they stay), with or without an abort.
  */
@@ -1031,7 +1036,7 @@ export async function applyWorkspaceEditWithLsp(
 	edit: WorkspaceEdit,
 	cwd: string,
 	signal?: AbortSignal,
-	onApplied?: (applied: string[]) => void,
+	onApplied?: (applied: string[], failure?: unknown) => void,
 ): Promise<string[]> {
 	throwIfAborted(signal);
 	const executed: ExecutedWorkspaceChange[] = [];
@@ -1043,6 +1048,7 @@ export async function applyWorkspaceEditWithLsp(
 			appliedSoFar.push(line);
 		}));
 	} catch (err) {
+		onApplied?.([...appliedSoFar], err);
 		const notes = await reconcileExecutedChanges(executed, cwd, signal);
 		if (appliedSoFar.length === 0) throw err;
 		const changed = [...appliedSoFar, ...notes];

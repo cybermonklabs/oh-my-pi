@@ -244,16 +244,18 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		 * ToolAbortError, while the call's own deadline becomes a ToolError naming the
 		 * budget and server instead of an opaque "Operation aborted". Either keeps an
 		 * {@link LspOutcomeError}'s detail: changes made that stay, or edits the server
-		 * may still apply.
+		 * may still apply. Then the deadline error asks for the files to be read before
+		 * any retry, which could apply the change twice, instead of suggesting one.
 		 */
 		const rethrowAbort = (err: unknown, serverName?: string): void => {
 			if (!(err instanceof ToolAbortError) && !signal?.aborted) return;
 			const detail = err instanceof LspOutcomeError ? ` ${err.detail}` : "";
 			if (timeoutSignal.aborted && !callerSignal?.aborted) {
 				const server = serverName ? ` on ${serverName}` : "";
-				throw new ToolError(
-					`LSP ${action} timed out after ${timeoutSec}s${server}.${detail} The server may still be indexing; try again or pass timeout=<larger>.`,
-				);
+				const next = detail
+					? " Read the files it names, or that the server may still change, before any retry: a retry can apply the change twice."
+					: " The server may still be indexing; try again or pass timeout=<larger>.";
+				throw new ToolError(`LSP ${action} timed out after ${timeoutSec}s${server}.${detail}${next}`);
 			}
 			throw detail ? new ToolAbortError(`${ToolAbortError.MESSAGE}.${detail}`) : new ToolAbortError();
 		};

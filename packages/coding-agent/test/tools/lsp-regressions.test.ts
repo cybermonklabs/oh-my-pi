@@ -6135,8 +6135,11 @@ describe("lsp regressions", () => {
 			tempDir: string,
 			action: (uri: string) => CodeAction | Command,
 			onCommand: (message: RpcMessage, srv: FakeLspServer, controller: AbortController) => void,
-			/** Runs right before the call, with the call's controller. */
-			prepare?: (controller: AbortController) => void,
+			/** Runs right before the call, with the call's controller and the server's client. */
+			prepare?: (
+				controller: AbortController,
+				client: Awaited<ReturnType<typeof lspClient.getOrCreateClient>>,
+			) => void,
 		): Promise<{ target: string; settled: unknown; controller: AbortController }> {
 			const target = path.join(tempDir, "n.ts");
 			await Bun.write(target, 'export const a = "old";\n');
@@ -6166,7 +6169,7 @@ describe("lsp regressions", () => {
 			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: { "fake-lsp": serverConfig } });
 			const client = await lspClient.getOrCreateClient(serverConfig, tempDir, 1_000);
 			await lspClient.ensureFileOpen(client, target);
-			prepare?.(controller);
+			prepare?.(controller, client);
 			const settled = await settle(
 				new LspTool(makeLspSession(tempDir)).execute(
 					"apply-fix-it",
@@ -6348,7 +6351,7 @@ describe("lsp regressions", () => {
 			}
 		});
 
-		it("a workspace edit with no abort waits for a slow server, and does not stop it", async () => {
+		it("a workspace edit with a live signal and no abort waits for a slow server, and does not stop it", async () => {
 			const tempDir = TempDir.createSync("@omp-lsp-slow-server-no-abort-");
 			let fakeClock: { mockRestore(): void } | undefined;
 			try {
@@ -6378,7 +6381,9 @@ describe("lsp regressions", () => {
 					return flush();
 				});
 
-				const call = settle(lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path()));
+				// A live signal that is never aborted: the reconcile must not bound its steps.
+				const live = new AbortController();
+				const call = settle(lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), live.signal));
 				await stalled.promise;
 				// Every bound running now elapses; then the server reads again.
 				for (const timeout of timeouts) timeout.abort(new DOMException("The operation timed out.", "TimeoutError"));
@@ -6438,6 +6443,68 @@ describe("lsp regressions", () => {
 				expect({ killed: server.killed, applied: (settledCall as string[])[0] }).toEqual({
 					killed: true,
 					applied: "Applied 1 edit(s) to n.ts",
+				});
+			} finally {
+				fakeClock?.mockRestore();
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a workspace edit aborted while a step waits starts its bound at the abort, and the step gets it whole", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-bound-from-the-abort-");
+			let fakeClock: { mockRestore(): void } | undefined;
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, target);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// A fake clock for timeout signals: a bound elapses only when the test fires it, and the
+				// test hears when one is made.
+				const timeouts: AbortController[] = [];
+				let made = Promise.withResolvers<void>();
+				fakeClock = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+					const timeout = new AbortController();
+					timeouts.push(timeout);
+					made.resolve();
+					return timeout.signal;
+				});
+				// The server stops reading at the next write, until the test lets it go on.
+				const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+				const stalled = Promise.withResolvers<void>();
+				const resume = Promise.withResolvers<void>();
+				let stalls = 0;
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(async () => {
+					if (stalls++ === 0) {
+						stalled.resolve();
+						await resume.promise;
+					}
+					return flush();
+				});
+				const controller = new AbortController();
+
+				const call = settle(
+					lspClient.applyWorkspaceEditWithLsp(renameEdit(target), tempDir.path(), controller.signal),
+				);
+				await stalled.promise;
+				// While the call is live, no bound exists.
+				expect(timeouts.length).toBe(0);
+				made = Promise.withResolvers<void>();
+				controller.abort();
+				// The abort starts the bound; it has not elapsed, so the step goes on waiting.
+				expect(await Promise.race([made.promise.then(() => "bound started"), call.then(() => "call ended")])).toBe(
+					"bound started",
+				);
+				resume.resolve();
+				const settled = await call;
+				fakeClock.mockRestore();
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ settled, killed: server.killed }).toEqual({
+					settled: ["Applied 1 edit(s) to n.ts"],
+					killed: false,
 				});
 			} finally {
 				fakeClock?.mockRestore();
@@ -6674,6 +6741,190 @@ describe("lsp regressions", () => {
 				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
 				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n');
 				expect(text).toEndWith(`${NOT_WAITED}\n    fix.it`);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a recursive delete that stops partway names what it removed, and tells the server", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-partial-recursive-delete-");
+			try {
+				const dir = path.join(tempDir.path(), "d");
+				const removed = [path.join(dir, "x1.ts"), path.join(dir, "sub", "s.ts")];
+				const kept = path.join(dir, "keep.ts");
+				fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+				for (const file of [...removed, kept]) await Bun.write(file, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				await lspClient.ensureFileOpen(client, removed[0]);
+				await server.waitFor(message => message.method === "textDocument/didOpen");
+				// The recursive rm removes two files, then fails, as a rm that meets a directory the
+				// user cannot write does.
+				const realRm = fsp.rm;
+				vi.spyOn(fsp, "rm").mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+					if (target !== dir) return await realRm(target, options);
+					for (const file of removed) await realRm(file);
+					throw Object.assign(new Error(`EACCES: permission denied, rm '${dir}'`), { code: "EACCES" });
+				}) as typeof fsp.rm);
+				const edit: WorkspaceEdit = {
+					documentChanges: [{ kind: "delete", uri: fileToUri(dir), options: { recursive: true } }],
+				};
+
+				const settled = await settle(lspClient.applyWorkspaceEditWithLsp(edit, tempDir.path()));
+
+				expect({ removed: removed.map(file => fs.existsSync(file)), kept: fs.existsSync(kept) }).toEqual({
+					removed: [false, false],
+					kept: true,
+				});
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith(`EACCES: permission denied, rm '${dir}'. Before it failed, the workspace edit`);
+				expect(message).toContain("Deleted d/x1.ts (the recursive delete of d stopped partway)");
+				expect(message).toContain("Deleted d/sub/s.ts (the recursive delete of d stopped partway)");
+				expect(message).not.toContain("keep.ts");
+				// The server is told: the open document is closed, and the removed files are announced.
+				await server.waitFor(
+					m => m.method === "textDocument/didClose" && JSON.stringify(m.params).includes(fileToUri(removed[0])),
+				);
+				const watched = await server.waitFor(m => m.method === "workspace/didChangeWatchedFiles");
+				expect(JSON.stringify(watched.params)).toContain(fileToUri(removed[1]));
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command whose server edit fails partway while the server stops reading still returns at the abort", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-server-edit-partway-stalled-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				let stalling = false;
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): Command => ({ title: "Fix it", command: "fix.it", arguments: [] }),
+					(_message, srv) => {
+						srv.send({
+							jsonrpc: "2.0",
+							id: "server-edit",
+							method: "workspace/applyEdit",
+							params: { edit: editThatFailsPartway(target, dir) },
+						});
+					},
+					(controller, client) => {
+						// Once the server's edit has written n.ts, the call is aborted and the server never
+						// reads again: the refresh of n.ts and the reply to the server's edit wait forever.
+						const flush = client.proc.stdin.flush.bind(client.proc.stdin);
+						vi.spyOn(client.proc.stdin, "flush").mockImplementation(() =>
+							stalling ? Promise.withResolvers<number>().promise : flush(),
+						);
+						const write = Bun.write;
+						vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+							const written: number = await Reflect.apply(write, Bun, args);
+							if (args[0] === target) {
+								stalling = true;
+								controller.abort();
+							}
+							return written;
+						}) as never);
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).not.toBeInstanceOf(Error);
+				const text = (settled as { content: Array<{ text?: string }> }).content[0]?.text ?? "";
+				expect(text).toStartWith('Applied "Fix it":\n  Workspace edit:\n    Applied 1 edit(s) to n.ts\n');
+				expect(text).toContain("    The rest of the server's edit failed: ");
+				expect(text).toEndWith(`${NOT_WAITED}\n    fix.it`);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
+
+		/**
+		 * A `prepare` for {@link applyFixIt}: a fake clock for timeout signals, so that the
+		 * call's deadline (the first timeout the call makes) elapses only when the test fires
+		 * it. Returns the timeouts made.
+		 */
+		function fakeDeadline(): { timeouts: AbortController[]; fire(): void } {
+			const timeouts: AbortController[] = [];
+			vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+				const timeout = new AbortController();
+				timeouts.push(timeout);
+				return timeout.signal;
+			});
+			return {
+				timeouts,
+				fire: () => timeouts[0]?.abort(new DOMException("The operation timed out.", "TimeoutError")),
+			};
+		}
+
+		it("a code action whose own edit fails partway past the deadline names the change, and asks to read the files", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-own-edit-partway-deadline-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				const dir = path.join(tempDir.path(), "dir.ts");
+				fs.mkdirSync(dir);
+				// The deadline elapses once the edit has written n.ts; the edit then fails on the directory.
+				const { settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({ title: "Fix it", kind: "quickfix", edit: editThatFailsPartway(target, dir) }),
+					() => {},
+					() => {
+						const deadline = fakeDeadline();
+						const write = Bun.write;
+						vi.spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+							const written: number = await Reflect.apply(write, Bun, args);
+							if (args[0] === target) deadline.fire();
+							return written;
+						}) as never);
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith("LSP code_actions timed out after ");
+				expect(message).toContain("which stay: Applied 1 edit(s) to n.ts");
+				expect(message).toEndWith(
+					"Read the files it names, or that the server may still change, before any retry: a retry can apply the change twice.",
+				);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a command-only action past the deadline says the server may still edit, and does not suggest a retry", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-command-only-deadline-");
+			try {
+				let deadline: { fire(): void } | undefined;
+				// The deadline elapses when the command reaches the server, before anything changed.
+				const { target, settled } = await applyFixIt(
+					tempDir.path(),
+					(): CodeAction => ({
+						title: "Fix it",
+						kind: "quickfix",
+						command: { title: "Fix it", command: "fix.it", arguments: [] },
+					}),
+					() => deadline?.fire(),
+					() => {
+						deadline = fakeDeadline();
+					},
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(settled).toBeInstanceOf(Error);
+				const message = (settled as Error).message;
+				expect(message).toStartWith("LSP code_actions timed out after ");
+				expect(message).toContain(
+					"The call did not wait for the command fix.it; its server may still apply edits for it.",
+				);
+				expect(message).not.toContain("try again");
+				expect(message).toContain("before any retry");
 			} finally {
 				await lspClient.shutdownAll();
 				tempDir.removeSync();

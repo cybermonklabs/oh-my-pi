@@ -16,7 +16,7 @@ import type {
 	TextEdit,
 	WorkspaceEdit,
 } from "./types";
-import { readTextFromDisk, uriToFile } from "./utils";
+import { fileToUri, readTextFromDisk, uriToFile } from "./utils";
 
 // =============================================================================
 // Text Edit Application
@@ -304,6 +304,33 @@ export interface WorkspaceEditResult {
 }
 
 /**
+ * After a recursive delete of `root` failed, record each path it held (`held`, relative,
+ * as `readdir(root, { recursive: true })` lists them) that is gone, as a delete: the
+ * failed op may have removed part of the tree before it stopped.
+ */
+async function recordRemovedBeforeFailure(
+	root: string,
+	held: string[],
+	cwd: string,
+	record: (change: ExecutedWorkspaceChange, line: string) => void,
+): Promise<void> {
+	const shownRoot = formatPathRelativeToCwd(root, cwd);
+	for (const relative of held) {
+		const absolute = path.join(root, relative);
+		try {
+			await fs.lstat(absolute);
+			continue;
+		} catch (error) {
+			if (!isEnoent(error)) continue;
+		}
+		record(
+			{ kind: "delete", uri: fileToUri(absolute) },
+			`Deleted ${formatPathRelativeToCwd(absolute, cwd)} (the recursive delete of ${shownRoot} stopped partway)`,
+		);
+	}
+}
+
+/**
  * Apply a workspace edit (collection of file changes).
  * All text-edit batches are overlap-validated before anything is written so a
  * conflict throws without leaving the workspace half-applied.
@@ -311,7 +338,9 @@ export interface WorkspaceEditResult {
  * `onExecuted` fires after each filesystem mutation, with the line `applied` gets for it.
  * When a later op throws, the callback has already reported the executed prefix —
  * callers that must reconcile external state (e.g. LSP overlays) or report what changed
- * rely on this because the returned {@link WorkspaceEditResult} is lost on failure.
+ * rely on this because the returned {@link WorkspaceEditResult} is lost on failure. A
+ * recursive delete that throws after removing part of its tree reports each path it
+ * removed before it throws.
  */
 export async function applyWorkspaceEdit(
 	edit: WorkspaceEdit,
@@ -424,14 +453,21 @@ export async function applyWorkspaceEdit(
 				);
 			} else {
 				const filePath = uriToFile(op.uri);
+				// A recursive delete can remove part of a tree and then fail: what it held is
+				// listed first, so the paths it did remove can be recorded.
+				let held: string[] | undefined;
 				try {
 					const stat = await fs.lstat(filePath);
 					if (stat.isDirectory() && !stat.isSymbolicLink() && !op.options?.recursive) {
 						await fs.rmdir(filePath);
 					} else {
+						if (op.options?.recursive && stat.isDirectory() && !stat.isSymbolicLink()) {
+							held = await fs.readdir(filePath, { recursive: true });
+						}
 						await fs.rm(filePath, { recursive: op.options?.recursive ?? false });
 					}
 				} catch (error) {
+					if (held) await recordRemovedBeforeFailure(filePath, held, cwd, record);
 					if (!(op.options?.ignoreIfNotExists && isEnoent(error))) throw error;
 					continue;
 				}
