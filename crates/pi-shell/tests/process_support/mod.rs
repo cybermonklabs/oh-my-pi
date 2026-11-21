@@ -100,7 +100,7 @@ pub struct Run {
 impl Run {
 	pub fn new(program: impl AsRef<OsStr>, name: &'static str, args: &[impl AsRef<OsStr>]) -> Self {
 		Self {
-			program: PathBuf::from(program.as_ref()),
+			program: absolute(Path::new(program.as_ref())),
 			name,
 			args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
 			ignored: Vec::new(),
@@ -274,6 +274,21 @@ impl Run {
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		outcome(child.wait_with_output().expect("wait for the shell"))
+	}
+}
+
+/// `program` as a path that names it from any directory: a relative one
+/// with a directory part, as the obash under test is under Bazel (its
+/// runfiles path, `crates/pi-shell/obash`), is taken from the current
+/// directory, so that a run in another directory ([`Run::dumping_in`]) and
+/// a link in a temporary one ([`Run::under`]) still reach it. A bare name
+/// stays a `PATH` search.
+#[must_use]
+pub fn absolute(program: &Path) -> PathBuf {
+	if program.is_relative() && program.components().count() > 1 {
+		std::path::absolute(program).expect("the current directory")
+	} else {
+		program.to_owned()
 	}
 }
 

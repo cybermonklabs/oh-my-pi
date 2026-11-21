@@ -815,7 +815,8 @@ fn an_untrapped_hup_makes_zsh_exit_with_status_1_after_the_exit_trap_in_effect()
 fn a_parent_shell_reports_its_child_shells_signal_death() {
 	let dir = tempfile::tempdir().expect("a directory for a `zsh` link");
 	let zsh = dir.path().join("zsh");
-	std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_obash"), &zsh).expect("link obash as zsh");
+	let obash = process_support::absolute(env!("CARGO_BIN_EXE_obash").as_ref());
+	std::os::unix::fs::symlink(obash, &zsh).expect("link obash as zsh");
 	let line = |shell: &std::path::Path| {
 		format!("{} -f -c 'kill -TERM $$'; print -r -- st=$?", shell.display())
 	};
@@ -1583,4 +1584,36 @@ fn a_run_starts_with_a_core_size_limit_of_one_byte() {
 		.collect();
 	let (soft, hard) = (fields[4], fields[5]);
 	assert_eq!(soft, if hard == "0" { "0" } else { "1" }, "{fields:?}");
+}
+
+/// A run reaches its program by a relative path from any directory, as the
+/// obash under test is named under Bazel (its runfiles path,
+/// `crates/pi-shell/obash`): one in another directory ([`Run::dumping_in`])
+/// and one through a link in a temporary one ([`Run::under`]). Here obash
+/// is named by its path relative to the test's directory.
+#[test]
+fn a_run_reaches_its_program_by_a_relative_path_from_another_directory() {
+	let here = std::env::current_dir().expect("the test's directory");
+	let obash = fs::canonicalize(env!("CARGO_BIN_EXE_obash")).expect("the obash under test");
+	let here = fs::canonicalize(here).expect("the test's directory");
+	let common = here
+		.components()
+		.zip(obash.components())
+		.take_while(|(a, b)| a == b)
+		.count();
+	let mut relative = std::path::PathBuf::new();
+	for _ in here.components().skip(common) {
+		relative.push("..");
+	}
+	relative.extend(obash.components().skip(common));
+	assert!(relative.is_relative() && relative.components().count() > 1, "{relative:?}");
+	let dir = tempfile::tempdir().expect("another directory");
+	let elsewhere = Run::new(&relative, "bash", &["-c", "echo ok"])
+		.dumping_in(dir.path())
+		.go();
+	assert_eq!((elsewhere.stdout.as_slice(), elsewhere.end()), (&b"ok\n"[..], Some(Exit(0))));
+	let linked = Run::new(&relative, "bash", &["-c", "echo ok"])
+		.under(&["env"])
+		.go();
+	assert_eq!((linked.stdout.as_slice(), linked.end()), (&b"ok\n"[..], Some(Exit(0))));
 }
