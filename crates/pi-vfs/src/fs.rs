@@ -575,6 +575,8 @@ fn release_attempt(
 /// (told whether it opened one).
 #[cfg(all(test, unix))]
 pub(crate) mod fifo_seam {
+	use std::sync::atomic::{AtomicBool, Ordering};
+
 	use parking_lot::Mutex;
 
 	type Before = Box<dyn FnOnce() + Send>;
@@ -583,6 +585,13 @@ pub(crate) mod fifo_seam {
 
 	static NEXT: Mutex<Option<(Before, After)>> = Mutex::new(None);
 	static RELEASE: Mutex<Option<Release>> = Mutex::new(None);
+	static BY_NAME: AtomicBool = AtomicBool::new(false);
+
+	/// Makes pinned FIFO opens in this process from now on open the name and
+	/// check what a release opened, as without `/proc` (`on`), or not.
+	pub(crate) fn open_by_name(on: bool) {
+		BY_NAME.store(on, Ordering::SeqCst);
+	}
 
 	/// Hooks the next FIFO helper that starts in this process.
 	pub(crate) fn set(

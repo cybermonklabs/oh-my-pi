@@ -1484,5 +1484,7 @@ pub(crate) fn alone(name: &str) -> bool {
 		(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 	assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
 	assert!(out.contains("1 passed"), "{name} ran no test in a process of its own:\n{out}\n{err}");
+	// What the test reported of itself (counts, notes), for the run's log.
+	eprint!("{err}");
 	true
 }

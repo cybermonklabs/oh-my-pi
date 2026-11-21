@@ -957,6 +957,53 @@ mod unix {
 		}
 	}
 
+	/// Under a process umask that clears the owner's read bit (0400), a
+	/// masked `create_dir_at` never reports success with a mode other than
+	/// the one asked less the mask. On Linux it gives that mode: it is set
+	/// again on the directory made without opening it to read. Elsewhere it
+	/// may fail instead. Root can open any directory, so as root the old way
+	/// passes too. In a process of its own, whose umask this test sets.
+	#[test]
+	fn a_masked_create_dir_at_gives_the_mode_under_a_umask_without_owner_read() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_masked_create_dir_at_gives_the_mode_under_a_umask_without_owner_read",
+		) {
+			return;
+		}
+		let tree = Tree::new("umask-0400");
+		// After the tree is made, so its own directories keep the owner's
+		// read bit. SAFETY: `umask` has no preconditions; nothing else runs
+		// in this process.
+		unsafe { libc::umask(0o400) };
+		let rt = runtime();
+		let mode = |rel: &str| std::fs::symlink_metadata(tree.at(rel)).unwrap().mode() & 0o777;
+		let masked = Fs::native().with_creation_mask(Some(0o022));
+		let root = masked.blocking().open_dir(tree.at(""), true).unwrap();
+		let results = [
+			("made", root.create_dir_at(n("made"), Some(0o755))),
+			("made-async", rt.block_on(root.create_dir_at_async(n("made-async"), Some(0o755)))),
+		];
+		let modes: Vec<_> = results.iter().map(|(rel, _)| (*rel, mode(rel))).collect();
+		// The tree's removal lists them, which needs the owner's read bit.
+		for (rel, _) in &modes {
+			std::fs::set_permissions(tree.at(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let linux = cfg!(target_os = "linux");
+		for ((rel, result), (_, got)) in results.iter().zip(modes) {
+			match result {
+				Ok(()) => assert_eq!(got, 0o755, "{rel}: reported made, with mode {got:o}"),
+				Err(err) if linux => panic!("{rel}: {err:?} (mode {got:o})"),
+				Err(_) => {},
+			}
+		}
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!(
+				"note: as root a read-only open of the directory succeeds, so this cannot fail here"
+			);
+		}
+	}
+
 	/// A masked `create_dir_at` sets the mode on the directory it made, never
 	/// on what was swapped in for it between `mkdirat` and the mode: a
 	/// symlink to a file, a regular file renamed there, or a hard link to a
@@ -1224,7 +1271,10 @@ mod unix {
 	/// reaches `open` within the release's second: the release keeps the
 	/// read end open while it waits and tries again, so the helper's open
 	/// ends, its file is closed, and a later reader and writer of the FIFO
-	/// meet each other, the reader reading what the writer wrote. In a
+	/// meet each other, the reader reading what the writer wrote. The helper
+	/// is let go right after the drop; one that reached `open` only after the
+	/// release's ten tries (about a second) would fail this test after
+	/// [`HELPER_BOUND`], as that helper is not released by design. In a
 	/// process of its own, so the hook takes this test's helper.
 	#[test]
 	fn a_fifo_open_dropped_before_its_helper_opens_takes_no_later_connection() {
@@ -1311,14 +1361,58 @@ mod unix {
 		}
 	}
 
-	/// A release opens the other end only of the FIFO its open started on.
-	/// When the FIFO's name was given to another FIFO since (`rm p; mkfifo
-	/// p`), the release closes what it opened at once and stops, so a writer
-	/// to the new FIFO meets no reader that is about to go away (and would
-	/// lose what it wrote). Through a handle's `open_at_async` and through the
-	/// facade's own open. The helper is held before its `open`, so no release
-	/// can be answered. In a process of its own, so the hooks take this
-	/// test's helpers and releases.
+	/// Tries of each replaced-FIFO case: ext4, XFS and overlayfs give a freed
+	/// inode number to the next file made often but not always, so one try
+	/// can miss the reuse a case is about.
+	const REPLACE_TRIES: usize = 25;
+
+	/// The inode number of the entry at `path`.
+	fn ino(path: &Path) -> u64 {
+		std::fs::symlink_metadata(path).unwrap().ino()
+	}
+
+	/// Records each release attempt in this process from now on: whether it
+	/// held an end, and whether a writer to the FIFO now at the path in
+	/// `fifo` then met a reader.
+	fn record_releases(fifo: Arc<Mutex<PathBuf>>) -> Arc<Mutex<Vec<(bool, bool)>>> {
+		let attempts: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+		let recorded = Arc::clone(&attempts);
+		crate::fs::fifo_seam::on_release(move |held| {
+			use std::os::unix::fs::OpenOptionsExt;
+			let writer = std::fs::OpenOptions::new()
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&*fifo.lock());
+			recorded.lock().push((held, writer.is_ok()));
+		});
+		attempts
+	}
+
+	/// The FIFO open of `fifo` (`name` in `root`) through a handle's
+	/// `open_at_async` or the facade's own open, by `route`.
+	fn fifo_open<'a>(
+		route: &str,
+		root: &'a DirHandle,
+		fs: &'a Fs,
+		name: &'a str,
+		fifo: &'a Path,
+		options: &'a OpenOptions,
+	) -> std::pin::Pin<Box<dyn Future<Output = io::Result<File>> + 'a>> {
+		match route {
+			"handle" => Box::pin(root.open_at_async(n(name), options)),
+			_ => Box::pin(fs.open_with(fifo, options)),
+		}
+	}
+
+	/// A release never holds an end of a FIFO that replaced the one its open
+	/// started on (`rm p; mkfifo p`), so a writer to the new FIFO meets no
+	/// reader that is about to go away (and would lose what it wrote). The
+	/// helper is held before its `open`, so only the open itself holds the
+	/// old FIFO: on Linux its number then goes to no other file. Through a
+	/// handle's `open_at_async` and the facade's own open; with the helper
+	/// and releases reaching the FIFO through `/proc`, and by name, as
+	/// without `/proc`; [`REPLACE_TRIES`] tries each. In a process of its
+	/// own, so the hooks take this test's helpers and releases.
 	#[test]
 	fn a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on() {
 		if crate::dir_handle::alone(
@@ -1331,54 +1425,161 @@ mod unix {
 		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
 		let mut write = OpenOptions::new();
 		write.write(true);
-		for route in ["handle", "facade"] {
-			let name = format!("p-{route}");
-			let fifo = tree.at(&name);
-			mkfifo(&fifo);
-			let (started_tx, started) = std::sync::mpsc::channel();
-			let (go, hold) = std::sync::mpsc::channel();
-			let _opened = hook_next_fifo_helper(started_tx, Some(hold));
-			// Each release attempt: whether it held an end, and whether a
-			// writer to the FIFO now at the name met a reader then.
-			let attempts: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
-			{
-				let (attempts, fifo) = (Arc::clone(&attempts), fifo.clone());
-				crate::fs::fifo_seam::on_release(move |held| {
-					use std::os::unix::fs::OpenOptionsExt;
-					let writer = std::fs::OpenOptions::new()
-						.write(true)
-						.custom_flags(libc::O_NONBLOCK)
-						.open(&fifo);
-					attempts.lock().push((held, writer.is_ok()));
-				});
-			}
-			runtime().block_on(async {
-				let open: std::pin::Pin<Box<dyn Future<Output = io::Result<File>>>> = match route {
-					"handle" => Box::pin(root.open_at_async(n(&name), &write)),
-					_ => Box::pin(fs.open_with(&fifo, &write)),
-				};
-				let mut open = open;
-				tokio::select! {
-					biased;
-					_ = &mut open => panic!("{route}: a write-only FIFO open with no reader finished"),
-					() = std::future::ready(()) => {},
+		let current: Arc<Mutex<PathBuf>> = Arc::default();
+		let attempts = record_releases(Arc::clone(&current));
+		let mut reused = Vec::new();
+		for by_name in [false, true] {
+			crate::fs::fifo_seam::open_by_name(by_name);
+			for route in ["handle", "facade"] {
+				for i in 0..REPLACE_TRIES {
+					let case = format!("{route}, by name {by_name}, try {i}");
+					let name = format!("p-{route}-{by_name}-{i}");
+					let fifo = tree.at(&name);
+					mkfifo(&fifo);
+					current.lock().clone_from(&fifo);
+					let first = attempts.lock().len();
+					let (started_tx, started) = std::sync::mpsc::channel();
+					let (go, hold) = std::sync::mpsc::channel();
+					let _opened = hook_next_fifo_helper(started_tx, Some(hold));
+					runtime().block_on(async {
+						let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
+						tokio::select! {
+							biased;
+							_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+							() = std::future::ready(()) => {},
+						}
+						started
+							.recv_timeout(HELPER_BOUND)
+							.unwrap_or_else(|_| panic!("{case}: the helper never started"));
+						// The name now names another FIFO; then the open is
+						// dropped.
+						let old = ino(&fifo);
+						std::fs::remove_file(&fifo).unwrap();
+						mkfifo(&fifo);
+						if ino(&fifo) == old {
+							reused.push(case.clone());
+						}
+					});
+					// The helper stays held before its `open` for the rest of
+					// the process.
+					std::mem::forget(go);
+					let these = attempts.lock()[first..].to_vec();
+					assert!(!these.is_empty(), "{case}: no release ran");
+					assert!(
+						these.iter().all(|&(_, met)| !met),
+						"{case}: a writer to the new FIFO met a release's end: {these:?}"
+					);
 				}
-				started
-					.recv_timeout(HELPER_BOUND)
-					.unwrap_or_else(|_| panic!("{route}: the helper never started"));
-				// The name now names another FIFO; then the open is dropped.
-				std::fs::remove_file(&fifo).unwrap();
-				mkfifo(&fifo);
-			});
-			// The helper stays held before its `open` for the rest of the
-			// process.
-			std::mem::forget(go);
-			let attempts = attempts.lock().clone();
-			assert!(!attempts.is_empty(), "{route}: no release ran");
-			assert!(
-				attempts.iter().all(|&(_, met)| !met),
-				"{route}: a writer to the new FIFO met a release's end: {attempts:?}"
+			}
+		}
+		eprintln!(
+			"the new FIFO got the old one's number in {} of {} tries",
+			reused.len(),
+			4 * REPLACE_TRIES
+		);
+		if cfg!(target_os = "linux") {
+			assert!(reused.is_empty(), "a pinned FIFO's number went to the new FIFO: {reused:?}");
+		}
+	}
+
+	/// Whether the thread `tid` of this process waits in an `open`: its
+	/// `/proc/self/task/<tid>/syscall` names `openat`, or, where that file is
+	/// not there, its state is sleeping. `None` when neither can be read.
+	#[cfg(target_os = "linux")]
+	fn waits_in_open(tid: libc::c_long) -> Option<bool> {
+		if let Ok(syscall) = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")) {
+			let number = syscall.split_whitespace().next()?;
+			return Some(
+				number
+					.parse::<libc::c_long>()
+					.is_ok_and(|n| n == libc::SYS_openat),
 			);
+		}
+		let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+		Some(stat.rsplit_once(')')?.1.trim_start().starts_with('S'))
+	}
+
+	/// A release reaches the FIFO its open waits on after the FIFO's name was
+	/// given to another FIFO: the helper's open ends, and a writer to the new
+	/// FIFO meets no release's end. The helper runs into its `open` and is
+	/// seen waiting there before the name is replaced and the open dropped.
+	/// Through a handle and the facade, [`REPLACE_TRIES`] tries each. Linux
+	/// only: elsewhere a release opens the name, and a helper waiting on a
+	/// FIFO no name reaches stays there. In a process of its own, so the
+	/// hooks take this test's helpers and releases.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_release_reaches_the_fifo_its_open_waits_on_after_the_name_was_replaced() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_release_reaches_the_fifo_its_open_waits_on_after_the_name_was_replaced",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-waiting");
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let mut write = OpenOptions::new();
+		write.write(true);
+		let current: Arc<Mutex<PathBuf>> = Arc::default();
+		let attempts = record_releases(Arc::clone(&current));
+		for route in ["handle", "facade"] {
+			for i in 0..REPLACE_TRIES {
+				let case = format!("{route}, try {i}");
+				let name = format!("q-{route}-{i}");
+				let fifo = tree.at(&name);
+				mkfifo(&fifo);
+				current.lock().clone_from(&fifo);
+				let first = attempts.lock().len();
+				let (tid_tx, tid) = std::sync::mpsc::channel();
+				let (opened_tx, helper_opened) = std::sync::mpsc::channel();
+				crate::fs::fifo_seam::set(
+					move || {
+						// SAFETY: `gettid` has no preconditions.
+						let _ = tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) });
+					},
+					move |ok| {
+						let _ = opened_tx.send(ok);
+					},
+				);
+				runtime().block_on(async {
+					let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
+					tokio::select! {
+						biased;
+						_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+						() = std::future::ready(()) => {},
+					}
+					let tid = tid
+						.recv_timeout(HELPER_BOUND)
+						.unwrap_or_else(|_| panic!("{case}: the helper never started"));
+					let start = std::time::Instant::now();
+					loop {
+						match waits_in_open(tid) {
+							Some(true) => break,
+							Some(false) => {},
+							None => panic!("{case}: /proc says nothing of the helper's thread"),
+						}
+						assert!(
+							start.elapsed() < HELPER_BOUND,
+							"{case}: the helper never waited in open"
+						);
+						std::thread::sleep(Duration::from_millis(1));
+					}
+					std::fs::remove_file(&fifo).unwrap();
+					mkfifo(&fifo);
+				});
+				let opened = helper_opened
+					.recv_timeout(HELPER_BOUND)
+					.unwrap_or_else(|_| {
+						panic!("{case}: the helper's open still waited {HELPER_BOUND:?} after the drop")
+					});
+				assert!(opened, "{case}: the helper's open failed");
+				let these = attempts.lock()[first..].to_vec();
+				assert!(!these.is_empty(), "{case}: no release ran");
+				assert!(
+					these.iter().all(|&(_, met)| !met),
+					"{case}: a writer to the new FIFO met a release's end: {these:?}"
+				);
+			}
 		}
 	}
 
@@ -1583,8 +1784,8 @@ mod windows {
 	}
 
 	/// A Windows host handle refuses an entry name holding `:` (a stream of
-	/// another entry, or a drive) and makes nothing; a provider's handle
-	/// takes it, since a provider's names are its own.
+	/// another entry, or a drive) and makes nothing; a URL provider's handle
+	/// takes it, since such a provider's names are its own.
 	#[test]
 	fn a_colon_name_is_refused_on_the_host_and_taken_by_a_provider() {
 		let dir = temp("colon");
@@ -1608,6 +1809,41 @@ mod windows {
 				.unwrap();
 		});
 		assert_eq!(recorder.made.lock().len(), 1, "the provider made no directory");
+	}
+
+	/// A path handle whose path is a host path (from `Fs::open_dir_by_path`,
+	/// as pi-walker's provider sessions open one) refuses an entry name
+	/// holding `:` as a host handle does: it makes neither a stream of an
+	/// entry nor an entry in C:'s current directory.
+	#[test]
+	fn a_path_handle_over_a_host_path_refuses_a_colon_name() {
+		let dir = temp("colon-path");
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let handle = rt
+			.block_on(crate::Fs::native().open_dir_by_path(&dir, true))
+			.unwrap();
+		assert!(!handle.is_native(), "not a path handle");
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		let victim = format!("pi-vfs-path-victim-{}-{nanos}", std::process::id());
+		for name in [format!("C:{victim}"), "ab:s".to_owned(), "x::$INDEX_ALLOCATION".to_owned()] {
+			let result = rt.block_on(handle.create_dir_at_async(OsStr::new(&name), None));
+			let err = result.unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err:?}");
+		}
+		assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the path handle made an entry");
+		let cwd = std::path::Path::new("C:")
+			.canonicalize()
+			.unwrap()
+			.join(&victim);
+		let leaked = cwd.exists();
+		let _ = std::fs::remove_dir(&cwd);
+		assert!(!leaked, "{} was made in C:'s current directory", cwd.display());
 	}
 
 	/// `open_at` opens no directory on Windows either:
