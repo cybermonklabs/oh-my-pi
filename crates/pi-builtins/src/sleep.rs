@@ -98,7 +98,11 @@ mod tests {
 
 		let operands = ["0.001", "0.001s"].map(String::from);
 		assert_eq!(SleepCommand::total(&operands), Ok(Duration::from_millis(2)), "the operands sum");
-		let (code, ..) = returns("sleep 0.001 0.001s", run_proc::<SleepCommand>(&["sleep", "0.001", "0.001s"], None)).await;
+		let (code, ..) = returns(
+			"sleep 0.001 0.001s",
+			run_proc::<SleepCommand>(&["sleep", "0.001", "0.001s"], None),
+		)
+		.await;
 		assert_eq!(code, 0);
 	}
 
@@ -113,15 +117,15 @@ mod tests {
 
 		// `sleep infinity` must block until cancelled rather than erroring out.
 		let token = CancellationToken::new();
-		let ((code, ..), ()) = returns(
-			"a cancelled sleep infinity",
-			async {
-				tokio::join!(run_proc::<SleepCommand>(&["sleep", "infinity"], Some(token.clone())), async {
+		let ((code, ..), ()) = returns("a cancelled sleep infinity", async {
+			tokio::join!(
+				run_proc::<SleepCommand>(&["sleep", "infinity"], Some(token.clone())),
+				async {
 					tokio::task::yield_now().await;
 					token.cancel();
-				})
-			},
-		)
+				}
+			)
+		})
 		.await;
 		assert_eq!(code, 130);
 	}
