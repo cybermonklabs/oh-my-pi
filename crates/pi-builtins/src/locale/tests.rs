@@ -236,18 +236,58 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 	use std::os::unix::ffi::OsStrExt as _;
 
-	/// Lets the spawn's child out of its open on every way out of the test,
-	/// a failure included, so that it is not left waiting there once this
-	/// process has ended. An open of the FIFO for reading and writing never
-	/// waits on Linux (`fifo(7)`) and counts as a writer, which lets out a
-	/// child already in its open; removing the FIFO then fails the open of
-	/// a child not there yet, which ends its spawn.
-	struct Release<'a>(&'a Path);
+	/// Holds the spawner thread and lets the spawn's child out of its open
+	/// on every way out of the test, a failure included, so that no child is
+	/// left waiting there once this process has ended. The child can be in
+	/// one of three places then:
+	///
+	/// * asleep in its open of the FIFO: an open for reading and writing
+	///   never waits on Linux (`fifo(7)`) and counts as a writer, which lets
+	///   it out;
+	/// * short of its lookup of the FIFO's name: removing the name fails its
+	///   open, which ends the spawn;
+	/// * between its lookup and its open: it opens the FIFO it found, name
+	///   or no name, and waits there for a writer. When the last open file of
+	///   a FIFO closes, the kernel lets its pipe go, and the next open makes
+	///   a new one that has no writer (`fs/pipe.c`), so a writer closed
+	///   before that open lets nobody out.
+	///
+	/// So the writer stays open until the spawner has returned, which it
+	/// does only once its child is past the open or has failed it.
+	struct Release<'a> {
+		fifo:    &'a Path,
+		spawner: Option<std::thread::JoinHandle<libc::c_int>>,
+	}
 	impl Release<'_> {
-		fn let_go(&self) -> std::io::Result<fs::File> {
-			let writer = fs::OpenOptions::new().read(true).write(true).open(self.0)?;
-			fs::remove_file(self.0)?;
-			Ok(writer)
+		/// Whether the spawner has ended.
+		fn spawner_ended(&self) -> bool {
+			self.spawner.as_ref().is_some_and(std::thread::JoinHandle::is_finished)
+		}
+
+		/// Lets the child out as above and returns how the spawner ended;
+		/// `None` once the spawner has been joined. A writer that will not
+		/// open lets nobody out, so the spawner is then left unjoined.
+		fn let_go(&mut self) -> Option<std::io::Result<std::thread::Result<libc::c_int>>> {
+			let spawner = self.spawner.take()?;
+			let writer = match fs::OpenOptions::new().read(true).write(true).open(self.fifo) {
+				Ok(writer) => writer,
+				Err(error) => return Some(Err(error)),
+			};
+			let removed = fs::remove_file(self.fifo);
+			let ended = spawner.join();
+			drop(writer);
+			Some(removed.map(|()| ended))
+		}
+
+		/// The spawner ends before the writer comes only when the spawn
+		/// failed: on success it waits for a child that cannot leave the open
+		/// until then.
+		fn spawn_failed(&mut self) -> ! {
+			match self.spawner.take().map(std::thread::JoinHandle::join) {
+				Some(Ok(status)) => panic!("the spawn ended, status {status}, before its child was held in the open"),
+				Some(Err(panic)) => panic!("the spawn failed before its child was held in the open: {}", panic_text(&*panic)),
+				None => unreachable!("the spawner is joined once"),
+			}
 		}
 	}
 	impl Drop for Release<'_> {
@@ -260,15 +300,6 @@ fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 	fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
 		let text = panic.downcast_ref::<String>().map(String::as_str);
 		text.or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("no message")
-	}
-
-	/// The spawner ends before the writer comes only when the spawn failed:
-	/// on success it waits for a child that cannot leave the open until then.
-	fn spawn_failed(spawner: std::thread::JoinHandle<libc::c_int>) -> ! {
-		match spawner.join() {
-			Ok(status) => panic!("the spawn ended, status {status}, before its child was held in the open"),
-			Err(panic) => panic!("the spawn failed before its child was held in the open: {}", panic_text(&*panic)),
-		}
 	}
 
 	if !crate::own_process::own_process() {
@@ -320,8 +351,8 @@ fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 			status
 		}
 	});
-	let release = Release(&fifo);
-	let Ok(spawning) = spawning.recv() else { spawn_failed(spawner) };
+	let mut release = Release { fifo: &fifo, spawner: Some(spawner) };
+	let Ok(spawning) = spawning.recv() else { release.spawn_failed() };
 	let children = format!("/proc/self/task/{spawning}/children");
 	// The spawn is in flight once its child sleeps in that open. Each pass
 	// ends the wait on a fact: the child asleep there; the spawner ended,
@@ -330,13 +361,13 @@ fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 	// spawner has not cloned yet or its child is on its way to the open.
 	// No deadline decides, so a slow machine only waits longer.
 	let child = loop {
-		if spawner.is_finished() {
-			spawn_failed(spawner);
+		if release.spawner_ended() {
+			release.spawn_failed();
 		}
 		let listed = match fs::read_to_string(&children) {
 			Ok(listed) => listed,
 			// The thread's directory goes only once the thread has ended.
-			Err(_) if spawner.is_finished() => spawn_failed(spawner),
+			Err(_) if release.spawner_ended() => release.spawn_failed(),
 			Err(error) => panic!("{children}: {error}; the spawn's child cannot be found without it"),
 		};
 		if let Some(child) = listed.split_whitespace().next() {
@@ -357,12 +388,11 @@ fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 	};
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_: &str| None);
 	// A writer lets the spawn's child open the FIFO, run `true` and end.
-	let writer = release.let_go().expect("the FIFO opened as a writer, and then removed");
-	let status = match spawner.join() {
+	let ended = release.let_go().expect("the spawner, joined here first");
+	let status = match ended.expect("the FIFO opened as a writer, and then removed") {
 		Ok(status) => status,
 		Err(panic) => panic!("the spawn after its child {child} left the open: {}", panic_text(&*panic)),
 	};
-	drop(writer);
 	assert_eq!(status, 0, "the spawn's child {child} ran `true`");
 	assert!(
 		matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
