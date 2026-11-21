@@ -22,7 +22,13 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
-import { type AnySetting, type SettingChange, settingValuesEqual, trackSettingsReads } from "../config/registry";
+import {
+	type AnySetting,
+	lookup as lookupSetting,
+	type SettingChange,
+	settingValuesEqual,
+	trackSettingsReads,
+} from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
 import { clearPluginRootsAndCaches } from "../discovery/helpers";
@@ -447,6 +453,47 @@ interface SystemPromptHoldEnd {
 }
 
 /**
+ * Custom entry naming the settings a change the base prompt a {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record names
+ * withholds holds ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}), each with the value that prompt was built with, and the
+ * change whose settings notices tell the model of them ({@link SettingsNoticeDetails.hold}): what a resumed process
+ * that restores that prompt tells the model of where those notices did not ({@link SessionTools.takeSettingsNotice}).
+ * Each names the settings no such record of the same change names since the branch last recorded another prompt or
+ * ended a hold on this one.
+ */
+const SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE = "system-prompt-held-settings";
+
+/**
+ * A setting a {@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE} entry names, or a settings notice gives
+ * ({@link SettingsNoticeDetails.values}), with its value.
+ */
+interface HeldSettingRecord {
+	/** The setting's id. */
+	id: string;
+	/** The value; absent when the setting is unset, and for a credential, whose value is never recorded. */
+	value?: unknown;
+}
+
+/** Data of a {@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE} entry. */
+interface SystemPromptHeldSettings {
+	/** Digest of the base prompt that withholds the change, as {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} records it. */
+	digest: string;
+	/** The {@link HeldSettings.id} of the change. */
+	hold: string;
+	/** Each setting the change holds, with the value the prompt was built with. */
+	settings: HeldSettingRecord[];
+}
+
+/** What the session records of a change the base prompt a digest names withholds, on any branch. */
+interface RecordedHold {
+	/** When the change was made: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE} record's time. */
+	since: number;
+	/** Each setting a {@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE} record names, by id: the earliest record of it. */
+	settings: ReadonlyMap<string, HeldSettingRecord>;
+	/** The changes those records name ({@link SystemPromptHeldSettings.hold}). */
+	holds: ReadonlySet<string>;
+}
+
+/**
  * Longest a change the system prompt withholds to keep the cached prefix waits: the first request made this long after
  * the change carries it, however warm the cache stays, unless a lapse or a cut that rewrites every message sent it
  * earlier ({@link withheldChangeDue}).
@@ -468,10 +515,11 @@ interface WithheldChange {
 	/** A cut that rewrites every message, or a move to another transcript, ended the reason to withhold it. */
 	due: boolean;
 	/**
-	 * The branch view last found to record the change at {@link since} ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}) with
-	 * no record of another prompt and no end of a hold on this one after that record, or given such a record; a reply
-	 * under the change on another view records it there ({@link SessionTools.recordReplyPrompt}). Undefined before
-	 * then, once the change ended, and once its time moved to the clock's.
+	 * The branch view last found to record the change at {@link since} ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}) and
+	 * each setting it holds ({@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE}) with no record of another prompt and no
+	 * end of a hold on this one after those records, or given such records; a reply under the change on another view
+	 * records it there ({@link SessionTools.recordReplyPrompt}). Undefined before then, once the change ended, once
+	 * its time moved to the clock's, and once it holds a setting more.
 	 */
 	recordedOn: readonly SessionEntry[] | undefined;
 	/**
@@ -704,6 +752,35 @@ function promptHoldEndOfEntry(entry: SessionEntry): string | undefined {
 	return typeof digest === "string" ? digest : undefined;
 }
 
+/** Whether `value` names a setting with its value, as a {@link HeldSettingRecord} does. */
+function isHeldSettingRecord(value: unknown): value is HeldSettingRecord {
+	return isRecord(value) && typeof value.id === "string";
+}
+
+/** Whether `value` lists settings with their values, as {@link HeldSettingRecord}s. */
+function isHeldSettingRecords(value: unknown): value is HeldSettingRecord[] {
+	return Array.isArray(value) && value.every(isHeldSettingRecord);
+}
+
+/** The held settings a branch entry names, or `undefined` when it is no such record or a malformed one. */
+function heldSettingsOfEntry(entry: SessionEntry): SystemPromptHeldSettings | undefined {
+	if (
+		entry.type !== "custom" ||
+		entry.customType !== SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE ||
+		!isRecord(entry.data)
+	) {
+		return undefined;
+	}
+	const { digest, hold, settings } = entry.data;
+	if (typeof digest !== "string" || typeof hold !== "string" || !isHeldSettingRecords(settings)) return undefined;
+	return { digest, hold, settings };
+}
+
+/** `setting` with `value`, as a {@link HeldSettingRecord} gives it. */
+function heldSettingRecord(setting: AnySetting, value: unknown): HeldSettingRecord {
+	return setting.isCredential || value === undefined ? { id: setting.id } : { id: setting.id, value };
+}
+
 /** Index of the newest entry of `branch` that records a prompt other than `digest`; -1 when none does. */
 function otherPromptRecordIndex(branch: readonly SessionEntry[], digest: string): number {
 	return branch.findLastIndex(entry => {
@@ -825,17 +902,31 @@ function isPerCallModelAdvertisement(value: unknown): value is PerCallModelAdver
 }
 
 /**
+ * The settings a change the base prompt withholds holds, as its settings notices tell the model of them
+ * ({@link SessionTools.takeSettingsNotice}): a held settings rebuild's, or a restored transcript prompt's, which the
+ * session's records name ({@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE}).
+ */
+interface HeldSettings {
+	/** Identifies the change's settings notices on any branch ({@link SettingsNoticeDetails.hold}). */
+	readonly id: string;
+	/** Each changed setting's value the withholding prompt was built with. */
+	readonly before: Map<AnySetting, unknown>;
+	/** What the change's settings notices told the model, each with the ones before it on its branch, by number. */
+	readonly notices: SettingsNoticeState[];
+	/**
+	 * Changes of an earlier process the session records as held from the same prompt
+	 * ({@link SystemPromptHeldSettings.hold}): what their notices in the context gave each setting counts as told.
+	 */
+	readonly earlierHolds: ReadonlySet<string>;
+}
+
+/**
  * A rebuild that a settings change started while the prompt was bound, held until it is due
  * ({@link withheldChangeDue}: five minutes after the change at the latest; see
- * {@link SessionTools.absorbHeldSettingsRebuild}).
+ * {@link SessionTools.absorbHeldSettingsRebuild}). Its {@link HeldSettings.before} holds each changed setting's value
+ * when the hold began, and a restored transcript prompt's settings when it began on one.
  */
-interface HeldSettingsRebuild extends WithheldChange {
-	/** Identifies the hold's settings notices on any branch ({@link SettingsNoticeDetails.hold}). */
-	readonly id: string;
-	/** Each changed setting's value when the hold began: the value the bound prompt was built with. */
-	readonly before: Map<AnySetting, unknown>;
-	/** What the hold's settings notices told the model, each with the ones before it on its branch, by number. */
-	readonly notices: SettingsNoticeState[];
+interface HeldSettingsRebuild extends WithheldChange, HeldSettings {
 	/** Enabled tools a held reconcile unregistered, with the settings whose change did it; calls are refused. */
 	readonly disabledTools: Map<string, readonly AnySetting[]>;
 	/** Tools a held reconcile registered for the enabled set; the rebuild activates them. */
@@ -863,34 +954,42 @@ interface HeldSettingsRebuild extends WithheldChange {
 	readonly toolSettings: Settings;
 }
 
-/** What a settings notice and the notices before it on its branch told the model under one hold. */
+/** What a settings notice and the notices before it on its branch told the model under one change. */
 interface SettingsNoticeState {
 	/** The value given for each setting. */
 	readonly values: ReadonlyMap<AnySetting, unknown>;
-	/** The disabled and enabled tool lists given last ({@link NO_HELD_TOOLS} for none). */
-	readonly tools: string;
+	/** The tools given as disabled, their calls refused. */
+	readonly disabledTools: readonly string[];
+	/** The tools given as enabled, available after the rebuild. */
+	readonly enabledTools: readonly string[];
 }
-
-/** {@link SettingsNoticeState.tools} before any notice: no tool disabled or enabled. */
-const NO_HELD_TOOLS = JSON.stringify([[], []]);
 
 /**
  * A resumed transcript's stored prompt, restored in place of this process's own build, which it withholds from the
- * model ({@link SessionTools.replaceRestoredPromptIfDue}).
+ * model ({@link SessionTools.replaceRestoredPromptIfDue}), with the settings the session's records name as held from
+ * it ({@link SessionTools.#restoreTranscriptPrompt}).
  */
-interface RestoredPrompt extends WithheldChange {
+interface RestoredPrompt extends WithheldChange, HeldSettings {
 	/** The stored blocks, restored as the base; {@link WithheldChange.digest} is theirs. */
 	readonly base: readonly string[];
 }
 
-/** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids, tool names and its hold, never a value. */
+/** Data of a {@link SETTINGS_NOTICE_MESSAGE_TYPE} message: setting ids, tool names and its change, never a credential. */
 interface SettingsNoticeDetails {
 	settings: string[];
+	/** Each setting it names but a credential, with the value it gives now: what a resumed process counts as told. */
+	values: HeldSettingRecord[];
+	/** Tools it gives as disabled that no notice before it on its branch did. */
 	disabledTools: string[];
+	/** Tools a notice before it on its branch gave as disabled that run again. */
+	reenabledTools: string[];
+	/** Tools it gives as enabled after the rebuild that no notice before it on its branch did. */
 	enabledTools: string[];
-	/** The {@link HeldSettingsRebuild.id} of the hold the notice describes. */
+	/** Tools a notice before it on its branch gave as enabled after the rebuild that no longer are. */
+	withdrawnTools: string[];
+	/** The {@link HeldSettings.id} of the change the notice describes. */
 	hold: string;
-	/** The notice's index in that hold's {@link HeldSettingsRebuild.notices}. */
+	/** The notice's index in that change's {@link HeldSettings.notices}. */
 	notice: number;
 }
 
@@ -2970,13 +3069,15 @@ export class SessionTools {
 	/**
 	 * Records on the current branch that the base prompt `change` names withholds
 	 * a change made at its `since`, for a resumed process that restores that
-	 * prompt ({@link #withheldChangeSince}), unless the branch records that time
-	 * since it last recorded another prompt or ended a hold on this one. A spent
-	 * hold on the same prompt ({@link #spentHold}) is ended first, so the record
-	 * follows the end. Nothing reads it when the operator inputs cannot be
-	 * compared, so nothing is recorded then.
+	 * prompt ({@link #recordedHold}), unless the branch records that time
+	 * since it last recorded another prompt or ended a hold on this one, and the
+	 * settings it holds with the values that prompt was built with
+	 * ({@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE}), each the branch does not
+	 * name since then. A spent hold on the same prompt ({@link #spentHold}) is
+	 * ended first, so the records follow the end. Nothing reads them when the
+	 * operator inputs cannot be compared, so nothing is recorded then.
 	 */
-	#recordWithheldChange(change: WithheldChange): void {
+	#recordWithheldChange(change: WithheldChange & HeldSettings): void {
 		if (!this.#writesHoldRecords(change)) return;
 		this.#settleRestoredPrompt();
 		this.#endSpentHold(change.digest);
@@ -2985,14 +3086,34 @@ export class SessionTools {
 		// The view grows in place with the record and the entries after it.
 		change.recordedOn = branch;
 		change.recorded = true;
+		let dated = false;
+		const unnamed = new Map(change.before);
 		const other = otherPromptRecordIndex(branch, change.digest);
 		for (let index = branch.length - 1; index > other; index--) {
-			if (promptHoldEndOfEntry(branch[index]) === change.digest) break;
-			const withheld = promptHoldOfEntry(branch[index]);
-			if (withheld?.digest === change.digest && withheld.since === change.since) return;
+			const entry = branch[index];
+			if (promptHoldEndOfEntry(entry) === change.digest) break;
+			const withheld = promptHoldOfEntry(entry);
+			if (withheld?.digest === change.digest && withheld.since === change.since) dated = true;
+			const named = heldSettingsOfEntry(entry);
+			if (named?.digest === change.digest && named.hold === change.id) {
+				for (const setting of unnamed.keys()) {
+					if (named.settings.some(record => record.id === setting.id)) unnamed.delete(setting);
+				}
+			}
+			// The branch records both already.
+			if (dated && unnamed.size === 0) return;
 		}
-		const record: SystemPromptHold = { digest: change.digest, since: change.since };
-		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, record);
+		if (!dated) {
+			const record: SystemPromptHold = { digest: change.digest, since: change.since };
+			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HOLD_CUSTOM_TYPE, record);
+		}
+		if (unnamed.size === 0) return;
+		const record: SystemPromptHeldSettings = {
+			digest: change.digest,
+			hold: change.id,
+			settings: [...unnamed].map(([setting, value]) => heldSettingRecord(setting, value)),
+		};
+		this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE, record);
 	}
 
 	/**
@@ -3042,29 +3163,54 @@ export class SessionTools {
 	}
 
 	/**
-	 * When the session records that the base prompt `digest` names began to
-	 * withhold a change: the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
+	 * What the session records of a change the base prompt `digest` names
+	 * withholds: when it began, the earliest {@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}
 	 * record naming it written after the current branch last recorded another
 	 * prompt, on any branch, and after the last
-	 * {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} record naming it, on any branch.
+	 * {@link SYSTEM_PROMPT_HOLD_END_CUSTOM_TYPE} record naming it, on any branch;
+	 * and the settings each {@link SYSTEM_PROMPT_HELD_SETTINGS_CUSTOM_TYPE} record
+	 * naming it in that span names. Undefined when no hold record is there.
 	 * The change was made to the process, not to a branch: `/tree` onto a branch
 	 * that holds no record of it, before a restart, leaves it no less old, and a
 	 * change that went out on another branch went out of the process.
 	 */
-	#withheldChangeSince(digest: string): number | undefined {
+	#recordedHold(digest: string): RecordedHold | undefined {
 		const branch = this.#host.sessionManager.getBranchView();
 		const other = otherPromptRecordIndex(branch, digest);
 		const entries = this.#host.sessionManager.getEntries();
 		let since: number | undefined;
+		let settings = new Map<string, HeldSettingRecord>();
+		const holds = new Set<string>();
 		for (let index = other < 0 ? 0 : entries.indexOf(branch[other]) + 1; index < entries.length; index++) {
-			if (promptHoldEndOfEntry(entries[index]) === digest) {
+			const entry = entries[index];
+			if (promptHoldEndOfEntry(entry) === digest) {
 				since = undefined;
+				settings = new Map();
+				holds.clear();
 				continue;
 			}
-			const withheld = promptHoldOfEntry(entries[index]);
+			const withheld = promptHoldOfEntry(entry);
 			if (withheld?.digest === digest) since = Math.min(withheld.since, since ?? withheld.since);
+			const named = heldSettingsOfEntry(entry);
+			if (named?.digest !== digest) continue;
+			holds.add(named.hold);
+			for (const record of named.settings) if (!settings.has(record.id)) settings.set(record.id, record);
 		}
-		return since;
+		return since === undefined ? undefined : { since, settings, holds };
+	}
+
+	/**
+	 * Each setting `records` name, with the value the prompt they name was built with; undefined when one cannot be
+	 * told to the model: a credential, whose value is never recorded, or a setting this process does not know.
+	 */
+	#heldSettingValues(records: ReadonlyMap<string, HeldSettingRecord>): Map<AnySetting, unknown> | undefined {
+		const values = new Map<AnySetting, unknown>();
+		for (const [id, record] of records) {
+			const setting = lookupSetting(id);
+			if (!setting || setting.isCredential) return undefined;
+			values.set(setting, record.value);
+		}
+		return values;
 	}
 
 	/**
@@ -3089,11 +3235,16 @@ export class SessionTools {
 	 * releases the stored prompt first ({@link replaceRestoredPromptIfDue}). It
 	 * goes out too once the change the stored prompt withholds is
 	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} old by the session's record, on
-	 * whichever branch ({@link #withheldChangeSince}), a record dated after the
+	 * whichever branch ({@link #recordedHold}), a record dated after the
 	 * clock counting from now; a restored prompt is released as soon as that or
 	 * any other reason to keep it ends ({@link replaceRestoredPromptIfDue}).
-	 * Models that do not bind their prefix keep the fresh build: they rebuild
-	 * freely mid-session as well.
+	 * The settings a held change the session records holds go into the
+	 * settings notice ({@link takeSettingsNotice}), each with the value the
+	 * stored prompt was built with, so the model learns of a change held
+	 * after the transcript's last request too; one it cannot be told of (a
+	 * credential, a setting this process does not know) sends this process's
+	 * own build instead. Models that do not bind their prefix keep the fresh
+	 * build: they rebuild freely mid-session as well.
 	 */
 	#restoreTranscriptPrompt(): void {
 		const promptDigest = this.#restoredTranscript?.promptDigest;
@@ -3101,18 +3252,25 @@ export class SessionTools {
 		if (!promptDigest || operatorDigest === undefined || this.#host.model()?.thinking?.prefixBinding !== true) return;
 		if (systemPromptDigest(this.#baseSystemPrompt) === promptDigest) {
 			// This process's own build is the transcript's prompt: a hold the session records on it withholds nothing.
-			const since = this.#withheldChangeSince(promptDigest);
+			const since = this.#recordedHold(promptDigest)?.since;
 			if (since !== undefined) this.#spentHold = this.#withheldChange(promptDigest, since, true);
 			return;
 		}
 		const stored = this.#storedPrompt(promptDigest);
 		if (stored?.operatorDigest !== operatorDigest || systemPromptDigest(stored.blocks) !== stored.digest) return;
 		if (!this.#host.transcriptPromptCacheLive(promptDigest)) return;
-		const recordedSince = this.#withheldChangeSince(promptDigest);
+		const recorded = this.#recordedHold(promptDigest);
+		const before = recorded ? this.#heldSettingValues(recorded.settings) : new Map<AnySetting, unknown>();
+		// The session records a held change of a setting the model cannot be told of: this process's own build goes out.
+		if (!before) return;
 		const restoredPrompt: RestoredPrompt = {
 			base: stored.blocks,
 			// The earliest the session records, else the restore.
-			...this.#withheldChange(promptDigest, recordedSince ?? Date.now(), recordedSince !== undefined),
+			...this.#withheldChange(promptDigest, recorded?.since ?? Date.now(), recorded !== undefined),
+			id: crypto.randomUUID(),
+			before,
+			notices: [],
+			earlierHolds: recorded?.holds ?? new Set(),
 		};
 		// The change the stored prompt would withhold is due already: this process's own build goes out.
 		if (withheldChangeDue(restoredPrompt, false)) return;
@@ -4038,22 +4196,29 @@ export class SessionTools {
 	 * model what changed and when it goes out, and {@link absorbHeldSettingsRebuild} runs the rebuild once it is due:
 	 * at a cut the cut rule admits, once the prompt cache entry lapses, or five minutes after the change, whichever
 	 * comes first. A new hold is recorded on the branch with its start, as on each branch a reply under it goes to
-	 * ({@link recordReplyPrompt}), so a resumed process that restores the bound prompt keeps the change waiting no
-	 * longer ({@link #restoreTranscriptPrompt}). Returns the hold to extend, or undefined when the rebuild runs now: no
-	 * settings change started it, or nothing is bound. Unlike {@link #implicitRebuildBinding}, the prompt the session
-	 * was created with binds as soon as a reply was produced under it or a call sent with it, before any rebuild
-	 * committed.
+	 * ({@link recordReplyPrompt}), and so is each setting it holds, so a resumed process that restores the bound
+	 * prompt keeps the change waiting no longer and tells the model of it ({@link #restoreTranscriptPrompt}). A hold
+	 * on a restored transcript prompt holds the settings the session records as held from it too, with the values that
+	 * prompt was built with, and goes on from the notices that told the model of them. Returns the hold to extend, or
+	 * undefined when the rebuild runs now: no settings change started it, or nothing is bound. Unlike
+	 * {@link #implicitRebuildBinding}, the prompt the session was created with binds as soon as a reply was produced
+	 * under it or a call sent with it, before any rebuild committed.
 	 */
 	#holdSettingsRebuild(settingsChange: readonly SettingChange[] | undefined): HeldSettingsRebuild | undefined {
 		if (!settingsChange || !this.#promptBound) return undefined;
 		let held = this.#heldSettingsRebuild;
 		if (!held) {
-			const before = new Map(settingsChange.map(({ setting, previous }) => [setting, previous] as const));
+			const restored = this.#keptRestoredPrompt();
+			const before = new Map(restored?.before);
+			for (const { setting, previous } of settingsChange) {
+				if (!before.has(setting)) before.set(setting, previous);
+			}
 			held = {
-				id: crypto.randomUUID(),
+				id: restored?.id ?? crypto.randomUUID(),
 				...this.#withheldChange(this.currentPromptDigest(), Date.now(), false),
 				before,
-				notices: [],
+				notices: restored?.notices ?? [],
+				earlierHolds: restored?.earlierHolds ?? new Set(),
 				disabledTools: new Map(),
 				enabledTools: new Set(),
 				reconcile: false,
@@ -4065,11 +4230,23 @@ export class SessionTools {
 			this.#heldSettingsRebuild = held;
 			this.#recordWithheldChange(held);
 			this.#setAgentTools(this.#host.agent.state.tools);
+			return held;
 		}
+		let grown = false;
 		for (const { setting, previous } of settingsChange) {
-			if (!held.before.has(setting)) held.before.set(setting, previous);
+			if (held.before.has(setting)) continue;
+			held.before.set(setting, previous);
+			grown = true;
 		}
+		if (grown) this.#recordGrownHold(held);
 		return held;
+	}
+
+	/** Records the settings `held` holds that its records on the current branch do not name yet. */
+	#recordGrownHold(held: HeldSettingsRebuild): void {
+		// The branch's records may name fewer settings than the hold holds now.
+		held.recordedOn = undefined;
+		this.#recordWithheldChange(held);
 	}
 
 	/**
@@ -4341,8 +4518,9 @@ export class SessionTools {
 	 * or one that build did not read that changed since ({@link #promptUnreadChanges}), each with the value the base
 	 * was built under. Such a change moved nothing alone (a setting the prompt renders only beside another one, changed
 	 * in a later reload), and the rebuild sends it with the held change, so the settings notice names it as well
-	 * ({@link takeSettingsNotice}). A setting the prompt surface reads (`surfaceRead`, derived here when not given) is
-	 * left out, as {@link #promptMovers} leaves it.
+	 * ({@link takeSettingsNotice}), and so do the session's records of the hold ({@link #recordWithheldChange}). A
+	 * setting the prompt surface reads (`surfaceRead`, derived here when not given) is left out, as
+	 * {@link #promptMovers} leaves it.
 	 */
 	async #holdEarlierChanges(
 		read: ReadonlyMap<AnySetting, unknown>,
@@ -4360,9 +4538,13 @@ export class SessionTools {
 		}
 		if (earlier.length === 0) return;
 		const surface = surfaceRead ?? (await this.#promptSurfaceReads());
+		let grown = false;
 		for (const { setting, previous } of earlier) {
-			if (!surface.has(setting) && !held.before.has(setting)) held.before.set(setting, previous);
+			if (surface.has(setting) || held.before.has(setting)) continue;
+			held.before.set(setting, previous);
+			grown = true;
 		}
+		if (grown && this.#heldSettingsRebuild === held) this.#recordGrownHold(held);
 	}
 
 	/**
@@ -4418,45 +4600,59 @@ export class SessionTools {
 	}
 
 	/**
-	 * Builds the hidden notice of a held settings rebuild: each changed setting with the value the prompt was built
+	 * Builds the hidden notice of a held settings change: each changed setting with the value the prompt was built
 	 * with and the value now set (a credential's values withheld), the tools the change disabled, whose calls are
 	 * refused, the tools it enables at the rebuild, and when the rebuild comes at the latest. Gives only what changed
-	 * since the hold's last notice on the current branch: a branch the hold's notices are not on (`/tree` to an
-	 * earlier reply, a switch to another session) gets the whole change.
+	 * since the change's last notice on the current branch, both ways: a tool that notice gave as disabled that runs
+	 * again, and one it gave as enabled that the rebuild no longer brings; a branch the change's notices are not on
+	 * (`/tree` to an earlier reply, a switch to another session) gets the whole change. The change is a held settings
+	 * rebuild's, else the settings a kept restored transcript prompt withholds ({@link #restoreTranscriptPrompt}). A
+	 * setting the notices of an earlier process's change of that prompt gave at its current value counts as told
+	 * ({@link HeldSettings.earlierHolds}), so a resumed process names only what they did not.
 	 */
 	takeSettingsNotice(
 		messages: readonly AgentMessage[] = this.#host.agent.state.messages,
 	): CustomMessage<SettingsNoticeDetails> | undefined {
-		const held = this.#heldSettingsRebuild;
+		const rebuild = this.#heldSettingsRebuild;
+		const held = rebuild ?? this.#keptRestoredPrompt();
 		if (!held) return undefined;
 		const told = this.#settingsNoticeTold(held, messages);
+		const earlier = this.#earlierNoticeValues(held.earlierHolds, messages);
 		const values = new Map(told?.values);
 		const changes: SettingChangeView[] = [];
+		const given: HeldSettingRecord[] = [];
 		for (const [setting, before] of held.before) {
-			const known = values.has(setting) ? values.get(setting) : before;
+			const known = values.has(setting)
+				? values.get(setting)
+				: earlier.has(setting.id)
+					? earlier.get(setting.id)
+					: before;
 			const value = setting.get(this.#host.settings);
 			if (settingValuesEqual(value, known)) continue;
 			changes.push(settingChangeView(setting, known, value));
+			if (!setting.isCredential) given.push(heldSettingRecord(setting, value));
 			values.set(setting, value);
 		}
-		const disabledTools = [...held.disabledTools.keys()];
-		const enabledTools = [...held.enabledTools];
-		const tools = JSON.stringify([disabledTools, enabledTools]);
-		if (changes.length === 0 && tools === (told?.tools ?? NO_HELD_TOOLS)) return undefined;
-		held.notices.push({ values, tools });
+		const disabledTools = rebuild ? [...rebuild.disabledTools.keys()] : [];
+		const enabledTools = rebuild ? [...rebuild.enabledTools] : [];
+		const toldDisabled = told?.disabledTools ?? [];
+		const toldEnabled = told?.enabledTools ?? [];
+		const tools = {
+			disabledTools: disabledTools.filter(name => !toldDisabled.includes(name)),
+			reenabledTools: toldDisabled.filter(name => !disabledTools.includes(name)),
+			enabledTools: enabledTools.filter(name => !toldEnabled.includes(name)),
+			withdrawnTools: toldEnabled.filter(name => !enabledTools.includes(name)),
+		};
+		if (changes.length === 0 && Object.values(tools).every(names => names.length === 0)) return undefined;
+		held.notices.push({ values, disabledTools, enabledTools });
 		return {
 			role: "custom",
 			customType: SETTINGS_NOTICE_MESSAGE_TYPE,
-			content: prompt.render(settingsNoticePrompt, {
-				changes,
-				disabledTools,
-				enabledTools,
-				rebuildBy: withheldChangeDeadline(held),
-			}),
+			content: prompt.render(settingsNoticePrompt, { changes, ...tools, rebuildBy: withheldChangeDeadline(held) }),
 			details: {
 				settings: changes.map(change => change.id),
-				disabledTools,
-				enabledTools,
+				values: given,
+				...tools,
 				hold: held.id,
 				notice: held.notices.length - 1,
 			},
@@ -4467,7 +4663,7 @@ export class SessionTools {
 	}
 
 	/** What `held`'s newest settings notice in `messages` told the model; undefined when none is there. */
-	#settingsNoticeTold(held: HeldSettingsRebuild, messages: readonly AgentMessage[]): SettingsNoticeState | undefined {
+	#settingsNoticeTold(held: HeldSettings, messages: readonly AgentMessage[]): SettingsNoticeState | undefined {
 		for (let index = messages.length - 1; index >= 0; index--) {
 			const message = messages[index];
 			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
@@ -4477,6 +4673,24 @@ export class SessionTools {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * The value the newest settings notice of one of `holds` (an earlier process's) in `messages` gave each setting it
+	 * names, by id ({@link SettingsNoticeDetails.values}): told to the model already. Empty without such holds.
+	 */
+	#earlierNoticeValues(holds: ReadonlySet<string>, messages: readonly AgentMessage[]): Map<string, unknown> {
+		const told = new Map<string, unknown>();
+		if (holds.size === 0) return told;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message.role !== "custom" || message.customType !== SETTINGS_NOTICE_MESSAGE_TYPE) continue;
+			const details = message.details;
+			if (!isRecord(details) || typeof details.hold !== "string" || !holds.has(details.hold)) continue;
+			if (!isHeldSettingRecords(details.values)) continue;
+			for (const { id, value } of details.values) if (!told.has(id)) told.set(id, value);
+		}
+		return told;
 	}
 
 	/**

@@ -7578,6 +7578,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.getToolForEvalBridge(name);
 	}
 
+	/**
+	 * Why a call to the tool or `xd://` device `name` is refused while a held settings change keeps it listed
+	 * ({@link SessionTools.heldToolRefusal}); undefined when calls to it run.
+	 */
+	heldToolRefusal(name: string): string | undefined {
+		return this.#tools.heldToolRefusal(name);
+	}
+
 	/** Names currently authorized through the eval bridge. */
 	getEvalBridgeToolNames(): string[] {
 		return this.#tools.getEvalBridgeToolNames();

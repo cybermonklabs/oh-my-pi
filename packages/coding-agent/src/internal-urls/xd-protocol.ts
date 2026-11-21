@@ -92,6 +92,10 @@ export class XdProtocolHandler implements ProtocolHandler {
 		const xdev = session.xdev;
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
 		if (!name) throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
+		// A device a held settings change disabled stays listed until the rebuild; a call to it is refused as a direct
+		// call to the tool is, with the reason.
+		const heldRefusal = session.heldToolRefusal?.(name);
+		if (heldRefusal) throw new ToolError(heldRefusal);
 		const toolCall = context.toolCall;
 		if (!toolCall) throw new ToolError(`xd://${name} can only be written by the write tool.`);
 		const { result, xdev: dispatch } = await dispatchXdevTool(
@@ -114,13 +118,16 @@ export class XdProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	/** `read xd://` listing, or one device's usage/docs. */
+	/** `read xd://` listing, or one device's usage/docs; a device a held settings change disabled gives the reason. */
 	#usage(session: ToolSession, name: string | null): string {
 		if (name === REPORT_ISSUE_DEVICE_NAME) return reportIssueDeviceUsage();
 		if (name && isResolutionDeviceName(name)) return resolutionDeviceUsage(name);
 		const xdev = session.xdev;
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
-		return name === null ? xdevListing(xdev) : xdevDocs(xdev, name);
+		if (name === null) return xdevListing(xdev);
+		const heldRefusal = session.heldToolRefusal?.(name);
+		if (heldRefusal) throw new ToolError(heldRefusal);
+		return xdevDocs(xdev, name);
 	}
 
 	/** `read xd://<tool>/<topic>`: one named doc topic of a tool. */
