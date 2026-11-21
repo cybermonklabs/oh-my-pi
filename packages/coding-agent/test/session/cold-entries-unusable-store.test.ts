@@ -3,9 +3,10 @@
  * entry bodies in cannot be used: `os.tmpdir()` read-only or impossible to
  * create, its store directory one that other accounts can enter, every write
  * to it failing (a full disk), or an image of an entry going cold that cannot
- * be stored in the blob store. The entries read back as the session file
- * holds them, and a full disk does not make a resume do more work than the
- * transcript's size calls for.
+ * be stored in the blob store. The older bodies are then kept compressed in
+ * memory, the entries read back as the session file holds them, and a full
+ * disk does not make a resume do more work than the transcript's size calls
+ * for.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -286,9 +287,10 @@ describe("a resume and a running session work when the older-entry store cannot 
 		},
 	);
 
-	// On a shared host another account can make the store directory first; entries must not go where it can read them.
+	// On a shared host another account can make the store directory first; entries must not go where
+	// it can read them, and a long session must not hold every older body whole instead.
 	it.skipIf(!HAS_POSIX_OWNERS)(
-		"keeps every entry whole and the session working when the store directory lets other accounts in",
+		"keeps the older bodies compressed in memory and the session working when the store directory lets other accounts in",
 		async () => {
 			using dir = TempDir.createSync("@omp-cold-unusable-");
 			using tmp = TempDir.createSync("@omp-cold-unusable-tmp-");
@@ -299,7 +301,7 @@ describe("a resume and a running session work when the older-entry store cannot 
 			vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
 
 			const manager = await open(file);
-			expect(manager.coldStoreStats().coldEntries).toBe(0);
+			expect(manager.coldStoreStats()).toMatchObject({ coldEntries: 2, storeInMemory: true });
 			expect(readEntries(manager)).toEqual(await entriesInFile(file));
 			const u3 = manager.appendMessage(user(`u3 ${BODY}`));
 			manager.appendCompaction(`c2 ${BODY}`, undefined, u3, 2000);
@@ -307,7 +309,8 @@ describe("a resume and a running session work when the older-entry store cannot 
 				"compactionSummary",
 				"user",
 			]);
-			expect(manager.coldStoreStats().coldEntries).toBe(0);
+			// `u1` to `a2`, before the new cut at `u3`.
+			expect(manager.coldStoreStats()).toMatchObject({ coldEntries: 5, storeInMemory: true });
 			expect(fs.readdirSync(coldDir)).toEqual([]);
 			await manager.close();
 		},

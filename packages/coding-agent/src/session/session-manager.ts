@@ -864,6 +864,13 @@ export interface ColdStoreStats {
 	materializations: number;
 	/** Cold entries made whole again. */
 	hydrations: number;
+	/**
+	 * Whether the store keeps new records compressed in memory: no store file
+	 * could be made under `os.tmpdir()`, or a write to it failed.
+	 */
+	storeInMemory: boolean;
+	/** Bytes of the compressed blocks of records the store keeps in memory. */
+	compressedBytes: number;
 }
 
 /** Options of {@link SessionManager.buildSessionContext}. */
@@ -1193,8 +1200,6 @@ export class SessionManager {
 	readonly #coldStoreEnabled: boolean;
 	/** The store new cold entries go to; created when the first entry turns cold. */
 	#coldStore: ColdEntryStore | undefined;
-	/** A store could not be opened since the last load: entries stay whole instead of trying again for each. */
-	#coldStoreUnavailable = false;
 	/** The model the cut was last computed for (see `coldCutPathIndex`); unset until a context build names one. */
 	#coldCutModel: Model | undefined;
 	/**
@@ -2464,7 +2469,6 @@ export class SessionManager {
 	 */
 	#resetColdCut(store: ColdEntryStore | undefined, stale: boolean): void {
 		this.#adoptColdStore(store);
-		this.#coldStoreUnavailable = false;
 		this.#coldCutModel = undefined;
 		this.#coldCutStale = stale;
 	}
@@ -2478,25 +2482,22 @@ export class SessionManager {
 	}
 
 	/**
-	 * The store new cold entries go to, created on first use; undefined when
-	 * none can be opened, and then not tried again before the next load.
+	 * The store new cold entries go to, created on first use: over a file, or
+	 * kept compressed in memory where none can be made.
 	 */
-	#openColdStore(): ColdEntryStore | undefined {
-		if (this.#coldStore || this.#coldStoreUnavailable) return this.#coldStore;
+	#openColdStore(): ColdEntryStore {
+		if (this.#coldStore) return this.#coldStore;
 		const store = ColdEntryStore.open(this.#blobs);
-		if (store) this.#adoptColdStore(store);
-		else this.#coldStoreUnavailable = true;
+		this.#adoptColdStore(store);
 		return store;
 	}
 
 	/**
-	 * Whether a convert pass can make an entry cold, as `#openColdStore`
-	 * answers: false while no store can be opened before the next load, or
-	 * once the store takes no new record (a write to it failed, or it closed).
-	 * {@link convertToColdEntry} then keeps every entry whole.
+	 * Whether a convert pass can make an entry cold: false once the store
+	 * closed, when {@link convertToColdEntry} keeps every entry whole.
 	 */
 	#coldStoreTakesRecords(): boolean {
-		return this.#coldStore ? this.#coldStore.writable : !this.#coldStoreUnavailable;
+		return this.#coldStore?.writable ?? true;
 	}
 
 	/**
@@ -2995,8 +2996,6 @@ export class SessionManager {
 			entries: SessionEntry[];
 			index: SessionEntryIndex;
 			store: ColdEntryStore | undefined;
-			/** A store could not be opened: the entries stay whole. */
-			storeUnavailable: boolean;
 			/** Entries before this index were offered to the store by a compaction's kept start. */
 			cooled: number;
 			/** Entries carrying replay metadata a resume strips, sanitized once the load-time passes ran. */
@@ -3005,15 +3004,11 @@ export class SessionManager {
 			entries: [],
 			index: new SessionEntryIndex(),
 			store: undefined,
-			storeUnavailable: false,
 			cooled: 0,
 			unsanitized: [],
 		};
 		const openStore = () => {
-			if (!intake.store && !intake.storeUnavailable) {
-				intake.store = ColdEntryStore.open(this.#blobs);
-				intake.storeUnavailable = intake.store === undefined;
-			}
+			intake.store ??= ColdEntryStore.open(this.#blobs);
 			return intake.store;
 		};
 		const startMigration = (current: SessionHeader): SessionEntryMigration => {
@@ -4661,9 +4656,11 @@ export class SessionManager {
 	/**
 	 * The active-leaf branch from the cut on: the first entry the model context
 	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
-	 * bodies stay in memory, except patch records and a user's to-do edit older
-	 * than the newest to-do snapshot, so a reader of the recent turns reads no
-	 * older body.
+	 * bodies stay in memory, except the records no turn reads there (patch
+	 * records, `session_exit` records, a user's to-do edit, a to-do HUD choice
+	 * or a mode change older than the newest of its kind, a compaction older
+	 * than the one the context starts from), so a reader of the recent turns
+	 * reads no older body.
 	 * The whole branch when the context uses no compaction.
 	 */
 	getBranchFromCut(): SessionEntry[] {
@@ -4796,6 +4793,8 @@ export class SessionManager {
 			storeBytes: store?.bytes ?? 0,
 			materializations: store?.materializations ?? 0,
 			hydrations: store?.hydrations ?? 0,
+			storeInMemory: store?.inMemory ?? false,
+			compressedBytes: store?.compressedBytes ?? 0,
 		};
 	}
 

@@ -329,4 +329,53 @@ describe("what the cut leaves whole", () => {
 		expect(coldMessages(context)).toEqual([]);
 		expect(isColdEntry(entryOf(resumed, "a0"))).toBe(true);
 	});
+
+	// The walk that finds a rollover's request passes over the turn's async-result deliveries and peer
+	// IRC messages; reading their records back on every context build costs a parse each per turn.
+	it("finds a context-rollover compaction's request past cold custom messages without reading them", async () => {
+		using dir = TempDir.createSync("@omp-cold-boundary-");
+		const customMessage = (id: string, parentId: string | null, customType: string, details: object) => ({
+			type: "custom_message",
+			id,
+			parentId,
+			timestamp: TIMESTAMP,
+			customType,
+			content: `${id} ${BODY}`,
+			display: true,
+			details,
+			attribution: "agent",
+		});
+		// The parent's IRC message is the request; ten deliveries and peer messages follow it, more than the
+		// record cache keeps.
+		const entries: object[] = [
+			customMessage("p0", null, "irc:incoming", { from: "0-Main", message: `p0 ${BODY}`, fromParent: true }),
+		];
+		let parentId = "p0";
+		for (let index = 0; index < 10; index++) {
+			const id = `x${index}`;
+			entries.push(
+				index % 2 === 0
+					? customMessage(id, parentId, "async-result", { job: id, output: `${id} ${BODY}` })
+					: customMessage(id, parentId, "irc:incoming", { from: "0-Peer", message: `${id} ${BODY}` }),
+			);
+			parentId = id;
+		}
+		entries.push(
+			message("k0", parentId, assistant(`k0 ${BODY}`)),
+			compaction("c1", "k0", "k0", { details: { kind: "experimental-context-rollover" } }),
+			message("a1", "c1", assistant(`a1 ${BODY}`)),
+		);
+		const manager = await open(await writeSession(dir.path(), entries));
+		cleanups.push(() => manager.close());
+		expect(isColdEntry(entryOf(manager, "x0"))).toBe(true);
+		expect(isColdEntry(entryOf(manager, "x1"))).toBe(true);
+		const readsBefore = manager.coldStoreStats().materializations;
+
+		for (let build = 0; build < 3; build++) {
+			const context = manager.buildSessionContext().messages;
+			expect(context.map(found => found.role)).toEqual(["compactionSummary", "custom", "assistant", "assistant"]);
+			expect(JSON.stringify(context[1])).toContain("p0 ");
+		}
+		expect(manager.coldStoreStats().materializations).toBe(readsBefore);
+	});
 });

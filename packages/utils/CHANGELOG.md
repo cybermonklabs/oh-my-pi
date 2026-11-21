@@ -4,11 +4,12 @@
 
 ### Added
 
-- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`
+- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`; unlike `writeArchive` it empties `destPath` before it writes, so a failure leaves a truncated file there (write to a staging file and rename it on success)
 - Added `ArchiveReader.readFileChunks` to read an archive member in bounded chunks; plain tar files on disk yield reads of at most 1 MiB
 - Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
 - Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
 - Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time
+- Added `tryAcquireFileLockUnlessHeld`, which answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
 
 ### Fixed
 

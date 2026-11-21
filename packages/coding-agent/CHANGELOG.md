@@ -34,7 +34,7 @@
 - After `/model` or a fallback moves a session to another provider following an OpenAI remote compaction, and in a session with an experimental context-rollover compaction, requests no longer read older messages back from disk each time
 - Rebuilding the context after a compaction, a branch move or a model change no longer fails when an older message's image cannot be written to a full disk as the message leaves memory; that message stays in memory instead
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
-- omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them in memory instead
+- omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - On Windows, the temporary file of older entry bodies that a killed omp process left behind is deleted when a later omp process opens its first such file, unless another live process has taken the killed process's pid
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
 - After `/delete` while a backgrounded command still runs, closing the session frees the temporary file of older entry bodies at once instead of at the next garbage collection
@@ -43,7 +43,14 @@
 - A rate limit after a long thinking block no longer keeps a session whose request fits `retry.rateLimitFallbackMaxContextTokens` off `retry.fallbackChains`: the cap no longer counts the failed attempt's output, which the retry does not send again
 - RPC `cancel_subagent` answers `{"cancelled": false}` for a subagent whose IRC wake turn just ended, or whose run failed with an exception, while it is being cleaned up, instead of killing it
 - `RpcClient.steerSubagent` no longer gives up after 30 seconds while its message waits for a subagent between turns; its new `timeoutMs` option bounds the wait
-- A share with secret masking on no longer reads older tool start markers and to-do list edits back from disk only to drop their data
+- A share with secret masking on no longer reads older tool start markers, to-do list edits, compactions, branch summaries and custom messages back from disk only to drop their data
+- A subagent that answers an IRC message in the turn that message woke it for no longer sends the sender that answer a second time, reviving it, when its own idle timeout parks it while that turn still waits on its background work
+- A session write that waits on another omp process's write, and Hindsight's retried memory delivery while another omp process delivers, no longer block for about 50 ms on every attempt
+- A long session no longer keeps whole the older goal snapshots, context notebook revisions, to-do HUD choices and exit records, nor a snapcompact compaction a frame rescue replaced, each holding a copy of bodies that are out of memory
+- A `/resume` or `/move` that fails and rolls back, or a context rebuild that failed to read an older message, no longer leaves messages of the current model's context to be read back from disk on every request
+- RPC `cancel_subagent` and `steer_subagent` no longer reach a subagent whose first run failed before its first prompt while it is being cleaned up
+- A session copy or fork that fails to write frees its temporary file of older entry bodies at once instead of at the next garbage collection
+- A session whose temporary directory is read-only, full, missing or under a regular file, or whose temporary file fills the disk, now keeps its older entry bodies compressed in memory (about a fifth of their size) instead of whole
 
 ## [18.18.6] - 2026-11-09
 

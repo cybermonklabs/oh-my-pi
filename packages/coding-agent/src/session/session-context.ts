@@ -24,11 +24,13 @@ import {
 	REWIND_REPORT_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
+import { coldRolloverRequestMark } from "./cold-message";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
 import {
 	type CompactionEntry,
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
+	type ModeChangeEntry,
 	resolveSessionLeafId,
 	type SessionEntry,
 	type SessionMessageEntry,
@@ -63,13 +65,20 @@ function sitsBetweenTurnAndReminder(message: AgentMessage | undefined): boolean 
 	);
 }
 
+/**
+ * Whether `entry` is a request the context of an `experimental-context-rollover`
+ * compaction can take from before its kept entries: a user's request, or the
+ * parent's IRC message delivered while idle. A cold `custom_message` answers
+ * from the mark it took as it went cold (`coldRolloverRequestMark`), so the
+ * walk over the older entries on every context build reads no record back.
+ */
 export function isRolloverRequestEntry(entry: SessionEntry): boolean {
+	if (entry.type !== "custom_message") return isUserRequestEntry(entry);
+	const marked = coldRolloverRequestMark(entry);
+	if (marked !== undefined) return marked;
 	return (
 		isUserRequestEntry(entry) ||
-		(entry.type === "custom_message" &&
-			entry.customType === "irc:incoming" &&
-			isRecord(entry.details) &&
-			entry.details.fromParent === true)
+		(entry.customType === "irc:incoming" && isRecord(entry.details) && entry.details.fromParent === true)
 	);
 }
 
@@ -349,8 +358,8 @@ export function buildSessionContext(
 	const models: Record<string, string> = {};
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
-	let mode = "none";
-	let modeData: Record<string, unknown> | undefined;
+	// The last mode change on the path: only its data is read, since an older one's lies in the cold store.
+	let lastModeChange: ModeChangeEntry | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
 	// seen on this path. Once a user (or the agent itself) records an
 	// explicit default, later assistant-message inference must NOT overwrite
@@ -393,10 +402,11 @@ export function buildSessionContext(
 				injectedTtsrRulesSet.add(ruleName);
 			}
 		} else if (entry.type === "mode_change") {
-			mode = entry.mode;
-			modeData = entry.data;
+			lastModeChange = entry;
 		}
 	}
+	const mode = lastModeChange?.mode ?? "none";
+	const modeData = lastModeChange?.data;
 
 	if (options?.model && !options.transcript) {
 		compaction = getReadableCompactionEntry(path, options.model);

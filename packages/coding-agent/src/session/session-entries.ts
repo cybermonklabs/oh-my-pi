@@ -415,6 +415,13 @@ function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
 export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 
 /**
+ * `custom` type of the entry that records whether the to-do HUD is dismissed
+ * or revealed for one canonical snapshot ({@link todoSnapshotPhases}), named
+ * by its entry id and the JSON text of its list.
+ */
+export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
+
+/**
  * The phases a canonical to-do snapshot records, or undefined: a user's edit
  * of the list ({@link USER_TODO_EDIT_CUSTOM_TYPE}) or a successful `todo`
  * result ({@link todoResultPhases}). The to-do list restores from the newest
