@@ -447,9 +447,10 @@ async fn a_walk_dropped_before_its_seed_runs_keeps_job_paths_alive() {
 ///
 /// ```text
 /// RUSTFLAGS=-Zsanitizer=address ASAN_OPTIONS=detect_leaks=0 cargo test -p pi-walker \
-///     --target x86_64-unknown-linux-gnu -- walks_dropped_at_once_free_no_path_in_use
+///     --target x86_64-unknown-linux-gnu -- --ignored walks_dropped_at_once_free_no_path_in_use
 /// ```
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs AddressSanitizer"]
 async fn walks_dropped_at_once_free_no_path_in_use() {
 	let tmp = TempDir::new("drop-at-once");
 	let long = "p".repeat(150);

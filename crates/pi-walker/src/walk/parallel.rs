@@ -1087,8 +1087,10 @@ pub(super) mod seam {
 
 	type Hook = Box<dyn FnOnce(Bytes) + Send>;
 
-	/// Seams registered and not yet used; with none, walks skip the locks
-	/// below, so the seams leave other tests' timing alone.
+	/// Seams registered and not yet used. With none, `hold_first` and
+	/// `listing` take none of the locks below, but a test build still boxes
+	/// every worker future, and `arena::seam` still records each chunk under
+	/// a lock.
 	static ARMED: AtomicUsize = AtomicUsize::new(0);
 	/// Walk roots whose next spawned worker is held, with the sender each
 	/// held task drops when it is dropped.
