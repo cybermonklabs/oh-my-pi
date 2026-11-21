@@ -4,4 +4,5 @@
 # test that is not named fails, and when a named test passes or no longer
 # exists: remove its line then, so the list empties as the fixes land.
 # One per line: <bazel test target> <libtest test name>  <reason: the change
-# that fixes it and its issue>.
+# that fixes it and its issue>. The name runs to the first two spaces, so a
+# doctest's name, such as `src/lib.rs - f (line 3)`, is written whole.

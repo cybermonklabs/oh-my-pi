@@ -1,0 +1,6 @@
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "t::always" }
+{ "type": "test", "event": "started", "name": "t::needs_root" }
+{ "type": "test", "name": "t::always", "event": "ok" }
+{ "type": "test", "name": "t::needs_root", "event": "ok", "stdout": "not run: needs root to chown a file to another uid\n" }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000296492 }

@@ -101,7 +101,7 @@ while read -r manifest; do
 	echo "::error title=Rust test parity::$manifest is outside the root workspace and not in .github/sami/rust-test-cargo-workspaces.txt, so no job runs its tests"
 	unlisted=$((unlisted + 1))
 done < <(LC_ALL=C comm -23 "$tmp/manifests" "$tmp/members")
-echo "Cargo manifests: $(wc -l <"$tmp/manifests") tracked, $unlisted outside the root workspace and unlisted"
+echo "Cargo manifests: $(awk 'END { print NR }' "$tmp/manifests") tracked, $unlisted outside the root workspace and unlisted"
 
 # The crate roots the Bazel tests build, as repository paths, from each test
 # rule and each crate a test names. One JSON object per rule, with its
@@ -208,5 +208,5 @@ while IFS=$'\t' read -r _ binary rule value; do
 	echo "::error title=Rust test parity::$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
 	dropped=$((dropped + 1))
 done < <(awk -F'\t' '$1 == "skip"' "$tmp/args")
-echo "Skips in test targets' args: $(awk -F'\t' '$1 == "skip"' "$tmp/args" | wc -l), $dropped run nowhere"
+echo "Skips in test targets' args: $(awk -F'\t' '$1 == "skip" { n++ } END { print n + 0 }' "$tmp/args"), $dropped run nowhere"
 [ "$missing" = 0 ] && [ "$unlisted" = 0 ] && [ "$dropped" = 0 ]

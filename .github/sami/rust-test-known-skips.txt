@@ -1,7 +1,8 @@
 # Known skips for the rust_test job in .github/workflows/sami-build.yml: tests
-# that skip themselves (print a skip line and return) on the runner, though the
-# runner cannot give them their precondition. The job passes only when exactly
-# the tests named here skip. It fails when a test that is not named skips, and
+# that skip themselves on the runner (print `skipped: <reason>`, or a word the
+# skip scan in .github/sami/rust-test.sh knows, and return), though the runner
+# cannot give them their precondition. The job passes only when exactly the
+# tests named here skip. It fails when a test that is not named skips, and
 # when a named test runs: remove its line then. No skip is allowed, so a line
 # here needs the reason no GitHub-hosted runner can run the test, its owner,
 # and the change that will make it run.
