@@ -344,12 +344,13 @@ describe("--resume under session.storage: sql", () => {
 
 // A run that saves no session writes nothing to the store before its first model
 // request, so a store that refuses it, or whose table another client holds
-// locked, must neither end nor stall it there. The run below has no API key:
-// reaching that error is reaching the model request.
+// locked, must neither end nor stall it there. The run below has no API key, so
+// it ends at the API-key preflight: after the session is made, before the
+// request is prepared. Reaching that error is getting past every store step.
 describe("--no-session under session.storage: sql", () => {
 	const STORE_UNOPENED = "the session database could not be opened";
 
-	it("runs a prompt to its model request when the store refuses the connection", async () => {
+	it("runs a prompt to its API-key preflight when the store refuses the connection", async () => {
 		using tempDir = TempDir.createSync("@omp-no-session-sql-refused-");
 		const dsnFile = tempDir.join("dsn");
 		// Port 1 answers no connection.
@@ -363,7 +364,7 @@ describe("--no-session under session.storage: sql", () => {
 		expect(run.stderr).toContain(NO_API_KEY);
 	}, 30_000);
 
-	it("runs a prompt to its model request while another connection holds the store's write lock", async () => {
+	it("runs a prompt to its API-key preflight while another connection holds the store's write lock", async () => {
 		using tempDir = TempDir.createSync("@omp-no-session-sql-locked-");
 		const databasePath = tempDir.join("sessions.db");
 		const dsnFile = tempDir.join("dsn");
@@ -418,7 +419,7 @@ const POSTGRES_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 // only after the run ends, or as soon as a lock wait is seen (so a run that
 // waits ends, and the test reports the wait).
 describe.skipIf(!POSTGRES_URL)("--no-session under session.storage: sql on PostgreSQL", () => {
-	it("runs a prompt to its model request while another session holds ACCESS EXCLUSIVE on the session table", async () => {
+	it("runs a prompt to its API-key preflight while another session holds ACCESS EXCLUSIVE on the session table", async () => {
 		using tempDir = TempDir.createSync("@omp-no-session-pg-locked-");
 		const url = POSTGRES_URL ?? "";
 		const dsnFile = tempDir.join("dsn");

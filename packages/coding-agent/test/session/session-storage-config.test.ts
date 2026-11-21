@@ -392,10 +392,41 @@ describe("resolveSessionStorage with openOnFirstUse", () => {
 		);
 		expect(error.message).toMatch(/ \(ERR_POSTGRES_CONNECTION_[A-Z_]+\)$/);
 		expect(error.message).not.toContain("hunter2");
-		// A later use tries the database again rather than keeping the first failure.
-		const again = await rejection(storage.readText("/sessions/p/s.jsonl"));
-		expect(again.message).toStartWith(`OMP_SESSION_SQL_DSN_FILE names ${dsnFile}, but the session database`);
 	});
+
+	it("tries the database again at the next use after a failed open: the first use fails behind another connection's write lock, the next opens it", async () => {
+		const dir = makeTempDir("@pi-session-storage-first-use-retry-");
+		const databasePath = path.join(dir, "sessions.db");
+		const dsnFile = await writeDsnFile(`sqlite://${databasePath}\n`);
+		const storage = await resolveSessionStorage({
+			settings: Settings.isolated(),
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			openOnFirstUse: true,
+		});
+		// An exclusive transaction keeps the open from taking the write lock that making the tables needs.
+		const holder = new Database(databasePath, { create: true });
+		holder.run("BEGIN EXCLUSIVE");
+		let released = false;
+		try {
+			const first = await rejection(storage.writeText("/sessions/p/a.jsonl", "first\n"));
+			expect(first.message).toStartWith(
+				`OMP_SESSION_SQL_DSN_FILE names ${dsnFile}, but the session database could not be opened: `,
+			);
+			holder.run("ROLLBACK");
+			released = true;
+			// The failed open made no table (read once the lock is gone: a reader waits behind an exclusive one).
+			expect(sqliteTables(databasePath)).toEqual([]);
+
+			// The failed open is not kept: this use opens the database, and its write lands.
+			await storage.writeText("/sessions/p/a.jsonl", "second\n");
+			await storage.drain();
+			expect(sqliteTables(databasePath)).toContain("omp_session_files");
+			expect(await storage.readText("/sessions/p/a.jsonl")).toBe("second\n");
+		} finally {
+			if (!released) holder.run("ROLLBACK");
+			holder.close();
+		}
+	}, 30_000);
 
 	it("still refuses every configuration fault at once", async () => {
 		const missing = path.join(makeTempDir("@pi-session-storage-missing-"), "does-not-exist");

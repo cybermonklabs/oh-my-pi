@@ -3937,12 +3937,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * The largest blob one row of the table holds: the `maxBlobBytes` option,
 	 * else {@link MAX_BLOB_BYTES}, or less where MySQL's or MariaDB's
 	 * `max_allowed_packet` is smaller (16 MiB by default on MariaDB, 64 MiB on
-	 * MySQL 8). Read once; a failed read is tried again by the next call.
+	 * MySQL 8). Read once; a failed read is tried again by the next call. On
+	 * a store whose open is pending (see {@link awaitOpen}), the read waits for
+	 * it, so a server that refuses the connection fails the open, worded as the
+	 * refusal at start-up, before this sends anything.
 	 */
 	maxBlobBytes(): Promise<number> {
 		const bound = Math.min(this.#maxRowBlobBytes, MAX_BLOB_BYTES);
 		const query = this.#q.maxPacket;
 		if (!query) return Promise.resolve(bound);
+		const opening = this.#pendingOpen();
+		if (opening) return opening.then(() => this.maxBlobBytes());
 		this.#maxBlobBytes ??= this.#exclusive(() => this.#readOne("blob.insert", query, {})).then(
 			rows => {
 				const packet = Number((rows as Array<{ max_packet?: unknown }>)[0]?.max_packet);
@@ -4049,6 +4054,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/** Rewrite the row of `hash` with `data`, bytes that hash to it; answers false for one over `limit`, left as it is. */
 	async repairBlob(hash: string, data: Uint8Array, limit: number): Promise<boolean> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		if (data.byteLength > limit) return false;
 		await this.#fencedTransaction("blob.repair", [], transaction =>
 			run(transaction, this.#q.repairBlob, { sha256: hash, content: data, len: data.byteLength }).then(
