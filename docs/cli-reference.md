@@ -376,10 +376,13 @@ in it is on another device; a filesystem that gives its subvolumes devices of
 their own, such as btrfs, counts a subvolume as mounted). The mount ids come
 from `statx` (Linux 5.8 and later) or `/proc/self/fdinfo`; on a system that
 gives neither, or where reading them fails, that add refuses and names the
-cause. Before Linux 5.8 a file mounted in the tree shows no mount id, so it is
-found only when the emptying reaches it: the emptying stops there, names the
-path, leaves the file and keeps the registration, with what it reached before
-removed. Symlinks in the tree are removed, never followed. A tree more than 256
+cause. Before Linux 5.8, where `statx` gives no mount id, each entry's is read
+from `/proc/self/fdinfo`, a file's through an `O_PATH` descriptor, so a mounted
+file is refused too. A mount made while the tree is being emptied, or an entry
+the system will not remove (an NFS client's `.nfs…` name for a deleted file
+still open), stops the emptying there: the message names the entry and the
+error, what the emptying reached before it is gone, and the registration stays.
+Symlinks in the tree are removed, never followed. A tree more than 256
 directories deep is refused. Everything else the registration and the tree hold
 goes with them: any file written into the tree after the add stopped, anything
 staged there, and a merge or cherry-pick begun there. With

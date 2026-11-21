@@ -740,13 +740,16 @@ impl GitRepo {
 	/// add, a lock someone changed or removed, a commit or checkout made there,
 	/// a directory made again in its place, a repository or a mount point in the
 	/// tree, or a platform that cannot check these is refused with a message
-	/// naming the registration, and nothing is removed. A mount made during the
-	/// emptying, or a file mounted in the tree where `statx` gives no mount ids
-	/// (before Linux 5.8), stops the emptying there, with nothing on that mount
-	/// removed and the registration kept. The token stays on the emptied
-	/// directory. Registrations earlier reclaims moved out of git's view and did
-	/// not delete go first. Returns one note per removal, for the caller to
-	/// show.
+	/// naming the registration, and nothing is removed. Where `statx` gives no
+	/// mount ids (before Linux 5.8), each entry's is read from
+	/// `/proc/self/fdinfo`, a file's through an `O_PATH` descriptor. A mount
+	/// made during the emptying, or an entry the system will not remove (an NFS
+	/// client's `.nfs…` name for a deleted file still open), stops the emptying
+	/// there: nothing at that entry is touched, what the emptying reached before
+	/// it is gone, the registration is kept, and the message names the entry and
+	/// the error. The token stays on the emptied directory. Registrations
+	/// earlier reclaims moved out of git's view and did not delete go first.
+	/// Returns one note per removal, for the caller to show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
 		let common = &self.info().common_dir;
 		sweep_moved_registrations(common);
@@ -2844,7 +2847,8 @@ fn reclaim_tree(
 				"git worktree add",
 				format!(
 					"emptying '{}', the partial tree of an interrupted worktree add ({}), stopped: it \
-					 {}. Nothing there or below was touched, and the registration stays",
+					 {}. Nothing at that entry or below it was touched, what the emptying reached \
+					 before it is gone, and the registration stays",
 					tree.display(),
 					admin.display(),
 					stop.reason(tree)
@@ -2985,12 +2989,16 @@ mod test_hooks {
 	use std::{cell::RefCell, path::Path};
 
 	type Hook = Box<dyn FnMut(&Path)>;
+	#[cfg(target_os = "linux")]
+	type ErrnoHook = Box<dyn FnMut(&Path) -> Option<i32>>;
 
 	thread_local! {
 		static BEFORE_MARKER_RELEASE: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static BEFORE_TREE_REMOVAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static AFTER_REGISTRATION_MOVED: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static BEFORE_ENTRY_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+		#[cfg(target_os = "linux")]
+		static UNLINK_ERROR: RefCell<Option<ErrnoHook>> = const { RefCell::new(None) };
 		#[cfg(target_os = "linux")]
 		static MOUNT_IDS: std::cell::Cell<MountIds> = const { std::cell::Cell::new(MountIds::Statx) };
 	}
@@ -3017,6 +3025,25 @@ mod test_hooks {
 	#[cfg(target_os = "linux")]
 	pub fn mount_ids() -> MountIds {
 		MOUNT_IDS.with(std::cell::Cell::get)
+	}
+
+	/// Makes the emptying on this thread fail its `unlinkat` of an entry with
+	/// the error number `hook` gives for the entry's name, until [`clear`]:
+	/// how an NFS client refuses its `.nfs…` name for a deleted file still
+	/// open (`EBUSY`), which no test can make otherwise.
+	#[cfg(target_os = "linux")]
+	pub fn set_unlink_error(hook: impl FnMut(&Path) -> Option<i32> + 'static) {
+		UNLINK_ERROR.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+	}
+
+	#[cfg(target_os = "linux")]
+	pub fn unlink_error(name: &std::ffi::OsStr) -> Option<i32> {
+		UNLINK_ERROR.with(|slot| {
+			slot
+				.borrow_mut()
+				.as_mut()
+				.and_then(|hook| hook(Path::new(name)))
+		})
 	}
 
 	/// Runs `hook` with an entry's name just before a reclaim's walk or
@@ -3080,6 +3107,8 @@ mod test_hooks {
 		BEFORE_TREE_REMOVAL.with(|slot| *slot.borrow_mut() = None);
 		AFTER_REGISTRATION_MOVED.with(|slot| *slot.borrow_mut() = None);
 		BEFORE_ENTRY_OPEN.with(|slot| *slot.borrow_mut() = None);
+		#[cfg(target_os = "linux")]
+		UNLINK_ERROR.with(|slot| *slot.borrow_mut() = None);
 		#[cfg(target_os = "linux")]
 		MOUNT_IDS.with(|slot| slot.set(MountIds::Statx));
 	}
@@ -3721,11 +3750,11 @@ mod tests {
 		}
 	}
 
-	/// A file bind-mounted into the tree is someone else's too. Where `statx`
-	/// gives mount ids the reclaim refuses before anything is removed; with
-	/// `/proc/self/fdinfo`'s alone, as before Linux 5.8, a file's mount is not
-	/// seen until the emptying meets it (`EBUSY`), which then stops with the
-	/// path, keeps the registration and leaves the file. A bind mount needs
+	/// A file bind-mounted into the tree is someone else's too: the reclaim
+	/// refuses before anything is removed, with the mount ids `statx` gives
+	/// and with those of `/proc/self/fdinfo` alone, as before Linux 5.8, where
+	/// the file's is read through an `O_PATH` descriptor. The emptying alone
+	/// stops at it too. A bind mount needs
 	/// privileges the tests lack: the builds Job mounts a file inside a
 	/// directory the test user owns and names it in `PI_VCS_TEST_MOUNTED_FILE`;
 	/// that directory is the tree. Run with `--ignored`.
@@ -3758,14 +3787,50 @@ mod tests {
 				"{ids:?}: {err}"
 			);
 			assert!(admin.is_dir(), "{ids:?}: the registration was removed: {err}");
-			if ids == test_hooks::MountIds::Statx {
-				assert!(
-					tree.join("partial").is_file() && tree.join(".git").is_file(),
-					"{ids:?}: the reclaim removed something before it refused: {err}"
-				);
-				assert!(err.contains("nothing was removed"), "{ids:?}: {err}");
-			}
+			assert!(
+				tree.join("partial").is_file() && tree.join(".git").is_file(),
+				"{ids:?}: the reclaim removed something before it refused: {err}"
+			);
+			assert!(err.contains("nothing was removed"), "{ids:?}: {err}");
+			// The emptying alone.
+			test_hooks::set_mount_ids(ids);
+			let emptied = tree_dir::TreeDir::open(&tree).unwrap().unwrap().empty();
+			test_hooks::clear();
+			let err = emptied.unwrap_err();
+			assert_eq!(fs::read(&file).unwrap(), before, "{ids:?}: the emptying changed the file");
+			assert!(
+				matches!(tree_dir::stop_of(&err), Some(tree_dir::Stop::Mounted(at)) if at == Path::new("mounted")),
+				"{ids:?}: {err}"
+			);
 		}
+	}
+
+	/// An `unlinkat` the system refuses with `EBUSY` where no mount is (what
+	/// an NFS client does to its `.nfs…` name for a deleted file still open,
+	/// or a FUSE daemon's answer) stops the emptying with the entry and the
+	/// error, not as a mount point. No test can make NFS do that here, so a
+	/// test hook makes the unlink of `partial` fail with `EBUSY`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn an_unlink_refused_where_no_mount_is_keeps_its_error() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		test_hooks::set_unlink_error(|name| (name == Path::new("partial")).then_some(libc::EBUSY));
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		test_hooks::clear();
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains(&format!(
+				"has an entry the system would not remove ({}: ",
+				tree.join("partial").display()
+			)) && err.contains("os error 16")
+				&& !err.contains("mounted"),
+			"{err}"
+		);
+		assert!(err.contains("what the emptying reached before it is gone"), "{err}");
+		assert!(tree.join("partial").is_file() && admin.is_dir(), "{err}");
 	}
 
 	/// A symlink below the tree's root is removed itself, never followed:
