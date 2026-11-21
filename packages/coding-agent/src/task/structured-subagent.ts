@@ -738,8 +738,11 @@ async function leaseArtifacts(
 ): Promise<ArtifactLease> {
 	const sessionFile = session.getSessionFile();
 	if (sessionFile) {
+		// Beside the parent's transcript, on the parent's store: the first write
+		// that needs it makes it (the subagent's transcript, its output), so a
+		// store that refuses writes fails those writes, which retry, and never
+		// the launch.
 		const artifactsDir = sessionFile.slice(0, -6);
-		await fs.mkdir(artifactsDir, { recursive: true });
 		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
 	}
 	const artifactsDir = path.join(

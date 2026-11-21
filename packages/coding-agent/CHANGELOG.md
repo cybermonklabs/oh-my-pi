@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A subagent launched while the session store refuses writes (a full or read-only disk, a SQL store that is down) now starts at once: its transcript stays in memory and is written once the store accepts writes, as the main session's is. A session whose close the store refused keeps its transcript until the next write that lands on the same store sends it. A session whose directory cannot be made (`--session <new path>` too) now starts and warns instead of failing at start
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
