@@ -60,9 +60,14 @@ mod platform {
 			const { std::cell::RefCell::new(Vec::new()) };
 
 		/// Each `children` file read on this thread lists every thread of
-		/// each child after the child, as gVisor's does on any kernel.
+		/// each child too, all by id, as gVisor's does on any kernel.
 		pub(crate) static LIST_CHILD_THREADS: std::cell::Cell<bool> =
 			const { std::cell::Cell::new(false) };
+
+		/// Reading the status of the paired task id on this thread fails
+		/// with the paired `errno`.
+		pub(crate) static FAIL_STATUS_READS: std::cell::RefCell<Vec<(i32, i32)>> =
+			const { std::cell::RefCell::new(Vec::new()) };
 	}
 
 	/// `Err` with the `errno` a test hook pairs with `id` in `fails`.
@@ -96,22 +101,27 @@ mod platform {
 		Ok(children)
 	}
 
-	/// `children`, a `children` file's list, with each child followed by
-	/// its other threads ([`LIST_CHILD_THREADS`]).
+	/// `children`, a `children` file's list, with every other thread of each
+	/// child added and the whole list sorted by id ([`LIST_CHILD_THREADS`]).
 	#[cfg(test)]
 	fn with_their_threads(children: &str) -> String {
-		let mut listed = Vec::new();
+		let mut listed: Vec<i32> = Vec::new();
 		for child in children.split_whitespace() {
-			listed.push(child.to_owned());
+			listed.push(child.parse().expect("a children file lists ids"));
 			let tasks = fs::read_dir(format!("/proc/{child}/task"));
 			for task in tasks.into_iter().flatten().flatten() {
 				let tid = task.file_name().to_string_lossy().into_owned();
 				if tid != child {
-					listed.push(tid);
+					listed.push(tid.parse().expect("a task directory is named by its id"));
 				}
 			}
 		}
-		listed.join(" ")
+		listed.sort_unstable();
+		listed
+			.iter()
+			.map(i32::to_string)
+			.collect::<Vec<_>>()
+			.join(" ")
 	}
 
 	/// The process the task `id` is a thread of (`Tgid` in
@@ -119,17 +129,34 @@ mod platform {
 	/// another id for any other of its threads; `Ok(None)` when no signal
 	/// of ours reaches `id` any more ([`crate::sys::proc::read`]'s rule).
 	///
-	/// gVisor's `/proc/<pid>/task/<tid>/children` lists every child task of
-	/// the thread (`fsimpl/proc/task_files.go`), and there a thread that a
-	/// child process starts is a child task of the child's parent
-	/// (`kernel/task_clone.go`: `CLONE_THREAD` takes the creator's parent),
-	/// so the file lists each thread of a child after the child. Linux
-	/// lists the child alone.
+	/// Linux and gVisor both make a thread a child process starts a child
+	/// task of the child's parent (`CLONE_THREAD` takes the creator's
+	/// parent), but Linux links only a thread group's leader into its
+	/// parent's children, while gVisor links every task
+	/// (`kernel/task_start.go`). So gVisor's
+	/// `/proc/<pid>/task/<tid>/children` lists every thread of a child
+	/// process, sorted by id among the other children
+	/// (`fsimpl/proc/task_files.go`), where Linux lists the child alone.
+	///
+	/// The status is read as bytes: its first line is the task's name,
+	/// which can hold any bytes (`prctl(PR_SET_NAME)`, or a name cut at 15
+	/// bytes inside a character).
 	fn thread_group(id: i32) -> io::Result<Option<i32>> {
-		match fs::read_to_string(format!("/proc/{id}/status")) {
+		let status = {
+			#[cfg(test)]
+			failed(&FAIL_STATUS_READS, id)?;
+			fs::read(format!("/proc/{id}/status"))
+		};
+		match status {
 			Ok(status) => status
-				.lines()
-				.find_map(|line| line.strip_prefix("Tgid:")?.trim().parse().ok())
+				.split(|&byte| byte == b'\n')
+				.find_map(|line| {
+					std::str::from_utf8(line.strip_prefix(b"Tgid:")?)
+						.ok()?
+						.trim()
+						.parse()
+						.ok()
+				})
 				.map(Some)
 				.ok_or_else(|| io::ErrorKind::InvalidData.into()),
 			Err(error) if crate::sys::proc::out_of_reach(id, &error) => Ok(None),
@@ -343,10 +370,10 @@ mod platform {
 		/// fallback (kernels without `CONFIG_PROC_CHILDREN`, or a thread list
 		/// gone from `/proc`). A candidate that cannot be pinned or read makes
 		/// the walk incomplete, unless it is a thread of another process:
-		/// gVisor's `children` file lists every thread a child process
-		/// starts besides the child itself ([`thread_group`]), and
-		/// `pidfd_open` refuses a thread that leads no thread group. Such a
-		/// thread stands for its process, which is validated instead.
+		/// gVisor's `children` file lists every thread of a child process
+		/// ([`thread_group`]), and `pidfd_open` refuses a thread that leads
+		/// no thread group. Such a thread stands for its process, which is
+		/// validated instead.
 		fn push_validated_child(
 			&self,
 			child_pid: i32,
@@ -369,10 +396,18 @@ mod platform {
 					},
 					// Gone since it was listed.
 					Ok(None) => {},
-					_ => walk.fail(unread(
+					Ok(Some(_)) => walk.fail(unread(
 						&error,
 						format_args!(
 							"cannot read process {child_pid}, a possible child of process {}",
+							self.pid
+						),
+					)),
+					Err(status) => walk.fail(unread(
+						&status,
+						format_args!(
+							"cannot read the status of process {child_pid}, a possible child of process \
+							 {}",
 							self.pid
 						),
 					)),
@@ -2403,18 +2438,22 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	const SECOND_THREAD: &str = "PI_SHELL_TEST_SECOND_THREAD";
 
-	/// gVisor's `children` file lists every thread a child process starts
-	/// after the child itself, and `pidfd_open` refuses such a thread with
+	/// gVisor's `children` file lists every thread of a child process, by id
+	/// among the other children, and `pidfd_open` refuses such a thread with
 	/// `ENOENT` (it leads no thread group). The walk took each for a child
 	/// it could not read, so under gVisor the walk of a process with a
 	/// two-thread child was never complete, and a kill of its tree failed;
 	/// in the whole test binary, another test's child test process made
 	/// [`descendants_includes_freshly_spawned_child`] fail. Here the root is
-	/// `sh`, whose one child is a test process with a second thread: the
-	/// walk is complete and finds that child once, by its pid, with the
-	/// `children` files as the kernel writes them, and with each child
-	/// followed by its threads, as gVisor writes them. A child that cannot
-	/// be read for a reason that proves nothing still fails the walk.
+	/// `sh`, whose one child is a test process with a second thread whose
+	/// name is not UTF-8: the walk is complete and finds that child once, by
+	/// its pid, with the `children` files as the kernel writes them, and
+	/// with every thread of each child listed too, as gVisor writes them.
+	/// Where `pidfd_open` is unavailable a listed thread pins by its start
+	/// time and is taken for a child, a limit this keeps. A child that
+	/// cannot be read for a reason that proves nothing still fails the
+	/// walk, and so does a thread whose status cannot be read, with the
+	/// status read's error.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn threads_of_a_child_are_not_children() {
@@ -2449,15 +2488,34 @@ mod tests {
 				Some((pid.parse::<i32>().unwrap(), tid.parse::<i32>().unwrap()))
 			})
 			.expect("the child started its second thread");
+		let name = std::fs::read(format!("/proc/{child}/task/{thread}/comm"));
+		// Every task of the child (the harness's thread runs the helper, so
+		// there are more than two), by id, as a listing that takes each
+		// thread for a child has them.
+		let mut tasks: Vec<i32> = std::fs::read_dir(format!("/proc/{child}/task"))
+			.unwrap()
+			.map(|task| task.unwrap().file_name().to_str().unwrap().parse().unwrap())
+			.collect();
+		tasks.sort_unstable();
+		let pidfds = crate::sys::proc::short_of_descriptors::pidfd_available();
+		// gVisor's own `children` file lists the thread already.
+		let kernel_lists_threads =
+			std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", root.id()))
+				.is_ok_and(|listed| listed.split_whitespace().any(|id| id == thread.to_string()));
 		let root_pid = i32::try_from(root.id()).unwrap();
 		let pinned = platform::Process::from_pid(root_pid).expect("pin the root");
-		let walks = [false, true].map(|as_gvisor| {
+		let walk = |as_gvisor: bool, no_pidfd: bool| {
 			platform::LIST_CHILD_THREADS.set(as_gvisor);
+			platform::NO_PIDFD.set(no_pidfd);
 			let walk = pinned.children();
 			platform::LIST_CHILD_THREADS.set(false);
+			platform::NO_PIDFD.set(false);
 			let pids: Vec<i32> = walk.processes.iter().map(|process| process.pid()).collect();
-			(as_gvisor, walk.complete.map_err(|error| error.to_string()), pids)
-		});
+			(walk.complete.map_err(|error| error.to_string()), pids)
+		};
+		let as_kernel = walk(false, false);
+		let as_gvisor = walk(true, false);
+		let as_gvisor_without_pidfds = walk(true, true);
 		// A child that cannot be read for a reason that proves nothing (no
 		// descriptor left for its pidfd) still leaves the walk incomplete.
 		let refused = {
@@ -2465,6 +2523,13 @@ mod tests {
 			let walk = pinned.children();
 			drop(fails);
 			walk.complete.map_err(|error| error.to_string())
+		};
+		// So does a listed thread whose status cannot be read.
+		let status_refused = {
+			platform::FAIL_STATUS_READS.set(vec![(thread, libc::EMFILE)]);
+			let walk = walk(true, false);
+			platform::FAIL_STATUS_READS.set(Vec::new());
+			walk.0
 		};
 		drop(root.stdin.take());
 		let said: Vec<String> = lines.map(Result::unwrap).collect();
@@ -2474,6 +2539,11 @@ mod tests {
 			"the child test did not pass: {said:?}"
 		);
 		assert_ne!(child, thread, "the second thread is the child's own");
+		let name = name.expect("read the second thread's name");
+		assert!(
+			std::str::from_utf8(&name).is_err(),
+			"the second thread's name is not UTF-8: {name:?}"
+		);
 		let unread = format!("cannot read process {child}, a possible child of process {root_pid}");
 		assert!(
 			refused
@@ -2481,19 +2551,41 @@ mod tests {
 				.is_err_and(|error| error.starts_with(&unread)),
 			"{refused:?}"
 		);
-		for (as_gvisor, complete, pids) in walks {
-			assert_eq!(complete, Ok(()), "each child followed by its threads: {as_gvisor}");
-			assert_eq!(
-				pids,
-				[child],
-				"each child followed by its threads: {as_gvisor}; thread {thread}"
+		// A thread pinned by its start time is taken for a child.
+		let kernel = if pidfds || !kernel_lists_threads {
+			vec![child]
+		} else {
+			tasks.clone()
+		};
+		assert_eq!(
+			as_kernel,
+			(Ok(()), kernel),
+			"the children files as the kernel writes them, pidfds {pidfds}"
+		);
+		let taken = if pidfds { vec![child] } else { tasks.clone() };
+		assert_eq!(
+			as_gvisor,
+			(Ok(()), taken),
+			"every thread listed, pidfds {pidfds}; thread {thread}"
+		);
+		assert_eq!(as_gvisor_without_pidfds, (Ok(()), tasks), "every thread listed, no pidfds");
+		if pidfds {
+			let unread = format!(
+				"cannot read the status of process {thread}, a possible child of process {root_pid}: \
+				 {}",
+				crate::bash::diag::strerror(&io::Error::from_raw_os_error(libc::EMFILE))
+			);
+			assert!(
+				status_refused.as_ref().is_err_and(|error| *error == unread),
+				"{status_refused:?}"
 			);
 		}
 	}
 
 	/// Run by [`threads_of_a_child_are_not_children`] in a child process: a
-	/// second thread waits for this process's standard input to close, once
-	/// the line `SECOND <pid> <its thread id>` says it runs.
+	/// second thread, named with bytes that are not UTF-8, waits for this
+	/// process's standard input to close, once the line `SECOND <pid> <its
+	/// thread id>` says it runs.
 	#[cfg(target_os = "linux")]
 	#[test]
 	#[ignore = "run in a child process by threads_of_a_child_are_not_children"]
@@ -2503,6 +2595,11 @@ mod tests {
 		}
 		let (started, running) = std::sync::mpsc::channel();
 		let second = std::thread::spawn(move || {
+			// A name cut at 15 bytes inside a character, as the kernel cuts one.
+			let name = c"a\xe6\x95\xb0\xe6\x8d\xae\xe5\xa4\x84\xe7\x90\x86\xe8\x84";
+			// SAFETY: `name` is NUL-terminated and outlives the call, which
+			// names only this thread.
+			assert_eq!(unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) }, 0);
 			// SAFETY: gettid takes no arguments.
 			started.send(unsafe { libc::gettid() }).unwrap();
 			let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0]);
