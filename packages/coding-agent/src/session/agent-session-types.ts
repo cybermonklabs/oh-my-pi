@@ -95,6 +95,14 @@ export interface AgentSessionDisposeOptions {
 	 * while its `session_exit` record stays a plain dispose.
 	 */
 	ownedJobsEnd?: OwnedJobsEnd;
+	/**
+	 * When the final close fails, keep the conversation in memory (the agent's messages and the session
+	 * manager's entries) instead of releasing it, also after the send of a close the store refused for an
+	 * outage lands or ends (the session manager is sealed with `keepEntries`). The interactive mode sets
+	 * it: after a failed teardown it stays open, so its user can still `/export` or `/dump` the session the
+	 * store did not take. Every other caller releases it, as after a close that lands.
+	 */
+	keepTranscriptAfterFailedClose?: boolean;
 }
 
 /** Listener notified when command metadata changes. */

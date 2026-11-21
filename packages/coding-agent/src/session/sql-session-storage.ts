@@ -1751,9 +1751,9 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	 * {@link IndexedSessionStorage.drain}, then the blob writes queued so far,
 	 * then the claim releases in flight, so a closed session's lease is gone.
 	 */
-	override async drain(): Promise<void> {
+	override async drain(path?: string): Promise<void> {
 		try {
-			await super.drain();
+			await super.drain(path);
 			// A blob this land tries and still cannot land is warned about; one its pass did not try (see SqlBlobTier)
 			// gets no warning line of its own, since its failure names the blob whose write ended the pass. Either
 			// stays queued, and the drain does not reject for it.
