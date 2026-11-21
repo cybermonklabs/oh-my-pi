@@ -207,4 +207,98 @@ mod tests {
 		lock.release_native().expect("release");
 		let _ = std::fs::remove_file(&path);
 	}
+
+	/// Keep the calling thread, and only it, from creating Unix sockets, as a
+	/// sandbox's seccomp policy does: `socket(AF_UNIX, ..)` fails with `EPERM`.
+	/// A filter installed without `SECCOMP_FILTER_FLAG_TSYNC` binds this thread
+	/// alone and ends with it, so other tests are unaffected.
+	#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+	fn refuse_unix_sockets_on_this_thread() {
+		#[repr(C)]
+		struct SockFilter {
+			code: u16,
+			jt:   u8,
+			jf:   u8,
+			k:    u32,
+		}
+		#[repr(C)]
+		struct SockFprog {
+			len:    libc::c_ushort,
+			filter: *const SockFilter,
+		}
+		#[cfg(target_arch = "x86_64")]
+		const AUDIT_ARCH: u32 = 0xc000_003e;
+		#[cfg(target_arch = "aarch64")]
+		const AUDIT_ARCH: u32 = 0xc000_00b7;
+		const LOAD_WORD: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+		const JUMP_IF_EQUAL: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+		const RETURN: u16 = 0x06; // BPF_RET | BPF_K
+		const ALLOW: u32 = 0x7fff_0000; // SECCOMP_RET_ALLOW
+		const FAIL_WITH: u32 = 0x0005_0000; // SECCOMP_RET_ERRNO
+		// struct seccomp_data: nr at 0, arch at 4, args[0] at 16 (its low word on
+		// little-endian).
+		let load = |offset: u32| SockFilter { code: LOAD_WORD, jt: 0, jf: 0, k: offset };
+		let jump = |value: u32, jt: u8, jf: u8| SockFilter { code: JUMP_IF_EQUAL, jt, jf, k: value };
+		let ret = |value: u32| SockFilter { code: RETURN, jt: 0, jf: 0, k: value };
+		let filter = [
+			load(4),
+			jump(AUDIT_ARCH, 1, 0),
+			ret(ALLOW),
+			load(0),
+			jump(libc::SYS_socket as u32, 1, 0),
+			ret(ALLOW),
+			load(16),
+			jump(libc::AF_UNIX as u32, 0, 1),
+			ret(FAIL_WITH | libc::EPERM as u32),
+			ret(ALLOW),
+		];
+		let program = SockFprog { len: filter.len() as libc::c_ushort, filter: filter.as_ptr() };
+		// SAFETY: both calls change only this thread's syscall filter, and the
+		// kernel copies `program` before `prctl` returns.
+		unsafe {
+			assert_eq!(
+				libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+				0,
+				"no_new_privs: {}",
+				std::io::Error::last_os_error()
+			);
+			assert_eq!(
+				libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const program),
+				0,
+				"seccomp filter: {}",
+				std::io::Error::last_os_error()
+			);
+		}
+	}
+
+	/// A sandbox that refuses Unix sockets must not break locking: the probe of
+	/// the older build's name then reads it as not bound.
+	#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+	#[test]
+	fn a_process_kept_from_unix_sockets_still_takes_locks() {
+		use std::{os::unix::net::UnixDatagram, path::Path};
+
+		use super::FileLock;
+
+		let path = unique_lock_path("no-unix-sockets");
+		let thread_path = path.clone();
+		let outcome = std::thread::spawn(move || {
+			refuse_unix_sockets_on_this_thread();
+			// The filter is in force on this thread.
+			let refused = UnixDatagram::unbound().expect_err("the filter refuses Unix sockets");
+			assert_eq!(refused.raw_os_error(), Some(libc::EPERM));
+
+			let mut lock = FileLock::try_acquire_path(Path::new(&thread_path))
+				.expect("acquire without Unix sockets");
+			assert!(lock.is_acquired());
+			assert!(FileLock::is_held_path(&thread_path).expect("probe while held"));
+			lock.release_native().expect("release");
+			assert!(!FileLock::is_held_path(&thread_path).expect("probe after release"));
+		})
+		.join();
+		let _ = std::fs::remove_file(&path);
+		if let Err(panic) = outcome {
+			std::panic::resume_unwind(panic);
+		}
+	}
 }
