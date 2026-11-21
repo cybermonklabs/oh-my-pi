@@ -242,8 +242,8 @@ fn a_standalone_exit_ends_running_background_externals() {
 /// the shell's virtual pid, unknown to the system.
 #[test]
 fn a_background_pipelines_bang_is_its_last_process() {
-	let script = "T=$(/bin/mktemp); /bin/sleep 0.1 | /bin/sh -c 'echo $$ >\"$1\"; exec /bin/sleep \
-	              0.1' sh $T & p=$!; wait; [[ $p == $(<$T) ]] && print last; /bin/rm -f $T";
+	let script = "T=$(mktemp); /bin/sleep 0.1 | /bin/sh -c 'echo $$ >\"$1\"; exec /bin/sleep 0.1' \
+	              sh $T & p=$!; wait; [[ $p == $(<$T) ]] && print last; /bin/rm -f $T";
 	let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "zsh", script).go();
 	assert_eq!(
 		(ours.stdout.as_slice(), ours.stderr.as_slice(), ours.code),

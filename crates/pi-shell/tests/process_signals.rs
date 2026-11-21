@@ -565,8 +565,8 @@ fn an_untrapped_hup_makes_zsh_exit_with_status_1_after_the_exit_trap_in_effect()
 		format!("trap 'print x $?' EXIT; /bin/sh -c '{SHELL_ONLY}' sh HUP $$; print not-reached");
 	// The shell's own `kill` from a background job, once the command runs.
 	let from_a_job = format!(
-		"f=$(/bin/mktemp -u); trap 'print x $?; /bin/rm -f $f' EXIT; {{ while [[ ! -e $f ]]; do \
-		 sleep 0.01; done; kill -HUP $$ }} & /bin/sh -c '{SHELL_ONLY}' sh 0 $$ $f; print not-reached"
+		"f=$(mktemp -u); trap 'print x $?; /bin/rm -f $f' EXIT; {{ while [[ ! -e $f ]]; do sleep \
+		 0.01; done; kill -HUP $$ }} & /bin/sh -c '{SHELL_ONLY}' sh 0 $$ $f; print not-reached"
 	);
 	let cases: [(&str, &[u8], i32); 8] = [
 		("trap 'print root-exit $?' EXIT; kill -HUP $$; print not-reached", b"root-exit 1\n", 1),
