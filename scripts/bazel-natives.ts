@@ -50,14 +50,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
-	addonSourcesStampPath,
 	BAZEL_SOURCE_ROOTS,
 	copyAddonSourcesStamp,
 	type RustSources,
 	readRustSources,
-	settleRustSources,
-	writeAddonSourcesStamp,
 } from "../packages/natives/native/workspace-sources.js";
+import { installBuiltAddon } from "../packages/natives/scripts/install-addon";
 import { detectHostAvx2Support, detectHostMusl, resolveLocalHostAddon } from "./host-detect";
 import { hasVersionStampSlot, nativesPackageVersion, stampNativeVersion } from "./stamp-native-version";
 
@@ -500,21 +498,27 @@ async function main(): Promise<void> {
 	await fs.mkdir(destDir, { recursive: true });
 	const probeFilename = hostProbeFilename(options.targets, host);
 	const version = await nativesPackageVersion();
-	// A build that rewrote Cargo.lock compiled the lock it left (settleRustSources).
-	const sources = recorded && settleRustSources(repoRoot, recorded.sources);
-	for (const output of outputs) {
-		const absolute = path.isAbsolute(output) ? output : path.join(repoRoot, output);
-		const destPath = path.join(destDir, path.basename(output));
-		const stamped = await installAddon(absolute, destPath, version, options.source !== undefined);
-		if (recorded && sources) writeAddonSourcesStamp(destPath, sources, recorded.build);
-		else await fs.rm(addonSourcesStampPath(destPath), { force: true });
+	const addons = outputs.map(output => {
+		const built = path.isAbsolute(output) ? output : path.join(repoRoot, output);
+		return { built, destination: path.join(destDir, path.basename(output)) };
+	});
+	// A build that rewrote Cargo.lock compiled the lock it left: the sources are settled once,
+	// before any addon is installed (installBuiltAddon). Prebuilt addons get no record.
+	const stamped = await installBuiltAddon({
+		addons,
+		repoRoot,
+		sourcesBeforeBuild: recorded?.sources,
+		build: recorded?.build ?? {},
+		install: (built, destination) => installAddon(built, destination, version, options.source !== undefined),
+	});
+	for (const [index, { built, destination }] of addons.entries()) {
 		console.log(
-			stamped
-				? `installed ${path.basename(output)} (stamped ${version}) → ${destPath}`
-				: `installed ${path.basename(output)} (prebuilt without a version stamp slot; left unstamped) → ${destPath}`,
+			stamped[index]
+				? `installed ${path.basename(built)} (stamped ${version}) → ${destination}`
+				: `installed ${path.basename(built)} (prebuilt without a version stamp slot; left unstamped) → ${destination}`,
 		);
-		if (probeFilename && path.basename(output) === probeFilename) {
-			await verifyHostAddonLoads(destPath, undefined, stamped ? version : undefined);
+		if (probeFilename && path.basename(built) === probeFilename) {
+			await verifyHostAddonLoads(destination, undefined, stamped[index] ? version : undefined);
 		}
 	}
 }

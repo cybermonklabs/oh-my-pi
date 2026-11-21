@@ -255,8 +255,7 @@ try {
 	// compares the record with the checkout (native/workspace-sources.js); the settings are there
 	// to explain the addon, never compared.
 	await installBuiltAddon({
-		builtAddonPath,
-		addonPath: canonicalAddonPath,
+		addons: [{ built: builtAddonPath, destination: canonicalAddonPath }],
 		repoRoot,
 		sourcesBeforeBuild,
 		build: {

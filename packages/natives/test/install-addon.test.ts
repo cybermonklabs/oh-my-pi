@@ -1,7 +1,8 @@
 /**
- * A local Cargo build (`scripts/build-bindings.ts`) puts its addon in place with the record of
- * the sources it compiled. The sources are settled first, so a settle that throws (a listed
- * file that cannot be opened) installs nothing: the old addon keeps the record that names it.
+ * A native build (`scripts/build-bindings.ts`, `scripts/bazel-natives.ts`) puts its addons in
+ * place with the record of the sources it compiled. The sources are settled once, first, so a
+ * settle that throws (a listed file that cannot be opened) installs nothing: each old addon
+ * keeps the record that names it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -19,11 +20,14 @@ import { installBuiltAddon } from "../scripts/install-addon";
 let repo = "";
 let addon = "";
 let built = "";
+/** A second destination, as a Bazel build that installs several outputs has. */
+let elsewhere = "";
 
 beforeEach(async () => {
 	repo = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-install-"));
 	addon = path.join(repo, "packages/natives/native/pi_natives.linux-x64-modern.node");
 	built = path.join(repo, "packages/natives/native/.build/out/pi_natives.linux-x64-gnu.node");
+	elsewhere = path.join(repo, "elsewhere/pi_natives.linux-x64-modern.node");
 	await Bun.write(path.join(repo, "Cargo.toml"), "[workspace]\n");
 	await Bun.write(path.join(repo, "Cargo.lock"), "version = 4\n");
 	await Bun.write(path.join(repo, "crates/pi-natives/src/lib.rs"), "pub fn grep() {}\n");
@@ -63,8 +67,10 @@ if (${deny}) {
 let result;
 try {
 	await installBuiltAddon({
-		builtAddonPath: ${JSON.stringify(built)},
-		addonPath: ${JSON.stringify(addon)},
+		addons: [
+			{ built: ${JSON.stringify(built)}, destination: ${JSON.stringify(addon)} },
+			{ built: ${JSON.stringify(built)}, destination: ${JSON.stringify(elsewhere)} },
+		],
 		repoRoot: ${JSON.stringify(repo)},
 		sourcesBeforeBuild,
 		build: { builder: "cargo" },
@@ -85,14 +91,18 @@ process.exit(0);`;
 }
 
 describe("installing a locally built addon", () => {
-	it("puts the addon in place with a record that names it", async () => {
+	it("puts each addon in place with a record that names it", async () => {
+		await fs.mkdir(path.dirname(elsewhere), { recursive: true });
 		expect(installInChild(false)).toBe("installed");
 
-		expect(await Bun.file(addon).text()).toBe("new addon bytes");
-		expect(addonSourcesState(addon, repo)).toBe("current");
+		for (const destination of [addon, elsewhere]) {
+			expect(await Bun.file(destination).text()).toBe("new addon bytes");
+			expect(addonSourcesState(destination, repo)).toBe("current");
+		}
 	}, 60_000);
 
 	it("installs nothing when the settle throws, so the old addon keeps its record", async () => {
+		await fs.mkdir(path.dirname(elsewhere), { recursive: true });
 		const recordBefore = await Bun.file(addonSourcesStampPath(addon)).text();
 
 		expect(installInChild(true)).toBe("EACCES");
@@ -100,6 +110,7 @@ describe("installing a locally built addon", () => {
 		expect(await Bun.file(addon).text()).toBe("old addon bytes");
 		expect(await Bun.file(addonSourcesStampPath(addon)).text()).toBe(recordBefore);
 		expect(addonSourcesState(addon, repo)).toBe("current");
+		expect(await Bun.file(elsewhere).exists()).toBe(false);
 	}, 60_000);
 
 	it("records other sources for a file edited during the build and put back, times and all", async () => {
@@ -116,8 +127,7 @@ describe("installing a locally built addon", () => {
 		await fs.utimes(lib, time, time);
 
 		await installBuiltAddon({
-			builtAddonPath: built,
-			addonPath: addon,
+			addons: [{ built, destination: addon }],
 			repoRoot: repo,
 			sourcesBeforeBuild,
 			build: { builder: "cargo" },
@@ -125,5 +135,12 @@ describe("installing a locally built addon", () => {
 
 		expect(await Bun.file(addon).text()).toBe("new addon bytes");
 		expect(addonSourcesState(addon, repo)).toBe("other");
+	});
+
+	it("removes the record of an addon installed without one", async () => {
+		await installBuiltAddon({ addons: [{ built, destination: addon }], repoRoot: repo, build: {} });
+
+		expect(await Bun.file(addon).text()).toBe("new addon bytes");
+		expect(await Bun.file(addonSourcesStampPath(addon)).exists()).toBe(false);
 	});
 });

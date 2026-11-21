@@ -1,10 +1,15 @@
 /**
- * How a local Cargo build (`build-bindings.ts`) puts its addon in place with the record of the
- * Rust sources it compiled.
+ * How a native build (`build-bindings.ts`, `scripts/bazel-natives.ts`) puts its addons in place
+ * with the record of the Rust sources it compiled.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type RustSources, settleRustSources, writeAddonSourcesStamp } from "../native/workspace-sources.js";
+import {
+	addonSourcesStampPath,
+	type RustSources,
+	settleRustSources,
+	writeAddonSourcesStamp,
+} from "../native/workspace-sources.js";
 
 /** Copy `src` to `dest` under a temporary name and rename it into place. */
 export async function installBinary(src: string, dest: string): Promise<void> {
@@ -39,20 +44,33 @@ export async function installBinary(src: string, dest: string): Promise<void> {
 }
 
 /**
- * Put the addon a build left at `builtAddonPath` in place at `addonPath`, with the record of
- * the sources it was built from: `sourcesBeforeBuild`, settled (`settleRustSources`) before
- * anything is installed, as `scripts/bazel-natives.ts` does. A settle that throws (a listed
- * file that cannot be opened) installs nothing, so the old addon keeps the record that names
- * it. `build` holds the settings, kept to explain the addon and never compared.
+ * Put each addon a build left (`built`) in place at its `destination`, with the record of the
+ * sources it was built from: `sourcesBeforeBuild`, settled (`settleRustSources`) once, before
+ * anything is installed, so a settle that throws (a listed file that cannot be opened) installs
+ * nothing and every old addon keeps the record that names it. `install` puts one addon in place
+ * (by default `installBinary`, and nothing when the build left it at its destination); its
+ * record is written right after. Without `sourcesBeforeBuild` (prebuilt addons, whose sources
+ * are unknown) each destination's record is removed. `build` holds the settings, kept to explain
+ * an addon and never compared. Returns what `install` returned for each addon, in order.
  */
-export async function installBuiltAddon(options: {
-	builtAddonPath: string;
-	addonPath: string;
+export async function installBuiltAddon<T = void>(options: {
+	addons: readonly { built: string; destination: string }[];
 	repoRoot: string;
-	sourcesBeforeBuild: RustSources;
+	sourcesBeforeBuild?: RustSources;
 	build: Record<string, unknown>;
-}): Promise<void> {
-	const sources = settleRustSources(options.repoRoot, options.sourcesBeforeBuild);
-	if (options.builtAddonPath !== options.addonPath) await installBinary(options.builtAddonPath, options.addonPath);
-	writeAddonSourcesStamp(options.addonPath, sources, options.build);
+	install?: (built: string, destination: string) => Promise<T>;
+}): Promise<T[]> {
+	const install =
+		options.install ??
+		(async (built: string, destination: string) => {
+			if (built !== destination) await installBinary(built, destination);
+		});
+	const sources = options.sourcesBeforeBuild && settleRustSources(options.repoRoot, options.sourcesBeforeBuild);
+	const results: T[] = [];
+	for (const { built, destination } of options.addons) {
+		results.push((await install(built, destination)) as T);
+		if (sources) writeAddonSourcesStamp(destination, sources, options.build);
+		else await fs.rm(addonSourcesStampPath(destination), { force: true });
+	}
+	return results;
 }
