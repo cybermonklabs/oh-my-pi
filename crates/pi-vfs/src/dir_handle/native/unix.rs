@@ -507,8 +507,8 @@ pub(crate) fn open_at(
 /// name since `mkdirat` is refused and keeps its mode, and the call fails; a
 /// directory renamed in at the name is not told apart and gets the mode.
 /// When the mode cannot be set, the call fails with that error, and the
-/// directory at the name stays as it was: the one made keeps `mode` and the
-/// owner's read bit, less the process umask.
+/// directory at the name stays as it was: the one made keeps `mode` less
+/// `mask`, with the owner's read bit, less the process umask.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,

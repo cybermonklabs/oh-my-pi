@@ -368,9 +368,9 @@ pub(crate) const FIFO_RELEASE_ATTEMPTS: usize = 10;
 /// made, often the FIFO made at the same name: `rm p; mkfifo p`). Where
 /// `/proc/self/fd` is there, each release opens the other end through
 /// `/proc/self/fd/N` of it, so it reaches this FIFO whatever its name holds
-/// later; the helper opens its end there too, unless the open creates or
-/// truncates: it then opens the name with the caller's options, so the
-/// kernel's checks of the name apply ([`creates_or_truncates`]).
+/// later; the helper opens its end there too, unless the open has `O_CREAT`:
+/// it then opens the name with the caller's options, so the kernel's check
+/// of the name applies ([`creates`]).
 ///
 /// Elsewhere (macOS) a FIFO cannot be held without opening one of its ends,
 /// so the pin is the (device, inode) of a `stat`, which a FIFO made later at
@@ -430,9 +430,10 @@ impl FifoPin {
 		Ok(pin)
 	}
 
-	/// `/proc/self/fd/N` of the pin, where the open and its releases reach
-	/// the FIFO; `None` off Linux and without `/proc`, when they open the
-	/// name and a release checks what it opened ([`Self::check`]).
+	/// `/proc/self/fd/N` of the pin, where the releases reach the FIFO, and
+	/// the helper too unless the open has `O_CREAT` ([`creates`]); `None`
+	/// off Linux and without `/proc`, when they open the name and a release
+	/// checks what it opened ([`Self::check`]).
 	#[cfg_attr(
 		not(target_os = "linux"),
 		allow(
@@ -489,27 +490,27 @@ const fn is_fifo(st: &libc::stat) -> bool {
 	st.st_mode & libc::S_IFMT == libc::S_IFIFO
 }
 
-/// Whether an open with `options` asks to create or truncate: `create`,
-/// `truncate` or `create_new`, or `O_CREAT`, `O_EXCL` or `O_TRUNC` among
-/// the custom flags. The kernel checks such an open against the name it
-/// opens (`EEXIST`, the write permission `O_TRUNC` asks even of a
-/// read-only open, `fs.protected_fifos` in a sticky directory), so a pinned
-/// FIFO's helper runs it by name with the caller's own options, never
-/// through `/proc/self/fd/N`, whose magic link those checks do not see.
+/// Whether an open with `options` has `O_CREAT`: `create`, `create_new`, or
+/// a custom `O_CREAT`. The kernel checks such an open of an existing FIFO
+/// against the directory its name is in (`fs.protected_fifos` in a sticky
+/// directory, which `may_create_in_sticky` reads only under `O_CREAT`); a
+/// walk through `/proc/self/fd/N` ends in `/proc/self/fd`, which is never
+/// sticky. So a pinned FIFO's helper runs such an open by name with the
+/// caller's own options. The checks of other flags hold through the magic
+/// link (the write permission `O_TRUNC` asks, from the flags alone; `EEXIST`
+/// needs `O_CREAT`), so every other open reopens the pin.
 #[cfg(unix)]
-const fn creates_or_truncates(options: &OpenOptions) -> bool {
-	options.is_create()
-		|| options.is_truncate()
-		|| options.is_create_new()
-		|| options.get_custom_flags() & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) != 0
+const fn creates(options: &OpenOptions) -> bool {
+	options.is_create() || options.is_create_new() || options.get_custom_flags() & libc::O_CREAT != 0
 }
 
-/// `options`, which neither create nor truncate ([`creates_or_truncates`]),
-/// for an open of a pinned FIFO through `/proc/self/fd/N`: without
-/// `O_NOFOLLOW`, which would refuse the magic link itself.
+/// `options`, which have no `O_CREAT` ([`creates`]), for an open of a pinned
+/// FIFO through `/proc/self/fd/N`: without `O_NOFOLLOW`, which would refuse
+/// the magic link itself. `O_TRUNC` stays, so the kernel asks the write
+/// permission it asks of the plain open.
 #[cfg(unix)]
 fn reopen_options(options: &OpenOptions) -> OpenOptions {
-	debug_assert!(!creates_or_truncates(options), "a creating open goes by name");
+	debug_assert!(!creates(options), "a creating open goes by name");
 	let mut reopen = options.clone();
 	reopen.custom_flags(options.get_custom_flags() & !libc::O_NOFOLLOW);
 	reopen
@@ -535,10 +536,22 @@ pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send +
 /// at that moment are released too: a reader reads EOF, a writer's first
 /// write fails with `EPIPE`. On Linux the releases reach the FIFO the open
 /// started on, whatever its name holds later ([`FifoPin`]), and so does the
-/// helper, unless the open creates or truncates: the helper then opens the
-/// name with the caller's options ([`creates_or_truncates`]). Elsewhere the
-/// helper and its releases open the name, and a release that reached
-/// another FIFO closes it at once and stops.
+/// helper, unless the open has `O_CREAT`: the helper then opens the name
+/// with the caller's options ([`creates`]). Elsewhere the helper and its
+/// releases open the name, and a release that reached another FIFO closes
+/// it at once and stops.
+///
+/// The open with `O_CREAT` leaves a window on Linux: if the name is given to
+/// another FIFO B between the pin and the helper's open (`rm p; mkfifo p`),
+/// the helper waits on B, which no release reaches (each opens the pinned
+/// FIFO). A cancel then runs every attempt, about a second, and the open
+/// fails with [`crate::cancelled`]; the helper thread stays blocked in
+/// `open`, holding the pin's descriptor (on a handle, also its duplicate of
+/// the directory's descriptor), until B's next peer connects. That peer
+/// meets an end that closes at once: a reader reads end of file, a writer's
+/// first write fails with `EPIPE`. No release can reach the helper there
+/// without opening the other end of whatever FIFO the name holds, which
+/// would complete another open waiting on B.
 ///
 /// An open that is dropped before it finishes (the job that made it was
 /// aborted, its run task was dropped) is released the same way, on a
@@ -589,17 +602,18 @@ impl FifoOpening {
 	/// Starts the open of `end` of the pinned FIFO `pin` on a helper thread.
 	/// With a reopen path ([`FifoPin`]), each release opens the other end
 	/// there, and the helper opens it with `options` (no `O_NOFOLLOW`),
-	/// unless the open creates or truncates ([`creates_or_truncates`]): that
-	/// helper runs `by_name`, the plain open by name with the caller's own
-	/// options, so the kernel checks it as it checks the plain open. Without
-	/// a reopen path, the helper runs `by_name` and each release runs
-	/// `release_by_name`, a non-blocking open of the other end at the name,
-	/// whose end the pin then checks. Both keep the pin until they end, so
-	/// its descriptor is not closed, nor its number given to another file,
-	/// while they can use it. Whether this process may open the other end
-	/// is the release's own open to find (`EACCES`), never a check of the
-	/// name, which can name another file, or none, by then. Without a pin
-	/// there is no release.
+	/// unless the open has `O_CREAT` ([`creates`]): that helper runs
+	/// `by_name`, the plain open by name with the caller's own options, so
+	/// the kernel checks the name as it checks the plain open's (a FIFO put
+	/// at the name since the pin leaves the helper where no release reaches
+	/// it: see [`FifoOpening`]). Without a reopen path, the helper runs
+	/// `by_name` and each release runs `release_by_name`, a non-blocking
+	/// open of the other end at the name, whose end the pin then checks.
+	/// Both keep the pin until they end, so its descriptor is not closed,
+	/// nor its number given to another file, while they can use it. Whether
+	/// this process may open the other end is the release's own open to
+	/// find (`EACCES`), never a check of the name, which can name another
+	/// file, or none, by then. Without a pin there is no release.
 	pub(crate) fn start_pinned(
 		pin: Option<FifoPin>,
 		end: FifoEnd,
@@ -619,24 +633,23 @@ impl FifoOpening {
 		let (open_pin, release_pin) = (Arc::clone(&pin), pin);
 		let reopens = release_pin.reopen_path().is_some();
 		let gone = || io::Error::other("the FIFO's pin has no reopen path");
-		let open: Box<dyn FnOnce() -> io::Result<File> + Send> =
-			if reopens && !creates_or_truncates(options) {
-				#[cfg(test)]
-				fifo_seam::note_helper(fifo_seam::Helper::Reopen);
-				let open_options = reopen_options(options).to_std();
-				Box::new(move || {
-					let path = open_pin.reopen_path().ok_or_else(gone)?;
-					open_options.open(path).map(File::from)
-				})
-			} else {
-				#[cfg(test)]
-				fifo_seam::note_helper(fifo_seam::Helper::ByName);
-				Box::new(move || {
-					let opened = by_name();
-					drop(open_pin);
-					opened
-				})
-			};
+		let open: Box<dyn FnOnce() -> io::Result<File> + Send> = if reopens && !creates(options) {
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::Reopen);
+			let open_options = reopen_options(options).to_std();
+			Box::new(move || {
+				let path = open_pin.reopen_path().ok_or_else(gone)?;
+				open_options.open(path).map(File::from)
+			})
+		} else {
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::ByName);
+			Box::new(move || {
+				let opened = by_name();
+				drop(open_pin);
+				opened
+			})
+		};
 		let release: FifoRelease = if reopens {
 			let release_options = end.release_options().to_std();
 			Arc::new(move || {

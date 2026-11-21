@@ -623,12 +623,13 @@ fn host_fifo_end(
 }
 
 /// Starts the open of `end` of the FIFO `name` in `handle`, pinned as `pin`,
-/// on a helper thread ([`FifoOpening::start_pinned`]). On Linux the helper
-/// and each release reach the pinned FIFO through `/proc/self/fd`;
-/// elsewhere the helper opens `name` relative to a duplicate of the
-/// directory's descriptor, and each release opens its other end there
-/// without blocking and closes it at once when it is another FIFO. No check
-/// of the name decides whether a release runs.
+/// on a helper thread ([`FifoOpening::start_pinned`]). On Linux each release
+/// reaches the pinned FIFO through `/proc/self/fd`, and so does the helper,
+/// unless the open has `O_CREAT`: that helper opens `name` with the caller's
+/// options, relative to a duplicate of the directory's descriptor.
+/// Elsewhere the helper opens `name` there, and each release opens its
+/// other end there without blocking and closes it at once when it is
+/// another FIFO. No check of the name decides whether a release runs.
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -913,8 +914,8 @@ impl DirHandle {
 	/// mode change, or, where the mode is set without `/proc`, `EACCES` from
 	/// the read-only open of a directory this process may not read). The
 	/// directory at the name then keeps its mode: the one made has the mode
-	/// asked and the owner's read bit, less the process umask; one renamed in
-	/// has its own.
+	/// asked less the mask, with the owner's read bit, less the process
+	/// umask; one renamed in has its own.
 	pub fn create_dir_at(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
 		let bytes = self.entry(name)?;
 		self.call(
