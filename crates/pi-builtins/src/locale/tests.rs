@@ -218,20 +218,58 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 	}
 }
 
-/// A query started while another thread is inside `posix_spawn` still
-/// answers. glibc 2.41's `posix_spawn` holds the lock that `abort` and a
-/// `sigaction` of `SIGABRT` share until its child runs the program, and a
+/// A query started while another thread holds the library's abort lock
+/// still answers. glibc 2.41's `sigaction` of `SIGABRT` takes that lock
+/// for writing, and its `posix_spawn` holds it for reading until the
+/// spawn's child runs the program (`_Fork` holds it across the fork
+/// itself); musl takes its one `__abort_lock` in the same three places. A
 /// child made by `clone3` keeps a copy of that lock as it was: the query's
 /// child, putting `SIGABRT` back to default, waited on it until the
 /// query's deadline ended it ("was ended before it finished"), which failed
 /// a run of `locale::tests` about one time in three on Debian 13. Here the
 /// spawn's child is held in an open of a FIFO that has no writer, so the
-/// spawn is in flight for the whole query. Where the library takes no such
-/// lock this passes either way.
+/// spawn is in flight for the whole query. glibc before 2.41 takes no such
+/// lock, and there this passes either way; on musl it fails without the
+/// change, as on glibc 2.41.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 	use std::os::unix::ffi::OsStrExt as _;
+
+	/// Lets the spawn's child out of its open on every way out of the test,
+	/// a failure included, so that it is not left waiting there once this
+	/// process has ended. An open of the FIFO for reading and writing never
+	/// waits on Linux (`fifo(7)`) and counts as a writer, which lets out a
+	/// child already in its open; removing the FIFO then fails the open of
+	/// a child not there yet, which ends its spawn.
+	struct Release<'a>(&'a Path);
+	impl Release<'_> {
+		fn let_go(&self) -> std::io::Result<fs::File> {
+			let writer = fs::OpenOptions::new().read(true).write(true).open(self.0)?;
+			fs::remove_file(self.0)?;
+			Ok(writer)
+		}
+	}
+	impl Drop for Release<'_> {
+		fn drop(&mut self) {
+			let _ = self.let_go();
+		}
+	}
+
+	/// What the spawner panicked with.
+	fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+		let text = panic.downcast_ref::<String>().map(String::as_str);
+		text.or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("no message")
+	}
+
+	/// The spawner ends before the writer comes only when the spawn failed:
+	/// on success it waits for a child that cannot leave the open until then.
+	fn spawn_failed(spawner: std::thread::JoinHandle<libc::c_int>) -> ! {
+		match spawner.join() {
+			Ok(status) => panic!("the spawn ended, status {status}, before its child was held in the open"),
+			Err(panic) => panic!("the spawn failed before its child was held in the open: {}", panic_text(&*panic)),
+		}
+	}
 
 	if !crate::own_process::own_process() {
 		return;
@@ -282,23 +320,48 @@ fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
 			status
 		}
 	});
-	let spawning = spawning.recv().unwrap();
-	// The spawn is in flight once its child sleeps in that open.
+	let release = Release(&fifo);
+	let Ok(spawning) = spawning.recv() else { spawn_failed(spawner) };
+	let children = format!("/proc/self/task/{spawning}/children");
+	// The spawn is in flight once its child sleeps in that open. Each pass
+	// ends the wait on a fact: the child asleep there; the spawner ended,
+	// which only a failed spawn does (its panic is reported); or a read
+	// this cannot do (its error is reported). Until one of those, the
+	// spawner has not cloned yet or its child is on its way to the open.
+	// No deadline decides, so a slow machine only waits longer.
 	let child = loop {
-		let listed =
-			fs::read_to_string(format!("/proc/self/task/{spawning}/children")).unwrap_or_default();
+		if spawner.is_finished() {
+			spawn_failed(spawner);
+		}
+		let listed = match fs::read_to_string(&children) {
+			Ok(listed) => listed,
+			// The thread's directory goes only once the thread has ended.
+			Err(_) if spawner.is_finished() => spawn_failed(spawner),
+			Err(error) => panic!("{children}: {error}; the spawn's child cannot be found without it"),
+		};
 		if let Some(child) = listed.split_whitespace().next() {
-			let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
-			if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) {
-				break child.to_owned();
+			match fs::read_to_string(format!("/proc/{child}/stat")) {
+				Ok(stat) if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) => {
+					break child.to_owned();
+				},
+				Ok(_) => {},
+				// Collected since it was listed: the spawn failed, and the next
+				// pass finds the spawner ended.
+				Err(error)
+					if error.kind() == std::io::ErrorKind::NotFound
+						|| error.raw_os_error() == Some(libc::ESRCH) => {},
+				Err(error) => panic!("/proc/{child}/stat, of the child {children} lists as {listed:?}: {error}"),
 			}
 		}
 		std::thread::yield_now();
 	};
 	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_: &str| None);
 	// A writer lets the spawn's child open the FIFO, run `true` and end.
-	let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-	let status = spawner.join().unwrap();
+	let writer = release.let_go().expect("the FIFO opened as a writer, and then removed");
+	let status = match spawner.join() {
+		Ok(status) => status,
+		Err(panic) => panic!("the spawn after its child {child} left the open: {}", panic_text(&*panic)),
+	};
 	drop(writer);
 	assert_eq!(status, 0, "the spawn's child {child} ran `true`");
 	assert!(

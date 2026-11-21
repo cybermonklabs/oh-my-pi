@@ -1115,30 +1115,78 @@ const CHILD_NO_SETUP: libc::c_int = 124;
 #[cfg(target_os = "linux")]
 const KERNEL_SIGSET_BYTES: usize = 8;
 
-/// The kernel's `struct sigaction`, which `rt_sigaction` reads and writes:
-/// not the library's, whose mask is 128 bytes and whose fields are in
-/// another order. Where the architecture defines `SA_RESTORER` the
-/// restorer sits between the flags and the mask; riscv and loongarch have
-/// none (`asm-generic/signal.h`).
+/// The kernel's `struct sigaction`, which `rt_sigaction` reads and writes
+/// (`include/linux/signal_types.h`): not the library's, whose mask is 128
+/// bytes and whose fields are in another order. Its shape is the
+/// architecture's, so it is written out only for those whose headers were
+/// read (Linux 7.0), and any other stops the build below. x86, arm, arm64,
+/// powerpc and s390 put a restorer between the flags and the mask
+/// (`__ARCH_HAS_SA_RESTORER`, from each one's `asm/signal.h`, or on arm64
+/// from `SA_RESTORER` through `asm-generic/signal.h`); riscv and loongarch
+/// have none. All of them have 64 signals, so the mask is
+/// [`KERNEL_SIGSET_BYTES`] long, and all take the generic call's four
+/// arguments (`kernel/signal.c`).
 #[cfg(target_os = "linux")]
 #[repr(C)]
 #[allow(dead_code, reason = "the kernel reads and writes every field; this reads the handler")]
 struct KernelSigaction {
 	handler: libc::sighandler_t,
 	flags: libc::c_ulong,
-	#[cfg(not(any(target_arch = "riscv64", target_arch = "riscv32", target_arch = "loongarch64")))]
+	#[cfg(any(
+		target_arch = "x86_64",
+		target_arch = "x86",
+		target_arch = "aarch64",
+		target_arch = "arm",
+		target_arch = "powerpc",
+		target_arch = "powerpc64",
+		target_arch = "s390x",
+	))]
 	restorer: libc::sighandler_t,
 	mask: [u8; KERNEL_SIGSET_BYTES],
 }
 
+// Elsewhere the structure or the call has another shape: mips puts the
+// flags first and has 128 signals (`__ARCH_HAS_IRIX_SIGACTION`), and sparc
+// and alpha take the restorer as an argument of the call
+// (`CONFIG_ODD_RT_SIGACTION`). The kernel would refuse such a call or read
+// fields it was not given, so the build stops rather than guess. The
+// library's `sigaction` is no fallback: it waits on the lock
+// `kernel_sigaction` is there to avoid.
+#[cfg(all(
+	target_os = "linux",
+	not(any(
+		target_arch = "x86_64",
+		target_arch = "x86",
+		target_arch = "aarch64",
+		target_arch = "arm",
+		target_arch = "riscv64",
+		target_arch = "riscv32",
+		target_arch = "powerpc",
+		target_arch = "powerpc64",
+		target_arch = "loongarch64",
+		target_arch = "s390x",
+	))
+))]
+compile_error!(
+	"the locale query's child sets signal dispositions with `rt_sigaction` and `KernelSigaction`, whose \
+	 layout is checked for x86, x86_64, arm, aarch64, riscv32, riscv64, loongarch64, powerpc, powerpc64 and \
+	 s390x only: check this architecture's `struct sigaction` and `rt_sigaction` in the kernel's sources \
+	 and add it at `KernelSigaction` in crates/pi-builtins/src/locale.rs"
+);
+
 /// `rt_sigaction(signal, new, old)` through the kernel itself, as the
-/// child sets its mask with `rt_sigprocmask`: glibc's `sigaction` takes a
-/// lock for `SIGABRT` (glibc 2.41, `signal/sigaction.c`, the abort lock
-/// that makes `abort` async-signal-safe), and `posix_spawn` holds that lock
-/// while its child runs. `fork` puts the lock back in its child; a child
-/// made by `clone3` or `clone` keeps it as it was, so one made while
-/// another thread was in `posix_spawn` waited on it for ever, until the
-/// query's deadline ended it.
+/// child sets its mask with `rt_sigprocmask`. The library's `sigaction`
+/// takes a lock for `SIGABRT`, the one that makes `abort`
+/// async-signal-safe, and other calls hold it: glibc 2.41's `sigaction`
+/// takes it for writing (`signal/sigaction.c`), its `posix_spawn` holds it
+/// for reading while the spawn's child runs
+/// (`sysdeps/unix/sysv/linux/spawni.c`), and its `_Fork` across the fork
+/// (`sysdeps/nptl/_Fork.c`); musl takes its one `__abort_lock` in the same
+/// three places (`src/signal/sigaction.c`, `src/process/posix_spawn.c`,
+/// `src/process/_Fork.c`). `fork` leaves the lock free in its child; a
+/// child made by `clone3` or `clone` keeps it as it was, so one made while
+/// another thread was in `posix_spawn` or `fork` waited on it for ever,
+/// until the query's deadline ended it.
 ///
 /// # Safety
 ///
