@@ -1,6 +1,13 @@
-//! The wakers of the tasks waiting on one thing, all woken at once: a
-//! [`Wakers`] is itself a waker ([`Wake`]), so the one wait registered for
-//! the thing (a readiness watch, a pump's poll) wakes every task stored in it.
+//! The tasks waiting on one thing, all woken at once.
+//!
+//! Each waiting task holds a [`WaitKey`]: its slot in the [`Wakers`] of the
+//! thing it waits on, which it frees when it is dropped (the wait ended, or
+//! the task was dropped while it waited), as `futures::lock::Mutex` keeps
+//! the waiters of a lock. A task that polls again replaces the waker in its
+//! own slot. So a [`Wakers`] holds one slot per live key and nothing for a
+//! task that is gone, however many tasks waited before. A [`Wakers`] is
+//! itself a waker ([`Wake`]): the one wait registered for the thing (a
+//! readiness watch) wakes every task waiting in it.
 
 use std::{
 	sync::Arc,
@@ -9,150 +16,94 @@ use std::{
 
 use parking_lot::Mutex;
 
-/// The fewest new wakers stored before the next one wakes them
-/// ([`Wakers::add`]).
-const MIN_CAP: usize = 64;
-
-/// Wakers of the tasks waiting on one thing. A task is stored once (an equal
-/// waker is not repeated) and is only ever forgotten by being woken, so a
-/// waker that stands for several tasks (every engine vproc polls with the
-/// engine's one waker) never loses one of their waits.
+/// The wakers of the tasks waiting on one thing, one slot per [`WaitKey`].
+#[derive(Default)]
 pub struct Wakers(Mutex<Set>);
 
+#[derive(Default)]
 struct Set {
-	/// The stored wakers.
-	wakers:    Vec<Stored>,
-	/// How many stored wakers are new (did not come back): at most `cap`.
-	new:       usize,
-	/// [`MIN_CAP`], or 4 × the stored wakers that came back at the last
-	/// overflow if that is more.
-	cap:       usize,
-	/// Copies of the wakers overflows woke, to know them if they come back:
-	/// one is kept while fewer than 4 × `cap` are.
-	woken:     Vec<Waker>,
-	/// Overflows since the set was last woken (64 bits: no count of
-	/// overflows reaches its end).
-	overflows: u64,
-	/// The overflow at which `woken` is next forgotten: 1, 2, 4, 8, ...
-	forget_at: u64,
+	slots:   Vec<Slot>,
+	/// Free slots, reused before the vector grows.
+	free:    Vec<usize>,
+	/// How many slots hold a waker.
+	waiting: usize,
 }
 
-struct Stored {
-	waker: Waker,
-	/// An overflow woke it, and its task waited again.
-	back:  bool,
+#[derive(Default)]
+enum Slot {
+	/// No key holds it.
+	#[default]
+	Free,
+	/// Its key's task waits.
+	Waiting(Waker),
+	/// Its key's task was woken and has not waited since.
+	Woken,
 }
 
-impl Default for Set {
-	fn default() -> Self {
-		Self {
-			wakers:    Vec::new(),
-			new:       0,
-			cap:       MIN_CAP,
-			woken:     Vec::new(),
-			overflows: 0,
-			forget_at: 1,
-		}
-	}
-}
-
-impl Default for Wakers {
-	fn default() -> Self {
-		Self(Mutex::new(Set::default()))
-	}
-}
+/// One task's wait in a [`Wakers`]: none until the task first waits, then
+/// its slot there, freed when the key is dropped. The waiting future holds
+/// it, so a task dropped while it waits leaves nothing behind.
+#[derive(Default)]
+pub struct WaitKey(Option<(Arc<Wakers>, usize)>);
 
 impl Wakers {
-	/// Store `waker`, and say whether the set was empty: then nothing is
-	/// registered to wake it, and the caller registers the one wait that does.
-	///
-	/// A task dropped while it waits leaves its waker here until the set is
-	/// woken, so the set must not keep every waker it is given. It keeps at
-	/// most `cap` new wakers: the next new one is an overflow, which wakes
-	/// them and keeps a copy of each it wakes (while fewer than 4 × `cap`
-	/// copies are kept), to know it if it is stored again. A task alive when
-	/// it is woken polls again and is stored again: it came back. The wakers
-	/// that came back do not count against the cap, and every second overflow
-	/// wakes them too, so one whose task was dropped since goes. The cap is 4
-	/// × the stored wakers that came back, or 64 if that is more: it grows
-	/// with live tasks and never with dropped ones, whose wakers do not come
-	/// back. The copies are forgotten at overflows 1, 2, 4, 8, ... since the
-	/// set was last woken, so dropped tasks' wakers cannot fill them for good.
-	///
-	/// So, with C the largest cap since the copies were last forgotten, at
-	/// most C new wakers and 4¼ × C that came back or are copies are held:
-	/// 5¼ × C in all. With one live task and any number that wait once and
-	/// are dropped, C is 64 and at most 336 are held. Live tasks that each
-	/// wait again when woken settle within a few rounds of wakes: 300 in 2,
-	/// 1,000 in 3, 5,000 in 4.
-	pub fn add(&self, waker: &Waker) -> bool {
-		let (was_empty, wake, forgotten) = {
+	/// `key`'s task waits here with `waker`, which replaces the one it waited
+	/// with before (a key it held in another set first leaves that set). Says
+	/// whether no task waited here before: then nothing is registered to wake
+	/// them, and the caller registers the one wait that does.
+	pub fn wait(self: &Arc<Self>, key: &mut WaitKey, waker: &Waker) -> bool {
+		if key
+			.0
+			.as_ref()
+			.is_some_and(|(set, _)| !Arc::ptr_eq(set, self))
+		{
+			*key = WaitKey::default();
+		}
+		let (first, replaced) = {
 			let mut set = self.0.lock();
-			if set.wakers.iter().any(|s| s.waker.will_wake(waker)) {
+			let at = if let Some((_, at)) = &key.0 {
+				*at
+			} else {
+				let at = set.free.pop().unwrap_or_else(|| {
+					set.slots.push(Slot::Free);
+					set.slots.len() - 1
+				});
+				key.0 = Some((Arc::clone(self), at));
+				at
+			};
+			if let Slot::Waiting(old) = &set.slots[at]
+				&& old.will_wake(waker)
+			{
 				return false;
 			}
-			let was_empty = set.wakers.is_empty();
-			let (mut wake, mut forgotten) = (Vec::new(), Vec::new());
-			if let Some(i) = set.woken.iter().position(|w| w.will_wake(waker)) {
-				set.woken.swap_remove(i);
-				set.wakers.push(Stored { waker: waker.clone(), back: true });
+			let first = set.waiting == 0;
+			let replaced = std::mem::replace(&mut set.slots[at], Slot::Waiting(waker.clone()));
+			if matches!(replaced, Slot::Waiting(_)) {
+				(false, replaced)
 			} else {
-				if set.new >= set.cap {
-					(wake, forgotten) = set.overflow();
-				}
-				set.wakers
-					.push(Stored { waker: waker.clone(), back: false });
-				set.new += 1;
+				set.waiting += 1;
+				(first, replaced)
 			}
-			(was_empty, wake, forgotten)
 		};
-		// Woken, and dropped, outside the lock.
-		drop(forgotten);
-		for w in wake {
-			w.wake();
-		}
-		was_empty
+		// Dropped outside the lock.
+		drop(replaced);
+		first
 	}
 
-	/// Take them all (to wake or drop outside the lock), and start again.
+	/// Take the waker of every waiting task (to wake outside the lock). Their
+	/// keys keep their slots and wait again with them.
 	pub fn take(&self) -> Vec<Waker> {
-		let set = std::mem::take(&mut *self.0.lock());
-		set.wakers.into_iter().map(|s| s.waker).collect()
-	}
-}
-
-impl Set {
-	/// A new waker found `cap` new ones stored. Returns the wakers to wake,
-	/// and the copies forgotten (to drop outside the lock).
-	fn overflow(&mut self) -> (Vec<Waker>, Vec<Waker>) {
-		self.overflows += 1;
-		let back = self.wakers.len() - self.new;
-		self.cap = MIN_CAP.max(4 * back);
-		let forgotten = if self.overflows >= self.forget_at {
-			self.forget_at *= 2;
-			std::mem::take(&mut self.woken)
-		} else {
-			Vec::new()
-		};
-		let wake_back = self.overflows % 2 == 0;
-		// Those that came back first, so an overflow that wakes them keeps a
-		// copy of each.
-		let (came_back, new): (Vec<Stored>, Vec<Stored>) = std::mem::take(&mut self.wakers)
-			.into_iter()
-			.partition(|s| s.back);
-		let mut wake = Vec::with_capacity(new.len() + if wake_back { came_back.len() } else { 0 });
-		for s in came_back.into_iter().chain(new) {
-			if s.back && !wake_back {
-				self.wakers.push(s);
-				continue;
+		let mut set = self.0.lock();
+		let mut wakers = Vec::with_capacity(set.waiting);
+		set.waiting = 0;
+		for slot in &mut set.slots {
+			if matches!(slot, Slot::Waiting(_))
+				&& let Slot::Waiting(waker) = std::mem::replace(slot, Slot::Woken)
+			{
+				wakers.push(waker);
 			}
-			if self.woken.len() < 4 * self.cap {
-				self.woken.push(s.waker.clone());
-			}
-			wake.push(s.waker);
 		}
-		self.new = 0;
-		(wake, forgotten)
+		wakers
 	}
 }
 
@@ -165,6 +116,50 @@ impl Wake for Wakers {
 		for w in self.take() {
 			w.wake();
 		}
+	}
+}
+
+impl Drop for WaitKey {
+	/// Free the slot; its waker, if the task still waited, is dropped outside
+	/// the lock.
+	fn drop(&mut self) {
+		let Some((wakers, at)) = self.0.take() else {
+			return;
+		};
+		let freed = {
+			let mut set = wakers.0.lock();
+			let freed = std::mem::take(&mut set.slots[at]);
+			if matches!(freed, Slot::Waiting(_)) {
+				set.waiting -= 1;
+			}
+			if set.free.len() + 1 == set.slots.len() {
+				// The last key is gone: give the memory back.
+				set.slots = Vec::new();
+				set.free = Vec::new();
+			} else {
+				set.free.push(at);
+			}
+			freed
+		};
+		drop(freed);
+	}
+}
+
+#[cfg(test)]
+impl Wakers {
+	/// Test only: wakers held, the slots of tasks that wait.
+	pub(crate) fn held(&self) -> usize {
+		let set = self.0.lock();
+		set.slots
+			.iter()
+			.filter(|s| matches!(s, Slot::Waiting(_)))
+			.count()
+	}
+
+	/// Test only: slots taken by keys.
+	pub(crate) fn keys(&self) -> usize {
+		let set = self.0.lock();
+		set.slots.len() - set.free.len()
 	}
 }
 
@@ -190,150 +185,177 @@ mod tests {
 		}
 	}
 
-	impl Wakers {
-		/// Wakers held: stored, and copies of woken ones.
-		fn held(&self) -> usize {
-			let set = self.0.lock();
-			set.wakers.len() + set.woken.len()
-		}
-
-		fn cap(&self) -> usize {
-			self.0.lock().cap
-		}
+	/// A live task: its waker and the key its waiting future holds.
+	struct Live {
+		task:  Arc<Task>,
+		waker: Waker,
+		key:   WaitKey,
 	}
 
-	/// Live tasks, each storing itself again whenever it is woken (as a live
-	/// task that polls again does), until none is woken. Returns the rounds of
-	/// wakes it took, at most `most`.
-	fn settle(wakers: &Wakers, tasks: &[Arc<Task>], most: usize) -> usize {
-		let handles: Vec<Waker> = tasks.iter().map(|t| Waker::from(Arc::clone(t))).collect();
-		let mut seen: Vec<usize> = tasks.iter().map(|t| t.wakes()).collect();
-		for h in &handles {
-			wakers.add(h);
-		}
-		let mut rounds = 0;
-		loop {
-			let woken: Vec<usize> = (0..tasks.len())
-				.filter(|&i| tasks[i].wakes() != seen[i])
-				.collect();
-			if woken.is_empty() {
-				return rounds;
-			}
-			rounds += 1;
-			assert!(
-				rounds <= most,
-				"{} live tasks still churn after {rounds} rounds of wakes",
-				tasks.len()
-			);
-			for i in woken {
-				seen[i] = tasks[i].wakes();
-				wakers.add(&handles[i]);
-			}
-		}
-	}
-
-	/// Every task is stored once: waking the set wakes each exactly once.
-	fn each_stored_once(wakers: Wakers, tasks: &[Arc<Task>]) {
-		let before: Vec<usize> = tasks.iter().map(|t| t.wakes()).collect();
-		Waker::from(Arc::new(wakers)).wake();
-		for (t, b) in tasks.iter().zip(before) {
-			assert_eq!(t.wakes(), b + 1, "each stored task is woken once");
-		}
-	}
-
-	// Failure mode (review round 3): a cap that wakes every stored task each
-	// time it is reached churns for good once more live tasks wait than it
-	// holds: each woken task stores itself again and the next one over the cap
-	// wakes them all again. The rounds are the ones `Wakers::add` states.
-	#[test]
-	fn live_tasks_past_the_cap_settle() {
-		for (n, rounds) in [(300, 2), (1000, 3), (5000, 4)] {
-			let wakers = Wakers::default();
-			let tasks: Vec<Arc<Task>> = (0..n).map(|_| Arc::default()).collect();
-			settle(&wakers, &tasks, rounds);
-			each_stored_once(wakers, &tasks);
-		}
-	}
-
-	// Failure mode (review of #111 at b42e3751): the cap grows with every
-	// waker that fills the set, dropped tasks' too, so one live task and
-	// 10,000 that wait once and are dropped grew the set to 4,096 wakers and
-	// its cap to 8,192.
-	#[test]
-	fn tasks_dropped_while_they_wait_do_not_grow_the_set() {
-		let wakers = Wakers::default();
-		let live = Arc::new(Task::default());
-		let handle = Waker::from(Arc::clone(&live));
-		let mut seen = 0;
-		wakers.add(&handle);
-		let mut most = 0;
-		for _ in 0..10_000 {
-			// It waits once, and is dropped: only the set holds it.
-			wakers.add(&Waker::from(Arc::new(Task::default())));
-			if live.wakes() != seen {
-				seen = live.wakes();
-				wakers.add(&handle);
-			}
-			most = most.max(wakers.held());
-		}
-		assert!(most <= 336, "{most} wakers held, more than 5¼ × 64");
-		assert_eq!(wakers.cap(), MIN_CAP);
-		each_stored_once(wakers, &[live]);
-	}
-
-	// Failure mode: a task that came back (an overflow woke it and it waited
-	// again) and was dropped then is never woken again, so it is never
-	// forgotten, and such tasks pile up past any bound.
-	#[test]
-	fn tasks_dropped_after_they_came_back_do_not_grow_the_set() {
-		let wakers = Wakers::default();
-		let mut waiting: Vec<(Arc<Task>, Waker)> = Vec::new();
-		let mut most = 0;
-		for step in 0..192_000 {
-			if step % 64 == 0 {
-				// It waits, and once woken waits again, and is dropped.
+	fn live(n: usize) -> Vec<Live> {
+		(0..n)
+			.map(|_| {
 				let task = Arc::new(Task::default());
-				let handle = Waker::from(Arc::clone(&task));
-				wakers.add(&handle);
-				waiting.push((task, handle));
-			} else {
-				wakers.add(&Waker::from(Arc::new(Task::default())));
-			}
-			waiting.retain(|(task, handle)| {
-				if task.wakes() == 0 {
-					return true;
+				Live { waker: Waker::from(Arc::clone(&task)), task, key: WaitKey::default() }
+			})
+			.collect()
+	}
+
+	/// A fixed pseudo-random order of `0..n` (xorshift), the same each run.
+	fn shuffled(n: usize, seed: u64) -> Vec<usize> {
+		let mut order: Vec<usize> = (0..n).collect();
+		let mut x = seed;
+		for i in (1..n).rev() {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			order.swap(i, (x % (i as u64 + 1)) as usize);
+		}
+		order
+	}
+
+	/// A task that waits once and is dropped with its future: nothing but
+	/// the set could still hold its waker.
+	fn wait_once_and_drop(wakers: &Arc<Wakers>, woken: &Arc<Task>) {
+		let mut key = WaitKey::default();
+		wakers.wait(&mut key, &Waker::from(Arc::clone(woken)));
+	}
+
+	// Failure mode (review of #111 at 7eb2f7d0): live tasks woke each other
+	// for good when they waited again in another order than they first
+	// waited. Only the thing's readiness wakes a task here: until it fires
+	// no live task is woken, whatever the order, and one fire wakes each
+	// once.
+	#[test]
+	fn live_tasks_in_any_order_are_woken_once_each_by_a_fire() {
+		let wakers = Arc::new(Wakers::default());
+		let mut tasks = live(5000);
+		for seed in [0x9e37_79b9_7f4a_7c15, 0x2545_f491_4f6c_dd1d, 0xd1b5_4a32_d192_ed03] {
+			for _ in 0..3 {
+				for i in shuffled(tasks.len(), seed) {
+					let t = &mut tasks[i];
+					wakers.wait(&mut t.key, &t.waker);
 				}
-				wakers.add(handle);
-				false
-			});
-			most = most.max(wakers.held());
+			}
+			assert!(tasks.iter().all(|t| t.task.wakes() == 0), "no task is woken before a fire");
+			assert_eq!(wakers.held(), 5000, "each task is stored once");
 		}
-		assert!(most <= 336, "{most} wakers held, more than 5¼ × 64");
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert!(tasks.iter().all(|t| t.task.wakes() == 1), "a fire wakes each task once");
+		for i in shuffled(tasks.len(), 7) {
+			let t = &mut tasks[i];
+			wakers.wait(&mut t.key, &t.waker);
+		}
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert!(tasks.iter().all(|t| t.task.wakes() == 2), "the next fire wakes each once again");
 	}
 
-	// Failure mode: the copies that tell a task that came back from a new one
-	// fill up with dropped tasks' wakers and are never forgotten, so live
-	// tasks are never known when they come back and churn for good.
+	// Failure mode (review of #111 at 7eb2f7d0): live tasks after 300,000
+	// dropped ones were woken for 235 rounds before they settled. Dropped
+	// tasks leave nothing here, so live ones after them are held and woken
+	// as if they were the first.
 	#[test]
-	fn live_tasks_settle_after_many_dropped_ones() {
-		let wakers = Wakers::default();
-		for _ in 0..5000 {
-			wakers.add(&Waker::from(Arc::new(Task::default())));
+	fn live_tasks_after_many_dropped_ones_are_held_alone() {
+		let wakers = Arc::new(Wakers::default());
+		let dropped = Arc::new(Task::default());
+		for _ in 0..300_000 {
+			wait_once_and_drop(&wakers, &dropped);
 		}
-		let tasks: Vec<Arc<Task>> = (0..1000).map(|_| Arc::default()).collect();
-		settle(&wakers, &tasks, 5);
+		assert_eq!((wakers.held(), wakers.keys()), (0, 0), "dropped tasks leave nothing");
+		let mut tasks = live(1000);
+		for t in &mut tasks {
+			wakers.wait(&mut t.key, &t.waker);
+		}
+		assert_eq!(wakers.held(), 1000);
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert!(tasks.iter().all(|t| t.task.wakes() == 1), "a fire wakes each live task once");
+		assert_eq!(dropped.wakes(), 0, "no dropped task is woken");
 	}
 
-	// Failure mode: the caller is told the set was empty when it was not (a
-	// second wait registered) or not told when it was (no wait at all).
+	// Failure mode (review of #111 at 7eb2f7d0): 100 live tasks beside a
+	// stream of 37,020 that wait once and are dropped were woken 2,000,033
+	// times. Here they are not woken at all until a fire, and the set never
+	// holds more than the live tasks and the one dropped task in flight.
 	#[test]
-	fn add_says_whether_the_set_was_empty() {
+	fn live_tasks_beside_a_stream_of_dropped_ones_are_not_woken() {
+		let wakers = Arc::new(Wakers::default());
+		let dropped = Arc::new(Task::default());
+		let mut tasks = live(100);
+		for t in &mut tasks {
+			wakers.wait(&mut t.key, &t.waker);
+		}
+		for n in 0..37_020 {
+			let mut key = WaitKey::default();
+			wakers.wait(&mut key, &Waker::from(Arc::clone(&dropped)));
+			assert!(wakers.held() <= 101, "{} wakers held", wakers.held());
+			drop(key);
+			// A live task polls again now and then, with the same waker.
+			let t = &mut tasks[n % 100];
+			wakers.wait(&mut t.key, &t.waker);
+		}
+		let woken: usize = tasks.iter().map(|t| t.task.wakes()).sum();
+		assert_eq!(woken, 0, "live tasks woken {woken} times by tasks that came and went");
+		assert_eq!(wakers.held(), 100);
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert!(tasks.iter().all(|t| t.task.wakes() == 1));
+		assert_eq!(dropped.wakes(), 0);
+	}
+
+	// Failure mode: a dropped task's waker stays stored, and with it the
+	// task's memory.
+	#[test]
+	fn a_dropped_waiter_leaves_nothing_stored() {
+		let wakers = Arc::new(Wakers::default());
+		let task = Arc::new(Task::default());
+		let mut key = WaitKey::default();
+		wakers.wait(&mut key, &Waker::from(Arc::clone(&task)));
+		assert_eq!((wakers.held(), Arc::strong_count(&task)), (1, 2));
+		drop(key);
+		assert_eq!((wakers.held(), wakers.keys()), (0, 0));
+		assert_eq!(Arc::strong_count(&task), 1, "the set keeps no clone of the waker");
+	}
+
+	// Failure mode: a task that polls again takes a second slot, and the
+	// set grows with every poll of a live task.
+	#[test]
+	fn a_task_waiting_again_replaces_its_own_wait() {
+		let wakers = Arc::new(Wakers::default());
+		let (first, second) = (Arc::new(Task::default()), Arc::new(Task::default()));
+		let mut key = WaitKey::default();
+		wakers.wait(&mut key, &Waker::from(Arc::clone(&first)));
+		wakers.wait(&mut key, &Waker::from(Arc::clone(&second)));
+		assert_eq!((wakers.held(), wakers.keys()), (1, 1));
+		Waker::from(Arc::clone(&wakers)).wake();
+		assert_eq!((first.wakes(), second.wakes()), (0, 1), "only the latest waker is woken");
+	}
+
+	// Failure mode: the caller is told no task waited when one did (a second
+	// watch registered) or not told when none did (no watch at all, the
+	// next fire never comes).
+	#[test]
+	fn wait_says_whether_a_task_waited() {
 		let wakers = Arc::new(Wakers::default());
 		let (a, b) = (Waker::from(Arc::new(Task::default())), Waker::from(Arc::new(Task::default())));
-		assert!(wakers.add(&a));
-		assert!(!wakers.add(&a), "the same waker again");
-		assert!(!wakers.add(&b));
+		let (mut ka, mut kb) = (WaitKey::default(), WaitKey::default());
+		assert!(wakers.wait(&mut ka, &a));
+		assert!(!wakers.wait(&mut ka, &a), "the same task again");
+		assert!(!wakers.wait(&mut kb, &b));
 		Waker::from(Arc::clone(&wakers)).wake_by_ref();
-		assert!(wakers.add(&b), "empty again once woken");
+		assert!(wakers.wait(&mut kb, &b), "none waits once all were woken");
+		drop(kb);
+		assert!(wakers.wait(&mut ka, &a), "none waits once the only one waiting is gone");
+	}
+
+	// Failure mode: a key that waits in another set (its file was replaced)
+	// keeps its slot in the first, which then holds a waker for good.
+	#[test]
+	fn a_key_waits_in_one_set_at_a_time() {
+		let (one, two) = (Arc::new(Wakers::default()), Arc::new(Wakers::default()));
+		let task = Arc::new(Task::default());
+		let waker = Waker::from(Arc::clone(&task));
+		let mut key = WaitKey::default();
+		one.wait(&mut key, &waker);
+		assert!(two.wait(&mut key, &waker));
+		assert_eq!((one.keys(), two.keys()), (0, 1));
 	}
 }

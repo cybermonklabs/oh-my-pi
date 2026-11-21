@@ -3,10 +3,10 @@
 //! The other end of a FIFO, a `/dev/fd/N` or a socket may be a vproc of the
 //! same engine, so a `read(2)` or `write(2)` that waits in the kernel would
 //! deadlock the scheduler. [`StdFile`](crate::sys::StdFile) therefore asks
-//! [`now`] first and only does I/O that cannot wait; otherwise it stores the
-//! polling task's waker with the other tasks waiting in that direction
-//! (`sys::wakers::Wakers`), registers one [`watch`] whose waker wakes them
-//! all, and returns `Pending`.
+//! [`now`] first and only does I/O that cannot wait; otherwise the polling
+//! task waits by its key beside the other tasks waiting in that direction
+//! ([`Wakers`](crate::sys::Wakers)), the first registers one [`watch`] whose
+//! waker wakes them all, and the poll returns `Pending`.
 //!
 //! The descriptor's flags are never changed: `O_NONBLOCK` lives on the open
 //! file description, which externals inherit and other processes may share.

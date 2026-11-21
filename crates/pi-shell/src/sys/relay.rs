@@ -43,9 +43,12 @@ use std::{
 
 use crate::{
 	bash::{ExitStatus, ExtProc, OsHandle, ProcEvent, Signal},
-	sys::pump::{
-		BUF, BURST, End, PollIo, orphan,
-		os::{self, OsPipe, Timer},
+	sys::{
+		WaitKey,
+		pump::{
+			BUF, BURST, End, PollIo, orphan,
+			os::{self, OsPipe, Timer},
+		},
 	},
 };
 
@@ -117,6 +120,8 @@ struct Relay {
 	target:   Option<u64>,
 	/// The hold grace, once the drain waits on a held character.
 	grace:    Option<Timer>,
+	/// The relay's wait on its sink, which the engine may wait on too.
+	key:      WaitKey,
 }
 
 impl Relay {
@@ -133,6 +138,7 @@ impl Relay {
 			phase: Phase::Reading,
 			target: None,
 			grace: None,
+			key: WaitKey::default(),
 		}
 	}
 
@@ -150,7 +156,7 @@ impl Relay {
 				} else {
 					&self.buf[..self.raw_len]
 				};
-				match std::task::ready!(self.sink.poll_write(cx, &bytes[self.sent..])) {
+				match std::task::ready!(self.sink.poll_write(cx, &bytes[self.sent..], &mut self.key)) {
 					Ok(n) if n > 0 => self.sent += n,
 					Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
 					_ => {
