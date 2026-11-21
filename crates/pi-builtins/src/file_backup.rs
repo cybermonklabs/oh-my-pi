@@ -512,6 +512,208 @@ pub(crate) mod tests {
 		}
 	}
 
+	/// A provider over host files whose names fold, as on a case-insensitive
+	/// filesystem (APFS and NTFS by default, a casefold ext4 or tmpfs
+	/// directory): a path whose last name is no entry of its directory, but
+	/// matches one but for ASCII case, names that entry. Identities and link
+	/// counts are the host's.
+	#[derive(Debug, Default)]
+	pub(crate) struct FoldingHost;
+
+	impl FoldingHost {
+		/// A filesystem over this provider.
+		pub(crate) fn fs() -> pi_vfs::Fs {
+			pi_vfs::Fs::new(Arc::new(Self))
+		}
+
+		/// The host path `path` names.
+		fn fold(path: &Path) -> PathBuf {
+			let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+				return path.to_path_buf();
+			};
+			if fs::symlink_metadata(path).is_ok() {
+				return path.to_path_buf();
+			}
+			let Ok(entries) = fs::read_dir(dir) else {
+				return path.to_path_buf();
+			};
+			entries
+				.filter_map(Result::ok)
+				.map(|entry| entry.file_name())
+				.find(|entry| entry.eq_ignore_ascii_case(name))
+				.map_or_else(|| path.to_path_buf(), |entry| dir.join(entry))
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl pi_vfs::FileSystem for FoldingHost {
+		async fn open(&self, path: &Path, options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+			pi_vfs::Fs::default().open_with(Self::fold(path), options).await
+		}
+
+		async fn metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			pi_vfs::Fs::default().metadata(Self::fold(path)).await
+		}
+
+		async fn symlink_metadata(&self, path: &Path) -> io::Result<pi_vfs::Metadata> {
+			pi_vfs::Fs::default().symlink_metadata(Self::fold(path)).await
+		}
+
+		async fn read_dir(&self, path: &Path) -> io::Result<pi_vfs::ReadDir> {
+			pi_vfs::Fs::default().read_dir(Self::fold(path)).await
+		}
+
+		async fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+			pi_vfs::Fs::default().read_link(Self::fold(path)).await
+		}
+
+		async fn create_dir(&self, path: &Path, _mode: Option<u32>) -> io::Result<()> {
+			pi_vfs::Fs::default().create_dir(Self::fold(path)).await
+		}
+
+		async fn remove_file(&self, path: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().remove_file(Self::fold(path)).await
+		}
+
+		async fn remove_dir(&self, path: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().remove_dir(Self::fold(path)).await
+		}
+
+		async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().rename(Self::fold(from), Self::fold(to)).await
+		}
+
+		async fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+			pi_vfs::Fs::default().copy(Self::fold(from), Self::fold(to)).await
+		}
+
+		async fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+			pi_vfs::Fs::default().hard_link(Self::fold(original), Self::fold(link)).await
+		}
+
+		async fn symlink(&self, target: &Path, link: &Path, kind: pi_vfs::SymlinkKind) -> io::Result<()> {
+			pi_vfs::Fs::default().symlink_with(target, Self::fold(link), kind).await
+		}
+
+		async fn set_permissions(&self, path: &Path, permissions: pi_vfs::Permissions) -> io::Result<()> {
+			pi_vfs::Fs::default().set_permissions(Self::fold(path), permissions).await
+		}
+	}
+
+	/// Whether names fold in `dir`: a file made as `fold-probe` is found as
+	/// `FOLD-PROBE`.
+	pub(crate) fn folds_names(dir: &Path) -> bool {
+		let probe = dir.join("fold-probe");
+		fs::write(&probe, "").unwrap();
+		let folds = dir.join("FOLD-PROBE").exists();
+		fs::remove_file(&probe).unwrap();
+		folds
+	}
+
+	/// The entries of `dir` in name order, as the GNU comparison script
+	/// prints them: a regular file as ` name=contents#links`, a symbolic
+	/// link as ` name=link:target`.
+	pub(crate) fn listing(dir: &Path) -> String {
+		use std::os::unix::fs::MetadataExt as _;
+		let mut names = fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name().into_string().unwrap())
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+			.iter()
+			.map(|name| {
+				let path = dir.join(name);
+				let metadata = fs::symlink_metadata(&path).unwrap();
+				if metadata.is_symlink() {
+					format!(" {name}=link:{}", fs::read_link(&path).unwrap().display())
+				} else {
+					format!(" {name}={}#{}", fs::read_to_string(&path).unwrap(), metadata.nlink())
+				}
+			})
+			.collect()
+	}
+
+	/// Checks `util` (`mv`, `cp`, `ln` or `ln -s`) where names fold and the
+	/// source `DEST~` ("P") is the backup's entry: `<util> -b DEST~ dest`,
+	/// with `dest` ("old"), backs `dest` up as `dest~`, which names `DEST~`.
+	/// `run(fs, dir, args)` runs it over `fs` in `dir` and returns the exit
+	/// status and standard error. It runs over the host where a temporary
+	/// directory folds names (a casefold tmpfs or ext4 directory, APFS), and
+	/// says the host half was skipped elsewhere; then over [`FoldingHost`].
+	///
+	/// - `DEST~` with one link is one entry with `dest~`, by its identity:
+	///   refused with "might destroy source", nothing changed. GNU 9.4 and
+	///   9.7, in a casefold tmpfs directory, lose P: mv and ln exit 0, and cp
+	///   exits 1 ("skipping file 'DEST~', as it was replaced while being
+	///   copied").
+	/// - With a second link, `other`, no name or identity tells the entries
+	///   apart. The backup replaces the entry `DEST~` and P stays in
+	///   `other`, as with GNU; mv moves and ln links the old contents, as
+	///   GNU's do; cp finds its source replaced when it opens it and fails as
+	///   GNU cp fails, leaving the old contents at the backup name, where GNU
+	///   renames them back to `dest`.
+	pub(crate) fn check_folded_sources(util: &str, run: impl Fn(&pi_vfs::Fs, &Path, &[&str]) -> (i32, String)) {
+		let root = tempfile::tempdir().unwrap();
+		if folds_names(root.path()) {
+			let host = pi_vfs::Fs::default();
+			check_folded_source("host", util, &root.path().join("host"), |dir, args| run(&host, dir, args));
+		} else {
+			eprintln!("{util}: the host half is skipped: names do not fold in {}", root.path().display());
+		}
+		let folding = FoldingHost::fs();
+		check_folded_source("provider", util, &root.path().join("provider"), |dir, args| {
+			run(&folding, dir, args)
+		});
+	}
+
+	fn check_folded_source(half: &str, util: &str, root: &Path, run: impl Fn(&Path, &[&str]) -> (i32, String)) {
+		let symbolic = util == "ln -s";
+		let (name, verb) = match util {
+			"mv" => ("mv", "moved"),
+			"cp" => ("cp", "copied"),
+			_ => ("ln", "linked"),
+		};
+		let args: &[&str] = if symbolic { &["-s", "-b", "DEST~", "dest"] } else { &["-b", "DEST~", "dest"] };
+		for links in [1, 2] {
+			let case = format!("{half}: {util} links={links}");
+			let dir = root.join(format!("{}{links}", util.replace(' ', "")));
+			fs::create_dir_all(&dir).unwrap();
+			fs::write(dir.join("DEST~"), "P").unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			if links == 2 {
+				fs::hard_link(dir.join("DEST~"), dir.join("other")).unwrap();
+			}
+			let got = run(&dir, args);
+			let read = |entry: &str| fs::read_to_string(dir.join(entry)).ok();
+			if links == 1 {
+				let refused = format!("{name}: backing up 'dest' might destroy source;  'DEST~' not {verb}\n");
+				assert_eq!(got, (1, refused), "{case}");
+				assert_eq!(read("DEST~").as_deref(), Some("P"), "{case}: the source was lost");
+				assert_eq!(read("dest").as_deref(), Some("old"), "{case}: dest changed");
+				continue;
+			}
+			assert_eq!(read("other").as_deref(), Some("P"), "{case}: the second link was lost");
+			match util {
+				"cp" => {
+					let skipped = "cp: skipping file 'DEST~', as it was replaced while being copied\n";
+					assert_eq!(got, (1, skipped.to_owned()), "{case}");
+					assert_eq!(read("DEST~").as_deref(), Some("old"), "{case}: no backup");
+					assert_eq!(read("dest"), None, "{case}: the replaced source was copied");
+				},
+				"mv" => {
+					assert_eq!(got, (0, String::new()), "{case}");
+					assert_eq!(read("dest").as_deref(), Some("old"), "{case}");
+				},
+				_ => {
+					assert_eq!(got, (0, String::new()), "{case}");
+					assert_eq!(read("dest").as_deref(), Some("old"), "{case}");
+					assert_eq!(read("DEST~").as_deref(), Some("old"), "{case}: no backup");
+				},
+			}
+		}
+	}
+
 	/// One directory of [`check_numbered_backups`]: what is at `dest.~N~`
 	/// before the backup (`None` for a symlink to nothing), the
 	/// `--backup` CONTROL word, and the backup name GNU coreutils picks.

@@ -942,4 +942,55 @@ mod tests {
 		assert_eq!(fs::read_to_string(dir.path().join("dest~")).unwrap(), "payload");
 		assert_eq!(fs::read_to_string(dir.path().join("dest")).unwrap(), "old");
 	}
+
+	/// `ln -L -b x dest`, where `x -> dest~ -> a`, is refused: ln follows the
+	/// chain, and the backup would replace the link `dest~` it passes through,
+	/// so `dest` would be linked to the old `dest`. GNU ln 9.4 and 9.7 exit 0
+	/// there with `dest` and `dest~` the old file (`dest=old#2 dest~=old#2`)
+	/// and the link lost.
+	#[cfg(unix)]
+	#[test]
+	fn a_followed_chain_through_the_backup_is_not_linked_over_it() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("a"), "payload").unwrap();
+		std::os::unix::fs::symlink("a", dir.path().join("dest~")).unwrap();
+		std::os::unix::fs::symlink("dest~", dir.path().join("x")).unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		let (code, capture) = run_util::<Ln>(&["-L", "-b", "x", "dest"], "", dir.path());
+		assert_eq!(
+			(code, capture.err()),
+			(1, "ln: backing up 'dest' might destroy source;  'x' not linked\n".to_owned())
+		);
+		assert_eq!(
+			crate::file_backup::tests::listing(dir.path()),
+			" a=payload#1 dest=old#1 dest~=link:a x=link:dest~"
+		);
+	}
+
+	/// `ln -s -b dest~ dest` with nothing at `dest~` links `dest` to `dest~`
+	/// and backs `dest` up there, as GNU ln 9.4 and 9.7 do: the backup
+	/// replaces no entry, so it cannot replace the source. With `dest~`
+	/// present it is refused ([`a_source_that_is_the_destinations_backup_is_not_linked_over_it`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_symbolic_link_to_a_free_backup_name_is_made() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("dest"), "old").unwrap();
+		let (code, capture) = run_util::<Ln>(&["-s", "-b", "dest~", "dest"], "", dir.path());
+		assert_eq!((code, capture.err()), (0, String::new()));
+		assert_eq!(crate::file_backup::tests::listing(dir.path()), " dest=link:dest~ dest~=old#1");
+	}
+
+	/// `ln -b DEST~ dest` and `ln -s -b DEST~ dest` where names fold
+	/// ([`crate::file_backup::tests::check_folded_sources`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_source_whose_name_folds_to_the_backup_is_not_linked_over_it() {
+		for util in ["ln", "ln -s"] {
+			crate::file_backup::tests::check_folded_sources(util, |fs, dir, args| {
+				let (code, capture) = crate::host::run_util_on::<Ln>(fs, args, "", dir);
+				(code, capture.err())
+			});
+		}
+	}
 }

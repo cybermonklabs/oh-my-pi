@@ -4034,4 +4034,114 @@ mod tests {
 		assert_eq!(fs::read_to_string(dir.path().join("dest~")).unwrap(), "payload");
 		assert_eq!(fs::read_to_string(dir.path().join("dest")).unwrap(), "old");
 	}
+
+	/// The backup of a destination that is the source's own file, as GNU cp
+	/// 9.4 and 9.7 make it (the states are theirs, links counted):
+	/// - Where `dest` is another entry of the source's file, it is renamed to
+	///   the backup name and the copy makes a new `dest`. Where that name is
+	///   another link of the same file, the rename would do nothing, and GNU's
+	///   create of `dest` then fails: "cannot create regular file 'dest': File
+	///   exists", status 1, nothing changed.
+	/// - Where `dest` is the source's own entry (`cp -fb a a`), the backup is
+	///   a copy, refused where the backup name is the source's file ("'a' and
+	///   'a~' are the same file"). The copy is made under a new name and
+	///   renamed over the backup name, so it never writes through what that
+	///   name holds: a symbolic link to an unrelated `u` is replaced and `u`
+	///   kept. GNU writes through it, losing `u`'s contents (`a~=link:u
+	///   u=A#1`): a stated difference.
+	///
+	/// Before, the backup was a copy written through the backup name
+	/// whenever the source and `dest` were one file: with `dest~` a third
+	/// link, or a symbolic link to `a`, the copy emptied all three, status 0.
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_of_the_sources_own_file_is_made_as_gnu_makes_it() {
+		let exists = "cp: cannot create regular file 'dest': File exists\n";
+		let same = "cp: 'a' and 'a~' are the same file\n";
+		#[rustfmt::skip]
+		let cases: [(&str, &str, &[&str], i32, &str, &str); 14] = [
+			("three-links", "A>a a=dest a=dest~", &["-b", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
+			("three-links", "A>a a=dest a=dest~", &["--backup=simple", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
+			("three-links", "A>a a=dest a=dest~", &["--backup=existing", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
+			("three-links", "A>a a=dest a=dest~", &["--backup=numbered", "a", "dest"], 0, "", " a=A#3 dest=A#1 dest.~1~=A#3 dest~=A#3"),
+			("three-links", "A>a a=dest a=dest~", &["-fb", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
+			("dest~-link", "A>a a=dest a@dest~", &["-b", "a", "dest"], 0, "", " a=A#2 dest=A#1 dest~=A#2"),
+			("dest~-other", "A>a a=dest U>u u@dest~", &["-b", "a", "dest"], 0, "", " a=A#2 dest=A#1 dest~=A#2 u=U#1"),
+			("dest~-none", "A>a a=dest", &["-b", "a", "dest"], 0, "", " a=A#2 dest=A#1 dest~=A#2"),
+			("backup-is-dest", "A>a old>dest dest=dest~", &["-b", "a", "dest"], 1, exists, " a=A#1 dest=old#2 dest~=old#2"),
+			("self-hard", "A>a a=a~", &["-fb", "a", "a"], 1, same, " a=A#2 a~=A#2"),
+			("self-sym", "A>a a@a~", &["-fb", "a", "a"], 1, same, " a=A#1 a~=link:a"),
+			("self-other", "A>a U>u u@a~", &["-fb", "a", "a"], 0, "", " a=A#1 a~=A#1 u=U#1"),
+			("self-none", "A>a", &["-fb", "a", "a"], 0, "", " a=A#1 a~=A#1"),
+			("self-none", "A>a", &["-b", "a", "a"], 1, "cp: 'a' and 'a' are the same file\n", " a=A#1"),
+		];
+		let root = tempdir().unwrap();
+		for (index, (case, setup, args, code, err, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(format!("{index}-{case}"));
+			fs::create_dir(&dir).unwrap();
+			for step in setup.split(' ') {
+				if let Some((contents, name)) = step.split_once('>') {
+					fs::write(dir.join(name), contents).unwrap();
+				} else if let Some((original, link)) = step.split_once('=') {
+					fs::hard_link(dir.join(original), dir.join(link)).unwrap();
+				} else if let Some((target, link)) = step.split_once('@') {
+					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+				}
+			}
+			let (got, capture) = run_util::<Cp>(args, "", &dir);
+			let what = format!("{case} cp {}", args.join(" "));
+			assert_eq!((got, capture.err().as_str()), (code, err), "{what}");
+			assert_eq!(crate::file_backup::tests::listing(&dir), after, "{what}");
+		}
+	}
+
+	/// A followed source whose chain of symbolic links passes through the
+	/// backup's entry: `x -> dest~ -> a`. `cp -b x dest` is refused: the
+	/// backup would replace the link `dest~` with the old `dest`, and the copy
+	/// would then read that. GNU 9.4 and 9.7 make the backup, losing the link,
+	/// then find the source replaced ("skipping file 'x', as it was replaced
+	/// while being copied", status 1) and rename the backup back. With `-P`
+	/// the link `x` is copied, not followed, and the backup replaces `dest~`,
+	/// as GNU's does; so it does where `dest~` holds the contents itself.
+	#[cfg(unix)]
+	#[test]
+	fn a_source_chain_through_the_backup_is_not_copied_over_it() {
+		use std::os::unix::fs::symlink;
+		let root = tempdir().unwrap();
+		#[rustfmt::skip]
+		let cases: [(&str, bool, &[&str], i32, &str, &str); 3] = [
+			("chain", true, &["-b", "x", "dest"], 1,
+				"cp: backing up 'dest' might destroy source;  'x' not copied\n",
+				" a=payload#1 dest=old#1 dest~=link:a x=link:dest~"),
+			("chain-P", true, &["-P", "-b", "x", "dest"], 0, "",
+				" a=payload#1 dest=link:dest~ dest~=old#1 x=link:dest~"),
+			("held-P", false, &["-P", "-b", "x", "dest"], 0, "", " dest=link:dest~ dest~=old#1 x=link:dest~"),
+		];
+		for (case, chain, args, code, err, after) in cases {
+			let dir = root.path().join(case);
+			fs::create_dir(&dir).unwrap();
+			if chain {
+				fs::write(dir.join("a"), "payload").unwrap();
+				symlink("a", dir.join("dest~")).unwrap();
+			} else {
+				fs::write(dir.join("dest~"), "payload").unwrap();
+			}
+			symlink("dest~", dir.join("x")).unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			let (got, capture) = run_util::<Cp>(args, "", &dir);
+			assert_eq!((got, capture.err().as_str()), (code, err), "{case}");
+			assert_eq!(crate::file_backup::tests::listing(&dir), after, "{case}");
+		}
+	}
+
+	/// `cp -b DEST~ dest` where names fold
+	/// ([`crate::file_backup::tests::check_folded_sources`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_source_whose_name_folds_to_the_backup_is_not_copied_over_it() {
+		crate::file_backup::tests::check_folded_sources("cp", |fs, dir, args| {
+			let (code, capture) = crate::host::run_util_on::<Cp>(fs, args, "", dir);
+			(code, capture.err())
+		});
+	}
 }

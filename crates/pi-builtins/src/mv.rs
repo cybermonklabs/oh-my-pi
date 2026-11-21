@@ -1813,4 +1813,15 @@ mod tests {
 			assert_eq!(fs::read(dir.join("dest.~1~")).unwrap(), b"old", "to {target}: no numbered backup");
 		}
 	}
+
+	/// `mv -b DEST~ dest` where names fold
+	/// ([`crate::file_backup::tests::check_folded_sources`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_source_whose_name_folds_to_the_backup_is_not_moved_over_it() {
+		crate::file_backup::tests::check_folded_sources("mv", |fs, dir, args| {
+			let (code, capture) = run_util_on::<Mv>(fs, args, "", dir);
+			(code, capture.err())
+		});
+	}
 }
