@@ -1320,7 +1320,9 @@ async fn timeout_and_nohup_quote_in_c_when_a_category_does_not_load() {
 /// name the shell's hash table holds runs from it (where coreutils, which
 /// sees no hash table, finds nothing). bash 5.2's `timeout` and `nohup`
 /// are programs, so `PATH` is coreutils' reference here; the hash table is
-/// the shell's.
+/// the shell's. `a/foo` has no execute bit, so no user may run it, root
+/// included. `b/foo` has the group's alone: its owner may not run it, and
+/// root may, as `access(2)` answers for the user the test runs as.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
@@ -1328,22 +1330,27 @@ async fn timeout_and_nohup_find_a_command_as_the_shell_does() {
 
 	let dir = tempfile::tempdir().unwrap();
 	let p = dir.path();
-	for (sub, mode) in [("a", 0o614), ("b", 0o755)] {
+	for (sub, mode) in [("a", 0o644), ("b", 0o614), ("c", 0o755)] {
 		std::fs::create_dir(p.join(sub)).unwrap();
 		let file = p.join(sub).join("foo");
 		std::fs::write(&file, format!("#!/bin/sh\necho {}\n", sub.to_uppercase())).unwrap();
 		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
 	}
+	let b_foo = std::ffi::CString::new(p.join("b/foo").as_os_str().as_bytes()).unwrap();
+	// SAFETY: access reads the NUL-terminated path it is given.
+	let b_runs = unsafe { libc::access(b_foo.as_ptr(), libc::X_OK) } == 0;
+	let found = if b_runs { "B\n" } else { "C\n" };
 	let path = format!(
-		"{}:{}:{}",
+		"{}:{}:{}:{}",
 		p.join("a").display(),
 		p.join("b").display(),
+		p.join("c").display(),
 		std::env::var("PATH").unwrap()
 	);
 	let echo = crate::testkit::child::on_path("echo");
 	for wrapper in ["timeout 5", "nohup"] {
 		let path = [("PATH", path.as_str())];
-		assert_wrapper_as_coreutils(p, wrapper, "foo", "C", &path, (0, "B\n", "")).await;
+		assert_wrapper_as_coreutils(p, wrapper, "foo", "C", &path, (0, found, "")).await;
 		let ran =
 			run(&mut session_in(p, &[]), &format!("hash -p {echo} myecho; {wrapper} myecho hi")).await;
 		assert_eq!(
