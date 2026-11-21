@@ -1222,8 +1222,8 @@ export class SessionTools {
 	 * model call; see {@link #implicitRebuildBinding}.
 	 */
 	#restoredTranscript: RestoredTranscript | undefined;
-	/** Digests of the last primary model call, until its reply ends. */
-	#capturedCall: ModelCallDigests | undefined;
+	/** The last primary model call, until its reply ends: its digests, and the active tools when it captured them. */
+	#capturedCall: { digests: ModelCallDigests; activeTools: AgentTool[] } | undefined;
 	/** Digests of the call each primary reply with provider output was produced by. */
 	readonly #replyCalls = new WeakMap<AgentMessage, ModelCallDigests>();
 	/** Newest {@link SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE} record of a branch view ({@link scanNewestRecord}). */
@@ -2972,7 +2972,10 @@ export class SessionTools {
 		const continued = previous?.toolsDigest === this.#boundToolsDigest() ? previous : undefined;
 		const promptDigest = systemPromptDigest(this.baseOfSystemPrompt(prompt));
 		const toolsDigest = this.#host.toolDefinitionsDigest();
-		this.#capturedCall = { prompt: promptDigest, tools: toolsDigest };
+		this.#capturedCall = {
+			digests: { prompt: promptDigest, tools: toolsDigest },
+			activeTools: this.#host.agent.state.tools,
+		};
 		if (this.#heldSettingsRebuild) return;
 		if (this.#host.model()?.thinking?.prefixBinding !== true) {
 			this.#sentDeclarations = undefined;
@@ -2991,9 +2994,32 @@ export class SessionTools {
 	 * this process captured it or the current branch records it.
 	 */
 	#boundToolsDigest(): string | undefined {
-		if (this.#capturedCall) return this.#capturedCall.tools;
+		if (this.#capturedCall) return this.#capturedCall.digests.tools;
 		const reply = this.#latestReply();
 		return (reply && this.#replyCalls.get(reply)?.tools) ?? this.recordedToolsDigest();
+	}
+
+	/**
+	 * Called each time a provider turns a fallback on in the session's provider state. Only the strict-tools fallback
+	 * changes the digest: the endpoint rejected strict tools, so the call in flight retries sending its tools without
+	 * `strict`. The digest of its tool definitions is taken again for the tools it captured, now that the fallback
+	 * counts in it, and so are the declarations kept with that digest (what the call declares, what a held rebuild
+	 * keeps declaring), so its reply records the definitions the retry sent. A call the fallback does not reach, and
+	 * any other fallback, keeps its digest. Gives whether a call in flight now counts other tool definitions.
+	 */
+	recountCapturedCallTools(): boolean {
+		const call = this.#capturedCall;
+		if (!call) return false;
+		const { digests } = call;
+		const recounted = this.#host.toolDefinitionsDigest(call.activeTools);
+		if (recounted === digests.tools) return false;
+		this.#capturedCall = { digests: { prompt: digests.prompt, tools: recounted }, activeTools: call.activeTools };
+		const sent = this.#sentDeclarations;
+		if (sent?.toolsDigest === digests.tools) this.#sentDeclarations = { ...sent, toolsDigest: recounted };
+		const held = this.#heldSettingsRebuild;
+		const kept = held?.declarations;
+		if (held && kept?.toolsDigest === digests.tools) held.declarations = { ...kept, toolsDigest: recounted };
+		return true;
 	}
 
 	/**
@@ -3007,7 +3033,7 @@ export class SessionTools {
 		this.#capturedCall = undefined;
 		if (call === undefined || reply.role !== "assistant") return;
 		if (reply.content.some(block => block.type !== "text" || block.text.length > 0)) {
-			this.#replyCalls.set(reply, call);
+			this.#replyCalls.set(reply, call.digests);
 		}
 	}
 

@@ -77,7 +77,6 @@ import {
 import { getProxyForUrl } from "../utils/proxy";
 import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import { getHeadersFromError, getRetryAfterMsFromHeaders, type HeadersLike } from "../utils/retry-after";
-import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { fetchAuthorizedAtWire, type WireAuthorization } from "../utils/transport-fetch";
 import { toWebSocketHeaders, toWebSocketUrl } from "../utils/websocket";
 import { compactGrammarDefinition } from "./grammar";
@@ -105,6 +104,7 @@ import { CodexApiError } from "./openai-codex/response-handler";
 import { getCodexAttestationHeader } from "./openai-codex-attestation";
 export { createOpenAICodexCompactionRequestContext } from "./openai-codex-compaction";
 import { getOpenAICodexWebSocketEnvValue } from "./openai-codex-transport";
+import { nonFunctionTool, openAIFunctionTools, openAIToolsRequest } from "./openai-tool-strict";
 import {
 	createCodexProviderSessionState,
 	getCodexProviderSessionState,
@@ -4642,40 +4642,35 @@ export function convertOpenAICodexResponsesTools(
 	tools: Tool[],
 	model: Model<"openai-codex-responses">,
 ): CodexToolPayload[] {
-	const allowFreeform = model.applyPatchToolType === "freeform";
-	const payloads: CodexToolPayload[] = [];
-	for (const tool of tools) {
-		// Subscription models default to the function fallback. Explicit metadata
-		// remains authoritative for future Codex endpoints that implement GA computer use.
-		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
-			payloads.push({ type: "computer" });
-			continue;
+	const request = openAIToolsRequest(model);
+	const declared = openAIFunctionTools(request, tools);
+	return tools.map((tool, index): CodexToolPayload => {
+		switch (nonFunctionTool(request, tool)) {
+			case "computer":
+				return { type: "computer" };
+			case "custom": {
+				const customFormat = tool.customFormat!;
+				return {
+					type: "custom",
+					name: tool.customWireName ?? tool.name,
+					description: tool.description || "",
+					format: {
+						type: "grammar",
+						syntax: customFormat.syntax,
+						definition: compactGrammarDefinition(customFormat.syntax, customFormat.definition),
+					},
+				};
+			}
 		}
-		if (allowFreeform && tool.customFormat) {
-			payloads.push({
-				type: "custom",
-				name: tool.customWireName ?? tool.name,
-				description: tool.description || "",
-				format: {
-					type: "grammar",
-					syntax: tool.customFormat.syntax,
-					definition: compactGrammarDefinition(tool.customFormat.syntax, tool.customFormat.definition),
-				},
-			});
-			continue;
-		}
-		const strict = !!(!NO_STRICT && tool.strict);
-		const baseParameters = sanitizeSchemaForOpenAIResponses(toolWireSchema(tool), { repairArrayItems: true });
-		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(baseParameters, strict);
-		payloads.push({
+		const { strict, parameters } = declared[index]!;
+		return {
 			type: "function",
 			name: tool.name,
 			description: tool.description || "",
 			parameters,
-			...(effectiveStrict ? { strict: true } : !NO_STRICT && tool.strict === false ? { strict: false } : {}),
-		});
-	}
-	return payloads;
+			...(strict === undefined ? {} : { strict }),
+		};
+	});
 }
 
 export class CodexWebSocketTransportError extends Error {

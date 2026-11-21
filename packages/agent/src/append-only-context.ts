@@ -17,6 +17,7 @@
 import type { AgentTool } from "./types";
 import type { Context, Message, Tool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
+import type { StrictnessHashedTool } from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
 import { normalizeTools } from "./agent-loop";
 import { messageEstimateVersion } from "./compaction/message-cache";
 import type { AgentContext, AgentMessage } from "./types";
@@ -495,9 +496,10 @@ function normalizeWireTools(tools: AgentContext["tools"], options: BuildOptions)
 
 /**
  * The fields of a provider-bound tool spec the wire carries; `normalizeTools` has rendered `examples` into the
- * description. A provider that defers a declared tool's loading marks it `deferLoading`.
+ * description. A provider that defers a declared tool's loading marks it `deferLoading`. JSON keeps a `strict: null`
+ * (a tool sent without the flag it has by default) apart from an unset `strict`, which it leaves out.
  */
-function wireToolFields(t: Tool) {
+function wireToolFields(t: StrictnessHashedTool) {
 	return {
 		n: t.name,
 		d: t.description,
@@ -513,7 +515,7 @@ function wireToolFields(t: Tool) {
  * Fingerprint of provider-bound tool specs as a request declares them, in order: a same-name tool whose description,
  * schema, `strict`, `customFormat`, `customWireName` or deferral changed, or another order, makes another one.
  */
-export function toolSpecsFingerprint(tools: readonly Tool[]): string {
+export function toolSpecsFingerprint(tools: readonly StrictnessHashedTool[]): string {
 	return hashPayload(JSON.stringify(tools.map(wireToolFields)));
 }
 

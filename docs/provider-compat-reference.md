@@ -225,7 +225,7 @@ All providers start from the same neutral wire schema — `toolWireSchema(tool)`
 - **Streaming**: `content_block_start` (`tool_use`, carries `id`+`name`) → `input_json_delta` fragments → parse via `parseStreamingJson` at `content_block_stop`. Envelope anomalies are logged (`reportAnthropicEnvelopeAnomaly`), not fatal.
 - **Results**: `user` message with `tool_result` blocks (`tool_use_id`). Images embed inside `tool_result.content`; on **error** results Anthropic rejects embedded images, so text stays in the block and images are hoisted after the `tool_result` run. Z.AI's Anthropic-shaped endpoint additionally needs `id` on the block (`requiresToolResultId`).
 - **Replay quirk**: assistant turns are stably partitioned `[...non_tool_use, ...tool_use]` so `tool_use` blocks sit at the tail — otherwise Anthropic 400s with "tool_use ids were found without tool_result blocks immediately after".
-- **Strict fallback**: a 400 strict rejection sets `providerSessionState.strictToolsDisabled` and retries without `strict`.
+- **Strict fallback**: a 400 strict rejection sets `providerSessionState.strictToolsDisabled` and retries without `strict` (see [Strict tools lifecycle](#strict-tools-lifecycle)).
 
 ### OpenAI Chat Completions (`providers/openai-completions.ts`)
 
@@ -266,7 +266,7 @@ All providers start from the same neutral wire schema — `toolWireSchema(tool)`
 
 ### Strict tools lifecycle
 
-`OpenAIStrictToolsState` (`providers/openai-shared.ts`) tracks strict-mode failures per scope `${provider}:${baseUrl}:${modelId}`: a recognized 400/422 strict-schema rejection calls `disableStrictToolsForScope`, and `isStrictToolsDisabledForScope` makes all subsequent requests for that scope run non-strict — one retry, then remembered, no per-turn 400 tax. Anthropic has the analogous per-session `strictToolsDisabled` flag.
+`OpenAIStrictToolsState` (`providers/openai-shared.ts`) tracks strict-mode failures per scope `${provider}:${baseUrl}:${modelId}`: a recognized 400/422 strict-schema rejection calls `disableStrictToolsForScope`, and `isStrictToolsDisabledForScope` makes all subsequent requests for that scope run non-strict — one retry, then remembered, no per-turn 400 tax. Anthropic has the analogous per-session `strictToolsDisabled` flag, beside its other runtime-learned fallbacks (`replayUnsignedThinkingDisabled`, `thinkingReplayDisabled`, `cacheControlUnsupported`, `cacheControlOptionsUnsupported`, `prefixDroppedThinkingBlocks`). `providers/provider-fallbacks.ts` reads them all without loading the providers (`providerFallbacks()`; `strictToolsFallbackHolds()`, which the agent's declared-tools digest counts) and tells the map's owner when a provider turns one on (`onProviderFallback()`; the providers call `reportProviderFallback()`); a recorded one goes back with `restoreAnthropicFallback()` (`providers/anthropic.ts`), or, without loading the provider, `restoreOpenAICompletionsStrictToolsFallback()` (`providers/openai-completions-state.ts`) or `restoreOpenAIResponsesStrictToolsFallback()` (`providers/openai-responses-state.ts`). The coding agent keeps them in the session (`provider-fallbacks` entries, `docs/session.md`), so a resumed process leaves out what the endpoint rejected from its first request, as the session's last request did.
 
 ### Text-based tool-call dialects (`src/dialect/`)
 

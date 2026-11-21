@@ -1,9 +1,10 @@
 /**
  * One omp process of `agent-session-no-strict-tool-digest.test.ts`, run as `bun <this file> <input JSON>`: the
  * providers read `PI_NO_STRICT` once, when they load, so each process the test runs with or without it is its own.
- * On the gateway's claude-opus-5-5 with `read` and `edit` (a tool the provider declares as strict unless
- * `PI_NO_STRICT` is set), on the input's session file or a new session, it reads the prompt cache status, sends each
- * prompt at its minute, and writes what it saw to the input's `out` file.
+ * On the gateway's claude-opus-5-5 with `read` and `edit` (a tool the Anthropic provider declares as strict unless
+ * `PI_NO_STRICT` is set; an OpenAI one asks strict decoding for every tool not marked `strict: false` unless it is),
+ * on Anthropic's messages API or the input's OpenAI API, on the input's session file or a new session, it reads the
+ * prompt cache status, sends each prompt at its minute, and writes what it saw to the input's `out` file.
  */
 import { vi } from "bun:test";
 import * as path from "node:path";
@@ -13,7 +14,13 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { PromptCacheStatus } from "@oh-my-pi/pi-tui/status-line/host";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { answer, gatewaySessionOptions, type MessagesRequest, mockGatewayFetch } from "../helpers/anthropic-gateway";
+import { answer, gatewaySessionOptions, mockGatewayFetch } from "../helpers/anthropic-gateway";
+import {
+	type GatewayRequest,
+	gatewayModel,
+	mockOpenAIGatewayFetch,
+	type OpenAIGatewayApi,
+} from "../helpers/openai-gateway";
 
 /** What the test gives the process. */
 export interface ProcessInput {
@@ -27,12 +34,14 @@ export interface ProcessInput {
 	prompts: { text: string; minute: number }[];
 	/** The file the process writes its {@link ProcessRun} to. */
 	out: string;
+	/** The OpenAI API the gateway serves the model on; Anthropic's messages API without one. */
+	api?: OpenAIGatewayApi;
 }
 
 /** What the process saw. */
 export interface ProcessRun {
 	/** Each request the gateway received, oldest first. */
-	requests: MessagesRequest[];
+	requests: GatewayRequest[];
 	/** The session file the process wrote. */
 	sessionFile: string;
 	/** The prompt cache status before the first prompt. */
@@ -43,13 +52,14 @@ const MINUTE_MS = 60_000;
 
 const input = JSON.parse(Bun.argv[2] ?? "{}") as ProcessInput;
 const realNow = Date.now.bind(Date);
-const { requests, restore } = mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
+const { requests, restore } = input.api
+	? mockOpenAIGatewayFetch(input.api)
+	: mockGatewayFetch(turn => answer(turn, { cacheWriteTokens: 100 }));
 const authStorage = createInMemoryAuthStorage();
 let run: ProcessRun;
 try {
 	const modelRegistry = new ModelRegistry(authStorage, path.join(input.dir, "models.yml"));
-	const model = modelRegistry.find("anthropic", "claude-opus-5-5");
-	if (!model) throw new Error("Expected the gateway's claude-opus-5-5");
+	const model = gatewayModel(modelRegistry, input.api);
 	const sessionManager = input.sessionFile
 		? await SessionManager.open(input.sessionFile)
 		: SessionManager.create(input.dir, path.join(input.dir, "sessions"));

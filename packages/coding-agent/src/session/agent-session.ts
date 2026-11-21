@@ -89,6 +89,7 @@ import type {
 import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
+import { onProviderFallback } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -545,6 +546,7 @@ import {
 } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
+import { ProviderFallbackRecord } from "./provider-fallback-record";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
@@ -825,6 +827,16 @@ interface PromptCacheShape {
 	tools: string;
 	systemPrompt: number | bigint;
 	retention: string;
+}
+
+/** The newest main-loop request: its transcript, model, active tools, shape and messages. */
+interface PromptCacheArm {
+	readonly sessionId: string;
+	readonly model: Model;
+	/** The active tools when it was armed. */
+	readonly tools: AgentTool[];
+	shape: PromptCacheShape;
+	readonly messages: readonly AgentMessage[];
 }
 
 /** What a branch says about the prompt cache its newest cached reply left. */
@@ -1642,16 +1654,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#yieldTerminationPending = false;
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	/** The session's record of the fallbacks {@link #providerSessionState} keeps. */
+	readonly #providerFallbacks: ProviderFallbackRecord;
 	readonly #cacheWarmer: CacheWarmer | undefined;
 	/** Transcript the warmer was last armed for: its confirmed entry describes no other transcript. */
 	#promptCacheArmSessionId: string | undefined;
 	/** Each armed main-loop request's dispatch hook, keyed by the context it was armed with. */
 	readonly #promptCacheDispatch = new WeakMap<Context, () => void>();
 	/**
-	 * The newest main-loop request's shape, messages and transcript, recorded with or without a warmer: a
-	 * side request repeats that request's prefix only while none of them changed (see {@link promptCacheExpiresAt}).
+	 * The newest main-loop request, recorded with or without a warmer: a side request repeats that request's prefix
+	 * only while none of it changed (see {@link promptCacheExpiresAt}); the warmer compares against its shape; a provider
+	 * fallback recounts its tools ({@link #onProviderFallback}). It holds a copy of the messages until dispose releases
+	 * memory.
 	 */
-	#lastRequestArm: { sessionId: string; shape: PromptCacheShape; messages: readonly AgentMessage[] } | undefined;
+	#lastRequestArm: PromptCacheArm | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
 	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
@@ -3319,6 +3335,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		});
 		this.agent.setOnBeforeYield(() => this.#ttsr.settleJudgments());
 		this.agent.setOnModelCallSystemPrompt(prompt => {
+			// The provider state may have dropped a fallback since (a Responses state a stale replay closed): the
+			// session's record and the call's digests follow what the request sends.
+			this.#providerFallbacks.sync();
 			this.#tools.recordPrimaryModelCall(prompt);
 			this.#recordModelCallSystemPrompt(prompt);
 		});
@@ -3394,6 +3413,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// tool_execution_start, and the wrapper's approval gate.
 		this.agent.beforeToolCall = (ctx, signal) => this.#beforeToolCall(ctx, signal);
 		this.agent.providerSessionState = this.#providerSessionState;
+		this.#providerFallbacks = new ProviderFallbackRecord({
+			sessionManager: this.sessionManager,
+			providerSessionState: this.#providerSessionState,
+			findModel: (provider, modelId) => this.#modelRegistry.find(provider, modelId),
+		});
+		onProviderFallback(this.#providerSessionState, () => this.#onProviderFallback());
 		// Records this session's work writes name it; the getter follows every
 		// re-key (new session, resume, fork, relocation off a contended file).
 		const sessionManager = this.sessionManager;
@@ -6820,10 +6845,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	startCacheWarming(model: Model, context: Context, options: SimpleStreamOptions): void {
 		const sessionId = this.sessionManager.getSessionId();
-		// A copy: `/clear` truncates the live array in place, which an alias would follow.
-		const armMessages = this.messages.slice();
-		const armShape = this.#promptCacheShape(model);
-		this.#lastRequestArm = { sessionId, shape: armShape, messages: armMessages };
+		const arm: PromptCacheArm = {
+			sessionId,
+			model,
+			tools: this.agent.state.tools,
+			shape: this.#promptCacheShape(model),
+			// A copy: `/clear` truncates the live array in place, which an alias would follow.
+			messages: this.messages.slice(),
+		};
+		this.#lastRequestArm = arm;
 		const warmer = this.#cacheWarmer;
 		if (!warmer) return;
 		// The warmer keeps its confirmed entry across requests until a response
@@ -6836,9 +6866,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			cacheRetention: options.cacheRetention ?? (retentionSetting === "auto" ? undefined : retentionSetting),
 		};
 		const dispatched = warmer.start({ model, context, options: warmingOptions }, () =>
-			this.#promptCacheChange(armShape, armMessages),
+			this.#promptCacheChange(arm.shape, arm.messages),
 		);
 		this.#promptCacheDispatch.set(context, dispatched);
+	}
+
+	/**
+	 * A provider turned a fallback on after the endpoint rejected part of a request: the session records it, and the
+	 * primary request in flight, when the provider retries it without strict tools, counts the tool definitions the
+	 * retry sends, for its reply's record and for the cache entry it writes, which is the one the next request reads.
+	 */
+	#onProviderFallback(): void {
+		this.#providerFallbacks.sync();
+		if (!this.#tools.recountCapturedCallTools()) return;
+		const arm = this.#lastRequestArm;
+		if (!arm) return;
+		const tools = this.agent.declaredToolsFingerprint(arm.model, arm.tools);
+		if (tools !== arm.shape.tools) arm.shape = { ...arm.shape, tools };
 	}
 
 	/**
@@ -7329,6 +7373,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!this.#freshProviderSessionId) {
 			seedCredentialPins(this.#modelRegistry.authStorage, this.sessionManager, sid);
 		}
+		// Likewise the provider fallbacks the session records: the first request leaves out what the endpoint
+		// rejected, as the session's last one did. A `/fresh` or `/clear` that closed the provider state records it has
+		// none.
+		this.#providerFallbacks.sync();
 		// Keep every live advisor's provider identity in lockstep with the primary's
 		// across every session-boundary transition — including branch paths that
 		// skip conversation restore — so advisors never emit the previous
@@ -7666,6 +7714,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#releasePowerAssertion();
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		onProviderFallback(this.#providerSessionState, undefined);
 		this.#closeAllProviderSessions("dispose");
 		this.#maintenance.cancelSpeculation();
 		this.setHindsightSessionState(undefined);
@@ -7761,6 +7810,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
+		// The newest request's arm holds a copy of the messages; the warmer let go of its own at dispose's cancel.
+		this.#lastRequestArm = undefined;
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */
@@ -14473,6 +14524,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
+			// A state the switch closed drops the fallback it kept, as the session's record does now.
+			this.#providerFallbacks.sync();
 			if (isChanging) {
 				this.#clearInheritedProviderPromptCacheKey();
 			}
@@ -15523,8 +15576,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#syncPlanReferenceToBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
+				this.#providerFallbacks.forget();
 			} else if (didReloadConversationChange) {
 				this.#closeAllProviderSessions("session reload");
+				this.#providerFallbacks.forget();
 			}
 
 			if (targetModel) {
@@ -15549,6 +15604,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					this.sessionManager.appendModelChange(`${targetModel.provider}/${targetModel.id}`);
 				}
 			}
+			// The provider fallbacks the session records, now that its model's provider state is set.
+			this.#providerFallbacks.sync();
 
 			const model = this.model;
 			if (model) {

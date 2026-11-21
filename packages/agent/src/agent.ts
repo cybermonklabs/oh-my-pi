@@ -31,6 +31,12 @@ import {
 	anthropicKeepsToolDeclaration,
 } from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import {
+	isOpenAIToolsModel,
+	type OpenAIToolsModelApi,
+	openAIStrictnessHashedTools,
+} from "@oh-my-pi/pi-ai/providers/openai-tool-strict";
+import { strictToolsFallbackHolds } from "@oh-my-pi/pi-ai/providers/provider-fallbacks";
 import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { NO_STRICT } from "@oh-my-pi/pi-ai/utils/schema/adapt";
@@ -463,6 +469,8 @@ export class Agent {
 				declaration: RecordedToolDeclaration | undefined;
 				sentRevision: number;
 				strictWithheld: boolean;
+				openAIWire: Model<OpenAIToolsModelApi> | undefined;
+				openAIStrictFallback: boolean;
 				fingerprint: string;
 		  }
 		| undefined;
@@ -726,8 +734,14 @@ export class Agent {
 	 * active tool is withdrawn (the request then declares none) or a withdrawn tool this agent never sent (a resumed
 	 * process's) leaves the declaration. Where the request sends no tool as strict ({@link #withholdsStrictTools}),
 	 * each tool counts as marked `strict: false`, so turning `PI_NO_STRICT` or Claude Code's experimental-beta kill
-	 * switch on or off changes it. With `tools`, the fingerprint the request would declare with them in place of the
-	 * active tools.
+	 * switch on or off, or the provider's strict-tools fallback after the endpoint rejected strict tools, changes it.
+	 * On an OpenAI API (an `openrouter` model's included), not under an owned dialect (which carries the tools in the
+	 * prompt), a tool the request sends with another `strict` flag than it would under default settings counts with
+	 * that flag ({@link openAIStrictnessHashedTools}, the strict-tools fallback the provider state keeps for the model
+	 * included: {@link strictToolsFallbackHolds}), so turning `PI_NO_STRICT` or the fallback on or off changes it
+	 * exactly where it changes the wire, and under default settings it is what it was before strictness counted; a
+	 * change of the model's compat is not seen. With `tools`, the fingerprint the request would declare with them in
+	 * place of the active tools.
 	 */
 	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
@@ -737,6 +751,10 @@ export class Agent {
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
 		const strictWithheld = this.#withholdsStrictTools(model);
+		const openAIWire =
+			model !== undefined && isOpenAIToolsModel(model) && !this.#ownedDialect(model) ? model : undefined;
+		const openAIStrictFallback =
+			openAIWire !== undefined && strictToolsFallbackHolds(this.#providerSessionState, openAIWire);
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
 		const memoized = tools === this.#state.tools;
 		const memo = this.#declaredToolsMemo;
@@ -750,15 +768,21 @@ export class Agent {
 			memo.pruneDescriptions === pruneDescriptions &&
 			memo.declaration === declaration &&
 			memo.sentRevision === sentRevision &&
-			memo.strictWithheld === strictWithheld
+			memo.strictWithheld === strictWithheld &&
+			memo.openAIWire === openAIWire &&
+			memo.openAIStrictFallback === openAIStrictFallback
 		) {
 			return memo.fingerprint;
 		}
 		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
 		const declared = this.#declaredFrom(active, declaration);
-		// The provider decodes no tool as strict there, as it decodes one marked `strict: false`.
+		// The provider decodes no tool as strict where it withholds strict tools, as it decodes one marked `strict: false`.
 		const fingerprint = toolSpecsFingerprint(
-			strictWithheld ? declared.map(tool => ({ ...tool, strict: false })) : declared,
+			strictWithheld
+				? declared.map(tool => ({ ...tool, strict: false }))
+				: openAIWire
+					? openAIStrictnessHashedTools(openAIWire, declared, { disableStrictTools: openAIStrictFallback })
+					: declared,
 		);
 		if (memoized) {
 			this.#declaredToolsMemo = {
@@ -770,6 +794,8 @@ export class Agent {
 				declaration,
 				sentRevision,
 				strictWithheld,
+				openAIWire,
+				openAIStrictFallback,
 				fingerprint,
 			};
 		}
@@ -823,15 +849,19 @@ export class Agent {
 
 	/**
 	 * Whether the next main request on `model` sends no tool as strict: on Anthropic, under `PI_NO_STRICT`
-	 * ({@link NO_STRICT}, the value the provider read when it loaded), or where the compat the request goes out with
+	 * ({@link NO_STRICT}, the value the provider read when it loaded), where the compat the request goes out with
 	 * disables strict tools ({@link withoutDisabledExperimentalBetas}: Claude Code's experimental-beta kill switch, or a
-	 * host whose compat rejects them); not under an owned dialect, which carries the tools in the prompt.
+	 * host whose compat rejects them), or where the provider state keeps the strict-tools fallback for the model after
+	 * the endpoint rejected strict tools ({@link strictToolsFallbackHolds}); not under an owned dialect, which carries
+	 * the tools in the prompt.
 	 */
 	#withholdsStrictTools(model: Model | undefined): boolean {
 		const wireModel = this.#anthropicWireModel(model);
 		return (
 			wireModel !== undefined &&
-			(NO_STRICT || withoutDisabledExperimentalBetas(wireModel).compat.disableStrictTools === true)
+			(NO_STRICT ||
+				withoutDisabledExperimentalBetas(wireModel).compat.disableStrictTools === true ||
+				strictToolsFallbackHolds(this.#providerSessionState, wireModel))
 		);
 	}
 
