@@ -2759,8 +2759,35 @@ mod tests {
 		(git(path, &["ls-files", "--stage"]), git(path, &["status", "--porcelain"]), listings)
 	}
 
+	/// Whether the reference `git apply --reverse` gives a deleted file its
+	/// mode back. git 2.45.0 to 2.49.x do not: git commit 01aff0ae left a
+	/// reversed deletion's mode unset, so `--reverse` re-creates a deleted
+	/// gitlink as a regular file. git commit 1d9a6649 fixed it, in 2.50.0.
+	fn reference_git_restores_deleted_modes() -> bool {
+		static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+		*ANSWER.get_or_init(|| {
+			let temp = init(&[("tool", b"run\n")]);
+			git(temp.path(), &["update-index", "--chmod=+x", "tool"]);
+			git(temp.path(), &["commit", "-qm", "executable"]);
+			// Forced: the worktree file keeps its old mode where the
+			// filesystem has no executable bit to set.
+			git(temp.path(), &["rm", "-q", "-f", "tool"]);
+			let patch = git(temp.path(), &["diff", "--cached", "--no-ext-diff"]);
+			git(temp.path(), &["commit", "-qm", "remove"]);
+			fs::write(temp.path().join(".git/remove.patch"), patch).expect("write patch");
+			git(temp.path(), &["apply", "--reverse", "--index", ".git/remove.patch"]);
+			git(temp.path(), &["ls-files", "--stage", "tool"]).starts_with("100755 ")
+		})
+	}
+
 	/// Apply `patch` to `ours` and `git apply` it to `oracle`, then assert both
 	/// agree on success, `can_apply_patch`, and the resulting gitlink state.
+	///
+	/// Reversing a gitlink deletion over the existing submodule directory
+	/// gives the gitlink back and leaves the directory as it was. A reference
+	/// git that does not restore a reversed deletion's mode cannot judge that
+	/// case, so omp is checked against that result directly; with any other
+	/// git, git's own result is also checked to be exactly that.
 	fn assert_gitlink_apply_matches_git(
 		ours: &Path,
 		oracle: &Path,
@@ -2773,6 +2800,30 @@ mod tests {
 			.can_apply_patch(patch, options)
 			.expect("check patch");
 		let applied = repository.apply_patch(patch, options);
+		let reverses_a_deletion =
+			options.reverse && !options.cached && patch.contains("deleted file mode 160000");
+		let untouched = gitlink_snapshot(oracle);
+		if reverses_a_deletion {
+			assert!(
+				untouched
+					.0
+					.lines()
+					.any(|line| line.starts_with("160000 ") && line.ends_with("\tmodule")),
+				"{case}: the fixture holds no gitlink to give back: {}",
+				untouched.0
+			);
+		}
+		if reverses_a_deletion && !reference_git_restores_deleted_modes() {
+			eprintln!(
+				"{case}: this git re-creates a reversed deletion without its mode (git 01aff0ae, \
+				 fixed by 1d9a6649 in git 2.50.0); omp is checked against a fixed git's result"
+			);
+			assert!(applied.is_ok(), "{case}: ours {applied:?}");
+			assert!(checked, "{case}");
+			assert!(ours.join("module").is_dir(), "{case}: module is not a directory");
+			assert_eq!(gitlink_snapshot(ours), untouched, "{case}");
+			return;
+		}
 		fs::write(oracle.join(".git/change.patch"), patch).expect("write patch");
 		let mut args = vec!["apply"];
 		if options.cached {
@@ -2795,6 +2846,14 @@ mod tests {
 		);
 		assert_eq!(checked, expected.status.success(), "{case}");
 		assert_eq!(gitlink_snapshot(ours), gitlink_snapshot(oracle), "{case}");
+		if reverses_a_deletion {
+			assert_eq!(
+				gitlink_snapshot(oracle),
+				untouched,
+				"{case}: git's result differs from the one omp is checked against where git has the \
+				 01aff0ae bug"
+			);
+		}
 	}
 
 	#[test]
