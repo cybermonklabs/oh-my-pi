@@ -231,8 +231,9 @@ function writeReply(result: unknown): [status: number, size: number] {
  * full rewrite streams its body in parts to a staging key of its own and
  * swaps it in (see `writeFullStream`), so the body is never one value here;
  * only the check after a failed publish reads the stored copy back whole,
- * one string and then one buffer, as Redis has no chunked read. A read of a
- * whole session is one value too, for the same reason.
+ * one string and then one buffer, as the Redis backend has no chunked read
+ * (`readChunks`): a read of the whole value goes through `readFull`. A read
+ * of a whole session is one value too, for the same reason.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/**
