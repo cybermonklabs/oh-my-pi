@@ -292,8 +292,8 @@ impl NativeSpawner {
 	/// whoever calls this (every external's `poll_wait` and a
 	/// [`Parker`](crate::sys::Parker) do) and wakes `cx`'s task when it can go
 	/// on.
-	pub fn poll_orphans(cx: &Context<'_>) {
-		crate::sys::pump::orphan::poll(cx);
+	pub fn poll_orphans(cx: &Context<'_>, key: &mut crate::sys::WaitKey) {
+		crate::sys::pump::orphan::poll(cx, key);
 	}
 
 	/// Spawn `spec`; see the module docs for the process lifecycle.

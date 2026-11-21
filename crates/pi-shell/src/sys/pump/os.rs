@@ -189,6 +189,9 @@ mod imp {
 		/// made at the first such write.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		room:        RoomSlot,
+		/// Linux: the pump's wait on its room, the end's only writer's.
+		#[cfg(any(target_os = "linux", target_os = "android"))]
+		room_key:    crate::sys::WaitKey,
 		/// Linux, a feed's end: a non-blocking description of the child's
 		/// end, through which [`reclaim`] drains the pipe while the room
 		/// thread finishes its write.
@@ -254,6 +257,8 @@ mod imp {
 				#[cfg(any(target_os = "linux", target_os = "android"))]
 				room: RoomSlot::Unmade,
 				#[cfg(any(target_os = "linux", target_os = "android"))]
+				room_key: crate::sys::WaitKey::default(),
+				#[cfg(any(target_os = "linux", target_os = "android"))]
 				drain: None,
 				file: fs::File::from(fd),
 			})
@@ -280,8 +285,8 @@ mod imp {
 		/// pipe writable whenever any byte fits, while a write of at most
 		/// `PIPE_BUF` bytes is atomic and fails with `EAGAIN` unless all of
 		/// it does, so a writer that waited for `POLLOUT` woke and failed over
-		/// and over. `None` where the end has no room: the write then waits
-		/// for `POLLOUT`.
+		/// and over. `None` where the end has no room, or its room can make no
+		/// thread now (the thread limit): the write then waits for `POLLOUT`.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
 		fn poll_write_pipe(
 			&mut self,
@@ -303,7 +308,7 @@ mod imp {
 				return None;
 			};
 			let file = &self.file;
-			Some(room.poll_write(cx, buf, |b| (&*file).write(b)))
+			room.poll_write(cx, buf, &mut self.room_key, |b| (&*file).write(b))
 		}
 
 		/// See [`super::OsPipe::for_reclaim`].
@@ -323,12 +328,16 @@ mod imp {
 		/// Linux: finish the write of `held` the room thread may have in
 		/// hand, reading what the pipe holds into `back` meanwhile through
 		/// the drain, since that write is made only as the pipe empties; how
-		/// many bytes of `held` the thread made. With no write in hand the
-		/// thread makes one of `held` now, the same way, which changes
-		/// nothing for the bytes given back.
+		/// many bytes of `held` the thread made. It asks with the pump's own
+		/// key, which the write in hand, or its result, belongs to. With no
+		/// write in hand and no result, the thread makes one of `held` now,
+		/// the same way, which changes nothing for the bytes given back;
+		/// where it can make no thread, nothing was in hand and none of
+		/// `held` was made.
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		fn settle(&self, held: &[u8], back: &mut Vec<u8>) -> usize {
-			let (RoomSlot::Made(room), Some(mut drain)) = (&self.room, self.drain.as_ref()) else {
+		fn settle(&mut self, held: &[u8], back: &mut Vec<u8>) -> usize {
+			let Self { room, drain, room_key, .. } = self;
+			let (RoomSlot::Made(room), Some(mut drain)) = (&*room, drain.as_ref()) else {
 				return 0;
 			};
 			if held.is_empty() {
@@ -338,10 +347,10 @@ mod imp {
 			let cx = Context::from_waker(&waker);
 			let mut buf = vec![0u8; 64 << 10];
 			loop {
-				if let Poll::Ready(r) =
-					room.poll_write(&cx, held, |_| Err(io::ErrorKind::WouldBlock.into()))
-				{
-					return r.map_or(0, |n| n.min(held.len()));
+				match room.poll_write(&cx, held, room_key, |_| Err(io::ErrorKind::WouldBlock.into())) {
+					Some(Poll::Ready(r)) => return r.map_or(0, |n| n.min(held.len())),
+					Some(Poll::Pending) => {},
+					None => return 0,
 				}
 				let mut took = false;
 				loop {
@@ -388,10 +397,10 @@ mod imp {
 	/// Linux: a write of `held` the end's room thread may have in hand is
 	/// finished first ([`UnixEnd::settle`]), so the bytes it made come back
 	/// from the pipe, once and in order.
-	pub fn reclaim(pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
+	pub fn reclaim(mut pipe: Option<OsPipe>, mut read: &fs::File, held: &[u8]) -> Vec<u8> {
 		let mut back = Vec::new();
 		#[cfg(any(target_os = "linux", target_os = "android"))]
-		let made = pipe.as_ref().map_or(0, |p| p.0.settle(held, &mut back));
+		let made = pipe.as_mut().map_or(0, |p| p.0.settle(held, &mut back));
 		#[cfg(not(any(target_os = "linux", target_os = "android")))]
 		let made = 0;
 		drop(pipe);
@@ -1610,5 +1619,49 @@ mod write_wait_tests {
 		expected.extend_from_slice(&held);
 		assert_eq!(back.len(), expected.len(), "each byte once");
 		assert!(back == expected, "in order");
+	}
+
+	// Failure mode: where no room thread can be made (`pthread_create` at
+	// the thread limit) a pump write that would wait fails, where the base
+	// waited. It must wait for the pipe to poll writable instead, and be made
+	// once, by the end itself.
+	#[test]
+	fn a_pump_write_waits_for_pollout_where_no_thread_can_be_made() {
+		let (mut ours, mut theirs) = pipe(true).expect("a pump pipe the child reads");
+		let count = Arc::new(Count::default());
+		let waker = Waker::from(Arc::clone(&count));
+		let cx = Context::from_waker(&waker);
+		crate::sys::room::no_thread_on_this_thread(true);
+		let page = [5u8; 4096];
+		let mut put = 0;
+		loop {
+			match ours.poll_write(&cx, &page) {
+				Poll::Ready(Ok(n)) => put += n,
+				Poll::Ready(Err(e)) => panic!("a pump write that waits fails: {e}"),
+				Poll::Pending => break,
+			}
+			assert!(put < 16 << 20, "the pipe never filled");
+		}
+		let mut got = vec![0u8; put];
+		theirs
+			.read_exact(&mut got)
+			.expect("read what the pipe holds");
+		let deadline = Instant::now() + Duration::from_secs(30);
+		let n = loop {
+			match ours.poll_write(&cx, &page) {
+				Poll::Ready(Ok(n)) => break n,
+				Poll::Ready(Err(e)) => panic!("the write that waited: {e}"),
+				Poll::Pending => {
+					assert!(Instant::now() < deadline, "not written within 30 s");
+					std::thread::sleep(Duration::from_millis(1));
+				},
+			}
+		};
+		crate::sys::room::no_thread_on_this_thread(false);
+		assert_eq!(n, page.len());
+		drop(ours);
+		let mut last = Vec::new();
+		theirs.read_to_end(&mut last).expect("read the rest");
+		assert_eq!(last, page, "written by the end itself, once");
 	}
 }

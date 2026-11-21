@@ -23,11 +23,12 @@ use std::{
 
 use parking_lot::Mutex;
 
-use super::Wakers;
+use crate::sys::{WaitKey, Wakers};
 
 type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// The retained work, and the wakers of everyone who polls it.
+/// The retained work, and the waits of everyone who polls it, one per
+/// poller's key.
 struct Orphans {
 	work:   Mutex<Vec<Work>>,
 	wakers: Arc<Wakers>,
@@ -51,17 +52,18 @@ pub fn adopt(work: impl Future<Output = ()> + Send + 'static) {
 	ORPHANS.waker.wake_by_ref();
 }
 
-/// Advance the retained work; `cx`'s task is woken when it can go on. Work
-/// adopted while none is retained wakes nobody: it is adopted while its
-/// adopter is being polled, whose drive loop polls this next.
-pub fn poll(cx: &Context<'_>) {
+/// Advance the retained work; `cx`'s task, waiting by its poller's `key`, is
+/// woken when it can go on. Work adopted while none is retained wakes
+/// nobody: it is adopted while its adopter is being polled, whose drive loop
+/// polls this next.
+pub fn poll(cx: &Context<'_>, key: &mut WaitKey) {
 	let orphans = &*ORPHANS;
 	let mut work = std::mem::take(&mut *orphans.work.lock());
 	if work.is_empty() {
 		return;
 	}
-	// Whether the set was empty does not matter: the work is polled below.
-	let _ = orphans.wakers.add(cx.waker());
+	// Whether no poller waited does not matter: the work is polled below.
+	let _ = orphans.wakers.wait(key, cx.waker());
 	// Polled outside the lock: work finishing here may adopt more.
 	let mut ocx = Context::from_waker(&orphans.waker);
 	work.retain_mut(|w| w.as_mut().poll(&mut ocx).is_pending());
@@ -72,7 +74,7 @@ pub fn poll(cx: &Context<'_>) {
 	};
 	if settled {
 		// Nothing left to wake anyone for: forget the pollers' wakers (they
-		// would keep their tasks alive).
+		// would keep their tasks alive); their keys keep their slots.
 		drop(orphans.wakers.take());
 	}
 }

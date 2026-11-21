@@ -36,16 +36,18 @@ const NOTIFIED: u8 = 2;
 /// woken, an awaited external exits (Linux), or a timeout passes. Only that
 /// thread may [`park`](Parker::park).
 pub struct Parker {
-	bell:  Arc<Bell>,
-	waker: Waker,
+	bell:       Arc<Bell>,
+	waker:      Waker,
+	/// This parker's wait on the retained output work of gone `ExtProc`s.
+	orphan_key: crate::sys::WaitKey,
 	/// Reused per park: the poll set (eventfd first, then the pidfds) and
 	/// the pid of each pidfd.
 	#[cfg(target_os = "linux")]
-	fds:   Vec<libc::pollfd>,
+	fds:        Vec<libc::pollfd>,
 	#[cfg(target_os = "linux")]
-	pids:  Vec<i32>,
+	pids:       Vec<i32>,
 	#[cfg(target_os = "linux")]
-	ready: Vec<Waker>,
+	ready:      Vec<Waker>,
 }
 
 /// The waker's side of a [`Parker`].
@@ -135,6 +137,7 @@ impl Parker {
 		Self {
 			waker: Waker::from(Arc::clone(&bell)),
 			bell,
+			orphan_key: crate::sys::WaitKey::default(),
 			#[cfg(target_os = "linux")]
 			fds: Vec::new(),
 			#[cfg(target_os = "linux")]
@@ -209,8 +212,8 @@ impl Parker {
 
 	/// Advance retained output work of gone `ExtProc`s with this parker's
 	/// waker (no runtime drives it here).
-	fn poll_orphans(&self) {
-		super::pump::orphan::poll(&std::task::Context::from_waker(&self.waker));
+	fn poll_orphans(&mut self) {
+		super::pump::orphan::poll(&std::task::Context::from_waker(&self.waker), &mut self.orphan_key);
 	}
 
 	/// Wake the awaited externals that have exited, without blocking: a
