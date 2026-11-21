@@ -908,9 +908,13 @@ impl DirHandle {
 	///
 	/// A `name` that is not one entry name; the creation's errors (an entry
 	/// that exists already included); on the host, the error of setting the
-	/// masked mode (`ENOTDIR` when something else is at the name by then,
-	/// `EPERM` for a directory another user owns), after which the directory
-	/// stays with the mode it was made with.
+	/// masked mode: `ENOTDIR` when something else is at the name by then, and
+	/// for a directory another user owns a permission error (`EPERM` from the
+	/// mode change, or, where the mode is set without `/proc`, `EACCES` from
+	/// the read-only open of a directory this process may not read). The
+	/// directory at the name then keeps its mode: the one made has the mode
+	/// asked and the owner's read bit, less the process umask; one renamed in
+	/// has its own.
 	pub fn create_dir_at(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
 		let bytes = self.entry(name)?;
 		self.call(

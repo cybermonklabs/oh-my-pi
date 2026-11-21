@@ -507,8 +507,8 @@ pub(crate) fn open_at(
 /// name since `mkdirat` is refused and keeps its mode, and the call fails; a
 /// directory renamed in at the name is not told apart and gets the mode.
 /// When the mode cannot be set, the call fails with that error, and the
-/// directory stays as it was made: `mode` and the owner's bits, less the
-/// process umask.
+/// directory at the name stays as it was: the one made keeps `mode` and the
+/// owner's read bit, less the process umask.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -523,10 +523,11 @@ pub(crate) fn create_dir_at(
 	let mode = mask.map_or(requested, |mask| requested & !mask) as libc::mode_t;
 	// Where `/proc` is not there (and off Linux) the mode is set again
 	// through a descriptor opened to read the directory, which needs the
-	// owner's read and search bits, so the directory is made with the
-	// owner's bits too; through `/proc` the final mode is set all the same.
+	// owner's read bit on it (search is needed on the parent only), so the
+	// directory is made with that bit too; through `/proc` the final mode is
+	// set all the same.
 	let made = if mask.is_some() {
-		mode | libc::S_IRWXU
+		mode | libc::S_IRUSR
 	} else {
 		mode
 	};
