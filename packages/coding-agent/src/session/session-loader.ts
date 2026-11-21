@@ -38,7 +38,7 @@ import {
 	type SessionHeader,
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
-import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
+import { isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
@@ -941,10 +941,6 @@ export async function visitEntriesFromFile(
 	await visitSessionFile(filePath, storage, visit, { throwIfMissing: true });
 }
 
-function hasImageUrl(value: unknown): value is { image_url: string } {
-	return typeof value === "object" && value !== null && "image_url" in value && typeof value.image_url === "string";
-}
-
 /** A persisted blob reference and the field that holds it. */
 interface BlobRefSite {
 	holder: Record<string, unknown>;
@@ -955,15 +951,12 @@ interface BlobRefSite {
 }
 
 /**
- * Collect the blob references in session image blocks and provider image URLs.
- * Snapcompact frames stay as references until context rebuilding selects them.
+ * Collect the blob references in `value`, a node under `key` of its holder,
+ * and below it, wherever persistence externalizes an image and a load resolves
+ * it ({@link resolvedImageSiteOf}). An array's elements sit under the array's
+ * key. Snapcompact frames stay as references until context rebuilding selects them.
  */
 function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string): void {
-	if (key !== "frames" && isExternalizableImagePosition(value, key) && isBlobRef(value.data)) {
-		sites.push({ holder: value, key: "data", ref: value.data, asDataUrl: false });
-		return;
-	}
-
 	if (Array.isArray(value)) {
 		for (const item of value) collectBlobRefSites(item, sites, key);
 		return;
@@ -971,15 +964,23 @@ function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string)
 
 	if (typeof value !== "object" || value === null) return;
 	const holder = value as Record<string, unknown>;
-	if (holder.type === "image_generation_call" && typeof holder.result === "string" && isBlobRef(holder.result)) {
-		sites.push({ holder, key: "result", ref: holder.result, asDataUrl: false });
+	const site = resolvedImageSiteOf(holder, key);
+	const ref = site === undefined ? undefined : holder[site];
+	if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
+		sites.push({ holder, key: site, ref, asDataUrl: false });
+		// An image payload's other fields hold no image.
+		if (site === "data") return;
 	}
 
-	if (hasImageUrl(value) && isBlobRef(value.image_url)) {
-		sites.push({ holder, key: "image_url", ref: value.image_url, asDataUrl: true });
+	for (const childKey in holder) {
+		const child = holder[childKey];
+		if (typeof child !== "string") {
+			collectBlobRefSites(child, sites, childKey);
+		} else if (resolvedImageSiteOf(child, childKey) !== undefined && isBlobRef(child)) {
+			// A provider image's URL: its blob holds the whole data URL.
+			sites.push({ holder, key: childKey, ref: child, asDataUrl: true });
+		}
 	}
-
-	for (const childKey in holder) collectBlobRefSites(holder[childKey], sites, childKey);
 }
 
 /**

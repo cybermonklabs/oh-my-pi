@@ -2999,18 +2999,21 @@ export class SessionManager {
 	}
 
 	/**
-	 * The stored line of `entry`: a cold entry's whole form read back from its
-	 * record, masked with `mask` as a hot entry is ({@link maskSessionEntry}),
-	 * so the store gets the same bytes whether the entry is cold or whole. An
-	 * `entry_patch` record stays one line, each of its patches masked by the
-	 * rules of the entry this manager holds under its id
-	 * ({@link maskEntryPatchRecord}).
+	 * The stored line of `entry`, without its patches when `withoutPatches`: a
+	 * cold entry's whole form read back from its record, masked with `mask` in
+	 * that form, so the store gets the same bytes whether the entry is cold or
+	 * whole ({@link maskSessionEntry}). An `entry_patch` record stays one line,
+	 * each of its patches masked by the rules of the entry this manager holds
+	 * under its id ({@link maskEntryPatchRecord}).
 	 */
-	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
-		const source = coldEntryForPersistence(entry) ?? entry;
+	#lineFor(entry: FileEntry, mask = this.storeMask(), withoutPatches = false): string {
+		const record = coldEntryForPersistence(entry);
+		const read = record ?? entry;
+		const source = withoutPatches ? withoutEntryPatches(read) : read;
+		const form = record === undefined ? "live" : "record";
 		const masked = isEntryPatchRecord(source)
-			? maskEntryPatchRecord(source, this.#index, mask)
-			: maskSessionEntry(source, mask);
+			? maskEntryPatchRecord(source, this.#index, mask, form)
+			: maskSessionEntry(source, mask, form);
 		return `${stringifyJson(prepareEntryForPersistence(masked, this.#blobs)) ?? "null"}\n`;
 	}
 
@@ -3149,8 +3152,7 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const entry = entries[index]!;
-					const line = manager.#lineFor(withoutEntryPatches(coldEntryForPersistence(entry) ?? entry), mask);
+					const line = manager.#lineFor(entries[index]!, mask, true);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
 					bytesSinceGc += lineBytes;

@@ -21,6 +21,8 @@ const TEXT_CONTENT_KEY = "content";
  *  generic string truncation, which appends {@link TRUNCATION_NOTICE} and
  *  corrupts the base64 the provider decodes on resume. */
 const SNAPCOMPACT_FRAMES_KEY = "frames";
+/** Key of a provider image's URL (OpenAI `input_image`, computer-use screenshot); a data URL there is one blob. */
+const IMAGE_URL_KEY = "image_url";
 
 function truncateString(value: string, maxLength: number): string {
 	if (value.length <= maxLength) return value;
@@ -68,10 +70,9 @@ export function isImageDataPayload(value: unknown): value is { data: string; mim
  * True when an image payload sits in a persistence position whose base64 is
  * externalized to the blob store instead of truncated as a generic string: a
  * `content` image block, an `images[]` entry, or a snapcompact frame under
- * `frames[]`. The eager load path uses the same position check but deliberately
- * leaves snapcompact frames as references for lazy context rebuilding.
+ * `frames[]`.
  */
-export function isExternalizableImagePosition(
+function isExternalizableImagePosition(
 	value: unknown,
 	key: string | undefined,
 ): value is { data: string; mimeType?: string } {
@@ -79,44 +80,79 @@ export function isExternalizableImagePosition(
 	return (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images" || key === SNAPCOMPACT_FRAMES_KEY;
 }
 
-function shouldExternalizeImagePayload(
-	value: unknown,
-	key: string | undefined,
-): value is { data: string; mimeType?: string } {
-	if (!isExternalizableImagePosition(value, key)) return false;
-	if (isBlobRef(value.data) || value.data.length < BLOB_EXTERNALIZE_THRESHOLD) return false;
-	return true;
-}
+/**
+ * Where a node of a session entry holds an image ({@link imageSiteOf}): `data`
+ * or `result`, the field of an object node that holds the image's base64; or
+ * `image_url`, a string node that is itself the image's URL, of which a data
+ * URL is stored whole.
+ */
+export type ImageSite = "data" | "result" | typeof IMAGE_URL_KEY;
 
 /**
- * The node a persisted line holds for `value` when `value` is an image payload
- * it externalizes (an `image_url` data URL, a generated image, a positioned
- * image payload; see {@link isExternalizableImagePosition}), with the payload
- * replaced by its blob reference; undefined for any other value.
+ * Where `value`, a node under `key` of its holder (an array element under its
+ * array's key, at any depth), holds an image: the `data` of an image payload at
+ * an image position ({@link isExternalizableImagePosition}), the `result` of a
+ * generated image (`type: "image_generation_call"`), or `value` itself, a
+ * string under `image_url`. The one rule by which persistence writes an image
+ * to the blob store and its blob reference in its place, a load resolves that
+ * reference ({@link resolvedImageSiteOf}), and store masking keeps it.
  */
-function externalizeImageNode(value: unknown, blobStore: BlobStore, key: string | undefined): unknown {
-	if (typeof value === "string") {
-		return key === "image_url" && isImageDataUrl(value)
-			? externalizeImageDataUrlSync(blobStore, value, { mirror: true })
-			: undefined;
-	}
+function imageSiteOf(value: unknown, key: string | undefined): ImageSite | undefined {
+	if (typeof value === "string") return key === IMAGE_URL_KEY ? IMAGE_URL_KEY : undefined;
 	if (typeof value !== "object" || value === null) return undefined;
-	if (
+	if (isExternalizableImagePosition(value, key)) return "data";
+	const generated =
 		"type" in value &&
 		value.type === "image_generation_call" &&
 		"result" in value &&
-		typeof value.result === "string" &&
-		!isBlobRef(value.result) &&
-		value.result.length >= BLOB_EXTERNALIZE_THRESHOLD
-	) {
-		return { ...value, result: externalizeImagePayloadSync(blobStore, value, value.result, undefined, true) };
+		typeof value.result === "string";
+	return generated ? "result" : undefined;
+}
+
+/**
+ * The {@link imageSiteOf} site of `value` whose blob reference a load resolves:
+ * every site but a snapcompact frame's, which stays a reference until context
+ * rebuilding draws the frame (`lazyImageDataSync`).
+ */
+export function resolvedImageSiteOf(value: unknown, key: string | undefined): ImageSite | undefined {
+	const site = imageSiteOf(value, key);
+	return site === "data" && key === SNAPCOMPACT_FRAMES_KEY ? undefined : site;
+}
+
+/**
+ * The {@link imageSiteOf} site of `value` whose image a persisted line
+ * externalizes: a data URL, or base64 that is no blob reference yet and at
+ * least {@link BLOB_EXTERNALIZE_THRESHOLD} long (a smaller image stays inline).
+ */
+function externalizedImageSite(value: unknown, key: string | undefined): ImageSite | undefined {
+	const site = imageSiteOf(value, key);
+	if (site === undefined) return undefined;
+	const image = typeof value === "string" ? value : (value as Record<string, unknown>)[site];
+	if (typeof image !== "string") return undefined;
+	if (site === IMAGE_URL_KEY) return isImageDataUrl(image) ? site : undefined;
+	return isBlobRef(image) || image.length < BLOB_EXTERNALIZE_THRESHOLD ? undefined : site;
+}
+
+/**
+ * The node a persisted line holds for `value` when it externalizes the image
+ * `value` holds ({@link externalizedImageSite}), with the image replaced by its
+ * blob reference; undefined for any other value.
+ */
+function externalizeImageNode(value: unknown, blobStore: BlobStore, key: string | undefined): unknown {
+	const site = externalizedImageSite(value, key);
+	if (site === undefined) return undefined;
+	if (typeof value === "string") return externalizeImageDataUrlSync(blobStore, value, { mirror: true });
+	if (site === "result") {
+		const generated = value as { result: string };
+		return {
+			...generated,
+			result: externalizeImagePayloadSync(blobStore, generated, generated.result, undefined, true),
+		};
 	}
-	if (shouldExternalizeImagePayload(value, key)) {
-		// A snapcompact frame never goes to the tier: its archive's text draws it again.
-		const mirror = key !== SNAPCOMPACT_FRAMES_KEY;
-		return { ...value, data: externalizeImagePayloadSync(blobStore, value, value.data, value.mimeType, mirror) };
-	}
-	return undefined;
+	const payload = value as { data: string; mimeType?: string };
+	// A snapcompact frame never goes to the tier: its archive's text draws it again.
+	const mirror = key !== SNAPCOMPACT_FRAMES_KEY;
+	return { ...payload, data: externalizeImagePayloadSync(blobStore, payload, payload.data, payload.mimeType, mirror) };
 }
 
 /** True for a non-empty string — marks signature/encrypted fields whose block must persist verbatim. */
@@ -366,8 +402,7 @@ function persistenceNodeNeedsRewrite(obj: unknown, key?: string): boolean {
 			key !== "textSignature"
 		)
 			return true;
-		if (key === "image_url" && isImageDataUrl(obj)) return true;
-		return false;
+		return externalizedImageSite(obj, key) !== undefined;
 	}
 	if (Array.isArray(obj)) {
 		for (const item of obj) {
@@ -384,19 +419,7 @@ function persistenceNodeNeedsRewrite(obj: unknown, key?: string): boolean {
 		if ("jsonlEvents" in obj) return true;
 		// Externalize shapes rewrite (not verbatim): check before the
 		// atomic/verbatim classification below.
-		if (typeof obj === "object" && "type" in obj) {
-			const typed = obj as Record<string, unknown>;
-			if (
-				typed.type === "image_generation_call" &&
-				"result" in typed &&
-				typeof typed.result === "string" &&
-				!isBlobRef(typed.result) &&
-				typed.result.length >= BLOB_EXTERNALIZE_THRESHOLD
-			) {
-				return true;
-			}
-		}
-		if (shouldExternalizeImagePayload(obj, key)) return true;
+		if (externalizedImageSite(obj, key) !== undefined) return true;
 		if (isAtomicPersistenceNode(obj, key)) return false;
 		for (const childKey in obj) {
 			if (!Object.hasOwn(obj, childKey)) continue;

@@ -45,7 +45,13 @@ import type { AssistantRetryRecovery, ContextSnapshot, Message } from "@oh-my-pi
 import { cloneJsonTree, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import type { CustomEntry, CustomMessageEntry, FileEntry, SessionEntry } from "./session-entries";
-import { maskEntryFields, maskMessageFields, maskSessionEntry, maskStoredData } from "./session-entry-mask";
+import {
+	type MaskedForm,
+	maskEntryFields,
+	maskMessageFields,
+	maskSessionEntry,
+	maskStoredData,
+} from "./session-entry-mask";
 
 export const ENTRY_PATCH_CUSTOM_TYPE = "entry_patch";
 
@@ -378,27 +384,28 @@ function maskFields<T extends object>(value: T, maskField: (key: string, field: 
 }
 
 /**
- * `record`, an `entry_patch` record, as the store holds it under `mask`; the
- * live record keeps its values. Its own fields are masked as every entry's
- * are ({@link maskSessionEntry}). Each patch is masked as its fields are in
- * the stored line of the entry it names, found in `targets`: that entry's
- * `type` and its message's `role`, which a cold entry keeps in memory, choose
- * the rules, so a signed block whose text masking changes loses its signature
- * as it does there, a field that entry keeps stays as written, and `entryId`
- * is kept. A patch naming an entry `targets` lacks (one an atomic batch
- * rolled back) has no such rules: masked as free data, it is left out of the
- * stored record when masking changes it, so no masked text is stored beside
- * its signature. Any other field of the data is masked as free data, and data
- * of another shape as any `custom` entry's is.
+ * `record`, an `entry_patch` record read in `form`, as the store holds it
+ * under `mask`; the live record keeps its values. Its own fields are masked as
+ * every entry's are ({@link maskSessionEntry}). Each patch is masked as its
+ * fields are in the stored line of the entry it names, found in `targets`:
+ * that entry's `type` and its message's `role`, which a cold entry keeps in
+ * memory, choose the rules, so a signed block whose text masking changes loses
+ * its signature as it does there, a field that entry keeps stays as written,
+ * and `entryId` is kept. A patch naming an entry `targets` lacks (one an
+ * atomic batch rolled back) has no such rules: masked as free data, it is left
+ * out of the stored record when masking changes it, so no masked text is
+ * stored beside its signature. Any other field of the data is masked as free
+ * data, and data of another shape as any `custom` entry's is.
  */
 export function maskEntryPatchRecord(
 	record: CustomEntry,
 	targets: EntryPatchTargets,
 	mask: SessionStoreMask | null,
+	form: MaskedForm = "live",
 ): CustomEntry {
 	if (mask === null || mask.empty) return record;
 	const data = record.data;
-	if (!isEntryPatchData(data)) return maskSessionEntry(record, mask);
+	if (!isEntryPatchData(data)) return maskSessionEntry(record, mask, form);
 	let patches: EntryPatch[] | undefined;
 	for (let index = 0; index < data.patches.length; index++) {
 		const patch = data.patches[index]!;
@@ -408,13 +415,13 @@ export function maskEntryPatchRecord(
 			masked = maskFields(patch, (key, value) => {
 				// Kept, as the entry's own `id` is.
 				if (key === "entryId") return value;
-				if (key === "entry") return maskEntryFields(value, target.type, mask);
+				if (key === "entry") return maskEntryFields(value, target.type, mask, form);
 				if (key === "message" && target.type === "message") {
-					return maskMessageFields(value, target.message.role, mask);
+					return maskMessageFields(value, target.message.role, mask, form);
 				}
-				return maskStoredData(value, mask);
+				return maskStoredData(value, mask, form);
 			});
-		} else if (maskStoredData(patch, mask) === patch) {
+		} else if (maskStoredData(patch, mask, form) === patch) {
 			masked = patch;
 		}
 		if (patches === undefined) {
@@ -424,11 +431,11 @@ export function maskEntryPatchRecord(
 		if (masked !== undefined) patches.push(masked);
 	}
 	const maskedData = maskFields(data, (key, value) =>
-		key === "patches" ? (patches ?? value) : maskStoredData(value, mask),
+		key === "patches" ? (patches ?? value) : maskStoredData(value, mask, form),
 	);
 	// The record's own fields; its data is masked above.
 	const fields = { ...record, data: NO_PATCHES };
-	const maskedFields = maskSessionEntry(fields, mask);
+	const maskedFields = maskSessionEntry(fields, mask, form);
 	if (maskedFields === fields && maskedData === data) return record;
 	return { ...maskedFields, data: maskedData };
 }
