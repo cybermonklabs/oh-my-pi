@@ -793,10 +793,14 @@ fn rename(
 			)));
 		}
 
-		// numbered-backup probing goes through the injected filesystem. A
-		// numbered backup is renamed without replacing, as GNU mv renames it,
-		// and one whose name, cut to fit, is the source is refused as one
-		// that is the source's by name: the rename would replace it.
+		// numbered-backup probing goes through the injected filesystem. GNU mv
+		// renames a numbered backup without replacing and fails when an entry
+		// holds a long name's `~` fallback; here `backup_path` refuses that
+		// name after an lstat (`exclusive`), and the rename below then
+		// replaces whatever is there, as a simple backup's does. A backup
+		// whose entry is the source's own is refused: the rename would
+		// replace the source. Another hard link of the source is another
+		// entry and is replaced, as GNU mv replaces it.
 		backup = backup_path(&filesystem, opts.backup, &to_fs, &opts.suffix, true)
 			.map_err(|_| io::Error::other(MvError::CannotBackup(to.quote().to_string())))?;
 		if let Some(backup) = &backup

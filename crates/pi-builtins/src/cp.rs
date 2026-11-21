@@ -39,7 +39,7 @@ use uucore::{
 
 use crate::{
 	file_backup::{
-		backup_display, backup_path, determine_backup_mode, determine_backup_suffix,
+		backup_display, backup_is_source, backup_path, determine_backup_mode, determine_backup_suffix,
 		source_is_destination_backup,
 	},
 	host::{Host, Utility, format_usage, matches_parser, strip_errno},
@@ -2038,13 +2038,18 @@ fn handle_existing_dest(
 		)));
 	}
 	let mut is_dest_removed = false;
-	// A numbered backup is renamed without replacing, as GNU cp renames it.
+	// GNU cp renames a numbered backup without replacing and fails when an
+	// entry holds a long name's `~` fallback; here `backup_path` refuses that
+	// name after an lstat (`exclusive`), and `backup_dest` then renames with
+	// replacement, as for a simple backup.
 	let backup = backup_path(&filesystem, options.backup, &dest_fs, &options.backup_suffix, true)
 		.map_err(|_| CpError::Error(format!("cannot backup {}: File exists", dest.quote())))?;
 	if let Some(backup) = &backup {
-		// Any backup name that is the source itself, as the `~` name a long
-		// name gives way to can be, would destroy it too.
-		if paths_refer_to_same_file(&filesystem, &source_fs, backup, true) {
+		// A backup whose entry is the source's own, or the one it resolves
+		// to when cp follows it, would replace what cp is about to read.
+		// Another hard link of the source is another entry and is replaced,
+		// as GNU cp replaces it.
+		if backup_is_source(&filesystem, &source_fs, options.dereference(source_in_command_line), backup) {
 			return Err(CpError::Error(format!(
 				"backing up {} might destroy source;  {} not copied",
 				dest.quote(),

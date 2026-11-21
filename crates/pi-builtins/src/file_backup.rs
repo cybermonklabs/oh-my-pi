@@ -345,14 +345,34 @@ pub(crate) fn source_is_destination_backup(
 	same_file(filesystem, from, follow_from, &with_file_name(to, &backup_name), true)
 }
 
-/// Whether making the backup `backup` would replace the source `source`
-/// (followed when `follow_source`): the rename that makes it replaces the
-/// entry at `backup`, and that entry is the source's, as a long name's `~`
-/// fallback can be. Decided as [`source_is_destination_backup`] decides,
-/// with `backup` not followed.
-#[cfg(any(feature = "util.ln", feature = "util.mv"))]
+/// Whether making the backup `backup` would replace the source `source`:
+/// the rename that makes the backup replaces the entry at `backup`, and the
+/// source is lost only when that entry is the source's own (a long name's
+/// `~` fallback, or `ln -b dest~ dest`, can be) or, when the source is
+/// followed (`follow_source`), the entry it resolves to. Another hard link
+/// of the source is another entry: replacing it leaves the source, as GNU's
+/// mv, cp and ln leave it. Entries are compared as GNU's `same_nameat`
+/// compares them, by name and directory ([`same_entry`]).
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
 pub(crate) fn backup_is_source(filesystem: &BlockingFs, source: &Path, follow_source: bool, backup: &Path) -> bool {
-	same_file(filesystem, source, follow_source, backup, false)
+	same_entry(filesystem, source, backup)
+		|| (follow_source
+			&& filesystem
+				.canonicalize(source)
+				.is_ok_and(|resolved| same_entry(filesystem, &resolved, backup)))
+}
+
+/// Whether `a` and `b` name the same directory entry: the same name in the
+/// same directory, the directories compared as [`same_file`] compares files.
+/// Directories cannot be hard links, so that is one entry.
+#[cfg(any(feature = "util.cp", feature = "util.ln", feature = "util.mv"))]
+fn same_entry(filesystem: &BlockingFs, a: &Path, b: &Path) -> bool {
+	match (file_name(a), file_name(b)) {
+		(Some(a_name), Some(b_name)) if a_name == b_name => {
+			same_file(filesystem, backup_dir(a), true, backup_dir(b), true)
+		},
+		_ => false,
+	}
 }
 
 /// Whether `a` and `b`, each followed when its flag says so, are the same
