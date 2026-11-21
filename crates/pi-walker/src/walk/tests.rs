@@ -351,8 +351,9 @@ async fn walks_end_when_a_waiting_worker_misses_a_wakeup() {
 		assert_eq!(visited.len(), 12, "walk {round}");
 		complete += 1;
 	}
-	// The 30 s limit catches the hang on every walk that runs; the floor only
-	// fails a run in which almost no walk could open its directories.
+	// The 30 s limit catches the hang on every walk that runs; the floor
+	// fails a run in which more than 1,000 of the 20,000 walks could not open
+	// their root or a directory.
 	assert!(
 		complete >= 19_000,
 		"{complete} of 20,000 walks complete, fewer than 19,000; {root_failed} could not open the \

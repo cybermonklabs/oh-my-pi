@@ -131,10 +131,11 @@ where
 				let mut state = Some(state);
 				// flume 0.12's `recv_async` can lose a wakeup: a worker woken
 				// for a job another worker took misses a job sent while it
-				// waits again (zesterer/flume#177). Here that delays the
-				// missed job and never strands it. A receive takes a queued
-				// job before it waits, so the next worker to come back takes
-				// it, and the next send wakes the waiting worker. The worker
+				// re-registers to wait (zesterer/flume#177). This pool's jobs
+				// do not wait on one another, so here that delays the missed
+				// job and never strands it. A receive takes a queued job
+				// before it waits, so the next worker to come back takes it,
+				// and the next send wakes the waiting worker. The worker
 				// that took the job this one was woken for comes back after
 				// it, unless that job panicked or the consumer is gone. If
 				// every other job panicked, the consumer reaches a panicked
