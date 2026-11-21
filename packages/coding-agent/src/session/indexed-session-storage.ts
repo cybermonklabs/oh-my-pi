@@ -766,11 +766,12 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * The body of a full rewrite of `lines` that has no spool: measured now
 	 * ({@link measureLines}), and read from the lines again when it publishes,
 	 * through the backend's streamed write ({@link streamLines}), so it is
-	 * never one value; a backend without one cannot take it. A publish that
-	 * fails replaces nothing, and is logged as an error naming the session,
-	 * the path and the cause, besides failing the write as any publish does;
-	 * the next full rewrite tries the spool, and this, again. A refusal the
-	 * caller resolves (a size conflict, a lost claim) is not logged.
+	 * never one value; a backend without one cannot take it, and its rewrite
+	 * fails without reading the stored copy back. A publish that fails
+	 * replaces nothing, and is logged as an error naming the session, the path
+	 * and the cause, besides failing the write as any publish does; the next
+	 * full rewrite tries the spool, and this, again. A refusal the caller
+	 * resolves (a size conflict, a lost claim) is not logged.
 	 */
 	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
 		const measured = measureLines(lines);
@@ -802,8 +803,10 @@ export class IndexedSessionStorage implements SessionStorage {
 					throw err;
 				}
 			},
-			// Compared by size and SHA-256, chunk by chunk, with what the lines measured.
+			// Compared by size and SHA-256, chunk by chunk, with what the lines measured. A backend
+			// without a streamed write was handed nothing, so nothing it holds is this write's: no read.
 			isStored: async () => {
+				if (!this.#backend.writeFullStream) return false;
 				const stored = await digestStream(this.#backendChunks(path, 0));
 				return stored.bytes === measured.bytes && stored.hash === measured.hash;
 			},

@@ -8,8 +8,8 @@
  * its caller sees it, logs an error naming the session, the path and the
  * cause, and leaves the stored copy whole; the next rewrite tries again. A
  * store whose backend has no streamed write fails such a rewrite rather than
- * join it. A throw from the lines themselves is no spool failure, and fails
- * the rewrite as it is.
+ * join it, and reads nothing back to check it. A throw from the lines
+ * themselves is no spool failure, and fails the rewrite as it is.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -23,6 +23,7 @@ import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/sessi
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { rejectionOf } from "../helpers/rejection";
 
 /** Root ignores directory permissions, so a read-only directory cannot be made for it. */
 const RUNS_AS_ROOT = process.getuid?.() === 0;
@@ -127,10 +128,14 @@ function tmpdirUnderRegularFile(tmp: TempDir): void {
 	process.env.TMPDIR = tmp.join("not-a-directory", "tmp");
 }
 
-/** A backend that keeps each session's text in memory and has no streamed full write; it records each `writeFull` body's length. */
+/**
+ * A backend that keeps each session's text in memory and has no streamed full
+ * write; it records each `writeFull` body's length and each path `readFull` reads.
+ */
 class NoStreamBackend implements SessionStorageBackend {
 	readonly sessions = new Map<string, string>();
 	readonly writeFullBytes: number[] = [];
+	readonly readFullPaths: string[] = [];
 
 	init(): Promise<void> {
 		return Promise.resolve();
@@ -139,6 +144,7 @@ class NoStreamBackend implements SessionStorageBackend {
 		return Promise.resolve([]);
 	}
 	readFull(path: string): Promise<string | null> {
+		this.readFullPaths.push(path);
 		return Promise.resolve(this.sessions.get(path) ?? null);
 	}
 	readSlices(): Promise<[string, string]> {
@@ -167,14 +173,6 @@ class NoStreamBackend implements SessionStorageBackend {
 	move(): Promise<void> {
 		return Promise.resolve();
 	}
-}
-
-/** What `promise` settles with: undefined when it resolves, the reason when it rejects. */
-function failureOf(promise: Promise<unknown>): Promise<unknown> {
-	return promise.then(
-		() => undefined,
-		(err: unknown) => err,
-	);
 }
 
 describe("SQL session storage full rewrites when the spool cannot be used", () => {
@@ -349,9 +347,9 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			const expectedSize = Buffer.byteLength(before);
 
 			storage.writeLinesSync(SYNC_FILE, changing, { expectedSize });
-			const syncFailure = await failureOf(storage.drain());
+			const syncFailure = await rejectionOf(storage.drain());
 			reads = 0;
-			const atomicFailure = await failureOf(storage.writeLinesAtomic(ATOMIC_FILE, changing, { expectedSize }));
+			const atomicFailure = await rejectionOf(storage.writeLinesAtomic(ATOMIC_FILE, changing, { expectedSize }));
 
 			expect({
 				syncFailed: syncFailure instanceof Error,
@@ -393,8 +391,8 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		backend.writeFullBytes.length = 0;
 
 		storage.writeLinesSync(SYNC_FILE, sessionLines("written by writeLinesSync"), { expectedSize });
-		const syncFailure = await failureOf(storage.drain());
-		const atomicFailure = await failureOf(
+		const syncFailure = await rejectionOf(storage.drain());
+		const atomicFailure = await rejectionOf(
 			storage.writeLinesAtomic(ATOMIC_FILE, sessionLines("written by writeLinesAtomic"), { expectedSize }),
 		);
 
@@ -414,5 +412,36 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			expect.objectContaining({ session: ID, path: SYNC_FILE }),
 			expect.objectContaining({ session: ID, path: ATOMIC_FILE }),
 		]);
+	});
+
+	// If this regresses, every atomic rewrite on a backend without a streamed write reads the whole
+	// stored transcript back into memory while the spool cannot be used, to check a write that never
+	// ran, and one over a stored copy with the same bytes reports itself stored without being written.
+	it("fails an atomic rewrite on a backend without a streamed write without reading the stored copy back", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		tmpdirUnderRegularFile(tmp);
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(logger, "error").mockImplementation(() => {});
+		const backend = new NoStreamBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const lines = sessionLines("already stored");
+		const stored = lines.join("");
+		await storage.writeText(ATOMIC_FILE, stored);
+		backend.readFullPaths.length = 0;
+
+		const failure = await rejectionOf(
+			storage.writeLinesAtomic(ATOMIC_FILE, lines, { expectedSize: Buffer.byteLength(stored) }),
+		);
+
+		expect({
+			failure: String(failure),
+			readFullPaths: backend.readFullPaths,
+			stored: backend.sessions.get(ATOMIC_FILE),
+		}).toEqual({
+			failure: expect.stringContaining("no streamed full write"),
+			readFullPaths: [],
+			stored,
+		});
 	});
 });

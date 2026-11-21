@@ -210,13 +210,23 @@ function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefine
 }
 
 /**
+ * The conflict a write script reports as `{0, actual}`: `actual` is the
+ * session's byte length, or -1 when it has none; a reply that carries no
+ * number there (NaN) reads as none too.
+ */
+function sizeConflict(path: string, expectedSize: number | null, actual: number): SessionWriteConflictError {
+	return new SessionWriteConflictError(path, expectedSize, actual === -1 || !Number.isFinite(actual) ? null : actual);
+}
+
+/**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
  * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
  * single sibling HASH. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
  * `listFilesSync` calls remain available without mirroring full content. A
  * full rewrite streams in parts to a staging key of its own and swaps it in
- * (see `writeFullStream`), so the transcript is never one value here.
+ * (see `writeFullStream`), so a full rewrite's body is never one value here;
+ * a read still is, as Redis has no chunked read.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/**
@@ -323,9 +333,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		if (expectedSize === undefined) return;
 		const written = Array.isArray(result) && Number(result[0]) === 1;
 		if (written) return;
-		const encodedActual = Array.isArray(result) ? Number(result[1]) : Number.NaN;
-		const actualSize = encodedActual === -1 ? null : Number.isFinite(encodedActual) ? encodedActual : null;
-		throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		throw sizeConflict(path, expectedSize, Array.isArray(result) ? Number(result[1]) : Number.NaN);
 	}
 
 	/**
@@ -382,7 +390,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		}
 		const [status, size] = Array.isArray(result) ? result.map(Number) : [Number.NaN, Number.NaN];
 		if (status === 1) return;
-		if (status === 0) throw new SessionWriteConflictError(path, expectedSize ?? null, size === -1 ? null : size);
+		if (status === 0) throw sizeConflict(path, expectedSize ?? null, size);
 		throw new Error(
 			`RedisSessionStorage: the staging key of a full write of ${path} held ${size} bytes, not ${byteLength}`,
 		);
