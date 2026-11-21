@@ -58,6 +58,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	bash::{EnvView, FdRef, FileKind, NativeRef, OsHandle, Signal, Task},
 	git::flag_on,
+	sys::WaitKey,
 	tools::ToolConfig,
 };
 
@@ -290,14 +291,19 @@ impl fmt::Debug for FdHandle {
 
 #[async_trait::async_trait]
 impl pi_vfs::FileHandle for FdHandle {
+	/// The extra's thread waits apart from the engine and any other task
+	/// waiting on the same object: its own key, which this future holds and
+	/// frees when the read ends or is dropped.
 	async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
 		let fd = self.fd()?;
-		std::future::poll_fn(|cx| fd.poll_read(cx, buf)).await
+		let mut key = WaitKey::default();
+		std::future::poll_fn(|cx| fd.poll_read_keyed(cx, buf, &mut key)).await
 	}
 
 	/// A zero-length write never waits: it fails only as a write would (an
 	/// engine pipe with no reader left is `BrokenPipe`), which is how an
 	/// extra asks whether its reader is gone (`OpenFile::reader_gone`).
+	/// Other writes wait with a key of their own, as [`Self::read`].
 	async fn write(&self, buf: &[u8]) -> io::Result<usize> {
 		let fd = self.fd()?;
 		if buf.is_empty() {
@@ -306,7 +312,8 @@ impl pi_vfs::FileHandle for FdHandle {
 				Poll::Pending => Ok(0),
 			};
 		}
-		std::future::poll_fn(|cx| fd.poll_write(cx, buf)).await
+		let mut key = WaitKey::default();
+		std::future::poll_fn(|cx| fd.poll_write_keyed(cx, buf, &mut key)).await
 	}
 
 	async fn seek(&self, pos: SeekFrom) -> io::Result<u64> {

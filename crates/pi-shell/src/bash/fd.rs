@@ -280,6 +280,45 @@ impl FdRef {
 		}
 	}
 
+	/// [`Self::poll_read`] for a host task that may wait beside the engine
+	/// and other tasks on this object: `key`, which the task's future holds,
+	/// keeps its wait apart ([`File::poll_read_keyed`]).
+	pub fn poll_read_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_read_keyed(cx, buf, key),
+			None => Poll::Ready(Ok(0)),
+		}
+	}
+
+	/// [`Self::poll_write`] for a host task that may wait beside others, as
+	/// [`Self::poll_read_keyed`].
+	pub fn poll_write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.write_keyed(cx, bytes, None, key)
+	}
+
+	fn write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_keyed(cx, bytes, tag, key),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
 	/// Attribute successful visible writes to `tag` using a trace-only heap
 	/// wrapper. Non-observed handles are returned unchanged; retagging
 	/// replaces rather than nests wrappers. Shared-description identity,
@@ -429,6 +468,27 @@ impl File for TaggedOutput {
 		self
 			.base
 			.poll_write_tagged(cx, bytes, tag.unwrap_or(self.tag))
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.base.poll_read_keyed(cx, bytes, key)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self
+			.base
+			.write_keyed(cx, bytes, Some(tag.unwrap_or(self.tag)), key)
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
