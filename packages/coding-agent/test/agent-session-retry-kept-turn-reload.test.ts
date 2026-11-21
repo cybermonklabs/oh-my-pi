@@ -485,17 +485,33 @@ describe("a kept and continued turn in the context rebuilt from the session file
 	});
 
 	describe.each([
-		{ cut: "a cut stream", frame: OVERLOADED_FRAME, retried: false },
-		{ cut: "a rate limit", frame: RATE_LIMIT_FRAME, retried: true },
-	])("a turn $cut ended after its text", ({ frame, retried }) => {
-		const cutTurn = { stream: MESSAGE_START_FRAME + TEXT_FRAMES + frame };
+		{
+			cut: "a cut stream",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, OVERLOADED_FRAME),
+			retried: false,
+		},
+		{
+			cut: "a rate limit",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, RATE_LIMIT_FRAME),
+			retried: true,
+		},
+		{
+			cut: "a malformed call",
+			primary: (turns: PrimaryTurn[]) => {
+				sessions.authStorage.keys.setRuntime("google", "google-test-key");
+				return geminiPrimary(turns);
+			},
+			retried: false,
+		},
+	])("a turn $cut ended after its text", ({ primary, retried }) => {
 		const keptConversation = ["user", `assistant[text:${FIRST_TEXT}]`, `assistant[text:${CONTINUED_TEXT}]`];
 
 		// The marker changes nothing on screen: after a reload the transcript
-		// draws the kept turn as it drew it live (a cut stream as its error, a
-		// rate limit as the retried note).
+		// draws the kept turn as it drew it live (a cut stream or a malformed
+		// call as its error, a rate limit as the retried note).
 		it("is drawn after a reload as it was drawn live", async () => {
-			const result = await runAndReopen([cutTurn, { stream: CONTINUED_ANSWER }]);
+			const { answers, options } = primary([CUT, CONTINUED_TEXT]);
+			const result = await runAndReopen(answers, options);
 			const live = failedTurn(sessions.drawnTurns(result.session));
 			const reloaded = failedTurn(result.reopened.buildSessionContext({ transcript: true }).messages);
 			if (!live || !reloaded) throw new Error("Expected the kept turn live and in the reloaded transcript");
@@ -510,10 +526,11 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		// Regression: after a resume, the next request no longer carries the
 		// first half of the answer the continuation finished.
 		it("is sent to the model again after a resume", async () => {
-			const result = await runAndReopen([cutTurn, { stream: CONTINUED_ANSWER }]);
-			sessions.answers = [{ stream: answer(FRESH_TEXT) }];
+			const { answers, options } = primary([CUT, CONTINUED_TEXT, FRESH_TEXT]);
+			const result = await runAndReopen(answers, options);
 			// The resume builds the live context from the file, as the CLI's `--resume` does.
 			const resumed = await sessions.startSession(result.reopened, {
+				...options,
 				messages: result.reopened.buildSessionContext().messages,
 			});
 
@@ -532,14 +549,13 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		// The earlier answer is long and the kept-recent budget small, so the
 		// cut falls on the prompt of the kept turn.
 		it("stays in the kept region of a compaction after its continuation", async () => {
-			const result = await runAndReopen(
-				[{ stream: answer("An earlier answer. ".repeat(1_500)) }, cutTurn, { stream: CONTINUED_ANSWER }],
-				{
-					prompts: ["An earlier question", "Answer in two parts"],
-					settings: { "compaction.keepRecentTokens": 2_000 },
-					compactionSummary: "The earlier question was answered.",
-				},
-			);
+			const { answers, options } = primary(["An earlier answer. ".repeat(1_500), CUT, CONTINUED_TEXT]);
+			const result = await runAndReopen(answers, {
+				...options,
+				prompts: ["An earlier question", "Answer in two parts"],
+				settings: { "compaction.keepRecentTokens": 2_000 },
+				compactionSummary: "The earlier question was answered.",
+			});
 
 			await result.session.compact();
 
