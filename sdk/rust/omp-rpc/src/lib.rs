@@ -8,6 +8,7 @@
 #[rustfmt::skip]
 pub mod wire;
 pub mod client;
+mod deep;
 mod frame;
 pub mod host_tool;
 pub mod host_uri;

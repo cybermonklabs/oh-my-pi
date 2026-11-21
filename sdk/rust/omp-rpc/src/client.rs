@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
+	deep::{self, dispose},
 	frame::{FrameDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES},
 	host_tool::{HostTool, HostToolContext, text_payload},
 	host_uri::{HostUri, HostUriContext, uri_scheme},
@@ -369,7 +370,7 @@ impl Shared {
 			if text.is_empty() {
 				continue;
 			}
-			let raw: Value = match serde_json::from_slice(text) {
+			let raw: Value = match deep::parse(text) {
 				Ok(raw) => raw,
 				Err(error) => {
 					return Closure::Protocol(format!("Failed to decode RPC output: {error}"));
@@ -409,9 +410,32 @@ impl Shared {
 			},
 			_ => {},
 		}
+		// A response's `data` is moved into the decoded response, never rebuilt
+		// through serde, which recurses once per level (see `deep`).
+		let is_response = frame.get("type").and_then(Value::as_str) == Some("response");
+		let data = is_response
+			.then(|| frame.as_object_mut()?.remove("data"))
+			.flatten();
 		let decoded = match RpcServerFrame::deserialize(&frame) {
 			Ok(decoded) => decoded,
 			Err(error) => {
+				// The call this response answers fails now, not at its timeout.
+				if is_response
+					&& let Some((_, waiter)) = frame
+						.get("id")
+						.and_then(Value::as_str)
+						.and_then(|id| self.state().pending.remove(id))
+				{
+					let _ = waiter.send(Err(Error::Json(error)));
+					if let Some(data) = data {
+						dispose(data);
+					}
+					dispose(frame);
+					return;
+				}
+				if let (Some(data), Some(members)) = (data, frame.as_object_mut()) {
+					members.insert("data".to_owned(), data);
+				}
 				let error = error.to_string();
 				if frame.get("type").and_then(Value::as_str) == Some("prompt_result")
 					&& let Some(id) = frame.get("id").and_then(Value::as_str)
@@ -425,9 +449,12 @@ impl Shared {
 			},
 		};
 		let event = match decoded {
-			RpcServerFrame::Response(response) => match self.response(response) {
-				Some(response) => Event::UnmatchedResponse(response),
-				None => return,
+			RpcServerFrame::Response(mut response) => {
+				response.data = data;
+				match self.response(response) {
+					Some(response) => Event::UnmatchedResponse(response),
+					None => return,
+				}
 			},
 			// Host tool and URI frames were consumed above; only malformed ones get here.
 			RpcServerFrame::RpcHostRequest(_) => return,
@@ -438,7 +465,11 @@ impl Shared {
 			RpcServerFrame::Unknown(raw) => Event::Notification(RpcNotification::Unknown(raw)),
 		};
 		// The host may drop the receiver; keep serving calls.
-		let _ = events.send(event);
+		if let Err(mpsc::SendError(Event::UnmatchedResponse(RpcResponse { data: Some(data), .. }))) =
+			events.send(event)
+		{
+			dispose(data);
+		}
 	}
 
 	/// Delivers a response to its waiter; returns it when nobody waits for it.
@@ -446,7 +477,13 @@ impl Shared {
 		let mut state = self.state();
 		if let Some(id) = &response.id {
 			if let Some((_, waiter)) = state.pending.remove(id) {
-				let _ = waiter.send(Ok(response));
+				// A call that timed out meanwhile no longer takes it.
+				if let Err(mpsc::SendError(Ok(RpcResponse { data: Some(data), .. }))) =
+					waiter.send(Ok(response))
+				{
+					drop(state);
+					dispose(data);
+				}
 				return None;
 			}
 			if !response.success {

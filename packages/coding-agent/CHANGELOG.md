@@ -54,6 +54,7 @@
 - A session that keeps its older entry bodies compressed in memory no longer decompresses a whole block of them for each entry a full rewrite or a walk over every entry reads, which on a long session blocked for minutes
 - A long goal session no longer reads each older goal mode change back from disk every time it resumes or starts a subagent
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
+- The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
 
 ## [18.18.6] - 2026-11-09
 
