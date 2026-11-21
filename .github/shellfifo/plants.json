@@ -1,0 +1,67 @@
+[
+ {
+  "name": "creating-open-through-pin",
+  "what": "FifoOpen reopens the pin for an open that creates too (O_CREAT through /proc/self/fd/N again)",
+  "edits": [
+   [
+    "crates/pi-vfs/src/fifo.rs",
+    "self.pin.is_some() && !self.creates",
+    "self.pin.is_some()",
+    1
+   ]
+  ],
+  "catch_vfs": [
+   "fifo::tests::an_open_that_creates_is_handed_its_path_and_one_that_does_not_the_pin",
+   "fifo::tests::a_drop_leaves_a_helper_whose_path_names_another_fifo_before_it_opens",
+   "tests::fifo_opens_through_a_cancellable_view_that_create_open_the_path"
+  ],
+  "catch_shell": [
+   "sys::fs::fifo::tests::an_open_that_may_create_opens_the_path_and_one_that_does_not_the_pin"
+  ]
+ },
+ {
+  "name": "shell-create-through-pin",
+  "what": "pi-shell's FIFO open says it creates nothing, so its > reopens the pin with O_CREAT",
+  "edits": [
+   [
+    "crates/pi-shell/src/sys/fs.rs",
+    "FifoOpen::start(host, &meta, nofollow, creates, move",
+    "FifoOpen::start(host, &meta, nofollow, false, move",
+    1
+   ]
+  ],
+  "catch_shell": [
+   "sys::fs::fifo::tests::an_open_that_may_create_opens_the_path_and_one_that_does_not_the_pin"
+  ]
+ },
+ {
+  "name": "facade-create-through-pin",
+  "what": "pi-vfs's facade FIFO open says it creates nothing, so its O_CREAT open reopens the pin",
+  "edits": [
+   [
+    "crates/pi-vfs/src/fs.rs",
+    "FifoOpen::start(path, meta, nofollow, creates, move",
+    "FifoOpen::start(path, meta, nofollow, false, move",
+    1
+   ]
+  ],
+  "catch_vfs": [
+   "tests::fifo_opens_through_a_cancellable_view_that_create_open_the_path"
+  ]
+ },
+ {
+  "name": "drop-joins-a-path-helper",
+  "what": "the drop joins a helper that opens the path whatever the path names",
+  "edits": [
+   [
+    "crates/pi-vfs/src/fifo.rs",
+    "if !self.node.reopens() {",
+    "if false {",
+    1
+   ]
+  ],
+  "catch_vfs": [
+   "fifo::tests::a_drop_leaves_a_helper_whose_path_names_another_fifo_before_it_opens"
+  ]
+ }
+]

@@ -1,0 +1,114 @@
+name: shellfifo
+on:
+   push:
+      branches: [scratch/shellfifo]
+permissions:
+   contents: read
+env:
+   CARGO_TERM_COLOR: never
+   REL: 969c839b9b9cf61259ef42899c51a38a696eda65
+jobs:
+   # A VM whose kernel enforces fs.protected_fifos (set to 1 here) and where
+   # root is at hand. Trees: rel = the sami release; trial = rel with this
+   # branch's fix (HEAD~1) merged in; fix = HEAD~1; a "+plant" tree carries
+   # one plant that sends an O_CREAT open through the pin again.
+   ubuntu:
+      runs-on: ubuntu-24.04
+      timeout-minutes: 120
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { tree: rel, plant: "", obash: true, tests: false }
+               - { tree: trial, plant: "", obash: true, tests: true }
+               - { tree: trial, plant: shell-create-through-pin, obash: true, tests: true }
+               - { tree: fix, plant: "", obash: false, tests: true }
+               - { tree: fix, plant: creating-open-through-pin, obash: false, tests: true }
+               - { tree: fix, plant: facade-create-through-pin, obash: false, tests: true }
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              fetch-depth: 0
+         - name: Tree, plant and the sysctl
+           run: |
+              set -euo pipefail
+              git log --format='%H %s' -3
+              uname -a; id; rustup show
+              sudo sysctl -w fs.protected_fifos=1
+              echo "protected_fifos=$(cat /proc/sys/fs/protected_fifos) protected_regular=$(cat /proc/sys/fs/protected_regular)"
+              FIX=$(git rev-parse HEAD~1)
+              T=$RUNNER_TEMP/tree
+              case "${{ matrix.tree }}" in
+                rel) git worktree add --detach "$T" "$REL" ;;
+                trial) git worktree add --detach "$T" "$REL"
+                       git -C "$T" -c user.name=trial -c user.email=trial@invalid merge --no-edit "$FIX" ;;
+                fix) git worktree add --detach "$T" "$FIX" ;;
+              esac
+              echo "TREE ${{ matrix.tree }} $(git -C "$T" rev-parse HEAD^{tree}) at $(git -C "$T" rev-parse HEAD)"
+              if [ -n "${{ matrix.plant }}" ]; then
+                python3 .github/shellfifo/plant.py .github/shellfifo/plants.json "$T" "${{ matrix.plant }}" apply
+                git -C "$T" diff --stat
+              fi
+         - name: Build
+           run: |
+              set -euo pipefail
+              cd "$RUNNER_TEMP/tree"
+              if [ "${{ matrix.obash }}" = true ]; then
+                cargo build -p pi-shell --bin obash
+                cp target/debug/obash "$RUNNER_TEMP/obash"
+                echo "BIN obash $(sha256sum "$RUNNER_TEMP/obash" | cut -c1-16)"
+              fi
+              if [ "${{ matrix.tests }}" = true ]; then
+                for crate in pi-vfs pi-shell; do
+                  lib=${crate//-/_}
+                  exe=$(cargo test -p "$crate" --lib --no-run --message-format=json | python3 -c 'import json,sys
+              for line in sys.stdin:
+                  m = json.loads(line)
+                  if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == sys.argv[1] and m["profile"]["test"]:
+                      print(m["executable"])' "$lib" | tail -n 1)
+                  cp "$exe" "$RUNNER_TEMP/bin-$crate"; chmod 755 "$RUNNER_TEMP/bin-$crate"
+                  echo "BIN $crate $(sha256sum "$RUNNER_TEMP/bin-$crate" | cut -c1-16)"
+                done
+              fi
+         - name: The shell's > and >> as root and as the runner, against bash
+           if: matrix.obash
+           run: |
+              mkdir -p "$RUNNER_TEMP/e2e"
+              sudo python3 .github/shellfifo/shellfifo-e2e.py "$RUNNER_TEMP/e2e" runner \
+                bash=/usr/bin/bash "obash-${{ matrix.tree }}${{ matrix.plant && '+plant' || '' }}=$RUNNER_TEMP/obash"
+         - name: The FIFO tests as root and as the runner
+           if: matrix.tests
+           run: |
+              set +e
+              mkdir -p "$RUNNER_TEMP/t" && chmod 755 "$RUNNER_TEMP/t"
+              for crate in pi-vfs pi-shell; do
+                if [ "$crate" = pi-vfs ]; then filters="fifo"; else filters="sys::fs::fifo::tests:: sys::fs::tests::fifos::"; fi
+                for who in root runner; do
+                  log=$RUNNER_TEMP/$crate-$who.log
+                  if [ "$who" = root ]; then
+                    sudo env TMPDIR="$RUNNER_TEMP/t" "$RUNNER_TEMP/bin-$crate" $filters --nocapture > "$log" 2>&1; rc=$?
+                  else
+                    env TMPDIR="$RUNNER_TEMP/t" "$RUNNER_TEMP/bin-$crate" $filters --nocapture > "$log" 2>&1; rc=$?
+                  fi
+                  echo "RESULT ${{ matrix.tree }}${{ matrix.plant && '+' || '' }}${{ matrix.plant }} $crate $who exit=$rc $(grep -E '^test result' "$log" | tail -n 1)"
+                  grep -E '^test .* (ok|FAILED)$|UNKNOWN|where the plain open gives|read [0-9]+ bytes|through the pin|left:|right:' "$log" | sort | uniq -c | sed 's/^/    /'
+                done
+              done
+   macos:
+      runs-on: macos-15
+      timeout-minutes: 90
+      steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              fetch-depth: 2
+         - name: The FIFO tests of both crates at the fix (no procfs)
+           run: |
+              set -o pipefail
+              git checkout --detach HEAD~1
+              git log --format='%H %s' -1; sw_vers; uname -a; id
+              cargo test -p pi-vfs --lib fifo -- --nocapture 2>&1 | tee "$RUNNER_TEMP/vfs.log"
+              cargo test -p pi-shell --lib sys::fs -- --nocapture 2>&1 | tee "$RUNNER_TEMP/shell.log"
+         - name: Summary
+           if: always()
+           run: |
+              grep -hE '^test |^test result|UNKNOWN|FAILED|panicked' "$RUNNER_TEMP/vfs.log" "$RUNNER_TEMP/shell.log" || true
