@@ -16,6 +16,7 @@ import {
 	continuesCachedPrompt,
 	gatewayModelsYml,
 	gatewaySessionOptions,
+	imagesPerMessage,
 	type MessagesRequest,
 	mockGatewayFetch,
 } from "./helpers/anthropic-gateway";
@@ -28,15 +29,6 @@ const MODELS_YML = gatewayModelsYml(1_000_000, 4);
 interface Turn {
 	text: string;
 	images: number;
-}
-
-/** How many image blocks each of `request`'s messages sends. */
-function imagesPerMessage(request: MessagesRequest): number[] {
-	return request.messages.map(message =>
-		Array.isArray(message.content)
-			? message.content.filter(block => typeof block === "object" && block !== null && block.type === "image").length
-			: 0,
-	);
 }
 
 describe("image count clamp across a restart", () => {

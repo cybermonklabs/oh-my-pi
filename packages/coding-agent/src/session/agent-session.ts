@@ -3037,8 +3037,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#tools.setBaseSystemPrompt(prompt);
 				this.agent.setSystemPrompt(prompt);
 			},
-			refreshBaseSystemPrompt: () => this.#tools.refreshBaseSystemPrompt(),
-			replaceMemoryTools: tools => this.#tools.replaceMemoryTools(tools),
+			refreshBaseSystemPrompt: options => this.#tools.refreshBaseSystemPrompt(undefined, options),
+			replaceMemoryTools: (tools, options) => this.#tools.replaceMemoryTools(tools, options),
 		};
 		this.#memory = new SessionMemory(memoryHost, {
 			memoryEnabled: this.memoryEnabled,
@@ -8564,11 +8564,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Withdraws the recall the conversation carries as a hidden message and the reports of what changed in a reused
 	 * recall's memories, after the backend's recall was reset (`/memory clear`, a rebuilt Hindsight state), then
 	 * rebuilds the base prompt: no later request sends them again, and the rebuild asks the backend for its whole
-	 * memory instructions.
+	 * memory instructions. A rebuild for the memory settings a rebuilt state took in is held on a bound prompt
+	 * ({@link SessionMemory.withdrawRecall}).
 	 */
 	withdrawMemoryRecall(): Promise<void> {
-		this.#memory.adoptRecall(undefined, []);
-		return this.refreshBaseSystemPrompt();
+		return this.#memory.withdrawRecall();
 	}
 
 	/**

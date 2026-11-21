@@ -19,6 +19,7 @@ import {
 	streamSimple,
 	type TextContent,
 	type ThinkingBudgets,
+	type Tool,
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
@@ -462,6 +463,15 @@ export class Agent {
 				fingerprint: string;
 		  }
 		| undefined;
+	/** {@link declaredTools} under a kept declaration, with the inputs it was computed from. */
+	#declaredToolsListMemo:
+		| {
+				tools: AgentTool[];
+				declaration: RecordedToolDeclaration;
+				sentRevision: number;
+				declared: readonly Tool[];
+		  }
+		| undefined;
 	/** What this Agent's previous main request sent per call; side requests leave it alone. */
 	#repeatedPerCallMessages = new RepeatedPerCallMessages();
 	#steeringQueue: AgentMessage[] = [];
@@ -717,14 +727,7 @@ export class Agent {
 		const intentTracing = this.#intentTracing;
 		const intentDescription = this.#intentDescription;
 		const pruneDescriptions = this.prunesToolDescriptions(model);
-		// An owned dialect carries the tools in the prompt, where no declaration is kept.
-		const declaration =
-			model !== undefined &&
-			isAnthropicMessagesModel(model) &&
-			anthropicKeepsToolDeclaration(model) &&
-			!this.#ownedDialect(model)
-				? latestToolDeclaration(this.#state.messages)
-				: undefined;
+		const declaration = this.#toolDeclaration(model);
 		// The sent definitions change the fingerprint only through a declaration.
 		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
 		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
@@ -744,9 +747,7 @@ export class Agent {
 			return memo.fingerprint;
 		}
 		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
-		const declared = declaration
-			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
-			: active;
+		const declared = this.#declaredFrom(active, declaration);
 		const fingerprint = toolSpecsFingerprint(declared);
 		if (memoized) {
 			this.#declaredToolsMemo = {
@@ -761,6 +762,50 @@ export class Agent {
 			};
 		}
 		return fingerprint;
+	}
+
+	/**
+	 * The tools the next main request on `model` declares, in wire order, as {@link declaredToolsFingerprint} hashes
+	 * them: the active tools as they are (not normalized for the wire), and on a provider that keeps its tool
+	 * declaration across a conversation, each withdrawn tool it still holds as this agent last sent it, a newly
+	 * active tool as a copy with `deferLoading`. The same list, copies included, until the active tools, the
+	 * declaration or the sent definitions change; the active tools' array itself where no declaration is kept.
+	 */
+	declaredTools(model: Model | undefined): readonly Tool[] {
+		const tools = this.#state.tools;
+		const declaration = this.#toolDeclaration(model);
+		if (!declaration) return tools;
+		const sentRevision = this.#sentToolDefinitions.revision;
+		const memo = this.#declaredToolsListMemo;
+		if (memo?.tools === tools && memo.declaration === declaration && memo.sentRevision === sentRevision) {
+			return memo.declared;
+		}
+		const declared = this.#declaredFrom(tools, declaration);
+		this.#declaredToolsListMemo = { tools, declaration, sentRevision, declared };
+		return declared;
+	}
+
+	/**
+	 * The tools a main request with the `active` tools declares: under a kept `declaration`, in its wire order, each
+	 * withdrawn tool it holds as this agent last sent it ({@link anthropicDeclaredTools}); `active` itself without one.
+	 */
+	#declaredFrom(active: readonly Tool[], declaration: RecordedToolDeclaration | undefined): readonly Tool[] {
+		return declaration
+			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
+			: active;
+	}
+
+	/**
+	 * The declaration the next main request on `model` keeps ({@link latestToolDeclaration}): undefined on a provider
+	 * that keeps none, and under an owned dialect, which carries the tools in the prompt.
+	 */
+	#toolDeclaration(model: Model | undefined): RecordedToolDeclaration | undefined {
+		return model !== undefined &&
+			isAnthropicMessagesModel(model) &&
+			anthropicKeepsToolDeclaration(model) &&
+			!this.#ownedDialect(model)
+			? latestToolDeclaration(this.#state.messages)
+			: undefined;
 	}
 
 	/**

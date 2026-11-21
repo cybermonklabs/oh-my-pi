@@ -1,4 +1,5 @@
 import { vi } from "bun:test";
+import type { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { TempDir } from "@oh-my-pi/pi-utils";
@@ -32,8 +33,16 @@ export interface WireMessage {
 	content: unknown;
 }
 
+/** A tool definition as a `/v1/messages` request declares it. */
 export interface WireTool {
 	name: string;
+	description?: string;
+	input_schema?: unknown;
+}
+
+/** Tokens of `tool`'s definition as the wire carries it: its name, its description and its input schema. */
+export function wireToolTokens(tokenizer: Tokenizer, tool: WireTool): number {
+	return tokenizer.countTokens([tool.name, tool.description ?? "", JSON.stringify(tool.input_schema)]);
 }
 
 /** A `/v1/messages` request body, as far as the tests read it. */
@@ -41,6 +50,15 @@ export interface MessagesRequest {
 	system?: unknown;
 	tools?: WireTool[];
 	messages: WireMessage[];
+}
+
+/** How many image blocks each of `request`'s messages sends. */
+export function imagesPerMessage(request: MessagesRequest): number[] {
+	return request.messages.map(message =>
+		Array.isArray(message.content)
+			? message.content.filter(block => typeof block === "object" && block !== null && block.type === "image").length
+			: 0,
+	);
 }
 
 /** Usage of the request a reply answers. */

@@ -1163,6 +1163,8 @@ export class SessionManager {
 	#titleRevision = 0;
 	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
 	#bodyRevision = 0;
+	/** Bumped each time the entries are read in whole ({@link loadRevision}). */
+	#loadRevision = 0;
 	#sessionFile: string | undefined;
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
@@ -2886,6 +2888,7 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
+		this.#loadRevision++;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
@@ -4579,6 +4582,16 @@ export class SessionManager {
 	/** Bumped when entries are rewritten in place (`rewriteEntries`, replay sanitizing); appends do not bump it. */
 	get bodyRevision(): number {
 		return this.#bodyRevision;
+	}
+
+	/**
+	 * Bumped each time the entries are read in whole: a session file opened, resumed or read again (a `/resume` of the
+	 * session already held, a reload), a captured state restored. Records read from the entries and kept by session
+	 * (image drops, snapcompact refusals) are read again at a new revision: another process may have continued the
+	 * session file since this one last read it.
+	 */
+	get loadRevision(): number {
+		return this.#loadRevision;
 	}
 
 	/** Tracks user rename requests; background title updates do not invalidate them. */

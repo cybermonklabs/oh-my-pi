@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `estimateContextToolSchemaTokens()` takes the agent (`ToolDeclarationSource`) instead of its tool array, and counts the tool definitions its next request declares: the roster and each tool taken off it that a kept declaration still sends (`declaredTools()`), from its sent definition, counted again only when that definition changes. It reads the prune mode from the agent (`prunesToolDescriptions()`), so its options take only `sourceRevision`
+
 ### Changed
 
 - The status line's git-status polling interval now widens automatically for a repository whose `git status` stays slow across consecutive calls, instead of holding a fixed 10-second refresh regardless of cost ([#13405](https://github.com/can1357/oh-my-pi/pull/13405) by [@sjawhar](https://github.com/sjawhar)).
@@ -23,6 +27,7 @@
 - A terminal that never answers the DA1 sentinel of a background-colour query no longer freezes light/dark detection for the rest of the session: the query gives up after five seconds and the refresh waiting behind it runs ([#17404](https://github.com/can1357/oh-my-pi/pull/17404) by [@sjawhar](https://github.com/sjawhar))
 - Task results from a structured subagent that replied without calling `yield` now show the missing-yield warning line in both task views; without an output schema such a result still succeeds, shows a warning badge and counts as succeeded, while with an output schema (or with empty output) it fails and counts as failed, as before; report text that only looks like that warning is shown as ordinary output ([#16928](https://github.com/can1357/oh-my-pi/pull/16928) by [@sjawhar](https://github.com/sjawhar))
 - Fixed long Markdown files and skills being slow to appear in read previews: a collapsed preview now renders only the start of the document, so its footer gives the rows it hides as a minimum (`… 45+ more lines`) ([#13840](https://github.com/can1357/oh-my-pi/pull/13840) by [@sjawhar](https://github.com/sjawhar)).
+- `computeNonMessageTokens()` and `computeNonMessageBreakdown()` count a tool taken off the roster that the source's agent still declares, so the status line and the compaction figures built on them no longer count too low on a model that keeps its tool declaration
 
 ### Added
 

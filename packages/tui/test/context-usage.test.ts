@@ -5,7 +5,7 @@
  * actually receive — not by stringifying the arktype instance's enumerable
  * internals, which massively overcounts.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
@@ -274,6 +274,53 @@ describe("computeNonMessageTokens / computeNonMessageBreakdown memoization", () 
 		expect(
 			computeNonMessageBreakdown(session as never, tokenizer, session.settings.revision).toolsTokens,
 		).toBeGreaterThan(first);
+	});
+});
+
+/**
+ * Contract: on a model that keeps its tool declaration across a conversation,
+ * the next request still declares a tool taken off the roster, and the
+ * non-message totals count it from its sent definition. `Agent.declaredTools`
+ * builds a new list each time the agent's tools, its declaration or its sent
+ * definitions change (a deferred tool as a copy), so the count is kept while
+ * the withdrawn definitions are the same: a rebuilt total or a replaced roster
+ * does not count them again, a new declaration does.
+ */
+describe("withdrawn declared tool accounting", () => {
+	it("counts a withdrawn tool's sent definition again only when that definition changes", () => {
+		const readTool = { name: "read", description: "Read a file.", parameters: { type: "object" } };
+		const parameters = { type: "object", properties: { command: { type: "string" } }, required: ["command"] };
+		let withdrawn = { name: "bash", description: "Run a shell command and return its output.", parameters };
+		const agent = {
+			state: { tools: [readTool] },
+			// A new list on each call, the withdrawn tool as a copy, as a new build of the agent's list gives it.
+			declaredTools: () => [readTool, { ...withdrawn }],
+		};
+		const session = { systemPrompt: ["base"], agent };
+		const expected =
+			estimateToolSchemaTokens([readTool as never], tokenizer) +
+			tokenizer.countTokens(["bash", withdrawn.description, JSON.stringify(parameters)]);
+		const countTokens = vi.spyOn(tokenizer, "countTokens");
+		const bashCounts = () =>
+			countTokens.mock.calls.filter(([text]) => Array.isArray(text) && text.includes("bash")).length;
+		try {
+			expect(computeNonMessageBreakdown(session as never, tokenizer).toolsTokens).toBe(expected);
+			expect(bashCounts()).toBe(1);
+
+			// A new system prompt rebuilds the totals, and setTools replaces the roster with the same tools: the
+			// withdrawn definition is the same, so it is not counted again.
+			session.systemPrompt = ["base with more words in it"];
+			agent.state.tools = [readTool];
+			computeNonMessageTokens(session as never, tokenizer);
+			expect(bashCounts()).toBe(1);
+
+			// A later declaration sends it with another definition.
+			withdrawn = { ...withdrawn, description: "Run a command." };
+			computeNonMessageTokens(session as never, tokenizer);
+			expect(bashCounts()).toBe(2);
+		} finally {
+			countTokens.mockRestore();
+		}
 	});
 });
 
