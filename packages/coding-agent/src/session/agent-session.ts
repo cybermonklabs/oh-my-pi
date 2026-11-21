@@ -7629,9 +7629,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// superseding queued tail work and fencing already-running atomic
 		// rewrites at their commit guard; hot-path appends drained above are
 		// already durable, and close() (scheduled post-seal) still flushes and
-		// closes the writer.
-		this.sessionManager.seal();
-		await this.sessionManager.close();
+		// closes the writer. A caller that stays open after a failed close seals
+		// with keepEntries, so the end of a held close's send leaves the manager's
+		// entries too (see SessionManager.seal); after a close that lands, the
+		// release below still drops them.
+		this.sessionManager.seal({ keepEntries: options.keepTranscriptAfterFailedClose === true });
+		let closeError: { error: unknown } | undefined;
+		try {
+			await this.sessionManager.close();
+		} catch (error) {
+			closeError = { error };
+		}
 
 		// Release retained conversation memory. dispose() is terminal, and every
 		// revival path reopens the transcript from disk (AgentLifecycleManager
@@ -7639,7 +7647,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// dead weight from here on. Dropping it lets a parked subagent's session
 		// graph shed its heavy payloads even while the lifecycle adoption record's
 		// reviver closure still references the session object. Fixes #8003.
-		this.#releaseRetainedSessionMemory();
+		// A close that failed releases the same: nothing writes a sealed manager's
+		// entries, except the send of a transcript a close the store refused for
+		// an outage holds (SessionManager.holdsTranscript), which keeps the
+		// manager's entries until it lands or ends. A caller that stays open
+		// after a failed close (the interactive mode, whose user may still
+		// `/export` or `/dump` the session) keeps both copies instead, the
+		// manager's also after a held send ends (the keepEntries seal above).
+		const keepAll = closeError !== undefined && options.keepTranscriptAfterFailedClose === true;
+		if (!keepAll) this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
 		// A run past the deadline may still resolve keys, so the account pools
 		// are lifted only once the run has settled: here when it drained,
 		// otherwise in the deferred pass below. Each lease lifts only the
@@ -7660,20 +7676,26 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			void (async () => {
 				await this.agent.waitForIdle();
 				await this.#drainInFlightEventHandlers();
-				this.#releaseRetainedSessionMemory();
+				if (!keepAll) {
+					this.#releaseRetainedSessionMemory({ keepTranscript: this.sessionManager.holdsTranscript() });
+				}
 				this.#accountPoolScope?.release();
 			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
 		}
+		if (closeError) throw closeError.error;
 	}
 
-	/** Drop the in-memory conversation state after the terminal dispose flush. */
-	#releaseRetainedSessionMemory(): void {
+	/**
+	 * Drop the in-memory conversation state after the terminal dispose flush. With `keepTranscript`, the
+	 * session manager keeps its entries: a close the store refused holds them for a later send.
+	 */
+	#releaseRetainedSessionMemory(options: { keepTranscript?: boolean } = {}): void {
 		this.#releaseQueuedTtsrReservations();
 		this.agent.reset();
 		this.#tools.releaseRestoredTranscript();
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
-		this.sessionManager.releaseRetainedEntries();
+		if (!options.keepTranscript) this.sessionManager.releaseRetainedEntries();
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */
