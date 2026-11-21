@@ -1484,7 +1484,7 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 }
 
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
-/** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
+/** Matches the truncation applied to per-server instructions inside `renderSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 /** Built-ins `createTools` force-includes into explicit tool lists; the active set mirrors them. */
 const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context"];
@@ -2055,7 +2055,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		return scan;
 	};
 	// Undefined until needed: enabling `includeWorkspaceTree` mid-session scans
-	// on the next prompt rebuild (see rebuildSystemPrompt).
+	// on the next prompt rebuild (see renderSystemPrompt).
 	let workspaceTreePromise: Promise<WorkspaceTree> | undefined = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
 		: cfgIncludeWorkspaceTree.get(settings)
@@ -4570,7 +4570,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
 		// so that subagents launched in the same parallel batch can see each other in
-		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
+		// their initial `# IRC Peers` block (rendered inside `renderSystemPrompt`).
 		// The session reference is attached after construction below.
 		const registrationInput = {
 			id: resolvedAgentId,
@@ -4864,10 +4864,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					});
 		const transformToolCallArguments = (args: Record<string, unknown>, toolName: string): Record<string, unknown> => {
 			let result = args;
-			// A call to a tool a held settings change keeps declared as sent runs under the settings it was declared under.
-			const maxTimeout = cfgToolsMaxTimeout.get((hasSession && session.toolCallSettingsFor(toolName)) || settings);
-			if (maxTimeout > 0 && typeof result.timeout === "number") {
-				result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
+			if (typeof result.timeout === "number") {
+				// A call to a tool a held settings change keeps declared as sent runs under the settings it was
+				// declared under.
+				const maxTimeout = cfgToolsMaxTimeout.get(
+					(hasSession && session.toolCallSettingsFor(toolName)) || settings,
+				);
+				if (maxTimeout > 0) result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
 			}
 			if (obfuscator?.hasSecrets()) {
 				result = deobfuscateToolArguments(obfuscator, result);
@@ -5362,7 +5365,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		});
 		// The loop snapshots this switch per prompt run. `tools.intentTracing` is synced by each
-		// prompt build instead (`rebuildSystemPrompt`), with the intent-field guidance it renders.
+		// prompt build instead (`renderSystemPrompt`), with the intent-field guidance it renders.
 		cfgToolsAbortOnFabricatedResult.listen(session, abortOnFabricatedResult => {
 			agent.abortOnFabricatedToolResult = abortOnFabricatedResult;
 		});

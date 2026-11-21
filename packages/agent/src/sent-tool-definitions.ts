@@ -1,8 +1,9 @@
-import type { AnthropicRequestControls, Context, Tool } from "@oh-my-pi/pi-ai";
+import type { Context, Tool } from "@oh-my-pi/pi-ai";
+import type { AnthropicToolControls } from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
 import type { AgentMessage } from "./types";
 
 /** A tool declaration a response recorded: the names its request declared, in wire order. */
-export type RecordedToolDeclaration = NonNullable<AnthropicRequestControls["tools"]>;
+export type RecordedToolDeclaration = AnthropicToolControls;
 
 /**
  * The tool declaration the newest response in `messages` that recorded one holds (`requestControls.tools`);

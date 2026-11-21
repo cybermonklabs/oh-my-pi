@@ -35,8 +35,15 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 	return memorySettings;
 }
 
-/** Each memory backend's tracking of the transcript ({@link SessionMemory.conversationTracking}). */
+/**
+ * What a transcript leaves in the session's memory state ({@link SessionMemory.conversationTracking}): the base prompt
+ * captured before a per-turn memory promotion, the recall the conversation carries as hidden messages, and each memory
+ * backend's tracking of the transcript.
+ */
 export interface ConversationTracking {
+	readonly promotionSnapshot: string[] | undefined;
+	readonly hiddenRecall: string | undefined;
+	readonly recallChanges: readonly RecallChangesReport[];
 	readonly hindsight: HindsightConversationTracking | undefined;
 	readonly mnemopi: MnemopiConversationTracking | undefined;
 }
@@ -193,11 +200,6 @@ export class SessionMemory {
 		return this.#memoryBackendTransition;
 	}
 
-	/** Base prompt captured before a per-turn memory promotion. */
-	get promotionSnapshot(): string[] | undefined {
-		return this.#baseSystemPromptBeforeMemoryPromotion;
-	}
-
 	/** Clears the per-turn memory promotion after a canonical prompt rebuild. */
 	clearPromotionSnapshot(): void {
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
@@ -206,11 +208,6 @@ export class SessionMemory {
 	/** Captures the canonical prompt before the first per-turn memory promotion. */
 	capturePromotionSnapshot(prompt: string[]): void {
 		this.#baseSystemPromptBeforeMemoryPromotion ??= prompt;
-	}
-
-	/** Restores a promotion snapshot while rolling back a failed session switch. */
-	restorePromotionSnapshot(prompt: string[] | undefined): void {
-		this.#baseSystemPromptBeforeMemoryPromotion = prompt;
 	}
 
 	/** The recall the conversation carries as a hidden message; undefined when its recall, if any, is a system block. */
@@ -274,18 +271,23 @@ export class SessionMemory {
 		return true;
 	}
 
-	/** The backends' transcript tracking a new transcript resets ({@link resetContextForNewTranscript}). */
+	/** What a new transcript resets ({@link resetContextForNewTranscript}), for a failed session switch to put back. */
 	conversationTracking(): ConversationTracking {
 		const hindsight = this.#host.getHindsightSessionState();
 		const mnemopi = this.#host.getMnemopiSessionState();
 		return {
+			promotionSnapshot: this.#baseSystemPromptBeforeMemoryPromotion,
+			hiddenRecall: this.#hiddenRecall,
+			recallChanges: this.#recallChanges,
 			hindsight: hindsight && !hindsight.aliasOf ? hindsight.conversationTracking() : undefined,
 			mnemopi: mnemopi && !mnemopi.aliasOf ? mnemopi.conversationTracking() : undefined,
 		};
 	}
 
-	/** Puts back the tracking {@link conversationTracking} took, while rolling back a failed session switch. */
+	/** Puts back the state {@link conversationTracking} took, while rolling back a failed session switch. */
 	restoreConversationTracking(tracking: ConversationTracking): void {
+		this.#baseSystemPromptBeforeMemoryPromotion = tracking.promotionSnapshot;
+		this.adoptRecall(tracking.hiddenRecall, tracking.recallChanges);
 		if (tracking.hindsight) this.#host.getHindsightSessionState()?.restoreConversationTracking(tracking.hindsight);
 		if (tracking.mnemopi) this.#host.getMnemopiSessionState()?.restoreConversationTracking(tracking.mnemopi);
 	}

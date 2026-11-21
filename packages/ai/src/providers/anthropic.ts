@@ -211,6 +211,11 @@ import {
 	isAnthropicFastModeFallbackDisabled,
 	normalizeAnthropicBaseUrl,
 } from "./anthropic-state";
+import {
+	type AnthropicToolControls,
+	anthropicKeepsToolDeclaration,
+	declareAnthropicTools,
+} from "./anthropic-tool-declaration";
 
 export {
 	applyClaudeToolPrefix,
@@ -4724,7 +4729,6 @@ type AnthropicControlRecord = { index: number; live: boolean; controls: Anthropi
 /** A control to splice in before `context.messages[index]`. */
 type AnthropicControlInsert = { index: number; spec: AnthropicControlSpec };
 
-type AnthropicToolControls = NonNullable<AnthropicRequestControls["tools"]>;
 type AnthropicEffortControls = NonNullable<AnthropicRequestControls["effort"]>;
 
 function anthropicControlOf(message: Message): AnthropicControlSpec | undefined {
@@ -4796,86 +4800,6 @@ function diffAnthropicActiveTools(
 	return changes;
 }
 
-/** What a live request declares in its top-level `tools` ({@link declareAnthropicTools}). */
-interface AnthropicToolDeclaration {
-	/** The declared names, in wire order. */
-	declared: string[];
-	/** The declared names sent with `defer_loading`. */
-	deferred: Set<string>;
-	/** The definition of each declared name, in wire order, a deferred one with `deferLoading`. */
-	tools: Tool[];
-}
-
-/**
- * The top-level `tools` a live request declares on a model that keeps its tool
- * declaration ({@link anthropicKeepsToolDeclaration}): the declaration `latest`
- * (the tool controls the newest response recorded) holds, minus names with no
- * definition in `tools` or `inactiveTools`, plus newly active tools appended
- * with `defer_loading`. Without a record, `tools` as given.
- */
-function declareAnthropicTools(
-	tools: readonly Tool[],
-	inactiveTools: readonly Tool[] | undefined,
-	latest: AnthropicToolControls | undefined,
-): AnthropicToolDeclaration {
-	const definitions = new Map<string, Tool>();
-	for (const tool of tools) definitions.set(tool.name, tool);
-	for (const tool of inactiveTools ?? []) {
-		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
-	}
-	let declared = tools.map(tool => tool.name);
-	const deferred = new Set<string>();
-	if (latest) {
-		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
-		declared = latest.declared.filter(name => definitions.has(name));
-		const declaredSet = new Set(declared);
-		for (const name of latest.deferred) {
-			if (declaredSet.has(name)) deferred.add(name);
-		}
-		for (const tool of tools) {
-			if (declaredSet.has(tool.name)) continue;
-			declared.push(tool.name);
-			declaredSet.add(tool.name);
-			deferred.add(tool.name);
-		}
-		// The API rejects a declaration whose tools are all deferred (a tool-less
-		// conversation gaining tools, or a resume that kept none of the loaded
-		// ones), so load them all and let the controls replay availability.
-		if (declared.every(name => deferred.has(name))) deferred.clear();
-	}
-	const declaredTools: Tool[] = [];
-	for (const name of declared) {
-		const tool = definitions.get(name);
-		if (tool) declaredTools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
-	}
-	return { declared, deferred, tools: declaredTools };
-}
-
-/**
- * Whether requests on `model` keep their top-level tool declaration across a
- * conversation, announcing availability changes as controls instead: a tool
- * taken off the roster stays declared ({@link anthropicDeclaredTools}).
- */
-export function anthropicKeepsToolDeclaration(model: Model<"anthropic-messages">): boolean {
-	return model.compat.supportsMidConversationToolChanges === true;
-}
-
-/**
- * The top-level `tools` a live request declares, in wire order, on a model that
- * keeps its tool declaration ({@link anthropicKeepsToolDeclaration}): `latest`,
- * the tool controls the newest response recorded (`requestControls.tools`),
- * minus each name with no definition in `tools` (the active tools) or
- * `inactiveTools` (the withdrawn ones the sender can re-declare), plus each
- * newly active tool, appended with `deferLoading`.
- */
-export function anthropicDeclaredTools(
-	tools: readonly Tool[],
-	inactiveTools: readonly Tool[] | undefined,
-	latest: NonNullable<AnthropicRequestControls["tools"]>,
-): Tool[] {
-	return declareAnthropicTools(tools, inactiveTools, latest).tools;
-}
-
 /**
  * Keep top-level `tools` byte-stable across a conversation. The declared list
  * is the latest record's ({@link declareAnthropicTools}).
@@ -4906,9 +4830,12 @@ function planAnthropicToolControls(
 	}
 	const inserts: AnthropicControlInsert[] = [];
 	const latest = toolRecords.at(-1);
-	const { declared, deferred, tools } = declareAnthropicTools(context.tools, context.inactiveTools, latest?.tools);
+	const { declared, declaredSet, deferred, tools } = declareAnthropicTools(
+		context.tools,
+		context.inactiveTools,
+		latest?.tools,
+	);
 	if (latest) {
-		const declaredSet = new Set(declared);
 		// The chain starts from what the top-level declaration makes active, so a
 		// rewritten history converges on the current roster instead of trusting a
 		// record whose earlier controls were summarized away.
@@ -4927,7 +4854,7 @@ function planAnthropicToolControls(
 		tools,
 		inserts,
 		record: {
-			declared: tools.map(tool => tool.name),
+			declared,
 			deferred: tools.filter(tool => tool.deferLoading === true).map(tool => tool.name),
 			active: activeNames,
 		},

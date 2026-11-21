@@ -23,8 +23,12 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
-import { anthropicDeclaredTools, anthropicKeepsToolDeclaration } from "@oh-my-pi/pi-ai/providers/anthropic";
+import {
+	anthropicDeclaredTools,
+	anthropicKeepsToolDeclaration,
+} from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -444,7 +448,7 @@ export class Agent {
 		request?: ProviderContextRequest,
 	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
-	/** {@link declaredToolsFingerprint} for the inputs it was last computed from. */
+	/** {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from. */
 	#declaredToolsMemo:
 		| {
 				model: Model | undefined;
@@ -714,14 +718,19 @@ export class Agent {
 		const pruneDescriptions = this.prunesToolDescriptions(model);
 		// An owned dialect carries the tools in the prompt, where no declaration is kept.
 		const declaration =
-			model?.api === "anthropic-messages" &&
-			anthropicKeepsToolDeclaration(model as Model<"anthropic-messages">) &&
+			model !== undefined &&
+			isAnthropicMessagesModel(model) &&
+			anthropicKeepsToolDeclaration(model) &&
 			!this.#ownedDialect(model)
 				? latestToolDeclaration(this.#state.messages)
 				: undefined;
-		const sentRevision = this.#sentToolDefinitions.revision;
+		// The sent definitions change the fingerprint only through a declaration.
+		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
+		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
+		const memoized = tools === this.#state.tools;
 		const memo = this.#declaredToolsMemo;
 		if (
+			memoized &&
 			memo !== undefined &&
 			memo.model === model &&
 			memo.tools === tools &&
@@ -738,16 +747,18 @@ export class Agent {
 			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
 			: active;
 		const fingerprint = toolSpecsFingerprint(declared);
-		this.#declaredToolsMemo = {
-			model,
-			tools,
-			intentTracing,
-			intentDescription,
-			pruneDescriptions,
-			declaration,
-			sentRevision,
-			fingerprint,
-		};
+		if (memoized) {
+			this.#declaredToolsMemo = {
+				model,
+				tools,
+				intentTracing,
+				intentDescription,
+				pruneDescriptions,
+				declaration,
+				sentRevision,
+				fingerprint,
+			};
+		}
 		return fingerprint;
 	}
 

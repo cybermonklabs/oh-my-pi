@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic`: whether a model keeps its top-level tool declaration across a conversation, and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
+- Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation, and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
 
 ## [18.18.4] - 2026-11-09
 

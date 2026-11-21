@@ -2,10 +2,9 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -27,16 +26,6 @@ describe("a setting a tool definition renders, changed after /tree to a reply se
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
-
-	/** Rewrites the overlay and reloads it as the config watcher does, then waits for the hold the change starts. */
-	async function reload(session: AgentSession, settings: Settings, overlay: string, content: string): Promise<void> {
-		const spy = vi.spyOn(session, "holdToolDeclarationChange");
-		await Bun.write(overlay, content);
-		await settings.reloadFromDisk();
-		await Promise.resolve();
-		await Promise.all(spy.mock.results.map(result => result.value));
-		spy.mockRestore();
-	}
 
 	it("declares what the request of the reply /tree moved to declared", async () => {
 		using tempDir = TempDir.createSync("@pi-declhold-tree-");
@@ -73,12 +62,14 @@ describe("a setting a tool definition renders, changed after /tree to a reply se
 				.find(entry => entry.type === "message" && entry.message.role === "assistant");
 			if (!firstReply) throw new Error("Expected the first reply on the branch");
 			// The change is held, then goes out with the first request five minutes or more after it.
-			await reload(session, settings, overlay, `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`);
+			await reloadOverlay({ session, settings, overlay }, `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`, [
+				"holdToolDeclarationChange",
+			]);
 			now += PAST_HOLD_BOUND_MS;
 			await session.prompt("second");
 			// The user continues from the first reply, and puts the timeout back to what its request was sent with.
 			await session.navigateTree(firstReply.id);
-			await reload(session, settings, overlay, LONG_ENTRIES);
+			await reloadOverlay({ session, settings, overlay }, LONG_ENTRIES, ["holdToolDeclarationChange"]);
 			await session.prompt("third, on the branch from the first reply");
 		} finally {
 			await session.dispose();

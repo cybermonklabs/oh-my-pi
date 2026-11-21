@@ -4,7 +4,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -52,12 +52,9 @@ describe("a configuration reload of a setting only the system prompt renders, be
 			skills: [],
 		});
 		try {
-			const spy = vi.spyOn(session, "holdToolDeclarationChange");
-			await Bun.write(overlay, `${LONG_ENTRIES}task:\n  maxConcurrency: 3\n`);
-			await settings.reloadFromDisk();
-			await Promise.resolve();
-			await Promise.all(spy.mock.results.map(result => result.value));
-			spy.mockRestore();
+			await reloadOverlay({ session, settings, overlay }, `${LONG_ENTRIES}task:\n  maxConcurrency: 3\n`, [
+				"holdToolDeclarationChange",
+			]);
 			await session.prompt("first");
 			// A rebuild that changes nothing of its own, such as a memory backend's periodic refresh.
 			await session.refreshBaseSystemPrompt();

@@ -2699,8 +2699,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
-			toolDefinitionsDigest: tools =>
-				tools ? this.agent.declaredToolsFingerprint(this.model, tools) : this.#promptCacheShape(this.model).tools,
+			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
@@ -14415,10 +14414,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousTools = [...this.agent.state.tools];
 		const previousBasePrompt = this.#tools.basePromptState;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
-		// The target transcript starts without this one's recall; a rolled-back switch keeps the conversation's.
-		const previousHiddenMemoryRecall = this.#memory.hiddenRecall;
-		const previousMemoryRecallChanges = this.#memory.recallChanges;
+		// The target transcript starts without this one's recall; a rolled-back switch keeps the conversation's memory
+		// state.
 		const previousMemoryTracking = this.#memory.conversationTracking();
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
@@ -14691,8 +14688,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.agent.setTools(previousTools);
 			// The prompt with what it lists, so the notices compare against what the request carries.
 			this.#tools.restoreBasePromptState(previousBasePrompt);
-			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
-			this.#memory.adoptRecall(previousHiddenMemoryRecall, previousMemoryRecallChanges);
 			this.#memory.restoreConversationTracking(previousMemoryTracking);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);

@@ -10,7 +10,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, reloadOverlay } from "./helpers/agent-session-setup";
 import { answer, gatewayModelsYml, gatewaySessionOptions, mockGatewayFetch } from "./helpers/anthropic-gateway";
 
 /** One-hour cache entries. */
@@ -64,12 +64,9 @@ describe("hold records after a switch to another session", () => {
 			const sourceFile = sessionManager.getSessionFile();
 			if (!sourceFile) throw new Error("Expected the session's file");
 			// A change only the bash definition renders is held on the bound prompt and recorded with its start.
-			const hold = vi.spyOn(session, "holdToolDeclarationChange");
-			await Bun.write(overlay, `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`);
-			await settings.reloadFromDisk();
-			await Promise.resolve();
-			await Promise.all(hold.mock.results.map(result => result.value));
-			hold.mockRestore();
+			await reloadOverlay({ session, settings, overlay }, `${LONG_ENTRIES}tools:\n  maxTimeout: 120\n`, [
+				"holdToolDeclarationChange",
+			]);
 			await sessionManager.flush();
 			// Precondition: the hold is recorded in the session whose prompt holds it.
 			expect(await holdRecords(sourceFile)).toEqual(["system-prompt-hold"]);
