@@ -2009,6 +2009,10 @@ fn copy_into_backup(host: &Host, source: &Path, dest: &Path, backup: &Path, opti
 			if filesystem.is_native_local(backup) {
 				open.custom_flags(libc::O_NOFOLLOW);
 			}
+			// The seam where a test puts an entry at the backup name after cp
+			// looked at it, before cp opens it.
+			#[cfg(test)]
+			crate::host::run_hook(backup);
 			let file = match filesystem.open_with(backup, &open) {
 				Ok(file) => file,
 				Err(_) if existing.is_ok() && options.unlink_after_failed_open() => {
@@ -4325,11 +4329,19 @@ mod tests {
 	///   In each mode the backup is a copy of the source as that mode copies:
 	///   `cp -l -fb a a` makes `a~` a link of `a`'s file; `cp -s -fb` makes
 	///   `a~` a symbolic link to the source and keeps `a` (refused where `a~`
-	///   is `a`'s file); `cp -P -fb l l` copies the link `l` to `l~`;
-	///   `cp -fb l l` copies the file `l` leads to; `--attributes-only` makes
-	///   an empty `a~`, or keeps the one there. Without `-f` GNU makes none of
-	///   these: `-l` does nothing, `cp -b l l` cannot open the source it
+	///   is `a`'s file by its own lstat, so a link `a~ -> a` is replaced, and
+	///   refused for a relative source outside the current directory, as GNU
+	///   refuses any relative link there); `cp -P -fb l l` copies the link `l`
+	///   to `l~`; `cp -fb l l` copies the file `l` leads to; `--attributes-only`
+	///   makes an empty `a~`, or keeps the one there. A data copy refuses a
+	///   dangling `a~` ("not writing through dangling symlink") and one that
+	///   leads to a directory, and every mode refuses a directory at `a~`, with
+	///   GNU 9.7's message (9.4's leaves out the source). Without `-f` GNU makes
+	///   none of these: `-l` does nothing, `cp -b l l` cannot open the source it
 	///   renamed and renames it back, and the others refuse the same file.
+	/// - GNU makes that backup only where the two names are the same string:
+	///   `cp -fb a ./a` and `cp -fb <dir>/a a` are the same file, and `cp -l
+	///   -fb a ./a` does nothing.
 	/// - With `--attributes-only` a destination is backed up as in any copy,
 	///   and an empty one with the source's attributes made in its place.
 	///
@@ -4344,7 +4356,7 @@ mod tests {
 		let linked = "A>a old>dest dest=dest~ a@l";
 		let unchanged = " a=A#1 dest=old#2 dest~=old#2 l=link:a";
 		#[rustfmt::skip]
-		let cases: [(&str, &str, &[&str], i32, &str, &str); 41] = [
+		let cases: [(&str, &str, &[&str], i32, &str, &str); 52] = [
 			("three-links", "A>a a=dest a=dest~", &["-b", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
 			("three-links", "A>a a=dest a=dest~", &["--backup=simple", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
 			("three-links", "A>a a=dest a=dest~", &["--backup=existing", "a", "dest"], 1, exists, " a=A#3 dest=A#3 dest~=A#3"),
@@ -4386,6 +4398,17 @@ mod tests {
 			("self-P-no-f", "A>a a@l", &["-P", "-b", "l", "l"], 1, "cp: 'l' and 'l' are the same file\n", " a=A#1 l=link:a"),
 			("self-s-no-f", "A>a", &["-s", "-b", "a", "a"], 1, "cp: 'a' and 'a' are the same file\n", " a=A#1"),
 			("self-l-no-f", "A>a", &["-l", "-b", "a", "a"], 0, "", " a=A#1"),
+			("rel-s", "dir:d A>d/a", &["-s", "-fb", "d/a", "d/a"], 1, "cp: d/a~: can make relative symbolic links only in current directory\n", " d=dir"),
+			("dangling-a~", "A>a missing@a~", &["-fb", "a", "a"], 1, "cp: not writing through dangling symlink 'a~'\n", " a=A#1 a~=link:missing"),
+			("dir-link-a~", "A>a dir:d d@a~", &["-fb", "a", "a"], 1, "cp: cannot overwrite directory 'a~' with non-directory 'a'\n", " a=A#1 a~=link:d d=dir"),
+			("s-self-link", "A>a a@a~", &["-s", "-fb", "<W>/a", "<W>/a"], 0, "", " a=A#1 a~=link:<W>/a"),
+			("dot", "A>a", &["-fb", "a", "./a"], 1, "cp: 'a' and './a' are the same file\n", " a=A#1"),
+			("abs", "A>a", &["-fb", "<W>/a", "a"], 1, "cp: '<W>/a' and 'a' are the same file\n", " a=A#1"),
+			("l-dot", "A>a", &["-l", "-fb", "a", "./a"], 0, "", " a=A#1"),
+			("s-dot", "A>a", &["-s", "-fb", "<W>/a", "./a"], 1, "cp: '<W>/a' and './a' are the same file\n", " a=A#1"),
+			("l-dir", "A>a dir:a~", &["-l", "-fb", "a", "a"], 1, "cp: cannot overwrite directory 'a~' with non-directory 'a'\n", " a=A#1 a~=dir"),
+			("s-dir", "A>a dir:a~", &["-s", "-fb", "<W>/a", "<W>/a"], 1, "cp: cannot overwrite directory '<W>/a~' with non-directory '<W>/a'\n", " a=A#1 a~=dir"),
+			("P-dir", "A>a a@l dir:l~", &["-P", "-fb", "l", "l"], 1, "cp: cannot overwrite directory 'l~' with non-directory 'l'\n", " a=A#1 l=link:a l~=dir"),
 		];
 		let root = tempdir().unwrap();
 		let mut failures = Vec::new();
@@ -4393,7 +4416,9 @@ mod tests {
 			let dir = root.path().join(format!("{index}-{case}"));
 			fs::create_dir(&dir).unwrap();
 			for step in setup.split(' ') {
-				if let Some(name) = step.strip_prefix("fifo:") {
+				if let Some(name) = step.strip_prefix("dir:") {
+					fs::create_dir(dir.join(name)).unwrap();
+				} else if let Some(name) = step.strip_prefix("fifo:") {
 					let path = std::ffi::CString::new(dir.join(name).into_os_string().into_encoded_bytes()).unwrap();
 					// SAFETY: `path` is a NUL-terminated path that outlives the call.
 					assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{case}: mkfifo");
@@ -4417,76 +4442,114 @@ mod tests {
 		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
 	}
 
-	/// `cp -R -fb p p`, where `p` is a FIFO, is refused as GNU cp 9.4 and 9.7
-	/// refuse it ("'p' and 'p' are the same file"): its backup would be a
-	/// copy, and reading the FIFO waits for a writer that never comes. The
-	/// test opens the FIFO for writing whenever a reader has it open, so a cp
-	/// that reads it gets end of file and ends, and the test then fails on
-	/// that read; it ends when cp does.
+	/// A FIFO is refused as the same file only where it is the destination's
+	/// own entry, as GNU cp 9.4 and 9.7 refuse it: its backup would be a copy,
+	/// and reading the FIFO waits for a writer. There `-l` does nothing, as
+	/// GNU's does. Another link of the FIFO is another entry: `cp -R -b p q`,
+	/// with `q` a link of `p`, backs `q` up and makes a new FIFO `q`, and
+	/// without `-R` the copy reads `p`, as GNU's does. The test opens the FIFO
+	/// for writing whenever a reader has it open, so a cp that reads it gets
+	/// end of file and ends; each row says whether cp must read it.
 	#[cfg(unix)]
 	#[test]
 	fn a_fifo_is_not_backed_up_onto_itself() {
 		use std::os::unix::fs::OpenOptionsExt as _;
-		let dir = tempdir().unwrap();
-		let fifo = dir.path().join("p");
-		let path = std::ffi::CString::new(fifo.clone().into_os_string().into_encoded_bytes()).unwrap();
-		// SAFETY: `path` is a NUL-terminated path that outlives the call.
-		assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "mkfifo");
-		let cwd = dir.path().to_path_buf();
-		let cp = std::thread::spawn(move || {
-			let (code, capture) = run_util::<Cp>(&["-R", "-fb", "p", "p"], "", &cwd);
-			(code, capture.err())
-		});
-		let mut read = false;
-		while !cp.is_finished() {
-			// A writer opens without waiting only while a reader has it open;
-			// dropping it at once gives that reader end of file.
-			let writer = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo);
-			if writer.is_ok() {
-				read = true;
-			} else {
-				std::thread::yield_now();
+		let same = "cp: 'p' and 'p' are the same file\n";
+		#[rustfmt::skip]
+		let cases: [(&str, bool, &[&str], i32, &str, &str, bool); 7] = [
+			("own -R -fb", false, &["-R", "-fb", "p", "p"], 1, same, " p=fifo", false),
+			("own -fb", false, &["-fb", "p", "p"], 1, same, " p=fifo", false),
+			("own -l -fb", false, &["-l", "-fb", "p", "p"], 0, "", " p=fifo", false),
+			("own -s -fb", false, &["-s", "-fb", "<W>/p", "<W>/p"], 1, "cp: '<W>/p' and '<W>/p' are the same file\n", " p=fifo", false),
+			("link -R -b", true, &["-R", "-b", "p", "q"], 0, "", " p=fifo q=fifo q~=fifo", false),
+			("link -R -fb", true, &["-R", "-fb", "p", "q"], 0, "", " p=fifo q=fifo q~=fifo", false),
+			("link -b", true, &["-b", "p", "q"], 0, "", " p=fifo q=#1 q~=fifo", true),
+		];
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (case, linked, args, code, err, after, reads)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			let fifo = dir.join("p");
+			let path = std::ffi::CString::new(fifo.clone().into_os_string().into_encoded_bytes()).unwrap();
+			// SAFETY: `path` is a NUL-terminated path that outlives the call.
+			assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0, "{case}: mkfifo");
+			// gVisor's gofer filesystem refuses a second link of a FIFO
+			// (EOPNOTSUPP); there the rows that need one are skipped, saying so.
+			if linked && let Err(error) = fs::hard_link(&fifo, dir.join("q")) {
+				assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{case}: link of the FIFO: {error}");
+				eprintln!("{case}: skipped: this filesystem cannot link a FIFO ({error})");
+				continue;
+			}
+			let at = |text: &str| text.replace("<W>", &dir.display().to_string());
+			let args = args.iter().map(|arg| at(arg)).collect::<Vec<_>>();
+			let (cwd, shown) = (dir.clone(), args.join(" "));
+			let cp = std::thread::spawn(move || {
+				let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+				let (code, capture) = run_util::<Cp>(&args, "", &cwd);
+				(code, capture.err())
+			});
+			let mut read = false;
+			while !cp.is_finished() {
+				// A writer opens without waiting only while a reader has it
+				// open; dropping it at once gives that reader end of file.
+				let writer = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo);
+				if writer.is_ok() {
+					read = true;
+				} else {
+					std::thread::yield_now();
+				}
+			}
+			let (got, got_err) = cp.join().unwrap();
+			let found = (got, got_err, crate::file_backup::tests::listing(&dir), read);
+			if found != (code, at(err), at(after), reads) {
+				failures.push(format!("{case} cp {shown}: {found:?}"));
 			}
 		}
-		let (code, err) = cp.join().unwrap();
-		assert!(!read, "cp opened the FIFO to read it");
-		assert_eq!((code, err.as_str()), (1, "cp: 'p' and 'p' are the same file\n"));
-		assert_eq!(crate::file_backup::tests::listing(dir.path()), " p=fifo");
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
 	}
 
 	/// `cp -fb a a` writes its backup copy into a regular file at the backup
 	/// name, as GNU cp 9.4 and 9.7 do: in a directory the user cannot write,
 	/// into a file with another hard link (both links then hold the copy),
 	/// and keeping that file's mode. With nothing there the backup is a new
-	/// file with `a`'s mode; a file that cannot be opened for writing is
-	/// replaced by one, as `-f` replaces a destination; a directory there is
-	/// refused with GNU 9.7's message (9.4's leaves out `'a'`). A symbolic
-	/// link there is replaced by a new file renamed over it, never written
-	/// through, so in a directory the user cannot write that backup fails;
-	/// GNU writes through the link and loses its target's contents.
+	/// file, created exclusively, with `a`'s mode; a file that cannot be
+	/// opened for writing is removed and created again, as `-f` replaces a
+	/// destination; a directory there is refused with GNU 9.7's message (9.4's
+	/// leaves out `'a'`). A symbolic link there is replaced by a new file
+	/// renamed over it, never written through, so in a directory the user
+	/// cannot write that backup fails; GNU writes through the link and loses
+	/// its target's contents. Each row has GNU's answer as uid 1000 and as
+	/// root, who writes a file of mode 444 in place and writes a directory of
+	/// mode 555; the read-only rows of `-l`, `-s` and `-P` have GNU's messages.
 	#[cfg(unix)]
 	#[test]
 	fn a_backup_copy_into_a_regular_file_is_written_as_gnu_writes_it() {
 		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+		type Outcome = (i32, &'static str, &'static str, &'static [(&'static str, u32)]);
 		let root = tempdir().unwrap();
 		let root_user = nix::unistd::geteuid().is_root();
 		let mode = |path: &std::path::Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+		let fb: &[&str] = &["-fb", "a", "a"];
+		let denied = "cp: cannot create regular file 'a~': Permission denied\n";
 		#[rustfmt::skip]
-		let cases: [(&str, &str, i32, &str, &str, &[(&str, u32)]); 7] = [
-			("read-only-dir", "old>a~ a~:640 .:555", 0, "", " a=A#1 a~=A#1", &[("a~", 0o640)]),
-			("other-link", "old>a~ a~=h", 0, "", " a=A#1 a~=A#2 h=A#2", &[]),
-			("mode", "old>a~ a~:600", 0, "", " a=A#1 a~=A#1", &[("a~", 0o600)]),
-			("new", "a:640", 0, "", " a=A#1 a~=A#1", &[("a~", 0o640)]),
-			("read-only-file", "old>a~ a~:444", 0, "", " a=A#1 a~=A#1", &[("a~", 0o644)]),
-			("directory", "dir:a~", 1, "cp: cannot overwrite directory 'a~' with non-directory 'a'\n", " a=A#1 a~=dir", &[]),
-			("read-only-dir-link", "U>u u@a~ .:555", 1, "cp: cannot backup 'a': Permission denied\n", " a=A#1 a~=link:u u=U#1", &[]),
+		let cases: [(&str, &str, &[&str], Outcome, Outcome); 12] = [
+			("read-only-dir", "old>a~ a~:640 .:555", fb, (0, "", " a=A#1 a~=A#1", &[("a~", 0o640)]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o640)])),
+			("other-link", "old>a~ a~=h", fb, (0, "", " a=A#1 a~=A#2 h=A#2", &[]), (0, "", " a=A#1 a~=A#2 h=A#2", &[])),
+			("mode", "old>a~ a~:600", fb, (0, "", " a=A#1 a~=A#1", &[("a~", 0o600)]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o600)])),
+			("new", "a:640", fb, (0, "", " a=A#1 a~=A#1", &[("a~", 0o640)]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o640)])),
+			("read-only-file", "old>a~ a~:444", fb, (0, "", " a=A#1 a~=A#1", &[("a~", 0o644)]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o444)])),
+			("directory", "dir:a~", fb, (1, "cp: cannot overwrite directory 'a~' with non-directory 'a'\n", " a=A#1 a~=dir", &[]), (1, "cp: cannot overwrite directory 'a~' with non-directory 'a'\n", " a=A#1 a~=dir", &[])),
+			("read-only-dir-link", "U>u u@a~ .:555", fb, (1, denied, " a=A#1 a~=link:u u=U#1", &[]), (0, "", " a=A#1 a~=A#1 u=U#1", &[])),
+			("read-only-dir-new", ".:555", fb, (1, denied, " a=A#1", &[]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o644)])),
+			("read-only-dir-444", "old>a~ a~:444 .:555", fb, (1, "cp: cannot remove 'a~': Permission denied\n", " a=A#1 a~=old#1", &[("a~", 0o444)]), (0, "", " a=A#1 a~=A#1", &[("a~", 0o444)])),
+			("read-only-dir-l", ".:555", &["-l", "-fb", "a", "a"], (1, "cp: cannot create hard link 'a~' to 'a': Permission denied\n", " a=A#1", &[]), (0, "", " a=A#2 a~=A#2", &[])),
+			("read-only-dir-s", ".:555", &["-s", "-fb", "<W>/a", "<W>/a"], (1, "cp: cannot create symbolic link '<W>/a~' to '<W>/a': Permission denied\n", " a=A#1", &[]), (0, "", " a=A#1 a~=link:<W>/a", &[])),
+			("read-only-dir-P", "a@l .:555", &["-P", "-fb", "l", "l"], (1, "cp: cannot create symbolic link 'l~': Permission denied\n", " a=A#1 l=link:a", &[]), (0, "", " a=A#1 l=link:a l~=link:a", &[])),
 		];
 		let mut failures = Vec::new();
-		for (case, setup, code, err, after, modes) in cases {
-			if root_user && setup.contains(".:555") {
-				eprintln!("{case}: skipped: root writes a directory without write permission");
-				continue;
-			}
+		for (case, setup, args, as_user, as_root) in cases {
+			let (code, err, after, modes) = if root_user { as_root } else { as_user };
 			let dir = root.path().join(case);
 			fs::create_dir(&dir).unwrap();
 			fs::write(dir.join("a"), "A").unwrap();
@@ -4505,17 +4568,181 @@ mod tests {
 					fs::set_permissions(dir.join(name), fs::Permissions::from_mode(bits)).unwrap();
 				}
 			}
-			let (got, capture) = run_util::<Cp>(&["-fb", "a", "a"], "", &dir);
+			let at = |text: &str| text.replace("<W>", &dir.display().to_string());
+			let args = args.iter().map(|arg| at(arg)).collect::<Vec<_>>();
+			let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+			let (got, capture) = run_util::<Cp>(&args, "", &dir);
 			fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 			let listed = crate::file_backup::tests::listing(&dir);
 			let found_modes = modes.iter().map(|&(name, _)| mode(&dir.join(name))).collect::<Vec<_>>();
 			let expected_modes = modes.iter().map(|&(_, bits)| bits).collect::<Vec<_>>();
-			if (got, capture.err().as_str(), listed.as_str(), &found_modes) != (code, err, after, &expected_modes) {
+			if (got, capture.err(), listed.clone(), &found_modes) != (code, at(err), at(after), &expected_modes) {
 				let octal = found_modes.iter().map(|bits| format!("{bits:o}")).collect::<Vec<_>>();
 				failures.push(format!("{case}: {got} {:?} {listed:?} modes {octal:?}", capture.err()));
 			}
 		}
-		assert!(failures.is_empty(), "rows that differ:\n{}", failures.join("\n"));
+		let who = if root_user { "root" } else { "a user" };
+		assert!(failures.is_empty(), "rows that differ from GNU as {who}:\n{}", failures.join("\n"));
+	}
+
+	/// `cp -i -b` where `dest~` is another link of `dest`, answered yes: the
+	/// rename that makes the backup does nothing, and GNU cp 9.4 and 9.7 then
+	/// replace `dest` with a hard link (`-l`), as they do under `-f`, and
+	/// refuse a symbolic link, a copied link and a regular file ("File
+	/// exists"), nothing changed.
+	#[cfg(unix)]
+	#[test]
+	fn an_interactive_backup_onto_a_linked_destination_is_made_as_gnu_makes_it() {
+		let unchanged = " a=A#1 dest=old#2 dest~=old#2 l=link:a";
+		let prompt = "cp: overwrite 'dest'? ";
+		#[rustfmt::skip]
+		let cases: [(&[&str], i32, &str, &str); 4] = [
+			(&["-i", "-l", "-b", "a", "dest"], 0, "", " a=A#2 dest=A#2 dest~=old#1 l=link:a"),
+			(&["-i", "-s", "-b", "<W>/a", "dest"], 1, "cp: cannot create symbolic link 'dest' to '<W>/a': File exists\n", unchanged),
+			(&["-i", "-P", "-b", "l", "dest"], 1, "cp: cannot create symbolic link 'dest': File exists\n", unchanged),
+			(&["-i", "-b", "a", "dest"], 1, "cp: cannot create regular file 'dest': File exists\n", unchanged),
+		];
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (args, code, err, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("a"), "A").unwrap();
+			std::os::unix::fs::symlink("a", dir.join("l")).unwrap();
+			fs::write(dir.join("dest"), "old").unwrap();
+			fs::hard_link(dir.join("dest"), dir.join("dest~")).unwrap();
+			let at = |text: &str| text.replace("<W>", &dir.display().to_string());
+			let args = args.iter().map(|arg| at(arg)).collect::<Vec<_>>();
+			let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+			let (got, capture) = run_util::<Cp>(&args, "y\n", &dir);
+			let found = (got, capture.err(), crate::file_backup::tests::listing(&dir));
+			if found != (code, format!("{prompt}{}", at(err)), at(after)) {
+				failures.push(format!("cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
+	/// `-v` reports the backup of the source's own entry as GNU cp 9.4 and 9.7
+	/// report it, `'a' -> 'a~'`, in every mode; `-l` reports nothing where
+	/// `a~` is already `a`'s file and nothing is made. A backup by renaming is
+	/// reported with the copy, as before.
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_of_the_sources_own_entry_is_reported_by_v() {
+		#[rustfmt::skip]
+		let cases: [(&str, &[&str], &str, &str); 8] = [
+			("A>a", &["-fbv", "a", "a"], "'a' -> 'a~'\n", " a=A#1 a~=A#1"),
+			("A>a old>a~", &["-fbv", "a", "a"], "'a' -> 'a~'\n", " a=A#1 a~=A#1"),
+			("A>a", &["-l", "-fbv", "a", "a"], "'a' -> 'a~'\n", " a=A#2 a~=A#2"),
+			("A>a", &["-s", "-fbv", "<W>/a", "<W>/a"], "'<W>/a' -> '<W>/a~'\n", " a=A#1 a~=link:<W>/a"),
+			("A>a a@l", &["-P", "-fbv", "l", "l"], "'l' -> 'l~'\n", " a=A#1 l=link:a l~=link:a"),
+			("A>a a@l", &["-fbv", "l", "l"], "'l' -> 'l~'\n", " a=A#1 l=link:a l~=A#1"),
+			("A>a a=a~", &["-l", "-fbv", "a", "a"], "", " a=A#2 a~=A#2"),
+			("A>a old>dest", &["-bv", "a", "dest"], "'a' -> 'dest' (backup: 'dest~')\n", " a=A#1 dest=A#1 dest~=old#1"),
+		];
+		let root = tempdir().unwrap();
+		let mut failures = Vec::new();
+		for (index, (setup, args, out, after)) in cases.into_iter().enumerate() {
+			let dir = root.path().join(index.to_string());
+			fs::create_dir(&dir).unwrap();
+			for step in setup.split(' ') {
+				if let Some((contents, name)) = step.split_once('>') {
+					fs::write(dir.join(name), contents).unwrap();
+				} else if let Some((original, link)) = step.split_once('=') {
+					fs::hard_link(dir.join(original), dir.join(link)).unwrap();
+				} else if let Some((target, link)) = step.split_once('@') {
+					std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+				}
+			}
+			let at = |text: &str| text.replace("<W>", &dir.display().to_string());
+			let args = args.iter().map(|arg| at(arg)).collect::<Vec<_>>();
+			let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+			let (got, capture) = run_util::<Cp>(&args, "", &dir);
+			let found = (got, capture.out(), capture.err(), crate::file_backup::tests::listing(&dir));
+			if found != (0, at(out), String::new(), at(after)) {
+				failures.push(format!("cp {}: {found:?}", args.join(" ")));
+			}
+		}
+		assert!(failures.is_empty(), "rows that differ from GNU:\n{}", failures.join("\n"));
+	}
+
+	/// `cp -fbp a a` gives the backup `a`'s mode and modification time, as GNU
+	/// cp 9.4 and 9.7 do, whether `a~` is new or an existing file of another
+	/// mode; without `-p` an existing `a~` keeps its mode (the `mode` row of
+	/// [`a_backup_copy_into_a_regular_file_is_written_as_gnu_writes_it`]).
+	#[cfg(unix)]
+	#[test]
+	fn a_backup_of_the_sources_own_entry_takes_its_attributes_under_p() {
+		use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+		let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+		for existing in [false, true] {
+			let dir = tempdir().unwrap();
+			let a = dir.path().join("a");
+			fs::write(&a, "A").unwrap();
+			fs::set_permissions(&a, fs::Permissions::from_mode(0o640)).unwrap();
+			fs::File::options().write(true).open(&a).unwrap().set_modified(when).unwrap();
+			if existing {
+				fs::write(dir.path().join("a~"), "old").unwrap();
+				fs::set_permissions(dir.path().join("a~"), fs::Permissions::from_mode(0o600)).unwrap();
+			}
+			let (code, capture) = run_util::<Cp>(&["-fbp", "a", "a"], "", dir.path());
+			let backup = fs::metadata(dir.path().join("a~")).unwrap();
+			assert_eq!(
+				(code, capture.err(), fs::read_to_string(dir.path().join("a~")).unwrap()),
+				(0, String::new(), "A".to_owned()),
+				"existing a~: {existing}"
+			);
+			assert_eq!(
+				(backup.mode() & 0o7777, backup.mtime()),
+				(0o640, 1_600_000_000),
+				"existing a~: {existing}: a~'s mode and modification time"
+			);
+		}
+	}
+
+	/// The backup copy of `cp -fb a a` never writes through a symbolic link
+	/// put at `a~` after cp looked at the name (a test hook puts it there,
+	/// pointing at `victim`): an existing regular `a~` is opened without
+	/// following a link (`O_NOFOLLOW`), and on that failure `-f` removes the
+	/// link and creates `a~` exclusively; where nothing was at `a~`, it is
+	/// created exclusively (`O_EXCL`), so the link there fails the copy, with
+	/// GNU's message for a create that finds a name taken.
+	#[cfg(unix)]
+	#[test]
+	fn a_link_put_at_the_backup_name_is_not_written_through() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		};
+		#[rustfmt::skip]
+		let cases: [(bool, i32, &str, &str); 2] = [
+			(true, 0, "", " a=A#1 a~=A#1 victim=V#1"),
+			(false, 1, "cp: cannot create regular file 'a~': File exists\n", " a=A#1 a~=link:victim victim=V#1"),
+		];
+		for (existing, code, err, after) in cases {
+			let dir = tempdir().unwrap();
+			fs::write(dir.path().join("a"), "A").unwrap();
+			fs::write(dir.path().join("victim"), "V").unwrap();
+			let backup = dir.path().join("a~");
+			if existing {
+				fs::write(&backup, "old").unwrap();
+			}
+			let ran = Arc::new(AtomicBool::new(false));
+			let (link, hook_ran) = (backup.clone(), Arc::clone(&ran));
+			crate::host::hook_at(backup.clone(), move || {
+				let _ = fs::remove_file(&link);
+				std::os::unix::fs::symlink("victim", &link).unwrap();
+				hook_ran.store(true, Ordering::SeqCst);
+			});
+			let (got, capture) = run_util::<Cp>(&["-fb", "a", "a"], "", dir.path());
+			assert!(ran.load(Ordering::SeqCst), "existing a~: {existing}: the hook did not run");
+			assert_eq!(
+				(got, capture.err(), crate::file_backup::tests::listing(dir.path())),
+				(code, err.to_owned(), after.to_owned()),
+				"existing a~: {existing}"
+			);
+		}
 	}
 
 	/// A followed source whose chain of symbolic links passes through the
