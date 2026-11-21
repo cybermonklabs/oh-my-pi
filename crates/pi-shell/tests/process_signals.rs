@@ -829,6 +829,53 @@ fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 	]);
 }
 
+/// A signal ignored on entry: zsh holds it ignored until a trap for it is
+/// set or removed, and `trap - TERM` resets it, so a program it then runs
+/// in place of itself gets the `TERM` sent to the shell, as one never
+/// ignored; before, the program inherits it ignored. bash cannot reset one
+/// (`trap - TERM` leaves it ignored), and the program inherits it ignored.
+/// `handles` traps `TERM` and exits 42 on it, which it can only where it did
+/// not inherit it ignored (POSIX sh); it makes `$F` once it has started,
+/// and goes on once the run has sent the signal ([`SENT`]).
+#[test]
+fn a_signal_ignored_on_entry_reaches_the_program_run_in_place_once_zsh_resets_it() {
+	let handles = format!(
+		"/bin/sh -c 'trap \"echo got; exit 42\" TERM; : > \"$F\"; {SENT}; /bin/sleep 1; echo done'"
+	);
+	let dies = format!("/bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 1'");
+	for (shell, script, stdout, end) in [
+		("zsh", format!("trap - TERM; exec {handles}"), "got\n", Exit(42)),
+		("zsh", format!("trap - TERM; {handles}"), "got\n", Exit(42)),
+		("zsh", format!("trap - TERM; exec {dies}"), "", Signal(libc::SIGTERM)),
+		("zsh", format!("exec {handles}"), "done\n", Exit(0)),
+		("bash", format!("trap - TERM; exec {handles}"), "done\n", Exit(0)),
+	] {
+		let run = |program: &OsStr| {
+			let dir = tempfile::tempdir().expect("a directory for the start file");
+			let started = dir.path().join("started");
+			Run::script(program, shell, &script)
+				.env("F", &started)
+				.ignoring(&[libc::SIGTERM])
+				.when_blocked()
+				.go_signalled(&started, libc::SIGTERM, false)
+		};
+		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")));
+		assert_eq!(
+			(String::from_utf8_lossy(&ours.stdout), ours.end()),
+			(stdout.into(), Some(end)),
+			"{shell}: {script}: {ours:?}"
+		);
+		if let Some(real) = real(shell) {
+			let theirs = run(real.as_os_str());
+			assert_eq!(
+				(&ours.stdout, ours.end()),
+				(&theirs.stdout, theirs.end()),
+				"{shell}: {script}: {theirs:?}"
+			);
+		}
+	}
+}
+
 /// A terminal's `^C` is the kernel's `INT` to its foreground process group,
 /// which the program the shell runs in place of itself gets from the kernel
 /// too: the shell gives it no second time, and does not die of it while the

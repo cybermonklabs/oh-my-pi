@@ -129,12 +129,16 @@ fn own(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> Result<Own, Stor
 	let root_process = vp.parent.is_none() || vp.in_place();
 	// The program the process runs gets what would end it, and what the
 	// shell holds ignored for itself (`QUIT`): the program starts with it at
-	// its default. One ignored on entry it inherits ignored.
+	// its default. One ignored on entry it inherits ignored while the shell
+	// holds it so: bash always (it cannot reset one), zsh until a trap for it
+	// is set or removed (`trap - TERM`, [`release`]), which resets it.
 	if root_process
 		&& k.program_in_place
 		&& sig.default_action() == DefaultAction::Terminate
 		&& sig != Signal::Kill
-		&& !cx.host.ignored_signals().contains(sig)
+		&& !(cx.host.ignored_signals().contains(sig)
+			&& (vp.mode.dialect() != Dialect::Zsh
+				|| names_hold(cx.store, vp, MiscKey::HeldIgnored, sig)?))
 	{
 		return Ok(Own::Program);
 	}
