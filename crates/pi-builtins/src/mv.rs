@@ -477,22 +477,6 @@ fn handle_two_paths(host: &mut Host, source: &Path, target: &Path, opts: &Option
 		if !filesystem.is_dir(&source_fs) {
 			return Err(MvError::DirectoryToNonDirectory(target.quote().to_string()).into());
 		}
-	} else if filesystem.exists(&target_fs) && source_is_dir {
-		match opts.overwrite {
-			OverwriteMode::NoClobber => return Ok(()),
-			OverwriteMode::Interactive => prompt_overwrite(host, target, None)?,
-			OverwriteMode::Force => {},
-			OverwriteMode::Default => {
-				let (writable, mode) = is_writable(host, target);
-				if !writable && stdin_is_terminal(host) {
-					prompt_overwrite(host, target, mode)?;
-				}
-			},
-		}
-		return Err(
-			MvError::NonDirectoryToDirectory(source.quote().to_string(), target.quote().to_string())
-				.into(),
-		);
 	}
 
 	match rename(host, source, target, opts, None, &mut MoveCopier::new(opts.verbose)) {
@@ -761,7 +745,10 @@ fn rename(
 	let from_fs = host.resolve(from);
 	let to_fs = host.resolve(to);
 
-	if filesystem.exists(&to_fs) {
+	// The destination as `lstat` sees it, as GNU mv sees it: a symlink there
+	// is a destination to skip, ask about, compare and back up, even one that
+	// points nowhere.
+	if let Ok(to_meta) = filesystem.symlink_metadata(&to_fs) {
 		if opts.update == UpdateMode::None {
 			if opts.debug {
 				let _ = writeln!(host.stdout, "skipped {}", to.quote());
@@ -769,10 +756,13 @@ fn rename(
 			return Ok(());
 		}
 
-		if (opts.update == UpdateMode::IfOlder)
-			&& filesystem.metadata(&from_fs)?.modified()? <= filesystem.metadata(&to_fs)?.modified()?
-		{
-			return Ok(());
+		// GNU compares the times only for a source that is not a directory,
+		// each as `lstat` reports it; a directory goes on to the checks below.
+		if opts.update == UpdateMode::IfOlder {
+			let from_meta = filesystem.symlink_metadata(&from_fs)?;
+			if !from_meta.file_type().is_dir() && from_meta.modified()? <= to_meta.modified()? {
+				return Ok(());
+			}
 		}
 
 		if opts.update == UpdateMode::NoneFail {
@@ -982,7 +972,13 @@ fn is_empty_dir(host: &Host, path: &Path) -> bool {
 /// Check if file is writable, returning the mode for potential reuse.
 #[cfg(unix)]
 fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
-	if let Ok(metadata) = host.fs().metadata(host.resolve(path)) {
+	let path = host.resolve(path);
+	// A symlink is writable whatever it points to, as GNU mv's
+	// `writable_destination` decides: the move replaces the link itself.
+	if host.fs().is_symlink(&path) {
+		return (true, None);
+	}
+	if let Ok(metadata) = host.fs().metadata(path) {
 		let mode = metadata.permissions().mode();
 		// Check if user write bit is set
 		((mode & 0o200) != 0, Some(mode))
@@ -994,7 +990,12 @@ fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
 /// Check if file is writable.
 #[cfg(not(unix))]
 fn is_writable(host: &Host, path: &Path) -> (bool, Option<u32>) {
-	if let Ok(metadata) = host.fs().metadata(host.resolve(path)) {
+	let path = host.resolve(path);
+	// A symlink is writable whatever it points to, as on Unix.
+	if host.fs().is_symlink(&path) {
+		return (true, None);
+	}
+	if let Ok(metadata) = host.fs().metadata(path) {
 		(!metadata.permissions().readonly(), None)
 	} else {
 		(false, None) // If we can't get metadata, prompt user to be safe
