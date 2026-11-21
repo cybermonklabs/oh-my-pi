@@ -597,10 +597,14 @@ impl FifoOpening {
 		let Some(pin) = pin.map(Arc::new) else {
 			// Nothing identifies the FIFO (it was gone when the open started).
 			let refuse: FifoRelease = Arc::new(|| Err(io::Error::other("no FIFO pinned; no release")));
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::ByName);
 			return Self::spawn(by_name, refuse, token);
 		};
 		let (open_pin, release_pin) = (Arc::clone(&pin), pin);
 		if release_pin.reopen_path().is_some() {
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::Reopen);
 			let (open_options, release_options) =
 				(reopen_options(options).to_std(), end.release_options().to_std());
 			let gone = || io::Error::other("the FIFO's pin has no reopen path");
@@ -616,6 +620,8 @@ impl FifoOpening {
 				token,
 			);
 		}
+		#[cfg(test)]
+		fifo_seam::note_helper(fifo_seam::Helper::ByName);
 		Self::spawn(
 			move || {
 				let opened = by_name();
@@ -782,8 +788,9 @@ fn release_attempt(
 /// and after it (told whether the open succeeded); a hook run after each
 /// release's open of the other end, while the end it opened is still held
 /// (told whether it opened one); a hook run just after the next FIFO pin is
-/// taken; and a switch that makes pinned FIFO opens open the name, as they
-/// do without `/proc`.
+/// taken; a record of the way each pinned FIFO's helper opens it; and a
+/// switch that makes pinned FIFO opens open the name, as they do without
+/// `/proc`.
 #[cfg(all(test, unix))]
 pub(crate) mod fifo_seam {
 	use std::sync::atomic::{AtomicBool, Ordering};
@@ -798,6 +805,27 @@ pub(crate) mod fifo_seam {
 	static RELEASE: Mutex<Option<Release>> = Mutex::new(None);
 	static AFTER_PIN: Mutex<Option<Before>> = Mutex::new(None);
 	static BY_NAME: AtomicBool = AtomicBool::new(false);
+	static HELPERS: Mutex<Vec<Helper>> = Mutex::new(Vec::new());
+
+	/// The way a FIFO's helper opens it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Helper {
+		/// By the name, with the caller's own options (`by_name`).
+		ByName,
+		/// Through the pin's `/proc/self/fd/N`, with the options for that.
+		Reopen,
+	}
+
+	pub(super) fn note_helper(helper: Helper) {
+		HELPERS.lock().push(helper);
+	}
+
+	/// The ways the FIFO helpers started in this process since the last
+	/// call opened their FIFO, in order.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests read it"))]
+	pub(crate) fn take_helpers() -> Vec<Helper> {
+		std::mem::take(&mut *HELPERS.lock())
+	}
 
 	/// Makes pinned FIFO opens in this process from now on open the name and
 	/// check what a release opened, as without `/proc` (`on`), or not.

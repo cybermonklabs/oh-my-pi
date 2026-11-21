@@ -556,14 +556,31 @@ fn set_made_dir_mode(dir: &Handle, name: *const c_char, mode: libc::mode_t) -> i
 		let by_fd = CString::new(format!("{}/self/fd/{}", proc_root(), fd.as_raw_fd()))
 			.map_err(|_| nul_in_path())?;
 		// SAFETY: `by_fd` is NUL-terminated.
-		match retry(|| unsafe { libc::chmod(by_fd.as_ptr(), mode) }) {
+		match mode_change(retry(|| unsafe { libc::chmod(by_fd.as_ptr(), mode) })) {
 			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
 			result => return result,
 		}
 	}
 	let fd = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)?;
 	// SAFETY: `fd` is an open descriptor.
-	retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
+	mode_change(retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) }))
+}
+
+/// The result of a mode change in [`set_made_dir_mode`].
+#[cfg(not(test))]
+const fn mode_change(result: io::Result<()>) -> io::Result<()> {
+	result
+}
+
+/// The result of a mode change in [`set_made_dir_mode`]; with
+/// [`seams::fail_mode_changes`] on, that error in place of a success, as a
+/// directory another user owns gives one.
+#[cfg(test)]
+fn mode_change(result: io::Result<()>) -> io::Result<()> {
+	match (seams::mode_change_error(), &result) {
+		(Some(errno), Ok(())) => Err(io::Error::from_raw_os_error(errno)),
+		_ => result,
+	}
 }
 
 /// Where [`set_made_dir_mode`] finds `/proc`.
@@ -757,7 +774,7 @@ pub(crate) fn chown_at(
 }
 
 #[cfg(test)]
-pub(crate) use seams::after_create_dir;
+pub(crate) use seams::{after_create_dir, fail_mode_changes};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use seams::{emulate_old_glibc, set_mode_without_proc};
 
@@ -777,8 +794,8 @@ pub(crate) fn touch_fifo_at(dir: &Handle, name: &[u8], write: bool) -> io::Resul
 }
 
 /// Test seams: a hook between a call's steps, so a test can swap an entry
-/// exactly there, an emulated glibc, and a switch that makes the masked
-/// mode be set as without `/proc`.
+/// exactly there, an emulated glibc, a switch that makes the masked mode be
+/// set as without `/proc`, and one that makes its mode change fail.
 #[cfg(test)]
 mod seams {
 	use parking_lot::Mutex;
@@ -823,6 +840,19 @@ mod seams {
 	#[cfg(target_os = "linux")]
 	pub(super) fn mode_without_proc() -> bool {
 		MODE_WITHOUT_PROC.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	static MODE_CHANGE_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+	/// Makes each mode change of a masked `create_dir_at` in this process
+	/// from now on fail with `errno` after it ran (`Some`), as it fails for a
+	/// directory another user owns, or not (`None`).
+	pub(crate) fn fail_mode_changes(errno: Option<i32>) {
+		MODE_CHANGE_ERROR.store(errno.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+	}
+
+	pub(super) fn mode_change_error() -> Option<i32> {
+		Some(MODE_CHANGE_ERROR.load(std::sync::atomic::Ordering::SeqCst)).filter(|&errno| errno != 0)
 	}
 
 	#[cfg(target_os = "linux")]

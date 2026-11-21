@@ -1177,15 +1177,16 @@ mod unix {
 	}
 
 	/// A masked `create_dir_at` returns the error of the call that sets the
-	/// mode again, after which the directory at the name keeps its mode: a
-	/// directory root owns, renamed in at the name between `mkdirat` and that
-	/// call while the process acts as another user, who may not set its mode
-	/// (`EPERM`, or `EACCES` where `/proc/self/fd` is closed to a process
-	/// whose effective user changed). By every way the mode is set again
-	/// ([`mode_routes`]), sync and async. As root only, which can make a
-	/// directory that user does not own and then act as that user; as any
-	/// other user this checks nothing and says so. In a process of its own,
-	/// whose effective user and way of setting the mode this test sets.
+	/// mode again, by every way the mode is set ([`mode_routes`]), sync and
+	/// async. First as any user: a test seam makes each mode change fail with
+	/// `EPERM` after it ran, and the call must return that error. Then as
+	/// root only: a directory root owns is renamed in at the name between
+	/// `mkdirat` and the mode change while the process acts as another user,
+	/// who may not set its mode (`EPERM`, or `EACCES` where `/proc/self/fd`
+	/// is closed to a process whose effective user changed); the call must
+	/// fail and the directory keep its mode. As another user that second half
+	/// checks nothing and says so. In a process of its own, whose effective
+	/// user, seam and way of setting the mode this test sets.
 	#[test]
 	fn a_masked_create_dir_at_returns_the_error_of_setting_the_mode() {
 		if crate::dir_handle::alone(
@@ -1193,11 +1194,41 @@ mod unix {
 		) {
 			return;
 		}
+		let failing = Tree::new("mkdir-fail");
+		let masked = Fs::native().with_creation_mask(Some(0o022));
+		let root = masked.blocking().open_dir(failing.at(""), true).unwrap();
+		let rt = runtime();
+		let mut wrong = Vec::new();
+		for &(id, label) in mode_routes() {
+			use_mode_route(id);
+			for call in ["sync", "async"] {
+				let name = format!("failed-{id}-{call}");
+				super::super::native::fail_mode_changes(Some(libc::EPERM));
+				let created = if call == "sync" {
+					root.create_dir_at(n(&name), Some(0o700))
+				} else {
+					rt.block_on(root.create_dir_at_async(n(&name), Some(0o700)))
+				};
+				super::super::native::fail_mode_changes(None);
+				let made = std::fs::symlink_metadata(failing.at(&name)).is_ok_and(|meta| meta.is_dir());
+				let returned = created
+					.as_ref()
+					.is_err_and(|err| err.raw_os_error() == Some(libc::EPERM));
+				if !(made && returned) {
+					wrong.push(format!("{label}, {call}: {created:?}, made {made}"));
+				}
+			}
+		}
+		assert!(
+			wrong.is_empty(),
+			"a masked create_dir_at whose mode change failed with EPERM (that error expected): \
+			 {wrong:?}"
+		);
 		// SAFETY: `geteuid` has no preconditions.
 		if unsafe { libc::geteuid() } != 0 {
 			eprintln!(
-				"UNKNOWN: not root, so no directory of another user can be put at the name; nothing \
-				 was checked"
+				"UNKNOWN: not root, so no directory of another user can be put at the name; the \
+				 second half checked nothing"
 			);
 			return;
 		}
@@ -1216,10 +1247,7 @@ mod unix {
 			return;
 		}
 		std::os::unix::fs::chown(tree.at(""), Some(OTHER), Some(OTHER)).unwrap();
-		let masked = Fs::native().with_creation_mask(Some(0o022));
 		let root = masked.blocking().open_dir(tree.at(""), true).unwrap();
-		let rt = runtime();
-		let mut wrong = Vec::new();
 		for &(id, label) in mode_routes() {
 			use_mode_route(id);
 			for call in ["sync", "async"] {
@@ -1726,10 +1754,13 @@ mod unix {
 	/// given to another FIFO: the helper's open ends, and a writer to the new
 	/// FIFO meets no release's end. The helper runs into its `open` and is
 	/// seen waiting there before the name is replaced and the open dropped.
-	/// Through a handle and the facade, [`REPLACE_TRIES`] tries each. Linux
-	/// only: elsewhere a release opens the name, and a helper waiting on a
-	/// FIFO no name reaches stays there. In a process of its own, so the
-	/// hooks take this test's helpers and releases.
+	/// With a write-only open, whose helper reopens the pin, and with the
+	/// shell's `>` options (write, create, truncate), whose helper opens the
+	/// name before the name is replaced; through a handle and the facade,
+	/// [`REPLACE_TRIES`] tries each. Linux only: elsewhere a release opens
+	/// the name, and a helper waiting on a FIFO no name reaches stays there.
+	/// In a process of its own, so the hooks take this test's helpers and
+	/// releases.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_release_reaches_the_fifo_its_open_waits_on_after_the_name_was_replaced() {
@@ -1741,67 +1772,72 @@ mod unix {
 		let tree = Tree::new("fifo-waiting");
 		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
 		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
-		let mut write = OpenOptions::new();
+		let (mut write, mut redirect) = (OpenOptions::new(), OpenOptions::new());
 		write.write(true);
+		redirect.write(true).create(true).truncate(true);
 		let current: Arc<Mutex<PathBuf>> = Arc::default();
 		let attempts = record_releases(Arc::clone(&current));
-		for route in ["handle", "facade"] {
-			for i in 0..REPLACE_TRIES {
-				let case = format!("{route}, try {i}");
-				let name = format!("q-{route}-{i}");
-				let fifo = tree.at(&name);
-				mkfifo(&fifo);
-				current.lock().clone_from(&fifo);
-				let first = attempts.lock().len();
-				let (tid_tx, tid) = std::sync::mpsc::channel();
-				let (opened_tx, helper_opened) = std::sync::mpsc::channel();
-				crate::fs::fifo_seam::set(
-					move || {
-						// SAFETY: `gettid` has no preconditions.
-						let _ = tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) });
-					},
-					move |ok| {
-						let _ = opened_tx.send(ok);
-					},
-				);
-				runtime().block_on(async {
-					let mut open = fifo_open(route, &root, &fs, &name, &fifo, &write);
-					tokio::select! {
-						biased;
-						_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
-						() = std::future::ready(()) => {},
-					}
-					let tid = tid
-						.recv_timeout(HELPER_BOUND)
-						.unwrap_or_else(|_| panic!("{case}: the helper never started"));
-					let start = std::time::Instant::now();
-					loop {
-						match waits_in_open(tid) {
-							Some(true) => break,
-							Some(false) => {},
-							None => panic!("{case}: /proc says nothing of the helper's thread"),
-						}
-						assert!(
-							start.elapsed() < HELPER_BOUND,
-							"{case}: the helper never waited in open"
-						);
-						std::thread::sleep(Duration::from_millis(1));
-					}
-					std::fs::remove_file(&fifo).unwrap();
+		for (opens, options) in [("write", &write), ("write, create, truncate", &redirect)] {
+			for route in ["handle", "facade"] {
+				for i in 0..REPLACE_TRIES {
+					let case = format!("{opens}, {route}, try {i}");
+					let name = format!("q-{}-{route}-{i}", opens.len());
+					let fifo = tree.at(&name);
 					mkfifo(&fifo);
-				});
-				let opened = helper_opened
-					.recv_timeout(HELPER_BOUND)
-					.unwrap_or_else(|_| {
-						panic!("{case}: the helper's open still waited {HELPER_BOUND:?} after the drop")
+					current.lock().clone_from(&fifo);
+					let first = attempts.lock().len();
+					let (tid_tx, tid) = std::sync::mpsc::channel();
+					let (opened_tx, helper_opened) = std::sync::mpsc::channel();
+					crate::fs::fifo_seam::set(
+						move || {
+							// SAFETY: `gettid` has no preconditions.
+							let _ = tid_tx.send(unsafe { libc::syscall(libc::SYS_gettid) });
+						},
+						move |ok| {
+							let _ = opened_tx.send(ok);
+						},
+					);
+					runtime().block_on(async {
+						let mut open = fifo_open(route, &root, &fs, &name, &fifo, options);
+						tokio::select! {
+							biased;
+							_ = &mut open => panic!("{case}: a write-only FIFO open with no reader finished"),
+							() = std::future::ready(()) => {},
+						}
+						let tid = tid
+							.recv_timeout(HELPER_BOUND)
+							.unwrap_or_else(|_| panic!("{case}: the helper never started"));
+						let start = std::time::Instant::now();
+						loop {
+							match waits_in_open(tid) {
+								Some(true) => break,
+								Some(false) => {},
+								None => panic!("{case}: /proc says nothing of the helper's thread"),
+							}
+							assert!(
+								start.elapsed() < HELPER_BOUND,
+								"{case}: the helper never waited in open"
+							);
+							std::thread::sleep(Duration::from_millis(1));
+						}
+						std::fs::remove_file(&fifo).unwrap();
+						mkfifo(&fifo);
 					});
-				assert!(opened, "{case}: the helper's open failed");
-				let these = attempts.lock()[first..].to_vec();
-				assert!(!these.is_empty(), "{case}: no release ran");
-				assert!(
-					these.iter().all(|&(_, met)| !met),
-					"{case}: a writer to the new FIFO met a release's end: {these:?}"
-				);
+					let opened = helper_opened
+						.recv_timeout(HELPER_BOUND)
+						.unwrap_or_else(|_| {
+							panic!(
+								"{case}: the helper's open still waited {HELPER_BOUND:?} after the drop"
+							)
+						});
+					assert!(opened, "{case}: the helper's open failed");
+					let these = attempts.lock()[first..].to_vec();
+					assert!(!these.is_empty(), "{case}: no release ran");
+					assert!(
+						these.iter().all(|&(_, met)| !met),
+						"{case}: a writer to the new FIFO met a release's end: {these:?}"
+					);
+				}
 			}
 		}
 	}
@@ -1916,15 +1952,19 @@ mod unix {
 
 	/// A FIFO open under a cancellable facade refuses what the same open
 	/// without a token refuses, with the same error: an exclusive create of
-	/// the FIFO (`O_CREAT | O_EXCL` among the custom flags: `EEXIST`), and a
-	/// read-only or append open that truncates (`EINVAL`). A handle's
-	/// `open_at` and `open_at_async` are compared with a handle's `open_at`
-	/// without a token, the facade's own blocking and async opens with the
-	/// facade's open without one; on Linux with the helper reaching the FIFO
-	/// through `/proc` and by name, as without `/proc`. Both ends of the FIFO
-	/// are held open throughout, so an open that goes ahead where the plain
-	/// one fails ends at once instead of waiting. In a process of its own, as
-	/// the by-name switch is the process's.
+	/// the FIFO (`O_CREAT | O_EXCL` among the custom flags, or `create` with a
+	/// custom `O_EXCL`: `EEXIST`), a read-only or append open that truncates
+	/// (`EINVAL`), and a read-only open with a custom `O_TRUNC` of a FIFO this
+	/// process may not write (`EACCES`: the kernel asks write permission for
+	/// `O_TRUNC`; root may write it, so as root the plain open opens it, and
+	/// so must the others). A handle's `open_at` and `open_at_async` are
+	/// compared with a handle's `open_at` without a token, the facade's own
+	/// blocking and async opens with the facade's open without one; on Linux
+	/// with the helper reaching the FIFO through `/proc` and by name, as
+	/// without `/proc`. Both ends of each FIFO are held open throughout, so an
+	/// open that goes ahead where the plain one fails ends at once instead of
+	/// waiting. In a process of its own, as the by-name switch is the
+	/// process's.
 	#[test]
 	fn a_fifo_open_refuses_what_the_plain_open_refuses() {
 		use std::os::unix::fs::OpenOptionsExt;
@@ -1934,25 +1974,48 @@ mod unix {
 			return;
 		}
 		let tree = Tree::new("fifo-refused");
-		let fifo = tree.at("p");
-		mkfifo(&fifo);
-		let reader = std::fs::OpenOptions::new()
-			.read(true)
-			.custom_flags(libc::O_NONBLOCK)
-			.open(&fifo)
-			.unwrap();
-		let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-		let (mut exclusive, mut read, mut append) =
-			(OpenOptions::new(), OpenOptions::new(), OpenOptions::new());
+		// `p` is open to its owner; `q` is read-only once both its ends are
+		// open.
+		let mut ends = Vec::new();
+		for name in ["p", "q"] {
+			let fifo = tree.at(name);
+			mkfifo(&fifo);
+			ends.push(
+				std::fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&fifo)
+					.unwrap(),
+			);
+			ends.push(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+		}
+		std::fs::set_permissions(tree.at("q"), std::fs::Permissions::from_mode(0o444)).unwrap();
+		// SAFETY: `geteuid` has no preconditions.
+		let root_user = unsafe { libc::geteuid() } == 0;
+		let (mut exclusive, mut create_excl, mut read, mut append, mut read_otrunc) = (
+			OpenOptions::new(),
+			OpenOptions::new(),
+			OpenOptions::new(),
+			OpenOptions::new(),
+			OpenOptions::new(),
+		);
 		exclusive
 			.write(true)
 			.custom_flags(libc::O_CREAT | libc::O_EXCL);
+		create_excl
+			.write(true)
+			.create(true)
+			.custom_flags(libc::O_EXCL);
 		read.read(true).truncate(true);
 		append.append(true).truncate(true);
+		read_otrunc.read(true).custom_flags(libc::O_TRUNC);
+		// Each case: its FIFO, its options, whether the plain open refuses it.
 		let cases = [
-			("an exclusive create", exclusive),
-			("a read that truncates", read),
-			("an append that truncates", append),
+			("an exclusive create", "p", exclusive, true),
+			("a create with a custom O_EXCL", "p", create_excl, true),
+			("a read that truncates", "p", read, true),
+			("an append that truncates", "p", append, true),
+			("a read with a custom O_TRUNC of a read-only FIFO", "q", read_otrunc, !root_user),
 		];
 		// An error as its kind and its OS error: the facade's open refuses an
 		// invalid combination before any system call, a handle's `open_at`
@@ -1970,19 +2033,23 @@ mod unix {
 		let mut wrong = Vec::new();
 		for by_name in [false, true] {
 			crate::fs::fifo_seam::open_by_name(by_name);
-			for (case, options) in &cases {
+			for (case, name, options, refused) in &cases {
+				let fifo = tree.at(name);
 				let by_facade = error(plain.open_with(&fifo, options));
-				let by_handle = error(plain_root.open_at(n("p"), options));
-				// The control: both plain opens refuse it, with one kind.
-				assert!(
-					matches!((&by_facade, &by_handle), (Err((a, _)), Err((b, _))) if a == b),
-					"{case}: the plain opens gave {by_facade:?} and {by_handle:?}"
-				);
+				let by_handle = error(plain_root.open_at(n(name), options));
+				// The control: both plain opens refuse it, with one kind (or,
+				// where root may, both open it).
+				let agree = match (&by_facade, &by_handle) {
+					(Err((a, _)), Err((b, _))) => *refused && a == b,
+					(Ok(()), Ok(())) => !refused,
+					_ => false,
+				};
+				assert!(agree, "{case}: the plain opens gave {by_facade:?} and {by_handle:?}");
 				let got = [
-					("a handle's open_at", error(root.open_at(n("p"), options)), &by_handle),
+					("a handle's open_at", error(root.open_at(n(name), options)), &by_handle),
 					(
 						"a handle's open_at_async",
-						error(rt.block_on(root.open_at_async(n("p"), options))),
+						error(rt.block_on(root.open_at_async(n(name), options))),
 						&by_handle,
 					),
 					("the facade's open", error(fs.blocking().open_with(&fifo, options)), &by_facade),
@@ -2002,8 +2069,240 @@ mod unix {
 				}
 			}
 		}
-		drop((reader, writer));
+		drop(ends);
+		if root_user {
+			eprintln!(
+				"note: as root the read-only FIFO can be written, so its O_TRUNC case cannot fail here"
+			);
+		}
 		assert!(wrong.is_empty(), "FIFO opens under a token: {wrong:#?}");
+	}
+
+	/// Options of FIFO opens that create or truncate, each by label: what the
+	/// shell's `>` and `tee` open with, and each such flag alone.
+	#[cfg(target_os = "linux")]
+	fn creating_or_truncating_opens() -> Vec<(&'static str, OpenOptions)> {
+		let make = |label, f: &dyn Fn(&mut OpenOptions)| {
+			let mut options = OpenOptions::new();
+			f(&mut options);
+			(label, options)
+		};
+		vec![
+			make("write, create", &|o| {
+				o.write(true).create(true);
+			}),
+			make("write, create, truncate", &|o| {
+				o.write(true).create(true).truncate(true);
+			}),
+			make("write, truncate", &|o| {
+				o.write(true).truncate(true);
+			}),
+			make("write, custom O_CREAT", &|o| {
+				o.write(true).custom_flags(libc::O_CREAT);
+			}),
+			make("write, custom O_TRUNC", &|o| {
+				o.write(true).custom_flags(libc::O_TRUNC);
+			}),
+			make("read, custom O_TRUNC", &|o| {
+				o.read(true).custom_flags(libc::O_TRUNC);
+			}),
+		]
+	}
+
+	/// A FIFO open under a cancellable facade that asks to create or truncate
+	/// opens the name with the caller's own options, so the kernel's checks
+	/// of such an open apply to it (`fs.protected_fifos` in a sticky
+	/// directory, the write permission `O_TRUNC` needs): its helper takes the
+	/// by-name way, never the `/proc/self/fd/N` reopen. An open that does
+	/// neither is the control: with `/proc` its helper reopens the pin. An
+	/// exclusive create (`create` or a custom `O_CREAT`, with a custom
+	/// `O_EXCL`) starts no helper and fails with `EEXIST`, as the plain open
+	/// does. Each through a handle's `open_at_async` and the facade's own
+	/// open, with both ends of the FIFO held, so each open ends at once. Linux
+	/// only (only there is there a reopen). In a process of its own, as the
+	/// record of the helpers is the process's.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_fifo_open_that_creates_or_truncates_opens_the_name_with_the_callers_options() {
+		use std::os::unix::fs::OpenOptionsExt;
+
+		use crate::fs::fifo_seam::{Helper, take_helpers};
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_fifo_open_that_creates_or_truncates_opens_the_name_with_the_callers_options",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-creating");
+		let fifo = tree.at("p");
+		mkfifo(&fifo);
+		let reader = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+			.unwrap();
+		let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let rt = runtime();
+		let reopens = Path::new("/proc/self/fd").is_dir();
+		let mut plain_write = OpenOptions::new();
+		plain_write.write(true);
+		// Each case: its options, the helpers it starts, and whether it opens.
+		let mut cases: Vec<_> = creating_or_truncating_opens()
+			.into_iter()
+			.map(|(label, options)| (label, options, vec![Helper::ByName], true))
+			.collect();
+		// The control.
+		let control = if reopens {
+			Helper::Reopen
+		} else {
+			Helper::ByName
+		};
+		cases.push(("write only (the control)", plain_write, vec![control], true));
+		// An exclusive create never waits on a FIFO: it takes the plain open,
+		// which gives `EEXIST`, and starts no helper.
+		let (mut create_excl, mut custom_excl) = (OpenOptions::new(), OpenOptions::new());
+		create_excl
+			.write(true)
+			.create(true)
+			.custom_flags(libc::O_EXCL);
+		custom_excl
+			.write(true)
+			.custom_flags(libc::O_CREAT | libc::O_EXCL);
+		cases.push(("write, create, custom O_EXCL", create_excl, vec![], false));
+		cases.push(("write, custom O_CREAT | O_EXCL", custom_excl, vec![], false));
+		let mut wrong = Vec::new();
+		take_helpers();
+		for (label, options, want, opens) in &cases {
+			for route in ["handle", "facade"] {
+				let opened = rt.block_on(fifo_open(route, &root, &fs, "p", &fifo, options));
+				let helpers = take_helpers();
+				let as_due = if *opens {
+					opened.is_ok()
+				} else {
+					opened
+						.as_ref()
+						.is_err_and(|err| err.raw_os_error() == Some(libc::EEXIST))
+				};
+				if !as_due || helpers != *want {
+					wrong.push(format!(
+						"{label}, {route}: {:?}, helpers {helpers:?} where {want:?} are due",
+						opened.map(drop)
+					));
+				}
+			}
+		}
+		drop((reader, writer));
+		if !reopens {
+			eprintln!(
+				"note: /proc/self/fd is not there, so every helper went by name; the control cannot \
+				 tell the ways apart"
+			);
+		}
+		assert!(wrong.is_empty(), "FIFO opens under a token: {wrong:#?}");
+	}
+
+	/// With `fs.protected_fifos` at 1 or more, an open that asks to create of
+	/// a FIFO another user owns in a world-writable sticky directory that
+	/// user does not own is refused (`EACCES`), so a command that means to
+	/// create a file never writes into such a FIFO. A FIFO open under a
+	/// cancellable facade is refused as the plain open is: through a handle's
+	/// `open_at` and `open_at_async` and the facade's blocking and async
+	/// opens, with the shell's `>` and `tee`'s options. The FIFO's read end
+	/// is held, so an open that goes ahead ends at once and its write
+	/// reaches that reader. As root only (which can give the FIFO to another
+	/// user), where `fs.protected_fifos` is 1 or more and the plain open is
+	/// refused; elsewhere it checks nothing and says so. Linux only.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_fifo_open_that_creates_is_refused_in_a_sticky_directory_as_the_plain_open_is() {
+		use std::os::unix::fs::OpenOptionsExt;
+		let protected = std::fs::read_to_string("/proc/sys/fs/protected_fifos")
+			.ok()
+			.and_then(|value| value.trim().parse::<u32>().ok());
+		if protected.is_none_or(|value| value < 1) {
+			eprintln!(
+				"UNKNOWN: fs.protected_fifos is {protected:?}, not 1 or more; nothing was checked"
+			);
+			return;
+		}
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } != 0 {
+			eprintln!(
+				"UNKNOWN: not root, so no FIFO of another user can be made; nothing was checked"
+			);
+			return;
+		}
+		let tree = Tree::new("fifo-sticky");
+		let sticky = tree.at("sticky");
+		std::fs::create_dir(&sticky).unwrap();
+		std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+		let fifo = sticky.join("report.txt");
+		mkfifo(&fifo);
+		std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o666)).unwrap();
+		std::os::unix::fs::chown(&fifo, Some(OTHER), Some(OTHER)).unwrap();
+		let mut reader = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(&fifo)
+			.unwrap();
+		let error = |opened: io::Result<File>| {
+			opened
+				.map(|mut file| {
+					let _ = file.write_all(b"written");
+				})
+				.map_err(|err| (err.kind(), err.raw_os_error()))
+		};
+		let plain = BlockingFs::native();
+		let plain_dir = plain.open_dir(&sticky, true).unwrap();
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		let dir = fs.blocking().open_dir(&sticky, true).unwrap();
+		let rt = runtime();
+		let name = n("report.txt");
+		let mut wrong = Vec::new();
+		for (label, options) in creating_or_truncating_opens()
+			.into_iter()
+			.filter(|(label, _)| label.starts_with("write, create"))
+		{
+			let by_facade = error(plain.open_with(&fifo, &options));
+			let by_handle = error(plain_dir.open_at(name, &options));
+			if by_facade.is_ok() || by_handle.is_ok() {
+				eprintln!(
+					"UNKNOWN: {label}: the plain opens gave {by_facade:?} and {by_handle:?}, so \
+					 fs.protected_fifos does not hold here; nothing was checked"
+				);
+				return;
+			}
+			let got = [
+				("a handle's open_at", error(dir.open_at(name, &options)), &by_handle),
+				(
+					"a handle's open_at_async",
+					error(rt.block_on(dir.open_at_async(name, &options))),
+					&by_handle,
+				),
+				("the facade's open", error(fs.blocking().open_with(&fifo, &options)), &by_facade),
+				(
+					"the facade's async open",
+					error(rt.block_on(fs.open_with(&fifo, &options))),
+					&by_facade,
+				),
+			];
+			for (route, result, want) in got {
+				if result != *want {
+					wrong.push(format!(
+						"{label}, {route}: {result:?} where the plain open gives {want:?}"
+					));
+				}
+			}
+		}
+		let mut leaked = Vec::new();
+		let _ = reader.read_to_end(&mut leaked);
+		assert!(
+			wrong.is_empty(),
+			"FIFO opens under a token in a sticky directory (another user's FIFO read {} bytes): \
+			 {wrong:#?}",
+			leaked.len()
+		);
 	}
 
 	/// Opens `fifo`'s read end without blocking and closes it, which releases
