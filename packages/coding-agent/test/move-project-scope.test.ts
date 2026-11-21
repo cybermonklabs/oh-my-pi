@@ -3,7 +3,7 @@
  * directory — task agents, project extensions, custom tools, and project MCP servers —
  * so the session sees the destination project's set, and moving back restores the source's.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -95,24 +95,21 @@ function writeProject(root: string, label: string, mcpServerScript: string): voi
 	);
 }
 
-/**
- * `/move` reconnects MCP servers in the background (turns wait for them, bounded) and exposes no
- * completion signal, so the test polls the live registry while real stdio servers handshake.
- */
-async function until(condition: () => boolean, what: string): Promise<void> {
-	const deadline = Date.now() + 10_000;
-	while (!condition()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
-		await Bun.sleep(20);
-	}
-}
-
 describe("/move re-scopes project-discovered capabilities", () => {
 	const tempDirs: string[] = [];
 	const originalProjectDir = getProjectDir();
 	const originalAgentDir = getAgentDir();
+	let originalStartupTimeout: string | undefined;
+
+	beforeEach(() => {
+		// The variable overrides the setting the test makes ("mcp.startupTimeoutMs": 0).
+		originalStartupTimeout = Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+		delete Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+	});
 
 	afterEach(() => {
+		if (originalStartupTimeout === undefined) delete Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS;
+		else Bun.env.OMP_MCP_STARTUP_TIMEOUT_MS = originalStartupTimeout;
 		setProjectDir(originalProjectDir);
 		setAgentDir(originalAgentDir);
 		AgentStorage.close();
@@ -134,7 +131,13 @@ describe("/move re-scopes project-discovered capabilities", () => {
 		setProjectDir(cwdA);
 
 		const authStorage = createInMemoryAuthStorage();
-		const settings = await Settings.loadIsolated({ cwd: cwdA, agentDir });
+		// Startup and each reconnect wait until this test's own servers settle ("mcp.startupTimeoutMs": 0)
+		// rather than for the default 250 ms window, which a busy machine's server spawn outlasts.
+		const settings = await Settings.loadIsolated({
+			cwd: cwdA,
+			agentDir,
+			overrides: { "mcp.startupTimeoutMs": 0 },
+		});
 		const sessionManager = SessionManager.create(cwdA, SessionManager.getDefaultSessionDir(cwdA, agentDir));
 		let session: AgentSession | undefined;
 		try {
@@ -159,8 +162,12 @@ describe("/move re-scopes project-discovered capabilities", () => {
 			const tools = () => live.getAllToolNames();
 			const hasMcpProbe = (label: string) => tools().some(name => name.endsWith(`${label}_probe`));
 			const taskDescription = () => live.getToolByName("task")?.description ?? "";
+			// `/move` reconnects MCP servers in the background and hands the reconnect to
+			// `setPendingMCPDiscovery` (turns wait for it); the test awaits that same promise.
+			const pendingDiscovery = vi.spyOn(live, "setPendingMCPDiscovery");
 			const move = async (target: string, from: string) => {
 				const output: string[] = [];
+				const reconnects = pendingDiscovery.mock.calls.length;
 				await executeAcpBuiltinSlashCommand(`/move ${target}`, {
 					session: live,
 					sessionManager,
@@ -173,13 +180,17 @@ describe("/move re-scopes project-discovered capabilities", () => {
 					reloadPlugins: async () => {},
 				});
 				expect(output.join("\n")).toContain("Moved to ");
+				expect(pendingDiscovery).toHaveBeenCalledTimes(reconnects + 1);
+				// In an object, so that awaiting `move` does not wait for it too: the checks
+				// right after `/move` run before the reconnect settles.
+				return { reconnect: pendingDiscovery.mock.calls[reconnects][0] };
 			};
 
 			expect(tools()).toEqual(expect.arrayContaining(["alpha_ext_tool", "alpha_custom_tool"]));
-			await until(() => hasMcpProbe("alpha"), "alpha MCP tools to arrive");
+			expect(hasMcpProbe("alpha")).toBe(true);
 			expect(taskDescription()).toContain("alpha-agent");
 
-			await move(cwdB, cwdA);
+			const toBeta = await move(cwdB, cwdA);
 
 			expect(sessionManager.getCwd()).toBe(cwdB);
 			expect(tools()).toEqual(expect.arrayContaining(["beta_ext_tool", "beta_custom_tool"]));
@@ -191,15 +202,19 @@ describe("/move re-scopes project-discovered capabilities", () => {
 			expect(customResult.content).toEqual([{ type: "text", text: cwdB }]);
 			expect(taskDescription()).toContain("beta-agent");
 			expect(taskDescription()).not.toContain("alpha-agent");
-			await until(() => hasMcpProbe("beta") && !hasMcpProbe("alpha"), "beta MCP tools to replace alpha's");
+			await toBeta.reconnect;
+			expect(hasMcpProbe("beta")).toBe(true);
+			expect(hasMcpProbe("alpha")).toBe(false);
 
-			await move(cwdA, cwdB);
+			const backToAlpha = await move(cwdA, cwdB);
 
 			expect(tools()).toEqual(expect.arrayContaining(["alpha_ext_tool", "alpha_custom_tool"]));
 			expect(tools()).not.toContain("beta_ext_tool");
 			expect(tools()).not.toContain("beta_custom_tool");
 			expect(taskDescription()).toContain("alpha-agent");
-			await until(() => hasMcpProbe("alpha") && !hasMcpProbe("beta"), "alpha MCP tools to return");
+			await backToAlpha.reconnect;
+			expect(hasMcpProbe("alpha")).toBe(true);
+			expect(hasMcpProbe("beta")).toBe(false);
 		} finally {
 			await session?.dispose();
 			authStorage.close();
