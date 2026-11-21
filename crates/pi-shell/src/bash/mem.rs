@@ -743,8 +743,9 @@ mod tests {
 	}
 
 	/// A stage pipe's conversion into the OS pipe of [`crate::sys::stage_pipe`]
-	/// (Linux, the one platform that has it).
-	#[cfg(any(target_os = "linux", target_os = "android"))]
+	/// on the Unix hosts that have it (Windows', whose shell writes can wait
+	/// on a worker, has its own tests there).
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 	mod shared {
 		use std::io::{Read, Write};
 
@@ -755,15 +756,20 @@ mod tests {
 		}
 
 		/// What an external holds: a blocking descriptor of the same pipe end,
-		/// opened anew through `/proc/self/fd` (the engine forbids `unsafe`,
-		/// so no `dup` here).
+		/// opened anew through `/proc/self/fd`, or on macOS duplicated through
+		/// `/dev/fd` (the engine forbids `unsafe`, so no `dup` here).
 		fn external(end: &MemFile) -> std::fs::File {
 			let fd = end.os_handle().expect("an OS end").0;
 			let write = matches!(end, MemFile::PipeWrite(_));
+			let dir = if cfg!(target_os = "macos") {
+				"/dev/fd"
+			} else {
+				"/proc/self/fd"
+			};
 			std::fs::OpenOptions::new()
 				.read(!write)
 				.write(write)
-				.open(format!("/proc/self/fd/{fd}"))
+				.open(format!("{dir}/{fd}"))
 				.expect("open the pipe end")
 		}
 

@@ -4,7 +4,8 @@
 //! pair of stages with an in-memory pipe and pumped each external's end
 //! through its own process, so when obash died, the stage before lost its
 //! reader and the stage after read end of file. A pipe between stages now
-//! becomes an OS pipe once an external takes one of its ends (Linux), and a
+//! becomes an OS pipe once an external takes one of its ends (Linux, macOS;
+//! Windows has its own tests in `pipeline_shared_pipe_windows.rs`), and a
 //! stage of shell code reads and writes that pipe itself.
 //!
 //! Each case runs its script under obash (`bash -c` or `zsh -f -c` by
@@ -62,25 +63,33 @@ impl Dialect {
 const SENT: [libc::c_int; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM, libc::SIGPIPE];
 
 /// A stage that makes `$F`, waits until the shell (its `$$`, as `$1`) is a
-/// zombie or gone, then prints `child-done`. This and the next three are
-/// Linux's: they read `/proc`, and only Linux shares the pipe.
+/// zombie or gone, then prints `child-done`. This and the next one read the
+/// process table: `/proc` on Linux, `ps` on macOS.
 #[cfg(target_os = "linux")]
 const CHILD: &str = "/bin/sh -c ': > \"$F\"; while read -r x1 x2 st x4 < /proc/$1/stat && [ \
                      \"$st\" != Z ]; do sleep 0.05; done; echo child-done' sh $$";
+#[cfg(target_os = "macos")]
+const CHILD: &str = "/bin/sh -c ': > \"$F\"; while st=$(ps -o stat= -p \"$1\"); do case $st in \
+                     *Z*) break;; esac; sleep 0.05; done; echo child-done' sh $$";
 
 /// The same, printing `late`: a background holder of a pipe's write end.
 #[cfg(target_os = "linux")]
 const LATE: &str = "/bin/sh -c ': > \"$F\"; while read -r x1 x2 st x4 < /proc/$1/stat && [ \
                     \"$st\" != Z ]; do sleep 0.05; done; echo late' sh $$";
+#[cfg(target_os = "macos")]
+const LATE: &str = "/bin/sh -c ': > \"$F\"; while st=$(ps -o stat= -p \"$1\"); do case $st in \
+                    *Z*) break;; esac; sleep 0.05; done; echo late' sh $$";
 
 /// `cat`, once it has made `$F.cat`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const CAT: &str = "/bin/sh -c ': > \"$F.cat\"; exec cat'";
 
 /// Two external stages print the pipe their stdout and stdin are
 /// (`/proc/PID/fd`, read in a command substitution because dash opens a
 /// simple command's redirections in its own process), and the script says
-/// whether they are one pipe.
+/// whether they are one pipe. Linux only: on macOS the two ends of one
+/// anonymous pipe `stat` as two inodes (measured with bash 5.3 and zsh 5.9),
+/// so no such probe tells one pipe from two there.
 #[cfg(target_os = "linux")]
 const ONE_PIPE: &str = "w=$(/bin/mktemp -d); /bin/sh -c 'x=$(readlink /proc/$$/fd/1); printf \
                         \"%s\\n\" \"$x\" > \"$1/w\"' sh \"$w\" | /bin/sh -c 'x=$(readlink \
@@ -189,7 +198,7 @@ impl Case {
 		Self { dialect, script: script.into(), signal: None, stdout, end: Some(End::Exit(0)) }
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
 	const fn signalled(mut self, signal: libc::c_int, end: Option<End>) -> Self {
 		self.signal = Some(signal);
 		self.end = end;
@@ -228,7 +237,7 @@ fn check(test: &str, cases: &[Case]) {
 /// by `HUP` (zsh) and by `KILL`: the stages share one kernel pipe, so what
 /// CHILD writes after the shell is gone still reaches `cat`. A background
 /// holder of the write end keeps the pipe open the same way.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn external_stages_outlive_the_shell() {
 	use Dialect::{Bash, Zsh};
