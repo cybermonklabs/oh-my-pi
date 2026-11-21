@@ -29,6 +29,8 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
+	/** What the add did besides the checkout, for the user to see. */
+	notes?: string[];
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;
 	/** Source `HEAD` the worktree branch was created at. */
@@ -158,6 +160,7 @@ export async function createSessionWorktree(
 		branch,
 		clonedWith: result.clonedWith ?? undefined,
 		cloneError: result.cloneError ?? undefined,
+		notes: result.notes,
 		sourceCwd: cwd,
 		baseCommit,
 		keptChanges: keepChanges,

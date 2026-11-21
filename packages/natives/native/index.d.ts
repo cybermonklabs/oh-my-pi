@@ -817,6 +817,15 @@ export declare class VcsGitRepo {
   worktreeRemove(path: string, force: boolean, signal?: unknown | undefined | null): Promise<boolean>
   /** Prune worktrees. */
   worktreePrune(signal?: unknown | undefined | null): Promise<undefined>
+  /**
+   * Remove the registration an interrupted worktree add of `path` left,
+   * and empty the tree it made, so `path` can be added again; returns a
+   * note for each removal. Refuses a registration of `path` it cannot
+   * prove abandoned, one whose HEAD moved or has a reflog or that holds
+   * refs of its own, or one whose tree holds a repository (a `.git` entry
+   * or a bare repository its commit does not track) or a mount point.
+   */
+  worktreeReclaimAbandoned(path: string, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent subjects. */
   logSubjects(count: number, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent one-line commits. */
@@ -4298,12 +4307,20 @@ export interface VcsWorktreeAddOptions {
    * (target must be the source `HEAD`).
    */
   keepChanges?: boolean
+  /**
+   * Lock the new worktree with this reason, written as
+   * `git worktree add --lock --reason <reason>` writes it. Absent leaves
+   * it unlocked.
+   */
+  lock?: string
 }
 
 /** Worktree creation outcome. */
 export interface VcsWorktreeAddResult {
   clonedWith?: IsoBackendKind
   cloneError?: string
+  /** What the add did besides the checkout, for the caller to show. */
+  notes: Array<string>
 }
 
 /** One worktree listing row. */

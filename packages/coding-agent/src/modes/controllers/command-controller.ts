@@ -1788,6 +1788,9 @@ export class CommandController {
 					error: worktree.cloneError,
 				});
 			}
+			for (const note of worktree.notes ?? []) {
+				this.ctx.showWarning(`Worktree ${worktree.path}: ${note}`);
+			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
 			const cleanup = worktree.keptChanges

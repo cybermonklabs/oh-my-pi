@@ -132,12 +132,18 @@ pub struct VcsWorktreeAddOptions {
 	/// Carry the source checkout's uncommitted changes into the new worktree
 	/// (target must be the source `HEAD`).
 	pub keep_changes: Option<bool>,
+	/// Lock the new worktree with this reason, written as
+	/// `git worktree add --lock --reason <reason>` writes it. Absent leaves
+	/// it unlocked.
+	pub lock:         Option<String>,
 }
 /// Worktree creation outcome.
 #[napi(object)]
 pub struct VcsWorktreeAddResult {
 	pub cloned_with: Option<IsoBackendKind>,
 	pub clone_error: Option<String>,
+	/// What the add did besides the checkout, for the caller to show.
+	pub notes:       Vec<String>,
 }
 /// Commit author identity.
 #[napi(object)]
@@ -895,10 +901,12 @@ impl VcsGitRepo {
 				detach: options.detach,
 				clone,
 				keep_changes: options.keep_changes.unwrap_or(false),
+				lock: options.lock,
 			})
 			.map(|result| VcsWorktreeAddResult {
 				cloned_with: result.cloned_with.map(to_napi_kind),
 				clone_error: result.clone_error,
+				notes:       result.notes,
 			})
 		})
 	}
@@ -920,6 +928,23 @@ impl VcsGitRepo {
 	#[napi]
 	pub fn worktree_prune(&self, signal: Option<Unknown>) -> Promise<()> {
 		blocking("vcs.worktreePrune", self.inner.clone(), signal, |r| r.worktree_prune())
+	}
+
+	/// Remove the registration an interrupted worktree add of `path` left,
+	/// and empty the tree it made, so `path` can be added again; returns a
+	/// note for each removal. Refuses a registration of `path` it cannot
+	/// prove abandoned, one whose HEAD moved or has a reflog or that holds
+	/// refs of its own, or one whose tree holds a repository (a `.git` entry
+	/// or a bare repository its commit does not track) or a mount point.
+	#[napi]
+	pub fn worktree_reclaim_abandoned(
+		&self,
+		path: String,
+		signal: Option<Unknown>,
+	) -> Promise<Vec<String>> {
+		blocking("vcs.worktreeReclaimAbandoned", self.inner.clone(), signal, move |r| {
+			r.worktree_reclaim_abandoned(Path::new(&path))
+		})
 	}
 
 	/// Recent subjects.

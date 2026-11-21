@@ -56,7 +56,18 @@ export interface AddWorktreeOptions {
 	forceBranch?: string;
 	detach: boolean;
 	quiet: boolean;
+	/** Lock the new worktree, as `git worktree add --lock`. */
+	lock: boolean;
+	/** The lock's reason, as `git worktree add --reason`; requires {@link lock}. */
+	reason?: string;
 }
+
+/**
+ * The reason git records for `git worktree add --lock` without `--reason`. git
+ * writes it translated (`_("added with --lock")`); this is its untranslated
+ * text, which git writes under the C locale.
+ */
+const GIT_DEFAULT_LOCK_REASON = "added with --lock";
 
 export interface ListWorktreesOptions {
 	json: boolean;
@@ -103,9 +114,19 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (options.branch && options.forceBranch) {
 		throw new Error("fatal: options '-b' and '-B' cannot be used together");
 	}
+	if (options.reason !== undefined && !options.lock) {
+		throw new Error("fatal: the option '--reason' requires '--lock'");
+	}
 	const cwd = path.resolve(options.cwd ?? process.cwd());
 	const repository = vcs.requireGit(cwd);
 	const worktreePath = path.resolve(cwd, options.path);
+	// An add of this path that died before it finished (a signal, a timeout's
+	// kill) left a registration that says so. It goes first and the tree it
+	// made is emptied, so the path can be added again; one it cannot prove
+	// abandoned is refused here, before any branch is made.
+	for (const note of await repository.worktreeReclaimAbandoned(worktreePath)) {
+		console.error(chalk.dim(`note: ${note}`));
+	}
 	try {
 		const stat = await fs.stat(worktreePath);
 		const nonEmpty = !stat.isDirectory() || (await fs.readdir(worktreePath)).length > 0;
@@ -154,6 +175,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 		detach,
 		clone: cfgWorktreeClone.get(settings),
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+		lock: options.lock ? (options.reason ?? GIT_DEFAULT_LOCK_REASON) : undefined,
 	});
 	if (!options.quiet) {
 		console.log(`HEAD is now at ${shortSha} ${subject}`);
@@ -163,6 +185,9 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	}
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
+	}
+	for (const note of result.notes) {
+		console.error(chalk.dim(`note: ${note}`));
 	}
 	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha);
 	process.stderr.write(hook.stdout);

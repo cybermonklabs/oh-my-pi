@@ -266,8 +266,10 @@ export function formatPrCheckoutResult(options: {
 	remoteUrl: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	/** What the worktree add did besides the checkout. */
+	notes?: string[];
 }): string {
-	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith } = options;
+	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith, notes } = options;
 	const lines: string[] = [
 		reused ? `# Pull Request #${data.number ?? "?"} Worktree` : `# Checked Out Pull Request #${data.number ?? "?"}`,
 		"",
@@ -292,6 +294,9 @@ export function formatPrCheckoutResult(options: {
 			? "Reused the existing PR worktree."
 			: "Created a dedicated worktree for this PR and configured the local branch to push back to the PR head branch.",
 	);
+	if (notes && notes.length > 0) {
+		lines.push("", "Notes:", ...notes.map(note => `- ${note}`));
+	}
 	return lines.join("\n").trim();
 }
 
@@ -402,6 +407,8 @@ export interface PrCheckoutOutcome {
 	headRefName: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	/** What the worktree add did besides the checkout. */
+	notes?: string[];
 }
 
 export async function checkoutPullRequest(
@@ -500,6 +507,7 @@ export async function checkoutPullRequest(
 
 			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
 			let clonedWith: IsoBackendKind | undefined;
+			let notes: string[] | undefined;
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
@@ -520,6 +528,7 @@ export async function checkoutPullRequest(
 						error: result.cloneError,
 					});
 				}
+				notes = result.notes;
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 
@@ -532,6 +541,7 @@ export async function checkoutPullRequest(
 				headRefName,
 				reused: Boolean(existingWorktree),
 				clonedWith,
+				notes,
 			};
 		},
 		signal,
