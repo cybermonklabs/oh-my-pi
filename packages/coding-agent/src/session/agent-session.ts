@@ -533,6 +533,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import {
+	type BasePromptRebuildOptions,
 	customMessagesByType,
 	customMessagesOf,
 	promptDigestOfEntry,
@@ -5548,15 +5549,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end") {
 			await messageEndPersistence;
 			if (this.#promptGeneration !== eventPromptGeneration) return;
-			if (interruptedThinkingMessage) {
-				this.sessionManager.appendCustomMessageEntry(
-					interruptedThinkingMessage.customType,
-					interruptedThinkingMessage.content,
-					interruptedThinkingMessage.display,
-					interruptedThinkingMessage.details,
-					interruptedThinkingMessage.attribution,
-				);
-			}
+			if (interruptedThinkingMessage) this.sessionManager.appendCustomMessage(interruptedThinkingMessage);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -8299,6 +8292,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.getToolForEvalBridge(name);
 	}
 
+	/**
+	 * Why a call to the tool or `xd://` device `name` is refused while a held settings change keeps it listed
+	 * ({@link SessionTools.heldToolRefusal}); undefined when calls to it run.
+	 */
+	heldToolRefusal(name: string): string | undefined {
+		return this.#tools.heldToolRefusal(name);
+	}
+
 	/** Names currently authorized through the eval bridge. */
 	getEvalBridgeToolNames(): string[] {
 		return this.#tools.getEvalBridgeToolNames();
@@ -8683,10 +8684,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/**
 	 * Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. A rebuild a settings
-	 * change started passes `settingsChange`, which holds it on a bound prompt (see
+	 * change started passes `settingsChange`, which holds it on a bound prompt, and one that finishes such a change
+	 * in the background passes `joinsHeldChange`, which joins a held one (see
 	 * {@link SessionTools.refreshBaseSystemPrompt}).
 	 */
-	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: SettingsChangeOptions): Promise<void> {
+	refreshBaseSystemPrompt(commitIf?: () => boolean, options?: BasePromptRebuildOptions): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt(commitIf, options);
 	}
 
@@ -12110,13 +12112,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return outcome.sessionClaimed;
 			}
 			this.agent.appendMessage(normalizedAppMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				normalizedAppMessage.customType,
-				normalizedAppMessage.content,
-				normalizedAppMessage.display,
-				normalizedAppMessage.details,
-				normalizedAppMessage.attribution,
-			);
+			this.sessionManager.appendCustomMessage(normalizedAppMessage);
 			return false;
 		}
 

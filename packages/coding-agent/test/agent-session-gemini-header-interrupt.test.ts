@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
 	Api,
 	AssistantMessage,
@@ -17,7 +17,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -229,6 +229,29 @@ describe("AgentSession Gemini header-runaway interrupt", () => {
 		expect(assistants[0].content).toEqual([{ type: "text", text: "Acted: called a tool." }]);
 		const replaysHeaders = messages.some(m => m.role === "assistant" && /Refining Stage/.test(messageText(m)));
 		expect(replaysHeaders).toBe(false);
+	});
+
+	it("stores the tool-call reminder under the timestamp it was sent with", async () => {
+		// The clock the agent stamps messages with runs a second ahead of the one the session's entries are dated by,
+		// as when a millisecond passes between taking the reminder and storing it.
+		const wallNow = Date.now.bind(Date);
+		vi.spyOn(Date, "now").mockImplementation(() => wallNow() + 1_000);
+		let call = 0;
+		buildSession((model, _context, options) =>
+			++call === 1 ? headerRunawayStream(model, options) : successStream(model, "Acted: called a tool."),
+		);
+
+		await session?.prompt("Do the task");
+		await session?.waitForIdle();
+
+		const isReminder = (message: AgentMessage): message is CustomMessage =>
+			message.role === "custom" && message.customType === "gemini-tool-call-reminder";
+		const sent = session?.agent.state.messages.find(isReminder);
+		if (!session || !sent) throw new Error("Expected the tool-call reminder in agent state");
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's drops,
+		// the date/cwd reminder's placements): it must find the turn the agent sent.
+		const reread = session.sessionManager.buildSessionContext().messages.find(isReminder);
+		expect(reread?.timestamp).toBe(sent.timestamp);
 	});
 
 	it("does not interrupt when the tool-call reminder setting is off", async () => {

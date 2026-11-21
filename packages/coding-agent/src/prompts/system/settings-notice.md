@@ -6,7 +6,13 @@ Settings changed after the system prompt and tool definitions above were written
 {{#if disabledTools.length}}
 Disabled by this change; they stay listed until the rebuild, and calls to them are refused from now on: {{#list disabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
+{{#if reenabledTools.length}}
+No longer disabled; calls to them run again from now on: {{#list reenabledTools join=", "}}`{{this}}`{{/list}}
+{{/if}}
 {{#if enabledTools.length}}
 Enabled by this change; available after the rebuild: {{#list enabledTools join=", "}}`{{this}}`{{/list}}
+{{/if}}
+{{#if noLongerEnabledTools.length}}
+No longer enabled; not available after the rebuild: {{#list noLongerEnabledTools join=", "}}`{{this}}`{{/list}}
 {{/if}}
 </system-notice>

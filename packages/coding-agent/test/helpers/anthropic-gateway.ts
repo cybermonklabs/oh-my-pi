@@ -155,6 +155,16 @@ export function textOf(value: unknown): string {
 	return [record.text, record.content].map(textOf).join("\n");
 }
 
+/** The tool result a request carries for the call `toolUseId`. */
+export function toolResultOf(
+	request: MessagesRequest | undefined,
+	toolUseId: string,
+): Record<string, unknown> | undefined {
+	return request?.messages
+		.flatMap(message => (Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : []))
+		.find(block => block.type === "tool_result" && block.tool_use_id === toolUseId);
+}
+
 /** Cache breakpoints follow the end of each request, so they are left out of the comparison. */
 export function withoutCacheControl(value: unknown): string {
 	return JSON.stringify(value, (key, inner) => (key === "cache_control" ? undefined : inner));
@@ -203,9 +213,10 @@ export function mockGatewayFetch(reply: (turn: number) => Response): GatewayFetc
 
 /**
  * The `createAgentSession` options every gateway test passes: `tempDir` as its working and agent directory, and no
- * extension discovery, prompt templates, slash commands, MCP, LSP or Python preflight.
+ * extension discovery, prompt templates, slash commands, MCP, LSP or Python preflight. A process the test spawns passes
+ * the test's directory as `{ path }`.
  */
-export function gatewaySessionOptions(tempDir: TempDir): CreateAgentSessionOptions {
+export function gatewaySessionOptions(tempDir: Pick<TempDir, "path">): CreateAgentSessionOptions {
 	return {
 		cwd: tempDir.path(),
 		agentDir: tempDir.path(),

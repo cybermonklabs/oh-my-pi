@@ -2733,6 +2733,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
+			heldToolRefusal: name => session?.heldToolRefusal(name),
 			getAdvertisedEvalToolNames: () => session?.getAdvertisedEvalToolNames() ?? [],
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it

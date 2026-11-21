@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
 	Api,
 	AssistantMessage,
@@ -371,5 +371,47 @@ describe("AgentSession thinking-loop retry", () => {
 		);
 		expect(assistants).toHaveLength(1);
 		expect(assistants[0].content).toEqual([{ type: "text", text: "Recovered after retry." }]);
+	});
+
+	it("stores the redirect notice under the timestamp it was sent with", async () => {
+		// The clock the agent stamps messages with runs a second ahead of the one the session's entries are dated by,
+		// as when a millisecond passes between taking the notice and storing it.
+		const wallNow = Date.now.bind(Date);
+		vi.spyOn(Date, "now").mockImplementation(() => wallNow() + 1_000);
+		const model = createMockModel({ provider: "openrouter", id: "google/gemini-3.5-flash" }).model;
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: requestedModel =>
+				++calls === 1 ? errorIdOnlyThinkingLoopStream(requestedModel) : successStream(requestedModel),
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 5_000,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
+			"todo.enabled": false,
+			"model.loopGuard.enabled": true,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		mockSchedulerWaitWithClock();
+
+		await session.prompt("Trigger redirect injection after thinking loop");
+		await session.waitForIdle();
+
+		const isRedirect = (message: AgentMessage): message is CustomMessage =>
+			message.role === "custom" && message.customType === "thinking-loop-redirect";
+		const sent = session.agent.state.messages.find(isRedirect);
+		if (!sent) throw new Error("Expected the redirect notice in agent state");
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's drops,
+		// the date/cwd reminder's placements): it must find the turn the agent sent.
+		const reread = sessionManager.buildSessionContext().messages.find(isRedirect);
+		expect(reread?.timestamp).toBe(sent.timestamp);
 	});
 });

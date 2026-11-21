@@ -8,11 +8,11 @@
  * and re-drives the turn so the model can read the file again and correct the
  * patch.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Context, Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -21,7 +21,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries, TempDir } from "@oh-my-pi/pi-utils";
@@ -126,75 +126,87 @@ describe("AgentSession streaming edit preview recovery", () => {
 			await session.dispose();
 			session = undefined;
 		}
+		vi.restoreAllMocks();
 	});
+
+	/**
+	 * Prompts a session in `dir` whose model streams an `edit` call whose final preview fails, then answers with text
+	 * once re-driven; gives the session, the context of each model call and the notices it emitted.
+	 */
+	async function promptPreviewFailure(dir: string): Promise<{
+		active: AgentSession;
+		contexts: Context[];
+		notices: Array<Extract<AgentSessionEvent, { type: "notice" }>>;
+	}> {
+		await Bun.write(path.join(dir, "sample.txt"), "alpha\n");
+		const settings = Settings.isolated({
+			"edit.mode": "patch",
+			"edit.streamingAbort": true,
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"advisor.enabled": false,
+		});
+		const toolSession = {
+			cwd: dir,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			enableLsp: false,
+			settings,
+			getArtifactsDir: () => null,
+			getSessionId: () => null,
+			getPlanModeState: () => undefined,
+		} as unknown as ToolSession;
+		const editTool = new EditTool(toolSession, "patch");
+		// EditTool narrows `params` beyond AgentTool's generic schema
+		// (same cast the ACP permission tests use); the session registry
+		// only consumes the AgentTool surface.
+		const agentEditTool = editTool as AgentTool;
+
+		const model = createMockModel({ provider: "anthropic", id: "claude-streaming-edit-recovery" }).model;
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const contexts: Context[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [agentEditTool], messages: [] },
+			streamFn: (streamModel, context) => {
+				contexts.push(context);
+				return contexts.length === 1
+					? streamingEditFailureStream({
+							model: streamModel,
+							args: { path: "sample.txt", edits: [{ diff: "@@\n-missing\n+replacement\n" }] },
+						})
+					: textStream({ model: streamModel, text: "Recovered after preview failure." });
+			},
+			convertToLlm,
+		});
+		const active = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			toolRegistry: new Map([["edit", agentEditTool]]),
+		});
+		session = active;
+		const notices: Array<Extract<AgentSessionEvent, { type: "notice" }>> = [];
+		active.subscribe(event => {
+			if (event.type === "notice") notices.push(event);
+		});
+
+		await active.prompt("Fix sample.txt");
+		await active.waitForIdle();
+		return { active, contexts, notices };
+	}
 
 	it("aborts the failed preview, then re-drives the model with the diagnostic", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "streaming-edit-recovery-"));
 		try {
-			await Bun.write(path.join(dir, "sample.txt"), "alpha\n");
-			const settings = Settings.isolated({
-				"edit.mode": "patch",
-				"edit.streamingAbort": true,
-				"compaction.enabled": false,
-				"retry.enabled": false,
-				"todo.enabled": false,
-				"advisor.enabled": false,
-			});
-			const toolSession = {
-				cwd: dir,
-				hasUI: false,
-				getSessionFile: () => null,
-				getSessionSpawns: () => "*",
-				enableLsp: false,
-				settings,
-				getArtifactsDir: () => null,
-				getSessionId: () => null,
-				getPlanModeState: () => undefined,
-			} as unknown as ToolSession;
-			const editTool = new EditTool(toolSession, "patch");
-			// EditTool narrows `params` beyond AgentTool's generic schema
-			// (same cast the ACP permission tests use); the session registry
-			// only consumes the AgentTool surface.
-			const agentEditTool = editTool as AgentTool;
-
-			const model = createMockModel({ provider: "anthropic", id: "claude-streaming-edit-recovery" }).model;
-			settings.setModelRole("default", `${model.provider}/${model.id}`);
-			const contexts: Context[] = [];
-			let call = 0;
-			const agent = new Agent({
-				getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
-				initialState: { model, systemPrompt: ["Test"], tools: [agentEditTool], messages: [] },
-				streamFn: (streamModel, context) => {
-					contexts.push(context);
-					call += 1;
-					return call === 1
-						? streamingEditFailureStream({
-								model: streamModel,
-								args: { path: "sample.txt", edits: [{ diff: "@@\n-missing\n+replacement\n" }] },
-							})
-						: textStream({ model: streamModel, text: "Recovered after preview failure." });
-				},
-				convertToLlm,
-			});
-			const active = new AgentSession({
-				agent,
-				sessionManager: SessionManager.inMemory(),
-				settings,
-				modelRegistry,
-				toolRegistry: new Map([["edit", agentEditTool]]),
-			});
-			session = active;
-			const notices: Array<Extract<AgentSessionEvent, { type: "notice" }>> = [];
-			active.subscribe(event => {
-				if (event.type === "notice") notices.push(event);
-			});
-
-			await active.prompt("Fix sample.txt");
-			await active.waitForIdle();
+			const { active, contexts, notices } = await promptPreviewFailure(dir);
 
 			// The failed run was followed by a second model call: the guard
 			// re-drove the turn instead of ending the prompt with nothing.
-			expect(call).toBe(2);
+			expect(contexts).toHaveLength(2);
 
 			// The second call carried the hidden recovery prompt as a developer
 			// message naming the diagnostic and the way out.
@@ -235,6 +247,28 @@ describe("AgentSession streaming edit preview recovery", () => {
 			);
 			if (!finalAssistant) throw new Error("expected a recovered final assistant message");
 			expect(messageText(finalAssistant)).toContain("Recovered");
+		} finally {
+			await removeWithRetries(dir);
+		}
+	}, 20_000);
+
+	it("stores the recovery prompt under the timestamp it was sent with", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "streaming-edit-recovery-"));
+		try {
+			// The clock the agent stamps messages with runs a second ahead of the one the session's entries are dated
+			// by, as when a millisecond passes between taking the recovery prompt and storing it.
+			const wallNow = Date.now.bind(Date);
+			vi.spyOn(Date, "now").mockImplementation(() => wallNow() + 1_000);
+			const { active } = await promptPreviewFailure(dir);
+
+			const isRecovery = (message: AgentMessage): message is CustomMessage =>
+				message.role === "custom" && message.customType === "streaming-edit-recovery";
+			const sent = active.agent.state.messages.find(isRecovery);
+			if (!sent) throw new Error("Expected the recovery prompt in agent state");
+			// A session read again from its entries names each turn by its role and timestamp (the image clamp's
+			// drops, the date/cwd reminder's placements): it must find the turn the agent sent.
+			const reread = active.sessionManager.buildSessionContext().messages.find(isRecovery);
+			expect(reread?.timestamp).toBe(sent.timestamp);
 		} finally {
 			await removeWithRetries(dir);
 		}

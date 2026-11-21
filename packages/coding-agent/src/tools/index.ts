@@ -385,6 +385,11 @@ export interface ToolSession {
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
 	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
+	/**
+	 * Why a call to the tool or `xd://` device `name`, bare or `xd://`-prefixed, is refused: a held settings change
+	 * disabled it while the bound prompt still lists it, until the rebuild. Undefined when calls to it run.
+	 */
+	heldToolRefusal?: (name: string) => string | undefined;
 	/** Current session context for eval-bridged tool execution. */
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Tool names the eval description advertises as callable from cells; frozen with the cached prompt prefix. */

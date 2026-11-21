@@ -7,7 +7,7 @@ import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage, type OverlayRebuild, reloadOverlay } from "./helpers/agent-session-setup";
+import { createInMemoryAuthStorage, RELOAD_CALLS, reloadOverlay } from "./helpers/agent-session-setup";
 import {
 	answer,
 	gatewayModelsYml,
@@ -152,13 +152,6 @@ const MINUTE_MS = 60_000;
 
 /** When the requests between the first request and the bound are made, in minutes after the first request. */
 const EARLY_REQUEST_MINUTES = [0.75, 1.5, 2.5, 3.5, 4.5, 5.25] as const;
-
-/** The calls of the session a reload of these overlays may start. */
-const RELOAD_CALLS: readonly OverlayRebuild[] = [
-	"refreshBaseSystemPrompt",
-	"reconcileBuiltinTools",
-	"holdToolDeclarationChange",
-];
 
 /**
  * Rewrites the overlay and reloads it as the config watcher does, then waits for each call of the session the change

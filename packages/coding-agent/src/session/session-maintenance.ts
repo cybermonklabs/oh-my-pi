@@ -595,14 +595,18 @@ interface RefusedSnapcompact {
 	afterTokens: number;
 	/** The branch leaf the pass was weighed on: a later point weighs the history that grew from it. */
 	leafId: string;
-	/** The session, newest compaction, model and method settings the archive was rendered for. */
+	/**
+	 * The newest compaction, model and method settings the archive was rendered for. It names no session: a copy of the
+	 * session (a fork, a branch into a new file, a move off a contested file) holds the same history.
+	 */
 	contextKey: string;
 }
 
 /**
  * The {@link RefusedSnapcompact} records one read of a session's entries holds, oldest first, with the session and
  * the read ({@link SessionManager.loadRevision}) they were read for, and the latest pass this process saw refused
- * since that read: a new read starts with none.
+ * since that read: a new read of the entries starts with none, while a copy of the session in this process (another
+ * session id at the same revision) keeps the one this process saw.
  */
 interface SnapcompactRefusals {
 	sessionId: string;
@@ -629,19 +633,74 @@ function isRecordedSnapcompactRefusal(data: unknown): data is RefusedSnapcompact
 }
 
 /**
- * The cut rule's last answer for an automatic model-summary compaction when it was "waits": the session and model it
- * was weighed for and the prompt cache entry it was weighed on, followed through each request that touched that entry
- * while it was live (`SessionMaintenance.#compactionWaits`).
+ * The cut rule's last answer for an automatic model-summary compaction when it was "waits": the model it was weighed
+ * for, the prompt cache entry it was weighed on, followed through each request that touched that entry while it was
+ * live (`SessionMaintenance.#compactionWaits`), the newest compaction on the branch then, and the branch leaf the rule
+ * answered at. It names no session: a copy of the session (a fork, a branch into a new file, a move off a contested
+ * file) sends the same history, and its requests read the same entry.
  */
 interface CompactionWait {
-	sessionId: string;
 	/** `provider/id` of the model the compaction was weighed for. */
 	modelKey: string;
 	entry: NonNullable<ContextCutSession["cacheEntry"]>;
+	/** Id of the branch's newest compaction when the rule answered, null with none: another one ends the wait. */
+	compactionId: string | null;
+	/** The branch leaf the rule answered at: a branch that does not carry it holds another history. */
+	leafId: string;
+}
+
+/**
+ * Custom session entry holding a {@link CompactionWait}, written each time the cut rule answers "waits" for an
+ * automatic model-summary compaction on figures the session's newest record does not hold, on the branch current
+ * then: a process that reads the session's entries in whole (from its file, or a copy of it) holds the wait of the
+ * newest record while it still applies, as the process that wrote it did.
+ */
+const COMPACTION_WAIT_ENTRY_TYPE = "compaction-wait";
+
+/**
+ * Custom session entry holding `{ version: 1 }`, written when a wait the session's newest
+ * {@link COMPACTION_WAIT_ENTRY_TYPE} record holds stops: the rule admits the compaction, or the wait no longer applies.
+ */
+const COMPACTION_WAIT_END_ENTRY_TYPE = "compaction-wait-end";
+
+function isRecordedCompactionWait(data: unknown): data is CompactionWait & { version: 1 } {
+	if (!isRecord(data) || data.version !== 1 || !isRecord(data.entry)) return false;
+	const { tier, touchedAt, ttlMs } = data.entry;
+	return (
+		typeof data.modelKey === "string" &&
+		typeof data.leafId === "string" &&
+		(typeof data.compactionId === "string" || data.compactionId === null) &&
+		(tier === "short" || tier === "long") &&
+		typeof touchedAt === "number" &&
+		(ttlMs === undefined || typeof ttlMs === "number")
+	);
+}
+
+function isRecordedCompactionWaitEnd(data: unknown): data is { version: 1 } {
+	return isRecord(data) && data.version === 1;
+}
+
+/**
+ * What one read of a session's entries records of the cut rule's waits: the newest {@link COMPACTION_WAIT_ENTRY_TYPE}
+ * record among them, undefined when there is none or a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record ends it, kept
+ * current by this process's own writes; the read it was taken for (the session's id and
+ * {@link SessionManager.loadRevision}); whether this process took it in since that read
+ * (`SessionMaintenance.#compactionWaits`); and whether the read copies one this process had taken in: another session
+ * id at the same revision (a `/fork`, a branch into a new file, a move off a contested file, `/new`), which holds the
+ * history this process held, part of it, or none of it.
+ */
+interface CompactionWaitRecords {
+	sessionId: string;
+	loadRevision: number;
+	newest: CompactionWait | undefined;
+	taken: boolean;
+	copied: boolean;
 }
 
 /** The figures of `entry` the cut rule reads, kept as they stand now. */
-function cacheEntryFigures(entry: ObservedPromptCacheEntry): NonNullable<ContextCutSession["cacheEntry"]> {
+function cacheEntryFigures(
+	entry: NonNullable<ContextCutSession["cacheEntry"]>,
+): NonNullable<ContextCutSession["cacheEntry"]> {
 	return { tier: entry.tier, touchedAt: entry.touchedAt, ttlMs: entry.ttlMs };
 }
 
@@ -730,23 +789,35 @@ export class SessionMaintenance {
 	/**
 	 * The refusals the session records ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}) on every branch and the latest pass
 	 * the cut rule refused after rendering ({@link #snapcompactMayBeAdmitted}): read once for each session the manager
-	 * holds and each time it reads the session's file (again after a switch to another session, or back to one another
-	 * process continued meanwhile), and kept current by this process's own writes ({@link #sessionSnapcompactRefusals}).
+	 * holds and each time it reads the session's entries in whole (again after a switch to another session, or back to
+	 * one another process continued meanwhile), and kept current by this process's own writes
+	 * ({@link #sessionSnapcompactRefusals}).
 	 */
 	#recordedSnapcompactRefusals: SnapcompactRefusals | undefined;
 	/**
 	 * The cut rule's last answer for an automatic model-summary compaction, while it was "waits". While it holds, no
-	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run.
+	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run. A
+	 * process that read the session's entries in whole takes it from the session's records, and one that copied the
+	 * session carries it to the copy ({@link #compactionWaits}).
 	 */
 	#compactionWait: CompactionWait | undefined;
 	/**
-	 * The read of the session's entries ({@link SessionManager.loadRevision}) when the cut rule last answered for an
-	 * automatic model-summary compaction ({@link #recordCompactionAnswer}); 0, as in a session this process began,
-	 * until it first answers. Another revision means this process read the session from its file (a resume, a
-	 * `/resume` switch) and knows no answer from before the read, while the process that wrote it may have been
-	 * waiting on the compaction ({@link deferThresholdCompactionToSpeculation} asks the rule first then).
+	 * The newest wait the session records ({@link COMPACTION_WAIT_ENTRY_TYPE}): read once for each session the manager
+	 * holds and each time it reads the session's entries in whole, and kept current by this process's own writes
+	 * ({@link #sessionCompactionWaits}).
 	 */
-	#compactionAnswerRevision = 0;
+	#recordedCompactionWaits: CompactionWaitRecords | undefined;
+	/**
+	 * The read ({@link #sessionCompactionWaits}) the cut rule last answered in for an automatic model-summary
+	 * compaction ({@link #recordCompactionAnswer}); undefined until it first answers. Another read means this process
+	 * holds another session, or read the session's entries again, since it answered: one it read (a resume, a `/resume`
+	 * switch, a fork of a session file) may have been waiting on the compaction in the process that wrote it, and a copy
+	 * (a `/fork`, a branch into a new file, a move off a contested file) may hold a branch the rule was not asked about.
+	 * It takes or carries the wait while that applies ({@link #compactionWaits}), and
+	 * {@link deferThresholdCompactionToSpeculation} asks the rule first otherwise; a session this process began, before
+	 * it first answers, has nothing to ask about.
+	 */
+	#compactionAnswerRead: CompactionWaitRecords | undefined;
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -952,52 +1023,169 @@ export class SessionMaintenance {
 
 	/**
 	 * Records the cut rule's answer for an automatic model-summary compaction: a wait on the entry the next request
-	 * reads, or nothing once the rule admitted it.
+	 * reads, or nothing once the rule admitted it. The session records it too, so a process that reads the session's
+	 * entries in whole holds the same wait: a wait on figures its newest record does not hold writes a
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record, and an answer that ends the recorded wait a
+	 * {@link COMPACTION_WAIT_END_ENTRY_TYPE} one.
 	 */
 	#recordCompactionAnswer(admitted: boolean): void {
 		const model = this.#model;
 		const entry = admitted || !model ? undefined : this.#nextPromptCacheEntry();
-		this.#compactionAnswerRevision = this.#host.sessionManager.loadRevision;
-		this.#compactionWait =
-			!model || !entry
+		const sessionManager = this.#host.sessionManager;
+		// The answer stands over the wait the session records.
+		const records = this.#sessionCompactionWaits();
+		records.taken = true;
+		this.#compactionAnswerRead = records;
+		const leafId = sessionManager.getLeafId();
+		const wait: CompactionWait | undefined =
+			!model || !entry || leafId === null
 				? undefined
 				: {
-						sessionId: this.#host.sessionManager.getSessionId(),
 						modelKey: `${model.provider}/${model.id}`,
 						entry: cacheEntryFigures(entry),
+						compactionId: getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null,
+						leafId,
 					};
+		this.#compactionWait = wait;
+		if (!wait) {
+			this.#endRecordedCompactionWait(records);
+			return;
+		}
+		const newest = records.newest;
+		if (
+			newest?.modelKey === wait.modelKey &&
+			newest.compactionId === wait.compactionId &&
+			newest.entry.tier === wait.entry.tier &&
+			newest.entry.touchedAt === wait.entry.touchedAt &&
+			newest.entry.ttlMs === wait.entry.ttlMs
+		) {
+			return;
+		}
+		const recorded: CompactionWait = { ...wait };
+		sessionManager.appendCustomEntry(COMPACTION_WAIT_ENTRY_TYPE, { version: 1, ...recorded });
+		records.newest = recorded;
 	}
 
 	/**
 	 * Whether the cut rule's last answer for an automatic model-summary compaction is still "waits" on the same cache
-	 * entry: same session and model, and the entry the next request reads is the one the rule waited on, readable, not
-	 * lapsed, and touched since only by requests that came while it was live. A lapse, an entry the next request
-	 * cannot read, a new entry, another session or model end the wait, as does a pass the rule admits (a forced reason
-	 * among them, {@link #recordCompactionAnswer}). The real pass asks the rule again at every maintenance point; this
-	 * only keeps a background summary from being requested, at a model call each, for a cut that cannot run yet.
+	 * entry: same model, the same newest compaction on the branch, and the entry the next request reads is the one the
+	 * rule waited on, readable, not lapsed, and touched since only by requests that came while it was live. A lapse, an
+	 * entry the next request cannot read, a new entry, another model or compaction end the wait, as does a pass the
+	 * rule admits (a forced reason among them, {@link #recordCompactionAnswer}); the session records the end. At each
+	 * new read of the session ({@link #sessionCompactionWaits}: another session id, or its entries read in whole) the
+	 * wait is taken in again ({@link #takeCompactionWait}). The real pass asks the rule again at every maintenance
+	 * point; this only keeps a background summary from being requested, at a model call each, for a cut that cannot
+	 * run yet.
 	 */
 	#compactionWaits(): boolean {
+		const records = this.#sessionCompactionWaits();
+		if (!records.taken) {
+			records.taken = true;
+			// Entries read in whole bring the records of every process that wrote them, which stand over the wait this
+			// process held. A copy this process made holds its own history, whose newest answer is the wait it held.
+			return this.#takeCompactionWait(records, records.copied ? this.#compactionWait : records.newest);
+		}
 		const wait = this.#compactionWait;
 		if (!wait) return false;
-		const model = this.#model;
 		const entry = this.#nextPromptCacheEntry();
-		if (
-			model &&
-			entry &&
-			!entry.refreshMissed &&
-			wait.sessionId === this.#host.sessionManager.getSessionId() &&
-			wait.modelKey === `${model.provider}/${model.id}` &&
-			entry.tier === wait.entry.tier &&
-			entry.touchedAt >= wait.entry.touchedAt &&
-			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
-			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
-			!promptCacheEntryLapsed(entry, Date.now())
-		) {
+		if (entry && entry.touchedAt >= wait.entry.touchedAt && this.#compactionWaitHolds(wait, entry)) {
 			wait.entry = cacheEntryFigures(entry);
 			return true;
 		}
 		this.#compactionWait = undefined;
+		this.#endRecordedCompactionWait(records);
 		return false;
+	}
+
+	/**
+	 * Takes `candidate` in as this process's wait at a new read of the session while it applies there: on a branch that
+	 * carries the leaf the rule answered at, as a wait holds ({@link #compactionWaitHolds}). The entry the next request
+	 * reads may now be the one the branch's newest reply left, touched a moment before the request the wait followed,
+	 * so the branch, not that touch, shows it is not an older one; the wait follows that entry from then on. With no
+	 * candidate that applies no wait stands, and the read's newest record is ended, as a wait that stops is.
+	 */
+	#takeCompactionWait(records: CompactionWaitRecords, candidate: CompactionWait | undefined): boolean {
+		const entry = this.#nextPromptCacheEntry();
+		if (
+			!candidate ||
+			!entry ||
+			this.#host.sessionManager.getBranchView().findLastIndex(branchEntry => branchEntry.id === candidate.leafId) <
+				0 ||
+			!this.#compactionWaitHolds(candidate, entry)
+		) {
+			this.#compactionWait = undefined;
+			this.#endRecordedCompactionWait(records);
+			return false;
+		}
+		this.#compactionWait = { ...candidate, entry: cacheEntryFigures(entry) };
+		return true;
+	}
+
+	/**
+	 * Whether `entry`, the one the next request reads, keeps `wait` as the session stands now: same model, the same
+	 * newest compaction on the branch, and a readable entry of the same tier, touched again before the entry the rule
+	 * waited on lapsed and not lapsed since.
+	 */
+	#compactionWaitHolds(wait: CompactionWait, entry: ObservedPromptCacheEntry): boolean {
+		const model = this.#model;
+		return (
+			model !== undefined &&
+			!entry.refreshMissed &&
+			wait.modelKey === `${model.provider}/${model.id}` &&
+			wait.compactionId === (getLatestCompactionEntry(this.#host.sessionManager.getBranchView())?.id ?? null) &&
+			entry.tier === wait.entry.tier &&
+			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
+			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
+			!promptCacheEntryLapsed(entry, Date.now())
+		);
+	}
+
+	/**
+	 * The newest wait the session's entries record, on every branch ({@link #recordedCompactionWaits}): the newest
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record, whichever session wrote it (a copy of the session holds the records of
+	 * the session it copies), unless a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record follows it. Read again for each
+	 * session id the manager holds and each read of its entries in whole; a new read is not taken in yet
+	 * ({@link #compactionWaits}).
+	 */
+	#sessionCompactionWaits(): CompactionWaitRecords {
+		const sessionManager = this.#host.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const loadRevision = sessionManager.loadRevision;
+		const cached = this.#recordedCompactionWaits;
+		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached;
+		let newest: CompactionWait | undefined;
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type !== "custom") continue;
+			const data = entry.data;
+			if (entry.customType === COMPACTION_WAIT_ENTRY_TYPE) {
+				if (isRecordedCompactionWait(data)) {
+					newest = {
+						modelKey: data.modelKey,
+						entry: cacheEntryFigures(data.entry),
+						compactionId: data.compactionId,
+						leafId: data.leafId,
+					};
+				}
+			} else if (entry.customType === COMPACTION_WAIT_END_ENTRY_TYPE && isRecordedCompactionWaitEnd(data)) {
+				newest = undefined;
+			}
+		}
+		const read: CompactionWaitRecords = {
+			sessionId,
+			loadRevision,
+			newest,
+			taken: false,
+			copied: cached?.taken === true && cached.loadRevision === loadRevision,
+		};
+		this.#recordedCompactionWaits = read;
+		return read;
+	}
+
+	/** Records that the wait the session's newest record holds stopped, if it holds one. */
+	#endRecordedCompactionWait(records: CompactionWaitRecords): void {
+		if (!records.newest) return;
+		this.#host.sessionManager.appendCustomEntry(COMPACTION_WAIT_END_ENTRY_TYPE, { version: 1 });
+		records.newest = undefined;
 	}
 
 	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */
@@ -2748,13 +2936,17 @@ export class SessionMaintenance {
 	 * async compaction is disabled, or when a `session_before_compact`
 	 * extension must keep exact blocking semantics.
 	 *
-	 * A process that read the session from its file (a resume, a `/resume`
-	 * switch) asks the cut rule before its first summary since the read, with
-	 * the figures the real pass weighs (`pendingContextTokens`: the pending
-	 * prompt counted in `contextTokens`), and keeps the answer: the process
-	 * that wrote the session may have been waiting on this compaction on the
-	 * entry the next request reads, starting no summary, and a wait starts
-	 * none here either.
+	 * A process that holds the session under another read than the one it
+	 * last asked the cut rule in ({@link #compactionAnswerRead}: it read the
+	 * session's entries in whole, a resume, a `/resume` switch, a fork of a
+	 * session file, or copied it, a `/fork`, a branch into a new file, a move
+	 * off a contested file) takes or carries the wait while it still applies
+	 * ({@link #compactionWaits}); with none, it asks the cut rule before its
+	 * first summary since, with the figures the real pass weighs
+	 * (`pendingContextTokens`: the pending prompt counted in `contextTokens`),
+	 * and keeps the answer: the process that wrote the session may have been
+	 * waiting on this compaction on the entry the next request reads, starting
+	 * no summary, and a wait starts none here either.
 	 */
 	deferThresholdCompactionToSpeculation(
 		contextTokens: number,
@@ -2794,7 +2986,10 @@ export class SessionMaintenance {
 			}
 			return true; // still summarizing in the background
 		}
-		if (this.#compactionAnswerRevision !== this.#host.sessionManager.loadRevision) {
+		const answered = this.#compactionAnswerRead;
+		const records = this.#sessionCompactionWaits();
+		// A session this process began has nothing to ask about until it first answers.
+		if (answered === undefined ? records.loadRevision !== 0 : answered !== records) {
 			// The summary cuts nothing, so the admitted-cut listeners hear nothing; the real pass asks again before it
 			// commits one.
 			const cut = this.#compactionCutBeforeStart(
@@ -5662,9 +5857,11 @@ export class SessionMaintenance {
 	 * context it was rendered for stands ({@link #snapcompactContextKey}, on a branch that carries the leaf it was
 	 * weighed on): the pass starts, runs its hooks and renders again only when those figures are admitted (the context
 	 * grew, the entry lapsed or cannot be read, the reason forces the cut), or once that context is gone (a branch
-	 * without that leaf, another session, a compaction, another model or method settings). The refusal is kept in the
-	 * session as well ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}), so a process that resumes it weighs the same figures on
-	 * the same branches, one continued from the refused leaf itself, which does not carry the record, included.
+	 * without that leaf, another session's included, a compaction, another model or method settings). A copy of the
+	 * session (a `/fork`, a branch into a new file, a move off a contested file) holds the same history, so the refusal
+	 * stands there too. The refusal is kept in the session as well ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}), so a
+	 * process that resumes it weighs the same figures on the same branches, one continued from the refused leaf itself,
+	 * which does not carry the record, included.
 	 */
 	#snapcompactMayBeAdmitted(
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
@@ -5708,9 +5905,12 @@ export class SessionMaintenance {
 	 * The refusals the session records on every branch, oldest first, and the refusal this process remembers since
 	 * they were read ({@link #recordedSnapcompactRefusals}). Each record sits after the refused leaf on the branch
 	 * current when it was written, while the process that wrote it weighs it on every branch that carries that leaf, so
-	 * a process that resumes the session reads them all. A new read remembers no refusal: read again from the session's
-	 * file, the records hold every process's refusals, and the newest that applies stands over this process's own
-	 * (another process may have refused a pass on a branch that carries this one's leaf since).
+	 * a process that resumes the session reads them all. A read of the entries in whole remembers no refusal: the
+	 * records hold every process's refusals, and the newest that applies stands over this process's own (another
+	 * process may have refused a pass on a branch that carries this one's leaf since). A copy of the session this
+	 * process made (another session id at the same revision: a `/fork`, a branch into a new file, a move off a contested
+	 * file) holds this process's history, so it keeps the refusal the process remembers, which a branch copied up to
+	 * the refused leaf holds no record of.
 	 */
 	#sessionSnapcompactRefusals(): SnapcompactRefusals {
 		const sessionManager = this.#host.sessionManager;
@@ -5726,7 +5926,12 @@ export class SessionMaintenance {
 				refusals.push({ afterTokens: data.afterTokens, leafId: data.leafId, contextKey: data.contextKey });
 			}
 		}
-		const read: SnapcompactRefusals = { sessionId, loadRevision, refusals, remembered: undefined };
+		const read: SnapcompactRefusals = {
+			sessionId,
+			loadRevision,
+			refusals,
+			remembered: cached?.loadRevision === loadRevision ? cached.remembered : undefined,
+		};
 		this.#recordedSnapcompactRefusals = read;
 		return read;
 	}
@@ -5738,13 +5943,12 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * What a snapcompact archive is rendered for besides the history it summarizes: the session, the newest compaction
-	 * on `branch`, the reading model, the method `settings` and the archive shape setting.
+	 * What a snapcompact archive is rendered for besides the history it summarizes: the newest compaction on `branch`,
+	 * the reading model, the method `settings` and the archive shape setting.
 	 */
 	#snapcompactContextKey(branch: readonly SessionEntry[], settings: EngineCompactionSettings): string {
 		const model = this.#model;
 		return JSON.stringify([
-			this.#host.sessionManager.getSessionId(),
 			getLatestCompactionEntry(branch)?.id,
 			model && `${model.provider}/${model.id}`,
 			settings,

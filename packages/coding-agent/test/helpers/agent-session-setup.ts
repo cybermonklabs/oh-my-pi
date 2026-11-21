@@ -73,6 +73,16 @@ export type OverlayRebuild =
 	| "refreshSkillsAndCommands"
 	| "holdToolDeclarationChange";
 
+/**
+ * The calls of the session a reload that changes the prompt or the tools may start (a memory switch among them): the
+ * prompt rebuild, the tool reconcile, and the hold of a change no rebuild takes.
+ */
+export const RELOAD_CALLS: readonly OverlayRebuild[] = [
+	"refreshBaseSystemPrompt",
+	"reconcileBuiltinTools",
+	"holdToolDeclarationChange",
+];
+
 /** How {@link reloadOverlay} waits for the calls a reload starts. */
 export interface ReloadOverlayOptions {
 	/**
