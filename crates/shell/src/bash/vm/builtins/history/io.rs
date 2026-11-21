@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash::{
 	diag,
-	fs::{FsPoll, OpenFlags, SeekFrom, Stat},
+	fs::{FsPoll, OpenFlags, Stat},
 	host::Deadline,
 	vm::{
 		Cx,
@@ -393,9 +393,11 @@ fn read(
 	}
 }
 
-/// [`HistOp::Write`]: open, then write `data` from where the file stood
-/// once opened (kept, as 8 bytes, in the scratch's input buffer: the
-/// file's position tells how much was written).
+/// [`HistOp::Write`]: open, then write `data`. How much is written is a
+/// count, kept as 8 bytes in the scratch's input buffer and set to 0 when
+/// the open starts; never the file's position, which a FIFO, a pipe or a
+/// socket does not have (the seek fails, and the whole history would go
+/// out again on every poll).
 fn write(
 	tcx: &mut Context<'_>,
 	cx: &mut Cx<'_>,
@@ -410,14 +412,20 @@ fn write(
 		WriteHow::Append => OpenFlags::APPEND,
 		WriteHow::Excl => OpenFlags::EXCL,
 	});
-	// The file's position once opened, beside `sc.live` (the file).
+	// The count of bytes written, beside `sc.live` (the file).
 	let input = &mut sc.io.get_or_insert_with(Box::default).input;
 	loop {
 		match &mut sc.live {
-			Live::None => match cx.host.fs().open(BStr::new(path), flags, mode) {
-				FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
-				FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
-				FsPoll::Pending(f) => sc.live = Live::Open(f),
+			Live::None => {
+				// A new write: what an earlier op left in the buffer is no
+				// count of this one.
+				input.clear();
+				input.extend_from_slice(&0u64.to_le_bytes());
+				match cx.host.fs().open(BStr::new(path), flags, mode) {
+					FsPoll::Ready(Ok(f)) => sc.live = Live::File(f),
+					FsPoll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
+					FsPoll::Pending(f) => sc.live = Live::Open(f),
+				}
 			},
 			Live::Open(f) => match f.poll(tcx) {
 				Poll::Ready(Ok(file)) => sc.live = Live::File(file),
@@ -425,25 +433,10 @@ fn write(
 				Poll::Pending => return Poll::Pending,
 			},
 			Live::File(f) => {
-				let known = input
+				let done = input
 					.get(..8)
-					.map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
-				let start = if let Some(s) = known {
-					s
-				} else {
-					let at = if how == WriteHow::Append {
-						f.seek(SeekFrom::End(0))
-					} else {
-						f.seek(SeekFrom::Current(0))
-					};
-					let at = at.unwrap_or(0);
-					input.clear();
-					input.extend_from_slice(&at.to_le_bytes());
-					at
-				};
-				let done = f
-					.seek(SeekFrom::Current(0))
-					.map_or(0, |p| usize::try_from(p.saturating_sub(start)).unwrap_or(0));
+					.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+				let done = usize::try_from(done).unwrap_or(usize::MAX);
 				let rest = data.get(done..).unwrap_or_default();
 				if rest.is_empty() {
 					return match f.poll_flush(tcx) {
@@ -457,7 +450,11 @@ fn write(
 						let e = io::Error::from(io::ErrorKind::WriteZero);
 						return Poll::Ready(Err(HistErr::of(&e)));
 					},
-					Poll::Ready(Ok(_)) => {},
+					Poll::Ready(Ok(n)) => {
+						let total = u64::try_from(done.saturating_add(n)).unwrap_or(u64::MAX);
+						input.clear();
+						input.extend_from_slice(&total.to_le_bytes());
+					},
 					Poll::Ready(Err(e)) => return Poll::Ready(Err(HistErr::of(&e))),
 					Poll::Pending => return Poll::Pending,
 				}
