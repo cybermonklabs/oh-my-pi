@@ -978,8 +978,8 @@ describe("the transaction runner's state table", () => {
 		storage.blobTier.store(IMAGE_HASH, IMAGE, "image/png");
 		storage.blobTier.store(ICON_HASH, ICON, "image/png");
 		const writer = storage.openWriter(FILE);
-		// The line names the icon first, which no pass tries: the append rejects for it, with the image's last
-		// error as its cause.
+		// The line names the icon first, which no pass tries: the append rejects for a named blob, with the image's
+		// last error as its cause.
 		const line = `{"type":"message","images":["blob:sha256:${ICON_HASH}","blob:sha256:${IMAGE_HASH}"]}\n`;
 		const error = await rejection(writer.append(line));
 		expect({ reserved: tried().length, closes: closes() }).toEqual({ reserved: 3 * attempts, closes: 3 * attempts });
