@@ -161,21 +161,26 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 		expect(last?.role === "assistant" && last.content).toContainEqual({ type: "text", text: "done after restore" });
 	});
 
-	for (const [label, relaunched, ran] of [
+	for (const [label, skipped, ran] of [
 		[
 			"does not run again a cut-off call whose subagent restore relaunched, gives it a result naming the subagent, and runs the batch's other call again",
-			{ call_1: ["Worker"] },
+			{ relaunched: { call_1: ["Worker"] } },
+			["second"],
+		],
+		[
+			"does not run again a cut-off call an earlier restore did not run again, whose subagent ran since, and says where its result is",
+			{ ran: { call_1: ["Worker"] } },
 			["second"],
 		],
 		[
 			"control: runs every call of the cut-off batch again when restore relaunched no subagent",
-			{},
+			{ relaunched: {} },
 			["first", "second"],
 		],
 	] as const) {
 		it(label, async () => {
-			// If this regresses, a call that started a subagent `--restore` relaunched runs again: its subagent's work
-			// starts a second time beside the relaunched one, and the parent gets two results for it.
+			// If this regresses, a call that started a subagent `--restore` relaunched, now or at an earlier restore,
+			// runs again: its subagent's work starts a second time, and the parent gets two results for it.
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 			const executed: string[] = [];
@@ -196,7 +201,7 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 				[{ content: ["done after restore"], stopReason: "stop" }],
 			);
 
-			await expect(session.restoreInterruptedTurn({ relaunched })).resolves.toBe(true);
+			await expect(session.restoreInterruptedTurn(skipped)).resolves.toBe(true);
 			await session.waitForIdle();
 
 			expect(executed).toEqual([...ran]);
@@ -208,10 +213,17 @@ describe("AgentSession.restoreInterruptedTurn (omp --restore)", () => {
 				first?.role === "toolResult"
 					? first.content.map(part => (part.type === "text" ? part.text : "")).join("")
 					: "";
-			if ("call_1" in relaunched) {
+			if ("relaunched" in skipped && "call_1" in skipped.relaunched) {
 				expect(text).toContain("is not run again");
 				expect(text).toContain("Subagent Worker it started was relaunched by --restore and goes on with its work.");
 				expect(text).toContain("as its own follow-up turn unless a `wait` takes it");
+				expect(text).toContain(
+					"Any of this call's work that had not started when it was cut off did not run either",
+				);
+			} else if ("ran" in skipped) {
+				expect(text).toContain("is not run again");
+				expect(text).toContain("Subagent Worker it started is not running");
+				expect(text).toContain("read it with `read agent://Worker`");
 			} else {
 				expect(text).not.toContain("is not run again");
 			}

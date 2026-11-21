@@ -400,14 +400,25 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 				);
 			}
 		}
-		if (name === "wait") {
-			// A wait hands the cell its settled jobs' results and consumes them, so no delivery records the
-			// handover: record each subagent's before the cell gets it, and name it in the eval result.
-			const handed = waitHandedSubagents(result.details);
-			if (handed.length > 0) {
-				const handedAt = await recordHandovers(options.session, handed);
-				options.onAgentResults?.(handed.map((run, index) => ({ id: run.agentId, handedAt: handedAt[index]! })));
-			}
+		// A wait hands the cell its settled jobs' results and consumes them, so no delivery records the
+		// handover: record each subagent's before the cell gets it, and name it in the eval result. A kill
+		// (`tool.write` to `proc://<id>/kill`; the prelude's `write()` rejects protocol paths) of a job that had
+		// settled does the same, and its result is the same job report. Each settled job's report names the
+		// subagents its result hands over too (a work pool's workers). An aborted run is named, not recorded.
+		const jobReport = name === "wait" ? result.details : killJobReport(name, result.details);
+		const handed = waitHandedSubagents(jobReport);
+		if (handed.length > 0) {
+			const settled = handed.filter(run => !run.aborted && !run.workerLost);
+			const handedAt = await recordHandovers(options.session, settled);
+			const at = new Map(settled.map((run, index) => [run, handedAt[index]!]));
+			options.onAgentResults?.(
+				handed.map(run => ({
+					id: run.agentId,
+					...(run.aborted ? { aborted: true } : {}),
+					...(run.workerLost ? { workerLost: true } : {}),
+					handedAt: at.get(run) ?? Date.now(),
+				})),
+			);
 		}
 		const replies = reply === undefined ? toolResultReplies(result.details) : [reply];
 		if (replies.length > 0) {
@@ -422,4 +433,10 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		});
 		throw error;
 	}
+}
+
+/** The job report a `write` result holds when it killed a job (`write proc://<id>/kill`): its `proc` details. */
+function killJobReport(name: string, details: unknown): unknown {
+	if (name !== "write" || !isRecord(details) || !isRecord(details.proc)) return undefined;
+	return details.proc.op === "cancel" ? details.proc : undefined;
 }

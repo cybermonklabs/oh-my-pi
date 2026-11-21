@@ -395,6 +395,7 @@ import {
 	INTERRUPTED_TURN_ERROR,
 	ownedJobsAbortReason,
 	restoreSkippedCallReason,
+	type RestoreSkippedCalls,
 	plainTurnAbortReason,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
@@ -1099,10 +1100,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#exitRecorded = false;
 	/**
 	 * Cut-off calls `restoreInterruptedTurn` does not run again, each with the subagents it
-	 * started that `omp --restore` relaunched; {@link #beforeToolCall} blocks each once. Cleared
-	 * when the continuation's run ends.
+	 * started that `omp --restore` relaunched and those it relaunched earlier that are not
+	 * running now ({@link RestoreSkippedCalls}); {@link #beforeToolCall} blocks each once.
+	 * Cleared when the continuation's run ends.
 	 */
-	#restoreSkippedCalls: Map<string, readonly string[]> | undefined;
+	#restoreSkippedCalls: Map<string, { relaunched: readonly string[]; ran: readonly string[] }> | undefined;
 	/** Last observed `workspace.additionalDirectories`, diffed on change to add/remove only settings-seeded roots. */
 	#settingsWorkspaceDirectories: readonly string[] = [];
 	/** Last observed auto-QA gate; the system prompt advertises `xd://report_issue` only while it holds. */
@@ -5838,10 +5840,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
-		const relaunched = this.#restoreSkippedCalls?.get(ctx.toolCall.id);
-		if (relaunched) {
+		const skipped = this.#restoreSkippedCalls?.get(ctx.toolCall.id);
+		if (skipped) {
 			this.#restoreSkippedCalls?.delete(ctx.toolCall.id);
-			return { block: true, reason: restoreSkippedCallReason(relaunched) };
+			return { block: true, reason: restoreSkippedCallReason(skipped.relaunched, skipped.ran) };
 		}
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
@@ -13485,10 +13487,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
 	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
 	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A call in `options.relaunched` does not run again: it started
-	 * subagents restore relaunched, whose results come as follow-up turns, so running it
-	 * again would start that work twice; it gets a result that says so
-	 * ({@link restoreSkippedCallReason}), and the batch's other calls run again. A turn
+	 * transcript stops. A call in `options.relaunched` or `options.ran` does not run again:
+	 * it started subagents restore relaunched, whose results come as follow-up turns, or that
+	 * an earlier restore relaunched and that ran since, so running it again would start that
+	 * work twice; it gets a result that says so ({@link restoreSkippedCallReason}), and the
+	 * batch's other calls run again. A turn
 	 * that failed because no request could resolve its provider key is retried the same
 	 * way, even after a normal exit: nothing was sent, and a worker that exits on it has
 	 * nothing else to resume it. A turn that finished, failed otherwise, or the user
@@ -13497,9 +13500,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * @returns whether a continuation was scheduled; false while a turn runs, without
 	 * a model, or with nothing left unfinished.
 	 */
-	async restoreInterruptedTurn(
-		options: { relaunched?: Readonly<Record<string, readonly string[]>> } = {},
-	): Promise<boolean> {
+	async restoreInterruptedTurn(options: RestoreSkippedCalls = {}): Promise<boolean> {
 		const branch = this.sessionManager.getBranch();
 		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
 		const model = this.model;
@@ -13514,8 +13515,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.sessionManager.appendMessage(abort);
 			this.replaceMessagesFromSessionContext(this.buildDisplaySessionContext().messages);
 		}
-		const relaunched = Object.entries(options.relaunched ?? {}).filter(([, ids]) => ids.length > 0);
-		this.#restoreSkippedCalls = relaunched.length > 0 ? new Map(relaunched) : undefined;
+		const skipped = new Map<string, { relaunched: readonly string[]; ran: readonly string[] }>();
+		for (const [callId, ids] of Object.entries(options.relaunched ?? {})) {
+			if (ids.length > 0) skipped.set(callId, { relaunched: ids, ran: [] });
+		}
+		for (const [callId, ids] of Object.entries(options.ran ?? {})) {
+			if (ids.length > 0) skipped.set(callId, { relaunched: skipped.get(callId)?.relaunched ?? [], ran: ids });
+		}
+		this.#restoreSkippedCalls = skipped.size > 0 ? skipped : undefined;
 		const scheduled = await this.retry();
 		if (!scheduled) this.#restoreSkippedCalls = undefined;
 		return scheduled;
@@ -14599,7 +14606,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.sessionManager.flush();
 		// Last refusal point. Nothing below is rolled back when the transition stops, so an
 		// idle-only snapshot refuses here, after the flush awaits but before any state of the
-		// old session (pending messages, async jobs, auto-learn capture) is discarded.
+		// old session (pending messages, auto-learn capture) is discarded.
 		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 
 		// Clear pending messages (bound to old session state)
@@ -14609,7 +14616,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -14636,6 +14642,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As on a switch: the outgoing session's background jobs share this agent id, so their
+			// results would otherwise land in the new transcript (their deliveries wait while the
+			// transition runs). They are cancelled once the new session exists, so a work pool this
+			// stops records its discards in the session the user goes on with, which kept the pool's
+			// spawn records, as well as in the one it left. Only a delivery waits: on the empty-session
+			// path (a branch from a user message that is the session's first entry) the manager's
+			// `newSession` and `setSessionName` await after the swap, so a record a running job or cell
+			// appends in that window, such as a pool's spawn record or an eval cell's handover record,
+			// goes into the new session.
+			this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 			this.#clearSessionScopedToolState();
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
@@ -14738,7 +14754,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
@@ -14761,6 +14776,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
+			// As in {@link #branchIntoNewSession}: cancelled once the new session exists. Before the
+			// branch, a work pool this stops would append its discards to the leaf this branch is
+			// pinned to, and the branch would refuse the changed session.
+			this.#cancelOwnAsyncJobs(plainTurnAbortReason("stop"));
 
 			this.#clearSessionScopedToolState();
 

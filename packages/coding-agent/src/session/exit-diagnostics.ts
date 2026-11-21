@@ -356,17 +356,54 @@ export function sessionExitFollowsLastMessage(entries: readonly SessionEntry[]):
 }
 
 /**
- * The result text of a cut-off call `omp --restore` does not run again because restore
- * relaunched the subagents it started (`relaunched`): the model reads that the work goes on
- * and that each result arrives when it is done.
+ * The calls of a restored turn's cut-off batch that `omp --restore` does not run again, each with
+ * the subagents it started: those restore relaunched now (`relaunched`), and those an earlier
+ * restore already relaunched for it that are not running now (`ran`: the call's result on the
+ * branch is that restore's skip, {@link isRestoreSkippedCallResult}).
  */
-export function restoreSkippedCallReason(relaunched: readonly string[]): string {
-	const names = relaunched.join(", ");
-	const work =
-		relaunched.length === 1
-			? `Subagent ${names} it started was relaunched by --restore and goes on with its work. Its result arrives`
-			: `Subagents ${names} it started were relaunched by --restore and go on with their work. Each result arrives`;
-	return `This call was cut off when the previous process ended and is not run again: ${work} when it is done (as its own follow-up turn unless a \`wait\` takes it); do not start that work again.`;
+export interface RestoreSkippedCalls {
+	relaunched?: Readonly<Record<string, readonly string[]>>;
+	ran?: Readonly<Record<string, readonly string[]>>;
+}
+
+/** How every skip result {@link restoreSkippedCallReason} writes begins. */
+const RESTORE_SKIPPED_CALL_PREFIX = "This call was cut off when the previous process ended and is not run again:";
+
+/**
+ * The result text of a cut-off call `omp --restore` does not run again because it started
+ * subagents: those restore relaunched (`relaunched`), whose results arrive when they are done, and
+ * those that ran before (`ran`), whose results did not reach the session. The call's other work
+ * did not run: a call that started any subagent is not run again, so work it had not started yet
+ * (a later item, the rest of a cell) is the model's to start again.
+ */
+export function restoreSkippedCallReason(relaunched: readonly string[], ran: readonly string[] = []): string {
+	const parts: string[] = [];
+	if (relaunched.length === 1) {
+		parts.push(
+			`Subagent ${relaunched[0]} it started was relaunched by --restore and goes on with its work. Its result arrives when it is done (as its own follow-up turn unless a \`wait\` takes it).`,
+		);
+	} else if (relaunched.length > 1) {
+		parts.push(
+			`Subagents ${relaunched.join(", ")} it started were relaunched by --restore and go on with their work. Each result arrives when it is done (as its own follow-up turn unless a \`wait\` takes it).`,
+		);
+	}
+	if (ran.length === 1) {
+		parts.push(
+			`Subagent ${ran[0]} it started is not running: it ran before the previous process ended, and its result did not reach this session; read it with \`read agent://${ran[0]}\`.`,
+		);
+	} else if (ran.length > 1) {
+		parts.push(
+			`Subagents ${ran.join(", ")} it started are not running: they ran before the previous process ended, and their results did not reach this session; read each with \`read agent://<id>\`.`,
+		);
+	}
+	return `${RESTORE_SKIPPED_CALL_PREFIX} ${parts.join(" ")} Do not start that work again. Any of this call's work that had not started when it was cut off did not run either: start that again if it is still needed.`;
+}
+
+/** Whether `message` is the result {@link restoreSkippedCallReason} gave a call `omp --restore` did not run again. */
+export function isRestoreSkippedCallResult(message: AgentMessage): boolean {
+	if (message.role !== "toolResult" || !message.isError) return false;
+	const first = message.content[0];
+	return first?.type === "text" && first.text.startsWith(RESTORE_SKIPPED_CALL_PREFIX);
 }
 
 /** Pairs unresolved calls at the end of an interrupted turn with result messages. */

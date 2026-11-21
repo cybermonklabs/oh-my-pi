@@ -8,10 +8,12 @@
  * settled run, and a work pool's worker. A cell's `wait()` and a bridged `tool.wait` write
  * `delivered` first and then hand the result over, so a process that goes away between the two
  * leaves `delivered`, and restore never runs that run again; a background `task` spawn's result
- * a bridged `tool.wait` hands a cell is recorded the same way, and so is each worker's batch
- * the pool's aggregate result or a `peek` hands over. A handle's `status()`, `done()` and
- * `attempts()` hand the cell no result and write nothing. A result the session receives as an
- * `async-result` message needs no marker: that message is the handover and its record at once.
+ * a bridged `tool.wait` or a cell's kill of a settled job hands a cell is recorded the same way,
+ * and so is each worker whose latest batch a `peek` hands over, and each worker a work pool's
+ * aggregate result names (its job report's `agentResults`) when such a call returns that result.
+ * A handle's `status()`, `done()` and `attempts()` hand the cell no result and write nothing. A
+ * result the session receives as an `async-result` message, a `wait` result or a kill's needs no
+ * marker: that entry is the handover and its record at once, and names a pool's workers too.
  */
 import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";
@@ -27,24 +29,38 @@ export type EvalAgentJobState = "owed" | "delivered";
 export interface EvalAgentJobRecord {
 	agentId: string;
 	state: EvalAgentJobState;
+	/**
+	 * With `owed`: the parent's top-level calls the run is owed for, when they differ from the one its
+	 * spawn record names (a kept-alive work pool worker's later batch, whose items later `eval` calls
+	 * pushed). `omp --restore` matches the run to a cut-off call by its latest `owed` record's calls.
+	 */
+	spawnCallIds?: string[];
 }
 
 /**
  * Appends `state` for each of `agentIds` to `session`'s transcript, then waits until the records
- * are on disk. Nothing is written or flushed for no ids or a session without a transcript.
+ * are on disk, and returns the appended entries' ids (a work pool keeps those of its `owed` records,
+ * to find the sessions that hold its spawns). Nothing is written or flushed for no ids or a session
+ * without a transcript. An `owed` record names `spawnCallIds` when given.
  */
 export async function recordEvalAgentJobs(
 	session: ToolSession,
 	agentIds: readonly string[],
 	state: EvalAgentJobState,
-): Promise<void> {
+	spawnCallIds?: readonly string[],
+): Promise<string[]> {
 	const manager = session.sessionManager;
-	if (!manager || agentIds.length === 0) return;
+	if (!manager || agentIds.length === 0) return [];
+	const entryIds: string[] = [];
 	for (const agentId of agentIds) {
-		const record: EvalAgentJobRecord = { agentId, state };
-		manager.appendCustomEntry(EVAL_AGENT_JOB_CUSTOM_TYPE, record);
+		const record: EvalAgentJobRecord =
+			state === "owed" && spawnCallIds?.length
+				? { agentId, state, spawnCallIds: [...spawnCallIds] }
+				: { agentId, state };
+		entryIds.push(manager.appendCustomEntry(EVAL_AGENT_JOB_CUSTOM_TYPE, record));
 	}
 	await manager.flush();
+	return entryIds;
 }
 
 /** The handover record of one job run: when it was first handed over (epoch ms), and its write and flush. */
@@ -97,7 +113,7 @@ export async function recordHandovers(
 			session,
 			fresh.map(run => run.agentId),
 			"delivered",
-		);
+		).then(() => {});
 		for (const run of fresh) byRun.set(runKey(run), { at, written });
 		written.catch(() => {
 			for (const run of fresh) if (byRun.get(runKey(run))?.written === written) byRun.delete(runKey(run));
@@ -108,18 +124,41 @@ export async function recordHandovers(
 	return recorded.map(handover => handover.at);
 }
 
+/** A subagent run a job report hands its caller, keyed for {@link recordHandovers}, with the run-end flags it records. */
+export interface HandedRun {
+	agentId: string;
+	jobId: string;
+	aborted?: boolean;
+	workerLost?: boolean;
+}
+
 /**
- * The settled subagent jobs a `wait` tool result hands its caller: each listed job that is no
- * longer running and has a subagent (`agentUrlId`), with its job id.
+ * The settled subagent jobs a job report hands its caller: a `wait` tool result, or a kill's
+ * (`write proc://<id>/kill` of a job that had settled, whose report lists the jobs as a `wait`
+ * does). Each listed job that is no longer running and has a subagent (`agentUrlId`), with its job
+ * id, and the subagents such a job's result hands over (its `agentResults`: a work pool's workers),
+ * each keyed by the job and with its run-end flags.
  */
-export function waitHandedSubagents(details: unknown): Array<{ agentId: string; jobId: string }> {
+export function waitHandedSubagents(details: unknown): HandedRun[] {
 	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
-	const handed: Array<{ agentId: string; jobId: string }> = [];
+	const handed: HandedRun[] = [];
 	for (const job of details.jobs) {
 		if (!isRecord(job) || job.status === "running") continue;
 		const agentId = stringProperty(job, "agentUrlId");
 		const jobId = stringProperty(job, "id");
 		if (agentId && jobId) handed.push({ agentId, jobId });
+		if (!jobId || !Array.isArray(job.agentResults)) continue;
+		for (const result of job.agentResults) {
+			if (!isRecord(result)) continue;
+			const id = stringProperty(result, "id");
+			if (!id) continue;
+			handed.push({
+				agentId: id,
+				jobId,
+				...(result.aborted === true ? { aborted: true } : {}),
+				...(result.workerLost === true ? { workerLost: true } : {}),
+			});
+		}
 	}
 	return handed;
 }
@@ -130,5 +169,10 @@ export function readEvalAgentJobRecord(entry: SessionEntry): EvalAgentJobRecord 
 	const { data } = entry;
 	if (!isRecord(data) || typeof data.agentId !== "string") return undefined;
 	if (data.state !== "owed" && data.state !== "delivered") return undefined;
-	return { agentId: data.agentId, state: data.state };
+	const calls = Array.isArray(data.spawnCallIds)
+		? data.spawnCallIds.filter((call): call is string => typeof call === "string")
+		: [];
+	return calls.length > 0
+		? { agentId: data.agentId, state: data.state, spawnCallIds: calls }
+		: { agentId: data.agentId, state: data.state };
 }

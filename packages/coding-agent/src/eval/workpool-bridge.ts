@@ -7,7 +7,7 @@ import {
 	normalizeModelSelector,
 	resolveEffectiveSubagentPolicy,
 } from "../task/structured-subagent";
-import { type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
+import { settledWorkerResults, type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
@@ -134,11 +134,14 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		const peeked = pool.peek();
 		// A settled batch's output reaches the cell here: record that handover, on disk, before the cell gets it,
 		// so `omp --restore` does not run that worker's turn again for an owner that already holds its result.
+		// Only a worker whose latest batch settled: a peek that shows a kept-alive worker's earlier batch while its
+		// newer one runs hands over nothing of the turn it owes. A cancelled batch's aborted run settles nothing.
+		const latest = new Map(peeked.batches.map(batch => [batch.agent, batch.id]));
 		await recordHandovers(
 			options.session,
-			peeked.batches
-				.filter(batch => batch.status !== "running")
-				.map(batch => ({ agentId: batch.agent, jobId: batch.id })),
+			settledWorkerResults(peeked.batches)
+				.filter(result => !result.aborted)
+				.map(result => ({ agentId: result.id, jobId: latest.get(result.id)! })),
 		);
 		return peeked;
 	}

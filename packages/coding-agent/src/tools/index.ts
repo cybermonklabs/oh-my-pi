@@ -352,7 +352,18 @@ export interface ToolSession {
 	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent">>;
+		Partial<
+			Pick<
+				SessionManager,
+				| "getSessionId"
+				| "getLeafId"
+				| "appendModelUsage"
+				| "getArtifactContent"
+				| "getLeftSessionsMark"
+				| "getLeftSessions"
+				| "appendCustomEntriesToSession"
+			>
+		>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */

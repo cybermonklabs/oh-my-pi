@@ -12,6 +12,7 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobType } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
+import type { EvalHeldAgentResult } from "@oh-my-pi/pi-tui/tools/eval";
 import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -59,6 +60,8 @@ type AsyncResultJobDetails = {
 	meta?: OutputMeta;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
+	/** The subagents whose results the job's result hands over (`AsyncJobDetails.agentResults`): this delivery is their handover. */
+	agentResults?: EvalHeldAgentResult[];
 };
 
 export type AsyncResultDetails = {
@@ -157,6 +160,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			namedByCommand: command !== undefined,
 			durationMs: entry.durationMs,
 			meta: entry.job?.latestDetails?.meta,
+			agentResults: entry.job?.latestDetails?.agentResults,
 			structured,
 			structuredJson: structuredJson === undefined ? undefined : escapeHarnessTags(structuredJson),
 			hasStructuredData,
@@ -177,6 +181,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			durationMs: job.durationMs,
 			...(job.meta ? { meta: job.meta } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
+			...(job.agentResults ? { agentResults: job.agentResults } : {}),
 		})),
 	};
 	const text = prompt.render(asyncResultTemplate, {

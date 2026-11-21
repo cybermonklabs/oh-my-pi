@@ -38,6 +38,8 @@ import {
 	endsOnCredentialUnavailableTurn,
 	hasRestorableTurn,
 	isInterruptedTurnAbort,
+	isRestoreSkippedCallResult,
+	type RestoreSkippedCalls,
 } from "../session/exit-diagnostics";
 import { isReasonlessAbort, isUserInterruptAbort } from "../session/messages";
 import { activeBranch, type SessionEntry } from "../session/session-entries";
@@ -71,11 +73,11 @@ export interface RestoreOutcome {
  * interrupted turns, each as a background job of its parent (registered first, so
  * a resumed turn waiting on such a job finds it), then its own interrupted turn. A
  * resumed turn does not run again a cut-off call that started a subagent restore
- * relaunched ({@link relaunchedByCutOffCall}).
+ * relaunched, now or at an earlier restore ({@link relaunchedByCutOffCall}).
  */
 export async function restoreSession(session: AgentSession, options: RestoreOptions = {}): Promise<RestoreOutcome> {
-	const { ids, relaunchedByCall } = await restoreSubagents(session, options);
-	const turn = await session.restoreInterruptedTurn({ relaunched: relaunchedByCall });
+	const { ids, skippedByCall } = await restoreSubagents(session, options);
+	const turn = await session.restoreInterruptedTurn(skippedByCall);
 	return { turn, subagents: ids };
 }
 
@@ -92,15 +94,15 @@ interface Relaunch {
  * turn (see the module docs). Nothing is restored for a session without a file, or
  * without background jobs (the `async.enabled` setting off), which could not deliver
  * the results. Returns the relaunched ids, and for `session`'s own cut-off batch the
- * calls that started relaunched subagents.
+ * calls not to run again ({@link relaunchedByCutOffCall}).
  */
 async function restoreSubagents(
 	session: AgentSession,
 	options: RestoreOptions,
-): Promise<{ ids: string[]; relaunchedByCall: Record<string, string[]> }> {
+): Promise<{ ids: string[]; skippedByCall: RestoreSkippedCalls }> {
 	const sessionFile = session.sessionManager.getSessionFile();
 	const manager = session.asyncJobManager;
-	if (!sessionFile || !manager) return { ids: [], relaunchedByCall: {} };
+	if (!sessionFile || !manager) return { ids: [], skippedByCall: { relaunched: {} } };
 	const registry = AgentRegistry.global();
 	await ensurePersistedRoster(registry, sessionFile);
 	const subSessions = await collectSubSessions(sessionFile, {
@@ -181,6 +183,12 @@ async function restoreSubagents(
 				logger.debug("Key-stranded subagent has no positive parent wait record; not restored", { id });
 				continue;
 			}
+		} else if (spawns.discardedByParent(sub)) {
+			// Its parent's current conversation records the spawn as discarded (a launch the task call did not
+			// adopt, a worker of a pool that was stopped), though its transcript reads as cut off: a whole-session
+			// fork copies a running worker's transcript mid-run, and the stop that follows ends it in the original.
+			logger.debug("Interrupted subagent's spawn was discarded by its parent; not restored", { id });
+			continue;
 		}
 		const ref = registry.get(id);
 		const init = extractSessionInit(sub.entries);
@@ -190,29 +198,33 @@ async function restoreSubagents(
 		}
 		relaunches.push({ key, sub, ref: { ...ref, sessionFile: ref.sessionFile }, init });
 	}
-	// Each parent's resumed turn learns which of its cut-off calls started a relaunched subagent before any
-	// relaunch starts, so a relaunched parent does not run that call again either.
-	const childrenOf = new Map<string | null, Array<{ agentId: string; spawnCallId?: string }>>();
-	for (const { sub, init } of relaunches) {
-		const siblings = childrenOf.get(sub.parent) ?? [];
-		siblings.push({ agentId: sub.agentId, spawnCallId: init.spawnCallId });
-		childrenOf.set(sub.parent, siblings);
+	// Each parent's resumed turn learns which of its cut-off calls started subagents before any relaunch
+	// starts, so a relaunched parent does not run such a call again either: the relaunched subagents, and
+	// the parent's other subagents for a call an earlier restore already did not run again.
+	const relaunchedKeys = new Set(relaunches.map(({ key }) => key));
+	const childrenOf = new Map<string | null, { relaunched: SpawnedChild[]; others: SpawnedChild[] }>();
+	for (const key of keys) {
+		const sub = subSessions[key]!;
+		const children = childrenOf.get(sub.parent) ?? { relaunched: [], others: [] };
+		const child = { agentId: sub.agentId, spawnCallIds: spawns.callsOf(sub) };
+		(relaunchedKeys.has(key) ? children.relaunched : children.others).push(child);
+		childrenOf.set(sub.parent, children);
 	}
-	const relaunchedByCallOf = (parentKey: string | null): Record<string, string[]> => {
+	const skippedByCallOf = (parentKey: string | null): RestoreSkippedCalls => {
 		const children = childrenOf.get(parentKey);
-		if (!children) return {};
+		if (!children) return { relaunched: {} };
 		const parent = parentKey === null ? undefined : subSessions[parentKey];
 		const branch = parent
 			? activeBranch(parent.entries, parent.leafId)
 			: activeBranch(session.sessionManager.getEntries(), session.sessionManager.getLeafId());
-		return relaunchedByCutOffCall(branch, children);
+		return relaunchedByCutOffCall(branch, children.relaunched, children.others);
 	};
 	for (const { key, sub, ref, init } of relaunches) {
 		const id = sub.agentId;
 		const sessionFileOfRef = ref.sessionFile;
 		const agentName = persistedAgentName(ref.displayName, init);
 		const structured = init.tools.includes("yield");
-		const restoreRelaunched = relaunchedByCallOf(key);
+		const restoreSkipped = skippedByCallOf(key);
 		manager.register(
 			"task",
 			id,
@@ -222,7 +234,7 @@ async function restoreSubagents(
 					agent: persistedAgentDefinition(ref.displayName, init),
 					message: init.task,
 					restore: true,
-					restoreRelaunched,
+					restoreSkipped,
 					structured,
 					workPoolYieldItems: init.workPoolYieldItems,
 					outputSchema: init.outputSchema,
@@ -246,25 +258,41 @@ async function restoreSubagents(
 	}
 	const ids = relaunches.map(({ sub }) => sub.agentId);
 	if (ids.length > 0) logger.info("Restored interrupted subagents", { ids });
-	return { ids, relaunchedByCall: relaunchedByCallOf(null) };
+	return { ids, skippedByCall: skippedByCallOf(null) };
+}
+
+/** A subagent of a parent's transcript, and the calls of the parent its current run was requested under ({@link SpawnRecords.callsOf}). */
+interface SpawnedChild {
+	agentId: string;
+	spawnCallIds: readonly string[];
 }
 
 /**
- * The calls of a parent's cut-off batch that started subagents `--restore` relaunches, each with
- * those subagents' ids. The batch is the last reply with tool calls on the parent's current
- * conversation (`branch` selected, after its last `/clear`). A call started each relaunched
- * subagent whose `session_init` names it as the call the spawn was requested under
- * (`spawnCallId`): a `task` call, also for a streamed launch made before its
- * `tool_execution_start`, or the `eval` call whose cell spawned it (a bridged `tool.task`, an
- * `agent()` job, a work pool's worker). A subagent another call or a job of an earlier turn
- * started is no call's of the batch, nor is one whose transcript names no call (an older
- * version wrote it): the batch's calls run again. The record is the spawn's own, so a second
- * restore inside the resumed batch reads the same call for a subagent it relaunches again.
+ * The calls of a parent's cut-off batch that `--restore` does not run again, each with the
+ * subagents it started. The batch is the last reply with tool calls on the parent's current
+ * conversation (`branch` selected, after its last `/clear`). A call started each subagent whose
+ * current run was requested under it ({@link SpawnRecords.callsOf}): the call its `session_init`
+ * names (`spawnCallId`: a `task` call, also for a streamed launch made before its
+ * `tool_execution_start`, or the `eval` call whose cell spawned it with a bridged `tool.task`, an
+ * `agent()` job or a work pool), or, for a kept-alive work pool worker's later batch, the calls
+ * that pushed that batch's items, which its latest `owed` record names. Such a call is
+ * not run again:
+ * - when restore relaunches a subagent it started (`relaunched`);
+ * - when an earlier restore did not run it again, which its result on `branch` says
+ *   ({@link isRestoreSkippedCallResult}): the subagents it started that restore does not
+ *   relaunch now (`others`, which ran since that restore) go in `ran`, so a call whose
+ *   relaunched subagent finished before the next process end still does not start it again.
+ * A subagent another call or a job of an earlier turn started is no call's of the batch, nor is
+ * one whose transcript names no call (an older version wrote it): the batch's calls run again,
+ * and so does a call whose subagents an earlier restore relaunched under such a transcript.
+ * The record is the spawn's own, so a second restore inside the resumed batch reads the same
+ * call for a subagent it relaunches again.
  */
 export function relaunchedByCutOffCall(
 	branch: readonly SessionEntry[],
-	relaunched: ReadonlyArray<{ agentId: string; spawnCallId?: string }>,
-): Record<string, string[]> {
+	relaunched: readonly SpawnedChild[],
+	others: readonly SpawnedChild[] = [],
+): RestoreSkippedCalls {
 	let start = 0;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		if (branch[index]!.type === "reset_boundary") {
@@ -272,7 +300,7 @@ export function relaunchedByCutOffCall(
 			break;
 		}
 	}
-	let batch: Extract<SessionEntry, { type: "message" }> | undefined;
+	let batchIndex = -1;
 	for (let index = branch.length - 1; index >= start; index--) {
 		const entry = branch[index]!;
 		if (
@@ -280,19 +308,30 @@ export function relaunchedByCutOffCall(
 			entry.message.role === "assistant" &&
 			entry.message.content.some(part => part.type === "toolCall")
 		) {
-			batch = entry;
+			batchIndex = index;
 			break;
 		}
 	}
-	if (batch?.message.role !== "assistant") return {};
+	const batch = branch[batchIndex];
+	if (batch?.type !== "message" || batch.message.role !== "assistant") return { relaunched: {} };
 	const callIds = new Set<string>();
 	for (const part of batch.message.content) if (part.type === "toolCall") callIds.add(part.id);
 	const byCall: Record<string, string[]> = {};
-	for (const { agentId, spawnCallId } of relaunched) {
-		if (spawnCallId === undefined || !callIds.has(spawnCallId)) continue;
-		(byCall[spawnCallId] ??= []).push(agentId);
+	for (const { agentId, spawnCallIds } of relaunched) {
+		for (const call of spawnCallIds) if (callIds.has(call)) (byCall[call] ??= []).push(agentId);
 	}
-	return byCall;
+	const skippedBefore = new Set<string>();
+	for (const entry of branch.slice(batchIndex + 1)) {
+		if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
+		if (callIds.has(entry.message.toolCallId) && isRestoreSkippedCallResult(entry.message)) {
+			skippedBefore.add(entry.message.toolCallId);
+		}
+	}
+	const ran: Record<string, string[]> = {};
+	for (const { agentId, spawnCallIds } of others) {
+		for (const call of spawnCallIds) if (skippedBefore.has(call)) (ran[call] ??= []).push(agentId);
+	}
+	return Object.keys(ran).length > 0 ? { relaunched: byCall, ran } : { relaunched: byCall };
 }
 
 /**
@@ -343,13 +382,15 @@ interface SpawnedSubagents {
 	/** Those any record names, on any branch, before or after the last `/clear`. */
 	named: Set<string>;
 	/**
-	 * Streamed launches nobody adopted, each with when its discard record was written (epoch ms):
-	 * the ids whose latest record of any kind on the selected branch, read from the leaf back, is a
-	 * discard record ({@link readDiscardedLaunch}). A record that names the id after the discard (a
-	 * later spawn's job record, a result) is a later spawn of a reused id. Never the parent's work,
-	 * but only for a subagent whose transcript began by the discard: a later process can allocate
-	 * the id of a launch discarded before it wrote a transcript again, and that spawn may have
-	 * written no record yet.
+	 * Spawns the parent discarded, each with when its discard record was written (epoch ms): a
+	 * streamed launch nobody adopted, and each worker of a work pool the parent stopped (a kill, the
+	 * user's stop), whose failed batch the stop cannot cancel. The ids whose latest record of any
+	 * kind on the selected branch, read from the leaf back, is a discard record
+	 * ({@link readDiscardedLaunch}). A record that names the id after the discard (a later spawn's
+	 * job record, a result) is a later spawn of a reused id. Never the parent's work, but only for a
+	 * subagent whose transcript began by the discard: a later process can allocate the id of a
+	 * launch discarded before it wrote a transcript again, and that spawn may have written no
+	 * record yet.
 	 */
 	discardedAt: Map<string, number>;
 	/**
@@ -359,8 +400,22 @@ interface SpawnedSubagents {
 	 * that went away between the two leaves it.
 	 */
 	settled: Map<string, number>;
+	/**
+	 * The handovers the parent's transcript holds off the selected branch, as `settled` reads them,
+	 * but a run handed over only as aborted (or lost with its worker) settles nothing here: the
+	 * parent took no turn on that branch's result. Read only for a subagent placed by the call its
+	 * spawn record names ({@link spawnedInCurrentConversation}): a restored turn that runs its
+	 * cut-off calls again leaves their first results, and the handovers they held, on a branch of
+	 * their own, and a parent that got the subagent's failure there acts on it.
+	 */
+	settledElsewhere: Map<string, number>;
 	/** Eval jobs (an `agent()` job, a bridged `tool.task` background spawn) whose latest record in the current conversation is `owed`: a result still owed to the parent. */
 	owedJobs: Set<string>;
+	/**
+	 * The calls each subagent's latest `owed` record that names any calls names, on any branch: a
+	 * kept-alive work pool worker's later batch, whose items later calls pushed.
+	 */
+	owedCalls: Map<string, string[]>;
 	/** When that last `/clear` was written, in epoch ms; undefined without one. */
 	clearedAt: number | undefined;
 	/**
@@ -403,8 +458,8 @@ interface CutOffWindow {
 
 /**
  * The subagent ids a parent's transcript entry names: a `task` result's (its settled results and
- * its spawns' progress), the ones an `eval` result's `agentResults`, a job delivery or a `wait`
- * hands it, and an eval job record's.
+ * its spawns' progress), the ones an `eval` result's `agentResults`, a job delivery, a `wait` or a
+ * kill hands it, and an eval job record's.
  */
 function recordedAgentIds(entry: SessionEntry): string[] {
 	const job = readEvalAgentJobRecord(entry);
@@ -431,20 +486,20 @@ interface HeldResult {
  * The subagents whose result a parent's transcript entry hands it: a `task` result's
  * results that settle their runs (a sync spawn's; a background spawn's "started" result
  * names it only in its progress), and the settled jobs a background job's delivery
- * (`async-result`) or a `wait` returned. A run its abort ended (`aborted`) or that was lost
- * with its worker thread (`workerLost`) settles only when the parent took a turn after the
- * result (`wentOn`, {@link parentWentOn}), since it then read it, as after a worker crashed
- * while the parent ran on. When the parent's process goes away inside the call, the agent
- * loop still records such a result, but the parent takes no turn after it, and the
+ * (`async-result`), a `wait` or a kill of a job that had settled (a `write` to
+ * `proc://<id>/kill`, {@link killJobReport}) returned, with the subagents such a job reports it
+ * hands over (a work pool's workers, its `agentResults`). A run its abort ended (`aborted`) or
+ * that was lost with its worker thread (`workerLost`) settles only when the parent took a turn
+ * after the result (`wentOn`, {@link parentWentOn}), since it then read it, as after a worker
+ * crashed while the parent ran on. When the parent's process goes away inside the call, the
+ * agent loop still records such a result, but the parent takes no turn after it, and the
  * subagent's turn stays as its transcript left it (a stop of the run left an aborted record
  * there, which `--restore` leaves anyway). Only an `eval` result says when its handovers
  * happened (`agentResults[].handedAt`): it is written when the cell ends.
  */
 function heldResults(entry: SessionEntry, wentOn: boolean): HeldResult[] {
 	if (entry.type === "custom_message") {
-		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE
-			? settledJobAgentIds(entry.details).map(id => ({ id }))
-			: [];
+		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE ? settledJobResults(entry.details, wentOn) : [];
 	}
 	if (entry.type !== "message" || entry.message.role !== "toolResult") return [];
 	const { toolName, details } = entry.message;
@@ -454,15 +509,27 @@ function heldResults(entry: SessionEntry, wentOn: boolean): HeldResult[] {
 			.filter(result => wentOn || (!result.aborted && !result.workerLost))
 			.map(result => ({ id: result.id }));
 	}
-	if (toolName === "eval") return evalHeldResults(details, wentOn);
-	return toolName === "wait" ? settledJobAgentIds(details).map(id => ({ id })) : [];
+	if (toolName === "eval") return isRecord(details) ? agentResultsHeld(details.agentResults, wentOn) : [];
+	if (toolName === "wait") return settledJobResults(details, wentOn);
+	return settledJobResults(killJobReport(entry.message), wentOn);
 }
 
-/** The subagents an `eval` result's `agentResults` names, read as a `task` result's ({@link heldResults}), with their handover times. */
-function evalHeldResults(details: unknown, wentOn: boolean): HeldResult[] {
-	if (!isRecord(details) || !Array.isArray(details.agentResults)) return [];
+/**
+ * The job report a `write` result holds when it killed a job (`write proc://<id>/kill`): its
+ * `proc` details, which list the jobs as a `wait` does; a kill of a job that had settled hands
+ * its result over.
+ */
+function killJobReport(message: { toolName: string; details?: unknown }): unknown {
+	const { details } = message;
+	if (message.toolName !== "write" || !isRecord(details) || !isRecord(details.proc)) return undefined;
+	return details.proc.op === "cancel" ? details.proc : undefined;
+}
+
+/** The subagents an `agentResults` list names (an `eval` result's, a settled job's), read as a `task` result's ({@link heldResults}), with the handover times it gives. */
+function agentResultsHeld(agentResults: unknown, wentOn: boolean): HeldResult[] {
+	if (!Array.isArray(agentResults)) return [];
 	const held: HeldResult[] = [];
-	for (const result of details.agentResults) {
+	for (const result of agentResults) {
 		if (!isRecord(result)) continue;
 		const id = stringProperty(result, "id");
 		if (!id || (!wentOn && (result.aborted === true || result.workerLost === true))) continue;
@@ -499,13 +566,14 @@ function isProcessExitRecord(message: AgentMessage): boolean {
 }
 
 /**
- * The agent ids of the settled jobs a job report lists: an `async-result` delivery's
- * (`agentId`, else `jobId`) or a `wait` snapshot's (`agentUrlId`, else `id`), whose
- * running jobs it hands over no result of.
+ * The results the settled jobs of a job report hand over: an `async-result` delivery's, a
+ * `wait` snapshot's or a kill's. Each settled job hands over its own agent's (`agentId`, else
+ * `agentUrlId`, `jobId` or `id`) and those of the subagents it lists in its `agentResults` (a work
+ * pool's workers, read as {@link heldResults} reads them). A running job hands over none.
  */
-function settledJobAgentIds(details: unknown): string[] {
+function settledJobResults(details: unknown, wentOn: boolean): HeldResult[] {
 	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
-	const ids: string[] = [];
+	const held: HeldResult[] = [];
 	for (const job of details.jobs) {
 		if (!isRecord(job) || job.status === "running") continue;
 		const id =
@@ -513,9 +581,10 @@ function settledJobAgentIds(details: unknown): string[] {
 			stringProperty(job, "agentUrlId") ??
 			stringProperty(job, "jobId") ??
 			stringProperty(job, "id");
-		if (id) ids.push(id);
+		if (id) held.push({ id });
+		held.push(...agentResultsHeld(job.agentResults, wentOn));
 	}
-	return ids;
+	return held;
 }
 
 /**
@@ -675,12 +744,16 @@ function pendingAsyncWork(conversation: readonly SessionEntry[], beforeIndex: nu
 	return { startedAt, endedAt: Number.POSITIVE_INFINITY, excluded };
 }
 
-/** Every id a job report says settled: an `async-result` delivery's or a `wait` snapshot's settled jobs, by job and subagent id. */
+/**
+ * Every id a job report says settled: an `async-result` delivery's, a `wait` snapshot's or a
+ * kill's ({@link killJobReport}) settled jobs, by job and subagent id, with the subagents each
+ * lists in its `agentResults` (a work pool's workers).
+ */
 function settledJobIds(entry: SessionEntry): string[] {
 	let details: unknown;
 	if (entry.type === "custom_message" && entry.customType === ASYNC_RESULT_MESSAGE_TYPE) details = entry.details;
-	else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "wait") {
-		details = entry.message.details;
+	else if (entry.type === "message" && entry.message.role === "toolResult") {
+		details = entry.message.toolName === "wait" ? entry.message.details : killJobReport(entry.message);
 	}
 	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
 	const ids: string[] = [];
@@ -690,6 +763,7 @@ function settledJobIds(entry: SessionEntry): string[] {
 			const id = stringProperty(job, key);
 			if (id) ids.push(id);
 		}
+		for (const held of agentResultsHeld(job.agentResults, true)) ids.push(held.id);
 	}
 	return ids;
 }
@@ -768,6 +842,20 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		for (const held of heldResults(entry, wentOn)) settle(settled, held.id, held.handedAt ?? writtenAt);
 		if (parentWentOn(entry)) wentOn = true;
 	}
+	const settledElsewhere = new Map<string, number>();
+	// The calls a run is owed for, by its latest `owed` record that names any, on whatever branch it lies: a
+	// restored turn's replay leaves the records of its cut-off batch on a branch of their own, and call ids
+	// do not repeat.
+	const owedCalls = new Map<string, string[]>();
+	const onBranch = new Set(branch.map(entry => entry.id));
+	for (const entry of entries) {
+		const job = readEvalAgentJobRecord(entry);
+		if (job?.state === "owed" && job.spawnCallIds) owedCalls.set(job.agentId, job.spawnCallIds);
+		if (onBranch.has(entry.id)) continue;
+		const writtenAt = Date.parse(entry.timestamp);
+		if (job?.state === "delivered") settle(settledElsewhere, job.agentId, writtenAt);
+		for (const held of heldResults(entry, false)) settle(settledElsewhere, held.id, held.handedAt ?? writtenAt);
+	}
 	const conversation = branch.slice(conversationStart);
 	const toolCallIds = (from: readonly SessionEntry[]): Set<string> => {
 		const ids = new Set<string>();
@@ -783,7 +871,9 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		named,
 		discardedAt,
 		settled,
+		settledElsewhere,
 		owedJobs,
+		owedCalls,
 		clearedAt,
 		conversationCalls: toolCallIds(conversation),
 		savedCalls: toolCallIds(entries),
@@ -833,6 +923,31 @@ class SpawnRecords {
 	}
 
 	/**
+	 * The parent's calls `sub`'s current run was requested under: those its parent's latest `owed`
+	 * record for it names ({@link SpawnedSubagents.owedCalls}: a kept-alive pool worker's later batch),
+	 * else the call its spawn record names (`spawnCallId`); none for a transcript that names no call.
+	 */
+	callsOf(sub: SubSession): string[] {
+		const owed = this.#ofParent(sub.parent)?.owedCalls.get(sub.agentId);
+		if (owed) return owed;
+		const spawnCallId = extractSessionInit(sub.entries)?.spawnCallId;
+		return spawnCallId === undefined ? [] : [spawnCallId];
+	}
+
+	/**
+	 * Whether `sub`'s own parent's current conversation records its spawn as discarded
+	 * ({@link SpawnedSubagents.discardedAt}: a launch the task tool did not adopt, a worker of a work
+	 * pool that was stopped), by a record written once `sub`'s transcript had begun. A transcript
+	 * begun after the discard is a later spawn of the same id.
+	 */
+	discardedByParent(sub: SubSession): boolean {
+		const discardedAt = this.#ofParent(sub.parent)?.discardedAt.get(sub.agentId);
+		if (discardedAt === undefined) return false;
+		const spawnedAt = sub.header ? Date.parse(sub.header.timestamp) : Number.NaN;
+		return Number.isFinite(spawnedAt) && !(spawnedAt > discardedAt);
+	}
+
+	/**
 	 * Whether `sub` belongs to the session's current conversation: it, and each subagent
 	 * above it, was spawned in its parent's current conversation
 	 * ({@link spawnedInCurrentConversation}), since the subagents of work a `/clear` left
@@ -852,32 +967,43 @@ class SpawnRecords {
 	/**
 	 * Whether `sub`'s own parent records that it still waits on `sub`'s turn that began at
 	 * `turnStartedAt` (epoch ms), read in this order:
-	 * - a result of `sub`'s run handed over (`settled`): written since the turn began, it settles
-	 *   the turn; written before, it answered an earlier turn, and this one is a turn the parent
+	 * - a result of `sub`'s run handed over (`settled`, and for a subagent placed by the call its
+	 *   spawn record names, `settledElsewhere` too): written since the turn began, it settles the
+	 *   turn; written before, it answered an earlier turn, and this one is a turn the parent
 	 *   messaged `sub` for, so the parent waits (an unreadable or unknown time judges nothing, and
 	 *   the result stands);
+	 * - else a discard of `sub`'s spawn ({@link SpawnedSubagents.discardedAt}: a streamed launch
+	 *   nobody adopted, or a worker of a work pool the parent stopped, written after `sub`'s
+	 *   transcript began): the parent does not wait;
 	 * - else a `task` result that names the run and settles none of it (`current`: a background
 	 *   spawn's "started" result, or a sync call's result the process exit cut off), or an eval
 	 *   `agent()` job still `owed`: the parent waits;
 	 * - else `sub` was spawned in the window of a call the parent's process went away inside
 	 *   ({@link SpawnedSubagents.cutOffWindows}), by none of the finished calls the window leaves
-	 *   out ({@link CutOffWindow.excluded}), and is not a streamed launch that call discarded
-	 *   unadopted ({@link SpawnedSubagents.discardedAt}: a discard written after `sub`'s transcript
-	 *   began).
+	 *   out ({@link CutOffWindow.excluded}).
 	 * Nothing else is evidence of a wait.
 	 */
 	parentStillWaits(sub: SubSession, turnStartedAt: number | undefined): boolean {
 		const parent = this.#ofParent(sub.parent);
 		if (!parent) return false;
-		const settledAt = parent.settled.get(sub.agentId);
-		if (settledAt !== undefined) return turnStartedAt !== undefined && settledAt < turnStartedAt;
-		if (parent.current.has(sub.agentId) || parent.owedJobs.has(sub.agentId)) return true;
-		if (!sub.header) return false;
-		const spawnedAt = Date.parse(sub.header.timestamp);
-		if (!Number.isFinite(spawnedAt)) return false;
-		const discardedAt = parent.discardedAt.get(sub.agentId);
-		if (discardedAt !== undefined && !(spawnedAt > discardedAt)) return false;
 		const spawnCallId = extractSessionInit(sub.entries)?.spawnCallId;
+		let settledAt = parent.settled.get(sub.agentId);
+		const elsewhere =
+			spawnCallId !== undefined && parent.conversationCalls.has(spawnCallId)
+				? parent.settledElsewhere.get(sub.agentId)
+				: undefined;
+		// The later of the two handovers, as {@link settle} keeps it.
+		if (
+			elsewhere !== undefined &&
+			(settledAt === undefined || (Number.isFinite(elsewhere) && !(settledAt >= elsewhere)))
+		) {
+			settledAt = elsewhere;
+		}
+		if (settledAt !== undefined) return turnStartedAt !== undefined && settledAt < turnStartedAt;
+		const spawnedAt = sub.header ? Date.parse(sub.header.timestamp) : Number.NaN;
+		if (this.discardedByParent(sub)) return false;
+		if (parent.current.has(sub.agentId) || parent.owedJobs.has(sub.agentId)) return true;
+		if (!Number.isFinite(spawnedAt)) return false;
 		const leftOut = (window: CutOffWindow): boolean => {
 			if (!window.excluded) return false;
 			if (spawnCallId !== undefined) return window.excluded.calls.has(spawnCallId);

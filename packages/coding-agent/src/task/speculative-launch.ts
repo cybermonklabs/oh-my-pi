@@ -31,9 +31,10 @@ import type { SessionEntry } from "../session/session-entries";
 import type { SpawnRun } from "./spawn-run";
 
 /**
- * Custom entry type of the record a parent's transcript keeps of a launch nobody adopted: its
- * subagent's run was aborted, and no call result reports it. `omp --restore` never runs it again,
- * though it can end its turn on a key error before the discard reaches it.
+ * Custom entry type of the record a parent's transcript keeps of a spawn it discarded: a launch
+ * nobody adopted, whose subagent's run was aborted and no call result reports, and a worker of a
+ * work pool the parent stopped. `omp --restore` never runs it again, though it can end its turn
+ * on a key error before the discard reaches it.
  */
 export const TASK_LAUNCH_DISCARDED_CUSTOM_TYPE = "task-launch-discarded";
 
