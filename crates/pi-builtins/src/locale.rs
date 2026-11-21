@@ -7,7 +7,7 @@
 //! change the C locale of the whole host process.
 //!
 //! Used by `sort` and `comm` (collation), `sort` (numerics), `uniq`, `date`,
-//! `du`, `df`, `env`, `fold`, `grep`, and `sed`.
+//! `du`, `df`, `env`, and `fold`.
 
 #![allow(dead_code, reason = "each utility uses a subset")]
 
@@ -42,14 +42,9 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 	})
 }
 
-/// The categories a GNU utility's `setlocale(LC_ALL, "")` loads, by the
-/// variable that names each and its `newlocale` mask: the six POSIX ones
-/// and, with glibc, the six it adds. Every one of them has to load.
-///
-/// The six are glibc's (`target_env = "gnu"`), not Linux's: musl, the other
-/// libc a Linux build links, has the six POSIX categories alone, and its
-/// `setlocale` reads no `LC_PAPER` and the like; naming them there would
-/// ask a question no utility on that libc asks.
+/// The categories a locale environment names, with the mask `newlocale`
+/// knows each by: the six POSIX ones and, on Linux, the six glibc adds. A
+/// utility's `setlocale(LC_ALL, "")` has to load every one of them.
 #[cfg(unix)]
 const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_CTYPE", libc::LC_CTYPE_MASK),
@@ -58,17 +53,17 @@ const LOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
 	("LC_COLLATE", libc::LC_COLLATE_MASK),
 	("LC_MONETARY", libc::LC_MONETARY_MASK),
 	("LC_MESSAGES", libc::LC_MESSAGES_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_PAPER", libc::LC_PAPER_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_NAME", libc::LC_NAME_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_ADDRESS", libc::LC_ADDRESS_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_TELEPHONE", libc::LC_TELEPHONE_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_MEASUREMENT", libc::LC_MEASUREMENT_MASK),
-	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	#[cfg(target_os = "linux")]
 	("LC_IDENTIFICATION", libc::LC_IDENTIFICATION_MASK),
 ];
 
@@ -172,6 +167,31 @@ fn is_utf8_charset(codeset: &str) -> bool {
 	codeset.eq_ignore_ascii_case("utf-8") || codeset.eq_ignore_ascii_case("utf8")
 }
 
+/// The categories a GNU utility's `setlocale(LC_ALL, "")` loads, by the
+/// variable that names each and its `newlocale` mask: the six POSIX ones
+/// and, with glibc, the six it adds.
+#[cfg(unix)]
+const SETLOCALE_CATEGORIES: &[(&str, libc::c_int)] = &[
+	("LC_CTYPE", libc::LC_CTYPE_MASK),
+	("LC_NUMERIC", libc::LC_NUMERIC_MASK),
+	("LC_TIME", libc::LC_TIME_MASK),
+	("LC_COLLATE", libc::LC_COLLATE_MASK),
+	("LC_MONETARY", libc::LC_MONETARY_MASK),
+	("LC_MESSAGES", libc::LC_MESSAGES_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_PAPER", libc::LC_PAPER_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_NAME", libc::LC_NAME_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_ADDRESS", libc::LC_ADDRESS_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_TELEPHONE", libc::LC_TELEPHONE_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_MEASUREMENT", libc::LC_MEASUREMENT_MASK),
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	("LC_IDENTIFICATION", libc::LC_IDENTIFICATION_MASK),
+];
+
 /// Whether a GNU utility started with the environment `var` reads would run
 /// with a UTF-8 `LC_CTYPE`, for a caller with no [`Host`] (pi-shell's
 /// `timeout` and `nohup`; a caller with one asks [`ctype_is_utf8`]).
@@ -200,7 +220,7 @@ pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 		return false;
 	};
 	#[cfg(unix)]
-	if !LOCALE_CATEGORIES
+	if !SETLOCALE_CATEGORIES
 		.iter()
 		.all(|&(category, mask)| named(category).is_none_or(|name| locale_loadable(name, mask)))
 	{
@@ -215,25 +235,19 @@ pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 /// [`ctype_is_utf8_in`] for one with an environment), as coreutils' `env`
 /// and `timeout` and findutils' `find` print a command they could not run:
 /// `‘name’` in UTF-8, `'name'` otherwise (the C locale, where a `'` in the
-/// name is `\'`, as a `’` is `\’` in UTF-8). A backslash is `\\`; a
-/// character that is not printable in the locale ([`Unit::printable`]) is
-/// a C escape (`\t`, `\n`, …) or the octal escapes of its bytes
-/// (`\303\251` for `é` in the C locale, `\377` for a byte that is no
-/// UTF-8). `name` is the bytes as given: coreutils 9.7's `env $'\xff'` is
-/// `env: ‘\377’: No such file or directory`.
-pub fn gnu_quote(utf8: bool, name: &[u8]) -> String {
+/// name is `\'`). A backslash is `\\`; a character that is not printable in
+/// the locale is a C escape (`\t`, `\n`, …) or the octal escapes of its
+/// bytes (`\303\251` for `é` in the C locale).
+pub fn gnu_quote(utf8: bool, name: &str) -> String {
 	let (open, close) = if utf8 { ('‘', '’') } else { ('\'', '\'') };
 	let mut out = String::with_capacity(name.len() + 2);
 	out.push(open);
-	for unit in units(name, utf8) {
-		match unit {
-			Unit::Char('\\') => out.push_str("\\\\"),
-			Unit::Char(c) if c == close => {
-				out.push('\\');
-				out.push(c);
-			},
-			unit if unit.printable(utf8) => unit.push_to(&mut out),
-			unit => unit.escape(&mut out),
+	for c in name.chars() {
+		match c {
+			'\\' => out.push_str("\\\\"),
+			'\'' if !utf8 => out.push_str("\\'"),
+			c if printable(c, utf8) => out.push(c),
+			c => escape(&mut out, c),
 		}
 	}
 	out.push(close);
@@ -246,173 +260,76 @@ pub fn gnu_quote(utf8: bool, name: &[u8]) -> String {
 /// a word a shell reads back as `name`. `'name'`, with a `'` as `'\''` and a
 /// character not printable in the locale as `$'\t'`, `$'\303\251'`, …;
 /// but `"name"` for a name holding a `'` whose characters are all safe in
-/// both C and shell double quotes (`"it's"`). `name` is the bytes as given.
-pub fn gnu_quote_shell(utf8: bool, name: &[u8]) -> String {
-	let safe = |unit: Unit| match unit {
-		Unit::Char(c) => c.is_ascii_alphanumeric() || "%+,-./:]_@'".contains(c) || (!c.is_ascii() && unit.printable(utf8)),
-		Unit::Byte(_) => false,
+/// both C and shell double quotes (`"it's"`).
+pub fn gnu_quote_shell(utf8: bool, name: &str) -> String {
+	let safe = |c: char| {
+		c.is_ascii_alphanumeric() || "%+,-./:]_@'".contains(c) || (!c.is_ascii() && printable(c, utf8))
 	};
-	let mut out = String::with_capacity(name.len() + 2);
-	if name.contains(&b'\'') && units(name, utf8).all(safe) {
-		out.push('"');
-		units(name, utf8).for_each(|unit| unit.push_to(&mut out));
-		out.push('"');
-		return out;
+	if name.contains('\'') && name.chars().all(safe) {
+		return format!("\"{name}\"");
 	}
+	let mut out = String::with_capacity(name.len() + 2);
 	out.push('\'');
 	// Inside a `$'…'` of escapes, closed (and the quotes reopened) at the
 	// next printable character.
 	let mut escaping = false;
-	for unit in units(name, utf8) {
-		if unit.printable(utf8) {
+	for c in name.chars() {
+		if printable(c, utf8) {
 			if escaping {
 				out.push_str("''");
 				escaping = false;
 			}
-			if unit == Unit::Char('\'') {
+			if c == '\'' {
 				out.push_str("'\\''");
 			} else {
-				unit.push_to(&mut out);
+				out.push(c);
 			}
 		} else {
 			if !escaping {
 				out.push_str("'$'");
 				escaping = true;
 			}
-			unit.escape(&mut out);
+			escape(&mut out, c);
 		}
 	}
 	out.push('\'');
 	out
 }
 
-/// What quotearg reads a name in: a character, or a byte that is not one in
-/// the locale (any byte past ASCII in C, a byte that is no UTF-8 in UTF-8).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Unit {
-	Char(char),
-	Byte(u8),
-}
-
-/// The units of `name` as quotearg reads them in the locale: in C each
-/// byte, in UTF-8 each character, and each byte that is no UTF-8.
-fn units(name: &[u8], utf8: bool) -> impl Iterator<Item = Unit> + '_ {
-	let mut c_bytes = (!utf8).then(|| name.iter());
-	let mut chunks = name.utf8_chunks();
-	let mut chars = "".chars();
-	let mut invalid: &[u8] = &[];
-	std::iter::from_fn(move || {
-		if let Some(bytes) = &mut c_bytes {
-			let &byte = bytes.next()?;
-			return Some(if byte.is_ascii() { Unit::Char(char::from(byte)) } else { Unit::Byte(byte) });
-		}
-		loop {
-			if let Some(c) = chars.next() {
-				return Some(Unit::Char(c));
-			}
-			if let Some((&byte, rest)) = invalid.split_first() {
-				invalid = rest;
-				return Some(Unit::Byte(byte));
-			}
-			let chunk = chunks.next()?;
-			chars = chunk.valid().chars();
-			invalid = chunk.invalid();
-		}
-	})
-}
-
-impl Unit {
-	/// Whether quotearg prints the unit as itself: printable ASCII, or in a
-	/// UTF-8 locale a character glibc's `iswprint` takes (not a control,
-	/// unassigned, U+2028 or U+2029: coreutils 9.7 writes `x\342\200\250y`).
-	fn printable(self, utf8: bool) -> bool {
-		match self {
-			Self::Char(c) if c.is_ascii() => (' '..='~').contains(&c),
-			Self::Char(c) => utf8 && wide_printable(c),
-			Self::Byte(_) => false,
-		}
-	}
-
-	fn push_to(self, out: &mut String) {
-		match self {
-			Self::Char(c) => out.push(c),
-			Self::Byte(byte) => Self::octal(out, &[byte]),
-		}
-	}
-
-	/// quotearg's backslash escape of the unprintable unit: a C escape, else
-	/// the octal escape of each of its bytes.
-	fn escape(self, out: &mut String) {
-		let c = match self {
-			Self::Char(c) => c,
-			Self::Byte(byte) => return Self::octal(out, &[byte]),
-		};
-		let letter = match c {
-			'\x07' => Some('a'),
-			'\x08' => Some('b'),
-			'\x0c' => Some('f'),
-			'\n' => Some('n'),
-			'\r' => Some('r'),
-			'\t' => Some('t'),
-			'\x0b' => Some('v'),
-			_ => None,
-		};
-		if let Some(letter) = letter {
-			out.push('\\');
-			out.push(letter);
-			return;
-		}
-		let mut bytes = [0; 4];
-		Self::octal(out, c.encode_utf8(&mut bytes).as_bytes());
-	}
-
-	fn octal(out: &mut String, bytes: &[u8]) {
-		use std::fmt::Write as _;
-		for byte in bytes {
-			let _ = write!(out, "\\{byte:03o}");
-		}
+/// Whether quotearg prints `c` as itself: printable ASCII, or in a UTF-8
+/// locale any character but a control.
+fn printable(c: char, utf8: bool) -> bool {
+	if c.is_ascii() {
+		(' '..='~').contains(&c)
+	} else {
+		utf8 && !c.is_control()
 	}
 }
 
-/// Whether glibc's `iswprint` takes `c` in a UTF-8 locale, which is what
-/// quotearg asks: asked of the C.UTF-8 locale where it loads, else every
-/// character but a control, U+2028 and U+2029.
-fn wide_printable(c: char) -> bool {
-	#[cfg(unix)]
-	if let Some(ctype) = &*UTF8_CTYPE {
-		// SAFETY: `ctype.0` is a locale object that lives as long as the
-		// process, and `iswprint_l` only reads it.
-		return unsafe { iswprint_l(u32::from(c), ctype.0) } != 0;
+/// quotearg's backslash escape of the unprintable `c`: a C escape, else the
+/// octal escape of each of its bytes.
+fn escape(out: &mut String, c: char) {
+	use std::fmt::Write as _;
+	let letter = match c {
+		'\x07' => Some('a'),
+		'\x08' => Some('b'),
+		'\x0c' => Some('f'),
+		'\n' => Some('n'),
+		'\r' => Some('r'),
+		'\t' => Some('t'),
+		'\x0b' => Some('v'),
+		_ => None,
+	};
+	if let Some(letter) = letter {
+		out.push('\\');
+		out.push(letter);
+		return;
 	}
-	!c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}')
+	let mut bytes = [0; 4];
+	for byte in c.encode_utf8(&mut bytes).bytes() {
+		let _ = write!(out, "\\{byte:03o}");
+	}
 }
-
-#[cfg(unix)]
-unsafe extern "C" {
-	/// `iswprint` in the locale `locale`: glibc, musl and the BSDs have it.
-	/// Its `wint_t` is a 32-bit integer everywhere (`unsigned int` in glibc
-	/// and musl, `int` on macOS), which the `libc` crate does not name.
-	fn iswprint_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
-}
-
-/// The C.UTF-8 `LC_CTYPE`, loaded once, for [`wide_printable`].
-#[cfg(unix)]
-struct Utf8Ctype(libc::locale_t);
-
-// SAFETY: a locale object is never changed once made, and the `_l`
-// functions may read it from any thread.
-#[cfg(unix)]
-unsafe impl Send for Utf8Ctype {}
-#[cfg(unix)]
-unsafe impl Sync for Utf8Ctype {}
-
-#[cfg(unix)]
-static UTF8_CTYPE: std::sync::LazyLock<Option<Utf8Ctype>> = std::sync::LazyLock::new(|| {
-	// SAFETY: the name is a valid NUL-terminated string; a non-null result
-	// is a locale object kept for the life of the process.
-	let handle = unsafe { libc::newlocale(libc::LC_CTYPE_MASK, c"C.UTF-8".as_ptr(), std::ptr::null_mut()) };
-	(!handle.is_null()).then_some(Utf8Ctype(handle))
-});
 
 /// Parses a locale name the way uucore parses the process one:
 /// `language_TERRITORY[.codeset][@modifier]` becomes a BCP 47 locale plus
@@ -2120,53 +2037,15 @@ mod quote_tests {
 			("é", "'\\303\\251'", "‘é’", "''$'\\303\\251'", "'é'"),
 		];
 		for (name, quote_c, quote_utf8, shell_c, shell_utf8) in cases {
-			check(name.as_bytes(), [quote_c, quote_utf8, shell_c, shell_utf8]);
+			let got = (
+				gnu_quote(false, name),
+				gnu_quote(true, name),
+				gnu_quote_shell(false, name),
+				gnu_quote_shell(true, name),
+			);
+			let want = (quote_c.to_owned(), quote_utf8.to_owned(), shell_c.to_owned(), shell_utf8.to_owned());
+			assert_eq!(got, want, "{name:?}");
 		}
-	}
-
-	/// The same as coreutils 9.7 quotes a name of raw bytes, or one with a
-	/// character glibc does not print (U+2028, the unassigned U+0378), or a
-	/// `’`, which `quote` escapes in UTF-8: measured with `/usr/bin/timeout
-	/// 5 NAME` and `/usr/bin/nohup NAME`, `LC_ALL=C` and `LC_ALL=C.UTF-8`. A
-	/// private-use character and U+200B print as themselves.
-	#[test]
-	fn raw_bytes_and_characters_glibc_does_not_print_are_escaped() {
-		let cases: [(&[u8], [&str; 4]); 10] = [
-			(b"\xff", ["'\\377'", "‘\\377’", "''$'\\377'", "''$'\\377'"]),
-			(b"a\xffb", ["'a\\377b'", "‘a\\377b’", "'a'$'\\377''b'", "'a'$'\\377''b'"]),
-			("x\u{2028}y".as_bytes(), [
-				"'x\\342\\200\\250y'",
-				"‘x\\342\\200\\250y’",
-				"'x'$'\\342\\200\\250''y'",
-				"'x'$'\\342\\200\\250''y'",
-			]),
-			("x\u{378}y".as_bytes(), ["'x\\315\\270y'", "‘x\\315\\270y’", "'x'$'\\315\\270''y'", "'x'$'\\315\\270''y'"]),
-			("a’b".as_bytes(), ["'a\\342\\200\\231b'", "‘a\\’b’", "'a'$'\\342\\200\\231''b'", "'a’b'"]),
-			("a‘b".as_bytes(), ["'a\\342\\200\\230b'", "‘a‘b’", "'a'$'\\342\\200\\230''b'", "'a‘b'"]),
-			("p\u{e000}q".as_bytes(), ["'p\\356\\200\\200q'", "‘p\u{e000}q’", "'p'$'\\356\\200\\200''q'", "'p\u{e000}q'"]),
-			("z\u{200b}w".as_bytes(), ["'z\\342\\200\\213w'", "‘z\u{200b}w’", "'z'$'\\342\\200\\213''w'", "'z\u{200b}w'"]),
-			(b"c\x7f", ["'c\\177'", "‘c\\177’", "'c'$'\\177'", "'c'$'\\177'"]),
-			("it’s'".as_bytes(), [
-				"'it\\342\\200\\231s\\''",
-				"‘it\\’s'’",
-				"'it'$'\\342\\200\\231''s'\\'''",
-				"\"it’s'\"",
-			]),
-		];
-		for (name, want) in cases {
-			check(name, want);
-		}
-	}
-
-	/// `name` quoted by `quote` in C and in UTF-8, then by `quoteaf` in both.
-	fn check(name: &[u8], want: [&str; 4]) {
-		let got = [
-			gnu_quote(false, name),
-			gnu_quote(true, name),
-			gnu_quote_shell(false, name),
-			gnu_quote_shell(true, name),
-		];
-		assert_eq!(got, want.map(str::to_owned), "{:?}", String::from_utf8_lossy(name));
 	}
 
 	/// The environment's `LC_CTYPE` is UTF-8 for a GNU utility only when its

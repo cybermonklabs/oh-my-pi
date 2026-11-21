@@ -132,7 +132,7 @@ impl Nohup {
 					env.get(var.as_bytes())
 						.and_then(|value| value.to_str().ok())
 				});
-				let name = pi_builtins::extras::gnu_quote_shell(utf8, &self.name);
+				let name = pi_builtins::extras::gnu_quote_shell(utf8, &self.name.to_str_lossy());
 				self
 					.out
 					.push(2, format!("nohup: failed to run command {name}: {text}\n"));

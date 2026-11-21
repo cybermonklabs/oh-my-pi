@@ -194,11 +194,9 @@ pub(crate) fn invocation(
 	umask: u32,
 	config: &ToolConfig,
 ) -> Invocation {
-	// The bytes as given, which on unix are any: `cat $'\xff'` opens the file
-	// of that name, not one named U+FFFD.
 	let argv = argv
 		.iter()
-		.map(|arg| arg.to_os_str_lossy().into_owned())
+		.map(|arg| arg.to_str_lossy().into_owned())
 		.collect();
 	// Files the extra creates get the shell's `umask`, not the process's.
 	let fs = config.filesystem().with_creation_mask(Some(umask));
@@ -209,9 +207,6 @@ pub(crate) fn invocation(
 		.collect();
 	let [stdin, stdout, stderr] = stdio;
 	invocation.stdio = [open_fd(stdin, false), open_fd(stdout, true), open_fd(stderr, true)];
-	// `2>&1` puts one fd object in both slots; the builtin's duplicates of a
-	// regular file cannot tell that from `>f 2>f`.
-	invocation.stdout_is_stderr = stdout.is_open() && stdout.same(stderr);
 	invocation.fds = extra_fds
 		.iter()
 		.filter(|(_, fd)| fd.is_open())

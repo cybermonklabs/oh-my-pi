@@ -10,7 +10,6 @@ use std::{
 	io::{self, Read, Write},
 	ops::BitOr,
 	path::{Component, MAIN_SEPARATOR, Path, PathBuf, Prefix},
-	sync::LazyLock,
 };
 
 use clap::{
@@ -26,7 +25,6 @@ use thiserror::Error;
 use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
 use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes};
-use crate::long_options::OptionTable;
 
 macro_rules! show_error {
 	($host:expr, $($args:tt)+) => {{
@@ -983,11 +981,8 @@ static OPT_PROMPT_ALWAYS: &str = "prompt-always";
 static OPT_PROMPT_ONCE: &str = "prompt-once";
 static OPT_RECURSIVE: &str = "recursive";
 static OPT_VERBOSE: &str = "verbose";
-const OPT_PROGRESS: &str = "progress";
+static OPT_PROGRESS: &str = "progress";
 static PRESUME_INPUT_TTY: &str = "-presume-input-tty";
-/// The long name of `PRESUME_INPUT_TTY`, whose alias, the id, has the third
-/// dash GNU rm 9.7 spells it with.
-const OPT_PRESUME_INPUT_TTY: &str = "presume-input-tty";
 
 static ARG_FILES: &str = "files";
 
@@ -997,15 +992,6 @@ pub(crate) struct Rm {
 }
 
 matches_parser!(Rm, uu_app);
-
-/// The long options `rm` has and GNU rm 9.7 does not, or hides behind a
-/// third dash (`---presume-input-tty`): GNU reads `--p`, `--pr` and `--pres`
-/// as `--preserve-root`, where each also begins one of these.
-const BUILTIN_ONLY_LONG_OPTIONS: [&str; 2] = [OPT_PROGRESS, OPT_PRESUME_INPUT_TTY];
-
-/// The options `rm` accepts.
-static OPTIONS: LazyLock<OptionTable> =
-	LazyLock::new(|| OptionTable::new(uu_app(), &BUILTIN_ONLY_LONG_OPTIONS));
 
 impl Utility for Rm {
 	const NAME: &'static str = "rm";
@@ -1022,7 +1008,7 @@ impl Utility for Rm {
 				return Err(RmError::MayNotAbbreviateNoPreserveRoot.to_string());
 			}
 		}
-		Ok(OPTIONS.spell_out_all(argv))
+		Ok(argv)
 	}
 
 
@@ -1217,7 +1203,7 @@ pub fn uu_app() -> Command {
 		// hyphens. Therefore it supports 3 leading hyphens.
 		.arg(
 			Arg::new(PRESUME_INPUT_TTY)
-				.long(OPT_PRESUME_INPUT_TTY)
+				.long("presume-input-tty")
 				.alias(PRESUME_INPUT_TTY)
 				.hide(true)
 				.action(ArgAction::SetTrue),

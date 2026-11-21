@@ -1625,16 +1625,16 @@ impl ShellCommand {
 ///
 /// `program` is the name the utility gave: a relative path runs from `cwd`,
 /// and a bare name is looked up on `PATH`, where only a path that fits is
-/// found (pi-shell's lookup reads that program: a refusal it finds to be the
+/// found (the shell's twin reads that program: a refusal it finds to be the
 /// interpreter's reaches the utility without its `errno`). `cwd` is taken
 /// lexically normalized (`-execdir`'s `<dir>/./sub` is `<dir>/sub`), as the
 /// shell enters it.
 ///
-/// pi-shell's VM asks this too (`refused_as_too_long` in
-/// `bash/vm/command.rs`), to decide which refusals reach the utility: one
-/// rule for both.
+/// The shell's twin, `refused_as_too_long` in pi-shell's VM
+/// (`bash/vm/command.rs`), decides which refusals reach the utility; the
+/// two apply the same rule.
 #[cfg(unix)]
-pub fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
+pub(crate) fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd: &Path) -> bool {
 	use std::os::unix::ffi::OsStrExt as _;
 	match error.raw_os_error() {
 		Some(libc::E2BIG) => true,
@@ -1650,16 +1650,34 @@ pub fn command_line_too_long(error: &io::Error, program: &Path, line: usize, cwd
 
 /// Whether the program at `path` is a `#!` script whose interpreter the
 /// system cannot reach by its path: the interpreter its first line names
-/// ([`script_interpreter`]; relative to `cwd` when relative) is past
-/// `PATH_MAX` or holds a name past `NAME_MAX`, or looking it up fails with
-/// `ENAMETOOLONG` (a symlink on its way names one). Only read for an
-/// `ENAMETOOLONG` of a long line, the one refusal it decides.
+/// (read as the kernel reads it, from the file's first 256 bytes; relative
+/// to `cwd` when relative) is past `PATH_MAX` or holds a name past
+/// `NAME_MAX`, or looking it up fails with `ENAMETOOLONG` (a symlink on its
+/// way names one). Only read for an `ENAMETOOLONG` of a long line, the one
+/// refusal it decides. The shell's twin is `interpreter_path_too_long` in
+/// pi-shell's VM.
 #[cfg(unix)]
 fn interpreter_path_too_long(path: &Path, cwd: &Path) -> bool {
-	let Some(name) = script_interpreter(path) else {
+	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
+	let Ok(file) = std::fs::File::open(path) else {
 		return false;
 	};
-	let interpreter = cwd.join(name);
+	let mut head = Vec::with_capacity(256);
+	if file.take(256).read_to_end(&mut head).is_err() {
+		return false;
+	}
+	let Some(line) = head.strip_prefix(b"#!") else {
+		return false;
+	};
+	let line = &line[line.iter().take_while(|&&c| c == b' ' || c == b'\t').count()..];
+	let end = line
+		.iter()
+		.position(|&c| matches!(c, b' ' | b'\t' | b'\n' | b'\0'))
+		.unwrap_or(line.len());
+	if end == 0 {
+		return false;
+	}
+	let interpreter = cwd.join(std::ffi::OsStr::from_bytes(&line[..end]));
 	!path_fits(&interpreter)
 		|| std::fs::metadata(&interpreter).is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
 }
@@ -1671,7 +1689,7 @@ const POSIX_ARG_MAX: usize = 4096;
 
 /// The bytes the arguments `argv` take in a command line: each string and
 /// its terminating NUL, as the system counts them.
-pub fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
+pub(crate) fn line_bytes<S: AsRef<OsStr>>(argv: impl IntoIterator<Item = S>) -> usize {
 	argv.into_iter().map(|arg| arg.as_ref().len() + 1).sum()
 }
 
@@ -1689,7 +1707,7 @@ fn path_fits(path: &Path) -> bool {
 /// Windows commands are not split (the shell keeps its diagnostic for every
 /// refused start): see the Unix twin.
 #[cfg(not(unix))]
-pub fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
+pub(crate) fn command_line_too_long(_error: &io::Error, _program: &Path, _line: usize, _cwd: &Path) -> bool {
 	false
 }
 
@@ -1890,11 +1908,6 @@ pub(crate) enum StreamWriter {
 	/// capture pipe): one buffer means diagnostics and output interleave in
 	/// exactly the order they were written.
 	Shared(Arc<Mutex<StreamWriter>>),
-	/// Stderr's handle onto the writer it shares with stdout: each write is
-	/// flushed at once with the output buffered before it, as glibc's `error`
-	/// flushes stdout and stderr is unbuffered. So a diagnostic also lands
-	/// ahead of output a utility then writes to the raw descriptor.
-	Diagnostics(Arc<Mutex<StreamWriter>>),
 	/// Memory-backed output of an async utility: writes append to a buffer
 	/// the host delivers asynchronously (see [`Host::flush_output`]).
 	Async(AsyncOut),
@@ -1929,18 +1942,8 @@ impl StreamWriter {
 		match self {
 			Self::Block(w) => w.get_ref().clone(),
 			Self::Line(w) => w.get_ref().clone(),
-			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().dup_file(),
+			Self::Shared(shared) => shared.lock().dup_file(),
 			Self::Async(out) => out.dup_file(),
-		}
-	}
-
-	/// Another handle onto this writer where it is shared by stdout and
-	/// stderr, with the same flush rule; `None` for a writer of its own.
-	pub fn share(&self) -> Option<Self> {
-		match self {
-			Self::Shared(shared) => Some(Self::Shared(Arc::clone(shared))),
-			Self::Diagnostics(shared) => Some(Self::Diagnostics(Arc::clone(shared))),
-			Self::Block(_) | Self::Line(_) | Self::Async(_) => None,
 		}
 	}
 
@@ -1950,7 +1953,7 @@ impl StreamWriter {
 		match self {
 			Self::Block(w) => w.get_ref().is_terminal(),
 			Self::Line(w) => w.get_ref().is_terminal(),
-			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().is_terminal(),
+			Self::Shared(shared) => shared.lock().is_terminal(),
 			Self::Async(out) => out.is_terminal(),
 		}
 	}
@@ -1962,12 +1965,6 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write(buf),
 			Self::Line(w) => w.write(buf),
 			Self::Shared(shared) => shared.lock().write(buf),
-			Self::Diagnostics(shared) => {
-				let mut shared = shared.lock();
-				let written = shared.write(buf)?;
-				shared.flush()?;
-				Ok(written)
-			},
 			Self::Async(out) => out.write(buf),
 		}
 	}
@@ -1976,7 +1973,7 @@ impl Write for StreamWriter {
 		match self {
 			Self::Block(w) => w.flush(),
 			Self::Line(w) => w.flush(),
-			Self::Shared(shared) | Self::Diagnostics(shared) => shared.lock().flush(),
+			Self::Shared(shared) => shared.lock().flush(),
 			Self::Async(out) => out.flush(),
 		}
 	}
@@ -1986,12 +1983,6 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_vectored(bufs),
 			Self::Line(w) => w.write_vectored(bufs),
 			Self::Shared(shared) => shared.lock().write_vectored(bufs),
-			Self::Diagnostics(shared) => {
-				let mut shared = shared.lock();
-				let written = shared.write_vectored(bufs)?;
-				shared.flush()?;
-				Ok(written)
-			},
 			Self::Async(out) => out.write_vectored(bufs),
 		}
 	}
@@ -2007,11 +1998,6 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_all(buf),
 			Self::Line(w) => w.write_all(buf),
 			Self::Shared(shared) => shared.lock().write_all(buf),
-			Self::Diagnostics(shared) => {
-				let mut shared = shared.lock();
-				shared.write_all(buf)?;
-				shared.flush()
-			},
 			Self::Async(out) => out.write_all(buf),
 		}
 	}
@@ -2021,11 +2007,6 @@ impl Write for StreamWriter {
 			Self::Block(w) => w.write_fmt(args),
 			Self::Line(w) => w.write_fmt(args),
 			Self::Shared(shared) => shared.lock().write_fmt(args),
-			Self::Diagnostics(shared) => {
-				let mut shared = shared.lock();
-				shared.write_fmt(args)?;
-				shared.flush()
-			},
 			Self::Async(out) => out.write_fmt(args),
 		}
 	}
@@ -2420,55 +2401,6 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 	}
 }
 
-/// The bytes of a file's start the kernel reads for a `#!` line
-/// (`BINPRM_BUF_SIZE`).
-const SHEBANG_BUFFER: usize = 256;
-
-/// The interpreter the `#!` line of the file at `path` names, read from its
-/// first [`SHEBANG_BUFFER`] bytes as the kernel reads them
-/// ([`shebang_interpreter`]). `None` for a file that names none or cannot be
-/// read.
-#[cfg(unix)]
-pub fn script_interpreter(path: &Path) -> Option<PathBuf> {
-	use std::{io::Read as _, os::unix::ffi::OsStrExt as _};
-	let mut head = [0; SHEBANG_BUFFER];
-	let len = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
-	shebang_interpreter(&head[..len]).map(|name| PathBuf::from(std::ffi::OsStr::from_bytes(name)))
-}
-
-/// The interpreter a `#!` line names, read from `head`, the file's first
-/// bytes, as Linux's `binfmt_script` reads its first [`SHEBANG_BUFFER`]: the
-/// first word after `#!` and any blanks (spaces and tabs), up to a blank, a
-/// NUL or the end of the line. `None` where the file does not start with
-/// `#!`, where the line names nothing (blanks alone, or a NUL first, as in
-/// `#! \0x`), and where no newline comes in those bytes and nothing ends the
-/// name there, which the kernel takes for a name cut short. For each of
-/// these `execve` fails with `ENOEXEC`, and `execvp` runs the file with
-/// `/bin/sh`. (GKE Sandbox, gVisor, reads a NUL as part of the name and
-/// fails with `EINVAL` or `ENOENT` where Linux reads no name.)
-fn shebang_interpreter(head: &[u8]) -> Option<&[u8]> {
-	let head = &head[..head.len().min(SHEBANG_BUFFER)];
-	let rest = head.strip_prefix(b"#!")?;
-	let blank = |byte: u8| matches!(byte, b' ' | b'\t');
-	let line = match rest.iter().position(|&byte| byte == b'\n') {
-		Some(end) => &rest[..end],
-		// A shorter file is followed by the NULs the kernel pads it with.
-		None if head.len() < SHEBANG_BUFFER => rest,
-		// A blank or a NUL must end the name within the buffer, whose last
-		// byte the kernel then drops.
-		None => {
-			let start = rest.iter().position(|&byte| !blank(byte))?;
-			if !rest[start..].iter().any(|&byte| blank(byte) || byte == 0) {
-				return None;
-			}
-			&rest[..rest.len() - 1]
-		},
-	};
-	let name = &line[line.iter().position(|&byte| !blank(byte))?..];
-	let end = name.iter().position(|&byte| blank(byte) || byte == 0).unwrap_or(name.len());
-	(end > 0).then_some(&name[..end])
-}
-
 /// What the shared adapter needs to know about a utility, whichever trait it
 /// implements.
 #[derive(Clone, Copy)]
@@ -2518,9 +2450,8 @@ pub struct Invocation {
 	/// The name the extra was invoked as: selects the extra and names it in
 	/// diagnostics (`sg` runs `ast-grep` and still says `sg`).
 	pub name:           String,
-	/// The arguments, `argv[0]` included, as the shell has them: a byte that
-	/// is not UTF-8 stays itself (`cat $'\xff'` opens the file of that name).
-	pub argv:           Vec<OsString>,
+	/// The arguments, `argv[0]` included.
+	pub argv:           Vec<String>,
 	/// The exported environment.
 	pub env:            HashMap<String, String>,
 	/// The shell's working directory, which relative paths resolve against.
@@ -2528,10 +2459,6 @@ pub struct Invocation {
 	/// Descriptors 0, 1, and 2; [`Fd::Closed`] reads as end of input and
 	/// discards writes.
 	pub stdio:          [Fd; 3],
-	/// Whether descriptors 1 and 2 are one open file (`2>&1`), which only the
-	/// caller can tell for a regular file: output and diagnostics then go
-	/// through one writer, in the order they are written.
-	pub stdout_is_stderr: bool,
 	/// Further open descriptors (`exec 3<…`, process substitution) by number,
 	/// reachable through `/dev/fd/N` paths.
 	pub fds:            Vec<(i32, Fd)>,
@@ -2561,14 +2488,13 @@ impl Invocation {
 	/// An invocation of `argv` (named by `argv[0]`) in `cwd` on `fs`, with no
 	/// environment, closed stdio, no cancellation, and no command runner.
 	#[must_use]
-	pub fn new(argv: Vec<OsString>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
+	pub fn new(argv: Vec<String>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
 		Self {
-			name: argv.first().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+			name: argv.first().cloned().unwrap_or_default(),
 			argv,
 			env: HashMap::new(),
 			cwd,
 			stdio: [Fd::Closed, Fd::Closed, Fd::Closed],
-			stdout_is_stderr: false,
 			fds: Vec::new(),
 			fs,
 			cancel: None,
@@ -2581,27 +2507,14 @@ impl Invocation {
 	/// Opens the descriptors as shareable [`OpenFile`]s; `default_name` stands
 	/// in for an empty [`Invocation::name`].
 	pub(crate) fn open(self, default_name: &str) -> Opened {
-		let Self {
-			name,
-			argv,
-			env,
-			cwd,
-			stdio,
-			stdout_is_stderr,
-			fds,
-			fs,
-			cancel,
-			commands,
-			reported_error,
-			too_long_to_caller,
-		} = self;
+		let Self { name, argv, env, cwd, stdio, fds, fs, cancel, commands, reported_error, too_long_to_caller } =
+			self;
 		Opened {
 			name: if name.is_empty() { default_name.to_string() } else { name },
 			argv,
 			env,
 			cwd,
 			stdio: stdio.map(OpenFile::from_fd),
-			stdout_is_stderr,
 			fds: fds
 				.into_iter()
 				.filter_map(|(number, fd)| Some((number, OpenFile::from_fd(fd)?)))
@@ -2619,11 +2532,10 @@ impl Invocation {
 /// closed one.
 pub(crate) struct Opened {
 	pub name:           String,
-	pub argv:           Vec<OsString>,
+	pub argv:           Vec<String>,
 	pub env:            HashMap<String, String>,
 	pub cwd:            PathBuf,
 	pub stdio:          [Option<OpenFile>; 3],
-	pub stdout_is_stderr: bool,
 	pub fds:            Vec<(i32, OpenFile)>,
 	pub fs:             pi_vfs::Fs,
 	pub cancel:         Option<CancellationToken>,
@@ -2735,7 +2647,7 @@ struct Prepared<P> {
 /// failure).
 fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, Early> {
 	let mut invocation = invocation.open(spec.name);
-	let argv = std::mem::take(&mut invocation.argv);
+	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
 	let [_, stdout, stderr] = &invocation.stdio;
 
 	let argv = match (spec.rewrite_argv)(argv) {
@@ -2748,11 +2660,6 @@ fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepar
 
 	let parsed = match P::try_parse_from(&argv) {
 		Ok(parsed) => parsed,
-		// clap's text for an argument its parser reads as text but that is
-		// not UTF-8 names neither the utility nor the argument.
-		Err(err) if err.kind() == clap::error::ErrorKind::InvalidUtf8 => {
-			return Err(Early::report(spec.usage_error.into(), stderr.as_ref(), invalid_utf8(spec.name)));
-		},
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
 			// stdout with a success status, everything else on stderr.
@@ -2966,7 +2873,6 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 		name: invoked,
 		env,
 		stdio: [stdin, stdout, stderr_file],
-		stdout_is_stderr,
 		cancel: token,
 		reported_error,
 		too_long_to_caller,
@@ -3006,15 +2912,12 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 	// `2>&1` (and the default capture pipe): one shared writer keeps
 	// diagnostics and output in exact write order. It carries stdout output,
 	// so it takes the stdout guard: once the reader is gone every write fails
-	// and nothing is observable either way. A pipe is recognised by its
-	// identity; a regular file only by the caller, since `>f 2>f` opens two
-	// files on one inode whose offsets one writer would merge.
+	// and nothing is observable either way.
 	//
 	// An async utility's writers never touch a descriptor: they append to
 	// memory-backed `AsyncOut`s that the host drains asynchronously.
 	let mut async_out = None;
-	let one_file = stdout_is_stderr || stdout_destination.shares_with(&stderr_destination);
-	let (merged_out, stderr) = if one_file {
+	let (merged_out, stderr) = if stdout_destination.shares_with(&stderr_destination) {
 		if async_io {
 			let out = async_out_for(
 				stderr_file,
@@ -3029,7 +2932,7 @@ fn build_host(invocation: Opened, spec: Spec) -> Result<Host, Early> {
 			let guarded = SigpipeGuard::wrap(stderr_file, GuardedStream::Stdout, &sigpipe, &command_cancel);
 			let shared =
 				Arc::new(Mutex::new(StreamWriter::new(guarded, stderr_destination.regular_file)));
-			(Some(Arc::clone(&shared)), StreamWriter::Diagnostics(shared))
+			(Some(Arc::clone(&shared)), StreamWriter::Shared(shared))
 		}
 	} else if async_io {
 		let out = async_out_for(
@@ -3181,7 +3084,7 @@ impl ProcContext {
 		};
 		let (stdout, stderr) = match &invocation.stdio {
 			[_, Some(stdout), Some(stderr)]
-				if invocation.stdout_is_stderr || Destination::of(stdout).shares_with(&Destination::of(stderr)) =>
+				if Destination::of(stdout).shares_with(&Destination::of(stderr)) =>
 			{
 				let merged = out(stderr, GuardedStream::Stdout);
 				(Some(merged.clone()), Some(merged))
@@ -3313,21 +3216,9 @@ impl Write for ProcStream {
 /// status 141 for a closed reader and 1 otherwise.
 pub(crate) async fn run_process<P: Process>(invocation: Invocation) -> i32 {
 	let mut invocation = invocation.open("");
-	let argv = std::mem::take(&mut invocation.argv);
+	let argv = P::rewrite_argv(std::mem::take(&mut invocation.argv));
 	let context = ProcContext::from_invocation(invocation, P::USES_PATHS);
-	// A process builtin's parser reads text: an argument that is not UTF-8
-	// is refused, not read as some other one.
-	let Ok(argv) = argv.into_iter().map(OsString::into_string).collect::<Result<Vec<_>, _>>() else {
-		let _ = context.stderr().write_all(invalid_utf8(&context.command_name).as_bytes());
-		return drained_status(&context, INVALID_USAGE_EXIT_CODE).await;
-	};
-	run_process_in::<P>(P::rewrite_argv(argv), &context).await
-}
-
-/// The refusal of an argument that is not UTF-8 by the builtin `name`, whose
-/// parser reads that argument as text: `seq $'\xff'`.
-fn invalid_utf8(name: &str) -> String {
-	format!("{name}: invalid UTF-8 was detected in one or more arguments\n")
+	run_process_in::<P>(argv, &context).await
 }
 
 /// [`run_process`] against an existing context.
@@ -3638,37 +3529,6 @@ mod testing {
 		assert_eq!(super::pollable_fd(&null), None);
 		let (reader, _writer) = std::io::pipe().unwrap();
 		assert!(super::pollable_fd(&OpenFile::from(reader)).is_some());
-	}
-
-	/// The interpreter of a `#!` line, as Linux's `fs/binfmt_script.c`
-	/// reads it (`None` where `execve` fails with `ENOEXEC`).
-	#[test]
-	fn shebang_interpreter_reads_as_linux_does() {
-		use super::shebang_interpreter;
-		let named = |head: &[u8]| shebang_interpreter(head).map(<[u8]>::to_vec);
-		assert_eq!(named(b"#!/bin/sh\necho\n"), Some(b"/bin/sh".to_vec()));
-		assert_eq!(named(b"#! \t/bin/sh -e  \n"), Some(b"/bin/sh".to_vec()));
-		assert_eq!(named(b"#!/bin/sh"), Some(b"/bin/sh".to_vec()));
-		assert_eq!(named(b"#!/bin/echo\0junk\n"), Some(b"/bin/echo".to_vec()));
-		assert_eq!(named(b"#!/bin/echo\r\n"), Some(b"/bin/echo\r".to_vec()));
-		assert_eq!(named(b"echo\n"), None);
-		assert_eq!(named(b"#!"), None);
-		assert_eq!(named(b"#!   \n"), None);
-		// Blanks, then a NUL: no name.
-		assert_eq!(named(b"#! \0x"), None);
-		assert_eq!(named(b"#!\0/bin/echo\n"), None);
-		// No newline in the first 256 bytes: the name must end there.
-		let long = |name_len: usize, then: &[u8]| {
-			let mut head = b"#!".to_vec();
-			head.resize(2 + name_len, b'a');
-			head.extend_from_slice(then);
-			head.resize(300, b'b');
-			head
-		};
-		assert_eq!(named(&long(300, b"")), None);
-		assert_eq!(named(&long(253, b" ")), Some(vec![b'a'; 253]));
-		assert_eq!(named(&long(254, b" ")), None);
-		assert_eq!(named(&long(10, b" ")), Some(vec![b'a'; 10]));
 	}
 
 	#[cfg(windows)]
@@ -3997,7 +3857,7 @@ mod testing {
 			error.try_clone().expect("stderr"),
 		);
 		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(OsString::from).collect(),
+			argv.iter().map(ToString::to_string).collect(),
 			cwd.to_path_buf(),
 			pi_vfs::Fs::native(),
 		);
@@ -4203,7 +4063,7 @@ mod testing {
 		let output = tempfile::tempfile().expect("stdout file");
 		let error = tempfile::tempfile().expect("stderr file");
 		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(OsString::from).collect(),
+			argv.iter().map(ToString::to_string).collect(),
 			std::env::current_dir().expect("current dir"),
 			pi_vfs::Fs::native(),
 		);
@@ -4304,11 +4164,8 @@ mod testing {
 					if let (Some(argv0), Some(first)) = (argv0, argv.first_mut()) {
 						*first = argv0;
 					}
-					let mut invocation = crate::extras::Invocation::new(
-						argv.iter().map(OsString::from).collect(),
-						runner.cwd.clone(),
-						pi_vfs::Fs::native(),
-					);
+					let mut invocation =
+						crate::extras::Invocation::new(argv, runner.cwd.clone(), pi_vfs::Fs::native());
 					invocation.name = name;
 					invocation.env = runner.env.clone();
 					invocation.stdio = [

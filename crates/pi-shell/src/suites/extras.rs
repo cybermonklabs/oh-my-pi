@@ -475,8 +475,7 @@ async fn a_builtins_refused_exec_is_not_retried() {
 			ran.stderr
 		);
 		assert_eq!(too_long_reports(&ran.stderr), 1, "{command}: {}", ran.stderr);
-		let own = |line: &&str| line.starts_with("xargs:") || line.starts_with("find:");
-		assert!(!ran.stderr.lines().any(|line| own(&line)), "{command}: {}", ran.stderr);
+		assert!(!ran.stderr.contains("could not be run"), "{command}: {}", ran.stderr);
 	}
 }
 
@@ -714,14 +713,10 @@ async fn env_does_not_hand_up_a_refusal_after_reading_env0_from() {
 /// - `noexec`, a script without the execute bit, which no lookup finds
 ///   executable;
 /// - `ia`, a script whose `#!` interpreter is `noexec`: the system refuses its
-///   `exec` with `EACCES` (also for root, as no execute bit is set), and the
-///   lookup finds that before it;
+///   `exec` with `EACCES` (also for root, as no execute bit is set);
 /// - `s`, a script whose `#!` interpreter is a symlink to a name past
-///   `NAME_MAX` (`ENAMETOOLONG` of a path, on a line no system refuses),
-///   which the lookup leaves to the system's `exec`;
-/// - `mi`, a script whose `#!` interpreter does not exist (`ENOENT`), which
-///   the lookup finds before the `exec`;
-/// - `d`, a directory, which nothing may execute (`EACCES`);
+///   `NAME_MAX` (`ENAMETOOLONG` of a path, on a line no system refuses);
+/// - `mi`, a script whose `#!` interpreter does not exist (`ENOENT`);
 /// - `bin`, an executable that is no program (`ENOEXEC`), which runs as a
 ///   script, as `execvp` runs it with `/bin/sh`.
 #[cfg(target_os = "linux")]
@@ -748,11 +743,12 @@ fn cannot_run_dir() -> tempfile::TempDir {
 	dir
 }
 
-/// The scripts of [`cannot_run_dir`] whose `exec` the system refuses where
-/// the lookup did not foresee it, with the `strerror` text of the refusal:
-/// `ENAMETOOLONG` of a `#!` interpreter.
+/// The scripts of [`cannot_run_dir`] whose `exec` the system refuses, with
+/// the `strerror` text of the refusal: `EACCES`, `ENOENT` of a `#!`
+/// interpreter, and `ENAMETOOLONG` of one.
 #[cfg(target_os = "linux")]
-const REFUSED_EXECS: [(&str, &str); 1] = [("s", "File name too long")];
+const REFUSED_EXECS: [(&str, &str); 3] =
+	[("ia", "Permission denied"), ("mi", "No such file or directory"), ("s", "File name too long")];
 
 /// How many lines of `stderr` are the shell's diagnostic for `program`
 /// refused with the text `said`: a line naming `program` and saying `said`
@@ -769,7 +765,8 @@ fn shell_reports(stderr: &str, program: &str, said: &str) -> usize {
 /// Runs `xargs -t -n1 PROGRAM < words` in `dir` ([`cannot_run_dir`]) for a
 /// program no lookup finds runnable, and asserts that xargs tries the first
 /// line only, stops, and exits `status`, with the one line `said` and
-/// nothing else: the text and status of GNU findutils 4.10's xargs.
+/// nothing else: the text and status of xargs at 9058ab9d, which this PR
+/// keeps (only a line too long changed).
 #[cfg(target_os = "linux")]
 async fn assert_xargs_cannot_run(dir: &Path, program: &str, status: i32, said: &str) {
 	let ran = run(&mut session_in(dir, &[]), &format!("xargs -t -n1 {program} < words")).await;
@@ -782,38 +779,35 @@ async fn assert_xargs_cannot_run(dir: &Path, program: &str, status: i32, said: &
 	assert_eq!(reported, [said], "{program}");
 }
 
-/// A command no lookup finds, or a script whose `#!` interpreter does not
-/// exist: 127 and `xargs: NAME: No such file or directory`, and xargs stops,
-/// for a name on `PATH` and a path, as GNU findutils 4.10's xargs.
+/// A command no lookup finds: 127 and `xargs: NAME: No such file or
+/// directory`, and xargs stops, for a name on `PATH`, a path, and a
+/// directory (no lookup finds one runnable), as at 9058ab9d.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_stops_with_127_for_a_command_it_cannot_find() {
 	let dir = cannot_run_dir();
-	for program in ["no-such-command-here", "./nosuch", "./mi"] {
+	for program in ["no-such-command-here", "./nosuch", "./d"] {
 		let said = format!("xargs: {program}: No such file or directory");
 		assert_xargs_cannot_run(dir.path(), program, 127, &said).await;
 	}
 }
 
-/// A file the lookup finds but none may run (no execute bit, a directory, a
-/// `#!` interpreter without the execute bit): 126 and `xargs: NAME:
-/// Permission denied`, and xargs stops, as GNU findutils 4.10's xargs.
+/// A file the lookup finds but none may run (no execute bit): 126 and
+/// `xargs: Command could not be run: permission denied`, and xargs stops,
+/// as at 9058ab9d (not `xargs: NAME: Permission denied`).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_stops_with_126_for_a_command_it_may_not_run() {
 	let dir = cannot_run_dir();
-	for program in ["./noexec", "./d", "./ia"] {
-		let said = format!("xargs: {program}: Permission denied");
-		assert_xargs_cannot_run(dir.path(), program, 126, &said).await;
-	}
+	let said = "xargs: Command could not be run: permission denied";
+	assert_xargs_cannot_run(dir.path(), "./noexec", 126, said).await;
 }
 
 /// A program whose `exec` the system refuses for anything but a line too
-/// long, where the lookup did not foresee it (a `#!` interpreter past
-/// `NAME_MAX`): the shell reports it for each line (status 126), xargs goes
-/// on to every line and exits 123, and splits nothing. Under `timeout`,
-/// which ran, it is timeout's failure in coreutils' words (status 126,
-/// xargs 123).
+/// long (`EACCES`, a `#!` interpreter missing, or past `NAME_MAX`): the shell
+/// reports it for each line (status 126), xargs goes on to every line and
+/// exits 123, and splits nothing. Under `timeout`, which ran, it is timeout's
+/// failure in coreutils' words (status 126, xargs 123).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_leaves_a_refused_exec_to_the_shell() {
@@ -854,10 +848,10 @@ async fn xargs_runs_a_file_that_is_no_program_as_a_script() {
 }
 
 /// `find -exec … +` and `-exec … ;` with a command no lookup finds
-/// runnable: `find: ‘NAME’: strerror` for each command line, in the quotes
-/// of the locale (`'NAME'` in C), as GNU findutils 4.10; find goes on, and
-/// exits 1 for `+` (0 for `;`, whose failure is only the test's). One batch
-/// per directory with `-execdir`.
+/// runnable: `Failed to run NAME: ERROR` for each command line, in any
+/// locale, as at 9058ab9d; find goes on, and exits 1 for `+` (0 for `;`,
+/// whose failure is only the test's). One batch per directory with
+/// `-execdir`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_reports_a_command_it_cannot_start() {
@@ -866,30 +860,23 @@ async fn find_reports_a_command_it_cannot_start() {
 	let abs = |name: &str| p.join(name).display().to_string();
 	for locale in ["C", "C.UTF-8"] {
 		let mut s = session_in(p, &[("LC_ALL", locale)]);
-		let (open, close) = if locale == "C" { ("'", "'") } else { ("‘", "’") };
 		let mut check = async |command: String, program: &str, said: &str, times: usize, rc: i32| {
 			let ran = run(&mut s, &format!("{command}; echo rc=$?")).await;
 			assert_eq!(ran.stdout, format!("rc={rc}\n"), "{locale} {command}: {}", ran.stderr);
-			let message = format!("find: {open}{program}{close}: {said}");
+			let message = format!("Failed to run {program}: {said}");
 			let said: Vec<&str> = ran.stderr.lines().collect();
 			assert_eq!(said, vec![message.as_str(); times], "{locale} {command}");
 		};
 		for (program, said) in [
-			("no-such-command-here", "No such file or directory"),
-			("./noexec", "Permission denied"),
-			("./d", "Permission denied"),
-			("./ia", "Permission denied"),
-			("./mi", "No such file or directory"),
+			("no-such-command-here", "entity not found"),
+			("./noexec", "permission denied"),
+			("./d", "entity not found"),
 		] {
 			check(format!("find findroot -type f -exec {program} {{}} +"), program, said, 1, 1).await;
 			check(format!("find findroot -type f -exec {program} {{}} \\;"), program, said, 2, 0)
 				.await;
 		}
-		for (name, said) in [
-			("noexec", "Permission denied"),
-			("nosuch", "No such file or directory"),
-			("mi", "No such file or directory"),
-		] {
+		for (name, said) in [("noexec", "permission denied"), ("nosuch", "entity not found")] {
 			let execdir = format!("find findroot -type f -execdir {} {{}} +", abs(name));
 			check(execdir, &abs(name), said, 2, 1).await;
 		}
@@ -897,11 +884,10 @@ async fn find_reports_a_command_it_cannot_start() {
 }
 
 /// `find -exec … +`, `-exec … ;` and `-execdir … +` with a program whose
-/// `exec` the system refuses for anything but a line too long, where the
-/// lookup did not foresee it: the shell reports it once per command line
-/// (status 126), find writes nothing of its own, goes on, and exits 1 for
-/// `+` (0 for `;`). A file that is no program runs as a script, as `execvp`
-/// runs it.
+/// `exec` the system refuses for anything but a line too long: the shell
+/// reports it once per command line (status 126), find writes nothing of
+/// its own, goes on, and exits 1 for `+` (0 for `;`). A file that is no
+/// program runs as a script, as `execvp` runs it.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_leaves_a_refused_exec_to_the_shell() {
@@ -1395,26 +1381,31 @@ async fn a_script_without_a_shebang_gets_the_path_it_ran_by_as_dollar_zero() {
 }
 
 /// A `#!` interpreter that does not exist, under xargs and `find -exec`,
-/// `-exec ;` and `-execdir`: `ENOENT`, which the lookup finds before the
-/// `exec`, reported as GNU findutils 4.10 reports it, naming the program as
-/// given, in the C and UTF-8 locales, with GNU's statuses: xargs stops at
-/// the first line.
+/// `-exec ;` and `-execdir`: the shell's diagnostic names the path the
+/// program ran by, byte for byte as at 9058ab9d (measured there), in the C
+/// and UTF-8 locales, with base's statuses.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_missing_interpreter_is_reported_as_gnu_findutils_does() {
+async fn a_missing_interpreter_is_reported_as_at_base() {
 	let dir = cannot_run_dir();
-	for (locale, open, close) in [("C", "'", "'"), ("C.UTF-8", "‘", "’")] {
-		let find = |name: &str| format!("find: {open}{name}{close}: No such file or directory\n");
-		let cases = [
-			(
-				"printf 'a\\nb\\n' | xargs -n1 ./mi",
-				127,
-				"xargs: ./mi: No such file or directory\n".to_owned(),
-			),
-			("find findroot -name f1 -exec ./mi {} +", 1, find("./mi")),
-			("find findroot -name f1 -exec ./mi {} \\;", 0, find("./mi")),
-			("find findroot -name f2 -execdir ../../mi {} +", 1, find("../../mi")),
-		];
+	let p = dir.path().display().to_string();
+	let said = |path: &str| {
+		format!(
+			"bash: {path}: /nonexistent/interpreter: bad interpreter: No such file or directory\n"
+		)
+	};
+	let by_path = said(&format!("{p}/./mi"));
+	let cases = [
+		("printf 'a\\nb\\n' | xargs -n1 ./mi", 123, by_path.repeat(2)),
+		("find findroot -name f1 -exec ./mi {} +", 1, by_path.clone()),
+		("find findroot -name f1 -exec ./mi {} \\;", 0, by_path.clone()),
+		(
+			"find findroot -name f2 -execdir ../../mi {} +",
+			1,
+			said(&format!("{p}/findroot/a/../../mi")),
+		),
+	];
+	for locale in ["C", "C.UTF-8"] {
 		let mut s = session_in(dir.path(), &[("LC_ALL", locale)]);
 		for (command, status, stderr) in &cases {
 			let ran = run(&mut s, command).await;

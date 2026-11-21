@@ -12,9 +12,8 @@
 //! a line whose `ifne` program the system refused.
 
 use std::{
-	ffi::{OsStr, OsString},
+	ffi::OsString,
 	io::{self, ErrorKind, Read, Write},
-	path::Path,
 	sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -128,7 +127,6 @@ fn app() -> ClapCommand {
 /// `first` byte) piped in, returning its status.
 fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) -> i32 {
 	let name = command[0].to_string_lossy().into_owned();
-	let program = command[0].clone();
 	let pumped = io::pipe().and_then(|(reader, writer)| Ok((reader, writer, host.stdin.try_clone()?)));
 	let (reader, mut writer, mut input) = match pumped {
 		Ok(pumped) => pumped,
@@ -159,7 +157,7 @@ fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) ->
 		Ok(status) => status,
 		Err(err)
 			if hand_up
-				&& refused_as_too_long(&err, &program, line, host.cwd())
+				&& command_line_too_long(&err, std::path::Path::new(&name), line, host.cwd())
 				&& host.hand_up_too_long(&err) =>
 		{
 			return 126;
@@ -183,13 +181,6 @@ fn run_with_input(host: &mut Host, command: Vec<OsString>, first: Option<u8>) ->
 		},
 		Ok(()) => status.code(),
 	}
-}
-
-/// Whether `err` refused the command line of `program`, as given (the
-/// bytes the shell runs, not a lossy copy), as too long; see
-/// [`command_line_too_long`].
-fn refused_as_too_long(err: &io::Error, program: &OsStr, line: usize, cwd: &Path) -> bool {
-	command_line_too_long(err, Path::new(program), line, cwd)
 }
 
 enum CopyError {
@@ -295,29 +286,5 @@ mod tests {
 		assert_eq!(code, 1);
 		assert_eq!(stdout, "");
 		assert!(stderr.contains("usage: ifne"));
-	}
-
-	/// The rule reads the program as the shell runs it, its raw bytes: a
-	/// script named so whose `#!` interpreter the system cannot reach by its
-	/// path (a symlink to a name past `NAME_MAX`) has that `ENAMETOOLONG` for
-	/// its own, never the line's. A lossy copy of the name (`U+FFFD` for the
-	/// `\xff`) named no file, so the line was taken as too long and split.
-	#[cfg(unix)]
-	#[test]
-	fn the_too_long_rule_reads_the_raw_program_name() {
-		use std::{
-			ffi::OsStr,
-			os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
-		};
-		let dir = tempfile::tempdir().expect("temporary directory");
-		let at = |name: &[u8]| dir.path().join(OsStr::from_bytes(name));
-		std::os::unix::fs::symlink(at("0".repeat(256).as_bytes()), at(b"ll")).expect("symlink");
-		std::fs::write(at(b"s\xff"), format!("#!{}\n", at(b"ll").display())).expect("script");
-		std::fs::set_permissions(at(b"s\xff"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
-		let enametoolong = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
-		let long = 4 * 4096;
-		assert!(!super::refused_as_too_long(&enametoolong, OsStr::from_bytes(b"./s\xff"), long, dir.path()));
-		let e2big = std::io::Error::from_raw_os_error(libc::E2BIG);
-		assert!(super::refused_as_too_long(&e2big, OsStr::from_bytes(b"./s\xff"), long, dir.path()));
 	}
 }

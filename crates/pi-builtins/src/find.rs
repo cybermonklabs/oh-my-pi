@@ -611,81 +611,26 @@ pub mod matchers {
 		use std::{
 			error::Error,
 			ffi::OsString,
-			io::{self, Write},
+			io::Write,
 			path::{Path, PathBuf},
 			sync::{Mutex, PoisonError},
 		};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
-		use crate::host::{
-			CommandStatus, Host, ShellCommand, command_line_too_long, line_bytes, run_strerror,
-		};
+		use crate::host::{ShellCommand, command_line_too_long, line_bytes};
 
-		/// Whether the command named `name` that `-exec` ran succeeded, after
-		/// GNU findutils 4.10's diagnostic where it did not run (`find:
-		/// ‘nosuch’: No such file or directory`) or a signal killed it (`find:
-		/// ‘./cmd’ terminated by signal 9`), quoted as GNU quotes in the
-		/// locale: `'nosuch'` outside a UTF-8 one.
-		fn exec_succeeded(host: &mut Host, name: &str, outcome: io::Result<CommandStatus>) -> bool {
-			match outcome {
-				Ok(CommandStatus::Signaled(signal)) => {
-					let name = super::super::quoted(host, name.as_bytes());
-					let _ = writeln!(host.stderr, "find: {name} terminated by signal {signal}");
-					false
-				},
-				Ok(status) => status.success(),
-				Err(error) => {
-					let name = super::super::quoted(host, name.as_bytes());
-					let _ = writeln!(host.stderr, "find: {name}: {}", run_strerror(&error));
-					false
-				},
-			}
-		}
-
-		/// A start point split as GNU find splits its operand for `-execdir`,
-		/// as written: the directory before its last name (`.` where it has
-		/// none) and that name with any trailing `/`. `None` below the start
-		/// points, for `/`, and for an operand that is not UTF-8.
-		fn split_start(entry: &WalkEntry) -> Option<(&str, &str)> {
-			if entry.depth() != 0 {
-				return None;
-			}
-			let operand = entry.display_path().to_str()?;
-			let trimmed = operand.trim_end_matches('/');
-			if trimmed.is_empty() {
-				return None;
-			}
-			Some(match trimmed.rfind('/') {
-				Some(slash) => (&operand[..slash.max(1)], &operand[slash + 1..]),
-				None => (".", operand),
-			})
-		}
-
-		/// `{}` replacement for `-execdir`: the entry name relative to its
-		/// parent, and for a start point its last name as written: `find .
-		/// -execdir` passes `./.`, `find sub/ -execdir` `./sub/`.
-		fn execdir_arg(entry: &WalkEntry) -> PathBuf {
-			if let Some((_, name)) = split_start(entry) {
-				return PathBuf::from(format!("./{name}"));
-			}
-			let path = entry.path();
+		/// `{}` replacement for `-execdir`: the entry name relative to its parent.
+		fn execdir_arg(path: &Path) -> PathBuf {
 			match pi_vfs::file_name(path) {
 				Some(name) => Path::new(".").join(name),
 				None => Path::new(".").join(path),
 			}
 		}
 
-		/// Working directory for running `-execdir` on `entry`; `None` keeps the
-		/// current directory. A start point runs in the directory its operand
-		/// names, as in GNU find: `find . -execdir` in `.`, `find sub/inner
-		/// -execdir` in `sub`. Provider directories are fine: builtins run
-		/// there, and the shell refuses external programs with its own
-		/// diagnostic.
-		pub(crate) fn execdir_dir(entry: &WalkEntry) -> Option<&Path> {
-			if let Some((dir, _)) = split_start(entry) {
-				return Some(Path::new(dir));
-			}
-			let path = entry.path();
+		/// Working directory for running `-execdir` on `path`; `None` keeps the
+		/// current directory. Provider directories are fine: builtins run there,
+		/// and the shell refuses external programs with its own diagnostic.
+		fn execdir_dir(path: &Path) -> Option<&Path> {
 			match pi_vfs::parent_path(path) {
 				// Root paths like "/" have no parent.  Run them from the root to match GNU
 				// find.
@@ -734,7 +679,7 @@ pub mod matchers {
 		impl Matcher for SingleExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info)
+					execdir_arg(file_info.path())
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -753,7 +698,7 @@ pub mod matchers {
 				// and status 126: one command cannot be split.
 				let mut command = ShellCommand::new(argv);
 				if self.exec_in_parent_dir
-					&& let Some(dir) = execdir_dir(file_info)
+					&& let Some(dir) = execdir_dir(file_info.path())
 				{
 					command = command.current_dir(dir);
 				}
@@ -765,8 +710,13 @@ pub mod matchers {
 					.lock()
 					.unwrap_or_else(PoisonError::into_inner)
 					.flush();
-				let outcome = matcher_io.host().run_command_async(command).await;
-				exec_succeeded(matcher_io.host(), &self.executable, outcome)
+				match matcher_io.host().run_command_async(command).await {
+					Ok(status) => status.success(),
+					Err(e) => {
+						failed_to_run(matcher_io, &self.executable, &e);
+						false
+					},
+				}
 			}
 
 			fn has_side_effects(&self) -> bool {
@@ -840,22 +790,44 @@ pub mod matchers {
 						.unwrap_or_else(PoisonError::into_inner)
 						.flush();
 					match matcher_io.host().run_command_async(shell_command).await {
+						Ok(status) => {
+							if !status.success() {
+								matcher_io.set_exit_code(1);
+							}
+						},
 						Err(e) if files.len() > 1 && too_long(&e, command, line, matcher_io.host().cwd()) => {
 							let middle = files.start + files.len() / 2;
 							pending.push(middle..files.end);
 							pending.push(files.start..middle);
 						},
-						// Any other outcome is reported as for `-exec … ;`, a line
-						// refused as too long with one file (which no split can
-						// help) included: `find: ‘NAME’: Argument list too long`.
-						outcome => {
-							if !exec_succeeded(matcher_io.host(), &self.executable, outcome) {
-								matcher_io.set_exit_code(1);
-							}
+						Err(e) if too_long(&e, command, line, matcher_io.host().cwd()) => {
+							too_long_alone(matcher_io, &self.executable, &e);
+							matcher_io.set_exit_code(1);
+						},
+						Err(e) => {
+							failed_to_run(matcher_io, &self.executable, &e);
+							matcher_io.set_exit_code(1);
 						},
 					}
 				}
 			}
+		}
+
+		/// Reports that the command `executable` could not be started (nothing
+		/// executable has its name): `Failed to run NAME: ERROR`.
+		fn failed_to_run(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
+			let _ = writeln!(&mut matcher_io.host().stderr, "Failed to run {executable}: {error}");
+		}
+
+		/// Reports that the system refused `executable`'s line with one file as
+		/// too long, which no split can help: `find: ‘NAME’: strerror`, with the
+		/// quotes of the locale find runs in (`'NAME'` in the C locale), as GNU's
+		/// find quotes it.
+		fn too_long_alone(matcher_io: &mut MatcherIO<'_>, executable: &str, error: &std::io::Error) {
+			let host = matcher_io.host();
+			let name = crate::locale::gnu_quote(crate::locale::ctype_is_utf8(host), executable);
+			let text = crate::host::run_strerror(error);
+			let _ = writeln!(&mut host.stderr, "find: {name}: {text}");
 		}
 
 		/// Whether `error` is the system refusing `command`'s line of `line`
@@ -870,7 +842,7 @@ pub mod matchers {
 		impl Matcher for MultiExecMatcher {
 			async fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
 				let path_to_file = if self.exec_in_parent_dir {
-					execdir_arg(file_info)
+					execdir_arg(file_info.path())
 				} else {
 					file_info.display_path().to_path_buf()
 				};
@@ -886,7 +858,7 @@ pub mod matchers {
 				};
 				if let Some(mut full) = full {
 					if self.exec_in_parent_dir
-						&& let Some(dir) = execdir_dir(file_info)
+						&& let Some(dir) = execdir_dir(file_info.path())
 					{
 						full.current_dir(dir);
 					}
@@ -1461,24 +1433,17 @@ pub mod matchers {
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
-		/// The depth of a matcher that holds `submatchers`: one level more
-		/// than the deepest of them (see [`Matcher::depth`]).
-		fn depth_over(submatchers: &[Box<dyn Matcher>]) -> usize {
-			1 + submatchers.iter().map(Matcher::depth).max().unwrap_or(0)
-		}
-
 		/// This matcher contains a collection of other matchers. A file only matches
 		/// if it matches ALL the contained sub-matchers. For sub-matchers that have
 		/// side effects, the side effects occur in the same order as the sub-matchers
 		/// were pushed into the collection.
 		pub struct AndMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
-			depth:       usize,
 		}
 
 		impl AndMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { depth: depth_over(&submatchers), submatchers }
+				Self { submatchers }
 			}
 		}
 
@@ -1518,10 +1483,6 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
-			}
-
-			fn depth(&self) -> usize {
-				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1567,12 +1528,11 @@ pub mod matchers {
 		/// were pushed into the collection.
 		pub struct OrMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
-			depth:       usize,
 		}
 
 		impl OrMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { depth: depth_over(&submatchers), submatchers }
+				Self { submatchers }
 			}
 		}
 
@@ -1612,10 +1572,6 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
-			}
-
-			fn depth(&self) -> usize {
-				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1683,12 +1639,11 @@ pub mod matchers {
 		/// occur in the same order as the sub-matchers were pushed into the collection.
 		pub struct ListMatcher {
 			submatchers: Vec<Box<dyn Matcher>>,
-			depth:       usize,
 		}
 
 		impl ListMatcher {
 			pub fn new(submatchers: Vec<Box<dyn Matcher>>) -> Self {
-				Self { depth: depth_over(&submatchers), submatchers }
+				Self { submatchers }
 			}
 		}
 
@@ -1712,10 +1667,6 @@ pub mod matchers {
 					.submatchers
 					.iter()
 					.any(super::Matcher::has_side_effects)
-			}
-
-			fn depth(&self) -> usize {
-				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -1830,13 +1781,11 @@ pub mod matchers {
 		/// Matcher that wraps another matcher and inverts matching criteria.
 		pub struct NotMatcher {
 			submatcher: Box<dyn Matcher>,
-			depth:      usize,
 		}
 
 		impl NotMatcher {
 			pub fn new(submatcher: impl Matcher) -> Self {
-				let submatcher = submatcher.into_box();
-				Self { depth: 1 + submatcher.depth(), submatcher }
+				Self { submatcher: submatcher.into_box() }
 			}
 		}
 
@@ -1852,10 +1801,6 @@ pub mod matchers {
 
 			fn has_side_effects(&self) -> bool {
 				self.submatcher.has_side_effects()
-			}
-
-			fn depth(&self) -> usize {
-				self.depth
 			}
 
 			async fn finished_dir(&self, dir: &Path, matcher_io: &mut MatcherIO) {
@@ -4259,13 +4204,6 @@ pub mod matchers {
 			false
 		}
 
-		/// How many matchers deep the tree under this one is, this one
-		/// included: evaluating the tree and dropping it recurse once for
-		/// each level (see [`MAX_EXPRESSION_DEPTH`]).
-		fn depth(&self) -> usize {
-			1
-		}
-
 		/// Notification that find is leaving a given directory.
 		async fn finished_dir(&self, _finished_directory: &Path, _matcher_io: &mut MatcherIO) {}
 
@@ -4301,10 +4239,6 @@ pub mod matchers {
 
 		fn has_side_effects(&self) -> bool {
 			(**self).has_side_effects()
-		}
-
-		fn depth(&self) -> usize {
-			(**self).depth()
 		}
 
 		async fn finished_dir(&self, finished_directory: &Path, matcher_io: &mut MatcherIO) {
@@ -4376,7 +4310,7 @@ pub mod matchers {
 		config: &mut Config,
 		host: &mut Host,
 	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
-		let top_level_matcher = build_matcher_tree(args, config, host).await?;
+		let (_, top_level_matcher) = build_matcher_tree(args, config, 0, false, host).await?;
 
 		// if the matcher doesn't have any side-effects, then we default to printing
 		if !top_level_matcher.has_side_effects() {
@@ -4560,36 +4494,17 @@ pub mod matchers {
 		Ok(file)
 	}
 
-	/// The deepest a tree of matchers may be, once read (see
-	/// [`Matcher::depth`]). Evaluating the tree and dropping it recurse once
-	/// for each level, so a deeper one, such as `! \( ! \( … \) \)` nested
-	/// 100,000 deep, would overflow the stack and abort the process (the
-	/// release build did from about 13,000 levels); it is refused instead.
-	/// A nest of parentheses alone is one level, however deep: a group of
-	/// one expression is that expression.
-	const MAX_EXPRESSION_DEPTH: usize = 1000;
-
-	/// The main "translate command-line args into a matcher" function.
-	///
-	/// A parenthesized expression is read as an expression of its own, with
-	/// the default regex type, and becomes one condition of the expression
-	/// it is in. The expressions a `(` interrupted are kept on a stack, not
-	/// by recursion, so a nest of parentheses 10,000 deep, which GNU find
-	/// reads, does not overflow the stack, nor does one deeper. A tree of
-	/// matchers deeper than [`MAX_EXPRESSION_DEPTH`] is refused.
+	/// The main "translate command-line args into a matcher" function. Will call
+	/// itself recursively if it encounters an opening bracket. A successful return
+	/// consists of a tuple containing the new index into the args array to use (if
+	/// called recursively) and the resulting matcher.
 	async fn build_matcher_tree(
 		args: &[&str],
 		config: &mut Config,
+		arg_index: usize,
+		mut expecting_bracket: bool,
 		host: &mut Host,
-	) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
-		/// An expression a `(` interrupted, to go on with once `)` closes
-		/// the expression inside.
-		struct Outer {
-			matcher:             ListMatcherBuilder,
-			regex_type:          regex::RegexType,
-			invert_next_matcher: bool,
-		}
-		let mut outer: Vec<Outer> = Vec::new();
+	) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
 		let mut top_level_matcher = ListMatcherBuilder::new();
 
 		let mut regex_type = regex::RegexType::default();
@@ -4598,7 +4513,7 @@ pub mod matchers {
 		// order of arguments is important
 		// arguments can start with + as well as -
 		// multiple-character flags don't start with a double dash
-		let mut i = 0;
+		let mut i = arg_index;
 		let mut invert_next_matcher = false;
 		while i < args.len() {
 			let possible_submatcher = match args[i] {
@@ -4947,34 +4862,24 @@ pub mod matchers {
 					None
 				},
 				"(" => {
-					outer.push(Outer {
-						matcher:             std::mem::replace(
-							&mut top_level_matcher,
-							ListMatcherBuilder::new(),
-						),
-						regex_type:          std::mem::take(&mut regex_type),
-						invert_next_matcher: std::mem::take(&mut invert_next_matcher),
-					});
-					None
+					let (new_arg_index, sub_matcher) =
+						Box::pin(build_matcher_tree(args, config, i + 1, true, host)).await?;
+					i = new_arg_index;
+					Some(sub_matcher)
 				},
 				")" => {
-					let Some(enclosing) = outer.pop() else {
+					if !expecting_bracket {
 						return Err(From::from(
 							"invalid expression: expected expression before closing parentheses ')'.",
 						));
-					};
+					}
 
 					let bracket = args[i - 1];
 					if bracket == "(" {
 						return Err(From::from("invalid expression; empty parentheses are not allowed."));
 					}
 
-					// The expression inside becomes one condition of the one
-					// the `(` interrupted, which goes on as it was.
-					let inner = std::mem::replace(&mut top_level_matcher, enclosing.matcher);
-					regex_type = enclosing.regex_type;
-					invert_next_matcher = enclosing.invert_next_matcher;
-					Some(inner.build())
+					return Ok((i, top_level_matcher.build()));
 				},
 				"-follow" => {
 					// This option affects multiple matchers.
@@ -5067,7 +4972,7 @@ pub mod matchers {
 								// Convert args to unix timestamps. (expressed in numeric types)
 								let Some(comparable_time) = parse_date_str_to_timestamps(time) else {
 									let utf8 = crate::locale::ctype_is_utf8(host);
-									let quoted = crate::locale::gnu_quote(utf8, args[i + 1].as_bytes());
+									let quoted = crate::locale::gnu_quote(utf8, args[i + 1]);
 									return Err(From::from(format!(
 										"find: I cannot figure out how to interpret {quoted} as a date or time"
 									)));
@@ -5091,23 +4996,19 @@ pub mod matchers {
 			i += 1;
 			if config.help_requested || config.version_requested {
 				// Ignore anything, even invalid expressions, after -help/-version
-				outer.clear();
+				expecting_bracket = false;
 				break;
 			}
-			if let Some(mut submatcher) = possible_submatcher {
+			if let Some(submatcher) = possible_submatcher {
 				if invert_next_matcher {
-					submatcher = NotMatcher::new(submatcher).into_box();
+					top_level_matcher.new_and_condition(NotMatcher::new(submatcher));
 					invert_next_matcher = false;
+				} else {
+					top_level_matcher.new_and_condition(submatcher);
 				}
-				if submatcher.depth() > MAX_EXPRESSION_DEPTH {
-					return Err(From::from(format!(
-						"an expression nested more than {MAX_EXPRESSION_DEPTH} levels deep is not supported"
-					)));
-				}
-				top_level_matcher.new_and_condition(submatcher);
 			}
 		}
-		if !outer.is_empty() {
+		if expecting_bracket {
 			return Err(From::from(
 				"invalid expression; I was expecting to find a ')' somewhere but did not see one.",
 			));
@@ -5115,7 +5016,7 @@ pub mod matchers {
 		if config.files0_argument.is_some() {
 			parse_files0_args(config, host).await?;
 		}
-		Ok(top_level_matcher.build())
+		Ok((i, top_level_matcher.build()))
 	}
 
 	// https://www.gnu.org/software/findutils/manual/html_node/find_html/Starting-points.html
@@ -5170,17 +5071,8 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::OsStringValueParser};
 
-use crate::host::{AsyncUtility, Host, matches_parser, strip_errno};
+use crate::host::{AsyncUtility, Host, matches_parser};
 use matchers::{Follow, WalkEntry};
-
-/// `name` (its bytes) in the quotes GNU findutils 4.10 puts around a name
-/// in a diagnostic, quotearg's ([`gnu_quote`](crate::locale::gnu_quote)):
-/// `‘name’` in a UTF-8 locale, `'name'` elsewhere, with what the locale
-/// does not print escaped: `find 'a’b'` is `find: ‘a\’b’: No such file or
-/// directory`, and `'a\342\200\231b'` in the C locale.
-fn quoted(host: &Host, name: &[u8]) -> String {
-	crate::locale::gnu_quote(crate::locale::ctype_is_utf8(host), name)
-}
 
 pub struct Config {
 	same_file_system:  bool,
@@ -5348,9 +5240,7 @@ async fn apply_find_entry(
 
 	// Allocated only when the directory changes, not for every entry. Every
 	// path comes from one walk, so the same directory is spelled the same.
-	// `-execdir ... +` runs a batch in the directory of its entries, where
-	// a start point names its own (see `execdir_dir`).
-	let new_dir = matchers::exec::execdir_dir(&entry);
+	let new_dir = pi_vfs::parent_path(entry.path());
 	if new_dir.map(Path::as_os_str) != current_dir.as_deref().map(Path::as_os_str) {
 		if let Some(dir) = current_dir.take() {
 			matcher.finished_dir(dir.as_path(), &mut matcher_io).await;
@@ -5422,12 +5312,9 @@ async fn process_dir_walk_request(
 	let mut ret = 0;
 	let tree_options = find_tree_options(config);
 	match pi_walker::walk::Tree::new(&layer, resolved_root, &tree_options).await {
-		// GNU names the start point as given: `find nosuch` is `find:
-		// ‘nosuch’: No such file or directory`, exit 1.
-		Err(pi_walker::walk::WalkError::Root { error, .. }) => {
+		Err(pi_walker::walk::WalkError::Root { path, error }) => {
 			ret = 1;
-			let name = quoted(host, &crate::host::os_bytes_lossy(operand.as_os_str()));
-			let _ = writeln!(host.stderr, "find: {name}: {}", strip_errno(&error));
+			let _ = writeln!(host.stderr, "Error: {}: {error}", path.display());
 		},
 		Ok(mut tree) => {
 			let mut pace = host.output_pace();
@@ -6474,55 +6361,6 @@ mod tests {
 			assert_eq!((code, capture.err().as_str()), gnu, "{operand:?}");
 			assert!(root.is_dir(), "{operand:?}: the directory was removed");
 			assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{operand:?}: the contents stay");
-		}
-	}
-
-	/// A nest of parentheses as deep as GNU find reads, and deeper, must be
-	/// read without overflowing the stack of the thread the shell runs on.
-	#[tokio::test(flavor = "multi_thread")]
-	async fn reads_a_nest_of_parentheses_deeper_than_the_stack() {
-		// If this regresses, `find . \( … -name a.txt … \)` nested 100,000
-		// deep overflows the stack and aborts the process, where GNU find
-		// 4.10 prints `./a.txt` (measured 10,000 deep), and refuses the nest
-		// left unclosed with exit 1.
-		let (_dir, root) = fixture();
-		let depth = 100_000;
-		let mut args = vec![".".to_owned()];
-		args.extend(std::iter::repeat_n("(".to_owned(), depth));
-		args.extend(["-name".to_owned(), "a.txt".to_owned()]);
-		let unclosed = args.clone();
-		args.extend(std::iter::repeat_n(")".to_owned(), depth));
-		let (code, capture) = run(&root, &args).await;
-		assert_eq!((code, capture.out().as_str()), (0, "./a.txt\n"), "{}", capture.err());
-		let (code, capture) = run(&root, &unclosed).await;
-		assert_eq!(code, 1);
-		assert!(capture.err().contains("expecting to find a ')'"), "{}", capture.err());
-	}
-
-	/// A tree of matchers deeper than evaluating it can recurse must be
-	/// refused, with the process alive.
-	#[tokio::test(flavor = "multi_thread")]
-	async fn refuses_an_expression_too_deep_to_evaluate() {
-		// If this regresses, `find . ! \( ! \( … -name a.txt … \) \)` nested
-		// 100,000 deep, a `!` matcher for each level, overflows the stack as
-		// it is evaluated or dropped and aborts the process.
-		let (_dir, root) = fixture();
-		let nest = |depth: usize, open: &[&str]| {
-			let mut args = vec![".".to_owned()];
-			for _ in 0..depth {
-				args.extend(open.iter().map(|&arg| arg.to_owned()));
-			}
-			args.extend(["-name".to_owned(), "a.txt".to_owned()]);
-			args.extend(std::iter::repeat_n(")".to_owned(), depth));
-			args
-		};
-		for open in [&["!", "("][..], &["-true", "("][..]] {
-			let (code, capture) = run(&root, &nest(100_000, open)).await;
-			assert_eq!(code, 1, "{open:?}: {}", capture.out());
-			assert!(capture.err().contains("nested more than 1000 levels deep is not supported"), "{}", capture.err());
-			// An even number of `!` leaves the name test as it is.
-			let (code, capture) = run(&root, &nest(100, open)).await;
-			assert_eq!((code, capture.out().as_str()), (0, "./a.txt\n"), "{open:?}: {}", capture.err());
 		}
 	}
 }

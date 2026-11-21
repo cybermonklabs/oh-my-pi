@@ -44,7 +44,7 @@ use uucore::{
 use crate::{
 	host::{
 		Host, ShellCommand, Utility, command_line_too_long, format_usage, line_bytes, os_bytes_lossy,
-		run_strerror, strip_errno,
+		strip_errno,
 	},
 	locale::{self, gnu_quote},
 	quoting_style::quoting_style_by_name,
@@ -577,15 +577,15 @@ impl Run<'_> {
 				Err(EXIT_CANNOT_INVOKE)
 			},
 			Err(error) => {
-				let code = match error.kind() {
+				let (code, text) = match error.kind() {
 					io::ErrorKind::Interrupted => return Err(EXIT_INTERRUPTED),
-					io::ErrorKind::NotFound => EXIT_ENOENT,
-					_ => EXIT_CANNOT_INVOKE,
+					io::ErrorKind::NotFound => (EXIT_ENOENT, "No such file or directory".to_owned()),
+					io::ErrorKind::PermissionDenied => {
+						(EXIT_CANNOT_INVOKE, "Permission denied".to_owned())
+					},
+					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				let text = run_strerror(&error);
-				// The bytes as given: `env $'\xff'` is `env: ‘\377’: No such file or
-				// directory`, as in GNU coreutils 9.7.
-				let name = gnu_quote(self.utf8, &program);
+				let name = gnu_quote(self.utf8, &String::from_utf8_lossy(&program));
 				self.error(&format!("{name}: {text}"));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");
@@ -1529,7 +1529,7 @@ mod tests {
 		] {
 			let case = format!("errno {errno}, asked {asked}, {option}, {} bytes", arg.len());
 			let mut error = tempfile::tempfile().unwrap();
-			let argv = ["env", option, "prog", arg].map(OsString::from).to_vec();
+			let argv = ["env", option, "prog", arg].map(String::from).to_vec();
 			let mut invocation = Invocation::new(argv, std::env::temp_dir(), pi_vfs::Fs::native());
 			invocation.stdio = [Fd::Closed, Fd::Closed, Fd::File(error.try_clone().unwrap())];
 			let (runner, seen) = crate::host::Refusing::new(1, 0, errno);
