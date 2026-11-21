@@ -654,7 +654,7 @@ const BLOB_PARTS_PATH = "blob:sha256:";
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
-/** Attempts per write when PostgreSQL or MySQL picks it as a deadlock victim. */
+/** Attempts per write the database rolls back so that it can run again (see {@link isRetryableConflict}). */
 const WRITE_ATTEMPTS = 5;
 /**
  * Key of the PostgreSQL advisory lock every start-up statement takes (see
@@ -1574,12 +1574,20 @@ function isNoActiveTransactionError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
 	return message.includes("no transaction is active");
 }
-/** MySQL `ER_LOCK_DEADLOCK` (errno 1213, SQLSTATE 40001) or PostgreSQL `deadlock_detected` / `serialization_failure`. */
-function isDeadlockError(error: unknown): boolean {
+/**
+ * A transaction the database rolled back so that it can run again: MySQL
+ * `ER_LOCK_DEADLOCK` (errno 1213, SQLSTATE 40001), MariaDB `ER_CHECKREAD`
+ * (errno 1020), or PostgreSQL `deadlock_detected` / `serialization_failure`.
+ * MariaDB answers 1020 ("Record has changed since last read in table ...")
+ * under `innodb_snapshot_isolation`, ON by default from MariaDB 11.6.2, when
+ * a locking read or a write meets a row changed after the transaction's read
+ * view was made; it rolls the transaction back, as it does a deadlock victim.
+ */
+function isRetryableConflict(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	const errno = "errno" in error ? error.errno : undefined;
 	const sqlState = "sqlState" in error ? error.sqlState : undefined;
-	return errno === 1213 || errno === "40P01" || errno === "40001" || sqlState === "40001";
+	return errno === 1213 || errno === 1020 || errno === "40P01" || errno === "40001" || sqlState === "40001";
 }
 /**
  * A primary-key collision, as each dialect reports it: PostgreSQL
@@ -2698,8 +2706,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 						);
 						break;
 					} catch (err) {
-						// Two claims of a missing row both insert: one deadlocks or meets the other's row, and runs again.
-						if (attempt >= WRITE_ATTEMPTS || !(isDeadlockError(err) || isPrimaryKeyViolation(err))) throw err;
+						// Two claims of a missing row both insert: one deadlocks (on MariaDB it can meet a write
+						// conflict instead) or meets the other's row, and runs again.
+						if (attempt >= WRITE_ATTEMPTS || !(isRetryableConflict(err) || isPrimaryKeyViolation(err))) throw err;
 						held = false;
 						await Bun.sleep(Math.random() * 20 * attempt);
 					}
@@ -3234,8 +3243,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * collision, and 25006, 42501 and a closed connection are neither. Only
 	 * `#postgres` marks an error, so on MySQL and SQLite no error is one. The
 	 * mark is on the error object as `#postgres` threw it, and each layer
-	 * between it and the tier rethrows that same object: {@link #retryDeadlocks}
-	 * (a marked error is no deadlock), {@link #transaction},
+	 * between it and the tier rethrows that same object: {@link #retryConflicts}
+	 * (a marked error is no conflict), {@link #transaction},
 	 * {@link #fencedTransaction} (nor a fence refusal) and {@link insertBlob}.
 	 * The tier reads the mark on the runner's own error, which its blob write
 	 * rethrows as it is, and only then wraps that error, as the cause, in the
@@ -3267,17 +3276,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * Run `work` in one transaction. On SQLite it opens with `BEGIN IMMEDIATE`,
 	 * taking the write lock up front, so a writer in another process makes it
 	 * wait (busy timeout) or fail before anything ran. On PostgreSQL it is a
-	 * write of {@link #postgres}. On PostgreSQL and MySQL a
-	 * transaction the database aborts as a deadlock victim runs again; each
-	 * one recomputes everything under its own locks. A refused read-only
-	 * default is no deadlock and does not run again.
+	 * write of {@link #postgres}. On PostgreSQL and MySQL a transaction the
+	 * database aborts as a deadlock victim, or on MariaDB as a write conflict,
+	 * runs again; each one recomputes everything under its own locks. A
+	 * refused read-only default is no conflict and does not run again.
 	 */
 	#transaction(
 		operation: PgOperation,
 		work: (transaction: SqlSessionStorageTransaction) => Promise<void>,
 	): Promise<void> {
-		if (this.#adapter === "postgres") return this.#retryDeadlocks(() => this.#postgres(operation, "write", work));
-		if (this.#adapter === "mysql") return this.#retryDeadlocks(() => this.#client.transaction(work));
+		if (this.#adapter === "postgres") return this.#retryConflicts(() => this.#postgres(operation, "write", work));
+		if (this.#adapter === "mysql") return this.#retryConflicts(() => this.#client.transaction(work));
 		return this.#exclusive(async () => {
 			await this.#client.unsafe("BEGIN IMMEDIATE");
 			try {
@@ -3305,13 +3314,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		});
 	}
 
-	async #retryDeadlocks(write: () => Promise<unknown>): Promise<void> {
+	async #retryConflicts(write: () => Promise<unknown>): Promise<void> {
 		for (let attempt = 1; ; attempt++) {
 			try {
 				await write();
 				return;
 			} catch (err) {
-				if (attempt >= WRITE_ATTEMPTS || !isDeadlockError(err)) throw err;
+				if (attempt >= WRITE_ATTEMPTS || !isRetryableConflict(err)) throw err;
 				await Bun.sleep(Math.random() * 20 * attempt);
 			}
 		}

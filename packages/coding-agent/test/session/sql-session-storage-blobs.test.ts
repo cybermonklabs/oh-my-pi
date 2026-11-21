@@ -101,14 +101,19 @@ function failing(client: SqlSessionStorageClient, pattern: RegExp, times: number
 	};
 }
 
-/** `client`, adding to `into` each deadlock its transactions' statements meet. */
+/**
+ * `client`, adding to `into` each statement of its transactions that the database rolled back for a conflict the
+ * store runs again: a deadlock, or MariaDB's write conflict (error 1020, "Record has changed since last read").
+ */
 function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessionStorageClient {
 	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
 		async unsafe(query, values) {
 			try {
 				return await executor.unsafe(query, values);
 			} catch (err) {
-				if (err instanceof Error && /deadlock/i.test(err.message)) into.push(query.slice(0, 80));
+				if (err instanceof Error && /deadlock|record has changed since last read/i.test(err.message)) {
+					into.push(query.slice(0, 80));
+				}
 				throw err;
 			}
 		},
@@ -1471,9 +1476,13 @@ describe("session blobs in the SQL session storage", () => {
 			// locks every row and gap of the session table in path order on MySQL and MariaDB (it can use no index).
 			// The rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
 			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
-			// gap. InnoDB rolls one back, and the deadlock retry runs it again: both end as they would alone.
+			// gap. InnoDB rolls one back, and the retry runs it again: both end as they would alone.
+			// The contract is that end state, asserted on every server. The deadlock itself is MySQL's lock
+			// behaviour, asserted exactly there. MariaDB 11.8.9 (`innodb_snapshot_isolation` ON) met neither a
+			// deadlock nor a write conflict here in any of our runs; one there, rolled back and run again, ends the
+			// same, so its count may be 0 or 1.
 			it.skipIf(adapter !== "mysql")(
-				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
+				"deadlocks once on MySQL (at most once on MariaDB), and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
 				async () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
 					const deadlocks: string[] = [];
@@ -1512,10 +1521,12 @@ describe("session blobs in the SQL session storage", () => {
 					}
 					await Promise.all([renaming, deleting]);
 					expect({
-						deadlocks: deadlocks.length,
 						paths: await db.paths(),
 						b: (await db.row(b))?.content,
-					}).toEqual({ deadlocks: 1, paths: [b, c], b: moved });
+						c: (await db.row(c))?.content,
+					}).toEqual({ paths: [b, c], b: moved, c: transcript(ID, "kept apart") });
+					if (db.server === "mariadb") expect([0, 1]).toContain(deadlocks.length);
+					else expect(deadlocks.length).toBe(1);
 				},
 			);
 
