@@ -1193,10 +1193,19 @@ fn zsh_close(
 const TEE_HOLD: usize = 64 << 10;
 
 /// A write of at most this many bytes goes into a tee whole or not at all,
-/// as a pipe keeps a write of at most `PIPE_BUF` bytes whole, so another
-/// writer's bytes never land inside it. It is Linux's `PIPE_BUF`, used on
-/// every platform: macOS's is 512, so the tee keeps at least as much whole
-/// as a pipe does there.
+/// as a pipe keeps a write of at most `PIPE_BUF` bytes whole. It is Linux's
+/// `PIPE_BUF`, used on every platform: macOS's is 512, so the tee keeps at
+/// least as much whole as a pipe does there. This keeps whole a write the
+/// shell makes to the tee itself (a builtin's, a diagnostic, a write through
+/// a duplicate or a nested tee), so another writer's bytes never land
+/// inside it. A program's output does not come in its own writes: the tee
+/// has no OS handle, so a program writing to it is pumped, and its pump
+/// reads up to 64 KiB from the program's pipe at once and hands the chunk
+/// to the tee in one write. That read can end inside one of the program's
+/// writes, and a chunk longer than this is split where a slow target leaves
+/// less room, so another writer's line can still land inside a program's.
+/// zsh keeps it whole because every writer writes into its tee process's
+/// pipe; closing it needs a pipe of the tee's own that every writer shares.
 const TEE_WHOLE: usize = 4096;
 
 /// zsh's multio tee (`closemn` for output). Like zsh's tee process, which
@@ -1208,8 +1217,9 @@ const TEE_WHOLE: usize = 4096;
 /// share its queue, so no write's progress or failure is another's: each
 /// target goes through each write on its own, a write is `Pending` only
 /// when it took nothing, a write of at most [`TEE_WHOLE`] bytes is taken
-/// whole, and a target whose chunk failed is skipped for the
-/// rest of the write that chunk belongs to (a target that is gone is
+/// whole (which keeps the shell's own writes whole, not a program's pumped
+/// output: see [`TEE_WHOLE`]), and a target whose chunk failed is skipped for
+/// the rest of the write that chunk belongs to (a target that is gone is
 /// skipped); the next write starts afresh. A tee reports no target's
 /// failure to its writers. The tee polls its targets with a waker of its
 /// own, which wakes every caller waiting on the tee ([`Waiters`]): a target
@@ -1232,7 +1242,7 @@ struct TeeShared {
 /// its calls registered it, and the entry's generation. All are woken
 /// together, and taken off, when a target the tee polled is ready; when a
 /// call moved the queue on, all but that call's own caller are, and that
-/// caller's waker too when another call registered it. A call
+/// caller's waker too, once, when another call registered it. A call
 /// registers its waker before it polls the targets, so no target's wake can
 /// come before it, and takes its registration back once it is `Ready`: a
 /// waiter is a call still waiting, or one cancelled while it waited, until
@@ -1281,18 +1291,23 @@ impl Waiters {
 
 	/// Wakes every waiter but `caller`, which stays registered throughout:
 	/// a target's wake that comes while the others are woken finds it. The
-	/// engine polls every vproc with one waker, so another call registered
+	/// engine polls every vproc with one waker, so another registration
 	/// under `caller`'s waker (its count above the caller's own one) can be
 	/// another vproc waiting on the tee: then `caller`'s waker is woken too,
-	/// still registered, and the engine polls them all again.
+	/// still registered, and the engine polls them all again. Its count goes
+	/// back to 1, the caller's own call, since the calls it woke register
+	/// again when they are polled. A registration whose call is gone (one
+	/// cancelled while it waited, or an earlier poll of a wait polled again)
+	/// so wakes the caller once, not on every later move.
 	fn wake_others(&self, caller: &Waker) {
 		let wake: Vec<Waker> = {
 			let mut list = self.0.lock();
 			let mut wake = Vec::new();
-			list.entries.retain(|(w, calls, _)| {
+			list.entries.retain_mut(|(w, calls, _)| {
 				if w.will_wake(caller) {
 					if *calls > 1 {
 						wake.push(w.clone());
+						*calls = 1;
 					}
 					true
 				} else {
@@ -1477,10 +1492,11 @@ impl File for Tee {
 	/// moves the queue on; `Pending`, with nothing taken, while the tee
 	/// holds [`TEE_HOLD`] bytes, or while a write of at most [`TEE_WHOLE`]
 	/// bytes does not fit whole. A longer write takes what fits, as a pipe
-	/// does. Room is not reserved for a waiting write: under sustained
-	/// contention, longer writes can take the room a waiting short write
-	/// needs, and the short write goes in at the first poll that finds room
-	/// for it.
+	/// takes a write longer than `PIPE_BUF`; that is how a pump's chunk of a
+	/// program's output can be split (see [`TEE_WHOLE`]). Room is not
+	/// reserved for a waiting write: under sustained contention, longer
+	/// writes can take the room a waiting short write needs, and the short
+	/// write goes in at the first poll that finds room for it.
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
 		if buf.is_empty() {
 			return Poll::Ready(Ok(0));
@@ -2347,6 +2363,42 @@ mod tests {
 		state.lock().open = true;
 		assert!(tee.poll_settle(&mut cx).is_ready(), "the settle with the target open");
 		assert!(!alone.0.load(Ordering::SeqCst), "a call alone under its waker woke itself");
+	}
+
+	// Failure mode: a registration whose call is gone kept its count. A
+	// settle under the engine's waker waited and was never polled again
+	// (cancelled), and the target became ready with no wake, so no target's
+	// wake took the entry off. From then on every write under that waker
+	// that moved the queue saw a count above 1 and woke the engine, which
+	// made every parked vproc runnable, on each `echo` through the tee. The
+	// first move wakes the engine once, for the call registered under its
+	// waker, and puts the count back to the caller's own one: later moves
+	// by a caller alone under its waker do not wake it.
+	#[test]
+	fn a_gone_calls_registration_wakes_the_caller_once_not_on_every_move() {
+		let (gate, state) = Gate::closed();
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(gate))]);
+		let engine = Arc::new(Woken(AtomicBool::new(false), std::thread::current()));
+		let waker = Waker::from(Arc::clone(&engine));
+		let mut cx = Context::from_waker(&waker);
+		assert!(matches!(tee.poll_write(&mut cx, b"b\n"), Poll::Ready(Ok(2))));
+		// A settle that waits and is never polled again.
+		assert!(tee.poll_settle(&mut cx).is_pending(), "the settle with the target closed");
+		// The target becomes ready without a wake.
+		state.lock().open = true;
+		engine.0.store(false, Ordering::SeqCst);
+		assert!(matches!(tee.poll_write(&mut cx, b"a\n"), Poll::Ready(Ok(2))));
+		assert!(engine.0.load(Ordering::SeqCst), "the first move did not wake the waiting call");
+		for i in 1..=3 {
+			engine.0.store(false, Ordering::SeqCst);
+			assert!(matches!(tee.poll_write(&mut cx, b"c\n"), Poll::Ready(Ok(2))));
+			assert!(
+				!engine.0.load(Ordering::SeqCst),
+				"move {i} woke the engine for the registration of a call that is gone"
+			);
+		}
+		assert_eq!(waiting(&tee), 0, "the tee keeps a waker after every call finished");
+		assert_eq!(std::mem::take(&mut state.lock().got), b"b\na\nc\nc\nc\n");
 	}
 
 	/// How many wakers a tee holds.
