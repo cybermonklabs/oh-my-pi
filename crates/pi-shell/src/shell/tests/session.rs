@@ -614,6 +614,69 @@ fn a_close_failure_report_to_a_full_output_pipe_gives_up_at_its_limit() {
 	drop(reader);
 }
 
+/// The report of a failed close is out before the run closes the
+/// descriptor. Through a writer thread (Darwin, Windows, a Linux terminal,
+/// socket or failed reopen), the record is taken at once and written later,
+/// so the report must wait for its flush: otherwise the last write before the
+/// close could fail with nobody waiting for it. The pipe is full when the
+/// report starts, so the thread cannot have written the record at the first
+/// poll; a report that returns there returned before its record was out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_close_failure_report_through_the_writer_thread_returns_only_once_written() {
+	crate::sys::in_blocking_writer_process(
+		concat!(
+			module_path!(),
+			"::a_close_failure_report_through_the_writer_thread_returns_only_once_written"
+		),
+		|| {
+			use std::{
+				io::{Read as _, Write as _},
+				os::fd::AsRawFd,
+				pin::pin,
+				task::Poll,
+			};
+
+			const RECORD: &[u8] = b"pi-shell: closing a file failed: lost\n";
+			let (mut reader, writer) = pipe_to_files("output").expect("pipe");
+			// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
+			let capacity = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETPIPE_SZ) };
+			let capacity = usize::try_from(capacity).expect("F_GETPIPE_SZ");
+			(&writer)
+				.write_all(&vec![b'q'; capacity])
+				.expect("fill the pipe");
+			let mut stderr = crate::sys::StdFile::new(writer);
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("runtime");
+			let mut result = Ok(succeeded());
+			let err = io::Error::other("lost");
+			let token = CancellationToken::new();
+			let drain = runtime.block_on(async {
+				let mut report = pin!(report_close_failure(&mut stderr, &err, &mut result, &token));
+				let first = std::future::poll_fn(|cx| Poll::Ready(report.as_mut().poll(cx))).await;
+				assert!(
+					first.is_pending(),
+					"the report returned while the writer thread still held its record"
+				);
+				let drain = std::thread::spawn(move || {
+					let mut all = Vec::new();
+					reader.read_to_end(&mut all).expect("drain the output pipe");
+					all
+				});
+				report.await;
+				drain
+			});
+			drop(stderr);
+			let all = drain.join().expect("the drain thread");
+			assert_eq!(all.len(), capacity + RECORD.len());
+			assert_eq!(&all[capacity..], RECORD, "the record reached the pipe whole");
+			assert_eq!(result.map(|outcome| outcome.status).ok(), Some(1));
+		},
+	);
+}
+
 #[cfg(unix)]
 #[test]
 fn read_process_substitution_assigns_line() {

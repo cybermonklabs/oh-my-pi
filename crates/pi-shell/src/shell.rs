@@ -1071,7 +1071,13 @@ async fn report_close_failure(
 		line.truncate(end);
 		line.push('\n');
 	}
-	let write = std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes()));
+	// A writer thread takes the record at once and writes it later: the
+	// report is out, or has failed, only once it is flushed, so nothing the
+	// run wrote last before it closes the descriptor is left unreported.
+	let write = async {
+		std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes())).await?;
+		std::future::poll_fn(|cx| crate::bash::File::poll_flush(stderr, cx)).await
+	};
 	tokio::select! {
 		_ = write => {},
 		() = cancel_token.cancelled() => {},
