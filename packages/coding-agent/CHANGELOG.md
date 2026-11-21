@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Where the shell decodes program output (Windows with a legacy code page), a program whose output ends inside a character and that leaves a process holding its output no longer has that character shown after the next command's output
+- Where the shell decodes program output (Windows with a legacy code page), output that ends inside a character no longer comes after the next command's output when the program leaves a process holding its output open
 
 ## [18.18.6] - 2026-11-09
 
