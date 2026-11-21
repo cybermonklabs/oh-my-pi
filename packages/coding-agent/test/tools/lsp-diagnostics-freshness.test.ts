@@ -147,11 +147,7 @@ describe("LSP diagnostics freshness", () => {
 
 		expect(result.finalContent).toBe(".section {}\n");
 		expect(await Bun.file(filePath).text()).toBe(".section {}\n");
-		expect(notify).toHaveBeenCalledWith(
-			tempDir.path(),
-			[{ filePath, type: lspClient.FileChangeType.Created }],
-			undefined,
-		);
+		expect(notify).toHaveBeenCalledWith(tempDir.path(), [{ filePath, type: lspClient.FileChangeType.Created }]);
 	});
 
 	it("does not start an LSP server just to notify existing clients when write-time features are disabled", async () => {
@@ -171,11 +167,7 @@ describe("LSP diagnostics freshness", () => {
 
 		expect(result.finalContent).toBe("export const value = 1;\n");
 		expect(await Bun.file(filePath).text()).toBe("export const value = 1;\n");
-		expect(notify).toHaveBeenCalledWith(
-			tempDir.path(),
-			[{ filePath, type: lspClient.FileChangeType.Created }],
-			undefined,
-		);
+		expect(notify).toHaveBeenCalledWith(tempDir.path(), [{ filePath, type: lspClient.FileChangeType.Created }]);
 		expect(loadConfig).not.toHaveBeenCalled();
 		expect(getServers).not.toHaveBeenCalled();
 		expect(getOrCreate).not.toHaveBeenCalled();
@@ -433,15 +425,13 @@ describe("LSP diagnostics freshness", () => {
 		const tsUri = fileToUri(tsPath);
 		const client = createClient(tempDir.path(), TEST_SERVER);
 		const events: string[] = [];
-		const notifySignals: Array<AbortSignal | undefined> = [];
 
 		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
 		vi.spyOn(lspConfig, "getServersForFile").mockImplementation((_config, filePath) =>
 			filePath.endsWith(".module.scss") ? [] : [["test-lsp", TEST_SERVER]],
 		);
 		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
-		vi.spyOn(lspClient, "notifyWorkspaceWatchedFiles").mockImplementation(async (_cwd, changes, notifySignal) => {
-			notifySignals.push(notifySignal);
+		vi.spyOn(lspClient, "notifyWorkspaceWatchedFiles").mockImplementation(async (_cwd, changes) => {
 			for (const change of changes) {
 				events.push(`watched:${path.basename(change.filePath)}:${change.type}`);
 			}
@@ -467,7 +457,6 @@ describe("LSP diagnostics freshness", () => {
 
 		expect(result.diagnostics?.summary).toBe("no issues");
 		expect(events[0]).toBe(`watched:probe.module.scss:${lspClient.FileChangeType.Created}`);
-		expect(notifySignals.some(signal => signal instanceof AbortSignal)).toBe(true);
 		expect(events).toContain("sync:probe.tsx");
 	});
 

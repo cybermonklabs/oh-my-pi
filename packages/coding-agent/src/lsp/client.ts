@@ -911,7 +911,7 @@ async function reconcileExecutedChanges(
 			await refreshFile(activeClient, uriToFile(uri), signal);
 		}
 	}
-	await notifyWorkspaceWatchedFiles(cwd, watchedFiles, signal);
+	await notifyWorkspaceWatchedFiles(cwd, watchedFiles);
 }
 
 /**
@@ -2047,16 +2047,14 @@ const WATCHED_FILES_NOTIFY_TIMEOUT_MS = 2_000;
  * This also covers sibling files that are not open text documents, such as generated
  * CSS modules or type files that another edited document imports immediately.
  *
- * The underlying stdin write drain is self-bounded by
- * {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}; only an abort of the caller's
- * `signal` rejects.
+ * Every caller announces a change it has already made, so the caller's abort
+ * does not stop the notice: a server left out keeps a stale view of the file for
+ * its next diagnostics. The notice is bounded only by its own
+ * {@link WATCHED_FILES_NOTIFY_TIMEOUT_MS}, so a call aborted after its change
+ * can wait up to that long for it. It never rejects: a failed delivery is a
+ * debug log.
  */
-export async function notifyWorkspaceWatchedFiles(
-	cwd: string,
-	changes: readonly WatchedFileChange[],
-	signal?: AbortSignal,
-): Promise<void> {
-	throwIfAborted(signal);
+export async function notifyWorkspaceWatchedFiles(cwd: string, changes: readonly WatchedFileChange[]): Promise<void> {
 	if (changes.length === 0) return;
 
 	const workspace = path.resolve(cwd);
@@ -2065,8 +2063,7 @@ export async function notifyWorkspaceWatchedFiles(
 	);
 	if (activeClients.length === 0) return;
 
-	const timeoutSignal = AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
-	const sendSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const sendSignal = AbortSignal.timeout(WATCHED_FILES_NOTIFY_TIMEOUT_MS);
 	const results = await Promise.allSettled(
 		activeClients.map(async client => {
 			const served = await Promise.all(changes.map(change => clientServesPath(client, change.filePath)));
@@ -2097,7 +2094,6 @@ export async function notifyWorkspaceWatchedFiles(
 			await refreshOpenFiles(client, sendSignal);
 		}),
 	);
-	throwIfAborted(signal);
 	for (const result of results) {
 		if (result.status === "rejected") {
 			logger.debug("LSP watched-files notification failed", { cwd, error: String(result.reason) });

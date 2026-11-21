@@ -99,8 +99,10 @@ export async function routeWriteThroughBridge(
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}
+	// The client has written the file, so the notice goes out even if the call
+	// was aborted meanwhile (bounded by the notice's own timeout).
 	if (session.enableLsp ?? true) {
-		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }], signal);
+		await notifyWorkspaceWatchedFiles(session.cwd, [{ filePath: absolutePath, type: changeType }]);
 	}
 	session.bumpFileMutationVersion?.(absolutePath);
 

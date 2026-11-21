@@ -10,6 +10,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { rejectionOf, trackUnhandled } from "../helpers/rejection";
 import { restoreEnvValue } from "../helpers/settings-test-state";
+import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
@@ -50,12 +51,13 @@ import {
 	uriToFile,
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { sanitizeText, TempDir } from "@oh-my-pi/pi-utils";
-import type { Subprocess } from "bun";
+import type { BunFile, Subprocess } from "bun";
 import DEFAULTS from "../../src/lsp/defaults.json" with { type: "json" };
 import { renderResult as renderLocalResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { getLanguageFromPath } from "@oh-my-pi/pi-tui/lang-from-path";
@@ -5795,6 +5797,212 @@ describe("lsp regressions", () => {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
 		}
+	});
+
+	describe("an edit whose change is made before the call's abort", () => {
+		// Each case places the abort right after the change lands. The change is then reported as
+		// made, and the server is still told of it: its notice is bounded by its own timeout, not
+		// by the call's abort.
+		const config: ServerConfig = { command: "fake-lsp", fileTypes: ["ts"], rootMarkers: [] };
+
+		function editSession(cwd: string, getClientBridge?: () => ClientBridge | undefined): ToolSession {
+			return {
+				cwd,
+				hasUI: false,
+				enableLsp: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated({
+					"edit.enforceSeenLines": false,
+					"lsp.formatOnWrite": false,
+					"lsp.diagnosticsOnEdit": false,
+				}),
+				getClientBridge,
+			} as ToolSession;
+		}
+
+		/** Whether the server got a watched-files notice naming `filePath`, within a second. */
+		function told(server: FakeLspServer, filePath: string): Promise<boolean> {
+			return server
+				.waitFor(
+					message =>
+						message.method === "workspace/didChangeWatchedFiles" &&
+						JSON.stringify(message.params).includes(fileToUri(filePath)),
+				)
+				.then(
+					() => true,
+					() => false,
+				);
+		}
+
+		it("a write on disk is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-disk-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				// The abort lands as soon as the file's new bytes are on disk, before the notice of them.
+				const bunFile = Object.getPrototypeOf(Bun.file(target));
+				const write = bunFile.write;
+				vi.spyOn(bunFile, "write").mockImplementation(async function (this: BunFile, ...args: unknown[]) {
+					const written = await write.apply(this, args);
+					if (this.name === target) controller.abort();
+					return written;
+				});
+
+				const result = await new EditTool(editSession(tempDir.path()), "replace").execute(
+					"landed-disk-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(controller.signal.aborted).toBe(true);
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bridge write is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-bridge-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				// The abort lands while the client applies the write; the client finishes it.
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async ({ path: written, content }) => {
+						await Bun.write(written, content);
+						controller.abort();
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute(
+					"landed-bridge-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a delete is reported as made, and the server is told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-delete-");
+			try {
+				const target = path.join(tempDir.path(), "gone.ts");
+				await Bun.write(target, "export const a = 1;\n");
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const controller = new AbortController();
+				const session = editSession(tempDir.path());
+				// The abort lands once the file is gone, when the edit asks whether to tell the server.
+				Object.defineProperty(session, "enableLsp", {
+					get: () => {
+						if (!fs.existsSync(target)) controller.abort();
+						return true;
+					},
+				});
+
+				const result = await new EditTool(session, "apply_patch").execute(
+					"landed-delete",
+					{ input: "*** Begin Patch\n*** Delete File: gone.ts\n*** End Patch\n" },
+					controller.signal,
+				);
+
+				expect(fs.existsSync(target)).toBe(false);
+				expect(controller.signal.aborted).toBe(true);
+				expect({ isError: result.isError === true, serverTold: await told(server, target) }).toEqual({
+					isError: false,
+					serverTold: true,
+				});
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a bridge write the client refuses still fails, and the server is not told", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-refused-bridge-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				const server = installHandshakeLsp();
+				await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async () => {
+						throw new Error("the editor refused the write");
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute("refused-bridge-write", {
+					path: "n.ts",
+					old_string: "old",
+					new_string: "new",
+				});
+
+				expect(await Bun.file(target).text()).toBe('export const a = "old";\n');
+				expect(result.isError).toBe(true);
+				expect(result.details?.errorKind).toBe("write_failed");
+				expect(await told(server, target)).toBe(false);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		});
+
+		it("a server that stops reading delays an aborted edit only by the notice's own timeout", async () => {
+			const tempDir = TempDir.createSync("@omp-lsp-landed-wedged-");
+			try {
+				const target = path.join(tempDir.path(), "n.ts");
+				await Bun.write(target, 'export const a = "old";\n');
+				installHandshakeLsp();
+				const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+				// From here the server never drains its input: only the notice's timeout ends the notice.
+				vi.spyOn(client.proc.stdin, "flush").mockImplementation(() => new Promise<number>(() => {}));
+				const controller = new AbortController();
+				const bridge: ClientBridge = {
+					capabilities: { writeTextFile: true },
+					writeTextFile: async ({ path: written, content }) => {
+						await Bun.write(written, content);
+						controller.abort();
+					},
+				};
+
+				const session = editSession(tempDir.path(), () => bridge);
+				const result = await new EditTool(session, "replace").execute(
+					"landed-wedged-write",
+					{ path: "n.ts", old_string: "old", new_string: "new" },
+					controller.signal,
+				);
+
+				expect(await Bun.file(target).text()).toBe('export const a = "new";\n');
+				expect(result.isError).not.toBe(true);
+			} finally {
+				await lspClient.shutdownAll();
+				tempDir.removeSync();
+			}
+		}, 15_000);
 	});
 
 	it("reconciles the executed prefix when a workspace edit fails partway", async () => {

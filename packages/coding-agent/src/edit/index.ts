@@ -556,9 +556,9 @@ export class EditTool implements AgentTool<TInput> {
 				try {
 					await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
 				} catch (error) {
-					// The flush runs on this call's signal, so after a cancel it rejects
-					// as aborted; the cancel outcome, which names what this call changed,
-					// is the result.
+					// The flush can still fail on its own (an earlier batch file that
+					// cannot be read back, say); after a cancel, the cancel outcome, which
+					// names what this call changed, is the result.
 					if (outcome.errorKind !== "cancelled") throw error;
 					logger.debug("LSP batch flush after a cancelled edit failed", {
 						batchId: batch.id,
@@ -724,9 +724,9 @@ export class EditTool implements AgentTool<TInput> {
 		// - the ACP bridge route checks once more just before it calls the
 		//   client; an abort seen there fails the write ("Operation aborted"),
 		//   and nothing is written;
-		// - otherwise the change lands (on disk, or through the client). With
-		//   LSP on, the LSP notice that follows it can still fail the write
-		//   ("Operation aborted"); else the write succeeds.
+		// - otherwise the change lands (on disk, or through the client), and the
+		//   LSP notice that follows it goes out even after the abort (bounded by
+		//   its own 2 s timeout): the write succeeds.
 		// A failed write ends the call as `write_failed`, naming no earlier
 		// file, or, in a call that closes an LSP batch, as the batch flush's
 		// error when that flush fails too. A write that succeeds is named by
@@ -736,11 +736,9 @@ export class EditTool implements AgentTool<TInput> {
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {
-				await notifyWorkspaceWatchedFiles(
-					this.session.cwd,
-					[{ filePath: request.path, type: FileChangeType.Deleted }],
-					signal,
-				);
+				await notifyWorkspaceWatchedFiles(this.session.cwd, [
+					{ filePath: request.path, type: FileChangeType.Deleted },
+				]);
 			}
 			this.session.bumpFileMutationVersion?.(request.path);
 			const diagnostics =
@@ -767,14 +765,10 @@ export class EditTool implements AgentTool<TInput> {
 			if (mode !== undefined) await chmodMovedFile(request.moveTo, mode);
 			await deleteFileWithFallback(request.path, Bun.file(request.path));
 			if (this.session.enableLsp ?? true) {
-				await notifyWorkspaceWatchedFiles(
-					this.session.cwd,
-					[
-						{ filePath: request.path, type: FileChangeType.Deleted },
-						{ filePath: request.moveTo, type: FileChangeType.Created },
-					],
-					signal,
-				);
+				await notifyWorkspaceWatchedFiles(this.session.cwd, [
+					{ filePath: request.path, type: FileChangeType.Deleted },
+					{ filePath: request.moveTo, type: FileChangeType.Created },
+				]);
 			}
 			this.session.bumpFileMutationVersion?.(request.path);
 			this.session.bumpFileMutationVersion?.(request.moveTo);

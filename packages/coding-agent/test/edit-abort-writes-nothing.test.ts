@@ -112,8 +112,9 @@ describe("EditTool and its call's abort signal", () => {
 	});
 
 	it("an aborted edit that closes an LSP batch still ends with the cancel message", async () => {
-		// LSP on with its defaults (no format, no diagnostics): the batch flush only announces the
-		// writes, and that announcement rejects on an aborted signal.
+		// LSP on with its defaults (no format, no diagnostics). The batch flush reads back the
+		// earlier edit's file, which is a directory by then, so the flush rejects (EISDIR); the
+		// cancel outcome must still be the call's result.
 		const session = createSession({ enableLsp: true });
 		const toolCalls = [
 			{ id: "first", name: "edit" },
@@ -130,6 +131,9 @@ describe("EditTool and its call's abort signal", () => {
 			inBatch(0),
 		);
 		expect(first.isError).not.toBe(true);
+		// The earlier file becomes a directory: reading it back fails the flush.
+		await fs.rm(path.join(tmpDir, "earlier.txt"));
+		await fs.mkdir(path.join(tmpDir, "earlier.txt"));
 
 		const backing = path.join(tmpDir, "n.md");
 		await Bun.write(backing, "old\n");
@@ -151,33 +155,28 @@ describe("EditTool and its call's abort signal", () => {
 			(rejection: unknown) => rejection,
 		);
 		expect(await Bun.file(backing).text()).toBe("old\n");
-		expect(await Bun.file(path.join(tmpDir, "earlier.txt")).text()).toBe("two\n");
+		expect((await fs.stat(path.join(tmpDir, "earlier.txt"))).isDirectory()).toBe(true);
 		expect(error).toBeInstanceOf(ToolAbortError);
 		expect((error as ToolAbortError).message).toBe("Edit cancelled before it wrote anything; no file was changed.");
 	});
 
 	it("an edit whose write fails and that closes an LSP batch ends with the batch flush's error", async () => {
-		// The second edit writes through an ACP client bridge, and the call is aborted as that write
-		// begins (the session's bridge lookup aborts it). The bridge route's last check then fails
-		// the write before the client is asked to write, so the outcome is `write_failed`, not
-		// `cancelled`. The batch flush runs on the aborted signal and rejects; after any outcome
-		// other than `cancelled`, that rejection is the call's result.
-		const controller = new AbortController();
+		// The second edit writes through an ACP client bridge that refuses the write, so the outcome
+		// is `write_failed`, not `cancelled`. The batch flush then fails too: it reads back the
+		// earlier edit's file, which is a directory by then (EISDIR). After any outcome other than
+		// `cancelled`, the flush's failure is the call's result.
 		const bridgeWrites: string[] = [];
 		const bridge: ClientBridge = {
 			capabilities: { writeTextFile: true },
 			writeTextFile: async ({ path: target }) => {
 				bridgeWrites.push(target);
+				throw new Error("the editor refused the write");
 			},
 		};
 		let bridgeOn = false;
 		const session: ToolSession = {
 			...createSession({ enableLsp: true }),
-			getClientBridge: () => {
-				if (!bridgeOn) return undefined;
-				controller.abort();
-				return bridge;
-			},
+			getClientBridge: () => (bridgeOn ? bridge : undefined),
 		};
 		const toolCalls = [
 			{ id: "first", name: "edit" },
@@ -194,6 +193,8 @@ describe("EditTool and its call's abort signal", () => {
 			inBatch(0),
 		);
 		expect(first.isError).not.toBe(true);
+		await fs.rm(path.join(tmpDir, "earlier.txt"));
+		await fs.mkdir(path.join(tmpDir, "earlier.txt"));
 
 		const target = path.join(tmpDir, "n.md");
 		await Bun.write(target, "old\n");
@@ -201,7 +202,7 @@ describe("EditTool and its call's abort signal", () => {
 		const call = new EditTool(session, "replace").execute(
 			"second",
 			{ path: "n.md", old_string: "old", new_string: "new" },
-			controller.signal,
+			undefined,
 			undefined,
 			inBatch(1),
 		);
@@ -212,9 +213,7 @@ describe("EditTool and its call's abort signal", () => {
 		);
 		// The file first, so a failure shows whether the call wrote.
 		expect(await Bun.file(target).text()).toBe("old\n");
-		expect(bridgeWrites).toEqual([]);
-		expect(await Bun.file(path.join(tmpDir, "earlier.txt")).text()).toBe("two\n");
-		expect(settled).toBeInstanceOf(ToolAbortError);
-		expect((settled as ToolAbortError).message).toBe("Operation aborted");
+		expect(bridgeWrites).toHaveLength(1);
+		expect(settled).toMatchObject({ code: "EISDIR" });
 	});
 });
