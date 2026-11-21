@@ -196,8 +196,9 @@ enum ScopedOpen {
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
 	/// the wait goes through [`FifoOpening`], which the token can interrupt.
+	/// `id` is the FIFO's identity at the `stat`.
 	#[cfg(unix)]
-	Fifo { token: CancellationToken, end: FifoEnd },
+	Fifo { token: CancellationToken, end: FifoEnd, id: FifoId },
 }
 
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
@@ -213,7 +214,7 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 	if let Some(token) = &scope.cancel
 		&& !options.is_create_new()
 	{
-		use std::os::unix::fs::FileTypeExt;
+		use std::os::unix::fs::{FileTypeExt, MetadataExt};
 		let end = match (options.is_read(), options.is_writable()) {
 			(true, false) if !options.is_create() => FifoEnd::Read,
 			(false, true) => FifoEnd::Write,
@@ -224,7 +225,7 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 		};
 		let kind = meta.file_type();
 		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
-			return ScopedOpen::Fifo { token: token.clone(), end };
+			return ScopedOpen::Fifo { token: token.clone(), end, id: (meta.dev(), meta.ino()) };
 		}
 		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
 	}
@@ -243,9 +244,11 @@ fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait(&token)?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, end, id } => {
+			Ok(FifoOpening::start(scope, path, options, end, id, &token)?
+				.wait(&token)?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -268,10 +271,12 @@ async fn native_open_scoped_async(
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait_async(&token)
-			.await?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, end, id } => {
+			Ok(FifoOpening::start(scope, path, options, end, id, &token)?
+				.wait_async(&token)
+				.await?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -314,14 +319,37 @@ impl FifoEnd {
 	}
 }
 
-/// How many times a cancelled [`FifoOpening`] tries to release its helper's
-/// open, one poll slice apart, before it leaves the helper blocked.
+/// How many times a cancelled or dropped [`FifoOpening`] tries to release
+/// its helper's open, one poll slice apart (about a second in all), before it
+/// leaves the helper blocked.
 #[cfg(unix)]
 const FIFO_RELEASE_ATTEMPTS: usize = 10;
 
+/// The device and inode of a FIFO: a release opens the other end of the FIFO
+/// an open started on, and of no other ([`same_fifo`]).
+#[cfg(unix)]
+pub(crate) type FifoId = (u64, u64);
+
+/// `Ok` when the end a release opened, whose (device, inode) is `found`, is
+/// of the FIFO `started` names; else an error, and the caller closes the end
+/// at once and stops releasing. The FIFO's name was given to another FIFO
+/// since the open started (`rm p; mkfifo p`): the helper waits on a FIFO no
+/// name reaches, and an end held on the new one would be a reader or writer
+/// that is going away, which a writer to the new FIFO could meet and lose its
+/// data to.
+#[cfg(unix)]
+pub(crate) fn same_fifo(found: FifoId, started: FifoId) -> io::Result<()> {
+	if found == started {
+		Ok(())
+	} else {
+		Err(io::Error::other("the FIFO's name now names another FIFO; no release"))
+	}
+}
+
 /// A non-blocking open of the other end of the FIFO a [`FifoOpening`] opens;
-/// `ENXIO` while no open of this end waits yet. The end it returns stays
-/// open until the wait for the helper's answer ends, so a helper that
+/// `ENXIO` while no open of this end waits yet, and an error of
+/// [`same_fifo`]'s when the name now names another FIFO. The end it returns
+/// stays open until the wait for the helper's answer ends, so a helper that
 /// reaches its `open` during that wait connects to it.
 #[cfg(unix)]
 pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync>;
@@ -333,15 +361,19 @@ pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send +
 ///
 /// Once the token fires, when this process may open the other end, a
 /// non-blocking open of the other end connects to the waiting open and closes
-/// at once; it is tried again while the helper has not reached `open` yet
-/// (`ENXIO`). The helper's descriptor is closed, and the open fails with
+/// at once; it is tried again while the helper has not reached `open` yet,
+/// one poll slice apart, for about a second ([`FIFO_RELEASE_ATTEMPTS`]). The
+/// helper's descriptor is closed, and the open fails with
 /// [`crate::cancelled`]. Other opens of the same end waiting at that moment
 /// are released too: a reader reads EOF, a writer's first write fails with
-/// `EPIPE`.
+/// `EPIPE`. A release opens only the FIFO the open started on: when the name
+/// now names another FIFO, it closes what it opened at once and stops.
 ///
 /// An open that is dropped before it finishes (the job that made it was
 /// aborted, its run task was dropped) is released the same way, on a
-/// detached thread, so the helper does not take the next connection.
+/// detached thread after the first attempt. A helper that reaches `open`
+/// after the last attempt, about a second on, still takes the next
+/// connection of the other end and closes it.
 ///
 /// When it may not (a FIFO this process can read but not write, or the
 /// reverse), or the release fails, the open still fails with
@@ -362,19 +394,23 @@ pub(crate) struct FifoOpening {
 
 #[cfg(unix)]
 impl FifoOpening {
-	/// Opens `end` of the FIFO at `path` under `scope`.
+	/// Opens `end` of the FIFO at `path` under `scope`; `id` is the FIFO's
+	/// identity when the open started.
 	fn start(
 		scope: &Scope,
 		path: &Path,
 		options: &OpenOptions,
 		end: FifoEnd,
+		id: FifoId,
 		token: &CancellationToken,
 	) -> io::Result<Self> {
 		let (scope, owned_path, options) = (scope.clone(), path.to_path_buf(), options.clone());
 		let release_path = path.to_path_buf();
 		let release: FifoRelease = Arc::new(move || {
-			native::open(&release_path, &end.release_options())
-				.map(|end| Box::new(end) as Box<dyn Send>)
+			let end = native::open(&release_path, &end.release_options())?;
+			let meta = end.metadata()?;
+			same_fifo((meta.dev().unwrap_or_default(), meta.ino().unwrap_or_default()), id)?;
+			Ok(Box::new(end) as Box<dyn Send>)
 		});
 		Self::spawn(
 			move || native_open(&scope, &owned_path, &options),
@@ -473,29 +509,16 @@ impl Drop for FifoOpening {
 	/// Releases an open dropped before it ended. The first attempt runs here,
 	/// so the release is done, and the helper's descriptor closed, before what
 	/// follows the drop (the next command) opens this FIFO; it takes
-	/// microseconds. A helper that has not reached `open` yet, one slice into
-	/// the attempt, is left to a detached thread that tries again, so that no
-	/// runtime worker waits for it and the helper takes no later connection.
+	/// microseconds when the helper waits in `open`. A helper that has not
+	/// answered one slice into it is left to a detached thread that tries
+	/// again for about a second ([`FIFO_RELEASE_ATTEMPTS`]), so that no
+	/// runtime worker waits for it.
 	fn drop(&mut self) {
-		use std::sync::mpsc::RecvTimeoutError;
 		if self.settled || !self.releasable {
 			return;
 		}
-		let released = (self.release)();
-		#[cfg(test)]
-		fifo_seam::after_release(released.is_ok());
-		match released {
-			Ok(held) => {
-				// The helper's open returns as soon as it sees the release,
-				// which stays open while this waits.
-				let answer = self.opened.recv_timeout(POLL_SLICE);
-				drop(held);
-				if !matches!(answer, Err(RecvTimeoutError::Timeout)) {
-					return;
-				}
-			},
-			Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
-			Err(_) => return,
+		if release_attempt(&*self.release, &self.opened) {
+			return;
 		}
 		let (_, placeholder) = std::sync::mpsc::sync_channel(0);
 		let opened = std::mem::replace(&mut self.opened, placeholder);
@@ -524,7 +547,8 @@ fn release_fifo_open(
 /// non-blocking open of the other end (`release`), kept open while this waits
 /// one poll slice for the helper's result, which is dropped. `false` when
 /// another attempt is due: the helper has not answered (it has not reached
-/// `open` yet, or, for a writer's release, `ENXIO`).
+/// `open` yet, or, for a writer's release, `ENXIO`). `true` also when the
+/// release failed otherwise, the name now naming another FIFO included.
 #[cfg(unix)]
 fn release_attempt(
 	release: &(dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync),

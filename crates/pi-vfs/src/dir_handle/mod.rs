@@ -25,9 +25,10 @@
 //! [`BlockingFs`](crate::BlockingFs) drives it, see the crate docs) and the
 //! `_async` twin awaits it. An entry name is one component: an empty name,
 //! `.`, `..` and a name holding a separator (`/`; on Windows `\` too) are
-//! refused with [`io::ErrorKind::InvalidInput`], and on Windows a name holding
-//! `:` too, which would name a drive (`C:x`) or a stream of another entry
-//! (`a:s`). [`DirHandle::open_parent`] climbs.
+//! refused with [`io::ErrorKind::InvalidInput`], and on a Windows host handle
+//! a name holding `:` too, which would name a drive (`C:x`) or a stream of
+//! another entry (`a:s`); a provider takes its own names.
+//! [`DirHandle::open_parent`] climbs.
 //!
 //! Tree walkers (`pi-walker`) use the rest of this module:
 //! [`DirHandle::list_into`] reads a listing into a reusable [`Listing`];
@@ -61,7 +62,7 @@ use tokio::runtime::Handle;
 
 pub use self::listing::{Detail, FileInfo, FileType, Listing, Record, Stamp};
 #[cfg(unix)]
-use crate::fs::{FifoEnd, FifoOpening, FifoRelease};
+use crate::fs::{FifoEnd, FifoId, FifoOpening, FifoRelease, same_fifo};
 use crate::{
 	error::crosses_devices,
 	file::File,
@@ -213,30 +214,56 @@ impl fmt::Debug for DirHandle {
 	}
 }
 
-/// `name`'s bytes when it is one entry name: not empty, `.` or `..`, holding
-/// no separator, and on Windows no `:`, which would make the name a drive's
-/// current directory (`C:x`, which a join to a directory's path turns into
-/// that) or a stream of another entry (`a:s`, `x::$INDEX_ALLOCATION`).
+/// `name`'s bytes when it is one entry name: not empty, `.` or `..`, and
+/// holding no separator. A Windows host handle also refuses `:`
+/// ([`DirHandle::entry`]).
 fn entry_name(name: &OsStr) -> io::Result<&[u8]> {
 	let bytes = name.as_encoded_bytes();
-	let refused = matches!(bytes, b"" | b"." | b"..")
-		|| bytes
-			.iter()
-			.any(|&b| is_rel_separator(b) || (cfg!(windows) && b == b':'));
-	if refused {
-		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name"));
+	if matches!(bytes, b"" | b"." | b"..") || bytes.iter().any(|&b| is_rel_separator(b)) {
+		return Err(not_one_entry());
 	}
 	Ok(bytes)
 }
 
-/// Refuses `O_DIRECTORY` in an open's custom flags: a directory opens only
-/// through [`DirHandle::open_dir_at`], which refuses a symlink also on a
-/// kernel that follows one despite `O_NOFOLLOW` when `O_DIRECTORY` is set, and
-/// on a path handle, the facade's open would open the directory. (Windows
-/// custom flags have no such flag.)
-#[cfg(unix)]
+fn not_one_entry() -> io::Error {
+	io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name")
+}
+
+impl DirHandle {
+	/// `name`'s bytes when it is one entry name of this directory:
+	/// [`entry_name`]'s rule, and on a Windows host handle no `:`, which
+	/// would make the name a drive's current directory (`C:x`, which a join
+	/// to the directory's path turns into that) or a stream of another entry
+	/// (`a:s`, `x::$INDEX_ALLOCATION`). A provider's names are its own: a
+	/// listing of one may hold `:`, and its calls take such a name.
+	#[cfg_attr(
+		not(windows),
+		allow(clippy::unused_self, reason = "only a Windows host refuses more")
+	)]
+	fn entry<'n>(&self, name: &'n OsStr) -> io::Result<&'n [u8]> {
+		let bytes = entry_name(name)?;
+		#[cfg(windows)]
+		if matches!(self.repr, DirRepr::Host { .. }) && bytes.contains(&b':') {
+			return Err(not_one_entry());
+		}
+		Ok(bytes)
+	}
+}
+
+/// Refuses an open of a directory through `open_at`: `O_DIRECTORY` on Unix,
+/// `FILE_FLAG_BACKUP_SEMANTICS` (which lets `CreateFileW` open a directory)
+/// on Windows. A directory opens only through [`DirHandle::open_dir_at`],
+/// which refuses a symlink also on a kernel that follows one despite
+/// `O_NOFOLLOW` when `O_DIRECTORY` is set; and on a path handle, the
+/// facade's open would open the directory.
 fn refuse_directory_flag(options: &OpenOptions) -> io::Result<()> {
-	if options.get_custom_flags() & libc::O_DIRECTORY != 0 {
+	#[cfg(unix)]
+	let flag = libc::O_DIRECTORY;
+	#[cfg(windows)]
+	let flag = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS as i32;
+	#[cfg(not(any(unix, windows)))]
+	let flag = 0;
+	if options.get_custom_flags() & flag != 0 {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidInput,
 			"open_at opens no directory: open it with open_dir_at",
@@ -507,9 +534,9 @@ fn host_open_at(
 ) -> io::Result<File> {
 	#[cfg(unix)]
 	if let Some(token) = &scope.cancel
-		&& let Some(end) = host_fifo_end(s, handle, name, options)
+		&& let Some((end, id)) = host_fifo_end(s, handle, name, options)
 	{
-		let file = host_fifo_open(handle, scope, name, options, end, token)?.wait(token)?;
+		let file = host_fifo_open(handle, scope, name, options, end, id, token)?.wait(token)?;
 		return Ok(file.bind_host(token.clone(), true));
 	}
 	open_host_entry(s, handle, scope, name, options)
@@ -530,9 +557,9 @@ async fn host_open_at_async(
 	options: &OpenOptions,
 ) -> io::Result<File> {
 	#[cfg(unix)]
-	if let Some(end) = with_scratch(|s| host_fifo_end(s, handle, name, options)) {
+	if let Some((end, id)) = with_scratch(|s| host_fifo_end(s, handle, name, options)) {
 		let token = scope.cancel.clone().unwrap_or_default();
-		let file = host_fifo_open(handle, scope, name, options, end, &token)?
+		let file = host_fifo_open(handle, scope, name, options, end, id, &token)?
 			.wait_async(&token)
 			.await?;
 		return Ok(if scope.cancel.is_some() {
@@ -557,19 +584,19 @@ fn open_host_entry(
 	Ok(File::from(file).bind(scope))
 }
 
-/// The end of a FIFO an `open_at` of `name` with `options` waits on: when
-/// the open can block (read-only or write-only, without `O_NONBLOCK`, not
-/// creating the entry new) and `name` is a FIFO, by one `fstatat` that does
-/// not follow a symlink there (the open refuses one anyway). If the entry
-/// changes between the `fstatat` and the open, it is opened as the
-/// `fstatat` described it, as the facade's opens are.
+/// The end of a FIFO an `open_at` of `name` with `options` waits on, and the
+/// FIFO's identity: when the open can block (read-only or write-only,
+/// without `O_NONBLOCK`, not creating the entry new) and `name` is a FIFO,
+/// by one `fstatat` that does not follow a symlink there (the open refuses
+/// one anyway). If the entry changes between the `fstatat` and the open, it
+/// is opened as the `fstatat` described it, as the facade's opens are.
 #[cfg(unix)]
 fn host_fifo_end(
 	s: &mut native::Scratch,
 	handle: &native::Handle,
 	name: &[u8],
 	options: &OpenOptions,
-) -> Option<FifoEnd> {
+) -> Option<(FifoEnd, FifoId)> {
 	if options.is_create_new() || options.get_custom_flags() & libc::O_NONBLOCK != 0 {
 		return None;
 	}
@@ -579,13 +606,15 @@ fn host_fifo_end(
 		_ => return None,
 	};
 	let meta = native::stat_at(s, handle, name, false).ok()?;
-	meta.file_type().is_fifo().then_some(end)
+	let id = meta.dev().zip(meta.ino())?;
+	meta.file_type().is_fifo().then_some((end, id))
 }
 
-/// Starts the open of `end` of the FIFO `name` in `handle` on a helper
-/// thread ([`FifoOpening`]), through a duplicate of the directory's
-/// descriptor; a cancelled or dropped open is released by a non-blocking
-/// open of the other end relative to the same directory.
+/// Starts the open of `end` of the FIFO `name` in `handle`, whose identity
+/// was `id` when the open started, on a helper thread ([`FifoOpening`]),
+/// through a duplicate of the directory's descriptor. A cancelled or dropped
+/// open is released by a non-blocking open of the other end relative to the
+/// same directory, of that FIFO only ([`same_fifo`]).
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -593,15 +622,20 @@ fn host_fifo_open(
 	name: &[u8],
 	options: &OpenOptions,
 	end: FifoEnd,
+	id: FifoId,
 	token: &tokio_util::sync::CancellationToken,
 ) -> io::Result<FifoOpening> {
+	use std::os::unix::fs::MetadataExt;
 	let dir = Arc::new(handle.try_clone()?);
 	let releasable = native::may_access_at(handle, name, end.release_access());
 	let (open_dir, open_name, options, mask) =
 		(Arc::clone(&dir), name.to_vec(), options.clone(), host_mask(scope));
 	let (release_name, writer) = (name.to_vec(), end.released_by_writer());
 	let release: FifoRelease = Arc::new(move || {
-		native::touch_fifo_at(&dir, &release_name, writer).map(|end| Box::new(end) as Box<dyn Send>)
+		let end = std::fs::File::from(native::touch_fifo_at(&dir, &release_name, writer)?);
+		let meta = end.metadata()?;
+		same_fifo((meta.dev(), meta.ino()), id)?;
+		Ok(Box::new(end) as Box<dyn Send>)
 	});
 	FifoOpening::spawn(
 		move || {
@@ -661,7 +695,7 @@ impl DirHandle {
 	/// A `name` that is not one entry name; the open's errors; an entry that
 	/// is not a directory.
 	pub fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, scope| host_open_dir_at(s, handle, scope, bytes),
 			|provided| provider_open_dir_at(provided, name),
@@ -674,7 +708,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::open_dir_at`].
 	pub async fn open_dir_at_async(&self, name: &OsStr) -> io::Result<Self> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, scope| host_open_dir_at(s, handle, scope, bytes),
@@ -786,7 +820,7 @@ impl DirHandle {
 	///
 	/// A `name` that is not one entry name; the stat's errors.
 	pub fn stat_at(&self, name: &OsStr, follow: bool) -> io::Result<Metadata> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::stat_at(s, handle, bytes, follow),
 			|provided| provider_stat_at(provided, name, follow),
@@ -799,7 +833,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::stat_at`].
 	pub async fn stat_at_async(&self, name: &OsStr, follow: bool) -> io::Result<Metadata> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::stat_at(s, handle, bytes, follow),
@@ -811,11 +845,13 @@ impl DirHandle {
 	/// Opens the entry `name` as `options` say, never through a symlink
 	/// there: `ELOOP` on Unix, `ERROR_STOPPED_ON_SYMLINK` on Windows, and on a
 	/// provider [`is_symlink_refusal`]'s error for one there when checked. No
-	/// directory: `O_DIRECTORY` is refused, as [`Self::open_dir_at`] opens
-	/// one. A file it creates gets the mode `options` give (`0o666` by
-	/// default) as the facade's host opens give it: less the process umask,
-	/// or exactly less the facade's creation mask. The file's reads observe
-	/// the facade's cancellation, as files opened through the facade do.
+	/// directory, on any handle: `O_DIRECTORY` (Unix) and
+	/// `FILE_FLAG_BACKUP_SEMANTICS` (Windows) are refused, as
+	/// [`Self::open_dir_at`] opens one. A file it creates gets the mode
+	/// `options` give (`0o666` by default) as the facade's host opens give it:
+	/// less the process umask, or exactly less the facade's creation mask. The
+	/// file's reads observe the facade's cancellation, as files opened through
+	/// the facade do.
 	///
 	/// A FIFO's open waits for its other end. On the host on Unix,
 	/// [`Self::open_at_async`] waits on a helper thread, holding no runtime
@@ -825,13 +861,12 @@ impl DirHandle {
 	/// # Errors
 	///
 	/// A `name` that is not one entry name; the refusal of a symlink;
-	/// [`io::ErrorKind::InvalidInput`] for `O_DIRECTORY`; the open's errors,
-	/// `EINVAL` for options [`std::fs::OpenOptions`] refuses included; the
-	/// facade's cancellation error once its token fires during a FIFO's
-	/// wait.
+	/// [`io::ErrorKind::InvalidInput`] for `O_DIRECTORY` or
+	/// `FILE_FLAG_BACKUP_SEMANTICS`; the open's errors, `EINVAL` for options
+	/// [`std::fs::OpenOptions`] refuses included; the facade's cancellation
+	/// error once its token fires during a FIFO's wait.
 	pub fn open_at(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
-		let bytes = entry_name(name)?;
-		#[cfg(unix)]
+		let bytes = self.entry(name)?;
 		refuse_directory_flag(options)?;
 		self.call(
 			|s, handle, scope| host_open_at(s, handle, scope, bytes, options),
@@ -845,8 +880,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::open_at`].
 	pub async fn open_at_async(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
-		let bytes = entry_name(name)?;
-		#[cfg(unix)]
+		let bytes = self.entry(name)?;
 		refuse_directory_flag(options)?;
 		match &self.repr {
 			DirRepr::Host { handle, scope } => host_open_at_async(handle, scope, bytes, options).await,
@@ -863,7 +897,7 @@ impl DirHandle {
 	/// A `name` that is not one entry name; the creation's errors (an entry
 	/// that exists already included).
 	pub fn create_dir_at(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, scope| native::create_dir_at(s, handle, bytes, mode, host_mask(scope)),
 			|provided| provider_create_dir_at(provided, name, mode),
@@ -876,7 +910,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::create_dir_at`].
 	pub async fn create_dir_at_async(&self, name: &OsStr, mode: Option<u32>) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, scope| native::create_dir_at(s, handle, bytes, mode, host_mask(scope)),
@@ -894,7 +928,7 @@ impl DirHandle {
 	///
 	/// A `name` that is not one entry name; the removal's errors.
 	pub fn remove_at(&self, name: &OsStr, dir: bool) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::remove_at(s, handle, bytes, dir),
 			|provided| provider_remove_at(provided, name, dir),
@@ -907,7 +941,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::remove_at`].
 	pub async fn remove_at_async(&self, name: &OsStr, dir: bool) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::remove_at(s, handle, bytes, dir),
@@ -927,7 +961,7 @@ impl DirHandle {
 	/// host and one path handle, or path handles on two facades; the rename's
 	/// errors.
 	pub fn rename_at(&self, from: &OsStr, to_dir: &Self, to: &OsStr) -> io::Result<()> {
-		let (from_bytes, to_bytes) = (entry_name(from)?, entry_name(to)?);
+		let (from_bytes, to_bytes) = (self.entry(from)?, to_dir.entry(to)?);
 		match self.rename_pair(to_dir)? {
 			RenamePair::Host(handle, to_handle) => {
 				with_scratch(|s| native::rename_at(s, handle, from_bytes, to_handle, to_bytes))
@@ -947,7 +981,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::rename_at`].
 	pub async fn rename_at_async(&self, from: &OsStr, to_dir: &Self, to: &OsStr) -> io::Result<()> {
-		let (from_bytes, to_bytes) = (entry_name(from)?, entry_name(to)?);
+		let (from_bytes, to_bytes) = (self.entry(from)?, to_dir.entry(to)?);
 		match self.rename_pair(to_dir)? {
 			RenamePair::Host(handle, to_handle) => {
 				with_scratch(|s| native::rename_at(s, handle, from_bytes, to_handle, to_bytes))
@@ -967,7 +1001,7 @@ impl DirHandle {
 	///
 	/// A `name` that is not one entry name; the creation's errors.
 	pub fn symlink_at(&self, target: &Path, name: &OsStr) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::symlink_at(s, handle, target, bytes),
 			|provided| provided.fs.symlink(target, provided.child(name)),
@@ -980,7 +1014,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::symlink_at`].
 	pub async fn symlink_at_async(&self, target: &Path, name: &OsStr) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::symlink_at(s, handle, target, bytes),
@@ -996,7 +1030,7 @@ impl DirHandle {
 	/// A `name` that is not one entry name; the read's errors (`EINVAL` for an
 	/// entry that is no symlink).
 	pub fn read_link_at(&self, name: &OsStr) -> io::Result<PathBuf> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::read_link_at(s, handle, bytes),
 			|provided| provided.fs.read_link(provided.child(name)),
@@ -1009,7 +1043,7 @@ impl DirHandle {
 	///
 	/// As for [`Self::read_link_at`].
 	pub async fn read_link_at_async(&self, name: &OsStr) -> io::Result<PathBuf> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::read_link_at(s, handle, bytes),
@@ -1032,7 +1066,7 @@ impl DirHandle {
 		permissions: Permissions,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::set_permissions_at(s, handle, bytes, permissions, follow),
 			|provided| provider_set_permissions_at(provided, name, permissions, follow),
@@ -1050,7 +1084,7 @@ impl DirHandle {
 		permissions: Permissions,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::set_permissions_at(s, handle, bytes, permissions, follow),
@@ -1074,7 +1108,7 @@ impl DirHandle {
 		modified: FileTime,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::set_times_at(s, handle, bytes, accessed, modified, follow),
 			|provided| {
@@ -1097,7 +1131,7 @@ impl DirHandle {
 		modified: FileTime,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::set_times_at(s, handle, bytes, accessed, modified, follow),
@@ -1123,7 +1157,7 @@ impl DirHandle {
 		gid: Option<u32>,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self.call(
 			|s, handle, _| native::chown_at(s, handle, bytes, uid, gid, follow),
 			|provided| provided.fs.chown(provided.child(name), uid, gid, follow),
@@ -1142,7 +1176,7 @@ impl DirHandle {
 		gid: Option<u32>,
 		follow: bool,
 	) -> io::Result<()> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		self
 			.call_async(
 				|s, handle, _| native::chown_at(s, handle, bytes, uid, gid, follow),
@@ -1220,7 +1254,7 @@ impl DirHandle {
 		name: &OsStr,
 		follow: bool,
 	) -> io::Result<(RegularFile, FileInfo)> {
-		let bytes = entry_name(name)?;
+		let bytes = self.entry(name)?;
 		match &self.repr {
 			DirRepr::Host { handle, .. } => {
 				let (handle, info) = with_scratch(|s| native::open_file_at(s, handle, bytes, follow))?;

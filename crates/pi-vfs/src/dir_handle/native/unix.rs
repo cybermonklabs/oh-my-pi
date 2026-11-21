@@ -501,11 +501,14 @@ pub(crate) fn open_at(
 }
 
 /// `mkdirat` of `name` in `dir` with `mode` (`0o777` by default) less the
-/// process umask; with a creation `mask`, exactly `mode` less `mask`: the
-/// mode is set again after the create as a no-follow
-/// [`set_permissions_at`] sets it, which needs no read permission on the new
-/// directory and changes no symlink swapped in for it (Linux refuses one;
-/// macOS changes the link itself). Best effort, as the facade's creations.
+/// process umask; with a creation `mask`, exactly `mode` less `mask`. For
+/// that, the directory is made with the owner's read, write and search bits
+/// too, so this process can always open it, and the mode is set on a descriptor
+/// of it opened as [`open_child`] opens one (`O_DIRECTORY | O_NOFOLLOW`):
+/// whatever was swapped in for it since `mkdirat` (a symlink, a regular file,
+/// a hard link to another file) is refused and keeps its mode. Best effort,
+/// as the facade's creations: when that open fails, the directory keeps the
+/// owner bits it was made with.
 pub(crate) fn create_dir_at(
 	s: &mut Scratch,
 	dir: &Handle,
@@ -517,13 +520,21 @@ pub(crate) fn create_dir_at(
 	let entry = name;
 	let name = s.cstr(name)?;
 	let requested = mode.unwrap_or(0o777);
-	let mode = mask.map_or(requested, |mask| requested & !mask);
+	let mode = mask.map_or(requested, |mask| requested & !mask) as libc::mode_t;
+	let made = if mask.is_some() {
+		mode | libc::S_IRWXU
+	} else {
+		mode
+	};
 	// SAFETY: `name` is NUL-terminated.
-	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, mode as libc::mode_t) })?;
+	retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), name, made) })?;
 	#[cfg(test)]
 	seams::fire_after_create_dir(entry);
-	if mask.is_some() {
-		let _ = chmod_at(dir, name, mode as libc::mode_t, false);
+	if mask.is_some()
+		&& let Ok(fd) = sys::openat_dir(dir.as_raw_fd(), name, DIR_FLAGS | libc::O_NOFOLLOW)
+	{
+		// SAFETY: `fd` is an open descriptor.
+		let _ = retry(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) });
 	}
 	Ok(())
 }
