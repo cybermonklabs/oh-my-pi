@@ -41,8 +41,8 @@ enum Mode {
 pub struct OutputDecoder {
 	pending:           Vec<u8>,
 	mode:              Mode,
-	/// Continuation bytes still to drop: the rest of a character whose
-	/// start [`Self::release`] gave out as U+FFFD.
+	/// Bytes still to drop after a release: the rest of the character whose
+	/// start [`Self::release`] gave out.
 	skip:              u8,
 	#[cfg(windows)]
 	fallback_codepage: u32,
@@ -94,11 +94,11 @@ impl OutputDecoder {
 	/// Push the next pipe read. Returns text that is safe to emit now;
 	/// incomplete UTF-8 / DBCS sequences stay buffered.
 	pub fn push(&mut self, mut bytes: &[u8]) -> String {
-		// The rest of a character released early is part of the U+FFFD
-		// already given out for it.
+		// The rest of a character released early belongs to what the release
+		// already gave out for it.
 		while self.skip > 0 {
 			match bytes.split_first() {
-				Some((&byte, rest)) if byte & 0xc0 == 0x80 => {
+				Some((&byte, rest)) if self.rest_of_released(byte) => {
 					bytes = rest;
 					self.skip -= 1;
 				},
@@ -127,10 +127,19 @@ impl OutputDecoder {
 	}
 
 	/// Give out the held bytes while the stream goes on, as
-	/// [`ByteDecoder::release`] says: in UTF-8 the unfinished character is one
-	/// U+FFFD and the bytes that would have finished it are dropped when they
-	/// come next; the decoder stays in UTF-8. A stream already decoded from the
-	/// ANSI code page has its held lead byte decoded alone, as at its end.
+	/// [`ByteDecoder::release`] says.
+	///
+	/// In UTF-8 the held bytes are the start of one character. They come out
+	/// as the end of the stream would give them: U+FFFD, or where this
+	/// decoder has an ANSI fallback, the code page's reading of them (a
+	/// CP1252 `é` at the end of a program's output stays `é`). The decoder
+	/// stays in UTF-8, and the continuation bytes that would have finished
+	/// them as a UTF-8 character are dropped when they come next.
+	///
+	/// A stream already read from the code page holds at most the lead byte of
+	/// a double-byte character: it comes out as U+FFFD, and one byte in the
+	/// trail range that comes next is dropped with it, so the characters after
+	/// it keep their alignment.
 	pub fn release(&mut self) -> String {
 		match self.mode {
 			Mode::Utf8 => {
@@ -145,11 +154,35 @@ impl OutputDecoder {
 					_ => 4,
 				};
 				self.skip = u8::try_from(len.saturating_sub(self.pending.len())).unwrap_or(0);
+				#[cfg(windows)]
+				if self.can_fallback_to_acp() {
+					// What the end of the stream would read, in the code page;
+					// the mode stays UTF-8 (`drain_acp` does not change it).
+					return self.drain_acp(true);
+				}
 				self.pending.clear();
 				REPLACEMENT.to_owned()
 			},
 			#[cfg(windows)]
-			Mode::Acp => self.drain_acp(true),
+			Mode::Acp => {
+				if self.pending.is_empty() {
+					return String::new();
+				}
+				self.pending.clear();
+				self.skip = 1;
+				REPLACEMENT.to_owned()
+			},
+		}
+	}
+
+	/// Whether `byte` can be the rest of the character the last release gave
+	/// out: a UTF-8 continuation byte, or in a code-page stream a byte in the
+	/// double-byte trail range (0x40-0xFE but 0x7F).
+	const fn rest_of_released(&self, byte: u8) -> bool {
+		match self.mode {
+			Mode::Utf8 => byte & 0xc0 == 0x80,
+			#[cfg(windows)]
+			Mode::Acp => matches!(byte, 0x40..=0x7e | 0x80..=0xfe),
 		}
 	}
 
@@ -820,17 +853,38 @@ mod tests {
 		assert_eq!(decoder.finish(), "é");
 	}
 
+	/// Where the host has an ANSI fallback, a release reads a code-page letter
+	/// at the end of a program's output as the end of the stream would:
+	/// CP1252 `caf E9` is `café`, not `caf` and U+FFFD. The decoder stays in
+	/// UTF-8 for what follows.
+	#[cfg(windows)]
+	#[test]
+	fn release_reads_a_held_letter_from_the_code_page() {
+		let mut decoder = OutputDecoder::with_fallback_codepage(1252);
+		assert_eq!(decoder.push(b"caf\xe9"), "caf");
+		assert_eq!(decoder.release(), "é");
+		assert_eq!(decoder.push("日本語\n".as_bytes()), "日本語\n");
+		assert_eq!(decoder.finish(), "");
+		// GBK 鏃 (E6 97) is also the start of a three-byte UTF-8 character.
+		let mut decoder = OutputDecoder::with_fallback_codepage(936);
+		assert_eq!(decoder.push(b"ok \xe6\x97"), "ok ");
+		assert_eq!(decoder.release(), "鏃");
+		assert_eq!(decoder.push("日本語\n".as_bytes()), "日本語\n");
+		assert_eq!(decoder.finish(), "");
+	}
+
 	/// A release is not the end of the stream: where the host has an ANSI
-	/// fallback, the unfinished character is still one U+FFFD and the
-	/// decoder stays in UTF-8, so the rest of the stream (the end of 日, then
-	/// 本語) is not read from the code page.
+	/// fallback, the held start of a UTF-8 character (E6 97 of 日) is read from
+	/// the code page, the rest of that character (A5) is dropped, and the
+	/// decoder stays in UTF-8, so `本語` and `日本語` after it are not read from
+	/// the code page.
 	#[cfg(windows)]
 	#[test]
 	fn release_keeps_utf8_where_the_host_has_an_ansi_fallback() {
-		for codepage in [1252, 936] {
+		for (codepage, start) in [(1252, "æ—"), (936, "鏃")] {
 			let mut decoder = OutputDecoder::with_fallback_codepage(codepage);
 			assert_eq!(decoder.push(b"done\n\xe6\x97"), "done\n", "code page {codepage}");
-			assert_eq!(decoder.release(), "\u{FFFD}", "code page {codepage}");
+			assert_eq!(decoder.release(), start, "code page {codepage}");
 			let mut rest = vec![0xa5];
 			rest.extend_from_slice("本語\n".as_bytes());
 			assert_eq!(decoder.push(&rest), "本語\n", "code page {codepage}");
@@ -839,18 +893,25 @@ mod tests {
 		}
 	}
 
-	/// In a stream already read from the code page, a release decodes the
-	/// held lead byte alone, as the end of the stream would, and the stream
-	/// stays in the code page.
+	/// In a stream already read from the code page, a release gives the held
+	/// lead byte of a double-byte character (CE of 文) as U+FFFD and drops its
+	/// trail (C4) when it comes next, so the characters after it keep their
+	/// alignment: C4 is itself a GBK lead, and paired with what follows it
+	/// would misread `中文`.
 	#[cfg(windows)]
 	#[test]
-	fn release_in_an_acp_stream_keeps_the_code_page() {
+	fn release_in_an_acp_stream_drops_the_rest_of_its_character() {
 		let mut decoder = OutputDecoder::with_fallback_codepage(936);
 		// GBK 中, then the lead byte of 文.
 		assert_eq!(decoder.push(&[0xd6, 0xd0, 0xce]), "中");
-		assert!(!decoder.release().is_empty());
+		assert_eq!(decoder.release(), "\u{FFFD}");
 		assert!(decoder.pending.is_empty());
-		assert_eq!(decoder.push(&[0xd6, 0xd0, 0xce, 0xc4]), "中文");
+		assert_eq!(decoder.push(&[0xc4, 0xd6, 0xd0, 0xce, 0xc4, b'\r', b'\n']), "中文\r\n");
+		// The drop is one byte, and only a trail-range byte: an ASCII control
+		// after a released lead is kept.
+		assert_eq!(decoder.push(&[0xce]), "");
+		assert_eq!(decoder.release(), "\u{FFFD}");
+		assert_eq!(decoder.push(b"\r\nok"), "\r\nok");
 		assert_eq!(decoder.finish(), "");
 	}
 

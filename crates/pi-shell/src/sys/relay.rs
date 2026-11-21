@@ -23,20 +23,22 @@
 //! reaches the sink ahead of whatever the next command writes there. Only the
 //! relay reads the pipe, and the task polling it is the one sizing the
 //! drain, so at the exit what the relay has read and what the pipe holds are
-//! one snapshot: everything the exited program wrote. The exit is reported
-//! once the relay has forwarded that much. A process the program left
-//! running may keep the pipe open forever; the drain never waits for the end
-//! of the stream beyond a short grace for a character the bytes end inside.
-//! Past the grace the decoder releases those bytes once
+//! one snapshot: everything the exited program wrote, and whatever another
+//! process holding the pipe wrote by then. The exit is reported once the
+//! relay has forwarded that much. A process the program left running may
+//! keep the pipe open forever; the drain never waits for the end of the
+//! stream beyond a short grace for a character the bytes end inside. Past
+//! the grace the decoder releases those bytes once
 //! ([`ByteDecoder::release`]) and the relay forwards them before the exit is
 //! reported, so the next command's output does not overtake them. They need
 //! not be the program's: a process it left running may have written them
-//! before the exit, and a character that process finishes later is then one
-//! replacement character. The release does not end the stream: the decoder
-//! decodes what follows as before. The relay itself goes on to the end of
-//! the stream, as a plain pipe would carry that process's output: once the
-//! `ExtProc` is dropped it runs as adopted work (`pump::orphan`), and
-//! releases what the decoder holds at the end.
+//! before the exit, and a character that process finishes later then comes
+//! out broken: its start as the release gave it, its rest dropped. The
+//! release does not end the stream: the decoder decodes what follows as
+//! before. The relay itself goes on to the end of the stream, as a plain pipe
+//! would carry that process's output: once the `ExtProc` is dropped it runs
+//! as adopted work (`pump::orphan`), and releases what the decoder holds at
+//! the end.
 
 use std::{
 	fs,
@@ -70,10 +72,12 @@ pub trait ByteDecoder: Send {
 	/// Flush held bytes at the end of the stream.
 	fn finish(&mut self) -> String;
 	/// Give out the held bytes now, while the stream goes on (another
-	/// process may still write into it): an unfinished character comes out
-	/// as one replacement character, and how the decoder reads what follows
-	/// does not change. A relay calls it at most once, when its program has
-	/// exited and the end of the stream has not come within a short grace.
+	/// process may still write into it). The held bytes come out once, as a
+	/// replacement character or as the decoder's own reading of them; the
+	/// bytes that would have finished their character are dropped when they
+	/// come next, and how the decoder reads what follows does not change. A
+	/// relay calls it at most once, when its program has exited and the end of
+	/// the stream has not come within a short grace.
 	fn release(&mut self) -> String;
 }
 
