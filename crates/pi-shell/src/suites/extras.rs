@@ -273,11 +273,12 @@ async fn xargs_runs_builtins_and_programs() {
 }
 
 /// `sh` behind a symlink at a path of about 3500 bytes (the directory goes
-/// with the guard). `execve` copies the program's path onto the new stack
-/// with the command line, while xargs counts only the command line and the
-/// environment against `sysconf(_SC_ARG_MAX)`, with 2048 bytes to spare: the
-/// kernel refuses a line xargs filled, as a sandbox whose limit is below
-/// `sysconf` (gVisor) refuses every full line.
+/// with the guard). Linux's `execve` copies the program's path onto the new
+/// stack with the command line, while xargs counts only the command line and
+/// the environment against `sysconf(_SC_ARG_MAX)`, with 2048 bytes to spare:
+/// Linux refuses a line xargs filled. gVisor counts neither the path nor the
+/// environment against the argument strings' limit, so it refuses a full line
+/// only in a process with [`ROOM_TO_REFUSE`] (see [`with_room_to_refuse`]).
 #[cfg(target_os = "linux")]
 fn sh_at_a_long_path() -> (tempfile::TempDir, String) {
 	let dir = tempfile::tempdir().unwrap();
@@ -291,6 +292,74 @@ fn sh_at_a_long_path() -> (tempfile::TempDir, String) {
 	let path = path.into_os_string().into_string().unwrap();
 	assert!(path.len() < 4000, "{} bytes is too close to PATH_MAX", path.len());
 	(dir, path)
+}
+
+/// The soft stack limit, in bytes, of the process each test that needs a full
+/// line refused runs in ([`with_room_to_refuse`]). glibc's
+/// `sysconf(_SC_ARG_MAX)` and Linux's exec limit are each a quarter of it,
+/// 4 MiB. gVisor's `execve` takes 2 MiB of argument strings, with their NULs,
+/// whatever the stack limit (`ExecMaxTotalSize` in gVisor's
+/// `pkg/sentry/syscalls/linux/sys_thread.go`), and counts the environment
+/// apart. So at this limit a full line xargs or find fills holds about 4 MiB
+/// of strings, which gVisor refuses as Linux does, and half of one runs on
+/// both. At 8 MiB, a pod's default and the most a setuid program such as
+/// `sudo` starts with (Linux caps a secure exec's soft stack limit at
+/// `_STK_LIM`), xargs' full line holds less than 2 MiB of strings, and gVisor
+/// runs it whole.
+#[cfg(target_os = "linux")]
+const ROOM_TO_REFUSE: libc::rlim_t = 16 << 20;
+
+/// The variable naming the test a child process of this test binary runs
+/// with [`ROOM_TO_REFUSE`].
+#[cfg(target_os = "linux")]
+const ROOM_TO_REFUSE_TEST: &str = "PI_SHELL_TEST_ROOM_TO_REFUSE";
+
+/// Whether the test `name` of this module runs its checks here: the first
+/// call of each test whose checks need the system to refuse a full line.
+///
+/// In a child process of this test binary that runs `name` alone (named by
+/// [`ROOM_TO_REFUSE_TEST`]), it sets the process's soft stack limit to
+/// [`ROOM_TO_REFUSE`] and returns `true`; the limit is the whole process's,
+/// so only a process that runs one test sets it. Anywhere else it runs `name`
+/// in such a child, and returns `false` once the child passed, or panics with
+/// the child's output.
+#[cfg(target_os = "linux")]
+async fn with_room_to_refuse(name: &str) -> bool {
+	let test = format!("suites::extras::{name}");
+	if std::env::var_os(ROOM_TO_REFUSE_TEST).is_some_and(|named| named == test.as_str()) {
+		let mut stack = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: getrlimit writes into the struct it is given.
+		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut stack) }, 0);
+		assert!(
+			stack.rlim_max >= ROOM_TO_REFUSE,
+			"the hard stack limit {} is below {ROOM_TO_REFUSE} bytes: gVisor would run every full \
+			 line",
+			stack.rlim_max
+		);
+		stack.rlim_cur = ROOM_TO_REFUSE;
+		// SAFETY: a plain setrlimit of this process, which runs this test alone.
+		let set = unsafe { libc::setrlimit(libc::RLIMIT_STACK, &raw const stack) };
+		assert_eq!(set, 0, "setrlimit: {}", io::Error::last_os_error());
+		// SAFETY: plain call without pointer arguments.
+		let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+		assert_eq!(arg_max as libc::rlim_t, ROOM_TO_REFUSE / 4, "sysconf(_SC_ARG_MAX)");
+		return true;
+	}
+	let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+		.args(["--exact", &test, "--nocapture", "--test-threads=1"])
+		.env(ROOM_TO_REFUSE_TEST, &test)
+		.stdin(std::process::Stdio::null())
+		.output()
+		.await
+		.unwrap();
+	let (out, err) =
+		(String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+	assert!(
+		child.status.success() && out.contains("1 passed"),
+		"{test} with a {ROOM_TO_REFUSE}-byte stack: {}\n{out}{err}",
+		child.status
+	);
+	false
 }
 
 /// A command that prints an `@ N` line for its N arguments, then each of
@@ -347,6 +416,9 @@ fn too_long_reports(stderr: &str) -> usize {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
+	if !with_room_to_refuse("xargs_splits_a_line_the_kernel_refuses_as_too_long").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let mut s = session_in(dir.path(), &[]);
@@ -390,6 +462,9 @@ async fn xargs_splits_a_line_the_kernel_refuses_as_too_long() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long() {
+	if !with_room_to_refuse("find_exec_plus_splits_a_batch_the_kernel_refuses_as_too_long").await {
+		return;
+	}
 	let show_files = format!("find many -type f -exec /bin/sh {SHOW_ARGS} {{}} +");
 	let dir = tempfile::tempdir().unwrap();
 	std::fs::create_dir(dir.path().join("many")).unwrap();
@@ -497,6 +572,9 @@ fn lines_tried(stderr: &str, program: &str) -> usize {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_function_of_the_callers_runs_for_the_words_xargs_generates() {
+	if !with_room_to_refuse("no_function_of_the_callers_runs_for_the_words_xargs_generates").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
@@ -590,6 +668,10 @@ async fn a_function_the_command_defines_runs_in_xargs_and_find() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_words_a_callout_generates_take_no_alias_or_disabled_builtin() {
+	if !with_room_to_refuse("the_words_a_callout_generates_take_no_alias_or_disabled_builtin").await
+	{
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
@@ -639,6 +721,9 @@ async fn the_words_a_callout_generates_take_no_alias_or_disabled_builtin() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_callers_xtrace_does_not_trace_the_commands_xargs_runs() {
+	if !with_room_to_refuse("the_callers_xtrace_does_not_trace_the_commands_xargs_runs").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -678,6 +763,9 @@ async fn the_callers_xtrace_does_not_trace_the_commands_xargs_runs() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn env_does_not_hand_up_a_refusal_after_reading_env0_from() {
+	if !with_room_to_refuse("env_does_not_hand_up_a_refusal_after_reading_env0_from").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1425,6 +1513,9 @@ async fn a_missing_interpreter_is_reported_as_at_base() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_line_is_split_through_env_command_and_exec() {
+	if !with_room_to_refuse("a_refused_line_is_split_through_env_command_and_exec").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1552,6 +1643,9 @@ fn big_argument(dir: &Path, full: usize) {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_line_is_split_through_env_and_its_options() {
+	if !with_room_to_refuse("a_refused_line_is_split_through_env_and_its_options").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1599,6 +1693,9 @@ async fn a_refused_line_is_split_through_env_and_its_options() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_line_is_split_through_nohup() {
+	if !with_room_to_refuse("a_refused_line_is_split_through_nohup").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1623,6 +1720,9 @@ async fn a_refused_line_is_split_through_nohup() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_line_is_split_through_ifne() {
+	if !with_room_to_refuse("a_refused_line_is_split_through_ifne").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1646,6 +1746,9 @@ async fn a_refused_line_is_split_through_ifne() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_line_is_split_through_timeout() {
+	if !with_room_to_refuse("a_refused_line_is_split_through_timeout").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	let (_long, sh) = sh_at_a_long_path();
@@ -1717,6 +1820,9 @@ async fn a_refused_line_is_split_through_timeout() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_callers_debug_and_err_traps_do_not_run_in_xargs_commands() {
+	if !with_room_to_refuse("the_callers_debug_and_err_traps_do_not_run_in_xargs_commands").await {
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let words = words_past_a_full_line(dir.path());
 	std::fs::write(dir.path().join("two"), "1\n2\n").unwrap();
