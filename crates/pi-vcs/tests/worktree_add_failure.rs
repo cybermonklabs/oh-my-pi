@@ -167,3 +167,46 @@ fn a_failed_add_into_an_existing_empty_directory_leaves_it_empty() {
 	assert_eq!(fs::read_dir(&target).map(|entries| entries.count()).ok(), Some(0));
 	assert_eq!(registrations(&source), Vec::<String>::new());
 }
+
+/// A clone copies the source root's mode onto the tree. From a source whose
+/// root is 0500 and holds nothing but `.git`, the clone leaves the tree
+/// unwritable and its add fails; the plain checkout that follows still gets
+/// a tree it can write.
+#[cfg(unix)]
+#[test]
+fn a_failed_clone_leaves_the_checkout_a_writable_tree() {
+	use std::os::unix::fs::PermissionsExt;
+	let temp = tempfile::tempdir().unwrap();
+	if !clone_works_on(temp.path()) {
+		eprintln!("SKIP: no working clone backend on this filesystem");
+		return;
+	}
+	let source = temp.path().join("source");
+	fs::create_dir(&source).unwrap();
+	git(&source, &["init", "-q", "-b", "main"]);
+	for (key, value) in
+		[("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")]
+	{
+		git(&source, &["config", key, value]);
+	}
+	git(&source, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+	git(&source, &["read-tree", "HEAD"]);
+	let repo = GitRepo::require(&source).unwrap();
+	fs::set_permissions(&source, fs::Permissions::from_mode(0o500)).unwrap();
+	if fs::write(source.join("probe"), "").is_ok() {
+		fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+		eprintln!("SKIP: running as root, where a 0500 directory is still writable");
+		return;
+	}
+	let target = temp.path().join("target");
+	let result = repo.worktree_add(&target, "HEAD", WorktreeAddOptions {
+		detach:       true,
+		clone:        WorktreeClone::Auto,
+		keep_changes: false,
+		lock:         None,
+	});
+	fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+	let result = result.unwrap_or_else(|err| panic!("the add failed: {err}"));
+	assert!(target.join(".git").is_file(), "{result:?}");
+	assert_eq!(git(&target, &["rev-parse", "HEAD"]), git(&source, &["rev-parse", "HEAD"]));
+}

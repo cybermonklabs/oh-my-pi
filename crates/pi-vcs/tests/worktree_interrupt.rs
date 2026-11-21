@@ -77,6 +77,9 @@ fn fixture(count: usize, tracked: bool) -> (TempDir, PathBuf, GitRepo) {
 		("commit.gpgsign", "false"),
 		("core.excludesFile", ".git/no-global-excludes"),
 		("core.hooksPath", ".git/hooks"),
+		// 10,000 loose objects pass `gc.auto`'s threshold, and a background
+		// `git gc --auto` would pack and delete them under a running add.
+		("gc.auto", "0"),
 	] {
 		git(&source, &["config", key, value]);
 	}
@@ -394,6 +397,37 @@ fn an_add_refuses_a_killed_adds_tree_holding_a_repository_of_its_own() {
 		.to_string();
 	assert!(refused.contains("`.git` that is not this registration's"), "{refused}");
 	assert_eq!(git(&target, &["log", "-1", "--format=%s"]), "mine", "the repository was removed");
+	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
+}
+
+/// Someone cloned a repository below the root of the killed add's tree and
+/// committed there: an add of the path refuses, as git refuses a path that
+/// exists, and the clone and its commit stay.
+#[test]
+fn an_add_refuses_a_killed_adds_tree_with_a_repository_cloned_below_its_root() {
+	let (_temp, source, repo, target) = abandoned();
+	let dep = target.join("vendor/dep");
+	fs::create_dir_all(target.join("vendor")).unwrap();
+	git(&target.join("vendor"), &["clone", "-q", source.to_str().unwrap(), "dep"]);
+	fs::write(dep.join("my-work.txt"), "committed after the add was killed\n").unwrap();
+	git(&dep, &["add", "my-work.txt"]);
+	git(&dep, &[
+		"-c",
+		"user.name=T",
+		"-c",
+		"user.email=t@example.com",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-qm",
+		"unpushed",
+	]);
+	let refused = repo
+		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
+		.unwrap_err()
+		.to_string();
+	assert!(refused.contains("holds a repository below its root"), "{refused}");
+	assert_eq!(git(&dep, &["log", "-1", "--format=%s"]), "unpushed", "the clone was removed");
 	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
 }
 

@@ -49,6 +49,7 @@ pub fn prepare_destination(
 
 /// Whether `path` is a directory, not a link to one, with no entries: a
 /// destination a clone fills in place rather than replaces.
+#[cfg(any(target_os = "linux", windows))]
 pub fn is_empty_dir(path: &Path) -> bool {
 	fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 		&& fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())

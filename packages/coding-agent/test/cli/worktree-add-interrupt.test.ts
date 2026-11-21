@@ -30,6 +30,8 @@ describe.skipIf(process.platform === "win32")("omp worktree add after an add tha
 				Array.from({ length: 10 }, (_, file) => Bun.write(path.join(dirPath, `f${file}`), `${dir} ${file}\n`)),
 			);
 		}
+		// No background `git gc --auto` packs the loose objects under a running add.
+		await $`git -C ${repo} config gc.auto 0`.quiet();
 		await $`git -C ${repo} add .`.quiet();
 		await $`git -C ${repo} -c user.name=Probe -c user.email=probe@example.invalid -c commit.gpgsign=false commit -qm probe`.quiet();
 	});
