@@ -165,6 +165,7 @@ pub(super) fn reference() -> Option<PathBuf> {
 	let Some((path, version)) = found else {
 		let required = std::env::var_os("RSYNC_REFERENCE_REQUIRED").is_some_and(|v| !v.is_empty());
 		assert!(!required, "no rsync 3.5.1 on PATH, and RSYNC_REFERENCE_REQUIRED is set");
+		eprintln!("skipped: no rsync 3.5.1 on PATH");
 		return None;
 	};
 	let missing: Vec<&str> = ["xxh128", "lz4", "zstd"].into_iter().filter(|name| !version.contains(name)).collect();

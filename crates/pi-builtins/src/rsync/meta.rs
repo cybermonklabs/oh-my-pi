@@ -1516,7 +1516,10 @@ mod tests {
 					tree.remove_xattr(rel, OsStr::new(XSTAT_ATTR), false).unwrap();
 					true
 				},
-				Err(err) if is_no_xattr(&err) || err.kind() == io::ErrorKind::PermissionDenied => false,
+				Err(err) if is_no_xattr(&err) || err.kind() == io::ErrorKind::PermissionDenied => {
+					eprintln!("skipped: the temporary filesystem refuses rsync's stat xattr: {err}");
+					false
+				},
 				Err(err) => panic!("set_xattr: {err}"),
 			}
 		}
