@@ -319,10 +319,12 @@ impl FifoEnd {
 #[cfg(unix)]
 const FIFO_RELEASE_ATTEMPTS: usize = 10;
 
-/// A non-blocking open of the other end of the FIFO a [`FifoOpening`] opens,
-/// closed at once; `ENXIO` while no open of this end waits yet.
+/// A non-blocking open of the other end of the FIFO a [`FifoOpening`] opens;
+/// `ENXIO` while no open of this end waits yet. The end it returns stays
+/// open until the wait for the helper's answer ends, so a helper that
+/// reaches its `open` during that wait connects to it.
 #[cfg(unix)]
-pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync>;
 
 /// One end of a FIFO being opened on a helper thread, so that the wait for
 /// the other end observes a token and, for async callers, holds no runtime
@@ -370,8 +372,10 @@ impl FifoOpening {
 	) -> io::Result<Self> {
 		let (scope, owned_path, options) = (scope.clone(), path.to_path_buf(), options.clone());
 		let release_path = path.to_path_buf();
-		let release: FifoRelease =
-			Arc::new(move || native::open(&release_path, &end.release_options()).map(drop));
+		let release: FifoRelease = Arc::new(move || {
+			native::open(&release_path, &end.release_options())
+				.map(|end| Box::new(end) as Box<dyn Send>)
+		});
 		Self::spawn(
 			move || native_open(&scope, &owned_path, &options),
 			release,
@@ -469,17 +473,23 @@ impl Drop for FifoOpening {
 	/// Releases an open dropped before it ended. The first attempt runs here,
 	/// so the release is done, and the helper's descriptor closed, before what
 	/// follows the drop (the next command) opens this FIFO; it takes
-	/// microseconds. A helper that has not reached `open` yet is left to a
-	/// detached thread, so that no runtime worker waits for it.
+	/// microseconds. A helper that has not reached `open` yet, one slice into
+	/// the attempt, is left to a detached thread that tries again, so that no
+	/// runtime worker waits for it and the helper takes no later connection.
 	fn drop(&mut self) {
+		use std::sync::mpsc::RecvTimeoutError;
 		if self.settled || !self.releasable {
 			return;
 		}
 		match (self.release)() {
-			Ok(()) => {
-				// The helper's open returns as soon as it sees the release.
-				let _ = self.opened.recv_timeout(POLL_SLICE);
-				return;
+			Ok(held) => {
+				// The helper's open returns as soon as it sees the release,
+				// which stays open while this waits.
+				let answer = self.opened.recv_timeout(POLL_SLICE);
+				drop(held);
+				if !matches!(answer, Err(RecvTimeoutError::Timeout)) {
+					return;
+				}
 			},
 			Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
 			Err(_) => return,
@@ -497,7 +507,7 @@ impl Drop for FifoOpening {
 /// Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
 #[cfg(unix)]
 fn release_fifo_open(
-	release: &(dyn Fn() -> io::Result<()> + Send + Sync),
+	release: &(dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) {
 	for _ in 0..FIFO_RELEASE_ATTEMPTS {
@@ -508,22 +518,24 @@ fn release_fifo_open(
 }
 
 /// One attempt to release a helper's open of one end of a FIFO: a
-/// non-blocking open of the other end (`release`), then a wait of one poll
-/// slice for the helper's result, which is dropped. `false` when another
-/// attempt is due: the helper has not reached `open` yet (`ENXIO`) and has
-/// not answered.
+/// non-blocking open of the other end (`release`), kept open while this waits
+/// one poll slice for the helper's result, which is dropped. `false` when
+/// another attempt is due: the helper has not answered (it has not reached
+/// `open` yet, or, for a writer's release, `ENXIO`).
 #[cfg(unix)]
 fn release_attempt(
-	release: &(dyn Fn() -> io::Result<()> + Send + Sync),
+	release: &(dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) -> bool {
 	use std::sync::mpsc::RecvTimeoutError;
-	if let Err(err) = release()
-		&& err.raw_os_error() != Some(libc::ENXIO)
-	{
-		return true;
-	}
-	!matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout))
+	let held = match release() {
+		Ok(held) => Some(held),
+		Err(err) if err.raw_os_error() == Some(libc::ENXIO) => None,
+		Err(_) => return true,
+	};
+	let answered = !matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout));
+	drop(held);
+	answered
 }
 
 /// Test seam: a hook a test sets for the next FIFO helper, run on the

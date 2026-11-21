@@ -8,10 +8,12 @@
 //! [`Fs::open_dir`] and [`BlockingFs::open_dir`](crate::BlockingFs::open_dir)
 //! open a [`DirHandle`]:
 //!
-//! - On the host it holds a descriptor (Unix) or handle (Windows), and each
-//!   call is one `*at` syscall relative to it (`openat`, `fstatat`, `unlinkat`,
-//!   ...; `NtCreateFile` with a root directory on Windows, whose module says
-//!   which calls go through the directory's path there).
+//! - On the host it holds a descriptor (Unix) or handle (Windows), and its
+//!   calls are syscalls relative to it where implemented (`openat`, `fstatat`,
+//!   `unlinkat`, ...; `NtCreateFile` with a root directory on Windows): most
+//!   are one call, a listing loops over its reads, a directory open can probe
+//!   and stat, a masked creation sets the mode again, and the Windows module
+//!   says which calls go through the directory's path there.
 //! - On a provider it holds the directory's path and the facade it came from.
 //!   Each call joins the entry's name to that path ([`child_path`]) and makes
 //!   the facade's call on it, so providers need no extra trait methods; they
@@ -23,8 +25,9 @@
 //! [`BlockingFs`](crate::BlockingFs) drives it, see the crate docs) and the
 //! `_async` twin awaits it. An entry name is one component: an empty name,
 //! `.`, `..` and a name holding a separator (`/`; on Windows `\` too) are
-//! refused with [`io::ErrorKind::InvalidInput`]. [`DirHandle::open_parent`]
-//! climbs.
+//! refused with [`io::ErrorKind::InvalidInput`], and on Windows a name holding
+//! `:` too, which would name a drive (`C:x`) or a stream of another entry
+//! (`a:s`). [`DirHandle::open_parent`] climbs.
 //!
 //! Tree walkers (`pi-walker`) use the rest of this module:
 //! [`DirHandle::list_into`] reads a listing into a reusable [`Listing`];
@@ -210,26 +213,36 @@ impl fmt::Debug for DirHandle {
 	}
 }
 
-/// `name`'s bytes when it is one entry name: exactly one normal path
-/// component, so not empty, `.` or `..`, holding no separator, and on Windows
-/// carrying no drive or UNC prefix (`C:x`, which a join to a directory's path
-/// would turn into that drive's current directory). On Unix the byte checks
-/// are that rule; Windows also parses the name, for its prefixes.
+/// `name`'s bytes when it is one entry name: not empty, `.` or `..`, holding
+/// no separator, and on Windows no `:`, which would make the name a drive's
+/// current directory (`C:x`, which a join to a directory's path turns into
+/// that) or a stream of another entry (`a:s`, `x::$INDEX_ALLOCATION`).
 fn entry_name(name: &OsStr) -> io::Result<&[u8]> {
 	let bytes = name.as_encoded_bytes();
-	let refused = matches!(bytes, b"" | b"." | b"..") || bytes.iter().any(|&b| is_rel_separator(b));
-	#[cfg(windows)]
-	let refused = refused || {
-		let mut parts = Path::new(name).components();
-		!matches!(
-			(parts.next(), parts.next()),
-			(Some(std::path::Component::Normal(part)), None) if part == name
-		)
-	};
+	let refused = matches!(bytes, b"" | b"." | b"..")
+		|| bytes
+			.iter()
+			.any(|&b| is_rel_separator(b) || (cfg!(windows) && b == b':'));
 	if refused {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name"));
 	}
 	Ok(bytes)
+}
+
+/// Refuses `O_DIRECTORY` in an open's custom flags: a directory opens only
+/// through [`DirHandle::open_dir_at`], which refuses a symlink also on a
+/// kernel that follows one despite `O_NOFOLLOW` when `O_DIRECTORY` is set, and
+/// on a path handle, the facade's open would open the directory. (Windows
+/// custom flags have no such flag.)
+#[cfg(unix)]
+fn refuse_directory_flag(options: &OpenOptions) -> io::Result<()> {
+	if options.get_custom_flags() & libc::O_DIRECTORY != 0 {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"open_at opens no directory: open it with open_dir_at",
+		));
+	}
+	Ok(())
 }
 
 /// Refuses a path that is not walk-relative: empty, or with an empty, `.`, or
@@ -587,7 +600,9 @@ fn host_fifo_open(
 	let (open_dir, open_name, options, mask) =
 		(Arc::clone(&dir), name.to_vec(), options.clone(), host_mask(scope));
 	let (release_name, writer) = (name.to_vec(), end.released_by_writer());
-	let release: FifoRelease = Arc::new(move || native::touch_fifo_at(&dir, &release_name, writer));
+	let release: FifoRelease = Arc::new(move || {
+		native::touch_fifo_at(&dir, &release_name, writer).map(|end| Box::new(end) as Box<dyn Send>)
+	});
 	FifoOpening::spawn(
 		move || {
 			with_scratch(|s| native::open_at(s, &open_dir, &open_name, &options, mask)).map(File::from)
@@ -816,6 +831,8 @@ impl DirHandle {
 	/// wait.
 	pub fn open_at(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
 		let bytes = entry_name(name)?;
+		#[cfg(unix)]
+		refuse_directory_flag(options)?;
 		self.call(
 			|s, handle, scope| host_open_at(s, handle, scope, bytes, options),
 			|provided| provider_open_at(provided, name, options),
@@ -829,6 +846,8 @@ impl DirHandle {
 	/// As for [`Self::open_at`].
 	pub async fn open_at_async(&self, name: &OsStr, options: &OpenOptions) -> io::Result<File> {
 		let bytes = entry_name(name)?;
+		#[cfg(unix)]
+		refuse_directory_flag(options)?;
 		match &self.repr {
 			DirRepr::Host { handle, scope } => host_open_at_async(handle, scope, bytes, options).await,
 			DirRepr::Provider(provided) => provider_open_at(provided, name, options).await,
