@@ -324,10 +324,14 @@ mod unix {
 		}
 
 		/// Deliver the OS signals caught since the last call to the root
-		/// vproc; one the kernel sent the whole process group as
-		/// [`SigTarget::Group`] ([`batch`]).
+		/// vproc: one the kernel sent the whole process group as
+		/// [`SigTarget::Group`] ([`batch`]), any other as
+		/// [`SigTarget::Outside`].
 		pub fn dispatch(ctl: &ControlHandle, root: Vpid) {
 			let pending = PENDING.swap(0, Ordering::AcqRel);
+			if pending == 0 {
+				return;
+			}
 			// Those of this batch; a later delivery's mark stays for the next.
 			let kernel = FROM_KERNEL.fetch_and(!pending, Ordering::AcqRel) & pending;
 			// SAFETY: getsid and getpid take no pointer and cannot fail here.
@@ -337,7 +341,7 @@ mod unix {
 					let target = if group {
 						SigTarget::Group(root)
 					} else {
-						SigTarget::Vpid(root)
+						SigTarget::Outside(root)
 					};
 					ctl.signal(target, signal);
 				}

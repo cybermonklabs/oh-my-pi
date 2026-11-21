@@ -703,9 +703,10 @@ pub fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// Let the externals `vp`'s frames wait for outlive it: the shell's own end
 /// after a signal it caught leaves its foreground command running, as bash's
-/// `termsig_handler` and zsh's `zexit` do ([`crate::bash::ExtProc::release`]).
-/// Every other end of a vproc (cancel, a host's stop) still ends them.
-fn release_externals(vp: &mut Vproc) {
+/// `termsig_handler` and zsh's `zexit` do ([`crate::bash::ExtProc::release`]);
+/// so do the vprocs of that command (`Shell::release_foreground`). Every
+/// other end of a vproc (cancel, a host's stop) still ends them.
+pub(super) fn release_externals(vp: &mut Vproc) {
 	for frame in &mut vp.frames {
 		if let Some(sc) = frame.scratch.as_mut()
 			&& let super::proc::Live::Ext(ext) = &mut sc.live
@@ -2390,6 +2391,7 @@ pub fn start_sub(
 			k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 			k.spawned.push(Box::new(child));
 			sc.sub = Some(PendingSub::Fork { vpid, capture });
+			super::wait_starts(k, cx, vp);
 			Flow::Block(WaitKey::Proc(vpid))
 		},
 		ComsubForm::NoFork | ComsubForm::Value => {
@@ -2739,6 +2741,8 @@ pub fn settle_sub(
 				sc.sub = Some(PendingSub::Fork { vpid, capture });
 				return Some(Flow::Block(WaitKey::Proc(vpid)));
 			};
+			// The root that read it acts now on an `INT` it noted meanwhile.
+			super::end_held_sigint(k, vp, true);
 			// zsh's `readoutput` trims the output itself; `=(…)` keeps it.
 			(capture.take(), status, vp.mode.dialect() == Dialect::Zsh)
 		},
@@ -4282,10 +4286,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			},
 		}
 		scratch(vp).children = children.into_iter().map(|v| (v, None)).collect();
-		// bash `wait_for` clears `wait_sigint_received` as each wait starts.
-		if vp.parent.is_none() {
-			k.held_sigint = None;
-		}
+		super::wait_starts(k, cx, vp);
 	}
 	let status = vp.status;
 	let sc = scratch(vp);
@@ -4306,8 +4307,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		statuses.push(last);
 	}
 	clear_scratch(&mut k.root, cx.store, vp);
-	// The job's end decides on an `INT` the root held for it.
-	super::end_held_sigint(k, vp);
+	// The job's end decides on an `INT` the vproc held for it.
+	super::end_held_sigint(k, vp, false);
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
 		super::jobctl::fg_done(k, cx, vp, None, b"");
 	}

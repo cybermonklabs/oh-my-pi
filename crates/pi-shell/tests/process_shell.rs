@@ -930,22 +930,31 @@ struct SentCase {
 	end:    End,
 }
 
+/// One run of `script` as `shell` by `program`, which gets `sig` (to its
+/// process group with `group`) once the command it waits for has made
+/// `$F`; the real shell (`real`) only once it has also blocked
+/// ([`Run::when_blocked`]).
+fn sent(
+	program: &OsStr,
+	shell: &'static str,
+	script: &str,
+	sig: libc::c_int,
+	group: bool,
+	real: bool,
+) -> Outcome {
+	let dir = tempfile::tempdir().expect("a directory for the start file");
+	let started = dir.path().join("started");
+	let run = Run::script(program, shell, script).env("F", &started);
+	let run = if group { run.own_group() } else { run };
+	let run = if real { run.when_blocked() } else { run };
+	run.go_signalled(&started, sig, group)
+}
+
 /// Run each case under obash and, where it exists, the real shell: both
 /// print the same and end the same.
 fn run_sent(cases: Vec<SentCase>) {
-	let dir = tempfile::tempdir().expect("a directory for the start file");
-	let started = dir.path().join("started");
 	for SentCase { shell, script, sig, group, stdout, end } in cases {
-		// The real shell signalled only once it has blocked
-		// ([`Run::when_blocked`]).
-		let run = |program: &OsStr, real: bool| {
-			let _ = fs::remove_file(&started);
-			let run = Run::script(program, shell, &script).env("F", &started);
-			let run = if group { run.own_group() } else { run };
-			let run = if real { run.when_blocked() } else { run };
-			run.go_signalled(&started, sig, group)
-		};
-		let ours = run(OsStr::new(env!("CARGO_BIN_EXE_obash")), false);
+		let ours = sent(OsStr::new(env!("CARGO_BIN_EXE_obash")), shell, &script, sig, group, false);
 		let shown = format!(
 			"{shell}: {script}, signal {sig} to the {}",
 			if group { "group" } else { "shell" }
@@ -956,7 +965,7 @@ fn run_sent(cases: Vec<SentCase>) {
 			"{shown}: {ours:?}"
 		);
 		if let Some(real) = real(shell) {
-			let theirs = run(real.as_os_str(), true);
+			let theirs = sent(real.as_os_str(), shell, &script, sig, group, true);
 			assert_eq!(
 				(&ours.stdout, ours.end()),
 				(&theirs.stdout, theirs.end()),
@@ -974,7 +983,8 @@ fn run_sent(cases: Vec<SentCase>) {
 /// its own for (`TERM`) or holds ignored for itself (`QUIT`), and the shell
 /// ends as the program does. zsh's `HUP` handler and bash's EXIT trap went
 /// with the shell: a server the program runs goes on after a `HUP` it
-/// handles. zsh runs a last `( … )` in place too. The program makes `$F`
+/// handles. zsh runs a last `( … )` in place too, and a trap set in it is
+/// the process's: it runs, and the shell goes on. The program makes `$F`
 /// once it has started.
 #[test]
 fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
@@ -982,6 +992,7 @@ fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 	let server = "/bin/sh -c 'trap \"echo reload\" HUP; : > \"$F\"; /bin/sleep 1; echo done'";
 	let counter =
 		"/bin/sh -c 'trap \"echo got\" HUP TERM QUIT; : > \"$F\"; /bin/sleep 1; echo done'";
+	let waits = "/bin/sh -c ': > \"$F\"; /bin/sleep 1'";
 	let case = |shell, script: String, sig, stdout, end| SentCase {
 		shell,
 		script,
@@ -996,6 +1007,20 @@ fn a_signal_to_the_shell_reaches_the_program_it_runs_in_place() {
 		case("zsh", format!("true; {program}"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
 		case("zsh", server.into(), libc::SIGHUP, b"reload\ndone\n", Exit(0)),
 		case("zsh", format!("( {program} )"), libc::SIGHUP, b"", Signal(libc::SIGHUP)),
+		case(
+			"zsh",
+			format!("( trap 'print got' TERM; {waits}; print after )"),
+			libc::SIGTERM,
+			b"got\nafter\n",
+			Exit(0),
+		),
+		case(
+			"zsh",
+			format!("( trap 'print h' HUP; {waits}; print after )"),
+			libc::SIGHUP,
+			b"h\nafter\n",
+			Exit(0),
+		),
 		case("zsh", counter.into(), libc::SIGTERM, b"got\ndone\n", Exit(0)),
 		case("zsh", counter.into(), libc::SIGQUIT, b"got\ndone\n", Exit(0)),
 		case("bash", counter.into(), libc::SIGTERM, b"got\ndone\n", Exit(0)),
@@ -1085,14 +1110,18 @@ fn an_execd_program_leaves_no_exit_trap_to_run() {
 	}
 }
 
-/// bash with an EXIT trap catches `INT` (`terminating_signals`), but while
-/// it waits for a foreground command without job control it only notes one
-/// (`wait_sigint_handler`): once the command has ended it acts on it (runs
-/// the trap, then dies of `SIGINT`) only if the command died of `SIGINT`
-/// too; else the command caught it and the script goes on. A subshell, or a
-/// pipeline stage that is shell code, dies of the `INT` the group gets, so
-/// bash acts on it; under `set -m` bash acts at once. The command makes `$F`
-/// once it has started.
+/// bash catches `INT` for each wait without job control (`wait_for`'s
+/// `wait_sigint_handler`), EXIT trap or not: while it waits for a
+/// foreground command it only notes one, and once the command has ended it
+/// acts on it (runs the EXIT trap, then dies of `SIGINT`) only if the last
+/// process of it to end died of `SIGINT`; else the command caught it and
+/// the script goes on. Each stage, subshell and command substitution is a
+/// bash process of its own in the group: one that runs shell code dies of
+/// the `INT` the group gets at once, one that waits for a command holds it
+/// by the same rule. Reading a command substitution's output bash with an
+/// EXIT trap acts once the substitution has ended, whatever its command
+/// did, and without one at once. Under `set -m` bash acts at once. The
+/// command makes `$F` once it has started.
 #[test]
 fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	let child =
@@ -1111,6 +1140,13 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// which it removes for the next run.
 	let last = "/bin/sh -c 'until [ -e \"$F.a\" ]; do /bin/sleep 0.01; done; rm -f \"$F.a\"; : > \
 	            \"$F\"; exec /bin/cat'";
+	// A command that catches `INT` and outlives it by a second (its `sleep`
+	// runs in the background, which ignores `INT`): it prints `child-int` on
+	// the signal and `child-done` at its end; `quiet` prints only the latter.
+	let hold = "/bin/sh -c 'trap \"echo child-int\" INT; : > \"$F\"; /bin/sleep 1 & wait $!; wait \
+	            $!; echo child-done'";
+	let quiet =
+		"/bin/sh -c 'trap : INT; : > \"$F\"; /bin/sleep 1 & wait $!; wait $!; echo child-done'";
 	run_sent(vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
@@ -1164,6 +1200,62 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"x\n",
 			died,
 		),
+		// A stage of shell code dies of the `INT` at once (`… | while read`,
+		// `while …; done | …`), and the command that caught it ends last; a
+		// stage or a subshell that waits for that command goes on.
+		case(
+			format!("trap 'echo x' EXIT; {quiet} | while read l; do echo got $l; done; echo after"),
+			true,
+			b"after\nx\n",
+			Exit(0),
+		),
+		case(
+			format!("trap 'echo x' EXIT; while :; do /bin/sleep 0.2; done | {hold}; echo after"),
+			true,
+			b"child-int\nchild-done\nafter\nx\n",
+			Exit(0),
+		),
+		case(
+			format!("trap 'echo x' EXIT; {{ {quiet}; }} | cat; echo after"),
+			true,
+			b"after\nx\n",
+			Exit(0),
+		),
+		case(
+			format!("trap 'echo x' EXIT; ( {hold}; echo more ); echo after"),
+			true,
+			b"child-int\nchild-done\nmore\nafter\nx\n",
+			Exit(0),
+		),
+		// The command of a substitution writes to fd 3, the run's output.
+		case(
+			format!("trap 'echo x' EXIT; exec 3>&1; v=$({hold} >&3); echo after $v"),
+			true,
+			b"child-int\nchild-done\nx\n",
+			died,
+		),
+		// No EXIT trap: the same holds.
+		case(format!("{hold}; echo after"), true, b"child-int\nchild-done\nafter\n", Exit(0)),
+		case(format!("{hold}; echo after"), false, b"child-done\nafter\n", Exit(0)),
+		case(
+			format!("{quiet} | while read l; do echo got $l; done; echo after"),
+			true,
+			b"after\n",
+			Exit(0),
+		),
+		case(
+			format!("( {hold}; echo more ); echo after"),
+			true,
+			b"child-int\nchild-done\nmore\nafter\n",
+			Exit(0),
+		),
+		case("/bin/sh -c ': > \"$F\"; exec /bin/sleep 3'; echo after".into(), true, b"", died),
+		case(
+			format!("exec 3>&1; v=$({hold} >&3); echo after $v"),
+			true,
+			b"child-int\nchild-done\n",
+			died,
+		),
 		// Under `set -m` bash holds nothing (its child, in a group of its own,
 		// gets nothing either).
 		case(
@@ -1179,10 +1271,18 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 
 /// A signal the shell catches ends it (bash's EXIT trap, zsh's `HUP`
 /// handler) while it waits for a foreground command: the command outlives
-/// the shell, as bash's `termsig_handler` and zsh's `zexit` leave it. The
-/// command makes `$F`, then prints `child-done` a second later, which the
-/// run reads to the end of its output. One the shell does not catch ends it
-/// at its default action, and the command goes on too.
+/// the shell, as bash's `termsig_handler` and zsh's `zexit` leave it, and so
+/// does the command of a `( … )`. The command makes `$F`, then prints
+/// `child-done` a second later, which the run reads to the end of its
+/// output. One the shell does not catch ends it at its default action, and
+/// the command goes on too.
+///
+/// A known difference, until `fix/shell-external-stages-share-a-kernel-pipe`
+/// (INFRA-1484's architect ruled so on 2026-11-21 at 03:22Z): obash joins
+/// two external stages with a pipe its own process pumps (`mem::pipe`,
+/// `vm/exec.rs`), so the output a stage writes after the shell died is
+/// lost, where bash's and zsh's stages share a kernel pipe. The rows of
+/// `child | cat` assert both outputs; the fix makes obash's fail.
 #[test]
 fn a_caught_signal_that_ends_the_shell_leaves_its_foreground_command_running() {
 	let child =
@@ -1199,6 +1299,13 @@ fn a_caught_signal_that_ends_the_shell_leaves_its_foreground_command_running() {
 		case(
 			"bash",
 			format!("trap 'echo x' EXIT; {child}; echo after"),
+			libc::SIGTERM,
+			b"x\nchild-done\n",
+			Signal(libc::SIGTERM),
+		),
+		case(
+			"bash",
+			format!("trap 'echo x' EXIT; ( {child} ); echo after"),
 			libc::SIGTERM,
 			b"x\nchild-done\n",
 			Signal(libc::SIGTERM),
@@ -1240,6 +1347,42 @@ fn a_caught_signal_that_ends_the_shell_leaves_its_foreground_command_running() {
 			Signal(libc::SIGTERM),
 		),
 	]);
+	// The known difference (above): the real shell's output and obash's.
+	for (shell, script, sig, theirs, ours, end) in [
+		(
+			"bash",
+			format!("trap 'echo x' EXIT; {child} | cat; echo after"),
+			libc::SIGTERM,
+			"x\nchild-done\n",
+			"x\n",
+			Signal(libc::SIGTERM),
+		),
+		(
+			"zsh",
+			format!("trap 'print x' EXIT; {child} | cat; print after"),
+			libc::SIGHUP,
+			"x\nchild-done\n",
+			"x\n",
+			Exit(1),
+		),
+		("zsh", format!("{child} | cat; print after"), libc::SIGHUP, "child-done\n", "", Exit(1)),
+	] {
+		let shown = format!("{shell}: {script}, signal {sig} to the shell");
+		let lost = sent(OsStr::new(env!("CARGO_BIN_EXE_obash")), shell, &script, sig, false, false);
+		assert_eq!(
+			(String::from_utf8_lossy(&lost.stdout), lost.end()),
+			(ours.into(), Some(end)),
+			"{shown}"
+		);
+		if let Some(real) = real(shell) {
+			let kept = sent(real.as_os_str(), shell, &script, sig, false, true);
+			assert_eq!(
+				(String::from_utf8_lossy(&kept.stdout), kept.end()),
+				(theirs.into(), Some(end)),
+				"{shown}"
+			);
+		}
+	}
 }
 
 /// An interactive shell's `HUP` from outside, with an EXIT trap that

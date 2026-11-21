@@ -1102,8 +1102,8 @@ struct WinProc {
 	inner:    Arc<Inner>,
 	tracker:  Arc<Tracker>,
 	shared:   Arc<Shared>,
-	/// [`crate::bash::Lineage::detached`]: dropping it while it runs leaves
-	/// the job alone.
+	/// [`crate::bash::Lineage::detached`], or [`ExtProc::release`]d: dropping
+	/// it while it runs leaves the job alone.
 	detached: bool,
 	/// The child's pumps and the shared input feeds it holds (kept open
 	/// while this lives), driven by `poll_wait`.

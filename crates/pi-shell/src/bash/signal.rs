@@ -487,6 +487,10 @@ pub enum SigTarget {
 	/// terminal's `INT`, `QUIT` or hangup `HUP`): a program it runs in place
 	/// of itself, in that group too, has the signal from the kernel already.
 	Group(Vpid),
+	/// One virtual process, as another process signalled its OS process
+	/// (`SI_USER`: a `kill`): that process alone, or its whole process group
+	/// (`kill -INT -PGID`, `timeout`), which the signal does not tell apart.
+	Outside(Vpid),
 	/// Every process of a job (and its externals' process group).
 	Job(JobId),
 	/// Every virtual process of the shell.

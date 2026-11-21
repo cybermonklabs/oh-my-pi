@@ -1561,8 +1561,9 @@ struct UnixProc {
 	scope:    Scope,
 	tracker:  Arc<Tracker>,
 	shared:   Arc<Shared>,
-	/// [`crate::bash::Lineage::detached`]: dropping it while it runs releases
-	/// the process instead of escalating TERM → KILL.
+	/// [`crate::bash::Lineage::detached`], or [`ExtProc::release`]d: dropping
+	/// it while it runs releases the process instead of escalating TERM →
+	/// KILL.
 	detached: bool,
 	/// The child's pumps and the shared input feeds it holds (kept open
 	/// while this lives), driven by `poll_wait`.
@@ -1664,8 +1665,9 @@ impl ExtProc for UnixProc {
 		self.scope.signal(Signal::Cont)
 	}
 
-	/// Drop then releases it as a detached one ([`Self::detached`]); its
-	/// scope stays recorded, so [`kill_leftovers`] still reaches it.
+	/// Drop then releases it as a detached one ([`Self::detached`]). Its
+	/// scope stays recorded: [`kill_leftovers`] (which only the test kit
+	/// calls) still reaches it; nothing else ends it.
 	fn release(&mut self) {
 		self.detached = true;
 	}

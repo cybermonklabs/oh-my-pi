@@ -27,12 +27,17 @@
 //! - bash with an EXIT trap, interactive or not: once one is set its
 //!   `terminating_signals` are caught (`set_signal` →
 //!   `initialize_terminating_signals`), unless ignored on entry, and one of
-//!   them runs the trap, then kills the shell (`termsig_handler`). While the
-//!   root waits, without job control, for a foreground job of externals only
-//!   (one it runs itself, or a pipeline of them), an `INT` waits for the job:
-//!   the shell acts on it only if no process of the job ended other than by
-//!   `SIGINT` (`jobs.c` `wait_for`: `wait_sigint_handler` when `job_control ==
-//!   0`, `child_caught_sigint`; [`Untrapped::BashExitTrapAfterChild`]). A host
+//!   them runs the trap, then kills the shell (`termsig_handler`).
+//! - bash catches `INT` for each wait without job control (`jobs.c`
+//!   `wait_for`'s `wait_sigint_handler`), EXIT trap or not: a shell, or a
+//!   subshell, that waits for its foreground job notes it, and acts on it once
+//!   the job has ended, only if the last process of the job to end died of
+//!   `SIGINT` (`child_caught_sigint`, which `waitchld` sets again for each
+//!   child it reaps; [`Untrapped::Held`]); else it goes on. One that runs shell
+//!   code meanwhile acts at once. A root with an EXIT trap that reads a command
+//!   substitution acts once the read ends. obash catches it for that
+//!   ([`Own::BashInt`]), and gives the kernel's `INT` to each process of the
+//!   foreground command bash would run (`Shell::int_to_foreground`). A host
 //!   embedded in a runtime lets the shell catch only the signals it hands over
 //!   ([`crate::bash::Host::may_catch`]): the runtime's fault handlers stay.
 //! - Else the signal's default action.
@@ -88,11 +93,10 @@ pub(super) enum Untrapped {
 	ZshHupExit,
 	/// bash: run the EXIT trap, then die of the signal.
 	BashExitTrapThenDie,
-	/// bash, `INT` while the root waits, without job control, for a
-	/// foreground job of externals only: wait for the job, then act only if
-	/// no process of it ended other than by `SIGINT` (bash
-	/// `wait_sigint_handler`, `child_caught_sigint`; [`super::HeldInt`]).
-	BashExitTrapAfterChild,
+	/// bash, `INT` while the vproc waits without job control for what
+	/// [`super::HeldInt`] says: noted, to act on once the wait ends
+	/// ([`super::Kernel::int_notes`]).
+	Held(super::HeldInt),
 	/// The signal's default action.
 	Default,
 }
@@ -108,6 +112,10 @@ enum Own {
 	ZshHup,
 	/// bash's catch of a terminating signal once an EXIT trap is set.
 	BashExitTrap,
+	/// bash's catch of `INT` without an EXIT trap, for its waits without job
+	/// control (`wait_sigint_handler`): held while it waits, else at its
+	/// default.
+	BashInt,
 	/// Caught to be forwarded to the program the root's process runs in
 	/// place of the shell ([`program_in_place`]).
 	Program,
@@ -150,13 +158,17 @@ fn own(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> Result<Own, Stor
 		{
 			Own::BashExitTrap
 		},
+		Dialect::Bash if sig == Signal::Int && !cx.host.ignored_signals().contains(sig) => {
+			Own::BashInt
+		},
 		_ => Own::Default,
 	})
 }
 
-/// [`Untrapped`] for `sig`, which `vp` has no trap for ([`own`]);
-/// `externals`: the root waits for a foreground job of externals only (the
-/// engine's `foreground_externals`).
+/// [`Untrapped`] for `sig`, which `vp` has no trap for ([`own`]); `waits`:
+/// what `vp` waits for (the engine's `Shell::waits`), for bash's `INT`
+/// hold, which a subshell always has and the root only without job control
+/// (`set -m`).
 ///
 /// # Errors
 ///
@@ -166,23 +178,28 @@ pub(super) fn decide(
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
 	sig: Signal,
-	externals: bool,
+	waits: Option<super::HeldInt>,
 ) -> Result<Untrapped, StoreError> {
-	Ok(match own(k, cx, vp, sig)? {
+	let own = own(k, cx, vp, sig)?;
+	let held = if sig == Signal::Int && matches!(own, Own::BashExitTrap | Own::BashInt) {
+		let monitor =
+			vp.parent.is_none() && state::option(&mut k.root, cx.store, vp, OptId::Monitor)?;
+		waits.filter(|_| !monitor)
+	} else {
+		None
+	};
+	Ok(match own {
 		// `WINCH` has no handler to run here: its default ignores it.
 		Own::Caught if jobctl::untrapped(k, cx, vp, sig) => Untrapped::Handled,
 		Own::Caught | Own::Program | Own::Default => Untrapped::Default,
 		Own::Ignored => Untrapped::Ignored,
 		Own::ZshHup => Untrapped::ZshHupExit,
-		Own::BashExitTrap => {
-			// bash `wait_for` holds it only when `job_control == 0`.
-			let monitor = state::option(&mut k.root, cx.store, vp, OptId::Monitor)?;
-			if sig == Signal::Int && vp.parent.is_none() && !monitor && externals {
-				Untrapped::BashExitTrapAfterChild
-			} else {
-				Untrapped::BashExitTrapThenDie
-			}
+		// Without an EXIT trap the read of a substitution is no wait.
+		Own::BashInt => match held {
+			Some(held @ super::HeldInt::Job { .. }) => Untrapped::Held(held),
+			_ => Untrapped::Default,
 		},
+		Own::BashExitTrap => held.map_or(Untrapped::BashExitTrapThenDie, Untrapped::Held),
 	})
 }
 
@@ -215,7 +232,7 @@ fn disposition<'a>(
 	Ok(match own(k, cx, vp, sig)? {
 		Own::Caught => Some(BStr::new(CATCH)),
 		Own::Ignored => Some(BStr::new(b"")),
-		Own::ZshHup | Own::BashExitTrap | Own::Program => {
+		Own::ZshHup | Own::BashExitTrap | Own::BashInt | Own::Program => {
 			cx.host.may_catch(sig).then(|| BStr::new(CATCH))
 		},
 		Own::Default => None,
@@ -265,13 +282,14 @@ pub(super) fn program_in_place(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, runn
 	}
 }
 
-/// Whether the root asks the host for `sig`'s disposition: not a subshell,
-/// whose traps change no disposition of the process; not a signal the
-/// platform lacks (number 0: `EMT` on Linux); and not `KILL`, `STOP` or
-/// `CHLD` (which comes from the engine, one per reaped child, not from the
-/// OS).
+/// Whether the root asks the host for `sig`'s disposition: the root's
+/// process (the root, or the zsh `( … )` it runs in place, whose traps are
+/// the process's), not another subshell, whose traps change no disposition
+/// of the process; not a signal the platform lacks (number 0: `EMT` on
+/// Linux); and not `KILL`, `STOP` or `CHLD` (which comes from the engine, one
+/// per reaped child, not from the OS).
 fn asks(k: &Kernel, vp: &Vproc, sig: Signal) -> bool {
-	vp.overlay.is_none()
+	(vp.parent.is_none() || vp.in_place())
 		&& sig.number(k.engine.config().platform) != 0
 		&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
 }
@@ -356,8 +374,9 @@ pub(super) fn bash_exit_trap_set(
 /// ([`MiscKey::HeldIgnored`]: `QUIT`, and in zsh those ignored on entry),
 /// the `trap ''` records of the signals ignored on entry (zsh: `QUIT` alone,
 /// [`MiscKey::ZshEntryIgnored`]; any of them may be trapped), then their
-/// dispositions and zsh's `HUP` catch ([`reinstall_these`]). Commands get
-/// `QUIT` at its default. An interactive shell's own handlers follow
+/// dispositions, zsh's `HUP` catch and bash's `INT` catch for its waits
+/// ([`Own::BashInt`]; [`reinstall_these`]). Commands get `QUIT` at its
+/// default. An interactive shell's own handlers follow
 /// ([`jobctl::init_io`]).
 ///
 /// # Errors
@@ -400,7 +419,11 @@ pub(super) fn init(
 			Some(Record::Trap { mode, action: BString::default() }),
 		);
 	}
-	let own = if zsh { held.with(Signal::Hup) } else { held };
+	let own = if zsh {
+		held.with(Signal::Hup)
+	} else {
+		held.with(Signal::Int)
+	};
 	// A refusal leaves the disposition the process started with.
 	let _ = reinstall_these(k, cx, vp, own.iter())?;
 	Ok(())
@@ -436,6 +459,28 @@ pub(super) fn reinstall_these(
 	vp: &Vproc,
 	signals: impl Iterator<Item = Signal>,
 ) -> Result<Result<(), (Signal, io::Error)>, StoreError> {
+	reask(k, cx, vp, signals, When::NotDefault)
+}
+
+/// The zsh `( … )` that `vp`'s process ran in place of itself has ended: its
+/// traps were the process's ([`asks`]), and the process is `vp`'s again (a
+/// session's root runs its next command). `vp` asks the host again for the
+/// disposition of every signal, its default too.
+pub(super) fn in_place_ended(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) {
+	if let Err(err) = reask(k, cx, vp, Signal::iter(), When::Always) {
+		k.fail(err);
+	}
+}
+
+/// Ask the host for `vp`'s disposition of each of `signals` ([`ask`]): its
+/// trap's, its zsh trap function's, or its own rules'.
+fn reask(
+	k: &Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	signals: impl Iterator<Item = Signal>,
+	when: When,
+) -> Result<Result<(), (Signal, io::Error)>, StoreError> {
 	let platform = k.engine.config().platform;
 	for sig in signals {
 		let key = TrapKey::Signal(sig);
@@ -446,7 +491,7 @@ pub(super) fn reinstall_these(
 			},
 			_ => None,
 		};
-		let asked = ask(k, cx, vp, sig, action.as_ref().map(BStr::new), When::NotDefault)?;
+		let asked = ask(k, cx, vp, sig, action.as_ref().map(BStr::new), when)?;
 		if let Some(Err(err)) = asked {
 			return Ok(Err((sig, err)));
 		}

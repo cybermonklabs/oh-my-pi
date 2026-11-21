@@ -39,6 +39,9 @@ pub struct Ctl {
 	parked:     AtomicU64,
 	waiters:    Mutex<Vec<Waker>>,
 	signals:    Mutex<Vec<(SigTarget, Signal)>>,
+	/// How many signals [`ControlHandle::signal`] has queued, the last one's
+	/// number ([`Self::signals_queued`]); changed under `signals`' lock.
+	queued:     AtomicU64,
 }
 
 impl Ctl {
@@ -50,6 +53,7 @@ impl Ctl {
 			parked:     AtomicU64::new(0),
 			waiters:    Mutex::new(Vec::new()),
 			signals:    Mutex::new(Vec::new()),
+			queued:     AtomicU64::new(0),
 		})
 	}
 
@@ -68,8 +72,18 @@ impl Ctl {
 		Signal::from_repr(self.cancel_sig.load(Ordering::Acquire)).unwrap_or(Signal::Term)
 	}
 
-	pub(crate) fn take_signals(&self) -> Vec<(SigTarget, Signal)> {
-		std::mem::take(&mut *self.signals.lock())
+	/// Take the queued signals, with the number of the first: they are
+	/// numbered from 1 in the order they were queued.
+	pub(crate) fn take_signals(&self) -> (Vec<(SigTarget, Signal)>, u64) {
+		let mut signals = self.signals.lock();
+		let first = self.queued.load(Ordering::Acquire) + 1 - signals.len() as u64;
+		(std::mem::take(&mut *signals), first)
+	}
+
+	/// The number of the last signal queued: one with a higher number was
+	/// queued after this call.
+	pub(crate) fn signals_queued(&self) -> u64 {
+		self.queued.load(Ordering::Acquire)
 	}
 
 	/// Whether `sig` is forwarded ([`ControlHandle::signal`]) and not yet
@@ -195,7 +209,10 @@ impl ControlHandle {
 	/// Deliver a signal on the virtual signal bus (the `kill` builtin uses
 	/// the same path).
 	pub fn signal(&self, target: SigTarget, sig: Signal) {
-		self.0.signals.lock().push((target, sig));
+		let mut signals = self.0.signals.lock();
+		signals.push((target, sig));
+		self.0.queued.fetch_add(1, Ordering::AcqRel);
+		drop(signals);
 		self.0.request(SIGNAL, 0);
 	}
 

@@ -2361,6 +2361,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					},
 				};
 			}
+			// A signal that came before the program exists is the shell's as it
+			// runs shell code: the host hands it over now, and it is delivered
+			// before the spawn, as bash takes one that comes before it forks (the
+			// program would not have it). One that comes during the spawn is
+			// taken so when the wait begins ([`super::wait_starts`]). The op runs
+			// again then.
+			cx.host.forward_signals();
+			if k.ctl.word() & super::control::SIGNAL != 0 {
+				return Some(Flow::Block(WaitKey::Signal));
+			}
 			let exec_as = st(vp).exec_as.clone();
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
@@ -2586,10 +2596,7 @@ fn spawned_external(
 			let s = st(vp);
 			s.waiting = Some(Awaited::Ext { pid });
 			s.stage = Stage::Await;
-			// bash `wait_for` clears `wait_sigint_received` as each wait starts.
-			if vp.parent.is_none() {
-				k.held_sigint = None;
-			}
+			super::wait_starts(k, cx, vp);
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
 		Err(err)
