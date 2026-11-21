@@ -210,6 +210,28 @@ impl FdRef {
 		}
 	}
 
+	/// Write a prefix of `buf`, with its chunk's mark
+	/// ([`File::poll_write_marked`]).
+	pub fn poll_write_marked(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<u64>)>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_marked(cx, buf),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
+	/// Wait until this writer's chunks are out, with their first error
+	/// ([`File::poll_settle_marked`]).
+	pub fn poll_settle_marked(&self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_settle_marked(cx, marks),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
 	/// Kind of the underlying object; `None` when closed or lost.
 	pub fn kind(&self) -> Option<FileKind> {
 		self.0.state.lock().file_ref().map(File::kind)

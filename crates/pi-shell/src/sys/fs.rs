@@ -107,50 +107,39 @@ pub(crate) const BLOCKING_WRITE_CHUNK: usize = 64 << 10;
 /// runs next (an external that inherits the descriptor, another writer on
 /// the same pipe) comes after them.
 ///
-/// A failed chunk's error stays: every later write and settle on the
-/// descriptor returns it, as every later `write(2)` to a pipe whose reader
-/// left, a hung-up terminal or a reset socket fails. So the writer whose
-/// chunk failed gets it at its settle, whichever writer polls first.
+/// Each chunk handed off gets the next mark. A chunk that fails keeps its
+/// error under its mark until the writer that handed it off takes it, by
+/// settling with the marks of its own chunks ([`File::poll_settle_marked`]);
+/// a flush, which the engine makes before it closes the descriptor, takes
+/// what no writer took. No other write sees it: every later write is made,
+/// as every later `write(2)` is (a FIFO whose reader came back takes it), and
+/// a writer gets the errors of its own chunks only.
 #[derive(Debug)]
 struct BlockingWriter {
-	jobs:  std::sync::mpsc::Sender<Vec<u8>>,
+	jobs:  std::sync::mpsc::Sender<(u64, Vec<u8>)>,
 	state: Arc<parking_lot::Mutex<WriterState>>,
 }
+
+/// The most failed chunks whose errors are kept for their writers; past it
+/// the oldest is dropped (its writer never settled).
+const KEPT_ERRORS: usize = 64;
 
 #[derive(Debug, Default)]
 struct WriterState {
 	/// The thread is writing a chunk.
 	busy:   bool,
-	/// The error of the first chunk that failed; it never clears.
-	error:  Option<StickyError>,
+	/// Chunks handed off so far: the mark of the latest.
+	handed: u64,
+	/// Errors of failed chunks that no writer took yet, by mark.
+	failed: std::collections::BTreeMap<u64, io::Error>,
 	/// Writers and settles to wake when the thread is idle again.
 	wakers: Vec<Waker>,
-}
-
-/// A failed chunk's error, given again to each later write and settle.
-#[derive(Debug)]
-struct StickyError {
-	kind: io::ErrorKind,
-	os:   Option<i32>,
-	text: String,
-}
-
-impl StickyError {
-	fn new(e: &io::Error) -> Self {
-		Self { kind: e.kind(), os: e.raw_os_error(), text: e.to_string() }
-	}
-
-	fn get(&self) -> io::Error {
-		self
-			.os
-			.map_or_else(|| io::Error::new(self.kind, self.text.clone()), io::Error::from_raw_os_error)
-	}
 }
 
 impl BlockingWriter {
 	fn start(file: &fs::File) -> io::Result<Self> {
 		let mut file = file.try_clone()?;
-		let (jobs, queue) = std::sync::mpsc::channel::<Vec<u8>>();
+		let (jobs, queue) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
 		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
 		let shared = Arc::clone(&state);
 		std::thread::Builder::new()
@@ -158,15 +147,16 @@ impl BlockingWriter {
 			.stack_size(64 << 10)
 			.spawn(move || {
 				// Ends once the `StdFile` is dropped and the last chunk is done.
-				while let Ok(bytes) = queue.recv() {
+				while let Ok((mark, bytes)) = queue.recv() {
 					let result = write_all_waiting(&mut file, &bytes);
 					let wakers = {
 						let mut s = shared.lock();
 						s.busy = false;
-						if let Err(e) = result
-							&& s.error.is_none()
-						{
-							s.error = Some(StickyError::new(&e));
+						if let Err(e) = result {
+							s.failed.insert(mark, e);
+							while s.failed.len() > KEPT_ERRORS {
+								s.failed.pop_first();
+							}
 						}
 						std::mem::take(&mut s.wakers)
 					};
@@ -178,32 +168,65 @@ impl BlockingWriter {
 		Ok(Self { jobs, state })
 	}
 
-	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+	/// Hands off a chunk of `buf`: `Ready` with its length and its mark.
+	fn poll_write(&self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<(usize, u64)>> {
 		let mut s = self.state.lock();
-		if let Some(e) = &s.error {
-			return Poll::Ready(Err(e.get()));
-		}
 		if s.busy {
 			register(&mut s.wakers, cx);
 			return Poll::Pending;
 		}
 		let chunk = &buf[..buf.len().min(BLOCKING_WRITE_CHUNK)];
-		if self.jobs.send(chunk.to_vec()).is_err() {
+		let mark = s.handed + 1;
+		if self.jobs.send((mark, chunk.to_vec())).is_err() {
 			return Poll::Ready(Err(io::Error::other("the writer thread stopped")));
 		}
+		s.handed = mark;
 		s.busy = true;
-		Poll::Ready(Ok(chunk.len()))
+		Poll::Ready(Ok((chunk.len(), mark)))
 	}
 
-	/// `Ready` once every chunk handed off is in the kernel, or with the
-	/// error of the chunk that failed.
-	fn poll_settle(&self, cx: &Context<'_>) -> Poll<io::Result<()>> {
+	/// `Ready` once every chunk handed off is in the kernel or failed. Takes
+	/// no error.
+	fn poll_settle(&self, cx: &Context<'_>) -> Poll<()> {
 		let mut s = self.state.lock();
 		if s.busy {
 			register(&mut s.wakers, cx);
 			return Poll::Pending;
 		}
-		Poll::Ready(s.error.as_ref().map_or(Ok(()), |e| Err(e.get())))
+		Poll::Ready(())
+	}
+
+	/// `Ready` once every chunk up to the last of `marks` is done, with the
+	/// error of the first of these chunks that failed, which it takes.
+	fn poll_settle_marked(&self, cx: &Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		let mut s = self.state.lock();
+		let done = s.handed - u64::from(s.busy);
+		if marks.iter().any(|&mark| mark > done) {
+			register(&mut s.wakers, cx);
+			return Poll::Pending;
+		}
+		let mut first = None;
+		for mark in marks {
+			if let Some(e) = s.failed.remove(mark)
+				&& first.is_none()
+			{
+				first = Some(e);
+			}
+		}
+		Poll::Ready(first.map_or(Ok(()), Err))
+	}
+
+	/// `Ready` once the thread is idle, with the first error no writer took
+	/// (all of them are taken).
+	fn poll_drain(&self, cx: &Context<'_>) -> Poll<io::Result<()>> {
+		let mut s = self.state.lock();
+		if s.busy {
+			register(&mut s.wakers, cx);
+			return Poll::Pending;
+		}
+		let first = s.failed.pop_first().map(|(_, e)| e);
+		s.failed.clear();
+		Poll::Ready(first.map_or(Ok(()), Err))
 	}
 
 	/// Test only: whether no chunk is being written.
@@ -514,8 +537,12 @@ impl StdFile {
 	}
 
 	/// A write handed to this descriptor's [`BlockingWriter`], started on
-	/// the first one.
-	fn poll_blocking_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+	/// the first one: its length and its chunk's mark.
+	fn poll_blocking_write(
+		&mut self,
+		cx: &Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, u64)>> {
 		if self.writer.is_none() {
 			match BlockingWriter::start(&self.file) {
 				Ok(writer) => self.writer = Some(writer),
@@ -549,12 +576,12 @@ impl StdFile {
 		&mut self,
 		cx: &Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<()>> {
+	) -> Poll<io::Result<Option<u64>>> {
 		if buf.len() > crate::sys::ready::WRITE_CHUNK {
 			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
 		}
 		if !self.gated(true) || buf.is_empty() {
-			return Poll::Ready(self.file.write_all(buf));
+			return Poll::Ready(self.file.write_all(buf).map(|()| None));
 		}
 		#[cfg(target_os = "linux")]
 		if self.private_writer.is_some() {
@@ -568,7 +595,7 @@ impl StdFile {
 				&& let Some(writer) = self.private_writer.as_ref()
 			{
 				match write_once(writer, buf) {
-					Ok(n) if n == buf.len() => return Poll::Ready(Ok(())),
+					Ok(n) if n == buf.len() => return Poll::Ready(Ok(None)),
 					Ok(_) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
 					Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
 					Err(e) => return Poll::Ready(Err(e)),
@@ -580,7 +607,7 @@ impl StdFile {
 			};
 		}
 		match self.poll_blocking_write(cx, buf) {
-			Poll::Ready(Ok(n)) if n == buf.len() => Poll::Ready(Ok(())),
+			Poll::Ready(Ok((n, mark))) if n == buf.len() => Poll::Ready(Ok(Some(mark))),
 			Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
 			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
 			Poll::Pending => Poll::Pending,
@@ -596,15 +623,15 @@ impl StdFile {
 		&mut self,
 		cx: &Context<'_>,
 		buf: &[u8],
-	) -> Poll<io::Result<()>> {
+	) -> Poll<io::Result<Option<u64>>> {
 		if buf.len() > BLOCKING_WRITE_CHUNK {
 			return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
 		}
 		if self.kind == FileKind::Regular || buf.is_empty() {
-			return Poll::Ready(self.file.write_all(buf));
+			return Poll::Ready(self.file.write_all(buf).map(|()| None));
 		}
 		match self.poll_blocking_write(cx, buf) {
-			Poll::Ready(Ok(n)) if n == buf.len() => Poll::Ready(Ok(())),
+			Poll::Ready(Ok((n, mark))) if n == buf.len() => Poll::Ready(Ok(Some(mark))),
 			Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
 			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
 			Poll::Pending => Poll::Pending,
@@ -692,26 +719,43 @@ impl File for StdFile {
 	}
 
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		self.poll_write_marked(cx, buf).map_ok(|(n, _)| n)
+	}
+
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<u64>)>> {
 		#[cfg(unix)]
 		if self.gated(true) && !buf.is_empty() {
 			#[cfg(target_os = "linux")]
 			if self.private_writer.is_some() {
-				return self.poll_private_write(cx, buf);
+				return self.poll_private_write(cx, buf).map_ok(|n| (n, None));
 			}
 			// No readiness check first: the writer thread waits instead.
-			return self.poll_blocking_write(cx, buf);
+			return self
+				.poll_blocking_write(cx, buf)
+				.map_ok(|(n, mark)| (n, Some(mark)));
 		}
 		// Windows: anonymous pipes and consoles cannot be polled, so every
 		// write that may wait goes to the writer thread.
 		#[cfg(not(unix))]
 		if self.kind != FileKind::Regular && !buf.is_empty() {
-			return self.poll_blocking_write(cx, buf);
+			return self
+				.poll_blocking_write(cx, buf)
+				.map_ok(|(n, mark)| (n, Some(mark)));
 		}
-		Poll::Ready(self.file.write(buf))
+		Poll::Ready(self.file.write(buf).map(|n| (n, None)))
 	}
 
+	/// Waits for the writer thread, and gives the first error of a chunk no
+	/// writer took: the engine flushes before it closes the descriptor, so a
+	/// failure of the last write before the close is reported there.
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-		if let Err(e) = std::task::ready!(self.poll_settle(cx)) {
+		if let Some(writer) = &self.writer
+			&& let Err(e) = std::task::ready!(writer.poll_drain(cx))
+		{
 			return Poll::Ready(Err(e));
 		}
 		Poll::Ready(self.file.flush())
@@ -719,7 +763,14 @@ impl File for StdFile {
 
 	fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		match &self.writer {
-			Some(writer) => writer.poll_settle(cx),
+			Some(writer) => writer.poll_settle(cx).map(Ok),
+			None => Poll::Ready(Ok(())),
+		}
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		match &self.writer {
+			Some(writer) => writer.poll_settle_marked(cx, marks),
 			None => Poll::Ready(Ok(())),
 		}
 	}
@@ -1881,10 +1932,10 @@ mod tests {
 		}
 
 		/// A chunk that fails is the failure of the writer that handed it off,
-		/// whichever writer polls the descriptor first (`trap '' PIPE; echo a
-		/// & echo b`): the error stays, so the other writer's write fails too,
-		/// as its own write would on a pipe whose reader left, and the first
-		/// writer's settle still gets it.
+		/// and of no other (`trap '' PIPE; echo a & echo b`). A's chunk is in
+		/// the kernel; B's fails when the reader leaves. B's settle with its
+		/// own mark gets the error; A's settle with its own mark gets none,
+		/// though B's failure is newer than A's hand-off.
 		#[cfg(target_os = "linux")]
 		#[test]
 		fn a_failed_chunk_is_reported_to_the_writer_that_handed_it_off() {
@@ -1894,40 +1945,121 @@ mod tests {
 					"::a_failed_chunk_is_reported_to_the_writer_that_handed_it_off"
 				),
 				|| {
-					let (mut writer, reader) = pipe_with_free(0);
+					let (mut writer, reader) = pipe_with_free(2);
 					assert!(!writer.has_private_writer());
 					let flag = Arc::new(Flag::default());
 					let waker = Waker::from(Arc::clone(&flag));
 					let mut cx = Context::from_waker(&waker);
 					let finished = deadline("two writers and a failed chunk", Duration::from_secs(5));
-					// Writer A hands its line off; the pipe is full, so the thread
-					// waits.
-					let a = writer.poll_write(&mut cx, b"a\n");
-					assert!(matches!(a, Poll::Ready(Ok(2))), "A: {a:?}");
-					// Writer B polls while A's chunk is in flight.
-					let b = writer.poll_write(&mut cx, b"b\n");
-					assert!(b.is_pending(), "B while A's chunk is in flight: {b:?}");
-					// The reader leaves: A's chunk fails with EPIPE, and B polls
-					// first.
-					drop(reader);
-					let b = loop {
-						match writer.poll_write(&mut cx, b"b\n") {
-							Poll::Pending => flag.wait("A's chunk failed"),
-							ready => break ready,
-						}
+					// Writer A hands off its line; it fills the pipe's last room.
+					let a = write_marked(&mut writer, &mut cx, b"a\n");
+					let Poll::Ready(Ok((2, Some(a_mark)))) = a else {
+						panic!("A: {a:?}")
 					};
-					assert!(
-						matches!(&b, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe),
-						"B: {b:?}"
-					);
-					let a_done = writer.poll_flush(&mut cx);
+					settled(&mut writer, &flag, &mut cx, &[a_mark]).expect("A's chunk is out");
+					// Writer B hands off its line; the pipe is full, so it waits.
+					let b = write_marked(&mut writer, &mut cx, b"b\n");
+					let Poll::Ready(Ok((2, Some(b_mark)))) = b else {
+						panic!("B: {b:?}")
+					};
+					// Nothing reads, so B's line cannot go out; the reader leaves
+					// and B's chunk fails, whether its write started yet or not.
+					drop(reader);
+					let b_done = settled(&mut writer, &flag, &mut cx, &[b_mark]);
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a_mark]);
 					drop(finished);
 					assert!(
-						matches!(&a_done, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe),
-						"A's chunk failed, and A's flush found no error: {a_done:?}"
+						matches!(&b_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"B's chunk failed, and B's settle found no error: {b_done:?}"
+					);
+					assert!(
+						a_done.is_ok(),
+						"A's chunk was out, and A's settle got an error: {a_done:?}"
 					);
 				},
 			);
+		}
+
+		/// A failed chunk's error does not outlive its writer: a FIFO whose
+		/// reader left and came back takes the next write again (`exec
+		/// 3>fifo`, the reader leaves, `echo a >&3` fails with `EPIPE`, a new
+		/// reader opens the FIFO, `echo b >&3` goes out), as `write(2)` on the
+		/// same descriptor does.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_fifo_whose_reader_comes_back_takes_the_next_write() {
+			in_blocking_writer_process(
+				concat!(module_path!(), "::a_fifo_whose_reader_comes_back_takes_the_next_write"),
+				|| {
+					let dir = tempfile::tempdir().unwrap();
+					let path = dir.path().join("fifo");
+					let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+					// SAFETY: `c` is a NUL-terminated path.
+					assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+					let first = fs::OpenOptions::new()
+						.read(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.unwrap();
+					let mut writer =
+						StdFile::new(fs::OpenOptions::new().write(true).open(&path).unwrap());
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a FIFO whose reader comes back", Duration::from_secs(5));
+					drop(first);
+					let a = write_marked(&mut writer, &mut cx, b"a\n");
+					let Poll::Ready(Ok((2, Some(a_mark)))) = a else {
+						panic!("a: {a:?}")
+					};
+					let a_done = settled(&mut writer, &flag, &mut cx, &[a_mark]);
+					assert!(
+						matches!(&a_done, Err(e) if e.kind() == io::ErrorKind::BrokenPipe),
+						"`a` had no reader: {a_done:?}"
+					);
+					let mut second = fs::OpenOptions::new()
+						.read(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path)
+						.unwrap();
+					let b = write_marked(&mut writer, &mut cx, b"b\n");
+					let Poll::Ready(Ok((2, Some(b_mark)))) = b else {
+						panic!("`b` after a new reader opened the FIFO: {b:?}")
+					};
+					settled(&mut writer, &flag, &mut cx, &[b_mark]).expect("`b` went out");
+					let mut line = [0u8; 2];
+					second.read_exact(&mut line).unwrap();
+					drop(finished);
+					assert_eq!(&line, b"b\n");
+				},
+			);
+		}
+
+		/// Hands `buf` to `writer`: what it took and its chunk's mark.
+		#[cfg(target_os = "linux")]
+		fn write_marked(
+			writer: &mut StdFile,
+			cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<io::Result<(usize, Option<u64>)>> {
+			writer.poll_write_marked(cx, buf)
+		}
+
+		/// Settles `writer` for `marks`, waiting for its writer thread.
+		#[cfg(target_os = "linux")]
+		fn settled(
+			writer: &mut StdFile,
+			flag: &Flag,
+			cx: &mut Context<'_>,
+			marks: &[u64],
+		) -> io::Result<()> {
+			loop {
+				match writer.poll_settle_marked(cx, marks) {
+					Poll::Ready(result) => return result,
+					Poll::Pending => flag.wait("the writer thread finished the chunk"),
+				}
+			}
 		}
 
 		/// Flushes `writer`, waiting for its writer thread; panics on an error.
@@ -2008,13 +2140,34 @@ mod tests {
 		/// A full pipe whose reader left has no room, yet a write to it does
 		/// not wait: it fails with `EPIPE` at once, and must not poll again
 		/// forever for room that never comes.
-		#[cfg(any(target_os = "linux", target_os = "android"))]
+		///
+		/// A process that another test of this process forks holds a copy of
+		/// every descriptor until its exec, this pipe's read end too, and the
+		/// write then still sees a reader. So the test runs in a process of its
+		/// own, where no other test runs.
+		#[cfg(target_os = "linux")]
 		#[test]
 		fn a_write_to_a_full_pipe_whose_reader_left_fails_at_once() {
+			const NAME: &str =
+				"sys::fs::tests::fifos::a_write_to_a_full_pipe_whose_reader_left_fails_at_once";
+			const ALONE: &str = "PI_SHELL_TEST_ALONE";
+			if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
+				let output = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+					.env(ALONE, NAME)
+					.output()
+					.unwrap();
+				let (out, err) =
+					(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+				assert!(output.status.success(), "the run of its own failed:\n{out}\n{err}");
+				assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
+				return;
+			}
+
 			let (mut writer, reader) = pipe_with_free(0);
 			drop(reader);
 			let finished =
-				deadline("poll_write to a full pipe with no reader", Duration::from_secs(1));
+				deadline("poll_write to a full pipe with no reader", Duration::from_secs(10));
 			let wrote = writer.poll_write(&mut Context::from_waker(Waker::noop()), b"x");
 			drop(finished);
 			assert!(

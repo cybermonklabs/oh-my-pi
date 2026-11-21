@@ -980,10 +980,41 @@ pub enum TryEnd {
 /// Bytes still to be written to an fd.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWrite {
-	pub fd:    i32,
-	pub bytes: BString,
-	pub off:   usize,
+	pub fd:     i32,
+	pub bytes:  BString,
+	pub off:    usize,
+	/// Where the bytes handed off so far went ([`HandedOff`]).
+	#[serde(skip)]
+	pub handed: HandedOff,
 }
+
+impl PendingWrite {
+	/// `bytes` for fd `fd`, nothing written yet.
+	pub fn new(fd: i32, bytes: BString) -> Self {
+		Self { fd, bytes, off: 0, handed: HandedOff::default() }
+	}
+}
+
+/// Where a [`PendingWrite`]'s bytes went once handed off: the object that
+/// took them, and the marks of the chunks its writer thread took
+/// ([`crate::bash::File::poll_write_marked`]). The entry is done once that
+/// object has settled those chunks: the fd may name another object by then (a
+/// redirection restored in between), and another writer on the same object
+/// may have chunks of its own in flight. Live state of one host file: not
+/// saved, and not part of the entry's value.
+#[derive(Clone, Debug, Default)]
+pub struct HandedOff {
+	pub file:  Option<crate::bash::FdRef>,
+	pub marks: Vec<u64>,
+}
+
+impl PartialEq for HandedOff {
+	fn eq(&self, _: &Self) -> bool {
+		true
+	}
+}
+
+impl Eq for HandedOff {}
 
 /// One logged expansion step (see `expand`): replaying the log reproduces
 /// an expansion that parked on a command substitution without repeating

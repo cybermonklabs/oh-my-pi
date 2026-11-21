@@ -122,16 +122,38 @@ pub trait File: Send {
 	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
 	/// Flush buffered writes (called before the engine closes the fd).
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+	/// [`File::poll_write`], with the mark of the chunk it handed to a writer
+	/// thread (`None` when it wrote as it took): the writer settles with its
+	/// own chunks' marks ([`File::poll_settle_marked`]) to get their errors.
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<u64>)>> {
+		match self.poll_write(cx, buf) {
+			Poll::Ready(Ok(n)) => Poll::Ready(Ok((n, None))),
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
+		}
+	}
 	/// Ready once every write this file took is out of the shell: in the
-	/// kernel, or failed (with that error, as the next write would get it).
-	/// A file that writes as it takes is settled at once; a host file that
-	/// hands writes to a writer thread waits for it. The engine settles
-	/// before it counts output as written, so whatever runs next (an
-	/// external that inherits the fd, another writer on the same pipe) comes
-	/// after it. Unlike [`File::poll_flush`] this asks nothing of the object
-	/// behind the file (a provider's flush is not called).
+	/// kernel, or failed. It takes no write's error (a writer takes its own
+	/// with [`File::poll_settle_marked`]). A file that writes as it takes is
+	/// settled at once; a host file that hands writes to a writer thread
+	/// waits for it. The engine settles before it counts output as written,
+	/// so whatever runs next (an external that inherits the fd, another
+	/// writer on the same pipe) comes after it. Unlike [`File::poll_flush`]
+	/// this asks nothing of the object behind the file (a provider's flush
+	/// is not called).
 	fn poll_settle(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		Poll::Ready(Ok(()))
+	}
+	/// [`File::poll_settle`] for one writer: Ready once its chunks (`marks`,
+	/// from [`File::poll_write_marked`]) are out, with the first error among
+	/// them, which it takes. Another writer's error is not returned.
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		let _ = marks;
+		self.poll_settle(cx)
 	}
 	/// Reposition (`<>` redirections, `read -N` on regular files).
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;

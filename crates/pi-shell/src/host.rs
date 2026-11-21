@@ -154,6 +154,18 @@ impl File for StreamFile {
 		self.with(Poll::Ready(Ok(())), |f| f.poll_settle(cx))
 	}
 
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<u64>)>> {
+		self.with(Poll::Ready(Ok((buf.len(), None))), |f| f.poll_write_marked(cx, buf))
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		self.with(Poll::Ready(Ok(())), |f| f.poll_settle_marked(cx, marks))
+	}
+
 	fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
 		self.with(Err(io::ErrorKind::Unsupported.into()), |f| f.seek(pos))
 	}

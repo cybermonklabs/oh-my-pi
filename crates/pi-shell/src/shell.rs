@@ -1077,8 +1077,9 @@ async fn report_close_failure(
 	// report is out, or has failed, only once it has settled, so nothing the
 	// run wrote last before it closes the descriptor is left unreported.
 	let write = async {
-		std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes())).await?;
-		std::future::poll_fn(|cx| crate::bash::File::poll_settle(stderr, cx)).await
+		let mark = std::future::poll_fn(|cx| stderr.poll_write_atomic(cx, line.as_bytes())).await?;
+		std::future::poll_fn(|cx| crate::bash::File::poll_settle_marked(stderr, cx, mark.as_slice()))
+			.await
 	};
 	tokio::select! {
 		_ = write => {},

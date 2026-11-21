@@ -1425,8 +1425,8 @@ pub trait CommandRunner: Send {
 ///
 /// Construct via [`Host::stdout_writer`]; [`StreamWriter::line`] and
 /// [`StreamWriter::block`] force a policy. An async utility writes to
-/// [`StreamWriter::Async`] instead and asks the host when to deliver (`rg
-/// --line-buffered` delivers each result with [`Host::deliver_output`]).
+/// [`StreamWriter::Async`] instead and asks the host when to deliver
+/// ([`Host::flush_output`], [`Host::deliver_output`]).
 pub(crate) enum StreamWriter {
 	/// Block-buffered: flushed when full, on drop, and on explicit `flush`.
 	Block(BufWriter<OpenFile>),

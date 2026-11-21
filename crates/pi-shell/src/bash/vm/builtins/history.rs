@@ -406,7 +406,7 @@ pub fn fc(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		echoed.push(b'\n');
 		ctx.vp
 			.out
-			.push_back(super::super::proc::PendingWrite { fd: 2, bytes: echoed, off: 0 });
+			.push_back(super::super::proc::PendingWrite::new(2, echoed));
 		// bash's `fc_replhist`: the command takes the `fc` line's place.
 		if list.pending
 			&& let Some(entry) = list.entries.last_mut()

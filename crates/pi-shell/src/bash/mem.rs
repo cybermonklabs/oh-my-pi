@@ -428,6 +428,18 @@ impl File for MemFile {
 		self.file().poll_settle(cx)
 	}
 
+	fn poll_write_marked(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<(usize, Option<u64>)>> {
+		self.file().poll_write_marked(cx, buf)
+	}
+
+	fn poll_settle_marked(&mut self, cx: &mut Context<'_>, marks: &[u64]) -> Poll<io::Result<()>> {
+		self.file().poll_settle_marked(cx, marks)
+	}
+
 	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
 		self.file().seek(pos)
 	}

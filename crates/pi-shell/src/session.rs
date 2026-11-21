@@ -1168,15 +1168,15 @@ mod tests {
 		);
 	}
 
-	/// What fd 1 gets while `script` runs with fd 2 a full pipe nothing
-	/// reads, on the writer-thread route (the test's child process), until
-	/// the run ends or 10 s pass. What a command hands to fd 2's writer thread
-	/// stays there, so a later command's line on fd 1 shows that the later
-	/// command ran before the earlier command's fd 2 output was out. The
-	/// verdict is that line, not the time: a run that waits as it must is
-	/// only ended by the bound.
+	/// Runs `script` with fd 2 a full pipe, on the writer-thread route (the
+	/// test's child process). For the first 2 s nothing reads that pipe, so
+	/// what a command hands to its writer thread stays there: a later
+	/// command's line on fd 1 then shows that the later command ran before
+	/// the earlier command's output was out. Then the pipe is drained, and the
+	/// later command must run. Returns fd 1 while the pipe was held, fd 1 at
+	/// the end, and what the drained pipe held after its fill.
 	#[cfg(target_os = "linux")]
-	fn stdout_while_stderr_is_held(script: &str) -> String {
+	fn run_with_held_stderr(script: &str) -> (String, String, String) {
 		use std::os::fd::{AsRawFd, OwnedFd};
 
 		let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1184,45 +1184,63 @@ mod tests {
 			.enable_all()
 			.build()
 			.unwrap();
-		let (err_r, err_w) = io::pipe().unwrap();
-		// SAFETY: `F_GETPIPE_SZ` takes no argument; `err_w` owns the fd.
-		let capacity = unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETPIPE_SZ) };
-		std::io::Write::write_all(&mut &err_w, &vec![b'q'; usize::try_from(capacity).unwrap()])
-			.unwrap();
+		let (mut held_r, held_w) = io::pipe().unwrap();
+		// SAFETY: `F_GETPIPE_SZ` takes no argument; `held_w` owns the fd.
+		let capacity =
+			usize::try_from(unsafe { libc::fcntl(held_w.as_raw_fd(), libc::F_GETPIPE_SZ) }).unwrap();
+		std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
 		let (mut out_r, out_w) = io::pipe().unwrap();
-		let drained = std::thread::spawn(move || {
-			let mut out = Vec::new();
-			out_r.read_to_end(&mut out).unwrap();
-			out
+		let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let seen = std::sync::Arc::clone(&out);
+		let out_thread = std::thread::spawn(move || {
+			let mut buf = [0u8; 4096];
+			while let Ok(n) = out_r.read(&mut buf) {
+				if n == 0 {
+					break;
+				}
+				seen.lock().extend_from_slice(&buf[..n]);
+			}
+		});
+		let snapshot = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+		let (held_out, held_tail) = (std::sync::Arc::clone(&out), std::sync::Arc::clone(&snapshot));
+		let held_thread = std::thread::spawn(move || {
+			std::thread::sleep(std::time::Duration::from_secs(2));
+			*held_tail.lock() = String::from_utf8_lossy(&held_out.lock()).into_owned();
+			let mut all = Vec::new();
+			held_r.read_to_end(&mut all).unwrap();
+			all
 		});
 		runtime.block_on(async {
 			let mut s = session();
 			let stdio = RunStdio {
 				stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
 				stdout: Some(std::fs::File::from(OwnedFd::from(out_w))),
-				stderr: Some(std::fs::File::from(OwnedFd::from(err_w))),
+				stderr: Some(std::fs::File::from(OwnedFd::from(held_w))),
 			};
-			let cancel = CancellationToken::new();
-			let run = s.run(script, stdio, cancel.clone());
-			let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
-			cancel.cancel();
+			let run = s.run(script, stdio, CancellationToken::new());
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
 		});
-		// The runtime's tasks (an extra, a tool) go with it; the reader of
-		// fd 2 goes last, so a writer thread waiting on it fails and ends.
 		drop(runtime);
-		drop(err_r);
-		String::from_utf8_lossy(&drained.join().unwrap()).into_owned()
+		let all = held_thread.join().unwrap();
+		out_thread.join().unwrap();
+		let held = snapshot.lock().clone();
+		let end = String::from_utf8_lossy(&out.lock()).into_owned();
+		(held, end, String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned())
 	}
 
-	/// One held-stderr case in the test's own child process.
+	/// One held-stderr case in the test's own child process: `after` is
+	/// absent while fd 2 is held, and present once it drains, and the held
+	/// text `held` reached fd 2.
 	#[cfg(target_os = "linux")]
-	fn next_command_waits_for_held_stderr(test: &str, script: &str) {
+	fn next_command_waits_for_held_stderr(test: &str, script: &str, held: &str) {
 		crate::sys::in_blocking_writer_process(test, || {
-			let out = stdout_while_stderr_is_held(script);
+			let (while_held, end, drained) = run_with_held_stderr(script);
 			assert!(
-				!out.contains("after"),
-				"the next command ran before the earlier command's stderr was out: {out:?}"
+				!while_held.contains("after"),
+				"the next command ran before the earlier command's output was out: {while_held:?}"
 			);
+			assert!(end.contains("after"), "the next command never ran once fd 2 drained: {end:?}");
+			assert!(drained.contains(held), "the held output never reached fd 2: {drained:?}");
 		});
 	}
 
@@ -1233,6 +1251,7 @@ mod tests {
 		next_command_waits_for_held_stderr(
 			concat!(module_path!(), "::a_held_diagnostic_keeps_the_next_command_from_running"),
 			"nosuchcmd; echo after",
+			"not found",
 		);
 	}
 
@@ -1243,6 +1262,7 @@ mod tests {
 		next_command_waits_for_held_stderr(
 			concat!(module_path!(), "::a_held_xtrace_line_keeps_its_command_from_running"),
 			"set -x; echo after",
+			"+ echo after",
 		);
 	}
 
@@ -1253,6 +1273,7 @@ mod tests {
 		next_command_waits_for_held_stderr(
 			concat!(module_path!(), "::a_held_refusal_keeps_the_next_command_from_running"),
 			"suspend; echo after",
+			"suspend",
 		);
 	}
 
@@ -1263,6 +1284,7 @@ mod tests {
 		next_command_waits_for_held_stderr(
 			concat!(module_path!(), "::a_held_fc_echo_keeps_its_command_from_running"),
 			"history -s 'echo after'; fc -s",
+			"echo after",
 		);
 	}
 
@@ -1273,6 +1295,25 @@ mod tests {
 		next_command_waits_for_held_stderr(
 			concat!(module_path!(), "::a_held_tool_message_keeps_the_next_command_from_running"),
 			"nohup; echo after",
+			"nohup",
+		);
+	}
+
+	/// A diagnostic of a failed redirection of a compound command, held on
+	/// the redirection's target, keeps the next command from running: the
+	/// restore puts fd 2 back (here `/dev/null`, which takes everything at
+	/// once) before the held entry settles, so the settle must wait on the
+	/// file that took the bytes (fd 3, the held pipe), not on fd 2.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running() {
+		next_command_waits_for_held_stderr(
+			concat!(
+				module_path!(),
+				"::a_held_diagnostic_on_a_restored_fd_keeps_the_next_command_from_running"
+			),
+			"exec 3>&2 2>/dev/null; { :; } 2>&3 >/nonexistent/out; echo after",
+			"nonexistent",
 		);
 	}
 }

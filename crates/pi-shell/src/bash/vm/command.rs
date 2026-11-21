@@ -840,8 +840,7 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
+	s.writes.push_back(PendingWrite::new(1, text));
 	s.stage = Stage::Output;
 	None
 }
@@ -1395,11 +1394,10 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Option<Flo
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
-							fd:    2,
-							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
-							off:   0,
-						});
+						vp.out.push_back(PendingWrite::new(
+							2,
+							BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
+						));
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
@@ -2658,7 +2656,7 @@ fn run_builtin(
 						.as_mut()
 						.expect("exec")
 						.writes
-						.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+						.push_back(PendingWrite::new(fd, bytes.into()));
 				}
 				let e = sc.exec.as_mut().expect("exec");
 				e.status = outcome.status;
@@ -2828,10 +2826,8 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 		let text = k.render_diag(cx, vp, line, &Diag::Usage { msg: msg.into() }.by("exec"));
 		let s = st(vp);
 		s.argv = argv;
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: USAGE.into(), off: 0 });
+		s.writes.push_back(PendingWrite::new(2, text.into()));
+		s.writes.push_back(PendingWrite::new(2, USAGE.into()));
 		s.status = 2;
 		s.stage = Stage::Output;
 		return None;
@@ -3212,35 +3208,51 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 }
 
 /// Write the command's own output in order (pollable). A write is done once
-/// its bytes are handed off and settled ([`crate::bash::File::poll_settle`]): a
-/// host file's writer thread takes a chunk at once and writes it later, so the
-/// settle is where that write fails, and its error is this command's, as a
-/// write error is.
+/// its bytes are handed off and the object that took them has settled its
+/// own chunks ([`crate::bash::File::poll_settle_marked`], the entry's
+/// [`HandedOff`](super::proc::HandedOff)): a host file's writer thread takes
+/// a chunk at once and writes it later, so the settle is where that write
+/// fails, and its error, and only its, is this command's, as a write error
+/// is.
 fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
 	let waker = k.waker.clone();
 	let mut tcx = Context::from_waker(&waker);
 	loop {
-		let pending = st(vp).writes.front()?;
-		let (fd, handed_off) = (pending.fd, pending.off >= pending.bytes.len());
+		let fd = st(vp).writes.front()?.fd;
 		let handle = vp.fds.handle(fd);
-		if handed_off {
-			match handle.poll_settle(&mut tcx) {
-				Poll::Ready(Ok(())) => {
-					st(vp).writes.pop_front();
-				},
-				Poll::Ready(Err(err)) => {
-					if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
-						return Some(flow);
-					}
-				},
-				Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
-			}
+		let pending = st(vp).writes.front_mut().expect("checked");
+		let done = pending.off >= pending.bytes.len();
+		// What another object took (the fd was restored in between) is out
+		// there before the rest goes to this one.
+		let settled = match &pending.handed.file {
+			Some(held) if done || !held.same(&handle) => {
+				match held.poll_settle_marked(&mut tcx, &pending.handed.marks) {
+					Poll::Ready(result) => Some(result),
+					Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
+				}
+			},
+			_ => None,
+		};
+		match settled {
+			Some(Err(err)) => {
+				if let Some(flow) = write_failed(k, vp, cx, line, fd, err) {
+					return Some(flow);
+				}
+				continue;
+			},
+			Some(Ok(())) => pending.handed = super::proc::HandedOff::default(),
+			None => {},
+		}
+		if done {
+			st(vp).writes.pop_front();
 			continue;
 		}
-		let state = st(vp);
-		let pending = state.writes.front_mut().expect("checked");
-		match handle.poll_write(&mut tcx, &pending.bytes[pending.off..]) {
-			Poll::Ready(Ok(written)) if written > 0 => pending.off += written,
+		match handle.poll_write_marked(&mut tcx, &pending.bytes[pending.off..]) {
+			Poll::Ready(Ok((written, mark))) if written > 0 => {
+				pending.off += written;
+				pending.handed.marks.extend(mark);
+				pending.handed.file.get_or_insert(handle);
+			},
 			Poll::Ready(res) => {
 				let err = res
 					.err()
@@ -3285,9 +3297,7 @@ fn write_failed(
 	// Through the command's own fd 2 (`2>&1 >&4`), while its
 	// redirections are in place.
 	let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-	st(vp)
-		.writes
-		.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
 	None
 }
 
@@ -3365,7 +3375,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, bytes));
 	}
 }
 

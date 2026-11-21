@@ -304,8 +304,8 @@ impl pi_vfs::FileHandle for FdHandle {
 				Poll::Pending => Ok(0),
 			};
 		}
-		let n = std::future::poll_fn(|cx| fd.poll_write(cx, buf)).await?;
-		std::future::poll_fn(|cx| fd.poll_settle(cx)).await?;
+		let (n, mark) = std::future::poll_fn(|cx| fd.poll_write_marked(cx, buf)).await?;
+		std::future::poll_fn(|cx| fd.poll_settle_marked(cx, mark.as_slice())).await?;
 		Ok(n)
 	}
 
