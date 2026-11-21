@@ -16,11 +16,13 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::{Map, Value};
 
-/// `serde_json::from_slice::<Value>(text)`, also for a response frame that
-/// nests deeper than it reads, but only in its `data`: the client moves a
-/// response's `data` into its result without recursion, while decoding any
-/// other value copies it by recursion, so text that nests that deep elsewhere
-/// fails as `serde_json` fails it. Scalars and member names are still read by
+use crate::wire::{Command, GetTreeCommand, RpcResponse};
+
+/// `serde_json::from_slice::<Value>(text)`, also for a `get_tree` answer that
+/// nests deeper than it reads, but only in its `data`: that answer's result
+/// takes its `data` into a [`DeepJson`] without recursion, while decoding any
+/// other value copies it by recursion, so other text that nests that deep fails
+/// as `serde_json` fails it. Scalars and member names are still read by
 /// `serde_json`.
 pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
 	let error = match serde_json::from_slice(text) {
@@ -31,7 +33,7 @@ pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
 	let Ok(value) = parse_deep(text) else {
 		return Err(error);
 	};
-	if is_deep_only_in_data(&value) {
+	if is_deep_only_in_tree_data(&value) {
 		Ok(value)
 	} else {
 		drop_deep(value);
@@ -39,16 +41,31 @@ pub(crate) fn parse(text: &[u8]) -> Result<Value, serde_json::Error> {
 	}
 }
 
-/// Whether `value` is a response frame whose members other than `data` nest
+/// Whether `value` is a `get_tree` answer whose members other than `data` nest
 /// no deeper than `serde_json` reads.
-fn is_deep_only_in_data(value: &Value) -> bool {
+fn is_deep_only_in_tree_data(value: &Value) -> bool {
 	let Some(members) = value.as_object() else {
 		return false;
 	};
 	members.get("type").and_then(Value::as_str) == Some("response")
+		&& members.get("command").and_then(Value::as_str) == Some(GetTreeCommand::NAME)
 		&& members
 			.iter()
 			.all(|(key, member)| key == "data" || !nests_deeper_than(member, SERDE_JSON_MAX_DEPTH - 1))
+}
+
+/// Drops with [`drop_deep`] the `data` of `response` when it nests deeper than
+/// `serde_json` reads, which only a `get_tree` answer's can ([`parse`]): for
+/// every path on which that data would otherwise be decoded or dropped by
+/// recursion, all but the successful answer to a `get_tree` call.
+pub(crate) fn drop_deep_tree_data(response: &mut RpcResponse) {
+	if response.command == GetTreeCommand::NAME
+		&& let Some(data) = response
+			.data
+			.take_if(|data| nests_deeper_than(data, SERDE_JSON_MAX_DEPTH))
+	{
+		drop_deep(data);
+	}
 }
 
 /// Drops `value` without recursing into it.
@@ -537,7 +554,7 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_deeper_than_serde_json_only_in_the_data_of_a_response() {
+	fn parses_deeper_than_serde_json_only_in_the_data_of_a_get_tree_answer() {
 		let depth = 200_000;
 		let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
 		let response =
@@ -547,6 +564,7 @@ mod tests {
 			deep.clone(),
 			format!(r#"{{"type":"big","pad":{deep}}}"#),
 			format!(r#"{{"type":"response","command":"get_tree","success":false,"error":{deep}}}"#),
+			format!(r#"{{"type":"response","command":"get_messages","success":true,"data":{deep}}}"#),
 		] {
 			assert!(parse(text.as_bytes()).is_err());
 		}

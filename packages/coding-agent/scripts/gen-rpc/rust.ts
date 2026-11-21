@@ -156,6 +156,8 @@ class RustEmitter {
 	/** Generated type name → emitted code; detects collisions. */
 	#extra = new Map<string, string>();
 	#defaults: string[] = [];
+	/** Object definition → the plan of every field, made once (planning registers defaults and inline types). */
+	#plans = new Map<string, FieldPlan[]>();
 	/** Preamble helpers some field needs. */
 	#helpers = new Set<"orUnknown" | "scalarOrArray">();
 	#names = new Set<string>();
@@ -224,29 +226,36 @@ class RustEmitter {
 	}
 
 	/**
-	 * The members of result `def` that hold raw JSON, each with a shallow value
-	 * serde decodes into its field (as `#planFields` types it) while the member is
-	 * detached.
+	 * The members of result `def` that hold raw JSON, each with its field as
+	 * `#planFields` plans it and a shallow value serde decodes into that field
+	 * while the member is detached.
 	 */
 	#rawMembers(def: ObjectDef): { key: string; name: string; placeholder: string }[] {
-		const omitted = this.#omitted.get(def.name);
-		return def.fields
-			.filter(
-				field =>
-					!omitted?.has(field.key) &&
-					!field.unknownFallback &&
-					!field.scalarOrArray &&
-					this.#isRawJson(field.type),
-			)
-			.map(field => {
-				let shape = field.type;
-				for (let def = this.#aliasOf(shape); def; def = this.#aliasOf(shape)) shape = def.type;
-				const optional = nonNull(shape) !== undefined || (!field.required && !field.hasDefault);
-				let placeholder = "Value::Null";
-				if (!optional && shape.kind === "array") placeholder = "Value::Array(Vec::new())";
-				else if (!optional && shape.kind === "record") placeholder = "Value::Object(Map::new())";
-				return { key: field.key, name: snake(field.key), placeholder };
-			});
+		return this.#objectPlans(def)
+			.filter(plan => !plan.field.unknownFallback && !plan.field.scalarOrArray && this.#isRawJson(plan.field.type))
+			.map(plan => ({ key: plan.field.key, name: plan.name, placeholder: this.#placeholder(plan.type) }));
+	}
+
+	/** A shallow JSON value serde decodes into the Rust raw JSON type `rust`. */
+	#placeholder(rust: string): string {
+		const deep = /^crate::DeepJson<(.*)>$/.exec(rust);
+		if (deep) return this.#placeholder(deep[1]);
+		if (rust === "Value" || rust.startsWith("Option<")) return "Value::Null";
+		if (rust.startsWith("Vec<")) return "Value::Array(Vec::new())";
+		if (rust.startsWith("Map<")) return "Value::Object(Map::new())";
+		const alias = this.#model.defs.get(rust);
+		if (alias?.kind === "alias") return this.#placeholder(this.render(alias.type, alias.name));
+		throw new Error(`no shallow JSON value decodes into ${rust}`);
+	}
+
+	/** `#planFields` of every field of `def`, planned once. */
+	#objectPlans(def: ObjectDef): FieldPlan[] {
+		let plans = this.#plans.get(def.name);
+		if (!plans) {
+			plans = this.#planFields(def, def.fields);
+			this.#plans.set(def.name, plans);
+		}
+		return plans;
 	}
 
 	/** The alias definition `type` refers to, if it refers to one. */
@@ -479,7 +488,7 @@ class RustEmitter {
 	}
 
 	#openStruct(def: ObjectDef): string {
-		const plans = this.#planFields(def, def.fields);
+		const plans = this.#objectPlans(def);
 		const writes = plans
 			.map(
 				plan =>
@@ -634,7 +643,7 @@ class RustEmitter {
 			return this.#closedStruct(
 				def.name,
 				def.doc,
-				this.#planFields(def, def.fields),
+				this.#objectPlans(def),
 				"Debug, Clone, PartialEq, Serialize, Deserialize",
 			);
 		}
@@ -669,9 +678,7 @@ class RustEmitter {
 			let project = "";
 			output = command.result;
 			if (command.unwrap) {
-				const plan = this.#planFields(result, result.fields).find(
-					candidate => candidate.field.key === command.unwrap,
-				);
+				const plan = this.#objectPlans(result).find(candidate => candidate.field.key === command.unwrap);
 				if (!plan || result.open) throw new Error(`${command.name}: cannot unwrap ${command.unwrap}`);
 				output = plan.type;
 				project = `.map(|result| result.${plan.name})`;
