@@ -284,7 +284,10 @@ async fn native_open_scoped_async(
 /// a helper thread (see [`FifoOpen`]), so that the wait for the other end
 /// observes `token` and, for async callers, holds no runtime worker. The
 /// helper runs the ordinary blocking open, so the open returns exactly when
-/// it would without a token: once the other end connects.
+/// it would without a token: once the other end connects. An open that
+/// creates (`O_CREAT`: the shell's `>`, `tee`) opens the path, so the kernel
+/// checks `O_CREAT` against the path's directory as for the plain open
+/// (`fs.protected_fifos`; see [`FifoOpen`]).
 ///
 /// Once the token fires, the open fails with [`crate::cancelled`], and
 /// dropping it releases the helper, so it leaves no end of the FIFO behind
@@ -304,8 +307,9 @@ fn start_fifo(
 		return Err(crate::cancelled());
 	}
 	let nofollow = options.get_custom_flags() & libc::O_NOFOLLOW != 0;
+	let creates = options.is_create() || options.get_custom_flags() & libc::O_CREAT != 0;
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start(path, meta, nofollow, move |path, pinned| {
+	Ok(FifoOpen::start(path, meta, nofollow, creates, move |path, pinned| {
 		if !pinned {
 			return native_open(&scope, path, &options);
 		}
