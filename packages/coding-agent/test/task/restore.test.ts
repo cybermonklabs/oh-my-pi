@@ -365,6 +365,7 @@ describe("restoreSession (omp --restore)", () => {
 		"FollowedUp",
 		"Unsettled",
 		"Streamed",
+		"Spawned",
 	];
 	let tempDir: TempDir | undefined;
 	let manager: AsyncJobManager | undefined;
@@ -718,10 +719,29 @@ describe("restoreSession (omp --restore)", () => {
 	});
 
 	for (const [source, toolName, details] of [
-		["an eval workpool batch", "eval", { workpool: { state: "completed", ids: ["Worker"] } }],
-		["vibe_wait", "vibe_wait", { sessions: ["Worker"] }],
+		[
+			"an eval cell's work pool, whose result names no worker",
+			"eval",
+			{
+				language: "js",
+				cells: [{ code: "await pool.run(items)", language: "js", output: "Worker failed.", status: "complete" }],
+			},
+		],
+		[
+			"vibe_wait, whose settled list restore does not read",
+			"vibe_wait",
+			{
+				op: "wait",
+				screens: [],
+				wait: {
+					settled: [{ id: "Worker", jobId: "vibe-Worker", status: "failed" }],
+					stillRunning: [],
+					timedOut: false,
+				},
+			},
+		],
 	] as const) {
-		it(`does not relaunch a worker of ${source} whose failure the parent got, when a later call of that turn is cut off`, async () => {
+		it(`does not relaunch a worker whose failure the parent got from ${source}, when a later call of that turn is cut off: the window alone decides`, async () => {
 			// If this regresses, the cut-off window opens at the turn's input instead of at the call the process went away
 			// inside: a worker whose failure an earlier call of the same turn returned is relaunched, and the parent gets
 			// its result a second time.
@@ -785,10 +805,34 @@ describe("restoreSession (omp --restore)", () => {
 		expect(followUp).not.toHaveBeenCalled();
 	});
 
-	it("relaunches only the spawn of the reply that streamed at the cut-off, not one of the reply it replaced", async () => {
-		// If this regresses, the window of the reply that streamed when the process went away opens at the input both
-		// replies share, before the replaced reply's spawns: one of them is relaunched for a turn that never started
-		// it; or the streaming reply's own spawn, which no record names yet, is not relaunched.
+	it("relaunches only the spawn of the reply that streamed after the parent went back to the input, not one of the reply it replaced", async () => {
+		// If this regresses, the window of the reply that streamed when the process went away opens before the parent
+		// went back to the input: a spawn the replaced reply made after its last saved entry is relaunched for a turn
+		// that never started it; or the streaming reply's own spawn, which no record names yet, is not relaunched.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		const input = main.getLeafId();
+		if (!input) throw new Error("Expected the parent's input entry");
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_replaced", "eval"));
+		tick();
+		// The replaced reply's cell spawned this subagent after the reply's last saved entry; nothing names it.
+		await writeSubagent(mainFile, cwd, "Replaced", stranded, { normalExit: true });
+		tick();
+		// The parent went back to the input; selecting the branch saved a summary of the one it left.
+		main.branchWithSummary(input, "The replaced reply ran a cell.");
+		tick();
+		// The new reply launched a subagent while it streamed, before it was saved; then the process went away.
+		await writeSubagent(mainFile, cwd, "Streamed", stranded, { normalExit: true });
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Streamed"] });
+	});
+
+	it("relaunches neither spawn when nothing the selected branch wrote places the parent's return to the input", async () => {
+		// If this regresses, the window opens at the replaced reply's last saved entry, and the replaced reply's spawn
+		// made after it is relaunched, though nothing tells it from a spawn of the new reply.
 		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 		const { main, mainFile, cwd } = openParent();
 		const input = main.getLeafId();
@@ -798,18 +842,12 @@ describe("restoreSession (omp --restore)", () => {
 		tick();
 		await writeSubagent(mainFile, cwd, "Replaced", stranded, { normalExit: true });
 		tick();
-		main.appendMessage(toolResultMessage("call_eval_replaced", "eval", {}));
-		tick();
-		main.appendMessage(assistant({ content: [{ type: "text", text: "The replaced reply." }] }));
-		// The reply was regenerated from the same input; the process went away while the new one streamed, after
-		// it launched a subagent and before the reply was saved.
-		tick();
 		main.branch(input);
 		await writeSubagent(mainFile, cwd, "Streamed", stranded, { normalExit: true });
 
 		const { outcome } = await restoreParent(main, mainFile);
 
-		expect(outcome).toEqual({ turn: false, subagents: ["Streamed"] });
+		expect(outcome).toEqual({ turn: false, subagents: [] });
 	});
 
 	it("does not relaunch a key-stranded subagent of a turn its parent ended by an abort that gave a reason", async () => {
@@ -867,33 +905,27 @@ describe("restoreSession (omp --restore)", () => {
 		],
 	})) {
 		it(`does not relaunch an unrecorded subagent of a parent subagent whose run ended with ${end}`, async () => {
-			// If this regresses, a parent subagent's finished run reads as a turn its process cut off: every subagent it
-			// left without a record is relaunched, and its result goes to a parent whose run is over.
+			// If this regresses, a parent subagent's finished run reads as a turn its process cut off: the subagent it
+			// left without a record, spawned as its yield reply began, is relaunched, and its result goes to a parent
+			// whose run is over. Without the yield check the window would open at that reply and take it in.
 			const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
 			const { main, mainFile, cwd } = openParent();
 			appendTaskSpawn(main, "Outer");
-			const outer = await SessionManager.open(
-				path.join(mainFile.slice(0, -6), "Outer.jsonl"),
-				undefined,
-				undefined,
-				{
-					initialCwd: cwd,
-					parentSession: mainFile,
-					suppressBreadcrumb: true,
-				},
-			);
+			const outerFile = path.join(mainFile.slice(0, -6), "Outer.jsonl");
+			const outer = await SessionManager.open(outerFile, undefined, undefined, {
+				initialCwd: cwd,
+				parentSession: mainFile,
+				suppressBreadcrumb: true,
+			});
 			outer.appendSessionInit({ systemPrompt: ["sub prompt"], task: "Outer task", tools: ["eval", "yield"] });
 			outer.appendMessage({ role: "user", content: "Outer task", timestamp: Date.now() });
 			tick();
 			outer.appendMessage(toolCallMessage("call_outer_eval", "eval"));
 			tick();
-			await writeSubagent(path.join(mainFile.slice(0, -6), "Outer.jsonl"), cwd, "Inner", stranded, {
-				normalExit: true,
-			});
-			tick();
 			outer.appendMessage(toolResultMessage("call_outer_eval", "eval", {}));
 			tick();
 			outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+			await writeSubagent(outerFile, cwd, "Inner", stranded, { normalExit: true });
 			outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
 			for (const message of endRecords()) outer.appendMessage(message);
 			await outer.close();
@@ -903,6 +935,39 @@ describe("restoreSession (omp --restore)", () => {
 			expect(outcome.subagents).not.toContain("Inner");
 		});
 	}
+
+	it("relaunches an unrecorded subagent of a parent subagent whose terminal yield came while its backgrounded cell still ran", async () => {
+		// If this regresses, restore reads that yield as the end of the run, though the executor parks the run there
+		// until the cell's job settles: the cell's subagent, which no record names, is left while its parent waits.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		appendTaskSpawn(main, "Outer");
+		const outerFile = path.join(mainFile.slice(0, -6), "Outer.jsonl");
+		const outer = await SessionManager.open(outerFile, undefined, undefined, {
+			initialCwd: cwd,
+			parentSession: mainFile,
+			suppressBreadcrumb: true,
+		});
+		outer.appendSessionInit({ systemPrompt: ["sub prompt"], task: "Outer task", tools: ["eval", "yield"] });
+		outer.appendMessage({ role: "user", content: "Outer task", timestamp: Date.now() });
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_eval", "eval"));
+		tick();
+		outer.appendMessage(
+			toolResultMessage("call_outer_eval", "eval", { async: { state: "running", jobId: "bg_cell", type: "eval" } }),
+		);
+		tick();
+		outer.appendMessage(toolCallMessage("call_outer_yield", "yield"));
+		outer.appendMessage(toolResultMessage("call_outer_yield", "yield", { data: "done", status: "success" }));
+		tick();
+		// The backgrounded cell spawned it after the yield; its job never delivered before the process went away.
+		await writeSubagent(outerFile, cwd, "Inner", stranded, { normalExit: true });
+		await outer.close();
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome.subagents).toContain("Inner");
+	});
 
 	for (const [records, details, relaunched] of [
 		["leaves it when the eval result's agentResults names it", { agentResults: [{ id: "Held" }] }, false],
@@ -932,6 +997,27 @@ describe("restoreSession (omp --restore)", () => {
 			expect(outcome).toEqual({ turn: false, subagents: relaunched ? ["Held"] : [] });
 		});
 	}
+
+	it("relaunches a background subagent an eval cell's tool.task started, whose result never reached the parent, after a later call is cut off", async () => {
+		// If this regresses, the `owed` record a bridged background spawn leaves is not read: the subagent, whose
+		// "started" result settled nothing and whose failure never reached the parent, is outside the cut-off call's
+		// window and is left, though its parent still waits on it.
+		const tick = clockFrom(Date.parse("2026-11-17T12:00:00.000Z"));
+		const { main, mainFile, cwd } = openParent();
+		tick();
+		main.appendMessage(toolCallMessage("call_eval_spawn", "eval"));
+		appendAgentJobRecord(main, "Spawned", "owed");
+		tick();
+		await writeSubagent(mainFile, cwd, "Spawned", stranded, { normalExit: true });
+		tick();
+		main.appendMessage(toolResultMessage("call_eval_spawn", "eval", {}));
+		tick();
+		main.appendMessage(toolCallMessage("call_read", "read"));
+
+		const { outcome } = await restoreParent(main, mainFile);
+
+		expect(outcome).toEqual({ turn: false, subagents: ["Spawned"] });
+	});
 
 	it("does not relaunch a background subagent whose failure an eval cell's tool.wait handed over", async () => {
 		// The records a bridged `tool.wait` leaves: `delivered` before the cell gets the result, and the subagent in
@@ -1183,13 +1269,13 @@ describe("restoreSession (omp --restore)", () => {
 	const evalHandovers: Record<string, { agentJob: boolean; record: (main: SessionManager, id: string) => void }> = {
 		"an eval cell's tool.task result": {
 			agentJob: false,
-			record: (main, id) => appendParentToolResult(main, "eval", { agentResults: [{ id }] }),
+			record: (main, id) => appendParentToolResult(main, "eval", { agentResults: [{ id, handedAt: Date.now() }] }),
 		},
 		"an agent() job's wait() in a foreground cell": {
 			agentJob: true,
 			record: (main, id) => {
 				appendAgentJobRecord(main, id, "delivered");
-				appendParentToolResult(main, "eval", { agentResults: [{ id }] });
+				appendParentToolResult(main, "eval", { agentResults: [{ id, handedAt: Date.now() }] });
 			},
 		},
 		"an agent() job's wait() in a backgrounded cell": {
@@ -1217,13 +1303,49 @@ describe("restoreSession (omp --restore)", () => {
 		});
 	}
 
+	for (const [records, handedAt, relaunched] of [
+		["relaunches it: the eval result says the handover came before that turn", FOLLOW_UP_START + 60_000, true],
+		["control: an eval result that says no handover time settles by when it was written", undefined, false],
+	] as const) {
+		it(`a follow-up turn a cell started after it took the subagent's result through tool.wait, the cell's eval result written after that turn began: ${records}`, async () => {
+			// If this regresses, the eval result, saved when the cell ends, settles the subagent at that later time: the
+			// turn the same cell messaged it for after the handover reads as settled, and `--restore` never goes on with it.
+			setSystemTime(new Date(FOLLOW_UP_START));
+			const { main, mainFile, cwd } = openParent();
+			appendAgentJobRecord(main, "FollowedUp", "owed");
+			await writeFollowedUp(
+				mainFile,
+				cwd,
+				// The cell's tool.wait took the first turn's result; the cell then messaged the subagent.
+				() => appendAgentJobRecord(main, "FollowedUp", "delivered"),
+				// The cell ended after the follow-up turn had begun; its eval result names the handover.
+				() => {
+					appendParentToolResult(main, "eval", {
+						agentResults: [handedAt === undefined ? { id: "FollowedUp" } : { id: "FollowedUp", handedAt }],
+					});
+					main.appendMessage(assistant({ content: [{ type: "text", text: "Asked FollowedUp for the rest." }] }));
+				},
+			);
+
+			const { outcome } = await restoreParent(main, mainFile);
+
+			expect(outcome).toEqual({ turn: false, subagents: relaunched ? ["FollowedUp"] : [] });
+		});
+	}
+
 	/**
 	 * Subagent FollowedUp's transcript under `mainFile`: a first turn that finished at
 	 * {@link FOLLOW_UP_START}, then, two minutes later, a turn its parent's message woke, which ended
 	 * because its key could not be resolved. `parentRecords` runs a minute after the first turn, to
-	 * write what the parent recorded between the two.
+	 * write what the parent recorded between the two; `afterTurnBegan`, when given, a minute after
+	 * the follow-up turn began.
 	 */
-	async function writeFollowedUp(mainFile: string, cwd: string, parentRecords: () => void): Promise<void> {
+	async function writeFollowedUp(
+		mainFile: string,
+		cwd: string,
+		parentRecords: () => void,
+		afterTurnBegan?: () => void,
+	): Promise<void> {
 		setSystemTime(new Date(FOLLOW_UP_START));
 		const sub = await SessionManager.open(
 			path.join(mainFile.slice(0, -6), "FollowedUp.jsonl"),
@@ -1252,6 +1374,10 @@ describe("restoreSession (omp --restore)", () => {
 			kind: "normal",
 			recordedAt: new Date().toISOString(),
 		});
+		if (afterTurnBegan) {
+			setSystemTime(new Date(FOLLOW_UP_START + 180_000));
+			afterTurnBegan();
+		}
 		await sub.close();
 		setSystemTime();
 	}

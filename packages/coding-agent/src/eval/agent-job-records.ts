@@ -1,27 +1,28 @@
 /**
- * Transcript records of the subagent jobs whose results a session's eval cells take, which
- * `omp --restore` reads as evidence of whether the session still waits on a job's subagent
- * ({@link readEvalAgentJobRecord}).
+ * Transcript records of the subagent jobs a session's eval cells start or take results of,
+ * which `omp --restore` reads as evidence of whether the session still waits on a job's
+ * subagent ({@link readEvalAgentJobRecord}).
  *
- * An eval `agent()` job is `owed` from its spawn until its result is handed to the session. A
- * cell's `wait()` and a bridged `tool.wait` write `delivered` first and then hand the result
- * over, so a process that goes away between the two leaves `delivered`, and restore never runs
- * that run again; a background `task` spawn's result a bridged `tool.wait` hands a cell is
- * recorded the same way. A handle's `status()`, `done()` and `attempts()` hand the cell no
- * result and write nothing. A result the session receives as an `async-result` message needs no
- * marker: that message is the handover and its record at once.
+ * A job is `owed` from its spawn until its result is handed to the session: an eval `agent()`
+ * job, and a background spawn a bridged `tool.task` starts, whose "started" result names no
+ * settled run. A cell's `wait()` and a bridged `tool.wait` write `delivered` first and then hand
+ * the result over, so a process that goes away between the two leaves `delivered`, and restore
+ * never runs that run again; a background `task` spawn's result a bridged `tool.wait` hands a
+ * cell is recorded the same way. A handle's `status()`, `done()` and `attempts()` hand the cell
+ * no result and write nothing. A result the session receives as an `async-result` message needs
+ * no marker: that message is the handover and its record at once.
  */
 import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
 
-/** Custom entry type of an eval `agent()` job record. */
+/** Custom entry type of an eval job record: an `agent()` job's, or a bridged `tool.task` background spawn's. */
 export const EVAL_AGENT_JOB_CUSTOM_TYPE = "eval-agent-job";
 
 /** `owed`: spawned, its result not yet handed to the session; `delivered`: handed over, or being handed over. */
 export type EvalAgentJobState = "owed" | "delivered";
 
-/** One state change of the eval `agent()` job whose subagent is `agentId`. */
+/** One state change of the eval job whose subagent is `agentId`. */
 export interface EvalAgentJobRecord {
 	agentId: string;
 	state: EvalAgentJobState;
@@ -45,27 +46,61 @@ export async function recordEvalAgentJobs(
 	await manager.flush();
 }
 
-/** Job runs whose handover is already recorded. */
-const handedOver = new WeakSet<object>();
+/** The handover record of one job run: when it was first handed over (epoch ms), and its write and flush. */
+interface Handover {
+	at: number;
+	written: Promise<void>;
+}
+
+/** Per session transcript, the handover record of each job run (keyed by {@link runKey}), settled or still in flight. */
+const handovers = new WeakMap<object, Map<string, Handover>>();
+
+/** A job run's identity within its session: its subagent and its job. A follow-up turn is no job run. */
+function runKey(run: { agentId: string; jobId: string }): string {
+	return `${run.agentId}\u0000${run.jobId}`;
+}
 
 /**
  * Records that each of `runs` handed its subagent's result to `session`'s cell: `delivered`,
- * on disk, before the caller hands the result over. A run whose handover is recorded writes
- * nothing again (a second `wait()` on a settled handle), so the record keeps the time its result
- * first reached the cell, and a later turn the parent messages the subagent for stays a new run.
- * A run with no job object (one the manager no longer holds) is recorded each time.
+ * on disk, before the caller hands the result over. A run is known by its subagent and job ids,
+ * not by a job object (the worker thread's job manager builds a new one on every read), and is
+ * recorded once: a later `wait()` on the settled handle writes nothing. A caller that finds the
+ * record still being written waits for it to reach the disk too, so no concurrent `wait()` hands
+ * the result over first. A failed write is forgotten, and the next handover of that run writes
+ * it again.
+ *
+ * Returns, for each of `runs` in order, when its result first reached the cell (epoch ms): the
+ * time the eval result names it with, so a turn the cell messaged the subagent for after that
+ * stays unsettled, however often or late the cell waits again.
  */
 export async function recordHandovers(
 	session: ToolSession,
-	runs: ReadonlyArray<{ agentId: string; job: object | undefined }>,
-): Promise<void> {
-	const fresh = runs.filter(run => !run.job || !handedOver.has(run.job));
-	for (const run of fresh) if (run.job) handedOver.add(run.job);
-	await recordEvalAgentJobs(
-		session,
-		fresh.map(run => run.agentId),
-		"delivered",
-	);
+	runs: ReadonlyArray<{ agentId: string; jobId: string }>,
+): Promise<number[]> {
+	const manager = session.sessionManager;
+	if (!manager) return runs.map(() => Date.now());
+	let byRun = handovers.get(manager);
+	if (!byRun) {
+		byRun = new Map();
+		handovers.set(manager, byRun);
+	}
+	const fresh = runs.filter(run => !byRun.has(runKey(run)));
+	if (fresh.length > 0) {
+		const at = Date.now();
+		// Appended synchronously in this call, before any other caller can look the run up.
+		const written = recordEvalAgentJobs(
+			session,
+			fresh.map(run => run.agentId),
+			"delivered",
+		);
+		for (const run of fresh) byRun.set(runKey(run), { at, written });
+		written.catch(() => {
+			for (const run of fresh) if (byRun.get(runKey(run))?.written === written) byRun.delete(runKey(run));
+		});
+	}
+	const recorded = runs.map(run => byRun.get(runKey(run))!);
+	await Promise.all(recorded.map(handover => handover.written));
+	return recorded.map(handover => handover.at);
 }
 
 /**

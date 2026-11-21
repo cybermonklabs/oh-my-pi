@@ -17,7 +17,7 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
 import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
-import { recordHandovers, waitHandedSubagents } from "../agent-job-records";
+import { recordEvalAgentJobs, recordHandovers, waitHandedSubagents } from "../agent-job-records";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
 import { EVAL_COMPLETION_BRIDGE_NAME, type EvalCompletionHandleResult, runEvalCompletion } from "../completion-bridge";
@@ -373,26 +373,32 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			const phases = committedTodoPhases(result);
 			if (phases) options.session.commitTodoPhases?.(phases);
 		}
-		if (name === "task" && isTaskToolDetails(result.details) && result.details.results.length > 0) {
-			options.onAgentResults?.(
-				result.details.results.map(agent => ({
-					id: agent.id,
-					...(agent.aborted ? { aborted: true } : {}),
-					...(agent.workerLost ? { workerLost: true } : {}),
-				})),
-			);
+		if (name === "task" && isTaskToolDetails(result.details)) {
+			const settledIds = new Set(result.details.results.map(agent => agent.id));
+			// A background spawn's "started" result settles no run: record it `owed`, on disk before the cell goes
+			// on, as `agent()` does, so `omp --restore` knows the parent still waits on it. Only the call's own
+			// spawns: the nested snapshots of its progress name the spawns' own subagents.
+			const started = (result.details.progress ?? []).map(spawn => spawn.id).filter(id => !settledIds.has(id));
+			await recordEvalAgentJobs(options.session, started, "owed");
+			if (result.details.results.length > 0) {
+				const handedAt = Date.now();
+				options.onAgentResults?.(
+					result.details.results.map(agent => ({
+						id: agent.id,
+						...(agent.aborted ? { aborted: true } : {}),
+						...(agent.workerLost ? { workerLost: true } : {}),
+						handedAt,
+					})),
+				);
+			}
 		}
 		if (name === "wait") {
 			// A wait hands the cell its settled jobs' results and consumes them, so no delivery records the
 			// handover: record each subagent's before the cell gets it, and name it in the eval result.
 			const handed = waitHandedSubagents(result.details);
 			if (handed.length > 0) {
-				const manager = options.session.asyncJobManager;
-				await recordHandovers(
-					options.session,
-					handed.map(run => ({ agentId: run.agentId, job: manager?.getJob(run.jobId) })),
-				);
-				options.onAgentResults?.(handed.map(run => ({ id: run.agentId })));
+				const handedAt = await recordHandovers(options.session, handed);
+				options.onAgentResults?.(handed.map((run, index) => ({ id: run.agentId, handedAt: handedAt[index]! })));
 			}
 		}
 		const replies = reply === undefined ? toolResultReplies(result.details) : [reply];

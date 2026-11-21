@@ -207,18 +207,28 @@ interface SpawnedSubagents {
 	/** Streamed launches nobody adopted, from their discard records ({@link readDiscardedLaunch}): never the parent's work. */
 	discarded: Set<string>;
 	/**
-	 * Those whose result the current conversation holds ({@link heldResultAgentIds}) or whose eval
-	 * `agent()` job's latest record is `delivered`, each with when its latest such record was
-	 * written, in epoch ms. `delivered` is written before the result reaches the cell, so a process
+	 * Those whose result the current conversation holds ({@link heldResults}) or whose eval job
+	 * has a `delivered` record, each with when its latest handover happened, in epoch ms
+	 * ({@link settle}). `delivered` is written before the result reaches the cell, so a process
 	 * that went away between the two leaves it.
 	 */
 	settled: Map<string, number>;
-	/** Eval `agent()` jobs whose latest record in the current conversation is `owed`: a result still owed to the parent. */
+	/** Eval jobs (an `agent()` job, a bridged `tool.task` background spawn) whose latest record in the current conversation is `owed`: a result still owed to the parent. */
 	owedJobs: Set<string>;
 	/** When that last `/clear` was written, in epoch ms; undefined without one. */
 	clearedAt: number | undefined;
 	/** The windows of the calls the parent's process ended inside ({@link cutOffWindows}). */
 	cutOffWindows: CutOffWindow[];
+}
+
+/**
+ * Records in `settled` that subagent `id`'s result was handed over at `at` (epoch ms), keeping
+ * its latest handover: the one that settles the turn before it. An unreadable time is kept only
+ * while nothing else is known; it then judges nothing, and the result stands.
+ */
+function settle(settled: Map<string, number>, id: string, at: number): void {
+	const prior = settled.get(id);
+	if (prior === undefined || (Number.isFinite(at) && !(prior >= at))) settled.set(id, at);
 }
 
 /** When (epoch ms) a call the parent's process ended inside started, and when its turn ended (`Infinity`: it never did). */
@@ -230,11 +240,15 @@ interface CutOffWindow {
 /**
  * The subagent ids a parent's transcript entry names: a `task` result's (its settled results and
  * its spawns' progress), the ones an `eval` result's `agentResults`, a job delivery or a `wait`
- * hands it, and an eval `agent()` job record's.
+ * hands it, and an eval job record's.
  */
 function recordedAgentIds(entry: SessionEntry): string[] {
 	const job = readEvalAgentJobRecord(entry);
-	return [...taskResultAgentIds(entry), ...heldResultAgentIds(entry, true), ...(job ? [job.agentId] : [])];
+	return [
+		...taskResultAgentIds(entry),
+		...heldResults(entry, true).map(held => held.id),
+		...(job ? [job.agentId] : []),
+	];
 }
 
 /** The subagent ids a persisted `task` tool result names: its settled results and its spawns' progress. */
@@ -243,8 +257,14 @@ function taskResultAgentIds(entry: SessionEntry): string[] {
 	return taskCardAgentIds(entry.message.details);
 }
 
+/** A subagent whose result a parent's transcript entry hands it, and when it was handed over when the entry says (epoch ms). */
+interface HeldResult {
+	id: string;
+	handedAt?: number;
+}
+
 /**
- * The subagent ids whose result a parent's transcript entry hands it: a `task` result's
+ * The subagents whose result a parent's transcript entry hands it: a `task` result's
  * results that settle their runs (a sync spawn's; a background spawn's "started" result
  * names it only in its progress), and the settled jobs a background job's delivery
  * (`async-result`) or a `wait` returned. A run its abort ended (`aborted`) or that was lost
@@ -253,11 +273,14 @@ function taskResultAgentIds(entry: SessionEntry): string[] {
  * while the parent ran on. When the parent's process goes away inside the call, the agent
  * loop still records such a result, but the parent takes no turn after it, and the
  * subagent's turn stays as its transcript left it (a stop of the run left an aborted record
- * there, which `--restore` leaves anyway).
+ * there, which `--restore` leaves anyway). Only an `eval` result says when its handovers
+ * happened (`agentResults[].handedAt`): it is written when the cell ends.
  */
-function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
+function heldResults(entry: SessionEntry, wentOn: boolean): HeldResult[] {
 	if (entry.type === "custom_message") {
-		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE ? settledJobAgentIds(entry.details) : [];
+		return entry.customType === ASYNC_RESULT_MESSAGE_TYPE
+			? settledJobAgentIds(entry.details).map(id => ({ id }))
+			: [];
 	}
 	if (entry.type !== "message" || entry.message.role !== "toolResult") return [];
 	const { toolName, details } = entry.message;
@@ -265,22 +288,24 @@ function heldResultAgentIds(entry: SessionEntry, wentOn: boolean): string[] {
 		if (!isTaskToolDetails(details)) return [];
 		return details.results
 			.filter(result => wentOn || (!result.aborted && !result.workerLost))
-			.map(result => result.id);
+			.map(result => ({ id: result.id }));
 	}
-	if (toolName === "eval") return evalHeldAgentIds(details, wentOn);
-	return toolName === "wait" ? settledJobAgentIds(details) : [];
+	if (toolName === "eval") return evalHeldResults(details, wentOn);
+	return toolName === "wait" ? settledJobAgentIds(details).map(id => ({ id })) : [];
 }
 
-/** The subagent ids an `eval` result's `agentResults` names, read as a `task` result's ({@link heldResultAgentIds}). */
-function evalHeldAgentIds(details: unknown, wentOn: boolean): string[] {
+/** The subagents an `eval` result's `agentResults` names, read as a `task` result's ({@link heldResults}), with their handover times. */
+function evalHeldResults(details: unknown, wentOn: boolean): HeldResult[] {
 	if (!isRecord(details) || !Array.isArray(details.agentResults)) return [];
-	const ids: string[] = [];
-	for (const held of details.agentResults) {
-		if (!isRecord(held)) continue;
-		const id = stringProperty(held, "id");
-		if (id && (wentOn || (held.aborted !== true && held.workerLost !== true))) ids.push(id);
+	const held: HeldResult[] = [];
+	for (const result of details.agentResults) {
+		if (!isRecord(result)) continue;
+		const id = stringProperty(result, "id");
+		if (!id || (!wentOn && (result.aborted === true || result.workerLost === true))) continue;
+		const handedAt = typeof result.handedAt === "number" ? result.handedAt : undefined;
+		held.push(handedAt === undefined ? { id } : { id, handedAt });
 	}
-	return ids;
+	return held;
 }
 
 /**
@@ -362,10 +387,11 @@ function messageStartedAt(entry: Extract<SessionEntry, { type: "message" }>): nu
  * - The last turn, when it was still live as the transcript was last written: it ends in a reply's
  *   calls, their results, or the record a process exit leaves ({@link isProcessExitRecord}). Its
  *   call is the last reply that makes calls; with no reply saved, the reply that streamed when the
- *   process went away, from the turn's input on, or from the last entry of a reply it replaced
- *   there. The window runs on to the end. A turn its run ended with a terminal `yield`
- *   ({@link yieldEndsRun}) is not live, though the executor then stops the session with an abort
- *   that gives no reason.
+ *   process went away ({@link replyStreamStartedAt}). The window runs on to the end. A run that a
+ *   terminal `yield` ended ({@link yieldEndsRun}) is not live, though the executor then stops the
+ *   session with an abort that gives no reason; one whose async work was still pending at that
+ *   `yield` is, since the executor parks the run there until that work settles
+ *   ({@link pendingAsyncWorkSince}).
  * - The latest reply with a call no result answers: the agent loop answers every call it finishes,
  *   an aborted one too, so the process ended inside it (a hard kill). Its window ends at the next
  *   input after it, when the conversation went on.
@@ -405,7 +431,9 @@ function liveCallStartedAt(
 		if (entry.type !== "message") continue;
 		const { message } = entry;
 		if (message.role === "toolResult") {
-			if (message.toolName === "yield" && !message.isError && yieldEndsRun(message.details)) return undefined;
+			if (message.toolName === "yield" && !message.isError && yieldEndsRun(message.details)) {
+				return pendingAsyncWorkSince(conversation, index);
+			}
 			continue;
 		}
 		if (message.role !== "assistant") continue;
@@ -417,28 +445,82 @@ function liveCallStartedAt(
 }
 
 /**
+ * When the earliest async work of the conversation that was still pending at
+ * `conversation[beforeIndex]` started (epoch ms); undefined when none was. Async work is a
+ * backgrounded eval cell or background `task` spawn (its result's `async` job), or an eval job
+ * record that is `owed`; it settles with its job's delivery (`async-result`), a `wait` that lists
+ * it settled, or its `delivered` record. A job started where the reply that made its call began.
+ */
+function pendingAsyncWorkSince(conversation: readonly SessionEntry[], beforeIndex: number): number | undefined {
+	const calledAt = new Map<string, number>();
+	const pending = new Map<string, number>();
+	for (const entry of conversation.slice(0, beforeIndex)) {
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			for (const part of entry.message.content) {
+				if (part.type === "toolCall") calledAt.set(part.id, messageStartedAt(entry));
+			}
+		}
+		const job = readEvalAgentJobRecord(entry);
+		if (job) {
+			if (job.state === "owed") pending.set(job.agentId, Date.parse(entry.timestamp));
+			else pending.delete(job.agentId);
+		}
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			const async = isRecord(entry.message.details) ? entry.message.details.async : undefined;
+			const jobId = isRecord(async) && async.state === "running" ? stringProperty(async, "jobId") : undefined;
+			if (jobId) pending.set(jobId, calledAt.get(entry.message.toolCallId) ?? Date.parse(entry.timestamp));
+		}
+		for (const id of settledJobIds(entry)) pending.delete(id);
+	}
+	let since: number | undefined;
+	for (const startedAt of pending.values()) if (since === undefined || startedAt < since) since = startedAt;
+	return since;
+}
+
+/** Every id a job report says settled: an `async-result` delivery's or a `wait` snapshot's settled jobs, by job and subagent id. */
+function settledJobIds(entry: SessionEntry): string[] {
+	let details: unknown;
+	if (entry.type === "custom_message" && entry.customType === ASYNC_RESULT_MESSAGE_TYPE) details = entry.details;
+	else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "wait") {
+		details = entry.message.details;
+	}
+	if (!isRecord(details) || !Array.isArray(details.jobs)) return [];
+	const ids: string[] = [];
+	for (const job of details.jobs) {
+		if (!isRecord(job) || job.status === "running") continue;
+		for (const key of ["jobId", "id", "agentId", "agentUrlId"]) {
+			const id = stringProperty(job, key);
+			if (id) ids.push(id);
+		}
+	}
+	return ids;
+}
+
+/**
  * When the reply to the input at `conversation[inputIndex]` began streaming, its turn having no
- * reply saved: when the input was written, or after the last entry of a reply the parent replaced
- * on a branch it left there, whose calls ended before the parent went back to the input.
+ * reply saved: when the input was written. When the parent replaced a reply to that input, on a
+ * branch it left, the new reply began after the parent went back to the input, which only an
+ * entry the selected branch wrote after it can place (a branch summary, say): its time, and
+ * undefined with none, since a spawn of the replaced reply made after its last saved entry
+ * cannot be told from one of the new reply.
  */
 function replyStreamStartedAt(
 	conversation: readonly SessionEntry[],
 	entries: readonly SessionEntry[],
 	inputIndex: number,
-): number {
+): number | undefined {
 	const onBranch = new Map(conversation.map((entry, index) => [entry.id, index]));
 	const parentOf = new Map(entries.map(entry => [entry.id, entry.parentId]));
-	let startedAt = Date.parse(conversation[inputIndex]!.timestamp);
-	for (const entry of entries) {
-		if (onBranch.has(entry.id)) continue;
+	const replaced = entries.some(entry => {
+		if (onBranch.has(entry.id)) return false;
 		let ancestor = entry.parentId;
 		while (ancestor && !onBranch.has(ancestor)) ancestor = parentOf.get(ancestor) ?? null;
 		const forkedAt = ancestor ? onBranch.get(ancestor) : undefined;
-		if (forkedAt === undefined || forkedAt < inputIndex) continue;
-		const writtenAt = Date.parse(entry.timestamp);
-		if (writtenAt > startedAt) startedAt = writtenAt;
-	}
-	return startedAt;
+		return forkedAt !== undefined && forkedAt >= inputIndex;
+	});
+	if (!replaced) return Date.parse(conversation[inputIndex]!.timestamp);
+	const next = conversation[inputIndex + 1];
+	return next ? Date.parse(next.timestamp) : undefined;
 }
 
 function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string | null): SpawnedSubagents {
@@ -469,14 +551,15 @@ function readSpawnedSubagents(entries: readonly SessionEntry[], leafId: string |
 		for (const id of taskResultAgentIds(entry)) current.add(id);
 		for (const id of recordedAgentIds(entry)) inConversation.add(id);
 		const writtenAt = Date.parse(entry.timestamp);
-		// Read from the leaf back: the first record of a job, and the first result naming a subagent, is its latest.
+		// Read from the leaf back: the first record of a job is its latest state. A subagent's settled
+		// time is its latest handover's, by when the handover happened, not when the entry was written.
 		const job = readEvalAgentJobRecord(entry);
 		if (job && !seenJobs.has(job.agentId)) {
 			seenJobs.add(job.agentId);
 			if (job.state === "owed") owedJobs.add(job.agentId);
-			else if (!settled.has(job.agentId)) settled.set(job.agentId, writtenAt);
 		}
-		for (const id of heldResultAgentIds(entry, wentOn)) if (!settled.has(id)) settled.set(id, writtenAt);
+		if (job?.state === "delivered") settle(settled, job.agentId, writtenAt);
+		for (const held of heldResults(entry, wentOn)) settle(settled, held.id, held.handedAt ?? writtenAt);
 		if (parentWentOn(entry)) wentOn = true;
 	}
 	return {

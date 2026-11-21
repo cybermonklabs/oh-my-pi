@@ -39,8 +39,8 @@ interface EvalHandleBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
-	/** Receives the agent handles whose settled results a call hands the cell. */
-	onAgentResults?: (results: Array<{ id: string }>) => void;
+	/** Receives the agent handles whose settled results a call hands the cell, and when it handed them over. */
+	onAgentResults?: (results: Array<{ id: string; handedAt: number }>) => void;
 }
 
 type ResolvedHandle =
@@ -297,16 +297,15 @@ export async function runEvalWait(
 			const settled = resolved.flatMap((handle): Array<Extract<ResolvedHandle, { job: unknown }>> =>
 				"job" in handle && handle.job.status !== "running" ? [handle] : [],
 			);
-			const settledAgents = settled.map(handle => ({ id: handle.job.agentId ?? handle.job.id }));
+			const runs = settled.map(handle => ({ agentId: handle.job.agentId ?? handle.job.id, jobId: handle.job.id }));
 			// `delivered` reaches the disk before the cell gets the results: a process that goes away in between
-			// leaves `delivered`, which `omp --restore` never runs again.
-			await recordHandovers(
-				options.session,
-				settled.map(handle => ({ agentId: handle.job.agentId ?? handle.job.id, job: handle.job })),
-			);
+			// leaves `delivered`, which `omp --restore` never runs again. Each run is named with when its result
+			// first reached the cell, however often the cell waits on it.
+			const handedAt = await recordHandovers(options.session, runs);
 			const manager = options.session.asyncJobManager;
 			if (manager && settled.length > 0) manager.consumeJobResults(settled.map(handle => handle.ref.id));
-			if (settledAgents.length > 0) options.onAgentResults?.(settledAgents);
+			if (runs.length > 0)
+				options.onAgentResults?.(runs.map((run, index) => ({ id: run.agentId, handedAt: handedAt[index]! })));
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,

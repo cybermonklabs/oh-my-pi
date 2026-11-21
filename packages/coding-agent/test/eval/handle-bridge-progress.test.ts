@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "../../src/async";
@@ -59,16 +59,18 @@ test("eval wait reports the agent result it hands the cell, and status reports n
 	const job = manager.getJob(id);
 	if (!job) throw new Error("missing job");
 	await job.promise;
-	const held: Array<{ id: string }> = [];
+	const held: Array<{ id: string; handedAt?: number }> = [];
 	const options = {
 		session: { asyncJobManager: manager, getAgentId: () => "Main" } as Partial<ToolSession> as ToolSession,
-		onAgentResults: (results: Array<{ id: string }>) => held.push(...results),
+		onAgentResults: (results: Array<{ id: string; handedAt: number }>) => held.push(...results),
 	};
 
 	runEvalStatus({ item: { kind: "agent", id } }, options);
 	expect(held).toEqual([]);
+	const before = Date.now();
 	await runEvalWait({ items: [{ kind: "agent", id }] }, options);
-	expect(held).toEqual([{ id: "Scout" }]);
+	expect(held).toEqual([{ id: "Scout", handedAt: expect.any(Number) }]);
+	expect(held[0]!.handedAt).toBeGreaterThanOrEqual(before);
 	await manager.dispose();
 });
 
@@ -104,6 +106,138 @@ test("eval wait writes `delivered` once, to disk, before the cell gets a settled
 		"status returned",
 	]);
 	await manager.dispose();
+});
+
+test("eval wait records a run's handover once, and names it with its first handover time, when the job manager returns a new job object on every read", async () => {
+	// If this regresses, the worker thread's job manager, which builds a new job object for each read, defeats the
+	// once-per-run check: each later wait() appends `delivered` again, or names the run in the eval result with a
+	// later time, and either settles a follow-up turn the cell started between the two waits.
+	const manager = new AsyncJobManager({});
+	const id = manager.register("task", "Worker", async () => "done", {
+		id: "Worker",
+		ownerId: "Main",
+		agentId: "Worker",
+	});
+	await manager.getJob(id)?.promise;
+	const getJob = manager.getJob.bind(manager);
+	vi.spyOn(manager, "getJob").mockImplementation(jobId => {
+		const job = getJob(jobId);
+		return job && { ...job };
+	});
+	const log: string[] = [];
+	const session = {
+		asyncJobManager: manager,
+		getAgentId: () => "Main",
+		sessionManager: loggingSessionManager(log),
+	} as unknown as ToolSession;
+	const held: Array<{ id: string; handedAt: number }> = [];
+	const onAgentResults = (results: Array<{ id: string; handedAt: number }>) => held.push(...results);
+
+	try {
+		setSystemTime(new Date("2026-11-17T12:00:00.000Z"));
+		await runEvalWait({ items: [{ kind: "agent", id }] }, { session, onAgentResults });
+		setSystemTime(new Date("2026-11-17T12:05:00.000Z"));
+		await runEvalWait({ items: [{ kind: "agent", id }] }, { session, onAgentResults });
+	} finally {
+		setSystemTime();
+	}
+
+	expect(log).toEqual(['append eval-agent-job {"agentId":"Worker","state":"delivered"}', "flushed"]);
+	const first = Date.parse("2026-11-17T12:00:00.000Z");
+	expect(held).toEqual([
+		{ id: "Worker", handedAt: first },
+		{ id: "Worker", handedAt: first },
+	]);
+	await manager.dispose();
+});
+
+test("a concurrent eval wait of the same run waits for the first wait's record to reach the disk", async () => {
+	// If this regresses, a second wait() that finds the handover being recorded returns at once: its caller takes the
+	// result before the `delivered` record is durable, and a process that goes away then leaves the job `owed`.
+	const manager = new AsyncJobManager({});
+	const id = manager.register("task", "Worker", async () => "done", {
+		id: "Worker",
+		ownerId: "Main",
+		agentId: "Worker",
+	});
+	await manager.getJob(id)?.promise;
+	const log: string[] = [];
+	const disk = Promise.withResolvers<void>();
+	const session = {
+		asyncJobManager: manager,
+		getAgentId: () => "Main",
+		sessionManager: {
+			appendCustomEntry: (customType: string, data?: unknown) => {
+				log.push(`append ${customType} ${JSON.stringify(data)}`);
+				return "entry";
+			},
+			flush: async () => {
+				await disk.promise;
+				log.push("flushed");
+			},
+		},
+	} as unknown as ToolSession;
+
+	const first = runEvalWait({ items: [{ kind: "agent", id }] }, { session }).then(() =>
+		log.push("first wait returned"),
+	);
+	const second = runEvalWait({ items: [{ kind: "agent", id }] }, { session }).then(() =>
+		log.push("second wait returned"),
+	);
+	// A real wait, on purpose: the test shows that no wait returns while the disk is held, an absence no event
+	// signals. A wait that returns early has this long to do so; under load the test can only miss it, not fail falsely.
+	await Bun.sleep(50);
+	log.push("disk done");
+	disk.resolve();
+	await Promise.all([first, second]);
+
+	expect(log.slice(0, 2)).toEqual(['append eval-agent-job {"agentId":"Worker","state":"delivered"}', "disk done"]);
+	expect(log.slice(2).sort()).toEqual(["first wait returned", "flushed", "second wait returned"].sort());
+	expect(log.indexOf("flushed")).toBeLessThan(log.indexOf("second wait returned"));
+	await manager.dispose();
+});
+
+test("a bridged tool.task records each background spawn it starts as owed before the cell goes on", async () => {
+	// If this regresses, a background spawn a cell starts through `tool.task` leaves no record: its "started" result
+	// settles no run, so a process that goes away before the spawn's result reaches the parent leaves a subagent
+	// `omp --restore` never relaunches, though the parent never got its result.
+	const log: string[] = [];
+	const taskTool: AgentTool = {
+		name: "task",
+		label: "Task",
+		description: "Runs subagents",
+		parameters: type({}),
+		async execute() {
+			log.push("task ran");
+			return {
+				content: [{ type: "text", text: "Started background job Worker." }],
+				details: {
+					projectAgentsDir: null,
+					results: [],
+					totalDurationMs: 5,
+					progress: [{ index: 0, id: "Worker", agent: "task", agentSource: "user", status: "running", task: "t" }],
+					async: { state: "running", jobId: "Worker", type: "task" },
+				},
+			};
+		},
+	};
+	const session = {
+		getAgentId: () => "Main",
+		sessionManager: loggingSessionManager(log),
+		getToolByName: (name: string) => (name === "task" ? taskTool : undefined),
+	} as unknown as ToolSession;
+	const held: Array<{ id: string }> = [];
+
+	await callSessionTool("task", {}, { session, onAgentResults: results => held.push(...results) });
+	log.push("cell went on");
+
+	expect(log).toEqual([
+		"task ran",
+		'append eval-agent-job {"agentId":"Worker","state":"owed"}',
+		"flushed",
+		"cell went on",
+	]);
+	expect(held).toEqual([]);
 });
 
 test("a bridged tool.wait records each subagent result it hands the cell before the cell gets it", async () => {
@@ -151,8 +285,8 @@ test("a bridged tool.wait records each subagent result it hands the cell before 
 		sessionManager: loggingSessionManager(log),
 		getToolByName: (name: string) => (name === "wait" ? waitTool : undefined),
 	} as unknown as ToolSession;
-	const held: Array<{ id: string }> = [];
-	const onAgentResults = (results: Array<{ id: string }>) => held.push(...results);
+	const held: Array<{ id: string; handedAt?: number }> = [];
+	const onAgentResults = (results: Array<{ id: string; handedAt?: number }>) => held.push(...results);
 
 	await callSessionTool("wait", {}, { session, onAgentResults });
 	log.push("cell got the result");
@@ -167,7 +301,10 @@ test("a bridged tool.wait records each subagent result it hands the cell before 
 		"wait ran",
 		"cell got it again",
 	]);
-	expect(held).toEqual([{ id: "Worker" }, { id: "Worker" }]);
+	expect(held).toEqual([
+		{ id: "Worker", handedAt: expect.any(Number) },
+		{ id: "Worker", handedAt: expect.any(Number) },
+	]);
 	await manager.dispose();
 });
 
