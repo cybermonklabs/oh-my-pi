@@ -1,0 +1,62 @@
+# Scratch only, never merged: records zsh_comp_pty's macOS-only snapshot options_of_ls_ask_then_list from
+# macOS's /bin/zsh (PI_COMP_ORACLE=1 PI_COMP_BLESS=1), checks it against zsh again, and runs obash against it.
+# Runs on pushes to scratch/zsh53r10 (its first commit; the proof run's commit replaces this file).
+name: scratch zsh53r10 bless
+
+on:
+  push:
+    branches: ["scratch/zsh53r10"]
+
+permissions:
+  contents: read
+
+jobs:
+  bless:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: "0"
+      TEST: options_of_ls_ask_then_list
+      SNAP: crates/pi-shell/tests/fixtures/zsh_comp_pty/options_of_ls_ask_then_list.txt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install --profile minimal
+          rustc -V
+          /bin/zsh --version
+          sw_vers
+          mkdir -p bless-logs
+          cp "$SNAP" bless-logs/before.txt
+          shasum -a 256 "$SNAP" | tee bless-logs/sha-before.txt
+      - name: Bless from /bin/zsh
+        shell: bash
+        run: |
+          set -o pipefail
+          PI_COMP_ORACLE=1 PI_COMP_BLESS=1 cargo test -p pi-shell --test zsh_comp_pty -- --exact "$TEST" --nocapture 2>&1 | tee bless-logs/bless.log
+          cp "$SNAP" bless-logs/after.txt
+          shasum -a 256 "$SNAP" | tee bless-logs/sha-after.txt
+          diff -u bless-logs/before.txt bless-logs/after.txt | tee bless-logs/snapshot.diff || true
+      - name: zsh against the new snapshot, three times
+        shell: bash
+        run: |
+          set -o pipefail
+          for i in 1 2 3; do PI_COMP_ORACLE=1 cargo test -p pi-shell --test zsh_comp_pty -- --exact "$TEST" 2>&1 | tail -3; done | tee bless-logs/zsh-check.log
+      - name: obash against the new snapshot, three times
+        if: always()
+        shell: bash
+        run: |
+          for i in 1 2 3; do cargo test -p pi-shell --test zsh_comp_pty -- --exact "$TEST" 2>&1 | tail -3; done | tee bless-logs/obash-check.log
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bless-logs
+          path: bless-logs
