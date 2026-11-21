@@ -904,18 +904,15 @@ export const LINE_STREAM_CHUNK = 1 << 20;
 /**
  * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
  * UTF-16 units, never holding their full concatenation, iterating them once.
- * Returns the UTF-8 bytes written and the text of the first chunk, which holds
- * at least the whole first line.
+ * Returns the UTF-8 bytes written.
  */
-export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): { bytes: number; head: string } {
+export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): number {
 	let bytes = 0;
-	let head: string | undefined;
 	let chunk = "";
 	const flush = (): void => {
 		const encoded = Buffer.from(chunk, "utf8");
 		fs.writeFileSync(fd, encoded);
 		bytes += encoded.byteLength;
-		head ??= chunk;
 		chunk = "";
 	};
 	for (const line of lines) {
@@ -923,7 +920,7 @@ export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>):
 		if (chunk.length >= LINE_STREAM_CHUNK) flush();
 	}
 	if (chunk.length > 0) flush();
-	return { bytes, head: head ?? "" };
+	return bytes;
 }
 
 /** Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation. */

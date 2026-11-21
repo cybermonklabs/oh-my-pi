@@ -1,5 +1,6 @@
 import {
 	IndexedSessionStorage,
+	STALE_STAGING_MS,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 	utf8Parts,
@@ -45,8 +46,6 @@ const DEFAULT_PREFIX = "omp:sessions:";
 const DEFAULT_SCAN_COUNT = 500;
 /** Bytes of each part a streamed full write appends to its staging key. */
 const STAGING_PART_BYTES = 1024 * 1024;
-/** How long a staging key lives after its last part: a live full write finishes far sooner. */
-const STALE_STAGING_MS = 60 * 60 * 1000;
 
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
@@ -229,9 +228,11 @@ function writeReply(result: unknown): [status: number, size: number] {
  * single sibling HASH. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
  * `listFilesSync` calls remain available without mirroring full content. A
- * full rewrite streams in parts to a staging key of its own and swaps it in
- * (see `writeFullStream`), so a full rewrite's body is never one value here;
- * a read still is, as Redis has no chunked read.
+ * full rewrite streams its body in parts to a staging key of its own and
+ * swaps it in (see `writeFullStream`), so the body is never one value here;
+ * only the check after a failed publish reads the stored copy back whole,
+ * one string and then one buffer, as Redis has no chunked read. A read of a
+ * whole session is one value too, for the same reason.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/**

@@ -4,12 +4,14 @@
  * fails as a full disk does, or a spool directory that another account could
  * enter. The rewrite then streams the lines to the store's staged write
  * straight from the lines, never joined, and the store warns once, not on
- * every rewrite. When that streamed write fails too, the rewrite fails where
- * its caller sees it, logs an error naming the session, the path and the
- * cause, and leaves the stored copy whole; the next rewrite tries again. A
- * store whose backend has no streamed write fails such a rewrite rather than
- * join it, and reads nothing back to check it. A throw from the lines
- * themselves is no spool failure, and fails the rewrite as it is.
+ * every rewrite; it records the title a rewrite through the spool records,
+ * also from a first line as long as the head the title is read from. When
+ * that streamed write fails too, the rewrite fails where its caller sees it,
+ * logs an error naming the session, the path and the cause, and leaves the
+ * stored copy whole; the next rewrite tries again. A store whose backend has
+ * no streamed write fails such a rewrite rather than join it, and reads
+ * nothing back to check it. A throw from the lines themselves is no spool
+ * failure, and fails the rewrite as it is.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -19,7 +21,14 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
-import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { CURRENT_SESSION_VERSION, SESSION_TITLE_SLOT_BYTES } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { LINE_STREAM_CHUNK } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	parseTitleSlotFromContent,
+	type SessionTitleUpdate,
+	serializeTitleSlot,
+	titleUpdateFromSlot,
+} from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
@@ -48,6 +57,23 @@ function sessionLines(text: string, count = 3): string[] {
 		),
 	];
 }
+
+/** The title the title slot of each of {@link FIRST_LINES} records. */
+const TITLE: SessionTitleUpdate = { title: "Rewritten session", source: "user", updatedAt: TIMESTAMP };
+
+/**
+ * First lines a rewrite can start with, each a title slot recording
+ * {@link TITLE}: the fixed-width slot sessions write, and one of at least
+ * {@link LINE_STREAM_CHUNK} UTF-16 units, the head a rewrite reads its title
+ * from, which only a head of whole lines keeps the title of.
+ */
+const FIRST_LINES: ReadonlyArray<{ name: string; line: string }> = [
+	{ name: "the fixed-width title slot", line: serializeTitleSlot(TITLE) },
+	{
+		name: `a title slot of ${LINE_STREAM_CHUNK} UTF-16 units or more`,
+		line: `${JSON.stringify({ type: "title", v: 1, ...TITLE, pad: " ".repeat(LINE_STREAM_CHUNK) })}\n`,
+	},
+];
 
 async function withSqliteStorage(run: (storage: SqlSessionStorage) => Promise<void>): Promise<void> {
 	const client = new SQL("sqlite::memory:");
@@ -401,4 +427,39 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 			stored,
 		});
 	});
+
+	for (const { name, line } of FIRST_LINES) {
+		// If this regresses, a session whose rewrite streams to the store because the spool cannot be
+		// used is listed under another title than the same rewrite through the spool gives it, or none.
+		it(`records the title a spooled rewrite records when the first line is ${name}`, async () => {
+			using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const lines = [line, ...sessionLines("titled")];
+			const spooled = `/sessions/-project-/2026-11-19T00-00-02-000Z_${ID}.jsonl`;
+			const streamed = `/sessions/-project-/2026-11-19T00-00-03-000Z_${ID}.jsonl`;
+			const client = new SQL("sqlite::memory:");
+			try {
+				const storage = await SqlSessionStorage.create({ client });
+				process.env.TMPDIR = tmp.path();
+				await storage.writeLinesAtomic(spooled, lines);
+				const warningsAfterSpooled = spoolWarnings(warn.mock.calls).length;
+				process.env.TMPDIR = pathUnderRegularFile(tmp);
+				await storage.writeLinesAtomic(streamed, lines);
+				await storage.drain();
+
+				// The title the next process lists each session under: the saved title, laid over its head.
+				const reopened = await SqlSessionStorage.create({ client });
+				const titleOf = async (file: string): Promise<SessionTitleUpdate | undefined> => {
+					const [head] = await reopened.readTextSlices(file, SESSION_TITLE_SLOT_BYTES, 0);
+					return titleUpdateFromSlot(parseTitleSlotFromContent(head));
+				};
+				expect({
+					spoolWarnings: [warningsAfterSpooled, spoolWarnings(warn.mock.calls).length],
+					titles: { spooled: await titleOf(spooled), streamed: await titleOf(streamed) },
+				}).toEqual({ spoolWarnings: [0, 1], titles: { spooled: TITLE, streamed: TITLE } });
+			} finally {
+				await client.end();
+			}
+		});
+	}
 });

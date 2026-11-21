@@ -7,6 +7,7 @@ import { digestStream } from "../utils/file-hash";
 import {
 	headerSessionId,
 	IndexedSessionStorage,
+	STALE_STAGING_MS,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 	utf8PartEnd,
@@ -741,8 +742,6 @@ const MYSQL_PLAIN_STAGING_CHARS = MYSQL_PATH_CHARS - STAGING_MARK.length - STAGI
  * in hex and {@link STAGING_MARK}. No session path starts with "#".
  */
 const HASHED_STAGING = "#omp-staging/";
-/** Age at which a staging set is a dead writer's: a live full write finishes far sooner. */
-const STALE_STAGING_MS = 60 * 60 * 1000;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
