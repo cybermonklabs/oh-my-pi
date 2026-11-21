@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   carry:
+    # Scratch trial only (never in a member): the release jobs run on sami alone.
+    if: github.ref == 'refs/heads/sami'
     # A release is a flat merge of member branches, so the previous release is
     # not an ancestor of this one and nothing else notices when a composition
     # drops or reverts what the previous release carried (v18.16.0 lost two
@@ -41,6 +43,7 @@ jobs:
           cat "$RUNNER_TEMP/carry-notes.md" >>"$GITHUB_STEP_SUMMARY"
 
   version:
+    if: github.ref == 'refs/heads/sami'
     needs: carry
     name: Compute version
     runs-on: ubuntu-22.04
@@ -57,6 +60,7 @@ jobs:
           manifest_path: packages/coding-agent/package.json
 
   release_binary:
+    if: github.ref == 'refs/heads/sami'
     needs: version
     strategy:
       fail-fast: false
@@ -461,6 +465,14 @@ jobs:
             PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
             bash .github/sami/rust-test.sh
+      - name: "Scratch trial: the logs the step read"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-logs-linux
+          path: ${{ runner.temp }}/rust-test
+          retention-days: 3
+          if-no-files-found: warn
       # Each Linux test binary's listing, for rust_test_macos's inventory.
       - name: The test binaries' listings
         if: ${{ !cancelled() }}
@@ -550,8 +562,17 @@ jobs:
             PI_TEST_REAL_BASH=/bin/bash \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE" \
             bash .github/sami/rust-test.sh
+      - name: "Scratch trial: the logs the step read"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-logs-macos
+          path: ${{ runner.temp }}/rust-test
+          retention-days: 3
+          if-no-files-found: warn
 
   release_github:
+    if: github.ref == 'refs/heads/sami'
     # A red Rust test stops the release: rust_test and rust_test_macos are
     # needs like the builds.
     needs: [carry, version, release_binary, rust_test, rust_test_macos]
@@ -572,5 +593,3 @@ jobs:
             Commit: ${{ github.sha }}
 
             ${{ needs.carry.outputs.notes }}
-
-            Also excluded: #17964 (per-provider prompt-cache retention and cache warming). No member carries it. The earlier warming implementation was removed after a replay measured only 0.8% benefit. The reworked change remains in upstream review.

@@ -1156,3 +1156,6 @@ mod tests {
 		]);
 	}
 }
+
+#[cfg(test)]
+mod gate_controls;
