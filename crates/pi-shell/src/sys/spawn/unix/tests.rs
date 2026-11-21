@@ -581,19 +581,12 @@ fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 		"sys::spawn::unix::tests::inherit_keeps_the_hosts_group_and_signals_only_the_child";
 	const ALONE: &str = "PI_SHELL_TEST_ALONE";
 	if std::env::var_os(ALONE).is_none_or(|name| name != NAME) {
-		let output = std::process::Command::new(std::env::current_exe().unwrap())
-			.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-			.env(ALONE, NAME)
-			.process_group(0)
-			.output()
-			.unwrap();
-		let (out, err) =
-			(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-		assert!(
-			output.status.success(),
-			"the run of its own failed ({}):\n{out}\n{err}",
-			output.status
-		);
+		let (status, out, err) = run_alone(NAME, ALONE, Duration::from_secs(60));
+		let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+		let Some(status) = status else {
+			panic!("the run of its own did not end within 60 s; its group was killed:\n{out}\n{err}");
+		};
+		assert!(status.success(), "the run of its own failed ({status}):\n{out}\n{err}");
 		assert!(out.contains("1 passed"), "the run of its own ran no test:\n{out}\n{err}");
 		return;
 	}
@@ -623,6 +616,66 @@ fn inherit_keeps_the_hosts_group_and_signals_only_the_child() {
 	assert!(live(grandchild.pid), "the grandchild is outside the child's scope");
 	assert!(proc::signal_pinned(&grandchild, Signal::Kill).unwrap());
 	until("grandchild gone", || proc::ended(grandchild.pid));
+}
+
+/// Run this binary's test `name` alone (`--exact`, the marker `alone` set to
+/// it), in a process group of its own, for up to `bound`: its exit status
+/// (`None` past `bound`, when its whole group is killed) and what it wrote to
+/// stdout and stderr so far. The pipes are read on threads of their own, so
+/// a full pipe cannot stop the run, and output a process outside its group
+/// keeps open cannot keep this waiting.
+fn run_alone(
+	name: &str,
+	alone: &str,
+	bound: Duration,
+) -> (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>) {
+	use std::{io::Read, process::Stdio, time::Instant};
+	fn reader(
+		mut pipe: impl Read + Send + 'static,
+	) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+		let got = Arc::new(Mutex::new(Vec::new()));
+		let into = Arc::clone(&got);
+		let thread = thread::spawn(move || {
+			let mut buf = [0u8; 4096];
+			while let Ok(n @ 1..) = pipe.read(&mut buf) {
+				into.lock().extend_from_slice(&buf[..n]);
+			}
+		});
+		(got, thread)
+	}
+	let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+		.args(["--exact", name, "--nocapture", "--test-threads=1"])
+		.env(alone, name)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0)
+		.spawn()
+		.unwrap();
+	let group = i32::try_from(child.id()).unwrap();
+	let (out, out_thread) = reader(child.stdout.take().unwrap());
+	let (err, err_thread) = reader(child.stderr.take().unwrap());
+	let deadline = Instant::now() + bound;
+	let status = loop {
+		if let Some(status) = child.try_wait().unwrap() {
+			break Some(status);
+		}
+		if Instant::now() >= deadline {
+			// SAFETY: kill takes integer ids; the group is the run's own.
+			unsafe { libc::kill(-group, libc::SIGKILL) };
+			child.wait().unwrap();
+			break None;
+		}
+		thread::sleep(Duration::from_millis(10));
+	};
+	// The pipes close once every process of the run's group is gone; give
+	// the readers a moment for the last bytes, never a wait without end.
+	let drained = Instant::now() + Duration::from_secs(5);
+	while !(out_thread.is_finished() && err_thread.is_finished()) && Instant::now() < drained {
+		thread::sleep(Duration::from_millis(10));
+	}
+	let (out, err) = (out.lock().clone(), err.lock().clone());
+	(status, out, err)
 }
 
 /// A child of the test, killed when dropped (also when the test fails).
