@@ -143,12 +143,12 @@ fn lower_command(
 
 /// bash's command that it runs with `exec` and no fork when this complete
 /// command ends the `-c` string (`evalstring.c` `should_suppress_fork`,
-/// `can_optimize_connection`): the simple command that ends the list, a
-/// pipeline of its own (no `!`, `time` or second stage) that ends its
-/// and-or list, not run in the background; after an earlier item only when
-/// `;` or a newline ends that one and the command is its and-or list alone
-/// (`connection(earlier, this, ';')`). bash forks a compound command's last
-/// command. The run checks its redirections. Node ids into `out`.
+/// `can_optimize_connection`): the simple command with no redirection that
+/// ends the list, a pipeline of its own (no `!`, `time` or second stage)
+/// that ends its and-or list, not run in the background; after an earlier
+/// item only when `;` or a newline ends that one and the command is its
+/// and-or list alone (`connection(earlier, this, ';')`). bash forks a
+/// compound command's last command. Node ids into `out`.
 fn bash_tails(list: st::List<'_>, out: &mut Vec<u32>) {
 	let items = list.items();
 	let Some(item) = items.last() else {
@@ -170,6 +170,7 @@ fn bash_tails(list: st::List<'_>, out: &mut Vec<u32>) {
 	}
 	if let Some(cmd) = p.stages().one()
 		&& let st::CommandKind::Simple(_) = cmd.kind()
+		&& cmd.redirs().is_empty()
 	{
 		out.push(cmd.id().0);
 	}

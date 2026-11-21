@@ -137,12 +137,11 @@ fn trapped(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
 /// top level (no function, `eval`, `source` or trap) or at the top of a
 /// subshell the root runs in place ([`super::proc::VprocZsh::in_place`]), as
 /// the last command of the complete command, while no trap that counts is set
-/// ([`counts_a_trap`]), as the parse tree records ([`Unit::tails`]). bash
-/// (`evalstring.c` `should_suppress_fork`, `can_optimize_connection`) wants
-/// a simple command with no redirection that ends the complete command;
-/// zsh takes one, and passes `last1` into compound commands, into a `for`
-/// body only on the loop's last word (`execfor`: `do_exec && args &&
-/// empty(args)`).
+/// ([`counts_a_trap`]), as the parse tree records ([`Unit::tails`]): bash's
+/// simple command with no redirection (`evalstring.c`
+/// `should_suppress_fork`, `can_optimize_connection`); zsh's `last1`, which
+/// it passes into compound commands, into a `for` body only on the loop's
+/// last word (`execfor`: `do_exec && args && empty(args)`).
 fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 	let Some(f) = vp.frames.last() else {
 		return false;
@@ -158,14 +157,8 @@ fn no_fork(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> bool {
 		FrameKind::Subshell => !bash && vp.in_place() && vp.frames.len() == 1,
 		_ => false,
 	};
-	let last = u.tails.binary_search(&op.node).is_ok()
-		&& if bash {
-			u.cmds
-				.get(op.a as usize)
-				.is_some_and(|cmd| cmd.redirs.is_none())
-		} else {
-			f.loops.iter().all(zsh_last_pass)
-		};
+	let last =
+		u.tails.binary_search(&op.node).is_ok() && (bash || f.loops.iter().all(zsh_last_pass));
 	at_end && last && !counts_a_trap(k, cx, vp, bash).unwrap_or(true)
 }
 
