@@ -1662,6 +1662,8 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	private constructor(backend: SqlSessionStorageBackend) {
 		super(backend);
 		this.#backend = backend;
+		// Claims and blob statements run outside the indexed queue, so they wait for a deferred open there.
+		backend.awaitOpen(() => this.pendingOpen());
 		if (!backend.claims) return;
 		// The last release of a claim waits for this store's queued writes under it.
 		const settle = (paths: readonly string[]) =>
@@ -1701,6 +1703,22 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const storage = new SqlSessionStorage(new SqlSessionStorageBackend(options));
 		await storage.initialize();
+		return storage;
+	}
+
+	/**
+	 * A store that opens on its first use rather than now: {@link create}'s
+	 * DDL, migration and index load run when something first reads, writes,
+	 * claims or stores a blob (see {@link IndexedSessionStorage.openOnFirstUse}).
+	 * For a process that may never use the store (`omp --no-session`); a failed
+	 * open is that use's error, as `describeFailure` words it.
+	 */
+	static createOnFirstUse(
+		options: SqlSessionStorageOptions,
+		describeFailure: (err: unknown) => Error,
+	): SqlSessionStorage {
+		const storage = new SqlSessionStorage(new SqlSessionStorageBackend(options));
+		storage.openOnFirstUse(describeFailure);
 		return storage;
 	}
 
@@ -2106,6 +2124,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * unset when it claims nothing.
 	 */
 	readonly #gate: "row" | "lock" | undefined;
+	/** The store's pending open, `undefined` once it is open; see {@link awaitOpen}. */
+	#pendingOpen: () => Promise<void> | undefined = () => undefined;
 	/** The SQLite database file a `lock` claim is keyed by. */
 	readonly #sqliteFile: string | undefined;
 	readonly #expiryMs: number;
@@ -2503,6 +2523,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
+	 * Make every claim statement, lease read and blob statement wait first for
+	 * the open `pendingOpen` answers while one is pending: the store's open,
+	 * which runs on the first use when the store opens on first use (see
+	 * SqlSessionStorage.createOnFirstUse). A lease release needs no wait: it
+	 * deletes a lease only a claim statement took.
+	 */
+	awaitOpen(pendingOpen: () => Promise<void> | undefined): void {
+		this.#pendingOpen = pendingOpen;
+	}
+
+	/**
 	 * Register, once while this store holds a lease row, the release a signal or exit runs: whatever took the
 	 * lease (an opened session, a subagent's, a delete, a rename, a move's destination) may never reach the release
 	 * it owns, since a signal ends the process from postmortem without running a `finally`. The callback is
@@ -2584,6 +2615,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/** The process that holds `sessionId`'s lease now, as its row names it. */
 	async claimHolder(sessionId: string): Promise<SessionClaimHolder | undefined> {
 		try {
+			const opening = this.#pendingOpen();
+			if (opening) await opening;
 			const [row] = await this.#probeLease(sessionId);
 			return row ? { host: row.host, pid: rowNumber(row.pid) } : undefined;
 		} catch (err) {
@@ -2653,6 +2686,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * session held by that process.
 	 */
 	async #runClaim(claim: LeaseClaim): Promise<boolean> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		await claim.after;
 		for (const file of claim.paths.keys()) {
 			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch((err: unknown) => {
@@ -3770,6 +3805,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * back, so a delete of another session keeps them.
 	 */
 	async addReferences(path: string, hashes: readonly string[]): Promise<void> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		const named = new Set(hashes);
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
@@ -3847,6 +3884,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * parts' references. Answers whether this call added the row of `hash`.
 	 */
 	async insertBlob(hash: string, data: Uint8Array, mimeType: string | undefined, limit: number): Promise<boolean> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		const created = Date.now();
 		let added = false;
 		await this.#fencedTransaction("blob.insert", [], async transaction => {
@@ -3922,6 +3961,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/** Of `hashes`, the ones the table holds, each with its size; reads no blob's bytes. */
 	async blobSizes(hashes: readonly string[]): Promise<Map<string, number>> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		const sizes = new Map<string, number>();
 		for (const batch of batches(hashes, BLOB_READ_BATCH)) {
 			const query = this.#q.selectBlobSizes(batch.length);
@@ -3940,6 +3981,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * parted blob is read from its parts and handed on whole.
 	 */
 	async readBlobs(hashes: readonly string[], visit: (hash: string, data: Buffer) => Promise<void>): Promise<void> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		let batch: string[] = [];
 		let bytes = 0;
 		const readBatch = async (): Promise<void> => {
@@ -3978,6 +4021,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/** Of `hashes`, the rows whose bytes do not hash to their key (a parted blob's row is not checked). */
 	async wrongBlobs(hashes: readonly string[]): Promise<string[]> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		const wrong: string[] = [];
 		const digests = this.#q.blobDigests;
 		for (const batch of batches(hashes, BLOB_READ_BATCH)) {
@@ -4021,6 +4066,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * {@link #deleteOrphans}). Without `apply`, only counts.
 	 */
 	async sweepBlobs(referenced: ReadonlySet<string>, beforeMs: number, apply: boolean): Promise<SessionBlobSweep> {
+		const opening = this.#pendingOpen();
+		if (opening) await opening;
 		if (apply) {
 			// The references of paths that have no session row, each dropped with its blob's row locked exclusive.
 			const dangling = (await this.#exclusive(() =>

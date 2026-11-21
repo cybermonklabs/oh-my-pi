@@ -2089,12 +2089,16 @@ export async function runRootCommand(
 		// Install the configured session storage before anything lists or opens a
 		// session — every session listing and SessionManager below reads through
 		// this default. A refusal names only the variable or setting and the path;
-		// it never echoes the connection string.
+		// it never echoes the connection string. Under --no-session the run keeps
+		// no session of its own, so the database opens only when something uses
+		// it (a subagent's transcript): one that is down or locked must neither
+		// end nor stall a run that never touches it.
 		try {
 			setDefaultSessionStorage(
 				await logger.time("resolveSessionStorage", resolveSessionStorage, {
 					settings: settingsInstance,
 					env: process.env,
+					openOnFirstUse: parsedArgs.noSession === true,
 				}),
 			);
 		} catch (error) {

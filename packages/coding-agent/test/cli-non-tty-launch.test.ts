@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -339,4 +340,142 @@ describe("--resume under session.storage: sql", () => {
 		expect(run.stderr).toContain(id);
 		expect(run.stderr).toContain(NO_API_KEY);
 	}, 30_000);
+});
+
+// A run that saves no session writes nothing to the store before its first model
+// request, so a store that refuses it, or whose table another client holds
+// locked, must neither end nor stall it there. The run below has no API key:
+// reaching that error is reaching the model request.
+describe("--no-session under session.storage: sql", () => {
+	const STORE_UNOPENED = "the session database could not be opened";
+
+	it("runs a prompt to its model request when the store refuses the connection", async () => {
+		using tempDir = TempDir.createSync("@omp-no-session-sql-refused-");
+		const dsnFile = tempDir.join("dsn");
+		// Port 1 answers no connection.
+		await Bun.write(dsnFile, "postgres://omp@127.0.0.1:1/sessions\n");
+
+		const run = await launchWithoutTerminal(tempDir, ["say ok"], {
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+		});
+
+		expect(run.stderr).not.toContain(STORE_UNOPENED);
+		expect(run.stderr).toContain(NO_API_KEY);
+	}, 30_000);
+
+	it("runs a prompt to its model request while another connection holds the store's write lock", async () => {
+		using tempDir = TempDir.createSync("@omp-no-session-sql-locked-");
+		const databasePath = tempDir.join("sessions.db");
+		const dsnFile = tempDir.join("dsn");
+		await Bun.write(dsnFile, `sqlite://${databasePath}\n`);
+		// An exclusive transaction keeps every other connection from taking the
+		// write lock that making the store's tables needs.
+		const holder = new Database(databasePath, { create: true });
+		try {
+			holder.run("BEGIN EXCLUSIVE");
+			const run = await launchWithoutTerminal(tempDir, ["say ok"], {
+				env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			});
+
+			expect(run.stderr).not.toContain(STORE_UNOPENED);
+			expect(run.stderr).toContain(NO_API_KEY);
+		} finally {
+			holder.close();
+		}
+	}, 30_000);
+
+	it("a run that saves its session still refuses a store that refuses the connection", async () => {
+		using tempDir = TempDir.createSync("@omp-session-sql-refused-");
+		const dsnFile = tempDir.join("dsn");
+		await Bun.write(dsnFile, "postgres://omp@127.0.0.1:1/sessions\n");
+
+		const run = await launchWithoutTerminal(tempDir, ["say ok"], {
+			persistSession: true,
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+		});
+
+		expect(run.exitCode, run.stderr).toBe(1);
+		expect(run.stderr).toContain(STORE_UNOPENED);
+		expect(run.stderr).not.toContain(NO_API_KEY);
+	}, 30_000);
+
+	it("still refuses a storage kind other than file or sql at start-up", async () => {
+		using tempDir = TempDir.createSync("@omp-no-session-bad-kind-");
+		const run = await launchWithoutTerminal(tempDir, ["say ok"], { env: { OMP_SESSION_STORAGE: "launch-probe" } });
+
+		expect(run.exitCode, run.stderr).toBe(1);
+		expect(run.stderr).toContain('OMP_SESSION_STORAGE is "launch-probe"; expected "file" or "sql"');
+		expect(run.stderr).not.toContain(NO_API_KEY);
+	}, 30_000);
+});
+
+const POSTGRES_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
+
+// PostgreSQL: another session holds ACCESS EXCLUSIVE on the session table for
+// the whole run. The verdict comes from events, not from a clock: the run
+// ended, no backend of the store's database waited on a lock while it ran, and
+// no backend that was not there before it began connected. The lock is released
+// only after the run ends, or as soon as a lock wait is seen (so a run that
+// waits ends, and the test reports the wait).
+describe.skipIf(!POSTGRES_URL)("--no-session under session.storage: sql on PostgreSQL", () => {
+	it("runs a prompt to its model request while another session holds ACCESS EXCLUSIVE on the session table", async () => {
+		using tempDir = TempDir.createSync("@omp-no-session-pg-locked-");
+		const url = POSTGRES_URL ?? "";
+		const dsnFile = tempDir.join("dsn");
+		await Bun.write(dsnFile, `${url}\n`);
+		// The store's tables exist, as they do in every deployment, so the lock has something to hold.
+		const setup = new SQL(url);
+		const made = await SqlSessionStorage.create({ client: setup });
+		await made.drain();
+		await setup.end();
+
+		const holder = new SQL(url, { max: 1 });
+		const watcher = new SQL(url, { max: 1 });
+		const { promise: lockTaken, resolve: tookLock } = Promise.withResolvers<void>();
+		const { promise: release, resolve: releaseLock } = Promise.withResolvers<void>();
+		const held = holder.begin(async transaction => {
+			await transaction.unsafe("LOCK TABLE omp_session_files IN ACCESS EXCLUSIVE MODE");
+			tookLock();
+			await release;
+		});
+		// The client backends of the store's database, other than the watcher's own.
+		const backends = async () =>
+			(await watcher.unsafe(
+				"SELECT pid, wait_event_type FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend' AND pid <> pg_backend_pid()",
+			)) as Array<{ pid: number; wait_event_type: string | null }>;
+		try {
+			await lockTaken;
+			const before = new Set((await backends()).map(row => row.pid));
+			const connected = new Set<number>();
+			let sawLockWait = false;
+			let ended = false;
+			const watch = (async () => {
+				while (!ended) {
+					for (const row of await backends()) {
+						if (!before.has(row.pid)) connected.add(row.pid);
+						if (row.wait_event_type === "Lock" && !sawLockWait) {
+							sawLockWait = true;
+							releaseLock();
+						}
+					}
+					// Another process's backends: no fake clock reaches them, so the watcher paces its reads.
+					await Bun.sleep(50);
+				}
+			})();
+			const run = await launchWithoutTerminal(tempDir, ["say ok"], {
+				env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			});
+			ended = true;
+			await watch;
+
+			expect(sawLockWait, "a backend waited on the held lock while the --no-session run ran").toBe(false);
+			expect([...connected], "backends that connected while the --no-session run ran").toEqual([]);
+			expect(run.stderr).toContain(NO_API_KEY);
+		} finally {
+			releaseLock();
+			await held;
+			await holder.end();
+			await watcher.end();
+		}
+	}, 60_000);
 });

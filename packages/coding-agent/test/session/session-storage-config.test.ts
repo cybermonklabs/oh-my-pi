@@ -6,7 +6,10 @@
  * without a storage argument read and write the same table.
  */
 
+import { SQL } from "bun";
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -19,6 +22,18 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage-config";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+/** The tables of the SQLite file at `databasePath`: none until a store's open has run its DDL. */
+function sqliteTables(databasePath: string): string[] {
+	if (!fs.existsSync(databasePath)) return [];
+	const db = new Database(databasePath, { readonly: true });
+	try {
+		const rows = db.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all();
+		return (rows as Array<{ name: string }>).map(row => row.name);
+	} finally {
+		db.close();
+	}
+}
 
 const tempDirs: TempDir[] = [];
 
@@ -357,4 +372,81 @@ describe("resolveSessionStorage", () => {
 			expect(error.message).not.toContain("hunter2");
 		},
 	);
+});
+
+// `openOnFirstUse` (a `--no-session` run): the configuration is checked at once,
+// the database is not touched until something first uses the store.
+describe("resolveSessionStorage with openOnFirstUse", () => {
+	it("resolves an unreachable database without touching it, and the first use refuses as a start-up would", async () => {
+		const dsnFile = await writeDsnFile("postgres://user:hunter2@127.0.0.1:1/sessions");
+		const storage = await resolveSessionStorage({
+			settings: Settings.isolated(),
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			openOnFirstUse: true,
+		});
+		expect(storage).toBeInstanceOf(SqlSessionStorage);
+
+		const error = await rejection(storage.refresh?.() ?? Promise.resolve());
+		expect(error.message).toStartWith(
+			`OMP_SESSION_SQL_DSN_FILE names ${dsnFile}, but the session database could not be opened: `,
+		);
+		expect(error.message).toMatch(/ \(ERR_POSTGRES_CONNECTION_[A-Z_]+\)$/);
+		expect(error.message).not.toContain("hunter2");
+		// A later use tries the database again rather than keeping the first failure.
+		const again = await rejection(storage.readText("/sessions/p/s.jsonl"));
+		expect(again.message).toStartWith(`OMP_SESSION_SQL_DSN_FILE names ${dsnFile}, but the session database`);
+	});
+
+	it("still refuses every configuration fault at once", async () => {
+		const missing = path.join(makeTempDir("@pi-session-storage-missing-"), "does-not-exist");
+		const blank = await writeDsnFile("  \n");
+		const unparsable = await writeDsnFile("host=127.0.0.1 password=hunter2");
+		const cases: Array<[NodeJS.ProcessEnv, string]> = [
+			[{ OMP_SESSION_STORAGE: "launch-probe" }, 'OMP_SESSION_STORAGE is "launch-probe"; expected "file" or "sql"'],
+			[{ OMP_SESSION_STORAGE: "sql" }, "session storage is sql but no connection-string file is named"],
+			[
+				{ OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: missing },
+				`names ${missing}, which could not be read`,
+			],
+			[{ OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: blank }, `names ${blank}, which is empty`],
+			[
+				{ OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: unparsable },
+				"but its contents are not a connection URL the database driver accepts",
+			],
+		];
+		for (const [env, expected] of cases) {
+			const error = await rejection(
+				resolveSessionStorage({ settings: Settings.isolated(), env, openOnFirstUse: true }),
+			);
+			expect(error.message).toContain(expected);
+		}
+	});
+
+	it("opens the database at its first use and keeps what was written before it", async () => {
+		const dir = makeTempDir("@pi-session-storage-first-use-");
+		const databasePath = path.join(dir, "sessions.db");
+		const dsnFile = await writeDsnFile(`sqlite://${databasePath}\n`);
+		const storage = await resolveSessionStorage({
+			settings: Settings.isolated(),
+			env: { OMP_SESSION_STORAGE: "sql", OMP_SESSION_SQL_DSN_FILE: dsnFile },
+			openOnFirstUse: true,
+		});
+		// Nothing ran on the database yet: no table is made. (Bun's SQLite client
+		// may create the empty file when the client is made; that runs no statement.)
+		expect(sqliteTables(databasePath)).toEqual([]);
+
+		// A synchronous write is the first use; it lands once the deferred open has made the tables.
+		storage.writeTextSync("/sessions/p/a.jsonl", '{"type":"session","id":"a"}\n');
+		await storage.drain();
+		expect(await storage.readText("/sessions/p/a.jsonl")).toBe('{"type":"session","id":"a"}\n');
+
+		// Another client sees the row, so it is in the database and not only in this process's view.
+		const otherClient = new SQL(`sqlite://${databasePath}`);
+		try {
+			const other = await SqlSessionStorage.create({ client: otherClient });
+			expect(other.existsSync("/sessions/p/a.jsonl")).toBe(true);
+		} finally {
+			await otherClient.end();
+		}
+	});
 });
