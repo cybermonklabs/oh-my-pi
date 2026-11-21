@@ -2,6 +2,7 @@ import type * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, isEnotdir, isFsError, logger, toError } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { RACY_STAMP_WINDOW_MS } from "../tools/racy-stamp";
 import {
 	collectEnvSecretValues,
 	connectionUrlPasswords,
@@ -37,7 +38,11 @@ export interface SessionStoreMaskerOptions {
 	env?: () => Env;
 	/** Directory of the global secrets.yml. */
 	agentDir: string;
-	/** Clock for the refresh interval, and to tell a file changed just before its read (default: `Date.now`). */
+	/**
+	 * Clock for the refresh interval, and to tell a file changed just before its read (default: `Date.now`).
+	 * It must give Unix-epoch milliseconds, comparable with file times: on a clock behind the files' change
+	 * times every file counts as just changed, so no stamp is kept and every refresh reads every file again.
+	 */
 	now?: () => number;
 }
 
@@ -145,17 +150,24 @@ function stampOf(filePath: string, stat: fs.BigIntStats): string {
 }
 
 /**
- * How long a file must have gone unchanged before its stamp is trusted. A filesystem times a change by
- * its clock's tick (a few milliseconds on Linux, up to two seconds elsewhere), so two writes in one tick
- * leave the same mtime and ctime, and a rewrite of the same size then leaves the whole stamp as it was.
+ * How long a file must have gone unchanged before its stamp is trusted: git's racy-clean window, shared
+ * with the grep tool. A filesystem times a change by its clock's tick (a few milliseconds on Linux, up to
+ * two seconds elsewhere), so two writes in one tick leave the same mtime and ctime, and a rewrite of the
+ * same size then leaves the whole stamp as it was.
  */
-const STAMP_SETTLE_NS = 2_000_000_000n;
+const STAMP_SETTLE_NS = BigInt(RACY_STAMP_WINDOW_MS) * 1_000_000n;
 
 /**
  * The stamp to keep for the file `stat` describes, read at `readAtMs` on the masker's clock: none while
  * its last change is within {@link STAMP_SETTLE_NS} of the read, so the next refresh reads it again, as
  * git reads again a file whose index entry was written in the tick of its last change. Otherwise a
  * value rotated in the tick of the read before it would never be read.
+ *
+ * The file's times come from the filesystem's clock and the read time from the masker's. Where the
+ * filesystem's clock runs {@link STAMP_SETTLE_NS} or more behind (an NFS or SMB server, a VM share whose
+ * guest clock drifted), a file just changed already counts as settled, and a same-size rewrite in the
+ * tick of a read is missed as it was before this rule. git does not have this gap: it compares with the
+ * index file's own mtime, from the same clock.
  */
 function settledStampOf(filePath: string, stat: fs.BigIntStats, readAtMs: number): string | undefined {
 	const changedNs = stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;

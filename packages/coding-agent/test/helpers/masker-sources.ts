@@ -1,5 +1,6 @@
 import { spyOn } from "bun:test";
 import * as fs from "node:fs";
+import { RACY_STAMP_WINDOW_MS } from "@oh-my-pi/pi-coding-agent/tools/racy-stamp";
 import { logger } from "@oh-my-pi/pi-utils";
 
 /** The marker of the first entry of a project secrets.yml. */
@@ -8,6 +9,20 @@ export const YML_MARKER = "[REDACTED:secrets.yml:project#1]";
 /** A secrets.yml whose one entry is the plain value `value`. */
 export function plainYml(value: string): string {
 	return ["- type: plain", `  content: ${value}`].join("\n");
+}
+
+/**
+ * The first reading of the masker's clock, in Unix-epoch milliseconds, at which each of `paths` has
+ * gone unchanged for the racy-stamp window, so a read of it then keeps its stamp.
+ */
+export function settledClock(paths: readonly string[]): number {
+	const changedNs = paths.map(file => {
+		const stat = fs.statSync(file, { bigint: true });
+		return stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs;
+	});
+	const lastNs = changedNs.reduce((last, ns) => (ns > last ? ns : last));
+	// Rounded up to the next millisecond, as the masker's clock gives whole milliseconds.
+	return Number((lastNs + 999_999n) / 1_000_000n) + RACY_STAMP_WINDOW_MS;
 }
 
 /**

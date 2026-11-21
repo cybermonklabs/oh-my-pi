@@ -38,7 +38,7 @@ import * as utils from "@oh-my-pi/pi-utils";
 import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
-import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
+import { failNextReads, plainYml, settledClock, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
 
 const ENV_VALUE = "zq9-synthetic-service-4821";
 const FILE_VALUE = "file-held-token-7310";
@@ -958,13 +958,16 @@ describe("session store masking as the masker's sources change", () => {
 	}
 
 	it("K23: goes on writing under the values it holds when a refresh cannot read a source, and masks the rotated values once it can", async () => {
-		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A2"];
-		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B2"];
+		// Each rotation changes the value's length, so it always changes the file's stat.
+		const [ymlBefore, ymlAfter] = ["yml-held-value-A1", "yml-held-value-A22"];
+		const [fileBefore, fileAfter] = ["file-held-value-B1", "file-held-value-B22"];
 		const fileMarker = "[REDACTED:file:ROTATING_FILE]";
 		const yml = path.join(cwd, ".omp", "secrets.yml");
 		const rotatingFile = tmp.join("rotating.txt");
 		await Bun.write(yml, plainYml(ymlBefore));
 		await Bun.write(rotatingFile, fileBefore);
+		// Each read comes after both files have settled, so a read that succeeds keeps their stamps.
+		now = settledClock([yml, rotatingFile]);
 		useProcessMasker({ ROTATING_FILE: rotatingFile });
 		const storage = new FileSessionStorage();
 		const manager = await maskedSession(cwd, storage);
@@ -984,7 +987,8 @@ describe("session store masking as the masker's sources change", () => {
 		await Bun.write(rotatingFile, fileAfter);
 		const pending = failNextReads([yml, rotatingFile]);
 		const warnings = sourceReadWarnings();
-		now += 60_000;
+		// The rotated files have settled too: a stamp the failed read kept would hold at the next refresh.
+		now = Math.max(now + 60_000, settledClock([yml, rotatingFile]));
 		// The write goes on: the values held before stay masked, the rotated ones are not held yet.
 		expect(await write()).toEqual([beforeRotation, beforeRotation]);
 		expect(pending.size).toBe(0);
