@@ -82,7 +82,7 @@ async fn native_listing_reports_names_and_types() {
 	{
 		std::os::unix::fs::symlink("a.txt", tmp.0.join("link")).unwrap();
 		mkfifo(&tmp.0.join("fifo"));
-		let _socket = std::os::unix::net::UnixListener::bind(tmp.0.join("sock")).unwrap();
+		let _socket = bind_socket_in(&tmp.0, "sock");
 	}
 	let fs = Fs::native();
 	let mut s = fs.session();
@@ -100,6 +100,43 @@ async fn native_listing_reports_names_and_types() {
 		"b.txt".to_owned(),
 		FileType::File
 	)]);
+}
+
+/// Binds a Unix socket named `name` in `dir`. A socket address holds a path of
+/// at most 108 bytes (104 on macOS), and a test's directory can be longer:
+/// Bazel's `TEST_TMPDIR` is. So the bind goes through a symlink to `dir` in a
+/// short directory of its own under `/tmp`, removed again once the socket is
+/// made; the socket itself is an entry of `dir`.
+#[cfg(unix)]
+fn bind_socket_in(dir: &Path, name: &str) -> std::os::unix::net::UnixListener {
+	use std::os::unix::ffi::OsStrExt as _;
+	let mut template = *b"/tmp/pw-sock-XXXXXX\0";
+	// SAFETY: `template` is a writable, NUL-terminated template ending in six
+	// `X`s, which `mkdtemp` replaces in place.
+	let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+	assert!(!made.is_null(), "mkdtemp: {}", io::Error::last_os_error());
+	let short = PathBuf::from(std::ffi::OsStr::from_bytes(&template[..template.len() - 1]));
+	let link = short.join("d");
+	std::os::unix::fs::symlink(dir, &link).unwrap();
+	let bound = std::os::unix::net::UnixListener::bind(link.join(name));
+	std::fs::remove_file(&link).unwrap();
+	std::fs::remove_dir(&short).unwrap();
+	bound.unwrap_or_else(|err| panic!("bind {name} in {}: {err}", dir.display()))
+}
+
+/// [`bind_socket_in`] makes the socket in a directory whose path, with the
+/// socket's name, is longer than a socket address holds.
+#[cfg(unix)]
+#[test]
+fn a_socket_binds_in_a_directory_too_long_for_its_address() {
+	use std::os::unix::fs::FileTypeExt as _;
+	let tmp = TempDir::new("long-sock");
+	let long = tmp.0.join("d".repeat(120));
+	std::fs::create_dir(&long).unwrap();
+	assert!(long.join("sock").as_os_str().len() > 108, "a socket address would hold the path");
+	let _socket = bind_socket_in(&long, "sock");
+	let entry = std::fs::symlink_metadata(long.join("sock")).unwrap();
+	assert!(entry.file_type().is_socket(), "{:?}", entry.file_type());
 }
 
 /// Full listings carry regular-file sizes and every entry's mtime.
