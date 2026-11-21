@@ -4704,6 +4704,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		}
 		// Spawning tool calls are streaming: boot a subagent worker they will need while their arguments stream.
+		// The loop emits a message's first `start` as `message_start`, not as an update: each assistant
+		// message's count starts from zero there.
+		if (event.type === "message_start" && event.message.role === "assistant") this.#spawnSignal?.reset();
 		const expectedSpawns =
 			event.type === "message_update" ? this.#spawnSignal?.observe(event.assistantMessageEvent) : undefined;
 		if (expectedSpawns) prewarmSubagentWorker(this.settings, this.#modelRegistry, expectedSpawns);

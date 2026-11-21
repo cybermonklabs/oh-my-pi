@@ -60,6 +60,7 @@
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
 - The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
 - A resumed session gives back a provider image's data URL listed under `image_url` (in a tool result's `details`, for example) instead of its `blob:sha256:` reference
+- Parked task subagents no longer keep settings listeners in memory, and the subagent worker booted ahead of a `task` call counts only the current answer's task calls
 
 ## [18.18.6] - 2026-11-09
 
