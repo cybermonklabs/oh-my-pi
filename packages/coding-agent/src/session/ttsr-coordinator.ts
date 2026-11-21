@@ -725,6 +725,8 @@ export class TtsrCoordinator {
 				const injection = this.#getInjectionContent();
 				if (injection) {
 					const details = { rules: injection.rules.map(rule => rule.name), matched: injection.matched };
+					// One timestamp for the message sent and the entry stored: a re-read names the same turn.
+					const timestamp = Date.now();
 					this.#host.agent.appendMessage({
 						role: "custom",
 						customType: "ttsr-injection",
@@ -732,7 +734,7 @@ export class TtsrCoordinator {
 						display: false,
 						details,
 						attribution: "agent",
-						timestamp: Date.now(),
+						timestamp,
 					});
 					this.#host.sessionManager.appendCustomMessageEntry(
 						"ttsr-injection",
@@ -740,6 +742,7 @@ export class TtsrCoordinator {
 						false,
 						details,
 						"agent",
+						timestamp,
 					);
 					this.#markInjected(details.rules);
 				}

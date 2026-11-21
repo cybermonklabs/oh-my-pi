@@ -4955,6 +4955,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					interruptedThinkingMessage.display,
 					interruptedThinkingMessage.details,
 					interruptedThinkingMessage.attribution,
+					// The timestamp the agent sent it with: a re-read names the same turn.
+					interruptedThinkingMessage.timestamp,
 				);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
@@ -11284,6 +11286,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				normalizedAppMessage.display,
 				normalizedAppMessage.details,
 				normalizedAppMessage.attribution,
+				// Its own timestamp, as the default append below keeps one: the image clamp and the date/cwd reminder
+				// name the turn by it, and after a re-read they must find the turn the model was sent.
+				normalizedAppMessage.timestamp,
 			);
 			return false;
 		}

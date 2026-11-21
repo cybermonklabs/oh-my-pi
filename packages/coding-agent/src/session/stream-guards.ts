@@ -173,15 +173,24 @@ export class StreamingEditGuard {
 			if (signal.aborted || this.#host.isDisposed()) return;
 			if (this.#host.promptGeneration() !== generation || this.#host.promptSequence() !== sequence) return;
 			const content = prompt.render(streamingEditRecoveryTemplate, { diagnostic });
-			this.#host.agent.appendMessage({
+			const recovery: CustomMessage = {
 				role: "custom",
 				customType: STREAMING_EDIT_RECOVERY_TYPE,
 				content,
 				display: false,
 				attribution: "agent",
 				timestamp: Date.now(),
-			});
-			this.#host.sessionManager.appendCustomMessageEntry(STREAMING_EDIT_RECOVERY_TYPE, content, false);
+			};
+			this.#host.agent.appendMessage(recovery);
+			// Stored under the timestamp it was sent with, so a re-read names the same turn.
+			this.#host.sessionManager.appendCustomMessageEntry(
+				STREAMING_EDIT_RECOVERY_TYPE,
+				content,
+				false,
+				undefined,
+				"agent",
+				recovery.timestamp,
+			);
 			this.#host.emitNotice(
 				"info",
 				`Streaming edit preview failed; retrying with the error context (attempt ${attempt}/${STREAMING_EDIT_RECOVERY_LIMIT}).`,
@@ -272,6 +281,7 @@ export class LoopGuards {
 			false,
 			details,
 			"agent",
+			redirectMessage.timestamp,
 		);
 	}
 
@@ -310,7 +320,7 @@ export class LoopGuards {
 			if (aborted) this.#host.discardAssistantTurn(aborted);
 			const content = prompt.render(geminiToolReminderTemplate, { count: headerCount });
 			const details = { headers: headerCount };
-			this.#host.agent.appendMessage({
+			const reminder: CustomMessage = {
 				role: "custom",
 				customType: GEMINI_TOOL_REMINDER_TYPE,
 				content,
@@ -318,13 +328,15 @@ export class LoopGuards {
 				details,
 				attribution: "agent",
 				timestamp: Date.now(),
-			});
+			};
+			this.#host.agent.appendMessage(reminder);
 			this.#host.sessionManager.appendCustomMessageEntry(
 				GEMINI_TOOL_REMINDER_TYPE,
 				content,
 				false,
 				details,
 				"agent",
+				reminder.timestamp,
 			);
 			try {
 				await this.#host.agent.continue();

@@ -328,6 +328,8 @@ export class IrcBridge {
 				record.display,
 				record.details,
 				record.attribution ?? "agent",
+				// The message's own time, which the record was sent with: a re-read names the same turn.
+				record.timestamp,
 			);
 			return "injected";
 		}
