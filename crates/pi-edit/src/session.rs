@@ -327,9 +327,9 @@ impl Session {
 	/// for every file, then write in payload order. A writer failure aborts
 	/// the loop; files already written stay written and the error is
 	/// returned verbatim, except a writer's [`EditError::Cancelled`], which
-	/// comes back naming the files this call had already written. URL
-	/// targets never reuse preview-time answers (see
-	/// [`Self::begin_apply_url_targets`]).
+	/// comes back naming what this call's earlier writes changed (a move by
+	/// its source and destination, a delete as deleted). URL targets never
+	/// reuse preview-time answers (see [`Self::begin_apply_url_targets`]).
 	///
 	/// # Errors
 	/// Staging and plan-mode failures, all raised before the first write —
@@ -357,12 +357,14 @@ impl Session {
 
 		let last_write = staged.iter().rposition(|file| file.op != FileOp::Noop);
 		let mut files = Vec::with_capacity(staged.len());
+		// What each completed write changed, for a cancel later in the loop.
+		let mut changed: Vec<String> = Vec::new();
 		for (index, mut file) in staged.into_iter().enumerate() {
 			let canonical = canonical_key(&file.absolute);
 			let response = if file.op == FileOp::Noop {
 				WriteResponse::default()
 			} else {
-				writer
+				let response = writer
 					.write(WriteRequest {
 						absolute:     file.absolute.clone(),
 						display:      file.display.clone(),
@@ -374,15 +376,15 @@ impl Session {
 					})
 					.await
 					.map_err(|err| match err {
-						EditError::Cancelled { .. } => EditError::Cancelled {
-							written: files
-								.iter()
-								.filter(|done: &&FileOutcome| done.op != FileOp::Noop)
-								.map(|done| done.display.clone())
-								.collect(),
-						},
+						EditError::Cancelled { .. } => EditError::Cancelled { written: changed.clone() },
 						other => other,
-					})?
+					})?;
+				changed.push(match (&file.move_to, file.op) {
+					(Some(dest), _) => format!("{} (moved to {})", file.display, dest.display),
+					(None, FileOp::Delete) => format!("{} (deleted)", file.display),
+					(None, _) => file.display.clone(),
+				});
+				response
 			};
 
 			let mut tag: Option<String> = None;

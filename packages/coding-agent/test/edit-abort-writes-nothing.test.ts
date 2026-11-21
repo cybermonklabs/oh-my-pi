@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
@@ -12,13 +13,13 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 let tmpDir: string;
 
-function createSession(): ToolSession {
+function createSession({ enableLsp = false }: { enableLsp?: boolean } = {}): ToolSession {
 	const getArtifactsDir = () => path.join(tmpDir, "artifacts");
 	const getSessionId = () => "session-a";
 	return {
 		cwd: tmpDir,
 		hasUI: false,
-		enableLsp: false,
+		enableLsp,
 		getSessionFile: () => path.join(tmpDir, "session.jsonl"),
 		getSessionSpawns: () => "*",
 		getArtifactsDir,
@@ -107,5 +108,50 @@ describe("EditTool and its call's abort signal", () => {
 		const result = await call;
 		expect(result.isError).not.toBe(true);
 		expect(await Bun.file(backing).text()).toBe("new\n");
+	});
+
+	it("an aborted edit that closes an LSP batch still ends with the cancel message", async () => {
+		// LSP on with its defaults (no format, no diagnostics): the batch flush only announces the
+		// writes, and that announcement rejects on an aborted signal.
+		const session = createSession({ enableLsp: true });
+		const toolCalls = [
+			{ id: "first", name: "edit" },
+			{ id: "second", name: "edit" },
+		];
+		const inBatch = (index: number) =>
+			({ toolCall: { batchId: "batch-1", index, total: 2, toolCalls } }) as unknown as AgentToolContext;
+		await Bun.write(path.join(tmpDir, "earlier.txt"), "one\n");
+		const first = await new EditTool(session, "replace").execute(
+			"first",
+			{ path: "earlier.txt", old_string: "one", new_string: "two" },
+			undefined,
+			undefined,
+			inBatch(0),
+		);
+		expect(first.isError).not.toBe(true);
+
+		const backing = path.join(tmpDir, "n.md");
+		await Bun.write(backing, "old\n");
+		const held = registerHeldScheme(backing);
+		const controller = new AbortController();
+		const call = new EditTool(session, "replace").execute(
+			"second",
+			{ path: "held://n.md", old_string: "old", new_string: "new" },
+			controller.signal,
+			undefined,
+			inBatch(1),
+		);
+		await held.located;
+		controller.abort();
+		held.release();
+
+		const error = await call.then(
+			() => undefined,
+			(rejection: unknown) => rejection,
+		);
+		expect(await Bun.file(backing).text()).toBe("old\n");
+		expect(await Bun.file(path.join(tmpDir, "earlier.txt")).text()).toBe("two\n");
+		expect(error).toBeInstanceOf(ToolAbortError);
+		expect((error as ToolAbortError).message).toBe("Edit cancelled before it wrote anything; no file was changed.");
 	});
 });

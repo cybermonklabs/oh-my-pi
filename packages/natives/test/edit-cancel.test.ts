@@ -154,7 +154,7 @@ describe("EditSession.apply and the call's abort signal", () => {
 		expect(writer.begun).toEqual([path.join(dir, "a.md")]);
 		expect(await Bun.file(path.join(dir, "a.md")).text()).toBe("new\n");
 		expect(result.errorKind).toBe("cancelled");
-		expect(result.text).toBe("Edit cancelled after writing a.md; no other file was changed.");
+		expect(result.text).toBe("Edit cancelled after changing a.md; no other file was changed.");
 	});
 
 	test("a host that declines a write because the call was cancelled is reported as cancelled", async () => {

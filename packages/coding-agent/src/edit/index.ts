@@ -553,7 +553,18 @@ export class EditTool implements AgentTool<TInput> {
 				(_error, request) => this.#write(request, signal),
 			);
 			if (outcome.isError && batch?.flush) {
-				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+				try {
+					await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+				} catch (error) {
+					// The flush runs on this call's signal, so after a cancel it rejects
+					// as aborted; the cancel outcome, which names what this call changed,
+					// is the result.
+					if (outcome.errorKind !== "cancelled") throw error;
+					logger.debug("LSP batch flush after a cancelled edit failed", {
+						batchId: batch.id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			}
 		} catch (error) {
 			if (batch?.flush) await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
@@ -708,7 +719,9 @@ export class EditTool implements AgentTool<TInput> {
 
 	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
 		// Last check before anything touches disk: an aborted call begins no
-		// write. Past this point the write runs to its end and is reported.
+		// write. A write that has begun runs to its end even if the call is
+		// aborted meanwhile; such a call can end as a failed write
+		// (`write_failed`) rather than `cancelled`.
 		if (signal?.aborted) return { written: "", cancelled: true };
 		if (request.op === "delete") {
 			await deleteFileWithFallback(request.path, Bun.file(request.path));

@@ -205,9 +205,10 @@ export declare class EditSession {
   /**
    * Stage and apply the finished edit through `writer`. Never rejects for
    * engine failures: those come back as `isError` outcomes carrying the
-   * model-facing message. Once `request.signal` fires no further write
-   * begins; the outcome is then `cancelled` and names the files already
-   * written.
+   * model-facing message. Once `request.signal` fires, no further write is
+   * handed to `writer`, and the outcome is then `cancelled`, naming what the
+   * call's earlier writes changed (see `EditApplyRequest.signal` for what a
+   * writer must check itself).
    */
   apply(request: EditApplyRequest, writer: (error: Error | null, request: EditWriteRequest) => Promise<EditWriteResponse>): Promise<EditApplyOutcome>
   /** Stop the preview pump and release buffers. */
@@ -1847,8 +1848,12 @@ export interface EditApplyRequest {
   lspBatchId?: string
   lspFlush: boolean
   /**
-   * Abort signal of the tool call. Once it fires no further write begins:
-   * the outcome is `cancelled` and names the files already written.
+   * Abort signal of the tool call. Once it fires, `apply` hands no further
+   * write to the host writer, and the outcome is `cancelled`, naming what
+   * the call's earlier writes changed. A write handed over just before the
+   * abort can still reach the writer after it: a writer that must start
+   * nothing after the abort checks its own signal first and returns
+   * `cancelled: true`.
    */
   signal?: unknown
 }

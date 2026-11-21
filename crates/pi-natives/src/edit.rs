@@ -220,8 +220,12 @@ pub struct EditWriteResponse {
 pub struct EditApplyRequest<'env> {
 	pub lsp_batch_id: Option<String>,
 	pub lsp_flush:    bool,
-	/// Abort signal of the tool call. Once it fires no further write begins:
-	/// the outcome is `cancelled` and names the files already written.
+	/// Abort signal of the tool call. Once it fires, `apply` hands no further
+	/// write to the host writer, and the outcome is `cancelled`, naming what
+	/// the call's earlier writes changed. A write handed over just before the
+	/// abort can still reach the writer after it: a writer that must start
+	/// nothing after the abort checks its own signal first and returns
+	/// `cancelled: true`.
 	pub signal:       Option<Unknown<'env>>,
 }
 
@@ -495,7 +499,7 @@ impl Shared {
 /// Bridges the host writer callback into the engine's writer trait.
 struct TsfnWriter {
 	tsfn:   WriterCallback,
-	/// The call's abort signal: no write begins once it fired.
+	/// The call's abort signal: no write is handed to the host once it fired.
 	cancel: task::CancelToken,
 }
 
@@ -519,8 +523,11 @@ impl EditWriter for TsfnWriter {
 			flush_lsp:    request.flush_lsp,
 			lsp_batch_id: request.lsp_batch_id,
 		};
-		// A write the host has begun is awaited to its end, never dropped: only
-		// the host knows whether its bytes landed.
+		// Between the check above and the host running the write, the JS thread
+		// can abort the signal; only the host can see that, so a host that must
+		// start nothing after the abort checks its own signal (EditTool's writer
+		// does). A write the host has begun is awaited to its end, never
+		// dropped: only the host knows whether its bytes landed.
 		let promise = self
 			.tsfn
 			.call_async(Ok(payload))
@@ -721,9 +728,10 @@ impl EditSession {
 
 	/// Stage and apply the finished edit through `writer`. Never rejects for
 	/// engine failures: those come back as `isError` outcomes carrying the
-	/// model-facing message. Once `request.signal` fires no further write
-	/// begins; the outcome is then `cancelled` and names the files already
-	/// written.
+	/// model-facing message. Once `request.signal` fires, no further write is
+	/// handed to `writer`, and the outcome is then `cancelled`, naming what the
+	/// call's earlier writes changed (see `EditApplyRequest.signal` for what a
+	/// writer must check itself).
 	#[napi]
 	pub fn apply<'env>(
 		&self,

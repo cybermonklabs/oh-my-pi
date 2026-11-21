@@ -42,9 +42,10 @@ pub enum EditError {
 	/// The host writer callback failed; carries its message verbatim.
 	#[error("{0}")]
 	Writer(String),
-	/// The call was cancelled before a write began. `written` names the
-	/// files earlier writes of the same call had already changed; they stay
-	/// changed, and no other file was touched.
+	/// The call was cancelled before a write began. `written` names what
+	/// earlier writes of the same call had already changed (`a.md`,
+	/// `a.md (moved to c.md)`, `a.md (deleted)`); those changes stay, and no
+	/// other file was touched.
 	#[error("{}", cancelled_message(.written))]
 	Cancelled { written: Vec<String> },
 	/// A check refused a payload that parsed; `reason` names the check.
@@ -181,7 +182,7 @@ fn cancelled_message(written: &[String]) -> String {
 	if written.is_empty() {
 		"Edit cancelled before it wrote anything; no file was changed.".to_owned()
 	} else {
-		format!("Edit cancelled after writing {}; no other file was changed.", written.join(", "))
+		format!("Edit cancelled after changing {}; no other file was changed.", written.join(", "))
 	}
 }
 
