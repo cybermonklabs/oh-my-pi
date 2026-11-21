@@ -235,7 +235,7 @@ fn obash() -> i32 {
 	}
 	let modes = EnvModes::from_env();
 	if !cli.testing() && modes.as_ref().is_ok_and(|m| !m.testing()) {
-		return process::main(argv, ProcessOptions::default());
+		return process::main(argv, ProcessOptions::default()).end();
 	}
 	let whole_stdin = cli.print || cli.ir || cli.json.is_some();
 	let mut launch = match process::start(&argv, whole_stdin) {

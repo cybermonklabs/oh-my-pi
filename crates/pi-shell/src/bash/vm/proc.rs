@@ -208,6 +208,17 @@ pub struct VprocZsh {
 	/// op returned anything else. Never imaged: it lives within one op step.
 	#[serde(skip)]
 	pub glob_hook:          Option<(BString, u32)>,
+	/// A `( … )` the root runs in place of itself, as the last command of
+	/// its `-c` string (zsh's `last1`: no fork). Its own last command runs
+	/// in place of it in turn ([`super::killed::in_place`]). A subshell of
+	/// it starts without.
+	#[serde(default)]
+	pub in_place:           bool,
+	/// The signal (its number) the command this vproc ran in place of
+	/// itself died of: an [`Self::in_place`] subshell's process would have
+	/// been that command, so its parent dies of it too.
+	#[serde(default)]
+	pub died_of:            Option<i32>,
 }
 
 /// A number as zsh's `lastmathval` keeps it ([`VprocZsh::last_math`]); a
@@ -237,10 +248,29 @@ impl VprocZsh {
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
 			&& self.glob_hook.is_none()
+			&& !self.in_place
+			&& self.died_of.is_none()
 	}
 }
 
 impl Vproc {
+	/// zsh: a `( … )` the root runs in place of itself
+	/// ([`VprocZsh::in_place`]).
+	pub fn in_place(&self) -> bool {
+		self.zsh.as_ref().is_some_and(|z| z.in_place)
+	}
+
+	/// The signal the command this vproc ran in place of itself died of
+	/// ([`VprocZsh::died_of`]).
+	pub fn died_of(&self) -> Option<i32> {
+		self.zsh.as_ref().and_then(|z| z.died_of)
+	}
+
+	/// The vproc's zsh state, created on first use.
+	pub fn zsh_state(&mut self) -> &mut VprocZsh {
+		self.zsh.get_or_insert_with(Box::default)
+	}
+
 	/// zsh's current sticky emulation.
 	pub fn sticky(&self) -> Option<&crate::bash::store::Sticky> {
 		self.zsh.as_ref().and_then(|z| z.sticky.as_ref())
@@ -1535,6 +1565,16 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// bash's notice of the command a signal killed, written to the shell's
+	/// own standard error once the command's redirections are undone
+	/// ([`super::killed`]).
+	#[serde(default)]
+	pub notice:      Option<Box<BString>>,
+	/// The external runs in place of the shell: the last command of a `-c`
+	/// string the real shell runs without a fork ([`super::killed::in_place`]).
+	/// A signal sent to the shell is the program's then, as for `exec`.
+	#[serde(default)]
+	pub in_place:    bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1754,11 +1794,13 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
+// that to at most 1,840 B. bash's pending notice of a killed command
+// (`ExecState::notice`, 376 → 384 B): the bench measured 1,848 B per idle
+// vproc with it.
 const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

@@ -353,6 +353,10 @@ pub struct Root {
 	synced:            Synced,
 	/// zsh's history events as last written (mirrors their store record).
 	pub hist_events:   parking_lot::Mutex<super::builtins::history::model::EventsCache>,
+	/// The engine's platform ([`crate::bash::EngineConfig::platform`]), for
+	/// code that holds the root but not the kernel (a zsh function's trap
+	/// scope ending as its frame pops names its `TRAPNAL` functions by it).
+	platform:          crate::bash::ids::Platform,
 }
 
 /// The root vproc's fields the interpreter updates in place (`vp.status = …`
@@ -497,6 +501,16 @@ impl Root {
 	/// The store epoch these facts were derived at.
 	pub const fn epoch(&self) -> u64 {
 		self.epoch
+	}
+
+	/// The engine's platform ([`Self::set_platform`]).
+	pub const fn platform(&self) -> crate::bash::ids::Platform {
+		self.platform
+	}
+
+	/// Record the engine's platform (the kernel does, as it starts).
+	pub const fn set_platform(&mut self, platform: crate::bash::ids::Platform) {
+		self.platform = platform;
 	}
 
 	/// Write the lazy empty scopes ([`Self::lazy`]) as store records: before

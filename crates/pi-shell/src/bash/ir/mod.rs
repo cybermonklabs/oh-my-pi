@@ -293,6 +293,15 @@ pub struct Unit {
 	pub conds:               Vec<CondIr>,
 	/// Function definitions.
 	pub funcs:               Vec<FuncIr>,
+	/// The syntax node ids, sorted, of the commands the real shell runs in
+	/// place of itself when this complete command is the last of its `-c`
+	/// string: bash's one simple command with no redirection it runs with
+	/// `exec` and no fork (`lower::bash_tails`); zsh's, with `last1`
+	/// (`lower::zsh_tails`): simple commands it runs with `exec` and no fork,
+	/// and `( … )` subshells it runs in place, one in a `for` body only on the
+	/// loop's last word, which the run decides.
+	#[serde(default)]
+	pub tails:               Vec<u32>,
 }
 
 impl Unit {
@@ -332,6 +341,7 @@ impl Unit {
 			ariths: Vec::new(),
 			conds: Vec::new(),
 			funcs: Vec::new(),
+			tails: Vec::new(),
 		}
 	}
 

@@ -73,6 +73,8 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			notice: None,
+			in_place: false,
 		}
 	}
 
@@ -104,6 +106,8 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			notice,
+			in_place,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +134,8 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*notice = None;
+		*in_place = false;
 	}
 }
 
@@ -2355,6 +2361,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					},
 				};
 			}
+			// A signal that came before the program exists is the shell's as it
+			// runs shell code: the host hands it over now, and it is delivered
+			// before the spawn, as bash takes one that comes before it forks (the
+			// program would not have it). One that comes during the spawn is
+			// taken so when the wait begins ([`super::wait_starts`]). The op runs
+			// again then.
+			cx.host.forward_signals();
+			if k.ctl.word() & super::control::SIGNAL != 0 {
+				return Some(Flow::Block(WaitKey::Signal));
+			}
 			let exec_as = st(vp).exec_as.clone();
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
@@ -2413,6 +2429,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				ChildRedirs { list, exec_diag: super::redir::diag_prefix(k, cx, vp, line, &name) }
 			});
 			let child_redirs = redirs.is_some();
+			// Known before the spawn: a signal can come while it is in flight.
+			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
+			// The root's process becomes the program's: each signal that would
+			// end it is caught, to be the program's
+			// ([`super::untrapped::program_in_place`]). Before the spawn, so
+			// the program starts with its default.
+			if (vp.parent.is_none() || vp.in_place()) && super::runs_in_place(vp) {
+				super::untrapped::program_in_place(k, cx, vp, true);
+			}
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2530,6 +2555,12 @@ fn spawned_external(
 	if spawned.is_err() && !k.bangs.is_empty() {
 		k.settle_bang(vp.vpid, None);
 	}
+	// No program to give them to: the signals sent while it was spawned go,
+	// and the process is the shell's again
+	// ([`super::untrapped::program_ended`]).
+	if spawned.is_err() && (vp.parent.is_none() || vp.in_place()) {
+		super::untrapped::program_ended(k, cx, vp);
+	}
 	match spawned {
 		Err(_) if child_redirs => {
 			// The redirections are applied here after all, then the spawn
@@ -2542,7 +2573,7 @@ fn spawned_external(
 			}
 			st(vp).stage = Stage::Redirect;
 		},
-		Ok(child) => {
+		Ok(mut child) => {
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
@@ -2552,10 +2583,18 @@ fn spawned_external(
 			if !k.bangs.is_empty() {
 				k.settle_bang(vp.vpid, Some(pid));
 			}
+			// Sent to the shell while the program it runs in place of itself
+			// was being spawned: the program's.
+			if vp.parent.is_none() || vp.in_place() {
+				for sig in std::mem::take(&mut k.forward).iter() {
+					let _ = child.signal(sig);
+				}
+			}
 			scratch(vp).live = Live::Ext(child);
 			let s = st(vp);
 			s.waiting = Some(Awaited::Ext { pid });
 			s.stage = Stage::Await;
+			super::wait_starts(k, cx, vp);
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
 		Err(err)
@@ -4525,6 +4564,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// The shell's process was the program it `exec`ed: bash and zsh
+			// run no EXIT trap after it.
+			if replacing && reaped {
+				super::exec::spend_exit_trap(vp);
+			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
 				let text = vp
 					.frames
@@ -4538,6 +4582,31 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					})
 					.unwrap_or_default();
 				super::jobctl::fg_done(k, cx, vp, killed, &text);
+			}
+			let in_place = st(vp).in_place;
+			if let (Some(sig), false) = (killed, replacing) {
+				let end = super::killed::killed(k, cx, vp, op, pid, sig, in_place);
+				// bash ran it with `exec`: its process is the command's. In a
+				// subshell zsh ran in place of itself, that process is the
+				// root's too ([`super::proc::VprocZsh::died_of`]).
+				if end.no_fork {
+					let signal = i32::from(sig.number(platform));
+					match run {
+						Some(run) if vp.parent.is_none() => {
+							k.exec_signals.insert(run, signal);
+						},
+						_ if vp.in_place() => vp.zsh_state().died_of = Some(signal),
+						_ => {},
+					}
+				}
+				st(vp).notice = end.notice.map(Box::new);
+			}
+			super::external_ended(k, vp, killed, replacing);
+			// The program run in place has ended (or is lost): the process is
+			// the shell's own again, with the shell's signal rules; a session
+			// runs its next command ([`super::untrapped::program_ended`]).
+			if vp.parent.is_none() || vp.in_place() {
+				super::untrapped::program_ended(k, cx, vp);
 			}
 			status
 		},
@@ -4699,6 +4768,7 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
+	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
 	vp.pipestatus.clear();
@@ -4717,6 +4787,12 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	// bash writes it from the shell, after the command's redirections,
+	// which only its child had.
+	if let Some(bytes) = notice {
+		vp.out
+			.push_back(PendingWrite { fd: 2, bytes: *bytes, off: 0 });
+	}
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}

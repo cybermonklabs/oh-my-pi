@@ -149,7 +149,9 @@ fn prepare(call: &ToolCall, config: &ToolConfig, waker: Waker) -> flume::Receive
 		let _ = tx.send(run_layers(layers, &args, &cwd, &env, &config));
 		waker.wake();
 	};
-	if let Err(err) = std::thread::Builder::new().name("pi-git".into()).spawn(job) {
+	if let Err(err) =
+		crate::sys::thread::spawn_helper(std::thread::Builder::new().name("pi-git".into()), job)
+	{
 		return finished(Prepared {
 			out:  vec![(2, format!("git: {err}\n").into_bytes())],
 			next: Next::Exit(1),

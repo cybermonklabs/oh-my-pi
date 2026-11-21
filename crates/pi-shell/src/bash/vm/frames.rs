@@ -23,7 +23,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use bstr::{BStr, BString};
+use bstr::BString;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -48,15 +48,15 @@ use crate::bash::{
 		materialize,
 	},
 	mem::{Capture, MemEnd, MemImage, MemObj},
-	signal::{SigSet, Signal},
+	signal::SigSet,
 	snapshot::{ExternalizeReport, Lost, RestoreOpts, RestoreReport},
-	store::{BlobSlot, Change, Key, MiscKey, Record, StateStore, StoreError, Table, TrapKey},
+	store::{BlobSlot, Change, Key, MiscKey, Record, StateStore, StoreError, Table},
 };
 
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -750,7 +750,14 @@ impl Shell {
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
-		reinstall_signal_traps(cx)?;
+		// A restore in a new process starts with default dispositions
+		// (handlers do not survive `exec`): the root asks the host again for
+		// each signal's, its traps' and its own rules' alike.
+		if let Err((sig, source)) =
+			super::untrapped::reinstall(&shell.k, cx, &shell.procs[0]).map_err(RestoreError::Store)?
+		{
+			return Err(RestoreError::SignalSetup { sig, source });
+		}
 		let root = (shell.procs[0].vpid, shell.procs[0].mode);
 		shell
 			.k
@@ -1085,35 +1092,6 @@ impl Shell {
 		}
 		Ok(())
 	}
-}
-
-/// Give the host the OS disposition of every trapped or ignored signal in
-/// the root trap table: a restore in a new process starts with default
-/// dispositions (handlers do not survive `exec`), so a trapped signal
-/// would otherwise kill it. `KILL` and `STOP` cannot be trapped; `CHLD`
-/// traps run from the engine (one per reaped child), with no OS handler,
-/// as the `trap` builtin sets them.
-///
-/// # Errors
-///
-/// [`RestoreError::Store`] when the trap table cannot be read,
-/// [`RestoreError::SignalSetup`] when the host refuses a disposition.
-fn reinstall_signal_traps(cx: &mut Cx<'_>) -> Result<(), RestoreError> {
-	let mut traps = Vec::new();
-	cx.store.scan(Table::Trap, &mut |key, rec| {
-		if let (Key::Trap(TrapKey::Signal(sig)), Record::Trap { action, .. }) = (key, rec)
-			&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
-		{
-			traps.push((sig, action.clone()));
-		}
-	})?;
-	for (sig, action) in traps {
-		// `Ok(false)`: ignored on entry, which the trap table already says.
-		cx.host
-			.set_signal_trap(sig, Some(BStr::new(&action)))
-			.map_err(|source| RestoreError::SignalSetup { sig, source })?;
-	}
-	Ok(())
 }
 
 fn run_image(r: &Run) -> RunImage {

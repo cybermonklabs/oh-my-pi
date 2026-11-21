@@ -20,36 +20,22 @@ use crate::bash::{
 /// zsh `SIGCOUNT`: the signals `kill -l` lists (`$signals[2,32]`).
 const SIGCOUNT: i64 = 31;
 
-/// zsh `sigs[n]` for `1 <= n <= SIGCOUNT` (as `$signals`).
+/// zsh `sigs[n]` for `1 <= n <= SIGCOUNT` (as `$signals`): zsh's name of
+/// the signal ([`Signal::zsh_name`]).
 fn sig_name(n: i64, platform: Platform) -> String {
 	u8::try_from(n)
 		.ok()
 		.and_then(|n| Signal::from_number(n, platform))
-		.map_or_else(|| format!("SIG{n}"), |s| s.to_string())
+		.map_or_else(|| format!("SIG{n}"), |s| s.zsh_name(platform).to_owned())
 }
 
 /// The signal number `name` (without `SIG`) names in `sigs`, then zsh's
-/// `alt_sigs` (`CLD` and `IO` where they alias `CHLD` and `POLL`; `ERR`
-/// names zsh's `SIGZERR`, past `SIGCOUNT`, so never a signal here).
+/// `alt_sigs` ([`Signal::from_zsh_name`]; `ERR` names zsh's `SIGZERR`,
+/// past `SIGCOUNT`, so never a signal here).
 fn sig_number(name: &[u8], platform: Platform, nocase: bool) -> Option<i64> {
-	let eq = |a: &[u8], b: &[u8]| {
-		if nocase {
-			a.eq_ignore_ascii_case(b)
-		} else {
-			a == b
-		}
-	};
-	if let Some(n) = (1..=SIGCOUNT).find(|&n| eq(sig_name(n, platform).as_bytes(), name)) {
-		return Some(n);
-	}
-	if platform == Platform::Linux {
-		for (alt, sig) in [(&b"CLD"[..], Signal::Chld), (b"IO", Signal::Io)] {
-			if eq(alt, name) {
-				return Some(i64::from(sig.number(platform)));
-			}
-		}
-	}
-	None
+	Signal::from_zsh_name(name, platform, nocase)
+		.map(|s| i64::from(s.number(platform)))
+		.filter(|n| (1..=SIGCOUNT).contains(n))
 }
 
 /// zsh `zstrtol(s, &end, 10)`: blanks, a sign, decimal digits; the value

@@ -108,10 +108,12 @@ impl Poller {
 	fn start() -> Self {
 		let started = io::pipe().and_then(|(r, w)| {
 			set_nonblocking(w.as_raw_fd())?;
-			thread::Builder::new()
-				.name("obash-ready".into())
-				.stack_size(64 << 10)
-				.spawn(move || run(r))?;
+			crate::sys::thread::spawn_helper(
+				thread::Builder::new()
+					.name("obash-ready".into())
+					.stack_size(64 << 10),
+				move || run(r),
+			)?;
 			Ok(w)
 		});
 		Self { entries: Mutex::new(Vec::new()), next: AtomicU64::new(1), wake: started.ok() }

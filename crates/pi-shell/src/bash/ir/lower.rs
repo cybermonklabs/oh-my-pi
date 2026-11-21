@@ -125,6 +125,12 @@ fn lower_command(
 		let idx = l.str(&w.bash_msg);
 		l.emit(Opcode::Warn, idx, w.line, w.line);
 	}
+	if mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		zsh_tails(cc.list(), &mut l.unit.tails);
+		l.unit.tails.sort_unstable();
+	} else {
+		bash_tails(cc.list(), &mut l.unit.tails);
+	}
 	l.list(cc.list())?;
 	l.emit(Opcode::End, 0, 0, 0);
 	match replay_id {
@@ -133,6 +139,95 @@ fn lower_command(
 		_ => l.unit.seal_from(l.source_hash),
 	}
 	Ok(l.unit)
+}
+
+/// bash's command that it runs with `exec` and no fork when this complete
+/// command ends the `-c` string (`evalstring.c` `should_suppress_fork`,
+/// `can_optimize_connection`): the simple command with no redirection that
+/// ends the list, a pipeline of its own (no `!`, `time` or second stage)
+/// that ends its and-or list, not run in the background; after an earlier
+/// item only when `;` or a newline ends that one and the command is its
+/// and-or list alone (`connection(earlier, this, ';')`). bash forks a
+/// compound command's last command. Node ids into `out`.
+fn bash_tails(list: st::List<'_>, out: &mut Vec<u32>) {
+	let items = list.items();
+	let Some(item) = items.last() else {
+		return;
+	};
+	let ao = item.and_or();
+	let background = |sep| matches!(sep, syn::Sep::Amp | syn::Sep::Disown);
+	if background(item.sep())
+		|| (items.len() > 1
+			&& items
+				.get(items.len() - 2)
+				.is_some_and(|earlier| background(earlier.sep()) || ao.rest().len() != 0))
+	{
+		return;
+	}
+	let p = ao.rest().last().map_or_else(|| ao.first(), |(_, p)| p);
+	if p.bang() || p.time().is_some() {
+		return;
+	}
+	if let Some(cmd) = p.stages().one()
+		&& let st::CommandKind::Simple(_) = cmd.kind()
+		&& cmd.redirs().is_empty()
+	{
+		out.push(cmd.id().0);
+	}
+}
+
+/// zsh's `last1` (`execlist`, `execpline`, `execcmd`): what of `list` zsh
+/// runs in place of itself when `list` is the last it runs. The last list
+/// item, unless it runs in the background; of its and-or list, the last
+/// pipeline, when that has one stage and no `!` or `time`; that command if
+/// it is simple, else on into the body of a `{ }`, the always-list of a `try`
+/// (`exectry`; not its try-list), the body of a `( … )` (whose node goes in
+/// too: zsh runs it without a fork), of every branch of an `if` (not a
+/// condition), of each `case` arm that ends with `;;` (`;&` and `;|` run on)
+/// and of a `for` over words (`execfor`: on its last word only, which the
+/// run decides, [`crate::bash::vm`]'s `no_fork`; not `for ((…))`). Node ids
+/// into `out`.
+fn zsh_tails(list: st::List<'_>, out: &mut Vec<u32>) {
+	let Some(item) = list.items().into_iter().next_back() else {
+		return;
+	};
+	if matches!(item.sep(), syn::Sep::Amp | syn::Sep::Disown) {
+		return;
+	}
+	let ao = item.and_or();
+	let p = ao.rest().last().map_or_else(|| ao.first(), |(_, p)| p);
+	if p.bang() || p.time().is_some() {
+		return;
+	}
+	let Some(cmd) = p.stages().one() else {
+		return;
+	};
+	match cmd.kind() {
+		st::CommandKind::Simple(_) => out.push(cmd.id().0),
+		st::CommandKind::Brace(body) => zsh_tails(body, out),
+		st::CommandKind::Subshell(body) => {
+			out.push(cmd.id().0);
+			zsh_tails(body, out);
+		},
+		st::CommandKind::If(i) => {
+			for arm in i.arms() {
+				zsh_tails(arm.body, out);
+			}
+			if let Some(body) = i.else_body() {
+				zsh_tails(body, out);
+			}
+		},
+		st::CommandKind::Case(c) => {
+			for arm in c.arms() {
+				if arm.term() == syn::CaseTerm::Break {
+					zsh_tails(arm.body(), out);
+				}
+			}
+		},
+		st::CommandKind::Try(t) => zsh_tails(t.always(), out),
+		st::CommandKind::For(f) => zsh_tails(f.body(), out),
+		_ => {},
+	}
 }
 
 /// Lower a word parsed at run time (`parse_text`: here-document bodies,

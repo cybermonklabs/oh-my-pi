@@ -939,7 +939,16 @@ impl<'e, 'c> Expander<'e, 'c> {
 			.and_then(|v| v.as_scalar().map(BString::from));
 		Ok(match (v, user) {
 			(Some(v), _) => Some(v),
-			(None, b"") => Some(self.cx.host.user().home),
+			// bash `sh_get_home_dir`: the password database entry's home, `/`
+			// for a user without one.
+			(None, b"") => {
+				let home = self.cx.host.user().home;
+				Some(if home.is_empty() {
+					BString::from("/")
+				} else {
+					home
+				})
+			},
 			(None, _) => None,
 		})
 	}
@@ -2089,7 +2098,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 				},
 				b'u' => {
 					let name = self.cx.host.user().name;
-					lit(&mut out, &name);
+					// bash `get_current_user_info`: a uid without a password
+					// database entry is named so.
+					let shown: &[u8] = if name.is_empty() {
+						b"I have no name!"
+					} else {
+						&name
+					};
+					lit(&mut out, shown);
 				},
 				b'h' | b'H' => {
 					let host = self.cx.host.hostname();
