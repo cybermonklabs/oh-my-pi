@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `history -w` and `history -a` to a FIFO, a pipe or a socket writing the history again on every poll, without end; the write now counts the bytes it wrote instead of reading the file's position, which such a file does not have
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
