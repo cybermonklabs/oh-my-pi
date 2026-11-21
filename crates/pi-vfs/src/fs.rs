@@ -355,7 +355,7 @@ impl FifoEnd {
 /// its helper's open, one poll slice apart (about a second in all), before it
 /// leaves the helper blocked.
 #[cfg(unix)]
-const FIFO_RELEASE_ATTEMPTS: usize = 10;
+pub(crate) const FIFO_RELEASE_ATTEMPTS: usize = 10;
 
 /// The FIFO an open started on, pinned so that the open and its releases
 /// reach it ([`FifoOpening::start_pinned`]).
