@@ -4,10 +4,12 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
+import { holdAsAnOlderLinuxBuild } from "../helpers/older-build-lock";
 
 /** Long enough that no endpoint check runs during a test: a broker here stops only when asked. */
 const NO_ENDPOINT_CHECK_MS = 3_600_000;
@@ -51,6 +53,17 @@ async function stop(client: DaemonBrokerClient, broker: { run: Promise<void> }):
 	await client.request({ op: "shutdown" });
 	client.close();
 	await broker.run;
+}
+
+/** Start a broker with a client for its scope, and report whether it took the scope; one that did is stopped. */
+async function attempt(projectDir: string, runtimeDir: string): Promise<"listening" | "returned"> {
+	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 3_600_000 });
+	const listening = Promise.withResolvers<"listening">();
+	const run = startBroker(projectDir, runtimeDir, () => listening.resolve("listening"));
+	const outcome = await Promise.race([listening.promise, run.then(() => "returned" as const)]);
+	if (outcome === "listening") await stop(client, { run });
+	else client.close();
+	return outcome;
 }
 
 describe.skipIf(process.platform === "win32")("daemon broker scope lock", () => {
@@ -111,4 +124,52 @@ describe.skipIf(process.platform === "win32")("daemon broker scope lock", () => 
 			await successor.exited;
 		}
 	}, 30_000);
+
+	// A broker of an older build locks broker.pid itself, and holds that lock before it writes its pid
+	// there; a broker of this build locks a sidecar beside the runtime dir, which never meets it.
+	it("steps back while broker.pid's lock is held, as a broker of an older build holds it", async () => {
+		using tempDir = TempDir.createSync("@omp-launch-scope-lock-older-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+		const previousTitle = process.title;
+		// macOS: an older build's lock exactly. Linux: the open-file-description lock the probe reads.
+		const older = FileLock.tryAcquire(path.join(runtimeDir, "broker.pid"));
+		try {
+			expect(older.acquired).toBe(true);
+			expect(await attempt(projectDir, runtimeDir)).toBe("returned");
+			older.release();
+			// Control: with that lock gone, the same scope is taken.
+			expect(await attempt(projectDir, runtimeDir)).toBe("listening");
+		} finally {
+			older.release();
+			process.title = previousTitle;
+		}
+	}, 30_000);
+
+	it.skipIf(process.platform !== "linux")(
+		"steps back while an older Linux build holds broker.pid as its abstract socket name",
+		async () => {
+			using tempDir = TempDir.createSync("@omp-launch-scope-lock-older-linux-");
+			const projectDir = path.join(tempDir.path(), "project");
+			const runtimeDir = path.join(tempDir.path(), "runtime");
+			await fs.mkdir(projectDir);
+			await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+			const previousTitle = process.title;
+			const release = holdAsAnOlderLinuxBuild(path.join(runtimeDir, "broker.pid"));
+			try {
+				expect(await attempt(projectDir, runtimeDir)).toBe("returned");
+			} finally {
+				release();
+			}
+			try {
+				// Control: once the older build exits, the same scope is taken.
+				expect(await attempt(projectDir, runtimeDir)).toBe("listening");
+			} finally {
+				process.title = previousTitle;
+			}
+		},
+		30_000,
+	);
 });

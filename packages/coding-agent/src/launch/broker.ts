@@ -373,12 +373,23 @@ async function holdsLiveForeignLease(pidPath: string, endpoint: string): Promise
  * beside the runtime dir ({@link daemonBrokerLockPath}), so deleting the dir
  * does not free the scope while this broker runs. `broker.pid` stays as
  * human-readable metadata for `omp ps` and dead-scope pruning.
+ *
+ * A broker of an older build locks `broker.pid` itself, which this lock never
+ * meets, and holds that lock before it writes its pid there. So the scope is
+ * refused while anyone holds `broker.pid`'s lock: on Linux the open-file
+ * description query plus the probe of the older build's abstract name, on
+ * macOS `F_GETLK` (which sees the older `flock`), on Windows the mutex listing.
  */
 async function acquireBrokerLease(runtimeDir: string, endpoint: string): Promise<BrokerLease | null> {
 	const pidPath = path.join(runtimeDir, PID_FILE);
 	const lock = FileLock.tryAcquire(daemonBrokerLockPath(runtimeDir));
 	if (!lock.acquired) return null;
 	try {
+		// A broker of an older build holds broker.pid's lock (see above).
+		if (FileLock.isHeld(pidPath)) {
+			lock.release();
+			return null;
+		}
 		// A broker from a build without the native lock cannot be seen through it;
 		// adopt the scope instead of starting a duplicate supervisor.
 		if (await holdsLiveForeignLease(pidPath, endpoint)) {
@@ -418,6 +429,16 @@ async function releaseBrokerLease(lease: BrokerLease): Promise<void> {
  * the path, which no deletion freed; the sidecar outlives the dir in the same
  * way (on macOS too, where the lock used to be `broker.pid` itself), short of a
  * deletion of the directory that holds it.
+ *
+ * Nothing removes a sidecar: there is one empty file for each scope ever
+ * started, in the daemons root beside the scope dirs, and the pruner passes
+ * over anything that is not a directory (`pruneDeadDaemonRuntimeDirs`).
+ * Unlinking it is not safe even for a pruner that holds the lock and checks
+ * the inode first: a broker that opened the old file before the unlink can
+ * take its lock after the pruner lets go, while another broker creates and
+ * locks a new file at the path, and both serve. Removal would need every
+ * acquirer to recheck the path's inode after locking, which `FileLock` does
+ * not do.
  */
 export function daemonBrokerLockPath(runtimeDir: string): string {
 	return `${path.resolve(runtimeDir)}.broker.lock`;
