@@ -23,14 +23,23 @@
 //! reaches the sink ahead of whatever the next command writes there. Only the
 //! relay reads the pipe, and the task polling it is the one sizing the
 //! drain, so at the exit what the relay has read and what the pipe holds are
-//! one snapshot: everything the exited program wrote. The exit is reported
-//! once the relay has forwarded that much. A process the program left
-//! running may keep the pipe open forever; the drain never waits for the end
-//! of the stream beyond a short grace for a character the program ended
-//! inside. The relay itself goes on to the end of the stream, as a plain pipe
-//! would carry that process's output: once the `ExtProc` is dropped it runs
-//! as adopted work (`pump::orphan`), and releases what the decoder holds at
-//! the end.
+//! one snapshot: everything the exited program wrote, and whatever another
+//! process holding the pipe wrote by then. The exit is reported once the
+//! relay has forwarded that much. A process the program left running may
+//! keep the pipe open forever; the drain never waits for the end of the
+//! stream beyond a short grace for a character the bytes end inside. Past
+//! the grace the decoder releases those bytes once
+//! ([`ByteDecoder::release`]) and the relay forwards them before the exit is
+//! reported, so the next command's output does not overtake them. They need
+//! not be the program's: a process it left running may have written them
+//! before the exit, and a character that process finishes later then comes
+//! out broken: its start as the release gave it, and its rest, as the
+//! decoder reads the bytes that come next, dropped. The release does not end
+//! the stream: the decoder decodes the bytes after that character as if it
+//! had never been written. The relay itself goes on to the end of the
+//! stream, as a plain pipe would carry that process's output: once the
+//! `ExtProc` is dropped it runs as adopted work (`pump::orphan`), and
+//! releases what the decoder holds at the end.
 
 use std::{
 	fs,
@@ -63,10 +72,19 @@ pub trait ByteDecoder: Send {
 	fn holds_bytes(&self) -> bool;
 	/// Flush held bytes at the end of the stream.
 	fn finish(&mut self) -> String;
+	/// Give out the held bytes now, while the stream goes on (another
+	/// process may still write into it). The held bytes come out once, as a
+	/// replacement character or as the decoder's own reading of them. The
+	/// bytes that come next and that the decoder reads as the rest of their
+	/// character are dropped, and no others; the bytes after that character
+	/// are decoded as if it had never been written. A relay calls it at most
+	/// once, when its program has exited and the end of the stream has not
+	/// come within a short grace.
+	fn release(&mut self) -> String;
 }
 
 /// How long the drain waits for the end of the stream when the decoder holds
-/// the start of a character the program ended inside.
+/// the start of a character, before it has the decoder release those bytes.
 const HOLD_GRACE: Duration = Duration::from_millis(50);
 
 /// The OS handle a spawned child's stdio can inherit for `writer`.
@@ -113,10 +131,14 @@ struct Relay {
 	/// Bytes read from the program so far.
 	consumed: u64,
 	phase:    Phase,
-	/// Bytes the program wrote, once its exit sized them.
+	/// Bytes the pipe had carried at the program's exit, once sized: what it
+	/// wrote, and what any other process holding the pipe wrote by then.
 	target:   Option<u64>,
 	/// The hold grace, once the drain waits on a held character.
 	grace:    Option<Timer>,
+	/// The grace ended and the decoder released what it held: the drain no
+	/// longer waits on held bytes.
+	released: bool,
 }
 
 impl Relay {
@@ -133,6 +155,7 @@ impl Relay {
 			phase: Phase::Reading,
 			target: None,
 			grace: None,
+			released: false,
 		}
 	}
 
@@ -215,9 +238,9 @@ impl Relay {
 		}
 	}
 
-	/// After the program's exit: whether everything it wrote has been
-	/// forwarded. The relay itself goes on to the end of the stream, which a
-	/// process the program left running may hold open.
+	/// After the program's exit: whether everything the pipe carried by then
+	/// has been forwarded. The relay itself goes on to the end of the stream,
+	/// which a process the program left running may hold open.
 	fn drained(&mut self, cx: &Context<'_>) -> bool {
 		match self.phase {
 			Phase::Done => return true,
@@ -235,17 +258,47 @@ impl Relay {
 		let Some(target) = self.target else {
 			return false;
 		};
-		self.consumed >= target
-			&& self.sent >= self.text.len().max(self.raw_len)
-			&& (!self
-				.decoder
-				.as_ref()
-				.is_some_and(|decoder| decoder.holds_bytes())
-				|| self
-					.grace
-					.get_or_insert_with(|| Timer::after(HOLD_GRACE))
-					.poll(cx)
-					.is_ready())
+		if self.consumed < target || self.sent < self.text.len().max(self.raw_len) {
+			return false;
+		}
+		if self.released {
+			// What the release gave out is in the sink. The decoder may still
+			// hold bytes: the released ones until what comes next shows where
+			// their character ends, and what came after them.
+			return true;
+		}
+		let Some(decoder) = self
+			.decoder
+			.as_mut()
+			.filter(|decoder| decoder.holds_bytes())
+		else {
+			return true;
+		};
+		if self
+			.grace
+			.get_or_insert_with(|| Timer::after(HOLD_GRACE))
+			.poll(cx)
+			.is_pending()
+		{
+			return false;
+		}
+		// The end of the stream did not come within the grace: another
+		// process holds the pipe. Whose the held bytes are is unknown (the
+		// program's, or what that process wrote before the exit), but the
+		// next command's output must not overtake them: they go into the
+		// sink now, ahead of the exit, once. The stream goes on: the decoder
+		// drops the rest of the released character when it comes and
+		// decodes the bytes after it as if that character had never been
+		// written.
+		self.released = true;
+		self.text = decoder.release().into_bytes();
+		self.sent = 0;
+		if self.text.is_empty() {
+			return true;
+		}
+		// The next poll writes them, then reports the exit.
+		cx.waker().wake_by_ref();
+		false
 	}
 }
 
@@ -453,6 +506,10 @@ mod tests {
 		fn finish(&mut self) -> String {
 			self.held.take().map(char::from).into_iter().collect()
 		}
+
+		fn release(&mut self) -> String {
+			self.finish()
+		}
 	}
 
 	/// An observation-only relay forwards the original read buffer, even
@@ -477,6 +534,193 @@ mod tests {
 		let mut bytes = Vec::new();
 		output.read_to_end(&mut bytes).unwrap();
 		assert_eq!(bytes, b"\xff\xc3\0");
+	}
+
+	/// An external that has exited.
+	struct Exited;
+
+	impl ExtProc for Exited {
+		fn pid(&self) -> u32 {
+			0
+		}
+
+		fn poll_wait(&mut self, _cx: &mut Context<'_>) -> Poll<ExitStatus> {
+			Poll::Ready(ExitStatus::Exited(0))
+		}
+
+		fn signal(&mut self, _sig: Signal) -> io::Result<()> {
+			Ok(())
+		}
+
+		fn stop(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+
+		fn cont(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	/// The crate's own decoder, UTF-8 only (an invalid or unfinished sequence
+	/// becomes U+FFFD), on any host.
+	struct Utf8;
+
+	impl OutputDecoding for Utf8 {
+		fn decoder(&self) -> Box<dyn ByteDecoder> {
+			Box::new(crate::output_decode::OutputDecoder::utf8())
+		}
+	}
+
+	/// The program's output ends inside a character (Latin-1 `é`, a UTF-8
+	/// lead byte), and another process holds a copy of its write end past the
+	/// hold grace, as a fork of this process does until its exec: the
+	/// decoder's verdict on that character is in the sink when the exit is
+	/// reported, so ahead of anything the next command writes there (`caf`
+	/// alone is the exit reported with the byte held). The relay then reads
+	/// on: what the copy writes later follows, once.
+	#[tokio::test]
+	async fn an_unfinished_character_is_out_before_the_exit_while_a_copy_holds_the_pipe() {
+		use std::io::{Read, Seek, Write};
+
+		let mut output = tempfile::tempfile().unwrap();
+		let read = |output: &mut fs::File| {
+			output.rewind().unwrap();
+			let mut bytes = Vec::new();
+			output.read_to_end(&mut bytes).unwrap();
+			bytes
+		};
+		let mut relays = Relays::new(Some(&Utf8));
+		relays
+			.attach(End::File(Box::new(super::super::StdFile::new(output.try_clone().unwrap()))), true)
+			.unwrap();
+		relays.writers[0].write_all(b"caf\xe9").unwrap();
+		let mut copy = relays.writers[0].try_clone().unwrap();
+		let mut child = relays.wrap(Box::new(Exited));
+		let status = std::future::poll_fn(|cx| child.poll_wait(cx)).await;
+		assert_eq!(status, ExitStatus::Exited(0));
+		assert_eq!(read(&mut output), "caf\u{FFFD}".as_bytes());
+		copy.write_all(b"!").unwrap();
+		drop(copy);
+		// What the copy wrote is readable now, so the dropped `ExtProc`
+		// forwards it at once (the end of the stream can come later: another
+		// fork of this test process may still hold the pipe).
+		drop(child);
+		assert_eq!(read(&mut output), "caf\u{FFFD}!".as_bytes());
+	}
+
+	/// A relay with the crate's UTF-8 decoder into a temporary file, around an
+	/// external that has exited after `wrote` went into its pipe; and a copy
+	/// of the pipe's write end, held as a process the program left running
+	/// holds it.
+	fn exited_with_a_copy(wrote: &[u8]) -> (fs::File, fs::File, Relayed) {
+		use std::io::Write;
+
+		let output = tempfile::tempfile().unwrap();
+		let mut relays = Relays::new(Some(&Utf8));
+		relays
+			.attach(End::File(Box::new(super::super::StdFile::new(output.try_clone().unwrap()))), true)
+			.unwrap();
+		relays.writers[0].write_all(wrote).unwrap();
+		let copy = relays.writers[0].try_clone().unwrap();
+		let Relays { set, writers, .. } = relays;
+		drop(writers);
+		(output, copy, Relayed { child: Box::new(Exited), relays: set, status: None })
+	}
+
+	/// What is in the temporary file `output`.
+	fn contents(output: &mut fs::File) -> Vec<u8> {
+		use std::io::{Read, Seek};
+
+		output.rewind().unwrap();
+		let mut bytes = Vec::new();
+		output.read_to_end(&mut bytes).unwrap();
+		bytes
+	}
+
+	/// The release happens once. Between it and the next poll the other
+	/// process writes `!` and the start of 中 (E4), then the rest of 中
+	/// (B8 AD): 中 comes out whole, as a plain pipe would carry it. Released
+	/// again, the start of 中 would be a U+FFFD and its rest two more.
+	#[tokio::test]
+	async fn a_character_written_after_the_release_comes_out_whole() {
+		use std::io::Write;
+
+		let (mut output, mut copy, mut relayed) = exited_with_a_copy(b"caf\xe9");
+		let mut wrote = false;
+		let status = std::future::poll_fn(|cx| {
+			let polled = relayed.poll_wait(cx);
+			// The grace released the held byte, which the next poll writes;
+			// the other process's bytes are in the pipe by then.
+			if polled.is_pending() && !wrote && !relayed.relays[0].text.is_empty() {
+				copy.write_all(b"!\xe4").unwrap();
+				wrote = true;
+			}
+			polled
+		})
+		.await;
+		assert_eq!(status, ExitStatus::Exited(0));
+		assert!(wrote, "the grace never released the held byte");
+		copy.write_all(b"\xb8\xad").unwrap();
+		drop(copy);
+		// What the copy wrote is readable now, so the dropped `ExtProc`
+		// forwards it at once (the end of the stream can come later).
+		drop(relayed);
+		assert_eq!(contents(&mut output), "caf\u{FFFD}!中".as_bytes());
+	}
+
+	/// A process that ends each of its writes inside a character, one write
+	/// per poll, does not hold the exit back: the release happens once, and
+	/// the exit is reported at the poll after it, with what that process
+	/// wrote since still held. (Released at every poll, the exit would wait
+	/// until that process stopped writing, here after 100 writes.)
+	#[tokio::test]
+	async fn a_writer_ending_every_write_inside_a_character_does_not_hold_the_exit() {
+		use std::io::Write;
+
+		let (mut output, mut copy, mut relayed) = exited_with_a_copy(b"caf\xe9");
+		let mut writes = 0;
+		let status = std::future::poll_fn(|cx| {
+			let polled = relayed.poll_wait(cx);
+			if polled.is_pending()
+				&& (writes > 0 || !relayed.relays[0].text.is_empty())
+				&& writes < 100
+			{
+				copy.write_all(&[0xe4]).unwrap();
+				writes += 1;
+			}
+			polled
+		})
+		.await;
+		assert_eq!(status, ExitStatus::Exited(0));
+		assert_eq!(writes, 1);
+		assert_eq!(contents(&mut output), "caf\u{FFFD}".as_bytes());
+		// The decoder held the start of 中 after the release: its rest
+		// finishes it. Readable now, so the dropped `ExtProc` forwards it at
+		// once (the end of the stream can come later).
+		copy.write_all(&[0xb8, 0xad]).unwrap();
+		drop(copy);
+		drop(relayed);
+		assert_eq!(contents(&mut output), "caf\u{FFFD}中".as_bytes());
+	}
+
+	/// The held bytes need not be the program's. Here the program wrote
+	/// `done\n`, and a process it left running wrote E6 97, the start of 日,
+	/// before the exit; it writes the rest of 日 (A5) and `本` after the
+	/// grace. The release cannot tell the two apart: 日 is one U+FFFD, out
+	/// before the exit; its rest is dropped with it, and `本` comes out whole.
+	#[tokio::test]
+	async fn a_character_split_across_the_grace_is_one_replacement() {
+		use std::io::Write;
+
+		let (mut output, mut copy, mut relayed) = exited_with_a_copy(b"done\n\xe6\x97");
+		let status = std::future::poll_fn(|cx| relayed.poll_wait(cx)).await;
+		assert_eq!(status, ExitStatus::Exited(0));
+		assert_eq!(contents(&mut output), "done\n\u{FFFD}".as_bytes());
+		copy.write_all(b"\xa5").unwrap();
+		copy.write_all("本\n".as_bytes()).unwrap();
+		drop(copy);
+		drop(relayed);
+		assert_eq!(contents(&mut output), "done\n\u{FFFD}本\n".as_bytes());
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -626,16 +870,17 @@ mod tests {
 	}
 
 	/// A leftover keeps the pipe open while the decoder holds the character
-	/// the program ended inside: the exit is reported after the short hold
-	/// grace (a timer wakes the drain, nothing else would), and the held byte
-	/// is released at the end of the stream, when the leftover is gone, by the
-	/// relay that outlived the program's `ExtProc`.
+	/// the program ended inside: after the short hold grace (a timer wakes
+	/// the drain, nothing else would) the held byte is released into the
+	/// capture, and then the exit is reported, so the next command's output
+	/// still comes after it. `X` before `c` is the exit reported with the
+	/// byte held.
 	#[tokio::test(flavor = "current_thread")]
-	async fn held_bytes_wait_for_the_end_of_a_stream_a_leftover_holds() {
+	async fn held_bytes_come_before_the_next_command_while_a_leftover_holds_the_pipe() {
 		let (out, took) =
 			run_timed(&mut session(true), "/bin/sh -c 'printf abc; /bin/sleep 1 &'; printf X", true)
 				.await;
-		assert_eq!(out, b"abXc");
+		assert_eq!(out, b"abcX");
 		assert!(took < Duration::from_millis(800), "waited for the leftover: {took:?}");
 	}
 
