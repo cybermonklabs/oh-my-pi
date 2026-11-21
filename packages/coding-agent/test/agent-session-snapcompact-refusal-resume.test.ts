@@ -19,6 +19,25 @@ const GROWTH = 20_000;
 /** How many replies before the final one say what their request sent. */
 const SIZED_REPLIES = 3;
 
+/** A session whose automatic snapcompact pass the cut rule refused, as a case goes on from it. */
+interface RefusedPass {
+	/** The session's manager in the process that refused the pass. */
+	readonly sessionManager: SessionManager;
+	/** The process that refused the pass. */
+	readonly first: AgentSession;
+	/** How many archives the passes have rendered. */
+	renders(): number;
+	/** Whether `manager`'s branch holds a compaction. */
+	compacted(manager: SessionManager): boolean;
+	/** Ends the process that refused and opens its session file again, as omp does when it restarts and resumes it. */
+	restart(): Promise<SessionManager>;
+	/**
+	 * Opens a session on `manager` and ends a turn with its newest reply, which runs the resumed session's first
+	 * maintenance point; gives the automatic compactions it announced.
+	 */
+	maintainResumed(manager: SessionManager): Promise<string[]>;
+}
+
 describe("an automatic snapcompact pass the cut rule refused before the session was resumed", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -67,7 +86,18 @@ describe("an automatic snapcompact pass the cut rule refused before the session 
 		await session.waitForIdle();
 	}
 
-	it("weighs the refused figures before it starts, and renders no archive at the resumed session's first maintenance point", async () => {
+	/** The newest reply of the agent's context. */
+	function lastReply(session: AgentSession): AgentMessage {
+		const last = session.agent.state.messages.findLast(message => message.role === "assistant");
+		if (!last) throw new Error("Expected a reply in the context");
+		return last;
+	}
+
+	/**
+	 * Runs `run` once the first maintenance point of a session past the threshold rendered an archive the cut rule
+	 * refused, and disposes every session it opened.
+	 */
+	async function withRefusedPass(run: (pass: RefusedPass) => Promise<void>): Promise<void> {
 		const bundled = getBundledModel("anthropic", "claude-opus-5-5");
 		const model: Model = { ...bundled, contextWindow: CONTEXT_WINDOW, maxTokens: 64_000 };
 		vi.spyOn(modelRegistry, "find").mockReturnValue(model);
@@ -90,6 +120,10 @@ describe("an automatic snapcompact pass the cut rule refused before the session 
 			sessions.push(session);
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 			return session;
+		};
+		const close = async (session: AgentSession) => {
+			await session.dispose();
+			sessions.splice(sessions.indexOf(session), 1);
 		};
 		try {
 			const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"), undefined, {
@@ -121,8 +155,7 @@ describe("an automatic snapcompact pass the cut rule refused before the session 
 			const before =
 				computeNonMessageTokens(sizing, sizing.agent.tokenizer, sizing.settings.revision) +
 				sizing.agent.tokenizer.countMessages(transcript, { excludeEncryptedReasoning: true });
-			await sizing.dispose();
-			sessions.splice(sessions.indexOf(sizing), 1);
+			await close(sizing);
 			final.usage.cacheRead = before;
 			final.usage.output = 100;
 			final.usage.totalTokens = before + 100;
@@ -141,40 +174,92 @@ describe("an automatic snapcompact pass the cut rule refused before the session 
 
 			// The context (~93,000 tokens) is past the 90,000-token threshold and far below the prompt budget, so the
 			// cut is not forced: the pass starts and renders, and the archive it rendered does not pay for rewriting
-			// itself and the kept turns, so nothing is committed.
+			// itself and the kept turns, so the cut rule refuses it and nothing is committed.
 			await endTurn(first, final);
 			expect({ renders: render.mock.calls.length, compacted: compacted(sessionManager) }).toEqual({
 				renders: 1,
 				compacted: false,
 			});
-			const sessionFile = sessionManager.getSessionFile();
-			if (!sessionFile) throw new Error("Expected the session's file");
-			await sessionManager.flush();
-			await first.dispose();
-			sessions.splice(sessions.indexOf(first), 1);
 
-			// omp restarts a moment later and resumes the session: the entry is as live and the history the same, so
-			// the same archive waits on the same figures. The resumed process weighs them before it starts, as the
-			// process that refused did, and announces and renders nothing.
-			const resumedManager = await SessionManager.open(sessionFile, tempDir.join("sessions"), undefined, {
-				suppressBreadcrumb: true,
-			});
-			const resumed = open(resumedManager);
-			const starts: string[] = [];
-			resumed.subscribe(event => {
-				if (event.type === "auto_compaction_start") starts.push(event.action);
-			});
-			const last = resumed.agent.state.messages.findLast(message => message.role === "assistant");
-			if (!last) throw new Error("Expected the resumed transcript's final reply");
-			await endTurn(resumed, last);
-			expect({ starts, renders: render.mock.calls.length, compacted: compacted(resumedManager) }).toEqual({
-				starts: [],
-				renders: 1,
-				compacted: false,
+			await run({
+				sessionManager,
+				first,
+				renders: () => render.mock.calls.length,
+				compacted,
+				restart: async () => {
+					const sessionFile = sessionManager.getSessionFile();
+					if (!sessionFile) throw new Error("Expected the session's file");
+					await sessionManager.flush();
+					await close(first);
+					return SessionManager.open(sessionFile, tempDir.join("sessions"), undefined, {
+						suppressBreadcrumb: true,
+					});
+				},
+				maintainResumed: async manager => {
+					const resumed = open(manager);
+					const starts: string[] = [];
+					resumed.subscribe(event => {
+						if (event.type === "auto_compaction_start") starts.push(event.action);
+					});
+					await endTurn(resumed, lastReply(resumed));
+					return starts;
+				},
 			});
 		} finally {
 			for (const session of sessions.splice(0)) await session.dispose();
 			await tempDir.remove();
 		}
+	}
+
+	it("weighs the refused figures before it starts, and renders no archive at the resumed session's first maintenance point", async () => {
+		await withRefusedPass(async ({ renders, compacted, restart, maintainResumed }) => {
+			// omp restarts a moment later and resumes the session: the entry is as live and the history the same, so
+			// the same archive waits on the same figures. The resumed process weighs them before it starts, as the
+			// process that refused did, and announces and renders nothing.
+			const resumedManager = await restart();
+			expect({
+				starts: await maintainResumed(resumedManager),
+				renders: renders(),
+				compacted: compacted(resumedManager),
+			}).toEqual({ starts: [], renders: 1, compacted: false });
+		});
+	}, 60_000);
+
+	// The refusal is weighed again by its figures on every branch that carries the leaf it was weighed on. Its record
+	// sits after that leaf on the branch current then, so a branch continued from the leaf itself (`/tree` to it)
+	// carries the leaf but not the record: a process that resumes the session on that branch must still weigh the
+	// refusal, as the process that refused does, instead of rendering the archive again.
+	it("weighs the refusal on a branch continued from the leaf it was weighed on, and renders no archive at the resumed session's first maintenance point", async () => {
+		await withRefusedPass(async ({ sessionManager, first, renders, compacted, restart, maintainResumed }) => {
+			// The refusal is recorded after the final reply.
+			const refusal = sessionManager
+				.getBranch()
+				.find(entry => entry.type === "custom" && entry.customType === "snapcompact-refusal");
+			const refusedLeaf = sessionManager
+				.getBranch()
+				.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+			if (!refusal || !refusedLeaf) throw new Error("Expected the refusal and the reply it was weighed on");
+
+			// `/tree` to the final reply itself: the branch carries the leaf the refusal was weighed on, not its
+			// record. The process that refused weighs its figures there and renders nothing.
+			await first.navigateTree(refusedLeaf.id);
+			await endTurn(first, lastReply(first));
+			expect(renders()).toBe(1);
+
+			// omp restarts a moment later and resumes the session on that branch (the exit record continues it from
+			// the final reply): the entry is as live and the history the same, so the resumed process weighs the same
+			// figures and announces and renders nothing.
+			const resumedManager = await restart();
+			const resumedBranch = resumedManager.getBranch();
+			expect({
+				carriesLeaf: resumedBranch.some(entry => entry.id === refusedLeaf.id),
+				carriesRecord: resumedBranch.some(entry => entry.id === refusal.id),
+			}).toEqual({ carriesLeaf: true, carriesRecord: false });
+			expect({
+				starts: await maintainResumed(resumedManager),
+				renders: renders(),
+				compacted: compacted(resumedManager),
+			}).toEqual({ starts: [], renders: 1, compacted: false });
+		});
 	}, 60_000);
 });

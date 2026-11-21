@@ -243,6 +243,18 @@ function extendRetentionPrefixKey(key: string, messages: HindsightMessage[], fro
 	return key;
 }
 
+/** A transcript's recall, retention and mental-model tracking ({@link HindsightSessionState.conversationTracking}). */
+export interface HindsightConversationTracking {
+	readonly lastRetainedTurn: number;
+	readonly hasRecalledForFirstTurn: boolean;
+	readonly lastRecallSnippet: string | undefined;
+	readonly lastRetainedMessageIndex: number;
+	readonly cachedTranscript: string;
+	readonly lastRetainedPrefixKey: string;
+	readonly mentalModelsSnippet: string | undefined;
+	readonly mentalModelsLoadedAt: number | undefined;
+}
+
 /** Per-session Hindsight runtime state owned by its AgentSession. */
 export class HindsightSessionState implements HindsightSessionStateApi {
 	/** Session id used for retain-queue metadata. */
@@ -326,6 +338,38 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
 		this.#lastRetainedPrefixKey = "";
+	}
+
+	/** What {@link resetConversationTracking} and a transcript's mental-model reload change, for {@link restoreConversationTracking}. */
+	conversationTracking(): HindsightConversationTracking {
+		return {
+			lastRetainedTurn: this.lastRetainedTurn,
+			hasRecalledForFirstTurn: this.hasRecalledForFirstTurn,
+			lastRecallSnippet: this.lastRecallSnippet,
+			lastRetainedMessageIndex: this.#lastRetainedMessageIndex,
+			cachedTranscript: this.#cachedTranscript,
+			lastRetainedPrefixKey: this.#lastRetainedPrefixKey,
+			mentalModelsSnippet: this.mentalModelsSnippet,
+			mentalModelsLoadedAt: this.mentalModelsLoadedAt,
+		};
+	}
+
+	/**
+	 * Puts back the tracking of a transcript the session returns to (a session switch that failed after it reset the
+	 * tracking for the target): its first turn already recalled, and its prompt keeps the mental models it was sent
+	 * with. A recall or a mental-model reload still running for the target is dropped.
+	 */
+	restoreConversationTracking(tracking: HindsightConversationTracking): void {
+		this.#recallGeneration++;
+		this.#mentalModelsLoadGeneration++;
+		this.lastRetainedTurn = tracking.lastRetainedTurn;
+		this.hasRecalledForFirstTurn = tracking.hasRecalledForFirstTurn;
+		this.lastRecallSnippet = tracking.lastRecallSnippet;
+		this.#lastRetainedMessageIndex = tracking.lastRetainedMessageIndex;
+		this.#cachedTranscript = tracking.cachedTranscript;
+		this.#lastRetainedPrefixKey = tracking.lastRetainedPrefixKey;
+		this.mentalModelsSnippet = tracking.mentalModelsSnippet;
+		this.mentalModelsLoadedAt = tracking.mentalModelsLoadedAt;
 	}
 
 	/**

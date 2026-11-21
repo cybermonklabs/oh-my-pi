@@ -212,6 +212,11 @@ import {
 	isAnthropicFastModeFallbackDisabled,
 	normalizeAnthropicBaseUrl,
 } from "./anthropic-state";
+import {
+	type AnthropicToolControls,
+	anthropicKeepsToolDeclaration,
+	declareAnthropicTools,
+} from "./anthropic-tool-declaration";
 
 export {
 	applyClaudeToolPrefix,
@@ -4752,7 +4757,6 @@ type AnthropicControlRecord = { index: number; live: boolean; controls: Anthropi
 /** A control to splice in before `context.messages[index]`. */
 type AnthropicControlInsert = { index: number; spec: AnthropicControlSpec };
 
-type AnthropicToolControls = NonNullable<AnthropicRequestControls["tools"]>;
 type AnthropicEffortControls = NonNullable<AnthropicRequestControls["effort"]>;
 
 function anthropicControlOf(message: Message): AnthropicControlSpec | undefined {
@@ -4826,8 +4830,7 @@ function diffAnthropicActiveTools(
 
 /**
  * Keep top-level `tools` byte-stable across a conversation. The declared list
- * is the latest record's, minus names with no definition in `tools` or
- * `inactiveTools`, plus newly active tools appended with `defer_loading`.
+ * is the latest record's ({@link declareAnthropicTools}).
  * Every recorded active-set change is replayed as a control before the
  * response of the request that made it; the change this request makes goes
  * at the tail. Records at a different index than they were written at are
@@ -4845,11 +4848,6 @@ function planAnthropicToolControls(
 	ownChange: boolean,
 ): { tools: Tool[] | undefined; inserts: AnthropicControlInsert[]; record: AnthropicToolControls | undefined } {
 	if (!enabled || !context.tools) return { tools: context.tools, inserts: [], record: undefined };
-	const definitions = new Map<string, Tool>();
-	for (const tool of context.tools) definitions.set(tool.name, tool);
-	for (const tool of context.inactiveTools ?? []) {
-		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
-	}
 	const activeNames = context.tools.map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
@@ -4859,26 +4857,13 @@ function planAnthropicToolControls(
 		}
 	}
 	const inserts: AnthropicControlInsert[] = [];
-	let declared = activeNames;
-	const deferred = new Set<string>();
 	const latest = toolRecords.at(-1);
+	const { declared, declaredSet, deferred, tools } = declareAnthropicTools(
+		context.tools,
+		context.inactiveTools,
+		latest?.tools,
+	);
 	if (latest) {
-		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
-		declared = latest.tools.declared.filter(name => definitions.has(name));
-		const declaredSet = new Set(declared);
-		for (const name of latest.tools.deferred) {
-			if (declaredSet.has(name)) deferred.add(name);
-		}
-		for (const name of activeNames) {
-			if (declaredSet.has(name)) continue;
-			declared.push(name);
-			declaredSet.add(name);
-			deferred.add(name);
-		}
-		// The API rejects a declaration whose tools are all deferred (a tool-less
-		// conversation gaining tools, or a resume that kept none of the loaded
-		// ones), so load them all and let the controls below replay availability.
-		if (declared.every(name => deferred.has(name))) deferred.clear();
 		// The chain starts from what the top-level declaration makes active, so a
 		// rewritten history converges on the current roster instead of trusting a
 		// record whose earlier controls were summarized away.
@@ -4893,16 +4878,11 @@ function planAnthropicToolControls(
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
 	}
 
-	const tools: Tool[] = [];
-	for (const name of declared) {
-		const tool = definitions.get(name);
-		if (tool) tools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
-	}
 	return {
 		tools,
 		inserts,
 		record: {
-			declared: tools.map(tool => tool.name),
+			declared,
 			deferred: tools.filter(tool => tool.deferLoading === true).map(tool => tool.name),
 			active: activeNames,
 		},
@@ -5242,7 +5222,7 @@ function buildParams(
 	const toolPlan = planAnthropicToolControls(
 		context,
 		records,
-		model.compat.supportsMidConversationToolChanges === true,
+		anthropicKeepsToolDeclaration(model),
 		!compactionRequest,
 	);
 

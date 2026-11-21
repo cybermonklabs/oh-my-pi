@@ -187,6 +187,16 @@ export interface SteeringQueueState {
 	source?: SteeringInterruptSource;
 }
 
+/** What a provider-context transform (`AgentOptions.transformProviderContext`) shapes a context for. */
+export interface ProviderContextRequest {
+	/**
+	 * A side request (`Agent.buildSideRequestContext`): it shares the conversation's prompt prefix but is no part of
+	 * its history, so a transform that keeps state for the conversation's requests reads that state and leaves it as
+	 * it was.
+	 */
+	sideRequest?: boolean;
+}
+
 /**
  * Configuration for the agent loop.
  */

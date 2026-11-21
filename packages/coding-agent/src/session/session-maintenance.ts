@@ -600,8 +600,9 @@ interface RefusedSnapcompact {
 }
 
 /**
- * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal: a process that resumes the
- * session finds the figures on the branch and weighs them before it starts another pass.
+ * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal on the branch current then, after
+ * the leaf the archive was weighed on: a process that resumes the session finds the figures among the entries of every
+ * branch and weighs them on any branch that carries that leaf before it starts another pass.
  */
 const SNAPCOMPACT_REFUSAL_ENTRY_TYPE = "snapcompact-refusal";
 
@@ -613,23 +614,6 @@ function isRecordedSnapcompactRefusal(data: unknown): data is RefusedSnapcompact
 		typeof data.leafId === "string" &&
 		typeof data.contextKey === "string"
 	);
-}
-
-/**
- * The newest refusal `branch` records since its newest compaction; one before it was weighed for the history that
- * compaction replaced.
- */
-function recordedSnapcompactRefusal(branch: readonly SessionEntry[]): RefusedSnapcompact | undefined {
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry.type === "compaction") return undefined;
-		if (entry.type !== "custom" || entry.customType !== SNAPCOMPACT_REFUSAL_ENTRY_TYPE) continue;
-		const data = entry.data;
-		if (isRecordedSnapcompactRefusal(data)) {
-			return { afterTokens: data.afterTokens, leafId: data.leafId, contextKey: data.contextKey };
-		}
-	}
-	return undefined;
 }
 
 /**
@@ -733,6 +717,12 @@ export class SessionMaintenance {
 	#pruneOffer: { sessionId: string; leafId: string | null; withheld: boolean } | undefined;
 	/** The latest automatic snapcompact pass the cut rule refused after rendering ({@link #snapcompactMayBeAdmitted}). */
 	#refusedSnapcompact: RefusedSnapcompact | undefined;
+	/**
+	 * The refusals the session records ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}) on every branch, oldest first, with the
+	 * session they were read for: read once for each session the manager holds (again after a switch to another one)
+	 * and kept current by this process's own writes ({@link #sessionSnapcompactRefusals}).
+	 */
+	#recordedSnapcompactRefusals: { sessionId: string; refusals: RefusedSnapcompact[] } | undefined;
 	/**
 	 * The cut rule's last answer for an automatic model-summary compaction, while it was "waits". While it holds, no
 	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run.
@@ -5609,11 +5599,12 @@ export class SessionMaintenance {
 	 * that cut reaches the {@link onContextCutAdmitted} listeners. With nothing to summarize the rule is not asked.
 	 *
 	 * Once the rule refused a rendered archive, the rule weighs what that archive would leave instead, while the
-	 * context it was rendered for stands ({@link #snapcompactContextKey}, on a branch that grew from the one it was
+	 * context it was rendered for stands ({@link #snapcompactContextKey}, on a branch that carries the leaf it was
 	 * weighed on): the pass starts, runs its hooks and renders again only when those figures are admitted (the context
-	 * grew, the entry lapsed or cannot be read, the reason forces the cut), or once that context is gone (another
-	 * branch or session, a compaction, another model or method settings). The refusal is kept on the branch as well
-	 * ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}), so a process that resumes the session weighs the same figures.
+	 * grew, the entry lapsed or cannot be read, the reason forces the cut), or once that context is gone (a branch
+	 * without that leaf, another session, a compaction, another model or method settings). The refusal is kept in the
+	 * session as well ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}), so a process that resumes it weighs the same figures on
+	 * the same branches, one continued from the refused leaf itself, which does not carry the record, included.
 	 */
 	#snapcompactMayBeAdmitted(
 		reason: "overflow" | "threshold" | "idle" | "incomplete",
@@ -5633,9 +5624,9 @@ export class SessionMaintenance {
 			branch.findLastIndex(entry => entry.id === candidate.leafId) >= 0;
 		let refused = this.#refusedSnapcompact;
 		if (!applies(refused)) {
-			// A refusal this process does not remember: one an earlier process recorded on the branch (a resumed session).
-			refused = recordedSnapcompactRefusal(branch);
-			if (!applies(refused)) refused = undefined;
+			// A refusal this process does not remember: one an earlier process recorded (a resumed session), on this
+			// branch or on another that carries the leaf it was weighed on.
+			refused = this.#sessionSnapcompactRefusals().findLast(applies);
 			this.#refusedSnapcompact = refused;
 		}
 		if (refused) {
@@ -5650,6 +5641,26 @@ export class SessionMaintenance {
 			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
 			keptTokens;
 		return this.#cutRuleAdmits(this.#compactionCut("compaction-snapcompact-bound", reason, afterTokens, trigger));
+	}
+
+	/**
+	 * The refusals the session records on every branch, oldest first ({@link #recordedSnapcompactRefusals}). Each
+	 * record sits after the refused leaf on the branch current when it was written, while the process that wrote it
+	 * weighs it on every branch that carries that leaf, so a process that resumes the session reads them all.
+	 */
+	#sessionSnapcompactRefusals(): RefusedSnapcompact[] {
+		const sessionId = this.#host.sessionManager.getSessionId();
+		if (this.#recordedSnapcompactRefusals?.sessionId === sessionId) return this.#recordedSnapcompactRefusals.refusals;
+		const refusals: RefusedSnapcompact[] = [];
+		for (const entry of this.#host.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== SNAPCOMPACT_REFUSAL_ENTRY_TYPE) continue;
+			const data = entry.data;
+			if (isRecordedSnapcompactRefusal(data)) {
+				refusals.push({ afterTokens: data.afterTokens, leafId: data.leafId, contextKey: data.contextKey });
+			}
+		}
+		this.#recordedSnapcompactRefusals = { sessionId, refusals };
+		return refusals;
 	}
 
 	/**
@@ -6717,11 +6728,13 @@ export class SessionMaintenance {
 							contextKey: this.#snapcompactContextKey(pathEntriesForCompaction, effectiveSettings),
 						};
 						this.#refusedSnapcompact = refused;
-						// Kept on the branch, so a process that resumes the session weighs these figures before it starts.
+						// Kept in the session, so a process that resumes it weighs these figures before it starts.
+						const refusals = this.#sessionSnapcompactRefusals();
 						this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, {
 							version: 1,
 							...refused,
 						});
+						refusals.push(refused);
 					}
 					await this.#emitLifecycleEvent(
 						{

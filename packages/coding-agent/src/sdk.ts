@@ -9,6 +9,7 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	filterProviderReplayMessages,
+	type ProviderContextRequest,
 	resolveTelemetry,
 	type StreamFn,
 	type ThinkingLevel,
@@ -87,7 +88,7 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine, everySetting, type SettingChange } from "./config/registry";
+import { bindEffects, combine, everySetting, type SettingChange, trackSettingsReads } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -1531,7 +1532,7 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 }
 
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
-/** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
+/** Matches the truncation applied to per-server instructions inside `renderSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 /** Built-ins `createTools` force-includes into explicit tool lists; the active set mirrors them. */
 const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context"];
@@ -2104,7 +2105,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		return scan;
 	};
 	// Undefined until needed: enabling `includeWorkspaceTree` mid-session scans
-	// on the next prompt rebuild (see rebuildSystemPrompt).
+	// on the next prompt rebuild (see renderSystemPrompt).
 	let workspaceTreePromise: Promise<WorkspaceTree> | undefined = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
 		: cfgIncludeWorkspaceTree.get(settings)
@@ -4484,7 +4485,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (!own || own.size === 0) return hosted;
 			return new Map([...own, ...hosted].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)));
 		};
-		const rebuildSystemPrompt: SystemPromptRebuilder = async (
+		const renderSystemPrompt: SystemPromptRebuilder = async (
 			toolNames,
 			tools,
 			xdev,
@@ -4736,6 +4737,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
 		};
+		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
+		// them, whether or not a listener rebuilds the prompt for it (`SessionTools.holdToolDeclarationChange`).
+		const rebuildSystemPrompt: SystemPromptRebuilder = async (toolNames, tools, xdev) => {
+			const { value, read } = await trackSettingsReads(settings, () => renderSystemPrompt(toolNames, tools, xdev));
+			return { ...value, settingsRead: read };
+		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
@@ -4836,7 +4843,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,
 		// so that subagents launched in the same parallel batch can see each other in
-		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
+		// their initial `# IRC Peers` block (rendered inside `renderSystemPrompt`).
 		// The session reference is attached after construction below.
 		const registrationInput = {
 			id: resolvedAgentId,
@@ -4901,7 +4908,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 
 		setSessionActiveToolNames(initialToolNames);
-		const { systemPrompt } = await logger.time(
+		const { systemPrompt, settingsRead: baseSettingsRead } = await logger.time(
 			"buildSystemPrompt",
 			rebuildSystemPrompt,
 			initialToolNames,
@@ -4989,17 +4996,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// the main loop and every advisor get their own. Only the main loop
 		// journals its reminders in the session and asks the session's cut rule
 		// about its forced image drops: an advisor's history is not the session's.
+		// A side request (`buildSideRequestContext`) is no part of the history
+		// either: it reads the conversation's image drops and changes none.
 		const createTransformProviderContext = (
 			journal?: DateCwdReminderJournal,
 			imageClamp = new ProviderImageClamp(),
 		) => {
 			const dateCwdReminder = new DateCwdReminderInjector(journal);
-			return async (context: Context, transformModel: Model): Promise<Context> => {
+			const sideImageClamp = imageClamp.sideRequestClamp();
+			return async (context: Context, transformModel: Model, request?: ProviderContextRequest): Promise<Context> => {
+				const clamp = request?.sideRequest ? sideImageClamp : imageClamp;
 				let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 				// The archive was sized for the model active at the last context build; a model switch may have lowered the budget.
 				transformed = capArchiveFrameBytes(transformed, transformModel);
 				transformed = await snapcompactInline.transform(transformed, transformModel);
-				transformed = imageClamp.clampImageCount(transformed, transformModel);
+				transformed = clamp.clampImageCount(transformed, transformModel);
 				transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
 				// After the model-specific normalizers: they carry better wording for the
 				// cases they own (STB WebP), so this stays the backstop for everything
@@ -5007,7 +5018,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				transformed = await dropUnreadableContextImages(transformed, transformModel);
 				transformed = await blobBroker.decorateContext(transformed, transformModel);
 				// Byte budget after decoration: URL/file-referenced images carry no inline bytes.
-				transformed = imageClamp.clampImageBytes(transformed, transformModel);
+				transformed = clamp.clampImageBytes(transformed, transformModel);
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
@@ -5019,7 +5030,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision. Each forced drop is kept on the branch, so a resumed
+		// as forced; asking it logs the decision. Each forced drop is kept in the session, so a resumed
 		// process drops the same images.
 		const mainImageClamp = new ProviderImageClamp(site => {
 			if (session) session.admitsProviderContextCut(providerContextCut(site));
@@ -5124,11 +5135,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
-		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
+		const transformToolCallArguments = (args: Record<string, unknown>, toolName: string): Record<string, unknown> => {
 			let result = args;
-			const maxTimeout = cfgToolsMaxTimeout.get(settings);
-			if (maxTimeout > 0 && typeof result.timeout === "number") {
-				result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
+			if (typeof result.timeout === "number") {
+				// A call to a tool a held settings change keeps declared as sent runs under the settings it was
+				// declared under.
+				const maxTimeout = cfgToolsMaxTimeout.get(
+					(hasSession && session.toolCallSettingsFor(toolName)) || settings,
+				);
+				if (maxTimeout > 0) result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
 			}
 			if (obfuscator?.hasSecrets()) {
 				result = deobfuscateToolArguments(obfuscator, result);
@@ -5527,6 +5542,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			baseSettingsRead,
 			operatorPromptDigest,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
@@ -5631,7 +5647,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		});
 		// The loop snapshots this switch per prompt run. `tools.intentTracing` is synced by each
-		// prompt build instead (`rebuildSystemPrompt`), with the intent-field guidance it renders.
+		// prompt build instead (`renderSystemPrompt`), with the intent-field guidance it renders.
 		cfgToolsAbortOnFabricatedResult.listen(session, abortOnFabricatedResult => {
 			agent.abortOnFabricatedToolResult = abortOnFabricatedResult;
 		});
@@ -6125,7 +6141,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					// The primary's chain, reminder placements and count-clamp image drops, so the capture matches its
-					// cached prompt; its byte-clamp drops stay its own and never ask the session's cut rule.
+					// cached prompt; a drop of its own (a forced count drop, its byte-clamp drops) stays its own, out of
+					// the session's record, and never asks the session's cut rule.
 					transformProviderContext: createTransformProviderContext(
 						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
 						mainImageClamp.sideRequestClamp(),

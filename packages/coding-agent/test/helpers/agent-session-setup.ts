@@ -63,8 +63,15 @@ export interface OverlaySession {
 	overlay: string;
 }
 
-/** A rebuild of the session a settings reload may start, which {@link reloadOverlay} waits for. */
-export type OverlayRebuild = "refreshBaseSystemPrompt" | "reconcileBuiltinTools" | "refreshSkillsAndCommands";
+/**
+ * A call of the session a settings reload may start, which {@link reloadOverlay} waits for: a rebuild, or the hold of a
+ * change no rebuild takes.
+ */
+export type OverlayRebuild =
+	| "refreshBaseSystemPrompt"
+	| "reconcileBuiltinTools"
+	| "refreshSkillsAndCommands"
+	| "holdToolDeclarationChange";
 
 /**
  * Rewrites the overlay file with `content` and reloads it as the config watcher does, then waits for each call of the

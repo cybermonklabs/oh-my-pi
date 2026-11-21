@@ -50,7 +50,6 @@ import {
 	type ThinkingLevel,
 	type ToolChoiceDirective,
 	type ToolExecution,
-	wireToolsFingerprint,
 } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionPreparation,
@@ -652,6 +651,14 @@ const cfgWorkspacePromptInputs = combine({
 const PLAN_MODE_REMINDER_MAX = 3;
 /** Custom message type of the plan mode instructions. */
 const PLAN_MODE_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
+/** Custom message type of the approved-plan reference. */
+const PLAN_MODE_REFERENCE_MESSAGE_TYPE = "plan-mode-reference";
+/**
+ * Custom session entry written when the prompt sent next carries the approved plan in its own text (the
+ * plan-approved prompt, {@link AgentSession.markPlanReferenceSent}): a branch that holds it and grows past it carries
+ * the plan as a reference message would.
+ */
+const PLAN_REFERENCE_PROMPT_ENTRY_TYPE = "plan-reference-prompt";
 /** Custom message type of the goal mode instructions. */
 const GOAL_MODE_CONTEXT_MESSAGE_TYPE = "goal-mode-context";
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
@@ -1264,12 +1271,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
-	#planReferenceSent = false;
 	/**
-	 * The branch entry the approved-plan reference went out after in this process (null: before the first entry), set
-	 * with {@link #planReferenceSent}: a branch that holds it and grows past it carries the reference.
+	 * Whether the current branch carries the approved-plan reference, so no request sends it again: read from the
+	 * branch whenever the session loads one ({@link #syncPlanReferenceToBranch}: at startup, on a switch, a `/tree` move
+	 * or a rewind), and set when this process sends it.
 	 */
-	#planReferenceSentAfter: string | null = null;
+	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
 	#planReferenceApproved = false;
 	#clientBridge: ClientBridge | undefined;
@@ -1645,17 +1652,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#lastRequestArm: { sessionId: string; shape: PromptCacheShape; messages: readonly AgentMessage[] } | undefined;
 	/** {@link #promptCacheShape} for the inputs it was last built from. */
-	#promptCacheShapeMemo:
-		| {
-				model: Model | undefined;
-				tools: unknown;
-				systemPrompt: unknown;
-				intentTracing: boolean;
-				intentDescription: string | undefined;
-				pruneToolDescriptions: boolean;
-				shape: PromptCacheShape;
-		  }
-		| undefined;
+	#promptCacheShapeMemo: { model: Model | undefined; systemPrompt: unknown; shape: PromptCacheShape } | undefined;
 	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -2756,8 +2753,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
 		this.sessionManager = config.sessionManager;
-		// Only a recorded approval may turn a draft file into an execution reference.
-		this.#adoptPlanApprovalFromBranch();
+		// Only a recorded approval may turn a draft file into an execution reference, and a reference the loaded branch
+		// carries goes out no second time.
+		this.#syncPlanReferenceToBranch();
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
 		this.#costGate = config.costGate ?? this.#createCostGate();
@@ -3261,7 +3259,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
-			toolDefinitionsDigest: () => this.#promptCacheShape(this.model).tools,
+			toolDefinitionsDigest: tools => this.agent.declaredToolsFingerprint(this.model, tools),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
@@ -3291,6 +3289,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
+			baseSettingsRead: config.baseSettingsRead,
 			operatorPromptDigest: config.operatorPromptDigest,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
@@ -6886,21 +6885,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** The request inputs outside the transcript that are part of the cache key; rebuilt only when one of them is replaced. */
 	#promptCacheShape(model: Model | undefined): PromptCacheShape {
-		const { tools, systemPrompt } = this.agent.state;
+		const { systemPrompt } = this.agent.state;
 		const thinkingLevel = this.thinkingLevel;
 		const retention = cfgProvidersCacheRetention.get(this.settings);
-		const intentTracing = this.agent.intentTracing;
-		const intentDescription = this.agent.intentDescription;
-		const pruneToolDescriptions = this.agent.prunesToolDescriptions(model);
+		// The definitions as the wire declares them: a refreshed MCP tool keeps its name, and a tool taken off the
+		// roster that the request keeps declared changes nothing.
+		const tools = this.agent.declaredToolsFingerprint(model);
 		const memo = this.#promptCacheShapeMemo;
 		if (
 			memo !== undefined &&
 			memo.model === model &&
-			memo.tools === tools &&
 			memo.systemPrompt === systemPrompt &&
-			memo.intentTracing === intentTracing &&
-			memo.intentDescription === intentDescription &&
-			memo.pruneToolDescriptions === pruneToolDescriptions &&
+			memo.shape.tools === tools &&
 			memo.shape.thinkingLevel === thinkingLevel &&
 			memo.shape.retention === retention
 		) {
@@ -6910,20 +6906,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			model: model ? `${model.provider}/${model.id}` : "",
 			modelName: model?.name ?? "no model",
 			thinkingLevel,
-			// The specs as the wire carries them: a refreshed MCP tool keeps its name.
-			tools: wireToolsFingerprint(tools, { intentTracing, intentDescription, pruneToolDescriptions }),
+			tools,
 			systemPrompt: Bun.hash(JSON.stringify(systemPrompt)),
 			retention,
 		};
-		this.#promptCacheShapeMemo = {
-			model,
-			tools,
-			systemPrompt,
-			intentTracing,
-			intentDescription,
-			pruneToolDescriptions,
-			shape,
-		};
+		this.#promptCacheShapeMemo = { model, systemPrompt, shape };
 		return shape;
 	}
 
@@ -8642,7 +8629,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		const planReference = await this.#buildPlanReferenceMessage();
 		if (planReference) {
-			this.#notePlanReferenceSent();
+			this.#planReferenceSent = true;
 			missing.push(planReference);
 		}
 		const enabledToolNames = this.getEnabledToolNames();
@@ -9190,8 +9177,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#goalRuntime;
 	}
 
+	/**
+	 * Records that the prompt the caller sends next carries the approved plan in its own text (the plan-approved
+	 * prompt), so no reference goes out with it or after it. The record is kept on the branch
+	 * ({@link PLAN_REFERENCE_PROMPT_ENTRY_TYPE}), so a process that resumes the session, a switch back to it and a
+	 * `/tree` move read it as the reference it stands for.
+	 */
 	markPlanReferenceSent(): void {
-		this.#notePlanReferenceSent();
+		this.sessionManager.appendCustomEntry(PLAN_REFERENCE_PROMPT_ENTRY_TYPE);
+		this.#planReferenceSent = true;
 	}
 
 	/** Marks a reviewed plan as approved so later prompts may reference it. */
@@ -9401,7 +9395,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * rewrite (new session, compaction, edit). Inlines the plan body so the
 	 * executor need not re-read it; the durable `local://` path stays in the
 	 * prompt as the recovery route when a compressor expires the inline copy.
-	 * Returns null during plan mode, once already sent, or when no plan exists.
+	 * Returns null during plan mode, while the current branch carries it, or when
+	 * no plan exists.
 	 */
 	async #buildPlanReferenceMessage(): Promise<CustomMessage | null> {
 		if (this.#planModeState?.enabled) return null;
@@ -9419,7 +9414,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		return {
 			role: "custom",
-			customType: "plan-mode-reference",
+			customType: PLAN_MODE_REFERENCE_MESSAGE_TYPE,
 			content,
 			display: false,
 			attribution: "agent",
@@ -9427,10 +9422,32 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	/** Records that the approved-plan reference goes out now, after the current branch leaf. */
-	#notePlanReferenceSent(): void {
-		this.#planReferenceSent = true;
-		this.#planReferenceSentAfter = this.sessionManager.getLeafId();
+	/**
+	 * Whether the current branch carries the approved-plan reference: since its newest approval, compaction and context
+	 * reset (`/clear`), it holds a reference message, or a record that the prompt after it carried the plan
+	 * ({@link markPlanReferenceSent}) and that prompt. A reference before an approval was for the plan approved before,
+	 * and one before a compaction or reset is not in the context the requests send.
+	 */
+	#branchCarriesPlanReference(): boolean {
+		const branch = this.sessionManager.getBranchView();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			switch (entry.type) {
+				case "custom_message":
+					if (entry.customType === PLAN_MODE_REFERENCE_MESSAGE_TYPE) return true;
+					break;
+				case "custom":
+					if (entry.customType === PLAN_REFERENCE_PROMPT_ENTRY_TYPE) return index < branch.length - 1;
+					break;
+				case "mode_change":
+					if (typeof entry.data?.approvedPlanFilePath === "string") return false;
+					break;
+				case "compaction":
+				case "reset_boundary":
+					return false;
+			}
+		}
+		return false;
 	}
 
 	/**
@@ -9453,17 +9470,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * After a move to another branch or transcript: the approval it records ({@link #adoptPlanApprovalFromBranch}),
-	 * and whether it carries the reference this process sent, which it does when it holds the entry the reference went
-	 * out after and grows past it. One that lacks it gets it again with its next request.
+	 * Reads the plan state of the branch the session loaded (at startup, after a switch, a `/tree` move or a rewind):
+	 * the approval it records ({@link #adoptPlanApprovalFromBranch}), and whether it carries the reference
+	 * ({@link #branchCarriesPlanReference}), whichever process sent it. One that lacks it gets it with its next request.
 	 */
 	#syncPlanReferenceToBranch(): void {
 		this.#adoptPlanApprovalFromBranch();
-		if (!this.#planReferenceSent) return;
-		const branch = this.sessionManager.getBranchView();
-		const after = this.#planReferenceSentAfter;
-		const index = after === null ? -1 : branch.findIndex(entry => entry.id === after);
-		this.#planReferenceSent = (after === null || index >= 0) && index < branch.length - 1;
+		this.#planReferenceSent = this.#branchCarriesPlanReference();
 	}
 
 	#isScoutAvailable(): boolean {
@@ -10762,7 +10775,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// lost the approved plan (issue #4094). The compaction-success resets
 			// (issue #1246) still clear it for re-injection on the next turn.
 			if (planReferenceMessage) {
-				this.#notePlanReferenceSent();
+				this.#planReferenceSent = true;
 			}
 			try {
 				const run = this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions, () => {
@@ -12706,6 +12719,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
+	 * The settings a call to the tool `name` runs under, for work done on it outside the tool (its arguments'
+	 * transform): while a held settings change keeps the tool declared as sent and alters what it would declare, the
+	 * ones it was declared under ({@link SessionTools.toolCallSettingsFor}); otherwise undefined.
+	 */
+	toolCallSettingsFor(name: string): Settings | undefined {
+		return this.#tools.toolCallSettingsFor(name);
+	}
+
+	/**
 	 * The settings the agent's requests read beside the system prompt and the tool declarations (intent field,
 	 * description pruning, tool-call dialect): under a held settings change, the values the bound prompt was sent
 	 * with ({@link SessionTools.requestSettings}); otherwise the session's own.
@@ -14344,6 +14366,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the rewind branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
@@ -15365,7 +15389,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousTools = [...this.agent.state.tools];
 		const previousBasePrompt = this.#tools.basePromptState;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
+		// The target transcript starts without this one's recall; a rolled-back switch keeps the conversation's memory
+		// state.
+		const previousMemoryTracking = this.#memory.conversationTracking();
 		const previousFreshProviderSessionId = this.#freshProviderSessionId;
 		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
 		const previousTaskSiblingCandidate = this.sessionManager.getTaskSiblingCandidate();
@@ -15590,6 +15616,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// A prompt restored for the session left behind stays with it.
 			if (switchingToDifferentSession) this.#tools.leaveRestoredTranscript();
+			// A held settings change keeps declaring what the request the loaded branch continues from declared.
+			this.#tools.followBranchDeclarations();
 			// Refresh the workspace-roots block to match the resumed session's directory set.
 			// Wrapped so a rebuild failure (e.g. a gate that intentionally fails in tests)
 			// doesn't roll back an otherwise-successful session switch.
@@ -15641,7 +15669,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.agent.setTools(previousTools);
 			// The prompt with what it lists, so the notices compare against what the request carries.
 			this.#tools.restoreBasePromptState(previousBasePrompt);
-			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
+			this.#memory.restoreConversationTracking(previousMemoryTracking);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);
 			this.agent.replaceQueues(
@@ -15888,6 +15916,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			if (!skipConversationRestore) {
 				this.replaceMessagesFromSessionContext(sessionContext.messages);
+				// A held settings change keeps declaring what the request the new file continues from declared.
+				this.#tools.followBranchDeclarations();
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
@@ -16339,6 +16369,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#syncPlanReferenceToBranch();
+		// A held settings change keeps declaring what the request the branch continues from declared.
+		this.#tools.followBranchDeclarations();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
 		this.#branchSummaryAbortController = undefined;

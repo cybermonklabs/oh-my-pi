@@ -5,11 +5,11 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { all as allSettings, combine, type Derived } from "../config/registry";
 import type { Settings } from "../config/settings";
-import type { HindsightSessionState } from "../hindsight/state";
+import type { HindsightConversationTracking, HindsightSessionState } from "../hindsight/state";
 import type { RecallChangesReport } from "../memory-backend/recall-entry";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
-import type { MnemopiSessionState } from "../mnemopi/state";
+import type { MnemopiConversationTracking, MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -33,6 +33,19 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 		),
 	);
 	return memorySettings;
+}
+
+/**
+ * What a transcript leaves in the session's memory state ({@link SessionMemory.conversationTracking}): the base prompt
+ * captured before a per-turn memory promotion, the recall the conversation carries as hidden messages, and each memory
+ * backend's tracking of the transcript.
+ */
+export interface ConversationTracking {
+	readonly promotionSnapshot: string[] | undefined;
+	readonly hiddenRecall: string | undefined;
+	readonly recallChanges: readonly RecallChangesReport[];
+	readonly hindsight: HindsightConversationTracking | undefined;
+	readonly mnemopi: MnemopiConversationTracking | undefined;
 }
 
 /** Capabilities borrowed from the owning AgentSession. */
@@ -187,11 +200,6 @@ export class SessionMemory {
 		return this.#memoryBackendTransition;
 	}
 
-	/** Base prompt captured before a per-turn memory promotion. */
-	get promotionSnapshot(): string[] | undefined {
-		return this.#baseSystemPromptBeforeMemoryPromotion;
-	}
-
 	/** Clears the per-turn memory promotion after a canonical prompt rebuild. */
 	clearPromotionSnapshot(): void {
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
@@ -200,11 +208,6 @@ export class SessionMemory {
 	/** Captures the canonical prompt before the first per-turn memory promotion. */
 	capturePromotionSnapshot(prompt: string[]): void {
 		this.#baseSystemPromptBeforeMemoryPromotion ??= prompt;
-	}
-
-	/** Restores a promotion snapshot while rolling back a failed session switch. */
-	restorePromotionSnapshot(prompt: string[] | undefined): void {
-		this.#baseSystemPromptBeforeMemoryPromotion = prompt;
 	}
 
 	/** The recall the conversation carries as a hidden message; undefined when its recall, if any, is a system block. */
@@ -266,6 +269,27 @@ export class SessionMemory {
 		if (!state || state.aliasOf) return false;
 		state.resetConversationTracking();
 		return true;
+	}
+
+	/** What a new transcript resets ({@link resetContextForNewTranscript}), for a failed session switch to put back. */
+	conversationTracking(): ConversationTracking {
+		const hindsight = this.#host.getHindsightSessionState();
+		const mnemopi = this.#host.getMnemopiSessionState();
+		return {
+			promotionSnapshot: this.#baseSystemPromptBeforeMemoryPromotion,
+			hiddenRecall: this.#hiddenRecall,
+			recallChanges: this.#recallChanges,
+			hindsight: hindsight && !hindsight.aliasOf ? hindsight.conversationTracking() : undefined,
+			mnemopi: mnemopi && !mnemopi.aliasOf ? mnemopi.conversationTracking() : undefined,
+		};
+	}
+
+	/** Puts back the state {@link conversationTracking} took, while rolling back a failed session switch. */
+	restoreConversationTracking(tracking: ConversationTracking): void {
+		this.#baseSystemPromptBeforeMemoryPromotion = tracking.promotionSnapshot;
+		this.adoptRecall(tracking.hiddenRecall, tracking.recallChanges);
+		if (tracking.hindsight) this.#host.getHindsightSessionState()?.restoreConversationTracking(tracking.hindsight);
+		if (tracking.mnemopi) this.#host.getMnemopiSessionState()?.restoreConversationTracking(tracking.mnemopi);
 	}
 
 	/** Resets transcript-scoped memory counters and removes a promoted prompt. */

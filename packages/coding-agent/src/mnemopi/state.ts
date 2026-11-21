@@ -317,6 +317,14 @@ export interface MnemopiSessionStateApi {
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
 }
 
+/** A transcript's recall and retention tracking ({@link MnemopiSessionState.conversationTracking}). */
+export interface MnemopiConversationTracking {
+	readonly lastRetainedTurn: number;
+	readonly retentionCursorLoaded: boolean;
+	readonly hasRecalledForFirstTurn: boolean;
+	readonly lastRecallSnippet: string | undefined;
+}
+
 export class MnemopiSessionState implements MnemopiSessionStateApi {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -399,6 +407,29 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+	}
+
+	/** What {@link resetConversationTracking} resets, for {@link restoreConversationTracking}. */
+	conversationTracking(): MnemopiConversationTracking {
+		return {
+			lastRetainedTurn: this.lastRetainedTurn,
+			retentionCursorLoaded: this.#retentionCursorLoaded,
+			hasRecalledForFirstTurn: this.hasRecalledForFirstTurn,
+			lastRecallSnippet: this.lastRecallSnippet,
+		};
+	}
+
+	/**
+	 * Puts back the tracking of a transcript the session returns to (a session switch that failed after it reset the
+	 * tracking for the target): its first turn already recalled, so its next one recalls no more than before. A recall
+	 * still running for the target is dropped.
+	 */
+	restoreConversationTracking(tracking: MnemopiConversationTracking): void {
+		this.#recallGeneration++;
+		this.lastRetainedTurn = tracking.lastRetainedTurn;
+		this.#retentionCursorLoaded = tracking.retentionCursorLoaded;
+		this.hasRecalledForFirstTurn = tracking.hasRecalledForFirstTurn;
+		this.lastRecallSnippet = tracking.lastRecallSnippet;
 	}
 
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {

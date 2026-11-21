@@ -24,7 +24,12 @@ import {
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import {
+	anthropicDeclaredTools,
+	anthropicKeepsToolDeclaration,
+} from "@oh-my-pi/pi-ai/providers/anthropic-tool-declaration";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { isAnthropicMessagesModel } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -39,11 +44,11 @@ import {
 	steeringQueueState,
 	unpairedToolCallTail,
 } from "./agent-loop";
-import type { AppendOnlyContextManager } from "./append-only-context";
+import { type AppendOnlyContextManager, toolSpecsFingerprint } from "./append-only-context";
 import { agentPauseGate } from "./pause";
 import { RepeatedPerCallMessages } from "./repeated-per-call-messages";
 import { isProviderRefusalMessage } from "./replay-policy";
-import { SentToolDefinitions } from "./sent-tool-definitions";
+import { latestToolDeclaration, type RecordedToolDeclaration, SentToolDefinitions } from "./sent-tool-definitions";
 import { Tokenizer } from "./tokenizer";
 import {
 	createAdditionalContextMessage,
@@ -64,6 +69,7 @@ import type {
 	AsideBoundary,
 	AsideMessage,
 	PrepareQueuedMessages,
+	ProviderContextRequest,
 	QueuedMessageGate,
 	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
@@ -72,6 +78,9 @@ import type {
 	ToolChoiceDirective,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
+
+/** The request {@link Agent.buildSideRequestContext} passes its provider-context transform. */
+const SIDE_REQUEST: ProviderContextRequest = { sideRequest: true };
 
 /**
  * Default convertToLlm: Keep only LLM-compatible replay messages.
@@ -129,9 +138,14 @@ export interface AgentOptions {
 
 	/**
 	 * Optional transform applied after provider context assembly and before
-	 * telemetry capture/provider send.
+	 * telemetry capture/provider send. A side request ({@link Agent.buildSideRequestContext})
+	 * passes `{ sideRequest: true }`; the loop's own requests pass no `request`.
 	 */
-	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 
 	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
@@ -429,8 +443,25 @@ export class Agent {
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
-	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#transformProviderContext?: (
+		context: Context,
+		model: Model,
+		request?: ProviderContextRequest,
+	) => Context | Promise<Context>;
 	#sentToolDefinitions = new SentToolDefinitions();
+	/** {@link declaredToolsFingerprint} for the active tools and the other inputs it was last computed from. */
+	#declaredToolsMemo:
+		| {
+				model: Model | undefined;
+				tools: AgentTool[];
+				intentTracing: boolean;
+				intentDescription: string | undefined;
+				pruneDescriptions: boolean;
+				declaration: RecordedToolDeclaration | undefined;
+				sentRevision: number;
+				fingerprint: string;
+		  }
+		| undefined;
 	/** What this Agent's previous main request sent per call; side requests leave it alone. */
 	#repeatedPerCallMessages = new RepeatedPerCallMessages();
 	#steeringQueue: AgentMessage[] = [];
@@ -671,6 +702,65 @@ export class Agent {
 	 */
 	copySentToolDefinitions(keep?: (name: string) => boolean): SentToolDefinitions {
 		return this.#sentToolDefinitions.copy(keep);
+	}
+
+	/**
+	 * Fingerprint of the tool definitions the next main request on `model` declares, as the wire carries them: the
+	 * active tools, normalized as that request sends them, and on a provider that keeps its tool declaration
+	 * across a conversation, in the order and with the deferral that declaration gives them, each withdrawn tool it
+	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}). Withdrawing such a
+	 * tool leaves the fingerprint as it was; a withdrawn tool this agent never sent (a resumed process's) leaves the
+	 * declaration, which changes it. With `tools`, the fingerprint the request would declare with them in place of
+	 * the active tools.
+	 */
+	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
+		const intentTracing = this.#intentTracing;
+		const intentDescription = this.#intentDescription;
+		const pruneDescriptions = this.prunesToolDescriptions(model);
+		// An owned dialect carries the tools in the prompt, where no declaration is kept.
+		const declaration =
+			model !== undefined &&
+			isAnthropicMessagesModel(model) &&
+			anthropicKeepsToolDeclaration(model) &&
+			!this.#ownedDialect(model)
+				? latestToolDeclaration(this.#state.messages)
+				: undefined;
+		// The sent definitions change the fingerprint only through a declaration.
+		const sentRevision = declaration ? this.#sentToolDefinitions.revision : 0;
+		// Only the active tools are memoized: a caller's tools are computed without touching the memo.
+		const memoized = tools === this.#state.tools;
+		const memo = this.#declaredToolsMemo;
+		if (
+			memoized &&
+			memo !== undefined &&
+			memo.model === model &&
+			memo.tools === tools &&
+			memo.intentTracing === intentTracing &&
+			memo.intentDescription === intentDescription &&
+			memo.pruneDescriptions === pruneDescriptions &&
+			memo.declaration === declaration &&
+			memo.sentRevision === sentRevision
+		) {
+			return memo.fingerprint;
+		}
+		const active = normalizeTools(tools, { injectIntent: intentTracing, intentDescription, pruneDescriptions }) ?? [];
+		const declared = declaration
+			? anthropicDeclaredTools(active, this.#sentToolDefinitions.inactiveFor(declaration, active), declaration)
+			: active;
+		const fingerprint = toolSpecsFingerprint(declared);
+		if (memoized) {
+			this.#declaredToolsMemo = {
+				model,
+				tools,
+				intentTracing,
+				intentDescription,
+				pruneDescriptions,
+				declaration,
+				sentRevision,
+				fingerprint,
+			};
+		}
+		return fingerprint;
 	}
 
 	/**
@@ -973,7 +1063,9 @@ export class Agent {
 	 * cache. Never touches the append-only log or the tool-choice queue. Owned/
 	 * in-band dialect sessions stay tools-less (matching their no-native-tools wire
 	 * shape and avoiding tool-markup leakage). `llmMessages` is already converted
-	 * (and, in production, obfuscated) by the caller.
+	 * (and, in production, obfuscated) by the caller. The provider-context transform
+	 * is told the request is a side request, so state it keeps for the conversation's
+	 * requests (image drops) stays as the loop's requests left it.
 	 *
 	 * `systemPrompt` defaults to the live agent prompt so the side request hits the
 	 * same cached prefix as the main loop. Callers that must pin a different prompt
@@ -999,7 +1091,9 @@ export class Agent {
 		// Side requests reuse the main loop's sent definitions without recording their own; attached before the
 		// transform too, so a request-size clamp in it measures them.
 		context = this.#sentToolDefinitions.withInactiveTools(context);
-		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
+		if (this.#transformProviderContext) {
+			context = await this.#transformProviderContext(context, model, SIDE_REQUEST);
+		}
 		context = this.#sentToolDefinitions.withInactiveTools(context);
 		return context;
 	}
