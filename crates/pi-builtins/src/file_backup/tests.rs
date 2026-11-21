@@ -190,9 +190,10 @@ pub(crate) fn folds_names(dir: &Path) -> bool {
 
 /// The entries of `dir` in name order, as the GNU comparison script
 /// prints them: a regular file as ` name=contents#links`, a symbolic
-/// link as ` name=link:target`.
+/// link as ` name=link:target`, a FIFO as ` name=fifo` (gVisor counts two
+/// links for one) and a directory as ` name=dir`.
 pub(crate) fn listing(dir: &Path) -> String {
-	use std::os::unix::fs::MetadataExt as _;
+	use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 	let mut names = fs::read_dir(dir)
 		.unwrap()
 		.map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -205,6 +206,10 @@ pub(crate) fn listing(dir: &Path) -> String {
 			let metadata = fs::symlink_metadata(&path).unwrap();
 			if metadata.is_symlink() {
 				format!(" {name}=link:{}", fs::read_link(&path).unwrap().display())
+			} else if metadata.file_type().is_fifo() {
+				format!(" {name}=fifo")
+			} else if metadata.is_dir() {
+				format!(" {name}=dir")
 			} else {
 				format!(" {name}={}#{}", fs::read_to_string(&path).unwrap(), metadata.nlink())
 			}
@@ -212,13 +217,15 @@ pub(crate) fn listing(dir: &Path) -> String {
 		.collect()
 }
 
-/// Checks `util` (`mv`, `cp`, `ln` or `ln -s`) where names fold and the
-/// source `DEST~` ("P") is the backup's entry: `<util> -b DEST~ dest`,
-/// with `dest` ("old"), backs `dest` up as `dest~`, which names `DEST~`.
-/// `run(fs, dir, args)` runs it over `fs` in `dir` and returns the exit
-/// status and standard error. It runs over the host where a temporary
-/// directory folds names (a casefold tmpfs or ext4 directory, APFS), and
-/// says the host half was skipped elsewhere; then over [`FoldingHost`].
+/// Checks `util` (`mv`, `cp`, `cp --reflink=always`, `ln` or `ln -s`)
+/// where names fold and the source `DEST~` ("P") is the backup's entry:
+/// `<util> -b DEST~ dest`, with `dest` ("old"), backs `dest` up as
+/// `dest~`, which names `DEST~`. `run(fs, dir, args)` runs it over `fs` in
+/// `dir` and returns the exit status and standard error. It runs over the
+/// host where a temporary directory folds names (a casefold tmpfs or ext4
+/// directory, APFS), and says the host half was skipped elsewhere; then
+/// over [`FoldingHost`]. `cp --reflink=always` has `cp`'s answers on any
+/// filesystem: its clone comes after the check of the source it opened.
 ///
 /// - `DEST~` with one link is one entry with `dest~`, by its identity:
 ///   refused with "might destroy source", nothing changed. GNU 9.4 and
@@ -246,13 +253,13 @@ pub(crate) fn check_folded_sources(util: &str, run: impl Fn(&pi_vfs::Fs, &Path, 
 }
 
 fn check_folded_source(half: &str, util: &str, root: &Path, run: impl Fn(&Path, &[&str]) -> (i32, String)) {
-	let symbolic = util == "ln -s";
 	let (name, verb) = match util {
 		"mv" => ("mv", "moved"),
-		"cp" => ("cp", "copied"),
+		"cp" | "cp --reflink=always" => ("cp", "copied"),
 		_ => ("ln", "linked"),
 	};
-	let args: &[&str] = if symbolic { &["-s", "-b", "DEST~", "dest"] } else { &["-b", "DEST~", "dest"] };
+	let mut args = util.split(' ').skip(1).collect::<Vec<_>>();
+	args.extend(["-b", "DEST~", "dest"]);
 	for links in [1, 2] {
 		let case = format!("{half}: {util} links={links}");
 		let dir = root.join(format!("{}{links}", util.replace(' ', "")));
@@ -262,7 +269,7 @@ fn check_folded_source(half: &str, util: &str, root: &Path, run: impl Fn(&Path, 
 		if links == 2 {
 			fs::hard_link(dir.join("DEST~"), dir.join("other")).unwrap();
 		}
-		let got = run(&dir, args);
+		let got = run(&dir, &args);
 		let read = |entry: &str| fs::read_to_string(dir.join(entry)).ok();
 		if links == 1 {
 			let refused = format!("{name}: backing up 'dest' might destroy source;  'DEST~' not {verb}\n");
@@ -272,7 +279,7 @@ fn check_folded_source(half: &str, util: &str, root: &Path, run: impl Fn(&Path, 
 			continue;
 		}
 		assert_eq!(read("other").as_deref(), Some("P"), "{case}: the second link was lost");
-		match util {
+		match name {
 			"cp" => {
 				let skipped = "cp: skipping file 'DEST~', as it was replaced while being copied\n";
 				assert_eq!(got, (1, skipped.to_owned()), "{case}");

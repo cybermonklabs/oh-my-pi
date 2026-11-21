@@ -3249,27 +3249,30 @@ mod testing {
 		tree
 	}
 
-	/// Hooks keyed by path, each run once by the first [`run_hook`] for its
-	/// path ([`SwapTree::swap_at`] and [`hook_at`] register them).
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	/// Hooks keyed by path, each run once by a [`run_hook`] for its path, in
+	/// the order registered ([`SwapTree::swap_at`] and [`hook_at`] register
+	/// them).
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	type Hook = (PathBuf, Box<dyn FnOnce() + Send>);
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
-	/// Runs `hook` at the first [`run_hook`] for `path`.
-	#[cfg(all(unix, feature = "util.rm"))]
+	/// Runs `hook` at a later [`run_hook`] for `path`: the first one, or the
+	/// one after those that run the hooks registered before it for `path`.
+	#[cfg(all(unix, any(feature = "util.cp", feature = "util.rm")))]
 	pub(crate) fn hook_at(path: PathBuf, hook: impl FnOnce() + Send + 'static) {
 		HOOKS.lock().push((path, Box::new(hook)));
 	}
 
 	/// Runs (once) the hook a test registered for `path`, if any: the seam
-	/// where a test swaps an entry a walk listed before the utility reaches it.
-	#[cfg(any(feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
+	/// where a test swaps an entry a walk listed before the utility reaches
+	/// it, or a source cp is about to open.
+	#[cfg(any(feature = "util.cp", feature = "util.find", feature = "util.grep", feature = "util.rg", feature = "util.rm"))]
 	pub(crate) fn run_hook(path: &std::path::Path) {
 		let hook = {
 			let mut hooks = HOOKS.lock();
 			let found = hooks.iter().position(|(hooked, _)| hooked == path);
-			found.map(|index| hooks.swap_remove(index).1)
+			found.map(|index| hooks.remove(index).1)
 		};
 		if let Some(hook) = hook {
 			hook();
