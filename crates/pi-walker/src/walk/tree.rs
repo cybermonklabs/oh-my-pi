@@ -225,11 +225,14 @@ impl Drop for Stack {
 /// root's included: the deepest frames keep theirs, so every child opens
 /// relative to its parent whatever the depth, and deep trees cannot exhaust
 /// descriptors. A frame that gave its handle up gets it back when the walk
-/// returns to it through its child's `..`, else when the walk enters one of
-/// its subdirectories, below the root's handle with no symlink followed on
-/// the way ([`Session::open_dir_beneath`]; by path under
-/// [`Follow::Always`]), each time only when it has the identity it recorded
-/// (device and inode on Unix).
+/// returns to it through its child's `..` ([`Session::open_parent`]), else
+/// when the walk enters one of its subdirectories, below the root's handle
+/// with no symlink followed on the way
+/// ([`Session::open_dir_beneath_to_search`]; by path under
+/// [`Follow::Always`], [`Session::open_dir_to_search`]). Each of these opens
+/// only to reach what is below the directory (search-only on Linux), and the
+/// handle is kept only when it has the identity the frame recorded (device
+/// and inode on Unix).
 pub(crate) const MAX_OPEN_DIRS: usize = 64;
 
 /// Where a [`Tree`] is in its traversal.
