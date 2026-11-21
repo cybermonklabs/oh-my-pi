@@ -98,21 +98,20 @@ impl Entry {
 		(self.dev, self.ino)
 	}
 
-	/// Whether this entry, below the tree's root `root`, is a directory that
-	/// is the root of a mount, on another mount, or on another device than
+	/// Whether this entry, below the tree's root `root`, is a mount point: the
+	/// root of a mount or on another mount than the root, whatever its type (a
+	/// file can be bind-mounted too), or a directory on another device than
 	/// the root (a filesystem that gives its subvolumes devices of their own,
-	/// such as btrfs, counts too). Only a directory can hold a filesystem the
-	/// reclaim could empty: anything else is removed by name, and `unlinkat`
-	/// on a mounted file fails (`EBUSY`) without touching what is behind it.
-	/// Devices are compared between directories only: an overlay whose layers
-	/// lie on two filesystems gives its files another device than its
-	/// directories, on one mount. Where `statx` gives no mount id, the walks
-	/// read it from the opened directory ([`mount_id`]).
+	/// such as btrfs, counts too). Devices are compared between directories
+	/// only: an overlay whose layers lie on two filesystems gives its files
+	/// another device than its directories, on one mount. Where `statx` gives
+	/// no mount id (before Linux 5.8), the walks read a directory's from the
+	/// opened directory ([`mount_id`]); a mounted file there is met by the
+	/// emptying, whose `unlinkat` fails with `EBUSY`.
 	const fn mounted_below(&self, root: &Self) -> bool {
-		self.is_dir()
-			&& (self.mount_root
-				|| self.dev != root.dev
-				|| matches!((self.mount, root.mount), (Some(mine), Some(theirs)) if mine != theirs))
+		self.mount_root
+			|| matches!((self.mount, root.mount), (Some(mine), Some(theirs)) if mine != theirs)
+			|| (self.is_dir() && self.dev != root.dev)
 	}
 }
 
@@ -180,17 +179,28 @@ fn entry_of(fd: RawFd) -> io::Result<Entry> {
 
 /// The mount id of the open file `fd`: what `statx` gave (`reported`), else
 /// the `mnt_id:` line of `/proc/self/fdinfo/<fd>` (Linux 3.15 and later).
-/// `None` when neither is there.
-fn mount_id(fd: RawFd, reported: Option<u64>) -> Option<u64> {
+/// `None` when fdinfo has no such line; the error of the read when it cannot
+/// be read.
+fn mount_id(fd: RawFd, reported: Option<u64>) -> io::Result<Option<u64>> {
 	if reported.is_some() {
-		return reported;
+		return Ok(reported);
 	}
 	#[cfg(test)]
 	if super::test_hooks::mount_ids() == super::test_hooks::MountIds::None {
-		return None;
+		return Ok(None);
 	}
-	let text = fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
-	parse_mnt_id(&text)
+	let text = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+	Ok(parse_mnt_id(&text))
+}
+
+/// The mount id of the open file `fd`, as [`mount_id`] gives it, or the stop
+/// that says why there is none.
+fn mount_id_or_stop(fd: RawFd, reported: Option<u64>) -> io::Result<u64> {
+	match mount_id(fd, reported) {
+		Ok(Some(id)) => Ok(id),
+		Ok(None) => Err(stop(Stop::NoMountIds)),
+		Err(err) => Err(stop(Stop::MountIdUnread(err))),
+	}
 }
 
 /// The `mnt_id:` value of a `/proc/<pid>/fdinfo/<fd>` text.
@@ -218,17 +228,24 @@ pub enum Stop {
 	/// The system reports no mount ids, so a mount point cannot be told from
 	/// a directory of the tree's own filesystem.
 	NoMountIds,
+	/// `statx` gave no mount id and reading `/proc/self/fdinfo` failed, with
+	/// this error.
+	MountIdUnread(io::Error),
 }
 
 impl Stop {
-	/// What the stop says of the tree at `tree`, as the rest of a sentence
-	/// that names the tree.
+	/// What the stop says of the tree at `tree`, as a predicate of the tree:
+	/// it reads after "it" and after "and".
 	pub fn reason(&self, tree: &Path) -> String {
 		match self {
-			Self::Changed(at) => {
-				format!("{} changed while the reclaim checked it", tree.join(at).display())
-			},
-			Self::Cycle(at) => format!("{} is one of its own ancestors", tree.join(at).display()),
+			Self::Changed(at) => format!(
+				"has an entry that changed while the reclaim walked it ({})",
+				tree.join(at).display()
+			),
+			Self::Cycle(at) => format!(
+				"has a directory that is one of its own ancestors ({})",
+				tree.join(at).display()
+			),
 			Self::TooDeep(at) => format!(
 				"is more than {MAX_DEPTH} directories deep at {}, deeper than the reclaim walks",
 				tree.join(at).display()
@@ -240,6 +257,11 @@ impl Stop {
 			                     `/proc/self/fdinfo`), so a filesystem mounted in it cannot be told \
 			                     apart"
 				.to_owned(),
+			Self::MountIdUnread(err) => format!(
+				"is on a system where `statx` gives no mount ids and reading them from \
+				 `/proc/self/fdinfo` failed ({err}), so a filesystem mounted in it cannot be told \
+				 apart"
+			),
 		}
 	}
 }
@@ -271,15 +293,14 @@ struct Root {
 impl Root {
 	fn of(fd: RawFd) -> io::Result<Self> {
 		let entry = entry_of(fd)?;
-		let mount = mount_id(fd, entry.mount).ok_or_else(|| stop(Stop::NoMountIds))?;
+		let mount = mount_id_or_stop(fd, entry.mount)?;
 		Ok(Self { entry, mount })
 	}
 
 	/// Whether the directory `child`, opened as `fd`, is on another mount
 	/// than the root.
 	fn other_mount(&self, fd: RawFd, child: &Entry) -> io::Result<bool> {
-		let mount = mount_id(fd, child.mount).ok_or_else(|| stop(Stop::NoMountIds))?;
-		Ok(mount != self.mount)
+		Ok(mount_id_or_stop(fd, child.mount)? != self.mount)
 	}
 }
 
@@ -393,7 +414,7 @@ fn remove_all_in(
 			return Err(stop(Stop::Mounted(path)));
 		}
 		if !entry.is_dir() {
-			unlink_at(dir, &name, 0)?;
+			unlink_at(dir, &name, 0).map_err(|err| busy_is_mounted(err, &path))?;
 			continue;
 		}
 		may_enter(ancestors, &entry, &path)?;
@@ -407,9 +428,20 @@ fn remove_all_in(
 		remove_all_in(child.as_raw_fd(), &path, root, ancestors)?;
 		ancestors.pop();
 		drop(child);
-		unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
+		unlink_at(dir, &name, libc::AT_REMOVEDIR).map_err(|err| busy_is_mounted(err, &path))?;
 	}
 	Ok(())
+}
+
+/// An `EBUSY` from removing the entry at `path` is a mount there (a file
+/// bind-mounted where `statx` gives no mount id to show it): the stop says
+/// so, where the bare error would name neither the path nor the cause.
+fn busy_is_mounted(err: io::Error, path: &Path) -> io::Error {
+	if err.raw_os_error() == Some(libc::EBUSY) {
+		stop(Stop::Mounted(path.to_path_buf()))
+	} else {
+		err
+	}
 }
 
 /// What below a tree's root is not the interrupted add's to remove, by its
@@ -591,12 +623,12 @@ mod tests {
 		Entry { kind, dev, ino: 7, mount, mount_root: false }
 	}
 
-	/// A directory is a mount point when it is on another mount or device
-	/// than the root, or is a mount's root; anything else never is, whatever
-	/// device it reports (an overlay whose layers lie on two filesystems
-	/// gives its files another device than its directories).
+	/// An entry of any type is a mount point when it is on another mount than
+	/// the root or is a mount's root; a device of its own makes a mount point
+	/// of a directory only (an overlay whose layers lie on two filesystems
+	/// gives its files another device than its directories, on one mount).
 	#[test]
-	fn mounted_below_decides_for_directories_only() {
+	fn mounted_below_compares_devices_for_directories_only() {
 		let root = entry(libc::S_IFDIR, 421, Some(3880));
 		let cases = [
 			("directory, same mount", entry(libc::S_IFDIR, 421, Some(3880)), false),
@@ -605,14 +637,17 @@ mod tests {
 			("directory, no mount id, same device", entry(libc::S_IFDIR, 421, None), false),
 			("file, other device", entry(libc::S_IFREG, 422, Some(3880)), false),
 			("symlink, other device", entry(libc::S_IFLNK, 422, Some(3880)), false),
-			("file, other mount", entry(libc::S_IFREG, 421, Some(3881)), false),
+			("file, other mount", entry(libc::S_IFREG, 421, Some(3881)), true),
+			("file, no mount id, other device", entry(libc::S_IFREG, 422, None), false),
 		];
 		for (what, case, mounted) in cases {
 			assert_eq!(case.mounted_below(&root), mounted, "{what}");
 		}
-		let mut mount_root = entry(libc::S_IFDIR, 421, Some(3880));
-		mount_root.mount_root = true;
-		assert!(mount_root.mounted_below(&root), "a directory that is a mount's root");
+		for kind in [libc::S_IFDIR, libc::S_IFREG] {
+			let mut mount_root = entry(kind, 421, Some(3880));
+			mount_root.mount_root = true;
+			assert!(mount_root.mounted_below(&root), "a mount's root of type {kind:o}");
+		}
 	}
 
 	#[test]
@@ -628,9 +663,60 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let fd = fs::File::open(dir.path()).unwrap();
 		let statx = entry_of(fd.as_raw_fd()).unwrap().mount;
-		let fdinfo = mount_id(fd.as_raw_fd(), None);
+		let fdinfo = mount_id(fd.as_raw_fd(), None).unwrap();
 		assert!(statx.is_some() || fdinfo.is_some(), "neither statx nor fdinfo gives a mount id");
-		assert!(mount_id(fd.as_raw_fd(), statx).is_some());
+		assert!(mount_id(fd.as_raw_fd(), statx).unwrap().is_some());
+	}
+
+	/// A failed read of `/proc/self/fdinfo` is given as that error, in a stop
+	/// that names it, not as a system without mount ids.
+	#[test]
+	fn an_unreadable_fdinfo_gives_its_error() {
+		// No process has a descriptor this high: Linux caps them far below.
+		let closed = libc::c_int::MAX;
+		let err = mount_id(closed, None).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+		let err = mount_id_or_stop(closed, None).unwrap_err();
+		let reason = stop_of(&err)
+			.expect("not a stop")
+			.reason(Path::new("/t/wt"));
+		assert!(
+			reason.contains("reading them from `/proc/self/fdinfo` failed")
+				&& reason.contains("os error 2"),
+			"{reason}"
+		);
+	}
+
+	/// `Root::other_mount` tells a directory on another mount from one on the
+	/// root's, with the mount ids `statx` gives and, as before Linux 5.8, with
+	/// those of `/proc/self/fdinfo` alone: `/proc` is always a mount of its
+	/// own, and a subdirectory of the root is on the root's mount. Before 5.8
+	/// this comparison is all that refuses a bind mount from the tree's own
+	/// filesystem, which has the root's device.
+	#[test]
+	fn other_mount_tells_a_mount_from_a_subdirectory() {
+		use super::super::test_hooks::{self, MountIds};
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("sub")).unwrap();
+		for ids in [MountIds::Statx, MountIds::FdinfoOnly] {
+			test_hooks::set_mount_ids(ids);
+			let root_fd = fs::File::open(dir.path()).unwrap();
+			let root = Root::of(root_fd.as_raw_fd()).unwrap();
+			for (path, other) in [(Path::new("/proc"), true), (&dir.path().join("sub"), false)] {
+				let fd = fs::File::open(path).unwrap();
+				let child = entry_of(fd.as_raw_fd()).unwrap();
+				if ids == MountIds::FdinfoOnly {
+					assert_eq!(child.mount, None, "statx's mount id was not hidden");
+				}
+				assert_eq!(
+					root.other_mount(fd.as_raw_fd(), &child).unwrap(),
+					other,
+					"{} with mount ids from {ids:?}",
+					path.display()
+				);
+			}
+			test_hooks::clear();
+		}
 	}
 
 	/// A symlink to a directory is not opened as the tree's root (under gVisor

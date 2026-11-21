@@ -732,18 +732,21 @@ impl GitRepo {
 	/// root included) and nothing mounted in it. Symlinks in the tree are
 	/// removed, never followed. A tree more than 256 directories deep, or on a
 	/// system that reports no mount ids (neither `statx` nor
-	/// `/proc/self/fdinfo`), is refused. Files written into that tree after the
-	/// add stopped, changes staged there, and a merge or cherry-pick begun there
-	/// go with it; so does a commit made there and left by a checkout back to
-	/// the add's commit when `core.logAllRefUpdates` is off, which leaves no
-	/// trace in `HEAD`. A live add, a lock someone changed or removed, a commit
-	/// or checkout made there, a directory made again in its place, a repository
-	/// or a mount point in the tree, or a platform that cannot check these is
-	/// refused with a message naming the registration, and nothing is removed. A
-	/// mount made during the emptying stops it there, with nothing on
-	/// that filesystem removed. The token stays on the emptied directory.
-	/// Registrations earlier reclaims moved out of git's view and did not delete
-	/// go first. Returns one note per removal, for the caller to show.
+	/// `/proc/self/fdinfo`) or where reading them fails, is refused. Files
+	/// written into that tree after the add stopped, changes staged there, and a
+	/// merge or cherry-pick begun there go with it; so does a commit made there
+	/// and left by a checkout back to the add's commit when
+	/// `core.logAllRefUpdates` is off, which leaves no trace in `HEAD`. A live
+	/// add, a lock someone changed or removed, a commit or checkout made there,
+	/// a directory made again in its place, a repository or a mount point in the
+	/// tree, or a platform that cannot check these is refused with a message
+	/// naming the registration, and nothing is removed. A mount made during the
+	/// emptying, or a file mounted in the tree where `statx` gives no mount ids
+	/// (before Linux 5.8), stops the emptying there, with nothing on that mount
+	/// removed and the registration kept. The token stays on the emptied
+	/// directory. Registrations earlier reclaims moved out of git's view and did
+	/// not delete go first. Returns one note per removal, for the caller to
+	/// show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
 		let common = &self.info().common_dir;
 		sweep_moved_registrations(common);
@@ -3677,34 +3680,92 @@ mod tests {
 			"{} is not a mount point",
 			mount.display()
 		);
-		// What an earlier run left in the tree, beside the mount point.
-		for entry in fs::read_dir(&tree).unwrap() {
-			let path = entry.unwrap().path();
-			if path != mount {
-				let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+		// With the mount ids `statx` gives, and with those of
+		// `/proc/self/fdinfo` alone, as before Linux 5.8: there a bind mount
+		// from the tree's own filesystem shows neither another device nor a
+		// mount-root attribute, and only the opened directory's mount id
+		// tells it.
+		for ids in [test_hooks::MountIds::Statx, test_hooks::MountIds::FdinfoOnly] {
+			// What an earlier run left in the tree, beside the mount point.
+			for entry in fs::read_dir(&tree).unwrap() {
+				let path = entry.unwrap().path();
+				if path != mount {
+					let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+				}
+			}
+			let data = mount.join("data");
+			fs::write(&data, "someone's\n").unwrap();
+			let (_temp, repo) = fixture();
+			let admin = abandoned_add(&repo, &tree, None);
+			test_hooks::set_mount_ids(ids);
+			let result = repo.worktree_reclaim_abandoned(&tree);
+			test_hooks::clear();
+			assert!(
+				data.is_file(),
+				"{ids:?}: the reclaim emptied the filesystem mounted at {}: {result:?}",
+				mount.display()
+			);
+			let err = result.unwrap_err().to_string();
+			assert!(err.contains("holds a filesystem mounted below its root"), "{ids:?}: {err}");
+			assert!(
+				tree.join("partial").is_file() && tree.join(".git").is_file() && admin.is_dir(),
+				"{ids:?}: the reclaim removed something: {err}"
+			);
+			// The emptying alone.
+			test_hooks::set_mount_ids(ids);
+			let emptied = tree_dir::TreeDir::open(&tree).unwrap().unwrap().empty();
+			test_hooks::clear();
+			let err = emptied.unwrap_err().to_string();
+			assert!(data.is_file(), "{ids:?}: the emptying removed {}: {err}", data.display());
+			assert!(err.contains("mounted below its root"), "{ids:?}: {err}");
+		}
+	}
+
+	/// A file bind-mounted into the tree is someone else's too. Where `statx`
+	/// gives mount ids the reclaim refuses before anything is removed; with
+	/// `/proc/self/fdinfo`'s alone, as before Linux 5.8, a file's mount is not
+	/// seen until the emptying meets it (`EBUSY`), which then stops with the
+	/// path, keeps the registration and leaves the file. A bind mount needs
+	/// privileges the tests lack: the builds Job mounts a file inside a
+	/// directory the test user owns and names it in `PI_VCS_TEST_MOUNTED_FILE`;
+	/// that directory is the tree. Run with `--ignored`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "needs a file mounted inside a directory the test user owns: PI_VCS_TEST_MOUNTED_FILE"]
+	fn reclaim_refuses_a_tree_holding_a_mounted_file() {
+		let file = PathBuf::from(std::env::var("PI_VCS_TEST_MOUNTED_FILE").expect(
+			"PI_VCS_TEST_MOUNTED_FILE names a file mounted inside a directory the test user owns",
+		));
+		let tree = file.parent().unwrap().to_path_buf();
+		let before = fs::read(&file).unwrap();
+		for ids in [test_hooks::MountIds::Statx, test_hooks::MountIds::FdinfoOnly] {
+			for entry in fs::read_dir(&tree).unwrap() {
+				let path = entry.unwrap().path();
+				if path != file {
+					let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
+				}
+			}
+			let (_temp, repo) = fixture();
+			let admin = abandoned_add(&repo, &tree, None);
+			test_hooks::set_mount_ids(ids);
+			let result = repo.worktree_reclaim_abandoned(&tree);
+			test_hooks::clear();
+			assert_eq!(fs::read(&file).unwrap(), before, "{ids:?}: the mounted file changed");
+			let err = result.unwrap_err().to_string();
+			assert!(
+				err.contains("holds a filesystem mounted below its root")
+					&& err.contains(&file.display().to_string()),
+				"{ids:?}: {err}"
+			);
+			assert!(admin.is_dir(), "{ids:?}: the registration was removed: {err}");
+			if ids == test_hooks::MountIds::Statx {
+				assert!(
+					tree.join("partial").is_file() && tree.join(".git").is_file(),
+					"{ids:?}: the reclaim removed something before it refused: {err}"
+				);
+				assert!(err.contains("nothing was removed"), "{ids:?}: {err}");
 			}
 		}
-		let data = mount.join("data");
-		fs::write(&data, "someone's\n").unwrap();
-		let (_temp, repo) = fixture();
-		let admin = abandoned_add(&repo, &tree, None);
-		let result = repo.worktree_reclaim_abandoned(&tree);
-		assert!(
-			data.is_file(),
-			"the reclaim emptied the filesystem mounted at {}: {result:?}",
-			mount.display()
-		);
-		let err = result.unwrap_err().to_string();
-		assert!(err.contains("holds a filesystem mounted below its root"), "{err}");
-		assert!(
-			tree.join("partial").is_file() && tree.join(".git").is_file() && admin.is_dir(),
-			"the reclaim removed something: {err}"
-		);
-		// The emptying alone.
-		let dir = tree_dir::TreeDir::open(&tree).unwrap().unwrap();
-		let err = dir.empty().unwrap_err().to_string();
-		assert!(data.is_file(), "the emptying removed {}: {err}", data.display());
-		assert!(err.contains("mounted below its root"), "{err}");
 	}
 
 	/// A symlink below the tree's root is removed itself, never followed:
@@ -3793,7 +3854,7 @@ mod tests {
 			);
 			let err = result.unwrap_err().to_string();
 			assert!(
-				err.contains("changed while the reclaim checked it"),
+				err.contains("has an entry that changed while the reclaim walked it ("),
 				"swap at open {swap_at}: {err}"
 			);
 			if swap_at == 1 {
@@ -3841,7 +3902,7 @@ mod tests {
 			);
 			let err = result.unwrap_err().to_string();
 			assert!(
-				err.contains("changed while the reclaim checked it"),
+				err.contains("has an entry that changed while the reclaim walked it ("),
 				"swap at open {swap_at}: {err}"
 			);
 			if swap_at == 1 {
@@ -3854,8 +3915,9 @@ mod tests {
 	/// A `.git` in the tree's root that is a FIFO is refused, never opened. The
 	/// test watches the FIFO while the reclaim runs on another thread: a
 	/// reader waiting in its open lets a non-blocking writer open succeed, so a
-	/// reclaim that opens the FIFO fails the test at once, by name, rather than
-	/// waiting for a writer.
+	/// reclaim that waits in its open of the FIFO fails the test at once, by
+	/// name, rather than waiting for a writer. A non-blocking open holds the
+	/// reader for too short a time to be seen reliably.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn reclaim_refuses_a_fifo_named_git_without_opening_it() {
