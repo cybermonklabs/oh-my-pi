@@ -705,10 +705,10 @@ export class Agent {
 	 * across a conversation, in the order and with the deferral that declaration gives them, each withdrawn tool it
 	 * still holds re-declared from the definition this agent sent ({@link SentToolDefinitions}). Withdrawing such a
 	 * tool leaves the fingerprint as it was; a withdrawn tool this agent never sent (a resumed process's) leaves the
-	 * declaration, which changes it.
+	 * declaration, which changes it. With `tools`, the fingerprint the request would declare with them in place of
+	 * the active tools.
 	 */
-	declaredToolsFingerprint(model: Model | undefined): string {
-		const tools = this.#state.tools;
+	declaredToolsFingerprint(model: Model | undefined, tools: AgentTool[] = this.#state.tools): string {
 		const intentTracing = this.#intentTracing;
 		const intentDescription = this.#intentDescription;
 		const pruneDescriptions = this.prunesToolDescriptions(model);

@@ -87,7 +87,7 @@ import {
 import { formatModelSelectorValue, parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { buildServiceTierByFamily } from "./config/service-tier";
-import { bindEffects, combine, everySetting, type SettingChange } from "./config/registry";
+import { bindEffects, combine, everySetting, type SettingChange, trackSettingsReads } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -4227,7 +4227,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (!own || own.size === 0) return hosted;
 			return new Map([...own, ...hosted].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)));
 		};
-		const rebuildSystemPrompt: SystemPromptRebuilder = async (
+		const renderSystemPrompt: SystemPromptRebuilder = async (
 			toolNames,
 			tools,
 			xdev,
@@ -4479,6 +4479,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
 		};
+		// Each build reports every setting it read, with the value it read: a bound prompt holds a change of any of
+		// them, whether or not a listener rebuilds the prompt for it (`SessionTools.holdToolDeclarationChange`).
+		const rebuildSystemPrompt: SystemPromptRebuilder = async (toolNames, tools, xdev) => {
+			const { value, read } = await trackSettingsReads(settings, () => renderSystemPrompt(toolNames, tools, xdev));
+			return { ...value, settingsRead: read };
+		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
@@ -4629,7 +4635,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 
 		setSessionActiveToolNames(initialToolNames);
-		const { systemPrompt } = await logger.time(
+		const { systemPrompt, settingsRead: baseSettingsRead } = await logger.time(
 			"buildSystemPrompt",
 			rebuildSystemPrompt,
 			initialToolNames,
@@ -4856,9 +4862,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
-		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
+		const transformToolCallArguments = (args: Record<string, unknown>, toolName: string): Record<string, unknown> => {
 			let result = args;
-			const maxTimeout = cfgToolsMaxTimeout.get(settings);
+			// A call to a tool a held settings change keeps declared as sent runs under the settings it was declared under.
+			const maxTimeout = cfgToolsMaxTimeout.get((hasSession && session.toolCallSettingsFor(toolName)) || settings);
 			if (maxTimeout > 0 && typeof result.timeout === "number") {
 				result = { ...result, timeout: Math.min(result.timeout, maxTimeout) };
 			}
@@ -5250,6 +5257,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorStreamFn: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
+			baseSettingsRead,
 			operatorPromptDigest,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,

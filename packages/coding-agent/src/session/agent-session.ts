@@ -2690,7 +2690,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				const entry = this.#inferredPromptCacheEntry(promptDigest);
 				return entry?.change === undefined && !promptCacheEntryLapsed(entry, Date.now());
 			},
-			toolDefinitionsDigest: () => this.#promptCacheShape(this.model).tools,
+			toolDefinitionsDigest: tools =>
+				tools ? this.agent.declaredToolsFingerprint(this.model, tools) : this.#promptCacheShape(this.model).tools,
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
 			captureMemoryPromotionSnapshot: prompt => this.#memory.capturePromotionSnapshot(prompt),
 			adoptMemoryRecall: (hidden, changes) => this.#memory.adoptRecall(hidden, changes),
@@ -2720,6 +2721,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
+			baseSettingsRead: config.baseSettingsRead,
 			operatorPromptDigest: config.operatorPromptDigest,
 			skills: config.skills,
 			skillWarnings: config.skillWarnings,
@@ -11760,6 +11762,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	get toolCallSettings(): Settings | undefined {
 		return this.#tools.toolCallSettings;
+	}
+
+	/**
+	 * The settings a call to the tool `name` runs under, for work done on it outside the tool (its arguments'
+	 * transform): while a held settings change keeps the tool declared as sent and alters what it would declare, the
+	 * ones it was declared under ({@link SessionTools.toolCallSettingsFor}); otherwise undefined.
+	 */
+	toolCallSettingsFor(name: string): Settings | undefined {
+		return this.#tools.toolCallSettingsFor(name);
 	}
 
 	/**

@@ -28,6 +28,7 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { SessionAccountPoolScope } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
+import type { AnySetting } from "../config/registry";
 import type { Settings } from "../config/settings";
 import type { SkillsSettings } from "../extensibility/settings";
 import type { CursorMcpResourceAdapter } from "../cursor";
@@ -350,6 +351,8 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. */
 	rebuildSystemPrompt?: SystemPromptRebuilder;
+	/** Each setting the startup system prompt's build read, with the value it read: a bound prompt holds their changes. */
+	baseSettingsRead?: ReadonlyMap<AnySetting, unknown>;
 	/**
 	 * Digest of the prompt inputs the operator gives explicitly, or undefined when they cannot be compared; a
 	 * resumed transcript's stored prompt is sent again only while it is unchanged.
