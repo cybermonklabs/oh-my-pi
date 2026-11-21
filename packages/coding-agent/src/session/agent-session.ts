@@ -274,6 +274,7 @@ import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { supportsExternalThinking } from "../tools/think";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./session-entries";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import { isTaskToolDetails, settledTaskDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { currentThreadId, isMainThread } from "../thread/identity";
 import { registerLocalSession } from "../thread/session-directory";
@@ -307,7 +308,7 @@ import {
 	type ToolCallRunMark,
 	UNNAMED_USER_WAIT_PROMPT,
 } from "./agent-session-events";
-import { type AgentViewSession, isLocalAgentSession } from "./agent-session-handle";
+import { type AgentViewSession, isLocalAgentSession, type ToolExecutionUpdateEvent } from "./agent-session-handle";
 import {
 	asyncJobSnapshot,
 	asyncJobTree,
@@ -503,6 +504,7 @@ import { type ObservedPromptCacheEntry, promptCacheStatus } from "./prompt-cache
 import { PromptFollowUps } from "./prompt-follow-ups";
 import type { PromptCacheStatus } from "@oh-my-pi/pi-tui/status-line/host";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { isSettledJobFrame } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { anonymizeSessionTranscripts } from "./session-anonymizer";
 import {
 	formatSessionDumpText,
@@ -1085,6 +1087,18 @@ function isEvalActivity(message: AgentMessage): boolean {
 	return (
 		message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.name === "eval")
 	);
+}
+
+/**
+ * The copy of a tool update that {@link AgentSession.activeToolExecutionUpdates}
+ * keeps. A returned background call keeps its settled frame for the session's
+ * life, so a settled `task` frame keeps only what its settled card draws
+ * ({@link settledTaskDetails}); every other update is kept as emitted.
+ */
+function keptToolExecutionUpdate(event: ToolExecutionUpdateEvent): ToolExecutionUpdateEvent {
+	const details: unknown = event.partialResult?.details;
+	if (event.toolName !== "task" || !isSettledJobFrame(details) || !isTaskToolDetails(details)) return event;
+	return { ...event, partialResult: { ...event.partialResult, details: settledTaskDetails(details) } };
 }
 
 export class AgentSession implements SettingsScope, AgentViewSession {
@@ -4654,7 +4668,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
 			// logical session transitions clear the cache.
-			this.#activeToolExecutionUpdates.set(event.toolCallId, event);
+			this.#activeToolExecutionUpdates.set(event.toolCallId, keptToolExecutionUpdate(event));
 		} else if (event.type === "tool_execution_end") {
 			this.#activeToolExecutionUpdates.delete(event.toolCallId);
 			// A `tool_execution_end` carries no run identity, so a duplicate of an
