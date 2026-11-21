@@ -19,7 +19,6 @@
 ### Fixed
 
 - With `secrets.maskSessionStore` on and a `secrets.yml` rule that matches a run of hex, a full write of a long session no longer replaces with a marker the blob reference of an older tool result's provider image (`image_url`, or a list of them there), generated image, or image in a list nested inside a `content` or `images` list, which lost the image on resume and, under SQL session storage, let `omp gc` delete its blob
-- A resumed session gives back a provider image's data URL listed under `image_url` (in a tool result's `details`, say) instead of its `blob:sha256:` reference
 - Bash tool: `xargs` and `find -exec ... {} +` no longer fail with "Argument list too long" where the system takes fewer argument bytes than they counted on (GKE Sandbox, or large exported variables for `find`); like GNU xargs, they split a refused command line in halves and retry, and one argument too long on its own is still an error
 - Daemons: a daemon record the broker could not write (a full or read-only disk) is written again once the disk takes writes, a daemon's exit too, which was lost before; the failure is warned once, and polls retry it with a backoff of up to 5 s. The broker's waits, a daemon's uptime (which decides whether a crash grows its restart backoff) and the client's wait for the broker it starts are timed on the monotonic clock, so a step of the wall clock neither holds nor shortens them
 - Bash tool: on a loaded machine, a command's last output could be lost (`status 0`, no output): once the command ended, the shell waited 250 ms for its output reader and then dropped what the reader had not yet read. On Linux and macOS, output the command wrote before it ended is now always kept; only a background job's later output is still cut, once the pipe is quiet or 2 s after the command ended
@@ -211,7 +210,7 @@
 - A share with secret masking on no longer reads older tool start markers, to-do list edits, compactions, branch summaries and custom messages back from disk only to drop their data
 - A subagent that answers an IRC message in the turn that message woke it for no longer sends the sender that answer a second time, reviving it, when its own idle timeout parks it while that turn still waits on its background work
 - A session write that waits on another omp process's write, and Hindsight's retried memory delivery while another omp process delivers, no longer block for about 50 ms on every attempt
-- A long session no longer keeps whole the older goal snapshots, context notebook revisions, to-do HUD choices and exit records, nor a snapcompact compaction a frame rescue replaced, each holding a copy of bodies that are out of memory
+- A long session no longer keeps whole the older goal snapshots, goal completion records, context notebook revisions, to-do HUD choices and exit records, nor a snapcompact compaction a frame rescue replaced, each holding a copy of bodies that are out of memory
 - A `/resume` or `/move` that fails and rolls back, or a context rebuild that failed to read an older message, no longer leaves messages of the current model's context to be read back from disk on every request
 - RPC `cancel_subagent` and `steer_subagent` no longer reach a subagent whose first run failed before its first prompt while it is being cleaned up
 - A session copy or fork that fails to write frees its temporary file of older entry bodies at once instead of at the next garbage collection
@@ -219,6 +218,8 @@
 - A session that keeps its older entry bodies compressed in memory no longer decompresses a whole block of them for each entry a full rewrite or a walk over every entry reads, which on a long session blocked for minutes
 - A long goal session no longer reads each older goal mode change back from disk every time it resumes or starts a subagent
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
+- The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
+- A resumed session gives back a provider image's data URL listed under `image_url` (in a tool result's `details`, for example) instead of its `blob:sha256:` reference
 
 ### Breaking Changes
 

@@ -394,3 +394,104 @@ fn prompt(message: &str) -> PromptCommand {
 		streaming_behavior: None,
 	}
 }
+
+/// More entries than any limit a decoder once stopped at: `serde_json` reads
+/// 128 levels (64 entries, since `get_tree` nests each entry two levels under
+/// its parent), and decoding or dropping a `Value` recurses once per level.
+const DEEP_CHAIN_ENTRIES: usize = 100_000;
+
+/// Writes, as `test/rpc-get-tree.test.ts` does, a session that is one chain of
+/// [`DEEP_CHAIN_ENTRIES`] custom entries, `e0` its root.
+fn write_chain_session(dir: &Path) -> PathBuf {
+	const TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
+	let header = json!({
+		"type": "session",
+		"version": 3,
+		"id": "deep-chain",
+		"timestamp": TIMESTAMP,
+		"cwd": dir,
+	});
+	let mut lines = vec![header.to_string()];
+	for index in 0..DEEP_CHAIN_ENTRIES {
+		let parent = if index == 0 { Value::Null } else { Value::String(format!("e{}", index - 1)) };
+		let entry = json!({
+			"type": "custom",
+			"id": format!("e{index}"),
+			"parentId": parent,
+			"timestamp": TIMESTAMP,
+			"customType": "probe",
+			"data": {"index": index},
+		});
+		lines.push(entry.to_string());
+	}
+	let file = dir.join("sessions").join("chain.jsonl");
+	std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+	std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+	file
+}
+
+// If this regresses, `get_tree` on a long session (a long controller session is
+// one chain of 84,773 entries) closes the client with "Failed to decode
+// reassembled RPC frame", or overflows a thread's stack and aborts the process.
+#[test]
+#[ignore = "spawns the real omp server; run with --ignored"]
+fn smoke_get_tree_deep_chain() {
+	let repo = repo_root();
+	let dir = std::env::temp_dir().join(format!("omp-rpc-rust-tree-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let session = write_chain_session(&dir);
+	// Real RPC dispatch over the session file; its mock model is never called here.
+	let mut process = Process::new("bun");
+	process
+		.arg("packages/coding-agent/test/fixtures/tree-rpc-agent.ts")
+		.arg(&dir)
+		.arg(&session)
+		.current_dir(&repo)
+		.env("PI_CODING_AGENT_DIR", &dir)
+		.env("PI_NO_TITLE", "1");
+	let (client, _events) = Client::spawn(process, ClientOptions::default()).expect("spawn + ready");
+	assert_eq!(client.protocol_version(), 2);
+
+	let SessionTree { tree, leaf_id } = client.call(&GetTreeCommand {}).expect("get_tree");
+	let leaf = format!("e{}", DEEP_CHAIN_ENTRIES - 1);
+	assert_eq!(leaf_id.as_deref(), Some(leaf.as_str()));
+	assert_eq!(tree.len(), 1);
+	// Walked down and taken apart node by node: comparing or dropping the tree
+	// whole recurses once per level, past any thread's stack.
+	let mut misplaced = Vec::new();
+	let mut depth = 0;
+	let mut deepest = String::new();
+	let mut next = tree.into_iter().next();
+	while let Some(mut node) = next {
+		let entry = node.get("entry").and_then(Value::as_object);
+		let id = entry
+			.and_then(|entry| entry.get("id"))
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_owned();
+		let parent = entry.and_then(|entry| entry.get("parentId")).cloned();
+		let expected_parent =
+			if depth == 0 { Value::Null } else { Value::String(format!("e{}", depth - 1)) };
+		let children = match node.remove("children") {
+			Some(Value::Array(children)) => children,
+			_ => Vec::new(),
+		};
+		if id != format!("e{depth}") || parent != Some(expected_parent) || children.len() > 1 {
+			misplaced.push(id.clone());
+		}
+		deepest = id;
+		depth += 1;
+		next = children.into_iter().next().and_then(|child| match child {
+			Value::Object(child) => Some(child),
+			_ => None,
+		});
+	}
+	assert_eq!(misplaced, Vec::<String>::new());
+	assert_eq!(depth, DEEP_CHAIN_ENTRIES);
+	assert_eq!(deepest, leaf);
+
+	// The client still serves commands after the deep answer.
+	client.call(&GetStateCommand {}).expect("get_state after get_tree");
+	drop(client);
+	let _ = std::fs::remove_dir_all(&dir);
+}

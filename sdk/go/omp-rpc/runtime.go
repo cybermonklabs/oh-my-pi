@@ -36,7 +36,15 @@ func (c Commands) call(ctx context.Context, command string, params any, timeout 
 			data = json.RawMessage("null")
 		}
 	}
-	if err := json.Unmarshal(data, out); err != nil {
+	// A generated result type decodes itself: json.Unmarshal would first check the
+	// whole result against encoding/json's nesting limit, which a get_tree answer
+	// exceeds (see splitObject).
+	if result, ok := out.(json.Unmarshaler); ok {
+		err = result.UnmarshalJSON(data)
+	} else {
+		err = json.Unmarshal(data, out)
+	}
+	if err != nil {
 		return fmt.Errorf("omprpc: %s result: %w", command, err)
 	}
 	return nil
@@ -65,9 +73,8 @@ func newUnknownNotification(tag string, data []byte) UnknownNotification {
 
 // peekTag returns the string at property in a JSON object, or "".
 func peekTag(data []byte, property string) string {
-	var raw map[string]json.RawMessage
 	var tag string
-	if json.Unmarshal(data, &raw) == nil {
+	if raw, err := decodeObject(data, ""); err == nil {
 		_ = json.Unmarshal(raw[property], &tag)
 	}
 	return tag
@@ -81,7 +88,12 @@ func Ptr[T any](v T) *T {
 func decodeObject(data []byte, owner string) (map[string]json.RawMessage, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("%s: %w", owner, err)
+		// Nested past encoding/json's limit, as a get_tree answer is: see splitObject.
+		deep, deepErr := splitObject(data)
+		if deepErr != nil {
+			return nil, fmt.Errorf("%s: %w", owner, err)
+		}
+		raw = deep
 	}
 	if raw == nil {
 		return nil, fmt.Errorf("%s: expected an object, got null", owner)
@@ -217,6 +229,9 @@ func (d *fieldDecoder) take(key string) (json.RawMessage, bool) {
 
 func (d *fieldDecoder) decode(key string, value json.RawMessage, dst any) {
 	err := json.Unmarshal(value, dst)
+	if err != nil && decodeDeep(value, dst) {
+		err = nil
+	}
 	switch {
 	case err == nil:
 		d.consume(key)

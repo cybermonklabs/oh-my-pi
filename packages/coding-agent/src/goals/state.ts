@@ -3,6 +3,12 @@ import { stableStringifyJson } from "@oh-my-pi/pi-utils";
 import { type Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { UsageStatistics } from "../session/session-entries";
 
+/**
+ * `custom` type of the entry a completed goal appends after its `mode_change`
+ * to `none`: its `data` holds the goal's objective and the tokens and time it used.
+ */
+export const GOAL_COMPLETED_CUSTOM_TYPE = "goal-completed";
+
 export interface GoalModeState {
 	enabled: boolean;
 	mode: "active" | "exiting";

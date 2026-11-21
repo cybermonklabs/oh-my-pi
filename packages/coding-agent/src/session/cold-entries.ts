@@ -33,6 +33,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
+import { GOAL_COMPLETED_CUSTOM_TYPE } from "../goals/state";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import {
 	approvedPlanFileOf,
@@ -465,7 +466,8 @@ function firstReadCompactionIndex(path: readonly SessionEntry[], compactions: Re
  * Whether `entry` goes to the store from the cut on too, unless kept whole by
  * position: a record no turn reads (a patch record, which a load applies; a
  * `session_exit` record, of which a resume reads only the newest's kind and
- * how many tool calls were pending, not their arguments), or one a newer
+ * how many tool calls were pending, not their arguments; a goal's completion
+ * record, which holds the objective its mode changes hold), or one a newer
  * entry of its kind supersedes (a user's edit of the to-do list, a to-do HUD
  * choice, a mode change: only the newest on the path is read whole; of an
  * older mode change a resume reads only its mode and the approved plan file it
@@ -479,6 +481,7 @@ function isStoredPastCut(entry: SessionEntry): boolean {
 		type === PATCH_RECORD_CUSTOM_TYPE ||
 		type === USER_TODO_EDIT_CUSTOM_TYPE ||
 		type === SESSION_EXIT_CUSTOM_TYPE ||
+		type === GOAL_COMPLETED_CUSTOM_TYPE ||
 		type === TODO_HUD_STATE_CUSTOM_TYPE
 	);
 }
