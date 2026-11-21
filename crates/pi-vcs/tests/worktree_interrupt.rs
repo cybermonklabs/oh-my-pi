@@ -12,7 +12,7 @@
 
 use std::{
 	env, fs,
-	os::unix::process::ExitStatusExt,
+	os::unix::process::{CommandExt, ExitStatusExt},
 	path::{Path, PathBuf},
 	process::{Child, Command, Stdio},
 };
@@ -117,8 +117,13 @@ fn clone_works_on(root: &Path) -> bool {
 	works
 }
 
+/// Starts the add in a child process, in a process group of its own: the
+/// tests stop it with `SIGSTOP`, and a stopped member makes some kernels
+/// (gVisor) send `SIGHUP` to its whole group, the test runner's too, when
+/// another member exits while that group has no parent outside it.
 fn spawn_add(source: &Path, target: &Path, clone: &str) -> Child {
 	Command::new(env::current_exe().unwrap())
+		.process_group(0)
 		.args(["interrupted_add_child", "--exact", "--nocapture", "--test-threads=1"])
 		.env(CHILD_SOURCE, source)
 		.env(CHILD_TARGET, target)
@@ -428,7 +433,7 @@ fn an_add_refuses_a_killed_adds_tree_with_a_repository_cloned_below_its_root() {
 		.worktree_add(&target, "HEAD", options(WorktreeClone::Off))
 		.unwrap_err()
 		.to_string();
-	assert!(refused.contains("holds a repository below its root"), "{refused}");
+	assert!(refused.contains("holds a repository ("), "{refused}");
 	assert_eq!(git(&dep, &["log", "-1", "--format=%s"]), "unpushed", "the clone was removed");
 	assert!(listed_block(&source, &target).is_some(), "the registration was removed");
 }

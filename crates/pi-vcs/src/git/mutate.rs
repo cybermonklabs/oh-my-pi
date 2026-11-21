@@ -719,23 +719,27 @@ impl GitRepo {
 		Ok(WorktreeAddResult { cloned_with: None, clone_error, notes })
 	}
 
-	/// Remove the registration an interrupted [`Self::worktree_add`] of
-	/// `path` left, and empty the tree that add made, so `path` can be added
-	/// again. Only a registration that names `path` and holds the
-	/// add-in-progress marker is considered. It goes when no process holds
-	/// that marker any more, its `locked` file holds exactly what the add
-	/// wrote, its `HEAD` is still what the add wrote and has no reflog, and
-	/// `path` is missing, or is still the directory the add made (same device
-	/// and inode, and the token the add set on it) with no repository in it
-	/// (no `.git` but the add's own gitfile at its root, and no bare
-	/// repository) and no filesystem mounted in it (every entry on the root's
-	/// device). Files written into that tree after the add stopped, and
-	/// changes staged there, are removed with it. A live add, a lock someone
-	/// changed or removed, a commit or checkout made there, a directory made
-	/// again in its place, a repository or a mount point anywhere in the
-	/// tree, or a platform that cannot check these is refused with a message
-	/// naming the registration, and nothing is removed. A mount made during
-	/// the emptying stops it there, with nothing on that filesystem removed.
+	/// Remove the registration an interrupted [`Self::worktree_add`] of `path`
+	/// left, and empty the tree that add made, so `path` can be added again.
+	/// Only a registration that names `path` and holds the add-in-progress
+	/// marker is considered. It goes when no process holds that marker any more,
+	/// its `locked` file holds exactly what the add wrote, its `HEAD` is still
+	/// what the add wrote (or was never written) and has no reflog, it holds no
+	/// refs of the worktree's own, and `path` is missing, or is still the
+	/// directory the add made (same device and inode, and the token the add set
+	/// on it) with no repository in it (no `.git` but the add's own gitfile at
+	/// its root, and no bare repository the add's commit does not track, the
+	/// root included) and nothing mounted in it. Symlinks in the tree are
+	/// removed, never followed. Files written into that tree after the add
+	/// stopped, changes staged there, and a merge or cherry-pick begun there go
+	/// with it; so does a commit made there and left by a checkout back to the
+	/// add's commit when `core.logAllRefUpdates` is off, which leaves no trace
+	/// in `HEAD`. A live add, a lock someone changed or removed, a commit or
+	/// checkout made there, a directory made again in its place, a repository or
+	/// a mount point in the tree, or a platform that cannot check these is
+	/// refused with a message naming the registration, and nothing is removed. A
+	/// mount made during the emptying stops it there, with nothing on that
+	/// filesystem removed. The token stays on the emptied directory.
 	/// Registrations earlier reclaims moved out of git's view and did not delete
 	/// go first. Returns one note per removal, for the caller to show.
 	pub fn worktree_reclaim_abandoned(&self, path: &Path) -> Result<Vec<String>> {
@@ -2397,7 +2401,9 @@ const fn mark_tree(_dir: &Path) -> Option<TreeMark> {
 mod tree_dir {
 	use std::{
 		ffi::{CStr, CString, OsStr},
-		fs, io,
+		fs,
+		io::{self, Read as _},
+		mem::MaybeUninit,
 		os::{
 			fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 			unix::ffi::OsStrExt,
@@ -2410,16 +2416,34 @@ mod tree_dir {
 	/// An open directory: `O_RDONLY | O_DIRECTORY | O_NOFOLLOW`.
 	pub struct TreeDir(fs::File);
 
+	/// The deepest a walk goes below the tree's root. Each level holds one
+	/// descriptor, so a deeper tree is refused rather than run out of them.
+	const MAX_DEPTH: usize = 256;
+
+	/// The most of a `.git` file that is read: a gitfile is one short line.
+	const GITFILE_MAX: u64 = 4096;
+
 	fn c_name(name: &OsStr) -> io::Result<CString> {
 		CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+	}
+
+	/// Runs `call` again while it fails with `EINTR`.
+	fn retry(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
+		loop {
+			let rc = call();
+			if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+				return rc;
+			}
+		}
 	}
 
 	/// `openat(dir, name, flags | O_CLOEXEC | O_NOFOLLOW)`.
 	fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
 		// SAFETY: `name` is a live NUL-terminated string; the flags take no
 		// mode argument.
-		let fd =
-			unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+		let fd = retry(|| unsafe {
+			libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		});
 		if fd < 0 {
 			return Err(io::Error::last_os_error());
 		}
@@ -2430,7 +2454,7 @@ mod tree_dir {
 	/// `unlinkat(dir, name, flags)`; a name already gone is fine.
 	fn unlink_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
 		// SAFETY: `name` is a live NUL-terminated string.
-		if unsafe { libc::unlinkat(dir, name.as_ptr(), flags) } == 0 {
+		if retry(|| unsafe { libc::unlinkat(dir, name.as_ptr(), flags) }) == 0 {
 			return Ok(());
 		}
 		let err = io::Error::last_os_error();
@@ -2441,21 +2465,60 @@ mod tree_dir {
 		}
 	}
 
-	/// The device the entry `name` in the directory `dir` is on, without
-	/// following a symlink or triggering an automount: a mount point reports
-	/// the mounted filesystem's. `None` when the entry is gone.
-	fn device_at(dir: RawFd, name: &CStr) -> io::Result<Option<libc::dev_t>> {
-		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-		// SAFETY: `name` is a live NUL-terminated string, and `stat` is
-		// writable memory of the size `fstatat` fills.
-		let rc = unsafe {
-			libc::fstatat(
+	/// What `statx` tells of an entry, as the walks need it.
+	#[derive(Clone, Copy)]
+	struct Entry {
+		/// The file type bits of the mode (`S_IFMT`).
+		kind:       libc::mode_t,
+		dev:        libc::dev_t,
+		ino:        u64,
+		/// The mount the entry is on, where the kernel reports it.
+		mount:      Option<u64>,
+		/// Whether the entry is the root of a mount (a mount point), where the
+		/// kernel reports it.
+		mount_root: bool,
+	}
+
+	impl Entry {
+		const fn is_dir(&self) -> bool {
+			self.kind == libc::S_IFDIR
+		}
+
+		const fn is_file(&self) -> bool {
+			self.kind == libc::S_IFREG
+		}
+
+		const fn id(&self) -> (libc::dev_t, u64) {
+			(self.dev, self.ino)
+		}
+
+		/// Whether this entry, below a tree's root `root`, is a mount point,
+		/// which a reclaim never descends into or removes: the root of a
+		/// mount, another mount, or another device (a filesystem that gives
+		/// its subvolumes devices of their own, such as btrfs, counts too).
+		const fn mounted_below(&self, root: &Self) -> bool {
+			self.mount_root
+				|| self.dev != root.dev
+				|| matches!((self.mount, root.mount), (Some(mine), Some(theirs)) if mine != theirs)
+		}
+	}
+
+	/// `statx` of `name` in `dir` (`flags` adds `AT_EMPTY_PATH` for `dir`
+	/// itself), never following a symlink or triggering an automount. `None`
+	/// when the entry is gone.
+	fn statx_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<Option<Entry>> {
+		let mut buf = MaybeUninit::<libc::statx>::zeroed();
+		// SAFETY: `name` is a live NUL-terminated string, and `buf` is writable
+		// memory of the size `statx` fills.
+		let rc = retry(|| unsafe {
+			libc::statx(
 				dir,
 				name.as_ptr(),
-				stat.as_mut_ptr(),
-				libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+				flags | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+				libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID,
+				buf.as_mut_ptr(),
 			)
-		};
+		});
 		if rc != 0 {
 			let err = io::Error::last_os_error();
 			return if err.kind() == io::ErrorKind::NotFound {
@@ -2464,38 +2527,94 @@ mod tree_dir {
 				Err(err)
 			};
 		}
-		// SAFETY: `fstatat` succeeded, so it filled `stat`.
-		Ok(Some(unsafe { stat.assume_init() }.st_dev))
+		// SAFETY: `statx` succeeded, so it filled `buf` (zeroed where it did
+		// not).
+		let stat = unsafe { buf.assume_init() };
+		let mount_root = u64::from(libc::STATX_ATTR_MOUNT_ROOT.cast_unsigned());
+		Ok(Some(Entry {
+			kind:       libc::mode_t::from(stat.stx_mode) & libc::S_IFMT,
+			dev:        libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+			ino:        stat.stx_ino,
+			mount:      (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id),
+			mount_root: stat.stx_attributes_mask & mount_root != 0
+				&& stat.stx_attributes & mount_root != 0,
+		}))
 	}
 
-	/// The device the open file `fd` is on.
-	fn device_of(fd: RawFd) -> io::Result<libc::dev_t> {
-		let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-		// SAFETY: `fd` is an open descriptor, and `stat` is writable memory of
-		// the size `fstat` fills.
-		if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: `fstat` succeeded, so it filled `stat`.
-		Ok(unsafe { stat.assume_init() }.st_dev)
+	/// The entry `name` in the directory `dir`.
+	fn entry_at(dir: RawFd, name: &CStr) -> io::Result<Option<Entry>> {
+		statx_at(dir, name, 0)
 	}
 
-	/// Whether `found`, the device of an entry below a tree's root, is not the
-	/// root's `root`: the entry is a mount point (or on a filesystem that gives
-	/// its subvolumes devices of their own), which the reclaim never descends
-	/// into or removes.
-	const fn other_device(found: libc::dev_t, root: libc::dev_t) -> bool {
-		found != root
+	/// The open file `fd` itself.
+	fn entry_of(fd: RawFd) -> io::Result<Entry> {
+		statx_at(fd, c"", libc::AT_EMPTY_PATH)?
+			.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 	}
 
-	/// The error the emptying stops with at `path`, a mount point that
-	/// appeared after the checks.
+	/// The error a walk stops with at `path`, a mount point that appeared
+	/// after the checks.
 	fn mounted(path: &Path) -> io::Error {
 		io::Error::other(format!(
 			"a filesystem is mounted at {} in the tree of an interrupted worktree add; the reclaim \
 			 stopped there and removed nothing on it",
 			path.display()
 		))
+	}
+
+	/// The error a walk stops with at `path`, an entry that changed between
+	/// its check and its open (a directory swapped for a symlink, say).
+	fn changed(path: &Path) -> io::Error {
+		io::Error::other(format!(
+			"{} in the tree of an interrupted worktree add changed while the reclaim checked it; the \
+			 reclaim stopped there",
+			path.display()
+		))
+	}
+
+	/// The error a walk stops with at `path`: deeper than [`MAX_DEPTH`], or
+	/// a directory that is one of its own ancestors.
+	fn not_walked(path: &Path, why: &str) -> io::Error {
+		io::Error::other(format!(
+			"{} in the tree of an interrupted worktree add {why}; the reclaim stopped there",
+			path.display()
+		))
+	}
+
+	/// Opens the directory `name` in `dir` (at `path`), which `entry_at` said
+	/// is the directory `entry`, and checks that the open reached that very
+	/// directory: some kernels (gVisor) follow a symlink for `O_DIRECTORY`
+	/// even with `O_NOFOLLOW`, so the opened file's type, device and inode
+	/// must match. `None` when the entry is gone.
+	fn open_dir(dir: RawFd, name: &CStr, entry: &Entry, path: &Path) -> io::Result<Option<OwnedFd>> {
+		#[cfg(test)]
+		super::test_hooks::before_entry_open(OsStr::from_bytes(name.to_bytes()));
+		let fd = match open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY) {
+			Ok(fd) => fd,
+			Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+				return Err(changed(path));
+			},
+			Err(err) => return Err(err),
+		};
+		let opened = entry_of(fd.as_raw_fd())?;
+		if !opened.is_dir() || opened.id() != entry.id() {
+			return Err(changed(path));
+		}
+		Ok(Some(fd))
+	}
+
+	/// Checks that the directory `entry` (at `path`) can be walked into
+	/// below `ancestors`: not one of them (a cycle), and not deeper than
+	/// [`MAX_DEPTH`].
+	fn may_enter(ancestors: &[(libc::dev_t, u64)], entry: &Entry, path: &Path) -> io::Result<()> {
+		if ancestors.contains(&entry.id()) {
+			return Err(not_walked(path, "is one of its own ancestors"));
+		}
+		if ancestors.len() > MAX_DEPTH {
+			return Err(not_walked(path, &format!("is more than {MAX_DEPTH} levels deep")));
+		}
+		Ok(())
 	}
 
 	/// The names in the directory `dir`, without `.` and `..`.
@@ -2545,36 +2664,40 @@ mod tree_dir {
 		}
 	}
 
-	/// Removes everything in the directory `dir` (at `at`), never following a
-	/// symlink: each subdirectory is opened `O_NOFOLLOW` from its parent, and
-	/// a name that turned into a symlink or a file meanwhile is unlinked
-	/// itself. An entry on another device than `dev`, the tree root's, stops
-	/// it before anything on that device is touched.
-	fn remove_all_in(dir: RawFd, dev: libc::dev_t, at: &Path) -> io::Result<()> {
+	/// Removes everything in the directory `dir` (at `at`), deciding each
+	/// entry by its `statx` before touching it: anything that is not a
+	/// directory is unlinked without being opened, and a directory is opened
+	/// only if the open reaches that same directory (`open_dir`). An entry
+	/// that is a mount point stops it before anything on that mount is
+	/// touched. `ancestors` holds the directories open above, the root's
+	/// first.
+	fn remove_all_in(
+		dir: RawFd,
+		at: &Path,
+		root: &Entry,
+		ancestors: &mut Vec<(libc::dev_t, u64)>,
+	) -> io::Result<()> {
 		for name in names(dir)? {
 			let path = at.join(OsStr::from_bytes(name.as_bytes()));
-			match device_at(dir, &name)? {
-				None => continue,
-				Some(found) if other_device(found, dev) => return Err(mounted(&path)),
-				Some(_) => {},
+			let Some(entry) = entry_at(dir, &name)? else {
+				continue;
+			};
+			if entry.mounted_below(root) {
+				return Err(mounted(&path));
 			}
-			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
-				Ok(child) => {
-					// A mount made on the name after `device_at`: the open
-					// went onto it.
-					if other_device(device_of(child.as_raw_fd())?, dev) {
-						return Err(mounted(&path));
-					}
-					remove_all_in(child.as_raw_fd(), dev, &path)?;
-					drop(child);
-					unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
-				},
-				Err(err) if err.kind() == io::ErrorKind::NotFound => {},
-				Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
-					unlink_at(dir, &name, 0)?;
-				},
-				Err(err) => return Err(err),
+			if !entry.is_dir() {
+				unlink_at(dir, &name, 0)?;
+				continue;
 			}
+			may_enter(ancestors, &entry, &path)?;
+			let Some(child) = open_dir(dir, &name, &entry, &path)? else {
+				continue;
+			};
+			ancestors.push(entry.id());
+			remove_all_in(child.as_raw_fd(), &path, root, ancestors)?;
+			ancestors.pop();
+			drop(child);
+			unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
 		}
 		Ok(())
 	}
@@ -2582,59 +2705,62 @@ mod tree_dir {
 	/// What below a tree's root is not the interrupted add's to remove, by
 	/// its path relative to the root.
 	pub enum Foreign {
-		/// A repository: an entry named `.git`, or a directory holding `HEAD`,
-		/// `objects` and `refs` (a bare repository).
+		/// A repository: an entry named `.git` below the root, or a directory
+		/// (the root too) holding `HEAD`, `objects` and `refs` whose `HEAD`
+		/// the add's commit does not track (a bare repository).
 		Repository(PathBuf),
-		/// An entry on another device than the root: a mount point.
+		/// An entry that is a mount point.
 		MountPoint(PathBuf),
 	}
 
-	/// Looks in the directory `dir` (at `at` below the tree's root, on the
-	/// device `dev`) for what is not the add's: an entry on another device,
-	/// an entry named `.git` (the root's own is skipped), or, below the root,
-	/// `dir` itself holding `HEAD`, `objects` and `refs`. Queues every
-	/// subdirectory it opens without following a symlink.
+	/// Looks in the directory `dir` (at `at` below the tree's root, with the
+	/// directories open above it in `ancestors`, the root's first) for what is
+	/// not the add's, deciding each entry by its `statx`: a mount point, an
+	/// entry named `.git` (the root's own is checked apart), or `dir` itself
+	/// holding `HEAD`, `objects` and `refs` where `tracked` says the add's
+	/// commit does not track that `HEAD`. Walks depth first, holding only the
+	/// descriptors of the directories above.
 	fn foreign_entry_in(
 		dir: RawFd,
 		at: &Path,
-		root: bool,
-		dev: libc::dev_t,
-		pending: &mut Vec<(OwnedFd, PathBuf)>,
+		root: &Entry,
+		ancestors: &mut Vec<(libc::dev_t, u64)>,
+		tracked: &dyn Fn(&Path) -> bool,
 	) -> io::Result<Option<Foreign>> {
 		let names = names(dir)?;
-		if !root
-			&& [&b"HEAD"[..], b"objects", b"refs"]
-				.iter()
-				.all(|wanted| names.iter().any(|name| name.as_bytes() == *wanted))
+		if [&b"HEAD"[..], b"objects", b"refs"]
+			.iter()
+			.all(|wanted| names.iter().any(|name| name.as_bytes() == *wanted))
+			&& !tracked(&at.join("HEAD"))
 		{
 			return Ok(Some(Foreign::Repository(at.to_path_buf())));
 		}
 		for name in names {
 			let relative = at.join(OsStr::from_bytes(name.as_bytes()));
-			match device_at(dir, &name)? {
-				None => continue,
-				Some(found) if other_device(found, dev) => {
-					return Ok(Some(Foreign::MountPoint(relative)));
-				},
-				Some(_) => {},
+			let Some(entry) = entry_at(dir, &name)? else {
+				continue;
+			};
+			if entry.mounted_below(root) {
+				return Ok(Some(Foreign::MountPoint(relative)));
 			}
 			if name.as_bytes() == b".git" {
-				if root {
+				if ancestors.len() == 1 {
 					continue;
 				}
 				return Ok(Some(Foreign::Repository(relative)));
 			}
-			match open_at(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
-				Ok(child) => {
-					if other_device(device_of(child.as_raw_fd())?, dev) {
-						return Ok(Some(Foreign::MountPoint(relative)));
-					}
-					pending.push((child, relative));
-				},
-				Err(err)
-					if err.kind() == io::ErrorKind::NotFound
-						|| matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {},
-				Err(err) => return Err(err),
+			if !entry.is_dir() {
+				continue;
+			}
+			may_enter(ancestors, &entry, &relative)?;
+			let Some(child) = open_dir(dir, &name, &entry, &relative)? else {
+				continue;
+			};
+			ancestors.push(entry.id());
+			let found = foreign_entry_in(child.as_raw_fd(), &relative, root, ancestors, tracked)?;
+			ancestors.pop();
+			if found.is_some() {
+				return Ok(found);
 			}
 		}
 		Ok(None)
@@ -2663,46 +2789,48 @@ mod tree_dir {
 		/// Whether this directory holds no `.git`, or a `.git` file naming the
 		/// registration `admin` (a relative name taken from `tree`, the path
 		/// it was opened at): anything else (a repository of its own, a
-		/// `.git` naming another registration) is not the interrupted add's
-		/// to remove.
+		/// `.git` naming another registration, a FIFO or other special file)
+		/// is not the interrupted add's to remove. The entry's type is read
+		/// before it is opened, and the open does not block.
 		pub fn git_entry_is_ours(&self, tree: &Path, admin: &Path) -> bool {
-			let entry = match open_at(self.0.as_raw_fd(), c".git", libc::O_RDONLY) {
-				Ok(fd) => fs::File::from(fd),
-				Err(err) => return err.kind() == io::ErrorKind::NotFound,
+			let fd = self.0.as_raw_fd();
+			let entry = match entry_at(fd, c".git") {
+				Ok(None) => return true,
+				Ok(Some(entry)) if entry.is_file() => entry,
+				_ => return false,
 			};
-			if !entry.metadata().is_ok_and(|meta| meta.is_file()) {
+			let Ok(opened) = open_at(fd, c".git", libc::O_RDONLY | libc::O_NONBLOCK) else {
+				return false;
+			};
+			if !entry_of(opened.as_raw_fd()).is_ok_and(|now| now.is_file() && now.id() == entry.id()) {
 				return false;
 			}
-			io::read_to_string(entry)
-				.ok()
-				.and_then(|text| {
-					text
-						.trim()
-						.strip_prefix("gitdir:")
-						.map(|raw| tree.join(raw.trim()))
-				})
+			let mut text = String::new();
+			if fs::File::from(opened)
+				.take(GITFILE_MAX)
+				.read_to_string(&mut text)
+				.is_err()
+			{
+				return false;
+			}
+			text
+				.trim()
+				.strip_prefix("gitdir:")
+				.map(|raw| tree.join(raw.trim()))
 				.is_some_and(|named| resolve_leaf(&named) == resolve_leaf(admin))
 		}
 
-		/// The first entry below this directory's root that is not the
-		/// add's: an entry on another device (a mount point), an entry named
-		/// `.git` (the root's own is not looked at), or a directory holding
-		/// `HEAD`, `objects` and `refs`. Walks every subdirectory without
-		/// following a symlink or descending onto another device.
-		pub fn foreign_entry(&self) -> io::Result<Option<Foreign>> {
-			let dev = device_of(self.0.as_raw_fd())?;
-			let mut pending = Vec::new();
-			if let Some(found) =
-				foreign_entry_in(self.0.as_raw_fd(), Path::new(""), true, dev, &mut pending)?
-			{
-				return Ok(Some(found));
-			}
-			while let Some((dir, at)) = pending.pop() {
-				if let Some(found) = foreign_entry_in(dir.as_raw_fd(), &at, false, dev, &mut pending)? {
-					return Ok(Some(found));
-				}
-			}
-			Ok(None)
+		/// The first entry of this directory's tree that is not the add's:
+		/// a mount point below the root, an entry named `.git` below the root
+		/// (the root's own is not looked at), or a directory, the root
+		/// included, holding `HEAD`, `objects` and `refs` whose `HEAD`
+		/// `tracked` (a path relative to the root) says the add's commit does
+		/// not track. Walks every subdirectory without following a symlink or
+		/// descending onto another mount.
+		pub fn foreign_entry(&self, tracked: &dyn Fn(&Path) -> bool) -> io::Result<Option<Foreign>> {
+			let root = entry_of(self.0.as_raw_fd())?;
+			let mut ancestors = vec![root.id()];
+			foreign_entry_in(self.0.as_raw_fd(), Path::new(""), &root, &mut ancestors, tracked)
 		}
 
 		/// Adds the owner's read, write and search bits to this directory's
@@ -2718,24 +2846,12 @@ mod tree_dir {
 		}
 
 		/// Removes everything in this directory (opened at `path`), keeping
-		/// the directory. It stops at an entry on another device than this
-		/// directory, before touching anything there.
+		/// the directory. It stops at a mount point, before touching anything
+		/// on that mount.
 		pub fn empty(&self, path: &Path) -> io::Result<()> {
-			remove_all_in(self.0.as_raw_fd(), device_of(self.0.as_raw_fd())?, path)
-		}
-
-		/// Removes the token from this directory if it is still `token`; a
-		/// failure is ignored. Another add of the same path may have set its
-		/// own since, which stays.
-		pub fn clear_mark_if(&self, token: &str) {
-			if tree_mark::get_fd(self.0.as_raw_fd())
-				.ok()
-				.flatten()
-				.as_deref()
-				== Some(token)
-			{
-				tree_mark::clear_fd(self.0.as_raw_fd());
-			}
+			let root = entry_of(self.0.as_raw_fd())?;
+			let mut ancestors = vec![root.id()];
+			remove_all_in(self.0.as_raw_fd(), path, &root, &mut ancestors)
 		}
 	}
 }
@@ -2835,12 +2951,6 @@ mod tree_mark {
 		Ok(std::str::from_utf8(&buf[..len as usize])
 			.ok()
 			.map(str::to_owned))
-	}
-
-	/// Removes the token from the open directory `fd`; a failure is ignored.
-	pub fn clear_fd(fd: std::os::fd::RawFd) {
-		// SAFETY: the name is a live NUL-terminated string.
-		unsafe { libc::fremovexattr(fd, NAME.as_ptr()) };
 	}
 
 	/// Removes the token from `dir`; a failure is ignored.
@@ -2952,20 +3062,19 @@ fn reclaim_with_marker(
 }
 
 /// What a reclaim took from a dead add while its marker was held: the note
-/// so far, the registration moved out of git's view, and (on Linux) the
-/// emptied tree with the token the add set on it.
+/// so far, and the registration moved out of git's view.
 struct Reclaimed {
 	note:  String,
 	moved: PathBuf,
-	#[cfg(target_os = "linux")]
-	tree:  Option<(tree_dir::TreeDir, String)>,
 }
 
 impl Reclaimed {
-	/// Deletes the moved registration and clears the add's token from the
-	/// tree, only if the tree still holds that token: an add of the same path
-	/// that started after the registration moved has set its own. Returns the
-	/// note, with what could not be deleted.
+	/// Deletes the moved registration. Returns the note, with what could not
+	/// be deleted. The add's token stays on the emptied directory: an add of
+	/// the same path that started after the registration moved may have set
+	/// its own there already, which no read-then-remove could tell from the
+	/// dead add's in one step, and a token no registration records matches
+	/// nothing.
 	fn finish(self) -> String {
 		use std::fmt::Write as _;
 		#[cfg(test)]
@@ -2979,10 +3088,6 @@ impl Reclaimed {
 				"; could not delete the removed registration {}: {err}",
 				self.moved.display()
 			);
-		}
-		#[cfg(target_os = "linux")]
-		if let Some((dir, token)) = self.tree {
-			dir.clear_mark_if(&token);
 		}
 		note
 	}
@@ -3062,12 +3167,18 @@ fn take_abandoned_add(
 		// A commit or a checkout in the tree after the add died is recorded
 		// only here: `HEAD` moves (a detached commit is reachable from nothing
 		// else) and `logs/HEAD` appears. Removing the registration would lose
-		// both.
-		if fs::read_to_string(admin.join("HEAD")).ok().as_deref() != Some(&format!("{head}\n")) {
-			return Err(refuse(
-				"whose HEAD moved since that add wrote it (a commit or a checkout there), which \
-				 removing it would lose",
-			));
+		// both. A `HEAD` missing or empty is one the add died before writing:
+		// nothing can commit through the registration before `link` writes
+		// the tree's gitfile, after it.
+		match fs::read_to_string(admin.join("HEAD")) {
+			Ok(text) if text.is_empty() || text == format!("{head}\n") => {},
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+			_ => {
+				return Err(refuse(
+					"whose HEAD moved since that add wrote it (a commit or a checkout there), which \
+					 removing it would lose",
+				));
+			},
 		}
 		match fs::symlink_metadata(admin.join("logs").join("HEAD")) {
 			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
@@ -3078,17 +3189,21 @@ fn take_abandoned_add(
 				));
 			},
 		}
-		let (note, dir) = reclaim_tree(common, admin, tree, made.as_ref(), &refuse)?;
+		// Refs of the worktree's own (`refs/worktree/*`, `refs/bisect/*`) live
+		// in the registration too; the add writes none.
+		match fs::symlink_metadata(admin.join("refs")) {
+			Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+			_ => {
+				return Err(refuse(
+					"whose registration holds refs of the worktree's own (refs/worktree, refs/bisect), \
+					 which removing it would lose",
+				));
+			},
+		}
+		let note = reclaim_tree(common, admin, tree, made.as_ref(), head, &refuse)?;
 		// Moved while the marker is held, so no other add can take it first.
 		let moved = move_registration(common, admin)?;
-		#[cfg(not(target_os = "linux"))]
-		let _ = dir;
-		Ok(Some(Reclaimed {
-			note,
-			moved,
-			#[cfg(target_os = "linux")]
-			tree: dir.zip(made.map(|made| made.token)),
-		}))
+		Ok(Some(Reclaimed { note, moved }))
 	}
 	#[cfg(not(unix))]
 	{
@@ -3099,30 +3214,30 @@ fn take_abandoned_add(
 
 /// Empties the tree an interrupted add left at `tree` while it is still the
 /// directory that add made (`made`) and holds no repository and no mount
-/// point, and returns the note to show with the directory, held open so its
-/// token can go after the registration; a tree that is gone leaves only the
-/// registration to remove. Anything else is refused with `refuse`, and
-/// nothing is removed. The tree is opened once, without following a symlink,
-/// and every check and the removal go through that descriptor.
+/// point, and returns the note to show; a tree that is gone leaves only the
+/// registration to remove. A directory holding `HEAD`, `objects` and `refs`
+/// counts as a repository unless the commit the add checked out (`head`, what
+/// it wrote to `HEAD`) tracks that `HEAD`. Anything else is refused with
+/// `refuse`, and nothing is removed. The tree is opened once, without
+/// following a symlink, and every check and the removal go through that
+/// descriptor.
 #[cfg(target_os = "linux")]
 fn reclaim_tree(
 	common: &Path,
 	admin: &Path,
 	tree: &Path,
 	made: Option<&TreeMark>,
+	head: &str,
 	refuse: &impl Fn(&str) -> Error,
-) -> Result<(String, Option<tree_dir::TreeDir>)> {
+) -> Result<String> {
 	let not_made_here =
 		|| refuse("and the directory there cannot be told apart from one made again in its place");
 	let dir = match tree_dir::TreeDir::open(tree) {
 		Ok(Some(dir)) => dir,
 		Ok(None) => {
-			return Ok((
-				format!(
-					"removed the registration an interrupted worktree add of {} left",
-					tree.display()
-				),
-				None,
+			return Ok(format!(
+				"removed the registration an interrupted worktree add of {} left",
+				tree.display()
 			));
 		},
 		Err(err) if matches!(err.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
@@ -3141,14 +3256,13 @@ fn reclaim_tree(
 	}
 	// The add's own tree never holds a `.git` below its root (the clone leaves
 	// out directories a `.git` marks, and a checkout writes a submodule as an
-	// empty directory), and it is one filesystem: a mount below it is someone
-	// else's.
-	match dir.foreign_entry()? {
+	// empty directory), it holds a bare repository only where its commit
+	// tracks one (a test fixture), and it is one filesystem: a mount below it
+	// is someone else's.
+	let tracked = |path: &Path| tracked_by(common, head, path);
+	match dir.foreign_entry(&tracked)? {
 		Some(tree_dir::Foreign::Repository(nested)) => {
-			return Err(refuse(&format!(
-				"and holds a repository below its root ({})",
-				tree.join(nested).display()
-			)));
+			return Err(refuse(&format!("and holds a repository ({})", tree.join(nested).display())));
 		},
 		Some(tree_dir::Foreign::MountPoint(mount)) => {
 			return Err(refuse(&format!(
@@ -3164,14 +3278,42 @@ fn reclaim_tree(
 	// the add keeps an empty directory anyway.
 	dir.make_owner_writable()?;
 	dir.empty(tree)?;
-	Ok((
-		format!(
-			"emptied the partial tree an interrupted worktree add left at {}, with any file written \
-			 into it after that add stopped",
-			tree.display()
-		),
-		Some(dir),
+	Ok(format!(
+		"emptied the partial tree an interrupted worktree add left at {}, with any file written or \
+		 change staged there after that add stopped",
+		tree.display()
 	))
+}
+
+/// Whether the commit an add checked out tracks `path` (relative to the
+/// tree's root). `head` is what the add wrote to `HEAD`: an object id, or
+/// `ref: <name>`, read where it points now. Anything that cannot be read
+/// counts as not tracked.
+#[cfg(target_os = "linux")]
+fn tracked_by(common: &Path, head: &str, path: &Path) -> bool {
+	let Ok(repo) = gix::open(common) else {
+		return false;
+	};
+	let id = match head.strip_prefix("ref: ") {
+		Some(name) => {
+			let Ok(mut reference) = repo.find_reference(name) else {
+				return false;
+			};
+			match reference.peel_to_id() {
+				Ok(id) => id.detach(),
+				Err(_) => return false,
+			}
+		},
+		None => match gix::ObjectId::from_hex(head.as_bytes()) {
+			Ok(id) => id,
+			Err(_) => return false,
+		},
+	};
+	repo
+		.find_commit(id)
+		.ok()
+		.and_then(|commit| commit.tree().ok())
+		.is_some_and(|tree| tree.lookup_entry_by_path(path).ok().flatten().is_some())
 }
 
 /// Off Linux an add marks no tree (`made` is always `None`), so only a tree
@@ -3182,12 +3324,13 @@ fn reclaim_tree(
 	_admin: &Path,
 	tree: &Path,
 	_made: Option<&TreeMark>,
+	_head: &str,
 	refuse: &impl Fn(&str) -> Error,
-) -> Result<(String, Option<()>)> {
+) -> Result<String> {
 	match fs::symlink_metadata(tree) {
-		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((
-			format!("removed the registration an interrupted worktree add of {} left", tree.display()),
-			None,
+		Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(format!(
+			"removed the registration an interrupted worktree add of {} left",
+			tree.display()
 		)),
 		Err(err) => Err(err.into()),
 		Ok(_) => Err(refuse(
@@ -3272,6 +3415,24 @@ mod test_hooks {
 		static BEFORE_MARKER_RELEASE: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static BEFORE_TREE_REMOVAL: RefCell<Option<Hook>> = const { RefCell::new(None) };
 		static AFTER_REGISTRATION_MOVED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+		static BEFORE_ENTRY_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+	}
+
+	/// Runs `hook` with an entry's name just before a reclaim's walk or
+	/// emptying on this thread opens that entry as a directory, until
+	/// [`clear`].
+	#[cfg(target_os = "linux")]
+	pub fn set_before_entry_open(hook: impl FnMut(&Path) + 'static) {
+		BEFORE_ENTRY_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+	}
+
+	#[cfg(target_os = "linux")]
+	pub fn before_entry_open(name: &std::ffi::OsStr) {
+		BEFORE_ENTRY_OPEN.with(|slot| {
+			if let Some(hook) = slot.borrow_mut().as_mut() {
+				hook(Path::new(name));
+			}
+		});
 	}
 
 	/// Runs `hook` with the moved registration's path after a reclaim on
@@ -3317,6 +3478,7 @@ mod test_hooks {
 		BEFORE_MARKER_RELEASE.with(|slot| *slot.borrow_mut() = None);
 		BEFORE_TREE_REMOVAL.with(|slot| *slot.borrow_mut() = None);
 		AFTER_REGISTRATION_MOVED.with(|slot| *slot.borrow_mut() = None);
+		BEFORE_ENTRY_OPEN.with(|slot| *slot.borrow_mut() = None);
 	}
 
 	pub fn before_marker_release(admin: &Path) {
@@ -3573,12 +3735,19 @@ mod tests {
 		let tree = trees.path().join("wt");
 		let admin = abandoned_add(&repo, &tree, None);
 		let inode = fs::metadata(&tree).unwrap().ino();
+		let token = tree_mark::get(&tree).unwrap();
 		let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
 		assert_eq!(notes.len(), 1, "{notes:?}");
-		assert!(notes[0].contains("emptied the partial tree"), "{notes:?}");
+		assert!(
+			notes[0].contains("emptied the partial tree")
+				&& notes[0].contains("any file written or change staged there"),
+			"{notes:?}"
+		);
 		assert!(is_empty_dir(&tree) && !admin.exists());
 		assert_eq!(fs::metadata(&tree).unwrap().ino(), inode, "the directory was not kept");
-		assert_eq!(tree_mark::get(&tree).unwrap(), None, "the add's token stayed on the directory");
+		// A token is never removed after the registration moved: another add
+		// of the path may have set its own by then.
+		assert_eq!(tree_mark::get(&tree).unwrap(), token, "the reclaim removed the token");
 		// With a lock of the caller's, too.
 		let admin = abandoned_add(&repo, &tree, Some("in use"));
 		assert_eq!(repo.worktree_reclaim_abandoned(&tree).unwrap().len(), 1);
@@ -3704,7 +3873,7 @@ mod tests {
 				.worktree_reclaim_abandoned(&tree)
 				.unwrap_err()
 				.to_string();
-			assert!(err.contains("holds a repository below its root"), "{nested}: {err}");
+			assert!(err.contains("holds a repository ("), "{nested}: {err}");
 			assert!(inner.join(".git/HEAD").is_file() && inner.join("work.txt").is_file(), "{nested}");
 			assert!(tree.join("partial").is_file() && admin.is_dir(), "{nested}");
 		}
@@ -3741,7 +3910,6 @@ mod tests {
 		let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
 		assert_eq!(notes.len(), 1, "the retry did not reclaim: {notes:?}");
 		assert!(!admin.exists() && is_empty_dir(&tree));
-		assert_eq!(tree_mark::get(&tree).unwrap(), None, "the token outlived the registration");
 	}
 
 	/// A registration whose removal fails part way still leaves git's view
@@ -3858,7 +4026,7 @@ mod tests {
 			.worktree_reclaim_abandoned(&tree)
 			.unwrap_err()
 			.to_string();
-		assert!(err.contains("holds a repository below its root"), "{err}");
+		assert!(err.contains("holds a repository ("), "{err}");
 		assert!(tree.join("nested/m.git/HEAD").is_file() && admin.is_dir());
 	}
 
@@ -3873,14 +4041,39 @@ mod tests {
 	#[test]
 	#[ignore = "needs a mount point inside a directory the test user owns: PI_VCS_TEST_MOUNT_POINT"]
 	fn reclaim_refuses_a_tree_holding_a_mount_point() {
-		use std::os::unix::fs::MetadataExt;
 		let mount = PathBuf::from(std::env::var("PI_VCS_TEST_MOUNT_POINT").expect(
 			"PI_VCS_TEST_MOUNT_POINT names a mount point inside a directory the test user owns",
 		));
 		let tree = mount.parent().unwrap().to_path_buf();
-		assert_ne!(
-			fs::metadata(&mount).unwrap().dev(),
-			fs::metadata(&tree).unwrap().dev(),
+		// Device, mount id and mount-root attribute, as `statx` gives them: a
+		// bind mount from the same filesystem shares the device.
+		let ids = |path: &Path| {
+			let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+			let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+			// SAFETY: `name` is a live NUL-terminated path and `buf` is
+			// writable memory of the size `statx` fills.
+			let rc = unsafe {
+				libc::statx(
+					libc::AT_FDCWD,
+					name.as_ptr(),
+					libc::AT_SYMLINK_NOFOLLOW,
+					libc::STATX_INO | libc::STATX_MNT_ID,
+					buf.as_mut_ptr(),
+				)
+			};
+			assert_eq!(rc, 0, "statx {}", path.display());
+			// SAFETY: `statx` succeeded.
+			let stat = unsafe { buf.assume_init() };
+			let root = u64::from(libc::STATX_ATTR_MOUNT_ROOT.cast_unsigned());
+			(
+				(stat.stx_dev_major, stat.stx_dev_minor),
+				stat.stx_mnt_id,
+				stat.stx_attributes & root != 0,
+			)
+		};
+		let (inner, outer) = (ids(&mount), ids(&tree));
+		assert!(
+			inner.2 || inner.0 != outer.0 || inner.1 != outer.1,
 			"{} is not a mount point",
 			mount.display()
 		);
@@ -3912,6 +4105,263 @@ mod tests {
 		let err = dir.empty(&tree).unwrap_err().to_string();
 		assert!(data.is_file(), "the emptying removed {}: {err}", data.display());
 		assert!(err.contains("a filesystem is mounted at"), "{err}");
+	}
+
+	/// A symlink below the tree's root is removed itself, never followed:
+	/// what it points to outside the tree stays. Some kernels (gVisor) follow
+	/// a symlink for `O_DIRECTORY` even with `O_NOFOLLOW`, so the walks decide
+	/// by the entry's type before they open anything.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_removes_a_symlink_below_the_root_and_nothing_it_points_to() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let victim = trees.path().join("victim");
+		fs::create_dir_all(victim.join("deeper")).unwrap();
+		fs::write(victim.join("theirs.txt"), "theirs\n").unwrap();
+		fs::write(victim.join("deeper/more.txt"), "theirs\n").unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::create_dir(tree.join("sub")).unwrap();
+		std::os::unix::fs::symlink(&victim, tree.join("data")).unwrap();
+		std::os::unix::fs::symlink(&victim, tree.join("sub/data")).unwrap();
+		std::os::unix::fs::symlink(victim.join("theirs.txt"), tree.join("file")).unwrap();
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		assert!(
+			victim.join("theirs.txt").is_file() && victim.join("deeper/more.txt").is_file(),
+			"the reclaim removed files outside the tree through a symlink: {result:?}"
+		);
+		assert_eq!(result.unwrap().len(), 1);
+		assert!(is_empty_dir(&tree) && !admin.exists());
+	}
+
+	/// A symlink cycle below the root (`loop -> .`, `up -> ..`) is not walked
+	/// into: the reclaim finishes, removes the symlinks and keeps what is
+	/// beside the tree.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_finishes_on_a_symlink_cycle_below_the_root() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		fs::write(trees.path().join("beside.txt"), "beside\n").unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::create_dir(tree.join("sub")).unwrap();
+		std::os::unix::fs::symlink(".", tree.join("loop")).unwrap();
+		std::os::unix::fs::symlink("..", tree.join("sub/up")).unwrap();
+		std::os::unix::fs::symlink("..", tree.join("up")).unwrap();
+		let result = repo.worktree_reclaim_abandoned(&tree);
+		assert!(trees.path().join("beside.txt").is_file(), "the reclaim left the tree: {result:?}");
+		assert_eq!(result.unwrap().len(), 1);
+		assert!(is_empty_dir(&tree) && !admin.exists());
+	}
+
+	/// A directory swapped for a symlink after its type was read and before
+	/// it is opened, in the walk or in the emptying, stops the reclaim: the
+	/// opened directory must be the one read, so nothing outside the tree
+	/// is removed.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_directory_swapped_for_a_symlink_before_its_open_stops_the_reclaim() {
+		for swap_at in [1, 2] {
+			let (_temp, repo) = fixture();
+			let trees = tempfile::tempdir().unwrap();
+			let victim = trees.path().join("victim");
+			fs::create_dir(&victim).unwrap();
+			fs::write(victim.join("theirs.txt"), "theirs\n").unwrap();
+			let tree = trees.path().join("wt");
+			let admin = abandoned_add(&repo, &tree, None);
+			fs::create_dir(tree.join("sub")).unwrap();
+			fs::write(tree.join("sub/mine.txt"), "mine\n").unwrap();
+			let (sub, target) = (tree.join("sub"), victim.clone());
+			let mut opens = 0;
+			// The walk opens `sub` first, then the emptying.
+			test_hooks::set_before_entry_open(move |name| {
+				if name == Path::new("sub") {
+					opens += 1;
+					if opens == swap_at {
+						fs::remove_dir_all(&sub).unwrap();
+						std::os::unix::fs::symlink(&target, &sub).unwrap();
+					}
+				}
+			});
+			let result = repo.worktree_reclaim_abandoned(&tree);
+			test_hooks::clear();
+			assert!(
+				victim.join("theirs.txt").is_file(),
+				"swap at open {swap_at}: the reclaim removed a file outside the tree: {result:?}"
+			);
+			let err = result.unwrap_err().to_string();
+			assert!(
+				err.contains("changed while the reclaim checked it"),
+				"swap at open {swap_at}: {err}"
+			);
+			if swap_at == 1 {
+				assert!(admin.is_dir() && tree.join("partial").is_file(), "the walk removed something");
+			}
+		}
+	}
+
+	/// A `.git` in the tree's root that is a FIFO is refused at once: it is
+	/// never opened, so nothing waits for a writer.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_fifo_named_git_without_blocking() {
+		use std::os::unix::ffi::OsStringExt;
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		fs::remove_file(tree.join(".git")).unwrap();
+		let fifo = std::ffi::CString::new(tree.join(".git").into_os_string().into_vec()).unwrap();
+		// SAFETY: `fifo` is a live NUL-terminated path.
+		assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("holds a `.git` that is not this registration's"), "{err}");
+		assert!(tree.join("partial").is_file() && admin.is_dir());
+	}
+
+	/// A bare-looking directory (`HEAD`, `objects`, `refs`) that the add's
+	/// commit tracks, such as a test fixture, is the add's own checkout and
+	/// goes with the tree; one at the tree's root that the commit does not
+	/// track (`git init --bare .` after the kill) is refused.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_empties_a_tracked_bare_fixture_and_refuses_an_untracked_bare_root() {
+		let (temp, repo) = fixture();
+		let fixture_dir = temp.path().join("tests/testrepo.git");
+		for dir in ["objects/info", "refs/heads"] {
+			fs::create_dir_all(fixture_dir.join(dir)).unwrap();
+		}
+		fs::write(fixture_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+		fs::write(fixture_dir.join("objects/info/packs"), "\n").unwrap();
+		fs::write(fixture_dir.join("refs/heads/main"), "0000000000000000000000000000000000000000\n")
+			.unwrap();
+		git(temp.path(), &["add", "tests"]);
+		git(temp.path(), &["commit", "-qm", "fixture"]);
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		// What the checkout wrote before the add was killed.
+		let copy = tree.join("tests/testrepo.git");
+		for dir in ["objects/info", "refs/heads"] {
+			fs::create_dir_all(copy.join(dir)).unwrap();
+		}
+		fs::copy(fixture_dir.join("HEAD"), copy.join("HEAD")).unwrap();
+		let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
+		assert_eq!(notes.len(), 1, "{notes:?}");
+		assert!(is_empty_dir(&tree) && !admin.exists());
+		// Not tracked, at the root.
+		let admin = abandoned_add(&repo, &tree, None);
+		git(&tree, &["init", "-q", "--bare", "."]);
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("holds a repository ("), "{err}");
+		assert!(tree.join("HEAD").is_file() && tree.join("partial").is_file() && admin.is_dir());
+	}
+
+	/// An add killed after it wrote `gitdir` and before `HEAD` left a
+	/// registration with no `HEAD` (or an empty one): nothing could commit
+	/// through it, so it is reclaimed.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_takes_a_registration_whose_head_was_never_written() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		for (name, empty) in [("missing", false), ("empty", true)] {
+			let tree = trees.path().join(name);
+			let admin = abandoned_add(&repo, &tree, None);
+			if empty {
+				fs::write(admin.join("HEAD"), "").unwrap();
+			} else {
+				fs::remove_file(admin.join("HEAD")).unwrap();
+			}
+			let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
+			assert_eq!(notes.len(), 1, "{name}: {notes:?}");
+			assert!(is_empty_dir(&tree) && !admin.exists(), "{name}");
+		}
+	}
+
+	/// Refs of the worktree's own (`refs/bisect/*`, `refs/worktree/*`) live
+	/// in its registration: the reclaim refuses rather than lose them.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_refuses_a_registration_holding_refs_of_its_own() {
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		let head = git(repo.root(), &["rev-parse", "HEAD"]);
+		fs::create_dir_all(admin.join("refs/bisect")).unwrap();
+		fs::write(admin.join("refs/bisect/bad"), format!("{head}\n")).unwrap();
+		let err = repo
+			.worktree_reclaim_abandoned(&tree)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("refs of the worktree's own"), "{err}");
+		assert!(tree.join("partial").is_file() && admin.join("refs/bisect/bad").is_file());
+	}
+
+	/// The walks hold only the descriptors of the directories above the one
+	/// they read, so a tree with many sibling directories is reclaimed under
+	/// a low descriptor limit. The limit is set in a child process of this
+	/// test binary, which runs [`wide_tree_under_a_low_descriptor_limit`].
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn reclaim_of_a_wide_tree_needs_few_descriptors() {
+		use std::os::unix::process::CommandExt;
+		let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+		child
+			.args([
+				"--exact",
+				"git::mutate::tests::wide_tree_under_a_low_descriptor_limit",
+				"--ignored",
+				"--nocapture",
+				"--test-threads=1",
+			])
+			.env("PI_VCS_TEST_WIDE_TREE_CHILD", "1");
+		// SAFETY: `setrlimit` is async-signal-safe and touches only the child.
+		unsafe {
+			child.pre_exec(|| {
+				let limit = libc::rlimit { rlim_cur: 128, rlim_max: 128 };
+				if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+					return Err(io::Error::last_os_error());
+				}
+				Ok(())
+			});
+		}
+		let output = child.output().unwrap();
+		let text = String::from_utf8_lossy(&output.stdout);
+		assert!(output.status.success(), "{text}{}", String::from_utf8_lossy(&output.stderr));
+		assert!(text.contains("1 passed"), "the child ran no test: {text}");
+	}
+
+	/// Run by [`reclaim_of_a_wide_tree_needs_few_descriptors`] under a
+	/// descriptor limit of 128.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run by reclaim_of_a_wide_tree_needs_few_descriptors, under a low descriptor limit"]
+	fn wide_tree_under_a_low_descriptor_limit() {
+		assert_eq!(
+			std::env::var("PI_VCS_TEST_WIDE_TREE_CHILD").as_deref(),
+			Ok("1"),
+			"run through reclaim_of_a_wide_tree_needs_few_descriptors"
+		);
+		let (_temp, repo) = fixture();
+		let trees = tempfile::tempdir().unwrap();
+		let tree = trees.path().join("wt");
+		let admin = abandoned_add(&repo, &tree, None);
+		for n in 0..1000 {
+			fs::create_dir_all(tree.join(format!("node_modules/pkg{n}/lib"))).unwrap();
+		}
+		let notes = repo.worktree_reclaim_abandoned(&tree).unwrap();
+		assert_eq!(notes.len(), 1, "{notes:?}");
+		assert!(is_empty_dir(&tree) && !admin.exists());
 	}
 
 	/// A registration an earlier reclaim moved out of `worktrees/` and did not

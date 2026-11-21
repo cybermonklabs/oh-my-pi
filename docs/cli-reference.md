@@ -361,22 +361,28 @@ A worktree add that fails removes its tree and its registration, as
 and `omp worktree clear` leave it alone. An add killed or terminated midway
 leaves that locked registration and its partial tree. On Linux, where the
 filesystem keeps user extended attributes, another add of the same path then
-empties that tree (the directory stays) and removes the registration first,
-and says so, when it can tell both are still the stopped add's: nobody changed
-or removed its lock, its `HEAD` is still what the add wrote and has no reflog
-(no commit or checkout was made there), the directory is the one the add made
+empties that tree (the directory stays) and removes the registration first, and
+says so, when it can tell both are still the stopped add's: nobody changed or
+removed its lock; its `HEAD` is still what the add wrote (or the add died before
+writing it) and has no reflog; the registration holds no refs of the worktree's
+own (`refs/worktree/*`, `refs/bisect/*`); the directory is the one the add made
 (same device and inode, and the random token the add set on it as an extended
-attribute), the tree holds no repository (no `.git` but the add's own gitfile at
-its root, and no bare repository: a directory holding `HEAD`, `objects` and
-`refs`), and nothing is mounted in it (every entry is on the device of the
-tree's root; a filesystem that gives its subvolumes devices of their own, such
-as btrfs, counts a subvolume as mounted). Any other file written into that tree
-after the add stopped, and anything staged there, is removed with it. A
-directory made again in its place with `mkdir` never carries the token, even
-with the same inode; a copy that keeps extended attributes (`cp -a`,
-`tar --xattrs`) does. Otherwise that add refuses and names the registration, as
-git refuses a registered path; adds of other paths never touch it. Without user
-extended attributes (off Linux, or on a filesystem without them) the stopped
-add's tree is never emptied by a later add. On a filesystem that cannot lock
-files, an add goes on without its add-in-progress marker, and a killed one is
-never emptied by a later add.
+attribute); the tree holds no repository (no `.git` but the add's own gitfile at
+its root, and no bare repository, a directory holding `HEAD`, `objects` and
+`refs`, the root included, unless the commit the add checked out tracks that
+`HEAD`, as with a test fixture); and nothing is mounted in it (no entry is the
+root of a mount, on another mount or on another device; a filesystem that gives
+its subvolumes devices of their own, such as btrfs, counts a subvolume as
+mounted). Symlinks in the tree are removed, never followed. Everything else the
+registration and the tree hold goes with them: any file written into the tree
+after the add stopped, anything staged there, and a merge or cherry-pick begun
+there. With `core.logAllRefUpdates=false`, a commit made there and left by a
+checkout back to the add's commit leaves no trace in `HEAD` and goes too. The
+token stays on the emptied directory. A directory made again in its place with
+`mkdir` never carries the token, even with the same inode; a copy that keeps
+extended attributes (`cp -a`, `tar --xattrs`) does. Otherwise that add refuses
+and names the registration, as git refuses a registered path; adds of other
+paths never touch it. Without user extended attributes (off Linux, or on a
+filesystem without them) the stopped add's tree is never emptied by a later add.
+On a filesystem that cannot lock files, an add goes on without its
+add-in-progress marker, and a killed one is never emptied by a later add.

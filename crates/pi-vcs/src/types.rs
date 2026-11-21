@@ -141,7 +141,7 @@ pub struct WorktreeAddResult {
 	pub cloned_with: Option<pi_iso::BackendKind>,
 	pub clone_error: Option<String>,
 	/// What the add did besides the checkout that its caller should show: the
-	/// partial tree of an interrupted add of the same path it removed, or a
+	/// partial tree of an interrupted add of the same path it emptied, or a
 	/// marker or lock it could not remove at the end.
 	pub notes:       Vec<String>,
 }

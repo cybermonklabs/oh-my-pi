@@ -933,9 +933,9 @@ impl VcsGitRepo {
 	/// Remove the registration an interrupted worktree add of `path` left,
 	/// and empty the tree it made, so `path` can be added again; returns a
 	/// note for each removal. Refuses a registration of `path` it cannot
-	/// prove abandoned, one whose HEAD moved or has a reflog, or one whose
-	/// tree holds a repository (a `.git` entry or a bare repository) or a
-	/// mount point.
+	/// prove abandoned, one whose HEAD moved or has a reflog or that holds
+	/// refs of its own, or one whose tree holds a repository (a `.git` entry
+	/// or a bare repository its commit does not track) or a mount point.
 	#[napi]
 	pub fn worktree_reclaim_abandoned(
 		&self,
