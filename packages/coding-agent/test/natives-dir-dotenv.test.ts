@@ -446,23 +446,29 @@ test("probe", async () => {
 		},
 		120_000,
 	);
-	it("lets a child a test starts give its commands the PI_NATIVES_DIR it was started with", async () => {
-		// Started with the test marker, as a test starts an omp: its launch environment is what
-		// the test gave it, so its commands get that value even after the variable left
-		// `process.env`.
-		const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
-		const given = path.join(tempRoot, "given-natives");
-		const script = `delete process.env.PI_NATIVES_DIR;
+	// Linux only: only Linux keeps a copy of the launch environment (`/proc/self/environ`) the
+	// variable can be read back from after the script deletes it from `process.env`.
+	it.skipIf(process.platform !== "linux")(
+		"lets a child a test starts give its commands the PI_NATIVES_DIR it was started with",
+		async () => {
+			// Started with the test marker, as a test starts an omp: its launch environment is what
+			// the test gave it, so its commands get that value even after the variable left
+			// `process.env`.
+			const envTs = path.join(import.meta.dir, "../../utils/src/env.ts");
+			const given = path.join(tempRoot, "given-natives");
+			const script = `delete process.env.PI_NATIVES_DIR;
 const { filterChildShellEnv } = await import(${JSON.stringify(envTs)});
 console.log(JSON.stringify(filterChildShellEnv(process.env).PI_NATIVES_DIR ?? null));`;
-		const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
-			env: { ...process.env, PI_TEST_RUNTIME: "1", PI_NATIVES_DIR: given },
-			stdout: "pipe",
-			stderr: "inherit",
-		});
-		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+			const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+				env: { ...process.env, PI_TEST_RUNTIME: "1", PI_NATIVES_DIR: given },
+				stdout: "pipe",
+				stderr: "inherit",
+			});
+			const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
 
-		expect(exitCode).toBe(0);
-		expect(JSON.parse(stdout.trim())).toBe(given);
-	}, 60_000);
+			expect(exitCode).toBe(0);
+			expect(JSON.parse(stdout.trim())).toBe(given);
+		},
+		60_000,
+	);
 });
