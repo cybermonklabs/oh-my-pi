@@ -150,10 +150,10 @@ function stampOf(filePath: string, stat: fs.BigIntStats): string {
 }
 
 /**
- * How long a file must have gone unchanged before its stamp is trusted: git's racy-clean window, shared
- * with the grep tool. A filesystem times a change by its clock's tick (a few milliseconds on Linux, up to
- * two seconds elsewhere), so two writes in one tick leave the same mtime and ctime, and a rewrite of the
- * same size then leaves the whole stamp as it was.
+ * How long a file must have gone unchanged before its stamp is trusted: a window after git's racy-clean
+ * rule, shared with the grep tool. A filesystem times a change by its clock's tick (a few milliseconds on
+ * Linux, up to two seconds elsewhere), so two writes in one tick leave the same mtime and ctime, and a
+ * rewrite of the same size then leaves the whole stamp as it was.
  */
 const STAMP_SETTLE_NS = BigInt(RACY_STAMP_WINDOW_MS) * 1_000_000n;
 
