@@ -218,6 +218,95 @@ fn a_silent_or_flooding_utility_affirms_nothing() {
 	}
 }
 
+/// A query started while another thread is inside `posix_spawn` still
+/// answers. glibc 2.41's `posix_spawn` holds the lock that `abort` and a
+/// `sigaction` of `SIGABRT` share until its child runs the program, and a
+/// child made by `clone3` keeps a copy of that lock as it was: the query's
+/// child, putting `SIGABRT` back to default, waited on it until the
+/// query's deadline ended it ("was ended before it finished"), which failed
+/// a run of `locale::tests` about one time in three on Debian 13. Here the
+/// spawn's child is held in an open of a FIFO that has no writer, so the
+/// spawn is in flight for the whole query. Where the library takes no such
+/// lock this passes either way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_spawn_in_flight_on_another_thread_does_not_hold_up_the_query() {
+	use std::os::unix::ffi::OsStrExt as _;
+
+	if !crate::own_process::own_process() {
+		return;
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("locale");
+	crate::testprog::write(&program, "#!/bin/sh\nprintf 'ISO-8859-1\\n'\n");
+	let fifo = dir.path().join("fifo");
+	let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+	// SAFETY: a valid NUL-terminated path.
+	let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+	assert_eq!(made, 0, "{}", std::io::Error::last_os_error());
+	let (started, spawning) = std::sync::mpsc::channel();
+	let spawner = std::thread::spawn(move || {
+		// SAFETY: gettid takes no arguments.
+		started.send(unsafe { libc::gettid() }).unwrap();
+		// SAFETY: the file actions are initialised before use and destroyed
+		// after it; every pointer names a live NUL-terminated string, and
+		// `argv` and `envp` end in a null pointer.
+		unsafe {
+			let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+			assert_eq!(libc::posix_spawn_file_actions_init(actions.as_mut_ptr()), 0);
+			// The spawn's child opens the FIFO for reading before it runs
+			// `true`, and no writer comes until the query has answered.
+			let open = libc::posix_spawn_file_actions_addopen(
+				actions.as_mut_ptr(),
+				3,
+				fifo_c.as_ptr(),
+				libc::O_RDONLY,
+				0,
+			);
+			assert_eq!(open, 0);
+			let argv = [c"true".as_ptr().cast_mut(), std::ptr::null_mut()];
+			let envp = [std::ptr::null_mut::<libc::c_char>()];
+			let mut pid: libc::pid_t = 0;
+			let spawned = libc::posix_spawn(
+				&raw mut pid,
+				c"/bin/true".as_ptr(),
+				actions.as_ptr(),
+				std::ptr::null(),
+				argv.as_ptr(),
+				envp.as_ptr(),
+			);
+			libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+			assert_eq!(spawned, 0, "posix_spawn: {}", std::io::Error::from_raw_os_error(spawned));
+			let mut status = 0;
+			assert_eq!(libc::waitpid(pid, &raw mut status, 0), pid);
+			status
+		}
+	});
+	let spawning = spawning.recv().unwrap();
+	// The spawn is in flight once its child sleeps in that open.
+	let child = loop {
+		let listed =
+			fs::read_to_string(format!("/proc/self/task/{spawning}/children")).unwrap_or_default();
+		if let Some(child) = listed.split_whitespace().next() {
+			let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
+			if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) {
+				break child.to_owned();
+			}
+		}
+		std::thread::yield_now();
+	};
+	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &|_: &str| None);
+	// A writer lets the spawn's child open the FIFO, run `true` and end.
+	let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+	let status = spawner.join().unwrap();
+	drop(writer);
+	assert_eq!(status, 0, "the spawn's child {child} ran `true`");
+	assert!(
+		matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
+		"{answer:?}"
+	);
+}
+
 /// A query libc could not be asked is not an observation of the C locale.
 ///
 /// Under `SIGCHLD=SIG_IGN` no query runs at all, and reading that refusal

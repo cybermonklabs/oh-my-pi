@@ -1115,6 +1115,45 @@ const CHILD_NO_SETUP: libc::c_int = 124;
 #[cfg(target_os = "linux")]
 const KERNEL_SIGSET_BYTES: usize = 8;
 
+/// The kernel's `struct sigaction`, which `rt_sigaction` reads and writes:
+/// not the library's, whose mask is 128 bytes and whose fields are in
+/// another order. Where the architecture defines `SA_RESTORER` the
+/// restorer sits between the flags and the mask; riscv and loongarch have
+/// none (`asm-generic/signal.h`).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[allow(dead_code, reason = "the kernel reads and writes every field; this reads the handler")]
+struct KernelSigaction {
+	handler: libc::sighandler_t,
+	flags: libc::c_ulong,
+	#[cfg(not(any(target_arch = "riscv64", target_arch = "riscv32", target_arch = "loongarch64")))]
+	restorer: libc::sighandler_t,
+	mask: [u8; KERNEL_SIGSET_BYTES],
+}
+
+/// `rt_sigaction(signal, new, old)` through the kernel itself, as the
+/// child sets its mask with `rt_sigprocmask`: glibc's `sigaction` takes a
+/// lock for `SIGABRT` (glibc 2.41, `signal/sigaction.c`, the abort lock
+/// that makes `abort` async-signal-safe), and `posix_spawn` holds that lock
+/// while its child runs. `fork` puts the lock back in its child; a child
+/// made by `clone3` or `clone` keeps it as it was, so one made while
+/// another thread was in `posix_spawn` waited on it for ever, until the
+/// query's deadline ended it.
+///
+/// # Safety
+///
+/// `new` and `old` are null or valid for a read and a write of a
+/// [`KernelSigaction`].
+#[cfg(target_os = "linux")]
+unsafe fn kernel_sigaction(
+	signal: libc::c_int,
+	new: *const KernelSigaction,
+	old: *mut KernelSigaction,
+) -> libc::c_long {
+	// SAFETY: the caller's contract; the size is the kernel's own.
+	unsafe { libc::syscall(libc::SYS_rt_sigaction, signal, new, old, KERNEL_SIGSET_BYTES) }
+}
+
 /// `clone3`'s argument block, as much of it as this uses.
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -1409,14 +1448,17 @@ fn start_locale_utility(
 			// * and a signal that cannot be blocked either ends the
 			//   child, because nothing is left to make it safe.
 			//
-			// The numbers the library keeps for itself — 32 and 33 on
-			// glibc 2.39, 32 to 34 on musl — reach the blocking step:
-			// they can be neither read nor set, and `sigaddset` will not
-			// name them, so the bit goes in directly and the mask is
-			// restored through the kernel's own call, which does not take
-			// them back out as `pthread_sigmask` does. They are then
-			// blocked in the utility, where the library never delivered
-			// them to an application anyway.
+			// Dispositions are read and set through the kernel's own call
+			// ([`kernel_sigaction`]), never the library's `sigaction`,
+			// which can wait on a lock this copy of the process holds for
+			// a thread that does not exist here. So the numbers the
+			// library keeps for itself — 32 and 33 on glibc, 32 to 34 on
+			// musl — are read and put back to default like any other;
+			// `execve` would do that to a caught one anyway. Where a
+			// filter refuses them they reach the blocking step, and as
+			// `sigaddset` will not name them, the bit goes in directly and
+			// the mask is restored through the kernel's own call, which
+			// does not take them back out as `pthread_sigmask` does.
 			//
 			// The cost of that last rung, stated rather than engineered
 			// around: a signal that reaches it is blocked in the utility,
@@ -1436,17 +1478,16 @@ fn start_locale_utility(
 				if signal == libc::SIGKILL || signal == libc::SIGSTOP {
 					continue;
 				}
-				let mut default = std::mem::MaybeUninit::<libc::sigaction>::zeroed().assume_init();
-				default.sa_sigaction = libc::SIG_DFL;
-				if libc::sigemptyset(&raw mut default.sa_mask) != 0 {
-					libc::_exit(CHILD_NO_SETUP);
-				}
-				let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-				if libc::sigaction(signal, std::ptr::null(), current.as_mut_ptr()) == 0 {
+				let default = KernelSigaction {
+					handler: libc::SIG_DFL,
+					..std::mem::zeroed()
+				};
+				let mut current = std::mem::MaybeUninit::<KernelSigaction>::zeroed();
+				if kernel_sigaction(signal, std::ptr::null(), current.as_mut_ptr()) == 0 {
 					let current = current.assume_init();
-					if current.sa_sigaction == libc::SIG_IGN
-						|| current.sa_sigaction == libc::SIG_DFL
-						|| libc::sigaction(signal, &raw const default, std::ptr::null_mut()) == 0
+					if current.handler == libc::SIG_IGN
+						|| current.handler == libc::SIG_DFL
+						|| kernel_sigaction(signal, &raw const default, std::ptr::null_mut()) == 0
 					{
 						continue;
 					}
@@ -1454,11 +1495,11 @@ fn start_locale_utility(
 					// The read was refused, so the set is asked what was
 					// there. It answers atomically: nothing of this
 					// process's runs in between.
-					let mut was = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-					if libc::sigaction(signal, &raw const default, was.as_mut_ptr()) == 0 {
+					let mut was = std::mem::MaybeUninit::<KernelSigaction>::zeroed();
+					if kernel_sigaction(signal, &raw const default, was.as_mut_ptr()) == 0 {
 						let was = was.assume_init();
-						if was.sa_sigaction != libc::SIG_IGN
-							|| libc::sigaction(signal, &raw const was, std::ptr::null_mut()) == 0
+						if was.handler != libc::SIG_IGN
+							|| kernel_sigaction(signal, &raw const was, std::ptr::null_mut()) == 0
 						{
 							continue;
 						}
