@@ -63,3 +63,14 @@ success-output = "immediate"
 [[profile.ci.overrides]]
 filter = 'package(pi-shell) & binary(/^(process_shell|process_signals|pty_harness|zle_hist_pty|zle_pty|zle_widgets_pty|zsh_comp_pty|zsh_comp_y0[123]|zsh_compctl_pty|zsh_computil_args_pty|zsh_computil_pty|zsh_jobs_pty|zsh_mod_curses|zsh_mod_files|zsh_mod_rlimits|zsh_mod_watch|zsh_parity_pty|zsh_zcompile)$/)'
 success-output = "immediate"
+
+# Tests that need something of the host say so the same way when it lacks
+# it, on a `skipped: <reason>` line: zftp's, a TCP port `/etc/services` names
+# between 20000 and 60000; the collation test's, an en_US.UTF-8 collator.
+[[profile.default.overrides]]
+filter = 'package(pi-shell) & (binary(zsh_mod_zftp) | test(=testkit::suites::zsh_parity::expandmb_sorting_follows_lc_collate))'
+success-output = "immediate"
+
+[[profile.ci.overrides]]
+filter = 'package(pi-shell) & (binary(zsh_mod_zftp) | test(=testkit::suites::zsh_parity::expandmb_sorting_follows_lc_collate))'
+success-output = "immediate"
