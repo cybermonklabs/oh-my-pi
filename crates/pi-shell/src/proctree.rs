@@ -1737,9 +1737,17 @@ mod tests {
 	}
 
 	/// `open` tells a pid no process holds (`OpenProcess` gives
-	/// `ERROR_INVALID_PARAMETER`) from a live process: `Ok(None)` once the
-	/// child is reaped and its last handle closed, `Ok(Some)` while it runs;
-	/// and a walk over a snapshot read whole is complete.
+	/// `ERROR_INVALID_PARAMETER`) from a live process, and an exited process
+	/// from a running one; and a walk over a snapshot read whole is complete.
+	///
+	/// Windows does not free a killed child's process object at the moment
+	/// the last handle to it closes: for a short while after, with no other
+	/// process holding a handle, its pid still opens. Such an open gives the
+	/// process with its status exited, which is all a walk relies on
+	/// ([`Process::child`] keeps only a running child). Here a second handle
+	/// of the test's own keeps the object for certain; once that closes, the
+	/// pid is gone, not yet freed (the child, exited), or reused (another
+	/// creation time), and never the child running.
 	#[cfg(windows)]
 	#[test]
 	fn open_tells_a_process_that_is_gone_from_a_live_one() {
@@ -1749,19 +1757,46 @@ mod tests {
 			.spawn()
 			.expect("spawn sleeper");
 		let pid = i32::try_from(child.id()).unwrap();
-		let live = platform::Process::open(pid).expect("open a live child");
-		assert!(live.as_ref().is_some_and(|process| process.pid() == pid));
+		let held = platform::Process::open(pid)
+			.expect("open a live child")
+			.expect("the live child opens");
+		assert_eq!(held.pid(), pid);
+		assert_eq!(held.status(), ProcessStatus::Running);
+		let started = held.start_ticks();
 		let me = platform::Process::open(i32::try_from(std::process::id()).unwrap())
 			.unwrap()
 			.unwrap();
 		let walk = me.children();
 		assert!(walk.complete.is_ok(), "{:?}", walk.complete);
 		assert!(walk.processes.iter().any(|process| process.pid() == pid), "the child is not listed");
-		drop((live, walk));
+		drop(walk);
 		let _ = child.kill();
 		let _ = child.wait();
 		drop(child);
-		assert!(matches!(platform::Process::open(pid), Ok(None)), "the reaped child is not gone");
+		// `held` keeps the object: the pid opens as the child, exited, and no
+		// walk lists it.
+		let exited = platform::Process::open(pid)
+			.expect("open the exited child")
+			.expect("the held child opens");
+		assert_eq!(exited.start_ticks(), started, "the held pid is the child's");
+		assert_eq!(exited.status(), ProcessStatus::Exited, "the killed child reads as exited");
+		let walk = me.children();
+		assert!(walk.complete.is_ok(), "{:?}", walk.complete);
+		assert!(
+			!walk.processes.iter().any(|process| process.pid() == pid),
+			"the exited child is listed"
+		);
+		drop((held, exited, walk));
+		match platform::Process::open(pid) {
+			Ok(None) => {},
+			Ok(Some(process)) => assert!(
+				process.start_ticks() != started || process.status() == ProcessStatus::Exited,
+				"the killed child reads as running"
+			),
+			Err(error) => panic!("open the killed child's pid: {error}"),
+		}
+		// A pid far beyond those Windows gives: no process holds it.
+		assert!(matches!(platform::Process::open(0x7fff_fffc), Ok(None)), "a pid no process holds");
 	}
 
 	/// A kernel before 6.16 answers `pidfd_open` with `EINVAL` for a pid whose
