@@ -127,23 +127,34 @@ function deadlockLog(client: SqlSessionStorageClient, into: string[]): SqlSessio
 	};
 }
 
-/** `client`, and the statement of its transactions it waits on: the last one sent whose answer has not come. */
+/**
+ * `client` (MySQL or MariaDB), and the statement of its transactions it waits on: the last one sent whose answer has
+ * not come, with the server's id of the connection it runs on. Each transaction first reads `CONNECTION_ID()`, which
+ * reads no table, so it opens no read view and takes no lock.
+ */
 function inFlightClient(client: SqlSessionStorageClient): {
 	client: SqlSessionStorageClient;
-	waiting(): { query: string; ms: number } | undefined;
+	waiting(): { query: string; ms: number; connection: number } | undefined;
 } {
-	let current: { query: string; at: number } | undefined;
-	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
-		async unsafe(query, values) {
-			const mine = { query, at: performance.now() };
-			current = mine;
-			try {
-				return await executor.unsafe(query, values);
-			} finally {
-				if (current === mine) current = undefined;
-			}
-		},
-	});
+	let current: { query: string; at: number; connection: number } | undefined;
+	const wrap = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => {
+		let connection: number | undefined;
+		return {
+			async unsafe(query, values) {
+				if (connection === undefined) {
+					const [row] = (await executor.unsafe("SELECT CONNECTION_ID() AS id")) as Array<{ id?: unknown }>;
+					connection = Number(row?.id);
+				}
+				const mine = { query, at: performance.now(), connection };
+				current = mine;
+				try {
+					return await executor.unsafe(query, values);
+				} finally {
+					if (current === mine) current = undefined;
+				}
+			},
+		};
+	};
 	return {
 		client: {
 			options: client.options,
@@ -152,7 +163,10 @@ function inFlightClient(client: SqlSessionStorageClient): {
 			end: () => client.end?.() ?? Promise.resolve(),
 			...reserveWrapped(client, wrap),
 		},
-		waiting: () => (current ? { query: current.query, ms: performance.now() - current.at } : undefined),
+		waiting: () =>
+			current
+				? { query: current.query, ms: performance.now() - current.at, connection: current.connection }
+				: undefined,
 	};
 }
 
@@ -1509,10 +1523,11 @@ describe("session blobs in the SQL session storage", () => {
 			// gap. InnoDB rolls one back (1213), and the retry runs it again. MariaDB 11.8.1 and later use the
 			// primary key for the `substr` (MDEV-34911): the lock is a range over A and its directory, plus the first
 			// row past it, C, with the gap before it, which keeps new rows out of the directory. B is in that gap, so
-			// the rename's UPDATE still waits for the delete (the next case shows it), but the range never reaches D:
-			// the delete never waits for the rename, only one side waits, and there is no deadlock. The end state is
-			// asserted on every server, and the deadlock count from the lock's plan, read with EXPLAIN before the race:
-			// 1 on a scan, 0 on a range.
+			// the rename's UPDATE still waits for the delete (the next case shows it), but the range never reaches D,
+			// which is not the first row past the directory: the delete never waits for the rename, only one side
+			// waits, and there is no deadlock (where the source is that first row, it deadlocks on a range too: the
+			// case after next). The end state is asserted on every server, and the deadlock count from the lock's
+			// plan, read with EXPLAIN before the race: 1 on a scan, 0 on a range.
 			it.skipIf(adapter !== "mysql")(
 				"runs the rolled-back side again when a delete with artifacts meets a rename's destination that has no row: one deadlock where the delete's lock scans the table (MySQL, MariaDB before 11.8.1), none where it is a range (MariaDB 11.8.1 and later)",
 				async () => {
@@ -1626,8 +1641,8 @@ describe("session blobs in the SQL session storage", () => {
 						renaming = renamer.rename(d, b).finally(() => {
 							settled = true;
 						});
-						// The wait: the statement the rename has had in flight for 200 ms, and the server's own count of
-						// transactions waiting for a lock (no other transaction runs on the server in this case).
+						// The wait: the statement the rename has had in flight for 200 ms, and the server's own record that
+						// the rename's transaction, on its connection, waits for a lock.
 						const until = Date.now() + 3000;
 						while (Date.now() < until && !settled) {
 							const pending = tracked?.waiting();
@@ -1638,7 +1653,8 @@ describe("session blobs in the SQL session storage", () => {
 										? "lock"
 										: pending.query.slice(0, 80);
 								const [row] = (await db.sql(
-									"SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX WHERE trx_state = 'LOCK WAIT'",
+									"SELECT COUNT(*) AS n FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = @1 AND trx_state = 'LOCK WAIT'",
+									[pending.connection],
 								)) as Array<{ n?: unknown }>;
 								lockWaits = Number(row?.n ?? 0);
 								if (lockWaits > 0) break;
@@ -1665,6 +1681,60 @@ describe("session blobs in the SQL session storage", () => {
 						b: moved,
 						deadlocks: 0,
 					});
+				},
+			);
+
+			// The deadlock on a range too: where the move's source is the first row past the deleted directory, the
+			// range lock's next row is the source itself. The rename b-src → a7-dst is paused before its UPDATE, holding
+			// b-src; the delete of A with its artifacts locks A and its directory, then waits for b-src, the first row
+			// past the range; the rename's UPDATE into a7-dst, in the gap before b-src, then waits for that lock.
+			// InnoDB rolls one back (1213) on a range as on a scan, and the retry runs it again.
+			it.skipIf(adapter !== "mysql")(
+				"runs the rolled-back side again when a rename's source is the first row past a deleted artifacts directory: one deadlock where the delete's lock is a range, as where it scans",
+				async () => {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const deadlocks: string[] = [];
+					let gate: GatedClient | undefined;
+					const renamer = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								deadlockLog(client, deadlocks),
+								new RegExp(`^UPDATE \\S*\\b${db.table} SET path\\b`),
+								"before",
+							);
+							return gate.client;
+						},
+					});
+					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
+					// In path order: a, then a's directory, then a7-dst (no row), then b-src, then c.
+					const [a, into, first, c] = ["a", "a7-dst", "b-src", "c"].map(name =>
+						db.dir.join("sessions", `${name}.jsonl`),
+					) as [string, string, string, string];
+					const moved = transcript(ID, "moved");
+					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
+					await renamer.writeText(first, moved);
+					await renamer.drain();
+					await deleter.refresh();
+
+					gate?.close();
+					const renaming = renamer.rename(first, into);
+					let deleting: Promise<void> | undefined;
+					try {
+						await Promise.race([gate?.paused(), renaming]);
+						deleting = deleter.deleteSessionWithArtifacts(a);
+						// A real wait: the delete's lock must reach the rename's source on the server before the UPDATE runs.
+						await Promise.race([deleting, Bun.sleep(1000)]);
+					} finally {
+						gate?.open();
+					}
+					await Promise.all([renaming, deleting]);
+					expect({
+						paths: await db.paths(),
+						into: (await db.row(into))?.content,
+						c: (await db.row(c))?.content,
+						deadlocks: deadlocks.length,
+					}).toEqual({ paths: [into, c], into: moved, c: transcript(ID, "kept apart"), deadlocks: 1 });
 				},
 			);
 
