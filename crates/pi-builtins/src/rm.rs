@@ -453,9 +453,10 @@ fn open_stat_dir(path: &Path, id: Option<(u64, u64)>) -> std::io::Result<DirFd> 
 /// gVisor before release-20261109.0 (GKE Sandbox's among them) follows a
 /// final symlink to a directory despite `O_NOFOLLOW` when `O_DIRECTORY` is
 /// set (google/gvisor#14786), so a directory swapped for a symlink since the
-/// stat would take the walk off the tree. gnulib's fts, which GNU rm walks
-/// with, compares the device and inode of each directory it enters the same
-/// way.
+/// stat would take the walk off the tree. gnulib's fts makes this comparison
+/// only for `..` and for walks that follow links (`fts_safe_changedir`); GNU
+/// rm's physical walk relies on `O_NOFOLLOW` instead, which those gVisor
+/// releases do not honour here.
 #[cfg(not(target_os = "redox"))]
 fn open_stat_subdir(dir_fd: &DirFd, name: &OsStr, id: (u64, u64)) -> std::io::Result<DirFd> {
 	let fd = dir_fd.open_subdir(name, SymlinkBehavior::NoFollow)?;
