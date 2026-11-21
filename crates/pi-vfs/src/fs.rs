@@ -398,8 +398,15 @@ impl FifoOpening {
 		std::thread::Builder::new()
 			.name("pi-vfs-fifo-open".to_owned())
 			.spawn(move || {
+				#[cfg(test)]
+				let after = fifo_seam::before_open();
+				let opened = open();
+				#[cfg(test)]
+				if let Some(after) = after {
+					after(opened.is_ok());
+				}
 				// After a cancellation nobody receives; the file then closes here.
-				let _ = sender.send(open());
+				let _ = sender.send(opened);
 				notify.notify_one();
 			})?;
 		Ok(Self { release, releasable, opened, done, settled: false })
@@ -517,6 +524,34 @@ fn release_attempt(
 		return true;
 	}
 	!matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout))
+}
+
+/// Test seam: a hook a test sets for the next FIFO helper, run on the
+/// helper's thread before its `open` (it may block, to hold the helper back)
+/// and after it (told whether the open succeeded).
+#[cfg(all(test, unix))]
+pub(crate) mod fifo_seam {
+	use parking_lot::Mutex;
+
+	type Before = Box<dyn FnOnce() + Send>;
+	type After = Box<dyn FnOnce(bool) + Send>;
+
+	static NEXT: Mutex<Option<(Before, After)>> = Mutex::new(None);
+
+	/// Hooks the next FIFO helper that starts in this process.
+	pub(crate) fn set(
+		before: impl FnOnce() + Send + 'static,
+		after: impl FnOnce(bool) + Send + 'static,
+	) {
+		*NEXT.lock() = Some((Box::new(before), Box::new(after)));
+	}
+
+	/// Runs the hook's first half, if one is set, and hands back its second.
+	pub(super) fn before_open() -> Option<After> {
+		let (before, after) = NEXT.lock().take()?;
+		before();
+		Some(after)
+	}
 }
 
 #[cfg(unix)]

@@ -31,7 +31,9 @@ fn entry_names_are_exactly_one_component() {
 	for name in ["a", "a b", ".a", "a.", "..a"] {
 		assert!(entry_name(OsStr::new(name)).is_ok(), "{name:?}");
 	}
-	for name in ["C:x", "C:", "d:victim", "a\\b", "\\\\?\\x", "\\a"] {
+	for name in
+		["C:x", "C:", "d:victim", "a\\b", "\\\\?\\x", "\\a", "ab:s", "x::$INDEX_ALLOCATION", "a:"]
+	{
 		assert_eq!(entry_name(OsStr::new(name)).is_err(), cfg!(windows), "{name:?}");
 	}
 }
@@ -928,6 +930,32 @@ mod unix {
 		{
 			assert_eq!(mode(rel), want, "masked: {rel}: {:o}", mode(rel));
 		}
+		// A mode with no owner read: the directory cannot be opened to read
+		// by a user other than root, so only a chmod that needs no open gives
+		// 0o333 (the umask leaves 0o311).
+		let unmasked = Fs::native().with_creation_mask(Some(0));
+		let root = unmasked.blocking().open_dir(tree.at(""), true).unwrap();
+		root.create_dir_at(n("dir-333"), Some(0o333)).unwrap();
+		rt.block_on(root.create_dir_at_async(n("dir-333-async"), Some(0o333)))
+			.unwrap();
+		let modes: Vec<_> = ["dir-333", "dir-333-async"]
+			.iter()
+			.map(|rel| (*rel, mode(rel)))
+			.collect();
+		// The temporary tree's removal lists them, which needs owner read.
+		for (rel, _) in &modes {
+			std::fs::set_permissions(tree.at(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		for (rel, got) in modes {
+			assert_eq!(got, 0o333, "no owner read: {rel}: {got:o}");
+		}
+		// SAFETY: `geteuid` has no preconditions.
+		if unsafe { libc::geteuid() } == 0 {
+			eprintln!(
+				"note: as root the open the old code needed succeeds, so the 0o333 case cannot fail \
+				 here"
+			);
+		}
 	}
 
 	/// A masked `create_dir_at` sets the mode on the directory it made, never
@@ -974,22 +1002,24 @@ mod unix {
 	}
 
 	/// `open_at` opens no directory: `O_DIRECTORY` in its custom flags is
-	/// refused, for a directory and for a symlink to one, so a directory is
-	/// opened only by `open_dir_at`, with its care for kernels that follow a
-	/// symlink despite `O_NOFOLLOW`.
+	/// refused on every handle, for a directory and for a symlink to one, so
+	/// a directory is opened only by `open_dir_at`, with its care for kernels
+	/// that follow a symlink despite `O_NOFOLLOW`, and a path handle's facade
+	/// opens no directory either.
 	#[test]
 	fn open_at_refuses_o_directory() {
 		let tree = Tree::new("open-at-dir");
 		let rt = runtime();
-		let root = BlockingFs::native().open_dir(tree.at(""), true).unwrap();
 		let mut options = OpenOptions::new();
 		options.read(true).custom_flags(libc::O_DIRECTORY);
-		for name in ["d", "ld"] {
-			let sync = root.open_at(n(name), &options).map(drop);
-			let asynchronous = rt.block_on(root.open_at_async(n(name), &options)).map(drop);
-			for result in [sync, asynchronous] {
-				let err = result.unwrap_err();
-				assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}: {err:?}");
+		for (label, root) in tree.roots() {
+			for name in ["d", "ld"] {
+				let sync = root.open_at(n(name), &options).map(drop);
+				let asynchronous = rt.block_on(root.open_at_async(n(name), &options)).map(drop);
+				for result in [sync, asynchronous] {
+					let err = result.unwrap_err();
+					assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{label}: {name}: {err:?}");
+				}
 			}
 		}
 	}
@@ -1141,6 +1171,134 @@ mod unix {
 			},
 			|| release_reader(&fifo),
 		);
+	}
+
+	/// A FIFO helper's hook (see `fifo_seam`): `started` is told when the
+	/// helper reaches the hook; with `hold`, the helper then waits until
+	/// `hold` is released before its `open`. Returns the channel the helper
+	/// tells whether its open succeeded.
+	fn hook_next_fifo_helper(
+		started: std::sync::mpsc::Sender<()>,
+		hold: Option<std::sync::mpsc::Receiver<()>>,
+	) -> std::sync::mpsc::Receiver<bool> {
+		let (opened, ended) = std::sync::mpsc::channel();
+		crate::fs::fifo_seam::set(
+			move || {
+				let _ = started.send(());
+				if let Some(hold) = hold {
+					let _ = hold.recv();
+				}
+			},
+			move |ok| {
+				let _ = opened.send(ok);
+			},
+		);
+		ended
+	}
+
+	/// Bound on a helper's open after its release, a hang guard only: a
+	/// correct release connects it in milliseconds.
+	const HELPER_BOUND: Duration = Duration::from_secs(30);
+
+	/// A write-only open of a FIFO under a cancellable facade, dropped before
+	/// its helper reaches `open`, leaves no helper behind: the release keeps
+	/// the read end open while it waits, and tries again until the helper
+	/// connects, so the helper's open ends and a later reader and writer of
+	/// the FIFO meet each other, the reader reading what the writer wrote. In
+	/// a process of its own, so the hook takes this test's helper.
+	#[test]
+	fn a_fifo_open_dropped_before_its_helper_opens_takes_no_later_connection() {
+		if crate::dir_handle::alone(
+			"dir_handle::tests::unix::a_fifo_open_dropped_before_its_helper_opens_takes_no_later_connection",
+		) {
+			return;
+		}
+		let tree = Tree::new("fifo-dropped");
+		mkfifo(&tree.at("p"));
+		let (started_tx, started) = std::sync::mpsc::channel();
+		let (go, hold) = std::sync::mpsc::channel();
+		let helper_opened = hook_next_fifo_helper(started_tx, Some(hold));
+		let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+		// A handle's `open_at_async` starts the helper in its first poll.
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let mut write = OpenOptions::new();
+		write.write(true);
+		runtime().block_on(async {
+			let open = root.open_at_async(n("p"), &write);
+			tokio::pin!(open);
+			// Polled once: the helper starts and waits at the hook; then the
+			// open is dropped.
+			tokio::select! {
+				biased;
+				_ = &mut open => panic!("a write-only FIFO open with no reader finished"),
+				() = std::future::ready(()) => {},
+			}
+		});
+		started
+			.recv_timeout(HELPER_BOUND)
+			.expect("the helper never started");
+		go.send(()).unwrap();
+		let opened = helper_opened.recv_timeout(HELPER_BOUND);
+		if let Ok(opened) = opened {
+			assert!(opened, "the helper's open failed");
+		} else {
+			// Free the helper, so this process can end, then fail.
+			release_reader_end(&tree.at("p"));
+			panic!("the helper's open was still waiting {HELPER_BOUND:?} after the drop");
+		}
+		// The FIFO is free: a reader and a writer that arrive now meet.
+		let fifo = tree.at("p");
+		let reader = std::thread::spawn(move || std::fs::read(fifo).unwrap());
+		std::fs::write(tree.at("p"), b"data").unwrap();
+		assert_eq!(reader.join().unwrap(), b"data", "the reader's connection was taken");
+	}
+
+	/// Opens `fifo`'s read end without blocking and closes it, which releases
+	/// an open of its write end waiting for a reader.
+	fn release_reader_end(fifo: &Path) {
+		use std::os::unix::fs::OpenOptionsExt;
+		let _ = std::fs::OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(fifo);
+	}
+
+	/// Under a cancellable facade, the blocking `open_at` of a FIFO with no
+	/// other end ends at the token with the facade's cancellation error, and
+	/// its helper's open is released. In a process of its own, so the hook
+	/// takes this test's helper.
+	#[test]
+	fn open_at_of_a_fifo_ends_at_the_token() {
+		if crate::dir_handle::alone("dir_handle::tests::unix::open_at_of_a_fifo_ends_at_the_token") {
+			return;
+		}
+		let tree = Tree::new("fifo-token-sync");
+		mkfifo(&tree.at("p"));
+		let (started_tx, started) = std::sync::mpsc::channel();
+		let helper_opened = hook_next_fifo_helper(started_tx, None);
+		let token = tokio_util::sync::CancellationToken::new();
+		let fs = Fs::native().with_cancellation(token.clone());
+		let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+		let canceller = std::thread::spawn(move || {
+			started
+				.recv_timeout(HELPER_BOUND)
+				.expect("the helper never started");
+			token.cancel();
+		});
+		let fifo = tree.at("p");
+		ends(
+			"the blocking FIFO open under a token",
+			move || {
+				let mut read = OpenOptions::new();
+				read.read(true);
+				let err = root.open_at(n("p"), &read).map(drop).unwrap_err();
+				assert!(crate::error::is_cancelled(&err), "{err:?}");
+			},
+			|| release_reader(&fifo),
+		);
+		canceller.join().unwrap();
+		let opened = helper_opened.recv_timeout(HELPER_BOUND);
+		assert!(opened.is_ok(), "the helper's open was not released");
 	}
 }
 
