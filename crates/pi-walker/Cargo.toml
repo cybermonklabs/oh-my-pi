@@ -23,22 +23,10 @@ pi-vfs.workspace = true
 regex.workspace = true
 tokio.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-	"Wdk_Foundation",
-	"Wdk_Storage_FileSystem",
-	"Win32_Foundation",
-	"Win32_Security",
-	"Win32_Storage_FileSystem",
-	"Win32_System_IO",
-	"Win32_System_Kernel",
-	"Win32_System_WindowsProgramming",
-] }
-
 [dev-dependencies]
 async-trait.workspace = true
 globset.workspace = true
 ignore.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

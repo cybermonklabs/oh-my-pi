@@ -7,6 +7,8 @@
 //! the provider. A URL reaching a facade without a provider is `NotFound`;
 //! it is never resolved against the process working directory.
 
+#[cfg(unix)]
+use std::{ffi::CStr, os::fd::RawFd};
 use std::{
 	ffi::{OsStr, OsString},
 	fmt,
@@ -27,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::file::POLL_SLICE;
 use crate::{
 	dir::{EntryBinding, ReadDir},
+	dir_handle::DirHandle,
 	error::{
 		already_exists, invalid_argument, no_provider, not_a_directory, not_permitted,
 		permission_denied, unsupported,
@@ -195,15 +198,19 @@ enum ScopedOpen {
 	Typed { token: CancellationToken, poll: bool },
 	/// Open one end of a FIFO, which waits until the other end connects, so
 	/// the wait goes through [`FifoOpening`], which the token can interrupt.
+	/// `pin` is the FIFO at the path when the pin was taken, just after the
+	/// `stat` ([`FifoPin`]; a FIFO put there in between is the one pinned);
+	/// `None` when it was gone by then, and the open then has no release.
 	#[cfg(unix)]
-	Fifo { token: CancellationToken, end: FifoEnd },
+	Fifo { token: CancellationToken, end: FifoEnd, pin: Option<FifoPin> },
 }
 
 /// Under a cancellable scope on Unix, a read-only or write-only open takes
 /// one `stat` first. It says whether the file's reads must poll (see
 /// [`crate::reads_can_block`]) and whether the open itself can block: a
-/// FIFO's open waits for the other end. Without a token, for any other open,
-/// or when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
+/// FIFO's open waits for the other end, unless the open never waits on a
+/// FIFO it finds ([`FifoEnd::of`]). Without a token, for any other open, or
+/// when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
 /// changes between the `stat` and the open, the file is opened as the `stat`
 /// described it.
 #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn, reason = "const only off Unix"))]
@@ -212,18 +219,23 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 	if let Some(token) = &scope.cancel
 		&& !options.is_create_new()
 	{
-		use std::os::unix::fs::FileTypeExt;
-		let end = match (options.is_read(), options.is_writable()) {
-			(true, false) if !options.is_create() => FifoEnd::Read,
-			(false, true) => FifoEnd::Write,
+		use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+		match (options.is_read(), options.is_writable()) {
+			(true, false) if !options.is_create() => {},
+			(false, true) => {},
 			_ => return ScopedOpen::Plain,
-		};
+		}
 		let Ok(meta) = std::fs::metadata(path) else {
 			return ScopedOpen::Plain;
 		};
-		let kind = meta.file_type();
-		if kind.is_fifo() && options.get_custom_flags() & libc::O_NONBLOCK == 0 {
-			return ScopedOpen::Fifo { token: token.clone(), end };
+		if meta.file_type().is_fifo()
+			&& let Some(end) = FifoEnd::of(options)
+		{
+			let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
+			let pin = std::ffi::CString::new(path.as_os_str().as_bytes())
+				.ok()
+				.and_then(|path| FifoPin::at(libc::AT_FDCWD, &path, follow).ok().flatten());
+			return ScopedOpen::Fifo { token: token.clone(), end, pin };
 		}
 		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
 	}
@@ -242,9 +254,11 @@ fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait(&token)?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, end, pin } => {
+			Ok(FifoOpening::start(scope, path, options, end, pin, &token)?
+				.wait(&token)?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -267,10 +281,12 @@ async fn native_open_scoped_async(
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
 		},
 		#[cfg(unix)]
-		ScopedOpen::Fifo { token, end } => Ok(FifoOpening::start(scope, path, options, end, &token)?
-			.wait_async(&token)
-			.await?
-			.bind_host(token, true)),
+		ScopedOpen::Fifo { token, end, pin } => {
+			Ok(FifoOpening::start(scope, path, options, end, pin, &token)?
+				.wait_async(&token)
+				.await?
+				.bind_host(token, true))
+		},
 		ScopedOpen::Plain => Ok(native_open(scope, path, options)?.bind(scope)),
 	}
 }
@@ -278,7 +294,7 @@ async fn native_open_scoped_async(
 /// The end of a FIFO an open takes.
 #[cfg(unix)]
 #[derive(Clone, Copy)]
-enum FifoEnd {
+pub(crate) enum FifoEnd {
 	/// Waits for a writer.
 	Read,
 	/// Waits for a reader.
@@ -287,12 +303,39 @@ enum FifoEnd {
 
 #[cfg(unix)]
 impl FifoEnd {
-	/// The `faccessat` mode a release of this end needs: it opens the other.
-	const fn release_access(self) -> libc::c_int {
-		match self {
-			Self::Read => libc::W_OK,
-			Self::Write => libc::R_OK,
+	/// The end of a FIFO an open with `options` waits on: a read-only open
+	/// that creates nothing, or a write-only one, without `O_NONBLOCK`.
+	/// `None` for every other open, and for one that never waits on a FIFO
+	/// it finds: one the plain open refuses before it looks at the entry
+	/// (`EINVAL`: truncating or creating without write access, or appending
+	/// with truncation, the combinations `std` refuses), and an exclusive
+	/// create (`create_new`, or a custom `O_EXCL` with `create` or a custom
+	/// `O_CREAT`), which fails with `EEXIST` on any entry. Those take the
+	/// plain open, which gives their error.
+	pub(crate) const fn of(options: &OpenOptions) -> Option<Self> {
+		let custom = options.get_custom_flags();
+		let creates = options.is_create() || custom & libc::O_CREAT != 0;
+		if options.is_create_new()
+			|| (creates && custom & libc::O_EXCL != 0)
+			|| custom & libc::O_NONBLOCK != 0
+		{
+			return None;
 		}
+		let (write, append, truncate) =
+			(options.is_write(), options.is_append(), options.is_truncate());
+		if (!write && !append && (truncate || options.is_create())) || (append && truncate) {
+			return None;
+		}
+		match (options.is_read(), write || append) {
+			(true, false) => Some(Self::Read),
+			(false, true) => Some(Self::Write),
+			_ => None,
+		}
+	}
+
+	/// Whether a release of this end opens the write end.
+	pub(crate) const fn released_by_writer(self) -> bool {
+		matches!(self, Self::Read)
 	}
 
 	/// A non-blocking open of the other end, which releases a waiting open
@@ -308,53 +351,339 @@ impl FifoEnd {
 	}
 }
 
-/// How many times a cancelled [`FifoOpening`] tries to release its helper's
-/// open, one poll slice apart, before it leaves the helper blocked.
+/// How many times a cancelled or dropped [`FifoOpening`] tries to release
+/// its helper's open, one poll slice apart (about a second in all), before it
+/// leaves the helper blocked.
 #[cfg(unix)]
-const FIFO_RELEASE_ATTEMPTS: usize = 10;
+pub(crate) const FIFO_RELEASE_ATTEMPTS: usize = 10;
+
+/// The FIFO an open started on, pinned so that the open and its releases
+/// reach it ([`FifoOpening::start_pinned`]).
+///
+/// On Linux it holds an `O_PATH` descriptor of the FIFO, taken when the open
+/// starts and kept until the open and every release of it have ended. An
+/// `O_PATH` open runs no `fifo_open`, so it is neither a reader nor a writer.
+/// While it is open the FIFO's inode is not freed, so its number goes to no
+/// other file (ext4 and overlayfs on it give a freed number to the next file
+/// made, often the FIFO made at the same name: `rm p; mkfifo p`). Where
+/// `/proc/self/fd` is there, each release opens the other end through
+/// `/proc/self/fd/N` of it, so it reaches this FIFO whatever its name holds
+/// later; the helper opens its end there too, unless the open has `O_CREAT`:
+/// it then opens the name with the caller's options, so the kernel's check
+/// of the name applies ([`creates`]).
+///
+/// Elsewhere (macOS) a FIFO cannot be held without opening one of its ends,
+/// so the pin is the (device, inode) of a `stat`, which a FIFO made later at
+/// a reused number would share (APFS does not reuse numbers soon).
+#[cfg(unix)]
+pub(crate) struct FifoPin {
+	dev: u64,
+	ino: u64,
+	#[cfg(target_os = "linux")]
+	fd:  std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast, reason = "stat field widths differ by platform")]
+impl FifoPin {
+	/// Pins the FIFO `name` names relative to the directory `dir`
+	/// (`AT_FDCWD` for a path), following a final symlink only with
+	/// `follow`. `Ok(None)` when it is no FIFO.
+	#[cfg(target_os = "linux")]
+	pub(crate) fn at(dir: RawFd, name: &CStr, follow: bool) -> io::Result<Option<Self>> {
+		use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+		let flags = libc::O_PATH | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW };
+		// SAFETY: `name` is NUL-terminated.
+		let raw = unsafe { libc::openat(dir, name.as_ptr(), flags) };
+		if raw < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `raw` was just opened, and nothing else owns it.
+		let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+		let st = fstat(fd.as_raw_fd())?;
+		let pin = is_fifo(&st).then(|| Self { dev: st.st_dev as u64, ino: st.st_ino as u64, fd });
+		#[cfg(test)]
+		if pin.is_some() {
+			fifo_seam::fire_after_pin();
+		}
+		Ok(pin)
+	}
+
+	/// Pins the FIFO `name` names relative to the directory `dir`
+	/// (`AT_FDCWD` for a path), following a final symlink only with
+	/// `follow`. `Ok(None)` when it is no FIFO.
+	#[cfg(not(target_os = "linux"))]
+	pub(crate) fn at(dir: RawFd, name: &CStr, follow: bool) -> io::Result<Option<Self>> {
+		let flag = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+		let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `name` is NUL-terminated and `st` is a valid out-pointer.
+		if unsafe { libc::fstatat(dir, name.as_ptr(), st.as_mut_ptr(), flag) } == -1 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `fstatat` succeeded and filled `st`.
+		let st = unsafe { st.assume_init() };
+		let pin = is_fifo(&st).then_some(Self { dev: st.st_dev as u64, ino: st.st_ino as u64 });
+		#[cfg(test)]
+		if pin.is_some() {
+			fifo_seam::fire_after_pin();
+		}
+		Ok(pin)
+	}
+
+	/// `/proc/self/fd/N` of the pin, where the releases reach the FIFO, and
+	/// the helper too unless the open has `O_CREAT` ([`creates`]); `None`
+	/// off Linux and without `/proc`, when they open the name and a release
+	/// checks what it opened ([`Self::check`]).
+	#[cfg_attr(
+		not(target_os = "linux"),
+		allow(
+			clippy::unused_self,
+			clippy::missing_const_for_fn,
+			reason = "only Linux has a reopen path"
+		)
+	)]
+	fn reopen_path(&self) -> Option<PathBuf> {
+		#[cfg(target_os = "linux")]
+		{
+			use std::os::fd::AsRawFd;
+			static PROC_FD: std::sync::LazyLock<bool> =
+				std::sync::LazyLock::new(|| Path::new("/proc/self/fd").is_dir());
+			#[cfg(test)]
+			if fifo_seam::by_name() {
+				return None;
+			}
+			let proc = *PROC_FD;
+			proc.then(|| PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd())))
+		}
+		#[cfg(not(target_os = "linux"))]
+		None
+	}
+
+	/// `Ok` when `end`, an end a release opened by name, is of the pinned
+	/// FIFO; else an error, and the release closes it at once and stops. Its
+	/// open has happened by then, though: an end of another FIFO at the name
+	/// has completed an open waiting there (a reader then reads end of file).
+	fn check(&self, end: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+		use std::os::fd::AsRawFd;
+		let st = fstat(end.as_raw_fd())?;
+		if (st.st_dev as u64, st.st_ino as u64) == (self.dev, self.ino) {
+			Ok(())
+		} else {
+			Err(io::Error::other("the FIFO's name now names another FIFO; no release"))
+		}
+	}
+}
+
+#[cfg(unix)]
+fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+	let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+	// SAFETY: `st` is a valid out-pointer.
+	if unsafe { libc::fstat(fd, st.as_mut_ptr()) } == -1 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: `fstat` succeeded and filled `st`.
+	Ok(unsafe { st.assume_init() })
+}
+
+#[cfg(unix)]
+const fn is_fifo(st: &libc::stat) -> bool {
+	st.st_mode & libc::S_IFMT == libc::S_IFIFO
+}
+
+/// Whether an open with `options` has `O_CREAT`: `create`, `create_new`, or
+/// a custom `O_CREAT`. The kernel checks such an open of an existing FIFO
+/// against the directory its name is in (`fs.protected_fifos` in a sticky
+/// directory, which `may_create_in_sticky` reads only under `O_CREAT`); a
+/// walk through `/proc/self/fd/N` ends in `/proc/self/fd`, which is never
+/// sticky. So a pinned FIFO's helper runs such an open by name with the
+/// caller's own options. The checks of other flags hold through the magic
+/// link (the write permission `O_TRUNC` asks, from the flags alone; `EEXIST`
+/// needs `O_CREAT`), so every other open reopens the pin.
+#[cfg(unix)]
+const fn creates(options: &OpenOptions) -> bool {
+	options.is_create() || options.is_create_new() || options.get_custom_flags() & libc::O_CREAT != 0
+}
+
+/// `options`, which have no `O_CREAT` ([`creates`]), for an open of a pinned
+/// FIFO through `/proc/self/fd/N`: without `O_NOFOLLOW`, which would refuse
+/// the magic link itself. `O_TRUNC` stays, so the kernel asks the write
+/// permission it asks of the plain open.
+#[cfg(unix)]
+fn reopen_options(options: &OpenOptions) -> OpenOptions {
+	debug_assert!(!creates(options), "a creating open goes by name");
+	let mut reopen = options.clone();
+	reopen.custom_flags(options.get_custom_flags() & !libc::O_NOFOLLOW);
+	reopen
+}
+
+/// A non-blocking open of the other end of the FIFO a [`FifoOpening`] opens;
+/// `ENXIO` while no open of this end waits yet. The end it returns stays
+/// open until the wait for the helper's answer ends, so a helper that
+/// reaches its `open` during that wait connects to it.
+#[cfg(unix)]
+pub(crate) type FifoRelease = Arc<dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync>;
 
 /// One end of a FIFO being opened on a helper thread, so that the wait for
 /// the other end observes a token and, for async callers, holds no runtime
 /// worker. The helper runs the ordinary blocking open, so the open returns
 /// exactly when it would without a token: once the other end connects.
 ///
-/// Once the token fires, when this process may open the other end, a
-/// non-blocking open of the other end connects to the waiting open and closes
-/// at once; it is tried again while the helper has not reached `open` yet
-/// (`ENXIO`). The helper's descriptor is closed, and the open fails with
-/// [`crate::cancelled`]. Other opens of the same end waiting at that moment
-/// are released too: a reader reads EOF, a writer's first write fails with
-/// `EPIPE`.
+/// Once the token fires, a non-blocking open of the other end connects to
+/// the waiting open and closes at once; it is tried again while the helper
+/// has not reached `open` yet, one poll slice apart, for about a second
+/// ([`FIFO_RELEASE_ATTEMPTS`]). The helper's descriptor is closed, and the
+/// open fails with [`crate::cancelled`]. Other opens of the same end waiting
+/// at that moment are released too: a reader reads EOF, a writer's first
+/// write fails with `EPIPE`. Where `/proc/self/fd` is there (Linux with
+/// `/proc`), the releases reach the FIFO the open started on, whatever its
+/// name holds later ([`FifoPin`]), and so does the helper, unless the open
+/// has `O_CREAT`: the helper then opens the name with the caller's options
+/// ([`creates`]). Elsewhere (off Linux, and on Linux without `/proc`) the
+/// helper and its releases open the name, and a release that reached
+/// another FIFO closes it at once and stops.
+///
+/// An open with `O_CREAT` leaves a window where `/proc/self/fd` is there: if
+/// the name is given to another FIFO B between the pin and the helper's
+/// open (`rm p; mkfifo p`), the helper waits on B, which no release reaches
+/// (each opens the pinned FIFO). A cancel then runs every attempt, about a
+/// second; an async open's cancel spends that second on the runtime worker
+/// that awaits it ([`Self::wait_async`]). The open fails with
+/// [`crate::cancelled`], and the helper thread stays blocked in `open`,
+/// holding the pin's descriptor (on a handle, also its duplicate of the
+/// directory's descriptor), until B's next peer connects. If B's name goes
+/// first (a script that ends with `rm p`), nothing can open B again, and
+/// the thread and those descriptors stay for the life of the process. A
+/// peer that connects completes the helper's open; the helper's end closes
+/// once its result finds nobody to receive it. A reader peer then reads end
+/// of file; a writer peer's writes before that close land in B's buffer and
+/// are lost, and its writes after it fail with `EPIPE`.
+///
+/// That window is a trade-off, not a limit. One last release attempt by
+/// name (the `release_by_name` that [`Self::start_pinned`] takes), made only
+/// for an open with `O_CREAT` and only after every pinned attempt went
+/// unanswered, would reach the helper on B. It is not made: it would also
+/// complete every other open waiting on B's same end, and B is a FIFO this
+/// open never pinned; keeping a release from reaching a FIFO its open did
+/// not start on is what the pin is for.
 ///
 /// An open that is dropped before it finishes (the job that made it was
 /// aborted, its run task was dropped) is released the same way, on a
-/// detached thread, so the helper does not take the next connection.
+/// detached thread after the first attempt. A helper that reaches `open`
+/// after the last attempt, about a second on, still takes the next
+/// connection of the other end and closes it.
 ///
-/// When it may not (a FIFO this process can read but not write, or the
-/// reverse), or the release fails, the open still fails with
+/// When the release fails (this process may not open the other end: a FIFO
+/// it can read but not write, or the reverse), the open still fails with
 /// [`crate::cancelled`], but the helper stays blocked in `open` until the
 /// other end arrives. It then takes that connection and closes it: the next
 /// writer's first write fails with `EPIPE`, the next reader reads EOF. Without
 /// a token the whole command would have stayed blocked there instead.
 #[cfg(unix)]
-struct FifoOpening {
-	path:       PathBuf,
-	end:        FifoEnd,
-	releasable: bool,
-	opened:     std::sync::mpsc::Receiver<io::Result<File>>,
+pub(crate) struct FifoOpening {
+	release: FifoRelease,
+	opened:  std::sync::mpsc::Receiver<io::Result<File>>,
 	/// Notified once the helper has sent its result.
-	done:       Arc<tokio::sync::Notify>,
+	done:    Arc<tokio::sync::Notify>,
 	/// Whether the open has ended: its result was taken, or it was released.
-	settled:    bool,
+	settled: bool,
 }
 
 #[cfg(unix)]
 impl FifoOpening {
+	/// Opens `end` of the FIFO at `path` under `scope`; `pin` is the FIFO the
+	/// open started on.
 	fn start(
 		scope: &Scope,
 		path: &Path,
 		options: &OpenOptions,
 		end: FifoEnd,
+		pin: Option<FifoPin>,
+		token: &CancellationToken,
+	) -> io::Result<Self> {
+		let (scope, owned_path, open_options) = (scope.clone(), path.to_path_buf(), options.clone());
+		let (release_path, release_options) = (path.to_path_buf(), end.release_options().to_std());
+		Self::start_pinned(
+			pin,
+			end,
+			options,
+			move || native_open(&scope, &owned_path, &open_options),
+			move || release_options.open(&release_path),
+			token,
+		)
+	}
+
+	/// Starts the open of `end` of the pinned FIFO `pin` on a helper thread.
+	/// With a reopen path ([`FifoPin`]), each release opens the other end
+	/// there, and the helper opens it with `options` (no `O_NOFOLLOW`),
+	/// unless the open has `O_CREAT` ([`creates`]): that helper runs
+	/// `by_name`, the plain open by name with the caller's own options, so
+	/// the kernel checks the name as it checks the plain open's (a FIFO put
+	/// at the name since the pin leaves the helper where no release reaches
+	/// it: see [`FifoOpening`]). Without a reopen path, the helper runs
+	/// `by_name` and each release runs `release_by_name`, a non-blocking
+	/// open of the other end at the name, whose end the pin then checks.
+	/// Both keep the pin until they end, so its descriptor is not closed,
+	/// nor its number given to another file, while they can use it. Whether
+	/// this process may open the other end is the release's own open to
+	/// find (`EACCES`), never a check of the name, which can name another
+	/// file, or none, by then. Without a pin there is no release.
+	pub(crate) fn start_pinned(
+		pin: Option<FifoPin>,
+		end: FifoEnd,
+		options: &OpenOptions,
+		by_name: impl FnOnce() -> io::Result<File> + Send + 'static,
+		release_by_name: impl Fn() -> io::Result<std::fs::File> + Send + Sync + 'static,
+		token: &CancellationToken,
+	) -> io::Result<Self> {
+		use std::os::fd::AsFd;
+		let Some(pin) = pin.map(Arc::new) else {
+			// Nothing identifies the FIFO (it was gone when the open started).
+			let refuse: FifoRelease = Arc::new(|| Err(io::Error::other("no FIFO pinned; no release")));
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::ByName);
+			return Self::spawn(by_name, refuse, token);
+		};
+		let (open_pin, release_pin) = (Arc::clone(&pin), pin);
+		let reopens = release_pin.reopen_path().is_some();
+		let gone = || io::Error::other("the FIFO's pin has no reopen path");
+		let open: Box<dyn FnOnce() -> io::Result<File> + Send> = if reopens && !creates(options) {
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::Reopen);
+			let open_options = reopen_options(options).to_std();
+			Box::new(move || {
+				let path = open_pin.reopen_path().ok_or_else(gone)?;
+				open_options.open(path).map(File::from)
+			})
+		} else {
+			#[cfg(test)]
+			fifo_seam::note_helper(fifo_seam::Helper::ByName);
+			Box::new(move || {
+				let opened = by_name();
+				drop(open_pin);
+				opened
+			})
+		};
+		let release: FifoRelease = if reopens {
+			let release_options = end.release_options().to_std();
+			Arc::new(move || {
+				let path = release_pin.reopen_path().ok_or_else(gone)?;
+				Ok(Box::new(release_options.open(path)?) as Box<dyn Send>)
+			})
+		} else {
+			Arc::new(move || {
+				let end = release_by_name()?;
+				release_pin.check(end.as_fd())?;
+				Ok(Box::new(end) as Box<dyn Send>)
+			})
+		};
+		Self::spawn(open, release, token)
+	}
+
+	/// Runs `open`, a blocking open of one end of a FIFO, on a helper thread;
+	/// `release` opens the other end without blocking.
+	pub(crate) fn spawn(
+		open: impl FnOnce() -> io::Result<File> + Send + 'static,
+		release: FifoRelease,
 		token: &CancellationToken,
 	) -> io::Result<Self> {
 		if token.is_cancelled() {
@@ -362,27 +691,26 @@ impl FifoOpening {
 		}
 		let (sender, opened) = std::sync::mpsc::sync_channel(1);
 		let done = Arc::new(tokio::sync::Notify::new());
-		let (scope, owned_path, options, notify) =
-			(scope.clone(), path.to_path_buf(), options.clone(), done.clone());
+		let notify = done.clone();
 		std::thread::Builder::new()
 			.name("pi-vfs-fifo-open".to_owned())
 			.spawn(move || {
+				#[cfg(test)]
+				let after = fifo_seam::before_open();
+				let opened = open();
+				#[cfg(test)]
+				if let Some(after) = after {
+					after(opened.is_ok());
+				}
 				// After a cancellation nobody receives; the file then closes here.
-				let _ = sender.send(native_open(&scope, &owned_path, &options));
+				let _ = sender.send(opened);
 				notify.notify_one();
 			})?;
-		Ok(Self {
-			path: path.to_path_buf(),
-			end,
-			releasable: may_access(path, end.release_access()),
-			opened,
-			done,
-			settled: false,
-		})
+		Ok(Self { release, opened, done, settled: false })
 	}
 
 	/// Waits for the open on this thread, in poll slices, checking `token`.
-	fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
+	pub(crate) fn wait(mut self, token: &CancellationToken) -> io::Result<File> {
 		use std::sync::mpsc::RecvTimeoutError;
 		loop {
 			match self.opened.recv_timeout(POLL_SLICE) {
@@ -401,7 +729,7 @@ impl FifoOpening {
 	}
 
 	/// Awaits the open or `token`, whichever comes first.
-	async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
+	pub(crate) async fn wait_async(mut self, token: &CancellationToken) -> io::Result<File> {
 		tokio::select! {
 			biased;
 			() = self.done.notified() => {},
@@ -420,14 +748,11 @@ impl FifoOpening {
 		}
 	}
 
-	/// Ends a cancelled open: releases the helper's open when this process may
-	/// open the other end. The release takes microseconds unless the helper
-	/// has not reached `open` yet, and is bounded by [`FIFO_RELEASE_ATTEMPTS`]
-	/// slices.
+	/// Ends a cancelled open: releases the helper's open. The release takes
+	/// microseconds unless the helper has not reached `open` yet, and is
+	/// bounded by [`FIFO_RELEASE_ATTEMPTS`] slices.
 	fn cancel(mut self) -> io::Result<File> {
-		if self.releasable {
-			release_fifo_open(&self.path, self.end, &self.opened);
-		}
+		release_fifo_open(&*self.release, &self.opened);
 		self.settled = true;
 		Err(crate::cancelled())
 	}
@@ -438,80 +763,170 @@ impl Drop for FifoOpening {
 	/// Releases an open dropped before it ended. The first attempt runs here,
 	/// so the release is done, and the helper's descriptor closed, before what
 	/// follows the drop (the next command) opens this FIFO; it takes
-	/// microseconds. A helper that has not reached `open` yet is left to a
-	/// detached thread, so that no runtime worker waits for it.
+	/// microseconds when the helper waits in `open`. A helper that has not
+	/// answered one slice into it is left to a detached thread that tries
+	/// again for about a second ([`FIFO_RELEASE_ATTEMPTS`]), so that no
+	/// runtime worker waits for it.
 	fn drop(&mut self) {
-		if self.settled || !self.releasable {
+		if self.settled {
 			return;
 		}
-		match native::open(&self.path, &self.end.release_options()) {
-			Ok(_release) => {
-				// The helper's open returns as soon as it sees the release.
-				let _ = self.opened.recv_timeout(POLL_SLICE);
-				return;
-			},
-			Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {},
-			Err(_) => return,
+		if release_attempt(&*self.release, &self.opened) {
+			return;
 		}
 		let (_, placeholder) = std::sync::mpsc::sync_channel(0);
 		let opened = std::mem::replace(&mut self.opened, placeholder);
-		let (path, end) = (std::mem::take(&mut self.path), self.end);
+		let release = Arc::clone(&self.release);
 		let _ = std::thread::Builder::new()
 			.name("pi-vfs-fifo-release".to_owned())
-			.spawn(move || release_fifo_open(&path, end, &opened));
+			.spawn(move || release_fifo_open(&*release, &opened));
 	}
 }
 
-/// Releases a helper's open of one end of the FIFO at `path`; see
-/// [`release_attempt`]. Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
+/// Releases a helper's open of one end of a FIFO; see [`release_attempt`].
+/// Bounded by [`FIFO_RELEASE_ATTEMPTS`] attempts.
 #[cfg(unix)]
 fn release_fifo_open(
-	path: &Path,
-	end: FifoEnd,
+	release: &(dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) {
 	for _ in 0..FIFO_RELEASE_ATTEMPTS {
-		if release_attempt(path, end, opened) {
+		if release_attempt(release, opened) {
 			break;
 		}
 	}
 }
 
-/// One attempt to release a helper's open of one end of the FIFO at `path`:
-/// a non-blocking open of the other end, then a wait of one poll slice for
-/// the helper's result, which is dropped. `false` when another attempt is
-/// due: the helper has not reached `open` yet (`ENXIO`) and has not
-/// answered.
+/// One attempt to release a helper's open of one end of a FIFO: a
+/// non-blocking open of the other end (`release`), kept open while this waits
+/// one poll slice for the helper's result, which is dropped after it, so the
+/// helper's end, closed second, is the last of the two. `false` when another
+/// attempt is due: the helper has not answered (it has not reached `open`
+/// yet, or, for a writer's release, `ENXIO`). `true` also when the release
+/// failed otherwise, a release that reached another FIFO included.
 #[cfg(unix)]
 fn release_attempt(
-	path: &Path,
-	end: FifoEnd,
+	release: &(dyn Fn() -> io::Result<Box<dyn Send>> + Send + Sync),
 	opened: &std::sync::mpsc::Receiver<io::Result<File>>,
 ) -> bool {
 	use std::sync::mpsc::RecvTimeoutError;
-	if let Err(err) = native::open(path, &end.release_options())
-		&& err.raw_os_error() != Some(libc::ENXIO)
-	{
-		return true;
+	let released = release();
+	#[cfg(test)]
+	fifo_seam::after_release(released.is_ok());
+	let held = match released {
+		Ok(held) => Some(held),
+		Err(err) if err.raw_os_error() == Some(libc::ENXIO) => None,
+		Err(_) => return true,
+	};
+	let answer = opened.recv_timeout(POLL_SLICE);
+	drop(held);
+	let answered = !matches!(answer, Err(RecvTimeoutError::Timeout));
+	drop(answer);
+	answered
+}
+
+/// Test seams: a hook a test sets for the next FIFO helper, run on the
+/// helper's thread before its `open` (it may block, to hold the helper back)
+/// and after it (told whether the open succeeded); a hook run after each
+/// release's open of the other end, while the end it opened is still held
+/// (told whether it opened one); a hook run just after the next FIFO pin is
+/// taken; a record of the way each pinned FIFO's helper opens it; and a
+/// switch that makes pinned FIFO opens open the name, as they do without
+/// `/proc`.
+#[cfg(all(test, unix))]
+pub(crate) mod fifo_seam {
+	use std::sync::atomic::{AtomicBool, Ordering};
+
+	use parking_lot::Mutex;
+
+	type Before = Box<dyn FnOnce() + Send>;
+	type After = Box<dyn FnOnce(bool) + Send>;
+	type Release = Box<dyn FnMut(bool) + Send>;
+
+	static NEXT: Mutex<Option<(Before, After)>> = Mutex::new(None);
+	static RELEASE: Mutex<Option<Release>> = Mutex::new(None);
+	static AFTER_PIN: Mutex<Option<Before>> = Mutex::new(None);
+	static BY_NAME: AtomicBool = AtomicBool::new(false);
+	static HELPERS: Mutex<Vec<Helper>> = Mutex::new(Vec::new());
+
+	/// The way a FIFO's helper opens it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(crate) enum Helper {
+		/// By the name, with the caller's own options (`by_name`).
+		ByName,
+		/// Through the pin's `/proc/self/fd/N`, with the options for that.
+		Reopen,
 	}
-	!matches!(opened.recv_timeout(POLL_SLICE), Err(RecvTimeoutError::Timeout))
+
+	pub(super) fn note_helper(helper: Helper) {
+		HELPERS.lock().push(helper);
+	}
+
+	/// The ways the FIFO helpers started in this process since the last
+	/// call opened their FIFO, in order.
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux tests read it"))]
+	pub(crate) fn take_helpers() -> Vec<Helper> {
+		std::mem::take(&mut *HELPERS.lock())
+	}
+
+	/// Makes pinned FIFO opens in this process from now on open the name and
+	/// check what a release opened, as without `/proc` (`on`), or not.
+	pub(crate) fn open_by_name(on: bool) {
+		BY_NAME.store(on, Ordering::SeqCst);
+	}
+
+	#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "only Linux reopens"))]
+	pub(super) fn by_name() -> bool {
+		BY_NAME.load(Ordering::SeqCst)
+	}
+
+	/// Hooks the next FIFO helper that starts in this process.
+	pub(crate) fn set(
+		before: impl FnOnce() + Send + 'static,
+		after: impl FnOnce(bool) + Send + 'static,
+	) {
+		*NEXT.lock() = Some((Box::new(before), Box::new(after)));
+	}
+
+	/// Runs the hook's first half, if one is set, and hands back its second.
+	pub(super) fn before_open() -> Option<After> {
+		let (before, after) = NEXT.lock().take()?;
+		before();
+		Some(after)
+	}
+
+	/// Hooks every release attempt in this process from now on.
+	pub(crate) fn on_release(hook: impl FnMut(bool) + Send + 'static) {
+		*RELEASE.lock() = Some(Box::new(hook));
+	}
+
+	pub(super) fn after_release(held: bool) {
+		if let Some(hook) = RELEASE.lock().as_mut() {
+			hook(held);
+		}
+	}
+
+	/// Hooks the next FIFO pin taken in this process: `hook` runs just after
+	/// the pin, before anything else of its open.
+	#[cfg_attr(
+		not(target_os = "linux"),
+		allow(dead_code, reason = "only a Linux test renames a pinned FIFO")
+	)]
+	pub(crate) fn after_pin(hook: impl FnOnce() + Send + 'static) {
+		*AFTER_PIN.lock() = Some(Box::new(hook));
+	}
+
+	pub(super) fn fire_after_pin() {
+		let hook = AFTER_PIN.lock().take();
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
 }
 
 #[cfg(unix)]
 fn helper_exited() -> io::Error {
 	io::Error::other("FIFO open thread exited")
-}
-
-/// Whether this process may open `path` with `mode` (`R_OK`, `W_OK`), by its
-/// effective IDs.
-#[cfg(unix)]
-fn may_access(path: &Path, mode: libc::c_int) -> bool {
-	use std::os::unix::ffi::OsStrExt;
-	let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-		return false;
-	};
-	// SAFETY: `path` is a NUL-terminated string alive for the call.
-	unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
 }
 
 /// Reads a whole host file. Under a cancellable scope the read goes through
@@ -837,6 +1252,15 @@ impl Fs {
 			.map(|mount| &mount.file)
 	}
 
+	/// Whether a descriptor overlay is mounted below `path`, which a host
+	/// directory handle would reach past.
+	fn mounts_below(&self, path: &Path) -> bool {
+		self
+			.mounts
+			.as_ref()
+			.is_some_and(|mounts| mounts.iter().any(|mount| mount.path.starts_with(path)))
+	}
+
 	fn route(&self, path: &Path) -> io::Result<Route<'_>> {
 		if let Some(file) = self.mounted(path) {
 			return Ok(Route::Mounted(file));
@@ -1004,6 +1428,56 @@ impl Fs {
 		} else {
 			self.symlink_metadata(path).await
 		}
+	}
+
+	/// Opens the directory at `path` as a [`DirHandle`], below which every
+	/// call names one entry: a descriptor on the host, the path on a provider.
+	/// Earlier components are followed; with `follow` the last is too.
+	/// Without, a symlink that is the last component is refused (`ENOTDIR` on
+	/// Unix, also on a kernel that follows one despite `O_NOFOLLOW`;
+	/// `ERROR_STOPPED_ON_SYMLINK` on Windows; [`not_a_directory`] on a
+	/// provider). A host handle keeps this facade's creation mask and
+	/// cancellation for the files and directories it creates and opens. A
+	/// host directory with a descriptor overlay mounted below it opens as a
+	/// path handle on this facade ([`Self::open_dir_by_path`]), so its calls
+	/// reach the overlay, as this facade's own calls do.
+	///
+	/// # Errors
+	///
+	/// The open's errors; [`not_a_directory`] for anything else, a descriptor
+	/// overlay included.
+	pub async fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.route(path)? {
+			Route::Native if !self.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				DirHandle::open_provider(self, Handle::try_current().ok(), path, follow).await
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// Opens the directory at `path` as a handle that names its entries by
+	/// path on this facade, whatever serves them: each call joins the entry's
+	/// name to `path` and makes this facade's path call, which routes it as
+	/// the facade routes any path. Where this facade serves `path` from the
+	/// host, [`Self::open_dir`] opens a host handle instead; a walk that
+	/// started below a provider's root keeps to paths with this call. The
+	/// directory is checked to be one, a final symlink followed only with
+	/// `follow`.
+	///
+	/// # Errors
+	///
+	/// The facade's metadata errors; [`not_a_directory`] for anything else, a
+	/// descriptor overlay included.
+	pub async fn open_dir_by_path(
+		&self,
+		path: impl AsRef<Path>,
+		follow: bool,
+	) -> io::Result<DirHandle> {
+		DirHandle::open_provider(self, Handle::try_current().ok(), path.as_ref(), follow).await
 	}
 
 	pub async fn read_dir(&self, path: impl AsRef<Path>) -> io::Result<ReadDir> {
@@ -1634,6 +2108,29 @@ impl BlockingFs {
 				let read_dir = self.run(provider.read_dir(path))?;
 				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
 				Ok(read_dir.bind(self.fs.entry_binding(provider, runtime)))
+			},
+			Route::Mounted(_) => Err(not_a_directory()),
+		}
+	}
+
+	/// See [`Fs::open_dir`]. The handle's synchronous provider calls are
+	/// driven as this facade drives its own.
+	///
+	/// # Errors
+	///
+	/// As for [`Fs::open_dir`].
+	pub fn open_dir(&self, path: impl AsRef<Path>, follow: bool) -> io::Result<DirHandle> {
+		let path = path.as_ref();
+		match self.fs.route(path)? {
+			Route::Native if !self.fs.mounts_below(path) => {
+				DirHandle::open_host(path, follow, &self.fs.scope)
+			},
+			Route::Native | Route::Provider(_) => {
+				let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
+				block_on(
+					self.runtime.as_ref(),
+					DirHandle::open_provider(&self.fs, runtime, path, follow),
+				)
 			},
 			Route::Mounted(_) => Err(not_a_directory()),
 		}

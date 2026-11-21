@@ -17,7 +17,7 @@ use std::{
 pub(crate) use self::unix::{
 	access, allocated_size, chown, close, file_id, file_id_of, file_is_locked, file_metadata,
 	file_set_permissions, file_set_times, fstat_fs, get_xattr, link_count, list_xattr, make_node,
-	remove_xattr, set_dir_mode, set_permissions, set_times, set_xattr, stat_fs, symlink,
+	remove_xattr, set_dir_mode, set_permissions, set_times, set_xattr, stat_fs, symlink, timespec,
 };
 #[cfg(windows)]
 pub(crate) use self::windows::{

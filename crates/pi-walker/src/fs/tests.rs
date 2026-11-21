@@ -249,36 +249,6 @@ async fn opens_beneath_a_root_follow_no_symlink() {
 			.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
 	}
-
-	// The component walk, which kernels without `openat2` get.
-	let DirRepr::Native(handle) = &root.repr else {
-		panic!("a native root");
-	};
-	let mut scratch = native::Scratch::default();
-	assert!(native::open_beneath_walking(&mut scratch, handle, b"a/b/file.txt", false).is_ok());
-	assert!(native::open_beneath_walking(&mut scratch, handle, b"a/b", true).is_ok());
-	for (rel, dir) in [
-		("a/b/flink", false),
-		("a/link/file.txt", false),
-		("esc/secret", false),
-		("a/link", true),
-		("esc", true),
-	] {
-		let err =
-			native::open_beneath_walking(&mut scratch, handle, rel.as_bytes(), dir).unwrap_err();
-		assert!(refused_link(&err), "{rel}: {err:?}");
-	}
-}
-
-/// A walk-relative path splits on `/`, and on Windows on `\` too, so a `..`
-/// hidden behind `\` is refused there; elsewhere `\` is part of a name.
-#[test]
-fn walk_relative_paths_split_on_the_platform_separators() {
-	assert!(check_relative(b"a/b").is_ok());
-	assert!(check_relative(b"a/../b").is_err());
-	for rel in [&b"a\\..\\b"[..], b"a\\.", b"a\\\\b", b"\\a"] {
-		assert_eq!(check_relative(rel).is_err(), cfg!(windows), "{:?}", String::from_utf8_lossy(rel));
-	}
 }
 
 /// Paths a confined call refuses as not walk-relative.
@@ -400,10 +370,12 @@ async fn removals_beneath_a_root_follow_no_symlink() {
 	assert!(!tmp.0.join("root/a").exists());
 	for rel in NOT_WALK_RELATIVE {
 		for dir in [false, true] {
-			let err = s
-				.remove_beneath(&root, rel.as_bytes(), dir)
-				.await
-				.unwrap_err();
+			let err = if dir {
+				s.remove_dir_beneath(&root, rel.as_bytes()).await
+			} else {
+				s.remove_file_beneath(&root, rel.as_bytes()).await
+			}
+			.unwrap_err();
 			assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel:?}");
 		}
 	}
@@ -958,4 +930,57 @@ async fn sessions_refuse_foreign_dirs() {
 	let mem_dir = provider.open_dir(Path::new("mem://r")).await.unwrap();
 	assert!(native.list(&mem_dir, Detail::Minimal, 0).await.is_err());
 	assert!(provider.open_file_at(&host_dir, b"a", false).await.is_err());
+}
+
+/// A provider that serves every path from the host
+/// ([`pi_vfs::FileSystem::is_native_local`]): its facade routes each path
+/// call to the host, so none of its own calls is made.
+#[derive(Debug)]
+struct AllHostLocal;
+
+#[async_trait::async_trait]
+impl pi_vfs::FileSystem for AllHostLocal {
+	fn is_native_local(&self, _path: &Path) -> bool {
+		true
+	}
+
+	async fn open(&self, _path: &Path, _options: &pi_vfs::OpenOptions) -> io::Result<pi_vfs::File> {
+		Err(pi_vfs::unsupported("open"))
+	}
+
+	async fn metadata(&self, _path: &Path) -> io::Result<pi_vfs::Metadata> {
+		Err(pi_vfs::unsupported("metadata"))
+	}
+
+	async fn read_dir(&self, _path: &Path) -> io::Result<pi_vfs::ReadDir> {
+		Err(pi_vfs::unsupported("read_dir"))
+	}
+}
+
+/// A provider session opens a directory by path as a path on its facade, as
+/// it did before directory handles, also where the facade serves the path
+/// from the host: the directory stays the session's own kind, and its
+/// listing and opens go through the facade's calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_sessions_open_directories_as_facade_paths() {
+	let tmp = TempDir::new("by-path");
+	tmp.write("sub/f.txt", b"ok");
+	let vfs = pi_vfs::Fs::new(std::sync::Arc::new(AllHostLocal));
+	let mut s = Fs::Provider(vfs).session();
+	for unlinked in [false, true] {
+		let dir = if unlinked {
+			s.open_dir_unlinked(&tmp.0).await.unwrap()
+		} else {
+			s.open_dir(&tmp.0).await.unwrap()
+		};
+		assert!(!dir.holds_descriptor(), "a provider session opened a host descriptor");
+		assert_eq!(names(s.list(&dir, Detail::Minimal, 0).await.unwrap()), [(
+			"sub".to_owned(),
+			FileType::Dir
+		)]);
+		let sub = s.open_child(&dir, b"sub").await.unwrap();
+		assert!(!sub.holds_descriptor());
+		let (data, _) = read_all(&mut s, &sub, "f.txt", 16).await;
+		assert_eq!(data, b"ok");
+	}
 }

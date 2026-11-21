@@ -21,7 +21,7 @@ use super::{
 	aligned_buf, is_dot_or_dot_dot, le16, le32, le64,
 	unix::{Scratch, nanos, openat_plain, type_of_dt, type_of_mode, walk_beneath},
 };
-use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
+use crate::dir_handle::{Detail, FileInfo, FileType, Listing, Stamp};
 
 /// Directory opens and listings contend in the kernel: on APFS throughput
 /// peaks at 4–6 threads and collapses beyond 8.

@@ -13,7 +13,7 @@ use super::{
 	is_dot_or_dot_dot,
 	unix::{Scratch, nanos, openat_plain, type_of_mode, walk_beneath},
 };
-use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
+use crate::dir_handle::{Detail, FileInfo, FileType, Listing, Stamp};
 
 pub(super) const WORKERS: usize = 4;
 

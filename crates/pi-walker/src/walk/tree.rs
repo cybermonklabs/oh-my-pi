@@ -610,11 +610,6 @@ fn moved() -> io::Error {
 	io::Error::other("the directory was moved or replaced during the walk")
 }
 
-fn record_name<'n>(names: &'n [u8], record: &Record) -> &'n [u8] {
-	let start = record.name_off as usize;
-	&names[start..start + record.name_len as usize]
-}
-
 impl Cx {
 	/// The report of `post` at the current paths.
 	fn entry(&self, post: Post) -> TreeEntry<'_> {
@@ -951,17 +946,16 @@ impl Cx {
 			self.pool.push(listing);
 			return Err(error);
 		}
-		let Listing { records, names } = &mut listing;
-		let names = names.as_slice();
+		let (records, names) = listing.parts_mut();
 		match self.opts.order {
 			Order::Listing => {},
 			Order::Names => {
-				records.sort_unstable_by(|a, b| record_name(names, a).cmp(record_name(names, b)));
+				records.sort_unstable_by(|a, b| a.name_in(names).cmp(b.name_in(names)));
 			},
 			Order::Paths => {
 				let key = |record: &Record| {
 					let slash = (record.file_type == FileType::Dir).then_some(&b'/');
-					record_name(names, record).iter().chain(slash)
+					record.name_in(names).iter().chain(slash)
 				};
 				records.sort_unstable_by(|a, b| key(a).cmp(key(b)));
 			},

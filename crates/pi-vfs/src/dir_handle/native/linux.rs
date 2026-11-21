@@ -40,7 +40,7 @@ use super::{
 	aligned_buf, is_dot_or_dot_dot, le16, le64,
 	unix::{Scratch, nanos, type_of_dt, type_of_mode, walk_beneath},
 };
-use crate::fs::{Detail, FileInfo, FileType, Listing, Stamp};
+use crate::dir_handle::{Detail, FileInfo, FileType, Listing, Stamp};
 
 /// On a 16-vCPU arm64 VM, 8 workers walked faster and steadier than 16
 /// (kernel contention on fd-table and dcache locks grows with thread count).
@@ -671,8 +671,8 @@ mod tests {
 
 	impl Tree {
 		fn new(tag: &str) -> Self {
-			let base = crate::testing::temp_root()
-				.join(format!("pi-walker-linux-{tag}-{}", std::process::id()));
+			let base = crate::dir_handle::temp_root()
+				.join(format!("pi-vfs-linux-{tag}-{}", std::process::id()));
 			let _ = fs::remove_dir_all(&base);
 			fs::create_dir_all(base.join("a")).expect("create a");
 			fs::write(base.join("a/f"), "f").expect("write a/f");
@@ -698,31 +698,11 @@ mod tests {
 		DIRECTORY_LINKS.store(UNPROBED, Ordering::SeqCst);
 	}
 
-	/// Runs the test `name` (its path in this crate) again in a process of its
-	/// own and fails when that run fails or runs no test: `true` here, `false`
-	/// in that process, which runs the test's body. The fallbacks are the
-	/// process's: a walk of any other test of this process sets them when its
-	/// kernel refuses `openat2` (gVisor) or `O_NOATIME` (a file of another
-	/// owner), and a test that reads them would read that walk's decision.
-	fn alone(name: &str) -> bool {
-		const ALONE: &str = "PI_WALKER_TEST_ALONE";
-		if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
-			return false;
-		}
-		let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-			.args(["--exact", name, "--nocapture", "--test-threads=1"])
-			.env(ALONE, name)
-			.output()
-			.expect("run the test in a process of its own");
-		let (out, err) =
-			(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-		assert!(output.status.success(), "{name} failed in a process of its own:\n{out}\n{err}");
-		assert!(
-			out.contains("1 passed"),
-			"{name} ran no test in a process of its own:\n{out}\n{err}"
-		);
-		true
-	}
+	// The fallbacks are the process's: a walk of any other test of this
+	// process sets them when its kernel refuses `openat2` (gVisor) or
+	// `O_NOATIME` (a file of another owner), and a test that reads them would
+	// read that walk's decision; such a test runs in a process of its own.
+	use crate::dir_handle::alone;
 
 	/// Whether the kernel opens `a/f` below `root` with `openat2`.
 	fn openat2_works(root: c_int) -> bool {
@@ -895,7 +875,7 @@ mod tests {
 	#[test]
 	fn a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one() {
 		if alone(
-			"fs::native::sys::tests::a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one",
+			"dir_handle::native::sys::tests::a_kernel_that_follows_a_symlink_despite_o_nofollow_opens_nothing_through_one",
 		) {
 			return;
 		}
@@ -1042,7 +1022,9 @@ mod tests {
 	/// the test would pass without checking `O_NOCTTY`.
 	#[test]
 	fn a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal() {
-		if alone("fs::native::sys::tests::a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal") {
+		if alone(
+			"dir_handle::native::sys::tests::a_terminal_at_a_directorys_name_does_not_become_the_controlling_terminal",
+		) {
 			return;
 		}
 		let _serial = SWITCHES.lock();
